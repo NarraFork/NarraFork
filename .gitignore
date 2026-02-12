@@ -1,0 +1,9 @@
+node_modules/
+dist/
+drizzle/
+frontend/routeTree.gen.ts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.worktrees/

@@ -1,0 +1,44 @@
+{
+	"name": "narrafork",
+	"type": "module",
+	"version": "0.1.0",
+	"private": true,
+	"scripts": {
+		"dev": "bun run db:push && bun run --hot server/index.ts",
+		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
+		"build": "bunx vite build --config frontend/vite.config.ts",
+		"start": "bun run db:push && bun server/index.ts",
+		"db:push": "bunx drizzle-kit push",
+		"db:generate": "bunx drizzle-kit generate",
+		"db:migrate": "bun server/db/migrate.ts",
+		"check": "bunx @biomejs/biome check .",
+		"format": "bunx @biomejs/biome check --write ."
+	},
+	"dependencies": {
+		"@anthropic-ai/claude-agent-sdk": "^0.2.39",
+		"@mantine/core": "^7.17.0",
+		"@mantine/hooks": "^7.17.0",
+		"@tanstack/react-query": "^5.75.0",
+		"@tanstack/react-router": "^1.120.0",
+		"drizzle-orm": "^0.44.0",
+		"hono": "^4.7.0",
+		"nanoid": "^5.1.0",
+		"react": "^19.1.0",
+		"react-dom": "^19.1.0",
+		"zod": "^4.3.6"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.0.0",
+		"@tanstack/router-plugin": "^1.120.0",
+		"@types/bun": "^1.2.0",
+		"@types/react": "^19.1.0",
+		"@types/react-dom": "^19.1.0",
+		"@vitejs/plugin-react": "^4.4.0",
+		"better-sqlite3": "^12.6.2",
+		"drizzle-kit": "^0.31.0",
+		"postcss": "^8.5.0",
+		"postcss-preset-mantine": "^1.17.0",
+		"postcss-simple-vars": "^7.0.0",
+		"vite": "^6.3.0"
+	}
+}
