@@ -3,9 +3,9 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 import { narratorService } from "./narrator-service";
 
-const SUMMARY_MODEL = "claude-haiku-4-5";
 const SUMMARY_MAX_MESSAGES = 50;
 
 const SUMMARY_PROMPT = `You are a context summarizer. Analyze the conversation history below and produce a concise summary focusing on:
@@ -60,7 +60,7 @@ export const narratorContext = {
 				// For "full" mode, store parent session ID so we can fork on first message
 				claudeSessionId: input.inheritMode === "full" ? parent.claudeSessionId : null,
 				contextSummary,
-				status: "active",
+				status: "idle",
 				createdAt: now,
 				updatedAt: now,
 			})
@@ -97,7 +97,7 @@ export const narratorContext = {
 			const summaryQuery = query({
 				prompt: SUMMARY_PROMPT + conversationText,
 				options: {
-					model: SUMMARY_MODEL,
+					model: settings.agent.summaryModel,
 					maxTurns: 1,
 					tools: [],
 					permissionMode: "dontAsk",

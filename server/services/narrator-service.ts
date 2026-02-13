@@ -63,7 +63,7 @@ export const narratorService = {
 					| "plan"
 					| "dontAsk",
 				inheritMode: "fresh",
-				status: "active",
+				status: "idle",
 				createdAt: now,
 				updatedAt: now,
 			})
@@ -193,6 +193,11 @@ export const narratorService = {
 			.where(eq(narrators.id, narratorId));
 	},
 
+	async updateTitle(narratorId: string, title: string) {
+		const now = new Date().toISOString();
+		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
+	},
+
 	async updatePermissionMode(
 		narratorId: string,
 		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk",
@@ -206,7 +211,7 @@ export const narratorService = {
 
 	async updateStatus(
 		narratorId: string,
-		status: "active" | "paused" | "completed" | "error",
+		status: "idle" | "thinking" | "waiting" | "archived" | "error",
 		errorMessage?: string,
 	) {
 		const now = new Date().toISOString();
@@ -218,7 +223,7 @@ export const narratorService = {
 		eventBus.emit(
 			status === "error"
 				? { type: "narrator:error", narratorId, error: errorMessage ?? "Unknown error" }
-				: { type: "narrator:completed", narratorId },
+				: { type: "narrator:status_changed", narratorId, status },
 		);
 	},
 

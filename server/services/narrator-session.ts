@@ -6,8 +6,8 @@ import {
 	type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { and, eq } from "drizzle-orm";
-import { db } from "../db";
-import { chapters, narratorToolCalls, permissionRequests } from "../db/schema";
+import { db, sqlite } from "../db";
+import { chapters, narrators, narratorToolCalls, permissionRequests } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -15,6 +15,7 @@ import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
+import { generateAndSetTitle } from "./narrator-title";
 
 // === In-memory state ===
 
@@ -29,6 +30,8 @@ const activeSessions = new Map<string, ActiveSession>();
 interface PendingPermission {
 	resolve: (result: PermissionResult) => void;
 	timeoutId: ReturnType<typeof setTimeout>;
+	input: Record<string, unknown>;
+	narratorId: string;
 }
 
 const pendingPermissions = new Map<string, PendingPermission>();
@@ -59,6 +62,12 @@ async function handlePermission(
 		toolUseID: string;
 	},
 ): Promise<PermissionResult> {
+	// Auto-allow safe built-in tools that don't need user approval
+	const autoAllowTools = ["TodoWrite", "TodoRead"];
+	if (autoAllowTools.includes(toolName)) {
+		return { behavior: "allow", updatedInput: input };
+	}
+
 	const requestId = generateId();
 	const now = new Date().toISOString();
 
@@ -100,6 +109,9 @@ async function handlePermission(
 
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId });
 
+	// Mark narrator as waiting for user decision
+	await narratorService.updateStatus(narratorId, "waiting");
+
 	// Return a promise that resolves when user decides or timeout
 	return new Promise<PermissionResult>((resolve) => {
 		const timeoutId = setTimeout(async () => {
@@ -112,7 +124,7 @@ async function handlePermission(
 			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, PERMISSION_TIMEOUT_MS);
 
-		pendingPermissions.set(requestId, { resolve, timeoutId });
+		pendingPermissions.set(requestId, { resolve, timeoutId, input, narratorId });
 	});
 }
 
@@ -121,6 +133,7 @@ export async function resolvePermission(
 	requestId: string,
 	decision: "allow" | "deny",
 	denyMessage?: string,
+	answers?: Record<string, string>,
 ): Promise<void> {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -131,6 +144,9 @@ export async function resolvePermission(
 	clearTimeout(pending.timeoutId);
 	pendingPermissions.delete(requestId);
 
+	// Resume thinking status now that user has decided
+	await narratorService.updateStatus(pending.narratorId, "thinking");
+
 	// Update DB
 	const now = new Date().toISOString();
 	await db
@@ -139,7 +155,9 @@ export async function resolvePermission(
 		.where(eq(permissionRequests.id, requestId));
 
 	if (decision === "allow") {
-		pending.resolve({ behavior: "allow" });
+		// For AskUserQuestion, merge answers into the input so the SDK sees them
+		const updatedInput = answers ? { ...pending.input, answers } : pending.input;
+		pending.resolve({ behavior: "allow", updatedInput });
 	} else {
 		pending.resolve({ behavior: "deny", message: denyMessage ?? "Permission denied by user" });
 	}
@@ -226,6 +244,7 @@ export async function* startSession(
 	});
 
 	activeSessions.set(narratorId, { query: sdkQuery, abortController, narratorId });
+	await narratorService.updateStatus(narratorId, "thinking");
 
 	try {
 		for await (const message of sdkQuery) {
@@ -254,6 +273,12 @@ async function processSDKMessage(
 
 			// Persist message + tool calls
 			const saved = await narratorService.persistAssistantMessage(narratorId, message as any);
+
+			// Auto-generate title after first assistant message
+			const narrator = await narratorService.getById(narratorId);
+			if ((narrator.messageCount ?? 0) === 0 && !narrator.title) {
+				generateAndSetTitle(narratorId);
+			}
 
 			// Broadcast to WebSocket
 			broadcastToNarrator(narratorId, {
@@ -329,7 +354,7 @@ async function processSDKMessage(
 					errors.join("; ") || message.subtype,
 				);
 			} else {
-				await narratorService.updateStatus(narratorId, "active");
+				await narratorService.updateStatus(narratorId, "idle");
 			}
 
 			return {
@@ -367,4 +392,56 @@ export async function interruptSession(narratorId: string): Promise<boolean> {
 
 export function isSessionActive(narratorId: string): boolean {
 	return activeSessions.has(narratorId);
+}
+
+// === Startup recovery ===
+
+/** Clean up stale in-progress states left by a previous server run. */
+export async function recoverOnStartup(): Promise<void> {
+	// 1. Migrate legacy status values and reset in-progress statuses
+	const now = new Date().toISOString();
+	const migrations = [
+		["active", "idle"],
+		["paused", "idle"],
+		["completed", "archived"],
+		["thinking", "idle"],
+		["waiting", "idle"],
+	] as const;
+	const stmt = sqlite.prepare(
+		"UPDATE narrators SET status = ?, updated_at = ? WHERE status = ?",
+	);
+	for (const [from, to] of migrations) {
+		const result = stmt.run(to, now, from);
+		if (result.changes > 0) {
+			logger.info(`Narrator status migrated: ${from} → ${to}`, { count: result.changes });
+		}
+	}
+
+	// 2. Auto-deny all stale pending permission requests
+	const stalePermissions = await db.query.permissionRequests.findMany({
+		where: eq(permissionRequests.decision, "pending"),
+	});
+	if (stalePermissions.length > 0) {
+		await db
+			.update(permissionRequests)
+			.set({ decision: "deny", decidedBy: "server_restart", decidedAt: now })
+			.where(eq(permissionRequests.decision, "pending"));
+		logger.info("Stale permission requests auto-denied on startup", {
+			count: stalePermissions.length,
+		});
+	}
+
+	// 3. Mark all "running" tool calls as "failed" (interrupted by restart)
+	const staleToolCalls = await db.query.narratorToolCalls.findMany({
+		where: eq(narratorToolCalls.status, "running"),
+	});
+	if (staleToolCalls.length > 0) {
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "failed", errorMessage: "Interrupted by server restart" })
+			.where(eq(narratorToolCalls.status, "running"));
+		logger.info("Stale running tool calls marked as failed on startup", {
+			count: staleToolCalls.length,
+		});
+	}
 }

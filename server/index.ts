@@ -6,6 +6,7 @@ import "./db"; // Ensure DB is initialized early
 import { verifyToken } from "./lib/auth";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
+import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import { terminalService } from "./services/terminal-service";
 import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
 
@@ -60,4 +61,9 @@ logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
 // Recover terminals that survived a server restart (dtach sessions persist)
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });
+});
+
+// Clean up stale narrator states from previous server run
+recoverNarrators().catch((err) => {
+	logger.error("Narrator state recovery failed", { error: String(err) });
 });
