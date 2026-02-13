@@ -9,4 +9,5 @@ export default defineConfig({
 		url: resolve(homedir(), ".narrafork", "narrafork.db"),
 	},
 	out: "./drizzle",
+	tablesFilter: ["!*_fts*"],
 });

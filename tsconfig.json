@@ -11,12 +11,12 @@
 		"resolveJsonModule": true,
 		"isolatedModules": true,
 		"noEmit": true,
-		"types": ["bun-types"],
+		"types": ["bun-types", "vite-plugin-pwa/client"],
 		"paths": {
 			"@server/*": ["./server/*"],
 			"@frontend/*": ["./frontend/*"]
 		}
 	},
-	"include": ["server/**/*.ts", "frontend/**/*.ts", "frontend/**/*.tsx"],
+	"include": ["server/**/*.ts", "frontend/**/*.ts", "frontend/**/*.tsx", "tests/**/*.ts"],
 	"exclude": ["node_modules", "dist"]
 }
