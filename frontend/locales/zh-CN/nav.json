@@ -4,5 +4,7 @@
 	"projects": "项目",
 	"sessions": "会话",
 	"settings": "设置",
+	"admin": "管理",
+	"logout": "退出登录",
 	"searchPlaceholder": "搜索章节与消息..."
 }

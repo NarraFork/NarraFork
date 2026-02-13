@@ -4,7 +4,19 @@
 	"thinking": "Thinking",
 	"sendPlaceholder": "Send a message...",
 	"interrupt": "Interrupt",
-	"live": "live",
 	"permissionRequest": "Permission Request",
-	"tool": "Tool:"
+	"tool": "Tool:",
+	"questionFromNarrator": "Narrator has a question",
+	"typeCustomAnswer": "Or type a custom answer...",
+	"submitAnswer": "Submit",
+	"skipQuestion": "Skip",
+	"untitled": "Untitled",
+	"generateTitle": "Generate title",
+	"scrollToBottom": "Scroll to bottom",
+	"disconnected": "Disconnected",
+	"status_idle": "Idle",
+	"status_thinking": "Thinking",
+	"status_waiting": "Waiting",
+	"status_archived": "Archived",
+	"status_error": "Error"
 }

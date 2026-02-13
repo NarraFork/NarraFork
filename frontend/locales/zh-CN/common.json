@@ -14,5 +14,18 @@
 	"branch": "分支：",
 	"base": "基线：",
 	"input": "输入",
-	"output": "输出"
+	"output": "输出",
+	"login": "登录",
+	"register": "注册",
+	"username": "用户名",
+	"password": "密码",
+	"firstUserSetup": "还没有用户，请创建第一个管理员账户。",
+	"createAdmin": "创建管理员账户",
+	"adminPanel": "管理面板",
+	"registrationSettings": "注册设置",
+	"registrationOpen": "允许新用户注册",
+	"userManagement": "用户管理",
+	"noUsers": "暂无用户。",
+	"role": "角色",
+	"createdAt": "创建时间"
 }

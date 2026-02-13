@@ -2,5 +2,7 @@
 	"title": "搜索结果",
 	"resultsFor": "\"{{query}}\" 的搜索结果",
 	"noResults": "未找到结果。",
-	"enterQuery": "在顶栏输入搜索关键词。"
+	"enterQuery": "在顶栏输入搜索关键词。",
+	"shortQueryHint": "搜索词较短，查询可能较慢。点击按钮确认搜索。",
+	"searchAnyway": "搜索"
 }

@@ -1,5 +1,9 @@
 {
 	"welcome": "欢迎使用 NarraFork",
 	"subtitle": "AI 驱动的协作编程平台。",
-	"viewProjects": "查看项目"
+	"viewProjects": "查看项目",
+	"activeProjects": "活跃项目",
+	"totalProjects": "项目总数",
+	"standaloneSessions": "独立会话",
+	"recentProjects": "最近项目"
 }

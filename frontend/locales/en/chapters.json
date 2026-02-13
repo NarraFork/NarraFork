@@ -55,5 +55,7 @@
 	"deleteBranches": "Delete git branches",
 	"cleanupFailed": "Cleanup failed",
 	"cleanupCount": "Cleanup {{count}} chapter(s)",
-	"forkFromMessage": "Fork from this message"
+	"forkFromMessage": "Fork from this message",
+	"dormant": "Dormant",
+	"wake": "Wake"
 }

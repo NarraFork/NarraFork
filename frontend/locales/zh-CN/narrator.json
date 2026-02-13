@@ -4,7 +4,19 @@
 	"thinking": "思考中",
 	"sendPlaceholder": "发送消息...",
 	"interrupt": "中断",
-	"live": "在线",
 	"permissionRequest": "权限请求",
-	"tool": "工具："
+	"tool": "工具：",
+	"questionFromNarrator": "叙述者有问题要问你",
+	"typeCustomAnswer": "或输入自定义回答...",
+	"submitAnswer": "提交",
+	"skipQuestion": "跳过",
+	"untitled": "未命名",
+	"generateTitle": "生成标题",
+	"scrollToBottom": "滚动到底部",
+	"disconnected": "连接断开",
+	"status_idle": "空闲",
+	"status_thinking": "思考中",
+	"status_waiting": "等待中",
+	"status_archived": "已归档",
+	"status_error": "错误"
 }

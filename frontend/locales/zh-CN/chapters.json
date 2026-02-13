@@ -55,5 +55,7 @@
 	"deleteBranches": "删除 Git 分支",
 	"cleanupFailed": "清理失败",
 	"cleanupCount": "清理 {{count}} 个章节",
-	"forkFromMessage": "从此消息分叉"
+	"forkFromMessage": "从此消息分叉",
+	"dormant": "休眠",
+	"wake": "唤醒"
 }

@@ -14,5 +14,18 @@
 	"branch": "Branch:",
 	"base": "Base:",
 	"input": "Input",
-	"output": "Output"
+	"output": "Output",
+	"login": "Login",
+	"register": "Register",
+	"username": "Username",
+	"password": "Password",
+	"firstUserSetup": "No users yet. Create the first admin account.",
+	"createAdmin": "Create Admin Account",
+	"adminPanel": "Admin Panel",
+	"registrationSettings": "Registration Settings",
+	"registrationOpen": "Allow new user registration",
+	"userManagement": "User Management",
+	"noUsers": "No users found.",
+	"role": "Role",
+	"createdAt": "Created"
 }

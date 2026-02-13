@@ -1,5 +1,9 @@
 {
 	"welcome": "Welcome to NarraFork",
 	"subtitle": "AI-powered collaborative programming platform.",
-	"viewProjects": "View Projects"
+	"viewProjects": "View Projects",
+	"activeProjects": "Active Projects",
+	"totalProjects": "Total Projects",
+	"standaloneSessions": "Standalone Sessions",
+	"recentProjects": "Recent Projects"
 }

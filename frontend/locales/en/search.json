@@ -2,5 +2,7 @@
 	"title": "Search Results",
 	"resultsFor": "Results for \"{{query}}\"",
 	"noResults": "No results found.",
-	"enterQuery": "Enter a search query in the header."
+	"enterQuery": "Enter a search query in the header.",
+	"shortQueryHint": "Query is very short and may be slow. Click to search anyway.",
+	"searchAnyway": "Search"
 }
