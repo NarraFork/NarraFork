@@ -1,6 +1,7 @@
 import { Button, Card, Group, Loader, Modal, Stack, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useTranslation } from "react-i18next";
 import { useCreateSession, useDeleteSession, useSessions } from "../../hooks/useSessions";
 
 export const Route = createFileRoute("/sessions/")({
@@ -12,6 +13,9 @@ function SessionsPage() {
 	const createSession = useCreateSession();
 	const deleteSession = useDeleteSession();
 	const [opened, { open, close }] = useDisclosure(false);
+	const { t } = useTranslation("sessions");
+	const { t: tc } = useTranslation("common");
+	const { i18n } = useTranslation();
 
 	const handleCreate = () => {
 		createSession.mutate(
@@ -25,14 +29,14 @@ function SessionsPage() {
 	return (
 		<Stack>
 			<Group justify="space-between">
-				<Title order={2}>Standalone Sessions</Title>
-				<Button onClick={open}>New Session</Button>
+				<Title order={2}>{t("title")}</Title>
+				<Button onClick={open}>{t("newSession")}</Button>
 			</Group>
 
 			{isLoading ? (
 				<Loader />
 			) : !sessions?.length ? (
-				<Text c="dimmed">No standalone sessions. Create one to start a conversation without a chapter.</Text>
+				<Text c="dimmed">{t("noSessions")}</Text>
 			) : (
 				<Stack>
 					{sessions.map((session: any) => (
@@ -42,21 +46,20 @@ function SessionsPage() {
 							params={{ sessionId: session.id }}
 							style={{ textDecoration: "none", color: "inherit" }}
 						>
-							<Card
-								shadow="sm"
-								padding="md"
-								withBorder
-							>
+							<Card shadow="sm" padding="md" withBorder>
 								<Group justify="space-between">
 									<div>
-										<Text fw={500}>Session {session.id.slice(0, 8)}</Text>
+										<Text fw={500}>{t("sessionId", { id: session.id.slice(0, 8) })}</Text>
 										<Text size="sm" c="dimmed">
-											{session.model} &middot; {session.messageCount ?? 0} messages
+											{t("sessionMeta", {
+												model: session.model,
+												count: session.messageCount ?? 0,
+											})}
 										</Text>
 									</div>
 									<Group>
 										<Text size="xs" c="dimmed">
-											{new Date(session.createdAt).toLocaleDateString()}
+											{new Date(session.createdAt).toLocaleDateString(i18n.language)}
 										</Text>
 										<Button
 											size="xs"
@@ -68,7 +71,7 @@ function SessionsPage() {
 												deleteSession.mutate(session.id);
 											}}
 										>
-											Delete
+											{tc("delete")}
 										</Button>
 									</Group>
 								</Group>
@@ -78,13 +81,13 @@ function SessionsPage() {
 				</Stack>
 			)}
 
-			<Modal opened={opened} onClose={close} title="New Standalone Session">
+			<Modal opened={opened} onClose={close} title={t("newSessionModal")}>
 				<Stack>
 					<Text size="sm" c="dimmed">
-						Create a standalone AI session not bound to any chapter. Useful for general questions and explorations.
+						{t("newSessionDescription")}
 					</Text>
 					<Button onClick={handleCreate} loading={createSession.isPending}>
-						Create Session
+						{t("createSession")}
 					</Button>
 				</Stack>
 			</Modal>

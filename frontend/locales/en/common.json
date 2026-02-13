@@ -1,0 +1,18 @@
+{
+	"create": "Create",
+	"save": "Save",
+	"delete": "Delete",
+	"send": "Send",
+	"refresh": "Refresh",
+	"allow": "Allow",
+	"deny": "Deny",
+	"unknownError": "Unknown error",
+	"title": "Title",
+	"description": "Description",
+	"type": "Type",
+	"strategy": "Strategy",
+	"branch": "Branch:",
+	"base": "Base:",
+	"input": "Input",
+	"output": "Output"
+}

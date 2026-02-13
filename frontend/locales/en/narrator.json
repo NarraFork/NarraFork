@@ -1,0 +1,10 @@
+{
+	"you": "You",
+	"narrator": "Narrator",
+	"thinking": "Thinking",
+	"sendPlaceholder": "Send a message...",
+	"interrupt": "Interrupt",
+	"live": "live",
+	"permissionRequest": "Permission Request",
+	"tool": "Tool:"
+}

@@ -15,8 +15,9 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
-import { ChapterCard } from "../../components/chapter/ChapterCard";
+import { useTranslation } from "react-i18next";
 import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
+import { ChapterCard } from "../../components/chapter/ChapterCard";
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useProject } from "../../hooks/useProjects";
@@ -36,9 +37,12 @@ function ProjectDetailPage() {
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [type, setType] = useState<string>("meanwhile");
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
+	const { t: tp } = useTranslation("projects");
 
 	if (projectLoading) return <Loader />;
-	if (!project) return <Text>Project not found</Text>;
+	if (!project) return <Text>{tp("projectNotFound")}</Text>;
 
 	const primaryRepo =
 		project.repositories?.find((r: any) => r.isPrimary) ?? project.repositories?.[0];
@@ -80,21 +84,33 @@ function ProjectDetailPage() {
 				</Badge>
 			</Group>
 			<Group justify="space-between">
-				<Title order={3}>Chapters</Title>
+				<Title order={3}>{t("title")}</Title>
 				<Group gap="xs">
 					<Link to="/projects/$projectId/graph" params={{ projectId }}>
 						<Button variant="light" size="sm">
-							View Graph
+							{t("viewGraph")}
 						</Button>
 					</Link>
-					<Button variant="light" color="red" size="sm" onClick={openCleanup} disabled={!chapters?.length}>
-						Cleanup
+					<Button
+						variant="light"
+						color="red"
+						size="sm"
+						onClick={openCleanup}
+						disabled={!chapters?.length}
+					>
+						{t("cleanup")}
 					</Button>
-					<Button variant="light" color="green" size="sm" onClick={openBatchMerge} disabled={!chapters?.length}>
-						Batch Merge
+					<Button
+						variant="light"
+						color="green"
+						size="sm"
+						onClick={openBatchMerge}
+						disabled={!chapters?.length}
+					>
+						{t("batchMerge")}
 					</Button>
 					<Button onClick={open} disabled={!primaryRepo}>
-						New Chapter
+						{t("newChapter")}
 					</Button>
 				</Group>
 			</Group>
@@ -102,7 +118,7 @@ function ProjectDetailPage() {
 			{chaptersLoading ? (
 				<Loader />
 			) : !chapters?.length ? (
-				<Text c="dimmed">No chapters yet. Create one to start working.</Text>
+				<Text c="dimmed">{t("noChapters")}</Text>
 			) : (
 				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
 					{chapters.map((chapter: any) => (
@@ -111,32 +127,32 @@ function ProjectDetailPage() {
 				</SimpleGrid>
 			)}
 
-			<Modal opened={opened} onClose={close} title="New Chapter">
+			<Modal opened={opened} onClose={close} title={t("newChapter")}>
 				<Stack>
 					<TextInput
-						label="Title"
-						placeholder="Add authentication"
+						label={tc("title")}
+						placeholder={t("titlePlaceholder")}
 						value={title}
 						onChange={(e) => setTitle(e.currentTarget.value)}
 						required
 					/>
 					<Textarea
-						label="Description"
-						placeholder="What this chapter is about..."
+						label={tc("description")}
+						placeholder={t("descriptionPlaceholder")}
 						value={description}
 						onChange={(e) => setDescription(e.currentTarget.value)}
 					/>
 					<Select
-						label="Type"
+						label={tc("type")}
 						data={[
-							{ value: "meanwhile", label: "Meanwhile (parallel work)" },
-							{ value: "whatif", label: "WhatIf (exploration)" },
+							{ value: "meanwhile", label: t("typeMeanwhile") },
+							{ value: "whatif", label: t("typeWhatif") },
 						]}
 						value={type}
 						onChange={(v) => setType(v ?? "meanwhile")}
 					/>
 					<Button onClick={handleCreate} loading={createChapter.isPending}>
-						Create
+						{tc("create")}
 					</Button>
 				</Stack>
 			</Modal>

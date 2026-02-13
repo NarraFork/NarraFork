@@ -1,17 +1,20 @@
 import { Button, Stack, Text, Title } from "@mantine/core";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useTranslation } from "react-i18next";
 
 export const Route = createFileRoute("/")({
 	component: DashboardPage,
 });
 
 function DashboardPage() {
+	const { t } = useTranslation("dashboard");
+
 	return (
 		<Stack>
-			<Title>Welcome to NarraFork</Title>
-			<Text c="dimmed">AI-powered collaborative programming platform.</Text>
+			<Title>{t("welcome")}</Title>
+			<Text c="dimmed">{t("subtitle")}</Text>
 			<Button component={Link} to="/projects" w="fit-content">
-				View Projects
+				{t("viewProjects")}
 			</Button>
 		</Stack>
 	);

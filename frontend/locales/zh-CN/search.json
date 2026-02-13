@@ -1,0 +1,6 @@
+{
+	"title": "搜索结果",
+	"resultsFor": "\"{{query}}\" 的搜索结果",
+	"noResults": "未找到结果。",
+	"enterQuery": "在顶栏输入搜索关键词。"
+}

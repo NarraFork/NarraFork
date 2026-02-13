@@ -1,5 +1,6 @@
 import { ActionIcon, Group, Tabs, Text, Tooltip } from "@mantine/core";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "../../hooks/useTerminals";
 import { TerminalPanel } from "./TerminalPanel";
 
@@ -12,6 +13,7 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 	const createTerminal = useCreateTerminal(chapterId);
 	const deleteTerminal = useDeleteTerminal(chapterId);
 	const [activeTab, setActiveTab] = useState<string | null>(null);
+	const { t } = useTranslation("terminal");
 
 	const runningTerminals = (terminals ?? []).filter((t: any) => t.status === "running");
 
@@ -42,9 +44,9 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 		return (
 			<Group justify="center" align="center" h="100%" gap="xs">
 				<Text size="sm" c="dimmed">
-					No terminals
+					{t("noTerminals")}
 				</Text>
-				<Tooltip label="New terminal">
+				<Tooltip label={t("newTerminal")}>
 					<ActionIcon variant="light" onClick={handleCreate} loading={createTerminal.isPending}>
 						+
 					</ActionIcon>
@@ -75,7 +77,7 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 						</Tabs.Tab>
 					))}
 				</Tabs.List>
-				<Tooltip label="New terminal">
+				<Tooltip label={t("newTerminal")}>
 					<ActionIcon
 						variant="subtle"
 						onClick={handleCreate}

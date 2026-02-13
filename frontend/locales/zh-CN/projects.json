@@ -1,0 +1,11 @@
+{
+	"title": "项目",
+	"newProject": "新建项目",
+	"noProjects": "暂无项目，创建一个以开始。",
+	"projectName": "项目名称",
+	"projectNamePlaceholder": "我的项目",
+	"repositoryPath": "仓库路径",
+	"repositoryPathPlaceholder": "/home/user/projects/my-repo",
+	"repositoryPathDescription": "本地已有的 Git 仓库路径",
+	"projectNotFound": "项目未找到"
+}

@@ -1,0 +1,6 @@
+{
+	"noTerminals": "No terminals",
+	"newTerminal": "New terminal",
+	"processExited": "[Process exited with code {{code}}]",
+	"error": "[Error: {{message}}]"
+}

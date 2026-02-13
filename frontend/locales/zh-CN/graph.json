@@ -1,0 +1,7 @@
+{
+	"storyNetwork": "故事网络",
+	"loadFailed": "加载图谱失败：{{message}}",
+	"noChapters": "暂无章节。",
+	"narratorCount": "{{count}} 个叙述者",
+	"containers": "容器"
+}

@@ -1,5 +1,6 @@
 import { Badge, Card, Group, Loader, Stack, Text, Title } from "@mantine/core";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useTranslation } from "react-i18next";
 import { useSearch } from "../hooks/useSearch";
 
 interface SearchParams {
@@ -16,20 +17,21 @@ export const Route = createFileRoute("/search")({
 function SearchPage() {
 	const { q } = Route.useSearch();
 	const { data, isLoading } = useSearch(q ?? "");
+	const { t } = useTranslation("search");
 
 	return (
 		<Stack>
-			<Title order={2}>Search Results</Title>
+			<Title order={2}>{t("title")}</Title>
 			{q && (
 				<Text c="dimmed" size="sm">
-					Results for &quot;{q}&quot;
+					{t("resultsFor", { query: q })}
 				</Text>
 			)}
 
 			{isLoading ? (
 				<Loader />
 			) : !data?.results?.length ? (
-				<Text c="dimmed">{q ? "No results found." : "Enter a search query in the header."}</Text>
+				<Text c="dimmed">{q ? t("noResults") : t("enterQuery")}</Text>
 			) : (
 				<Stack>
 					{data.results.map((result: any) => {

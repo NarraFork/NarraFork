@@ -1,5 +1,12 @@
 import { ActionIcon, Badge, Card, Group, Loader, Stack, Text } from "@mantine/core";
-import { useContainers, useStartContainers, useStopContainers, usePauseContainers, useUnpauseContainers } from "../../hooks/useContainers";
+import { useTranslation } from "react-i18next";
+import {
+	useContainers,
+	usePauseContainers,
+	useStartContainers,
+	useStopContainers,
+	useUnpauseContainers,
+} from "../../hooks/useContainers";
 import { CONTAINER_STATUS_COLORS } from "../../lib/constants";
 
 interface ContainerStatusProps {
@@ -12,6 +19,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 	const stop = useStopContainers();
 	const pause = usePauseContainers();
 	const unpause = useUnpauseContainers();
+	const { t } = useTranslation("containers");
 
 	if (isLoading) return <Loader size="xs" />;
 	if (!containers?.length) return null;
@@ -20,7 +28,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 		<Stack gap="xs">
 			<Group justify="space-between">
 				<Text size="sm" fw={600}>
-					Containers
+					{t("title")}
 				</Text>
 				<Group gap={4}>
 					<ActionIcon
@@ -29,7 +37,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 						color="green"
 						onClick={() => start.mutate(chapterId)}
 						loading={start.isPending}
-						title="Start"
+						title={t("start")}
 					>
 						&#9654;
 					</ActionIcon>
@@ -39,7 +47,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 						color="red"
 						onClick={() => stop.mutate(chapterId)}
 						loading={stop.isPending}
-						title="Stop"
+						title={t("stop")}
 					>
 						&#9632;
 					</ActionIcon>
@@ -49,7 +57,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 						color="yellow"
 						onClick={() => pause.mutate(chapterId)}
 						loading={pause.isPending}
-						title="Pause"
+						title={t("pause")}
 					>
 						&#10074;&#10074;
 					</ActionIcon>
@@ -59,7 +67,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 						color="teal"
 						onClick={() => unpause.mutate(chapterId)}
 						loading={unpause.isPending}
-						title="Resume"
+						title={t("resume")}
 					>
 						&#9654;
 					</ActionIcon>

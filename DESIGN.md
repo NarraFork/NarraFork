@@ -56,6 +56,7 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 | @xyflow/react (React Flow) | 故事网络可视化 | >= 12.x |
 | @dagrejs/dagre | 图自动布局 | >= 1.x |
 | xterm.js | 终端模拟 | >= 5.x |
+| react-i18next + i18next | 国际化（英文 + 简体中文） | >= 16.x / >= 25.x |
 
 ### 2.3 工具链
 | 技术 | 用途 |
@@ -794,7 +795,11 @@ frontend/
     usePermissions.ts         # 权限审批 hooks                [Phase 5]
   lib/
     api.ts                    # API 客户端（含 auth token 管理）
+    i18n.ts                   # i18next 初始化（语言检测 + locale 导入）
     constants.ts              # 常量（状态颜色映射等）
+  locales/
+    en/                       # 英文翻译（12 个命名空间 JSON）
+    zh-CN/                    # 简体中文翻译（12 个命名空间 JSON）
 ```
 ### 6.2 故事网络可视化
 

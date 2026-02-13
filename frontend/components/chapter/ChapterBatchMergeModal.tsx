@@ -1,6 +1,7 @@
 import { Alert, Button, Checkbox, Modal, Select, Stack, Text, TextInput } from "@mantine/core";
-import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
 interface ChapterBatchMergeModalProps {
@@ -15,6 +16,8 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 	const [title, setTitle] = useState("");
 	const [strategy, setStrategy] = useState<string>("merge");
 	const qc = useQueryClient();
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 
 	const resetState = () => {
 		setSelected([]);
@@ -58,21 +61,23 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 	const sourceChapters = activeChapters.filter((ch) => ch.id !== baseChapterId);
 
 	return (
-		<Modal opened={opened} onClose={handleClose} title="Batch Merge">
+		<Modal opened={opened} onClose={handleClose} title={t("batchMergeTitle")}>
 			<Stack>
 				<Text size="sm" c="dimmed">
-					Merge multiple source chapters into a target chapter. A temporary fork is created for the merge; all sources are merged sequentially.
+					{t("batchMergeDescription")}
 				</Text>
 
 				<Select
-					label="Target Chapter"
-					placeholder="Select target chapter"
+					label={t("targetChapter")}
+					placeholder={t("selectTarget")}
 					data={targetOptions}
 					value={baseChapterId}
 					onChange={setBaseChapterId}
 				/>
 
-				<Text size="sm" fw={500}>Source Chapters</Text>
+				<Text size="sm" fw={500}>
+					{t("sourceChapters")}
+				</Text>
 				{sourceChapters.map((ch) => (
 					<Checkbox
 						key={ch.id}
@@ -83,32 +88,34 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 				))}
 				{sourceChapters.length === 0 && (
 					<Text c="dimmed" size="sm">
-						No chapters available as source.
+						{t("noSourceChapters")}
 					</Text>
 				)}
 
 				<TextInput
-					label="Merge Session Title"
-					placeholder="Merge sprint-3 branches"
+					label={t("mergeSessionTitle")}
+					placeholder={t("mergeSessionPlaceholder")}
 					value={title}
 					onChange={(e) => setTitle(e.currentTarget.value)}
 					required
 				/>
 
 				<Select
-					label="Strategy"
+					label={tc("strategy")}
 					data={[
-						{ value: "merge", label: "Merge (preserve history)" },
-						{ value: "squash", label: "Squash (single commit)" },
-						{ value: "cherry-pick", label: "Cherry-pick (individual commits)" },
+						{ value: "merge", label: t("strategyMerge") },
+						{ value: "squash", label: t("strategySquash") },
+						{ value: "cherry-pick", label: t("strategyCherryPick") },
 					]}
 					value={strategy}
 					onChange={(v) => setStrategy(v ?? "merge")}
 				/>
 
 				{batchMerge.isError && (
-					<Alert color="red" title="Batch merge failed">
-						<Text size="sm">{batchMerge.error instanceof Error ? batchMerge.error.message : "Unknown error"}</Text>
+					<Alert color="red" title={t("batchMergeFailed")}>
+						<Text size="sm">
+							{batchMerge.error instanceof Error ? batchMerge.error.message : tc("unknownError")}
+						</Text>
 					</Alert>
 				)}
 				<Button
@@ -117,7 +124,7 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 					loading={batchMerge.isPending}
 					disabled={!baseChapterId || selected.length === 0 || !title.trim()}
 				>
-					Merge {selected.length} chapter{selected.length !== 1 ? "s" : ""}
+					{t("mergeCount", { count: selected.length })}
 				</Button>
 			</Stack>
 		</Modal>

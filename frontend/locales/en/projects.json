@@ -1,0 +1,11 @@
+{
+	"title": "Projects",
+	"newProject": "New Project",
+	"noProjects": "No projects yet. Create one to get started.",
+	"projectName": "Project Name",
+	"projectNamePlaceholder": "My Project",
+	"repositoryPath": "Repository Path",
+	"repositoryPathPlaceholder": "/home/user/projects/my-repo",
+	"repositoryPathDescription": "Local path to an existing git repository",
+	"projectNotFound": "Project not found"
+}

@@ -2,6 +2,7 @@ import { Button, Loader, NumberInput, Paper, Stack, TextInput, Title } from "@ma
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
 export const Route = createFileRoute("/settings/")({
@@ -21,6 +22,8 @@ function SettingsPage() {
 
 	const [port, setPort] = useState<number | undefined>();
 	const [projectDir, setProjectDir] = useState("");
+	const { t } = useTranslation("settings");
+	const { t: tc } = useTranslation("common");
 
 	// Sync state when data loads
 	if (settings && port === undefined) {
@@ -39,23 +42,23 @@ function SettingsPage() {
 
 	return (
 		<Stack>
-			<Title order={2}>Settings</Title>
+			<Title order={2}>{t("title")}</Title>
 			<Paper withBorder p="md">
 				<Stack>
 					<NumberInput
-						label="Server Port"
+						label={t("serverPort")}
 						value={port}
 						onChange={(v) => setPort(typeof v === "number" ? v : 7778)}
 						min={1024}
 						max={65535}
 					/>
 					<TextInput
-						label="Default Project Directory"
+						label={t("defaultProjectDir")}
 						value={projectDir}
 						onChange={(e) => setProjectDir(e.currentTarget.value)}
 					/>
 					<Button onClick={handleSave} loading={updateSettings.isPending} w="fit-content">
-						Save
+						{tc("save")}
 					</Button>
 				</Stack>
 			</Paper>

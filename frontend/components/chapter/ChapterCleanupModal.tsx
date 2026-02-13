@@ -1,6 +1,7 @@
 import { Alert, Button, Checkbox, Modal, Stack, Text } from "@mantine/core";
-import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
 interface ChapterCleanupModalProps {
@@ -14,6 +15,8 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 	const [force, setForce] = useState(false);
 	const [deleteBranch, setDeleteBranch] = useState(false);
 	const qc = useQueryClient();
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 
 	const resetState = () => {
 		setSelected([]);
@@ -45,15 +48,13 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 	};
 
 	// Only show chapters that can be cleaned up
-	const cleanable = chapters.filter(
-		(ch) => ch.status === "active" || ch.status === "dormant",
-	);
+	const cleanable = chapters.filter((ch) => ch.status === "active" || ch.status === "dormant");
 
 	return (
-		<Modal opened={opened} onClose={handleClose} title="Batch Cleanup">
+		<Modal opened={opened} onClose={handleClose} title={t("batchCleanup")}>
 			<Stack>
 				<Text size="sm" c="dimmed">
-					Select chapters to abandon and clean up. This will remove worktrees and optionally delete branches.
+					{t("cleanupDescription")}
 				</Text>
 				{cleanable.map((ch) => (
 					<Checkbox
@@ -65,22 +66,24 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 				))}
 				{cleanable.length === 0 && (
 					<Text c="dimmed" size="sm">
-						No chapters available for cleanup.
+						{t("noCleanupChapters")}
 					</Text>
 				)}
 				<Checkbox
-					label="Force (ignore uncommitted changes)"
+					label={t("forceCleanup")}
 					checked={force}
 					onChange={(e) => setForce(e.currentTarget.checked)}
 				/>
 				<Checkbox
-					label="Delete git branches"
+					label={t("deleteBranches")}
 					checked={deleteBranch}
 					onChange={(e) => setDeleteBranch(e.currentTarget.checked)}
 				/>
 				{cleanup.isError && (
-					<Alert color="red" title="Cleanup failed">
-						<Text size="sm">{cleanup.error instanceof Error ? cleanup.error.message : "Unknown error"}</Text>
+					<Alert color="red" title={t("cleanupFailed")}>
+						<Text size="sm">
+							{cleanup.error instanceof Error ? cleanup.error.message : tc("unknownError")}
+						</Text>
 					</Alert>
 				)}
 				<Button
@@ -89,7 +92,7 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 					loading={cleanup.isPending}
 					disabled={selected.length === 0}
 				>
-					Cleanup {selected.length} chapter{selected.length !== 1 ? "s" : ""}
+					{t("cleanupCount", { count: selected.length })}
 				</Button>
 			</Stack>
 		</Modal>

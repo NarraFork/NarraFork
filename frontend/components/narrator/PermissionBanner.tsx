@@ -1,4 +1,5 @@
 import { Alert, Button, Code, Group, Text } from "@mantine/core";
+import { useTranslation } from "react-i18next";
 
 interface PermissionBannerProps {
 	request: {
@@ -13,11 +14,13 @@ interface PermissionBannerProps {
 export function PermissionBanner({ request, onDecision }: PermissionBannerProps) {
 	const inputPreview = JSON.stringify(request.inputJson, null, 2);
 	const truncated = inputPreview.length > 300 ? `${inputPreview.slice(0, 300)}...` : inputPreview;
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 
 	return (
-		<Alert color="yellow" title="Permission Request" radius="md">
+		<Alert color="yellow" title={t("permissionRequest")} radius="md">
 			<Text size="sm" fw={500} mb={4}>
-				Tool: <Code>{request.toolName}</Code>
+				{t("tool")} <Code>{request.toolName}</Code>
 			</Text>
 			{request.decisionReason && (
 				<Text size="xs" c="dimmed" mb={4}>
@@ -29,7 +32,7 @@ export function PermissionBanner({ request, onDecision }: PermissionBannerProps)
 			</Code>
 			<Group>
 				<Button size="xs" color="green" onClick={() => onDecision(request.id, "allow")}>
-					Allow
+					{tc("allow")}
 				</Button>
 				<Button
 					size="xs"
@@ -37,7 +40,7 @@ export function PermissionBanner({ request, onDecision }: PermissionBannerProps)
 					variant="light"
 					onClick={() => onDecision(request.id, "deny")}
 				>
-					Deny
+					{tc("deny")}
 				</Button>
 			</Group>
 		</Alert>

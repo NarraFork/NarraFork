@@ -1,5 +1,6 @@
 import { Button, Code, Group, Loader, Select, Stack, Text } from "@mantine/core";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useContainerLogs, useContainers } from "../../hooks/useContainers";
 
 interface ContainerLogsProps {
@@ -10,10 +11,16 @@ export function ContainerLogs({ chapterId }: ContainerLogsProps) {
 	const [service, setService] = useState<string | null>(null);
 	const [tail, setTail] = useState<string>("100");
 	const { data: containers } = useContainers(chapterId);
-	const { data: logData, isLoading, refetch } = useContainerLogs(chapterId, {
+	const {
+		data: logData,
+		isLoading,
+		refetch,
+	} = useContainerLogs(chapterId, {
 		tail: Number.parseInt(tail, 10),
 		service: service ?? undefined,
 	});
+	const { t } = useTranslation("containers");
+	const { t: tc } = useTranslation("common");
 
 	const serviceOptions = (containers ?? []).map((c: any) => ({
 		value: c.serviceName,
@@ -25,7 +32,7 @@ export function ContainerLogs({ chapterId }: ContainerLogsProps) {
 			<Group gap="xs">
 				<Select
 					size="xs"
-					placeholder="All services"
+					placeholder={t("allServices")}
 					data={serviceOptions}
 					value={service}
 					onChange={setService}
@@ -35,16 +42,16 @@ export function ContainerLogs({ chapterId }: ContainerLogsProps) {
 				<Select
 					size="xs"
 					data={[
-						{ value: "50", label: "50 lines" },
-						{ value: "100", label: "100 lines" },
-						{ value: "500", label: "500 lines" },
+						{ value: "50", label: t("lines50") },
+						{ value: "100", label: t("lines100") },
+						{ value: "500", label: t("lines500") },
 					]}
 					value={tail}
 					onChange={(v) => setTail(v ?? "100")}
 					style={{ width: 120 }}
 				/>
 				<Button size="xs" variant="light" onClick={() => refetch()} loading={isLoading}>
-					Refresh
+					{tc("refresh")}
 				</Button>
 			</Group>
 			{isLoading ? (
@@ -63,7 +70,7 @@ export function ContainerLogs({ chapterId }: ContainerLogsProps) {
 				</Code>
 			) : (
 				<Text size="sm" c="dimmed">
-					No logs available.
+					{t("noLogs")}
 				</Text>
 			)}
 		</Stack>

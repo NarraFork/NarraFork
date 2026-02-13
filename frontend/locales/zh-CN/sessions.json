@@ -1,0 +1,11 @@
+{
+	"title": "独立会话",
+	"newSession": "新建会话",
+	"noSessions": "暂无独立会话。创建一个以开始不绑定章节的对话。",
+	"sessionId": "会话 {{id}}",
+	"sessionMeta": "{{model}} · {{count}} 条消息",
+	"newSessionModal": "新建独立会话",
+	"newSessionDescription": "创建一个不绑定任何章节的独立 AI 会话。适用于一般问题和探索。",
+	"createSession": "创建会话",
+	"sessionNotFound": "会话未找到"
+}

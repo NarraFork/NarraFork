@@ -1,0 +1,7 @@
+{
+	"storyNetwork": "Story Network",
+	"loadFailed": "Failed to load graph: {{message}}",
+	"noChapters": "No chapters yet.",
+	"narratorCount": "{{count}} narrator(s)",
+	"containers": "containers"
+}

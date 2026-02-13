@@ -14,6 +14,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useCreateProject, useProjects } from "../../hooks/useProjects";
 
 export const Route = createFileRoute("/projects/")({
@@ -26,6 +27,8 @@ function ProjectListPage() {
 	const [opened, { open, close }] = useDisclosure(false);
 	const [name, setName] = useState("");
 	const [repoPath, setRepoPath] = useState("");
+	const { t } = useTranslation("projects");
+	const { t: tc } = useTranslation("common");
 
 	const handleCreate = () => {
 		if (!name.trim()) return;
@@ -46,12 +49,12 @@ function ProjectListPage() {
 	return (
 		<Stack>
 			<Group justify="space-between">
-				<Title order={2}>Projects</Title>
-				<Button onClick={open}>New Project</Button>
+				<Title order={2}>{t("title")}</Title>
+				<Button onClick={open}>{t("newProject")}</Button>
 			</Group>
 
 			{!projects?.length ? (
-				<Text c="dimmed">No projects yet. Create one to get started.</Text>
+				<Text c="dimmed">{t("noProjects")}</Text>
 			) : (
 				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
 					{projects.map((project: any) => (
@@ -82,24 +85,24 @@ function ProjectListPage() {
 				</SimpleGrid>
 			)}
 
-			<Modal opened={opened} onClose={close} title="New Project">
+			<Modal opened={opened} onClose={close} title={t("newProject")}>
 				<Stack>
 					<TextInput
-						label="Project Name"
-						placeholder="My Project"
+						label={t("projectName")}
+						placeholder={t("projectNamePlaceholder")}
 						value={name}
 						onChange={(e) => setName(e.currentTarget.value)}
 						required
 					/>
 					<TextInput
-						label="Repository Path"
-						placeholder="/home/user/projects/my-repo"
+						label={t("repositoryPath")}
+						placeholder={t("repositoryPathPlaceholder")}
 						value={repoPath}
 						onChange={(e) => setRepoPath(e.currentTarget.value)}
-						description="Local path to an existing git repository"
+						description={t("repositoryPathDescription")}
 					/>
 					<Button onClick={handleCreate} loading={createProject.isPending}>
-						Create
+						{tc("create")}
 					</Button>
 				</Stack>
 			</Modal>

@@ -1,5 +1,6 @@
 import { Badge, Code, Collapse, Group, Paper, Text, UnstyledButton } from "@mantine/core";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 const TOOL_STATUS_COLORS: Record<string, string> = {
 	pending: "yellow",
@@ -22,6 +23,7 @@ interface ToolCallCardProps {
 
 export function ToolCallCard({ toolCall }: ToolCallCardProps) {
 	const [opened, setOpened] = useState(false);
+	const { t } = useTranslation("common");
 
 	return (
 		<Paper withBorder radius="sm" p="xs" my={4}>
@@ -44,7 +46,7 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
 			</UnstyledButton>
 			<Collapse in={opened}>
 				<Text size="xs" fw={500} mt="xs" mb={2}>
-					Input
+					{t("input")}
 				</Text>
 				<Code block style={{ fontSize: 11, maxHeight: 200, overflow: "auto" }}>
 					{JSON.stringify(toolCall.inputJson, null, 2)}
@@ -52,7 +54,7 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
 				{toolCall.outputJson && (
 					<>
 						<Text size="xs" fw={500} mt="xs" mb={2}>
-							Output
+							{t("output")}
 						</Text>
 						<Code block style={{ fontSize: 11, maxHeight: 200, overflow: "auto" }}>
 							{typeof toolCall.outputJson === "string"

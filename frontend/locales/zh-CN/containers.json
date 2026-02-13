@@ -1,0 +1,12 @@
+{
+	"title": "容器",
+	"start": "启动",
+	"stop": "停止",
+	"pause": "暂停",
+	"resume": "恢复",
+	"allServices": "所有服务",
+	"lines50": "50 行",
+	"lines100": "100 行",
+	"lines500": "500 行",
+	"noLogs": "暂无日志。"
+}

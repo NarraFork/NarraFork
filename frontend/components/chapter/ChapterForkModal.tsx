@@ -1,6 +1,7 @@
 import { Alert, Button, Modal, Select, Stack, Text, Textarea, TextInput } from "@mantine/core";
-import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
 interface ChapterForkModalProps {
@@ -10,12 +11,19 @@ interface ChapterForkModalProps {
 	forkAtMessageUuid?: string;
 }
 
-export function ChapterForkModal({ chapterId, opened, onClose, forkAtMessageUuid }: ChapterForkModalProps) {
+export function ChapterForkModal({
+	chapterId,
+	opened,
+	onClose,
+	forkAtMessageUuid,
+}: ChapterForkModalProps) {
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [type, setType] = useState<string>("meanwhile");
 	const [inheritMode, setInheritMode] = useState<string>("fresh");
 	const qc = useQueryClient();
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 
 	// When forking from a specific message, default to full inheritance
 	useEffect(() => {
@@ -37,13 +45,14 @@ export function ChapterForkModal({ chapterId, opened, onClose, forkAtMessageUuid
 	};
 
 	const fork = useMutation({
-		mutationFn: () => api.forkChapter(chapterId, {
-			title: title.trim(),
-			description: description.trim() || undefined,
-			type,
-			inheritMode,
-			forkAtMessageUuid,
-		}),
+		mutationFn: () =>
+			api.forkChapter(chapterId, {
+				title: title.trim(),
+				description: description.trim() || undefined,
+				type,
+				inheritMode,
+				forkAtMessageUuid,
+			}),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
@@ -52,52 +61,54 @@ export function ChapterForkModal({ chapterId, opened, onClose, forkAtMessageUuid
 	});
 
 	return (
-		<Modal opened={opened} onClose={handleClose} title="Fork Chapter">
+		<Modal opened={opened} onClose={handleClose} title={t("forkChapter")}>
 			<Stack>
 				{forkAtMessageUuid && (
 					<Alert color="blue" variant="light">
-						Forking from a specific message point. The new narrator will inherit conversation history up to this message.
+						{t("forkAtMessageAlert")}
 					</Alert>
 				)}
 				<TextInput
-					label="Title"
-					placeholder="New branch title"
+					label={tc("title")}
+					placeholder={t("forkTitlePlaceholder")}
 					value={title}
 					onChange={(e) => setTitle(e.currentTarget.value)}
 					required
 				/>
 				<Textarea
-					label="Description"
-					placeholder="What this fork is about..."
+					label={tc("description")}
+					placeholder={t("forkDescriptionPlaceholder")}
 					value={description}
 					onChange={(e) => setDescription(e.currentTarget.value)}
 				/>
 				<Select
-					label="Type"
+					label={tc("type")}
 					data={[
-						{ value: "meanwhile", label: "Meanwhile (parallel work)" },
-						{ value: "whatif", label: "WhatIf (exploration)" },
+						{ value: "meanwhile", label: t("typeMeanwhile") },
+						{ value: "whatif", label: t("typeWhatif") },
 					]}
 					value={type}
 					onChange={(v) => setType(v ?? "meanwhile")}
 				/>
 				<Select
-					label="Context Inheritance"
+					label={t("contextInheritance")}
 					data={[
-						{ value: "fresh", label: "Fresh (no context)" },
-						{ value: "compressed", label: "Compressed (summary)" },
-						{ value: "full", label: "Full (complete history)" },
+						{ value: "fresh", label: t("inheritFresh") },
+						{ value: "compressed", label: t("inheritCompressed") },
+						{ value: "full", label: t("inheritFull") },
 					]}
 					value={inheritMode}
 					onChange={(v) => setInheritMode(v ?? "fresh")}
 				/>
 				{fork.isError && (
-					<Alert color="red" title="Fork failed">
-						<Text size="sm">{fork.error instanceof Error ? fork.error.message : "Unknown error"}</Text>
+					<Alert color="red" title={t("forkFailed")}>
+						<Text size="sm">
+							{fork.error instanceof Error ? fork.error.message : tc("unknownError")}
+						</Text>
 					</Alert>
 				)}
 				<Button onClick={() => fork.mutate()} loading={fork.isPending} disabled={!title.trim()}>
-					Fork
+					{t("fork")}
 				</Button>
 			</Stack>
 		</Modal>

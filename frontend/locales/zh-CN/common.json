@@ -1,0 +1,18 @@
+{
+	"create": "创建",
+	"save": "保存",
+	"delete": "删除",
+	"send": "发送",
+	"refresh": "刷新",
+	"allow": "允许",
+	"deny": "拒绝",
+	"unknownError": "未知错误",
+	"title": "标题",
+	"description": "描述",
+	"type": "类型",
+	"strategy": "策略",
+	"branch": "分支：",
+	"base": "基线：",
+	"input": "输入",
+	"output": "输出"
+}

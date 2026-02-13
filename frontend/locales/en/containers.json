@@ -1,0 +1,12 @@
+{
+	"title": "Containers",
+	"start": "Start",
+	"stop": "Stop",
+	"pause": "Pause",
+	"resume": "Resume",
+	"allServices": "All services",
+	"lines50": "50 lines",
+	"lines100": "100 lines",
+	"lines500": "500 lines",
+	"noLogs": "No logs available."
+}

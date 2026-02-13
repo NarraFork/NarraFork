@@ -1,13 +1,8 @@
 import { Loader, Text } from "@mantine/core";
-import {
-	Background,
-	Controls,
-	ReactFlow,
-	type EdgeTypes,
-	type NodeTypes,
-} from "@xyflow/react";
+import { Background, Controls, type EdgeTypes, type NodeTypes, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { useStoryGraph } from "../../hooks/useStoryGraph";
 import { ChapterNode } from "./ChapterNode";
 import { ForkEdge } from "./ForkEdge";
@@ -28,6 +23,7 @@ interface StoryNetworkProps {
 
 export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	const { nodes, edges, isLoading, error } = useStoryGraph(projectId);
+	const { t } = useTranslation("graph");
 
 	const defaultEdgeOptions = useMemo(
 		() => ({
@@ -37,8 +33,8 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	);
 
 	if (isLoading) return <Loader />;
-	if (error) return <Text c="red">Failed to load graph: {error.message}</Text>;
-	if (nodes.length === 0) return <Text c="dimmed">No chapters yet.</Text>;
+	if (error) return <Text c="red">{t("loadFailed", { message: error.message })}</Text>;
+	if (nodes.length === 0) return <Text c="dimmed">{t("noChapters")}</Text>;
 
 	return (
 		<div style={{ width: "100%", height: "100%" }}>

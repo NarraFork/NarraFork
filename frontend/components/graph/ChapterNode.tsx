@@ -1,6 +1,7 @@
 import { Badge, Card, Group, Text } from "@mantine/core";
-import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useNavigate } from "@tanstack/react-router";
+import { Handle, type NodeProps, Position } from "@xyflow/react";
+import { useTranslation } from "react-i18next";
 import { CHAPTER_STATUS_COLORS, CHAPTER_TYPE_ICONS } from "../../lib/constants";
 
 interface ChapterNodeData {
@@ -16,6 +17,7 @@ interface ChapterNodeData {
 export function ChapterNode({ data, id }: NodeProps) {
 	const d = data as ChapterNodeData;
 	const navigate = useNavigate();
+	const { t } = useTranslation("graph");
 
 	return (
 		<>
@@ -51,11 +53,11 @@ export function ChapterNode({ data, id }: NodeProps) {
 				</Text>
 				<Group gap={8} mt={4}>
 					<Text size="xs" c="dimmed">
-						{d.narratorCount} narrator{d.narratorCount !== 1 ? "s" : ""}
+						{t("narratorCount", { count: d.narratorCount })}
 					</Text>
 					{d.hasContainers && (
 						<Badge size="xs" variant="dot" color="teal">
-							containers
+							{t("containers")}
 						</Badge>
 					)}
 				</Group>

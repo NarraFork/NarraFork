@@ -12,6 +12,7 @@ import {
 } from "@mantine/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useNarratorMessages } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { MessageBubble } from "./MessageBubble";
@@ -40,6 +41,8 @@ export function NarratorPanel({ narratorId, narrator, onForkFromMessage }: Narra
 	const [streamingText, setStreamingText] = useState("");
 	const [pendingPermission, setPendingPermission] = useState<any>(null);
 	const viewportRef = useRef<HTMLDivElement>(null);
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 
 	// Auto-scroll to bottom when messages change
 	const scrollToBottom = useCallback(() => {
@@ -153,7 +156,7 @@ export function NarratorPanel({ narratorId, narrator, onForkFromMessage }: Narra
 					</Text>
 					{connected && (
 						<Badge size="xs" variant="dot" color="green">
-							live
+							{t("live")}
 						</Badge>
 					)}
 				</Group>
@@ -170,7 +173,7 @@ export function NarratorPanel({ narratorId, narrator, onForkFromMessage }: Narra
 							color="red"
 							onClick={() => interruptMutation.mutate(narratorId)}
 						>
-							Interrupt
+							{t("interrupt")}
 						</Button>
 					)}
 				</Group>
@@ -214,7 +217,7 @@ export function NarratorPanel({ narratorId, narrator, onForkFromMessage }: Narra
 			>
 				<Textarea
 					flex={1}
-					placeholder="Send a message..."
+					placeholder={t("sendPlaceholder")}
 					value={input}
 					onChange={(e) => setInput(e.currentTarget.value)}
 					onKeyDown={handleKeyDown}
@@ -224,7 +227,7 @@ export function NarratorPanel({ narratorId, narrator, onForkFromMessage }: Narra
 					disabled={sending}
 				/>
 				<Button onClick={handleSend} loading={sending} disabled={!input.trim()}>
-					Send
+					{tc("send")}
 				</Button>
 			</Group>
 		</Stack>

@@ -1,7 +1,20 @@
-import { Badge, Box, Button, Code, Collapse, Group, Loader, Paper, Stack, Text, Title } from "@mantine/core";
+import {
+	Badge,
+	Box,
+	Button,
+	Code,
+	Collapse,
+	Group,
+	Loader,
+	Paper,
+	Stack,
+	Text,
+	Title,
+} from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { ChapterMergeModal } from "../../components/chapter/ChapterMergeModal";
 import { ContainerLogs } from "../../components/container/ContainerLogs";
@@ -32,11 +45,16 @@ function ChapterDetailPage() {
 	const [mergeOpened, { open: openMerge, close: closeMerge }] = useDisclosure(false);
 	const [containersOpen, { toggle: toggleContainers }] = useDisclosure(false);
 	const [forkAtMessageUuid, setForkAtMessageUuid] = useState<string | undefined>();
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 
-	const handleForkFromMessage = useCallback((sdkMessageUuid: string) => {
-		setForkAtMessageUuid(sdkMessageUuid);
-		openFork();
-	}, [openFork]);
+	const handleForkFromMessage = useCallback(
+		(sdkMessageUuid: string) => {
+			setForkAtMessageUuid(sdkMessageUuid);
+			openFork();
+		},
+		[openFork],
+	);
 
 	const handleForkClose = useCallback(() => {
 		setForkAtMessageUuid(undefined);
@@ -70,7 +88,7 @@ function ChapterDetailPage() {
 	}, []);
 
 	if (isLoading) return <Loader />;
-	if (!chapter) return <Text>Chapter not found</Text>;
+	if (!chapter) return <Text>{t("chapterNotFound")}</Text>;
 
 	const primaryNarrator = narratorList?.find((n: any) => n.type === "primary");
 
@@ -91,13 +109,13 @@ function ChapterDetailPage() {
 					{chapter.status === "active" && (
 						<Group gap="xs">
 							<Button size="xs" variant="light" onClick={openFork}>
-								Fork
+								{t("fork")}
 							</Button>
 							<Button size="xs" variant="light" color="green" onClick={openMerge}>
-								Merge
+								{t("merge")}
 							</Button>
 							<Button size="xs" variant="light" color="gray" onClick={toggleContainers}>
-								Containers
+								{t("containers")}
 							</Button>
 						</Group>
 					)}
@@ -109,13 +127,13 @@ function ChapterDetailPage() {
 					<Group gap="lg">
 						<Group gap={4}>
 							<Text size="xs" fw={500}>
-								Branch:
+								{tc("branch")}
 							</Text>
 							<Code style={{ fontSize: 11 }}>{chapter.branch}</Code>
 						</Group>
 						<Group gap={4}>
 							<Text size="xs" fw={500}>
-								Base:
+								{tc("base")}
 							</Text>
 							<Code style={{ fontSize: 11 }}>{chapter.baseBranch}</Code>
 						</Group>
@@ -143,9 +161,9 @@ function ChapterDetailPage() {
 				) : (
 					<Paper withBorder p="xl" h="100%">
 						<Stack align="center" justify="center" h="100%">
-							<Text c="dimmed">No narrator yet for this chapter.</Text>
+							<Text c="dimmed">{t("noNarrator")}</Text>
 							<Button onClick={() => createNarrator.mutate({})} loading={createNarrator.isPending}>
-								Start Narrator
+								{t("startNarrator")}
 							</Button>
 						</Stack>
 					</Paper>

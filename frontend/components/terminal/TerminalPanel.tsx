@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { useTerminalWS } from "../../hooks/useTerminalWS";
 
 interface TerminalPanelProps {
@@ -13,16 +14,17 @@ export function TerminalPanel({ terminalId }: TerminalPanelProps) {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const termRef = useRef<Terminal | null>(null);
 	const fitAddonRef = useRef<FitAddon | null>(null);
+	const { t } = useTranslation("terminal");
 
 	const { write, resize } = useTerminalWS(terminalId, {
 		onOutput: (data) => {
 			termRef.current?.write(data);
 		},
 		onExit: (code) => {
-			termRef.current?.write(`\r\n[Process exited with code ${code}]\r\n`);
+			termRef.current?.write(`\r\n${t("processExited", { code })}\r\n`);
 		},
 		onError: (message) => {
-			termRef.current?.write(`\r\n[Error: ${message}]\r\n`);
+			termRef.current?.write(`\r\n${t("error", { message })}\r\n`);
 		},
 	});
 

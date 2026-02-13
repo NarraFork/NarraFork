@@ -1,0 +1,11 @@
+{
+	"title": "Standalone Sessions",
+	"newSession": "New Session",
+	"noSessions": "No standalone sessions. Create one to start a conversation without a chapter.",
+	"sessionId": "Session {{id}}",
+	"sessionMeta": "{{model}} \u00b7 {{count}} messages",
+	"newSessionModal": "New Standalone Session",
+	"newSessionDescription": "Create a standalone AI session not bound to any chapter. Useful for general questions and explorations.",
+	"createSession": "Create Session",
+	"sessionNotFound": "Session not found"
+}

@@ -1,4 +1,5 @@
 import { ActionIcon, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
+import { useTranslation } from "react-i18next";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
@@ -16,6 +17,8 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("chapters");
 
 	return (
 		<Paper
@@ -28,10 +31,10 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 			<Stack gap={4}>
 				<Group justify="space-between">
 					<Text size="xs" fw={600} c="dimmed">
-						{isUser ? "You" : "Narrator"}
+						{isUser ? t("you") : t("narrator")}
 					</Text>
 					{canFork && (
-						<Tooltip label="Fork from this message">
+						<Tooltip label={tc("forkFromMessage")}>
 							<ActionIcon
 								size="xs"
 								variant="subtle"
@@ -56,7 +59,7 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 						return (
 							<Paper key={key} p="xs" bg="yellow.0" radius="sm">
 								<Text size="xs" c="dimmed" fw={500} mb={2}>
-									Thinking
+									{t("thinking")}
 								</Text>
 								<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
 									{block.thinking}

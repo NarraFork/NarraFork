@@ -1,6 +1,7 @@
 import { Alert, Button, Loader, Modal, Select, Stack, Text, TextInput } from "@mantine/core";
-import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
 interface ChapterMergeModalProps {
@@ -10,12 +11,19 @@ interface ChapterMergeModalProps {
 	onClose: () => void;
 }
 
-export function ChapterMergeModal({ chapterId, projectId, opened, onClose }: ChapterMergeModalProps) {
+export function ChapterMergeModal({
+	chapterId,
+	projectId,
+	opened,
+	onClose,
+}: ChapterMergeModalProps) {
 	const [targetId, setTargetId] = useState<string | null>(null);
 	const [strategy, setStrategy] = useState<string>("merge");
 	const [message, setMessage] = useState("");
 	const [conflicts, setConflicts] = useState<any>(null);
 	const qc = useQueryClient();
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 
 	const resetState = () => {
 		setTargetId(null);
@@ -64,65 +72,75 @@ export function ChapterMergeModal({ chapterId, projectId, opened, onClose }: Cha
 	};
 
 	return (
-		<Modal opened={opened} onClose={handleClose} title="Merge Chapter">
+		<Modal opened={opened} onClose={handleClose} title={t("mergeChapter")}>
 			<Stack>
 				<Select
-					label="Merge into"
-					placeholder="Select target chapter"
+					label={t("mergeInto")}
+					placeholder={t("selectTarget")}
 					data={targetOptions}
 					value={targetId}
 					onChange={setTargetId}
 					searchable
 				/>
 				<Select
-					label="Strategy"
+					label={tc("strategy")}
 					data={[
-						{ value: "merge", label: "Merge (preserve history)" },
-						{ value: "squash", label: "Squash (single commit)" },
-						{ value: "cherry-pick", label: "Cherry-pick (individual commits)" },
+						{ value: "merge", label: t("strategyMerge") },
+						{ value: "squash", label: t("strategySquash") },
+						{ value: "cherry-pick", label: t("strategyCherryPick") },
 					]}
 					value={strategy}
 					onChange={(v) => setStrategy(v ?? "merge")}
 				/>
 				<TextInput
-					label="Merge message (optional)"
-					placeholder="Describe the merge..."
+					label={t("mergeMessage")}
+					placeholder={t("mergeMessagePlaceholder")}
 					value={message}
 					onChange={(e) => setMessage(e.currentTarget.value)}
 				/>
 
 				{conflicts && conflicts.hasConflicts && (
-					<Alert color="yellow" title="Conflicts detected">
+					<Alert color="yellow" title={t("conflictsDetected")}>
 						<Text size="sm">
-							{conflicts.conflictFiles?.length ?? 0} file(s) have conflicts.
-							You may proceed, and the AI narrator can help resolve them.
+							{t("conflictsDescription", { count: conflicts.conflictFiles?.length ?? 0 })}
 						</Text>
 					</Alert>
 				)}
 
 				{conflicts && !conflicts.hasConflicts && (
-					<Alert color="green" title="No conflicts">
-						<Text size="sm">Merge can proceed cleanly.</Text>
+					<Alert color="green" title={t("noConflicts")}>
+						<Text size="sm">{t("mergeClean")}</Text>
 					</Alert>
 				)}
 
 				{checkConflicts.isError && (
-					<Alert color="red" title="Conflict check failed">
-						<Text size="sm">{checkConflicts.error instanceof Error ? checkConflicts.error.message : "Unknown error"}</Text>
+					<Alert color="red" title={t("conflictCheckFailed")}>
+						<Text size="sm">
+							{checkConflicts.error instanceof Error
+								? checkConflicts.error.message
+								: tc("unknownError")}
+						</Text>
 					</Alert>
 				)}
 
 				{merge.isError && (
-					<Alert color="red" title="Merge failed">
-						<Text size="sm">{merge.error instanceof Error ? merge.error.message : "Unknown error"}</Text>
+					<Alert color="red" title={t("mergeFailed")}>
+						<Text size="sm">
+							{merge.error instanceof Error ? merge.error.message : tc("unknownError")}
+						</Text>
 					</Alert>
 				)}
 
-				<Button variant="light" onClick={handleCheck} loading={checkConflicts.isPending} disabled={!targetId}>
-					Check Conflicts
+				<Button
+					variant="light"
+					onClick={handleCheck}
+					loading={checkConflicts.isPending}
+					disabled={!targetId}
+				>
+					{t("checkConflicts")}
 				</Button>
 				<Button onClick={() => merge.mutate()} loading={merge.isPending} disabled={!targetId}>
-					Merge
+					{t("merge")}
 				</Button>
 			</Stack>
 		</Modal>

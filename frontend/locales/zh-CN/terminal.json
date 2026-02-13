@@ -1,0 +1,6 @@
+{
+	"noTerminals": "无终端",
+	"newTerminal": "新建终端",
+	"processExited": "[进程已退出，退出码 {{code}}]",
+	"error": "[错误：{{message}}]"
+}
