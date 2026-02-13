@@ -83,7 +83,7 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 ```
 projects ──1:N──> repositories
 projects ──1:N──> chapters
-chapters ──1:N──> narrators
+chapters ──1:N──> narrators (chapterId nullable: null = 游离会话)
 chapters ──self── chapters (parentChapterId)
 chapters ──1:N──> container_instances
 chapters ──1:N──> port_allocations
@@ -128,7 +128,7 @@ export const repositories = sqliteTable('repositories', {
   defaultBranch: text('default_branch').default('main'),
   isPrimary: integer('is_primary', { mode: 'boolean' }).default(false),
   startupScript: text('startup_script'),           // chapter 创建后执行的脚本
-  copyFiles: text('copy_files'),                   // glob 模式，逗号分隔
+  copyFiles: text('copy_files'),                   // JSON 数组，如 ["*.env", ".vscode/"]
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -190,7 +190,7 @@ export const chapters = sqliteTable('chapters', {
 ```typescript
 export const narrators = sqliteTable('narrators', {
   id: text('id').primaryKey(),
-  chapterId: text('chapter_id').notNull()
+  chapterId: text('chapter_id')              // null = 游离会话（standalone session）
     .references(() => chapters.id),
 
   // Claude Agent SDK session 管理
@@ -373,7 +373,7 @@ export const users = sqliteTable('users', {
 })
 ```
 
-#### FTS5 全文搜索虚拟表（Phase 5 待实现）
+#### FTS5 全文搜索虚拟表
 
 ```sql
 -- 章节搜索
@@ -463,7 +463,7 @@ server/
 > - 权限审批逻辑整合到 `narrator-session.ts`（与 session 生命周期紧密耦合），不再有独立的 `narrator-permission.ts`
 > - 终端 PTY 管理整合到 `terminal-service.ts`（dtach 模式不需要独立 PTY 管理器），不再有独立的 `terminal/` 目录
 > - 事件通知由 `event-bus.ts` + `narrator-ws.ts` 组合实现，不再有独立的 `notification-service.ts`
-> - `graph.ts`、`search.ts`、`mcp.ts` 路由属于 Phase 5 待实现
+> - `graph.ts`、`search.ts`、`sessions.ts`、`mcp.ts` 路由已在 Phase 5 实现
 ### 4.2 核心服务设计
 
 #### 4.2.1 chapter-fork.ts — 分叉服务
@@ -586,7 +586,7 @@ server/
 
 核心功能：
 - `run()` — 启动批量合并会话，创建临时 fork 作为合并目标，按队列顺序合并
-- `processQueue()` — 逐个处理合并队列，冲突时通过 eventBus 广播 `merge:conflict`，等待用户决策（resolve/skip/cancel）
+- `processQueue()` — 逐个处理合并队列，冲突时通过 eventBus 广播 `merge:conflict`，等待用户决策（continue/cancel）
 - `rollback()` — 合并失败时删除临时 fork chapter
 
 关键设计：
@@ -678,17 +678,17 @@ GET    /api/settings                               # 获取配置
 PATCH  /api/settings                               # 更新配置（深度合并）
 ```
 
-#### Story Network Graph（Phase 5 待实现）
+#### Story Network Graph
 ```
 GET    /api/projects/:id/graph                     # 故事网络图数据
 ```
 
-#### Search（Phase 5 待实现）
+#### Search
 ```
 GET    /api/search?q=&entities=chapters,messages    # 全文搜索
 ```
 
-#### Standalone Sessions（游离会话，Phase 5 待实现）
+#### Standalone Sessions（游离会话）
 ```
 POST   /api/sessions                               # 创建游离会话
 GET    /api/sessions                               # 列表
@@ -719,7 +719,7 @@ type NarratorWSCommand =
   | { type: 'subscribe'; narratorIds: string[] }
   | { type: 'unsubscribe'; narratorIds: string[] }
   | { type: 'permission_decision'; requestId: string; decision: 'allow' | 'deny'; message?: string }
-  | { type: 'merge_decision'; mergeSessionId: string; action: 'resolve' | 'skip' | 'cancel' }
+  | { type: 'merge_decision'; mergeSessionId: string; decision: 'continue' | 'cancel' }
 ```
 
 ### 5.3 MCP 工具（暴露给 Agent）
@@ -752,36 +752,36 @@ frontend/
     projects/
       index.tsx               # 项目列表
       $projectId.tsx          # 项目详情
-      $projectId.graph.tsx    # 故事网络图                    [Phase 5]
+      $projectId.graph.tsx    # 故事网络图
     chapters/
       $chapterId.tsx          # Chapter 详情（Narrator + Terminal）
     sessions/
-      index.tsx               # 游离会话列表                  [Phase 5]
-      $sessionId.tsx          # 游离会话详情                  [Phase 5]
+      index.tsx               # 游离会话列表
+      $sessionId.tsx          # 游离会话详情
     settings/
       index.tsx               # 设置页
   components/
     chapter/
       ChapterCard.tsx         # Chapter 卡片
-      ChapterForkModal.tsx    # 分叉对话框                    [Phase 5]
-      ChapterMergeModal.tsx   # 合并对话框                    [Phase 5]
-      ChapterCleanupModal.tsx # 批量清理对话框                [Phase 5]
+      ChapterForkModal.tsx    # 分叉对话框
+      ChapterMergeModal.tsx   # 合并对话框
+      ChapterCleanupModal.tsx # 批量清理对话框
     narrator/
       NarratorPanel.tsx       # Narrator 面板（消息列表 + 输入）
       MessageBubble.tsx       # 消息气泡
       ToolCallCard.tsx        # Tool Call 展示卡片
       PermissionBanner.tsx    # 权限审批横幅
     graph/
-      StoryNetwork.tsx        # React Flow 故事网络            [Phase 5]
-      ChapterNode.tsx         # 自定义节点（Mantine Card）    [Phase 5]
-      ForkEdge.tsx            # 分叉边                        [Phase 5]
-      MergeEdge.tsx           # 合并边                        [Phase 5]
+      StoryNetwork.tsx        # React Flow 故事网络
+      ChapterNode.tsx         # 自定义节点（Mantine Card）
+      ForkEdge.tsx            # 分叉边
+      MergeEdge.tsx           # 合并边
     terminal/
       TerminalPanel.tsx       # 终端面板
       TerminalTabs.tsx        # 终端标签页
     container/
-      ContainerStatus.tsx     # 容器状态指示器                [Phase 5]
-      ContainerLogs.tsx       # 容器日志查看器                [Phase 5]
+      ContainerStatus.tsx     # 容器状态指示器
+      ContainerLogs.tsx       # 容器日志查看器
     ui/                       # Mantine 扩展组件
   hooks/
     useProjects.ts            # Project CRUD hooks
@@ -790,9 +790,9 @@ frontend/
     useNarratorWS.ts          # Narrator WebSocket 连接
     useTerminals.ts           # Terminal CRUD hooks
     useTerminalWS.ts          # Terminal WebSocket 连接
-    useStoryGraph.ts          # 故事网络数据 + 布局           [Phase 5]
-    useContainers.ts          # 容器管理 hooks                [Phase 5]
-    usePermissions.ts         # 权限审批 hooks                [Phase 5]
+    useStoryGraph.ts          # 故事网络数据 + 布局
+    useContainers.ts          # 容器管理 hooks
+    usePermissions.ts         # 权限审批 hooks
   lib/
     api.ts                    # API 客户端（含 auth token 管理）
     i18n.ts                   # i18next 初始化（语言检测 + locale 导入）
@@ -962,16 +962,16 @@ interface NarraForkSettings {
 ### Phase 4: 容器与资源 ✅
 - Podman 容器生命周期
 - 端口自动分配（并发安全）
-- 不活跃 chapter 自动休眠（调度机制待定）
+- 不活跃 chapter 自动休眠（防抖调度，chapter 创建/访问时触发）
 - 批量清理
 - JWT 认证 + 用户管理 + admin 面板
 
-### Phase 5: 可视化与体验
+### Phase 5: 可视化与体验 ✅
 - React Flow 故事网络
-- 游离会话 + 附加到 Narrator
-- 会话回溯分叉 UI
-- MCP 工具暴露给 Agent
-- 全文搜索（FTS5）
+- 游离会话（standalone sessions，narrator.chapterId = null）
+- 会话回溯分叉 UI（ChapterForkModal + forkAtMessageUuid）
+- MCP 工具暴露给 Agent（8 个工具）
+- 全文搜索（FTS5 + 同步触发器）
 - 容器状态 / 日志前端组件
 
 ---

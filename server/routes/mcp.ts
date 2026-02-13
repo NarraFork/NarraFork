@@ -5,6 +5,7 @@ import { z } from "zod";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
+import { narratorContext } from "../services/narrator-context";
 import { narratorService } from "../services/narrator-service";
 
 function createMcpServer(): McpServer {
@@ -210,23 +211,18 @@ function createMcpServer(): McpServer {
 
 	server.tool(
 		"narrafork_get_context_summary",
-		"Get a context summary of a narrator's recent conversation",
+		"Get an AI-generated context summary of a narrator's recent conversation",
 		{ narratorId: z.string().describe("Narrator ID to get context from") },
 		async ({ narratorId }) => {
 			try {
 				const narrator = await narratorService.getById(narratorId);
-				const messages = await narratorService.getMessages(narratorId, 20);
-				const summary = messages
-					.filter((m) => m.role === "assistant" && m.contentText)
-					.map((m) => m.contentText)
-					.join("\n---\n")
-					.slice(0, 5000);
+				const summary = await narratorContext.generateContextSummary(narratorId);
 
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Narrator: ${narrator.type} (${narrator.model})\nStatus: ${narrator.status}\nMessages: ${narrator.messageCount}\n\nRecent context:\n${summary}`,
+							text: `Narrator: ${narrator.type} (${narrator.model})\nStatus: ${narrator.status}\nMessages: ${narrator.messageCount}\n\nContext summary:\n${summary}`,
 						},
 					],
 				};

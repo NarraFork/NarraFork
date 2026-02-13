@@ -155,7 +155,7 @@ export const permissionRequests = sqliteTable(
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id),
-		toolCallId: text("tool_call_id"),
+		toolCallId: text("tool_call_id").references(() => narratorToolCalls.id),
 		toolName: text("tool_name").notNull(),
 		inputJson: text("input_json", { mode: "json" }),
 		decisionReason: text("decision_reason"),
