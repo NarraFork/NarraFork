@@ -1,5 +1,5 @@
-import { Box, Group, Loader, Text, Title } from "@mantine/core";
-import { createFileRoute } from "@tanstack/react-router";
+import { Box, Loader, Text } from "@mantine/core";
+import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { useSession } from "../../hooks/useSessions";
@@ -10,6 +10,8 @@ export const Route = createFileRoute("/sessions/$sessionId")({
 
 function SessionDetailPage() {
 	const { sessionId } = Route.useParams();
+	const location = useLocation();
+	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const { data: session, isLoading } = useSession(sessionId);
 	const { t } = useTranslation("sessions");
 
@@ -17,15 +19,13 @@ function SessionDetailPage() {
 	if (!session) return <Text>{t("sessionNotFound")}</Text>;
 
 	return (
-		<Box h="calc(100vh - 100px)" style={{ display: "flex", flexDirection: "column" }}>
-			<Group p="xs">
-				<Title order={3}>{t("sessionId", { id: session.id.slice(0, 8) })}</Title>
-				<Text size="sm" c="dimmed">
-					{t("sessionMeta", { model: session.model, count: session.messageCount ?? 0 })}
-				</Text>
-			</Group>
+		<Box h="calc(100dvh - 92px)" style={{ display: "flex", flexDirection: "column" }}>
 			<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-				<NarratorPanel narratorId={sessionId} narrator={session} />
+				<NarratorPanel
+					narratorId={sessionId}
+					narrator={session}
+					highlightMessageId={highlightMessageId}
+				/>
 			</Box>
 		</Box>
 	);

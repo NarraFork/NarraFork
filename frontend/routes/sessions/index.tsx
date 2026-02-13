@@ -49,7 +49,9 @@ function SessionsPage() {
 							<Card shadow="sm" padding="md" withBorder>
 								<Group justify="space-between">
 									<div>
-										<Text fw={500}>{t("sessionId", { id: session.id.slice(0, 8) })}</Text>
+										<Text fw={500}>
+											{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
+										</Text>
 										<Text size="sm" c="dimmed">
 											{t("sessionMeta", {
 												model: session.model,

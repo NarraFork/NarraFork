@@ -12,7 +12,8 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { createFileRoute } from "@tanstack/react-router";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
@@ -23,6 +24,7 @@ import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { TerminalTabs } from "../../components/terminal/TerminalTabs";
 import { useChapter } from "../../hooks/useChapters";
 import { useCreateNarrator, useNarrators } from "../../hooks/useNarrator";
+import { api } from "../../lib/api";
 import { CHAPTER_STATUS_COLORS } from "../../lib/constants";
 
 export const Route = createFileRoute("/chapters/$chapterId")({
@@ -34,6 +36,8 @@ const DEFAULT_TERMINAL_HEIGHT = 300;
 
 function ChapterDetailPage() {
 	const { chapterId } = Route.useParams();
+	const location = useLocation();
+	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const { data: chapter, isLoading } = useChapter(chapterId);
 	const { data: narratorList, isLoading: narratorsLoading } = useNarrators(chapterId);
 	const createNarrator = useCreateNarrator(chapterId);
@@ -47,6 +51,17 @@ function ChapterDetailPage() {
 	const [forkAtMessageUuid, setForkAtMessageUuid] = useState<string | undefined>();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
+	const qc = useQueryClient();
+
+	const dormantChapter = useMutation({
+		mutationFn: () => api.dormantChapter(chapterId),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["chapters", chapterId] }),
+	});
+
+	const wakeChapter = useMutation({
+		mutationFn: () => api.wakeChapter(chapterId),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["chapters", chapterId] }),
+	});
 
 	const handleForkFromMessage = useCallback(
 		(sdkMessageUuid: string) => {
@@ -95,7 +110,7 @@ function ChapterDetailPage() {
 	return (
 		<Box
 			ref={containerRef}
-			h="calc(100vh - 80px)"
+			h="calc(100dvh - 92px)"
 			style={{ display: "flex", flexDirection: "column" }}
 		>
 			{/* Chapter info header */}
@@ -106,19 +121,41 @@ function ChapterDetailPage() {
 						<Badge color={chapter.type === "meanwhile" ? "indigo" : "orange"}>{chapter.type}</Badge>
 						<Badge color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>{chapter.status}</Badge>
 					</Group>
-					{chapter.status === "active" && (
-						<Group gap="xs">
-							<Button size="xs" variant="light" onClick={openFork}>
-								{t("fork")}
+					<Group gap="xs">
+						{chapter.status === "active" && (
+							<>
+								<Button size="xs" variant="light" onClick={openFork}>
+									{t("fork")}
+								</Button>
+								<Button size="xs" variant="light" color="green" onClick={openMerge}>
+									{t("merge")}
+								</Button>
+								<Button size="xs" variant="light" color="gray" onClick={toggleContainers}>
+									{t("containers")}
+								</Button>
+								<Button
+									size="xs"
+									variant="light"
+									color="yellow"
+									onClick={() => dormantChapter.mutate()}
+									loading={dormantChapter.isPending}
+								>
+									{t("dormant")}
+								</Button>
+							</>
+						)}
+						{chapter.status === "dormant" && (
+							<Button
+								size="xs"
+								variant="light"
+								color="green"
+								onClick={() => wakeChapter.mutate()}
+								loading={wakeChapter.isPending}
+							>
+								{t("wake")}
 							</Button>
-							<Button size="xs" variant="light" color="green" onClick={openMerge}>
-								{t("merge")}
-							</Button>
-							<Button size="xs" variant="light" color="gray" onClick={toggleContainers}>
-								{t("containers")}
-							</Button>
-						</Group>
-					)}
+						)}
+					</Group>
 				</Group>
 
 				{chapter.description && <Text c="dimmed">{chapter.description}</Text>}
@@ -157,6 +194,7 @@ function ChapterDetailPage() {
 						narratorId={primaryNarrator.id}
 						narrator={primaryNarrator}
 						onForkFromMessage={handleForkFromMessage}
+						highlightMessageId={highlightMessageId}
 					/>
 				) : (
 					<Paper withBorder p="xl" h="100%">

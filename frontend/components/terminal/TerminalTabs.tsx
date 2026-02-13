@@ -1,4 +1,5 @@
 import { ActionIcon, Group, Tabs, Text, Tooltip } from "@mantine/core";
+import { IconPlus, IconX } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "../../hooks/useTerminals";
@@ -48,7 +49,7 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 				</Text>
 				<Tooltip label={t("newTerminal")}>
 					<ActionIcon variant="light" onClick={handleCreate} loading={createTerminal.isPending}>
-						+
+						<IconPlus size={16} />
 					</ActionIcon>
 				</Tooltip>
 			</Group>
@@ -69,7 +70,7 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 							value={t.id}
 							rightSection={
 								<ActionIcon size="xs" variant="subtle" onClick={(e) => handleClose(e, t.id)}>
-									×
+									<IconX size={12} />
 								</ActionIcon>
 							}
 						>
@@ -84,7 +85,7 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 						loading={createTerminal.isPending}
 						ml={4}
 					>
-						+
+						<IconPlus size={16} />
 					</ActionIcon>
 				</Tooltip>
 			</Group>

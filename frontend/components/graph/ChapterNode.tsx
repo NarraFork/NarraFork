@@ -1,8 +1,14 @@
 import { Badge, Card, Group, Text } from "@mantine/core";
+import { IconGitBranch, IconQuestionMark } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
-import { CHAPTER_STATUS_COLORS, CHAPTER_TYPE_ICONS } from "../../lib/constants";
+import { CHAPTER_STATUS_COLORS } from "../../lib/constants";
+
+const CHAPTER_TYPE_ICON: Record<string, React.ReactNode> = {
+	meanwhile: <IconGitBranch size={14} />,
+	whatif: <IconQuestionMark size={14} />,
+};
 
 interface ChapterNodeData {
 	title: string;
@@ -38,7 +44,7 @@ export function ChapterNode({ data, id }: NodeProps) {
 				<Group justify="space-between" mb={4}>
 					<Group gap={6}>
 						<Text size="xs" c="dimmed" fw={700}>
-							{CHAPTER_TYPE_ICONS[d.chapterType] ?? ""}
+							{CHAPTER_TYPE_ICON[d.chapterType] ?? null}
 						</Text>
 						<Text size="sm" fw={600} lineClamp={1} style={{ maxWidth: 180 }}>
 							{d.title}

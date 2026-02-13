@@ -12,7 +12,7 @@ interface PermissionBannerProps {
 }
 
 export function PermissionBanner({ request, onDecision }: PermissionBannerProps) {
-	const inputPreview = JSON.stringify(request.inputJson, null, 2);
+	const inputPreview = JSON.stringify(request.inputJson ?? {}, null, 2) ?? "";
 	const truncated = inputPreview.length > 300 ? `${inputPreview.slice(0, 300)}...` : inputPreview;
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
