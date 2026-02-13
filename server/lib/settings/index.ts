@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -25,6 +26,10 @@ export interface NarraForkSettings {
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
 	};
+	auth: {
+		jwtSecret: string;
+		registrationOpen: boolean;
+	};
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -49,6 +54,10 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	editor: {
 		type: "vscode",
+	},
+	auth: {
+		jwtSecret: "",
+		registrationOpen: true,
 	},
 };
 
@@ -75,10 +84,17 @@ export function loadSettings(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true });
 	if (!existsSync(settingsPath)) {
 		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2));
-		return DEFAULTS;
 	}
-	const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
-	return deepMerge(DEFAULTS, raw);
+	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
+	const merged = deepMerge(DEFAULTS, raw);
+
+	// Auto-generate JWT secret on first run
+	if (!merged.auth.jwtSecret) {
+		merged.auth.jwtSecret = randomBytes(32).toString("hex");
+		saveSettings(merged);
+	}
+
+	return merged;
 }
 
 export function saveSettings(settings: NarraForkSettings): void {

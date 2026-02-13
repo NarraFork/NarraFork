@@ -214,3 +214,14 @@ export const portAllocations = sqliteTable("port_allocations", {
 	serviceName: text("service_name"),
 	allocatedAt: text("allocated_at").notNull(),
 });
+
+// === users ===
+export const users = sqliteTable("users", {
+	id: text("id").primaryKey(),
+	username: text("username").notNull().unique(),
+	passwordHash: text("password_hash").notNull(),
+	role: text("role", { enum: ["admin", "user"] })
+		.notNull()
+		.default("user"),
+	createdAt: text("created_at").notNull(),
+});

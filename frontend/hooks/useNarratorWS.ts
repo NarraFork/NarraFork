@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getToken } from "../lib/api";
 
 interface NarratorWSCallbacks {
 	onMessage?: (data: any) => void;
@@ -20,7 +21,9 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 		const host = window.location.hostname;
 		// In dev, WS goes to backend port via Vite proxy or direct
 		const port = import.meta.env.DEV ? "7778" : window.location.port;
-		const ws = new WebSocket(`${protocol}//${host}:${port}/ws/narrator`);
+		const token = getToken();
+		const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+		const ws = new WebSocket(`${protocol}//${host}:${port}/ws/narrator${tokenParam}`);
 		wsRef.current = ws;
 
 		ws.onopen = () => {

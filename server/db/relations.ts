@@ -10,6 +10,7 @@ import {
 	projects,
 	repositories,
 	terminals,
+	users,
 } from "./schema";
 
 export const projectsRelations = relations(projects, ({ many }) => ({
@@ -98,3 +99,5 @@ export const portAllocationsRelations = relations(portAllocations, ({ one }) => 
 		references: [chapters.id],
 	}),
 }));
+
+export const usersRelations = relations(users, () => ({}));

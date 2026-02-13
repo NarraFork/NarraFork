@@ -1,11 +1,33 @@
 const BASE = "/api";
+const TOKEN_KEY = "narrafork_token";
+
+export function getToken(): string | null {
+	return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setToken(token: string): void {
+	localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearToken(): void {
+	localStorage.removeItem(TOKEN_KEY);
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
 	const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) };
 	if (options?.body) {
 		headers["Content-Type"] = "application/json";
 	}
+	const token = getToken();
+	if (token) {
+		headers.Authorization = `Bearer ${token}`;
+	}
 	const response = await fetch(`${BASE}${path}`, { ...options, headers });
+	if (response.status === 401) {
+		clearToken();
+		window.location.href = "/login";
+		throw new Error("Session expired");
+	}
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ error: response.statusText }));
 		throw new Error(error.error ?? "Request failed");
@@ -14,6 +36,26 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+	// Auth
+	authStatus: () => request<{ hasUsers: boolean; registrationOpen: boolean }>("/auth/status"),
+	register: (data: { username: string; password: string }) =>
+		request<{ user: any; token: string }>("/auth/register", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	login: (data: { username: string; password: string }) =>
+		request<{ user: any; token: string }>("/auth/login", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	me: () => request<any>("/auth/me"),
+
+	// Admin
+	listUsers: () => request<any[]>("/admin/users"),
+	deleteUser: (id: string) => request<any>(`/admin/users/${id}`, { method: "DELETE" }),
+	updateAdminSettings: (data: { registrationOpen: boolean }) =>
+		request<any>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
+
 	// Projects
 	listProjects: (status?: string) =>
 		request<any[]>(`/projects${status ? `?status=${status}` : ""}`),

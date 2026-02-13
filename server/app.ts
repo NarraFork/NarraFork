@@ -1,8 +1,14 @@
+import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { db } from "./db";
+import { users } from "./db/schema";
 import { AppError } from "./lib/errors";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
+import { requireAuth } from "./middleware/auth";
+import { adminRoutes } from "./routes/admin";
+import { authRoutes } from "./routes/auth";
 import { chapterRoutes } from "./routes/chapters";
 import { narratorRoutes } from "./routes/narrators";
 import { projectRoutes } from "./routes/projects";
@@ -20,13 +26,27 @@ app.use(
 	}),
 );
 
+// Public routes (no auth required)
+app.route("/api/auth", authRoutes);
+app.get("/api/health", (c) => c.json({ status: "ok" }));
+
+app.get("/api/auth/status", async (c) => {
+	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
+	return c.json({
+		hasUsers: userCount > 0,
+		registrationOpen: settings.auth.registrationOpen,
+	});
+});
+
+// All routes below require authentication
+app.use("/api/*", requireAuth);
+
 app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
-
-app.get("/api/health", (c) => c.json({ status: "ok" }));
+app.route("/api/admin", adminRoutes);
 
 app.onError((err, c) => {
 	if (err instanceof AppError) {

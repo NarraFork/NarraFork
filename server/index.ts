@@ -3,10 +3,11 @@ import { resolve } from "node:path";
 import { serveStatic } from "hono/bun";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
+import { verifyToken } from "./lib/auth";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
 import { terminalService } from "./services/terminal-service";
-import { resolveWSData, type WSData, wsHandlers } from "./websocket/ws-handler";
+import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
 
 const port = settings.server.port;
 const isProd = process.env.NODE_ENV === "production";
@@ -20,9 +21,9 @@ if (isProd) {
 	}
 }
 
-const server = Bun.serve({
+const _server = Bun.serve({
 	port,
-	fetch(req, server) {
+	async fetch(req, server) {
 		const url = new URL(req.url);
 
 		// WebSocket upgrade for /ws/narrator and /ws/terminal
@@ -31,6 +32,18 @@ const server = Bun.serve({
 			if (!wsData) {
 				return new Response("Unknown WebSocket endpoint", { status: 404 });
 			}
+
+			// Verify JWT from query param
+			const token = url.searchParams.get("token");
+			if (!token) {
+				return new Response("Authentication required", { status: 401 });
+			}
+			try {
+				await verifyToken(token);
+			} catch {
+				return new Response("Invalid or expired token", { status: 401 });
+			}
+
 			const upgraded = server.upgrade(req, { data: wsData });
 			if (upgraded) return undefined;
 			return new Response("WebSocket upgrade failed", { status: 400 });

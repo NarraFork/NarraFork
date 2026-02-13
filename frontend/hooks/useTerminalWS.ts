@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getToken } from "../lib/api";
 
 interface TerminalWSCallbacks {
 	onOutput?: (data: string) => void;
@@ -18,7 +19,11 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 		const host = window.location.hostname;
 		const port = import.meta.env.DEV ? "7778" : window.location.port;
-		const ws = new WebSocket(`${protocol}//${host}:${port}/ws/terminal?terminalId=${terminalId}`);
+		const token = getToken();
+		const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+		const ws = new WebSocket(
+			`${protocol}//${host}:${port}/ws/terminal?terminalId=${terminalId}${tokenParam}`,
+		);
 		wsRef.current = ws;
 
 		ws.onopen = () => setConnected(true);
