@@ -48,7 +48,6 @@ export const portAllocator = {
 				} catch {
 					// Primary key conflict — another chapter grabbed this port concurrently
 					usedPorts.add(p);
-					continue;
 				}
 			}
 

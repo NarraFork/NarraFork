@@ -224,7 +224,12 @@ export const narratorService = {
 
 	async updateToolCallResult(
 		toolUseId: string,
-		result: { output?: any; status: "completed" | "failed"; errorMessage?: string; durationMs?: number },
+		result: {
+			output?: any;
+			status: "completed" | "failed";
+			errorMessage?: string;
+			durationMs?: number;
+		},
 	) {
 		const now = new Date().toISOString();
 		await db

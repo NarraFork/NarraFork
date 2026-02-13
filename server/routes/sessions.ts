@@ -4,10 +4,7 @@ import { streamSSE } from "hono/streaming";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
-import {
-	createSessionSchema,
-	sendMessageSchema,
-} from "../lib/validators";
+import { createSessionSchema, sendMessageSchema } from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import { startSession } from "../services/narrator-session";
 

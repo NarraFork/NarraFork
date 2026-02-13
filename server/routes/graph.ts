@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapters, narrators, containerInstances } from "../db/schema";
+import { chapters, containerInstances, narrators } from "../db/schema";
 
 export const graphRoutes = new Hono();
 

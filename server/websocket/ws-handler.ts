@@ -45,23 +45,14 @@ export const wsHandlers = {
 		try {
 			const parsed = JSON.parse(text);
 			if (channel === "narrator") {
-				handleNarratorWS.message(
-					ws as ServerWebSocket<WSData & { channel: "narrator" }>,
-					parsed,
-				);
+				handleNarratorWS.message(ws as ServerWebSocket<WSData & { channel: "narrator" }>, parsed);
 			} else if (channel === "terminal") {
-				handleTerminalWS.message(
-					ws as ServerWebSocket<WSData & { channel: "terminal" }>,
-					parsed,
-				);
+				handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
 			}
 		} catch {
 			// For terminal, raw text might be terminal input (not JSON)
 			if (channel === "terminal") {
-				handleTerminalWS.rawMessage(
-					ws as ServerWebSocket<WSData & { channel: "terminal" }>,
-					text,
-				);
+				handleTerminalWS.rawMessage(ws as ServerWebSocket<WSData & { channel: "terminal" }>, text);
 			} else {
 				logger.warn("Invalid WebSocket JSON", { channel, text: text.slice(0, 200) });
 			}

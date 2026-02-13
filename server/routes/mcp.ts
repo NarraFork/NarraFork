@@ -39,7 +39,12 @@ function createMcpServer(): McpServer {
 					],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -51,7 +56,10 @@ function createMcpServer(): McpServer {
 			chapterId: z.string().describe("Source chapter ID to fork from"),
 			title: z.string().describe("Title for the new chapter"),
 			type: z.enum(["meanwhile", "whatif"]).optional().describe("Chapter type"),
-			inheritMode: z.enum(["full", "compressed", "fresh"]).optional().describe("Narrator context inheritance mode"),
+			inheritMode: z
+				.enum(["full", "compressed", "fresh"])
+				.optional()
+				.describe("Narrator context inheritance mode"),
 		},
 		async ({ chapterId, title, type, inheritMode }) => {
 			try {
@@ -60,7 +68,12 @@ function createMcpServer(): McpServer {
 					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -80,7 +93,12 @@ function createMcpServer(): McpServer {
 					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -99,7 +117,12 @@ function createMcpServer(): McpServer {
 					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -118,7 +141,12 @@ function createMcpServer(): McpServer {
 					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -134,7 +162,12 @@ function createMcpServer(): McpServer {
 					content: [{ type: "text", text: `Chapter ${chapterId} abandoned` }],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -165,7 +198,12 @@ function createMcpServer(): McpServer {
 					],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
@@ -193,7 +231,12 @@ function createMcpServer(): McpServer {
 					],
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+				return {
+					content: [
+						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
 			}
 		},
 	);
