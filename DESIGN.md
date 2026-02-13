@@ -207,8 +207,11 @@ export const narrators = sqliteTable('narrators', {
     .references(() => narrators.id),
   contextSummary: text('context_summary'),         // compressed 模式下的摘要
 
+  // 会话标题（自动生成或手动设置）
+  title: text('title'),
+
   // 会话配置
-  model: text('model').default('claude-sonnet-4-5'),
+  model: text('model').default('sonnet'),
   systemPrompt: text('system_prompt'),             // 额外的 system prompt
   permissionMode: text('permission_mode', {
     enum: ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk']
@@ -219,10 +222,10 @@ export const narrators = sqliteTable('narrators', {
   totalCostUsd: real('total_cost_usd').default(0),
   lastMessageAt: text('last_message_at'),
 
-  // 状态
+  // 状态：idle（空闲）、thinking（处理中）、waiting（等待权限审批）、archived（已归档）、error
   status: text('status', {
-    enum: ['active', 'paused', 'completed', 'error']
-  }).notNull().default('active'),
+    enum: ['idle', 'thinking', 'waiting', 'archived', 'error']
+  }).notNull().default('idle'),
   errorMessage: text('error_message'),
 
   createdAt: text('created_at').notNull(),
@@ -376,14 +379,19 @@ export const users = sqliteTable('users', {
 #### FTS5 全文搜索虚拟表
 
 ```sql
--- 章节搜索
+-- 章节搜索（trigram tokenizer 支持 CJK）
 CREATE VIRTUAL TABLE chapters_fts USING fts5(
-  title, description, content=chapters, content_rowid=rowid
+  title, description, content=chapters, content_rowid=rowid, tokenize='trigram'
 );
 
 -- 消息搜索
 CREATE VIRTUAL TABLE narrator_messages_fts USING fts5(
-  content_text, content=narrator_messages, content_rowid=rowid
+  content_text, content=narrator_messages, content_rowid=rowid, tokenize='trigram'
+);
+
+-- 叙述者标题搜索
+CREATE VIRTUAL TABLE narrators_fts USING fts5(
+  title, content='narrators', content_rowid=rowid, tokenize='trigram'
 );
 ```
 
@@ -438,10 +446,12 @@ server/
     narrator-service.ts       # 叙述者生命周期
     narrator-session.ts       # Claude SDK session 管理 + 权限审批
     narrator-context.ts       # 上下文继承（full/compressed/fresh）
+    narrator-title.ts         # 会话标题自动生成（Haiku 模型）
     container-service.ts      # 容器管理（Docker/Podman compose）
     port-allocator.ts         # 端口分配
     git-service.ts            # Git 操作封装
     terminal-service.ts       # 终端 + dtach PTY 管理
+    search-service.ts         # 全文搜索（FTS5 + LIKE 降级）
   middleware/
     auth.ts                   # JWT 认证 + 管理员权限中间件
   websocket/
@@ -470,13 +480,14 @@ server/
 
 职责：从父 Chapter 创建新的分叉 Chapter，包含 git worktree、Narrator 继承、可选容器。
 
-核心操作流程（6 步原子操作 + 回滚栈）：
+核心操作流程（7 步原子操作 + 回滚栈）：
 1. 创建 DB 记录（chapter + forkPoint）
-2. 创建 Git worktree（基于父 branch）
-3. 复制 repo 配置的 copyFiles
-4. Fork Narrator(s)（根据 inheritMode 调用 narrator-context）
-5. 可选启动容器
-6. 执行 startup script
+2. 创建 Git branch（基于父 branch）
+3. 创建 Git worktree（关联新 branch）
+4. 复制 repo 配置的 copyFiles
+5. Fork Narrator(s)（根据 inheritMode 调用 narrator-context）
+6. 复制 containerConfig + 可选启动容器（non-fatal，失败不回滚）
+7. 执行 startup script（non-fatal，60 秒超时，失败不回滚）
 
 关键设计：
 - 使用 `rollback: Array<() => Promise<void>>` 手动回滚栈，每步成功后 push 逆操作
@@ -488,16 +499,18 @@ server/
 职责：封装 Claude Agent SDK 的 `query()` 调用，管理 session 的创建、恢复、分叉。
 
 核心功能：
-- `createNarratorSession()` — 新建 session，传入 `cwd`、`model`、`permissionMode`、`canUseTool`、`mcpServers`
-- `resumeNarratorSession()` — 恢复已有 session，使用 SDK 的 `resume: claudeSessionId`
-- `forkNarratorSession()` — 分叉 session，使用 SDK 的 `resume` + `forkSession: true` + 可选 `resumeSessionAt`
+- `startSession()` — 统一入口，根据 narrator 状态自动判断新建、恢复或分叉 session。传入 `cwd`、`model`、`permissionMode`。通过条件分支处理：无 `claudeSessionId` 时新建，有 `claudeSessionId` 时恢复（SDK `resume`），`isFullFork` 标志时分叉（SDK `resume` + `forkSession: true` + 可选 `resumeSessionAt`）
+- `interruptSession()` — 中断当前执行
+- `recoverOnStartup()` — 服务器重启恢复逻辑：重置 `thinking` 状态的 narrator 为 `idle`，自动拒绝 pending 权限请求，标记 running tool calls 为 failed
+- `isSessionActive()` — 检查 narrator 是否有活跃的 SDK session
 
 关键设计：
 - 内存中维护 `Map<narratorId, { query, abortController }>` 用于中断控制
-- `processMessages()` 异步生成器统一处理消息流：捕获 `session_id` 持久化到 DB、持久化 assistant 消息、更新统计、广播到 WebSocket
-- `canUseTool` 回调创建权限请求记录，通过 WebSocket 推送给前端，用 Promise + EventEmitter 等待用户决定
-- 权限审批流程：创建 tool_call 记录 → 创建 permission_request → WebSocket 推送 → 等待决定 → 更新记录 → 返回 SDK
-- MCP 工具通过 `mcpServers` 选项注入，指向本地 `/mcp` 端点
+- `startSession()` 是异步生成器，内部 `processSDKMessage()` 处理每条消息：捕获 `session_id` 持久化到 DB、持久化 assistant 消息、更新统计、广播到 WebSocket
+- 首条 assistant 消息时自动调用 `narrator-title.ts` 的 `generateAndSetTitle()` 生成会话标题
+- `canUseTool` 回调仅在 `default` 权限模式下启用，其他模式不触发权限审批流程
+- `canUseTool` 对 `TodoWrite`/`TodoRead` 工具自动允许（白名单），不需要用户审批
+- 权限审批流程：创建 tool_call 记录 → 创建 permission_request → WebSocket 推送 → 等待决定（5 分钟超时，超时自动拒绝，`decidedBy: "auto_timeout"`）→ 更新记录 → 返回 SDK
 #### 4.2.3 narrator-context.ts — 上下文继承
 
 职责：在 Chapter 分叉时处理 Narrator 的上下文继承策略。
@@ -508,10 +521,23 @@ server/
 - **fresh**：全新 session，不带任何历史上下文
 
 关键设计：
-- compressed 模式使用 `claude-haiku-4-5`，`maxTurns: 1`，不需要工具
+- compressed 模式使用 `settings.agent.summaryModel`（可配置，默认 `haiku`），`maxTurns: 1`，`tools: []` 明确禁用工具
 - 摘要 prompt 要求关注：已做决策、代码当前状态、待办事项、关键上下文
 - 摘要语言跟随原对话语言
-#### 4.2.4 chapter-merge.ts — 合并服务
+
+#### 4.2.4 narrator-title.ts — 会话标题自动生成
+
+职责：使用 Haiku 模型根据会话前几条消息自动生成简短标题。
+
+核心功能：
+- `generateTitle(narratorId)` — 读取前 4 条消息，使用 `settings.agent.summaryModel` 生成最多 50 字符的标题
+- `generateAndSetTitle(narratorId)` — fire-and-forget 版本，生成后持久化到 DB 并通过 WebSocket 广播 `narrator:title_updated` 事件
+
+关键设计：
+- 在 `narrator-session.ts` 的 `processSDKMessage()` 中，首条 assistant 消息时自动触发
+- 标题用于前端会话列表展示和 `narrators_fts` 全文搜索
+
+#### 4.2.5 chapter-merge.ts — 合并服务
 
 职责：处理 Chapter 间的代码合并，包括冲突预检测和 AI 辅助解决。
 
@@ -529,7 +555,7 @@ server/
 - 合并成功后更新 source chapter 状态为 `merged`，记录 `mergedIntoChapterId` 和 `mergeCommitSha`
 - cherry-pick 策略按 commit 顺序逐个 pick（`--reverse`）
 - AI 解决冲突时 resume 目标 Narrator 的 session，提供冲突文件列表
-#### 4.2.5 container-service.ts — Podman 容器管理
+#### 4.2.6 container-service.ts — Podman 容器管理
 
 职责：管理 Chapter 的可选 Podman 容器环境生命周期。
 
@@ -553,34 +579,37 @@ server/
 - 环境变量注入 `NARRAFORK_CHAPTER_ID` 和 `NARRAFORK_VOLUME_PREFIX` 用于隔离
 - 端口映射通过 `PORT_{containerPort}` 环境变量传递给 compose
 - compose 文件解析带路径穿越防护（resolve 后校验仍在 worktree 内）
-#### 4.2.6 chapter-cleanup.ts — 批量清理
+#### 4.2.7 chapter-cleanup.ts — 批量清理
 
 职责：批量清理不再需要的 Chapter 资源，以及自动休眠/唤醒不活跃 Chapter。
 
 核心功能：
 - `batchCleanup()` — 批量清理指定 chapters，返回 `CleanupReport { cleaned, skipped, errors }`
-- `dormantInactiveChapters()` — 按 `lastAccessedAt` 排序，超出 `maxActiveChapters` 的自动休眠（触发机制待定：可选 setInterval / 请求级 hook / 外部 cron）
+- `dormantInactiveChapters()` — 按 `lastAccessedAt` 排序，超出 `maxActiveWorktrees` 的自动休眠
+- `scheduleAutoDormant()` — 防抖调度（30 秒窗口），在 chapter 创建和访问时触发
 - `wakeChapter()` — 唤醒 dormant chapter，重建 worktree + 恢复容器
 
 清理流程（每个 chapter）：
 1. Dirty check — 检查 `git status --porcelain`，有未提交更改时跳过（除非 force）
 2. 停止并删除容器（可选删除 volumes）
-3. 删除 worktree（`git worktree remove`）
-4. 删除 branch（`git branch -D`，可选）
-5. 更新状态为 `abandoned`
+3. 清理 chapter 下所有终端（`terminalService.cleanupForChapter`）
+4. 删除 worktree（`git worktree remove`）
+5. 删除 branch（`git branch -D`，可选）
+6. 更新状态为 `abandoned`
 
 休眠流程：
-1. 暂停容器（pause，非 remove）
-2. 自动 commit 未保存更改（`git add -A && git commit -m "auto-save before dormant"`）
-3. 删除 worktree（保留 branch）
-4. 状态设为 `dormant`，`worktreePath` 置 null
+1. 清理 chapter 下所有终端
+2. 暂停容器（pause，非 remove）
+3. 自动 commit 未保存更改（`git add -A && git commit -m "auto-save before dormant"`）
+4. 删除 worktree（保留 branch）
+5. 状态设为 `dormant`，`worktreePath` 置 null
 
 唤醒流程：
 1. 重建 worktree（`git worktree add`，使用已有 branch）
 2. 重启容器（如有 containerConfig）
 3. 状态恢复为 `active`
 
-#### 4.2.7 chapter-batch-merge.ts — 批量合并编排
+#### 4.2.8 chapter-batch-merge.ts — 批量合并编排
 
 职责：按顺序将多个 source chapter 合并到同一个 target chapter，支持冲突时暂停等待用户决策。
 
@@ -593,6 +622,26 @@ server/
 - 合并在临时 fork 上进行，全部成功后才 fast-forward 目标 branch
 - 通过 `merge:*` 事件族广播进度，前端可实时展示每一步状态
 - 支持 AI 自动解决冲突（`merge:ai_resolving` 事件）或等待用户手动决策
+
+#### 4.2.9 terminal-service.ts — 终端管理
+
+职责：管理 Chapter 的终端实例，通过 dtach 实现终端持久化。
+
+核心功能：
+- `create()` / `list()` / `kill()` — 终端 CRUD
+- `cleanupForChapter(chapterId)` — 批量清理 chapter 下所有终端，被 chapter-cleanup 和 chapter-service 调用
+- `recoverOnStartup()` — 服务器重启时恢复 running 状态的终端（重新 attach dtach socket）
+
+#### 4.2.10 search-service.ts — 全文搜索
+
+职责：基于 FTS5 虚拟表提供全文搜索，支持 chapters、messages、narrators 三种实体。
+
+核心功能：
+- `search(query, entities, limit)` — 统一搜索入口，返回按实体分组的结果
+
+关键设计：
+- 查询长度 < 3 时自动降级为 LIKE 搜索（trigram tokenizer 要求 >= 3 字符）
+- 查询字符串进行特殊字符清理（防 FTS5 注入）
 
 ---
 
@@ -649,6 +698,9 @@ GET    /api/narrators/:id/messages                 # 历史消息（?limit=&offs
 
 POST   /api/narrators/:id/interrupt                # 中断当前执行
 PATCH  /api/narrators/:id/permission-mode          # 切换权限模式
+PATCH  /api/narrators/:id/title                    # 手动更新标题
+POST   /api/narrators/:id/generate-title           # AI 自动生成标题
+PATCH  /api/narrators/:id/archive                  # 归档叙述者
 ```
 
 #### Permission Requests
@@ -662,7 +714,13 @@ POST   /api/narrators/permissions/:requestId/deny     # 拒绝
 ```
 POST   /api/auth/register                          # 注册（首个用户自动成为 admin）
 POST   /api/auth/login                             # 登录（返回 JWT）
-GET    /api/auth/me                                # 当前用户信息
+GET    /api/auth/me                                # 当前用户信息（需认证）
+GET    /api/auth/status                            # 公开端点，返回 { hasUsers, registrationOpen }
+```
+
+#### Health
+```
+GET    /api/health                                 # 公开端点，健康检查
 ```
 
 #### Admin
@@ -685,7 +743,7 @@ GET    /api/projects/:id/graph                     # 故事网络图数据
 
 #### Search
 ```
-GET    /api/search?q=&entities=chapters,messages    # 全文搜索
+GET    /api/search?q=&entities=chapters,messages,narrators&limit=  # 全文搜索（默认搜索 chapters,messages,narrators）
 ```
 
 #### Standalone Sessions（游离会话）
@@ -694,6 +752,9 @@ POST   /api/sessions                               # 创建游离会话
 GET    /api/sessions                               # 列表
 GET    /api/sessions/:id                           # 详情
 POST   /api/sessions/:id/messages                  # 发送消息
+GET    /api/sessions/:id/messages                  # 消息历史（?limit=&offset=）
+PATCH  /api/sessions/:id/title                     # 手动更新标题
+POST   /api/sessions/:id/generate-title            # AI 自动生成标题
 DELETE /api/sessions/:id                           # 删除
 ```
 
@@ -711,14 +772,16 @@ DELETE /api/sessions/:id                           # 删除
 type NarratorWSMessage =
   | { type: 'message'; narratorId: string; message: SDKMessage }
   | { type: 'permission_request'; narratorId: string; request: PermissionRequest }
-  | { type: 'status_change'; narratorId: string; status: NarratorStatus }
+  | { type: 'status_changed'; narratorId: string; status: NarratorStatus }
   | { type: 'tool_progress'; narratorId: string; toolUseId: string; elapsed: number }
+  | { type: 'title_updated'; narratorId: string; title: string }
+  | { type: 'error'; message: string }
 
 // 客户端 → 服务端
 type NarratorWSCommand =
   | { type: 'subscribe'; narratorIds: string[] }
   | { type: 'unsubscribe'; narratorIds: string[] }
-  | { type: 'permission_decision'; requestId: string; decision: 'allow' | 'deny'; message?: string }
+  | { type: 'permission_decision'; requestId: string; decision: 'allow' | 'deny'; message?: string; answers?: Record<string, string> }
   | { type: 'merge_decision'; mergeSessionId: string; decision: 'continue' | 'cancel' }
 ```
 
@@ -746,9 +809,12 @@ const mcpTools = [
 
 ```
 frontend/
+  main.tsx                  # i18n init + MantineProvider（auto 主题）+ QueryClient + RouterProvider + PWA 注册
   routes/
-    __root.tsx                # 根布局（Mantine Provider, React Query）
+    __root.tsx                # 根布局（AppShell + 认证守卫 + 全局搜索 + 导航）
     index.tsx                 # 首页/仪表盘
+    login.tsx                 # 登录/注册页面
+    search.tsx                # 搜索结果页面
     projects/
       index.tsx               # 项目列表
       $projectId.tsx          # 项目详情
@@ -759,18 +825,23 @@ frontend/
       index.tsx               # 游离会话列表
       $sessionId.tsx          # 游离会话详情
     settings/
-      index.tsx               # 设置页
+      index.tsx               # 设置页（含语言切换器）
+    admin/
+      index.tsx               # 管理员面板（用户管理 + 全局设置）
   components/
     chapter/
       ChapterCard.tsx         # Chapter 卡片
       ChapterForkModal.tsx    # 分叉对话框
       ChapterMergeModal.tsx   # 合并对话框
       ChapterCleanupModal.tsx # 批量清理对话框
+      ChapterBatchMergeModal.tsx # 批量合并对话框
     narrator/
       NarratorPanel.tsx       # Narrator 面板（消息列表 + 输入）
       MessageBubble.tsx       # 消息气泡
+      MarkdownContent.tsx     # Markdown 渲染（react-markdown + remark-gfm）
       ToolCallCard.tsx        # Tool Call 展示卡片
       PermissionBanner.tsx    # 权限审批横幅
+      AskUserQuestionBanner.tsx # AskUserQuestion 工具调用的问答 UI
     graph/
       StoryNetwork.tsx        # React Flow 故事网络
       ChapterNode.tsx         # 自定义节点（Mantine Card）
@@ -782,7 +853,8 @@ frontend/
     container/
       ContainerStatus.tsx     # 容器状态指示器
       ContainerLogs.tsx       # 容器日志查看器
-    ui/                       # Mantine 扩展组件
+    LanguageSwitcher.tsx      # 语言切换器（Mantine Select，位于设置页）
+    ThemeSwitcher.tsx         # 主题切换器（light/dark/auto）
   hooks/
     useProjects.ts            # Project CRUD hooks
     useChapters.ts            # Chapter CRUD hooks
@@ -793,6 +865,9 @@ frontend/
     useStoryGraph.ts          # 故事网络数据 + 布局
     useContainers.ts          # 容器管理 hooks
     usePermissions.ts         # 权限审批 hooks
+    useAuth.ts                # 认证 hooks（login/register/logout/status）
+    useSessions.ts            # 游离会话 CRUD hooks
+    useSearch.ts              # 搜索 hook（300ms 防抖）
   lib/
     api.ts                    # API 客户端（含 auth token 管理）
     i18n.ts                   # i18next 初始化（语言检测 + locale 导入）
@@ -807,14 +882,17 @@ frontend/
 
 组件结构：
 - `StoryNetwork` — 主容器，使用 `useStoryGraph(projectId)` 获取图数据，Dagre 自动布局（`rankdir: 'TB'`，节点间距 80/120）
-- `ChapterNode` — 自定义 React Flow 节点，使用 Mantine Card 渲染，显示标题、类型图标（⟂/?)、状态 Badge、narrator 数量、容器标记
-- `ForkEdge` — 分叉边（默认样式，蓝色）
-- `MergeEdge` — 合并边（smoothstep 样式，绿色，animated）
+- `ChapterNode` — 自定义 React Flow 节点，使用 Mantine Card 渲染，显示标题、类型图标（meanwhile=`IconGitBranch`，whatif=`IconQuestionMark`）、状态 Badge、narrator 数量、容器标记
+- `ForkEdge` — 分叉边（贝塞尔曲线样式，蓝色 `#4c6ef5`）
+- `MergeEdge` — 合并边（smoothstep 样式，绿色 `#40c057`，`strokeDasharray` + CSS class 动画）
 
 关键设计：
 - React Flow 与 Mantine 无样式冲突（React Flow 使用独立 CSS 命名空间）
 - 节点尺寸固定 280×120，Dagre 布局后居中偏移
-- 状态颜色映射：active=green, dormant=yellow, merged=blue, abandoned=gray
+- Chapter 状态颜色映射：active=green, dormant=yellow, merged=blue, abandoned=gray
+- Narrator 状态颜色映射：idle=blue, thinking=yellow, waiting=orange, archived=gray, error=red
+- 默认主题为 `auto`（跟随系统），用户可通过 `ThemeSwitcher` 切换 light/dark/auto
+- 支持 PWA（Service Worker 注册，离线缓存 + 自动更新提示）
 
 ### 6.3 Narrator 消息面板
 
@@ -831,13 +909,13 @@ frontend/
 
 组件结构：
 - `PermissionBanner` — 固定在 Narrator 面板顶部的审批横幅，使用 `usePermissions(narratorId)` hook
-- 显示 tool name + input JSON + decisionReason
-- 三个操作按钮：Allow / Deny / Always Allow
+- `AskUserQuestionBanner` — 处理 Narrator 的 `AskUserQuestion` 工具调用，显示问题选项供用户回答
+- 显示 tool name + input JSON（截断到 300 字符）+ decisionReason
+- 两个操作按钮：Allow / Deny
 
 关键设计：
 - 一次只处理一个 pending 请求（队列式）
-- Always Allow 通过 SDK 的 `PermissionUpdate` 机制实现
-- WebSocket 双向通信：服务端推送请求，客户端发送决定
+- WebSocket 双向通信：服务端推送请求，客户端发送决定（支持 `answers` 字段用于 AskUserQuestion 回答）
 
 ---
 
@@ -865,7 +943,8 @@ type NarraForkEvent =
   | { type: 'merge:error'; mergeSessionId: string; sourceChapterId: string; error: string }
   // Narrator
   | { type: 'narrator:message'; narratorId: string; role: string }
-  | { type: 'narrator:completed'; narratorId: string }
+  | { type: 'narrator:status_changed'; narratorId: string; status: string }
+  | { type: 'narrator:title_updated'; narratorId: string; title: string }
   | { type: 'narrator:error'; narratorId: string; error: string }
   | { type: 'narrator:permission_request'; narratorId: string; requestId: string }
   // 容器
@@ -909,9 +988,11 @@ interface NarraForkSettings {
     defaultProjectDir: string       // 默认 ~/projects
   }
   agent: {
-    defaultModel: string            // 默认 claude-sonnet-4-5
+    defaultModel: string            // 默认 'sonnet'
     defaultPermissionMode: PermissionMode
-    summaryModel: string            // 压缩上下文用的模型，默认 claude-haiku-4-5
+    summaryModel: string            // 压缩上下文用的模型，默认 'haiku'
+    customModels: ModelOption[]     // 自定义模型选项列表，默认 []
+    // ModelOption = { value: string; label: string }
   }
   chapters: {
     maxActiveWorktrees: number      // 默认 10
@@ -996,3 +1077,8 @@ interface NarraForkSettings {
 | 批量合并 | 临时 fork + 队列式处理 | 在临时分支上合并，全部成功后 fast-forward，失败可回滚 |
 | containerConfig 存储 | chapters 表 JSON 字段 | 避免独立表的 JOIN 开销，配置结构简单 |
 | 数据共享模式 | 全团队共享，无用户隔离 | 小团队私有部署，认证仅用于身份识别 |
+| Narrator 状态机 | idle/thinking/waiting/archived/error | 比 active/paused/completed 更细粒度，反映 AI 会话实时状态 |
+| 会话标题生成 | Haiku 模型自动生成 | 首条 assistant 消息后 fire-and-forget，改善会话列表可读性 |
+| FTS tokenizer | trigram | 支持 CJK 搜索，无需分词器 |
+| 主题模式 | auto（跟随系统） | 用户可切换 light/dark/auto，比固定 dark 更灵活 |
+| 自动休眠触发 | 防抖调度（30 秒窗口） | chapter 创建/访问时触发，避免频繁检查 |
