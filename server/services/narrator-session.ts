@@ -7,7 +7,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, narratorToolCalls, permissionRequests } from "../db/schema";
+import { chapters, narratorToolCalls, permissionRequests } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -175,12 +175,28 @@ export async function* startSession(
 	const abortController = new AbortController();
 	const permMode = (narrator.permissionMode ?? "default") as PermissionMode;
 
+	// Determine if this is a fork-on-first-message scenario (full inheritance mode)
+	const isFullFork =
+		narrator.inheritMode === "full" &&
+		narrator.parentNarratorId &&
+		narrator.claudeSessionId &&
+		(narrator.messageCount ?? 0) === 0;
+
+	// For full fork, get the fork point message UUID from the chapter
+	let resumeSessionAt: string | undefined;
+	if (isFullFork && chapter.forkPoint) {
+		const fp = chapter.forkPoint as { commitSha: string; narratorMessageUuid?: string };
+		resumeSessionAt = fp.narratorMessageUuid;
+	}
+
 	const sdkQuery = query({
 		prompt,
 		options: {
 			cwd: chapter.worktreePath,
 			model: narrator.model ?? settings.agent.defaultModel,
 			resume: narrator.claudeSessionId ?? undefined,
+			...(isFullFork && { forkSession: true }),
+			...(isFullFork && resumeSessionAt && { resumeSessionAt }),
 			includePartialMessages: true,
 			systemPrompt: narrator.systemPrompt
 				? { type: "preset", preset: "claude_code", append: narrator.systemPrompt }
@@ -259,7 +275,9 @@ async function processSDKMessage(
 							output: block.content,
 							status: isError ? "failed" : "completed",
 							errorMessage: isError
-								? (typeof block.content === "string" ? block.content : JSON.stringify(block.content))
+								? typeof block.content === "string"
+									? block.content
+									: JSON.stringify(block.content)
 								: undefined,
 						});
 

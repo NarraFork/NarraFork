@@ -65,3 +65,57 @@ export const createTerminalSchema = z.object({
 	cols: z.number().int().min(10).max(500).optional(),
 	rows: z.number().int().min(2).max(200).optional(),
 });
+
+// === Fork / Merge / Cleanup ===
+
+export const forkChapterSchema = z.object({
+	title: z.string().min(1).max(200),
+	description: z.string().max(2000).optional(),
+	type: z.enum(["meanwhile", "whatif"]).optional(),
+	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
+	forkAtMessageUuid: z.string().optional(),
+});
+
+export const mergeChapterSchema = z.object({
+	targetChapterId: z.string().min(1),
+	strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),
+	message: z.string().max(500).optional(),
+});
+
+export const mergeCheckSchema = z.object({
+	targetChapterId: z.string().min(1),
+});
+
+export const batchCleanupSchema = z.object({
+	chapterIds: z.array(z.string().min(1)).min(1),
+	force: z.boolean().optional(),
+	deleteBranch: z.boolean().optional(),
+});
+
+export const batchMergeSchema = z.object({
+	baseChapterId: z.string().min(1),
+	sourceChapterIds: z.array(z.string().min(1)).min(1),
+	title: z.string().min(1).max(200),
+	description: z.string().max(2000).optional(),
+	strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),
+});
+
+// === Auth ===
+
+export const registerSchema = z.object({
+	username: z
+		.string()
+		.min(3)
+		.max(50)
+		.regex(/^[a-zA-Z0-9_-]+$/, "Alphanumeric, hyphens, underscores only"),
+	password: z.string().min(8).max(128),
+});
+
+export const loginSchema = z.object({
+	username: z.string().min(1),
+	password: z.string().min(1),
+});
+
+export const adminUpdateSettingsSchema = z.object({
+	registrationOpen: z.boolean(),
+});

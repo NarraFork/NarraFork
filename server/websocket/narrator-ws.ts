@@ -1,6 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import { resolvePermission } from "../services/narrator-session";
 import type { WSData } from "./ws-handler";
 
@@ -28,6 +29,11 @@ export type NarratorClientMessage =
 			requestId: string;
 			decision: "allow" | "deny";
 			message?: string;
+	  }
+	| {
+			type: "merge_decision";
+			mergeSessionId: string;
+			decision: MergeDecision;
 	  };
 
 // === Connection registry ===
@@ -39,7 +45,11 @@ const connections = new Set<NarratorWS>();
 // === Event bus → WebSocket broadcast ===
 
 function shouldForwardEvent(event: NarraForkEvent): boolean {
-	return event.type.startsWith("narrator:") || event.type.startsWith("chapter:");
+	return (
+		event.type.startsWith("narrator:") ||
+		event.type.startsWith("chapter:") ||
+		event.type.startsWith("merge:")
+	);
 }
 
 function eventToNarratorId(event: NarraForkEvent): string | null {
@@ -54,7 +64,7 @@ eventBus.onAny((event) => {
 
 	for (const ws of connections) {
 		// If event has a narratorId, only send to subscribers of that narrator
-		// Otherwise (chapter events), broadcast to all narrator WS clients
+		// Otherwise (chapter/merge events), broadcast to all narrator WS clients
 		if (narratorId && !ws.data.subscribedNarrators.has(narratorId)) continue;
 
 		try {
@@ -93,9 +103,7 @@ export const handleNarratorWS = {
 				for (const id of parsed.narratorIds) {
 					ws.data.subscribedNarrators.add(id);
 				}
-				logger.debug("Narrator WS subscribed", {
-					count: parsed.narratorIds.length,
-				});
+				logger.debug("Narrator WS subscribed", { count: parsed.narratorIds.length });
 				break;
 			}
 			case "unsubscribe": {
@@ -108,8 +116,12 @@ export const handleNarratorWS = {
 				resolvePermission(parsed.requestId, parsed.decision, parsed.message).catch((err) =>
 					logger.error("Failed to resolve permission", { error: String(err) }),
 				);
-				logger.debug("Permission decision received via WS", {
-					requestId: parsed.requestId,
+				break;
+			}
+			case "merge_decision": {
+				resolveMergeDecision(parsed.mergeSessionId, parsed.decision);
+				logger.debug("Merge decision received via WS", {
+					mergeSessionId: parsed.mergeSessionId,
 					decision: parsed.decision,
 				});
 				break;

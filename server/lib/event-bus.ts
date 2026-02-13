@@ -12,6 +12,51 @@ export type NarraForkEvent =
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
 	| { type: "chapter:abandoned"; chapterId: string }
+	// Batch merge session
+	| {
+			type: "merge:started";
+			mergeSessionId: string;
+			targetChapterId: string;
+			sourceChapterIds: string[];
+	  }
+	| {
+			type: "merge:step_ok";
+			mergeSessionId: string;
+			sourceChapterId: string;
+			index: number;
+			total: number;
+			commitSha?: string;
+	  }
+	| {
+			type: "merge:conflict";
+			mergeSessionId: string;
+			sourceChapterId: string;
+			index: number;
+			total: number;
+			conflictFiles: string[];
+	  }
+	| {
+			type: "merge:ai_resolving";
+			mergeSessionId: string;
+			sourceChapterId: string;
+	  }
+	| {
+			type: "merge:completed";
+			mergeSessionId: string;
+			targetChapterId: string;
+			mergedCount: number;
+	  }
+	| {
+			type: "merge:cancelled";
+			mergeSessionId: string;
+			reason: string;
+	  }
+	| {
+			type: "merge:error";
+			mergeSessionId: string;
+			sourceChapterId: string;
+			error: string;
+	  }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:completed"; narratorId: string }
