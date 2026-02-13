@@ -5,6 +5,7 @@ import {
 	createNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
+	updateNarratorTitleSchema,
 } from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import {
@@ -13,6 +14,7 @@ import {
 	resolvePermission,
 	startSession,
 } from "../services/narrator-session";
+import { generateTitle } from "../services/narrator-title";
 
 export const narratorRoutes = new Hono();
 
@@ -89,6 +91,34 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updatePermissionMode(id, permissionMode);
+	return c.json({ ok: true });
+});
+
+// Update narrator title
+narratorRoutes.patch("/:id/title", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateNarratorTitleSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await narratorService.getById(id);
+	await narratorService.updateTitle(id, parsed.data.title);
+	return c.json({ ok: true, title: parsed.data.title });
+});
+
+// Regenerate narrator title via AI
+narratorRoutes.post("/:id/generate-title", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const title = await generateTitle(id);
+	await narratorService.updateTitle(id, title);
+	return c.json({ title });
+});
+
+// Archive narrator
+narratorRoutes.patch("/:id/archive", async (c) => {
+	const id = c.req.param("id");
+	if (isSessionActive(id)) await interruptSession(id);
+	await narratorService.getById(id);
+	await narratorService.updateStatus(id, "archived");
 	return c.json({ ok: true });
 });
 

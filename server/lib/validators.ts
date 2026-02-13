@@ -149,3 +149,9 @@ export const createSessionSchema = z.object({
 		.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"])
 		.optional(),
 });
+
+// === Narrator title ===
+
+export const updateNarratorTitleSchema = z.object({
+	title: z.string().min(1).max(200),
+});

@@ -4,9 +4,14 @@ import { streamSSE } from "hono/streaming";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
-import { createSessionSchema, sendMessageSchema } from "../lib/validators";
+import {
+	createSessionSchema,
+	sendMessageSchema,
+	updateNarratorTitleSchema,
+} from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import { startSession } from "../services/narrator-session";
+import { generateTitle } from "../services/narrator-title";
 
 export const sessionRoutes = new Hono();
 
@@ -99,4 +104,35 @@ sessionRoutes.delete("/:id", async (c) => {
 	}
 	await narratorService.remove(id);
 	return c.json({ ok: true });
+});
+
+// Update session title
+sessionRoutes.patch("/:id/title", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateNarratorTitleSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const session = await db.query.narrators.findFirst({
+		where: eq(narrators.id, id),
+	});
+	if (!session) throw new NotFoundError("Session", id);
+	if (session.chapterId !== null) {
+		throw new ValidationError("This narrator is bound to a chapter, not a standalone session");
+	}
+	await narratorService.updateTitle(id, parsed.data.title);
+	return c.json({ ok: true, title: parsed.data.title });
+});
+
+// Regenerate session title via AI
+sessionRoutes.post("/:id/generate-title", async (c) => {
+	const id = c.req.param("id");
+	const session = await db.query.narrators.findFirst({
+		where: eq(narrators.id, id),
+	});
+	if (!session) throw new NotFoundError("Session", id);
+	if (session.chapterId !== null) {
+		throw new ValidationError("This narrator is bound to a chapter, not a standalone session");
+	}
+	const title = await generateTitle(id);
+	await narratorService.updateTitle(id, title);
+	return c.json({ title });
 });

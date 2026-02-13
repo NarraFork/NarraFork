@@ -7,8 +7,10 @@ searchRoutes.get("/", async (c) => {
 	const q = c.req.query("q");
 	if (!q || !q.trim()) return c.json({ results: [] });
 
-	const entitiesParam = c.req.query("entities") ?? "chapters,messages";
-	const entities = entitiesParam.split(",").filter((e) => ["chapters", "messages"].includes(e));
+	const entitiesParam = c.req.query("entities") ?? "chapters,messages,narrators";
+	const entities = entitiesParam
+		.split(",")
+		.filter((e) => ["chapters", "messages", "narrators"].includes(e));
 
 	if (entities.length === 0) {
 		return c.json({ results: [] });

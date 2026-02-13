@@ -18,6 +18,7 @@ export type NarratorServerMessage =
 	| { type: "permission_request"; narratorId: string; request: unknown }
 	| { type: "status_change"; narratorId: string; status: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
+	| { type: "title_updated"; narratorId: string; title: string }
 	| { type: "error"; message: string };
 
 // Client → Server messages
@@ -29,6 +30,7 @@ export type NarratorClientMessage =
 			requestId: string;
 			decision: "allow" | "deny";
 			message?: string;
+			answers?: Record<string, string>;
 	  }
 	| {
 			type: "merge_decision";
@@ -113,8 +115,8 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "permission_decision": {
-				resolvePermission(parsed.requestId, parsed.decision, parsed.message).catch((err) =>
-					logger.error("Failed to resolve permission", { error: String(err) }),
+				resolvePermission(parsed.requestId, parsed.decision, parsed.message, parsed.answers).catch(
+					(err) => logger.error("Failed to resolve permission", { error: String(err) }),
 				);
 				break;
 			}
