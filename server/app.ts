@@ -10,8 +10,12 @@ import { requireAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
 import { authRoutes } from "./routes/auth";
 import { chapterRoutes } from "./routes/chapters";
+import { graphRoutes } from "./routes/graph";
+import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
 import { projectRoutes } from "./routes/projects";
+import { searchRoutes } from "./routes/search";
+import { sessionRoutes } from "./routes/sessions";
 import { settingsRoutes } from "./routes/settings";
 import { terminalRoutes } from "./routes/terminals";
 
@@ -47,6 +51,12 @@ app.route("/api/narrators", narratorRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/admin", adminRoutes);
+app.route("/api/sessions", sessionRoutes);
+app.route("/api/search", searchRoutes);
+app.route("/api/mcp", mcpRoutes);
+
+// Graph routes are nested under projects for RESTful consistency
+app.route("/api/projects", graphRoutes);
 
 app.onError((err, c) => {
 	if (err instanceof AppError) {

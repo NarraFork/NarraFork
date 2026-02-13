@@ -13,9 +13,10 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { ChapterCard } from "../../components/chapter/ChapterCard";
+import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useProject } from "../../hooks/useProjects";
 
@@ -29,6 +30,7 @@ function ProjectDetailPage() {
 	const { data: chapters, isLoading: chaptersLoading } = useChapters(projectId);
 	const createChapter = useCreateChapter();
 	const [opened, { open, close }] = useDisclosure(false);
+	const [cleanupOpened, { open: openCleanup, close: closeCleanup }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [type, setType] = useState<string>("meanwhile");
@@ -77,9 +79,19 @@ function ProjectDetailPage() {
 			</Group>
 			<Group justify="space-between">
 				<Title order={3}>Chapters</Title>
-				<Button onClick={open} disabled={!primaryRepo}>
-					New Chapter
-				</Button>
+				<Group gap="xs">
+					<Link to="/projects/$projectId/graph" params={{ projectId }}>
+						<Button variant="light" size="sm">
+							View Graph
+						</Button>
+					</Link>
+					<Button variant="light" color="red" size="sm" onClick={openCleanup} disabled={!chapters?.length}>
+						Cleanup
+					</Button>
+					<Button onClick={open} disabled={!primaryRepo}>
+						New Chapter
+					</Button>
+				</Group>
 			</Group>
 
 			{chaptersLoading ? (
@@ -123,6 +135,12 @@ function ProjectDetailPage() {
 					</Button>
 				</Stack>
 			</Modal>
+
+			<ChapterCleanupModal
+				chapters={chapters ?? []}
+				opened={cleanupOpened}
+				onClose={closeCleanup}
+			/>
 		</Stack>
 	);
 }

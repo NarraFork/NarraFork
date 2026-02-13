@@ -22,7 +22,7 @@ export async function createToken(userId: string, role: string): Promise<string>
 }
 
 export async function verifyToken(token: string): Promise<JwtPayload> {
-	return verify(token, JWT_SECRET) as Promise<JwtPayload>;
+	return verify(token, JWT_SECRET, "HS256") as unknown as Promise<JwtPayload>;
 }
 
 export async function registerUser(username: string, password: string) {

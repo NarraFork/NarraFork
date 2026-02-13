@@ -140,8 +140,9 @@ export const terminalService = {
 
 	write(terminalId: string, data: string) {
 		const active = activeTerminals.get(terminalId);
-		if (!active?.process.stdin) return;
-		active.process.stdin.write(new TextEncoder().encode(data));
+		const stdin = active?.process.stdin;
+		if (!stdin || typeof stdin === "number") return;
+		stdin.write(new TextEncoder().encode(data));
 	},
 
 	resize(terminalId: string, cols: number, rows: number) {

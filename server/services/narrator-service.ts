@@ -14,7 +14,7 @@ import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 
 interface CreateNarratorInput {
-	chapterId: string;
+	chapterId?: string | null;
 	type?: "primary" | "secondary";
 	model?: string;
 	systemPrompt?: string;
@@ -23,18 +23,20 @@ interface CreateNarratorInput {
 
 export const narratorService = {
 	async create(input: CreateNarratorInput) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.chapterId),
-		});
-		if (!chapter) throw new NotFoundError("Chapter", input.chapterId);
-		if (chapter.status !== "active") {
-			throw new ValidationError("Cannot create narrator for non-active chapter");
+		if (input.chapterId) {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, input.chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", input.chapterId);
+			if (chapter.status !== "active") {
+				throw new ValidationError("Cannot create narrator for non-active chapter");
+			}
 		}
 
 		const type = input.type ?? "primary";
 
-		// Enforce single primary narrator per chapter
-		if (type === "primary") {
+		// Enforce single primary narrator per chapter (only for chapter-bound narrators)
+		if (type === "primary" && input.chapterId) {
 			const existing = await db.query.narrators.findFirst({
 				where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.type, "primary")),
 			});
@@ -50,7 +52,7 @@ export const narratorService = {
 			.insert(narrators)
 			.values({
 				id,
-				chapterId: input.chapterId,
+				chapterId: input.chapterId ?? null,
 				type,
 				model: input.model ?? settings.agent.defaultModel,
 				systemPrompt: input.systemPrompt,

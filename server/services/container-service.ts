@@ -7,7 +7,6 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { settings } from "../lib/settings";
 import { type PortMapping, portAllocator } from "./port-allocator";
 
 export interface ContainerConfig {
@@ -24,7 +23,7 @@ interface ExecResult {
 }
 
 function runtime(): string {
-	return settings.containers.runtime;
+	return "podman";
 }
 
 async function exec(

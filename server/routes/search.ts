@@ -1,0 +1,27 @@
+import { Hono } from "hono";
+import { searchService } from "../services/search-service";
+
+export const searchRoutes = new Hono();
+
+searchRoutes.get("/", async (c) => {
+	const q = c.req.query("q");
+	if (!q || !q.trim()) return c.json({ results: [] });
+
+	const entitiesParam = c.req.query("entities") ?? "chapters,messages";
+	const entities = entitiesParam.split(",").filter((e) => ["chapters", "messages"].includes(e));
+
+	if (entities.length === 0) {
+		return c.json({ results: [] });
+	}
+
+	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
+	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 100);
+
+	const results = searchService.search({
+		query: q.trim(),
+		entities,
+		limit,
+	});
+
+	return c.json({ results });
+});

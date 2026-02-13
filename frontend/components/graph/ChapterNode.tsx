@@ -1,0 +1,66 @@
+import { Badge, Card, Group, Text } from "@mantine/core";
+import { Handle, type NodeProps, Position } from "@xyflow/react";
+import { useNavigate } from "@tanstack/react-router";
+import { CHAPTER_STATUS_COLORS, CHAPTER_TYPE_ICONS } from "../../lib/constants";
+
+interface ChapterNodeData {
+	title: string;
+	chapterType: string;
+	status: string;
+	branch: string;
+	narratorCount: number;
+	hasContainers: boolean;
+	[key: string]: unknown;
+}
+
+export function ChapterNode({ data, id }: NodeProps) {
+	const d = data as ChapterNodeData;
+	const navigate = useNavigate();
+
+	return (
+		<>
+			<Handle type="target" position={Position.Top} />
+			<Card
+				shadow="sm"
+				padding="xs"
+				radius="md"
+				withBorder
+				style={{
+					width: 280,
+					height: 120,
+					cursor: "pointer",
+					borderColor: `var(--mantine-color-${CHAPTER_STATUS_COLORS[d.status] ?? "gray"}-4)`,
+				}}
+				onClick={() => navigate({ to: "/chapters/$chapterId", params: { chapterId: id } })}
+			>
+				<Group justify="space-between" mb={4}>
+					<Group gap={6}>
+						<Text size="xs" c="dimmed" fw={700}>
+							{CHAPTER_TYPE_ICONS[d.chapterType] ?? ""}
+						</Text>
+						<Text size="sm" fw={600} lineClamp={1} style={{ maxWidth: 180 }}>
+							{d.title}
+						</Text>
+					</Group>
+					<Badge size="xs" color={CHAPTER_STATUS_COLORS[d.status] ?? "gray"}>
+						{d.status}
+					</Badge>
+				</Group>
+				<Text size="xs" c="dimmed" lineClamp={1}>
+					{d.branch}
+				</Text>
+				<Group gap={8} mt={4}>
+					<Text size="xs" c="dimmed">
+						{d.narratorCount} narrator{d.narratorCount !== 1 ? "s" : ""}
+					</Text>
+					{d.hasContainers && (
+						<Badge size="xs" variant="dot" color="teal">
+							containers
+						</Badge>
+					)}
+				</Group>
+			</Card>
+			<Handle type="source" position={Position.Bottom} />
+		</>
+	);
+}

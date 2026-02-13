@@ -1,7 +1,8 @@
-import { AppShell, Burger, Group, NavLink, Title } from "@mantine/core";
+import { AppShell, Burger, Group, NavLink, TextInput, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import type { QueryClient } from "@tanstack/react-query";
-import { createRootRouteWithContext, Link, Outlet } from "@tanstack/react-router";
+import { createRootRouteWithContext, Link, Outlet, useNavigate } from "@tanstack/react-router";
+import { useState } from "react";
 
 interface RouterContext {
 	queryClient: QueryClient;
@@ -13,6 +14,14 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 
 function RootLayout() {
 	const [opened, { toggle }] = useDisclosure();
+	const [searchQuery, setSearchQuery] = useState("");
+	const navigate = useNavigate();
+
+	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
+		if (e.key === "Enter" && searchQuery.trim()) {
+			navigate({ to: "/search", search: { q: searchQuery.trim() } });
+		}
+	};
 
 	return (
 		<AppShell
@@ -21,15 +30,26 @@ function RootLayout() {
 			padding="md"
 		>
 			<AppShell.Header>
-				<Group h="100%" px="md">
-					<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-					<Title order={3}>NarraFork</Title>
+				<Group h="100%" px="md" justify="space-between">
+					<Group>
+						<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+						<Title order={3}>NarraFork</Title>
+					</Group>
+					<TextInput
+						placeholder="Search chapters & messages..."
+						size="sm"
+						style={{ width: 300 }}
+						value={searchQuery}
+						onChange={(e) => setSearchQuery(e.currentTarget.value)}
+						onKeyDown={handleSearchKeyDown}
+					/>
 				</Group>
 			</AppShell.Header>
 
 			<AppShell.Navbar p="md">
 				<NavLink component={Link} to="/" label="Dashboard" />
 				<NavLink component={Link} to="/projects" label="Projects" />
+				<NavLink component={Link} to="/sessions" label="Sessions" />
 				<NavLink component={Link} to="/settings" label="Settings" />
 			</AppShell.Navbar>
 

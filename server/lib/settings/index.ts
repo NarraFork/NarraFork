@@ -19,7 +19,6 @@ export interface NarraForkSettings {
 		dormantAfterMinutes: number;
 	};
 	containers: {
-		runtime: "podman" | "docker";
 		portRangeStart: number;
 		portRangeEnd: number;
 	};
@@ -48,7 +47,6 @@ const DEFAULTS: NarraForkSettings = {
 		dormantAfterMinutes: 0,
 	},
 	containers: {
-		runtime: "podman",
 		portRangeStart: 10000,
 		portRangeEnd: 20000,
 	},

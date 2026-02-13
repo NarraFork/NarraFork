@@ -159,12 +159,24 @@ export async function* startSession(
 	}
 
 	const narrator = await narratorService.getById(narratorId);
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-	});
-	if (!chapter) throw new NotFoundError("Chapter", narrator.chapterId);
-	if (!chapter.worktreePath) {
-		throw new Error("Chapter has no worktree (dormant?)");
+
+	// Standalone sessions (no chapter) use home dir; chapter-bound sessions use worktree
+	let sessionCwd: string;
+	let chapter: Awaited<ReturnType<typeof db.query.chapters.findFirst>> | null = null;
+
+	if (narrator.chapterId) {
+		const ch = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+		});
+		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
+		if (!ch.worktreePath) {
+			throw new Error("Chapter has no worktree (dormant?)");
+		}
+		chapter = ch;
+		sessionCwd = ch.worktreePath;
+	} else {
+		// Standalone session
+		sessionCwd = process.env.HOME ?? "/tmp";
 	}
 
 	// Persist user message
@@ -177,6 +189,7 @@ export async function* startSession(
 
 	// Determine if this is a fork-on-first-message scenario (full inheritance mode)
 	const isFullFork =
+		chapter &&
 		narrator.inheritMode === "full" &&
 		narrator.parentNarratorId &&
 		narrator.claudeSessionId &&
@@ -184,7 +197,7 @@ export async function* startSession(
 
 	// For full fork, get the fork point message UUID from the chapter
 	let resumeSessionAt: string | undefined;
-	if (isFullFork && chapter.forkPoint) {
+	if (isFullFork && chapter?.forkPoint) {
 		const fp = chapter.forkPoint as { commitSha: string; narratorMessageUuid?: string };
 		resumeSessionAt = fp.narratorMessageUuid;
 	}
@@ -192,7 +205,7 @@ export async function* startSession(
 	const sdkQuery = query({
 		prompt,
 		options: {
-			cwd: chapter.worktreePath,
+			cwd: sessionCwd,
 			model: narrator.model ?? settings.agent.defaultModel,
 			resume: narrator.claudeSessionId ?? undefined,
 			...(isFullFork && { forkSession: true }),

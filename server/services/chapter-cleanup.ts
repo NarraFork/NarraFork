@@ -197,7 +197,7 @@ export const chapterCleanup = {
 			}
 		}
 
-		logger.info("Batch cleanup completed", report);
+		logger.info("Batch cleanup completed", report as unknown as Record<string, unknown>);
 		return report;
 	},
 

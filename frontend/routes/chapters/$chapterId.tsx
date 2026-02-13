@@ -1,6 +1,11 @@
-import { Badge, Box, Button, Code, Group, Loader, Paper, Stack, Text, Title } from "@mantine/core";
+import { Badge, Box, Button, Code, Collapse, Group, Loader, Paper, Stack, Text, Title } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useRef, useState } from "react";
+import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
+import { ChapterMergeModal } from "../../components/chapter/ChapterMergeModal";
+import { ContainerLogs } from "../../components/container/ContainerLogs";
+import { ContainerStatus } from "../../components/container/ContainerStatus";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { TerminalTabs } from "../../components/terminal/TerminalTabs";
 import { useChapter } from "../../hooks/useChapters";
@@ -23,6 +28,9 @@ function ChapterDetailPage() {
 	const [terminalHeight, setTerminalHeight] = useState(DEFAULT_TERMINAL_HEIGHT);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const dragging = useRef(false);
+	const [forkOpened, { open: openFork, close: closeFork }] = useDisclosure(false);
+	const [mergeOpened, { open: openMerge, close: closeMerge }] = useDisclosure(false);
+	const [containersOpen, { toggle: toggleContainers }] = useDisclosure(false);
 
 	const onDragStart = useCallback((e: React.MouseEvent) => {
 		e.preventDefault();
@@ -63,10 +71,25 @@ function ChapterDetailPage() {
 		>
 			{/* Chapter info header */}
 			<Box p="xs">
-				<Group>
-					<Title order={2}>{chapter.title}</Title>
-					<Badge color={chapter.type === "meanwhile" ? "indigo" : "orange"}>{chapter.type}</Badge>
-					<Badge color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>{chapter.status}</Badge>
+				<Group justify="space-between">
+					<Group>
+						<Title order={2}>{chapter.title}</Title>
+						<Badge color={chapter.type === "meanwhile" ? "indigo" : "orange"}>{chapter.type}</Badge>
+						<Badge color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>{chapter.status}</Badge>
+					</Group>
+					{chapter.status === "active" && (
+						<Group gap="xs">
+							<Button size="xs" variant="light" onClick={openFork}>
+								Fork
+							</Button>
+							<Button size="xs" variant="light" color="green" onClick={openMerge}>
+								Merge
+							</Button>
+							<Button size="xs" variant="light" color="gray" onClick={toggleContainers}>
+								Containers
+							</Button>
+						</Group>
+					)}
 				</Group>
 
 				{chapter.description && <Text c="dimmed">{chapter.description}</Text>}
@@ -87,6 +110,13 @@ function ChapterDetailPage() {
 						</Group>
 					</Group>
 				</Paper>
+
+				<Collapse in={containersOpen}>
+					<Paper withBorder p="sm" mt="xs">
+						<ContainerStatus chapterId={chapterId} />
+						<ContainerLogs chapterId={chapterId} />
+					</Paper>
+				</Collapse>
 			</Box>
 
 			{/* Narrator panel */}
@@ -135,6 +165,14 @@ function ChapterDetailPage() {
 			>
 				<TerminalTabs chapterId={chapterId} />
 			</Box>
+
+			<ChapterForkModal chapterId={chapterId} opened={forkOpened} onClose={closeFork} />
+			<ChapterMergeModal
+				chapterId={chapterId}
+				projectId={chapter.projectId}
+				opened={mergeOpened}
+				onClose={closeMerge}
+			/>
 		</Box>
 	);
 }

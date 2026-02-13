@@ -72,9 +72,7 @@ export const narrators = sqliteTable(
 	"narrators",
 	{
 		id: text("id").primaryKey(),
-		chapterId: text("chapter_id")
-			.notNull()
-			.references(() => chapters.id),
+		chapterId: text("chapter_id").references(() => chapters.id),
 		claudeSessionId: text("claude_session_id"),
 		type: text("type", { enum: ["primary", "secondary"] })
 			.notNull()

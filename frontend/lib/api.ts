@@ -105,4 +105,58 @@ export const api = {
 		request<any>("/terminals", { method: "POST", body: JSON.stringify(data) }),
 	getTerminal: (id: string) => request<any>(`/terminals/${id}`),
 	deleteTerminal: (id: string) => request<any>(`/terminals/${id}`, { method: "DELETE" }),
+
+	// Graph
+	getProjectGraph: (projectId: string) =>
+		request<{ nodes: any[]; edges: any[] }>(`/projects/${projectId}/graph`),
+
+	// Search
+	search: (q: string, entities = "chapters,messages") =>
+		request<{ results: any[] }>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
+
+	// Standalone Sessions
+	listSessions: () => request<any[]>("/sessions"),
+	getSession: (id: string) => request<any>(`/sessions/${id}`),
+	createSession: (data: { model?: string; systemPrompt?: string; permissionMode?: string }) =>
+		request<any>("/sessions", { method: "POST", body: JSON.stringify(data) }),
+	deleteSession: (id: string) => request<any>(`/sessions/${id}`, { method: "DELETE" }),
+	getSessionMessages: (id: string, limit?: number) =>
+		request<any[]>(`/sessions/${id}/messages${limit ? `?limit=${limit}` : ""}`),
+
+	// Containers
+	getContainers: (chapterId: string) => request<any[]>(`/chapters/${chapterId}/containers`),
+	startContainers: (chapterId: string) =>
+		request<any>(`/chapters/${chapterId}/containers/start`, { method: "POST" }),
+	stopContainers: (chapterId: string) =>
+		request<any>(`/chapters/${chapterId}/containers/stop`, { method: "POST" }),
+	pauseContainers: (chapterId: string) =>
+		request<any>(`/chapters/${chapterId}/containers/pause`, { method: "POST" }),
+	unpauseContainers: (chapterId: string) =>
+		request<any>(`/chapters/${chapterId}/containers/unpause`, { method: "POST" }),
+	getContainerLogs: (chapterId: string, opts?: { tail?: number; service?: string }) => {
+		const params = new URLSearchParams();
+		if (opts?.tail) params.set("tail", String(opts.tail));
+		if (opts?.service) params.set("service", opts.service);
+		const qs = params.toString();
+		return request<{ logs: string }>(`/chapters/${chapterId}/containers/logs${qs ? `?${qs}` : ""}`);
+	},
+	removeContainers: (chapterId: string, opts?: { deleteVolumes?: boolean }) =>
+		request<any>(`/chapters/${chapterId}/containers/remove`, {
+			method: "POST",
+			body: JSON.stringify(opts ?? {}),
+		}),
+
+	// Chapter operations (fork/merge/cleanup)
+	forkChapter: (id: string, data: { title: string; description?: string; type?: string; inheritMode?: string }) =>
+		request<any>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
+	checkMergeConflicts: (id: string, targetChapterId: string) =>
+		request<any>(`/chapters/${id}/merge-check?targetChapterId=${targetChapterId}`),
+	mergeChapter: (id: string, data: { targetChapterId: string; strategy?: string; message?: string }) =>
+		request<any>(`/chapters/${id}/merge`, { method: "POST", body: JSON.stringify(data) }),
+	cleanupChapters: (data: { chapterIds: string[]; force?: boolean; deleteBranch?: boolean }) =>
+		request<any>("/chapters/cleanup", { method: "POST", body: JSON.stringify(data) }),
+	dormantChapter: (id: string) =>
+		request<any>(`/chapters/${id}/dormant`, { method: "POST" }),
+	wakeChapter: (id: string) =>
+		request<any>(`/chapters/${id}/wake`, { method: "POST" }),
 };

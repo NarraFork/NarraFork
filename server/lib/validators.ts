@@ -139,3 +139,13 @@ export const loginSchema = z.object({
 export const adminUpdateSettingsSchema = z.object({
 	registrationOpen: z.boolean(),
 });
+
+// === Sessions (standalone) ===
+
+export const createSessionSchema = z.object({
+	model: z.string().optional(),
+	systemPrompt: z.string().max(10000).optional(),
+	permissionMode: z
+		.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"])
+		.optional(),
+});
