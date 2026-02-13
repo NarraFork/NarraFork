@@ -6,6 +6,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { terminalService } from "./terminal-service";
 
@@ -33,6 +34,18 @@ export const chapterCleanup = {
 
 		// Kill terminals
 		await terminalService.cleanupForChapter(chapterId);
+
+		// Pause containers (if any)
+		if (chapter.containerConfig) {
+			try {
+				await containerService.pauseChapterContainers(chapterId);
+			} catch (err) {
+				logger.warn("Failed to pause containers during dormant", {
+					chapterId,
+					error: String(err),
+				});
+			}
+		}
 
 		// Auto-commit uncommitted changes
 		await gitService.autoCommit(chapter.worktreePath, "auto-save before dormant");
@@ -74,6 +87,18 @@ export const chapterCleanup = {
 			.update(chapters)
 			.set({ status: "active", worktreePath, lastAccessedAt: now, updatedAt: now })
 			.where(eq(chapters.id, chapterId));
+
+		// Restart containers (if chapter has containerConfig)
+		if (chapter.containerConfig) {
+			try {
+				await containerService.unpauseChapterContainers(chapterId);
+			} catch (err) {
+				logger.warn("Failed to unpause containers during wake", {
+					chapterId,
+					error: String(err),
+				});
+			}
+		}
 
 		logger.info("Chapter woken", { chapterId, worktreePath });
 		eventBus.emit({ type: "chapter:woken", chapterId });
@@ -119,6 +144,20 @@ export const chapterCleanup = {
 
 				// Kill terminals
 				await terminalService.cleanupForChapter(chapterId);
+
+				// Stop and remove containers
+				if (chapter.containerConfig) {
+					try {
+						await containerService.removeChapterContainers(chapterId, {
+							deleteVolumes: options.deleteBranch,
+						});
+					} catch (err) {
+						logger.warn("Failed to remove containers during cleanup", {
+							chapterId,
+							error: String(err),
+						});
+					}
+				}
 
 				// Remove worktree
 				if (chapter.worktreePath) {

@@ -100,6 +100,26 @@ export const batchMergeSchema = z.object({
 	strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),
 });
 
+// === Containers ===
+
+export const containerConfigSchema = z.object({
+	composeFile: z.string().max(500).optional(),
+	services: z.array(z.string().min(1)).optional(),
+	ports: z
+		.array(
+			z.object({
+				containerPort: z.number().int().min(1).max(65535),
+				serviceName: z.string().min(1),
+			}),
+		)
+		.optional(),
+	env: z.record(z.string(), z.string()).optional(),
+});
+
+export const containerRemoveSchema = z.object({
+	deleteVolumes: z.boolean().optional(),
+});
+
 // === Auth ===
 
 export const registerSchema = z.object({

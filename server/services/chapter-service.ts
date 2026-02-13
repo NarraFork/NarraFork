@@ -7,12 +7,12 @@ import {
 	narrators,
 	portAllocations,
 	repositories,
-	terminals,
 } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { terminalService } from "./terminal-service";
@@ -152,8 +152,19 @@ export const chapterService = {
 
 		// Kill running terminals and delete records
 		await terminalService.cleanupForChapter(id);
-		await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
-		await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+
+		// Stop and remove containers (+ release ports)
+		try {
+			await containerService.removeChapterContainers(id, { deleteVolumes: true });
+		} catch (err) {
+			logger.warn("Failed to remove containers during chapter delete", {
+				chapterId: id,
+				error: String(err),
+			});
+			// Fall back to DB-only cleanup
+			await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+			await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+		}
 
 		if (chapter.worktreePath) {
 			const repo = await db.query.repositories.findFirst({

@@ -3,6 +3,7 @@ import { ValidationError } from "../lib/errors";
 import {
 	batchCleanupSchema,
 	batchMergeSchema,
+	containerRemoveSchema,
 	createChapterSchema,
 	forkChapterSchema,
 	mergeChapterSchema,
@@ -13,6 +14,7 @@ import { chapterCleanup } from "../services/chapter-cleanup";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
+import { containerService } from "../services/container-service";
 
 export const chapterRoutes = new Hono();
 
@@ -120,4 +122,58 @@ chapterRoutes.post("/batch-merge", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const result = await chapterBatchMerge.run(parsed.data);
 	return c.json(result, 201);
+});
+
+// === Containers ===
+
+chapterRoutes.get("/:id/containers", async (c) => {
+	const id = c.req.param("id");
+	const instances = await containerService.listByChapter(id);
+	return c.json(instances);
+});
+
+chapterRoutes.post("/:id/containers/start", async (c) => {
+	const id = c.req.param("id");
+	await containerService.startChapterContainers(id);
+	return c.json({ ok: true });
+});
+
+chapterRoutes.post("/:id/containers/stop", async (c) => {
+	const id = c.req.param("id");
+	await containerService.stopChapterContainers(id);
+	return c.json({ ok: true });
+});
+
+chapterRoutes.post("/:id/containers/pause", async (c) => {
+	const id = c.req.param("id");
+	await containerService.pauseChapterContainers(id);
+	return c.json({ ok: true });
+});
+
+chapterRoutes.post("/:id/containers/unpause", async (c) => {
+	const id = c.req.param("id");
+	await containerService.unpauseChapterContainers(id);
+	return c.json({ ok: true });
+});
+
+chapterRoutes.get("/:id/containers/logs", async (c) => {
+	const id = c.req.param("id");
+	const tail = c.req.query("tail");
+	const service = c.req.query("service");
+	const logs = await containerService.getContainerLogs(id, {
+		tail: tail ? Number.parseInt(tail, 10) : undefined,
+		service: service ?? undefined,
+	});
+	return c.json({ logs });
+});
+
+chapterRoutes.post("/:id/containers/remove", async (c) => {
+	const id = c.req.param("id");
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = containerRemoveSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await containerService.removeChapterContainers(id, {
+		deleteVolumes: parsed.data.deleteVolumes,
+	});
+	return c.json({ ok: true });
 });

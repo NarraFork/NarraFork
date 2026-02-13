@@ -6,6 +6,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorContext } from "./narrator-context";
 
@@ -125,7 +126,64 @@ export const chapterFork = {
 				});
 			}
 
-			// Steps 5-6: Container startup and startup script are Phase 4 concerns
+			// Step 5: Start containers (if parent has containerConfig)
+			if (parent.containerConfig) {
+				// Copy containerConfig to forked chapter
+				await db
+					.update(chapters)
+					.set({ containerConfig: parent.containerConfig, updatedAt: now })
+					.where(eq(chapters.id, id));
+
+				try {
+					await containerService.startChapterContainers(id);
+					rollback.push(async () => {
+						try {
+							await containerService.removeChapterContainers(id, { deleteVolumes: true });
+						} catch {
+							// best effort
+						}
+					});
+				} catch (err) {
+					logger.warn("Container startup failed during fork (non-fatal)", {
+						chapterId: id,
+						error: String(err),
+					});
+				}
+			}
+
+			// Step 6: Execute startup script (if repo has one)
+			if (repo.startupScript) {
+				try {
+					const proc = Bun.spawn(["sh", "-c", repo.startupScript], {
+						cwd: worktreePath,
+						stdout: "pipe",
+						stderr: "pipe",
+						env: {
+							...process.env,
+							NARRAFORK_CHAPTER_ID: id,
+						},
+					});
+					const timeout = setTimeout(() => {
+						proc.kill();
+						logger.warn("Startup script timed out during fork", { chapterId: id });
+					}, 60_000);
+					const exitCode = await proc.exited;
+					clearTimeout(timeout);
+					if (exitCode !== 0) {
+						const stderr = await new Response(proc.stderr).text();
+						logger.warn("Startup script failed during fork (non-fatal)", {
+							chapterId: id,
+							exitCode,
+							stderr: stderr.trim(),
+						});
+					}
+				} catch (err) {
+					logger.warn("Startup script error during fork (non-fatal)", {
+						chapterId: id,
+						error: String(err),
+					});
+				}
+			}
 
 			logger.info("Chapter forked", {
 				id,
