@@ -25,8 +25,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 	const response = await fetch(`${BASE}${path}`, { ...options, headers });
 	if (response.status === 401) {
 		clearToken();
-		window.location.href = "/login";
-		throw new Error("Session expired");
+		throw new Error("Unauthorized");
 	}
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ error: response.statusText }));
@@ -98,6 +97,13 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ message }),
 		}),
+	updateNarratorTitle: (id: string, title: string) =>
+		request<{ ok: boolean; title: string }>(`/narrators/${id}/title`, {
+			method: "PATCH",
+			body: JSON.stringify({ title }),
+		}),
+	generateNarratorTitle: (id: string) =>
+		request<{ title: string }>(`/narrators/${id}/generate-title`, { method: "POST" }),
 
 	// Terminals
 	listTerminals: (chapterId: string) => request<any[]>(`/terminals?chapterId=${chapterId}`),
@@ -122,6 +128,13 @@ export const api = {
 	deleteSession: (id: string) => request<any>(`/sessions/${id}`, { method: "DELETE" }),
 	getSessionMessages: (id: string, limit?: number) =>
 		request<any[]>(`/sessions/${id}/messages${limit ? `?limit=${limit}` : ""}`),
+	updateSessionTitle: (id: string, title: string) =>
+		request<{ ok: boolean; title: string }>(`/sessions/${id}/title`, {
+			method: "PATCH",
+			body: JSON.stringify({ title }),
+		}),
+	generateSessionTitle: (id: string) =>
+		request<{ title: string }>(`/sessions/${id}/generate-title`, { method: "POST" }),
 
 	// Containers
 	getContainers: (chapterId: string) => request<any[]>(`/chapters/${chapterId}/containers`),

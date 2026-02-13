@@ -1,6 +1,7 @@
 import "@frontend/lib/i18n";
 import { createTheme, MantineProvider } from "@mantine/core";
 import "@mantine/core/styles.css";
+import { registerSW } from "virtual:pwa-register";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRouter, RouterProvider } from "@tanstack/react-router";
 import React from "react";
@@ -31,9 +32,20 @@ declare module "@tanstack/react-router" {
 	}
 }
 
+const updateSW = registerSW({
+	onNeedRefresh() {
+		if (confirm("New version available. Reload to update?")) {
+			updateSW(true);
+		}
+	},
+	onOfflineReady() {
+		console.log("App ready to work offline");
+	},
+});
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
 	<React.StrictMode>
-		<MantineProvider theme={theme} defaultColorScheme="dark">
+		<MantineProvider theme={theme} defaultColorScheme="auto">
 			<QueryClientProvider client={queryClient}>
 				<RouterProvider router={router} />
 			</QueryClientProvider>

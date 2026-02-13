@@ -17,12 +17,11 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 		if (!terminalId) return;
 
 		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-		const host = window.location.hostname;
-		const port = import.meta.env.DEV ? "7778" : window.location.port;
 		const token = getToken();
 		const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+		// Use current host:port — Vite proxy handles /ws in dev
 		const ws = new WebSocket(
-			`${protocol}//${host}:${port}/ws/terminal?terminalId=${terminalId}${tokenParam}`,
+			`${protocol}//${window.location.host}/ws/terminal?terminalId=${terminalId}${tokenParam}`,
 		);
 		wsRef.current = ws;
 

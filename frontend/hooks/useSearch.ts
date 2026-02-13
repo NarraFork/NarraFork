@@ -2,7 +2,11 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 
-export function useSearch(query: string, entities = "chapters,messages") {
+export function useSearch(
+	query: string,
+	entities = "chapters,messages,narrators",
+	forceSearch = false,
+) {
 	const [debouncedQuery, setDebouncedQuery] = useState(query);
 
 	useEffect(() => {
@@ -10,9 +14,14 @@ export function useSearch(query: string, entities = "chapters,messages") {
 		return () => clearTimeout(timer);
 	}, [query]);
 
-	return useQuery({
-		queryKey: ["search", debouncedQuery, entities],
-		queryFn: () => api.search(debouncedQuery, entities),
-		enabled: debouncedQuery.length >= 2,
-	});
+	const isShortQuery = debouncedQuery.length > 0 && debouncedQuery.length < 3;
+
+	return {
+		...useQuery({
+			queryKey: ["search", debouncedQuery, entities],
+			queryFn: () => api.search(debouncedQuery, entities),
+			enabled: debouncedQuery.length >= 3 || (isShortQuery && forceSearch),
+		}),
+		isShortQuery,
+	};
 }

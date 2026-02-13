@@ -5,9 +5,12 @@ export const CHAPTER_STATUS_COLORS: Record<string, string> = {
 	abandoned: "gray",
 };
 
-export const CHAPTER_TYPE_ICONS: Record<string, string> = {
-	meanwhile: "\u27C2",
-	whatif: "?",
+export const NARRATOR_STATUS_COLORS: Record<string, string> = {
+	idle: "gray",
+	thinking: "blue",
+	waiting: "yellow",
+	archived: "dark",
+	error: "red",
 };
 
 export const CONTAINER_STATUS_COLORS: Record<string, string> = {
