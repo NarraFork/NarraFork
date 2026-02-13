@@ -21,14 +21,16 @@ interface NarratorPanelProps {
 	narratorId: string;
 	narrator: {
 		id: string;
+		chapterId?: string | null;
 		model: string | null;
 		status: string;
 		totalCostUsd: number | null;
 		permissionMode: string | null;
 	};
+	onForkFromMessage?: (sdkMessageUuid: string) => void;
 }
 
-export function NarratorPanel({ narratorId, narrator }: NarratorPanelProps) {
+export function NarratorPanel({ narratorId, narrator, onForkFromMessage }: NarratorPanelProps) {
 	const { data: dbMessages, isLoading } = useNarratorMessages(narratorId);
 	const interruptMutation = useInterruptNarrator();
 	const qc = useQueryClient();
@@ -185,7 +187,11 @@ export function NarratorPanel({ narratorId, narrator }: NarratorPanelProps) {
 			<ScrollArea flex={1} viewportRef={viewportRef} p="sm">
 				<Stack gap="sm">
 					{messages.map((msg: any) => (
-						<MessageBubble key={msg.id} message={msg} />
+						<MessageBubble
+							key={msg.id}
+							message={msg}
+							onForkFromMessage={narrator.chapterId ? onForkFromMessage : undefined}
+						/>
 					))}
 					{streamingText && (
 						<MessageBubble

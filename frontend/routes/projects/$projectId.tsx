@@ -16,6 +16,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { ChapterCard } from "../../components/chapter/ChapterCard";
+import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useProject } from "../../hooks/useProjects";
@@ -31,6 +32,7 @@ function ProjectDetailPage() {
 	const createChapter = useCreateChapter();
 	const [opened, { open, close }] = useDisclosure(false);
 	const [cleanupOpened, { open: openCleanup, close: closeCleanup }] = useDisclosure(false);
+	const [batchMergeOpened, { open: openBatchMerge, close: closeBatchMerge }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [type, setType] = useState<string>("meanwhile");
@@ -88,6 +90,9 @@ function ProjectDetailPage() {
 					<Button variant="light" color="red" size="sm" onClick={openCleanup} disabled={!chapters?.length}>
 						Cleanup
 					</Button>
+					<Button variant="light" color="green" size="sm" onClick={openBatchMerge} disabled={!chapters?.length}>
+						Batch Merge
+					</Button>
 					<Button onClick={open} disabled={!primaryRepo}>
 						New Chapter
 					</Button>
@@ -140,6 +145,11 @@ function ProjectDetailPage() {
 				chapters={chapters ?? []}
 				opened={cleanupOpened}
 				onClose={closeCleanup}
+			/>
+			<ChapterBatchMergeModal
+				chapters={chapters ?? []}
+				opened={batchMergeOpened}
+				onClose={closeBatchMerge}
 			/>
 		</Stack>
 	);

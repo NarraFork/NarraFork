@@ -13,6 +13,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { containerService } from "./container-service";
+import { chapterCleanup } from "./chapter-cleanup";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { terminalService } from "./terminal-service";
@@ -85,6 +86,7 @@ export const chapterService = {
 
 			logger.info("Chapter created", { id, branch: branchName, worktreePath });
 			eventBus.emit({ type: "chapter:created", chapterId: id, projectId: input.projectId });
+			chapterCleanup.scheduleAutoDormant(input.projectId);
 			return chapter;
 		} catch (err) {
 			logger.error("Chapter creation failed, rolling back", { error: String(err) });
@@ -104,6 +106,17 @@ export const chapterService = {
 			where: eq(chapters.id, id),
 		});
 		if (!chapter) throw new NotFoundError("Chapter", id);
+
+		// Touch lastAccessedAt and schedule auto-dormant check
+		if (chapter.status === "active") {
+			const now = new Date().toISOString();
+			await db
+				.update(chapters)
+				.set({ lastAccessedAt: now })
+				.where(eq(chapters.id, id));
+			chapterCleanup.scheduleAutoDormant(chapter.projectId);
+		}
+
 		return chapter;
 	},
 

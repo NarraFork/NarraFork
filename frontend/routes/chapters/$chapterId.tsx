@@ -31,6 +31,17 @@ function ChapterDetailPage() {
 	const [forkOpened, { open: openFork, close: closeFork }] = useDisclosure(false);
 	const [mergeOpened, { open: openMerge, close: closeMerge }] = useDisclosure(false);
 	const [containersOpen, { toggle: toggleContainers }] = useDisclosure(false);
+	const [forkAtMessageUuid, setForkAtMessageUuid] = useState<string | undefined>();
+
+	const handleForkFromMessage = useCallback((sdkMessageUuid: string) => {
+		setForkAtMessageUuid(sdkMessageUuid);
+		openFork();
+	}, [openFork]);
+
+	const handleForkClose = useCallback(() => {
+		setForkAtMessageUuid(undefined);
+		closeFork();
+	}, [closeFork]);
 
 	const onDragStart = useCallback((e: React.MouseEvent) => {
 		e.preventDefault();
@@ -124,7 +135,11 @@ function ChapterDetailPage() {
 				{narratorsLoading ? (
 					<Loader />
 				) : primaryNarrator ? (
-					<NarratorPanel narratorId={primaryNarrator.id} narrator={primaryNarrator} />
+					<NarratorPanel
+						narratorId={primaryNarrator.id}
+						narrator={primaryNarrator}
+						onForkFromMessage={handleForkFromMessage}
+					/>
 				) : (
 					<Paper withBorder p="xl" h="100%">
 						<Stack align="center" justify="center" h="100%">
@@ -166,7 +181,12 @@ function ChapterDetailPage() {
 				<TerminalTabs chapterId={chapterId} />
 			</Box>
 
-			<ChapterForkModal chapterId={chapterId} opened={forkOpened} onClose={closeFork} />
+			<ChapterForkModal
+				chapterId={chapterId}
+				opened={forkOpened}
+				onClose={handleForkClose}
+				forkAtMessageUuid={forkAtMessageUuid}
+			/>
 			<ChapterMergeModal
 				chapterId={chapterId}
 				projectId={chapter.projectId}

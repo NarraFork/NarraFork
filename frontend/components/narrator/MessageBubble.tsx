@@ -1,4 +1,4 @@
-import { Paper, Stack, Text } from "@mantine/core";
+import { ActionIcon, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
@@ -7,12 +7,15 @@ interface MessageBubbleProps {
 		contentJson: any[];
 		contentText?: string;
 		toolCalls?: any[];
+		sdkMessageUuid?: string;
 	};
+	onForkFromMessage?: (sdkMessageUuid: string) => void;
 }
 
-export function MessageBubble({ message }: MessageBubbleProps) {
+export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
 
 	return (
 		<Paper
@@ -23,9 +26,23 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 			mr={isUser ? 0 : 40}
 		>
 			<Stack gap={4}>
-				<Text size="xs" fw={600} c="dimmed">
-					{isUser ? "You" : "Narrator"}
-				</Text>
+				<Group justify="space-between">
+					<Text size="xs" fw={600} c="dimmed">
+						{isUser ? "You" : "Narrator"}
+					</Text>
+					{canFork && (
+						<Tooltip label="Fork from this message">
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="gray"
+								onClick={() => onForkFromMessage(message.sdkMessageUuid!)}
+							>
+								&#x2442;
+							</ActionIcon>
+						</Tooltip>
+					)}
+				</Group>
 				{blocks.map((block: any, i: number) => {
 					const key = block.id ?? `${block.type}-${i}`;
 					if (block.type === "text") {

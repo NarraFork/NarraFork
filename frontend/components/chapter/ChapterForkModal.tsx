@@ -1,5 +1,5 @@
 import { Alert, Button, Modal, Select, Stack, Text, Textarea, TextInput } from "@mantine/core";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api";
 
@@ -7,14 +7,22 @@ interface ChapterForkModalProps {
 	chapterId: string;
 	opened: boolean;
 	onClose: () => void;
+	forkAtMessageUuid?: string;
 }
 
-export function ChapterForkModal({ chapterId, opened, onClose }: ChapterForkModalProps) {
+export function ChapterForkModal({ chapterId, opened, onClose, forkAtMessageUuid }: ChapterForkModalProps) {
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [type, setType] = useState<string>("meanwhile");
 	const [inheritMode, setInheritMode] = useState<string>("fresh");
 	const qc = useQueryClient();
+
+	// When forking from a specific message, default to full inheritance
+	useEffect(() => {
+		if (forkAtMessageUuid) {
+			setInheritMode("full");
+		}
+	}, [forkAtMessageUuid]);
 
 	const resetState = () => {
 		setTitle("");
@@ -34,6 +42,7 @@ export function ChapterForkModal({ chapterId, opened, onClose }: ChapterForkModa
 			description: description.trim() || undefined,
 			type,
 			inheritMode,
+			forkAtMessageUuid,
 		}),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
@@ -45,6 +54,11 @@ export function ChapterForkModal({ chapterId, opened, onClose }: ChapterForkModa
 	return (
 		<Modal opened={opened} onClose={handleClose} title="Fork Chapter">
 			<Stack>
+				{forkAtMessageUuid && (
+					<Alert color="blue" variant="light">
+						Forking from a specific message point. The new narrator will inherit conversation history up to this message.
+					</Alert>
+				)}
 				<TextInput
 					label="Title"
 					placeholder="New branch title"

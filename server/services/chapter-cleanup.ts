@@ -236,4 +236,31 @@ export const chapterCleanup = {
 		}
 		return dormanted;
 	},
+
+	/**
+	 * Debounced auto-dormant trigger. Multiple calls within the debounce window
+	 * (30 seconds) for the same projectId are collapsed into a single execution.
+	 */
+	_dormantTimers: new Map<string, ReturnType<typeof setTimeout>>(),
+
+	scheduleAutoDormant(projectId: string): void {
+		if (settings.chapters.maxActiveWorktrees <= 0) return;
+
+		const existing = this._dormantTimers.get(projectId);
+		if (existing) clearTimeout(existing);
+
+		const timer = setTimeout(async () => {
+			this._dormantTimers.delete(projectId);
+			try {
+				await this.dormantInactiveChapters(projectId);
+			} catch (err) {
+				logger.warn("Scheduled auto-dormant failed", {
+					projectId,
+					error: String(err),
+				});
+			}
+		}, 30_000);
+
+		this._dormantTimers.set(projectId, timer);
+	},
 };

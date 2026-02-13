@@ -147,7 +147,7 @@ export const api = {
 		}),
 
 	// Chapter operations (fork/merge/cleanup)
-	forkChapter: (id: string, data: { title: string; description?: string; type?: string; inheritMode?: string }) =>
+	forkChapter: (id: string, data: { title: string; description?: string; type?: string; inheritMode?: string; forkAtMessageUuid?: string }) =>
 		request<any>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
 	checkMergeConflicts: (id: string, targetChapterId: string) =>
 		request<any>(`/chapters/${id}/merge-check?targetChapterId=${targetChapterId}`),
@@ -155,6 +155,8 @@ export const api = {
 		request<any>(`/chapters/${id}/merge`, { method: "POST", body: JSON.stringify(data) }),
 	cleanupChapters: (data: { chapterIds: string[]; force?: boolean; deleteBranch?: boolean }) =>
 		request<any>("/chapters/cleanup", { method: "POST", body: JSON.stringify(data) }),
+	batchMerge: (data: { baseChapterId: string; sourceChapterIds: string[]; title: string; strategy?: string }) =>
+		request<any>("/chapters/batch-merge", { method: "POST", body: JSON.stringify(data) }),
 	dormantChapter: (id: string) =>
 		request<any>(`/chapters/${id}/dormant`, { method: "POST" }),
 	wakeChapter: (id: string) =>
