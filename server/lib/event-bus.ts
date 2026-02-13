@@ -59,9 +59,10 @@ export type NarraForkEvent =
 	  }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
-	| { type: "narrator:completed"; narratorId: string }
+	| { type: "narrator:status_changed"; narratorId: string; status: string }
 	| { type: "narrator:error"; narratorId: string; error: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
+	| { type: "narrator:title_updated"; narratorId: string; title: string }
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }

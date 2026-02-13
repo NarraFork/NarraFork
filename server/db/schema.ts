@@ -77,12 +77,13 @@ export const narrators = sqliteTable(
 		type: text("type", { enum: ["primary", "secondary"] })
 			.notNull()
 			.default("primary"),
+		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
 			.default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
 		contextSummary: text("context_summary"),
-		model: text("model").default("claude-sonnet-4-5"),
+		model: text("model").default("sonnet"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
 			enum: ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"],
@@ -90,9 +91,9 @@ export const narrators = sqliteTable(
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
-		status: text("status", { enum: ["active", "paused", "completed", "error"] })
+		status: text("status", { enum: ["idle", "thinking", "waiting", "archived", "error"] })
 			.notNull()
-			.default("active"),
+			.default("idle"),
 		errorMessage: text("error_message"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),

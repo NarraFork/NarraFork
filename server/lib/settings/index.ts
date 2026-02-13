@@ -3,6 +3,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
+export interface ModelOption {
+	value: string;
+	label: string;
+}
+
 export interface NarraForkSettings {
 	server: { port: number };
 	paths: { defaultProjectDir: string };
@@ -10,6 +15,7 @@ export interface NarraForkSettings {
 		defaultModel: string;
 		defaultPermissionMode: string;
 		summaryModel: string;
+		customModels: ModelOption[];
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -35,9 +41,10 @@ const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778 },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
-		defaultModel: "claude-sonnet-4-5",
+		defaultModel: "sonnet",
 		defaultPermissionMode: "default",
-		summaryModel: "claude-haiku-4-5",
+		summaryModel: "haiku",
+		customModels: [],
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
