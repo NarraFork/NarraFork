@@ -56,3 +56,12 @@ export const permissionDecisionSchema = z.object({
 	decision: z.enum(["allow", "deny"]),
 	message: z.string().optional(),
 });
+
+// === Terminals ===
+
+export const createTerminalSchema = z.object({
+	chapterId: z.string().min(1),
+	name: z.string().max(100).optional(),
+	cols: z.number().int().min(10).max(500).optional(),
+	rows: z.number().int().min(2).max(200).optional(),
+});

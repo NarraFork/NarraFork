@@ -5,6 +5,7 @@ import { chapters, projects, repositories } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
+import { chapterService } from "../services/chapter-service";
 
 export const projectRoutes = new Hono();
 
@@ -87,7 +88,13 @@ projectRoutes.patch("/:id", async (c) => {
 
 projectRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");
-	await db.delete(chapters).where(eq(chapters.projectId, id));
+	// Cascade: remove chapters (which cascade-deletes narrators, messages, etc.)
+	const projectChapters = await db.query.chapters.findMany({
+		where: eq(chapters.projectId, id),
+	});
+	for (const chapter of projectChapters) {
+		await chapterService.remove(chapter.id);
+	}
 	await db.delete(repositories).where(eq(repositories.projectId, id));
 	await db.delete(projects).where(eq(projects.id, id));
 	return c.json({ ok: true });

@@ -1,12 +1,21 @@
 import { resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, repositories } from "../db/schema";
+import {
+	chapters,
+	containerInstances,
+	narrators,
+	portAllocations,
+	repositories,
+	terminals,
+} from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { gitService } from "./git-service";
+import { narratorService } from "./narrator-service";
+import { terminalService } from "./terminal-service";
 
 function slugify(text: string): string {
 	return text
@@ -132,6 +141,20 @@ export const chapterService = {
 
 	async remove(id: string) {
 		const chapter = await this.getById(id);
+
+		// Delete all narrators (and their messages, tool calls, permissions) first
+		const chapterNarrators = await db.query.narrators.findMany({
+			where: eq(narrators.chapterId, id),
+		});
+		for (const narrator of chapterNarrators) {
+			await narratorService.remove(narrator.id);
+		}
+
+		// Kill running terminals and delete records
+		await terminalService.cleanupForChapter(id);
+		await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+		await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+
 		if (chapter.worktreePath) {
 			const repo = await db.query.repositories.findFirst({
 				where: eq(repositories.id, chapter.repositoryId),
@@ -145,6 +168,16 @@ export const chapterService = {
 				}
 			}
 		}
+		// Detach self-referencing FKs pointing to this chapter
+		await db
+			.update(chapters)
+			.set({ parentChapterId: null })
+			.where(eq(chapters.parentChapterId, id));
+		await db
+			.update(chapters)
+			.set({ mergedIntoChapterId: null })
+			.where(eq(chapters.mergedIntoChapterId, id));
+
 		await db.delete(chapters).where(eq(chapters.id, id));
 		eventBus.emit({ type: "chapter:abandoned", chapterId: id });
 	},

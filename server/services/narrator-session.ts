@@ -5,7 +5,7 @@ import {
 	query,
 	type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, narratorToolCalls, permissionRequests } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
@@ -62,11 +62,21 @@ async function handlePermission(
 	const requestId = generateId();
 	const now = new Date().toISOString();
 
+	// Look up the narratorToolCalls record by SDK tool_use_id to get its PK.
+	// The assistant message (which creates tool call records) is processed before
+	// canUseTool fires, so the record should exist.
+	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, options.toolUseID),
+		),
+	});
+
 	// Create permission request record
 	await db.insert(permissionRequests).values({
 		id: requestId,
 		narratorId,
-		toolCallId: options.toolUseID, // SDK tool_use ID, links to narratorToolCalls.toolUseId
+		toolCallId: toolCallRecord?.id ?? null,
 		toolName,
 		inputJson: input,
 		decisionReason: options.decisionReason,

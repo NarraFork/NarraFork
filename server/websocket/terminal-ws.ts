@@ -1,5 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import { logger } from "../lib/logger";
+import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
 // === Types ===
@@ -76,12 +77,9 @@ export const handleTerminalWS = {
 				break;
 			}
 			case "resize": {
-				// Phase 1: log only. Phase 2 will forward to PTY.
-				logger.debug("Terminal resize", {
-					terminalId: ws.data.terminalId,
-					cols: parsed.cols,
-					rows: parsed.rows,
-				});
+				if (ws.data.terminalId) {
+					terminalService.resize(ws.data.terminalId, parsed.cols, parsed.rows);
+				}
 				break;
 			}
 			default: {
@@ -93,11 +91,7 @@ export const handleTerminalWS = {
 	/** Handle raw (non-JSON) text as terminal input */
 	rawMessage(ws: TerminalWS, text: string) {
 		if (!ws.data.terminalId) return;
-		// Phase 1: log only. Phase 2 will forward to PTY via dtach.
-		logger.debug("Terminal input", {
-			terminalId: ws.data.terminalId,
-			length: text.length,
-		});
+		terminalService.write(ws.data.terminalId, text);
 	},
 
 	close(ws: TerminalWS) {

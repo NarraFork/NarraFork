@@ -7,6 +7,7 @@ import { chapterRoutes } from "./routes/chapters";
 import { narratorRoutes } from "./routes/narrators";
 import { projectRoutes } from "./routes/projects";
 import { settingsRoutes } from "./routes/settings";
+import { terminalRoutes } from "./routes/terminals";
 
 const isProd = process.env.NODE_ENV === "production";
 
@@ -22,6 +23,7 @@ app.use(
 app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);
 app.route("/api/narrators", narratorRoutes);
+app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));

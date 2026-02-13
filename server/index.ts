@@ -5,7 +5,8 @@ import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
-import { resolveWSData, wsHandlers, type WSData } from "./websocket/ws-handler";
+import { terminalService } from "./services/terminal-service";
+import { resolveWSData, type WSData, wsHandlers } from "./websocket/ws-handler";
 
 const port = settings.server.port;
 const isProd = process.env.NODE_ENV === "production";
@@ -42,3 +43,8 @@ const server = Bun.serve({
 });
 
 logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
+
+// Recover terminals that survived a server restart (dtach sessions persist)
+terminalService.recoverOnStartup().catch((err) => {
+	logger.error("Terminal recovery failed", { error: String(err) });
+});

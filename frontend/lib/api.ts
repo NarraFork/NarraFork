@@ -56,4 +56,11 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ message }),
 		}),
+
+	// Terminals
+	listTerminals: (chapterId: string) => request<any[]>(`/terminals?chapterId=${chapterId}`),
+	createTerminal: (data: { chapterId: string; name?: string; cols?: number; rows?: number }) =>
+		request<any>("/terminals", { method: "POST", body: JSON.stringify(data) }),
+	getTerminal: (id: string) => request<any>(`/terminals/${id}`),
+	deleteTerminal: (id: string) => request<any>(`/terminals/${id}`, { method: "DELETE" }),
 };

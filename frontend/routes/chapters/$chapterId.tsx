@@ -1,6 +1,8 @@
 import { Badge, Box, Button, Code, Group, Loader, Paper, Stack, Text, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
+import { useCallback, useRef, useState } from "react";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
+import { TerminalTabs } from "../../components/terminal/TerminalTabs";
 import { useChapter } from "../../hooks/useChapters";
 import { useCreateNarrator, useNarrators } from "../../hooks/useNarrator";
 import { CHAPTER_STATUS_COLORS } from "../../lib/constants";
@@ -9,11 +11,44 @@ export const Route = createFileRoute("/chapters/$chapterId")({
 	component: ChapterDetailPage,
 });
 
+const MIN_PANEL_HEIGHT = 100;
+const DEFAULT_TERMINAL_HEIGHT = 300;
+
 function ChapterDetailPage() {
 	const { chapterId } = Route.useParams();
 	const { data: chapter, isLoading } = useChapter(chapterId);
 	const { data: narratorList, isLoading: narratorsLoading } = useNarrators(chapterId);
 	const createNarrator = useCreateNarrator(chapterId);
+
+	const [terminalHeight, setTerminalHeight] = useState(DEFAULT_TERMINAL_HEIGHT);
+	const containerRef = useRef<HTMLDivElement>(null);
+	const dragging = useRef(false);
+
+	const onDragStart = useCallback((e: React.MouseEvent) => {
+		e.preventDefault();
+		dragging.current = true;
+
+		const onMouseMove = (ev: MouseEvent) => {
+			if (!dragging.current || !containerRef.current) return;
+			const containerRect = containerRef.current.getBoundingClientRect();
+			const newTerminalHeight = containerRect.bottom - ev.clientY;
+			const maxHeight = containerRect.height - MIN_PANEL_HEIGHT;
+			setTerminalHeight(Math.max(MIN_PANEL_HEIGHT, Math.min(maxHeight, newTerminalHeight)));
+		};
+
+		const onMouseUp = () => {
+			dragging.current = false;
+			document.removeEventListener("mousemove", onMouseMove);
+			document.removeEventListener("mouseup", onMouseUp);
+			document.body.style.cursor = "";
+			document.body.style.userSelect = "";
+		};
+
+		document.body.style.cursor = "row-resize";
+		document.body.style.userSelect = "none";
+		document.addEventListener("mousemove", onMouseMove);
+		document.addEventListener("mouseup", onMouseUp);
+	}, []);
 
 	if (isLoading) return <Loader />;
 	if (!chapter) return <Text>Chapter not found</Text>;
@@ -21,9 +56,13 @@ function ChapterDetailPage() {
 	const primaryNarrator = narratorList?.find((n: any) => n.type === "primary");
 
 	return (
-		<Stack h="calc(100vh - 80px)">
+		<Box
+			ref={containerRef}
+			h="calc(100vh - 80px)"
+			style={{ display: "flex", flexDirection: "column" }}
+		>
 			{/* Chapter info header */}
-			<Box>
+			<Box p="xs">
 				<Group>
 					<Title order={2}>{chapter.title}</Title>
 					<Badge color={chapter.type === "meanwhile" ? "indigo" : "orange"}>{chapter.type}</Badge>
@@ -51,7 +90,7 @@ function ChapterDetailPage() {
 			</Box>
 
 			{/* Narrator panel */}
-			<Box flex={1} style={{ minHeight: 0 }}>
+			<Box style={{ flex: 1, minHeight: MIN_PANEL_HEIGHT, overflow: "hidden" }}>
 				{narratorsLoading ? (
 					<Loader />
 				) : primaryNarrator ? (
@@ -67,6 +106,35 @@ function ChapterDetailPage() {
 					</Paper>
 				)}
 			</Box>
-		</Stack>
+
+			{/* Drag handle */}
+			<Box
+				onMouseDown={onDragStart}
+				style={{
+					height: 6,
+					cursor: "row-resize",
+					backgroundColor: "var(--mantine-color-gray-3)",
+					flexShrink: 0,
+					transition: "background-color 0.15s",
+				}}
+				onMouseEnter={(e) => {
+					e.currentTarget.style.backgroundColor = "var(--mantine-color-blue-4)";
+				}}
+				onMouseLeave={(e) => {
+					e.currentTarget.style.backgroundColor = "var(--mantine-color-gray-3)";
+				}}
+			/>
+
+			{/* Terminal area */}
+			<Box
+				style={{
+					height: terminalHeight,
+					flexShrink: 0,
+					overflow: "hidden",
+				}}
+			>
+				<TerminalTabs chapterId={chapterId} />
+			</Box>
+		</Box>
 	);
 }
