@@ -4,15 +4,17 @@ import {
 	type Query,
 	query,
 	type SDKMessage,
+	type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { and, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { chapters, narrators, narratorToolCalls, permissionRequests } from "../db/schema";
+import { chapters, narratorMessages, narrators, narratorToolCalls, permissionRequests } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { getImagePath, type ImageRef, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle } from "./narrator-title";
@@ -168,6 +170,7 @@ export async function resolvePermission(
 export async function* startSession(
 	narratorId: string,
 	prompt: string,
+	images?: ImageRef[],
 ): AsyncGenerator<SessionEvent> {
 	// Prevent concurrent sessions for the same narrator
 	if (activeSessions.has(narratorId)) {
@@ -193,12 +196,24 @@ export async function* startSession(
 		chapter = ch;
 		sessionCwd = ch.worktreePath;
 	} else {
-		// Standalone session
-		sessionCwd = process.env.HOME ?? "/tmp";
+		// Standalone session — use stored CWD or fall back to HOME
+		sessionCwd = narrator.cwd || process.env.HOME || "/tmp";
 	}
 
-	// Persist user message
-	const userMsg = await narratorService.persistUserMessage(narratorId, prompt);
+	// Persist user message with image refs
+	const persistBlocks: any[] = [];
+	if (images?.length) {
+		for (const img of images) {
+			persistBlocks.push({
+				type: "image",
+				imageId: img.imageId,
+				filename: img.filename,
+				mediaType: img.mediaType,
+			});
+		}
+	}
+	persistBlocks.push({ type: "text", text: prompt });
+	const userMsg = await narratorService.persistUserMessage(narratorId, prompt, persistBlocks);
 	yield { type: "user_message", data: userMsg };
 
 	// Build SDK options
@@ -220,8 +235,35 @@ export async function* startSession(
 		resumeSessionAt = fp.narratorMessageUuid;
 	}
 
+	// Build SDK prompt — use AsyncIterable<SDKUserMessage> when images are present
+	let sdkPrompt: string | AsyncIterable<SDKUserMessage> = prompt;
+	if (images?.length) {
+		const contentBlocks: any[] = [];
+		for (const img of images) {
+			const filePath = getImagePath(narratorId, img.imageId);
+			if (filePath) {
+				const data = await imageToBase64(filePath);
+				contentBlocks.push({
+					type: "image",
+					source: { type: "base64", media_type: img.mediaType, data },
+				});
+			}
+		}
+		contentBlocks.push({ type: "text", text: prompt });
+
+		async function* singleMessage(): AsyncIterable<SDKUserMessage> {
+			yield {
+				type: "user",
+				message: { role: "user", content: contentBlocks },
+				parent_tool_use_id: null,
+				session_id: narrator.claudeSessionId ?? "",
+			};
+		}
+		sdkPrompt = singleMessage();
+	}
+
 	const sdkQuery = query({
-		prompt,
+		prompt: sdkPrompt,
 		options: {
 			cwd: sessionCwd,
 			model: narrator.model ?? settings.agent.defaultModel,
@@ -246,9 +288,20 @@ export async function* startSession(
 	activeSessions.set(narratorId, { query: sdkQuery, abortController, narratorId });
 	await narratorService.updateStatus(narratorId, "thinking");
 
+	let shouldGenerateTitle = false;
 	try {
 		for await (const message of sdkQuery) {
 			const event = await processSDKMessage(narratorId, message);
+			if (event?.type === "assistant_message") {
+				// Check if title generation is needed, but defer it until after the loop
+				// to avoid concurrent DB writes with ongoing message processing
+				if (!shouldGenerateTitle) {
+					const narrator = await narratorService.getById(narratorId);
+					if ((narrator.messageCount ?? 0) === 0 && !narrator.title) {
+						shouldGenerateTitle = true;
+					}
+				}
+			}
 			if (event) yield event;
 		}
 	} catch (err) {
@@ -258,6 +311,10 @@ export async function* startSession(
 		yield { type: "error", data: { message: errorMsg } };
 	} finally {
 		activeSessions.delete(narratorId);
+		// Generate title after all message processing is done — no concurrent DB writes
+		if (shouldGenerateTitle) {
+			generateAndSetTitle(narratorId).catch(() => {});
+		}
 		yield { type: "done", data: null };
 	}
 }
@@ -274,17 +331,15 @@ async function processSDKMessage(
 			// Persist message + tool calls
 			const saved = await narratorService.persistAssistantMessage(narratorId, message as any);
 
-			// Auto-generate title after first assistant message
-			const narrator = await narratorService.getById(narratorId);
-			if ((narrator.messageCount ?? 0) === 0 && !narrator.title) {
-				generateAndSetTitle(narratorId);
-			}
-
-			// Broadcast to WebSocket
+			// Broadcast full persisted message (with toolCalls) to WebSocket
+			const fullMessage = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, saved.id),
+				with: { toolCalls: true },
+			});
 			broadcastToNarrator(narratorId, {
 				type: "message",
 				narratorId,
-				message: { role: "assistant", content: message.message.content },
+				message: fullMessage,
 			});
 
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
@@ -407,9 +462,7 @@ export async function recoverOnStartup(): Promise<void> {
 		["thinking", "idle"],
 		["waiting", "idle"],
 	] as const;
-	const stmt = sqlite.prepare(
-		"UPDATE narrators SET status = ?, updated_at = ? WHERE status = ?",
-	);
+	const stmt = sqlite.prepare("UPDATE narrators SET status = ?, updated_at = ? WHERE status = ?");
 	for (const [from, to] of migrations) {
 		const result = stmt.run(to, now, from);
 		if (result.changes > 0) {

@@ -5,16 +5,16 @@ import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 
-const TITLE_PROMPT = `Based on the following conversation opening, generate a short descriptive title (max 50 characters). Reply with ONLY the title text, no quotes, no punctuation wrapping, no explanation.
+const TITLE_PROMPT = `Based on the following conversation opening, generate a short descriptive title (max 50 characters). Use the same language as the conversation. Reply with ONLY the title text, no quotes, no punctuation wrapping, no explanation.
 
 Conversation:
 `;
 
 /**
- * Generate a title for a narrator session using the summary model (haiku).
+ * Generate a title for a narrator session using the summary model.
  * Uses Claude Agent SDK query() — same pattern as narrator-context.ts.
  */
-export async function generateTitle(narratorId: string): Promise<string> {
+export async function generateTitle(narratorId: string, stderrChunks: string[]): Promise<string> {
 	const messages = await narratorService.getMessages(narratorId, 4);
 	if (messages.length === 0) return "New conversation";
 
@@ -28,6 +28,11 @@ export async function generateTitle(narratorId: string): Promise<string> {
 		})
 		.join("\n\n");
 
+	logger.info("Title generation starting", {
+		narratorId,
+		model: settings.agent.summaryModel,
+	});
+
 	const titleQuery = query({
 		prompt: TITLE_PROMPT + conversationText,
 		options: {
@@ -35,6 +40,10 @@ export async function generateTitle(narratorId: string): Promise<string> {
 			maxTurns: 1,
 			tools: [],
 			permissionMode: "dontAsk",
+			settingSources: ["user"],
+			stderr: (data: string) => {
+				stderrChunks.push(data);
+			},
 		},
 	});
 
@@ -59,8 +68,9 @@ export async function generateTitle(narratorId: string): Promise<string> {
  * Also broadcasts the title update via WebSocket and event bus.
  */
 export async function generateAndSetTitle(narratorId: string): Promise<void> {
+	const stderrChunks: string[] = [];
 	try {
-		const title = await generateTitle(narratorId);
+		const title = await generateTitle(narratorId, stderrChunks);
 		await narratorService.updateTitle(narratorId, title);
 
 		broadcastToNarrator(narratorId, {
@@ -76,6 +86,7 @@ export async function generateAndSetTitle(narratorId: string): Promise<void> {
 		logger.error("Failed to auto-generate narrator title", {
 			narratorId,
 			error: String(err),
+			stderr: stderrChunks.join(""),
 		});
 	}
 }

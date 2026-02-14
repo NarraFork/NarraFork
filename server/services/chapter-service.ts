@@ -1,13 +1,7 @@
 import { resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	containerInstances,
-	narrators,
-	portAllocations,
-	repositories,
-} from "../db/schema";
+import { chapters, containerInstances, narrators, portAllocations, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -28,10 +22,8 @@ function slugify(text: string): string {
 
 interface CreateChapterInput {
 	projectId: string;
-	repositoryId: string;
 	title: string;
 	description?: string;
-	type?: "meanwhile" | "whatif";
 	baseBranch?: string;
 }
 
@@ -40,40 +32,42 @@ export const chapterService = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, input.repositoryId),
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, input.projectId),
 		});
-		if (!repo) throw new NotFoundError("Repository", input.repositoryId);
+		if (!project) throw new NotFoundError("Project", input.projectId);
+		if (!project.gitPath) throw new ValidationError("Project has no git repository configured");
 
-		if (!(await gitService.isGitRepo(repo.path))) {
-			throw new ValidationError(`Path is not a git repository: ${repo.path}`);
+		const gitPath = project.gitPath;
+		if (!(await gitService.isGitRepo(gitPath))) {
+			throw new ValidationError(`Path is not a git repository: ${gitPath}`);
 		}
 
-		const type = input.type ?? "meanwhile";
-		const baseBranch = input.baseBranch ?? repo.defaultBranch ?? "main";
+		let baseBranch = input.baseBranch ?? project.defaultBranch ?? "main";
+		if (!(await gitService.branchExists(gitPath, baseBranch))) {
+			baseBranch = await gitService.getCurrentBranch(gitPath);
+		}
 		const slug = slugify(input.title);
 		const shortId = generateShortId(6);
-		const branchName = `${type}/${slug}-${shortId}`;
-		const worktreePath = resolve(repo.path, ".worktrees", `${slug}-${shortId}`);
+		const branchName = `chapter/${slug}-${shortId}`;
+		const worktreePath = resolve(gitPath, ".worktrees", `${slug}-${shortId}`);
 
 		const rollback: Array<() => Promise<void>> = [];
 
 		try {
-			await gitService.createBranch(repo.path, branchName, baseBranch);
-			rollback.push(() => gitService.deleteBranch(repo.path, branchName));
+			await gitService.createBranch(gitPath, branchName, baseBranch);
+			rollback.push(() => gitService.deleteBranch(gitPath, branchName));
 
-			await gitService.createWorktree(repo.path, worktreePath, branchName);
-			rollback.push(() => gitService.removeWorktree(repo.path, worktreePath));
+			await gitService.createWorktree(gitPath, worktreePath, branchName);
+			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
 
 			const [chapter] = await db
 				.insert(chapters)
 				.values({
 					id,
 					projectId: input.projectId,
-					repositoryId: input.repositoryId,
 					title: input.title,
 					description: input.description,
-					type,
 					status: "active",
 					branch: branchName,
 					worktreePath,
@@ -176,19 +170,21 @@ export const chapterService = {
 			await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
 		}
 
+		// Clean up git resources
 		if (chapter.worktreePath) {
-			const repo = await db.query.repositories.findFirst({
-				where: eq(repositories.id, chapter.repositoryId),
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
 			});
-			if (repo) {
+			if (project?.gitPath) {
 				try {
-					await gitService.removeWorktree(repo.path, chapter.worktreePath);
-					await gitService.deleteBranch(repo.path, chapter.branch);
+					await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+					await gitService.deleteBranch(project.gitPath, chapter.branch);
 				} catch (err) {
 					logger.warn("Failed to clean up git resources", { error: String(err) });
 				}
 			}
 		}
+
 		// Detach self-referencing FKs pointing to this chapter
 		await db
 			.update(chapters)

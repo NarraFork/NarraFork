@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, repositories } from "../db/schema";
+import { chapters, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -21,7 +21,6 @@ function slugify(text: string): string {
 export interface ForkChapterInput {
 	title: string;
 	description?: string;
-	type?: "meanwhile" | "whatif";
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
 }
@@ -29,7 +28,7 @@ export interface ForkChapterInput {
 export const chapterFork = {
 	/**
 	 * Fork a chapter with atomic operations and rollback stack.
-	 * 6-step process: DB record → worktree → copy files → fork narrators → (container) → (startup script)
+	 * Creates a new branch + worktree from the parent's current state.
 	 */
 	async fork(parentChapterId: string, input: ForkChapterInput) {
 		const parent = await db.query.chapters.findFirst({
@@ -40,26 +39,25 @@ export const chapterFork = {
 			throw new ValidationError("Can only fork active chapters");
 		}
 
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, parent.repositoryId),
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, parent.projectId),
 		});
-		if (!repo) throw new NotFoundError("Repository", parent.repositoryId);
+		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
+		const gitPath = project.gitPath;
 
-		const type = input.type ?? parent.type;
 		const inheritMode = input.inheritMode ?? "full";
 		const slug = slugify(input.title);
 		const shortId = generateShortId(6);
-		const branchName = `${type}/${slug}-${shortId}`;
-		const worktreePath = resolve(repo.path, ".worktrees", `${slug}-${shortId}`);
+		const branchName = `chapter/${slug}-${shortId}`;
+		const worktreePath = resolve(gitPath, ".worktrees", `${slug}-${shortId}`);
 		const now = new Date().toISOString();
 		const id = generateId();
 
 		// Get current commit SHA for fork point
 		const commitSha = parent.worktreePath
 			? await gitService.getHeadCommit(parent.worktreePath)
-			: await gitService.getHeadCommit(repo.path);
+			: await gitService.getHeadCommit(gitPath);
 
-		// Build fork point metadata
 		const forkPoint: { commitSha: string; narratorMessageUuid?: string } = { commitSha };
 		if (input.forkAtMessageUuid) {
 			forkPoint.narratorMessageUuid = input.forkAtMessageUuid;
@@ -68,16 +66,21 @@ export const chapterFork = {
 		const rollback: Array<() => Promise<void>> = [];
 
 		try {
-			// Step 1: Create DB record
+			// Step 1: Create git branch + worktree
+			await gitService.createBranch(gitPath, branchName, parent.branch);
+			rollback.push(() => gitService.deleteBranch(gitPath, branchName));
+
+			await gitService.createWorktree(gitPath, worktreePath, branchName);
+			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
+
+			// Step 2: Create DB record
 			const [chapter] = await db
 				.insert(chapters)
 				.values({
 					id,
 					projectId: parent.projectId,
-					repositoryId: parent.repositoryId,
 					title: input.title,
 					description: input.description,
-					type,
 					status: "active",
 					branch: branchName,
 					worktreePath,
@@ -93,17 +96,10 @@ export const chapterFork = {
 				await db.delete(chapters).where(eq(chapters.id, id));
 			});
 
-			// Step 2: Create git branch + worktree
-			await gitService.createBranch(repo.path, branchName, parent.branch);
-			rollback.push(() => gitService.deleteBranch(repo.path, branchName));
-
-			await gitService.createWorktree(repo.path, worktreePath, branchName);
-			rollback.push(() => gitService.removeWorktree(repo.path, worktreePath));
-
-			// Step 3: Copy repo-configured copyFiles
-			if (repo.copyFiles) {
-				const files = JSON.parse(repo.copyFiles) as string[];
-				if (files.length > 0 && parent.worktreePath) {
+			// Step 3: Copy project-configured files
+			if (project.copyFiles && parent.worktreePath) {
+				const files = JSON.parse(project.copyFiles) as string[];
+				if (files.length > 0) {
 					await gitService.copyFiles(parent.worktreePath, worktreePath, files);
 				}
 			}
@@ -112,7 +108,6 @@ export const chapterFork = {
 			const parentNarrators = await db.query.narrators.findMany({
 				where: eq(narrators.chapterId, parentChapterId),
 			});
-
 			for (const parentNarrator of parentNarrators) {
 				const forkedNarrator = await narratorContext.forkNarrator({
 					parentNarratorId: parentNarrator.id,
@@ -128,17 +123,17 @@ export const chapterFork = {
 
 			// Step 5: Start containers (if parent has containerConfig)
 			if (parent.containerConfig) {
-				// Copy containerConfig to forked chapter
 				await db
 					.update(chapters)
 					.set({ containerConfig: parent.containerConfig, updatedAt: now })
 					.where(eq(chapters.id, id));
-
 				try {
 					await containerService.startChapterContainers(id);
 					rollback.push(async () => {
 						try {
-							await containerService.removeChapterContainers(id, { deleteVolumes: true });
+							await containerService.removeChapterContainers(id, {
+								deleteVolumes: true,
+							});
 						} catch {
 							// best effort
 						}
@@ -151,17 +146,14 @@ export const chapterFork = {
 				}
 			}
 
-			// Step 6: Execute startup script (if repo has one)
-			if (repo.startupScript) {
+			// Step 6: Execute startup script (if project has one)
+			if (project.startupScript) {
 				try {
-					const proc = Bun.spawn(["sh", "-c", repo.startupScript], {
+					const proc = Bun.spawn(["sh", "-c", project.startupScript], {
 						cwd: worktreePath,
 						stdout: "pipe",
 						stderr: "pipe",
-						env: {
-							...process.env,
-							NARRAFORK_CHAPTER_ID: id,
-						},
+						env: { ...process.env, NARRAFORK_CHAPTER_ID: id },
 					});
 					const timeout = setTimeout(() => {
 						proc.kill();

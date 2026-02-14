@@ -25,6 +25,11 @@ export const gitService = {
 		return result.stdout;
 	},
 
+	async branchExists(repoPath: string, branchName: string): Promise<boolean> {
+		const result = await exec(["rev-parse", "--verify", branchName], repoPath);
+		return result.exitCode === 0;
+	},
+
 	async createBranch(repoPath: string, branchName: string, baseBranch: string): Promise<void> {
 		const result = await exec(["branch", branchName, baseBranch], repoPath);
 		if (result.exitCode !== 0) throw new Error(`Failed to create branch: ${result.stderr}`);
@@ -212,5 +217,24 @@ export const gitService = {
 				logger.warn("Failed to copy file", { file, error: String(err) });
 			}
 		}
+	},
+
+	async initRepo(path: string): Promise<void> {
+		await Bun.spawn(["mkdir", "-p", path]).exited;
+		const result = await exec(["init"], path);
+		if (result.exitCode !== 0) throw new Error(`Failed to init repo: ${result.stderr}`);
+		// Create initial empty commit so branches can be created
+		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], path);
+		if (commitResult.exitCode !== 0) {
+			throw new Error(`Failed to create initial commit: ${commitResult.stderr}`);
+		}
+	},
+
+	async cloneRepo(url: string, destPath: string, branch?: string): Promise<void> {
+		const args = ["clone"];
+		if (branch) args.push("--branch", branch);
+		args.push(url, destPath);
+		const result = await exec(args, ".");
+		if (result.exitCode !== 0) throw new Error(`Failed to clone repo: ${result.stderr}`);
 	},
 };

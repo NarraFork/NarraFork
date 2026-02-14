@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { asc, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, repositories } from "../db/schema";
+import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -16,10 +16,14 @@ export interface CleanupReport {
 	errors: Array<{ chapterId: string; error: string }>;
 }
 
+async function getProjectGitPath(projectId: string): Promise<string | null> {
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, projectId),
+	});
+	return project?.gitPath ?? null;
+}
+
 export const chapterCleanup = {
-	/**
-	 * Make a chapter dormant: auto-commit, remove worktree, keep branch.
-	 */
 	async dormant(chapterId: string): Promise<void> {
 		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
 		if (!chapter) throw new NotFoundError("Chapter", chapterId);
@@ -27,15 +31,11 @@ export const chapterCleanup = {
 			throw new ValidationError("Can only make active chapters dormant");
 		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, chapter.repositoryId),
-		});
-		if (!repo) throw new NotFoundError("Repository", chapter.repositoryId);
+		const gitPath = await getProjectGitPath(chapter.projectId);
+		if (!gitPath) throw new ValidationError("Project has no git repository configured");
 
-		// Kill terminals
 		await terminalService.cleanupForChapter(chapterId);
 
-		// Pause containers (if any)
 		if (chapter.containerConfig) {
 			try {
 				await containerService.pauseChapterContainers(chapterId);
@@ -47,11 +47,8 @@ export const chapterCleanup = {
 			}
 		}
 
-		// Auto-commit uncommitted changes
 		await gitService.autoCommit(chapter.worktreePath, "auto-save before dormant");
-
-		// Remove worktree (keep branch)
-		await gitService.removeWorktree(repo.path, chapter.worktreePath);
+		await gitService.removeWorktree(gitPath, chapter.worktreePath);
 
 		const now = new Date().toISOString();
 		await db
@@ -63,24 +60,18 @@ export const chapterCleanup = {
 		eventBus.emit({ type: "chapter:dormant", chapterId });
 	},
 
-	/**
-	 * Wake a dormant chapter: recreate worktree from existing branch.
-	 */
 	async wake(chapterId: string): Promise<void> {
 		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
 		if (!chapter) throw new NotFoundError("Chapter", chapterId);
 		if (chapter.status !== "dormant") throw new ValidationError("Can only wake dormant chapters");
 
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, chapter.repositoryId),
-		});
-		if (!repo) throw new NotFoundError("Repository", chapter.repositoryId);
+		const gitPath = await getProjectGitPath(chapter.projectId);
+		if (!gitPath) throw new ValidationError("Project has no git repository configured");
 
-		// Reconstruct worktree path from branch name
 		const branchSuffix = chapter.branch.split("/").slice(1).join("/");
-		const worktreePath = resolve(repo.path, ".worktrees", branchSuffix);
+		const worktreePath = resolve(gitPath, ".worktrees", branchSuffix);
 
-		await gitService.createWorktree(repo.path, worktreePath, chapter.branch);
+		await gitService.createWorktree(gitPath, worktreePath, chapter.branch);
 
 		const now = new Date().toISOString();
 		await db
@@ -88,7 +79,6 @@ export const chapterCleanup = {
 			.set({ status: "active", worktreePath, lastAccessedAt: now, updatedAt: now })
 			.where(eq(chapters.id, chapterId));
 
-		// Restart containers (if chapter has containerConfig)
 		if (chapter.containerConfig) {
 			try {
 				await containerService.unpauseChapterContainers(chapterId);
@@ -104,9 +94,6 @@ export const chapterCleanup = {
 		eventBus.emit({ type: "chapter:woken", chapterId });
 	},
 
-	/**
-	 * Batch cleanup chapters. Skips chapters with uncommitted changes unless force=true.
-	 */
 	async batchCleanup(
 		chapterIds: string[],
 		options: { force?: boolean; deleteBranch?: boolean } = {},
@@ -125,15 +112,6 @@ export const chapterCleanup = {
 					continue;
 				}
 
-				const repo = await db.query.repositories.findFirst({
-					where: eq(repositories.id, chapter.repositoryId),
-				});
-				if (!repo) {
-					report.errors.push({ chapterId, error: "Repository not found" });
-					continue;
-				}
-
-				// Dirty check
 				if (chapter.worktreePath && !options.force) {
 					const status = await gitService.getStatus(chapter.worktreePath);
 					if (status) {
@@ -142,10 +120,8 @@ export const chapterCleanup = {
 					}
 				}
 
-				// Kill terminals
 				await terminalService.cleanupForChapter(chapterId);
 
-				// Stop and remove containers
 				if (chapter.containerConfig) {
 					try {
 						await containerService.removeChapterContainers(chapterId, {
@@ -159,10 +135,11 @@ export const chapterCleanup = {
 					}
 				}
 
-				// Remove worktree
-				if (chapter.worktreePath) {
+				const gitPath = await getProjectGitPath(chapter.projectId);
+
+				if (chapter.worktreePath && gitPath) {
 					try {
-						await gitService.removeWorktree(repo.path, chapter.worktreePath);
+						await gitService.removeWorktree(gitPath, chapter.worktreePath);
 					} catch (err) {
 						logger.warn("Failed to remove worktree during cleanup", {
 							chapterId,
@@ -171,10 +148,9 @@ export const chapterCleanup = {
 					}
 				}
 
-				// Optionally delete branch
-				if (options.deleteBranch) {
+				if (options.deleteBranch && gitPath) {
 					try {
-						await gitService.deleteBranch(repo.path, chapter.branch);
+						await gitService.deleteBranch(gitPath, chapter.branch);
 					} catch (err) {
 						logger.warn("Failed to delete branch during cleanup", {
 							chapterId,
@@ -183,7 +159,6 @@ export const chapterCleanup = {
 					}
 				}
 
-				// Update status
 				const now = new Date().toISOString();
 				await db
 					.update(chapters)
@@ -201,10 +176,6 @@ export const chapterCleanup = {
 		return report;
 	},
 
-	/**
-	 * Auto-dormant inactive chapters when active count exceeds maxActiveWorktrees.
-	 * Sorts by lastAccessedAt ascending (least recently used first).
-	 */
 	async dormantInactiveChapters(projectId: string): Promise<string[]> {
 		const maxActive = settings.chapters.maxActiveWorktrees;
 
@@ -237,10 +208,6 @@ export const chapterCleanup = {
 		return dormanted;
 	},
 
-	/**
-	 * Debounced auto-dormant trigger. Multiple calls within the debounce window
-	 * (30 seconds) for the same projectId are collapsed into a single execution.
-	 */
 	_dormantTimers: new Map<string, ReturnType<typeof setTimeout>>(),
 
 	scheduleAutoDormant(projectId: string): void {

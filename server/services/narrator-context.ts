@@ -101,6 +101,7 @@ export const narratorContext = {
 					maxTurns: 1,
 					tools: [],
 					permissionMode: "dontAsk",
+					settingSources: ["user"],
 				},
 			});
 
