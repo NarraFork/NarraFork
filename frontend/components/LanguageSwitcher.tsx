@@ -1,5 +1,6 @@
 import { Select } from "@mantine/core";
 import { useTranslation } from "react-i18next";
+import { useUpdateUserPreferences } from "../hooks/useUserPreferences";
 
 const LANGUAGE_OPTIONS = [
 	{ value: "en", label: "English" },
@@ -8,13 +9,17 @@ const LANGUAGE_OPTIONS = [
 
 export function LanguageSwitcher() {
 	const { i18n } = useTranslation();
+	const updatePrefs = useUpdateUserPreferences();
 
 	return (
 		<Select
 			data={LANGUAGE_OPTIONS}
 			value={i18n.language}
 			onChange={(value) => {
-				if (value) i18n.changeLanguage(value);
+				if (value) {
+					i18n.changeLanguage(value);
+					updatePrefs.mutate({ language: value });
+				}
 			}}
 			size="sm"
 			w={120}

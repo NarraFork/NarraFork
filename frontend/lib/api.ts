@@ -34,8 +34,24 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 	return response.json();
 }
 
+export interface TreeMessage {
+	id: string;
+	narratorId: string;
+	parentToolUseId: string | null;
+	sdkMessageUuid?: string | null;
+	role: string;
+	contentJson: any[];
+	contentText: string | null;
+	toolCalls: any[];
+	tokensIn?: number | null;
+	tokensOut?: number | null;
+	costUsd?: number | null;
+	createdAt: string;
+	children: TreeMessage[];
+}
+
 export interface PaginatedMessages {
-	messages: any[];
+	messages: TreeMessage[];
 	hasMore: boolean;
 	nextCursor: string | null;
 }
@@ -130,10 +146,6 @@ export const api = {
 	interruptNarrator: (id: string) => request<any>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	getBufferedMessage: (id: string) =>
 		request<{ text: string; bufferedAt: string } | null>(`/narrators/${id}/buffer`),
-	findParentMessage: (id: string, toolUseId: string) =>
-		request<{ messageId: string | null; createdAt: string | null }>(
-			`/narrators/${id}/messages/find-parent?toolUseId=${encodeURIComponent(toolUseId)}`,
-		),
 	getPendingPermissions: (id: string) => request<any[]>(`/narrators/${id}/permissions`),
 	approvePermission: (requestId: string) =>
 		request<any>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),
@@ -188,8 +200,9 @@ export const api = {
 		request<any>("/favorites/reorder", { method: "PUT", body: JSON.stringify({ ids }) }),
 
 	// User Preferences
-	getUserPreferences: () => request<{ autoLoadOlderMessages: boolean }>("/user-preferences"),
-	updateUserPreferences: (data: { autoLoadOlderMessages?: boolean }) =>
+	getUserPreferences: () =>
+		request<{ autoLoadOlderMessages: boolean; language: string }>("/user-preferences"),
+	updateUserPreferences: (data: { autoLoadOlderMessages?: boolean; language?: string }) =>
 		request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Containers

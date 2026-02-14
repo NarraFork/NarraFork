@@ -88,6 +88,8 @@ chapters ──1:N──> terminals
 narrators ──1:N── narrator_messages
 narrators ──1:N── narrator_tool_calls
 narrators ──1:N── permission_requests
+users ──1:1── user_preferences
+users ──1:N── user_favorite_directories
 ```
 
 > 注：`containerConfig` 以 JSON 字段存储在 `chapters` 表中，而非独立的 `container_configs` 表。
@@ -199,14 +201,21 @@ export const narrators = sqliteTable('narrators', {
     enum: ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk']
   }).default('default'),
 
+  // 工作目录（游离会话使用，chapter 会话从 worktree 获取）
+  cwd: text('cwd'),
+
+  // TodoWrite 工具持久化
+  todosJson: text('todos_json', { mode: 'json' }),     // JSON 数组，TodoWrite 工具写入的 todos
+  todosToolUseId: text('todos_tool_use_id'),            // 关联的 tool_use_id
+
   // 统计
   messageCount: integer('message_count').default(0),
   totalCostUsd: real('total_cost_usd').default(0),
   lastMessageAt: text('last_message_at'),
 
-  // 状态：idle（空闲）、thinking（处理中）、waiting（等待权限审批）、archived（已归档）、error
+  // 状态：idle（空闲）、thinking（处理中）、waiting（等待权限审批）、done（完成待阅读）、archived（已归档）、error
   status: text('status', {
-    enum: ['idle', 'thinking', 'waiting', 'archived', 'error']
+    enum: ['idle', 'thinking', 'waiting', 'done', 'archived', 'error']
   }).notNull().default('idle'),
   errorMessage: text('error_message'),
 
@@ -234,6 +243,9 @@ export const narratorMessages = sqliteTable('narrator_messages', {
 
   // 纯文本内容（用于搜索和预览）
   contentText: text('content_text'),
+
+  // 子 agent 消息关联：指向父 tool_use_id，用于懒加载子 agent 消息树
+  parentToolUseId: text('parent_tool_use_id'),
 
   // Token 统计
   tokensIn: integer('tokens_in'),
@@ -358,6 +370,32 @@ export const users = sqliteTable('users', {
 })
 ```
 
+#### user_preferences — 用户偏好设置
+
+```typescript
+export const userPreferences = sqliteTable('user_preferences', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull().unique(),       // 每用户一条记录
+  autoLoadOlderMessages: integer('auto_load_older_messages', { mode: 'boolean' }).default(true),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+})
+```
+
+#### user_favorite_directories — 用户收藏目录
+
+```typescript
+export const userFavoriteDirectories = sqliteTable('user_favorite_directories', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  path: text('path').notNull(),
+  label: text('label'),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+})
+```
+
 #### FTS5 全文搜索虚拟表
 
 ```sql
@@ -414,11 +452,17 @@ server/
   routes/
     projects.ts               # 项目 CRUD
     chapters.ts               # 章节 CRUD + 分叉/合并 + 容器管理
-    narrators.ts              # 叙述者管理 + 消息流 + 权限审批
+    narrators.ts              # 叙述者管理 + 消息流 + 权限审批 + 游离会话
     terminals.ts              # 终端管理
     auth.ts                   # 注册 / 登录 / 当前用户
     admin.ts                  # 用户管理 + 全局设置
-    settings.ts               # 用户级配置管理
+    settings.ts               # 全局配置管理
+    user-preferences.ts       # 用户偏好设置（autoLoadOlderMessages 等）
+    favorites.ts              # 用户收藏目录 CRUD
+    uploads.ts                # 图片上传文件服务
+    graph.ts                  # 故事网络图数据
+    search.ts                 # 全文搜索
+    mcp.ts                    # MCP 工具暴露
   services/
     chapter-service.ts        # 章节生命周期
     chapter-fork.ts           # 分叉逻辑（原子操作 + 回滚）
@@ -455,7 +499,7 @@ server/
 > - 权限审批逻辑整合到 `narrator-session.ts`（与 session 生命周期紧密耦合），不再有独立的 `narrator-permission.ts`
 > - 终端 PTY 管理整合到 `terminal-service.ts`（dtach 模式不需要独立 PTY 管理器），不再有独立的 `terminal/` 目录
 > - 事件通知由 `event-bus.ts` + `narrator-ws.ts` 组合实现，不再有独立的 `notification-service.ts`
-> - `graph.ts`、`search.ts`、`sessions.ts`、`mcp.ts` 路由已在 Phase 5 实现
+> - 游离会话（standalone sessions）整合到 `narrators.ts`（通过 `chapterId=null` 区分），不再有独立的 `sessions.ts` 路由
 ### 4.2 核心服务设计
 
 #### 4.2.1 chapter-fork.ts — 分叉服务
@@ -477,21 +521,30 @@ server/
 - 支持 `forkAtMessageUuid` 回溯分叉，记录在 `forkPoint.narratorMessageUuid`
 #### 4.2.2 narrator-session.ts — Claude Session 管理
 
-职责：封装 Claude Agent SDK 的 `query()` 调用，管理 session 的创建、恢复、分叉。
+职责：封装 Claude Agent SDK 的 `query()` 调用，管理 session 的创建、恢复、分叉，以及消息缓冲和权限审批。
 
 核心功能：
 - `startSession()` — 统一入口，根据 narrator 状态自动判断新建、恢复或分叉 session。传入 `cwd`、`model`、`permissionMode`。通过条件分支处理：无 `claudeSessionId` 时新建，有 `claudeSessionId` 时恢复（SDK `resume`），`isFullFork` 标志时分叉（SDK `resume` + `forkSession: true` + 可选 `resumeSessionAt`）
 - `interruptSession()` — 中断当前执行
 - `recoverOnStartup()` — 服务器重启恢复逻辑：重置 `thinking` 状态的 narrator 为 `idle`，自动拒绝 pending 权限请求，标记 running tool calls 为 failed
 - `isSessionActive()` — 检查 narrator 是否有活跃的 SDK session
+- `setBufferedMessage()` / `clearBufferedMessage()` / `getBufferedMessage()` — 消息缓冲管理，允许用户在 narrator thinking 时排队下一条消息
 
 关键设计：
 - 内存中维护 `Map<narratorId, { query, abortController }>` 用于中断控制
 - `startSession()` 是异步生成器，内部 `processSDKMessage()` 处理每条消息：捕获 `session_id` 持久化到 DB、持久化 assistant 消息、更新统计、广播到 WebSocket
-- 首条 assistant 消息时自动调用 `narrator-title.ts` 的 `generateAndSetTitle()` 生成会话标题
-- `canUseTool` 回调仅在 `default` 权限模式下启用，其他模式不触发权限审批流程
+- 两阶段标题生成：首条用户消息时立即调用 `generateQuickTitle()` 生成快速标题（不等 AI 回复），session 结束后再调用 `generateAndSetTitle()` 生成更准确的标题（会 await quickTitle 完成以避免竞态）
+- 权限模式自动处理：
+  - `default` 模式：启用 `canUseTool` 回调，走完整审批流程
+  - `acceptEdits` 模式：自动允许 `Edit`/`Write`/`NotebookEdit`/`MultiEdit` 工具，其余走审批
+  - `bypassPermissions` / `dontAsk` 模式：SDK 层面跳过所有权限检查
+  - `plan` 模式：SDK 层面进入 plan 模式
 - `canUseTool` 对 `TodoWrite`/`TodoRead` 工具自动允许（白名单），不需要用户审批
 - 权限审批流程：创建 tool_call 记录 → 创建 permission_request → WebSocket 推送 → 等待决定（5 分钟超时，超时自动拒绝，`decidedBy: "auto_timeout"`）→ 更新记录 → 返回 SDK
+- "Allow with feedback" 流程：用户批准权限时附带 `feedbackText`，session 在当前 tool 完成后中断，feedbackText 作为下一条用户消息自动发送
+- 消息缓冲：用户在 narrator thinking 时可通过 WebSocket 发送 `buffer_message`，session 结束后自动链式发送缓冲消息
+- `TodoWrite` 工具结果自动持久化到 narrator 的 `todosJson` 字段
+- Session 结束时状态设为 `done`（而非 `idle`），前端通过 `mark-read` 端点手动重置为 `idle`
 #### 4.2.3 narrator-context.ts — 上下文继承
 
 职责：在 Chapter 分叉时处理 Narrator 的上下文继承策略。
@@ -508,14 +561,16 @@ server/
 
 #### 4.2.4 narrator-title.ts — 会话标题自动生成
 
-职责：使用 Haiku 模型根据会话前几条消息自动生成简短标题。
+职责：使用 Haiku 模型根据会话消息自动生成简短标题。支持两阶段生成。
 
 核心功能：
 - `generateTitle(narratorId)` — 读取前 4 条消息，使用 `settings.agent.summaryModel` 生成最多 50 字符的标题
-- `generateAndSetTitle(narratorId)` — fire-and-forget 版本，生成后持久化到 DB 并通过 WebSocket 广播 `narrator:title_updated` 事件
+- `generateQuickTitle(narratorId, userMessage)` — 仅根据用户消息快速生成标题（不等 AI 回复），fire-and-forget，错误仅记录不抛出
+- `generateAndSetTitle(narratorId)` — fire-and-forget 版本，生成后持久化到 DB 并通过 WebSocket 广播 `title_updated` 事件 + eventBus 发射 `narrator:title_updated`
 
 关键设计：
-- 在 `narrator-session.ts` 的 `processSDKMessage()` 中，首条 assistant 消息时自动触发
+- 两阶段标题生成：首条用户消息时 `generateQuickTitle` 立即生成快速标题，session 结束后 `generateAndSetTitle` 生成更准确的标题
+- `generateAndSetTitle` 会 await `quickTitlePromise` 完成后再执行，避免竞态覆盖
 - 标题用于前端会话列表展示和 `narrators_fts` 全文搜索
 
 #### 4.2.5 chapter-merge.ts — 合并服务
@@ -667,21 +722,26 @@ GET    /api/chapters/:id/containers/logs            # 容器日志
 POST   /api/chapters/:id/containers/remove          # 删除容器（可选删除 volumes）
 ```
 
-#### Narrators
+#### Narrators（含游离会话）
 ```
-GET    /api/narrators                              # 列表（?chapterId=）
-POST   /api/narrators                              # 创建
+GET    /api/narrators                              # 列表（?chapterId=&standalone=true）
+POST   /api/narrators                              # 创建（chapterId 为空时创建游离会话）
 GET    /api/narrators/:id                          # 详情
 DELETE /api/narrators/:id                          # 删除
 
-POST   /api/narrators/:id/messages                 # 发送消息（SSE 流式响应）
-GET    /api/narrators/:id/messages                 # 历史消息（?limit=&offset=）
+POST   /api/narrators/:id/messages                 # 发送消息（SSE 流式响应，支持 multipart 图片上传）
+GET    /api/narrators/:id/messages                 # 历史消息（?limit=&cursor=&around=）
+GET    /api/narrators/:id/messages/find-parent      # 按 tool_use_id 查找父消息（子 agent 懒加载）
+GET    /api/narrators/:id/buffer                   # 获取缓冲消息（多设备同步）
 
 POST   /api/narrators/:id/interrupt                # 中断当前执行
 PATCH  /api/narrators/:id/permission-mode          # 切换权限模式
+PATCH  /api/narrators/:id/model                    # 切换模型
 PATCH  /api/narrators/:id/title                    # 手动更新标题
 POST   /api/narrators/:id/generate-title           # AI 自动生成标题
 PATCH  /api/narrators/:id/archive                  # 归档叙述者
+PATCH  /api/narrators/:id/unarchive                # 取消归档
+PATCH  /api/narrators/:id/mark-read                # 标记已读（done → idle）
 ```
 
 #### Permission Requests
@@ -727,16 +787,24 @@ GET    /api/projects/:id/graph                     # 故事网络图数据
 GET    /api/search?q=&entities=chapters,messages,narrators&limit=  # 全文搜索（默认搜索 chapters,messages,narrators）
 ```
 
-#### Standalone Sessions（游离会话）
+#### User Preferences
 ```
-POST   /api/sessions                               # 创建游离会话
-GET    /api/sessions                               # 列表
-GET    /api/sessions/:id                           # 详情
-POST   /api/sessions/:id/messages                  # 发送消息
-GET    /api/sessions/:id/messages                  # 消息历史（?limit=&offset=）
-PATCH  /api/sessions/:id/title                     # 手动更新标题
-POST   /api/sessions/:id/generate-title            # AI 自动生成标题
-DELETE /api/sessions/:id                           # 删除
+GET    /api/user-preferences                       # 获取当前用户偏好
+PATCH  /api/user-preferences                       # 更新偏好（原子 upsert）
+```
+
+#### Favorite Directories
+```
+GET    /api/favorites                              # 列表
+POST   /api/favorites                              # 添加收藏目录
+PATCH  /api/favorites/:id                          # 更新
+DELETE /api/favorites/:id                          # 删除
+PUT    /api/favorites/reorder                      # 重排序
+```
+
+#### Uploads
+```
+GET    /api/uploads/:narratorId/:imageId           # 获取上传的图片（带缓存头）
 ```
 
 ### 5.2 WebSocket 端点
@@ -753,16 +821,24 @@ DELETE /api/sessions/:id                           # 删除
 type NarratorWSMessage =
   | { type: 'message'; narratorId: string; message: SDKMessage }
   | { type: 'permission_request'; narratorId: string; request: PermissionRequest }
+  | { type: 'permission_resolved'; narratorId: string; requestId: string; decision: string }
   | { type: 'status_changed'; narratorId: string; status: NarratorStatus }
+  | { type: 'stream_event'; narratorId: string; event: any }
+  | { type: 'tool_completed'; narratorId: string; toolUseId: string; status: string; output?: any }
   | { type: 'tool_progress'; narratorId: string; toolUseId: string; elapsed: number }
   | { type: 'title_updated'; narratorId: string; title: string }
+  | { type: 'todos_updated'; narratorId: string; todos: any[]; toolUseId?: string }
+  | { type: 'buffer_set'; narratorId: string; text: string }
+  | { type: 'buffer_cleared'; narratorId: string; reason: 'cancelled' | 'sent' | 'session_error' }
   | { type: 'error'; message: string }
 
 // 客户端 → 服务端
 type NarratorWSCommand =
   | { type: 'subscribe'; narratorIds: string[] }
   | { type: 'unsubscribe'; narratorIds: string[] }
-  | { type: 'permission_decision'; requestId: string; decision: 'allow' | 'deny'; message?: string; answers?: Record<string, string> }
+  | { type: 'permission_decision'; requestId: string; decision: 'allow' | 'deny'; message?: string; answers?: Record<string, string>; feedbackText?: string }
+  | { type: 'buffer_message'; narratorId: string; text: string; images?: string[] }
+  | { type: 'cancel_buffer'; narratorId: string }
   | { type: 'merge_decision'; mergeSessionId: string; decision: 'continue' | 'cancel' }
 ```
 
@@ -802,7 +878,8 @@ frontend/
     chapters/
       $chapterId.tsx          # Chapter 详情（Narrator + Terminal）
     sessions/
-      index.tsx               # 游离会话列表
+      index.tsx               # 游离会话列表（活跃）
+      archived.tsx            # 已归档会话列表
       $sessionId.tsx          # 游离会话详情
     settings/
       index.tsx               # 设置页（含语言切换器）
@@ -816,11 +893,13 @@ frontend/
       ChapterCleanupModal.tsx # 批量清理对话框
       ChapterBatchMergeModal.tsx # 批量合并对话框
     narrator/
-      NarratorPanel.tsx       # Narrator 面板（消息列表 + 输入）
+      NarratorPanel.tsx       # Narrator 面板（消息列表 + 输入 + 图片上传 + 缓冲消息）
       MessageBubble.tsx       # 消息气泡
       MarkdownContent.tsx     # Markdown 渲染（react-markdown + remark-gfm）
       ToolCallCard.tsx        # Tool Call 展示卡片
-      PermissionBanner.tsx    # 权限审批横幅
+      CodeBlockWithActions.tsx # 代码块（复制/全屏/自动换行/横屏模式）
+      DiffView.tsx            # Diff 查看器（行级 + 词级高亮）
+      PermissionBanner.tsx    # 权限审批横幅（支持内联 per-tool-call 审批 + feedbackText）
       AskUserQuestionBanner.tsx # AskUserQuestion 工具调用的问答 UI
     graph/
       StoryNetwork.tsx        # React Flow 故事网络
@@ -838,7 +917,7 @@ frontend/
   hooks/
     useProjects.ts            # Project CRUD hooks
     useChapters.ts            # Chapter CRUD hooks
-    useNarrator.ts            # Narrator 消息 + WebSocket
+    useNarrator.ts            # Narrator 消息 + CRUD（含游离会话）
     useNarratorWS.ts          # Narrator WebSocket 连接
     useTerminals.ts           # Terminal CRUD hooks
     useTerminalWS.ts          # Terminal WebSocket 连接
@@ -846,8 +925,9 @@ frontend/
     useContainers.ts          # 容器管理 hooks
     usePermissions.ts         # 权限审批 hooks
     useAuth.ts                # 认证 hooks（login/register/logout/status）
-    useSessions.ts            # 游离会话 CRUD hooks
     useSearch.ts              # 搜索 hook（300ms 防抖）
+    useUserPreferences.ts     # 用户偏好设置 hooks
+    useFavoriteDirectories.ts # 收藏目录 hooks
   lib/
     api.ts                    # API 客户端（含 auth token 管理）
     i18n.ts                   # i18next 初始化（语言检测 + locale 导入）
@@ -877,25 +957,31 @@ frontend/
 ### 6.3 Narrator 消息面板
 
 组件结构：
-- `NarratorPanel` — 消息列表 + 输入框，通过 WebSocket 接收实时消息流
+- `NarratorPanel` — 消息列表 + 输入框 + 图片上传，通过 WebSocket 接收实时消息流。支持消息缓冲（narrator thinking 时排队下一条消息）、模型/权限模式切换、归档/取消归档
 - `MessageBubble` — 消息气泡，解析 `contentJson` 中的 text/tool_use/thinking blocks
-- `ToolCallCard` — Tool Call 展示卡片，可折叠显示 input/output JSON，状态 Badge（pending/approved/denied/running/completed/failed）+ 耗时
+- `ToolCallCard` — Tool Call 展示卡片，可折叠显示 input/output JSON，状态 Badge（pending/approved/denied/running/completed/failed）+ 耗时。支持 TodoWrite 工具的 todo 列表渲染
+- `CodeBlockWithActions` — 代码块增强组件，支持复制、全屏查看、自动换行切换、移动端横屏模式。桌面端 hover 显示操作栏，移动端始终显示
+- `DiffView` — Diff 查看器，行级对比 + 词级高亮（added/removed），最多显示 500 行，带行号 gutter
 
 关键设计：
 - `contentJson` 存储完整的 `BetaMessage.content` 数组，前端按 block 类型分别渲染
 - Tool Call 卡片默认折叠，点击展开参数和结果
+- 消息历史支持游标分页（cursor-based）和围绕定位（around），用于子 agent 消息懒加载
+- 图片上传支持最多 10 张，通过 multipart/form-data 发送
 
 ### 6.4 权限审批 UI
 
 组件结构：
-- `PermissionBanner` — 固定在 Narrator 面板顶部的审批横幅，使用 `usePermissions(narratorId)` hook
+- `PermissionBanner` — 内联权限审批组件，嵌入在对应 ToolCallCard 内（per-tool-call 审批），使用 `usePermissions(narratorId)` hook
 - `AskUserQuestionBanner` — 处理 Narrator 的 `AskUserQuestion` 工具调用，显示问题选项供用户回答
 - 显示 tool name + input JSON（截断到 300 字符）+ decisionReason
-- 两个操作按钮：Allow / Deny
+- 三个操作：Allow / Allow with feedback（附带 textarea）/ Deny
 
 关键设计：
 - 一次只处理一个 pending 请求（队列式）
-- WebSocket 双向通信：服务端推送请求，客户端发送决定（支持 `answers` 字段用于 AskUserQuestion 回答）
+- WebSocket 双向通信：服务端推送请求，客户端发送决定（支持 `answers` 字段用于 AskUserQuestion 回答，`feedbackText` 字段用于 "allow with feedback"）
+- "Allow with feedback" 流程：用户批准权限的同时附带反馈文本，session 在当前 tool 完成后中断，feedbackText 作为下一条用户消息自动发送
+- 多标签页同步：`permission_resolved` 消息确保其他标签页及时更新审批状态
 
 ---
 
@@ -1056,8 +1142,11 @@ interface NarraForkSettings {
 | 批量合并 | 临时 fork + 队列式处理 | 在临时分支上合并，全部成功后 fast-forward，失败可回滚 |
 | containerConfig 存储 | chapters 表 JSON 字段 | 避免独立表的 JOIN 开销，配置结构简单 |
 | 数据共享模式 | 全团队共享，无用户隔离 | 小团队私有部署，认证仅用于身份识别 |
-| Narrator 状态机 | idle/thinking/waiting/archived/error | 比 active/paused/completed 更细粒度，反映 AI 会话实时状态 |
-| 会话标题生成 | Haiku 模型自动生成 | 首条 assistant 消息后 fire-and-forget，改善会话列表可读性 |
+| Narrator 状态机 | idle/thinking/waiting/done/archived/error | 比 active/paused/completed 更细粒度，`done` 表示 AI 完成回复待用户阅读 |
+| 会话标题生成 | 两阶段：quickTitle（用户消息即时生成）+ generateAndSetTitle（session 结束后精确生成） | 快速标题改善 UX，精确标题保证质量 |
+| 游离会话路由 | 整合到 narrators.ts（chapterId=null） | 避免重复路由逻辑，统一会话管理 |
+| 权限审批 UI | 内联 per-tool-call 审批 + feedbackText | 比顶部 banner 更直观，feedback 支持 "allow with guidance" 模式 |
+| 消息缓冲 | 内存 Map + WebSocket 双向同步 | 允许用户在 AI thinking 时排队消息，多设备同步 |
 | FTS tokenizer | trigram | 支持 CJK 搜索，无需分词器 |
 | 主题模式 | auto（跟随系统） | 用户可切换 light/dark/auto，比固定 dark 更灵活 |
 | 自动休眠触发 | 防抖调度（30 秒窗口） | chapter 创建/访问时触发，避免频繁检查 |

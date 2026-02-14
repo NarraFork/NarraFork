@@ -20,9 +20,10 @@ import {
 	useNavigate,
 	useRouterState,
 } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
+import { useUserPreferences } from "../hooks/useUserPreferences";
 import { clearToken, getToken } from "../lib/api";
 
 interface RouterContext {
@@ -47,9 +48,17 @@ function AuthenticatedLayout() {
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
-	const { t } = useTranslation("nav");
+	const { t, i18n } = useTranslation("nav");
 	const { data: user, isLoading, isError, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
+	const { data: prefs } = useUserPreferences();
+
+	// Sync language from backend preference on login / app init
+	useEffect(() => {
+		if (prefs?.language && prefs.language !== i18n.language) {
+			i18n.changeLanguage(prefs.language);
+		}
+	}, [prefs?.language, i18n]);
 
 	const hasToken = !!getToken();
 
