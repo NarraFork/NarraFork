@@ -86,12 +86,36 @@ export const api = {
 	updateSettings: (data: any) =>
 		request<any>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
 
-	// Narrators
-	listNarrators: (chapterId: string) => request<any[]>(`/narrators?chapterId=${chapterId}`),
+	// Narrators (both chapter-bound and standalone sessions)
+	listNarrators: (opts?: {
+		chapterId?: string;
+		standalone?: boolean;
+		status?: string;
+		sortBy?: string;
+		sortOrder?: string;
+	}) => {
+		const params = new URLSearchParams();
+		if (opts?.chapterId) params.set("chapterId", opts.chapterId);
+		if (opts?.standalone) params.set("standalone", "true");
+		if (opts?.status) params.set("status", opts.status);
+		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
+		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
+		const qs = params.toString();
+		return request<any[]>(`/narrators${qs ? `?${qs}` : ""}`);
+	},
 	getNarrator: (id: string) => request<any>(`/narrators/${id}`),
-	createNarrator: (data: { chapterId: string; type?: string; model?: string }) =>
-		request<any>("/narrators", { method: "POST", body: JSON.stringify(data) }),
-	deleteNarrator: (id: string) => request<any>(`/narrators/${id}`, { method: "DELETE" }),
+	createNarrator: (data: {
+		chapterId?: string | null;
+		type?: string;
+		model?: string;
+		systemPrompt?: string;
+		permissionMode?: string;
+		cwd?: string;
+	}) => request<any>("/narrators", { method: "POST", body: JSON.stringify(data) }),
+	archiveNarrator: (id: string) => request<any>(`/narrators/${id}/archive`, { method: "PATCH" }),
+	unarchiveNarrator: (id: string) =>
+		request<any>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
+	markNarratorRead: (id: string) => request<any>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
 	getNarratorMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
 		const params = new URLSearchParams();
 		if (around) {
@@ -104,6 +128,8 @@ export const api = {
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
 	},
 	interruptNarrator: (id: string) => request<any>(`/narrators/${id}/interrupt`, { method: "POST" }),
+	getBufferedMessage: (id: string) =>
+		request<{ text: string; bufferedAt: string } | null>(`/narrators/${id}/buffer`),
 	findParentMessage: (id: string, toolUseId: string) =>
 		request<{ messageId: string | null; createdAt: string | null }>(
 			`/narrators/${id}/messages/find-parent?toolUseId=${encodeURIComponent(toolUseId)}`,
@@ -123,6 +149,16 @@ export const api = {
 		}),
 	generateNarratorTitle: (id: string) =>
 		request<{ title: string }>(`/narrators/${id}/generate-title`, { method: "POST" }),
+	updateNarratorModel: (id: string, model: string) =>
+		request<{ ok: boolean }>(`/narrators/${id}/model`, {
+			method: "PATCH",
+			body: JSON.stringify({ model }),
+		}),
+	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
+		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
+			method: "PATCH",
+			body: JSON.stringify({ permissionMode }),
+		}),
 
 	// Terminals
 	listTerminals: (chapterId: string) => request<any[]>(`/terminals?chapterId=${chapterId}`),
@@ -139,35 +175,6 @@ export const api = {
 	search: (q: string, entities = "chapters,messages") =>
 		request<{ results: any[] }>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
 
-	// Standalone Sessions
-	listSessions: () => request<any[]>("/sessions"),
-	getSession: (id: string) => request<any>(`/sessions/${id}`),
-	createSession: (data: {
-		model?: string;
-		systemPrompt?: string;
-		permissionMode?: string;
-		cwd?: string;
-	}) => request<any>("/sessions", { method: "POST", body: JSON.stringify(data) }),
-	deleteSession: (id: string) => request<any>(`/sessions/${id}`, { method: "DELETE" }),
-	getSessionMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
-		const params = new URLSearchParams();
-		if (around) {
-			params.set("around", around);
-		} else {
-			if (limit) params.set("limit", String(limit));
-			if (cursor) params.set("cursor", cursor);
-		}
-		const qs = params.toString();
-		return request<PaginatedMessages>(`/sessions/${id}/messages${qs ? `?${qs}` : ""}`);
-	},
-	updateSessionTitle: (id: string, title: string) =>
-		request<{ ok: boolean; title: string }>(`/sessions/${id}/title`, {
-			method: "PATCH",
-			body: JSON.stringify({ title }),
-		}),
-	generateSessionTitle: (id: string) =>
-		request<{ title: string }>(`/sessions/${id}/generate-title`, { method: "POST" }),
-
 	// Favorite Directories
 	listFavoriteDirectories: () => request<any[]>("/favorites"),
 	createFavoriteDirectory: (data: { path: string; label?: string }) =>
@@ -179,6 +186,11 @@ export const api = {
 	deleteFavoriteDirectory: (id: string) => request<any>(`/favorites/${id}`, { method: "DELETE" }),
 	reorderFavoriteDirectories: (ids: string[]) =>
 		request<any>("/favorites/reorder", { method: "PUT", body: JSON.stringify({ ids }) }),
+
+	// User Preferences
+	getUserPreferences: () => request<{ autoLoadOlderMessages: boolean }>("/user-preferences"),
+	updateUserPreferences: (data: { autoLoadOlderMessages?: boolean }) =>
+		request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Containers
 	getContainers: (chapterId: string) => request<any[]>(`/chapters/${chapterId}/containers`),

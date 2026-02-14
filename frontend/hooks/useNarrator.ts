@@ -1,11 +1,17 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
-export function useNarrators(chapterId: string) {
+export function useNarrators(opts?: {
+	chapterId?: string;
+	standalone?: boolean;
+	status?: string;
+	sortBy?: string;
+	sortOrder?: string;
+}) {
 	return useQuery({
-		queryKey: ["narrators", { chapterId }],
-		queryFn: () => api.listNarrators(chapterId),
-		enabled: !!chapterId,
+		queryKey: ["narrators", { ...opts }],
+		queryFn: () => api.listNarrators(opts),
+		enabled: !!(opts?.chapterId || opts?.standalone),
 	});
 }
 
@@ -21,11 +27,11 @@ export function useNarratorMessages(narratorId: string, around?: string) {
 	return useInfiniteQuery({
 		queryKey: ["narrators", narratorId, "messages", { around }],
 		queryFn: ({ pageParam }) => {
-			// First page: use `around` if provided, otherwise fetch latest 10
+			// First page: use `around` if provided, otherwise fetch latest 20
 			if (!pageParam && around) {
 				return api.getNarratorMessages(narratorId, undefined, undefined, around);
 			}
-			return api.getNarratorMessages(narratorId, pageParam ? 50 : 10, pageParam);
+			return api.getNarratorMessages(narratorId, pageParam ? 50 : 20, pageParam);
 		},
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
@@ -33,23 +39,38 @@ export function useNarratorMessages(narratorId: string, around?: string) {
 	});
 }
 
-export function useCreateNarrator(chapterId: string) {
+export function useCreateNarrator() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (data?: { type?: string; model?: string }) =>
-			api.createNarrator({ chapterId, ...data }),
+		mutationFn: (data: {
+			chapterId?: string | null;
+			type?: string;
+			model?: string;
+			systemPrompt?: string;
+			permissionMode?: string;
+			cwd?: string;
+		}) => api.createNarrator(data),
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators", { chapterId }] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});
 }
 
-export function useDeleteNarrator(chapterId: string) {
+export function useArchiveNarrator() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (id: string) => api.deleteNarrator(id),
+		mutationFn: (id: string) => api.archiveNarrator(id),
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators", { chapterId }] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+export function useUnarchiveNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.unarchiveNarrator(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});
 }
@@ -57,5 +78,27 @@ export function useDeleteNarrator(chapterId: string) {
 export function useInterruptNarrator() {
 	return useMutation({
 		mutationFn: (id: string) => api.interruptNarrator(id),
+	});
+}
+
+export function useUpdatePermissionMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, permissionMode }: { id: string; permissionMode: string }) =>
+			api.updateNarratorPermissionMode(id, permissionMode),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useUpdateModel() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, model }: { id: string; model: string }) =>
+			api.updateNarratorModel(id, model),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
 	});
 }
