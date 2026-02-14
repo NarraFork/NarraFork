@@ -194,7 +194,7 @@ export const DiffView = memo(function DiffView({ oldStr, newStr, maxHeight = 200
 	const style =
 		maxHeight != null
 			? { ...containerStyle, maxHeight }
-			: { ...containerStyle, maxHeight: undefined, overflow: undefined as any };
+			: { ...containerStyle, maxHeight: undefined, overflow: "auto" as any, height: "100%" };
 
 	return (
 		<Box style={style}>

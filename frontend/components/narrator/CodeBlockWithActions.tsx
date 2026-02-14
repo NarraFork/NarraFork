@@ -1,4 +1,13 @@
-import { ActionIcon, Box, Code, CopyButton, Group, Modal, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Code,
+	CopyButton,
+	Group,
+	Modal,
+	ScrollArea,
+	Tooltip,
+} from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowsMaximize,
@@ -10,6 +19,7 @@ import {
 import { type CSSProperties, memo, type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DiffView } from "./DiffView";
+import { MarkdownContent } from "./MarkdownContent";
 
 interface CodeBlockWithActionsProps {
 	/** Text content to display and copy */
@@ -20,6 +30,8 @@ interface CodeBlockWithActionsProps {
 	title?: string;
 	/** If provided, renders DiffView instead of Code in fullscreen */
 	diff?: { oldStr: string; newStr: string };
+	/** If true, render content as markdown instead of a code block */
+	markdown?: boolean;
 	/** Extra children rendered inside the wrapper (e.g. existing Code block) */
 	children?: ReactNode;
 }
@@ -76,6 +88,7 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 	style,
 	title,
 	diff,
+	markdown,
 	children,
 }: CodeBlockWithActionsProps) {
 	const { t } = useTranslation("common");
@@ -155,11 +168,18 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 				)}
 
 				{/* Inline content */}
-				{children ?? (
-					<Code block style={{ ...style, ...wrapStyle }}>
-						{content}
-					</Code>
-				)}
+				{children ??
+					(markdown ? (
+						<ScrollArea.Autosize mah={style?.maxHeight ?? 480} type="auto">
+							<Box px="xs" py={4}>
+								<MarkdownContent text={content} />
+							</Box>
+						</ScrollArea.Autosize>
+					) : (
+						<Code block style={{ ...style, ...wrapStyle }}>
+							{content}
+						</Code>
+					))}
 
 				{/* Mobile: always-visible bar below content */}
 				{isMobile && (
@@ -186,6 +206,8 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 						overflow: landscape ? "hidden" : "auto",
 						padding: isMobile ? 8 : undefined,
 						position: "relative",
+						display: "flex",
+						flexDirection: "column",
 					},
 				}}
 			>
@@ -219,6 +241,10 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 					>
 						{diff ? (
 							<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} />
+						) : markdown ? (
+							<Box px="md" py="xs" style={{ overflow: "auto", height: "100%" }}>
+								<MarkdownContent text={content} />
+							</Box>
 						) : (
 							<Code
 								block
@@ -236,7 +262,13 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 						)}
 					</Box>
 				) : diff ? (
-					<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} />
+					<Box style={{ flex: 1, minHeight: 0 }}>
+						<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} />
+					</Box>
+				) : markdown ? (
+					<Box px="md" py="xs">
+						<MarkdownContent text={content} />
+					</Box>
 				) : (
 					<Code
 						block
@@ -244,8 +276,10 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 							...style,
 							...wrapStyle,
 							maxHeight: undefined,
-							overflow: undefined,
+							overflow: "auto",
 							fontSize: isMobile ? 11 : 12,
+							flex: 1,
+							minHeight: 0,
 						}}
 					>
 						{content}

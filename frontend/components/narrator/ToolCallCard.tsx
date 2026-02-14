@@ -3,11 +3,11 @@ import {
 	Box,
 	Button,
 	Code,
-	Collapse,
 	Divider,
 	Group,
 	List,
 	Paper,
+	Stack,
 	Text,
 	Textarea,
 	ThemeIcon,
@@ -21,6 +21,7 @@ import {
 	IconFile,
 	IconListCheck,
 	IconLoader2,
+	IconMap,
 	IconPlayerPlay,
 	IconRobot,
 	IconSearch,
@@ -32,6 +33,7 @@ import { useTranslation } from "react-i18next";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { CodeBlockWithActions } from "./CodeBlockWithActions";
 import { DiffView } from "./DiffView";
+import { LazyCollapse } from "./LazyCollapse";
 
 // --- Types ---
 
@@ -95,8 +97,10 @@ const BASH_TOOLS = new Set(["Bash", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const TODO_TOOLS = new Set(["TodoWrite", "TodoRead"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
+const ASK_TOOLS = new Set(["AskUserQuestion"]);
+const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 
-type ToolCategory = "file" | "bash" | "search" | "todo" | "taskOutput" | "generic";
+type ToolCategory = "file" | "bash" | "search" | "todo" | "taskOutput" | "ask" | "plan" | "generic";
 
 export function isEditTool(name: string): boolean {
 	return EDIT_TOOLS.has(name);
@@ -108,6 +112,8 @@ function getCategory(name: string): ToolCategory {
 	if (SEARCH_TOOLS.has(name)) return "search";
 	if (TODO_TOOLS.has(name)) return "todo";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
+	if (ASK_TOOLS.has(name)) return "ask";
+	if (PLAN_TOOLS.has(name)) return "plan";
 	return "generic";
 }
 
@@ -123,6 +129,10 @@ function getCategoryIcon(cat: ToolCategory) {
 			return IconListCheck;
 		case "taskOutput":
 			return IconRobot;
+		case "ask":
+			return IconPlayerPlay;
+		case "plan":
+			return IconMap;
 		default:
 			return IconCode;
 	}
@@ -140,6 +150,10 @@ function getCategoryColor(cat: ToolCategory) {
 			return "teal";
 		case "taskOutput":
 			return "indigo";
+		case "ask":
+			return "blue";
+		case "plan":
+			return "grape";
 		default:
 			return "gray";
 	}
@@ -184,6 +198,16 @@ function getSummary(toolName: string, input: any): string {
 			if (toolName === "TaskStop") return taskId ? `Stop ${taskId}` : "Stop task";
 			return taskId ? `Check ${taskId}` : "Check task output";
 		}
+		case "ask": {
+			const questions = input?.questions;
+			if (Array.isArray(questions) && questions.length > 0) {
+				const header = questions[0].header ?? "";
+				return header || "Question";
+			}
+			return "Question";
+		}
+		case "plan":
+			return toolName === "ExitPlanMode" ? "Plan ready" : "Enter plan mode";
 		default:
 			return toolName;
 	}
@@ -563,6 +587,69 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
+	// Plan content from inputJson.plan is shown by InlinePermission during approval.
+	// Here we only render after completion, using outputJson or falling back to inputJson.plan.
+	const planText =
+		toolCall.status === "completed" || toolCall.status === "failed"
+			? typeof toolCall.outputJson === "string"
+				? toolCall.outputJson
+				: typeof toolCall.inputJson?.plan === "string"
+					? toolCall.inputJson.plan
+					: ""
+			: "";
+
+	if (!planText) {
+		return null;
+	}
+
+	return (
+		<Box mt="xs">
+			<CodeBlockWithActions content={planText} markdown title={`Plan — ${toolCall.toolName}`} />
+		</Box>
+	);
+}
+
+function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
+	const questions: {
+		question: string;
+		header: string;
+		options?: { label: string; description: string }[];
+	}[] = toolCall.inputJson?.questions ?? [];
+	const answers: Record<string, string> = toolCall.inputJson?.answers ?? {};
+
+	if (!questions.length) {
+		return <GenericDetail toolCall={toolCall} />;
+	}
+
+	return (
+		<Box mt="xs">
+			<Stack gap="sm">
+				{questions.map((q) => {
+					const answer = answers[q.question];
+					return (
+						<Box key={q.header}>
+							<Text size="xs" fw={600} c="dimmed" mb={2}>
+								{q.question}
+							</Text>
+							{answer ? (
+								<Text size="xs" ff="monospace" c="teal">
+									{answer}
+								</Text>
+							) : (
+								<Text size="xs" c="dimmed" fs="italic">
+									{t("skipQuestion")}
+								</Text>
+							)}
+						</Box>
+					);
+				})}
+			</Stack>
+		</Box>
+	);
+}
+
 function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 	const cat = getCategory(toolCall.toolName);
 	switch (cat) {
@@ -576,6 +663,10 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <TodoDetail toolCall={toolCall} />;
 		case "taskOutput":
 			return <TaskOutputDetail toolCall={toolCall} />;
+		case "ask":
+			return <AskDetail toolCall={toolCall} />;
+		case "plan":
+			return <PlanDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}
@@ -612,9 +703,20 @@ function InlinePermission({
 		);
 	}
 
+	// ExitPlanMode: show plan content above the allow/deny buttons
+	const planText =
+		permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
+			? permission.inputJson.plan
+			: null;
+
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
 		<Box mt="xs">
+			{planText && (
+				<Box mb="xs">
+					<CodeBlockWithActions content={planText} markdown title="Plan" />
+				</Box>
+			)}
 			{permission.decisionReason && (
 				<Text size="xs" c="dimmed" mb={4}>
 					{permission.decisionReason}
@@ -666,9 +768,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName);
 	const isEdit = isEditTool(toolCall.toolName);
-	// Auto-expand: failed, permission pending, todo tools, or edit tools
+	// Auto-expand: permission pending, todo tools, or edit tools (success only).
+	// Failed edit calls default to collapsed (usually just a "read first" error).
+	const isFailed = toolCall.status === "failed";
 	const defaultOpen =
-		toolCall.status === "failed" || !!pendingPermission || cat === "todo" || isEdit;
+		!!pendingPermission || cat === "todo" || (isEdit && !isFailed) || (isFailed && !isEdit);
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Auto-expand when a permission request arrives
@@ -709,10 +813,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 			<Box>
 				<Box p="xs">
 					<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
-					<Collapse in={opened}>
+					<LazyCollapse in={opened}>
 						<DetailRenderer toolCall={toolCall} />
 						{permissionUI}
-					</Collapse>
+					</LazyCollapse>
 				</Box>
 				{!isLast && <Divider />}
 			</Box>
@@ -722,10 +826,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 	return (
 		<Paper withBorder radius="sm" p="xs" style={borderColor ? { borderColor } : undefined}>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
-			<Collapse in={opened}>
+			<LazyCollapse in={opened}>
 				<DetailRenderer toolCall={toolCall} />
 				{permissionUI}
-			</Collapse>
+			</LazyCollapse>
 		</Paper>
 	);
 });
@@ -784,13 +888,13 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 					{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 				</Group>
 			</UnstyledButton>
-			<Collapse in={expanded}>
+			<LazyCollapse in={expanded}>
 				<Box mt={4} pl={4} style={{ borderLeft: `2px solid var(--mantine-color-${color}-4)` }}>
 					{toolCalls.map((tc, i) => (
 						<ToolCallCard key={tc.inputJson?.file_path ?? i} toolCall={tc} />
 					))}
 				</Box>
-			</Collapse>
+			</LazyCollapse>
 		</Paper>
 	);
 });
