@@ -10,6 +10,7 @@ export const userPreferencesRoutes = new Hono();
 
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
+	language: "en",
 };
 
 userPreferencesRoutes.get("/", async (c) => {
@@ -31,15 +32,17 @@ userPreferencesRoutes.patch("/", async (c) => {
 
 	// Atomic upsert — avoids read-then-write race condition
 	sqlite.run(
-		`INSERT INTO user_preferences (id, user_id, auto_load_older_messages, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO user_preferences (id, user_id, auto_load_older_messages, language, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
+		   language = COALESCE(?, language),
 		   updated_at = ?`,
 		[
 			id,
 			userId,
 			(parsed.data.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
+			parsed.data.language ?? DEFAULTS.language,
 			now,
 			now,
 			parsed.data.autoLoadOlderMessages != null
@@ -47,6 +50,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 					? 1
 					: 0
 				: null,
+			parsed.data.language ?? null,
 			now,
 		],
 	);

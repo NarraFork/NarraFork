@@ -21,6 +21,7 @@ import {
 	startSession,
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
+import { getUserLanguage } from "../lib/prompt-i18n";
 
 /** Parse message request supporting both JSON and multipart/form-data (with images) */
 export async function parseMessageRequest(
@@ -119,11 +120,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	}
 
 	const { message, images } = await parseMessageRequest(c, id);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
 
 	return streamSSE(c, async (stream) => {
 		const MAX_CHAIN_DEPTH = 10;
 		let chainCount = 0;
-		let sessionGen = startSession(id, message, images);
+		let sessionGen = startSession(id, message, images, locale);
 		while (chainCount < MAX_CHAIN_DEPTH) {
 			chainCount++;
 			let feedbackMessage: string | null = null;
@@ -145,25 +148,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				});
 			}
 			if (feedbackMessage) {
-				sessionGen = startSession(id, feedbackMessage);
+				sessionGen = startSession(id, feedbackMessage, undefined, locale);
 				continue;
 			}
 			if (bufferedSend) {
-				sessionGen = startSession(id, bufferedSend.message, bufferedSend.images);
+				sessionGen = startSession(id, bufferedSend.message, bufferedSend.images, locale);
 				continue;
 			}
 			break;
 		}
 	});
-});
-
-// Find parent message by tool_use_id (for lazy-loading subagent parents)
-narratorRoutes.get("/:id/messages/find-parent", async (c) => {
-	const id = c.req.param("id");
-	const toolUseId = c.req.query("toolUseId");
-	if (!toolUseId) throw new ValidationError("toolUseId query parameter is required");
-	const result = await narratorService.findMessageByToolUseId(id, toolUseId);
-	return c.json(result ?? { messageId: null, createdAt: null });
 });
 
 // Get buffered message (for multi-device hydration on page load)
@@ -232,7 +226,9 @@ narratorRoutes.patch("/:id/title", async (c) => {
 narratorRoutes.post("/:id/generate-title", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
-	const title = await generateTitle(id, []);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const title = await generateTitle(id, [], locale);
 	await narratorService.updateTitle(id, title);
 	return c.json({ title });
 });

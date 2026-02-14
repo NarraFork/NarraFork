@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { getUserLanguage } from "../lib/prompt-i18n";
 import {
 	batchCleanupSchema,
 	batchMergeSchema,
@@ -59,7 +60,9 @@ chapterRoutes.post("/:id/fork", async (c) => {
 	const id = c.req.param("id");
 	const parsed = forkChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const chapter = await chapterFork.fork(id, parsed.data);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const chapter = await chapterFork.fork(id, { ...parsed.data, locale });
 	return c.json(chapter, 201);
 });
 
@@ -85,7 +88,9 @@ chapterRoutes.post("/:id/ai-resolve", async (c) => {
 	const id = c.req.param("id");
 	const parsed = mergeChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const result = await chapterMerge.aiResolveConflicts(id, parsed.data);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const result = await chapterMerge.aiResolveConflicts(id, parsed.data, locale);
 	return c.json(result);
 });
 
@@ -120,7 +125,9 @@ chapterRoutes.post("/cleanup", async (c) => {
 chapterRoutes.post("/batch-merge", async (c) => {
 	const parsed = batchMergeSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const result = await chapterBatchMerge.run(parsed.data);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const result = await chapterBatchMerge.run({ ...parsed.data, locale });
 	return c.json(result, 201);
 });
 
