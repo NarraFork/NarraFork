@@ -75,11 +75,13 @@ export const narrators = sqliteTable(
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
-		status: text("status", { enum: ["idle", "thinking", "waiting", "archived", "error"] })
+		status: text("status", { enum: ["idle", "thinking", "waiting", "done", "archived", "error"] })
 			.notNull()
 			.default("idle"),
 		cwd: text("cwd"),
 		errorMessage: text("error_message"),
+		todosJson: text("todos_json", { mode: "json" }),
+		todosToolUseId: text("todos_tool_use_id"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -198,6 +200,17 @@ export const portAllocations = sqliteTable("port_allocations", {
 	chapterId: text("chapter_id").references(() => chapters.id),
 	serviceName: text("service_name"),
 	allocatedAt: text("allocated_at").notNull(),
+});
+
+// === user_preferences ===
+export const userPreferences = sqliteTable("user_preferences", {
+	id: text("id").primaryKey(),
+	userId: text("user_id").notNull().unique(),
+	autoLoadOlderMessages: integer("auto_load_older_messages", { mode: "boolean" })
+		.notNull()
+		.default(true),
+	createdAt: text("created_at").notNull(),
+	updatedAt: text("updated_at").notNull(),
 });
 
 // === users ===

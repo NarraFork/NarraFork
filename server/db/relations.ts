@@ -10,6 +10,7 @@ import {
 	projects,
 	terminals,
 	userFavoriteDirectories,
+	userPreferences,
 	users,
 } from "./schema";
 
@@ -91,16 +92,24 @@ export const portAllocationsRelations = relations(portAllocations, ({ one }) => 
 	}),
 }));
 
-export const usersRelations = relations(users, ({ many }) => ({
+export const usersRelations = relations(users, ({ many, one }) => ({
 	favoriteDirectories: many(userFavoriteDirectories),
+	preferences: one(userPreferences, {
+		fields: [users.id],
+		references: [userPreferences.userId],
+	}),
 }));
 
-export const userFavoriteDirectoriesRelations = relations(
-	userFavoriteDirectories,
-	({ one }) => ({
-		user: one(users, {
-			fields: [userFavoriteDirectories.userId],
-			references: [users.id],
-		}),
+export const userFavoriteDirectoriesRelations = relations(userFavoriteDirectories, ({ one }) => ({
+	user: one(users, {
+		fields: [userFavoriteDirectories.userId],
+		references: [users.id],
 	}),
-);
+}));
+
+export const userPreferencesRelations = relations(userPreferences, ({ one }) => ({
+	user: one(users, {
+		fields: [userPreferences.userId],
+		references: [users.id],
+	}),
+}));

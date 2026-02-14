@@ -95,10 +95,9 @@ sqlite.run(`
 `);
 sqlite.run(`
   CREATE TRIGGER IF NOT EXISTS narrators_fts_update AFTER UPDATE OF title ON narrators BEGIN
-    INSERT INTO narrators_fts(narrators_fts, rowid, title)
-    VALUES ('delete', OLD.rowid, COALESCE(OLD.title, ''));
-    INSERT INTO narrators_fts(rowid, title)
-    VALUES (NEW.rowid, COALESCE(NEW.title, ''));
+    DELETE FROM narrators_fts WHERE rowid = OLD.rowid;
+    INSERT OR IGNORE INTO narrators_fts(rowid, title)
+    SELECT NEW.rowid, NEW.title WHERE NEW.title IS NOT NULL;
   END
 `);
 sqlite.run(`
@@ -115,5 +114,17 @@ if (ftsTablesRecreated.length > 0) {
 	sqlite.run("INSERT INTO narrator_messages_fts(narrator_messages_fts) VALUES ('rebuild')");
 	sqlite.run("INSERT INTO narrators_fts(narrators_fts) VALUES ('rebuild')");
 }
+
+// User preferences table (per-account settings)
+sqlite.run(`
+  CREATE TABLE IF NOT EXISTS user_preferences (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    auto_load_older_messages INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+`);
+
 export const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 export { sqlite };
