@@ -32,6 +32,7 @@ No test framework is configured.
 ## Tech Stack
 
 - **Runtime:** Bun (≥ 1.2), all scripts via `bun run`/`bunx`
+- **Never use `npx`** — it may resolve to wrong or missing packages. Always use `bunx` instead.
 - **Backend:** Hono v4 on Bun.serve(), SQLite via `bun:sqlite`, Drizzle ORM
 - **Frontend:** React 19 + Mantine v7 (dark theme, indigo primary), TanStack Router (file-based), TanStack React Query, React Flow for graph visualization, xterm.js for terminals, react-i18next for i18n
 - **AI:** `@anthropic-ai/claude-agent-sdk` for narrator sessions

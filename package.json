@@ -7,6 +7,7 @@
 		"dev": "bun run db:push; bun run --hot server/index.ts",
 		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
 		"dev:all": "bun run db:push; bun run --hot server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
+		"dev:cold": "bun run db:push; bun run server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
 		"build": "bunx vite build --config frontend/vite.config.ts",
 		"start": "bun run db:push && bun server/index.ts",
 		"db:push": "bunx drizzle-kit push",
@@ -14,6 +15,7 @@
 		"db:migrate": "bun server/db/migrate.ts",
 		"check": "bunx @biomejs/biome check .",
 		"format": "bunx @biomejs/biome check --write .",
+		"approve": "bun server/scripts/approve-all.ts",
 		"test": "bun test",
 		"test:watch": "bun test --watch"
 	},
@@ -29,6 +31,7 @@
 		"@xterm/addon-fit": "^0.11.0",
 		"@xterm/xterm": "^6.0.0",
 		"@xyflow/react": "^12.10.0",
+		"diff": "^8.0.3",
 		"drizzle-orm": "^0.44.0",
 		"hono": "^4.7.0",
 		"i18next": "^25.8.6",

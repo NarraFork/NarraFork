@@ -28,5 +28,8 @@
 	"themeDark": "Dark",
 	"themeAuto": "System",
 	"languageSection": "Language",
+	"sessionSection": "Session",
+	"autoLoadOlderMessages": "Auto-load older messages on scroll",
+	"autoLoadOlderMessagesDesc": "Automatically load earlier messages when scrolling to the top of a conversation",
 	"unsavedSave": "Save Changes"
 }

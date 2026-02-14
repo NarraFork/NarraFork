@@ -28,5 +28,8 @@
 	"themeDark": "深色",
 	"themeAuto": "跟随系统",
 	"languageSection": "语言",
+	"sessionSection": "会话",
+	"autoLoadOlderMessages": "滚动时自动加载更早消息",
+	"autoLoadOlderMessagesDesc": "滚动到会话顶部时自动加载更早的消息",
 	"unsavedSave": "保存更改"
 }

@@ -11,7 +11,22 @@
 	"workingDirectory": "工作目录",
 	"workingDirectoryHint": "留空则使用主目录",
 	"workingDirectoryPlaceholder": "/path/to/directory",
+	"model": "模型",
+	"modelHint": "留空则使用设置中的默认模型",
 	"addToFavorites": "添加到收藏",
 	"favoriteDirectories": "收藏目录",
-	"cwdLabel": "{{path}}"
+	"cwdLabel": "{{path}}",
+	"archive": "归档",
+	"unarchive": "取消归档",
+	"archivedSessions": "已归档会话",
+	"viewArchived": "查看已归档",
+	"backToSessions": "返回会话列表",
+	"noArchivedSessions": "暂无已归档会话。",
+	"sortBy": "排序方式",
+	"sortUpdatedAt": "最近更新",
+	"sortCreatedAt": "最近创建",
+	"sortTitle": "标题",
+	"sortMessageCount": "消息数量",
+	"sortDescending": "降序",
+	"sortAscending": "升序"
 }

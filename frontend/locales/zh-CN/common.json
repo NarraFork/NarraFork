@@ -27,5 +27,11 @@
 	"userManagement": "用户管理",
 	"noUsers": "暂无用户。",
 	"role": "角色",
-	"createdAt": "创建时间"
+	"createdAt": "创建时间",
+	"copy": "复制",
+	"copied": "已复制",
+	"fullscreen": "全屏查看",
+	"wordWrap": "自动换行",
+	"noWrap": "不换行",
+	"landscape": "横屏模式"
 }

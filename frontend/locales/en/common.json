@@ -27,5 +27,11 @@
 	"userManagement": "User Management",
 	"noUsers": "No users found.",
 	"role": "Role",
-	"createdAt": "Created"
+	"createdAt": "Created",
+	"copy": "Copy",
+	"copied": "Copied",
+	"fullscreen": "Fullscreen",
+	"wordWrap": "Word wrap",
+	"noWrap": "No wrap",
+	"landscape": "Landscape"
 }
