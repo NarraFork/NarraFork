@@ -26,30 +26,19 @@ CREATE TABLE IF NOT EXISTS projects (
 	status TEXT NOT NULL DEFAULT 'active',
 	default_agent TEXT DEFAULT 'claude',
 	settings TEXT,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS repositories (
-	id TEXT PRIMARY KEY,
-	project_id TEXT REFERENCES projects(id),
-	path TEXT NOT NULL,
-	display_name TEXT NOT NULL,
+	git_path TEXT,
 	remote_url TEXT,
 	default_branch TEXT DEFAULT 'main',
-	is_primary INTEGER DEFAULT 0,
 	startup_script TEXT,
 	copy_files TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
--- PLACEHOLDER_REMAINING
 CREATE TABLE IF NOT EXISTS chapters (
 	id TEXT PRIMARY KEY,
 	project_id TEXT NOT NULL REFERENCES projects(id),
-	repository_id TEXT NOT NULL REFERENCES repositories(id),
 	title TEXT NOT NULL,
 	description TEXT,
-	type TEXT NOT NULL DEFAULT 'meanwhile',
 	status TEXT NOT NULL DEFAULT 'active',
 	branch TEXT NOT NULL,
 	worktree_path TEXT,
@@ -73,13 +62,14 @@ CREATE TABLE IF NOT EXISTS narrators (
 	inherit_mode TEXT NOT NULL DEFAULT 'fresh',
 	parent_narrator_id TEXT REFERENCES narrators(id),
 	context_summary TEXT,
-	model TEXT DEFAULT 'sonnet',
+	model TEXT DEFAULT 'claude-sonnet',
 	system_prompt TEXT,
 	permission_mode TEXT DEFAULT 'default',
 	message_count INTEGER DEFAULT 0,
 	total_cost_usd REAL DEFAULT 0,
 	last_message_at TEXT,
 	status TEXT NOT NULL DEFAULT 'idle',
+	cwd TEXT,
 	error_message TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
@@ -88,6 +78,7 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	id TEXT PRIMARY KEY,
 	narrator_id TEXT NOT NULL REFERENCES narrators(id),
 	sdk_message_uuid TEXT,
+	parent_tool_use_id TEXT,
 	role TEXT NOT NULL,
 	content_json TEXT NOT NULL,
 	content_text TEXT,
@@ -150,6 +141,14 @@ CREATE TABLE IF NOT EXISTS port_allocations (
 	chapter_id TEXT REFERENCES chapters(id),
 	service_name TEXT,
 	allocated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_favorite_directories (
+	id TEXT PRIMARY KEY,
+	user_id TEXT NOT NULL REFERENCES users(id),
+	path TEXT NOT NULL,
+	label TEXT,
+	sort_order INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL
 );
 `;
 

@@ -56,7 +56,6 @@ describe("forkChapterSchema", () => {
 	it("accepts valid fork input", () => {
 		const result = forkChapterSchema.safeParse({
 			title: "Experiment",
-			type: "whatif",
 			inheritMode: "compressed",
 		});
 		expect(result.success).toBe(true);

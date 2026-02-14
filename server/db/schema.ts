@@ -10,19 +10,9 @@ export const projects = sqliteTable("projects", {
 		.default("active"),
 	defaultAgent: text("default_agent", { enum: ["claude", "opencode"] }).default("claude"),
 	settings: text("settings", { mode: "json" }),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
-});
-
-// === repositories ===
-export const repositories = sqliteTable("repositories", {
-	id: text("id").primaryKey(),
-	projectId: text("project_id").references(() => projects.id),
-	path: text("path").notNull(),
-	displayName: text("display_name").notNull(),
+	gitPath: text("git_path"),
 	remoteUrl: text("remote_url"),
 	defaultBranch: text("default_branch").default("main"),
-	isPrimary: integer("is_primary", { mode: "boolean" }).default(false),
 	startupScript: text("startup_script"),
 	copyFiles: text("copy_files"),
 	createdAt: text("created_at").notNull(),
@@ -37,14 +27,8 @@ export const chapters = sqliteTable(
 		projectId: text("project_id")
 			.notNull()
 			.references(() => projects.id),
-		repositoryId: text("repository_id")
-			.notNull()
-			.references(() => repositories.id),
 		title: text("title").notNull(),
 		description: text("description"),
-		type: text("type", { enum: ["meanwhile", "whatif"] })
-			.notNull()
-			.default("meanwhile"),
 		status: text("status", { enum: ["active", "dormant", "merged", "abandoned"] })
 			.notNull()
 			.default("active"),
@@ -83,7 +67,7 @@ export const narrators = sqliteTable(
 			.default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
 		contextSummary: text("context_summary"),
-		model: text("model").default("sonnet"),
+		model: text("model").default("claude-sonnet"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
 			enum: ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"],
@@ -94,6 +78,7 @@ export const narrators = sqliteTable(
 		status: text("status", { enum: ["idle", "thinking", "waiting", "archived", "error"] })
 			.notNull()
 			.default("idle"),
+		cwd: text("cwd"),
 		errorMessage: text("error_message"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -110,6 +95,7 @@ export const narratorMessages = sqliteTable(
 			.notNull()
 			.references(() => narrators.id),
 		sdkMessageUuid: text("sdk_message_uuid"),
+		parentToolUseId: text("parent_tool_use_id"),
 		role: text("role", { enum: ["user", "assistant", "system"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),
 		contentText: text("content_text"),
@@ -224,3 +210,19 @@ export const users = sqliteTable("users", {
 		.default("user"),
 	createdAt: text("created_at").notNull(),
 });
+
+// === user_favorite_directories ===
+export const userFavoriteDirectories = sqliteTable(
+	"user_favorite_directories",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		label: text("label"),
+		sortOrder: integer("sort_order").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_fav_dirs_user").on(table.userId, table.sortOrder)],
+);

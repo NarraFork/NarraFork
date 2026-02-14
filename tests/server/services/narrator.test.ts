@@ -6,7 +6,6 @@ import {
 	narrators,
 	narratorToolCalls,
 	projects,
-	repositories,
 } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -17,24 +16,15 @@ afterEach(() => cleanDb(sqlite));
 const now = new Date().toISOString();
 
 function seedProject() {
-	db.insert(projects).values({ id: "p1", name: "Proj", createdAt: now, updatedAt: now }).run();
-	db.insert(repositories)
-		.values({
-			id: "r1",
-			projectId: "p1",
-			path: "/tmp/repo",
-			displayName: "repo",
-			createdAt: now,
-			updatedAt: now,
-		})
+	db.insert(projects)
+		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
 	db.insert(chapters)
 		.values({
 			id: "ch1",
 			projectId: "p1",
-			repositoryId: "r1",
 			title: "Chapter 1",
-			branch: "meanwhile/ch1-abc",
+			branch: "chapter/ch1-abc",
 			baseBranch: "main",
 			createdAt: now,
 			updatedAt: now,
@@ -61,7 +51,7 @@ describe("narrator CRUD", () => {
 		expect(result!.chapterId).toBe("ch1");
 		expect(result!.type).toBe("primary");
 		expect(result!.status).toBe("idle");
-		expect(result!.model).toBe("sonnet");
+		expect(result!.model).toBe("claude-sonnet");
 	});
 
 	it("can create a standalone narrator (null chapterId)", async () => {

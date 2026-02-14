@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { chapters, projects, repositories } from "../../../server/db/schema";
+import { chapters, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -9,16 +9,8 @@ afterEach(() => cleanDb(sqlite));
 const now = new Date().toISOString();
 
 function seedGraph() {
-	db.insert(projects).values({ id: "p1", name: "Proj", createdAt: now, updatedAt: now }).run();
-	db.insert(repositories)
-		.values({
-			id: "r1",
-			projectId: "p1",
-			path: "/tmp/repo",
-			displayName: "repo",
-			createdAt: now,
-			updatedAt: now,
-		})
+	db.insert(projects)
+		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
 
 	// Root chapter
@@ -26,9 +18,8 @@ function seedGraph() {
 		.values({
 			id: "root",
 			projectId: "p1",
-			repositoryId: "r1",
 			title: "Root",
-			branch: "meanwhile/root-aaa",
+			branch: "chapter/root-aaa",
 			baseBranch: "main",
 			createdAt: now,
 			updatedAt: now,
@@ -40,11 +31,9 @@ function seedGraph() {
 		.values({
 			id: "fork1",
 			projectId: "p1",
-			repositoryId: "r1",
 			title: "Fork 1",
-			type: "whatif",
-			branch: "whatif/fork1-bbb",
-			baseBranch: "meanwhile/root-aaa",
+			branch: "chapter/fork1-bbb",
+			baseBranch: "chapter/root-aaa",
 			parentChapterId: "root",
 			createdAt: now,
 			updatedAt: now,
@@ -56,10 +45,9 @@ function seedGraph() {
 		.values({
 			id: "merged1",
 			projectId: "p1",
-			repositoryId: "r1",
 			title: "Merged",
 			status: "merged",
-			branch: "meanwhile/merged-ccc",
+			branch: "chapter/merged-ccc",
 			baseBranch: "main",
 			parentChapterId: "root",
 			mergedIntoChapterId: "root",
@@ -77,7 +65,6 @@ function buildGraph(projectChapters: any[]) {
 		type: "chapterNode",
 		data: {
 			title: ch.title,
-			chapterType: ch.type,
 			status: ch.status,
 		},
 	}));

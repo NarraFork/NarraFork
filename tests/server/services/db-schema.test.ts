@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
-import { chapters, projects, repositories } from "../../../server/db/schema";
+import { chapters, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -26,25 +26,16 @@ describe("test DB setup", () => {
 });
 
 describe("chapters schema", () => {
-	it("can create chapter with FK to project and repo", async () => {
-		db.insert(projects).values({ id: "p1", name: "Proj", createdAt: now, updatedAt: now }).run();
-		db.insert(repositories)
-			.values({
-				id: "r1",
-				projectId: "p1",
-				path: "/tmp/repo",
-				displayName: "repo",
-				createdAt: now,
-				updatedAt: now,
-			})
+	it("can create chapter with FK to project", async () => {
+		db.insert(projects)
+			.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 			.run();
 		db.insert(chapters)
 			.values({
 				id: "ch1",
 				projectId: "p1",
-				repositoryId: "r1",
 				title: "Chapter 1",
-				branch: "meanwhile/test-abc123",
+				branch: "chapter/test-abc123",
 				baseBranch: "main",
 				createdAt: now,
 				updatedAt: now,
@@ -53,29 +44,19 @@ describe("chapters schema", () => {
 
 		const ch = await db.query.chapters.findFirst({ where: eq(chapters.id, "ch1") });
 		expect(ch).toBeDefined();
-		expect(ch!.type).toBe("meanwhile");
 		expect(ch!.status).toBe("active");
 	});
 
 	it("supports self-referencing parentChapterId", async () => {
-		db.insert(projects).values({ id: "p1", name: "Proj", createdAt: now, updatedAt: now }).run();
-		db.insert(repositories)
-			.values({
-				id: "r1",
-				projectId: "p1",
-				path: "/tmp/repo",
-				displayName: "repo",
-				createdAt: now,
-				updatedAt: now,
-			})
+		db.insert(projects)
+			.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 			.run();
 		db.insert(chapters)
 			.values({
 				id: "parent",
 				projectId: "p1",
-				repositoryId: "r1",
 				title: "Parent",
-				branch: "meanwhile/parent-aaa",
+				branch: "chapter/parent-aaa",
 				baseBranch: "main",
 				createdAt: now,
 				updatedAt: now,
@@ -85,12 +66,10 @@ describe("chapters schema", () => {
 			.values({
 				id: "child",
 				projectId: "p1",
-				repositoryId: "r1",
 				title: "Child",
-				branch: "whatif/child-bbb",
+				branch: "chapter/child-bbb",
 				baseBranch: "main",
 				parentChapterId: "parent",
-				type: "whatif",
 				createdAt: now,
 				updatedAt: now,
 			})
@@ -98,6 +77,5 @@ describe("chapters schema", () => {
 
 		const child = await db.query.chapters.findFirst({ where: eq(chapters.id, "child") });
 		expect(child!.parentChapterId).toBe("parent");
-		expect(child!.type).toBe("whatif");
 	});
 });

@@ -37,16 +37,15 @@ describe("slugify", () => {
 });
 
 describe("branch naming", () => {
-	it("follows type/slug-shortId pattern", () => {
-		const type = "whatif";
+	it("follows chapter/slug-shortId pattern", () => {
 		const slug = slugify("Experiment Alpha");
 		const shortId = "abc123";
-		const branch = `${type}/${slug}-${shortId}`;
-		expect(branch).toBe("whatif/experiment-alpha-abc123");
+		const branch = `chapter/${slug}-${shortId}`;
+		expect(branch).toBe("chapter/experiment-alpha-abc123");
 	});
 
-	it("meanwhile type", () => {
-		const branch = `meanwhile/${slugify("Add Auth")}-xyz789`;
-		expect(branch).toBe("meanwhile/add-auth-xyz789");
+	it("another branch name", () => {
+		const branch = `chapter/${slugify("Add Auth")}-xyz789`;
+		expect(branch).toBe("chapter/add-auth-xyz789");
 	});
 });

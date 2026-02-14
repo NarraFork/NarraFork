@@ -8,26 +8,17 @@ import {
 	permissionRequests,
 	portAllocations,
 	projects,
-	repositories,
 	terminals,
+	userFavoriteDirectories,
 	users,
 } from "./schema";
 
 export const projectsRelations = relations(projects, ({ many }) => ({
-	repositories: many(repositories),
 	chapters: many(chapters),
-}));
-
-export const repositoriesRelations = relations(repositories, ({ one }) => ({
-	project: one(projects, { fields: [repositories.projectId], references: [projects.id] }),
 }));
 
 export const chaptersRelations = relations(chapters, ({ one, many }) => ({
 	project: one(projects, { fields: [chapters.projectId], references: [projects.id] }),
-	repository: one(repositories, {
-		fields: [chapters.repositoryId],
-		references: [repositories.id],
-	}),
 	parentChapter: one(chapters, {
 		fields: [chapters.parentChapterId],
 		references: [chapters.id],
@@ -100,4 +91,16 @@ export const portAllocationsRelations = relations(portAllocations, ({ one }) => 
 	}),
 }));
 
-export const usersRelations = relations(users, () => ({}));
+export const usersRelations = relations(users, ({ many }) => ({
+	favoriteDirectories: many(userFavoriteDirectories),
+}));
+
+export const userFavoriteDirectoriesRelations = relations(
+	userFavoriteDirectories,
+	({ one }) => ({
+		user: one(users, {
+			fields: [userFavoriteDirectories.userId],
+			references: [users.id],
+		}),
+	}),
+);

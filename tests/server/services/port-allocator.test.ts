@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
-import { chapters, portAllocations, projects, repositories } from "../../../server/db/schema";
+import { chapters, portAllocations, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -10,24 +10,15 @@ afterEach(() => cleanDb(sqlite));
 const now = new Date().toISOString();
 
 function seedChapter(chapterId = "ch1") {
-	db.insert(projects).values({ id: "p1", name: "Proj", createdAt: now, updatedAt: now }).run();
-	db.insert(repositories)
-		.values({
-			id: "r1",
-			projectId: "p1",
-			path: "/tmp/repo",
-			displayName: "repo",
-			createdAt: now,
-			updatedAt: now,
-		})
+	db.insert(projects)
+		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
 	db.insert(chapters)
 		.values({
 			id: chapterId,
 			projectId: "p1",
-			repositoryId: "r1",
 			title: "Ch",
-			branch: "meanwhile/ch-abc",
+			branch: "chapter/ch-abc",
 			baseBranch: "main",
 			createdAt: now,
 			updatedAt: now,
@@ -83,9 +74,8 @@ describe("port allocations", () => {
 			.values({
 				id: "ch2",
 				projectId: "p1",
-				repositoryId: "r1",
 				title: "Ch2",
-				branch: "meanwhile/ch2-def",
+				branch: "chapter/ch2-def",
 				baseBranch: "main",
 				createdAt: now,
 				updatedAt: now,

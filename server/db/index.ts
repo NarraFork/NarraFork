@@ -14,6 +14,7 @@ const sqlite = new Database(dbPath);
 
 sqlite.run("PRAGMA journal_mode = WAL");
 sqlite.run("PRAGMA foreign_keys = ON");
+sqlite.run("PRAGMA busy_timeout = 5000");
 
 // FTS5 virtual tables for full-text search (Phase 5)
 // Use trigram tokenizer for CJK (Chinese/Japanese/Korean) support
