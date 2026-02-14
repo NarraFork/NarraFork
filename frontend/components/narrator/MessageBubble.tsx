@@ -30,7 +30,6 @@ interface MessageBubbleProps {
 function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) {
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: fetch only when image identity changes
 	useEffect(() => {
 		if (block.previewUrl || !narratorId || !block.imageId) return;
 

@@ -1,4 +1,4 @@
-import { Alert, Button, Loader, Modal, Select, Stack, Text, TextInput } from "@mantine/core";
+import { Alert, Button, Modal, Select, Stack, Text, TextInput } from "@mantine/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -99,7 +99,7 @@ export function ChapterMergeModal({
 					onChange={(e) => setMessage(e.currentTarget.value)}
 				/>
 
-				{conflicts && conflicts.hasConflicts && (
+				{conflicts?.hasConflicts && (
 					<Alert color="yellow" title={t("conflictsDetected")}>
 						<Text size="sm">
 							{t("conflictsDescription", { count: conflicts.conflictFiles?.length ?? 0 })}

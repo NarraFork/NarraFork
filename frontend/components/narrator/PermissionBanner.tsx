@@ -1,5 +1,6 @@
 import { Alert, Button, Code, Group, Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
+import { CodeBlockWithActions } from "./CodeBlockWithActions";
 
 interface PermissionBannerProps {
 	request: {
@@ -27,9 +28,11 @@ export function PermissionBanner({ request, onDecision }: PermissionBannerProps)
 					{request.decisionReason}
 				</Text>
 			)}
-			<Code block style={{ fontSize: 11, maxHeight: 120, overflow: "auto" }} mb="sm">
-				{truncated}
-			</Code>
+			<CodeBlockWithActions
+				content={truncated}
+				style={{ fontSize: 11, maxHeight: 120, overflow: "auto" }}
+				title={`${request.toolName} — Permission`}
+			/>
 			<Group>
 				<Button size="xs" color="green" onClick={() => onDecision(request.id, "allow")}>
 					{tc("allow")}
