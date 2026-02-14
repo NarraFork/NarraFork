@@ -1,7 +1,26 @@
-import { Button, Card, Group, Loader, Modal, Stack, Text, Title } from "@mantine/core";
+import {
+	ActionIcon,
+	Button,
+	Card,
+	Group,
+	Loader,
+	Modal,
+	Stack,
+	Text,
+	TextInput,
+	Title,
+	Tooltip,
+} from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { IconFolder, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useCreateFavoriteDirectory,
+	useDeleteFavoriteDirectory,
+	useFavoriteDirectories,
+} from "../../hooks/useFavoriteDirectories";
 import { useCreateSession, useDeleteSession, useSessions } from "../../hooks/useSessions";
 
 export const Route = createFileRoute("/sessions/")({
@@ -16,14 +35,28 @@ function SessionsPage() {
 	const { t } = useTranslation("sessions");
 	const { t: tc } = useTranslation("common");
 	const { i18n } = useTranslation();
+	const [cwd, setCwd] = useState("");
+	const { data: favorites } = useFavoriteDirectories();
+	const addFavorite = useCreateFavoriteDirectory();
+	const removeFavorite = useDeleteFavoriteDirectory();
+
+	const isFavorited = favorites?.some((f: any) => f.path === cwd);
 
 	const handleCreate = () => {
 		createSession.mutate(
-			{},
+			{ ...(cwd ? { cwd } : {}) },
 			{
-				onSuccess: () => close(),
+				onSuccess: () => {
+					close();
+					setCwd("");
+				},
 			},
 		);
+	};
+
+	const handleClose = () => {
+		close();
+		setCwd("");
 	};
 
 	return (
@@ -58,6 +91,11 @@ function SessionsPage() {
 												count: session.messageCount ?? 0,
 											})}
 										</Text>
+										{session.cwd && (
+											<Text size="xs" c="dimmed" truncate>
+												{t("cwdLabel", { path: session.cwd })}
+											</Text>
+										)}
 									</div>
 									<Group>
 										<Text size="xs" c="dimmed">
@@ -83,11 +121,71 @@ function SessionsPage() {
 				</Stack>
 			)}
 
-			<Modal opened={opened} onClose={close} title={t("newSessionModal")}>
+			<Modal opened={opened} onClose={handleClose} title={t("newSessionModal")}>
 				<Stack>
 					<Text size="sm" c="dimmed">
 						{t("newSessionDescription")}
 					</Text>
+
+					<TextInput
+						label={t("workingDirectory")}
+						description={t("workingDirectoryHint")}
+						placeholder={t("workingDirectoryPlaceholder")}
+						leftSection={<IconFolder size={16} />}
+						value={cwd}
+						onChange={(e) => setCwd(e.currentTarget.value)}
+						rightSection={
+							cwd ? (
+								isFavorited ? (
+									<IconStarFilled
+										size={16}
+										style={{ color: "var(--mantine-color-yellow-5)" }}
+									/>
+								) : (
+									<Tooltip label={t("addToFavorites")}>
+										<ActionIcon
+											variant="subtle"
+											size="sm"
+											onClick={() => addFavorite.mutate({ path: cwd })}
+										>
+											<IconStar size={16} />
+										</ActionIcon>
+									</Tooltip>
+								)
+							) : null
+						}
+					/>
+
+					{favorites?.length ? (
+						<Stack gap="xs">
+							<Text size="xs" fw={500} c="dimmed">
+								{t("favoriteDirectories")}
+							</Text>
+							{favorites.map((fav: any) => (
+								<Group key={fav.id} gap="xs" wrap="nowrap">
+									<Button
+										variant={cwd === fav.path ? "light" : "subtle"}
+										size="xs"
+										style={{ flex: 1, justifyContent: "flex-start" }}
+										onClick={() => setCwd(fav.path)}
+									>
+										<Text size="xs" truncate>
+											{fav.label || fav.path}
+										</Text>
+									</Button>
+									<ActionIcon
+										variant="subtle"
+										color="red"
+										size="xs"
+										onClick={() => removeFavorite.mutate(fav.id)}
+									>
+										<IconX size={14} />
+									</ActionIcon>
+								</Group>
+							))}
+						</Stack>
+					) : null}
+
 					<Button onClick={handleCreate} loading={createSession.isPending}>
 						{t("createSession")}
 					</Button>

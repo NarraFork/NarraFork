@@ -7,5 +7,15 @@
 	"repositoryPath": "仓库路径",
 	"repositoryPathPlaceholder": "/home/user/projects/my-repo",
 	"repositoryPathDescription": "本地已有的 Git 仓库路径",
-	"projectNotFound": "项目未找到"
+	"projectNotFound": "项目未找到",
+	"repoMode": "仓库",
+	"repoModeNone": "稍后添加",
+	"repoModeExisting": "已有仓库",
+	"repoModeInit": "新建仓库",
+	"repoModeClone": "克隆远程仓库",
+	"cloneUrl": "克隆地址",
+	"cloneUrlPlaceholder": "https://github.com/user/repo.git",
+	"cloneBranch": "分支（可选）",
+	"initPathDescription": "新仓库将创建在此路径",
+	"clonePathDescription": "克隆到本地的路径"
 }

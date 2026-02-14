@@ -34,6 +34,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 	return response.json();
 }
 
+export interface PaginatedMessages {
+	messages: any[];
+	hasMore: boolean;
+	nextCursor: string | null;
+}
+
 export const api = {
 	// Auth
 	authStatus: () => request<{ hasUsers: boolean; registrationOpen: boolean }>("/auth/status"),
@@ -86,9 +92,22 @@ export const api = {
 	createNarrator: (data: { chapterId: string; type?: string; model?: string }) =>
 		request<any>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	deleteNarrator: (id: string) => request<any>(`/narrators/${id}`, { method: "DELETE" }),
-	getNarratorMessages: (id: string, limit?: number) =>
-		request<any[]>(`/narrators/${id}/messages${limit ? `?limit=${limit}` : ""}`),
+	getNarratorMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
+		const params = new URLSearchParams();
+		if (around) {
+			params.set("around", around);
+		} else {
+			if (limit) params.set("limit", String(limit));
+			if (cursor) params.set("cursor", cursor);
+		}
+		const qs = params.toString();
+		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
+	},
 	interruptNarrator: (id: string) => request<any>(`/narrators/${id}/interrupt`, { method: "POST" }),
+	findParentMessage: (id: string, toolUseId: string) =>
+		request<{ messageId: string | null; createdAt: string | null }>(
+			`/narrators/${id}/messages/find-parent?toolUseId=${encodeURIComponent(toolUseId)}`,
+		),
 	getPendingPermissions: (id: string) => request<any[]>(`/narrators/${id}/permissions`),
 	approvePermission: (requestId: string) =>
 		request<any>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),
@@ -123,11 +142,24 @@ export const api = {
 	// Standalone Sessions
 	listSessions: () => request<any[]>("/sessions"),
 	getSession: (id: string) => request<any>(`/sessions/${id}`),
-	createSession: (data: { model?: string; systemPrompt?: string; permissionMode?: string }) =>
-		request<any>("/sessions", { method: "POST", body: JSON.stringify(data) }),
+	createSession: (data: {
+		model?: string;
+		systemPrompt?: string;
+		permissionMode?: string;
+		cwd?: string;
+	}) => request<any>("/sessions", { method: "POST", body: JSON.stringify(data) }),
 	deleteSession: (id: string) => request<any>(`/sessions/${id}`, { method: "DELETE" }),
-	getSessionMessages: (id: string, limit?: number) =>
-		request<any[]>(`/sessions/${id}/messages${limit ? `?limit=${limit}` : ""}`),
+	getSessionMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
+		const params = new URLSearchParams();
+		if (around) {
+			params.set("around", around);
+		} else {
+			if (limit) params.set("limit", String(limit));
+			if (cursor) params.set("cursor", cursor);
+		}
+		const qs = params.toString();
+		return request<PaginatedMessages>(`/sessions/${id}/messages${qs ? `?${qs}` : ""}`);
+	},
 	updateSessionTitle: (id: string, title: string) =>
 		request<{ ok: boolean; title: string }>(`/sessions/${id}/title`, {
 			method: "PATCH",
@@ -135,6 +167,18 @@ export const api = {
 		}),
 	generateSessionTitle: (id: string) =>
 		request<{ title: string }>(`/sessions/${id}/generate-title`, { method: "POST" }),
+
+	// Favorite Directories
+	listFavoriteDirectories: () => request<any[]>("/favorites"),
+	createFavoriteDirectory: (data: { path: string; label?: string }) =>
+		request<any>("/favorites", { method: "POST", body: JSON.stringify(data) }),
+	updateFavoriteDirectory: (
+		id: string,
+		data: { path?: string; label?: string | null; sortOrder?: number },
+	) => request<any>(`/favorites/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	deleteFavoriteDirectory: (id: string) => request<any>(`/favorites/${id}`, { method: "DELETE" }),
+	reorderFavoriteDirectories: (ids: string[]) =>
+		request<any>("/favorites/reorder", { method: "PUT", body: JSON.stringify({ ids }) }),
 
 	// Containers
 	getContainers: (chapterId: string) => request<any[]>(`/chapters/${chapterId}/containers`),
@@ -165,7 +209,6 @@ export const api = {
 		data: {
 			title: string;
 			description?: string;
-			type?: string;
 			inheritMode?: string;
 			forkAtMessageUuid?: string;
 		},

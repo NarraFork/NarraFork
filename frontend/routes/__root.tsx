@@ -23,7 +23,7 @@ import {
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
-import { getToken } from "../lib/api";
+import { clearToken, getToken } from "../lib/api";
 
 interface RouterContext {
 	queryClient: QueryClient;
@@ -58,8 +58,9 @@ function AuthenticatedLayout() {
 		return <Navigate to="/login" />;
 	}
 
-	// Token exists but query failed (expired/invalid) → redirect to login
+	// Token exists but query failed (expired/invalid) → clear token and redirect
 	if (isError) {
+		clearToken();
 		return <Navigate to="/login" />;
 	}
 

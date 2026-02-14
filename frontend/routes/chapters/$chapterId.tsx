@@ -118,7 +118,6 @@ function ChapterDetailPage() {
 				<Group justify="space-between">
 					<Group>
 						<Title order={2}>{chapter.title}</Title>
-						<Badge color={chapter.type === "meanwhile" ? "indigo" : "orange"}>{chapter.type}</Badge>
 						<Badge color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>{chapter.status}</Badge>
 					</Group>
 					<Group gap="xs">

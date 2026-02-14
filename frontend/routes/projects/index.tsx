@@ -5,6 +5,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	SegmentedControl,
 	SimpleGrid,
 	Stack,
 	Text,
@@ -26,22 +27,36 @@ function ProjectListPage() {
 	const createProject = useCreateProject();
 	const [opened, { open, close }] = useDisclosure(false);
 	const [name, setName] = useState("");
+	const [repoMode, setRepoMode] = useState<string>("existing");
 	const [repoPath, setRepoPath] = useState("");
+	const [cloneUrl, setCloneUrl] = useState("");
+	const [cloneBranch, setCloneBranch] = useState("");
 	const { t } = useTranslation("projects");
 	const { t: tc } = useTranslation("common");
 
 	const handleCreate = () => {
 		if (!name.trim()) return;
-		createProject.mutate(
-			{ name: name.trim(), repositoryPath: repoPath.trim() || undefined },
-			{
-				onSuccess: () => {
-					close();
-					setName("");
-					setRepoPath("");
-				},
+		const data: Record<string, any> = { name: name.trim() };
+
+		if (repoMode !== "none") {
+			data.repoMode = repoMode;
+			data.gitPath = repoPath.trim() || undefined;
+		}
+		if (repoMode === "clone") {
+			data.cloneUrl = cloneUrl.trim() || undefined;
+			data.cloneBranch = cloneBranch.trim() || undefined;
+		}
+
+		createProject.mutate(data, {
+			onSuccess: () => {
+				close();
+				setName("");
+				setRepoMode("existing");
+				setRepoPath("");
+				setCloneUrl("");
+				setCloneBranch("");
 			},
-		);
+		});
 	};
 
 	if (isLoading) return <Loader />;
@@ -94,13 +109,54 @@ function ProjectListPage() {
 						onChange={(e) => setName(e.currentTarget.value)}
 						required
 					/>
-					<TextInput
-						label={t("repositoryPath")}
-						placeholder={t("repositoryPathPlaceholder")}
-						value={repoPath}
-						onChange={(e) => setRepoPath(e.currentTarget.value)}
-						description={t("repositoryPathDescription")}
-					/>
+					<div>
+						<Text size="sm" fw={500} mb={4}>
+							{t("repoMode")}
+						</Text>
+						<SegmentedControl
+							fullWidth
+							value={repoMode}
+							onChange={setRepoMode}
+							data={[
+								{ value: "existing", label: t("repoModeExisting") },
+								{ value: "init", label: t("repoModeInit") },
+								{ value: "clone", label: t("repoModeClone") },
+								{ value: "none", label: t("repoModeNone") },
+							]}
+						/>
+					</div>
+					{repoMode === "clone" && (
+						<>
+							<TextInput
+								label={t("cloneUrl")}
+								placeholder={t("cloneUrlPlaceholder")}
+								value={cloneUrl}
+								onChange={(e) => setCloneUrl(e.currentTarget.value)}
+								required
+							/>
+							<TextInput
+								label={t("cloneBranch")}
+								value={cloneBranch}
+								onChange={(e) => setCloneBranch(e.currentTarget.value)}
+							/>
+						</>
+					)}
+					{repoMode !== "none" && (
+						<TextInput
+							label={t("repositoryPath")}
+							placeholder={t("repositoryPathPlaceholder")}
+							value={repoPath}
+							onChange={(e) => setRepoPath(e.currentTarget.value)}
+							description={
+								repoMode === "init"
+									? t("initPathDescription")
+									: repoMode === "clone"
+										? t("clonePathDescription")
+										: t("repositoryPathDescription")
+							}
+							required
+						/>
+					)}
 					<Button onClick={handleCreate} loading={createProject.isPending}>
 						{tc("create")}
 					</Button>

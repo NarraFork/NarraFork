@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
 export function useNarrators(chapterId: string) {
@@ -17,10 +17,18 @@ export function useNarrator(id: string) {
 	});
 }
 
-export function useNarratorMessages(narratorId: string) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "messages"],
-		queryFn: () => api.getNarratorMessages(narratorId),
+export function useNarratorMessages(narratorId: string, around?: string) {
+	return useInfiniteQuery({
+		queryKey: ["narrators", narratorId, "messages", { around }],
+		queryFn: ({ pageParam }) => {
+			// First page: use `around` if provided, otherwise fetch latest 10
+			if (!pageParam && around) {
+				return api.getNarratorMessages(narratorId, undefined, undefined, around);
+			}
+			return api.getNarratorMessages(narratorId, pageParam ? 50 : 10, pageParam);
+		},
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
 		enabled: !!narratorId,
 	});
 }

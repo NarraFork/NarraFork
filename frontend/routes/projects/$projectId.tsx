@@ -1,10 +1,10 @@
 import {
 	Badge,
 	Button,
+	Divider,
 	Group,
 	Loader,
 	Modal,
-	Select,
 	SimpleGrid,
 	Stack,
 	Text,
@@ -36,7 +36,6 @@ function ProjectDetailPage() {
 	const [batchMergeOpened, { open: openBatchMerge, close: closeBatchMerge }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
-	const [type, setType] = useState<string>("meanwhile");
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
 	const { t: tp } = useTranslation("projects");
@@ -44,25 +43,21 @@ function ProjectDetailPage() {
 	if (projectLoading) return <Loader />;
 	if (!project) return <Text>{tp("projectNotFound")}</Text>;
 
-	const primaryRepo =
-		project.repositories?.find((r: any) => r.isPrimary) ?? project.repositories?.[0];
+	const hasGitPath = !!project.gitPath;
 
 	const handleCreate = () => {
-		if (!title.trim() || !primaryRepo) return;
+		if (!title.trim()) return;
 		createChapter.mutate(
 			{
 				projectId,
-				repositoryId: primaryRepo.id,
 				title: title.trim(),
 				description: description.trim() || undefined,
-				type,
 			},
 			{
 				onSuccess: () => {
 					close();
 					setTitle("");
 					setDescription("");
-					setType("meanwhile");
 				},
 			},
 		);
@@ -78,11 +73,19 @@ function ProjectDetailPage() {
 							{project.description}
 						</Text>
 					)}
+					{project.gitPath && (
+						<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
+							{project.gitPath}
+						</Text>
+					)}
 				</div>
 				<Badge color={project.status === "active" ? "green" : "gray"} size="lg">
 					{project.status}
 				</Badge>
 			</Group>
+
+			<Divider />
+
 			<Group justify="space-between">
 				<Title order={3}>{t("title")}</Title>
 				<Group gap="xs">
@@ -109,7 +112,7 @@ function ProjectDetailPage() {
 					>
 						{t("batchMerge")}
 					</Button>
-					<Button onClick={open} disabled={!primaryRepo}>
+					<Button onClick={open} disabled={!hasGitPath}>
 						{t("newChapter")}
 					</Button>
 				</Group>
@@ -141,15 +144,6 @@ function ProjectDetailPage() {
 						placeholder={t("descriptionPlaceholder")}
 						value={description}
 						onChange={(e) => setDescription(e.currentTarget.value)}
-					/>
-					<Select
-						label={tc("type")}
-						data={[
-							{ value: "meanwhile", label: t("typeMeanwhile") },
-							{ value: "whatif", label: t("typeWhatif") },
-						]}
-						value={type}
-						onChange={(v) => setType(v ?? "meanwhile")}
 					/>
 					<Button onClick={handleCreate} loading={createChapter.isPending}>
 						{tc("create")}

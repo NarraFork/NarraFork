@@ -7,5 +7,15 @@
 	"repositoryPath": "Repository Path",
 	"repositoryPathPlaceholder": "/home/user/projects/my-repo",
 	"repositoryPathDescription": "Local path to an existing git repository",
-	"projectNotFound": "Project not found"
+	"projectNotFound": "Project not found",
+	"repoMode": "Repository",
+	"repoModeNone": "Add later",
+	"repoModeExisting": "Existing repository",
+	"repoModeInit": "Initialize new",
+	"repoModeClone": "Clone from URL",
+	"cloneUrl": "Clone URL",
+	"cloneUrlPlaceholder": "https://github.com/user/repo.git",
+	"cloneBranch": "Branch (optional)",
+	"initPathDescription": "Path where the new repository will be created",
+	"clonePathDescription": "Local path to clone into"
 }

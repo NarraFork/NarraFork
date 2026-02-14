@@ -18,5 +18,10 @@
 	"status_thinking": "Thinking",
 	"status_waiting": "Waiting",
 	"status_archived": "Archived",
-	"status_error": "Error"
+	"status_error": "Error",
+	"attachImage": "Attach image",
+	"removeImage": "Remove",
+	"imageTooLarge": "Image must be under 10MB",
+	"unsupportedFormat": "Supported: PNG, JPEG, GIF, WebP",
+	"loadOlderMessages": "Load older messages"
 }

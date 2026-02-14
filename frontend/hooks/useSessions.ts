@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
 export function useSessions() {
@@ -16,10 +16,17 @@ export function useSession(id: string) {
 	});
 }
 
-export function useSessionMessages(id: string, limit?: number) {
-	return useQuery({
-		queryKey: ["sessions", id, "messages", limit],
-		queryFn: () => api.getSessionMessages(id, limit),
+export function useSessionMessages(id: string, around?: string) {
+	return useInfiniteQuery({
+		queryKey: ["sessions", id, "messages", { around }],
+		queryFn: ({ pageParam }) => {
+			if (!pageParam && around) {
+				return api.getSessionMessages(id, undefined, undefined, around);
+			}
+			return api.getSessionMessages(id, pageParam ? 50 : 10, pageParam);
+		},
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
 		enabled: !!id,
 	});
 }

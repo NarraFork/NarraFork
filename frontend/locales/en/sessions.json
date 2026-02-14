@@ -7,5 +7,11 @@
 	"newSessionModal": "New Standalone Session",
 	"newSessionDescription": "Create a standalone AI session not bound to any chapter. Useful for general questions and explorations.",
 	"createSession": "Create Session",
-	"sessionNotFound": "Session not found"
+	"sessionNotFound": "Session not found",
+	"workingDirectory": "Working Directory",
+	"workingDirectoryHint": "Leave empty to use home directory",
+	"workingDirectoryPlaceholder": "/path/to/directory",
+	"addToFavorites": "Add to favorites",
+	"favoriteDirectories": "Favorites",
+	"cwdLabel": "{{path}}"
 }

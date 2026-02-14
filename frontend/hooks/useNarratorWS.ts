@@ -32,9 +32,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 			const token = getToken();
 			const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-			const ws = new WebSocket(
-				`${protocol}//${window.location.host}/ws/narrator${tokenParam}`,
-			);
+			const ws = new WebSocket(`${protocol}//${window.location.host}/ws/narrator${tokenParam}`);
 			wsRef.current = ws;
 
 			ws.onopen = () => {
@@ -62,10 +60,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							callbacksRef.current.onStatusChange?.(data.status);
 							break;
 						case "tool_progress":
-							callbacksRef.current.onToolProgress?.(
-								data.toolUseId,
-								data.elapsed,
-							);
+							callbacksRef.current.onToolProgress?.(data.toolUseId, data.elapsed);
 							break;
 						case "title_updated":
 						case "narrator:title_updated":
@@ -105,9 +100,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			const ws = wsRef.current;
 			if (ws) {
 				if (ws.readyState === WebSocket.OPEN) {
-					ws.send(
-						JSON.stringify({ type: "unsubscribe", narratorIds: [narratorId] }),
-					);
+					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: [narratorId] }));
 				}
 				ws.close();
 			}

@@ -23,9 +23,9 @@ import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { api } from "../../lib/api";
 
 const BUILTIN_MODELS = [
-	{ value: "haiku", label: "Haiku" },
-	{ value: "sonnet", label: "Sonnet" },
-	{ value: "opus", label: "Opus" },
+	{ value: "claude-haiku", label: "Haiku" },
+	{ value: "claude-sonnet", label: "Sonnet" },
+	{ value: "claude-opus", label: "Opus" },
 ];
 
 export const Route = createFileRoute("/settings/")({
@@ -48,9 +48,9 @@ function SettingsPage() {
 	const [port, setPort] = useState<number | undefined>();
 	const [projectDir, setProjectDir] = useState("");
 	// Agent
-	const [defaultModel, setDefaultModel] = useState("sonnet");
+	const [defaultModel, setDefaultModel] = useState("claude-sonnet");
 	const [permissionMode, setPermissionMode] = useState("default");
-	const [summaryModel, setSummaryModel] = useState("haiku");
+	const [summaryModel, setSummaryModel] = useState("claude-haiku");
 	const [customModels, setCustomModels] = useState<Array<{ value: string; label: string }>>([]);
 	const [newModelValue, setNewModelValue] = useState("");
 	const [newModelLabel, setNewModelLabel] = useState("");
@@ -74,9 +74,9 @@ function SettingsPage() {
 	const serverSnapshot = useRef({
 		port: 7778 as number | undefined,
 		projectDir: "",
-		defaultModel: "sonnet",
+		defaultModel: "claude-sonnet",
 		permissionMode: "default",
-		summaryModel: "haiku",
+		summaryModel: "claude-haiku",
 		customModels: [] as Array<{ value: string; label: string }>,
 		maxWorktrees: 10,
 		maxContainers: 5,
@@ -93,9 +93,9 @@ function SettingsPage() {
 			const snap = {
 				port: settings.server?.port ?? 7778,
 				projectDir: settings.paths?.defaultProjectDir ?? "",
-				defaultModel: settings.agent?.defaultModel ?? "sonnet",
+				defaultModel: settings.agent?.defaultModel ?? "claude-sonnet",
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
-				summaryModel: settings.agent?.summaryModel ?? "haiku",
+				summaryModel: settings.agent?.summaryModel ?? "claude-haiku",
 				customModels: settings.agent?.customModels ?? [],
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
@@ -269,7 +269,7 @@ function SettingsPage() {
 						data={allModels}
 						searchable
 						value={defaultModel}
-						onChange={(v) => setDefaultModel(v ?? "sonnet")}
+						onChange={(v) => setDefaultModel(v ?? "claude-sonnet")}
 					/>
 					<Select
 						label={t("permissionMode")}
@@ -288,7 +288,7 @@ function SettingsPage() {
 						data={allModels}
 						searchable
 						value={summaryModel}
-						onChange={(v) => setSummaryModel(v ?? "haiku")}
+						onChange={(v) => setSummaryModel(v ?? "claude-haiku")}
 					/>
 					<Stack gap="xs">
 						<Text size="sm" fw={500}>

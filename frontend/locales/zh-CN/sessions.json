@@ -7,5 +7,11 @@
 	"newSessionModal": "新建独立会话",
 	"newSessionDescription": "创建一个不绑定任何章节的独立 AI 会话。适用于一般问题和探索。",
 	"createSession": "创建会话",
-	"sessionNotFound": "会话未找到"
+	"sessionNotFound": "会话未找到",
+	"workingDirectory": "工作目录",
+	"workingDirectoryHint": "留空则使用主目录",
+	"workingDirectoryPlaceholder": "/path/to/directory",
+	"addToFavorites": "添加到收藏",
+	"favoriteDirectories": "收藏目录",
+	"cwdLabel": "{{path}}"
 }
