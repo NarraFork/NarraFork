@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, repositories } from "../db/schema";
+import { chapters, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -33,32 +33,34 @@ export interface AiResolveResult {
 	error?: string;
 }
 
+async function getProjectGitPath(projectId: string): Promise<string> {
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, projectId),
+	});
+	if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
+	return project.gitPath;
+}
+
 export const chapterMerge = {
-	/**
-	 * Pre-check merge conflicts using git merge-tree simulation.
-	 * Does not modify any worktree.
-	 */
 	async checkConflicts(
 		sourceChapterId: string,
 		targetChapterId: string,
 	): Promise<MergeCheckResult> {
 		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-
 		const target = await db.query.chapters.findFirst({ where: eq(chapters.id, targetChapterId) });
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
-
 		if (source.status !== "active") throw new ValidationError("Source chapter must be active");
 		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+		if (source.projectId !== target.projectId) {
+			throw new ValidationError("Cannot merge chapters from different projects");
+		}
 
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, source.repositoryId),
-		});
-		if (!repo) throw new NotFoundError("Repository", source.repositoryId);
+		const gitPath = await getProjectGitPath(source.projectId);
 
-		const baseSha = await gitService.getMergeBase(repo.path, target.branch, source.branch);
+		const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
 		const { hasConflicts, conflictFiles } = await gitService.mergeTree(
-			repo.path,
+			gitPath,
 			baseSha,
 			target.branch,
 			source.branch,
@@ -73,71 +75,37 @@ export const chapterMerge = {
 		};
 	},
 
-	/**
-	 * Execute merge of source chapter into target chapter.
-	 * Supports merge, squash, and cherry-pick strategies.
-	 */
 	async merge(sourceChapterId: string, input: MergeChapterInput): Promise<MergeResult> {
 		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-
 		const target = await db.query.chapters.findFirst({
 			where: eq(chapters.id, input.targetChapterId),
 		});
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
-
 		if (source.status !== "active" && source.status !== "dormant") {
 			throw new ValidationError("Source chapter must be active or dormant");
 		}
-		if (target.status !== "active") {
-			throw new ValidationError("Target chapter must be active");
-		}
-		if (!target.worktreePath) {
-			throw new ValidationError("Target chapter has no worktree");
+		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+		if (source.projectId !== target.projectId) {
+			throw new ValidationError("Cannot merge chapters from different projects");
 		}
 
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, source.repositoryId),
-		});
-		if (!repo) throw new NotFoundError("Repository", source.repositoryId);
+		const gitPath = await getProjectGitPath(source.projectId);
 
 		const strategy = input.strategy ?? "merge";
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 
 		let result: MergeResult;
-
 		if (strategy === "cherry-pick") {
-			const baseSha = await gitService.getMergeBase(repo.path, target.branch, source.branch);
-			result = await gitService.cherryPick(target.worktreePath, repo.path, source.branch, baseSha);
+			const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
+			result = await gitService.cherryPick(target.worktreePath, gitPath, source.branch, baseSha);
 		} else {
 			result = await gitService.merge(target.worktreePath, source.branch, strategy, message);
 		}
 
 		if (result.success) {
-			const now = new Date().toISOString();
-			await db
-				.update(chapters)
-				.set({
-					status: "merged",
-					mergedIntoChapterId: input.targetChapterId,
-					mergeCommitSha: result.commitSha,
-					mergeStrategy: strategy,
-					updatedAt: now,
-				})
-				.where(eq(chapters.id, sourceChapterId));
-
-			logger.info("Chapter merged", {
-				sourceId: sourceChapterId,
-				targetId: input.targetChapterId,
-				strategy,
-				commitSha: result.commitSha,
-			});
-
-			eventBus.emit({
-				type: "chapter:merged",
-				sourceId: sourceChapterId,
-				targetId: input.targetChapterId,
-			});
+			await this.markMerged(sourceChapterId, input.targetChapterId, strategy, result.commitSha);
 		} else if (result.conflictFiles) {
 			eventBus.emit({
 				type: "chapter:conflict",
@@ -145,9 +113,7 @@ export const chapterMerge = {
 				targetId: input.targetChapterId,
 				files: result.conflictFiles,
 			});
-
-			// Abort the failed merge to clean up
-			if (strategy !== "cherry-pick" && target.worktreePath) {
+			if (strategy !== "cherry-pick") {
 				try {
 					await gitService.mergeAbort(target.worktreePath);
 				} catch {
@@ -159,28 +125,21 @@ export const chapterMerge = {
 		return result;
 	},
 
-	/**
-	 * AI-assisted conflict resolution.
-	 * Performs the merge (leaving conflicts in worktree), then sends the target chapter's
-	 * primary narrator a prompt to resolve them. After the narrator finishes, stages and
-	 * commits the resolution, completing the merge.
-	 *
-	 * Flow: git merge (with conflicts) → narrator resolves files → git add -A && commit → done
-	 */
 	async aiResolveConflicts(
 		sourceChapterId: string,
 		input: MergeChapterInput,
 	): Promise<AiResolveResult> {
 		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-
 		const target = await db.query.chapters.findFirst({
 			where: eq(chapters.id, input.targetChapterId),
 		});
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+		if (source.projectId !== target.projectId) {
+			throw new ValidationError("Cannot merge chapters from different projects");
+		}
 
-		// Find target chapter's primary narrator
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, input.targetChapterId), eq(narrators.type, "primary")),
 		});
@@ -188,30 +147,22 @@ export const chapterMerge = {
 			return { resolved: false, error: "Target chapter has no primary narrator" };
 		}
 
+		const gitPath = await getProjectGitPath(source.projectId);
+
 		const strategy = input.strategy ?? "merge";
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
-
-		// Perform the merge, leaving conflict markers in the worktree
-		// For merge/squash: git merge --no-commit so conflicts stay
-		// For cherry-pick: conflicts are already left in place
-		const repo = await db.query.repositories.findFirst({
-			where: eq(repositories.id, source.repositoryId),
-		});
-		if (!repo) throw new NotFoundError("Repository", source.repositoryId);
-
 		let conflictFiles: string[];
 
 		if (strategy === "cherry-pick") {
-			const baseSha = await gitService.getMergeBase(repo.path, target.branch, source.branch);
+			const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
 			const cpResult = await gitService.cherryPick(
 				target.worktreePath,
-				repo.path,
+				gitPath,
 				source.branch,
 				baseSha,
 			);
 			if (cpResult.success) {
-				// No conflicts after all — just mark as merged
-				return this.markMerged(
+				return this.markMergedResult(
 					sourceChapterId,
 					input.targetChapterId,
 					strategy,
@@ -220,16 +171,14 @@ export const chapterMerge = {
 			}
 			conflictFiles = cpResult.conflictFiles ?? [];
 		} else {
-			// Use --no-commit variant so conflicts stay in worktree for resolution
 			const mergeResult = await gitService.mergeNoCommit(
 				target.worktreePath,
 				source.branch,
 				strategy,
 			);
 			if (!mergeResult.hasConflicts) {
-				// Clean merge — commit it
 				const commitSha = await gitService.autoCommit(target.worktreePath, message);
-				return this.markMerged(
+				return this.markMergedResult(
 					sourceChapterId,
 					input.targetChapterId,
 					strategy,
@@ -239,9 +188,7 @@ export const chapterMerge = {
 			conflictFiles = mergeResult.conflictFiles;
 		}
 
-		// Send conflict resolution prompt to the narrator
 		const prompt = buildConflictResolutionPrompt(conflictFiles, source.branch, target.branch);
-
 		logger.info("Starting AI conflict resolution", {
 			sourceId: sourceChapterId,
 			targetId: input.targetChapterId,
@@ -250,15 +197,12 @@ export const chapterMerge = {
 		});
 
 		try {
-			// Consume the entire narrator session (it will edit files to resolve conflicts)
 			for await (const _event of startSession(primaryNarrator.id, prompt)) {
-				// We just drain the session — the narrator does its work in the worktree
+				// drain the session — the narrator resolves conflicts in the worktree
 			}
 
-			// After narrator finishes, check if conflicts are resolved
 			const remainingConflicts = await gitService.getConflictFiles(target.worktreePath);
 			if (remainingConflicts.length > 0) {
-				// Narrator didn't fully resolve — abort
 				await gitService.mergeAbort(target.worktreePath);
 				return {
 					resolved: false,
@@ -266,9 +210,8 @@ export const chapterMerge = {
 				};
 			}
 
-			// All resolved — commit
 			const commitSha = await gitService.autoCommit(target.worktreePath, message);
-			return this.markMerged(
+			return this.markMergedResult(
 				sourceChapterId,
 				input.targetChapterId,
 				strategy,
@@ -276,7 +219,6 @@ export const chapterMerge = {
 			);
 		} catch (err) {
 			logger.error("AI conflict resolution failed", { error: String(err) });
-			// Abort the in-progress merge
 			try {
 				await gitService.mergeAbort(target.worktreePath);
 			} catch {
@@ -286,13 +228,12 @@ export const chapterMerge = {
 		}
 	},
 
-	/** Internal helper: mark source chapter as merged and emit events */
 	async markMerged(
 		sourceChapterId: string,
 		targetChapterId: string,
 		strategy: string,
 		commitSha?: string,
-	): Promise<AiResolveResult> {
+	): Promise<void> {
 		const now = new Date().toISOString();
 		await db
 			.update(chapters)
@@ -305,7 +246,22 @@ export const chapterMerge = {
 			})
 			.where(eq(chapters.id, sourceChapterId));
 
+		logger.info("Chapter merged", {
+			sourceId: sourceChapterId,
+			targetId: targetChapterId,
+			strategy,
+			commitSha,
+		});
 		eventBus.emit({ type: "chapter:merged", sourceId: sourceChapterId, targetId: targetChapterId });
+	},
+
+	async markMergedResult(
+		sourceChapterId: string,
+		targetChapterId: string,
+		strategy: string,
+		commitSha?: string,
+	): Promise<AiResolveResult> {
+		await this.markMerged(sourceChapterId, targetChapterId, strategy, commitSha);
 		return { resolved: true, mergeResult: { success: true, commitSha } };
 	},
 };

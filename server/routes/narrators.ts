@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { ValidationError } from "../lib/errors";
+import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
 	createNarratorSchema,
 	permissionDecisionSchema,
@@ -15,6 +16,38 @@ import {
 	startSession,
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
+
+/** Parse message request supporting both JSON and multipart/form-data (with images) */
+export async function parseMessageRequest(
+	c: {
+		req: {
+			header: (name: string) => string | undefined;
+			formData: () => Promise<FormData>;
+			json: () => Promise<any>;
+		};
+	},
+	narratorId: string,
+): Promise<{ message: string; images: ImageRef[] }> {
+	const contentType = c.req.header("content-type") ?? "";
+	if (contentType.includes("multipart/form-data")) {
+		const formData = await c.req.formData();
+		const message = formData.get("message") as string;
+		if (!message?.trim()) throw new ValidationError("message is required");
+		const files = formData.getAll("images") as File[];
+		if (files.length > 10) {
+			throw new ValidationError("Maximum 10 images per message");
+		}
+		const images: ImageRef[] = [];
+		for (const file of files) {
+			images.push(await saveUploadedImage(narratorId, file));
+		}
+		return { message, images };
+	}
+	const body = await c.req.json();
+	const parsed = sendMessageSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return { message: parsed.data.message, images: [] };
+}
 
 export const narratorRoutes = new Hono();
 
@@ -48,15 +81,14 @@ narratorRoutes.delete("/:id", async (c) => {
 	await narratorService.remove(id);
 	return c.json({ ok: true });
 });
-// Send message — SSE streaming response
+// Send message — SSE streaming response (supports text + image uploads)
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	const body = await c.req.json();
-	const parsed = sendMessageSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await narratorService.getById(id); // throws NotFoundError if missing
+	const { message, images } = await parseMessageRequest(c, id);
 
 	return streamSSE(c, async (stream) => {
-		for await (const event of startSession(id, parsed.data.message)) {
+		for await (const event of startSession(id, message, images)) {
 			await stream.writeSSE({
 				event: event.type,
 				data: JSON.stringify(event.data),
@@ -65,13 +97,28 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	});
 });
 
-// Get message history
+// Find parent message by tool_use_id (for lazy-loading subagent parents)
+narratorRoutes.get("/:id/messages/find-parent", async (c) => {
+	const id = c.req.param("id");
+	const toolUseId = c.req.query("toolUseId");
+	if (!toolUseId) throw new ValidationError("toolUseId query parameter is required");
+	const result = await narratorService.findMessageByToolUseId(id, toolUseId);
+	return c.json(result ?? { messageId: null, createdAt: null });
+});
+
+// Get message history (cursor-based pagination, newest first)
 narratorRoutes.get("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	const limit = Number(c.req.query("limit") ?? 100);
-	const offset = Number(c.req.query("offset") ?? 0);
-	const messages = await narratorService.getMessages(id, limit, offset);
-	return c.json(messages);
+	const around = c.req.query("around") || undefined;
+	if (around) {
+		const result = await narratorService.getMessagesAround(id, around);
+		return c.json(result);
+	}
+	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
+	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
+	const cursor = c.req.query("cursor") || undefined;
+	const result = await narratorService.getMessagesCursor(id, limit, cursor);
+	return c.json(result);
 });
 
 // Interrupt active session
@@ -108,7 +155,7 @@ narratorRoutes.patch("/:id/title", async (c) => {
 narratorRoutes.post("/:id/generate-title", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
-	const title = await generateTitle(id);
+	const title = await generateTitle(id, []);
 	await narratorService.updateTitle(id, title);
 	return c.json({ title });
 });
