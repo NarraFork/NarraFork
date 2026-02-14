@@ -768,11 +768,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName);
 	const isEdit = isEditTool(toolCall.toolName);
-	// Auto-expand: permission pending, todo tools, or edit tools (success only).
-	// Failed edit calls default to collapsed (usually just a "read first" error).
+	// Auto-expand: permission pending, todo tools, or edit tools.
+	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
 	const isFailed = toolCall.status === "failed";
+	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
 	const defaultOpen =
-		!!pendingPermission || cat === "todo" || (isEdit && !isFailed) || (isFailed && !isEdit);
+		!!pendingPermission || cat === "todo" || (isEdit && !isFailedEdit) || (isFailed && !isEdit);
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Auto-expand when a permission request arrives
