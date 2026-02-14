@@ -19,7 +19,6 @@ export function ChapterForkModal({
 }: ChapterForkModalProps) {
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
-	const [type, setType] = useState<string>("meanwhile");
 	const [inheritMode, setInheritMode] = useState<string>("fresh");
 	const qc = useQueryClient();
 	const { t } = useTranslation("chapters");
@@ -35,7 +34,6 @@ export function ChapterForkModal({
 	const resetState = () => {
 		setTitle("");
 		setDescription("");
-		setType("meanwhile");
 		setInheritMode("fresh");
 	};
 
@@ -49,7 +47,6 @@ export function ChapterForkModal({
 			api.forkChapter(chapterId, {
 				title: title.trim(),
 				description: description.trim() || undefined,
-				type,
 				inheritMode,
 				forkAtMessageUuid,
 			}),
@@ -80,15 +77,6 @@ export function ChapterForkModal({
 					placeholder={t("forkDescriptionPlaceholder")}
 					value={description}
 					onChange={(e) => setDescription(e.currentTarget.value)}
-				/>
-				<Select
-					label={tc("type")}
-					data={[
-						{ value: "meanwhile", label: t("typeMeanwhile") },
-						{ value: "whatif", label: t("typeWhatif") },
-					]}
-					value={type}
-					onChange={(v) => setType(v ?? "meanwhile")}
 				/>
 				<Select
 					label={t("contextInheritance")}

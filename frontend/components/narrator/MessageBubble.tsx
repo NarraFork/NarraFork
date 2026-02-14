@@ -1,9 +1,22 @@
-import { ActionIcon, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Group,
+	Image,
+	Paper,
+	Skeleton,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { getToken } from "../../lib/api";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
+	narratorId?: string;
 	message: {
 		role: string;
 		contentJson: any[];
@@ -14,7 +27,66 @@ interface MessageBubbleProps {
 	onForkFromMessage?: (sdkMessageUuid: string) => void;
 }
 
-export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps) {
+function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) {
+	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: fetch only when image identity changes
+	useEffect(() => {
+		if (block.previewUrl || !narratorId || !block.imageId) return;
+
+		const token = getToken();
+		const headers: Record<string, string> = {};
+		if (token) headers.Authorization = `Bearer ${token}`;
+
+		let cancelled = false;
+		let objectUrl: string | null = null;
+		fetch(`/api/uploads/${narratorId}/${block.imageId}`, { headers })
+			.then((res) => (res.ok ? res.blob() : null))
+			.then((blob) => {
+				if (blob && !cancelled) {
+					objectUrl = URL.createObjectURL(blob);
+					setBlobUrl(objectUrl);
+				}
+			})
+			.catch(() => {});
+
+		return () => {
+			cancelled = true;
+			if (objectUrl) URL.revokeObjectURL(objectUrl);
+		};
+	}, [narratorId, block.imageId, block.previewUrl]);
+
+	const src = block.previewUrl ?? blobUrl;
+	if (!src) {
+		return <Skeleton h={200} w={300} radius="sm" />;
+	}
+	return (
+		<Box
+			style={{
+				maxWidth: "100%",
+				width: "fit-content",
+				height: 200,
+				borderRadius: "var(--mantine-radius-sm)",
+				overflow: "hidden",
+				margin: "0 auto",
+			}}
+		>
+			<Image
+				src={src}
+				alt={block.filename ?? "image"}
+				radius="sm"
+				h={200}
+				w="auto"
+				fit="contain"
+				loading="lazy"
+				style={{ cursor: "pointer", maxWidth: "100%" }}
+				onClick={() => window.open(src, "_blank")}
+			/>
+		</Box>
+	);
+}
+
+export function MessageBubble({ narratorId, message, onForkFromMessage }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
@@ -38,6 +110,9 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 								</Text>
 							);
 						}
+						if (block.type === "image") {
+							return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+						}
 						return null;
 					})}
 				</Stack>
@@ -45,7 +120,7 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 		);
 	}
 
-	// Assistant messages: no bubble wrapper, render content directly
+	// Assistant messages: render content blocks directly
 	return (
 		<Stack gap={4}>
 			{canFork && (
@@ -66,6 +141,9 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 				const key = block.id ?? `${block.type}-${i}`;
 				if (block.type === "text") {
 					return <MarkdownContent key={key} text={block.text} />;
+				}
+				if (block.type === "image") {
+					return <ImageBlock key={key} block={block} narratorId={narratorId} />;
 				}
 				if (block.type === "thinking") {
 					return (
@@ -95,6 +173,7 @@ export function MessageBubble({ message, onForkFromMessage }: MessageBubbleProps
 								outputJson: tc?.outputJson,
 								status: tc?.status ?? "running",
 								durationMs: tc?.durationMs,
+								errorMessage: tc?.errorMessage,
 							}}
 						/>
 					);

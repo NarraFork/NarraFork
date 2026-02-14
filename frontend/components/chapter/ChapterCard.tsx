@@ -10,7 +10,6 @@ interface ChapterCardProps {
 		id: string;
 		projectId: string;
 		title: string;
-		type: string;
 		status: string;
 		branch: string;
 		createdAt: string;
@@ -43,14 +42,9 @@ export function ChapterCard({ chapter }: ChapterCardProps) {
 			>
 				<Group justify="space-between" mb="xs">
 					<Text fw={500}>{chapter.title}</Text>
-					<Group gap="xs">
-						<Badge size="sm" color={chapter.type === "meanwhile" ? "indigo" : "orange"}>
-							{chapter.type}
-						</Badge>
-						<Badge size="sm" color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>
-							{chapter.status}
-						</Badge>
-					</Group>
+					<Badge size="sm" color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>
+						{chapter.status}
+					</Badge>
 				</Group>
 				<Code>{chapter.branch}</Code>
 			</Card.Section>
