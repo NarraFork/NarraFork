@@ -1,4 +1,4 @@
-import { and, eq, gte, lt } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lt } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -13,6 +13,53 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { deleteNarratorUploads } from "../lib/uploads";
+
+/**
+ * Build a tree from a flat array of messages.
+ * Messages with parentToolUseId are nested under the message whose
+ * toolCalls contains the matching toolUseId.
+ * Returns only top-level messages (parentToolUseId is null).
+ */
+function buildMessageTree(flatMessages: any[]): any[] {
+	// Shallow clone each message to avoid mutating drizzle results
+	const cloned = flatMessages.map((msg) => ({ ...msg, children: [] as any[] }));
+
+	// Map: toolUseId → cloned message that CONTAINS that tool_use block
+	const toolUseIdToMsg = new Map<string, any>();
+	for (const msg of cloned) {
+		if (msg.toolCalls) {
+			for (const tc of msg.toolCalls) {
+				toolUseIdToMsg.set(tc.toolUseId, msg);
+			}
+		}
+	}
+
+	const topLevel: any[] = [];
+	for (const msg of cloned) {
+		if (msg.parentToolUseId && toolUseIdToMsg.has(msg.parentToolUseId)) {
+			toolUseIdToMsg.get(msg.parentToolUseId).children.push(msg);
+		} else if (!msg.parentToolUseId) {
+			topLevel.push(msg);
+		}
+		// Child messages whose parent isn't in the set are silently dropped
+		// (they belong to a different page)
+	}
+
+	return topLevel;
+}
+
+/** Collect all toolUseIds from a set of messages (for iterative child fetching) */
+function collectToolUseIds(messages: any[]): string[] {
+	const ids: string[] = [];
+	for (const msg of messages) {
+		if (msg.toolCalls) {
+			for (const tc of msg.toolCalls) {
+				ids.push(tc.toolUseId);
+			}
+		}
+	}
+	return ids;
+}
 
 interface CreateNarratorInput {
 	chapterId?: string | null;
@@ -101,46 +148,93 @@ export const narratorService = {
 	},
 
 	async getMessagesCursor(narratorId: string, limit = 50, cursor?: string) {
-		const conditions = [eq(narratorMessages.narratorId, narratorId)];
+		// Query 1: top-level messages only (parentToolUseId IS NULL)
+		const topConditions = [
+			eq(narratorMessages.narratorId, narratorId),
+			isNull(narratorMessages.parentToolUseId),
+		];
 		if (cursor) {
-			conditions.push(lt(narratorMessages.createdAt, cursor));
+			topConditions.push(lt(narratorMessages.createdAt, cursor));
 		}
-		const rows = await db.query.narratorMessages.findMany({
-			where: and(...conditions),
+		const topRows = await db.query.narratorMessages.findMany({
+			where: and(...topConditions),
 			with: { toolCalls: true },
 			orderBy: (m, { desc }) => [desc(m.createdAt)],
 			limit: limit + 1,
 		});
-		const hasMore = rows.length > limit;
-		const messages = hasMore ? rows.slice(0, limit) : rows;
-		messages.reverse();
+		const hasMore = topRows.length > limit;
+		const topMessages = hasMore ? topRows.slice(0, limit) : topRows;
+		topMessages.reverse(); // chronological order
+
+		if (topMessages.length === 0) {
+			return { messages: [], hasMore, nextCursor: null };
+		}
+
+		// Query 2: fetch child messages whose parentToolUseId matches a tool call
+		// in the top-level messages. Children are created DURING the parent's tool
+		// execution, so their createdAt is typically EARLIER than the parent — we
+		// match by parentToolUseId instead of time range.
+		const parentToolUseIds = collectToolUseIds(topMessages);
+		const childRows =
+			parentToolUseIds.length > 0
+				? await db.query.narratorMessages.findMany({
+						where: and(
+							eq(narratorMessages.narratorId, narratorId),
+							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
+						),
+						with: { toolCalls: true },
+						orderBy: (m, { asc }) => [asc(m.createdAt)],
+					})
+				: [];
+
+		// Build tree from combined set
+		const tree = buildMessageTree([...topMessages, ...childRows]);
+
 		return {
-			messages,
+			messages: tree,
 			hasMore,
-			nextCursor: hasMore ? messages[0].createdAt : null,
+			nextCursor: hasMore ? topMessages[0].createdAt : null,
 		};
 	},
 
 	/**
-	 * Fetch messages around a target message ID.
-	 * Returns `contextSize` messages before + the target + all messages after,
-	 * with hasMore/nextCursor for loading even older messages.
+	 * Fetch messages around a target message ID (tree-structured).
+	 * If the target is a child message, finds its top-level ancestor first.
+	 * Returns `contextSize` top-level messages before + the target's top-level + all after,
+	 * with children nested.
 	 */
 	async getMessagesAround(narratorId: string, messageId: string, contextSize = 5) {
-		// Find the target message's timestamp
-		const target = await db.query.narratorMessages.findFirst({
+		// Find the target message
+		let target = await db.query.narratorMessages.findFirst({
 			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
 		});
 		if (!target) {
-			// Fallback to normal latest-first fetch
 			return this.getMessagesCursor(narratorId, 10);
 		}
 
-		// Fetch `contextSize + 1` messages before the target (to determine hasMore)
+		// If target is a child message, walk up to find the top-level ancestor
+		let anchorTs = target.createdAt;
+		if (target.parentToolUseId) {
+			const parentTc = await db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, target.parentToolUseId),
+				),
+			});
+			if (parentTc) {
+				const parentMsg = await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, parentTc.messageId),
+				});
+				if (parentMsg) anchorTs = parentMsg.createdAt;
+			}
+		}
+
+		// Fetch top-level messages before the anchor
 		const olderRows = await db.query.narratorMessages.findMany({
 			where: and(
 				eq(narratorMessages.narratorId, narratorId),
-				lt(narratorMessages.createdAt, target.createdAt),
+				isNull(narratorMessages.parentToolUseId),
+				lt(narratorMessages.createdAt, anchorTs),
 			),
 			with: { toolCalls: true },
 			orderBy: (m, { desc }) => [desc(m.createdAt)],
@@ -150,19 +244,39 @@ export const narratorService = {
 		const olderMessages = hasMore ? olderRows.slice(0, contextSize) : olderRows;
 		olderMessages.reverse();
 
-		// Fetch the target + all newer messages
+		// Fetch the anchor + all newer top-level messages
 		const newerRows = await db.query.narratorMessages.findMany({
 			where: and(
 				eq(narratorMessages.narratorId, narratorId),
-				gte(narratorMessages.createdAt, target.createdAt),
+				isNull(narratorMessages.parentToolUseId),
+				gte(narratorMessages.createdAt, anchorTs),
 			),
 			with: { toolCalls: true },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 		});
 
-		const messages = [...olderMessages, ...newerRows];
+		const topMessages = [...olderMessages, ...newerRows];
+		if (topMessages.length === 0) {
+			return { messages: [], hasMore, nextCursor: null };
+		}
+
+		// Fetch child messages by parentToolUseId matching
+		const parentToolUseIds = collectToolUseIds(topMessages);
+		const childRows =
+			parentToolUseIds.length > 0
+				? await db.query.narratorMessages.findMany({
+						where: and(
+							eq(narratorMessages.narratorId, narratorId),
+							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
+						),
+						with: { toolCalls: true },
+						orderBy: (m, { asc }) => [asc(m.createdAt)],
+					})
+				: [];
+
+		const tree = buildMessageTree([...topMessages, ...childRows]);
 		return {
-			messages,
+			messages: tree,
 			hasMore,
 			nextCursor: hasMore ? (olderMessages[0]?.createdAt ?? null) : null,
 		};
@@ -354,22 +468,4 @@ export const narratorService = {
 		logger.info("Narrator removed", { narratorId });
 	},
 
-	/**
-	 * Find the message that contains a given tool_use_id.
-	 * Returns the message ID and createdAt so the frontend can load pages up to it.
-	 */
-	async findMessageByToolUseId(narratorId: string, toolUseId: string) {
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-		});
-		if (!tc) return null;
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, tc.messageId),
-		});
-		if (!msg) return null;
-		return { messageId: msg.id, createdAt: msg.createdAt };
-	},
 };

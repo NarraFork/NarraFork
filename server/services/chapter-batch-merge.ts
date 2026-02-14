@@ -1,3 +1,4 @@
+import { type Locale } from "../lib/prompt-i18n";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -14,6 +15,7 @@ export interface BatchMergeInput {
 	title: string;
 	description?: string;
 	strategy?: "merge" | "squash" | "cherry-pick";
+	locale?: Locale;
 }
 
 export type MergeDecision = "continue" | "cancel";
@@ -91,7 +93,7 @@ export const chapterBatchMerge = {
 		});
 
 		// Step 2: Process merges in background
-		this.processQueue(mergeSessionId, targetChapterId, input.sourceChapterIds, strategy).catch(
+		this.processQueue(mergeSessionId, targetChapterId, input.sourceChapterIds, strategy, input.locale).catch(
 			(err) => {
 				logger.error("Batch merge unexpected error", { mergeSessionId, error: String(err) });
 				eventBus.emit({
@@ -112,6 +114,7 @@ export const chapterBatchMerge = {
 		targetChapterId: string,
 		sourceChapterIds: string[],
 		strategy: "merge" | "squash" | "cherry-pick",
+		locale?: Locale,
 	): Promise<void> {
 		const total = sourceChapterIds.length;
 		let mergedCount = 0;
@@ -171,7 +174,7 @@ export const chapterBatchMerge = {
 			const aiResult = await chapterMerge.aiResolveConflicts(sourceId, {
 				targetChapterId,
 				strategy,
-			});
+			}, locale);
 
 			if (!aiResult.resolved) {
 				eventBus.emit({

@@ -6,6 +6,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import type { Locale } from "../lib/prompt-i18n";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorContext } from "./narrator-context";
@@ -23,6 +24,7 @@ export interface ForkChapterInput {
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
+	locale?: Locale;
 }
 
 export const chapterFork = {
@@ -115,6 +117,7 @@ export const chapterFork = {
 					inheritMode,
 					forkAtMessageUuid: input.forkAtMessageUuid,
 					type: parentNarrator.type as "primary" | "secondary",
+					locale: input.locale,
 				});
 				rollback.push(async () => {
 					await db.delete(narrators).where(eq(narrators.id, forkedNarrator.id));

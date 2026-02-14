@@ -24,6 +24,7 @@ import { getImagePath, type ImageRef, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
+import type { Locale } from "../lib/prompt-i18n";
 
 // === In-memory state ===
 
@@ -247,6 +248,7 @@ export async function* startSession(
 	narratorId: string,
 	prompt: string,
 	images?: ImageRef[],
+	locale: Locale = "en",
 ): AsyncGenerator<SessionEvent> {
 	// Prevent concurrent sessions for the same narrator
 	if (activeSessions.has(narratorId)) {
@@ -363,7 +365,7 @@ export async function* startSession(
 	const isFirstMessage = (narrator.messageCount ?? 0) === 0 && !narrator.title;
 	let quickTitlePromise: Promise<void> | null = null;
 	if (isFirstMessage) {
-		quickTitlePromise = generateQuickTitle(narratorId, prompt).catch(() => {});
+		quickTitlePromise = generateQuickTitle(narratorId, prompt, locale).catch(() => {});
 	}
 
 	let shouldUpdateTitle = false;
@@ -389,7 +391,7 @@ export async function* startSession(
 		// Wait for quick title to finish first to avoid race condition
 		if (shouldUpdateTitle && quickTitlePromise) {
 			await quickTitlePromise;
-			generateAndSetTitle(narratorId).catch(() => {});
+			generateAndSetTitle(narratorId, locale).catch(() => {});
 		}
 
 		// If there's pending feedback from "allow with feedback", yield it so the

@@ -13,6 +13,7 @@ const DEFAULT_SHELL = process.env.SHELL ?? "/bin/bash";
 
 interface ActiveTerminal {
 	process: Subprocess;
+	terminal?: InstanceType<typeof Bun.Terminal>;
 	socketPath: string;
 	terminalId: string;
 }
@@ -85,50 +86,32 @@ export const terminalService = {
 			return;
 		}
 
+		const pty = new Bun.Terminal({
+			cols: 80,
+			rows: 24,
+			data(_term, data) {
+				const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+				if (text) {
+					sendToTerminal(terminalId, { type: "output", data: text });
+				}
+			},
+		});
+
 		const proc = Bun.spawn(["dtach", "-a", terminal.dtachSocket, "-E", "-r", "none"], {
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
+			terminal: pty,
 		});
 
 		activeTerminals.set(terminalId, {
 			process: proc,
+			terminal: pty,
 			socketPath: terminal.dtachSocket,
 			terminalId,
 		});
 
-		// Pipe stdout to WebSocket clients
-		this._pipeOutput(terminalId, proc);
-
-		logger.info("Terminal attached", { terminalId });
-	},
-
-	/** @internal Pipe subprocess stdout to WS clients, handle exit */
-	_pipeOutput(terminalId: string, proc: Subprocess) {
-		const stdout = proc.stdout;
-		if (!stdout) return;
-
-		const reader = (stdout as ReadableStream<Uint8Array>).getReader();
-		const decoder = new TextDecoder();
-
-		(async () => {
-			try {
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					const text = decoder.decode(value, { stream: true });
-					if (text) {
-						sendToTerminal(terminalId, { type: "output", data: text });
-					}
-				}
-			} catch (err) {
-				logger.debug("Terminal stdout ended", { terminalId, error: String(err) });
-			}
-		})();
-
 		// Monitor process exit
 		proc.exited.then(async (code) => {
 			activeTerminals.delete(terminalId);
+			pty.close();
 			await db
 				.update(terminals)
 				.set({ status: "exited", exitCode: code ?? 0 })
@@ -136,27 +119,28 @@ export const terminalService = {
 			sendToTerminal(terminalId, { type: "exit", code: code ?? 0 });
 			logger.info("Terminal exited", { terminalId, code });
 		});
+
+		logger.info("Terminal attached", { terminalId });
 	},
 
 	write(terminalId: string, data: string) {
 		const active = activeTerminals.get(terminalId);
-		const stdin = active?.process.stdin;
-		if (!stdin || typeof stdin === "number") return;
-		stdin.write(new TextEncoder().encode(data));
+		if (!active?.terminal) return;
+		active.terminal.write(new TextEncoder().encode(data));
 	},
 
 	resize(terminalId: string, cols: number, rows: number) {
-		// dtach manages the PTY master; resize through pipes requires
-		// direct Unix socket communication with MSG_WINCH packets.
-		// For now, store the size — a future enhancement can implement
-		// dtach wire protocol for proper resize.
-		logger.debug("Terminal resize requested (stored only)", { terminalId, cols, rows });
+		const active = activeTerminals.get(terminalId);
+		if (!active?.terminal) return;
+		active.terminal.resize(cols, rows);
+		logger.debug("Terminal resized", { terminalId, cols, rows });
 	},
 
 	async kill(terminalId: string) {
 		const active = activeTerminals.get(terminalId);
 		if (active) {
 			active.process.kill();
+			active.terminal?.close();
 			activeTerminals.delete(terminalId);
 		}
 

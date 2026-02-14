@@ -4,6 +4,7 @@ import { chapters, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { type Locale, getPrompt } from "../lib/prompt-i18n";
 import { gitService } from "./git-service";
 import { startSession } from "./narrator-session";
 
@@ -128,6 +129,7 @@ export const chapterMerge = {
 	async aiResolveConflicts(
 		sourceChapterId: string,
 		input: MergeChapterInput,
+		locale: Locale = "en",
 	): Promise<AiResolveResult> {
 		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
@@ -188,7 +190,7 @@ export const chapterMerge = {
 			conflictFiles = mergeResult.conflictFiles;
 		}
 
-		const prompt = buildConflictResolutionPrompt(conflictFiles, source.branch, target.branch);
+		const prompt = buildConflictResolutionPrompt(conflictFiles, source.branch, target.branch, locale);
 		logger.info("Starting AI conflict resolution", {
 			sourceId: sourceChapterId,
 			targetId: input.targetChapterId,
@@ -270,16 +272,11 @@ function buildConflictResolutionPrompt(
 	conflictFiles: string[],
 	sourceBranch: string,
 	targetBranch: string,
+	locale: Locale = "en",
 ): string {
 	const fileList = conflictFiles.map((f) => `  - ${f}`).join("\n");
-	return `A git merge from branch "${sourceBranch}" into "${targetBranch}" has produced conflicts in the following files:
-
-${fileList}
-
-Please resolve all merge conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
-1. Read the file to understand both sides of the conflict
-2. Edit the file to produce the correct merged result, removing all conflict markers
-3. Make sure the resolved code compiles and makes sense
-
-Do NOT run git add or git commit — just resolve the conflicts in the files.`;
+	return getPrompt("conflictResolution", locale)
+		.replace("{sourceBranch}", sourceBranch)
+		.replace("{targetBranch}", targetBranch)
+		.replace("{fileList}", fileList);
 }

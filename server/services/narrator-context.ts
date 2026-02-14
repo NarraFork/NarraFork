@@ -3,21 +3,11 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { type Locale, getPrompt } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { narratorService } from "./narrator-service";
 
 const SUMMARY_MAX_MESSAGES = 50;
-
-const SUMMARY_PROMPT = `You are a context summarizer. Analyze the conversation history below and produce a concise summary focusing on:
-1. Key decisions made
-2. Current state of the code/project
-3. Outstanding TODOs and next steps
-4. Important context that a new session would need
-
-Respond in the same language as the original conversation. Be concise but thorough.
-
-Conversation history:
-`;
 
 interface ForkNarratorInput {
 	parentNarratorId: string;
@@ -25,6 +15,7 @@ interface ForkNarratorInput {
 	inheritMode: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
 	type?: "primary" | "secondary";
+	locale?: Locale;
 }
 
 export const narratorContext = {
@@ -40,7 +31,10 @@ export const narratorContext = {
 		let contextSummary: string | null = null;
 
 		if (input.inheritMode === "compressed") {
-			contextSummary = await this.generateContextSummary(input.parentNarratorId);
+			contextSummary = await this.generateContextSummary(
+				input.parentNarratorId,
+				input.locale ?? "en",
+			);
 		}
 
 		const [narrator] = await db
@@ -80,7 +74,7 @@ export const narratorContext = {
 	 * Generate a compressed context summary from parent narrator's recent messages.
 	 * Uses Haiku model for fast, low-cost summarization.
 	 */
-	async generateContextSummary(narratorId: string): Promise<string> {
+	async generateContextSummary(narratorId: string, locale: Locale = "en"): Promise<string> {
 		const messages = await narratorService.getMessages(narratorId, SUMMARY_MAX_MESSAGES);
 
 		if (messages.length === 0) return "No conversation history.";
@@ -93,9 +87,11 @@ export const narratorContext = {
 			})
 			.join("\n\n");
 
+		const summaryPrompt = getPrompt("summary", locale);
+
 		try {
 			const summaryQuery = query({
-				prompt: SUMMARY_PROMPT + conversationText,
+				prompt: summaryPrompt + conversationText,
 				options: {
 					model: settings.agent.summaryModel,
 					maxTurns: 1,
