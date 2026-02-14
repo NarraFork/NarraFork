@@ -2,7 +2,11 @@ import type { ServerWebSocket } from "bun";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
-import { resolvePermission } from "../services/narrator-session";
+import {
+	clearBufferedMessage,
+	resolvePermission,
+	setBufferedMessage,
+} from "../services/narrator-session";
 import type { WSData } from "./ws-handler";
 
 // === Types ===
@@ -15,10 +19,22 @@ export interface NarratorWSData {
 // Server → Client messages
 export type NarratorServerMessage =
 	| { type: "message"; narratorId: string; message: unknown }
+	| { type: "stream_event"; narratorId: string; event: unknown }
 	| { type: "permission_request"; narratorId: string; request: unknown }
 	| { type: "status_change"; narratorId: string; status: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
+	| {
+			type: "tool_completed";
+			narratorId: string;
+			toolUseId: string;
+			status: string;
+			output?: unknown;
+	  }
 	| { type: "title_updated"; narratorId: string; title: string }
+	| { type: "permission_resolved"; narratorId: string; requestId: string }
+	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
+	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
+	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "session_error" }
 	| { type: "error"; message: string };
 
 // Client → Server messages
@@ -31,12 +47,15 @@ export type NarratorClientMessage =
 			decision: "allow" | "deny";
 			message?: string;
 			answers?: Record<string, string>;
+			feedbackText?: string;
 	  }
 	| {
 			type: "merge_decision";
 			mergeSessionId: string;
 			decision: MergeDecision;
-	  };
+	  }
+	| { type: "buffer_message"; narratorId: string; text: string }
+	| { type: "cancel_buffer"; narratorId: string };
 
 // === Connection registry ===
 
@@ -46,7 +65,19 @@ const connections = new Set<NarratorWS>();
 
 // === Event bus → WebSocket broadcast ===
 
+/**
+ * Events that are already pushed to WS clients via broadcastToNarrator()
+ * in narrator-session.ts / narrator-title.ts. Forwarding them again from
+ * the event bus would cause duplicate delivery.
+ */
+const ALREADY_BROADCAST_EVENTS = new Set([
+	"narrator:message",
+	"narrator:permission_request",
+	"narrator:title_updated",
+]);
+
 function shouldForwardEvent(event: NarraForkEvent): boolean {
+	if (ALREADY_BROADCAST_EVENTS.has(event.type)) return false;
 	return (
 		event.type.startsWith("narrator:") ||
 		event.type.startsWith("chapter:") ||
@@ -115,9 +146,13 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "permission_decision": {
-				resolvePermission(parsed.requestId, parsed.decision, parsed.message, parsed.answers).catch(
-					(err) => logger.error("Failed to resolve permission", { error: String(err) }),
-				);
+				resolvePermission(
+					parsed.requestId,
+					parsed.decision,
+					parsed.message,
+					parsed.answers,
+					parsed.feedbackText,
+				).catch((err) => logger.error("Failed to resolve permission", { error: String(err) }));
 				break;
 			}
 			case "merge_decision": {
@@ -125,6 +160,30 @@ export const handleNarratorWS = {
 				logger.debug("Merge decision received via WS", {
 					mergeSessionId: parsed.mergeSessionId,
 					decision: parsed.decision,
+				});
+				break;
+			}
+			case "buffer_message": {
+				if (!parsed.text || typeof parsed.text !== "string" || parsed.text.length > 100_000) {
+					break;
+				}
+				const result = setBufferedMessage(parsed.narratorId, parsed.text);
+				if (result.ok) {
+					broadcastToNarrator(parsed.narratorId, {
+						type: "buffer_set",
+						narratorId: parsed.narratorId,
+						text: parsed.text,
+						bufferedAt: result.bufferedAt,
+					});
+				}
+				break;
+			}
+			case "cancel_buffer": {
+				clearBufferedMessage(parsed.narratorId);
+				broadcastToNarrator(parsed.narratorId, {
+					type: "buffer_cleared",
+					narratorId: parsed.narratorId,
+					reason: "cancelled",
 				});
 				break;
 			}

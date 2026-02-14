@@ -66,10 +66,7 @@ favoriteRoutes.patch("/:id", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const fav = await db.query.userFavoriteDirectories.findFirst({
-		where: and(
-			eq(userFavoriteDirectories.id, id),
-			eq(userFavoriteDirectories.userId, userId),
-		),
+		where: and(eq(userFavoriteDirectories.id, id), eq(userFavoriteDirectories.userId, userId)),
 	});
 	if (!fav) throw new NotFoundError("Favorite directory", id);
 
@@ -87,16 +84,11 @@ favoriteRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");
 
 	const fav = await db.query.userFavoriteDirectories.findFirst({
-		where: and(
-			eq(userFavoriteDirectories.id, id),
-			eq(userFavoriteDirectories.userId, userId),
-		),
+		where: and(eq(userFavoriteDirectories.id, id), eq(userFavoriteDirectories.userId, userId)),
 	});
 	if (!fav) throw new NotFoundError("Favorite directory", id);
 
-	await db
-		.delete(userFavoriteDirectories)
-		.where(eq(userFavoriteDirectories.id, id));
+	await db.delete(userFavoriteDirectories).where(eq(userFavoriteDirectories.id, id));
 
 	return c.json({ ok: true });
 });

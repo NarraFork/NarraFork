@@ -44,13 +44,14 @@ export const updateChapterSchema = z.object({
 // === Narrators ===
 
 export const createNarratorSchema = z.object({
-	chapterId: z.string().min(1),
+	chapterId: z.string().min(1).nullish(),
 	type: z.enum(["primary", "secondary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
 	permissionMode: z
 		.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"])
 		.optional(),
+	cwd: z.string().min(1).max(4096).optional(),
 });
 
 export const sendMessageSchema = z.object({
@@ -144,21 +145,18 @@ export const adminUpdateSettingsSchema = z.object({
 	registrationOpen: z.boolean(),
 });
 
-// === Sessions (standalone) ===
-
-export const createSessionSchema = z.object({
-	model: z.string().optional(),
-	systemPrompt: z.string().max(10000).optional(),
-	permissionMode: z
-		.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"])
-		.optional(),
-	cwd: z.string().min(1).max(4096).optional(),
-});
-
 // === Narrator title ===
 
 export const updateNarratorTitleSchema = z.object({
 	title: z.string().min(1).max(200),
+});
+
+export const updateNarratorModelSchema = z.object({
+	model: z
+		.string()
+		.min(1)
+		.max(200)
+		.regex(/^[a-zA-Z0-9._:/-]+$/, "Invalid model identifier"),
 });
 
 // === Favorite Directories ===
@@ -176,4 +174,10 @@ export const updateFavoriteDirectorySchema = z.object({
 
 export const reorderFavoriteDirectoriesSchema = z.object({
 	ids: z.array(z.string().min(1)).min(1),
+});
+
+// === User Preferences ===
+
+export const updateUserPreferencesSchema = z.object({
+	autoLoadOlderMessages: z.boolean().optional(),
 });

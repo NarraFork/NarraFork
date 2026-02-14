@@ -1,15 +1,20 @@
+import { and, asc, desc, eq, isNull, ne } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { db } from "../db";
+import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
 	createNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
+	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 } from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import {
+	getBufferedMessage,
 	interruptSession,
 	isSessionActive,
 	resolvePermission,
@@ -51,10 +56,39 @@ export async function parseMessageRequest(
 
 export const narratorRoutes = new Hono();
 
-// List narrators for a chapter
+// List narrators — by chapterId, or standalone (chapterId IS NULL)
 narratorRoutes.get("/", async (c) => {
 	const chapterId = c.req.query("chapterId");
-	if (!chapterId) throw new ValidationError("chapterId query parameter is required");
+	const standalone = c.req.query("standalone");
+
+	if (standalone === "true") {
+		// Standalone sessions (no chapter)
+		const status = c.req.query("status");
+		const sortBy = c.req.query("sortBy") ?? "updatedAt";
+		const sortOrder = c.req.query("sortOrder") ?? "desc";
+
+		const whereClause =
+			status === "archived"
+				? and(isNull(narrators.chapterId), eq(narrators.status, "archived"))
+				: and(isNull(narrators.chapterId), ne(narrators.status, "archived"));
+
+		const sortColumnMap: Record<string, any> = {
+			updatedAt: narrators.updatedAt,
+			createdAt: narrators.createdAt,
+			title: narrators.title,
+			messageCount: narrators.messageCount,
+		};
+		const column = sortColumnMap[sortBy] ?? narrators.updatedAt;
+		const orderFn = sortOrder === "asc" ? asc : desc;
+
+		const list = await db.query.narrators.findMany({
+			where: whereClause,
+			orderBy: [orderFn(column)],
+		});
+		return c.json(list);
+	}
+
+	if (!chapterId) throw new ValidationError("chapterId or standalone=true is required");
 	const list = await narratorService.listByChapter(chapterId);
 	return c.json(list);
 });
@@ -74,25 +108,51 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json(narrator);
 });
 
-// Delete narrator
-narratorRoutes.delete("/:id", async (c) => {
-	const id = c.req.param("id");
-	if (isSessionActive(id)) await interruptSession(id);
-	await narratorService.remove(id);
-	return c.json({ ok: true });
-});
 // Send message — SSE streaming response (supports text + image uploads)
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id); // throws NotFoundError if missing
+	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
+
+	// Auto-unarchive on interaction
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
 	const { message, images } = await parseMessageRequest(c, id);
 
 	return streamSSE(c, async (stream) => {
-		for await (const event of startSession(id, message, images)) {
-			await stream.writeSSE({
-				event: event.type,
-				data: JSON.stringify(event.data),
-			});
+		const MAX_CHAIN_DEPTH = 10;
+		let chainCount = 0;
+		let sessionGen = startSession(id, message, images);
+		while (chainCount < MAX_CHAIN_DEPTH) {
+			chainCount++;
+			let feedbackMessage: string | null = null;
+			let bufferedSend: { message: string; images?: any[] } | null = null;
+			for await (const event of sessionGen) {
+				if (event.type === "auto_feedback") {
+					// Session was interrupted for "allow with feedback" — start a new session
+					feedbackMessage = event.data.message;
+					break;
+				}
+				if (event.type === "buffered_send") {
+					// User queued a message while narrator was thinking — chain into new session
+					bufferedSend = event.data;
+					break;
+				}
+				await stream.writeSSE({
+					event: event.type,
+					data: JSON.stringify(event.data),
+				});
+			}
+			if (feedbackMessage) {
+				sessionGen = startSession(id, feedbackMessage);
+				continue;
+			}
+			if (bufferedSend) {
+				sessionGen = startSession(id, bufferedSend.message, bufferedSend.images);
+				continue;
+			}
+			break;
 		}
 	});
 });
@@ -104,6 +164,13 @@ narratorRoutes.get("/:id/messages/find-parent", async (c) => {
 	if (!toolUseId) throw new ValidationError("toolUseId query parameter is required");
 	const result = await narratorService.findMessageByToolUseId(id, toolUseId);
 	return c.json(result ?? { messageId: null, createdAt: null });
+});
+
+// Get buffered message (for multi-device hydration on page load)
+narratorRoutes.get("/:id/buffer", async (c) => {
+	const id = c.req.param("id");
+	const buffered = getBufferedMessage(id);
+	return c.json(buffered ? { text: buffered.text, bufferedAt: buffered.bufferedAt } : null);
 });
 
 // Get message history (cursor-based pagination, newest first)
@@ -126,6 +193,16 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
 	const interrupted = await interruptSession(id);
 	return c.json({ interrupted });
+});
+
+// Update model
+narratorRoutes.patch("/:id/model", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateNarratorModelSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await narratorService.getById(id); // ensure exists
+	await narratorService.updateModel(id, parsed.data.model);
+	return c.json({ ok: true });
 });
 
 // Update permission mode
@@ -166,6 +243,24 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 	if (isSessionActive(id)) await interruptSession(id);
 	await narratorService.getById(id);
 	await narratorService.updateStatus(id, "archived");
+	return c.json({ ok: true });
+});
+
+// Unarchive narrator
+narratorRoutes.patch("/:id/unarchive", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	await narratorService.updateStatus(id, "idle");
+	return c.json({ ok: true });
+});
+
+// Mark narrator as read (done → idle)
+narratorRoutes.patch("/:id/mark-read", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator.status === "done") {
+		await narratorService.updateStatus(id, "idle");
+	}
 	return c.json({ ok: true });
 });
 
