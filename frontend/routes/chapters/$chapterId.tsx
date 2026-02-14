@@ -185,7 +185,7 @@ function ChapterDetailPage() {
 			</Box>
 
 			{/* Narrator panel */}
-			<Box style={{ flex: 1, minHeight: MIN_PANEL_HEIGHT, overflow: "hidden" }}>
+			<Box mx="calc(var(--mantine-spacing-md) * -1)" style={{ flex: 1, minHeight: MIN_PANEL_HEIGHT, overflow: "hidden" }}>
 				{narratorsLoading ? (
 					<Loader />
 				) : primaryNarrator ? (

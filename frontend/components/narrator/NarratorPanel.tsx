@@ -1152,8 +1152,9 @@ export function NarratorPanel({
 			{/* Header */}
 			<Group
 				justify="space-between"
-				p="xs"
-				style={{ borderBottom: "1px solid var(--mantine-color-gray-3)", flexShrink: 0 }}
+				py="xs"
+				px="md"
+				style={{ borderBottom: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 			>
 				<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
 					{editingTitle ? (
@@ -1332,7 +1333,7 @@ export function NarratorPanel({
 
 			{/* Fallback permission banner — only shown when permission can't be matched to a tool call */}
 			{pendingPermission && !pendingPermission.toolUseId && (
-				<Box p="xs">
+				<Box py="xs" px="md">
 					{pendingPermission.toolName === "AskUserQuestion" &&
 					pendingPermission.inputJson?.questions ? (
 						<AskUserQuestionBanner
@@ -1352,7 +1353,8 @@ export function NarratorPanel({
 				<ScrollArea
 					h="100%"
 					viewportRef={viewportRef}
-					p="sm"
+					py="sm"
+					px="md"
 					onScrollPositionChange={handleScroll}
 					styles={{ viewport: { overscrollBehavior: "contain" } }}
 				>
@@ -1409,10 +1411,11 @@ export function NarratorPanel({
 			{/* Image previews */}
 			{attachedImages.length > 0 && (
 				<Group
-					p="xs"
+					pt="xs"
+					px="md"
 					pb={0}
 					gap="xs"
-					style={{ borderTop: "1px solid var(--mantine-color-gray-3)", flexShrink: 0 }}
+					style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 				>
 					{attachedImages.map((file, i) => (
 						<Box key={`${file.name}-${i}`} pos="relative" style={{ display: "inline-block" }}>
@@ -1473,13 +1476,13 @@ export function NarratorPanel({
 					}}
 				>
 					<Group
-						px="xs"
+						px="md"
 						pt={4}
 						pb={0}
 						gap="xs"
 						style={{
 							borderTop:
-								attachedImages.length > 0 ? undefined : "1px solid var(--mantine-color-gray-3)",
+								attachedImages.length > 0 ? undefined : "1px solid var(--mantine-color-default-border)",
 							flexShrink: 0,
 						}}
 					>
@@ -1498,14 +1501,14 @@ export function NarratorPanel({
 			{/* Buffered message indicator */}
 			{bufferedText && (
 				<Group
-					px="xs"
+					px="md"
 					py={4}
 					gap="xs"
 					style={{
 						borderTop:
 							attachedImages.length > 0 || showWorkIndicator
 								? undefined
-								: "1px solid var(--mantine-color-gray-3)",
+								: "1px solid var(--mantine-color-default-border)",
 						backgroundColor: "var(--mantine-color-blue-light)",
 						flexShrink: 0,
 					}}
@@ -1520,7 +1523,7 @@ export function NarratorPanel({
 
 			{/* Input */}
 			<Group
-				px="xs"
+				px="md"
 				pt={showWorkIndicator || bufferedText ? 4 : "xs"}
 				pb="xs"
 				gap="xs"
@@ -1529,7 +1532,7 @@ export function NarratorPanel({
 					borderTop:
 						attachedImages.length > 0 || showWorkIndicator || bufferedText
 							? undefined
-							: "1px solid var(--mantine-color-gray-3)",
+							: "1px solid var(--mantine-color-default-border)",
 					flexShrink: 0,
 				}}
 			>
