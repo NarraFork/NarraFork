@@ -3,6 +3,8 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { checkIntegrity, recoverWithCli, startWalCheckpointInterval, tryWalRecovery } from "../lib/db-resilience";
+import { logger } from "../lib/logger";
 import * as relations from "./relations";
 import * as schema from "./schema";
 
@@ -10,11 +12,55 @@ const narraforkDir = resolve(homedir(), ".narrafork");
 mkdirSync(narraforkDir, { recursive: true });
 
 const dbPath = resolve(narraforkDir, "narrafork.db");
-const sqlite = new Database(dbPath);
 
-sqlite.run("PRAGMA journal_mode = WAL");
-sqlite.run("PRAGMA foreign_keys = ON");
-sqlite.run("PRAGMA busy_timeout = 5000");
+function openDatabase(): Database {
+	const conn = new Database(dbPath);
+	conn.run("PRAGMA journal_mode = WAL");
+	conn.run("PRAGMA foreign_keys = ON");
+	conn.run("PRAGMA busy_timeout = 5000");
+	return conn;
+}
+
+let sqlite = openDatabase();
+
+// Startup integrity check — detect corruption early
+const integrity = checkIntegrity(sqlite);
+if (!integrity.ok) {
+	logger.error("Database integrity check failed on startup — attempting recovery", {
+		details: integrity.details,
+	});
+	const walOk = tryWalRecovery(sqlite);
+	if (walOk && checkIntegrity(sqlite).ok) {
+		logger.info("Database recovered after WAL checkpoint");
+	} else {
+		logger.warn("WAL recovery insufficient, attempting CLI .recover");
+		sqlite.close();
+		const recovered = recoverWithCli(dbPath);
+		sqlite = openDatabase();
+		if (recovered && checkIntegrity(sqlite).ok) {
+			logger.info("Database recovered via sqlite3 CLI .recover");
+		} else {
+			logger.error("Automatic recovery failed — manual repair needed", {
+				hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
+			});
+		}
+	}
+}
+
+// Periodic WAL checkpoint to prevent WAL file bloat and reduce corruption risk
+const walCheckpointTimer = startWalCheckpointInterval(sqlite);
+
+// Clean up on process exit
+process.on("exit", () => {
+	clearInterval(walCheckpointTimer);
+	try {
+		sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+		// Mark clean shutdown so next startup can skip FTS rebuild
+		sqlite.run("PRAGMA application_id = 0x4E465243"); // "NFRC" = NarraFork Clean
+	} catch {
+		// best-effort on exit
+	}
+});
 
 // FTS5 virtual tables for full-text search (Phase 5)
 // Use trigram tokenizer for CJK (Chinese/Japanese/Korean) support
@@ -108,12 +154,33 @@ sqlite.run(`
   END
 `);
 
-// Rebuild FTS indexes only after migration (table was recreated with new tokenizer)
-if (ftsTablesRecreated.length > 0) {
-	sqlite.run("INSERT INTO chapters_fts(chapters_fts) VALUES ('rebuild')");
-	sqlite.run("INSERT INTO narrator_messages_fts(narrator_messages_fts) VALUES ('rebuild')");
-	sqlite.run("INSERT INTO narrators_fts(narrators_fts) VALUES ('rebuild')");
+// Rebuild FTS indexes only after migration or unclean shutdown
+// (FTS trigram indexes can silently corrupt on crash, causing "malformed" errors on UPDATE)
+const CLEAN_SHUTDOWN_MARKER = 0x4E465243; // "NFRC"
+const appId = (sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)?.application_id ?? 0;
+const needsFtsRebuild = ftsTablesRecreated.length > 0 || appId !== CLEAN_SHUTDOWN_MARKER;
+
+if (needsFtsRebuild) {
+	try {
+		sqlite.run("INSERT INTO narrators_fts(narrators_fts) VALUES ('rebuild')");
+		sqlite.run("INSERT INTO chapters_fts(chapters_fts) VALUES ('rebuild')");
+		sqlite.run("INSERT INTO narrator_messages_fts(narrator_messages_fts) VALUES ('rebuild')");
+		logger.info("FTS indexes rebuilt on startup", {
+			reason: ftsTablesRecreated.length > 0 ? "migration" : "unclean_shutdown",
+		});
+	} catch (err) {
+		logger.warn("FTS rebuild failed on startup", { error: String(err) });
+	}
 }
+
+// Clear the clean shutdown marker — it will be set again on clean exit
+sqlite.run("PRAGMA application_id = 0");
+
+// Index for efficient subagent child message lookups
+sqlite.run(`
+  CREATE INDEX IF NOT EXISTS idx_messages_parent_tool_use
+  ON narrator_messages(narrator_id, parent_tool_use_id)
+`);
 
 // User preferences table (per-account settings)
 sqlite.run(`

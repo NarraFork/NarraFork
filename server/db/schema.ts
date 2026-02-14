@@ -106,7 +106,10 @@ export const narratorMessages = sqliteTable(
 		costUsd: real("cost_usd"),
 		createdAt: text("created_at").notNull(),
 	},
-	(table) => [index("idx_messages_narrator").on(table.narratorId, table.createdAt)],
+	(table) => [
+		index("idx_messages_narrator").on(table.narratorId, table.createdAt),
+		index("idx_messages_parent_tool_use").on(table.narratorId, table.parentToolUseId),
+	],
 );
 
 // === narrator_tool_calls ===
@@ -209,6 +212,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 	autoLoadOlderMessages: integer("auto_load_older_messages", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	language: text("language").notNull().default("en"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

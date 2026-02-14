@@ -180,4 +180,5 @@ export const reorderFavoriteDirectoriesSchema = z.object({
 
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
+	language: z.enum(["en", "zh-CN"]).optional(),
 });
