@@ -39,8 +39,8 @@ function ChapterDetailPage() {
 	const location = useLocation();
 	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const { data: chapter, isLoading } = useChapter(chapterId);
-	const { data: narratorList, isLoading: narratorsLoading } = useNarrators(chapterId);
-	const createNarrator = useCreateNarrator(chapterId);
+	const { data: narratorList, isLoading: narratorsLoading } = useNarrators({ chapterId });
+	const createNarrator = useCreateNarrator();
 
 	const [terminalHeight, setTerminalHeight] = useState(DEFAULT_TERMINAL_HEIGHT);
 	const containerRef = useRef<HTMLDivElement>(null);
@@ -199,7 +199,10 @@ function ChapterDetailPage() {
 					<Paper withBorder p="xl" h="100%">
 						<Stack align="center" justify="center" h="100%">
 							<Text c="dimmed">{t("noNarrator")}</Text>
-							<Button onClick={() => createNarrator.mutate({})} loading={createNarrator.isPending}>
+							<Button
+								onClick={() => createNarrator.mutate({ chapterId })}
+								loading={createNarrator.isPending}
+							>
 								{t("startNarrator")}
 							</Button>
 						</Stack>

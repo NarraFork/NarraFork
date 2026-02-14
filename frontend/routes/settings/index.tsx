@@ -14,19 +14,22 @@ import {
 	Title,
 	Transition,
 } from "@mantine/core";
+import {
+	IconHandStop,
+	IconListCheck,
+	IconPencilCheck,
+	IconShield,
+	IconShieldOff,
+} from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
+import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-
-const BUILTIN_MODELS = [
-	{ value: "claude-haiku", label: "Haiku" },
-	{ value: "claude-sonnet", label: "Sonnet" },
-	{ value: "claude-opus", label: "Opus" },
-];
+import { BUILTIN_MODELS } from "../../lib/constants";
 
 export const Route = createFileRoute("/settings/")({
 	component: SettingsPage,
@@ -43,6 +46,11 @@ function SettingsPage() {
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
 	});
 	const { t } = useTranslation("settings");
+	const { t: tn } = useTranslation("narrator");
+
+	// Per-user preferences (account-independent)
+	const { data: userPrefs } = useUserPreferences();
+	const updateUserPref = useUpdateUserPreferences();
 
 	// Server
 	const [port, setPort] = useState<number | undefined>();
@@ -274,12 +282,44 @@ function SettingsPage() {
 					<Select
 						label={t("permissionMode")}
 						data={[
-							{ value: "default", label: "Default" },
-							{ value: "acceptEdits", label: "Accept Edits" },
-							{ value: "bypassPermissions", label: "Bypass Permissions" },
-							{ value: "plan", label: "Plan" },
-							{ value: "dontAsk", label: "Don't Ask" },
+							{ value: "default", label: tn("perm_default") },
+							{ value: "acceptEdits", label: tn("perm_acceptEdits") },
+							{ value: "bypassPermissions", label: tn("perm_bypassPermissions") },
+							{ value: "plan", label: tn("perm_plan") },
+							{ value: "dontAsk", label: tn("perm_dontAsk") },
 						]}
+						leftSection={
+							permissionMode === "default" ? (
+								<IconShield size={14} />
+							) : permissionMode === "acceptEdits" ? (
+								<IconPencilCheck size={14} />
+							) : permissionMode === "bypassPermissions" ? (
+								<IconShieldOff size={14} />
+							) : permissionMode === "plan" ? (
+								<IconListCheck size={14} />
+							) : permissionMode === "dontAsk" ? (
+								<IconHandStop size={14} />
+							) : (
+								<IconShield size={14} />
+							)
+						}
+						renderOption={({ option, checked }) => {
+							const icons: Record<string, React.ReactNode> = {
+								default: <IconShield size={14} />,
+								acceptEdits: <IconPencilCheck size={14} />,
+								bypassPermissions: <IconShieldOff size={14} />,
+								plan: <IconListCheck size={14} />,
+								dontAsk: <IconHandStop size={14} />,
+							};
+							return (
+								<Group gap="xs" wrap="nowrap">
+									{icons[option.value] ?? <IconShield size={14} />}
+									<Text size="sm" fw={checked ? 600 : 400}>
+										{option.label}
+									</Text>
+								</Group>
+							);
+						}}
 						value={permissionMode}
 						onChange={(v) => setPermissionMode(v ?? "default")}
 					/>
@@ -412,6 +452,21 @@ function SettingsPage() {
 						]}
 						value={editor}
 						onChange={(v) => setEditor(v ?? "vscode")}
+					/>
+				</Stack>
+			</Paper>
+
+			{/* Session (per-user preferences) */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("sessionSection")}</Title>
+					<Switch
+						label={t("autoLoadOlderMessages")}
+						description={t("autoLoadOlderMessagesDesc")}
+						checked={userPrefs?.autoLoadOlderMessages ?? true}
+						onChange={(e) =>
+							updateUserPref.mutate({ autoLoadOlderMessages: e.currentTarget.checked })
+						}
 					/>
 				</Stack>
 			</Paper>

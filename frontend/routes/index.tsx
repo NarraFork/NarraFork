@@ -15,8 +15,8 @@ function DashboardPage() {
 		queryFn: () => api.listProjects(),
 	});
 	const { data: sessions } = useQuery({
-		queryKey: ["sessions"],
-		queryFn: api.listSessions,
+		queryKey: ["narrators", { standalone: true }],
+		queryFn: () => api.listNarrators({ standalone: true }),
 	});
 
 	if (projectsLoading) return <Loader />;
@@ -29,9 +29,24 @@ function DashboardPage() {
 			<Text c="dimmed">{t("subtitle")}</Text>
 
 			<SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }}>
-				<StatCard label={t("activeProjects")} value={activeProjects.length} color="indigo" />
-				<StatCard label={t("totalProjects")} value={projects?.length ?? 0} color="blue" />
-				<StatCard label={t("standaloneSessions")} value={sessions?.length ?? 0} color="violet" />
+				<StatCard
+					label={t("activeProjects")}
+					value={activeProjects.length}
+					color="indigo"
+					to="/projects"
+				/>
+				<StatCard
+					label={t("totalProjects")}
+					value={projects?.length ?? 0}
+					color="blue"
+					to="/projects"
+				/>
+				<StatCard
+					label={t("standaloneSessions")}
+					value={sessions?.length ?? 0}
+					color="violet"
+					to="/sessions"
+				/>
 			</SimpleGrid>
 
 			{activeProjects.length > 0 && (
@@ -69,9 +84,19 @@ function DashboardPage() {
 	);
 }
 
-function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
+function StatCard({
+	label,
+	value,
+	color,
+	to,
+}: {
+	label: string;
+	value: number;
+	color: string;
+	to: string;
+}) {
 	return (
-		<Card withBorder>
+		<Card withBorder component={Link} to={to} style={{ textDecoration: "none", cursor: "pointer" }}>
 			<Text size="xs" tt="uppercase" fw={700} c="dimmed">
 				{label}
 			</Text>
