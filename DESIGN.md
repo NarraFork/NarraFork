@@ -8,8 +8,6 @@ NarraFork 是一个以"叙事分叉"为核心隐喻的 AI 编程协作平台。�
 
 - **Chapter（章节）**：工作的基本单元，对应一个 git worktree + 一个或多个 AI 会话
 - **Narrator（叙述者）**：绑定到 Chapter 的 Claude Code 会话，拥有完整的上下文记忆
-- **Meanwhile（同时）**：并行工作的 Chapter，最终都需要合并
-- **WhatIf（假设）**：技术探索/实验性 Chapter，可能只取其中一个结果
 - **Story Network（故事网络）**：所有 Chapter 的分叉/合并关系构成的有向图
 
 ### 1.2 与 Fulcrum 的关系
@@ -81,7 +79,6 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 ### 3.1 核心实体关系图
 
 ```
-projects ──1:N──> repositories
 projects ──1:N──> chapters
 chapters ──1:N──> narrators (chapterId nullable: null = 游离会话)
 chapters ──self── chapters (parentChapterId)
@@ -95,6 +92,7 @@ narrators ──1:N── permission_requests
 
 > 注：`containerConfig` 以 JSON 字段存储在 `chapters` 表中，而非独立的 `container_configs` 表。
 > `users` 表用于 JWT 认证，与上述业务实体无直接关联。
+> 一个项目有且只有一个 Git 仓库，仓库信息直接存储在 `projects` 表中。
 
 ### 3.2 表定义
 
@@ -111,22 +109,9 @@ export const projects = sqliteTable('projects', {
     enum: ['claude', 'opencode']
   }).default('claude'),
   settings: text('settings', { mode: 'json' }),   // 项目级配置 JSON
-  createdAt: text('created_at').notNull(),
-  updatedAt: text('updated_at').notNull(),
-})
-```
-
-#### repositories — Git 仓库
-
-```typescript
-export const repositories = sqliteTable('repositories', {
-  id: text('id').primaryKey(),
-  projectId: text('project_id').references(() => projects.id),
-  path: text('path').notNull(),                    // 本地绝对路径
-  displayName: text('display_name').notNull(),
+  gitPath: text('git_path'),                       // 本地绝对路径（一个项目一个仓库）
   remoteUrl: text('remote_url'),                   // git remote URL
   defaultBranch: text('default_branch').default('main'),
-  isPrimary: integer('is_primary', { mode: 'boolean' }).default(false),
   startupScript: text('startup_script'),           // chapter 创建后执行的脚本
   copyFiles: text('copy_files'),                   // JSON 数组，如 ["*.env", ".vscode/"]
   createdAt: text('created_at').notNull(),
@@ -141,14 +126,8 @@ export const chapters = sqliteTable('chapters', {
   id: text('id').primaryKey(),
   projectId: text('project_id').notNull()
     .references(() => projects.id),
-  repositoryId: text('repository_id').notNull()
-    .references(() => repositories.id),
   title: text('title').notNull(),
   description: text('description'),
-  // 类型：meanwhile（并行工作）或 whatif（技术探索）
-  type: text('type', {
-    enum: ['meanwhile', 'whatif']
-  }).notNull().default('meanwhile'),
 
   // 状态机：active → merged/abandoned, dormant 是中间态
   status: text('status', {
@@ -156,9 +135,9 @@ export const chapters = sqliteTable('chapters', {
   }).notNull().default('active'),
 
   // Git 信息
-  branch: text('branch').notNull(),                // git branch 名
-  worktreePath: text('worktree_path'),             // worktree 绝对路径，dormant 时为 null
-  baseBranch: text('base_branch').notNull(),       // 基于哪个 branch 创建
+  branch: text('branch').notNull(),                  // git branch 名
+  worktreePath: text('worktree_path'),               // 章节根目录，dormant 时为 null
+  baseBranch: text('base_branch').notNull(),          // 基于哪个 branch 创建
 
   // 分叉关系
   parentChapterId: text('parent_chapter_id')
@@ -175,9 +154,6 @@ export const chapters = sqliteTable('chapters', {
 
   // 容器配置（JSON 字段，非独立表）
   containerConfig: text('container_config', { mode: 'json' }),
-  // { composeFile?: string, services?: string[],
-  //   ports?: Array<{ containerPort: number, serviceName: string }>,
-  //   env?: Record<string, string> }
 
   // 元数据
   lastAccessedAt: text('last_accessed_at'),
@@ -185,6 +161,12 @@ export const chapters = sqliteTable('chapters', {
   updatedAt: text('updated_at').notNull(),
 })
 ```
+
+> 章节目录结构：worktree 位于 `<project.gitPath>/.worktrees/<slug-shortId>/`
+> ```
+> /path/to/repo/.worktrees/add-auth-x7k2m9/   (worktree for this chapter)
+> ```
+
 #### narrators — 叙述者（AI 会话）
 
 ```typescript
@@ -478,21 +460,20 @@ server/
 
 #### 4.2.1 chapter-fork.ts — 分叉服务
 
-职责：从父 Chapter 创建新的分叉 Chapter，包含 git worktree、Narrator 继承、可选容器。
+职责：从父 Chapter 创建新的分叉 Chapter，包含 git worktree、Narrator 继承、可选容器。从项目的 `gitPath` 获取仓库信息。
 
-核心操作流程（7 步原子操作 + 回滚栈）：
-1. 创建 DB 记录（chapter + forkPoint）
-2. 创建 Git branch（基于父 branch）
-3. 创建 Git worktree（关联新 branch）
-4. 复制 repo 配置的 copyFiles
-5. Fork Narrator(s)（根据 inheritMode 调用 narrator-context）
-6. 复制 containerConfig + 可选启动容器（non-fatal，失败不回滚）
-7. 执行 startup script（non-fatal，60 秒超时，失败不回滚）
+核心操作流程（6 步原子操作 + 回滚栈）：
+1. 创建 Git branch + worktree（`<project.gitPath>/.worktrees/<slug-shortId>/`）
+2. 创建 DB 记录（chapter + forkPoint）
+3. 复制 repo 配置的 copyFiles
+4. Fork Narrator(s)（根据 inheritMode 调用 narrator-context）
+5. 复制 containerConfig + 可选启动容器（non-fatal，失败不回滚）
+6. 执行 startup script（non-fatal，60 秒超时）
 
 关键设计：
 - 使用 `rollback: Array<() => Promise<void>>` 手动回滚栈，每步成功后 push 逆操作
 - 失败时逆序执行回滚，覆盖 DB + git + container 跨系统操作
-- Branch 命名规则：`{type}/{slug}-{nanoid(6)}`，如 `meanwhile/add-auth-x7k2m9`
+- Branch 命名规则：`chapter/{slug}-{nanoid(6)}`，如 `chapter/add-auth-x7k2m9`
 - 支持 `forkAtMessageUuid` 回溯分叉，记录在 `forkPoint.narratorMessageUuid`
 #### 4.2.2 narrator-session.ts — Claude Session 管理
 
@@ -794,7 +775,6 @@ const mcpTools = [
   'narrafork_fork_chapter',        // 分叉当前 chapter
   'narrafork_merge_chapter',       // 合并 chapter
   'narrafork_check_conflicts',     // 检查合并冲突
-  'narrafork_create_whatif',       // 快速创建 WhatIf 分支
   'narrafork_abandon_chapter',     // 放弃当前 chapter
   'narrafork_list_narrators',      // 列出 narrators
   'narrafork_get_context_summary', // 获取其他 narrator 的上下文摘要
@@ -882,7 +862,7 @@ frontend/
 
 组件结构：
 - `StoryNetwork` — 主容器，使用 `useStoryGraph(projectId)` 获取图数据，Dagre 自动布局（`rankdir: 'TB'`，节点间距 80/120）
-- `ChapterNode` — 自定义 React Flow 节点，使用 Mantine Card 渲染，显示标题、类型图标（meanwhile=`IconGitBranch`，whatif=`IconQuestionMark`）、状态 Badge、narrator 数量、容器标记
+- `ChapterNode` — 自定义 React Flow 节点，使用 Mantine Card 渲染，显示标题、状态 Badge、narrator 数量、容器标记
 - `ForkEdge` — 分叉边（贝塞尔曲线样式，蓝色 `#4c6ef5`）
 - `MergeEdge` — 合并边（smoothstep 样式，绿色 `#40c057`，`strokeDasharray` + CSS class 动画）
 
@@ -1037,7 +1017,6 @@ interface NarraForkSettings {
 - Chapter 分叉（原子操作 + 回滚）
 - 上下文继承（full / compressed / fresh）
 - 合并冲突检测 + AI 辅助解决
-- Meanwhile / WhatIf 类型区分
 - 批量合并编排（队列式 + 冲突等待）
 
 ### Phase 4: 容器与资源 ✅

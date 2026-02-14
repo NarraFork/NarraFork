@@ -9,7 +9,6 @@ NarraFork is an AI-powered collaborative programming platform built around a "na
 **Core domain concepts:**
 - **Chapter** — work unit = git worktree + AI session(s), with statuses: active/dormant/merged/abandoned
 - **Narrator** — Claude Code session bound to a chapter (or standalone), with streaming output and permission control
-- **Fork types** — Meanwhile (parallel work), WhatIf (experimental exploration)
 - **Story Network** — directed graph of all chapter fork/merge relationships
 
 ## Commands
@@ -69,7 +68,7 @@ server/
 - **Event bus** (`lib/event-bus.ts`) decouples services → WebSocket broadcast. All cross-service communication flows through typed events.
 - **Narrator sessions** use Claude Agent SDK `query()` with SSE streaming on HTTP + parallel WebSocket broadcast. Permission requests pause the session with a Promise resolved by user decision (5-min timeout).
 - **Fork context inheritance** has three modes: `full` (defer SDK session fork), `compressed` (Haiku-generated summary in system prompt), `fresh` (no context).
-- **Git worktrees** per active chapter under `<repo>/.worktrees/`. Dormant chapters remove worktree but preserve branch.
+- **Git worktrees** per active chapter under `<project.gitPath>/.worktrees/`. Dormant chapters remove worktree but preserve branch. Each project has exactly one git repository, configured via `gitPath` on the project.
 - **Container management** via Podman compose with port allocation from a configurable pool (default 10000–20000).
 - **Terminal persistence** via dtach — terminals survive server restarts.
 - **Batch merge** orchestrates multi-chapter merges with conflict detection, interactive WebSocket decisions, and AI-assisted conflict resolution.
