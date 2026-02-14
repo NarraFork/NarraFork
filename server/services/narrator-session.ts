@@ -8,7 +8,13 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { and, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { chapters, narratorMessages, narrators, narratorToolCalls, permissionRequests } from "../db/schema";
+import {
+	chapters,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	permissionRequests,
+} from "../db/schema";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -17,7 +23,7 @@ import { settings } from "../lib/settings";
 import { getImagePath, type ImageRef, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
-import { generateAndSetTitle } from "./narrator-title";
+import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 
 // === In-memory state ===
 
@@ -34,9 +40,21 @@ interface PendingPermission {
 	timeoutId: ReturnType<typeof setTimeout>;
 	input: Record<string, unknown>;
 	narratorId: string;
+	toolUseId: string;
 }
 
 const pendingPermissions = new Map<string, PendingPermission>();
+
+// Feedback queued by "allow with feedback" — keyed by narratorId
+const pendingFeedback = new Map<string, { toolUseId: string; feedbackText: string }>();
+
+// Buffered message queued by user while narrator is thinking — keyed by narratorId
+interface BufferedMessage {
+	text: string;
+	images?: ImageRef[];
+	bufferedAt: string;
+}
+const bufferedMessages = new Map<string, BufferedMessage>();
 
 // === SSE event types yielded to the HTTP response ===
 
@@ -47,6 +65,8 @@ export type SessionEvent =
 	| { type: "tool_progress"; data: any }
 	| { type: "result"; data: any }
 	| { type: "error"; data: { message: string } }
+	| { type: "auto_feedback"; data: { message: string } }
+	| { type: "buffered_send"; data: { message: string; images?: ImageRef[] } }
 	| { type: "done"; data: null };
 
 // === Permission handling ===
@@ -68,6 +88,31 @@ async function handlePermission(
 	const autoAllowTools = ["TodoWrite", "TodoRead"];
 	if (autoAllowTools.includes(toolName)) {
 		return { behavior: "allow", updatedInput: input };
+	}
+
+	// Read permission mode from DB in real-time so mid-session changes take effect
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { permissionMode: true },
+	});
+	const permMode = narrator?.permissionMode ?? "default";
+
+	// Auto-allow/deny based on current permission mode
+	if (permMode === "bypassPermissions") {
+		return { behavior: "allow", updatedInput: input };
+	}
+	if (permMode === "dontAsk") {
+		return {
+			behavior: "deny",
+			message: "Non-interactive session: all risky operations are denied",
+		};
+	}
+	if (permMode === "acceptEdits") {
+		// Accept file-editing tools automatically, prompt for others
+		const editTools = ["Edit", "Write", "NotebookEdit", "MultiEdit"];
+		if (editTools.includes(toolName)) {
+			return { behavior: "allow", updatedInput: input };
+		}
 	}
 
 	const requestId = generateId();
@@ -103,6 +148,7 @@ async function handlePermission(
 		request: {
 			id: requestId,
 			toolName,
+			toolUseId: options.toolUseID,
 			inputJson: input,
 			decisionReason: options.decisionReason,
 			suggestions: options.suggestions,
@@ -126,7 +172,13 @@ async function handlePermission(
 			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, PERMISSION_TIMEOUT_MS);
 
-		pendingPermissions.set(requestId, { resolve, timeoutId, input, narratorId });
+		pendingPermissions.set(requestId, {
+			resolve,
+			timeoutId,
+			input,
+			narratorId,
+			toolUseId: options.toolUseID,
+		});
 	});
 }
 
@@ -136,6 +188,7 @@ export async function resolvePermission(
 	decision: "allow" | "deny",
 	denyMessage?: string,
 	answers?: Record<string, string>,
+	feedbackText?: string,
 ): Promise<void> {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -146,17 +199,40 @@ export async function resolvePermission(
 	clearTimeout(pending.timeoutId);
 	pendingPermissions.delete(requestId);
 
-	// Resume thinking status now that user has decided
-	await narratorService.updateStatus(pending.narratorId, "thinking");
+	// Broadcast to all subscribers so other tabs can clear the permission banner
+	broadcastToNarrator(pending.narratorId, {
+		type: "permission_resolved",
+		narratorId: pending.narratorId,
+		requestId,
+	});
 
-	// Update DB
-	const now = new Date().toISOString();
-	await db
-		.update(permissionRequests)
-		.set({ decision, decidedBy: "user", decidedAt: now, denyMessage })
-		.where(eq(permissionRequests.id, requestId));
+	// Always resolve the pending promise to avoid deadlocking the SDK.
+	// If any DB operation below fails, we still need to unblock the session.
+	try {
+		// Resume thinking status now that user has decided
+		await narratorService.updateStatus(pending.narratorId, "thinking");
+
+		// Update DB
+		const now = new Date().toISOString();
+		await db
+			.update(permissionRequests)
+			.set({ decision, decidedBy: "user", decidedAt: now, denyMessage })
+			.where(eq(permissionRequests.id, requestId));
+	} catch (err) {
+		logger.error("Failed to update permission state in DB, resolving anyway", {
+			requestId,
+			error: String(err),
+		});
+	}
 
 	if (decision === "allow") {
+		// Queue feedback for after tool completion — will interrupt session and auto-send
+		if (feedbackText?.trim()) {
+			pendingFeedback.set(pending.narratorId, {
+				toolUseId: pending.toolUseId,
+				feedbackText: feedbackText.trim(),
+			});
+		}
 		// For AskUserQuestion, merge answers into the input so the SDK sees them
 		const updatedInput = answers ? { ...pending.input, answers } : pending.input;
 		pending.resolve({ behavior: "allow", updatedInput });
@@ -218,7 +294,6 @@ export async function* startSession(
 
 	// Build SDK options
 	const abortController = new AbortController();
-	const permMode = (narrator.permissionMode ?? "default") as PermissionMode;
 
 	// Determine if this is a fork-on-first-message scenario (full inheritance mode)
 	const isFullFork =
@@ -274,12 +349,8 @@ export async function* startSession(
 			systemPrompt: narrator.systemPrompt
 				? { type: "preset", preset: "claude_code", append: narrator.systemPrompt }
 				: undefined,
-			permissionMode: permMode,
-			...(permMode === "bypassPermissions" && { allowDangerouslySkipPermissions: true }),
-			canUseTool:
-				permMode === "default"
-					? (toolName, input, opts) => handlePermission(narratorId, toolName, input, opts)
-					: undefined,
+			permissionMode: "default" as PermissionMode,
+			canUseTool: (toolName, input, opts) => handlePermission(narratorId, toolName, input, opts),
 			abortController,
 			settingSources: ["user"],
 		},
@@ -288,18 +359,21 @@ export async function* startSession(
 	activeSessions.set(narratorId, { query: sdkQuery, abortController, narratorId });
 	await narratorService.updateStatus(narratorId, "thinking");
 
-	let shouldGenerateTitle = false;
+	// Phase 1: Generate quick title from user message immediately (fire-and-forget)
+	const isFirstMessage = (narrator.messageCount ?? 0) === 0 && !narrator.title;
+	let quickTitlePromise: Promise<void> | null = null;
+	if (isFirstMessage) {
+		quickTitlePromise = generateQuickTitle(narratorId, prompt).catch(() => {});
+	}
+
+	let shouldUpdateTitle = false;
 	try {
 		for await (const message of sdkQuery) {
 			const event = await processSDKMessage(narratorId, message);
 			if (event?.type === "assistant_message") {
-				// Check if title generation is needed, but defer it until after the loop
-				// to avoid concurrent DB writes with ongoing message processing
-				if (!shouldGenerateTitle) {
-					const narrator = await narratorService.getById(narratorId);
-					if ((narrator.messageCount ?? 0) === 0 && !narrator.title) {
-						shouldGenerateTitle = true;
-					}
+				// Phase 2: After first AI reply, update title with full conversation context
+				if (!shouldUpdateTitle && isFirstMessage) {
+					shouldUpdateTitle = true;
 				}
 			}
 			if (event) yield event;
@@ -311,11 +385,51 @@ export async function* startSession(
 		yield { type: "error", data: { message: errorMsg } };
 	} finally {
 		activeSessions.delete(narratorId);
-		// Generate title after all message processing is done — no concurrent DB writes
-		if (shouldGenerateTitle) {
+		// Phase 2: Update title with full conversation after AI reply is done
+		// Wait for quick title to finish first to avoid race condition
+		if (shouldUpdateTitle && quickTitlePromise) {
+			await quickTitlePromise;
 			generateAndSetTitle(narratorId).catch(() => {});
 		}
-		yield { type: "done", data: null };
+
+		// If there's pending feedback from "allow with feedback", yield it so the
+		// SSE route can start a new session with the feedback message
+		const fb = pendingFeedback.get(narratorId);
+		if (fb) {
+			pendingFeedback.delete(narratorId);
+			yield { type: "auto_feedback", data: { message: fb.feedbackText } };
+		} else {
+			// Check for buffered message queued by user while narrator was thinking
+			const buffered = bufferedMessages.get(narratorId);
+			if (buffered) {
+				bufferedMessages.delete(narratorId);
+				// Don't auto-send if session errored out
+				const finalNarrator = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { status: true },
+				});
+				if (finalNarrator?.status === "error") {
+					broadcastToNarrator(narratorId, {
+						type: "buffer_cleared" as any,
+						narratorId,
+						reason: "session_error",
+					});
+					yield { type: "done", data: null };
+				} else {
+					broadcastToNarrator(narratorId, {
+						type: "buffer_cleared" as any,
+						narratorId,
+						reason: "sent",
+					});
+					yield {
+						type: "buffered_send",
+						data: { message: buffered.text, images: buffered.images },
+					};
+				}
+			} else {
+				yield { type: "done", data: null };
+			}
+		}
 	}
 }
 
@@ -330,6 +444,23 @@ async function processSDKMessage(
 
 			// Persist message + tool calls
 			const saved = await narratorService.persistAssistantMessage(narratorId, message as any);
+
+			// Check for TodoWrite and persist + broadcast todos snapshot
+			const assistantContent = (message as any).message?.content;
+			if (Array.isArray(assistantContent)) {
+				const todoBlock = assistantContent.find(
+					(b: any) => b.type === "tool_use" && b.name === "TodoWrite",
+				);
+				if (todoBlock?.input?.todos) {
+					await narratorService.updateTodos(narratorId, todoBlock.input.todos, todoBlock.id);
+					broadcastToNarrator(narratorId, {
+						type: "todos_updated",
+						narratorId,
+						todos: todoBlock.input.todos,
+						toolUseId: todoBlock.id,
+					});
+				}
+			}
 
 			// Broadcast full persisted message (with toolCalls) to WebSocket
 			const fullMessage = await db.query.narratorMessages.findFirst({
@@ -350,9 +481,9 @@ async function processSDKMessage(
 		case "stream_event": {
 			// Forward streaming deltas to WebSocket for real-time UI
 			broadcastToNarrator(narratorId, {
-				type: "message",
+				type: "stream_event",
 				narratorId,
-				message: { type: "stream_event", event: message.event },
+				event: message.event,
 			});
 			return { type: "stream_event", data: message.event };
 		}
@@ -364,22 +495,47 @@ async function processSDKMessage(
 				for (const block of content) {
 					if (block.type === "tool_result" && block.tool_use_id) {
 						const isError = block.is_error ?? false;
-						await narratorService.updateToolCallResult(block.tool_use_id, {
-							output: block.content,
-							status: isError ? "failed" : "completed",
-							errorMessage: isError
-								? typeof block.content === "string"
-									? block.content
-									: JSON.stringify(block.content)
-								: undefined,
-						});
+						const status = isError ? "failed" : "completed";
+
+						// Non-critical: persist tool result to DB. Failure should not kill the session.
+						try {
+							await narratorService.updateToolCallResult(block.tool_use_id, {
+								output: block.content,
+								status,
+								errorMessage: isError
+									? typeof block.content === "string"
+										? block.content
+										: JSON.stringify(block.content)
+									: undefined,
+							});
+						} catch (err) {
+							logger.error("Failed to persist tool call result", {
+								narratorId,
+								toolUseId: block.tool_use_id,
+								error: String(err),
+							});
+						}
 
 						broadcastToNarrator(narratorId, {
-							type: "tool_progress",
+							type: "tool_completed",
 							narratorId,
 							toolUseId: block.tool_use_id,
-							elapsed: 0,
+							status,
+							output: block.content,
 						});
+
+						// If this tool had "allow with feedback", interrupt session now
+						const fb = pendingFeedback.get(narratorId);
+						if (fb && fb.toolUseId === block.tool_use_id) {
+							const session = activeSessions.get(narratorId);
+							if (session) {
+								logger.info("Interrupting session for allow-with-feedback", {
+									narratorId,
+									toolUseId: fb.toolUseId,
+								});
+								session.query.interrupt().catch(() => {});
+							}
+						}
 					}
 				}
 			}
@@ -409,7 +565,7 @@ async function processSDKMessage(
 					errors.join("; ") || message.subtype,
 				);
 			} else {
-				await narratorService.updateStatus(narratorId, "idle");
+				await narratorService.updateStatus(narratorId, "done");
 			}
 
 			return {
@@ -447,6 +603,32 @@ export async function interruptSession(narratorId: string): Promise<boolean> {
 
 export function isSessionActive(narratorId: string): boolean {
 	return activeSessions.has(narratorId);
+}
+
+// === Buffered message API ===
+
+/** Set a buffered message to auto-send when the current session completes. */
+export function setBufferedMessage(
+	narratorId: string,
+	text: string,
+	images?: ImageRef[],
+): { ok: boolean; bufferedAt: string } {
+	if (!activeSessions.has(narratorId)) {
+		return { ok: false, bufferedAt: "" };
+	}
+	const bufferedAt = new Date().toISOString();
+	bufferedMessages.set(narratorId, { text, images, bufferedAt });
+	return { ok: true, bufferedAt };
+}
+
+/** Cancel a buffered message. */
+export function clearBufferedMessage(narratorId: string): void {
+	bufferedMessages.delete(narratorId);
+}
+
+/** Get the current buffered message (for REST hydration). */
+export function getBufferedMessage(narratorId: string): BufferedMessage | null {
+	return bufferedMessages.get(narratorId) ?? null;
 }
 
 // === Startup recovery ===

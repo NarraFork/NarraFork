@@ -64,6 +64,62 @@ export async function generateTitle(narratorId: string, stderrChunks: string[]):
 }
 
 /**
+ * Generate a quick title from just the user message (before AI replies).
+ * Fire-and-forget — errors are logged, not thrown.
+ */
+export async function generateQuickTitle(narratorId: string, userMessage: string): Promise<void> {
+	const stderrChunks: string[] = [];
+	try {
+		const truncated = userMessage.length > 500 ? `${userMessage.slice(0, 500)}...` : userMessage;
+		const prompt = `${TITLE_PROMPT}[User]: ${truncated}`;
+
+		logger.info("Quick title generation starting", {
+			narratorId,
+			model: settings.agent.summaryModel,
+		});
+
+		const titleQuery = query({
+			prompt,
+			options: {
+				model: settings.agent.summaryModel,
+				maxTurns: 1,
+				tools: [],
+				permissionMode: "dontAsk",
+				settingSources: ["user"],
+				stderr: (data: string) => {
+					stderrChunks.push(data);
+				},
+			},
+		});
+
+		let title = "";
+		for await (const message of titleQuery) {
+			if (message.type === "assistant") {
+				for (const block of message.message.content) {
+					if (block.type === "text") {
+						title += block.text;
+					}
+				}
+			}
+		}
+
+		title = title.trim().replace(/^["'""]+|["'""]+$/g, "");
+		title = title || "New conversation";
+
+		await narratorService.updateTitle(narratorId, title);
+		broadcastToNarrator(narratorId, { type: "title_updated", narratorId, title });
+		eventBus.emit({ type: "narrator:title_updated", narratorId, title });
+		logger.info("Quick title auto-generated", { narratorId, title });
+	} catch (err) {
+		logger.error("Failed to generate quick title", {
+			narratorId,
+			error: String(err),
+			stderr: stderrChunks.join(""),
+		});
+	}
+}
+
+/**
  * Generate a title and persist it. Fire-and-forget — errors are logged, not thrown.
  * Also broadcasts the title update via WebSocket and event bus.
  */

@@ -169,13 +169,19 @@ export const narratorService = {
 	},
 
 	async getPendingPermissions(narratorId: string) {
-		return db.query.permissionRequests.findMany({
+		const perms = await db.query.permissionRequests.findMany({
 			where: and(
 				eq(permissionRequests.narratorId, narratorId),
 				eq(permissionRequests.decision, "pending"),
 			),
+			with: { toolCall: { columns: { toolUseId: true } } },
 			orderBy: (p, { asc }) => [asc(p.createdAt)],
 		});
+		return perms.map((perm) => ({
+			...perm,
+			toolUseId: perm.toolCall?.toolUseId ?? null,
+			toolCall: undefined,
+		}));
 	},
 
 	async persistUserMessage(narratorId: string, text: string, contentBlocks?: any[]) {
@@ -275,6 +281,11 @@ export const narratorService = {
 		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
 	},
 
+	async updateModel(narratorId: string, model: string) {
+		const now = new Date().toISOString();
+		await db.update(narrators).set({ model, updatedAt: now }).where(eq(narrators.id, narratorId));
+	},
+
 	async updatePermissionMode(
 		narratorId: string,
 		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk",
@@ -288,7 +299,7 @@ export const narratorService = {
 
 	async updateStatus(
 		narratorId: string,
-		status: "idle" | "thinking" | "waiting" | "archived" | "error",
+		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error",
 		errorMessage?: string,
 	) {
 		const now = new Date().toISOString();
@@ -302,6 +313,14 @@ export const narratorService = {
 				? { type: "narrator:error", narratorId, error: errorMessage ?? "Unknown error" }
 				: { type: "narrator:status_changed", narratorId, status },
 		);
+	},
+
+	async updateTodos(narratorId: string, todos: any[], toolUseId?: string) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ todosJson: todos, todosToolUseId: toolUseId ?? null, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 
 	async updateToolCallResult(
