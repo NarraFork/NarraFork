@@ -4,7 +4,6 @@ import {
 	Box,
 	Button,
 	CloseButton,
-	Collapse,
 	Divider,
 	Group,
 	Image,
@@ -55,7 +54,9 @@ import { api, getToken } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { CodeBlockWithActions } from "./CodeBlockWithActions";
+import { LazyCollapse } from "./LazyCollapse";
 import { MessageBubble } from "./MessageBubble";
+import { findMsgByToolUseIdInTree, insertChildIntoCache, updateToolCallInTree } from "./message-tree-utils";
 import { PermissionBanner } from "./PermissionBanner";
 import type { PendingPermission, ToolCallData } from "./ToolCallCard";
 import { isEditTool, STATUS_COLORS, StatusIcon, ToolCallCard } from "./ToolCallCard";
@@ -74,19 +75,13 @@ if (typeof document !== "undefined") {
 	}
 }
 
-// --- Message-level grouping: merge consecutive tool-only messages + subagent nesting ---
+// --- Message-level helpers ---
 
 function isToolOnlyMessage(msg: any): boolean {
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	return (
 		msg.role === "assistant" && blocks.length > 0 && blocks.every((b: any) => b.type === "tool_use")
 	);
-}
-
-function getToolUseId(msg: any): string | null {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	const block = blocks.find((b: any) => b.type === "tool_use");
-	return block?.id ?? null;
 }
 
 function resolveToolCallFromMsg(msg: any): ToolCallData | null {
@@ -105,12 +100,11 @@ function resolveToolCallFromMsg(msg: any): ToolCallData | null {
 	};
 }
 
-// --- SubagentCard: renders a Task tool call with its child tool calls nested inside ---
+// --- SubagentCard: renders a Task tool call with its child messages (pre-nested from backend) ---
 
 function SubagentCard({
 	toolCall,
 	childMessages,
-	childrenMap,
 	narratorId,
 	inRun,
 	isLast,
@@ -119,7 +113,6 @@ function SubagentCard({
 }: {
 	toolCall: ToolCallData;
 	childMessages: any[];
-	childrenMap: Map<string, any[]>;
 	narratorId: string;
 	inRun?: boolean;
 	isLast?: boolean;
@@ -150,11 +143,16 @@ function SubagentCard({
 	}, [toolCall.outputJson]);
 
 	// Collect child tool calls
-	const childToolCalls: { tc: ToolCallData; toolUseId: string | null; msgId: string }[] = [];
+	const childToolCalls: {
+		tc: ToolCallData;
+		toolUseId: string | null;
+		msgId: string;
+		childMsg: any;
+	}[] = [];
 	for (const cm of childMessages) {
 		if (!isToolOnlyMessage(cm)) continue;
 		const tc = resolveToolCallFromMsg(cm);
-		if (tc) childToolCalls.push({ tc, toolUseId: getToolUseId(cm), msgId: cm.id });
+		if (tc) childToolCalls.push({ tc, toolUseId: tc.toolUseId, msgId: cm.id, childMsg: cm });
 	}
 
 	const totalMs =
@@ -182,13 +180,13 @@ function SubagentCard({
 					<Badge size="xs" variant="light" color="indigo">
 						{agentType}
 					</Badge>
+					{input.model && (
+						<Badge size="xs" variant="light" color="violet">
+							{input.model}
+						</Badge>
+					)}
 					<Box style={{ flex: 1 }} />
 					<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-						{input.model && (
-							<Text size="xs" c="dimmed">
-								{input.model}
-							</Text>
-						)}
 						{childToolCalls.length > 0 && (
 							<Text size="xs" c="dimmed">
 								{childToolCalls.length} calls
@@ -217,7 +215,7 @@ function SubagentCard({
 					{description}
 				</Text>
 			</UnstyledButton>
-			<Collapse in={expanded}>
+			<LazyCollapse in={expanded}>
 				{/* Result — shown directly when expanded */}
 				{resultText && (
 					<Box px="xs" pb={4}>
@@ -244,7 +242,7 @@ function SubagentCard({
 								</Text>
 							</Group>
 						</UnstyledButton>
-						<Collapse in={showPrompt}>
+						<LazyCollapse in={showPrompt}>
 							<Box mt={4}>
 								<CodeBlockWithActions
 									content={prompt}
@@ -257,7 +255,7 @@ function SubagentCard({
 									title="Prompt"
 								/>
 							</Box>
-						</Collapse>
+						</LazyCollapse>
 					</Box>
 				)}
 				{/* Permission-pending child — shown standalone outside the collapsed tool calls list */}
@@ -284,24 +282,23 @@ function SubagentCard({
 								</Text>
 							</Group>
 						</UnstyledButton>
-						<Collapse in={showCalls}>
+						<LazyCollapse in={showCalls}>
 							<Box pl="md" mt={4} style={{ borderLeft: "2px solid var(--mantine-color-indigo-3)" }}>
-								{childToolCalls.map(({ tc, toolUseId, msgId }) => {
+								{childToolCalls.map(({ tc, toolUseId, msgId, childMsg }) => {
 									const key = toolUseId ?? tc.toolName;
-									const subChildren = toolUseId ? childrenMap.get(toolUseId) : undefined;
+									const subChildren = childMsg?.children;
 									const matchedPerm =
 										permCb?.pendingPermission &&
 										tc.toolUseId &&
 										tc.toolUseId === permCb.pendingPermission.toolUseId
 											? permCb.pendingPermission
 											: null;
-									if (subChildren && subChildren.length > 0) {
+									if ((subChildren && subChildren.length > 0) || tc.toolName === "Task") {
 										return (
 											<div key={key} id={`msg-${msgId}`}>
 												<SubagentCard
 													toolCall={tc}
 													childMessages={subChildren}
-													childrenMap={childrenMap}
 													narratorId={narratorId}
 													permCb={permCb}
 													editExpandOverride={editExpandOverride}
@@ -323,10 +320,10 @@ function SubagentCard({
 									);
 								})}
 							</Box>
-						</Collapse>
+						</LazyCollapse>
 					</Box>
 				)}
-			</Collapse>
+			</LazyCollapse>
 			{inRun && !isLast && <Divider />}
 		</Box>
 	);
@@ -353,7 +350,6 @@ interface PermissionCallbacks {
 
 function renderToolRun(
 	run: any[],
-	childrenMap: Map<string, any[]>,
 	narratorId: string,
 	permCb: PermissionCallbacks,
 	expandedToolUseId?: string | null,
@@ -376,8 +372,7 @@ function renderToolRun(
 				}}
 			>
 				{run.map((m: any, idx: number) => {
-					const toolUseId = getToolUseId(m);
-					const children = toolUseId ? childrenMap.get(toolUseId) : undefined;
+					const children = m.children;
 					const tc = resolveToolCallFromMsg(m);
 					if (!tc) return null;
 					if ((children && children.length > 0) || tc.toolName === "Task") {
@@ -397,7 +392,6 @@ function renderToolRun(
 								<SubagentCard
 									toolCall={tc}
 									childMessages={children ?? []}
-									childrenMap={childrenMap}
 									narratorId={narratorId}
 									inRun
 									isLast={idx === run.length - 1}
@@ -439,8 +433,7 @@ function renderToolRun(
 	}
 	// Single tool message
 	const msg = run[0];
-	const toolUseId = getToolUseId(msg);
-	const children = toolUseId ? childrenMap.get(toolUseId) : undefined;
+	const children = msg.children;
 	const tc = resolveToolCallFromMsg(msg);
 	if (!tc) return null;
 	if ((children && children.length > 0) || tc.toolName === "Task") {
@@ -457,7 +450,6 @@ function renderToolRun(
 				<SubagentCard
 					toolCall={tc}
 					childMessages={children ?? []}
-					childrenMap={childrenMap}
 					narratorId={narratorId}
 					permCb={permCb}
 					editExpandOverride={editExpandOverride}
@@ -488,7 +480,7 @@ function renderToolRun(
 	);
 }
 
-function renderGroupedMessages(
+function renderTreeMessages(
 	messages: any[],
 	narratorId: string,
 	onForkFromMessage: ((uuid: string) => void) | undefined,
@@ -496,53 +488,24 @@ function renderGroupedMessages(
 	permCb: PermissionCallbacks,
 	expandedToolUseId?: string | null,
 	editExpandOverride?: boolean | null,
-): { elements: React.ReactNode[]; orphanParentIds: string[]; topLevelCount: number } {
-	// Build map: toolUseId → child messages (messages with that parentToolUseId)
-	const childrenMap = new Map<string, any[]>();
-	const topLevel: any[] = [];
-
-	// Collect all toolUseIds present in the loaded messages
-	const loadedToolUseIds = new Set<string>();
-	for (const msg of messages) {
-		const tuid = getToolUseId(msg);
-		if (tuid) loadedToolUseIds.add(tuid);
-	}
-
-	const orphanParentIds = new Set<string>();
-
-	for (const msg of messages) {
-		if (msg.parentToolUseId) {
-			if (loadedToolUseIds.has(msg.parentToolUseId)) {
-				// Parent is loaded — nest as child
-				const arr = childrenMap.get(msg.parentToolUseId) ?? [];
-				arr.push(msg);
-				childrenMap.set(msg.parentToolUseId, arr);
-			} else {
-				// Parent not loaded — hide and track as orphan
-				orphanParentIds.add(msg.parentToolUseId);
-			}
-		} else {
-			topLevel.push(msg);
-		}
-	}
-
+): { elements: React.ReactNode[] } {
+	// Messages are already tree-structured from the backend (children nested).
+	// We only need to group consecutive tool-only messages into visual "runs".
 	const elements: React.ReactNode[] = [];
 	let i = 0;
 
-	while (i < topLevel.length) {
-		const msg = topLevel[i];
+	while (i < messages.length) {
+		const msg = messages[i];
 
 		if (isToolOnlyMessage(msg)) {
-			// Collect consecutive tool-only messages
 			const run: any[] = [msg];
 			let j = i + 1;
-			while (j < topLevel.length && isToolOnlyMessage(topLevel[j])) {
-				run.push(topLevel[j]);
+			while (j < messages.length && isToolOnlyMessage(messages[j])) {
+				run.push(messages[j]);
 				j++;
 			}
 			const el = renderToolRun(
 				run,
-				childrenMap,
 				narratorId,
 				permCb,
 				expandedToolUseId,
@@ -572,7 +535,7 @@ function renderGroupedMessages(
 		}
 	}
 
-	return { elements, orphanParentIds: [...orphanParentIds], topLevelCount: topLevel.length };
+	return { elements };
 }
 
 const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
@@ -736,14 +699,10 @@ export function NarratorPanel({
 		setPendingPermission(null);
 	}, []);
 
-	// Compute grouped message elements + detect orphan subagent children
-	const {
-		elements: groupedElements,
-		orphanParentIds,
-		topLevelCount,
-	} = useMemo(
+	// Compute grouped message elements (tree already built by backend)
+	const { elements: groupedElements } = useMemo(
 		() =>
-			renderGroupedMessages(
+			renderTreeMessages(
 				messages,
 				narratorId,
 				narrator.chapterId ? onForkFromMessage : undefined,
@@ -771,71 +730,6 @@ export function NarratorPanel({
 			handleQuestionDeny,
 		],
 	);
-
-	// Auto-load older pages when orphan subagent children are detected
-	const orphanTargetsRef = useRef(new Map<string, string>()); // toolUseId → target createdAt
-	const orphanQueriedRef = useRef(new Set<string>()); // toolUseIds we've already queried
-	// biome-ignore lint/correctness/useExhaustiveDependencies: trigger on orphan/page changes
-	useEffect(() => {
-		if (orphanParentIds.length === 0) return;
-
-		// Step 1: query server for any new orphan parents we haven't looked up yet
-		const unqueried = orphanParentIds.filter((id) => !orphanQueriedRef.current.has(id));
-		if (unqueried.length > 0) {
-			for (const id of unqueried) orphanQueriedRef.current.add(id);
-			// Query the first unqueried orphan (batch one at a time)
-			api
-				.findParentMessage(narratorId, unqueried[0])
-				.then((result) => {
-					if (result.createdAt) {
-						orphanTargetsRef.current.set(unqueried[0], result.createdAt);
-						// Trigger a re-render to start loading
-						fetchNextPage();
-					}
-				})
-				.catch(() => {});
-			return;
-		}
-
-		// Step 2: if we have targets and haven't loaded far enough, keep fetching
-		if (!hasNextPage || isFetchingNextPage) return;
-		const targets = orphanTargetsRef.current;
-		if (targets.size === 0) return;
-
-		// Find the oldest target we need to reach
-		let oldestTarget: string | null = null;
-		for (const ts of targets.values()) {
-			if (!oldestTarget || ts < oldestTarget) oldestTarget = ts;
-		}
-		if (!oldestTarget) return;
-
-		// Check if we've loaded far enough
-		const pages = messagesData?.pages;
-		if (!pages?.length) return;
-		const lastPage = pages[pages.length - 1];
-		const oldestLoaded = lastPage.messages[0]?.createdAt;
-		if (oldestLoaded && oldestLoaded <= oldestTarget) {
-			// We've loaded past the target — clean up resolved targets
-			for (const [key, ts] of targets.entries()) {
-				if (oldestLoaded <= ts) targets.delete(key);
-			}
-			return;
-		}
-
-		// Need to load more
-		fetchNextPage();
-	}, [orphanParentIds, hasNextPage, isFetchingNextPage, narratorId, messagesData, fetchNextPage]);
-
-	// Auto-load more pages when visible (top-level) messages are fewer than the
-	// initial page size — this can happen after subagent children get nested under
-	// their parents, reducing the visible count below 20.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: trigger on count/page changes
-	useEffect(() => {
-		if (orphanParentIds.length > 0) return; // let orphan resolution finish first
-		if (!hasNextPage || isFetchingNextPage) return;
-		if (topLevelCount >= 20) return;
-		fetchNextPage();
-	}, [topLevelCount, orphanParentIds, hasNextPage, isFetchingNextPage, fetchNextPage]);
 
 	// Load older messages with scroll position preservation
 	const handleLoadOlder = useCallback(() => {
@@ -927,18 +821,25 @@ export function NarratorPanel({
 		useNarratorWS(narratorId, {
 			onMessage: (wsData: any) => {
 				if (wsData.message?.id && wsData.message?.createdAt) {
-					// Full persisted message from WS — append to cache directly
+					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
+
 					qc.setQueryData(messagesQueryKey, (old: any) => {
 						if (!old?.pages?.length) return old;
+
+						// Child message: insert into parent's children array in the tree
+						if (newMsg.parentToolUseId) {
+							return insertChildIntoCache(old, newMsg);
+						}
+
+						// Top-level message: append to first page
 						const pages = [...old.pages];
 						const firstPage = { ...pages[0] };
-						// Dedup: skip if real message already present
-						if (firstPage.messages.some((m: any) => m.id === wsData.message.id)) {
+						if (firstPage.messages.some((m: any) => m.id === newMsg.id)) {
 							return old;
 						}
 						// Replace optimistic user message if one exists — revoke blob URLs
 						const optimistic = firstPage.messages.filter(
-							(m: any) => String(m.id).startsWith("optimistic-") && m.role === wsData.message.role,
+							(m: any) => String(m.id).startsWith("optimistic-") && m.role === newMsg.role,
 						);
 						for (const om of optimistic) {
 							if (Array.isArray(om.contentJson)) {
@@ -948,9 +849,9 @@ export function NarratorPanel({
 							}
 						}
 						const withoutOptimistic = firstPage.messages.filter(
-							(m: any) => !String(m.id).startsWith("optimistic-") || m.role !== wsData.message.role,
+							(m: any) => !String(m.id).startsWith("optimistic-") || m.role !== newMsg.role,
 						);
-						firstPage.messages = [...withoutOptimistic, wsData.message];
+						firstPage.messages = [...withoutOptimistic, newMsg];
 						pages[0] = firstPage;
 						return { ...old, pages };
 					});
@@ -959,27 +860,19 @@ export function NarratorPanel({
 				}
 			},
 			onToolCompleted: (toolUseId: string, status: string, output?: unknown) => {
-				// Update tool call status in cached messages
+				// Update tool call status in cached messages (recursing into children)
 				qc.setQueryData(messagesQueryKey, (old: any) => {
 					if (!old?.pages?.length) return old;
 					let anyChanged = false;
 					const pages = old.pages.map((page: any) => {
-						let pageChanged = false;
-						const messages = page.messages.map((msg: any) => {
-							if (!msg.toolCalls?.length) return msg;
-							let msgChanged = false;
-							const updatedCalls = msg.toolCalls.map((tc: any) => {
-								if (tc.toolUseId !== toolUseId) return tc;
-								msgChanged = true;
-								return { ...tc, status, outputJson: output ?? tc.outputJson };
-							});
-							if (!msgChanged) return msg;
-							pageChanged = true;
-							return { ...msg, toolCalls: updatedCalls };
-						});
-						if (!pageChanged) return page;
-						anyChanged = true;
-						return { ...page, messages };
+						const { messages, changed } = updateToolCallInTree(
+							page.messages,
+							toolUseId,
+							status,
+							output,
+						);
+						if (changed) anyChanged = true;
+						return changed ? { ...page, messages } : page;
 					});
 					return anyChanged ? { ...old, pages } : old;
 				});
@@ -1057,6 +950,7 @@ export function NarratorPanel({
 	}, [editingTitle]);
 
 	const saveTitle = async () => {
+		if (generatingTitle) return; // Don't save stale value while AI is generating
 		const trimmed = titleValue.trim();
 		if (trimmed && trimmed !== narrator.title) {
 			await api.updateNarratorTitle(narratorId, trimmed);
@@ -1551,31 +1445,16 @@ export function NarratorPanel({
 					disabled={!activeTodo}
 					onClick={async () => {
 						if (!activeTodo || !todosToolUseId) return;
-						// Find the message containing this tool call in loaded messages
-						let msg = messages.find((m: any) =>
-							m.toolCalls?.some((tc: any) => tc.toolUseId === todosToolUseId),
-						);
+						// Find the message containing this tool call in loaded messages (recursive tree search)
+						let msg = findMsgByToolUseIdInTree(messages, todosToolUseId);
 						if (!msg) {
-							// Message not loaded — find it on the server and reload around it
+							// Message not loaded — refetch and search again
 							try {
-								const result = await api.findParentMessage(narratorId, todosToolUseId);
-								if (result.messageId) {
-									const data = await api.getNarratorMessages(
-										narratorId,
-										undefined,
-										undefined,
-										result.messageId,
-									);
-									qc.setQueryData(messagesQueryKey, {
-										pages: [data],
-										pageParams: [undefined],
-									});
-									// Wait for React to render the new messages
-									await new Promise((r) => requestAnimationFrame(r));
-									msg = data.messages?.find((m: any) =>
-										m.toolCalls?.some((tc: any) => tc.toolUseId === todosToolUseId),
-									);
-								}
+								await qc.refetchQueries({ queryKey: messagesQueryKey });
+								// After refetch, get fresh messages from cache
+								const freshData = qc.getQueryData<any>(messagesQueryKey);
+								const freshMessages = freshData?.pages?.flatMap((p: any) => p.messages) ?? [];
+								msg = findMsgByToolUseIdInTree(freshMessages, todosToolUseId);
 							} catch {
 								return;
 							}
