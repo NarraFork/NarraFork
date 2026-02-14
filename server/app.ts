@@ -10,6 +10,7 @@ import { requireAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
 import { authRoutes } from "./routes/auth";
 import { chapterRoutes } from "./routes/chapters";
+import { favoriteRoutes } from "./routes/favorites";
 import { graphRoutes } from "./routes/graph";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
@@ -18,6 +19,7 @@ import { searchRoutes } from "./routes/search";
 import { sessionRoutes } from "./routes/sessions";
 import { settingsRoutes } from "./routes/settings";
 import { terminalRoutes } from "./routes/terminals";
+import { uploadRoutes } from "./routes/uploads";
 
 const isProd = process.env.NODE_ENV === "production";
 
@@ -54,6 +56,8 @@ app.route("/api/admin", adminRoutes);
 app.route("/api/sessions", sessionRoutes);
 app.route("/api/search", searchRoutes);
 app.route("/api/mcp", mcpRoutes);
+app.route("/api/uploads", uploadRoutes);
+app.route("/api/favorites", favoriteRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);

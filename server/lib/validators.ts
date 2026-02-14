@@ -8,25 +8,30 @@ const gitBranchName = z.string().regex(/^[a-zA-Z0-9._\-/]+$/, "Invalid branch na
 export const createProjectSchema = z.object({
 	name: z.string().min(1).max(200),
 	description: z.string().max(2000).optional(),
-	repositoryPath: z.string().min(1).optional(),
-	repositoryName: z.string().max(200).optional(),
+	// Repository mode: "existing" (default), "init", "clone", or omitted for no repo
+	repoMode: z.enum(["existing", "init", "clone"]).optional(),
+	gitPath: z.string().min(1).optional(),
 	defaultBranch: gitBranchName.optional(),
+	// Clone-specific fields
+	cloneUrl: z.string().min(1).optional(),
+	cloneBranch: gitBranchName.optional(),
 });
 
 export const updateProjectSchema = z.object({
 	name: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
 	status: z.enum(["active", "archived"]).optional(),
+	defaultBranch: gitBranchName.optional(),
+	startupScript: z.string().max(5000).nullable().optional(),
+	copyFiles: z.string().max(5000).nullable().optional(),
 });
 
 // === Chapters ===
 
 export const createChapterSchema = z.object({
 	projectId: z.string().min(1),
-	repositoryId: z.string().min(1),
 	title: z.string().min(1).max(200),
 	description: z.string().max(2000).optional(),
-	type: z.enum(["meanwhile", "whatif"]).optional(),
 	baseBranch: gitBranchName.optional(),
 });
 
@@ -71,7 +76,6 @@ export const createTerminalSchema = z.object({
 export const forkChapterSchema = z.object({
 	title: z.string().min(1).max(200),
 	description: z.string().max(2000).optional(),
-	type: z.enum(["meanwhile", "whatif"]).optional(),
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	forkAtMessageUuid: z.string().optional(),
 });
@@ -148,10 +152,28 @@ export const createSessionSchema = z.object({
 	permissionMode: z
 		.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"])
 		.optional(),
+	cwd: z.string().min(1).max(4096).optional(),
 });
 
 // === Narrator title ===
 
 export const updateNarratorTitleSchema = z.object({
 	title: z.string().min(1).max(200),
+});
+
+// === Favorite Directories ===
+
+export const createFavoriteDirectorySchema = z.object({
+	path: z.string().min(1).max(4096),
+	label: z.string().max(200).optional(),
+});
+
+export const updateFavoriteDirectorySchema = z.object({
+	path: z.string().min(1).max(4096).optional(),
+	label: z.string().max(200).nullable().optional(),
+	sortOrder: z.number().int().min(0).optional(),
+});
+
+export const reorderFavoriteDirectoriesSchema = z.object({
+	ids: z.array(z.string().min(1)).min(1),
 });

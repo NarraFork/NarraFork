@@ -41,9 +41,9 @@ const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778 },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
-		defaultModel: "sonnet",
+		defaultModel: "claude-sonnet",
 		defaultPermissionMode: "default",
-		summaryModel: "haiku",
+		summaryModel: "claude-haiku",
 		customModels: [],
 	},
 	chapters: {

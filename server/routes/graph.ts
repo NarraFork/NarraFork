@@ -13,7 +13,6 @@ graphRoutes.get("/:id/graph", async (c) => {
 		columns: {
 			id: true,
 			title: true,
-			type: true,
 			status: true,
 			branch: true,
 			parentChapterId: true,
@@ -58,7 +57,6 @@ graphRoutes.get("/:id/graph", async (c) => {
 		type: "chapterNode",
 		data: {
 			title: ch.title,
-			chapterType: ch.type,
 			status: ch.status,
 			branch: ch.branch,
 			narratorCount: narratorCounts.get(ch.id) ?? 0,

@@ -1,11 +1,12 @@
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapters, projects, repositories } from "../db/schema";
+import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
+import { gitService } from "../services/git-service";
 
 export const projectRoutes = new Hono();
 
@@ -19,7 +20,6 @@ projectRoutes.get("/", async (c) => {
 			: undefined;
 	const result = await db.query.projects.findMany({
 		where,
-		with: { repositories: true },
 		orderBy: (projects, { desc }) => [desc(projects.updatedAt)],
 	});
 	return c.json(result);
@@ -33,29 +33,45 @@ projectRoutes.post("/", async (c) => {
 	const now = new Date().toISOString();
 	const projectId = generateId();
 
+	let gitPath = body.gitPath?.trim() || null;
+	let remoteUrl: string | null = null;
+	let defaultBranch = body.defaultBranch ?? "main";
+	const mode = body.repoMode;
+
+	if (mode === "existing" && gitPath) {
+		if (!(await gitService.isGitRepo(gitPath))) {
+			throw new ValidationError(`Path is not a git repository: ${gitPath}`);
+		}
+	} else if (mode === "init" && gitPath) {
+		await gitService.initRepo(gitPath);
+		const detectedBranch = await gitService.getCurrentBranch(gitPath);
+		defaultBranch = body.defaultBranch ?? detectedBranch ?? "main";
+	} else if (mode === "clone" && body.cloneUrl && gitPath) {
+		await gitService.cloneRepo(body.cloneUrl, gitPath, body.cloneBranch);
+		const detectedBranch = await gitService.getCurrentBranch(gitPath);
+		remoteUrl = body.cloneUrl;
+		defaultBranch = body.cloneBranch ?? detectedBranch ?? "main";
+	} else if (!mode) {
+		gitPath = null;
+	} else if (mode) {
+		throw new ValidationError(
+			`gitPath is required when repoMode is "${mode}"${mode === "clone" ? " (cloneUrl is also required)" : ""}`,
+		);
+	}
+
 	const [project] = await db
 		.insert(projects)
 		.values({
 			id: projectId,
 			name: body.name,
 			description: body.description,
+			gitPath,
+			remoteUrl,
+			defaultBranch,
 			createdAt: now,
 			updatedAt: now,
 		})
 		.returning();
-
-	if (body.repositoryPath) {
-		await db.insert(repositories).values({
-			id: generateId(),
-			projectId,
-			path: body.repositoryPath,
-			displayName: body.repositoryName ?? body.name,
-			isPrimary: true,
-			defaultBranch: body.defaultBranch ?? "main",
-			createdAt: now,
-			updatedAt: now,
-		});
-	}
 
 	return c.json(project, 201);
 });
@@ -64,7 +80,6 @@ projectRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, id),
-		with: { repositories: true },
 	});
 	if (!project) throw new NotFoundError("Project", id);
 	return c.json(project);
@@ -95,7 +110,6 @@ projectRoutes.delete("/:id", async (c) => {
 	for (const chapter of projectChapters) {
 		await chapterService.remove(chapter.id);
 	}
-	await db.delete(repositories).where(eq(repositories.projectId, id));
 	await db.delete(projects).where(eq(projects.id, id));
 	return c.json({ ok: true });
 });

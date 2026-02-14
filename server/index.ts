@@ -24,6 +24,7 @@ if (isProd) {
 
 const _server = Bun.serve({
 	port,
+	idleTimeout: 255,
 	async fetch(req, server) {
 		const url = new URL(req.url);
 

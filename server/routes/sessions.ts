@@ -4,14 +4,11 @@ import { streamSSE } from "hono/streaming";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
-import {
-	createSessionSchema,
-	sendMessageSchema,
-	updateNarratorTitleSchema,
-} from "../lib/validators";
+import { createSessionSchema, updateNarratorTitleSchema } from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import { startSession } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
+import { parseMessageRequest } from "./narrators";
 
 export const sessionRoutes = new Hono();
 
@@ -25,6 +22,7 @@ sessionRoutes.post("/", async (c) => {
 		model: parsed.data.model,
 		systemPrompt: parsed.data.systemPrompt,
 		permissionMode: parsed.data.permissionMode,
+		cwd: parsed.data.cwd,
 	});
 
 	return c.json(session, 201);
@@ -52,11 +50,9 @@ sessionRoutes.get("/:id", async (c) => {
 	return c.json(session);
 });
 
-// Send message to standalone session (SSE stream)
+// Send message to standalone session (SSE stream, supports text + images)
 sessionRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	const parsed = sendMessageSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	// Verify this is a standalone session
 	const session = await db.query.narrators.findFirst({
@@ -67,8 +63,10 @@ sessionRoutes.post("/:id/messages", async (c) => {
 		throw new ValidationError("This narrator is bound to a chapter, not a standalone session");
 	}
 
+	const { message, images } = await parseMessageRequest(c, id);
+
 	return streamSSE(c, async (stream) => {
-		for await (const event of startSession(id, parsed.data.message)) {
+		for await (const event of startSession(id, message, images)) {
 			await stream.writeSSE({ event: event.type, data: JSON.stringify(event.data) });
 		}
 	});
@@ -84,11 +82,15 @@ sessionRoutes.get("/:id/messages", async (c) => {
 	if (session.chapterId !== null) {
 		throw new ValidationError("This narrator is bound to a chapter, not a standalone session");
 	}
-	const rawLimit = Number.parseInt(c.req.query("limit") ?? "100", 10);
-	const limit = Math.min(Number.isNaN(rawLimit) ? 100 : rawLimit, 500);
-	const rawOffset = Number.parseInt(c.req.query("offset") ?? "0", 10);
-	const offset = Number.isNaN(rawOffset) || rawOffset < 0 ? 0 : rawOffset;
-	const messages = await narratorService.getMessages(id, limit, offset);
+	const around = c.req.query("around") || undefined;
+	if (around) {
+		const result = await narratorService.getMessagesAround(id, around);
+		return c.json(result);
+	}
+	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
+	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
+	const cursor = c.req.query("cursor") || undefined;
+	const messages = await narratorService.getMessagesCursor(id, limit, cursor);
 	return c.json(messages);
 });
 
@@ -132,7 +134,7 @@ sessionRoutes.post("/:id/generate-title", async (c) => {
 	if (session.chapterId !== null) {
 		throw new ValidationError("This narrator is bound to a chapter, not a standalone session");
 	}
-	const title = await generateTitle(id);
+	const title = await generateTitle(id, []);
 	await narratorService.updateTitle(id, title);
 	return c.json({ title });
 });

@@ -29,7 +29,6 @@ function createMcpServer(): McpServer {
 								chapters.map((ch) => ({
 									id: ch.id,
 									title: ch.title,
-									type: ch.type,
 									status: ch.status,
 									branch: ch.branch,
 								})),
@@ -56,15 +55,14 @@ function createMcpServer(): McpServer {
 		{
 			chapterId: z.string().describe("Source chapter ID to fork from"),
 			title: z.string().describe("Title for the new chapter"),
-			type: z.enum(["meanwhile", "whatif"]).optional().describe("Chapter type"),
 			inheritMode: z
 				.enum(["full", "compressed", "fresh"])
 				.optional()
 				.describe("Narrator context inheritance mode"),
 		},
-		async ({ chapterId, title, type, inheritMode }) => {
+		async ({ chapterId, title, inheritMode }) => {
 			try {
-				const chapter = await chapterFork.fork(chapterId, { title, type, inheritMode });
+				const chapter = await chapterFork.fork(chapterId, { title, inheritMode });
 				return {
 					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
 				};
@@ -116,30 +114,6 @@ function createMcpServer(): McpServer {
 				const result = await chapterMerge.checkConflicts(chapterId, targetChapterId);
 				return {
 					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	server.tool(
-		"narrafork_create_whatif",
-		"Quick-create a WhatIf exploration branch from a chapter",
-		{
-			chapterId: z.string().describe("Source chapter ID"),
-			title: z.string().describe("Title for the WhatIf branch"),
-		},
-		async ({ chapterId, title }) => {
-			try {
-				const chapter = await chapterFork.fork(chapterId, { title, type: "whatif" });
-				return {
-					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
 				};
 			} catch (err) {
 				return {
