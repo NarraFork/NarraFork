@@ -1,4 +1,4 @@
-import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 // === projects ===
 export const projects = sqliteTable("projects", {
@@ -48,6 +48,7 @@ export const chapters = sqliteTable(
 	(table) => [
 		index("idx_chapters_project").on(table.projectId, table.status),
 		index("idx_chapters_parent").on(table.parentChapterId),
+		uniqueIndex("idx_chapters_project_branch").on(table.projectId, table.branch),
 	],
 );
 

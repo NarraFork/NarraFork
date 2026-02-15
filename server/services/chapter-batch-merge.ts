@@ -93,17 +93,7 @@ export const chapterBatchMerge = {
 		});
 
 		// Step 2: Process merges in background
-		this.processQueue(mergeSessionId, targetChapterId, input.sourceChapterIds, strategy, input.locale).catch(
-			(err) => {
-				logger.error("Batch merge unexpected error", { mergeSessionId, error: String(err) });
-				eventBus.emit({
-					type: "merge:error",
-					mergeSessionId,
-					sourceChapterId: "",
-					error: String(err),
-				});
-			},
-		);
+		this.processQueue(mergeSessionId, targetChapterId, input.sourceChapterIds, strategy, input.locale);
 
 		return { mergeSessionId, targetChapterId };
 	},
@@ -118,9 +108,12 @@ export const chapterBatchMerge = {
 	): Promise<void> {
 		const total = sourceChapterIds.length;
 		let mergedCount = 0;
+		let currentSourceId = "";
 
+		try {
 		for (let i = 0; i < total; i++) {
 			const sourceId = sourceChapterIds[i];
+			currentSourceId = sourceId;
 
 			// Try merge
 			const result = await chapterMerge.merge(sourceId, {
@@ -210,6 +203,15 @@ export const chapterBatchMerge = {
 			targetChapterId,
 			mergedCount,
 		});
+		} catch (err) {
+			logger.error("Batch merge unexpected error", { mergeSessionId, sourceChapterId: currentSourceId, error: String(err) });
+			eventBus.emit({
+				type: "merge:error",
+				mergeSessionId,
+				sourceChapterId: currentSourceId,
+				error: String(err),
+			});
+		}
 	},
 
 	/** Delete the forked chapter on cancellation/failure */

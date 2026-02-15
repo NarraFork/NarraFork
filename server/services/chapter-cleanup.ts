@@ -48,13 +48,14 @@ export const chapterCleanup = {
 		}
 
 		await gitService.autoCommit(chapter.worktreePath, "auto-save before dormant");
-		await gitService.removeWorktree(gitPath, chapter.worktreePath);
 
 		const now = new Date().toISOString();
 		await db
 			.update(chapters)
 			.set({ status: "dormant", worktreePath: null, updatedAt: now })
 			.where(eq(chapters.id, chapterId));
+
+		await gitService.removeWorktree(gitPath, chapter.worktreePath);
 
 		logger.info("Chapter made dormant", { chapterId });
 		eventBus.emit({ type: "chapter:dormant", chapterId });

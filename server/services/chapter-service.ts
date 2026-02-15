@@ -95,11 +95,16 @@ export const chapterService = {
 		}
 	},
 
-	async getById(id: string) {
+	async findById(id: string) {
 		const chapter = await db.query.chapters.findFirst({
 			where: eq(chapters.id, id),
 		});
 		if (!chapter) throw new NotFoundError("Chapter", id);
+		return chapter;
+	},
+
+	async getById(id: string) {
+		const chapter = await this.findById(id);
 
 		// Touch lastAccessedAt and schedule auto-dormant check
 		if (chapter.status === "active") {
@@ -144,7 +149,7 @@ export const chapterService = {
 	},
 
 	async remove(id: string) {
-		const chapter = await this.getById(id);
+		const chapter = await this.findById(id);
 
 		// Delete all narrators (and their messages, tool calls, permissions) first
 		const chapterNarrators = await db.query.narrators.findMany({
