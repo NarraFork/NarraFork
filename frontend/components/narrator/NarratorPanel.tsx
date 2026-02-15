@@ -8,6 +8,7 @@ import {
 	Group,
 	Image,
 	Loader,
+	Menu,
 	Modal,
 	Paper,
 	ScrollArea,
@@ -27,10 +28,11 @@ import {
 	IconArrowDown,
 	IconChevronDown,
 	IconChevronRight,
+	IconCheck,
 	IconCode,
 	IconCodeOff,
+	IconDots,
 	IconHandStop,
-	IconListCheck,
 	IconPaperclip,
 	IconPencilCheck,
 	IconRobot,
@@ -142,7 +144,8 @@ function SubagentCard({
 		return "";
 	}, [toolCall.outputJson]);
 
-	// Collect child tool calls
+	// Determine if this subagent type should render results as markdown
+	const useMarkdown = /^explore$/i.test(agentType);
 	const childToolCalls: {
 		tc: ToolCallData;
 		toolUseId: string | null;
@@ -228,6 +231,8 @@ function SubagentCard({
 								whiteSpace: "pre-wrap",
 							}}
 							title={`${agentType} — ${description}`}
+							markdown={useMarkdown}
+							contentType={useMarkdown ? "markdown" : "code"}
 						/>
 					</Box>
 				)}
@@ -542,7 +547,6 @@ const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
 	default: <IconShield size={14} />,
 	acceptEdits: <IconPencilCheck size={14} />,
 	bypassPermissions: <IconShieldOff size={14} />,
-	plan: <IconListCheck size={14} />,
 	dontAsk: <IconHandStop size={14} />,
 };
 
@@ -556,6 +560,7 @@ interface NarratorPanelProps {
 		status: string;
 		totalCostUsd: number | null;
 		permissionMode: string | null;
+		sdkPlanMode?: boolean | null;
 		todosJson?: any[] | null;
 		todosToolUseId?: string | null;
 	};
@@ -635,6 +640,7 @@ export function NarratorPanel({
 
 	const isWorking = sending || narrator.status === "thinking";
 	const isWaiting = narrator.status === "waiting";
+	const isPlanning = narrator.sdkPlanMode && narrator.status === "thinking";
 	const showWorkIndicator = !!(activeTodo || isWorking || isWaiting);
 
 	// Memoize blob URLs to avoid creating new ones on every render
@@ -898,6 +904,11 @@ export function NarratorPanel({
 			},
 			onBufferCleared: () => {
 				setBufferedText(null);
+			},
+			onSdkPlanModeChanged: (sdkPlanMode) => {
+				qc.setQueryData(["narrators", narratorId], (old: any) =>
+					old ? { ...old, sdkPlanMode } : old,
+				);
 			},
 		});
 
@@ -1199,14 +1210,30 @@ export function NarratorPanel({
 						</Text>
 					)}
 					{narrator.status !== "idle" && (
-						<Badge size="sm" color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}>
-							{t(`status_${narrator.status}`)}
+						<Badge
+							size="sm"
+							color={
+								narrator.sdkPlanMode && narrator.status === "thinking"
+									? "green"
+									: NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"
+							}
+						>
+							{narrator.sdkPlanMode && narrator.status === "thinking"
+								? t("status_planning")
+								: t(`status_${narrator.status}`)}
 						</Badge>
 					)}
 					{disconnected && (
 						<Badge size="xs" variant="dot" color="red">
 							{t("disconnected")}
 						</Badge>
+					)}
+				</Group>
+				<Group gap="xs">
+					{narrator.totalCostUsd != null && narrator.totalCostUsd > 0 && (
+						<Text size="xs" c="dimmed" visibleFrom="sm">
+							${narrator.totalCostUsd.toFixed(4)}
+						</Text>
 					)}
 					<Tooltip label={t("modelTooltip")}>
 						<Select
@@ -1219,15 +1246,9 @@ export function NarratorPanel({
 							onChange={(v) => {
 								if (v) modelMutation.mutate({ id: narratorId, model: v });
 							}}
+							visibleFrom="sm"
 						/>
 					</Tooltip>
-				</Group>
-				<Group gap="xs">
-					{narrator.totalCostUsd != null && narrator.totalCostUsd > 0 && (
-						<Text size="xs" c="dimmed">
-							${narrator.totalCostUsd.toFixed(4)}
-						</Text>
-					)}
 					<Tooltip label={t("permissionMode")}>
 						<Select
 							size="xs"
@@ -1240,7 +1261,6 @@ export function NarratorPanel({
 								{ value: "default", label: t("perm_default") },
 								{ value: "acceptEdits", label: t("perm_acceptEdits") },
 								{ value: "bypassPermissions", label: t("perm_bypassPermissions") },
-								{ value: "plan", label: t("perm_plan") },
 								{ value: "dontAsk", label: t("perm_dontAsk") },
 							]}
 							renderOption={({ option, checked }) => (
@@ -1255,18 +1275,56 @@ export function NarratorPanel({
 							onChange={(v) => {
 								if (v) permModeMutation.mutate({ id: narratorId, permissionMode: v });
 							}}
+							visibleFrom="sm"
 						/>
 					</Tooltip>
-					{(sending || narrator.status === "thinking" || narrator.status === "waiting") && (
-						<Button
-							size="xs"
-							variant="light"
-							color="red"
-							onClick={() => interruptMutation.mutate(narratorId)}
-						>
-							{t("interrupt")}
-						</Button>
-					)}
+					<Menu position="bottom-end" hiddenFrom="sm">
+						<Menu.Target>
+							<ActionIcon variant="subtle" color="gray">
+								<IconDots size={16} />
+							</ActionIcon>
+						</Menu.Target>
+						<Menu.Dropdown>
+							{narrator.totalCostUsd != null && narrator.totalCostUsd > 0 && (
+								<>
+								<Menu.Label>${narrator.totalCostUsd.toFixed(4)}</Menu.Label>
+								<Menu.Divider />
+								</>
+							)}
+							<Menu.Label>{t("modelTooltip")}</Menu.Label>
+							{allModels.map((m) => {
+								const val = typeof m === "string" ? m : m.value;
+								const label = typeof m === "string" ? m : m.label;
+								const selected = narrator.model === val;
+								return (
+									<Menu.Item
+										key={val}
+										onClick={() => modelMutation.mutate({ id: narratorId, model: val })}
+										rightSection={selected ? <IconCheck size={14} /> : null}
+										fw={selected ? 600 : 400}
+									>
+										{label}
+									</Menu.Item>
+								);
+							})}
+							<Menu.Divider />
+							<Menu.Label>{t("permissionMode")}</Menu.Label>
+							{(["default", "acceptEdits", "bypassPermissions", "dontAsk"] as const).map((mode) => {
+								const selected = narrator.permissionMode === mode || (!narrator.permissionMode && mode === "default");
+								return (
+									<Menu.Item
+										key={mode}
+										leftSection={PERM_MODE_ICONS[mode]}
+										onClick={() => permModeMutation.mutate({ id: narratorId, permissionMode: mode })}
+										rightSection={selected ? <IconCheck size={14} /> : null}
+										fw={selected ? 600 : 400}
+									>
+										{t(`perm_${mode}`)}
+									</Menu.Item>
+								);
+							})}
+						</Menu.Dropdown>
+					</Menu>
 					<Tooltip
 						label={
 							editExpandOverride === false
@@ -1486,13 +1544,15 @@ export function NarratorPanel({
 							flexShrink: 0,
 						}}
 					>
-						<Loader size={14} color={isWaiting ? "yellow" : "blue"} />
-						<Text size="xs" c={isWaiting ? "yellow" : "blue"} truncate style={{ flex: 1 }}>
+						<Loader size={14} color={isWaiting ? "yellow" : isPlanning ? "green" : "blue"} />
+						<Text size="xs" c={isWaiting ? "yellow" : isPlanning ? "green" : "blue"} truncate style={{ flex: 1 }}>
 							{activeTodo
 								? activeTodo.content || activeTodo.activeForm
 								: isWaiting
 									? t("status_waiting")
-									: t("thinking")}
+									: isPlanning
+										? t("planning")
+										: t("thinking")}
 						</Text>
 					</Group>
 				</UnstyledButton>
@@ -1570,13 +1630,28 @@ export function NarratorPanel({
 					minRows={1}
 					maxRows={6}
 				/>
-				<Button
-					onClick={handleSend}
-					loading={sending && !input.trim()}
-					disabled={!input.trim() || (sending && !!bufferedText)}
-				>
-					{sending ? t("queue") : tc("send")}
-				</Button>
+				{(() => {
+					const isActive = sending || narrator.status === "thinking" || narrator.status === "waiting";
+					const showInterrupt = isActive && !input.trim();
+					return showInterrupt ? (
+						<Button
+							color="red"
+							variant="light"
+							onClick={() => interruptMutation.mutate(narratorId)}
+							loading={interruptMutation.isPending}
+						>
+							{t("interrupt")}
+						</Button>
+					) : (
+						<Button
+							onClick={handleSend}
+							loading={sending && !input.trim()}
+							disabled={!input.trim() || (sending && !!bufferedText)}
+						>
+							{sending ? t("queue") : tc("send")}
+						</Button>
+					);
+				})()}
 			</Group>
 		</Stack>
 	);

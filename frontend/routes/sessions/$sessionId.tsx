@@ -19,7 +19,7 @@ function SessionDetailPage() {
 	if (!session) return <Text>{t("sessionNotFound")}</Text>;
 
 	return (
-		<Box h="calc(100dvh - 92px)" mx="calc(var(--mantine-spacing-md) * -1)" style={{ display: "flex", flexDirection: "column" }}>
+		<Box h="calc(100dvh - 60px)" mx="calc(var(--mantine-spacing-md) * -1)" my="calc(var(--mantine-spacing-md) * -1)" style={{ display: "flex", flexDirection: "column" }}>
 			<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
 				<NarratorPanel
 					narratorId={sessionId}
