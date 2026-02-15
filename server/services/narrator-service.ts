@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, isNull, lt } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lt, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -379,13 +379,12 @@ export const narratorService = {
 	},
 
 	async updateStats(narratorId: string, costUsd: number) {
-		const narrator = await this.getById(narratorId);
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
 			.set({
-				messageCount: (narrator.messageCount ?? 0) + 1,
-				totalCostUsd: (narrator.totalCostUsd ?? 0) + costUsd,
+				messageCount: sql`COALESCE(${narrators.messageCount}, 0) + 1`,
+				totalCostUsd: sql`COALESCE(${narrators.totalCostUsd}, 0) + ${costUsd}`,
 				lastMessageAt: now,
 				updatedAt: now,
 			})
@@ -469,11 +468,13 @@ export const narratorService = {
 	},
 
 	async remove(narratorId: string) {
-		// Delete in dependency order
-		await db.delete(permissionRequests).where(eq(permissionRequests.narratorId, narratorId));
-		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
-		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
-		await db.delete(narrators).where(eq(narrators.id, narratorId));
+		// Delete in dependency order within a transaction
+		await db.transaction(async (tx) => {
+			await tx.delete(permissionRequests).where(eq(permissionRequests.narratorId, narratorId));
+			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
+			await tx.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
+			await tx.delete(narrators).where(eq(narrators.id, narratorId));
+		});
 		await deleteNarratorUploads(narratorId);
 		logger.info("Narrator removed", { narratorId });
 	},

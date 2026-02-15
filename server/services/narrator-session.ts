@@ -161,10 +161,25 @@ async function handlePermission(
 	// Mark narrator as waiting for user decision
 	await narratorService.updateStatus(narratorId, "waiting");
 
-	// Return a promise that resolves when user decides or timeout
+	// If already aborted, reject immediately
+	if (options.signal.aborted) {
+		await db
+			.update(permissionRequests)
+			.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
+			.where(eq(permissionRequests.id, requestId));
+		return { behavior: "deny", message: "Session aborted" };
+	}
+
+	// Return a promise that resolves when user decides, timeout, or abort
 	return new Promise<PermissionResult>((resolve) => {
-		const timeoutId = setTimeout(async () => {
+		const cleanup = () => {
+			clearTimeout(timeoutId);
+			options.signal.removeEventListener("abort", onAbort);
 			pendingPermissions.delete(requestId);
+		};
+
+		const timeoutId = setTimeout(async () => {
+			cleanup();
 			// Auto-deny on timeout
 			await db
 				.update(permissionRequests)
@@ -172,6 +187,17 @@ async function handlePermission(
 				.where(eq(permissionRequests.id, requestId));
 			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, PERMISSION_TIMEOUT_MS);
+
+		const onAbort = async () => {
+			cleanup();
+			await db
+				.update(permissionRequests)
+				.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
+				.where(eq(permissionRequests.id, requestId));
+			resolve({ behavior: "deny", message: "Session aborted" });
+		};
+
+		options.signal.addEventListener("abort", onAbort, { once: true });
 
 		pendingPermissions.set(requestId, {
 			resolve,

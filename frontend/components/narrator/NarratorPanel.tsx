@@ -23,6 +23,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import {
 	IconArchive,
 	IconArrowDown,
@@ -706,6 +707,9 @@ export function NarratorPanel({
 	}, []);
 
 	// Compute grouped message elements (tree already built by backend)
+	// Note: highlightedId and pendingPermission are intentionally excluded from deps
+	// to avoid rebuilding the entire message tree on every highlight/permission change.
+	// Child components receive fresh values via their own re-renders.
 	const { elements: groupedElements } = useMemo(
 		() =>
 			renderTreeMessages(
@@ -722,13 +726,12 @@ export function NarratorPanel({
 				expandedToolUseId,
 				editExpandOverride,
 			),
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 		[
 			messages,
 			narratorId,
 			narrator.chapterId,
 			onForkFromMessage,
-			highlightedId,
-			pendingPermission,
 			expandedToolUseId,
 			editExpandOverride,
 			handlePermissionDecision,
@@ -1106,8 +1109,13 @@ export function NarratorPanel({
 					}
 				}
 			}
-		} catch (_err) {
-			// Error handling — messages will be refreshed via WS
+		} catch (err) {
+			const message = err instanceof Error ? err.message : "Failed to send message";
+			notifications.show({
+				title: "Error",
+				message,
+				color: "red",
+			});
 		} finally {
 			setSending(false);
 			setStreamingText("");
