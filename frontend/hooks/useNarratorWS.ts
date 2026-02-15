@@ -25,6 +25,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 	callbacksRef.current = callbacks;
 	const [connected, setConnected] = useState(false);
 	const [disconnected, setDisconnected] = useState(false);
+	const [reconnectKey, setReconnectKey] = useState(0);
 	const reconnectAttempts = useRef(0);
 	const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 	const unmountedRef = useRef(false);
@@ -94,8 +95,8 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							callbacksRef.current.onSdkPlanModeChanged?.(data.sdkPlanMode);
 							break;
 					}
-				} catch {
-					// ignore parse errors
+				} catch (err) {
+					if (import.meta.env.DEV) console.warn("[useNarratorWS] Failed to parse WS message:", err);
 				}
 			};
 
@@ -132,7 +133,8 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 				ws.close();
 			}
 		};
-	}, [narratorId]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey is used to trigger manual reconnection
+	}, [narratorId, reconnectKey]);
 
 	const sendPermissionDecision = useCallback(
 		(
@@ -141,8 +143,9 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			message?: string,
 			answers?: Record<string, string>,
 			feedbackText?: string,
-		) => {
-			wsRef.current?.send(
+		): boolean => {
+			if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
+			wsRef.current.send(
 				JSON.stringify({
 					type: "permission_decision",
 					requestId,
@@ -152,6 +155,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 					feedbackText,
 				}),
 			);
+			return true;
 		},
 		[],
 	);
@@ -166,7 +170,12 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 		wsRef.current?.send(JSON.stringify({ type: "cancel_buffer", narratorId: targetNarratorId }));
 	}, []);
 
-	return { connected, disconnected, sendPermissionDecision, sendBufferMessage, cancelBuffer };
+	const reconnect = useCallback(() => {
+		reconnectAttempts.current = 0;
+		setReconnectKey((k) => k + 1);
+	}, []);
+
+	return { connected, disconnected, sendPermissionDecision, sendBufferMessage, cancelBuffer, reconnect };
 }
 
 /**
@@ -217,8 +226,8 @@ export function useSessionsListWS(narratorIds: string[], onUpdate: () => void) {
 					) {
 						onUpdateRef.current();
 					}
-				} catch {
-					// ignore
+				} catch (err) {
+					if (import.meta.env.DEV) console.warn("[useSessionsListWS] Failed to parse WS message:", err);
 				}
 			};
 			ws.onclose = () => {

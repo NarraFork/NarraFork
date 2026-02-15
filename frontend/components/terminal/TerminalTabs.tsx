@@ -1,6 +1,6 @@
 import { ActionIcon, Group, Tabs, Text, Tooltip } from "@mantine/core";
 import { IconPlus, IconX } from "@tabler/icons-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "../../hooks/useTerminals";
 import { TerminalPanel } from "./TerminalPanel";
@@ -19,12 +19,14 @@ export function TerminalTabs({ chapterId }: TerminalTabsProps) {
 	const runningTerminals = (terminals ?? []).filter((t: any) => t.status === "running");
 
 	// Auto-select first terminal if current selection is gone
-	if (activeTab && !runningTerminals.some((t: any) => t.id === activeTab)) {
-		setActiveTab(runningTerminals[0]?.id ?? null);
-	}
-	if (!activeTab && runningTerminals.length > 0) {
-		setActiveTab(runningTerminals[0].id);
-	}
+	useEffect(() => {
+		if (activeTab && !runningTerminals.some((t: any) => t.id === activeTab)) {
+			setActiveTab(runningTerminals[0]?.id ?? null);
+		}
+		if (!activeTab && runningTerminals.length > 0) {
+			setActiveTab(runningTerminals[0].id);
+		}
+	}, [activeTab, runningTerminals]);
 
 	const handleCreate = () => {
 		const name = `Terminal ${(terminals?.length ?? 0) + 1}`;

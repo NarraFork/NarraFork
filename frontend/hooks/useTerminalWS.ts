@@ -7,50 +7,89 @@ interface TerminalWSCallbacks {
 	onError?: (message: string) => void;
 }
 
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY_MS = 1000;
+
 export function useTerminalWS(terminalId: string | undefined, callbacks: TerminalWSCallbacks) {
 	const wsRef = useRef<WebSocket | null>(null);
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
 	const [connected, setConnected] = useState(false);
+	const [disconnected, setDisconnected] = useState(false);
+	const reconnectAttempts = useRef(0);
+	const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+	const unmountedRef = useRef(false);
 
 	useEffect(() => {
 		if (!terminalId) return;
+		unmountedRef.current = false;
 
-		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-		const token = getToken();
-		const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
-		// Use current host:port — Vite proxy handles /ws in dev
-		const ws = new WebSocket(
-			`${protocol}//${window.location.host}/ws/terminal?terminalId=${terminalId}${tokenParam}`,
-		);
-		wsRef.current = ws;
+		function connect() {
+			if (unmountedRef.current) return;
 
-		ws.onopen = () => setConnected(true);
+			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+			const token = getToken();
+			const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+			// Use current host:port — Vite proxy handles /ws in dev
+			const ws = new WebSocket(
+				`${protocol}//${window.location.host}/ws/terminal?terminalId=${terminalId}${tokenParam}`,
+			);
+			wsRef.current = ws;
 
-		ws.onmessage = (event) => {
-			try {
-				const data = JSON.parse(event.data);
-				switch (data.type) {
-					case "output":
-						callbacksRef.current.onOutput?.(data.data);
-						break;
-					case "exit":
-						callbacksRef.current.onExit?.(data.code);
-						break;
-					case "error":
-						callbacksRef.current.onError?.(data.message);
-						break;
+			ws.onopen = () => {
+				setConnected(true);
+				setDisconnected(false);
+				reconnectAttempts.current = 0;
+			};
+
+			ws.onmessage = (event) => {
+				try {
+					const data = JSON.parse(event.data);
+					switch (data.type) {
+						case "output":
+							callbacksRef.current.onOutput?.(data.data);
+							break;
+						case "exit":
+							callbacksRef.current.onExit?.(data.code);
+							break;
+						case "error":
+							callbacksRef.current.onError?.(data.message);
+							break;
+					}
+				} catch (err) {
+					if (import.meta.env.DEV) console.warn("[useTerminalWS] Failed to parse WS message:", err);
 				}
-			} catch {
-				// ignore non-JSON
-			}
-		};
+			};
 
-		ws.onclose = () => setConnected(false);
-		ws.onerror = () => setConnected(false);
+			ws.onclose = () => {
+				setConnected(false);
+				scheduleReconnect();
+			};
+			ws.onerror = () => {
+				setConnected(false);
+			};
+		}
+
+		function scheduleReconnect() {
+			if (unmountedRef.current) return;
+			if (reconnectAttempts.current >= MAX_RECONNECT_ATTEMPTS) {
+				setDisconnected(true);
+				return;
+			}
+			const delay = RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempts.current;
+			reconnectAttempts.current++;
+			reconnectTimer.current = setTimeout(connect, delay);
+		}
+
+		connect();
 
 		return () => {
-			ws.close();
+			unmountedRef.current = true;
+			clearTimeout(reconnectTimer.current);
+			const ws = wsRef.current;
+			if (ws) {
+				ws.close();
+			}
 		};
 	}, [terminalId]);
 
@@ -62,5 +101,5 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 		wsRef.current?.send(JSON.stringify({ type: "resize", cols, rows }));
 	}, []);
 
-	return { connected, write, resize };
+	return { connected, disconnected, write, resize };
 }
