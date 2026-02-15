@@ -13,7 +13,7 @@ export function clearToken(): void {
 	localStorage.removeItem(TOKEN_KEY);
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit & { signal?: AbortSignal }): Promise<T> {
 	const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) };
 	if (options?.body) {
 		headers["Content-Type"] = "application/json";

@@ -9,7 +9,7 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { getToken } from "../../lib/api";
 import { MarkdownContent } from "./MarkdownContent";
@@ -85,7 +85,7 @@ function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) 
 	);
 }
 
-export function MessageBubble({ narratorId, message, onForkFromMessage }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({ narratorId, message, onForkFromMessage }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
@@ -181,4 +181,4 @@ export function MessageBubble({ narratorId, message, onForkFromMessage }: Messag
 			})}
 		</Stack>
 	);
-}
+});

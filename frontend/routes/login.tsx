@@ -75,6 +75,7 @@ function LoginPage() {
 	return (
 		<Center h="100vh">
 			<Paper withBorder shadow="md" p="xl" w={400}>
+				<form onSubmit={e => e.preventDefault()}>
 				<Stack>
 					<Title order={2} ta="center">
 						NarraFork
@@ -171,6 +172,7 @@ function LoginPage() {
 						</Tabs>
 					)}
 				</Stack>
+				</form>
 			</Paper>
 		</Center>
 	);

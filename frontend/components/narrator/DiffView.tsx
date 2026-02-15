@@ -202,12 +202,19 @@ export const DiffView = memo(function DiffView({ oldStr, newStr, maxHeight = 200
 			? { ...containerStyle, maxHeight, ...wrapOverride }
 			: { ...containerStyle, maxHeight: undefined, overflow: "auto" as any, height: "100%", ...wrapOverride };
 
+	const truncated = lines.length >= MAX_DIFF_LINES;
+
 	return (
 		<Box style={style}>
 			{lines.map((line, i) => (
 				// biome-ignore lint/suspicious/noArrayIndexKey: diff lines are computed once and never reordered
 				<DiffLineRow key={i} line={line} />
 			))}
+			{truncated && (
+				<div style={{ textAlign: "center", opacity: 0.6, paddingTop: 4 }}>
+					... diff truncated at {MAX_DIFF_LINES} lines ...
+				</div>
+			)}
 		</Box>
 	);
 });
