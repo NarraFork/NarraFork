@@ -1,13 +1,5 @@
 import { describe, expect, it } from "bun:test";
-
-// Extract slugify from chapter-fork (it's not exported, so we replicate it for testing)
-function slugify(text: string): string {
-	return text
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/(^-|-$)/g, "")
-		.slice(0, 30);
-}
+import { slugify } from "../../../server/services/chapter-fork";
 
 describe("slugify", () => {
 	it("lowercases and replaces spaces with hyphens", () => {

@@ -1,21 +1,5 @@
 import { describe, expect, it } from "bun:test";
-
-// Test the deep-merge logic directly (extracted from settings module)
-function deepMerge<T extends Record<string, any>>(defaults: T, overrides: Record<string, any>): T {
-	const result = { ...defaults };
-	for (const key of Object.keys(overrides)) {
-		const val = overrides[key];
-		if (val && typeof val === "object" && !Array.isArray(val) && key in defaults) {
-			result[key as keyof T] = deepMerge(
-				defaults[key as keyof T] as Record<string, any>,
-				val,
-			) as T[keyof T];
-		} else {
-			result[key as keyof T] = val;
-		}
-	}
-	return result;
-}
+import { deepMerge } from "../../../server/lib/settings";
 
 describe("settings deepMerge", () => {
 	it("merges nested objects", () => {

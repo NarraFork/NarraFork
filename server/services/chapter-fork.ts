@@ -11,7 +11,7 @@ import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorContext } from "./narrator-context";
 
-function slugify(text: string): string {
+export function slugify(text: string): string {
 	return text
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")

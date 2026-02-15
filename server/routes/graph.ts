@@ -3,6 +3,76 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { chapters, containerInstances, narrators } from "../db/schema";
 
+export interface GraphChapter {
+	id: string;
+	title: string;
+	status: string;
+	branch: string;
+	parentChapterId: string | null;
+	mergedIntoChapterId: string | null;
+}
+
+export interface GraphNode {
+	id: string;
+	type: string;
+	data: {
+		title: string;
+		status: string;
+		branch: string;
+		narratorCount: number;
+		hasContainers: boolean;
+	};
+	position: { x: number; y: number };
+}
+
+export interface GraphEdge {
+	id: string;
+	source: string;
+	target: string;
+	type: string;
+}
+
+export function buildGraph(
+	projectChapters: GraphChapter[],
+	narratorCounts: Map<string, number>,
+	containerPresence: Set<string>,
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+	const nodes: GraphNode[] = projectChapters.map((ch) => ({
+		id: ch.id,
+		type: "chapterNode",
+		data: {
+			title: ch.title,
+			status: ch.status,
+			branch: ch.branch,
+			narratorCount: narratorCounts.get(ch.id) ?? 0,
+			hasContainers: containerPresence.has(ch.id),
+		},
+		position: { x: 0, y: 0 },
+	}));
+
+	const edges: GraphEdge[] = [];
+	for (const ch of projectChapters) {
+		if (ch.parentChapterId) {
+			edges.push({
+				id: `fork-${ch.parentChapterId}-${ch.id}`,
+				source: ch.parentChapterId,
+				target: ch.id,
+				type: "forkEdge",
+			});
+		}
+		if (ch.mergedIntoChapterId) {
+			edges.push({
+				id: `merge-${ch.id}-${ch.mergedIntoChapterId}`,
+				source: ch.id,
+				target: ch.mergedIntoChapterId,
+				type: "mergeEdge",
+			});
+		}
+	}
+
+	return { nodes, edges };
+}
+
 export const graphRoutes = new Hono();
 
 graphRoutes.get("/:id/graph", async (c) => {
@@ -51,49 +121,12 @@ graphRoutes.get("/:id/graph", async (c) => {
 		containerPresence.add(ci.chapterId);
 	}
 
-	// Build nodes
-	const nodes = projectChapters.map((ch) => ({
-		id: ch.id,
-		type: "chapterNode",
-		data: {
-			title: ch.title,
-			status: ch.status,
-			branch: ch.branch,
-			narratorCount: narratorCounts.get(ch.id) ?? 0,
-			hasContainers: containerPresence.has(ch.id),
-		},
-		position: { x: 0, y: 0 }, // Dagre will compute positions on the frontend
-	}));
-
-	// Build edges
-	const edges: Array<{
-		id: string;
-		source: string;
-		target: string;
-		type: string;
-	}> = [];
-
-	for (const ch of projectChapters) {
-		// Fork edges: parent → child
-		if (ch.parentChapterId) {
-			edges.push({
-				id: `fork-${ch.parentChapterId}-${ch.id}`,
-				source: ch.parentChapterId,
-				target: ch.id,
-				type: "forkEdge",
-			});
-		}
-
-		// Merge edges: source → target (chapter merged into another)
-		if (ch.mergedIntoChapterId) {
-			edges.push({
-				id: `merge-${ch.id}-${ch.mergedIntoChapterId}`,
-				source: ch.id,
-				target: ch.mergedIntoChapterId,
-				type: "mergeEdge",
-			});
-		}
-	}
+	// Build graph
+	const { nodes, edges } = buildGraph(
+		projectChapters as GraphChapter[],
+		narratorCounts,
+		containerPresence,
+	);
 
 	return c.json({ nodes, edges });
 });

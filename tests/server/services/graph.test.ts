@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { chapters, projects } from "../../../server/db/schema";
+import { buildGraph } from "../../../server/routes/graph";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -58,45 +59,15 @@ function seedGraph() {
 		.run();
 }
 
-// Replicate the graph building logic from server/routes/graph.ts
-function buildGraph(projectChapters: any[]) {
-	const nodes = projectChapters.map((ch: any) => ({
-		id: ch.id,
-		type: "chapterNode",
-		data: {
-			title: ch.title,
-			status: ch.status,
-		},
-	}));
-
-	const edges: Array<{ id: string; source: string; target: string; type: string }> = [];
-	for (const ch of projectChapters) {
-		if (ch.parentChapterId) {
-			edges.push({
-				id: `fork-${ch.parentChapterId}-${ch.id}`,
-				source: ch.parentChapterId,
-				target: ch.id,
-				type: "forkEdge",
-			});
-		}
-		if (ch.mergedIntoChapterId) {
-			edges.push({
-				id: `merge-${ch.id}-${ch.mergedIntoChapterId}`,
-				source: ch.id,
-				target: ch.mergedIntoChapterId,
-				type: "mergeEdge",
-			});
-		}
-	}
-
-	return { nodes, edges };
-}
+// Empty maps for tests that don't need narrator/container data
+const emptyNarratorCounts = new Map<string, number>();
+const emptyContainerPresence = new Set<string>();
 
 describe("story network graph", () => {
 	it("builds nodes for all chapters", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
-		const { nodes } = buildGraph(allChapters);
+		const { nodes } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		expect(nodes).toHaveLength(3);
 		expect(nodes.map((n: any) => n.id).sort()).toEqual(["fork1", "merged1", "root"]);
 	});
@@ -104,7 +75,7 @@ describe("story network graph", () => {
 	it("creates fork edges from parent to child", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
-		const { edges } = buildGraph(allChapters);
+		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		const forkEdges = edges.filter((e) => e.type === "forkEdge");
 		expect(forkEdges).toHaveLength(2); // fork1 and merged1 both have parentChapterId
 		expect(forkEdges.some((e) => e.source === "root" && e.target === "fork1")).toBe(true);
@@ -113,7 +84,7 @@ describe("story network graph", () => {
 	it("creates merge edges from source to target", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
-		const { edges } = buildGraph(allChapters);
+		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		const mergeEdges = edges.filter((e) => e.type === "mergeEdge");
 		expect(mergeEdges).toHaveLength(1);
 		expect(mergeEdges[0].source).toBe("merged1");
@@ -123,7 +94,7 @@ describe("story network graph", () => {
 	it("root chapter has no incoming fork edges", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
-		const { edges } = buildGraph(allChapters);
+		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		const incomingToRoot = edges.filter((e) => e.target === "root" && e.type === "forkEdge");
 		expect(incomingToRoot).toHaveLength(0);
 	});

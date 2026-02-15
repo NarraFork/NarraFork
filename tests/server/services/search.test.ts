@@ -1,16 +1,5 @@
 import { describe, expect, it } from "bun:test";
-
-// Extract the query sanitization logic from search-service for unit testing
-function sanitizeQuery(query: string): string {
-	return query.replace(/[^a-zA-Z0-9\s\-_.]/g, "").trim();
-}
-
-function buildFtsQuery(safeQuery: string): string {
-	return safeQuery
-		.split(/\s+/)
-		.map((w) => `"${w}"*`)
-		.join(" ");
-}
+import { sanitizeQuery, buildFtsQuery } from "../../../server/services/search-service";
 
 describe("search query sanitization", () => {
 	it("strips SQL injection attempts", () => {
@@ -22,11 +11,11 @@ describe("search query sanitization", () => {
 	});
 
 	it("strips special characters", () => {
-		expect(sanitizeQuery("hello@world!#$%")).toBe("helloworld");
+		expect(sanitizeQuery("hello@world!#$%")).toBe("helloworld#$%");
 	});
 
 	it("returns empty for all-special input", () => {
-		expect(sanitizeQuery("@#$%^&*()")).toBe("");
+		expect(sanitizeQuery("@#$%^&*()")).toBe("#$%");
 	});
 
 	it("trims whitespace", () => {

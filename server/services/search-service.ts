@@ -15,13 +15,26 @@ interface SearchOptions {
 	limit?: number;
 }
 
+/** Sanitize: remove FTS5 special chars to prevent injection */
+export function sanitizeQuery(query: string): string {
+	return query.replace(/['"*(){}[\]^~@:;!&|,<>\\]/g, "").trim();
+}
+
+/** Build an FTS5 prefix query from sanitized input */
+export function buildFtsQuery(safeQuery: string): string {
+	return safeQuery
+		.split(/\s+/)
+		.map((w) => `"${w}"*`)
+		.join(" ");
+}
+
 /** Run an FTS5 MATCH query or fall back to LIKE for short queries */
 function ftsQuery(
 	ftsSQL: string,
 	likeSQL: string,
 	useFts: boolean,
-	ftsArgs: unknown[],
-	likeArgs: unknown[],
+	ftsArgs: (string | number)[],
+	likeArgs: (string | number)[],
 ): any[] {
 	return useFts
 		? (sqlite.prepare(ftsSQL).all(...ftsArgs) as any[])
@@ -34,7 +47,7 @@ export const searchService = {
 		const results: SearchResult[] = [];
 
 		// Sanitize: remove FTS5 special chars to prevent injection
-		const safeQuery = query.replace(/['"*(){}[\]^~@:;!&|,<>\\]/g, "").trim();
+		const safeQuery = sanitizeQuery(query);
 		if (!safeQuery) return results;
 
 		// Trigram tokenizer requires >= 3 characters; fall back to LIKE for shorter queries
