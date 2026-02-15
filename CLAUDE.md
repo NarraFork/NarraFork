@@ -15,11 +15,10 @@ NarraFork is an AI-powered collaborative programming platform built around a "na
 
 | Command | Purpose |
 |---------|---------|
-| `bun run dev` | Backend: push DB schema + hot-reload server (port 7778) |
+| `bun run dev` | Backend: run DB migrations + hot-reload server (port 7778) |
 | `bun run dev:frontend` | Frontend: Vite dev server (port 5173, proxies /api and /ws to 7778) |
 | `bun run build` | Build frontend to `dist/frontend/` |
-| `bun run start` | Production: push DB schema + serve backend + static frontend |
-| `bun run db:push` | Push Drizzle schema directly to SQLite (no migration files) |
+| `bun run start` | Production: run DB migrations + serve backend + static frontend |
 | `bun run db:generate` | Generate Drizzle migration SQL files |
 | `bun run db:migrate` | Run migrations from `./drizzle/` |
 | `bun run check` | Biome lint + format check |

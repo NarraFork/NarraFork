@@ -195,10 +195,10 @@ export const narrators = sqliteTable('narrators', {
   title: text('title'),
 
   // 会话配置
-  model: text('model').default('sonnet'),
+  model: text('model').default('claude-sonnet'),
   systemPrompt: text('system_prompt'),             // 额外的 system prompt
   permissionMode: text('permission_mode', {
-    enum: ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk']
+    enum: ['default', 'acceptEdits', 'bypassPermissions', 'dontAsk']
   }).default('default'),
 
   // 工作目录（游离会话使用，chapter 会话从 worktree 获取）
@@ -217,6 +217,7 @@ export const narrators = sqliteTable('narrators', {
   status: text('status', {
     enum: ['idle', 'thinking', 'waiting', 'done', 'archived', 'error']
   }).notNull().default('idle'),
+  sdkPlanMode: integer('sdk_plan_mode', { mode: 'boolean' }).notNull().default(false),
   errorMessage: text('error_message'),
 
   createdAt: text('created_at').notNull(),
@@ -376,7 +377,11 @@ export const users = sqliteTable('users', {
 export const userPreferences = sqliteTable('user_preferences', {
   id: text('id').primaryKey(),
   userId: text('user_id').notNull().unique(),       // 每用户一条记录
-  autoLoadOlderMessages: integer('auto_load_older_messages', { mode: 'boolean' }).default(true),
+  autoLoadOlderMessages: integer('auto_load_older_messages', { mode: 'boolean' }).notNull().default(true),
+  language: text('language').notNull().default('en'),
+  wordWrapMarkdown: integer('word_wrap_markdown', { mode: 'boolean' }).notNull().default(true),
+  wordWrapCode: integer('word_wrap_code', { mode: 'boolean' }).notNull().default(true),
+  wordWrapDiff: integer('word_wrap_diff', { mode: 'boolean' }).notNull().default(true),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -448,7 +453,6 @@ server/
     relations.ts              # Drizzle 关系定义
     index.ts                  # DB 连接 + 导出
     migrate.ts                # 迁移脚本
-    migrations/               # Drizzle-kit 生成的迁移文件
   routes/
     projects.ts               # 项目 CRUD
     chapters.ts               # 章节 CRUD + 分叉/合并 + 容器管理
