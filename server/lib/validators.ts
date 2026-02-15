@@ -48,9 +48,7 @@ export const createNarratorSchema = z.object({
 	type: z.enum(["primary", "secondary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
-	permissionMode: z
-		.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"])
-		.optional(),
+	permissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"]).optional(),
 	cwd: z.string().min(1).max(4096).optional(),
 	sdkPlanMode: z.boolean().optional(),
 });
@@ -186,3 +184,52 @@ export const updateUserPreferencesSchema = z.object({
 	wordWrapCode: z.boolean().optional(),
 	wordWrapDiff: z.boolean().optional(),
 });
+
+// === WebSocket Messages ===
+
+// Narrator client → server
+export const narratorWsMessageSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("subscribe"),
+		narratorIds: z.array(z.string().min(1)),
+	}),
+	z.object({
+		type: z.literal("unsubscribe"),
+		narratorIds: z.array(z.string().min(1)),
+	}),
+	z.object({
+		type: z.literal("permission_decision"),
+		requestId: z.string().min(1),
+		decision: z.enum(["allow", "deny"]),
+		message: z.string().optional(),
+		answers: z.record(z.string(), z.string()).optional(),
+		feedbackText: z.string().optional(),
+	}),
+	z.object({
+		type: z.literal("merge_decision"),
+		mergeSessionId: z.string().min(1),
+		decision: z.enum(["continue", "cancel"]),
+	}),
+	z.object({
+		type: z.literal("buffer_message"),
+		narratorId: z.string().min(1),
+		text: z.string().min(1).max(100_000),
+	}),
+	z.object({
+		type: z.literal("cancel_buffer"),
+		narratorId: z.string().min(1),
+	}),
+]);
+
+// Terminal client → server
+export const terminalWsMessageSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("attach"),
+		terminalId: z.string().min(1),
+	}),
+	z.object({
+		type: z.literal("resize"),
+		cols: z.number().int().min(10).max(500),
+		rows: z.number().int().min(2).max(200),
+	}),
+]);

@@ -1,6 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import {
 	clearBufferedMessage,
@@ -132,64 +133,73 @@ export const handleNarratorWS = {
 	},
 
 	message(ws: NarratorWS, parsed: NarratorClientMessage) {
-		switch (parsed.type) {
+		const result = narratorWsMessageSchema.safeParse(parsed);
+		if (!result.success) {
+			logger.warn("Invalid narrator WS message", {
+				error: result.error.message,
+				parsed,
+			});
+			try {
+				ws.send(JSON.stringify({ type: "error", message: "Invalid message format" }));
+			} catch {
+				// connection may be dead
+			}
+			return;
+		}
+		const msg = result.data;
+
+		switch (msg.type) {
 			case "subscribe": {
-				for (const id of parsed.narratorIds) {
+				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.add(id);
 				}
-				logger.debug("Narrator WS subscribed", { count: parsed.narratorIds.length });
+				logger.debug("Narrator WS subscribed", { count: msg.narratorIds.length });
 				break;
 			}
 			case "unsubscribe": {
-				for (const id of parsed.narratorIds) {
+				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.delete(id);
 				}
 				break;
 			}
 			case "permission_decision": {
 				resolvePermission(
-					parsed.requestId,
-					parsed.decision,
-					parsed.message,
-					parsed.answers,
-					parsed.feedbackText,
+					msg.requestId,
+					msg.decision,
+					msg.message,
+					msg.answers,
+					msg.feedbackText,
 				).catch((err) => logger.error("Failed to resolve permission", { error: String(err) }));
 				break;
 			}
 			case "merge_decision": {
-				resolveMergeDecision(parsed.mergeSessionId, parsed.decision);
+				resolveMergeDecision(msg.mergeSessionId, msg.decision);
 				logger.debug("Merge decision received via WS", {
-					mergeSessionId: parsed.mergeSessionId,
-					decision: parsed.decision,
+					mergeSessionId: msg.mergeSessionId,
+					decision: msg.decision,
 				});
 				break;
 			}
 			case "buffer_message": {
-				if (!parsed.text || typeof parsed.text !== "string" || parsed.text.length > 100_000) {
-					break;
-				}
-				const result = setBufferedMessage(parsed.narratorId, parsed.text);
-				if (result.ok) {
-					broadcastToNarrator(parsed.narratorId, {
+				const bufResult = setBufferedMessage(msg.narratorId, msg.text);
+				if (bufResult.ok) {
+					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
-						narratorId: parsed.narratorId,
-						text: parsed.text,
-						bufferedAt: result.bufferedAt,
+						narratorId: msg.narratorId,
+						text: msg.text,
+						bufferedAt: bufResult.bufferedAt,
 					});
 				}
 				break;
 			}
 			case "cancel_buffer": {
-				clearBufferedMessage(parsed.narratorId);
-				broadcastToNarrator(parsed.narratorId, {
+				clearBufferedMessage(msg.narratorId);
+				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
-					narratorId: parsed.narratorId,
+					narratorId: msg.narratorId,
 					reason: "cancelled",
 				});
 				break;
-			}
-			default: {
-				logger.warn("Unknown narrator WS message type", { parsed });
 			}
 		}
 	},

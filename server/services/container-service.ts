@@ -126,13 +126,24 @@ export const containerService = {
 		}
 
 		// Query running containers to record instances
-		await this._recordContainerInstances(
-			chapterId,
-			chapter.worktreePath,
-			composeFile,
-			portMappings,
-			env,
-		);
+		try {
+			await this._recordContainerInstances(
+				chapterId,
+				chapter.worktreePath,
+				composeFile,
+				portMappings,
+				env,
+			);
+		} catch (recordErr) {
+			// Containers are running but DB has no record — tear them down to avoid port leak
+			logger.error("Failed to record container instances, running compose down to clean up", {
+				chapterId,
+				error: String(recordErr),
+			});
+			await exec(["compose", "-f", composeFile, "down"], chapter.worktreePath, env);
+			await portAllocator.release(chapterId);
+			throw new Error(`Containers started but recording failed, cleaned up: ${recordErr}`);
+		}
 
 		logger.info("Chapter containers started", { chapterId });
 		eventBus.emit({ type: "container:started", chapterId });

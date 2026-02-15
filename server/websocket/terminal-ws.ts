@@ -1,5 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import { logger } from "../lib/logger";
+import { terminalWsMessageSchema } from "../lib/validators";
 import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
@@ -70,20 +71,32 @@ export const handleTerminalWS = {
 	},
 
 	message(ws: TerminalWS, parsed: TerminalClientMessage) {
-		switch (parsed.type) {
+		const result = terminalWsMessageSchema.safeParse(parsed);
+		if (!result.success) {
+			logger.warn("Invalid terminal WS message", {
+				error: result.error.message,
+				parsed,
+			});
+			try {
+				ws.send(JSON.stringify({ type: "error", message: "Invalid message format" }));
+			} catch {
+				// connection may be dead
+			}
+			return;
+		}
+		const msg = result.data;
+
+		switch (msg.type) {
 			case "attach": {
-				attachToTerminal(ws, parsed.terminalId);
-				logger.debug("Terminal WS attached", { terminalId: parsed.terminalId });
+				attachToTerminal(ws, msg.terminalId);
+				logger.debug("Terminal WS attached", { terminalId: msg.terminalId });
 				break;
 			}
 			case "resize": {
 				if (ws.data.terminalId) {
-					terminalService.resize(ws.data.terminalId, parsed.cols, parsed.rows);
+					terminalService.resize(ws.data.terminalId, msg.cols, msg.rows);
 				}
 				break;
-			}
-			default: {
-				logger.warn("Unknown terminal WS message type", { parsed });
 			}
 		}
 	},

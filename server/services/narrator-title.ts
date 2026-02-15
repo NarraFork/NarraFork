@@ -1,7 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { type Locale, getPrompt } from "../lib/prompt-i18n";
+import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
@@ -85,11 +85,20 @@ export async function generateTitle(
 		return title;
 	})();
 
-	const timeoutPromise = new Promise<never>((_, reject) =>
-		setTimeout(() => reject(new Error("Title generation timed out")), TITLE_TIMEOUT_MS),
-	);
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	const timeoutPromise = new Promise<never>((_, reject) => {
+		timeoutHandle = setTimeout(
+			() => reject(new Error("Title generation timed out")),
+			TITLE_TIMEOUT_MS,
+		);
+	});
 
-	let title = await Promise.race([titlePromise, timeoutPromise]);
+	let title: string;
+	try {
+		title = await Promise.race([titlePromise, timeoutPromise]);
+	} finally {
+		clearTimeout(timeoutHandle);
+	}
 
 	// Clean up: remove surrounding quotes if present
 	title = title.trim().replace(/^["'""]+|["'""]+$/g, "");
@@ -147,11 +156,20 @@ export async function generateQuickTitle(
 			return title;
 		})();
 
-		const timeoutPromise = new Promise<never>((_, reject) =>
-			setTimeout(() => reject(new Error("Quick title generation timed out")), TITLE_TIMEOUT_MS),
-		);
+		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+		const timeoutPromise = new Promise<never>((_, reject) => {
+			timeoutHandle = setTimeout(
+				() => reject(new Error("Quick title generation timed out")),
+				TITLE_TIMEOUT_MS,
+			);
+		});
 
-		let title = await Promise.race([titlePromise, timeoutPromise]);
+		let title: string;
+		try {
+			title = await Promise.race([titlePromise, timeoutPromise]);
+		} finally {
+			clearTimeout(timeoutHandle);
+		}
 
 		title = title.trim().replace(/^["'""]+|["'""]+$/g, "");
 		title = title || "New conversation";
