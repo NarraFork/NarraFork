@@ -3,3 +3,4 @@ import { db } from "./index";
 
 migrate(db, { migrationsFolder: "./drizzle" });
 console.log("Migrations complete.");
+process.exit(0);

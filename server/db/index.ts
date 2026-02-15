@@ -182,16 +182,5 @@ sqlite.run(`
   ON narrator_messages(narrator_id, parent_tool_use_id)
 `);
 
-// User preferences table (per-account settings)
-sqlite.run(`
-  CREATE TABLE IF NOT EXISTS user_preferences (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-    auto_load_older_messages INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  )
-`);
-
 export const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 export { sqlite };
