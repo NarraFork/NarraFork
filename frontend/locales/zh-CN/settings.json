@@ -31,5 +31,9 @@
 	"sessionSection": "会话",
 	"autoLoadOlderMessages": "滚动时自动加载更早消息",
 	"autoLoadOlderMessagesDesc": "滚动到会话顶部时自动加载更早的消息",
+	"wordWrapSection": "默认自动换行",
+	"wordWrapMarkdown": "Markdown",
+	"wordWrapCode": "代码",
+	"wordWrapDiff": "Diff",
 	"unsavedSave": "保存更改"
 }

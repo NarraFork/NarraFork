@@ -16,10 +16,13 @@ import {
 	IconTextWrap,
 	IconTextWrapDisabled,
 } from "@tabler/icons-react";
-import { type CSSProperties, memo, type ReactNode, useState } from "react";
+import { type CSSProperties, memo, type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
+
+export type CodeContentType = "markdown" | "code" | "diff";
 
 interface CodeBlockWithActionsProps {
 	/** Text content to display and copy */
@@ -32,8 +35,12 @@ interface CodeBlockWithActionsProps {
 	diff?: { oldStr: string; newStr: string };
 	/** If true, render content as markdown instead of a code block */
 	markdown?: boolean;
+	/** Content type for word-wrap default preference. Defaults to "code". */
+	contentType?: CodeContentType;
 	/** Extra children rendered inside the wrapper (e.g. existing Code block) */
 	children?: ReactNode;
+	/** Render function receiving wordWrap state, used instead of children when wrap control is needed */
+	renderContent?: (wordWrap: boolean) => ReactNode;
 }
 
 /** Desktop: hidden by default, shown on hover */
@@ -55,14 +62,6 @@ const actionBarVisible: CSSProperties = {
 	...actionBarBase,
 	opacity: 1,
 	pointerEvents: "auto",
-};
-
-/** Mobile: always-visible strip below the code block with larger touch targets */
-const mobileBarStyle: CSSProperties = {
-	display: "flex",
-	justifyContent: "flex-end",
-	gap: 8,
-	paddingTop: 6,
 };
 
 /** Fullscreen modal toolbar */
@@ -89,13 +88,30 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 	title,
 	diff,
 	markdown,
+	contentType = "code",
 	children,
+	renderContent,
 }: CodeBlockWithActionsProps) {
 	const { t } = useTranslation("common");
+	const { data: userPrefs } = useUserPreferences();
+	const defaultWrap =
+		contentType === "markdown"
+			? (userPrefs?.wordWrapMarkdown ?? true)
+			: contentType === "diff"
+				? (userPrefs?.wordWrapDiff ?? true)
+				: (userPrefs?.wordWrapCode ?? true);
 	const [fullscreen, { open, close }] = useDisclosure(false);
 	const [hovered, setHovered] = useState(false);
-	const [wordWrap, setWordWrap] = useState(true);
+	const [wordWrap, setWordWrap] = useState(defaultWrap);
+	const userToggled = useRef(false);
 	const [landscape, setLandscape] = useState(false);
+
+	// Sync with user preferences once they load (unless user already toggled manually)
+	useEffect(() => {
+		if (!userToggled.current) {
+			setWordWrap(defaultWrap);
+		}
+	}, [defaultWrap]);
 	const isMobile = useMediaQuery("(max-width: 768px)");
 
 	const iconSize = isMobile ? 18 : 12;
@@ -139,7 +155,7 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 				size={btnSize}
 				variant="filled"
 				color={wordWrap ? "indigo" : "gray"}
-				onClick={() => setWordWrap((v) => !v)}
+				onClick={() => { userToggled.current = true; setWordWrap((v) => !v); }}
 				aria-label={wordWrap ? t("noWrap") : t("wordWrap")}
 			>
 				{wordWrap ? <IconTextWrap size={iconSize} /> : <IconTextWrapDisabled size={iconSize} />}
@@ -148,47 +164,37 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 	);
 
 	const wrapStyle: CSSProperties = wordWrap
-		? { whiteSpace: "pre-wrap", wordBreak: "break-all" }
+		? { whiteSpace: "pre-wrap", wordBreak: "break-all", overflowX: "hidden" }
 		: { whiteSpace: "pre", overflowX: "auto" };
 
 	return (
 		<>
 			<Box
 				pos="relative"
-				onMouseEnter={isMobile ? undefined : () => setHovered(true)}
-				onMouseLeave={isMobile ? undefined : () => setHovered(false)}
+				style={{ maxWidth: "100%", minWidth: 0 }}
+				onMouseEnter={() => setHovered(true)}
+				onMouseLeave={() => setHovered(false)}
 			>
-				{/* Desktop: floating overlay on hover */}
-				{!isMobile && (
-					<Group gap={2} style={hovered ? actionBarVisible : actionBarHidden}>
-						{wrapToggle}
-						{copyBtn}
-						{fullscreenBtn}
-					</Group>
-				)}
+				{/* Floating overlay on hover */}
+				<Group gap={2} style={hovered ? actionBarVisible : actionBarHidden}>
+					{wrapToggle}
+					{copyBtn}
+					{fullscreenBtn}
+				</Group>
 
 				{/* Inline content */}
-				{children ??
+				{renderContent
+					? renderContent(wordWrap)
+					: children ??
 					(markdown ? (
-						<ScrollArea.Autosize mah={style?.maxHeight ?? 480} type="auto">
-							<Box px="xs" py={4}>
-								<MarkdownContent text={content} />
-							</Box>
-						</ScrollArea.Autosize>
+						<Box px="xs" py={4} style={{ ...wrapStyle, maxHeight: style?.maxHeight ?? 480, overflowY: "auto" }}>
+							<MarkdownContent text={content} />
+						</Box>
 					) : (
 						<Code block style={{ ...style, ...wrapStyle }}>
 							{content}
 						</Code>
 					))}
-
-				{/* Mobile: always-visible bar below content */}
-				{isMobile && (
-					<div style={mobileBarStyle}>
-						{wrapToggle}
-						{copyBtn}
-						{fullscreenBtn}
-					</div>
-				)}
 			</Box>
 
 			{/* Fullscreen modal */}
@@ -240,9 +246,9 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 						}}
 					>
 						{diff ? (
-							<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} />
+							<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} wordWrap={wordWrap} />
 						) : markdown ? (
-							<Box px="md" py="xs" style={{ overflow: "auto", height: "100%" }}>
+							<Box px="md" py="xs" style={{ overflow: "auto", height: "100%", ...wrapStyle }}>
 								<MarkdownContent text={content} />
 							</Box>
 						) : (
@@ -263,10 +269,10 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 					</Box>
 				) : diff ? (
 					<Box style={{ flex: 1, minHeight: 0 }}>
-						<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} />
+						<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} wordWrap={wordWrap} />
 					</Box>
 				) : markdown ? (
-					<Box px="md" py="xs">
+					<Box px="md" py="xs" style={wrapStyle}>
 						<MarkdownContent text={content} />
 					</Box>
 				) : (

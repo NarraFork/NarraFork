@@ -10,6 +10,8 @@ interface DiffViewProps {
 	newStr: string;
 	/** Max height in px. Pass undefined to remove the limit. Defaults to 200. */
 	maxHeight?: number;
+	/** Enable word-wrap. Defaults to false (horizontal scroll). */
+	wordWrap?: boolean;
 }
 
 type DiffLine = {
@@ -186,15 +188,19 @@ const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
 
 // --- Exported component ---
 
-export const DiffView = memo(function DiffView({ oldStr, newStr, maxHeight = 200 }: DiffViewProps) {
+export const DiffView = memo(function DiffView({ oldStr, newStr, maxHeight = 200, wordWrap }: DiffViewProps) {
 	const lines = useMemo(() => computeDiff(oldStr, newStr), [oldStr, newStr]);
 
 	if (lines.length === 0) return null;
 
+	const wrapOverride = wordWrap
+		? { whiteSpace: "pre-wrap" as const, wordBreak: "break-all" as const, overflowX: "hidden" as const }
+		: {};
+
 	const style =
 		maxHeight != null
-			? { ...containerStyle, maxHeight }
-			: { ...containerStyle, maxHeight: undefined, overflow: "auto" as any, height: "100%" };
+			? { ...containerStyle, maxHeight, ...wrapOverride }
+			: { ...containerStyle, maxHeight: undefined, overflow: "auto" as any, height: "100%", ...wrapOverride };
 
 	return (
 		<Box style={style}>

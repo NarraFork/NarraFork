@@ -31,5 +31,9 @@
 	"sessionSection": "Session",
 	"autoLoadOlderMessages": "Auto-load older messages on scroll",
 	"autoLoadOlderMessagesDesc": "Automatically load earlier messages when scrolling to the top of a conversation",
+	"wordWrapSection": "Word Wrap Defaults",
+	"wordWrapMarkdown": "Markdown",
+	"wordWrapCode": "Code",
+	"wordWrapDiff": "Diff",
 	"unsavedSave": "Save Changes"
 }

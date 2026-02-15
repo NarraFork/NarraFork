@@ -11,6 +11,9 @@ export const userPreferencesRoutes = new Hono();
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
 	language: "en",
+	wordWrapMarkdown: true,
+	wordWrapCode: true,
+	wordWrapDiff: true,
 };
 
 userPreferencesRoutes.get("/", async (c) => {
@@ -32,17 +35,23 @@ userPreferencesRoutes.patch("/", async (c) => {
 
 	// Atomic upsert — avoids read-then-write race condition
 	sqlite.run(
-		`INSERT INTO user_preferences (id, user_id, auto_load_older_messages, language, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO user_preferences (id, user_id, auto_load_older_messages, language, word_wrap_markdown, word_wrap_code, word_wrap_diff, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
+		   word_wrap_markdown = COALESCE(?, word_wrap_markdown),
+		   word_wrap_code = COALESCE(?, word_wrap_code),
+		   word_wrap_diff = COALESCE(?, word_wrap_diff),
 		   updated_at = ?`,
 		[
 			id,
 			userId,
 			(parsed.data.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
 			parsed.data.language ?? DEFAULTS.language,
+			(parsed.data.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
+			(parsed.data.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
+			(parsed.data.wordWrapDiff ?? DEFAULTS.wordWrapDiff) ? 1 : 0,
 			now,
 			now,
 			parsed.data.autoLoadOlderMessages != null
@@ -51,6 +60,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 					: 0
 				: null,
 			parsed.data.language ?? null,
+			parsed.data.wordWrapMarkdown != null ? (parsed.data.wordWrapMarkdown ? 1 : 0) : null,
+			parsed.data.wordWrapCode != null ? (parsed.data.wordWrapCode ? 1 : 0) : null,
+			parsed.data.wordWrapDiff != null ? (parsed.data.wordWrapDiff ? 1 : 0) : null,
 			now,
 		],
 	);

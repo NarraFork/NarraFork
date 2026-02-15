@@ -310,16 +310,19 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 				<CodeBlockWithActions
 					content={`--- old\n${toolCall.inputJson.old_string}\n+++ new\n${toolCall.inputJson.new_string ?? ""}`}
 					title={fp ? basename(fp) : "Diff"}
+					contentType="diff"
 					diff={{
 						oldStr: toolCall.inputJson.old_string,
 						newStr: toolCall.inputJson.new_string ?? "",
 					}}
-				>
-					<DiffView
-						oldStr={toolCall.inputJson.old_string}
-						newStr={toolCall.inputJson.new_string ?? ""}
-					/>
-				</CodeBlockWithActions>
+					renderContent={(wordWrap) => (
+						<DiffView
+							oldStr={toolCall.inputJson.old_string}
+							newStr={toolCall.inputJson.new_string ?? ""}
+							wordWrap={wordWrap}
+						/>
+					)}
+				/>
 			)}
 			{!isEdit && toolCall.outputJson && (
 				<>
@@ -605,7 +608,7 @@ function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	return (
 		<Box mt="xs">
-			<CodeBlockWithActions content={planText} markdown title={`Plan — ${toolCall.toolName}`} />
+			<CodeBlockWithActions content={planText} markdown contentType="markdown" title={`Plan — ${toolCall.toolName}`} />
 		</Box>
 	);
 }
@@ -714,7 +717,7 @@ function InlinePermission({
 		<Box mt="xs">
 			{planText && (
 				<Box mb="xs">
-					<CodeBlockWithActions content={planText} markdown title="Plan" />
+					<CodeBlockWithActions content={planText} markdown contentType="markdown" title="Plan" />
 				</Box>
 			)}
 			{permission.decisionReason && (
