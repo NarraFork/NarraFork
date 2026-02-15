@@ -13,6 +13,8 @@
 	"workingDirectoryPlaceholder": "/path/to/directory",
 	"model": "Model",
 	"modelHint": "Leave empty to use the default model from settings",
+	"startInPlanMode": "Start in plan mode",
+	"startInPlanModeHint": "Narrator will plan before executing, requiring your approval before implementation",
 	"addToFavorites": "Add to favorites",
 	"favoriteDirectories": "Favorites",
 	"cwdLabel": "{{path}}",

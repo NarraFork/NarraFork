@@ -127,6 +127,7 @@ export const api = {
 		systemPrompt?: string;
 		permissionMode?: string;
 		cwd?: string;
+		sdkPlanMode?: boolean;
 	}) => request<any>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	archiveNarrator: (id: string) => request<any>(`/narrators/${id}/archive`, { method: "PATCH" }),
 	unarchiveNarrator: (id: string) =>
@@ -201,9 +202,20 @@ export const api = {
 
 	// User Preferences
 	getUserPreferences: () =>
-		request<{ autoLoadOlderMessages: boolean; language: string }>("/user-preferences"),
-	updateUserPreferences: (data: { autoLoadOlderMessages?: boolean; language?: string }) =>
-		request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
+		request<{
+			autoLoadOlderMessages: boolean;
+			language: string;
+			wordWrapMarkdown: boolean;
+			wordWrapCode: boolean;
+			wordWrapDiff: boolean;
+		}>("/user-preferences"),
+	updateUserPreferences: (data: {
+		autoLoadOlderMessages?: boolean;
+		language?: string;
+		wordWrapMarkdown?: boolean;
+		wordWrapCode?: boolean;
+		wordWrapDiff?: boolean;
+	}) => request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Containers
 	getContainers: (chapterId: string) => request<any[]>(`/chapters/${chapterId}/containers`),

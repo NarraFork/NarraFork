@@ -13,6 +13,7 @@ interface NarratorWSCallbacks {
 	onTodosUpdated?: (todos: any[], toolUseId?: string) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "session_error") => void;
+	onSdkPlanModeChanged?: (sdkPlanMode: boolean) => void;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -88,6 +89,9 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							break;
 						case "buffer_cleared":
 							callbacksRef.current.onBufferCleared?.(data.reason);
+							break;
+						case "sdk_plan_mode_changed":
+							callbacksRef.current.onSdkPlanModeChanged?.(data.sdkPlanMode);
 							break;
 					}
 				} catch {
@@ -208,7 +212,8 @@ export function useSessionsListWS(narratorIds: string[], onUpdate: () => void) {
 						data.type === "status_change" ||
 						data.type === "narrator:status_changed" ||
 						data.type === "title_updated" ||
-						data.type === "narrator:title_updated"
+						data.type === "narrator:title_updated" ||
+						data.type === "sdk_plan_mode_changed"
 					) {
 						onUpdateRef.current();
 					}

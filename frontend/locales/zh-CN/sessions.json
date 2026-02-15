@@ -13,6 +13,8 @@
 	"workingDirectoryPlaceholder": "/path/to/directory",
 	"model": "模型",
 	"modelHint": "留空则使用设置中的默认模型",
+	"startInPlanMode": "以计划模式启动",
+	"startInPlanModeHint": "叙述者会先制定计划再执行，需要你批准后才会实施",
 	"addToFavorites": "添加到收藏",
 	"favoriteDirectories": "收藏目录",
 	"cwdLabel": "{{path}}",

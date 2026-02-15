@@ -49,9 +49,10 @@ export const createNarratorSchema = z.object({
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
 	permissionMode: z
-		.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"])
+		.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"])
 		.optional(),
 	cwd: z.string().min(1).max(4096).optional(),
+	sdkPlanMode: z.boolean().optional(),
 });
 
 export const sendMessageSchema = z.object({
@@ -181,4 +182,7 @@ export const reorderFavoriteDirectoriesSchema = z.object({
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
 	language: z.enum(["en", "zh-CN"]).optional(),
+	wordWrapMarkdown: z.boolean().optional(),
+	wordWrapCode: z.boolean().optional(),
+	wordWrapDiff: z.boolean().optional(),
 });

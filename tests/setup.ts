@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS narrators (
 	model TEXT DEFAULT 'claude-sonnet',
 	system_prompt TEXT,
 	permission_mode TEXT DEFAULT 'default',
+	sdk_plan_mode INTEGER NOT NULL DEFAULT 0,
 	message_count INTEGER DEFAULT 0,
 	total_cost_usd REAL DEFAULT 0,
 	last_message_at TEXT,

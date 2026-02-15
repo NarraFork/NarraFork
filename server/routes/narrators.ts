@@ -203,7 +203,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	const id = c.req.param("id");
 	const { permissionMode } = await c.req.json();
-	const validModes = ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"];
+	const validModes = ["default", "acceptEdits", "bypassPermissions", "dontAsk"];
 	if (!permissionMode || !validModes.includes(permissionMode)) {
 		throw new ValidationError(`permissionMode must be one of: ${validModes.join(", ")}`);
 	}

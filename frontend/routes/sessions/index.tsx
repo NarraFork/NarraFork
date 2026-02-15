@@ -3,6 +3,7 @@ import {
 	Badge,
 	Button,
 	Card,
+	Checkbox,
 	Group,
 	Loader,
 	Modal,
@@ -54,6 +55,7 @@ function SessionsPage() {
 	const { i18n } = useTranslation();
 	const [cwd, setCwd] = useState("");
 	const [selectedModel, setSelectedModel] = useState("");
+	const [planMode, setPlanMode] = useState(false);
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
@@ -94,12 +96,14 @@ function SessionsPage() {
 			{
 				...(cwd ? { cwd } : {}),
 				...(selectedModel ? { model: selectedModel } : {}),
+				...(planMode ? { sdkPlanMode: true } : {}),
 			},
 			{
 				onSuccess: (data: any) => {
 					close();
 					setCwd("");
 					setSelectedModel("");
+					setPlanMode(false);
 					navigate({ to: "/sessions/$sessionId", params: { sessionId: data.id } });
 				},
 			},
@@ -110,6 +114,7 @@ function SessionsPage() {
 		close();
 		setCwd("");
 		setSelectedModel("");
+		setPlanMode(false);
 	};
 
 	return (
@@ -160,7 +165,14 @@ function SessionsPage() {
 											<Text fw={500}>
 												{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
 											</Text>
-											{session.status === "thinking" && <Loader size={14} />}
+											{session.status === "thinking" && (
+												<Loader size={14} color={session.sdkPlanMode ? "green" : undefined} />
+											)}
+											{session.status === "thinking" && session.sdkPlanMode && (
+												<Badge size="xs" color="green">
+													{tn("status_planning")}
+												</Badge>
+											)}
 											{session.status &&
 												session.status !== "idle" &&
 												session.status !== "thinking" && (
@@ -276,6 +288,13 @@ function SessionsPage() {
 						onChange={(v) => setSelectedModel(v ?? "")}
 						placeholder={settingsData?.agent?.defaultModel ?? "claude-sonnet"}
 						clearable
+					/>
+
+					<Checkbox
+						label={t("startInPlanMode")}
+						description={t("startInPlanModeHint")}
+						checked={planMode}
+						onChange={(e) => setPlanMode(e.currentTarget.checked)}
 					/>
 
 					<Button onClick={handleCreate} loading={createSession.isPending}>

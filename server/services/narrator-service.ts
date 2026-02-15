@@ -68,6 +68,7 @@ interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
+	sdkPlanMode?: boolean;
 }
 
 export const narratorService = {
@@ -96,6 +97,11 @@ export const narratorService = {
 
 		const now = new Date().toISOString();
 		const id = generateId();
+		const resolvedPermMode = (input.permissionMode ?? settings.agent.defaultPermissionMode) as
+			| "default"
+			| "acceptEdits"
+			| "bypassPermissions"
+			| "dontAsk";
 
 		const [narrator] = await db
 			.insert(narrators)
@@ -105,12 +111,8 @@ export const narratorService = {
 				type,
 				model: input.model ?? settings.agent.defaultModel,
 				systemPrompt: input.systemPrompt,
-				permissionMode: (input.permissionMode ?? settings.agent.defaultPermissionMode) as
-					| "default"
-					| "acceptEdits"
-					| "bypassPermissions"
-					| "plan"
-					| "dontAsk",
+				permissionMode: resolvedPermMode,
+				sdkPlanMode: input.sdkPlanMode ?? false,
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
@@ -402,12 +404,20 @@ export const narratorService = {
 
 	async updatePermissionMode(
 		narratorId: string,
-		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk",
+		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "dontAsk",
 	) {
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
 			.set({ permissionMode, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
+	async updateSdkPlanMode(narratorId: string, sdkPlanMode: boolean) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ sdkPlanMode, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 	},
 

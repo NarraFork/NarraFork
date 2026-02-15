@@ -351,7 +351,7 @@ export async function* startSession(
 			systemPrompt: narrator.systemPrompt
 				? { type: "preset", preset: "claude_code", append: narrator.systemPrompt }
 				: undefined,
-			permissionMode: "default" as PermissionMode,
+			permissionMode: (narrator.sdkPlanMode ? "plan" : "default") as PermissionMode,
 			canUseTool: (toolName, input, opts) => handlePermission(narratorId, toolName, input, opts),
 			abortController,
 			settingSources: ["user"],
@@ -461,6 +461,25 @@ async function processSDKMessage(
 						todos: todoBlock.input.todos,
 						toolUseId: todoBlock.id,
 					});
+				}
+
+				// Track EnterPlanMode / ExitPlanMode tool invocations for sdkPlanMode
+				for (const block of assistantContent) {
+					if (block.type === "tool_use" && block.name === "EnterPlanMode") {
+						await narratorService.updateSdkPlanMode(narratorId, true);
+						broadcastToNarrator(narratorId, {
+							type: "sdk_plan_mode_changed",
+							narratorId,
+							sdkPlanMode: true,
+						});
+					} else if (block.type === "tool_use" && block.name === "ExitPlanMode") {
+						await narratorService.updateSdkPlanMode(narratorId, false);
+						broadcastToNarrator(narratorId, {
+							type: "sdk_plan_mode_changed",
+							narratorId,
+							sdkPlanMode: false,
+						});
+					}
 				}
 			}
 

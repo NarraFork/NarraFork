@@ -35,6 +35,7 @@ export type NarratorServerMessage =
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "session_error" }
+	| { type: "sdk_plan_mode_changed"; narratorId: string; sdkPlanMode: boolean }
 	| { type: "error"; message: string };
 
 // Client → Server messages

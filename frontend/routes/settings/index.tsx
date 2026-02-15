@@ -16,7 +16,6 @@ import {
 } from "@mantine/core";
 import {
 	IconHandStop,
-	IconListCheck,
 	IconPencilCheck,
 	IconShield,
 	IconShieldOff,
@@ -285,7 +284,6 @@ function SettingsPage() {
 							{ value: "default", label: tn("perm_default") },
 							{ value: "acceptEdits", label: tn("perm_acceptEdits") },
 							{ value: "bypassPermissions", label: tn("perm_bypassPermissions") },
-							{ value: "plan", label: tn("perm_plan") },
 							{ value: "dontAsk", label: tn("perm_dontAsk") },
 						]}
 						leftSection={
@@ -295,8 +293,6 @@ function SettingsPage() {
 								<IconPencilCheck size={14} />
 							) : permissionMode === "bypassPermissions" ? (
 								<IconShieldOff size={14} />
-							) : permissionMode === "plan" ? (
-								<IconListCheck size={14} />
 							) : permissionMode === "dontAsk" ? (
 								<IconHandStop size={14} />
 							) : (
@@ -308,7 +304,6 @@ function SettingsPage() {
 								default: <IconShield size={14} />,
 								acceptEdits: <IconPencilCheck size={14} />,
 								bypassPermissions: <IconShieldOff size={14} />,
-								plan: <IconListCheck size={14} />,
 								dontAsk: <IconHandStop size={14} />,
 							};
 							return (
@@ -466,6 +461,34 @@ function SettingsPage() {
 						checked={userPrefs?.autoLoadOlderMessages ?? true}
 						onChange={(e) =>
 							updateUserPref.mutate({ autoLoadOlderMessages: e.currentTarget.checked })
+						}
+					/>
+				</Stack>
+			</Paper>
+
+			{/* Word Wrap Defaults (per-user preferences) */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("wordWrapSection")}</Title>
+					<Switch
+						label={t("wordWrapMarkdown")}
+						checked={userPrefs?.wordWrapMarkdown ?? true}
+						onChange={(e) =>
+							updateUserPref.mutate({ wordWrapMarkdown: e.currentTarget.checked })
+						}
+					/>
+					<Switch
+						label={t("wordWrapCode")}
+						checked={userPrefs?.wordWrapCode ?? true}
+						onChange={(e) =>
+							updateUserPref.mutate({ wordWrapCode: e.currentTarget.checked })
+						}
+					/>
+					<Switch
+						label={t("wordWrapDiff")}
+						checked={userPrefs?.wordWrapDiff ?? true}
+						onChange={(e) =>
+							updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })
 						}
 					/>
 				</Stack>

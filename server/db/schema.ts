@@ -70,7 +70,7 @@ export const narrators = sqliteTable(
 		model: text("model").default("claude-sonnet"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
-			enum: ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"],
+			enum: ["default", "acceptEdits", "bypassPermissions", "dontAsk"],
 		}).default("default"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
@@ -78,6 +78,7 @@ export const narrators = sqliteTable(
 		status: text("status", { enum: ["idle", "thinking", "waiting", "done", "archived", "error"] })
 			.notNull()
 			.default("idle"),
+		sdkPlanMode: integer("sdk_plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
 		errorMessage: text("error_message"),
 		todosJson: text("todos_json", { mode: "json" }),
@@ -213,6 +214,9 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	language: text("language").notNull().default("en"),
+	wordWrapMarkdown: integer("word_wrap_markdown", { mode: "boolean" }).notNull().default(true),
+	wordWrapCode: integer("word_wrap_code", { mode: "boolean" }).notNull().default(true),
+	wordWrapDiff: integer("word_wrap_diff", { mode: "boolean" }).notNull().default(true),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
