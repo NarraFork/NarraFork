@@ -85,9 +85,21 @@ class NarraForkEventBus {
 
 	emit(event: NarraForkEvent): void {
 		logger.debug("Event emitted", { eventType: event.type, ...event });
-		this.emitter.emit(event.type, event);
-		// Also emit a wildcard for catch-all subscribers (e.g. WS broadcast)
-		this.emitter.emit("*", event);
+		// Manually iterate listeners with try-catch so one failure doesn't break others
+		for (const eventName of [event.type, "*"]) {
+			const listeners = this.emitter.rawListeners(eventName);
+			for (const listener of listeners) {
+				try {
+					(listener as (e: NarraForkEvent) => void)(event);
+				} catch (err) {
+					logger.error("Event listener threw an error", {
+						eventType: event.type,
+						listenedEvent: eventName,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		}
 	}
 
 	on<T extends NarraForkEventType>(type: T, handler: EventHandler<T>): void {

@@ -124,38 +124,46 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const locale = await getUserLanguage(userId);
 
 	return streamSSE(c, async (stream) => {
-		const MAX_CHAIN_DEPTH = 10;
-		let chainCount = 0;
-		let sessionGen = startSession(id, message, images, locale);
-		while (chainCount < MAX_CHAIN_DEPTH) {
-			chainCount++;
-			let feedbackMessage: string | null = null;
-			let bufferedSend: { message: string; images?: any[] } | null = null;
-			for await (const event of sessionGen) {
-				if (event.type === "auto_feedback") {
-					// Session was interrupted for "allow with feedback" — start a new session
-					feedbackMessage = event.data.message;
-					break;
+		try {
+			const MAX_CHAIN_DEPTH = 10;
+			let chainCount = 0;
+			let sessionGen = startSession(id, message, images, locale);
+			while (chainCount < MAX_CHAIN_DEPTH) {
+				chainCount++;
+				let feedbackMessage: string | null = null;
+				let bufferedSend: { message: string; images?: any[] } | null = null;
+				for await (const event of sessionGen) {
+					if (event.type === "auto_feedback") {
+						// Session was interrupted for "allow with feedback" — start a new session
+						feedbackMessage = event.data.message;
+						break;
+					}
+					if (event.type === "buffered_send") {
+						// User queued a message while narrator was thinking — chain into new session
+						bufferedSend = event.data;
+						break;
+					}
+					await stream.writeSSE({
+						event: event.type,
+						data: JSON.stringify(event.data),
+					});
 				}
-				if (event.type === "buffered_send") {
-					// User queued a message while narrator was thinking — chain into new session
-					bufferedSend = event.data;
-					break;
+				if (feedbackMessage) {
+					sessionGen = startSession(id, feedbackMessage, undefined, locale);
+					continue;
 				}
-				await stream.writeSSE({
-					event: event.type,
-					data: JSON.stringify(event.data),
-				});
+				if (bufferedSend) {
+					sessionGen = startSession(id, bufferedSend.message, bufferedSend.images, locale);
+					continue;
+				}
+				break;
 			}
-			if (feedbackMessage) {
-				sessionGen = startSession(id, feedbackMessage, undefined, locale);
-				continue;
-			}
-			if (bufferedSend) {
-				sessionGen = startSession(id, bufferedSend.message, bufferedSend.images, locale);
-				continue;
-			}
-			break;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : "Internal stream error";
+			await stream.writeSSE({
+				event: "error",
+				data: JSON.stringify({ error: message }),
+			});
 		}
 	});
 });
