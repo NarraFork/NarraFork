@@ -15,7 +15,7 @@ export default defineConfig({
 		}),
 		react(),
 		VitePWA({
-			registerType: "prompt",
+			registerType: "autoUpdate",
 			includeAssets: ["favicon.svg", "apple-touch-icon-180x180.png"],
 			manifest: {
 				name: "NarraFork",
@@ -60,6 +60,14 @@ export default defineConfig({
 	build: {
 		outDir: resolve(__dirname, "..", "dist", "frontend"),
 		emptyOutDir: true,
+		rollupOptions: {
+			output: {
+				manualChunks: {
+					xterm: ["@xterm/xterm", "@xterm/addon-fit"],
+				},
+			},
+		},
+		minify: "terser",
 	},
 	server: {
 		port: 41221,

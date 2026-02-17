@@ -14,9 +14,9 @@ function DashboardPage() {
 		queryKey: ["projects"],
 		queryFn: () => api.listProjects(),
 	});
-	const { data: sessions } = useQuery({
-		queryKey: ["narrators", { standalone: true }],
-		queryFn: () => api.listNarrators({ standalone: true }),
+	const { data: sessionsData } = useQuery({
+		queryKey: ["narrators", "count", { standalone: true }],
+		queryFn: () => api.listNarratorsPaginated({ standalone: true, limit: 1 }),
 	});
 
 	if (projectsLoading) return <Loader />;
@@ -43,7 +43,7 @@ function DashboardPage() {
 				/>
 				<StatCard
 					label={t("standaloneSessions")}
-					value={sessions?.length ?? 0}
+					value={sessionsData?.totalCount ?? 0}
 					color="violet"
 					to="/sessions"
 				/>
@@ -61,7 +61,7 @@ function DashboardPage() {
 								withBorder
 								component={Link}
 								to="/projects/$projectId"
-								params={{ projectId: project.id }}
+								params={{ projectId: project.id } as any}
 								style={{ textDecoration: "none" }}
 							>
 								<Group justify="space-between" mb="xs">

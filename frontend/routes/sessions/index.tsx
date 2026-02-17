@@ -26,14 +26,18 @@ import {
 } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useCreateFavoriteDirectory,
 	useDeleteFavoriteDirectory,
 	useFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
-import { useArchiveNarrator, useCreateNarrator, useNarrators } from "../../hooks/useNarrator";
+import {
+	useArchiveNarrator,
+	useCreateNarrator,
+	useNarratorsPaginated,
+} from "../../hooks/useNarrator";
 import { useSessionsListWS } from "../../hooks/useNarratorWS";
 import { api } from "../../lib/api";
 import { BUILTIN_MODELS, NARRATOR_STATUS_COLORS } from "../../lib/constants";
@@ -45,7 +49,17 @@ export const Route = createFileRoute("/sessions/")({
 function SessionsPage() {
 	const [sortBy, setSortBy] = useState("updatedAt");
 	const [sortOrder, setSortOrder] = useState("desc");
-	const { data: sessions, isLoading } = useNarrators({ standalone: true, sortBy, sortOrder });
+	const {
+		data: paginatedData,
+		isLoading,
+		hasNextPage,
+		fetchNextPage,
+		isFetchingNextPage,
+	} = useNarratorsPaginated({ standalone: true, sortBy, sortOrder });
+	const sessions = useMemo(
+		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
+		[paginatedData],
+	);
 	const createSession = useCreateNarrator();
 	const archiveSession = useArchiveNarrator();
 	const [opened, { open, close }] = useDisclosure(false);
@@ -57,6 +71,7 @@ function SessionsPage() {
 	const [selectedModel, setSelectedModel] = useState("");
 	const [planMode, setPlanMode] = useState(false);
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
+	const [navigatingId, setNavigatingId] = useState<string | null>(null);
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -72,10 +87,48 @@ function SessionsPage() {
 		return [...BUILTIN_MODELS, ...(customModels ?? [])];
 	}, [customModels]);
 
-	const sessionIds = useMemo(() => (sessions ?? []).map((s: any) => s.id), [sessions]);
-	useSessionsListWS(sessionIds, () => {
-		qc.invalidateQueries({ queryKey: ["narrators"] });
+	const sessionIds = useMemo(() => sessions.map((s: any) => s.id), [sessions]);
+	useSessionsListWS(sessionIds, (narratorId, event) => {
+		if (!narratorId) {
+			// Fallback: no narratorId in event, invalidate all
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			return;
+		}
+		// Targeted update of the specific session in paginated cache
+		qc.setQueryData(
+			["narrators", "paginated", { standalone: true, sortBy, sortOrder }],
+			(old: any) => {
+				if (!old?.pages) return old;
+				let changed = false;
+				const pages = old.pages.map((page: any) => ({
+					...page,
+					items: page.items.map((item: any) => {
+						if (item.id !== narratorId) return item;
+						changed = true;
+						return {
+							...item,
+							...(event.status !== undefined ? { status: event.status } : {}),
+							...(event.title !== undefined ? { title: event.title } : {}),
+							...(event.sdkPlanMode !== undefined ? { sdkPlanMode: event.sdkPlanMode } : {}),
+							updatedAt: new Date().toISOString(),
+						};
+					}),
+				}));
+				return changed ? { ...old, pages } : old;
+			},
+		);
 	});
+
+	// Infinite scroll sentinel
+	const sentinelRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (!sentinelRef.current || !hasNextPage) return;
+		const observer = new IntersectionObserver(([entry]) => {
+			if (entry.isIntersecting && !isFetchingNextPage) fetchNextPage();
+		});
+		observer.observe(sentinelRef.current);
+		return () => observer.disconnect();
+	}, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
 	const sortOptions = useMemo(
 		() => [
@@ -88,6 +141,15 @@ function SessionsPage() {
 	);
 
 	const toggleSortOrder = () => setSortOrder((prev) => (prev === "desc" ? "asc" : "desc"));
+
+	const handleSessionClick = useCallback(
+		(sessionId: string) => {
+			if (navigatingId) return;
+			setNavigatingId(sessionId);
+			navigate({ to: "/sessions/$sessionId", params: { sessionId } });
+		},
+		[navigate, navigatingId],
+	);
 
 	const isFavorited = favorites?.some((f: any) => f.path === cwd);
 
@@ -119,7 +181,8 @@ function SessionsPage() {
 
 	return (
 		<Stack>
-			<Group justify="space-between">
+			{/* Desktop header */}
+			<Group justify="space-between" visibleFrom="sm">
 				<Title order={2}>{t("title")}</Title>
 				<Group gap="xs">
 					<Select
@@ -146,74 +209,141 @@ function SessionsPage() {
 				</Group>
 			</Group>
 
+			{/* Mobile header */}
+			<Stack gap="xs" hiddenFrom="sm">
+				<Group justify="space-between">
+					<Title order={3}>{t("title")}</Title>
+					<Button size="xs" onClick={open}>
+						{t("newSession")}
+					</Button>
+				</Group>
+				<Group gap="xs">
+					<Select
+						size="xs"
+						style={{ flex: 1 }}
+						data={sortOptions}
+						value={sortBy}
+						onChange={(v) => v && setSortBy(v)}
+						allowDeselect={false}
+					/>
+					<Tooltip label={sortOrder === "desc" ? t("sortDescending") : t("sortAscending")}>
+						<ActionIcon variant="subtle" size="sm" onClick={toggleSortOrder}>
+							{sortOrder === "desc" ? (
+								<IconSortDescending size={16} />
+							) : (
+								<IconSortAscending size={16} />
+							)}
+						</ActionIcon>
+					</Tooltip>
+					<Button variant="subtle" size="xs" component={Link} to="/sessions/archived">
+						{t("viewArchived")}
+					</Button>
+				</Group>
+			</Stack>
+
 			{isLoading ? (
 				<Loader />
-			) : !sessions?.length ? (
+			) : !sessions.length ? (
 				<Text c="dimmed">{t("noSessions")}</Text>
 			) : (
 				<Stack>
-					{sessions.map((session: any) => (
-						<Card key={session.id} shadow="sm" padding="md" withBorder>
-							<Group justify="space-between">
-								<Link
-									to="/sessions/$sessionId"
-									params={{ sessionId: session.id }}
-									style={{ textDecoration: "none", color: "inherit", flex: 1, minWidth: 0 }}
-								>
-									<div>
-										<Group gap="xs">
-											<Text fw={500}>
-												{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
-											</Text>
-											{session.status === "thinking" && (
-												<Loader size={14} color={session.sdkPlanMode ? "green" : undefined} />
-											)}
-											{session.status === "thinking" && session.sdkPlanMode && (
-												<Badge size="xs" color="green">
-													{tn("status_planning")}
-												</Badge>
-											)}
-											{session.status &&
-												session.status !== "idle" &&
-												session.status !== "thinking" && (
-													<Badge size="xs" color={NARRATOR_STATUS_COLORS[session.status] ?? "gray"}>
-														{tn(`status_${session.status}`)}
+					{sessions.map((session: any) => {
+						const isNavigating = navigatingId === session.id;
+						return (
+							<Card
+								key={session.id}
+								shadow="sm"
+								padding="md"
+								withBorder
+								style={{
+									cursor: "pointer",
+									transition: "transform 80ms ease, opacity 150ms ease",
+									opacity: navigatingId && !isNavigating ? 0.5 : 1,
+									WebkitTapHighlightColor: "transparent",
+								}}
+								onClick={() => handleSessionClick(session.id)}
+								onPointerDown={(e: React.PointerEvent<HTMLDivElement>) => {
+									e.currentTarget.style.transform = "scale(0.985)";
+								}}
+								onPointerUp={(e: React.PointerEvent<HTMLDivElement>) => {
+									e.currentTarget.style.transform = "";
+								}}
+								onPointerLeave={(e: React.PointerEvent<HTMLDivElement>) => {
+									e.currentTarget.style.transform = "";
+								}}
+							>
+								<Group justify="space-between">
+									<div style={{ flex: 1, minWidth: 0 }}>
+										<div>
+											<Group gap="xs">
+												<Text fw={500}>
+													{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
+												</Text>
+												{session.status === "thinking" && (
+													<Loader size={14} color={session.sdkPlanMode ? "green" : undefined} />
+												)}
+												{session.status === "thinking" && session.sdkPlanMode && (
+													<Badge size="xs" color="green">
+														{tn("status_planning")}
 													</Badge>
 												)}
-										</Group>
-										<Text size="sm" c="dimmed">
-											{t("sessionMeta", {
-												model: session.model,
-												count: session.messageCount ?? 0,
-											})}
-										</Text>
-										{session.cwd && (
-											<Text size="xs" c="dimmed" truncate>
-												{t("cwdLabel", { path: session.cwd })}
+												{session.status &&
+													session.status !== "idle" &&
+													session.status !== "thinking" && (
+														<Badge
+															size="xs"
+															color={NARRATOR_STATUS_COLORS[session.status] ?? "gray"}
+														>
+															{tn(`status_${session.status}`)}
+														</Badge>
+													)}
+											</Group>
+											<Text size="sm" c="dimmed">
+												{t("sessionMeta", {
+													model: session.model,
+													count: session.messageCount ?? 0,
+												})}
 											</Text>
-										)}
+											{session.cwd && (
+												<Text size="xs" c="dimmed" truncate>
+													{t("cwdLabel", { path: session.cwd })}
+												</Text>
+											)}
+										</div>
 									</div>
-								</Link>
-								<Group>
-									<Text size="xs" c="dimmed">
-										{new Date(
-											sortBy === "updatedAt" ? session.updatedAt : session.createdAt,
-										).toLocaleDateString(i18n.language)}
-									</Text>
-									<Tooltip label={t("archive")}>
-										<ActionIcon
-											size="sm"
-											color="orange"
-											variant="subtle"
-											onClick={() => setConfirmArchiveId(session.id)}
-										>
-											<IconArchive size={16} />
-										</ActionIcon>
-									</Tooltip>
+									<Group>
+										<Text size="xs" c="dimmed">
+											{new Date(
+												sortBy === "updatedAt" ? session.updatedAt : session.createdAt,
+											).toLocaleDateString(i18n.language)}
+										</Text>
+										<Tooltip label={t("archive")}>
+											<ActionIcon
+												size="sm"
+												color="orange"
+												variant="subtle"
+												onClick={(e: React.MouseEvent) => {
+													e.stopPropagation();
+													setConfirmArchiveId(session.id);
+												}}
+											>
+												<IconArchive size={16} />
+											</ActionIcon>
+										</Tooltip>
+									</Group>
 								</Group>
-							</Group>
-						</Card>
-					))}
+							</Card>
+						);
+					})}
+					<div ref={sentinelRef} style={{ height: 1 }} />
+					{isFetchingNextPage && (
+						<Group justify="center" py="md">
+							<Loader size="sm" />
+							<Text size="sm" c="dimmed">
+								{t("loadingMore")}
+							</Text>
+						</Group>
+					)}
 				</Stack>
 			)}
 

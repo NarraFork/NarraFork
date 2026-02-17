@@ -2,6 +2,7 @@ import {
 	Badge,
 	Box,
 	Button,
+	Center,
 	Code,
 	Collapse,
 	Group,
@@ -102,7 +103,12 @@ function ChapterDetailPage() {
 		document.addEventListener("mouseup", onMouseUp);
 	}, []);
 
-	if (isLoading) return <Loader />;
+	if (isLoading)
+		return (
+			<Center h="calc(100dvh - 60px)">
+				<Loader />
+			</Center>
+		);
 	if (!chapter) return <Text>{t("chapterNotFound")}</Text>;
 
 	const primaryNarrator = narratorList?.find((n: any) => n.type === "primary");
@@ -185,7 +191,11 @@ function ChapterDetailPage() {
 			</Box>
 
 			{/* Narrator panel */}
-			<Box mx="calc(var(--mantine-spacing-md) * -1)" mb="calc(var(--mantine-spacing-md) * -1)" style={{ flex: 1, minHeight: MIN_PANEL_HEIGHT, overflow: "hidden" }}>
+			<Box
+				mx="calc(var(--mantine-spacing-md) * -1)"
+				mb="calc(var(--mantine-spacing-md) * -1)"
+				style={{ flex: 1, minHeight: MIN_PANEL_HEIGHT, overflow: "hidden" }}
+			>
 				{narratorsLoading ? (
 					<Loader />
 				) : primaryNarrator ? (

@@ -11,18 +11,39 @@ import {
 } from "@mantine/core";
 import { IconArchiveOff } from "@tabler/icons-react";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarrators, useUnarchiveNarrator } from "../../hooks/useNarrator";
+import { useNarratorsPaginated, useUnarchiveNarrator } from "../../hooks/useNarrator";
 
 export const Route = createFileRoute("/sessions/archived")({
 	component: ArchivedSessionsPage,
 });
 
 function ArchivedSessionsPage() {
-	const { data: sessions, isLoading } = useNarrators({ standalone: true, status: "archived" });
+	const {
+		data: paginatedData,
+		isLoading,
+		hasNextPage,
+		fetchNextPage,
+		isFetchingNextPage,
+	} = useNarratorsPaginated({ standalone: true, status: "archived" });
+	const sessions = useMemo(
+		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
+		[paginatedData],
+	);
 	const unarchiveSession = useUnarchiveNarrator();
 	const { t } = useTranslation("sessions");
 	const { i18n } = useTranslation();
+
+	const sentinelRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (!sentinelRef.current || !hasNextPage) return;
+		const observer = new IntersectionObserver(([entry]) => {
+			if (entry.isIntersecting && !isFetchingNextPage) fetchNextPage();
+		});
+		observer.observe(sentinelRef.current);
+		return () => observer.disconnect();
+	}, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
 	return (
 		<Stack>
@@ -35,7 +56,7 @@ function ArchivedSessionsPage() {
 
 			{isLoading ? (
 				<Loader />
-			) : !sessions?.length ? (
+			) : !sessions.length ? (
 				<Text c="dimmed">{t("noArchivedSessions")}</Text>
 			) : (
 				<Stack>
@@ -88,6 +109,15 @@ function ArchivedSessionsPage() {
 							</Card>
 						</Link>
 					))}
+					<div ref={sentinelRef} style={{ height: 1 }} />
+					{isFetchingNextPage && (
+						<Group justify="center" py="md">
+							<Loader size="sm" />
+							<Text size="sm" c="dimmed">
+								{t("loadingMore")}
+							</Text>
+						</Group>
+					)}
 				</Stack>
 			)}
 		</Stack>

@@ -75,103 +75,103 @@ function LoginPage() {
 	return (
 		<Center h="100vh">
 			<Paper withBorder shadow="md" p="xl" w={400}>
-				<form onSubmit={e => e.preventDefault()}>
-				<Stack>
-					<Title order={2} ta="center">
-						NarraFork
-					</Title>
+				<form onSubmit={(e) => e.preventDefault()}>
+					<Stack>
+						<Title order={2} ta="center">
+							NarraFork
+						</Title>
 
-					{needsSetup ? (
-						<>
-							<Text size="sm" c="dimmed" ta="center">
-								{t("firstUserSetup")}
-							</Text>
-							{error && <Alert color="red">{error}</Alert>}
-							<TextInput
-								label={t("username")}
-								value={username}
-								onChange={(e) => setUsername(e.currentTarget.value)}
-								onKeyDown={(e) => handleKeyDown(e, handleRegister)}
-							/>
-							<PasswordInput
-								label={t("password")}
-								value={password}
-								onChange={(e) => setPassword(e.currentTarget.value)}
-								onKeyDown={(e) => handleKeyDown(e, handleRegister)}
-							/>
-							<Button
-								onClick={handleRegister}
-								loading={register.isPending}
-								disabled={!username.trim() || !password}
-							>
-								{t("createAdmin")}
-							</Button>
-						</>
-					) : (
-						<Tabs defaultValue="login">
-							<Tabs.List grow>
-								<Tabs.Tab value="login">{t("login")}</Tabs.Tab>
-								{canRegister && <Tabs.Tab value="register">{t("register")}</Tabs.Tab>}
-							</Tabs.List>
+						{needsSetup ? (
+							<>
+								<Text size="sm" c="dimmed" ta="center">
+									{t("firstUserSetup")}
+								</Text>
+								{error && <Alert color="red">{error}</Alert>}
+								<TextInput
+									label={t("username")}
+									value={username}
+									onChange={(e) => setUsername(e.currentTarget.value)}
+									onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+								/>
+								<PasswordInput
+									label={t("password")}
+									value={password}
+									onChange={(e) => setPassword(e.currentTarget.value)}
+									onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+								/>
+								<Button
+									onClick={handleRegister}
+									loading={register.isPending}
+									disabled={!username.trim() || !password}
+								>
+									{t("createAdmin")}
+								</Button>
+							</>
+						) : (
+							<Tabs defaultValue="login">
+								<Tabs.List grow>
+									<Tabs.Tab value="login">{t("login")}</Tabs.Tab>
+									{canRegister && <Tabs.Tab value="register">{t("register")}</Tabs.Tab>}
+								</Tabs.List>
 
-							{error && (
-								<Alert color="red" mt="sm">
-									{error}
-								</Alert>
-							)}
+								{error && (
+									<Alert color="red" mt="sm">
+										{error}
+									</Alert>
+								)}
 
-							<Tabs.Panel value="login" pt="sm">
-								<Stack>
-									<TextInput
-										label={t("username")}
-										value={username}
-										onChange={(e) => setUsername(e.currentTarget.value)}
-										onKeyDown={(e) => handleKeyDown(e, handleLogin)}
-									/>
-									<PasswordInput
-										label={t("password")}
-										value={password}
-										onChange={(e) => setPassword(e.currentTarget.value)}
-										onKeyDown={(e) => handleKeyDown(e, handleLogin)}
-									/>
-									<Button
-										onClick={handleLogin}
-										loading={login.isPending}
-										disabled={!username.trim() || !password}
-									>
-										{t("login")}
-									</Button>
-								</Stack>
-							</Tabs.Panel>
-
-							{canRegister && (
-								<Tabs.Panel value="register" pt="sm">
+								<Tabs.Panel value="login" pt="sm">
 									<Stack>
 										<TextInput
 											label={t("username")}
 											value={username}
 											onChange={(e) => setUsername(e.currentTarget.value)}
-											onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+											onKeyDown={(e) => handleKeyDown(e, handleLogin)}
 										/>
 										<PasswordInput
 											label={t("password")}
 											value={password}
 											onChange={(e) => setPassword(e.currentTarget.value)}
-											onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+											onKeyDown={(e) => handleKeyDown(e, handleLogin)}
 										/>
 										<Button
-											onClick={handleRegister}
-											loading={register.isPending}
+											onClick={handleLogin}
+											loading={login.isPending}
 											disabled={!username.trim() || !password}
 										>
-											{t("register")}
+											{t("login")}
 										</Button>
 									</Stack>
 								</Tabs.Panel>
-							)}
-						</Tabs>
-					)}
-				</Stack>
+
+								{canRegister && (
+									<Tabs.Panel value="register" pt="sm">
+										<Stack>
+											<TextInput
+												label={t("username")}
+												value={username}
+												onChange={(e) => setUsername(e.currentTarget.value)}
+												onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+											/>
+											<PasswordInput
+												label={t("password")}
+												value={password}
+												onChange={(e) => setPassword(e.currentTarget.value)}
+												onKeyDown={(e) => handleKeyDown(e, handleRegister)}
+											/>
+											<Button
+												onClick={handleRegister}
+												loading={register.isPending}
+												disabled={!username.trim() || !password}
+											>
+												{t("register")}
+											</Button>
+										</Stack>
+									</Tabs.Panel>
+								)}
+							</Tabs>
+						)}
+					</Stack>
 				</form>
 			</Paper>
 		</Center>

@@ -14,12 +14,7 @@ import {
 	Title,
 	Transition,
 } from "@mantine/core";
-import {
-	IconHandStop,
-	IconPencilCheck,
-	IconShield,
-	IconShieldOff,
-} from "@tabler/icons-react";
+import { IconHandStop, IconPencilCheck, IconShield, IconShieldOff } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -463,6 +458,14 @@ function SettingsPage() {
 							updateUserPref.mutate({ autoLoadOlderMessages: e.currentTarget.checked })
 						}
 					/>
+					<Switch
+						label={t("replyInUserLanguage")}
+						description={t("replyInUserLanguageDesc")}
+						checked={userPrefs?.replyInUserLanguage ?? false}
+						onChange={(e) =>
+							updateUserPref.mutate({ replyInUserLanguage: e.currentTarget.checked })
+						}
+					/>
 				</Stack>
 			</Paper>
 
@@ -473,23 +476,17 @@ function SettingsPage() {
 					<Switch
 						label={t("wordWrapMarkdown")}
 						checked={userPrefs?.wordWrapMarkdown ?? true}
-						onChange={(e) =>
-							updateUserPref.mutate({ wordWrapMarkdown: e.currentTarget.checked })
-						}
+						onChange={(e) => updateUserPref.mutate({ wordWrapMarkdown: e.currentTarget.checked })}
 					/>
 					<Switch
 						label={t("wordWrapCode")}
 						checked={userPrefs?.wordWrapCode ?? true}
-						onChange={(e) =>
-							updateUserPref.mutate({ wordWrapCode: e.currentTarget.checked })
-						}
+						onChange={(e) => updateUserPref.mutate({ wordWrapCode: e.currentTarget.checked })}
 					/>
 					<Switch
 						label={t("wordWrapDiff")}
 						checked={userPrefs?.wordWrapDiff ?? true}
-						onChange={(e) =>
-							updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })
-						}
+						onChange={(e) => updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })}
 					/>
 				</Stack>
 			</Paper>

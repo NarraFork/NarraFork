@@ -13,7 +13,10 @@ export function clearToken(): void {
 	localStorage.removeItem(TOKEN_KEY);
 }
 
-async function request<T>(path: string, options?: RequestInit & { signal?: AbortSignal }): Promise<T> {
+async function request<T>(
+	path: string,
+	options?: RequestInit & { signal?: AbortSignal },
+): Promise<T> {
 	const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) };
 	if (options?.body) {
 		headers["Content-Type"] = "application/json";
@@ -48,6 +51,13 @@ export interface TreeMessage {
 	costUsd?: number | null;
 	createdAt: string;
 	children: TreeMessage[];
+}
+
+export interface PaginatedNarrators {
+	items: any[];
+	hasMore: boolean;
+	nextCursor: string | null;
+	totalCount: number;
 }
 
 export interface PaginatedMessages {
@@ -119,6 +129,24 @@ export const api = {
 		const qs = params.toString();
 		return request<any[]>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
+	listNarratorsPaginated: (opts?: {
+		standalone?: boolean;
+		status?: string;
+		sortBy?: string;
+		sortOrder?: string;
+		limit?: number;
+		cursor?: string;
+	}) => {
+		const params = new URLSearchParams();
+		if (opts?.standalone) params.set("standalone", "true");
+		if (opts?.status) params.set("status", opts.status);
+		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
+		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
+		if (opts?.limit) params.set("limit", String(opts.limit));
+		if (opts?.cursor) params.set("cursor", opts.cursor);
+		const qs = params.toString();
+		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
+	},
 	getNarrator: (id: string) => request<any>(`/narrators/${id}`),
 	createNarrator: (data: {
 		chapterId?: string | null;
@@ -144,6 +172,8 @@ export const api = {
 		const qs = params.toString();
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
 	},
+	getToolCallDetail: (narratorId: string, toolUseId: string) =>
+		request<any>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
 	interruptNarrator: (id: string) => request<any>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	getBufferedMessage: (id: string) =>
 		request<{ text: string; bufferedAt: string } | null>(`/narrators/${id}/buffer`),
@@ -174,9 +204,21 @@ export const api = {
 		}),
 
 	// Terminals
-	listTerminals: (chapterId: string) => request<any[]>(`/terminals?chapterId=${chapterId}`),
-	createTerminal: (data: { chapterId: string; name?: string; cols?: number; rows?: number }) =>
-		request<any>("/terminals", { method: "POST", body: JSON.stringify(data) }),
+	listTerminals: (chapterId: string) => {
+		const params = new URLSearchParams({ chapterId });
+		return request<any[]>(`/terminals?${params}`);
+	},
+	listTerminalsByNarrator: (narratorId: string) => {
+		const params = new URLSearchParams({ narratorId });
+		return request<any[]>(`/terminals?${params}`);
+	},
+	createTerminal: (data: {
+		chapterId?: string;
+		narratorId?: string;
+		name?: string;
+		cols?: number;
+		rows?: number;
+	}) => request<any>("/terminals", { method: "POST", body: JSON.stringify(data) }),
 	getTerminal: (id: string) => request<any>(`/terminals/${id}`),
 	deleteTerminal: (id: string) => request<any>(`/terminals/${id}`, { method: "DELETE" }),
 
@@ -208,6 +250,7 @@ export const api = {
 			wordWrapMarkdown: boolean;
 			wordWrapCode: boolean;
 			wordWrapDiff: boolean;
+			replyInUserLanguage: boolean;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -215,6 +258,7 @@ export const api = {
 		wordWrapMarkdown?: boolean;
 		wordWrapCode?: boolean;
 		wordWrapDiff?: boolean;
+		replyInUserLanguage?: boolean;
 	}) => request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Containers
