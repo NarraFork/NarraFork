@@ -15,8 +15,8 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 
 | 命令 | 用途 |
 |------|------|
-| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7778） |
-| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 5173，代理 /api 和 /ws 到 7778） |
+| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7779） |
+| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 7778，代理 /api 和 /ws 到 7779） |
 | `bun run build` | 构建前端到 `dist/frontend/` |
 | `bun run start` | 生产环境：运行数据库迁移 + 启动后端 + 静态前端 |
 | `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
@@ -92,7 +92,7 @@ frontend/
 
 **路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目、章节、会话、设置、搜索、图可视化。
 
-**Vite 开发代理：** `/api/*` → `localhost:7778`，`/ws/*` → `ws://localhost:7778`。
+**Vite 开发代理：** `/api/*` → `localhost:7779`，`/ws/*` → `ws://localhost:7779`。
 
 ### API 路由
 
