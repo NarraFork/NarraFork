@@ -11,8 +11,10 @@ import {
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowsMaximize,
+	IconCode,
 	IconCopy,
 	IconDeviceMobileRotated,
+	IconMarkdown,
 	IconTextWrap,
 	IconTextWrapDisabled,
 } from "@tabler/icons-react";
@@ -24,7 +26,7 @@ import { MarkdownContent } from "./MarkdownContent";
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
-interface CodeBlockWithActionsProps {
+interface ContentViewerProps {
 	/** Text content to display and copy */
 	content: string;
 	/** Style applied to the Code block */
@@ -82,7 +84,7 @@ const landscapeContainerStyle: CSSProperties = {
 	overflow: "auto",
 };
 
-export const CodeBlockWithActions = memo(function CodeBlockWithActions({
+export const ContentViewer = memo(function ContentViewer({
 	content,
 	style,
 	title,
@@ -91,7 +93,7 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 	contentType = "code",
 	children,
 	renderContent,
-}: CodeBlockWithActionsProps) {
+}: ContentViewerProps) {
 	const { t } = useTranslation("common");
 	const { data: userPrefs } = useUserPreferences();
 	const defaultWrap =
@@ -105,6 +107,7 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 	const [wordWrap, setWordWrap] = useState(defaultWrap);
 	const userToggled = useRef(false);
 	const [landscape, setLandscape] = useState(false);
+	const [showSource, setShowSource] = useState(false);
 
 	// Sync with user preferences once they load (unless user already toggled manually)
 	useEffect(() => {
@@ -155,7 +158,10 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 				size={btnSize}
 				variant="filled"
 				color={wordWrap ? "indigo" : "gray"}
-				onClick={() => { userToggled.current = true; setWordWrap((v) => !v); }}
+				onClick={() => {
+					userToggled.current = true;
+					setWordWrap((v) => !v);
+				}}
 				aria-label={wordWrap ? t("noWrap") : t("wordWrap")}
 			>
 				{wordWrap ? <IconTextWrap size={iconSize} /> : <IconTextWrapDisabled size={iconSize} />}
@@ -167,6 +173,32 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 		? { whiteSpace: "pre-wrap", wordBreak: "break-all", overflowX: "hidden" }
 		: { whiteSpace: "pre", overflowX: "auto" };
 
+	const sourceToggle = markdown ? (
+		<Tooltip label={showSource ? t("rendered") : t("source")} withArrow position="top">
+			<ActionIcon
+				size={btnSize}
+				variant="filled"
+				color={showSource ? "indigo" : "gray"}
+				onClick={() => setShowSource((v) => !v)}
+				aria-label={showSource ? t("rendered") : t("source")}
+			>
+				{showSource ? <IconMarkdown size={iconSize} /> : <IconCode size={iconSize} />}
+			</ActionIcon>
+		</Tooltip>
+	) : null;
+
+	/** Render markdown or raw source depending on toggle */
+	const renderMarkdown = (extraStyle?: CSSProperties) =>
+		showSource ? (
+			<Code block style={{ ...style, ...wrapStyle, ...extraStyle }}>
+				{content}
+			</Code>
+		) : (
+			<Box px="xs" py={4} style={{ minWidth: 0, ...extraStyle }}>
+				<MarkdownContent text={content} />
+			</Box>
+		);
+
 	return (
 		<>
 			<Box
@@ -177,6 +209,7 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 			>
 				{/* Floating overlay on hover */}
 				<Group gap={2} style={hovered ? actionBarVisible : actionBarHidden}>
+					{sourceToggle}
 					{wrapToggle}
 					{copyBtn}
 					{fullscreenBtn}
@@ -185,16 +218,17 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 				{/* Inline content */}
 				{renderContent
 					? renderContent(wordWrap)
-					: children ??
-					(markdown ? (
-						<Box px="xs" py={4} style={{ ...wrapStyle, maxHeight: style?.maxHeight ?? 480, overflowY: "auto" }}>
-							<MarkdownContent text={content} />
-						</Box>
-					) : (
-						<Code block style={{ ...style, ...wrapStyle }}>
-							{content}
-						</Code>
-					))}
+					: (children ??
+						(markdown ? (
+							renderMarkdown({
+								maxHeight: style?.maxHeight,
+								overflowY: style?.maxHeight ? "auto" : undefined,
+							})
+						) : (
+							<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
+								{content}
+							</Code>
+						)))}
 			</Box>
 
 			{/* Fullscreen modal */}
@@ -219,6 +253,7 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 			>
 				{/* Toolbar inside modal */}
 				<div style={modalToolbarStyle}>
+					{sourceToggle}
 					{wrapToggle}
 					{copyBtn}
 					{isMobile && (
@@ -246,11 +281,14 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 						}}
 					>
 						{diff ? (
-							<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} wordWrap={wordWrap} />
+							<DiffView
+								oldStr={diff.oldStr}
+								newStr={diff.newStr}
+								maxHeight={undefined}
+								wordWrap={wordWrap}
+							/>
 						) : markdown ? (
-							<Box px="md" py="xs" style={{ overflow: "auto", height: "100%", ...wrapStyle }}>
-								<MarkdownContent text={content} />
-							</Box>
+							renderMarkdown({ overflow: "auto", height: "100%" })
 						) : (
 							<Code
 								block
@@ -269,12 +307,15 @@ export const CodeBlockWithActions = memo(function CodeBlockWithActions({
 					</Box>
 				) : diff ? (
 					<Box style={{ flex: 1, minHeight: 0 }}>
-						<DiffView oldStr={diff.oldStr} newStr={diff.newStr} maxHeight={undefined} wordWrap={wordWrap} />
+						<DiffView
+							oldStr={diff.oldStr}
+							newStr={diff.newStr}
+							maxHeight={undefined}
+							wordWrap={wordWrap}
+						/>
 					</Box>
 				) : markdown ? (
-					<Box px="md" py="xs" style={wrapStyle}>
-						<MarkdownContent text={content} />
-					</Box>
+					renderMarkdown()
 				) : (
 					<Code
 						block

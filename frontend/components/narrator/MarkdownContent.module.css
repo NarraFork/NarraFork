@@ -1,0 +1,10 @@
+.root {
+	min-width: 0;
+	max-width: 100%;
+	overflow-wrap: break-word;
+	word-break: break-word;
+}
+
+.root > *:first-child {
+	margin-top: 0 !important;
+}
