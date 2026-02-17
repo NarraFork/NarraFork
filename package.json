@@ -9,7 +9,7 @@
 		"dev:all": "bun run db:migrate; bun run --hot server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
 		"dev:cold": "bun run db:migrate; bun run server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
 		"build": "bunx vite build --config frontend/vite.config.ts",
-		"start": "bun run db:migrate && bun server/index.ts",
+		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",
 		"db:generate": "bunx drizzle-kit generate",
 		"db:migrate": "bun server/db/migrate.ts",
 		"check": "bunx @biomejs/biome check .",
@@ -28,8 +28,8 @@
 		"@tabler/icons-react": "^3.36.1",
 		"@tanstack/react-query": "^5.75.0",
 		"@tanstack/react-router": "^1.120.0",
-		"@xterm/addon-fit": "^0.11.0",
-		"@xterm/xterm": "^6.0.0",
+		"@xterm/addon-fit": "0.10.0",
+		"@xterm/xterm": "5.5.0",
 		"@xyflow/react": "^12.10.0",
 		"diff": "^8.0.3",
 		"drizzle-orm": "^0.44.0",
@@ -57,6 +57,7 @@
 		"postcss": "^8.5.0",
 		"postcss-preset-mantine": "^1.17.0",
 		"postcss-simple-vars": "^7.0.0",
+		"typescript": "^5.9.3",
 		"vite": "^6.3.0",
 		"vite-plugin-pwa": "^1.2.0"
 	}

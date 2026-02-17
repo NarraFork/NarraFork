@@ -1,137 +1,137 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件为 Claude Code (claude.ai/code) 在本仓库中工作时提供指导。
 
-## Project Overview
+## 项目概述
 
-NarraFork is an AI-powered collaborative programming platform built around a "narrative forking" metaphor. Software development is modeled as a branching story network where each work branch (Chapter) has its own AI narrator (Claude Code session) operating in an isolated git worktree with optional Podman container environments. Designed for small-team private deployment with shared project data.
+NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件开发被建模为分支故事网络，每个工作分支（章节/Chapter）拥有独立的 AI 叙述者（Claude Code 会话），运行在隔离的 git worktree 中，可选配 Podman 容器环境。面向小团队私有化部署，支持共享项目数据。
 
-**Core domain concepts:**
-- **Chapter** — work unit = git worktree + AI session(s), with statuses: active/dormant/merged/abandoned
-- **Narrator** — Claude Code session bound to a chapter (or standalone), with streaming output and permission control
-- **Story Network** — directed graph of all chapter fork/merge relationships
+**核心领域概念：**
+- **章节（Chapter）** — 工作单元 = git worktree + AI 会话，状态包括：active/dormant/merged/abandoned
+- **叙述者（Narrator）** — 绑定到章节（或独立运行）的 Claude Code 会话，支持流式输出和权限控制
+- **故事网络（Story Network）** — 所有章节 fork/merge 关系构成的有向图
 
-## Commands
+## 常用命令
 
-| Command | Purpose |
-|---------|---------|
-| `bun run dev` | Backend: run DB migrations + hot-reload server (port 7778) |
-| `bun run dev:frontend` | Frontend: Vite dev server (port 5173, proxies /api and /ws to 7778) |
-| `bun run build` | Build frontend to `dist/frontend/` |
-| `bun run start` | Production: run DB migrations + serve backend + static frontend |
-| `bun run db:generate` | Generate Drizzle migration SQL files |
-| `bun run db:migrate` | Run migrations from `./drizzle/` |
-| `bun run check` | Biome lint + format check |
-| `bun run format` | Biome lint + format with auto-fix |
+| 命令 | 用途 |
+|------|------|
+| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7778） |
+| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 5173，代理 /api 和 /ws 到 7778） |
+| `bun run build` | 构建前端到 `dist/frontend/` |
+| `bun run start` | 生产环境：运行数据库迁移 + 启动后端 + 静态前端 |
+| `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
+| `bun run db:migrate` | 执行 `./drizzle/` 中的迁移 |
+| `bun run check` | Biome 代码检查 + 格式检查 |
+| `bun run format` | Biome 代码检查 + 格式化（自动修复） |
 
-**Dev requires two processes:** `bun run dev` (backend) and `bun run dev:frontend` (frontend).
+**开发需要两个进程：** `bun run dev`（后端）和 `bun run dev:frontend`（前端）。
 
-No test framework is configured.
+未配置测试框架。
 
-## Tech Stack
+## 技术栈
 
-- **Runtime:** Bun (≥ 1.2), all scripts via `bun run`/`bunx`
-- **Never use `npx`** — it may resolve to wrong or missing packages. Always use `bunx` instead.
-- **Backend:** Hono v4 on Bun.serve(), SQLite via `bun:sqlite`, Drizzle ORM
-- **Frontend:** React 19 + Mantine v7 (dark theme, indigo primary), TanStack Router (file-based), TanStack React Query, React Flow for graph visualization, xterm.js for terminals, react-i18next for i18n
-- **AI:** `@anthropic-ai/claude-agent-sdk` for narrator sessions
-- **Validation:** Zod v4
-- **Linting:** Biome v2 (tabs, 100-char line width, recommended rules)
-- **External deps:** git, dtach (terminal persistence), optionally podman (containers)
+- **运行时：** Bun（≥ 1.2），所有脚本通过 `bun run`/`bunx` 执行
+- **禁止使用 `npx`** — 可能解析到错误或缺失的包，始终使用 `bunx` 代替
+- **后端：** Hono v4 运行于 Bun.serve()，SQLite 通过 `bun:sqlite`，Drizzle ORM
+- **前端：** React 19 + Mantine v7（暗色主题，indigo 主色），TanStack Router（基于文件），TanStack React Query，React Flow（图可视化），xterm.js（终端），react-i18next（国际化）
+- **AI：** `@anthropic-ai/claude-agent-sdk` 用于叙述者会话
+- **校验：** Zod v4
+- **代码规范：** Biome v2（tab 缩进，100 字符行宽，推荐规则集）
+- **外部依赖：** git、可选 podman（容器）
 
-## Architecture
+## 架构
 
-### Backend (`server/`)
+### 后端（`server/`）
 
 ```
 server/
-  index.ts          — Bun.serve() entry: HTTP via Hono + WS upgrade
-  app.ts            — Hono route registration + global error handler
+  index.ts          — Bun.serve() 入口：HTTP（Hono）+ WS 升级
+  app.ts            — Hono 路由注册 + 全局错误处理
   db/
-    schema.ts       — Drizzle table definitions (projects, chapters, narrators, etc.)
-    relations.ts    — Drizzle relation definitions
-    index.ts        — DB init (WAL mode, foreign keys, FTS5 virtual tables + triggers)
-  middleware/auth.ts — requireAuth / requireAdmin JWT middleware
+    schema.ts       — Drizzle 表定义（projects、chapters、narrators 等）
+    relations.ts    — Drizzle 关系定义
+    index.ts        — 数据库初始化（WAL 模式、外键、FTS5 虚拟表 + 触发器）
+  middleware/auth.ts — requireAuth / requireAdmin JWT 中间件
   lib/
-    auth.ts         — JWT sign/verify (HS256, 7-day), bcrypt registration/login
-    validators.ts   — Zod schemas for all API inputs
-    event-bus.ts    — Typed EventEmitter for cross-service decoupling
-    settings/       — File-based settings (~/.narrafork/settings.json) with deep-merge defaults
-    errors.ts       — AppError hierarchy (NotFoundError, ValidationError)
-    id.ts           — nanoid generators (21-char default, 8-char short)
-  routes/           — Hono route groups mounted at /api/*
-  services/         — Business logic (chapter CRUD, fork, merge, narrator sessions, git, terminals, containers)
-  websocket/        — Bun WebSocket handlers for narrator events and terminal I/O
+    auth.ts         — JWT 签发/验证（HS256，7 天有效期），bcrypt 注册/登录
+    validators.ts   — 所有 API 输入的 Zod schema
+    event-bus.ts    — 类型化 EventEmitter，用于服务间解耦
+    settings/       — 基于文件的配置（~/.narrafork/settings.json），深度合并默认值
+    errors.ts       — AppError 层级（NotFoundError、ValidationError）
+    id.ts           — nanoid 生成器（21 字符默认，8 字符短 ID）
+  routes/           — Hono 路由组，挂载于 /api/*
+  services/         — 业务逻辑（章节 CRUD、fork、merge、叙述者会话、git、终端、容器）
+  websocket/        — Bun WebSocket 处理器（叙述者事件和终端 I/O）
 ```
 
-**Key patterns:**
-- **Event bus** (`lib/event-bus.ts`) decouples services → WebSocket broadcast. All cross-service communication flows through typed events.
-- **Narrator sessions** use Claude Agent SDK `query()` with SSE streaming on HTTP + parallel WebSocket broadcast. Permission requests pause the session with a Promise resolved by user decision (5-min timeout).
-- **Fork context inheritance** has three modes: `full` (defer SDK session fork), `compressed` (Haiku-generated summary in system prompt), `fresh` (no context).
-- **Git worktrees** per active chapter under `<project.gitPath>/.worktrees/`. Dormant chapters remove worktree but preserve branch. Each project has exactly one git repository, configured via `gitPath` on the project.
-- **Container management** via Podman compose with port allocation from a configurable pool (default 10000–20000).
-- **Terminal persistence** via dtach — terminals survive server restarts.
-- **Batch merge** orchestrates multi-chapter merges with conflict detection, interactive WebSocket decisions, and AI-assisted conflict resolution.
+**关键模式：**
+- **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
+- **叙述者会话**使用 Claude Agent SDK 的 `query()` 方法，通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。
+- **Fork 上下文继承**有三种模式：`full`（延迟 SDK 会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
+- **Git worktrees** 每个活跃章节在 `<project.gitPath>/.worktrees/` 下创建。休眠章节移除 worktree 但保留分支。每个项目对应一个 git 仓库，通过项目的 `gitPath` 配置。
+- **容器管理**通过 Podman compose 实现，端口从可配置池中分配（默认 10000–20000）。
+- **终端管理**通过 Bun.Terminal (PTY) 直接实现 — 终端生命周期与服务器进程绑定，重启后标记为已退出。
+- **批量合并**编排多章节合并，支持冲突检测、WebSocket 交互式决策和 AI 辅助冲突解决。
 
-**Database:** SQLite at `~/.narrafork/narrafork.db`. All PKs are nanoid text IDs. FTS5 virtual tables for chapters and narrator messages with sync triggers.
+**数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。所有主键为 nanoid 文本 ID。FTS5 虚拟表用于章节和叙述者消息的全文搜索，通过触发器同步。
 
-**Auth:** JWT in `Authorization: Bearer` header (HTTP) or `?token=` query param (WebSocket). First registered user gets admin. JWT secret auto-generated in settings file.
+**认证：** JWT 通过 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。首个注册用户自动获得管理员权限。JWT 密钥在配置文件中自动生成。
 
-### Frontend (`frontend/`)
+### 前端（`frontend/`）
 
 ```
 frontend/
-  main.tsx            — i18n init + MantineProvider + QueryClient + RouterProvider
-  lib/api.ts          — Typed fetch wrapper with JWT injection and 401 redirect
-  lib/i18n.ts         — i18next initialization with language detector + locale imports
-  locales/            — Translation JSON files: en/ and zh-CN/, 12 namespaces each
-  routes/             — TanStack file-based routes (auto code-splitting)
-  hooks/              — React Query hooks per resource + WebSocket hooks
-  components/         — Domain-grouped: chapter/, narrator/, terminal/, container/, graph/
+  main.tsx            — i18n 初始化 + MantineProvider + QueryClient + RouterProvider
+  lib/api.ts          — 类型化 fetch 封装，自动注入 JWT 并处理 401 重定向
+  lib/i18n.ts         — i18next 初始化，语言检测 + 语言包导入
+  locales/            — 翻译 JSON 文件：en/ 和 zh-CN/，每种语言 12 个命名空间
+  routes/             — TanStack 基于文件的路由（自动代码分割）
+  hooks/              — 按资源划分的 React Query hooks + WebSocket hooks
+  components/         — 按领域分组：chapter/、narrator/、terminal/、container/、graph/
 ```
 
-**Route structure:** `__root.tsx` (AppShell layout) → dashboard, projects, chapters, sessions, settings, search, graph visualization.
+**路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目、章节、会话、设置、搜索、图可视化。
 
-**Vite dev proxy:** `/api/*` → `localhost:7778`, `/ws/*` → `ws://localhost:7778`.
+**Vite 开发代理：** `/api/*` → `localhost:7778`，`/ws/*` → `ws://localhost:7778`。
 
-### API Routes
+### API 路由
 
-All under `/api/`. Public: `/api/auth/*`, `/api/health`, `/api/auth/status`. Everything else requires JWT.
+全部位于 `/api/` 下。公开接口：`/api/auth/*`、`/api/health`、`/api/auth/status`。其余均需 JWT。
 
 - `/api/projects` — CRUD + `/:id/graph`
-- `/api/chapters` — CRUD + fork, merge, merge-check, ai-resolve, dormant, wake, cleanup, batch-merge, containers
-- `/api/narrators` — CRUD + messages (SSE), interrupt, permission-mode, permissions, approve/deny
+- `/api/chapters` — CRUD + fork、merge、merge-check、ai-resolve、dormant、wake、cleanup、batch-merge、containers
+- `/api/narrators` — CRUD + messages（SSE）、interrupt、permission-mode、permissions、approve/deny
 - `/api/terminals` — CRUD
-- `/api/sessions` — Standalone narrator sessions (no chapter)
-- `/api/settings`, `/api/admin`, `/api/search`, `/api/mcp`
+- `/api/sessions` — 独立叙述者会话（不绑定章节）
+- `/api/settings`、`/api/admin`、`/api/search`、`/api/mcp`
 
-**WebSocket:** `/ws/narrator?token=` (subscribe/unsubscribe model), `/ws/terminal?terminalId=&token=` (stdin/stdout piping)
+**WebSocket：** `/ws/narrator?token=`（订阅/取消订阅模型），`/ws/terminal?terminalId=&token=`（stdin/stdout 管道）
 
-## Code Style
+## 代码风格
 
-- **Biome** enforces formatting and linting — run `bun run check` before committing
-- Indent with **tabs**, max line width **100**
-- Path aliases: `@server/*` → `./server/*`, `@frontend/*` → `./frontend/*`
-- ESM throughout (`"type": "module"`)
-- `routeTree.gen.ts` is auto-generated — do not edit manually
-- IDs: use `generateId()` (21-char) or `generateShortId()` (8-char) from `@server/lib/id`
-- Errors: throw `AppError` subclasses from `@server/lib/errors` — the global handler serializes them
-- Validation: define Zod schemas in `@server/lib/validators.ts`, parse in route handlers
-- Settings at `~/.narrafork/settings.json` — access via the `settings` singleton from `@server/lib/settings`
+- **Biome** 强制格式化和代码检查 — 提交前运行 `bun run check`
+- 使用 **tab** 缩进，最大行宽 **100** 字符
+- 路径别名：`@server/*` → `./server/*`，`@frontend/*` → `./frontend/*`
+- 全局使用 ESM（`"type": "module"`）
+- `routeTree.gen.ts` 为自动生成文件 — 请勿手动编辑
+- ID 生成：使用 `@server/lib/id` 中的 `generateId()`（21 字符）或 `generateShortId()`（8 字符）
+- 错误处理：抛出 `@server/lib/errors` 中的 `AppError` 子类 — 全局处理器负责序列化
+- 校验：在 `@server/lib/validators.ts` 中定义 Zod schema，在路由处理器中解析
+- 配置文件位于 `~/.narrafork/settings.json` — 通过 `@server/lib/settings` 的 `settings` 单例访问
 
 ## DESIGN.md
 
-The `DESIGN.md` file (written in Chinese) contains the full project specification including all 5 development phases, detailed database schema, API contracts, and UI wireframes. Consult it for requirements and architectural decisions.
+`DESIGN.md` 文件（中文编写）包含完整的项目规格说明，涵盖全部 5 个开发阶段、详细的数据库 schema、API 契约和 UI 线框图。需求和架构决策请参阅该文件。
 
-## i18n
+## 国际化（i18n）
 
-Frontend internationalization uses `react-i18next` with `i18next-browser-languagedetector`.
+前端国际化使用 `react-i18next` 配合 `i18next-browser-languagedetector`。
 
-- **Languages:** English (default fallback) + Simplified Chinese (`zh-CN`)
-- **Config:** `frontend/lib/i18n.ts` — eagerly imports all locale JSONs, no async loading
-- **Detection:** localStorage key `narrafork_lang` → browser navigator → fallback `en`
-- **Namespaces:** 12 feature-scoped JSON files per language under `frontend/locales/{en,zh-CN}/`: common, nav, dashboard, projects, chapters, sessions, settings, search, narrator, terminal, containers, graph
-- **Switcher:** `frontend/components/LanguageSwitcher.tsx` — Mantine Select in the app header
-- **Usage pattern:** `const { t } = useTranslation("namespace")` in components, `t("key", { param })` for interpolation
-- **Multi-namespace:** `const { t } = useTranslation("chapters"); const { t: tc } = useTranslation("common");`
-- **Adding strings:** add keys to both `en/*.json` and `zh-CN/*.json`, use `t("key")` in JSX
+- **支持语言：** 英文（默认回退）+ 简体中文（`zh-CN`）
+- **配置：** `frontend/lib/i18n.ts` — 同步导入所有语言包，无异步加载
+- **检测顺序：** localStorage 键 `narrafork_lang` → 浏览器 navigator → 回退 `en`
+- **命名空间：** 每种语言 12 个按功能划分的 JSON 文件，位于 `frontend/locales/{en,zh-CN}/`：common、nav、dashboard、projects、chapters、sessions、settings、search、narrator、terminal、containers、graph
+- **语言切换器：** `frontend/components/LanguageSwitcher.tsx` — 应用头部的 Mantine Select 组件
+- **使用方式：** 组件中 `const { t } = useTranslation("namespace")`，插值 `t("key", { param })`
+- **多命名空间：** `const { t } = useTranslation("chapters"); const { t: tc } = useTranslation("common");`
+- **添加字符串：** 同时在 `en/*.json` 和 `zh-CN/*.json` 中添加键值，在 JSX 中使用 `t("key")`

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { sanitizeQuery, buildFtsQuery } from "../../../server/services/search-service";
+import { buildFtsQuery, sanitizeQuery } from "../../../server/services/search-service";
 
 describe("search query sanitization", () => {
 	it("strips SQL injection attempts", () => {
