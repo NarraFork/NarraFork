@@ -9,6 +9,14 @@ export function useTerminals(chapterId: string) {
 	});
 }
 
+export function useNarratorTerminals(narratorId: string) {
+	return useQuery({
+		queryKey: ["terminals", { narratorId }],
+		queryFn: () => api.listTerminalsByNarrator(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
 export function useCreateTerminal(chapterId: string) {
 	const qc = useQueryClient();
 	return useMutation({
@@ -20,12 +28,33 @@ export function useCreateTerminal(chapterId: string) {
 	});
 }
 
+export function useCreateNarratorTerminal(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) =>
+			api.createTerminal({ narratorId, ...data }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
+		},
+	});
+}
+
 export function useDeleteTerminal(chapterId: string) {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => api.deleteTerminal(id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["terminals", { chapterId }] });
+		},
+	});
+}
+
+export function useDeleteNarratorTerminal(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.deleteTerminal(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
 		},
 	});
 }

@@ -5,6 +5,7 @@ interface TerminalWSCallbacks {
 	onOutput?: (data: string) => void;
 	onExit?: (code: number) => void;
 	onError?: (message: string) => void;
+	onRequestResize?: () => void;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -54,6 +55,9 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 							break;
 						case "error":
 							callbacksRef.current.onError?.(data.message);
+							break;
+						case "requestResize":
+							callbacksRef.current.onRequestResize?.();
 							break;
 					}
 				} catch (err) {

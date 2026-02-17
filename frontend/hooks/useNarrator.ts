@@ -15,6 +15,27 @@ export function useNarrators(opts?: {
 	});
 }
 
+export function useNarratorsPaginated(opts?: {
+	standalone?: boolean;
+	status?: string;
+	sortBy?: string;
+	sortOrder?: string;
+	limit?: number;
+}) {
+	return useInfiniteQuery({
+		queryKey: ["narrators", "paginated", { ...opts }],
+		queryFn: ({ pageParam }) =>
+			api.listNarratorsPaginated({
+				...opts,
+				cursor: pageParam,
+			}),
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (lastPage) =>
+			lastPage.hasMore ? (lastPage.nextCursor ?? undefined) : undefined,
+		enabled: !!opts?.standalone,
+	});
+}
+
 export function useNarrator(id: string) {
 	return useQuery({
 		queryKey: ["narrators", id],
@@ -36,6 +57,20 @@ export function useNarratorMessages(narratorId: string, around?: string) {
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
 		enabled: !!narratorId,
+		// Messages are kept up-to-date via WebSocket (setQueryData), so background
+		// refetch on remount is unnecessary. A high staleTime prevents TanStack Query
+		// from refetching ALL cached pages when the component remounts, which would
+		// cause a cascade of API calls proportional to the number of loaded pages.
+		staleTime: Infinity,
+	});
+}
+
+export function useToolCallDetail(narratorId: string, toolUseId: string, enabled: boolean) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
+		queryFn: () => api.getToolCallDetail(narratorId, toolUseId),
+		enabled: !!narratorId && !!toolUseId && enabled,
+		staleTime: 5 * 60 * 1000,
 	});
 }
 

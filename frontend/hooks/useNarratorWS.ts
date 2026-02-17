@@ -14,6 +14,8 @@ interface NarratorWSCallbacks {
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "session_error") => void;
 	onSdkPlanModeChanged?: (sdkPlanMode: boolean) => void;
+	onCompacting?: () => void;
+	onCompactDone?: () => void;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -94,6 +96,12 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 						case "sdk_plan_mode_changed":
 							callbacksRef.current.onSdkPlanModeChanged?.(data.sdkPlanMode);
 							break;
+						case "compacting":
+							callbacksRef.current.onCompacting?.();
+							break;
+						case "compact_done":
+							callbacksRef.current.onCompactDone?.();
+							break;
 					}
 				} catch (err) {
 					if (import.meta.env.DEV) console.warn("[useNarratorWS] Failed to parse WS message:", err);
@@ -133,7 +141,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 				ws.close();
 			}
 		};
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey is used to trigger manual reconnection
+		// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey is used to trigger manual reconnection
 	}, [narratorId, reconnectKey]);
 
 	const sendPermissionDecision = useCallback(
@@ -175,14 +183,31 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 		setReconnectKey((k) => k + 1);
 	}, []);
 
-	return { connected, disconnected, sendPermissionDecision, sendBufferMessage, cancelBuffer, reconnect };
+	return {
+		connected,
+		disconnected,
+		sendPermissionDecision,
+		sendBufferMessage,
+		cancelBuffer,
+		reconnect,
+	};
 }
 
 /**
  * Subscribe to status/title changes for a list of narrator IDs (used on session list pages).
- * Calls `onUpdate` whenever any subscribed narrator changes status or title.
+ * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
-export function useSessionsListWS(narratorIds: string[], onUpdate: () => void) {
+export interface SessionListWSEvent {
+	type: "status" | "title" | "planMode";
+	status?: string;
+	title?: string;
+	sdkPlanMode?: boolean;
+}
+
+export function useSessionsListWS(
+	narratorIds: string[],
+	onUpdate: (narratorId: string, event: SessionListWSEvent) => void,
+) {
 	const wsRef = useRef<WebSocket | null>(null);
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
@@ -217,17 +242,17 @@ export function useSessionsListWS(narratorIds: string[], onUpdate: () => void) {
 			ws.onmessage = (event) => {
 				try {
 					const data = JSON.parse(event.data);
-					if (
-						data.type === "status_change" ||
-						data.type === "narrator:status_changed" ||
-						data.type === "title_updated" ||
-						data.type === "narrator:title_updated" ||
-						data.type === "sdk_plan_mode_changed"
-					) {
-						onUpdateRef.current();
+					const nId = data.narratorId;
+					if (data.type === "status_change" || data.type === "narrator:status_changed") {
+						onUpdateRef.current(nId, { type: "status", status: data.status });
+					} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
+						onUpdateRef.current(nId, { type: "title", title: data.title });
+					} else if (data.type === "sdk_plan_mode_changed") {
+						onUpdateRef.current(nId, { type: "planMode", sdkPlanMode: data.sdkPlanMode });
 					}
 				} catch (err) {
-					if (import.meta.env.DEV) console.warn("[useSessionsListWS] Failed to parse WS message:", err);
+					if (import.meta.env.DEV)
+						console.warn("[useSessionsListWS] Failed to parse WS message:", err);
 				}
 			};
 			ws.onclose = () => {
