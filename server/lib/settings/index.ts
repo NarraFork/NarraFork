@@ -69,7 +69,10 @@ const DEFAULTS: NarraForkSettings = {
 const narraforkDir = resolve(homedir(), ".narrafork");
 const settingsPath = resolve(narraforkDir, "settings.json");
 
-export function deepMerge<T extends Record<string, any>>(defaults: T, overrides: Record<string, any>): T {
+export function deepMerge<T extends Record<string, any>>(
+	defaults: T,
+	overrides: Record<string, any>,
+): T {
 	const result = { ...defaults };
 	for (const key of Object.keys(overrides)) {
 		const val = overrides[key];

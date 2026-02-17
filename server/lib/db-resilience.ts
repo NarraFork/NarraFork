@@ -1,6 +1,13 @@
 import { Database } from "bun:sqlite";
-import { existsSync, copyFileSync, unlinkSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
+import {
+	copyFileSync,
+	existsSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { logger } from "./logger";
 
 /**
@@ -20,9 +27,7 @@ export async function withDbRetry<T>(
 		} catch (err) {
 			lastError = err;
 			const msg = err instanceof Error ? err.message : String(err);
-			const isRetryable =
-				msg.includes("database is locked") ||
-				msg.includes("SQLITE_BUSY");
+			const isRetryable = msg.includes("database is locked") || msg.includes("SQLITE_BUSY");
 
 			if (!isRetryable || attempt === maxRetries) {
 				logger.error(`${label} failed after ${attempt} attempt(s)`, {
@@ -37,7 +42,7 @@ export async function withDbRetry<T>(
 			});
 
 			// Exponential backoff: 200ms, 400ms, 800ms
-			await sleep(200 * Math.pow(2, attempt - 1));
+			await sleep(200 * 2 ** (attempt - 1));
 		}
 	}
 
@@ -105,16 +110,16 @@ export function recoverWithCli(dbPath: string): boolean {
 
 		// Step 1: Try .recover first (handles corruption), fall back to .dump
 		try {
-			execSync(
-				`sqlite3 "${dbPath}" ".recover" > "${sqlDumpPath}"`,
-				{ timeout: 60_000, stdio: "pipe" },
-			);
+			execSync(`sqlite3 "${dbPath}" ".recover" > "${sqlDumpPath}"`, {
+				timeout: 60_000,
+				stdio: "pipe",
+			});
 		} catch {
 			logger.warn("sqlite3 .recover failed, trying .dump");
-			execSync(
-				`sqlite3 "${dbPath}" ".dump" > "${sqlDumpPath}"`,
-				{ timeout: 60_000, stdio: "pipe" },
-			);
+			execSync(`sqlite3 "${dbPath}" ".dump" > "${sqlDumpPath}"`, {
+				timeout: 60_000,
+				stdio: "pipe",
+			});
 		}
 
 		// Step 2: Filter out FTS artifacts, ALL triggers, and virtual tables.
@@ -165,10 +170,7 @@ export function recoverWithCli(dbPath: string): boolean {
 		writeFileSync(sqlDumpPath, filtered.join("\n"));
 
 		// Step 3: Import cleaned SQL into new DB
-		execSync(
-			`sqlite3 "${recoveredPath}" < "${sqlDumpPath}"`,
-			{ timeout: 60_000, stdio: "pipe" },
-		);
+		execSync(`sqlite3 "${recoveredPath}" < "${sqlDumpPath}"`, { timeout: 60_000, stdio: "pipe" });
 
 		// Clean up dump file
 		if (existsSync(sqlDumpPath)) unlinkSync(sqlDumpPath);
@@ -211,7 +213,9 @@ export function recoverWithCli(dbPath: string): boolean {
 		});
 		for (const f of [recoveredPath, sqlDumpPath]) {
 			if (existsSync(f)) {
-				try { unlinkSync(f); } catch {}
+				try {
+					unlinkSync(f);
+				} catch {}
 			}
 		}
 		return false;

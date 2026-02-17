@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { loadSettings, type NarraForkSettings, saveSettings } from "../lib/settings";
 import { ValidationError } from "../lib/errors";
+import { loadSettings, type NarraForkSettings, saveSettings } from "../lib/settings";
 
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
@@ -11,8 +11,14 @@ const modelOptionSchema = z.object({
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
 const updateSettingsSchema = z
 	.object({
-		server: z.object({ port: z.number().int().min(1).max(65535) }).partial().optional(),
-		paths: z.object({ defaultProjectDir: z.string().min(1) }).partial().optional(),
+		server: z
+			.object({ port: z.number().int().min(1).max(65535) })
+			.partial()
+			.optional(),
+		paths: z
+			.object({ defaultProjectDir: z.string().min(1) })
+			.partial()
+			.optional(),
 		agent: z
 			.object({
 				defaultModel: z.string().min(1),

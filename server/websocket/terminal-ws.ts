@@ -15,7 +15,8 @@ export interface TerminalWSData {
 export type TerminalServerMessage =
 	| { type: "output"; data: string }
 	| { type: "exit"; code: number }
-	| { type: "error"; message: string };
+	| { type: "error"; message: string }
+	| { type: "requestResize" };
 
 // Client → Server messages (JSON)
 export type TerminalClientMessage =
@@ -27,6 +28,9 @@ type TerminalWS = ServerWebSocket<WSData & { channel: "terminal" }>;
 // === Connection registry (terminalId → set of WS clients) ===
 
 const connectionsByTerminal = new Map<string, Set<TerminalWS>>();
+
+/** Track the last client that sent input per terminal — only this client's resize is honored */
+const lastActiveClient = new Map<string, TerminalWS>();
 
 /** Send data to all WS clients attached to a terminal */
 export function sendToTerminal(terminalId: string, message: TerminalServerMessage): void {
@@ -45,9 +49,13 @@ export function sendToTerminal(terminalId: string, message: TerminalServerMessag
 function attachToTerminal(ws: TerminalWS, terminalId: string) {
 	// Detach from previous terminal if any
 	if (ws.data.terminalId) {
-		const prev = connectionsByTerminal.get(ws.data.terminalId);
+		const prevId = ws.data.terminalId;
+		const prev = connectionsByTerminal.get(prevId);
 		prev?.delete(ws);
-		if (prev?.size === 0) connectionsByTerminal.delete(ws.data.terminalId);
+		if (prev?.size === 0) connectionsByTerminal.delete(prevId);
+		if (lastActiveClient.get(prevId) === ws) {
+			lastActiveClient.delete(prevId);
+		}
 	}
 
 	ws.data.terminalId = terminalId;
@@ -57,6 +65,16 @@ function attachToTerminal(ws: TerminalWS, terminalId: string) {
 		connectionsByTerminal.set(terminalId, clients);
 	}
 	clients.add(ws);
+
+	// Replay scrollback buffer so the client sees previous output
+	const scrollback = terminalService.getScrollback(terminalId);
+	if (scrollback) {
+		try {
+			ws.send(JSON.stringify({ type: "output", data: scrollback }));
+		} catch {
+			// connection may be dead
+		}
+	}
 }
 
 // === WebSocket handlers ===
@@ -93,8 +111,13 @@ export const handleTerminalWS = {
 				break;
 			}
 			case "resize": {
-				if (ws.data.terminalId) {
-					terminalService.resize(ws.data.terminalId, msg.cols, msg.rows);
+				const terminalId = ws.data.terminalId;
+				if (!terminalId) break;
+				// Only honor resize from the last client that sent input,
+				// or if no client has sent input yet (single-client case)
+				const active = lastActiveClient.get(terminalId);
+				if (!active || active === ws) {
+					terminalService.resize(terminalId, msg.cols, msg.rows);
 				}
 				break;
 			}
@@ -104,14 +127,30 @@ export const handleTerminalWS = {
 	/** Handle raw (non-JSON) text as terminal input */
 	rawMessage(ws: TerminalWS, text: string) {
 		if (!ws.data.terminalId) return;
-		terminalService.write(ws.data.terminalId, text);
+		const terminalId = ws.data.terminalId;
+		const prev = lastActiveClient.get(terminalId);
+		if (prev !== ws) {
+			lastActiveClient.set(terminalId, ws);
+			// Active client changed — ask the new client to re-send its dimensions
+			try {
+				ws.send(JSON.stringify({ type: "requestResize" }));
+			} catch {
+				// connection may be dead
+			}
+		}
+		terminalService.write(terminalId, text);
 	},
 
 	close(ws: TerminalWS) {
 		if (ws.data.terminalId) {
-			const clients = connectionsByTerminal.get(ws.data.terminalId);
+			const terminalId = ws.data.terminalId;
+			const clients = connectionsByTerminal.get(terminalId);
 			clients?.delete(ws);
-			if (clients?.size === 0) connectionsByTerminal.delete(ws.data.terminalId);
+			if (clients?.size === 0) connectionsByTerminal.delete(terminalId);
+			// Clear active client if this was it
+			if (lastActiveClient.get(terminalId) === ws) {
+				lastActiveClient.delete(terminalId);
+			}
 		}
 	},
 };

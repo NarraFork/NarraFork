@@ -18,6 +18,14 @@ if (isProd) {
 	const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
 	if (existsSync(staticDir)) {
 		app.use("/assets/*", serveStatic({ root: staticDir }));
+		// PWA files (sw.js, manifest, workbox, icons) must be served before the SPA catch-all
+		app.use("/sw.js", serveStatic({ root: staticDir }));
+		app.use("/workbox-*.js", serveStatic({ root: staticDir }));
+		app.use("/manifest.webmanifest", serveStatic({ root: staticDir }));
+		app.use("/favicon.svg", serveStatic({ root: staticDir }));
+		app.use("/pwa-*.png", serveStatic({ root: staticDir }));
+		app.use("/apple-touch-icon-*.png", serveStatic({ root: staticDir }));
+		// SPA catch-all: everything else gets index.html
 		app.get("*", serveStatic({ root: staticDir, path: "index.html" }));
 	}
 }
@@ -59,7 +67,7 @@ const _server = Bun.serve({
 
 logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
 
-// Recover terminals that survived a server restart (dtach sessions persist)
+// Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });
 });

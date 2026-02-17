@@ -42,15 +42,25 @@ export const wsHandlers = {
 		const text = typeof message === "string" ? message : new TextDecoder().decode(message);
 		const { channel } = ws.data;
 
+		let parsed: unknown;
+		let isStructuredMessage = false;
 		try {
-			const parsed = JSON.parse(text);
+			parsed = JSON.parse(text);
+			// Only treat as a structured message if it's an object with a "type" field.
+			// Bare JSON values (numbers, booleans, strings) should fall through to raw handling.
+			isStructuredMessage = typeof parsed === "object" && parsed !== null && "type" in parsed;
+		} catch {
+			// Not valid JSON — will be handled as raw input below
+		}
+
+		if (isStructuredMessage) {
 			if (channel === "narrator") {
 				handleNarratorWS.message(ws as ServerWebSocket<WSData & { channel: "narrator" }>, parsed);
 			} else if (channel === "terminal") {
 				handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
 			}
-		} catch {
-			// For terminal, raw text might be terminal input (not JSON)
+		} else {
+			// For terminal, raw text is terminal input (keystrokes)
 			if (channel === "terminal") {
 				handleTerminalWS.rawMessage(ws as ServerWebSocket<WSData & { channel: "terminal" }>, text);
 			} else {

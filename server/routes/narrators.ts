@@ -1,9 +1,10 @@
-import { and, asc, desc, eq, isNull, ne } from "drizzle-orm";
+import { and, asc, type Column, desc, eq, gt, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
+import { getUserLanguage, getUserReplyInLanguage } from "../lib/prompt-i18n";
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
 	createNarratorSchema,
@@ -14,14 +15,16 @@ import {
 } from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import {
+	closeSession,
 	getBufferedMessage,
 	interruptSession,
 	isSessionActive,
 	resolvePermission,
 	startSession,
+	updateSessionModel,
+	updateSessionPermissionMode,
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
-import { getUserLanguage } from "../lib/prompt-i18n";
 
 /** Parse message request supporting both JSON and multipart/form-data (with images) */
 export async function parseMessageRequest(
@@ -29,7 +32,7 @@ export async function parseMessageRequest(
 		req: {
 			header: (name: string) => string | undefined;
 			formData: () => Promise<FormData>;
-			json: () => Promise<any>;
+			json: () => Promise<unknown>;
 		};
 	},
 	narratorId: string,
@@ -63,30 +66,74 @@ narratorRoutes.get("/", async (c) => {
 	const standalone = c.req.query("standalone");
 
 	if (standalone === "true") {
-		// Standalone sessions (no chapter)
+		// Standalone sessions (no chapter) — cursor-based pagination
 		const status = c.req.query("status");
-		const sortBy = c.req.query("sortBy") ?? "updatedAt";
+		const rawSortBy = c.req.query("sortBy") ?? "updatedAt";
 		const sortOrder = c.req.query("sortOrder") ?? "desc";
+		const rawLimit = Number.parseInt(c.req.query("limit") ?? "20", 10);
+		const limit = Math.min(Number.isNaN(rawLimit) ? 20 : rawLimit, 100);
+		const cursorParam = c.req.query("cursor");
 
-		const whereClause =
+		const baseWhere =
 			status === "archived"
 				? and(isNull(narrators.chapterId), eq(narrators.status, "archived"))
 				: and(isNull(narrators.chapterId), ne(narrators.status, "archived"));
 
-		const sortColumnMap: Record<string, any> = {
+		const sortColumnMap: Record<string, Column> = {
 			updatedAt: narrators.updatedAt,
 			createdAt: narrators.createdAt,
 			title: narrators.title,
 			messageCount: narrators.messageCount,
 		};
-		const column = sortColumnMap[sortBy] ?? narrators.updatedAt;
+		const sortBy = rawSortBy in sortColumnMap ? rawSortBy : "updatedAt";
+		const column = sortColumnMap[sortBy];
 		const orderFn = sortOrder === "asc" ? asc : desc;
+		const cmpFn = sortOrder === "asc" ? gt : lt;
 
-		const list = await db.query.narrators.findMany({
-			where: whereClause,
-			orderBy: [orderFn(column)],
-		});
-		return c.json(list);
+		// Decode cursor: { v: sortValue, id: narratorId }
+		let cursorWhere: ReturnType<typeof and> | undefined;
+		if (cursorParam) {
+			try {
+				const decoded = JSON.parse(Buffer.from(cursorParam, "base64url").toString());
+				const cursorVal = decoded.v;
+				const cursorId = decoded.id;
+				// (column > cursorVal) OR (column = cursorVal AND id > cursorId) for asc
+				// (column < cursorVal) OR (column = cursorVal AND id < cursorId) for desc
+				cursorWhere = or(
+					cmpFn(column, cursorVal),
+					and(eq(column, cursorVal), cmpFn(narrators.id, cursorId)),
+				);
+			} catch {
+				// Invalid cursor — ignore, start from beginning
+			}
+		}
+
+		const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
+
+		const [list, countResult] = await Promise.all([
+			db.query.narrators.findMany({
+				where: whereClause,
+				orderBy: [orderFn(column), orderFn(narrators.id)],
+				limit: limit + 1,
+			}),
+			db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere),
+		]);
+		const totalCount = countResult[0]?.count ?? 0;
+
+		const hasMore = list.length > limit;
+		const items = hasMore ? list.slice(0, limit) : list;
+		const lastItem = items[items.length - 1];
+		const nextCursor =
+			hasMore && lastItem
+				? Buffer.from(
+						JSON.stringify({
+							v: (lastItem as Record<string, unknown>)[sortBy] ?? lastItem.updatedAt,
+							id: lastItem.id,
+						}),
+					).toString("base64url")
+				: null;
+
+		return c.json({ items, hasMore, nextCursor, totalCount });
 	}
 
 	if (!chapterId) throw new ValidationError("chapterId or standalone=true is required");
@@ -122,41 +169,15 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const { message, images } = await parseMessageRequest(c, id);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	return streamSSE(c, async (stream) => {
 		try {
-			const MAX_CHAIN_DEPTH = 10;
-			let chainCount = 0;
-			let sessionGen = startSession(id, message, images, locale);
-			while (chainCount < MAX_CHAIN_DEPTH) {
-				chainCount++;
-				let feedbackMessage: string | null = null;
-				let bufferedSend: { message: string; images?: any[] } | null = null;
-				for await (const event of sessionGen) {
-					if (event.type === "auto_feedback") {
-						// Session was interrupted for "allow with feedback" — start a new session
-						feedbackMessage = event.data.message;
-						break;
-					}
-					if (event.type === "buffered_send") {
-						// User queued a message while narrator was thinking — chain into new session
-						bufferedSend = event.data;
-						break;
-					}
-					await stream.writeSSE({
-						event: event.type,
-						data: JSON.stringify(event.data),
-					});
-				}
-				if (feedbackMessage) {
-					sessionGen = startSession(id, feedbackMessage, undefined, locale);
-					continue;
-				}
-				if (bufferedSend) {
-					sessionGen = startSession(id, bufferedSend.message, bufferedSend.images, locale);
-					continue;
-				}
-				break;
+			for await (const event of startSession(id, message, images, locale, replyInUserLanguage)) {
+				await stream.writeSSE({
+					event: event.type,
+					data: JSON.stringify(event.data),
+				});
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : "Internal stream error";
@@ -190,6 +211,14 @@ narratorRoutes.get("/:id/messages", async (c) => {
 	return c.json(result);
 });
 
+// Get full tool call detail (untruncated inputJson/outputJson)
+narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
+	const id = c.req.param("id");
+	const toolUseId = c.req.param("toolUseId");
+	const tc = await narratorService.getToolCallDetail(id, toolUseId);
+	return c.json(tc);
+});
+
 // Interrupt active session
 narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
@@ -204,6 +233,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateModel(id, parsed.data.model);
+	await updateSessionModel(id, parsed.data.model);
 	return c.json({ ok: true });
 });
 
@@ -217,6 +247,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updatePermissionMode(id, permissionMode);
+	await updateSessionPermissionMode(id, permissionMode);
 	return c.json({ ok: true });
 });
 
@@ -244,7 +275,7 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 // Archive narrator
 narratorRoutes.patch("/:id/archive", async (c) => {
 	const id = c.req.param("id");
-	if (isSessionActive(id)) await interruptSession(id);
+	if (isSessionActive(id)) closeSession(id);
 	await narratorService.getById(id);
 	await narratorService.updateStatus(id, "archived");
 	return c.json({ ok: true });
