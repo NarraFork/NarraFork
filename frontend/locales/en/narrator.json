@@ -3,6 +3,7 @@
 	"narrator": "Narrator",
 	"thinking": "Thinking",
 	"planning": "Planning",
+	"compacting": "Context full, compacting...",
 	"sendPlaceholder": "Send a message...",
 	"interrupt": "Interrupt",
 	"permissionRequest": "Permission Request",
@@ -11,9 +12,11 @@
 	"typeCustomAnswer": "Or type a custom answer...",
 	"submitAnswer": "Submit",
 	"skipQuestion": "Skip",
+	"answered": "Answered",
 	"untitled": "Untitled",
 	"generateTitle": "Generate title",
 	"scrollToBottom": "Scroll to bottom",
+	"scrollToBottomWithCount": "Scroll to bottom ({{count}} new messages)",
 	"disconnected": "Disconnected",
 	"status_idle": "Idle",
 	"status_thinking": "Thinking",
@@ -42,5 +45,8 @@
 	"feedbackPlaceholder": "Feedback to model (optional)",
 	"bufferedMessage": "Queued",
 	"cancelBuffer": "Cancel queued message",
-	"queue": "Queue"
+	"queue": "Queue",
+	"bgAgentWarning": "Background agents don't work well with NarraFork and may have permission issues.",
+	"bgAgentRetry": "Retry as foreground agent",
+	"bgAgentRetryPrompt": "The previous Task was launched with `run_in_background: true`, which caused permission issues.\nPlease retry the same task using a synchronous (foreground) Task instead — do NOT set `run_in_background`."
 }

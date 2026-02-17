@@ -1,6 +1,12 @@
 {
 	"noTerminals": "无终端",
 	"newTerminal": "新建终端",
+	"terminal": "终端",
 	"processExited": "[进程已退出，退出码 {{code}}]",
-	"error": "[错误：{{message}}]"
+	"error": "[错误：{{message}}]",
+	"sendToChat": "发送到会话",
+	"sendToTerminal": "发送到终端",
+	"openTerminal": "打开终端",
+	"closeTerminal": "关闭终端",
+	"restartTerminal": "重启终端"
 }

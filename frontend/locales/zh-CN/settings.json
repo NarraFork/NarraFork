@@ -31,6 +31,8 @@
 	"sessionSection": "会话",
 	"autoLoadOlderMessages": "滚动时自动加载更早消息",
 	"autoLoadOlderMessagesDesc": "滚动到会话顶部时自动加载更早的消息",
+	"replyInUserLanguage": "要求 Narrator 使用您的语言回复",
+	"replyInUserLanguageDesc": "指示 Narrator 使用与界面相同的语言进行回复",
 	"wordWrapSection": "默认自动换行",
 	"wordWrapMarkdown": "Markdown",
 	"wordWrapCode": "代码",

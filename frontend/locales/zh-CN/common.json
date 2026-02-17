@@ -33,5 +33,7 @@
 	"fullscreen": "全屏查看",
 	"wordWrap": "自动换行",
 	"noWrap": "不换行",
-	"landscape": "横屏模式"
+	"landscape": "横屏模式",
+	"source": "查看源码",
+	"rendered": "查看渲染"
 }

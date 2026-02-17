@@ -33,5 +33,7 @@
 	"fullscreen": "Fullscreen",
 	"wordWrap": "Word wrap",
 	"noWrap": "No wrap",
-	"landscape": "Landscape"
+	"landscape": "Landscape",
+	"source": "View source",
+	"rendered": "View rendered"
 }

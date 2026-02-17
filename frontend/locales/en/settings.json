@@ -31,6 +31,8 @@
 	"sessionSection": "Session",
 	"autoLoadOlderMessages": "Auto-load older messages on scroll",
 	"autoLoadOlderMessagesDesc": "Automatically load earlier messages when scrolling to the top of a conversation",
+	"replyInUserLanguage": "Ask Narrator to reply in your language",
+	"replyInUserLanguageDesc": "Instruct the Narrator to respond in the same language as your UI",
 	"wordWrapSection": "Word Wrap Defaults",
 	"wordWrapMarkdown": "Markdown",
 	"wordWrapCode": "Code",

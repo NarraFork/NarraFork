@@ -30,5 +30,6 @@
 	"sortTitle": "Title",
 	"sortMessageCount": "Messages",
 	"sortDescending": "Descending",
-	"sortAscending": "Ascending"
+	"sortAscending": "Ascending",
+	"loadingMore": "Loading more..."
 }
