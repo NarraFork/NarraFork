@@ -14,7 +14,6 @@ import {
 	Modal,
 	NativeSelect,
 	Paper,
-	Progress,
 	ScrollArea,
 	Stack,
 	Text,
@@ -22,7 +21,6 @@ import {
 	TextInput,
 	ThemeIcon,
 	Tooltip,
-	Transition,
 	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
@@ -828,6 +826,7 @@ function useProgressiveMessageCount(
 	const [count, setCount] = useState(batchSize);
 	const prevTotalRef = useRef(totalMessages);
 	const prevResetKeyRef = useRef(resetKey);
+	const needsSnapRef = useRef(false);
 
 	let effectiveCount = count;
 	if (prevResetKeyRef.current !== resetKey) {
@@ -836,6 +835,7 @@ function useProgressiveMessageCount(
 		prevTotalRef.current = totalMessages;
 		setCount(batchSize);
 		effectiveCount = batchSize;
+		needsSnapRef.current = true;
 	} else if (prevTotalRef.current !== totalMessages) {
 		const prevTotal = prevTotalRef.current;
 		prevTotalRef.current = totalMessages;
@@ -847,6 +847,7 @@ function useProgressiveMessageCount(
 			// Initial data load (was empty, now has messages) — start progressive
 			setCount(batchSize);
 			effectiveCount = batchSize;
+			needsSnapRef.current = true;
 		} else if (totalMessages > count) {
 			const delta = totalMessages - prevTotal;
 			if (delta > prependThreshold) {
@@ -863,27 +864,53 @@ function useProgressiveMessageCount(
 	// biome-ignore lint/correctness/useExhaustiveDependencies: viewportRef is a stable ref — .current is read inside the effect, not a dependency
 	useEffect(() => {
 		if (skip || count >= totalMessages) return;
-		const id = requestAnimationFrame(() => {
+		const id = setTimeout(() => {
 			const vp = viewportRef.current;
 			if (vp && vp.scrollTop === 0) {
 				vp.scrollTop = 1;
 			}
 			setCount((c) => Math.min(c + batchSize, totalMessages));
-		});
-		return () => cancelAnimationFrame(id);
+		}, 50);
+		return () => clearTimeout(id);
 	}, [skip, count, totalMessages, batchSize]);
+
+	// Snap to bottom once after the first batch is rendered to DOM
+	// biome-ignore lint/correctness/useExhaustiveDependencies: only needs to run when count changes
+	useLayoutEffect(() => {
+		if (!needsSnapRef.current) return;
+		if (count < batchSize) return;
+		const vp = viewportRef.current;
+		if (vp) {
+			needsSnapRef.current = false;
+			vp.scrollTop = vp.scrollHeight;
+		}
+	}, [count]);
 
 	if (skip || totalMessages <= effectiveCount) return { visibleCount: totalMessages, done: true };
 	return { visibleCount: effectiveCount, done: false };
 }
 
-function FakeProgress() {
-	const [value, setValue] = useState(0);
-	useEffect(() => {
-		const id = requestAnimationFrame(() => setValue(100));
-		return () => cancelAnimationFrame(id);
-	}, []);
-	return <Progress value={value} size="xs" transitionDuration={500} />;
+function RenderProgress({ value }: { value: number }) {
+	const pct = Math.round(Math.min(value, 1) * 100);
+	return (
+		<div
+			style={{
+				height: 3,
+				width: "100%",
+				backgroundColor: "var(--mantine-color-default-border)",
+				overflow: "hidden",
+			}}
+		>
+			<div
+				style={{
+					height: "100%",
+					width: `${pct}%`,
+					backgroundColor: "var(--mantine-color-indigo-filled)",
+					transition: "width 80ms linear",
+				}}
+			/>
+		</div>
+	);
 }
 
 // --- StreamingBubble: isolated component to avoid re-rendering the entire panel on every text delta ---
@@ -1300,6 +1327,33 @@ export function NarratorPanel({
 		viewportRef,
 	);
 
+	// Trim message cache on unmount / narrator switch: keep only the newest
+	// pages totalling ~200 messages to avoid heavy progressive re-renders.
+	// Capture the key inside the effect so cleanup trims the *old* narrator's
+	// cache (not the new one — refs would already point to the new key).
+	useEffect(() => {
+		const keyToTrim = messagesQueryKey;
+		return () => {
+			const MAX_CACHED_MESSAGES = 200;
+			qc.setQueryData(keyToTrim, (old: any) => {
+				if (!old?.pages?.length || old.pages.length <= 1) return old;
+				let total = 0;
+				let keepCount = 0;
+				for (const page of old.pages) {
+					total += page.messages?.length ?? 0;
+					keepCount++;
+					if (total >= MAX_CACHED_MESSAGES) break;
+				}
+				if (keepCount >= old.pages.length) return old;
+				return {
+					...old,
+					pages: old.pages.slice(0, keepCount),
+					pageParams: old.pageParams.slice(0, keepCount),
+				};
+			});
+		};
+	}, [messagesQueryKey, qc]);
+
 	// Build visible page elements based on visibleCount (message-level progressive rendering).
 	// Pages are stored newest-first in messagesData.pages; we reverse to display oldest-first.
 	// We walk from the bottom (newest page) upward, allocating visibleCount messages across pages.
@@ -1603,26 +1657,17 @@ export function NarratorPanel({
 		}
 	}, [messages, renderDone, scrollToBottom, highlightMessageId]);
 
-	// During initial progressive render, keep viewport pinned to bottom.
-	// For loadOlder, we rely on browser scroll anchoring — a tall spacer at the
-	// top of the list ensures scrollTop is never 0, so anchoring always works.
-	useLayoutEffect(() => {
-		const vp = viewportRef.current;
-		if (!vp || !visibleElements.length) return;
-		if (renderDone) return;
-		// Only pin to bottom during initial progressive render
-		if (isAtBottomRef.current && !highlightMessageId) {
-			vp.scrollTop = vp.scrollHeight;
-		}
-	}, [visibleElements, renderDone, highlightMessageId]);
-
 	// Auto-scroll via ResizeObserver: when content grows and user is at bottom,
 	// start the lerp follow loop. It chases the latest scrollHeight each frame.
+	// initialScrollDone is a trigger dep: contentRef.current is null on first mount,
+	// so we need the effect to re-run once initialScrollDone flips to true (at which
+	// point the DOM is ready) to actually observe the content element.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: initialScrollDone is a trigger dep, not read inside
 	useEffect(() => {
 		const content = contentRef.current;
 		if (!content) return;
 
-		const observer = new ResizeObserver(() => {
+		const contentObserver = new ResizeObserver(() => {
 			if (!initialScrollDoneRef.current) return;
 			if (isAtBottomRef.current && !highlightMessageId) {
 				startFollowing();
@@ -1635,12 +1680,24 @@ export function NarratorPanel({
 				}
 			}
 		});
-		observer.observe(content);
+		contentObserver.observe(content);
+
+		// Viewport resize (e.g. input area appearing after SPA refresh) must
+		// trigger lerp even during progressive render — not gated by initialScrollDone.
+		const vp = viewportRef.current;
+		const vpObserver = new ResizeObserver(() => {
+			if (isAtBottomRef.current && !highlightMessageId) {
+				startFollowing();
+			}
+		});
+		if (vp) vpObserver.observe(vp);
+
 		return () => {
-			observer.disconnect();
+			contentObserver.disconnect();
+			vpObserver.disconnect();
 			stopFollowing();
 		};
-	}, [highlightMessageId, startFollowing, stopFollowing]);
+	}, [highlightMessageId, startFollowing, stopFollowing, initialScrollDone]);
 
 	// Scroll to highlighted message from search — only once on initial load
 	useEffect(() => {
@@ -1743,10 +1800,10 @@ export function NarratorPanel({
 			},
 			onStatusChange: () => {
 				setIsCompacting(false);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onTitleUpdated: () => {
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onTodosUpdated: (todos, toolUseId) => {
 				setCurrentTodos(todos);
@@ -1834,7 +1891,7 @@ export function NarratorPanel({
 		const trimmed = titleValue.trim();
 		if (trimmed && trimmed !== narrator?.title) {
 			await api.updateNarratorTitle(narratorId, trimmed);
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 		}
 		setEditingTitle(false);
 	};
@@ -1844,7 +1901,7 @@ export function NarratorPanel({
 		try {
 			const { title } = await api.generateNarratorTitle(narratorId);
 			setTitleValue(title);
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 		} finally {
 			setGeneratingTitle(false);
 		}
@@ -1994,7 +2051,7 @@ export function NarratorPanel({
 			streamingRef.current = "";
 			setStreamingVersion((v) => v + 1);
 			qc.invalidateQueries({ queryKey: messagesQueryKey });
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 		}
 	};
 
@@ -2196,7 +2253,7 @@ export function NarratorPanel({
 			<Box pos="relative" style={{ flex: 1, minHeight: 0 }}>
 				{(isFetchingNextPage || !renderDone) && (
 					<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
-						<FakeProgress />
+						<RenderProgress value={messages.length > 0 ? visibleCount / messages.length : 0} />
 					</Box>
 				)}
 				<ScrollArea
@@ -2227,50 +2284,49 @@ export function NarratorPanel({
 				)}
 
 				{/* Scroll to bottom button */}
-				<Transition mounted={!isAtBottom} transition="slide-up" duration={200}>
-					{(styles) => (
-						<Box
+				<Box
+					style={{
+						position: "absolute",
+						bottom: 12,
+						right: 24,
+						zIndex: 10,
+						transform: isAtBottom ? "translateY(80px)" : "translateY(0)",
+						opacity: isAtBottom ? 0 : 1,
+						transition: "transform 200ms ease, opacity 200ms ease",
+						pointerEvents: isAtBottom ? "none" : "auto",
+					}}
+				>
+					{unreadCount > 0 && (
+						<Badge
+							size="sm"
+							circle
+							color="indigo"
 							style={{
-								...styles,
 								position: "absolute",
-								bottom: 12,
-								right: 24,
-								zIndex: 10,
+								top: -6,
+								right: -6,
+								zIndex: 1,
+								pointerEvents: "none",
 							}}
 						>
-							{unreadCount > 0 && (
-								<Badge
-									size="sm"
-									circle
-									color="indigo"
-									style={{
-										position: "absolute",
-										top: -6,
-										right: -6,
-										zIndex: 1,
-										pointerEvents: "none",
-									}}
-								>
-									{unreadCount > 99 ? "99+" : unreadCount}
-								</Badge>
-							)}
-							<ActionIcon
-								variant="filled"
-								color="gray"
-								radius="xl"
-								size="lg"
-								onClick={() => scrollToBottom()}
-								title={
-									unreadCount > 0
-										? t("scrollToBottomWithCount", { count: unreadCount })
-										: t("scrollToBottom")
-								}
-							>
-								<IconArrowDown size={18} />
-							</ActionIcon>
-						</Box>
+							{unreadCount > 99 ? "99+" : unreadCount}
+						</Badge>
 					)}
-				</Transition>
+					<ActionIcon
+						variant="filled"
+						color="gray"
+						radius="xl"
+						size="lg"
+						onClick={() => scrollToBottom()}
+						title={
+							unreadCount > 0
+								? t("scrollToBottomWithCount", { count: unreadCount })
+								: t("scrollToBottom")
+						}
+					>
+						<IconArrowDown size={18} />
+					</ActionIcon>
+				</Box>
 			</Box>
 
 			{/* Image previews */}
