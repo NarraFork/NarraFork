@@ -4,7 +4,7 @@ import { chapters, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { type Locale, getPrompt } from "../lib/prompt-i18n";
+import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { gitService } from "./git-service";
 import { startSession } from "./narrator-session";
 
@@ -190,7 +190,12 @@ export const chapterMerge = {
 			conflictFiles = mergeResult.conflictFiles;
 		}
 
-		const prompt = buildConflictResolutionPrompt(conflictFiles, source.branch, target.branch, locale);
+		const prompt = buildConflictResolutionPrompt(
+			conflictFiles,
+			source.branch,
+			target.branch,
+			locale,
+		);
 		logger.info("Starting AI conflict resolution", {
 			sourceId: sourceChapterId,
 			targetId: input.targetChapterId,

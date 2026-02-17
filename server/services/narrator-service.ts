@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -46,6 +46,27 @@ function buildMessageTree(flatMessages: any[]): any[] {
 	}
 
 	return topLevel;
+}
+
+/** Truncate a JSON value to a preview string if it exceeds maxLen characters */
+function truncateJson(val: any, maxLen: number): any {
+	if (val === null || val === undefined) return val;
+	const str = typeof val === "string" ? val : JSON.stringify(val);
+	if (str.length <= maxLen) return val;
+	return { _truncated: true, preview: str.slice(0, maxLen), fullLength: str.length };
+}
+
+/** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
+function truncateToolIO(tree: any[], maxLen = 2000): any[] {
+	return tree.map((msg) => ({
+		...msg,
+		toolCalls: msg.toolCalls?.map((tc: any) => ({
+			...tc,
+			inputJson: truncateJson(tc.inputJson, maxLen),
+			outputJson: truncateJson(tc.outputJson, maxLen),
+		})),
+		children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
+	}));
 }
 
 /** Collect all toolUseIds from a set of messages (for iterative child fetching) */
@@ -149,14 +170,54 @@ export const narratorService = {
 		});
 	},
 
+	/** Fetch the N earliest top-level user/assistant messages with text content. */
+	async getEarliestMessages(narratorId: string, limit = 2) {
+		return db.query.narratorMessages.findMany({
+			where: and(
+				eq(narratorMessages.narratorId, narratorId),
+				inArray(narratorMessages.role, ["user", "assistant"]),
+				isNotNull(narratorMessages.contentText),
+			),
+			orderBy: (m, { asc }) => [asc(m.createdAt)],
+			limit,
+		});
+	},
+
+	/** Fetch the N most recent top-level user/assistant messages with text content (chronological order). */
+	async getRecentMessages(narratorId: string, limit = 4) {
+		const rows = await db.query.narratorMessages.findMany({
+			where: and(
+				eq(narratorMessages.narratorId, narratorId),
+				inArray(narratorMessages.role, ["user", "assistant"]),
+				isNotNull(narratorMessages.contentText),
+			),
+			orderBy: (m, { desc }) => [desc(m.createdAt)],
+			limit,
+		});
+		return rows.reverse();
+	},
+
 	async getMessagesCursor(narratorId: string, limit = 50, cursor?: string) {
 		// Query 1: top-level messages only (parentToolUseId IS NULL)
-		const topConditions = [
+		const topConditions: any[] = [
 			eq(narratorMessages.narratorId, narratorId),
 			isNull(narratorMessages.parentToolUseId),
 		];
 		if (cursor) {
-			topConditions.push(lt(narratorMessages.createdAt, cursor));
+			// Composite cursor: "createdAt|id" — backward-compatible with plain timestamp
+			const sepIdx = cursor.indexOf("|");
+			if (sepIdx >= 0) {
+				const cursorTs = cursor.slice(0, sepIdx);
+				const cursorId = cursor.slice(sepIdx + 1);
+				topConditions.push(
+					or(
+						lt(narratorMessages.createdAt, cursorTs),
+						and(eq(narratorMessages.createdAt, cursorTs), lt(narratorMessages.id, cursorId)),
+					)!,
+				);
+			} else {
+				topConditions.push(lt(narratorMessages.createdAt, cursor));
+			}
 		}
 		const topRows = await db.query.narratorMessages.findMany({
 			where: and(...topConditions),
@@ -173,11 +234,9 @@ export const narratorService = {
 		}
 
 		// Query 2: fetch child messages whose parentToolUseId matches a tool call
-		// in the top-level messages. Children are created DURING the parent's tool
-		// execution, so their createdAt is typically EARLIER than the parent — we
-		// match by parentToolUseId instead of time range.
+		// in the top-level messages.
 		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childRows =
+		const childMessages =
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
 						where: and(
@@ -186,16 +245,17 @@ export const narratorService = {
 						),
 						with: { toolCalls: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
+						limit: 500,
 					})
 				: [];
 
-		// Build tree from combined set
-		const tree = buildMessageTree([...topMessages, ...childRows]);
+		// Build tree from combined set and truncate large tool I/O
+		const tree = truncateToolIO(buildMessageTree([...topMessages, ...childMessages]));
 
 		return {
 			messages: tree,
 			hasMore,
-			nextCursor: hasMore ? topMessages[0].createdAt : null,
+			nextCursor: hasMore ? `${topMessages[0].createdAt}|${topMessages[0].id}` : null,
 		};
 	},
 
@@ -207,7 +267,7 @@ export const narratorService = {
 	 */
 	async getMessagesAround(narratorId: string, messageId: string, contextSize = 5) {
 		// Find the target message
-		let target = await db.query.narratorMessages.findFirst({
+		const target = await db.query.narratorMessages.findFirst({
 			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
 		});
 		if (!target) {
@@ -264,7 +324,7 @@ export const narratorService = {
 
 		// Fetch child messages by parentToolUseId matching
 		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childRows =
+		const childMessages =
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
 						where: and(
@@ -273,15 +333,27 @@ export const narratorService = {
 						),
 						with: { toolCalls: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
+						limit: 500,
 					})
 				: [];
 
-		const tree = buildMessageTree([...topMessages, ...childRows]);
+		const tree = truncateToolIO(buildMessageTree([...topMessages, ...childMessages]));
 		return {
 			messages: tree,
 			hasMore,
 			nextCursor: hasMore ? (olderMessages[0]?.createdAt ?? null) : null,
 		};
+	},
+
+	async getToolCallDetail(narratorId: string, toolUseId: string) {
+		const tc = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+		});
+		if (!tc) throw new NotFoundError("ToolCall", toolUseId);
+		return tc;
 	},
 
 	async getPendingPermissions(narratorId: string) {
@@ -311,6 +383,23 @@ export const narratorService = {
 				role: "user",
 				contentJson: contentBlocks ?? [{ type: "text", text }],
 				contentText: text,
+				createdAt: now,
+			})
+			.returning();
+		return msg;
+	},
+
+	async persistCompactMessage(narratorId: string, summary: string) {
+		const id = generateId();
+		const now = new Date().toISOString();
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "text", text: "[Context compacted]" }],
+				contentText: `[Compact] ${summary.slice(0, 200)}...`,
 				createdAt: now,
 			})
 			.returning();
@@ -478,5 +567,4 @@ export const narratorService = {
 		await deleteNarratorUploads(narratorId);
 		logger.info("Narrator removed", { narratorId });
 	},
-
 };

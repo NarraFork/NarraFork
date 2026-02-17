@@ -10,7 +10,7 @@ import { narratorService } from "./narrator-service";
  * Persist a generated title to DB and broadcast. Isolated so both quick and
  * full title flows share the same error handling / retry path.
  */
-async function persistTitle(narratorId: string, title: string): Promise<boolean> {
+export async function persistTitle(narratorId: string, title: string): Promise<boolean> {
 	try {
 		await narratorService.updateTitle(narratorId, title);
 		broadcastToNarrator(narratorId, { type: "title_updated", narratorId, title });
@@ -35,15 +35,30 @@ export async function generateTitle(
 	stderrChunks: string[],
 	locale: Locale = "en",
 ): Promise<string> {
-	const messages = await narratorService.getMessages(narratorId, 4);
-	if (messages.length === 0) return "New conversation";
+	const HEAD_COUNT = 2;
+	const TAIL_COUNT = 4;
 
-	const conversationText = messages
-		.map((m) => {
+	// Two targeted queries with SQL-level filtering (no over-fetch)
+	const [head, tail] = await Promise.all([
+		narratorService.getEarliestMessages(narratorId, HEAD_COUNT),
+		narratorService.getRecentMessages(narratorId, TAIL_COUNT),
+	]);
+
+	// Deduplicate: remove tail messages already in head (short conversations)
+	const headIds = new Set(head.map((m) => m.id));
+	const uniqueTail = tail.filter((m) => !headIds.has(m.id));
+	const selected = [...head, ...uniqueTail];
+
+	if (selected.length === 0) return "New conversation";
+
+	const conversationText = selected
+		.map((m, i) => {
 			const role = m.role === "assistant" ? "Assistant" : "User";
-			const text = m.contentText || JSON.stringify(m.contentJson);
-			const truncated = text.length > 500 ? `${text.slice(0, 500)}...` : text;
-			return `[${role}]: ${truncated}`;
+			const text = m.contentText!;
+			const maxLen = i >= head.length ? 600 : 300;
+			const truncated = text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
+			const section = i >= head.length ? "(recent) " : "";
+			return `${section}[${role}]: ${truncated}`;
 		})
 		.join("\n\n");
 
@@ -59,7 +74,7 @@ export async function generateTitle(
 	const TITLE_TIMEOUT_MS = 30_000;
 	const titlePromise = (async () => {
 		const titleQuery = query({
-			prompt: titlePrompt + conversationText,
+			prompt: `${titlePrompt}${conversationText}\n</conversation>`,
 			options: {
 				model: settings.agent.summaryModel,
 				maxTurns: 1,
@@ -118,8 +133,8 @@ export async function generateQuickTitle(
 	const stderrChunks: string[] = [];
 	try {
 		const truncated = userMessage.length > 500 ? `${userMessage.slice(0, 500)}...` : userMessage;
-		const titlePrompt = getPrompt("title", locale);
-		const prompt = `${titlePrompt}[User]: ${truncated}`;
+		const titlePrompt = getPrompt("quickTitle", locale);
+		const prompt = `${titlePrompt}${truncated}\n</user_message>`;
 
 		logger.info("Quick title generation starting", {
 			narratorId,

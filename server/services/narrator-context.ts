@@ -3,11 +3,12 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { type Locale, getPrompt } from "../lib/prompt-i18n";
+import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { narratorService } from "./narrator-service";
 
 const SUMMARY_MAX_MESSAGES = 50;
+const COMPACT_MAX_MESSAGES = 100;
 
 interface ForkNarratorInput {
 	parentNarratorId: string;
@@ -117,6 +118,70 @@ export const narratorContext = {
 		} catch (err) {
 			logger.error("Context summary generation failed", { narratorId, error: String(err) });
 			return "Context summary generation failed. Starting fresh.";
+		}
+	},
+
+	/**
+	 * Generate a thorough compact summary for session rotation.
+	 * More detailed than fork summary — preserves file paths, modifications, and working state.
+	 */
+	async generateCompactSummary(narratorId: string, locale: Locale = "en"): Promise<string> {
+		const messages = await narratorService.getMessages(narratorId, COMPACT_MAX_MESSAGES);
+
+		if (messages.length === 0) return "No conversation history.";
+
+		const conversationText = messages
+			.filter((m) => m.role === "user" || m.role === "assistant")
+			.map((m) => {
+				const role = m.role === "assistant" ? "Assistant" : "User";
+				let text = m.contentText || "";
+				if (!text && m.role === "assistant") {
+					const content = m.contentJson as any[];
+					const toolNames = content
+						?.filter((b: any) => b.type === "tool_use")
+						.map((b: any) => b.name);
+					if (toolNames?.length) {
+						text = `[Used tools: ${toolNames.join(", ")}]`;
+					}
+				}
+				if (!text) return null;
+				return `[${role}]: ${text}`;
+			})
+			.filter(Boolean)
+			.join("\n\n");
+
+		const compactPrompt = getPrompt("compact", locale);
+
+		try {
+			const compactQuery = query({
+				prompt: compactPrompt + conversationText,
+				options: {
+					model: settings.agent.summaryModel,
+					maxTurns: 1,
+					tools: [],
+					permissionMode: "dontAsk",
+					settingSources: ["user"],
+				},
+			});
+
+			let summary = "";
+			for await (const message of compactQuery) {
+				if (message.type === "assistant") {
+					for (const block of message.message.content) {
+						if (block.type === "text") {
+							summary += block.text;
+						}
+					}
+				}
+			}
+
+			return summary || "Failed to generate compact summary.";
+		} catch (err) {
+			logger.error("Compact summary generation failed, falling back to basic summary", {
+				narratorId,
+				error: String(err),
+			});
+			return this.generateContextSummary(narratorId, locale);
 		}
 	},
 };

@@ -1,7 +1,7 @@
-import { type Locale } from "../lib/prompt-i18n";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import type { Locale } from "../lib/prompt-i18n";
 import { chapterFork } from "./chapter-fork";
 import { chapterMerge } from "./chapter-merge";
 import { chapterService } from "./chapter-service";
@@ -93,7 +93,13 @@ export const chapterBatchMerge = {
 		});
 
 		// Step 2: Process merges in background
-		this.processQueue(mergeSessionId, targetChapterId, input.sourceChapterIds, strategy, input.locale);
+		this.processQueue(
+			mergeSessionId,
+			targetChapterId,
+			input.sourceChapterIds,
+			strategy,
+			input.locale,
+		);
 
 		return { mergeSessionId, targetChapterId };
 	},
@@ -111,17 +117,85 @@ export const chapterBatchMerge = {
 		let currentSourceId = "";
 
 		try {
-		for (let i = 0; i < total; i++) {
-			const sourceId = sourceChapterIds[i];
-			currentSourceId = sourceId;
+			for (let i = 0; i < total; i++) {
+				const sourceId = sourceChapterIds[i];
+				currentSourceId = sourceId;
 
-			// Try merge
-			const result = await chapterMerge.merge(sourceId, {
-				targetChapterId,
-				strategy,
-			});
+				// Try merge
+				const result = await chapterMerge.merge(sourceId, {
+					targetChapterId,
+					strategy,
+				});
 
-			if (result.success) {
+				if (result.success) {
+					mergedCount++;
+					eventBus.emit({
+						type: "merge:step_ok",
+						mergeSessionId,
+						sourceChapterId: sourceId,
+						index: i,
+						total,
+						commitSha: result.commitSha,
+					});
+					continue;
+				}
+
+				// Conflict — broadcast and wait for decision
+				eventBus.emit({
+					type: "merge:conflict",
+					mergeSessionId,
+					sourceChapterId: sourceId,
+					index: i,
+					total,
+					conflictFiles: result.conflictFiles ?? [],
+				});
+
+				const decision = await waitForDecision(mergeSessionId);
+
+				if (decision === "cancel") {
+					// Rollback: delete the forked chapter entirely
+					eventBus.emit({
+						type: "merge:cancelled",
+						mergeSessionId,
+						reason: "User cancelled on conflict",
+					});
+					await this.rollback(targetChapterId);
+					return;
+				}
+
+				// User chose continue — AI resolve
+				eventBus.emit({
+					type: "merge:ai_resolving",
+					mergeSessionId,
+					sourceChapterId: sourceId,
+				});
+
+				const aiResult = await chapterMerge.aiResolveConflicts(
+					sourceId,
+					{
+						targetChapterId,
+						strategy,
+					},
+					locale,
+				);
+
+				if (!aiResult.resolved) {
+					eventBus.emit({
+						type: "merge:error",
+						mergeSessionId,
+						sourceChapterId: sourceId,
+						error: aiResult.error ?? "AI resolution failed",
+					});
+					// Rollback
+					eventBus.emit({
+						type: "merge:cancelled",
+						mergeSessionId,
+						reason: aiResult.error ?? "AI resolution failed",
+					});
+					await this.rollback(targetChapterId);
+					return;
+				}
+
 				mergedCount++;
 				eventBus.emit({
 					type: "merge:step_ok",
@@ -129,82 +203,22 @@ export const chapterBatchMerge = {
 					sourceChapterId: sourceId,
 					index: i,
 					total,
-					commitSha: result.commitSha,
+					commitSha: aiResult.mergeResult?.commitSha,
 				});
-				continue;
 			}
 
-			// Conflict — broadcast and wait for decision
 			eventBus.emit({
-				type: "merge:conflict",
+				type: "merge:completed",
 				mergeSessionId,
-				sourceChapterId: sourceId,
-				index: i,
-				total,
-				conflictFiles: result.conflictFiles ?? [],
-			});
-
-			const decision = await waitForDecision(mergeSessionId);
-
-			if (decision === "cancel") {
-				// Rollback: delete the forked chapter entirely
-				eventBus.emit({
-					type: "merge:cancelled",
-					mergeSessionId,
-					reason: "User cancelled on conflict",
-				});
-				await this.rollback(targetChapterId);
-				return;
-			}
-
-			// User chose continue — AI resolve
-			eventBus.emit({
-				type: "merge:ai_resolving",
-				mergeSessionId,
-				sourceChapterId: sourceId,
-			});
-
-			const aiResult = await chapterMerge.aiResolveConflicts(sourceId, {
 				targetChapterId,
-				strategy,
-			}, locale);
-
-			if (!aiResult.resolved) {
-				eventBus.emit({
-					type: "merge:error",
-					mergeSessionId,
-					sourceChapterId: sourceId,
-					error: aiResult.error ?? "AI resolution failed",
-				});
-				// Rollback
-				eventBus.emit({
-					type: "merge:cancelled",
-					mergeSessionId,
-					reason: aiResult.error ?? "AI resolution failed",
-				});
-				await this.rollback(targetChapterId);
-				return;
-			}
-
-			mergedCount++;
-			eventBus.emit({
-				type: "merge:step_ok",
-				mergeSessionId,
-				sourceChapterId: sourceId,
-				index: i,
-				total,
-				commitSha: aiResult.mergeResult?.commitSha,
+				mergedCount,
 			});
-		}
-
-		eventBus.emit({
-			type: "merge:completed",
-			mergeSessionId,
-			targetChapterId,
-			mergedCount,
-		});
 		} catch (err) {
-			logger.error("Batch merge unexpected error", { mergeSessionId, sourceChapterId: currentSourceId, error: String(err) });
+			logger.error("Batch merge unexpected error", {
+				mergeSessionId,
+				sourceChapterId: currentSourceId,
+				error: String(err),
+			});
 			eventBus.emit({
 				type: "merge:error",
 				mergeSessionId,
