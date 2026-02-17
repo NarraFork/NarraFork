@@ -188,19 +188,34 @@ const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
 
 // --- Exported component ---
 
-export const DiffView = memo(function DiffView({ oldStr, newStr, maxHeight = 200, wordWrap }: DiffViewProps) {
+export const DiffView = memo(function DiffView({
+	oldStr,
+	newStr,
+	maxHeight = 200,
+	wordWrap,
+}: DiffViewProps) {
 	const lines = useMemo(() => computeDiff(oldStr, newStr), [oldStr, newStr]);
 
 	if (lines.length === 0) return null;
 
 	const wrapOverride = wordWrap
-		? { whiteSpace: "pre-wrap" as const, wordBreak: "break-all" as const, overflowX: "hidden" as const }
+		? {
+				whiteSpace: "pre-wrap" as const,
+				wordBreak: "break-all" as const,
+				overflowX: "hidden" as const,
+			}
 		: {};
 
 	const style =
 		maxHeight != null
 			? { ...containerStyle, maxHeight, ...wrapOverride }
-			: { ...containerStyle, maxHeight: undefined, overflow: "auto" as any, height: "100%", ...wrapOverride };
+			: {
+					...containerStyle,
+					maxHeight: undefined,
+					overflow: "auto" as any,
+					height: "100%",
+					...wrapOverride,
+				};
 
 	const truncated = lines.length >= MAX_DIFF_LINES;
 

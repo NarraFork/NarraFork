@@ -1,6 +1,6 @@
 import { Alert, Button, Code, Group, Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
-import { CodeBlockWithActions } from "./CodeBlockWithActions";
+import { ContentViewer } from "./ContentViewer";
 
 interface PermissionBannerProps {
 	request: {
@@ -28,7 +28,7 @@ export function PermissionBanner({ request, onDecision }: PermissionBannerProps)
 					{request.decisionReason}
 				</Text>
 			)}
-			<CodeBlockWithActions
+			<ContentViewer
 				content={truncated}
 				style={{ fontSize: 11, maxHeight: 120, overflow: "auto" }}
 				title={`${request.toolName} — Permission`}

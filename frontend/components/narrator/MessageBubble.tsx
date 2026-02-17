@@ -12,7 +12,7 @@ import {
 import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { getToken } from "../../lib/api";
-import { MarkdownContent } from "./MarkdownContent";
+import { ContentViewer } from "./ContentViewer";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
@@ -85,7 +85,11 @@ function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) 
 	);
 }
 
-export const MessageBubble = memo(function MessageBubble({ narratorId, message, onForkFromMessage }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({
+	narratorId,
+	message,
+	onForkFromMessage,
+}: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
@@ -139,7 +143,8 @@ export const MessageBubble = memo(function MessageBubble({ narratorId, message, 
 			{blocks.map((block: any, i: number) => {
 				const key = block.id ?? `${block.type}-${i}`;
 				if (block.type === "text") {
-					return <MarkdownContent key={key} text={block.text} />;
+					if (!block.text?.trim()) return null;
+					return <ContentViewer key={key} content={block.text} markdown contentType="markdown" />;
 				}
 				if (block.type === "image") {
 					return <ImageBlock key={key} block={block} narratorId={narratorId} />;
@@ -168,7 +173,8 @@ export const MessageBubble = memo(function MessageBubble({ narratorId, message, 
 							key={key}
 							toolCall={{
 								toolName: block.name,
-								inputJson: block.input,
+								toolUseId: block.id,
+								inputJson: tc?.inputJson ?? block.input,
 								outputJson: tc?.outputJson,
 								status: tc?.status ?? "running",
 								durationMs: tc?.durationMs,

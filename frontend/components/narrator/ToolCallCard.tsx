@@ -30,8 +30,9 @@ import {
 } from "@tabler/icons-react";
 import { memo, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useToolCallDetail } from "../../hooks/useNarrator";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
-import { CodeBlockWithActions } from "./CodeBlockWithActions";
+import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 
@@ -58,6 +59,8 @@ export interface PendingPermission {
 
 interface ToolCallCardProps {
 	toolCall: ToolCallData;
+	/** Narrator ID for lazy-loading truncated tool call data */
+	narratorId?: string;
 	/** When true, card is inside a tool_run wrapper — no own border/radius */
 	inRun?: boolean;
 	/** When true, this is the last item in a run — no bottom divider */
@@ -200,8 +203,15 @@ function getSummary(toolName: string, input: any): string {
 		}
 		case "ask": {
 			const questions = input?.questions;
+			const answers = input?.answers as Record<string, string> | undefined;
 			if (Array.isArray(questions) && questions.length > 0) {
-				const header = questions[0].header ?? "";
+				const header = questions[0].header ?? "Question";
+				if (answers && Object.keys(answers).length > 0) {
+					const vals = Object.values(answers);
+					const joined = vals.join(", ");
+					const label = joined.length > 60 ? `${joined.slice(0, 57)}...` : joined;
+					return `${header} → ${label}`;
+				}
 				return header || "Question";
 			}
 			return "Question";
@@ -291,6 +301,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const fp = getFilePath(toolCall.inputJson);
 	const isEdit = toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit";
+	const isWrite = toolCall.toolName === "Write";
 
 	const outputText =
 		typeof toolCall.outputJson === "string"
@@ -298,6 +309,9 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 			: toolCall.outputJson
 				? JSON.stringify(toolCall.outputJson, null, 2)
 				: "";
+
+	// For Write tool, display the written content from input instead of the result prompt
+	const writeContent = isWrite ? (toolCall.inputJson?.content ?? "") : "";
 
 	return (
 		<Box mt="xs">
@@ -307,7 +321,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Text>
 			)}
 			{isEdit && toolCall.inputJson?.old_string != null && (
-				<CodeBlockWithActions
+				<ContentViewer
 					content={`--- old\n${toolCall.inputJson.old_string}\n+++ new\n${toolCall.inputJson.new_string ?? ""}`}
 					title={fp ? basename(fp) : "Diff"}
 					contentType="diff"
@@ -324,12 +338,19 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					)}
 				/>
 			)}
-			{!isEdit && toolCall.outputJson && (
+			{isWrite && writeContent && (
+				<ContentViewer
+					content={writeContent}
+					style={codeStyle}
+					title={fp ? basename(fp) : "Write"}
+				/>
+			)}
+			{!isEdit && !isWrite && toolCall.outputJson && (
 				<>
 					<Text size="xs" fw={500} mb={2}>
 						{t("output")}
 					</Text>
-					<CodeBlockWithActions
+					<ContentViewer
 						content={outputText}
 						style={codeStyle}
 						title={fp ? basename(fp) : "Output"}
@@ -337,7 +358,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</>
 			)}
 			{isEdit && !toolCall.inputJson?.old_string && (
-				<CodeBlockWithActions
+				<ContentViewer
 					content={JSON.stringify(toolCall.inputJson, null, 2)}
 					style={codeStyle}
 					title={fp ? basename(fp) : "Edit"}
@@ -360,7 +381,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	return (
 		<Box mt="xs">
 			{cmd && (
-				<CodeBlockWithActions
+				<ContentViewer
 					content={`$ ${cmd}`}
 					style={{ ...termStyle, maxHeight: 60 }}
 					title="Command"
@@ -371,14 +392,10 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mt={4} mb={2}>
 						{t("output")}
 					</Text>
-					<CodeBlockWithActions
-						content={outputText}
-						style={termStyle}
-						title={cmd ? `$ ${cmd}` : "Bash"}
-					/>
+					<ContentViewer content={outputText} style={termStyle} title={cmd ? `$ ${cmd}` : "Bash"} />
 				</>
 			)}
-			{toolCall.errorMessage && (
+			{toolCall.errorMessage && !toolCall.outputJson && (
 				<Text size="xs" c="red" mt={4}>
 					{toolCall.errorMessage}
 				</Text>
@@ -410,7 +427,7 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mt={4} mb={2}>
 						{t("output")}
 					</Text>
-					<CodeBlockWithActions
+					<ContentViewer
 						content={outputText}
 						style={codeStyle}
 						title={pattern ? `/${pattern}/` : "Search"}
@@ -436,17 +453,13 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 			<Text size="xs" fw={500} mb={2}>
 				{t("input")}
 			</Text>
-			<CodeBlockWithActions
-				content={inputText}
-				style={codeStyle}
-				title={`${toolCall.toolName} Input`}
-			/>
+			<ContentViewer content={inputText} style={codeStyle} title={`${toolCall.toolName} Input`} />
 			{toolCall.outputJson && (
 				<>
 					<Text size="xs" fw={500} mt="xs" mb={2}>
 						{t("output")}
 					</Text>
-					<CodeBlockWithActions
+					<ContentViewer
 						content={outputText}
 						style={codeStyle}
 						title={`${toolCall.toolName} Output`}
@@ -580,11 +593,7 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Text>
 			)}
 			{parsed?.output && (
-				<CodeBlockWithActions
-					content={parsed.output}
-					style={codeStyle}
-					title={`TaskOutput ${taskId}`}
-				/>
+				<ContentViewer content={parsed.output} style={codeStyle} title={`TaskOutput ${taskId}`} />
 			)}
 		</Box>
 	);
@@ -607,48 +616,33 @@ function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
 	}
 
 	return (
-		<Box mt="xs">
-			<CodeBlockWithActions content={planText} markdown contentType="markdown" title={`Plan — ${toolCall.toolName}`} />
+		<Box
+			mt="xs"
+			style={{ flex: 1, minHeight: 0, maxHeight: "calc(100vh - 200px)", overflow: "auto" }}
+		>
+			<ContentViewer
+				content={planText}
+				markdown
+				contentType="markdown"
+				title={`Plan — ${toolCall.toolName}`}
+			/>
 		</Box>
 	);
 }
 
 function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const { t } = useTranslation("narrator");
-	const questions: {
-		question: string;
-		header: string;
-		options?: { label: string; description: string }[];
-	}[] = toolCall.inputJson?.questions ?? [];
+	const questions = toolCall.inputJson?.questions ?? [];
 	const answers: Record<string, string> = toolCall.inputJson?.answers ?? {};
 
-	if (!questions.length) {
-		return <GenericDetail toolCall={toolCall} />;
+	// Don't show the read-only summary while the permission is still pending —
+	// the interactive AskUserQuestionBanner (rendered via InlinePermission) handles that.
+	if (!questions.length || toolCall.status === "running" || toolCall.status === "pending") {
+		return null;
 	}
 
 	return (
 		<Box mt="xs">
-			<Stack gap="sm">
-				{questions.map((q) => {
-					const answer = answers[q.question];
-					return (
-						<Box key={q.header}>
-							<Text size="xs" fw={600} c="dimmed" mb={2}>
-								{q.question}
-							</Text>
-							{answer ? (
-								<Text size="xs" ff="monospace" c="teal">
-									{answer}
-								</Text>
-							) : (
-								<Text size="xs" c="dimmed" fs="italic">
-									{t("skipQuestion")}
-								</Text>
-							)}
-						</Box>
-					);
-				})}
-			</Stack>
+			<AskUserQuestionBanner requestId="" questions={questions} answers={answers} readOnly />
 		</Box>
 	);
 }
@@ -714,10 +708,13 @@ function InlinePermission({
 
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
-		<Box mt="xs">
+		<Box
+			mt="xs"
+			style={planText ? { display: "flex", flexDirection: "column", flex: 1 } : undefined}
+		>
 			{planText && (
-				<Box mb="xs">
-					<CodeBlockWithActions content={planText} markdown contentType="markdown" title="Plan" />
+				<Box mb="xs" style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+					<ContentViewer content={planText} markdown contentType="markdown" title="Plan" />
 				</Box>
 			)}
 			{permission.decisionReason && (
@@ -756,10 +753,45 @@ function InlinePermission({
 	);
 }
 
+/** Check if a tool call has any truncated inputJson or outputJson */
+function hasTruncatedData(toolCall: ToolCallData): boolean {
+	return toolCall.inputJson?._truncated === true || toolCall.outputJson?._truncated === true;
+}
+
+/** Wrapper that lazy-loads full tool call data when truncated fields are detected */
+function LazyDetailRenderer({
+	toolCall,
+	narratorId,
+	opened,
+}: {
+	toolCall: ToolCallData;
+	narratorId?: string;
+	opened: boolean;
+}) {
+	const needsFetch = hasTruncatedData(toolCall) && opened && !!narratorId;
+	const { data: fullTc } = useToolCallDetail(
+		narratorId ?? "",
+		toolCall.toolUseId ?? "",
+		needsFetch,
+	);
+
+	const resolvedToolCall = useMemo(() => {
+		if (!fullTc) return toolCall;
+		return {
+			...toolCall,
+			inputJson: fullTc.inputJson ?? toolCall.inputJson,
+			outputJson: fullTc.outputJson ?? toolCall.outputJson,
+		};
+	}, [toolCall, fullTc]);
+
+	return <DetailRenderer toolCall={resolvedToolCall} />;
+}
+
 // --- Main single card ---
 
 export const ToolCallCard = memo(function ToolCallCard({
 	toolCall,
+	narratorId,
 	inRun,
 	isLast,
 	pendingPermission,
@@ -818,7 +850,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<Box p="xs">
 					<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
 					<LazyCollapse in={opened}>
-						<DetailRenderer toolCall={toolCall} />
+						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
 						{permissionUI}
 					</LazyCollapse>
 				</Box>
@@ -827,12 +859,29 @@ export const ToolCallCard = memo(function ToolCallCard({
 		);
 	}
 
+	const isExitPlanExpanded = toolCall.toolName === "ExitPlanMode" && opened;
+
 	return (
 		<Paper withBorder radius="sm" p="xs" style={borderColor ? { borderColor } : undefined}>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
 			<LazyCollapse in={opened}>
-				<DetailRenderer toolCall={toolCall} />
-				{permissionUI}
+				{isExitPlanExpanded ? (
+					<Box
+						style={{
+							height: "calc(100vh - 200px)",
+							display: "flex",
+							flexDirection: "column",
+						}}
+					>
+						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+						{permissionUI}
+					</Box>
+				) : (
+					<>
+						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+						{permissionUI}
+					</>
+				)}
 			</LazyCollapse>
 		</Paper>
 	);

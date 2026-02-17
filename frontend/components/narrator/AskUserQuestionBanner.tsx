@@ -1,4 +1,4 @@
-import { Alert, Button, Checkbox, Group, Radio, Stack, Text, Textarea } from "@mantine/core";
+import { Alert, Badge, Button, Checkbox, Group, Radio, Stack, Text, Textarea } from "@mantine/core";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -12,13 +12,19 @@ interface Question {
 interface AskUserQuestionBannerProps {
 	requestId: string;
 	questions: Question[];
-	onSubmit: (requestId: string, answers: Record<string, string>) => void;
-	onDeny: (requestId: string) => void;
+	/** Pre-filled answers — used for read-only display of completed questions */
+	answers?: Record<string, string>;
+	/** When true, render in read-only mode (no submit/skip, selections locked) */
+	readOnly?: boolean;
+	onSubmit?: (requestId: string, answers: Record<string, string>) => void;
+	onDeny?: (requestId: string) => void;
 }
 
 export function AskUserQuestionBanner({
 	requestId,
 	questions,
+	answers: savedAnswers,
+	readOnly,
 	onSubmit,
 	onDeny,
 }: AskUserQuestionBannerProps) {
@@ -31,7 +37,6 @@ export function AskUserQuestionBanner({
 		const custom = customInputs[question]?.trim();
 		return custom || selections[question] || "";
 	};
-
 	const handleRadioChange = (question: string, value: string) => {
 		setSelections((prev) => ({ ...prev, [question]: value }));
 	};
@@ -54,14 +59,34 @@ export function AskUserQuestionBanner({
 		for (const q of questions) {
 			answers[q.question] = getAnswer(q.question);
 		}
-		onSubmit(requestId, answers);
+		onSubmit?.(requestId, answers);
 	};
 
+	/** Check if a saved answer matches a specific option label (exact or within comma-separated list) */
+	const isOptionSelected = (question: string, optLabel: string) => {
+		const answer = savedAnswers?.[question];
+		if (!answer) return false;
+		return answer === optLabel || answer.split(", ").includes(optLabel);
+	};
+
+	/** Check if the saved answer is a custom (free-text) response not matching any option */
+	const getCustomAnswer = (q: Question) => {
+		const answer = savedAnswers?.[q.question];
+		if (!answer) return undefined;
+		const optionLabels = q.options.map((o) => o.label);
+		// If the answer doesn't match any option (or combination), it's custom
+		const parts = answer.split(", ");
+		if (parts.every((p) => optionLabels.includes(p))) return undefined;
+		return answer;
+	};
+	const alertColor = readOnly ? "gray" : "blue";
+
 	return (
-		<Alert color="blue" title={t("questionFromNarrator")} radius="md">
+		<Alert color={alertColor} radius="md">
 			<Stack gap="md">
 				{questions.map((q) => {
-					const hasCustom = !!customInputs[q.question]?.trim();
+					const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
+					const customAnswer = readOnly ? getCustomAnswer(q) : undefined;
 					return (
 						<Stack key={q.header} gap="xs">
 							<Text size="sm" fw={500}>
@@ -74,17 +99,29 @@ export function AskUserQuestionBanner({
 											key={opt.label}
 											label={opt.label}
 											description={opt.description}
-											disabled={hasCustom}
-											onChange={(e) =>
-												handleCheckboxChange(q.question, opt.label, e.currentTarget.checked)
+											disabled={readOnly || hasCustom}
+											checked={readOnly ? isOptionSelected(q.question, opt.label) : undefined}
+											onChange={
+												readOnly
+													? undefined
+													: (e) =>
+															handleCheckboxChange(q.question, opt.label, e.currentTarget.checked)
 											}
 										/>
 									))}
 								</Stack>
 							) : (
 								<Radio.Group
-									value={hasCustom ? "" : (selections[q.question] ?? "")}
-									onChange={(val) => handleRadioChange(q.question, val)}
+									value={
+										readOnly
+											? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")
+												? savedAnswers?.[q.question]
+												: ""
+											: hasCustom
+												? ""
+												: (selections[q.question] ?? "")
+									}
+									onChange={readOnly ? () => {} : (val) => handleRadioChange(q.question, val)}
 								>
 									<Stack gap={4}>
 										{q.options.map((opt) => (
@@ -93,32 +130,47 @@ export function AskUserQuestionBanner({
 												value={opt.label}
 												label={opt.label}
 												description={opt.description}
-												disabled={hasCustom}
+												disabled={readOnly || hasCustom}
 											/>
 										))}
 									</Stack>
 								</Radio.Group>
 							)}
-							<Textarea
-								size="xs"
-								placeholder={t("typeCustomAnswer")}
-								value={customInputs[q.question] ?? ""}
-								onChange={(e) => handleCustomInput(q.question, e.currentTarget.value)}
-								autosize
-								minRows={1}
-								maxRows={3}
-							/>
+							{readOnly ? (
+								customAnswer && (
+									<Text size="xs" ff="monospace" c="teal">
+										{customAnswer}
+									</Text>
+								)
+							) : (
+								<Textarea
+									size="xs"
+									placeholder={t("typeCustomAnswer")}
+									value={customInputs[q.question] ?? ""}
+									onChange={(e) => handleCustomInput(q.question, e.currentTarget.value)}
+									autosize
+									minRows={1}
+									maxRows={3}
+								/>
+							)}
+							{readOnly && savedAnswers?.[q.question] && (
+								<Badge size="xs" color="teal" variant="light">
+									{t("answered")}
+								</Badge>
+							)}
 						</Stack>
 					);
 				})}
-				<Group>
-					<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>
-						{t("submitAnswer")}
-					</Button>
-					<Button size="xs" color="red" variant="light" onClick={() => onDeny(requestId)}>
-						{t("skipQuestion")}
-					</Button>
-				</Group>
+				{!readOnly && (
+					<Group>
+						<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>
+							{t("submitAnswer")}
+						</Button>
+						<Button size="xs" color="red" variant="light" onClick={() => onDeny?.(requestId)}>
+							{t("skipQuestion")}
+						</Button>
+					</Group>
+				)}
 			</Stack>
 		</Alert>
 	);
