@@ -42,6 +42,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
 	permissionRequests: many(permissionRequests),
+	terminals: many(terminals),
 }));
 
 export const narratorMessagesRelations = relations(narratorMessages, ({ one, many }) => ({
@@ -76,6 +77,7 @@ export const permissionRequestsRelations = relations(permissionRequests, ({ one 
 
 export const terminalsRelations = relations(terminals, ({ one }) => ({
 	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
+	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
 }));
 
 export const containerInstancesRelations = relations(containerInstances, ({ one }) => ({

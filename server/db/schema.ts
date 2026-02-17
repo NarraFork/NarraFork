@@ -111,6 +111,7 @@ export const narratorMessages = sqliteTable(
 	(table) => [
 		index("idx_messages_narrator").on(table.narratorId, table.createdAt),
 		index("idx_messages_parent_tool_use").on(table.narratorId, table.parentToolUseId),
+		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
 	],
 );
 
@@ -166,18 +167,26 @@ export const permissionRequests = sqliteTable(
 );
 
 // === terminals ===
-export const terminals = sqliteTable("terminals", {
-	id: text("id").primaryKey(),
-	chapterId: text("chapter_id").references(() => chapters.id),
-	name: text("name").notNull(),
-	cwd: text("cwd"),
-	dtachSocket: text("dtach_socket"),
-	status: text("status", { enum: ["running", "exited"] })
-		.notNull()
-		.default("running"),
-	exitCode: integer("exit_code"),
-	createdAt: text("created_at").notNull(),
-});
+export const terminals = sqliteTable(
+	"terminals",
+	{
+		id: text("id").primaryKey(),
+		chapterId: text("chapter_id").references(() => chapters.id),
+		narratorId: text("narrator_id").references(() => narrators.id),
+		name: text("name").notNull(),
+		cwd: text("cwd"),
+		dtachSocket: text("dtach_socket"),
+		status: text("status", { enum: ["running", "exited"] })
+			.notNull()
+			.default("running"),
+		exitCode: integer("exit_code"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_terminals_chapter").on(table.chapterId),
+		index("idx_terminals_narrator").on(table.narratorId),
+	],
+);
 
 // === container_instances ===
 export const containerInstances = sqliteTable("container_instances", {
@@ -218,6 +227,9 @@ export const userPreferences = sqliteTable("user_preferences", {
 	wordWrapMarkdown: integer("word_wrap_markdown", { mode: "boolean" }).notNull().default(true),
 	wordWrapCode: integer("word_wrap_code", { mode: "boolean" }).notNull().default(true),
 	wordWrapDiff: integer("word_wrap_diff", { mode: "boolean" }).notNull().default(true),
+	replyInUserLanguage: integer("reply_in_user_language", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

@@ -3,7 +3,12 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { checkIntegrity, recoverWithCli, startWalCheckpointInterval, tryWalRecovery } from "../lib/db-resilience";
+import {
+	checkIntegrity,
+	recoverWithCli,
+	startWalCheckpointInterval,
+	tryWalRecovery,
+} from "../lib/db-resilience";
 import { logger } from "../lib/logger";
 import * as relations from "./relations";
 import * as schema from "./schema";
@@ -156,8 +161,10 @@ sqlite.run(`
 
 // Rebuild FTS indexes only after migration or unclean shutdown
 // (FTS trigram indexes can silently corrupt on crash, causing "malformed" errors on UPDATE)
-const CLEAN_SHUTDOWN_MARKER = 0x4E465243; // "NFRC"
-const appId = (sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)?.application_id ?? 0;
+const CLEAN_SHUTDOWN_MARKER = 0x4e465243; // "NFRC"
+const appId =
+	(sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
+		?.application_id ?? 0;
 const needsFtsRebuild = ftsTablesRecreated.length > 0 || appId !== CLEAN_SHUTDOWN_MARKER;
 
 if (needsFtsRebuild) {

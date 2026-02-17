@@ -6,10 +6,7 @@ try {
 	console.log("Migrations complete.");
 	process.exit(0);
 } catch (err) {
-	console.error(
-		"Migration failed:",
-		err instanceof Error ? err.message : err,
-	);
+	console.error("Migration failed:", err instanceof Error ? err.message : err);
 	if (err instanceof Error && err.stack) {
 		console.error(err.stack);
 	}

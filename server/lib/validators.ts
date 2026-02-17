@@ -64,12 +64,17 @@ export const permissionDecisionSchema = z.object({
 
 // === Terminals ===
 
-export const createTerminalSchema = z.object({
-	chapterId: z.string().min(1),
-	name: z.string().max(100).optional(),
-	cols: z.number().int().min(10).max(500).optional(),
-	rows: z.number().int().min(2).max(200).optional(),
-});
+export const createTerminalSchema = z
+	.object({
+		chapterId: z.string().min(1).optional(),
+		narratorId: z.string().min(1).optional(),
+		name: z.string().max(100).optional(),
+		cols: z.number().int().min(10).max(500).optional(),
+		rows: z.number().int().min(2).max(200).optional(),
+	})
+	.refine((d) => (d.chapterId || d.narratorId) && !(d.chapterId && d.narratorId), {
+		message: "Exactly one of chapterId or narratorId is required",
+	});
 
 // === Fork / Merge / Cleanup ===
 
@@ -183,6 +188,7 @@ export const updateUserPreferencesSchema = z.object({
 	wordWrapMarkdown: z.boolean().optional(),
 	wordWrapCode: z.boolean().optional(),
 	wordWrapDiff: z.boolean().optional(),
+	replyInUserLanguage: z.boolean().optional(),
 });
 
 // === WebSocket Messages ===
