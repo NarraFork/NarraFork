@@ -4,6 +4,9 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 
+const vitePort = Number(process.env.VITE_PORT) || 7778;
+const backendPort = Number(process.env.BACKEND_PORT) || 7779;
+
 export default defineConfig({
 	root: resolve(__dirname),
 	plugins: [
@@ -70,14 +73,14 @@ export default defineConfig({
 		minify: "terser",
 	},
 	server: {
-		port: 41221,
+		port: vitePort,
 		proxy: {
 			"/api": {
-				target: "http://localhost:7778",
+				target: `http://localhost:${backendPort}`,
 				changeOrigin: true,
 			},
 			"/ws": {
-				target: "ws://localhost:7778",
+				target: `ws://localhost:${backendPort}`,
 				ws: true,
 			},
 		},

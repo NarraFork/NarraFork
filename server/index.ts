@@ -10,7 +10,7 @@ import { recoverOnStartup as recoverNarrators } from "./services/narrator-sessio
 import { terminalService } from "./services/terminal-service";
 import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
 
-const port = settings.server.port;
+const port = Number(process.env.PORT) || settings.server.port;
 const isProd = process.env.NODE_ENV === "production";
 
 // Production: serve Vite build output via Hono
