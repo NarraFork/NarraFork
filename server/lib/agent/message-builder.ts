@@ -21,10 +21,14 @@ interface DbToolCall {
 
 /**
  *
- * Strategy:
- * - Filter out system messages and child messages (parentToolUseId != null)
- * - Tool results from completed tool calls are attached to the next user message's
+ * - Drop the last user message (it's sent as currentMessage)
+ * - Merge consecutive user messages into one
+ * - assistant content uses "." as placeholder when only tool_uses exist
+ * - Trailing orphan user messages get an auto-paired assistant "OK"
+ * - Tool results from completed tool calls attach to the next user message
  */
+	const modelId = resolveModel(model);
+
 	// Only top-level user/assistant messages
 	const topLevel = dbMessages.filter(
 		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant"),
@@ -35,15 +39,14 @@ interface DbToolCall {
 		topLevel.pop();
 	}
 
-	// Merge consecutive same-role messages (e.g. multiple user messages without assistant reply)
+	// Merge consecutive user messages (e.g. from previous failed sessions)
 	const merged: DbMessage[] = [];
 	for (const msg of topLevel) {
 		const prev = merged[merged.length - 1];
 		if (prev && prev.role === msg.role && msg.role === "user") {
-			// Merge consecutive user messages into one
 			const prevText = prev.contentText || "";
 			const curText = msg.contentText || "";
-			prev.contentText = prevText ? `${prevText}\n\n${curText}` : curText;
+			prev.contentText = prevText ? `${prevText}\n${curText}` : curText;
 		} else {
 			merged.push({ ...msg });
 		}
@@ -56,7 +59,7 @@ interface DbToolCall {
 			const textParts = content
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
+			let text = textParts.join("\n") || msg.contentText || "";
 
 			const toolUses =
 				msg.toolCalls
@@ -67,8 +70,11 @@ interface DbToolCall {
 						input: (tc.inputJson as Record<string, unknown>) ?? {},
 					})) ?? [];
 
+			if (!text && toolUses.length > 0) {
+				text = ".";
+			}
+
 					content: text,
-					messageId: msg.sdkMessageUuid ?? msg.id,
 					...(toolUses.length > 0 ? { toolUses } : {}),
 				},
 			};
@@ -96,13 +102,19 @@ interface DbToolCall {
 		} else if (msg.role === "user") {
 			const text = msg.contentText || "";
 					content: text,
-					modelId: resolveModel(model),
-					...(pendingToolResults.length > 0
-						: {}),
+					modelId,
+						pendingToolResults.length > 0 ? { toolResults: pendingToolResults } : {},
 				},
 			};
 			history.push(userMsg);
 			pendingToolResults = [];
+		}
+	}
+
+	if (history.length > 0) {
+		const last = history[history.length - 1];
+			history.push({
+			});
 		}
 	}
 
