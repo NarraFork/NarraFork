@@ -1,4 +1,16 @@
-import { ActionIcon, Badge, Loader, Paper, Stack, Switch, Table, Text, Title } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Button,
+	Group,
+	Loader,
+	Paper,
+	Stack,
+	Switch,
+	Table,
+	Text,
+	Title,
+} from "@mantine/core";
 import { IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
@@ -107,6 +119,16 @@ function AdminPage() {
 							</Table.Tbody>
 						</Table>
 					)}
+				</Stack>
+			</Paper>
+
+			<Paper withBorder p="md">
+				<Stack>
+					<Group>
+						</Button>
+						</Button>
+						</Button>
+					</Group>
 				</Stack>
 			</Paper>
 		</Stack>

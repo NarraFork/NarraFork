@@ -10,6 +10,14 @@ import { recoverOnStartup as recoverNarrators } from "./services/narrator-sessio
 import { terminalService } from "./services/terminal-service";
 import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
 
+// Catch unhandled errors to prevent silent crashes
+process.on("uncaughtException", (err) => {
+	logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
+});
+process.on("unhandledRejection", (reason) => {
+	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
+});
+
 const port = Number(process.env.PORT) || settings.server.port;
 const isProd = process.env.NODE_ENV === "production";
 
@@ -66,6 +74,14 @@ const _server = Bun.serve({
 });
 
 logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
+
+	try {
+			configPath:
+		});
+		});
+	} catch (err) {
+	}
+}
 
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
