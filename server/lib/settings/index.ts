@@ -16,6 +16,7 @@ export interface NarraForkSettings {
 		defaultPermissionMode: string;
 		summaryModel: string;
 		customModels: ModelOption[];
+		extendedContext: boolean;
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -35,6 +36,10 @@ export interface NarraForkSettings {
 		jwtSecret: string;
 		registrationOpen: boolean;
 	};
+		credentialsPath: string;
+		configPath: string;
+		defaultModel?: string;
+	};
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -45,6 +50,7 @@ const DEFAULTS: NarraForkSettings = {
 		defaultPermissionMode: "default",
 		summaryModel: "claude-haiku",
 		customModels: [],
+		extendedContext: false,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,

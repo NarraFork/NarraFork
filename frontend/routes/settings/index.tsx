@@ -7,6 +7,7 @@ import {
 	NumberInput,
 	Paper,
 	Select,
+	Slider,
 	Stack,
 	Switch,
 	Text,
@@ -21,6 +22,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
+import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { BUILTIN_MODELS } from "../../lib/constants";
@@ -56,6 +58,8 @@ function SettingsPage() {
 	const [customModels, setCustomModels] = useState<Array<{ value: string; label: string }>>([]);
 	const [newModelValue, setNewModelValue] = useState("");
 	const [newModelLabel, setNewModelLabel] = useState("");
+	const [extendedContext, setExtendedContext] = useState(false);
+	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
 	const [maxContainers, setMaxContainers] = useState(5);
@@ -80,6 +84,7 @@ function SettingsPage() {
 		permissionMode: "default",
 		summaryModel: "claude-haiku",
 		customModels: [] as Array<{ value: string; label: string }>,
+		extendedContext: false,
 		maxWorktrees: 10,
 		maxContainers: 5,
 		sizeWarning: 500,
@@ -99,6 +104,7 @@ function SettingsPage() {
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				summaryModel: settings.agent?.summaryModel ?? "claude-haiku",
 				customModels: settings.agent?.customModels ?? [],
+				extendedContext: settings.agent?.extendedContext ?? false,
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -115,6 +121,7 @@ function SettingsPage() {
 			setPermissionMode(snap.permissionMode);
 			setSummaryModel(snap.summaryModel);
 			setCustomModels(snap.customModels);
+			setExtendedContext(snap.extendedContext);
 			setMaxWorktrees(snap.maxWorktrees);
 			setMaxContainers(snap.maxContainers);
 			setSizeWarning(snap.sizeWarning);
@@ -137,6 +144,7 @@ function SettingsPage() {
 			permissionMode !== s.permissionMode ||
 			summaryModel !== s.summaryModel ||
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
+			extendedContext !== s.extendedContext ||
 			maxWorktrees !== s.maxWorktrees ||
 			maxContainers !== s.maxContainers ||
 			sizeWarning !== s.sizeWarning ||
@@ -154,6 +162,7 @@ function SettingsPage() {
 		permissionMode,
 		summaryModel,
 		customModels,
+		extendedContext,
 		maxWorktrees,
 		maxContainers,
 		sizeWarning,
@@ -202,6 +211,7 @@ function SettingsPage() {
 					defaultPermissionMode: permissionMode,
 					summaryModel,
 					customModels,
+					extendedContext,
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -225,6 +235,7 @@ function SettingsPage() {
 						permissionMode,
 						summaryModel,
 						customModels: [...customModels],
+						extendedContext,
 						maxWorktrees,
 						maxContainers,
 						sizeWarning,
@@ -319,6 +330,12 @@ function SettingsPage() {
 						searchable
 						value={summaryModel}
 						onChange={(v) => setSummaryModel(v ?? "claude-haiku")}
+					/>
+					<Switch
+						label={t("extendedContext")}
+						description={t("extendedContextDesc")}
+						checked={extendedContext}
+						onChange={(e) => setExtendedContext(e.currentTarget.checked)}
 					/>
 					<Stack gap="xs">
 						<Text size="sm" fw={500}>
@@ -487,6 +504,60 @@ function SettingsPage() {
 						label={t("wordWrapDiff")}
 						checked={userPrefs?.wordWrapDiff ?? true}
 						onChange={(e) => updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })}
+					/>
+				</Stack>
+			</Paper>
+
+			{/* Terminal */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("terminalSection")}</Title>
+					<Select
+						label={t("terminalTheme")}
+						data={[
+							{ value: "auto", label: t("terminalThemeAuto") },
+							...TERMINAL_THEMES.map((th) => ({ value: th.key, label: th.label })),
+						]}
+						value={userPrefs?.terminalTheme ?? "auto"}
+						onChange={(v) => updateUserPref.mutate({ terminalTheme: v ?? "auto" })}
+					/>
+					<Stack gap={4}>
+						<Text size="sm" fw={500}>
+							{t("terminalFontSize")}
+						</Text>
+						<Group>
+							<Slider
+								value={localFontSize ?? userPrefs?.terminalFontSize ?? 14}
+								onChange={setLocalFontSize}
+								onChangeEnd={(v) => {
+									setLocalFontSize(null);
+									updateUserPref.mutate({ terminalFontSize: v });
+								}}
+								min={8}
+								max={32}
+								step={1}
+								style={{ flex: 1 }}
+								marks={[
+									{ value: 8, label: "8" },
+									{ value: 14, label: "14" },
+									{ value: 20, label: "20" },
+									{ value: 32, label: "32" },
+								]}
+							/>
+						</Group>
+					</Stack>
+				</Stack>
+			</Paper>
+
+			{/* Debug (per-user preferences) */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("debugSection")}</Title>
+					<Switch
+						label={t("showTokenUsage")}
+						description={t("showTokenUsageDesc")}
+						checked={userPrefs?.showTokenUsage ?? false}
+						onChange={(e) => updateUserPref.mutate({ showTokenUsage: e.currentTarget.checked })}
 					/>
 				</Stack>
 			</Paper>

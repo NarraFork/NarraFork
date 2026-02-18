@@ -9,6 +9,8 @@
 	"summaryModel": "摘要模型",
 	"customModels": "模型列表",
 	"customModelsDesc": "内置模型不可编辑或删除。可在下方添加自定义模型 ID。",
+	"extendedContext": "扩展上下文（1M tokens）",
+	"extendedContextDesc": "为支持的模型启用 1M token 上下文窗口（Opus 4.6、Sonnet 4.5、Sonnet 4）",
 	"modelValuePlaceholder": "模型 ID",
 	"modelLabelPlaceholder": "显示名称",
 	"chaptersSection": "章节",
@@ -37,5 +39,12 @@
 	"wordWrapMarkdown": "Markdown",
 	"wordWrapCode": "代码",
 	"wordWrapDiff": "Diff",
+	"debugSection": "调试",
+	"showTokenUsage": "显示每轮对话的 Token 用量",
+	"showTokenUsageDesc": "每轮对话结束后显示输入/输出 Token 数量",
+	"terminalSection": "终端",
+	"terminalTheme": "终端主题",
+	"terminalThemeAuto": "自动（跟随系统）",
+	"terminalFontSize": "字体大小",
 	"unsavedSave": "保存更改"
 }
