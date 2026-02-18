@@ -8,3 +8,14 @@
 .root > *:first-child {
 	margin-top: 0 !important;
 }
+
+.rootNoWrap {
+	min-width: 0;
+	max-width: 100%;
+	overflow-x: auto;
+	white-space: pre;
+}
+
+.rootNoWrap > *:first-child {
+	margin-top: 0 !important;
+}

@@ -3,6 +3,7 @@ import { getToken } from "../lib/api";
 
 interface NarratorWSCallbacks {
 	onMessage?: (data: any) => void;
+	onUserMessage?: (data: any) => void;
 	onStreamEvent?: (data: any) => void;
 	onPermissionRequest?: (request: any) => void;
 	onPermissionResolved?: (requestId: string) => void;
@@ -57,6 +58,9 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 					switch (data.type) {
 						case "message":
 							callbacksRef.current.onMessage?.(data);
+							break;
+						case "user_message":
+							callbacksRef.current.onUserMessage?.(data);
 							break;
 						case "stream_event":
 							callbacksRef.current.onStreamEvent?.(data);

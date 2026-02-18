@@ -9,6 +9,8 @@ import {
 	portAllocations,
 	projects,
 	terminals,
+	terminalTabs,
+	terminalViewState,
 	userFavoriteDirectories,
 	userPreferences,
 	users,
@@ -78,6 +80,17 @@ export const permissionRequestsRelations = relations(permissionRequests, ({ one 
 export const terminalsRelations = relations(terminals, ({ one }) => ({
 	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
+}));
+
+export const terminalTabsRelations = relations(terminalTabs, ({ one }) => ({
+	chapter: one(chapters, { fields: [terminalTabs.chapterId], references: [chapters.id] }),
+	narrator: one(narrators, { fields: [terminalTabs.narratorId], references: [narrators.id] }),
+}));
+
+export const terminalViewStateRelations = relations(terminalViewState, ({ one }) => ({
+	user: one(users, { fields: [terminalViewState.userId], references: [users.id] }),
+	chapter: one(chapters, { fields: [terminalViewState.chapterId], references: [chapters.id] }),
+	narrator: one(narrators, { fields: [terminalViewState.narratorId], references: [narrators.id] }),
 }));
 
 export const containerInstancesRelations = relations(containerInstances, ({ one }) => ({

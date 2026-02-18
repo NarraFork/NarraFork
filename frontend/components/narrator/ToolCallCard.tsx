@@ -333,6 +333,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						<DiffView
 							oldStr={toolCall.inputJson.old_string}
 							newStr={toolCall.inputJson.new_string ?? ""}
+							maxHeight={200}
 							wordWrap={wordWrap}
 						/>
 					)}
@@ -392,7 +393,11 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mt={4} mb={2}>
 						{t("output")}
 					</Text>
-					<ContentViewer content={outputText} style={termStyle} title={cmd ? `$ ${cmd}` : "Bash"} />
+					<ContentViewer
+						content={outputText}
+						style={termStyle}
+						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Bash"}
+					/>
 				</>
 			)}
 			{toolCall.errorMessage && !toolCall.outputJson && (

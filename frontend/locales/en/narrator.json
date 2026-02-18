@@ -4,6 +4,7 @@
 	"thinking": "Thinking",
 	"planning": "Planning",
 	"compacting": "Context full, compacting...",
+	"compacted": "Context compacted",
 	"sendPlaceholder": "Send a message...",
 	"interrupt": "Interrupt",
 	"permissionRequest": "Permission Request",

@@ -4,6 +4,7 @@
 	"thinking": "思考中",
 	"planning": "计划中",
 	"compacting": "上下文已满，正在压缩...",
+	"compacted": "上下文已压缩",
 	"sendPlaceholder": "发送消息...",
 	"interrupt": "中断",
 	"permissionRequest": "权限请求",

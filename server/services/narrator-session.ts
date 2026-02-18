@@ -435,6 +435,14 @@ async function createSession(
 		// Custom compact logic (runCustomCompact / handleCompactRotation) is preserved
 		// and can be activated by setting _compactTriggered = true + interrupting here.
 		logger.info("PreCompact triggered, allowing SDK compact", { narratorId });
+
+		// Persist a system message so compact state survives page reloads
+		const compactMsg = await narratorService.persistCompactingMessage(narratorId);
+		broadcastToNarrator(narratorId, {
+			type: "message",
+			narratorId,
+			message: compactMsg,
+		});
 		broadcastToNarrator(narratorId, { type: "compacting", narratorId });
 		return {};
 	};
@@ -517,6 +525,9 @@ async function createSession(
 			resume: resumeSessionId,
 			...(isFullFork && { forkSession: true }),
 			...(isFullFork && resumeSessionAt && { resumeSessionAt }),
+			...(settings.agent.extendedContext && {
+				betas: ["context-1m-2025-08-07"] as const,
+			}),
 			includePartialMessages: true,
 			systemPrompt: systemPromptOption,
 			permissionMode: (narrator.sdkPlanMode ? "plan" : "default") as PermissionMode,
@@ -561,6 +572,7 @@ async function consumeSDKMessages(session: ActiveSession): Promise<void> {
 	const { narratorId, locale } = session;
 	let shouldUpdateTitle = false;
 	let titleTracked = false;
+	let lastAssistantMsgId: string | null = null;
 
 	try {
 		for await (const message of session.query) {
@@ -601,8 +613,21 @@ async function consumeSDKMessages(session: ActiveSession): Promise<void> {
 					.where(eq(narrators.id, narratorId));
 			}
 
+			// Track last assistant message ID for cost attribution
+			if (event?.type === "assistant_message" && event.data?.id) {
+				lastAssistantMsgId = event.data.id;
+			}
+
 			if (event) {
 				session.events.emit("event", event);
+			}
+
+			// After each turn completes, write cost + usage to last assistant message
+			if (message.type === "result" && lastAssistantMsgId) {
+				const costUsd = message.total_cost_usd ?? 0;
+				const usage = message.usage ?? null;
+				await narratorService.updateMessageCost(lastAssistantMsgId, costUsd, usage);
+				lastAssistantMsgId = null;
 			}
 
 			// After each turn completes, handle feedback/buffered messages
@@ -621,6 +646,11 @@ async function consumeSDKMessages(session: ActiveSession): Promise<void> {
 					const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
 						{ type: "text", text: fb.feedbackText },
 					]);
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: userMsg,
+					});
 					session.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "thinking");
 					await feedMessageInternal(session, fb.feedbackText);
@@ -643,6 +673,11 @@ async function consumeSDKMessages(session: ActiveSession): Promise<void> {
 						const userMsg = await narratorService.persistUserMessage(narratorId, buffered.text, [
 							{ type: "text", text: buffered.text },
 						]);
+						broadcastToNarrator(narratorId, {
+							type: "user_message",
+							narratorId,
+							message: userMsg,
+						});
 						session.events.emit("event", { type: "user_message", data: userMsg });
 						await narratorService.updateStatus(narratorId, "thinking");
 						await feedMessageInternal(session, buffered.text, buffered.images);
@@ -789,6 +824,11 @@ async function handleCompactRotation(
 		const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
 			{ type: "text", text: fb.feedbackText },
 		]);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: userMsg,
+		});
 		newSession.events.emit("event", { type: "user_message", data: userMsg });
 		await narratorService.updateStatus(narratorId, "thinking");
 		await feedMessageInternal(newSession, fb.feedbackText);
@@ -807,6 +847,11 @@ async function handleCompactRotation(
 		const userMsg = await narratorService.persistUserMessage(narratorId, buffered.text, [
 			{ type: "text", text: buffered.text },
 		]);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: userMsg,
+		});
 		newSession.events.emit("event", { type: "user_message", data: userMsg });
 		await narratorService.updateStatus(narratorId, "thinking");
 		await feedMessageInternal(newSession, buffered.text, buffered.images);
@@ -1081,8 +1126,27 @@ async function processSDKMessage(
 					numTurns: message.num_turns,
 					durationMs: message.duration_ms,
 					isError: message.is_error,
+					usage: message.usage ?? null,
 				},
 			};
+		}
+
+		case "system": {
+			const subtype = message.subtype;
+			if (subtype === "compact_boundary") {
+				logger.info("Compact boundary received", { narratorId });
+				// Update the "compacting" system message to "compacted"
+				const updated = await narratorService.finalizeCompactingMessage(narratorId);
+				if (updated) {
+					broadcastToNarrator(narratorId, {
+						type: "message",
+						narratorId,
+						message: updated,
+					});
+				}
+				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+			}
+			return null;
 		}
 
 		default:
@@ -1138,6 +1202,12 @@ export async function* startSession(
 	session.events.on("event", onEvent);
 
 	// Emit user_message AFTER subscribing so it's not lost
+	// Broadcast to all WS subscribers so other clients see the user message in real-time
+	broadcastToNarrator(narratorId, {
+		type: "user_message",
+		narratorId,
+		message: userMsg,
+	});
 	yield { type: "user_message", data: userMsg };
 
 	try {

@@ -76,7 +76,9 @@ export const narrators = sqliteTable(
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
-		status: text("status", { enum: ["idle", "thinking", "waiting", "done", "archived", "error"] })
+		status: text("status", {
+			enum: ["idle", "thinking", "waiting", "done", "archived", "error", "interrupted"],
+		})
 			.notNull()
 			.default("idle"),
 		sdkPlanMode: integer("sdk_plan_mode", { mode: "boolean" }).notNull().default(false),
@@ -104,8 +106,8 @@ export const narratorMessages = sqliteTable(
 		contentJson: text("content_json", { mode: "json" }).notNull(),
 		contentText: text("content_text"),
 		tokensIn: integer("tokens_in"),
-		tokensOut: integer("tokens_out"),
 		costUsd: real("cost_usd"),
+		turnUsageJson: text("turn_usage_json", { mode: "json" }),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -188,6 +190,48 @@ export const terminals = sqliteTable(
 	],
 );
 
+// === terminal_tabs ===
+export const terminalTabs = sqliteTable(
+	"terminal_tabs",
+	{
+		id: text("id").primaryKey(),
+		chapterId: text("chapter_id").references(() => chapters.id),
+		narratorId: text("narrator_id").references(() => narrators.id),
+		name: text("name").notNull(),
+		sortOrder: integer("sort_order").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_terminal_tabs_chapter").on(table.chapterId, table.sortOrder),
+		index("idx_terminal_tabs_narrator").on(table.narratorId, table.sortOrder),
+	],
+);
+
+// === terminal_view_state ===
+export const terminalViewState = sqliteTable(
+	"terminal_view_state",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id),
+		chapterId: text("chapter_id").references(() => chapters.id),
+		narratorId: text("narrator_id").references(() => narrators.id),
+		layout: text("layout", {
+			enum: ["single", "split-h", "split-v", "triple", "quad"],
+		})
+			.notNull()
+			.default("single"),
+		activeTabId: text("active_tab_id"),
+		panelAssignments: text("panel_assignments", { mode: "json" }),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_view_state_user_chapter").on(table.userId, table.chapterId),
+		uniqueIndex("idx_view_state_user_narrator").on(table.userId, table.narratorId),
+	],
+);
+
 // === container_instances ===
 export const containerInstances = sqliteTable("container_instances", {
 	id: text("id").primaryKey(),
@@ -230,6 +274,9 @@ export const userPreferences = sqliteTable("user_preferences", {
 	replyInUserLanguage: integer("reply_in_user_language", { mode: "boolean" })
 		.notNull()
 		.default(false),
+	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
+	terminalTheme: text("terminal_theme").notNull().default("auto"),
+	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

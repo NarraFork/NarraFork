@@ -389,6 +389,23 @@ export const narratorService = {
 		return msg;
 	},
 
+	async persistCompactingMessage(narratorId: string) {
+		const id = generateId();
+		const now = new Date().toISOString();
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "compact", status: "compacting" }],
+				contentText: "[Compacting]",
+				createdAt: now,
+			})
+			.returning();
+		return msg;
+	},
+
 	async persistCompactMessage(narratorId: string, summary: string) {
 		const id = generateId();
 		const now = new Date().toISOString();
@@ -398,12 +415,34 @@ export const narratorService = {
 				id,
 				narratorId,
 				role: "system",
-				contentJson: [{ type: "text", text: "[Context compacted]" }],
+				contentJson: [{ type: "compact", status: "compacted" }],
 				contentText: `[Compact] ${summary.slice(0, 200)}...`,
 				createdAt: now,
 			})
 			.returning();
 		return msg;
+	},
+
+	/** Update the most recent "compacting" system message to "compacted" status. */
+	async finalizeCompactingMessage(narratorId: string) {
+		const msg = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "system"),
+				eq(narratorMessages.contentText, "[Compacting]"),
+			),
+			orderBy: (m, { desc }) => [desc(m.createdAt)],
+		});
+		if (!msg) return null;
+		const [updated] = await db
+			.update(narratorMessages)
+			.set({
+				contentJson: [{ type: "compact", status: "compacted" }],
+				contentText: "[Compacted]",
+			})
+			.where(eq(narratorMessages.id, msg.id))
+			.returning();
+		return updated;
 	},
 
 	async persistAssistantMessage(
@@ -437,7 +476,6 @@ export const narratorService = {
 				contentJson: content,
 				contentText: contentText || null,
 				tokensIn: usage?.input_tokens,
-				tokensOut: usage?.output_tokens,
 				createdAt: now,
 			})
 			.returning();
@@ -480,6 +518,16 @@ export const narratorService = {
 			.where(eq(narrators.id, narratorId));
 	},
 
+	async updateMessageCost(messageId: string, costUsd: number, turnUsage?: Record<string, unknown>) {
+		await db
+			.update(narratorMessages)
+			.set({
+				costUsd,
+				...(turnUsage ? { turnUsageJson: turnUsage } : {}),
+			})
+			.where(eq(narratorMessages.id, messageId));
+	},
+
 	async updateTitle(narratorId: string, title: string) {
 		const now = new Date().toISOString();
 		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
@@ -511,7 +559,7 @@ export const narratorService = {
 
 	async updateStatus(
 		narratorId: string,
-		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error",
+		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
 		errorMessage?: string,
 	) {
 		const now = new Date().toISOString();

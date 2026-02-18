@@ -37,6 +37,7 @@ export type NarratorServerMessage =
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "session_error" }
 	| { type: "sdk_plan_mode_changed"; narratorId: string; sdkPlanMode: boolean }
+	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
 	| { type: "error"; message: string };

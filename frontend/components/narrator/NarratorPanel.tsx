@@ -95,6 +95,10 @@ if (typeof document !== "undefined") {
 		style.textContent = `@keyframes highlight-blink {
 			0%, 100% { background-color: transparent }
 			25%, 75% { background-color: var(--mantine-color-yellow-light) }
+		}
+		@keyframes indeterminate-slide {
+			0% { transform: translateX(-100%) }
+			100% { transform: translateX(433%) }
 		}`;
 		document.head.appendChild(style);
 	}
@@ -222,6 +226,43 @@ const SubagentCard = memo(
 		const prompt = input.prompt ?? "";
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
+		// Clamp card height to 80% of the nearest scroll container (chat viewport).
+		// Read once after mount via DOM traversal — works regardless of render timing.
+		const cardRef = useRef<HTMLDivElement>(null);
+		const scrollBoxRef = useRef<HTMLDivElement>(null);
+		const [vpHeight, setVpHeight] = useState<number | undefined>();
+		useEffect(() => {
+			const node = cardRef.current;
+			if (!node || vpHeight) return;
+			let el: HTMLElement | null = node.parentElement;
+			while (el) {
+				const ov = getComputedStyle(el).overflowY;
+				if (ov === "scroll" || ov === "auto") {
+					setVpHeight(el.clientHeight * 0.8);
+					return;
+				}
+				el = el.parentElement;
+			}
+		});
+		const prevChildCount = useRef(childMessages.length);
+		useEffect(() => {
+			const el = scrollBoxRef.current;
+			if (!el) return;
+			if (childMessages.length > prevChildCount.current) {
+				el.scrollTop = el.scrollHeight;
+			}
+			prevChildCount.current = childMessages.length;
+		}, [childMessages.length]);
+		// Scroll to bottom after expand animation finishes (LazyCollapse ~200ms)
+		useEffect(() => {
+			if (!expanded) return;
+			const t = setTimeout(() => {
+				const el = scrollBoxRef.current;
+				if (el) el.scrollTop = el.scrollHeight;
+			}, 250);
+			return () => clearTimeout(t);
+		}, [expanded]);
+
 		// Extract result text from outputJson
 		const resultText = useMemo(() => {
 			const out = toolCall.outputJson;
@@ -274,7 +315,7 @@ const SubagentCard = memo(
 		}, [isSoleInRun, isTerminal]);
 
 		const content = (
-			<Box>
+			<Box ref={cardRef}>
 				{/* Header: two-line collapsed view */}
 				<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
 					{/* Line 1: icon | type | model | calls | status | duration | chevron */}
@@ -320,206 +361,213 @@ const SubagentCard = memo(
 						{description}
 					</Text>
 				</UnstyledButton>
-				<LazyCollapse in={expanded}>
-					{/* Background agent warning */}
-					{showBgWarning && (
-						<Alert
-							icon={<IconAlertTriangle size={16} />}
-							color="orange"
-							variant="light"
-							mx="xs"
-							mb={4}
-							p="xs"
-							styles={{ message: { fontSize: 12 } }}
-						>
-							<Group gap="xs" justify="space-between" wrap="nowrap">
-								<Text size="xs">{t("bgAgentWarning")}</Text>
-								<Button
-									size="compact-xs"
-									variant="light"
-									color="orange"
-									style={{ flexShrink: 0 }}
-									onClick={() => onBgAgentRetry(toolCall.toolUseId ?? "")}
-								>
-									{t("bgAgentRetry")}
-								</Button>
-							</Group>
-						</Alert>
-					)}
-					{/* Result — shown directly when expanded */}
-					{resultText && (
-						<Box px="xs" pb={4}>
-							<ContentViewer
-								content={resultText}
-								style={{
-									fontSize: 11,
-									maxHeight: 300,
-									overflow: "auto",
-									whiteSpace: "pre-wrap",
-								}}
-								title={`${agentType} — ${description}`}
-								markdown={useMarkdown}
-								contentType={useMarkdown ? "markdown" : "code"}
-							/>
-						</Box>
-					)}
-					{/* Prompt — collapsed by default */}
-					{prompt && (
-						<Box px="xs" pb={4}>
-							<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
-								<Group gap={4}>
-									{showPrompt ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-									<Text size="xs" c="dimmed" fw={500}>
-										Prompt
-									</Text>
+				<Box>
+					<LazyCollapse in={expanded}>
+						{/* Background agent warning */}
+						{showBgWarning && (
+							<Alert
+								icon={<IconAlertTriangle size={16} />}
+								color="orange"
+								variant="light"
+								mx="xs"
+								mb={4}
+								p="xs"
+								styles={{ message: { fontSize: 12 } }}
+							>
+								<Group gap="xs" justify="space-between" wrap="nowrap">
+									<Text size="xs">{t("bgAgentWarning")}</Text>
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="orange"
+										style={{ flexShrink: 0 }}
+										onClick={() => onBgAgentRetry(toolCall.toolUseId ?? "")}
+									>
+										{t("bgAgentRetry")}
+									</Button>
 								</Group>
-							</UnstyledButton>
-							<LazyCollapse in={showPrompt}>
-								<Box mt={4}>
-									<ContentViewer
-										content={prompt}
+							</Alert>
+						)}
+						{/* Result — shown directly when expanded */}
+						{resultText && (
+							<Box px="xs" pb={4}>
+								<ContentViewer
+									content={resultText}
+									style={{
+										fontSize: 11,
+										maxHeight: 300,
+										overflow: "auto",
+										whiteSpace: "pre-wrap",
+									}}
+									title={`${agentType} — ${description}`}
+									markdown={useMarkdown}
+									contentType={useMarkdown ? "markdown" : "code"}
+								/>
+							</Box>
+						)}
+						{/* Prompt — collapsed by default */}
+						{prompt && (
+							<Box px="xs" pb={4}>
+								<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
+									<Group gap={4}>
+										{showPrompt ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+										<Text size="xs" c="dimmed" fw={500}>
+											Prompt
+										</Text>
+									</Group>
+								</UnstyledButton>
+								<LazyCollapse in={showPrompt}>
+									<Box mt={4}>
+										<ContentViewer
+											content={prompt}
+											style={{
+												fontSize: 11,
+												maxHeight: 200,
+												overflow: "auto",
+												whiteSpace: "pre-wrap",
+											}}
+											title="Prompt"
+										/>
+									</Box>
+								</LazyCollapse>
+							</Box>
+						)}
+						{/* Permission-pending child — shown standalone outside the collapsed tool calls list */}
+						{permChild && permCb?.pendingPermission && (
+							<Box px="xs" pb="xs">
+								<ToolCallCard
+									toolCall={permChild.tc}
+									narratorId={narratorId}
+									pendingPermission={permCb.pendingPermission}
+									onPermissionDecision={permCb.onPermissionDecision}
+									onQuestionSubmit={permCb.onQuestionSubmit}
+									onQuestionDeny={permCb.onQuestionDeny}
+									editExpandOverride={editExpandOverride}
+								/>
+							</Box>
+						)}
+						{/* Child tool calls — collapsed by default */}
+						{childToolCalls.length > 0 && (
+							<Box px="xs" pb="xs">
+								<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
+									<Group gap={4}>
+										{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+										<Text size="xs" c="dimmed">
+											{childToolCalls.length} tool calls
+										</Text>
+									</Group>
+								</UnstyledButton>
+								<LazyCollapse in={showCalls}>
+									<Box
+										ref={scrollBoxRef}
+										pl="md"
+										mt={4}
 										style={{
-											fontSize: 11,
-											maxHeight: 200,
-											overflow: "auto",
-											whiteSpace: "pre-wrap",
+											borderLeft: "2px solid var(--mantine-color-indigo-3)",
+											overflow: "hidden auto",
+											maxHeight: vpHeight,
 										}}
-										title="Prompt"
-									/>
-								</Box>
-							</LazyCollapse>
-						</Box>
-					)}
-					{/* Permission-pending child — shown standalone outside the collapsed tool calls list */}
-					{permChild && permCb?.pendingPermission && (
-						<Box px="xs" pb="xs">
-							<ToolCallCard
-								toolCall={permChild.tc}
-								narratorId={narratorId}
-								pendingPermission={permCb.pendingPermission}
-								onPermissionDecision={permCb.onPermissionDecision}
-								onQuestionSubmit={permCb.onQuestionSubmit}
-								onQuestionDeny={permCb.onQuestionDeny}
-								editExpandOverride={editExpandOverride}
-							/>
-						</Box>
-					)}
-					{/* Child tool calls — collapsed by default */}
-					{childToolCalls.length > 0 && (
-						<Box px="xs" pb="xs">
-							<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
-								<Group gap={4}>
-									{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-									<Text size="xs" c="dimmed">
-										{childToolCalls.length} tool calls
-									</Text>
-								</Group>
-							</UnstyledButton>
-							<LazyCollapse in={showCalls}>
-								<Box
-									pl="md"
-									mt={4}
-									style={{ borderLeft: "2px solid var(--mantine-color-indigo-3)" }}
-								>
-									{(() => {
-										const els: React.ReactNode[] = [];
-										let ci = 0;
-										while (ci < childToolCalls.length) {
-											const item = childToolCalls[ci];
-											const subCh = item.childMsg?.children;
-											const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Task";
-											if (isSub) {
-												els.push(
-													<div key={item.toolUseId ?? item.tc.toolName} id={`msg-${item.msgId}`}>
-														<SubagentCard
-															toolCall={item.tc}
-															childMessages={subCh}
-															narratorId={narratorId}
-															permCb={permCb}
-															editExpandOverride={editExpandOverride}
-															onBgAgentRetry={permCb?.onBgAgentRetry}
-														/>
-													</div>,
-												);
-												ci++;
-												continue;
+									>
+										{(() => {
+											const els: React.ReactNode[] = [];
+											let ci = 0;
+											while (ci < childToolCalls.length) {
+												const item = childToolCalls[ci];
+												const subCh = item.childMsg?.children;
+												const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Task";
+												if (isSub) {
+													els.push(
+														<div key={item.toolUseId ?? item.tc.toolName} id={`msg-${item.msgId}`}>
+															<SubagentCard
+																toolCall={item.tc}
+																childMessages={subCh}
+																narratorId={narratorId}
+																permCb={permCb}
+																editExpandOverride={editExpandOverride}
+																onBgAgentRetry={permCb?.onBgAgentRetry}
+															/>
+														</div>,
+													);
+													ci++;
+													continue;
+												}
+												// Collect consecutive non-subagent calls into a run
+												const run: typeof childToolCalls = [item];
+												let j = ci + 1;
+												while (j < childToolCalls.length) {
+													const nx = childToolCalls[j];
+													const nxCh = nx.childMsg?.children;
+													if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Task") break;
+													run.push(nx);
+													j++;
+												}
+												if (run.length >= 2) {
+													els.push(
+														<Box
+															key={`crun-${run[0].msgId}`}
+															style={{
+																border: "1px solid var(--mantine-color-default-border)",
+																borderRadius: "var(--mantine-radius-sm)",
+																overflow: "hidden",
+															}}
+														>
+															{run.map((r, ri) => {
+																const mp =
+																	permCb?.pendingPermission &&
+																	r.tc.toolUseId &&
+																	r.tc.toolUseId === permCb.pendingPermission.toolUseId
+																		? permCb.pendingPermission
+																		: null;
+																return (
+																	<div key={r.toolUseId ?? r.tc.toolName} id={`msg-${r.msgId}`}>
+																		<ToolCallCard
+																			toolCall={r.tc}
+																			narratorId={narratorId}
+																			inRun
+																			isLast={ri === run.length - 1}
+																			pendingPermission={mp}
+																			onPermissionDecision={permCb?.onPermissionDecision}
+																			onQuestionSubmit={permCb?.onQuestionSubmit}
+																			onQuestionDeny={permCb?.onQuestionDeny}
+																			editExpandOverride={editExpandOverride}
+																		/>
+																	</div>
+																);
+															})}
+														</Box>,
+													);
+												} else {
+													const r = run[0];
+													const mp =
+														permCb?.pendingPermission &&
+														r.tc.toolUseId &&
+														r.tc.toolUseId === permCb.pendingPermission.toolUseId
+															? permCb.pendingPermission
+															: null;
+													els.push(
+														<div key={r.toolUseId ?? r.tc.toolName} id={`msg-${r.msgId}`}>
+															<ToolCallCard
+																toolCall={r.tc}
+																narratorId={narratorId}
+																pendingPermission={mp}
+																onPermissionDecision={permCb?.onPermissionDecision}
+																onQuestionSubmit={permCb?.onQuestionSubmit}
+																onQuestionDeny={permCb?.onQuestionDeny}
+																editExpandOverride={editExpandOverride}
+															/>
+														</div>,
+													);
+												}
+												ci = j;
 											}
-											// Collect consecutive non-subagent calls into a run
-											const run: typeof childToolCalls = [item];
-											let j = ci + 1;
-											while (j < childToolCalls.length) {
-												const nx = childToolCalls[j];
-												const nxCh = nx.childMsg?.children;
-												if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Task") break;
-												run.push(nx);
-												j++;
-											}
-											if (run.length >= 2) {
-												els.push(
-													<Box
-														key={`crun-${run[0].msgId}`}
-														style={{
-															border: "1px solid var(--mantine-color-default-border)",
-															borderRadius: "var(--mantine-radius-sm)",
-															overflow: "hidden",
-														}}
-													>
-														{run.map((r, ri) => {
-															const mp =
-																permCb?.pendingPermission &&
-																r.tc.toolUseId &&
-																r.tc.toolUseId === permCb.pendingPermission.toolUseId
-																	? permCb.pendingPermission
-																	: null;
-															return (
-																<div key={r.toolUseId ?? r.tc.toolName} id={`msg-${r.msgId}`}>
-																	<ToolCallCard
-																		toolCall={r.tc}
-																		narratorId={narratorId}
-																		inRun
-																		isLast={ri === run.length - 1}
-																		pendingPermission={mp}
-																		onPermissionDecision={permCb?.onPermissionDecision}
-																		onQuestionSubmit={permCb?.onQuestionSubmit}
-																		onQuestionDeny={permCb?.onQuestionDeny}
-																		editExpandOverride={editExpandOverride}
-																	/>
-																</div>
-															);
-														})}
-													</Box>,
-												);
-											} else {
-												const r = run[0];
-												const mp =
-													permCb?.pendingPermission &&
-													r.tc.toolUseId &&
-													r.tc.toolUseId === permCb.pendingPermission.toolUseId
-														? permCb.pendingPermission
-														: null;
-												els.push(
-													<div key={r.toolUseId ?? r.tc.toolName} id={`msg-${r.msgId}`}>
-														<ToolCallCard
-															toolCall={r.tc}
-															narratorId={narratorId}
-															pendingPermission={mp}
-															onPermissionDecision={permCb?.onPermissionDecision}
-															onQuestionSubmit={permCb?.onQuestionSubmit}
-															onQuestionDeny={permCb?.onQuestionDeny}
-															editExpandOverride={editExpandOverride}
-														/>
-													</div>,
-												);
-											}
-											ci = j;
-										}
-										return els;
-									})()}
-								</Box>
-							</LazyCollapse>
-						</Box>
-					)}
-				</LazyCollapse>
+											return els;
+										})()}
+									</Box>
+								</LazyCollapse>
+							</Box>
+						)}
+					</LazyCollapse>
+				</Box>
 				{inRun && !isLast && <Divider />}
 			</Box>
 		);
@@ -710,6 +758,7 @@ function renderTreeMessages(
 	permCb: PermissionCallbacks,
 	expandedToolUseId?: string | null,
 	editExpandOverride?: boolean | null,
+	showTokenUsage?: boolean,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// We only need to group consecutive tool-only messages into visual "runs".
@@ -746,11 +795,25 @@ function renderTreeMessages(
 						animation: highlightedId === msg.id ? "highlight-blink 1.5s ease" : undefined,
 					}}
 				>
+					{showTokenUsage && msg.role === "assistant" && msg.tokensIn != null && (
+						<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
+							↑ {(msg.tokensIn as number).toLocaleString()}
+						</Text>
+					)}
 					<MessageBubble
 						narratorId={narratorId}
 						message={msg}
 						onForkFromMessage={onForkFromMessage}
 					/>
+					{showTokenUsage && msg.turnUsageJson != null && (
+						<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
+							Σ {((msg.turnUsageJson as any).input_tokens ?? 0).toLocaleString()} in ·{" "}
+							{((msg.turnUsageJson as any).output_tokens ?? 0).toLocaleString()} out
+							{msg.costUsd != null &&
+								(msg.costUsd as number) > 0 &&
+								` · $${(msg.costUsd as number).toFixed(4)}`}
+						</Text>
+					)}
 				</Box>,
 			);
 			i++;
@@ -770,6 +833,7 @@ interface PageElementsProps {
 	permCb: PermissionCallbacks;
 	expandedToolUseId?: string | null;
 	editExpandOverride?: boolean | null;
+	showTokenUsage?: boolean;
 	/** When set, only render the last N messages of this page (for progressive rendering). */
 	maxMessages?: number;
 }
@@ -783,6 +847,7 @@ const MemoizedPageElements = memo(
 		permCb,
 		expandedToolUseId,
 		editExpandOverride,
+		showTokenUsage,
 		maxMessages,
 	}: PageElementsProps) {
 		const msgs =
@@ -797,6 +862,7 @@ const MemoizedPageElements = memo(
 			permCb,
 			expandedToolUseId,
 			editExpandOverride,
+			showTokenUsage,
 		);
 		return <>{elements}</>;
 	},
@@ -808,6 +874,7 @@ const MemoizedPageElements = memo(
 		prev.permCb.bgRetryDismissedIds === next.permCb.bgRetryDismissedIds &&
 		prev.expandedToolUseId === next.expandedToolUseId &&
 		prev.editExpandOverride === next.editExpandOverride &&
+		prev.showTokenUsage === next.showTokenUsage &&
 		prev.maxMessages === next.maxMessages,
 );
 
@@ -821,7 +888,6 @@ function useProgressiveMessageCount(
 	skip: boolean,
 	resetKey: string,
 	viewportRef: React.RefObject<HTMLDivElement | null>,
-	prependThreshold = 20,
 ): { visibleCount: number; done: boolean } {
 	const [count, setCount] = useState(batchSize);
 	const prevTotalRef = useRef(totalMessages);
@@ -849,40 +915,41 @@ function useProgressiveMessageCount(
 			effectiveCount = batchSize;
 			needsSnapRef.current = true;
 		} else if (totalMessages > count) {
-			const delta = totalMessages - prevTotal;
-			if (delta > prependThreshold) {
-				// Large batch (loadOlder) — progressive render from current count
-				effectiveCount = count;
-			} else {
-				// Small incremental append (WS) — render immediately
-				setCount(totalMessages);
-				effectiveCount = totalMessages;
-			}
+			// Both loadOlder (large batch) and WS append (small) — render immediately.
+			// overflow-anchor handles scroll compensation for prepended content;
+			// the useLayoutEffect scrollTop=1 hack prevents anchor latching to top.
+			setCount(totalMessages);
+			effectiveCount = totalMessages;
 		}
 	}
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: viewportRef is a stable ref — .current is read inside the effect, not a dependency
 	useEffect(() => {
 		if (skip || count >= totalMessages) return;
 		const id = setTimeout(() => {
-			const vp = viewportRef.current;
-			if (vp && vp.scrollTop === 0) {
-				vp.scrollTop = 1;
-			}
 			setCount((c) => Math.min(c + batchSize, totalMessages));
 		}, 50);
 		return () => clearTimeout(id);
 	}, [skip, count, totalMessages, batchSize]);
 
-	// Snap to bottom once after the first batch is rendered to DOM
+	// After each batch renders to DOM (useLayoutEffect = before browser paint):
+	// 1. Snap to bottom on initial load / narrator switch (needsSnapRef).
+	// 2. Otherwise, ensure scrollTop > 0 so overflow-anchor doesn't latch onto
+	//    the top edge — which would cause the viewport to stick to the top
+	//    instead of compensating for prepended content.
+	//    Done here (not in the timer callback) to avoid racing with the
+	//    browser's anchor recalculation between frames.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: only needs to run when count changes
 	useLayoutEffect(() => {
-		if (!needsSnapRef.current) return;
-		if (count < batchSize) return;
 		const vp = viewportRef.current;
-		if (vp) {
+		if (!vp) return;
+		if (needsSnapRef.current) {
+			if (count < batchSize) return;
 			needsSnapRef.current = false;
 			vp.scrollTop = vp.scrollHeight;
+			return;
+		}
+		if (vp.scrollTop === 0) {
+			vp.scrollTop = 1;
 		}
 	}, [count]);
 
@@ -890,8 +957,8 @@ function useProgressiveMessageCount(
 	return { visibleCount: effectiveCount, done: false };
 }
 
-function RenderProgress({ value }: { value: number }) {
-	const pct = Math.round(Math.min(value, 1) * 100);
+function RenderProgress({ value, indeterminate }: { value?: number; indeterminate?: boolean }) {
+	const pct = value != null ? Math.round(Math.min(value, 1) * 100) : 0;
 	return (
 		<div
 			style={{
@@ -902,12 +969,21 @@ function RenderProgress({ value }: { value: number }) {
 			}}
 		>
 			<div
-				style={{
-					height: "100%",
-					width: `${pct}%`,
-					backgroundColor: "var(--mantine-color-indigo-filled)",
-					transition: "width 80ms linear",
-				}}
+				style={
+					indeterminate
+						? {
+								height: "100%",
+								width: "30%",
+								backgroundColor: "var(--mantine-color-indigo-filled)",
+								animation: "indeterminate-slide 1.2s ease-in-out infinite",
+							}
+						: {
+								height: "100%",
+								width: `${pct}%`,
+								backgroundColor: "var(--mantine-color-indigo-filled)",
+								transition: "width 80ms linear",
+							}
+				}
 			/>
 		</div>
 	);
@@ -1187,6 +1263,17 @@ export function NarratorPanel({
 		return result;
 	}, [hydrated, messagesData]);
 
+	// Derive isCompacting from persisted messages on initial load / data refresh
+	useEffect(() => {
+		if (!messages.length) return;
+		const last = messages[messages.length - 1];
+		const blocks = Array.isArray(last.contentJson) ? last.contentJson : [];
+		const compactBlock = blocks.find((b: any) => b.type === "compact");
+		if (compactBlock) {
+			setIsCompacting(compactBlock.status === "compacting");
+		}
+	}, [messages]);
+
 	// Build toolUseId → path index for O(1) lookups in WS callbacks (incremental)
 	const prevPagesForIndexRef = useRef<unknown[]>([]);
 	const toolUseIndexRef = useRef<MessageIndex>(new Map());
@@ -1355,6 +1442,8 @@ export function NarratorPanel({
 	}, [messagesQueryKey, qc]);
 
 	// Build visible page elements based on visibleCount (message-level progressive rendering).
+	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
+
 	// Pages are stored newest-first in messagesData.pages; we reverse to display oldest-first.
 	// We walk from the bottom (newest page) upward, allocating visibleCount messages across pages.
 	const visibleElements = useMemo(() => {
@@ -1373,6 +1462,7 @@ export function NarratorPanel({
 					permCb={renderPermCb}
 					expandedToolUseId={expandedToolUseId}
 					editExpandOverride={editExpandOverride}
+					showTokenUsage={showTokenUsage}
 				/>
 			));
 		}
@@ -1393,6 +1483,7 @@ export function NarratorPanel({
 					permCb={renderPermCb}
 					expandedToolUseId={expandedToolUseId}
 					editExpandOverride={editExpandOverride}
+					showTokenUsage={showTokenUsage}
 					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
 				/>,
 			);
@@ -1409,6 +1500,7 @@ export function NarratorPanel({
 		expandedToolUseId,
 		editExpandOverride,
 		highlightedId,
+		showTokenUsage,
 	]);
 
 	const handleLoadOlder = useCallback(() => {
@@ -1416,77 +1508,42 @@ export function NarratorPanel({
 		fetchNextPage();
 	}, [fetchNextPage, isFetchingNextPage]);
 
-	// Sentinel message ID: determines which message acts as the IntersectionObserver
-	// target for triggering loadOlder.
-	// We use the LAST message of the oldest page (the boundary between the oldest
-	// and second-oldest page). After loadOlder adds a new oldest page, the sentinel
-	// moves to the bottom of that new page — the user must scroll through the
-	// entire new page before the next loadOlder triggers. This is robust against
-	// maxPages eviction (which shifts page indices but doesn't change the fact
-	// that the sentinel is at the bottom of the oldest loaded page).
-	// Only updated when renderDone is true (progressive rendering finished).
-	const [sentinelMsgId, setSentinelMsgId] = useState<string | undefined>(undefined);
-	useEffect(() => {
-		if (!renderDone || !messagesData?.pages?.length) return;
-		const pages = messagesData.pages;
-		// pages are newest-first; use the first message of the oldest page as sentinel.
-		const oldestPage = pages[pages.length - 1];
-		const id = oldestPage?.messages?.[0]?.id as string | undefined;
-		setSentinelMsgId(id);
-	}, [renderDone, messagesData]);
-
-	// Auto-load older messages: observe the sentinel message. When it enters the
-	// viewport, trigger fetchNextPage after a short delay.
+	// Auto-load older messages: scrollTop-based detection.
+	// Trigger loadOlder when scrollTop > 0 && scrollTop < viewportHeight (user is
+	// near the top). scrollTop === 0 is never used as a trigger — it's reserved for
+	// the overflow-anchor hack in useProgressiveMessageCount.
+	// The effect tears down when isFetchingNextPage becomes true (preventing
+	// re-trigger during fetch) and re-attaches when the fetch completes.
 	const handleLoadOlderRef = useRef(handleLoadOlder);
 	handleLoadOlderRef.current = handleLoadOlder;
 	useEffect(() => {
 		if (!autoLoadEnabled || !hasNextPage || !initialScrollDone || !renderDone || isFetchingNextPage)
 			return;
-		if (!sentinelMsgId) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
-		const target = document.getElementById(`msg-${sentinelMsgId}`);
-		if (!target) {
-			console.warn("[sentinel] DOM element not found for msg-%s", sentinelMsgId);
-			return;
-		}
-		let timer: ReturnType<typeof setTimeout> | null = null;
-		const handleIntersection = (entries: IntersectionObserverEntry[]) => {
-			const isVisible = entries[0]?.isIntersecting;
-			if (isVisible) {
-				if (vp.scrollHeight <= vp.clientHeight) return;
-				if (!timer) {
-					timer = setTimeout(() => {
-						handleLoadOlderRef.current();
-					}, 100);
-				}
-			} else {
-				if (timer) {
-					clearTimeout(timer);
-					timer = null;
-				}
+		const check = () => {
+			const st = vp.scrollTop;
+			// Don't fetch at scrollTop 0 (anchor hack territory) or when content
+			// doesn't fill the viewport (scrollHeight <= clientHeight).
+			if (st > 0 && st < vp.clientHeight * 2 && vp.scrollHeight > vp.clientHeight) {
+				handleLoadOlderRef.current();
 			}
 		};
-		const observer = new IntersectionObserver(handleIntersection, { threshold: 0 });
-		observer.observe(target);
-		return () => {
-			observer.disconnect();
-			if (timer) clearTimeout(timer);
-		};
-	}, [
-		autoLoadEnabled,
-		hasNextPage,
-		initialScrollDone,
-		renderDone,
-		isFetchingNextPage,
-		sentinelMsgId,
-	]);
+		// Check immediately — user may already be near the top
+		check();
+		vp.addEventListener("scroll", check, { passive: true });
+		return () => vp.removeEventListener("scroll", check);
+	}, [autoLoadEnabled, hasNextPage, initialScrollDone, renderDone, isFetchingNextPage]);
 
 	// --- Scroll state: user-input driven ---
 	// isAtBottom is only set to false by user input events (wheel/touch/scrollbar).
 	// Programmatic scrolls (ResizeObserver, scrollToBottom) don't flip it.
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
+
+	// Smooth-follow refs — declared early so the callback ref closure can read them.
+	const followRafRef = useRef(0);
+	const followingRef = useRef(false);
 
 	// Callback ref to bind user-input listeners as soon as viewport mounts.
 	const lastTouchYRef = useRef(0);
@@ -1514,7 +1571,7 @@ export function NarratorPanel({
 
 		const onWheel = (e: WheelEvent) => {
 			if (e.deltaY < 0) detachFromBottom();
-			else if (e.deltaY > 0) requestAnimationFrame(checkAtBottom);
+			// checkAtBottom handled by scrollend for inertia correctness
 		};
 		const onTouchStart = (e: TouchEvent) => {
 			if (e.touches.length > 0) lastTouchYRef.current = e.touches[0].clientY;
@@ -1525,54 +1582,48 @@ export function NarratorPanel({
 			const delta = lastTouchYRef.current - cur;
 			lastTouchYRef.current = cur;
 			if (delta < 0) detachFromBottom();
-			else if (delta > 0) requestAnimationFrame(checkAtBottom);
+			// checkAtBottom handled by scrollend for inertia correctness
 		};
-		// Scrollbar drag: track scroll direction via scroll events while pointer is
-		// held down in the scrollbar gutter. We use a flag + persistent scroll
-		// listener instead of pointermove (which browsers swallow during native
-		// scrollbar interaction).
+
+		// Generic scroll direction tracking — covers middle-click autoscroll,
+		// Mantine custom scrollbar drag, keyboard scroll, and any other source.
+		// Detach on upward scroll unless the lerp follow loop is driving it.
 		let lastScrollTop = node.scrollTop;
 
-		const onScrollDuringDrag = () => {
+		const onScroll = () => {
 			const cur = node.scrollTop;
-			if (cur < lastScrollTop) detachFromBottom();
-			else if (cur > lastScrollTop) requestAnimationFrame(checkAtBottom);
+			if (!followingRef.current && cur < lastScrollTop) {
+				detachFromBottom();
+			}
 			lastScrollTop = cur;
 		};
 
-		const onPointerDown = (e: PointerEvent) => {
-			if (
-				e.clientX >
-				node.getBoundingClientRect().right - (node.offsetWidth - node.clientWidth) - 2
-			) {
-				lastScrollTop = node.scrollTop;
-				node.addEventListener("scroll", onScrollDuringDrag, { passive: true });
-				const onUp = () => {
-					node.removeEventListener("scroll", onScrollDuringDrag);
-					window.removeEventListener("pointerup", onUp);
-					requestAnimationFrame(checkAtBottom);
-				};
-				window.addEventListener("pointerup", onUp);
-			}
+		// scrollend fires after ALL scroll types finish (inertia, autoscroll,
+		// scrollbar drag, programmatic). We run checkAtBottom here so that
+		// inertia/middle-click/scrollbar-drag reaching the bottom is detected.
+		const onScrollEnd = () => {
+			// Skip if the lerp follow loop is driving the scroll — that loop
+			// sets isAtBottom itself when it finishes.
+			if (followingRef.current) return;
+			checkAtBottom();
 		};
 
 		node.addEventListener("wheel", onWheel, { passive: true });
 		node.addEventListener("touchstart", onTouchStart, { passive: true });
 		node.addEventListener("touchmove", onTouchMove, { passive: true });
-		node.addEventListener("pointerdown", onPointerDown, { passive: true });
+		node.addEventListener("scroll", onScroll, { passive: true });
+		node.addEventListener("scrollend", onScrollEnd, { passive: true });
 		cleanupRef.current = () => {
 			node.removeEventListener("wheel", onWheel);
 			node.removeEventListener("touchstart", onTouchStart);
 			node.removeEventListener("touchmove", onTouchMove);
-			node.removeEventListener("pointerdown", onPointerDown);
-			node.removeEventListener("scroll", onScrollDuringDrag);
+			node.removeEventListener("scroll", onScroll);
+			node.removeEventListener("scrollend", onScrollEnd);
 		};
 	}, []);
 
 	// Smooth-follow animation: lerp towards latest scrollHeight each frame.
 	// Shared by ResizeObserver (auto-follow) and scrollToBottom button.
-	const followRafRef = useRef(0);
-	const followingRef = useRef(false);
 
 	const startFollowing = useCallback(() => {
 		const step = () => {
@@ -1628,8 +1679,7 @@ export function NarratorPanel({
 
 	// Initial scroll to bottom — wait for progressive render to finish,
 	// then instant-scroll and mark done. The ref is set synchronously so
-	// ResizeObserver starts working immediately. The state update for
-	// sentinel gating happens on the next render.
+	// ResizeObserver starts working immediately.
 	// Skip if the user has already scrolled up during progressive rendering.
 
 	useEffect(() => {
@@ -1645,7 +1695,7 @@ export function NarratorPanel({
 			scrollToBottom(true);
 		}
 		// If user scrolled away before progressive render finished, still mark
-		// initial scroll as done so the sentinel can appear.
+		// initial scroll as done so loadOlder detection can activate.
 		if (
 			!initialScrollDoneRef.current &&
 			messages.length > 0 &&
@@ -1734,7 +1784,16 @@ export function NarratorPanel({
 				}
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				setIsCompacting(false);
+				// Derive compacting state from system compact messages
+				const blocks = Array.isArray(wsData.message?.contentJson)
+					? wsData.message.contentJson
+					: [];
+				const compactBlock = blocks.find((b: any) => b.type === "compact");
+				if (compactBlock) {
+					setIsCompacting(compactBlock.status === "compacting");
+				} else {
+					setIsCompacting(false);
+				}
 				// Clear streaming buffer when a full assistant message arrives via WS
 				if (wsData.message?.role === "assistant" && streamingRef.current) {
 					streamingRef.current = "";
@@ -1784,6 +1843,44 @@ export function NarratorPanel({
 				} else {
 					qc.invalidateQueries({ queryKey: messagesQueryKey });
 				}
+			},
+			onUserMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
+				if (!wsData.message?.id || !wsData.message?.createdAt) return;
+				const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
+
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) {
+						return {
+							pages: [{ messages: [newMsg], hasMore: false, nextCursor: null }],
+							pageParams: [undefined],
+						};
+					}
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+
+					// Skip if already present
+					if (firstPage.messages.some((m: NarratorMsg) => m.id === newMsg.id)) {
+						return old;
+					}
+
+					// Replace optimistic user message if one exists — revoke blob URLs
+					const optimistic = firstPage.messages.filter(
+						(m: NarratorMsg) => String(m.id).startsWith("optimistic-") && m.role === "user",
+					);
+					for (const om of optimistic) {
+						if (Array.isArray(om.contentJson)) {
+							for (const block of om.contentJson) {
+								if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
+							}
+						}
+					}
+					const withoutOptimistic = firstPage.messages.filter(
+						(m: NarratorMsg) => !String(m.id).startsWith("optimistic-") || m.role !== "user",
+					);
+					firstPage.messages = [...withoutOptimistic, newMsg];
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
 			},
 			onToolCompleted: (toolUseId: string, status: string, output?: unknown) => {
 				// Update tool call status using indexed lookup (O(1) instead of full tree traversal)
@@ -2253,7 +2350,14 @@ export function NarratorPanel({
 			<Box pos="relative" style={{ flex: 1, minHeight: 0 }}>
 				{(isFetchingNextPage || !renderDone) && (
 					<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
-						<RenderProgress value={messages.length > 0 ? visibleCount / messages.length : 0} />
+						<RenderProgress
+							indeterminate={isFetchingNextPage}
+							value={
+								!isFetchingNextPage && messages.length > 0
+									? visibleCount / messages.length
+									: undefined
+							}
+						/>
 					</Box>
 				)}
 				<ScrollArea
@@ -2263,7 +2367,12 @@ export function NarratorPanel({
 					py="sm"
 					px="md"
 					scrollbars="y"
-					styles={{ viewport: { overscrollBehavior: "contain", overflowAnchor: "auto" } }}
+					styles={{
+						viewport: { overscrollBehavior: "contain", overflowAnchor: "auto" },
+						scrollbar: renderDone
+							? undefined
+							: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
+					}}
 				>
 					<Stack gap="sm" ref={contentRef}>
 						{visibleElements}

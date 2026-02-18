@@ -3,6 +3,7 @@ import {
 	Box,
 	Group,
 	Image,
+	Loader,
 	Paper,
 	Skeleton,
 	Stack,
@@ -11,6 +12,7 @@ import {
 } from "@mantine/core";
 import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { IconArrowsMinimize } from "@tabler/icons-react";
 import { getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
 import { ToolCallCard } from "./ToolCallCard";
@@ -95,6 +97,27 @@ export const MessageBubble = memo(function MessageBubble({
 	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("chapters");
+
+	// System messages (compact indicators)
+	if (message.role === "system") {
+		const compactBlock = blocks.find((b: any) => b.type === "compact");
+		if (compactBlock) {
+			const isCompacting = compactBlock.status === "compacting";
+			return (
+				<Group gap={6} justify="center" py={4}>
+					{isCompacting ? (
+						<Loader size={14} color="orange" />
+					) : (
+						<IconArrowsMinimize size={14} style={{ color: "var(--mantine-color-orange-6)" }} />
+					)}
+					<Text size="xs" c="orange">
+						{isCompacting ? t("compacting") : t("compacted")}
+					</Text>
+				</Group>
+			);
+		}
+		return null;
+	}
 
 	// User messages: full-width bubble
 	if (isUser) {

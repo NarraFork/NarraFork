@@ -8,7 +8,7 @@ import { memo, useMemo } from "react";
 interface DiffViewProps {
 	oldStr: string;
 	newStr: string;
-	/** Max height in px. Pass undefined to remove the limit. Defaults to 200. */
+	/** Max height in px. When undefined, uses flex to fill parent. */
 	maxHeight?: number;
 	/** Enable word-wrap. Defaults to false (horizontal scroll). */
 	wordWrap?: boolean;
@@ -191,7 +191,7 @@ const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
 export const DiffView = memo(function DiffView({
 	oldStr,
 	newStr,
-	maxHeight = 200,
+	maxHeight,
 	wordWrap,
 }: DiffViewProps) {
 	const lines = useMemo(() => computeDiff(oldStr, newStr), [oldStr, newStr]);
@@ -207,13 +207,14 @@ export const DiffView = memo(function DiffView({
 		: {};
 
 	const style =
-		maxHeight != null
+		maxHeight !== undefined
 			? { ...containerStyle, maxHeight, ...wrapOverride }
 			: {
 					...containerStyle,
 					maxHeight: undefined,
 					overflow: "auto" as any,
-					height: "100%",
+					flex: 1,
+					minHeight: 0,
 					...wrapOverride,
 				};
 

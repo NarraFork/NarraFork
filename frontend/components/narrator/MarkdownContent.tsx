@@ -1,12 +1,25 @@
 import { Anchor, Blockquote, Code, Divider, List, Table, Text, Title } from "@mantine/core";
-import { memo, useMemo } from "react";
+import { memo, type ReactNode, useMemo } from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import classes from "./MarkdownContent.module.css";
 
+/** Recursively extract plain text from React children */
+function extractText(node: ReactNode): string {
+	if (node == null || typeof node === "boolean") return "";
+	if (typeof node === "string" || typeof node === "number") return String(node);
+	if (Array.isArray(node)) return node.map(extractText).join("");
+	if (typeof node === "object" && "props" in node) return extractText(node.props.children);
+	return "";
+}
+
 const MD_PATTERN =
 	/(?:^#{1,6}\s|(?:^|\n)```|\*\*|__|\*(?!\s)|_(?!\s)|\[.+?\]\(.+?\)|^>\s|^[-*+]\s|^\d+\.\s|^\|.+\||!\[)/m;
+
+/** Detect box-drawing / ASCII-art diagram characters that should never be word-wrapped */
+const DIAGRAM_PATTERN =
+	/[─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┘├┤┬┴┼╋╔╗╚╝╠╣╦╩╬║═╒╓╕╖╘╙╛╜╞╟╡╢╤╥╧╨╪╫]|[┌┐└┘├┤┬┴┼│─]|[╭╮╯╰]|[+\-|]{3,}.*[+\-|]{3,}/;
 
 function hasMarkdown(text: string): boolean {
 	return MD_PATTERN.test(text);
@@ -23,8 +36,21 @@ const HEADING_ORDER: Record<string, 1 | 2 | 3 | 4 | 5 | 6> = {
 
 const mdComponents: Components = {
 	p({ children }) {
+		const text = extractText(children);
+		const isDiagram = DIAGRAM_PATTERN.test(text);
 		return (
-			<Text size="sm" style={{ marginTop: "0.35em", marginBottom: 0 }}>
+			<Text
+				size="sm"
+				style={{
+					marginTop: "0.35em",
+					marginBottom: 0,
+					...(isDiagram && {
+						whiteSpace: "pre",
+						overflowX: "auto",
+						wordBreak: "normal",
+					}),
+				}}
+			>
 				{children}
 			</Text>
 		);
@@ -69,8 +95,18 @@ const mdComponents: Components = {
 	code({ children, className }) {
 		const isBlock = className?.startsWith("language-");
 		if (isBlock) {
+			const text = extractText(children);
+			const isDiagram = DIAGRAM_PATTERN.test(text);
 			return (
-				<Code block fz="xs" style={{ maxWidth: "100%", overflowX: "auto" }}>
+				<Code
+					block
+					fz="xs"
+					style={{
+						maxWidth: "100%",
+						overflowX: "auto",
+						...(isDiagram && { whiteSpace: "pre", wordBreak: "normal" }),
+					}}
+				>
 					{children}
 				</Code>
 			);
@@ -78,6 +114,27 @@ const mdComponents: Components = {
 		return <Code fz="xs">{children}</Code>;
 	},
 	pre({ children }) {
+		// For fenced code blocks without a language tag, react-markdown renders
+		// <pre><code>…</code></pre> where the inner <code> has no className.
+		// Detect diagram content and force no-wrap on those blocks.
+		const text = extractText(children);
+		const isDiagram = DIAGRAM_PATTERN.test(text);
+		if (isDiagram) {
+			return (
+				<Code
+					block
+					fz="xs"
+					style={{
+						maxWidth: "100%",
+						overflowX: "auto",
+						whiteSpace: "pre",
+						wordBreak: "normal",
+					}}
+				>
+					{text}
+				</Code>
+			);
+		}
 		return <>{children}</>;
 	},
 	hr() {
@@ -137,22 +194,30 @@ const remarkPlugins = [remarkGfm];
 
 interface MarkdownContentProps {
 	text: string;
+	/** When false, disable word-wrap so long lines scroll horizontally. Defaults to true. */
+	wordWrap?: boolean;
 }
 
-export const MarkdownContent = memo(function MarkdownContent({ text }: MarkdownContentProps) {
+export const MarkdownContent = memo(function MarkdownContent({
+	text,
+	wordWrap = true,
+}: MarkdownContentProps) {
 	const trimmed = text.trim();
 	const isMd = useMemo(() => hasMarkdown(trimmed), [trimmed]);
 
 	if (!isMd) {
 		return (
-			<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+			<Text
+				size="sm"
+				style={wordWrap ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre", overflowX: "auto" }}
+			>
 				{trimmed}
 			</Text>
 		);
 	}
 
 	return (
-		<div className={classes.root}>
+		<div className={wordWrap ? classes.root : classes.rootNoWrap}>
 			<Markdown remarkPlugins={remarkPlugins} components={mdComponents}>
 				{trimmed}
 			</Markdown>
