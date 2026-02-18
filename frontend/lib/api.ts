@@ -47,8 +47,12 @@ export interface TreeMessage {
 	contentText: string | null;
 	toolCalls: any[];
 	tokensIn?: number | null;
-	tokensOut?: number | null;
 	costUsd?: number | null;
+	turnUsageJson?: {
+		input_tokens?: number;
+		output_tokens?: number;
+		[key: string]: unknown;
+	} | null;
 	createdAt: string;
 	children: TreeMessage[];
 }
@@ -222,6 +226,36 @@ export const api = {
 	getTerminal: (id: string) => request<any>(`/terminals/${id}`),
 	deleteTerminal: (id: string) => request<any>(`/terminals/${id}`, { method: "DELETE" }),
 
+	// Terminal Tabs
+	listTerminalTabs: (opts: { chapterId?: string; narratorId?: string }) => {
+		const params = new URLSearchParams();
+		if (opts.chapterId) params.set("chapterId", opts.chapterId);
+		if (opts.narratorId) params.set("narratorId", opts.narratorId);
+		return request<any[]>(`/terminals/tabs?${params}`);
+	},
+	createTerminalTab: (data: { chapterId?: string; narratorId?: string; name: string }) =>
+		request<any>("/terminals/tabs", { method: "POST", body: JSON.stringify(data) }),
+	updateTerminalTab: (id: string, data: { name?: string }) =>
+		request<any>(`/terminals/tabs/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	deleteTerminalTab: (id: string) => request<any>(`/terminals/tabs/${id}`, { method: "DELETE" }),
+	reorderTerminalTabs: (ids: string[]) =>
+		request<any>("/terminals/tabs/reorder", { method: "PUT", body: JSON.stringify({ ids }) }),
+
+	// Terminal View State
+	getTerminalViewState: (opts: { chapterId?: string; narratorId?: string }) => {
+		const params = new URLSearchParams();
+		if (opts.chapterId) params.set("chapterId", opts.chapterId);
+		if (opts.narratorId) params.set("narratorId", opts.narratorId);
+		return request<any>(`/terminals/view-state?${params}`);
+	},
+	updateTerminalViewState: (data: {
+		chapterId?: string;
+		narratorId?: string;
+		layout?: string;
+		activeTabId?: string | null;
+		panelAssignments?: Record<string, string> | null;
+	}) => request<any>("/terminals/view-state", { method: "PUT", body: JSON.stringify(data) }),
+
 	// Graph
 	getProjectGraph: (projectId: string) =>
 		request<{ nodes: any[]; edges: any[] }>(`/projects/${projectId}/graph`),
@@ -251,6 +285,9 @@ export const api = {
 			wordWrapCode: boolean;
 			wordWrapDiff: boolean;
 			replyInUserLanguage: boolean;
+			showTokenUsage: boolean;
+			terminalTheme: string;
+			terminalFontSize: number;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -259,6 +296,9 @@ export const api = {
 		wordWrapCode?: boolean;
 		wordWrapDiff?: boolean;
 		replyInUserLanguage?: boolean;
+		showTokenUsage?: boolean;
+		terminalTheme?: string;
+		terminalFontSize?: number;
 	}) => request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Containers
@@ -310,4 +350,56 @@ export const api = {
 	}) => request<any>("/chapters/batch-merge", { method: "POST", body: JSON.stringify(data) }),
 	dormantChapter: (id: string) => request<any>(`/chapters/${id}/dormant`, { method: "POST" }),
 	wakeChapter: (id: string) => request<any>(`/chapters/${id}/wake`, { method: "POST" }),
+
+			method: "POST",
+			body: JSON.stringify({ priority }),
+		}),
+			method: "POST",
+			body: JSON.stringify({ credentials }),
+		}),
 };
+
+	text: string,
+	model?: string,
+	signal?: AbortSignal,
+): AsyncGenerator<string> {
+	const token = getToken();
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			...(token ? { Authorization: `Bearer ${token}` } : {}),
+		},
+		body: JSON.stringify({ text, model }),
+		signal,
+	});
+	if (!res.ok) {
+		const err = await res.json().catch(() => ({ error: res.statusText }));
+		throw new Error(err.error ?? "Request failed");
+	}
+	if (!res.body) throw new Error("No response body");
+
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	let buf = "";
+	let currentEvent = "chunk";
+
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buf += decoder.decode(value, { stream: true });
+
+		const lines = buf.split("\n");
+		buf = lines.pop() ?? "";
+
+		for (const line of lines) {
+			if (line.startsWith("event:")) {
+				currentEvent = line.slice(6).trim();
+			} else if (line.startsWith("data:")) {
+				const data = line.slice(5).trimStart();
+				if (currentEvent === "error") throw new Error(data || "Unknown error");
+				if (currentEvent === "done") return;
+				yield data;
+			}
+		}
+	}
+}

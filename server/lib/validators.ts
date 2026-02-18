@@ -76,6 +76,40 @@ export const createTerminalSchema = z
 		message: "Exactly one of chapterId or narratorId is required",
 	});
 
+// === Terminal Tabs ===
+
+export const createTerminalTabSchema = z
+	.object({
+		chapterId: z.string().min(1).optional(),
+		narratorId: z.string().min(1).optional(),
+		name: z.string().min(1).max(100),
+	})
+	.refine((d) => (d.chapterId || d.narratorId) && !(d.chapterId && d.narratorId), {
+		message: "Exactly one of chapterId or narratorId is required",
+	});
+
+export const updateTerminalTabSchema = z.object({
+	name: z.string().min(1).max(100).optional(),
+});
+
+export const reorderTerminalTabsSchema = z.object({
+	ids: z.array(z.string().min(1)).min(1),
+});
+
+// === Terminal View State ===
+
+export const updateTerminalViewStateSchema = z
+	.object({
+		chapterId: z.string().min(1).optional(),
+		narratorId: z.string().min(1).optional(),
+		layout: z.enum(["single", "split-h", "split-v", "triple", "quad"]).optional(),
+		activeTabId: z.string().nullable().optional(),
+		panelAssignments: z.record(z.string(), z.string()).nullable().optional(),
+	})
+	.refine((d) => d.chapterId || d.narratorId, {
+		message: "Either chapterId or narratorId is required",
+	});
+
 // === Fork / Merge / Cleanup ===
 
 export const forkChapterSchema = z.object({
@@ -189,6 +223,9 @@ export const updateUserPreferencesSchema = z.object({
 	wordWrapCode: z.boolean().optional(),
 	wordWrapDiff: z.boolean().optional(),
 	replyInUserLanguage: z.boolean().optional(),
+	showTokenUsage: z.boolean().optional(),
+	terminalTheme: z.string().min(1).max(50).optional(),
+	terminalFontSize: z.number().int().min(8).max(32).optional(),
 });
 
 // === WebSocket Messages ===
@@ -230,12 +267,40 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 // Terminal client → server
 export const terminalWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({
-		type: z.literal("attach"),
+		type: z.literal("subscribe"),
+		terminalIds: z.array(z.string().min(1)),
+	}),
+	z.object({
+		type: z.literal("unsubscribe"),
+		terminalIds: z.array(z.string().min(1)),
+	}),
+	z.object({
+		type: z.literal("input"),
 		terminalId: z.string().min(1),
+		data: z.string(),
 	}),
 	z.object({
 		type: z.literal("resize"),
+		terminalId: z.string().min(1),
 		cols: z.number().int().min(10).max(500),
 		rows: z.number().int().min(2).max(200),
+	}),
+	z.object({
+		type: z.literal("create"),
+		requestId: z.string().min(1),
+		chapterId: z.string().min(1).optional(),
+		narratorId: z.string().min(1).optional(),
+		name: z.string().max(100).optional(),
+		cols: z.number().int().min(10).max(500).optional(),
+		rows: z.number().int().min(2).max(200).optional(),
+	}),
+	z.object({
+		type: z.literal("kill"),
+		terminalId: z.string().min(1),
+	}),
+	z.object({
+		type: z.literal("rename"),
+		terminalId: z.string().min(1),
+		name: z.string().min(1).max(100),
 	}),
 ]);

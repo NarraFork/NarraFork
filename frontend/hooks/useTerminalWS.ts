@@ -1,109 +1,271 @@
+/**
+ * Terminal WebSocket hook — singleton connection, subscribe/unsubscribe model.
+ *
+ * A single WS connection to /ws/terminal manages all terminal subscriptions.
+ * Components call useTerminalConnection(terminalId, callbacks) to subscribe
+ * to a specific terminal's output.
+ */
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
 
+// === Types ===
+
 interface TerminalWSCallbacks {
 	onOutput?: (data: string) => void;
+	onScrollback?: (data: string) => void;
 	onExit?: (code: number) => void;
 	onError?: (message: string) => void;
 	onRequestResize?: () => void;
+	onBufferState?: (state: { mouseTracking: boolean; cursorVisible: boolean }) => void;
 }
+
+type Listener = {
+	callbacks: TerminalWSCallbacks;
+};
+
+// === Singleton WS Manager ===
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1000;
 
+class TerminalWSManager {
+	private ws: WebSocket | null = null;
+	private listeners = new Map<string, Set<Listener>>();
+	private reconnectAttempts = 0;
+	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	private disposed = false;
+	private _connected = false;
+	private _disconnected = false;
+	private statusListeners = new Set<() => void>();
+
+	get connected() {
+		return this._connected;
+	}
+	get disconnected() {
+		return this._disconnected;
+	}
+
+	connect() {
+		if (this.ws?.readyState === WebSocket.OPEN || this.disposed) return;
+		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+		const token = getToken();
+		const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+		const ws = new WebSocket(`${protocol}//${window.location.host}/ws/terminal${tokenParam}`);
+		this.ws = ws;
+
+		ws.onopen = () => {
+			this._connected = true;
+			this._disconnected = false;
+			this.reconnectAttempts = 0;
+			this.notifyStatus();
+			// Re-subscribe all active terminals
+			const ids = [...this.listeners.keys()];
+			if (ids.length > 0) {
+				this.send({ type: "subscribe", terminalIds: ids });
+			}
+		};
+
+		ws.onmessage = (event) => {
+			try {
+				const msg = JSON.parse(event.data);
+				this.handleMessage(msg);
+			} catch {
+				// ignore parse errors
+			}
+		};
+
+		ws.onclose = () => {
+			this._connected = false;
+			this.notifyStatus();
+			this.scheduleReconnect();
+		};
+
+		ws.onerror = () => {
+			this._connected = false;
+			this.notifyStatus();
+		};
+	}
+
+	private scheduleReconnect() {
+		if (this.disposed) return;
+		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+			this._disconnected = true;
+			this.notifyStatus();
+			return;
+		}
+		const delay = RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts;
+		this.reconnectAttempts++;
+		this.reconnectTimer = setTimeout(() => this.connect(), delay);
+	}
+
+	private handleMessage(msg: Record<string, unknown>) {
+		const type = msg.type as string;
+		const terminalId = msg.terminalId as string | undefined;
+
+		if (!terminalId) return;
+		const listeners = this.listeners.get(terminalId);
+		if (!listeners) return;
+
+		for (const listener of listeners) {
+			const { callbacks } = listener;
+			switch (type) {
+				case "output":
+					callbacks.onOutput?.(msg.data as string);
+					break;
+				case "scrollback":
+					callbacks.onScrollback?.(msg.data as string);
+					break;
+				case "exit":
+					callbacks.onExit?.(msg.code as number);
+					break;
+				case "error":
+					callbacks.onError?.(msg.message as string);
+					break;
+				case "requestResize":
+					callbacks.onRequestResize?.();
+					break;
+				case "bufferState":
+					callbacks.onBufferState?.({
+						mouseTracking: msg.mouseTracking as boolean,
+						cursorVisible: msg.cursorVisible as boolean,
+					});
+					break;
+			}
+		}
+	}
+
+	subscribe(terminalId: string, listener: Listener): () => void {
+		this.ensureConnected();
+		let set = this.listeners.get(terminalId);
+		if (!set) {
+			set = new Set();
+			this.listeners.set(terminalId, set);
+			// First subscriber for this terminal — send subscribe message
+			if (this._connected) {
+				this.send({ type: "subscribe", terminalIds: [terminalId] });
+			}
+		}
+		set.add(listener);
+
+		return () => {
+			set!.delete(listener);
+			if (set!.size === 0) {
+				this.listeners.delete(terminalId);
+				if (this._connected) {
+					this.send({ type: "unsubscribe", terminalIds: [terminalId] });
+				}
+			}
+		};
+	}
+
+	sendInput(terminalId: string, data: string) {
+		this.send({ type: "input", terminalId, data });
+	}
+
+	sendResize(terminalId: string, cols: number, rows: number) {
+		this.send({ type: "resize", terminalId, cols, rows });
+	}
+
+	onStatusChange(cb: () => void): () => void {
+		this.statusListeners.add(cb);
+		return () => this.statusListeners.delete(cb);
+	}
+
+	private ensureConnected() {
+		if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+			this.connect();
+		}
+	}
+
+	private send(msg: Record<string, unknown>) {
+		if (this.ws?.readyState === WebSocket.OPEN) {
+			this.ws.send(JSON.stringify(msg));
+		}
+	}
+
+	private notifyStatus() {
+		for (const cb of this.statusListeners) cb();
+	}
+
+	dispose() {
+		this.disposed = true;
+		clearTimeout(this.reconnectTimer);
+		this.ws?.close();
+		this.ws = null;
+	}
+}
+
+// Module-level singleton
+let manager: TerminalWSManager | null = null;
+
+function getManager(): TerminalWSManager {
+	if (!manager) {
+		manager = new TerminalWSManager();
+		manager.connect();
+	}
+	return manager;
+}
+
+// === React Hooks ===
+
+/**
+ * Subscribe to a terminal's output via the singleton WS connection.
+ * Drop-in replacement for the old per-terminal useTerminalWS hook.
+ */
 export function useTerminalWS(terminalId: string | undefined, callbacks: TerminalWSCallbacks) {
-	const wsRef = useRef<WebSocket | null>(null);
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
 	const [connected, setConnected] = useState(false);
 	const [disconnected, setDisconnected] = useState(false);
-	const reconnectAttempts = useRef(0);
-	const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-	const unmountedRef = useRef(false);
 
 	useEffect(() => {
 		if (!terminalId) return;
-		unmountedRef.current = false;
+		const mgr = getManager();
 
-		function connect() {
-			if (unmountedRef.current) return;
+		const listener: Listener = {
+			callbacks: {
+				onOutput: (data) => callbacksRef.current.onOutput?.(data),
+				onScrollback: (data) => callbacksRef.current.onScrollback?.(data),
+				onExit: (code) => callbacksRef.current.onExit?.(code),
+				onError: (msg) => callbacksRef.current.onError?.(msg),
+				onRequestResize: () => callbacksRef.current.onRequestResize?.(),
+				onBufferState: (state) => callbacksRef.current.onBufferState?.(state),
+			},
+		};
 
-			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-			const token = getToken();
-			const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
-			// Use current host:port — Vite proxy handles /ws in dev
-			const ws = new WebSocket(
-				`${protocol}//${window.location.host}/ws/terminal?terminalId=${terminalId}${tokenParam}`,
-			);
-			wsRef.current = ws;
-
-			ws.onopen = () => {
-				setConnected(true);
-				setDisconnected(false);
-				reconnectAttempts.current = 0;
-			};
-
-			ws.onmessage = (event) => {
-				try {
-					const data = JSON.parse(event.data);
-					switch (data.type) {
-						case "output":
-							callbacksRef.current.onOutput?.(data.data);
-							break;
-						case "exit":
-							callbacksRef.current.onExit?.(data.code);
-							break;
-						case "error":
-							callbacksRef.current.onError?.(data.message);
-							break;
-						case "requestResize":
-							callbacksRef.current.onRequestResize?.();
-							break;
-					}
-				} catch (err) {
-					if (import.meta.env.DEV) console.warn("[useTerminalWS] Failed to parse WS message:", err);
-				}
-			};
-
-			ws.onclose = () => {
-				setConnected(false);
-				scheduleReconnect();
-			};
-			ws.onerror = () => {
-				setConnected(false);
-			};
-		}
-
-		function scheduleReconnect() {
-			if (unmountedRef.current) return;
-			if (reconnectAttempts.current >= MAX_RECONNECT_ATTEMPTS) {
-				setDisconnected(true);
-				return;
-			}
-			const delay = RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempts.current;
-			reconnectAttempts.current++;
-			reconnectTimer.current = setTimeout(connect, delay);
-		}
-
-		connect();
+		const unsubscribe = mgr.subscribe(terminalId, listener);
+		const unsubStatus = mgr.onStatusChange(() => {
+			setConnected(mgr.connected);
+			setDisconnected(mgr.disconnected);
+		});
+		setConnected(mgr.connected);
+		setDisconnected(mgr.disconnected);
 
 		return () => {
-			unmountedRef.current = true;
-			clearTimeout(reconnectTimer.current);
-			const ws = wsRef.current;
-			if (ws) {
-				ws.close();
-			}
+			unsubscribe();
+			unsubStatus();
 		};
 	}, [terminalId]);
 
-	const write = useCallback((data: string) => {
-		wsRef.current?.send(data);
-	}, []);
+	const write = useCallback(
+		(data: string) => {
+			if (terminalId) getManager().sendInput(terminalId, data);
+		},
+		[terminalId],
+	);
 
-	const resize = useCallback((cols: number, rows: number) => {
-		wsRef.current?.send(JSON.stringify({ type: "resize", cols, rows }));
-	}, []);
+	const resize = useCallback(
+		(cols: number, rows: number) => {
+			if (terminalId) getManager().sendResize(terminalId, cols, rows);
+		},
+		[terminalId],
+	);
 
 	return { connected, disconnected, write, resize };
+}
+
+/** Access the singleton manager for imperative operations (sendInput/sendResize) */
+export function getTerminalWSManager(): TerminalWSManager {
+	return getManager();
 }

@@ -8,5 +8,10 @@
 	"sendToTerminal": "Send to terminal",
 	"openTerminal": "Open terminal",
 	"closeTerminal": "Close terminal",
-	"restartTerminal": "Restart terminal"
+	"restartTerminal": "Restart terminal",
+	"layoutSingle": "Single",
+	"layoutSplitH": "Split horizontal",
+	"layoutSplitV": "Split vertical",
+	"layoutTriple": "Triple",
+	"layoutQuad": "Quad"
 }

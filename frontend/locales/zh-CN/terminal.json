@@ -8,5 +8,10 @@
 	"sendToTerminal": "发送到终端",
 	"openTerminal": "打开终端",
 	"closeTerminal": "关闭终端",
-	"restartTerminal": "重启终端"
+	"restartTerminal": "重启终端",
+	"layoutSingle": "单面板",
+	"layoutSplitH": "水平分屏",
+	"layoutSplitV": "垂直分屏",
+	"layoutTriple": "三面板",
+	"layoutQuad": "四面板"
 }

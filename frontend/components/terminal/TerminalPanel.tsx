@@ -1,4 +1,4 @@
-import { Box } from "@mantine/core";
+import { Box, useMantineColorScheme } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
@@ -6,10 +6,13 @@ import "@xterm/xterm/css/xterm.css";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTerminalWS } from "../../hooks/useTerminalWS";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { SelectionPopover } from "../common/SelectionPopover";
+import { setupOsc52Handler } from "./osc52-handler";
 import { type Modifiers, TerminalAuxKeys } from "./TerminalAuxKeys";
+import { getTerminalTheme } from "./terminal-theme";
 
-export const TERM_BG = "#1a1b26";
+export const TERM_BG = "#1a1b26"; // Default fallback, actual bg comes from theme
 
 const HANDLE_SIZE = 20;
 const HANDLE_COLOR = "#4c6ef5"; // Mantine indigo
@@ -95,6 +98,15 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const termRef = useRef<Terminal | null>(null);
 		const fitAddonRef = useRef<FitAddon | null>(null);
 		const { t } = useTranslation("terminal");
+		const { data: prefs } = useUserPreferences();
+		const { colorScheme } = useMantineColorScheme();
+		const terminalThemeKey = (prefs as any)?.terminalTheme ?? "auto";
+		const terminalFontSize = (prefs as any)?.terminalFontSize ?? 14;
+		const resolvedTheme = getTerminalTheme(
+			terminalThemeKey,
+			colorScheme === "auto" ? "dark" : colorScheme,
+		);
+		const themeBg = resolvedTheme.background ?? TERM_BG;
 		const [xtermSelection, setXtermSelection] = useState<string>("");
 		const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);
 		const isMobile = useMediaQuery("(max-width: 768px)");
@@ -170,6 +182,11 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				termRef.current?.write(data);
 				writingRef.current = false;
 			},
+			onScrollback: (data) => {
+				writingRef.current = true;
+				termRef.current?.write(data);
+				writingRef.current = false;
+			},
 			onExit: (code) => {
 				termRef.current?.write(`\r\n${t("processExited", { code })}\r\n`);
 				onExitRef.current?.(code);
@@ -211,18 +228,17 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 			const term = new Terminal({
 				cursorBlink: true,
-				fontSize: 14,
+				fontSize: terminalFontSize,
 				fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
-				theme: {
-					background: TERM_BG,
-					foreground: "#c0caf5",
-					cursor: "#c0caf5",
-				},
+				theme: resolvedTheme,
 			});
 			const fitAddon = new FitAddon();
 			term.loadAddon(fitAddon);
 			term.open(containerRef.current);
 			fitAddon.fit();
+
+			// OSC 52 clipboard handler
+			const disposeOsc52 = setupOsc52Handler(term);
 
 			termRef.current = term;
 			fitAddonRef.current = fitAddon;
@@ -458,6 +474,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			container.addEventListener("touchend", onLongPressEnd, { passive: true });
 
 			return () => {
+				disposeOsc52();
 				selDisposable.dispose();
 				resizeObserver.disconnect();
 				container.removeEventListener("touchstart", onTouchStart);
@@ -473,6 +490,17 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				fitAddonRef.current = null;
 			};
 		}, [write, resize, handleSelectionChange]);
+
+		// Live-update theme and font size without recreating the terminal
+		useEffect(() => {
+			const term = termRef.current;
+			if (!term) return;
+			term.options.theme = resolvedTheme;
+			if (term.options.fontSize !== terminalFontSize) {
+				term.options.fontSize = terminalFontSize;
+				fitAddonRef.current?.fit();
+			}
+		}, [resolvedTheme, terminalFontSize]);
 
 		const handleAuxKey = useCallback(
 			(data: string) => {
@@ -522,7 +550,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					style={{
 						flex: 1,
 						minHeight: 0,
-						backgroundColor: TERM_BG,
+						backgroundColor: themeBg,
 						padding: 4,
 						position: "relative",
 						overscrollBehavior: "contain",

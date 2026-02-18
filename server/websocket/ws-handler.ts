@@ -18,8 +18,7 @@ export function resolveWSData(url: URL): WSData | null {
 		return { channel: "narrator", connectedAt: Date.now(), subscribedNarrators: new Set() };
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {
-		const terminalId = url.searchParams.get("terminalId") ?? undefined;
-		return { channel: "terminal", connectedAt: Date.now(), terminalId };
+		return { channel: "terminal", connectedAt: Date.now(), subscribedTerminals: new Set() };
 	}
 	return null;
 }
@@ -43,29 +42,24 @@ export const wsHandlers = {
 		const { channel } = ws.data;
 
 		let parsed: unknown;
-		let isStructuredMessage = false;
 		try {
 			parsed = JSON.parse(text);
-			// Only treat as a structured message if it's an object with a "type" field.
-			// Bare JSON values (numbers, booleans, strings) should fall through to raw handling.
-			isStructuredMessage = typeof parsed === "object" && parsed !== null && "type" in parsed;
+			if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) {
+				logger.warn("Invalid WebSocket message: missing type field", {
+					channel,
+					text: text.slice(0, 200),
+				});
+				return;
+			}
 		} catch {
-			// Not valid JSON — will be handled as raw input below
+			logger.warn("Invalid WebSocket JSON", { channel, text: text.slice(0, 200) });
+			return;
 		}
 
-		if (isStructuredMessage) {
-			if (channel === "narrator") {
-				handleNarratorWS.message(ws as ServerWebSocket<WSData & { channel: "narrator" }>, parsed);
-			} else if (channel === "terminal") {
-				handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
-			}
-		} else {
-			// For terminal, raw text is terminal input (keystrokes)
-			if (channel === "terminal") {
-				handleTerminalWS.rawMessage(ws as ServerWebSocket<WSData & { channel: "terminal" }>, text);
-			} else {
-				logger.warn("Invalid WebSocket JSON", { channel, text: text.slice(0, 200) });
-			}
+		if (channel === "narrator") {
+			handleNarratorWS.message(ws as ServerWebSocket<WSData & { channel: "narrator" }>, parsed);
+		} else if (channel === "terminal") {
+			handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
 		}
 	},
 
