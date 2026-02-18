@@ -1785,9 +1785,7 @@ export function NarratorPanel({
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
 				// Derive compacting state from system compact messages
-				const blocks = Array.isArray(wsData.message?.contentJson)
-					? wsData.message.contentJson
-					: [];
+				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
 				const compactBlock = blocks.find((b: any) => b.type === "compact");
 				if (compactBlock) {
 					setIsCompacting(compactBlock.status === "compacting");

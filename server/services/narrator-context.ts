@@ -1,6 +1,6 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { agentGenerate } from "../lib/agent";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
@@ -91,28 +91,10 @@ export const narratorContext = {
 		const summaryPrompt = getPrompt("summary", locale);
 
 		try {
-			const summaryQuery = query({
-				prompt: summaryPrompt + conversationText,
-				options: {
-					model: settings.agent.summaryModel,
-					maxTurns: 1,
-					tools: [],
-					permissionMode: "dontAsk",
-					settingSources: ["user"],
-				},
-			});
-
-			let summary = "";
-			for await (const message of summaryQuery) {
-				if (message.type === "assistant") {
-					const content = message.message.content;
-					for (const block of content) {
-						if (block.type === "text") {
-							summary += block.text;
-						}
-					}
-				}
-			}
+			const summary = await agentGenerate(
+				summaryPrompt + conversationText,
+				settings.agent.summaryModel,
+			);
 
 			return summary || "Failed to generate summary.";
 		} catch (err) {
@@ -153,27 +135,10 @@ export const narratorContext = {
 		const compactPrompt = getPrompt("compact", locale);
 
 		try {
-			const compactQuery = query({
-				prompt: compactPrompt + conversationText,
-				options: {
-					model: settings.agent.summaryModel,
-					maxTurns: 1,
-					tools: [],
-					permissionMode: "dontAsk",
-					settingSources: ["user"],
-				},
-			});
-
-			let summary = "";
-			for await (const message of compactQuery) {
-				if (message.type === "assistant") {
-					for (const block of message.message.content) {
-						if (block.type === "text") {
-							summary += block.text;
-						}
-					}
-				}
-			}
+			const summary = await agentGenerate(
+				compactPrompt + conversationText,
+				settings.agent.summaryModel,
+			);
 
 			return summary || "Failed to generate compact summary.";
 		} catch (err) {

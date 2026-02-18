@@ -1,15 +1,5 @@
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import {
-	type HookCallback,
-	type NotificationHookInput,
-	type PermissionMode,
-	type PermissionResult,
-	type Query,
-	query,
-	type SDKAssistantMessage,
-	type SDKMessage,
-	type SDKUserMessage,
-} from "@anthropic-ai/claude-agent-sdk";
 import { and, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -19,6 +9,7 @@ import {
 	narratorToolCalls,
 	permissionRequests,
 } from "../db/schema";
+import { type AgentEvent, agentLoop, buildHistory, type PermissionResult } from "../lib/agent";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -26,72 +17,24 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { getReplyLanguageInstruction } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
-import { getImagePath, type ImageRef, imageToBase64 } from "../lib/uploads";
+import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorContext } from "./narrator-context";
 import { narratorService } from "./narrator-service";
-import { generateAndSetTitle, generateQuickTitle, persistTitle } from "./narrator-title";
-
-// === Async message channel for streaming input mode ===
-
-class MessageChannel implements AsyncIterable<SDKUserMessage> {
-	private queue: SDKUserMessage[] = [];
-	private waiting: ((result: IteratorResult<SDKUserMessage>) => void) | null = null;
-	private closed = false;
-
-	push(msg: SDKUserMessage): void {
-		if (this.closed) return;
-		if (this.waiting) {
-			const resolve = this.waiting;
-			this.waiting = null;
-			resolve({ value: msg, done: false });
-		} else {
-			this.queue.push(msg);
-		}
-	}
-
-	close(): void {
-		this.closed = true;
-		if (this.waiting) {
-			const resolve = this.waiting;
-			this.waiting = null;
-			resolve({ value: undefined as unknown as SDKUserMessage, done: true });
-		}
-	}
-	async *[Symbol.asyncIterator](): AsyncIterableIterator<SDKUserMessage> {
-		while (true) {
-			if (this.queue.length > 0) {
-				const msg = this.queue.shift();
-				if (msg !== undefined) yield msg;
-			} else if (this.closed) {
-				return;
-			} else {
-				const result = await new Promise<IteratorResult<SDKUserMessage>>((resolve) => {
-					this.waiting = resolve;
-				});
-				if (result.done) return;
-				yield result.value;
-			}
-		}
-	}
-}
+import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 
 // === In-memory state ===
 
 interface ActiveSession {
-	query: Query;
-	channel: MessageChannel;
 	abortController: AbortController;
 	narratorId: string;
-	sessionId: string | null;
+	conversationId: string;
+	cwd: string;
+	model: string;
+	systemPrompt: string | null;
 	events: EventEmitter;
 	alive: boolean;
 	locale: Locale;
-	/** Set to true after a resume failure triggered a fresh-session retry */
-	_skipResume?: boolean;
-	/** Set to true when PreCompact hook fires, signaling session rotation */
-	_compactTriggered?: boolean;
-	/** Set to true when this session was created with a compact summary */
 	_usedCompactSummary?: boolean;
 }
 
@@ -109,9 +52,6 @@ interface PendingPermission {
 }
 
 const pendingPermissions = new Map<string, PendingPermission>();
-
-// Narrators whose resume failed — next createSession will skip resume
-const resumeFailedNarrators = new Set<string>();
 
 // Feedback queued by "allow with feedback" — keyed by narratorId
 const pendingFeedback = new Map<string, { toolUseId: string; feedbackText: string }>();
@@ -141,29 +81,24 @@ const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 async function handlePermission(
 	narratorId: string,
+	signal: AbortSignal,
 	toolName: string,
 	input: Record<string, unknown>,
-	options: {
-		signal: AbortSignal;
-		suggestions?: unknown[];
-		decisionReason?: string;
-		toolUseID: string;
-	},
+	toolUseId: string,
 ): Promise<PermissionResult> {
-	// Auto-allow safe built-in tools that don't need user approval
+	// Auto-allow safe built-in tools
 	const autoAllowTools = ["TodoWrite", "TodoRead"];
 	if (autoAllowTools.includes(toolName)) {
 		return { behavior: "allow", updatedInput: input };
 	}
 
-	// Read permission mode from DB in real-time so mid-session changes take effect
+	// Read permission mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { permissionMode: true },
 	});
 	const permMode = narrator?.permissionMode ?? "default";
 
-	// Auto-allow/deny based on current permission mode
 	if (permMode === "bypassPermissions") {
 		return { behavior: "allow", updatedInput: input };
 	}
@@ -174,7 +109,6 @@ async function handlePermission(
 		};
 	}
 	if (permMode === "acceptEdits") {
-		// Accept file-editing tools automatically, prompt for others
 		const editTools = ["Edit", "Write", "NotebookEdit", "MultiEdit"];
 		if (editTools.includes(toolName)) {
 			return { behavior: "allow", updatedInput: input };
@@ -184,48 +118,32 @@ async function handlePermission(
 	const requestId = generateId();
 	const now = new Date().toISOString();
 
-	// Look up the narratorToolCalls record by SDK tool_use_id to get its PK.
 	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
 		where: and(
 			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, options.toolUseID),
+			eq(narratorToolCalls.toolUseId, toolUseId),
 		),
 	});
 
-	// Create permission request record
 	await db.insert(permissionRequests).values({
 		id: requestId,
 		narratorId,
 		toolCallId: toolCallRecord?.id ?? null,
 		toolName,
 		inputJson: input,
-		decisionReason: options.decisionReason,
-		suggestions: options.suggestions,
 		decision: "pending",
 		createdAt: now,
 	});
 
-	// Broadcast to WebSocket subscribers
 	broadcastToNarrator(narratorId, {
 		type: "permission_request",
 		narratorId,
-		request: {
-			id: requestId,
-			toolName,
-			toolUseId: options.toolUseID,
-			inputJson: input,
-			decisionReason: options.decisionReason,
-			suggestions: options.suggestions,
-		},
+		request: { id: requestId, toolName, toolUseId, inputJson: input },
 	});
-
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId });
-
-	// Mark narrator as waiting for user decision
 	await narratorService.updateStatus(narratorId, "waiting");
 
-	// If already aborted, reject immediately
-	if (options.signal.aborted) {
+	if (signal.aborted) {
 		await db
 			.update(permissionRequests)
 			.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
@@ -233,15 +151,14 @@ async function handlePermission(
 		return { behavior: "deny", message: "Session aborted" };
 	}
 
-	// Return a promise that resolves when user decides, timeout, or abort
 	return new Promise<PermissionResult>((resolve) => {
 		const cleanup = () => {
-			clearTimeout(timeoutId);
-			options.signal.removeEventListener("abort", onAbort);
+			clearTimeout(tid);
+			signal.removeEventListener("abort", onAbort);
 			pendingPermissions.delete(requestId);
 		};
 
-		const timeoutId = setTimeout(async () => {
+		const tid = setTimeout(async () => {
 			cleanup();
 			await db
 				.update(permissionRequests)
@@ -259,14 +176,14 @@ async function handlePermission(
 			resolve({ behavior: "deny", message: "Session aborted" });
 		};
 
-		options.signal.addEventListener("abort", onAbort, { once: true });
+		signal.addEventListener("abort", onAbort, { once: true });
 
 		pendingPermissions.set(requestId, {
 			resolve,
-			timeoutId,
+			timeoutId: tid,
 			input,
 			narratorId,
-			toolUseId: options.toolUseID,
+			toolUseId,
 		});
 	});
 }
@@ -344,10 +261,10 @@ export async function resolvePermission(
 	}
 }
 
-// === Session lifecycle (streaming input mode) ===
+// === Session lifecycle ===
 
 /**
- * Ensure a long-lived streaming SDK session exists for this narrator.
+ * Ensure an active session exists for this narrator.
  * If one is already alive, return it. Otherwise create a new one.
  */
 async function ensureSession(
@@ -358,11 +275,10 @@ async function ensureSession(
 	const existing = activeSessions.get(narratorId);
 	if (existing?.alive) return existing;
 
-	// If another call is already creating a session, wait for it
 	const pending = sessionCreationLocks.get(narratorId);
 	if (pending) return pending;
 
-	const creation = createSession(narratorId, locale, false, replyInUserLanguage);
+	const creation = createSession(narratorId, locale, replyInUserLanguage);
 	sessionCreationLocks.set(narratorId, creation);
 	try {
 		return await creation;
@@ -374,131 +290,42 @@ async function ensureSession(
 async function createSession(
 	narratorId: string,
 	locale: Locale,
-	skipResume = false,
 	replyInUserLanguage = false,
 ): Promise<ActiveSession> {
-	// Clean up dead session if present
 	const existing = activeSessions.get(narratorId);
-	if (existing) activeSessions.delete(narratorId);
-
-	// Auto-skip resume if a previous resume attempt failed for this narrator
-	if (resumeFailedNarrators.has(narratorId)) {
-		skipResume = true;
-		resumeFailedNarrators.delete(narratorId);
+	if (existing) {
+		existing.abortController.abort();
+		activeSessions.delete(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
 
 	// Resolve CWD
 	let sessionCwd: string;
-	let chapter: Awaited<ReturnType<typeof db.query.chapters.findFirst>> | null = null;
-
 	if (narrator.chapterId) {
 		const ch = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
 		});
 		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
-		if (!ch.worktreePath) {
-			throw new Error("Chapter has no worktree (dormant?)");
-		}
-		chapter = ch;
+		if (!ch.worktreePath) throw new Error("Chapter has no worktree (dormant?)");
 		sessionCwd = ch.worktreePath;
 	} else {
 		sessionCwd = narrator.cwd || process.env.HOME || "/tmp";
 	}
 
-	// Fork detection
-	const isFullFork =
-		!skipResume &&
-		chapter &&
-		narrator.inheritMode === "full" &&
-		narrator.parentNarratorId &&
-		narrator.claudeSessionId &&
-		(narrator.messageCount ?? 0) === 0;
-
-	let resumeSessionAt: string | undefined;
-	if (isFullFork && chapter?.forkPoint) {
-		const fp = chapter.forkPoint as { commitSha: string; narratorMessageUuid?: string };
-		resumeSessionAt = fp.narratorMessageUuid;
-	}
-
-	// Determine resume session ID (skip if previous resume failed)
-	const resumeSessionId = skipResume ? undefined : (narrator.claudeSessionId ?? undefined);
-
-	const abortController = new AbortController();
-	const channel = new MessageChannel();
-	const events = new EventEmitter();
-	events.setMaxListeners(20);
-
-	const onPreCompact: HookCallback = async (_input) => {
-		// Let SDK handle compact normally for now.
-		// Custom compact logic (runCustomCompact / handleCompactRotation) is preserved
-		// and can be activated by setting _compactTriggered = true + interrupting here.
-		logger.info("PreCompact triggered, allowing SDK compact", { narratorId });
-
-		// Persist a system message so compact state survives page reloads
-		const compactMsg = await narratorService.persistCompactingMessage(narratorId);
-		broadcastToNarrator(narratorId, {
-			type: "message",
-			narratorId,
-			message: compactMsg,
-		});
-		broadcastToNarrator(narratorId, { type: "compacting", narratorId });
-		return {};
-	};
-
-	const onNotification: HookCallback = async (input) => {
-		const notification = input as NotificationHookInput;
-		if (notification.title) {
-			const title = notification.title.trim().replace(/^["'""]+|["'""]+$/g, "");
-			if (title) {
-				persistTitle(narratorId, title).catch(() => {});
-			}
-		}
-		return {};
-	};
-
-	if (skipResume) {
-		logger.info("Creating fresh session (resume skipped)", { narratorId });
-	}
-
-	// When skipping resume due to failure, generate a context summary to preserve continuity
+	// Build system prompt
 	let effectiveSystemPrompt = narrator.systemPrompt;
-	if (skipResume && narrator.claudeSessionId) {
-		try {
-			logger.info("Generating context summary for resume-failed session", { narratorId });
-			const summary = await narratorContext.generateContextSummary(narratorId, locale);
-			const base = effectiveSystemPrompt ?? "";
-			const sep = base ? "\n\n" : "";
-			effectiveSystemPrompt = `${base}${sep}## Previous Context Summary\n\nThis session was automatically recovered after a resume failure. Here is a summary of the prior conversation:\n\n${summary}`;
-			logger.info("Context summary injected into system prompt", {
-				narratorId,
-				summaryLength: summary.length,
-			});
-		} catch (err) {
-			logger.error("Failed to generate context summary for resume fallback", {
-				narratorId,
-				error: String(err),
-			});
-			// Continue without summary — a fresh session is better than no session
-		}
-	}
 
-	// When a compact summary exists, inject it and start a fresh session (no resume)
+	// Inject compact summary if available
 	let usedCompactSummary = false;
-	if (narrator.contextSummary && !skipResume) {
-		skipResume = true;
+	if (narrator.contextSummary) {
 		usedCompactSummary = true;
 		const base = effectiveSystemPrompt ?? "";
 		const sep = base ? "\n\n" : "";
 		effectiveSystemPrompt = `${base}${sep}## Conversation Context\n\n${narrator.contextSummary}`;
-		logger.info("Using compact summary for new session", {
-			narratorId,
-			summaryLength: narrator.contextSummary.length,
-		});
 	}
 
-	// Append language instruction when user has "reply in my language" enabled
+	// Append language instruction
 	if (replyInUserLanguage) {
 		const instruction = getReplyLanguageInstruction(locale);
 		const base = effectiveSystemPrompt ?? "";
@@ -506,259 +333,147 @@ async function createSession(
 		effectiveSystemPrompt = `${base}${sep}## Language\n\n${instruction}`;
 	}
 
-	// When resuming an existing SDK session, skip the heavy claude_code preset
-	// and CLAUDE.md loading — the SDK already has the full context from the JSONL.
-	// This avoids ~22k of redundant prompt tokens on every resume.
-	const isResume = !!resumeSessionId && !isFullFork;
-
-	const systemPromptOption = isResume
-		? ""
-		: effectiveSystemPrompt
-			? { type: "preset" as const, preset: "claude_code" as const, append: effectiveSystemPrompt }
-			: { type: "preset" as const, preset: "claude_code" as const };
-
-	const sdkQuery = query({
-		prompt: channel,
-		options: {
-			cwd: sessionCwd,
-			model: narrator.model ?? settings.agent.defaultModel,
-			resume: resumeSessionId,
-			...(isFullFork && { forkSession: true }),
-			...(isFullFork && resumeSessionAt && { resumeSessionAt }),
-			...(settings.agent.extendedContext && {
-				betas: ["context-1m-2025-08-07"] as const,
-			}),
-			includePartialMessages: true,
-			systemPrompt: systemPromptOption,
-			permissionMode: (narrator.sdkPlanMode ? "plan" : "default") as PermissionMode,
-			canUseTool: (toolName, input, opts) => handlePermission(narratorId, toolName, input, opts),
-			abortController,
-			settingSources: ["user", "project"],
-			hooks: {
-				PreCompact: [{ hooks: [onPreCompact] }],
-				Notification: [{ hooks: [onNotification] }],
-			},
-		},
-	});
+	const abortController = new AbortController();
+	const events = new EventEmitter();
+	events.setMaxListeners(20);
 
 	const session: ActiveSession = {
-		query: sdkQuery,
-		channel,
 		abortController,
 		narratorId,
-		sessionId: narrator.claudeSessionId ?? null,
+		conversationId: narrator.claudeSessionId ?? randomUUID(),
+		cwd: sessionCwd,
+		model: narrator.model ?? settings.agent.defaultModel,
+		systemPrompt: effectiveSystemPrompt,
 		events,
 		alive: true,
 		locale,
-		_skipResume: skipResume,
 		_usedCompactSummary: usedCompactSummary,
 	};
 
 	activeSessions.set(narratorId, session);
-
-	// Start detached consumption loop
-	consumeSDKMessages(session).catch((err) => {
-		logger.error("SDK consumption loop crashed", { narratorId, error: String(err) });
-	});
-
 	return session;
 }
 
+// === Agent loop execution ===
+
+const COMPACT_HISTORY_THRESHOLD = 80;
+
 /**
- * Detached background loop that reads SDK messages and broadcasts events.
- * Runs independently of any SSE connection.
+ * Build AgentConfig, start agentLoop(), and consume events.
+ * Runs in the background — kicked off by feedMessage().
+ * Handles chained messages (feedback/buffered) by looping.
  */
-async function consumeSDKMessages(session: ActiveSession): Promise<void> {
+async function runAgentLoop(session: ActiveSession, text: string): Promise<void> {
 	const { narratorId, locale } = session;
 	let shouldUpdateTitle = false;
 	let titleTracked = false;
-	let lastAssistantMsgId: string | null = null;
+	let currentText = text;
 
 	try {
-		for await (const message of session.query) {
-			// Update session ID from SDK messages
-			if ("session_id" in message && message.session_id) {
-				session.sessionId = message.session_id as string;
+		while (session.alive) {
+			const dbMessages = await narratorService.getMessages(narratorId, 200);
+			const history = buildHistory(dbMessages, session.model);
+
+			// Compact if history is too long
+			if (history.length > COMPACT_HISTORY_THRESHOLD) {
+				await runCustomCompact(narratorId, locale);
+				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+				// Reload session with summary in system prompt (use DB base to avoid cumulative append)
+				const fresh = await narratorService.getById(narratorId);
+				if (fresh.contextSummary) {
+					const base = fresh.systemPrompt ?? "";
+					const sep = base ? "\n\n" : "";
+					session.systemPrompt = `${base}${sep}## Conversation Context\n\n${fresh.contextSummary}`;
+					session._usedCompactSummary = true;
+				}
+				history.length = 0;
 			}
 
-			let event: SessionEvent | null = null;
-			try {
-				event = await processSDKMessage(narratorId, message);
-			} catch (err) {
-				// Non-fatal: log and continue — don't kill the session for transient DB errors
-				logger.error("processSDKMessage failed, continuing session", {
-					narratorId,
-					messageType: message.type,
-					error: String(err),
+			const config: import("../lib/agent").AgentConfig = {
+				narratorId,
+				conversationId: session.conversationId,
+				model: session.model,
+				cwd: session.cwd,
+				systemPrompt: session.systemPrompt ?? undefined,
+				signal: session.abortController.signal,
+				permissionHandler: (toolName, input, toolUseId) =>
+					handlePermission(narratorId, session.abortController.signal, toolName, input, toolUseId),
+			};
+
+			// Run one agent loop pass
+			for await (const event of agentLoop(config, currentText, history)) {
+				if (!session.alive) break;
+
+				const mapped = await processAgentEvent(session, event, {
+					titleTracked,
+					shouldUpdateTitle,
 				});
+				if (mapped?.titleUpdate !== undefined) {
+					shouldUpdateTitle = mapped.titleUpdate;
+					titleTracked = true;
+				}
 			}
 
-			if (event?.type === "assistant_message" && !shouldUpdateTitle && !titleTracked) {
-				const narrator = await db.query.narrators.findFirst({
+			// Agent loop done — update status
+			await narratorService.updateStats(narratorId, 0);
+			await narratorService.updateStatus(narratorId, "idle");
+
+			// Check for chained feedback
+			const fb = pendingFeedback.get(narratorId);
+			if (fb) {
+				pendingFeedback.delete(narratorId);
+				const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
+					{ type: "text", text: fb.feedbackText },
+				]);
+				broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+				session.events.emit("event", { type: "user_message", data: userMsg });
+				await narratorService.updateStatus(narratorId, "thinking");
+				currentText = fb.feedbackText;
+				continue;
+			}
+
+			// Check for buffered messages
+			const buffered = bufferedMessages.get(narratorId);
+			if (buffered) {
+				bufferedMessages.delete(narratorId);
+				const finalNarrator = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { messageCount: true, title: true },
+					columns: { status: true },
 				});
-				if (narrator && (narrator.messageCount ?? 0) <= 1 && !narrator.title) {
-					shouldUpdateTitle = true;
-				}
-				titleTracked = true;
-			}
-
-			// Clear compact summary after first successful response in new session
-			if (event?.type === "assistant_message" && session._usedCompactSummary) {
-				session._usedCompactSummary = false;
-				await db
-					.update(narrators)
-					.set({ contextSummary: null, updatedAt: new Date().toISOString() })
-					.where(eq(narrators.id, narratorId));
-			}
-
-			// Track last assistant message ID for cost attribution
-			if (event?.type === "assistant_message" && event.data?.id) {
-				lastAssistantMsgId = event.data.id;
-			}
-
-			if (event) {
-				session.events.emit("event", event);
-			}
-
-			// After each turn completes, write cost + usage to last assistant message
-			if (message.type === "result" && lastAssistantMsgId) {
-				const costUsd = message.total_cost_usd ?? 0;
-				const usage = message.usage ?? null;
-				await narratorService.updateMessageCost(lastAssistantMsgId, costUsd, usage);
-				lastAssistantMsgId = null;
-			}
-
-			// After each turn completes, handle feedback/buffered messages
-			if (message.type === "result") {
-				// Check if this result was triggered by our PreCompact interrupt
-				if (session._compactTriggered) {
-					session._compactTriggered = false;
-					await handleCompactRotation(session, narratorId, locale);
-					continue;
-				}
-
-				const fb = pendingFeedback.get(narratorId);
-				if (fb) {
-					pendingFeedback.delete(narratorId);
-					// Auto-feed feedback as a new message
-					const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
-						{ type: "text", text: fb.feedbackText },
+				if (finalNarrator?.status !== "error") {
+					broadcastToNarrator(narratorId, { type: "buffer_cleared", narratorId, reason: "sent" });
+					const userMsg = await narratorService.persistUserMessage(narratorId, buffered.text, [
+						{ type: "text", text: buffered.text },
 					]);
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: userMsg,
-					});
+					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 					session.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "thinking");
-					await feedMessageInternal(session, fb.feedbackText);
+					currentText = buffered.text;
 					continue;
 				}
-
-				const buffered = bufferedMessages.get(narratorId);
-				if (buffered) {
-					bufferedMessages.delete(narratorId);
-					const finalNarrator = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { status: true },
-					});
-					if (finalNarrator?.status !== "error") {
-						broadcastToNarrator(narratorId, {
-							type: "buffer_cleared",
-							narratorId,
-							reason: "sent",
-						});
-						const userMsg = await narratorService.persistUserMessage(narratorId, buffered.text, [
-							{ type: "text", text: buffered.text },
-						]);
-						broadcastToNarrator(narratorId, {
-							type: "user_message",
-							narratorId,
-							message: userMsg,
-						});
-						session.events.emit("event", { type: "user_message", data: userMsg });
-						await narratorService.updateStatus(narratorId, "thinking");
-						await feedMessageInternal(session, buffered.text, buffered.images);
-						continue;
-					}
-					broadcastToNarrator(narratorId, {
-						type: "buffer_cleared",
-						narratorId,
-						reason: "session_error",
-					});
-				}
-
-				// No chained message — this turn is done
-				session.events.emit("event", { type: "done", data: null });
+				broadcastToNarrator(narratorId, {
+					type: "buffer_cleared",
+					narratorId,
+					reason: "session_error",
+				});
 			}
+
+			// No chained message — done
+			session.events.emit("event", { type: "done", data: null });
+			break;
 		}
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
-
-		// If compact triggered the interruption, handle it gracefully
-		if (session._compactTriggered) {
-			session._compactTriggered = false;
-			try {
-				await handleCompactRotation(session, narratorId, locale);
-			} catch (compactErr) {
-				logger.error("Compact rotation failed in catch block", {
-					narratorId,
-					error: String(compactErr),
-				});
-				session.events.emit("event", { type: "done", data: null });
-			}
-			return;
-		}
-
-		// Detect resume failures (malformed session data from corrupted JSONL)
-		const isResumeFailure =
-			session.sessionId &&
-			!session._skipResume &&
-			(errorMsg.includes("Improperly formed request") ||
-				errorMsg.includes("400 Bad Request") ||
-				errorMsg.includes("invalid_request_error"));
-
-		if (isResumeFailure) {
-			logger.warn("Session resume failed, clearing claudeSessionId for fresh start", {
-				narratorId,
-				error: errorMsg,
-			});
-			resumeFailedNarrators.add(narratorId);
-			// Persist the decision: clear DB session ID so a server restart
-			// won't re-attempt resuming the corrupted session
-			await db
-				.update(narrators)
-				.set({ claudeSessionId: null, updatedAt: new Date().toISOString() })
-				.where(eq(narrators.id, narratorId));
-			await narratorService.updateStatus(
-				narratorId,
-				"error",
-				"Session context corrupted. Send a new message to auto-recover with context summary.",
-			);
-		} else {
-			logger.error("Narrator session error", { narratorId, error: errorMsg });
-			await narratorService.updateStatus(narratorId, "error", errorMsg);
-		}
-
+		logger.error("Narrator session error", { narratorId, error: errorMsg });
+		await narratorService.updateStatus(narratorId, "error", errorMsg);
 		session.events.emit("event", { type: "error", data: { message: errorMsg } });
 		session.events.emit("event", { type: "done", data: null });
 	} finally {
 		session.alive = false;
 		activeSessions.delete(narratorId);
-
-		// Clean up SDK resources to prevent process leaks
-		session.channel.close();
 		session.abortController.abort();
-
-		// Safety net: ensure SSE consumers always receive a done event.
-		// Duplicate done is harmless — startSession breaks on the first one.
 		session.events.emit("event", { type: "done", data: null });
-
 		session.events.removeAllListeners();
-
-		// Title generation after session ends
 		if (shouldUpdateTitle) {
 			generateAndSetTitle(narratorId, locale).catch(() => {});
 		}
@@ -792,114 +507,11 @@ async function runCustomCompact(narratorId: string, locale: Locale): Promise<voi
 	logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 }
 
-/**
- * Handle compact-triggered session rotation: run compact, then re-deliver
- * any pending feedback or buffered messages via a new session.
- */
-async function handleCompactRotation(
-	session: ActiveSession,
-	narratorId: string,
-	locale: Locale,
-): Promise<void> {
-	logger.info("Running custom compact after PreCompact interrupt", { narratorId });
-
-	try {
-		await runCustomCompact(narratorId, locale);
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-	} catch (err) {
-		logger.error("Custom compact failed", { narratorId, error: String(err) });
-		// Even if compact fails, clear session so next message starts fresh
-		await db
-			.update(narrators)
-			.set({ claudeSessionId: null, updatedAt: new Date().toISOString() })
-			.where(eq(narrators.id, narratorId));
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-	}
-
-	// Re-deliver pending feedback or buffered messages via a new session
-	const fb = pendingFeedback.get(narratorId);
-	if (fb) {
-		pendingFeedback.delete(narratorId);
-		const newSession = await ensureSession(narratorId, locale);
-		const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
-			{ type: "text", text: fb.feedbackText },
-		]);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: userMsg,
-		});
-		newSession.events.emit("event", { type: "user_message", data: userMsg });
-		await narratorService.updateStatus(narratorId, "thinking");
-		await feedMessageInternal(newSession, fb.feedbackText);
-		return;
-	}
-
-	const buffered = bufferedMessages.get(narratorId);
-	if (buffered) {
-		bufferedMessages.delete(narratorId);
-		broadcastToNarrator(narratorId, {
-			type: "buffer_cleared",
-			narratorId,
-			reason: "sent",
-		});
-		const newSession = await ensureSession(narratorId, locale);
-		const userMsg = await narratorService.persistUserMessage(narratorId, buffered.text, [
-			{ type: "text", text: buffered.text },
-		]);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: userMsg,
-		});
-		newSession.events.emit("event", { type: "user_message", data: userMsg });
-		await narratorService.updateStatus(narratorId, "thinking");
-		await feedMessageInternal(newSession, buffered.text, buffered.images);
-		return;
-	}
-
-	// No pending messages — session will be recreated on next user message
-	session.events.emit("event", { type: "done", data: null });
-}
-
 // === Message feeding ===
 
-/** Push a message into an existing session's channel (internal, no persistence). */
-async function feedMessageInternal(
-	session: ActiveSession,
-	text: string,
-	images?: ImageRef[],
-): Promise<void> {
-	const contentBlocks: Array<
-		| { type: "text"; text: string }
-		| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
-	> = [];
-	if (images?.length) {
-		for (const img of images) {
-			const filePath = getImagePath(session.narratorId, img.imageId);
-			if (filePath) {
-				const data = await imageToBase64(filePath);
-				contentBlocks.push({
-					type: "image",
-					source: { type: "base64", media_type: img.mediaType, data },
-				});
-			}
-		}
-	}
-	contentBlocks.push({ type: "text", text });
-
-	session.channel.push({
-		type: "user",
-		message: { role: "user", content: contentBlocks },
-		parent_tool_use_id: null,
-		session_id: session.sessionId ?? "",
-	});
-}
-
 /**
- * Feed a new user message into the narrator's streaming session.
- * Creates the session if it doesn't exist yet.
- * Returns the ActiveSession and persisted user message for the caller to emit after subscribing.
+ * Persist a user message and kick off the agent loop in the background.
+ * Returns the session and persisted message for SSE subscription.
  */
 async function feedMessage(
 	narratorId: string,
@@ -910,7 +522,6 @@ async function feedMessage(
 ): Promise<{ session: ActiveSession; userMsg: typeof narratorMessages.$inferSelect }> {
 	const session = await ensureSession(narratorId, locale, replyInUserLanguage);
 
-	// Persist user message to DB
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
 		| { type: "image"; imageId: string; filename: string; mediaType: string }
@@ -928,224 +539,161 @@ async function feedMessage(
 	persistBlocks.push({ type: "text", text: prompt });
 	const userMsg = await narratorService.persistUserMessage(narratorId, prompt, persistBlocks);
 
-	// Update status
 	await narratorService.updateStatus(narratorId, "thinking");
 
-	// Quick title on first message
 	const narrator = await narratorService.getById(narratorId);
 	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
 		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
 	}
 
-	// Feed the message into the channel
-	await feedMessageInternal(session, prompt, images);
+	// Start agent loop in background
+	runAgentLoop(session, prompt).catch((err) => {
+		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
+	});
 
 	return { session, userMsg };
 }
 
-// === SDK message processing ===
+// === Agent event processing ===
 
-async function processSDKMessage(
-	narratorId: string,
-	message: SDKMessage,
-): Promise<SessionEvent | null> {
-	switch (message.type) {
-		case "assistant": {
-			// Persist session ID
-			await narratorService.updateSessionId(narratorId, message.session_id);
+async function processAgentEvent(
+	session: ActiveSession,
+	event: AgentEvent,
+	state: { titleTracked: boolean; shouldUpdateTitle: boolean },
+): Promise<{ titleUpdate?: boolean } | null> {
+	const { narratorId } = session;
 
-			// Persist message + tool calls
-			const saved = await narratorService.persistAssistantMessage(
+	switch (event.type) {
+		case "stream_text": {
+			broadcastToNarrator(narratorId, {
+				type: "stream_event",
 				narratorId,
-				message as unknown as Parameters<typeof narratorService.persistAssistantMessage>[1],
-			);
+				event: { type: "content_block_delta", delta: { text: event.text } },
+			});
+			session.events.emit("event", {
+				type: "stream_event",
+				data: { type: "content_block_delta", delta: { text: event.text } },
+			});
+			return null;
+		}
 
-			// Check for TodoWrite and persist + broadcast todos snapshot
-			const assistantContent = (message as SDKAssistantMessage).message?.content;
-			if (Array.isArray(assistantContent)) {
-				const todoBlock = assistantContent.find(
-					(b: { type: string; name?: string; input?: Record<string, unknown>; id?: string }) =>
-						b.type === "tool_use" && b.name === "TodoWrite",
-				);
-				if (todoBlock?.input?.todos) {
-					await narratorService.updateTodos(narratorId, todoBlock.input.todos, todoBlock.id);
+		case "tool_call": {
+			broadcastToNarrator(narratorId, {
+				type: "tool_started",
+				narratorId,
+				toolUseId: event.toolUseId,
+				toolName: event.toolName,
+				input: event.input,
+			});
+			return null;
+		}
+
+		case "assistant_message": {
+			// Build SDK-compatible message for persistAssistantMessage
+			const content: any[] = [];
+			if (event.text) content.push({ type: "text", text: event.text });
+			for (const tu of event.toolUses) {
+				content.push({ type: "tool_use", id: tu.toolUseId, name: tu.name, input: tu.input });
+			}
+
+			const saved = await narratorService.persistAssistantMessage(narratorId, {
+				uuid: event.messageId ?? randomUUID(),
+				session_id: session.conversationId,
+				message: { content },
+			});
+
+			// TodoWrite / EnterPlanMode tracking
+			for (const tu of event.toolUses) {
+				if (tu.name === "TodoWrite" && tu.input?.todos) {
+					await narratorService.updateTodos(narratorId, tu.input.todos as any[], tu.toolUseId);
 					broadcastToNarrator(narratorId, {
 						type: "todos_updated",
 						narratorId,
-						todos: todoBlock.input.todos,
-						toolUseId: todoBlock.id,
+						todos: tu.input.todos as any[],
+						toolUseId: tu.toolUseId,
 					});
 				}
-
-				// Track EnterPlanMode tool invocations for sdkPlanMode
-				for (const block of assistantContent) {
-					if (block.type === "tool_use" && block.name === "EnterPlanMode") {
-						await narratorService.updateSdkPlanMode(narratorId, true);
-						broadcastToNarrator(narratorId, {
-							type: "sdk_plan_mode_changed",
-							narratorId,
-							sdkPlanMode: true,
-						});
-					}
+				if (tu.name === "EnterPlanMode") {
+					await narratorService.updateSdkPlanMode(narratorId, true);
+					broadcastToNarrator(narratorId, {
+						type: "sdk_plan_mode_changed",
+						narratorId,
+						sdkPlanMode: true,
+					});
 				}
 			}
 
-			// Broadcast full persisted message (with toolCalls) to WebSocket
 			const fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, saved.id),
 				with: { toolCalls: true },
 			});
-			broadcastToNarrator(narratorId, {
-				type: "message",
-				narratorId,
-				message: fullMessage,
-			});
-
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: fullMessage });
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 
-			return { type: "assistant_message", data: saved };
+			// Clear compact summary after first response
+			if (session._usedCompactSummary) {
+				session._usedCompactSummary = false;
+				await db
+					.update(narrators)
+					.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+					.where(eq(narrators.id, narratorId));
+			}
+
+			session.events.emit("event", { type: "assistant_message", data: saved });
+
+			// Title tracking
+			let titleUpdate: boolean | undefined;
+			if (!state.titleTracked) {
+				const n = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { messageCount: true, title: true },
+				});
+				titleUpdate = !!(n && (n.messageCount ?? 0) <= 1 && !n.title);
+			}
+			return { titleUpdate };
 		}
 
-		case "stream_event": {
+		case "tool_result": {
+			const status = event.isError ? "failed" : "completed";
+			try {
+				await narratorService.updateToolCallResult(event.toolUseId, {
+					output: event.output,
+					status,
+					errorMessage: event.isError ? event.output : undefined,
+					durationMs: event.durationMs,
+				});
+			} catch (err) {
+				logger.error("Failed to persist tool result", {
+					narratorId,
+					toolUseId: event.toolUseId,
+					error: String(err),
+				});
+			}
+
 			broadcastToNarrator(narratorId, {
-				type: "stream_event",
+				type: "tool_completed",
 				narratorId,
-				event: message.event,
+				toolUseId: event.toolUseId,
+				status,
+				output: event.output,
 			});
-			return { type: "stream_event", data: message.event };
-		}
 
-		case "user": {
-			// User messages from SDK contain tool_result content blocks
-			const content = message.message?.content;
-			if (Array.isArray(content)) {
-				for (const block of content) {
-					if (block.type === "tool_result" && block.tool_use_id) {
-						const isError = block.is_error ?? false;
-						const status = isError ? "failed" : "completed";
-
-						try {
-							await narratorService.updateToolCallResult(block.tool_use_id, {
-								output: block.content,
-								status,
-								errorMessage: isError
-									? typeof block.content === "string"
-										? block.content
-										: JSON.stringify(block.content)
-									: undefined,
-							});
-						} catch (err) {
-							logger.error("Failed to persist tool call result", {
-								narratorId,
-								toolUseId: block.tool_use_id,
-								error: String(err),
-							});
-						}
-
-						broadcastToNarrator(narratorId, {
-							type: "tool_completed",
-							narratorId,
-							toolUseId: block.tool_use_id,
-							status,
-							output: block.content,
-						});
-
-						// ExitPlanMode: only leave plan mode when user approved
-						if (!isError) {
-							try {
-								const toolCall = await db.query.narratorToolCalls.findFirst({
-									where: eq(narratorToolCalls.toolUseId, block.tool_use_id),
-									columns: { toolName: true },
-								});
-								if (toolCall?.toolName === "ExitPlanMode") {
-									await narratorService.updateSdkPlanMode(narratorId, false);
-									broadcastToNarrator(narratorId, {
-										type: "sdk_plan_mode_changed",
-										narratorId,
-										sdkPlanMode: false,
-									});
-								}
-							} catch (err) {
-								logger.error("Failed to check ExitPlanMode tool result", {
-									narratorId,
-									toolUseId: block.tool_use_id,
-									error: String(err),
-								});
-							}
-						}
-
-						// If this tool had "allow with feedback", interrupt session now
-						const fb = pendingFeedback.get(narratorId);
-						if (fb && fb.toolUseId === block.tool_use_id) {
-							const session = activeSessions.get(narratorId);
-							if (session) {
-								logger.info("Interrupting session for allow-with-feedback", {
-									narratorId,
-									toolUseId: fb.toolUseId,
-								});
-								session.query.interrupt().catch(() => {});
-							}
-						}
-					}
-				}
+			// ExitPlanMode check
+			if (!event.isError && event.toolName === "ExitPlanMode") {
+				await narratorService.updateSdkPlanMode(narratorId, false);
+				broadcastToNarrator(narratorId, {
+					type: "sdk_plan_mode_changed",
+					narratorId,
+					sdkPlanMode: false,
+				});
 			}
 			return null;
 		}
 
-		case "tool_progress": {
-			broadcastToNarrator(narratorId, {
-				type: "tool_progress",
-				narratorId,
-				toolUseId: message.tool_use_id,
-				elapsed: message.elapsed_time_seconds ?? 0,
-			});
-			return { type: "tool_progress", data: message };
-		}
-
-		case "result": {
-			const costUsd = message.total_cost_usd ?? 0;
-			await narratorService.updateStats(narratorId, costUsd);
-
-			if (message.is_error) {
-				const errors = "errors" in message ? (message as { errors: string[] }).errors : [];
-				await narratorService.updateStatus(
-					narratorId,
-					"error",
-					errors.join("; ") || message.subtype,
-				);
-			} else {
-				// In streaming mode, "idle" instead of "done" — session stays alive
-				await narratorService.updateStatus(narratorId, "idle");
-			}
-
-			return {
-				type: "result",
-				data: {
-					subtype: message.subtype,
-					totalCostUsd: costUsd,
-					numTurns: message.num_turns,
-					durationMs: message.duration_ms,
-					isError: message.is_error,
-					usage: message.usage ?? null,
-				},
-			};
-		}
-
-		case "system": {
-			const subtype = message.subtype;
-			if (subtype === "compact_boundary") {
-				logger.info("Compact boundary received", { narratorId });
-				// Update the "compacting" system message to "compacted"
-				const updated = await narratorService.finalizeCompactingMessage(narratorId);
-				if (updated) {
-					broadcastToNarrator(narratorId, {
-						type: "message",
-						narratorId,
-						message: updated,
-					});
-				}
-				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-			}
+		case "error": {
+			logger.error("Agent loop error", { narratorId, error: event.message });
+			await narratorService.updateStatus(narratorId, "error", event.message);
+			session.events.emit("event", { type: "error", data: { message: event.message } });
 			return null;
 		}
 
@@ -1154,12 +702,11 @@ async function processSDKMessage(
 	}
 }
 
-// === Public API: startSession (compatibility wrapper) ===
+// === Public API ===
 
 /**
- * Start or feed a message into a streaming session.
+ * Start or feed a message into a session.
  * Yields SessionEvent objects for SSE consumption.
- * The underlying SDK session stays alive between calls.
  */
 export async function* startSession(
 	narratorId: string,
@@ -1235,18 +782,12 @@ export async function* startSession(
 
 // === Session control ===
 
-export async function interruptSession(narratorId: string): Promise<boolean> {
+export function interruptSession(narratorId: string): boolean {
 	const session = activeSessions.get(narratorId);
 	if (!session) return false;
-
-	try {
-		await session.query.interrupt();
-		logger.info("Narrator session interrupted", { narratorId });
-		return true;
-	} catch (err) {
-		logger.error("Failed to interrupt session", { narratorId, error: String(err) });
-		return false;
-	}
+	session.abortController.abort();
+	logger.info("Narrator session interrupted", { narratorId });
+	return true;
 }
 
 /** Gracefully close a streaming session. */
@@ -1254,7 +795,7 @@ export function closeSession(narratorId: string): void {
 	const session = activeSessions.get(narratorId);
 	if (!session) return;
 	session.alive = false;
-	session.channel.close();
+	session.abortController.abort();
 	logger.info("Narrator session closed", { narratorId });
 }
 
@@ -1264,21 +805,15 @@ export function isSessionActive(narratorId: string): boolean {
 
 // === Dynamic session controls ===
 
-export async function updateSessionModel(narratorId: string, model: string): Promise<void> {
+export function updateSessionModel(narratorId: string, model: string): void {
 	const session = activeSessions.get(narratorId);
 	if (session?.alive) {
-		await session.query.setModel(model);
+		session.model = model;
 	}
 }
 
-export async function updateSessionPermissionMode(
-	narratorId: string,
-	mode: PermissionMode,
-): Promise<void> {
-	const session = activeSessions.get(narratorId);
-	if (session?.alive) {
-		await session.query.setPermissionMode(mode);
-	}
+export function updateSessionPermissionMode(_narratorId: string, _mode: string): void {
+	// Permission mode is read from DB in real-time by handlePermission
 }
 
 // === Buffered message API ===

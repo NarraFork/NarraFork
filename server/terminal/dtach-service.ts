@@ -154,10 +154,13 @@ export const dtachService = {
 		});
 
 		// Attach to dtach session through PTY
-		const proc = Bun.spawn(["bash", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath], {
-			env: { ...process.env, TERM: "xterm-256color" },
-			terminal: pty,
-		});
+		const proc = Bun.spawn(
+			["bash", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath],
+			{
+				env: { ...process.env, TERM: "xterm-256color" },
+				terminal: pty,
+			},
+		);
 
 		return { pty, proc };
 	},

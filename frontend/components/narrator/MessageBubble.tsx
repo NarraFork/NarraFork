@@ -10,9 +10,9 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
+import { IconArrowsMinimize } from "@tabler/icons-react";
 import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { IconArrowsMinimize } from "@tabler/icons-react";
 import { getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
 import { ToolCallCard } from "./ToolCallCard";

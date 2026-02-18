@@ -71,10 +71,7 @@ export const terminalTabService = {
 	async reorder(ids: string[]) {
 		await db.transaction(async (tx) => {
 			for (let i = 0; i < ids.length; i++) {
-				await tx
-					.update(terminalTabs)
-					.set({ sortOrder: i })
-					.where(eq(terminalTabs.id, ids[i]));
+				await tx.update(terminalTabs).set({ sortOrder: i }).where(eq(terminalTabs.id, ids[i]));
 			}
 		});
 	},

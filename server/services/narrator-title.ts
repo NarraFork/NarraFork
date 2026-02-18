@@ -1,4 +1,4 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { agentGenerate } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
@@ -28,13 +28,8 @@ export async function persistTitle(narratorId: string, title: string): Promise<b
 
 /**
  * Generate a title for a narrator session using the summary model.
- * Uses Claude Agent SDK query() — same pattern as narrator-context.ts.
  */
-export async function generateTitle(
-	narratorId: string,
-	stderrChunks: string[],
-	locale: Locale = "en",
-): Promise<string> {
+export async function generateTitle(narratorId: string, locale: Locale = "en"): Promise<string> {
 	const HEAD_COUNT = 2;
 	const TAIL_COUNT = 4;
 
@@ -70,35 +65,11 @@ export async function generateTitle(
 		locale,
 	});
 
-	// Wrap query() with a timeout — SDK can hang indefinitely
 	const TITLE_TIMEOUT_MS = 30_000;
-	const titlePromise = (async () => {
-		const titleQuery = query({
-			prompt: `${titlePrompt}${conversationText}\n</conversation>`,
-			options: {
-				model: settings.agent.summaryModel,
-				maxTurns: 1,
-				tools: [],
-				permissionMode: "dontAsk",
-				settingSources: ["user"],
-				stderr: (data: string) => {
-					stderrChunks.push(data);
-				},
-			},
-		});
-
-		let title = "";
-		for await (const message of titleQuery) {
-			if (message.type === "assistant") {
-				for (const block of message.message.content) {
-					if (block.type === "text") {
-						title += block.text;
-					}
-				}
-			}
-		}
-		return title;
-	})();
+	const titlePromise = agentGenerate(
+		`${titlePrompt}${conversationText}\n</conversation>`,
+		settings.agent.summaryModel,
+	);
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 	const timeoutPromise = new Promise<never>((_, reject) => {
@@ -130,7 +101,6 @@ export async function generateQuickTitle(
 	userMessage: string,
 	locale: Locale = "en",
 ): Promise<void> {
-	const stderrChunks: string[] = [];
 	try {
 		const truncated = userMessage.length > 500 ? `${userMessage.slice(0, 500)}...` : userMessage;
 		const titlePrompt = getPrompt("quickTitle", locale);
@@ -143,33 +113,7 @@ export async function generateQuickTitle(
 		});
 
 		const TITLE_TIMEOUT_MS = 30_000;
-		const titlePromise = (async () => {
-			const titleQuery = query({
-				prompt,
-				options: {
-					model: settings.agent.summaryModel,
-					maxTurns: 1,
-					tools: [],
-					permissionMode: "dontAsk",
-					settingSources: ["user"],
-					stderr: (data: string) => {
-						stderrChunks.push(data);
-					},
-				},
-			});
-
-			let title = "";
-			for await (const message of titleQuery) {
-				if (message.type === "assistant") {
-					for (const block of message.message.content) {
-						if (block.type === "text") {
-							title += block.text;
-						}
-					}
-				}
-			}
-			return title;
-		})();
+		const titlePromise = agentGenerate(prompt, settings.agent.summaryModel);
 
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 		const timeoutPromise = new Promise<never>((_, reject) => {
@@ -195,7 +139,6 @@ export async function generateQuickTitle(
 		logger.error("Failed to generate quick title", {
 			narratorId,
 			error: String(err),
-			stderr: stderrChunks.join(""),
 		});
 	}
 }
@@ -208,9 +151,8 @@ export async function generateAndSetTitle(
 	narratorId: string,
 	locale: Locale = "en",
 ): Promise<void> {
-	const stderrChunks: string[] = [];
 	try {
-		const title = await generateTitle(narratorId, stderrChunks, locale);
+		const title = await generateTitle(narratorId, locale);
 		await persistTitle(narratorId, title);
 
 		logger.info("Narrator title auto-generated", { narratorId, title });
@@ -218,7 +160,6 @@ export async function generateAndSetTitle(
 		logger.error("Failed to auto-generate narrator title", {
 			narratorId,
 			error: String(err),
-			stderr: stderrChunks.join(""),
 		});
 	}
 }
