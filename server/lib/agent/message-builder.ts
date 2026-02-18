@@ -30,8 +30,27 @@ interface DbToolCall {
 		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant"),
 	);
 
+	// Drop the last user message — it's the current message being sent via currentMessage
+	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
+		topLevel.pop();
+	}
 
+	// Merge consecutive same-role messages (e.g. multiple user messages without assistant reply)
+	const merged: DbMessage[] = [];
 	for (const msg of topLevel) {
+		const prev = merged[merged.length - 1];
+		if (prev && prev.role === msg.role && msg.role === "user") {
+			// Merge consecutive user messages into one
+			const prevText = prev.contentText || "";
+			const curText = msg.contentText || "";
+			prev.contentText = prevText ? `${prevText}\n\n${curText}` : curText;
+		} else {
+			merged.push({ ...msg });
+		}
+	}
+
+
+	for (const msg of merged) {
 		if (msg.role === "assistant") {
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
