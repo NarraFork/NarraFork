@@ -1,4 +1,5 @@
 import type {
+import { resolveModel } from "./resolve-model";
 
 interface DbMessage {
 	id: string;
@@ -76,7 +77,7 @@ interface DbToolCall {
 		} else if (msg.role === "user") {
 			const text = msg.contentText || "";
 					content: text,
-					modelId: model,
+					modelId: resolveModel(model),
 					...(pendingToolResults.length > 0
 						: {}),
 				},

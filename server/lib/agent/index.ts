@@ -5,6 +5,7 @@ registerCoreTools();
 
 export { agentLoop } from "./loop";
 export { buildHistory } from "./message-builder";
+export { resolveModel } from "./resolve-model";
 export { toolRegistry } from "./tool-registry";
 export type {
 	AgentConfig,
@@ -20,4 +21,5 @@ export type {
  * Simple text generation — no tools, no loop.
  */
 export async function agentGenerate(text: string, model?: string): Promise<string> {
+	const { resolveModel } = await import("./resolve-model");
 }

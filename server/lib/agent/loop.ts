@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolveModel } from "./resolve-model";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type { AgentConfig, AgentEvent, AgentToolUse, ToolContext } from "./types";
@@ -124,7 +125,7 @@ function buildRequest(
 			history: history.length > 0 ? history : undefined,
 			currentMessage: {
 					content,
-					modelId: config.model,
+					modelId: resolveModel(config.model),
 						tools,
 						...(toolResults.length > 0 ? { toolResults } : {}),
 					},
