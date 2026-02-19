@@ -163,7 +163,7 @@ export const narratorService = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		return db.query.narratorMessages.findMany({
 			where: eq(narratorMessages.narratorId, narratorId),
-			with: { toolCalls: true },
+			with: { toolCalls: { with: { permissionRequests: true } } },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 			limit,
 			offset,
@@ -221,7 +221,7 @@ export const narratorService = {
 		}
 		const topRows = await db.query.narratorMessages.findMany({
 			where: and(...topConditions),
-			with: { toolCalls: true },
+			with: { toolCalls: { with: { permissionRequests: true } } },
 			orderBy: (m, { desc }) => [desc(m.createdAt)],
 			limit: limit + 1,
 		});
@@ -243,7 +243,7 @@ export const narratorService = {
 							eq(narratorMessages.narratorId, narratorId),
 							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
 						),
-						with: { toolCalls: true },
+						with: { toolCalls: { with: { permissionRequests: true } } },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -298,7 +298,7 @@ export const narratorService = {
 				isNull(narratorMessages.parentToolUseId),
 				lt(narratorMessages.createdAt, anchorTs),
 			),
-			with: { toolCalls: true },
+			with: { toolCalls: { with: { permissionRequests: true } } },
 			orderBy: (m, { desc }) => [desc(m.createdAt)],
 			limit: contextSize + 1,
 		});
@@ -313,7 +313,7 @@ export const narratorService = {
 				isNull(narratorMessages.parentToolUseId),
 				gte(narratorMessages.createdAt, anchorTs),
 			),
-			with: { toolCalls: true },
+			with: { toolCalls: { with: { permissionRequests: true } } },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 		});
 
@@ -331,7 +331,7 @@ export const narratorService = {
 							eq(narratorMessages.narratorId, narratorId),
 							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
 						),
-						with: { toolCalls: true },
+						with: { toolCalls: { with: { permissionRequests: true } } },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -592,14 +592,13 @@ export const narratorService = {
 			durationMs?: number;
 		},
 	) {
-		const now = new Date().toISOString();
 		await db
 			.update(narratorToolCalls)
 			.set({
 				outputJson: result.output ?? null,
 				status: result.status,
-				errorMessage: result.errorMessage,
-				durationMs: result.durationMs,
+				errorMessage: result.errorMessage ?? null,
+				durationMs: result.durationMs ?? null,
 			})
 			.where(eq(narratorToolCalls.toolUseId, toolUseId));
 	},

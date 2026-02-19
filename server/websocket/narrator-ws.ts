@@ -30,6 +30,7 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			status: string;
 			output?: unknown;
+			permissionRequest?: { id: string; toolName: string; toolUseId?: string; inputJson: unknown };
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
 	| { type: "permission_resolved"; narratorId: string; requestId: string }
@@ -40,6 +41,7 @@ export type NarratorServerMessage =
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
+	| { type: "context_usage"; narratorId: string; percentage: number }
 	| { type: "error"; message: string };
 
 // Client → Server messages

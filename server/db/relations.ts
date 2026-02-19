@@ -55,7 +55,7 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 	toolCalls: many(narratorToolCalls),
 }));
 
-export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one }) => ({
+export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one, many }) => ({
 	narrator: one(narrators, {
 		fields: [narratorToolCalls.narratorId],
 		references: [narrators.id],
@@ -64,6 +64,7 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one })
 		fields: [narratorToolCalls.messageId],
 		references: [narratorMessages.id],
 	}),
+	permissionRequests: many(permissionRequests),
 }));
 
 export const permissionRequestsRelations = relations(permissionRequests, ({ one }) => ({

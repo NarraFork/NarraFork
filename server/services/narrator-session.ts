@@ -45,7 +45,7 @@ const sessionCreationLocks = new Map<string, Promise<ActiveSession>>();
 
 interface PendingPermission {
 	resolve: (result: PermissionResult) => void;
-	timeoutId: ReturnType<typeof setTimeout>;
+	cleanup: () => void;
 	input: Record<string, unknown>;
 	narratorId: string;
 	toolUseId: string;
@@ -73,6 +73,8 @@ export type SessionEvent =
 	| { type: "tool_progress"; data: unknown }
 	| { type: "result"; data: unknown }
 	| { type: "error"; data: { message: string } }
+	| { type: "interrupted"; data: { message: string } }
+	| { type: "context_usage"; data: { percentage: number } }
 	| { type: "done"; data: null };
 
 // === Permission handling ===
@@ -135,19 +137,47 @@ async function handlePermission(
 		createdAt: now,
 	});
 
+	// Mark the tool call as pending permission
+	if (toolCallRecord) {
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(eq(narratorToolCalls.id, toolCallRecord.id));
+	}
+
 	broadcastToNarrator(narratorId, {
 		type: "permission_request",
 		narratorId,
 		request: { id: requestId, toolName, toolUseId, inputJson: input },
 	});
+	// Also broadcast as tool_completed so the tool call card updates its status
+	broadcastToNarrator(narratorId, {
+		type: "tool_completed",
+		narratorId,
+		toolUseId,
+		status: "pending",
+		permissionRequest: { id: requestId, toolName, toolUseId, inputJson: input },
+	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId });
 	await narratorService.updateStatus(narratorId, "waiting");
 
 	if (signal.aborted) {
+		broadcastToNarrator(narratorId, {
+			type: "permission_resolved",
+			narratorId,
+			requestId,
+		});
 		await db
 			.update(permissionRequests)
 			.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
 			.where(eq(permissionRequests.id, requestId));
+		// Restore tool call status
+		if (toolCallRecord) {
+			await db
+				.update(narratorToolCalls)
+				.set({ status: "running" })
+				.where(eq(narratorToolCalls.id, toolCallRecord.id));
+		}
 		return { behavior: "deny", message: "Session aborted" };
 	}
 
@@ -160,19 +190,51 @@ async function handlePermission(
 
 		const tid = setTimeout(async () => {
 			cleanup();
+			broadcastToNarrator(narratorId, {
+				type: "permission_resolved",
+				narratorId,
+				requestId,
+			});
 			await db
 				.update(permissionRequests)
 				.set({ decision: "deny", decidedBy: "auto_timeout", decidedAt: new Date().toISOString() })
 				.where(eq(permissionRequests.id, requestId));
+			// Restore tool call status — deny still returns a result, so tool continues
+			await db
+				.update(narratorToolCalls)
+				.set({ status: "running" })
+				.where(eq(narratorToolCalls.toolUseId, toolUseId));
+			broadcastToNarrator(narratorId, {
+				type: "tool_completed",
+				narratorId,
+				toolUseId,
+				status: "running",
+			});
 			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, PERMISSION_TIMEOUT_MS);
 
 		const onAbort = async () => {
 			cleanup();
+			broadcastToNarrator(narratorId, {
+				type: "permission_resolved",
+				narratorId,
+				requestId,
+			});
 			await db
 				.update(permissionRequests)
 				.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
 				.where(eq(permissionRequests.id, requestId));
+			// Restore tool call status
+			await db
+				.update(narratorToolCalls)
+				.set({ status: "running" })
+				.where(eq(narratorToolCalls.toolUseId, toolUseId));
+			broadcastToNarrator(narratorId, {
+				type: "tool_completed",
+				narratorId,
+				toolUseId,
+				status: "running",
+			});
 			resolve({ behavior: "deny", message: "Session aborted" });
 		};
 
@@ -180,7 +242,7 @@ async function handlePermission(
 
 		pendingPermissions.set(requestId, {
 			resolve,
-			timeoutId: tid,
+			cleanup,
 			input,
 			narratorId,
 			toolUseId,
@@ -202,14 +264,27 @@ export async function resolvePermission(
 		return;
 	}
 
-	clearTimeout(pending.timeoutId);
-	pendingPermissions.delete(requestId);
+	// Clean up timeout + abort listener to prevent stale handlers from firing
+	pending.cleanup();
+
+	// Restore tool call status from "pending" back to "running"
+	await db
+		.update(narratorToolCalls)
+		.set({ status: "running" })
+		.where(eq(narratorToolCalls.toolUseId, pending.toolUseId));
 
 	// Broadcast to all subscribers so other tabs can clear the permission banner
 	broadcastToNarrator(pending.narratorId, {
 		type: "permission_resolved",
 		narratorId: pending.narratorId,
 		requestId,
+	});
+	// Broadcast tool call status restoration
+	broadcastToNarrator(pending.narratorId, {
+		type: "tool_completed",
+		narratorId: pending.narratorId,
+		toolUseId: pending.toolUseId,
+		status: "running",
 	});
 
 	try {
@@ -372,7 +447,7 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 	try {
 		while (session.alive) {
 			const dbMessages = await narratorService.getMessages(narratorId, 200);
-			const history = buildHistory(dbMessages, session.model);
+			const { history, trailingToolResults } = buildHistory(dbMessages, session.model);
 
 			// Compact if history is too long
 			if (history.length > COMPACT_HISTORY_THRESHOLD) {
@@ -401,7 +476,7 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 			};
 
 			// Run one agent loop pass
-			for await (const event of agentLoop(config, currentText, history)) {
+			for await (const event of agentLoop(config, currentText, history, trailingToolResults)) {
 				if (!session.alive) break;
 
 				const mapped = await processAgentEvent(session, event, {
@@ -568,11 +643,17 @@ async function processAgentEvent(
 			broadcastToNarrator(narratorId, {
 				type: "stream_event",
 				narratorId,
-				event: { type: "content_block_delta", delta: { text: event.text } },
+				event: {
+					type: "content_block_delta",
+					delta: { type: "text_delta", text: event.text },
+				},
 			});
 			session.events.emit("event", {
 				type: "stream_event",
-				data: { type: "content_block_delta", delta: { text: event.text } },
+				data: {
+					type: "content_block_delta",
+					delta: { type: "text_delta", text: event.text },
+				},
 			});
 			return null;
 		}
@@ -625,7 +706,7 @@ async function processAgentEvent(
 
 			const fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, saved.id),
-				with: { toolCalls: true },
+				with: { toolCalls: { with: { permissionRequests: true } } },
 			});
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: fullMessage });
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
@@ -691,9 +772,69 @@ async function processAgentEvent(
 		}
 
 		case "error": {
+			// Abort is not a real error — treat as interruption
+			if (event.message === "Aborted") {
+				logger.info("Agent loop aborted (interrupted)", { narratorId });
+				await narratorService.updateStatus(narratorId, "idle");
+				session.events.emit("event", {
+					type: "interrupted",
+					data: { message: "Session interrupted" },
+				});
+				return null;
+			}
 			logger.error("Agent loop error", { narratorId, error: event.message });
 			await narratorService.updateStatus(narratorId, "error", event.message);
 			session.events.emit("event", { type: "error", data: { message: event.message } });
+			return null;
+		}
+
+		case "stream_reasoning": {
+			broadcastToNarrator(narratorId, {
+				type: "stream_event",
+				narratorId,
+				event: {
+					type: "content_block_delta",
+					delta: { type: "reasoning_delta", text: event.text },
+				},
+			});
+			session.events.emit("event", {
+				type: "stream_event",
+				data: {
+					type: "content_block_delta",
+					delta: { type: "reasoning_delta", text: event.text },
+				},
+			});
+			return null;
+		}
+
+		case "context_usage": {
+			broadcastToNarrator(narratorId, {
+				type: "context_usage",
+				narratorId,
+				percentage: event.percentage,
+			});
+			session.events.emit("event", {
+				type: "context_usage",
+				data: { percentage: event.percentage },
+			});
+			return null;
+		}
+
+		case "invalid_state": {
+				narratorId,
+				reason: event.reason,
+				message: event.message,
+			});
+				type: "error",
+				error: { type: "invalid_state", reason: event.reason, message: event.message },
+			};
+			broadcastToNarrator(narratorId, {
+				type: "stream_event",
+				narratorId,
+			});
+			session.events.emit("event", {
+				type: "stream_event",
+			});
 			return null;
 		}
 
@@ -885,6 +1026,20 @@ export async function recoverOnStartup(): Promise<void> {
 			.where(eq(narratorToolCalls.status, "running"));
 		logger.info("Stale running tool calls marked as failed on startup", {
 			count: staleToolCalls.length,
+		});
+	}
+
+	// Also recover tool calls stuck in "pending" (permission was never resolved)
+	const stalePendingToolCalls = await db.query.narratorToolCalls.findMany({
+		where: eq(narratorToolCalls.status, "pending"),
+	});
+	if (stalePendingToolCalls.length > 0) {
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "failed", errorMessage: "Interrupted by server restart" })
+			.where(eq(narratorToolCalls.status, "pending"));
+		logger.info("Stale pending tool calls marked as failed on startup", {
+			count: stalePendingToolCalls.length,
 		});
 	}
 }
