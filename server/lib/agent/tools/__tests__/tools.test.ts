@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ToolContext } from "../../types";
@@ -331,10 +331,236 @@ describe("Grep", () => {
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("line one");
 	});
+
+	// --- Edge cases and complex combinations ---
+
+	test("-n: false suppresses line numbers in content mode", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line one", output_mode: "content", "-n": false, path: SAMPLE_FILE },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line one");
+		// Should NOT have "1:" prefix
+		expect(result.output).not.toMatch(/^\d+:/m);
+	});
+
+	test("-A: after-context lines", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line two", output_mode: "content", "-A": 2, path: SAMPLE_FILE },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line two");
+		expect(result.output).toContain("line three");
+		expect(result.output).toContain("line four");
+	});
+
+	test("-B: before-context lines", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line four", output_mode: "content", "-B": 2, path: SAMPLE_FILE },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line two");
+		expect(result.output).toContain("line three");
+		expect(result.output).toContain("line four");
+	});
+
+	test("-A and -B together", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line three", output_mode: "content", "-A": 1, "-B": 1, path: SAMPLE_FILE },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line two");
+		expect(result.output).toContain("line three");
+		expect(result.output).toContain("line four");
+		expect(result.output).not.toContain("line one");
+	});
+
+	test("context param is ignored in files_with_matches mode", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "const", context: 3 },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		// Should still be file paths, not content
+		expect(result.output).toContain("a.ts");
+		expect(result.output).not.toMatch(/const a/);
+	});
+
+	test("-C overrides context param", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line three", output_mode: "content", context: 0, "-C": 1, path: SAMPLE_FILE },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		// -C: 1 should win over context: 0
+		expect(result.output).toContain("line two");
+		expect(result.output).toContain("line four");
+	});
+
+	test("relative path resolved against cwd", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line", path: "sample.txt", output_mode: "content" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line one");
+	});
+
+	test("invalid regex returns error", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "[invalid" },
+			makeCtx(),
+		);
+		expect(result.isError).toBe(true);
+	});
+
+	test("glob with multiple extensions via brace expansion", async () => {
+		const result = await grepTool.execute(
+			{ pattern: ".", glob: "*.{ts,json}" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain(".ts");
+		expect(result.output).toContain(".json");
+	});
+
+	test("offset beyond result count returns empty", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line", output_mode: "content", path: SAMPLE_FILE, offset: 100 },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output.trim()).toBe("");
+	});
+
+	test("head_limit: 0 returns empty", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "line", output_mode: "content", path: SAMPLE_FILE, head_limit: 0 },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output.trim()).toBe("");
+	});
+
+	test("count mode with glob filter", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "const", output_mode: "count", glob: "*.ts" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		// Each .ts file has 1 match
+		expect(result.output).toContain(":1");
+	});
+
+	test("multiline with content mode and line numbers", async () => {
+		const result = await grepTool.execute(
+			{
+				pattern: "hello.*\\n.*world",
+				multiline: true,
+				output_mode: "content",
+				"-n": true,
+				path: NESTED_FILE,
+			},
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("hello");
+		expect(result.output).toContain("world");
+	});
 });
 
 // ============================================================
-// Bash tool
+// Grep — parameter validation (Zod schema)
+// ============================================================
+
+// ============================================================
+// Grep — shell injection safety
+// ============================================================
+
+describe("Grep injection safety", () => {
+	test("pattern with shell metacharacters is not interpreted", async () => {
+		// If this were shell-interpreted, it would execute `touch`
+		const marker = join(TEST_DIR, "pwned");
+		const result = await grepTool.execute(
+			{ pattern: `$(touch ${marker})`, path: SAMPLE_FILE },
+			makeCtx(),
+		);
+		// rg treats it as a literal regex (which won't match), not a shell command
+		expect(existsSync(marker)).toBe(false);
+	});
+
+	test("path with shell metacharacters is not interpreted", async () => {
+		const marker = join(TEST_DIR, "pwned2");
+		const result = await grepTool.execute(
+			{ pattern: "line", path: `$(touch ${marker})` },
+			makeCtx(),
+		);
+		expect(existsSync(marker)).toBe(false);
+	});
+
+	test("glob with shell metacharacters is not interpreted", async () => {
+		const marker = join(TEST_DIR, "pwned3");
+		const result = await grepTool.execute(
+			{ pattern: "line", glob: `$(touch ${marker})` },
+			makeCtx(),
+		);
+		expect(existsSync(marker)).toBe(false);
+	});
+
+	test("pattern with semicolon and pipe is treated literally", async () => {
+		const result = await grepTool.execute(
+			{ pattern: "; echo INJECTED | cat" },
+			makeCtx(),
+		);
+		// Should not contain "INJECTED" in output — rg just fails to match
+		expect(result.output).not.toContain("INJECTED");
+	});
+
+	test("pattern with backticks is treated literally", async () => {
+		const marker = join(TEST_DIR, "pwned4");
+		const result = await grepTool.execute(
+			{ pattern: "`touch " + marker + "`" },
+			makeCtx(),
+		);
+		expect(existsSync(marker)).toBe(false);
+	});
+});
+
+describe("Grep schema validation", () => {
+	test("rejects missing pattern", () => {
+		const result = grepTool.parameters.safeParse({});
+		expect(result.success).toBe(false);
+	});
+
+	test("rejects invalid output_mode", () => {
+		const result = grepTool.parameters.safeParse({ pattern: "x", output_mode: "invalid" });
+		expect(result.success).toBe(false);
+	});
+
+	test("accepts all valid params", () => {
+		const result = grepTool.parameters.safeParse({
+			pattern: "test",
+			path: "/tmp",
+			glob: "*.ts",
+			output_mode: "content",
+			context: 2,
+			"-i": true,
+			"-n": false,
+			"-A": 3,
+			"-B": 1,
+			"-C": 2,
+			head_limit: 10,
+			offset: 5,
+			multiline: true,
+			type: "ts",
+		});
+		expect(result.success).toBe(true);
+	});
+});
 // ============================================================
 
 describe("Bash", () => {
