@@ -19,3 +19,7 @@
 .rootNoWrap > *:first-child {
 	margin-top: 0 !important;
 }
+
+.rootNoWrap p {
+	margin-block: 0.25em;
+}

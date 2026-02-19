@@ -9,7 +9,12 @@ interface NarratorWSCallbacks {
 	onPermissionResolved?: (requestId: string) => void;
 	onStatusChange?: (status: string) => void;
 	onToolProgress?: (toolUseId: string, elapsed: number) => void;
-	onToolCompleted?: (toolUseId: string, status: string, output?: unknown) => void;
+	onToolCompleted?: (
+		toolUseId: string,
+		status: string,
+		output?: unknown,
+		permissionRequest?: { id: string; toolName: string; inputJson: unknown },
+	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (todos: any[], toolUseId?: string) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
@@ -17,6 +22,7 @@ interface NarratorWSCallbacks {
 	onSdkPlanModeChanged?: (sdkPlanMode: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
+	onContextUsage?: (percentage: number) => void;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -29,16 +35,20 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 	const [connected, setConnected] = useState(false);
 	const [disconnected, setDisconnected] = useState(false);
 	const [reconnectKey, setReconnectKey] = useState(0);
-	const reconnectAttempts = useRef(0);
-	const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-	const unmountedRef = useRef(false);
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey triggers manual reconnection
 	useEffect(() => {
 		if (!narratorId) return;
-		unmountedRef.current = false;
+
+		// Per-invocation flag: set to true when this effect is cleaned up.
+		// Each effect run gets its own `cancelled` captured by its closures,
+		// preventing stale onclose handlers from spawning duplicate connections.
+		let cancelled = false;
+		let attempts = 0;
+		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
 		function connect() {
-			if (unmountedRef.current) return;
+			if (cancelled) return;
 
 			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 			const token = getToken();
@@ -47,12 +57,17 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			wsRef.current = ws;
 
 			ws.onopen = () => {
+				if (cancelled) {
+					ws.close();
+					return;
+				}
 				setConnected(true);
 				setDisconnected(false);
-				reconnectAttempts.current = 0;
+				attempts = 0;
 				ws.send(JSON.stringify({ type: "subscribe", narratorIds: [narratorId] }));
 			};
 			ws.onmessage = (event) => {
+				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
 					switch (data.type) {
@@ -82,7 +97,12 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							callbacksRef.current.onToolProgress?.(data.toolUseId, data.elapsed);
 							break;
 						case "tool_completed":
-							callbacksRef.current.onToolCompleted?.(data.toolUseId, data.status, data.output);
+							callbacksRef.current.onToolCompleted?.(
+								data.toolUseId,
+								data.status,
+								data.output,
+								data.permissionRequest,
+							);
 							break;
 						case "todos_updated":
 							callbacksRef.current.onTodosUpdated?.(data.todos, data.toolUseId);
@@ -106,6 +126,9 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 						case "compact_done":
 							callbacksRef.current.onCompactDone?.();
 							break;
+						case "context_usage":
+							callbacksRef.current.onContextUsage?.(data.percentage);
+							break;
 					}
 				} catch (err) {
 					if (import.meta.env.DEV) console.warn("[useNarratorWS] Failed to parse WS message:", err);
@@ -113,39 +136,45 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			};
 
 			ws.onclose = () => {
+				if (cancelled) return;
 				setConnected(false);
 				scheduleReconnect();
 			};
 			ws.onerror = () => {
+				if (cancelled) return;
 				setConnected(false);
 			};
 		}
 
 		function scheduleReconnect() {
-			if (unmountedRef.current) return;
-			if (reconnectAttempts.current >= MAX_RECONNECT_ATTEMPTS) {
+			if (cancelled) return;
+			if (attempts >= MAX_RECONNECT_ATTEMPTS) {
 				setDisconnected(true);
 				return;
 			}
-			const delay = RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempts.current;
-			reconnectAttempts.current++;
-			reconnectTimer.current = setTimeout(connect, delay);
+			const delay = RECONNECT_BASE_DELAY_MS * 2 ** attempts;
+			attempts++;
+			reconnectTimer = setTimeout(connect, delay);
 		}
 
 		connect();
 
 		return () => {
-			unmountedRef.current = true;
-			clearTimeout(reconnectTimer.current);
+			cancelled = true;
+			clearTimeout(reconnectTimer);
 			const ws = wsRef.current;
 			if (ws) {
+				// Suppress handlers before closing to avoid any late-firing events
+				ws.onopen = null;
+				ws.onmessage = null;
+				ws.onclose = null;
+				ws.onerror = null;
 				if (ws.readyState === WebSocket.OPEN) {
 					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: [narratorId] }));
 				}
 				ws.close();
 			}
 		};
-		// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey is used to trigger manual reconnection
 	}, [narratorId, reconnectKey]);
 
 	const sendPermissionDecision = useCallback(
@@ -183,7 +212,6 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 	}, []);
 
 	const reconnect = useCallback(() => {
-		reconnectAttempts.current = 0;
 		setReconnectKey((k) => k + 1);
 	}, []);
 
@@ -215,10 +243,6 @@ export function useSessionsListWS(
 	const wsRef = useRef<WebSocket | null>(null);
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
-	const idsRef = useRef<string[]>(narratorIds);
-	const unmountedRef = useRef(false);
-	const reconnectAttempts = useRef(0);
-	const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
 	// Stable serialized key for dependency comparison
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
@@ -226,12 +250,14 @@ export function useSessionsListWS(
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds; using the array directly would reconnect on every render
 	useEffect(() => {
 		if (!narratorIds.length) return;
-		unmountedRef.current = false;
-		reconnectAttempts.current = 0;
-		idsRef.current = narratorIds;
+
+		let cancelled = false;
+		let attempts = 0;
+		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+		const currentIds = narratorIds;
 
 		function connect() {
-			if (unmountedRef.current) return;
+			if (cancelled) return;
 
 			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 			const token = getToken();
@@ -240,10 +266,15 @@ export function useSessionsListWS(
 			wsRef.current = ws;
 
 			ws.onopen = () => {
-				reconnectAttempts.current = 0;
-				ws.send(JSON.stringify({ type: "subscribe", narratorIds: idsRef.current }));
+				if (cancelled) {
+					ws.close();
+					return;
+				}
+				attempts = 0;
+				ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
 			};
 			ws.onmessage = (event) => {
+				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
 					const nId = data.narratorId;
@@ -260,28 +291,33 @@ export function useSessionsListWS(
 				}
 			};
 			ws.onclose = () => {
+				if (cancelled) return;
 				scheduleReconnect();
 			};
 			ws.onerror = () => {};
 		}
 
 		function scheduleReconnect() {
-			if (unmountedRef.current) return;
-			if (reconnectAttempts.current >= MAX_RECONNECT_ATTEMPTS) return;
-			const delay = RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempts.current;
-			reconnectAttempts.current++;
-			reconnectTimer.current = setTimeout(connect, delay);
+			if (cancelled) return;
+			if (attempts >= MAX_RECONNECT_ATTEMPTS) return;
+			const delay = RECONNECT_BASE_DELAY_MS * 2 ** attempts;
+			attempts++;
+			reconnectTimer = setTimeout(connect, delay);
 		}
 
 		connect();
 
 		return () => {
-			unmountedRef.current = true;
-			clearTimeout(reconnectTimer.current);
+			cancelled = true;
+			clearTimeout(reconnectTimer);
 			const ws = wsRef.current;
 			if (ws) {
+				ws.onopen = null;
+				ws.onmessage = null;
+				ws.onclose = null;
+				ws.onerror = null;
 				if (ws.readyState === WebSocket.OPEN) {
-					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: idsRef.current }));
+					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
 				}
 				ws.close();
 			}

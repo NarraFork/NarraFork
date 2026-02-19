@@ -253,3 +253,67 @@ export function updateToolCallByIndex(
 	pages[entry.pageIdx] = page;
 	return { ...old, pages };
 }
+
+/** Merge a permission request into a tool call's permissionRequests array in the cache */
+export function mergePermissionIntoToolCall(
+	old: any,
+	toolUseId: string,
+	permissionRequest: { id: string; toolName: string; inputJson: unknown },
+	index: MessageIndex,
+): any {
+	const fields = {
+		permissionRequests: [{ ...permissionRequest, decision: "pending" }],
+	};
+	const entry = index.get(toolUseId);
+	if (!entry) {
+		// Fallback: full traversal
+		if (!old?.pages?.length) return old;
+		let anyChanged = false;
+		const pages = old.pages.map((page: any) => {
+			const { messages, changed } = mergeToolCallFieldsInTree(
+				page.messages,
+				toolUseId,
+				fields,
+			);
+			if (changed) anyChanged = true;
+			return changed ? { ...page, messages } : page;
+		});
+		return anyChanged ? { ...old, pages } : old;
+	}
+	// Use indexed path for O(1) lookup
+	const pages = [...old.pages];
+	const page = { ...pages[entry.pageIdx] };
+	page.messages = mergeFieldsAtPath(page.messages, entry.path, toolUseId, fields);
+	pages[entry.pageIdx] = page;
+	return { ...old, pages };
+}
+
+/** Navigate to a message by path and merge fields into its tool call immutably */
+function mergeFieldsAtPath(
+	messages: any[],
+	path: number[],
+	toolUseId: string,
+	fields: Record<string, unknown>,
+): any[] {
+	if (path.length === 0) return messages;
+	const [idx, ...rest] = path;
+	const updated = [...messages];
+	const msg = updated[idx];
+	if (!msg) return messages;
+
+	if (rest.length === 0) {
+		if (!msg.toolCalls?.length) return messages;
+		const updatedCalls = msg.toolCalls.map((tc: any) => {
+			if (tc.toolUseId !== toolUseId) return tc;
+			return { ...tc, ...fields };
+		});
+		updated[idx] = { ...msg, toolCalls: updatedCalls };
+	} else {
+		if (!msg.children?.length) return messages;
+		updated[idx] = {
+			...msg,
+			children: mergeFieldsAtPath(msg.children, rest, toolUseId, fields),
+		};
+	}
+	return updated;
+}

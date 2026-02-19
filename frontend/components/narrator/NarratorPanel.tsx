@@ -78,6 +78,7 @@ import {
 	findMsgByToolUseIdInTree,
 	insertChildIntoCache,
 	type MessageIndex,
+	mergePermissionIntoToolCall,
 	mergeToolCallFieldsInTree,
 	updateToolCallByIndex,
 	updateToolUseIndex,
@@ -140,6 +141,14 @@ interface ToolCallRow {
 	status?: string;
 	durationMs?: number;
 	errorMessage?: string;
+	permissionRequests?: Array<{
+		id: string;
+		toolName: string;
+		inputJson: any;
+		decision: string;
+		decisionReason?: string;
+		suggestions?: any[];
+	}>;
 }
 
 interface NarratorMsg {
@@ -180,7 +189,30 @@ function resolveToolCallFromMsg(msg: NarratorMsg): ToolCallData | null {
 		status: tc?.status ?? "running",
 		durationMs: tc?.durationMs,
 		errorMessage: tc?.errorMessage,
+		permissionRequests: tc?.permissionRequests,
 	};
+}
+
+/** Resolve a PendingPermission from a tool call's data or WS state fallback. */
+function resolvePendingPerm(
+	tc: ToolCallData,
+	wsPerm: PendingPermission | null | undefined,
+): PendingPermission | null {
+	const pr = tc.permissionRequests?.find((p) => p.decision === "pending");
+	if (pr) {
+		return {
+			id: pr.id,
+			toolName: pr.toolName,
+			toolUseId: tc.toolUseId,
+			inputJson: pr.inputJson,
+			decisionReason: pr.decisionReason,
+			suggestions: pr.suggestions,
+		} as PendingPermission;
+	}
+	if (wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
+		return wsPerm;
+	}
+	return null;
 }
 
 // --- SubagentCard: renders a Task tool call with its child messages (pre-nested from backend) ---
@@ -297,9 +329,13 @@ const SubagentCard = memo(
 			(toolCall.durationMs ?? 0);
 
 		// Find the child tool call that has a pending permission (if any)
-		const permChild = permCb?.pendingPermission?.toolUseId
-			? childToolCalls.find((c) => c.tc.toolUseId === permCb.pendingPermission?.toolUseId)
-			: null;
+		const permChild =
+			childToolCalls.find(
+				(c) => c.tc.permissionRequests?.some((pr) => pr.decision === "pending"),
+			) ??
+			(permCb?.pendingPermission?.toolUseId
+				? childToolCalls.find((c) => c.tc.toolUseId === permCb.pendingPermission?.toolUseId)
+				: null);
 
 		// Auto-expand the subagent card when a child needs permission
 		useEffect(() => {
@@ -433,19 +469,22 @@ const SubagentCard = memo(
 							</Box>
 						)}
 						{/* Permission-pending child — shown standalone outside the collapsed tool calls list */}
-						{permChild && permCb?.pendingPermission && (
-							<Box px="xs" pb="xs">
-								<ToolCallCard
-									toolCall={permChild.tc}
-									narratorId={narratorId}
-									pendingPermission={permCb.pendingPermission}
-									onPermissionDecision={permCb.onPermissionDecision}
-									onQuestionSubmit={permCb.onQuestionSubmit}
-									onQuestionDeny={permCb.onQuestionDeny}
-									editExpandOverride={editExpandOverride}
-								/>
-							</Box>
-						)}
+						{permChild && (() => {
+							const resolvedPerm = resolvePendingPerm(permChild.tc, permCb?.pendingPermission);
+							return resolvedPerm ? (
+								<Box px="xs" pb="xs">
+									<ToolCallCard
+										toolCall={permChild.tc}
+										narratorId={narratorId}
+										pendingPermission={resolvedPerm}
+										onPermissionDecision={permCb?.onPermissionDecision}
+										onQuestionSubmit={permCb?.onQuestionSubmit}
+										onQuestionDeny={permCb?.onQuestionDeny}
+										editExpandOverride={editExpandOverride}
+									/>
+								</Box>
+							) : null;
+						})()}
 						{/* Child tool calls — collapsed by default */}
 						{childToolCalls.length > 0 && (
 							<Box px="xs" pb="xs">
@@ -512,12 +551,7 @@ const SubagentCard = memo(
 															}}
 														>
 															{run.map((r, ri) => {
-																const mp =
-																	permCb?.pendingPermission &&
-																	r.tc.toolUseId &&
-																	r.tc.toolUseId === permCb.pendingPermission.toolUseId
-																		? permCb.pendingPermission
-																		: null;
+																const mp = resolvePendingPerm(r.tc, permCb?.pendingPermission);
 																return (
 																	<div key={r.toolUseId ?? r.tc.toolName} id={`msg-${r.msgId}`}>
 																		<ToolCallCard
@@ -538,12 +572,7 @@ const SubagentCard = memo(
 													);
 												} else {
 													const r = run[0];
-													const mp =
-														permCb?.pendingPermission &&
-														r.tc.toolUseId &&
-														r.tc.toolUseId === permCb.pendingPermission.toolUseId
-															? permCb.pendingPermission
-															: null;
+													const mp = resolvePendingPerm(r.tc, permCb?.pendingPermission);
 													els.push(
 														<div key={r.toolUseId ?? r.tc.toolName} id={`msg-${r.msgId}`}>
 															<ToolCallCard
@@ -614,9 +643,7 @@ function renderToolRun(
 	editExpandOverride?: boolean | null,
 ) {
 	const matchPermission = (tc: ToolCallData) =>
-		permCb.pendingPermission && tc.toolUseId && tc.toolUseId === permCb.pendingPermission.toolUseId
-			? permCb.pendingPermission
-			: null;
+		resolvePendingPerm(tc, permCb.pendingPermission);
 
 	// Count Task (subagent) tool calls in this run
 	const taskCount = run.filter((m: NarratorMsg) => {
@@ -1880,15 +1907,63 @@ export function NarratorPanel({
 					return { ...old, pages };
 				});
 			},
-			onToolCompleted: (toolUseId: string, status: string, output?: unknown) => {
+			onToolCompleted: (
+				toolUseId: string,
+				status: string,
+				output?: unknown,
+				permissionRequest?: { id: string; toolName: string; inputJson: unknown },
+			) => {
 				// Update tool call status using indexed lookup (O(1) instead of full tree traversal)
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
-					return updateToolCallByIndex(old, toolUseId, status, output, toolUseIndexRef.current);
+					let result = updateToolCallByIndex(
+						old,
+						toolUseId,
+						status,
+						output,
+						toolUseIndexRef.current,
+					);
+					if (permissionRequest) {
+						// Permission requested: merge permissionRequest data into tool call
+						result = mergePermissionIntoToolCall(
+							result,
+							toolUseId,
+							permissionRequest,
+							toolUseIndexRef.current,
+						);
+					} else if (status !== "pending") {
+						// Permission resolved or tool completed: clear stale permissionRequests
+						let anyChanged = false;
+						const pages = result.pages.map((page: any) => {
+							const { messages, changed } = mergeToolCallFieldsInTree(
+								page.messages,
+								toolUseId,
+								{ permissionRequests: [] },
+							);
+							if (changed) anyChanged = true;
+							return changed ? { ...page, messages } : page;
+						});
+						if (anyChanged) result = { ...result, pages };
+					}
+					return result;
 				});
 			},
 			onPermissionRequest: (request) => {
 				setPendingPermission(request);
+				// Also merge into the tool call's permissionRequests in the cache so the
+				// data-driven matchPermission path works even if tool_completed arrives late
+				// or its merge fails (stale index / tool call not yet in cache).
+				if (request.toolUseId) {
+					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						if (!old?.pages?.length) return old;
+						return mergePermissionIntoToolCall(
+							old,
+							request.toolUseId,
+							request,
+							toolUseIndexRef.current,
+						);
+					});
+				}
 			},
 			onPermissionResolved: () => {
 				setPendingPermission(null);
@@ -1960,6 +2035,31 @@ export function NarratorPanel({
 			.then((buf) => setBufferedText(buf?.text ?? null))
 			.catch(() => {});
 	}, [narratorId, connected]);
+
+	// Fallback: when narrator status is "waiting" but we have no pendingPermission
+	// (e.g. WS message was missed, page was refreshed mid-permission), poll the API.
+	useEffect(() => {
+		if (narrator?.status !== "waiting" || pendingPermission) return;
+		let cancelled = false;
+		const poll = () => {
+			api
+				.getPendingPermissions(narratorId)
+				.then((perms) => {
+					if (cancelled) return;
+					if (perms.length > 0) {
+						setPendingPermission(perms[0]);
+						qc.invalidateQueries({ queryKey: messagesQueryKey });
+					}
+				})
+				.catch(() => {});
+		};
+		poll();
+		const timer = setInterval(poll, 5000);
+		return () => {
+			cancelled = true;
+			clearInterval(timer);
+		};
+	}, [narratorId, narrator?.status, pendingPermission]);
 
 	// Mark "done" narrator as read (→ idle) when user enters the panel
 	useEffect(() => {

@@ -46,6 +46,14 @@ export interface ToolCallData {
 	status: string;
 	durationMs?: number;
 	errorMessage?: string;
+	permissionRequests?: Array<{
+		id: string;
+		toolName: string;
+		inputJson: any;
+		decision: string;
+		decisionReason?: string;
+		suggestions?: any[];
+	}>;
 }
 
 export interface PendingPermission {
@@ -813,13 +821,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isFailed = toolCall.status === "failed";
 	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
 	const defaultOpen =
-		!!pendingPermission || cat === "todo" || (isEdit && !isFailedEdit) || (isFailed && !isEdit);
+		!!pendingPermission ||
+		toolCall.status === "pending" ||
+		cat === "todo" ||
+		(isEdit && !isFailedEdit) ||
+		(isFailed && !isEdit);
 	const [opened, setOpened] = useState(defaultOpen);
 
-	// Auto-expand when a permission request arrives
+	// Auto-expand when a permission request arrives or tool call enters pending state
 	useEffect(() => {
-		if (pendingPermission) setOpened(true);
-	}, [pendingPermission]);
+		if (pendingPermission || toolCall.status === "pending") setOpened(true);
+	}, [pendingPermission, toolCall.status]);
 
 	// Force expand from outside (e.g. navigating to this card)
 	useEffect(() => {
