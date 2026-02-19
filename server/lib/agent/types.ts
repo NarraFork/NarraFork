@@ -58,6 +58,9 @@ export type AgentEvent =
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
+	| { type: "stream_reasoning"; text: string }
+	| { type: "context_usage"; percentage: number }
+	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "done" };
 
 export interface AgentToolUse {

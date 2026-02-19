@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -11,14 +12,15 @@ export const readTool: ToolDefinition = {
 		offset: z.number().optional(),
 		limit: z.number().optional(),
 	}),
-	async execute(args): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, offset, limit } = args as {
 			file_path: string;
 			offset?: number;
 			limit?: number;
 		};
+		const resolvedPath = resolve(ctx.cwd, file_path);
 		try {
-			const text = await Bun.file(file_path).text();
+			const text = await Bun.file(resolvedPath).text();
 			const lines = text.split("\n");
 			const start = Math.max(0, (offset ?? 1) - 1);
 			const end = limit ? start + limit : lines.length;

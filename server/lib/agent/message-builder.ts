@@ -26,7 +26,12 @@ interface DbToolCall {
  * - assistant content uses "." as placeholder when only tool_uses exist
  * - Trailing orphan user messages get an auto-paired assistant "OK"
  * - Tool results from completed tool calls attach to the next user message
+ * - When consecutive assistant messages exist (tool-call then text-response),
+ *   a synthetic user message is inserted to carry tool results
  */
+export function buildHistory(
+	dbMessages: DbMessage[],
+	model: string,
 	const modelId = resolveModel(model);
 
 	// Only top-level user/assistant messages
@@ -55,15 +60,34 @@ interface DbToolCall {
 
 	for (const msg of merged) {
 		if (msg.role === "assistant") {
+			// When we have pending tool results (from a previous assistant's tool calls)
+			// but the next DB message is another assistant (no intervening user message),
+			// insert a synthetic user message to carry the tool results.
+			if (pendingToolResults.length > 0) {
+				history.push({
+						content: ".",
+						modelId,
+					},
+				});
+				pendingToolResults = [];
+			}
+
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
 			let text = textParts.join("\n") || msg.contentText || "";
 
+			// Only include tool uses that have completed results (completed/failed).
+			const completedToolUseIds = new Set(
+				msg.toolCalls
+					?.filter((tc) => tc.status === "completed" || tc.status === "failed")
+					.map((tc) => tc.toolUseId) ?? [],
+			);
+
 			const toolUses =
 				msg.toolCalls
-					?.filter((tc) => tc.toolName && tc.toolUseId)
+					?.filter((tc) => tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId))
 					.map((tc) => ({
 						toolUseId: tc.toolUseId,
 						name: tc.toolName,
@@ -118,5 +142,5 @@ interface DbToolCall {
 		}
 	}
 
-	return history;
+	return { history, trailingToolResults: pendingToolResults };
 }

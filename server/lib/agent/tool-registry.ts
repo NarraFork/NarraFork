@@ -55,7 +55,8 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 	} else if (schema instanceof z.ZodBoolean) {
 		result = { type: "boolean" };
 	} else if (schema instanceof z.ZodEnum) {
-		result = { type: "string", enum: schema._zod.def.entries };
+		// Zod v4 internal: _zod.def.entries is an object, not an array
+		result = { type: "string", enum: Object.values(schema._zod.def.entries) };
 	} else if (schema instanceof z.ZodArray) {
 		result = { type: "array", items: convertNode(schema.element) };
 	} else if (schema instanceof z.ZodLiteral) {

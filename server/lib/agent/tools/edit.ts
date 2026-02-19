@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 
@@ -11,15 +12,16 @@ export const editTool: ToolDefinition = {
 		new_string: z.string(),
 		replace_all: z.boolean().optional(),
 	}),
-	async execute(args): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, old_string, new_string, replace_all } = args as {
 			file_path: string;
 			old_string: string;
 			new_string: string;
 			replace_all?: boolean;
 		};
+		const resolvedPath = resolve(ctx.cwd, file_path);
 		try {
-			const content = await Bun.file(file_path).text();
+			const content = await Bun.file(resolvedPath).text();
 
 			if (!content.includes(old_string)) {
 				return { output: `old_string not found in ${file_path}`, isError: true };
@@ -40,7 +42,7 @@ export const editTool: ToolDefinition = {
 				? content.replaceAll(old_string, new_string)
 				: content.replace(old_string, new_string);
 
-			await Bun.write(file_path, updated);
+			await Bun.write(resolvedPath, updated);
 			return { output: `Edited ${file_path}`, title: file_path };
 		} catch (err) {
 			return {
