@@ -216,7 +216,7 @@ describe("narrator cascade delete", () => {
 				messageId: "msg1",
 				toolUseId: "tu1",
 				toolName: "Bash",
-				status: "completed",
+				status: "success",
 				createdAt: now,
 			})
 			.run();

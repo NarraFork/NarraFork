@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS narrators (
 	status TEXT NOT NULL DEFAULT 'idle',
 	cwd TEXT,
 	error_message TEXT,
+	todos_json TEXT,
+	todos_tool_use_id TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	tokens_in INTEGER,
 	tokens_out INTEGER,
 	cost_usd REAL,
+	turn_usage_json TEXT,
 	created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS narrator_tool_calls (
@@ -96,28 +99,20 @@ CREATE TABLE IF NOT EXISTS narrator_tool_calls (
 	tool_name TEXT NOT NULL,
 	input_json TEXT,
 	output_json TEXT,
-	status TEXT NOT NULL DEFAULT 'pending',
+	status TEXT NOT NULL DEFAULT 'initializing',
 	duration_ms INTEGER,
 	error_message TEXT,
+	permission_decided_by TEXT,
+	permission_decided_at TEXT,
+	permission_deny_message TEXT,
+	permission_decision_reason TEXT,
+	permission_suggestions TEXT,
 	created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS permission_requests (
-	id TEXT PRIMARY KEY,
-	narrator_id TEXT NOT NULL REFERENCES narrators(id),
-	tool_call_id TEXT REFERENCES narrator_tool_calls(id),
-	tool_name TEXT NOT NULL,
-	input_json TEXT,
-	decision_reason TEXT,
-	suggestions TEXT,
-	decision TEXT NOT NULL DEFAULT 'pending',
-	decided_by TEXT,
-	deny_message TEXT,
-	created_at TEXT NOT NULL,
-	decided_at TEXT
 );
 CREATE TABLE IF NOT EXISTS terminals (
 	id TEXT PRIMARY KEY,
 	chapter_id TEXT REFERENCES chapters(id),
+	narrator_id TEXT REFERENCES narrators(id),
 	name TEXT NOT NULL,
 	cwd TEXT,
 	dtach_socket TEXT,
