@@ -26,6 +26,7 @@ import {
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
+	IconWorldSearch,
 	IconX,
 } from "@tabler/icons-react";
 import { memo, useEffect, useMemo, useState } from "react";
@@ -39,6 +40,7 @@ import { LazyCollapse } from "./LazyCollapse";
 // --- Types ---
 
 export interface ToolCallData {
+	id?: string;
 	toolName: string;
 	toolUseId?: string;
 	inputJson: any;
@@ -46,14 +48,8 @@ export interface ToolCallData {
 	status: string;
 	durationMs?: number;
 	errorMessage?: string;
-	permissionRequests?: Array<{
-		id: string;
-		toolName: string;
-		inputJson: any;
-		decision: string;
-		decisionReason?: string;
-		suggestions?: any[];
-	}>;
+	permissionDecisionReason?: string | null;
+	permissionSuggestions?: any[] | null;
 }
 
 export interface PendingPermission {
@@ -94,24 +90,33 @@ interface ToolCallCardProps {
 // --- Constants ---
 
 export const STATUS_COLORS: Record<string, string> = {
+	initializing: "gray",
 	pending: "yellow",
-	approved: "teal",
-	denied: "red",
 	running: "blue",
-	completed: "green",
-	failed: "red",
+	success: "green",
+	fail: "red",
 };
 
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit"]);
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
 const BASH_TOOLS = new Set(["Bash", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
+const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const TODO_TOOLS = new Set(["TodoWrite", "TodoRead"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 
-type ToolCategory = "file" | "bash" | "search" | "todo" | "taskOutput" | "ask" | "plan" | "generic";
+type ToolCategory =
+	| "file"
+	| "bash"
+	| "search"
+	| "webSearch"
+	| "todo"
+	| "taskOutput"
+	| "ask"
+	| "plan"
+	| "generic";
 
 export function isEditTool(name: string): boolean {
 	return EDIT_TOOLS.has(name);
@@ -121,6 +126,7 @@ function getCategory(name: string): ToolCategory {
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (SEARCH_TOOLS.has(name)) return "search";
+	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
 	if (TODO_TOOLS.has(name)) return "todo";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (ASK_TOOLS.has(name)) return "ask";
@@ -136,6 +142,8 @@ function getCategoryIcon(cat: ToolCategory) {
 			return IconTerminal2;
 		case "search":
 			return IconSearch;
+		case "webSearch":
+			return IconWorldSearch;
 		case "todo":
 			return IconListCheck;
 		case "taskOutput":
@@ -157,6 +165,8 @@ function getCategoryColor(cat: ToolCategory) {
 			return "orange";
 		case "search":
 			return "cyan";
+		case "webSearch":
+			return "teal";
 		case "todo":
 			return "teal";
 		case "taskOutput":
@@ -202,6 +212,11 @@ function getSummary(toolName: string, input: any): string {
 			if (!pat) return toolName;
 			return pat.length > 60 ? `${pat.slice(0, 57)}...` : pat;
 		}
+		case "webSearch": {
+			const q = input?.query ?? "";
+			if (!q) return "Web Search";
+			return q.length > 60 ? `${q.slice(0, 57)}...` : q;
+		}
 		case "todo":
 			return toolName === "TodoWrite" ? "Update todos" : "Read todos";
 		case "taskOutput": {
@@ -234,13 +249,13 @@ function getSummary(toolName: string, input: any): string {
 // --- Helper: status indicator icon ---
 
 export function StatusIcon({ status }: { status: string }) {
-	if (status === "running" || status === "pending") {
+	if (status === "running" || status === "pending" || status === "initializing") {
 		return <IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />;
 	}
-	if (status === "completed" || status === "approved") {
+	if (status === "success") {
 		return <IconCheck size={12} />;
 	}
-	if (status === "failed" || status === "denied") {
+	if (status === "fail") {
 		return <IconX size={12} />;
 	}
 	return null;
@@ -451,6 +466,87 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("common");
+	const query = toolCall.inputJson?.query ?? "";
+	const raw =
+		typeof toolCall.outputJson === "string"
+			? toolCall.outputJson
+			: toolCall.outputJson
+				? JSON.stringify(toolCall.outputJson, null, 2)
+				: "";
+
+	// Try to parse structured search results from the output
+	const results = useMemo(() => {
+		if (!raw) return null;
+		try {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed?.results)) return parsed.results;
+			if (Array.isArray(parsed)) return parsed;
+		} catch {
+			// not JSON — fall through
+		}
+		return null;
+	}, [raw]);
+
+	return (
+		<Box mt="xs">
+			{query && <Code style={{ fontSize: 11 }}>{query}</Code>}
+			{results ? (
+				<Stack gap={6} mt={4}>
+					{results.slice(0, 10).map((r: any, i: number) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: search results lack stable IDs
+						<Box key={i}>
+							<Text
+								size="xs"
+								fw={600}
+								component="a"
+								href={r.url}
+								target="_blank"
+								rel="noopener noreferrer"
+								c="indigo"
+								style={{ textDecoration: "none" }}
+							>
+								{r.title || r.url}
+							</Text>
+							{r.domain && (
+								<Text size="xs" c="dimmed" ff="monospace">
+									{r.domain}
+								</Text>
+							)}
+							{r.snippet && (
+								<Text size="xs" c="dimmed" lineClamp={2}>
+									{r.snippet}
+								</Text>
+							)}
+						</Box>
+					))}
+				</Stack>
+			) : (
+				raw && (
+					<>
+						<Text size="xs" fw={500} mt={4} mb={2}>
+							{t("output")}
+						</Text>
+						<ContentViewer
+							content={raw}
+							style={codeStyle}
+							title={query || "Web Search"}
+							markdown
+							contentType="markdown"
+						/>
+					</>
+				)
+			)}
+			{toolCall.errorMessage && !toolCall.outputJson && (
+				<Text size="xs" c="red" mt={4}>
+					{toolCall.errorMessage}
+				</Text>
+			)}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = JSON.stringify(toolCall.inputJson, null, 2);
@@ -616,7 +712,7 @@ function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
 	// Plan content from inputJson.plan is shown by InlinePermission during approval.
 	// Here we only render after completion, using outputJson or falling back to inputJson.plan.
 	const planText =
-		toolCall.status === "completed" || toolCall.status === "failed"
+		toolCall.status === "success" || toolCall.status === "fail"
 			? typeof toolCall.outputJson === "string"
 				? toolCall.outputJson
 				: typeof toolCall.inputJson?.plan === "string"
@@ -669,6 +765,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <BashDetail toolCall={toolCall} />;
 		case "search":
 			return <SearchDetail toolCall={toolCall} />;
+		case "webSearch":
+			return <WebSearchDetail toolCall={toolCall} />;
 		case "todo":
 			return <TodoDetail toolCall={toolCall} />;
 		case "taskOutput":
@@ -818,7 +916,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isEdit = isEditTool(toolCall.toolName);
 	// Auto-expand: permission pending, todo tools, or edit tools.
 	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
-	const isFailed = toolCall.status === "failed";
+	const isFailed = toolCall.status === "fail";
 	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
 	const defaultOpen =
 		!!pendingPermission ||
@@ -845,7 +943,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const borderColor = pendingPermission
 		? "var(--mantine-color-yellow-6)"
-		: toolCall.status === "failed"
+		: toolCall.status === "fail"
 			? "var(--mantine-color-red-7)"
 			: toolCall.status === "running"
 				? "var(--mantine-color-blue-7)"
@@ -915,18 +1013,12 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 	const cat = getCategory(toolCalls[0].toolName);
 	const Icon = getCategoryIcon(cat);
 	const color = getCategoryColor(cat);
-	const allDone = toolCalls.every((tc) => tc.status === "completed");
-	const anyFailed = toolCalls.some((tc) => tc.status === "failed");
+	const allDone = toolCalls.every((tc) => tc.status === "success");
+	const anyFailed = toolCalls.some((tc) => tc.status === "fail");
 	const anyRunning = toolCalls.some((tc) => tc.status === "running");
 
 	const statusColor = anyFailed ? "red" : anyRunning ? "blue" : allDone ? "green" : "yellow";
-	const statusLabel = anyFailed
-		? "failed"
-		: anyRunning
-			? "running"
-			: allDone
-				? "completed"
-				: "pending";
+	const statusLabel = anyFailed ? "fail" : anyRunning ? "running" : allDone ? "success" : "pending";
 
 	// Collect unique tool names for the label
 	const names = [...new Set(toolCalls.map((tc) => tc.toolName))];

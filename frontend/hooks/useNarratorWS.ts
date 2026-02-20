@@ -6,15 +6,10 @@ interface NarratorWSCallbacks {
 	onUserMessage?: (data: any) => void;
 	onStreamEvent?: (data: any) => void;
 	onPermissionRequest?: (request: any) => void;
-	onPermissionResolved?: (requestId: string) => void;
+	onPermissionResolved?: (requestId: string, toolUseId?: string) => void;
 	onStatusChange?: (status: string) => void;
 	onToolProgress?: (toolUseId: string, elapsed: number) => void;
-	onToolCompleted?: (
-		toolUseId: string,
-		status: string,
-		output?: unknown,
-		permissionRequest?: { id: string; toolName: string; inputJson: unknown },
-	) => void;
+	onToolCompleted?: (toolUseId: string, status: string, output?: unknown) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (todos: any[], toolUseId?: string) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
@@ -23,6 +18,8 @@ interface NarratorWSCallbacks {
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number) => void;
+	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
+	onNarratorError?: (error: string) => void;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -87,7 +84,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							}
 							break;
 						case "permission_resolved":
-							callbacksRef.current.onPermissionResolved?.(data.requestId);
+							callbacksRef.current.onPermissionResolved?.(data.requestId, data.toolUseId);
 							break;
 						case "status_change":
 						case "narrator:status_changed":
@@ -97,12 +94,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							callbacksRef.current.onToolProgress?.(data.toolUseId, data.elapsed);
 							break;
 						case "tool_completed":
-							callbacksRef.current.onToolCompleted?.(
-								data.toolUseId,
-								data.status,
-								data.output,
-								data.permissionRequest,
-							);
+							callbacksRef.current.onToolCompleted?.(data.toolUseId, data.status, data.output);
 							break;
 						case "todos_updated":
 							callbacksRef.current.onTodosUpdated?.(data.todos, data.toolUseId);
@@ -128,6 +120,12 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							break;
 						case "context_usage":
 							callbacksRef.current.onContextUsage?.(data.percentage);
+							break;
+						case "metering":
+							callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
+							break;
+						case "narrator:error":
+							callbacksRef.current.onNarratorError?.(data.error);
 							break;
 					}
 				} catch (err) {

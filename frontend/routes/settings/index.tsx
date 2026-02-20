@@ -1,11 +1,14 @@
 import {
 	ActionIcon,
 	Affix,
+	Badge,
 	Button,
 	Group,
 	Loader,
+	NativeSelect,
 	NumberInput,
 	Paper,
+	PasswordInput,
 	Select,
 	Slider,
 	Stack,
@@ -15,7 +18,14 @@ import {
 	Title,
 	Transition,
 } from "@mantine/core";
-import { IconHandStop, IconPencilCheck, IconShield, IconShieldOff } from "@tabler/icons-react";
+import {
+	IconEye,
+	IconEyeOff,
+	IconHandStop,
+	IconPencilCheck,
+	IconShield,
+	IconShieldOff,
+} from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -25,7 +35,7 @@ import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import { BUILTIN_MODELS } from "../../lib/constants";
+import { BUILTIN_MODELS, groupModelsByProvider, type ModelOption } from "../../lib/constants";
 
 export const Route = createFileRoute("/settings/")({
 	component: SettingsPage,
@@ -55,11 +65,18 @@ function SettingsPage() {
 	const [defaultModel, setDefaultModel] = useState("claude-sonnet");
 	const [permissionMode, setPermissionMode] = useState("default");
 	const [summaryModel, setSummaryModel] = useState("claude-haiku");
-	const [customModels, setCustomModels] = useState<Array<{ value: string; label: string }>>([]);
+	const [customModels, setCustomModels] = useState<
+		Array<{ value: string; label: string; provider?: string }>
+	>([]);
 	const [newModelValue, setNewModelValue] = useState("");
 	const [newModelLabel, setNewModelLabel] = useState("");
+	const [newModelProvider, setNewModelProvider] = useState("openai");
 	const [extendedContext, setExtendedContext] = useState(false);
+	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
+	// OpenAI
+	const [openaiApiKey, setOpenaiApiKey] = useState("");
+	const [openaiBaseUrl, setOpenaiBaseUrl] = useState("");
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
 	const [maxContainers, setMaxContainers] = useState(5);
@@ -83,7 +100,8 @@ function SettingsPage() {
 		defaultModel: "claude-sonnet",
 		permissionMode: "default",
 		summaryModel: "claude-haiku",
-		customModels: [] as Array<{ value: string; label: string }>,
+		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
+		hiddenModels: [] as string[],
 		extendedContext: false,
 		maxWorktrees: 10,
 		maxContainers: 5,
@@ -93,6 +111,8 @@ function SettingsPage() {
 		portStart: 10000,
 		portEnd: 20000,
 		editor: "vscode",
+		openaiApiKey: "",
+		openaiBaseUrl: "",
 	});
 
 	useEffect(() => {
@@ -104,6 +124,7 @@ function SettingsPage() {
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				summaryModel: settings.agent?.summaryModel ?? "claude-haiku",
 				customModels: settings.agent?.customModels ?? [],
+				hiddenModels: settings.agent?.hiddenModels ?? [],
 				extendedContext: settings.agent?.extendedContext ?? false,
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
@@ -113,6 +134,8 @@ function SettingsPage() {
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
 				editor: settings.editor?.type ?? "vscode",
+				openaiApiKey: settings.openai?.apiKey ?? "",
+				openaiBaseUrl: settings.openai?.baseUrl ?? "",
 			};
 			serverSnapshot.current = snap;
 			setPort(snap.port);
@@ -121,6 +144,7 @@ function SettingsPage() {
 			setPermissionMode(snap.permissionMode);
 			setSummaryModel(snap.summaryModel);
 			setCustomModels(snap.customModels);
+			setHiddenModels(snap.hiddenModels);
 			setExtendedContext(snap.extendedContext);
 			setMaxWorktrees(snap.maxWorktrees);
 			setMaxContainers(snap.maxContainers);
@@ -130,6 +154,8 @@ function SettingsPage() {
 			setPortStart(snap.portStart);
 			setPortEnd(snap.portEnd);
 			setEditor(snap.editor);
+			setOpenaiApiKey(snap.openaiApiKey);
+			setOpenaiBaseUrl(snap.openaiBaseUrl);
 			setInitialized(true);
 		}
 	}, [settings, initialized]);
@@ -144,6 +170,7 @@ function SettingsPage() {
 			permissionMode !== s.permissionMode ||
 			summaryModel !== s.summaryModel ||
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
+			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			extendedContext !== s.extendedContext ||
 			maxWorktrees !== s.maxWorktrees ||
 			maxContainers !== s.maxContainers ||
@@ -152,7 +179,9 @@ function SettingsPage() {
 			dormantMinutes !== s.dormantMinutes ||
 			portStart !== s.portStart ||
 			portEnd !== s.portEnd ||
-			editor !== s.editor
+			editor !== s.editor ||
+			openaiApiKey !== s.openaiApiKey ||
+			openaiBaseUrl !== s.openaiBaseUrl
 		);
 	}, [
 		initialized,
@@ -162,6 +191,7 @@ function SettingsPage() {
 		permissionMode,
 		summaryModel,
 		customModels,
+		hiddenModels,
 		extendedContext,
 		maxWorktrees,
 		maxContainers,
@@ -171,6 +201,8 @@ function SettingsPage() {
 		portStart,
 		portEnd,
 		editor,
+		openaiApiKey,
+		openaiBaseUrl,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -185,14 +217,32 @@ function SettingsPage() {
 
 	if (isLoading) return <Loader />;
 
-	const allModels = [...BUILTIN_MODELS, ...customModels];
+				.map((m: any) => ({
+					value: String(m.model_id ?? m.modelId ?? ""),
+					label: String(
+						m.model_short_name ??
+							m.modelShortName ??
+							m.model_name ??
+							m.modelName ??
+							m.model_id ??
+							m.modelId ??
+							"",
+					),
+					rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
+				}))
+				.filter((m: ModelOption) => m.value)
+		: BUILTIN_MODELS;
+	const visibleModels = allModels.filter((m) => !hiddenModels.includes(m.value));
+	const groupedModels = groupModelsByProvider(visibleModels, {
+		openai: t("modelProviderOpenAI"),
+	});
 
 	const handleAddModel = () => {
 		const v = newModelValue.trim();
 		const l = newModelLabel.trim();
 		if (!v || !l) return;
 		if (allModels.some((m) => m.value === v)) return;
-		setCustomModels([...customModels, { value: v, label: l }]);
+		setCustomModels([...customModels, { value: v, label: l, provider }]);
 		setNewModelValue("");
 		setNewModelLabel("");
 	};
@@ -211,6 +261,7 @@ function SettingsPage() {
 					defaultPermissionMode: permissionMode,
 					summaryModel,
 					customModels,
+					hiddenModels,
 					extendedContext,
 				},
 				chapters: {
@@ -225,6 +276,10 @@ function SettingsPage() {
 					portRangeEnd: portEnd,
 				},
 				editor: { type: editor },
+				openai: {
+					apiKey: openaiApiKey,
+					baseUrl: openaiBaseUrl,
+				},
 			},
 			{
 				onSuccess: () => {
@@ -235,6 +290,7 @@ function SettingsPage() {
 						permissionMode,
 						summaryModel,
 						customModels: [...customModels],
+						hiddenModels: [...hiddenModels],
 						extendedContext,
 						maxWorktrees,
 						maxContainers,
@@ -244,6 +300,8 @@ function SettingsPage() {
 						portStart,
 						portEnd,
 						editor,
+						openaiApiKey,
+						openaiBaseUrl,
 					};
 				},
 			},
@@ -279,7 +337,7 @@ function SettingsPage() {
 					<Title order={4}>{t("agentSection")}</Title>
 					<Select
 						label={t("defaultModel")}
-						data={allModels}
+						data={groupedModels}
 						searchable
 						value={defaultModel}
 						onChange={(v) => setDefaultModel(v ?? "claude-sonnet")}
@@ -326,7 +384,7 @@ function SettingsPage() {
 					/>
 					<Select
 						label={t("summaryModel")}
-						data={allModels}
+						data={groupedModels}
 						searchable
 						value={summaryModel}
 						onChange={(v) => setSummaryModel(v ?? "claude-haiku")}
@@ -344,16 +402,37 @@ function SettingsPage() {
 						<Text size="xs" c="dimmed">
 							{t("customModelsDesc")}
 						</Text>
-						{BUILTIN_MODELS.map((m) => (
-							<Group key={m.value} gap="xs">
-								<TextInput value={m.value} disabled style={{ flex: 1 }} />
-								<TextInput value={m.label} disabled style={{ flex: 1 }} />
-							</Group>
-						))}
+							const isHidden = hiddenModels.includes(m.value);
+							return (
+								<Group key={m.value} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
+									<TextInput value={m.value} disabled style={{ flex: 1 }} />
+									<TextInput value={m.label} disabled style={{ flex: 1 }} />
+									<Badge size="sm" variant="light" color="violet" w={70}>
+									</Badge>
+									<ActionIcon
+										variant="subtle"
+										color={isHidden ? "gray" : "blue"}
+										onClick={() =>
+											setHiddenModels((prev) =>
+												isHidden ? prev.filter((id) => id !== m.value) : [...prev, m.value],
+											)
+										}
+									>
+										{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+									</ActionIcon>
+								</Group>
+							);
+						})}
 						{customModels.map((m) => (
 							<Group key={m.value} gap="xs">
 								<TextInput value={m.value} disabled style={{ flex: 1 }} />
 								<TextInput value={m.label} disabled style={{ flex: 1 }} />
+								<Badge
+									size="sm"
+									variant="light"
+									w={70}
+								>
+								</Badge>
 								<ActionIcon color="red" variant="subtle" onClick={() => handleRemoveModel(m.value)}>
 									✕
 								</ActionIcon>
@@ -372,6 +451,20 @@ function SettingsPage() {
 								onChange={(e) => setNewModelLabel(e.currentTarget.value)}
 								style={{ flex: 1 }}
 							/>
+								<Badge size="sm" variant="light" color="teal" w={90}>
+									OpenAI
+								</Badge>
+							) : (
+								<NativeSelect
+									size="xs"
+									data={[
+										{ value: "openai", label: "OpenAI" },
+									]}
+									value={newModelProvider}
+									onChange={(e) => setNewModelProvider(e.currentTarget.value)}
+									w={90}
+								/>
+							)}
 							<ActionIcon
 								variant="light"
 								onClick={handleAddModel}
@@ -381,6 +474,28 @@ function SettingsPage() {
 							</ActionIcon>
 						</Group>
 					</Stack>
+				</Stack>
+			</Paper>
+
+			{/* OpenAI */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("openaiSection")}</Title>
+					<Text size="xs" c="dimmed">
+						{t("openaiSectionDesc")}
+					</Text>
+					<PasswordInput
+						label={t("openaiApiKey")}
+						placeholder={t("openaiApiKeyPlaceholder")}
+						value={openaiApiKey}
+						onChange={(e) => setOpenaiApiKey(e.currentTarget.value)}
+					/>
+					<TextInput
+						label={t("openaiBaseUrl")}
+						placeholder={t("openaiBaseUrlPlaceholder")}
+						value={openaiBaseUrl}
+						onChange={(e) => setOpenaiBaseUrl(e.currentTarget.value)}
+					/>
 				</Stack>
 			</Paper>
 

@@ -23,7 +23,29 @@ export const CONTAINER_STATUS_COLORS: Record<string, string> = {
 };
 
 export const BUILTIN_MODELS = [
-	{ value: "claude-haiku", label: "Haiku" },
-	{ value: "claude-sonnet", label: "Sonnet" },
-	{ value: "claude-opus", label: "Opus" },
 ];
+
+export type ModelOption = {
+	value: string;
+	label: string;
+	provider?: string;
+	rateMultiplier?: number;
+};
+
+/** Group ModelOption[] by provider for Mantine Select's grouped data format. */
+export function groupModelsByProvider(
+	models: ModelOption[],
+	providerLabels: Record<string, string> = {},
+): { group: string; items: { value: string; label: string }[] }[] {
+	const labels = { ...defaultLabels, ...providerLabels };
+	const groups = new Map<string, { value: string; label: string }[]>();
+	for (const m of models) {
+		if (!groups.has(prov)) groups.set(prov, []);
+		const suffix = m.rateMultiplier != null ? ` (×${m.rateMultiplier})` : "";
+		groups.get(prov)?.push({ value: m.value, label: `${m.label}${suffix}` });
+	}
+	return [...groups.entries()].map(([prov, items]) => ({
+		group: labels[prov] ?? prov,
+		items,
+	}));
+}

@@ -88,6 +88,8 @@ export const api = {
 	// Admin
 	listUsers: () => request<any[]>("/admin/users"),
 	deleteUser: (id: string) => request<any>(`/admin/users/${id}`, { method: "DELETE" }),
+	updateUser: (id: string, data: { username?: string; password?: string }) =>
+		request<any>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	updateAdminSettings: (data: { registrationOpen: boolean }) =>
 		request<any>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
 
@@ -205,6 +207,51 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",
 			body: JSON.stringify({ permissionMode }),
+		}),
+	getCompactSummary: (narratorId: string, messageId: string) =>
+		request<{ summary: string }>(`/narrators/${narratorId}/compact/${messageId}`),
+	sendNarratorMessage: async (narratorId: string, message: string, images?: File[]) => {
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+
+		let body: BodyInit;
+		if (images?.length) {
+			const formData = new FormData();
+			formData.append("message", message);
+			for (const img of images) formData.append("images", img);
+			body = formData;
+		} else {
+			headers["Content-Type"] = "application/json";
+			body = JSON.stringify({ message });
+		}
+
+		const res = await fetch(`${BASE}/narrators/${narratorId}/messages`, {
+			method: "POST",
+			headers,
+			body,
+		});
+		if (res.status === 401) {
+			clearToken();
+			throw new Error("Unauthorized");
+		}
+		if (!res.ok) {
+			const error = await res.json().catch(() => ({ error: res.statusText }));
+			throw new Error(error.error ?? "Request failed");
+		}
+		return res.json();
+	},
+	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/compact`, {
+			method: "POST",
+			body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
+		}),
+	deleteCompactMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, { method: "DELETE" }),
+	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ summary }),
 		}),
 
 	// Terminals
@@ -357,6 +404,11 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ credentials }),
 		}),
+		request<{ models: Array<Record<string, unknown>>; fromCache: boolean }>(
+		),
+		request<{ models: Array<Record<string, unknown>>; credentialId?: number; fromCache: boolean }>(
+			{ method: "POST" },
+		),
 };
 
 	text: string,

@@ -254,40 +254,6 @@ export function updateToolCallByIndex(
 	return { ...old, pages };
 }
 
-/** Merge a permission request into a tool call's permissionRequests array in the cache */
-export function mergePermissionIntoToolCall(
-	old: any,
-	toolUseId: string,
-	permissionRequest: { id: string; toolName: string; inputJson: unknown },
-	index: MessageIndex,
-): any {
-	const fields = {
-		permissionRequests: [{ ...permissionRequest, decision: "pending" }],
-	};
-	const entry = index.get(toolUseId);
-	if (!entry) {
-		// Fallback: full traversal
-		if (!old?.pages?.length) return old;
-		let anyChanged = false;
-		const pages = old.pages.map((page: any) => {
-			const { messages, changed } = mergeToolCallFieldsInTree(
-				page.messages,
-				toolUseId,
-				fields,
-			);
-			if (changed) anyChanged = true;
-			return changed ? { ...page, messages } : page;
-		});
-		return anyChanged ? { ...old, pages } : old;
-	}
-	// Use indexed path for O(1) lookup
-	const pages = [...old.pages];
-	const page = { ...pages[entry.pageIdx] };
-	page.messages = mergeFieldsAtPath(page.messages, entry.path, toolUseId, fields);
-	pages[entry.pageIdx] = page;
-	return { ...old, pages };
-}
-
 /** Navigate to a message by path and merge fields into its tool call immutably */
 function mergeFieldsAtPath(
 	messages: any[],
