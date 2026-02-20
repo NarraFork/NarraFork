@@ -1,5 +1,5 @@
 {
-	"title": "独立会话",
+	"title": "会话列表",
 	"newSession": "新建会话",
 	"noSessions": "暂无独立会话。创建一个以开始不绑定章节的对话。",
 	"sessionId": "会话 {{id}}",
