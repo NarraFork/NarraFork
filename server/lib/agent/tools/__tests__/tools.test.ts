@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ToolContext } from "../../types";
 import { bashTool } from "../bash";
 import { editTool } from "../edit";
@@ -232,7 +232,7 @@ describe("Grep", () => {
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("line two");
 		// Should have line numbers by default in content mode
-		expect(result.output).toMatch(/\d+[:\-].*line two/);
+		expect(result.output).toMatch(/\d+[:-].*line two/);
 	});
 
 	test("count mode returns match counts", async () => {
@@ -245,10 +245,7 @@ describe("Grep", () => {
 	});
 
 	test("no matches returns non-error", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "zzz_nonexistent_pattern_zzz" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "zzz_nonexistent_pattern_zzz" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("No matches");
 	});
@@ -263,10 +260,7 @@ describe("Grep", () => {
 	});
 
 	test("glob filter limits search scope", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "const", glob: "a.ts" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "const", glob: "a.ts" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("a.ts");
 		expect(result.output).not.toContain("b.ts");
@@ -304,10 +298,7 @@ describe("Grep", () => {
 	});
 
 	test("type filter works", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "const", type: "ts" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "const", type: "ts" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain(".ts");
 		expect(result.output).not.toContain(".json");
@@ -380,10 +371,7 @@ describe("Grep", () => {
 	});
 
 	test("context param is ignored in files_with_matches mode", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "const", context: 3 },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "const", context: 3 }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		// Should still be file paths, not content
 		expect(result.output).toContain("a.ts");
@@ -411,18 +399,12 @@ describe("Grep", () => {
 	});
 
 	test("invalid regex returns error", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "[invalid" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "[invalid" }, makeCtx());
 		expect(result.isError).toBe(true);
 	});
 
 	test("glob with multiple extensions via brace expansion", async () => {
-		const result = await grepTool.execute(
-			{ pattern: ".", glob: "*.{ts,json}" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: ".", glob: "*.{ts,json}" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain(".ts");
 		expect(result.output).toContain(".json");
@@ -512,20 +494,14 @@ describe("Grep injection safety", () => {
 	});
 
 	test("pattern with semicolon and pipe is treated literally", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "; echo INJECTED | cat" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "; echo INJECTED | cat" }, makeCtx());
 		// Should not contain "INJECTED" in output — rg just fails to match
 		expect(result.output).not.toContain("INJECTED");
 	});
 
 	test("pattern with backticks is treated literally", async () => {
 		const marker = join(TEST_DIR, "pwned4");
-		const result = await grepTool.execute(
-			{ pattern: "`touch " + marker + "`" },
-			makeCtx(),
-		);
+		const result = await grepTool.execute({ pattern: "`touch " + marker + "`" }, makeCtx());
 		expect(existsSync(marker)).toBe(false);
 	});
 });
@@ -571,10 +547,7 @@ describe("Bash", () => {
 	});
 
 	test("captures stderr", async () => {
-		const result = await bashTool.execute(
-			{ command: "echo err >&2" },
-			makeCtx(),
-		);
+		const result = await bashTool.execute({ command: "echo err >&2" }, makeCtx());
 		expect(result.output).toContain("err");
 	});
 
@@ -590,10 +563,7 @@ describe("Bash", () => {
 	});
 
 	test("respects timeout", async () => {
-		const result = await bashTool.execute(
-			{ command: "sleep 10", timeout: 500 },
-			makeCtx(),
-		);
+		const result = await bashTool.execute({ command: "sleep 10", timeout: 500 }, makeCtx());
 		// Should be killed before completing
 		expect(result.isError).toBe(true);
 	});
@@ -603,8 +573,8 @@ describe("Bash", () => {
 // zodToJsonSchema (tool-registry)
 // ============================================================
 
-import { zodToJsonSchema } from "../../tool-registry";
 import { z } from "zod/v4";
+import { zodToJsonSchema } from "../../tool-registry";
 
 describe("zodToJsonSchema", () => {
 	test("converts simple object schema", () => {
@@ -643,10 +613,13 @@ describe("zodToJsonSchema", () => {
 		const json = zodToJsonSchema(grepTool.parameters);
 		expect(json.type).toBe("object");
 		const props = json.properties as Record<string, any>;
-		expect(props.pattern).toEqual({ type: "string" });
+		expect(props.pattern.type).toBe("string");
+		expect(props.pattern.description).toBeDefined();
 		expect(props.output_mode.enum).toEqual(["content", "files_with_matches", "count"]);
-		expect(props["-i"]).toEqual({ type: "boolean" });
-		expect(props["-A"]).toEqual({ type: "number" });
+		expect(props["-i"].type).toBe("boolean");
+		expect(props["-i"].description).toBeDefined();
+		expect(props["-A"].type).toBe("number");
+		expect(props["-A"].description).toBeDefined();
 	});
 
 	test("converts all tool schemas without error", () => {

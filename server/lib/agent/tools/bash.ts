@@ -7,10 +7,16 @@ const TIMEOUT_MS = 120_000;
 export const bashTool: ToolDefinition = {
 	name: "Bash",
 	description:
-		"Execute a bash command. Use for git, npm, system commands. Output is truncated at 30000 chars.",
+		"Execute a bash command. Use for git, npm, system commands. Output is truncated at 30000 chars. " +
+		"IMPORTANT: Prefer dedicated tools over Bash when possible — use Read instead of cat/head/tail, " +
+		"Write instead of echo/cat heredoc, Edit instead of sed/awk, Glob instead of find/ls, " +
+		"Grep instead of grep/rg. Only use Bash for operations that genuinely require shell execution.",
 	parameters: z.object({
-		command: z.string(),
-		timeout: z.number().optional(),
+		command: z.string().describe("Bash command to execute"),
+		timeout: z
+			.number()
+			.optional()
+			.describe("Timeout in milliseconds (default: 120000, max: 600000)"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { command, timeout } = args as { command: string; timeout?: number };

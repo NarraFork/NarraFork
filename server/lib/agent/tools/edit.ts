@@ -7,10 +7,17 @@ export const editTool: ToolDefinition = {
 	description:
 		"Edit a file by replacing an exact string match. old_string must be unique in the file unless replace_all is true.",
 	parameters: z.object({
-		file_path: z.string(),
-		old_string: z.string(),
-		new_string: z.string(),
-		replace_all: z.boolean().optional(),
+		file_path: z.string().describe("Absolute or relative path to the file to edit"),
+		old_string: z
+			.string()
+			.describe(
+				"Exact string to find and replace. Must be unique in the file unless replace_all is true",
+			),
+		new_string: z.string().describe("Replacement string"),
+		replace_all: z
+			.boolean()
+			.optional()
+			.describe("Replace all occurrences instead of requiring uniqueness"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, old_string, new_string, replace_all } = args as {

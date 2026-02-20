@@ -7,8 +7,8 @@ export const writeTool: ToolDefinition = {
 	name: "Write",
 	description: "Write content to a file. Creates parent directories if needed.",
 	parameters: z.object({
-		file_path: z.string(),
-		content: z.string(),
+		file_path: z.string().describe("Absolute or relative path to the file to write"),
+		content: z.string().describe("Full content to write to the file"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, content } = args as { file_path: string; content: string };

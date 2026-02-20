@@ -8,9 +8,12 @@ export const readTool: ToolDefinition = {
 	description:
 		"Read a file. Returns content with line numbers. Supports offset/limit for large files.",
 	parameters: z.object({
-		file_path: z.string(),
-		offset: z.number().optional(),
-		limit: z.number().optional(),
+		file_path: z.string().describe("Absolute or relative path to the file to read"),
+		offset: z
+			.number()
+			.optional()
+			.describe("1-based line number to start reading from (default: 1)"),
+		limit: z.number().optional().describe("Maximum number of lines to return from the offset"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, offset, limit } = args as {

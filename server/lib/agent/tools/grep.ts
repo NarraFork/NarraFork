@@ -6,11 +6,7 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 /** Resolve the ripgrep binary path. Checks system paths, then vendored fallback. */
 function findRg(): string {
-	const systemPaths = [
-		"/usr/bin/rg",
-		"/usr/local/bin/rg",
-		"/home/linuxbrew/.linuxbrew/bin/rg",
-	];
+	const systemPaths = ["/usr/bin/rg", "/usr/local/bin/rg", "/home/linuxbrew/.linuxbrew/bin/rg"];
 	for (const p of systemPaths) {
 		if (existsSync(p)) return p;
 	}
@@ -33,20 +29,50 @@ export const grepTool: ToolDefinition = {
 	description:
 		"Search file contents using ripgrep. Supports regex, glob filtering, and output modes.",
 	parameters: z.object({
-		pattern: z.string(),
-		path: z.string().optional(),
-		glob: z.string().optional(),
-		output_mode: z.enum(["content", "files_with_matches", "count"]).optional(),
-		context: z.number().optional(),
-		"-i": z.boolean().optional(),
-		"-n": z.boolean().optional(),
-		"-A": z.number().optional(),
-		"-B": z.number().optional(),
-		"-C": z.number().optional(),
-		head_limit: z.number().optional(),
-		offset: z.number().optional(),
-		multiline: z.boolean().optional(),
-		type: z.string().optional(),
+		pattern: z.string().describe("Regex pattern to search for (ripgrep syntax)"),
+		path: z.string().optional().describe("File or directory to search. Defaults to cwd"),
+		glob: z
+			.string()
+			.optional()
+			.describe("Glob filter to restrict searched files, e.g. '*.ts' or '*.{ts,json}'"),
+		output_mode: z
+			.enum(["content", "files_with_matches", "count"])
+			.optional()
+			.describe(
+				"'content' shows matching lines, 'files_with_matches' (default) lists file paths, 'count' shows match counts per file",
+			),
+		context: z
+			.number()
+			.optional()
+			.describe(
+				"Number of context lines around each match (only in content mode). Overridden by -A/-B/-C",
+			),
+		"-i": z.boolean().optional().describe("Case-insensitive search"),
+		"-n": z
+			.boolean()
+			.optional()
+			.describe("Show line numbers in content mode (default: true). Set false to suppress"),
+		"-A": z.number().optional().describe("Show N lines after each match (only in content mode)"),
+		"-B": z.number().optional().describe("Show N lines before each match (only in content mode)"),
+		"-C": z
+			.number()
+			.optional()
+			.describe(
+				"Show N lines before and after each match (only in content mode). Takes precedence over context",
+			),
+		head_limit: z
+			.number()
+			.optional()
+			.describe("Max number of output lines to return (applied after offset)"),
+		offset: z.number().optional().describe("Number of output lines to skip from the beginning"),
+		multiline: z
+			.boolean()
+			.optional()
+			.describe("Enable multiline matching (pattern can span multiple lines)"),
+		type: z
+			.string()
+			.optional()
+			.describe("Restrict search to a file type recognized by ripgrep, e.g. 'ts', 'py', 'json'"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const {
