@@ -6,6 +6,7 @@ import { loadSettings, type NarraForkSettings, saveSettings } from "../lib/setti
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
 	label: z.string().min(1),
+	provider: z.string().optional(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
@@ -25,6 +26,8 @@ const updateSettingsSchema = z
 				defaultPermissionMode: z.string().min(1),
 				summaryModel: z.string().min(1),
 				customModels: z.array(modelOptionSchema),
+				hiddenModels: z.array(z.string()),
+				extendedContext: z.boolean(),
 			})
 			.partial()
 			.optional(),
@@ -57,13 +60,33 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		openai: z
+			.object({
+				apiKey: z.string(),
+				baseUrl: z.string(),
+				defaultModel: z.string(),
+			})
+			.partial()
+			.optional(),
 	})
 	.strict();
 
 export const settingsRoutes = new Hono();
 
 settingsRoutes.get("/", (c) => {
-	return c.json(loadSettings());
+	const s = loadSettings();
+	// Mask sensitive fields
+	const result = {
+		...s,
+		auth: { ...s.auth, jwtSecret: undefined },
+		openai: s.openai
+			? {
+					...s.openai,
+					apiKey: s.openai.apiKey ? `${"*".repeat(8)}${s.openai.apiKey.slice(-4)}` : "",
+				}
+			: undefined,
+	};
+	return c.json(result);
 });
 
 settingsRoutes.patch("/", async (c) => {
@@ -73,6 +96,12 @@ settingsRoutes.patch("/", async (c) => {
 
 	const current = loadSettings();
 	const validated = parsed.data;
+
+	// Preserve real API key if frontend sends back the masked value
+	if (validated.openai?.apiKey?.startsWith("*")) {
+		validated.openai.apiKey = current.openai?.apiKey ?? "";
+	}
+
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
@@ -84,5 +113,16 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 	saveSettings(merged);
-	return c.json(merged);
+	// Mask sensitive fields before returning (same logic as GET)
+	const result = {
+		...merged,
+		auth: { ...merged.auth, jwtSecret: undefined },
+		openai: merged.openai
+			? {
+					...merged.openai,
+					apiKey: merged.openai.apiKey ? `${"*".repeat(8)}${merged.openai.apiKey.slice(-4)}` : "",
+				}
+			: undefined,
+	};
+	return c.json(result);
 });

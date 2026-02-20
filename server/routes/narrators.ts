@@ -1,6 +1,5 @@
 import { and, asc, type Column, desc, eq, gt, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
@@ -20,7 +19,8 @@ import {
 	interruptSession,
 	isSessionActive,
 	resolvePermission,
-	startSession,
+	runCustomCompact,
+	sendMessage,
 	updateSessionModel,
 	updateSessionPermissionMode,
 } from "../services/narrator-session";
@@ -156,7 +156,7 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json(narrator);
 });
 
-// Send message — SSE streaming response (supports text + image uploads)
+// Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
@@ -171,22 +171,8 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	return streamSSE(c, async (stream) => {
-		try {
-			for await (const event of startSession(id, message, images, locale, replyInUserLanguage)) {
-				await stream.writeSSE({
-					event: event.type,
-					data: JSON.stringify(event.data),
-				});
-			}
-		} catch (err) {
-			const message = err instanceof Error ? err.message : "Internal stream error";
-			await stream.writeSSE({
-				event: "error",
-				data: JSON.stringify({ error: message }),
-			});
-		}
-	});
+	const userMsg = await sendMessage(id, message, images, locale, replyInUserLanguage);
+	return c.json(userMsg, 201);
 });
 
 // Get buffered message (for multi-device hydration on page load)
@@ -217,6 +203,46 @@ narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	const toolUseId = c.req.param("toolUseId");
 	const tc = await narratorService.getToolCallDetail(id, toolUseId);
 	return c.json(tc);
+});
+
+// Get compact summary for a specific compact message
+narratorRoutes.get("/:id/compact/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const summary = await narratorService.getCompactSummary(narratorId, messageId);
+	return c.json({ summary });
+});
+
+// Delete a compact message (undo compact)
+narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.deleteCompactMessage(narratorId, messageId);
+	return c.json({ ok: true });
+});
+
+// Update a compact message summary
+narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const { summary } = await c.req.json();
+	if (!summary || typeof summary !== "string") throw new ValidationError("summary is required");
+	await narratorService.updateCompactSummary(narratorId, messageId, summary);
+	return c.json({ ok: true });
+});
+
+// Trigger manual compact
+narratorRoutes.post("/:id/compact", async (c) => {
+	const narratorId = c.req.param("id");
+	await narratorService.getById(narratorId);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const body = await c.req.json().catch(() => ({}));
+	const beforeMessageId = body.beforeMessageId ?? undefined;
+	runCustomCompact(narratorId, locale, beforeMessageId).catch((err) => {
+		console.error("Manual compact failed", { narratorId, err });
+	});
+	return c.json({ ok: true });
 });
 
 // Interrupt active session

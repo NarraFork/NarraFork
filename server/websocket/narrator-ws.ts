@@ -30,10 +30,9 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			status: string;
 			output?: unknown;
-			permissionRequest?: { id: string; toolName: string; toolUseId?: string; inputJson: unknown };
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
-	| { type: "permission_resolved"; narratorId: string; requestId: string }
+	| { type: "permission_resolved"; narratorId: string; requestId: string; toolUseId?: string }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "session_error" }
@@ -42,6 +41,7 @@ export type NarratorServerMessage =
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
 	| { type: "context_usage"; narratorId: string; percentage: number }
+	| { type: "metering"; narratorId: string; unit: string; unitPlural: string; usage: number }
 	| { type: "error"; message: string };
 
 // Client → Server messages
@@ -158,7 +158,6 @@ export const handleNarratorWS = {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.add(id);
 				}
-				logger.debug("Narrator WS subscribed", { count: msg.narratorIds.length });
 				break;
 			}
 			case "unsubscribe": {
@@ -168,6 +167,12 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "permission_decision": {
+				logger.debug("WS permission_decision received", {
+					requestId: msg.requestId,
+					decision: msg.decision,
+					hasFeedback: !!msg.feedbackText,
+					hasAnswers: !!msg.answers,
+				});
 				resolvePermission(
 					msg.requestId,
 					msg.decision,

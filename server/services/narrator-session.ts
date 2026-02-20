@@ -1,21 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { and, eq } from "drizzle-orm";
+import { readFile } from "node:fs/promises";
+import { join, normalize, resolve } from "node:path";
+import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import {
-	chapters,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-	permissionRequests,
-} from "../db/schema";
+import { chapters, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { type AgentEvent, agentLoop, buildHistory, type PermissionResult } from "../lib/agent";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
-import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { getReplyLanguageInstruction } from "../lib/prompt-i18n";
+import { getReplyLanguageInstruction, getToolMessage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -25,17 +20,32 @@ import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 
 // === In-memory state ===
 
+
+/** Resolve provider name for a given model by looking up settings.agent.customModels. */
+function resolveProvider(model: string): string {
+	const custom = settings.agent.customModels ?? [];
+	const found = custom.find((m: { value: string; provider?: string }) => m.value === model);
+}
+
 interface ActiveSession {
 	abortController: AbortController;
 	narratorId: string;
 	conversationId: string;
 	cwd: string;
 	model: string;
+	provider: string;
 	systemPrompt: string | null;
 	events: EventEmitter;
 	alive: boolean;
 	locale: Locale;
 	_usedCompactSummary?: boolean;
+	/** Last reported context usage percentage from the provider (0–100) */
+	_lastContextUsagePct?: number;
+	/** Last reported metering from the provider */
+	_lastMeterUsage?: number;
+	_lastMeterUnit?: string;
+	/** Whether to append language instruction to system prompt */
+	_replyInUserLanguage?: boolean;
 }
 
 const activeSessions = new Map<string, ActiveSession>();
@@ -81,19 +91,74 @@ export type SessionEvent =
 
 const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+export function isInsideWorktree(cwd: string, filePath: string): boolean {
+	const resolved = normalize(resolve(cwd, filePath));
+	const base = normalize(cwd).replace(/\/+$/, "");
+	return resolved === base || resolved.startsWith(`${base}/`);
+}
+
+export function extractToolPaths(toolName: string, input: Record<string, unknown>): string[] {
+	switch (toolName) {
+		case "Read":
+		case "Write":
+		case "Edit":
+		case "NotebookEdit":
+		case "MultiEdit":
+			return typeof input.file_path === "string" ? [input.file_path] : [];
+		case "Glob":
+		case "Grep":
+			return typeof input.path === "string" ? [input.path] : [];
+		default:
+			return [];
+	}
+}
+
+// and does not access the local filesystem or execute arbitrary commands.
+const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "TodoRead", "EnterPlanMode", "ExitPlanMode", "WebSearch"];
+
+const ACCEPT_EDITS_AUTO_ALLOW = [
+	"Edit",
+	"Write",
+	"NotebookEdit",
+	"MultiEdit",
+	"Read",
+	"Glob",
+	"Grep",
+];
+
+/**
+ * Pure decision logic for permission handling.
+ * Returns "allow", "deny", or "ask" (needs user confirmation).
+ */
+export function resolvePermissionDecision(
+	toolName: string,
+	input: Record<string, unknown>,
+	permMode: string,
+	cwd: string,
+): "allow" | "deny" | "ask" {
+	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
+	if (permMode === "bypassPermissions") return "allow";
+	if (permMode === "dontAsk") return "deny";
+
+	const toolPaths = extractToolPaths(toolName, input);
+	const hasExternalPath = toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
+
+	if (!hasExternalPath) {
+		if (permMode === "default" && toolName !== "Bash") return "allow";
+		if (permMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName)) return "allow";
+	}
+
+	return "ask";
+}
+
 async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
 	toolName: string,
 	input: Record<string, unknown>,
 	toolUseId: string,
+	cwd: string,
 ): Promise<PermissionResult> {
-	// Auto-allow safe built-in tools
-	const autoAllowTools = ["TodoWrite", "TodoRead"];
-	if (autoAllowTools.includes(toolName)) {
-		return { behavior: "allow", updatedInput: input };
-	}
-
 	// Read permission mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -101,23 +166,46 @@ async function handlePermission(
 	});
 	const permMode = narrator?.permissionMode ?? "default";
 
-	if (permMode === "bypassPermissions") {
+	const decision = resolvePermissionDecision(toolName, input, permMode, cwd);
+	if (decision === "allow") {
+		logger.debug("Permission auto-allowed", { narratorId, toolName, toolUseId, permMode });
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "running",
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
 		return { behavior: "allow", updatedInput: input };
 	}
-	if (permMode === "dontAsk") {
+	if (decision === "deny") {
+		logger.debug("Permission auto-denied", { narratorId, toolName, toolUseId, permMode });
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: "Non-interactive session: all risky operations are denied",
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
 		return {
 			behavior: "deny",
 			message: "Non-interactive session: all risky operations are denied",
 		};
 	}
-	if (permMode === "acceptEdits") {
-		const editTools = ["Edit", "Write", "NotebookEdit", "MultiEdit"];
-		if (editTools.includes(toolName)) {
-			return { behavior: "allow", updatedInput: input };
-		}
-	}
 
-	const requestId = generateId();
 	const now = new Date().toISOString();
 
 	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
@@ -127,57 +215,50 @@ async function handlePermission(
 		),
 	});
 
-	await db.insert(permissionRequests).values({
-		id: requestId,
+	if (!toolCallRecord) {
+		logger.error("Tool call record not found for permission request", { narratorId, toolUseId });
+		return { behavior: "deny", message: "Internal error: tool call record not found" };
+	}
+
+	const toolCallId = toolCallRecord.id;
+
+	logger.debug("Permission request created", {
 		narratorId,
-		toolCallId: toolCallRecord?.id ?? null,
+		toolCallId,
+		toolUseId,
 		toolName,
-		inputJson: input,
-		decision: "pending",
-		createdAt: now,
+		pendingCount: pendingPermissions.size,
 	});
 
-	// Mark the tool call as pending permission
-	if (toolCallRecord) {
-		await db
-			.update(narratorToolCalls)
-			.set({ status: "pending" })
-			.where(eq(narratorToolCalls.id, toolCallRecord.id));
-	}
+	await db
+		.update(narratorToolCalls)
+		.set({ status: "pending" })
+		.where(eq(narratorToolCalls.id, toolCallId));
 
 	broadcastToNarrator(narratorId, {
 		type: "permission_request",
 		narratorId,
-		request: { id: requestId, toolName, toolUseId, inputJson: input },
+		request: { id: toolCallId, toolName, toolUseId, inputJson: input },
 	});
-	// Also broadcast as tool_completed so the tool call card updates its status
-	broadcastToNarrator(narratorId, {
-		type: "tool_completed",
-		narratorId,
-		toolUseId,
-		status: "pending",
-		permissionRequest: { id: requestId, toolName, toolUseId, inputJson: input },
-	});
-	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId });
+	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
 	await narratorService.updateStatus(narratorId, "waiting");
 
 	if (signal.aborted) {
 		broadcastToNarrator(narratorId, {
 			type: "permission_resolved",
 			narratorId,
-			requestId,
+			requestId: toolCallId,
+			toolUseId,
 		});
 		await db
-			.update(permissionRequests)
-			.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
-			.where(eq(permissionRequests.id, requestId));
-		// Restore tool call status
-		if (toolCallRecord) {
-			await db
-				.update(narratorToolCalls)
-				.set({ status: "running" })
-				.where(eq(narratorToolCalls.id, toolCallRecord.id));
-		}
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: "Session aborted",
+				permissionDecidedBy: "aborted",
+				permissionDecidedAt: new Date().toISOString(),
+			})
+			.where(eq(narratorToolCalls.id, toolCallId));
 		return { behavior: "deny", message: "Session aborted" };
 	}
 
@@ -185,62 +266,65 @@ async function handlePermission(
 		const cleanup = () => {
 			clearTimeout(tid);
 			signal.removeEventListener("abort", onAbort);
-			pendingPermissions.delete(requestId);
+			pendingPermissions.delete(toolCallId);
 		};
 
 		const tid = setTimeout(async () => {
+			logger.warn("Permission request timed out", {
+				narratorId,
+				toolCallId,
+				toolUseId,
+				toolName,
+				timeoutMs: PERMISSION_TIMEOUT_MS,
+			});
 			cleanup();
 			broadcastToNarrator(narratorId, {
 				type: "permission_resolved",
 				narratorId,
-				requestId,
+				requestId: toolCallId,
+				toolUseId,
 			});
-			await db
-				.update(permissionRequests)
-				.set({ decision: "deny", decidedBy: "auto_timeout", decidedAt: new Date().toISOString() })
-				.where(eq(permissionRequests.id, requestId));
-			// Restore tool call status — deny still returns a result, so tool continues
 			await db
 				.update(narratorToolCalls)
-				.set({ status: "running" })
-				.where(eq(narratorToolCalls.toolUseId, toolUseId));
-			broadcastToNarrator(narratorId, {
-				type: "tool_completed",
-				narratorId,
-				toolUseId,
-				status: "running",
-			});
+				.set({
+					status: "fail",
+					errorMessage: "Permission request timed out",
+					permissionDecidedBy: "auto_timeout",
+					permissionDecidedAt: new Date().toISOString(),
+				})
+				.where(eq(narratorToolCalls.id, toolCallId));
 			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, PERMISSION_TIMEOUT_MS);
 
 		const onAbort = async () => {
+			logger.debug("Permission request aborted", {
+				narratorId,
+				toolCallId,
+				toolUseId,
+				toolName,
+			});
 			cleanup();
 			broadcastToNarrator(narratorId, {
 				type: "permission_resolved",
 				narratorId,
-				requestId,
+				requestId: toolCallId,
+				toolUseId,
 			});
-			await db
-				.update(permissionRequests)
-				.set({ decision: "deny", decidedBy: "aborted", decidedAt: new Date().toISOString() })
-				.where(eq(permissionRequests.id, requestId));
-			// Restore tool call status
 			await db
 				.update(narratorToolCalls)
-				.set({ status: "running" })
-				.where(eq(narratorToolCalls.toolUseId, toolUseId));
-			broadcastToNarrator(narratorId, {
-				type: "tool_completed",
-				narratorId,
-				toolUseId,
-				status: "running",
-			});
+				.set({
+					status: "fail",
+					errorMessage: "Session aborted",
+					permissionDecidedBy: "aborted",
+					permissionDecidedAt: new Date().toISOString(),
+				})
+				.where(eq(narratorToolCalls.id, toolCallId));
 			resolve({ behavior: "deny", message: "Session aborted" });
 		};
 
 		signal.addEventListener("abort", onAbort, { once: true });
 
-		pendingPermissions.set(requestId, {
+		pendingPermissions.set(toolCallId, {
 			resolve,
 			cleanup,
 			input,
@@ -260,31 +344,30 @@ export async function resolvePermission(
 ): Promise<void> {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
-		logger.warn("Permission resolution for unknown request", { requestId });
+		logger.warn("Permission resolution for unknown request", {
+			requestId,
+			decision,
+			pendingKeys: [...pendingPermissions.keys()],
+		});
 		return;
 	}
 
+	logger.debug("Resolving permission", {
+		requestId,
+		decision,
+		narratorId: pending.narratorId,
+		toolUseId: pending.toolUseId,
+	});
+
 	// Clean up timeout + abort listener to prevent stale handlers from firing
 	pending.cleanup();
-
-	// Restore tool call status from "pending" back to "running"
-	await db
-		.update(narratorToolCalls)
-		.set({ status: "running" })
-		.where(eq(narratorToolCalls.toolUseId, pending.toolUseId));
 
 	// Broadcast to all subscribers so other tabs can clear the permission banner
 	broadcastToNarrator(pending.narratorId, {
 		type: "permission_resolved",
 		narratorId: pending.narratorId,
 		requestId,
-	});
-	// Broadcast tool call status restoration
-	broadcastToNarrator(pending.narratorId, {
-		type: "tool_completed",
-		narratorId: pending.narratorId,
 		toolUseId: pending.toolUseId,
-		status: "running",
 	});
 
 	try {
@@ -292,9 +375,17 @@ export async function resolvePermission(
 		const now = new Date().toISOString();
 		const effectiveDenyMessage = denyMessage || feedbackText?.trim() || undefined;
 		await db
-			.update(permissionRequests)
-			.set({ decision, decidedBy: "user", decidedAt: now, denyMessage: effectiveDenyMessage })
-			.where(eq(permissionRequests.id, requestId));
+			.update(narratorToolCalls)
+			.set({
+				status: decision === "allow" ? "running" : "fail",
+				permissionDecidedBy: "user",
+				permissionDecidedAt: now,
+				permissionDenyMessage: effectiveDenyMessage ?? null,
+				...(decision === "deny"
+					? { errorMessage: effectiveDenyMessage || "Permission denied by user" }
+					: {}),
+			})
+			.where(eq(narratorToolCalls.id, requestId));
 	} catch (err) {
 		logger.error("Failed to update permission state in DB, resolving anyway", {
 			requestId,
@@ -317,10 +408,6 @@ export async function resolvePermission(
 					.update(narratorToolCalls)
 					.set({ inputJson: updatedInput })
 					.where(eq(narratorToolCalls.toolUseId, pending.toolUseId));
-				await db
-					.update(permissionRequests)
-					.set({ inputJson: updatedInput })
-					.where(eq(permissionRequests.id, requestId));
 			} catch (err) {
 				logger.error("Failed to persist AskUserQuestion answers", {
 					requestId,
@@ -362,6 +449,63 @@ async function ensureSession(
 	}
 }
 
+/**
+ * Build the effective system prompt dynamically.
+ * Reads AGENT.md (fallback CLAUDE.md) from disk each time so changes are picked up mid-session.
+ */
+async function buildSystemPrompt(
+	narrator: { systemPrompt: string | null; contextSummary: string | null },
+	cwd: string,
+	locale: Locale,
+	replyInUserLanguage: boolean,
+): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
+	let prompt = narrator.systemPrompt;
+	let usedCompactSummary = false;
+
+	// Inject compact summary if available
+	if (narrator.contextSummary) {
+		usedCompactSummary = true;
+		const base = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}## Conversation Context\n\n${narrator.contextSummary}`;
+	}
+
+	// Inject current working directory
+	{
+		const base = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\``;
+	}
+
+	// Inject AGENT.md (fallback to CLAUDE.md) if present in the working directory
+	{
+		let agentMdContent: string | null = null;
+		for (const filename of ["AGENT.md", "CLAUDE.md"]) {
+			try {
+				agentMdContent = await readFile(join(cwd, filename), "utf-8");
+				break;
+			} catch {
+				// file not found, try next
+			}
+		}
+		if (agentMdContent) {
+			const base = prompt ?? "";
+			const sep = base ? "\n\n" : "";
+			prompt = `${base}${sep}## Project Instructions\n\n${agentMdContent}`;
+		}
+	}
+
+	// Append language instruction
+	if (replyInUserLanguage) {
+		const instruction = getReplyLanguageInstruction(locale);
+		const base = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}## Language\n\n${instruction}`;
+	}
+
+	return { prompt, usedCompactSummary };
+}
+
 async function createSession(
 	narratorId: string,
 	locale: Locale,
@@ -388,41 +532,32 @@ async function createSession(
 		sessionCwd = narrator.cwd || process.env.HOME || "/tmp";
 	}
 
-	// Build system prompt
-	let effectiveSystemPrompt = narrator.systemPrompt;
-
-	// Inject compact summary if available
-	let usedCompactSummary = false;
-	if (narrator.contextSummary) {
-		usedCompactSummary = true;
-		const base = effectiveSystemPrompt ?? "";
-		const sep = base ? "\n\n" : "";
-		effectiveSystemPrompt = `${base}${sep}## Conversation Context\n\n${narrator.contextSummary}`;
-	}
-
-	// Append language instruction
-	if (replyInUserLanguage) {
-		const instruction = getReplyLanguageInstruction(locale);
-		const base = effectiveSystemPrompt ?? "";
-		const sep = base ? "\n\n" : "";
-		effectiveSystemPrompt = `${base}${sep}## Language\n\n${instruction}`;
-	}
+	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
+		narrator,
+		sessionCwd,
+		locale,
+		replyInUserLanguage,
+	);
 
 	const abortController = new AbortController();
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
+
+	const sessionModel = narrator.model ?? settings.agent.defaultModel;
 
 	const session: ActiveSession = {
 		abortController,
 		narratorId,
 		conversationId: narrator.claudeSessionId ?? randomUUID(),
 		cwd: sessionCwd,
-		model: narrator.model ?? settings.agent.defaultModel,
+		model: sessionModel,
+		provider: resolveProvider(sessionModel),
 		systemPrompt: effectiveSystemPrompt,
 		events,
 		alive: true,
 		locale,
 		_usedCompactSummary: usedCompactSummary,
+		_replyInUserLanguage: replyInUserLanguage,
 	};
 
 	activeSessions.set(narratorId, session);
@@ -431,7 +566,8 @@ async function createSession(
 
 // === Agent loop execution ===
 
-const COMPACT_HISTORY_THRESHOLD = 80;
+/** Trigger compact when context usage exceeds this percentage (0–100). */
+const COMPACT_CONTEXT_USAGE_PCT = 80;
 
 /**
  * Build AgentConfig, start agentLoop(), and consume events.
@@ -446,33 +582,44 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 
 	try {
 		while (session.alive) {
-			const dbMessages = await narratorService.getMessages(narratorId, 200);
-			const { history, trailingToolResults } = buildHistory(dbMessages, session.model);
+			// Always use getMessagesSinceLastCompact: if no compact marker exists it
+			// returns all messages; after a compact it only returns post-compact messages
+			// (old context is already in the summary injected via system prompt).
+			const dbMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+			const { history, trailingToolResults } = buildHistory(
+				dbMessages,
+				session.model,
+				session.provider,
+			);
 
-			// Compact if history is too long
-			if (history.length > COMPACT_HISTORY_THRESHOLD) {
-				await runCustomCompact(narratorId, locale);
-				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-				// Reload session with summary in system prompt (use DB base to avoid cumulative append)
-				const fresh = await narratorService.getById(narratorId);
-				if (fresh.contextSummary) {
-					const base = fresh.systemPrompt ?? "";
-					const sep = base ? "\n\n" : "";
-					session.systemPrompt = `${base}${sep}## Conversation Context\n\n${fresh.contextSummary}`;
-					session._usedCompactSummary = true;
-				}
-				history.length = 0;
-			}
+			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
+			const freshNarrator = await narratorService.getById(narratorId);
+			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
+				freshNarrator,
+				session.cwd,
+				locale,
+				session._replyInUserLanguage ?? false,
+			);
+			session.systemPrompt = freshSystemPrompt;
+			session._usedCompactSummary = usedCompactSummary;
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
 				conversationId: session.conversationId,
 				model: session.model,
+				provider: session.provider,
 				cwd: session.cwd,
 				systemPrompt: session.systemPrompt ?? undefined,
 				signal: session.abortController.signal,
 				permissionHandler: (toolName, input, toolUseId) =>
-					handlePermission(narratorId, session.abortController.signal, toolName, input, toolUseId),
+					handlePermission(
+						narratorId,
+						session.abortController.signal,
+						toolName,
+						input,
+						toolUseId,
+						session.cwd,
+					),
 			};
 
 			// Run one agent loop pass
@@ -492,6 +639,22 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 			// Agent loop done — update status
 			await narratorService.updateStats(narratorId, 0);
 			await narratorService.updateStatus(narratorId, "idle");
+
+			// Compact if context usage is high (checked after a complete turn)
+			if (
+				session._lastContextUsagePct != null &&
+				session._lastContextUsagePct >= COMPACT_CONTEXT_USAGE_PCT
+			) {
+				logger.info("Context usage high, triggering compact", {
+					narratorId,
+					contextUsagePct: session._lastContextUsagePct,
+				});
+				await runCustomCompact(narratorId, locale);
+				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+				// System prompt will be rebuilt at the top of the next loop iteration
+				// via buildSystemPrompt(), which reads fresh contextSummary from DB.
+				session._lastContextUsagePct = undefined;
+			}
 
 			// Check for chained feedback
 			const fb = pendingFeedback.get(narratorId);
@@ -561,10 +724,32 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
  * Run custom compact: generate a summary from DB messages and store it.
  * Clears claudeSessionId so the next session starts fresh with the summary.
  */
-async function runCustomCompact(narratorId: string, locale: Locale): Promise<void> {
-	logger.info("Starting custom compact", { narratorId });
+export async function runCustomCompact(
+	narratorId: string,
+	locale: Locale,
+	beforeMessageId?: string,
+): Promise<void> {
+	logger.info("Starting custom compact", { narratorId, beforeMessageId });
 
-	const summary = await narratorContext.generateCompactSummary(narratorId, locale);
+	// Fetch messages to compact
+	const messages = beforeMessageId
+		? await narratorService.getMessagesBefore(narratorId, beforeMessageId)
+		: undefined;
+
+	if (beforeMessageId && (!messages || messages.length === 0)) {
+		logger.info("No messages to compact before target", { narratorId, beforeMessageId });
+		return;
+	}
+
+	// Insert a "compacting" marker so the frontend shows a loading indicator
+	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
+	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
+
+	const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+		narratorId,
+		locale,
+		messages,
+	);
 
 	const now = new Date().toISOString();
 	await db
@@ -576,7 +761,15 @@ async function runCustomCompact(narratorId: string, locale: Locale): Promise<voi
 		})
 		.where(eq(narrators.id, narratorId));
 
-	await narratorService.persistCompactMessage(narratorId, summary);
+	// Finalize the compacting marker into the final compacted message (with full summary)
+	const compactedMsg = await narratorService.finalizeCompactingMessage(
+		narratorId,
+		summary,
+		contextPercent,
+	);
+	if (compactedMsg) {
+		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactedMsg });
+	}
 	await narratorService.updateStatus(narratorId, "idle");
 
 	logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
@@ -640,6 +833,23 @@ async function processAgentEvent(
 
 	switch (event.type) {
 		case "stream_text": {
+			// the entire assistant turn is just the placeholder dot.
+					return null;
+				}
+				// Subsequent chunk arrived — flush the buffered dot first
+					const flushDelta = { type: "text_delta" as const, text: buffered };
+					broadcastToNarrator(narratorId, {
+						type: "stream_event",
+						narratorId,
+						event: { type: "content_block_delta", delta: flushDelta },
+					});
+					session.events.emit("event", {
+						type: "stream_event",
+						data: { type: "content_block_delta", delta: flushDelta },
+					});
+				}
+			}
+
 			broadcastToNarrator(narratorId, {
 				type: "stream_event",
 				narratorId,
@@ -672,7 +882,7 @@ async function processAgentEvent(
 		case "assistant_message": {
 			// Build SDK-compatible message for persistAssistantMessage
 			const content: any[] = [];
-			if (event.text) content.push({ type: "text", text: event.text });
+			// The model sometimes echoes it back — filter it out to avoid polluting the DB.
 			for (const tu of event.toolUses) {
 				content.push({ type: "tool_use", id: tu.toolUseId, name: tu.name, input: tu.input });
 			}
@@ -681,6 +891,9 @@ async function processAgentEvent(
 				uuid: event.messageId ?? randomUUID(),
 				session_id: session.conversationId,
 				message: { content },
+				contextPercent: session._lastContextUsagePct,
+				meterUsage: session._lastMeterUsage,
+				meterUnit: session._lastMeterUnit,
 			});
 
 			// TodoWrite / EnterPlanMode tracking
@@ -706,18 +919,19 @@ async function processAgentEvent(
 
 			const fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, saved.id),
-				with: { toolCalls: { with: { permissionRequests: true } } },
+				with: { toolCalls: true },
 			});
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: fullMessage });
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 
-			// Clear compact summary after first response
+			// Clear compact summary from DB after first response so it won't be
+			// re-injected if the session is recreated.
 			if (session._usedCompactSummary) {
-				session._usedCompactSummary = false;
 				await db
 					.update(narrators)
 					.set({ contextSummary: null, updatedAt: new Date().toISOString() })
 					.where(eq(narrators.id, narratorId));
+				session._usedCompactSummary = false;
 			}
 
 			session.events.emit("event", { type: "assistant_message", data: saved });
@@ -735,7 +949,7 @@ async function processAgentEvent(
 		}
 
 		case "tool_result": {
-			const status = event.isError ? "failed" : "completed";
+			const status = event.isError ? "fail" : "success";
 			try {
 				await narratorService.updateToolCallResult(event.toolUseId, {
 					output: event.output,
@@ -775,6 +989,7 @@ async function processAgentEvent(
 			// Abort is not a real error — treat as interruption
 			if (event.message === "Aborted") {
 				logger.info("Agent loop aborted (interrupted)", { narratorId });
+				await cleanupOrphanedToolCalls(narratorId, session.locale);
 				await narratorService.updateStatus(narratorId, "idle");
 				session.events.emit("event", {
 					type: "interrupted",
@@ -808,6 +1023,7 @@ async function processAgentEvent(
 		}
 
 		case "context_usage": {
+			session._lastContextUsagePct = event.percentage;
 			broadcastToNarrator(narratorId, {
 				type: "context_usage",
 				narratorId,
@@ -816,6 +1032,19 @@ async function processAgentEvent(
 			session.events.emit("event", {
 				type: "context_usage",
 				data: { percentage: event.percentage },
+			});
+			return null;
+		}
+
+		case "metering": {
+			session._lastMeterUsage = event.usage;
+			session._lastMeterUnit = event.unit;
+			broadcastToNarrator(narratorId, {
+				type: "metering",
+				narratorId,
+				unit: event.unit,
+				unitPlural: event.unitPlural,
+				usage: event.usage,
 			});
 			return null;
 		}
@@ -846,8 +1075,30 @@ async function processAgentEvent(
 // === Public API ===
 
 /**
+ * Send a message to a narrator session (fire-and-forget).
+ * Persists the user message, broadcasts it via WS, kicks off the agent loop
+ * in the background, and returns the persisted user message.
+ * All streaming events are delivered exclusively via WebSocket.
+ */
+export async function sendMessage(
+	narratorId: string,
+	prompt: string,
+	images?: ImageRef[],
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<typeof narratorMessages.$inferSelect> {
+	const { userMsg } = await feedMessage(narratorId, prompt, images, locale, replyInUserLanguage);
+	broadcastToNarrator(narratorId, {
+		type: "user_message",
+		narratorId,
+		message: userMsg,
+	});
+	return userMsg;
+}
+
+/**
  * Start or feed a message into a session.
- * Yields SessionEvent objects for SSE consumption.
+ * Yields SessionEvent objects for consumption (used by chapter-merge).
  */
 export async function* startSession(
 	narratorId: string,
@@ -923,10 +1174,44 @@ export async function* startSession(
 
 // === Session control ===
 
+/**
+ * Mark any in-flight tool calls for this narrator as failed.
+ * Without this, an interrupt leaves orphaned tool call records in
+ * "initializing" / "pending" / "running" state, which breaks the
+ */
+async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en"): Promise<void> {
+	const staleStatuses = ["initializing", "pending", "running"] as const;
+	const cleaned = await db
+		.update(narratorToolCalls)
+		.set({
+			status: "fail",
+			errorMessage: "Session interrupted by user",
+			outputJson: getToolMessage("interruptedByUser", locale),
+		})
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				inArray(narratorToolCalls.status, [...staleStatuses]),
+			),
+		)
+		.returning({ id: narratorToolCalls.id });
+	if (cleaned.length > 0) {
+		logger.info("Orphaned tool calls cleaned up after interrupt", {
+			narratorId,
+			count: cleaned.length,
+		});
+	}
+}
+
 export function interruptSession(narratorId: string): boolean {
 	const session = activeSessions.get(narratorId);
 	if (!session) return false;
 	session.abortController.abort();
+	// Fire-and-forget: clean up any in-flight tool calls so the
+	// conversation history stays consistent for the next query.
+	cleanupOrphanedToolCalls(narratorId, session.locale).catch((err) => {
+		logger.error("Failed to clean up orphaned tool calls", { narratorId, error: String(err) });
+	});
 	logger.info("Narrator session interrupted", { narratorId });
 	return true;
 }
@@ -937,6 +1222,12 @@ export function closeSession(narratorId: string): void {
 	if (!session) return;
 	session.alive = false;
 	session.abortController.abort();
+	cleanupOrphanedToolCalls(narratorId, session.locale).catch((err) => {
+		logger.error("Failed to clean up orphaned tool calls on close", {
+			narratorId,
+			error: String(err),
+		});
+	});
 	logger.info("Narrator session closed", { narratorId });
 }
 
@@ -950,6 +1241,7 @@ export function updateSessionModel(narratorId: string, model: string): void {
 	const session = activeSessions.get(narratorId);
 	if (session?.alive) {
 		session.model = model;
+		session.provider = resolveProvider(model);
 	}
 }
 
@@ -1003,15 +1295,20 @@ export async function recoverOnStartup(): Promise<void> {
 		}
 	}
 
-	const stalePermissions = await db.query.permissionRequests.findMany({
-		where: eq(permissionRequests.decision, "pending"),
+	const stalePermissions = await db.query.narratorToolCalls.findMany({
+		where: eq(narratorToolCalls.status, "pending"),
 	});
 	if (stalePermissions.length > 0) {
 		await db
-			.update(permissionRequests)
-			.set({ decision: "deny", decidedBy: "server_restart", decidedAt: now })
-			.where(eq(permissionRequests.decision, "pending"));
-		logger.info("Stale permission requests auto-denied on startup", {
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: "Interrupted by server restart",
+				permissionDecidedBy: "server_restart",
+				permissionDecidedAt: now,
+			})
+			.where(eq(narratorToolCalls.status, "pending"));
+		logger.info("Stale pending tool calls auto-denied on startup", {
 			count: stalePermissions.length,
 		});
 	}
@@ -1022,24 +1319,32 @@ export async function recoverOnStartup(): Promise<void> {
 	if (staleToolCalls.length > 0) {
 		await db
 			.update(narratorToolCalls)
-			.set({ status: "failed", errorMessage: "Interrupted by server restart" })
+			.set({
+				status: "fail",
+				errorMessage: "Interrupted by server restart",
+				outputJson: getToolMessage("interruptedByServerRestart"),
+			})
 			.where(eq(narratorToolCalls.status, "running"));
 		logger.info("Stale running tool calls marked as failed on startup", {
 			count: staleToolCalls.length,
 		});
 	}
 
-	// Also recover tool calls stuck in "pending" (permission was never resolved)
-	const stalePendingToolCalls = await db.query.narratorToolCalls.findMany({
-		where: eq(narratorToolCalls.status, "pending"),
+	// Also recover tool calls stuck in "initializing" (permission check never started)
+	const staleInitializing = await db.query.narratorToolCalls.findMany({
+		where: eq(narratorToolCalls.status, "initializing"),
 	});
-	if (stalePendingToolCalls.length > 0) {
+	if (staleInitializing.length > 0) {
 		await db
 			.update(narratorToolCalls)
-			.set({ status: "failed", errorMessage: "Interrupted by server restart" })
-			.where(eq(narratorToolCalls.status, "pending"));
-		logger.info("Stale pending tool calls marked as failed on startup", {
-			count: stalePendingToolCalls.length,
+			.set({
+				status: "fail",
+				errorMessage: "Interrupted by server restart",
+				outputJson: getToolMessage("interruptedByServerRestart"),
+			})
+			.where(eq(narratorToolCalls.status, "initializing"));
+		logger.info("Stale initializing tool calls marked as failed on startup", {
+			count: staleInitializing.length,
 		});
 	}
 }

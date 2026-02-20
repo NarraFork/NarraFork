@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 export interface ModelOption {
 	value: string;
 	label: string;
+	provider?: string;
 }
 
 export interface NarraForkSettings {
@@ -16,6 +17,7 @@ export interface NarraForkSettings {
 		defaultPermissionMode: string;
 		summaryModel: string;
 		customModels: ModelOption[];
+		hiddenModels: string[];
 		extendedContext: boolean;
 	};
 	chapters: {
@@ -40,6 +42,11 @@ export interface NarraForkSettings {
 		configPath: string;
 		defaultModel?: string;
 	};
+	openai?: {
+		apiKey: string;
+		baseUrl: string;
+		defaultModel: string;
+	};
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -50,6 +57,7 @@ const DEFAULTS: NarraForkSettings = {
 		defaultPermissionMode: "default",
 		summaryModel: "claude-haiku",
 		customModels: [],
+		hiddenModels: [],
 		extendedContext: false,
 	},
 	chapters: {
@@ -111,9 +119,19 @@ export function loadSettings(): NarraForkSettings {
 	return merged;
 }
 
-export function saveSettings(settings: NarraForkSettings): void {
+/** Internal mutable holder — `settings` re-exports its properties via the proxy-like sync in saveSettings. */
+const _cache: { current: NarraForkSettings | null } = { current: null };
+
+export function saveSettings(newSettings: NarraForkSettings): void {
 	mkdirSync(narraforkDir, { recursive: true });
-	writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
+	// Sync in-memory cache so all modules see the updated values immediately
+	if (_cache.current) {
+		for (const key of Object.keys(newSettings) as Array<keyof NarraForkSettings>) {
+			(_cache.current as any)[key] = newSettings[key];
+		}
+	}
 }
 
-export const settings = loadSettings();
+export const settings: NarraForkSettings = loadSettings();
+_cache.current = settings;

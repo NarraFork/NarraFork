@@ -1,12 +1,6 @@
 import { and, eq, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-	permissionRequests,
-} from "../db/schema";
+import { chapters, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -163,10 +157,119 @@ export const narratorService = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		return db.query.narratorMessages.findMany({
 			where: eq(narratorMessages.narratorId, narratorId),
-			with: { toolCalls: { with: { permissionRequests: true } } },
+			with: { toolCalls: true },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 			limit,
 			offset,
+		});
+	},
+
+	/**
+	 * Fetch all messages after the most recent compact marker.
+	 * If no compact marker exists, returns all messages.
+	 * Used by generateCompactSummary to avoid re-summarizing already-compacted history.
+	 */
+	async getMessagesSinceLastCompact(narratorId: string) {
+		// Find the most recent compact marker
+		const lastCompact = await db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.narratorId, narratorId), eq(narratorMessages.role, "system")),
+			orderBy: (m, { desc }) => [desc(m.createdAt)],
+		});
+
+		// Check if it's actually a finalized compact marker (ignore "compacting" —
+		// that marker is inserted *before* summary generation, so including it
+		// would cause getMessagesSinceLastCompact to return nothing).
+		const isCompactMarker =
+			lastCompact &&
+			Array.isArray(lastCompact.contentJson) &&
+			(lastCompact.contentJson as any[]).some(
+				(b: any) => b.type === "compact" && b.status === "compacted",
+			);
+
+		const conditions = [eq(narratorMessages.narratorId, narratorId)];
+		if (isCompactMarker && lastCompact) {
+			conditions.push(
+				or(
+					sql`${narratorMessages.createdAt} > ${lastCompact.createdAt}`,
+					and(
+						eq(narratorMessages.createdAt, lastCompact.createdAt),
+						sql`${narratorMessages.id} > ${lastCompact.id}`,
+					),
+				)!,
+			);
+		}
+
+		return db.query.narratorMessages.findMany({
+			where: and(...conditions),
+			with: { toolCalls: true },
+			orderBy: (m, { asc }) => [asc(m.createdAt)],
+		});
+	},
+
+	/**
+	 * Fetch messages between the last compact marker and a given message (exclusive).
+	 * Used for partial compact — compress only messages before the target.
+	 */
+	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
+		const target = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.id, beforeMessageId),
+				eq(narratorMessages.narratorId, narratorId),
+			),
+		});
+		if (!target) throw new NotFoundError("Message", beforeMessageId);
+
+		// Find the most recent finalized compact marker before the target
+		const lastCompact = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "system"),
+				or(
+					sql`${narratorMessages.createdAt} < ${target.createdAt}`,
+					and(
+						eq(narratorMessages.createdAt, target.createdAt),
+						sql`${narratorMessages.id} < ${target.id}`,
+					),
+				),
+			),
+			orderBy: (m, { desc }) => [desc(m.createdAt)],
+		});
+
+		const isCompactMarker =
+			lastCompact &&
+			Array.isArray(lastCompact.contentJson) &&
+			(lastCompact.contentJson as any[]).some(
+				(b: any) => b.type === "compact" && b.status === "compacted",
+			);
+
+		const conditions = [
+			eq(narratorMessages.narratorId, narratorId),
+			// Before target message
+			or(
+				sql`${narratorMessages.createdAt} < ${target.createdAt}`,
+				and(
+					eq(narratorMessages.createdAt, target.createdAt),
+					sql`${narratorMessages.id} < ${target.id}`,
+				),
+			)!,
+		];
+
+		if (isCompactMarker && lastCompact) {
+			conditions.push(
+				or(
+					sql`${narratorMessages.createdAt} > ${lastCompact.createdAt}`,
+					and(
+						eq(narratorMessages.createdAt, lastCompact.createdAt),
+						sql`${narratorMessages.id} > ${lastCompact.id}`,
+					),
+				)!,
+			);
+		}
+
+		return db.query.narratorMessages.findMany({
+			where: and(...conditions),
+			with: { toolCalls: true },
+			orderBy: (m, { asc }) => [asc(m.createdAt)],
 		});
 	},
 
@@ -221,7 +324,7 @@ export const narratorService = {
 		}
 		const topRows = await db.query.narratorMessages.findMany({
 			where: and(...topConditions),
-			with: { toolCalls: { with: { permissionRequests: true } } },
+			with: { toolCalls: true },
 			orderBy: (m, { desc }) => [desc(m.createdAt)],
 			limit: limit + 1,
 		});
@@ -243,7 +346,7 @@ export const narratorService = {
 							eq(narratorMessages.narratorId, narratorId),
 							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
 						),
-						with: { toolCalls: { with: { permissionRequests: true } } },
+						with: { toolCalls: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -298,7 +401,7 @@ export const narratorService = {
 				isNull(narratorMessages.parentToolUseId),
 				lt(narratorMessages.createdAt, anchorTs),
 			),
-			with: { toolCalls: { with: { permissionRequests: true } } },
+			with: { toolCalls: true },
 			orderBy: (m, { desc }) => [desc(m.createdAt)],
 			limit: contextSize + 1,
 		});
@@ -313,7 +416,7 @@ export const narratorService = {
 				isNull(narratorMessages.parentToolUseId),
 				gte(narratorMessages.createdAt, anchorTs),
 			),
-			with: { toolCalls: { with: { permissionRequests: true } } },
+			with: { toolCalls: true },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 		});
 
@@ -331,7 +434,7 @@ export const narratorService = {
 							eq(narratorMessages.narratorId, narratorId),
 							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
 						),
-						with: { toolCalls: { with: { permissionRequests: true } } },
+						with: { toolCalls: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -356,19 +459,96 @@ export const narratorService = {
 		return tc;
 	},
 
-	async getPendingPermissions(narratorId: string) {
-		const perms = await db.query.permissionRequests.findMany({
+	/** Extract the full compact summary from a compact system message. */
+	async getCompactSummary(narratorId: string, messageId: string): Promise<string> {
+		const msg = await db.query.narratorMessages.findFirst({
 			where: and(
-				eq(permissionRequests.narratorId, narratorId),
-				eq(permissionRequests.decision, "pending"),
+				eq(narratorMessages.id, messageId),
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "system"),
 			),
-			with: { toolCall: { columns: { toolUseId: true } } },
-			orderBy: (p, { asc }) => [asc(p.createdAt)],
 		});
-		return perms.map((perm) => ({
-			...perm,
-			toolUseId: perm.toolCall?.toolUseId ?? null,
-			toolCall: undefined,
+		if (!msg) throw new NotFoundError("Message", messageId);
+
+		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
+		if (!compactBlock?.summary) {
+			throw new NotFoundError("CompactSummary", messageId);
+		}
+		return compactBlock.summary;
+	},
+
+	/** Delete a compact message and clear the narrator's contextSummary. */
+	async deleteCompactMessage(narratorId: string, messageId: string) {
+		const msg = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.id, messageId),
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "system"),
+			),
+		});
+		if (!msg) throw new NotFoundError("Message", messageId);
+
+		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		const isCompact = blocks.some((b: any) => b.type === "compact");
+		if (!isCompact) throw new ValidationError("Message is not a compact message");
+
+		await db.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+
+		// Clear contextSummary and claudeSessionId so the next session rebuilds from full history
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ contextSummary: null, claudeSessionId: null, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
+	/** Update the summary text of a compact message and sync to narrator's contextSummary. */
+	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
+		const msg = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.id, messageId),
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "system"),
+			),
+		});
+		if (!msg) throw new NotFoundError("Message", messageId);
+
+		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		const isCompact = blocks.some((b: any) => b.type === "compact" && b.status === "compacted");
+		if (!isCompact) throw new ValidationError("Message is not a compacted message");
+
+		await db
+			.update(narratorMessages)
+			.set({
+				contentJson: [{ type: "compact", status: "compacted", summary }],
+				contentText: `[Compact] ${summary.slice(0, 200)}...`,
+			})
+			.where(eq(narratorMessages.id, messageId));
+
+		// Sync to narrator's contextSummary
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ contextSummary: summary, claudeSessionId: null, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
+	async getPendingPermissions(narratorId: string) {
+		const tcs = await db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "pending"),
+			),
+			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
+		});
+		return tcs.map((tc) => ({
+			id: tc.id,
+			toolName: tc.toolName,
+			toolUseId: tc.toolUseId,
+			inputJson: tc.inputJson,
+			decisionReason: tc.permissionDecisionReason,
+			suggestions: tc.permissionSuggestions,
 		}));
 	},
 
@@ -389,9 +569,25 @@ export const narratorService = {
 		return msg;
 	},
 
-	async persistCompactingMessage(narratorId: string) {
+	async persistCompactingMessage(narratorId: string, beforeMessageId?: string) {
 		const id = generateId();
-		const now = new Date().toISOString();
+		let createdAt: string;
+
+		if (beforeMessageId) {
+			// Insert just before the target message
+			const target = await db.query.narratorMessages.findFirst({
+				where: and(
+					eq(narratorMessages.id, beforeMessageId),
+					eq(narratorMessages.narratorId, narratorId),
+				),
+			});
+			if (!target) throw new NotFoundError("Message", beforeMessageId);
+			// Use a timestamp 1ms before the target
+			createdAt = new Date(new Date(target.createdAt).getTime() - 1).toISOString();
+		} else {
+			createdAt = new Date().toISOString();
+		}
+
 		const [msg] = await db
 			.insert(narratorMessages)
 			.values({
@@ -400,31 +596,14 @@ export const narratorService = {
 				role: "system",
 				contentJson: [{ type: "compact", status: "compacting" }],
 				contentText: "[Compacting]",
-				createdAt: now,
+				createdAt,
 			})
 			.returning();
 		return msg;
 	},
 
-	async persistCompactMessage(narratorId: string, summary: string) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "system",
-				contentJson: [{ type: "compact", status: "compacted" }],
-				contentText: `[Compact] ${summary.slice(0, 200)}...`,
-				createdAt: now,
-			})
-			.returning();
-		return msg;
-	},
-
-	/** Update the most recent "compacting" system message to "compacted" status. */
-	async finalizeCompactingMessage(narratorId: string) {
+	/** Update the most recent "compacting" system message to "compacted" with the full summary. */
+	async finalizeCompactingMessage(narratorId: string, summary: string, contextPercent?: number) {
 		const msg = await db.query.narratorMessages.findFirst({
 			where: and(
 				eq(narratorMessages.narratorId, narratorId),
@@ -437,8 +616,9 @@ export const narratorService = {
 		const [updated] = await db
 			.update(narratorMessages)
 			.set({
-				contentJson: [{ type: "compact", status: "compacted" }],
-				contentText: "[Compacted]",
+				contentJson: [{ type: "compact", status: "compacted", summary }],
+				contentText: `[Compact] ${summary.slice(0, 200)}...`,
+				contextPercent: contextPercent ?? null,
 			})
 			.where(eq(narratorMessages.id, msg.id))
 			.returning();
@@ -452,6 +632,9 @@ export const narratorService = {
 			session_id: string;
 			parent_tool_use_id?: string | null;
 			message: { content: any[]; usage?: any };
+			contextPercent?: number;
+			meterUsage?: number;
+			meterUnit?: string;
 		},
 	) {
 		const id = generateId();
@@ -476,6 +659,9 @@ export const narratorService = {
 				contentJson: content,
 				contentText: contentText || null,
 				tokensIn: usage?.input_tokens,
+				contextPercent: sdkMessage.contextPercent ?? null,
+				meterUsage: sdkMessage.meterUsage ?? null,
+				meterUnit: sdkMessage.meterUnit ?? null,
 				createdAt: now,
 			})
 			.returning();
@@ -490,7 +676,7 @@ export const narratorService = {
 				toolUseId: block.id,
 				toolName: block.name,
 				inputJson: block.input,
-				status: "running",
+				status: "initializing",
 				createdAt: now,
 			});
 		}
@@ -587,7 +773,7 @@ export const narratorService = {
 		toolUseId: string,
 		result: {
 			output?: any;
-			status: "completed" | "failed";
+			status: "success" | "fail";
 			errorMessage?: string;
 			durationMs?: number;
 		},
@@ -606,7 +792,6 @@ export const narratorService = {
 	async remove(narratorId: string) {
 		// Delete in dependency order within a transaction
 		await db.transaction(async (tx) => {
-			await tx.delete(permissionRequests).where(eq(permissionRequests.narratorId, narratorId));
 			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
 			await tx.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
 			await tx.delete(narrators).where(eq(narrators.id, narratorId));

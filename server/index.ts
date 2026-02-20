@@ -79,6 +79,7 @@ logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
 			configPath:
 		});
 		});
+		}
 	} catch (err) {
 	}
 }

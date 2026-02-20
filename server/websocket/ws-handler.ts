@@ -28,7 +28,6 @@ export function resolveWSData(url: URL): WSData | null {
 export const wsHandlers = {
 	open(ws: ServerWebSocket<WSData>) {
 		const { channel } = ws.data;
-		logger.debug("WebSocket connected", { channel });
 
 		if (channel === "narrator") {
 			handleNarratorWS.open(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
@@ -65,7 +64,6 @@ export const wsHandlers = {
 
 	close(ws: ServerWebSocket<WSData>, code: number, reason: string) {
 		const { channel } = ws.data;
-		logger.debug("WebSocket disconnected", { channel, code, reason });
 
 		if (channel === "narrator") {
 			handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);

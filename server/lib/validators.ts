@@ -183,6 +183,16 @@ export const adminUpdateSettingsSchema = z.object({
 	registrationOpen: z.boolean(),
 });
 
+export const adminUpdateUserSchema = z.object({
+	username: z
+		.string()
+		.min(3)
+		.max(50)
+		.regex(/^[a-zA-Z0-9_-]+$/, "Alphanumeric, hyphens, underscores only")
+		.optional(),
+	password: z.string().min(8).max(128).optional(),
+});
+
 // === Narrator title ===
 
 export const updateNarratorTitleSchema = z.object({
@@ -224,6 +234,8 @@ export const updateUserPreferencesSchema = z.object({
 	wordWrapDiff: z.boolean().optional(),
 	replyInUserLanguage: z.boolean().optional(),
 	showTokenUsage: z.boolean().optional(),
+	showSessionCost: z.boolean().optional(),
+	showMessageCost: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 });

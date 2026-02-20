@@ -48,9 +48,7 @@ async function getToken(): Promise<string> {
 function queryPending(): { id: string; narrator_id: string; tool_name: string }[] {
 	const sqlite = new Database(dbPath, { readonly: true });
 	const rows = sqlite
-		.prepare(
-			"SELECT id, narrator_id, tool_name FROM permission_requests WHERE decision = 'pending'",
-		)
+		.prepare("SELECT id, narrator_id, tool_name FROM narrator_tool_calls WHERE status = 'pending'")
 		.all() as { id: string; narrator_id: string; tool_name: string }[];
 	sqlite.close();
 	return rows;

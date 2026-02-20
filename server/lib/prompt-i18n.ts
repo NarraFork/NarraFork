@@ -3,7 +3,7 @@ import { db } from "../db";
 import { userPreferences } from "../db/schema";
 
 export type Locale = "en" | "zh-CN";
-export type PromptKey = "title" | "quickTitle" | "summary" | "compact" | "conflictResolution";
+export type PromptKey = "title" | "quickTitle" | "compact" | "compactSuffix" | "conflictResolution";
 
 const prompts: Record<PromptKey, Record<Locale, string>> = {
 	title: {
@@ -26,28 +26,6 @@ const prompts: Record<PromptKey, Record<Locale, string>> = {
 <user_message>
 `,
 	},
-	summary: {
-		en: `You are a context summarizer. Analyze the conversation history below and produce a concise summary focusing on:
-1. Key decisions made
-2. Current state of the code/project
-3. Outstanding TODOs and next steps
-4. Important context that a new session would need
-
-Always respond in English. Be concise but thorough.
-
-Conversation history:
-`,
-		"zh-CN": `你是一个上下文总结器。分析以下对话历史，生成一个简洁的总结，重点关注：
-1. 已做出的关键决策
-2. 代码/项目的当前状态
-3. 待办事项和下一步计划
-4. 新会话需要了解的重要上下文
-
-使用简体中文回复。简洁但全面。
-
-对话历史：
-`,
-	},
 	compact: {
 		en: `You are a conversation compactor. Create a comprehensive summary to replace the full conversation history. The AI assistant will use ONLY this summary to continue working — preserve ALL information needed.
 
@@ -61,8 +39,6 @@ Include:
 7. Current working state and directory context
 
 Be thorough but concise. This summary replaces the entire conversation.
-
-Conversation:
 `,
 		"zh-CN": `你是一个对话压缩器。创建一个全面的摘要来替代完整的对话历史。AI 助手将仅使用此摘要继续工作——必须保留所有必要信息。
 
@@ -76,9 +52,11 @@ Conversation:
 7. 当前工作状态和目录上下文
 
 全面但简洁。此摘要将替代整个对话历史。
-
-对话：
 `,
+	},
+	compactSuffix: {
+		en: `Now produce ONLY the summary. Do not continue the conversation. Do not generate code. Output the summary directly.`,
+		"zh-CN": `请仅输出摘要。不要继续对话。不要生成代码。直接输出摘要。`,
 	},
 	conflictResolution: {
 		en: `A git merge from branch "{sourceBranch}" into "{targetBranch}" has produced conflicts in the following files:
@@ -145,4 +123,23 @@ const languageInstructions: Record<Locale, string> = {
  */
 export function getReplyLanguageInstruction(locale: Locale): string {
 	return languageInstructions[locale] ?? languageInstructions.en;
+}
+
+// --- Tool-result messages (shown to the model, not the user) ---
+
+const toolMessages = {
+	interruptedByUser: {
+		en: "The user interrupted this tool call before it could execute.",
+		"zh-CN": "用户在此工具调用执行前中断了会话。",
+	},
+	interruptedByServerRestart: {
+		en: "Tool execution was interrupted by a server restart.",
+		"zh-CN": "工具执行因服务器重启而中断。",
+	},
+} satisfies Record<string, Record<Locale, string>>;
+
+export type ToolMessageKey = keyof typeof toolMessages;
+
+export function getToolMessage(key: ToolMessageKey, locale: Locale = "en"): string {
+	return toolMessages[key][locale] ?? toolMessages[key].en;
 }
