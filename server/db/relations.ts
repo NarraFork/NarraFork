@@ -5,7 +5,6 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
-	permissionRequests,
 	portAllocations,
 	projects,
 	terminals,
@@ -43,7 +42,6 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	}),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
-	permissionRequests: many(permissionRequests),
 	terminals: many(terminals),
 }));
 
@@ -55,7 +53,7 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 	toolCalls: many(narratorToolCalls),
 }));
 
-export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one, many }) => ({
+export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one }) => ({
 	narrator: one(narrators, {
 		fields: [narratorToolCalls.narratorId],
 		references: [narrators.id],
@@ -63,18 +61,6 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one, m
 	message: one(narratorMessages, {
 		fields: [narratorToolCalls.messageId],
 		references: [narratorMessages.id],
-	}),
-	permissionRequests: many(permissionRequests),
-}));
-
-export const permissionRequestsRelations = relations(permissionRequests, ({ one }) => ({
-	narrator: one(narrators, {
-		fields: [permissionRequests.narratorId],
-		references: [narrators.id],
-	}),
-	toolCall: one(narratorToolCalls, {
-		fields: [permissionRequests.toolCallId],
-		references: [narratorToolCalls.id],
 	}),
 }));
 

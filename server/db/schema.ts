@@ -108,6 +108,9 @@ export const narratorMessages = sqliteTable(
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
 		turnUsageJson: text("turn_usage_json", { mode: "json" }),
+		contextPercent: real("context_percent"),
+		meterUsage: real("meter_usage"),
+		meterUnit: text("meter_unit"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -133,39 +136,23 @@ export const narratorToolCalls = sqliteTable(
 		inputJson: text("input_json", { mode: "json" }),
 		outputJson: text("output_json", { mode: "json" }),
 		status: text("status", {
-			enum: ["pending", "approved", "denied", "running", "completed", "failed"],
+			enum: ["initializing", "pending", "running", "success", "fail"],
 		})
 			.notNull()
-			.default("pending"),
+			.default("initializing"),
 		durationMs: integer("duration_ms"),
 		errorMessage: text("error_message"),
+		permissionDecidedBy: text("permission_decided_by"),
+		permissionDecidedAt: text("permission_decided_at"),
+		permissionDenyMessage: text("permission_deny_message"),
+		permissionDecisionReason: text("permission_decision_reason"),
+		permissionSuggestions: text("permission_suggestions", { mode: "json" }),
 		createdAt: text("created_at").notNull(),
 	},
-	(table) => [index("idx_toolcalls_message").on(table.messageId)],
-);
-
-// === permission_requests ===
-export const permissionRequests = sqliteTable(
-	"permission_requests",
-	{
-		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.references(() => narrators.id),
-		toolCallId: text("tool_call_id").references(() => narratorToolCalls.id),
-		toolName: text("tool_name").notNull(),
-		inputJson: text("input_json", { mode: "json" }),
-		decisionReason: text("decision_reason"),
-		suggestions: text("suggestions", { mode: "json" }),
-		decision: text("decision", { enum: ["pending", "allow", "deny"] })
-			.notNull()
-			.default("pending"),
-		decidedBy: text("decided_by"),
-		denyMessage: text("deny_message"),
-		createdAt: text("created_at").notNull(),
-		decidedAt: text("decided_at"),
-	},
-	(table) => [index("idx_permissions_narrator").on(table.narratorId, table.decision)],
+	(table) => [
+		index("idx_toolcalls_message").on(table.messageId),
+		index("idx_toolcalls_status").on(table.narratorId, table.status),
+	],
 );
 
 // === terminals ===
@@ -275,6 +262,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(false),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
+	showSessionCost: integer("show_session_cost", { mode: "boolean" }).notNull().default(false),
+	showMessageCost: integer("show_message_cost", { mode: "boolean" }).notNull().default(false),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	createdAt: text("created_at").notNull(),
