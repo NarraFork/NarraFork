@@ -28,6 +28,8 @@ export interface ToolDefinition {
 	description: string;
 	parameters: z.ZodType;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
+	/** If provided, tool is only included when this returns true */
+	isAvailable?: () => boolean;
 }
 
 // === Permission ===
@@ -60,6 +62,7 @@ export type AgentEvent =
 	| { type: "error"; message: string }
 	| { type: "stream_reasoning"; text: string }
 	| { type: "context_usage"; percentage: number }
+	| { type: "metering"; unit: string; unitPlural: string; usage: number }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "done" };
 
@@ -75,6 +78,7 @@ export interface AgentConfig {
 	narratorId: string;
 	conversationId: string;
 	model: string;
+	provider: string;
 	cwd: string;
 	systemPrompt?: string;
 	signal: AbortSignal;

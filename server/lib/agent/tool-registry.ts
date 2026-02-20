@@ -2,7 +2,7 @@ import { z } from "zod/v4";
 import type { ToolDefinition } from "./types";
 
 /**
- * Registry for agent tools. Converts Zod schemas to JSON Schema
+ * Registry for agent tools.
  */
 export class ToolRegistry {
 	private tools = new Map<string, ToolDefinition>();
@@ -18,29 +18,26 @@ export class ToolRegistry {
 	all(): ToolDefinition[] {
 		return [...this.tools.values()];
 	}
-
-		return this.all().map((tool) => ({
-				name: tool.name,
-				description: tool.description,
-				inputSchema: { json: zodToJsonSchema(tool.parameters) },
-			},
-		}));
-	}
 }
 
 // === Minimal Zod → JSON Schema converter ===
 
-function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
+export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
 	return convertNode(schema);
 }
 
 function convertNode(schema: z.ZodType): Record<string, unknown> {
-	// Unwrap optionals and defaults
+	// Unwrap optionals and defaults, preserving description from wrapper
 	if (schema instanceof z.ZodOptional) {
-		return convertNode(schema.unwrap());
+		const inner = convertNode(schema.unwrap());
+		const desc = (schema as any).description;
+		if (desc && !inner.description) inner.description = desc;
+		return inner;
 	}
 	if (schema instanceof z.ZodDefault) {
 		const inner = convertNode(schema.removeDefault());
+		const desc = (schema as any).description;
+		if (desc && !inner.description) inner.description = desc;
 		return { ...inner, default: schema._zod.def.defaultValue };
 	}
 
@@ -74,7 +71,8 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 	}
 
 	// Propagate description from any schema type
-	const desc = schema._zod?.def?.description;
+	// Zod v4 stores .describe() on the schema instance directly, not in _zod.def
+	const desc = (schema as any).description ?? schema._zod?.def?.description;
 	if (desc) result.description = desc;
 
 	return result;

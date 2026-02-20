@@ -1,4 +1,4 @@
-import { resolveModel } from "./resolve-model";
+import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type { AgentConfig, AgentEvent, AgentToolUse, ToolContext } from "./types";
@@ -7,32 +7,28 @@ const DEFAULT_MAX_TURNS = 50;
 const PROGRESS_INTERVAL_MS = 5_000;
 
 /**
+ * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
  */
 export async function* agentLoop(
 	config: AgentConfig,
 	userText: string,
+	history: unknown[],
+	initialToolResults?: unknown[],
 ): AsyncGenerator<AgentEvent> {
-
+	const provider = getProvider(config.provider);
 	const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
+	const allTools = toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable());
+	const tools = provider.formatTools(allTools);
+	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 
 	// Shallow-copy to avoid mutating the caller's array
 	history = [...history];
 
+	// Inject system prompt via provider-specific mechanism
 	if (config.systemPrompt) {
-		const modelId = resolveModel(config.model);
-		history.unshift(
-			{
-					content: config.systemPrompt,
-					modelId,
-				},
-			},
-			{
-					content: "I will follow these instructions.",
-				},
-			},
-		);
+		provider.injectSystemPrompt(history, config.systemPrompt, config.model);
 	}
 
 	while (turnIndex < maxTurns) {
@@ -41,48 +37,58 @@ export async function* agentLoop(
 			return;
 		}
 
-		// Build the request for this turn
 		const isFirstTurn = turnIndex === 0;
 		const content = isFirstTurn ? userText : ".";
-		const request = buildRequest(config, content, history, tools, pendingToolResults);
 
+		// Call provider and collect the response
 		let assistantText = "";
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
-
 		// Accumulator for streaming tool use events (input arrives in chunks)
 		const toolUseAccum = new Map<string, { name: string; inputChunks: string[] }>();
 
 		try {
-				const parsed = parseStreamEvent(evt);
+			const stream = provider.chat({
+				conversationId: config.conversationId,
+				content,
+				model: config.model,
+				cwd: config.cwd,
+				history,
+				tools,
+				toolResults: pendingToolResults,
+				signal: config.signal,
+			});
+
+			for await (const parsed of stream) {
 				if (parsed.text) {
 					assistantText += parsed.text;
 					yield { type: "stream_text", text: parsed.text };
 				}
 				if (parsed.toolUses) toolUses.push(...parsed.toolUses);
 
-					const id = evt.data.toolUseId as string | undefined;
-					const name = evt.data.name as string | undefined;
+				// Handle streaming tool use chunks
+				if (parsed.toolUseChunk) {
+					const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
 					if (id) {
 						if (!toolUseAccum.has(id) && name) {
 							toolUseAccum.set(id, { name, inputChunks: [] });
 						}
 						const acc = toolUseAccum.get(id);
 						if (acc) {
-							if (typeof evt.data.input === "string") {
-								acc.inputChunks.push(evt.data.input);
+							if (typeof input === "string") {
+								acc.inputChunks.push(input);
 							}
-							if (evt.data.stop) {
+							if (stop) {
 								const raw = acc.inputChunks.join("");
-								let input: Record<string, unknown> = {};
+								let parsedInput: Record<string, unknown> = {};
 								if (raw) {
 									try {
-										input = JSON.parse(raw);
+										parsedInput = JSON.parse(raw);
 									} catch {
-										input = { _raw: raw };
+										parsedInput = { _raw: raw };
 									}
 								}
-								toolUses.push({ toolUseId: id, name: acc.name, input });
+								toolUses.push({ toolUseId: id, name: acc.name, input: parsedInput });
 								toolUseAccum.delete(id);
 							}
 						}
@@ -96,6 +102,14 @@ export async function* agentLoop(
 				if (parsed.contextUsagePercentage != null) {
 					yield { type: "context_usage", percentage: parsed.contextUsagePercentage };
 				}
+				if (parsed.metering) {
+					yield {
+						type: "metering",
+						unit: parsed.metering.unit,
+						unitPlural: parsed.metering.unitPlural,
+						usage: parsed.metering.usage,
+					};
+				}
 				if (parsed.invalidState) {
 					yield {
 						type: "invalid_state",
@@ -105,7 +119,6 @@ export async function* agentLoop(
 				}
 			}
 		} catch (err) {
-			// Abort signal → clean exit, not an error
 			if (config.signal.aborted) {
 				yield { type: "error", message: "Aborted" };
 				return;
@@ -129,21 +142,13 @@ export async function* agentLoop(
 			return;
 		}
 
-		// Push the currentMessage into history for the next turn.
+		// Push the current user turn into history for the next turn.
 		// This must happen AFTER the API call (not before), because
-		// buildRequest references the history array directly.
+		// chat() references the history array directly.
 		if (isFirstTurn) {
-			history.push({
-					content: userText,
-					modelId: resolveModel(config.model),
-				},
-			});
+			provider.pushUserTurn(history, userText, config.model, initialToolResults ?? []);
 		} else if (pendingToolResults.length > 0) {
-			history.push({
-					content: ".",
-					modelId: resolveModel(config.model),
-				},
-			});
+			provider.pushUserTurn(history, ".", config.model, pendingToolResults);
 		}
 
 		// Execute each tool call
@@ -163,12 +168,9 @@ export async function* agentLoop(
 
 			const result = await executeTool(tu, config);
 
-			pendingToolResults.push({
-				toolUseId: tu.toolUseId,
-				content: [{ text: result.output }],
-				status: result.isError ? "error" : "success",
-				isError: result.isError,
-			});
+			pendingToolResults.push(
+				provider.formatToolResult(tu.toolUseId, result.output, result.isError ?? false),
+			);
 
 			yield {
 				type: "tool_result",
@@ -180,23 +182,8 @@ export async function* agentLoop(
 			};
 		}
 
-		// Append assistant message to history for next turn.
-		// Tool results stay in pendingToolResults and are sent via
-		// (history ends with assistant; currentMessage is the next user turn)
-		const historyToolUses =
-			toolUses.length > 0
-				? toolUses.map((tu) => ({
-						toolUseId: tu.toolUseId,
-						name: tu.name,
-						input: tu.input,
-					}))
-				: undefined;
-
-		history.push({
-				content: assistantText || ".",
-				...(historyToolUses ? { toolUses: historyToolUses } : {}),
-			},
-		});
+		// Append assistant message to history for next turn
+		provider.pushAssistantTurn(history, assistantText, toolUses);
 
 		yield { type: "turn_complete", turnIndex };
 		turnIndex++;
@@ -206,105 +193,6 @@ export async function* agentLoop(
 }
 
 // === Internal helpers ===
-
-function buildRequest(
-	config: AgentConfig,
-	content: string,
-	return {
-			conversationId: config.conversationId,
-			history: history.length > 0 ? history : undefined,
-			currentMessage: {
-					content,
-					modelId: resolveModel(config.model),
-						tools,
-						...(toolResults.length > 0 ? { toolResults } : {}),
-					},
-				},
-			},
-			envState: {
-				operatingSystem:
-					process.platform === "win32"
-						? "WINDOWS"
-						: process.platform === "darwin"
-							? "MAC"
-							: "LINUX",
-				currentWorkingDirectory: config.cwd,
-			},
-			shellState: {
-				shellName: process.env.SHELL?.split("/").pop() ?? "bash",
-			},
-		},
-	};
-}
-
-interface ParsedEvent {
-	text?: string;
-	toolUses?: AgentToolUse[];
-	messageId?: string;
-	reasoning?: string;
-	contextUsagePercentage?: number;
-	invalidState?: { reason: string; message: string };
-}
-
-function parseStreamEvent(evt: StreamEvent): ParsedEvent {
-	const result: ParsedEvent = {};
-
-		if (evt.data.content != null) {
-			result.text = String(evt.data.content);
-		}
-		if (evt.data.messageId) {
-			result.messageId = String(evt.data.messageId);
-		}
-	}
-
-		const toolUse = evt.data.toolUse as
-			| { toolUseId: string; name: string; input: Record<string, unknown> }
-			| undefined;
-		if (toolUse?.toolUseId) {
-			result.toolUses = [
-				{
-					toolUseId: toolUse.toolUseId,
-					name: toolUse.name,
-					input: toolUse.input ?? {},
-				},
-			];
-		}
-
-		// Array of tool uses
-		const toolUses = evt.data.toolUses as
-			| Array<{ toolUseId: string; name: string; input: Record<string, unknown> }>
-			| undefined;
-		if (Array.isArray(toolUses) && toolUses.length > 0) {
-			result.toolUses = toolUses.map((tu) => ({
-				toolUseId: tu.toolUseId,
-				name: tu.name,
-				input: tu.input ?? {},
-			}));
-		}
-	}
-
-	if (evt.eventType === "reasoningContentEvent") {
-		const content = evt.data.content ?? evt.data.text;
-		if (content != null) {
-			result.reasoning = String(content);
-		}
-	}
-
-	if (evt.eventType === "contextUsageEvent") {
-		const pct = evt.data.contextUsagePercentage ?? evt.data.context_usage_percentage;
-		if (pct != null) {
-			result.contextUsagePercentage = Number(pct);
-		}
-	}
-
-		result.invalidState = {
-			reason: String(evt.data.reason ?? "unknown"),
-			message: String(evt.data.message ?? evt.data.content ?? "Invalid state"),
-		};
-	}
-
-	return result;
-}
 
 interface ToolExecResult {
 	output: string;
@@ -327,8 +215,11 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	// Permission check
 	const permission = await config.permissionHandler(tu.name, tu.input, tu.toolUseId);
 	if (permission.behavior === "deny") {
+		const userMessage = permission.message
+			? `The user rejected this tool call with the following message: ${permission.message}`
+			: "The user rejected this tool call.";
 		return {
-			output: permission.message ?? "Permission denied",
+			output: userMessage,
 			isError: true,
 			durationMs: Date.now() - start,
 		};
