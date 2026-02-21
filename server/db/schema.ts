@@ -52,6 +52,32 @@ export const chapters = sqliteTable(
 	],
 );
 
+// === conversation_branches ===
+export const conversationBranches = sqliteTable(
+	"conversation_branches",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id),
+		name: text("name").notNull(),
+		forkMessageId: text("fork_message_id"),
+		parentBranchId: text("parent_branch_id").references((): any => conversationBranches.id),
+		claudeSessionId: text("claude_session_id"),
+		contextSummary: text("context_summary"),
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		messageCount: integer("message_count").default(0),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_branches_narrator").on(table.narratorId),
+		index("idx_branches_parent").on(table.parentBranchId),
+	],
+);
+
 // === narrators ===
 export const narrators = sqliteTable(
 	"narrators",
@@ -59,6 +85,7 @@ export const narrators = sqliteTable(
 		id: text("id").primaryKey(),
 		chapterId: text("chapter_id").references(() => chapters.id),
 		claudeSessionId: text("claude_session_id"),
+		activeBranchId: text("active_branch_id"),
 		type: text("type", { enum: ["primary", "secondary"] })
 			.notNull()
 			.default("primary"),
@@ -117,6 +144,27 @@ export const narratorMessages = sqliteTable(
 		index("idx_messages_narrator").on(table.narratorId, table.createdAt),
 		index("idx_messages_parent_tool_use").on(table.narratorId, table.parentToolUseId),
 		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
+	],
+);
+
+// === branch_messages (junction table) ===
+export const branchMessages = sqliteTable(
+	"branch_messages",
+	{
+		id: text("id").primaryKey(),
+		branchId: text("branch_id")
+			.notNull()
+			.references(() => conversationBranches.id),
+		messageId: text("message_id")
+			.notNull()
+			.references(() => narratorMessages.id),
+		seq: integer("seq").notNull(),
+		isCompact: integer("is_compact").notNull().default(0),
+	},
+	(table) => [
+		uniqueIndex("idx_branch_messages_unique").on(table.branchId, table.messageId),
+		index("idx_branch_messages_seq").on(table.branchId, table.seq),
+		index("idx_branch_messages_message").on(table.messageId),
 	],
 );
 
@@ -260,7 +308,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 	wordWrapDiff: integer("word_wrap_diff", { mode: "boolean" }).notNull().default(true),
 	replyInUserLanguage: integer("reply_in_user_language", { mode: "boolean" })
 		.notNull()
-		.default(false),
+		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	showSessionCost: integer("show_session_cost", { mode: "boolean" }).notNull().default(false),
 	showMessageCost: integer("show_message_cost", { mode: "boolean" }).notNull().default(false),

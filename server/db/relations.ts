@@ -1,7 +1,9 @@
 import { relations } from "drizzle-orm";
 import {
+	branchMessages,
 	chapters,
 	containerInstances,
+	conversationBranches,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
@@ -40,9 +42,32 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 		references: [narrators.id],
 		relationName: "narratorParent",
 	}),
+	activeBranch: one(conversationBranches, {
+		fields: [narrators.activeBranchId],
+		references: [conversationBranches.id],
+	}),
+	branches: many(conversationBranches),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
 	terminals: many(terminals),
+}));
+
+export const conversationBranchesRelations = relations(conversationBranches, ({ one, many }) => ({
+	narrator: one(narrators, {
+		fields: [conversationBranches.narratorId],
+		references: [narrators.id],
+	}),
+	parentBranch: one(conversationBranches, {
+		fields: [conversationBranches.parentBranchId],
+		references: [conversationBranches.id],
+		relationName: "branchParent",
+	}),
+	childBranches: many(conversationBranches, { relationName: "branchParent" }),
+	forkMessage: one(narratorMessages, {
+		fields: [conversationBranches.forkMessageId],
+		references: [narratorMessages.id],
+	}),
+	branchMessages: many(branchMessages),
 }));
 
 export const narratorMessagesRelations = relations(narratorMessages, ({ one, many }) => ({
@@ -50,7 +75,19 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 		fields: [narratorMessages.narratorId],
 		references: [narrators.id],
 	}),
+	branchMessages: many(branchMessages),
 	toolCalls: many(narratorToolCalls),
+}));
+
+export const branchMessagesRelations = relations(branchMessages, ({ one }) => ({
+	branch: one(conversationBranches, {
+		fields: [branchMessages.branchId],
+		references: [conversationBranches.id],
+	}),
+	message: one(narratorMessages, {
+		fields: [branchMessages.messageId],
+		references: [narratorMessages.id],
+	}),
 }));
 
 export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one }) => ({
