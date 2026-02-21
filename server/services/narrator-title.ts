@@ -1,4 +1,4 @@
-import { agentGenerate } from "../lib/agent";
+import { agentGenerateWithHistory } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
@@ -66,9 +66,11 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 	});
 
 	const TITLE_TIMEOUT_MS = 30_000;
-	const titlePromise = agentGenerate(
-		`${titlePrompt}${conversationText}\n</conversation>`,
+	const titlePromise = agentGenerateWithHistory(
+		titlePrompt.replace(/<conversation>\s*$/, "").trim(),
+		`<conversation>\n${conversationText}\n</conversation>`,
 		settings.agent.summaryModel,
+		locale,
 	);
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -88,6 +90,10 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 
 	// Clean up: remove surrounding quotes if present
 	title = title.trim().replace(/^["'""]+|["'""]+$/g, "");
+	// Guard: if model returned something too long, it's not a valid title
+	if (title.length > 80) {
+		title = title.slice(0, 50);
+	}
 	logger.info("Title generation completed", { narratorId, title });
 	return title || "New conversation";
 }
@@ -104,7 +110,6 @@ export async function generateQuickTitle(
 	try {
 		const truncated = userMessage.length > 500 ? `${userMessage.slice(0, 500)}...` : userMessage;
 		const titlePrompt = getPrompt("quickTitle", locale);
-		const prompt = `${titlePrompt}${truncated}\n</user_message>`;
 
 		logger.info("Quick title generation starting", {
 			narratorId,
@@ -113,7 +118,12 @@ export async function generateQuickTitle(
 		});
 
 		const TITLE_TIMEOUT_MS = 30_000;
-		const titlePromise = agentGenerate(prompt, settings.agent.summaryModel);
+		const titlePromise = agentGenerateWithHistory(
+			titlePrompt.replace(/<user_message>\s*$/, "").trim(),
+			`<user_message>\n${truncated}\n</user_message>`,
+			settings.agent.summaryModel,
+			locale,
+		);
 
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 		const timeoutPromise = new Promise<never>((_, reject) => {
@@ -131,6 +141,9 @@ export async function generateQuickTitle(
 		}
 
 		title = title.trim().replace(/^["'""]+|["'""]+$/g, "");
+		if (title.length > 80) {
+			title = title.slice(0, 50);
+		}
 		title = title || "New conversation";
 
 		await persistTitle(narratorId, title);

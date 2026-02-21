@@ -4,7 +4,13 @@ import { readFile } from "node:fs/promises";
 import { join, normalize, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { chapters, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import {
+	chapters,
+	conversationBranches,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../db/schema";
 import { type AgentEvent, agentLoop, buildHistory, type PermissionResult } from "../lib/agent";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -13,6 +19,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { getReplyLanguageInstruction, getToolMessage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
+import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorContext } from "./narrator-context";
 import { narratorService } from "./narrator-service";
@@ -495,8 +502,8 @@ async function buildSystemPrompt(
 		}
 	}
 
-	// Append language instruction
-	if (replyInUserLanguage) {
+	// Append language instruction (always inject unless locale is English)
+	if (replyInUserLanguage || locale !== "en") {
 		const instruction = getReplyLanguageInstruction(locale);
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
@@ -519,6 +526,19 @@ async function createSession(
 
 	const narrator = await narratorService.getById(narratorId);
 
+	// Resolve branch-level session state
+	let effectiveSessionId = narrator.claudeSessionId;
+	let effectiveContextSummary = narrator.contextSummary;
+	if (narrator.activeBranchId) {
+		const branch = await db.query.conversationBranches.findFirst({
+			where: eq(conversationBranches.id, narrator.activeBranchId),
+		});
+		if (branch) {
+			effectiveSessionId = branch.claudeSessionId ?? null;
+			effectiveContextSummary = branch.contextSummary ?? null;
+		}
+	}
+
 	// Resolve CWD
 	let sessionCwd: string;
 	if (narrator.chapterId) {
@@ -533,7 +553,7 @@ async function createSession(
 	}
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
-		narrator,
+		{ systemPrompt: narrator.systemPrompt, contextSummary: effectiveContextSummary },
 		sessionCwd,
 		locale,
 		replyInUserLanguage,
@@ -548,7 +568,7 @@ async function createSession(
 	const session: ActiveSession = {
 		abortController,
 		narratorId,
-		conversationId: narrator.claudeSessionId ?? randomUUID(),
+		conversationId: effectiveSessionId ?? randomUUID(),
 		cwd: sessionCwd,
 		model: sessionModel,
 		provider: resolveProvider(sessionModel),
@@ -574,11 +594,16 @@ const COMPACT_CONTEXT_USAGE_PCT = 80;
  * Runs in the background — kicked off by feedMessage().
  * Handles chained messages (feedback/buffered) by looping.
  */
-async function runAgentLoop(session: ActiveSession, text: string): Promise<void> {
+async function runAgentLoop(
+	session: ActiveSession,
+	text: string,
+	images?: ImageRef[],
+): Promise<void> {
 	const { narratorId, locale } = session;
 	let shouldUpdateTitle = false;
 	let titleTracked = false;
 	let currentText = text;
+	let currentImages = images;
 
 	try {
 		while (session.alive) {
@@ -586,16 +611,27 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
 			const dbMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
-			const { history, trailingToolResults } = buildHistory(
+			const { history, trailingToolResults } = await buildHistory(
 				dbMessages,
 				session.model,
 				session.provider,
+				narratorId,
 			);
 
 			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
 			const freshNarrator = await narratorService.getById(narratorId);
+			// Use branch-level context summary if on a branch
+			let freshContextSummary = freshNarrator.contextSummary;
+			if (freshNarrator.activeBranchId) {
+				const branch = await db.query.conversationBranches.findFirst({
+					where: eq(conversationBranches.id, freshNarrator.activeBranchId),
+				});
+				if (branch) {
+					freshContextSummary = branch.contextSummary ?? null;
+				}
+			}
 			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
-				freshNarrator,
+				{ systemPrompt: freshNarrator.systemPrompt, contextSummary: freshContextSummary },
 				session.cwd,
 				locale,
 				session._replyInUserLanguage ?? false,
@@ -610,6 +646,7 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 				provider: session.provider,
 				cwd: session.cwd,
 				systemPrompt: session.systemPrompt ?? undefined,
+				locale,
 				signal: session.abortController.signal,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
@@ -622,8 +659,42 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 					),
 			};
 
+			// Convert images to base64 for the agent loop (first iteration only)
+			let loopImages: Array<{ format: string; base64: string }> | undefined;
+			if (currentImages?.length) {
+				const resolved: Array<{ format: string; base64: string }> = [];
+				for (const img of currentImages) {
+					const filePath = getImagePath(narratorId, img.imageId);
+					if (filePath) {
+						try {
+							const b64 = await imageToBase64(filePath);
+							const mimeToFormat: Record<string, string> = {
+								"image/png": "png",
+								"image/jpeg": "jpeg",
+								"image/gif": "gif",
+								"image/webp": "webp",
+							};
+							resolved.push({
+								format: mimeToFormat[img.mediaType] ?? "png",
+								base64: b64,
+							});
+						} catch {
+							// Image file may have been deleted — skip silently
+						}
+					}
+				}
+				if (resolved.length > 0) loopImages = resolved;
+				currentImages = undefined; // only attach images on the first iteration
+			}
+
 			// Run one agent loop pass
-			for await (const event of agentLoop(config, currentText, history, trailingToolResults)) {
+			for await (const event of agentLoop(
+				config,
+				currentText,
+				history,
+				trailingToolResults,
+				loopImages,
+			)) {
 				if (!session.alive) break;
 
 				const mapped = await processAgentEvent(session, event, {
@@ -680,13 +751,31 @@ async function runAgentLoop(session: ActiveSession, text: string): Promise<void>
 				});
 				if (finalNarrator?.status !== "error") {
 					broadcastToNarrator(narratorId, { type: "buffer_cleared", narratorId, reason: "sent" });
-					const userMsg = await narratorService.persistUserMessage(narratorId, buffered.text, [
-						{ type: "text", text: buffered.text },
-					]);
+					const persistBlocks: Array<
+						| { type: "text"; text: string }
+						| { type: "image"; imageId: string; filename: string; mediaType: string }
+					> = [];
+					if (buffered.images?.length) {
+						for (const img of buffered.images) {
+							persistBlocks.push({
+								type: "image",
+								imageId: img.imageId,
+								filename: img.filename,
+								mediaType: img.mediaType,
+							});
+						}
+					}
+					persistBlocks.push({ type: "text", text: buffered.text });
+					const userMsg = await narratorService.persistUserMessage(
+						narratorId,
+						buffered.text,
+						persistBlocks,
+					);
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 					session.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "thinking");
 					currentText = buffered.text;
+					currentImages = buffered.images;
 					continue;
 				}
 				broadcastToNarrator(narratorId, {
@@ -752,14 +841,28 @@ export async function runCustomCompact(
 	);
 
 	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({
-			contextSummary: summary,
-			claudeSessionId: null,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, narratorId));
+
+	// Determine whether to store summary on branch or narrator
+	const narrator = await narratorService.getById(narratorId);
+	if (narrator.activeBranchId) {
+		await db
+			.update(conversationBranches)
+			.set({
+				contextSummary: summary,
+				claudeSessionId: null,
+				updatedAt: now,
+			})
+			.where(eq(conversationBranches.id, narrator.activeBranchId));
+	} else {
+		await db
+			.update(narrators)
+			.set({
+				contextSummary: summary,
+				claudeSessionId: null,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, narratorId));
+	}
 
 	// Finalize the compacting marker into the final compacted message (with full summary)
 	const compactedMsg = await narratorService.finalizeCompactingMessage(
@@ -815,7 +918,7 @@ async function feedMessage(
 	}
 
 	// Start agent loop in background
-	runAgentLoop(session, prompt).catch((err) => {
+	runAgentLoop(session, prompt, images).catch((err) => {
 		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
 	});
 
@@ -927,10 +1030,21 @@ async function processAgentEvent(
 			// Clear compact summary from DB after first response so it won't be
 			// re-injected if the session is recreated.
 			if (session._usedCompactSummary) {
-				await db
-					.update(narrators)
-					.set({ contextSummary: null, updatedAt: new Date().toISOString() })
-					.where(eq(narrators.id, narratorId));
+				const freshN = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { activeBranchId: true },
+				});
+				if (freshN?.activeBranchId) {
+					await db
+						.update(conversationBranches)
+						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+						.where(eq(conversationBranches.id, freshN.activeBranchId));
+				} else {
+					await db
+						.update(narrators)
+						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+						.where(eq(narrators.id, narratorId));
+				}
 				session._usedCompactSummary = false;
 			}
 

@@ -49,7 +49,7 @@ export const terminalViewService = {
 				userId,
 				chapterId: opts.chapterId ?? null,
 				narratorId: opts.narratorId ?? null,
-				layout: opts.layout ?? "single",
+				layout: (opts.layout ?? "single") as "single" | "split-h" | "split-v" | "triple" | "quad",
 				activeTabId: opts.activeTabId ?? null,
 				panelAssignments: opts.panelAssignments ?? null,
 				updatedAt: now,
