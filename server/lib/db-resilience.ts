@@ -123,7 +123,7 @@ export function recoverWithCli(dbPath: string): boolean {
 		}
 
 		// Step 2: Filter out FTS artifacts, ALL triggers, and virtual tables.
-		// All of these are recreated by db/index.ts on startup.
+		// All of these are recreated by db/fts.ts (ensureFts) on startup.
 		//
 		// Known limitations of this line-based filter:
 		// - Multi-line INSERT values (e.g. strings with embedded newlines) may be
@@ -133,7 +133,7 @@ export function recoverWithCli(dbPath: string): boolean {
 		// - Indented SQL heuristic (line 150) may false-positive on legitimate
 		//   indented statements, though .dump/.recover output is typically unindented.
 		// These edge cases are acceptable because all filtered objects (FTS tables,
-		// triggers) are recreated by db/index.ts on startup anyway.
+		// triggers) are recreated by db/fts.ts (ensureFts) on startup anyway.
 		const rawSql = readFileSync(sqlDumpPath, "utf-8");
 		const lines = rawSql.split("\n");
 		const filtered: string[] = [];
