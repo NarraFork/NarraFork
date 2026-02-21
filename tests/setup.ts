@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS narrators (
 	id TEXT PRIMARY KEY,
 	chapter_id TEXT REFERENCES chapters(id),
 	claude_session_id TEXT,
+	active_branch_id TEXT,
 	title TEXT,
 	type TEXT NOT NULL DEFAULT 'primary',
 	inherit_mode TEXT NOT NULL DEFAULT 'fresh',
@@ -77,6 +78,19 @@ CREATE TABLE IF NOT EXISTS narrators (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversation_branches (
+	id TEXT PRIMARY KEY,
+	narrator_id TEXT NOT NULL REFERENCES narrators(id),
+	name TEXT NOT NULL,
+	fork_message_id TEXT,
+	parent_branch_id TEXT REFERENCES conversation_branches(id),
+	claude_session_id TEXT,
+	context_summary TEXT,
+	status TEXT NOT NULL DEFAULT 'active',
+	message_count INTEGER DEFAULT 0,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS narrator_messages (
 	id TEXT PRIMARY KEY,
 	narrator_id TEXT NOT NULL REFERENCES narrators(id),
@@ -89,8 +103,21 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	tokens_out INTEGER,
 	cost_usd REAL,
 	turn_usage_json TEXT,
+	context_percent REAL,
+	meter_usage REAL,
+	meter_unit TEXT,
 	created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS branch_messages (
+	id TEXT PRIMARY KEY,
+	branch_id TEXT NOT NULL REFERENCES conversation_branches(id),
+	message_id TEXT NOT NULL REFERENCES narrator_messages(id),
+	seq INTEGER NOT NULL,
+	is_compact INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_branch_messages_unique ON branch_messages(branch_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_branch_messages_seq ON branch_messages(branch_id, seq);
+CREATE INDEX IF NOT EXISTS idx_branch_messages_message ON branch_messages(message_id);
 CREATE TABLE IF NOT EXISTS narrator_tool_calls (
 	id TEXT PRIMARY KEY,
 	narrator_id TEXT NOT NULL REFERENCES narrators(id),

@@ -85,9 +85,12 @@ chapters ──self── chapters (parentChapterId)
 chapters ──1:N──> container_instances
 chapters ──1:N──> port_allocations
 chapters ──1:N──> terminals
-narrators ──1:N── narrator_messages
-narrators ──1:N── narrator_tool_calls
-narrators ──1:N── permission_requests
+narrators ──1:N──> narrator_messages
+narrators ──1:N──> narrator_tool_calls
+narrators ──1:N──> conversation_branches
+narrators ──ref──> conversation_branches (activeBranchId)
+conversation_branches ──1:N──> branch_messages
+narrator_messages ──1:N──> branch_messages
 users ──1:1── user_preferences
 users ──1:N── user_favorite_directories
 ```
@@ -95,6 +98,7 @@ users ──1:N── user_favorite_directories
 > 注：`containerConfig` 以 JSON 字段存储在 `chapters` 表中，而非独立的 `container_configs` 表。
 > `users` 表用于 JWT 认证，与上述业务实体无直接关联。
 > 一个项目有且只有一个 Git 仓库，仓库信息直接存储在 `projects` 表中。
+> 权限审批直接在 `narrator_tool_calls` 表中处理（`permissionDecidedBy`/`permissionDecidedAt` 等字段），无独立的 `permission_requests` 表。
 
 ### 3.2 表定义
 
@@ -179,6 +183,7 @@ export const narrators = sqliteTable('narrators', {
 
   // Claude Agent SDK session 管理
   claudeSessionId: text('claude_session_id'),      // SDK 返回的 session_id，持久化用于 resume
+  activeBranchId: text('active_branch_id'),        // 当前活跃的对话分支 ID
   type: text('type', {
     enum: ['primary', 'secondary']
   }).notNull().default('primary'),
@@ -189,7 +194,7 @@ export const narrators = sqliteTable('narrators', {
   }).notNull().default('fresh'),
   parentNarratorId: text('parent_narrator_id')
     .references(() => narrators.id),
-  contextSummary: text('context_summary'),         // compressed 模式下的摘要
+  contextSummary: text('context_summary'),         // compressed 模式或 compact 摘要
 
   // 会话标题（自动生成或手动设置）
   title: text('title'),
@@ -213,9 +218,9 @@ export const narrators = sqliteTable('narrators', {
   totalCostUsd: real('total_cost_usd').default(0),
   lastMessageAt: text('last_message_at'),
 
-  // 状态：idle（空闲）、thinking（处理中）、waiting（等待权限审批）、done（完成待阅读）、archived（已归档）、error
+  // 状态：idle（空闲）、thinking（处理中）、waiting（等待权限审批）、done（完成待阅读）、archived（已归档）、error、interrupted（已中断）
   status: text('status', {
-    enum: ['idle', 'thinking', 'waiting', 'done', 'archived', 'error']
+    enum: ['idle', 'thinking', 'waiting', 'done', 'archived', 'error', 'interrupted']
   }).notNull().default('idle'),
   sdkPlanMode: integer('sdk_plan_mode', { mode: 'boolean' }).notNull().default(false),
   errorMessage: text('error_message'),
@@ -239,7 +244,7 @@ export const narratorMessages = sqliteTable('narrator_messages', {
   }).notNull(),
 
   // 存储完整的 BetaMessage.content 数组（包含 text、tool_use、thinking blocks）
-  // 这是展示 tool call 参数和结果的关键
+  // system 消息用于 compact 标记：[{type: "compact", status: "compacted", summary}]
   contentJson: text('content_json', { mode: 'json' }).notNull(),
 
   // 纯文本内容（用于搜索和预览）
@@ -248,15 +253,22 @@ export const narratorMessages = sqliteTable('narrator_messages', {
   // 子 agent 消息关联：指向父 tool_use_id，用于懒加载子 agent 消息树
   parentToolUseId: text('parent_tool_use_id'),
 
-  // Token 统计
+  // Token 统计与用量
   tokensIn: integer('tokens_in'),
-  tokensOut: integer('tokens_out'),
   costUsd: real('cost_usd'),
+  turnUsageJson: text('turn_usage_json', { mode: 'json' }),  // 完整的 turn 用量 JSON
+  contextPercent: real('context_percent'),                     // 上下文窗口使用百分比
+  meterUsage: real('meter_usage'),                             // 计量用量
+  meterUnit: text('meter_unit'),                               // 计量单位
 
   createdAt: text('created_at').notNull(),
-})
+}, (table) => [
+  index('idx_messages_narrator').on(table.narratorId, table.createdAt),
+  index('idx_messages_parent_tool_use').on(table.narratorId, table.parentToolUseId),
+  index('idx_messages_toplevel').on(table.narratorId, table.parentToolUseId, table.createdAt),
+])
 ```
-#### narrator_tool_calls — Tool Call 记录
+#### narrator_tool_calls — Tool Call 记录（含权限审批）
 
 ```typescript
 export const narratorToolCalls = sqliteTable('narrator_tool_calls', {
@@ -271,40 +283,70 @@ export const narratorToolCalls = sqliteTable('narrator_tool_calls', {
   inputJson: text('input_json', { mode: 'json' }), // tool call 参数
   outputJson: text('output_json', { mode: 'json' }),// tool call 结果
   status: text('status', {
-    enum: ['pending', 'approved', 'denied', 'running', 'completed', 'failed']
-  }).notNull().default('pending'),
+    enum: ['initializing', 'pending', 'running', 'success', 'fail']
+  }).notNull().default('initializing'),
   durationMs: integer('duration_ms'),
   errorMessage: text('error_message'),
 
+  // 权限审批（内联，无独立 permission_requests 表）
+  permissionDecidedBy: text('permission_decided_by'),       // 'user' | 'auto' | 'auto_timeout' | 'aborted' | 'server_restart'
+  permissionDecidedAt: text('permission_decided_at'),
+  permissionDenyMessage: text('permission_deny_message'),
+  permissionDecisionReason: text('permission_decision_reason'),
+  permissionSuggestions: text('permission_suggestions', { mode: 'json' }),  // PermissionUpdate[]
+
   createdAt: text('created_at').notNull(),
-})
+}, (table) => [
+  index('idx_toolcalls_message').on(table.messageId),
+  index('idx_toolcalls_status').on(table.narratorId, table.status),
+])
 ```
 
-#### permission_requests — 权限审批队列
+#### conversation_branches — 对话分支
+
+每个叙述者创建时自动生成一个 root 分支（name="main"）。用户可从任意消息 fork 新分支，fork 时复制父分支中 fork 点及之前的消息引用（共享前缀）。
 
 ```typescript
-export const permissionRequests = sqliteTable('permission_requests', {
+export const conversationBranches = sqliteTable('conversation_branches', {
   id: text('id').primaryKey(),
   narratorId: text('narrator_id').notNull()
     .references(() => narrators.id),
-  toolCallId: text('tool_call_id')
-    .references(() => narratorToolCalls.id),  // 可选，权限请求可不关联特定 tool call
-
-  toolName: text('tool_name').notNull(),
-  inputJson: text('input_json', { mode: 'json' }),
-  decisionReason: text('decision_reason'),         // SDK 提供的原因
-  suggestions: text('suggestions', { mode: 'json' }), // PermissionUpdate[]
-
-  // 审批结果
-  decision: text('decision', {
-    enum: ['pending', 'allow', 'deny']
-  }).notNull().default('pending'),
-  decidedBy: text('decided_by'),                   // 'user' | 'auto_rule'
-  denyMessage: text('deny_message'),
-
+  name: text('name').notNull(),                     // 分支名称，如 "main"、"Branch 2"
+  forkMessageId: text('fork_message_id'),           // fork 起点消息 ID（root 分支为 null）
+  parentBranchId: text('parent_branch_id')          // 父分支 ID（root 分支为 null）
+    .references(() => conversationBranches.id),
+  claudeSessionId: text('claude_session_id'),       // 分支独立的 SDK session ID
+  contextSummary: text('context_summary'),          // 分支级别的上下文摘要
+  status: text('status', {
+    enum: ['active', 'archived']
+  }).notNull().default('active'),
+  messageCount: integer('message_count').default(0),
   createdAt: text('created_at').notNull(),
-  decidedAt: text('decided_at'),
-})
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  index('idx_branches_narrator').on(table.narratorId),
+  index('idx_branches_parent').on(table.parentBranchId),
+])
+```
+
+#### branch_messages — 分支-消息关联表（junction table）
+
+消息与分支的多对多关系。同一条消息可属于多个分支（fork 时共享前缀）。`seq` 字段维护分支内的消息顺序，`isCompact` 标记压缩点位置。
+
+```typescript
+export const branchMessages = sqliteTable('branch_messages', {
+  id: text('id').primaryKey(),
+  branchId: text('branch_id').notNull()
+    .references(() => conversationBranches.id),
+  messageId: text('message_id').notNull()
+    .references(() => narratorMessages.id),
+  seq: integer('seq').notNull(),                    // 分支内排序序号
+  isCompact: integer('is_compact').notNull().default(0),  // 1 = compact 标记点
+}, (table) => [
+  uniqueIndex('idx_branch_messages_unique').on(table.branchId, table.messageId),
+  index('idx_branch_messages_seq').on(table.branchId, table.seq),
+  index('idx_branch_messages_message').on(table.messageId),
+])
 ```
 
 #### terminals — 终端实例
@@ -523,6 +565,32 @@ server/
 - 失败时逆序执行回滚，覆盖 DB + git + container 跨系统操作
 - Branch 命名规则：`chapter/{slug}-{nanoid(6)}`，如 `chapter/add-auth-x7k2m9`
 - 支持 `forkAtMessageUuid` 回溯分叉，记录在 `forkPoint.narratorMessageUuid`
+
+#### 4.2.1b narrator-service.ts — 叙述者生命周期与消息管理
+
+职责：叙述者 CRUD、消息持久化、对话分支管理、Compact 机制。
+
+核心功能：
+- `create()` — 创建叙述者，自动创建 root 对话分支（name="main"），设置 `activeBranchId`
+- `persistUserMessage()` / `persistAssistantMessage()` — 消息持久化，同时写入 `narrator_messages` 和 `branch_messages`（junction table），维护分支内 `seq` 排序
+- `getMessagesCursor()` — 基于 `branch_messages.seq` 的游标分页，查询当前活跃分支的顶层消息，再递归加载子 agent 消息树（通过 `parentToolUseId` 关联）
+- `getMessagesAround()` — 围绕指定消息加载上下文（用于搜索结果定位）
+- `getMessagesSinceLastCompact()` — 从最近的 compact 标记之后加载消息（用于 SDK 历史重建）
+
+对话分支管理：
+- `createBranch()` — 从指定消息 fork 新分支，复制父分支中 fork 点及之前的 `branch_messages` 记录（共享前缀），自动切换到新分支
+- `switchBranch()` — 切换活跃分支，更新 `narrators.activeBranchId`
+- `deleteBranch()` — 删除分支，提升子分支到父分支，清理孤儿消息（仅属于该分支的消息）
+
+Compact 机制：
+- `persistCompactingMessage()` — 插入 role=system 的 compact 占位消息（`status: "compacting"`），支持指定 `beforeMessageId` 进行部分压缩
+- `finalizeCompactingMessage()` — 将占位消息更新为完成状态（`status: "compacted"`，含 summary），在 `branch_messages` 中标记 `isCompact=1`
+- `deleteCompactMessage()` / `updateCompactSummary()` — compact 标记的撤销和编辑
+
+消息树构建：
+- `buildMessageTree()` — 将扁平消息列表构建为树结构，子消息通过 `parentToolUseId` 嵌套到父消息的 `children` 数组
+- `truncateToolIO()` — 递归截断大型 tool call 的 inputJson/outputJson（默认 2000 字符），完整数据通过 `/tool-calls/:toolUseId` 端点获取
+
 #### 4.2.2 narrator-session.ts — Claude Session 管理
 
 职责：封装 Claude Agent SDK 的 `query()` 调用，管理 session 的创建、恢复、分叉，以及消息缓冲和权限审批。
@@ -544,7 +612,7 @@ server/
   - `bypassPermissions` / `dontAsk` 模式：SDK 层面跳过所有权限检查
   - `plan` 模式：SDK 层面进入 plan 模式
 - `canUseTool` 对 `TodoWrite`/`TodoRead` 工具自动允许（白名单），不需要用户审批
-- 权限审批流程：创建 tool_call 记录 → 创建 permission_request → WebSocket 推送 → 等待决定（5 分钟超时，超时自动拒绝，`decidedBy: "auto_timeout"`）→ 更新记录 → 返回 SDK
+- 权限审批流程：创建 tool_call 记录（status: initializing）→ 判断权限决策（auto allow/deny/ask）→ 需要用户审批时更新 status 为 pending → WebSocket 推送 `permission_request` → 等待决定（5 分钟超时，超时自动拒绝，`permissionDecidedBy: "auto_timeout"`）→ 更新 tool_call 记录 → 返回 SDK。权限状态直接记录在 `narrator_tool_calls` 表上，无独立的 `permission_requests` 表
 - "Allow with feedback" 流程：用户批准权限时附带 `feedbackText`，session 在当前 tool 完成后中断，feedbackText 作为下一条用户消息自动发送
 - 消息缓冲：用户在 narrator thinking 时可通过 WebSocket 发送 `buffer_message`，session 结束后自动链式发送缓冲消息
 - `TodoWrite` 工具结果自动持久化到 narrator 的 `todosJson` 字段
@@ -734,9 +802,14 @@ GET    /api/narrators/:id                          # 详情
 DELETE /api/narrators/:id                          # 删除
 
 POST   /api/narrators/:id/messages                 # 发送消息（SSE 流式响应，支持 multipart 图片上传）
-GET    /api/narrators/:id/messages                 # 历史消息（?limit=&cursor=&around=）
-GET    /api/narrators/:id/messages/find-parent      # 按 tool_use_id 查找父消息（子 agent 懒加载）
+GET    /api/narrators/:id/messages                 # 历史消息（?limit=&cursor=&branchId=&around=）
 GET    /api/narrators/:id/buffer                   # 获取缓冲消息（多设备同步）
+GET    /api/narrators/:id/tool-calls/:toolUseId    # 获取完整 tool call 详情（未截断）
+
+POST   /api/narrators/:id/compact                  # 触发手动 compact（?beforeMessageId=）
+GET    /api/narrators/:id/compact/:messageId        # 获取 compact 摘要
+PATCH  /api/narrators/:id/compact/:messageId        # 更新 compact 摘要
+DELETE /api/narrators/:id/compact/:messageId        # 删除 compact 标记（撤销 compact）
 
 POST   /api/narrators/:id/interrupt                # 中断当前执行
 PATCH  /api/narrators/:id/permission-mode          # 切换权限模式
@@ -746,6 +819,16 @@ POST   /api/narrators/:id/generate-title           # AI 自动生成标题
 PATCH  /api/narrators/:id/archive                  # 归档叙述者
 PATCH  /api/narrators/:id/unarchive                # 取消归档
 PATCH  /api/narrators/:id/mark-read                # 标记已读（done → idle）
+```
+
+#### Conversation Branches
+```
+GET    /api/narrators/:id/branches                 # 列表分支
+POST   /api/narrators/:id/branches                 # 创建分支（fork from message）
+PATCH  /api/narrators/:id/branches/:branchId       # 更新分支（重命名/归档）
+DELETE /api/narrators/:id/branches/:branchId       # 删除分支（孤儿消息自动清理）
+POST   /api/narrators/:id/branches/:branchId/switch # 切换活跃分支
+POST   /api/narrators/:id/branches/root/switch     # 切换到 root 分支
 ```
 
 #### Permission Requests
@@ -1130,27 +1213,29 @@ interface NarraForkSettings {
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| 会话分叉机制 | SDK 原生 resume + forkSession | 零成本，不需要自己管理消息树 |
-| 回溯分叉 | SDK 的 resumeSessionAt | 精确到消息级别的回溯 |
+| 会话分叉机制 | SDK 原生 resume + forkSession + 本地对话分支 | SDK 级别零成本继承，本地 conversation_branches 管理分支消息视图 |
+| 回溯分叉 | SDK 的 resumeSessionAt + conversation_branches fork | SDK 精确到消息级别回溯，本地分支复制共享前缀 |
 | 上下文压缩 | Haiku 模型做 summarization | 成本低，速度快 |
 | 容器运行时 | Podman | 无 daemon，rootless，兼容 Docker Compose 格式 |
 | 前端组件库 | Mantine | 开箱即用的复杂组件，CSS-in-JS 主题系统 |
 | 图可视化 | React Flow + Dagre | 成熟的 React 图渲染库，自动布局 |
-| 消息存储 | 完整 BetaMessage.content JSON | 保留 tool_use/thinking blocks 用于展示 |
+| 消息存储 | 完整 BetaMessage.content JSON + branch_messages junction table | 保留 tool_use/thinking blocks 用于展示，分支间共享消息实体 |
 | 端口管理 | DB 端口池 + insert 冲突重试 | 避免冲突，支持多 chapter 并发分配 |
 | 分叉原子性 | 手动回滚栈 | 比 DB 事务更灵活，覆盖 git/container 操作 |
 | 权限审批 | WebSocket 实时通道 | Agent 在等待，需要低延迟响应 |
 | 认证方案 | JWT Bearer token | 无状态，首个注册用户自动成为 admin |
 | 容器路由归属 | 整合到 chapters.ts | 容器是 chapter 的子资源，不需要独立路由文件 |
-| 权限审批服务 | 整合到 narrator-session.ts | 与 session 生命周期紧密耦合，Promise + EventEmitter 等待决定 |
+| 权限审批服务 | 整合到 narrator-session.ts + narrator_tool_calls 表 | 与 session 生命周期紧密耦合，权限状态直接记录在 tool call 上，无独立 permission_requests 表 |
 | 批量合并 | 临时 fork + 队列式处理 | 在临时分支上合并，全部成功后 fast-forward，失败可回滚 |
 | containerConfig 存储 | chapters 表 JSON 字段 | 避免独立表的 JOIN 开销，配置结构简单 |
 | 数据共享模式 | 全团队共享，无用户隔离 | 小团队私有部署，认证仅用于身份识别 |
-| Narrator 状态机 | idle/thinking/waiting/done/archived/error | 比 active/paused/completed 更细粒度，`done` 表示 AI 完成回复待用户阅读 |
+| Narrator 状态机 | idle/thinking/waiting/done/archived/error/interrupted | 比 active/paused/completed 更细粒度，`done` 表示 AI 完成回复待用户阅读，`interrupted` 表示用户主动中断 |
 | 会话标题生成 | 两阶段：quickTitle（用户消息即时生成）+ generateAndSetTitle（session 结束后精确生成） | 快速标题改善 UX，精确标题保证质量 |
 | 游离会话路由 | 整合到 narrators.ts（chapterId=null） | 避免重复路由逻辑，统一会话管理 |
 | 权限审批 UI | 内联 per-tool-call 审批 + feedbackText | 比顶部 banner 更直观，feedback 支持 "allow with guidance" 模式 |
 | 消息缓冲 | 内存 Map + WebSocket 双向同步 | 允许用户在 AI thinking 时排队消息，多设备同步 |
+| 对话分支 | conversation_branches + branch_messages junction table | 支持从任意消息 fork 新分支，共享前缀避免消息重复，seq 字段支持高效游标分页 |
+| Compact 机制 | system 消息标记 + branch_messages.isCompact | 压缩历史上下文为摘要注入 system prompt，减少 token 消耗，支持部分压缩（指定 beforeMessageId） |
 | FTS tokenizer | trigram | 支持 CJK 搜索，无需分词器 |
 | 主题模式 | auto（跟随系统） | 用户可切换 light/dark/auto，比固定 dark 更灵活 |
 | 自动休眠触发 | 防抖调度（30 秒窗口） | chapter 创建/访问时触发，避免频繁检查 |

@@ -73,7 +73,15 @@ server/
 - **终端管理**通过 Bun.Terminal (PTY) 直接实现 — 终端生命周期与服务器进程绑定，重启后标记为已退出。
 - **批量合并**编排多章节合并，支持冲突检测、WebSocket 交互式决策和 AI 辅助冲突解决。
 
-**数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。所有主键为 nanoid 文本 ID。FTS5 虚拟表用于章节和叙述者消息的全文搜索，通过触发器同步。
+**叙述者消息存储：** 消息通过三层结构管理：
+- `narrator_messages` — 存储所有消息（user/assistant/system），`contentJson` 保存完整的 SDK content blocks（text/tool_use/thinking），`parentToolUseId` 关联子 agent 消息树。
+- `conversation_branches` — 对话分支，每个叙述者创建时自动生成 root 分支（"main"），支持从任意消息 fork 新分支。叙述者通过 `activeBranchId` 跟踪当前分支。
+- `branch_messages` — 分支-消息关联表（junction table），通过 `seq` 字段维护分支内消息顺序，`isCompact` 标记压缩点。消息可被多个分支共享（fork 时复制共享前缀）。
+- `narrator_tool_calls` — 工具调用记录，同时承担权限审批职责（`permissionDecidedBy`/`permissionDecidedAt` 等字段），无独立的 `permission_requests` 表。
+- 消息分页基于 `branch_messages.seq` 的游标分页，查询时先通过 junction table 获取当前分支的顶层消息 ID，再加载消息及其子 agent 消息树。
+- **Compact 机制**：插入 role=system 的压缩标记消息（`contentJson: [{type: "compact", status: "compacted", summary}]`），在 `branch_messages` 中标记 `isCompact=1`，后续查询从最近的 compact 点之后开始加载。
+
+**数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。所有主键为 nanoid 文本 ID。FTS5 虚拟表（trigram tokenizer，支持 CJK）用于章节、叙述者标题和叙述者消息的全文搜索，通过触发器同步。
 
 **认证：** JWT 通过 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。首个注册用户自动获得管理员权限。JWT 密钥在配置文件中自动生成。
 

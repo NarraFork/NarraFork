@@ -159,7 +159,6 @@ describe("narrator messages", () => {
 				]),
 				contentText: "Let me check",
 				tokensIn: 100,
-				tokensOut: 50,
 				createdAt: now,
 			})
 			.run();
