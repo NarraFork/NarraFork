@@ -29,7 +29,7 @@ import {
 	IconWorldSearch,
 	IconX,
 } from "@tabler/icons-react";
-import { memo, useEffect, useMemo, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
@@ -37,18 +37,27 @@ import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 
+/**
+ * Context carrying the toolUseId of the narrator's latest TodoWrite call.
+ * TodoDetail uses this to decide whether in_progress items should animate.
+ */
+export const LatestTodosToolUseIdCtx = createContext<string | null>(null);
+
 // --- Types ---
 
 export interface ToolCallData {
 	id?: string;
 	toolName: string;
 	toolUseId?: string;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	inputJson: any;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	outputJson?: any;
 	status: string;
 	durationMs?: number;
 	errorMessage?: string;
 	permissionDecisionReason?: string | null;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	permissionSuggestions?: any[] | null;
 }
 
@@ -56,8 +65,10 @@ export interface PendingPermission {
 	id: string;
 	toolName: string;
 	toolUseId?: string;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	inputJson: any;
 	decisionReason?: string;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	suggestions?: any[];
 }
 
@@ -76,6 +87,7 @@ interface ToolCallCardProps {
 		requestId: string,
 		decision: "allow" | "deny",
 		feedbackText?: string,
+		compactAfter?: boolean,
 	) => void;
 	/** Callback when user submits answers to AskUserQuestion */
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
@@ -102,7 +114,7 @@ const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
 const BASH_TOOLS = new Set(["Bash", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
-const TODO_TOOLS = new Set(["TodoWrite", "TodoRead"]);
+const TODO_TOOLS = new Set(["TodoWrite"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
@@ -182,6 +194,7 @@ function getCategoryColor(cat: ToolCategory) {
 
 // --- Helper: extract a human-readable summary for the header ---
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getFilePath(input: any): string {
 	return input?.file_path ?? input?.filePath ?? input?.path ?? "";
 }
@@ -191,6 +204,7 @@ function basename(p: string): string {
 	return parts[parts.length - 1] || p;
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getSummary(toolName: string, input: any): string {
 	const cat = getCategory(toolName);
 	switch (cat) {
@@ -218,7 +232,7 @@ function getSummary(toolName: string, input: any): string {
 			return q.length > 60 ? `${q.slice(0, 57)}...` : q;
 		}
 		case "todo":
-			return toolName === "TodoWrite" ? "Update todos" : "Read todos";
+			return "Update todos";
 		case "taskOutput": {
 			const taskId = input?.task_id ?? "";
 			if (toolName === "TaskStop") return taskId ? `Stop ${taskId}` : "Stop task";
@@ -494,6 +508,7 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 			{query && <Code style={{ fontSize: 11 }}>{query}</Code>}
 			{results ? (
 				<Stack gap={6} mt={4}>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{results.slice(0, 10).map((r: any, i: number) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: search results lack stable IDs
 						<Box key={i}>
@@ -581,11 +596,13 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 const TODO_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }> = {
 	completed: { icon: IconCheck, color: "green" },
-	in_progress: { icon: IconLoader2, color: "blue" },
+	in_progress: { icon: IconPlayerPlay, color: "blue" },
 	pending: { icon: IconChevronRight, color: "yellow" },
 };
 
 function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const latestToolUseId = useContext(LatestTodosToolUseIdCtx);
+	const isLatest = !!toolCall.toolUseId && toolCall.toolUseId === latestToolUseId;
 	const todos: { content?: string; status?: string }[] =
 		toolCall.inputJson?.todos ?? toolCall.outputJson?.todos ?? [];
 
@@ -598,7 +615,8 @@ function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 			<List spacing={4} size="xs" center>
 				{todos.map((todo, i) => {
 					const entry = TODO_STATUS_ICON[todo.status ?? "pending"] ?? TODO_STATUS_ICON.pending;
-					const StatusIconComp = entry.icon;
+					const spinning = isLatest && todo.status === "in_progress";
+					const StatusIconComp = spinning ? IconLoader2 : entry.icon;
 					return (
 						<List.Item
 							// biome-ignore lint/suspicious/noArrayIndexKey: todo items lack unique IDs
@@ -607,11 +625,7 @@ function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 								<ThemeIcon size={16} variant="light" color={entry.color} radius="xl">
 									<StatusIconComp
 										size={10}
-										style={
-											todo.status === "in_progress"
-												? { animation: "spin 1s linear infinite" }
-												: undefined
-										}
+										style={spinning ? { animation: "spin 1s linear infinite" } : undefined}
 									/>
 								</ThemeIcon>
 							}
@@ -658,7 +672,8 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 			typeof out === "string"
 				? out
 				: Array.isArray(out)
-					? out.map((b: any) => b.text ?? "").join("")
+					? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+						out.map((b: any) => b.text ?? "").join("")
 					: "";
 		if (!raw) return null;
 		return parseTaskOutputXml(raw);
@@ -715,9 +730,11 @@ function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
 		toolCall.status === "success" || toolCall.status === "fail"
 			? typeof toolCall.outputJson === "string"
 				? toolCall.outputJson
-				: typeof toolCall.inputJson?.plan === "string"
-					? toolCall.inputJson.plan
-					: ""
+				: toolCall.outputJson?._truncated
+					? (toolCall.outputJson.preview as string)
+					: typeof toolCall.inputJson?.plan === "string"
+						? toolCall.inputJson.plan
+						: ""
 			: "";
 
 	if (!planText) {
@@ -789,7 +806,12 @@ function InlinePermission({
 	onQuestionDeny,
 }: {
 	permission: PendingPermission;
-	onDecision?: (requestId: string, decision: "allow" | "deny", feedbackText?: string) => void;
+	onDecision?: (
+		requestId: string,
+		decision: "allow" | "deny",
+		feedbackText?: string,
+		compactAfter?: boolean,
+	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;
 }) {
@@ -851,6 +873,16 @@ function InlinePermission({
 				>
 					{tc("allow")}
 				</Button>
+				{permission.toolName === "ExitPlanMode" && (
+					<Button
+						size="sm"
+						color="teal"
+						variant="light"
+						onClick={() => onDecision?.(permission.id, "allow", feedback || undefined, true)}
+					>
+						{t("acceptAndResetContext")}
+					</Button>
+				)}
 				<Button
 					size="sm"
 					color="red"
@@ -922,6 +954,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		!!pendingPermission ||
 		toolCall.status === "pending" ||
 		cat === "todo" ||
+		cat === "plan" ||
 		(isEdit && !isFailedEdit) ||
 		(isFailed && !isEdit);
 	const [opened, setOpened] = useState(defaultOpen);
@@ -974,29 +1007,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 		);
 	}
 
-	const isExitPlanExpanded = toolCall.toolName === "ExitPlanMode" && opened;
-
 	return (
 		<Paper withBorder radius="sm" p="xs" style={borderColor ? { borderColor } : undefined}>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
 			<LazyCollapse in={opened}>
-				{isExitPlanExpanded ? (
-					<Box
-						style={{
-							height: "calc(100vh - 200px)",
-							display: "flex",
-							flexDirection: "column",
-						}}
-					>
-						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-						{permissionUI}
-					</Box>
-				) : (
-					<>
-						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-						{permissionUI}
-					</>
-				)}
+				<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+				{permissionUI}
 			</LazyCollapse>
 		</Paper>
 	);

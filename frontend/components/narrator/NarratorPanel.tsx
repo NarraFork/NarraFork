@@ -86,7 +86,7 @@ import {
 } from "./message-tree-utils";
 
 import type { PendingPermission, ToolCallData } from "./ToolCallCard";
-import { STATUS_COLORS, StatusIcon, ToolCallCard } from "./ToolCallCard";
+import { LatestTodosToolUseIdCtx, STATUS_COLORS, StatusIcon, ToolCallCard } from "./ToolCallCard";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {
@@ -624,6 +624,7 @@ interface PermissionCallbacks {
 		requestId: string,
 		decision: "allow" | "deny",
 		feedbackText?: string,
+		compactAfter?: boolean,
 	) => void;
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny: (requestId: string) => void;
@@ -1089,7 +1090,7 @@ interface NarratorPanelProps {
 		status: string;
 		totalCostUsd: number | null;
 		permissionMode: string | null;
-		sdkPlanMode?: boolean | null;
+		planMode?: boolean | null;
 		todosJson?: TodoItem[] | null;
 		todosToolUseId?: string | null;
 		activeBranchId?: string | null;
@@ -1122,6 +1123,7 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const activeBranchId = (narrator as any)?.activeBranchId ?? null;
 	const createBranchMutation = useCreateBranch();
 	const {
@@ -1141,6 +1143,7 @@ export function NarratorPanel({
 	});
 	const allModels = useMemo(() => {
 		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					.map((m: any) => ({
 						value: String(m.model_id ?? m.modelId ?? ""),
 						label: String(
@@ -1313,7 +1316,7 @@ export function NarratorPanel({
 	const isWorking = narrator?.status === "thinking";
 	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
-	const isPlanning = narrator?.sdkPlanMode && narrator?.status === "thinking";
+	const isPlanning = narrator?.planMode && narrator?.status === "thinking";
 	const showWorkIndicator = !!(activeTodo || isWorking || isWaiting || isCompacting);
 
 	// Memoize blob URLs to avoid creating new ones on every render
@@ -1418,6 +1421,7 @@ export function NarratorPanel({
 				message?: string,
 				answers?: Record<string, string>,
 				feedbackText?: string,
+				compactAfter?: boolean,
 		  ) => void)
 		| null
 	>(null);
@@ -1430,13 +1434,41 @@ export function NarratorPanel({
 	pendingPermRef.current = pendingPermission;
 
 	const handlePermissionDecision = useCallback(
-		(requestId: string, decision: "allow" | "deny", feedbackText?: string) => {
-			sendPermissionDecisionRef.current?.(requestId, decision, undefined, undefined, feedbackText);
+		(
+			requestId: string,
+			decision: "allow" | "deny",
+			feedbackText?: string,
+			compactAfter?: boolean,
+		) => {
+			sendPermissionDecisionRef.current?.(
+				requestId,
+				decision,
+				undefined,
+				undefined,
+				feedbackText,
+				compactAfter,
+			);
 			const toolUseId = pendingPermRef.current?.toolUseId;
 			setPendingPermission(null);
 			if (toolUseId) {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
+
+					// When compactAfter is set, remove the message containing ExitPlanMode
+					if (compactAfter) {
+						let anyChanged = false;
+						const pages = old.pages.map((page: MessagesPage) => {
+							const msg = findMsgByToolUseIdInTree(page.messages, toolUseId);
+							if (!msg) return page;
+							anyChanged = true;
+							return {
+								...page,
+								messages: page.messages.filter((m: NarratorMsg) => m.id !== msg.id),
+							};
+						});
+						return anyChanged ? { ...old, pages } : old;
+					}
+
 					let anyChanged = false;
 					const pages = old.pages.map((page: MessagesPage) => {
 						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
@@ -1458,16 +1490,16 @@ export function NarratorPanel({
 			// Merge answers into the cached toolCalls[].inputJson and clear pending status
 			const perm = pendingPermRef.current;
 			if (perm?.toolUseId) {
+				const tuId = perm.toolUseId;
 				const mergedInput = { ...perm.inputJson, answers };
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					let anyChanged = false;
 					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages: m1, changed: c1 } = mergeToolCallFieldsInTree(
-							page.messages,
-							perm.toolUseId!,
-							{ inputJson: mergedInput, status: "running" },
-						);
+						const { messages: m1, changed: c1 } = mergeToolCallFieldsInTree(page.messages, tuId, {
+							inputJson: mergedInput,
+							status: "running",
+						});
 						if (c1) anyChanged = true;
 						return c1 ? { ...page, messages: m1 } : page;
 					});
@@ -1528,10 +1560,10 @@ export function NarratorPanel({
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
 			pendingPermission: null, // overridden per-render below
-			onPermissionDecision: (...args) => permCbRef.current!.onPermissionDecision(...args),
-			onQuestionSubmit: (...args) => permCbRef.current!.onQuestionSubmit(...args),
-			onQuestionDeny: (...args) => permCbRef.current!.onQuestionDeny(...args),
-			onBgAgentRetry: (...args) => permCbRef.current!.onBgAgentRetry?.(...args),
+			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
+			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
+			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
+			onBgAgentRetry: (...args) => permCbRef.current?.onBgAgentRetry?.(...args),
 			bgRetryDismissedIds: new Set(),
 		}),
 		[],
@@ -1945,6 +1977,7 @@ export function NarratorPanel({
 	const { connected, disconnected, sendPermissionDecision, sendBufferMessage, cancelBuffer } =
 		useNarratorWS(narratorId, {
 			onStreamEvent: (wsData: Record<string, unknown>) => {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const ev = wsData.event as Record<string, any> | undefined;
 				if (
 					ev?.type === "content_block_delta" &&
@@ -2145,9 +2178,9 @@ export function NarratorPanel({
 			onBufferCleared: () => {
 				setBufferedText(null);
 			},
-			onSdkPlanModeChanged: (sdkPlanMode) => {
+			onPlanModeChanged: (planMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, sdkPlanMode } : old,
+					old ? { ...old, planMode } : old,
 				);
 			},
 			onContextUsage: (percentage) => {
@@ -2463,21 +2496,14 @@ export function NarratorPanel({
 					<BranchSelector narratorId={narratorId} activeBranchId={activeBranchId} />
 				</Group>
 				<Group gap="xs">
-					<Tooltip
-						label={
-							editExpandOverride === false
-								? t("expandEdits", "Expand edits")
-								: t("collapseEdits", "Collapse edits")
-						}
-					>
+					<Tooltip label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}>
 						<ActionIcon
 							size="sm"
 							variant="subtle"
 							color="gray"
+							// Two-state toggle: null(default)/true → false(collapse), false → true(expand)
 							onClick={() =>
-								setEditExpandOverride((prev) =>
-									prev === null ? false : prev === false ? true : null,
-								)
+								setEditExpandOverride((prev) => (prev === true ? false : prev === false))
 							}
 						>
 							{editExpandOverride === false ? <IconCode size={16} /> : <IconCodeOff size={16} />}
@@ -2555,14 +2581,16 @@ export function NarratorPanel({
 							: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
 					}}
 				>
-					<Stack gap="sm" ref={contentRef}>
-						{visibleElements}
-						<StreamingBubble
-							narratorId={narratorId}
-							streamingRef={streamingRef}
-							version={streamingVersion}
-						/>
-					</Stack>
+					<LatestTodosToolUseIdCtx.Provider value={todosToolUseId}>
+						<Stack gap="sm" ref={contentRef}>
+							{visibleElements}
+							<StreamingBubble
+								narratorId={narratorId}
+								streamingRef={streamingRef}
+								version={streamingVersion}
+							/>
+						</Stack>
+					</LatestTodosToolUseIdCtx.Provider>
 				</ScrollArea>
 
 				{onSendToTerminal && (

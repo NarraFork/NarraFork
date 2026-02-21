@@ -36,7 +36,7 @@ export type NarratorServerMessage =
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "session_error" }
-	| { type: "sdk_plan_mode_changed"; narratorId: string; sdkPlanMode: boolean }
+	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
@@ -192,6 +192,7 @@ export const handleNarratorWS = {
 					msg.message,
 					msg.answers,
 					msg.feedbackText,
+					msg.compactAfter,
 				).catch((err) => logger.error("Failed to resolve permission", { error: String(err) }));
 				break;
 			}

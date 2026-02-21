@@ -6,6 +6,8 @@ export interface ToolContext {
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
+	/** Locale for i18n of tool outputs */
+	locale: string;
 	/** Request permission from the user. Returns true if allowed. */
 	requestPermission: (
 		toolName: string,
@@ -72,6 +74,20 @@ export interface AgentToolUse {
 	input: Record<string, unknown>;
 }
 
+// === Plan mode constants ===
+
+/** Tools allowed during plan mode. Everything else is auto-denied or description-overridden. */
+export const PLAN_MODE_ALLOWED_TOOLS = new Set([
+	"Read",
+	"Glob",
+	"Grep",
+	"WebSearch",
+	"TodoWrite",
+	"EnterPlanMode",
+	"ExitPlanMode",
+	"Bash",
+]);
+
 // === Agent config ===
 
 export interface AgentConfig {
@@ -84,6 +100,7 @@ export interface AgentConfig {
 	locale?: string;
 	signal: AbortSignal;
 	maxTurns?: number;
+	planMode?: boolean;
 	permissionHandler: (
 		toolName: string,
 		input: Record<string, unknown>,

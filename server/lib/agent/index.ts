@@ -18,6 +18,7 @@ export type {
 	ToolDefinition,
 	ToolResult,
 } from "./types";
+export { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 /**
  * Convert DB narrator messages into provider history format.

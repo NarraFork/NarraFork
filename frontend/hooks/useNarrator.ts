@@ -90,7 +90,7 @@ export function useCreateNarrator() {
 			systemPrompt?: string;
 			permissionMode?: string;
 			cwd?: string;
-			sdkPlanMode?: boolean;
+			planMode?: boolean;
 		}) => api.createNarrator(data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });

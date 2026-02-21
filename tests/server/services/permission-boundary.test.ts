@@ -149,7 +149,7 @@ describe("resolvePermissionDecision", () => {
 		expect(resolvePermissionDecision("TodoWrite", {}, "acceptEdits", CWD)).toBe("allow");
 	});
 
-	test("TodoRead is always allowed", () => {
+	test("TodoRead is allowed in default mode (no external paths)", () => {
 		expect(resolvePermissionDecision("TodoRead", {}, "default", CWD)).toBe("allow");
 	});
 
@@ -157,8 +157,10 @@ describe("resolvePermissionDecision", () => {
 		expect(resolvePermissionDecision("EnterPlanMode", {}, "default", CWD)).toBe("allow");
 	});
 
-	test("ExitPlanMode is always allowed", () => {
-		expect(resolvePermissionDecision("ExitPlanMode", {}, "dontAsk", CWD)).toBe("allow");
+	test("ExitPlanMode always requires user approval", () => {
+		expect(resolvePermissionDecision("ExitPlanMode", {}, "dontAsk", CWD)).toBe("ask");
+		expect(resolvePermissionDecision("ExitPlanMode", {}, "default", CWD)).toBe("ask");
+		expect(resolvePermissionDecision("ExitPlanMode", {}, "bypassPermissions", CWD)).toBe("ask");
 	});
 
 	// --- bypassPermissions mode ---

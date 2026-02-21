@@ -1,8 +1,10 @@
+import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { settings } from "../settings";
 import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type { AgentConfig, AgentEvent, AgentToolUse, ToolContext } from "./types";
+import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
@@ -19,7 +21,22 @@ export async function* agentLoop(
 ): AsyncGenerator<AgentEvent> {
 	const provider = getProvider(config.provider);
 	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
-	const allTools = toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable());
+	let allTools = toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable());
+
+	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
+	if (config.planMode) {
+		const locale = (config.locale as Locale) ?? "en";
+		const disabledDesc = getToolMessage("planModeToolDisabled", locale);
+		allTools = allTools.map((t) =>
+			PLAN_MODE_ALLOWED_TOOLS.has(t.name)
+				? t
+				: {
+						...t,
+						description: disabledDesc,
+					},
+		);
+	}
+
 	const tools = provider.formatTools(allTools);
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
@@ -205,6 +222,7 @@ interface ToolExecResult {
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
 	const tool = toolRegistry.get(tu.name);
 	const start = Date.now();
+	const locale = (config.locale as Locale) ?? "en";
 
 	if (!tool) {
 		return {
@@ -218,8 +236,10 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	const permission = await config.permissionHandler(tu.name, tu.input, tu.toolUseId);
 	if (permission.behavior === "deny") {
 		const userMessage = permission.message
-			? `The user rejected this tool call with the following message: ${permission.message}`
-			: "The user rejected this tool call.";
+			? getToolMessageWithParams("permissionDeniedWithMessage", locale, {
+					message: permission.message,
+				})
+			: getToolMessage("permissionDeniedByUser", locale);
 		return {
 			output: userMessage,
 			isError: true,
@@ -254,6 +274,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		narratorId: config.narratorId,
 		cwd: config.cwd,
 		signal: config.signal,
+		locale: config.locale ?? "en",
 		requestPermission: config.permissionHandler,
 	};
 

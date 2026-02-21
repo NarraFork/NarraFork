@@ -11,12 +11,22 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
-import { type AgentEvent, agentLoop, buildHistory, type PermissionResult } from "../lib/agent";
+import {
+	type AgentEvent,
+	agentLoop,
+	buildHistory,
+	type PermissionResult,
+	PLAN_MODE_ALLOWED_TOOLS,
+} from "../lib/agent";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { getReplyLanguageInstruction, getToolMessage } from "../lib/prompt-i18n";
+import {
+	getPlanModeSystemReminder,
+	getReplyLanguageInstruction,
+	getToolMessage,
+} from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
@@ -73,6 +83,9 @@ const pendingPermissions = new Map<string, PendingPermission>();
 // Feedback queued by "allow with feedback" — keyed by narratorId
 const pendingFeedback = new Map<string, { toolUseId: string; feedbackText: string }>();
 
+// Tracks narrators that should run plan compact after ExitPlanMode completes — keyed by narratorId
+const pendingPlanCompact = new Set<string>();
+
 // Buffered message queued by user while narrator is thinking — keyed by narratorId
 interface BufferedMessage {
 	text: string;
@@ -121,7 +134,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 }
 
 // and does not access the local filesystem or execute arbitrary commands.
-const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "TodoRead", "EnterPlanMode", "ExitPlanMode", "WebSearch"];
+const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -137,12 +150,19 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
  * Pure decision logic for permission handling.
  * Returns "allow", "deny", or "ask" (needs user confirmation).
  */
+/** Tools that always require user approval regardless of permission mode. */
+const ALWAYS_ASK_TOOLS = ["ExitPlanMode"];
+
 export function resolvePermissionDecision(
 	toolName: string,
 	input: Record<string, unknown>,
 	permMode: string,
 	cwd: string,
+	planMode = false,
 ): "allow" | "deny" | "ask" {
+	// Plan mode: deny mutating tools (except Bash which keeps its normal permission flow)
+	if (planMode && !PLAN_MODE_ALLOWED_TOOLS.has(toolName)) return "deny";
+	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 	if (permMode === "bypassPermissions") return "allow";
 	if (permMode === "dontAsk") return "deny";
@@ -165,15 +185,17 @@ async function handlePermission(
 	input: Record<string, unknown>,
 	toolUseId: string,
 	cwd: string,
+	locale: Locale = "en",
 ): Promise<PermissionResult> {
-	// Read permission mode from DB in real-time
+	// Read permission mode and plan mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { permissionMode: true },
+		columns: { permissionMode: true, planMode: true },
 	});
 	const permMode = narrator?.permissionMode ?? "default";
+	const planMode = narrator?.planMode ?? false;
 
-	const decision = resolvePermissionDecision(toolName, input, permMode, cwd);
+	const decision = resolvePermissionDecision(toolName, input, permMode, cwd, planMode);
 	if (decision === "allow") {
 		logger.debug("Permission auto-allowed", { narratorId, toolName, toolUseId, permMode });
 		await db
@@ -192,12 +214,13 @@ async function handlePermission(
 		return { behavior: "allow", updatedInput: input };
 	}
 	if (decision === "deny") {
+		const denyMsg = getToolMessage("permissionDeniedNonInteractive", locale);
 		logger.debug("Permission auto-denied", { narratorId, toolName, toolUseId, permMode });
 		await db
 			.update(narratorToolCalls)
 			.set({
 				status: "fail",
-				errorMessage: "Non-interactive session: all risky operations are denied",
+				errorMessage: denyMsg,
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
 			})
@@ -209,11 +232,9 @@ async function handlePermission(
 			);
 		return {
 			behavior: "deny",
-			message: "Non-interactive session: all risky operations are denied",
+			message: denyMsg,
 		};
 	}
-
-	const now = new Date().toISOString();
 
 	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
 		where: and(
@@ -348,6 +369,7 @@ export async function resolvePermission(
 	denyMessage?: string,
 	answers?: Record<string, string>,
 	feedbackText?: string,
+	compactAfter?: boolean,
 ): Promise<void> {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -423,6 +445,11 @@ export async function resolvePermission(
 			}
 		}
 
+		// Mark for plan compact if requested (ExitPlanMode + reset context)
+		if (compactAfter) {
+			pendingPlanCompact.add(pending.narratorId);
+		}
+
 		pending.resolve({ behavior: "allow", updatedInput });
 	} else {
 		const message = denyMessage || feedbackText?.trim() || "Permission denied by user";
@@ -465,6 +492,7 @@ async function buildSystemPrompt(
 	cwd: string,
 	locale: Locale,
 	replyInUserLanguage: boolean,
+	planMode = false,
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
 	let prompt = narrator.systemPrompt;
 	let usedCompactSummary = false;
@@ -508,6 +536,13 @@ async function buildSystemPrompt(
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
 		prompt = `${base}${sep}## Language\n\n${instruction}`;
+	}
+
+	// Inject plan mode system reminder
+	if (planMode) {
+		const base = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}${getPlanModeSystemReminder(locale)}`;
 	}
 
 	return { prompt, usedCompactSummary };
@@ -557,6 +592,7 @@ async function createSession(
 		sessionCwd,
 		locale,
 		replyInUserLanguage,
+		narrator.planMode ?? false,
 	);
 
 	const abortController = new AbortController();
@@ -588,6 +624,25 @@ async function createSession(
 
 /** Trigger compact when context usage exceeds this percentage (0–100). */
 const COMPACT_CONTEXT_USAGE_PCT = 80;
+
+/** Append pending todos to the user message text so the model has context. */
+function appendTodosContext(text: string, todosJson: unknown): string {
+	if (!Array.isArray(todosJson) || todosJson.length === 0) return text;
+	const pending = todosJson.filter((t: { status?: string }) => t.status !== "completed");
+	if (pending.length === 0) return text;
+	const statusIcon: Record<string, string> = {
+		in_progress: "→",
+		pending: "○",
+	};
+	const lines = pending.map(
+		(t: { id?: string; content?: string; status?: string; priority?: string }) => {
+			const icon = statusIcon[t.status ?? "pending"] ?? "○";
+			const pri = t.priority && t.priority !== "medium" ? ` [${t.priority}]` : "";
+			return `${icon} [${t.id}] ${t.content ?? ""}${pri}`;
+		},
+	);
+	return `${text}\n\n<current_todos>\n${lines.join("\n")}\n</current_todos>`;
+}
 
 /**
  * Build AgentConfig, start agentLoop(), and consume events.
@@ -635,6 +690,7 @@ async function runAgentLoop(
 				session.cwd,
 				locale,
 				session._replyInUserLanguage ?? false,
+				freshNarrator.planMode ?? false,
 			);
 			session.systemPrompt = freshSystemPrompt;
 			session._usedCompactSummary = usedCompactSummary;
@@ -648,6 +704,7 @@ async function runAgentLoop(
 				systemPrompt: session.systemPrompt ?? undefined,
 				locale,
 				signal: session.abortController.signal,
+				planMode: freshNarrator.planMode ?? false,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,
@@ -656,6 +713,7 @@ async function runAgentLoop(
 						input,
 						toolUseId,
 						session.cwd,
+						locale,
 					),
 			};
 
@@ -688,9 +746,13 @@ async function runAgentLoop(
 			}
 
 			// Run one agent loop pass
+
+			// Inject pending todos into the user message so the model always has context
+			const effectiveText = appendTodosContext(currentText, freshNarrator.todosJson);
+
 			for await (const event of agentLoop(
 				config,
-				currentText,
+				effectiveText,
 				history,
 				trailingToolResults,
 				loopImages,
@@ -878,6 +940,46 @@ export async function runCustomCompact(
 	logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 }
 
+/**
+ * Run plan compact: use the plan text directly as compact summary.
+ * Skips AI summary generation — the plan itself is the summary.
+ */
+async function runPlanCompact(narratorId: string, planText: string): Promise<void> {
+	logger.info("Starting plan compact", { narratorId, planLength: planText.length });
+
+	const now = new Date().toISOString();
+	const narrator = await narratorService.getById(narratorId);
+
+	// Store summary on branch or narrator
+	if (narrator.activeBranchId) {
+		await db
+			.update(conversationBranches)
+			.set({
+				contextSummary: planText,
+				apiConversationId: null,
+				updatedAt: now,
+			})
+			.where(eq(conversationBranches.id, narrator.activeBranchId));
+	} else {
+		await db
+			.update(narrators)
+			.set({
+				contextSummary: planText,
+				apiConversationId: null,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, narratorId));
+	}
+
+	// Insert compact message directly (no compacting intermediate state needed)
+	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
+	if (compactMsg) {
+		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
+	}
+
+	logger.info("Plan compact completed", { narratorId, summaryLength: planText.length });
+}
+
 // === Message feeding ===
 
 /**
@@ -984,6 +1086,7 @@ async function processAgentEvent(
 
 		case "assistant_message": {
 			// Build SDK-compatible message for persistAssistantMessage
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const content: any[] = [];
 			// The model sometimes echoes it back — filter it out to avoid polluting the DB.
 			for (const tu of event.toolUses) {
@@ -1002,20 +1105,22 @@ async function processAgentEvent(
 			// TodoWrite / EnterPlanMode tracking
 			for (const tu of event.toolUses) {
 				if (tu.name === "TodoWrite" && tu.input?.todos) {
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					await narratorService.updateTodos(narratorId, tu.input.todos as any[], tu.toolUseId);
 					broadcastToNarrator(narratorId, {
 						type: "todos_updated",
 						narratorId,
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 						todos: tu.input.todos as any[],
 						toolUseId: tu.toolUseId,
 					});
 				}
 				if (tu.name === "EnterPlanMode") {
-					await narratorService.updateSdkPlanMode(narratorId, true);
+					await narratorService.updatePlanMode(narratorId, true);
 					broadcastToNarrator(narratorId, {
-						type: "sdk_plan_mode_changed",
+						type: "plan_mode_changed",
 						narratorId,
-						sdkPlanMode: true,
+						planMode: true,
 					});
 				}
 			}
@@ -1089,12 +1194,22 @@ async function processAgentEvent(
 
 			// ExitPlanMode check
 			if (!event.isError && event.toolName === "ExitPlanMode") {
-				await narratorService.updateSdkPlanMode(narratorId, false);
+				await narratorService.updatePlanMode(narratorId, false);
 				broadcastToNarrator(narratorId, {
-					type: "sdk_plan_mode_changed",
+					type: "plan_mode_changed",
 					narratorId,
-					sdkPlanMode: false,
+					planMode: false,
 				});
+
+				// Plan compact: use the plan text directly as compact summary
+				if (pendingPlanCompact.has(narratorId)) {
+					pendingPlanCompact.delete(narratorId);
+					const planText = event.output;
+					if (planText) {
+						await runPlanCompact(narratorId, planText);
+						broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+					}
+				}
 			}
 			return null;
 		}

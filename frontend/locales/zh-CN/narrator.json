@@ -75,5 +75,6 @@
 	"contextMenu_copyBlock": "复制此块",
 	"contextMenu_delete": "删除消息",
 	"expandEdits": "展开编辑",
-	"collapseEdits": "折叠编辑"
+	"collapseEdits": "折叠编辑",
+	"acceptAndResetContext": "接受并重置上下文"
 }

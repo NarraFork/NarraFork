@@ -48,10 +48,10 @@ describe("narrator CRUD", () => {
 
 		const result = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(result).toBeDefined();
-		expect(result!.chapterId).toBe("ch1");
-		expect(result!.type).toBe("primary");
-		expect(result!.status).toBe("idle");
-		expect(result!.model).toBe("claude-sonnet");
+		expect(result?.chapterId).toBe("ch1");
+		expect(result?.type).toBe("primary");
+		expect(result?.status).toBe("idle");
+		expect(result?.model).toBe("claude-sonnet");
 	});
 
 	it("can create a standalone narrator (null chapterId)", async () => {
@@ -69,7 +69,7 @@ describe("narrator CRUD", () => {
 		const result = await db.query.narrators.findFirst({
 			where: eq(narrators.id, "n-standalone"),
 		});
-		expect(result!.chapterId).toBeNull();
+		expect(result?.chapterId).toBeNull();
 	});
 
 	it("can list narrators by chapter", async () => {
@@ -130,8 +130,8 @@ describe("narrator messages", () => {
 		const msg = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, "msg1"),
 		});
-		expect(msg!.role).toBe("user");
-		expect(msg!.contentText).toBe("Hello");
+		expect(msg?.role).toBe("user");
+		expect(msg?.contentText).toBe("Hello");
 	});
 
 	it("can persist assistant message with tool calls", async () => {
@@ -180,9 +180,9 @@ describe("narrator messages", () => {
 			where: eq(narratorMessages.id, "msg-a1"),
 			with: { toolCalls: true },
 		});
-		expect(msg!.tokensIn).toBe(100);
-		expect(msg!.toolCalls).toHaveLength(1);
-		expect(msg!.toolCalls[0].toolName).toBe("Read");
+		expect(msg?.tokensIn).toBe(100);
+		expect(msg?.toolCalls).toHaveLength(1);
+		expect(msg?.toolCalls[0].toolName).toBe("Read");
 	});
 });
 

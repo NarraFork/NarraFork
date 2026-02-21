@@ -69,7 +69,6 @@ function SessionsPage() {
 	const archiveSession = useArchiveNarrator();
 	const [opened, { open, close }] = useDisclosure(false);
 	const { t } = useTranslation("sessions");
-	const { t: tc } = useTranslation("common");
 	const { t: tn } = useTranslation("narrator");
 	const { i18n } = useTranslation();
 	const [cwd, setCwd] = useState("");
@@ -90,6 +89,7 @@ function SessionsPage() {
 	const customModels = settingsData?.agent?.customModels;
 	const allModels = useMemo(() => {
 		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					.map((m: any) => ({
 						value: String(m.model_id ?? m.modelId ?? ""),
 						label: String(
@@ -114,6 +114,7 @@ function SessionsPage() {
 			}),
 		);
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const sessionIds = useMemo(() => sessions.map((s: any) => s.id), [sessions]);
 	useSessionsListWS(sessionIds, (narratorId, event) => {
 		if (!narratorId) {
@@ -124,11 +125,14 @@ function SessionsPage() {
 		// Targeted update of the specific session in paginated cache
 		qc.setQueryData(
 			["narrators", "paginated", { standalone: true, sortBy, sortOrder }],
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(old: any) => {
 				if (!old?.pages) return old;
 				let changed = false;
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const pages = old.pages.map((page: any) => ({
 					...page,
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					items: page.items.map((item: any) => {
 						if (item.id !== narratorId) return item;
 						changed = true;
@@ -136,7 +140,7 @@ function SessionsPage() {
 							...item,
 							...(event.status !== undefined ? { status: event.status } : {}),
 							...(event.title !== undefined ? { title: event.title } : {}),
-							...(event.sdkPlanMode !== undefined ? { sdkPlanMode: event.sdkPlanMode } : {}),
+							...(event.planMode !== undefined ? { planMode: event.planMode } : {}),
 							updatedAt: new Date().toISOString(),
 						};
 					}),
@@ -178,6 +182,7 @@ function SessionsPage() {
 		[navigate, navigatingId],
 	);
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isFavorited = favorites?.some((f: any) => f.path === cwd);
 
 	const handleCreate = () => {
@@ -185,9 +190,10 @@ function SessionsPage() {
 			{
 				...(cwd ? { cwd } : {}),
 				...(selectedModel ? { model: selectedModel } : {}),
-				...(planMode ? { sdkPlanMode: true } : {}),
+				...(planMode ? { planMode: true } : {}),
 			},
 			{
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				onSuccess: (data: any) => {
 					close();
 					setCwd("");
@@ -274,6 +280,7 @@ function SessionsPage() {
 				<Text c="dimmed">{t("noSessions")}</Text>
 			) : (
 				<Stack>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{sessions.map((session: any) => {
 						const isNavigating = navigatingId === session.id;
 						return (
@@ -307,9 +314,9 @@ function SessionsPage() {
 													{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
 												</Text>
 												{session.status === "thinking" && (
-													<Loader size={14} color={session.sdkPlanMode ? "green" : undefined} />
+													<Loader size={14} color={session.planMode ? "green" : undefined} />
 												)}
-												{session.status === "thinking" && session.sdkPlanMode && (
+												{session.status === "thinking" && session.planMode && (
 													<Badge size="xs" color="green">
 														{tn("status_planning")}
 													</Badge>
@@ -411,6 +418,7 @@ function SessionsPage() {
 							<Text size="xs" fw={500} c="dimmed">
 								{t("favoriteDirectories")}
 							</Text>
+							{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 							{favorites.map((fav: any) => (
 								<Group key={fav.id} gap="xs" wrap="nowrap">
 									<Button

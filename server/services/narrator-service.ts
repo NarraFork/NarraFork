@@ -1,4 +1,4 @@
-import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	branchMessages,
@@ -21,11 +21,14 @@ import { deleteNarratorUploads } from "../lib/uploads";
  * toolCalls contains the matching toolUseId.
  * Returns only top-level messages (parentToolUseId is null).
  */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function buildMessageTree(flatMessages: any[]): any[] {
 	// Shallow clone each message to avoid mutating drizzle results
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const cloned = flatMessages.map((msg) => ({ ...msg, children: [] as any[] }));
 
 	// Map: toolUseId → cloned message that CONTAINS that tool_use block
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const toolUseIdToMsg = new Map<string, any>();
 	for (const msg of cloned) {
 		if (msg.toolCalls) {
@@ -35,6 +38,7 @@ function buildMessageTree(flatMessages: any[]): any[] {
 		}
 	}
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const topLevel: any[] = [];
 	for (const msg of cloned) {
 		if (msg.parentToolUseId && toolUseIdToMsg.has(msg.parentToolUseId)) {
@@ -50,6 +54,7 @@ function buildMessageTree(flatMessages: any[]): any[] {
 }
 
 /** Truncate a JSON value to a preview string if it exceeds maxLen characters */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function truncateJson(val: any, maxLen: number): any {
 	if (val === null || val === undefined) return val;
 	const str = typeof val === "string" ? val : JSON.stringify(val);
@@ -58,9 +63,11 @@ function truncateJson(val: any, maxLen: number): any {
 }
 
 /** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 	return tree.map((msg) => ({
 		...msg,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls: msg.toolCalls?.map((tc: any) => ({
 			...tc,
 			inputJson: truncateJson(tc.inputJson, maxLen),
@@ -70,7 +77,49 @@ function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 	}));
 }
 
+/**
+ * Remove assistant messages that only contain ExitPlanMode tool_use
+ * when immediately followed by a plan compact system message.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function filterExitPlanBeforePlanCompact(tree: any[]): any[] {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const result: any[] = [];
+	for (let i = 0; i < tree.length; i++) {
+		const msg = tree[i];
+		const next = tree[i + 1];
+		// Check if next message is a plan compact
+		if (
+			next?.role === "system" &&
+			Array.isArray(next.contentJson) &&
+			next.contentJson.some(
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				(b: any) => b.type === "compact" && b.subtype === "plan",
+			)
+		) {
+			// Check if current message only has ExitPlanMode tool_use (+ optional empty text)
+			if (msg.role === "assistant" && Array.isArray(msg.contentJson)) {
+				const blocks = msg.contentJson;
+				const onlyExitPlan =
+					blocks.length > 0 &&
+					blocks.every(
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+						(b: any) =>
+							(b.type === "tool_use" && b.name === "ExitPlanMode") ||
+							(b.type === "text" && !b.text?.trim()),
+					) &&
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					blocks.some((b: any) => b.type === "tool_use");
+				if (onlyExitPlan) continue; // skip this message
+			}
+		}
+		result.push(msg);
+	}
+	return result;
+}
+
 /** Collect all toolUseIds from a set of messages (for iterative child fetching) */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function collectToolUseIds(messages: any[]): string[] {
 	const ids: string[] = [];
 	for (const msg of messages) {
@@ -151,7 +200,7 @@ interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
-	sdkPlanMode?: boolean;
+	planMode?: boolean;
 }
 
 export const narratorService = {
@@ -197,7 +246,7 @@ export const narratorService = {
 				model: input.model ?? settings.agent.defaultModel,
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
-				sdkPlanMode: input.sdkPlanMode ?? false,
+				planMode: input.planMode ?? false,
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
@@ -417,6 +466,7 @@ export const narratorService = {
 		}
 
 		// Build cursor condition on seq
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const cursorConditions: any[] = [eq(branchMessages.branchId, effectiveBranchId)];
 		if (cursor) {
 			const cursorSeq = Number.parseInt(cursor, 10);
@@ -470,7 +520,9 @@ export const narratorService = {
 					})
 				: [];
 
-		const tree = truncateToolIO(buildMessageTree([...topMessages, ...childMessages]));
+		const tree = filterExitPlanBeforePlanCompact(
+			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		);
 
 		return {
 			messages: tree,
@@ -560,7 +612,7 @@ export const narratorService = {
 			.innerJoin(narratorMessages, eq(branchMessages.messageId, narratorMessages.id))
 			.where(
 				and(
-					eq(branchMessages.branchId, effectiveBranchId!),
+					eq(branchMessages.branchId, effectiveBranchId ?? ""),
 					gte(branchMessages.seq, anchorBm.seq),
 					isNull(narratorMessages.parentToolUseId),
 				),
@@ -600,7 +652,9 @@ export const narratorService = {
 					})
 				: [];
 
-		const tree = truncateToolIO(buildMessageTree([...topMessages, ...childMessages]));
+		const tree = filterExitPlanBeforePlanCompact(
+			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		);
 		return {
 			messages: tree,
 			hasMore,
@@ -630,7 +684,9 @@ export const narratorService = {
 		});
 		if (!msg) throw new NotFoundError("Message", messageId);
 
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
 		if (!compactBlock?.summary) {
 			throw new NotFoundError("CompactSummary", messageId);
@@ -649,7 +705,9 @@ export const narratorService = {
 		});
 		if (!msg) throw new NotFoundError("Message", messageId);
 
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (!compactBlock) throw new ValidationError("Message is not a compact message");
 
@@ -676,7 +734,9 @@ export const narratorService = {
 		});
 		if (!msg) throw new NotFoundError("Message", messageId);
 
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
 		if (!compactBlock) throw new ValidationError("Message is not a compacted message");
 
@@ -721,6 +781,7 @@ export const narratorService = {
 		}));
 	},
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	async persistUserMessage(narratorId: string, text: string, contentBlocks?: any[]) {
 		const id = generateId();
 		const now = new Date().toISOString();
@@ -881,6 +942,7 @@ export const narratorService = {
 			uuid: string;
 			session_id: string;
 			parent_tool_use_id?: string | null;
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			message: { content: any[]; usage?: any };
 			contextPercent?: number;
 			meterUsage?: number;
@@ -893,7 +955,9 @@ export const narratorService = {
 
 		// Extract plain text for search
 		const contentText = content
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.filter((b: any) => b.type === "text")
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.map((b: any) => b.text)
 			.join("\n");
 
@@ -934,6 +998,7 @@ export const narratorService = {
 		}
 
 		// Extract tool_use blocks and create tool call records
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
 		for (const block of toolUseBlocks) {
 			await db.insert(narratorToolCalls).values({
@@ -1014,11 +1079,11 @@ export const narratorService = {
 			.where(eq(narrators.id, narratorId));
 	},
 
-	async updateSdkPlanMode(narratorId: string, sdkPlanMode: boolean) {
+	async updatePlanMode(narratorId: string, planMode: boolean) {
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
-			.set({ sdkPlanMode, updatedAt: now })
+			.set({ planMode, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 	},
 
@@ -1040,6 +1105,7 @@ export const narratorService = {
 		);
 	},
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	async updateTodos(narratorId: string, todos: any[], toolUseId?: string) {
 		const now = new Date().toISOString();
 		await db
@@ -1051,6 +1117,7 @@ export const narratorService = {
 	async updateToolCallResult(
 		toolUseId: string,
 		result: {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			output?: any;
 			status: "success" | "fail";
 			errorMessage?: string;
@@ -1270,7 +1337,7 @@ export const narratorService = {
 				columns: { activeBranchId: true },
 			});
 			if (narrator?.activeBranchId === branchId) {
-				const newActive = branch.parentBranchId!;
+				const newActive = branch.parentBranchId ?? "";
 				await tx
 					.update(narrators)
 					.set({ activeBranchId: newActive, updatedAt: new Date().toISOString() })

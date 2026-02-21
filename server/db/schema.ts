@@ -35,8 +35,10 @@ export const chapters = sqliteTable(
 		branch: text("branch").notNull(),
 		worktreePath: text("worktree_path"),
 		baseBranch: text("base_branch").notNull(),
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentChapterId: text("parent_chapter_id").references((): any => chapters.id),
 		forkPoint: text("fork_point", { mode: "json" }),
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		mergedIntoChapterId: text("merged_into_chapter_id").references((): any => chapters.id),
 		mergeCommitSha: text("merge_commit_sha"),
 		mergeStrategy: text("merge_strategy", { enum: ["merge", "squash", "cherry-pick"] }),
@@ -62,6 +64,7 @@ export const conversationBranches = sqliteTable(
 			.references(() => narrators.id),
 		name: text("name").notNull(),
 		forkMessageId: text("fork_message_id"),
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentBranchId: text("parent_branch_id").references((): any => conversationBranches.id),
 		apiConversationId: text("api_conversation_id"),
 		contextSummary: text("context_summary"),
@@ -93,6 +96,7 @@ export const narrators = sqliteTable(
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
 			.default("fresh"),
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
 		contextSummary: text("context_summary"),
 		model: text("model").default("claude-sonnet"),
@@ -108,7 +112,7 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("idle"),
-		sdkPlanMode: integer("sdk_plan_mode", { mode: "boolean" }).notNull().default(false),
+		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
 		errorMessage: text("error_message"),
 		todosJson: text("todos_json", { mode: "json" }),

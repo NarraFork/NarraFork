@@ -2,19 +2,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getToken } from "../lib/api";
 
 interface NarratorWSCallbacks {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	onMessage?: (data: any) => void;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	onUserMessage?: (data: any) => void;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	onStreamEvent?: (data: any) => void;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	onPermissionRequest?: (request: any) => void;
 	onPermissionResolved?: (requestId: string, toolUseId?: string) => void;
 	onStatusChange?: (status: string) => void;
 	onToolProgress?: (toolUseId: string, elapsed: number) => void;
 	onToolCompleted?: (toolUseId: string, status: string, output?: unknown) => void;
 	onTitleUpdated?: (title: string) => void;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	onTodosUpdated?: (todos: any[], toolUseId?: string) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "session_error") => void;
-	onSdkPlanModeChanged?: (sdkPlanMode: boolean) => void;
+	onPlanModeChanged?: (planMode: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number) => void;
@@ -109,8 +114,8 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 						case "buffer_cleared":
 							callbacksRef.current.onBufferCleared?.(data.reason);
 							break;
-						case "sdk_plan_mode_changed":
-							callbacksRef.current.onSdkPlanModeChanged?.(data.sdkPlanMode);
+						case "plan_mode_changed":
+							callbacksRef.current.onPlanModeChanged?.(data.planMode);
 							break;
 						case "compacting":
 							callbacksRef.current.onCompacting?.();
@@ -182,6 +187,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			message?: string,
 			answers?: Record<string, string>,
 			feedbackText?: string,
+			compactAfter?: boolean,
 		): boolean => {
 			if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
 			wsRef.current.send(
@@ -192,6 +198,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 					message,
 					answers,
 					feedbackText,
+					compactAfter,
 				}),
 			);
 			return true;
@@ -231,7 +238,7 @@ export interface SessionListWSEvent {
 	type: "status" | "title" | "planMode";
 	status?: string;
 	title?: string;
-	sdkPlanMode?: boolean;
+	planMode?: boolean;
 }
 
 export function useSessionsListWS(
@@ -280,8 +287,8 @@ export function useSessionsListWS(
 						onUpdateRef.current(nId, { type: "status", status: data.status });
 					} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
 						onUpdateRef.current(nId, { type: "title", title: data.title });
-					} else if (data.type === "sdk_plan_mode_changed") {
-						onUpdateRef.current(nId, { type: "planMode", sdkPlanMode: data.sdkPlanMode });
+					} else if (data.type === "plan_mode_changed") {
+						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
 					}
 				} catch (err) {
 					if (import.meta.env.DEV)

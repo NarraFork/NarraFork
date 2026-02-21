@@ -22,6 +22,7 @@ function makeCtx(cwd = TEST_DIR): ToolContext {
 		narratorId: "test-narrator",
 		cwd,
 		signal: new AbortController().signal,
+		locale: "en",
 		requestPermission: async () => ({ behavior: "allow" as const }),
 	};
 }
@@ -467,7 +468,7 @@ describe("Grep injection safety", () => {
 	test("pattern with shell metacharacters is not interpreted", async () => {
 		// If this were shell-interpreted, it would execute `touch`
 		const marker = join(TEST_DIR, "pwned");
-		const result = await grepTool.execute(
+		const _result = await grepTool.execute(
 			{ pattern: `$(touch ${marker})`, path: SAMPLE_FILE },
 			makeCtx(),
 		);
@@ -477,7 +478,7 @@ describe("Grep injection safety", () => {
 
 	test("path with shell metacharacters is not interpreted", async () => {
 		const marker = join(TEST_DIR, "pwned2");
-		const result = await grepTool.execute(
+		const _result = await grepTool.execute(
 			{ pattern: "line", path: `$(touch ${marker})` },
 			makeCtx(),
 		);
@@ -486,7 +487,7 @@ describe("Grep injection safety", () => {
 
 	test("glob with shell metacharacters is not interpreted", async () => {
 		const marker = join(TEST_DIR, "pwned3");
-		const result = await grepTool.execute(
+		const _result = await grepTool.execute(
 			{ pattern: "line", glob: `$(touch ${marker})` },
 			makeCtx(),
 		);
@@ -501,7 +502,7 @@ describe("Grep injection safety", () => {
 
 	test("pattern with backticks is treated literally", async () => {
 		const marker = join(TEST_DIR, "pwned4");
-		const result = await grepTool.execute({ pattern: "`touch " + marker + "`" }, makeCtx());
+		const _result = await grepTool.execute({ pattern: `\`touch ${marker}\`` }, makeCtx());
 		expect(existsSync(marker)).toBe(false);
 	});
 });
@@ -598,6 +599,7 @@ describe("zodToJsonSchema", () => {
 			mode: z.enum(["a", "b", "c"]),
 		});
 		const json = zodToJsonSchema(schema);
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const props = json.properties as Record<string, any>;
 		expect(props.mode.enum).toEqual(["a", "b", "c"]);
 	});
@@ -605,6 +607,7 @@ describe("zodToJsonSchema", () => {
 	test("converts boolean schema", () => {
 		const schema = z.object({ flag: z.boolean() });
 		const json = zodToJsonSchema(schema);
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const props = json.properties as Record<string, any>;
 		expect(props.flag).toEqual({ type: "boolean" });
 	});
@@ -612,6 +615,7 @@ describe("zodToJsonSchema", () => {
 	test("converts grep tool schema without error", () => {
 		const json = zodToJsonSchema(grepTool.parameters);
 		expect(json.type).toBe("object");
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const props = json.properties as Record<string, any>;
 		expect(props.pattern.type).toBe("string");
 		expect(props.pattern.description).toBeDefined();

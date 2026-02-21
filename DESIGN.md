@@ -181,8 +181,8 @@ export const narrators = sqliteTable('narrators', {
   chapterId: text('chapter_id')              // null = 游离会话（standalone session）
     .references(() => chapters.id),
 
-  // Claude Agent SDK session 管理
-  claudeSessionId: text('claude_session_id'),      // SDK 返回的 session_id，持久化用于 resume
+  // API 会话标识
+  apiConversationId: text('api_conversation_id'),      // API 返回的 conversation_id，用于关联会话
   activeBranchId: text('active_branch_id'),        // 当前活跃的对话分支 ID
   type: text('type', {
     enum: ['primary', 'secondary']
@@ -315,7 +315,7 @@ export const conversationBranches = sqliteTable('conversation_branches', {
   forkMessageId: text('fork_message_id'),           // fork 起点消息 ID（root 分支为 null）
   parentBranchId: text('parent_branch_id')          // 父分支 ID（root 分支为 null）
     .references(() => conversationBranches.id),
-  claudeSessionId: text('claude_session_id'),       // 分支独立的 SDK session ID
+  apiConversationId: text('api_conversation_id'),       // 分支独立的 API conversation ID
   contextSummary: text('context_summary'),          // 分支级别的上下文摘要
   status: text('status', {
     enum: ['active', 'archived']
@@ -593,10 +593,10 @@ Compact 机制：
 
 #### 4.2.2 narrator-session.ts — Claude Session 管理
 
-职责：封装 Claude Agent SDK 的 `query()` 调用，管理 session 的创建、恢复、分叉，以及消息缓冲和权限审批。
+职责：封装 AI provider 的流式调用，管理会话的创建和上下文重建，以及消息缓冲和权限审批。
 
 核心功能：
-- `startSession()` — 统一入口，根据 narrator 状态自动判断新建、恢复或分叉 session。传入 `cwd`、`model`、`permissionMode`。通过条件分支处理：无 `claudeSessionId` 时新建，有 `claudeSessionId` 时恢复（SDK `resume`），`isFullFork` 标志时分叉（SDK `resume` + `forkSession: true` + 可选 `resumeSessionAt`）
+- `startSession()` — 统一入口，根据 narrator 状态自动判断新建或恢复会话。传入 `cwd`、`model`、`permissionMode`。无 `apiConversationId` 时生成新 ID，有则复用。每次请求通过 `buildHistory()` 从 DB 消息重建完整对话历史。
 - `interruptSession()` — 中断当前执行
 - `recoverOnStartup()` — 服务器重启恢复逻辑：重置 `thinking` 状态的 narrator 为 `idle`，自动拒绝 pending 权限请求，标记 running tool calls 为 failed
 - `isSessionActive()` — 检查 narrator 是否有活跃的 SDK session

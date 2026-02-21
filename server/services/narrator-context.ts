@@ -3,7 +3,7 @@ import { narrators } from "../db/schema";
 import { agentGenerate, agentGenerateWithMeta } from "../lib/agent";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { getPrompt, type Locale } from "../lib/prompt-i18n";
+import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { narratorService } from "./narrator-service";
 
@@ -166,10 +166,16 @@ export const narratorContext = {
 
 		const compactPrompt = getPrompt("compact", locale);
 
+		// Check if there are pending todos — if so, skip todo generation in summary
+		const narrator = await narratorService.getById(narratorId);
+		const todos = Array.isArray(narrator.todosJson) ? narrator.todosJson : [];
+		const hasPendingTodos = todos.some((t: { status?: string }) => t.status !== "completed");
+		const todoSkipHint = hasPendingTodos ? `\n\n${getToolMessage("compactTodoSkip", locale)}` : "";
+
 		try {
 			const compactSuffix = getPrompt("compactSuffix", locale);
 			const result = await agentGenerateWithMeta(
-				`${compactPrompt}\n<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`,
+				`${compactPrompt}${todoSkipHint}\n<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`,
 				settings.agent.summaryModel,
 			);
 

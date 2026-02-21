@@ -50,7 +50,7 @@ export const createNarratorSchema = z.object({
 	systemPrompt: z.string().max(10000).optional(),
 	permissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"]).optional(),
 	cwd: z.string().min(1).max(4096).optional(),
-	sdkPlanMode: z.boolean().optional(),
+	planMode: z.boolean().optional(),
 });
 
 export const sendMessageSchema = z.object({
@@ -271,6 +271,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		message: z.string().optional(),
 		answers: z.record(z.string(), z.string()).optional(),
 		feedbackText: z.string().optional(),
+		compactAfter: z.boolean().optional(),
 	}),
 	z.object({
 		type: z.literal("merge_decision"),

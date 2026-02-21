@@ -37,15 +37,22 @@ async function request<T>(
 	return response.json();
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: SDK content blocks have dynamic structure
+export type ContentBlock = any;
+// biome-ignore lint/suspicious/noExplicitAny: SDK tool call records have dynamic structure
+export type ToolCallRecord = any;
+// biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
+export type ApiEntity = any;
+
 export interface TreeMessage {
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;
 	sdkMessageUuid?: string | null;
 	role: string;
-	contentJson: any[];
+	contentJson: ContentBlock[];
 	contentText: string | null;
-	toolCalls: any[];
+	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	turnUsageJson?: {
@@ -59,7 +66,7 @@ export interface TreeMessage {
 }
 
 export interface PaginatedNarrators {
-	items: any[];
+	items: ApiEntity[];
 	hasMore: boolean;
 	nextCursor: string | null;
 	totalCount: number;
@@ -75,49 +82,49 @@ export const api = {
 	// Auth
 	authStatus: () => request<{ hasUsers: boolean; registrationOpen: boolean }>("/auth/status"),
 	register: (data: { username: string; password: string }) =>
-		request<{ user: any; token: string }>("/auth/register", {
+		request<{ user: ApiEntity; token: string }>("/auth/register", {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
 	login: (data: { username: string; password: string }) =>
-		request<{ user: any; token: string }>("/auth/login", {
+		request<{ user: ApiEntity; token: string }>("/auth/login", {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
-	me: () => request<any>("/auth/me"),
+	me: () => request<ApiEntity>("/auth/me"),
 
 	// Admin
-	listUsers: () => request<any[]>("/admin/users"),
-	deleteUser: (id: string) => request<any>(`/admin/users/${id}`, { method: "DELETE" }),
+	listUsers: () => request<ApiEntity[]>("/admin/users"),
+	deleteUser: (id: string) => request<ApiEntity>(`/admin/users/${id}`, { method: "DELETE" }),
 	updateUser: (id: string, data: { username?: string; password?: string }) =>
-		request<any>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+		request<ApiEntity>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	updateAdminSettings: (data: { registrationOpen: boolean }) =>
-		request<any>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
+		request<ApiEntity>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Projects
 	listProjects: (status?: string) =>
-		request<any[]>(`/projects${status ? `?status=${status}` : ""}`),
-	getProject: (id: string) => request<any>(`/projects/${id}`),
-	createProject: (data: any) =>
-		request<any>("/projects", { method: "POST", body: JSON.stringify(data) }),
-	updateProject: (id: string, data: any) =>
-		request<any>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
-	deleteProject: (id: string) => request<any>(`/projects/${id}`, { method: "DELETE" }),
+		request<ApiEntity[]>(`/projects${status ? `?status=${status}` : ""}`),
+	getProject: (id: string) => request<ApiEntity>(`/projects/${id}`),
+	createProject: (data: Record<string, unknown>) =>
+		request<ApiEntity>("/projects", { method: "POST", body: JSON.stringify(data) }),
+	updateProject: (id: string, data: Record<string, unknown>) =>
+		request<ApiEntity>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	deleteProject: (id: string) => request<ApiEntity>(`/projects/${id}`, { method: "DELETE" }),
 
 	// Chapters
 	listChapters: (projectId: string, status?: string) =>
-		request<any[]>(`/chapters?projectId=${projectId}${status ? `&status=${status}` : ""}`),
-	getChapter: (id: string) => request<any>(`/chapters/${id}`),
-	createChapter: (data: any) =>
-		request<any>("/chapters", { method: "POST", body: JSON.stringify(data) }),
-	updateChapter: (id: string, data: any) =>
-		request<any>(`/chapters/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
-	deleteChapter: (id: string) => request<any>(`/chapters/${id}`, { method: "DELETE" }),
+		request<ApiEntity[]>(`/chapters?projectId=${projectId}${status ? `&status=${status}` : ""}`),
+	getChapter: (id: string) => request<ApiEntity>(`/chapters/${id}`),
+	createChapter: (data: Record<string, unknown>) =>
+		request<ApiEntity>("/chapters", { method: "POST", body: JSON.stringify(data) }),
+	updateChapter: (id: string, data: Record<string, unknown>) =>
+		request<ApiEntity>(`/chapters/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	deleteChapter: (id: string) => request<ApiEntity>(`/chapters/${id}`, { method: "DELETE" }),
 
 	// Settings
-	getSettings: () => request<any>("/settings"),
-	updateSettings: (data: any) =>
-		request<any>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
+	getSettings: () => request<ApiEntity>("/settings"),
+	updateSettings: (data: Record<string, unknown>) =>
+		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Narrators (both chapter-bound and standalone sessions)
 	listNarrators: (opts?: {
@@ -134,7 +141,7 @@ export const api = {
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
 		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
 		const qs = params.toString();
-		return request<any[]>(`/narrators${qs ? `?${qs}` : ""}`);
+		return request<ApiEntity[]>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	listNarratorsPaginated: (opts?: {
 		standalone?: boolean;
@@ -154,7 +161,7 @@ export const api = {
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
-	getNarrator: (id: string) => request<any>(`/narrators/${id}`),
+	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
 	createNarrator: (data: {
 		chapterId?: string | null;
 		type?: string;
@@ -162,12 +169,14 @@ export const api = {
 		systemPrompt?: string;
 		permissionMode?: string;
 		cwd?: string;
-		sdkPlanMode?: boolean;
-	}) => request<any>("/narrators", { method: "POST", body: JSON.stringify(data) }),
-	archiveNarrator: (id: string) => request<any>(`/narrators/${id}/archive`, { method: "PATCH" }),
+		planMode?: boolean;
+	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
+	archiveNarrator: (id: string) =>
+		request<ApiEntity>(`/narrators/${id}/archive`, { method: "PATCH" }),
 	unarchiveNarrator: (id: string) =>
-		request<any>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
-	markNarratorRead: (id: string) => request<any>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
+		request<ApiEntity>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
+	markNarratorRead: (id: string) =>
+		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
 	getNarratorMessages: (
 		id: string,
 		limit?: number,
@@ -187,15 +196,16 @@ export const api = {
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
 	},
 	getToolCallDetail: (narratorId: string, toolUseId: string) =>
-		request<any>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
-	interruptNarrator: (id: string) => request<any>(`/narrators/${id}/interrupt`, { method: "POST" }),
+		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
+	interruptNarrator: (id: string) =>
+		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	getBufferedMessage: (id: string) =>
 		request<{ text: string; bufferedAt: string } | null>(`/narrators/${id}/buffer`),
-	getPendingPermissions: (id: string) => request<any[]>(`/narrators/${id}/permissions`),
+	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
 	approvePermission: (requestId: string) =>
-		request<any>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),
+		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),
 	denyPermission: (requestId: string, message?: string) =>
-		request<any>(`/narrators/permissions/${requestId}/deny`, {
+		request<ApiEntity>(`/narrators/permissions/${requestId}/deny`, {
 			method: "POST",
 			body: JSON.stringify({ message }),
 		}),
@@ -255,12 +265,14 @@ export const api = {
 			body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
 		}),
 	createPlan: (narratorId: string, content: string) =>
-		request<any>(`/narrators/${narratorId}/plan`, {
+		request<ApiEntity>(`/narrators/${narratorId}/plan`, {
 			method: "POST",
 			body: JSON.stringify({ content }),
 		}),
 	deleteCompactMessage: (narratorId: string, messageId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, { method: "DELETE" }),
+		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
+			method: "DELETE",
+		}),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
@@ -268,14 +280,14 @@ export const api = {
 		}),
 
 	// Conversation Branches
-	listBranches: (narratorId: string) => request<any[]>(`/narrators/${narratorId}/branches`),
+	listBranches: (narratorId: string) => request<ApiEntity[]>(`/narrators/${narratorId}/branches`),
 	createBranch: (narratorId: string, forkMessageId: string, name?: string) =>
-		request<any>(`/narrators/${narratorId}/branches`, {
+		request<ApiEntity>(`/narrators/${narratorId}/branches`, {
 			method: "POST",
 			body: JSON.stringify({ forkMessageId, name }),
 		}),
 	updateBranch: (narratorId: string, branchId: string, data: { name?: string; status?: string }) =>
-		request<any>(`/narrators/${narratorId}/branches/${branchId}`, {
+		request<ApiEntity>(`/narrators/${narratorId}/branches/${branchId}`, {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
@@ -291,11 +303,11 @@ export const api = {
 	// Terminals
 	listTerminals: (chapterId: string) => {
 		const params = new URLSearchParams({ chapterId });
-		return request<any[]>(`/terminals?${params}`);
+		return request<ApiEntity[]>(`/terminals?${params}`);
 	},
 	listTerminalsByNarrator: (narratorId: string) => {
 		const params = new URLSearchParams({ narratorId });
-		return request<any[]>(`/terminals?${params}`);
+		return request<ApiEntity[]>(`/terminals?${params}`);
 	},
 	createTerminal: (data: {
 		chapterId?: string;
@@ -303,31 +315,38 @@ export const api = {
 		name?: string;
 		cols?: number;
 		rows?: number;
-	}) => request<any>("/terminals", { method: "POST", body: JSON.stringify(data) }),
-	getTerminal: (id: string) => request<any>(`/terminals/${id}`),
-	deleteTerminal: (id: string) => request<any>(`/terminals/${id}`, { method: "DELETE" }),
+	}) => request<ApiEntity>("/terminals", { method: "POST", body: JSON.stringify(data) }),
+	getTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`),
+	deleteTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`, { method: "DELETE" }),
 
 	// Terminal Tabs
 	listTerminalTabs: (opts: { chapterId?: string; narratorId?: string }) => {
 		const params = new URLSearchParams();
 		if (opts.chapterId) params.set("chapterId", opts.chapterId);
 		if (opts.narratorId) params.set("narratorId", opts.narratorId);
-		return request<any[]>(`/terminals/tabs?${params}`);
+		return request<ApiEntity[]>(`/terminals/tabs?${params}`);
 	},
 	createTerminalTab: (data: { chapterId?: string; narratorId?: string; name: string }) =>
-		request<any>("/terminals/tabs", { method: "POST", body: JSON.stringify(data) }),
+		request<ApiEntity>("/terminals/tabs", { method: "POST", body: JSON.stringify(data) }),
 	updateTerminalTab: (id: string, data: { name?: string }) =>
-		request<any>(`/terminals/tabs/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
-	deleteTerminalTab: (id: string) => request<any>(`/terminals/tabs/${id}`, { method: "DELETE" }),
+		request<ApiEntity>(`/terminals/tabs/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteTerminalTab: (id: string) =>
+		request<ApiEntity>(`/terminals/tabs/${id}`, { method: "DELETE" }),
 	reorderTerminalTabs: (ids: string[]) =>
-		request<any>("/terminals/tabs/reorder", { method: "PUT", body: JSON.stringify({ ids }) }),
+		request<ApiEntity>("/terminals/tabs/reorder", {
+			method: "PUT",
+			body: JSON.stringify({ ids }),
+		}),
 
 	// Terminal View State
 	getTerminalViewState: (opts: { chapterId?: string; narratorId?: string }) => {
 		const params = new URLSearchParams();
 		if (opts.chapterId) params.set("chapterId", opts.chapterId);
 		if (opts.narratorId) params.set("narratorId", opts.narratorId);
-		return request<any>(`/terminals/view-state?${params}`);
+		return request<ApiEntity>(`/terminals/view-state?${params}`);
 	},
 	updateTerminalViewState: (data: {
 		chapterId?: string;
@@ -335,27 +354,35 @@ export const api = {
 		layout?: string;
 		activeTabId?: string | null;
 		panelAssignments?: Record<string, string> | null;
-	}) => request<any>("/terminals/view-state", { method: "PUT", body: JSON.stringify(data) }),
+	}) =>
+		request<ApiEntity>("/terminals/view-state", {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
 
 	// Graph
 	getProjectGraph: (projectId: string) =>
-		request<{ nodes: any[]; edges: any[] }>(`/projects/${projectId}/graph`),
+		request<{ nodes: ApiEntity[]; edges: ApiEntity[] }>(`/projects/${projectId}/graph`),
 
 	// Search
 	search: (q: string, entities = "chapters,messages") =>
-		request<{ results: any[] }>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
+		request<{ results: ApiEntity[] }>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
 
 	// Favorite Directories
-	listFavoriteDirectories: () => request<any[]>("/favorites"),
+	listFavoriteDirectories: () => request<ApiEntity[]>("/favorites"),
 	createFavoriteDirectory: (data: { path: string; label?: string }) =>
-		request<any>("/favorites", { method: "POST", body: JSON.stringify(data) }),
+		request<ApiEntity>("/favorites", { method: "POST", body: JSON.stringify(data) }),
 	updateFavoriteDirectory: (
 		id: string,
 		data: { path?: string; label?: string | null; sortOrder?: number },
-	) => request<any>(`/favorites/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
-	deleteFavoriteDirectory: (id: string) => request<any>(`/favorites/${id}`, { method: "DELETE" }),
+	) => request<ApiEntity>(`/favorites/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	deleteFavoriteDirectory: (id: string) =>
+		request<ApiEntity>(`/favorites/${id}`, { method: "DELETE" }),
 	reorderFavoriteDirectories: (ids: string[]) =>
-		request<any>("/favorites/reorder", { method: "PUT", body: JSON.stringify({ ids }) }),
+		request<ApiEntity>("/favorites/reorder", {
+			method: "PUT",
+			body: JSON.stringify({ ids }),
+		}),
 
 	// User Preferences
 	getUserPreferences: () =>
@@ -380,18 +407,22 @@ export const api = {
 		showTokenUsage?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
-	}) => request<any>("/user-preferences", { method: "PATCH", body: JSON.stringify(data) }),
+	}) =>
+		request<ApiEntity>("/user-preferences", {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
 
 	// Containers
-	getContainers: (chapterId: string) => request<any[]>(`/chapters/${chapterId}/containers`),
+	getContainers: (chapterId: string) => request<ApiEntity[]>(`/chapters/${chapterId}/containers`),
 	startContainers: (chapterId: string) =>
-		request<any>(`/chapters/${chapterId}/containers/start`, { method: "POST" }),
+		request<ApiEntity>(`/chapters/${chapterId}/containers/start`, { method: "POST" }),
 	stopContainers: (chapterId: string) =>
-		request<any>(`/chapters/${chapterId}/containers/stop`, { method: "POST" }),
+		request<ApiEntity>(`/chapters/${chapterId}/containers/stop`, { method: "POST" }),
 	pauseContainers: (chapterId: string) =>
-		request<any>(`/chapters/${chapterId}/containers/pause`, { method: "POST" }),
+		request<ApiEntity>(`/chapters/${chapterId}/containers/pause`, { method: "POST" }),
 	unpauseContainers: (chapterId: string) =>
-		request<any>(`/chapters/${chapterId}/containers/unpause`, { method: "POST" }),
+		request<ApiEntity>(`/chapters/${chapterId}/containers/unpause`, { method: "POST" }),
 	getContainerLogs: (chapterId: string, opts?: { tail?: number; service?: string }) => {
 		const params = new URLSearchParams();
 		if (opts?.tail) params.set("tail", String(opts.tail));
@@ -400,7 +431,7 @@ export const api = {
 		return request<{ logs: string }>(`/chapters/${chapterId}/containers/logs${qs ? `?${qs}` : ""}`);
 	},
 	removeContainers: (chapterId: string, opts?: { deleteVolumes?: boolean }) =>
-		request<any>(`/chapters/${chapterId}/containers/remove`, {
+		request<ApiEntity>(`/chapters/${chapterId}/containers/remove`, {
 			method: "POST",
 			body: JSON.stringify(opts ?? {}),
 		}),
@@ -414,35 +445,49 @@ export const api = {
 			inheritMode?: string;
 			forkAtMessageUuid?: string;
 		},
-	) => request<any>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
+	) => request<ApiEntity>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
 	checkMergeConflicts: (id: string, targetChapterId: string) =>
-		request<any>(`/chapters/${id}/merge-check?targetChapterId=${targetChapterId}`),
+		request<ApiEntity>(`/chapters/${id}/merge-check?targetChapterId=${targetChapterId}`),
 	mergeChapter: (
 		id: string,
 		data: { targetChapterId: string; strategy?: string; message?: string },
-	) => request<any>(`/chapters/${id}/merge`, { method: "POST", body: JSON.stringify(data) }),
+	) =>
+		request<ApiEntity>(`/chapters/${id}/merge`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 	cleanupChapters: (data: { chapterIds: string[]; force?: boolean; deleteBranch?: boolean }) =>
-		request<any>("/chapters/cleanup", { method: "POST", body: JSON.stringify(data) }),
+		request<ApiEntity>("/chapters/cleanup", { method: "POST", body: JSON.stringify(data) }),
 	batchMerge: (data: {
 		baseChapterId: string;
 		sourceChapterIds: string[];
 		title: string;
 		strategy?: string;
-	}) => request<any>("/chapters/batch-merge", { method: "POST", body: JSON.stringify(data) }),
-	dormantChapter: (id: string) => request<any>(`/chapters/${id}/dormant`, { method: "POST" }),
-	wakeChapter: (id: string) => request<any>(`/chapters/${id}/wake`, { method: "POST" }),
+	}) =>
+		request<ApiEntity>("/chapters/batch-merge", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	dormantChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/dormant`, { method: "POST" }),
+	wakeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/wake`, { method: "POST" }),
 
 			method: "POST",
 			body: JSON.stringify({ priority }),
+		}),
+			method: "POST",
+			body: JSON.stringify({ query }),
 		}),
 			method: "POST",
 			body: JSON.stringify({ credentials }),
 		}),
 		request<{ models: Array<Record<string, unknown>>; fromCache: boolean }>(
 		),
-		request<{ models: Array<Record<string, unknown>>; credentialId?: number; fromCache: boolean }>(
-			{ method: "POST" },
-		),
+		request<{
+			models: Array<Record<string, unknown>>;
+			credentialId?: number;
+			fromCache: boolean;
+			method: "POST",
+		}),
 };
 
 	text: string,

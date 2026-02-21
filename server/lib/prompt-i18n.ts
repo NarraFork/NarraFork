@@ -136,10 +136,127 @@ const toolMessages = {
 		en: "Tool execution was interrupted by a server restart.",
 		"zh-CN": "工具执行因服务器重启而中断。",
 	},
+	systemPromptAck: {
+		en: "I will follow these instructions.",
+		"zh-CN": "我会遵循这些指示。",
+	},
+	titleAck: {
+		en: "Understood. I will generate only a short title. Send me the content.",
+		"zh-CN": "明白。我只会生成一个简短的标题。请发送内容。",
+	},
+	titleReminder: {
+		en: "Reply with ONLY a short title (max 50 chars), nothing else.",
+		"zh-CN": "只回复一个简短的标题（最多50个字符），不要回复其他任何内容。",
+	},
+	compactTodoSkip: {
+		en: "Note: TODOs are tracked separately. Do NOT include any TODO or task list information in the summary.",
+		"zh-CN": "注意：待办事项已通过独立机制管理，摘要中不要包含任何 TODO 或待办事项信息。",
+	},
+	// Plan mode tool outputs
+	enterPlanModeOutput: {
+		en: "Entered plan mode. Analyze and plan before making changes.",
+		"zh-CN": "已进入计划模式。请先分析和规划，再进行修改。",
+	},
+	// Permission messages
+	permissionDeniedByUser: {
+		en: "The user rejected this tool call.",
+		"zh-CN": "用户拒绝了此工具调用。",
+	},
+	permissionDeniedWithMessage: {
+		en: "The user rejected this tool call with the following message: {message}",
+		"zh-CN": "用户拒绝了此工具调用，并附带以下消息：{message}",
+	},
+	permissionDeniedNonInteractive: {
+		en: "Non-interactive session: all risky operations are denied",
+		"zh-CN": "非交互式会话：所有高风险操作已被拒绝",
+	},
+	// Plan mode disabled tool description (injected in loop.ts)
+	planModeToolDisabled: {
+		en: "[PLAN MODE] This tool is disabled during plan mode. Focus on reading and analyzing code, then call ExitPlanMode with your plan.",
+		"zh-CN":
+			"[计划模式] 此工具在计划模式下已禁用。请专注于阅读和分析代码，然后调用 ExitPlanMode 提交你的计划。",
+	},
+	// TodoWrite output
+	todoWriteOutput: {
+		en: "Updated todos: {total} total ({completed} completed, {inProgress} in progress, {pending} pending)",
+		"zh-CN":
+			"已更新待办事项：共 {total} 项（{completed} 已完成，{inProgress} 进行中，{pending} 待处理）",
+	},
 } satisfies Record<string, Record<Locale, string>>;
 
 export type ToolMessageKey = keyof typeof toolMessages;
 
 export function getToolMessage(key: ToolMessageKey, locale: Locale = "en"): string {
 	return toolMessages[key][locale] ?? toolMessages[key].en;
+}
+
+/**
+ * Get a tool message with placeholder interpolation.
+ * Replaces `{key}` patterns with values from the params object.
+ */
+export function getToolMessageWithParams(
+	key: ToolMessageKey,
+	locale: Locale = "en",
+	params: Record<string, string | number> = {},
+): string {
+	let msg = toolMessages[key][locale] ?? toolMessages[key].en;
+	for (const [k, v] of Object.entries(params)) {
+		msg = msg.replaceAll(`{${k}}`, String(v));
+	}
+	return msg;
+}
+
+// --- Plan mode system reminder (injected into system prompt) ---
+
+const planModeSystemReminder: Record<Locale, string> = {
+	en: `<system-reminder>
+# Plan Mode
+
+CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase.
+
+STRICTLY FORBIDDEN: ANY file edits, modifications, or system changes. Do NOT use Write, Edit, or any bash command that modifies files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation. ZERO exceptions.
+
+## Your Responsibility
+
+Think, read, search, and construct a well-formed plan that accomplishes the user's goal. Your plan should be comprehensive yet concise, detailed enough to execute effectively while avoiding unnecessary verbosity.
+
+## Workflow
+
+1. **Understand** — Read relevant files and understand the codebase structure
+2. **Analyze** — Identify the changes needed, potential risks, and tradeoffs
+3. **Plan** — Formulate a clear, step-by-step implementation plan
+4. **Clarify** — Ask the user questions when weighing tradeoffs or facing ambiguity
+5. **Present** — Call ExitPlanMode with your complete plan when ready
+
+Do NOT make large assumptions about user intent. Ask clarifying questions when needed.
+
+Your turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop for any other reason.
+</system-reminder>`,
+	"zh-CN": `<system-reminder>
+# 计划模式
+
+关键约束：计划模式已激活 — 你处于只读阶段。
+
+严格禁止：任何文件编辑、修改或系统变更。不要使用 Write、Edit 或任何修改文件的 bash 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。零例外。
+
+## 你的职责
+
+思考、阅读、搜索，并构建一个完善的计划来实现用户的目标。计划应全面而简洁，足够详细以有效执行，同时避免不必要的冗长。
+
+## 工作流程
+
+1. **理解** — 阅读相关文件，理解代码库结构
+2. **分析** — 识别需要的变更、潜在风险和权衡
+3. **规划** — 制定清晰的、分步骤的实施计划
+4. **澄清** — 在权衡取舍或面临歧义时向用户提问
+5. **提交** — 准备好后调用 ExitPlanMode 提交完整计划
+
+不要对用户意图做大量假设。需要时请提出澄清问题。
+
+你的回合应该只以向用户提问或调用 ExitPlanMode 结束。不要因为其他原因停止。
+</system-reminder>`,
+};
+
+export function getPlanModeSystemReminder(locale: Locale = "en"): string {
+	return planModeSystemReminder[locale] ?? planModeSystemReminder.en;
 }
