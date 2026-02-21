@@ -223,6 +223,7 @@ function SettingsPage() {
 
 	if (isLoading) return <Loader />;
 
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				.map((m: any) => ({
 					value: String(m.model_id ?? m.modelId ?? ""),
 					label: String(

@@ -79,8 +79,8 @@ export class BufferManager {
 		this.chunks.push({ data, timestamp: Date.now() });
 		this.totalChars += data.length;
 		while (this.totalChars > MAX_BUFFER_CHARS && this.chunks.length > 1) {
-			const removed = this.chunks.shift()!;
-			this.totalChars -= removed.data.length;
+			const removed = this.chunks.shift();
+			if (removed) this.totalChars -= removed.data.length;
 		}
 		this.dirty = true;
 	}

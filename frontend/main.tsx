@@ -34,6 +34,7 @@ declare module "@tanstack/react-router" {
 	}
 }
 
+// biome-ignore lint/style/noNonNullAssertion: root element always exists
 ReactDOM.createRoot(document.getElementById("root")!).render(
 	<React.StrictMode>
 		<MantineProvider theme={theme} defaultColorScheme="auto">

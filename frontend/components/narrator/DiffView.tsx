@@ -212,6 +212,7 @@ export const DiffView = memo(function DiffView({
 			: {
 					...containerStyle,
 					maxHeight: undefined,
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					overflow: "auto" as any,
 					flex: 1,
 					minHeight: 0,

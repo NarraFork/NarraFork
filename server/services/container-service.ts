@@ -58,7 +58,7 @@ function resolveComposeFile(worktreePath: string, config: ContainerConfig | null
 	if (config?.composeFile) {
 		const p = resolve(worktreePath, config.composeFile);
 		// Prevent path traversal — resolved path must stay within worktree
-		if (!p.startsWith(worktreePath + "/") && p !== worktreePath) return null;
+		if (!p.startsWith(`${worktreePath}/`) && p !== worktreePath) return null;
 		return existsSync(p) ? p : null;
 	}
 	for (const name of ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"]) {

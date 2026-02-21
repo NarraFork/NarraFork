@@ -25,6 +25,7 @@ const linkStyle = { textDecoration: "none", color: "inherit" } as const;
 
 /** Resolve the navigation target for a search result */
 function getResultLink(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	result: any,
 ): { to: string; params: Record<string, string>; hash?: string } | null {
 	if (result.type === "chapter") {
@@ -99,6 +100,7 @@ function SearchPage() {
 				<Text c="dimmed">{q ? t("noResults") : t("enterQuery")}</Text>
 			) : (
 				<Stack>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{data.results.map((result: any) => {
 						const key = `${result.type}-${result.id}`;
 						const link = getResultLink(result);

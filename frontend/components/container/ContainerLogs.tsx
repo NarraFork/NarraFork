@@ -22,6 +22,7 @@ export function ContainerLogs({ chapterId }: ContainerLogsProps) {
 	const { t } = useTranslation("containers");
 	const { t: tc } = useTranslation("common");
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const serviceOptions = (containers ?? []).map((c: any) => ({
 		value: c.serviceName,
 		label: c.serviceName,

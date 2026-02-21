@@ -25,6 +25,7 @@ function SessionDetailPage() {
 
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(sessionId);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const hasRunningTerminal = (existingTerminals ?? []).some((t: any) => t.status === "running");
 
 	// Terminal drawer for mobile

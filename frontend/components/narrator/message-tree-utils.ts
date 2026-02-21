@@ -4,9 +4,29 @@
  * React Query's cached message pages.
  */
 
+import type { TreeMessage } from "@frontend/lib/api";
+
+interface ToolCall {
+	toolUseId: string;
+	status?: string;
+	outputJson?: unknown;
+	[key: string]: unknown;
+}
+
+interface CachePage {
+	messages: TreeMessage[];
+	hasMore?: boolean;
+	nextCursor?: string | null;
+}
+
+interface InfiniteCache {
+	pages: CachePage[];
+	pageParams?: unknown[];
+}
+
 /** Insert a child message into the correct parent's children array in the cache */
-export function insertChildIntoCache(old: any, childMsg: any): any {
-	const pages = old.pages.map((page: any) => {
+export function insertChildIntoCache(old: InfiniteCache, childMsg: TreeMessage): InfiniteCache {
+	const pages = old.pages.map((page) => {
 		const { messages, changed } = insertChildIntoMessages(page.messages, childMsg);
 		return changed ? { ...page, messages } : page;
 	});
@@ -14,17 +34,17 @@ export function insertChildIntoCache(old: any, childMsg: any): any {
 }
 
 function insertChildIntoMessages(
-	messages: any[],
-	childMsg: any,
-): { messages: any[]; changed: boolean } {
+	messages: TreeMessage[],
+	childMsg: TreeMessage,
+): { messages: TreeMessage[]; changed: boolean } {
 	let anyChanged = false;
-	const updated = messages.map((msg: any) => {
+	const updated = messages.map((msg) => {
 		// Check if this message contains the parent tool call
-		const hasParentTool = msg.toolCalls?.some(
-			(tc: any) => tc.toolUseId === childMsg.parentToolUseId,
+		const hasParentTool = (msg.toolCalls as ToolCall[])?.some(
+			(tc) => tc.toolUseId === childMsg.parentToolUseId,
 		);
 		if (hasParentTool) {
-			if (msg.children?.some((c: any) => c.id === childMsg.id)) return msg;
+			if (msg.children?.some((c) => c.id === childMsg.id)) return msg;
 			anyChanged = true;
 			return { ...msg, children: [...(msg.children || []), childMsg] };
 		}
@@ -43,16 +63,16 @@ function insertChildIntoMessages(
 
 /** Recursively merge extra fields into a tool call's record in the message tree */
 export function mergeToolCallFieldsInTree(
-	messages: any[],
+	messages: TreeMessage[],
 	toolUseId: string,
 	fields: Record<string, unknown>,
-): { messages: any[]; changed: boolean } {
+): { messages: TreeMessage[]; changed: boolean } {
 	let anyChanged = false;
-	const updated = messages.map((msg: any) => {
+	const updated = messages.map((msg) => {
 		let result = msg;
-		if (msg.toolCalls?.length) {
+		if ((msg.toolCalls as ToolCall[])?.length) {
 			let tcChanged = false;
-			const updatedCalls = msg.toolCalls.map((tc: any) => {
+			const updatedCalls = (msg.toolCalls as ToolCall[]).map((tc) => {
 				if (tc.toolUseId !== toolUseId) return tc;
 				tcChanged = true;
 				return { ...tc, ...fields };
@@ -76,19 +96,19 @@ export function mergeToolCallFieldsInTree(
 
 /** Recursively update a tool call's status/output in the message tree */
 export function updateToolCallInTree(
-	messages: any[],
+	messages: TreeMessage[],
 	toolUseId: string,
 	status: string,
 	output?: unknown,
-): { messages: any[]; changed: boolean } {
+): { messages: TreeMessage[]; changed: boolean } {
 	let anyChanged = false;
-	const updated = messages.map((msg: any) => {
+	const updated = messages.map((msg) => {
 		let msgChanged = false;
 		let result = msg;
 
 		// Update toolCalls on this message
-		if (msg.toolCalls?.length) {
-			const updatedCalls = msg.toolCalls.map((tc: any) => {
+		if ((msg.toolCalls as ToolCall[])?.length) {
+			const updatedCalls = (msg.toolCalls as ToolCall[]).map((tc) => {
 				if (tc.toolUseId !== toolUseId) return tc;
 				msgChanged = true;
 				return { ...tc, status, outputJson: output ?? tc.outputJson };
@@ -114,9 +134,12 @@ export function updateToolCallInTree(
 }
 
 /** Find a message in the tree that contains a tool call with the given toolUseId */
-export function findMsgByToolUseIdInTree(messages: any[], toolUseId: string): any | null {
+export function findMsgByToolUseIdInTree(
+	messages: TreeMessage[],
+	toolUseId: string,
+): TreeMessage | null {
 	for (const msg of messages) {
-		if (msg.toolCalls?.some((tc: any) => tc.toolUseId === toolUseId)) return msg;
+		if ((msg.toolCalls as ToolCall[])?.some((tc) => tc.toolUseId === toolUseId)) return msg;
 		if (msg.children?.length) {
 			const found = findMsgByToolUseIdInTree(msg.children, toolUseId);
 			if (found) return found;
@@ -131,7 +154,7 @@ export function findMsgByToolUseIdInTree(messages: any[], toolUseId: string): an
 export type MessageIndex = Map<string, { pageIdx: number; path: number[] }>;
 
 /** Build an index of toolUseId → location for all messages across all pages */
-export function buildToolUseIndex(pages: any[]): MessageIndex {
+export function buildToolUseIndex(pages: CachePage[]): MessageIndex {
 	const index: MessageIndex = new Map();
 	for (let p = 0; p < pages.length; p++) {
 		indexMessages(pages[p].messages, p, [], index);
@@ -146,8 +169,8 @@ export function buildToolUseIndex(pages: any[]): MessageIndex {
  */
 export function updateToolUseIndex(
 	prevIndex: MessageIndex,
-	prevPages: any[],
-	newPages: any[],
+	prevPages: CachePage[],
+	newPages: CachePage[],
 ): MessageIndex {
 	if (newPages.length !== prevPages.length) {
 		return buildToolUseIndex(newPages);
@@ -177,11 +200,16 @@ export function updateToolUseIndex(
 	return updated;
 }
 
-function indexMessages(messages: any[], pageIdx: number, path: number[], index: MessageIndex) {
+function indexMessages(
+	messages: TreeMessage[],
+	pageIdx: number,
+	path: number[],
+	index: MessageIndex,
+) {
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		if (msg.toolCalls) {
-			for (const tc of msg.toolCalls) {
+			for (const tc of msg.toolCalls as ToolCall[]) {
 				if (tc.toolUseId) {
 					index.set(tc.toolUseId, { pageIdx, path: [...path, i] });
 				}
@@ -195,12 +223,12 @@ function indexMessages(messages: any[], pageIdx: number, path: number[], index: 
 
 /** Navigate to a message by path and update its tool call immutably */
 function updateAtPath(
-	messages: any[],
+	messages: TreeMessage[],
 	path: number[],
 	toolUseId: string,
 	status: string,
 	output: unknown | undefined,
-): any[] {
+): TreeMessage[] {
 	if (path.length === 0) return messages;
 	const [idx, ...rest] = path;
 	const updated = [...messages];
@@ -209,8 +237,8 @@ function updateAtPath(
 
 	if (rest.length === 0) {
 		// This is the target message — update its toolCalls
-		if (!msg.toolCalls?.length) return messages;
-		const updatedCalls = msg.toolCalls.map((tc: any) => {
+		if (!(msg.toolCalls as ToolCall[])?.length) return messages;
+		const updatedCalls = (msg.toolCalls as ToolCall[]).map((tc) => {
 			if (tc.toolUseId !== toolUseId) return tc;
 			return { ...tc, status, outputJson: output ?? tc.outputJson };
 		});
@@ -228,18 +256,18 @@ function updateAtPath(
 
 /** Update a tool call using the pre-built index for O(1) lookup. Falls back to full traversal. */
 export function updateToolCallByIndex(
-	old: any,
+	old: InfiniteCache,
 	toolUseId: string,
 	status: string,
 	output: unknown | undefined,
 	index: MessageIndex,
-): any {
+): InfiniteCache {
 	const entry = index.get(toolUseId);
 	if (!entry) {
 		// Fallback: tool was added after last index build (e.g. new message via WS)
 		if (!old?.pages?.length) return old;
 		let anyChanged = false;
-		const pages = old.pages.map((page: any) => {
+		const pages = old.pages.map((page) => {
 			const { messages, changed } = updateToolCallInTree(page.messages, toolUseId, status, output);
 			if (changed) anyChanged = true;
 			return changed ? { ...page, messages } : page;
@@ -252,34 +280,4 @@ export function updateToolCallByIndex(
 	page.messages = updateAtPath(page.messages, entry.path, toolUseId, status, output);
 	pages[entry.pageIdx] = page;
 	return { ...old, pages };
-}
-
-/** Navigate to a message by path and merge fields into its tool call immutably */
-function mergeFieldsAtPath(
-	messages: any[],
-	path: number[],
-	toolUseId: string,
-	fields: Record<string, unknown>,
-): any[] {
-	if (path.length === 0) return messages;
-	const [idx, ...rest] = path;
-	const updated = [...messages];
-	const msg = updated[idx];
-	if (!msg) return messages;
-
-	if (rest.length === 0) {
-		if (!msg.toolCalls?.length) return messages;
-		const updatedCalls = msg.toolCalls.map((tc: any) => {
-			if (tc.toolUseId !== toolUseId) return tc;
-			return { ...tc, ...fields };
-		});
-		updated[idx] = { ...msg, toolCalls: updatedCalls };
-	} else {
-		if (!msg.children?.length) return messages;
-		updated[idx] = {
-			...msg,
-			children: mergeFieldsAtPath(msg.children, rest, toolUseId, fields),
-		};
-	}
-	return updated;
 }

@@ -149,8 +149,8 @@ class TerminalWSManager {
 		set.add(listener);
 
 		return () => {
-			set!.delete(listener);
-			if (set!.size === 0) {
+			set?.delete(listener);
+			if (set?.size === 0) {
 				this.listeners.delete(terminalId);
 				if (this._connected) {
 					this.send({ type: "unsubscribe", terminalIds: [terminalId] });

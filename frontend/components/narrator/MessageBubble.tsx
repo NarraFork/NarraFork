@@ -1,5 +1,7 @@
 import {
 	Box,
+	Button,
+	Group,
 	Image,
 	Loader,
 	Modal,
@@ -9,8 +11,6 @@ import {
 	Stack,
 	Text,
 	Textarea,
-	Button,
-	Group,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconArrowsMinimize, IconListCheck } from "@tabler/icons-react";
@@ -20,10 +20,7 @@ import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
 import { MarkdownContent } from "./MarkdownContent";
-import {
-	type MessageContextMenuActions,
-	MessageContextMenuCtx,
-} from "./MessageContextMenuCtx";
+import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
@@ -31,14 +28,17 @@ interface MessageBubbleProps {
 	message: {
 		id?: string;
 		role: string;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		contentJson: any[];
 		contentText?: string | null;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls?: any[];
 		sdkMessageUuid?: string | null;
 	};
 	onForkFromMessage?: (sdkMessageUuid: string) => void;
 	onBranchFromMessage?: (messageId: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	resolvePerm?: (tc: any) => PendingPermission | null;
 	onPermissionDecision?: (
 		requestId: string,
@@ -50,6 +50,7 @@ interface MessageBubbleProps {
 	onDeleteMessage?: (messageId: string) => void;
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) {
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
@@ -130,7 +131,7 @@ function CompactIndicator({
 
 	const { data, isLoading, error, refetch } = useQuery({
 		queryKey: ["compact-summary", narratorId, messageId],
-		queryFn: () => api.getCompactSummary(narratorId!, messageId!),
+		queryFn: () => api.getCompactSummary(narratorId ?? "", messageId ?? ""),
 		enabled: opened && !!narratorId && !!messageId,
 	});
 
@@ -380,18 +381,21 @@ export const MessageBubble = memo(function MessageBubble({
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const { t } = useTranslation("narrator");
+	const msgId = message.id;
 
 	// Build message-level context menu actions for ContentViewer to consume
 	const ctxActions = useMemo<MessageContextMenuActions>(() => {
 		const actions: MessageContextMenuActions = {};
-		if (message.id && onBranchFromMessage && !isUser) {
-			actions.onBranchFromMessage = () => onBranchFromMessage(message.id!);
+		const msgId = message.id;
+		const msgUuid = message.sdkMessageUuid;
+		if (msgId && onBranchFromMessage && !isUser) {
+			actions.onBranchFromMessage = () => onBranchFromMessage(msgId);
 		}
-		if (message.sdkMessageUuid && onForkFromMessage && !isUser) {
-			actions.onForkFromMessage = () => onForkFromMessage(message.sdkMessageUuid!);
+		if (msgUuid && onForkFromMessage && !isUser) {
+			actions.onForkFromMessage = () => onForkFromMessage(msgUuid);
 		}
-		if (message.id && onDeleteMessage) {
-			actions.onDeleteMessage = () => onDeleteMessage(message.id!);
+		if (msgId && onDeleteMessage) {
+			actions.onDeleteMessage = () => onDeleteMessage(msgId);
 		}
 		return actions;
 	}, [
@@ -405,6 +409,7 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// System messages (compact indicators / plan cards)
 	if (message.role === "system") {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (compactBlock) {
 			if (compactBlock.subtype === "plan") {
@@ -413,7 +418,7 @@ export const MessageBubble = memo(function MessageBubble({
 						summary={compactBlock.summary ?? ""}
 						narratorId={narratorId}
 						messageId={message.id}
-						onDelete={onDeleteMessage ? () => onDeleteMessage(message.id!) : undefined}
+						onDelete={onDeleteMessage && msgId ? () => onDeleteMessage(msgId) : undefined}
 					/>
 				);
 			}
@@ -424,7 +429,9 @@ export const MessageBubble = memo(function MessageBubble({
 					isCompacting={isCompacting}
 					narratorId={canNavigate ? narratorId : undefined}
 					messageId={canNavigate ? message.id : undefined}
-					onDelete={canNavigate && onDeleteMessage ? () => onDeleteMessage(message.id!) : undefined}
+					onDelete={
+						canNavigate && onDeleteMessage && msgId ? () => onDeleteMessage(msgId) : undefined
+					}
 				/>
 			);
 		}
@@ -434,17 +441,24 @@ export const MessageBubble = memo(function MessageBubble({
 	// User messages — wrap entire bubble in ContentViewer for context menu / swipe
 	if (isUser) {
 		const fullText = blocks
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.filter((b: any) => b.type === "text" && b.text)
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.map((b: any) => b.text)
 			.join("\n\n");
 		return (
 			<MessageContextMenuCtx.Provider value={ctxActions}>
 				<ContentViewer content={fullText} markdown contentType="markdown">
-					<Paper p="sm" radius="md" style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}>
+					<Paper
+						p="sm"
+						radius="md"
+						style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
+					>
 						<Stack gap={4}>
 							<Text size="xs" fw={600} c="indigo">
 								{t("you")}
 							</Text>
+							{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 							{blocks.map((block: any, i: number) => {
 								const key = block.id ?? `${block.type}-${i}`;
 								if (block.type === "text") {
@@ -471,13 +485,12 @@ export const MessageBubble = memo(function MessageBubble({
 	return (
 		<MessageContextMenuCtx.Provider value={ctxActions}>
 			<Stack gap={4}>
+				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 				{blocks.map((block: any, i: number) => {
 					const key = block.id ?? `${block.type}-${i}`;
 					if (block.type === "text") {
 						if (!block.text?.trim()) return null;
-						return (
-							<ContentViewer key={key} content={block.text} markdown contentType="markdown" />
-						);
+						return <ContentViewer key={key} content={block.text} markdown contentType="markdown" />;
 					}
 					if (block.type === "image") {
 						return <ImageBlock key={key} block={block} narratorId={narratorId} />;
@@ -500,6 +513,7 @@ export const MessageBubble = memo(function MessageBubble({
 						);
 					}
 					if (block.type === "tool_use") {
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 						const tc = message.toolCalls?.find((t: any) => t.toolUseId === block.id);
 						const toolCallData = {
 							id: tc?.id,

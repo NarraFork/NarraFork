@@ -35,10 +35,13 @@ function ftsQuery(
 	useFts: boolean,
 	ftsArgs: (string | number)[],
 	likeArgs: (string | number)[],
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 ): any[] {
 	return useFts
-		? (sqlite.prepare(ftsSQL).all(...ftsArgs) as any[])
-		: (sqlite.prepare(likeSQL).all(...likeArgs) as any[]);
+		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(sqlite.prepare(ftsSQL).all(...ftsArgs) as any[])
+		: // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(sqlite.prepare(likeSQL).all(...likeArgs) as any[]);
 }
 
 export const searchService = {

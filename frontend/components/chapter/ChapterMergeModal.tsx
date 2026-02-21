@@ -20,7 +20,7 @@ export function ChapterMergeModal({
 	const [targetId, setTargetId] = useState<string | null>(null);
 	const [strategy, setStrategy] = useState<string>("merge");
 	const [message, setMessage] = useState("");
-	const [conflicts, setConflicts] = useState<any>(null);
+	const [conflicts, setConflicts] = useState<Record<string, unknown> | null>(null);
 	const qc = useQueryClient();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
@@ -45,18 +45,18 @@ export function ChapterMergeModal({
 	});
 
 	const targetOptions = (chapters ?? [])
-		.filter((ch: any) => ch.id !== chapterId && ch.status === "active")
-		.map((ch: any) => ({ value: ch.id, label: ch.title }));
+		.filter((ch) => ch.id !== chapterId && ch.status === "active")
+		.map((ch) => ({ value: ch.id, label: ch.title }));
 
 	const checkConflicts = useMutation({
-		mutationFn: () => api.checkMergeConflicts(chapterId, targetId!),
+		mutationFn: () => api.checkMergeConflicts(chapterId, targetId ?? ""),
 		onSuccess: (data) => setConflicts(data),
 	});
 
 	const merge = useMutation({
 		mutationFn: () =>
 			api.mergeChapter(chapterId, {
-				targetChapterId: targetId!,
+				targetChapterId: targetId ?? "",
 				strategy,
 				message: message.trim() || undefined,
 			}),

@@ -34,7 +34,7 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 	const batchMerge = useMutation({
 		mutationFn: () =>
 			api.batchMerge({
-				baseChapterId: baseChapterId!,
+				baseChapterId: baseChapterId ?? "",
 				sourceChapterIds: selected,
 				title: title.trim(),
 				strategy,

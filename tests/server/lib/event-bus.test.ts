@@ -12,7 +12,9 @@ describe("eventBus", () => {
 	it("delivers typed events to subscribers", () => {
 		const received: NarraForkEvent[] = [];
 		const handler = (e: NarraForkEvent) => received.push(e);
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		eventBus.on("chapter:created", handler as any);
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		handlers.push(() => eventBus.off("chapter:created", handler as any));
 
 		eventBus.emit({ type: "chapter:created", chapterId: "c1", projectId: "p1" });
@@ -23,7 +25,9 @@ describe("eventBus", () => {
 	it("does not deliver events of other types", () => {
 		const received: NarraForkEvent[] = [];
 		const handler = (e: NarraForkEvent) => received.push(e);
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		eventBus.on("chapter:dormant", handler as any);
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		handlers.push(() => eventBus.off("chapter:dormant", handler as any));
 
 		eventBus.emit({ type: "chapter:created", chapterId: "c1", projectId: "p1" });

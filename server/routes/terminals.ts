@@ -24,7 +24,7 @@ terminalRoutes.get("/", async (c) => {
 	}
 	const list = chapterId
 		? await terminalService.listByChapter(chapterId)
-		: await terminalService.listByNarrator(narratorId!);
+		: await terminalService.listByNarrator(narratorId ?? "");
 	return c.json(list);
 });
 

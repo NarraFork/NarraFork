@@ -111,6 +111,7 @@ function ChapterDetailPage() {
 		);
 	if (!chapter) return <Text>{t("chapterNotFound")}</Text>;
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const primaryNarrator = narratorList?.find((n: any) => n.type === "primary");
 
 	return (

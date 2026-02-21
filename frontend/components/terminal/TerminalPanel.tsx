@@ -100,7 +100,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const { t } = useTranslation("terminal");
 		const { data: prefs } = useUserPreferences();
 		const { colorScheme } = useMantineColorScheme();
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const terminalThemeKey = (prefs as any)?.terminalTheme ?? "auto";
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const terminalFontSize = (prefs as any)?.terminalFontSize ?? 14;
 		const resolvedTheme = getTerminalTheme(
 			terminalThemeKey,

@@ -85,8 +85,10 @@ const DEFAULTS: NarraForkSettings = {
 const narraforkDir = resolve(homedir(), ".narrafork");
 const settingsPath = resolve(narraforkDir, "settings.json");
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function deepMerge<T extends Record<string, any>>(
 	defaults: T,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	overrides: Record<string, any>,
 ): T {
 	const result = { ...defaults };
@@ -94,6 +96,7 @@ export function deepMerge<T extends Record<string, any>>(
 		const val = overrides[key];
 		if (val && typeof val === "object" && !Array.isArray(val) && key in defaults) {
 			result[key as keyof T] = deepMerge(
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				defaults[key as keyof T] as Record<string, any>,
 				val,
 			) as T[keyof T];
@@ -130,6 +133,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	// Sync in-memory cache so all modules see the updated values immediately
 	if (_cache.current) {
 		for (const key of Object.keys(newSettings) as Array<keyof NarraForkSettings>) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(_cache.current as any)[key] = newSettings[key];
 		}
 	}

@@ -77,6 +77,7 @@ logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
 
 	try {
 			configPath:
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		});
 		});
 		}

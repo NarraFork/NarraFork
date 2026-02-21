@@ -10,6 +10,7 @@ function extractText(node: ReactNode): string {
 	if (node == null || typeof node === "boolean") return "";
 	if (typeof node === "string" || typeof node === "number") return String(node);
 	if (Array.isArray(node)) return node.map(extractText).join("");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	if (typeof node === "object" && "props" in node) return extractText((node as any).props.children);
 	return "";
 }
@@ -180,6 +181,7 @@ const mdComponents: Components = {
 	},
 };
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function heading({ children, node }: any) {
 	const tag = node?.tagName ?? "h3";
 	const order = HEADING_ORDER[tag] ?? 3;

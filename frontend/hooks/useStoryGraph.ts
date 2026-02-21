@@ -6,6 +6,7 @@ import { api } from "../lib/api";
 const NODE_WIDTH = 280;
 const NODE_HEIGHT = 120;
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function applyDagreLayout(nodes: any[], edges: any[]) {
 	const g = new dagre.graphlib.Graph();
 	g.setDefaultEdgeLabel(() => ({}));

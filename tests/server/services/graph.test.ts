@@ -67,14 +67,17 @@ describe("story network graph", () => {
 	it("builds nodes for all chapters", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const { nodes } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		expect(nodes).toHaveLength(3);
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		expect(nodes.map((n: any) => n.id).sort()).toEqual(["fork1", "merged1", "root"]);
 	});
 
 	it("creates fork edges from parent to child", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		const forkEdges = edges.filter((e) => e.type === "forkEdge");
 		expect(forkEdges).toHaveLength(2); // fork1 and merged1 both have parentChapterId
@@ -84,6 +87,7 @@ describe("story network graph", () => {
 	it("creates merge edges from source to target", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		const mergeEdges = edges.filter((e) => e.type === "mergeEdge");
 		expect(mergeEdges).toHaveLength(1);
@@ -94,6 +98,7 @@ describe("story network graph", () => {
 	it("root chapter has no incoming fork edges", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
 		const incomingToRoot = edges.filter((e) => e.target === "root" && e.type === "forkEdge");
 		expect(incomingToRoot).toHaveLength(0);

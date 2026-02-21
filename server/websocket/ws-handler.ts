@@ -65,7 +65,7 @@ export const wsHandlers = {
 		}
 	},
 
-	close(ws: ServerWebSocket<WSData>, code: number, reason: string) {
+	close(ws: ServerWebSocket<WSData>, _code: number, _reason: string) {
 		const { channel } = ws.data;
 
 		if (channel === "narrator") {

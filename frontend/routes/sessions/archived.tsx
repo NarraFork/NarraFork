@@ -60,6 +60,7 @@ function ArchivedSessionsPage() {
 				<Text c="dimmed">{t("noArchivedSessions")}</Text>
 			) : (
 				<Stack>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{sessions.map((session: any) => (
 						<Link
 							key={session.id}

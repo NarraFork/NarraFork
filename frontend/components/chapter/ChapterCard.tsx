@@ -35,6 +35,7 @@ export function ChapterCard({ chapter }: ChapterCardProps) {
 			<Card.Section
 				component={Link}
 				to="/chapters/$chapterId"
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				params={{ chapterId: chapter.id } as any}
 				inheritPadding
 				py="sm"

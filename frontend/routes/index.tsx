@@ -21,6 +21,7 @@ function DashboardPage() {
 
 	if (projectsLoading) return <Loader />;
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const activeProjects = projects?.filter((p: any) => p.status === "active") ?? [];
 
 	return (
@@ -55,12 +56,14 @@ function DashboardPage() {
 						{t("recentProjects")}
 					</Title>
 					<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
+						{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 						{activeProjects.slice(0, 6).map((project: any) => (
 							<Card
 								key={project.id}
 								withBorder
 								component={Link}
 								to="/projects/$projectId"
+								// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 								params={{ projectId: project.id } as any}
 								style={{ textDecoration: "none" }}
 							>

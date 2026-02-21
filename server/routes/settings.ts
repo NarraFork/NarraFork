@@ -108,8 +108,10 @@ settingsRoutes.patch("/", async (c) => {
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
 		if (val && typeof val === "object" && !Array.isArray(val)) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = { ...(current as any)[key], ...val };
 		} else {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
 		}
 	}

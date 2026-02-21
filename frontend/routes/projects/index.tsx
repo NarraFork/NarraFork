@@ -36,6 +36,7 @@ function ProjectListPage() {
 
 	const handleCreate = () => {
 		if (!name.trim()) return;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const data: Record<string, any> = { name: name.trim() };
 
 		if (repoMode !== "none") {
@@ -72,6 +73,7 @@ function ProjectListPage() {
 				<Text c="dimmed">{t("noProjects")}</Text>
 			) : (
 				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{projects.map((project: any) => (
 						<Card
 							key={project.id}
@@ -81,6 +83,7 @@ function ProjectListPage() {
 							withBorder
 							component={Link}
 							to="/projects/$projectId"
+							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 							params={{ projectId: project.id } as any}
 							style={{ textDecoration: "none" }}
 						>

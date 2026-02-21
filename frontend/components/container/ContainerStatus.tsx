@@ -73,6 +73,7 @@ export function ContainerStatus({ chapterId }: ContainerStatusProps) {
 					</ActionIcon>
 				</Group>
 			</Group>
+			{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 			{containers.map((c: any) => (
 				<Card key={c.id} padding="xs" withBorder>
 					<Group justify="space-between">

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { zodToJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ToolDefinition } from "./types";
@@ -230,10 +231,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			throw new Error("OpenAI API key not configured. Set openai.apiKey in settings.");
 		}
 
-		const reminder =
-			locale === "zh-CN"
-				? "只回复一个简短的标题（最多50个字符），不要回复其他任何内容。"
-				: "Reply with ONLY a short title (max 50 chars), nothing else.";
+		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 
 		const response = await fetch(`${baseUrl}/chat/completions`, {
 			method: "POST",

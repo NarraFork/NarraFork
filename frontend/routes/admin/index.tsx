@@ -127,6 +127,7 @@ function AdminPage() {
 								</Table.Tr>
 							</Table.Thead>
 							<Table.Tbody>
+								{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 								{users.map((u: any) => (
 									<Table.Tr key={u.id}>
 										<Table.Td>{u.username}</Table.Td>

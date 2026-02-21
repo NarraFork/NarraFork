@@ -15,8 +15,8 @@ describe("test DB setup", () => {
 
 		const result = await db.query.projects.findFirst({ where: eq(projects.id, "p1") });
 		expect(result).toBeDefined();
-		expect(result!.name).toBe("Test");
-		expect(result!.status).toBe("active");
+		expect(result?.name).toBe("Test");
+		expect(result?.status).toBe("active");
 	});
 
 	it("cleanDb resets between tests", async () => {
@@ -44,7 +44,7 @@ describe("chapters schema", () => {
 
 		const ch = await db.query.chapters.findFirst({ where: eq(chapters.id, "ch1") });
 		expect(ch).toBeDefined();
-		expect(ch!.status).toBe("active");
+		expect(ch?.status).toBe("active");
 	});
 
 	it("supports self-referencing parentChapterId", async () => {
@@ -76,6 +76,6 @@ describe("chapters schema", () => {
 			.run();
 
 		const child = await db.query.chapters.findFirst({ where: eq(chapters.id, "child") });
-		expect(child!.parentChapterId).toBe("parent");
+		expect(child?.parentChapterId).toBe("parent");
 	});
 });

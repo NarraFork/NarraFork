@@ -27,18 +27,23 @@ export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
 }
 
 function convertNode(schema: z.ZodType): Record<string, unknown> {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const def = (schema as any)._zod?.def;
 	const typeName: string | undefined = def?.typeName;
 
 	// Unwrap optionals and defaults, preserving description from wrapper
 	if (typeName === "ZodOptional" || schema instanceof z.ZodOptional) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const inner = convertNode((schema as z.ZodOptional<any>).unwrap());
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const desc = (schema as any).description;
 		if (desc && !inner.description) inner.description = desc;
 		return inner;
 	}
 	if (typeName === "ZodDefault" || schema instanceof z.ZodDefault) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const inner = convertNode((schema as z.ZodDefault<any>).removeDefault());
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const desc = (schema as any).description;
 		if (desc && !inner.description) inner.description = desc;
 		return { ...inner, default: def?.defaultValue };
@@ -58,12 +63,14 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 		// Zod v4 internal: _zod.def.entries is an object, not an array
 		result = { type: "string", enum: Object.values(def.entries) };
 	} else if (schema instanceof z.ZodArray) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		result = { type: "array", items: convertNode((schema as any).element) };
 	} else if (schema instanceof z.ZodLiteral) {
 		const values = def.values;
 		const val = Array.isArray(values) ? values[0] : values;
 		result = { type: typeof val, const: val };
 	} else if (schema instanceof z.ZodUnion) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const options = ((schema as any).options as any[]).map((o: any) => convertNode(o));
 		result = { anyOf: options };
 	} else if (schema instanceof z.ZodRecord) {
@@ -77,6 +84,7 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 
 	// Propagate description from any schema type
 	// Zod v4 stores .describe() on the schema instance directly, not in _zod.def
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const desc = (schema as any).description ?? def?.description;
 	if (desc) result.description = desc;
 
@@ -105,6 +113,7 @@ function convertObject(schema: z.ZodObject): Record<string, unknown> {
 
 function convertString(schema: z.ZodString): Record<string, unknown> {
 	const result: Record<string, unknown> = { type: "string" };
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const checks: any[] = (schema as any)._zod?.def?.checks ?? [];
 	for (const check of checks) {
 		if (check.kind === "min") result.minLength = check.value;
@@ -115,6 +124,7 @@ function convertString(schema: z.ZodString): Record<string, unknown> {
 
 function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
 	const result: Record<string, unknown> = { type: "number" };
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const checks: any[] = (schema as any)._zod?.def?.checks ?? [];
 	for (const check of checks) {
 		if (check.kind === "min") result.minimum = check.value;

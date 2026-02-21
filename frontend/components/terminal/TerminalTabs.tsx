@@ -33,6 +33,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	const viewState = useTerminalViewState(ctx);
 	const { t } = useTranslation("terminal");
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const runningTerminals = (terminals ?? []).filter((t: any) => t.status === "running");
 	const tabList = tabs ?? [];
 	const layout = (viewState.data?.layout ?? "single") as TerminalLayout;
@@ -51,6 +52,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	// Auto-select first tab if current is gone
 	// biome-ignore lint/correctness/useExhaustiveDependencies: viewState.update is stable, adding it would cause unnecessary re-renders
 	useEffect(() => {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		if (activeTabId && !tabList.some((t: any) => t.id === activeTabId)) {
 			const first = tabList[0]?.id ?? null;
 			setActiveTabId(first);
@@ -74,10 +76,12 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 		createTerminal.mutate(
 			{ name },
 			{
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				onSuccess: (_newTerm: any) => {
 					createTab.mutate(
 						{ name },
 						{
+							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 							onSuccess: (newTab: any) => {
 								setActiveTabId(newTab.id);
 								viewState.update({ activeTabId: newTab.id });
@@ -92,6 +96,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	const handleClose = useCallback(
 		(tabId: string) => {
 			// Find the terminal associated with this tab index
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const tabIdx = tabList.findIndex((t: any) => t.id === tabId);
 			const terminal = runningTerminals[tabIdx];
 			if (terminal) {

@@ -64,6 +64,7 @@ app.route("/api/projects", graphRoutes);
 
 app.onError((err, c) => {
 	if (err instanceof AppError) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		return c.json({ error: err.message, code: err.code }, err.statusCode as any);
 	}
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });

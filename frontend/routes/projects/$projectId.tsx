@@ -124,6 +124,7 @@ function ProjectDetailPage() {
 				<Text c="dimmed">{t("noChapters")}</Text>
 			) : (
 				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{chapters.map((chapter: any) => (
 						<ChapterCard key={chapter.id} chapter={chapter} />
 					))}

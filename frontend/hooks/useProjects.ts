@@ -27,6 +27,7 @@ export function useCreateProject() {
 export function useUpdateProject() {
 	const qc = useQueryClient();
 	return useMutation({
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		mutationFn: ({ id, data }: { id: string; data: any }) => api.updateProject(id, data),
 		onSuccess: (_, { id }) => {
 			qc.invalidateQueries({ queryKey: ["projects"] });

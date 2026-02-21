@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapters, containerInstances, narrators } from "../db/schema";
+import { chapters } from "../db/schema";
 
 export interface GraphChapter {
 	id: string;

@@ -31,6 +31,7 @@ describe("settings deepMerge", () => {
 		const overrides = { a: 2, unknown: "foo" };
 		const result = deepMerge(defaults, overrides);
 		expect(result.a).toBe(2);
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		expect((result as any).unknown).toBe("foo");
 	});
 });

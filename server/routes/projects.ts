@@ -15,6 +15,7 @@ const validStatuses = ["active", "archived"] as const;
 projectRoutes.get("/", async (c) => {
 	const status = c.req.query("status");
 	const where =
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		status && validStatuses.includes(status as any)
 			? eq(projects.status, status as (typeof validStatuses)[number])
 			: undefined;

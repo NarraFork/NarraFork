@@ -33,6 +33,7 @@ describe("port allocations", () => {
 			.values({ port: 10000, chapterId: "ch1", serviceName: "web", allocatedAt: now })
 			.run();
 
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const alloc = sqlite.prepare("SELECT * FROM port_allocations WHERE port = 10000").get() as any;
 		expect(alloc).toBeDefined();
 		expect(alloc.chapter_id).toBe("ch1");
@@ -63,6 +64,7 @@ describe("port allocations", () => {
 
 		db.delete(portAllocations).where(eq(portAllocations.chapterId, "ch1")).run();
 
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const remaining = sqlite.prepare("SELECT count(*) as c FROM port_allocations").get() as any;
 		expect(remaining.c).toBe(0);
 	});
@@ -92,6 +94,7 @@ describe("port allocations", () => {
 		// Release ch1 ports only
 		db.delete(portAllocations).where(eq(portAllocations.chapterId, "ch1")).run();
 
+		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		const remaining = sqlite.prepare("SELECT * FROM port_allocations").all() as any[];
 		expect(remaining).toHaveLength(1);
 		expect(remaining[0].port).toBe(10001);

@@ -49,7 +49,7 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 	const conversationText = selected
 		.map((m, i) => {
 			const role = m.role === "assistant" ? "Assistant" : "User";
-			const text = m.contentText!;
+			const text = m.contentText ?? "";
 			const maxLen = i >= head.length ? 600 : 300;
 			const truncated = text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
 			const section = i >= head.length ? "(recent) " : "";

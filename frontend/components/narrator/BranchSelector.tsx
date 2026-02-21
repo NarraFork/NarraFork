@@ -26,7 +26,9 @@ export function BranchSelector({ narratorId, activeBranchId }: BranchSelectorPro
 	// Don't render if no branches exist
 	if (!branches?.length) return null;
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const rootBranch = branches.find((b: any) => b.isRoot);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const nonRootBranches = branches.filter((b: any) => !b.isRoot);
 
 	const handleSwitch = (branchId: string) => {

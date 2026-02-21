@@ -53,6 +53,7 @@ function LoginPage() {
 		try {
 			await login.mutateAsync({ username, password });
 			navigate({ to: "/" });
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {
 			setError(e.message || t("unknownError"));
 		}
@@ -63,6 +64,7 @@ function LoginPage() {
 		try {
 			await register.mutateAsync({ username, password });
 			navigate({ to: "/" });
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {
 			setError(e.message || t("unknownError"));
 		}

@@ -21,6 +21,7 @@ export function useCreateChapter() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.createChapter,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		onSuccess: (data: any) => {
 			qc.invalidateQueries({ queryKey: ["chapters", { projectId: data.projectId }] });
 		},
@@ -30,6 +31,7 @@ export function useCreateChapter() {
 export function useUpdateChapter() {
 	const qc = useQueryClient();
 	return useMutation({
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		mutationFn: ({ id, data }: { id: string; data: any }) => api.updateChapter(id, data),
 		onSuccess: (_, { id }) => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
