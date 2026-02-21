@@ -27,18 +27,21 @@ export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
 }
 
 function convertNode(schema: z.ZodType): Record<string, unknown> {
+	const def = (schema as any)._zod?.def;
+	const typeName: string | undefined = def?.typeName;
+
 	// Unwrap optionals and defaults, preserving description from wrapper
-	if (schema instanceof z.ZodOptional) {
-		const inner = convertNode(schema.unwrap());
+	if (typeName === "ZodOptional" || schema instanceof z.ZodOptional) {
+		const inner = convertNode((schema as z.ZodOptional<any>).unwrap());
 		const desc = (schema as any).description;
 		if (desc && !inner.description) inner.description = desc;
 		return inner;
 	}
-	if (schema instanceof z.ZodDefault) {
-		const inner = convertNode(schema.removeDefault());
+	if (typeName === "ZodDefault" || schema instanceof z.ZodDefault) {
+		const inner = convertNode((schema as z.ZodDefault<any>).removeDefault());
 		const desc = (schema as any).description;
 		if (desc && !inner.description) inner.description = desc;
-		return { ...inner, default: schema._zod.def.defaultValue };
+		return { ...inner, default: def?.defaultValue };
 	}
 
 	let result: Record<string, unknown>;
@@ -53,18 +56,20 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 		result = { type: "boolean" };
 	} else if (schema instanceof z.ZodEnum) {
 		// Zod v4 internal: _zod.def.entries is an object, not an array
-		result = { type: "string", enum: Object.values(schema._zod.def.entries) };
+		result = { type: "string", enum: Object.values(def.entries) };
 	} else if (schema instanceof z.ZodArray) {
-		result = { type: "array", items: convertNode(schema.element) };
+		result = { type: "array", items: convertNode((schema as any).element) };
 	} else if (schema instanceof z.ZodLiteral) {
-		result = { type: typeof schema._zod.def.value, const: schema._zod.def.value };
+		const values = def.values;
+		const val = Array.isArray(values) ? values[0] : values;
+		result = { type: typeof val, const: val };
 	} else if (schema instanceof z.ZodUnion) {
-		const options = schema.options.map((o: z.ZodType) => convertNode(o));
+		const options = ((schema as any).options as any[]).map((o: any) => convertNode(o));
 		result = { anyOf: options };
 	} else if (schema instanceof z.ZodRecord) {
 		result = {
 			type: "object",
-			additionalProperties: convertNode(schema._zod.def.valueType),
+			additionalProperties: convertNode(def.valueType),
 		};
 	} else {
 		result = {};
@@ -72,7 +77,7 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 
 	// Propagate description from any schema type
 	// Zod v4 stores .describe() on the schema instance directly, not in _zod.def
-	const desc = (schema as any).description ?? schema._zod?.def?.description;
+	const desc = (schema as any).description ?? def?.description;
 	if (desc) result.description = desc;
 
 	return result;
@@ -100,7 +105,7 @@ function convertObject(schema: z.ZodObject): Record<string, unknown> {
 
 function convertString(schema: z.ZodString): Record<string, unknown> {
 	const result: Record<string, unknown> = { type: "string" };
-	const checks = schema._zod.def.checks ?? [];
+	const checks: any[] = (schema as any)._zod?.def?.checks ?? [];
 	for (const check of checks) {
 		if (check.kind === "min") result.minLength = check.value;
 		if (check.kind === "max") result.maxLength = check.value;
@@ -110,7 +115,7 @@ function convertString(schema: z.ZodString): Record<string, unknown> {
 
 function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
 	const result: Record<string, unknown> = { type: "number" };
-	const checks = schema._zod.def.checks ?? [];
+	const checks: any[] = (schema as any)._zod?.def?.checks ?? [];
 	for (const check of checks) {
 		if (check.kind === "min") result.minimum = check.value;
 		if (check.kind === "max") result.maximum = check.value;

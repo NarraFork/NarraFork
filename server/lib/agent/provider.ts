@@ -52,6 +52,8 @@ export interface ChatParams {
 	tools: unknown[];
 	toolResults: unknown[];
 	signal: AbortSignal;
+	/** Base64-encoded images to attach to the current user message */
+	images?: Array<{ format: string; base64: string }>;
 }
 
 // === The adapter interface ===
@@ -64,10 +66,16 @@ export interface ProviderAdapter {
 	buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
-	): { history: unknown[]; trailingToolResults: unknown[] };
+		narratorId?: string,
+	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
 
 	/** Inject system prompt into the history array (mutates in place) */
-	injectSystemPrompt(history: unknown[], systemPrompt: string, model: string): void;
+	injectSystemPrompt(
+		history: unknown[],
+		systemPrompt: string,
+		model: string,
+		locale?: string,
+	): void;
 
 	/** Stream a chat completion, yielding parsed events */
 	chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent>;
@@ -80,6 +88,23 @@ export interface ProviderAdapter {
 
 	/** Append an assistant turn to history (mutates in place) */
 	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void;
+
+	/** Simple text generation — no tools, no loop. Returns generated text. */
+	generate(text: string, model: string): Promise<string>;
+
+	/** Like generate() but also returns contextUsagePercentage if available. */
+	generateWithMeta(text: string, model: string): Promise<{ text: string; contextPercent?: number }>;
+
+	/**
+	 * Generate text using a history-based conversation (system instruction + user content).
+	 * Used for title generation where we need to separate instruction from content.
+	 */
+	generateWithHistory(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+	): Promise<string>;
 }
 
 // === Provider resolution ===

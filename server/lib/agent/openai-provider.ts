@@ -61,14 +61,20 @@ export class OpenAIProvider implements ProviderAdapter {
 		);
 	}
 
-	buildHistory(
+	async buildHistory(
 		dbMessages: DbMessage[],
 		_model: string,
-	): { history: unknown[]; trailingToolResults: unknown[] } {
+		_narratorId?: string,
+	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
 		return buildOAIHistory(dbMessages);
 	}
 
-	injectSystemPrompt(history: unknown[], systemPrompt: string, _model: string): void {
+	injectSystemPrompt(
+		history: unknown[],
+		systemPrompt: string,
+		_model: string,
+		_locale?: string,
+	): void {
 		const h = history as OAIMessage[];
 		h.unshift({ role: "system", content: systemPrompt });
 	}
@@ -163,6 +169,97 @@ export class OpenAIProvider implements ProviderAdapter {
 			}));
 		}
 		h.push(msg);
+	}
+
+	async generate(text: string, model: string): Promise<string> {
+		const result = await this.generateWithMeta(text, model);
+		return result.text;
+	}
+
+	async generateWithMeta(
+		text: string,
+		model: string,
+	): Promise<{ text: string; contextPercent?: number }> {
+		const { settings } = await import("../settings");
+		const apiKey = settings.openai?.apiKey;
+		const baseUrl = (settings.openai?.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+
+		if (!apiKey) {
+			throw new Error("OpenAI API key not configured. Set openai.apiKey in settings.");
+		}
+
+		const response = await fetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			},
+			body: JSON.stringify({
+				model,
+				messages: [{ role: "user", content: text }],
+			}),
+		});
+
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+		}
+
+		const json = (await response.json()) as {
+			choices?: Array<{ message?: { content?: string } }>;
+			usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+		};
+
+		return {
+			text: json.choices?.[0]?.message?.content ?? "",
+			contextPercent: undefined,
+		};
+	}
+
+	async generateWithHistory(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+	): Promise<string> {
+		const { settings } = await import("../settings");
+		const apiKey = settings.openai?.apiKey;
+		const baseUrl = (settings.openai?.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+
+		if (!apiKey) {
+			throw new Error("OpenAI API key not configured. Set openai.apiKey in settings.");
+		}
+
+		const reminder =
+			locale === "zh-CN"
+				? "只回复一个简短的标题（最多50个字符），不要回复其他任何内容。"
+				: "Reply with ONLY a short title (max 50 chars), nothing else.";
+
+		const response = await fetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			},
+			body: JSON.stringify({
+				model,
+				messages: [
+					{ role: "system", content: systemInstruction },
+					{ role: "user", content: `${reminder}\n\n${content}` },
+				],
+			}),
+		});
+
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+		}
+
+		const json = (await response.json()) as {
+			choices?: Array<{ message?: { content?: string } }>;
+		};
+
+		return json.choices?.[0]?.message?.content ?? "";
 	}
 }
 

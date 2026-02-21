@@ -81,6 +81,7 @@ export interface AgentConfig {
 	provider: string;
 	cwd: string;
 	systemPrompt?: string;
+	locale?: string;
 	signal: AbortSignal;
 	maxTurns?: number;
 	permissionHandler: (

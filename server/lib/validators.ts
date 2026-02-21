@@ -199,6 +199,18 @@ export const updateNarratorTitleSchema = z.object({
 	title: z.string().min(1).max(200),
 });
 
+// === Conversation Branches ===
+
+export const createBranchSchema = z.object({
+	forkMessageId: z.string().min(1),
+	name: z.string().min(1).max(200).optional(),
+});
+
+export const updateBranchSchema = z.object({
+	name: z.string().min(1).max(200).optional(),
+	status: z.enum(["active", "archived"]).optional(),
+});
+
 export const updateNarratorModelSchema = z.object({
 	model: z
 		.string()

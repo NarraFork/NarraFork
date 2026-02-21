@@ -110,7 +110,7 @@ export async function getUserReplyInLanguage(userId: string): Promise<boolean> {
 		where: eq(userPreferences.userId, userId),
 		columns: { replyInUserLanguage: true },
 	});
-	return pref?.replyInUserLanguage ?? false;
+	return pref?.replyInUserLanguage ?? true;
 }
 
 const languageInstructions: Record<Locale, string> = {

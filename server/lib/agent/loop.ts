@@ -1,9 +1,9 @@
+import { settings } from "../settings";
 import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type { AgentConfig, AgentEvent, AgentToolUse, ToolContext } from "./types";
 
-const DEFAULT_MAX_TURNS = 50;
 const PROGRESS_INTERVAL_MS = 5_000;
 
 /**
@@ -15,9 +15,10 @@ export async function* agentLoop(
 	userText: string,
 	history: unknown[],
 	initialToolResults?: unknown[],
+	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
 	const provider = getProvider(config.provider);
-	const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
+	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
 	const allTools = toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable());
 	const tools = provider.formatTools(allTools);
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
@@ -28,7 +29,7 @@ export async function* agentLoop(
 
 	// Inject system prompt via provider-specific mechanism
 	if (config.systemPrompt) {
-		provider.injectSystemPrompt(history, config.systemPrompt, config.model);
+		provider.injectSystemPrompt(history, config.systemPrompt, config.model, config.locale);
 	}
 
 	while (turnIndex < maxTurns) {
@@ -38,7 +39,7 @@ export async function* agentLoop(
 		}
 
 		const isFirstTurn = turnIndex === 0;
-		const content = isFirstTurn ? userText : ".";
+		const content = isFirstTurn ? userText : "";
 
 		// Call provider and collect the response
 		let assistantText = "";
@@ -57,6 +58,7 @@ export async function* agentLoop(
 				tools,
 				toolResults: pendingToolResults,
 				signal: config.signal,
+				...(isFirstTurn && images?.length ? { images } : {}),
 			});
 
 			for await (const parsed of stream) {
@@ -148,7 +150,7 @@ export async function* agentLoop(
 		if (isFirstTurn) {
 			provider.pushUserTurn(history, userText, config.model, initialToolResults ?? []);
 		} else if (pendingToolResults.length > 0) {
-			provider.pushUserTurn(history, ".", config.model, pendingToolResults);
+			provider.pushUserTurn(history, "", config.model, pendingToolResults);
 		}
 
 		// Execute each tool call
