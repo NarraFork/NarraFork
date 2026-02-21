@@ -10,7 +10,7 @@ interface ViewState {
 
 export function useTerminalViewState(opts: { chapterId?: string; narratorId?: string }) {
 	const qc = useQueryClient();
-	const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+	const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
 	const query = useQuery({
 		queryKey: ["terminalViewState", opts],

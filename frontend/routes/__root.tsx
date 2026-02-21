@@ -1,11 +1,15 @@
 import {
 	ActionIcon,
 	AppShell,
+	Box,
 	Burger,
+	Button,
 	Center,
 	Group,
 	Loader,
+	Modal,
 	NavLink,
+	Text,
 	TextInput,
 	Title,
 } from "@mantine/core";
@@ -45,6 +49,7 @@ function RootLayout() {
 
 function AuthenticatedLayout() {
 	const [opened, { toggle }] = useDisclosure();
+	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
@@ -107,16 +112,7 @@ function AuthenticatedLayout() {
 						<Title order={3} visibleFrom="sm">
 							{t("appName")}
 						</Title>
-						{searchOpen ? (
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								onClick={() => setSearchOpen(false)}
-								hiddenFrom="sm"
-							>
-								<IconX size={18} />
-							</ActionIcon>
-						) : (
+						{!searchOpen && (
 							<Title order={3} hiddenFrom="sm">
 								{t("appName")}
 							</Title>
@@ -140,21 +136,25 @@ function AuthenticatedLayout() {
 						/>
 						{/* Mobile: toggle search input via icon */}
 						{searchOpen ? (
-							<TextInput
-								placeholder={t("searchPlaceholder")}
-								size="sm"
-								style={{ flex: 1, minWidth: 0 }}
-								value={searchQuery}
-								onChange={(e) => setSearchQuery(e.currentTarget.value)}
-								onKeyDown={handleSearchKeyDown}
-								rightSection={
-									<ActionIcon size="sm" variant="subtle" onClick={handleSearch}>
-										<IconSearch size={16} />
-									</ActionIcon>
-								}
-								autoFocus
-								hiddenFrom="sm"
-							/>
+							<Group wrap="nowrap" gap="xs" hiddenFrom="sm" style={{ flex: 1, minWidth: 0 }}>
+								<TextInput
+									placeholder={t("searchPlaceholder")}
+									size="sm"
+									style={{ flex: 1, minWidth: 0 }}
+									value={searchQuery}
+									onChange={(e) => setSearchQuery(e.currentTarget.value)}
+									onKeyDown={handleSearchKeyDown}
+									rightSection={
+										<ActionIcon size="sm" variant="subtle" onClick={handleSearch}>
+											<IconSearch size={16} />
+										</ActionIcon>
+									}
+									autoFocus
+								/>
+								<ActionIcon variant="subtle" color="gray" onClick={() => setSearchOpen(false)}>
+									<IconX size={18} />
+								</ActionIcon>
+							</Group>
 						) : (
 							<ActionIcon
 								variant="subtle"
@@ -166,24 +166,48 @@ function AuthenticatedLayout() {
 								<IconSearch size={18} />
 							</ActionIcon>
 						)}
-						<ActionIcon variant="subtle" color="gray" onClick={logout} title={t("logout")}>
-							<IconLogout size={18} />
-						</ActionIcon>
 					</Group>
 				</Group>
 			</AppShell.Header>
 
-			<AppShell.Navbar p="md">
-				<NavLink component={Link} to="/" label={t("dashboard")} />
-				<NavLink component={Link} to="/projects" label={t("projects")} />
-				<NavLink component={Link} to="/sessions" label={t("sessions")} />
-				{user?.role === "admin" && <NavLink component={Link} to="/admin" label={t("admin")} />}
-				<NavLink component={Link} to="/settings" label={t("settings")} />
+			<AppShell.Navbar p="md" style={{ display: "flex", flexDirection: "column" }}>
+				<Box style={{ flex: 1 }}>
+					<NavLink component={Link} to="/" label={t("dashboard")} />
+					<NavLink component={Link} to="/projects" label={t("projects")} />
+					<NavLink component={Link} to="/sessions" label={t("sessions")} />
+					{user?.role === "admin" && <NavLink component={Link} to="/admin" label={t("admin")} />}
+					<NavLink component={Link} to="/settings" label={t("settings")} />
+				</Box>
+				<NavLink
+					label={t("logout")}
+					leftSection={<IconLogout size={16} />}
+					onClick={openLogout}
+					color="red"
+					variant="subtle"
+				/>
 			</AppShell.Navbar>
 
 			<AppShell.Main>
 				<Outlet />
 			</AppShell.Main>
+
+			<Modal
+				opened={logoutOpened}
+				onClose={closeLogout}
+				title={t("logoutConfirmTitle")}
+				centered
+				size="sm"
+			>
+				<Text mb="lg">{t("logoutConfirmMessage")}</Text>
+				<Group justify="flex-end">
+					<Button variant="default" onClick={closeLogout}>
+						{t("cancel")}
+					</Button>
+					<Button color="red" onClick={logout}>
+						{t("confirm")}
+					</Button>
+				</Group>
+			</Modal>
 		</AppShell>
 	);
 }

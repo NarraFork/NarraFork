@@ -6,5 +6,9 @@
 	"settings": "Settings",
 	"admin": "Admin",
 	"logout": "Logout",
+	"logoutConfirmTitle": "Confirm Logout",
+	"logoutConfirmMessage": "Are you sure you want to log out?",
+	"cancel": "Cancel",
+	"confirm": "Log Out",
 	"searchPlaceholder": "Search chapters & messages..."
 }

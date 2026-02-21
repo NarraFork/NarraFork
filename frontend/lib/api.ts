@@ -53,6 +53,7 @@ export interface TreeMessage {
 		output_tokens?: number;
 		[key: string]: unknown;
 	} | null;
+	contextPercent?: number | null;
 	createdAt: string;
 	children: TreeMessage[];
 }
@@ -167,7 +168,13 @@ export const api = {
 	unarchiveNarrator: (id: string) =>
 		request<any>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
 	markNarratorRead: (id: string) => request<any>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
-	getNarratorMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
+	getNarratorMessages: (
+		id: string,
+		limit?: number,
+		cursor?: string,
+		around?: string,
+		branchId?: string,
+	) => {
 		const params = new URLSearchParams();
 		if (around) {
 			params.set("around", around);
@@ -175,6 +182,7 @@ export const api = {
 			if (limit) params.set("limit", String(limit));
 			if (cursor) params.set("cursor", cursor);
 		}
+		if (branchId) params.set("branchId", branchId);
 		const qs = params.toString();
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
 	},
@@ -246,12 +254,38 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
 		}),
+	createPlan: (narratorId: string, content: string) =>
+		request<any>(`/narrators/${narratorId}/plan`, {
+			method: "POST",
+			body: JSON.stringify({ content }),
+		}),
 	deleteCompactMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, { method: "DELETE" }),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
 			body: JSON.stringify({ summary }),
+		}),
+
+	// Conversation Branches
+	listBranches: (narratorId: string) => request<any[]>(`/narrators/${narratorId}/branches`),
+	createBranch: (narratorId: string, forkMessageId: string, name?: string) =>
+		request<any>(`/narrators/${narratorId}/branches`, {
+			method: "POST",
+			body: JSON.stringify({ forkMessageId, name }),
+		}),
+	updateBranch: (narratorId: string, branchId: string, data: { name?: string; status?: string }) =>
+		request<any>(`/narrators/${narratorId}/branches/${branchId}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteBranch: (narratorId: string, branchId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/branches/${branchId}`, {
+			method: "DELETE",
+		}),
+	switchBranch: (narratorId: string, branchId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/branches/${branchId}/switch`, {
+			method: "POST",
 		}),
 
 	// Terminals

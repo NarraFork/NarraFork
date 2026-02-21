@@ -57,6 +57,7 @@ export function TerminalGrid({ layout, panelTerminals, onSendToChat, onExit }: T
 				const terminalId = panelTerminals.get(idx);
 				return (
 					<Box
+						// biome-ignore lint/suspicious/noArrayIndexKey: panels are fixed layout slots, order never changes
 						key={`${effectiveLayout}-${idx}`}
 						style={{
 							gridArea: panel.gridArea,

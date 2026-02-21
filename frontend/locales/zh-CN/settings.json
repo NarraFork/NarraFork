@@ -11,6 +11,8 @@
 	"customModelsDesc": "内置模型不可编辑或删除。可在下方添加自定义模型 ID。点击眼睛图标可隐藏模型，隐藏后不会出现在模型选择器中。",
 	"extendedContext": "扩展上下文（1M tokens）",
 	"extendedContextDesc": "为支持的模型启用 1M token 上下文窗口（Opus 4.6、Sonnet 4.5、Sonnet 4）",
+	"maxTurns": "每条消息最大轮次",
+	"maxTurnsDesc": "每条用户消息的 Agent 循环最大轮次数",
 	"modelValuePlaceholder": "模型 ID",
 	"modelLabelPlaceholder": "显示名称",
 	"modelProviderPlaceholder": "供应商",

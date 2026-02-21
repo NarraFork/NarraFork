@@ -44,15 +44,21 @@ export function useNarrator(id: string) {
 	});
 }
 
-export function useNarratorMessages(narratorId: string, around?: string) {
+export function useNarratorMessages(narratorId: string, around?: string, branchId?: string) {
 	return useInfiniteQuery({
-		queryKey: ["narrators", narratorId, "messages", { around }],
+		queryKey: ["narrators", narratorId, "messages", { around, branchId }],
 		queryFn: ({ pageParam }) => {
 			// First page: use `around` if provided, otherwise fetch latest 20
 			if (!pageParam && around) {
-				return api.getNarratorMessages(narratorId, undefined, undefined, around);
+				return api.getNarratorMessages(narratorId, undefined, undefined, around, branchId);
 			}
-			return api.getNarratorMessages(narratorId, pageParam ? 50 : 20, pageParam);
+			return api.getNarratorMessages(
+				narratorId,
+				pageParam ? 50 : 20,
+				pageParam,
+				undefined,
+				branchId,
+			);
 		},
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
@@ -135,6 +141,79 @@ export function useUpdateModel() {
 			api.updateNarratorModel(id, model),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+// === Conversation Branches ===
+
+export function useBranches(narratorId: string) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "branches"],
+		queryFn: () => api.listBranches(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateBranch() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			forkMessageId,
+			name,
+		}: {
+			narratorId: string;
+			forkMessageId: string;
+			name?: string;
+		}) => api.createBranch(narratorId, forkMessageId, name),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "branches"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "messages"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId] });
+		},
+	});
+}
+
+export function useSwitchBranch() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, branchId }: { narratorId: string; branchId: string }) =>
+			api.switchBranch(narratorId, branchId),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "messages"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateBranch() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			branchId,
+			data,
+		}: {
+			narratorId: string;
+			branchId: string;
+			data: { name?: string; status?: string };
+		}) => api.updateBranch(narratorId, branchId, data),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "branches"] });
+		},
+	});
+}
+
+export function useDeleteBranch() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, branchId }: { narratorId: string; branchId: string }) =>
+			api.deleteBranch(narratorId, branchId),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "branches"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "messages"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId] });
 		},
 	});
 }

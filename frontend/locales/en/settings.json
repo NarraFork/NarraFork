@@ -11,6 +11,8 @@
 	"customModelsDesc": "Built-in models cannot be edited or removed. Add custom model IDs below. Click the eye icon to hide a model from selectors.",
 	"extendedContext": "Extended Context (1M tokens)",
 	"extendedContextDesc": "Enable 1M token context window for supported models (Opus 4.6, Sonnet 4.5, Sonnet 4)",
+	"maxTurns": "Max Turns per Message",
+	"maxTurnsDesc": "Maximum number of agent loop turns per user message (0 = use default)",
 	"modelValuePlaceholder": "Model ID",
 	"modelLabelPlaceholder": "Display name",
 	"modelProviderPlaceholder": "Provider",

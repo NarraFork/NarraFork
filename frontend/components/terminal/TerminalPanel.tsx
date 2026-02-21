@@ -223,9 +223,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			},
 			[onSendToChat],
 		);
+		// biome-ignore lint/correctness/useExhaustiveDependencies: resolvedTheme and terminalFontSize are handled by a separate live-update effect below
 		useEffect(() => {
 			if (!containerRef.current) return;
-
 			const term = new Terminal({
 				cursorBlink: true,
 				fontSize: terminalFontSize,
@@ -424,7 +424,10 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					const touch = e.touches[0];
 					const cell = touchToCell(touch.clientX, touch.clientY);
 					if (!cell) return;
-					let nextHandles: typeof selHandles = null;
+					let nextHandles: {
+						start: { col: number; row: number };
+						end: { col: number; row: number };
+					} | null = null;
 					setSelHandles((prev) => {
 						if (!prev) return prev;
 						const next = { ...prev };
@@ -436,8 +439,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 						nextHandles = next;
 						return next;
 					});
-					if (nextHandles) {
-						applyHandleSelection(nextHandles.start, nextHandles.end);
+					if (nextHandles as typeof selHandles) {
+						const h = nextHandles as unknown as NonNullable<typeof selHandles>;
+						applyHandleSelection(h.start, h.end);
 					}
 					return;
 				}

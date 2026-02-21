@@ -60,6 +60,7 @@ import {
 import { useTranslation } from "react-i18next";
 import {
 	useArchiveNarrator,
+	useCreateBranch,
 	useInterruptNarrator,
 	useNarrator,
 	useNarratorMessages,
@@ -68,10 +69,10 @@ import {
 } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api } from "../../lib/api";
+import { api, type PaginatedMessages, type TreeMessage } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { SelectionPopover } from "../common/SelectionPopover";
-
+import { BranchSelector } from "./BranchSelector";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MessageBubble } from "./MessageBubble";
@@ -102,8 +103,8 @@ if (typeof document !== "undefined") {
 			100% { transform: translateX(433%) }
 		}
 		@media (max-width: 768px) {
-			.context-ring { width: 20px !important; height: 20px !important; }
-			.context-ring svg { width: 20px; height: 20px; }
+			.context-ring { width: 14px !important; height: 14px !important; display: flex !important; align-items: center; justify-content: center; }
+			.context-ring svg { width: 14px; height: 14px; display: block; }
 		}`;
 		document.head.appendChild(style);
 	}
@@ -115,11 +116,7 @@ interface TodoItem {
 	activeForm?: string;
 }
 
-interface MessagesPage {
-	messages: NarratorMsg[];
-	hasMore?: boolean;
-	nextCursor?: string | null;
-}
+type MessagesPage = PaginatedMessages;
 
 interface MessagesQueryData {
 	pages: MessagesPage[];
@@ -150,16 +147,7 @@ interface ToolCallRow {
 	permissionSuggestions?: unknown[] | null;
 }
 
-interface NarratorMsg {
-	id: string;
-	role: string;
-	contentJson?: ContentBlock[] | unknown;
-	contentText?: string;
-	toolCalls?: ToolCallRow[];
-	children?: NarratorMsg[];
-	createdAt?: string;
-	[key: string]: unknown;
-}
+type NarratorMsg = TreeMessage;
 
 // --- Message-level helpers ---
 
@@ -528,7 +516,7 @@ const SubagentCard = memo(
 														<div key={item.toolUseId ?? item.tc.toolName} id={`msg-${item.msgId}`}>
 															<SubagentCard
 																toolCall={item.tc}
-																childMessages={subCh}
+																childMessages={subCh ?? []}
 																narratorId={narratorId}
 																permCb={permCb}
 																editExpandOverride={editExpandOverride}
@@ -754,6 +742,7 @@ function renderTreeMessages(
 	editExpandOverride?: boolean | null,
 	showTokenUsage?: boolean,
 	onDeleteMessage?: (messageId: string) => void,
+	onBranchFromMessage?: (messageId: string) => void,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -793,6 +782,7 @@ function renderTreeMessages(
 									toolCalls: [],
 								}}
 								onForkFromMessage={onForkFromMessage}
+								onBranchFromMessage={onBranchFromMessage}
 								resolvePerm={(tc) => resolvePendingPerm(tc, permCb.pendingPermission)}
 								onPermissionDecision={permCb.onPermissionDecision}
 								onQuestionSubmit={permCb.onQuestionSubmit}
@@ -840,6 +830,7 @@ function renderTreeMessages(
 						narratorId={narratorId}
 						message={msg}
 						onForkFromMessage={onForkFromMessage}
+						onBranchFromMessage={onBranchFromMessage}
 						resolvePerm={(tc) => resolvePendingPerm(tc, permCb.pendingPermission)}
 						onPermissionDecision={permCb.onPermissionDecision}
 						onQuestionSubmit={permCb.onQuestionSubmit}
@@ -869,9 +860,10 @@ function renderTreeMessages(
 // --- MemoizedPageElements: per-page memoized rendering to avoid re-rendering all pages on WS updates ---
 
 interface PageElementsProps {
-	page: { messages: NarratorMsg[] };
+	page: MessagesPage;
 	narratorId: string;
 	onForkFromMessage: ((uuid: string) => void) | undefined;
+	onBranchFromMessage: ((messageId: string) => void) | undefined;
 	highlightedId: string | null;
 	permCb: PermissionCallbacks;
 	expandedToolUseId?: string | null;
@@ -887,6 +879,7 @@ const MemoizedPageElements = memo(
 		page,
 		narratorId,
 		onForkFromMessage,
+		onBranchFromMessage,
 		highlightedId,
 		permCb,
 		expandedToolUseId,
@@ -909,6 +902,7 @@ const MemoizedPageElements = memo(
 			editExpandOverride,
 			showTokenUsage,
 			onDeleteMessage,
+			onBranchFromMessage,
 		);
 		return <>{elements}</>;
 	},
@@ -916,6 +910,7 @@ const MemoizedPageElements = memo(
 		prev.page === next.page &&
 		prev.narratorId === next.narratorId &&
 		prev.onForkFromMessage === next.onForkFromMessage &&
+		prev.onBranchFromMessage === next.onBranchFromMessage &&
 		prev.permCb.pendingPermission === next.permCb.pendingPermission &&
 		prev.permCb.bgRetryDismissedIds === next.permCb.bgRetryDismissedIds &&
 		prev.expandedToolUseId === next.expandedToolUseId &&
@@ -1097,6 +1092,7 @@ interface NarratorPanelProps {
 		sdkPlanMode?: boolean | null;
 		todosJson?: TodoItem[] | null;
 		todosToolUseId?: string | null;
+		activeBranchId?: string | null;
 	};
 	onForkFromMessage?: (sdkMessageUuid: string) => void;
 	highlightMessageId?: string;
@@ -1126,13 +1122,15 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+	const activeBranchId = (narrator as any)?.activeBranchId ?? null;
+	const createBranchMutation = useCreateBranch();
 	const {
 		data: messagesData,
 		isLoading: messagesLoading,
 		hasNextPage,
 		fetchNextPage,
 		isFetchingNextPage,
-	} = useNarratorMessages(narratorId, highlightMessageId);
+	} = useNarratorMessages(narratorId, highlightMessageId, activeBranchId ?? undefined);
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
@@ -1170,8 +1168,13 @@ export function NarratorPanel({
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const qc = useQueryClient();
 	const messagesQueryKey = useMemo(
-		() => ["narrators", narratorId, "messages", { around: highlightMessageId }],
-		[narratorId, highlightMessageId],
+		() => [
+			"narrators",
+			narratorId,
+			"messages",
+			{ around: highlightMessageId, branchId: activeBranchId ?? undefined },
+		],
+		[narratorId, highlightMessageId, activeBranchId],
 	);
 
 	const handleDeleteMessage = useCallback(
@@ -1186,7 +1189,7 @@ export function NarratorPanel({
 				let foundCp: number | null = null;
 				for (const page of pages) {
 					for (let i = page.messages.length - 1; i >= 0; i--) {
-						const cp = (page.messages[i] as Record<string, unknown>).contextPercent;
+						const cp = (page.messages[i] as unknown as Record<string, unknown>).contextPercent;
 						if (cp != null) {
 							foundCp = cp as number;
 							break;
@@ -1242,9 +1245,9 @@ export function NarratorPanel({
 		if (!msgs?.length) return;
 		// Walk backwards to find the last message with contextPercent
 		for (let i = msgs.length - 1; i >= 0; i--) {
-			const cp = (msgs[i] as Record<string, unknown>).contextPercent;
+			const cp = (msgs[i] as unknown as Record<string, unknown>).contextPercent;
 			if (cp != null) {
-				setContextPercent(cp);
+				setContextPercent(cp as number);
 				break;
 			}
 		}
@@ -1352,7 +1355,7 @@ export function NarratorPanel({
 	}, []);
 
 	// Flatten infinite query pages into a single chronological array (incremental)
-	const prevPagesRef = useRef<unknown[]>([]);
+	const prevPagesRef = useRef<MessagesPage[]>([]);
 	const cachedFlatRef = useRef<NarratorMsg[]>([]);
 	const messages = useMemo(() => {
 		if (!hydrated || !messagesData?.pages) return [];
@@ -1384,7 +1387,9 @@ export function NarratorPanel({
 		if (!messages.length) return;
 		const last = messages[messages.length - 1];
 		const blocks = Array.isArray(last.contentJson) ? last.contentJson : [];
-		const compactBlock = blocks.find((b: ContentBlock) => b.type === "compact");
+		const compactBlock = blocks.find(
+			(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
+		);
 		if (compactBlock) {
 			setIsCompacting(compactBlock.status === "compacting");
 		}
@@ -1460,7 +1465,7 @@ export function NarratorPanel({
 					const pages = old.pages.map((page: MessagesPage) => {
 						const { messages: m1, changed: c1 } = mergeToolCallFieldsInTree(
 							page.messages,
-							perm.toolUseId,
+							perm.toolUseId!,
 							{ inputJson: mergedInput, status: "running" },
 						);
 						if (c1) anyChanged = true;
@@ -1523,10 +1528,10 @@ export function NarratorPanel({
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
 			pendingPermission: null, // overridden per-render below
-			onPermissionDecision: (...args) => permCbRef.current.onPermissionDecision(...args),
-			onQuestionSubmit: (...args) => permCbRef.current.onQuestionSubmit(...args),
-			onQuestionDeny: (...args) => permCbRef.current.onQuestionDeny(...args),
-			onBgAgentRetry: (...args) => permCbRef.current.onBgAgentRetry?.(...args),
+			onPermissionDecision: (...args) => permCbRef.current!.onPermissionDecision(...args),
+			onQuestionSubmit: (...args) => permCbRef.current!.onQuestionSubmit(...args),
+			onQuestionDeny: (...args) => permCbRef.current!.onQuestionDeny(...args),
+			onBgAgentRetry: (...args) => permCbRef.current!.onBgAgentRetry?.(...args),
 			bgRetryDismissedIds: new Set(),
 		}),
 		[],
@@ -1538,7 +1543,14 @@ export function NarratorPanel({
 	// pendingPermission IS included because it changes rarely (only on permission
 	// request/resolve) and must trigger a re-render so the inline permission UI
 	// appears correctly — especially on page reload when loaded via API.
-	const forkHandler = narrator?.chapterId ? onForkFromMessage : undefined;
+	// Fork handler: chapter-level fork (if chapter-bound) or branch-level fork
+	const handleBranchFork = useCallback(
+		(messageId: string) => {
+			createBranchMutation.mutate({ narratorId, forkMessageId: messageId });
+		},
+		[narratorId, createBranchMutation.mutate],
+	);
+	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleBranchFork;
 	const renderPermCb = useMemo(
 		() => ({ ...stablePermCb, pendingPermission, bgRetryDismissedIds }),
 		[stablePermCb, pendingPermission, bgRetryDismissedIds],
@@ -1609,6 +1621,7 @@ export function NarratorPanel({
 					page={page}
 					narratorId={narratorId}
 					onForkFromMessage={forkHandler}
+					onBranchFromMessage={handleBranchFork}
 					highlightedId={highlightedId}
 					permCb={renderPermCb}
 					expandedToolUseId={expandedToolUseId}
@@ -1631,6 +1644,7 @@ export function NarratorPanel({
 					page={page}
 					narratorId={narratorId}
 					onForkFromMessage={forkHandler}
+					onBranchFromMessage={handleBranchFork}
 					highlightedId={highlightedId}
 					permCb={renderPermCb}
 					expandedToolUseId={expandedToolUseId}
@@ -1649,6 +1663,7 @@ export function NarratorPanel({
 		visibleCount,
 		narratorId,
 		forkHandler,
+		handleBranchFork,
 		renderPermCb,
 		expandedToolUseId,
 		editExpandOverride,
@@ -1930,7 +1945,7 @@ export function NarratorPanel({
 	const { connected, disconnected, sendPermissionDecision, sendBufferMessage, cancelBuffer } =
 		useNarratorWS(narratorId, {
 			onStreamEvent: (wsData: Record<string, unknown>) => {
-				const ev = wsData.event;
+				const ev = wsData.event as Record<string, any> | undefined;
 				if (
 					ev?.type === "content_block_delta" &&
 					ev.delta?.type === "text_delta" &&
@@ -1941,9 +1956,11 @@ export function NarratorPanel({
 				}
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				// Derive compacting state from system compact messages
+				// Derive compacting state from system compact messages (skip plan subtype)
 				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
-				const compactBlock = blocks.find((b: ContentBlock) => b.type === "compact");
+				const compactBlock = blocks.find(
+					(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
+				);
 				if (compactBlock) {
 					setIsCompacting(compactBlock.status === "compacting");
 					// Update context indicator from compacted message
@@ -2295,11 +2312,16 @@ export function NarratorPanel({
 			})),
 			{ type: "text", text: msg },
 		];
-		const optimisticMsg = {
+		const optimisticMsg: TreeMessage = {
 			id: `optimistic-${Date.now()}`,
+			narratorId,
+			parentToolUseId: null,
 			role: "user",
 			contentJson: optimisticBlocks,
 			contentText: msg,
+			toolCalls: [],
+			createdAt: new Date().toISOString(),
+			children: [],
 		};
 		qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 			if (!old?.pages?.length) {
@@ -2395,52 +2417,50 @@ export function NarratorPanel({
 					>
 						<IconArrowLeft size={16} />
 					</ActionIcon>
-					{editingTitle ? (
-						<TextInput
-							ref={titleInputRef}
-							value={titleValue}
-							onChange={(e) => setTitleValue(e.currentTarget.value)}
-							onKeyDown={handleTitleKeyDown}
-							onBlur={saveTitle}
+					<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
+						{editingTitle ? (
+							<TextInput
+								ref={titleInputRef}
+								value={titleValue}
+								onChange={(e) => setTitleValue(e.currentTarget.value)}
+								onKeyDown={handleTitleKeyDown}
+								onBlur={saveTitle}
+								size="xs"
+								style={{ flex: 1, maxWidth: 500 }}
+							/>
+						) : (
+							<Text
+								size="sm"
+								fw={500}
+								onDoubleClick={startEditingTitle}
+								style={{
+									cursor: "pointer",
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									maxWidth: 500,
+								}}
+								title={narrator.title || t("untitled")}
+							>
+								{narrator.title || t("untitled")}
+							</Text>
+						)}
+						<ActionIcon
 							size="xs"
-							style={{ flex: 1, maxWidth: 250 }}
-							rightSection={
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									onMouseDown={(e: React.MouseEvent) => {
-										e.preventDefault();
-									}}
-									onClick={handleGenerateTitle}
-									loading={generatingTitle}
-									title={t("generateTitle")}
-								>
-									<IconSparkles size={12} />
-								</ActionIcon>
-							}
-						/>
-					) : (
-						<Text
-							size="sm"
-							fw={500}
-							onDoubleClick={startEditingTitle}
-							style={{
-								cursor: "pointer",
-								overflow: "hidden",
-								textOverflow: "ellipsis",
-								whiteSpace: "nowrap",
-								maxWidth: 250,
-							}}
-							title={narrator.title || t("untitled")}
+							variant="subtle"
+							onClick={handleGenerateTitle}
+							loading={generatingTitle}
+							title={t("generateTitle")}
 						>
-							{narrator.title || t("untitled")}
-						</Text>
-					)}
+							<IconSparkles size={12} />
+						</ActionIcon>
+					</Group>
 					{disconnected && (
 						<Badge size="xs" variant="dot" color="red">
 							{t("disconnected")}
 						</Badge>
 					)}
+					<BranchSelector narratorId={narratorId} activeBranchId={activeBranchId} />
 				</Group>
 				<Group gap="xs">
 					<Tooltip

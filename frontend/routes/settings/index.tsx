@@ -72,6 +72,7 @@ function SettingsPage() {
 	const [newModelLabel, setNewModelLabel] = useState("");
 	const [newModelProvider, setNewModelProvider] = useState("openai");
 	const [extendedContext, setExtendedContext] = useState(false);
+	const [maxTurns, setMaxTurns] = useState(200);
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// OpenAI
@@ -103,6 +104,7 @@ function SettingsPage() {
 		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
 		hiddenModels: [] as string[],
 		extendedContext: false,
+		maxTurns: 200,
 		maxWorktrees: 10,
 		maxContainers: 5,
 		sizeWarning: 500,
@@ -126,6 +128,7 @@ function SettingsPage() {
 				customModels: settings.agent?.customModels ?? [],
 				hiddenModels: settings.agent?.hiddenModels ?? [],
 				extendedContext: settings.agent?.extendedContext ?? false,
+				maxTurns: settings.agent?.maxTurns ?? 200,
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -146,6 +149,7 @@ function SettingsPage() {
 			setCustomModels(snap.customModels);
 			setHiddenModels(snap.hiddenModels);
 			setExtendedContext(snap.extendedContext);
+			setMaxTurns(snap.maxTurns);
 			setMaxWorktrees(snap.maxWorktrees);
 			setMaxContainers(snap.maxContainers);
 			setSizeWarning(snap.sizeWarning);
@@ -172,6 +176,7 @@ function SettingsPage() {
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			extendedContext !== s.extendedContext ||
+			maxTurns !== s.maxTurns ||
 			maxWorktrees !== s.maxWorktrees ||
 			maxContainers !== s.maxContainers ||
 			sizeWarning !== s.sizeWarning ||
@@ -193,6 +198,7 @@ function SettingsPage() {
 		customModels,
 		hiddenModels,
 		extendedContext,
+		maxTurns,
 		maxWorktrees,
 		maxContainers,
 		sizeWarning,
@@ -263,6 +269,7 @@ function SettingsPage() {
 					customModels,
 					hiddenModels,
 					extendedContext,
+					maxTurns,
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -292,6 +299,7 @@ function SettingsPage() {
 						customModels: [...customModels],
 						hiddenModels: [...hiddenModels],
 						extendedContext,
+						maxTurns,
 						maxWorktrees,
 						maxContainers,
 						sizeWarning,
@@ -394,6 +402,14 @@ function SettingsPage() {
 						description={t("extendedContextDesc")}
 						checked={extendedContext}
 						onChange={(e) => setExtendedContext(e.currentTarget.checked)}
+					/>
+					<NumberInput
+						label={t("maxTurns")}
+						description={t("maxTurnsDesc")}
+						value={maxTurns}
+						onChange={(v) => setMaxTurns(typeof v === "number" ? v : 200)}
+						min={1}
+						max={1000}
 					/>
 					<Stack gap="xs">
 						<Text size="sm" fw={500}>
@@ -593,7 +609,7 @@ function SettingsPage() {
 					<Switch
 						label={t("replyInUserLanguage")}
 						description={t("replyInUserLanguageDesc")}
-						checked={userPrefs?.replyInUserLanguage ?? false}
+						checked={userPrefs?.replyInUserLanguage ?? true}
 						onChange={(e) =>
 							updateUserPref.mutate({ replyInUserLanguage: e.currentTarget.checked })
 						}

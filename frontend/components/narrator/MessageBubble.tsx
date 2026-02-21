@@ -1,8 +1,5 @@
 import {
-	ActionIcon,
 	Box,
-	Button,
-	Group,
 	Image,
 	Loader,
 	Modal,
@@ -12,16 +9,21 @@ import {
 	Stack,
 	Text,
 	Textarea,
-	Tooltip,
+	Button,
+	Group,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconArrowsMinimize } from "@tabler/icons-react";
+import { IconArrowsMinimize, IconListCheck } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
 import { MarkdownContent } from "./MarkdownContent";
+import {
+	type MessageContextMenuActions,
+	MessageContextMenuCtx,
+} from "./MessageContextMenuCtx";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
@@ -30,11 +32,12 @@ interface MessageBubbleProps {
 		id?: string;
 		role: string;
 		contentJson: any[];
-		contentText?: string;
+		contentText?: string | null;
 		toolCalls?: any[];
-		sdkMessageUuid?: string;
+		sdkMessageUuid?: string | null;
 	};
 	onForkFromMessage?: (sdkMessageUuid: string) => void;
+	onBranchFromMessage?: (messageId: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
 	resolvePerm?: (tc: any) => PendingPermission | null;
 	onPermissionDecision?: (
@@ -252,10 +255,122 @@ function CompactIndicator({
 	);
 }
 
+function PlanCard({
+	summary,
+	narratorId,
+	messageId,
+	onDelete,
+}: {
+	summary: string;
+	narratorId?: string;
+	messageId?: string;
+	onDelete?: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [editing, setEditing] = useState(false);
+	const [editText, setEditText] = useState("");
+	const [displaySummary, setDisplaySummary] = useState(summary);
+	const [saving, setSaving] = useState(false);
+	const [deleting, setDeleting] = useState(false);
+
+	// Sync if parent re-renders with a new summary (e.g. after query refetch)
+	useEffect(() => {
+		setDisplaySummary(summary);
+	}, [summary]);
+
+	const handleEdit = () => {
+		setEditText(displaySummary);
+		setEditing(true);
+	};
+
+	const handleSave = async () => {
+		if (!narratorId || !messageId) return;
+		setSaving(true);
+		try {
+			await api.updateCompactSummary(narratorId, messageId, editText);
+			setDisplaySummary(editText);
+			setEditing(false);
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	const handleDelete = async () => {
+		if (!narratorId || !messageId) return;
+		setDeleting(true);
+		try {
+			await api.deleteCompactMessage(narratorId, messageId);
+			onDelete?.();
+		} finally {
+			setDeleting(false);
+		}
+	};
+
+	return (
+		<Paper
+			p="sm"
+			radius="md"
+			withBorder
+			style={{
+				borderColor: "var(--mantine-color-teal-light-color)",
+				backgroundColor: "var(--mantine-color-teal-light)",
+			}}
+		>
+			<Group gap={6} mb={6}>
+				<IconListCheck size={16} style={{ color: "var(--mantine-color-teal-6)" }} />
+				<Text size="xs" fw={600} c="teal">
+					{t("plan")}
+				</Text>
+				{narratorId && messageId && (
+					<Group gap={4} ml="auto">
+						{editing ? (
+							<>
+								<Button variant="subtle" size="compact-xs" onClick={() => setEditing(false)}>
+									{t("cancelEdit")}
+								</Button>
+								<Button size="compact-xs" loading={saving} onClick={handleSave}>
+									{t("saveEdit")}
+								</Button>
+							</>
+						) : (
+							<>
+								<Button variant="subtle" size="compact-xs" c="dimmed" onClick={handleEdit}>
+									{t("editCompact")}
+								</Button>
+								<Button
+									variant="subtle"
+									size="compact-xs"
+									c="red"
+									loading={deleting}
+									onClick={handleDelete}
+								>
+									{t("deleteCompact")}
+								</Button>
+							</>
+						)}
+					</Group>
+				)}
+			</Group>
+			{editing ? (
+				<Textarea
+					value={editText}
+					onChange={(e) => setEditText(e.currentTarget.value)}
+					autosize
+					minRows={4}
+					maxRows={20}
+				/>
+			) : (
+				<MarkdownContent text={displaySummary} />
+			)}
+		</Paper>
+	);
+}
+
 export const MessageBubble = memo(function MessageBubble({
 	narratorId,
 	message,
 	onForkFromMessage,
+	onBranchFromMessage,
 	resolvePerm,
 	onPermissionDecision,
 	onQuestionSubmit,
@@ -264,14 +379,44 @@ export const MessageBubble = memo(function MessageBubble({
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
-	const canFork = !isUser && message.sdkMessageUuid && onForkFromMessage;
 	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("chapters");
 
-	// System messages (compact indicators)
+	// Build message-level context menu actions for ContentViewer to consume
+	const ctxActions = useMemo<MessageContextMenuActions>(() => {
+		const actions: MessageContextMenuActions = {};
+		if (message.id && onBranchFromMessage && !isUser) {
+			actions.onBranchFromMessage = () => onBranchFromMessage(message.id!);
+		}
+		if (message.sdkMessageUuid && onForkFromMessage && !isUser) {
+			actions.onForkFromMessage = () => onForkFromMessage(message.sdkMessageUuid!);
+		}
+		if (message.id && onDeleteMessage) {
+			actions.onDeleteMessage = () => onDeleteMessage(message.id!);
+		}
+		return actions;
+	}, [
+		isUser,
+		message.id,
+		message.sdkMessageUuid,
+		onBranchFromMessage,
+		onForkFromMessage,
+		onDeleteMessage,
+	]);
+
+	// System messages (compact indicators / plan cards)
 	if (message.role === "system") {
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (compactBlock) {
+			if (compactBlock.subtype === "plan") {
+				return (
+					<PlanCard
+						summary={compactBlock.summary ?? ""}
+						narratorId={narratorId}
+						messageId={message.id}
+						onDelete={onDeleteMessage ? () => onDeleteMessage(message.id!) : undefined}
+					/>
+				);
+			}
 			const isCompacting = compactBlock.status === "compacting";
 			const canNavigate = !isCompacting && narratorId && message.id;
 			return (
@@ -286,105 +431,104 @@ export const MessageBubble = memo(function MessageBubble({
 		return null;
 	}
 
-	// User messages: full-width bubble
+	// User messages — wrap entire bubble in ContentViewer for context menu / swipe
 	if (isUser) {
+		const fullText = blocks
+			.filter((b: any) => b.type === "text" && b.text)
+			.map((b: any) => b.text)
+			.join("\n\n");
 		return (
-			<Paper p="sm" radius="md" style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}>
-				<Stack gap={4}>
-					<Text size="xs" fw={600} c="indigo">
-						{t("you")}
-					</Text>
-					{blocks.map((block: any, i: number) => {
-						const key = block.id ?? `${block.type}-${i}`;
-						if (block.type === "text") {
-							return (
-								<Text key={key} size="sm" style={{ whiteSpace: "pre-wrap" }}>
-									{block.text}
-								</Text>
-							);
-						}
-						if (block.type === "image") {
-							return <ImageBlock key={key} block={block} narratorId={narratorId} />;
-						}
-						return null;
-					})}
-				</Stack>
-			</Paper>
+			<MessageContextMenuCtx.Provider value={ctxActions}>
+				<ContentViewer content={fullText} markdown contentType="markdown">
+					<Paper p="sm" radius="md" style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}>
+						<Stack gap={4}>
+							<Text size="xs" fw={600} c="indigo">
+								{t("you")}
+							</Text>
+							{blocks.map((block: any, i: number) => {
+								const key = block.id ?? `${block.type}-${i}`;
+								if (block.type === "text") {
+									return (
+										<Text key={key} size="sm" style={{ whiteSpace: "pre-wrap" }}>
+											{block.text}
+										</Text>
+									);
+								}
+								if (block.type === "image") {
+									return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+								}
+								return null;
+							})}
+						</Stack>
+					</Paper>
+				</ContentViewer>
+			</MessageContextMenuCtx.Provider>
 		);
 	}
 
-	// Assistant messages: render content blocks directly
+	// Assistant messages — wrap in context provider so all ContentViewers
+	// (including those inside ToolCallCard) can access message-level actions
 	return (
-		<Stack gap={4}>
-			{canFork && (
-				<Group justify="flex-end" gap={4}>
-					<Tooltip label={tc("forkFromMessage")}>
-						<ActionIcon
-							size="xs"
-							variant="subtle"
-							color="gray"
-							onClick={() => onForkFromMessage(message.sdkMessageUuid!)}
-						>
-							&#x2442;
-						</ActionIcon>
-					</Tooltip>
-				</Group>
-			)}
-			{blocks.map((block: any, i: number) => {
-				const key = block.id ?? `${block.type}-${i}`;
-				if (block.type === "text") {
-					if (!block.text?.trim()) return null;
-					return <ContentViewer key={key} content={block.text} markdown contentType="markdown" />;
-				}
-				if (block.type === "image") {
-					return <ImageBlock key={key} block={block} narratorId={narratorId} />;
-				}
-				if (block.type === "thinking") {
-					return (
-						<Paper
-							key={key}
-							p="xs"
-							radius="sm"
-							style={{ backgroundColor: "var(--mantine-color-yellow-light)" }}
-						>
-							<Text size="xs" c="dimmed" fw={500} mb={2}>
-								{t("thinking")}
-							</Text>
-							<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-								{block.thinking}
-							</Text>
-						</Paper>
-					);
-				}
-				if (block.type === "tool_use") {
-					const tc = message.toolCalls?.find((t: any) => t.toolUseId === block.id);
-					const toolCallData = {
-						id: tc?.id,
-						toolName: block.name,
-						toolUseId: block.id,
-						inputJson: tc?.inputJson ?? block.input,
-						outputJson: tc?.outputJson,
-						status: tc?.status ?? "running",
-						durationMs: tc?.durationMs,
-						errorMessage: tc?.errorMessage,
-						permissionDecisionReason: tc?.permissionDecisionReason,
-						permissionSuggestions: tc?.permissionSuggestions,
-					};
-					const perm = resolvePerm?.(toolCallData) ?? null;
-					return (
-						<ToolCallCard
-							key={key}
-							toolCall={toolCallData}
-							narratorId={narratorId}
-							pendingPermission={perm}
-							onPermissionDecision={onPermissionDecision}
-							onQuestionSubmit={onQuestionSubmit}
-							onQuestionDeny={onQuestionDeny}
-						/>
-					);
-				}
-				return null;
-			})}
-		</Stack>
+		<MessageContextMenuCtx.Provider value={ctxActions}>
+			<Stack gap={4}>
+				{blocks.map((block: any, i: number) => {
+					const key = block.id ?? `${block.type}-${i}`;
+					if (block.type === "text") {
+						if (!block.text?.trim()) return null;
+						return (
+							<ContentViewer key={key} content={block.text} markdown contentType="markdown" />
+						);
+					}
+					if (block.type === "image") {
+						return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+					}
+					if (block.type === "thinking") {
+						return (
+							<Paper
+								key={key}
+								p="xs"
+								radius="sm"
+								style={{ backgroundColor: "var(--mantine-color-yellow-light)" }}
+							>
+								<Text size="xs" c="dimmed" fw={500} mb={2}>
+									{t("thinking")}
+								</Text>
+								<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+									{block.thinking}
+								</Text>
+							</Paper>
+						);
+					}
+					if (block.type === "tool_use") {
+						const tc = message.toolCalls?.find((t: any) => t.toolUseId === block.id);
+						const toolCallData = {
+							id: tc?.id,
+							toolName: block.name,
+							toolUseId: block.id,
+							inputJson: tc?.inputJson ?? block.input,
+							outputJson: tc?.outputJson,
+							status: tc?.status ?? "running",
+							durationMs: tc?.durationMs,
+							errorMessage: tc?.errorMessage,
+							permissionDecisionReason: tc?.permissionDecisionReason,
+							permissionSuggestions: tc?.permissionSuggestions,
+						};
+						const perm = resolvePerm?.(toolCallData) ?? null;
+						return (
+							<ToolCallCard
+								key={key}
+								toolCall={toolCallData}
+								narratorId={narratorId}
+								pendingPermission={perm}
+								onPermissionDecision={onPermissionDecision}
+								onQuestionSubmit={onQuestionSubmit}
+								onQuestionDeny={onQuestionDeny}
+							/>
+						);
+					}
+					return null;
+				})}
+			</Stack>
+		</MessageContextMenuCtx.Provider>
 	);
 });

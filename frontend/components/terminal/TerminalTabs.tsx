@@ -41,6 +41,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	);
 
 	// Sync active tab from view state on load
+	// biome-ignore lint/correctness/useExhaustiveDependencies: activeTabId intentionally excluded — only sync once when view state loads
 	useEffect(() => {
 		if (viewState.data?.activeTabId && !activeTabId) {
 			setActiveTabId(viewState.data.activeTabId);
@@ -48,6 +49,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	}, [viewState.data?.activeTabId]);
 
 	// Auto-select first tab if current is gone
+	// biome-ignore lint/correctness/useExhaustiveDependencies: viewState.update is stable, adding it would cause unnecessary re-renders
 	useEffect(() => {
 		if (activeTabId && !tabList.some((t: any) => t.id === activeTabId)) {
 			const first = tabList[0]?.id ?? null;
