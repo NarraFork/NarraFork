@@ -14,7 +14,7 @@ const DEFAULTS = {
 	wordWrapMarkdown: true,
 	wordWrapCode: true,
 	wordWrapDiff: true,
-	replyInUserLanguage: false,
+	replyInUserLanguage: true,
 	showTokenUsage: false,
 	terminalTheme: "auto",
 	terminalFontSize: 14,

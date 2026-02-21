@@ -42,6 +42,19 @@ export type NarratorServerMessage =
 	| { type: "compact_done"; narratorId: string }
 	| { type: "context_usage"; narratorId: string; percentage: number }
 	| { type: "metering"; narratorId: string; unit: string; unitPlural: string; usage: number }
+	// Branch events are forwarded via eventBus.onAny with "narrator:" prefix
+	// (e.g. "narrator:branch_created"), not via broadcastToNarrator().
+	| { type: "narrator:branch_created"; narratorId: string; branchId: string }
+	| { type: "narrator:branch_switched"; narratorId: string; activeBranchId: string }
+	| { type: "narrator:branch_updated"; narratorId: string; branchId: string }
+	| { type: "narrator:branch_deleted"; narratorId: string; branchId: string }
+	| {
+			type: "tool_started";
+			narratorId: string;
+			toolUseId: string;
+			toolName: string;
+			input: unknown;
+	  }
 	| { type: "error"; message: string };
 
 // Client → Server messages

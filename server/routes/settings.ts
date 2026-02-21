@@ -28,6 +28,7 @@ const updateSettingsSchema = z
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
 				extendedContext: z.boolean(),
+				maxTurns: z.number().int().min(1).max(1000),
 			})
 			.partial()
 			.optional(),

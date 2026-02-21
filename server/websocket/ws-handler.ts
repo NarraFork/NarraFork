@@ -1,6 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import { logger } from "../lib/logger";
-import { handleNarratorWS, type NarratorWSData } from "./narrator-ws";
+import { handleNarratorWS, type NarratorClientMessage, type NarratorWSData } from "./narrator-ws";
 import { handleTerminalWS, type TerminalWSData } from "./terminal-ws";
 
 // === Unified WS data type ===
@@ -56,7 +56,10 @@ export const wsHandlers = {
 		}
 
 		if (channel === "narrator") {
-			handleNarratorWS.message(ws as ServerWebSocket<WSData & { channel: "narrator" }>, parsed);
+			handleNarratorWS.message(
+				ws as ServerWebSocket<WSData & { channel: "narrator" }>,
+				parsed as NarratorClientMessage,
+			);
 		} else if (channel === "terminal") {
 			handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
 		}

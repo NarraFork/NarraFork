@@ -6,9 +6,11 @@ import { ValidationError } from "../lib/errors";
 import { getUserLanguage, getUserReplyInLanguage } from "../lib/prompt-i18n";
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
+	createBranchSchema,
 	createNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
+	updateBranchSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 } from "../lib/validators";
@@ -186,14 +188,15 @@ narratorRoutes.get("/:id/buffer", async (c) => {
 narratorRoutes.get("/:id/messages", async (c) => {
 	const id = c.req.param("id");
 	const around = c.req.query("around") || undefined;
+	const branchId = c.req.query("branchId") || undefined;
 	if (around) {
-		const result = await narratorService.getMessagesAround(id, around);
+		const result = await narratorService.getMessagesAround(id, around, undefined, branchId);
 		return c.json(result);
 	}
 	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
 	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
 	const cursor = c.req.query("cursor") || undefined;
-	const result = await narratorService.getMessagesCursor(id, limit, cursor);
+	const result = await narratorService.getMessagesCursor(id, limit, cursor, branchId);
 	return c.json(result);
 });
 
@@ -245,6 +248,16 @@ narratorRoutes.post("/:id/compact", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Create a plan compact message
+narratorRoutes.post("/:id/plan", async (c) => {
+	const narratorId = c.req.param("id");
+	await narratorService.getById(narratorId);
+	const { content } = await c.req.json();
+	if (!content || typeof content !== "string") throw new ValidationError("content is required");
+	const msg = await narratorService.persistPlanMessage(narratorId, content);
+	return c.json(msg);
+});
+
 // Interrupt active session
 narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
@@ -293,7 +306,7 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 	await narratorService.getById(id);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
-	const title = await generateTitle(id, [], locale);
+	const title = await generateTitle(id, locale);
 	await narratorService.updateTitle(id, title);
 	return c.json({ title });
 });
@@ -322,6 +335,72 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 	if (narrator.status === "done") {
 		await narratorService.updateStatus(id, "idle");
 	}
+	return c.json({ ok: true });
+});
+
+// === Conversation Branches ===
+
+// List branches
+narratorRoutes.get("/:id/branches", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const branches = await narratorService.listBranches(id);
+	return c.json(
+		branches.map((b) => ({
+			...b,
+			isRoot: b.parentBranchId === null,
+		})),
+	);
+});
+
+// Create branch (fork from message)
+narratorRoutes.post("/:id/branches", async (c) => {
+	const id = c.req.param("id");
+	const body = await c.req.json();
+	const parsed = createBranchSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const branch = await narratorService.createBranch(
+		id,
+		parsed.data.forkMessageId,
+		parsed.data.name,
+	);
+	return c.json(branch, 201);
+});
+
+// Update branch (rename/archive)
+narratorRoutes.patch("/:id/branches/:branchId", async (c) => {
+	const id = c.req.param("id");
+	const branchId = c.req.param("branchId");
+	const body = await c.req.json();
+	const parsed = updateBranchSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const branch = await narratorService.updateBranch(id, branchId, parsed.data);
+	return c.json(branch);
+});
+
+// Delete branch
+narratorRoutes.delete("/:id/branches/:branchId", async (c) => {
+	const id = c.req.param("id");
+	const branchId = c.req.param("branchId");
+	await narratorService.deleteBranch(id, branchId);
+	return c.json({ ok: true });
+});
+
+// Switch to root branch — must be before :branchId/switch
+narratorRoutes.post("/:id/branches/root/switch", async (c) => {
+	const id = c.req.param("id");
+	const branches = await narratorService.listBranches(id);
+	const rootBranch = branches.find((b) => b.parentBranchId === null);
+	if (!rootBranch) throw new ValidationError("No root branch found");
+	await narratorService.switchBranch(id, rootBranch.id);
+	return c.json({ ok: true });
+});
+
+// Switch active branch
+narratorRoutes.post("/:id/branches/:branchId/switch", async (c) => {
+	const id = c.req.param("id");
+	const branchId = c.req.param("branchId");
+	await narratorService.switchBranch(id, branchId);
 	return c.json({ ok: true });
 });
 
