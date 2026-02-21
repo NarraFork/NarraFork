@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS chapters (
 CREATE TABLE IF NOT EXISTS narrators (
 	id TEXT PRIMARY KEY,
 	chapter_id TEXT REFERENCES chapters(id),
-	claude_session_id TEXT,
+	api_conversation_id TEXT,
 	active_branch_id TEXT,
 	title TEXT,
 	type TEXT NOT NULL DEFAULT 'primary',
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS conversation_branches (
 	name TEXT NOT NULL,
 	fork_message_id TEXT,
 	parent_branch_id TEXT REFERENCES conversation_branches(id),
-	claude_session_id TEXT,
+	api_conversation_id TEXT,
 	context_summary TEXT,
 	status TEXT NOT NULL DEFAULT 'active',
 	message_count INTEGER DEFAULT 0,

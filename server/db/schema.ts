@@ -63,7 +63,7 @@ export const conversationBranches = sqliteTable(
 		name: text("name").notNull(),
 		forkMessageId: text("fork_message_id"),
 		parentBranchId: text("parent_branch_id").references((): any => conversationBranches.id),
-		claudeSessionId: text("claude_session_id"),
+		apiConversationId: text("api_conversation_id"),
 		contextSummary: text("context_summary"),
 		status: text("status", { enum: ["active", "archived"] })
 			.notNull()
@@ -84,7 +84,7 @@ export const narrators = sqliteTable(
 	{
 		id: text("id").primaryKey(),
 		chapterId: text("chapter_id").references(() => chapters.id),
-		claudeSessionId: text("claude_session_id"),
+		apiConversationId: text("api_conversation_id"),
 		activeBranchId: text("active_branch_id"),
 		type: text("type", { enum: ["primary", "secondary"] })
 			.notNull()

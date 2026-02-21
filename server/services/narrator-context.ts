@@ -55,7 +55,7 @@ export const narratorContext = {
 				inheritMode: input.inheritMode,
 				parentNarratorId: input.parentNarratorId,
 				// For "full" mode, store parent session ID so we can fork on first message
-				claudeSessionId: input.inheritMode === "full" ? parent.claudeSessionId : null,
+				apiConversationId: input.inheritMode === "full" ? parent.apiConversationId : null,
 				contextSummary,
 				status: "idle",
 				createdAt: now,

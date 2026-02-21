@@ -123,7 +123,7 @@ async function appendBranchMessage(
 }
 
 /**
- * Clear or set contextSummary + claudeSessionId on the active branch (or narrator if no branch).
+ * Clear or set contextSummary + apiConversationId on the active branch (or narrator if no branch).
  * Pass `summary = null` to clear, or a string to set.
  */
 async function clearContextSummary(narratorId: string, summary: string | null) {
@@ -135,12 +135,12 @@ async function clearContextSummary(narratorId: string, summary: string | null) {
 	if (narrator?.activeBranchId) {
 		await db
 			.update(conversationBranches)
-			.set({ contextSummary: summary, claudeSessionId: null, updatedAt: now })
+			.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
 			.where(eq(conversationBranches.id, narrator.activeBranchId));
 	}
 	await db
 		.update(narrators)
-		.set({ contextSummary: summary, claudeSessionId: null, updatedAt: now })
+		.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
 		.where(eq(narrators.id, narratorId));
 }
 
@@ -951,7 +951,7 @@ export const narratorService = {
 		return msg;
 	},
 
-	async updateSessionId(narratorId: string, claudeSessionId: string) {
+	async updateConversationId(narratorId: string, apiConversationId: string) {
 		const now = new Date().toISOString();
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
@@ -960,12 +960,12 @@ export const narratorService = {
 		if (narrator?.activeBranchId) {
 			await db
 				.update(conversationBranches)
-				.set({ claudeSessionId, updatedAt: now })
+				.set({ apiConversationId, updatedAt: now })
 				.where(eq(conversationBranches.id, narrator.activeBranchId));
 		} else {
 			await db
 				.update(narrators)
-				.set({ claudeSessionId, updatedAt: now })
+				.set({ apiConversationId, updatedAt: now })
 				.where(eq(narrators.id, narratorId));
 		}
 	},
