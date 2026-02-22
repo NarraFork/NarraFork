@@ -9,7 +9,7 @@ export const MAX_LINES = 2000;
 export const MAX_BYTES = 50 * 1024; // 50 KB
 
 /** Directory for persisted full outputs when truncation occurs. */
-const OUTPUT_DIR = join(tmpdir(), "narrafork-tool-output");
+export const OUTPUT_DIR = join(tmpdir(), "narrafork-tool-output");
 
 /** How long to keep truncated output files. */
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days

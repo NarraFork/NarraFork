@@ -508,13 +508,45 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 		// xargs — 递归分析被执行的命令
 		xargs: (tokens) => {
 			// 跳过 xargs 自身的 flags
-			const xargsFlags = new Set(["-0", "--null", "-d", "--delimiter", "-n", "--max-args",
-				"-P", "--max-procs", "-I", "-i", "--replace", "-L", "--max-lines",
-				"-s", "--max-chars", "-t", "--verbose", "-p", "--interactive",
-				"-r", "--no-run-if-empty", "--show-limits"]);
-			const flagsWithValue = new Set(["-d", "--delimiter", "-n", "--max-args",
-				"-P", "--max-procs", "-I", "-i", "--replace", "-L", "--max-lines",
-				"-s", "--max-chars"]);
+			const xargsFlags = new Set([
+				"-0",
+				"--null",
+				"-d",
+				"--delimiter",
+				"-n",
+				"--max-args",
+				"-P",
+				"--max-procs",
+				"-I",
+				"-i",
+				"--replace",
+				"-L",
+				"--max-lines",
+				"-s",
+				"--max-chars",
+				"-t",
+				"--verbose",
+				"-p",
+				"--interactive",
+				"-r",
+				"--no-run-if-empty",
+				"--show-limits",
+			]);
+			const flagsWithValue = new Set([
+				"-d",
+				"--delimiter",
+				"-n",
+				"--max-args",
+				"-P",
+				"--max-procs",
+				"-I",
+				"-i",
+				"--replace",
+				"-L",
+				"--max-lines",
+				"-s",
+				"--max-chars",
+			]);
 			let i = 1;
 			while (i < tokens.length) {
 				const t = tokens[i];
@@ -531,8 +563,7 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			// xargs 默认执行 echo — 安全
 			if (!execCmd) return null;
 
-			if (ALWAYS_ASK_COMMANDS.has(execCmd))
-				return `xargs ${execCmd} (dangerous command)`;
+			if (ALWAYS_ASK_COMMANDS.has(execCmd)) return `xargs ${execCmd} (dangerous command)`;
 			if (execCmd in CONDITIONAL_COMMANDS) {
 				const subTokens = tokens.slice(i);
 				const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));

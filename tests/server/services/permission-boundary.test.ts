@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	extractToolPaths,
 	isInsideWorktree,
 	resolvePermissionDecision,
 } from "../../../server/services/narrator-session";
+
+const TRUNCATE_DIR = join(tmpdir(), "narrafork-tool-output");
 
 // ============================================================
 // isInsideWorktree
@@ -358,5 +362,64 @@ describe("resolvePermissionDecision", () => {
 				CWD,
 			),
 		).toBe("ask");
+	});
+
+	// --- Truncated output directory: read-only auto-allow ---
+
+	test("default mode: Read in truncate output dir → allow", () => {
+		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
+		expect(resolvePermissionDecision("Read", { file_path: filePath }, "default", CWD)).toBe(
+			"allow",
+		);
+	});
+
+	test("default mode: Grep in truncate output dir → allow", () => {
+		expect(
+			resolvePermissionDecision("Grep", { pattern: "error", path: TRUNCATE_DIR }, "default", CWD),
+		).toBe("allow");
+	});
+
+	test("default mode: Glob in truncate output dir → allow", () => {
+		expect(
+			resolvePermissionDecision("Glob", { pattern: "tool_*", path: TRUNCATE_DIR }, "default", CWD),
+		).toBe("allow");
+	});
+
+	test("acceptEdits mode: Read in truncate output dir → allow", () => {
+		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
+		expect(resolvePermissionDecision("Read", { file_path: filePath }, "acceptEdits", CWD)).toBe(
+			"allow",
+		);
+	});
+
+	test("default mode: Write to truncate output dir → ask (not read-only)", () => {
+		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
+		expect(
+			resolvePermissionDecision("Write", { file_path: filePath, content: "x" }, "default", CWD),
+		).toBe("ask");
+	});
+
+	test("default mode: Edit in truncate output dir → ask (not read-only)", () => {
+		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
+		expect(
+			resolvePermissionDecision(
+				"Edit",
+				{ file_path: filePath, old_string: "a", new_string: "b" },
+				"default",
+				CWD,
+			),
+		).toBe("ask");
+	});
+
+	test("dontAsk mode: Read in truncate output dir → deny (dontAsk overrides)", () => {
+		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
+		expect(resolvePermissionDecision("Read", { file_path: filePath }, "dontAsk", CWD)).toBe("deny");
+	});
+
+	test("bypassPermissions mode: Read in truncate output dir → allow", () => {
+		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
+		expect(
+			resolvePermissionDecision("Read", { file_path: filePath }, "bypassPermissions", CWD),
+		).toBe("allow");
 	});
 });

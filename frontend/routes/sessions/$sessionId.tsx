@@ -47,6 +47,13 @@ function SessionDetailPage() {
 		}
 	}, [sessionId, hasRunningTerminal, existingTerminals]);
 
+	// Close terminal panel on unmount (navigating away)
+	useEffect(() => {
+		return () => {
+			localStorage.removeItem(terminalStorageKey(sessionId));
+		};
+	}, [sessionId]);
+
 	// Terminal width for desktop (as ratio of container)
 	const [terminalRatio, setTerminalRatio] = useState(DEFAULT_TERMINAL_RATIO);
 	const containerRef = useRef<HTMLDivElement>(null);

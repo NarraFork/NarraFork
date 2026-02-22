@@ -201,7 +201,8 @@ describe("prompt injection: indirect execution", () => {
 
 	test("xargs rm", () => expectBlocked("echo /etc/passwd | xargs rm"));
 	test("xargs with safe command → allow", () => expectAllowed("find . -name '*.log' | xargs cat"));
-	test("xargs with dangerous command → block", () => expectBlocked("find . -name '*.log' | xargs rm"));
+	test("xargs with dangerous command → block", () =>
+		expectBlocked("find . -name '*.log' | xargs rm"));
 
 	test("find -exec rm", () => expectBlocked('find / -name "*.log" -exec rm {} \\;'));
 	test("find -execdir", () => expectBlocked('find / -name "*.sh" -execdir chmod +x {} \\;'));
