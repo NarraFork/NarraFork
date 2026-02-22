@@ -87,7 +87,13 @@ import {
 import { NarratorForkSelector } from "./NarratorForkSelector";
 
 import type { PendingPermission, ToolCallData } from "./ToolCallCard";
-import { LatestTodosToolUseIdCtx, STATUS_COLORS, StatusIcon, ToolCallCard } from "./ToolCallCard";
+import {
+	ElapsedTimer,
+	LatestTodosToolUseIdCtx,
+	STATUS_COLORS,
+	StatusIcon,
+	ToolCallCard,
+} from "./ToolCallCard";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {
@@ -291,7 +297,7 @@ const SubagentCard = memo(
 			while (el) {
 				const ov = getComputedStyle(el).overflowY;
 				if (ov === "scroll" || ov === "auto") {
-					setVpHeight(el.clientHeight * 0.8);
+					setVpHeight(el.clientHeight * 0.7);
 					return;
 				}
 				el = el.parentElement;
@@ -424,10 +430,14 @@ const SubagentCard = memo(
 							<Box c={statusColor}>
 								<StatusIcon status={toolCall.status} />
 							</Box>
-							{totalMs > 0 && (
-								<Text size="xs" c="dimmed">
-									{(totalMs / 1000).toFixed(1)}s
-								</Text>
+							{toolCall.startedAt != null && !isTerminal ? (
+								<ElapsedTimer startedAt={toolCall.startedAt} />
+							) : (
+								totalMs > 0 && (
+									<Text size="xs" c="dimmed">
+										{(totalMs / 1000).toFixed(1)}s
+									</Text>
+								)
 							)}
 							{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 						</Group>
@@ -835,6 +845,12 @@ function renderTreeMessages(
 	while (i < messages.length) {
 		const msg = messages[i];
 
+		// Skip deferred streaming chunks — they are rendered after the StreamingBubble
+		if (msg._noMerge && msg.id === STREAMING_CHUNKS_MSG_ID) {
+			i++;
+			continue;
+		}
+
 		if (hasToolUse(msg)) {
 			// Render leading text (non-tool blocks) of this message if it's not tool-only
 			if (!isToolOnlyMessage(msg)) {
@@ -877,10 +893,17 @@ function renderTreeMessages(
 				}
 			}
 
-			// Collect this message and subsequent tool-bearing messages into a run
+			// Collect this message and subsequent tool-bearing messages into a run.
+			// Respect _noMerge flag on synthetic streaming messages — when the model
+			// emitted text before these tool chunks, they should render separately.
 			const run: NarratorMsg[] = [msg];
 			let j = i + 1;
-			while (j < messages.length && hasToolUse(messages[j]) && isToolOnlyMessage(messages[j])) {
+			while (
+				j < messages.length &&
+				hasToolUse(messages[j]) &&
+				isToolOnlyMessage(messages[j]) &&
+				!messages[j]._noMerge
+			) {
 				run.push(messages[j]);
 				j++;
 			}
@@ -1155,6 +1178,27 @@ function StreamingBubble({
 			}}
 		/>
 	);
+}
+
+/** Sentinel ID for the synthetic streaming-tool-chunks message injected into the cache. */
+const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
+
+/** Remove the synthetic streaming-chunks message from the query cache. */
+function removeStreamingChunksMsg(
+	qc: ReturnType<typeof useQueryClient>,
+	messagesQueryKey: unknown[],
+) {
+	qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+		if (!old?.pages?.length) return old;
+		const firstPage = old.pages[0];
+		if (!firstPage.messages.some((m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID)) return old;
+		const pages = [...old.pages];
+		pages[0] = {
+			...firstPage,
+			messages: firstPage.messages.filter((m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID),
+		};
+		return { ...old, pages };
+	});
 }
 
 const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
@@ -1482,6 +1526,15 @@ export function NarratorPanel({
 		cachedFlatRef.current = result;
 		return result;
 	}, [hydrated, messagesData]);
+
+	// Extract the deferred streaming chunks message (when _noMerge is set, it should
+	// render after the StreamingBubble instead of inline with other messages).
+	const deferredStreamingChunks = useMemo(() => {
+		if (!messages.length) return null;
+		const last = messages[messages.length - 1];
+		if (last.id === STREAMING_CHUNKS_MSG_ID && last._noMerge) return last;
+		return null;
+	}, [messages]);
 
 	// Derive isCompacting from persisted messages on initial load / data refresh
 	useEffect(() => {
@@ -2181,6 +2234,11 @@ export function NarratorPanel({
 						setStreamingVersion((v) => v + 1);
 					}
 
+					// Remove synthetic streaming-chunks message when real assistant message arrives
+					if (wsData.message?.role === "assistant") {
+						removeStreamingChunksMsg(qc, messagesQueryKey);
+					}
+
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
 
@@ -2287,18 +2345,88 @@ export function NarratorPanel({
 					);
 				});
 			},
-			onToolStarted: (toolUseId: string) => {
+			onToolStarted: (toolUseId: string, _toolName: string, streamStartedAt?: number) => {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					let anyChanged = false;
 					const pages = old.pages.map((page: MessagesPage) => {
 						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							startedAt: Date.now(),
+							status: "running",
+							startedAt: streamStartedAt ?? Date.now(),
 						});
 						if (changed) anyChanged = true;
 						return changed ? { ...page, messages } : page;
 					});
 					return anyChanged ? { ...old, pages } : old;
+				});
+			},
+			onToolUseChunk: (toolUseId: string, toolName: string, inputCharsTotal: number) => {
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					const pages = old?.pages?.length ? [...old.pages] : [];
+					const firstPage =
+						pages.length > 0 ? { ...pages[0] } : { messages: [], hasMore: false, nextCursor: null };
+
+					// Find or create the synthetic streaming message
+					const existingIdx = firstPage.messages.findIndex(
+						(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
+					);
+					const existing = existingIdx !== -1 ? firstPage.messages[existingIdx] : null;
+
+					// Build updated content blocks and tool calls
+					const prevBlocks: ContentBlock[] = existing
+						? [...(existing.contentJson as ContentBlock[])]
+						: [];
+					const prevToolCalls = existing ? [...(existing.toolCalls as ToolCallRow[])] : [];
+
+					const blockIdx = prevBlocks.findIndex(
+						(b: ContentBlock) => b.type === "tool_use" && b.id === toolUseId,
+					);
+					if (blockIdx === -1) {
+						// New tool — append block + tool call record
+						prevBlocks.push({ type: "tool_use", id: toolUseId, name: toolName, input: {} });
+						prevToolCalls.push({
+							toolUseId,
+							toolName,
+							inputJson: {},
+							status: "initializing",
+							createdAt: new Date().toISOString(),
+						} as ToolCallRow);
+					}
+					// Update inputCharsTotal on the tool call for display
+					const tcIdx = prevToolCalls.findIndex((tc: ToolCallRow) => tc.toolUseId === toolUseId);
+					if (tcIdx !== -1) {
+						prevToolCalls[tcIdx] = {
+							...prevToolCalls[tcIdx],
+							inputJson: { _streamingChars: inputCharsTotal },
+						};
+					}
+
+					// If there's streaming text content before these tool chunks,
+					// mark the message so the grouping logic won't merge it
+					// with the preceding tool run.
+					const hasLeadingText = !!streamingRef.current;
+
+					const syntheticMsg: NarratorMsg = {
+						id: STREAMING_CHUNKS_MSG_ID,
+						narratorId,
+						parentToolUseId: null,
+						role: "assistant",
+						contentJson: prevBlocks,
+						contentText: null,
+						toolCalls: prevToolCalls,
+						createdAt: existing?.createdAt ?? new Date().toISOString(),
+						children: [],
+						_noMerge: hasLeadingText,
+					};
+
+					if (existingIdx !== -1) {
+						firstPage.messages = [...firstPage.messages];
+						firstPage.messages[existingIdx] = syntheticMsg;
+					} else {
+						firstPage.messages = [...firstPage.messages, syntheticMsg];
+					}
+					pages[0] = firstPage;
+					return { ...old, pages } as MessagesQueryData;
 				});
 			},
 			onPermissionRequest: (request) => {
@@ -2361,6 +2489,9 @@ export function NarratorPanel({
 				if (status === "idle" && streamingRef.current) {
 					streamingRef.current = "";
 					setStreamingVersion((v) => v + 1);
+				}
+				if (status === "idle") {
+					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				// Optimistically update narrator cache so status-dependent UI
 				// (yellow spinner, fallback polling) reacts immediately.
@@ -2814,6 +2945,8 @@ export function NarratorPanel({
 								streamingRef={streamingRef}
 								version={streamingVersion}
 							/>
+							{deferredStreamingChunks &&
+								renderToolRun([deferredStreamingChunks], narratorId, renderPermCb)}
 						</Stack>
 					</LatestTodosToolUseIdCtx.Provider>
 				</ScrollArea>
@@ -3021,7 +3154,7 @@ export function NarratorPanel({
 					</Group>
 				)}
 				{/* Model & Permission selectors */}
-				<Group gap="xs" wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
+				<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
 					{/* Context usage indicator (all breakpoints) */}
 					{(() => {
 						const m = allModels.find(

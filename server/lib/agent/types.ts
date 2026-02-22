@@ -58,7 +58,13 @@ export type AgentEvent =
 			messageId?: string;
 	  }
 	| { type: "stream_text"; text: string }
-	| { type: "tool_call"; toolUseId: string; toolName: string; input: Record<string, unknown> }
+	| {
+			type: "tool_call";
+			toolUseId: string;
+			toolName: string;
+			input: Record<string, unknown>;
+			streamStartedAt?: number;
+	  }
 	| {
 			type: "tool_result";
 			toolUseId: string;
@@ -69,6 +75,17 @@ export type AgentEvent =
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
+	| {
+			type: "tool_use_chunk";
+			toolUseId: string;
+			toolName: string;
+			inputCharsTotal: number;
+	  }
+	| {
+			/** A single content block has been fully streamed and is ready for persistence / execution. */
+			type: "block_complete";
+			block: ContentBlock;
+	  }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
 	| { type: "stream_reasoning"; text: string }
@@ -81,7 +98,20 @@ export interface AgentToolUse {
 	toolUseId: string;
 	name: string;
 	input: Record<string, unknown>;
+	/** Timestamp (ms) when the first streaming chunk for this tool use arrived */
+	streamStartedAt?: number;
 }
+
+/** A fully-streamed content block within an assistant message. */
+export type ContentBlock =
+	| { type: "text"; text: string }
+	| {
+			type: "tool_use";
+			toolUseId: string;
+			name: string;
+			input: Record<string, unknown>;
+			streamStartedAt?: number;
+	  };
 
 // === Plan mode constants ===
 
@@ -96,6 +126,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"ExitPlanMode",
 	"Bash",
 	"Task",
+	"AskUserQuestion",
 ]);
 
 // === Agent config ===

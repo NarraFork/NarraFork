@@ -4,7 +4,14 @@ import { readFile } from "node:fs/promises";
 import { join, normalize, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { chapters, narratorMessages, narrators, narratorToolCalls, projects } from "../db/schema";
+import {
+	chapters,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	projects,
+} from "../db/schema";
 import {
 	type AgentEvent,
 	agentLoop,
@@ -13,6 +20,7 @@ import {
 	PLAN_MODE_ALLOWED_TOOLS,
 } from "../lib/agent";
 import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
+import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -63,6 +71,8 @@ interface ActiveSession {
 	_chapterId?: string;
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
 	_worktreePath?: string;
+	/** ID of the partial assistant message being incrementally built via block_complete events */
+	_partialMessageId?: string;
 }
 
 const activeSessions = new Map<string, ActiveSession>();
@@ -112,11 +122,24 @@ export type SessionEvent =
 // === Permission handling ===
 
 const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const EXIT_PLAN_MODE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes — plans need longer review
 
 export function isInsideWorktree(cwd: string, filePath: string): boolean {
 	const resolved = normalize(resolve(cwd, filePath));
 	const base = normalize(cwd).replace(/\/+$/, "");
 	return resolved === base || resolved.startsWith(`${base}/`);
+}
+
+/** Check if a path points inside the truncated-output temp directory. */
+function isInsideTruncateDir(cwd: string, filePath: string): boolean {
+	const resolved = normalize(resolve(cwd, filePath));
+	const base = normalize(TRUNCATE_OUTPUT_DIR).replace(/\/+$/, "");
+	return resolved === base || resolved.startsWith(`${base}/`);
+}
+
+/** Check if ALL paths target only the truncated-output directory (read-only safe zone). */
+function allPathsInTruncateDir(cwd: string, paths: string[]): boolean {
+	return paths.length > 0 && paths.every((p) => isInsideTruncateDir(cwd, p));
 }
 
 export function extractToolPaths(toolName: string, input: Record<string, unknown>): string[] {
@@ -158,12 +181,15 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Grep",
 ];
 
+/** Read-only tools that are safe to auto-allow for the truncated-output directory. */
+const READ_ONLY_TOOLS = ["Read", "Grep", "Glob"];
+
 /**
  * Pure decision logic for permission handling.
  * Returns "allow", "deny", or "ask" (needs user confirmation).
  */
 /** Tools that always require user approval regardless of permission mode. */
-const ALWAYS_ASK_TOOLS = ["ExitPlanMode"];
+const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
 
 // TODO: refactor resolvePermissionDecision params into an options object when adding more flags
 export function resolvePermissionDecision(
@@ -196,7 +222,9 @@ export function resolvePermissionDecision(
 		if (bashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (bashAnalysis.dangerousPatterns.length > 0) return "ask";
 		if (bashAnalysis.hasEnvInjection) return "ask";
-		const hasExternalBashPath = bashAnalysis.filePaths.some((p) => !isInsideWorktree(cwd, p));
+		const hasExternalBashPath = bashAnalysis.filePaths.some(
+			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+		);
 		if (hasExternalBashPath) return "ask";
 		// All commands whitelisted + all paths inside worktree + no dangerous patterns
 		if (permMode === "default" || permMode === "acceptEdits") return "allow";
@@ -209,6 +237,16 @@ export function resolvePermissionDecision(
 	if (!hasExternalPath) {
 		if (permMode === "default") return "allow";
 		if (permMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName)) return "allow";
+	}
+
+	// Read-only access to the truncated-output temp directory is always safe —
+	// the agent needs to retrieve full output after truncation without user approval.
+	if (
+		hasExternalPath &&
+		READ_ONLY_TOOLS.includes(toolName) &&
+		allPathsInTruncateDir(cwd, toolPaths)
+	) {
+		return "allow";
 	}
 
 	return "ask";
@@ -419,13 +457,16 @@ export async function handlePermission(
 			pendingPermissions.delete(toolCallId);
 		};
 
+		const timeoutMs =
+			toolName === "ExitPlanMode" ? EXIT_PLAN_MODE_TIMEOUT_MS : PERMISSION_TIMEOUT_MS;
+
 		const tid = setTimeout(async () => {
 			logger.warn("Permission request timed out", {
 				narratorId,
 				toolCallId,
 				toolUseId,
 				toolName,
-				timeoutMs: PERMISSION_TIMEOUT_MS,
+				timeoutMs,
 			});
 			cleanup();
 			broadcastToNarrator(wsTarget, {
@@ -448,7 +489,7 @@ export async function handlePermission(
 				await narratorService.updateStatus(broadcastTargetId, "thinking");
 			}
 			resolve({ behavior: "deny", message: "Permission request timed out" });
-		}, PERMISSION_TIMEOUT_MS);
+		}, timeoutMs);
 
 		const onAbort = async () => {
 			logger.debug("Permission request aborted", {
@@ -644,7 +685,7 @@ async function buildSystemPrompt(
 	{
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\``;
+		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (Bash, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in Bash commands — it is redundant.`;
 	}
 
 	// Inject AGENT.md (fallback to CLAUDE.md) if present in the working directory
@@ -1196,23 +1237,6 @@ async function processAgentEvent(
 
 	switch (event.type) {
 		case "stream_text": {
-			// the entire assistant turn is just the placeholder dot.
-					return null;
-				}
-				// Subsequent chunk arrived — flush the buffered dot first
-					const flushDelta = { type: "text_delta" as const, text: buffered };
-					broadcastToNarrator(narratorId, {
-						type: "stream_event",
-						narratorId,
-						event: { type: "content_block_delta", delta: flushDelta },
-					});
-					session.events.emit("event", {
-						type: "stream_event",
-						data: { type: "content_block_delta", delta: flushDelta },
-					});
-				}
-			}
-
 			broadcastToNarrator(narratorId, {
 				type: "stream_event",
 				narratorId,
@@ -1238,27 +1262,93 @@ async function processAgentEvent(
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				input: event.input,
+				streamStartedAt: event.streamStartedAt,
 			});
 			return null;
 		}
 
-		case "assistant_message": {
-			// Build message for persistAssistantMessage
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const content: any[] = [];
-			// The model sometimes echoes it back — filter it out to avoid polluting the DB.
-			for (const tu of event.toolUses) {
-				content.push({ type: "tool_use", id: tu.toolUseId, name: tu.name, input: tu.input });
+		case "tool_use_chunk": {
+			broadcastToNarrator(narratorId, {
+				type: "tool_use_chunk",
+				narratorId,
+				toolUseId: event.toolUseId,
+				toolName: event.toolName,
+				inputCharsTotal: event.inputCharsTotal,
+			});
+			return null;
+		}
+
+		case "block_complete": {
+			const { block } = event;
+
+			// Ensure a partial message exists for incremental persistence
+			if (!session._partialMessageId) {
+				const partial = await narratorService.createPartialAssistantMessage(narratorId, {
+					uuid: randomUUID(),
+					session_id: session.conversationId,
+					contextPercent: session._lastContextUsagePct,
+					meterUsage: session._lastMeterUsage,
+					meterUnit: session._lastMeterUnit,
+				});
+				session._partialMessageId = partial.id;
 			}
 
-			const saved = await narratorService.persistAssistantMessage(narratorId, {
-				uuid: event.messageId ?? randomUUID(),
-				session_id: session.conversationId,
-				message: { content },
-				contextPercent: session._lastContextUsagePct,
-				meterUsage: session._lastMeterUsage,
-				meterUnit: session._lastMeterUnit,
-			});
+			// Persist the completed block
+			if (block.type === "text") {
+				await narratorService.appendBlockToMessage(session._partialMessageId, narratorId, {
+					type: "text",
+					text: block.text,
+				});
+			} else if (block.type === "tool_use") {
+				await narratorService.appendBlockToMessage(session._partialMessageId, narratorId, {
+					type: "tool_use",
+					id: block.toolUseId,
+					name: block.name,
+					input: block.input,
+				});
+			}
+			return null;
+		}
+
+		case "assistant_message": {
+			let savedId: string;
+
+			if (session._partialMessageId) {
+				// Partial message was already created incrementally via block_complete —
+				// just update the final messageUuid if the provider gave us one.
+				savedId = session._partialMessageId;
+				if (event.messageId) {
+					await db
+						.update(narratorMessages)
+						.set({ messageUuid: event.messageId })
+						.where(eq(narratorMessages.id, savedId));
+				}
+				session._partialMessageId = undefined;
+			} else {
+				// No partial message — fallback to original full persistence
+				// (non-streaming providers or no block_complete events fired)
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				const content: any[] = [];
+				if (event.text) content.push({ type: "text", text: event.text });
+				for (const tu of event.toolUses) {
+					content.push({
+						type: "tool_use",
+						id: tu.toolUseId,
+						name: tu.name,
+						input: tu.input,
+					});
+				}
+
+				const saved = await narratorService.persistAssistantMessage(narratorId, {
+					uuid: event.messageId ?? randomUUID(),
+					session_id: session.conversationId,
+					message: { content },
+					contextPercent: session._lastContextUsagePct,
+					meterUsage: session._lastMeterUsage,
+					meterUnit: session._lastMeterUnit,
+				});
+				savedId = saved.id;
+			}
 
 			// TodoWrite / EnterPlanMode tracking
 			for (const tu of event.toolUses) {
@@ -1284,7 +1374,7 @@ async function processAgentEvent(
 			}
 
 			const fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, saved.id),
+				where: eq(narratorMessages.id, savedId),
 				with: { toolCalls: true },
 			});
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: fullMessage });
@@ -1300,7 +1390,8 @@ async function processAgentEvent(
 				session._usedCompactSummary = false;
 			}
 
-			session.events.emit("event", { type: "assistant_message", data: saved });
+			const savedMsg = fullMessage ?? { id: savedId };
+			session.events.emit("event", { type: "assistant_message", data: savedMsg });
 
 			// Title tracking
 			let titleUpdate: boolean | undefined;
@@ -1415,6 +1506,23 @@ async function processAgentEvent(
 		}
 
 		case "error": {
+			// Clean up partial message — remove incomplete message from DB
+			// so it doesn't leave orphaned tool_use blocks without results.
+			const partialId = session._partialMessageId;
+			session._partialMessageId = undefined;
+			if (partialId) {
+				try {
+					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));
+					await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId));
+					await db.delete(narratorMessages).where(eq(narratorMessages.id, partialId));
+				} catch (cleanupErr) {
+					logger.warn("Failed to clean up partial message on error", {
+						narratorId,
+						partialId,
+						error: String(cleanupErr),
+					});
+				}
+			}
 			// Abort is not a real error — treat as interruption
 			if (event.message === "Aborted") {
 				// Plan compact abort — don't treat as user interruption; runAgentLoop

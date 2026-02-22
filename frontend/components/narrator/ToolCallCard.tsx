@@ -121,7 +121,7 @@ const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 
-type ToolCategory =
+export type ToolCategory =
 	| "file"
 	| "bash"
 	| "search"
@@ -136,7 +136,7 @@ export function isEditTool(name: string): boolean {
 	return EDIT_TOOLS.has(name);
 }
 
-function getCategory(name: string): ToolCategory {
+export function getCategory(name: string): ToolCategory {
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (SEARCH_TOOLS.has(name)) return "search";
@@ -148,7 +148,7 @@ function getCategory(name: string): ToolCategory {
 	return "generic";
 }
 
-function getCategoryIcon(cat: ToolCategory) {
+export function getCategoryIcon(cat: ToolCategory) {
 	switch (cat) {
 		case "file":
 			return IconFile;
@@ -171,7 +171,7 @@ function getCategoryIcon(cat: ToolCategory) {
 	}
 }
 
-function getCategoryColor(cat: ToolCategory) {
+export function getCategoryColor(cat: ToolCategory) {
 	switch (cat) {
 		case "file":
 			return "violet";
@@ -208,6 +208,11 @@ function basename(p: string): string {
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getSummary(toolName: string, input: any): string {
+	// Synthetic streaming tool call — show character count
+	if (input?._streamingChars != null) {
+		const chars = input._streamingChars as number;
+		return chars > 0 ? `${chars} chars` : "";
+	}
 	const cat = getCategory(toolName);
 	switch (cat) {
 		case "file": {
@@ -271,7 +276,7 @@ function formatElapsed(s: number): string {
 	return `${m}m${sec.toString().padStart(2, "0")}s`;
 }
 
-function ElapsedTimer({ startedAt }: { startedAt: number }) {
+export function ElapsedTimer({ startedAt }: { startedAt: number }) {
 	const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startedAt) / 1000));
 	const rafRef = useRef(0);
 
@@ -319,7 +324,7 @@ function ToolHeader({
 }: {
 	toolCall: ToolCallData;
 	opened: boolean;
-	onToggle: () => void;
+	onToggle?: () => void;
 }) {
 	const cat = getCategory(toolCall.toolName);
 	const Icon = getCategoryIcon(cat);
@@ -330,37 +335,45 @@ function ToolHeader({
 	);
 	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
+	const content = (
+		<Group gap={6} wrap="nowrap">
+			<ThemeIcon size={18} variant="light" color={color} radius="sm">
+				<Icon size={12} />
+			</ThemeIcon>
+			<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0 }}>
+				{toolCall.toolName}
+			</Text>
+			<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
+				{summary}
+			</Text>
+			<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+				<Box c={statusColor}>
+					<StatusIcon status={toolCall.status} />
+				</Box>
+				{toolCall.startedAt != null &&
+				(toolCall.status === "running" ||
+					toolCall.status === "pending" ||
+					toolCall.status === "initializing") ? (
+					<ElapsedTimer startedAt={toolCall.startedAt} />
+				) : (
+					toolCall.durationMs != null && (
+						<Text size="xs" c="dimmed">
+							{(toolCall.durationMs / 1000).toFixed(1)}s
+						</Text>
+					)
+				)}
+				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+			</Group>
+		</Group>
+	);
+
+	if (!onToggle) {
+		return <Box style={{ cursor: "default" }}>{content}</Box>;
+	}
+
 	return (
 		<UnstyledButton onClick={onToggle} w="100%">
-			<Group gap={6} wrap="nowrap">
-				<ThemeIcon size={18} variant="light" color={color} radius="sm">
-					<Icon size={12} />
-				</ThemeIcon>
-				<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0 }}>
-					{toolCall.toolName}
-				</Text>
-				<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
-					{summary}
-				</Text>
-				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-					<Box c={statusColor}>
-						<StatusIcon status={toolCall.status} />
-					</Box>
-					{toolCall.startedAt != null &&
-					(toolCall.status === "running" ||
-						toolCall.status === "pending" ||
-						toolCall.status === "initializing") ? (
-						<ElapsedTimer startedAt={toolCall.startedAt} />
-					) : (
-						toolCall.durationMs != null && (
-							<Text size="xs" c="dimmed">
-								{(toolCall.durationMs / 1000).toFixed(1)}s
-							</Text>
-						)
-					)}
-					{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-				</Group>
-			</Group>
+			{content}
 		</UnstyledButton>
 	);
 }
@@ -810,7 +823,13 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	return (
 		<Box mt="xs">
-			<AskUserQuestionBanner requestId="" questions={questions} answers={answers} readOnly />
+			<AskUserQuestionBanner
+				requestId=""
+				narratorId=""
+				questions={questions}
+				answers={answers}
+				readOnly
+			/>
 		</Box>
 	);
 }
@@ -843,11 +862,13 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 
 function InlinePermission({
 	permission,
+	narratorId,
 	onDecision,
 	onQuestionSubmit,
 	onQuestionDeny,
 }: {
 	permission: PendingPermission;
+	narratorId?: string;
 	onDecision?: (
 		requestId: string,
 		decision: "allow" | "deny",
@@ -867,6 +888,7 @@ function InlinePermission({
 			<Box mt="xs">
 				<AskUserQuestionBanner
 					requestId={permission.id}
+					narratorId={narratorId ?? ""}
 					questions={permission.inputJson.questions}
 					onSubmit={(reqId, answers) => onQuestionSubmit?.(reqId, answers)}
 					onDeny={(reqId) => onQuestionDeny?.(reqId)}
@@ -988,17 +1010,20 @@ export const ToolCallCard = memo(function ToolCallCard({
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName);
 	const isEdit = isEditTool(toolCall.toolName);
+	// Streaming tool chunks (still being generated) — not expandable
+	const isStreaming = toolCall.inputJson?._streamingChars != null;
 	// Auto-expand: permission pending, todo tools, or edit tools.
 	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
 	const isFailed = toolCall.status === "fail";
 	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
 	const defaultOpen =
-		!!pendingPermission ||
-		toolCall.status === "pending" ||
-		cat === "todo" ||
-		cat === "plan" ||
-		(isEdit && !isFailedEdit) ||
-		(isFailed && !isEdit);
+		!isStreaming &&
+		(!!pendingPermission ||
+			toolCall.status === "pending" ||
+			cat === "todo" ||
+			cat === "plan" ||
+			(isEdit && !isFailedEdit) ||
+			(isFailed && !isEdit));
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Auto-expand when a permission request arrives or tool call enters pending state
@@ -1027,22 +1052,27 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const permissionUI = pendingPermission ? (
 		<InlinePermission
 			permission={pendingPermission}
+			narratorId={narratorId}
 			onDecision={onPermissionDecision}
 			onQuestionSubmit={onQuestionSubmit}
 			onQuestionDeny={onQuestionDeny}
 		/>
 	) : null;
 
+	const handleToggle = isStreaming ? undefined : () => setOpened((o) => !o);
+
 	// Inside a run: no Paper wrapper, just content + divider
 	if (inRun) {
 		return (
 			<Box>
 				<Box p="xs">
-					<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
-					<LazyCollapse in={opened}>
-						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-						{permissionUI}
-					</LazyCollapse>
+					<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
+					{!isStreaming && (
+						<LazyCollapse in={opened}>
+							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+							{permissionUI}
+						</LazyCollapse>
+					)}
 				</Box>
 				{!isLast && <Divider />}
 			</Box>
@@ -1051,11 +1081,13 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	return (
 		<Paper withBorder radius="sm" p="xs" style={borderColor ? { borderColor } : undefined}>
-			<ToolHeader toolCall={toolCall} opened={opened} onToggle={() => setOpened((o) => !o)} />
-			<LazyCollapse in={opened}>
-				<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-				{permissionUI}
-			</LazyCollapse>
+			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
+			{!isStreaming && (
+				<LazyCollapse in={opened}>
+					<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+					{permissionUI}
+				</LazyCollapse>
+			)}
 		</Paper>
 	);
 });

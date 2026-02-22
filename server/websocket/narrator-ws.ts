@@ -54,6 +54,14 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			toolName: string;
 			input: unknown;
+			streamStartedAt?: number;
+	  }
+	| {
+			type: "tool_use_chunk";
+			narratorId: string;
+			toolUseId: string;
+			toolName: string;
+			inputCharsTotal: number;
 	  }
 	| {
 			type: "subagent_started";

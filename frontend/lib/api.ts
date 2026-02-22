@@ -72,6 +72,8 @@ export interface TreeMessage {
 	subagentModel?: string | null;
 	createdAt: string;
 	children: TreeMessage[];
+	/** Synthetic flag: when true, tool run grouping should not merge this message with the preceding run. */
+	_noMerge?: boolean;
 }
 
 export interface PaginatedNarrators {
@@ -218,6 +220,19 @@ export const api = {
 		}),
 	generateNarratorTitle: (id: string) =>
 		request<{ title: string }>(`/narrators/${id}/generate-title`, { method: "POST" }),
+	suggestAnswers: (
+		narratorId: string,
+		questions: {
+			question: string;
+			header: string;
+			options: { label: string; description: string }[];
+			multiSelect?: boolean;
+		}[],
+	) =>
+		request<{ answers: Record<string, string> }>(`/narrators/${narratorId}/suggest-answers`, {
+			method: "POST",
+			body: JSON.stringify({ questions }),
+		}),
 	updateNarratorModel: (id: string, model: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/model`, {
 			method: "PATCH",

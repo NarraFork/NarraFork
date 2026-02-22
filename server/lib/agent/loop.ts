@@ -3,7 +3,7 @@ import { settings } from "../settings";
 import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
-import type { AgentConfig, AgentEvent, AgentToolUse, ToolContext } from "./types";
+import type { AgentConfig, AgentEvent, AgentToolUse, ContentBlock, ToolContext } from "./types";
 import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
@@ -76,8 +76,13 @@ export async function* agentLoop(
 		let assistantText = "";
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
+		// Map of tool executions started during streaming (toolUseId → Promise)
+		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 		// Accumulator for streaming tool use events (input arrives in chunks)
-		const toolUseAccum = new Map<string, { name: string; inputChunks: string[] }>();
+		const toolUseAccum = new Map<
+			string,
+			{ name: string; inputChunks: string[]; totalChars: number; startedAt: number }
+		>();
 
 		try {
 			const stream = provider.chat({
@@ -104,12 +109,31 @@ export async function* agentLoop(
 					const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
 					if (id) {
 						if (!toolUseAccum.has(id) && name) {
-							toolUseAccum.set(id, { name, inputChunks: [] });
+							toolUseAccum.set(id, {
+								name,
+								inputChunks: [],
+								totalChars: 0,
+								startedAt: Date.now(),
+							});
+							// Yield immediately so the frontend knows the tool name early
+							yield {
+								type: "tool_use_chunk",
+								toolUseId: id,
+								toolName: name,
+								inputCharsTotal: 0,
+							};
 						}
 						const acc = toolUseAccum.get(id);
 						if (acc) {
 							if (typeof input === "string") {
 								acc.inputChunks.push(input);
+								acc.totalChars += input.length;
+								yield {
+									type: "tool_use_chunk",
+									toolUseId: id,
+									toolName: acc.name,
+									inputCharsTotal: acc.totalChars,
+								};
 							}
 							if (stop) {
 								const raw = acc.inputChunks.join("");
@@ -121,8 +145,49 @@ export async function* agentLoop(
 										parsedInput = { _raw: raw };
 									}
 								}
-								toolUses.push({ toolUseId: id, name: acc.name, input: parsedInput });
+								const tu: AgentToolUse = {
+									toolUseId: id,
+									name: acc.name,
+									input: parsedInput,
+									streamStartedAt: acc.startedAt,
+								};
+								toolUses.push(tu);
 								toolUseAccum.delete(id);
+
+								// Block is complete — yield for immediate persistence
+								yield {
+									type: "block_complete",
+									block: {
+										type: "tool_use",
+										toolUseId: id,
+										name: tu.name,
+										input: parsedInput,
+										streamStartedAt: acc.startedAt,
+									} satisfies ContentBlock,
+								};
+
+								// Start tool execution eagerly (don't await — collect later).
+								// Wrap with .catch() so a rejected permissionHandler doesn't
+								// create an unhandled rejection; the error surfaces as isError.
+								earlyExecMap.set(
+									id,
+									executeTool(tu, config).catch(
+										(err): ToolExecResult => ({
+											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+											isError: true,
+											durationMs: 0,
+										}),
+									),
+								);
+
+								// Notify frontend the tool has started
+								yield {
+									type: "tool_call",
+									toolUseId: id,
+									toolName: tu.name,
+									input: parsedInput,
+									streamStartedAt: acc.startedAt,
+								};
 							}
 						}
 					}
@@ -152,6 +217,10 @@ export async function* agentLoop(
 				}
 			}
 		} catch (err) {
+			// Even on error, yield block_complete for accumulated text so it can be persisted
+			if (assistantText) {
+				yield { type: "block_complete", block: { type: "text", text: assistantText } };
+			}
 			if (config.signal.aborted) {
 				yield { type: "error", message: "Aborted" };
 				return;
@@ -159,6 +228,11 @@ export async function* agentLoop(
 			const msg = err instanceof Error ? err.message : String(err);
 			yield { type: "error", message: msg };
 			return;
+		}
+
+		// Yield block_complete for the text portion (if any) now that streaming is done
+		if (assistantText) {
+			yield { type: "block_complete", block: { type: "text", text: assistantText } };
 		}
 
 		// Yield the complete assistant message
@@ -210,6 +284,9 @@ export async function* agentLoop(
 		}
 
 		let toolIndex = 0;
+		// Tracks cumulative execution time of preceding serial tools in this turn,
+		// used to subtract wait time when computing display duration for fast tools.
+		let prevToolsExecMs = 0;
 		for (const group of groups) {
 			if (config.signal.aborted) {
 				yield { type: "error", message: "Aborted" };
@@ -219,9 +296,20 @@ export async function* agentLoop(
 			if (group.length === 1) {
 				// Serial execution (single tool)
 				const tu = group[0];
-				yield { type: "tool_call", toolUseId: tu.toolUseId, toolName: tu.name, input: tu.input };
+				const earlyPromise = earlyExecMap.get(tu.toolUseId);
 
-				const result = await executeTool(tu, config);
+				// Only yield tool_call if not already yielded during streaming
+				if (!earlyPromise) {
+					yield {
+						type: "tool_call",
+						toolUseId: tu.toolUseId,
+						toolName: tu.name,
+						input: tu.input,
+						streamStartedAt: tu.streamStartedAt,
+					};
+				}
+
+				const result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
 				const isLastTool = toolIndex === toolUses.length - 1;
 				const outputForModel =
 					isLastTool && shouldNudge ? result.output + nudgeText : result.output;
@@ -229,13 +317,22 @@ export async function* agentLoop(
 				pendingToolResults.push(
 					provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
 				);
+				// For tools with streamStartedAt, compute display duration as
+				// total elapsed minus time spent executing preceding tools.
+				let durationMs = result.durationMs;
+				if (tu.streamStartedAt != null) {
+					const totalElapsed = Date.now() - tu.streamStartedAt;
+					const adjusted = totalElapsed - prevToolsExecMs;
+					durationMs = Math.max(adjusted, result.durationMs);
+				}
+				prevToolsExecMs += result.durationMs;
 				yield {
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
 					output: result.output,
 					isError: result.isError ?? false,
-					durationMs: result.durationMs,
+					durationMs,
 				};
 				toolIndex++;
 
@@ -246,11 +343,22 @@ export async function* agentLoop(
 			} else {
 				// Parallel execution (multiple Task calls)
 				for (const tu of group) {
-					yield { type: "tool_call", toolUseId: tu.toolUseId, toolName: tu.name, input: tu.input };
+					if (!earlyExecMap.has(tu.toolUseId)) {
+						yield {
+							type: "tool_call",
+							toolUseId: tu.toolUseId,
+							toolName: tu.name,
+							input: tu.input,
+							streamStartedAt: tu.streamStartedAt,
+						};
+					}
 				}
 
-				const results = await Promise.all(group.map((tu) => executeTool(tu, config)));
+				const results = await Promise.all(
+					group.map((tu) => earlyExecMap.get(tu.toolUseId) ?? executeTool(tu, config)),
+				);
 				let hasFatal = false;
+				let maxParallelMs = 0;
 
 				for (let j = 0; j < group.length; j++) {
 					const tu = group[j];
@@ -271,9 +379,11 @@ export async function* agentLoop(
 						durationMs: result.durationMs,
 					};
 					toolIndex++;
+					if (result.durationMs > maxParallelMs) maxParallelMs = result.durationMs;
 
 					if (result.fatal) hasFatal = true;
 				}
+				prevToolsExecMs += maxParallelMs;
 
 				if (hasFatal) {
 					const fatalMsg = results.find((r) => r.fatal)?.output ?? "Fatal tool error";

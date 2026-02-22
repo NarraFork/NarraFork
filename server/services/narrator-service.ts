@@ -1128,6 +1128,92 @@ export const narratorService = {
 		return msg;
 	},
 
+	/**
+	 * Create a partial assistant message with no content blocks yet.
+	 * Blocks will be appended incrementally via appendBlockToMessage().
+	 */
+	async createPartialAssistantMessage(
+		narratorId: string,
+		sdkMessage: {
+			uuid: string;
+			session_id: string;
+			parent_tool_use_id?: string | null;
+			contextPercent?: number;
+			meterUsage?: number;
+			meterUnit?: string;
+		},
+	) {
+		const id = generateId();
+		const now = new Date().toISOString();
+
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				messageUuid: sdkMessage.uuid,
+				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
+				role: "assistant",
+				contentJson: [],
+				contentText: null,
+				tokensIn: null,
+				contextPercent: sdkMessage.contextPercent ?? null,
+				meterUsage: sdkMessage.meterUsage ?? null,
+				meterUnit: sdkMessage.meterUnit ?? null,
+				createdAt: now,
+			})
+			.returning();
+
+		await appendMessageRef(narratorId, id);
+		return msg;
+	},
+
+	/**
+	 * Append a completed content block to an existing assistant message
+	 * and optionally create a tool_call record for tool_use blocks.
+	 */
+	async appendBlockToMessage(
+		messageId: string,
+		narratorId: string,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		block: any,
+	) {
+		const existing = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { contentJson: true },
+		});
+		if (!existing) return;
+
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const content = [...((existing.contentJson as any[]) ?? []), block];
+		const contentText = content
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			.filter((b: any) => b.type === "text")
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			.map((b: any) => b.text)
+			.join("\n");
+
+		await db
+			.update(narratorMessages)
+			.set({ contentJson: content, contentText: contentText || null })
+			.where(eq(narratorMessages.id, messageId));
+
+		// Create tool_call record for tool_use blocks
+		if (block.type === "tool_use") {
+			const now = new Date().toISOString();
+			await db.insert(narratorToolCalls).values({
+				id: generateId(),
+				narratorId,
+				messageId,
+				toolUseId: block.id,
+				toolName: block.name,
+				inputJson: block.input,
+				status: "initializing",
+				createdAt: now,
+			});
+		}
+	},
+
 	async updateConversationId(narratorId: string, apiConversationId: string) {
 		const now = new Date().toISOString();
 		await db

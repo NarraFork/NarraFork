@@ -14,7 +14,8 @@ interface NarratorWSCallbacks {
 	onPermissionResolved?: (requestId: string, toolUseId?: string) => void;
 	onStatusChange?: (status: string) => void;
 	onToolProgress?: (toolUseId: string, elapsed: number) => void;
-	onToolStarted?: (toolUseId: string, toolName: string) => void;
+	onToolStarted?: (toolUseId: string, toolName: string, streamStartedAt?: number) => void;
+	onToolUseChunk?: (toolUseId: string, toolName: string, inputCharsTotal: number) => void;
 	onToolCompleted?: (
 		toolUseId: string,
 		status: string,
@@ -133,7 +134,18 @@ export function useNarratorWS(
 							callbacksRef.current.onToolProgress?.(data.toolUseId, data.elapsed);
 							break;
 						case "tool_started":
-							callbacksRef.current.onToolStarted?.(data.toolUseId, data.toolName);
+							callbacksRef.current.onToolStarted?.(
+								data.toolUseId,
+								data.toolName,
+								data.streamStartedAt,
+							);
+							break;
+						case "tool_use_chunk":
+							callbacksRef.current.onToolUseChunk?.(
+								data.toolUseId,
+								data.toolName,
+								data.inputCharsTotal,
+							);
 							break;
 						case "tool_completed":
 							callbacksRef.current.onToolCompleted?.(
