@@ -168,7 +168,7 @@ describe("narrator messages and refs", () => {
 			.values({
 				id: "msg-a1",
 				narratorId: "n1",
-				sdkMessageUuid: "uuid-123",
+				messageUuid: "uuid-123",
 				role: "assistant",
 				contentJson: JSON.stringify([
 					{ type: "text", text: "Let me check" },

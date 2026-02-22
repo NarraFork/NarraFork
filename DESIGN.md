@@ -238,7 +238,7 @@ export const narratorMessages = sqliteTable('narrator_messages', {
   narratorId: text('narrator_id').notNull()
     .references(() => narrators.id),
   // SDK 消息 UUID，用于 resumeSessionAt 回溯分叉
-  sdkMessageUuid: text('sdk_message_uuid'),
+  messageUuid: text('sdk_message_uuid'),
   role: text('role', {
     enum: ['user', 'assistant', 'system']
   }).notNull(),

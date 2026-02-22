@@ -9,7 +9,7 @@ export interface DbMessage {
 	contentJson: unknown;
 	contentText: string | null;
 	parentToolUseId: string | null;
-	sdkMessageUuid: string | null;
+	messageUuid: string | null;
 	toolCalls?: DbToolCall[];
 }
 

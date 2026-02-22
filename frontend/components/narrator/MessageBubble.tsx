@@ -33,9 +33,9 @@ interface MessageBubbleProps {
 		contentText?: string | null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls?: any[];
-		sdkMessageUuid?: string | null;
+		messageUuid?: string | null;
 	};
-	onForkFromMessage?: (sdkMessageUuid: string) => void;
+	onForkFromMessage?: (messageUuid: string) => void;
 	onBranchFromMessage?: (messageId: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -387,7 +387,7 @@ export const MessageBubble = memo(function MessageBubble({
 	const ctxActions = useMemo<MessageContextMenuActions>(() => {
 		const actions: MessageContextMenuActions = {};
 		const msgId = message.id;
-		const msgUuid = message.sdkMessageUuid;
+		const msgUuid = message.messageUuid;
 		if (msgId && onBranchFromMessage && !isUser) {
 			actions.onBranchFromMessage = () => onBranchFromMessage(msgId);
 		}
@@ -401,7 +401,7 @@ export const MessageBubble = memo(function MessageBubble({
 	}, [
 		isUser,
 		message.id,
-		message.sdkMessageUuid,
+		message.messageUuid,
 		onBranchFromMessage,
 		onForkFromMessage,
 		onDeleteMessage,

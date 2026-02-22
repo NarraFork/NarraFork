@@ -56,7 +56,7 @@ export interface TreeMessage {
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;
-	sdkMessageUuid?: string | null;
+	messageUuid?: string | null;
 	role: string;
 	contentJson: ContentBlock[];
 	contentText: string | null;

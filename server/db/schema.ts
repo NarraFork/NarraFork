@@ -108,7 +108,7 @@ export const narratorMessages = sqliteTable(
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id),
-		sdkMessageUuid: text("sdk_message_uuid"),
+		messageUuid: text("sdk_message_uuid"),
 		parentToolUseId: text("parent_tool_use_id"),
 		role: text("role", { enum: ["user", "assistant", "system"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),

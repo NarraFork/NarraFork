@@ -65,8 +65,8 @@ function ChapterDetailPage() {
 	});
 
 	const handleForkFromMessage = useCallback(
-		(sdkMessageUuid: string) => {
-			setForkAtMessageUuid(sdkMessageUuid);
+		(messageUuid: string) => {
+			setForkAtMessageUuid(messageUuid);
 			openFork();
 		},
 		[openFork],
