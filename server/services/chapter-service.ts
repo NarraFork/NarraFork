@@ -1,11 +1,12 @@
 import { resolve } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, containerInstances, narrators, portAllocations, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 import { chapterCleanup } from "./chapter-cleanup";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
@@ -18,6 +19,22 @@ function slugify(text: string): string {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/(^-|-$)/g, "")
 		.slice(0, 30);
+}
+
+interface ChapterSettings {
+	autoCreateNarrator?: boolean;
+	autoForkNarrators?: boolean;
+}
+
+const DEFAULT_CHAPTER_SETTINGS: ChapterSettings = {
+	autoCreateNarrator: true,
+	autoForkNarrators: true,
+};
+
+/** Resolve chapter settings from project, merging with defaults. */
+export function resolveChapterSettings(projectSettings: unknown): Required<ChapterSettings> {
+	const raw = (projectSettings ?? {}) as ChapterSettings;
+	return { ...DEFAULT_CHAPTER_SETTINGS, ...raw } as Required<ChapterSettings>;
 }
 
 interface CreateChapterInput {
@@ -77,6 +94,23 @@ export const chapterService = {
 					updatedAt: now,
 				})
 				.returning();
+
+			// Auto-create primary narrator if project setting enabled
+			const chSettings = resolveChapterSettings(project.chapterSettings);
+			if (chSettings.autoCreateNarrator) {
+				try {
+					await narratorService.create({
+						chapterId: id,
+						type: "primary",
+						model: settings.agent.defaultModel,
+					});
+				} catch (err) {
+					logger.warn("Failed to auto-create primary narrator", {
+						chapterId: id,
+						error: String(err),
+					});
+				}
+			}
 
 			logger.info("Chapter created", { id, branch: branchName, worktreePath });
 			eventBus.emit({ type: "chapter:created", chapterId: id, projectId: input.projectId });
@@ -151,12 +185,43 @@ export const chapterService = {
 	async remove(id: string) {
 		const chapter = await this.findById(id);
 
-		// Delete all narrators (and their messages, tool calls, permissions) first
+		// Unbind narrators instead of deleting them — preserve conversation history.
+		// Subagents and archived narrators are deleted; others are detached.
 		const chapterNarrators = await db.query.narrators.findMany({
 			where: eq(narrators.chapterId, id),
 		});
-		for (const narrator of chapterNarrators) {
+
+		const toDelete = chapterNarrators.filter(
+			(n) => n.type === "subagent" || n.status === "archived",
+		);
+		const toDetach = chapterNarrators.filter(
+			(n) => n.type !== "subagent" && n.status !== "archived",
+		);
+
+		for (const narrator of toDelete) {
 			await narratorService.remove(narrator.id);
+		}
+
+		if (toDetach.length > 0) {
+			const now = new Date().toISOString();
+			await db
+				.update(narrators)
+				.set({
+					chapterId: null,
+					// Preserve worktree path as cwd so the narrator retains a working directory
+					cwd: chapter.worktreePath ?? narrators.cwd,
+					updatedAt: now,
+				})
+				.where(
+					inArray(
+						narrators.id,
+						toDetach.map((n) => n.id),
+					),
+				);
+			logger.info("Detached narrators from chapter", {
+				chapterId: id,
+				detached: toDetach.map((n) => n.id),
+			});
 		}
 
 		// Kill running terminals and delete records

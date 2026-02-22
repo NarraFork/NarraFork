@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join, normalize, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { chapters, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import { chapters, narratorMessages, narrators, narratorToolCalls, projects } from "../db/schema";
 import {
 	type AgentEvent,
 	agentLoop,
@@ -585,8 +585,19 @@ async function createSession(
 			where: eq(chapters.id, narrator.chapterId),
 		});
 		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
-		if (!ch.worktreePath) throw new Error("Chapter has no worktree (dormant?)");
-		sessionCwd = ch.worktreePath;
+		if (ch.worktreePath) {
+			sessionCwd = ch.worktreePath;
+		} else {
+			// Chapter is dormant — fall back to project gitPath or narrator cwd
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, ch.projectId),
+			});
+			sessionCwd = narrator.cwd || project?.gitPath || process.env.HOME || "/tmp";
+			logger.info("Chapter dormant, using fallback CWD", {
+				chapterId: narrator.chapterId,
+				sessionCwd,
+			});
+		}
 	} else {
 		sessionCwd = narrator.cwd || process.env.HOME || "/tmp";
 	}

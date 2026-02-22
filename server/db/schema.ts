@@ -13,6 +13,7 @@ export const projects = sqliteTable("projects", {
 	defaultBranch: text("default_branch").default("main"),
 	startupScript: text("startup_script"),
 	copyFiles: text("copy_files"),
+	chapterSettings: text("chapter_settings", { mode: "json" }),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS projects (
 	default_branch TEXT DEFAULT 'main',
 	startup_script TEXT,
 	copy_files TEXT,
+	chapter_settings TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );

@@ -1,7 +1,4 @@
-import { db } from "../db";
-import { narrators } from "../db/schema";
 import { agentGenerate, agentGenerateWithMeta } from "../lib/agent";
-import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -12,67 +9,7 @@ const SUMMARY_MAX_MESSAGES = 50;
 /** Tool call statuses that indicate the call is still in-flight. */
 const IN_FLIGHT_STATUSES = new Set(["initializing", "pending", "running"]);
 
-interface ForkNarratorInput {
-	parentNarratorId: string;
-	newChapterId: string;
-	inheritMode: "full" | "compressed" | "fresh";
-	forkAtMessageUuid?: string;
-	type?: "primary" | "secondary";
-	locale?: Locale;
-}
-
 export const narratorContext = {
-	/**
-	 * Create a forked narrator with the specified inheritance mode.
-	 * For "full" mode, actual SDK fork is deferred to first message send.
-	 */
-	async forkNarrator(input: ForkNarratorInput) {
-		const parent = await narratorService.getById(input.parentNarratorId);
-		const now = new Date().toISOString();
-		const id = generateId();
-
-		let contextSummary: string | null = null;
-
-		if (input.inheritMode === "compressed") {
-			contextSummary = await this.generateContextSummary(
-				input.parentNarratorId,
-				input.locale ?? "en",
-			);
-		}
-
-		const [narrator] = await db
-			.insert(narrators)
-			.values({
-				id,
-				chapterId: input.newChapterId,
-				type: input.type ?? parent.type,
-				model: parent.model,
-				systemPrompt:
-					input.inheritMode === "compressed" && contextSummary
-						? buildCompressedSystemPrompt(parent.systemPrompt, contextSummary)
-						: parent.systemPrompt,
-				permissionMode: parent.permissionMode,
-				inheritMode: input.inheritMode,
-				parentNarratorId: input.parentNarratorId,
-				// For "full" mode, store parent session ID so we can fork on first message
-				apiConversationId: input.inheritMode === "full" ? parent.apiConversationId : null,
-				contextSummary,
-				status: "idle",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.returning();
-
-		logger.info("Narrator forked", {
-			id,
-			parentId: input.parentNarratorId,
-			inheritMode: input.inheritMode,
-			forkAtMessageUuid: input.forkAtMessageUuid,
-		});
-
-		return narrator;
-	},
-
 	/**
 	 * Generate a compressed context summary from parent narrator's recent messages.
 	 * Uses Haiku model for fast, low-cost summarization.
@@ -200,13 +137,4 @@ function summarizeJson(val: unknown, maxLen: number): string {
 	const str = typeof val === "string" ? val : JSON.stringify(val);
 	if (str.length <= maxLen) return str;
 	return `${str.slice(0, maxLen)}…[${str.length - maxLen} more chars]`;
-}
-
-function buildCompressedSystemPrompt(
-	originalPrompt: string | null,
-	contextSummary: string,
-): string {
-	const base = originalPrompt ?? "";
-	const separator = base ? "\n\n" : "";
-	return `${base}${separator}## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
 }

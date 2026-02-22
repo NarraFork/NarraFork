@@ -1225,23 +1225,24 @@ export const narratorService = {
 
 	// === Fork ===
 
-	async forkNarrator(parentNarratorId: string, forkMessageId: string, opts?: { title?: string }) {
+	async forkNarrator(
+		parentNarratorId: string,
+		forkMessageId: string | null,
+		opts?: {
+			title?: string;
+			newChapterId?: string;
+			inheritMode?: "full" | "compressed" | "fresh";
+			type?: "primary" | "secondary";
+			locale?: string;
+		},
+	) {
 		const parent = await this.getById(parentNarratorId);
 
 		if (parent.type === "subagent") {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 
-		// Verify forkMessage belongs to parent narrator (via refs)
-		const forkRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, parentNarratorId),
-				eq(narratorMessageRefs.messageId, forkMessageId),
-			),
-		});
-		if (!forkRef) throw new ValidationError("Fork message not found in parent narrator's refs");
-
-		const forkSeq = forkRef.seq;
+		const inheritMode = opts?.inheritMode ?? "fresh";
 		const now = new Date().toISOString();
 		const id = generateId();
 
@@ -1251,26 +1252,60 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "dontAsk";
 
-		// Fork type: always secondary when chapter-bound to avoid primary conflict
-		const forkType: "primary" | "secondary" = parent.chapterId
-			? "secondary"
-			: (parent.type as "primary" | "secondary");
+		// Determine fork type
+		const targetChapterId = opts?.newChapterId ?? parent.chapterId ?? null;
+		const forkType: "primary" | "secondary" =
+			opts?.type ?? (targetChapterId ? "secondary" : (parent.type as "primary" | "secondary"));
 
-		// Fetch prefix rows before transaction (read-only)
-		const prefixRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				isCompact: narratorMessageRefs.isCompact,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
+		// Handle context inheritance
+		let contextSummary: string | null = null;
+		let apiConversationId: string | null = null;
+		let systemPrompt = parent.systemPrompt;
+
+		if (inheritMode === "compressed") {
+			const { narratorContext } = await import("./narrator-context");
+			const locale = (opts?.locale ?? "en") as import("../lib/prompt-i18n").Locale;
+			contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale);
+			if (contextSummary && parent.systemPrompt) {
+				systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
+			}
+		} else if (inheritMode === "full") {
+			// Store parent session ID so we can fork on first message
+			apiConversationId = parent.apiConversationId ?? null;
+		}
+
+		// Copy message refs if forkMessageId is provided
+		let prefixRows: Array<{
+			messageId: string;
+			seq: number;
+			isCompact: number;
+		}> = [];
+
+		if (forkMessageId) {
+			// Verify forkMessage belongs to parent narrator (via refs)
+			const forkRef = await db.query.narratorMessageRefs.findFirst({
+				where: and(
 					eq(narratorMessageRefs.narratorId, parentNarratorId),
-					sql`${narratorMessageRefs.seq} <= ${forkSeq}`,
+					eq(narratorMessageRefs.messageId, forkMessageId),
 				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+			});
+			if (!forkRef) throw new ValidationError("Fork message not found in parent narrator's refs");
+
+			prefixRows = await db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+					isCompact: narratorMessageRefs.isCompact,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, parentNarratorId),
+						sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+					),
+				)
+				.orderBy(narratorMessageRefs.seq);
+		}
 
 		// Create narrator + copy refs atomically
 		const newNarrator = await db.transaction(async (tx) => {
@@ -1278,14 +1313,16 @@ export const narratorService = {
 				.insert(narrators)
 				.values({
 					id,
-					chapterId: parent.chapterId ?? null,
+					chapterId: targetChapterId,
 					type: forkType,
 					model: parent.model ?? "claude-sonnet",
-					systemPrompt: parent.systemPrompt,
+					systemPrompt,
 					permissionMode: resolvedPermMode,
 					parentNarratorId,
-					forkMessageId,
-					inheritMode: "fresh",
+					forkMessageId: forkMessageId ?? null,
+					inheritMode,
+					apiConversationId,
+					contextSummary,
 					status: "idle",
 					title: opts?.title ?? null,
 					cwd: parent.cwd ?? null,

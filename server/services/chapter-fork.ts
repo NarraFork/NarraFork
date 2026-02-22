@@ -7,9 +7,10 @@ import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
+import { resolveChapterSettings } from "./chapter-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
-import { narratorContext } from "./narrator-context";
+import { narratorService } from "./narrator-service";
 
 export function slugify(text: string): string {
 	return text
@@ -24,6 +25,8 @@ export interface ForkChapterInput {
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
+	/** Override project-level autoForkNarrators setting. */
+	forkNarrators?: boolean;
 	locale?: Locale;
 }
 
@@ -47,6 +50,8 @@ export const chapterFork = {
 		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 		const gitPath = project.gitPath;
 
+		const chSettings = resolveChapterSettings(project.chapterSettings);
+		const shouldForkNarrators = input.forkNarrators ?? chSettings.autoForkNarrators;
 		const inheritMode = input.inheritMode ?? "full";
 		const slug = slugify(input.title);
 		const shortId = generateShortId(6);
@@ -106,22 +111,30 @@ export const chapterFork = {
 				}
 			}
 
-			// Step 4: Fork narrators
-			const parentNarrators = await db.query.narrators.findMany({
-				where: eq(narrators.chapterId, parentChapterId),
-			});
-			for (const parentNarrator of parentNarrators) {
-				const forkedNarrator = await narratorContext.forkNarrator({
-					parentNarratorId: parentNarrator.id,
-					newChapterId: id,
-					inheritMode,
-					forkAtMessageUuid: input.forkAtMessageUuid,
-					type: parentNarrator.type as "primary" | "secondary",
-					locale: input.locale,
+			// Step 4: Fork narrators (unified path via narratorService.forkNarrator)
+			if (shouldForkNarrators) {
+				const parentNarrators = await db.query.narrators.findMany({
+					where: eq(narrators.chapterId, parentChapterId),
 				});
-				rollback.push(async () => {
-					await db.delete(narrators).where(eq(narrators.id, forkedNarrator.id));
-				});
+				// Only fork primary/secondary narrators, skip subagents
+				const forkable = parentNarrators.filter(
+					(n) => n.type === "primary" || n.type === "secondary",
+				);
+				for (const parentNarrator of forkable) {
+					const forked = await narratorService.forkNarrator(
+						parentNarrator.id,
+						input.forkAtMessageUuid ?? null,
+						{
+							newChapterId: id,
+							inheritMode,
+							type: parentNarrator.type as "primary" | "secondary",
+							locale: input.locale,
+						},
+					);
+					rollback.push(async () => {
+						await narratorService.remove(forked.id);
+					});
+				}
 			}
 
 			// Step 5: Start containers (if parent has containerConfig)
@@ -185,6 +198,7 @@ export const chapterFork = {
 				parentId: parentChapterId,
 				branch: branchName,
 				inheritMode,
+				forkNarrators: shouldForkNarrators,
 			});
 
 			eventBus.emit({ type: "chapter:forked", chapterId: id, parentId: parentChapterId });
