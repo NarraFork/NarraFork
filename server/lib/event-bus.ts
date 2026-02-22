@@ -82,7 +82,15 @@ export type NarraForkEvent =
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }
-	| { type: "container:error"; chapterId: string; error: string };
+	| { type: "container:error"; chapterId: string; error: string }
+	// Auto-commit
+	| {
+			type: "narrator:auto_commit";
+			narratorId: string;
+			chapterId: string;
+			commitSha: string;
+			message: string;
+	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

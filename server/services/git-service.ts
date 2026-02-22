@@ -6,6 +6,16 @@ interface ExecResult {
 	exitCode: number;
 }
 
+export interface GitStatusSummary {
+	hasChanges: boolean;
+	staged: number;
+	unstaged: number;
+	untracked: number;
+	files: Array<{ status: string; path: string }>;
+	headSha: string;
+	branch: string;
+}
+
 async function exec(args: string[], cwd: string): Promise<ExecResult> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr] = await Promise.all([
@@ -203,6 +213,82 @@ export const gitService = {
 		if (commitResult.exitCode !== 0) throw new Error(`git commit failed: ${commitResult.stderr}`);
 
 		return this.getHeadCommit(worktreePath);
+	},
+
+	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
+		const [statusResult, headResult, branchResult] = await Promise.all([
+			exec(["status", "--porcelain"], worktreePath),
+			exec(["rev-parse", "HEAD"], worktreePath),
+			exec(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
+		]);
+
+		const lines = statusResult.stdout.split("\n").filter(Boolean);
+		let staged = 0;
+		let unstaged = 0;
+		let untracked = 0;
+		const files: Array<{ status: string; path: string }> = [];
+
+		for (const line of lines) {
+			const x = line[0]; // index status
+			const y = line[1]; // worktree status
+			const path = line.slice(3);
+			files.push({ status: line.slice(0, 2).trim(), path });
+
+			if (y === "?") {
+				untracked++;
+			} else {
+				if (x !== " " && x !== "?") staged++;
+				if (y !== " " && y !== "?") unstaged++;
+			}
+		}
+
+		return {
+			hasChanges: lines.length > 0,
+			staged,
+			unstaged,
+			untracked,
+			files,
+			headSha: headResult.stdout,
+			branch: branchResult.stdout,
+		};
+	},
+
+	/** Get full diff of all uncommitted changes (staged + unstaged + untracked).
+	 *  Truncates at ~100KB to avoid blowing up AI token budgets. */
+	async getFullDiff(worktreePath: string, maxBytes = 100_000): Promise<string> {
+		// Diff of tracked files (staged + unstaged combined against HEAD)
+		const diffResult = await exec(["diff", "HEAD"], worktreePath);
+		const parts: string[] = [];
+		let totalLen = 0;
+
+		const addPart = (text: string): boolean => {
+			if (totalLen + text.length > maxBytes) {
+				const remaining = maxBytes - totalLen;
+				if (remaining > 0) parts.push(text.slice(0, remaining));
+				parts.push("\n\n[diff truncated — exceeded size limit]");
+				return false;
+			}
+			parts.push(text);
+			totalLen += text.length;
+			return true;
+		};
+
+		if (diffResult.stdout && !addPart(diffResult.stdout)) {
+			return parts.join("\n");
+		}
+
+		// List untracked files and show their content
+		const untrackedResult = await exec(
+			["ls-files", "--others", "--exclude-standard"],
+			worktreePath,
+		);
+		const untrackedFiles = untrackedResult.stdout.split("\n").filter(Boolean);
+		for (const file of untrackedFiles) {
+			const showResult = await exec(["diff", "--no-index", "/dev/null", file], worktreePath);
+			if (showResult.stdout && !addPart(showResult.stdout)) break;
+		}
+
+		return parts.join("\n");
 	},
 
 	async copyFiles(srcDir: string, destDir: string, files: string[]): Promise<void> {

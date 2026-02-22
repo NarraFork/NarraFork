@@ -297,6 +297,11 @@ const toolMessages = {
 		en: "The user approved your plan. You may now begin execution.",
 		"zh-CN": "用户批准了你的计划，可以开始执行。",
 	},
+	planCompactContinue: {
+		en: "The user approved your plan and the context has been reset. Your plan is now in the system prompt under Conversation Context. Please begin executing the plan.",
+		"zh-CN":
+			"用户批准了你的计划，上下文已重置。你的计划现在位于系统提示的 Conversation Context 部分。请开始执行计划。",
+	},
 	// Permission messages
 	permissionDeniedByUser: {
 		en: "The user rejected this tool call.",
