@@ -347,12 +347,39 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			return null;
 		},
 		bunx: (_tokens) => null,
-		// find -exec / -execdir 可以执行任意命令，-delete 会删除文件
+		// find -exec / -execdir — 提取被执行的命令进行递归分类
 		find: (tokens) => {
-			if (tokens.some((t) => t === "-exec" || t === "-execdir" || t === "-ok" || t === "-okdir"))
-				return "find with -exec";
 			if (tokens.some((t) => t === "-delete"))
 				return "find with -delete (removes files)";
+
+			const execFlags = ["-exec", "-execdir", "-ok", "-okdir"];
+			for (const flag of execFlags) {
+				const idx = tokens.indexOf(flag);
+				if (idx < 0) continue;
+
+				// -exec 后面到 \; 或 + 之间的 tokens 就是被执行的命令
+				const execCmd = tokens[idx + 1];
+				if (!execCmd) return `find with ${flag} (empty command)`;
+
+				// 递归分类：被执行的命令是否危险
+				if (ALWAYS_ASK_COMMANDS.has(execCmd))
+					return `find ${flag} ${execCmd} (dangerous command)`;
+
+				// 检查条件安全命令的危险参数
+				if (execCmd in CONDITIONAL_COMMANDS) {
+					// 提取 -exec 后面到终止符之间的完整 tokens
+					const endIdx = tokens.findIndex((t, i) => i > idx && (t === ";" || t === "+"));
+					const subTokens = tokens.slice(idx + 1, endIdx > 0 ? endIdx : undefined);
+					const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
+					if (danger) return `find ${flag} → ${danger}`;
+				}
+
+				// 被执行的命令在白名单中 — 安全
+				if (SAFE_COMMANDS.has(execCmd)) return null;
+
+				// 未知命令 — 保守拦截
+				return `find ${flag} ${execCmd} (unknown command)`;
+			}
 			return null;
 		},
 		// sed -i 可以修改文件
