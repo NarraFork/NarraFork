@@ -409,10 +409,14 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (tokens.includes("-c") || tokens.includes("-")) return "python3 with -c flag";
 			return null;
 		},
-		// npm/npx — postinstall 脚本可以执行任意代码，但这是正常开发流程
-		// 只拦截明确的 exec
+		// npm — run/exec 执行任意脚本/命令
 		npm: (tokens) => {
-			if (tokens.includes("exec")) return "npm exec";
+			if (tokens.includes("exec")) return "npm exec (executes arbitrary package)";
+			const sub = tokens[1];
+			if (sub === "run" || sub === "run-script") return `npm ${sub} (runs project script)`;
+			// npm test / npm start 等是 run 的别名
+			if (sub === "test" || sub === "start" || sub === "stop" || sub === "restart")
+				return `npm ${sub} (runs project script)`;
 			return null;
 		},
 		// pip install 可以执行 setup.py
@@ -442,10 +446,13 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (tokens.includes("run")) return "cargo run";
 			return null;
 		},
-		// bun run 可以执行任意代码（但 bun run dev 等是正常开发流程）
-		// bun -e 可以执行任意代码
+		// bun — run 执行项目脚本，-e 执行任意代码
 		bun: (tokens) => {
 			if (tokens.includes("-e") || tokens.includes("--eval")) return "bun with -e flag";
+			const sub = tokens[1];
+			if (sub === "run") return "bun run (runs project script)";
+			// bun test 等是内置命令但也执行项目配置
+			if (sub === "test") return "bun test (runs project script)";
 			return null;
 		},
 		// find -exec / -execdir — 提取被执行的命令进行递归分类
@@ -572,9 +579,23 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 		unzip: (_tokens) => null,
 		gzip: (_tokens) => null,
 		gunzip: (_tokens) => null,
-		// yarn/pnpm — 包管理器
-		yarn: (_tokens) => null,
-		pnpm: (_tokens) => null,
+		// yarn/pnpm — run 执行项目脚本
+		yarn: (tokens) => {
+			const sub = tokens[1];
+			if (sub === "run") return "yarn run (runs project script)";
+			if (sub === "test" || sub === "start" || sub === "stop")
+				return `yarn ${sub} (runs project script)`;
+			// yarn <script-name> 也是 run 的隐式别名，但无法区分子命令和脚本名
+			// 保守处理：只拦截明确的 run/test/start
+			return null;
+		},
+		pnpm: (tokens) => {
+			const sub = tokens[1];
+			if (sub === "run") return "pnpm run (runs project script)";
+			if (sub === "test" || sub === "start" || sub === "stop")
+				return `pnpm ${sub} (runs project script)`;
+			return null;
+		},
 		// npx/bunx — 包执行器，递归检查被执行的命令
 		npx: (tokens) => classifyPackageRunner(tokens, "npx"),
 		bunx: (tokens) => classifyPackageRunner(tokens, "bunx"),

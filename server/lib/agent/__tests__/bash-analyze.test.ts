@@ -187,7 +187,7 @@ describe("prompt injection: interpreter code execution", () => {
 	test("python script.py → allow", () => expectAllowed("python3 manage.py migrate"));
 	test("go build → allow", () => expectAllowed("go build ./..."));
 	test("cargo build → allow", () => expectAllowed("cargo build --release"));
-	test("bun run dev → allow", () => expectAllowed("bun run dev"));
+	test("bun run dev → ask (project script)", () => expectBlocked("bun run dev"));
 });
 
 // ══════════════════════════════════════════════════════════
@@ -268,7 +268,7 @@ describe("prompt injection: env var injection", () => {
 	// 安全的环境变量应该放行
 	test("HOME=... → allow", () => expectAllowed("HOME=/tmp ls"));
 	test("LANG=... → allow", () => expectAllowed("LANG=en_US.UTF-8 git status"));
-	test("CI=true → allow", () => expectAllowed("CI=true npm test"));
+	test("CI=true npm test → ask (project script)", () => expectBlocked("CI=true npm test"));
 });
 
 // ══════════════════════════════════════════════════════════
@@ -466,7 +466,8 @@ describe("prompt injection: combined attacks", () => {
 	test("git clone + cd + make (all safe)", () =>
 		expectAllowed("git clone https://github.com/user/repo.git && cd repo && make"));
 
-	test("npm install + npm test (all safe)", () => expectAllowed("npm install && npm test"));
+	test("npm install + npm test → ask (npm test is project script)", () =>
+		expectBlocked("npm install && npm test"));
 
 	test("mkdir + cp + ls (all safe)", () =>
 		expectAllowed("mkdir -p dist && cp src/*.js dist/ && ls dist/"));
@@ -475,7 +476,8 @@ describe("prompt injection: combined attacks", () => {
 
 	test("complex safe pipeline", () => expectAllowed("git log --oneline | head -20 | grep fix"));
 
-	test("node build + test (safe)", () => expectAllowed("npm run build && npm test"));
+	test("npm run build + npm test → ask (project scripts)", () =>
+		expectBlocked("npm run build && npm test"));
 });
 
 // ══════════════════════════════════════════════════════════
