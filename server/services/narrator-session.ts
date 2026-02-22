@@ -12,24 +12,30 @@ import {
 	type PermissionResult,
 	PLAN_MODE_ALLOWED_TOOLS,
 } from "../lib/agent";
+import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import type { Locale } from "../lib/prompt-i18n";
 import {
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
 	getToolMessage,
+	type Locale,
 } from "../lib/prompt-i18n";
 import { resolveProvider, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { gitService } from "./git-service";
+import { autoCommitIfNeeded } from "./narrator-auto-commit";
 import { narratorContext } from "./narrator-context";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 
 // === In-memory state ===
+
+// Tools that may modify files on disk — git status is tracked after these complete
+const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "Bash", "smartRelocate"]);
 
 
 interface ActiveSession {
@@ -51,6 +57,12 @@ interface ActiveSession {
 	_lastMeterUnit?: string;
 	/** Whether to append language instruction to system prompt */
 	_replyInUserLanguage?: boolean;
+	/** Set when plan compact aborts the current agent loop — the loop should restart with fresh context */
+	_planCompactAborted?: boolean;
+	/** Cached chapter ID (set when narrator is bound to an active chapter) */
+	_chapterId?: string;
+	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
+	_worktreePath?: string;
 }
 
 const activeSessions = new Map<string, ActiveSession>();
@@ -118,6 +130,14 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Glob":
 		case "Grep":
 			return typeof input.path === "string" ? [input.path] : [];
+		case "Bash": {
+			const paths: string[] = [];
+			if (typeof input.workdir === "string") paths.push(input.workdir);
+			if (Array.isArray(input._filePaths)) {
+				paths.push(...input._filePaths.filter((p): p is string => typeof p === "string"));
+			}
+			return paths;
+		}
 		default:
 			return [];
 	}
@@ -151,7 +171,11 @@ export function resolvePermissionDecision(
 	permMode: string,
 	cwd: string,
 	planMode = false,
-): "allow" | "deny" | "ask" {
+	bashAnalysis?: BashAnalysis,
+): "allow" | "deny" | "ask" | "fatal" {
+	// Catastrophic commands are ALWAYS blocked — no override possible
+	if (toolName === "Bash" && bashAnalysis?.isCatastrophic) return "fatal";
+
 	// Plan mode: deny mutating tools (except Bash which keeps its normal permission flow)
 	if (planMode && !PLAN_MODE_ALLOWED_TOOLS.has(toolName)) return "deny";
 	// Plan mode: Task is allowed but only for explore/plan subagents (general has write access)
@@ -161,11 +185,24 @@ export function resolvePermissionDecision(
 	if (permMode === "bypassPermissions") return "allow";
 	if (permMode === "dontAsk") return "deny";
 
+	// Bash: AST-based command-level security
+	if (toolName === "Bash") {
+		if (!bashAnalysis) return "ask";
+		if (bashAnalysis.nonWhitelisted.length > 0) return "ask";
+		if (bashAnalysis.dangerousPatterns.length > 0) return "ask";
+		if (bashAnalysis.hasEnvInjection) return "ask";
+		const hasExternalBashPath = bashAnalysis.filePaths.some((p) => !isInsideWorktree(cwd, p));
+		if (hasExternalBashPath) return "ask";
+		// All commands whitelisted + all paths inside worktree + no dangerous patterns
+		if (permMode === "default" || permMode === "acceptEdits") return "allow";
+		return "ask";
+	}
+
 	const toolPaths = extractToolPaths(toolName, input);
 	const hasExternalPath = toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
 
 	if (!hasExternalPath) {
-		if (permMode === "default" && toolName !== "Bash") return "allow";
+		if (permMode === "default") return "allow";
 		if (permMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName)) return "allow";
 	}
 
@@ -191,7 +228,52 @@ export async function handlePermission(
 	const permMode = narrator?.permissionMode ?? "default";
 	const planMode = narrator?.planMode ?? false;
 
-	const decision = resolvePermissionDecision(toolName, input, permMode, cwd, planMode);
+	// Bash command pre-analysis via tree-sitter AST
+	let bashAnalysis: BashAnalysis | undefined;
+	if (toolName === "Bash" && typeof input.command === "string") {
+		try {
+			bashAnalysis = await analyzeBashCommand(input.command, cwd);
+		} catch (err) {
+			logger.warn("Bash command analysis failed, falling back to ask", { err });
+			// Analysis failure → conservative: ask user
+		}
+	}
+
+	const decision = resolvePermissionDecision(
+		toolName,
+		input,
+		permMode,
+		cwd,
+		planMode,
+		bashAnalysis,
+	);
+	if (decision === "fatal") {
+		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
+		const fatalMsg = `FATAL: ${reason}. Session terminated for safety.`;
+		logger.error("Catastrophic command blocked", {
+			narratorId,
+			toolName,
+			toolUseId,
+			reason,
+			command: typeof input.command === "string" ? input.command : undefined,
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: fatalMsg,
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+				permissionDecisionReason: reason,
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		return { behavior: "deny", message: fatalMsg, fatal: true };
+	}
 	if (decision === "allow") {
 		logger.debug("Permission auto-allowed", { narratorId, toolName, toolUseId, permMode });
 		await db
@@ -254,15 +336,34 @@ export async function handlePermission(
 		pendingCount: pendingPermissions.size,
 	});
 
+	// Build decisionReason from bash analysis
+	let decisionReason: string | undefined;
+	if (bashAnalysis && !bashAnalysis.allWhitelisted) {
+		const parts: string[] = [];
+		if (bashAnalysis.nonWhitelisted.length > 0) {
+			parts.push(`Commands requiring approval: ${bashAnalysis.nonWhitelisted.join(", ")}`);
+		}
+		if (bashAnalysis.dangerousPatterns.length > 0) {
+			parts.push(`Dangerous patterns: ${bashAnalysis.dangerousPatterns.join(", ")}`);
+		}
+		if (bashAnalysis.hasEnvInjection) {
+			parts.push("Environment variable injection detected");
+		}
+		decisionReason = parts.join("; ");
+	}
+
 	await db
 		.update(narratorToolCalls)
-		.set({ status: "pending" })
+		.set({
+			status: "pending",
+			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
+		})
 		.where(eq(narratorToolCalls.id, toolCallId));
 
 	broadcastToNarrator(wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
-		request: { id: toolCallId, toolName, toolUseId, inputJson: input },
+		request: { id: toolCallId, toolName, toolUseId, inputJson: input, decisionReason },
 	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
 	await narratorService.updateStatus(narratorId, "waiting");
@@ -578,8 +679,10 @@ async function createSession(
 	const effectiveConversationId = narrator.apiConversationId;
 	const effectiveContextSummary = narrator.contextSummary;
 
-	// Resolve CWD
+	// Resolve CWD and cache chapter info for git tracking
 	let sessionCwd: string;
+	let sessionChapterId: string | undefined;
+	let sessionWorktreePath: string | undefined;
 	if (narrator.chapterId) {
 		const ch = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
@@ -587,6 +690,8 @@ async function createSession(
 		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
 		if (ch.worktreePath) {
 			sessionCwd = ch.worktreePath;
+			sessionChapterId = ch.id;
+			sessionWorktreePath = ch.worktreePath;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
 			const project = await db.query.projects.findFirst({
@@ -629,6 +734,8 @@ async function createSession(
 		locale,
 		_usedCompactSummary: usedCompactSummary,
 		_replyInUserLanguage: replyInUserLanguage,
+		_chapterId: sessionChapterId,
+		_worktreePath: sessionWorktreePath,
 	};
 
 	activeSessions.set(narratorId, session);
@@ -720,6 +827,14 @@ async function runAgentLoop(
 						session.cwd,
 						locale,
 					),
+				// onEvent receives only side-channel events (tool_output, tool_progress)
+				// from executeTool — NOT yielded events like tool_result or assistant_message.
+				onEvent: (event) => {
+					processAgentEvent(session, event, {
+						titleTracked: true,
+						shouldUpdateTitle: false,
+					}).catch(() => {});
+				},
 			};
 
 			// Convert images to base64 for the agent loop (first iteration only)
@@ -774,9 +889,47 @@ async function runAgentLoop(
 				}
 			}
 
+			// Plan compact aborted the agent loop — reset abort controller and
+			// restart the while-loop so the next iteration builds fresh history
+			// from only post-compact messages.
+			if (session._planCompactAborted) {
+				session._planCompactAborted = false;
+				session.abortController = new AbortController();
+				await narratorService.updateStats(narratorId, 0);
+
+				// Always persist a user message to kick off plan execution and continue
+				const continuePrompt = getToolMessage("planCompactContinue", locale);
+
+				// Check for chained feedback — use it instead of the default prompt
+				const fb = pendingFeedback.get(narratorId);
+				const promptText = fb ? fb.feedbackText : continuePrompt;
+				if (fb) pendingFeedback.delete(narratorId);
+
+				const userMsg = await narratorService.persistUserMessage(narratorId, promptText, [
+					{ type: "text", text: promptText },
+				]);
+				broadcastToNarrator(narratorId, {
+					type: "user_message",
+					narratorId,
+					message: userMsg,
+				});
+				session.events.emit("event", { type: "user_message", data: userMsg });
+				await narratorService.updateStatus(narratorId, "thinking");
+				currentText = promptText;
+				currentImages = undefined;
+				continue;
+			}
+
 			// Agent loop done — update status
 			await narratorService.updateStats(narratorId, 0);
 			await narratorService.updateStatus(narratorId, "idle");
+
+			// Auto-commit if there are uncommitted changes (chapter-bound narrators only)
+			if (session._worktreePath && session._chapterId) {
+				autoCommitIfNeeded(narratorId, session._chapterId, session._worktreePath, locale).catch(
+					(err) => logger.error("Auto-commit failed", { narratorId, error: String(err) }),
+				);
+			}
 
 			// Compact if context usage is high (checked after a complete turn)
 			if (
@@ -788,6 +941,9 @@ async function runAgentLoop(
 					contextUsagePct: session._lastContextUsagePct,
 				});
 				await runCustomCompact(narratorId, locale);
+				// Reset conversationId so the next loop iteration starts a fresh
+				// API conversation instead of continuing the old one.
+				session.conversationId = randomUUID();
 				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 				// System prompt will be rebuilt at the top of the next loop iteration
 				// via buildSystemPrompt(), which reads fresh contextSummary from DB.
@@ -1066,7 +1222,7 @@ async function processAgentEvent(
 		}
 
 		case "assistant_message": {
-			// Build SDK-compatible message for persistAssistantMessage
+			// Build message for persistAssistantMessage
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const content: any[] = [];
 			// The model sometimes echoes it back — filter it out to avoid polluting the DB.
@@ -1163,6 +1319,30 @@ async function processAgentEvent(
 				durationMs: event.durationMs,
 			});
 
+			// Git tracking: async broadcast git status after file-mutating tools
+			if (session._worktreePath && session._chapterId && FILE_MUTATING_TOOLS.has(event.toolName)) {
+				const chapterId = session._chapterId;
+				const worktreePath = session._worktreePath;
+				const toolUseId = event.toolUseId;
+				gitService.getStatusSummary(worktreePath).then(
+					(gitStatus) => {
+						broadcastToNarrator(narratorId, {
+							type: "git_status",
+							narratorId,
+							chapterId,
+							toolUseId,
+							status: gitStatus,
+						});
+					},
+					(err) => {
+						logger.debug("Git status tracking failed", {
+							narratorId,
+							error: String(err),
+						});
+					},
+				);
+			}
+
 			// ExitPlanMode check
 			if (!event.isError && event.toolName === "ExitPlanMode") {
 				await narratorService.updatePlanMode(narratorId, false);
@@ -1178,16 +1358,50 @@ async function processAgentEvent(
 					const planText = event.output;
 					if (planText) {
 						await runPlanCompact(narratorId, planText);
+						// Reset conversationId so the next loop iteration starts a fresh
+						// API conversation instead of continuing the old one.
+						session.conversationId = randomUUID();
 						broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+						// Abort the current agent loop so it doesn't continue with stale
+						// context. runAgentLoop will detect _planCompactAborted and restart
+						// the loop with fresh history built from post-compact messages.
+						session._planCompactAborted = true;
+						session.abortController.abort();
 					}
 				}
 			}
 			return null;
 		}
 
+		case "tool_output": {
+			broadcastToNarrator(narratorId, {
+				type: "tool_output",
+				narratorId,
+				toolUseId: event.toolUseId,
+				output: event.output,
+			});
+			return null;
+		}
+
+		case "tool_progress": {
+			broadcastToNarrator(narratorId, {
+				type: "tool_progress",
+				narratorId,
+				toolUseId: event.toolUseId,
+				elapsed: event.elapsed,
+			});
+			return null;
+		}
+
 		case "error": {
 			// Abort is not a real error — treat as interruption
 			if (event.message === "Aborted") {
+				// Plan compact abort — don't treat as user interruption; runAgentLoop
+				// handles the restart logic after the for-await loop exits.
+				if (session._planCompactAborted) {
+					logger.info("Agent loop aborted for plan compact", { narratorId });
+					return null;
+				}
 				logger.info("Agent loop aborted (interrupted)", { narratorId });
 				await cleanupOrphanedToolCalls(narratorId, session.locale);
 				await narratorService.updateStatus(narratorId, "idle");
