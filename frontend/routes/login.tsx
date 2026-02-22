@@ -26,7 +26,7 @@ function LoginPage() {
 	const { data: authStatus, isLoading: statusLoading } = useAuthStatus();
 	const login = useLogin();
 	const register = useRegister();
-	const { t } = useTranslation("common");
+	const { t, i18n } = useTranslation("common");
 
 	const [username, setUsername] = useState("");
 	const [password, setPassword] = useState("");
@@ -62,7 +62,7 @@ function LoginPage() {
 	const handleRegister = async () => {
 		setError("");
 		try {
-			await register.mutateAsync({ username, password });
+			await register.mutateAsync({ username, password, language: i18n.language });
 			navigate({ to: "/" });
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {

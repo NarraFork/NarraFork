@@ -74,6 +74,8 @@ function SettingsPage() {
 	const [extendedContext, setExtendedContext] = useState(false);
 	const [maxTurns, setMaxTurns] = useState(200);
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
+	const [subagentExploreModel, setSubagentExploreModel] = useState("");
+	const [subagentPlanModel, setSubagentPlanModel] = useState("");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// OpenAI
 	const [openaiApiKey, setOpenaiApiKey] = useState("");
@@ -105,6 +107,8 @@ function SettingsPage() {
 		hiddenModels: [] as string[],
 		extendedContext: false,
 		maxTurns: 200,
+		subagentExploreModel: "",
+		subagentPlanModel: "",
 		maxWorktrees: 10,
 		maxContainers: 5,
 		sizeWarning: 500,
@@ -129,6 +133,8 @@ function SettingsPage() {
 				hiddenModels: settings.agent?.hiddenModels ?? [],
 				extendedContext: settings.agent?.extendedContext ?? false,
 				maxTurns: settings.agent?.maxTurns ?? 200,
+				subagentExploreModel: settings.agent?.subagentModels?.explore ?? "",
+				subagentPlanModel: settings.agent?.subagentModels?.plan ?? "",
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -150,6 +156,8 @@ function SettingsPage() {
 			setHiddenModels(snap.hiddenModels);
 			setExtendedContext(snap.extendedContext);
 			setMaxTurns(snap.maxTurns);
+			setSubagentExploreModel(snap.subagentExploreModel);
+			setSubagentPlanModel(snap.subagentPlanModel);
 			setMaxWorktrees(snap.maxWorktrees);
 			setMaxContainers(snap.maxContainers);
 			setSizeWarning(snap.sizeWarning);
@@ -177,6 +185,8 @@ function SettingsPage() {
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			extendedContext !== s.extendedContext ||
 			maxTurns !== s.maxTurns ||
+			subagentExploreModel !== s.subagentExploreModel ||
+			subagentPlanModel !== s.subagentPlanModel ||
 			maxWorktrees !== s.maxWorktrees ||
 			maxContainers !== s.maxContainers ||
 			sizeWarning !== s.sizeWarning ||
@@ -199,6 +209,8 @@ function SettingsPage() {
 		hiddenModels,
 		extendedContext,
 		maxTurns,
+		subagentExploreModel,
+		subagentPlanModel,
 		maxWorktrees,
 		maxContainers,
 		sizeWarning,
@@ -271,6 +283,10 @@ function SettingsPage() {
 					hiddenModels,
 					extendedContext,
 					maxTurns,
+					subagentModels: {
+						explore: subagentExploreModel,
+						plan: subagentPlanModel,
+					},
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -301,6 +317,8 @@ function SettingsPage() {
 						hiddenModels: [...hiddenModels],
 						extendedContext,
 						maxTurns,
+						subagentExploreModel,
+						subagentPlanModel,
 						maxWorktrees,
 						maxContainers,
 						sizeWarning,
@@ -412,6 +430,32 @@ function SettingsPage() {
 						min={1}
 						max={1000}
 					/>
+					<Stack gap="xs">
+						<Text size="sm" fw={500}>
+							{t("subagentModels")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("subagentModelsDesc")}
+						</Text>
+						<Select
+							label={t("subagentExploreModel")}
+							data={groupedModels}
+							searchable
+							clearable
+							placeholder={t("subagentModelInherit")}
+							value={subagentExploreModel || null}
+							onChange={(v) => setSubagentExploreModel(v ?? "")}
+						/>
+						<Select
+							label={t("subagentPlanModel")}
+							data={groupedModels}
+							searchable
+							clearable
+							placeholder={t("subagentModelInherit")}
+							value={subagentPlanModel || null}
+							onChange={(v) => setSubagentPlanModel(v ?? "")}
+						/>
+					</Stack>
 					<Stack gap="xs">
 						<Text size="sm" fw={500}>
 							{t("customModels")}

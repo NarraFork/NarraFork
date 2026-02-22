@@ -1,6 +1,14 @@
 const BASE = "/api";
 const TOKEN_KEY = "narrafork_token";
 
+export class ApiError extends Error {
+	status: number;
+	constructor(message: string, status: number) {
+		super(message);
+		this.status = status;
+	}
+}
+
 export function getToken(): string | null {
 	return localStorage.getItem(TOKEN_KEY);
 }
@@ -28,11 +36,11 @@ async function request<T>(
 	const response = await fetch(`${BASE}${path}`, { ...options, headers });
 	if (response.status === 401) {
 		clearToken();
-		throw new Error("Unauthorized");
+		throw new ApiError("Unauthorized", 401);
 	}
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ error: response.statusText }));
-		throw new Error(error.error ?? "Request failed");
+		throw new ApiError(error.error ?? "Request failed", response.status);
 	}
 	return response.json();
 }
@@ -61,6 +69,7 @@ export interface TreeMessage {
 		[key: string]: unknown;
 	} | null;
 	contextPercent?: number | null;
+	subagentModel?: string | null;
 	createdAt: string;
 	children: TreeMessage[];
 }
@@ -81,13 +90,13 @@ export interface PaginatedMessages {
 export const api = {
 	// Auth
 	authStatus: () => request<{ hasUsers: boolean; registrationOpen: boolean }>("/auth/status"),
-	register: (data: { username: string; password: string }) =>
-		request<{ user: ApiEntity; token: string }>("/auth/register", {
+	register: (data: { username: string; password: string; language?: string }) =>
+		request<{ user: ApiEntity; token: string; language: string }>("/auth/register", {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
 	login: (data: { username: string; password: string }) =>
-		request<{ user: ApiEntity; token: string }>("/auth/login", {
+		request<{ user: ApiEntity; token: string; language: string }>("/auth/login", {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
@@ -177,13 +186,7 @@ export const api = {
 		request<ApiEntity>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
 	markNarratorRead: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
-	getNarratorMessages: (
-		id: string,
-		limit?: number,
-		cursor?: string,
-		around?: string,
-		branchId?: string,
-	) => {
+	getNarratorMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
 		const params = new URLSearchParams();
 		if (around) {
 			params.set("around", around);
@@ -191,7 +194,6 @@ export const api = {
 			if (limit) params.set("limit", String(limit));
 			if (cursor) params.set("cursor", cursor);
 		}
-		if (branchId) params.set("branchId", branchId);
 		const qs = params.toString();
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
 	},
@@ -279,26 +281,14 @@ export const api = {
 			body: JSON.stringify({ summary }),
 		}),
 
-	// Conversation Branches
-	listBranches: (narratorId: string) => request<ApiEntity[]>(`/narrators/${narratorId}/branches`),
-	createBranch: (narratorId: string, forkMessageId: string, name?: string) =>
-		request<ApiEntity>(`/narrators/${narratorId}/branches`, {
+	// Narrator Fork
+	forkNarrator: (narratorId: string, forkMessageId: string, title?: string) =>
+		request<ApiEntity>(`/narrators/${narratorId}/fork`, {
 			method: "POST",
-			body: JSON.stringify({ forkMessageId, name }),
+			body: JSON.stringify({ forkMessageId, title }),
 		}),
-	updateBranch: (narratorId: string, branchId: string, data: { name?: string; status?: string }) =>
-		request<ApiEntity>(`/narrators/${narratorId}/branches/${branchId}`, {
-			method: "PATCH",
-			body: JSON.stringify(data),
-		}),
-	deleteBranch: (narratorId: string, branchId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/branches/${branchId}`, {
-			method: "DELETE",
-		}),
-	switchBranch: (narratorId: string, branchId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/branches/${branchId}/switch`, {
-			method: "POST",
-		}),
+	getRelatedNarrators: (narratorId: string) =>
+		request<ApiEntity[]>(`/narrators/${narratorId}/related`),
 
 	// Terminals
 	listTerminals: (chapterId: string) => {

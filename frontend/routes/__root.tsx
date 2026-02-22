@@ -26,9 +26,10 @@ import {
 } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useUserPreferences } from "../hooks/useUserPreferences";
-import { clearToken, getToken } from "../lib/api";
+import { type ApiError, clearToken, getToken } from "../lib/api";
 
 interface RouterContext {
 	queryClient: QueryClient;
@@ -54,7 +55,7 @@ function AuthenticatedLayout() {
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
 	const { t, i18n } = useTranslation("nav");
-	const { data: user, isLoading, isError, fetchStatus } = useCurrentUser();
+	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 
@@ -72,8 +73,9 @@ function AuthenticatedLayout() {
 		return <Navigate to="/login" />;
 	}
 
-	// Token exists but query failed (expired/invalid) → clear token and redirect
-	if (isError) {
+	// Token exists but auth failed (expired/invalid) → clear token and redirect
+	// Don't clear on transient server errors (502, network issues, etc.)
+	if (isError && (error as ApiError)?.status === 401) {
 		clearToken();
 		return <Navigate to="/login" />;
 	}
@@ -105,6 +107,7 @@ function AuthenticatedLayout() {
 			navbar={{ width: 250, breakpoint: "sm", collapsed: { mobile: !opened } }}
 			padding="md"
 		>
+			<WSConnectionAlert />
 			<AppShell.Header>
 				<Group h="100%" px="md" justify="space-between" wrap="nowrap">
 					<Group wrap="nowrap">

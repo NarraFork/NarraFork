@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 // === Types ===
 
@@ -26,8 +27,10 @@ type Listener = {
 
 // === Singleton WS Manager ===
 
-const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 30_000;
+/** After this many fast retries, we consider the connection "disconnected" (show UI). */
+const DISCONNECTED_THRESHOLD = 3;
 
 class TerminalWSManager {
 	private ws: WebSocket | null = null;
@@ -59,6 +62,7 @@ class TerminalWSManager {
 			this._disconnected = false;
 			this.reconnectAttempts = 0;
 			this.notifyStatus();
+			this.syncGlobalStatus();
 			// Re-subscribe all active terminals
 			const ids = [...this.listeners.keys()];
 			if (ids.length > 0) {
@@ -78,6 +82,7 @@ class TerminalWSManager {
 		ws.onclose = () => {
 			this._connected = false;
 			this.notifyStatus();
+			this.syncGlobalStatus();
 			this.scheduleReconnect();
 		};
 
@@ -89,14 +94,37 @@ class TerminalWSManager {
 
 	private scheduleReconnect() {
 		if (this.disposed) return;
-		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._disconnected = true;
 			this.notifyStatus();
-			return;
+			this.syncGlobalStatus();
 		}
-		const delay = RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts;
+		const delay = Math.min(
+			RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts,
+			RECONNECT_MAX_DELAY_MS,
+		);
 		this.reconnectAttempts++;
 		this.reconnectTimer = setTimeout(() => this.connect(), delay);
+	}
+
+	/** Reset retry counter and reconnect immediately. */
+	resetReconnect() {
+		clearTimeout(this.reconnectTimer);
+		this.reconnectAttempts = 0;
+		this._disconnected = false;
+		this.notifyStatus();
+		this.ws?.close();
+		this.ws = null;
+		this.connect();
+	}
+
+	private syncGlobalStatus() {
+		if (this.listeners.size === 0) return;
+		setWSStatus("terminal", {
+			label: "Terminal",
+			connected: this._connected,
+			reconnect: () => this.resetReconnect(),
+		});
 	}
 
 	private handleMessage(msg: Record<string, unknown>) {
@@ -193,6 +221,7 @@ class TerminalWSManager {
 		clearTimeout(this.reconnectTimer);
 		this.ws?.close();
 		this.ws = null;
+		removeWSStatus("terminal");
 	}
 }
 

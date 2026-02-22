@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, clearToken, getToken, setToken } from "../lib/api";
+import { type ApiError, api, clearToken, getToken, setToken } from "../lib/api";
+import i18n from "../lib/i18n";
 
 export function useAuthStatus() {
 	return useQuery({
@@ -15,7 +16,11 @@ export function useCurrentUser() {
 		queryKey: ["auth", "me"],
 		queryFn: api.me,
 		enabled: !!getToken(),
-		retry: false,
+		retry: (failureCount, error) => {
+			// Don't retry auth failures, but retry transient server errors
+			if ((error as ApiError)?.status === 401) return false;
+			return failureCount < 3;
+		},
 		staleTime: 30_000,
 	});
 }
@@ -28,6 +33,7 @@ export function useLogin() {
 			setToken(data.token);
 			// Seed the user cache immediately so AuthenticatedLayout won't flash
 			qc.setQueryData(["auth", "me"], data.user);
+			i18n.changeLanguage(data.language);
 		},
 	});
 }
@@ -39,6 +45,7 @@ export function useRegister() {
 		onSuccess: (data) => {
 			setToken(data.token);
 			qc.setQueryData(["auth", "me"], data.user);
+			i18n.changeLanguage(data.language);
 		},
 	});
 }

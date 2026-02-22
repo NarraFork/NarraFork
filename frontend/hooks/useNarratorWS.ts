@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 interface NarratorWSCallbacks {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -13,7 +14,12 @@ interface NarratorWSCallbacks {
 	onPermissionResolved?: (requestId: string, toolUseId?: string) => void;
 	onStatusChange?: (status: string) => void;
 	onToolProgress?: (toolUseId: string, elapsed: number) => void;
-	onToolCompleted?: (toolUseId: string, status: string, output?: unknown) => void;
+	onToolCompleted?: (
+		toolUseId: string,
+		status: string,
+		output?: unknown,
+		durationMs?: number,
+	) => void;
 	onTitleUpdated?: (title: string) => void;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	onTodosUpdated?: (todos: any[], toolUseId?: string) => void;
@@ -27,20 +33,38 @@ interface NarratorWSCallbacks {
 	onNarratorError?: (error: string) => void;
 }
 
-const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 30_000;
+const DISCONNECTED_THRESHOLD = 3;
 
-export function useNarratorWS(narratorId: string | undefined, callbacks: NarratorWSCallbacks) {
+export function useNarratorWS(
+	narratorId: string | undefined,
+	callbacks: NarratorWSCallbacks,
+	lastMessageId?: string,
+) {
 	const wsRef = useRef<WebSocket | null>(null);
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
+	const lastMessageIdRef = useRef(lastMessageId);
+	lastMessageIdRef.current = lastMessageId;
 	const [connected, setConnected] = useState(false);
 	const [disconnected, setDisconnected] = useState(false);
+	const disconnectedRef = useRef(false);
 	const [reconnectKey, setReconnectKey] = useState(0);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey triggers manual reconnection
 	useEffect(() => {
 		if (!narratorId) return;
+
+		const wsStatusId = `narrator:${narratorId}`;
+
+		function syncGlobalStatus(isConnected: boolean) {
+			setWSStatus(wsStatusId, {
+				label: `Narrator`,
+				connected: isConnected,
+				reconnect: () => setReconnectKey((k) => k + 1),
+			});
+		}
 
 		// Per-invocation flag: set to true when this effect is cleaned up.
 		// Each effect run gets its own `cancelled` captured by its closures,
@@ -65,8 +89,17 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 				}
 				setConnected(true);
 				setDisconnected(false);
+				disconnectedRef.current = false;
 				attempts = 0;
-				ws.send(JSON.stringify({ type: "subscribe", narratorIds: [narratorId] }));
+				syncGlobalStatus(true);
+				const subscribeMsg: Record<string, unknown> = {
+					type: "subscribe",
+					narratorIds: [narratorId],
+				};
+				if (lastMessageIdRef.current) {
+					subscribeMsg.lastMessageId = lastMessageIdRef.current;
+				}
+				ws.send(JSON.stringify(subscribeMsg));
 			};
 			ws.onmessage = (event) => {
 				if (cancelled) return;
@@ -99,7 +132,12 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 							callbacksRef.current.onToolProgress?.(data.toolUseId, data.elapsed);
 							break;
 						case "tool_completed":
-							callbacksRef.current.onToolCompleted?.(data.toolUseId, data.status, data.output);
+							callbacksRef.current.onToolCompleted?.(
+								data.toolUseId,
+								data.status,
+								data.output,
+								data.durationMs,
+							);
 							break;
 						case "todos_updated":
 							callbacksRef.current.onTodosUpdated?.(data.todos, data.toolUseId);
@@ -141,6 +179,7 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 			ws.onclose = () => {
 				if (cancelled) return;
 				setConnected(false);
+				syncGlobalStatus(false);
 				scheduleReconnect();
 			};
 			ws.onerror = () => {
@@ -151,11 +190,12 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 
 		function scheduleReconnect() {
 			if (cancelled) return;
-			if (attempts >= MAX_RECONNECT_ATTEMPTS) {
+			if (attempts >= DISCONNECTED_THRESHOLD && !disconnectedRef.current) {
+				disconnectedRef.current = true;
 				setDisconnected(true);
-				return;
+				syncGlobalStatus(false);
 			}
-			const delay = RECONNECT_BASE_DELAY_MS * 2 ** attempts;
+			const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempts, RECONNECT_MAX_DELAY_MS);
 			attempts++;
 			reconnectTimer = setTimeout(connect, delay);
 		}
@@ -164,7 +204,9 @@ export function useNarratorWS(narratorId: string | undefined, callbacks: Narrato
 
 		return () => {
 			cancelled = true;
+			disconnectedRef.current = false;
 			clearTimeout(reconnectTimer);
+			removeWSStatus(wsStatusId);
 			const ws = wsRef.current;
 			if (ws) {
 				// Suppress handlers before closing to avoid any late-firing events
@@ -304,8 +346,7 @@ export function useSessionsListWS(
 
 		function scheduleReconnect() {
 			if (cancelled) return;
-			if (attempts >= MAX_RECONNECT_ATTEMPTS) return;
-			const delay = RECONNECT_BASE_DELAY_MS * 2 ** attempts;
+			const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempts, RECONNECT_MAX_DELAY_MS);
 			attempts++;
 			reconnectTimer = setTimeout(connect, delay);
 		}
