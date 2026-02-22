@@ -1,26 +1,17 @@
 import { existsSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const MAX_LINE_LENGTH = 2000;
 const MAX_MATCHES = 100;
 
-/** Resolve the ripgrep binary path. Checks system paths, then vendored fallback. */
+/** Resolve the ripgrep binary path. Checks system paths, then falls back to PATH. */
 function findRg(): string {
 	const systemPaths = ["/usr/bin/rg", "/usr/local/bin/rg", "/home/linuxbrew/.linuxbrew/bin/rg"];
 	for (const p of systemPaths) {
 		if (existsSync(p)) return p;
 	}
-	// Vendored rg from @anthropic-ai/claude-agent-sdk
-	const arch = process.arch === "x64" ? "x64" : "arm64";
-	const platform = process.platform === "darwin" ? "darwin" : "linux";
-	try {
-		const sdkEntry = require.resolve("@anthropic-ai/claude-agent-sdk");
-		const vendored = join(dirname(sdkEntry), "vendor", "ripgrep", `${arch}-${platform}`, "rg");
-		if (existsSync(vendored)) return vendored;
-	} catch {}
-	// Last resort: hope it's in PATH
 	return "rg";
 }
 
