@@ -1,6 +1,8 @@
 import { Alert, Badge, Button, Checkbox, Group, Radio, Stack, Text, Textarea } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { api } from "../../lib/api";
 
 interface Question {
 	question: string;
@@ -11,6 +13,7 @@ interface Question {
 
 interface AskUserQuestionBannerProps {
 	requestId: string;
+	narratorId: string;
 	questions: Question[];
 	/** Pre-filled answers — used for read-only display of completed questions */
 	answers?: Record<string, string>;
@@ -22,6 +25,7 @@ interface AskUserQuestionBannerProps {
 
 export function AskUserQuestionBanner({
 	requestId,
+	narratorId,
 	questions,
 	answers: savedAnswers,
 	readOnly,
@@ -31,6 +35,7 @@ export function AskUserQuestionBanner({
 	const { t } = useTranslation("narrator");
 	const [selections, setSelections] = useState<Record<string, string>>({});
 	const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
+	const [suggesting, setSuggesting] = useState(false);
 
 	// Custom input takes priority when non-empty
 	const getAnswer = (question: string) => {
@@ -60,6 +65,43 @@ export function AskUserQuestionBanner({
 			answers[q.question] = getAnswer(q.question);
 		}
 		onSubmit?.(requestId, answers);
+	};
+
+	const handleSuggest = async () => {
+		setSuggesting(true);
+		try {
+			const { answers } = await api.suggestAnswers(narratorId, questions);
+			const newSelections: Record<string, string> = {};
+			const newCustom: Record<string, string> = {};
+			for (const q of questions) {
+				const suggested = answers[q.question];
+				if (!suggested) continue;
+				const optionLabels = q.options.map((o) => o.label);
+				if (q.multiSelect) {
+					// Match comma-separated labels against options
+					const parts = suggested.split(", ").filter((p) => optionLabels.includes(p));
+					if (parts.length) {
+						newSelections[q.question] = parts.join(", ");
+					} else {
+						newCustom[q.question] = suggested;
+					}
+				} else if (optionLabels.includes(suggested)) {
+					newSelections[q.question] = suggested;
+				} else {
+					newCustom[q.question] = suggested;
+				}
+			}
+			setSelections((prev) => ({ ...prev, ...newSelections }));
+			setCustomInputs((prev) => ({ ...prev, ...newCustom }));
+		} catch {
+			notifications.show({
+				message: t("suggestFailed"),
+				color: "red",
+				autoClose: 3000,
+			});
+		} finally {
+			setSuggesting(false);
+		}
 	};
 
 	/** Check if a saved answer matches a specific option label (exact or within comma-separated list) */
@@ -165,6 +207,9 @@ export function AskUserQuestionBanner({
 					<Group>
 						<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>
 							{t("submitAnswer")}
+						</Button>
+						<Button size="xs" variant="light" loading={suggesting} onClick={handleSuggest}>
+							{suggesting ? t("suggesting") : t("suggestAnswer")}
 						</Button>
 						<Button size="xs" color="red" variant="light" onClick={() => onDeny?.(requestId)}>
 							{t("skipQuestion")}

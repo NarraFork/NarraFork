@@ -324,3 +324,23 @@ export const terminalWsMessageSchema = z.discriminatedUnion("type", [
 		name: z.string().min(1).max(100),
 	}),
 ]);
+
+// === Narrator suggest answers ===
+
+export const suggestAnswersSchema = z.object({
+	questions: z
+		.array(
+			z.object({
+				question: z.string().min(1),
+				header: z.string().min(1),
+				options: z.array(
+					z.object({
+						label: z.string(),
+						description: z.string(),
+					}),
+				),
+				multiSelect: z.boolean().optional(),
+			}),
+		)
+		.min(1),
+});

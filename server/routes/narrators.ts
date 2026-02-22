@@ -2,14 +2,21 @@ import { and, asc, type Column, desc, eq, gt, isNull, lt, ne, or, sql } from "dr
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
-import { getUserLanguage, getUserReplyInLanguage } from "../lib/prompt-i18n";
+import {
+	getToolMessage,
+	getUserLanguage,
+	getUserReplyInLanguage,
+	type Locale,
+} from "../lib/prompt-i18n";
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
 	createNarratorSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
+	suggestAnswersSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 } from "../lib/validators";
@@ -387,4 +394,69 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
 	await resolvePermission(requestId, "deny", parsed.success ? parsed.data.message : undefined);
 	return c.json({ ok: true });
+});
+
+// Suggest best-practice answers for AskUserQuestion
+narratorRoutes.post("/:id/suggest-answers", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	const userId = c.get("user").sub;
+	const locale = (await getUserLanguage(userId)) as Locale;
+
+	const body = await c.req.json();
+	const parsed = suggestAnswersSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { questions } = parsed.data;
+
+	// Load full conversation context (since last compact)
+	const dbMessages = await narratorService.getMessagesSinceLastCompact(id);
+	const conversationLines: string[] = [];
+	for (const m of dbMessages) {
+		if (m.parentToolUseId) continue; // skip sub-messages
+		const role = m.role === "assistant" ? "Assistant" : m.role === "user" ? "User" : "System";
+		const text = m.contentText ?? "";
+		if (!text.trim()) continue;
+		conversationLines.push(`[${role}]: ${text}`);
+	}
+	const conversationContext = conversationLines.join("\n\n");
+
+	const systemPrompt = getToolMessage("suggestAnswerSystem", locale);
+
+	// Build a concise description of each question for the LLM
+	const questionsText = questions
+		.map((q) => {
+			const opts = q.options.length
+				? `\nOptions: ${q.options.map((o) => `${o.label} — ${o.description}`).join("; ")}`
+				: "\n(free-text, no predefined options)";
+			return `Key: "${q.question}"\nQuestion: ${q.header}${opts}`;
+		})
+		.join("\n\n");
+
+	const userMessage = conversationContext
+		? `<conversation>\n${conversationContext}\n</conversation>\n\n<questions>\n${questionsText}\n</questions>`
+		: questionsText;
+
+	const raw = await agentGenerateWithHistory(
+		systemPrompt,
+		userMessage,
+		narrator.model ?? undefined,
+		locale,
+	);
+
+	// Parse JSON from the response (strip markdown fences if present)
+	let answers: Record<string, string> = {};
+	try {
+		const cleaned = raw
+			.replace(/```(?:json)?\s*/g, "")
+			.replace(/```\s*/g, "")
+			.trim();
+		answers = JSON.parse(cleaned);
+	} catch {
+		// If parsing fails, try to use the raw text as a single answer
+		if (questions.length === 1) {
+			answers = { [questions[0].question]: raw.trim() };
+		}
+	}
+
+	return c.json({ answers });
 });
