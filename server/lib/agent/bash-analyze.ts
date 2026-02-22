@@ -237,6 +237,73 @@ const ALWAYS_ASK_COMMANDS = new Set([
 ]);
 
 /**
+ * npx/bunx 执行的已知安全包名。
+ * 这些是常见的开发工具链命令，不会产生破坏性副作用。
+ */
+const SAFE_PACKAGE_RUNNERS = new Set([
+	// 测试
+	"vitest", "jest", "mocha", "playwright", "cypress",
+	// 类型检查 / 编译
+	"tsc", "tsup", "tsx", "ts-node", "esbuild", "swc",
+	// Lint / 格式化
+	"eslint", "prettier", "biome", "oxlint", "stylelint",
+	// 构建工具
+	"vite", "webpack", "rollup", "turbo", "nx",
+	// 代码生成 / 脚手架
+	"prisma", "drizzle-kit", "typeorm", "knex",
+	"create-react-app", "create-next-app", "create-vite",
+	// 文档
+	"typedoc", "jsdoc",
+	// 工具
+	"depcheck", "npm-check-updates", "ncu", "sort-package-json",
+	"license-checker", "madge", "size-limit",
+	// 包管理
+	"bun", "pnpm", "yarn",
+]);
+
+/**
+ * 对 npx/bunx 执行的命令进行递归分类。
+ * 已知安全包 → null（放行），否则返回危险描述（拦截）。
+ */
+function classifyPackageRunner(tokens: string[], runner: string): string | null {
+	// 跳过 flags（如 npx --yes, npx -p package）
+	let i = 1;
+	while (i < tokens.length && tokens[i].startsWith("-")) {
+		// --package / -p 后面跟包名，跳过
+		if (tokens[i] === "--package" || tokens[i] === "-p" || tokens[i] === "--yes" || tokens[i] === "-y") {
+			i++;
+			// -p / --package 后面的值也要跳过
+			if ((tokens[i - 1] === "--package" || tokens[i - 1] === "-p") && i < tokens.length) i++;
+		} else {
+			i++;
+		}
+	}
+	const execCmd = tokens[i];
+	if (!execCmd) return null; // 纯 npx（无命令）— 不危险
+
+	// 已知安全包
+	if (SAFE_PACKAGE_RUNNERS.has(execCmd)) return null;
+
+	// 被执行的命令如果在系统级白名单中也放行
+	if (SAFE_COMMANDS.has(execCmd)) return null;
+
+	// 被执行的命令在 ALWAYS_ASK 中 — 危险
+	if (ALWAYS_ASK_COMMANDS.has(execCmd))
+		return `${runner} ${execCmd} (dangerous command)`;
+
+	// 被执行的命令在 CONDITIONAL_COMMANDS 中 — 递归检查参数
+	if (execCmd in CONDITIONAL_COMMANDS) {
+		const subTokens = tokens.slice(i);
+		const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
+		if (danger) return `${runner} → ${danger}`;
+		return null;
+	}
+
+	// 未知包 — 需要用户确认
+	return `${runner} ${execCmd} (unrecognized package)`;
+}
+
+/**
  * 条件安全命令 — 在白名单中但某些参数组合是危险的。
  * key: 命令名, value: 危险参数检测函数
  */
@@ -346,7 +413,6 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (tokens.includes("-e") || tokens.includes("--eval")) return "bun with -e flag";
 			return null;
 		},
-		bunx: (_tokens) => null,
 		// find -exec / -execdir — 提取被执行的命令进行递归分类
 		find: (tokens) => {
 			if (tokens.some((t) => t === "-delete"))
@@ -439,7 +505,9 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 		// yarn/pnpm — 包管理器
 		yarn: (_tokens) => null,
 		pnpm: (_tokens) => null,
-		npx: (_tokens) => null,
+		// npx/bunx — 包执行器，递归检查被执行的命令
+		npx: (tokens) => classifyPackageRunner(tokens, "npx"),
+		bunx: (tokens) => classifyPackageRunner(tokens, "bunx"),
 	};
 
 /** 需要提取路径参数的命令（写操作） */
