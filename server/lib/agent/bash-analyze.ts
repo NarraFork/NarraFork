@@ -141,6 +141,8 @@ const SAFE_COMMANDS = new Set([
 	"awk",
 	"gawk",
 	"find",
+	// 间接执行（危险参数由 CONDITIONAL_COMMANDS 检测）
+	"xargs",
 	// 压缩
 	"tar",
 	"zip",
@@ -218,7 +220,7 @@ const ALWAYS_ASK_COMMANDS = new Set([
 	"podman",
 	"kubectl",
 	// 间接命令执行
-	"xargs",
+	// xargs 移至 CONDITIONAL_COMMANDS 进行递归分析
 	// 脚本解释器（可 -e/-c 执行任意代码）
 	"perl",
 	"ruby",
@@ -242,23 +244,53 @@ const ALWAYS_ASK_COMMANDS = new Set([
  */
 const SAFE_PACKAGE_RUNNERS = new Set([
 	// 测试
-	"vitest", "jest", "mocha", "playwright", "cypress",
+	"vitest",
+	"jest",
+	"mocha",
+	"playwright",
+	"cypress",
 	// 类型检查 / 编译
-	"tsc", "tsup", "tsx", "ts-node", "esbuild", "swc",
+	"tsc",
+	"tsup",
+	"tsx",
+	"ts-node",
+	"esbuild",
+	"swc",
 	// Lint / 格式化
-	"eslint", "prettier", "biome", "oxlint", "stylelint",
+	"eslint",
+	"prettier",
+	"biome",
+	"oxlint",
+	"stylelint",
 	// 构建工具
-	"vite", "webpack", "rollup", "turbo", "nx",
+	"vite",
+	"webpack",
+	"rollup",
+	"turbo",
+	"nx",
 	// 代码生成 / 脚手架
-	"prisma", "drizzle-kit", "typeorm", "knex",
-	"create-react-app", "create-next-app", "create-vite",
+	"prisma",
+	"drizzle-kit",
+	"typeorm",
+	"knex",
+	"create-react-app",
+	"create-next-app",
+	"create-vite",
 	// 文档
-	"typedoc", "jsdoc",
+	"typedoc",
+	"jsdoc",
 	// 工具
-	"depcheck", "npm-check-updates", "ncu", "sort-package-json",
-	"license-checker", "madge", "size-limit",
+	"depcheck",
+	"npm-check-updates",
+	"ncu",
+	"sort-package-json",
+	"license-checker",
+	"madge",
+	"size-limit",
 	// 包管理
-	"bun", "pnpm", "yarn",
+	"bun",
+	"pnpm",
+	"yarn",
 ]);
 
 /**
@@ -270,7 +302,12 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 	let i = 1;
 	while (i < tokens.length && tokens[i].startsWith("-")) {
 		// --package / -p 后面跟包名，跳过
-		if (tokens[i] === "--package" || tokens[i] === "-p" || tokens[i] === "--yes" || tokens[i] === "-y") {
+		if (
+			tokens[i] === "--package" ||
+			tokens[i] === "-p" ||
+			tokens[i] === "--yes" ||
+			tokens[i] === "-y"
+		) {
 			i++;
 			// -p / --package 后面的值也要跳过
 			if ((tokens[i - 1] === "--package" || tokens[i - 1] === "-p") && i < tokens.length) i++;
@@ -288,8 +325,7 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 	if (SAFE_COMMANDS.has(execCmd)) return null;
 
 	// 被执行的命令在 ALWAYS_ASK 中 — 危险
-	if (ALWAYS_ASK_COMMANDS.has(execCmd))
-		return `${runner} ${execCmd} (dangerous command)`;
+	if (ALWAYS_ASK_COMMANDS.has(execCmd)) return `${runner} ${execCmd} (dangerous command)`;
 
 	// 被执行的命令在 CONDITIONAL_COMMANDS 中 — 递归检查参数
 	if (execCmd in CONDITIONAL_COMMANDS) {
@@ -316,7 +352,11 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 
 			// push --force / -f / --force-with-lease / --mirror / --delete
 			if (sub === "push") {
-				if (tokens.some((t) => t === "--force" || t === "-f" || t === "--force-with-lease" || t === "--mirror"))
+				if (
+					tokens.some(
+						(t) => t === "--force" || t === "-f" || t === "--force-with-lease" || t === "--mirror",
+					)
+				)
 					return "git push --force (rewrites remote history)";
 				if (tokens.some((t) => t === "--delete" || t === "-d"))
 					return "git push --delete (deletes remote ref)";
@@ -326,17 +366,14 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (sub === "reset" && tokens.some((t) => t === "--hard"))
 				return "git reset --hard (discards uncommitted changes)";
 			// clean -f / -fd / -fdx
-			if (sub === "clean")
-				return "git clean (removes untracked files)";
+			if (sub === "clean") return "git clean (removes untracked files)";
 			// checkout -- (discard changes) — only when restoring files, not switching branches
 			if (sub === "checkout" && tokens.includes("--"))
 				return "git checkout -- (discards working tree changes)";
 			// rebase (interactive or not — rewrites history)
-			if (sub === "rebase")
-				return "git rebase (rewrites commit history)";
+			if (sub === "rebase") return "git rebase (rewrites commit history)";
 			// merge (can cause conflicts / alter branch state)
-			if (sub === "merge")
-				return "git merge (alters branch state)";
+			if (sub === "merge") return "git merge (alters branch state)";
 			// filter-branch / filter-repo (mass history rewrite)
 			if (sub === "filter-branch" || sub === "filter-repo")
 				return `git ${sub} (mass history rewrite)`;
@@ -350,11 +387,9 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (sub === "branch" && tokens.some((t) => t === "-D" || t === "--delete" || t === "-d"))
 				return "git branch delete";
 			// submodule deinit
-			if (sub === "submodule" && tokens.includes("deinit"))
-				return "git submodule deinit";
+			if (sub === "submodule" && tokens.includes("deinit")) return "git submodule deinit";
 			// worktree remove
-			if (sub === "worktree" && tokens.includes("remove"))
-				return "git worktree remove";
+			if (sub === "worktree" && tokens.includes("remove")) return "git worktree remove";
 
 			return null;
 		},
@@ -415,8 +450,7 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 		},
 		// find -exec / -execdir — 提取被执行的命令进行递归分类
 		find: (tokens) => {
-			if (tokens.some((t) => t === "-delete"))
-				return "find with -delete (removes files)";
+			if (tokens.some((t) => t === "-delete")) return "find with -delete (removes files)";
 
 			const execFlags = ["-exec", "-execdir", "-ok", "-okdir"];
 			for (const flag of execFlags) {
@@ -428,8 +462,7 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 				if (!execCmd) return `find with ${flag} (empty command)`;
 
 				// 递归分类：被执行的命令是否危险
-				if (ALWAYS_ASK_COMMANDS.has(execCmd))
-					return `find ${flag} ${execCmd} (dangerous command)`;
+				if (ALWAYS_ASK_COMMANDS.has(execCmd)) return `find ${flag} ${execCmd} (dangerous command)`;
 
 				// 检查条件安全命令的危险参数
 				if (execCmd in CONDITIONAL_COMMANDS) {
@@ -464,6 +497,43 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (fullText.includes("system(") || fullText.includes("| getline"))
 				return "gawk with system()/getline";
 			return null;
+		},
+		// xargs — 递归分析被执行的命令
+		xargs: (tokens) => {
+			// 跳过 xargs 自身的 flags
+			const xargsFlags = new Set(["-0", "--null", "-d", "--delimiter", "-n", "--max-args",
+				"-P", "--max-procs", "-I", "-i", "--replace", "-L", "--max-lines",
+				"-s", "--max-chars", "-t", "--verbose", "-p", "--interactive",
+				"-r", "--no-run-if-empty", "--show-limits"]);
+			const flagsWithValue = new Set(["-d", "--delimiter", "-n", "--max-args",
+				"-P", "--max-procs", "-I", "-i", "--replace", "-L", "--max-lines",
+				"-s", "--max-chars"]);
+			let i = 1;
+			while (i < tokens.length) {
+				const t = tokens[i];
+				if (t.startsWith("-") && xargsFlags.has(t)) {
+					i++;
+					if (flagsWithValue.has(t) && i < tokens.length) i++; // skip value
+				} else if (t.startsWith("-")) {
+					i++; // unknown flag, skip
+				} else {
+					break;
+				}
+			}
+			const execCmd = tokens[i];
+			// xargs 默认执行 echo — 安全
+			if (!execCmd) return null;
+
+			if (ALWAYS_ASK_COMMANDS.has(execCmd))
+				return `xargs ${execCmd} (dangerous command)`;
+			if (execCmd in CONDITIONAL_COMMANDS) {
+				const subTokens = tokens.slice(i);
+				const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
+				if (danger) return `xargs → ${danger}`;
+				return null;
+			}
+			if (SAFE_COMMANDS.has(execCmd)) return null;
+			return `xargs ${execCmd} (unknown command)`;
 		},
 		// tee 可以写入任意文件
 		tee: (_tokens) => {
@@ -840,7 +910,7 @@ const GIT_CURRENT_BRANCH_SAFE = new Set([
 	"fetch",
 	"pull",
 	"submodule",
-	"stash",  // push/pop/drop 有副作用，但不影响分支
+	"stash", // push/pop/drop 有副作用，但不影响分支
 	"config", // 可写入 .git/config，但不影响分支
 	"remote", // add/remove 修改远程配置，但不影响分支
 ]);
@@ -894,15 +964,37 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 		// branch: 查看分支列表是安全的，但创建/删除分支不行
 		if (sub === "branch") {
 			// 纯 `git branch` 或 `git branch -a/-r/--list/-v/--verbose` 是只读
-			const readonlyFlags = new Set(["-a", "--all", "-r", "--remotes", "--list", "-v", "--verbose", "-vv", "--no-color", "--color"]);
+			const readonlyFlags = new Set([
+				"-a",
+				"--all",
+				"-r",
+				"--remotes",
+				"--list",
+				"-v",
+				"--verbose",
+				"-vv",
+				"--no-color",
+				"--color",
+			]);
 			// 这些 flag 后面跟一个值参数（不是分支名）
-			const flagsWithValue = new Set(["--sort", "--format", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]);
+			const flagsWithValue = new Set([
+				"--sort",
+				"--format",
+				"--contains",
+				"--no-contains",
+				"--merged",
+				"--no-merged",
+				"--points-at",
+			]);
 			const args = tokens.slice(2);
 			let hasWriteFlag = false;
 			const nonFlagArgs: string[] = [];
 			let skipNext = false;
 			for (let i = 0; i < args.length; i++) {
-				if (skipNext) { skipNext = false; continue; }
+				if (skipNext) {
+					skipNext = false;
+					continue;
+				}
 				const arg = args[i];
 				if (arg.startsWith("-")) {
 					// Check if it's a flag with value (--contains=X or --contains X)
@@ -926,8 +1018,7 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 					violations.push("git branch -m/-M (renames branch)");
 				else if (flags.some((f) => f === "-c" || f === "-C" || f === "--copy"))
 					violations.push("git branch -c/-C (copies branch)");
-				else if (nonFlagArgs.length > 0)
-					violations.push("git branch <name> (creates new branch)");
+				else if (nonFlagArgs.length > 0) violations.push("git branch <name> (creates new branch)");
 			}
 			continue;
 		}
@@ -984,8 +1075,7 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 		if (sub === "worktree") {
 			if (tokens.includes("add"))
 				violations.push("git worktree add (creates worktree for another branch)");
-			if (tokens.includes("remove"))
-				violations.push("git worktree remove (removes worktree)");
+			if (tokens.includes("remove")) violations.push("git worktree remove (removes worktree)");
 			// list/prune 是安全的
 			continue;
 		}
@@ -1005,7 +1095,10 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 			if (isListMode) continue;
 			// -n<num> / --contains / --sort 等也是只读查询
 			const tagArgs = tagFlags.filter((t) => !t.startsWith("-"));
-			if (tagArgs.length > 0 || tagFlags.some((t) => t === "-d" || t === "--delete" || t === "-a" || t === "-s"))
+			if (
+				tagArgs.length > 0 ||
+				tagFlags.some((t) => t === "-d" || t === "--delete" || t === "-a" || t === "-s")
+			)
 				violations.push("git tag (creates/deletes tags)");
 			continue;
 		}
@@ -1124,7 +1217,11 @@ function detectCatastrophic(commands: BashAnalysis["commands"], rawCommand: stri
  * 分析 bash 命令字符串，返回命令列表、路径和白名单状态。
  * @param isChapter 是否在 chapter 模式下运行（启用 git 分支限制）
  */
-export async function analyzeBashCommand(command: string, cwd: string, isChapter = false): Promise<BashAnalysis> {
+export async function analyzeBashCommand(
+	command: string,
+	cwd: string,
+	isChapter = false,
+): Promise<BashAnalysis> {
 	const parser = await getParser();
 	const tree = parser.parse(command);
 
