@@ -22,9 +22,16 @@ export const exitPlanModeTool: ToolDefinition = {
 	name: "ExitPlanMode",
 	description:
 		"Exit plan mode and present your plan. " +
-		"Include a clear, structured plan of what you intend to do.",
+		"You MUST put your COMPLETE, FULL plan in the 'plan' parameter — this is the ONLY place the plan is stored and shown to the user. " +
+		"Do NOT summarize or abbreviate. Do NOT write the plan in your text response and then reference it here. " +
+		"The plan parameter must be self-contained and include every detail.",
 	parameters: z.object({
-		plan: z.string().describe("The complete plan in markdown format"),
+		plan: z
+			.string()
+			.describe(
+				"The COMPLETE plan in markdown format. Must contain the full implementation plan with all steps, details, and reasoning. " +
+					"This is the sole source of truth — do NOT put the plan in your text response instead.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (tool_result event).

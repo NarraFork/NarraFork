@@ -61,6 +61,8 @@ Be thorough but concise. This summary replaces the entire conversation.
 `,
 		"zh-CN": `你是一个对话压缩器。创建一个结构化的摘要来替代完整的对话历史。AI 助手将仅使用此摘要继续工作——必须保留所有必要信息。
 
+重要：无论对话中使用了什么语言，摘要必须使用简体中文撰写。
+
 严格使用以下模板：
 
 ---
@@ -93,7 +95,7 @@ Be thorough but concise. This summary replaces the entire conversation.
 	},
 	compactSuffix: {
 		en: `Now produce ONLY the summary. Do not continue the conversation. Do not generate code. Output the summary directly.`,
-		"zh-CN": `请仅输出摘要。不要继续对话。不要生成代码。直接输出摘要。`,
+		"zh-CN": `请仅输出摘要。不要继续对话。不要生成代码。直接输出摘要。摘要必须使用简体中文撰写（代码标识符和文件路径保持原样）。`,
 	},
 	conflictResolution: {
 		en: `A git merge from branch "{sourceBranch}" into "{targetBranch}" has produced conflicts in the following files:
@@ -251,7 +253,8 @@ export async function getUserReplyInLanguage(userId: string): Promise<boolean> {
 
 const languageInstructions: Record<Locale, string> = {
 	en: "Always reply in English.",
-	"zh-CN": "始终使用简体中文回复。",
+	"zh-CN":
+		"始终使用简体中文回复。无论上下文摘要或对话历史中使用了什么语言，你的回复必须使用简体中文。",
 };
 
 /**
@@ -327,6 +330,11 @@ const toolMessages = {
 		"zh-CN":
 			"已更新待办事项：共 {total} 项（{completed} 已完成，{inProgress} 进行中，{pending} 待处理）",
 	},
+	// Suggest best-practice answers for AskUserQuestion
+	suggestAnswerSystem: {
+		en: `You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the full conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences.`,
+		"zh-CN": `你是一位资深软件工程顾问。用户正在一次对话中被 AI 编程助手提问。你会收到 <conversation> 标签中的完整对话上下文和 <questions> 标签中的问题。对于每个问题，请结合具体的项目上下文和对话历史，建议最佳实践答案。如果提供了选项，从中选择；否则给出简洁的自由文本答案。只回复一个有效的 JSON 对象，将每个问题的 key 映射到你推荐的答案字符串。不要解释，不要 markdown 代码块。`,
+	},
 	// Nudge appended to tool results when turn count is high
 	turnNudge: {
 		en: "\n\n[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
@@ -379,6 +387,10 @@ Think, read, search, and construct a well-formed plan that accomplishes the user
 4. **Clarify** — Ask the user questions when weighing tradeoffs or facing ambiguity
 5. **Present** — Call ExitPlanMode with your complete plan when ready
 
+## CRITICAL: Plan Placement Rule
+
+Your plan MUST be written ENTIRELY inside the ExitPlanMode tool's "plan" parameter. This is the ONLY place the plan is stored, displayed to the user, and used for context reset. Do NOT write the plan in your text response and then call ExitPlanMode with a summary or reference like "see above". The "plan" parameter must be fully self-contained with all steps, details, and reasoning. If you write the plan in your text response instead, the user will lose it when context is reset.
+
 Do NOT make large assumptions about user intent. Ask clarifying questions when needed.
 
 Your turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop for any other reason.
@@ -401,6 +413,10 @@ Your turn should only end with either asking the user a question or calling Exit
 3. **规划** — 制定清晰的、分步骤的实施计划
 4. **澄清** — 在权衡取舍或面临歧义时向用户提问
 5. **提交** — 准备好后调用 ExitPlanMode 提交完整计划
+
+## 关键规则：计划必须写在工具参数中
+
+你的计划必须完整地写在 ExitPlanMode 工具的 "plan" 参数中。这是计划被存储、展示给用户和用于上下文重置的唯一位置。不要在文本回复中写计划然后在 ExitPlanMode 中只写摘要或"见上文"之类的引用。"plan" 参数必须完全自包含，包含所有步骤、细节和推理。如果你把计划写在文本回复中而不是工具参数中，用户在重置上下文时将丢失计划内容。
 
 不要对用户意图做大量假设。需要时请提出澄清问题。
 

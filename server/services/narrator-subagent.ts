@@ -48,7 +48,7 @@ async function buildSubagentSystemPrompt(
 	let prompt = getSubagentPrompt(subagentType, locale);
 
 	// Inject current working directory
-	prompt += `\n\n## Current Working Directory\n\n\`${cwd}\``;
+	prompt += `\n\n## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (Bash, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in Bash commands — it is redundant.`;
 
 	// Inject AGENT.md (fallback to CLAUDE.md) if present
 	for (const filename of ["AGENT.md", "CLAUDE.md"]) {

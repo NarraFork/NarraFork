@@ -13,6 +13,7 @@ export const bashTool: ToolDefinition = {
 	name: "Bash",
 	description:
 		"Execute a bash command. Use for git, npm, system commands. " +
+		"Commands run in the Current Working Directory by default — do NOT prepend `cd <cwd> &&` as it is redundant. " +
 		"Output exceeding 2000 lines or 50KB is truncated; full output is saved to a file for retrieval via Read/Grep. " +
 		"IMPORTANT: Prefer dedicated tools over Bash when possible — use Read instead of cat/head/tail, " +
 		"Write instead of echo/cat heredoc, Edit instead of sed/awk, Glob instead of find/ls, " +
@@ -28,8 +29,8 @@ export const bashTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe(
-				"Working directory for the command. Defaults to the project root. " +
-					"Use this instead of `cd <dir> && <command>` patterns.",
+				"Working directory for the command. Defaults to the Current Working Directory from the system prompt — " +
+					"do NOT cd to it manually. Use this parameter only when you need a *different* directory.",
 			),
 		description: z
 			.string()

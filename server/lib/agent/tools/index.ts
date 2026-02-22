@@ -1,4 +1,5 @@
 import { toolRegistry } from "../tool-registry";
+import { askUserQuestionTool } from "./ask-user-question";
 import { bashTool } from "./bash";
 import { editTool } from "./edit";
 import { globTool } from "./glob";
@@ -23,4 +24,5 @@ export function registerCoreTools(): void {
 	toolRegistry.register(enterPlanModeTool);
 	toolRegistry.register(exitPlanModeTool);
 	toolRegistry.register(taskTool);
+	toolRegistry.register(askUserQuestionTool);
 }
