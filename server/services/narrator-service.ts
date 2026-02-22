@@ -574,9 +574,15 @@ export const narratorService = {
 
 	/**
 	 * Fetch messages added after a given message ID (for WS catch-up).
-	 * Returns tree-structured messages in chronological order, capped at `limit`.
+	 * Returns:
+	 * - `topLevel`: new top-level messages (tree-structured, chronological)
+	 * - `orphanChildren`: child messages whose parent top-level message was
+	 *    already sent before the catch-up point (e.g. subagent messages that
+	 *    arrived while the client was disconnected). These should be sent as
+	 *    individual `{ type: "message" }` events so the frontend's
+	 *    `insertChildIntoCache` can place them correctly.
 	 */
-	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 100) {
+	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 200) {
 		// Find the seq of the reference message
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -585,53 +591,114 @@ export const narratorService = {
 			),
 			columns: { seq: true },
 		});
-		if (!ref) return [];
+		if (!ref) return { topLevel: [], orphanChildren: [] };
 
-		// Fetch top-level messages with seq > ref.seq (chronological order)
+		// Fetch ALL messages (top-level + children) with seq > ref.seq
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
 				seq: narratorMessageRefs.seq,
 			})
 			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gt(narratorMessageRefs.seq, ref.seq),
-					isNull(narratorMessages.parentToolUseId),
-				),
+				and(eq(narratorMessageRefs.narratorId, narratorId), gt(narratorMessageRefs.seq, ref.seq)),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} ASC`)
 			.limit(limit);
 
-		if (refRows.length === 0) return [];
+		if (refRows.length === 0) return { topLevel: [], orphanChildren: [] };
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const topMessages = await db.query.narratorMessages.findMany({
+		const allMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
 			with: { toolCalls: true },
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
-		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 
-		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childMessages =
-			parentToolUseIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true },
-						orderBy: (m, { asc }) => [asc(m.createdAt)],
-						limit: 500,
-					})
-				: [];
+		// Separate top-level vs child messages
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const topMsgs: any[] = [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const childMsgs: any[] = [];
+		for (const msg of allMessages) {
+			if (msg.parentToolUseId) {
+				childMsgs.push(msg);
+			} else {
+				topMsgs.push(msg);
+			}
+		}
 
-		await attachSubagentModels(childMessages);
+		// For new top-level messages, also fetch their children that might
+		// NOT be in the refRows (children created before the catch-up point
+		// but belonging to new top-level messages — unlikely but safe)
+		const newTopToolUseIds = collectToolUseIds(topMsgs);
+		const existingChildIds = new Set(childMsgs.map((m) => m.id));
+		if (newTopToolUseIds.length > 0) {
+			const extraChildren = await db.query.narratorMessages.findMany({
+				where: and(
+					inArray(narratorMessages.parentToolUseId, newTopToolUseIds),
+					// Exclude children we already have
+					childMsgs.length > 0
+						? sql`${narratorMessages.id} NOT IN (${sql.join(
+								childMsgs.map((m) => sql`${m.id}`),
+								sql`, `,
+							)})`
+						: undefined,
+				),
+				with: { toolCalls: true },
+				orderBy: (m, { asc }) => [asc(m.createdAt)],
+				limit: 500,
+			});
+			for (const c of extraChildren) {
+				if (!existingChildIds.has(c.id)) {
+					childMsgs.push(c);
+				}
+			}
+		}
 
-		return filterExitPlanBeforePlanCompact(
-			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		await attachSubagentModels(childMsgs);
+
+		// Build tree for new top-level messages
+		const tree = filterExitPlanBeforePlanCompact(
+			truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
 		);
+
+		// Orphan children: child messages whose parentToolUseId does NOT belong
+		// to any new top-level message (they belong to an older message already
+		// in the client's cache). Skip children of completed subagents — those
+		// are already embedded in the parent's tree when the client loads messages.
+		const newTopToolUseIdSet = new Set(newTopToolUseIds);
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const candidateOrphans: any[] = [];
+		const orphanToolUseIds: string[] = [];
+		for (const child of childMsgs) {
+			if (!newTopToolUseIdSet.has(child.parentToolUseId)) {
+				candidateOrphans.push(child);
+				orphanToolUseIds.push(child.parentToolUseId);
+			}
+		}
+
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		let orphanChildren: any[] = [];
+		if (candidateOrphans.length > 0) {
+			// Check which parent tool calls are already completed
+			const uniqueToolUseIds = [...new Set(orphanToolUseIds)];
+			const completedTcs = await db.query.narratorToolCalls.findMany({
+				where: and(
+					inArray(narratorToolCalls.toolUseId, uniqueToolUseIds),
+					isNotNull(narratorToolCalls.status),
+				),
+				columns: { toolUseId: true },
+			});
+			const completedSet = new Set(completedTcs.map((tc) => tc.toolUseId));
+			orphanChildren = candidateOrphans
+				.filter((c) => !completedSet.has(c.parentToolUseId))
+				.map((c) => ({ ...c, children: [] }));
+		}
+
+		return { topLevel: tree, orphanChildren: truncateToolIO(orphanChildren) };
 	},
 
 	/**
@@ -1026,7 +1093,7 @@ export const narratorService = {
 			.values({
 				id,
 				narratorId,
-				sdkMessageUuid: sdkMessage.uuid,
+				messageUuid: sdkMessage.uuid,
 				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
 				role: "assistant",
 				contentJson: content,

@@ -29,7 +29,7 @@ import {
 	IconWorldSearch,
 	IconX,
 } from "@tabler/icons-react";
-import { createContext, memo, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
@@ -59,6 +59,8 @@ export interface ToolCallData {
 	permissionDecisionReason?: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	permissionSuggestions?: any[] | null;
+	/** Timestamp (Date.now()) when the tool started running — used for live elapsed timer */
+	startedAt?: number;
 }
 
 export interface PendingPermission {
@@ -260,6 +262,39 @@ function getSummary(toolName: string, input: any): string {
 	}
 }
 
+// --- Helper: live elapsed timer for running tools ---
+
+function formatElapsed(s: number): string {
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	const sec = s % 60;
+	return `${m}m${sec.toString().padStart(2, "0")}s`;
+}
+
+function ElapsedTimer({ startedAt }: { startedAt: number }) {
+	const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startedAt) / 1000));
+	const rafRef = useRef(0);
+
+	useEffect(() => {
+		let last = performance.now();
+		const tick = (now: number) => {
+			if (now - last >= 1000) {
+				last = now;
+				setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+			}
+			rafRef.current = requestAnimationFrame(tick);
+		};
+		rafRef.current = requestAnimationFrame(tick);
+		return () => cancelAnimationFrame(rafRef.current);
+	}, [startedAt]);
+
+	return (
+		<Text size="xs" c="dimmed" ff="monospace">
+			{formatElapsed(elapsed)}
+		</Text>
+	);
+}
+
 // --- Helper: status indicator icon ---
 
 export function StatusIcon({ status }: { status: string }) {
@@ -311,10 +346,17 @@ function ToolHeader({
 					<Box c={statusColor}>
 						<StatusIcon status={toolCall.status} />
 					</Box>
-					{toolCall.durationMs != null && (
-						<Text size="xs" c="dimmed">
-							{(toolCall.durationMs / 1000).toFixed(1)}s
-						</Text>
+					{toolCall.startedAt != null &&
+					(toolCall.status === "running" ||
+						toolCall.status === "pending" ||
+						toolCall.status === "initializing") ? (
+						<ElapsedTimer startedAt={toolCall.startedAt} />
+					) : (
+						toolCall.durationMs != null && (
+							<Text size="xs" c="dimmed">
+								{(toolCall.durationMs / 1000).toFixed(1)}s
+							</Text>
+						)
 					)}
 					{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 				</Group>
@@ -1036,10 +1078,27 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 	const statusColor = anyFailed ? "red" : anyRunning ? "blue" : allDone ? "green" : "yellow";
 	const statusLabel = anyFailed ? "fail" : anyRunning ? "running" : allDone ? "success" : "pending";
 
+	const anyInProgress = toolCalls.some(
+		(tc) => tc.status === "running" || tc.status === "pending" || tc.status === "initializing",
+	);
+
 	// Collect unique tool names for the label
 	const names = [...new Set(toolCalls.map((tc) => tc.toolName))];
 	const label = names.length === 1 ? names[0] : names.join(", ");
 	const totalMs = toolCalls.reduce((sum, tc) => sum + (tc.durationMs ?? 0), 0);
+
+	// Find the earliest startedAt among in-progress tools for the group elapsed timer
+	const earliestRunningStart = anyInProgress
+		? toolCalls.reduce<number | undefined>((earliest, tc) => {
+				if (
+					(tc.status === "running" || tc.status === "pending" || tc.status === "initializing") &&
+					tc.startedAt != null
+				) {
+					return earliest == null ? tc.startedAt : Math.min(earliest, tc.startedAt);
+				}
+				return earliest;
+			}, undefined)
+		: undefined;
 
 	return (
 		<Paper withBorder radius="sm" p="xs">
@@ -1058,10 +1117,14 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 					<Badge size="xs" variant="dot" color={statusColor}>
 						{statusLabel}
 					</Badge>
-					{totalMs > 0 && (
-						<Text size="xs" c="dimmed">
-							{(totalMs / 1000).toFixed(1)}s
-						</Text>
+					{earliestRunningStart != null ? (
+						<ElapsedTimer startedAt={earliestRunningStart} />
+					) : (
+						totalMs > 0 && (
+							<Text size="xs" c="dimmed">
+								{(totalMs / 1000).toFixed(1)}s
+							</Text>
+						)
 					)}
 					{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 				</Group>

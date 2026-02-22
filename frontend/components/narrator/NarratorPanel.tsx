@@ -146,6 +146,8 @@ interface ToolCallRow {
 	errorMessage?: string;
 	permissionDecisionReason?: string | null;
 	permissionSuggestions?: unknown[] | null;
+	createdAt?: string;
+	permissionDecidedAt?: string | null;
 }
 
 type NarratorMsg = TreeMessage;
@@ -177,17 +179,26 @@ function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 	for (const block of blocks) {
 		if (block.type !== "tool_use") continue;
 		const tc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === block.id);
+		const status = tc?.status ?? "running";
+		// Derive startedAt for in-progress tools from persisted timestamps so the
+		// elapsed timer works correctly when re-entering a session.
+		let startedAt: number | undefined;
+		if (status === "running" || status === "pending" || status === "initializing") {
+			const ts = tc?.permissionDecidedAt ?? tc?.createdAt;
+			if (ts) startedAt = new Date(ts).getTime();
+		}
 		results.push({
 			id: tc?.id,
 			toolName: block.name ?? "",
 			toolUseId: block.id,
 			inputJson: tc?.inputJson ?? block.input,
 			outputJson: tc?.outputJson,
-			status: tc?.status ?? "running",
+			status,
 			durationMs: tc?.durationMs,
 			errorMessage: tc?.errorMessage,
 			permissionDecisionReason: tc?.permissionDecisionReason,
 			permissionSuggestions: tc?.permissionSuggestions,
+			startedAt,
 		});
 	}
 	return results;
@@ -1167,7 +1178,7 @@ interface NarratorPanelProps {
 		todosJson?: TodoItem[] | null;
 		todosToolUseId?: string | null;
 	};
-	onForkFromMessage?: (sdkMessageUuid: string) => void;
+	onForkFromMessage?: (messageUuid: string) => void;
 	highlightMessageId?: string;
 	/** Write selected chat text to the paired terminal panel. Provided by the session layout when a terminal is open. */
 	onSendToTerminal?: (text: string) => void;
@@ -1981,7 +1992,8 @@ export function NarratorPanel({
 			}
 			const target = vp.scrollHeight - vp.clientHeight;
 			const gap = target - vp.scrollTop;
-			if (gap < 1) {
+			// Use 1.5px threshold to account for sub-pixel rounding on high-DPI displays
+			if (gap < 1.5) {
 				vp.scrollTop = target;
 				followingRef.current = false;
 				if (!isAtBottomRef.current) {
@@ -1991,7 +2003,7 @@ export function NarratorPanel({
 				}
 				return;
 			}
-			vp.scrollTop += Math.max(gap * 0.25, 1);
+			vp.scrollTop += Math.max(gap * 0.25, 1.5);
 			followRafRef.current = requestAnimationFrame(step);
 		};
 		followingRef.current = true;
@@ -2275,6 +2287,20 @@ export function NarratorPanel({
 					);
 				});
 			},
+			onToolStarted: (toolUseId: string) => {
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					let anyChanged = false;
+					const pages = old.pages.map((page: MessagesPage) => {
+						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
+							startedAt: Date.now(),
+						});
+						if (changed) anyChanged = true;
+						return changed ? { ...page, messages } : page;
+					});
+					return anyChanged ? { ...old, pages } : old;
+				});
+			},
 			onPermissionRequest: (request) => {
 				// Add to the map keyed by toolUseId (supports multiple concurrent permissions)
 				if (request.toolUseId) {
@@ -2319,6 +2345,7 @@ export function NarratorPanel({
 						const pages = old.pages.map((page: MessagesPage) => {
 							const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
 								status: "running",
+								startedAt: Date.now(),
 							});
 							if (changed) anyChanged = true;
 							return changed ? { ...page, messages } : page;

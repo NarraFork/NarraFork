@@ -3,6 +3,7 @@ import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
+import type { GitStatusSummary } from "../services/git-service";
 import { narratorService } from "../services/narrator-service";
 import {
 	clearBufferedMessage,
@@ -25,12 +26,14 @@ export type NarratorServerMessage =
 	| { type: "permission_request"; narratorId: string; request: unknown }
 	| { type: "status_change"; narratorId: string; status: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
+	| { type: "tool_output"; narratorId: string; toolUseId: string; output: string }
 	| {
 			type: "tool_completed";
 			narratorId: string;
 			toolUseId: string;
 			status: string;
 			output?: unknown;
+			durationMs?: number;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
 	| { type: "permission_resolved"; narratorId: string; requestId: string; toolUseId?: string }
@@ -58,6 +61,21 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			toolUseId: string;
 			subagentType: string;
+	  }
+	| {
+			type: "git_status";
+			narratorId: string;
+			chapterId: string;
+			toolUseId: string;
+			status: GitStatusSummary;
+	  }
+	| { type: "auto_commit_started"; narratorId: string; chapterId: string }
+	| {
+			type: "auto_commit_done";
+			narratorId: string;
+			chapterId: string;
+			commitSha: string;
+			message: string;
 	  }
 	| { type: "error"; message: string };
 
@@ -182,18 +200,30 @@ export const handleNarratorWS = {
 					const narratorId = msg.narratorIds[0];
 					narratorService
 						.getMessagesAfter(narratorId, msg.lastMessageId)
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic tree message structure
-						.then((missed: any[]) => {
-							for (const message of missed) {
+						.then(({ topLevel, orphanChildren }) => {
+							// Send orphan children first — they belong to older messages
+							// already in the client's cache and need to be inserted via
+							// insertChildIntoCache before new top-level messages arrive.
+							for (const message of orphanChildren) {
 								try {
 									ws.send(JSON.stringify({ type: "message", narratorId, message }));
 								} catch {
-									break;
+									return;
+								}
+							}
+							// Then send new top-level messages (tree-structured)
+							for (const message of topLevel) {
+								try {
+									ws.send(JSON.stringify({ type: "message", narratorId, message }));
+								} catch {
+									return;
 								}
 							}
 						})
 						.catch((err: unknown) =>
-							logger.warn("Failed to send catch-up messages", { error: String(err) }),
+							logger.warn("Failed to send catch-up messages", {
+								error: String(err),
+							}),
 						);
 				}
 				break;
