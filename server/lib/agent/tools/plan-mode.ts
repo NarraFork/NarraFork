@@ -26,9 +26,11 @@ export const exitPlanModeTool: ToolDefinition = {
 	parameters: z.object({
 		plan: z.string().describe("The complete plan in markdown format"),
 	}),
-	async execute(args): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (tool_result event).
 		const { plan } = args as { plan: string };
-		return { output: plan };
+		const locale = (ctx?.locale as Locale) ?? "en";
+		const suffix = getToolMessage("exitPlanModeApproved", locale);
+		return { output: `${plan}\n\n${suffix}` };
 	},
 };

@@ -1,5 +1,4 @@
 import { z } from "zod/v4";
-import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const TIMEOUT_MS = 120_000;
@@ -46,7 +45,7 @@ export const bashTool: ToolDefinition = {
 			if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 			return {
-				output: truncateOutput(output || "(no output)"),
+				output: output || "(no output)",
 				isError: exitCode !== 0,
 				title: command.slice(0, 80),
 			};

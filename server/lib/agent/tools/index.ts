@@ -5,6 +5,7 @@ import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
+import { taskTool } from "./task";
 import { todoWriteTool } from "./todo";
 import { webSearchTool } from "./web-search";
 import { writeTool } from "./write";
@@ -21,4 +22,5 @@ export function registerCoreTools(): void {
 	toolRegistry.register(todoWriteTool);
 	toolRegistry.register(enterPlanModeTool);
 	toolRegistry.register(exitPlanModeTool);
+	toolRegistry.register(taskTool);
 }

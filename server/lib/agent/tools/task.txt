@@ -1,0 +1,37 @@
+Launch a new agent to handle tasks that genuinely benefit from an isolated context.
+
+IMPORTANT — This tool is expensive and slow. Do NOT use it casually. You already have Read, Glob, Grep, Bash, and WebSearch available directly. Use those first. Only spawn a subagent when the task meets one of the criteria below.
+
+Available agent types:
+- explore: Isolated read-only agent for codebase exploration. Tools: Read, Glob, Grep, WebSearch, Bash
+- plan: Software architect agent for designing implementation plans. Tools: Read, Glob, Grep, WebSearch, Bash
+- general: General-purpose agent with write access. Has access to all tools except Task.
+
+When to use each type:
+
+explore — ONLY for these situations:
+  1. Cross-module investigation: you need to trace logic across many files/modules and the search space is large enough that it would flood your own context with irrelevant content
+  2. Needle-in-haystack: you need to find a few critical pieces of information buried in a large codebase, and you want to avoid polluting your main context with all the intermediate search results
+  3. Exploratory trial-and-error: you're unsure which files or patterns are relevant and need to try multiple search strategies — offloading this keeps your context clean
+  If you already know which file to read, or can find what you need with a single Grep/Glob call, do it yourself. Do NOT use explore as a shortcut for simple lookups.
+
+plan — ONLY when you are in plan mode (EnterPlanMode). Do not spawn a plan subagent outside of plan mode. Use it to delegate architectural analysis of a specific subsystem while you focus on the broader design.
+
+general — For delegating self-contained subtasks that require file modifications, multi-step operations, or complex research that would clutter your main context. The subtask should be well-defined and independent enough to complete without back-and-forth.
+
+When NOT to use the Task tool:
+- Reading a specific file → use Read directly
+- Reading full contents of known files → use Read directly, NEVER delegate this to a subagent
+- Searching for a class/function definition → use Glob or Grep directly
+- Searching for code within a known file → use Read directly
+- Any task you can accomplish in 1-3 tool calls → do it yourself
+- Gathering context for a simple bug fix or small change → do it yourself
+
+CRITICAL — Subagents exist to FILTER and DISTILL information, not to relay it verbatim. Never instruct a subagent to return full file contents back to you. If you need the complete content of files, read them yourself. A subagent that returns full file contents defeats its entire purpose — it wastes time and tokens while providing zero context reduction. When using explore, your prompt should ask for specific answers, summaries, or relevant snippets — not raw file dumps.
+
+Usage notes:
+- Launch multiple agents concurrently whenever possible by using a single message with multiple tool uses
+- When the agent is done, it will return a single message back to you with its findings/results
+- Each agent invocation starts with a fresh context. Provide a highly detailed task description so the agent can work autonomously
+- The agent's outputs should generally be trusted
+- Clearly tell the agent whether you expect it to write code or just to do research

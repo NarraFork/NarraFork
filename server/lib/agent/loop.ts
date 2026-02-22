@@ -8,6 +8,9 @@ import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
+/** Tools that can safely run in parallel when multiple appear in the same turn. */
+const PARALLEL_TOOLS = new Set(["Task"]);
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -21,11 +24,16 @@ export async function* agentLoop(
 ): AsyncGenerator<AgentEvent> {
 	const provider = getProvider(config.provider);
 	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
+	const locale = (config.locale as Locale) ?? "en";
 	let allTools = toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable());
+
+	// Apply toolFilter if provided (used by subagents to restrict available tools)
+	if (config.toolFilter) {
+		allTools = allTools.filter(config.toolFilter);
+	}
 
 	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
 	if (config.planMode) {
-		const locale = (config.locale as Locale) ?? "en";
 		const disabledDesc = getToolMessage("planModeToolDisabled", locale);
 		allTools = allTools.map((t) =>
 			PLAN_MODE_ALLOWED_TOOLS.has(t.name)
@@ -172,33 +180,87 @@ export async function* agentLoop(
 
 		// Execute each tool call
 		pendingToolResults = [];
+		// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
+		const nudgeThreshold = Math.floor(maxTurns * 0.8);
+		const shouldNudge = turnIndex >= nudgeThreshold;
+		const nudgeText = shouldNudge
+			? getToolMessageWithParams("turnNudge", locale, {
+					turnIndex: turnIndex + 1,
+					maxTurns,
+				})
+			: "";
+
+		// Group tool calls into runs: consecutive Task calls form a parallel batch,
+		// everything else executes serially (one tool per group).
+		const groups: AgentToolUse[][] = [];
 		for (const tu of toolUses) {
+			const isParallel = PARALLEL_TOOLS.has(tu.name);
+			const lastGroup = groups[groups.length - 1];
+			if (isParallel && lastGroup && PARALLEL_TOOLS.has(lastGroup[0].name)) {
+				lastGroup.push(tu);
+			} else {
+				groups.push([tu]);
+			}
+		}
+
+		let toolIndex = 0;
+		for (const group of groups) {
 			if (config.signal.aborted) {
 				yield { type: "error", message: "Aborted" };
 				return;
 			}
 
-			yield {
-				type: "tool_call",
-				toolUseId: tu.toolUseId,
-				toolName: tu.name,
-				input: tu.input,
-			};
+			if (group.length === 1) {
+				// Serial execution (single tool)
+				const tu = group[0];
+				yield { type: "tool_call", toolUseId: tu.toolUseId, toolName: tu.name, input: tu.input };
 
-			const result = await executeTool(tu, config);
+				const result = await executeTool(tu, config);
+				const isLastTool = toolIndex === toolUses.length - 1;
+				const outputForModel =
+					isLastTool && shouldNudge ? result.output + nudgeText : result.output;
 
-			pendingToolResults.push(
-				provider.formatToolResult(tu.toolUseId, result.output, result.isError ?? false),
-			);
+				pendingToolResults.push(
+					provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
+				);
+				yield {
+					type: "tool_result",
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					output: result.output,
+					isError: result.isError ?? false,
+					durationMs: result.durationMs,
+				};
+				toolIndex++;
+			} else {
+				// Parallel execution (multiple Task calls)
+				for (const tu of group) {
+					yield { type: "tool_call", toolUseId: tu.toolUseId, toolName: tu.name, input: tu.input };
+				}
 
-			yield {
-				type: "tool_result",
-				toolUseId: tu.toolUseId,
-				toolName: tu.name,
-				output: result.output,
-				isError: result.isError ?? false,
-				durationMs: result.durationMs,
-			};
+				const results = await Promise.all(group.map((tu) => executeTool(tu, config)));
+
+				for (let j = 0; j < group.length; j++) {
+					const tu = group[j];
+					const result = results[j];
+					const isLastTool = toolIndex === toolUses.length - 1;
+					const outputForModel =
+						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
+
+					pendingToolResults.push(
+						provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
+					);
+					yield {
+						type: "tool_result",
+						toolUseId: tu.toolUseId,
+						toolName: tu.name,
+						output: result.output,
+						isError: result.isError ?? false,
+						durationMs: result.durationMs,
+					};
+					toolIndex++;
+				}
+			}
 		}
 
 		// Append assistant message to history for next turn
@@ -221,7 +283,6 @@ interface ToolExecResult {
 
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
 	const tool = toolRegistry.get(tu.name);
-	const start = Date.now();
 	const locale = (config.locale as Locale) ?? "en";
 
 	if (!tool) {
@@ -243,9 +304,12 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		return {
 			output: userMessage,
 			isError: true,
-			durationMs: Date.now() - start,
+			durationMs: 0,
 		};
 	}
+
+	// Start timing after permission is granted
+	const start = Date.now();
 
 	const effectiveInput = permission.updatedInput ?? tu.input;
 
@@ -276,12 +340,22 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		signal: config.signal,
 		locale: config.locale ?? "en",
 		requestPermission: config.permissionHandler,
+		currentToolUseId: tu.toolUseId,
 	};
 
 	try {
 		const result = await tool.execute(effectiveInput, ctx);
+		// If the tool already truncated its output, pass through as-is.
+		if (result.truncated) {
+			return {
+				output: result.output,
+				isError: result.isError,
+				durationMs: Date.now() - start,
+			};
+		}
+		const truncated = truncateOutput(result.output);
 		return {
-			output: truncateOutput(result.output),
+			output: truncated.content,
 			isError: result.isError,
 			durationMs: Date.now() - start,
 		};

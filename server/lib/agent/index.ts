@@ -1,8 +1,13 @@
+import { resolveProvider } from "../settings";
 import { getProvider } from "./provider";
 import { registerCoreTools } from "./tools";
+import { initTruncateCleanup } from "./truncate";
 
 // Auto-register core tools on module load
 registerCoreTools();
+
+// Start periodic cleanup of truncated output files
+initTruncateCleanup();
 
 export { agentLoop } from "./loop";
 export type { DbMessage, DbToolCall, ParsedStreamEvent, ProviderAdapter } from "./provider";
@@ -32,23 +37,12 @@ export async function buildHistory(
 	return getProvider(provider).buildHistory(dbMessages, model, narratorId);
 }
 
-/** Resolve provider name for a model by checking custom models in settings. */
-function resolveProviderForModel(model?: string): string {
-	try {
-		// Dynamic import to avoid circular dependency at module load time
-		const { settings } = require("../settings");
-		const custom = settings.agent?.customModels ?? [];
-		const found = custom.find((m: { value: string; provider?: string }) => m.value === model);
-	} catch {
-	}
-}
-
 /**
  * Simple text generation — no tools, no loop.
  * Routes to the correct provider based on the model.
  */
 export async function agentGenerate(text: string, model?: string): Promise<string> {
-	const provider = getProvider(resolveProviderForModel(model));
+	const provider = getProvider(resolveProvider(model));
 	return provider.generate(text, model ?? "claude-sonnet");
 }
 
@@ -56,7 +50,7 @@ export async function agentGenerateWithMeta(
 	text: string,
 	model?: string,
 ): Promise<{ text: string; contextPercent?: number }> {
-	const provider = getProvider(resolveProviderForModel(model));
+	const provider = getProvider(resolveProvider(model));
 	return provider.generateWithMeta(text, model ?? "claude-sonnet");
 }
 
@@ -70,6 +64,6 @@ export async function agentGenerateWithHistory(
 	model?: string,
 	locale?: string,
 ): Promise<string> {
-	const provider = getProvider(resolveProviderForModel(model));
+	const provider = getProvider(resolveProvider(model));
 	return provider.generateWithHistory(systemInstruction, content, model ?? "claude-sonnet", locale);
 }

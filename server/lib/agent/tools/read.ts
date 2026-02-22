@@ -1,6 +1,5 @@
 import { resolve } from "node:path";
 import { z } from "zod/v4";
-import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 
 export const readTool: ToolDefinition = {
@@ -33,7 +32,7 @@ export const readTool: ToolDefinition = {
 				.map((line, i) => `${String(start + i + 1).padStart(6)}│${line}`)
 				.join("\n");
 
-			return { output: truncateOutput(numbered || "(empty file)"), title: file_path };
+			return { output: numbered || "(empty file)", title: file_path };
 		} catch (err) {
 			return {
 				output: `Error reading ${file_path}: ${err instanceof Error ? err.message : String(err)}`,

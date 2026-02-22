@@ -16,6 +16,8 @@ export interface ToolContext {
 	) => Promise<PermissionResult>;
 	/** Emit progress updates for long-running tools */
 	emitProgress?: (toolUseId: string, elapsed: number) => void;
+	/** The toolUseId of the current tool execution (set by executeTool) */
+	currentToolUseId?: string;
 }
 
 export interface ToolResult {
@@ -23,6 +25,8 @@ export interface ToolResult {
 	isError?: boolean;
 	title?: string;
 	metadata?: Record<string, unknown>;
+	/** When true the output was already truncated by the tool itself — loop layer should skip re-truncation. */
+	truncated?: boolean;
 }
 
 export interface ToolDefinition {
@@ -86,6 +90,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"Bash",
+	"Task",
 ]);
 
 // === Agent config ===
@@ -101,6 +106,8 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	maxTurns?: number;
 	planMode?: boolean;
+	/** Filter tools available to this agent (subagent tool restriction) */
+	toolFilter?: (tool: ToolDefinition) => boolean;
 	permissionHandler: (
 		toolName: string,
 		input: Record<string, unknown>,
