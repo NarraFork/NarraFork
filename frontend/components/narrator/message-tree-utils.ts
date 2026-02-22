@@ -26,11 +26,13 @@ interface InfiniteCache {
 
 /** Insert a child message into the correct parent's children array in the cache */
 export function insertChildIntoCache(old: InfiniteCache, childMsg: TreeMessage): InfiniteCache {
+	let anyChanged = false;
 	const pages = old.pages.map((page) => {
 		const { messages, changed } = insertChildIntoMessages(page.messages, childMsg);
+		if (changed) anyChanged = true;
 		return changed ? { ...page, messages } : page;
 	});
-	return { ...old, pages };
+	return anyChanged ? { ...old, pages } : old;
 }
 
 function insertChildIntoMessages(
@@ -100,6 +102,7 @@ export function updateToolCallInTree(
 	toolUseId: string,
 	status: string,
 	output?: unknown,
+	durationMs?: number,
 ): { messages: TreeMessage[]; changed: boolean } {
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
@@ -111,7 +114,12 @@ export function updateToolCallInTree(
 			const updatedCalls = (msg.toolCalls as ToolCall[]).map((tc) => {
 				if (tc.toolUseId !== toolUseId) return tc;
 				msgChanged = true;
-				return { ...tc, status, outputJson: output ?? tc.outputJson };
+				return {
+					...tc,
+					status,
+					outputJson: output ?? tc.outputJson,
+					...(durationMs != null ? { durationMs } : {}),
+				};
 			});
 			if (msgChanged) {
 				anyChanged = true;
@@ -121,7 +129,7 @@ export function updateToolCallInTree(
 
 		// Recurse into children
 		if (msg.children?.length) {
-			const childResult = updateToolCallInTree(msg.children, toolUseId, status, output);
+			const childResult = updateToolCallInTree(msg.children, toolUseId, status, output, durationMs);
 			if (childResult.changed) {
 				anyChanged = true;
 				result = { ...result, children: childResult.messages };
@@ -228,6 +236,7 @@ function updateAtPath(
 	toolUseId: string,
 	status: string,
 	output: unknown | undefined,
+	durationMs?: number,
 ): TreeMessage[] {
 	if (path.length === 0) return messages;
 	const [idx, ...rest] = path;
@@ -240,7 +249,12 @@ function updateAtPath(
 		if (!(msg.toolCalls as ToolCall[])?.length) return messages;
 		const updatedCalls = (msg.toolCalls as ToolCall[]).map((tc) => {
 			if (tc.toolUseId !== toolUseId) return tc;
-			return { ...tc, status, outputJson: output ?? tc.outputJson };
+			return {
+				...tc,
+				status,
+				outputJson: output ?? tc.outputJson,
+				...(durationMs != null ? { durationMs } : {}),
+			};
 		});
 		updated[idx] = { ...msg, toolCalls: updatedCalls };
 	} else {
@@ -248,7 +262,7 @@ function updateAtPath(
 		if (!msg.children?.length) return messages;
 		updated[idx] = {
 			...msg,
-			children: updateAtPath(msg.children, rest, toolUseId, status, output),
+			children: updateAtPath(msg.children, rest, toolUseId, status, output, durationMs),
 		};
 	}
 	return updated;
@@ -261,6 +275,7 @@ export function updateToolCallByIndex(
 	status: string,
 	output: unknown | undefined,
 	index: MessageIndex,
+	durationMs?: number,
 ): InfiniteCache {
 	const entry = index.get(toolUseId);
 	if (!entry) {
@@ -268,7 +283,13 @@ export function updateToolCallByIndex(
 		if (!old?.pages?.length) return old;
 		let anyChanged = false;
 		const pages = old.pages.map((page) => {
-			const { messages, changed } = updateToolCallInTree(page.messages, toolUseId, status, output);
+			const { messages, changed } = updateToolCallInTree(
+				page.messages,
+				toolUseId,
+				status,
+				output,
+				durationMs,
+			);
 			if (changed) anyChanged = true;
 			return changed ? { ...page, messages } : page;
 		});
@@ -277,7 +298,7 @@ export function updateToolCallByIndex(
 
 	const pages = [...old.pages];
 	const page = { ...pages[entry.pageIdx] };
-	page.messages = updateAtPath(page.messages, entry.path, toolUseId, status, output);
+	page.messages = updateAtPath(page.messages, entry.path, toolUseId, status, output, durationMs);
 	pages[entry.pageIdx] = page;
 	return { ...old, pages };
 }

@@ -34,6 +34,8 @@ export type CodeContentType = "markdown" | "code" | "diff";
 interface ContentViewerProps {
 	/** Text content to display and copy */
 	content: string;
+	/** Full (untruncated) content shown only in fullscreen modal. Falls back to `content`. */
+	fullContent?: string;
 	/** Style applied to the Code block */
 	style?: CSSProperties;
 	/** Modal title when fullscreen */
@@ -118,7 +120,17 @@ export interface ContentViewerHandle {
 
 export const ContentViewer = memo(
 	forwardRef<ContentViewerHandle, ContentViewerProps>(function ContentViewer(
-		{ content, style, title, diff, markdown, contentType = "code", children, renderContent },
+		{
+			content,
+			fullContent,
+			style,
+			title,
+			diff,
+			markdown,
+			contentType = "code",
+			children,
+			renderContent,
+		},
 		ref,
 	) {
 		const { t } = useTranslation("common");
@@ -147,7 +159,7 @@ export const ContentViewer = memo(
 				userToggled.current = true;
 				setWordWrap((v) => !v);
 			},
-			getContent: () => content,
+			getContent: () => fullContent ?? content,
 		};
 
 		useImperativeHandle(ref, () => handle);
@@ -391,8 +403,8 @@ export const ContentViewer = memo(
 		const iconSize = isMobile ? 18 : 12;
 		const btnSize: "lg" | "xs" = isMobile ? "lg" : "xs";
 
-		const copyBtn = (
-			<CopyButton value={content}>
+		const makeCopyBtn = (value: string) => (
+			<CopyButton value={value}>
 				{({ copied, copy }) => (
 					<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
 						<ActionIcon
@@ -409,6 +421,10 @@ export const ContentViewer = memo(
 				)}
 			</CopyButton>
 		);
+		const copyBtn = makeCopyBtn(content);
+		/** Content used in fullscreen modal (untruncated when available) */
+		const modalContent = fullContent ?? content;
+		const modalCopyBtn = fullContent ? makeCopyBtn(modalContent) : copyBtn;
 
 		const fullscreenBtn = (
 			<Tooltip label={t("fullscreen")} withArrow position="top">
@@ -463,14 +479,14 @@ export const ContentViewer = memo(
 		) : null;
 
 		/** Render markdown or raw source depending on toggle */
-		const renderMarkdown = (extraStyle?: CSSProperties) =>
+		const renderMarkdown = (text: string, extraStyle?: CSSProperties) =>
 			showSource ? (
 				<Code block style={{ ...style, ...wrapStyle, ...extraStyle }}>
-					{content}
+					{text}
 				</Code>
 			) : (
 				<Box px="xs" py={4} style={{ minWidth: 0, ...extraStyle }}>
-					<MarkdownContent text={content} wordWrap={wordWrap} />
+					<MarkdownContent text={text} wordWrap={wordWrap} />
 				</Box>
 			);
 
@@ -525,7 +541,7 @@ export const ContentViewer = memo(
 						? renderContent(wordWrap)
 						: (children ??
 							(markdown ? (
-								renderMarkdown({
+								renderMarkdown(content, {
 									maxHeight: style?.maxHeight,
 									overflowY: style?.maxHeight ? "auto" : undefined,
 								})
@@ -663,7 +679,7 @@ export const ContentViewer = memo(
 					<div ref={modalBodyRef} style={modalToolbarStyle}>
 						{sourceToggle}
 						{wrapToggle}
-						{copyBtn}
+						{modalCopyBtn}
 						{isMobile && (
 							<Tooltip label={t("landscape")} withArrow position="top">
 								<ActionIcon
@@ -697,7 +713,7 @@ export const ContentViewer = memo(
 							/>
 						</Box>
 					) : markdown ? (
-						renderMarkdown({ flex: 1, minHeight: 0, overflow: "auto" })
+						renderMarkdown(modalContent, { flex: 1, minHeight: 0, overflow: "auto" })
 					) : (
 						<Code
 							block
@@ -711,7 +727,7 @@ export const ContentViewer = memo(
 								minHeight: 0,
 							}}
 						>
-							{content}
+							{modalContent}
 						</Code>
 					)}
 				</Modal>

@@ -1,4 +1,4 @@
-import { Box, useMantineColorScheme } from "@mantine/core";
+import { Badge, Box, useMantineColorScheme } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
@@ -178,7 +178,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 		const resizeRef = useRef<(cols: number, rows: number) => void>(() => {});
 
-		const { write, resize } = useTerminalWS(terminalId, {
+		const { write, resize, disconnected } = useTerminalWS(terminalId, {
 			onOutput: (data) => {
 				writingRef.current = true;
 				termRef.current?.write(data);
@@ -570,6 +570,22 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 							externalSelection={xtermSelection}
 							externalAnchor={selectionAnchor}
 						/>
+					)}
+					{disconnected && (
+						<Badge
+							size="xs"
+							variant="filled"
+							color="red"
+							style={{
+								position: "absolute",
+								top: 4,
+								right: 4,
+								zIndex: 10,
+								pointerEvents: "none",
+							}}
+						>
+							{t("disconnected")}
+						</Badge>
 					)}
 					{selHandles && (
 						<>
