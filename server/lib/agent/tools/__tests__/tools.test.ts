@@ -720,6 +720,132 @@ describe("Bash", () => {
 		// Should be killed before completing
 		expect(result.isError).toBe(true);
 	});
+
+	test("timeout appends bash_metadata", async () => {
+		const result = await bashTool.execute({ command: "sleep 10", timeout: 500 }, makeCtx());
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("<bash_metadata>");
+		expect(result.output).toContain("timed out");
+	});
+
+	test("abort kills process and reports in metadata", async () => {
+		const ac = new AbortController();
+		const ctx = makeCtx();
+		ctx.signal = ac.signal;
+		// Abort after 200ms
+		setTimeout(() => ac.abort(), 200);
+		const result = await bashTool.execute({ command: "sleep 10" }, ctx);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("<bash_metadata>");
+		expect(result.output).toContain("aborted");
+	});
+
+	test("kills child processes on timeout (no orphans)", async () => {
+		// Spawn a bash that forks a background child writing to a file
+		const marker = join(TEST_DIR, "orphan-marker");
+		const cmd = `bash -c 'while true; do echo x >> ${marker}; sleep 0.1; done' &\nsleep 10`;
+		const result = await bashTool.execute({ command: cmd, timeout: 600 }, makeCtx());
+		expect(result.isError).toBe(true);
+		// Wait a bit to see if the child is still writing
+		const sizeBefore = await Bun.file(marker)
+			.text()
+			.then((t) => t.length)
+			.catch(() => 0);
+		await Bun.sleep(500);
+		const sizeAfter = await Bun.file(marker)
+			.text()
+			.then((t) => t.length)
+			.catch(() => 0);
+		// If killTree worked, the child should have stopped writing
+		expect(sizeAfter).toBe(sizeBefore);
+	});
+
+	test("pre-aborted signal kills immediately", async () => {
+		const ac = new AbortController();
+		ac.abort(); // Already aborted
+		const ctx = makeCtx();
+		ctx.signal = ac.signal;
+		const start = Date.now();
+		const result = await bashTool.execute({ command: "sleep 10" }, ctx);
+		const elapsed = Date.now() - start;
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("aborted");
+		// Should finish quickly, not wait for sleep
+		expect(elapsed).toBeLessThan(3000);
+	});
+
+	test("negative timeout is clamped to 0", async () => {
+		const result = await bashTool.execute({ command: "sleep 10", timeout: -1 }, makeCtx());
+		expect(result.isError).toBe(true);
+	});
+
+	test("emitOutput is called with streaming output", async () => {
+		const chunks: string[] = [];
+		const ctx = makeCtx();
+		ctx.emitOutput = (output: string) => chunks.push(output);
+		await bashTool.execute({ command: "echo line1 && echo line2" }, ctx);
+		// emitOutput should have been called at least once with cumulative output
+		expect(chunks.length).toBeGreaterThanOrEqual(1);
+		const last = chunks[chunks.length - 1];
+		expect(last).toContain("line1");
+		expect(last).toContain("line2");
+	});
+
+	test("large output is truncated and marked", async () => {
+		// Generate output exceeding MAX_LINES (2000) / MAX_BYTES (50KB)
+		const result = await bashTool.execute({ command: "seq 1 3000" }, makeCtx());
+		expect(result.truncated).toBe(true);
+		expect(result.output).toContain("truncated");
+	});
+
+	test("workdir changes the working directory", async () => {
+		const result = await bashTool.execute({ command: "pwd", workdir: NESTED_DIR }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(result.output.trim()).toBe(NESTED_DIR);
+	});
+
+	test("workdir resolves relative paths against cwd", async () => {
+		const result = await bashTool.execute({ command: "pwd", workdir: "sub/dir" }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(result.output.trim()).toBe(NESTED_DIR);
+	});
+
+	test("description is used as title", async () => {
+		const result = await bashTool.execute(
+			{ command: "echo hello", description: "Prints greeting" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.title).toBe("Prints greeting");
+	});
+
+	test("title falls back to command when description is omitted", async () => {
+		const result = await bashTool.execute({ command: "echo hello" }, makeCtx());
+		expect(result.title).toBe("echo hello");
+	});
+
+	test("title falls back to command when description is empty string", async () => {
+		const result = await bashTool.execute({ command: "echo hello", description: "" }, makeCtx());
+		expect(result.title).toBe("echo hello");
+	});
+
+	test("returns fatal error for non-existent workdir", async () => {
+		const result = await bashTool.execute(
+			{ command: "pwd", workdir: "/no/such/directory" },
+			makeCtx(),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.fatal).toBe(true);
+		expect(result.output).toContain("does not exist");
+	});
+
+	test("workdir allows path traversal but resolves against cwd", async () => {
+		// ../  from TEST_DIR should resolve to its parent
+		const result = await bashTool.execute({ command: "pwd", workdir: ".." }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		const { dirname } = await import("node:path");
+		expect(result.output.trim()).toBe(dirname(TEST_DIR));
+	});
 });
 
 // ============================================================

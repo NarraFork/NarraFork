@@ -16,6 +16,8 @@ export interface ToolContext {
 	) => Promise<PermissionResult>;
 	/** Emit progress updates for long-running tools */
 	emitProgress?: (toolUseId: string, elapsed: number) => void;
+	/** Emit real-time output for streaming tool results (e.g. bash). Receives cumulative output. */
+	emitOutput?: (output: string) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
 	currentToolUseId?: string;
 }
@@ -27,6 +29,8 @@ export interface ToolResult {
 	metadata?: Record<string, unknown>;
 	/** When true the output was already truncated by the tool itself — loop layer should skip re-truncation. */
 	truncated?: boolean;
+	/** When true the error is unrecoverable — the agent loop should stop immediately without further tool calls. */
+	fatal?: boolean;
 }
 
 export interface ToolDefinition {
@@ -42,7 +46,7 @@ export interface ToolDefinition {
 
 export type PermissionResult =
 	| { behavior: "allow"; updatedInput?: Record<string, unknown> }
-	| { behavior: "deny"; message?: string };
+	| { behavior: "deny"; message?: string; fatal?: boolean };
 
 // === Agent events (yielded by the loop) ===
 
@@ -64,6 +68,7 @@ export type AgentEvent =
 			durationMs: number;
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
+	| { type: "tool_output"; toolUseId: string; output: string }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
 	| { type: "stream_reasoning"; text: string }

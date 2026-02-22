@@ -8,6 +8,12 @@ import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
+/** Max size of output pushed via tool_output events (UI preview only). */
+const MAX_STREAM_OUTPUT_LENGTH = 30_000;
+
+/** Minimum interval between tool_output events (ms). */
+const OUTPUT_THROTTLE_MS = 100;
+
 /** Tools that can safely run in parallel when multiple appear in the same turn. */
 const PARALLEL_TOOLS = new Set(["Task"]);
 
@@ -232,6 +238,11 @@ export async function* agentLoop(
 					durationMs: result.durationMs,
 				};
 				toolIndex++;
+
+				if (result.fatal) {
+					yield { type: "error", message: result.output };
+					return;
+				}
 			} else {
 				// Parallel execution (multiple Task calls)
 				for (const tu of group) {
@@ -239,6 +250,7 @@ export async function* agentLoop(
 				}
 
 				const results = await Promise.all(group.map((tu) => executeTool(tu, config)));
+				let hasFatal = false;
 
 				for (let j = 0; j < group.length; j++) {
 					const tu = group[j];
@@ -259,6 +271,14 @@ export async function* agentLoop(
 						durationMs: result.durationMs,
 					};
 					toolIndex++;
+
+					if (result.fatal) hasFatal = true;
+				}
+
+				if (hasFatal) {
+					const fatalMsg = results.find((r) => r.fatal)?.output ?? "Fatal tool error";
+					yield { type: "error", message: fatalMsg };
+					return;
 				}
 			}
 		}
@@ -279,6 +299,7 @@ interface ToolExecResult {
 	output: string;
 	isError?: boolean;
 	durationMs: number;
+	fatal?: boolean;
 }
 
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
@@ -305,6 +326,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			output: userMessage,
 			isError: true,
 			durationMs: 0,
+			fatal: permission.fatal,
 		};
 	}
 
@@ -343,6 +365,40 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		currentToolUseId: tu.toolUseId,
 	};
 
+	// Wire up emitOutput: throttled streaming of tool output to the UI
+	let pendingOutputTimer: ReturnType<typeof setTimeout> | undefined;
+	if (config.onEvent) {
+		const onEvent = config.onEvent;
+		let lastEmitTime = 0;
+		let latestOutput = "";
+
+		const flush = () => {
+			lastEmitTime = Date.now();
+			onEvent({ type: "tool_output", toolUseId: tu.toolUseId, output: latestOutput });
+		};
+
+		ctx.emitOutput = (output: string) => {
+			latestOutput =
+				output.length > MAX_STREAM_OUTPUT_LENGTH
+					? `${output.slice(0, MAX_STREAM_OUTPUT_LENGTH)}\n\n...`
+					: output;
+
+			const elapsed = Date.now() - lastEmitTime;
+			if (elapsed >= OUTPUT_THROTTLE_MS) {
+				if (pendingOutputTimer) {
+					clearTimeout(pendingOutputTimer);
+					pendingOutputTimer = undefined;
+				}
+				flush();
+			} else if (!pendingOutputTimer) {
+				pendingOutputTimer = setTimeout(() => {
+					pendingOutputTimer = undefined;
+					flush();
+				}, OUTPUT_THROTTLE_MS - elapsed);
+			}
+		};
+	}
+
 	try {
 		const result = await tool.execute(effectiveInput, ctx);
 		// If the tool already truncated its output, pass through as-is.
@@ -350,6 +406,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			return {
 				output: result.output,
 				isError: result.isError,
+				fatal: result.fatal,
 				durationMs: Date.now() - start,
 			};
 		}
@@ -357,6 +414,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		return {
 			output: truncated.content,
 			isError: result.isError,
+			fatal: result.fatal,
 			durationMs: Date.now() - start,
 		};
 	} catch (err) {
@@ -367,5 +425,6 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		};
 	} finally {
 		if (progressTimer) clearInterval(progressTimer);
+		if (pendingOutputTimer) clearTimeout(pendingOutputTimer);
 	}
 }
