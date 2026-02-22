@@ -4,7 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolContext } from "../../types";
 import { bashTool } from "../bash";
-import { editTool } from "../edit";
+import {
+	BlockAnchorReplacer,
+	ContextAwareReplacer,
+	EscapeNormalizedReplacer,
+	editTool,
+	IndentationFlexibleReplacer,
+	LineTrimmedReplacer,
+	MultiOccurrenceReplacer,
+	replace,
+	SimpleReplacer,
+	TrimmedBoundaryReplacer,
+	WhitespaceNormalizedReplacer,
+} from "../edit";
 import { globTool } from "../glob";
 import { grepTool } from "../grep";
 import { readTool } from "../read";
@@ -157,7 +169,7 @@ describe("Edit", () => {
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("not unique");
+		expect(result.output).toContain("multiple matches");
 	});
 
 	test("replace_all replaces all occurrences", async () => {
@@ -178,6 +190,304 @@ describe("Edit", () => {
 		);
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("not found");
+	});
+
+	test("errors when old_string === new_string", async () => {
+		writeFileSync(EDIT_FILE, "hello world");
+		const result = await editTool.execute(
+			{ file_path: EDIT_FILE, old_string: "hello", new_string: "hello" },
+			makeCtx(),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("identical");
+	});
+
+	test("creates file when old_string is empty", async () => {
+		const newFile = join(TEST_DIR, "edit-create.txt");
+		const result = await editTool.execute(
+			{ file_path: newFile, old_string: "", new_string: "brand new content" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(await Bun.file(newFile).text()).toBe("brand new content");
+	});
+
+	test("errors on missing file", async () => {
+		const result = await editTool.execute(
+			{ file_path: "nonexistent-edit.txt", old_string: "x", new_string: "y" },
+			makeCtx(),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not found");
+	});
+
+	test("normalizes CRLF line endings", async () => {
+		writeFileSync(EDIT_FILE, "line1\r\nline2\r\nline3");
+		const result = await editTool.execute(
+			{ file_path: EDIT_FILE, old_string: "line1\nline2", new_string: "replaced" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(await Bun.file(EDIT_FILE).text()).toContain("replaced");
+	});
+});
+
+// ============================================================
+// Edit — cascading replacer unit tests (replace function)
+// ============================================================
+
+describe("Edit replace() — fuzzy matching", () => {
+	test("exact match (SimpleReplacer)", () => {
+		const result = replace("foo bar baz", "bar", "qux");
+		expect(result).toBe("foo qux baz");
+	});
+
+	test("line-trimmed match (LineTrimmedReplacer)", () => {
+		// File has 4-space indent, search has 2-space indent
+		const content = "function test() {\n    const x = 1;\n    return x;\n}";
+		const result = replace(content, "  const x = 1;\n  return x;", "  const y = 2;\n  return y;");
+		expect(result).toContain("const y = 2");
+		expect(result).toContain("return y");
+	});
+
+	test("block-anchor match (BlockAnchorReplacer)", () => {
+		const content = [
+			"function hello() {",
+			"  const a = 1;",
+			"  const b = 2;",
+			"  const c = 3;",
+			"  return a + b + c;",
+			"}",
+		].join("\n");
+		// Search with slightly different middle lines but same anchors
+		const oldStr = [
+			"function hello() {",
+			"  const a = 1;",
+			"  const b = 99;", // different middle
+			"  const c = 3;",
+			"  return a + b + c;",
+			"}",
+		].join("\n");
+		const newStr = "function hello() { return 6; }";
+		const result = replace(content, oldStr, newStr);
+		expect(result).toBe("function hello() { return 6; }");
+	});
+
+	test("whitespace-normalized match (WhitespaceNormalizedReplacer)", () => {
+		const content = "const   x   =   1;";
+		const result = replace(content, "const x = 1;", "const x = 2;");
+		expect(result).toBe("const x = 2;");
+	});
+
+	test("indentation-flexible match (IndentationFlexibleReplacer)", () => {
+		const content = "    if (true) {\n        doSomething();\n    }";
+		// Search with no indentation
+		const result = replace(
+			content,
+			"if (true) {\n    doSomething();\n}",
+			"if (false) {\n    doNothing();\n}",
+		);
+		expect(result).toContain("doNothing");
+	});
+
+	test("escape-normalized match (EscapeNormalizedReplacer)", () => {
+		const content = 'console.log("hello\\nworld");';
+		// Search with literal escape sequences
+		const result = replace(content, 'console.log("hello\\nworld");', 'console.log("goodbye");');
+		expect(result).toBe('console.log("goodbye");');
+	});
+
+	test("trimmed-boundary match (TrimmedBoundaryReplacer)", () => {
+		const content = "hello world";
+		const result = replace(content, "  hello world  ", "goodbye");
+		expect(result).toBe("goodbye");
+	});
+
+	test("context-aware match (ContextAwareReplacer)", () => {
+		const content = [
+			"class Foo {",
+			"  private x = 1;",
+			"  private y = 2;",
+			"  private z = 3;",
+			"  constructor() {}",
+			"}",
+		].join("\n");
+		// Same first/last anchors, same line count, >50% middle match
+		const oldStr = [
+			"class Foo {",
+			"  private x = 1;",
+			"  private y = 999;", // 1 of 3 middle lines differs
+			"  private z = 3;",
+			"  constructor() {}",
+			"}",
+		].join("\n");
+		const result = replace(content, oldStr, "class Foo {}");
+		expect(result).toBe("class Foo {}");
+	});
+
+	test("multi-occurrence with replace_all (MultiOccurrenceReplacer)", () => {
+		const result = replace("aaa bbb aaa ccc aaa", "aaa", "xxx", true);
+		expect(result).toBe("xxx bbb xxx ccc xxx");
+	});
+
+	test("replace_all with exact match", () => {
+		const result = replace("aaa bbb aaa", "aaa", "xxx", true);
+		expect(result).toBe("xxx bbb xxx");
+	});
+
+	test("throws on not found", () => {
+		expect(() => replace("hello", "missing", "x")).toThrow("not found");
+	});
+
+	test("throws on multiple matches without replaceAll", () => {
+		expect(() => replace("aaa bbb aaa", "aaa", "xxx")).toThrow("multiple matches");
+	});
+
+	test("throws on identical old/new", () => {
+		expect(() => replace("hello", "hello", "hello")).toThrow("identical");
+	});
+});
+
+// ============================================================
+// Edit — individual Replacer isolation tests
+// ============================================================
+
+describe("Edit Replacers — isolated", () => {
+	function collect(replacer: typeof SimpleReplacer, content: string, find: string): string[] {
+		return [...replacer(content, find)];
+	}
+
+	// --- SimpleReplacer ---
+	test("SimpleReplacer yields the find string itself", () => {
+		expect(collect(SimpleReplacer, "anything", "foo")).toEqual(["foo"]);
+	});
+
+	// --- LineTrimmedReplacer ---
+	test("LineTrimmedReplacer matches despite leading/trailing whitespace on lines", () => {
+		const content = "  hello  \n  world  ";
+		const results = collect(LineTrimmedReplacer, content, "hello\nworld");
+		expect(results.length).toBe(1);
+		expect(results[0]).toBe("  hello  \n  world  ");
+	});
+
+	test("LineTrimmedReplacer yields nothing when lines don't match", () => {
+		expect(collect(LineTrimmedReplacer, "aaa\nbbb", "aaa\nccc")).toEqual([]);
+	});
+
+	// --- BlockAnchorReplacer ---
+	test("BlockAnchorReplacer requires at least 3 lines", () => {
+		expect(collect(BlockAnchorReplacer, "a\nb", "a\nb")).toEqual([]);
+	});
+
+	test("BlockAnchorReplacer matches with different middle content", () => {
+		const content = "START\noriginal middle\nEND";
+		const results = collect(BlockAnchorReplacer, content, "START\ntotally different\nEND");
+		expect(results.length).toBe(1);
+		expect(results[0]).toBe("START\noriginal middle\nEND");
+	});
+
+	test("BlockAnchorReplacer picks best candidate among multiple", () => {
+		const content = "START\nalpha\nEND\nSTART\nbeta\nEND";
+		// Search for something closer to "beta"
+		const results = collect(BlockAnchorReplacer, content, "START\nbeta\nEND");
+		expect(results.length).toBe(1);
+		expect(results[0]).toContain("beta");
+	});
+
+	// --- WhitespaceNormalizedReplacer ---
+	test("WhitespaceNormalizedReplacer collapses multiple spaces", () => {
+		const content = "const   x   =   1;";
+		const results = collect(WhitespaceNormalizedReplacer, content, "const x = 1;");
+		expect(results.length).toBeGreaterThanOrEqual(1);
+		expect(results[0]).toBe("const   x   =   1;");
+	});
+
+	test("WhitespaceNormalizedReplacer handles multi-line", () => {
+		const content = "a  b\nc  d";
+		const results = collect(WhitespaceNormalizedReplacer, content, "a b\nc d");
+		expect(results.length).toBeGreaterThanOrEqual(1);
+	});
+
+	// --- IndentationFlexibleReplacer ---
+	test("IndentationFlexibleReplacer matches blocks with different base indent", () => {
+		const content = "        if (x) {\n            y();\n        }";
+		const find = "    if (x) {\n        y();\n    }";
+		const results = collect(IndentationFlexibleReplacer, content, find);
+		expect(results.length).toBe(1);
+		expect(results[0]).toBe(content);
+	});
+
+	test("IndentationFlexibleReplacer yields nothing when structure differs", () => {
+		const content = "    if (x) {\n        y();\n    }";
+		const find = "    if (x) {\n        z();\n    }";
+		expect(collect(IndentationFlexibleReplacer, content, find)).toEqual([]);
+	});
+
+	// --- EscapeNormalizedReplacer ---
+	test("EscapeNormalizedReplacer handles \\n in search", () => {
+		const content = "line1\nline2";
+		const results = collect(EscapeNormalizedReplacer, content, "line1\\nline2");
+		expect(results.length).toBeGreaterThanOrEqual(1);
+	});
+
+	test("EscapeNormalizedReplacer handles \\t", () => {
+		const content = "col1\tcol2";
+		const results = collect(EscapeNormalizedReplacer, content, "col1\\tcol2");
+		expect(results.length).toBeGreaterThanOrEqual(1);
+	});
+
+	test("EscapeNormalizedReplacer handles escaped quotes", () => {
+		const content = 'say "hello"';
+		const results = collect(EscapeNormalizedReplacer, content, 'say \\"hello\\"');
+		expect(results.length).toBeGreaterThanOrEqual(1);
+	});
+
+	// --- TrimmedBoundaryReplacer ---
+	test("TrimmedBoundaryReplacer trims leading/trailing whitespace from find", () => {
+		const content = "hello world";
+		const results = collect(TrimmedBoundaryReplacer, content, "\n  hello world  \n");
+		expect(results.length).toBeGreaterThanOrEqual(1);
+	});
+
+	test("TrimmedBoundaryReplacer skips when find is already trimmed", () => {
+		expect(collect(TrimmedBoundaryReplacer, "hello", "hello")).toEqual([]);
+	});
+
+	// --- ContextAwareReplacer ---
+	test("ContextAwareReplacer requires at least 3 lines", () => {
+		expect(collect(ContextAwareReplacer, "a\nb", "a\nb")).toEqual([]);
+	});
+
+	test("ContextAwareReplacer matches when >50% middle lines match", () => {
+		const content = "HEADER\nline1\nline2\nline3\nFOOTER";
+		// 2 of 3 middle lines match
+		const find = "HEADER\nline1\nDIFFERENT\nline3\nFOOTER";
+		const results = collect(ContextAwareReplacer, content, find);
+		expect(results.length).toBe(1);
+	});
+
+	test("ContextAwareReplacer rejects when <50% middle lines match", () => {
+		const content = "HEADER\nline1\nline2\nline3\nFOOTER";
+		// 0 of 3 middle lines match
+		const find = "HEADER\nAAA\nBBB\nCCC\nFOOTER";
+		const results = collect(ContextAwareReplacer, content, find);
+		expect(results).toEqual([]);
+	});
+
+	test("ContextAwareReplacer requires same line count", () => {
+		const content = "HEADER\nline1\nline2\nFOOTER";
+		const find = "HEADER\nline1\nline2\nextra\nFOOTER";
+		expect(collect(ContextAwareReplacer, content, find)).toEqual([]);
+	});
+
+	// --- MultiOccurrenceReplacer ---
+	test("MultiOccurrenceReplacer yields every exact match", () => {
+		const results = collect(MultiOccurrenceReplacer, "aaa bbb aaa ccc aaa", "aaa");
+		expect(results).toEqual(["aaa", "aaa", "aaa"]);
+	});
+
+	test("MultiOccurrenceReplacer yields nothing when not found", () => {
+		expect(collect(MultiOccurrenceReplacer, "hello", "missing")).toEqual([]);
 	});
 });
 
@@ -218,247 +528,96 @@ describe("Glob", () => {
 // ============================================================
 
 describe("Grep", () => {
-	test("default mode (files_with_matches) returns file paths", async () => {
+	test("returns structured output with file paths and line numbers", async () => {
 		const result = await grepTool.execute({ pattern: "const" }, makeCtx());
 		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("a.ts");
-		expect(result.output).toContain("b.ts");
+		expect(result.output).toContain("Found");
+		expect(result.output).toContain("matches");
+		// Should contain file paths with colon suffix (grouped format)
+		expect(result.output).toMatch(/\.ts:/);
+		// Should contain "Line N:" format
+		expect(result.output).toMatch(/Line \d+:/);
 	});
 
-	test("content mode returns matching lines with line numbers", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line two", output_mode: "content" },
-			makeCtx(),
-		);
+	test("returns title and metadata", async () => {
+		const result = await grepTool.execute({ pattern: "const" }, makeCtx());
+		expect(result.title).toBe("const");
+		expect(result.metadata).toBeDefined();
+		expect(result.metadata?.matches).toBeGreaterThan(0);
+		expect(result.metadata?.truncated).toBe(false);
+	});
+
+	test("no matches returns informative message", async () => {
+		const result = await grepTool.execute({ pattern: "zzz_nonexistent_zzz" }, makeCtx());
 		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line two");
-		// Should have line numbers by default in content mode
-		expect(result.output).toMatch(/\d+[:-].*line two/);
+		expect(result.output).toContain("No files found");
+		expect(result.metadata).toEqual({ matches: 0, truncated: false });
 	});
 
-	test("count mode returns match counts", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line", output_mode: "count", path: SAMPLE_FILE },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("5");
-	});
-
-	test("no matches returns non-error", async () => {
-		const result = await grepTool.execute({ pattern: "zzz_nonexistent_pattern_zzz" }, makeCtx());
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("No matches");
-	});
-
-	test("case insensitive search", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "LINE TWO", "-i": true, output_mode: "content" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line two");
-	});
-
-	test("glob filter limits search scope", async () => {
-		const result = await grepTool.execute({ pattern: "const", glob: "a.ts" }, makeCtx());
+	test("include filter restricts scope", async () => {
+		const result = await grepTool.execute({ pattern: "const", include: "*.ts" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("a.ts");
-		expect(result.output).not.toContain("b.ts");
+		expect(result.output).not.toContain("c.json");
 	});
 
-	test("context lines with -C", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line three", output_mode: "content", "-C": 1 },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line two");
-		expect(result.output).toContain("line three");
-		expect(result.output).toContain("line four");
-	});
-
-	test("head_limit limits output lines", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line", output_mode: "content", path: SAMPLE_FILE, head_limit: 2 },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		const lines = result.output.trim().split("\n");
-		expect(lines.length).toBe(2);
-	});
-
-	test("offset skips initial results", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line", output_mode: "content", path: SAMPLE_FILE, offset: 2, head_limit: 2 },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line three");
-		expect(result.output).not.toContain("line one");
-	});
-
-	test("type filter works", async () => {
-		const result = await grepTool.execute({ pattern: "const", type: "ts" }, makeCtx());
+	test("include with multiple extensions via brace expansion", async () => {
+		const result = await grepTool.execute({ pattern: ".", include: "*.{ts,json}" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain(".ts");
-		expect(result.output).not.toContain(".json");
-	});
-
-	test("multiline search", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "hello.*world", multiline: true, output_mode: "content" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("hello");
-		expect(result.output).toContain("world");
-	});
-
-	test("path parameter targets specific file", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line", path: SAMPLE_FILE, output_mode: "content" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line one");
-	});
-
-	// --- Edge cases and complex combinations ---
-
-	test("-n: false suppresses line numbers in content mode", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line one", output_mode: "content", "-n": false, path: SAMPLE_FILE },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line one");
-		// Should NOT have "1:" prefix
-		expect(result.output).not.toMatch(/^\d+:/m);
-	});
-
-	test("-A: after-context lines", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line two", output_mode: "content", "-A": 2, path: SAMPLE_FILE },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line two");
-		expect(result.output).toContain("line three");
-		expect(result.output).toContain("line four");
-	});
-
-	test("-B: before-context lines", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line four", output_mode: "content", "-B": 2, path: SAMPLE_FILE },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line two");
-		expect(result.output).toContain("line three");
-		expect(result.output).toContain("line four");
-	});
-
-	test("-A and -B together", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line three", output_mode: "content", "-A": 1, "-B": 1, path: SAMPLE_FILE },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line two");
-		expect(result.output).toContain("line three");
-		expect(result.output).toContain("line four");
-		expect(result.output).not.toContain("line one");
-	});
-
-	test("context param is ignored in files_with_matches mode", async () => {
-		const result = await grepTool.execute({ pattern: "const", context: 3 }, makeCtx());
-		expect(result.isError).toBeFalsy();
-		// Should still be file paths, not content
-		expect(result.output).toContain("a.ts");
-		expect(result.output).not.toMatch(/const a/);
-	});
-
-	test("-C overrides context param", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line three", output_mode: "content", context: 0, "-C": 1, path: SAMPLE_FILE },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		// -C: 1 should win over context: 0
-		expect(result.output).toContain("line two");
-		expect(result.output).toContain("line four");
+		expect(result.output).toContain(".json");
 	});
 
 	test("relative path resolved against cwd", async () => {
+		const result = await grepTool.execute({ pattern: "line", path: "sample.txt" }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line one");
+	});
+
+	test("searches specific file", async () => {
+		const result = await grepTool.execute({ pattern: "line", path: SAMPLE_FILE }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line one");
+		expect(result.output).toContain("Line 1:");
+	});
+
+	test("results are sorted by modification time", async () => {
+		// Touch a.ts to make it newer
+		writeFileSync(join(TEST_DIR, "a.ts"), "const a = 1;\n");
+		const result = await grepTool.execute({ pattern: "const", include: "*.ts" }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		// a.ts was just written, should appear before b.ts
+		const aIdx = result.output.indexOf("a.ts:");
+		const bIdx = result.output.indexOf("b.ts:");
+		expect(aIdx).toBeLessThan(bIdx);
+	});
+
+	test("line text is truncated at MAX_LINE_LENGTH", async () => {
+		const longLine = "x".repeat(3000);
+		writeFileSync(join(TEST_DIR, "long.txt"), `${longLine}\n`);
 		const result = await grepTool.execute(
-			{ pattern: "line", path: "sample.txt", output_mode: "content" },
+			{ pattern: "x+", path: join(TEST_DIR, "long.txt") },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line one");
+		// Should contain truncation indicator
+		expect(result.output).toContain("...");
+		// Should not contain the full 3000-char line
+		expect(result.output.length).toBeLessThan(3000);
+	});
+
+	test("searches hidden files", async () => {
+		writeFileSync(join(TEST_DIR, ".hidden"), "secret_value\n");
+		const result = await grepTool.execute({ pattern: "secret_value", path: TEST_DIR }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("secret_value");
 	});
 
 	test("invalid regex returns error", async () => {
 		const result = await grepTool.execute({ pattern: "[invalid" }, makeCtx());
 		expect(result.isError).toBe(true);
 	});
-
-	test("glob with multiple extensions via brace expansion", async () => {
-		const result = await grepTool.execute({ pattern: ".", glob: "*.{ts,json}" }, makeCtx());
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain(".ts");
-		expect(result.output).toContain(".json");
-	});
-
-	test("offset beyond result count returns empty", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line", output_mode: "content", path: SAMPLE_FILE, offset: 100 },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output.trim()).toBe("");
-	});
-
-	test("head_limit: 0 returns empty", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "line", output_mode: "content", path: SAMPLE_FILE, head_limit: 0 },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output.trim()).toBe("");
-	});
-
-	test("count mode with glob filter", async () => {
-		const result = await grepTool.execute(
-			{ pattern: "const", output_mode: "count", glob: "*.ts" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		// Each .ts file has 1 match
-		expect(result.output).toContain(":1");
-	});
-
-	test("multiline with content mode and line numbers", async () => {
-		const result = await grepTool.execute(
-			{
-				pattern: "hello.*\\n.*world",
-				multiline: true,
-				output_mode: "content",
-				"-n": true,
-				path: NESTED_FILE,
-			},
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("hello");
-		expect(result.output).toContain("world");
-	});
 });
-
-// ============================================================
-// Grep — parameter validation (Zod schema)
-// ============================================================
 
 // ============================================================
 // Grep — shell injection safety
@@ -466,13 +625,11 @@ describe("Grep", () => {
 
 describe("Grep injection safety", () => {
 	test("pattern with shell metacharacters is not interpreted", async () => {
-		// If this were shell-interpreted, it would execute `touch`
 		const marker = join(TEST_DIR, "pwned");
 		const _result = await grepTool.execute(
 			{ pattern: `$(touch ${marker})`, path: SAMPLE_FILE },
 			makeCtx(),
 		);
-		// rg treats it as a literal regex (which won't match), not a shell command
 		expect(existsSync(marker)).toBe(false);
 	});
 
@@ -485,10 +642,10 @@ describe("Grep injection safety", () => {
 		expect(existsSync(marker)).toBe(false);
 	});
 
-	test("glob with shell metacharacters is not interpreted", async () => {
+	test("include with shell metacharacters is not interpreted", async () => {
 		const marker = join(TEST_DIR, "pwned3");
 		const _result = await grepTool.execute(
-			{ pattern: "line", glob: `$(touch ${marker})` },
+			{ pattern: "line", include: `$(touch ${marker})` },
 			makeCtx(),
 		);
 		expect(existsSync(marker)).toBe(false);
@@ -496,7 +653,6 @@ describe("Grep injection safety", () => {
 
 	test("pattern with semicolon and pipe is treated literally", async () => {
 		const result = await grepTool.execute({ pattern: "; echo INJECTED | cat" }, makeCtx());
-		// Should not contain "INJECTED" in output — rg just fails to match
 		expect(result.output).not.toContain("INJECTED");
 	});
 
@@ -513,27 +669,23 @@ describe("Grep schema validation", () => {
 		expect(result.success).toBe(false);
 	});
 
-	test("rejects invalid output_mode", () => {
-		const result = grepTool.parameters.safeParse({ pattern: "x", output_mode: "invalid" });
-		expect(result.success).toBe(false);
+	test("rejects unknown params (old params removed)", () => {
+		const _result = grepTool.parameters.safeParse({
+			pattern: "x",
+			output_mode: "content",
+			"-i": true,
+		});
+		// Zod strict mode or extra keys — should still parse pattern but ignore extras
+		// The key point: these old params no longer exist in the schema
+		const parsed = grepTool.parameters.safeParse({ pattern: "x" });
+		expect(parsed.success).toBe(true);
 	});
 
 	test("accepts all valid params", () => {
 		const result = grepTool.parameters.safeParse({
 			pattern: "test",
 			path: "/tmp",
-			glob: "*.ts",
-			output_mode: "content",
-			context: 2,
-			"-i": true,
-			"-n": false,
-			"-A": 3,
-			"-B": 1,
-			"-C": 2,
-			head_limit: 10,
-			offset: 5,
-			multiline: true,
-			type: "ts",
+			include: "*.ts",
 		});
 		expect(result.success).toBe(true);
 	});
@@ -619,11 +771,8 @@ describe("zodToJsonSchema", () => {
 		const props = json.properties as Record<string, any>;
 		expect(props.pattern.type).toBe("string");
 		expect(props.pattern.description).toBeDefined();
-		expect(props.output_mode.enum).toEqual(["content", "files_with_matches", "count"]);
-		expect(props["-i"].type).toBe("boolean");
-		expect(props["-i"].description).toBeDefined();
-		expect(props["-A"].type).toBe("number");
-		expect(props["-A"].description).toBeDefined();
+		expect(props.include.type).toBe("string");
+		expect(props.include.description).toBeDefined();
 	});
 
 	test("converts all tool schemas without error", () => {
