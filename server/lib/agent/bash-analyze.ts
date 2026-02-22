@@ -47,6 +47,7 @@ const SAFE_COMMANDS = new Set([
 	"git",
 	// 文件浏览（只读）
 	"ls",
+	"tree",
 	"pwd",
 	"cat",
 	"head",
