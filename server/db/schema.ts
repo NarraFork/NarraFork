@@ -8,8 +8,6 @@ export const projects = sqliteTable("projects", {
 	status: text("status", { enum: ["active", "archived"] })
 		.notNull()
 		.default("active"),
-	defaultAgent: text("default_agent", { enum: ["claude", "opencode"] }).default("claude"),
-	settings: text("settings", { mode: "json" }),
 	gitPath: text("git_path"),
 	remoteUrl: text("remote_url"),
 	defaultBranch: text("default_branch").default("main"),
@@ -54,33 +52,6 @@ export const chapters = sqliteTable(
 	],
 );
 
-// === conversation_branches ===
-export const conversationBranches = sqliteTable(
-	"conversation_branches",
-	{
-		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.references(() => narrators.id),
-		name: text("name").notNull(),
-		forkMessageId: text("fork_message_id"),
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		parentBranchId: text("parent_branch_id").references((): any => conversationBranches.id),
-		apiConversationId: text("api_conversation_id"),
-		contextSummary: text("context_summary"),
-		status: text("status", { enum: ["active", "archived"] })
-			.notNull()
-			.default("active"),
-		messageCount: integer("message_count").default(0),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_branches_narrator").on(table.narratorId),
-		index("idx_branches_parent").on(table.parentBranchId),
-	],
-);
-
 // === narrators ===
 export const narrators = sqliteTable(
 	"narrators",
@@ -88,10 +59,12 @@ export const narrators = sqliteTable(
 		id: text("id").primaryKey(),
 		chapterId: text("chapter_id").references(() => chapters.id),
 		apiConversationId: text("api_conversation_id"),
-		activeBranchId: text("active_branch_id"),
-		type: text("type", { enum: ["primary", "secondary"] })
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
+		forkMessageId: text("fork_message_id").references((): any => narratorMessages.id),
+		type: text("type", { enum: ["primary", "secondary", "subagent"] })
 			.notNull()
 			.default("primary"),
+		subagentType: text("subagent_type", { enum: ["explore", "plan", "general"] }),
 		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
@@ -120,7 +93,10 @@ export const narrators = sqliteTable(
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
-	(table) => [index("idx_narrators_chapter").on(table.chapterId)],
+	(table) => [
+		index("idx_narrators_chapter").on(table.chapterId),
+		index("idx_narrators_parent").on(table.parentNarratorId),
+	],
 );
 
 // === narrator_messages ===
@@ -151,14 +127,14 @@ export const narratorMessages = sqliteTable(
 	],
 );
 
-// === branch_messages (junction table) ===
-export const branchMessages = sqliteTable(
-	"branch_messages",
+// === narrator_message_refs (junction table) ===
+export const narratorMessageRefs = sqliteTable(
+	"narrator_message_refs",
 	{
 		id: text("id").primaryKey(),
-		branchId: text("branch_id")
+		narratorId: text("narrator_id")
 			.notNull()
-			.references(() => conversationBranches.id),
+			.references(() => narrators.id),
 		messageId: text("message_id")
 			.notNull()
 			.references(() => narratorMessages.id),
@@ -166,9 +142,9 @@ export const branchMessages = sqliteTable(
 		isCompact: integer("is_compact").notNull().default(0),
 	},
 	(table) => [
-		uniqueIndex("idx_branch_messages_unique").on(table.branchId, table.messageId),
-		index("idx_branch_messages_seq").on(table.branchId, table.seq),
-		index("idx_branch_messages_message").on(table.messageId),
+		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
+		index("idx_narrator_refs_seq").on(table.narratorId, table.seq),
+		index("idx_narrator_refs_message").on(table.messageId),
 	],
 );
 
@@ -314,8 +290,6 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
-	showSessionCost: integer("show_session_cost", { mode: "boolean" }).notNull().default(false),
-	showMessageCost: integer("show_message_cost", { mode: "boolean" }).notNull().default(false),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	createdAt: text("created_at").notNull(),
