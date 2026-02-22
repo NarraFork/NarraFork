@@ -347,10 +347,12 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			return null;
 		},
 		bunx: (_tokens) => null,
-		// find -exec / -execdir 可以执行任意命令
+		// find -exec / -execdir 可以执行任意命令，-delete 会删除文件
 		find: (tokens) => {
 			if (tokens.some((t) => t === "-exec" || t === "-execdir" || t === "-ok" || t === "-okdir"))
 				return "find with -exec";
+			if (tokens.some((t) => t === "-delete"))
+				return "find with -delete (removes files)";
 			return null;
 		},
 		// sed -i 可以修改文件
