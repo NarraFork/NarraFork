@@ -12,15 +12,19 @@ export const authRoutes = new Hono();
 authRoutes.post("/register", async (c) => {
 	const parsed = registerSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { user, token } = await registerUser(parsed.data.username, parsed.data.password);
-	return c.json({ user, token }, 201);
+	const { user, token, language } = await registerUser(
+		parsed.data.username,
+		parsed.data.password,
+		parsed.data.language,
+	);
+	return c.json({ user, token, language }, 201);
 });
 
 authRoutes.post("/login", async (c) => {
 	const parsed = loginSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { user, token } = await loginUser(parsed.data.username, parsed.data.password);
-	return c.json({ user, token });
+	const { user, token, language } = await loginUser(parsed.data.username, parsed.data.password);
+	return c.json({ user, token, language });
 });
 
 authRoutes.get("/me", requireAuth, async (c) => {

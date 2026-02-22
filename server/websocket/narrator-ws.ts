@@ -3,6 +3,7 @@ import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
+import { narratorService } from "../services/narrator-service";
 import {
 	clearBufferedMessage,
 	resolvePermission,
@@ -42,12 +43,8 @@ export type NarratorServerMessage =
 	| { type: "compact_done"; narratorId: string }
 	| { type: "context_usage"; narratorId: string; percentage: number }
 	| { type: "metering"; narratorId: string; unit: string; unitPlural: string; usage: number }
-	// Branch events are forwarded via eventBus.onAny with "narrator:" prefix
-	// (e.g. "narrator:branch_created"), not via broadcastToNarrator().
-	| { type: "narrator:branch_created"; narratorId: string; branchId: string }
-	| { type: "narrator:branch_switched"; narratorId: string; activeBranchId: string }
-	| { type: "narrator:branch_updated"; narratorId: string; branchId: string }
-	| { type: "narrator:branch_deleted"; narratorId: string; branchId: string }
+	// Narrator fork events forwarded via eventBus.onAny
+	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
 	| {
 			type: "tool_started";
 			narratorId: string;
@@ -55,11 +52,18 @@ export type NarratorServerMessage =
 			toolName: string;
 			input: unknown;
 	  }
+	| {
+			type: "subagent_started";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId: string;
+			subagentType: string;
+	  }
 	| { type: "error"; message: string };
 
 // Client → Server messages
 export type NarratorClientMessage =
-	| { type: "subscribe"; narratorIds: string[] }
+	| { type: "subscribe"; narratorIds: string[]; lastMessageId?: string }
 	| { type: "unsubscribe"; narratorIds: string[] }
 	| {
 			type: "permission_decision";
@@ -94,6 +98,8 @@ const ALREADY_BROADCAST_EVENTS = new Set([
 	"narrator:message",
 	"narrator:permission_request",
 	"narrator:title_updated",
+	"narrator:subagent_started",
+	"narrator:subagent_completed",
 ]);
 
 function shouldForwardEvent(event: NarraForkEvent): boolean {
@@ -170,6 +176,25 @@ export const handleNarratorWS = {
 			case "subscribe": {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.add(id);
+				}
+				// Catch-up: send messages the client missed while disconnected
+				if (msg.lastMessageId && msg.narratorIds.length === 1) {
+					const narratorId = msg.narratorIds[0];
+					narratorService
+						.getMessagesAfter(narratorId, msg.lastMessageId)
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic tree message structure
+						.then((missed: any[]) => {
+							for (const message of missed) {
+								try {
+									ws.send(JSON.stringify({ type: "message", narratorId, message }));
+								} catch {
+									break;
+								}
+							}
+						})
+						.catch((err: unknown) =>
+							logger.warn("Failed to send catch-up messages", { error: String(err) }),
+						);
 				}
 				break;
 			}
