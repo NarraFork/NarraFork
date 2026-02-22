@@ -63,11 +63,22 @@ export type NarraForkEvent =
 	| { type: "narrator:error"; narratorId: string; error: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
 	| { type: "narrator:title_updated"; narratorId: string; title: string }
-	// Conversation branches
-	| { type: "narrator:branch_created"; narratorId: string; branchId: string }
-	| { type: "narrator:branch_switched"; narratorId: string; activeBranchId: string }
-	| { type: "narrator:branch_updated"; narratorId: string; branchId: string }
-	| { type: "narrator:branch_deleted"; narratorId: string; branchId: string }
+	// Narrator fork
+	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
+	// Narrator subagent
+	| {
+			type: "narrator:subagent_started";
+			narratorId: string;
+			parentNarratorId: string;
+			toolUseId: string;
+			subagentType: string;
+	  }
+	| {
+			type: "narrator:subagent_completed";
+			narratorId: string;
+			parentNarratorId: string;
+			toolUseId: string;
+	  }
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }

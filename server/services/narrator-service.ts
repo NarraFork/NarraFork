@@ -1,9 +1,8 @@
-import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
-	branchMessages,
 	chapters,
-	conversationBranches,
+	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
@@ -14,6 +13,27 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { deleteNarratorUploads } from "../lib/uploads";
+
+/**
+ * For child messages belonging to subagent narrators, attach the subagent's
+ * resolved model as `subagentModel` on each message. This avoids extra API
+ * calls from the frontend.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+async function attachSubagentModels(childMessages: any[]): Promise<void> {
+	if (childMessages.length === 0) return;
+	const narratorIds = [...new Set(childMessages.map((m) => m.narratorId as string))];
+	if (narratorIds.length === 0) return;
+	const subagentRows = await db.query.narrators.findMany({
+		where: and(inArray(narrators.id, narratorIds), eq(narrators.type, "subagent")),
+		columns: { id: true, model: true },
+	});
+	const modelMap = new Map(subagentRows.map((r) => [r.id, r.model]));
+	for (const msg of childMessages) {
+		const model = modelMap.get(msg.narratorId);
+		if (model) msg.subagentModel = model;
+	}
+}
 
 /**
  * Build a tree from a flat array of messages.
@@ -62,17 +82,24 @@ function truncateJson(val: any, maxLen: number): any {
 	return { _truncated: true, preview: str.slice(0, maxLen), fullLength: str.length };
 }
 
+/** Tool names whose inputJson/outputJson should never be truncated in message lists
+ *  (their content IS the primary display payload, e.g. plan text). */
+const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
+
 /** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 	return tree.map((msg) => ({
 		...msg,
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		toolCalls: msg.toolCalls?.map((tc: any) => ({
-			...tc,
-			inputJson: truncateJson(tc.inputJson, maxLen),
-			outputJson: truncateJson(tc.outputJson, maxLen),
-		})),
+		toolCalls: msg.toolCalls?.map((tc: any) => {
+			if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return tc;
+			return {
+				...tc,
+				inputJson: truncateJson(tc.inputJson, maxLen),
+				outputJson: truncateJson(tc.outputJson, maxLen),
+			};
+		}),
 		children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
 	}));
 }
@@ -132,37 +159,37 @@ function collectToolUseIds(messages: any[]): string[] {
 	return ids;
 }
 
-/** Insert a message into branch_messages junction table */
-async function insertBranchMessage(
-	branchId: string,
+/** Insert a message into narrator_message_refs junction table */
+async function insertMessageRef(
+	narratorId: string,
 	messageId: string,
 	seq: number,
 	isCompact = 0,
 ): Promise<void> {
-	await db.insert(branchMessages).values({
+	await db.insert(narratorMessageRefs).values({
 		id: generateId(),
-		branchId,
+		narratorId,
 		messageId,
 		seq,
 		isCompact,
 	});
 }
 
-/** Atomically get next seq and insert into branch_messages (prevents race conditions) */
-async function appendBranchMessage(
-	branchId: string,
+/** Atomically get next seq and insert into narrator_message_refs (prevents race conditions) */
+async function appendMessageRef(
+	narratorId: string,
 	messageId: string,
 	isCompact = 0,
 ): Promise<number> {
 	return db.transaction(async (tx) => {
 		const result = await tx
-			.select({ maxSeq: sql<number | null>`MAX(${branchMessages.seq})` })
-			.from(branchMessages)
-			.where(eq(branchMessages.branchId, branchId));
+			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId));
 		const seq = (result[0]?.maxSeq ?? -1) + 1;
-		await tx.insert(branchMessages).values({
+		await tx.insert(narratorMessageRefs).values({
 			id: generateId(),
-			branchId,
+			narratorId,
 			messageId,
 			seq,
 			isCompact,
@@ -172,21 +199,11 @@ async function appendBranchMessage(
 }
 
 /**
- * Clear or set contextSummary + apiConversationId on the active branch (or narrator if no branch).
+ * Clear or set contextSummary + apiConversationId on the narrator.
  * Pass `summary = null` to clear, or a string to set.
  */
 async function clearContextSummary(narratorId: string, summary: string | null) {
 	const now = new Date().toISOString();
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { activeBranchId: true },
-	});
-	if (narrator?.activeBranchId) {
-		await db
-			.update(conversationBranches)
-			.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-			.where(eq(conversationBranches.id, narrator.activeBranchId));
-	}
 	await db
 		.update(narrators)
 		.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
@@ -201,6 +218,15 @@ interface CreateNarratorInput {
 	permissionMode?: string;
 	cwd?: string;
 	planMode?: boolean;
+}
+
+interface CreateSubagentInput {
+	parentNarratorId: string;
+	subagentType: "explore" | "plan" | "general";
+	cwd: string;
+	permissionMode?: string;
+	model?: string;
+	systemPrompt?: string;
 }
 
 export const narratorService = {
@@ -229,7 +255,6 @@ export const narratorService = {
 
 		const now = new Date().toISOString();
 		const id = generateId();
-		const rootBranchId = `root-${id}`;
 		const resolvedPermMode = (input.permissionMode ?? settings.agent.defaultPermissionMode) as
 			| "default"
 			| "acceptEdits"
@@ -242,7 +267,6 @@ export const narratorService = {
 				id,
 				chapterId: input.chapterId ?? null,
 				type,
-				activeBranchId: rootBranchId,
 				model: input.model ?? settings.agent.defaultModel,
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
@@ -255,21 +279,75 @@ export const narratorService = {
 			})
 			.returning();
 
-		// Auto-create root branch
-		await db.insert(conversationBranches).values({
-			id: rootBranchId,
-			narratorId: id,
-			name: "main",
-			forkMessageId: null,
-			parentBranchId: null,
-			status: "active",
-			messageCount: 0,
-			createdAt: now,
-			updatedAt: now,
-		});
-
 		logger.info("Narrator created", { id, chapterId: input.chapterId, type });
 		return narrator;
+	},
+
+	async createSubagent(input: CreateSubagentInput) {
+		const parent = await this.getById(input.parentNarratorId);
+
+		// Prevent nested subagents
+		if (parent.type === "subagent") {
+			throw new ValidationError("Subagents cannot spawn nested subagents");
+		}
+
+		const now = new Date().toISOString();
+		const id = generateId();
+		const resolvedPermMode = (input.permissionMode ?? parent.permissionMode ?? "default") as
+			| "default"
+			| "acceptEdits"
+			| "bypassPermissions"
+			| "dontAsk";
+
+		const [narrator] = await db
+			.insert(narrators)
+			.values({
+				id,
+				chapterId: parent.chapterId ?? null,
+				type: "subagent",
+				subagentType: input.subagentType,
+				model: input.model ?? parent.model ?? settings.agent.defaultModel,
+				systemPrompt: input.systemPrompt ?? null,
+				permissionMode: resolvedPermMode,
+				parentNarratorId: input.parentNarratorId,
+				cwd: input.cwd,
+				inheritMode: "fresh",
+				status: "thinking",
+				planMode: false,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.returning();
+
+		logger.info("Subagent created", {
+			id,
+			parentNarratorId: input.parentNarratorId,
+			subagentType: input.subagentType,
+		});
+		return narrator;
+	},
+
+	/**
+	 * Persist a user message for a subagent, linked to the parent's tool_use via parentToolUseId.
+	 */
+	async persistSubagentUserMessage(narratorId: string, text: string, parentToolUseId: string) {
+		const id = generateId();
+		const now = new Date().toISOString();
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				parentToolUseId,
+				role: "user",
+				contentJson: [{ type: "text", text }],
+				contentText: text,
+				createdAt: now,
+			})
+			.returning();
+
+		await appendMessageRef(narratorId, id);
+		return msg;
 	},
 
 	async getById(id: string) {
@@ -282,7 +360,7 @@ export const narratorService = {
 
 	async listByChapter(chapterId: string) {
 		return db.query.narrators.findMany({
-			where: eq(narrators.chapterId, chapterId),
+			where: and(eq(narrators.chapterId, chapterId), ne(narrators.type, "subagent")),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
 	},
@@ -300,51 +378,43 @@ export const narratorService = {
 	/**
 	 * Fetch all messages after the most recent compact marker.
 	 * If no compact marker exists, returns all messages.
-	 * Uses branch_messages junction table for branch-aware queries.
+	 * Uses narrator_message_refs junction table.
 	 */
 	async getMessagesSinceLastCompact(narratorId: string) {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
-		const activeBranchId = narrator?.activeBranchId;
-		if (!activeBranchId) return [];
-
-		// Find the last compact marker's seq in this branch
+		// Find the last compact marker's seq
 		const lastCompactRow = await db
-			.select({ seq: branchMessages.seq })
-			.from(branchMessages)
-			.where(and(eq(branchMessages.branchId, activeBranchId), eq(branchMessages.isCompact, 1)))
-			.orderBy(sql`${branchMessages.seq} DESC`)
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
-		// Fetch message IDs from branch_messages
-		const bmRows = await db
-			.select({ messageId: branchMessages.messageId, seq: branchMessages.seq })
-			.from(branchMessages)
+		// Fetch message IDs from narrator_message_refs
+		const refRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
 			.where(
 				and(
-					eq(branchMessages.branchId, activeBranchId),
-					compactSeq != null ? gt(branchMessages.seq, compactSeq) : undefined,
+					eq(narratorMessageRefs.narratorId, narratorId),
+					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 				),
 			)
-			.orderBy(branchMessages.seq);
+			.orderBy(narratorMessageRefs.seq);
 
-		if (bmRows.length === 0) return [];
+		if (refRows.length === 0) return [];
 
-		const messageIds = bmRows.map((r) => r.messageId);
+		const messageIds = refRows.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
-			where: and(
-				eq(narratorMessages.narratorId, narratorId),
-				inArray(narratorMessages.id, messageIds),
-			),
+			where: inArray(narratorMessages.id, messageIds),
 			with: { toolCalls: true },
 		});
 
-		// Sort by seq order from branch_messages (not createdAt)
-		const seqMap = new Map(bmRows.map((r) => [r.messageId, r.seq]));
+		// Sort by seq order from refs (not createdAt)
+		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		return messages;
 	},
@@ -354,66 +424,56 @@ export const narratorService = {
 	 * Used for partial compact — compress only messages before the target.
 	 */
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
-		const activeBranchId = narrator?.activeBranchId;
-		if (!activeBranchId) return [];
-
 		// Find the target message's seq
-		const targetBm = await db.query.branchMessages.findFirst({
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
-				eq(branchMessages.branchId, activeBranchId),
-				eq(branchMessages.messageId, beforeMessageId),
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, beforeMessageId),
 			),
 		});
-		if (!targetBm) throw new NotFoundError("Message", beforeMessageId);
+		if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
 
 		// Find the last compact marker before the target
 		const lastCompactRow = await db
-			.select({ seq: branchMessages.seq })
-			.from(branchMessages)
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
 			.where(
 				and(
-					eq(branchMessages.branchId, activeBranchId),
-					eq(branchMessages.isCompact, 1),
-					lt(branchMessages.seq, targetBm.seq),
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.isCompact, 1),
+					lt(narratorMessageRefs.seq, targetRef.seq),
 				),
 			)
-			.orderBy(sql`${branchMessages.seq} DESC`)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
-		const lowerBound = compactSeq != null ? gt(branchMessages.seq, compactSeq) : sql`1=1`;
+		const lowerBound = compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : sql`1=1`;
 
 		// Get message IDs in range (compactSeq, targetSeq)
-		const bmRows = await db
-			.select({ messageId: branchMessages.messageId, seq: branchMessages.seq })
-			.from(branchMessages)
+		const refRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
 			.where(
 				and(
-					eq(branchMessages.branchId, activeBranchId),
+					eq(narratorMessageRefs.narratorId, narratorId),
 					lowerBound,
-					lt(branchMessages.seq, targetBm.seq),
+					lt(narratorMessageRefs.seq, targetRef.seq),
 				),
 			)
-			.orderBy(branchMessages.seq);
+			.orderBy(narratorMessageRefs.seq);
 
-		if (bmRows.length === 0) return [];
+		if (refRows.length === 0) return [];
 
-		const messageIds = bmRows.map((r) => r.messageId);
+		const messageIds = refRows.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
-			where: and(
-				eq(narratorMessages.narratorId, narratorId),
-				inArray(narratorMessages.id, messageIds),
-			),
+			where: inArray(narratorMessages.id, messageIds),
 			with: { toolCalls: true },
 		});
 
-		// Sort by seq order from branch_messages (not createdAt)
-		const seqMap = new Map(bmRows.map((r) => [r.messageId, r.seq]));
+		// Sort by seq order from refs (not createdAt)
+		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		return messages;
 	},
@@ -445,50 +505,31 @@ export const narratorService = {
 		return rows.reverse();
 	},
 
-	async getMessagesCursor(
-		narratorId: string,
-		limit = 50,
-		cursor?: string,
-		branchId?: string | null,
-	) {
-		// Resolve effective branchId: use provided, or narrator's activeBranchId
-		let effectiveBranchId = branchId;
-		if (effectiveBranchId === undefined) {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { activeBranchId: true },
-			});
-			effectiveBranchId = narrator?.activeBranchId ?? null;
-		}
-
-		if (!effectiveBranchId) {
-			return { messages: [], hasMore: false, nextCursor: null };
-		}
-
+	async getMessagesCursor(narratorId: string, limit = 50, cursor?: string) {
 		// Build cursor condition on seq
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const cursorConditions: any[] = [eq(branchMessages.branchId, effectiveBranchId)];
+		const cursorConditions: any[] = [eq(narratorMessageRefs.narratorId, narratorId)];
 		if (cursor) {
 			const cursorSeq = Number.parseInt(cursor, 10);
 			if (!Number.isNaN(cursorSeq)) {
-				cursorConditions.push(lt(branchMessages.seq, cursorSeq));
+				cursorConditions.push(lt(narratorMessageRefs.seq, cursorSeq));
 			}
 		}
 
 		// Query top-level messages via junction table, ordered by seq DESC
-		const bmRows = await db
+		const refRows = await db
 			.select({
-				messageId: branchMessages.messageId,
-				seq: branchMessages.seq,
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
 			})
-			.from(branchMessages)
-			.innerJoin(narratorMessages, eq(branchMessages.messageId, narratorMessages.id))
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(and(...cursorConditions, isNull(narratorMessages.parentToolUseId)))
-			.orderBy(sql`${branchMessages.seq} DESC`)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(limit + 1);
 
-		const hasMore = bmRows.length > limit;
-		const pageRows = hasMore ? bmRows.slice(0, limit) : bmRows;
+		const hasMore = refRows.length > limit;
+		const pageRows = hasMore ? refRows.slice(0, limit) : refRows;
 		pageRows.reverse(); // chronological order
 
 		if (pageRows.length === 0) {
@@ -501,24 +542,24 @@ export const narratorService = {
 			with: { toolCalls: true },
 		});
 
-		// Sort by seq order from branch_messages (not createdAt)
+		// Sort by seq order from refs (not createdAt)
 		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 
-		// Fetch child messages
+		// Fetch child messages (don't filter by narratorId — forked narrators
+		// share messages whose narratorId points to the original creator)
 		const parentToolUseIds = collectToolUseIds(topMessages);
 		const childMessages =
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
-						where: and(
-							eq(narratorMessages.narratorId, narratorId),
-							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						),
+						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
 						with: { toolCalls: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
 				: [];
+
+		await attachSubagentModels(childMessages);
 
 		const tree = filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
@@ -532,29 +573,74 @@ export const narratorService = {
 	},
 
 	/**
+	 * Fetch messages added after a given message ID (for WS catch-up).
+	 * Returns tree-structured messages in chronological order, capped at `limit`.
+	 */
+	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 100) {
+		// Find the seq of the reference message
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, afterMessageId),
+			),
+			columns: { seq: true },
+		});
+		if (!ref) return [];
+
+		// Fetch top-level messages with seq > ref.seq (chronological order)
+		const refRows = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gt(narratorMessageRefs.seq, ref.seq),
+					isNull(narratorMessages.parentToolUseId),
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} ASC`)
+			.limit(limit);
+
+		if (refRows.length === 0) return [];
+
+		const messageIds = refRows.map((r) => r.messageId);
+		const topMessages = await db.query.narratorMessages.findMany({
+			where: inArray(narratorMessages.id, messageIds),
+			with: { toolCalls: true },
+		});
+
+		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
+		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+
+		const parentToolUseIds = collectToolUseIds(topMessages);
+		const childMessages =
+			parentToolUseIds.length > 0
+				? await db.query.narratorMessages.findMany({
+						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
+						with: { toolCalls: true },
+						orderBy: (m, { asc }) => [asc(m.createdAt)],
+						limit: 500,
+					})
+				: [];
+
+		await attachSubagentModels(childMessages);
+
+		return filterExitPlanBeforePlanCompact(
+			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		);
+	},
+
+	/**
 	 * Fetch messages around a target message ID (tree-structured).
 	 * If the target is a child message, finds its top-level ancestor first.
 	 * Returns `contextSize` top-level messages before + the target's top-level + all after,
 	 * with children nested.
 	 */
-	async getMessagesAround(
-		narratorId: string,
-		messageId: string,
-		contextSize = 5,
-		branchId?: string,
-	) {
-		let effectiveBranchId = branchId;
-		if (!effectiveBranchId) {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { activeBranchId: true },
-			});
-			effectiveBranchId = narrator?.activeBranchId ?? undefined;
-		}
-		if (!effectiveBranchId) {
-			return this.getMessagesCursor(narratorId, 10);
-		}
-
+	async getMessagesAround(narratorId: string, messageId: string, contextSize = 5) {
 		// Find the target message
 		const target = await db.query.narratorMessages.findFirst({
 			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
@@ -575,51 +661,51 @@ export const narratorService = {
 			if (parentTc) anchorMessageId = parentTc.messageId;
 		}
 
-		// Find the anchor's seq in the branch
-		const anchorBm = await db.query.branchMessages.findFirst({
+		// Find the anchor's seq in the refs
+		const anchorRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
-				eq(branchMessages.branchId, effectiveBranchId),
-				eq(branchMessages.messageId, anchorMessageId),
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, anchorMessageId),
 			),
 		});
-		if (!anchorBm) {
+		if (!anchorRef) {
 			return this.getMessagesCursor(narratorId, 10);
 		}
 
 		// Fetch older top-level messages (seq < anchorSeq)
-		const olderBmRows = await db
-			.select({ messageId: branchMessages.messageId, seq: branchMessages.seq })
-			.from(branchMessages)
-			.innerJoin(narratorMessages, eq(branchMessages.messageId, narratorMessages.id))
+		const olderRefRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(
 				and(
-					eq(branchMessages.branchId, effectiveBranchId),
-					lt(branchMessages.seq, anchorBm.seq),
+					eq(narratorMessageRefs.narratorId, narratorId),
+					lt(narratorMessageRefs.seq, anchorRef.seq),
 					isNull(narratorMessages.parentToolUseId),
 				),
 			)
-			.orderBy(sql`${branchMessages.seq} DESC`)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(contextSize + 1);
 
-		const hasMore = olderBmRows.length > contextSize;
-		const olderRows = hasMore ? olderBmRows.slice(0, contextSize) : olderBmRows;
+		const hasMore = olderRefRows.length > contextSize;
+		const olderRows = hasMore ? olderRefRows.slice(0, contextSize) : olderRefRows;
 		olderRows.reverse();
 
 		// Fetch anchor + all newer top-level messages
-		const newerBmRows = await db
-			.select({ messageId: branchMessages.messageId, seq: branchMessages.seq })
-			.from(branchMessages)
-			.innerJoin(narratorMessages, eq(branchMessages.messageId, narratorMessages.id))
+		const newerRefRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(
 				and(
-					eq(branchMessages.branchId, effectiveBranchId ?? ""),
-					gte(branchMessages.seq, anchorBm.seq),
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gte(narratorMessageRefs.seq, anchorRef.seq),
 					isNull(narratorMessages.parentToolUseId),
 				),
 			)
-			.orderBy(branchMessages.seq);
+			.orderBy(narratorMessageRefs.seq);
 
-		const allIds = [...olderRows.map((r) => r.messageId), ...newerBmRows.map((r) => r.messageId)];
+		const allIds = [...olderRows.map((r) => r.messageId), ...newerRefRows.map((r) => r.messageId)];
 		if (allIds.length === 0) {
 			return { messages: [], hasMore, nextCursor: null };
 		}
@@ -627,7 +713,7 @@ export const narratorService = {
 		// Build seq map for ordering
 		const seqMap = new Map<string, number>();
 		for (const r of olderRows) seqMap.set(r.messageId, r.seq);
-		for (const r of newerBmRows) seqMap.set(r.messageId, r.seq);
+		for (const r of newerRefRows) seqMap.set(r.messageId, r.seq);
 
 		const topMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, allIds),
@@ -637,20 +723,19 @@ export const narratorService = {
 		// Sort by seq order
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 
-		// Fetch child messages
+		// Fetch child messages (don't filter by narratorId — shared messages)
 		const parentToolUseIds = collectToolUseIds(topMessages);
 		const childMessages =
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
-						where: and(
-							eq(narratorMessages.narratorId, narratorId),
-							inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						),
+						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
 						with: { toolCalls: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
 				: [];
+
+		await attachSubagentModels(childMessages);
 
 		const tree = filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
@@ -714,7 +799,7 @@ export const narratorService = {
 		const isPlan = compactBlock.subtype === "plan";
 
 		// Delete from junction table first
-		await db.delete(branchMessages).where(eq(branchMessages.messageId, messageId));
+		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
 		await db.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
 
 		// Plan messages don't affect contextSummary; regular compacts need to clear it
@@ -785,10 +870,6 @@ export const narratorService = {
 	async persistUserMessage(narratorId: string, text: string, contentBlocks?: any[]) {
 		const id = generateId();
 		const now = new Date().toISOString();
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
 		const [msg] = await db
 			.insert(narratorMessages)
 			.values({
@@ -801,57 +882,44 @@ export const narratorService = {
 			})
 			.returning();
 
-		// Insert into branch_messages junction table
-		if (narrator?.activeBranchId) {
-			await appendBranchMessage(narrator.activeBranchId, id);
-			await db
-				.update(conversationBranches)
-				.set({
-					messageCount: sql`COALESCE(${conversationBranches.messageCount}, 0) + 1`,
-					updatedAt: now,
-				})
-				.where(eq(conversationBranches.id, narrator.activeBranchId));
-		}
+		// Insert into narrator_message_refs junction table
+		await appendMessageRef(narratorId, id);
 		return msg;
 	},
 
 	async persistCompactingMessage(narratorId: string, beforeMessageId?: string) {
 		const id = generateId();
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
-		const activeBranchId = narrator?.activeBranchId;
 
 		let seq: number;
-		if (beforeMessageId && activeBranchId) {
+		if (beforeMessageId) {
 			// Atomically shift seq values and compute insertion point
 			seq = await db.transaction(async (tx) => {
-				const targetBm = await tx.query.branchMessages.findFirst({
+				const targetRef = await tx.query.narratorMessageRefs.findFirst({
 					where: and(
-						eq(branchMessages.branchId, activeBranchId),
-						eq(branchMessages.messageId, beforeMessageId),
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, beforeMessageId),
 					),
 				});
-				if (!targetBm) throw new NotFoundError("Message", beforeMessageId);
+				if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
 				await tx
-					.update(branchMessages)
-					.set({ seq: sql`${branchMessages.seq} + 1` })
+					.update(narratorMessageRefs)
+					.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
 					.where(
-						and(eq(branchMessages.branchId, activeBranchId), gte(branchMessages.seq, targetBm.seq)),
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							gte(narratorMessageRefs.seq, targetRef.seq),
+						),
 					);
-				return targetBm.seq;
-			});
-		} else if (activeBranchId) {
-			seq = await db.transaction(async (tx) => {
-				const result = await tx
-					.select({ maxSeq: sql<number | null>`MAX(${branchMessages.seq})` })
-					.from(branchMessages)
-					.where(eq(branchMessages.branchId, activeBranchId));
-				return (result[0]?.maxSeq ?? -1) + 1;
+				return targetRef.seq;
 			});
 		} else {
-			seq = 0;
+			seq = await db.transaction(async (tx) => {
+				const result = await tx
+					.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+					.from(narratorMessageRefs)
+					.where(eq(narratorMessageRefs.narratorId, narratorId));
+				return (result[0]?.maxSeq ?? -1) + 1;
+			});
 		}
 
 		const createdAt = new Date().toISOString();
@@ -867,9 +935,7 @@ export const narratorService = {
 			})
 			.returning();
 
-		if (activeBranchId) {
-			await insertBranchMessage(activeBranchId, id, seq);
-		}
+		await insertMessageRef(narratorId, id, seq);
 
 		return msg;
 	},
@@ -880,11 +946,6 @@ export const narratorService = {
 	 */
 	async persistPlanMessage(narratorId: string, content: string) {
 		const id = generateId();
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
-		const activeBranchId = narrator?.activeBranchId;
 
 		const createdAt = new Date().toISOString();
 		const [msg] = await db
@@ -899,9 +960,7 @@ export const narratorService = {
 			})
 			.returning();
 
-		if (activeBranchId) {
-			await appendBranchMessage(activeBranchId, id, 1);
-		}
+		await appendMessageRef(narratorId, id, 1);
 
 		return msg;
 	},
@@ -927,11 +986,11 @@ export const narratorService = {
 			.where(eq(narratorMessages.id, msg.id))
 			.returning();
 
-		// Mark as compact in branch_messages
+		// Mark as compact in narrator_message_refs
 		await db
-			.update(branchMessages)
+			.update(narratorMessageRefs)
 			.set({ isCompact: 1 })
-			.where(eq(branchMessages.messageId, msg.id));
+			.where(eq(narratorMessageRefs.messageId, msg.id));
 
 		return updated;
 	},
@@ -961,11 +1020,6 @@ export const narratorService = {
 			.map((b: any) => b.text)
 			.join("\n");
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
-
 		const usage = sdkMessage.message.usage;
 		const [msg] = await db
 			.insert(narratorMessages)
@@ -985,17 +1039,8 @@ export const narratorService = {
 			})
 			.returning();
 
-		// Insert into branch_messages junction table
-		if (narrator?.activeBranchId) {
-			await appendBranchMessage(narrator.activeBranchId, id);
-			await db
-				.update(conversationBranches)
-				.set({
-					messageCount: sql`COALESCE(${conversationBranches.messageCount}, 0) + 1`,
-					updatedAt: now,
-				})
-				.where(eq(conversationBranches.id, narrator.activeBranchId));
-		}
+		// Insert into narrator_message_refs junction table
+		await appendMessageRef(narratorId, id);
 
 		// Extract tool_use blocks and create tool call records
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1018,21 +1063,10 @@ export const narratorService = {
 
 	async updateConversationId(narratorId: string, apiConversationId: string) {
 		const now = new Date().toISOString();
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { activeBranchId: true },
-		});
-		if (narrator?.activeBranchId) {
-			await db
-				.update(conversationBranches)
-				.set({ apiConversationId, updatedAt: now })
-				.where(eq(conversationBranches.id, narrator.activeBranchId));
-		} else {
-			await db
-				.update(narrators)
-				.set({ apiConversationId, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		}
+		await db
+			.update(narrators)
+			.set({ apiConversationId, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 
 	async updateStats(narratorId: string, costUsd: number) {
@@ -1077,6 +1111,18 @@ export const narratorService = {
 			.update(narrators)
 			.set({ permissionMode, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
+
+		// 同步权限模式到所有活跃的 subagent
+		await db
+			.update(narrators)
+			.set({ permissionMode, updatedAt: now })
+			.where(
+				and(
+					eq(narrators.parentNarratorId, narratorId),
+					eq(narrators.type, "subagent"),
+					inArray(narrators.status, ["thinking", "waiting", "idle"]),
+				),
+			);
 	},
 
 	async updatePlanMode(narratorId: string, planMode: boolean) {
@@ -1136,233 +1182,179 @@ export const narratorService = {
 	},
 
 	async remove(narratorId: string) {
+		// Recursively remove child narrators (subagents, forks) first
+		const children = await db.query.narrators.findMany({
+			where: eq(narrators.parentNarratorId, narratorId),
+			columns: { id: true },
+		});
+		for (const child of children) {
+			await this.remove(child.id);
+		}
+
 		// Delete in dependency order within a transaction
 		await db.transaction(async (tx) => {
 			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
-			// Delete branch_messages for all branches of this narrator
-			const branches = await tx.query.conversationBranches.findMany({
-				where: eq(conversationBranches.narratorId, narratorId),
-				columns: { id: true },
-			});
-			if (branches.length > 0) {
-				await tx.delete(branchMessages).where(
-					inArray(
-						branchMessages.branchId,
-						branches.map((b) => b.id),
+			// Delete narrator_message_refs for this narrator
+			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));
+
+			// Find messages that are ONLY owned by this narrator (not referenced by other narrators)
+			const orphanRows = await tx
+				.select({ id: narratorMessages.id })
+				.from(narratorMessages)
+				.where(
+					and(
+						eq(narratorMessages.narratorId, narratorId),
+						sql`NOT EXISTS (
+							SELECT 1 FROM narrator_message_refs nmr
+							WHERE nmr.message_id = ${narratorMessages.id}
+							AND nmr.narrator_id != ${narratorId}
+						)`,
 					),
 				);
+			const orphanIds = orphanRows.map((r) => r.id);
+
+			if (orphanIds.length > 0) {
+				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
 			}
-			await tx.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
-			await tx.delete(conversationBranches).where(eq(conversationBranches.narratorId, narratorId));
+
 			await tx.delete(narrators).where(eq(narrators.id, narratorId));
 		});
 		await deleteNarratorUploads(narratorId);
 		logger.info("Narrator removed", { narratorId });
 	},
 
-	// === Branch CRUD ===
+	// === Fork ===
 
-	async listBranches(narratorId: string) {
-		return db.query.conversationBranches.findMany({
-			where: eq(conversationBranches.narratorId, narratorId),
-			orderBy: (b, { asc }) => [asc(b.createdAt)],
-		});
-	},
+	async forkNarrator(parentNarratorId: string, forkMessageId: string, opts?: { title?: string }) {
+		const parent = await this.getById(parentNarratorId);
 
-	async getBranch(branchId: string) {
-		const branch = await db.query.conversationBranches.findFirst({
-			where: eq(conversationBranches.id, branchId),
-		});
-		if (!branch) throw new NotFoundError("Branch", branchId);
-		return branch;
-	},
+		if (parent.type === "subagent") {
+			throw new ValidationError("Cannot fork from a subagent narrator");
+		}
 
-	async createBranch(narratorId: string, forkMessageId: string, name?: string) {
-		const narrator = await this.getById(narratorId);
-		const activeBranchId = narrator.activeBranchId;
-		if (!activeBranchId) throw new ValidationError("Narrator has no active branch");
-
-		// Verify fork message belongs to this narrator
-		const forkMsg = await db.query.narratorMessages.findFirst({
+		// Verify forkMessage belongs to parent narrator (via refs)
+		const forkRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
-				eq(narratorMessages.id, forkMessageId),
-				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessageRefs.narratorId, parentNarratorId),
+				eq(narratorMessageRefs.messageId, forkMessageId),
 			),
 		});
-		if (!forkMsg) throw new NotFoundError("Message", forkMessageId);
+		if (!forkRef) throw new ValidationError("Fork message not found in parent narrator's refs");
 
-		// Find the fork message's seq in the parent branch
-		const forkBm = await db.query.branchMessages.findFirst({
-			where: and(
-				eq(branchMessages.branchId, activeBranchId),
-				eq(branchMessages.messageId, forkMessageId),
-			),
-		});
-		if (!forkBm) throw new ValidationError("Fork message not found in active branch");
-
-		// Count existing branches for auto-naming
-		const existingBranches = await db.query.conversationBranches.findMany({
-			where: eq(conversationBranches.narratorId, narratorId),
-			columns: { id: true },
-		});
-		const branchName = name || `Branch ${existingBranches.length + 1}`;
-
+		const forkSeq = forkRef.seq;
 		const now = new Date().toISOString();
 		const id = generateId();
-		const [branch] = await db
-			.insert(conversationBranches)
-			.values({
-				id,
-				narratorId,
-				name: branchName,
-				forkMessageId,
-				parentBranchId: activeBranchId,
-				status: "active",
-				messageCount: 0,
-				createdAt: now,
-				updatedAt: now,
-			})
-			.returning();
 
-		// Copy shared prefix: all messages from parent branch with seq <= forkSeq
+		const resolvedPermMode = (parent.permissionMode ?? "default") as
+			| "default"
+			| "acceptEdits"
+			| "bypassPermissions"
+			| "dontAsk";
+
+		// Fork type: always secondary when chapter-bound to avoid primary conflict
+		const forkType: "primary" | "secondary" = parent.chapterId
+			? "secondary"
+			: (parent.type as "primary" | "secondary");
+
+		// Fetch prefix rows before transaction (read-only)
 		const prefixRows = await db
 			.select({
-				messageId: branchMessages.messageId,
-				seq: branchMessages.seq,
-				isCompact: branchMessages.isCompact,
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				isCompact: narratorMessageRefs.isCompact,
 			})
-			.from(branchMessages)
+			.from(narratorMessageRefs)
 			.where(
 				and(
-					eq(branchMessages.branchId, activeBranchId),
-					sql`${branchMessages.seq} <= ${forkBm.seq}`,
+					eq(narratorMessageRefs.narratorId, parentNarratorId),
+					sql`${narratorMessageRefs.seq} <= ${forkSeq}`,
 				),
 			)
-			.orderBy(branchMessages.seq);
+			.orderBy(narratorMessageRefs.seq);
 
-		for (const row of prefixRows) {
-			await db.insert(branchMessages).values({
-				id: generateId(),
-				branchId: id,
-				messageId: row.messageId,
-				seq: row.seq,
-				isCompact: row.isCompact,
-			});
-		}
+		// Create narrator + copy refs atomically
+		const newNarrator = await db.transaction(async (tx) => {
+			const [created] = await tx
+				.insert(narrators)
+				.values({
+					id,
+					chapterId: parent.chapterId ?? null,
+					type: forkType,
+					model: parent.model ?? "claude-sonnet",
+					systemPrompt: parent.systemPrompt,
+					permissionMode: resolvedPermMode,
+					parentNarratorId,
+					forkMessageId,
+					inheritMode: "fresh",
+					status: "idle",
+					title: opts?.title ?? null,
+					cwd: parent.cwd ?? null,
+					createdAt: now,
+					updatedAt: now,
+				})
+				.returning();
 
-		// Update branch message count
-		await db
-			.update(conversationBranches)
-			.set({ messageCount: prefixRows.length, updatedAt: now })
-			.where(eq(conversationBranches.id, id));
-
-		// Switch to the new branch
-		await db
-			.update(narrators)
-			.set({ activeBranchId: id, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-
-		eventBus.emit({ type: "narrator:branch_created", narratorId, branchId: id });
-		eventBus.emit({ type: "narrator:branch_switched", narratorId, activeBranchId: id });
-
-		logger.info("Branch created", { narratorId, branchId: id, forkMessageId });
-		return branch;
-	},
-
-	async updateBranch(
-		narratorId: string,
-		branchId: string,
-		data: { name?: string; status?: "active" | "archived" },
-	) {
-		const branch = await this.getBranch(branchId);
-		if (branch.narratorId !== narratorId) {
-			throw new ValidationError("Branch does not belong to this narrator");
-		}
-
-		const now = new Date().toISOString();
-		const [updated] = await db
-			.update(conversationBranches)
-			.set({ ...data, updatedAt: now })
-			.where(eq(conversationBranches.id, branchId))
-			.returning();
-
-		eventBus.emit({ type: "narrator:branch_updated", narratorId, branchId });
-		return updated;
-	},
-
-	async deleteBranch(narratorId: string, branchId: string) {
-		const branch = await this.getBranch(branchId);
-		if (branch.narratorId !== narratorId) {
-			throw new ValidationError("Branch does not belong to this narrator");
-		}
-
-		// Prevent deleting root branch
-		if (!branch.parentBranchId) {
-			throw new ValidationError("Cannot delete the root branch");
-		}
-
-		await db.transaction(async (tx) => {
-			// Promote child branches: set their parentBranchId to this branch's parent
-			await tx
-				.update(conversationBranches)
-				.set({ parentBranchId: branch.parentBranchId, updatedAt: new Date().toISOString() })
-				.where(eq(conversationBranches.parentBranchId, branchId));
-
-			// Find messages that are ONLY in this branch (not referenced by other branches)
-			const orphanRows = await tx.all<{ message_id: string }>(sql`
-				SELECT bm.message_id FROM branch_messages bm
-				WHERE bm.branch_id = ${branchId}
-				AND NOT EXISTS (
-					SELECT 1 FROM branch_messages bm2
-					WHERE bm2.message_id = bm.message_id AND bm2.branch_id != ${branchId}
-				)
-			`);
-			const orphanIds = orphanRows.map((r) => r.message_id);
-
-			// Delete branch_messages rows for this branch
-			await tx.delete(branchMessages).where(eq(branchMessages.branchId, branchId));
-
-			// Delete orphaned messages and their tool calls
-			if (orphanIds.length > 0) {
-				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+			// Batch insert refs
+			if (prefixRows.length > 0) {
+				await tx.insert(narratorMessageRefs).values(
+					prefixRows.map((row) => ({
+						id: generateId(),
+						narratorId: id,
+						messageId: row.messageId,
+						seq: row.seq,
+						isCompact: row.isCompact,
+					})),
+				);
 			}
 
-			// Delete the branch record
-			await tx.delete(conversationBranches).where(eq(conversationBranches.id, branchId));
-
-			// If this was the active branch, switch to parent
-			const narrator = await tx.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { activeBranchId: true },
-			});
-			if (narrator?.activeBranchId === branchId) {
-				const newActive = branch.parentBranchId ?? "";
-				await tx
-					.update(narrators)
-					.set({ activeBranchId: newActive, updatedAt: new Date().toISOString() })
-					.where(eq(narrators.id, narratorId));
-				eventBus.emit({ type: "narrator:branch_switched", narratorId, activeBranchId: newActive });
-			}
+			return created;
 		});
 
-		eventBus.emit({ type: "narrator:branch_deleted", narratorId, branchId });
-		logger.info("Branch deleted", { narratorId, branchId });
+		eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
+		logger.info("Narrator forked", { parentNarratorId, newNarratorId: id, forkMessageId });
+		return newNarrator;
 	},
 
-	async switchBranch(narratorId: string, branchId: string) {
-		const branch = await this.getBranch(branchId);
-		if (branch.narratorId !== narratorId) {
-			throw new ValidationError("Branch does not belong to this narrator");
+	async listRelatedNarrators(narratorId: string) {
+		// Walk up to find root
+		let rootId = narratorId;
+		let current = await this.getById(narratorId);
+		while (current.parentNarratorId) {
+			rootId = current.parentNarratorId;
+			current = await this.getById(rootId);
 		}
 
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ activeBranchId: branchId, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
+		// Use recursive CTE to find all descendants efficiently (exclude subagents)
+		const rows = await db.all<{
+			id: string;
+			title: string | null;
+			parent_narrator_id: string | null;
+			fork_message_id: string | null;
+			type: string;
+			status: string;
+			message_count: number | null;
+			created_at: string;
+		}>(sql`
+			WITH RECURSIVE tree AS (
+				SELECT id, title, parent_narrator_id, fork_message_id, type, status, message_count, created_at
+				FROM narrators WHERE id = ${rootId} AND type != 'subagent'
+				UNION ALL
+				SELECT n.id, n.title, n.parent_narrator_id, n.fork_message_id, n.type, n.status, n.message_count, n.created_at
+				FROM narrators n JOIN tree t ON n.parent_narrator_id = t.id
+				WHERE n.type != 'subagent'
+			)
+			SELECT * FROM tree ORDER BY created_at ASC
+		`);
 
-		eventBus.emit({ type: "narrator:branch_switched", narratorId, activeBranchId: branchId });
-		logger.info("Branch switched", { narratorId, activeBranchId: branchId });
+		return rows.map((n) => ({
+			id: n.id,
+			title: n.title,
+			parentNarratorId: n.parent_narrator_id,
+			forkMessageId: n.fork_message_id,
+			type: n.type,
+			status: n.status,
+			messageCount: n.message_count,
+			createdAt: n.created_at,
+		}));
 	},
 };

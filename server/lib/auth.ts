@@ -1,7 +1,7 @@
 import { count, eq } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
-import { users } from "../db/schema";
+import { userPreferences, users } from "../db/schema";
 import { AppError } from "./errors";
 import { generateId } from "./id";
 import { settings } from "./settings";
@@ -25,7 +25,7 @@ export async function verifyToken(token: string): Promise<JwtPayload> {
 	return verify(token, JWT_SECRET, "HS256") as unknown as Promise<JwtPayload>;
 }
 
-export async function registerUser(username: string, password: string) {
+export async function registerUser(username: string, password: string, language?: string) {
 	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
 	const isFirstUser = userCount === 0;
 
@@ -48,18 +48,30 @@ export async function registerUser(username: string, password: string) {
 	});
 	const now = new Date().toISOString();
 
-	const [user] = await db
-		.insert(users)
-		.values({ id, username, passwordHash, role, createdAt: now })
-		.returning({
-			id: users.id,
-			username: users.username,
-			role: users.role,
-			createdAt: users.createdAt,
+	const [user] = await db.transaction(async (tx) => {
+		const [created] = await tx
+			.insert(users)
+			.values({ id, username, passwordHash, role, createdAt: now })
+			.returning({
+				id: users.id,
+				username: users.username,
+				role: users.role,
+				createdAt: users.createdAt,
+			});
+
+		const resolvedLang = language || "en";
+		await tx.insert(userPreferences).values({
+			id: generateId(),
+			userId: created.id,
+			language: resolvedLang,
 		});
 
+		return [created];
+	});
+
+	const resolvedLang = language || "en";
 	const token = await createToken(user.id, user.role);
-	return { user, token };
+	return { user, token, language: resolvedLang };
 }
 
 export async function loginUser(username: string, password: string) {
@@ -75,6 +87,11 @@ export async function loginUser(username: string, password: string) {
 		throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
 	}
 
+	const pref = await db.query.userPreferences.findFirst({
+		where: eq(userPreferences.userId, user.id),
+		columns: { language: true },
+	});
+
 	const token = await createToken(user.id, user.role);
 	return {
 		user: {
@@ -84,5 +101,6 @@ export async function loginUser(username: string, password: string) {
 			createdAt: user.createdAt,
 		},
 		token,
+		language: pref?.language ?? "en",
 	};
 }

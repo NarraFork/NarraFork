@@ -20,6 +20,10 @@ export interface NarraForkSettings {
 		hiddenModels: string[];
 		extendedContext: boolean;
 		maxTurns: number;
+		subagentModels: {
+			explore: string;
+			plan: string;
+		};
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -61,6 +65,10 @@ const DEFAULTS: NarraForkSettings = {
 		hiddenModels: [],
 		extendedContext: false,
 		maxTurns: 200,
+		subagentModels: {
+			explore: "",
+			plan: "",
+		},
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -141,3 +149,10 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
+
+
+/** Resolve provider name for a given model by looking up customModels in settings. */
+export function resolveProvider(model?: string): string {
+	const custom = settings.agent.customModels ?? [];
+	const found = custom.find((m) => m.value === model);
+}

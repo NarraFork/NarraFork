@@ -172,6 +172,7 @@ export const registerSchema = z.object({
 		.max(50)
 		.regex(/^[a-zA-Z0-9_-]+$/, "Alphanumeric, hyphens, underscores only"),
 	password: z.string().min(8).max(128),
+	language: z.string().min(1).max(10).optional(),
 });
 
 export const loginSchema = z.object({
@@ -199,16 +200,11 @@ export const updateNarratorTitleSchema = z.object({
 	title: z.string().min(1).max(200),
 });
 
-// === Conversation Branches ===
+// === Narrator Fork ===
 
-export const createBranchSchema = z.object({
+export const forkNarratorSchema = z.object({
 	forkMessageId: z.string().min(1),
-	name: z.string().min(1).max(200).optional(),
-});
-
-export const updateBranchSchema = z.object({
-	name: z.string().min(1).max(200).optional(),
-	status: z.enum(["active", "archived"]).optional(),
+	title: z.string().min(1).max(200).optional(),
 });
 
 export const updateNarratorModelSchema = z.object({
@@ -246,8 +242,6 @@ export const updateUserPreferencesSchema = z.object({
 	wordWrapDiff: z.boolean().optional(),
 	replyInUserLanguage: z.boolean().optional(),
 	showTokenUsage: z.boolean().optional(),
-	showSessionCost: z.boolean().optional(),
-	showMessageCost: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 });
@@ -259,6 +253,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({
 		type: z.literal("subscribe"),
 		narratorIds: z.array(z.string().min(1)),
+		lastMessageId: z.string().min(1).optional(),
 	}),
 	z.object({
 		type: z.literal("unsubscribe"),
