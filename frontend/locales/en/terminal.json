@@ -13,5 +13,6 @@
 	"layoutSplitH": "Split horizontal",
 	"layoutSplitV": "Split vertical",
 	"layoutTriple": "Triple",
-	"layoutQuad": "Quad"
+	"layoutQuad": "Quad",
+	"disconnected": "Disconnected"
 }

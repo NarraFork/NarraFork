@@ -43,4 +43,6 @@
 	"landscape": "Landscape",
 	"source": "View source",
 	"rendered": "View rendered",
+	"wsDisconnected": "Real-time connection lost. Some updates may not appear.",
+	"wsReconnect": "Reconnect"
 }
