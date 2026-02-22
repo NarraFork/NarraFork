@@ -379,6 +379,64 @@ describe("prompt injection: control flow hiding", () => {
 });
 
 // ══════════════════════════════════════════════════════════
+// git 子命令级别检测
+// ══════════════════════════════════════════════════════════
+
+describe("git: safe subcommands → allow", () => {
+	test("git status", () => expectAllowed("git status"));
+	test("git log", () => expectAllowed("git log --oneline -20"));
+	test("git diff", () => expectAllowed("git diff HEAD~1"));
+	test("git branch -a (list)", () => expectAllowed("git branch -a"));
+	test("git remote -v", () => expectAllowed("git remote -v"));
+	test("git show", () => expectAllowed("git show HEAD:src/index.ts"));
+	test("git blame", () => expectAllowed("git blame src/index.ts"));
+	test("git stash list", () => expectAllowed("git stash list"));
+	test("git add", () => expectAllowed("git add ."));
+	test("git commit", () => expectAllowed('git commit -m "fix bug"'));
+	test("git push (normal)", () => expectAllowed("git push origin main"));
+	test("git pull", () => expectAllowed("git pull origin main"));
+	test("git checkout -b", () => expectAllowed("git checkout -b new-branch"));
+	test("git switch -c", () => expectAllowed("git switch -c new-branch"));
+	test("git stash", () => expectAllowed("git stash"));
+	test("git stash pop", () => expectAllowed("git stash pop"));
+	test("git tag", () => expectAllowed("git tag v1.0.0"));
+	test("git fetch", () => expectAllowed("git fetch --all"));
+	test("git clone", () => expectAllowed("git clone https://github.com/user/repo.git"));
+	test("git init", () => expectAllowed("git init"));
+});
+
+describe("git: destructive subcommands → block", () => {
+	test("push --force", () => expectBlocked("git push --force origin main"));
+	test("push -f", () => expectBlocked("git push -f origin main"));
+	test("push --force-with-lease", () => expectBlocked("git push --force-with-lease origin main"));
+	test("push --mirror", () => expectBlocked("git push --mirror"));
+	test("push --delete", () => expectBlocked("git push origin --delete feature"));
+	test("reset --hard", () => expectBlocked("git reset --hard HEAD~5"));
+	test("clean -fd", () => expectBlocked("git clean -fd"));
+	test("clean -fdx", () => expectBlocked("git clean -fdx"));
+	test("checkout -- (discard)", () => expectBlocked("git checkout -- ."));
+	test("rebase", () => expectBlocked("git rebase main"));
+	test("rebase -i", () => expectBlocked("git rebase -i HEAD~10"));
+	test("merge", () => expectBlocked("git merge feature"));
+	test("filter-branch", () => expectBlocked("git filter-branch --all"));
+	test("reflog expire", () => expectBlocked("git reflog expire --expire=now --all"));
+	test("gc --prune", () => expectBlocked("git gc --prune=now --aggressive"));
+	test("branch -D", () => expectBlocked("git branch -D main"));
+	test("branch -d", () => expectBlocked("git branch -d feature"));
+	test("branch --delete", () => expectBlocked("git branch --delete feature"));
+
+	// dangerousPatterns 应该包含原因
+	test("push --force has reason", async () => {
+		const r = await expectBlocked("git push --force origin main");
+		expect(r.dangerousPatterns.some((p) => p.includes("push --force"))).toBe(true);
+	});
+	test("reset --hard has reason", async () => {
+		const r = await expectBlocked("git reset --hard HEAD~5");
+		expect(r.dangerousPatterns.some((p) => p.includes("reset --hard"))).toBe(true);
+	});
+});
+
+// ══════════════════════════════════════════════════════════
 // 第十一部分：供应链提示词注入 — 混合攻击（多技术组合）
 // ══════════════════════════════════════════════════════════
 
@@ -781,5 +839,543 @@ describe("catastrophic: resolvePermissionDecision returns fatal", () => {
 			analysis,
 		);
 		expect(decision).toBe("ask");
+	});
+});
+
+// ══════════════════════════════════════════════════════════
+// Chapter 模式 Git 分支限制
+// ══════════════════════════════════════════════════════════
+
+describe("Chapter mode - git branch restrictions", () => {
+	const cwd = "/home/user/project";
+
+	/** 在 chapter 模式下分析命令 */
+	async function chapterAnalyze(cmd: string) {
+		return analyzeBashCommand(cmd, cwd, true);
+	}
+
+	/** 在非 chapter 模式下分析命令 */
+	async function normalAnalyze(cmd: string) {
+		return analyzeBashCommand(cmd, cwd, false);
+	}
+
+	// ── 只读命令：chapter 模式下应放行 ──
+
+	describe("read-only git commands (allowed in chapter mode)", () => {
+		const readonlyCmds = [
+			"git status",
+			"git log --oneline -20",
+			"git diff HEAD~1",
+			"git diff --cached",
+			"git show HEAD",
+			"git blame src/index.ts",
+			"git shortlog -sn",
+			"git describe --tags",
+			"git remote -v",
+			"git config --list",
+			"git rev-parse HEAD",
+			"git rev-list --count HEAD",
+			"git ls-files",
+			"git ls-tree HEAD",
+			"git ls-remote origin",
+			"git cat-file -p HEAD",
+			"git reflog",
+			"git for-each-ref refs/heads",
+			"git count-objects -v",
+			"git fsck",
+			"git branch",
+			"git branch -a",
+			"git branch -r",
+			"git branch --list",
+			"git branch -v",
+			"git branch --verbose",
+			"git branch --contains HEAD",
+			"git branch --merged",
+			"git tag",
+		];
+
+		for (const cmd of readonlyCmds) {
+			test(`${cmd} → no violations`, async () => {
+				const r = await chapterAnalyze(cmd);
+				expect(r.gitBranchViolations).toEqual([]);
+			});
+		}
+	});
+
+	// ── 当前分支安全写操作：chapter 模式下应放行 ──
+
+	describe("current-branch safe writes (allowed in chapter mode)", () => {
+		const safeCmds = [
+			"git add .",
+			"git add -A",
+			"git commit -m 'fix bug'",
+			"git commit --amend --no-edit",
+			"git restore --staged src/index.ts",
+			"git rm --cached old-file.txt",
+			"git mv old.ts new.ts",
+			"git apply patch.diff",
+			"git cherry-pick abc123",
+			"git fetch origin",
+			"git pull origin main",
+			"git stash",
+			"git stash pop",
+			"git stash drop",
+			"git grep 'TODO'",
+			"git archive --format=tar HEAD",
+			"git format-patch HEAD~3",
+			"git clean -fd",
+			"git gc",
+			"git gc --prune=now",
+			"git init",
+			"git clone https://github.com/user/repo.git",
+			"git submodule update --init",
+			"git bisect start",
+			"git notes add -m 'note'",
+		];
+
+		for (const cmd of safeCmds) {
+			test(`${cmd} → no violations`, async () => {
+				const r = await chapterAnalyze(cmd);
+				expect(r.gitBranchViolations).toEqual([]);
+			});
+		}
+	});
+
+	// ── 分支切换：chapter 模式下应拦截 ──
+
+	describe("branch switching (denied in chapter mode)", () => {
+		test("git checkout main", async () => {
+			const r = await chapterAnalyze("git checkout main");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("switches branch");
+		});
+
+		test("git checkout develop", async () => {
+			const r = await chapterAnalyze("git checkout develop");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git checkout -b new-feature", async () => {
+			const r = await chapterAnalyze("git checkout -b new-feature");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("creates new branch");
+		});
+
+		test("git checkout -B force-branch", async () => {
+			const r = await chapterAnalyze("git checkout -B force-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git switch main", async () => {
+			const r = await chapterAnalyze("git switch main");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("switches branch");
+		});
+
+		test("git switch -c new-branch", async () => {
+			const r = await chapterAnalyze("git switch -c new-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		// checkout -- <file> 是恢复文件，不是切换分支
+		test("git checkout -- src/index.ts → allowed (file restore)", async () => {
+			const r = await chapterAnalyze("git checkout -- src/index.ts");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+	});
+
+	// ── 分支创建/删除/重命名：chapter 模式下应拦截 ──
+
+	describe("branch create/delete/rename (denied in chapter mode)", () => {
+		test("git branch new-feature", async () => {
+			const r = await chapterAnalyze("git branch new-feature");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("creates new branch");
+		});
+
+		test("git branch -d old-branch", async () => {
+			const r = await chapterAnalyze("git branch -d old-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("deletes branch");
+		});
+
+		test("git branch -D force-delete", async () => {
+			const r = await chapterAnalyze("git branch -D force-delete");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("deletes branch");
+		});
+
+		test("git branch --delete old-branch", async () => {
+			const r = await chapterAnalyze("git branch --delete old-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git branch -m old-name new-name", async () => {
+			const r = await chapterAnalyze("git branch -m old-name new-name");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("renames branch");
+		});
+
+		test("git branch -M force-rename", async () => {
+			const r = await chapterAnalyze("git branch -M force-rename");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git branch -c copy-branch", async () => {
+			const r = await chapterAnalyze("git branch -c copy-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("copies branch");
+		});
+	});
+
+	// ── Push 限制：chapter 模式下应拦截危险 push ──
+
+	describe("push restrictions (denied in chapter mode)", () => {
+		test("git push --force", async () => {
+			const r = await chapterAnalyze("git push --force");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("--force");
+		});
+
+		test("git push -f origin main", async () => {
+			const r = await chapterAnalyze("git push -f origin main");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git push --force-with-lease", async () => {
+			const r = await chapterAnalyze("git push --force-with-lease");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git push --mirror", async () => {
+			const r = await chapterAnalyze("git push --mirror");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			// --mirror should only produce one violation (--all/--mirror), not also --force
+			expect(r.gitBranchViolations).toHaveLength(1);
+			expect(r.gitBranchViolations[0]).toContain("--all/--mirror");
+		});
+
+		test("git push --all", async () => {
+			const r = await chapterAnalyze("git push --all");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("--all");
+		});
+
+		test("git push --delete origin old-branch", async () => {
+			const r = await chapterAnalyze("git push --delete origin old-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("--delete");
+		});
+
+		test("git push -d origin old-branch (short flag)", async () => {
+			const r = await chapterAnalyze("git push -d origin old-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("--delete");
+		});
+
+		test("git push origin src:dst (refspec targeting other branch)", async () => {
+			const r = await chapterAnalyze("git push origin feature:main");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("refspec");
+		});
+
+		// 普通 push（当前分支）应该放行
+		test("git push → no violations (pushes current branch)", async () => {
+			const r = await chapterAnalyze("git push");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git push origin → no violations", async () => {
+			const r = await chapterAnalyze("git push origin");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git push origin HEAD → no violations", async () => {
+			const r = await chapterAnalyze("git push origin HEAD");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+	});
+
+	// ── Merge/Rebase/Reset：chapter 模式下应拦截 ──
+
+	describe("merge/rebase/reset (denied in chapter mode)", () => {
+		test("git merge develop", async () => {
+			const r = await chapterAnalyze("git merge develop");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("merge");
+		});
+
+		test("git merge --no-ff feature", async () => {
+			const r = await chapterAnalyze("git merge --no-ff feature");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git rebase main", async () => {
+			const r = await chapterAnalyze("git rebase main");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("rebase");
+		});
+
+		test("git rebase -i HEAD~3", async () => {
+			const r = await chapterAnalyze("git rebase -i HEAD~3");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git reset --hard HEAD~1", async () => {
+			const r = await chapterAnalyze("git reset --hard HEAD~1");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("reset");
+		});
+
+		test("git reset --soft HEAD~1", async () => {
+			const r = await chapterAnalyze("git reset --soft HEAD~1");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git reset --mixed HEAD~1", async () => {
+			const r = await chapterAnalyze("git reset --mixed HEAD~1");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		// unstage 操作应该放行
+		test("git reset HEAD file.txt → allowed (unstage)", async () => {
+			const r = await chapterAnalyze("git reset HEAD file.txt");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git reset → allowed (unstage all)", async () => {
+			const r = await chapterAnalyze("git reset");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git reset -- file.txt → allowed (unstage file)", async () => {
+			const r = await chapterAnalyze("git reset -- file.txt");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+	});
+
+	// ── Worktree/Filter：chapter 模式下应拦截 ──
+
+	describe("worktree and history rewrite (denied in chapter mode)", () => {
+		test("git worktree add ../other-branch main", async () => {
+			const r = await chapterAnalyze("git worktree add ../other-branch main");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("worktree add");
+		});
+
+		test("git worktree remove ../other-branch", async () => {
+			const r = await chapterAnalyze("git worktree remove ../other-branch");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git worktree list → allowed", async () => {
+			const r = await chapterAnalyze("git worktree list");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git filter-branch", async () => {
+			const r = await chapterAnalyze("git filter-branch --tree-filter 'rm -f secret' HEAD");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git filter-repo", async () => {
+			const r = await chapterAnalyze("git filter-repo --path src/");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+	});
+
+	// ── Tag 创建/删除：chapter 模式下应拦截 ──
+
+	describe("tag create/delete (denied in chapter mode)", () => {
+		test("git tag v1.0.0", async () => {
+			const r = await chapterAnalyze("git tag v1.0.0");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("tag");
+		});
+
+		test("git tag -a v1.0.0 -m 'release'", async () => {
+			const r = await chapterAnalyze("git tag -a v1.0.0 -m 'release'");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git tag -d v1.0.0", async () => {
+			const r = await chapterAnalyze("git tag -d v1.0.0");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		// 纯 git tag（列出标签）应放行
+		test("git tag → allowed (list tags)", async () => {
+			const r = await chapterAnalyze("git tag");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git tag -l → allowed (list tags)", async () => {
+			const r = await chapterAnalyze("git tag -l");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git tag -l 'v1.*' → allowed (list matching tags)", async () => {
+			const r = await chapterAnalyze("git tag -l 'v1.*'");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+
+		test("git tag --list → allowed", async () => {
+			const r = await chapterAnalyze("git tag --list");
+			expect(r.gitBranchViolations).toEqual([]);
+		});
+	});
+
+	// ── 非 chapter 模式下不应有分支违规 ──
+
+	describe("non-chapter mode (no violations)", () => {
+		const cmds = [
+			"git checkout main",
+			"git switch develop",
+			"git branch new-feature",
+			"git branch -D old",
+			"git push --force",
+			"git merge develop",
+			"git rebase main",
+			"git reset --hard HEAD~1",
+		];
+
+		for (const cmd of cmds) {
+			test(`${cmd} → no violations in normal mode`, async () => {
+				const r = await normalAnalyze(cmd);
+				expect(r.gitBranchViolations).toEqual([]);
+			});
+		}
+	});
+
+	// ── resolvePermissionDecision 集成测试 ──
+
+	describe("resolvePermissionDecision integration", () => {
+		test("chapter mode + branch violation → deny", async () => {
+			const analysis = await chapterAnalyze("git checkout main");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git checkout main" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true, // isChapter
+			);
+			expect(decision).toBe("deny");
+		});
+
+		test("chapter mode + safe git command → allow", async () => {
+			const analysis = await chapterAnalyze("git status");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git status" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			expect(decision).toBe("allow");
+		});
+
+		test("chapter mode + git add/commit → allow", async () => {
+			const analysis = await chapterAnalyze("git add . && git commit -m 'fix'");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git add . && git commit -m 'fix'" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			expect(decision).toBe("allow");
+		});
+
+		test("chapter mode + git push (normal) → allow", async () => {
+			const analysis = await chapterAnalyze("git push origin");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git push origin" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			expect(decision).toBe("allow");
+		});
+
+		test("chapter mode + git push --force → deny", async () => {
+			const analysis = await chapterAnalyze("git push --force");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git push --force" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			expect(decision).toBe("deny");
+		});
+
+		test("non-chapter mode + git checkout → allow (no branch restriction)", async () => {
+			const analysis = await normalAnalyze("git checkout main");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git checkout main" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				false, // not chapter
+			);
+			// git checkout without -- is safe in CONDITIONAL_COMMANDS (returns null)
+			expect(decision).toBe("allow");
+		});
+
+		test("bypassPermissions does NOT bypass chapter branch restrictions", async () => {
+			const analysis = await chapterAnalyze("git checkout main");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git checkout main" },
+				"bypassPermissions",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			// Branch violations are checked BEFORE bypassPermissions
+			expect(decision).toBe("deny");
+		});
+
+		test("chapter mode + mixed command with branch violation → deny", async () => {
+			const analysis = await chapterAnalyze("git status && git checkout develop");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "git status && git checkout develop" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			expect(decision).toBe("deny");
+		});
+
+		test("catastrophic still takes priority over chapter deny", async () => {
+			const analysis = await chapterAnalyze("rm -rf /");
+			const decision = resolvePermissionDecision(
+				"Bash",
+				{ command: "rm -rf /" },
+				"default",
+				cwd,
+				false,
+				analysis,
+				true,
+			);
+			expect(decision).toBe("fatal");
+		});
 	});
 });

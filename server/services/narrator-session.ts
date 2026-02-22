@@ -165,6 +165,7 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode"];
 
+// TODO: refactor resolvePermissionDecision params into an options object when adding more flags
 export function resolvePermissionDecision(
 	toolName: string,
 	input: Record<string, unknown>,
@@ -172,9 +173,13 @@ export function resolvePermissionDecision(
 	cwd: string,
 	planMode = false,
 	bashAnalysis?: BashAnalysis,
+	isChapter = false,
 ): "allow" | "deny" | "ask" | "fatal" {
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === "Bash" && bashAnalysis?.isCatastrophic) return "fatal";
+
+	// Chapter mode: git branch violations are hard-denied (no bypass)
+	if (toolName === "Bash" && isChapter && bashAnalysis?.gitBranchViolations?.length) return "deny";
 
 	// Plan mode: deny mutating tools (except Bash which keeps its normal permission flow)
 	if (planMode && !PLAN_MODE_ALLOWED_TOOLS.has(toolName)) return "deny";
@@ -223,16 +228,17 @@ export async function handlePermission(
 	// Read permission mode and plan mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { permissionMode: true, planMode: true },
+		columns: { permissionMode: true, planMode: true, chapterId: true },
 	});
 	const permMode = narrator?.permissionMode ?? "default";
 	const planMode = narrator?.planMode ?? false;
+	const isChapter = !!narrator?.chapterId;
 
 	// Bash command pre-analysis via tree-sitter AST
 	let bashAnalysis: BashAnalysis | undefined;
 	if (toolName === "Bash" && typeof input.command === "string") {
 		try {
-			bashAnalysis = await analyzeBashCommand(input.command, cwd);
+			bashAnalysis = await analyzeBashCommand(input.command, cwd, isChapter);
 		} catch (err) {
 			logger.warn("Bash command analysis failed, falling back to ask", { err });
 			// Analysis failure → conservative: ask user
@@ -246,6 +252,7 @@ export async function handlePermission(
 		cwd,
 		planMode,
 		bashAnalysis,
+		isChapter,
 	);
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
@@ -292,8 +299,21 @@ export async function handlePermission(
 		return { behavior: "allow", updatedInput: input };
 	}
 	if (decision === "deny") {
-		const denyMsg = getToolMessage("permissionDeniedNonInteractive", locale);
-		logger.debug("Permission auto-denied", { narratorId, toolName, toolUseId, permMode });
+		// Chapter mode git branch violation — provide specific error message
+		const branchViolations = bashAnalysis?.gitBranchViolations;
+		const denyMsg =
+			isChapter && branchViolations?.length
+				? `DENIED: Chapter mode restricts git branch operations. Violations: ${branchViolations.join("; ")}. You may only work on the current branch.`
+				: getToolMessage("permissionDeniedNonInteractive", locale);
+		const decisionReason =
+			isChapter && branchViolations?.length ? branchViolations.join("; ") : undefined;
+		logger.debug("Permission auto-denied", {
+			narratorId,
+			toolName,
+			toolUseId,
+			permMode,
+			...(decisionReason ? { reason: decisionReason } : {}),
+		});
 		await db
 			.update(narratorToolCalls)
 			.set({
@@ -301,6 +321,7 @@ export async function handlePermission(
 				errorMessage: denyMsg,
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
+				...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 			})
 			.where(
 				and(

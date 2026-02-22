@@ -32,6 +32,8 @@ export interface BashAnalysis {
 	isCatastrophic: boolean;
 	/** 灾难性命令的原因描述 */
 	catastrophicReason?: string;
+	/** Chapter 模式下检测到的 git 分支违规操作（切换分支、修改其他分支等） */
+	gitBranchViolations: string[];
 }
 
 // ── 白名单 ────────────────────────────────────────────────
@@ -239,6 +241,55 @@ const ALWAYS_ASK_COMMANDS = new Set([
  */
 const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) => string | null> =
 	{
+		// git — 大部分子命令安全，但部分写操作有破坏性
+		git: (tokens) => {
+			const sub = tokens[1];
+			if (!sub) return null;
+
+			// push --force / -f / --force-with-lease / --mirror / --delete
+			if (sub === "push") {
+				if (tokens.some((t) => t === "--force" || t === "-f" || t === "--force-with-lease" || t === "--mirror"))
+					return "git push --force (rewrites remote history)";
+				if (tokens.some((t) => t === "--delete" || t === "-d"))
+					return "git push --delete (deletes remote ref)";
+				return null;
+			}
+			// reset --hard
+			if (sub === "reset" && tokens.some((t) => t === "--hard"))
+				return "git reset --hard (discards uncommitted changes)";
+			// clean -f / -fd / -fdx
+			if (sub === "clean")
+				return "git clean (removes untracked files)";
+			// checkout -- (discard changes) — only when restoring files, not switching branches
+			if (sub === "checkout" && tokens.includes("--"))
+				return "git checkout -- (discards working tree changes)";
+			// rebase (interactive or not — rewrites history)
+			if (sub === "rebase")
+				return "git rebase (rewrites commit history)";
+			// merge (can cause conflicts / alter branch state)
+			if (sub === "merge")
+				return "git merge (alters branch state)";
+			// filter-branch / filter-repo (mass history rewrite)
+			if (sub === "filter-branch" || sub === "filter-repo")
+				return `git ${sub} (mass history rewrite)`;
+			// reflog expire
+			if (sub === "reflog" && tokens.includes("expire"))
+				return "git reflog expire (destroys recovery points)";
+			// gc with aggressive prune
+			if (sub === "gc" && tokens.some((t) => t.startsWith("--prune")))
+				return "git gc --prune (permanently removes objects)";
+			// branch -D (force delete)
+			if (sub === "branch" && tokens.some((t) => t === "-D" || t === "--delete" || t === "-d"))
+				return "git branch delete";
+			// submodule deinit
+			if (sub === "submodule" && tokens.includes("deinit"))
+				return "git submodule deinit";
+			// worktree remove
+			if (sub === "worktree" && tokens.includes("remove"))
+				return "git worktree remove";
+
+			return null;
+		},
 		// node -e / --eval / --input-type / -p 可以执行任意 JS
 		node: (tokens) => {
 			const dangerous = ["-e", "--eval", "-p", "--print", "-"];
@@ -633,6 +684,244 @@ function isCatastrophicPath(p: string): boolean {
 	return CATASTROPHIC_PATHS.has(normalized);
 }
 
+// ── Chapter 模式 Git 分支违规检测 ─────────────────────────
+
+/**
+ * Git 纯只读子命令 — 在 chapter 模式下始终允许。
+ * 这些命令不会产生任何写入副作用。
+ */
+const GIT_READONLY_SUBCOMMANDS = new Set([
+	"status",
+	"log",
+	"diff",
+	"show",
+	"blame",
+	"shortlog",
+	"describe",
+	"rev-parse",
+	"rev-list",
+	"ls-files",
+	"ls-tree",
+	"ls-remote",
+	"cat-file",
+	"name-rev",
+	"reflog", // 查看 reflog（expire 已在 CONDITIONAL 中拦截）
+	"for-each-ref",
+	"count-objects",
+	"fsck",
+	"verify-pack",
+	"hash-object",
+	"symbolic-ref",
+]);
+
+/**
+ * 当前分支安全操作 — 只影响当前分支的工作区/暂存区/提交/本地配置。
+ * 在 chapter 模式下允许，因为不会影响其他分支。
+ * 注意：部分命令有写入副作用（如 stash/config/remote），但不涉及分支变更。
+ */
+const GIT_CURRENT_BRANCH_SAFE = new Set([
+	"add",
+	"commit",
+	"restore",
+	"rm",
+	"mv",
+	"apply",
+	"cherry-pick",
+	"am",
+	"notes",
+	"bisect",
+	"grep",
+	"archive",
+	"bundle",
+	"format-patch",
+	"send-email",
+	"request-pull",
+	"svn",
+	"init",
+	"clone",
+	"fetch",
+	"pull",
+	"submodule",
+	"stash",  // push/pop/drop 有副作用，但不影响分支
+	"config", // 可写入 .git/config，但不影响分支
+	"remote", // add/remove 修改远程配置，但不影响分支
+]);
+
+/**
+ * 检测 chapter 模式下的 git 分支违规操作。
+ * 返回违规描述列表（空列表 = 无违规）。
+ *
+ * 在 chapter 模式下，agent 只能在当前分支上工作，禁止：
+ * - 切换分支（checkout <branch>, switch, worktree add）
+ * - 创建/删除分支（branch <name>, branch -d/-D）
+ * - 推送到其他分支（push origin <src>:<dst>）
+ * - 修改其他分支的历史（rebase <other-branch>, merge, reset 到其他分支）
+ * - 强制推送（push --force）
+ */
+function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[] {
+	const violations: string[] = [];
+
+	for (const cmd of commands) {
+		const tokens = cmd.tokens;
+		if (tokens[0] !== "git") continue;
+
+		const sub = tokens[1];
+		if (!sub) continue;
+
+		// 只读命令 — 始终安全
+		if (GIT_READONLY_SUBCOMMANDS.has(sub)) continue;
+
+		// 当前分支安全写操作 — 允许
+		if (GIT_CURRENT_BRANCH_SAFE.has(sub)) continue;
+
+		// ── 逐个检测可能影响分支的命令 ──
+
+		// checkout: 只允许 checkout -- <file>（恢复文件），禁止切换分支
+		if (sub === "checkout") {
+			// checkout -- <file> 是恢复文件，不是切换分支（虽然有风险，但不违反分支限制）
+			if (tokens.includes("--")) continue;
+			// checkout -b <branch> 创建新分支
+			if (tokens.some((t) => t === "-b" || t === "-B"))
+				violations.push("git checkout -b (creates new branch)");
+			else violations.push("git checkout (switches branch)");
+			continue;
+		}
+
+		// switch: 专门用于切换分支
+		if (sub === "switch") {
+			violations.push("git switch (switches branch)");
+			continue;
+		}
+
+		// branch: 查看分支列表是安全的，但创建/删除分支不行
+		if (sub === "branch") {
+			// 纯 `git branch` 或 `git branch -a/-r/--list/-v/--verbose` 是只读
+			const readonlyFlags = new Set(["-a", "--all", "-r", "--remotes", "--list", "-v", "--verbose", "-vv", "--no-color", "--color"]);
+			// 这些 flag 后面跟一个值参数（不是分支名）
+			const flagsWithValue = new Set(["--sort", "--format", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]);
+			const args = tokens.slice(2);
+			let hasWriteFlag = false;
+			const nonFlagArgs: string[] = [];
+			let skipNext = false;
+			for (let i = 0; i < args.length; i++) {
+				if (skipNext) { skipNext = false; continue; }
+				const arg = args[i];
+				if (arg.startsWith("-")) {
+					// Check if it's a flag with value (--contains=X or --contains X)
+					const eqIdx = arg.indexOf("=");
+					const flagName = eqIdx >= 0 ? arg.slice(0, eqIdx) : arg;
+					if (flagsWithValue.has(flagName)) {
+						if (eqIdx < 0) skipNext = true; // next arg is the value
+					} else if (!readonlyFlags.has(arg)) {
+						hasWriteFlag = true;
+					}
+				} else {
+					nonFlagArgs.push(arg);
+				}
+			}
+			// 如果有非 flag 参数（分支名）或写 flag（-d/-D/-m/-M/-c/-C），则是写操作
+			if (nonFlagArgs.length > 0 || hasWriteFlag) {
+				const flags = args.filter((t) => t.startsWith("-"));
+				if (flags.some((f) => f === "-d" || f === "-D" || f === "--delete"))
+					violations.push("git branch -d/-D (deletes branch)");
+				else if (flags.some((f) => f === "-m" || f === "-M" || f === "--move"))
+					violations.push("git branch -m/-M (renames branch)");
+				else if (flags.some((f) => f === "-c" || f === "-C" || f === "--copy"))
+					violations.push("git branch -c/-C (copies branch)");
+				else if (nonFlagArgs.length > 0)
+					violations.push("git branch <name> (creates new branch)");
+			}
+			continue;
+		}
+
+		// push: 禁止 --force 和推送到非当前分支的 refspec
+		if (sub === "push") {
+			const pushFlags = tokens.slice(2);
+			if (pushFlags.some((t) => t === "--force" || t === "-f" || t === "--force-with-lease"))
+				violations.push("git push --force (may overwrite other branches)");
+			if (pushFlags.some((t) => t === "--delete" || t === "-d"))
+				violations.push("git push --delete (deletes remote branch)");
+			// push --all / --mirror 推送所有分支/引用
+			if (pushFlags.some((t) => t === "--all" || t === "--mirror"))
+				violations.push("git push --all/--mirror (pushes all branches)");
+			// 检查 refspec src:dst 格式 — 可能推送到其他分支
+			const pushArgs = pushFlags.filter((t) => !t.startsWith("-"));
+			// pushArgs: [remote, refspec...]
+			for (const arg of pushArgs.slice(1)) {
+				if (arg.includes(":")) {
+					violations.push(`git push with refspec '${arg}' (may target other branch)`);
+				}
+			}
+			continue;
+		}
+
+		// merge: 禁止（会改变当前分支状态，且涉及其他分支）
+		if (sub === "merge") {
+			violations.push("git merge (merges another branch into current)");
+			continue;
+		}
+
+		// rebase: 禁止（重写历史，可能涉及其他分支）
+		if (sub === "rebase") {
+			violations.push("git rebase (rewrites branch history)");
+			continue;
+		}
+
+		// reset: `git reset [file]` / `git reset HEAD [file]` (unstage) 是安全的，
+		// 但 `git reset --hard/--soft/--mixed` 会改变分支状态
+		if (sub === "reset") {
+			const resetArgs = tokens.slice(2);
+			const dangerousResetFlags = ["--hard", "--soft", "--mixed", "--merge", "--keep"];
+			if (resetArgs.some((t) => dangerousResetFlags.includes(t))) {
+				violations.push("git reset --hard/--soft/--mixed (alters branch state)");
+			}
+			// 纯 `git reset` (unstage all) 或 `git reset -- file` (unstage file) 是安全的
+			continue;
+		}
+
+		// clean: 允许（只影响工作区，不影响分支）
+		if (sub === "clean") continue;
+
+		// worktree: 禁止 add（创建新 worktree 关联其他分支）
+		if (sub === "worktree") {
+			if (tokens.includes("add"))
+				violations.push("git worktree add (creates worktree for another branch)");
+			if (tokens.includes("remove"))
+				violations.push("git worktree remove (removes worktree)");
+			// list/prune 是安全的
+			continue;
+		}
+
+		// filter-branch / filter-repo: 禁止
+		if (sub === "filter-branch" || sub === "filter-repo") {
+			violations.push(`git ${sub} (mass history rewrite)`);
+			continue;
+		}
+
+		// tag: 纯 `git tag` / `git tag -l` 列出标签是只读的，
+		// `git tag <name>` 创建标签 / `git tag -d` 删除标签需要拦截
+		if (sub === "tag") {
+			const tagFlags = tokens.slice(2);
+			// -l/--list 后面的参数是 pattern，不是 tag 名
+			const isListMode = tagFlags.some((t) => t === "-l" || t === "--list");
+			if (isListMode) continue;
+			// -n<num> / --contains / --sort 等也是只读查询
+			const tagArgs = tagFlags.filter((t) => !t.startsWith("-"));
+			if (tagArgs.length > 0 || tagFlags.some((t) => t === "-d" || t === "--delete" || t === "-a" || t === "-s"))
+				violations.push("git tag (creates/deletes tags)");
+			continue;
+		}
+
+		// gc: 允许（维护操作，不影响分支）
+		if (sub === "gc") continue;
+
+		// 其他未知 git 子命令 — 保守拒绝
+		violations.push(`git ${sub} (unknown git subcommand in chapter mode)`);
+	}
+
+	return violations;
+}
+
 /**
  * 检测灾难性命令 — 不可逆的系统级破坏操作。
  * 返回 null 表示安全，否则返回原因描述。
@@ -735,8 +1024,9 @@ function detectCatastrophic(commands: BashAnalysis["commands"], rawCommand: stri
 
 /**
  * 分析 bash 命令字符串，返回命令列表、路径和白名单状态。
+ * @param isChapter 是否在 chapter 模式下运行（启用 git 分支限制）
  */
-export async function analyzeBashCommand(command: string, cwd: string): Promise<BashAnalysis> {
+export async function analyzeBashCommand(command: string, cwd: string, isChapter = false): Promise<BashAnalysis> {
 	const parser = await getParser();
 	const tree = parser.parse(command);
 
@@ -858,6 +1148,9 @@ export async function analyzeBashCommand(command: string, cwd: string): Promise<
 	// 灾难性命令检测
 	const catastrophicReason = detectCatastrophic(commands, command);
 
+	// Chapter 模式下的 git 分支违规检测
+	const gitBranchViolations = isChapter ? detectGitBranchViolations(commands) : [];
+
 	return {
 		commands,
 		filePaths,
@@ -868,6 +1161,7 @@ export async function analyzeBashCommand(command: string, cwd: string): Promise<
 		hasEnvInjection,
 		isCatastrophic: catastrophicReason !== null,
 		catastrophicReason: catastrophicReason ?? undefined,
+		gitBranchViolations,
 	};
 }
 
@@ -879,4 +1173,6 @@ export {
 	PATH_COMMANDS,
 	CONDITIONAL_COMMANDS,
 	DANGEROUS_ENV_VARS,
+	GIT_READONLY_SUBCOMMANDS,
+	GIT_CURRENT_BRANCH_SAFE,
 };
