@@ -46,6 +46,12 @@ export type NarratorServerMessage =
 	| { type: "compact_done"; narratorId: string }
 	| { type: "compact_failed"; narratorId: string; messageId: string }
 	| { type: "context_usage"; narratorId: string; percentage: number }
+	| {
+			type: "prune_boundary";
+			narratorId: string;
+			boundaryMessageId: string | null;
+			prunedPercent: number | null;
+	  }
 	| { type: "metering"; narratorId: string; unit: string; unitPlural: string; usage: number }
 	// Narrator fork events forwarded via eventBus.onAny
 	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
@@ -88,7 +94,14 @@ export type NarratorServerMessage =
 			message: string;
 	  }
 	| { type: "auto_commit_failed"; narratorId: string; chapterId: string; error: string }
-	| { type: "error"; message: string };
+	| {
+			type: "catch_up";
+			narratorId: string;
+			orphanChildren: unknown[];
+			topLevel: unknown[];
+	  }
+	| { type: "error"; message: string }
+	| { type: "context_length_exceeded"; narratorId: string };
 
 // Client → Server messages
 export type NarratorClientMessage =
@@ -136,7 +149,8 @@ function shouldForwardEvent(event: NarraForkEvent): boolean {
 	return (
 		event.type.startsWith("narrator:") ||
 		event.type.startsWith("chapter:") ||
-		event.type.startsWith("merge:")
+		event.type.startsWith("merge:") ||
+		event.type.startsWith("user:")
 	);
 }
 
@@ -212,23 +226,18 @@ export const handleNarratorWS = {
 					narratorService
 						.getMessagesAfter(narratorId, msg.lastMessageId)
 						.then(({ topLevel, orphanChildren }) => {
-							// Send orphan children first — they belong to older messages
-							// already in the client's cache and need to be inserted via
-							// insertChildIntoCache before new top-level messages arrive.
-							for (const message of orphanChildren) {
-								try {
-									ws.send(JSON.stringify({ type: "message", narratorId, message }));
-								} catch {
-									return;
-								}
-							}
-							// Then send new top-level messages (tree-structured)
-							for (const message of topLevel) {
-								try {
-									ws.send(JSON.stringify({ type: "message", narratorId, message }));
-								} catch {
-									return;
-								}
+							if (topLevel.length === 0 && orphanChildren.length === 0) return;
+							try {
+								ws.send(
+									JSON.stringify({
+										type: "catch_up",
+										narratorId,
+										orphanChildren,
+										topLevel,
+									}),
+								);
+							} catch {
+								// connection dead
 							}
 						})
 						.catch((err: unknown) =>

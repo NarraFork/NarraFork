@@ -302,6 +302,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
+	recentTabs: text("recent_tabs").notNull().default("[]"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

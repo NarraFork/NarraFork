@@ -26,6 +26,7 @@ import {
 } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { RecentTabs } from "../components/nav/RecentTabs";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useUserPreferences } from "../hooks/useUserPreferences";
@@ -49,7 +50,7 @@ function RootLayout() {
 }
 
 function AuthenticatedLayout() {
-	const [opened, { toggle }] = useDisclosure();
+	const [opened, { toggle, close: closeNav }] = useDisclosure();
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
@@ -174,12 +175,17 @@ function AuthenticatedLayout() {
 			</AppShell.Header>
 
 			<AppShell.Navbar p="md" style={{ display: "flex", flexDirection: "column" }}>
-				<Box style={{ flex: 1 }}>
-					<NavLink component={Link} to="/" label={t("dashboard")} />
-					<NavLink component={Link} to="/projects" label={t("projects")} />
-					<NavLink component={Link} to="/sessions" label={t("sessions")} />
-					{user?.role === "admin" && <NavLink component={Link} to="/admin" label={t("admin")} />}
-					<NavLink component={Link} to="/settings" label={t("settings")} />
+				<Box>
+					<NavLink component={Link} to="/" label={t("dashboard")} onClick={closeNav} />
+					<NavLink component={Link} to="/projects" label={t("projects")} onClick={closeNav} />
+					<NavLink component={Link} to="/sessions" label={t("sessions")} onClick={closeNav} />
+					{user?.role === "admin" && (
+						<NavLink component={Link} to="/admin" label={t("admin")} onClick={closeNav} />
+					)}
+					<NavLink component={Link} to="/settings" label={t("settings")} onClick={closeNav} />
+				</Box>
+				<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+					<RecentTabs onNavigate={closeNav} />
 				</Box>
 				<NavLink
 					label={t("logout")}

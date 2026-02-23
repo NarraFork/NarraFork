@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { TreeMessage } from "../lib/api";
 import { getToken } from "../lib/api";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
@@ -36,9 +37,10 @@ interface NarratorWSCallbacks {
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number) => void;
-	onPruneBoundary?: (boundaryMessageId: string | null) => void;
+	onPruneBoundary?: (boundaryMessageId: string | null, prunedPercent: number | null) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onNarratorError?: (error: string) => void;
+	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -65,6 +67,10 @@ export function useNarratorWS(
 		if (!narratorId) return;
 
 		const wsStatusId = `narrator:${narratorId}`;
+		// Capture the narratorId for this effect invocation so we can guard
+		// against stale messages that arrive after the user navigated away
+		// (e.g. in-flight events from a pre-fork narrator).
+		const subscribedId = narratorId;
 
 		function syncGlobalStatus(isConnected: boolean) {
 			setWSStatus(wsStatusId, {
@@ -102,7 +108,7 @@ export function useNarratorWS(
 				syncGlobalStatus(true);
 				const subscribeMsg: Record<string, unknown> = {
 					type: "subscribe",
-					narratorIds: [narratorId],
+					narratorIds: [subscribedId],
 				};
 				if (lastMessageIdRef.current) {
 					subscribeMsg.lastMessageId = lastMessageIdRef.current;
@@ -113,6 +119,11 @@ export function useNarratorWS(
 				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
+					// Guard: discard messages targeting a different narrator.
+					// This prevents stale in-flight events (e.g. from a pre-fork
+					// narrator) from being applied to the wrong message cache when
+					// the user navigates between narrators.
+					if (data.narratorId && data.narratorId !== subscribedId) return;
 					switch (data.type) {
 						case "message":
 							callbacksRef.current.onMessage?.(data);
@@ -189,13 +200,19 @@ export function useNarratorWS(
 							callbacksRef.current.onContextUsage?.(data.percentage);
 							break;
 						case "prune_boundary":
-							callbacksRef.current.onPruneBoundary?.(data.boundaryMessageId ?? null);
+							callbacksRef.current.onPruneBoundary?.(
+								data.boundaryMessageId ?? null,
+								data.prunedPercent ?? null,
+							);
 							break;
 						case "metering":
 							callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
 							break;
 						case "narrator:error":
 							callbacksRef.current.onNarratorError?.(data.error);
+							break;
+						case "catch_up":
+							callbacksRef.current.onCatchUp?.(data.orphanChildren ?? [], data.topLevel ?? []);
 							break;
 					}
 				} catch (err) {
@@ -242,7 +259,7 @@ export function useNarratorWS(
 				ws.onclose = null;
 				ws.onerror = null;
 				if (ws.readyState === WebSocket.OPEN) {
-					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: [narratorId] }));
+					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: [subscribedId] }));
 				}
 				ws.close();
 			}
@@ -304,26 +321,31 @@ export function useNarratorWS(
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
 export interface SessionListWSEvent {
-	type: "status" | "title" | "planMode";
+	type: "status" | "title" | "planMode" | "unread";
 	status?: string;
 	title?: string;
 	planMode?: boolean;
+	unread?: boolean;
 }
 
 export function useSessionsListWS(
 	narratorIds: string[],
 	onUpdate: (narratorId: string, event: SessionListWSEvent) => void,
+	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
 ) {
 	const wsRef = useRef<WebSocket | null>(null);
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
+	const onGlobalEventRef = useRef(onGlobalEvent);
+	onGlobalEventRef.current = onGlobalEvent;
 
 	// Stable serialized key for dependency comparison
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds; using the array directly would reconnect on every render
 	useEffect(() => {
-		if (!narratorIds.length) return;
+		// Connect if we have narrator IDs to subscribe to, or a global event handler
+		if (!narratorIds.length && !onGlobalEventRef.current) return;
 
 		let cancelled = false;
 		let attempts = 0;
@@ -345,7 +367,9 @@ export function useSessionsListWS(
 					return;
 				}
 				attempts = 0;
-				ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
+				if (currentIds.length) {
+					ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
+				}
 			};
 			ws.onmessage = (event) => {
 				if (cancelled) return;
@@ -358,6 +382,10 @@ export function useSessionsListWS(
 						onUpdateRef.current(nId, { type: "title", title: data.title });
 					} else if (data.type === "plan_mode_changed") {
 						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
+					} else if (data.type === "narrator:unread_changed") {
+						onUpdateRef.current(nId, { type: "unread", unread: data.unread });
+					} else if (data.type.startsWith("user:")) {
+						onGlobalEventRef.current?.(data);
 					}
 				} catch (err) {
 					if (import.meta.env.DEV)
@@ -389,7 +417,7 @@ export function useSessionsListWS(
 				ws.onmessage = null;
 				ws.onclose = null;
 				ws.onerror = null;
-				if (ws.readyState === WebSocket.OPEN) {
+				if (ws.readyState === WebSocket.OPEN && currentIds.length) {
 					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
 				}
 				ws.close();

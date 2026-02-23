@@ -402,6 +402,15 @@ export const api = {
 			showTokenUsage: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
+			recentTabs: Array<{
+				type: "chapter" | "session";
+				id: string;
+				narratorId?: string;
+				title: string;
+				subtitle?: string;
+				status?: string;
+				lastVisitedAt: number;
+			}>;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -417,6 +426,34 @@ export const api = {
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",
 			body: JSON.stringify(data),
+		}),
+
+	// Recent Tabs
+	upsertRecentTab: (tab: {
+		type: "chapter" | "session";
+		id: string;
+		narratorId?: string;
+		title: string;
+		subtitle?: string;
+		status?: string;
+		lastVisitedAt: number;
+	}) =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs", {
+			method: "PUT",
+			body: JSON.stringify(tab),
+		}),
+	removeRecentTab: (type: "chapter" | "session", id: string) =>
+		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
+			method: "DELETE",
+		}),
+	clearRecentTabs: () =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs", {
+			method: "DELETE",
+		}),
+	reorderRecentTabs: (order: string[]) =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs/reorder", {
+			method: "PATCH",
+			body: JSON.stringify({ order }),
 		}),
 
 	// Containers

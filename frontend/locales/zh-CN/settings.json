@@ -38,6 +38,8 @@
 	"portRangeEnd": "端口范围结束",
 	"editorSection": "编辑器",
 	"editorType": "编辑器类型",
+	"legacyEncoding": "旧编码支持",
+	"legacyEncodingDesc": "自动检测并保留非 UTF-8 文件编码（如 GBK、Shift_JIS）。处理旧项目代码时启用此选项。",
 	"themeSection": "主题",
 	"themeLight": "浅色",
 	"themeDark": "深色",

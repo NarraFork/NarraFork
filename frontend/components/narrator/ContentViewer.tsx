@@ -24,11 +24,11 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
-import { getGlobalCloseSwipe, setGlobalCloseSwipe } from "./swipeState";
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -243,49 +243,15 @@ export const ContentViewer = memo(
 		}, [fullscreen]);
 
 		// Context menu state (desktop: Mantine Menu, mobile: swipe reveal)
-		const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
-		const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
+		// ContentViewer uses its own boxRef for both swipe and other purposes (viewport detection).
+		// excludeSelectors is empty because ContentViewer IS the content block.
+		const swipe = useSwipeMenu({
+			enabled: true,
+			externalBoxRef: boxRef,
+			excludeSelectors: [".mantine-Menu-dropdown"],
+		});
 
-		// Mobile swipe state
-		const [swipeOffset, setSwipeOffset] = useState(0);
-		const swipeOffsetRef = useRef(0);
-		const [swipeRevealed, setSwipeRevealed] = useState(false);
-		const [swipeClosing, setSwipeClosing] = useState(false);
-		const [swipeY, setSwipeY] = useState(0);
-		const [swipeInitialRight, setSwipeInitialRight] = useState(0);
-		const swipeRef = useRef<{
-			startX: number;
-			startY: number;
-			locked: boolean;
-			dir: "h" | "v" | null;
-		} | null>(null);
-		const SWIPE_THRESHOLD = 60;
-		const SWIPE_REVEAL_WIDTH = 180;
-		const swipeMenuRef = useRef<HTMLDivElement>(null);
-
-		const closeSwipe = useCallback(() => {
-			setSwipeClosing(true);
-			swipeOffsetRef.current = 0;
-			setSwipeOffset(0);
-			setSwipeRevealed(false);
-			setGlobalCloseSwipe(null);
-			// Remove menu DOM after transition completes
-			setTimeout(() => setSwipeClosing(false), 220);
-		}, []);
-
-		// Register as the global open swipe menu when revealed
-		useEffect(() => {
-			if (swipeRevealed) {
-				setGlobalCloseSwipe(closeSwipe);
-			}
-			return () => {
-				if (getGlobalCloseSwipe() === closeSwipe) {
-					setGlobalCloseSwipe(null);
-				}
-			};
-		}, [swipeRevealed, closeSwipe]);
-
-		// Desktop: right-click opens context menu
+		// Desktop: right-click opens context menu (override hook's handler to gate on !isMobile)
 		const handleContextMenu = useCallback(
 			(e: React.MouseEvent) => {
 				if (isMobile) return;
@@ -295,109 +261,11 @@ export const ContentViewer = memo(
 				e.stopPropagation();
 				const x = Math.min(e.clientX, window.innerWidth - 200);
 				const flipY = e.clientY > window.innerHeight - 300;
-				setCtxMenuPos({ x, y: e.clientY, flipY });
-				setCtxMenuOpened(true);
+				swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
+				swipe.setCtxMenuOpened(true);
 			},
-			[isMobile],
+			[isMobile, swipe.setCtxMenuPos, swipe.setCtxMenuOpened],
 		);
-
-		// Swipe-left to reveal action buttons (works on any touch device)
-		useEffect(() => {
-			const node = boxRef.current;
-			if (!node) return;
-
-			const onTouchStart = (e: TouchEvent) => {
-				// Don't interfere with open menus (e.g. another component's swipe menu)
-				if ((e.target as HTMLElement)?.closest?.(".mantine-Menu-dropdown")) return;
-				// Close any other open swipe menu
-				const currentGlobal = getGlobalCloseSwipe();
-				if (currentGlobal && currentGlobal !== closeSwipe) {
-					currentGlobal();
-					swipeRef.current = null;
-					return;
-				}
-				// If this menu is already revealed, close it and don't start a new swipe
-				if (swipeRevealed) {
-					closeSwipe();
-					swipeRef.current = null;
-					return;
-				}
-				const touch = e.touches[0];
-				swipeRef.current = {
-					startX: touch.clientX,
-					startY: touch.clientY,
-					locked: false,
-					dir: null,
-				};
-				setSwipeY(touch.clientY);
-				if (node) {
-					setSwipeInitialRight(node.getBoundingClientRect().right);
-				}
-			};
-
-			const onTouchMove = (e: TouchEvent) => {
-				const s = swipeRef.current;
-				if (!s || swipeRevealed) return;
-				const touch = e.touches[0];
-				const dx = s.startX - touch.clientX;
-				const dy = Math.abs(touch.clientY - s.startY);
-
-				// Determine direction lock
-				if (!s.dir) {
-					if (Math.abs(dx) > 10 || dy > 10) {
-						s.dir = Math.abs(dx) > dy ? "h" : "v";
-					}
-					return;
-				}
-				if (s.dir === "v") return; // vertical scroll, ignore
-
-				// Horizontal swipe — clamp between 0 and reveal width
-				const offset = Math.max(0, Math.min(dx, SWIPE_REVEAL_WIDTH));
-				swipeOffsetRef.current = offset;
-				setSwipeOffset(offset);
-			};
-
-			const onTouchEnd = () => {
-				const s = swipeRef.current;
-				swipeRef.current = null;
-				if (!s || s.dir !== "h") {
-					return;
-				}
-				// Snap: if past threshold, reveal; otherwise close
-				if (swipeOffsetRef.current >= SWIPE_THRESHOLD) {
-					swipeOffsetRef.current = SWIPE_REVEAL_WIDTH;
-					setSwipeOffset(SWIPE_REVEAL_WIDTH);
-					setSwipeRevealed(true);
-				} else {
-					swipeOffsetRef.current = 0;
-					setSwipeOffset(0);
-					setSwipeRevealed(false);
-				}
-			};
-
-			node.addEventListener("touchstart", onTouchStart, { passive: true });
-			node.addEventListener("touchmove", onTouchMove, { passive: true });
-			node.addEventListener("touchend", onTouchEnd, { passive: true });
-			return () => {
-				node.removeEventListener("touchstart", onTouchStart);
-				node.removeEventListener("touchmove", onTouchMove);
-				node.removeEventListener("touchend", onTouchEnd);
-			};
-		}, [swipeRevealed, closeSwipe]);
-
-		// Close swipe when tapping outside (but not on the swipe menu itself)
-		useEffect(() => {
-			if (!swipeRevealed) return;
-			const onTouch = (e: TouchEvent) => {
-				const target = e.target as Node;
-				const node = boxRef.current;
-				const menu = swipeMenuRef.current;
-				if (node?.contains(target) || menu?.contains(target)) return;
-				closeSwipe();
-			};
-			document.addEventListener("touchstart", onTouch, { passive: true });
-			return () => document.removeEventListener("touchstart", onTouch);
-		}, [swipeRevealed, closeSwipe]);
 
 		const iconSize = isMobile ? 18 : 12;
 		const btnSize: "lg" | "xs" = isMobile ? "lg" : "xs";
@@ -502,8 +370,7 @@ export const ContentViewer = memo(
 			}
 		}, [isMobile, open]);
 
-		const swipeTransition = swipeRef.current ? "none" : "transform 200ms ease";
-		const swipeMenuTransition = swipeRef.current ? "none" : "left 200ms ease, transform 200ms ease";
+		const SWIPE_REVEAL_WIDTH = 180;
 
 		return (
 			<>
@@ -515,8 +382,8 @@ export const ContentViewer = memo(
 					style={{
 						maxWidth: "100%",
 						minWidth: 0,
-						transform: swipeOffset > 0 ? `translateX(-${swipeOffset}px)` : undefined,
-						transition: swipeTransition,
+						transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+						transition: swipe.swipeTransition,
 					}}
 					onMouseEnter={isMobile ? undefined : () => setHovered(true)}
 					onMouseLeave={isMobile ? undefined : () => setHovered(false)}
@@ -552,30 +419,21 @@ export const ContentViewer = memo(
 				</Box>
 
 				{/* Swipe-reveal action menu — fixed, hugging the content's right edge */}
-				{(swipeOffset > 0 || swipeClosing) &&
+				{(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
 					(() => {
-						const menuLeft = swipeInitialRight - swipeOffset;
-						const boxRect = boxRef.current?.getBoundingClientRect();
-						const menuRef = swipeMenuRef.current;
-						const menuH = menuRef?.offsetHeight ?? 200;
-						let menuTop = swipeY;
-						if (boxRect && boxRect.height > menuH) {
-							// Clamp so menu stays within the content block bounds
-							const minTop = boxRect.top + menuH / 2;
-							const maxTop = boxRect.bottom - menuH / 2;
-							menuTop = Math.max(minTop, Math.min(swipeY, maxTop));
-						}
+						const menuEl = swipe.swipeMenuRef.current;
+						const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight ?? 200);
 						return (
 							<Box
-								ref={swipeMenuRef}
+								ref={swipe.swipeMenuRef}
 								style={{
 									position: "fixed",
-									left: menuLeft,
-									top: menuTop,
+									left: pos.left,
+									top: pos.top,
 									transform: "translateY(-50%)",
 									zIndex: 1000,
-									transition: swipeMenuTransition,
-									pointerEvents: swipeClosing ? "none" : "auto",
+									transition: swipe.swipeMenuTransition,
+									pointerEvents: swipe.swipeClosing ? "none" : "auto",
 								}}
 							>
 								<Menu opened withinPortal={false} position="bottom-start">
@@ -589,7 +447,7 @@ export const ContentViewer = memo(
 											leftSection={<IconArrowsMaximize size={14} />}
 											onClick={() => {
 												open();
-												closeSwipe();
+												swipe.closeSwipe();
 											}}
 										>
 											{t("fullscreen")}
@@ -601,7 +459,7 @@ export const ContentViewer = memo(
 											onClick={() => {
 												userToggled.current = true;
 												setWordWrap((v) => !v);
-												closeSwipe();
+												swipe.closeSwipe();
 											}}
 										>
 											{wordWrap ? t("noWrap") : t("wordWrap")}
@@ -610,7 +468,7 @@ export const ContentViewer = memo(
 											leftSection={<IconCopy size={14} />}
 											onClick={() => {
 												navigator.clipboard.writeText(content);
-												closeSwipe();
+												swipe.closeSwipe();
 											}}
 										>
 											{t("copy")}
@@ -623,7 +481,7 @@ export const ContentViewer = memo(
 												leftSection={<IconGitBranch size={14} />}
 												onClick={() => {
 													msgCtx.onBranchFromMessage?.();
-													closeSwipe();
+													swipe.closeSwipe();
 												}}
 											>
 												{tNarrator("contextMenu_branch")}
@@ -634,7 +492,7 @@ export const ContentViewer = memo(
 												leftSection={<IconGitFork size={14} />}
 												onClick={() => {
 													msgCtx.onForkFromMessage?.();
-													closeSwipe();
+													swipe.closeSwipe();
 												}}
 											>
 												{tNarrator("contextMenu_fork")}
@@ -646,7 +504,7 @@ export const ContentViewer = memo(
 												leftSection={<IconTrash size={14} />}
 												onClick={() => {
 													msgCtx.onDeleteMessage?.();
-													closeSwipe();
+													swipe.closeSwipe();
 												}}
 											>
 												{tNarrator("contextMenu_delete")}
@@ -732,17 +590,17 @@ export const ContentViewer = memo(
 
 				{/* Context menu */}
 				<Menu
-					opened={ctxMenuOpened}
-					onChange={setCtxMenuOpened}
+					opened={swipe.ctxMenuOpened}
+					onChange={swipe.setCtxMenuOpened}
 					position="bottom-start"
 					withinPortal
 					styles={{
 						dropdown: {
 							position: "fixed",
-							left: ctxMenuPos.x,
-							...(ctxMenuPos.flipY
-								? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
-								: { top: ctxMenuPos.y }),
+							left: swipe.ctxMenuPos.x,
+							...(swipe.ctxMenuPos.flipY
+								? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+								: { top: swipe.ctxMenuPos.y }),
 						},
 					}}
 				>
@@ -750,8 +608,8 @@ export const ContentViewer = memo(
 						<div
 							style={{
 								position: "fixed",
-								left: ctxMenuPos.x,
-								top: ctxMenuPos.y,
+								left: swipe.ctxMenuPos.x,
+								top: swipe.ctxMenuPos.y,
 								pointerEvents: "none",
 							}}
 						/>

@@ -36,6 +36,7 @@ import {
 	IconChevronRight,
 	IconCode,
 	IconCodeOff,
+	IconEye,
 	IconHandStop,
 	IconPaperclip,
 	IconPencilCheck,
@@ -44,6 +45,7 @@ import {
 	IconShieldOff,
 	IconSparkles,
 	IconTerminal,
+	IconTrash,
 } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -69,6 +71,7 @@ import {
 	useUpdatePermissionMode,
 } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
+import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type PaginatedMessages, type TreeMessage } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
@@ -76,7 +79,11 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MessageBubble } from "./MessageBubble";
-import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
+import {
+	type MessageContextMenuActions,
+	MessageContextMenuCtx,
+	useMessageContextMenu,
+} from "./MessageContextMenuCtx";
 import {
 	findMsgByToolUseIdInTree,
 	insertChildIntoCache,
@@ -406,6 +413,43 @@ const SubagentCard = memo(
 			}
 		}, [isTerminal]);
 
+		// --- Swipe / context-menu for SubagentCard itself ---
+		const parentMsgCtx = useMessageContextMenu();
+		const hasCardActions = !!parentMsgCtx.onDeleteMessage;
+
+		const swipe = useSwipeMenu({ enabled: hasCardActions });
+
+		const handleViewSession = useCallback(() => {
+			setExpanded(true);
+			setShowCalls(true);
+			swipe.closeSwipe();
+			// Scroll to bottom after expand animation
+			setTimeout(() => {
+				const el = scrollBoxRef.current;
+				if (el) el.scrollTop = el.scrollHeight;
+			}, 300);
+		}, [swipe.closeSwipe]);
+
+		const cardMenuItems = (
+			<>
+				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
+					{t("viewSubagentSession")}
+				</Menu.Item>
+				{parentMsgCtx.onDeleteMessage && (
+					<Menu.Item
+						color="red"
+						leftSection={<IconTrash size={14} />}
+						onClick={() => {
+							parentMsgCtx.onDeleteMessage?.();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_delete")}
+					</Menu.Item>
+				)}
+			</>
+		);
+
 		// Prevent child ContentViewers / ToolCallCards from inheriting
 		// the parent message's swipe/context-menu actions
 		const emptyCtx: MessageContextMenuActions = {};
@@ -679,12 +723,94 @@ const SubagentCard = memo(
 			</MessageContextMenuCtx.Provider>
 		);
 
-		if (inRun) return content;
+		const swipeMenu =
+			hasCardActions &&
+			(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+			(() => {
+				const menuEl = swipe.swipeMenuRef.current;
+				const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
+				return (
+					<Box
+						ref={swipe.swipeMenuRef}
+						style={{
+							position: "fixed",
+							left: pos.left,
+							top: pos.top,
+							transform: "translateY(-50%)",
+							zIndex: 1000,
+							transition: swipe.swipeMenuTransition,
+							pointerEvents: swipe.swipeClosing ? "none" : "auto",
+						}}
+					>
+						<Menu opened withinPortal={false} position="bottom-start">
+							<Menu.Dropdown style={{ position: "relative", width: 180 }}>
+								{cardMenuItems}
+							</Menu.Dropdown>
+						</Menu>
+					</Box>
+				);
+			})();
+
+		const ctxMenu = hasCardActions && (
+			<Menu
+				opened={swipe.ctxMenuOpened}
+				onChange={swipe.setCtxMenuOpened}
+				position="bottom-start"
+				withinPortal
+				styles={{
+					dropdown: {
+						position: "fixed",
+						left: swipe.ctxMenuPos.x,
+						...(swipe.ctxMenuPos.flipY
+							? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+							: { top: swipe.ctxMenuPos.y }),
+					},
+				}}
+			>
+				<Menu.Target>
+					<div
+						style={{
+							position: "fixed",
+							left: swipe.ctxMenuPos.x,
+							top: swipe.ctxMenuPos.y,
+							pointerEvents: "none",
+						}}
+					/>
+				</Menu.Target>
+				<Menu.Dropdown>{cardMenuItems}</Menu.Dropdown>
+			</Menu>
+		);
+
+		if (inRun) {
+			return (
+				<>
+					<Box
+						ref={swipe.swipeBoxRef}
+						onContextMenu={swipe.handleContextMenu}
+						style={swipe.swipeStyle}
+					>
+						{content}
+					</Box>
+					{swipeMenu}
+					{ctxMenu}
+				</>
+			);
+		}
 
 		return (
-			<Paper withBorder radius="sm" style={{ overflow: "hidden" }}>
-				{content}
-			</Paper>
+			<>
+				<Box
+					ref={swipe.swipeBoxRef}
+					onContextMenu={swipe.handleContextMenu}
+					style={swipe.swipeStyle}
+				>
+					<Paper withBorder radius="sm" style={{ overflow: "hidden" }}>
+						{content}
+					</Paper>
+				</Box>
+				{swipeMenu}
+				{ctxMenu}
+			</>
 		);
 	},
 	(prev, next) =>
@@ -1448,6 +1574,7 @@ export function NarratorPanel({
 	const [isCompacting, setIsCompacting] = useState(false);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
+	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 
 	// Initialize contextPercent and pruneBoundaryMessageId from initial data
 	const contextInitRef = useRef(false);
@@ -2632,8 +2759,9 @@ export function NarratorPanel({
 			onContextUsage: (percentage) => {
 				setContextPercent(percentage);
 			},
-			onPruneBoundary: (boundaryMessageId) => {
+			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				setPruneBoundaryMessageId(boundaryMessageId);
+				setPrunedPercent(prunedPct);
 			},
 			onCompacting: () => {
 				setIsCompacting(true);
@@ -2641,6 +2769,7 @@ export function NarratorPanel({
 			onCompactDone: () => {
 				setIsCompacting(false);
 				setPruneBoundaryMessageId(null);
+				setPrunedPercent(null);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
@@ -2651,6 +2780,40 @@ export function NarratorPanel({
 					color: "red",
 					autoClose: 8000,
 				});
+			},
+			onCatchUp: (orphanChildren, topLevel) => {
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					let result: MessagesQueryData = old;
+					// Insert orphan children into their parent's tree
+					for (const child of orphanChildren) {
+						if (child?.id && child?.parentToolUseId) {
+							result = insertChildIntoCache(result, {
+								...child,
+								children: child.children ?? [],
+							}) as MessagesQueryData;
+						}
+					}
+					// Append new top-level messages
+					if (topLevel.length > 0) {
+						const pages = [...result.pages];
+						const firstPage = { ...pages[0] };
+						const existingIds = new Set(firstPage.messages.map((m: NarratorMsg) => m.id));
+						const newMsgs = topLevel
+							.filter((m: NarratorMsg) => m?.id && m?.createdAt && !existingIds.has(m.id))
+							.map((m: NarratorMsg) => ({ ...m, children: m.children ?? [] }));
+						if (newMsgs.length > 0) {
+							firstPage.messages = [...firstPage.messages, ...newMsgs];
+							pages[0] = firstPage;
+							result = { ...result, pages };
+						}
+					}
+					return result;
+				});
+				// Instant scroll to bottom if user was already there
+				if (isAtBottomRef.current) {
+					requestAnimationFrame(() => scrollToBottom(true));
+				}
 			},
 		},
 		lastMessageId,
@@ -3331,6 +3494,9 @@ export function NarratorPanel({
 									</Box>
 								</Menu.Target>
 								<Menu.Dropdown>
+									{prunedPercent != null && (
+										<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
+									)}
 									<Menu.Label>Context: {contextPercent.toFixed(1)}%</Menu.Label>
 									<Menu.Item
 										leftSection={<IconArrowsMinimize size={14} />}

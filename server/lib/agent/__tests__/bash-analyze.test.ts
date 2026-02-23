@@ -576,10 +576,10 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: true,
 	};
 
-	test("default + allWhitelisted + internal paths → allow", () => {
+	test("default + allWhitelisted + internal paths → ask (default mode asks for all mutations)", () => {
 		expect(
 			resolvePermissionDecision("Bash", { command: "git status" }, "default", cwd, false, allSafe),
-		).toBe("allow");
+		).toBe("ask");
 	});
 
 	test("default + allWhitelisted + external path → ask", () => {
@@ -1268,7 +1268,7 @@ describe("Chapter mode - git branch restrictions", () => {
 			expect(decision).toBe("deny");
 		});
 
-		test("chapter mode + safe git command → allow", async () => {
+		test("chapter mode + safe git command → ask (default mode)", async () => {
 			const analysis = await chapterAnalyze("git status");
 			const decision = resolvePermissionDecision(
 				"Bash",
@@ -1279,10 +1279,10 @@ describe("Chapter mode - git branch restrictions", () => {
 				analysis,
 				true,
 			);
-			expect(decision).toBe("allow");
+			expect(decision).toBe("ask");
 		});
 
-		test("chapter mode + git add/commit → allow", async () => {
+		test("chapter mode + git add/commit → ask (default mode)", async () => {
 			const analysis = await chapterAnalyze("git add . && git commit -m 'fix'");
 			const decision = resolvePermissionDecision(
 				"Bash",
@@ -1293,10 +1293,10 @@ describe("Chapter mode - git branch restrictions", () => {
 				analysis,
 				true,
 			);
-			expect(decision).toBe("allow");
+			expect(decision).toBe("ask");
 		});
 
-		test("chapter mode + git push (normal) → allow", async () => {
+		test("chapter mode + git push (normal) → ask (default mode)", async () => {
 			const analysis = await chapterAnalyze("git push origin");
 			const decision = resolvePermissionDecision(
 				"Bash",
@@ -1307,7 +1307,7 @@ describe("Chapter mode - git branch restrictions", () => {
 				analysis,
 				true,
 			);
-			expect(decision).toBe("allow");
+			expect(decision).toBe("ask");
 		});
 
 		test("chapter mode + git push --force → deny", async () => {
@@ -1324,7 +1324,7 @@ describe("Chapter mode - git branch restrictions", () => {
 			expect(decision).toBe("deny");
 		});
 
-		test("non-chapter mode + git checkout → allow (no branch restriction)", async () => {
+		test("non-chapter mode + git checkout → ask (default mode asks for bash)", async () => {
 			const analysis = await normalAnalyze("git checkout main");
 			const decision = resolvePermissionDecision(
 				"Bash",
@@ -1335,8 +1335,8 @@ describe("Chapter mode - git branch restrictions", () => {
 				analysis,
 				false, // not chapter
 			);
-			// git checkout without -- is safe in CONDITIONAL_COMMANDS (returns null)
-			expect(decision).toBe("allow");
+			// default mode asks for all bash commands
+			expect(decision).toBe("ask");
 		});
 
 		test("bypassPermissions does NOT bypass chapter branch restrictions", async () => {

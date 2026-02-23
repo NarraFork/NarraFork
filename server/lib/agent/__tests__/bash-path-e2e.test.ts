@@ -15,36 +15,42 @@ async function fullChain(cmd: string, permMode = "default"): Promise<"allow" | "
 }
 
 describe("e2e: ls/grep pipe — project internal", () => {
-	test("ls -la | grep .ts → allow", async () => {
-		expect(await fullChain("ls -la | grep .ts")).toBe("allow");
+	test("ls -la | grep .ts → allow (acceptEdits)", async () => {
+		expect(await fullChain("ls -la | grep .ts", "acceptEdits")).toBe("allow");
 	});
 
-	test("ls src/ | grep -i test → allow", async () => {
-		expect(await fullChain("ls src/ | grep -i test")).toBe("allow");
+	test("ls src/ | grep -i test → allow (acceptEdits)", async () => {
+		expect(await fullChain("ls src/ | grep -i test", "acceptEdits")).toBe("allow");
 	});
 
-	test("grep -r TODO src/ | sort → allow", async () => {
-		expect(await fullChain("grep -r TODO src/ | sort")).toBe("allow");
+	test("grep -r TODO src/ | sort → allow (acceptEdits)", async () => {
+		expect(await fullChain("grep -r TODO src/ | sort", "acceptEdits")).toBe("allow");
 	});
 
-	test("grep -rn import src/ | head -20 → allow", async () => {
-		expect(await fullChain("grep -rn import src/ | head -20")).toBe("allow");
+	test("grep -rn import src/ | head -20 → allow (acceptEdits)", async () => {
+		expect(await fullChain("grep -rn import src/ | head -20", "acceptEdits")).toBe("allow");
 	});
 
-	test("cat package.json | grep version → allow", async () => {
-		expect(await fullChain("cat package.json | grep version")).toBe("allow");
+	test("cat package.json | grep version → allow (acceptEdits)", async () => {
+		expect(await fullChain("cat package.json | grep version", "acceptEdits")).toBe("allow");
 	});
 
-	test("find . -name '*.ts' | grep -v node_modules → allow", async () => {
-		expect(await fullChain("find . -name '*.ts' | grep -v node_modules")).toBe("allow");
+	test("find . -name '*.ts' | grep -v node_modules → allow (acceptEdits)", async () => {
+		expect(await fullChain("find . -name '*.ts' | grep -v node_modules", "acceptEdits")).toBe(
+			"allow",
+		);
 	});
 
-	test("find src/ -type f -name '*.ts' → allow", async () => {
-		expect(await fullChain("find src/ -type f -name '*.ts'")).toBe("allow");
+	test("find src/ -type f -name '*.ts' → allow (acceptEdits)", async () => {
+		expect(await fullChain("find src/ -type f -name '*.ts'", "acceptEdits")).toBe("allow");
 	});
 
-	test("ls -R | grep -E '\\.(ts|tsx)$' → allow", async () => {
-		expect(await fullChain("ls -R | grep -E '\\.(ts|tsx)$'")).toBe("allow");
+	test("ls -R | grep -E '\\.(ts|tsx)$' → allow (acceptEdits)", async () => {
+		expect(await fullChain("ls -R | grep -E '\\.(ts|tsx)$'", "acceptEdits")).toBe("allow");
+	});
+
+	test("default mode: safe internal bash → ask", async () => {
+		expect(await fullChain("ls -la | grep .ts")).toBe("ask");
 	});
 });
 

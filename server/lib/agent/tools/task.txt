@@ -29,6 +29,12 @@ When NOT to use the Task tool:
 
 CRITICAL — Subagents exist to FILTER and DISTILL information, not to relay it verbatim. Never instruct a subagent to return full file contents back to you. If you need the complete content of files, read them yourself. A subagent that returns full file contents defeats its entire purpose — it wastes time and tokens while providing zero context reduction. When using explore, your prompt should ask for specific answers, summaries, or relevant snippets — not raw file dumps.
 
+Working directory:
+- By default, subagents inherit the parent narrator's working directory
+- Use the `workdir` parameter to run a subagent in a different directory
+- When workdir differs from the parent's cwd, user approval is required before the subagent is created
+- Once created, the subagent's permission checks (path boundaries, etc.) are scoped to its own workdir
+
 Usage notes:
 - Launch multiple agents concurrently whenever possible by using a single message with multiple tool uses
 - When the agent is done, it will return a single message back to you with its findings/results

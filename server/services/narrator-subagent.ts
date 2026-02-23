@@ -191,6 +191,7 @@ interface SubagentExecOptions {
 async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	finalText: string;
 	hasError: boolean;
+	contextLengthExceeded?: boolean;
 }> {
 	const {
 		narratorId,
@@ -217,6 +218,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let pruneBoundaryId: string | null = null;
 	let needsRestart = false;
 	let currentConversationId = randomUUID();
+	let contextLengthExceeded = false;
 
 	// Build context management hooks for general subagents
 	const ctxMgmt = isGeneral
@@ -287,8 +289,9 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			hooks,
 		});
 
-		finalText = result.finalText;
-		hasError = result.hasError;
+		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
+		hasError = result.hasError || !!result.contextLengthExceeded;
+		if (result.contextLengthExceeded) contextLengthExceeded = true;
 
 		if (!needsRestart || !isGeneral || signal.aborted || hasError) break;
 
@@ -313,7 +316,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		trailingToolResults = rebuilt.trailingToolResults;
 	}
 
-	return { finalText, hasError };
+	return { finalText, hasError, contextLengthExceeded };
 }
 
 // === Subagent runner ===
@@ -390,8 +393,8 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			systemPrompt,
 			initialHistory: [],
 		});
-		finalText = result.finalText;
-		hasError = result.hasError;
+		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
+		hasError = result.hasError || !!result.contextLengthExceeded;
 	} finally {
 		await finalizeSubagent(
 			subagentId,
@@ -488,8 +491,8 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 			initialHistory: history,
 			initialTrailingToolResults: trailingToolResults,
 		});
-		finalText = result.finalText;
-		hasError = result.hasError;
+		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
+		hasError = result.hasError || !!result.contextLengthExceeded;
 	} finally {
 		await finalizeSubagent(
 			forkedId,

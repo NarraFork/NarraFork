@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
+import { readFileText } from "./encoding";
 
 export const readTool: ToolDefinition = {
 	name: "Read",
@@ -22,7 +23,7 @@ export const readTool: ToolDefinition = {
 		};
 		const resolvedPath = resolve(ctx.cwd, file_path);
 		try {
-			const text = await Bun.file(resolvedPath).text();
+			const { text } = await readFileText(resolvedPath);
 			const lines = text.split("\n");
 			const start = Math.max(0, (offset ?? 1) - 1);
 			const end = limit ? start + limit : lines.length;

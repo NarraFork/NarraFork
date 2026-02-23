@@ -15,7 +15,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useLocation } from "@tanstack/react-router";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { ChapterMergeModal } from "../../components/chapter/ChapterMergeModal";
@@ -25,6 +25,7 @@ import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { TerminalTabs } from "../../components/terminal/TerminalTabs";
 import { useChapter } from "../../hooks/useChapters";
 import { useCreateNarrator, useNarrators } from "../../hooks/useNarrator";
+import { addRecentTab, markTabRead } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import { CHAPTER_STATUS_COLORS } from "../../lib/constants";
 
@@ -102,6 +103,28 @@ function ChapterDetailPage() {
 		document.addEventListener("mousemove", onMouseMove);
 		document.addEventListener("mouseup", onMouseUp);
 	}, []);
+
+	// Record recent tab visit
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const primaryNarratorForTab = narratorList?.find((n: any) => n.type === "primary");
+	const chapterTitle = chapter?.title;
+	const chapterBranch = chapter?.branch;
+	const primaryNarratorId = primaryNarratorForTab?.id;
+	useEffect(() => {
+		if (!chapterTitle) return;
+		addRecentTab({
+			type: "chapter",
+			id: chapterId,
+			narratorId: primaryNarratorId,
+			title: chapterTitle,
+			subtitle: chapterBranch,
+		});
+	}, [chapterId, chapterTitle, chapterBranch, primaryNarratorId]);
+
+	// Mark narrator as read when visiting the chapter page
+	useEffect(() => {
+		if (primaryNarratorId) markTabRead(primaryNarratorId);
+	}, [primaryNarratorId]);
 
 	if (isLoading)
 		return (
@@ -201,6 +224,7 @@ function ChapterDetailPage() {
 					<Loader />
 				) : primaryNarrator ? (
 					<NarratorPanel
+						key={primaryNarrator.id}
 						narratorId={primaryNarrator.id}
 						narrator={primaryNarrator}
 						onForkFromMessage={handleForkFromMessage}

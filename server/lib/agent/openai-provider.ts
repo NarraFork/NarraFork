@@ -6,9 +6,13 @@ import type { AgentToolUse, ToolDefinition } from "./types";
 
 // === OpenAI message types ===
 
+type OAIContentPart =
+	| { type: "text"; text: string }
+	| { type: "image_url"; image_url: { url: string } };
+
 interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
-	content?: string | null;
+	content?: string | OAIContentPart[] | null;
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
 }
@@ -41,6 +45,7 @@ interface OAIStreamChunk {
 	id?: string;
 	choices?: Array<{ index: number; delta: OAIDelta; finish_reason?: string | null }>;
 	usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+	error?: { message?: string; type?: string; code?: string | number };
 }
 
 /**
@@ -106,7 +111,19 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		// Append current user message (skip "." continuation markers)
 		if (params.content && params.content !== ".") {
-			messages.push({ role: "user", content: params.content });
+			// Build user message with optional images
+			if (params.images?.length) {
+				const parts: OAIContentPart[] = [{ type: "text", text: params.content }];
+				for (const img of params.images) {
+					parts.push({
+						type: "image_url",
+						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
+					});
+				}
+				messages.push({ role: "user", content: parts });
+			} else {
+				messages.push({ role: "user", content: params.content });
+			}
 		} else if (params.toolResults.length === 0) {
 			// First turn or explicit user message
 			messages.push({ role: "user", content: params.content });
@@ -160,8 +177,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void {
 		const h = history as OAIMessage[];
-		const msg: OAIMessage = { role: "assistant" };
-		if (text) msg.content = text;
+		const msg: OAIMessage = { role: "assistant", content: text || null };
 		if (toolUses.length > 0) {
 			msg.tool_calls = toolUses.map((tu) => ({
 				id: tu.toolUseId,
@@ -268,7 +284,31 @@ interface OAIToolResult {
 	content: string;
 }
 
+// === Helpers ===
+
+/** Try to parse a string as JSON. Returns true if valid. */
+function isParsableJson(s: string): boolean {
+	try {
+		JSON.parse(s);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 // === SSE stream parser ===
+
+/**
+ * Tool call accumulator entry.
+ * `emitted` tracks whether a toolUseChunk with stop=true has already been
+ * yielded for this tool call (via the isParsableJson early-emit path).
+ */
+interface ToolAccumEntry {
+	id: string;
+	name: string;
+	args: string;
+	emitted: boolean;
+}
 
 async function* parseSSEStream(
 	body: ReadableStream<Uint8Array>,
@@ -276,7 +316,7 @@ async function* parseSSEStream(
 	const decoder = new TextDecoder();
 	let buffer = "";
 	// Accumulate tool call chunks by index
-	const toolAccum = new Map<number, { id: string; name: string; args: string }>();
+	const toolAccum = new Map<number, ToolAccumEntry>();
 
 	const reader = body.getReader();
 	try {
@@ -289,39 +329,86 @@ async function* parseSSEStream(
 			buffer = lines.pop() ?? "";
 
 			for (const line of lines) {
-				const parsed = parseSSELine(line, toolAccum);
-				if (parsed) yield parsed;
+				const events = parseSSELine(line, toolAccum);
+				for (const evt of events) {
+					yield evt;
+				}
 			}
 		}
 		// Process any remaining data in the buffer after stream ends
 		if (buffer.trim()) {
-			const parsed = parseSSELine(buffer, toolAccum);
-			if (parsed) yield parsed;
+			const events = parseSSELine(buffer, toolAccum);
+			for (const evt of events) {
+				yield evt;
+			}
 		}
+		// Flush any remaining accumulated tool calls that weren't emitted
+		// (e.g. stream ended without a finish_reason chunk)
+		const remaining = flushToolAccum(toolAccum);
+		if (remaining) yield remaining;
 	} finally {
 		reader.releaseLock();
 	}
 }
 
-function parseSSELine(
-	line: string,
-	toolAccum: Map<number, { id: string; name: string; args: string }>,
-): ParsedStreamEvent | null {
+/** Drain un-emitted tool calls from the accumulator into a ParsedStreamEvent. */
+function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEvent | null {
+	const toolUses: AgentToolUse[] = [];
+	for (const [, acc] of toolAccum) {
+		if (acc.emitted) continue; // already yielded via toolUseChunk
+		let input: Record<string, unknown> = {};
+		try {
+			input = JSON.parse(acc.args);
+		} catch {
+			input = { _raw: acc.args };
+		}
+		toolUses.push({
+			toolUseId: acc.id || randomUUID(),
+			name: acc.name,
+			input,
+		});
+	}
+	toolAccum.clear();
+	return toolUses.length > 0 ? { toolUses } : null;
+}
+
+function parseSSELine(line: string, toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEvent[] {
 	const trimmed = line.trim();
-	if (!trimmed || trimmed === "data: [DONE]") return null;
-	if (!trimmed.startsWith("data: ")) return null;
+	if (!trimmed || trimmed === "data: [DONE]") return [];
+	if (!trimmed.startsWith("data: ")) return [];
 
 	let chunk: OAIStreamChunk;
 	try {
 		chunk = JSON.parse(trimmed.slice(6));
 	} catch {
-		return null;
+		return [];
+	}
+
+	// Handle error objects embedded in stream chunks
+	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)
+	if (chunk.error) {
+		const msg = chunk.error.message || "Unknown OpenAI API error";
+		return [
+			{
+				invalidState: {
+					reason: String(chunk.error.code ?? chunk.error.type ?? "api_error"),
+					message: msg,
+				},
+			},
+		];
+	}
+
+	// Usage-only chunk (sent when stream_options.include_usage is true).
+	// This arrives as a separate chunk with no choices — skip silently.
+	if (chunk.usage && (!chunk.choices || chunk.choices.length === 0)) {
+		return [];
 	}
 
 	const choice = chunk.choices?.[0];
-	if (!choice) return null;
+	if (!choice) return [];
 
 	const delta = choice.delta;
+	const results: ParsedStreamEvent[] = [];
 	const result: ParsedStreamEvent = {};
 
 	// Text content
@@ -329,46 +416,85 @@ function parseSSELine(
 		result.text = delta.content;
 	}
 
-	// Tool call deltas
+	// Tool call deltas — emit as toolUseChunk for early execution support
 	if (delta.tool_calls) {
 		for (const tc of delta.tool_calls) {
 			const idx = tc.index;
-			if (tc.id) {
-				toolAccum.set(idx, { id: tc.id, name: tc.function?.name ?? "", args: "" });
-			}
-			const acc = toolAccum.get(idx);
-			if (acc && tc.function?.arguments) {
-				acc.args += tc.function.arguments;
-			}
-		}
-	}
 
-	// On finish, emit accumulated tool uses
-	if (choice.finish_reason === "tool_calls" || choice.finish_reason === "stop") {
-		if (toolAccum.size > 0) {
-			const toolUses: AgentToolUse[] = [];
-			for (const [, acc] of toolAccum) {
-				let input: Record<string, unknown> = {};
-				try {
-					input = JSON.parse(acc.args);
-				} catch {
-					input = { _raw: acc.args };
-				}
-				toolUses.push({
-					toolUseId: acc.id || randomUUID(),
-					name: acc.name,
-					input,
+			// First chunk for this tool call — initialize accumulator
+			if (tc.id && !toolAccum.has(idx)) {
+				const id = tc.id;
+				const name = tc.function?.name ?? "";
+				toolAccum.set(idx, { id, name, args: "", emitted: false });
+				// Emit initial chunk so the loop knows the tool name early
+				results.push({
+					toolUseChunk: { toolUseId: id, name, input: undefined, stop: false },
 				});
 			}
-			result.toolUses = toolUses;
-			toolAccum.clear();
+
+			const acc = toolAccum.get(idx);
+			if (acc && !acc.emitted) {
+				if (tc.function?.arguments) {
+					acc.args += tc.function.arguments;
+					// Emit argument delta
+					results.push({
+						toolUseChunk: {
+							toolUseId: acc.id,
+							input: tc.function.arguments,
+							stop: false,
+						},
+					});
+
+					// Early completion: if accumulated args form valid JSON, emit stop
+					// immediately so the agent loop can start executing the tool while
+					// the rest of the stream (other tool calls / text) is still arriving.
+					if (isParsableJson(acc.args)) {
+						results.push({
+							toolUseChunk: { toolUseId: acc.id, stop: true },
+						});
+						acc.emitted = true;
+					}
+				}
+			}
 		}
 	}
 
-	if (result.text || result.toolUses) {
-		return result;
+	// On any finish_reason, finalize
+	if (choice.finish_reason) {
+		// Emit stop for any tool calls that haven't been early-emitted yet
+		for (const [, acc] of toolAccum) {
+			if (!acc.emitted) {
+				results.push({
+					toolUseChunk: { toolUseId: acc.id, stop: true },
+				});
+				acc.emitted = true;
+			}
+		}
+
+		// Also emit as flat toolUses for consumers that don't handle toolUseChunk
+		const flushed = flushToolAccum(toolAccum);
+		if (flushed) {
+			Object.assign(result, flushed);
+		}
+
+		// Map non-normal finish reasons to invalidState
+		if (choice.finish_reason === "length") {
+			result.invalidState = {
+				reason: "max_tokens",
+				message: "Response truncated: model reached maximum token limit.",
+			};
+		} else if (choice.finish_reason === "content_filter") {
+			result.invalidState = {
+				reason: "content_filter",
+				message: "Response blocked by content filter.",
+			};
+		}
 	}
-	return null;
+
+	if (result.text || result.toolUses || result.invalidState) {
+		results.push(result);
+	}
+	return results;
 }
 
 // === History builder ===
@@ -421,8 +547,9 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 						},
 					})) ?? [];
 
-			const assistantMsg: OAIMessage = { role: "assistant" };
-			if (text) assistantMsg.content = text;
+			// OpenAI requires assistant messages to have content (string|null) or tool_calls.
+			// Always set content explicitly to avoid sending {role:"assistant"} with no fields.
+			const assistantMsg: OAIMessage = { role: "assistant", content: text || null };
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
 			history.push(assistantMsg);
 

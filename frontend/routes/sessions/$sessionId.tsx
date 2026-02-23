@@ -4,6 +4,8 @@ import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { SessionTerminal } from "../../components/terminal/SessionTerminal";
+import { useNarrator } from "../../hooks/useNarrator";
+import { addRecentTab, markTabRead } from "../../hooks/useRecentTabs";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 
 export const Route = createFileRoute("/sessions/$sessionId")({
@@ -22,6 +24,27 @@ function SessionDetailPage() {
 	const location = useLocation();
 	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const isMobile = useMediaQuery("(max-width: 768px)");
+
+	// Fetch narrator data for recent tab tracking
+	const { data: narrator } = useNarrator(sessionId);
+
+	// Record recent tab visit
+	const narratorTitle = narrator?.title;
+	const narratorCwd = narrator?.cwd;
+	useEffect(() => {
+		if (!narratorTitle) return;
+		addRecentTab({
+			type: "session",
+			id: sessionId,
+			title: narratorTitle || "New conversation",
+			subtitle: narratorCwd,
+		});
+	}, [sessionId, narratorTitle, narratorCwd]);
+
+	// Mark narrator as read when visiting the session page
+	useEffect(() => {
+		markTabRead(sessionId);
+	}, [sessionId]);
 
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(sessionId);
@@ -140,6 +163,7 @@ function SessionDetailPage() {
 			>
 				<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
 					<NarratorPanel
+						key={sessionId}
 						narratorId={sessionId}
 						highlightMessageId={highlightMessageId}
 						onSendToTerminal={handleSendToTerminal}
@@ -181,6 +205,7 @@ function SessionDetailPage() {
 			{/* Chat panel */}
 			<Box style={{ flex: 1, minWidth: MIN_PANEL_WIDTH, overflow: "hidden" }}>
 				<NarratorPanel
+					key={sessionId}
 					narratorId={sessionId}
 					highlightMessageId={highlightMessageId}
 					onSendToTerminal={terminalOpen ? handleSendToTerminal : undefined}

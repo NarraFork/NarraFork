@@ -99,6 +99,9 @@ interface BufferedMessage {
 }
 const bufferedMessages = new Map<string, BufferedMessage>();
 
+// Narrators that completed a turn (idle) but haven't been viewed yet — in-memory only
+const unreadNarrators = new Set<string>();
+
 // === SSE event types yielded to the HTTP response ===
 
 export type SessionEvent =
@@ -160,9 +163,10 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 }
 
 // and does not access the local filesystem or execute arbitrary commands.
-// Task is auto-allowed because it only spawns a subagent — the subagent's
-// individual tools go through their own permission checks.
-const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "Task", "ContinueTask"];
+// Task is auto-allowed when using the parent's cwd — the subagent's
+// individual tools go through their own permission checks. When Task specifies
+// a different workdir, it requires user approval (handled below).
+const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "ContinueTask"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -206,6 +210,23 @@ export function resolvePermissionDecision(
 	if (planMode && toolName === "Task" && input.subagent_type === "general") return "deny";
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
+
+	// Task: auto-allow when using parent's cwd; ask when workdir differs.
+	// bypassPermissions still bypasses this; dontAsk denies it.
+	if (toolName === "Task") {
+		const workdir = input.workdir;
+		if (typeof workdir === "string" && workdir) {
+			const resolved = normalize(resolve(cwd, workdir));
+			const normalizedCwd = normalize(resolve(cwd));
+			if (resolved !== normalizedCwd) {
+				if (permMode === "bypassPermissions") return "allow";
+				if (permMode === "dontAsk") return "deny";
+				return "ask";
+			}
+		}
+		return "allow";
+	}
+
 	if (permMode === "bypassPermissions") return "allow";
 	if (permMode === "dontAsk") return "deny";
 
@@ -220,7 +241,7 @@ export function resolvePermissionDecision(
 		);
 		if (hasExternalBashPath) return "ask";
 		// All commands whitelisted + all paths inside worktree + no dangerous patterns
-		if (permMode === "default" || permMode === "acceptEdits") return "allow";
+		if (permMode === "acceptEdits") return "allow";
 		return "ask";
 	}
 
@@ -228,7 +249,9 @@ export function resolvePermissionDecision(
 	const hasExternalPath = toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
 
 	if (!hasExternalPath) {
-		if (permMode === "default") return "allow";
+		if (permMode === "default") {
+			return READ_ONLY_TOOLS.includes(toolName) ? "allow" : "ask";
+		}
 		if (permMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName)) return "allow";
 	}
 
@@ -404,6 +427,12 @@ export async function handlePermission(
 		decisionReason = parts.join("; ");
 	}
 
+	// Build decisionReason for Task with custom workdir
+	if (toolName === "Task" && typeof input.workdir === "string" && input.workdir) {
+		const resolvedWorkdir = normalize(resolve(cwd, input.workdir));
+		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
+	}
+
 	await db
 		.update(narratorToolCalls)
 		.set({
@@ -477,7 +506,8 @@ export async function handlePermission(
 					permissionDecidedAt: new Date().toISOString(),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
-			// Restore parent narrator status on timeout
+			// Restore narrator status on timeout so the agent loop can continue
+			await narratorService.updateStatus(narratorId, "thinking");
 			if (broadcastTargetId && broadcastTargetId !== narratorId) {
 				await narratorService.updateStatus(broadcastTargetId, "thinking");
 			}
@@ -840,16 +870,17 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		opts;
 
 	const onContextUsage = (percentage: number) => {
-		// Dynamic pruning: 80–95%
-		if (percentage >= 80 && percentage < COMPACT_CONTEXT_USAGE_PCT && !pruneLocks.has(narratorId)) {
+		// Dynamic pruning: 90–95%
+		if (percentage >= 90 && percentage < COMPACT_CONTEXT_USAGE_PCT && !pruneLocks.has(narratorId)) {
 			pruneLocks.add(narratorId);
 			narratorService
 				.computeAndUpdatePruneBoundary(narratorId, percentage)
-				.then((boundaryMessageId) => {
+				.then((result) => {
 					broadcastToNarrator(narratorId, {
 						type: "prune_boundary",
 						narratorId,
-						boundaryMessageId,
+						boundaryMessageId: result?.boundaryMessageId ?? null,
+						prunedPercent: result?.prunedPercent ?? null,
 					});
 				})
 				.catch((err) => {
@@ -941,6 +972,9 @@ async function runAgentLoop(
 	let shouldUpdateTitle = false;
 	let currentText = text;
 	let currentImages = images;
+	/** How many times we've retried after emergency compact in this runAgentLoop call. */
+	let contextOverflowRetries = 0;
+	const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 
 	try {
 		while (session.alive) {
@@ -1104,34 +1138,40 @@ async function runAgentLoop(
 					// Clean up partial message
 					const partialId = session._partialMessageId;
 					session._partialMessageId = undefined;
-					if (partialId) {
-						try {
-							await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));
-							await db
-								.delete(narratorMessageRefs)
-								.where(eq(narratorMessageRefs.messageId, partialId));
-							await db.delete(narratorMessages).where(eq(narratorMessages.id, partialId));
-						} catch (cleanupErr) {
-							logger.warn("Failed to clean up partial message on error", {
-								narratorId,
-								partialId,
-								error: String(cleanupErr),
-							});
-						}
-					}
 					if (message === "Aborted") {
 						if (session._planCompactAborted) {
 							logger.info("Agent loop aborted for plan compact", { narratorId });
+							// Still clean up partial message in background
+							if (partialId) {
+								cleanupPartialMessage(partialId, narratorId);
+							}
 							return;
 						}
 						logger.info("Agent loop aborted (interrupted)", { narratorId });
-						await cleanupOrphanedToolCalls(narratorId, session.locale);
-						await narratorService.updateStatus(narratorId, "idle");
+						// Broadcast interrupted event FIRST for instant UI feedback,
+						// then run DB cleanup in parallel (non-blocking).
 						session.events.emit("event", {
 							type: "interrupted",
 							data: { message: "Session interrupted" },
 						});
+						// Fire-and-forget: DB cleanup runs in background
+						const cleanupTasks = [
+							cleanupOrphanedToolCalls(narratorId, session.locale),
+							narratorService.updateStatus(narratorId, "idle"),
+						];
+						if (partialId) {
+							cleanupTasks.push(cleanupPartialMessage(partialId, narratorId));
+						}
+						Promise.all(cleanupTasks).catch((err) => {
+							logger.warn("Post-interrupt cleanup failed", {
+								narratorId,
+								error: String(err),
+							});
+						});
 						return;
+					}
+					if (partialId) {
+						await cleanupPartialMessage(partialId, narratorId);
 					}
 					logger.error("Agent loop error", { narratorId, error: message });
 					await narratorService.updateStatus(narratorId, "error", message);
@@ -1209,6 +1249,83 @@ async function runAgentLoop(
 				eventContext,
 				hooks,
 			});
+
+			// --- Context length exceeded: compact progressively and retry ---
+			if (result.contextLengthExceeded && session.alive) {
+				contextOverflowRetries++;
+				if (contextOverflowRetries > MAX_CONTEXT_OVERFLOW_RETRIES) {
+					logger.error("Context length exceeded after max retries", { narratorId });
+					await narratorService.updateStatus(
+						narratorId,
+						"error",
+						"Context too long even after compact",
+					);
+					session.events.emit("event", {
+						type: "error",
+						data: { message: "Context too long even after compact" },
+					});
+					break;
+				}
+
+				logger.warn("Context length exceeded, attempting emergency compact", {
+					narratorId,
+					attempt: contextOverflowRetries,
+				});
+				broadcastToNarrator(narratorId, {
+					type: "context_length_exceeded",
+					narratorId,
+				});
+
+				// Try compact with increasing keepPairs: 2 → 3 → 4 → ...
+				// Start with keepPairs=2 (most aggressive — compress everything except
+				// the last 2 pairs). If the compact API call itself fails because the
+				// input to summarize is too large, increase keepPairs so less content
+				// is fed into the compact request.
+				let compacted = false;
+				const maxKeepPairs = 8;
+				for (let keepPairs = 2; keepPairs <= maxKeepPairs; keepPairs++) {
+					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+						narratorId,
+						keepPairs,
+					);
+					if (!boundaryMessageId) {
+						logger.warn("No compact boundary found", { narratorId, keepPairs });
+						break; // Not enough messages — no point trying larger keepPairs
+					}
+
+					try {
+						await runCustomCompact(narratorId, locale, boundaryMessageId);
+						session.conversationId = randomUUID();
+						broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+						compacted = true;
+						logger.info("Emergency compact succeeded, retrying", {
+							narratorId,
+							keepPairs,
+						});
+						break;
+					} catch (compactErr) {
+						logger.error("Emergency compact attempt failed", {
+							narratorId,
+							keepPairs,
+							error: String(compactErr),
+						});
+					}
+				}
+
+				if (compacted) {
+					// Retry: continue the while-loop which rebuilds history from post-compact messages
+					continue;
+				}
+
+				// All compact attempts failed — fall through to error state
+				logger.error("All emergency compact attempts failed", { narratorId });
+				await narratorService.updateStatus(narratorId, "error", "Context too long, compact failed");
+				session.events.emit("event", {
+					type: "error",
+					data: { message: "Context too long, compact failed" },
+				});
+				break;
+			}
 
 			if (result.shouldUpdateTitle) {
 				shouldUpdateTitle = true;
@@ -1650,13 +1767,33 @@ export async function* startSession(
 // === Session control ===
 
 /**
+ * Clean up a partial (incomplete) assistant message and its related records.
+ * Runs all three DELETEs in parallel since they target different tables.
+ */
+async function cleanupPartialMessage(partialId: string, narratorId: string): Promise<void> {
+	try {
+		await Promise.all([
+			db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId)),
+			db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId)),
+			db.delete(narratorMessages).where(eq(narratorMessages.id, partialId)),
+		]);
+	} catch (err) {
+		logger.warn("Failed to clean up partial message on error", {
+			narratorId,
+			partialId,
+			error: String(err),
+		});
+	}
+}
+
+/**
  * Mark any in-flight tool calls for this narrator as failed.
  * Without this, an interrupt leaves orphaned tool call records in
  * "initializing" / "pending" / "running" state, which breaks the
  */
 async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en"): Promise<void> {
 	const staleStatuses = ["initializing", "pending", "running"] as const;
-	const cleaned = await db
+	await db
 		.update(narratorToolCalls)
 		.set({
 			status: "fail",
@@ -1668,25 +1805,15 @@ async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en
 				eq(narratorToolCalls.narratorId, narratorId),
 				inArray(narratorToolCalls.status, [...staleStatuses]),
 			),
-		)
-		.returning({ id: narratorToolCalls.id });
-	if (cleaned.length > 0) {
-		logger.info("Orphaned tool calls cleaned up after interrupt", {
-			narratorId,
-			count: cleaned.length,
-		});
-	}
+		);
 }
 
 export function interruptSession(narratorId: string): boolean {
 	const session = activeSessions.get(narratorId);
 	if (!session) return false;
 	session.abortController.abort();
-	// Fire-and-forget: clean up any in-flight tool calls so the
-	// conversation history stays consistent for the next query.
-	cleanupOrphanedToolCalls(narratorId, session.locale).catch((err) => {
-		logger.error("Failed to clean up orphaned tool calls", { narratorId, error: String(err) });
-	});
+	// Cleanup is handled by the agent loop's onErrorCleanup callback
+	// when it detects the "Aborted" error — no need to duplicate here.
 	logger.info("Narrator session interrupted", { narratorId });
 	return true;
 }
@@ -1749,6 +1876,28 @@ export function clearBufferedMessage(narratorId: string): void {
 export function getBufferedMessage(narratorId: string): BufferedMessage | null {
 	return bufferedMessages.get(narratorId) ?? null;
 }
+
+// === Unread tracking (in-memory) ===
+
+/** Mark a narrator as read — clears the unread flag and broadcasts the change. */
+export function markNarratorRead(narratorId: string): void {
+	if (!unreadNarrators.delete(narratorId)) return;
+	eventBus.emit({ type: "narrator:unread_changed", narratorId, unread: false });
+}
+
+/** Check whether a narrator has unread content. */
+export function isNarratorUnread(narratorId: string): boolean {
+	return unreadNarrators.has(narratorId);
+}
+
+// Auto-mark narrator as unread when it finishes a turn (status → idle)
+eventBus.on("narrator:status_changed", (event) => {
+	if (event.status === "idle") {
+		if (unreadNarrators.has(event.narratorId)) return;
+		unreadNarrators.add(event.narratorId);
+		eventBus.emit({ type: "narrator:unread_changed", narratorId: event.narratorId, unread: true });
+	}
+});
 
 // === Startup recovery ===
 

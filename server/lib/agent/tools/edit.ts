@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
+import { readFileText, writeFileText } from "./encoding";
 
 // ── Replacer types & implementations ────────────────────────────
 // Sourced from opencode's cascading replacer approach:
@@ -394,7 +395,7 @@ export const editTool: ToolDefinition = {
 
 			// Create-new-file mode: old_string is empty
 			if (old_string === "") {
-				await Bun.write(resolvedPath, new_string);
+				await writeFileText(resolvedPath, new_string);
 				return {
 					output: `Created/overwritten ${file_path}`,
 					title: file_path,
@@ -410,13 +411,13 @@ export const editTool: ToolDefinition = {
 				};
 			}
 
-			const rawContent = await file.text();
+			const { text: rawContent, encoding } = await readFileText(resolvedPath);
 			const content = normalizeLineEndings(rawContent);
 			const normalizedOld = normalizeLineEndings(old_string);
 			const normalizedNew = normalizeLineEndings(new_string);
 
 			const updated = replace(content, normalizedOld, normalizedNew, replace_all);
-			await Bun.write(resolvedPath, updated);
+			await writeFileText(resolvedPath, updated, encoding);
 			return { output: `Edited ${file_path}`, title: file_path };
 		} catch (err) {
 			return {

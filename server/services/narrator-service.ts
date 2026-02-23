@@ -1811,18 +1811,18 @@ export const narratorService = {
 	/**
 	 * Compute and persist the prune boundary based on current context usage.
 	 *
-	 * Uses a quadratic ramp: `pruneRatio = t²` where `t = (pct - 80) / 15`.
+	 * Uses a quadratic ramp: `pruneRatio = t²` where `t = (pct - 90) / 5`.
 	 * At minimum, one message is always pruned once the threshold is reached.
 	 * The boundary never exceeds the compact-keep position (the message returned
 	 * by `getCompactBoundaryMessage`), so compact always has something to work with.
 	 *
-	 * Returns the boundary message ID, or null if no pruning is needed.
+	 * Returns the boundary message ID and pruned percentage, or null if no pruning is needed.
 	 */
 	async computeAndUpdatePruneBoundary(
 		narratorId: string,
 		contextPct: number,
-	): Promise<string | null> {
-		const PRUNE_START = 80;
+	): Promise<{ boundaryMessageId: string; prunedPercent: number } | null> {
+		const PRUNE_START = 90;
 		const PRUNE_END = 95;
 
 		const narrator = await db.query.narrators.findFirst({
@@ -1859,7 +1859,12 @@ export const narratorService = {
 		// Remaining = messages after the current boundary (or all if no boundary yet)
 		const alreadyPruned = currentBoundaryIdx + 1; // 0 if no boundary
 		const remaining = prunableRefs.length - alreadyPruned;
-		if (remaining <= 0) return narrator?.pruneBoundaryMessageId ?? null;
+		if (remaining <= 0) {
+			const bid = narrator?.pruneBoundaryMessageId ?? null;
+			if (!bid) return null;
+			const prunedPercent = Math.round((alreadyPruned / refs.length) * 100);
+			return { boundaryMessageId: bid, prunedPercent };
+		}
 
 		// Apply ratio to remaining messages — more aggressive as context grows,
 		// and each call prunes further into what's left
@@ -1867,6 +1872,7 @@ export const narratorService = {
 		const newBoundaryIdx = alreadyPruned + additionalPrune - 1;
 
 		const boundaryMessageId = prunableRefs[newBoundaryIdx].messageId;
+		const prunedPercent = Math.round(((newBoundaryIdx + 1) / refs.length) * 100);
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
@@ -1881,9 +1887,10 @@ export const narratorService = {
 			remaining,
 			prunableTotal: prunableRefs.length,
 			boundaryMessageId,
+			prunedPercent,
 		});
 
-		return boundaryMessageId;
+		return { boundaryMessageId, prunedPercent };
 	},
 
 	/** Clear the prune boundary (e.g. after compact completes). */

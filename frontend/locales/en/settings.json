@@ -38,6 +38,8 @@
 	"portRangeEnd": "Port Range End",
 	"editorSection": "Editor",
 	"editorType": "Editor Type",
+	"legacyEncoding": "Legacy Encoding Support",
+	"legacyEncodingDesc": "Auto-detect and preserve non-UTF-8 file encodings (e.g. GBK, Shift_JIS). Enable this when working with legacy codebases.",
 	"themeSection": "Theme",
 	"themeLight": "Light",
 	"themeDark": "Dark",

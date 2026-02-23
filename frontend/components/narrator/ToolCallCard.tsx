@@ -33,24 +33,15 @@ import {
 	IconWorldSearch,
 	IconX,
 } from "@tabler/icons-react";
-import {
-	createContext,
-	memo,
-	useCallback,
-	useContext,
-	useEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
+import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
-import { getGlobalCloseSwipe, setGlobalCloseSwipe } from "./swipeState";
 
 /**
  * Context carrying the toolUseId of the narrator's latest TodoWrite call.
@@ -1101,7 +1092,6 @@ function LazyDetailRenderer({
 
 // --- Swipe / context-menu constants ---
 
-const SWIPE_THRESHOLD = 60;
 const SWIPE_REVEAL_WIDTH = 180;
 
 // --- Main single card ---
@@ -1205,142 +1195,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	);
 
 	// --- Swipe & context-menu state ---
-	const swipeBoxRef = useRef<HTMLDivElement>(null);
-	const swipeMenuRef = useRef<HTMLDivElement>(null);
-	const [swipeOffset, setSwipeOffset] = useState(0);
-	const swipeOffsetRef = useRef(0);
-	const [swipeRevealed, setSwipeRevealed] = useState(false);
-	const [swipeClosing, setSwipeClosing] = useState(false);
-	const [swipeY, setSwipeY] = useState(0);
-	const [swipeInitialRight, setSwipeInitialRight] = useState(0);
-	const swipeRef = useRef<{
-		startX: number;
-		startY: number;
-		dir: "h" | "v" | null;
-	} | null>(null);
-
-	// Desktop context menu
-	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
-	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
-
-	const closeSwipe = useCallback(() => {
-		setSwipeClosing(true);
-		swipeOffsetRef.current = 0;
-		setSwipeOffset(0);
-		setSwipeRevealed(false);
-		setGlobalCloseSwipe(null);
-		setTimeout(() => setSwipeClosing(false), 220);
-	}, []);
-
-	useEffect(() => {
-		if (swipeRevealed) setGlobalCloseSwipe(closeSwipe);
-		return () => {
-			if (getGlobalCloseSwipe() === closeSwipe) setGlobalCloseSwipe(null);
-		};
-	}, [swipeRevealed, closeSwipe]);
-
-	// Swipe — only when touch starts outside a ContentViewer
-	useEffect(() => {
-		if (!hasActions) return;
-		const node = swipeBoxRef.current;
-		if (!node) return;
-
-		const onTouchStart = (e: TouchEvent) => {
-			const target = e.target as HTMLElement | null;
-			// Let ContentViewer handle its own swipe
-			if (target?.closest?.("[data-content-block]")) return;
-			// Don't interfere with open menus (e.g. ContentViewer's swipe menu)
-			if (target?.closest?.(".mantine-Menu-dropdown")) return;
-
-			const cur = getGlobalCloseSwipe();
-			if (cur && cur !== closeSwipe) {
-				cur();
-				swipeRef.current = null;
-				return;
-			}
-			if (swipeRevealed) {
-				closeSwipe();
-				swipeRef.current = null;
-				return;
-			}
-			const touch = e.touches[0];
-			swipeRef.current = { startX: touch.clientX, startY: touch.clientY, dir: null };
-			setSwipeY(touch.clientY);
-			setSwipeInitialRight(node.getBoundingClientRect().right);
-		};
-
-		const onTouchMove = (e: TouchEvent) => {
-			const s = swipeRef.current;
-			if (!s || swipeRevealed) return;
-			const touch = e.touches[0];
-			const dx = s.startX - touch.clientX;
-			const dy = Math.abs(touch.clientY - s.startY);
-			if (!s.dir) {
-				if (Math.abs(dx) > 10 || dy > 10) s.dir = Math.abs(dx) > dy ? "h" : "v";
-				return;
-			}
-			if (s.dir === "v") return;
-			const offset = Math.max(0, Math.min(dx, SWIPE_REVEAL_WIDTH));
-			swipeOffsetRef.current = offset;
-			setSwipeOffset(offset);
-		};
-
-		const onTouchEnd = () => {
-			const s = swipeRef.current;
-			swipeRef.current = null;
-			if (!s || s.dir !== "h") return;
-			if (swipeOffsetRef.current >= SWIPE_THRESHOLD) {
-				swipeOffsetRef.current = SWIPE_REVEAL_WIDTH;
-				setSwipeOffset(SWIPE_REVEAL_WIDTH);
-				setSwipeRevealed(true);
-			} else {
-				swipeOffsetRef.current = 0;
-				setSwipeOffset(0);
-				setSwipeRevealed(false);
-			}
-		};
-
-		node.addEventListener("touchstart", onTouchStart, { passive: true });
-		node.addEventListener("touchmove", onTouchMove, { passive: true });
-		node.addEventListener("touchend", onTouchEnd, { passive: true });
-		return () => {
-			node.removeEventListener("touchstart", onTouchStart);
-			node.removeEventListener("touchmove", onTouchMove);
-			node.removeEventListener("touchend", onTouchEnd);
-		};
-	}, [hasActions, swipeRevealed, closeSwipe]);
-
-	// Close swipe on outside tap
-	useEffect(() => {
-		if (!swipeRevealed) return;
-		const onTouch = (e: TouchEvent) => {
-			const t = e.target as Node;
-			if (swipeBoxRef.current?.contains(t) || swipeMenuRef.current?.contains(t)) return;
-			closeSwipe();
-		};
-		document.addEventListener("touchstart", onTouch, { passive: true });
-		return () => document.removeEventListener("touchstart", onTouch);
-	}, [swipeRevealed, closeSwipe]);
-
-	// Right-click context menu (skip ContentViewer areas — they have their own menu)
-	const handleContextMenu = useCallback(
-		(e: React.MouseEvent) => {
-			if (!hasActions) return;
-			if ((e.target as HTMLElement)?.closest?.("[data-content-block]")) return;
-			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
-			e.preventDefault();
-			e.stopPropagation();
-			const x = Math.min(e.clientX, window.innerWidth - 200);
-			const flipY = e.clientY > window.innerHeight - 300;
-			setCtxMenuPos({ x, y: e.clientY, flipY });
-			setCtxMenuOpened(true);
-		},
-		[hasActions],
-	);
-
-	const swipeTransition = swipeRef.current ? "none" : "transform 200ms ease";
-	const swipeMenuTransition = swipeRef.current ? "none" : "left 200ms ease, transform 200ms ease";
+	const swipe = useSwipeMenu({ enabled: hasActions });
 
 	const menuItemsNode = hasActions ? (
 		<>
@@ -1349,7 +1204,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					leftSection={<IconGitBranch size={14} />}
 					onClick={() => {
 						msgCtx.onBranchFromMessage?.();
-						closeSwipe();
+						swipe.closeSwipe();
 					}}
 				>
 					{tNarrator("contextMenu_branch")}
@@ -1360,7 +1215,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					leftSection={<IconGitFork size={14} />}
 					onClick={() => {
 						msgCtx.onForkFromMessage?.();
-						closeSwipe();
+						swipe.closeSwipe();
 					}}
 				>
 					{tNarrator("contextMenu_fork")}
@@ -1372,7 +1227,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					leftSection={<IconTrash size={14} />}
 					onClick={() => {
 						msgCtx.onDeleteMessage?.();
-						closeSwipe();
+						swipe.closeSwipe();
 					}}
 				>
 					{tNarrator("contextMenu_delete")}
@@ -1400,36 +1255,23 @@ export const ToolCallCard = memo(function ToolCallCard({
 		</>
 	);
 
-	const swipeStyle: React.CSSProperties | undefined =
-		swipeOffset > 0
-			? { transform: `translateX(-${swipeOffset}px)`, transition: swipeTransition }
-			: { transition: swipeTransition };
-
 	const swipeMenu =
 		hasActions &&
-		(swipeOffset > 0 || swipeClosing) &&
+		(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
 		(() => {
-			const menuLeft = swipeInitialRight - swipeOffset;
-			const boxRect = swipeBoxRef.current?.getBoundingClientRect();
-			const menuEl = swipeMenuRef.current;
-			const menuH = menuEl?.offsetHeight ?? 120;
-			let menuTop = swipeY;
-			if (boxRect && boxRect.height > menuH) {
-				const minTop = boxRect.top + menuH / 2;
-				const maxTop = boxRect.bottom - menuH / 2;
-				menuTop = Math.max(minTop, Math.min(swipeY, maxTop));
-			}
+			const menuEl = swipe.swipeMenuRef.current;
+			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
 			return (
 				<Box
-					ref={swipeMenuRef}
+					ref={swipe.swipeMenuRef}
 					style={{
 						position: "fixed",
-						left: menuLeft,
-						top: menuTop,
+						left: pos.left,
+						top: pos.top,
 						transform: "translateY(-50%)",
 						zIndex: 1000,
-						transition: swipeMenuTransition,
-						pointerEvents: swipeClosing ? "none" : "auto",
+						transition: swipe.swipeMenuTransition,
+						pointerEvents: swipe.swipeClosing ? "none" : "auto",
 					}}
 				>
 					<Menu opened withinPortal={false} position="bottom-start">
@@ -1443,17 +1285,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const ctxMenu = hasActions && (
 		<Menu
-			opened={ctxMenuOpened}
-			onChange={setCtxMenuOpened}
+			opened={swipe.ctxMenuOpened}
+			onChange={swipe.setCtxMenuOpened}
 			position="bottom-start"
 			withinPortal
 			styles={{
 				dropdown: {
 					position: "fixed",
-					left: ctxMenuPos.x,
-					...(ctxMenuPos.flipY
-						? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
-						: { top: ctxMenuPos.y }),
+					left: swipe.ctxMenuPos.x,
+					...(swipe.ctxMenuPos.flipY
+						? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+						: { top: swipe.ctxMenuPos.y }),
 				},
 			}}
 		>
@@ -1461,8 +1303,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<div
 					style={{
 						position: "fixed",
-						left: ctxMenuPos.x,
-						top: ctxMenuPos.y,
+						left: swipe.ctxMenuPos.x,
+						top: swipe.ctxMenuPos.y,
 						pointerEvents: "none",
 					}}
 				/>
@@ -1475,7 +1317,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 	if (inRun) {
 		return (
 			<>
-				<Box ref={swipeBoxRef} onContextMenu={handleContextMenu} style={swipeStyle}>
+				<Box
+					ref={swipe.swipeBoxRef}
+					onContextMenu={swipe.handleContextMenu}
+					style={swipe.swipeStyle}
+				>
 					<Box ref={isPlan ? cardRef : undefined}>
 						<Box p="xs">{cardContent}</Box>
 						{!isLast && <Divider />}
@@ -1489,7 +1335,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	return (
 		<>
-			<Box ref={swipeBoxRef} onContextMenu={handleContextMenu} style={swipeStyle}>
+			<Box ref={swipe.swipeBoxRef} onContextMenu={swipe.handleContextMenu} style={swipe.swipeStyle}>
 				<Paper
 					ref={isPlan ? cardRef : undefined}
 					withBorder

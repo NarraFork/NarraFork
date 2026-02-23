@@ -79,9 +79,11 @@
 	"contextMenu_toggleWrap": "Toggle word wrap",
 	"contextMenu_copyBlock": "Copy this block",
 	"contextMenu_delete": "Delete message",
+	"viewSubagentSession": "View session",
 	"expandEdits": "Expand edits",
 	"collapseEdits": "Collapse edits",
 	"acceptAndResetContext": "Accept & Reset Context",
 	"pruneBoundaryLabel": "↑ Tool call details above are pruned to save context",
+	"prunedPercent": "Pruned: {{percent}}%",
 	"truncatedPreview": "Content truncated ({{size}}) — expand to load full data"
 }

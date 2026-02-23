@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
+import { writeFileText } from "./encoding";
 
 export const writeTool: ToolDefinition = {
 	name: "Write",
@@ -15,7 +16,7 @@ export const writeTool: ToolDefinition = {
 		const resolvedPath = resolve(ctx.cwd, file_path);
 		try {
 			mkdirSync(dirname(resolvedPath), { recursive: true });
-			await Bun.write(resolvedPath, content);
+			await writeFileText(resolvedPath, content);
 			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
 		} catch (err) {
 			return {

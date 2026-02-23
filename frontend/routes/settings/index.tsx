@@ -90,6 +90,7 @@ function SettingsPage() {
 	const [portEnd, setPortEnd] = useState(20000);
 	// Editor
 	const [editor, setEditor] = useState("vscode");
+	const [legacyEncoding, setLegacyEncoding] = useState(false);
 
 	const [initialized, setInitialized] = useState(false);
 	const [highlight, setHighlight] = useState(false);
@@ -115,6 +116,7 @@ function SettingsPage() {
 		portStart: 10000,
 		portEnd: 20000,
 		editor: "vscode",
+		legacyEncoding: false,
 		openaiApiKey: "",
 		openaiBaseUrl: "",
 	});
@@ -140,6 +142,7 @@ function SettingsPage() {
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
 				editor: settings.editor?.type ?? "vscode",
+				legacyEncoding: settings.editor?.legacyEncoding ?? false,
 				openaiApiKey: settings.openai?.apiKey ?? "",
 				openaiBaseUrl: settings.openai?.baseUrl ?? "",
 			};
@@ -162,6 +165,7 @@ function SettingsPage() {
 			setPortStart(snap.portStart);
 			setPortEnd(snap.portEnd);
 			setEditor(snap.editor);
+			setLegacyEncoding(snap.legacyEncoding);
 			setOpenaiApiKey(snap.openaiApiKey);
 			setOpenaiBaseUrl(snap.openaiBaseUrl);
 			setInitialized(true);
@@ -190,6 +194,7 @@ function SettingsPage() {
 			portStart !== s.portStart ||
 			portEnd !== s.portEnd ||
 			editor !== s.editor ||
+			legacyEncoding !== s.legacyEncoding ||
 			openaiApiKey !== s.openaiApiKey ||
 			openaiBaseUrl !== s.openaiBaseUrl
 		);
@@ -213,6 +218,7 @@ function SettingsPage() {
 		portStart,
 		portEnd,
 		editor,
+		legacyEncoding,
 		openaiApiKey,
 		openaiBaseUrl,
 	]);
@@ -292,7 +298,7 @@ function SettingsPage() {
 					portRangeStart: portStart,
 					portRangeEnd: portEnd,
 				},
-				editor: { type: editor },
+				editor: { type: editor, legacyEncoding },
 				openai: {
 					apiKey: openaiApiKey,
 					baseUrl: openaiBaseUrl,
@@ -319,6 +325,7 @@ function SettingsPage() {
 						portStart,
 						portEnd,
 						editor,
+						legacyEncoding,
 						openaiApiKey,
 						openaiBaseUrl,
 					};
@@ -621,6 +628,12 @@ function SettingsPage() {
 						]}
 						value={editor}
 						onChange={(v) => setEditor(v ?? "vscode")}
+					/>
+					<Switch
+						label={t("legacyEncoding")}
+						description={t("legacyEncodingDesc")}
+						checked={legacyEncoding}
+						onChange={(e) => setLegacyEncoding(e.currentTarget.checked)}
 					/>
 				</Stack>
 			</Paper>

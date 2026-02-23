@@ -37,6 +37,7 @@ export interface NarraForkSettings {
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
+		legacyEncoding: boolean;
 	};
 	auth: {
 		jwtSecret: string;
@@ -81,6 +82,7 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	editor: {
 		type: "vscode",
+		legacyEncoding: false,
 	},
 	auth: {
 		jwtSecret: "",

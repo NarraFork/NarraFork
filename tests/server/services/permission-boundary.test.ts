@@ -196,13 +196,13 @@ describe("resolvePermissionDecision", () => {
 		);
 	});
 
-	test("default mode: Write inside worktree → allow", () => {
+	test("default mode: Write inside worktree → ask", () => {
 		expect(
 			resolvePermissionDecision("Write", { file_path: "out.txt", content: "x" }, "default", CWD),
-		).toBe("allow");
+		).toBe("ask");
 	});
 
-	test("default mode: Edit inside worktree → allow", () => {
+	test("default mode: Edit inside worktree → ask", () => {
 		expect(
 			resolvePermissionDecision(
 				"Edit",
@@ -210,7 +210,7 @@ describe("resolvePermissionDecision", () => {
 				"default",
 				CWD,
 			),
-		).toBe("allow");
+		).toBe("ask");
 	});
 
 	test("default mode: Glob without path → allow (uses cwd)", () => {
@@ -340,11 +340,11 @@ describe("resolvePermissionDecision", () => {
 
 	// --- Edge cases ---
 
-	test("default mode: tool with no path params (WebFetch) → allow", () => {
-		// No path to check → not external → auto-allow in default mode
+	test("default mode: tool with no path params (WebFetch) → ask", () => {
+		// No path to check → not external → but default mode asks for non-readonly tools
 		expect(
 			resolvePermissionDecision("WebFetch", { url: "https://example.com" }, "default", CWD),
-		).toBe("allow");
+		).toBe("ask");
 	});
 
 	test("unknown permission mode falls through to ask", () => {

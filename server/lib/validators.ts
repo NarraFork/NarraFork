@@ -246,6 +246,23 @@ export const updateUserPreferencesSchema = z.object({
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 });
 
+export const recentTabSchema = z.object({
+	type: z.enum(["chapter", "session"]),
+	id: z.string().min(1).max(50),
+	narratorId: z.string().min(1).max(50).optional(),
+	title: z.string().max(200),
+	subtitle: z.string().max(200).optional(),
+	status: z.string().max(50).optional(),
+	lastVisitedAt: z.number(),
+});
+
+export const upsertRecentTabSchema = recentTabSchema;
+
+export const removeRecentTabSchema = z.object({
+	type: z.enum(["chapter", "session"]),
+	id: z.string().min(1).max(50),
+});
+
 // === WebSocket Messages ===
 
 // Narrator client → server

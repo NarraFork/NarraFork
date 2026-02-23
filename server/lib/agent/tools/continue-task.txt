@@ -1,0 +1,14 @@
+Continue a previously launched subagent that has finished (successfully or with an error). The subagent retains its full conversation history, so you do NOT need to repeat the original instructions.
+
+Use this tool when:
+- A Task call returned an incomplete result (e.g. "Max turns exceeded") and you need the subagent to keep going
+- A Task call errored out and you want the subagent to retry or take a different approach
+- You want to give follow-up instructions to a subagent based on its previous output
+
+The subagent_id is returned by every Task call in the format `<subagent_id>ID</subagent_id>`. Pass that ID here along with your follow-up prompt.
+
+The subagent will resume with the same tools, working directory, and permissions as its original run. A fresh turn budget (maxTurns) is granted for each continuation.
+
+Each continuation returns a NEW subagent_id (the original is preserved as-is). Use the newly returned ID for any further continuations.
+
+Do NOT use this tool to continue a subagent that is still running — only completed or errored subagents can be continued.

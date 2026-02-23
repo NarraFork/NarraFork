@@ -1,3 +1,4 @@
+import { normalize, resolve } from "node:path";
 import { z } from "zod/v4";
 import { settings } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -26,6 +27,12 @@ function buildParameters() {
 			.describe(
 				`Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}`,
 			),
+		workdir: z
+			.string()
+			.optional()
+			.describe(
+				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
+			),
 	});
 }
 
@@ -38,12 +45,16 @@ export const taskTool: ToolDefinition = {
 		return buildParameters();
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { prompt, subagent_type, model } = args as {
+		const { prompt, subagent_type, model, workdir } = args as {
 			prompt: string;
 			description?: string;
 			subagent_type: "explore" | "plan" | "general";
 			model?: string;
+			workdir?: string;
 		};
+
+		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
+		const resolvedWorkdir = workdir ? normalize(resolve(ctx.cwd, workdir)) : ctx.cwd;
 
 		// Lazy import to avoid circular dependency at module load time
 		const { runSubagent } = await import("@server/services/narrator-subagent");
@@ -59,7 +70,7 @@ export const taskTool: ToolDefinition = {
 				toolUseId,
 				subagentType: subagent_type,
 				prompt,
-				cwd: ctx.cwd,
+				cwd: resolvedWorkdir,
 				signal: ctx.signal,
 				locale: ctx.locale,
 				model: model || undefined,

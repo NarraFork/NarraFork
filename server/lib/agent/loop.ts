@@ -8,6 +8,12 @@ import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
+/**
+ * Approximate character threshold for detecting output truncation by the API.
+ * limit the content was likely cut off mid-stream.
+ */
+const TRUNCATION_SUSPECT_THRESHOLD = 28_000;
+
 /** Max size of output pushed via tool_output events (UI preview only). */
 const MAX_STREAM_OUTPUT_LENGTH = 30_000;
 
@@ -239,6 +245,15 @@ export async function* agentLoop(
 				return;
 			}
 			const msg = err instanceof Error ? err.message : String(err);
+			if (
+				err &&
+				typeof err === "object" &&
+				"code" in err &&
+				(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
+			) {
+				yield { type: "context_length_exceeded", message: msg };
+				return;
+			}
 			yield { type: "error", message: msg };
 			return;
 		}
@@ -523,6 +538,18 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	}
 
 	try {
+		// Detect likely output truncation for file-writing tools BEFORE execution.
+		// When the API's max output token limit cuts off the response mid-stream,
+		// Write/Edit receive incomplete content. Reject early to avoid writing
+		// broken files, and tell the model to split the work.
+		const truncationHint = detectWriteTruncation(tu.name, effectiveInput);
+		if (truncationHint) {
+			return {
+				output: truncationHint,
+				isError: true,
+				durationMs: Date.now() - start,
+			};
+		}
 		const result = await tool.execute(effectiveInput, ctx);
 		// If the tool already truncated its output, pass through as-is.
 		if (result.truncated) {
@@ -550,4 +577,40 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		if (progressTimer) clearInterval(progressTimer);
 		if (pendingOutputTimer) clearTimeout(pendingOutputTimer);
 	}
+}
+
+/**
+ * Check if a Write or Edit tool call likely received truncated content
+ *
+ * Returns an error message to feed back to the model, or null if no
+ * truncation is suspected.
+ */
+function detectWriteTruncation(toolName: string, input: Record<string, unknown>): string | null {
+	if (toolName === "Write") {
+		const content = input.content;
+		if (typeof content === "string" && content.length >= TRUNCATION_SUSPECT_THRESHOLD) {
+			return (
+				`The content appears to have been truncated by the output token limit (${content.length} chars received). ` +
+				"The file was NOT written to avoid saving incomplete content. " +
+				"Please split the work: write the file in smaller sections using Write for the initial content, " +
+				"then use Edit to append or modify additional sections."
+			);
+		}
+	}
+	if (toolName === "Edit") {
+		const oldStr = input.old_string;
+		const newStr = input.new_string;
+		const oldLen = typeof oldStr === "string" ? oldStr.length : 0;
+		const newLen = typeof newStr === "string" ? newStr.length : 0;
+		if (oldLen >= TRUNCATION_SUSPECT_THRESHOLD || newLen >= TRUNCATION_SUSPECT_THRESHOLD) {
+			return (
+				`The edit parameters appear to have been truncated by the output token limit ` +
+				`(old_string: ${oldLen} chars, new_string: ${newLen} chars). ` +
+				"The edit was NOT applied. " +
+				"Please split the edit into smaller chunks — edit one function or section at a time " +
+				"instead of replacing large blocks in a single call."
+			);
+		}
+	}
+	return null;
 }

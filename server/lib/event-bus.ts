@@ -83,6 +83,8 @@ export type NarraForkEvent =
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }
 	| { type: "container:error"; chapterId: string; error: string }
+	// Narrator unread (in-memory only)
+	| { type: "narrator:unread_changed"; narratorId: string; unread: boolean }
 	// Auto-commit
 	| {
 			type: "narrator:auto_commit";
@@ -90,7 +92,9 @@ export type NarraForkEvent =
 			chapterId: string;
 			commitSha: string;
 			message: string;
-	  };
+	  }
+	// User preferences
+	| { type: "user:recent_tabs_changed"; userId: string };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

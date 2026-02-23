@@ -27,6 +27,7 @@ import {
 	getBufferedMessage,
 	interruptSession,
 	isSessionActive,
+	markNarratorRead,
 	resolvePermission,
 	runCustomCompact,
 	sendMessage,
@@ -279,7 +280,7 @@ narratorRoutes.post("/:id/plan", async (c) => {
 // Interrupt active session
 narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
-	const interrupted = await interruptSession(id);
+	const interrupted = interruptSession(id);
 	return c.json({ interrupted });
 });
 
@@ -353,6 +354,7 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 	if (narrator.status === "done") {
 		await narratorService.updateStatus(id, "idle");
 	}
+	markNarratorRead(id);
 	return c.json({ ok: true });
 });
 

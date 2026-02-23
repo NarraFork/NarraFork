@@ -57,6 +57,7 @@ const updateSettingsSchema = z
 		editor: z
 			.object({
 				type: z.enum(["vscode", "cursor", "windsurf", "zed"]),
+				legacyEncoding: z.boolean(),
 			})
 			.partial()
 			.optional(),
