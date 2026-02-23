@@ -44,6 +44,7 @@ export type NarratorServerMessage =
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
+	| { type: "compact_failed"; narratorId: string; messageId: string }
 	| { type: "context_usage"; narratorId: string; percentage: number }
 	| { type: "metering"; narratorId: string; unit: string; unitPlural: string; usage: number }
 	// Narrator fork events forwarded via eventBus.onAny
@@ -62,6 +63,7 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			toolName: string;
 			inputCharsTotal: number;
+			parentToolUseId?: string;
 	  }
 	| {
 			type: "subagent_started";
@@ -85,6 +87,7 @@ export type NarratorServerMessage =
 			commitSha: string;
 			message: string;
 	  }
+	| { type: "auto_commit_failed"; narratorId: string; chapterId: string; error: string }
 	| { type: "error"; message: string };
 
 // Client → Server messages
@@ -260,7 +263,9 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "merge_decision": {
-				resolveMergeDecision(msg.mergeSessionId, msg.decision);
+				resolveMergeDecision(msg.mergeSessionId, msg.decision).catch((err) =>
+					logger.error("Failed to resolve merge decision", { error: String(err) }),
+				);
 				logger.debug("Merge decision received via WS", {
 					mergeSessionId: msg.mergeSessionId,
 					decision: msg.decision,

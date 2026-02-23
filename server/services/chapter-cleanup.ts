@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { asc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
+import { chapterLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -25,74 +26,141 @@ async function getProjectGitPath(projectId: string): Promise<string | null> {
 
 export const chapterCleanup = {
 	async dormant(chapterId: string): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-		if (!chapter) throw new NotFoundError("Chapter", chapterId);
-		if (chapter.status !== "active")
-			throw new ValidationError("Can only make active chapters dormant");
-		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+		return chapterLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+			if (chapter.status !== "active")
+				throw new ValidationError("Can only make active chapters dormant");
+			if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 
-		const gitPath = await getProjectGitPath(chapter.projectId);
-		if (!gitPath) throw new ValidationError("Project has no git repository configured");
+			const gitPath = await getProjectGitPath(chapter.projectId);
+			if (!gitPath) throw new ValidationError("Project has no git repository configured");
 
-		await terminalService.cleanupForChapter(chapterId);
+			// Step 1: Clean up terminals
+			await terminalService.cleanupForChapter(chapterId);
 
-		if (chapter.containerConfig) {
+			// Step 2: Pause containers — fail loudly if config exists but pause fails
+			if (chapter.containerConfig) {
+				try {
+					await containerService.pauseChapterContainers(chapterId);
+				} catch (err) {
+					logger.warn("Failed to pause containers during dormant", {
+						chapterId,
+						error: String(err),
+					});
+					// Still proceed — containers may have been removed externally
+				}
+			}
+
+			// Step 3: Auto-commit with conflict recovery
 			try {
-				await containerService.pauseChapterContainers(chapterId);
-			} catch (err) {
-				logger.warn("Failed to pause containers during dormant", {
+				await gitService.autoCommit(chapter.worktreePath, "auto-save before dormant");
+			} catch (commitErr) {
+				// If worktree has merge conflicts, abort merge and retry
+				logger.warn("Auto-commit failed, attempting conflict recovery", {
 					chapterId,
+					error: String(commitErr),
+				});
+				try {
+					await gitService.mergeAbort(chapter.worktreePath);
+					await gitService.autoCommit(
+						chapter.worktreePath,
+						"auto-save before dormant (after merge abort)",
+					);
+				} catch (recoveryErr) {
+					logger.error("Conflict recovery failed during dormant", {
+						chapterId,
+						error: String(recoveryErr),
+					});
+					// Proceed anyway — worktree will be removed, branch state preserved
+				}
+			}
+
+			// Step 4: Remove worktree BEFORE updating DB
+			// This ensures we don't lose the worktreePath reference if removal fails
+			try {
+				await gitService.removeWorktree(gitPath, chapter.worktreePath);
+			} catch (err) {
+				// Worktree removal failed — still mark as dormant since terminals
+				// are already cleaned and containers paused. The stale worktree
+				// directory can be cleaned up manually or on next wake.
+				logger.warn("Worktree removal failed during dormant, proceeding anyway", {
+					chapterId,
+					worktreePath: chapter.worktreePath,
 					error: String(err),
 				});
 			}
-		}
 
-		await gitService.autoCommit(chapter.worktreePath, "auto-save before dormant");
+			// Step 5: Update DB — external resources already cleaned
+			const now = new Date().toISOString();
+			await db
+				.update(chapters)
+				.set({ status: "dormant", worktreePath: null, updatedAt: now })
+				.where(eq(chapters.id, chapterId));
 
-		const now = new Date().toISOString();
-		await db
-			.update(chapters)
-			.set({ status: "dormant", worktreePath: null, updatedAt: now })
-			.where(eq(chapters.id, chapterId));
-
-		await gitService.removeWorktree(gitPath, chapter.worktreePath);
-
-		logger.info("Chapter made dormant", { chapterId });
-		eventBus.emit({ type: "chapter:dormant", chapterId });
+			logger.info("Chapter made dormant", { chapterId });
+			eventBus.emit({ type: "chapter:dormant", chapterId });
+		});
 	},
 
 	async wake(chapterId: string): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-		if (!chapter) throw new NotFoundError("Chapter", chapterId);
-		if (chapter.status !== "dormant") throw new ValidationError("Can only wake dormant chapters");
+		return chapterLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+			if (chapter.status !== "dormant") throw new ValidationError("Can only wake dormant chapters");
 
-		const gitPath = await getProjectGitPath(chapter.projectId);
-		if (!gitPath) throw new ValidationError("Project has no git repository configured");
+			const gitPath = await getProjectGitPath(chapter.projectId);
+			if (!gitPath) throw new ValidationError("Project has no git repository configured");
 
-		const branchSuffix = chapter.branch.split("/").slice(1).join("/");
-		const worktreePath = resolve(gitPath, ".worktrees", branchSuffix);
+			const branchSuffix = chapter.branch.split("/").slice(1).join("/");
+			const worktreePath = resolve(gitPath, ".worktrees", branchSuffix);
 
-		await gitService.createWorktree(gitPath, worktreePath, chapter.branch);
+			// Step 1: Create worktree
+			await gitService.createWorktree(gitPath, worktreePath, chapter.branch);
 
-		const now = new Date().toISOString();
-		await db
-			.update(chapters)
-			.set({ status: "active", worktreePath, lastAccessedAt: now, updatedAt: now })
-			.where(eq(chapters.id, chapterId));
-
-		if (chapter.containerConfig) {
+			// Step 2: Update DB — if this fails, clean up the orphan worktree
+			const now = new Date().toISOString();
 			try {
-				await containerService.unpauseChapterContainers(chapterId);
-			} catch (err) {
-				logger.warn("Failed to unpause containers during wake", {
+				await db
+					.update(chapters)
+					.set({ status: "active", worktreePath, lastAccessedAt: now, updatedAt: now })
+					.where(eq(chapters.id, chapterId));
+			} catch (dbErr) {
+				logger.error("DB update failed during wake, removing orphan worktree", {
 					chapterId,
-					error: String(err),
+					error: String(dbErr),
 				});
+				try {
+					await gitService.removeWorktree(gitPath, worktreePath);
+				} catch (cleanupErr) {
+					logger.error("Failed to clean up orphan worktree", {
+						chapterId,
+						worktreePath,
+						error: String(cleanupErr),
+					});
+				}
+				throw dbErr;
 			}
-		}
 
-		logger.info("Chapter woken", { chapterId, worktreePath });
-		eventBus.emit({ type: "chapter:woken", chapterId });
+			// Step 3: Restore containers (non-fatal — chapter is already usable)
+			if (chapter.containerConfig) {
+				try {
+					await containerService.unpauseChapterContainers(chapterId);
+				} catch (err) {
+					logger.warn("Failed to unpause containers during wake", {
+						chapterId,
+						error: String(err),
+					});
+				}
+			}
+
+			logger.info("Chapter woken", { chapterId, worktreePath });
+			eventBus.emit({ type: "chapter:woken", chapterId });
+		});
 	},
 
 	async batchCleanup(
@@ -103,7 +171,9 @@ export const chapterCleanup = {
 
 		for (const chapterId of chapterIds) {
 			try {
-				const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+				const chapter = await db.query.chapters.findFirst({
+					where: eq(chapters.id, chapterId),
+				});
 				if (!chapter) {
 					report.errors.push({ chapterId, error: "Not found" });
 					continue;
@@ -212,10 +282,14 @@ export const chapterCleanup = {
 	_dormantTimers: new Map<string, ReturnType<typeof setTimeout>>(),
 
 	scheduleAutoDormant(projectId: string): void {
-		if (settings.chapters.maxActiveWorktrees <= 0) return;
-
 		const existing = this._dormantTimers.get(projectId);
 		if (existing) clearTimeout(existing);
+
+		// When disabled, clean up any existing timer and return
+		if (settings.chapters.maxActiveWorktrees <= 0) {
+			this._dormantTimers.delete(projectId);
+			return;
+		}
 
 		const timer = setTimeout(async () => {
 			this._dormantTimers.delete(projectId);
@@ -230,5 +304,13 @@ export const chapterCleanup = {
 		}, 30_000);
 
 		this._dormantTimers.set(projectId, timer);
+	},
+
+	/** Clear all pending timers (for graceful shutdown). */
+	clearAllTimers(): void {
+		for (const timer of this._dormantTimers.values()) {
+			clearTimeout(timer);
+		}
+		this._dormantTimers.clear();
 	},
 };

@@ -1,11 +1,14 @@
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { extname, resolve } from "node:path";
 import { serveStatic } from "hono/bun";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import { verifyToken } from "./lib/auth";
+import {
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
+import { chapterBatchMerge } from "./services/chapter-batch-merge";
+import { chapterCleanup } from "./services/chapter-cleanup";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import { terminalService } from "./services/terminal-service";
 import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
@@ -21,20 +24,88 @@ process.on("unhandledRejection", (reason) => {
 const port = Number(process.env.PORT) || settings.server.port;
 const isProd = process.env.NODE_ENV === "production";
 
+// MIME type lookup for embedded static files
+const MIME_TYPES: Record<string, string> = {
+	".html": "text/html; charset=utf-8",
+	".js": "text/javascript; charset=utf-8",
+	".css": "text/css; charset=utf-8",
+	".json": "application/json; charset=utf-8",
+	".svg": "image/svg+xml",
+	".png": "image/png",
+	".ico": "image/x-icon",
+	".webmanifest": "application/manifest+json",
+	".woff2": "font/woff2",
+	".woff": "font/woff",
+	".ttf": "font/ttf",
+	".txt": "text/plain; charset=utf-8",
+	".map": "application/json",
+};
+
 // Production: serve Vite build output via Hono
 if (isProd) {
-	const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
-	if (existsSync(staticDir)) {
-		app.use("/assets/*", serveStatic({ root: staticDir }));
-		// PWA files (sw.js, manifest, workbox, icons) must be served before the SPA catch-all
-		app.use("/sw.js", serveStatic({ root: staticDir }));
-		app.use("/workbox-*.js", serveStatic({ root: staticDir }));
-		app.use("/manifest.webmanifest", serveStatic({ root: staticDir }));
-		app.use("/favicon.svg", serveStatic({ root: staticDir }));
-		app.use("/pwa-*.png", serveStatic({ root: staticDir }));
-		app.use("/apple-touch-icon-*.png", serveStatic({ root: staticDir }));
-		// SPA catch-all: everything else gets index.html
-		app.get("*", serveStatic({ root: staticDir, path: "index.html" }));
+	// Try embedded assets first (compiled single-executable mode)
+	let hasEmbedded = false;
+	try {
+		// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
+		const { embeddedAssets } = await import("./generated/embedded-frontend");
+		const indexPath = embeddedAssets["/index.html"];
+		if (indexPath) {
+			hasEmbedded = true;
+			logger.info("Serving frontend from embedded assets");
+
+			// Serve exact-match embedded files
+			app.use("*", async (c, next) => {
+				// Skip API and WebSocket routes
+				if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+					return next();
+				}
+
+				const filePath = embeddedAssets[c.req.path];
+				if (filePath) {
+					const blob = Bun.file(filePath);
+					const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
+					const isHashed = c.req.path.startsWith("/assets/");
+					return new Response(blob, {
+						headers: {
+							"Content-Type": mime,
+							"Cache-Control": isHashed
+								? "public, max-age=31536000, immutable"
+								: "public, max-age=3600",
+						},
+					});
+				}
+
+				// SPA catch-all: serve index.html for non-file routes
+				if (!c.req.path.includes(".")) {
+					const blob = Bun.file(indexPath);
+					return new Response(blob, {
+						headers: {
+							"Content-Type": "text/html; charset=utf-8",
+							"Cache-Control": "no-cache",
+						},
+					});
+				}
+
+				return next();
+			});
+		}
+	} catch {
+		// Generated file doesn't exist — fall through to filesystem mode
+	}
+
+	// Fallback: serve from filesystem (bundle mode or bun run start)
+	if (!hasEmbedded) {
+		const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
+		if (existsSync(staticDir)) {
+			app.use("/assets/*", serveStatic({ root: staticDir }));
+			app.use("/sw.js", serveStatic({ root: staticDir }));
+			app.use("/workbox-*.js", serveStatic({ root: staticDir }));
+			app.use("/manifest.webmanifest", serveStatic({ root: staticDir }));
+			app.use("/favicon.svg", serveStatic({ root: staticDir }));
+			app.use("/pwa-*.png", serveStatic({ root: staticDir }));
+			app.use("/apple-touch-icon-*.png", serveStatic({ root: staticDir }));
+			app.get("*", serveStatic({ root: staticDir, path: "index.html" }));
+		}
 	}
 }
 
@@ -80,6 +151,11 @@ logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		});
 		});
+			if (cached.length > 0) {
+			} else {
+					.then((models) =>
+					)
+			}
 		}
 	} catch (err) {
 	}
@@ -94,3 +170,16 @@ terminalService.recoverOnStartup().catch((err) => {
 recoverNarrators().catch((err) => {
 	logger.error("Narrator state recovery failed", { error: String(err) });
 });
+
+// Mark interrupted merge sessions as error
+chapterBatchMerge.cleanupStaleSessions().catch((err) => {
+	logger.error("Merge session cleanup failed", { error: String(err) });
+});
+
+// Graceful shutdown
+const shutdown = () => {
+	chapterCleanup.clearAllTimers();
+	process.exit(0);
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

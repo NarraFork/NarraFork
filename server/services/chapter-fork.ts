@@ -7,18 +7,12 @@ import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
+import { slugify } from "../lib/slug";
 import { resolveChapterSettings } from "./chapter-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
-
-export function slugify(text: string): string {
-	return text
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/(^-|-$)/g, "")
-		.slice(0, 30);
-}
+import { portAllocator } from "./port-allocator";
 
 export interface ForkChapterInput {
 	title: string;
@@ -159,6 +153,19 @@ export const chapterFork = {
 						chapterId: id,
 						error: String(err),
 					});
+					// Ensure ports are released (startChapterContainers releases on
+					// failure internally, but double-check to prevent leaks)
+					try {
+						await portAllocator.release(id);
+					} catch {
+						// ignore
+					}
+					// Clear containerConfig so dormant/wake won't try to manage
+					// containers that were never started
+					await db
+						.update(chapters)
+						.set({ containerConfig: null, updatedAt: now })
+						.where(eq(chapters.id, id));
 				}
 			}
 

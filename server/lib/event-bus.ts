@@ -114,7 +114,18 @@ class NarraForkEventBus {
 			const listeners = this.emitter.rawListeners(eventName);
 			for (const listener of listeners) {
 				try {
-					(listener as (e: NarraForkEvent) => void)(event);
+					const result = (listener as (e: NarraForkEvent) => void | Promise<void>)(event);
+					// If a listener returns a Promise, catch its errors to prevent
+					// unhandled rejections (without changing emit's sync semantics)
+					if (result && typeof (result as Promise<void>).catch === "function") {
+						(result as Promise<void>).catch((err) => {
+							logger.error("Async event listener error", {
+								eventType: event.type,
+								listenedEvent: eventName,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						});
+					}
 				} catch (err) {
 					logger.error("Event listener threw an error", {
 						eventType: event.type,

@@ -1,3 +1,6 @@
+import { eq, inArray } from "drizzle-orm";
+import { db } from "../db";
+import { mergeSessions } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -20,43 +23,55 @@ export interface BatchMergeInput {
 
 export type MergeDecision = "continue" | "cancel";
 
-interface PendingDecision {
-	resolve: (decision: MergeDecision) => void;
-	timeoutId: ReturnType<typeof setTimeout>;
-}
-
-// In-memory state for pending conflict decisions (like permission requests)
-const pendingDecisions = new Map<string, PendingDecision>();
-
 const DECISION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const DECISION_POLL_INTERVAL_MS = 1000; // 1 second
 
 /**
  * Resolve a pending merge conflict decision.
  * Called from WebSocket when a user decides to continue or cancel.
  */
-export function resolveMergeDecision(mergeSessionId: string, decision: MergeDecision): void {
-	const pending = pendingDecisions.get(mergeSessionId);
-	if (!pending) {
+export async function resolveMergeDecision(
+	mergeSessionId: string,
+	decision: MergeDecision,
+): Promise<void> {
+	const now = new Date().toISOString();
+	const [updated] = await db
+		.update(mergeSessions)
+		.set({
+			status: decision === "continue" ? "running" : "cancelled",
+			updatedAt: now,
+		})
+		.where(eq(mergeSessions.id, mergeSessionId))
+		.returning();
+
+	if (!updated) {
 		logger.warn("Merge decision for unknown session", { mergeSessionId });
-		return;
 	}
-	clearTimeout(pending.timeoutId);
-	pendingDecisions.delete(mergeSessionId);
-	pending.resolve(decision);
 }
 
 /**
- * Wait for a user decision on a merge conflict.
+ * Wait for a user decision on a merge conflict by polling DB.
  * Returns "cancel" on timeout.
  */
-function waitForDecision(mergeSessionId: string): Promise<MergeDecision> {
-	return new Promise((resolve) => {
-		const timeoutId = setTimeout(() => {
-			pendingDecisions.delete(mergeSessionId);
-			resolve("cancel");
-		}, DECISION_TIMEOUT_MS);
-		pendingDecisions.set(mergeSessionId, { resolve, timeoutId });
-	});
+async function waitForDecision(mergeSessionId: string): Promise<MergeDecision> {
+	const startTime = Date.now();
+	while (Date.now() - startTime < DECISION_TIMEOUT_MS) {
+		const session = await db.query.mergeSessions.findFirst({
+			where: eq(mergeSessions.id, mergeSessionId),
+		});
+		if (!session) return "cancel";
+		if (session.status === "running") return "continue";
+		if (session.status === "cancelled") return "cancel";
+		// Still waiting_decision — poll again
+		await new Promise((r) => setTimeout(r, DECISION_POLL_INTERVAL_MS));
+	}
+	// Timeout — mark as cancelled
+	const now = new Date().toISOString();
+	await db
+		.update(mergeSessions)
+		.set({ status: "cancelled", error: "Decision timeout", updatedAt: now })
+		.where(eq(mergeSessions.id, mergeSessionId));
+	return "cancel";
 }
 
 export const chapterBatchMerge = {
@@ -70,11 +85,13 @@ export const chapterBatchMerge = {
 	 * 4. On completion: broadcast merge:completed
 	 *
 	 * Runs in the background (fire-and-forget from the HTTP handler).
-	 * All progress is communicated via eventBus → WebSocket.
+	 * All progress is communicated via eventBus → WebSocket and persisted to DB.
 	 */
 	async run(input: BatchMergeInput): Promise<{ mergeSessionId: string; targetChapterId: string }> {
 		const mergeSessionId = generateId();
 		const strategy = input.strategy ?? "merge";
+		// Deduplicate source chapters while preserving order
+		const sourceChapterIds = [...new Set(input.sourceChapterIds)];
 
 		// Step 1: Fork base chapter
 		const forkedChapter = await chapterFork.fork(input.baseChapterId, {
@@ -84,22 +101,42 @@ export const chapterBatchMerge = {
 		});
 
 		const targetChapterId = forkedChapter.id;
+		const now = new Date().toISOString();
+
+		// Persist session to DB
+		await db.insert(mergeSessions).values({
+			id: mergeSessionId,
+			targetChapterId,
+			sourceChapterIds,
+			strategy,
+			status: "running",
+			currentIndex: 0,
+			mergedCount: 0,
+			locale: input.locale ?? null,
+			createdAt: now,
+			updatedAt: now,
+		});
 
 		eventBus.emit({
 			type: "merge:started",
 			mergeSessionId,
 			targetChapterId,
-			sourceChapterIds: input.sourceChapterIds,
+			sourceChapterIds,
 		});
 
-		// Step 2: Process merges in background
+		// Step 2: Process merges in background (fire-and-forget)
 		this.processQueue(
 			mergeSessionId,
 			targetChapterId,
-			input.sourceChapterIds,
+			sourceChapterIds,
 			strategy,
 			input.locale,
-		);
+		).catch((err) => {
+			logger.error("Batch merge processQueue unhandled error", {
+				mergeSessionId,
+				error: String(err),
+			});
+		});
 
 		return { mergeSessionId, targetChapterId };
 	},
@@ -120,6 +157,17 @@ export const chapterBatchMerge = {
 			for (let i = 0; i < total; i++) {
 				const sourceId = sourceChapterIds[i];
 				currentSourceId = sourceId;
+				const now = new Date().toISOString();
+
+				// Update progress in DB
+				await db
+					.update(mergeSessions)
+					.set({
+						currentIndex: i,
+						currentSourceChapterId: sourceId,
+						updatedAt: now,
+					})
+					.where(eq(mergeSessions.id, mergeSessionId));
 
 				// Try merge
 				const result = await chapterMerge.merge(sourceId, {
@@ -129,6 +177,15 @@ export const chapterBatchMerge = {
 
 				if (result.success) {
 					mergedCount++;
+					const stepNow = new Date().toISOString();
+					await db
+						.update(mergeSessions)
+						.set({
+							mergedCount,
+							updatedAt: stepNow,
+						})
+						.where(eq(mergeSessions.id, mergeSessionId));
+
 					eventBus.emit({
 						type: "merge:step_ok",
 						mergeSessionId,
@@ -140,7 +197,17 @@ export const chapterBatchMerge = {
 					continue;
 				}
 
-				// Conflict — broadcast and wait for decision
+				// Conflict — persist state and broadcast, then wait for decision
+				const conflictNow = new Date().toISOString();
+				await db
+					.update(mergeSessions)
+					.set({
+						status: "waiting_decision",
+						conflictFiles: result.conflictFiles ?? [],
+						updatedAt: conflictNow,
+					})
+					.where(eq(mergeSessions.id, mergeSessionId));
+
 				eventBus.emit({
 					type: "merge:conflict",
 					mergeSessionId,
@@ -159,11 +226,20 @@ export const chapterBatchMerge = {
 						mergeSessionId,
 						reason: "User cancelled on conflict",
 					});
-					await this.rollback(targetChapterId);
+					await this.rollback(mergeSessionId, targetChapterId, "User cancelled");
 					return;
 				}
 
 				// User chose continue — AI resolve
+				const aiNow = new Date().toISOString();
+				await db
+					.update(mergeSessions)
+					.set({
+						status: "ai_resolving",
+						updatedAt: aiNow,
+					})
+					.where(eq(mergeSessions.id, mergeSessionId));
+
 				eventBus.emit({
 					type: "merge:ai_resolving",
 					mergeSessionId,
@@ -172,10 +248,7 @@ export const chapterBatchMerge = {
 
 				const aiResult = await chapterMerge.aiResolveConflicts(
 					sourceId,
-					{
-						targetChapterId,
-						strategy,
-					},
+					{ targetChapterId, strategy },
 					locale,
 				);
 
@@ -186,17 +259,31 @@ export const chapterBatchMerge = {
 						sourceChapterId: sourceId,
 						error: aiResult.error ?? "AI resolution failed",
 					});
-					// Rollback
 					eventBus.emit({
 						type: "merge:cancelled",
 						mergeSessionId,
 						reason: aiResult.error ?? "AI resolution failed",
 					});
-					await this.rollback(targetChapterId);
+					await this.rollback(
+						mergeSessionId,
+						targetChapterId,
+						aiResult.error ?? "AI resolution failed",
+					);
 					return;
 				}
 
 				mergedCount++;
+				const resolvedNow = new Date().toISOString();
+				await db
+					.update(mergeSessions)
+					.set({
+						status: "running",
+						mergedCount,
+						conflictFiles: null,
+						updatedAt: resolvedNow,
+					})
+					.where(eq(mergeSessions.id, mergeSessionId));
+
 				eventBus.emit({
 					type: "merge:step_ok",
 					mergeSessionId,
@@ -206,6 +293,18 @@ export const chapterBatchMerge = {
 					commitSha: aiResult.mergeResult?.commitSha,
 				});
 			}
+
+			// All merges completed
+			const doneNow = new Date().toISOString();
+			await db
+				.update(mergeSessions)
+				.set({
+					status: "completed",
+					mergedCount,
+					currentIndex: total,
+					updatedAt: doneNow,
+				})
+				.where(eq(mergeSessions.id, mergeSessionId));
 
 			eventBus.emit({
 				type: "merge:completed",
@@ -225,19 +324,61 @@ export const chapterBatchMerge = {
 				sourceChapterId: currentSourceId,
 				error: String(err),
 			});
+			// Rollback: delete the forked chapter
+			await this.rollback(mergeSessionId, targetChapterId, String(err));
 		}
 	},
 
-	/** Delete the forked chapter on cancellation/failure */
-	async rollback(targetChapterId: string): Promise<void> {
+	/** Delete the forked chapter on cancellation/failure and update session status. */
+	async rollback(mergeSessionId: string, targetChapterId: string, reason: string): Promise<void> {
 		try {
 			await chapterService.remove(targetChapterId);
-			logger.info("Batch merge rolled back", { targetChapterId });
+			logger.info("Batch merge rolled back", { mergeSessionId, targetChapterId });
 		} catch (err) {
 			logger.error("Failed to rollback batch merge", {
+				mergeSessionId,
 				targetChapterId,
 				error: String(err),
 			});
 		}
+		const now = new Date().toISOString();
+		await db
+			.update(mergeSessions)
+			.set({ status: "error", error: reason, updatedAt: now })
+			.where(eq(mergeSessions.id, mergeSessionId));
+	},
+
+	/** Get a merge session by ID. */
+	async getSession(mergeSessionId: string) {
+		return db.query.mergeSessions.findFirst({
+			where: eq(mergeSessions.id, mergeSessionId),
+		});
+	},
+
+	/**
+	 * Mark stale sessions (running/ai_resolving) as error on server startup.
+	 * These sessions were interrupted by a server restart.
+	 */
+	async cleanupStaleSessions(): Promise<void> {
+		const now = new Date().toISOString();
+		const staleStatuses = ["running", "ai_resolving", "waiting_decision"] as const;
+		const stale = await db.query.mergeSessions.findMany({
+			where: inArray(mergeSessions.status, [...staleStatuses]),
+		});
+		if (stale.length === 0) return;
+
+		await db
+			.update(mergeSessions)
+			.set({
+				status: "error",
+				error: "Server restarted during merge",
+				updatedAt: now,
+			})
+			.where(inArray(mergeSessions.status, [...staleStatuses]));
+
+		logger.info("Cleaned up stale merge sessions", {
+			count: stale.length,
+			ids: stale.map((s) => s.id),
+		});
 	},
 };

@@ -25,7 +25,7 @@ export const chapters = sqliteTable(
 		id: text("id").primaryKey(),
 		projectId: text("project_id")
 			.notNull()
-			.references(() => projects.id),
+			.references(() => projects.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
 		description: text("description"),
 		status: text("status", { enum: ["active", "dormant", "merged", "abandoned"] })
@@ -34,11 +34,16 @@ export const chapters = sqliteTable(
 		branch: text("branch").notNull(),
 		worktreePath: text("worktree_path"),
 		baseBranch: text("base_branch").notNull(),
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		parentChapterId: text("parent_chapter_id").references((): any => chapters.id),
+		// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
+		parentChapterId: text("parent_chapter_id").references((): any => chapters.id, {
+			onDelete: "set null",
+		}),
 		forkPoint: text("fork_point", { mode: "json" }),
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		mergedIntoChapterId: text("merged_into_chapter_id").references((): any => chapters.id),
+		mergedIntoChapterId: text("merged_into_chapter_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
+			(): any => chapters.id,
+			{ onDelete: "set null" },
+		),
 		mergeCommitSha: text("merge_commit_sha"),
 		mergeStrategy: text("merge_strategy", { enum: ["merge", "squash", "cherry-pick"] }),
 		containerConfig: text("container_config", { mode: "json" }),
@@ -91,6 +96,10 @@ export const narrators = sqliteTable(
 		errorMessage: text("error_message"),
 		todosJson: text("todos_json", { mode: "json" }),
 		todosToolUseId: text("todos_tool_use_id"),
+		pruneBoundaryMessageId: text("prune_boundary_message_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
+			(): any => narratorMessages.id,
+		),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -323,3 +332,26 @@ export const userFavoriteDirectories = sqliteTable(
 	},
 	(table) => [index("idx_fav_dirs_user").on(table.userId, table.sortOrder)],
 );
+
+// === merge_sessions ===
+export const mergeSessions = sqliteTable("merge_sessions", {
+	id: text("id").primaryKey(),
+	targetChapterId: text("target_chapter_id")
+		.notNull()
+		.references(() => chapters.id),
+	sourceChapterIds: text("source_chapter_ids", { mode: "json" }).notNull().$type<string[]>(),
+	strategy: text("strategy", { enum: ["merge", "squash", "cherry-pick"] })
+		.notNull()
+		.default("merge"),
+	status: text("status", {
+		enum: ["running", "waiting_decision", "ai_resolving", "completed", "cancelled", "error"],
+	}).notNull(),
+	currentIndex: integer("current_index").notNull().default(0),
+	mergedCount: integer("merged_count").notNull().default(0),
+	currentSourceChapterId: text("current_source_chapter_id"),
+	conflictFiles: text("conflict_files", { mode: "json" }).$type<string[]>(),
+	error: text("error"),
+	locale: text("locale"),
+	createdAt: text("created_at").notNull(),
+	updatedAt: text("updated_at").notNull(),
+});

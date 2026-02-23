@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { ValidationError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import {
 	batchCleanupSchema,
@@ -32,6 +32,13 @@ chapterRoutes.post("/", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const chapter = await chapterService.create(parsed.data);
 	return c.json(chapter, 201);
+});
+
+chapterRoutes.get("/merge-sessions/:sessionId", async (c) => {
+	const sessionId = c.req.param("sessionId");
+	const session = await chapterBatchMerge.getSession(sessionId);
+	if (!session) throw new NotFoundError("MergeSession", sessionId);
+	return c.json(session);
 });
 
 chapterRoutes.get("/:id", async (c) => {

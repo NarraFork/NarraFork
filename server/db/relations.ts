@@ -2,6 +2,7 @@ import { relations } from "drizzle-orm";
 import {
 	chapters,
 	containerInstances,
+	mergeSessions,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -132,5 +133,12 @@ export const userPreferencesRelations = relations(userPreferences, ({ one }) => 
 	user: one(users, {
 		fields: [userPreferences.userId],
 		references: [users.id],
+	}),
+}));
+
+export const mergeSessionsRelations = relations(mergeSessions, ({ one }) => ({
+	targetChapter: one(chapters, {
+		fields: [mergeSessions.targetChapterId],
+		references: [chapters.id],
 	}),
 }));
