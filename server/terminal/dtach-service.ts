@@ -4,55 +4,70 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { detectShell } from "../lib/agent/shell";
 import { logger } from "../lib/logger";
-
-const DEFAULT_SHELL = process.env.SHELL ?? "/bin/bash";
 
 // === Process tree utilities ===
 
+/**
+ * Find PIDs whose command line contains `searchArg`.
+ * Uses `pgrep -f` which works on both Linux and macOS.
+ */
 function findProcessesByArg(searchArg: string): number[] {
 	const pids: number[] = [];
 	try {
-		const procDirs = readdirSync("/proc").filter((d) => /^\d+$/.test(d));
-		for (const pid of procDirs) {
-			try {
-				const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
-				if (cmdline.includes(searchArg)) {
-					pids.push(Number.parseInt(pid, 10));
-				}
-			} catch {
-				// Process may have exited
-			}
+		const result = execSync(`pgrep -f "${searchArg}"`, {
+			encoding: "utf-8",
+			stdio: "pipe",
+		});
+		for (const line of result.trim().split("\n")) {
+			const pid = Number.parseInt(line, 10);
+			if (!Number.isNaN(pid)) pids.push(pid);
 		}
 	} catch {
-		try {
-			const result = execSync(`pgrep -f "${searchArg}"`, { encoding: "utf-8" });
-			for (const line of result.trim().split("\n")) {
-				const pid = Number.parseInt(line, 10);
-				if (!Number.isNaN(pid)) pids.push(pid);
-			}
-		} catch {
-			// No matches
-		}
+		// No matches or pgrep not available
 	}
 	return pids;
 }
 
+/**
+ * Get child PIDs recursively.
+ * Uses POSIX-compatible `ps -o pid=,ppid=` which works on both Linux and macOS (BSD ps).
+ */
 function getDescendantPids(pid: number): number[] {
 	const descendants: number[] = [];
 	try {
-		const result = execSync(`ps --ppid ${pid} -o pid= 2>/dev/null || true`, {
+		// POSIX-compatible: list all processes with pid and ppid columns
+		const result = execSync("ps -ax -o pid=,ppid=", {
 			encoding: "utf-8",
+			stdio: "pipe",
 		});
+		// Build parent→children map
+		const children = new Map<number, number[]>();
 		for (const line of result.trim().split("\n")) {
-			const childPid = Number.parseInt(line.trim(), 10);
-			if (!Number.isNaN(childPid)) {
-				descendants.push(childPid);
-				descendants.push(...getDescendantPids(childPid));
+			const parts = line.trim().split(/\s+/);
+			if (parts.length < 2) continue;
+			const childPid = Number.parseInt(parts[0], 10);
+			const parentPid = Number.parseInt(parts[1], 10);
+			if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
+			let list = children.get(parentPid);
+			if (!list) {
+				list = [];
+				children.set(parentPid, list);
 			}
+			list.push(childPid);
+		}
+		// BFS to collect all descendants
+		const queue = children.get(pid) ?? [];
+		while (queue.length > 0) {
+			const child = queue.shift();
+			if (child === undefined) break;
+			descendants.push(child);
+			const grandchildren = children.get(child);
+			if (grandchildren) queue.push(...grandchildren);
 		}
 	} catch {
 		// ignore
@@ -114,7 +129,7 @@ export const dtachService = {
 	}): Promise<{ proc: import("bun").Subprocess }> {
 		this.init();
 		const socketPath = this.getSocketPath(opts.terminalId);
-		const shell = DEFAULT_SHELL;
+		const shell = detectShell();
 
 		// dtach -n: create new session without attaching
 		// -z: disable suspend (Ctrl+Z doesn't detach)
@@ -153,9 +168,9 @@ export const dtachService = {
 			},
 		});
 
-		// Attach to dtach session through PTY
+		// Attach to dtach session through PTY — use sh -c for POSIX compatibility
 		const proc = Bun.spawn(
-			["bash", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath],
+			["sh", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath],
 			{
 				env: { ...process.env, TERM: "xterm-256color" },
 				terminal: pty,

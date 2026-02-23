@@ -126,6 +126,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"ExitPlanMode",
 	"Bash",
 	"Task",
+	"ContinueTask",
 	"AskUserQuestion",
 ]);
 
@@ -150,4 +151,13 @@ export interface AgentConfig {
 		toolUseId: string,
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
+	/**
+	 * Called before each non-first turn in the agent loop.
+	 * If it returns a new history + pendingToolResults, the loop replaces its
+	 * internal state — used for mid-turn context pruning.
+	 */
+	onBeforeTurn?: (turnIndex: number) => Promise<{
+		history: unknown[];
+		pendingToolResults: unknown[];
+	} | null>;
 }

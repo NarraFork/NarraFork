@@ -1,10 +1,9 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { z } from "zod/v4";
 import { settings } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
-const baseDescription = readFileSync(join(import.meta.dir, "task.txt"), "utf-8");
+// Use text import so the bundler inlines the file content at build time
+import baseDescription from "./task.txt" with { type: "text" };
 
 const BUILTIN_MODELS = ["claude-haiku", "claude-sonnet", "claude-opus"];
 

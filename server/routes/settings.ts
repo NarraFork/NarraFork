@@ -27,7 +27,6 @@ const updateSettingsSchema = z
 				summaryModel: z.string().min(1),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
-				extendedContext: z.boolean(),
 				maxTurns: z.number().int().min(1).max(1000),
 				subagentModels: z
 					.object({

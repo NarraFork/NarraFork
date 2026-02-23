@@ -8,7 +8,12 @@ const MAX_MATCHES = 100;
 
 /** Resolve the ripgrep binary path. Checks system paths, then falls back to PATH. */
 function findRg(): string {
-	const systemPaths = ["/usr/bin/rg", "/usr/local/bin/rg", "/home/linuxbrew/.linuxbrew/bin/rg"];
+	const systemPaths = [
+		"/usr/bin/rg",
+		"/usr/local/bin/rg",
+		"/opt/homebrew/bin/rg",
+		"/home/linuxbrew/.linuxbrew/bin/rg",
+	];
 	for (const p of systemPaths) {
 		if (existsSync(p)) return p;
 	}

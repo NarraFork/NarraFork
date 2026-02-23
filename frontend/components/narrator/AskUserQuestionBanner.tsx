@@ -26,13 +26,15 @@ interface AskUserQuestionBannerProps {
 export function AskUserQuestionBanner({
 	requestId,
 	narratorId,
-	questions,
+	questions: rawQuestions,
 	answers: savedAnswers,
 	readOnly,
 	onSubmit,
 	onDeny,
 }: AskUserQuestionBannerProps) {
 	const { t } = useTranslation("narrator");
+	// Defensive: questions may come from untyped JSON — ensure it's always an array
+	const questions = Array.isArray(rawQuestions) ? rawQuestions : [];
 	const [selections, setSelections] = useState<Record<string, string>>({});
 	const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
 	const [suggesting, setSuggesting] = useState(false);
@@ -130,54 +132,55 @@ export function AskUserQuestionBanner({
 					const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
 					const customAnswer = readOnly ? getCustomAnswer(q) : undefined;
 					return (
-						<Stack key={q.header} gap="xs">
+						<Stack key={q.question} gap="xs">
 							<Text size="sm" fw={500}>
-								{q.question}
+								{q.header}
 							</Text>
-							{q.multiSelect ? (
-								<Stack gap={4}>
-									{q.options.map((opt) => (
-										<Checkbox
-											key={opt.label}
-											label={opt.label}
-											description={opt.description}
-											disabled={readOnly || hasCustom}
-											checked={readOnly ? isOptionSelected(q.question, opt.label) : undefined}
-											onChange={
-												readOnly
-													? undefined
-													: (e) =>
-															handleCheckboxChange(q.question, opt.label, e.currentTarget.checked)
-											}
-										/>
-									))}
-								</Stack>
-							) : (
-								<Radio.Group
-									value={
-										readOnly
-											? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")
-												? savedAnswers?.[q.question]
-												: ""
-											: hasCustom
-												? ""
-												: (selections[q.question] ?? "")
-									}
-									onChange={readOnly ? () => {} : (val) => handleRadioChange(q.question, val)}
-								>
+							{q.options.length > 0 &&
+								(q.multiSelect ? (
 									<Stack gap={4}>
 										{q.options.map((opt) => (
-											<Radio
+											<Checkbox
 												key={opt.label}
-												value={opt.label}
 												label={opt.label}
 												description={opt.description}
 												disabled={readOnly || hasCustom}
+												checked={readOnly ? isOptionSelected(q.question, opt.label) : undefined}
+												onChange={
+													readOnly
+														? undefined
+														: (e) =>
+																handleCheckboxChange(q.question, opt.label, e.currentTarget.checked)
+												}
 											/>
 										))}
 									</Stack>
-								</Radio.Group>
-							)}
+								) : (
+									<Radio.Group
+										value={
+											readOnly
+												? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")
+													? savedAnswers?.[q.question]
+													: ""
+												: hasCustom
+													? ""
+													: (selections[q.question] ?? "")
+										}
+										onChange={readOnly ? () => {} : (val) => handleRadioChange(q.question, val)}
+									>
+										<Stack gap={4}>
+											{q.options.map((opt) => (
+												<Radio
+													key={opt.label}
+													value={opt.label}
+													label={opt.label}
+													description={opt.description}
+													disabled={readOnly || hasCustom}
+												/>
+											))}
+										</Stack>
+									</Radio.Group>
+								))}
 							{readOnly ? (
 								customAnswer && (
 									<Text size="xs" ff="monospace" c="teal">

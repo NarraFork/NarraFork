@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
@@ -22,8 +23,23 @@ interface ExecResult {
 	exitCode: number;
 }
 
+/** Detect available container runtime: podman or docker. Cached after first call. */
+let _runtime: string | null = null;
 function runtime(): string {
-	return "podman";
+	if (_runtime) return _runtime;
+	for (const cmd of ["podman", "docker"]) {
+		try {
+			execSync(`${cmd} --version`, { encoding: "utf-8", stdio: "pipe", timeout: 5000 });
+			_runtime = cmd;
+			logger.info("Container runtime detected", { runtime: cmd });
+			return cmd;
+		} catch {
+			// not available
+		}
+	}
+	// Default to podman — will fail at exec time with a clear error
+	_runtime = "podman";
+	return _runtime;
 }
 
 async function exec(

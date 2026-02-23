@@ -6,6 +6,7 @@ import {
 	Divider,
 	Group,
 	List,
+	Menu,
 	Paper,
 	Stack,
 	Text,
@@ -19,6 +20,8 @@ import {
 	IconChevronRight,
 	IconCode,
 	IconFile,
+	IconGitBranch,
+	IconGitFork,
 	IconListCheck,
 	IconLoader2,
 	IconMap,
@@ -26,16 +29,28 @@ import {
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
+	IconTrash,
 	IconWorldSearch,
 	IconX,
 } from "@tabler/icons-react";
-import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+	createContext,
+	memo,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
+import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { getGlobalCloseSwipe, setGlobalCloseSwipe } from "./swipeState";
 
 /**
  * Context carrying the toolUseId of the narrator's latest TodoWrite call.
@@ -194,11 +209,65 @@ export function getCategoryColor(cat: ToolCategory) {
 	}
 }
 
+// --- Truncation helpers ---
+
+/** Check whether a value is a truncated placeholder produced by the backend */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function isTruncated(val: any): val is { _truncated: true; preview: string; fullLength: number } {
+	return val?._truncated === true && typeof val?.preview === "string";
+}
+
+/**
+ * Resolve a possibly-truncated JSON value to a displayable string.
+ * For truncated objects, returns the `preview` field (raw JSON prefix).
+ * For normal values, returns JSON.stringify or the string itself.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function resolveDisplayText(val: any): string {
+	if (val === null || val === undefined) return "";
+	if (isTruncated(val)) return val.preview;
+	if (typeof val === "string") return val;
+	return JSON.stringify(val, null, 2);
+}
+
+/** Escape special regex characters in a string. */
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Try to extract a top-level string property from a possibly-truncated JSON object.
+ * For truncated objects, attempts a regex match on the preview string.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function extractField(val: any, ...keys: string[]): string {
+	if (!val) return "";
+	if (!isTruncated(val)) {
+		for (const k of keys) {
+			if (typeof val[k] === "string") return val[k];
+		}
+		return "";
+	}
+	// Try to extract from the JSON preview string via regex
+	for (const k of keys) {
+		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
+		const m = val.preview.match(re);
+		if (m) {
+			try {
+				return JSON.parse(`"${m[1]}"`);
+			} catch {
+				return m[1];
+			}
+		}
+	}
+	return "";
+}
+
 // --- Helper: extract a human-readable summary for the header ---
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getFilePath(input: any): string {
-	return input?.file_path ?? input?.filePath ?? input?.path ?? "";
+	return extractField(input, "file_path", "filePath", "path");
 }
 
 function basename(p: string): string {
@@ -224,30 +293,32 @@ function getSummary(toolName: string, input: any): string {
 			return base;
 		}
 		case "bash": {
-			const cmd = input?.command ?? "";
+			const cmd = extractField(input, "command");
 			if (!cmd) return toolName;
 			return cmd.length > 80 ? `${cmd.slice(0, 77)}...` : cmd;
 		}
 		case "search": {
-			const pat = input?.pattern ?? input?.glob ?? "";
+			const pat = extractField(input, "pattern", "glob");
 			if (!pat) return toolName;
 			return pat.length > 60 ? `${pat.slice(0, 57)}...` : pat;
 		}
 		case "webSearch": {
-			const q = input?.query ?? "";
+			const q = extractField(input, "query");
 			if (!q) return "Web Search";
 			return q.length > 60 ? `${q.slice(0, 57)}...` : q;
 		}
 		case "todo":
 			return "Update todos";
 		case "taskOutput": {
-			const taskId = input?.task_id ?? "";
+			const taskId = extractField(input, "task_id");
 			if (toolName === "TaskStop") return taskId ? `Stop ${taskId}` : "Stop task";
 			return taskId ? `Check ${taskId}` : "Check task output";
 		}
 		case "ask": {
-			const questions = input?.questions;
-			const answers = input?.answers as Record<string, string> | undefined;
+			const questions = isTruncated(input) ? undefined : input?.questions;
+			const answers = isTruncated(input)
+				? undefined
+				: (input?.answers as Record<string, string> | undefined);
 			if (Array.isArray(questions) && questions.length > 0) {
 				const header = questions[0].header ?? "Question";
 				if (answers && Object.keys(answers).length > 0) {
@@ -357,7 +428,7 @@ function ToolHeader({
 					<ElapsedTimer startedAt={toolCall.startedAt} />
 				) : (
 					toolCall.durationMs != null && (
-						<Text size="xs" c="dimmed">
+						<Text size="xs" c="dimmed" ff="monospace">
 							{(toolCall.durationMs / 1000).toFixed(1)}s
 						</Text>
 					)
@@ -389,21 +460,37 @@ const termStyle = {
 	color: "var(--mantine-color-gray-3)",
 } as const;
 
+/** Small indicator shown when tool call content is truncated (loading full data) */
+function TruncatedBadge({ fullLength }: { fullLength?: number }) {
+	const { t } = useTranslation("narrator");
+	return (
+		<Text size="xs" c="dimmed" fs="italic" mt={2}>
+			{t("truncatedPreview", {
+				size: fullLength ? `${Math.round(fullLength / 1024)}KB` : "",
+			})}
+		</Text>
+	);
+}
+
 function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const fp = getFilePath(toolCall.inputJson);
 	const isEdit = toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit";
 	const isWrite = toolCall.toolName === "Write";
+	const inputIsTruncated = isTruncated(toolCall.inputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
-	const outputText =
-		typeof toolCall.outputJson === "string"
-			? toolCall.outputJson
-			: toolCall.outputJson
-				? JSON.stringify(toolCall.outputJson, null, 2)
-				: "";
+	const outputText = resolveDisplayText(toolCall.outputJson);
 
 	// For Write tool, display the written content from input instead of the result prompt
-	const writeContent = isWrite ? (toolCall.inputJson?.content ?? "") : "";
+	const writeContent = isWrite
+		? inputIsTruncated
+			? extractField(toolCall.inputJson, "content") || toolCall.inputJson.preview
+			: (toolCall.inputJson?.content ?? "")
+		: "";
+
+	const oldString = inputIsTruncated ? undefined : toolCall.inputJson?.old_string;
+	const newString = inputIsTruncated ? undefined : toolCall.inputJson?.new_string;
 
 	return (
 		<Box mt="xs">
@@ -412,31 +499,44 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{fp}
 				</Text>
 			)}
-			{isEdit && toolCall.inputJson?.old_string != null && (
+			{isEdit && oldString != null && (
 				<ContentViewer
-					content={`--- old\n${toolCall.inputJson.old_string}\n+++ new\n${toolCall.inputJson.new_string ?? ""}`}
+					content={`--- old\n${oldString}\n+++ new\n${newString ?? ""}`}
 					title={fp ? basename(fp) : "Diff"}
 					contentType="diff"
 					diff={{
-						oldStr: toolCall.inputJson.old_string,
-						newStr: toolCall.inputJson.new_string ?? "",
+						oldStr: oldString,
+						newStr: newString ?? "",
 					}}
 					renderContent={(wordWrap) => (
 						<DiffView
-							oldStr={toolCall.inputJson.old_string}
-							newStr={toolCall.inputJson.new_string ?? ""}
+							oldStr={oldString}
+							newStr={newString ?? ""}
 							maxHeight={200}
 							wordWrap={wordWrap}
 						/>
 					)}
 				/>
 			)}
+			{isEdit && inputIsTruncated && !oldString && (
+				<>
+					<ContentViewer
+						content={toolCall.inputJson.preview}
+						style={codeStyle}
+						title={fp ? basename(fp) : "Edit"}
+					/>
+					<TruncatedBadge fullLength={toolCall.inputJson.fullLength} />
+				</>
+			)}
 			{isWrite && writeContent && (
-				<ContentViewer
-					content={writeContent}
-					style={codeStyle}
-					title={fp ? basename(fp) : "Write"}
-				/>
+				<>
+					<ContentViewer
+						content={writeContent}
+						style={codeStyle}
+						title={fp ? basename(fp) : "Write"}
+					/>
+					{inputIsTruncated && <TruncatedBadge fullLength={toolCall.inputJson.fullLength} />}
+				</>
 			)}
 			{!isEdit && !isWrite && toolCall.outputJson && (
 				<>
@@ -448,9 +548,10 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						style={codeStyle}
 						title={fp ? basename(fp) : "Output"}
 					/>
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
-			{isEdit && !toolCall.inputJson?.old_string && (
+			{isEdit && !inputIsTruncated && !toolCall.inputJson?.old_string && (
 				<ContentViewer
 					content={JSON.stringify(toolCall.inputJson, null, 2)}
 					style={codeStyle}
@@ -463,13 +564,9 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
-	const cmd = toolCall.inputJson?.command ?? "";
-	const outputText =
-		typeof toolCall.outputJson === "string"
-			? toolCall.outputJson
-			: toolCall.outputJson
-				? JSON.stringify(toolCall.outputJson, null, 2)
-				: "";
+	const cmd = extractField(toolCall.inputJson, "command");
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	return (
 		<Box mt="xs">
@@ -490,6 +587,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 						style={termStyle}
 						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Bash"}
 					/>
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 			{toolCall.errorMessage && !toolCall.outputJson && (
@@ -503,20 +601,17 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
-	const pattern = toolCall.inputJson?.pattern ?? toolCall.inputJson?.glob ?? "";
-	const outputText =
-		typeof toolCall.outputJson === "string"
-			? toolCall.outputJson
-			: toolCall.outputJson
-				? JSON.stringify(toolCall.outputJson, null, 2)
-				: "";
+	const pattern = extractField(toolCall.inputJson, "pattern", "glob");
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const searchPath = extractField(toolCall.inputJson, "path");
 
 	return (
 		<Box mt="xs">
-			{pattern && <Code style={{ fontSize: 11 }}>/{pattern}/</Code>}
-			{toolCall.inputJson?.path && (
-				<Text size="xs" c="dimmed" ff="monospace" ml={4} span>
-					in {toolCall.inputJson.path}
+			{pattern && <Code style={{ fontSize: 11 }}>{pattern}</Code>}
+			{searchPath && (
+				<Text size="xs" c="dimmed">
+					in {searchPath}
 				</Text>
 			)}
 			{toolCall.outputJson && (
@@ -524,11 +619,8 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mt={4} mb={2}>
 						{t("output")}
 					</Text>
-					<ContentViewer
-						content={outputText}
-						style={codeStyle}
-						title={pattern ? `/${pattern}/` : "Search"}
-					/>
+					<ContentViewer content={outputText} style={codeStyle} title={pattern || "Search"} />
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 		</Box>
@@ -537,17 +629,13 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
-	const query = toolCall.inputJson?.query ?? "";
-	const raw =
-		typeof toolCall.outputJson === "string"
-			? toolCall.outputJson
-			: toolCall.outputJson
-				? JSON.stringify(toolCall.outputJson, null, 2)
-				: "";
+	const query = extractField(toolCall.inputJson, "query");
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const raw = resolveDisplayText(toolCall.outputJson);
 
 	// Try to parse structured search results from the output
 	const results = useMemo(() => {
-		if (!raw) return null;
+		if (!raw || outputIsTruncated) return null;
 		try {
 			const parsed = JSON.parse(raw);
 			if (Array.isArray(parsed?.results)) return parsed.results;
@@ -556,7 +644,7 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 			// not JSON — fall through
 		}
 		return null;
-	}, [raw]);
+	}, [raw, outputIsTruncated]);
 
 	return (
 		<Box mt="xs">
@@ -605,6 +693,7 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 							markdown
 							contentType="markdown"
 						/>
+						{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 					</>
 				)
 			)}
@@ -619,13 +708,10 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
-	const inputText = JSON.stringify(toolCall.inputJson, null, 2);
-	const outputText =
-		typeof toolCall.outputJson === "string"
-			? toolCall.outputJson
-			: toolCall.outputJson
-				? JSON.stringify(toolCall.outputJson, null, 2)
-				: "";
+	const inputText = resolveDisplayText(toolCall.inputJson);
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const inputIsTruncated = isTruncated(toolCall.inputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	return (
 		<Box mt="xs">
@@ -633,6 +719,7 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 				{t("input")}
 			</Text>
 			<ContentViewer content={inputText} style={codeStyle} title={`${toolCall.toolName} Input`} />
+			{inputIsTruncated && <TruncatedBadge fullLength={toolCall.inputJson.fullLength} />}
 			{toolCall.outputJson && (
 				<>
 					<Text size="xs" fw={500} mt="xs" mb={2}>
@@ -643,6 +730,7 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 						style={codeStyle}
 						title={`${toolCall.toolName} Output`}
 					/>
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 		</Box>
@@ -658,8 +746,11 @@ const TODO_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }
 function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const latestToolUseId = useContext(LatestTodosToolUseIdCtx);
 	const isLatest = !!toolCall.toolUseId && toolCall.toolUseId === latestToolUseId;
-	const todos: { content?: string; status?: string }[] =
-		toolCall.inputJson?.todos ?? toolCall.outputJson?.todos ?? [];
+	const todos: { content?: string; status?: string }[] = isTruncated(toolCall.inputJson)
+		? isTruncated(toolCall.outputJson)
+			? []
+			: (toolCall.outputJson?.todos ?? [])
+		: (toolCall.inputJson?.todos ?? toolCall.outputJson?.todos ?? []);
 
 	if (!todos.length) {
 		return <GenericDetail toolCall={toolCall} />;
@@ -715,14 +806,15 @@ function parseTaskOutputXml(raw: string): Record<string, string> {
 }
 
 function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const taskId = toolCall.inputJson?.task_id ?? "";
-	const block = toolCall.inputJson?.block;
-	const timeout = toolCall.inputJson?.timeout;
+	const taskId = extractField(toolCall.inputJson, "task_id");
+	const block = isTruncated(toolCall.inputJson) ? undefined : toolCall.inputJson?.block;
+	const timeout = isTruncated(toolCall.inputJson) ? undefined : toolCall.inputJson?.timeout;
 
 	// Parse the XML-style output
 	const parsed = useMemo(() => {
 		const out = toolCall.outputJson;
 		if (!out) return null;
+		if (isTruncated(out)) return null;
 		const raw =
 			typeof out === "string"
 				? out
@@ -774,11 +866,21 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 			{parsed?.output && (
 				<ContentViewer content={parsed.output} style={codeStyle} title={`TaskOutput ${taskId}`} />
 			)}
+			{!parsed && isTruncated(toolCall.outputJson) && (
+				<>
+					<ContentViewer
+						content={toolCall.outputJson.preview}
+						style={codeStyle}
+						title={`TaskOutput ${taskId}`}
+					/>
+					<TruncatedBadge fullLength={toolCall.outputJson.fullLength} />
+				</>
+			)}
 		</Box>
 	);
 }
 
-function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
+function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight?: number }) {
 	// Plan content from inputJson.plan is shown by InlinePermission during approval.
 	// Here we only render after completion, using outputJson or falling back to inputJson.plan.
 	const planText =
@@ -792,28 +894,31 @@ function PlanDetail({ toolCall }: { toolCall: ToolCallData }) {
 						: ""
 			: "";
 
+	const outputTruncated = isTruncated(toolCall.outputJson);
+
 	if (!planText) {
 		return null;
 	}
 
 	return (
-		<Box
-			mt="xs"
-			style={{ flex: 1, minHeight: 0, maxHeight: "calc(100vh - 200px)", overflow: "auto" }}
-		>
+		<Box mt="xs" style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}>
 			<ContentViewer
 				content={planText}
 				markdown
 				contentType="markdown"
 				title={`Plan — ${toolCall.toolName}`}
 			/>
+			{outputTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 		</Box>
 	);
 }
 
 function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const questions = toolCall.inputJson?.questions ?? [];
-	const answers: Record<string, string> = toolCall.inputJson?.answers ?? {};
+	const raw = isTruncated(toolCall.inputJson) ? [] : (toolCall.inputJson?.questions ?? []);
+	const questions = Array.isArray(raw) ? raw : [];
+	const answers: Record<string, string> = isTruncated(toolCall.inputJson)
+		? {}
+		: (toolCall.inputJson?.answers ?? {});
 
 	// Don't show the read-only summary while the permission is still pending —
 	// the interactive AskUserQuestionBanner (rendered via InlinePermission) handles that.
@@ -883,7 +988,7 @@ function InlinePermission({
 	const [feedback, setFeedback] = useState("");
 
 	// AskUserQuestion: render the full question form inline
-	if (permission.toolName === "AskUserQuestion" && permission.inputJson?.questions) {
+	if (permission.toolName === "AskUserQuestion" && Array.isArray(permission.inputJson?.questions)) {
 		return (
 			<Box mt="xs">
 				<AskUserQuestionBanner
@@ -994,6 +1099,11 @@ function LazyDetailRenderer({
 	return <DetailRenderer toolCall={resolvedToolCall} />;
 }
 
+// --- Swipe / context-menu constants ---
+
+const SWIPE_THRESHOLD = 60;
+const SWIPE_REVEAL_WIDTH = 180;
+
 // --- Main single card ---
 
 export const ToolCallCard = memo(function ToolCallCard({
@@ -1010,6 +1120,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName);
 	const isEdit = isEditTool(toolCall.toolName);
+	const isPlan = cat === "plan";
 	// Streaming tool chunks (still being generated) — not expandable
 	const isStreaming = toolCall.inputJson?._streamingChars != null;
 	// Auto-expand: permission pending, todo tools, or edit tools.
@@ -1026,10 +1137,33 @@ export const ToolCallCard = memo(function ToolCallCard({
 			(isFailed && !isEdit));
 	const [opened, setOpened] = useState(defaultOpen);
 
+	// Clamp plan card height to 70% of the nearest scroll container (same as SubagentCard)
+	const cardRef = useRef<HTMLDivElement>(null);
+	const [vpHeight, setVpHeight] = useState<number | undefined>();
+	useEffect(() => {
+		if (!isPlan || vpHeight) return;
+		const node = cardRef.current;
+		if (!node) return;
+		let el: HTMLElement | null = node.parentElement;
+		while (el) {
+			const ov = getComputedStyle(el).overflowY;
+			if (ov === "scroll" || ov === "auto") {
+				setVpHeight(el.clientHeight * 0.85);
+				return;
+			}
+			el = el.parentElement;
+		}
+	});
+
 	// Auto-expand when a permission request arrives or tool call enters pending state
 	useEffect(() => {
 		if (pendingPermission || toolCall.status === "pending") setOpened(true);
 	}, [pendingPermission, toolCall.status]);
+
+	// Auto-expand todo/plan cards once streaming finishes
+	useEffect(() => {
+		if (!isStreaming && (cat === "todo" || cat === "plan")) setOpened(true);
+	}, [isStreaming, cat]);
 
 	// Force expand from outside (e.g. navigating to this card)
 	useEffect(() => {
@@ -1061,34 +1195,314 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const handleToggle = isStreaming ? undefined : () => setOpened((o) => !o);
 
+	// --- Message-level context menu actions (branch / fork / delete) ---
+	const msgCtx = useMessageContextMenu();
+	const { t: tNarrator } = useTranslation("narrator");
+	const hasActions = !!(
+		msgCtx.onBranchFromMessage ||
+		msgCtx.onForkFromMessage ||
+		msgCtx.onDeleteMessage
+	);
+
+	// --- Swipe & context-menu state ---
+	const swipeBoxRef = useRef<HTMLDivElement>(null);
+	const swipeMenuRef = useRef<HTMLDivElement>(null);
+	const [swipeOffset, setSwipeOffset] = useState(0);
+	const swipeOffsetRef = useRef(0);
+	const [swipeRevealed, setSwipeRevealed] = useState(false);
+	const [swipeClosing, setSwipeClosing] = useState(false);
+	const [swipeY, setSwipeY] = useState(0);
+	const [swipeInitialRight, setSwipeInitialRight] = useState(0);
+	const swipeRef = useRef<{
+		startX: number;
+		startY: number;
+		dir: "h" | "v" | null;
+	} | null>(null);
+
+	// Desktop context menu
+	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
+	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
+
+	const closeSwipe = useCallback(() => {
+		setSwipeClosing(true);
+		swipeOffsetRef.current = 0;
+		setSwipeOffset(0);
+		setSwipeRevealed(false);
+		setGlobalCloseSwipe(null);
+		setTimeout(() => setSwipeClosing(false), 220);
+	}, []);
+
+	useEffect(() => {
+		if (swipeRevealed) setGlobalCloseSwipe(closeSwipe);
+		return () => {
+			if (getGlobalCloseSwipe() === closeSwipe) setGlobalCloseSwipe(null);
+		};
+	}, [swipeRevealed, closeSwipe]);
+
+	// Swipe — only when touch starts outside a ContentViewer
+	useEffect(() => {
+		if (!hasActions) return;
+		const node = swipeBoxRef.current;
+		if (!node) return;
+
+		const onTouchStart = (e: TouchEvent) => {
+			const target = e.target as HTMLElement | null;
+			// Let ContentViewer handle its own swipe
+			if (target?.closest?.("[data-content-block]")) return;
+			// Don't interfere with open menus (e.g. ContentViewer's swipe menu)
+			if (target?.closest?.(".mantine-Menu-dropdown")) return;
+
+			const cur = getGlobalCloseSwipe();
+			if (cur && cur !== closeSwipe) {
+				cur();
+				swipeRef.current = null;
+				return;
+			}
+			if (swipeRevealed) {
+				closeSwipe();
+				swipeRef.current = null;
+				return;
+			}
+			const touch = e.touches[0];
+			swipeRef.current = { startX: touch.clientX, startY: touch.clientY, dir: null };
+			setSwipeY(touch.clientY);
+			setSwipeInitialRight(node.getBoundingClientRect().right);
+		};
+
+		const onTouchMove = (e: TouchEvent) => {
+			const s = swipeRef.current;
+			if (!s || swipeRevealed) return;
+			const touch = e.touches[0];
+			const dx = s.startX - touch.clientX;
+			const dy = Math.abs(touch.clientY - s.startY);
+			if (!s.dir) {
+				if (Math.abs(dx) > 10 || dy > 10) s.dir = Math.abs(dx) > dy ? "h" : "v";
+				return;
+			}
+			if (s.dir === "v") return;
+			const offset = Math.max(0, Math.min(dx, SWIPE_REVEAL_WIDTH));
+			swipeOffsetRef.current = offset;
+			setSwipeOffset(offset);
+		};
+
+		const onTouchEnd = () => {
+			const s = swipeRef.current;
+			swipeRef.current = null;
+			if (!s || s.dir !== "h") return;
+			if (swipeOffsetRef.current >= SWIPE_THRESHOLD) {
+				swipeOffsetRef.current = SWIPE_REVEAL_WIDTH;
+				setSwipeOffset(SWIPE_REVEAL_WIDTH);
+				setSwipeRevealed(true);
+			} else {
+				swipeOffsetRef.current = 0;
+				setSwipeOffset(0);
+				setSwipeRevealed(false);
+			}
+		};
+
+		node.addEventListener("touchstart", onTouchStart, { passive: true });
+		node.addEventListener("touchmove", onTouchMove, { passive: true });
+		node.addEventListener("touchend", onTouchEnd, { passive: true });
+		return () => {
+			node.removeEventListener("touchstart", onTouchStart);
+			node.removeEventListener("touchmove", onTouchMove);
+			node.removeEventListener("touchend", onTouchEnd);
+		};
+	}, [hasActions, swipeRevealed, closeSwipe]);
+
+	// Close swipe on outside tap
+	useEffect(() => {
+		if (!swipeRevealed) return;
+		const onTouch = (e: TouchEvent) => {
+			const t = e.target as Node;
+			if (swipeBoxRef.current?.contains(t) || swipeMenuRef.current?.contains(t)) return;
+			closeSwipe();
+		};
+		document.addEventListener("touchstart", onTouch, { passive: true });
+		return () => document.removeEventListener("touchstart", onTouch);
+	}, [swipeRevealed, closeSwipe]);
+
+	// Right-click context menu (skip ContentViewer areas — they have their own menu)
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			if (!hasActions) return;
+			if ((e.target as HTMLElement)?.closest?.("[data-content-block]")) return;
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+			e.preventDefault();
+			e.stopPropagation();
+			const x = Math.min(e.clientX, window.innerWidth - 200);
+			const flipY = e.clientY > window.innerHeight - 300;
+			setCtxMenuPos({ x, y: e.clientY, flipY });
+			setCtxMenuOpened(true);
+		},
+		[hasActions],
+	);
+
+	const swipeTransition = swipeRef.current ? "none" : "transform 200ms ease";
+	const swipeMenuTransition = swipeRef.current ? "none" : "left 200ms ease, transform 200ms ease";
+
+	const menuItemsNode = hasActions ? (
+		<>
+			{msgCtx.onBranchFromMessage && (
+				<Menu.Item
+					leftSection={<IconGitBranch size={14} />}
+					onClick={() => {
+						msgCtx.onBranchFromMessage?.();
+						closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_branch")}
+				</Menu.Item>
+			)}
+			{msgCtx.onForkFromMessage && (
+				<Menu.Item
+					leftSection={<IconGitFork size={14} />}
+					onClick={() => {
+						msgCtx.onForkFromMessage?.();
+						closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_fork")}
+				</Menu.Item>
+			)}
+			{msgCtx.onDeleteMessage && (
+				<Menu.Item
+					color="red"
+					leftSection={<IconTrash size={14} />}
+					onClick={() => {
+						msgCtx.onDeleteMessage?.();
+						closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_delete")}
+				</Menu.Item>
+			)}
+		</>
+	) : null;
+
+	// --- Render helpers ---
+
+	const planStyle =
+		isPlan && vpHeight ? { maxHeight: vpHeight, overflow: "hidden auto" as const } : undefined;
+
+	const cardContent = (
+		<>
+			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
+			{!isStreaming && (
+				<LazyCollapse in={opened}>
+					<Box style={planStyle}>
+						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+					</Box>
+					{permissionUI}
+				</LazyCollapse>
+			)}
+		</>
+	);
+
+	const swipeStyle: React.CSSProperties | undefined =
+		swipeOffset > 0
+			? { transform: `translateX(-${swipeOffset}px)`, transition: swipeTransition }
+			: { transition: swipeTransition };
+
+	const swipeMenu =
+		hasActions &&
+		(swipeOffset > 0 || swipeClosing) &&
+		(() => {
+			const menuLeft = swipeInitialRight - swipeOffset;
+			const boxRect = swipeBoxRef.current?.getBoundingClientRect();
+			const menuEl = swipeMenuRef.current;
+			const menuH = menuEl?.offsetHeight ?? 120;
+			let menuTop = swipeY;
+			if (boxRect && boxRect.height > menuH) {
+				const minTop = boxRect.top + menuH / 2;
+				const maxTop = boxRect.bottom - menuH / 2;
+				menuTop = Math.max(minTop, Math.min(swipeY, maxTop));
+			}
+			return (
+				<Box
+					ref={swipeMenuRef}
+					style={{
+						position: "fixed",
+						left: menuLeft,
+						top: menuTop,
+						transform: "translateY(-50%)",
+						zIndex: 1000,
+						transition: swipeMenuTransition,
+						pointerEvents: swipeClosing ? "none" : "auto",
+					}}
+				>
+					<Menu opened withinPortal={false} position="bottom-start">
+						<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+							{menuItemsNode}
+						</Menu.Dropdown>
+					</Menu>
+				</Box>
+			);
+		})();
+
+	const ctxMenu = hasActions && (
+		<Menu
+			opened={ctxMenuOpened}
+			onChange={setCtxMenuOpened}
+			position="bottom-start"
+			withinPortal
+			styles={{
+				dropdown: {
+					position: "fixed",
+					left: ctxMenuPos.x,
+					...(ctxMenuPos.flipY
+						? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
+						: { top: ctxMenuPos.y }),
+				},
+			}}
+		>
+			<Menu.Target>
+				<div
+					style={{
+						position: "fixed",
+						left: ctxMenuPos.x,
+						top: ctxMenuPos.y,
+						pointerEvents: "none",
+					}}
+				/>
+			</Menu.Target>
+			<Menu.Dropdown>{menuItemsNode}</Menu.Dropdown>
+		</Menu>
+	);
+
 	// Inside a run: no Paper wrapper, just content + divider
 	if (inRun) {
 		return (
-			<Box>
-				<Box p="xs">
-					<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
-					{!isStreaming && (
-						<LazyCollapse in={opened}>
-							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-							{permissionUI}
-						</LazyCollapse>
-					)}
+			<>
+				<Box ref={swipeBoxRef} onContextMenu={handleContextMenu} style={swipeStyle}>
+					<Box ref={isPlan ? cardRef : undefined}>
+						<Box p="xs">{cardContent}</Box>
+						{!isLast && <Divider />}
+					</Box>
 				</Box>
-				{!isLast && <Divider />}
-			</Box>
+				{swipeMenu}
+				{ctxMenu}
+			</>
 		);
 	}
 
 	return (
-		<Paper withBorder radius="sm" p="xs" style={borderColor ? { borderColor } : undefined}>
-			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
-			{!isStreaming && (
-				<LazyCollapse in={opened}>
-					<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-					{permissionUI}
-				</LazyCollapse>
-			)}
-		</Paper>
+		<>
+			<Box ref={swipeBoxRef} onContextMenu={handleContextMenu} style={swipeStyle}>
+				<Paper
+					ref={isPlan ? cardRef : undefined}
+					withBorder
+					radius="sm"
+					p="xs"
+					style={borderColor ? { borderColor } : undefined}
+				>
+					{cardContent}
+				</Paper>
+			</Box>
+			{swipeMenu}
+			{ctxMenu}
+		</>
 	);
 });
 
@@ -1153,7 +1567,7 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 						<ElapsedTimer startedAt={earliestRunningStart} />
 					) : (
 						totalMs > 0 && (
-							<Text size="xs" c="dimmed">
+							<Text size="xs" c="dimmed" ff="monospace">
 								{(totalMs / 1000).toFixed(1)}s
 							</Text>
 						)

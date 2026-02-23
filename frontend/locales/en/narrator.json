@@ -81,5 +81,7 @@
 	"contextMenu_delete": "Delete message",
 	"expandEdits": "Expand edits",
 	"collapseEdits": "Collapse edits",
-	"acceptAndResetContext": "Accept & Reset Context"
+	"acceptAndResetContext": "Accept & Reset Context",
+	"pruneBoundaryLabel": "↑ Tool call details above are pruned to save context",
+	"truncatedPreview": "Content truncated ({{size}}) — expand to load full data"
 }

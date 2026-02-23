@@ -13,19 +13,29 @@ export const narratorContext = {
 	/**
 	 * Generate a compressed context summary from parent narrator's recent messages.
 	 * Uses Haiku model for fast, low-cost summarization.
+	 *
+	 * If the narrator already has a contextSummary (from a previous compact), it is
+	 * prepended to the conversation text so the summary model can incorporate it.
+	 * This prevents losing context that was compacted before the recent messages.
 	 */
 	async generateContextSummary(narratorId: string, locale: Locale = "en"): Promise<string> {
+		const narrator = await narratorService.getById(narratorId);
 		const messages = await narratorService.getMessages(narratorId, SUMMARY_MAX_MESSAGES);
 
-		if (messages.length === 0) return "No conversation history.";
+		if (messages.length === 0 && !narrator.contextSummary) return "No conversation history.";
 
-		const conversationText = messages
+		let conversationText = messages
 			.map((m) => {
 				const role = m.role === "assistant" ? "Assistant" : "User";
 				const text = m.contentText || JSON.stringify(m.contentJson);
 				return `[${role}]: ${text}`;
 			})
 			.join("\n\n");
+
+		// Include prior compact summary so it isn't lost during fork
+		if (narrator.contextSummary) {
+			conversationText = `[Previous context summary]:\n${narrator.contextSummary}\n\n---\n\n${conversationText}`;
+		}
 
 		const summaryPrompt = getPrompt("compact", locale);
 
@@ -53,6 +63,8 @@ export const narratorContext = {
 	 *   to avoid summarizing incomplete operations.
 	 * - Includes tool call input/output summaries so the model retains knowledge of
 	 *   file modifications and command results.
+	 * - If the narrator already has a contextSummary from a previous compact, it is
+	 *   prepended so the summary model can incorporate prior context (summary chaining).
 	 */
 	async generateCompactSummary(
 		narratorId: string,
@@ -62,9 +74,14 @@ export const narratorContext = {
 		const messages =
 			providedMessages ?? (await narratorService.getMessagesSinceLastCompact(narratorId));
 
-		if (messages.length === 0) return { summary: "No conversation history." };
+		// Fetch narrator early — needed for contextSummary chaining and todo check
+		const narrator = await narratorService.getById(narratorId);
 
-		const conversationText = messages
+		if (messages.length === 0 && !narrator.contextSummary) {
+			return { summary: "No conversation history." };
+		}
+
+		let conversationText = messages
 			// Only user and assistant messages — system messages (including previous compact
 			// markers) are excluded because the system prompt is re-injected after compact.
 			.filter((m) => m.role === "user" || m.role === "assistant")
@@ -99,12 +116,16 @@ export const narratorContext = {
 			.filter(Boolean)
 			.join("\n\n");
 
+		// Chain previous compact summary so earlier context isn't lost across compacts
+		if (narrator.contextSummary) {
+			conversationText = `[Previous context summary]:\n${narrator.contextSummary}\n\n---\n\n${conversationText}`;
+		}
+
 		if (!conversationText.trim()) return { summary: "No conversation history." };
 
 		const compactPrompt = getPrompt("compact", locale);
 
 		// Check if there are pending todos — if so, skip todo generation in summary
-		const narrator = await narratorService.getById(narratorId);
 		const todos = Array.isArray(narrator.todosJson) ? narrator.todosJson : [];
 		const hasPendingTodos = todos.some((t: { status?: string }) => t.status !== "completed");
 		const todoSkipHint = hasPendingTodos ? `\n\n${getToolMessage("compactTodoSkip", locale)}` : "";

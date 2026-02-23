@@ -2,6 +2,7 @@ import type { Subprocess } from "bun";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, terminals } from "../db/schema";
+import { detectShell } from "../lib/agent/shell";
 import { NotFoundError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -9,7 +10,7 @@ import { BufferManager } from "../terminal/buffer-manager";
 import { dtachService } from "../terminal/dtach-service";
 import { sendToTerminal } from "../websocket/terminal-ws";
 
-const DEFAULT_SHELL = process.env.SHELL ?? "/bin/bash";
+const DEFAULT_SHELL = detectShell();
 
 interface ActiveTerminal {
 	process: Subprocess;

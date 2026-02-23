@@ -81,5 +81,7 @@
 	"contextMenu_delete": "删除消息",
 	"expandEdits": "展开编辑",
 	"collapseEdits": "折叠编辑",
-	"acceptAndResetContext": "接受并重置上下文"
+	"acceptAndResetContext": "接受并重置上下文",
+	"pruneBoundaryLabel": "↑ 以上工具调用详情已被裁剪以节省上下文",
+	"truncatedPreview": "内容已截断 ({{size}}) — 展开以加载完整数据"
 }

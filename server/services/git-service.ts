@@ -16,14 +16,14 @@ export interface GitStatusSummary {
 	branch: string;
 }
 
-async function exec(args: string[], cwd: string): Promise<ExecResult> {
+async function exec(args: string[], cwd: string, silent = false): Promise<ExecResult> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr] = await Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
 	]);
 	const exitCode = await proc.exited;
-	if (exitCode !== 0) {
+	if (exitCode !== 0 && !silent) {
 		logger.error("git command failed", { args: args.join(" "), cwd, stderr, exitCode });
 	}
 	return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
@@ -284,7 +284,8 @@ export const gitService = {
 		);
 		const untrackedFiles = untrackedResult.stdout.split("\n").filter(Boolean);
 		for (const file of untrackedFiles) {
-			const showResult = await exec(["diff", "--no-index", "/dev/null", file], worktreePath);
+			// --no-index always exits 1 when diff is found — silence the expected error log
+			const showResult = await exec(["diff", "--no-index", "/dev/null", file], worktreePath, true);
 			if (showResult.stdout && !addPart(showResult.stdout)) break;
 		}
 

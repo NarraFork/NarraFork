@@ -70,6 +70,19 @@ export async function* agentLoop(
 		}
 
 		const isFirstTurn = turnIndex === 0;
+
+		// Allow caller to rebuild history mid-loop (e.g. after prune boundary changes)
+		if (!isFirstTurn && config.onBeforeTurn) {
+			const replacement = await config.onBeforeTurn(turnIndex);
+			if (replacement) {
+				history = replacement.history;
+				if (config.systemPrompt) {
+					provider.injectSystemPrompt(history, config.systemPrompt, config.model, config.locale);
+				}
+				pendingToolResults = replacement.pendingToolResults;
+			}
+		}
+
 		const content = isFirstTurn ? userText : "";
 
 		// Call provider and collect the response

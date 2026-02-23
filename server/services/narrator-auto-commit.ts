@@ -31,7 +31,7 @@ Rules:
 
 /**
  * Check for uncommitted changes and auto-commit with an AI-generated message.
- * Fire-and-forget — errors are logged, not thrown to callers.
+ * Errors are logged and broadcast, never thrown to callers.
  */
 export async function autoCommitIfNeeded(
 	narratorId: string,
@@ -39,15 +39,18 @@ export async function autoCommitIfNeeded(
 	worktreePath: string,
 	locale: Locale,
 ): Promise<void> {
-	try {
-		const statusSummary = await gitService.getStatusSummary(worktreePath);
-		if (!statusSummary.hasChanges) return;
+	// Lightweight check — avoid the heavier getStatusSummary just to see if changes exist
+	const status = await gitService.getStatus(worktreePath);
+	if (!status) return;
 
+	let started = false;
+	try {
 		broadcastToNarrator(narratorId, {
 			type: "auto_commit_started",
 			narratorId,
 			chapterId,
 		});
+		started = true;
 
 		// Get full diff for AI to analyze
 		const diff = await gitService.getFullDiff(worktreePath);
@@ -124,10 +127,17 @@ export async function autoCommitIfNeeded(
 			status: updatedStatus,
 		});
 	} catch (err) {
-		logger.error("Auto-commit failed", {
-			narratorId,
-			chapterId,
-			error: err instanceof Error ? err.message : String(err),
-		});
+		const errorMsg = err instanceof Error ? err.message : String(err);
+		logger.error("Auto-commit failed", { narratorId, chapterId, error: errorMsg });
+
+		// Only broadcast failure if we already told the frontend we started
+		if (started) {
+			broadcastToNarrator(narratorId, {
+				type: "auto_commit_failed",
+				narratorId,
+				chapterId,
+				error: errorMsg,
+			});
+		}
 	}
 }

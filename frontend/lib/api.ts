@@ -87,6 +87,7 @@ export interface PaginatedMessages {
 	messages: TreeMessage[];
 	hasMore: boolean;
 	nextCursor: string | null;
+	pruneBoundaryMessageId?: string | null;
 }
 
 export const api = {

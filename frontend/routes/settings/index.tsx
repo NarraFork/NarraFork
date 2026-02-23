@@ -71,7 +71,6 @@ function SettingsPage() {
 	const [newModelValue, setNewModelValue] = useState("");
 	const [newModelLabel, setNewModelLabel] = useState("");
 	const [newModelProvider, setNewModelProvider] = useState("openai");
-	const [extendedContext, setExtendedContext] = useState(false);
 	const [maxTurns, setMaxTurns] = useState(200);
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
@@ -105,7 +104,6 @@ function SettingsPage() {
 		summaryModel: "claude-haiku",
 		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
 		hiddenModels: [] as string[],
-		extendedContext: false,
 		maxTurns: 200,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
@@ -131,7 +129,6 @@ function SettingsPage() {
 				summaryModel: settings.agent?.summaryModel ?? "claude-haiku",
 				customModels: settings.agent?.customModels ?? [],
 				hiddenModels: settings.agent?.hiddenModels ?? [],
-				extendedContext: settings.agent?.extendedContext ?? false,
 				maxTurns: settings.agent?.maxTurns ?? 200,
 				subagentExploreModel: settings.agent?.subagentModels?.explore ?? "",
 				subagentPlanModel: settings.agent?.subagentModels?.plan ?? "",
@@ -154,7 +151,6 @@ function SettingsPage() {
 			setSummaryModel(snap.summaryModel);
 			setCustomModels(snap.customModels);
 			setHiddenModels(snap.hiddenModels);
-			setExtendedContext(snap.extendedContext);
 			setMaxTurns(snap.maxTurns);
 			setSubagentExploreModel(snap.subagentExploreModel);
 			setSubagentPlanModel(snap.subagentPlanModel);
@@ -183,7 +179,6 @@ function SettingsPage() {
 			summaryModel !== s.summaryModel ||
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
-			extendedContext !== s.extendedContext ||
 			maxTurns !== s.maxTurns ||
 			subagentExploreModel !== s.subagentExploreModel ||
 			subagentPlanModel !== s.subagentPlanModel ||
@@ -207,7 +202,6 @@ function SettingsPage() {
 		summaryModel,
 		customModels,
 		hiddenModels,
-		extendedContext,
 		maxTurns,
 		subagentExploreModel,
 		subagentPlanModel,
@@ -281,7 +275,6 @@ function SettingsPage() {
 					summaryModel,
 					customModels,
 					hiddenModels,
-					extendedContext,
 					maxTurns,
 					subagentModels: {
 						explore: subagentExploreModel,
@@ -315,7 +308,6 @@ function SettingsPage() {
 						summaryModel,
 						customModels: [...customModels],
 						hiddenModels: [...hiddenModels],
-						extendedContext,
 						maxTurns,
 						subagentExploreModel,
 						subagentPlanModel,
@@ -415,12 +407,6 @@ function SettingsPage() {
 						searchable
 						value={summaryModel}
 						onChange={(v) => setSummaryModel(v ?? "claude-haiku")}
-					/>
-					<Switch
-						label={t("extendedContext")}
-						description={t("extendedContextDesc")}
-						checked={extendedContext}
-						onChange={(e) => setExtendedContext(e.currentTarget.checked)}
 					/>
 					<NumberInput
 						label={t("maxTurns")}

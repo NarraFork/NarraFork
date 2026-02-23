@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
-import { join, normalize, resolve } from "node:path";
+import { normalize, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -12,24 +11,13 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
-import {
-	type AgentEvent,
-	agentLoop,
-	buildHistory,
-	type PermissionResult,
-	PLAN_MODE_ALLOWED_TOOLS,
-} from "../lib/agent";
+import { buildHistory, type PermissionResult, PLAN_MODE_ALLOWED_TOOLS } from "../lib/agent";
 import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import {
-	getPlanModeSystemReminder,
-	getReplyLanguageInstruction,
-	getToolMessage,
-	type Locale,
-} from "../lib/prompt-i18n";
+import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
@@ -37,13 +25,16 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
 import { autoCommitIfNeeded } from "./narrator-auto-commit";
 import { narratorContext } from "./narrator-context";
+import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
+import { executeAgentLoop } from "./narrator-executor";
+import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 
 // === In-memory state ===
 
 // Tools that may modify files on disk — git status is tracked after these complete
-const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "Bash", "smartRelocate"]);
+const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "Bash"]);
 
 
 interface ActiveSession {
@@ -58,8 +49,8 @@ interface ActiveSession {
 	alive: boolean;
 	locale: Locale;
 	_usedCompactSummary?: boolean;
-	/** Last reported context usage percentage from the provider (0–100) */
-	_lastContextUsagePct?: number;
+	/** Current context usage percentage — used for message metadata */
+	_contextUsagePct?: number;
 	/** Last reported metering from the provider */
 	_lastMeterUsage?: number;
 	_lastMeterUnit?: string;
@@ -67,6 +58,8 @@ interface ActiveSession {
 	_replyInUserLanguage?: boolean;
 	/** Set when plan compact aborts the current agent loop — the loop should restart with fresh context */
 	_planCompactAborted?: boolean;
+	/** Cached prune boundary from the start of the current agent loop iteration */
+	_pruneBoundaryMessageId?: string | null;
 	/** Cached chapter ID (set when narrator is bound to an active chapter) */
 	_chapterId?: string;
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
@@ -169,7 +162,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 // and does not access the local filesystem or execute arbitrary commands.
 // Task is auto-allowed because it only spawns a subagent — the subagent's
 // individual tools go through their own permission checks.
-const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "Task"];
+const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "Task", "ContinueTask"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -664,64 +657,21 @@ async function ensureSession(
  * Reads AGENT.md (fallback CLAUDE.md) from disk each time so changes are picked up mid-session.
  */
 async function buildSystemPrompt(
-	narrator: { systemPrompt: string | null; contextSummary: string | null },
+	narrator: { systemPrompt: string | null; contextSummary: string | null; todosJson?: unknown },
 	cwd: string,
 	locale: Locale,
 	replyInUserLanguage: boolean,
 	planMode = false,
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
-	let prompt = narrator.systemPrompt;
-	let usedCompactSummary = false;
-
-	// Inject compact summary if available
-	if (narrator.contextSummary) {
-		usedCompactSummary = true;
-		const base = prompt ?? "";
-		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}## Conversation Context\n\n${narrator.contextSummary}`;
-	}
-
-	// Inject current working directory
-	{
-		const base = prompt ?? "";
-		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (Bash, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in Bash commands — it is redundant.`;
-	}
-
-	// Inject AGENT.md (fallback to CLAUDE.md) if present in the working directory
-	{
-		let agentMdContent: string | null = null;
-		for (const filename of ["AGENT.md", "CLAUDE.md"]) {
-			try {
-				agentMdContent = await readFile(join(cwd, filename), "utf-8");
-				break;
-			} catch {
-				// file not found, try next
-			}
-		}
-		if (agentMdContent) {
-			const base = prompt ?? "";
-			const sep = base ? "\n\n" : "";
-			prompt = `${base}${sep}## Project Instructions\n\n${agentMdContent}`;
-		}
-	}
-
-	// Append language instruction (always inject unless locale is English)
-	if (replyInUserLanguage || locale !== "en") {
-		const instruction = getReplyLanguageInstruction(locale);
-		const base = prompt ?? "";
-		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}## Language\n\n${instruction}`;
-	}
-
-	// Inject plan mode system reminder
-	if (planMode) {
-		const base = prompt ?? "";
-		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}${getPlanModeSystemReminder(locale)}`;
-	}
-
-	return { prompt, usedCompactSummary };
+	return buildEffectiveSystemPrompt({
+		basePrompt: narrator.systemPrompt,
+		cwd,
+		locale,
+		contextSummary: narrator.contextSummary,
+		todosJson: narrator.todosJson,
+		planMode,
+		replyInUserLanguage,
+	});
 }
 
 async function createSession(
@@ -770,7 +720,11 @@ async function createSession(
 	}
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
-		{ systemPrompt: narrator.systemPrompt, contextSummary: effectiveContextSummary },
+		{
+			systemPrompt: narrator.systemPrompt,
+			contextSummary: effectiveContextSummary,
+			todosJson: narrator.todosJson,
+		},
 		sessionCwd,
 		locale,
 		replyInUserLanguage,
@@ -807,7 +761,37 @@ async function createSession(
 // === Agent loop execution ===
 
 /** Trigger compact when context usage exceeds this percentage (0–100). */
-const COMPACT_CONTEXT_USAGE_PCT = 80;
+export const COMPACT_CONTEXT_USAGE_PCT = 95;
+
+/**
+ * Strip tool calls from messages at or before the prune boundary so they
+ * are excluded from the provider history entirely. This is simpler and
+ * safer than truncating input/output — no risk of malformed JSON reaching
+ * the API. The text content of these messages is preserved.
+ *
+ * Mutates the messages in place.
+ */
+export function pruneToolCalls(
+	dbMessages: import("../lib/agent/provider").DbMessage[],
+	boundaryMessageId: string,
+): void {
+	const boundaryIdx = dbMessages.findIndex((m) => m.id === boundaryMessageId);
+	if (boundaryIdx < 0) return;
+
+	// Collect IDs of top-level messages at or before the boundary
+	const pruneIds = new Set(
+		dbMessages
+			.slice(0, boundaryIdx + 1)
+			.filter((m) => !m.parentToolUseId)
+			.map((m) => m.id),
+	);
+
+	for (const msg of dbMessages) {
+		if (pruneIds.has(msg.id) && msg.toolCalls?.length) {
+			msg.toolCalls = [];
+		}
+	}
+}
 
 /** Append pending todos to the user message text so the model has context. */
 function appendTodosContext(text: string, todosJson: unknown): string {
@@ -828,10 +812,125 @@ function appendTodosContext(text: string, todosJson: unknown): string {
 	return `${text}\n\n<current_todos>\n${lines.join("\n")}\n</current_todos>`;
 }
 
+// === Shared context management hooks ===
+
+export interface ContextManagementOptions {
+	narratorId: string;
+	locale: Locale;
+	model: string;
+	provider: string;
+	/** Mutable getter/setter for the cached prune boundary */
+	getPruneBoundary: () => string | null;
+	setPruneBoundary: (id: string | null) => void;
+	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
+	onCompactDone?: () => void;
+}
+
 /**
- * Build AgentConfig, start agentLoop(), and consume events.
+ * Build reusable context management hooks (prune + compact) for both
+ * main narrators and subagents.
+ *
+ * Returns an `onContextUsage` EventHook and an `onBeforeTurn` AgentConfig callback.
+ */
+export function buildContextManagementHooks(opts: ContextManagementOptions): {
+	onContextUsage: NonNullable<EventHooks["onContextUsage"]>;
+	onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]>;
+} {
+	const { narratorId, locale, model, provider, getPruneBoundary, setPruneBoundary, onCompactDone } =
+		opts;
+
+	const onContextUsage = (percentage: number) => {
+		// Dynamic pruning: 80–95%
+		if (percentage >= 80 && percentage < COMPACT_CONTEXT_USAGE_PCT && !pruneLocks.has(narratorId)) {
+			pruneLocks.add(narratorId);
+			narratorService
+				.computeAndUpdatePruneBoundary(narratorId, percentage)
+				.then((boundaryMessageId) => {
+					broadcastToNarrator(narratorId, {
+						type: "prune_boundary",
+						narratorId,
+						boundaryMessageId,
+					});
+				})
+				.catch((err) => {
+					logger.error("Failed to update prune boundary", {
+						narratorId,
+						contextPct: percentage,
+						error: String(err),
+					});
+				})
+				.finally(() => {
+					pruneLocks.delete(narratorId);
+				});
+		}
+
+		// ≥ 95%: trigger compact
+		// Check compactLocks twice: once here (fast-path skip) and again inside
+		// runCustomCompact (authoritative). The early check avoids a redundant
+		// getCompactBoundaryMessage call when a compact is already in flight.
+		if (percentage >= COMPACT_CONTEXT_USAGE_PCT && !compactLocks.has(narratorId)) {
+			// Eagerly reserve the lock so back-to-back context_usage events don't
+			// each kick off getCompactBoundaryMessage before runCustomCompact sets
+			// its own lock. We store a deferred promise that runCustomCompact will
+			// replace with the real one.
+			const placeholder = Promise.resolve();
+			compactLocks.set(narratorId, placeholder);
+
+			logger.info("Context usage high, triggering compact (mid-turn)", {
+				narratorId,
+				current: percentage,
+			});
+			narratorService
+				.getCompactBoundaryMessage(narratorId)
+				.then((boundaryMessageId) => {
+					if (!boundaryMessageId) {
+						// Nothing to compact — release the placeholder lock
+						if (compactLocks.get(narratorId) === placeholder) {
+							compactLocks.delete(narratorId);
+						}
+						return;
+					}
+					runCustomCompact(narratorId, locale, boundaryMessageId)
+						.then(() => {
+							onCompactDone?.();
+							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+						})
+						.catch((err) => {
+							logger.error("Auto-compact failed (mid-turn)", {
+								narratorId,
+								error: String(err),
+							});
+						});
+				})
+				.catch(() => {
+					// Release placeholder on boundary query failure
+					if (compactLocks.get(narratorId) === placeholder) {
+						compactLocks.delete(narratorId);
+					}
+				});
+		}
+	};
+
+	const onBeforeTurn = async () => {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { pruneBoundaryMessageId: true },
+		});
+		const newBoundary = row?.pruneBoundaryMessageId ?? null;
+		if (newBoundary === getPruneBoundary()) return null;
+		setPruneBoundary(newBoundary);
+		const msgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+		if (newBoundary) pruneToolCalls(msgs, newBoundary);
+		const result = await buildHistory(msgs, model, provider, narratorId);
+		return { history: result.history, pendingToolResults: result.trailingToolResults };
+	};
+
+	return { onContextUsage, onBeforeTurn };
+}
+
+/**
+ * Build AgentConfig, start the agent loop via executeAgentLoop(), and handle chained messages.
  * Runs in the background — kicked off by feedMessage().
- * Handles chained messages (feedback/buffered) by looping.
  */
 async function runAgentLoop(
 	session: ActiveSession,
@@ -840,7 +939,6 @@ async function runAgentLoop(
 ): Promise<void> {
 	const { narratorId, locale } = session;
 	let shouldUpdateTitle = false;
-	let titleTracked = false;
 	let currentText = text;
 	let currentImages = images;
 
@@ -850,6 +948,17 @@ async function runAgentLoop(
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
 			const dbMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+
+			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
+			const freshNarrator = await narratorService.getById(narratorId);
+
+			// Apply dynamic pruning — strip tool calls from messages at or
+			// before the persisted boundary so the context stays within budget.
+			session._pruneBoundaryMessageId = freshNarrator.pruneBoundaryMessageId ?? null;
+			if (freshNarrator.pruneBoundaryMessageId) {
+				pruneToolCalls(dbMessages, freshNarrator.pruneBoundaryMessageId);
+			}
+
 			const { history, trailingToolResults } = await buildHistory(
 				dbMessages,
 				session.model,
@@ -857,10 +966,12 @@ async function runAgentLoop(
 				narratorId,
 			);
 
-			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
-			const freshNarrator = await narratorService.getById(narratorId);
 			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
-				{ systemPrompt: freshNarrator.systemPrompt, contextSummary: freshNarrator.contextSummary },
+				{
+					systemPrompt: freshNarrator.systemPrompt,
+					contextSummary: freshNarrator.contextSummary,
+					todosJson: freshNarrator.todosJson,
+				},
 				session.cwd,
 				locale,
 				session._replyInUserLanguage ?? false,
@@ -868,6 +979,165 @@ async function runAgentLoop(
 			);
 			session.systemPrompt = freshSystemPrompt;
 			session._usedCompactSummary = usedCompactSummary;
+
+			const eventContext: EventHandlerContext = {
+				narratorId,
+				broadcastTargetId: narratorId,
+				sseEmitter: session.events,
+				conversationId: session.conversationId,
+				getContextUsagePct: () => session._contextUsagePct,
+				getMeterUsage: () => session._lastMeterUsage,
+				getMeterUnit: () => session._lastMeterUnit,
+				getPartialMessageId: () => session._partialMessageId,
+				setPartialMessageId: (id) => {
+					session._partialMessageId = id;
+				},
+				setContextUsagePct: (pct) => {
+					session._contextUsagePct = pct;
+				},
+				setMeterData: (usage, unit) => {
+					session._lastMeterUsage = usage;
+					session._lastMeterUnit = unit;
+				},
+			};
+
+			// Build shared context management hooks (prune + compact)
+			const ctxMgmt = buildContextManagementHooks({
+				narratorId,
+				locale,
+				model: session.model,
+				provider: session.provider,
+				getPruneBoundary: () => session._pruneBoundaryMessageId ?? null,
+				setPruneBoundary: (id) => {
+					session._pruneBoundaryMessageId = id;
+				},
+				onCompactDone: () => {
+					const s = activeSessions.get(narratorId);
+					if (s?.alive) {
+						s.conversationId = randomUUID();
+					}
+				},
+			});
+
+			const hooks: EventHooks = {
+				onTitleCheck: async (_savedId) => {
+					const n = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { messageCount: true, title: true },
+					});
+					const titleUpdate = !!(n && (n.messageCount ?? 0) <= 1 && !n.title);
+					return { titleUpdate };
+				},
+				onTodoWrite: async (todos, toolUseId) => {
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					await narratorService.updateTodos(narratorId, todos as any[], toolUseId);
+					broadcastToNarrator(narratorId, {
+						type: "todos_updated",
+						narratorId,
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+						todos: todos as any[],
+						toolUseId,
+					});
+				},
+				onEnterPlanMode: async () => {
+					await narratorService.updatePlanMode(narratorId, true);
+					broadcastToNarrator(narratorId, {
+						type: "plan_mode_changed",
+						narratorId,
+						planMode: true,
+					});
+				},
+				onExitPlanMode: async (output) => {
+					await narratorService.updatePlanMode(narratorId, false);
+					broadcastToNarrator(narratorId, {
+						type: "plan_mode_changed",
+						narratorId,
+						planMode: false,
+					});
+					// Plan compact logic
+					if (pendingPlanCompact.has(narratorId)) {
+						pendingPlanCompact.delete(narratorId);
+						if (output) {
+							await runPlanCompact(narratorId, output);
+							session.conversationId = randomUUID();
+							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+							session._planCompactAborted = true;
+							session.abortController.abort();
+						}
+					}
+				},
+				onClearCompactSummary: async () => {
+					if (!session._usedCompactSummary) return;
+					await db
+						.update(narrators)
+						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+						.where(eq(narrators.id, narratorId));
+					session._usedCompactSummary = false;
+				},
+				onGitTrack:
+					session._worktreePath && session._chapterId
+						? (toolName, toolUseId) => {
+								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+								const chapterId = session._chapterId as string;
+								const worktreePath = session._worktreePath as string;
+								gitService.getStatusSummary(worktreePath).then(
+									(gitStatus) => {
+										broadcastToNarrator(narratorId, {
+											type: "git_status",
+											narratorId,
+											chapterId,
+											toolUseId,
+											status: gitStatus,
+										});
+									},
+									(err) => {
+										logger.debug("Git status tracking failed", {
+											narratorId,
+											error: String(err),
+										});
+									},
+								);
+							}
+						: undefined,
+				onContextUsage: ctxMgmt.onContextUsage,
+				onErrorCleanup: async (message) => {
+					// Clean up partial message
+					const partialId = session._partialMessageId;
+					session._partialMessageId = undefined;
+					if (partialId) {
+						try {
+							await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));
+							await db
+								.delete(narratorMessageRefs)
+								.where(eq(narratorMessageRefs.messageId, partialId));
+							await db.delete(narratorMessages).where(eq(narratorMessages.id, partialId));
+						} catch (cleanupErr) {
+							logger.warn("Failed to clean up partial message on error", {
+								narratorId,
+								partialId,
+								error: String(cleanupErr),
+							});
+						}
+					}
+					if (message === "Aborted") {
+						if (session._planCompactAborted) {
+							logger.info("Agent loop aborted for plan compact", { narratorId });
+							return;
+						}
+						logger.info("Agent loop aborted (interrupted)", { narratorId });
+						await cleanupOrphanedToolCalls(narratorId, session.locale);
+						await narratorService.updateStatus(narratorId, "idle");
+						session.events.emit("event", {
+							type: "interrupted",
+							data: { message: "Session interrupted" },
+						});
+						return;
+					}
+					logger.error("Agent loop error", { narratorId, error: message });
+					await narratorService.updateStatus(narratorId, "error", message);
+					session.events.emit("event", { type: "error", data: { message } });
+				},
+			};
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
@@ -889,13 +1159,11 @@ async function runAgentLoop(
 						session.cwd,
 						locale,
 					),
+				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {
-					processAgentEvent(session, event, {
-						titleTracked: true,
-						shouldUpdateTitle: false,
-					}).catch(() => {});
+					processEvent(event, eventContext, hooks).catch(() => {});
 				},
 			};
 
@@ -932,23 +1200,18 @@ async function runAgentLoop(
 			// Inject pending todos into the user message so the model always has context
 			const effectiveText = appendTodosContext(currentText, freshNarrator.todosJson);
 
-			for await (const event of agentLoop(
+			const result = await executeAgentLoop({
 				config,
-				effectiveText,
+				userText: effectiveText,
 				history,
 				trailingToolResults,
-				loopImages,
-			)) {
-				if (!session.alive) break;
+				images: loopImages,
+				eventContext,
+				hooks,
+			});
 
-				const mapped = await processAgentEvent(session, event, {
-					titleTracked,
-					shouldUpdateTitle,
-				});
-				if (mapped?.titleUpdate !== undefined) {
-					shouldUpdateTitle = mapped.titleUpdate;
-					titleTracked = true;
-				}
+			if (result.shouldUpdateTitle) {
+				shouldUpdateTitle = true;
 			}
 
 			// Plan compact aborted the agent loop — reset abort controller and
@@ -986,30 +1249,46 @@ async function runAgentLoop(
 			await narratorService.updateStats(narratorId, 0);
 			await narratorService.updateStatus(narratorId, "idle");
 
-			// Auto-commit if there are uncommitted changes (chapter-bound narrators only)
-			if (session._worktreePath && session._chapterId) {
-				autoCommitIfNeeded(narratorId, session._chapterId, session._worktreePath, locale).catch(
-					(err) => logger.error("Auto-commit failed", { narratorId, error: String(err) }),
-				);
-			}
-
-			// Compact if context usage is high (checked after a complete turn)
+			// Compact if context usage is high (checked after a complete turn).
+			// This is a fallback — the mid-turn compact in the context_usage handler
+			// may have already started a background compact.
 			if (
-				session._lastContextUsagePct != null &&
-				session._lastContextUsagePct >= COMPACT_CONTEXT_USAGE_PCT
+				session._contextUsagePct != null &&
+				session._contextUsagePct >= COMPACT_CONTEXT_USAGE_PCT &&
+				!compactLocks.has(narratorId)
 			) {
-				logger.info("Context usage high, triggering compact", {
-					narratorId,
-					contextUsagePct: session._lastContextUsagePct,
-				});
-				await runCustomCompact(narratorId, locale);
-				// Reset conversationId so the next loop iteration starts a fresh
-				// API conversation instead of continuing the old one.
-				session.conversationId = randomUUID();
-				broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-				// System prompt will be rebuilt at the top of the next loop iteration
-				// via buildSystemPrompt(), which reads fresh contextSummary from DB.
-				session._lastContextUsagePct = undefined;
+				session._contextUsagePct = undefined;
+
+				const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+
+				if (boundaryMessageId) {
+					logger.info("Context usage high, triggering background compact (post-turn)", {
+						narratorId,
+						boundaryMessageId,
+					});
+
+					// Fire-and-forget: compact runs in the background.
+					// On completion it resets the session's conversationId so the next
+					// agent loop iteration starts a fresh API conversation.
+					runCustomCompact(narratorId, locale, boundaryMessageId)
+						.then(() => {
+							const current = activeSessions.get(narratorId);
+							if (current?.alive) {
+								current.conversationId = randomUUID();
+							}
+							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+						})
+						.catch((compactErr) => {
+							logger.error("Auto-compact failed", {
+								narratorId,
+								error: String(compactErr),
+							});
+						});
+				} else {
+					logger.info("Context usage high but not enough messages to compact", {
+						narratorId,
+					});
+				}
 			}
 
 			// Check for chained feedback
@@ -1070,7 +1349,11 @@ async function runAgentLoop(
 				});
 			}
 
-			// No chained message — done
+			// No chained message — auto-commit before finishing
+			if (session._worktreePath && session._chapterId) {
+				await autoCommitIfNeeded(narratorId, session._chapterId, session._worktreePath, locale);
+			}
+
 			session.events.emit("event", { type: "done", data: null });
 			break;
 		}
@@ -1094,11 +1377,47 @@ async function runAgentLoop(
 
 // === Custom compact (session rotation) ===
 
+/** Per-narrator lock to prevent concurrent compact operations. */
+export const compactLocks = new Map<string, Promise<void>>();
+
+/** Per-narrator lock to prevent concurrent prune boundary computations. */
+export const pruneLocks = new Set<string>();
+
 /**
- * Run custom compact: generate a summary from DB messages and store it.
- * Clears apiConversationId so the next session starts fresh with the summary.
+ * Run custom compact with concurrency protection.
+ * If a compact is already in progress for this narrator, waits for it to finish
+ * and skips the duplicate request.
  */
 export async function runCustomCompact(
+	narratorId: string,
+	locale: Locale,
+	beforeMessageId?: string,
+): Promise<void> {
+	const existing = compactLocks.get(narratorId);
+	if (existing) {
+		logger.info("Compact already in progress, skipping duplicate", { narratorId });
+		// Wait for the in-flight compact to settle (ignore its error — the original
+		// caller handles it). We just need to know it's done before returning.
+		await existing.catch(() => {});
+		return;
+	}
+
+	const compactPromise = doRunCustomCompact(narratorId, locale, beforeMessageId);
+	compactLocks.set(narratorId, compactPromise);
+	try {
+		await compactPromise;
+	} finally {
+		compactLocks.delete(narratorId);
+	}
+}
+
+/**
+ * Internal compact implementation: generate a summary from DB messages and store it.
+ * Clears apiConversationId so the next session starts fresh with the summary.
+ *
+ * On failure, rolls back the compacting marker message and broadcasts a failure event.
+ */
+async function doRunCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
@@ -1119,36 +1438,48 @@ export async function runCustomCompact(
 	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
 
-	const { summary, contextPercent } = await narratorContext.generateCompactSummary(
-		narratorId,
-		locale,
-		messages,
-	);
+	try {
+		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+			narratorId,
+			locale,
+			messages,
+		);
 
-	const now = new Date().toISOString();
+		// Finalize the compacting marker — atomically sets isCompact=1,
+		// updates message content, and stores contextSummary on the narrator.
+		const compactedMsg = await narratorService.finalizeCompactingMessage(
+			compactingMsg.id,
+			narratorId,
+			summary,
+			contextPercent,
+		);
 
-	// Store summary on narrator
-	await db
-		.update(narrators)
-		.set({
-			contextSummary: summary,
-			apiConversationId: null,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, narratorId));
+		if (compactedMsg) {
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactedMsg });
+		}
+		await narratorService.clearPruneBoundary(narratorId);
+		await narratorService.updateStatus(narratorId, "idle");
 
-	// Finalize the compacting marker into the final compacted message (with full summary)
-	const compactedMsg = await narratorService.finalizeCompactingMessage(
-		narratorId,
-		summary,
-		contextPercent,
-	);
-	if (compactedMsg) {
-		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactedMsg });
+		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
+	} catch (err) {
+		// Roll back: remove the compacting marker so it doesn't linger in the UI
+		await narratorService.removeCompactingMessage(narratorId, compactingMsg.id).catch((e) => {
+			logger.error("Failed to clean up compacting message during rollback", {
+				narratorId,
+				messageId: compactingMsg.id,
+				error: String(e),
+			});
+		});
+		// Clear prune boundary — it may reference messages that a future compact
+		// would place before the compact point, causing pruneToolCalls to silently skip.
+		await narratorService.clearPruneBoundary(narratorId).catch(() => {});
+		broadcastToNarrator(narratorId, {
+			type: "compact_failed",
+			narratorId,
+			messageId: compactingMsg.id,
+		});
+		throw err;
 	}
-	await narratorService.updateStatus(narratorId, "idle");
-
-	logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 }
 
 /**
@@ -1158,24 +1489,14 @@ export async function runCustomCompact(
 async function runPlanCompact(narratorId: string, planText: string): Promise<void> {
 	logger.info("Starting plan compact", { narratorId, planLength: planText.length });
 
-	const now = new Date().toISOString();
-
-	// Store summary on narrator
-	await db
-		.update(narrators)
-		.set({
-			contextSummary: planText,
-			apiConversationId: null,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, narratorId));
-
-	// Insert compact message directly (no compacting intermediate state needed)
+	// persistPlanMessage atomically inserts the message, sets isCompact=1,
+	// and updates narrator's contextSummary + clears apiConversationId.
 	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
 	if (compactMsg) {
 		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
 	}
 
+	await narratorService.clearPruneBoundary(narratorId);
 	logger.info("Plan compact completed", { narratorId, summaryLength: planText.length });
 }
 
@@ -1224,395 +1545,6 @@ async function feedMessage(
 	});
 
 	return { session, userMsg };
-}
-
-// === Agent event processing ===
-
-async function processAgentEvent(
-	session: ActiveSession,
-	event: AgentEvent,
-	state: { titleTracked: boolean; shouldUpdateTitle: boolean },
-): Promise<{ titleUpdate?: boolean } | null> {
-	const { narratorId } = session;
-
-	switch (event.type) {
-		case "stream_text": {
-			broadcastToNarrator(narratorId, {
-				type: "stream_event",
-				narratorId,
-				event: {
-					type: "content_block_delta",
-					delta: { type: "text_delta", text: event.text },
-				},
-			});
-			session.events.emit("event", {
-				type: "stream_event",
-				data: {
-					type: "content_block_delta",
-					delta: { type: "text_delta", text: event.text },
-				},
-			});
-			return null;
-		}
-
-		case "tool_call": {
-			broadcastToNarrator(narratorId, {
-				type: "tool_started",
-				narratorId,
-				toolUseId: event.toolUseId,
-				toolName: event.toolName,
-				input: event.input,
-				streamStartedAt: event.streamStartedAt,
-			});
-			return null;
-		}
-
-		case "tool_use_chunk": {
-			broadcastToNarrator(narratorId, {
-				type: "tool_use_chunk",
-				narratorId,
-				toolUseId: event.toolUseId,
-				toolName: event.toolName,
-				inputCharsTotal: event.inputCharsTotal,
-			});
-			return null;
-		}
-
-		case "block_complete": {
-			const { block } = event;
-
-			// Ensure a partial message exists for incremental persistence
-			if (!session._partialMessageId) {
-				const partial = await narratorService.createPartialAssistantMessage(narratorId, {
-					uuid: randomUUID(),
-					session_id: session.conversationId,
-					contextPercent: session._lastContextUsagePct,
-					meterUsage: session._lastMeterUsage,
-					meterUnit: session._lastMeterUnit,
-				});
-				session._partialMessageId = partial.id;
-			}
-
-			// Persist the completed block
-			if (block.type === "text") {
-				await narratorService.appendBlockToMessage(session._partialMessageId, narratorId, {
-					type: "text",
-					text: block.text,
-				});
-			} else if (block.type === "tool_use") {
-				await narratorService.appendBlockToMessage(session._partialMessageId, narratorId, {
-					type: "tool_use",
-					id: block.toolUseId,
-					name: block.name,
-					input: block.input,
-				});
-			}
-			return null;
-		}
-
-		case "assistant_message": {
-			let savedId: string;
-
-			if (session._partialMessageId) {
-				// Partial message was already created incrementally via block_complete —
-				// just update the final messageUuid if the provider gave us one.
-				savedId = session._partialMessageId;
-				if (event.messageId) {
-					await db
-						.update(narratorMessages)
-						.set({ messageUuid: event.messageId })
-						.where(eq(narratorMessages.id, savedId));
-				}
-				session._partialMessageId = undefined;
-			} else {
-				// No partial message — fallback to original full persistence
-				// (non-streaming providers or no block_complete events fired)
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const content: any[] = [];
-				if (event.text) content.push({ type: "text", text: event.text });
-				for (const tu of event.toolUses) {
-					content.push({
-						type: "tool_use",
-						id: tu.toolUseId,
-						name: tu.name,
-						input: tu.input,
-					});
-				}
-
-				const saved = await narratorService.persistAssistantMessage(narratorId, {
-					uuid: event.messageId ?? randomUUID(),
-					session_id: session.conversationId,
-					message: { content },
-					contextPercent: session._lastContextUsagePct,
-					meterUsage: session._lastMeterUsage,
-					meterUnit: session._lastMeterUnit,
-				});
-				savedId = saved.id;
-			}
-
-			// TodoWrite / EnterPlanMode tracking
-			for (const tu of event.toolUses) {
-				if (tu.name === "TodoWrite" && tu.input?.todos) {
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					await narratorService.updateTodos(narratorId, tu.input.todos as any[], tu.toolUseId);
-					broadcastToNarrator(narratorId, {
-						type: "todos_updated",
-						narratorId,
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-						todos: tu.input.todos as any[],
-						toolUseId: tu.toolUseId,
-					});
-				}
-				if (tu.name === "EnterPlanMode") {
-					await narratorService.updatePlanMode(narratorId, true);
-					broadcastToNarrator(narratorId, {
-						type: "plan_mode_changed",
-						narratorId,
-						planMode: true,
-					});
-				}
-			}
-
-			const fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedId),
-				with: { toolCalls: true },
-			});
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: fullMessage });
-			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
-
-			// Clear compact summary from DB after first response so it won't be
-			// re-injected if the session is recreated.
-			if (session._usedCompactSummary) {
-				await db
-					.update(narrators)
-					.set({ contextSummary: null, updatedAt: new Date().toISOString() })
-					.where(eq(narrators.id, narratorId));
-				session._usedCompactSummary = false;
-			}
-
-			const savedMsg = fullMessage ?? { id: savedId };
-			session.events.emit("event", { type: "assistant_message", data: savedMsg });
-
-			// Title tracking
-			let titleUpdate: boolean | undefined;
-			if (!state.titleTracked) {
-				const n = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { messageCount: true, title: true },
-				});
-				titleUpdate = !!(n && (n.messageCount ?? 0) <= 1 && !n.title);
-			}
-			return { titleUpdate };
-		}
-
-		case "tool_result": {
-			const status = event.isError ? "fail" : "success";
-			try {
-				await narratorService.updateToolCallResult(event.toolUseId, {
-					output: event.output,
-					status,
-					errorMessage: event.isError ? event.output : undefined,
-					durationMs: event.durationMs,
-				});
-			} catch (err) {
-				logger.error("Failed to persist tool result", {
-					narratorId,
-					toolUseId: event.toolUseId,
-					error: String(err),
-				});
-			}
-
-			broadcastToNarrator(narratorId, {
-				type: "tool_completed",
-				narratorId,
-				toolUseId: event.toolUseId,
-				status,
-				output: event.output,
-				durationMs: event.durationMs,
-			});
-
-			// Git tracking: async broadcast git status after file-mutating tools
-			if (session._worktreePath && session._chapterId && FILE_MUTATING_TOOLS.has(event.toolName)) {
-				const chapterId = session._chapterId;
-				const worktreePath = session._worktreePath;
-				const toolUseId = event.toolUseId;
-				gitService.getStatusSummary(worktreePath).then(
-					(gitStatus) => {
-						broadcastToNarrator(narratorId, {
-							type: "git_status",
-							narratorId,
-							chapterId,
-							toolUseId,
-							status: gitStatus,
-						});
-					},
-					(err) => {
-						logger.debug("Git status tracking failed", {
-							narratorId,
-							error: String(err),
-						});
-					},
-				);
-			}
-
-			// ExitPlanMode check
-			if (!event.isError && event.toolName === "ExitPlanMode") {
-				await narratorService.updatePlanMode(narratorId, false);
-				broadcastToNarrator(narratorId, {
-					type: "plan_mode_changed",
-					narratorId,
-					planMode: false,
-				});
-
-				// Plan compact: use the plan text directly as compact summary
-				if (pendingPlanCompact.has(narratorId)) {
-					pendingPlanCompact.delete(narratorId);
-					const planText = event.output;
-					if (planText) {
-						await runPlanCompact(narratorId, planText);
-						// Reset conversationId so the next loop iteration starts a fresh
-						// API conversation instead of continuing the old one.
-						session.conversationId = randomUUID();
-						broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-						// Abort the current agent loop so it doesn't continue with stale
-						// context. runAgentLoop will detect _planCompactAborted and restart
-						// the loop with fresh history built from post-compact messages.
-						session._planCompactAborted = true;
-						session.abortController.abort();
-					}
-				}
-			}
-			return null;
-		}
-
-		case "tool_output": {
-			broadcastToNarrator(narratorId, {
-				type: "tool_output",
-				narratorId,
-				toolUseId: event.toolUseId,
-				output: event.output,
-			});
-			return null;
-		}
-
-		case "tool_progress": {
-			broadcastToNarrator(narratorId, {
-				type: "tool_progress",
-				narratorId,
-				toolUseId: event.toolUseId,
-				elapsed: event.elapsed,
-			});
-			return null;
-		}
-
-		case "error": {
-			// Clean up partial message — remove incomplete message from DB
-			// so it doesn't leave orphaned tool_use blocks without results.
-			const partialId = session._partialMessageId;
-			session._partialMessageId = undefined;
-			if (partialId) {
-				try {
-					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));
-					await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId));
-					await db.delete(narratorMessages).where(eq(narratorMessages.id, partialId));
-				} catch (cleanupErr) {
-					logger.warn("Failed to clean up partial message on error", {
-						narratorId,
-						partialId,
-						error: String(cleanupErr),
-					});
-				}
-			}
-			// Abort is not a real error — treat as interruption
-			if (event.message === "Aborted") {
-				// Plan compact abort — don't treat as user interruption; runAgentLoop
-				// handles the restart logic after the for-await loop exits.
-				if (session._planCompactAborted) {
-					logger.info("Agent loop aborted for plan compact", { narratorId });
-					return null;
-				}
-				logger.info("Agent loop aborted (interrupted)", { narratorId });
-				await cleanupOrphanedToolCalls(narratorId, session.locale);
-				await narratorService.updateStatus(narratorId, "idle");
-				session.events.emit("event", {
-					type: "interrupted",
-					data: { message: "Session interrupted" },
-				});
-				return null;
-			}
-			logger.error("Agent loop error", { narratorId, error: event.message });
-			await narratorService.updateStatus(narratorId, "error", event.message);
-			session.events.emit("event", { type: "error", data: { message: event.message } });
-			return null;
-		}
-
-		case "stream_reasoning": {
-			broadcastToNarrator(narratorId, {
-				type: "stream_event",
-				narratorId,
-				event: {
-					type: "content_block_delta",
-					delta: { type: "reasoning_delta", text: event.text },
-				},
-			});
-			session.events.emit("event", {
-				type: "stream_event",
-				data: {
-					type: "content_block_delta",
-					delta: { type: "reasoning_delta", text: event.text },
-				},
-			});
-			return null;
-		}
-
-		case "context_usage": {
-			session._lastContextUsagePct = event.percentage;
-			broadcastToNarrator(narratorId, {
-				type: "context_usage",
-				narratorId,
-				percentage: event.percentage,
-			});
-			session.events.emit("event", {
-				type: "context_usage",
-				data: { percentage: event.percentage },
-			});
-			return null;
-		}
-
-		case "metering": {
-			session._lastMeterUsage = event.usage;
-			session._lastMeterUnit = event.unit;
-			broadcastToNarrator(narratorId, {
-				type: "metering",
-				narratorId,
-				unit: event.unit,
-				unitPlural: event.unitPlural,
-				usage: event.usage,
-			});
-			return null;
-		}
-
-		case "invalid_state": {
-				narratorId,
-				reason: event.reason,
-				message: event.message,
-			});
-				type: "error",
-				error: { type: "invalid_state", reason: event.reason, message: event.message },
-			};
-			broadcastToNarrator(narratorId, {
-				type: "stream_event",
-				narratorId,
-			});
-			session.events.emit("event", {
-				type: "stream_event",
-			});
-			return null;
-		}
-
-		default:
-			return null;
-	}
 }
 
 // === Public API ===
@@ -1888,6 +1820,29 @@ export async function recoverOnStartup(): Promise<void> {
 			.where(eq(narratorToolCalls.status, "initializing"));
 		logger.info("Stale initializing tool calls marked as failed on startup", {
 			count: staleInitializing.length,
+		});
+	}
+
+	// Clean up stale "compacting" marker messages left by a previous crash.
+	// These are compact operations that started but never finalized.
+	const staleCompacting = await db.query.narratorMessages.findMany({
+		where: and(
+			eq(narratorMessages.role, "system"),
+			eq(narratorMessages.contentText, "[Compacting]"),
+		),
+	});
+	for (const msg of staleCompacting) {
+		await narratorService.removeCompactingMessage(msg.narratorId, msg.id).catch((e) => {
+			logger.error("Failed to clean up stale compacting message", {
+				messageId: msg.id,
+				narratorId: msg.narratorId,
+				error: String(e),
+			});
+		});
+	}
+	if (staleCompacting.length > 0) {
+		logger.info("Stale compacting messages cleaned up on startup", {
+			count: staleCompacting.length,
 		});
 	}
 }

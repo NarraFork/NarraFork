@@ -202,13 +202,6 @@ async function appendMessageRef(
  * Clear or set contextSummary + apiConversationId on the narrator.
  * Pass `summary = null` to clear, or a string to set.
  */
-async function clearContextSummary(narratorId: string, summary: string | null) {
-	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-		.where(eq(narrators.id, narratorId));
-}
 
 interface CreateNarratorInput {
 	chapterId?: string | null;
@@ -321,6 +314,90 @@ export const narratorService = {
 
 		logger.info("Subagent created", {
 			id,
+			parentNarratorId: input.parentNarratorId,
+			subagentType: input.subagentType,
+		});
+		return narrator;
+	},
+
+	/**
+	 * Fork a subagent: create a new subagent narrator that shares the original's
+	 * message history (via copied narrator_message_refs), then continue from there.
+	 * The original subagent remains untouched.
+	 */
+	async forkSubagent(input: {
+		originalSubagentId: string;
+		parentNarratorId: string;
+		subagentType: "explore" | "plan" | "general";
+		cwd: string;
+		systemPrompt?: string;
+		model?: string;
+		permissionMode?: string;
+		/** Pre-fetched original narrator to avoid redundant DB query */
+		_original?: typeof narrators.$inferSelect;
+	}) {
+		const original = input._original ?? (await this.getById(input.originalSubagentId));
+		if (original.type !== "subagent") {
+			throw new ValidationError("Can only fork subagent narrators");
+		}
+		const now = new Date().toISOString();
+		const id = generateId();
+		const resolvedPermMode = (input.permissionMode ?? "default") as
+			| "default"
+			| "acceptEdits"
+			| "bypassPermissions"
+			| "dontAsk";
+
+		// Copy all message refs from the original subagent
+		const prefixRows = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				isCompact: narratorMessageRefs.isCompact,
+			})
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, input.originalSubagentId))
+			.orderBy(narratorMessageRefs.seq);
+
+		const narrator = await db.transaction(async (tx) => {
+			const [created] = await tx
+				.insert(narrators)
+				.values({
+					id,
+					chapterId: original.chapterId ?? null,
+					type: "subagent",
+					subagentType: input.subagentType,
+					model: input.model ?? settings.agent.defaultModel,
+					systemPrompt: input.systemPrompt ?? null,
+					permissionMode: resolvedPermMode,
+					parentNarratorId: input.parentNarratorId,
+					forkMessageId: prefixRows.length > 0 ? prefixRows[prefixRows.length - 1].messageId : null,
+					cwd: input.cwd,
+					inheritMode: "fresh",
+					status: "thinking",
+					createdAt: now,
+					updatedAt: now,
+				})
+				.returning();
+
+			if (prefixRows.length > 0) {
+				await tx.insert(narratorMessageRefs).values(
+					prefixRows.map((row) => ({
+						id: generateId(),
+						narratorId: id,
+						messageId: row.messageId,
+						seq: row.seq,
+						isCompact: row.isCompact,
+					})),
+				);
+			}
+
+			return created;
+		});
+
+		logger.info("Subagent forked", {
+			id,
+			originalSubagentId: input.originalSubagentId,
 			parentNarratorId: input.parentNarratorId,
 			subagentType: input.subagentType,
 		});
@@ -480,28 +557,110 @@ export const narratorService = {
 
 	/** Fetch the N earliest top-level user/assistant messages with text content. */
 	async getEarliestMessages(narratorId: string, limit = 2) {
-		return db.query.narratorMessages.findMany({
-			where: and(
-				eq(narratorMessages.narratorId, narratorId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
-				isNotNull(narratorMessages.contentText),
-			),
-			orderBy: (m, { asc }) => [asc(m.createdAt)],
-			limit,
-		});
+		// Query via refs so forked narrators see inherited messages too
+		const rows = await db
+			.select({
+				id: narratorMessages.id,
+				narratorId: narratorMessages.narratorId,
+				role: narratorMessages.role,
+				contentJson: narratorMessages.contentJson,
+				contentText: narratorMessages.contentText,
+				createdAt: narratorMessages.createdAt,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessages.role, ["user", "assistant"]),
+					isNotNull(narratorMessages.contentText),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq)
+			.limit(limit);
+		return rows;
+	},
+
+	/**
+	 * Shared helper: fetch all post-last-compact top-level user/assistant message refs.
+	 * Used by both `getCompactBoundaryMessage` and `computeAndUpdatePruneBoundary`.
+	 */
+	async _getPostCompactTopLevelRefs(narratorId: string) {
+		const lastCompactRow = await db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+
+		const compactSeq = lastCompactRow[0]?.seq;
+
+		return db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+					inArray(narratorMessages.role, ["user", "assistant"]),
+					isNull(narratorMessages.parentToolUseId),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+	},
+
+	/**
+	 * Find the message ID that should serve as the compact boundary for auto-compact.
+	 * Returns the ID of the message at the start of the "keep" window — all messages
+	 * from this point onward will be preserved (not compacted).
+	 *
+	 * `keepPairs` controls how many recent user-assistant pairs to keep (default 2).
+	 * Returns null if there aren't enough messages to make compacting worthwhile.
+	 */
+	async getCompactBoundaryMessage(narratorId: string, keepPairs = 2): Promise<string | null> {
+		const refs = await this._getPostCompactTopLevelRefs(narratorId);
+
+		// Count how many messages to keep: keepPairs * 2 (user + assistant each)
+		const keepCount = keepPairs * 2;
+
+		// Need at least keepCount + 2 messages to make compact worthwhile
+		// (at least one pair to compress + keepCount to preserve)
+		if (refs.length < keepCount + 2) return null;
+
+		// The boundary is the message at position (length - keepCount)
+		const boundaryRef = refs[refs.length - keepCount];
+		return boundaryRef.messageId;
 	},
 
 	/** Fetch the N most recent top-level user/assistant messages with text content (chronological order). */
 	async getRecentMessages(narratorId: string, limit = 4) {
-		const rows = await db.query.narratorMessages.findMany({
-			where: and(
-				eq(narratorMessages.narratorId, narratorId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
-				isNotNull(narratorMessages.contentText),
-			),
-			orderBy: (m, { desc }) => [desc(m.createdAt)],
-			limit,
-		});
+		// Query via refs so forked narrators see inherited messages too
+		const rows = await db
+			.select({
+				id: narratorMessages.id,
+				narratorId: narratorMessages.narratorId,
+				role: narratorMessages.role,
+				contentJson: narratorMessages.contentJson,
+				contentText: narratorMessages.contentText,
+				createdAt: narratorMessages.createdAt,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessages.role, ["user", "assistant"]),
+					isNotNull(narratorMessages.contentText),
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(limit);
 		return rows.reverse();
 	},
 
@@ -846,7 +1005,10 @@ export const narratorService = {
 		return compactBlock.summary;
 	},
 
-	/** Delete a compact message and clear the narrator's contextSummary. */
+	/**
+	 * Delete a compact message and clear the narrator's contextSummary.
+	 * Returns metadata about the deletion so callers can assess impact.
+	 */
 	async deleteCompactMessage(narratorId: string, messageId: string) {
 		const msg = await db.query.narratorMessages.findFirst({
 			where: and(
@@ -863,19 +1025,76 @@ export const narratorService = {
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (!compactBlock) throw new ValidationError("Message is not a compact message");
 
-		const isPlan = compactBlock.subtype === "plan";
+		// Check if there's an older compact point that will take over
+		const currentRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		const prevCompact = currentRef
+			? await db
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.isCompact, 1),
+							lt(narratorMessageRefs.seq, currentRef.seq),
+						),
+					)
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(1)
+			: [];
 
-		// Delete from junction table first
-		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
-		await db.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+		// Delete atomically
+		await db.transaction(async (tx) => {
+			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
+			await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
 
-		// Plan messages don't affect contextSummary; regular compacts need to clear it
-		if (!isPlan) {
-			await clearContextSummary(narratorId, null);
-		}
+			// Both regular and plan compacts set contextSummary, so both need to clear it.
+			// Also clear prune boundary — compact deletion invalidates the pruning context.
+			const now = new Date().toISOString();
+			await tx
+				.update(narrators)
+				.set({
+					contextSummary: null,
+					apiConversationId: null,
+					pruneBoundaryMessageId: null,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+
+		return { previousCompactExists: prevCompact.length > 0 };
 	},
 
-	/** Update the summary text of a compact message and sync to narrator's contextSummary. */
+	/**
+	 * Remove a compacting/compact message by ID without touching narrator's contextSummary.
+	 * Used for rollback when compact generation fails mid-way.
+	 */
+	async removeCompactingMessage(narratorId: string, messageId: string) {
+		await db.transaction(async (tx) => {
+			await tx
+				.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.messageId, messageId),
+						eq(narratorMessageRefs.narratorId, narratorId),
+					),
+				);
+			await tx
+				.delete(narratorMessages)
+				.where(
+					and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+				);
+		});
+	},
+
+	/**
+	 * Update the summary text of a compact message and sync to narrator's contextSummary.
+	 * Both updates happen atomically in a transaction.
+	 */
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
 		const msg = await db.query.narratorMessages.findFirst({
 			where: and(
@@ -901,18 +1120,23 @@ export const narratorService = {
 		if (isPlan) newBlock.subtype = "plan";
 
 		const prefix = isPlan ? "[Plan]" : "[Compact]";
-		await db
-			.update(narratorMessages)
-			.set({
-				contentJson: [newBlock],
-				contentText: `${prefix} ${summary.slice(0, 200)}...`,
-			})
-			.where(eq(narratorMessages.id, messageId));
+		const now = new Date().toISOString();
 
-		// Plan messages don't affect contextSummary; regular compacts do
-		if (!isPlan) {
-			await clearContextSummary(narratorId, summary);
-		}
+		await db.transaction(async (tx) => {
+			await tx
+				.update(narratorMessages)
+				.set({
+					contentJson: [newBlock],
+					contentText: `${prefix} ${summary.slice(0, 200)}...`,
+				})
+				.where(eq(narratorMessages.id, messageId));
+
+			// Both regular and plan compacts sync contextSummary
+			await tx
+				.update(narrators)
+				.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+		});
 	},
 
 	async getPendingPermissions(narratorId: string) {
@@ -1010,11 +1234,12 @@ export const narratorService = {
 	/**
 	 * Insert a plan compact message — a compact marker with subtype "plan"
 	 * that displays its content as a card rather than a collapsible indicator.
+	 * Atomically inserts the message, sets isCompact=1, and updates contextSummary.
 	 */
 	async persistPlanMessage(narratorId: string, content: string) {
 		const id = generateId();
+		const now = new Date().toISOString();
 
-		const createdAt = new Date().toISOString();
 		const [msg] = await db
 			.insert(narratorMessages)
 			.values({
@@ -1023,43 +1248,74 @@ export const narratorService = {
 				role: "system",
 				contentJson: [{ type: "compact", status: "compacted", subtype: "plan", summary: content }],
 				contentText: `[Plan] ${content.slice(0, 200)}...`,
-				createdAt,
+				createdAt: now,
 			})
 			.returning();
 
-		await appendMessageRef(narratorId, id, 1);
+		// Atomically: append ref with isCompact=1 and update narrator's contextSummary
+		await db.transaction(async (tx) => {
+			const result = await tx
+				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId));
+			const seq = (result[0]?.maxSeq ?? -1) + 1;
+			await tx.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId,
+				messageId: id,
+				seq,
+				isCompact: 1,
+			});
+			await tx
+				.update(narrators)
+				.set({ contextSummary: content, apiConversationId: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+		});
 
 		return msg;
 	},
 
-	/** Update the most recent "compacting" system message to "compacted" with the full summary. */
-	async finalizeCompactingMessage(narratorId: string, summary: string, contextPercent?: number) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-				eq(narratorMessages.contentText, "[Compacting]"),
-			),
-			orderBy: (m, { desc }) => [desc(m.createdAt)],
+	/**
+	 * Finalize a "compacting" system message to "compacted" with the full summary.
+	 * Atomically updates the message content, sets isCompact=1 on the ref,
+	 * and stores the summary on the narrator — all in one transaction.
+	 */
+	async finalizeCompactingMessage(
+		messageId: string,
+		narratorId: string,
+		summary: string,
+		contextPercent?: number,
+	) {
+		const now = new Date().toISOString();
+		return db.transaction(async (tx) => {
+			const [updated] = await tx
+				.update(narratorMessages)
+				.set({
+					contentJson: [{ type: "compact", status: "compacted", summary }],
+					contentText: `[Compact] ${summary.slice(0, 200)}...`,
+					contextPercent: contextPercent ?? null,
+				})
+				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
+				.returning();
+			if (!updated) return null;
+
+			await tx
+				.update(narratorMessageRefs)
+				.set({ isCompact: 1 })
+				.where(
+					and(
+						eq(narratorMessageRefs.messageId, messageId),
+						eq(narratorMessageRefs.narratorId, narratorId),
+					),
+				);
+
+			await tx
+				.update(narrators)
+				.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+
+			return updated;
 		});
-		if (!msg) return null;
-		const [updated] = await db
-			.update(narratorMessages)
-			.set({
-				contentJson: [{ type: "compact", status: "compacted", summary }],
-				contentText: `[Compact] ${summary.slice(0, 200)}...`,
-				contextPercent: contextPercent ?? null,
-			})
-			.where(eq(narratorMessages.id, msg.id))
-			.returning();
-
-		// Mark as compact in narrator_message_refs
-		await db
-			.update(narratorMessageRefs)
-			.set({ isCompact: 1 })
-			.where(eq(narratorMessageRefs.messageId, msg.id));
-
-		return updated;
 	},
 
 	async persistAssistantMessage(
@@ -1425,6 +1681,8 @@ export const narratorService = {
 		} else if (inheritMode === "full") {
 			// Store parent session ID so we can fork on first message
 			apiConversationId = parent.apiConversationId ?? null;
+			// Inherit compact summary so context before the last compact point isn't lost
+			contextSummary = parent.contextSummary ?? null;
 		}
 
 		// Copy message refs if forkMessageId is provided
@@ -1546,5 +1804,94 @@ export const narratorService = {
 			messageCount: n.message_count,
 			createdAt: n.created_at,
 		}));
+	},
+
+	// === Dynamic pruning boundary ===
+
+	/**
+	 * Compute and persist the prune boundary based on current context usage.
+	 *
+	 * Uses a quadratic ramp: `pruneRatio = t²` where `t = (pct - 80) / 15`.
+	 * At minimum, one message is always pruned once the threshold is reached.
+	 * The boundary never exceeds the compact-keep position (the message returned
+	 * by `getCompactBoundaryMessage`), so compact always has something to work with.
+	 *
+	 * Returns the boundary message ID, or null if no pruning is needed.
+	 */
+	async computeAndUpdatePruneBoundary(
+		narratorId: string,
+		contextPct: number,
+	): Promise<string | null> {
+		const PRUNE_START = 80;
+		const PRUNE_END = 95;
+
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { pruneBoundaryMessageId: true },
+		});
+
+		if (contextPct < PRUNE_START) {
+			if (narrator?.pruneBoundaryMessageId) {
+				await this.clearPruneBoundary(narratorId);
+			}
+			return null;
+		}
+
+		const t = Math.min((contextPct - PRUNE_START) / (PRUNE_END - PRUNE_START), 1);
+		const pruneRatio = t * t;
+
+		// Reuse the shared helper — same data that getCompactBoundaryMessage uses
+		const refs = await this._getPostCompactTopLevelRefs(narratorId);
+
+		// Compact keeps the last 4 messages (2 pairs). Need at least 6 to have
+		// something prunable (4 kept + at least 2 to prune/compact).
+		const compactKeepCount = 4;
+		if (refs.length < compactKeepCount + 2) return null;
+
+		// Prunable range: everything except the compact-keep tail
+		const prunableRefs = refs.slice(0, refs.length - compactKeepCount);
+
+		// Find current boundary position to compute remaining (unpruned) messages
+		const currentBoundaryIdx = narrator?.pruneBoundaryMessageId
+			? prunableRefs.findIndex((r) => r.messageId === narrator.pruneBoundaryMessageId)
+			: -1;
+
+		// Remaining = messages after the current boundary (or all if no boundary yet)
+		const alreadyPruned = currentBoundaryIdx + 1; // 0 if no boundary
+		const remaining = prunableRefs.length - alreadyPruned;
+		if (remaining <= 0) return narrator?.pruneBoundaryMessageId ?? null;
+
+		// Apply ratio to remaining messages — more aggressive as context grows,
+		// and each call prunes further into what's left
+		const additionalPrune = Math.max(1, Math.floor(pruneRatio * remaining));
+		const newBoundaryIdx = alreadyPruned + additionalPrune - 1;
+
+		const boundaryMessageId = prunableRefs[newBoundaryIdx].messageId;
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ pruneBoundaryMessageId: boundaryMessageId, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+
+		logger.debug("Updated prune boundary", {
+			narratorId,
+			contextPct,
+			pruneRatio: Math.round(pruneRatio * 100),
+			additionalPrune,
+			remaining,
+			prunableTotal: prunableRefs.length,
+			boundaryMessageId,
+		});
+
+		return boundaryMessageId;
+	},
+
+	/** Clear the prune boundary (e.g. after compact completes). */
+	async clearPruneBoundary(narratorId: string): Promise<void> {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ pruneBoundaryMessageId: null, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 };

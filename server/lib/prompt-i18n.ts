@@ -427,3 +427,34 @@ Your turn should only end with either asking the user a question or calling Exit
 export function getPlanModeSystemReminder(locale: Locale = "en"): string {
 	return planModeSystemReminder[locale] ?? planModeSystemReminder.en;
 }
+
+// --- Todo management system reminder (injected into system prompt when todos exist) ---
+
+const todoSystemReminder: Record<Locale, string> = {
+	en: `## Todo Management
+
+You have an active todo list for this session. You MUST keep it up to date:
+
+- When you **start working** on a task, mark it as \`in_progress\`.
+- When you **finish** a task, mark it as \`completed\`.
+- When new subtasks emerge, **add** them.
+- When a task becomes irrelevant, **remove** it.
+- At the **end of your turn**, if any todo status has changed, call TodoWrite with the updated list.
+
+The current todos are appended to each user message under \`<current_todos>\`. Treat them as your working checklist — do not ignore them.`,
+	"zh-CN": `## 待办事项管理
+
+本会话有一个活跃的待办事项列表。你必须保持其更新：
+
+- 当你**开始处理**某个任务时，将其标记为 \`in_progress\`。
+- 当你**完成**某个任务时，将其标记为 \`completed\`。
+- 当出现新的子任务时，**添加**它们。
+- 当某个任务不再相关时，**移除**它。
+- 在你的**回合结束时**，如果任何待办事项状态发生了变化，调用 TodoWrite 更新列表。
+
+当前待办事项会附加在每条用户消息的 \`<current_todos>\` 中。将它们视为你的工作清单——不要忽略它们。`,
+};
+
+export function getTodoSystemReminder(locale: Locale = "en"): string {
+	return todoSystemReminder[locale] ?? todoSystemReminder.en;
+}

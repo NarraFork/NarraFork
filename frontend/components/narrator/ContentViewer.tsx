@@ -28,6 +28,7 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { getGlobalCloseSwipe, setGlobalCloseSwipe } from "./swipeState";
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -93,10 +94,6 @@ const modalToolbarStyle: CSSProperties = {
 };
 
 let nextInstanceId = 0;
-
-/** Global: close any currently open swipe menu. Each ContentViewer registers
- *  its closeSwipe; only the latest one matters. */
-let globalCloseSwipe: (() => void) | null = null;
 
 /** Global registry: instanceId → handle, so parent components can look up
  *  a ContentViewer by its data-cv-id DOM attribute without passing refs. */
@@ -271,7 +268,7 @@ export const ContentViewer = memo(
 			swipeOffsetRef.current = 0;
 			setSwipeOffset(0);
 			setSwipeRevealed(false);
-			globalCloseSwipe = null;
+			setGlobalCloseSwipe(null);
 			// Remove menu DOM after transition completes
 			setTimeout(() => setSwipeClosing(false), 220);
 		}, []);
@@ -279,11 +276,11 @@ export const ContentViewer = memo(
 		// Register as the global open swipe menu when revealed
 		useEffect(() => {
 			if (swipeRevealed) {
-				globalCloseSwipe = closeSwipe;
+				setGlobalCloseSwipe(closeSwipe);
 			}
 			return () => {
-				if (globalCloseSwipe === closeSwipe) {
-					globalCloseSwipe = null;
+				if (getGlobalCloseSwipe() === closeSwipe) {
+					setGlobalCloseSwipe(null);
 				}
 			};
 		}, [swipeRevealed, closeSwipe]);
@@ -304,16 +301,18 @@ export const ContentViewer = memo(
 			[isMobile],
 		);
 
-		// Mobile: swipe-left to reveal action buttons
+		// Swipe-left to reveal action buttons (works on any touch device)
 		useEffect(() => {
-			if (!isMobile) return;
 			const node = boxRef.current;
 			if (!node) return;
 
 			const onTouchStart = (e: TouchEvent) => {
-				// Close any other ContentViewer's open swipe menu
-				if (globalCloseSwipe && globalCloseSwipe !== closeSwipe) {
-					globalCloseSwipe();
+				// Don't interfere with open menus (e.g. another component's swipe menu)
+				if ((e.target as HTMLElement)?.closest?.(".mantine-Menu-dropdown")) return;
+				// Close any other open swipe menu
+				const currentGlobal = getGlobalCloseSwipe();
+				if (currentGlobal && currentGlobal !== closeSwipe) {
+					currentGlobal();
 					swipeRef.current = null;
 					return;
 				}
@@ -384,7 +383,7 @@ export const ContentViewer = memo(
 				node.removeEventListener("touchmove", onTouchMove);
 				node.removeEventListener("touchend", onTouchEnd);
 			};
-		}, [isMobile, swipeRevealed, closeSwipe]);
+		}, [swipeRevealed, closeSwipe]);
 
 		// Close swipe when tapping outside (but not on the swipe menu itself)
 		useEffect(() => {
@@ -516,8 +515,8 @@ export const ContentViewer = memo(
 					style={{
 						maxWidth: "100%",
 						minWidth: 0,
-						transform: isMobile && swipeOffset > 0 ? `translateX(-${swipeOffset}px)` : undefined,
-						transition: isMobile ? swipeTransition : undefined,
+						transform: swipeOffset > 0 ? `translateX(-${swipeOffset}px)` : undefined,
+						transition: swipeTransition,
 					}}
 					onMouseEnter={isMobile ? undefined : () => setHovered(true)}
 					onMouseLeave={isMobile ? undefined : () => setHovered(false)}
@@ -552,9 +551,8 @@ export const ContentViewer = memo(
 							)))}
 				</Box>
 
-				{/* Mobile swipe-reveal action menu — fixed, hugging the message's right edge */}
-				{isMobile &&
-					(swipeOffset > 0 || swipeClosing) &&
+				{/* Swipe-reveal action menu — fixed, hugging the content's right edge */}
+				{(swipeOffset > 0 || swipeClosing) &&
 					(() => {
 						const menuLeft = swipeInitialRight - swipeOffset;
 						const boxRect = boxRef.current?.getBoundingClientRect();

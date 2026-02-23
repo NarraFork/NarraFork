@@ -15,7 +15,12 @@ interface NarratorWSCallbacks {
 	onStatusChange?: (status: string) => void;
 	onToolProgress?: (toolUseId: string, elapsed: number) => void;
 	onToolStarted?: (toolUseId: string, toolName: string, streamStartedAt?: number) => void;
-	onToolUseChunk?: (toolUseId: string, toolName: string, inputCharsTotal: number) => void;
+	onToolUseChunk?: (
+		toolUseId: string,
+		toolName: string,
+		inputCharsTotal: number,
+		parentToolUseId?: string,
+	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
 		status: string,
@@ -31,6 +36,7 @@ interface NarratorWSCallbacks {
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number) => void;
+	onPruneBoundary?: (boundaryMessageId: string | null) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onNarratorError?: (error: string) => void;
 }
@@ -145,6 +151,7 @@ export function useNarratorWS(
 								data.toolUseId,
 								data.toolName,
 								data.inputCharsTotal,
+								data.parentToolUseId,
 							);
 							break;
 						case "tool_completed":
@@ -175,10 +182,14 @@ export function useNarratorWS(
 							callbacksRef.current.onCompacting?.();
 							break;
 						case "compact_done":
+						case "compact_failed":
 							callbacksRef.current.onCompactDone?.();
 							break;
 						case "context_usage":
 							callbacksRef.current.onContextUsage?.(data.percentage);
+							break;
+						case "prune_boundary":
+							callbacksRef.current.onPruneBoundary?.(data.boundaryMessageId ?? null);
 							break;
 						case "metering":
 							callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);

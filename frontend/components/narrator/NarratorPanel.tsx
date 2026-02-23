@@ -76,13 +76,16 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MessageBubble } from "./MessageBubble";
+import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
 	findMsgByToolUseIdInTree,
 	insertChildIntoCache,
 	type MessageIndex,
 	mergeToolCallFieldsInTree,
+	removeSubagentStreamingChunk,
 	updateToolCallByIndex,
 	updateToolUseIndex,
+	upsertSubagentStreamingChunk,
 } from "./message-tree-utils";
 import { NarratorForkSelector } from "./NarratorForkSelector";
 
@@ -403,267 +406,277 @@ const SubagentCard = memo(
 			}
 		}, [isTerminal]);
 
+		// Prevent child ContentViewers / ToolCallCards from inheriting
+		// the parent message's swipe/context-menu actions
+		const emptyCtx: MessageContextMenuActions = {};
+
 		const content = (
-			<Box ref={cardRef}>
-				{/* Header: two-line collapsed view */}
-				<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
-					{/* Line 1: icon | type | model | calls | status | duration | chevron */}
-					<Group gap={6} wrap="nowrap">
-						<ThemeIcon size={18} variant="light" color="indigo" radius="sm">
-							<IconRobot size={12} />
-						</ThemeIcon>
-						<Badge size="xs" variant="light" color="indigo">
-							{agentType}
-						</Badge>
-						{resolvedModel && (
-							<Badge size="xs" variant="light" color="violet">
-								{resolvedModel}
+			<MessageContextMenuCtx.Provider value={emptyCtx}>
+				<Box ref={cardRef}>
+					{/* Header: two-line collapsed view */}
+					<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
+						{/* Line 1: icon | type | model | calls | status | duration | chevron */}
+						<Group gap={6} wrap="nowrap">
+							<ThemeIcon size={18} variant="light" color="indigo" radius="sm">
+								<IconRobot size={12} />
+							</ThemeIcon>
+							<Badge size="xs" variant="light" color="indigo">
+								{agentType}
 							</Badge>
-						)}
-						<Box style={{ flex: 1 }} />
-						<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-							{childToolCalls.length > 0 && (
-								<Text size="xs" c="dimmed">
-									{childToolCalls.length} calls
-								</Text>
+							{resolvedModel && (
+								<Badge size="xs" variant="light" color="violet">
+									{resolvedModel}
+								</Badge>
 							)}
-							<Box c={statusColor}>
-								<StatusIcon status={toolCall.status} />
-							</Box>
-							{toolCall.startedAt != null && !isTerminal ? (
-								<ElapsedTimer startedAt={toolCall.startedAt} />
-							) : (
-								totalMs > 0 && (
+							<Box style={{ flex: 1 }} />
+							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+								{childToolCalls.length > 0 && (
 									<Text size="xs" c="dimmed">
-										{(totalMs / 1000).toFixed(1)}s
+										{childToolCalls.length} calls
 									</Text>
-								)
-							)}
-							{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+								)}
+								<Box c={statusColor}>
+									<StatusIcon status={toolCall.status} />
+								</Box>
+								{toolCall.startedAt != null && !isTerminal ? (
+									<ElapsedTimer startedAt={toolCall.startedAt} />
+								) : (
+									totalMs > 0 && (
+										<Text size="xs" c="dimmed" ff="monospace">
+											{(totalMs / 1000).toFixed(1)}s
+										</Text>
+									)
+								)}
+								{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+							</Group>
 						</Group>
-					</Group>
-					{/* Line 2: description (truncated when collapsed) */}
-					<Text
-						size="xs"
-						c="dimmed"
-						mt={2}
-						ml={24}
-						truncate={!expanded}
-						style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
-					>
-						{description}
-					</Text>
-				</UnstyledButton>
-				<Box>
-					<LazyCollapse in={expanded}>
-						{/* Background agent warning */}
-						{showBgWarning && (
-							<Alert
-								icon={<IconAlertTriangle size={16} />}
-								color="orange"
-								variant="light"
-								mx="xs"
-								mb={4}
-								p="xs"
-								styles={{ message: { fontSize: 12 } }}
-							>
-								<Group gap="xs" justify="space-between" wrap="nowrap">
-									<Text size="xs">{t("bgAgentWarning")}</Text>
-									<Button
-										size="compact-xs"
-										variant="light"
-										color="orange"
-										style={{ flexShrink: 0 }}
-										onClick={() => onBgAgentRetry(toolCall.toolUseId ?? "")}
-									>
-										{t("bgAgentRetry")}
-									</Button>
-								</Group>
-							</Alert>
-						)}
-						{/* Result — shown directly when expanded */}
-						{resultText && (
-							<Box px="xs" pb={4}>
-								<ContentViewer
-									content={resultText}
-									fullContent={fullResultText}
-									style={{
-										fontSize: 11,
-										maxHeight: 300,
-										overflow: "auto",
-										whiteSpace: "pre-wrap",
-									}}
-									title={`${agentType} — ${description}`}
-									markdown={useMarkdown}
-									contentType={useMarkdown ? "markdown" : "code"}
-								/>
-							</Box>
-						)}
-						{/* Prompt — collapsed by default */}
-						{prompt && (
-							<Box px="xs" pb={4}>
-								<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
-									<Group gap={4}>
-										{showPrompt ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-										<Text size="xs" c="dimmed" fw={500}>
-											Prompt
-										</Text>
+						{/* Line 2: description (truncated when collapsed) */}
+						<Text
+							size="xs"
+							c="dimmed"
+							mt={2}
+							ml={24}
+							truncate={!expanded}
+							style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
+						>
+							{description}
+						</Text>
+					</UnstyledButton>
+					<Box>
+						<LazyCollapse in={expanded}>
+							{/* Background agent warning */}
+							{showBgWarning && (
+								<Alert
+									icon={<IconAlertTriangle size={16} />}
+									color="orange"
+									variant="light"
+									mx="xs"
+									mb={4}
+									p="xs"
+									styles={{ message: { fontSize: 12 } }}
+								>
+									<Group gap="xs" justify="space-between" wrap="nowrap">
+										<Text size="xs">{t("bgAgentWarning")}</Text>
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="orange"
+											style={{ flexShrink: 0 }}
+											onClick={() => onBgAgentRetry(toolCall.toolUseId ?? "")}
+										>
+											{t("bgAgentRetry")}
+										</Button>
 									</Group>
-								</UnstyledButton>
-								<LazyCollapse in={showPrompt}>
-									<Box mt={4}>
-										<ContentViewer
-											content={prompt}
-											style={{
-												fontSize: 11,
-												maxHeight: 200,
-												overflow: "auto",
-												whiteSpace: "pre-wrap",
-											}}
-											title="Prompt"
-										/>
-									</Box>
-								</LazyCollapse>
-							</Box>
-						)}
-						{/* Child tool calls — collapsed by default */}
-						{childToolCalls.length > 0 && (
-							<Box px="xs" pb="xs">
-								<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
-									<Group gap={4}>
-										{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-										<Text size="xs" c="dimmed">
-											{childToolCalls.length} tool calls
-										</Text>
-									</Group>
-								</UnstyledButton>
-								<LazyCollapse in={showCalls}>
-									<Box
-										ref={scrollBoxRef}
-										pl="xs"
-										mt={4}
+								</Alert>
+							)}
+							{/* Result — shown directly when expanded */}
+							{resultText && (
+								<Box px="xs" pb={4}>
+									<ContentViewer
+										content={resultText}
+										fullContent={fullResultText}
 										style={{
-											overflow: "hidden auto",
-											maxHeight: vpHeight,
+											fontSize: 11,
+											maxHeight: 300,
+											overflow: "auto",
+											whiteSpace: "pre-wrap",
 										}}
-									>
-										{(() => {
-											const els: React.ReactNode[] = [];
-											let ci = 0;
-											while (ci < childToolCalls.length) {
-												const item = childToolCalls[ci];
-												const subCh = filterChildrenByToolUse(
-													item.childMsg?.children,
-													item.tc.toolUseId,
-												);
-												const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Task";
-												if (isSub) {
-													els.push(
-														<div
-															key={item.toolUseId ?? item.tc.toolName}
-															id={
-																item.toolUseId ? `tool-use-${item.toolUseId}` : `msg-${item.msgId}`
-															}
-														>
-															<SubagentCard
-																toolCall={item.tc}
-																childMessages={subCh ?? []}
-																narratorId={narratorId}
-																permCb={permCb}
-																editExpandOverride={editExpandOverride}
-																onBgAgentRetry={permCb?.onBgAgentRetry}
-															/>
-														</div>,
+										title={`${agentType} — ${description}`}
+										markdown={useMarkdown}
+										contentType={useMarkdown ? "markdown" : "code"}
+									/>
+								</Box>
+							)}
+							{/* Prompt — collapsed by default */}
+							{prompt && (
+								<Box px="xs" pb={4}>
+									<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
+										<Group gap={4}>
+											{showPrompt ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+											<Text size="xs" c="dimmed" fw={500}>
+												Prompt
+											</Text>
+										</Group>
+									</UnstyledButton>
+									<LazyCollapse in={showPrompt}>
+										<Box mt={4}>
+											<ContentViewer
+												content={prompt}
+												style={{
+													fontSize: 11,
+													maxHeight: 200,
+													overflow: "auto",
+													whiteSpace: "pre-wrap",
+												}}
+												title="Prompt"
+											/>
+										</Box>
+									</LazyCollapse>
+								</Box>
+							)}
+							{/* Child tool calls — collapsed by default */}
+							{childToolCalls.length > 0 && (
+								<Box px="xs" pb="xs">
+									<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
+										<Group gap={4}>
+											{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+											<Text size="xs" c="dimmed">
+												{childToolCalls.length} tool calls
+											</Text>
+										</Group>
+									</UnstyledButton>
+									<LazyCollapse in={showCalls}>
+										<Box
+											ref={scrollBoxRef}
+											pl="xs"
+											mt={4}
+											style={{
+												overflow: "hidden auto",
+												maxHeight: vpHeight,
+											}}
+										>
+											{(() => {
+												const els: React.ReactNode[] = [];
+												let ci = 0;
+												while (ci < childToolCalls.length) {
+													const item = childToolCalls[ci];
+													const subCh = filterChildrenByToolUse(
+														item.childMsg?.children,
+														item.tc.toolUseId,
 													);
-													ci++;
-													continue;
+													const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Task";
+													if (isSub) {
+														els.push(
+															<div
+																key={item.toolUseId ?? item.tc.toolName}
+																id={
+																	item.toolUseId
+																		? `tool-use-${item.toolUseId}`
+																		: `msg-${item.msgId}`
+																}
+															>
+																<SubagentCard
+																	toolCall={item.tc}
+																	childMessages={subCh ?? []}
+																	narratorId={narratorId}
+																	permCb={permCb}
+																	editExpandOverride={editExpandOverride}
+																	onBgAgentRetry={permCb?.onBgAgentRetry}
+																/>
+															</div>,
+														);
+														ci++;
+														continue;
+													}
+													// Collect consecutive non-subagent calls into a run
+													const run: typeof childToolCalls = [item];
+													let j = ci + 1;
+													while (j < childToolCalls.length) {
+														const nx = childToolCalls[j];
+														const nxCh = filterChildrenByToolUse(
+															nx.childMsg?.children,
+															nx.tc.toolUseId,
+														);
+														if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Task") break;
+														run.push(nx);
+														j++;
+													}
+													if (run.length >= 2) {
+														els.push(
+															<Box
+																key={`crun-${run[0].msgId}`}
+																style={{
+																	border: "1px solid var(--mantine-color-default-border)",
+																	borderRadius: "var(--mantine-radius-sm)",
+																	overflow: "hidden",
+																}}
+															>
+																{run.map((r, ri) => {
+																	const mp = resolvePendingPerm(
+																		r.tc,
+																		permCb?.pendingPermission,
+																		permCb?.pendingPermsMap,
+																	);
+																	return (
+																		<div
+																			key={r.toolUseId ?? r.tc.toolName}
+																			id={
+																				r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
+																			}
+																		>
+																			<ToolCallCard
+																				toolCall={r.tc}
+																				narratorId={narratorId}
+																				inRun
+																				isLast={ri === run.length - 1}
+																				pendingPermission={mp}
+																				onPermissionDecision={permCb?.onPermissionDecision}
+																				onQuestionSubmit={permCb?.onQuestionSubmit}
+																				onQuestionDeny={permCb?.onQuestionDeny}
+																				editExpandOverride={editExpandOverride}
+																			/>
+																		</div>
+																	);
+																})}
+															</Box>,
+														);
+													} else {
+														const r = run[0];
+														const mp = resolvePendingPerm(
+															r.tc,
+															permCb?.pendingPermission,
+															permCb?.pendingPermsMap,
+														);
+														els.push(
+															<div
+																key={r.toolUseId ?? r.tc.toolName}
+																id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
+															>
+																<ToolCallCard
+																	toolCall={r.tc}
+																	narratorId={narratorId}
+																	pendingPermission={mp}
+																	onPermissionDecision={permCb?.onPermissionDecision}
+																	onQuestionSubmit={permCb?.onQuestionSubmit}
+																	onQuestionDeny={permCb?.onQuestionDeny}
+																	editExpandOverride={editExpandOverride}
+																/>
+															</div>,
+														);
+													}
+													ci = j;
 												}
-												// Collect consecutive non-subagent calls into a run
-												const run: typeof childToolCalls = [item];
-												let j = ci + 1;
-												while (j < childToolCalls.length) {
-													const nx = childToolCalls[j];
-													const nxCh = filterChildrenByToolUse(
-														nx.childMsg?.children,
-														nx.tc.toolUseId,
-													);
-													if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Task") break;
-													run.push(nx);
-													j++;
-												}
-												if (run.length >= 2) {
-													els.push(
-														<Box
-															key={`crun-${run[0].msgId}`}
-															style={{
-																border: "1px solid var(--mantine-color-default-border)",
-																borderRadius: "var(--mantine-radius-sm)",
-																overflow: "hidden",
-															}}
-														>
-															{run.map((r, ri) => {
-																const mp = resolvePendingPerm(
-																	r.tc,
-																	permCb?.pendingPermission,
-																	permCb?.pendingPermsMap,
-																);
-																return (
-																	<div
-																		key={r.toolUseId ?? r.tc.toolName}
-																		id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
-																	>
-																		<ToolCallCard
-																			toolCall={r.tc}
-																			narratorId={narratorId}
-																			inRun
-																			isLast={ri === run.length - 1}
-																			pendingPermission={mp}
-																			onPermissionDecision={permCb?.onPermissionDecision}
-																			onQuestionSubmit={permCb?.onQuestionSubmit}
-																			onQuestionDeny={permCb?.onQuestionDeny}
-																			editExpandOverride={editExpandOverride}
-																		/>
-																	</div>
-																);
-															})}
-														</Box>,
-													);
-												} else {
-													const r = run[0];
-													const mp = resolvePendingPerm(
-														r.tc,
-														permCb?.pendingPermission,
-														permCb?.pendingPermsMap,
-													);
-													els.push(
-														<div
-															key={r.toolUseId ?? r.tc.toolName}
-															id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
-														>
-															<ToolCallCard
-																toolCall={r.tc}
-																narratorId={narratorId}
-																pendingPermission={mp}
-																onPermissionDecision={permCb?.onPermissionDecision}
-																onQuestionSubmit={permCb?.onQuestionSubmit}
-																onQuestionDeny={permCb?.onQuestionDeny}
-																editExpandOverride={editExpandOverride}
-															/>
-														</div>,
-													);
-												}
-												ci = j;
-											}
-											return els;
-										})()}
-									</Box>
-								</LazyCollapse>
-							</Box>
-						)}
-					</LazyCollapse>
+												return els;
+											})()}
+										</Box>
+									</LazyCollapse>
+								</Box>
+							)}
+						</LazyCollapse>
+					</Box>
+					{inRun && !isLast && <Divider />}
 				</Box>
-				{inRun && !isLast && <Divider />}
-			</Box>
+			</MessageContextMenuCtx.Provider>
 		);
 
 		if (inRun) return content;
@@ -743,6 +756,9 @@ function renderToolRun(
 	expandedToolUseId?: string | null,
 	highlightedId?: string | null,
 	editExpandOverride?: boolean | null,
+	onForkFromMessage?: (uuid: string) => void,
+	onDeleteMessage?: (messageId: string) => void,
+	onBranchFromMessage?: (messageId: string) => void,
 ) {
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
@@ -762,46 +778,62 @@ function renderToolRun(
 					}
 				: undefined;
 
+		// Build context menu actions for this tool call's parent message
+		const ctxActions: MessageContextMenuActions = {};
+		const msgUuid = item.msg.messageUuid;
+		const msgId = item.msg.id;
+		if (msgId && onBranchFromMessage) {
+			ctxActions.onBranchFromMessage = () => onBranchFromMessage(msgId);
+		}
+		if (msgUuid && onForkFromMessage) {
+			ctxActions.onForkFromMessage = () => onForkFromMessage(msgUuid);
+		}
+		if (msgId && onDeleteMessage) {
+			ctxActions.onDeleteMessage = () => onDeleteMessage(msgId);
+		}
+
 		if (item.isSubagent) {
 			return (
-				<div
-					key={key}
-					id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-					style={hlStyle}
-				>
-					<SubagentCard
-						toolCall={item.tc}
-						childMessages={item.children ?? []}
-						narratorId={narratorId}
-						inRun={total >= 2}
-						isLast={idx === total - 1}
-						isSoleInRun={soleSubagent}
-						permCb={permCb}
-						editExpandOverride={editExpandOverride}
-						onBgAgentRetry={permCb?.onBgAgentRetry}
-					/>
-				</div>
+				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
+					<div
+						id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
+						style={hlStyle}
+					>
+						<SubagentCard
+							toolCall={item.tc}
+							childMessages={item.children ?? []}
+							narratorId={narratorId}
+							inRun={total >= 2}
+							isLast={idx === total - 1}
+							isSoleInRun={soleSubagent}
+							permCb={permCb}
+							editExpandOverride={editExpandOverride}
+							onBgAgentRetry={permCb?.onBgAgentRetry}
+						/>
+					</div>
+				</MessageContextMenuCtx.Provider>
 			);
 		}
 		return (
-			<div
-				key={key}
-				id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-				style={hlStyle}
-			>
-				<ToolCallCard
-					toolCall={item.tc}
-					narratorId={narratorId}
-					inRun={total >= 2}
-					isLast={idx === total - 1}
-					pendingPermission={matchPermission(item.tc)}
-					onPermissionDecision={permCb.onPermissionDecision}
-					onQuestionSubmit={permCb.onQuestionSubmit}
-					onQuestionDeny={permCb.onQuestionDeny}
-					forceExpand={expandedToolUseId === item.tc.toolUseId}
-					editExpandOverride={editExpandOverride}
-				/>
-			</div>
+			<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
+				<div
+					id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
+					style={hlStyle}
+				>
+					<ToolCallCard
+						toolCall={item.tc}
+						narratorId={narratorId}
+						inRun={total >= 2}
+						isLast={idx === total - 1}
+						pendingPermission={matchPermission(item.tc)}
+						onPermissionDecision={permCb.onPermissionDecision}
+						onQuestionSubmit={permCb.onQuestionSubmit}
+						onQuestionDeny={permCb.onQuestionDeny}
+						forceExpand={expandedToolUseId === item.tc.toolUseId}
+						editExpandOverride={editExpandOverride}
+					/>
+				</div>
+			</MessageContextMenuCtx.Provider>
 		);
 	};
 
@@ -834,6 +866,8 @@ function renderTreeMessages(
 	showTokenUsage?: boolean,
 	onDeleteMessage?: (messageId: string) => void,
 	onBranchFromMessage?: (messageId: string) => void,
+	pruneBoundaryMessageId?: string | null,
+	pruneDividerLabel?: string,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -914,8 +948,26 @@ function renderTreeMessages(
 				expandedToolUseId,
 				highlightedId,
 				editExpandOverride,
+				onForkFromMessage,
+				onDeleteMessage,
+				onBranchFromMessage,
 			);
 			if (el) elements.push(el);
+
+			// Insert prune divider if any message in this run is the boundary
+			if (pruneBoundaryMessageId && run.some((m) => m.id === pruneBoundaryMessageId)) {
+				elements.push(
+					<Divider
+						key="prune-boundary"
+						my="xs"
+						label={pruneDividerLabel}
+						labelPosition="center"
+						color="yellow.7"
+						styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
+					/>,
+				);
+			}
+
 			i = j;
 		} else {
 			elements.push(
@@ -958,6 +1010,21 @@ function renderTreeMessages(
 					)}
 				</Box>,
 			);
+
+			// Insert prune divider after the boundary message
+			if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
+				elements.push(
+					<Divider
+						key="prune-boundary"
+						my="xs"
+						label={pruneDividerLabel}
+						labelPosition="center"
+						color="yellow.7"
+						styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
+					/>,
+				);
+			}
+
 			i++;
 		}
 	}
@@ -980,6 +1047,7 @@ interface PageElementsProps {
 	/** When set, only render the last N messages of this page (for progressive rendering). */
 	maxMessages?: number;
 	onDeleteMessage?: (messageId: string) => void;
+	pruneBoundaryMessageId?: string | null;
 }
 
 const MemoizedPageElements = memo(
@@ -995,11 +1063,13 @@ const MemoizedPageElements = memo(
 		showTokenUsage,
 		maxMessages,
 		onDeleteMessage,
+		pruneBoundaryMessageId,
 	}: PageElementsProps) {
 		const msgs =
 			maxMessages != null && maxMessages < page.messages.length
 				? page.messages.slice(page.messages.length - maxMessages)
 				: page.messages;
+		const { t } = useTranslation("narrator");
 		const { elements } = renderTreeMessages(
 			msgs,
 			narratorId,
@@ -1011,6 +1081,8 @@ const MemoizedPageElements = memo(
 			showTokenUsage,
 			onDeleteMessage,
 			onBranchFromMessage,
+			pruneBoundaryMessageId,
+			t("pruneBoundaryLabel"),
 		);
 		return <>{elements}</>;
 	},
@@ -1024,7 +1096,8 @@ const MemoizedPageElements = memo(
 		prev.expandedToolUseId === next.expandedToolUseId &&
 		prev.editExpandOverride === next.editExpandOverride &&
 		prev.showTokenUsage === next.showTokenUsage &&
-		prev.maxMessages === next.maxMessages,
+		prev.maxMessages === next.maxMessages &&
+		prev.pruneBoundaryMessageId === next.pruneBoundaryMessageId,
 );
 
 // --- useProgressiveMessageCount: render messages in batches to avoid blocking the main thread ---
@@ -1374,13 +1447,17 @@ export function NarratorPanel({
 	const [bufferedText, setBufferedText] = useState<string | null>(null);
 	const [isCompacting, setIsCompacting] = useState(false);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
+	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 
-	// Initialize contextPercent from the last assistant message when messages load
+	// Initialize contextPercent and pruneBoundaryMessageId from initial data
 	const contextInitRef = useRef(false);
 	useEffect(() => {
 		if (contextInitRef.current || !messagesData?.pages?.length) return;
-		// First page contains the latest messages (reversed to chronological order)
 		const firstPage = messagesData.pages[0];
+		// pruneBoundaryMessageId comes from the API response
+		if (firstPage?.pruneBoundaryMessageId) {
+			setPruneBoundaryMessageId(firstPage.pruneBoundaryMessageId);
+		}
 		const msgs = firstPage?.messages;
 		if (!msgs?.length) return;
 		// Walk backwards to find the last message with contextPercent
@@ -1789,7 +1866,7 @@ export function NarratorPanel({
 		},
 		[narratorId, forkNarratorMutation.mutate, navigate],
 	);
-	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleNarratorFork;
+	const forkHandler = narrator?.chapterId ? onForkFromMessage : undefined;
 	const renderPermCb = useMemo(
 		() => ({ ...stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds }),
 		[stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds],
@@ -1867,6 +1944,7 @@ export function NarratorPanel({
 					editExpandOverride={editExpandOverride}
 					showTokenUsage={showTokenUsage}
 					onDeleteMessage={handleDeleteMessage}
+					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>
 			));
 		}
@@ -1891,6 +1969,7 @@ export function NarratorPanel({
 					showTokenUsage={showTokenUsage}
 					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
 					onDeleteMessage={handleDeleteMessage}
+					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>,
 			);
 			remaining -= maxMsg;
@@ -1909,6 +1988,7 @@ export function NarratorPanel({
 		highlightedId,
 		showTokenUsage,
 		handleDeleteMessage,
+		pruneBoundaryMessageId,
 	]);
 
 	const handleLoadOlder = useCallback(() => {
@@ -2239,6 +2319,15 @@ export function NarratorPanel({
 						removeStreamingChunksMsg(qc, messagesQueryKey);
 					}
 
+					// Remove synthetic subagent streaming child when real child message arrives
+					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
+						const ptuId = newMsg.parentToolUseId;
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+							if (!old?.pages?.length) return old;
+							return removeSubagentStreamingChunk(old, ptuId);
+						});
+					}
+
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
 
@@ -2360,7 +2449,29 @@ export function NarratorPanel({
 					return anyChanged ? { ...old, pages } : old;
 				});
 			},
-			onToolUseChunk: (toolUseId: string, toolName: string, inputCharsTotal: number) => {
+			onToolUseChunk: (
+				toolUseId: string,
+				toolName: string,
+				inputCharsTotal: number,
+				parentToolUseId?: string,
+			) => {
+				// Subagent tool_use_chunk — update child messages in the tree
+				if (parentToolUseId) {
+					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						if (!old?.pages?.length) return old;
+						return upsertSubagentStreamingChunk(
+							old,
+							parentToolUseId,
+							narratorId,
+							toolUseId,
+							toolName,
+							inputCharsTotal,
+						);
+					});
+					return;
+				}
+
+				// Top-level tool_use_chunk — update synthetic streaming message
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					const pages = old?.pages?.length ? [...old.pages] : [];
 					const firstPage =
@@ -2521,11 +2632,15 @@ export function NarratorPanel({
 			onContextUsage: (percentage) => {
 				setContextPercent(percentage);
 			},
+			onPruneBoundary: (boundaryMessageId) => {
+				setPruneBoundaryMessageId(boundaryMessageId);
+			},
 			onCompacting: () => {
 				setIsCompacting(true);
 			},
 			onCompactDone: () => {
 				setIsCompacting(false);
+				setPruneBoundaryMessageId(null);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},

@@ -4,6 +4,7 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import {
 	getToolMessage,
 	getUserLanguage,
@@ -210,7 +211,8 @@ narratorRoutes.get("/:id/messages", async (c) => {
 	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
 	const cursor = c.req.query("cursor") || undefined;
 	const result = await narratorService.getMessagesCursor(id, limit, cursor);
-	return c.json(result);
+	const narrator = await narratorService.getById(id);
+	return c.json({ ...result, pruneBoundaryMessageId: narrator.pruneBoundaryMessageId ?? null });
 });
 
 // Get full tool call detail (untruncated inputJson/outputJson)
@@ -233,8 +235,8 @@ narratorRoutes.get("/:id/compact/:messageId", async (c) => {
 narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	await narratorService.deleteCompactMessage(narratorId, messageId);
-	return c.json({ ok: true });
+	const result = await narratorService.deleteCompactMessage(narratorId, messageId);
+	return c.json({ ok: true, ...result });
 });
 
 // Update a compact message summary
@@ -255,8 +257,11 @@ narratorRoutes.post("/:id/compact", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const body = await c.req.json().catch(() => ({}));
 	const beforeMessageId = body.beforeMessageId ?? undefined;
+	// Fire-and-forget — compact may take a while (AI summary generation).
+	// On failure, runCustomCompact rolls back the compacting marker and
+	// broadcasts a compact_failed event via WebSocket so the frontend can react.
 	runCustomCompact(narratorId, locale, beforeMessageId).catch((err) => {
-		console.error("Manual compact failed", { narratorId, err });
+		logger.error("Manual compact failed", { narratorId, err: String(err) });
 	});
 	return c.json({ ok: true });
 });

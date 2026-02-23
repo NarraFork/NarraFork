@@ -5,10 +5,11 @@ import type { ToolDefinition, ToolResult } from "../types";
 export const enterPlanModeTool: ToolDefinition = {
 	name: "EnterPlanMode",
 	description:
-		"Enter plan mode — ONLY use this for complex multi-step implementations, " +
-		"large-scale refactoring, or when the user explicitly asks for a plan. " +
-		"Do NOT enter plan mode for simple tasks, bug fixes, or straightforward changes. " +
-		"In plan mode, focus on analyzing the task, reading relevant files, and forming a plan " +
+		"Enter plan mode — ONLY use this when the task requires producing an implementation plan " +
+		"(e.g. the user explicitly asks for a plan, or a complex multi-step change needs an upfront design). " +
+		"Do NOT enter plan mode for code analysis, code review, bug investigation, answering questions, " +
+		"simple tasks, bug fixes, or straightforward changes — handle those directly in the current context. " +
+		"In plan mode, focus on reading relevant files and forming an actionable implementation plan " +
 		"without making any edits or running commands. Call ExitPlanMode with your plan when ready.",
 	parameters: z.object({}),
 	async execute(_args, ctx): Promise<ToolResult> {

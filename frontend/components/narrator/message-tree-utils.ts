@@ -4,7 +4,7 @@
  * React Query's cached message pages.
  */
 
-import type { TreeMessage } from "@frontend/lib/api";
+import type { ContentBlock, ToolCallRecord, TreeMessage } from "@frontend/lib/api";
 
 interface ToolCall {
 	toolUseId: string;
@@ -301,4 +301,186 @@ export function updateToolCallByIndex(
 	page.messages = updateAtPath(page.messages, entry.path, toolUseId, status, output, durationMs);
 	pages[entry.pageIdx] = page;
 	return { ...old, pages };
+}
+
+/**
+ * Sentinel ID for synthetic streaming-tool-chunks child messages inside subagent cards.
+ * Each parentToolUseId gets its own sentinel so multiple concurrent subagents don't collide.
+ */
+export function subagentStreamingId(parentToolUseId: string): string {
+	return `__streaming_subagent_${parentToolUseId}__`;
+}
+
+/**
+ * Upsert a synthetic streaming child message under a parent tool_use in the message tree.
+ * Used for subagent tool_use_chunk events — the streaming tool calls appear as children
+ * of the Task tool call that spawned the subagent.
+ */
+export function upsertSubagentStreamingChunk(
+	old: InfiniteCache,
+	parentToolUseId: string,
+	narratorId: string,
+	toolUseId: string,
+	toolName: string,
+	inputCharsTotal: number,
+): InfiniteCache {
+	const syntheticId = subagentStreamingId(parentToolUseId);
+
+	let anyChanged = false;
+	const pages = old.pages.map((page) => {
+		const { messages, changed } = upsertStreamingChildInMessages(
+			page.messages,
+			parentToolUseId,
+			syntheticId,
+			narratorId,
+			toolUseId,
+			toolName,
+			inputCharsTotal,
+		);
+		if (changed) anyChanged = true;
+		return changed ? { ...page, messages } : page;
+	});
+	return anyChanged ? { ...old, pages } : old;
+}
+
+function upsertStreamingChildInMessages(
+	messages: TreeMessage[],
+	parentToolUseId: string,
+	syntheticId: string,
+	narratorId: string,
+	toolUseId: string,
+	toolName: string,
+	inputCharsTotal: number,
+): { messages: TreeMessage[]; changed: boolean } {
+	let anyChanged = false;
+	const updated = messages.map((msg) => {
+		// Check if this message contains the parent tool call
+		const hasParentTool = (msg.toolCalls as ToolCall[])?.some(
+			(tc) => tc.toolUseId === parentToolUseId,
+		);
+		if (hasParentTool) {
+			anyChanged = true;
+			const children = [...(msg.children || [])];
+			const existingIdx = children.findIndex((c) => c.id === syntheticId);
+			const existing = existingIdx !== -1 ? children[existingIdx] : null;
+
+			// Build updated content blocks and tool calls
+			const prevBlocks: ContentBlock[] = existing
+				? [...(existing.contentJson as ContentBlock[])]
+				: [];
+			const prevToolCalls: ToolCallRecord[] = existing
+				? [...(existing.toolCalls as ToolCallRecord[])]
+				: [];
+
+			const blockIdx = prevBlocks.findIndex(
+				(b: ContentBlock) => b.type === "tool_use" && b.id === toolUseId,
+			);
+			if (blockIdx === -1) {
+				prevBlocks.push({ type: "tool_use", id: toolUseId, name: toolName, input: {} });
+				prevToolCalls.push({
+					toolUseId,
+					toolName,
+					inputJson: {},
+					status: "initializing",
+					createdAt: new Date().toISOString(),
+				} as ToolCallRecord);
+			}
+			const tcIdx = prevToolCalls.findIndex((tc: ToolCallRecord) => tc.toolUseId === toolUseId);
+			if (tcIdx !== -1) {
+				prevToolCalls[tcIdx] = {
+					...prevToolCalls[tcIdx],
+					inputJson: { _streamingChars: inputCharsTotal },
+				};
+			}
+
+			const syntheticChild: TreeMessage = {
+				id: syntheticId,
+				narratorId,
+				parentToolUseId,
+				role: "assistant",
+				contentJson: prevBlocks,
+				contentText: null,
+				toolCalls: prevToolCalls,
+				createdAt: existing?.createdAt ?? new Date().toISOString(),
+				children: [],
+			};
+
+			if (existingIdx !== -1) {
+				children[existingIdx] = syntheticChild;
+			} else {
+				children.push(syntheticChild);
+			}
+			return { ...msg, children };
+		}
+
+		// Recurse into children
+		if (msg.children?.length) {
+			const childResult = upsertStreamingChildInMessages(
+				msg.children,
+				parentToolUseId,
+				syntheticId,
+				narratorId,
+				toolUseId,
+				toolName,
+				inputCharsTotal,
+			);
+			if (childResult.changed) {
+				anyChanged = true;
+				return { ...msg, children: childResult.messages };
+			}
+		}
+		return msg;
+	});
+	return { messages: updated, changed: anyChanged };
+}
+
+/**
+ * Remove synthetic streaming child messages for a given parentToolUseId from the tree.
+ */
+export function removeSubagentStreamingChunk(
+	old: InfiniteCache,
+	parentToolUseId: string,
+): InfiniteCache {
+	const syntheticId = subagentStreamingId(parentToolUseId);
+	let anyChanged = false;
+	const pages = old.pages.map((page) => {
+		const { messages, changed } = removeStreamingChildInMessages(
+			page.messages,
+			parentToolUseId,
+			syntheticId,
+		);
+		if (changed) anyChanged = true;
+		return changed ? { ...page, messages } : page;
+	});
+	return anyChanged ? { ...old, pages } : old;
+}
+
+function removeStreamingChildInMessages(
+	messages: TreeMessage[],
+	parentToolUseId: string,
+	syntheticId: string,
+): { messages: TreeMessage[]; changed: boolean } {
+	let anyChanged = false;
+	const updated = messages.map((msg) => {
+		const hasParentTool = (msg.toolCalls as ToolCall[])?.some(
+			(tc) => tc.toolUseId === parentToolUseId,
+		);
+		if (hasParentTool && msg.children?.some((c) => c.id === syntheticId)) {
+			anyChanged = true;
+			return { ...msg, children: msg.children.filter((c) => c.id !== syntheticId) };
+		}
+		if (msg.children?.length) {
+			const childResult = removeStreamingChildInMessages(
+				msg.children,
+				parentToolUseId,
+				syntheticId,
+			);
+			if (childResult.changed) {
+				anyChanged = true;
+				return { ...msg, children: childResult.messages };
+			}
+		}
+		return msg;
+	});
+	return { messages: updated, changed: anyChanged };
 }
