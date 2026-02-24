@@ -48,6 +48,7 @@ interface MessageBubbleProps {
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;
+	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteMessage?: (messageId: string) => void;
 }
 
@@ -391,6 +392,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onPermissionDecision,
 	onQuestionSubmit,
 	onQuestionDeny,
+	onCompactBeforeMessage,
 	onDeleteMessage,
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
@@ -418,6 +420,9 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgUuid && onForkFromMessage && !isUser) {
 			actions.onForkFromMessage = () => onForkFromMessage(msgUuid);
 		}
+		if (msgId && onCompactBeforeMessage) {
+			actions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
+		}
 		if (msgId && onDeleteMessage) {
 			actions.onDeleteMessage = () => onDeleteMessage(msgId);
 		}
@@ -428,6 +433,7 @@ export const MessageBubble = memo(function MessageBubble({
 		message.messageUuid,
 		onBranchFromMessage,
 		onForkFromMessage,
+		onCompactBeforeMessage,
 		onDeleteMessage,
 	]);
 

@@ -27,7 +27,6 @@ import {
 	getBufferedMessage,
 	interruptSession,
 	isSessionActive,
-	markNarratorRead,
 	resolvePermission,
 	runCustomCompact,
 	sendMessage,
@@ -213,7 +212,11 @@ narratorRoutes.get("/:id/messages", async (c) => {
 	const cursor = c.req.query("cursor") || undefined;
 	const result = await narratorService.getMessagesCursor(id, limit, cursor);
 	const narrator = await narratorService.getById(id);
-	return c.json({ ...result, pruneBoundaryMessageId: narrator.pruneBoundaryMessageId ?? null });
+	return c.json({
+		...result,
+		pruneBoundaryMessageId: narrator.pruneBoundaryMessageId ?? null,
+		prunedPercent: narrator.prunedPercent ?? null,
+	});
 });
 
 // Get full tool call detail (untruncated inputJson/outputJson)
@@ -237,6 +240,14 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const result = await narratorService.deleteCompactMessage(narratorId, messageId);
+	return c.json({ ok: true, ...result });
+});
+
+// Delete a message and all subsequent messages
+narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const result = await narratorService.deleteMessage(narratorId, messageId);
 	return c.json({ ok: true, ...result });
 });
 
@@ -354,7 +365,6 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 	if (narrator.status === "done") {
 		await narratorService.updateStatus(id, "idle");
 	}
-	markNarratorRead(id);
 	return c.json({ ok: true });
 });
 

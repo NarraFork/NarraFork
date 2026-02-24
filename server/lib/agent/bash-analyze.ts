@@ -260,6 +260,7 @@ const SAFE_PACKAGE_RUNNERS = new Set([
 	"eslint",
 	"prettier",
 	"biome",
+	"@biomejs/biome",
 	"oxlint",
 	"stylelint",
 	// 构建工具

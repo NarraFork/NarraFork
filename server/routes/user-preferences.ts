@@ -1,7 +1,7 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
-import { userPreferences } from "../db/schema";
+import { narrators, userPreferences } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -35,12 +35,33 @@ userPreferencesRoutes.get("/", async (c) => {
 	});
 	if (!pref) return c.json({ ...DEFAULTS, recentTabs: [] });
 	// Parse recentTabs JSON string to array for the response
-	let recentTabs: unknown[] = [];
+	let recentTabs: Record<string, unknown>[] = [];
 	try {
 		recentTabs = JSON.parse(pref.recentTabs);
 	} catch {
 		// corrupted data, reset
 	}
+
+	// Enrich tabs with live narrator status from DB
+	if (recentTabs.length > 0) {
+		const narratorIds = recentTabs
+			.map((t) => (t.type === "session" ? (t.id as string) : (t.narratorId as string)))
+			.filter(Boolean);
+		if (narratorIds.length > 0) {
+			const rows = await db
+				.select({ id: narrators.id, status: narrators.status })
+				.from(narrators)
+				.where(inArray(narrators.id, narratorIds));
+			const statusMap = new Map(rows.map((r) => [r.id, r.status]));
+			for (const tab of recentTabs) {
+				const nId = tab.type === "session" ? (tab.id as string) : (tab.narratorId as string);
+				if (nId && statusMap.has(nId)) {
+					tab.status = statusMap.get(nId);
+				}
+			}
+		}
+	}
+
 	return c.json({ ...pref, recentTabs });
 });
 

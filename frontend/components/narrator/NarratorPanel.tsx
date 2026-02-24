@@ -76,6 +76,7 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type PaginatedMessages, type TreeMessage } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { SelectionPopover } from "../common/SelectionPopover";
+import { ChapterBar } from "./ChapterBar";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MessageBubble } from "./MessageBubble";
@@ -415,7 +416,7 @@ const SubagentCard = memo(
 
 		// --- Swipe / context-menu for SubagentCard itself ---
 		const parentMsgCtx = useMessageContextMenu();
-		const hasCardActions = !!parentMsgCtx.onDeleteMessage;
+		const hasCardActions = !!(parentMsgCtx.onDeleteMessage || parentMsgCtx.onCompactBeforeMessage);
 
 		const swipe = useSwipeMenu({ enabled: hasCardActions });
 
@@ -435,6 +436,17 @@ const SubagentCard = memo(
 				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
 					{t("viewSubagentSession")}
 				</Menu.Item>
+				{parentMsgCtx.onCompactBeforeMessage && (
+					<Menu.Item
+						leftSection={<IconArrowsMinimize size={14} />}
+						onClick={() => {
+							parentMsgCtx.onCompactBeforeMessage?.();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_compactBefore")}
+					</Menu.Item>
+				)}
 				{parentMsgCtx.onDeleteMessage && (
 					<Menu.Item
 						color="red"
@@ -885,6 +897,7 @@ function renderToolRun(
 	onForkFromMessage?: (uuid: string) => void,
 	onDeleteMessage?: (messageId: string) => void,
 	onBranchFromMessage?: (messageId: string) => void,
+	onCompactBeforeMessage?: (messageId: string) => void,
 ) {
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
@@ -913,6 +926,9 @@ function renderToolRun(
 		}
 		if (msgUuid && onForkFromMessage) {
 			ctxActions.onForkFromMessage = () => onForkFromMessage(msgUuid);
+		}
+		if (msgId && onCompactBeforeMessage) {
+			ctxActions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
 		}
 		if (msgId && onDeleteMessage) {
 			ctxActions.onDeleteMessage = () => onDeleteMessage(msgId);
@@ -994,6 +1010,7 @@ function renderTreeMessages(
 	onBranchFromMessage?: (messageId: string) => void,
 	pruneBoundaryMessageId?: string | null,
 	pruneDividerLabel?: string,
+	onCompactBeforeMessage?: (messageId: string) => void,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -1046,6 +1063,7 @@ function renderTreeMessages(
 								onPermissionDecision={permCb.onPermissionDecision}
 								onQuestionSubmit={permCb.onQuestionSubmit}
 								onQuestionDeny={permCb.onQuestionDeny}
+								onCompactBeforeMessage={onCompactBeforeMessage}
 								onDeleteMessage={onDeleteMessage}
 							/>
 						</Box>,
@@ -1077,6 +1095,7 @@ function renderTreeMessages(
 				onForkFromMessage,
 				onDeleteMessage,
 				onBranchFromMessage,
+				onCompactBeforeMessage,
 			);
 			if (el) elements.push(el);
 
@@ -1121,6 +1140,7 @@ function renderTreeMessages(
 						onPermissionDecision={permCb.onPermissionDecision}
 						onQuestionSubmit={permCb.onQuestionSubmit}
 						onQuestionDeny={permCb.onQuestionDeny}
+						onCompactBeforeMessage={onCompactBeforeMessage}
 						onDeleteMessage={onDeleteMessage}
 					/>
 					{showTokenUsage && msg.turnUsageJson != null && (
@@ -1173,6 +1193,7 @@ interface PageElementsProps {
 	/** When set, only render the last N messages of this page (for progressive rendering). */
 	maxMessages?: number;
 	onDeleteMessage?: (messageId: string) => void;
+	onCompactBeforeMessage?: (messageId: string) => void;
 	pruneBoundaryMessageId?: string | null;
 }
 
@@ -1189,6 +1210,7 @@ const MemoizedPageElements = memo(
 		showTokenUsage,
 		maxMessages,
 		onDeleteMessage,
+		onCompactBeforeMessage,
 		pruneBoundaryMessageId,
 	}: PageElementsProps) {
 		const msgs =
@@ -1209,6 +1231,7 @@ const MemoizedPageElements = memo(
 			onBranchFromMessage,
 			pruneBoundaryMessageId,
 			t("pruneBoundaryLabel"),
+			onCompactBeforeMessage,
 		);
 		return <>{elements}</>;
 	},
@@ -1241,6 +1264,10 @@ function useProgressiveMessageCount(
 	const prevTotalRef = useRef(totalMessages);
 	const prevResetKeyRef = useRef(resetKey);
 	const needsSnapRef = useRef(false);
+	// Track the effectiveCount that actually drives DOM rendering, so the
+	// useLayoutEffect can fire on the *same* render that changes the DOM —
+	// not one render later when the queued setCount finally takes effect.
+	const prevEffectiveRef = useRef(count);
 
 	let effectiveCount = count;
 	if (prevResetKeyRef.current !== resetKey) {
@@ -1290,12 +1317,21 @@ function useProgressiveMessageCount(
 	//    instead of compensating for prepended content.
 	//    Done here (not in the timer callback) to avoid racing with the
 	//    browser's anchor recalculation between frames.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: only needs to run when count changes
+	//
+	// We track effectiveCount via a ref instead of depending on `count` state,
+	// because when loading older messages, effectiveCount is set synchronously
+	// in the render phase (the DOM changes immediately), but the `setCount`
+	// state update only takes effect on the *next* render. If we depended on
+	// `count`, the scrollTop=1 hack would be one frame too late, allowing
+	// overflow-anchor to latch onto the top edge in the intervening paint.
+	const effectiveChanged = prevEffectiveRef.current !== effectiveCount;
+	prevEffectiveRef.current = effectiveCount;
 	useLayoutEffect(() => {
+		if (!effectiveChanged) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
 		if (needsSnapRef.current) {
-			if (count < batchSize) return;
+			if (effectiveCount < batchSize) return;
 			needsSnapRef.current = false;
 			vp.scrollTop = vp.scrollHeight;
 			return;
@@ -1307,7 +1343,7 @@ function useProgressiveMessageCount(
 		if (vp.scrollTop === 0 && vp.scrollHeight > vp.clientHeight) {
 			vp.scrollTop = 1;
 		}
-	}, [count]);
+	});
 
 	if (skip || totalMessages <= effectiveCount) return { visibleCount: totalMessages, done: true };
 	return { visibleCount: effectiveCount, done: false };
@@ -1493,24 +1529,41 @@ export function NarratorPanel({
 	}, [settingsData]);
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
+	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
 	const messagesQueryKey = useMemo(
 		() => ["narrators", narratorId, "messages", { around: highlightMessageId }],
 		[narratorId, highlightMessageId],
 	);
 
-	// Extract the latest message ID from cache for WS catch-up on reconnect
+	// Extract the latest message ID from cache for WS catch-up on reconnect.
+	// Must consider subagent children — they have higher seq values than their
+	// parent top-level message, so using only the top-level ID would cause the
+	// backend to re-send children the client already has (or worse, miss the
+	// correct catch-up point).
 	const lastMessageId = useMemo(() => {
 		const pages = messagesData?.pages;
 		if (!pages?.length) return undefined;
 		const firstPage = pages[0];
 		if (!firstPage?.messages?.length) return undefined;
 		const last = firstPage.messages[firstPage.messages.length - 1];
-		return last?.id as string | undefined;
+		if (!last) return undefined;
+		// Walk into the deepest last child to find the message with the highest seq
+		let deepest: NarratorMsg = last;
+		while (deepest.children?.length) {
+			deepest = deepest.children[deepest.children.length - 1];
+		}
+		return deepest.id as string | undefined;
 	}, [messagesData]);
 
 	const handleDeleteMessage = useCallback(
-		(messageId: string) => {
+		async (messageId: string) => {
+			// Snapshot for rollback
+			const prev = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
+
+			// Optimistic update
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length) return old;
 				const pages = old.pages.map((page) => ({
@@ -1532,8 +1585,35 @@ export function NarratorPanel({
 				setContextPercent(foundCp);
 				return { ...old, pages };
 			});
+
+			try {
+				await api.deleteMessage(narratorId, messageId);
+			} catch {
+				// Rollback on failure
+				qc.setQueryData(messagesQueryKey, prev);
+				notifications.show({
+					title: t("deleteMessageFailed"),
+					message: t("deleteMessageFailedDesc"),
+					color: "red",
+					autoClose: 5000,
+				});
+			}
 		},
-		[qc, messagesQueryKey],
+		[qc, messagesQueryKey, narratorId, t],
+	);
+
+	const handleCompactBefore = useCallback(
+		(messageId: string) => {
+			api.triggerCompact(narratorId, messageId).catch(() => {
+				notifications.show({
+					title: t("compactFailed"),
+					message: t("compactFailedDesc"),
+					color: "red",
+					autoClose: 5000,
+				});
+			});
+		},
+		[narratorId, t],
 	);
 
 	const [input, setInput] = useState(
@@ -1584,6 +1664,9 @@ export function NarratorPanel({
 		// pruneBoundaryMessageId comes from the API response
 		if (firstPage?.pruneBoundaryMessageId) {
 			setPruneBoundaryMessageId(firstPage.pruneBoundaryMessageId);
+		}
+		if (firstPage?.prunedPercent != null) {
+			setPrunedPercent(firstPage.prunedPercent);
 		}
 		const msgs = firstPage?.messages;
 		if (!msgs?.length) return;
@@ -1689,9 +1772,6 @@ export function NarratorPanel({
 	const highlightScrolledRef = useRef(false);
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
-	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("common");
-	const { t: tt } = useTranslation("terminal");
 
 	// Defer heavy message rendering until after the first paint so the shell
 	// (header + input) appears instantly when entering a session.
@@ -2071,6 +2151,7 @@ export function NarratorPanel({
 					editExpandOverride={editExpandOverride}
 					showTokenUsage={showTokenUsage}
 					onDeleteMessage={handleDeleteMessage}
+					onCompactBeforeMessage={handleCompactBefore}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>
 			));
@@ -2096,6 +2177,7 @@ export function NarratorPanel({
 					showTokenUsage={showTokenUsage}
 					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
 					onDeleteMessage={handleDeleteMessage}
+					onCompactBeforeMessage={handleCompactBefore}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>,
 			);
@@ -2115,6 +2197,7 @@ export function NarratorPanel({
 		highlightedId,
 		showTokenUsage,
 		handleDeleteMessage,
+		handleCompactBefore,
 		pruneBoundaryMessageId,
 	]);
 
@@ -2455,6 +2538,15 @@ export function NarratorPanel({
 						});
 					}
 
+					// Compact markers inserted via "compact before" may land in the middle
+					// of the conversation (specific seq position). We cannot simply append
+					// them to the end of the cache — check if this is a NEW compact message
+					// and invalidate so React Query refetches the correct order.
+					const isNewCompactMsg =
+						newMsg.role === "system" &&
+						Array.isArray(newMsg.contentJson) &&
+						newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
+
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
 
@@ -2477,6 +2569,9 @@ export function NarratorPanel({
 							pages[0] = firstPage;
 							return { ...old, pages };
 						}
+
+						// New compact message — skip cache append, will invalidate below
+						if (isNewCompactMsg) return old;
 
 						// Track unread count when user is scrolled up
 						if (!isAtBottomRef.current && newMsg.role === "assistant") {
@@ -2501,6 +2596,10 @@ export function NarratorPanel({
 						pages[0] = firstPage;
 						return { ...old, pages };
 					});
+					// New compact message was skipped in cache — refetch to get correct order
+					if (isNewCompactMsg) {
+						qc.invalidateQueries({ queryKey: messagesQueryKey });
+					}
 				} else {
 					qc.invalidateQueries({ queryKey: messagesQueryKey });
 				}
@@ -2763,6 +2862,14 @@ export function NarratorPanel({
 				setPruneBoundaryMessageId(boundaryMessageId);
 				setPrunedPercent(prunedPct);
 			},
+			onGitStatus: (data) => {
+				qc.setQueryData(["chapterGitStatus", data.chapterId], {
+					commitsAhead: data.commitsAhead,
+					baseBranch: data.baseBranch,
+					linesAdded: data.linesAdded,
+					linesRemoved: data.linesRemoved,
+				});
+			},
 			onCompacting: () => {
 				setIsCompacting(true);
 			},
@@ -2779,6 +2886,14 @@ export function NarratorPanel({
 					message: error,
 					color: "red",
 					autoClose: 8000,
+				});
+			},
+			onNarratorWarning: (message) => {
+				notifications.show({
+					title: t("narratorRetrying"),
+					message,
+					color: "yellow",
+					autoClose: 10000,
 				});
 			},
 			onCatchUp: (orphanChildren, topLevel) => {
@@ -3339,6 +3454,9 @@ export function NarratorPanel({
 				</Group>
 			)}
 
+			{/* Chapter bar — shown when narrator is bound to a chapter */}
+			{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
+
 			{/* Status bar — always visible */}
 			<Group
 				px="md"
@@ -3443,9 +3561,9 @@ export function NarratorPanel({
 						const circ = 2 * Math.PI * r;
 						const offset = circ * (1 - pct / 100);
 						const color =
-							pct >= 90
+							pct >= 99
 								? "var(--mantine-color-red-6)"
-								: pct >= 70
+								: pct >= 95
 									? "var(--mantine-color-yellow-6)"
 									: "var(--mantine-color-blue-6)";
 						return (

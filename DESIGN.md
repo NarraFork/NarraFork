@@ -1209,7 +1209,7 @@ frontend/
       index.tsx               # 项目列表
       $projectId.tsx          # 项目详情 = 故事网络图（主界面）
     chapters/
-      $chapterId.tsx          # Chapter 详情（Narrator + Terminal）
+      $chapterId.tsx          # Chapter 重定向（查询 primary narrator → 跳转 /sessions/$narratorId）
     sessions/
       index.tsx               # 游离会话列表（活跃）
       archived.tsx            # 已归档会话列表
@@ -1235,6 +1235,7 @@ frontend/
       ExplorationGroupPanel.tsx   # 探索组详情面板（侧边面板中显示）
     narrator/
       NarratorPanel.tsx       # Narrator 面板（消息列表 + 输入 + 图片上传 + 缓冲消息）
+      ChapterBar.tsx          # Chapter 信息栏（嵌入 NarratorPanel，当 narrator 绑定 chapter 时显示）
       MessageBubble.tsx       # 消息气泡
       MarkdownContent.tsx     # Markdown 渲染（react-markdown + remark-gfm）
       ToolCallCard.tsx        # Tool Call 展示卡片

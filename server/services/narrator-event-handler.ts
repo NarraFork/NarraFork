@@ -320,6 +320,13 @@ export async function processEvent(
 			return null;
 		}
 
+		case "retryable_error": {
+			// Transient errors are handled by the caller's retry logic —
+			// do NOT call onErrorCleanup (which would set status to "error").
+			logger.warn("Retryable API error", { narratorId, error: event.message });
+			return null;
+		}
+
 		case "stream_reasoning": {
 			broadcastToNarrator(broadcastTargetId, {
 				type: "stream_event",
@@ -342,10 +349,12 @@ export async function processEvent(
 		case "context_usage": {
 			ctx.setContextUsagePct(event.percentage);
 
+			const isSubagent = !!ctx.parentToolUseId;
 			broadcastToNarrator(broadcastTargetId, {
 				type: "context_usage",
 				narratorId: broadcastTargetId,
 				percentage: event.percentage,
+				...(isSubagent && { isSubagent: true }),
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "context_usage",
@@ -361,12 +370,14 @@ export async function processEvent(
 
 		case "metering": {
 			ctx.setMeterData(event.usage, event.unit);
+			const isSubagent = !!ctx.parentToolUseId;
 			broadcastToNarrator(broadcastTargetId, {
 				type: "metering",
 				narratorId: broadcastTargetId,
 				unit: event.unit,
 				unitPlural: event.unitPlural,
 				usage: event.usage,
+				...(isSubagent && { isSubagent: true }),
 			});
 			return null;
 		}

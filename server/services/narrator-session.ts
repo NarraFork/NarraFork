@@ -64,6 +64,10 @@ interface ActiveSession {
 	_chapterId?: string;
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
 	_worktreePath?: string;
+	/** Cached base branch (for commits-ahead tracking) */
+	_baseBranch?: string;
+	/** Trailing-edge throttle timer for git status tracking */
+	_gitTrackTimer?: ReturnType<typeof setTimeout>;
 	/** ID of the partial assistant message being incrementally built via block_complete events */
 	_partialMessageId?: string;
 }
@@ -98,9 +102,6 @@ interface BufferedMessage {
 	bufferedAt: string;
 }
 const bufferedMessages = new Map<string, BufferedMessage>();
-
-// Narrators that completed a turn (idle) but haven't been viewed yet — in-memory only
-const unreadNarrators = new Set<string>();
 
 // === SSE event types yielded to the HTTP response ===
 
@@ -725,6 +726,7 @@ async function createSession(
 	let sessionCwd: string;
 	let sessionChapterId: string | undefined;
 	let sessionWorktreePath: string | undefined;
+	let sessionBaseBranch: string | undefined;
 	if (narrator.chapterId) {
 		const ch = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
@@ -734,6 +736,7 @@ async function createSession(
 			sessionCwd = ch.worktreePath;
 			sessionChapterId = ch.id;
 			sessionWorktreePath = ch.worktreePath;
+			sessionBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
 			const project = await db.query.projects.findFirst({
@@ -782,6 +785,7 @@ async function createSession(
 		_replyInUserLanguage: replyInUserLanguage,
 		_chapterId: sessionChapterId,
 		_worktreePath: sessionWorktreePath,
+		_baseBranch: sessionBaseBranch,
 	};
 
 	activeSessions.set(narratorId, session);
@@ -791,7 +795,56 @@ async function createSession(
 // === Agent loop execution ===
 
 /** Trigger compact when context usage exceeds this percentage (0–100). */
-export const COMPACT_CONTEXT_USAGE_PCT = 95;
+export const COMPACT_CONTEXT_USAGE_PCT = 99;
+
+/**
+ * Minimum prunedPercent required before compact is allowed at the COMPACT_CONTEXT_USAGE_PCT
+ * threshold. If prunedPercent is below this value, the system continues pruning instead of
+ * compacting — giving prune more room to reclaim context before resorting to the heavier
+ * compact operation.
+ */
+const COMPACT_PRUNE_THRESHOLD_PCT = 80;
+
+/**
+ * Trigger a mid-turn compact: eagerly reserve the lock, find the boundary, and run compact.
+ * Extracted to avoid duplication between the prune-check path and the direct-compact fallback.
+ */
+function triggerMidTurnCompact(
+	narratorId: string,
+	locale: Locale,
+	onCompactDone?: () => void,
+): void {
+	const placeholder = Promise.resolve();
+	compactLocks.set(narratorId, placeholder);
+
+	logger.info("Context usage high, triggering compact (mid-turn)", { narratorId });
+	narratorService
+		.getCompactBoundaryMessage(narratorId)
+		.then((boundaryMessageId) => {
+			if (!boundaryMessageId) {
+				if (compactLocks.get(narratorId) === placeholder) {
+					compactLocks.delete(narratorId);
+				}
+				return;
+			}
+			runCustomCompact(narratorId, locale, boundaryMessageId)
+				.then(() => {
+					onCompactDone?.();
+					broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+				})
+				.catch((err) => {
+					logger.error("Auto-compact failed (mid-turn)", {
+						narratorId,
+						error: String(err),
+					});
+				});
+		})
+		.catch(() => {
+			if (compactLocks.get(narratorId) === placeholder) {
+				compactLocks.delete(narratorId);
+			}
+		});
+}
 
 /**
  * Strip tool calls from messages at or before the prune boundary so they
@@ -870,8 +923,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		opts;
 
 	const onContextUsage = (percentage: number) => {
-		// Dynamic pruning: 90–95%
-		if (percentage >= 90 && percentage < COMPACT_CONTEXT_USAGE_PCT && !pruneLocks.has(narratorId)) {
+		// Dynamic pruning: 95–98%
+		if (percentage >= 95 && percentage < COMPACT_CONTEXT_USAGE_PCT && !pruneLocks.has(narratorId)) {
 			pruneLocks.add(narratorId);
 			narratorService
 				.computeAndUpdatePruneBoundary(narratorId, percentage)
@@ -895,49 +948,45 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 				});
 		}
 
-		// ≥ 95%: trigger compact
-		// Check compactLocks twice: once here (fast-path skip) and again inside
-		// runCustomCompact (authoritative). The early check avoids a redundant
-		// getCompactBoundaryMessage call when a compact is already in flight.
-		if (percentage >= COMPACT_CONTEXT_USAGE_PCT && !compactLocks.has(narratorId)) {
-			// Eagerly reserve the lock so back-to-back context_usage events don't
-			// each kick off getCompactBoundaryMessage before runCustomCompact sets
-			// its own lock. We store a deferred promise that runCustomCompact will
-			// replace with the real one.
-			const placeholder = Promise.resolve();
-			compactLocks.set(narratorId, placeholder);
-
-			logger.info("Context usage high, triggering compact (mid-turn)", {
-				narratorId,
-				current: percentage,
-			});
+		// ≥ 99%: check prunedPercent before deciding compact vs continued prune.
+		// If prunedPercent < 80%, there's still room to prune further — skip compact.
+		if (
+			percentage >= COMPACT_CONTEXT_USAGE_PCT &&
+			!pruneLocks.has(narratorId) &&
+			!compactLocks.has(narratorId)
+		) {
+			pruneLocks.add(narratorId);
 			narratorService
-				.getCompactBoundaryMessage(narratorId)
-				.then((boundaryMessageId) => {
-					if (!boundaryMessageId) {
-						// Nothing to compact — release the placeholder lock
-						if (compactLocks.get(narratorId) === placeholder) {
-							compactLocks.delete(narratorId);
-						}
-						return;
-					}
-					runCustomCompact(narratorId, locale, boundaryMessageId)
-						.then(() => {
-							onCompactDone?.();
-							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-						})
-						.catch((err) => {
-							logger.error("Auto-compact failed (mid-turn)", {
-								narratorId,
-								error: String(err),
-							});
+				.computeAndUpdatePruneBoundary(narratorId, percentage)
+				.then((result) => {
+					broadcastToNarrator(narratorId, {
+						type: "prune_boundary",
+						narratorId,
+						boundaryMessageId: result?.boundaryMessageId ?? null,
+						prunedPercent: result?.prunedPercent ?? null,
+					});
+					const prunedPct = result?.prunedPercent ?? 0;
+					if (prunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
+						logger.info("Context ≥99% but prunedPercent below threshold, continuing prune", {
+							narratorId,
+							contextPct: percentage,
+							prunedPercent: prunedPct,
+							threshold: COMPACT_PRUNE_THRESHOLD_PCT,
 						});
-				})
-				.catch(() => {
-					// Release placeholder on boundary query failure
-					if (compactLocks.get(narratorId) === placeholder) {
-						compactLocks.delete(narratorId);
+						return; // stay in prune mode — don't compact yet
 					}
+					// prunedPercent ≥ 80%: prune is exhausted, proceed to compact
+					triggerMidTurnCompact(narratorId, locale, onCompactDone);
+				})
+				.catch((err) => {
+					logger.error("Failed to update prune boundary (pre-compact check)", {
+						narratorId,
+						contextPct: percentage,
+						error: String(err),
+					});
+				})
+				.finally(() => {
+					pruneLocks.delete(narratorId);
 				});
 		}
 	};
@@ -975,6 +1024,11 @@ async function runAgentLoop(
 	/** How many times we've retried after emergency compact in this runAgentLoop call. */
 	let contextOverflowRetries = 0;
 	const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
+
+	/** How many consecutive transient-error retries in this runAgentLoop call. */
+	let transientRetries = 0;
+	const MAX_TRANSIENT_RETRIES = 5;
+	const TRANSIENT_RETRY_BASE_MS = 3_000;
 
 	try {
 		while (session.alive) {
@@ -1114,23 +1168,42 @@ async function runAgentLoop(
 								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
 								const chapterId = session._chapterId as string;
 								const worktreePath = session._worktreePath as string;
-								gitService.getStatusSummary(worktreePath).then(
-									(gitStatus) => {
-										broadcastToNarrator(narratorId, {
-											type: "git_status",
-											narratorId,
-											chapterId,
-											toolUseId,
-											status: gitStatus,
-										});
-									},
-									(err) => {
-										logger.debug("Git status tracking failed", {
-											narratorId,
-											error: String(err),
-										});
-									},
-								);
+								const baseBranch = session._baseBranch as string | undefined;
+
+								// Throttle: collapse rapid successive calls into one trailing query.
+								// Store the latest toolUseId so the broadcast references the most
+								// recent tool, and clear any pending timer.
+								if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
+								session._gitTrackTimer = setTimeout(() => {
+									session._gitTrackTimer = undefined;
+									Promise.all([
+										gitService.getStatusSummary(worktreePath),
+										baseBranch
+											? gitService.getCommitsAhead(worktreePath, baseBranch)
+											: Promise.resolve({ count: 0, baseBranch: "" }),
+										gitService.getUncommittedLineStats(worktreePath),
+									]).then(
+										([gitStatus, ahead, lines]) => {
+											broadcastToNarrator(narratorId, {
+												type: "git_status",
+												narratorId,
+												chapterId,
+												toolUseId,
+												status: gitStatus,
+												commitsAhead: ahead.count,
+												baseBranch: ahead.baseBranch,
+												linesAdded: lines.added,
+												linesRemoved: lines.removed,
+											});
+										},
+										(err) => {
+											logger.debug("Git status tracking failed", {
+												narratorId,
+												error: String(err),
+											});
+										},
+									);
+								}, 800);
 							}
 						: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
@@ -1327,6 +1400,59 @@ async function runAgentLoop(
 				break;
 			}
 
+			// --- Transient API error: warn frontend and retry with backoff ---
+			if (result.retryableError && session.alive) {
+				transientRetries++;
+				if (transientRetries > MAX_TRANSIENT_RETRIES) {
+					logger.error("Transient error exceeded max retries", {
+						narratorId,
+						error: result.retryableError,
+						retries: transientRetries,
+					});
+					await narratorService.updateStatus(narratorId, "error", result.retryableError);
+					session.events.emit("event", {
+						type: "error",
+						data: { message: result.retryableError },
+					});
+					break;
+				}
+
+				const delayMs = TRANSIENT_RETRY_BASE_MS * 2 ** (transientRetries - 1);
+				logger.warn("Transient API error, retrying", {
+					narratorId,
+					error: result.retryableError,
+					attempt: transientRetries,
+					delayMs,
+				});
+
+				// Notify frontend about the retry
+				eventBus.emit({
+					type: "narrator:warning",
+					narratorId,
+					message: result.retryableError,
+				});
+
+				// Wait before retrying (abort-aware)
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, delayMs);
+					const onAbort = () => {
+						clearTimeout(timer);
+						resolve();
+					};
+					if (session.abortController.signal.aborted) {
+						clearTimeout(timer);
+						resolve();
+					} else {
+						session.abortController.signal.addEventListener("abort", onAbort, { once: true });
+					}
+				});
+
+				continue;
+			}
+
+			// Reset transient retry counter on success
+			transientRetries = 0;
+
 			if (result.shouldUpdateTitle) {
 				shouldUpdateTitle = true;
 			}
@@ -1362,13 +1488,21 @@ async function runAgentLoop(
 				continue;
 			}
 
+			// If the loop was interrupted (abort signal fired), reset the abort
+			// controller so that any chained buffered message or feedback below
+			// can start a fresh agent loop iteration without immediately aborting.
+			if (session.abortController.signal.aborted) {
+				session.abortController = new AbortController();
+			}
+
 			// Agent loop done — update status
 			await narratorService.updateStats(narratorId, 0);
-			await narratorService.updateStatus(narratorId, "idle");
+			await narratorService.updateStatus(narratorId, "done");
 
 			// Compact if context usage is high (checked after a complete turn).
 			// This is a fallback — the mid-turn compact in the context_usage handler
 			// may have already started a background compact.
+			// Before compacting, check prunedPercent: if < 80%, continue pruning instead.
 			if (
 				session._contextUsagePct != null &&
 				session._contextUsagePct >= COMPACT_CONTEXT_USAGE_PCT &&
@@ -1376,35 +1510,53 @@ async function runAgentLoop(
 			) {
 				session._contextUsagePct = undefined;
 
-				const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+				// Check current prunedPercent — if below threshold, prune further instead of compacting
+				const narrator = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { prunedPercent: true },
+				});
+				const currentPrunedPct = narrator?.prunedPercent ?? 0;
 
-				if (boundaryMessageId) {
-					logger.info("Context usage high, triggering background compact (post-turn)", {
-						narratorId,
-						boundaryMessageId,
-					});
-
-					// Fire-and-forget: compact runs in the background.
-					// On completion it resets the session's conversationId so the next
-					// agent loop iteration starts a fresh API conversation.
-					runCustomCompact(narratorId, locale, boundaryMessageId)
-						.then(() => {
-							const current = activeSessions.get(narratorId);
-							if (current?.alive) {
-								current.conversationId = randomUUID();
-							}
-							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-						})
-						.catch((compactErr) => {
-							logger.error("Auto-compact failed", {
-								narratorId,
-								error: String(compactErr),
-							});
-						});
+				if (currentPrunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
+					logger.info(
+						"Context ≥99% post-turn but prunedPercent below threshold, skipping compact",
+						{
+							narratorId,
+							prunedPercent: currentPrunedPct,
+							threshold: COMPACT_PRUNE_THRESHOLD_PCT,
+						},
+					);
 				} else {
-					logger.info("Context usage high but not enough messages to compact", {
-						narratorId,
-					});
+					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+
+					if (boundaryMessageId) {
+						logger.info("Context usage high, triggering background compact (post-turn)", {
+							narratorId,
+							boundaryMessageId,
+						});
+
+						// Fire-and-forget: compact runs in the background.
+						// On completion it resets the session's conversationId so the next
+						// agent loop iteration starts a fresh API conversation.
+						runCustomCompact(narratorId, locale, boundaryMessageId)
+							.then(() => {
+								const current = activeSessions.get(narratorId);
+								if (current?.alive) {
+									current.conversationId = randomUUID();
+								}
+								broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+							})
+							.catch((compactErr) => {
+								logger.error("Auto-compact failed", {
+									narratorId,
+									error: String(compactErr),
+								});
+							});
+					} else {
+						logger.info("Context usage high but not enough messages to compact", {
+							narratorId,
+						});
+					}
 				}
 			}
 
@@ -1482,6 +1634,7 @@ async function runAgentLoop(
 		session.events.emit("event", { type: "done", data: null });
 	} finally {
 		session.alive = false;
+		if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
 		activeSessions.delete(narratorId);
 		session.abortController.abort();
 		session.events.emit("event", { type: "done", data: null });
@@ -1575,7 +1728,23 @@ async function doRunCustomCompact(
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactedMsg });
 		}
 		await narratorService.clearPruneBoundary(narratorId);
-		await narratorService.updateStatus(narratorId, "idle");
+
+		// Only transition to idle if the narrator is still in "done" state.
+		// If a pending/buffered message already kicked off a new loop iteration
+		// (status = "thinking"), we must not overwrite it — the compact ran as a
+		// fire-and-forget background task and the new loop owns the status now.
+		const current = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { status: true },
+		});
+		if (!current || current.status === "done") {
+			await narratorService.updateStatus(narratorId, "idle");
+		} else {
+			logger.info("Skipping idle transition after compact — narrator already moved on", {
+				narratorId,
+				currentStatus: current.status,
+			});
+		}
 
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 	} catch (err) {
@@ -1823,6 +1992,7 @@ export function closeSession(narratorId: string): void {
 	const session = activeSessions.get(narratorId);
 	if (!session) return;
 	session.alive = false;
+	if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
 	session.abortController.abort();
 	cleanupOrphanedToolCalls(narratorId, session.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
@@ -1876,28 +2046,6 @@ export function clearBufferedMessage(narratorId: string): void {
 export function getBufferedMessage(narratorId: string): BufferedMessage | null {
 	return bufferedMessages.get(narratorId) ?? null;
 }
-
-// === Unread tracking (in-memory) ===
-
-/** Mark a narrator as read — clears the unread flag and broadcasts the change. */
-export function markNarratorRead(narratorId: string): void {
-	if (!unreadNarrators.delete(narratorId)) return;
-	eventBus.emit({ type: "narrator:unread_changed", narratorId, unread: false });
-}
-
-/** Check whether a narrator has unread content. */
-export function isNarratorUnread(narratorId: string): boolean {
-	return unreadNarrators.has(narratorId);
-}
-
-// Auto-mark narrator as unread when it finishes a turn (status → idle)
-eventBus.on("narrator:status_changed", (event) => {
-	if (event.status === "idle") {
-		if (unreadNarrators.has(event.narratorId)) return;
-		unreadNarrators.add(event.narratorId);
-		eventBus.emit({ type: "narrator:unread_changed", narratorId: event.narratorId, unread: true });
-	}
-});
 
 // === Startup recovery ===
 

@@ -290,7 +290,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		});
 
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
-		hasError = result.hasError || !!result.contextLengthExceeded;
+		hasError = result.hasError || !!result.contextLengthExceeded || !!result.retryableError;
+		if (result.retryableError) finalText = `Error: ${result.retryableError}`;
 		if (result.contextLengthExceeded) contextLengthExceeded = true;
 
 		if (!needsRestart || !isGeneral || signal.aborted || hasError) break;

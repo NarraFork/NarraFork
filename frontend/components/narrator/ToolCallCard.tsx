@@ -15,6 +15,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import {
+	IconArrowsMinimize,
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
@@ -962,6 +963,7 @@ function InlinePermission({
 	onDecision,
 	onQuestionSubmit,
 	onQuestionDeny,
+	planMaxHeight,
 }: {
 	permission: PendingPermission;
 	narratorId?: string;
@@ -973,6 +975,7 @@ function InlinePermission({
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;
+	planMaxHeight?: number;
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -1001,12 +1004,9 @@ function InlinePermission({
 
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
-		<Box
-			mt="xs"
-			style={planText ? { display: "flex", flexDirection: "column", flex: 1 } : undefined}
-		>
+		<Box mt="xs">
 			{planText && (
-				<Box mb="xs" style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+				<Box mb="xs" style={{ minHeight: 0, maxHeight: planMaxHeight, overflow: "auto" }}>
 					<ContentViewer content={planText} markdown contentType="markdown" title="Plan" />
 				</Box>
 			)}
@@ -1180,17 +1180,19 @@ export const ToolCallCard = memo(function ToolCallCard({
 			onDecision={onPermissionDecision}
 			onQuestionSubmit={onQuestionSubmit}
 			onQuestionDeny={onQuestionDeny}
+			planMaxHeight={vpHeight}
 		/>
 	) : null;
 
 	const handleToggle = isStreaming ? undefined : () => setOpened((o) => !o);
 
-	// --- Message-level context menu actions (branch / fork / delete) ---
+	// --- Message-level context menu actions (branch / fork / compact / delete) ---
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const hasActions = !!(
 		msgCtx.onBranchFromMessage ||
 		msgCtx.onForkFromMessage ||
+		msgCtx.onCompactBeforeMessage ||
 		msgCtx.onDeleteMessage
 	);
 
@@ -1219,6 +1221,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 					}}
 				>
 					{tNarrator("contextMenu_fork")}
+				</Menu.Item>
+			)}
+			{msgCtx.onCompactBeforeMessage && (
+				<Menu.Item
+					leftSection={<IconArrowsMinimize size={14} />}
+					onClick={() => {
+						msgCtx.onCompactBeforeMessage?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_compactBefore")}
 				</Menu.Item>
 			)}
 			{msgCtx.onDeleteMessage && (

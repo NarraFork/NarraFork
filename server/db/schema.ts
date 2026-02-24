@@ -172,6 +172,7 @@ export const narrators = sqliteTable(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
 			(): any => narratorMessages.id,
 		),
+		prunedPercent: integer("pruned_percent"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},

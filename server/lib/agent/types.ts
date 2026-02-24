@@ -88,6 +88,7 @@ export type AgentEvent =
 	  }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
+	| { type: "retryable_error"; message: string }
 	| { type: "context_length_exceeded"; message: string }
 	| { type: "stream_reasoning"; text: string }
 	| { type: "context_usage"; percentage: number }

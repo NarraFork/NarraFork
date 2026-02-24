@@ -16,8 +16,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { type SessionListWSEvent, useSessionsListWS } from "../../hooks/useNarratorWS";
-import { markTabRead, type RecentTab, useRecentTabs } from "../../hooks/useRecentTabs";
+import type { SessionListWSEvent } from "../../hooks/useNarratorWS";
+import { type RecentTab, useRecentTabs } from "../../hooks/useRecentTabs";
+import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { api } from "../../lib/api";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -32,6 +33,39 @@ const SWIPE_THRESHOLD = 80;
 // Module-level flag: set on dragEnd, cleared on next click capture.
 // Prevents the synthetic click after drag from triggering Link navigation.
 let justDragged = false;
+
+const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done"]);
+
+/**
+ * Move the tab matching `narratorId` to just after the last active (thinking/waiting/done) tab.
+ * This places it above all idle tabs without disturbing the order of other active tabs.
+ */
+function promoteAboveIdle(tabs: RecentTab[], narratorId: string): RecentTab[] {
+	const idx = tabs.findIndex(
+		(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
+	);
+	if (idx === -1) return tabs;
+
+	// Find the position right after the last active tab (excluding the target itself)
+	let lastActiveIdx = -1;
+	for (let i = 0; i < tabs.length; i++) {
+		if (i === idx) continue;
+		if (ACTIVE_STATUSES.has(tabs[i].status ?? "")) {
+			lastActiveIdx = i;
+		}
+	}
+
+	// Insert after the last active tab; if none, insert at position 0
+	const insertAt =
+		lastActiveIdx === -1 ? 0 : lastActiveIdx < idx ? lastActiveIdx + 1 : lastActiveIdx;
+
+	if (idx === insertAt) return tabs;
+
+	const result = [...tabs];
+	const [moved] = result.splice(idx, 1);
+	result.splice(insertAt, 0, moved);
+	return result;
+}
 
 function tabSortId(tab: RecentTab) {
 	return `${tab.type}:${tab.id}`;
@@ -94,34 +128,15 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 		return ids;
 	}, [tabs]);
 
-	// Subscribe to real-time title/status/unread updates via WS
+	// Subscribe to real-time title/status updates via WS
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: SessionListWSEvent) => {
-			if (event.type === "unread") {
-				if (!event.unread) return;
-				const current = qc.getQueryData<RecentTab[]>(QUERY_KEY);
-				const matched = current?.find(
-					(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
-				);
-				if (matched && isTabActive(matched, pathname)) {
-					markTabRead(narratorId);
-					return;
-				}
-				qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
-					if (!prev) return prev;
-					return prev.map((t) => {
-						const match =
-							(t.type === "session" && t.id === narratorId) || t.narratorId === narratorId;
-						return match ? { ...t, unread: true } : t;
-					});
-				});
-				return;
-			}
-
 			const patch: Partial<Pick<RecentTab, "title" | "status">> = {};
 			if (event.type === "title" && event.title) patch.title = event.title;
 			else if (event.type === "status" && event.status) patch.status = event.status;
 			else return;
+
+			const isPromote = event.type === "status" && event.status === "thinking";
 
 			qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
 				if (!prev) return prev;
@@ -135,10 +150,21 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 					}
 					return t;
 				});
-				return changed ? next : prev;
+				if (!changed) return prev;
+
+				// When a tab transitions to "thinking", promote it above all idle tabs
+				// but keep it below existing thinking/waiting/done tabs.
+				if (isPromote) {
+					return promoteAboveIdle(next, narratorId);
+				}
+				return next;
 			});
 
 			const current = qc.getQueryData<RecentTab[]>(QUERY_KEY);
+			if (isPromote && current) {
+				// Persist the new order after promotion
+				api.reorderRecentTabs(current.map((t) => `${t.type}:${t.id}`)).catch(() => {});
+			}
 			const matched = current?.find(
 				(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
 			);
@@ -146,7 +172,7 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 				api.upsertRecentTab(matched).catch(() => {});
 			}
 		},
-		[qc, pathname],
+		[qc],
 	);
 
 	// When another client changes recent tabs, refetch from backend
@@ -159,7 +185,7 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 		[qc],
 	);
 
-	useSessionsListWS(narratorIds, handleWSUpdate, handleGlobalEvent);
+	useRecentTabsWS(narratorIds, handleWSUpdate, handleGlobalEvent);
 
 	if (tabs.length === 0) return null;
 
@@ -199,7 +225,9 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 }
 
 function isTabActive(tab: RecentTab, pathname: string): boolean {
-	if (tab.type === "chapter") return pathname === `/chapters/${tab.id}`;
+	if (tab.type === "chapter") {
+		return tab.narratorId ? pathname === `/sessions/${tab.narratorId}` : false;
+	}
 	return pathname === `/sessions/${tab.id}`;
 }
 
@@ -213,8 +241,11 @@ interface SortableTabItemProps {
 function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemProps) {
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
-	const to = tab.type === "chapter" ? `/chapters/${tab.id}` : `/sessions/${tab.id}`;
-	const iconColor = tab.unread ? "var(--mantine-color-green-6)" : STATUS_COLORS[tab.status ?? ""];
+	const to =
+		tab.type === "chapter" && tab.narratorId
+			? `/sessions/${tab.narratorId}`
+			: `/sessions/${tab.id}`;
+	const iconColor = STATUS_COLORS[tab.status ?? ""];
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tabSortId(tab),
@@ -250,12 +281,16 @@ function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemP
 
 	// Swipe-right to close (mobile) — only when not dragging
 	const touchStartX = useRef(0);
+	const touchStartY = useRef(0);
 	const swiping = useRef(false);
+	const directionLocked = useRef<"horizontal" | "vertical" | null>(null);
 	const [swipeX, setSwipeX] = useState(0);
 	const [exiting, setExiting] = useState(false);
 
 	const handleTouchStart = useCallback((e: React.TouchEvent) => {
 		touchStartX.current = e.touches[0].clientX;
+		touchStartY.current = e.touches[0].clientY;
+		directionLocked.current = null;
 		swiping.current = true;
 	}, []);
 
@@ -263,6 +298,13 @@ function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemP
 		(e: React.TouchEvent) => {
 			if (!swiping.current || isDragging) return;
 			const dx = e.touches[0].clientX - touchStartX.current;
+			const dy = e.touches[0].clientY - touchStartY.current;
+			// Lock direction on first significant movement
+			if (!directionLocked.current) {
+				if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+				directionLocked.current = Math.abs(dy) > Math.abs(dx) ? "vertical" : "horizontal";
+			}
+			if (directionLocked.current === "vertical") return;
 			setSwipeX(Math.max(0, dx));
 		},
 		[isDragging],
@@ -295,9 +337,9 @@ function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemP
 	return (
 		<div
 			ref={setNodeRef}
-			style={{ ...sortStyle, overflow: "hidden", touchAction: "none" }}
 			{...attributes}
 			{...listeners}
+			style={{ ...sortStyle, overflow: "hidden", touchAction: "pan-y" }}
 		>
 			<div style={swipeStyle}>
 				<NavLink

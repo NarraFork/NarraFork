@@ -842,12 +842,15 @@ export const narratorService = {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		let orphanChildren: any[] = [];
 		if (candidateOrphans.length > 0) {
-			// Check which parent tool calls are already completed
+			// Check which parent tool calls are truly finished (success/fail).
+			// The status column is NOT NULL with default "initializing", so
+			// isNotNull() would match every row — including in-progress ones —
+			// which incorrectly filtered out ALL orphan children.
 			const uniqueToolUseIds = [...new Set(orphanToolUseIds)];
 			const completedTcs = await db.query.narratorToolCalls.findMany({
 				where: and(
 					inArray(narratorToolCalls.toolUseId, uniqueToolUseIds),
-					isNotNull(narratorToolCalls.status),
+					inArray(narratorToolCalls.status, ["success", "fail"]),
 				),
 				columns: { toolUseId: true },
 			});
@@ -1061,12 +1064,116 @@ export const narratorService = {
 					contextSummary: null,
 					apiConversationId: null,
 					pruneBoundaryMessageId: null,
+					prunedPercent: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId));
 		});
 
 		return { previousCompactExists: prevCompact.length > 0 };
+	},
+
+	/**
+	 * Delete a message and all subsequent messages from a narrator's conversation.
+	 * Removes refs for the target message and everything after it (by seq).
+	 * Messages not referenced by any other narrator are fully deleted.
+	 * Resets apiConversationId since conversation history changed.
+	 */
+	async deleteMessage(narratorId: string, messageId: string) {
+		// Verify the message belongs to this narrator via refs
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!targetRef) throw new NotFoundError("Message", messageId);
+
+		// Find all refs at or after this seq (the target + everything after it)
+		const refsToRemove = await db
+			.select({
+				id: narratorMessageRefs.id,
+				messageId: narratorMessageRefs.messageId,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gte(narratorMessageRefs.seq, targetRef.seq),
+				),
+			);
+
+		if (refsToRemove.length === 0) return;
+
+		const refIds = refsToRemove.map((r) => r.id);
+		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
+
+		await db.transaction(async (tx) => {
+			// Remove refs for this narrator
+			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
+
+			// Find messages that are now orphaned (not referenced by any narrator)
+			// Also include child messages (sub-agent messages via parentToolUseId)
+			const orphanRows = await tx
+				.select({ id: narratorMessages.id })
+				.from(narratorMessages)
+				.where(
+					and(
+						inArray(narratorMessages.id, messageIds),
+						sql`NOT EXISTS (
+							SELECT 1 FROM narrator_message_refs nmr
+							WHERE nmr.message_id = ${narratorMessages.id}
+						)`,
+					),
+				);
+
+			// Also find child messages (sub-agent) of orphaned top-level messages
+			const orphanIds = orphanRows.map((r) => r.id);
+			if (orphanIds.length > 0) {
+				// Get tool_use IDs from orphaned messages to find sub-agent children
+				const orphanMsgs = await tx
+					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+					.from(narratorMessages)
+					.where(inArray(narratorMessages.id, orphanIds));
+
+				const toolUseIds: string[] = [];
+				for (const msg of orphanMsgs) {
+					const blocks = Array.isArray(msg.contentJson)
+						? (msg.contentJson as { type: string; id?: string }[])
+						: [];
+					for (const b of blocks) {
+						if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
+					}
+				}
+
+				// Find child messages that reference these tool_use IDs
+				if (toolUseIds.length > 0) {
+					const childRows = await tx
+						.select({ id: narratorMessages.id })
+						.from(narratorMessages)
+						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
+					for (const c of childRows) orphanIds.push(c.id);
+				}
+
+				// Delete tool calls, then messages
+				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
+				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+			}
+
+			// Reset conversation state since history changed
+			const now = new Date().toISOString();
+			await tx
+				.update(narrators)
+				.set({
+					apiConversationId: null,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+
+		return { deletedCount: refsToRemove.length };
 	},
 
 	/**
@@ -1822,8 +1929,8 @@ export const narratorService = {
 		narratorId: string,
 		contextPct: number,
 	): Promise<{ boundaryMessageId: string; prunedPercent: number } | null> {
-		const PRUNE_START = 90;
-		const PRUNE_END = 95;
+		const PRUNE_START = 95;
+		const PRUNE_END = 99;
 
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
@@ -1876,7 +1983,7 @@ export const narratorService = {
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
-			.set({ pruneBoundaryMessageId: boundaryMessageId, updatedAt: now })
+			.set({ pruneBoundaryMessageId: boundaryMessageId, prunedPercent, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 
 		logger.debug("Updated prune boundary", {
@@ -1898,7 +2005,7 @@ export const narratorService = {
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
-			.set({ pruneBoundaryMessageId: null, updatedAt: now })
+			.set({ pruneBoundaryMessageId: null, prunedPercent: null, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 	},
 };

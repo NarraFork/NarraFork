@@ -4,9 +4,11 @@ import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { SessionTerminal } from "../../components/terminal/SessionTerminal";
+import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
-import { addRecentTab, markTabRead } from "../../hooks/useRecentTabs";
+import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { api } from "../../lib/api";
 
 export const Route = createFileRoute("/sessions/$sessionId")({
 	component: SessionDetailPage,
@@ -27,23 +29,43 @@ function SessionDetailPage() {
 
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(sessionId);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
+	const { data: chapter } = useChapter(chapterId ?? "");
 
 	// Record recent tab visit
 	const narratorTitle = narrator?.title;
 	const narratorCwd = narrator?.cwd;
+	const narratorStatus = narrator?.status;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const chapterTitle = (chapter as any)?.title as string | undefined;
 	useEffect(() => {
 		if (!narratorTitle) return;
-		addRecentTab({
-			type: "session",
-			id: sessionId,
-			title: narratorTitle || "New conversation",
-			subtitle: narratorCwd,
-		});
-	}, [sessionId, narratorTitle, narratorCwd]);
+		if (chapterId) {
+			// Chapter-bound narrator: record as chapter tab
+			addRecentTab({
+				type: "chapter",
+				id: chapterId,
+				narratorId: sessionId,
+				title: narratorTitle || "Chapter",
+				subtitle: chapterTitle,
+				status: narratorStatus,
+			});
+		} else {
+			// Standalone session
+			addRecentTab({
+				type: "session",
+				id: sessionId,
+				title: narratorTitle || "New conversation",
+				subtitle: narratorCwd,
+				status: narratorStatus,
+			});
+		}
+	}, [sessionId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle]);
 
-	// Mark narrator as read when visiting the session page
+	// Mark narrator as read (done → idle) when visiting the session page
 	useEffect(() => {
-		markTabRead(sessionId);
+		api.markNarratorRead(sessionId).catch(() => {});
 	}, [sessionId]);
 
 	// Check if there's a running terminal for this narrator

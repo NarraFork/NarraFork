@@ -88,6 +88,7 @@ export interface PaginatedMessages {
 	hasMore: boolean;
 	nextCursor: string | null;
 	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
 }
 
 export const api = {
@@ -563,6 +564,15 @@ export const api = {
 			`/chapters/${id}/commits${qs ? `?${qs}` : ""}`,
 		);
 	},
+
+	// === chapter git status ===
+	getChapterGitStatus: (id: string) =>
+		request<{
+			commitsAhead: number;
+			baseBranch: string;
+			linesAdded: number;
+			linesRemoved: number;
+		}>(`/chapters/${id}/git-status`),
 
 	// === chapter split ===
 	splitChapter: (

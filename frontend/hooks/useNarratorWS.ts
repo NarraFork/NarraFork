@@ -38,8 +38,16 @@ interface NarratorWSCallbacks {
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number) => void;
 	onPruneBoundary?: (boundaryMessageId: string | null, prunedPercent: number | null) => void;
+	onGitStatus?: (data: {
+		chapterId: string;
+		commitsAhead: number;
+		baseBranch: string;
+		linesAdded: number;
+		linesRemoved: number;
+	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onNarratorError?: (error: string) => void;
+	onNarratorWarning?: (message: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 }
 
@@ -197,7 +205,9 @@ export function useNarratorWS(
 							callbacksRef.current.onCompactDone?.();
 							break;
 						case "context_usage":
-							callbacksRef.current.onContextUsage?.(data.percentage);
+							if (!data.isSubagent) {
+								callbacksRef.current.onContextUsage?.(data.percentage);
+							}
 							break;
 						case "prune_boundary":
 							callbacksRef.current.onPruneBoundary?.(
@@ -205,11 +215,27 @@ export function useNarratorWS(
 								data.prunedPercent ?? null,
 							);
 							break;
+						case "git_status":
+							if (data.chapterId) {
+								callbacksRef.current.onGitStatus?.({
+									chapterId: data.chapterId,
+									commitsAhead: data.commitsAhead ?? 0,
+									baseBranch: data.baseBranch ?? "",
+									linesAdded: data.linesAdded ?? 0,
+									linesRemoved: data.linesRemoved ?? 0,
+								});
+							}
+							break;
 						case "metering":
-							callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
+							if (!data.isSubagent) {
+								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
+							}
 							break;
 						case "narrator:error":
 							callbacksRef.current.onNarratorError?.(data.error);
+							break;
+						case "narrator:warning":
+							callbacksRef.current.onNarratorWarning?.(data.message);
 							break;
 						case "catch_up":
 							callbacksRef.current.onCatchUp?.(data.orphanChildren ?? [], data.topLevel ?? []);
@@ -321,11 +347,10 @@ export function useNarratorWS(
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
 export interface SessionListWSEvent {
-	type: "status" | "title" | "planMode" | "unread";
+	type: "status" | "title" | "planMode";
 	status?: string;
 	title?: string;
 	planMode?: boolean;
-	unread?: boolean;
 }
 
 export function useSessionsListWS(
@@ -382,8 +407,6 @@ export function useSessionsListWS(
 						onUpdateRef.current(nId, { type: "title", title: data.title });
 					} else if (data.type === "plan_mode_changed") {
 						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
-					} else if (data.type === "narrator:unread_changed") {
-						onUpdateRef.current(nId, { type: "unread", unread: data.unread });
 					} else if (data.type.startsWith("user:")) {
 						onGlobalEventRef.current?.(data);
 					}

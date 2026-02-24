@@ -70,6 +70,59 @@ export const gitService = {
 		return result.stdout;
 	},
 
+	async getCommitsAhead(
+		worktreePath: string,
+		baseBranch: string,
+	): Promise<{ count: number; baseBranch: string }> {
+		const result = await exec(["rev-list", "--count", `${baseBranch}..HEAD`], worktreePath, true);
+		return {
+			count: result.exitCode === 0 ? Number.parseInt(result.stdout, 10) || 0 : 0,
+			baseBranch,
+		};
+	},
+
+	async getUncommittedLineStats(worktreePath: string): Promise<{ added: number; removed: number }> {
+		// staged + unstaged diff against HEAD
+		const tracked = await exec(["diff", "HEAD", "--numstat"], worktreePath, true);
+		// untracked files
+		const untracked = await exec(
+			["ls-files", "--others", "--exclude-standard"],
+			worktreePath,
+			true,
+		);
+
+		let added = 0;
+		let removed = 0;
+
+		if (tracked.exitCode === 0 && tracked.stdout) {
+			for (const line of tracked.stdout.split("\n").filter(Boolean)) {
+				const [a, r] = line.split("\t");
+				if (a !== "-") added += Number.parseInt(a, 10) || 0;
+				if (r !== "-") removed += Number.parseInt(r, 10) || 0;
+			}
+		}
+
+		// count lines in untracked files
+		if (untracked.exitCode === 0 && untracked.stdout) {
+			const files = untracked.stdout.split("\n").filter(Boolean);
+			for (const file of files) {
+				try {
+					const proc = Bun.spawn(["wc", "-l", file], {
+						cwd: worktreePath,
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					const out = await new Response(proc.stdout).text();
+					added += Number.parseInt(out.trim(), 10) || 0;
+				} catch {
+					// skip unreadable files
+				}
+			}
+		}
+
+		return { added, removed };
+	},
+
 	async getMergeBase(repoPath: string, branchA: string, branchB: string): Promise<string> {
 		const result = await exec(["merge-base", branchA, branchB], repoPath);
 		if (result.exitCode !== 0) throw new Error(`Failed to get merge base: ${result.stderr}`);

@@ -20,6 +20,7 @@ import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { containerService } from "../services/container-service";
+import { gitService } from "../services/git-service";
 
 export const chapterRoutes = new Hono();
 
@@ -226,4 +227,32 @@ chapterRoutes.get("/:id/commits", async (c) => {
 		return { sha, message, date };
 	});
 	return c.json(commits);
+});
+
+// === Git Status (commits ahead + uncommitted lines) ===
+
+chapterRoutes.get("/:id/git-status", async (c) => {
+	const id = c.req.param("id");
+	const chapter = await chapterService.getById(id);
+
+	if (!chapter.worktreePath) {
+		return c.json({
+			commitsAhead: 0,
+			linesAdded: 0,
+			linesRemoved: 0,
+			baseBranch: chapter.baseBranch,
+		});
+	}
+
+	const [ahead, lines] = await Promise.all([
+		gitService.getCommitsAhead(chapter.worktreePath, chapter.baseBranch),
+		gitService.getUncommittedLineStats(chapter.worktreePath),
+	]);
+
+	return c.json({
+		commitsAhead: ahead.count,
+		baseBranch: ahead.baseBranch,
+		linesAdded: lines.added,
+		linesRemoved: lines.removed,
+	});
 });

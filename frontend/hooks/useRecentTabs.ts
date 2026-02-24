@@ -13,8 +13,6 @@ export interface RecentTab {
 	title: string;
 	subtitle?: string;
 	status?: string;
-	/** In-memory unread flag — set when narrator finishes a turn */
-	unread?: boolean;
 	lastVisitedAt: number;
 }
 
@@ -164,28 +162,5 @@ export function addRecentTab(tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisit
 	// Persist to backend
 	api.upsertRecentTab(entry).catch((err) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);
-	});
-}
-
-/** Mark a narrator as read — clears unread in cache and notifies backend. */
-export function markTabRead(narratorId: string) {
-	// Clear unread flag in cache
-	globalQC.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (prev) => {
-		if (!prev) return prev;
-		let changed = false;
-		const next = prev.map((t) => {
-			const match = (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId;
-			if (match && t.unread) {
-				changed = true;
-				return { ...t, unread: false };
-			}
-			return t;
-		});
-		return changed ? next : prev;
-	});
-
-	// Notify backend (fire-and-forget)
-	api.markNarratorRead(narratorId).catch((err) => {
-		if (import.meta.env.DEV) console.warn("[useRecentTabs] markNarratorRead failed:", err);
 	});
 }

@@ -45,14 +45,21 @@ export type NarratorServerMessage =
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
 	| { type: "compact_failed"; narratorId: string; messageId: string }
-	| { type: "context_usage"; narratorId: string; percentage: number }
+	| { type: "context_usage"; narratorId: string; percentage: number; isSubagent?: boolean }
 	| {
 			type: "prune_boundary";
 			narratorId: string;
 			boundaryMessageId: string | null;
 			prunedPercent: number | null;
 	  }
-	| { type: "metering"; narratorId: string; unit: string; unitPlural: string; usage: number }
+	| {
+			type: "metering";
+			narratorId: string;
+			unit: string;
+			unitPlural: string;
+			usage: number;
+			isSubagent?: boolean;
+	  }
 	// Narrator fork events forwarded via eventBus.onAny
 	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
 	| {
@@ -84,6 +91,10 @@ export type NarratorServerMessage =
 			chapterId: string;
 			toolUseId: string;
 			status: GitStatusSummary;
+			commitsAhead?: number;
+			baseBranch?: string;
+			linesAdded?: number;
+			linesRemoved?: number;
 	  }
 	| { type: "auto_commit_started"; narratorId: string; chapterId: string }
 	| {
@@ -101,6 +112,7 @@ export type NarratorServerMessage =
 			topLevel: unknown[];
 	  }
 	| { type: "error"; message: string }
+	| { type: "warning"; narratorId: string; message: string }
 	| { type: "context_length_exceeded"; narratorId: string };
 
 // Client → Server messages

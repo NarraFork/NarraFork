@@ -17,6 +17,39 @@ const TRUNCATION_SUSPECT_THRESHOLD = 28_000;
 /** Max size of output pushed via tool_output events (UI preview only). */
 const MAX_STREAM_OUTPUT_LENGTH = 30_000;
 
+/** Patterns that indicate a transient API error worth retrying. */
+const RETRYABLE_PATTERNS = [
+	"MODEL_TEMPORARILY_UNAVAILABLE",
+	"overloaded",
+	"too many requests",
+	"rate limit",
+	"throttl",
+	"service unavailable",
+	"temporarily unavailable",
+	"capacity",
+	"try again",
+];
+
+/** HTTP status codes that indicate transient server-side issues. */
+const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
+
+function isRetryableError(err: unknown): boolean {
+	if (!err || typeof err !== "object") return false;
+	// Check for known retryable reason/code fields
+	const obj = err as Record<string, unknown>;
+	if (
+		obj.reason === "MODEL_TEMPORARILY_UNAVAILABLE" ||
+	) {
+		return true;
+	}
+	// Check HTTP status codes
+	if (typeof obj.status === "number" && RETRYABLE_STATUS_CODES.has(obj.status)) return true;
+	if (typeof obj.statusCode === "number" && RETRYABLE_STATUS_CODES.has(obj.statusCode)) return true;
+	// Check error message patterns
+	const msg = (obj.message ?? obj.error ?? "").toString().toLowerCase();
+	return RETRYABLE_PATTERNS.some((p) => msg.includes(p));
+}
+
 /** Minimum interval between tool_output events (ms). */
 const OUTPUT_THROTTLE_MS = 100;
 
@@ -252,6 +285,12 @@ export async function* agentLoop(
 				(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
 			) {
 				yield { type: "context_length_exceeded", message: msg };
+				return;
+			}
+			// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
+			// throttling, 429/529 overloaded)
+			if (isRetryableError(err)) {
+				yield { type: "retryable_error", message: msg };
 				return;
 			}
 			yield { type: "error", message: msg };

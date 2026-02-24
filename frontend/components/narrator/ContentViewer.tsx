@@ -2,6 +2,7 @@ import { ActionIcon, Box, Code, CopyButton, Group, Menu, Modal, Tooltip } from "
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowsMaximize,
+	IconArrowsMinimize,
 	IconCode,
 	IconCopy,
 	IconDeviceMobileRotated,
@@ -475,6 +476,7 @@ export const ContentViewer = memo(
 										</Menu.Item>
 										{(msgCtx.onBranchFromMessage ||
 											msgCtx.onForkFromMessage ||
+											msgCtx.onCompactBeforeMessage ||
 											msgCtx.onDeleteMessage) && <Menu.Divider />}
 										{msgCtx.onBranchFromMessage && (
 											<Menu.Item
@@ -496,6 +498,17 @@ export const ContentViewer = memo(
 												}}
 											>
 												{tNarrator("contextMenu_fork")}
+											</Menu.Item>
+										)}
+										{msgCtx.onCompactBeforeMessage && (
+											<Menu.Item
+												leftSection={<IconArrowsMinimize size={14} />}
+												onClick={() => {
+													msgCtx.onCompactBeforeMessage?.();
+													swipe.closeSwipe();
+												}}
+											>
+												{tNarrator("contextMenu_compactBefore")}
 											</Menu.Item>
 										)}
 										{msgCtx.onDeleteMessage && (
@@ -635,9 +648,10 @@ export const ContentViewer = memo(
 						>
 							{t("copy")}
 						</Menu.Item>
-						{(msgCtx.onBranchFromMessage || msgCtx.onForkFromMessage || msgCtx.onDeleteMessage) && (
-							<Menu.Divider />
-						)}
+						{(msgCtx.onBranchFromMessage ||
+							msgCtx.onForkFromMessage ||
+							msgCtx.onCompactBeforeMessage ||
+							msgCtx.onDeleteMessage) && <Menu.Divider />}
 						{msgCtx.onBranchFromMessage && (
 							<Menu.Item
 								leftSection={<IconGitBranch size={14} />}
@@ -649,6 +663,14 @@ export const ContentViewer = memo(
 						{msgCtx.onForkFromMessage && (
 							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
 								{tNarrator("contextMenu_fork")}
+							</Menu.Item>
+						)}
+						{msgCtx.onCompactBeforeMessage && (
+							<Menu.Item
+								leftSection={<IconArrowsMinimize size={14} />}
+								onClick={msgCtx.onCompactBeforeMessage}
+							>
+								{tNarrator("contextMenu_compactBefore")}
 							</Menu.Item>
 						)}
 						{msgCtx.onDeleteMessage && (

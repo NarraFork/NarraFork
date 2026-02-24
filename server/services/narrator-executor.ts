@@ -18,6 +18,8 @@ export interface ExecuteLoopResult {
 	shouldUpdateTitle: boolean;
 	/** Set when the API rejected the request because the context was too long. */
 	contextLengthExceeded?: boolean;
+	/** Set when the error is transient and the caller should retry after a delay. */
+	retryableError?: string;
 }
 
 /**
@@ -34,6 +36,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let hasError = false;
 	let shouldUpdateTitle = false;
 	let contextLengthExceeded = false;
+	let retryableError: string | undefined;
 
 	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
 		if (config.signal.aborted) break;
@@ -58,6 +61,10 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 			contextLengthExceeded = true;
 			break;
 		}
+		if (event.type === "retryable_error") {
+			retryableError = event.message;
+			break;
+		}
 		if (event.type === "error") {
 			if (event.message !== "Aborted") {
 				finalText = `Error: ${event.message}`;
@@ -67,5 +74,5 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 		}
 	}
 
-	return { finalText, hasError, shouldUpdateTitle, contextLengthExceeded };
+	return { finalText, hasError, shouldUpdateTitle, contextLengthExceeded, retryableError };
 }
