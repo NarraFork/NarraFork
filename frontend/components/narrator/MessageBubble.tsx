@@ -13,9 +13,10 @@ import {
 	Textarea,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { IconArrowsMinimize, IconListCheck } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
-import { memo, useEffect, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
@@ -142,6 +143,13 @@ function CompactIndicator({
 			await api.deleteCompactMessage(narratorId, messageId);
 			close();
 			onDelete?.();
+		} catch {
+			notifications.show({
+				title: t("deleteMessageFailed"),
+				message: t("deleteMessageFailedDesc"),
+				color: "red",
+				autoClose: 5000,
+			});
 		} finally {
 			setDeleting(false);
 		}
@@ -302,6 +310,13 @@ function PlanCard({
 		try {
 			await api.deleteCompactMessage(narratorId, messageId);
 			onDelete?.();
+		} catch {
+			notifications.show({
+				title: t("deleteMessageFailed"),
+				message: t("deleteMessageFailedDesc"),
+				color: "red",
+				autoClose: 5000,
+			});
 		} finally {
 			setDeleting(false);
 		}
@@ -381,7 +396,16 @@ export const MessageBubble = memo(function MessageBubble({
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const { t } = useTranslation("narrator");
+	const qc = useQueryClient();
 	const msgId = message.id;
+
+	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
+	// call their own delete API, so we only need to invalidate the messages
+	// query instead of firing another delete request via onDeleteMessage.
+	const invalidateMessages = useCallback(
+		() => qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] }),
+		[qc, narratorId],
+	);
 
 	// Build message-level context menu actions for ContentViewer to consume
 	const ctxActions = useMemo<MessageContextMenuActions>(() => {
@@ -418,7 +442,7 @@ export const MessageBubble = memo(function MessageBubble({
 						summary={compactBlock.summary ?? ""}
 						narratorId={narratorId}
 						messageId={message.id}
-						onDelete={onDeleteMessage && msgId ? () => onDeleteMessage(msgId) : undefined}
+						onDelete={invalidateMessages}
 					/>
 				);
 			}
@@ -429,9 +453,7 @@ export const MessageBubble = memo(function MessageBubble({
 					isCompacting={isCompacting}
 					narratorId={canNavigate ? narratorId : undefined}
 					messageId={canNavigate ? message.id : undefined}
-					onDelete={
-						canNavigate && onDeleteMessage && msgId ? () => onDeleteMessage(msgId) : undefined
-					}
+					onDelete={canNavigate ? invalidateMessages : undefined}
 				/>
 			);
 		}
