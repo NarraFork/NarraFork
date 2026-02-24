@@ -1,16 +1,9 @@
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapters } from "../db/schema";
-
-export interface GraphChapter {
-	id: string;
-	title: string;
-	status: string;
-	branch: string;
-	parentChapterId: string | null;
-	mergedIntoChapterId: string | null;
-}
+import { chapterEdges, chapters, explorationGroups } from "../db/schema";
+import { ValidationError } from "../lib/errors";
+import { updateGraphPositionsSchema } from "../lib/validators";
 
 export interface GraphNode {
 	id: string;
@@ -19,8 +12,13 @@ export interface GraphNode {
 		title: string;
 		status: string;
 		branch: string;
+		role: string;
+		color: string | null;
+		groupLabel: string | null;
+		explorationGroupId: string | null;
 		narratorCount: number;
 		hasContainers: boolean;
+		hasUpstreamUpdates: boolean;
 	};
 	position: { x: number; y: number };
 }
@@ -30,12 +28,31 @@ export interface GraphEdge {
 	source: string;
 	target: string;
 	type: string;
+	metadata?: unknown;
 }
 
 export function buildGraph(
-	projectChapters: GraphChapter[],
+	projectChapters: {
+		id: string;
+		title: string;
+		status: string;
+		branch: string;
+		role: string;
+		color: string | null;
+		groupLabel: string | null;
+		explorationGroupId: string | null;
+		positionX: number | null;
+		positionY: number | null;
+	}[],
 	narratorCounts: Map<string, number>,
 	containerPresence: Set<string>,
+	edgeRows: {
+		id: string;
+		sourceId: string;
+		targetId: string;
+		type: string;
+		metadata: unknown;
+	}[],
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
 	const nodes: GraphNode[] = projectChapters.map((ch) => ({
 		id: ch.id,
@@ -44,31 +61,27 @@ export function buildGraph(
 			title: ch.title,
 			status: ch.status,
 			branch: ch.branch,
+			role: ch.role,
+			color: ch.color,
+			groupLabel: ch.groupLabel,
+			explorationGroupId: ch.explorationGroupId,
 			narratorCount: narratorCounts.get(ch.id) ?? 0,
 			hasContainers: containerPresence.has(ch.id),
+			hasUpstreamUpdates: false,
 		},
-		position: { x: 0, y: 0 },
+		position: {
+			x: ch.positionX ?? 0,
+			y: ch.positionY ?? 0,
+		},
 	}));
 
-	const edges: GraphEdge[] = [];
-	for (const ch of projectChapters) {
-		if (ch.parentChapterId) {
-			edges.push({
-				id: `fork-${ch.parentChapterId}-${ch.id}`,
-				source: ch.parentChapterId,
-				target: ch.id,
-				type: "forkEdge",
-			});
-		}
-		if (ch.mergedIntoChapterId) {
-			edges.push({
-				id: `merge-${ch.id}-${ch.mergedIntoChapterId}`,
-				source: ch.id,
-				target: ch.mergedIntoChapterId,
-				type: "mergeEdge",
-			});
-		}
-	}
+	const edges: GraphEdge[] = edgeRows.map((e) => ({
+		id: e.id,
+		source: e.sourceId,
+		target: e.targetId,
+		type: e.type,
+		metadata: e.metadata,
+	}));
 
 	return { nodes, edges };
 }
@@ -85,8 +98,12 @@ graphRoutes.get("/:id/graph", async (c) => {
 			title: true,
 			status: true,
 			branch: true,
-			parentChapterId: true,
-			mergedIntoChapterId: true,
+			role: true,
+			color: true,
+			groupLabel: true,
+			explorationGroupId: true,
+			positionX: true,
+			positionY: true,
 			createdAt: true,
 		},
 	});
@@ -121,12 +138,52 @@ graphRoutes.get("/:id/graph", async (c) => {
 		containerPresence.add(ci.chapterId);
 	}
 
-	// Build graph
-	const { nodes, edges } = buildGraph(
-		projectChapters as GraphChapter[],
-		narratorCounts,
-		containerPresence,
-	);
+	// Get edges from chapter_edges table
+	const edgeRows = await db
+		.select()
+		.from(chapterEdges)
+		.where(eq(chapterEdges.projectId, projectId))
+		.all();
 
-	return c.json({ nodes, edges });
+	// Get exploration groups for this project
+	const groups = await db
+		.select()
+		.from(explorationGroups)
+		.where(eq(explorationGroups.projectId, projectId))
+		.all();
+
+	// Build graph
+	const { nodes, edges } = buildGraph(projectChapters, narratorCounts, containerPresence, edgeRows);
+
+	return c.json({ nodes, edges, explorationGroups: groups });
+});
+
+graphRoutes.patch("/:id/graph/positions", async (c) => {
+	const projectId = c.req.param("id");
+	const body = await c.req.json();
+	const parsed = updateGraphPositionsSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	// Validate all chapterIds belong to this project
+	const chapterIds = parsed.data.positions.map((p) => p.chapterId);
+	if (chapterIds.length > 0) {
+		const owned = await db
+			.select({ id: chapters.id })
+			.from(chapters)
+			.where(and(inArray(chapters.id, chapterIds), eq(chapters.projectId, projectId)));
+		const ownedIds = new Set(owned.map((r) => r.id));
+		const invalid = chapterIds.filter((id) => !ownedIds.has(id));
+		if (invalid.length > 0) {
+			throw new ValidationError(`Chapters not in project: ${invalid.join(", ")}`);
+		}
+	}
+
+	for (const pos of parsed.data.positions) {
+		await db
+			.update(chapters)
+			.set({ positionX: pos.x, positionY: pos.y })
+			.where(eq(chapters.id, pos.chapterId));
+	}
+
+	return c.json({ ok: true });
 });

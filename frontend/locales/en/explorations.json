@@ -1,0 +1,11 @@
+{
+	"title": "Exploration Groups",
+	"create": "Create Exploration Group",
+	"decide": "Decide Winner",
+	"abandon": "Abandon Exploration",
+	"status": {
+		"active": "Active",
+		"decided": "Decided",
+		"abandoned": "Abandoned"
+	}
+}

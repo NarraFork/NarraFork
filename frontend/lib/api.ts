@@ -291,6 +291,13 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "DELETE",
 		}),
+	deleteMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedCount: number }>(
+			`/narrators/${narratorId}/messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
@@ -368,7 +375,11 @@ export const api = {
 
 	// Graph
 	getProjectGraph: (projectId: string) =>
-		request<{ nodes: ApiEntity[]; edges: ApiEntity[] }>(`/projects/${projectId}/graph`),
+		request<{
+			nodes: ApiEntity[];
+			edges: ApiEntity[];
+			explorationGroups?: ApiEntity[];
+		}>(`/projects/${projectId}/graph`),
 
 	// Search
 	search: (q: string, entities = "chapters,messages") =>
@@ -487,6 +498,7 @@ export const api = {
 			description?: string;
 			inheritMode?: string;
 			forkAtMessageUuid?: string;
+			role?: string;
 		},
 	) => request<ApiEntity>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
 	checkMergeConflicts: (id: string, targetChapterId: string) =>
@@ -513,6 +525,127 @@ export const api = {
 		}),
 	dormantChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/dormant`, { method: "POST" }),
 	wakeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/wake`, { method: "POST" }),
+
+	// === chapter edges ===
+	listChapterEdges: (params: { projectId?: string; chapterId?: string; type?: string }) => {
+		const searchParams = new URLSearchParams();
+		if (params.projectId) searchParams.set("projectId", params.projectId);
+		if (params.chapterId) searchParams.set("chapterId", params.chapterId);
+		if (params.type) searchParams.set("type", params.type);
+		return request<ApiEntity[]>(`/chapter-edges?${searchParams}`);
+	},
+	createChapterEdge: (data: {
+		sourceId: string;
+		targetId: string;
+		type: string;
+		metadata?: Record<string, unknown>;
+	}) => request<ApiEntity>("/chapter-edges", { method: "POST", body: JSON.stringify(data) }),
+	deleteChapterEdge: (id: string) =>
+		request<{ ok: boolean }>(`/chapter-edges/${id}`, { method: "DELETE" }),
+
+	// === graph positions ===
+	updateGraphPositions: (
+		projectId: string,
+		positions: Array<{ chapterId: string; x: number; y: number }>,
+	) =>
+		request<{ ok: boolean }>(`/projects/${projectId}/graph/positions`, {
+			method: "PATCH",
+			body: JSON.stringify({ positions }),
+		}),
+
+	// === chapter commits ===
+	getChapterCommits: (id: string, params?: { limit?: number; since?: string }) => {
+		const searchParams = new URLSearchParams();
+		if (params?.limit) searchParams.set("limit", String(params.limit));
+		if (params?.since) searchParams.set("since", params.since);
+		const qs = searchParams.toString();
+		return request<Array<{ sha: string; message: string; date: string }>>(
+			`/chapters/${id}/commits${qs ? `?${qs}` : ""}`,
+		);
+	},
+
+	// === chapter split ===
+	splitChapter: (
+		id: string,
+		data: {
+			commitSha: string;
+			newFork: { title: string; description?: string; inheritMode?: string };
+		},
+	) =>
+		request<ApiEntity>(`/chapters/${id}/split`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	// === batch fork ===
+	batchForkChapter: (
+		id: string,
+		data: {
+			forks: Array<{
+				title: string;
+				description?: string;
+				inheritMode?: string;
+				role?: string;
+			}>;
+		},
+	) =>
+		request<{ created: ApiEntity[]; failed: Array<{ input: unknown; error: string }> }>(
+			`/chapters/${id}/batch-fork`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
+
+	// === cherry-pick ===
+	cherryPickChapter: (id: string, data: { sourceChapterId: string; commitShas: string[] }) =>
+		request<ApiEntity>(`/chapters/${id}/cherry-pick`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	// === dependency status ===
+	getDependencyStatus: (id: string) =>
+		request<
+			Array<{
+				edgeId: string;
+				sourceChapterId: string;
+				hasUpdates: boolean;
+				newCommitCount: number;
+			}>
+		>(`/chapters/${id}/dependency-status`),
+
+	// === sync upstream ===
+	syncUpstream: (id: string, data: { edgeId: string; strategy: "rebase" | "merge" }) =>
+		request<ApiEntity>(`/chapters/${id}/sync-upstream`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	// === exploration groups ===
+	listExplorationGroups: (projectId: string) =>
+		request<ApiEntity[]>(`/exploration-groups?projectId=${projectId}`),
+	getExplorationGroup: (id: string) => request<ApiEntity>(`/exploration-groups/${id}`),
+	createExplorationGroup: (data: {
+		projectId: string;
+		title: string;
+		description?: string;
+		baseChapterId: string;
+		branches: Array<{ title: string; description?: string; inheritMode?: string }>;
+	}) =>
+		request<ApiEntity>("/exploration-groups", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateExplorationGroup: (id: string, data: { title?: string; description?: string }) =>
+		request<ApiEntity>(`/exploration-groups/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	decideExplorationGroup: (id: string, chapterId: string) =>
+		request<ApiEntity>(`/exploration-groups/${id}/decide`, {
+			method: "POST",
+			body: JSON.stringify({ chapterId }),
+		}),
+	abandonExplorationGroup: (id: string) =>
+		request<ApiEntity>(`/exploration-groups/${id}/abandon`, { method: "POST" }),
 
 			method: "POST",
 			body: JSON.stringify({ priority }),

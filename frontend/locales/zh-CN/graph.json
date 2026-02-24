@@ -1,7 +1,25 @@
 {
 	"storyNetwork": "故事网络",
+	"loading": "加载图谱中…",
 	"loadFailed": "加载图谱失败：{{message}}",
 	"noChapters": "暂无章节。",
 	"narratorCount": "{{count}} 个叙述者",
-	"containers": "容器"
+	"containers": "容器",
+	"contextMenu": {
+		"fork": "分叉",
+		"setRole": "设置角色",
+		"role": {
+			"trunk": "主线",
+			"branch": "分支",
+			"exploration": "探索"
+		},
+		"dormant": "休眠",
+		"wake": "唤醒"
+	},
+	"sidePanel": {
+		"upstreamUpdates": "上游有更新",
+		"recentCommits": "最近提交",
+		"noCommits": "暂无提交。",
+		"openDetails": "打开详情"
+	}
 }

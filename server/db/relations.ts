@@ -1,7 +1,9 @@
 import { relations } from "drizzle-orm";
 import {
+	chapterEdges,
 	chapters,
 	containerInstances,
+	explorationGroups,
 	mergeSessions,
 	narratorMessageRefs,
 	narratorMessages,
@@ -19,6 +21,8 @@ import {
 
 export const projectsRelations = relations(projects, ({ many }) => ({
 	chapters: many(chapters),
+	chapterEdges: many(chapterEdges),
+	explorationGroups: many(explorationGroups),
 }));
 
 export const chaptersRelations = relations(chapters, ({ one, many }) => ({
@@ -29,10 +33,49 @@ export const chaptersRelations = relations(chapters, ({ one, many }) => ({
 		relationName: "chapterParent",
 	}),
 	childChapters: many(chapters, { relationName: "chapterParent" }),
+	explorationGroup: one(explorationGroups, {
+		fields: [chapters.explorationGroupId],
+		references: [explorationGroups.id],
+		relationName: "explorationGroupChapters",
+	}),
+	sourceEdges: many(chapterEdges, { relationName: "edgeSource" }),
+	targetEdges: many(chapterEdges, { relationName: "edgeTarget" }),
 	narrators: many(narrators),
 	terminals: many(terminals),
 	containerInstances: many(containerInstances),
 	portAllocations: many(portAllocations),
+}));
+
+export const chapterEdgesRelations = relations(chapterEdges, ({ one }) => ({
+	project: one(projects, { fields: [chapterEdges.projectId], references: [projects.id] }),
+	source: one(chapters, {
+		fields: [chapterEdges.sourceId],
+		references: [chapters.id],
+		relationName: "edgeSource",
+	}),
+	target: one(chapters, {
+		fields: [chapterEdges.targetId],
+		references: [chapters.id],
+		relationName: "edgeTarget",
+	}),
+}));
+
+export const explorationGroupsRelations = relations(explorationGroups, ({ one, many }) => ({
+	project: one(projects, {
+		fields: [explorationGroups.projectId],
+		references: [projects.id],
+	}),
+	baseChapter: one(chapters, {
+		fields: [explorationGroups.baseChapterId],
+		references: [chapters.id],
+		relationName: "explorationBase",
+	}),
+	decidedChapter: one(chapters, {
+		fields: [explorationGroups.decidedChapterId],
+		references: [chapters.id],
+		relationName: "explorationDecided",
+	}),
+	chapters: many(chapters, { relationName: "explorationGroupChapters" }),
 }));
 
 export const narratorsRelations = relations(narrators, ({ one, many }) => ({

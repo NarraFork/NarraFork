@@ -6,6 +6,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
+import { chapterEdgeService } from "./chapter-edge-service";
 import { gitService } from "./git-service";
 import { startSession } from "./narrator-session";
 import { terminalService } from "./terminal-service";
@@ -310,6 +311,23 @@ export const chapterMerge = {
 				updatedAt: now,
 			})
 			.where(eq(chapters.id, sourceChapterId));
+
+		// Create merge edge in chapter_edges
+		if (source) {
+			try {
+				await chapterEdgeService.createMergeEdge(
+					source.projectId,
+					sourceChapterId,
+					targetChapterId,
+					{
+						mergeCommitSha: commitSha,
+						strategy: strategy as string,
+					},
+				);
+			} catch (err) {
+				console.error("Failed to create merge edge:", err);
+			}
+		}
 
 		logger.info("Chapter merged", {
 			sourceId: sourceChapterId,

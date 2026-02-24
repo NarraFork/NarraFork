@@ -55,5 +55,13 @@
 	"cleanupCount": "Cleanup {{count}} chapter(s)",
 	"forkFromMessage": "Fork from this message",
 	"dormant": "Dormant",
-	"wake": "Wake"
+	"wake": "Wake",
+	"role": {
+		"trunk": "Trunk",
+		"branch": "Branch",
+		"exploration": "Exploration"
+	},
+	"status": {
+		"frozen": "Frozen"
+	}
 }

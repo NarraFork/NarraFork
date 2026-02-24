@@ -1,7 +1,25 @@
 {
 	"storyNetwork": "Story Network",
+	"loading": "Loading graph…",
 	"loadFailed": "Failed to load graph: {{message}}",
 	"noChapters": "No chapters yet.",
 	"narratorCount": "{{count}} narrator(s)",
-	"containers": "containers"
+	"containers": "containers",
+	"contextMenu": {
+		"fork": "Fork",
+		"setRole": "Set Role",
+		"role": {
+			"trunk": "Trunk",
+			"branch": "Branch",
+			"exploration": "Exploration"
+		},
+		"dormant": "Set Dormant",
+		"wake": "Wake Up"
+	},
+	"sidePanel": {
+		"upstreamUpdates": "Upstream updates",
+		"recentCommits": "Recent Commits",
+		"noCommits": "No commits yet.",
+		"openDetails": "Open Details"
+	}
 }

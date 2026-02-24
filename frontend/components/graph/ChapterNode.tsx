@@ -2,7 +2,7 @@ import { Badge, Card, Group, Text } from "@mantine/core";
 import { useNavigate } from "@tanstack/react-router";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
-import { CHAPTER_STATUS_COLORS } from "../../lib/constants";
+import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS } from "../../lib/constants";
 
 interface ChapterNodeData {
 	title: string;
@@ -10,6 +10,9 @@ interface ChapterNodeData {
 	branch: string;
 	narratorCount: number;
 	hasContainers: boolean;
+	role?: string;
+	color?: string;
+	hasUpstreamUpdates?: boolean;
 	[key: string]: unknown;
 }
 
@@ -17,6 +20,13 @@ export function ChapterNode({ data, id }: NodeProps) {
 	const d = data as ChapterNodeData;
 	const navigate = useNavigate();
 	const { t } = useTranslation("graph");
+
+	const role = d.role ?? "branch";
+	const isTrunk = role === "trunk";
+	const isFrozen = d.status === "frozen";
+	const roleIcon = CHAPTER_ROLE_ICONS[role] || "";
+	const borderColor =
+		d.color ?? `var(--mantine-color-${CHAPTER_STATUS_COLORS[d.status] ?? "gray"}-4)`;
 
 	return (
 		<>
@@ -27,15 +37,31 @@ export function ChapterNode({ data, id }: NodeProps) {
 				radius="md"
 				withBorder
 				style={{
-					width: 280,
-					height: 120,
+					width: isTrunk ? 320 : 280,
+					height: isTrunk ? 140 : 120,
 					cursor: "pointer",
-					borderColor: `var(--mantine-color-${CHAPTER_STATUS_COLORS[d.status] ?? "gray"}-4)`,
+					borderColor,
+					opacity: isFrozen ? 0.6 : 1,
+					position: "relative",
 				}}
 				onClick={() => navigate({ to: "/chapters/$chapterId", params: { chapterId: id } })}
 			>
+				{d.hasUpstreamUpdates && (
+					<div
+						style={{
+							position: "absolute",
+							top: 6,
+							right: 6,
+							width: 8,
+							height: 8,
+							borderRadius: "50%",
+							backgroundColor: "#fd7e14",
+						}}
+					/>
+				)}
 				<Group justify="space-between" mb={4}>
-					<Text size="sm" fw={600} lineClamp={1} style={{ maxWidth: 200 }}>
+					<Text size="sm" fw={600} lineClamp={1} style={{ maxWidth: isTrunk ? 240 : 200 }}>
+						{roleIcon ? `${roleIcon} ` : ""}
 						{d.title}
 					</Text>
 					<Badge size="xs" color={CHAPTER_STATUS_COLORS[d.status] ?? "gray"}>
@@ -46,6 +72,11 @@ export function ChapterNode({ data, id }: NodeProps) {
 					{d.branch}
 				</Text>
 				<Group gap={8} mt={4}>
+					{role !== "branch" && (
+						<Badge size="xs" variant="outline" color="indigo">
+							{role}
+						</Badge>
+					)}
 					<Text size="xs" c="dimmed">
 						{t("narratorCount", { count: d.narratorCount })}
 					</Text>

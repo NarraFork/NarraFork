@@ -7,9 +7,11 @@
 NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件开发被建模为分支故事网络，每个工作分支（章节/Chapter）拥有独立的 AI 叙述者（Claude Code 会话），运行在隔离的 git worktree 中，可选配 Podman 容器环境。面向小团队私有化部署，支持共享项目数据。
 
 **核心领域概念：**
-- **章节（Chapter）** — 工作单元 = git worktree + AI 会话，状态包括：active/dormant/merged/abandoned
+- **章节（Chapter）** — 工作单元 = git worktree + AI 会话，状态包括：active/dormant/merged/abandoned/frozen，角色（role）包括：trunk/branch/exploration
 - **叙述者（Narrator）** — 绑定到章节（或独立运行）的 Claude Code 会话，支持流式输出和权限控制
-- **故事网络（Story Network）** — 所有章节 fork/merge 关系构成的有向图
+- **故事网络（Story Network）** — 所有章节 fork/merge/dependency/cherry_pick 关系构成的有向图，是项目的主界面
+- **探索组（Exploration Group）** — 将多个探索分支组织为一个实验组，用于技术方案对比
+- **章节边（Chapter Edge）** — 章节间的显式关系，类型包括：fork/merge/dependency/cherry_pick
 
 ## 常用命令
 
@@ -71,10 +73,16 @@ server/
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
 - **叙述者会话**使用 Claude Agent SDK 的 `query()` 方法，通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。
 - **Fork 上下文继承**有三种模式：`full`（延迟 SDK 会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
+- **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。
+- **章节角色（Role）**：trunk（主线，接收合并）、branch（工作分支，默认）、exploration（探索分支）。角色是视觉和语义标签，不限制操作能力。
+- **章节边（Chapter Edges）**：`chapter_edges` 表显式建模四种关系（fork/merge/dependency/cherry_pick），与 `parentChapterId`/`mergedIntoChapterId` 冗余字段同步维护。
+- **依赖关系**：章节间可声明 dependency 边，系统检测上游变更并提供 rebase/merge 同步。
+- **探索组**：将多个 exploration 章节组织为实验组，支持决策（选定方案合并）和放弃。
 - **Git worktrees** 每个活跃章节在 `<project.gitPath>/.worktrees/` 下创建。休眠章节移除 worktree 但保留分支。每个项目对应一个 git 仓库，通过项目的 `gitPath` 配置。
 - **容器管理**通过 Podman compose 实现，端口从可配置池中分配（默认 10000–20000）。
 - **终端管理**通过 Bun.Terminal (PTY) 直接实现 — 终端生命周期与服务器进程绑定，重启后标记为已退出。
 - **批量合并**编排多章节合并，支持冲突检测、WebSocket 交互式决策和 AI 辅助冲突解决。
+- **故事网络图**是项目的主界面（`/projects/$projectId`），交互式 React Flow 画布，支持节点拖拽、右键菜单、侧边面板、边连接。
 
 **叙述者消息存储：** 消息通过三层结构管理：
 - `narrator_messages` — 存储所有消息（user/assistant/system），`contentJson` 保存完整的 SDK content blocks（text/tool_use/thinking），`parentToolUseId` 关联子 agent 消息树。
@@ -140,7 +148,7 @@ frontend/
 - **支持语言：** 英文（默认回退）+ 简体中文（`zh-CN`）
 - **配置：** `frontend/lib/i18n.ts` — 同步导入所有语言包，无异步加载
 - **检测顺序：** localStorage 键 `narrafork_lang` → 浏览器 navigator → 回退 `en`
-- **命名空间：** 每种语言 12 个按功能划分的 JSON 文件，位于 `frontend/locales/{en,zh-CN}/`：common、nav、dashboard、projects、chapters、sessions、settings、search、narrator、terminal、containers、graph
+- **命名空间：** 每种语言 13 个按功能划分的 JSON 文件，位于 `frontend/locales/{en,zh-CN}/`：common、nav、dashboard、projects、chapters、sessions、settings、search、narrator、terminal、containers、graph、explorations
 - **语言切换器：** `frontend/components/LanguageSwitcher.tsx` — 应用头部的 Mantine Select 组件
 - **使用方式：** 组件中 `const { t } = useTranslation("namespace")`，插值 `t("key", { param })`
 - **多命名空间：** `const { t } = useTranslation("chapters"); const { t: tc } = useTranslation("common");`

@@ -1,11 +1,11 @@
 import {
 	Badge,
+	Box,
 	Button,
 	Divider,
 	Group,
 	Loader,
 	Modal,
-	SimpleGrid,
 	Stack,
 	Text,
 	Textarea,
@@ -13,12 +13,12 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
-import { ChapterCard } from "../../components/chapter/ChapterCard";
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
+import { StoryNetwork } from "../../components/graph/StoryNetwork";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useProject } from "../../hooks/useProjects";
 
@@ -29,7 +29,7 @@ export const Route = createFileRoute("/projects/$projectId")({
 function ProjectDetailPage() {
 	const { projectId } = Route.useParams();
 	const { data: project, isLoading: projectLoading } = useProject(projectId);
-	const { data: chapters, isLoading: chaptersLoading } = useChapters(projectId);
+	const { data: chapters } = useChapters(projectId);
 	const createChapter = useCreateChapter();
 	const [opened, { open, close }] = useDisclosure(false);
 	const [cleanupOpened, { open: openCleanup, close: closeCleanup }] = useDisclosure(false);
@@ -64,40 +64,26 @@ function ProjectDetailPage() {
 	};
 
 	return (
-		<Stack>
-			<Group justify="space-between">
-				<div>
-					<Title order={2}>{project.name}</Title>
-					{project.description && (
-						<Text c="dimmed" size="sm">
-							{project.description}
-						</Text>
-					)}
-					{project.gitPath && (
-						<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
-							{project.gitPath}
-						</Text>
-					)}
-				</div>
-				<Badge color={project.status === "active" ? "green" : "gray"} size="lg">
-					{project.status}
-				</Badge>
-			</Group>
-
-			<Divider />
-
-			<Group justify="space-between">
-				<Title order={3}>{t("title")}</Title>
+		<Box
+			style={{
+				height: "calc(100vh - 60px)",
+				display: "flex",
+				flexDirection: "column",
+			}}
+		>
+			{/* Toolbar */}
+			<Group p="xs" justify="space-between" style={{ flexShrink: 0 }}>
+				<Group gap="sm">
+					<Title order={4}>{project.name}</Title>
+					<Badge color={project.status === "active" ? "green" : "gray"} size="sm">
+						{project.status}
+					</Badge>
+				</Group>
 				<Group gap="xs">
-					<Link to="/projects/$projectId/graph" params={{ projectId }}>
-						<Button variant="light" size="sm">
-							{t("viewGraph")}
-						</Button>
-					</Link>
 					<Button
 						variant="light"
 						color="red"
-						size="sm"
+						size="xs"
 						onClick={openCleanup}
 						disabled={!chapters?.length}
 					>
@@ -106,31 +92,26 @@ function ProjectDetailPage() {
 					<Button
 						variant="light"
 						color="green"
-						size="sm"
+						size="xs"
 						onClick={openBatchMerge}
 						disabled={!chapters?.length}
 					>
 						{t("batchMerge")}
 					</Button>
-					<Button onClick={open} disabled={!hasGitPath}>
+					<Button size="xs" onClick={open} disabled={!hasGitPath}>
 						{t("newChapter")}
 					</Button>
 				</Group>
 			</Group>
 
-			{chaptersLoading ? (
-				<Loader />
-			) : !chapters?.length ? (
-				<Text c="dimmed">{t("noChapters")}</Text>
-			) : (
-				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
-					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-					{chapters.map((chapter: any) => (
-						<ChapterCard key={chapter.id} chapter={chapter} />
-					))}
-				</SimpleGrid>
-			)}
+			<Divider />
 
+			{/* Graph canvas */}
+			<Box style={{ flex: 1, minHeight: 0 }}>
+				<StoryNetwork projectId={projectId} />
+			</Box>
+
+			{/* New chapter modal */}
 			<Modal opened={opened} onClose={close} title={t("newChapter")}>
 				<Stack>
 					<TextInput
@@ -162,6 +143,6 @@ function ProjectDetailPage() {
 				opened={batchMergeOpened}
 				onClose={closeBatchMerge}
 			/>
-		</Stack>
+		</Box>
 	);
 }

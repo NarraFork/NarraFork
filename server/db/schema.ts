@@ -18,6 +18,29 @@ export const projects = sqliteTable("projects", {
 	updatedAt: text("updated_at").notNull(),
 });
 
+// === exploration_groups ===
+export const explorationGroups = sqliteTable("exploration_groups", {
+	id: text("id").primaryKey(),
+	projectId: text("project_id")
+		.notNull()
+		.references(() => projects.id, { onDelete: "cascade" }),
+	title: text("title").notNull(),
+	description: text("description"),
+	// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
+	baseChapterId: text("base_chapter_id").references((): any => chapters.id, {
+		onDelete: "set null",
+	}),
+	status: text("status", { enum: ["active", "decided", "abandoned"] })
+		.notNull()
+		.default("active"),
+	// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
+	decidedChapterId: text("decided_chapter_id").references((): any => chapters.id, {
+		onDelete: "set null",
+	}),
+	createdAt: text("created_at").notNull(),
+	updatedAt: text("updated_at").notNull(),
+});
+
 // === chapters ===
 export const chapters = sqliteTable(
 	"chapters",
@@ -28,9 +51,17 @@ export const chapters = sqliteTable(
 			.references(() => projects.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
 		description: text("description"),
-		status: text("status", { enum: ["active", "dormant", "merged", "abandoned"] })
+		status: text("status", {
+			enum: ["active", "dormant", "merged", "abandoned", "frozen"],
+		})
 			.notNull()
 			.default("active"),
+
+		// 角色（视觉和语义标签，不限制操作能力）
+		role: text("role", { enum: ["trunk", "branch", "exploration"] })
+			.notNull()
+			.default("branch"),
+
 		branch: text("branch").notNull(),
 		worktreePath: text("worktree_path"),
 		baseBranch: text("base_branch").notNull(),
@@ -47,6 +78,19 @@ export const chapters = sqliteTable(
 		mergeCommitSha: text("merge_commit_sha"),
 		mergeStrategy: text("merge_strategy", { enum: ["merge", "squash", "cherry-pick"] }),
 		containerConfig: text("container_config", { mode: "json" }),
+
+		// 探索组
+		explorationGroupId: text("exploration_group_id").references(() => explorationGroups.id, {
+			onDelete: "set null",
+		}),
+
+		// 图可视化
+		color: text("color"),
+		groupLabel: text("group_label"),
+		pinned: integer("pinned").default(0),
+		positionX: real("position_x"),
+		positionY: real("position_y"),
+
 		lastAccessedAt: text("last_accessed_at"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -55,6 +99,34 @@ export const chapters = sqliteTable(
 		index("idx_chapters_project").on(table.projectId, table.status),
 		index("idx_chapters_parent").on(table.parentChapterId),
 		uniqueIndex("idx_chapters_project_branch").on(table.projectId, table.branch),
+	],
+);
+
+// === chapter_edges ===
+export const chapterEdges = sqliteTable(
+	"chapter_edges",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		sourceId: text("source_id")
+			.notNull()
+			.references(() => chapters.id, { onDelete: "cascade" }),
+		targetId: text("target_id")
+			.notNull()
+			.references(() => chapters.id, { onDelete: "cascade" }),
+		type: text("type", {
+			enum: ["fork", "merge", "dependency", "cherry_pick"],
+		}).notNull(),
+		metadata: text("metadata", { mode: "json" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_chapter_edges_src_tgt_type").on(table.sourceId, table.targetId, table.type),
+		index("idx_chapter_edges_project").on(table.projectId),
+		index("idx_chapter_edges_source").on(table.sourceId),
+		index("idx_chapter_edges_target").on(table.targetId),
 	],
 );
 

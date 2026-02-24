@@ -12,6 +12,31 @@ export type NarraForkEvent =
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
 	| { type: "chapter:abandoned"; chapterId: string }
+	| {
+			type: "chapter:split";
+			prefixChapterId: string;
+			continuationChapterId: string;
+			newForkChapterId: string;
+			commitSha: string;
+	  }
+	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] }
+	| { type: "chapter:frozen"; chapterId: string }
+	| { type: "chapter:role_changed"; chapterId: string; role: string }
+	// 依赖关系
+	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string }
+	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string }
+	| {
+			type: "dependency:upstream_updated";
+			edgeId: string;
+			targetChapterId: string;
+			newCommitCount: number;
+	  }
+	| { type: "dependency:synced"; edgeId: string; targetChapterId: string; strategy: string }
+	// 探索组
+	| { type: "exploration:created"; groupId: string; chapterIds: string[] }
+	| { type: "exploration:decided"; groupId: string; decidedChapterId: string }
+	| { type: "exploration:abandoned"; groupId: string }
+	| { type: "exploration:chapter_added"; groupId: string; chapterId: string }
 	// Batch merge session
 	| {
 			type: "merge:started";
@@ -61,6 +86,7 @@ export type NarraForkEvent =
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string }
 	| { type: "narrator:error"; narratorId: string; error: string }
+	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
 	| { type: "narrator:title_updated"; narratorId: string; title: string }
 	// Narrator fork
@@ -83,8 +109,6 @@ export type NarraForkEvent =
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }
 	| { type: "container:error"; chapterId: string; error: string }
-	// Narrator unread (in-memory only)
-	| { type: "narrator:unread_changed"; narratorId: string; unread: boolean }
 	// Auto-commit
 	| {
 			type: "narrator:auto_commit";

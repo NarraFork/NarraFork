@@ -3,6 +3,20 @@ export const CHAPTER_STATUS_COLORS: Record<string, string> = {
 	dormant: "yellow",
 	merged: "blue",
 	abandoned: "gray",
+	frozen: "cyan",
+};
+
+export const CHAPTER_ROLE_ICONS: Record<string, string> = {
+	trunk: "🏠",
+	branch: "",
+	exploration: "🔬",
+};
+
+export const EDGE_TYPE_COLORS: Record<string, string> = {
+	fork: "#4c6ef5",
+	merge: "#40c057",
+	dependency: "#fd7e14",
+	cherry_pick: "#7950f2",
 };
 
 export const NARRATOR_STATUS_COLORS: Record<string, string> = {

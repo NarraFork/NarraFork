@@ -2,6 +2,7 @@ import enChapters from "@frontend/locales/en/chapters.json";
 import enCommon from "@frontend/locales/en/common.json";
 import enContainers from "@frontend/locales/en/containers.json";
 import enDashboard from "@frontend/locales/en/dashboard.json";
+import enExplorations from "@frontend/locales/en/explorations.json";
 import enGraph from "@frontend/locales/en/graph.json";
 import enNarrator from "@frontend/locales/en/narrator.json";
 import enNav from "@frontend/locales/en/nav.json";
@@ -14,6 +15,7 @@ import zhChapters from "@frontend/locales/zh-CN/chapters.json";
 import zhCommon from "@frontend/locales/zh-CN/common.json";
 import zhContainers from "@frontend/locales/zh-CN/containers.json";
 import zhDashboard from "@frontend/locales/zh-CN/dashboard.json";
+import zhExplorations from "@frontend/locales/zh-CN/explorations.json";
 import zhGraph from "@frontend/locales/zh-CN/graph.json";
 import zhNarrator from "@frontend/locales/zh-CN/narrator.json";
 import zhNav from "@frontend/locales/zh-CN/nav.json";
@@ -31,6 +33,7 @@ const ns = [
 	"chapters",
 	"containers",
 	"dashboard",
+	"explorations",
 	"graph",
 	"narrator",
 	"nav",
@@ -51,6 +54,7 @@ i18n
 				chapters: enChapters,
 				containers: enContainers,
 				dashboard: enDashboard,
+				explorations: enExplorations,
 				graph: enGraph,
 				narrator: enNarrator,
 				nav: enNav,
@@ -65,6 +69,7 @@ i18n
 				chapters: zhChapters,
 				containers: zhContainers,
 				dashboard: zhDashboard,
+				explorations: zhExplorations,
 				graph: zhGraph,
 				narrator: zhNarrator,
 				nav: zhNav,

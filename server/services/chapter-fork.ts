@@ -8,6 +8,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
+import { chapterEdgeService } from "./chapter-edge-service";
 import { resolveChapterSettings } from "./chapter-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
@@ -19,6 +20,8 @@ export interface ForkChapterInput {
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
+	/** Chapter role: trunk, branch, or exploration. */
+	role?: "trunk" | "branch" | "exploration";
 	/** Override project-level autoForkNarrators setting. */
 	forkNarrators?: boolean;
 	locale?: Locale;
@@ -83,6 +86,7 @@ export const chapterFork = {
 					title: input.title,
 					description: input.description,
 					status: "active",
+					role: input.role ?? "branch",
 					branch: branchName,
 					worktreePath,
 					baseBranch: parent.branch,
@@ -95,6 +99,13 @@ export const chapterFork = {
 				.returning();
 			rollback.push(async () => {
 				await db.delete(chapters).where(eq(chapters.id, id));
+			});
+
+			// Create fork edge in chapter_edges
+			await chapterEdgeService.createForkEdge(parent.projectId, parentChapterId, chapter.id, {
+				commitSha: forkPoint.commitSha,
+				inheritMode: inheritMode,
+				narratorMessageUuid: input.forkAtMessageUuid,
 			});
 
 			// Step 3: Copy project-configured files

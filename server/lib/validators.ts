@@ -38,7 +38,10 @@ export const createChapterSchema = z.object({
 export const updateChapterSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
-	status: z.enum(["active", "dormant", "merged", "abandoned"]).optional(),
+	status: z.enum(["active", "dormant", "merged", "abandoned", "frozen"]).optional(),
+	role: z.enum(["trunk", "branch", "exploration"]).optional(),
+	color: z.string().max(20).nullable().optional(),
+	groupLabel: z.string().max(100).nullable().optional(),
 });
 
 // === Narrators ===
@@ -117,6 +120,7 @@ export const forkChapterSchema = z.object({
 	description: z.string().max(2000).optional(),
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	forkAtMessageUuid: z.string().optional(),
+	role: z.enum(["trunk", "branch", "exploration"]).default("branch"),
 });
 
 export const mergeChapterSchema = z.object({
@@ -360,4 +364,89 @@ export const suggestAnswersSchema = z.object({
 			}),
 		)
 		.min(1),
+});
+
+// === chapter edges ===
+export const createChapterEdgeSchema = z.object({
+	sourceId: z.string().min(1),
+	targetId: z.string().min(1),
+	type: z.enum(["dependency"]),
+	metadata: z
+		.object({
+			description: z.string().max(500).optional(),
+		})
+		.optional(),
+});
+
+// === graph positions ===
+export const updateGraphPositionsSchema = z.object({
+	positions: z
+		.array(
+			z.object({
+				chapterId: z.string().min(1),
+				x: z.number().finite(),
+				y: z.number().finite(),
+			}),
+		)
+		.max(500),
+});
+
+// === chapter split ===
+export const splitChapterSchema = z.object({
+	commitSha: z.string().min(1),
+	newFork: z.object({
+		title: z.string().min(1).max(200),
+		description: z.string().max(2000).optional(),
+		inheritMode: z.enum(["full", "compressed", "fresh"]).default("full"),
+	}),
+});
+
+// === batch fork ===
+export const batchForkSchema = z.object({
+	forks: z
+		.array(
+			z.object({
+				title: z.string().min(1).max(200),
+				description: z.string().max(2000).optional(),
+				inheritMode: z.enum(["full", "compressed", "fresh"]).default("full"),
+				role: z.enum(["trunk", "branch", "exploration"]).default("branch"),
+			}),
+		)
+		.min(1)
+		.max(10),
+});
+
+// === exploration groups ===
+export const createExplorationGroupSchema = z.object({
+	projectId: z.string().min(1),
+	title: z.string().min(1).max(200),
+	description: z.string().max(2000).optional(),
+	baseChapterId: z.string().min(1),
+	branches: z
+		.array(
+			z.object({
+				title: z.string().min(1).max(200),
+				description: z.string().max(2000).optional(),
+				inheritMode: z.enum(["full", "compressed", "fresh"]).default("full"),
+			}),
+		)
+		.min(2)
+		.max(10),
+});
+
+export const updateExplorationGroupSchema = z.object({
+	title: z.string().min(1).max(200).optional(),
+	description: z.string().max(2000).optional(),
+});
+
+// === cherry-pick ===
+export const cherryPickSchema = z.object({
+	sourceChapterId: z.string().min(1),
+	commitShas: z.array(z.string().min(1)).min(1),
+});
+
+// === commits list ===
+export const listCommitsSchema = z.object({
+	since: z.string().optional(),
+	limit: z.coerce.number().int().min(1).max(200).default(50),
 });

@@ -9,6 +9,7 @@ import { settings } from "./lib/settings";
 import { requireAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
 import { authRoutes } from "./routes/auth";
+import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
 import { favoriteRoutes } from "./routes/favorites";
 import { graphRoutes } from "./routes/graph";
@@ -49,6 +50,7 @@ app.use("/api/*", requireAuth);
 
 app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);
+app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);

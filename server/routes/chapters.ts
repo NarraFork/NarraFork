@@ -1,4 +1,7 @@
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { db } from "../db";
+import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import {
@@ -7,6 +10,7 @@ import {
 	containerRemoveSchema,
 	createChapterSchema,
 	forkChapterSchema,
+	listCommitsSchema,
 	mergeChapterSchema,
 	updateChapterSchema,
 } from "../lib/validators";
@@ -190,4 +194,36 @@ chapterRoutes.post("/:id/containers/remove", async (c) => {
 		deleteVolumes: parsed.data.deleteVolumes,
 	});
 	return c.json({ ok: true });
+});
+
+// === Commits ===
+
+chapterRoutes.get("/:id/commits", async (c) => {
+	const id = c.req.param("id");
+	const query = listCommitsSchema.parse({
+		limit: c.req.query("limit"),
+		since: c.req.query("since"),
+	});
+
+	const chapter = await chapterService.getById(id);
+
+	const project = await db.select().from(projects).where(eq(projects.id, chapter.projectId)).get();
+	if (!project?.gitPath) throw new ValidationError("Project has no git path");
+
+	const cwd = chapter.worktreePath || project.gitPath;
+	const args = ["log", `--max-count=${query.limit}`, "--format=%H|%s|%aI"];
+	if (query.since) args.push(`${query.since}..HEAD`);
+
+	const result = Bun.spawnSync(["git", ...args], { cwd });
+	if (result.exitCode !== 0) {
+		throw new ValidationError(`git log failed: ${result.stderr.toString().trim()}`);
+	}
+	const stdout = result.stdout.toString().trim();
+	if (!stdout) return c.json([]);
+
+	const commits = stdout.split("\n").map((line) => {
+		const [sha, message, date] = line.split("|", 3);
+		return { sha, message, date };
+	});
+	return c.json(commits);
 });
