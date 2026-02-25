@@ -10,8 +10,8 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ActionIcon, Box, Divider, Group, NavLink, Text, Tooltip } from "@mantine/core";
-import { IconClearAll, IconGitBranch, IconMessageCircle, IconX } from "@tabler/icons-react";
+import { Box, NavLink, Text } from "@mantine/core";
+import { IconFolder, IconGitBranch, IconMessageCircle, IconX } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef, useState } from "react";
@@ -71,64 +71,32 @@ function tabSortId(tab: RecentTab) {
 	return `${tab.type}:${tab.id}`;
 }
 
-interface RecentTabsProps {
+// === Shared hook: WS subscription + cache updates (mount once in root) ===
+
+interface RecentTabsWSProviderProps {
 	onNavigate?: () => void;
 }
 
-export function RecentTabs({ onNavigate }: RecentTabsProps) {
-	const { t } = useTranslation("nav");
-	const { tabs, removeTab, reorderTabs, clearAll } = useRecentTabs();
-	const pathname = useRouterState({ select: (s) => s.location.pathname });
+/**
+ * Invisible component that maintains the WS connection for recent tabs.
+ * Mount once in the root layout.
+ */
+export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
+	const { tabs } = useRecentTabs();
 	const qc = useQueryClient();
 
-	// DnD sensors: mouse with distance for desktop, touch with delay for long-press
-	const sensors = useSensors(
-		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
-		useSensor(KeyboardSensor),
-	);
-
-	const handleDragEnd = useCallback(
-		(event: DragEndEvent) => {
-			justDragged = true;
-			const { active, over } = event;
-			if (!over || active.id === over.id) return;
-			const oldIndex = tabs.findIndex((t) => tabSortId(t) === active.id);
-			const newIndex = tabs.findIndex((t) => tabSortId(t) === over.id);
-			if (oldIndex === -1 || newIndex === -1) return;
-			const reordered = [...tabs];
-			const [moved] = reordered.splice(oldIndex, 1);
-			reordered.splice(newIndex, 0, moved);
-			reorderTabs(reordered);
-		},
-		[tabs, reorderTabs],
-	);
-
-	const handleRemove = useCallback(
-		(type: RecentTab["type"], id: string) => {
-			removeTab(type, id);
-		},
-		[removeTab],
-	);
-
-	const handleClearAll = useCallback(() => {
-		clearAll();
-	}, [clearAll]);
-
-	// Collect narrator IDs for WS subscription
 	const narratorIds = useMemo(() => {
 		const ids: string[] = [];
 		for (const tab of tabs) {
 			if (tab.type === "session") {
 				ids.push(tab.id);
-			} else if (tab.narratorId) {
+			} else if (tab.type === "chapter" && tab.narratorId) {
 				ids.push(tab.narratorId);
 			}
 		}
 		return ids;
 	}, [tabs]);
 
-	// Subscribe to real-time title/status updates via WS
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: SessionListWSEvent) => {
 			const patch: Partial<Pick<RecentTab, "title" | "status">> = {};
@@ -152,8 +120,6 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 				});
 				if (!changed) return prev;
 
-				// When a tab transitions to "thinking", promote it above all idle tabs
-				// but keep it below existing thinking/waiting/done tabs.
 				if (isPromote) {
 					return promoteAboveIdle(next, narratorId);
 				}
@@ -162,7 +128,6 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 
 			const current = qc.getQueryData<RecentTab[]>(QUERY_KEY);
 			if (isPromote && current) {
-				// Persist the new order after promotion
 				api.reorderRecentTabs(current.map((t) => `${t.type}:${t.id}`)).catch(() => {});
 			}
 			const matched = current?.find(
@@ -175,7 +140,6 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 		[qc],
 	);
 
-	// When another client changes recent tabs, refetch from backend
 	const handleGlobalEvent = useCallback(
 		(event: { type: string }) => {
 			if (event.type === "user:recent_tabs_changed") {
@@ -187,35 +151,87 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 
 	useRecentTabsWS(narratorIds, handleWSUpdate, handleGlobalEvent);
 
-	if (tabs.length === 0) return null;
+	return null;
+}
 
-	const sortIds = tabs.map(tabSortId);
+// === Filtered tab list component ===
+
+interface RecentTabListProps {
+	filter: "project" | "session";
+	onNavigate?: () => void;
+	/** When true, the first tab (if active) removes its top border-radius */
+	firstTabConnected?: boolean;
+}
+
+/**
+ * Renders a filtered subset of recent tabs with DnD, clear button, etc.
+ * `filter="project"` shows project tabs; `filter="session"` shows chapter+session tabs.
+ */
+export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentTabListProps) {
+	const { tabs, removeTab, reorderTabs } = useRecentTabs();
+	const pathname = useRouterState({ select: (s) => s.location.pathname });
+
+	const filtered = useMemo(
+		() =>
+			filter === "project"
+				? tabs.filter((t) => t.type === "project")
+				: tabs.filter((t) => t.type !== "project"),
+		[tabs, filter],
+	);
+
+	const sensors = useSensors(
+		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
+		useSensor(KeyboardSensor),
+	);
+
+	const handleDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			justDragged = true;
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const oldIndex = filtered.findIndex((t) => tabSortId(t) === active.id);
+			const newIndex = filtered.findIndex((t) => tabSortId(t) === over.id);
+			if (oldIndex === -1 || newIndex === -1) return;
+			// Reorder within this group, keep the other group intact
+			const reordered = [...filtered];
+			const [moved] = reordered.splice(oldIndex, 1);
+			reordered.splice(newIndex, 0, moved);
+			const otherGroup = tabs.filter((t) =>
+				filter === "project" ? t.type !== "project" : t.type === "project",
+			);
+			// Invariant: projects always precede sessions in the persisted array,
+			// matching the visual layout in __root.tsx (project list above session list).
+			const full =
+				filter === "project" ? [...reordered, ...otherGroup] : [...otherGroup, ...reordered];
+			reorderTabs(full);
+		},
+		[filtered, tabs, filter, reorderTabs],
+	);
+
+	const handleRemove = useCallback(
+		(type: RecentTab["type"], id: string) => {
+			removeTab(type, id);
+		},
+		[removeTab],
+	);
+
+	if (filtered.length === 0) return null;
+
+	const sortIds = filtered.map(tabSortId);
 
 	return (
-		<Box mt="xs" style={{ overflow: "hidden" }}>
-			<Group justify="flex-end" px="xs" mb={2}>
-				<Divider style={{ flex: 1 }} />
-				<Tooltip label={t("clearAll")} position="right" withArrow>
-					<ActionIcon
-						size={16}
-						variant="subtle"
-						color="gray"
-						onClick={handleClearAll}
-						aria-label={t("clearAll")}
-					>
-						<IconClearAll size={12} />
-					</ActionIcon>
-				</Tooltip>
-			</Group>
+		<Box style={{ overflow: "hidden" }}>
 			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
 				<SortableContext items={sortIds} strategy={verticalListSortingStrategy}>
-					{tabs.map((tab) => (
+					{filtered.map((tab, i) => (
 						<SortableTabItem
 							key={tabSortId(tab)}
 							tab={tab}
 							active={isTabActive(tab, pathname)}
 							onRemove={handleRemove}
 							onNavigate={onNavigate}
+							connectTop={firstTabConnected && i === 0}
 						/>
 					))}
 				</SortableContext>
@@ -224,7 +240,10 @@ export function RecentTabs({ onNavigate }: RecentTabsProps) {
 	);
 }
 
-function isTabActive(tab: RecentTab, pathname: string): boolean {
+export function isTabActive(tab: RecentTab, pathname: string): boolean {
+	if (tab.type === "project") {
+		return pathname === `/projects/${tab.id}`;
+	}
 	if (tab.type === "chapter") {
 		return tab.narratorId ? pathname === `/sessions/${tab.narratorId}` : false;
 	}
@@ -236,15 +255,19 @@ interface SortableTabItemProps {
 	active: boolean;
 	onRemove: (type: RecentTab["type"], id: string) => void;
 	onNavigate?: () => void;
+	/** When true and active, remove top border-radius to connect with nav above */
+	connectTop?: boolean;
 }
 
-function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemProps) {
+function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: SortableTabItemProps) {
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const to =
-		tab.type === "chapter" && tab.narratorId
-			? `/sessions/${tab.narratorId}`
-			: `/sessions/${tab.id}`;
+		tab.type === "project"
+			? `/projects/${tab.id}`
+			: tab.type === "chapter" && tab.narratorId
+				? `/sessions/${tab.narratorId}`
+				: `/sessions/${tab.id}`;
 	const iconColor = STATUS_COLORS[tab.status ?? ""];
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -356,7 +379,9 @@ function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemP
 					}
 					description={tab.subtitle}
 					leftSection={
-						tab.type === "chapter" ? (
+						tab.type === "project" ? (
+							<IconFolder size={14} />
+						) : tab.type === "chapter" ? (
 							<IconGitBranch size={14} color={iconColor} />
 						) : (
 							<IconMessageCircle size={14} color={iconColor} />
@@ -376,7 +401,10 @@ function SortableTabItem({ tab, active, onRemove, onNavigate }: SortableTabItemP
 						/>
 					}
 					styles={{
-						root: { borderRadius: "var(--mantine-radius-sm)", cursor: "pointer" },
+						root: {
+							cursor: "pointer",
+							...(connectTop && active ? { borderTopLeftRadius: 0, borderTopRightRadius: 0 } : {}),
+						},
 						label: { overflow: "hidden" },
 						section: { marginInlineEnd: 4 },
 						description: {

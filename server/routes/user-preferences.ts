@@ -42,9 +42,10 @@ userPreferencesRoutes.get("/", async (c) => {
 		// corrupted data, reset
 	}
 
-	// Enrich tabs with live narrator status from DB
+	// Enrich tabs with live narrator status from DB (skip project tabs)
 	if (recentTabs.length > 0) {
 		const narratorIds = recentTabs
+			.filter((t) => t.type !== "project")
 			.map((t) => (t.type === "session" ? (t.id as string) : (t.narratorId as string)))
 			.filter(Boolean);
 		if (narratorIds.length > 0) {

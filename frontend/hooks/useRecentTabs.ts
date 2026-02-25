@@ -6,7 +6,7 @@ import { queryClient as globalQC } from "../lib/query-client";
 // === Types ===
 
 export interface RecentTab {
-	type: "chapter" | "session";
+	type: "chapter" | "session" | "project";
 	id: string;
 	/** Primary narrator ID — used for WS subscriptions */
 	narratorId?: string;
@@ -65,9 +65,10 @@ export function useRecentTabs() {
 				if (tab.type === "chapter") {
 					qc.removeQueries({ queryKey: ["chapters", tab.id] });
 					if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-				} else {
+				} else if (tab.type === "session") {
 					qc.removeQueries({ queryKey: ["narrators", tab.id] });
 				}
+				// project tabs: no narrator/chapter cache to evict
 			}
 			qc.setQueryData(
 				RECENT_TABS_QUERY_KEY,
@@ -81,20 +82,27 @@ export function useRecentTabs() {
 	});
 
 	const clearMutation = useMutation({
-		mutationFn: () => api.clearRecentTabs(),
-		onMutate: async () => {
+		mutationFn: (keepFilter?: (t: RecentTab) => boolean) => {
+			if (!keepFilter) return api.clearRecentTabs();
+			// Partial clear: persist only the kept tabs via reorder
+			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			const kept = prev.filter(keepFilter);
+			return api.reorderRecentTabs(kept.map((t) => `${t.type}:${t.id}`));
+		},
+		onMutate: async (keepFilter?: (t: RecentTab) => boolean) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			// Evict page data for all tabs
-			for (const tab of prev) {
+			const removed = keepFilter ? prev.filter((t) => !keepFilter(t)) : prev;
+			// Evict page data for removed tabs
+			for (const tab of removed) {
 				if (tab.type === "chapter") {
 					qc.removeQueries({ queryKey: ["chapters", tab.id] });
 					if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-				} else {
+				} else if (tab.type === "session") {
 					qc.removeQueries({ queryKey: ["narrators", tab.id] });
 				}
 			}
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, []);
+			qc.setQueryData(RECENT_TABS_QUERY_KEY, keepFilter ? prev.filter(keepFilter) : []);
 			return { prev };
 		},
 		onError: (_err, _vars, ctx) => {
@@ -137,7 +145,13 @@ export function useRecentTabs() {
 			[reorderMutation],
 		),
 		clearAll: useCallback(() => {
-			clearMutation.mutate();
+			clearMutation.mutate(undefined);
+		}, [clearMutation]),
+		clearProjects: useCallback(() => {
+			clearMutation.mutate((t: RecentTab) => t.type !== "project");
+		}, [clearMutation]),
+		clearSessions: useCallback(() => {
+			clearMutation.mutate((t: RecentTab) => t.type === "project");
 		}, [clearMutation]),
 	};
 }
