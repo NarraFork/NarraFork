@@ -164,10 +164,21 @@ export const TERMINAL_THEMES: TerminalThemeDefinition[] = [
 /** Map of theme key → ITheme for quick lookup */
 export const THEME_MAP = new Map(TERMINAL_THEMES.map((t) => [t.key, t.theme]));
 
-/** Get theme by key, with auto mode support */
-export function getTerminalTheme(key: string, colorScheme?: "light" | "dark"): ITheme {
+/** Get theme by key, with auto mode and OLED support */
+export function getTerminalTheme(
+	key: string,
+	colorScheme?: "light" | "dark",
+	oledMode?: boolean,
+): ITheme {
+	let theme: ITheme;
 	if (key === "auto") {
-		return colorScheme === "light" ? tokyoNightLight : tokyoNight;
+		theme = colorScheme === "light" ? tokyoNightLight : tokyoNight;
+	} else {
+		theme = THEME_MAP.get(key) ?? tokyoNight;
 	}
-	return THEME_MAP.get(key) ?? tokyoNight;
+	// In OLED mode + dark scheme, force pure black background
+	if (oledMode && colorScheme !== "light") {
+		return { ...theme, background: "#000000" };
+	}
+	return theme;
 }

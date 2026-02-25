@@ -3,6 +3,7 @@ import { createTheme, MantineProvider } from "@mantine/core";
 import "@mantine/core/styles.css";
 import { Notifications } from "@mantine/notifications";
 import "@mantine/notifications/styles.css";
+import "@frontend/styles/oled.css";
 
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createRouter, RouterProvider } from "@tanstack/react-router";
@@ -13,6 +14,15 @@ import { routeTree } from "./routeTree.gen";
 
 const theme = createTheme({
 	primaryColor: "indigo",
+	components: {
+		NavLink: {
+			styles: {
+				root: {
+					borderRadius: "var(--mantine-radius-sm)",
+				},
+			},
+		},
+	},
 });
 
 const router = createRouter({

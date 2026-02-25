@@ -5,6 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useTerminalWS } from "../../hooks/useTerminalWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { SelectionPopover } from "../common/SelectionPopover";
@@ -99,6 +100,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const fitAddonRef = useRef<FitAddon | null>(null);
 		const { t } = useTranslation("terminal");
 		const { data: prefs } = useUserPreferences();
+		const [oledMode] = useLocalPref("narrafork_oled");
 		const { colorScheme } = useMantineColorScheme();
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const terminalThemeKey = (prefs as any)?.terminalTheme ?? "auto";
@@ -107,6 +109,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const resolvedTheme = getTerminalTheme(
 			terminalThemeKey,
 			colorScheme === "auto" ? "dark" : colorScheme,
+			oledMode,
 		);
 		const themeBg = resolvedTheme.background ?? TERM_BG;
 		const [xtermSelection, setXtermSelection] = useState<string>("");
