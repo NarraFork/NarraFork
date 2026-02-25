@@ -1,3 +1,4 @@
+import { getOpenaiProviderConfig } from "../settings";
 import { OpenAIProvider } from "./openai-provider";
 import type { AgentToolUse } from "./types";
 
@@ -39,6 +40,8 @@ export interface ParsedStreamEvent {
 		input?: string;
 		stop?: boolean;
 	};
+	/** Internal: set when Responses API format is detected from the gateway */
+	_responsesApi?: boolean;
 }
 
 // === Chat parameters passed to provider.chat() ===
@@ -110,7 +113,9 @@ export interface ProviderAdapter {
 // === Provider resolution ===
 
 export function getProvider(provider: string): ProviderAdapter {
-	if (provider === "openai") {
-		return new OpenAIProvider();
+		const config = getOpenaiProviderConfig(provider);
+		if (config) {
+			return new OpenAIProvider(config);
+		}
 	}
 }

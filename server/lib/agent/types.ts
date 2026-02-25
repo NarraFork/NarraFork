@@ -72,6 +72,11 @@ export type AgentEvent =
 			output: string;
 			isError: boolean;
 			durationMs: number;
+			/** When set, the tool call input was broken (output truncated mid-stream).
+			 *  The event handler should overwrite the persisted inputJson with this value. */
+			brokenInputOverride?: Record<string, unknown>;
+			/** Updated input to display in the UI (for broken calls, the sanitized version). */
+			updatedInput?: Record<string, unknown>;
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
@@ -80,6 +85,10 @@ export type AgentEvent =
 			toolUseId: string;
 			toolName: string;
 			inputCharsTotal: number;
+			/** For Write/Edit tools: extracted file path from the JSON */
+			extractedFilePath?: string;
+			/** For Write/Edit tools: content chars received (excluding file_path field) */
+			contentCharsReceived?: number;
 	  }
 	| {
 			/** A single content block has been fully streamed and is ready for persistence / execution. */

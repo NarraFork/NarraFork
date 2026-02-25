@@ -9,6 +9,36 @@ export interface ModelOption {
 	provider?: string;
 }
 
+export interface OpenAIProviderConfig {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** User-defined display name, e.g. "DeepSeek", "Groq", "OpenAI". */
+	name: string;
+	/**
+	 * User-defined provider prefix used in model IDs, e.g. "openai", "deepseek", "groq".
+	 * Model IDs are formatted as "{prefix}:{model}", e.g. "deepseek:deepseek-chat".
+	 * Must be unique across all providers. Defaults to "openai" for legacy compat.
+	 */
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	defaultModel: string;
+	/** @deprecated Use `apiMode` instead. Kept for backward compatibility. */
+	responsesApi?: boolean;
+	/**
+	 * Which OpenAI API variant to use:
+	 *   - "responses"   — OpenAI Responses API (/responses endpoint, developer role, function_call items)
+	 *   - "completions"  — Standard Chat Completions API (/chat/completions, system role, tool_calls)
+	 *   - "codex"        — Codex: Responses API format to /responses endpoint,
+	 *                       default baseUrl https://chatgpt.com/backend-api/codex,
+	 *                       extra headers (originator, ChatGPT-Account-Id).
+	 * Defaults to "responses".
+	 */
+	apiMode?: "responses" | "completions" | "codex";
+	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
+	codexAccountId?: string;
+}
+
 export interface NarraForkSettings {
 	server: { port: number };
 	paths: { defaultProjectDir: string };
@@ -23,6 +53,7 @@ export interface NarraForkSettings {
 			explore: string;
 			plan: string;
 		};
+		legacyEncoding: boolean;
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -37,7 +68,8 @@ export interface NarraForkSettings {
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
-		legacyEncoding: boolean;
+		/** @deprecated Moved to `agent.legacyEncoding`. Kept for migration. */
+		legacyEncoding?: boolean;
 	};
 	auth: {
 		jwtSecret: string;
@@ -47,20 +79,15 @@ export interface NarraForkSettings {
 		configPath: string;
 		defaultModel?: string;
 	};
-	openai?: {
-		apiKey: string;
-		baseUrl: string;
-		defaultModel: string;
-	};
+	/** Multiple OpenAI-compatible API providers. */
+	openaiProviders?: OpenAIProviderConfig[];
 }
 
 const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778 },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
-		defaultModel: "claude-sonnet",
 		defaultPermissionMode: "default",
-		summaryModel: "claude-haiku",
 		customModels: [],
 		hiddenModels: [],
 		maxTurns: 200,
@@ -68,6 +95,7 @@ const DEFAULTS: NarraForkSettings = {
 			explore: "",
 			plan: "",
 		},
+		legacyEncoding: false,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -82,7 +110,6 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	editor: {
 		type: "vscode",
-		legacyEncoding: false,
 	},
 	auth: {
 		jwtSecret: "",
@@ -123,13 +150,68 @@ export function loadSettings(): NarraForkSettings {
 	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
 	const merged = deepMerge(DEFAULTS, raw);
 
+	let needsSave = false;
+
 	// Auto-generate JWT secret on first run
 	if (!merged.auth.jwtSecret) {
 		merged.auth.jwtSecret = randomBytes(32).toString("hex");
-		saveSettings(merged);
+		needsSave = true;
 	}
 
+	// Migrate editor.legacyEncoding → agent.legacyEncoding
+	if (raw.editor?.legacyEncoding === true && !raw.agent?.legacyEncoding) {
+		merged.agent.legacyEncoding = true;
+		delete (merged.editor as Record<string, unknown>).legacyEncoding;
+		needsSave = true;
+	}
+
+	// Migrate legacy single openai config → openaiProviders array
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
+	const mergedAny = merged as any;
+	if (mergedAny.openai?.apiKey && !merged.openaiProviders?.length) {
+		const legacyId = generateMigrationId();
+		merged.openaiProviders = [
+			{
+				id: legacyId,
+				name: "OpenAI",
+				prefix: "openai",
+				apiKey: mergedAny.openai.apiKey,
+				baseUrl: mergedAny.openai.baseUrl || "",
+				defaultModel: mergedAny.openai.defaultModel || "",
+				responsesApi: mergedAny.openai.responsesApi,
+				apiMode: mergedAny.openai.apiMode,
+				codexAccountId: mergedAny.openai.codexAccountId,
+			},
+		];
+		needsSave = true;
+	}
+
+	// Migrate providers without prefix field (added in multi-provider update)
+	if (merged.openaiProviders?.length) {
+		let migrated = false;
+		for (const p of merged.openaiProviders) {
+			if (!p.prefix) {
+				p.prefix = "openai";
+				migrated = true;
+			}
+		}
+		if (migrated) needsSave = true;
+	}
+
+	// Clean up legacy openai field from settings.json
+	if (mergedAny.openai !== undefined) {
+		delete mergedAny.openai;
+		needsSave = true;
+	}
+
+	if (needsSave) saveSettings(merged);
+
 	return merged;
+}
+
+/** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
+function generateMigrationId(): string {
+	return randomBytes(6).toString("base64url").slice(0, 8);
 }
 
 /** Internal mutable holder — `settings` re-exports its properties via the proxy-like sync in saveSettings. */
@@ -151,8 +233,86 @@ export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
 
 
-/** Resolve provider name for a given model by looking up customModels in settings. */
+/** Registry for external model checkers and listers (avoids circular imports). */
+let openaiModelChecker: ((model: string) => boolean) | null = null;
+let openaiModelLister: (() => string[]) | null = null;
+
+export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
+	openaiModelChecker = checker;
+}
+
+}
+
+export function registerOpenaiModelLister(lister: () => string[]): void {
+	openaiModelLister = lister;
+}
+
+}
+
+/**
+ * Get all available model values (provider:id format), excluding hidden models.
+ */
+export function getVisibleModels(): string[] {
+	const hidden = new Set(settings.agent.hiddenModels ?? []);
+	const openai = openaiModelLister?.() ?? [];
+	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
+	const seen = new Set<string>();
+	const result: string[] = [];
+		if (!seen.has(v) && !hidden.has(v)) {
+			seen.add(v);
+			result.push(v);
+		}
+	}
+	return result;
+}
+
+/**
+ * Parse a model string that may contain a "provider:" prefix.
+ * Supports any provider prefix that is alphanumeric + hyphen + underscore.
+ * Examples:
+ *   "openai:gpt-4o"           → { provider: "openai", model: "gpt-4o" }
+ *   "deepseek:deepseek-chat"  → { provider: "deepseek", model: "deepseek-chat" }
+ *   "gpt-4o"                  → { provider: undefined, model: "gpt-4o" }
+ */
+export function parseModelId(raw?: string): { provider?: string; model: string } {
+	if (!raw) return { model: "" };
+	const idx = raw.indexOf(":");
+	if (idx > 0) {
+		const prefix = raw.slice(0, idx);
+		if (/^[a-zA-Z0-9_-]+$/.test(prefix)) {
+			return { provider: prefix, model: raw.slice(idx + 1) };
+		}
+	}
+	return { model: raw };
+}
+
+/**
+ * Get the OpenAI provider config by its prefix.
+ * If prefix is undefined, returns the first provider (legacy compat).
+ */
+export function getOpenaiProviderConfig(prefix?: string): OpenAIProviderConfig | undefined {
+	const providers = settings.openaiProviders ?? [];
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+/**
+ * Get the provider prefix for a given OpenAI provider config.
+ * Simply returns the config's prefix field.
+ */
+export function openaiProviderPrefix(config: OpenAIProviderConfig): string {
+	return config.prefix;
+}
+
+/** Resolve provider name for a given model (supports "provider:model" prefix). */
 export function resolveProvider(model?: string): string {
+	const { provider: explicit, model: bare } = parseModelId(model);
+	if (explicit) return explicit;
 	const custom = settings.agent.customModels ?? [];
-	const found = custom.find((m) => m.value === model);
+	const found = custom.find((m) => m.value === bare || m.value === model);
+	if (found?.provider) return found.provider;
+	if (openaiModelChecker?.(bare)) return "openai";
+	// If the model is unknown but any OpenAI provider is configured, assume it's an OpenAI model.
+	const providers = settings.openaiProviders ?? [];
+	if (providers.some((p) => p.apiKey)) return providers[0]?.prefix ?? "openai";
 }

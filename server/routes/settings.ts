@@ -2,11 +2,24 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { ValidationError } from "../lib/errors";
 import { loadSettings, type NarraForkSettings, saveSettings } from "../lib/settings";
+import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
 	label: z.string().min(1),
 	provider: z.string().optional(),
+});
+
+const openaiProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
+	responsesApi: z.boolean().optional(),
+	apiMode: z.enum(["responses", "completions", "codex"]).optional(),
+	codexAccountId: z.string().optional(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
@@ -34,6 +47,7 @@ const updateSettingsSchema = z
 						plan: z.string(),
 					})
 					.partial(),
+				legacyEncoding: z.boolean(),
 			})
 			.partial()
 			.optional(),
@@ -57,7 +71,6 @@ const updateSettingsSchema = z
 		editor: z
 			.object({
 				type: z.enum(["vscode", "cursor", "windsurf", "zed"]),
-				legacyEncoding: z.boolean(),
 			})
 			.partial()
 			.optional(),
@@ -67,31 +80,31 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		openai: z
-			.object({
-				apiKey: z.string(),
-				baseUrl: z.string(),
-				defaultModel: z.string(),
-			})
-			.partial()
-			.optional(),
+		openaiProviders: z.array(openaiProviderSchema).optional(),
 	})
 	.strict();
 
 export const settingsRoutes = new Hono();
 
+/** Mask an API key for safe display (show last 4 chars). */
+function maskApiKey(key?: string): string {
+	if (!key) return "";
+	if (key.length <= 4) return "*".repeat(key.length);
+	return `${"*".repeat(8)}${key.slice(-4)}`;
+}
+
 settingsRoutes.get("/", (c) => {
 	const s = loadSettings();
-	// Mask sensitive fields
 	const result = {
 		...s,
 		auth: { ...s.auth, jwtSecret: undefined },
-		openai: s.openai
-			? {
-					...s.openai,
-					apiKey: s.openai.apiKey ? `${"*".repeat(8)}${s.openai.apiKey.slice(-4)}` : "",
-				}
-			: undefined,
+		// Multi-provider — mask all keys
+		openaiProviders: (s.openaiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		openaiModels: getOpenaiCachedModels(),
+		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 	};
 	return c.json(result);
 });
@@ -104,16 +117,26 @@ settingsRoutes.patch("/", async (c) => {
 	const current = loadSettings();
 	const validated = parsed.data;
 
-	// Preserve real API key if frontend sends back the masked value
-	if (validated.openai?.apiKey?.startsWith("*")) {
-		validated.openai.apiKey = current.openai?.apiKey ?? "";
+	// Preserve real API keys for multi-provider
+	if (validated.openaiProviders) {
+		const currentProviders = current.openaiProviders ?? [];
+		for (const p of validated.openaiProviders) {
+			if (p.apiKey?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.apiKey = existing?.apiKey ?? "";
+			}
+		}
 	}
 
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
-		if (val && typeof val === "object" && !Array.isArray(val)) {
+		if (key === "openaiProviders") {
+			// Array — replace entirely, don't merge
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(merged as any)[key] = val;
+		} else if (val && typeof val === "object" && !Array.isArray(val)) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = { ...(current as any)[key], ...val };
 		} else {
@@ -121,17 +144,16 @@ settingsRoutes.patch("/", async (c) => {
 			(merged as any)[key] = val;
 		}
 	}
+
 	saveSettings(merged);
 	// Mask sensitive fields before returning (same logic as GET)
 	const result = {
 		...merged,
 		auth: { ...merged.auth, jwtSecret: undefined },
-		openai: merged.openai
-			? {
-					...merged.openai,
-					apiKey: merged.openai.apiKey ? `${"*".repeat(8)}${merged.openai.apiKey.slice(-4)}` : "",
-				}
-			: undefined,
+		openaiProviders: (merged.openaiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 	};
 	return c.json(result);
 });

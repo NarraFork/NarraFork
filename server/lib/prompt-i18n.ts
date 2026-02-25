@@ -341,6 +341,22 @@ const toolMessages = {
 		"zh-CN":
 			"\n\n[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
 	},
+	// Injected as user content when broken tool calls are stripped from history
+	brokenToolCallReminder: {
+		en: "[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context. IMPORTANT: Do NOT retry with the same large content. You MUST split the work into smaller pieces — write files in sections using Write for the first part, then Edit/append for subsequent parts.]",
+		"zh-CN":
+			"[系统提示：你上一次的 {toolNames} 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。重要：不要用相同的大内容重试。你必须将工作拆分为更小的部分——先用 Write 写入文件的第一部分，然后用 Edit/追加写入后续部分。]",
+	},
+	// Placeholder for broken tool call content in persisted input
+	brokenToolCallInputPlaceholder: {
+		en: "[Content too large for single output — output was truncated]",
+		"zh-CN": "[过长的单次输出，输出被截断]",
+	},
+	// Persisted result for broken tool calls
+	brokenToolCallResult: {
+		en: "Write failed — system requires splitting into smaller segments.",
+		"zh-CN": "写入失败，系统要求改为分小段进行写入",
+	},
 } satisfies Record<string, Record<Locale, string>>;
 
 export type ToolMessageKey = keyof typeof toolMessages;

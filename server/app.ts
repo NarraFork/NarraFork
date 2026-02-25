@@ -15,6 +15,7 @@ import { favoriteRoutes } from "./routes/favorites";
 import { graphRoutes } from "./routes/graph";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
+import { openaiRoutes } from "./routes/openai";
 import { projectRoutes } from "./routes/projects";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
@@ -60,6 +61,7 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
+app.route("/api/openai", openaiRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);
