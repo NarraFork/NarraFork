@@ -63,5 +63,8 @@
 	},
 	"status": {
 		"frozen": "Frozen"
+	},
+	"commitDetail": {
+		"noDiff": "No file changes in this commit."
 	}
 }

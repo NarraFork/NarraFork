@@ -63,5 +63,8 @@
 	},
 	"status": {
 		"frozen": "已冻结"
+	},
+	"commitDetail": {
+		"noDiff": "此提交没有文件变更。"
 	}
 }

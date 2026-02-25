@@ -13,6 +13,8 @@
 	"searchPlaceholder": "Search chapters & messages...",
 	"recentTabs": "Recent",
 	"clearAll": "Clear",
+	"clearProjects": "Clear projects",
+	"clearSessions": "Clear sessions",
 	"noRecentTabs": "No recent tabs",
 	"closeTab": "Close tab"
 }

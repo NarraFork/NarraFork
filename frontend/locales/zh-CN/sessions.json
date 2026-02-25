@@ -31,5 +31,7 @@
 	"sortMessageCount": "消息数量",
 	"sortDescending": "降序",
 	"sortAscending": "升序",
-	"loadingMore": "加载更多..."
+	"loadingMore": "加载更多...",
+	"sessionUnloaded": "会话已暂停 — 标签页长时间未活跃",
+	"sessionUnloadedHint": "连接已释放以节省资源，返回后将自动恢复。"
 }

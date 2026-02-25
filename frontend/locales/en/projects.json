@@ -17,5 +17,9 @@
 	"cloneUrlPlaceholder": "https://github.com/user/repo.git",
 	"cloneBranch": "Branch (optional)",
 	"initPathDescription": "Path where the new repository will be created",
-	"clonePathDescription": "Local path to clone into"
+	"clonePathDescription": "Local path to clone into",
+	"deleteProject": "Delete Project",
+	"deleteProjectConfirm": "Are you sure you want to delete \"{{name}}\"? This will remove all chapters, narrators, terminals, and containers. The original repository files will not be affected.",
+	"deleteProjectTypeName": "Type the project name to confirm:",
+	"projectDeleted": "Project deleted"
 }

@@ -31,5 +31,7 @@
 	"sortMessageCount": "Messages",
 	"sortDescending": "Descending",
 	"sortAscending": "Ascending",
-	"loadingMore": "Loading more..."
+	"loadingMore": "Loading more...",
+	"sessionUnloaded": "Session paused — tab was inactive",
+	"sessionUnloadedHint": "The connection was released to save resources. It will restore automatically."
 }

@@ -17,5 +17,9 @@
 	"cloneUrlPlaceholder": "https://github.com/user/repo.git",
 	"cloneBranch": "分支（可选）",
 	"initPathDescription": "新仓库将创建在此路径",
-	"clonePathDescription": "克隆到本地的路径"
+	"clonePathDescription": "克隆到本地的路径",
+	"deleteProject": "删除项目",
+	"deleteProjectConfirm": "确定要删除「{{name}}」吗？这将移除所有章节、叙述者、终端和容器。原始仓库文件不会受到影响。",
+	"deleteProjectTypeName": "输入项目名称以确认：",
+	"projectDeleted": "项目已删除"
 }
