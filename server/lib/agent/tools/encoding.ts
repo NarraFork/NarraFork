@@ -4,7 +4,7 @@ import jschardet from "jschardet";
 
 /**
  * Encoding-aware file reading.
- * When `settings.editor.legacyEncoding` is enabled, detects the file encoding
+ * When `settings.agent.legacyEncoding` is enabled, detects the file encoding
  * (e.g. GBK, Shift_JIS) and decodes accordingly. Otherwise falls back to
  * Bun's default UTF-8 `.text()`.
  *
@@ -16,7 +16,7 @@ const CONFIDENCE_THRESHOLD = 0.7;
 export async function readFileText(path: string): Promise<{ text: string; encoding: string }> {
 	const file = Bun.file(path);
 
-	if (!settings.editor.legacyEncoding) {
+	if (!settings.agent.legacyEncoding) {
 		return { text: await file.text(), encoding: "utf-8" };
 	}
 
@@ -38,7 +38,7 @@ export async function writeFileText(
 	content: string,
 	encoding = "utf-8",
 ): Promise<void> {
-	if (!settings.editor.legacyEncoding || isUtf8(encoding)) {
+	if (!settings.agent.legacyEncoding || isUtf8(encoding)) {
 		await Bun.write(path, content);
 		return;
 	}

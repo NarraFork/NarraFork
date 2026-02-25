@@ -106,7 +106,11 @@ function convertObject(schema: z.ZodObject): Record<string, unknown> {
 		}
 	}
 
-	const result: Record<string, unknown> = { type: "object", properties };
+	const result: Record<string, unknown> = {
+		type: "object",
+		properties,
+		additionalProperties: false,
+	};
 	if (required.length > 0) result.required = required;
 	return result;
 }

@@ -27,7 +27,7 @@ beforeAll(() => {
 afterAll(() => {
 	rmSync(TEST_DIR, { recursive: true, force: true });
 	// Restore setting
-	settings.editor.legacyEncoding = false;
+	settings.agent.legacyEncoding = false;
 });
 
 describe("Legacy encoding support", () => {
@@ -41,21 +41,21 @@ describe("Legacy encoding support", () => {
 	});
 
 	test("read garbles GBK when legacyEncoding is off", async () => {
-		settings.editor.legacyEncoding = false;
+		settings.agent.legacyEncoding = false;
 		const result = await readTool.execute({ file_path: GBK_FILE }, makeCtx());
 		// UTF-8 decoding of GBK bytes produces garbled text
 		expect(result.output).not.toContain("你好世界");
 	});
 
 	test("read decodes GBK correctly when legacyEncoding is on", async () => {
-		settings.editor.legacyEncoding = true;
+		settings.agent.legacyEncoding = true;
 		const result = await readTool.execute({ file_path: GBK_FILE }, makeCtx());
 		expect(result.output).toContain("你好世界");
 		expect(result.output).toContain("这是GBK编码的文件");
 	});
 
 	test("edit preserves GBK encoding when legacyEncoding is on", async () => {
-		settings.editor.legacyEncoding = true;
+		settings.agent.legacyEncoding = true;
 		const result = await editTool.execute(
 			{ file_path: GBK_FILE, old_string: "你好世界", new_string: "再见世界" },
 			makeCtx(),
@@ -70,7 +70,7 @@ describe("Legacy encoding support", () => {
 	});
 
 	test("edit with legacyEncoding off corrupts GBK file", async () => {
-		settings.editor.legacyEncoding = false;
+		settings.agent.legacyEncoding = false;
 		// This will fail to find the old_string because UTF-8 decoding garbles it
 		const result = await editTool.execute(
 			{ file_path: GBK_FILE, old_string: "你好世界", new_string: "再见世界" },
@@ -83,7 +83,7 @@ describe("Legacy encoding support", () => {
 		const UTF8_FILE = join(TEST_DIR, "utf8-test.txt");
 		writeFileSync(UTF8_FILE, "你好世界\nUTF-8编码\n");
 
-		settings.editor.legacyEncoding = true;
+		settings.agent.legacyEncoding = true;
 		const readResult = await readTool.execute({ file_path: UTF8_FILE }, makeCtx());
 		expect(readResult.output).toContain("你好世界");
 

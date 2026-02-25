@@ -128,6 +128,10 @@ export async function processEvent(
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				inputCharsTotal: event.inputCharsTotal,
+				...(event.extractedFilePath && { extractedFilePath: event.extractedFilePath }),
+				...(event.contentCharsReceived != null && {
+					contentCharsReceived: event.contentCharsReceived,
+				}),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
@@ -261,6 +265,11 @@ export async function processEvent(
 					errorMessage: event.isError ? event.output : undefined,
 					durationMs: event.durationMs,
 				});
+				// Broken tool call: overwrite the persisted inputJson with a sanitized
+				// version (large content fields replaced with a short placeholder).
+				if (event.brokenInputOverride) {
+					await narratorService.overwriteToolCallInput(event.toolUseId, event.brokenInputOverride);
+				}
 			} catch (err) {
 				logger.error("Failed to persist tool result", {
 					narratorId,
@@ -276,6 +285,7 @@ export async function processEvent(
 				status,
 				output: event.output,
 				durationMs: event.durationMs,
+				...(event.updatedInput && { updatedInput: event.updatedInput }),
 			});
 
 			// Main narrator: git tracking

@@ -8,12 +8,6 @@ import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
-/**
- * Approximate character threshold for detecting output truncation by the API.
- * limit the content was likely cut off mid-stream.
- */
-const TRUNCATION_SUSPECT_THRESHOLD = 28_000;
-
 /** Max size of output pushed via tool_output events (UI preview only). */
 const MAX_STREAM_OUTPUT_LENGTH = 30_000;
 
@@ -102,6 +96,10 @@ export async function* agentLoop(
 		provider.injectSystemPrompt(history, config.systemPrompt, config.model, config.locale);
 	}
 
+	// Extra content to prepend to the next turn's user message (e.g. broken-tool reminder).
+	// Consumed once and reset to empty after use.
+	let nextTurnContent = "";
+
 	while (turnIndex < maxTurns) {
 		if (config.signal.aborted) {
 			yield { type: "error", message: "Aborted" };
@@ -122,7 +120,8 @@ export async function* agentLoop(
 			}
 		}
 
-		const content = isFirstTurn ? userText : "";
+		const content = isFirstTurn ? userText : nextTurnContent;
+		nextTurnContent = ""; // consume once
 
 		// Call provider and collect the response
 		let assistantText = "";
@@ -133,7 +132,13 @@ export async function* agentLoop(
 		// Accumulator for streaming tool use events (input arrives in chunks)
 		const toolUseAccum = new Map<
 			string,
-			{ name: string; inputChunks: string[]; totalChars: number; startedAt: number }
+			{
+				name: string;
+				inputChunks: string[];
+				totalChars: number;
+				startedAt: number;
+				extractedFilePath?: string;
+			}
 		>();
 
 		try {
@@ -180,11 +185,31 @@ export async function* agentLoop(
 							if (typeof input === "string") {
 								acc.inputChunks.push(input);
 								acc.totalChars += input.length;
+
+								// For Write/Edit tools, try to extract file_path from first chunk
+								if (!acc.extractedFilePath && (acc.name === "Write" || acc.name === "Edit")) {
+									const raw = acc.inputChunks.join("");
+									const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
+									if (filePathMatch) {
+										acc.extractedFilePath = filePathMatch[1];
+									}
+								}
+
+								// Calculate content chars (total minus file_path JSON overhead)
+								let contentChars = acc.totalChars;
+								if (acc.extractedFilePath) {
+									// Rough estimate: subtract the file_path field size
+									const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
+									contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+								}
+
 								yield {
 									type: "tool_use_chunk",
 									toolUseId: id,
 									toolName: acc.name,
 									inputCharsTotal: acc.totalChars,
+									...(acc.extractedFilePath && { extractedFilePath: acc.extractedFilePath }),
+									...(acc.extractedFilePath && { contentCharsReceived: contentChars }),
 								};
 							}
 							if (stop) {
@@ -297,18 +322,60 @@ export async function* agentLoop(
 			return;
 		}
 
-		// Yield block_complete for the text portion (if any) now that streaming is done
-		if (assistantText) {
-			yield { type: "block_complete", block: { type: "text", text: assistantText } };
+		// Detect orphaned tool uses — tool calls whose streaming input was cut off
+		// before receiving a stop signal (typically due to API max_tokens truncation).
+		// These are silently dropped by the accumulator, so we must detect and handle them.
+		const hasOrphanedToolUses = toolUseAccum.size > 0;
+		if (hasOrphanedToolUses) {
+			const orphanedNames = [...toolUseAccum.values()].map((a) => a.name).join(", ");
+			toolUseAccum.clear();
+
+			// Yield text block if any was accumulated before the truncation
+			if (assistantText) {
+				yield { type: "block_complete", block: { type: "text", text: assistantText } };
+			}
+
+			// Persist the assistant message (only the complete tool calls survive)
+			yield {
+				type: "assistant_message",
+				text: assistantText,
+				toolUses,
+				messageId,
+			};
+
+			if (toolUses.length === 0) {
+				// No complete tool calls at all — push the text-only assistant turn
+				// and inject a reminder so the model retries with a different strategy.
+				provider.pushAssistantTurn(history, assistantText, []);
+				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
+					toolNames: orphanedNames,
+				});
+				yield { type: "turn_complete", turnIndex };
+				turnIndex++;
+				continue;
+			}
+			// Some complete tool calls exist alongside orphaned ones — fall through
+			// to execute them. The orphaned ones are already gone from toolUses.
+			// Set nextTurnContent so the model gets a reminder after execution.
+			nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
+				toolNames: orphanedNames,
+			});
 		}
 
-		// Yield the complete assistant message
-		yield {
-			type: "assistant_message",
-			text: assistantText,
-			toolUses,
-			messageId,
-		};
+		if (!hasOrphanedToolUses) {
+			// Yield block_complete for the text portion (if any) now that streaming is done
+			if (assistantText) {
+				yield { type: "block_complete", block: { type: "text", text: assistantText } };
+			}
+
+			// Yield the complete assistant message
+			yield {
+				type: "assistant_message",
+				text: assistantText,
+				toolUses,
+				messageId,
+			};
+		}
 
 		// No tool calls → we're done
 		if (toolUses.length === 0) {
@@ -336,6 +403,10 @@ export async function* agentLoop(
 					maxTurns,
 				})
 			: "";
+
+		// Track tool calls whose input was broken (output cut off mid-stream).
+		// These will be stripped from the history to avoid polluting context.
+		const brokenToolUseIds = new Set<string>();
 
 		// Group tool calls into runs: consecutive Task calls form a parallel batch,
 		// everything else executes serially (one tool per group).
@@ -377,6 +448,7 @@ export async function* agentLoop(
 				}
 
 				const result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
+				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 				const isLastTool = toolIndex === toolUses.length - 1;
 				const outputForModel =
 					isLastTool && shouldNudge ? result.output + nudgeText : result.output;
@@ -393,13 +465,25 @@ export async function* agentLoop(
 					durationMs = Math.max(adjusted, result.durationMs);
 				}
 				prevToolsExecMs += result.durationMs;
+
+				// For broken tool calls, sanitize the persisted input and output
+				// so the DB shows a clean message instead of truncated garbage.
+				const brokenInputOverride = result.broken
+					? sanitizeBrokenInput(tu.name, tu.input, locale)
+					: undefined;
+				const displayOutput = result.broken
+					? getToolMessage("brokenToolCallResult", locale)
+					: result.output;
+
 				yield {
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
-					output: result.output,
+					output: displayOutput,
 					isError: result.isError ?? false,
 					durationMs,
+					brokenInputOverride,
+					updatedInput: brokenInputOverride,
 				};
 				toolIndex++;
 
@@ -430,6 +514,7 @@ export async function* agentLoop(
 				for (let j = 0; j < group.length; j++) {
 					const tu = group[j];
 					const result = results[j];
+					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 					const isLastTool = toolIndex === toolUses.length - 1;
 					const outputForModel =
 						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
@@ -437,13 +522,23 @@ export async function* agentLoop(
 					pendingToolResults.push(
 						provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
 					);
+
+					const brokenInputOverride = result.broken
+						? sanitizeBrokenInput(tu.name, tu.input, locale)
+						: undefined;
+					const displayOutput = result.broken
+						? getToolMessage("brokenToolCallResult", locale)
+						: result.output;
+
 					yield {
 						type: "tool_result",
 						toolUseId: tu.toolUseId,
 						toolName: tu.name,
-						output: result.output,
+						output: displayOutput,
 						isError: result.isError ?? false,
 						durationMs: result.durationMs,
+						brokenInputOverride,
+						updatedInput: brokenInputOverride,
 					};
 					toolIndex++;
 					if (result.durationMs > maxParallelMs) maxParallelMs = result.durationMs;
@@ -460,8 +555,29 @@ export async function* agentLoop(
 			}
 		}
 
-		// Append assistant message to history for next turn
-		provider.pushAssistantTurn(history, assistantText, toolUses);
+		// Strip broken tool calls from the history sent to the model.
+		// The UI already has the full picture (tool_result events were yielded above),
+		// but the model should not see the broken tool_use + tool_result pair —
+		// they waste context and cause retry loops.
+		if (brokenToolUseIds.size > 0) {
+			const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
+			pendingToolResults = pendingToolResults.filter(
+				(tr) => !brokenToolUseIds.has((tr as { toolUseId: string }).toolUseId),
+			);
+			provider.pushAssistantTurn(history, assistantText, cleanToolUses);
+
+			// Inject a user-side reminder so the model knows what happened and
+			// switches strategy instead of blindly retrying the same large write.
+			const brokenNames = toolUses
+				.filter((tu) => brokenToolUseIds.has(tu.toolUseId))
+				.map((tu) => tu.name);
+			nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
+				toolNames: brokenNames.join(", "),
+			});
+		} else {
+			// Append assistant message to history for next turn
+			provider.pushAssistantTurn(history, assistantText, toolUses);
+		}
 
 		yield { type: "turn_complete", turnIndex };
 		turnIndex++;
@@ -477,6 +593,11 @@ interface ToolExecResult {
 	isError?: boolean;
 	durationMs: number;
 	fatal?: boolean;
+	/** Set when the tool call was rejected because the model's output was
+	 *  cut off mid-stream (malformed JSON, suspiciously large content, etc.).
+	 *  The loop will strip this tool_use + tool_result from the history sent
+	 *  to the model and inject a user-side reminder instead. */
+	broken?: boolean;
 }
 
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
@@ -511,6 +632,21 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	const start = Date.now();
 
 	const effectiveInput = permission.updatedInput ?? tu.input;
+
+	// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
+	if ("_raw" in effectiveInput) {
+		const rawLen = typeof effectiveInput._raw === "string" ? effectiveInput._raw.length : 0;
+		return {
+			output:
+				`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
+				`The ${tu.name} was NOT executed to avoid corrupting files. ` +
+				"The response likely hit the output token limit. " +
+				"Please retry with smaller content — split large writes into multiple calls.",
+			isError: true,
+			durationMs: Date.now() - start,
+			broken: true,
+		};
+	}
 
 	// Validate parameters
 	const parsed = tool.parameters.safeParse(effectiveInput);
@@ -577,18 +713,6 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	}
 
 	try {
-		// Detect likely output truncation for file-writing tools BEFORE execution.
-		// When the API's max output token limit cuts off the response mid-stream,
-		// Write/Edit receive incomplete content. Reject early to avoid writing
-		// broken files, and tell the model to split the work.
-		const truncationHint = detectWriteTruncation(tu.name, effectiveInput);
-		if (truncationHint) {
-			return {
-				output: truncationHint,
-				isError: true,
-				durationMs: Date.now() - start,
-			};
-		}
 		const result = await tool.execute(effectiveInput, ctx);
 		// If the tool already truncated its output, pass through as-is.
 		if (result.truncated) {
@@ -619,37 +743,43 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 }
 
 /**
- * Check if a Write or Edit tool call likely received truncated content
- *
- * Returns an error message to feed back to the model, or null if no
- * truncation is suspected.
+ * Build a sanitized version of a broken tool call's input for DB persistence.
+ * Keeps structural parameters (file_path, etc.) but replaces large content
+ * fields with a short placeholder so the DB record is readable.
  */
-function detectWriteTruncation(toolName: string, input: Record<string, unknown>): string | null {
-	if (toolName === "Write") {
-		const content = input.content;
-		if (typeof content === "string" && content.length >= TRUNCATION_SUSPECT_THRESHOLD) {
-			return (
-				`The content appears to have been truncated by the output token limit (${content.length} chars received). ` +
-				"The file was NOT written to avoid saving incomplete content. " +
-				"Please split the work: write the file in smaller sections using Write for the initial content, " +
-				"then use Edit to append or modify additional sections."
-			);
+function sanitizeBrokenInput(
+	_toolName: string,
+	input: Record<string, unknown>,
+	locale: string,
+): Record<string, unknown> {
+	const placeholder = getToolMessage("brokenToolCallInputPlaceholder", (locale as Locale) ?? "en");
+	const clean: Record<string, unknown> = {};
+
+	// If input is just { _raw: "..." }, extract file_path and note the raw length
+	if ("_raw" in input && Object.keys(input).length === 1) {
+		const raw = input._raw as string;
+		// Try to extract file_path from the incomplete JSON
+		const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
+		clean.file_path = filePathMatch ? filePathMatch[1] : "[Unknown]";
+		clean.content = `${placeholder} (${raw.length} chars received)`;
+	} else {
+		// Normal case: copy non-content fields, replace content fields
+		for (const [key, value] of Object.entries(input)) {
+			if (key === "_raw") continue;
+			if (key === "content" || key === "old_string" || key === "new_string") {
+				clean[key] = placeholder;
+			} else {
+				clean[key] = value;
+			}
+		}
+		// Ensure file_path exists for Write/Edit tools
+		if (!("file_path" in clean) && !("old_string" in clean)) {
+			clean.file_path = "[Unknown]";
+		}
+		if (!("content" in clean) && !("old_string" in clean) && !("new_string" in clean)) {
+			clean.content = placeholder;
 		}
 	}
-	if (toolName === "Edit") {
-		const oldStr = input.old_string;
-		const newStr = input.new_string;
-		const oldLen = typeof oldStr === "string" ? oldStr.length : 0;
-		const newLen = typeof newStr === "string" ? newStr.length : 0;
-		if (oldLen >= TRUNCATION_SUSPECT_THRESHOLD || newLen >= TRUNCATION_SUSPECT_THRESHOLD) {
-			return (
-				`The edit parameters appear to have been truncated by the output token limit ` +
-				`(old_string: ${oldLen} chars, new_string: ${newLen} chars). ` +
-				"The edit was NOT applied. " +
-				"Please split the edit into smaller chunks — edit one function or section at a time " +
-				"instead of replacing large blocks in a single call."
-			);
-		}
-	}
-	return null;
+
+	return clean;
 }

@@ -1,17 +1,16 @@
 import { normalize, resolve } from "node:path";
 import { z } from "zod/v4";
-import { settings } from "../../settings";
+import { getVisibleModels } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
 
-const BUILTIN_MODELS = ["claude-haiku", "claude-sonnet", "claude-opus"];
-
-/** Build a dynamic model list string from builtins + custom models. */
+/** Build a dynamic model list string from all visible models. */
 function getAvailableModelsList(): string {
-	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
-	return [...BUILTIN_MODELS, ...custom].join(", ");
+	const models = getVisibleModels();
+	return models.length > 0
+		? models.join(", ")
 }
 
 function buildParameters() {

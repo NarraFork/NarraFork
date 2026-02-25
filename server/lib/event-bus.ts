@@ -135,8 +135,12 @@ class NarraForkEventBus {
 		this.emitter.setMaxListeners(100);
 	}
 
+	private static SILENT_EVENTS: Set<string> = new Set(["user:recent_tabs_changed"]);
+
 	emit(event: NarraForkEvent): void {
-		logger.debug("Event emitted", { eventType: event.type, ...event });
+		if (!NarraForkEventBus.SILENT_EVENTS.has(event.type)) {
+			logger.debug("Event emitted", { eventType: event.type, ...event });
+		}
 		// Manually iterate listeners with try-catch so one failure doesn't break others
 		for (const eventName of [event.type, "*"]) {
 			const listeners = this.emitter.rawListeners(eventName);

@@ -741,7 +741,7 @@ export const narratorService = {
 	 *    individual `{ type: "message" }` events so the frontend's
 	 *    `insertChildIntoCache` can place them correctly.
 	 */
-	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 200) {
+	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 40) {
 		// Find the seq of the reference message
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -750,9 +750,28 @@ export const narratorService = {
 			),
 			columns: { seq: true },
 		});
-		if (!ref) return { topLevel: [], orphanChildren: [] };
+		if (!ref) return { topLevel: [], orphanChildren: [], hitLimit: true };
 
-		// Fetch ALL messages (top-level + children) with seq > ref.seq
+		// Cheap COUNT to decide catch-up vs full-reload before fetching payloads.
+		// We count only top-level messages (parentToolUseId IS NULL) because child
+		// messages inflate the row count dramatically — a single assistant turn with
+		// tool calls can produce dozens of child refs.
+		const [{ cnt }] = await db
+			.select({ cnt: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gt(narratorMessageRefs.seq, ref.seq),
+					sql`${narratorMessages.parentToolUseId} IS NULL`,
+				),
+			);
+		if (cnt > limit) return { topLevel: [], orphanChildren: [], hitLimit: true };
+
+		// Fetch ALL messages (top-level + children) with seq > ref.seq.
+		// The COUNT check above already confirmed the top-level count is within
+		// bounds, so we use a generous hard cap here to include child messages.
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -763,9 +782,9 @@ export const narratorService = {
 				and(eq(narratorMessageRefs.narratorId, narratorId), gt(narratorMessageRefs.seq, ref.seq)),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-			.limit(limit);
+			.limit(10_000);
 
-		if (refRows.length === 0) return { topLevel: [], orphanChildren: [] };
+		if (refRows.length === 0) return { topLevel: [], orphanChildren: [], hitLimit: false };
 
 		const messageIds = refRows.map((r) => r.messageId);
 		const allMessages = await db.query.narratorMessages.findMany({
@@ -860,7 +879,11 @@ export const narratorService = {
 				.map((c) => ({ ...c, children: [] }));
 		}
 
-		return { topLevel: tree, orphanChildren: truncateToolIO(orphanChildren) };
+		return {
+			topLevel: tree,
+			orphanChildren: truncateToolIO(orphanChildren),
+			hitLimit: false,
+		};
 	},
 
 	/**
@@ -1695,6 +1718,42 @@ export const narratorService = {
 				durationMs: result.durationMs ?? null,
 			})
 			.where(eq(narratorToolCalls.toolUseId, toolUseId));
+	},
+
+	/** Overwrite the persisted inputJson for a tool call (used for broken/truncated calls).
+	 *  Also patches the corresponding tool_use block in the parent message's contentJson. */
+	async overwriteToolCallInput(toolUseId: string, input: Record<string, unknown>) {
+		logger.info("Overwriting broken tool call input", { toolUseId, inputKeys: Object.keys(input) });
+		// Update the tool_calls table
+		await db
+			.update(narratorToolCalls)
+			.set({ inputJson: input })
+			.where(eq(narratorToolCalls.toolUseId, toolUseId));
+
+		// Also patch the contentJson in the parent message so the UI shows
+		// the sanitized input instead of the truncated garbage.
+		const tc = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			columns: { messageId: true },
+		});
+		if (tc?.messageId) {
+			const msg = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, tc.messageId),
+				columns: { contentJson: true },
+			});
+			if (msg?.contentJson && Array.isArray(msg.contentJson)) {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				const patched = (msg.contentJson as any[]).map((block: any) =>
+					block.type === "tool_use" && block.id === toolUseId
+						? { ...block, input }
+						: block,
+				);
+				await db
+					.update(narratorMessages)
+					.set({ contentJson: patched })
+					.where(eq(narratorMessages.id, tc.messageId));
+			}
+		}
 	},
 
 	async remove(narratorId: string) {
