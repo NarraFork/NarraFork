@@ -12,9 +12,11 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
+	useComputedColorScheme,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconLogout, IconSearch, IconX } from "@tabler/icons-react";
+import { IconClearAll, IconLogout, IconSearch, IconX } from "@tabler/icons-react";
 import type { QueryClient } from "@tanstack/react-query";
 import {
 	createRootRouteWithContext,
@@ -26,9 +28,11 @@ import {
 } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { RecentTabs } from "../components/nav/RecentTabs";
+import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
+import { useLocalPref } from "../hooks/useLocalPref";
+import { useRecentTabs } from "../hooks/useRecentTabs";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { type ApiError, clearToken, getToken } from "../lib/api";
 
@@ -59,6 +63,10 @@ function AuthenticatedLayout() {
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
+	const { tabs, clearProjects, clearSessions } = useRecentTabs();
+	const [oledMode] = useLocalPref("narrafork_oled");
+	const computedScheme = useComputedColorScheme("dark");
+	const pathname = useRouterState({ select: (s) => s.location.pathname });
 
 	// Sync language from backend preference on login / app init
 	useEffect(() => {
@@ -66,6 +74,32 @@ function AuthenticatedLayout() {
 			i18n.changeLanguage(prefs.language);
 		}
 	}, [prefs?.language, i18n]);
+
+	// Sync OLED mode data attribute on <html>
+	useEffect(() => {
+		const html = document.documentElement;
+		if (oledMode) {
+			html.setAttribute("data-oled", "true");
+		} else {
+			html.removeAttribute("data-oled");
+		}
+	}, [oledMode]);
+
+	// Sync theme-color meta tag with actual background color
+	useEffect(() => {
+		const color = computedScheme === "dark" ? (oledMode ? "#000000" : "#1a1b1e") : "#ffffff";
+		for (const el of document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')) {
+			el.setAttribute("content", color);
+		}
+	}, [computedScheme, oledMode]);
+
+	// Fullscreen mode preference (local-only)
+	useEffect(() => {
+		const fullscreen = localStorage.getItem("narrafork_fullscreen") === "true";
+		if (fullscreen) {
+			document.documentElement.requestFullscreen?.().catch(() => {});
+		}
+	}, []);
 
 	const hasToken = !!getToken();
 
@@ -96,6 +130,12 @@ function AuthenticatedLayout() {
 			setSearchOpen(false);
 		}
 	};
+
+	// Check if the first tab in each group is active — used for connected border-radius
+	const projectTabs = tabs.filter((t) => t.type === "project");
+	const sessionTabs = tabs.filter((t) => t.type !== "project");
+	const firstProjectTabActive = projectTabs.length > 0 && isTabActive(projectTabs[0], pathname);
+	const firstSessionTabActive = sessionTabs.length > 0 && isTabActive(sessionTabs[0], pathname);
 
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
@@ -175,17 +215,93 @@ function AuthenticatedLayout() {
 			</AppShell.Header>
 
 			<AppShell.Navbar p="md" style={{ display: "flex", flexDirection: "column" }}>
+				<RecentTabsWSProvider />
 				<Box>
 					<NavLink component={Link} to="/" label={t("dashboard")} onClick={closeNav} />
-					<NavLink component={Link} to="/projects" label={t("projects")} onClick={closeNav} />
-					<NavLink component={Link} to="/sessions" label={t("sessions")} onClick={closeNav} />
+					<NavLink
+						component={Link}
+						to="/projects"
+						label={t("projects")}
+						onClick={closeNav}
+						styles={
+							firstProjectTabActive
+								? {
+										root: {
+											borderBottomLeftRadius: 0,
+											borderBottomRightRadius: 0,
+										},
+									}
+								: undefined
+						}
+						rightSection={
+							tabs.some((t) => t.type === "project") ? (
+								<Tooltip label={t("clearProjects")} position="right" withArrow>
+									<ActionIcon
+										size={20}
+										variant="subtle"
+										color="gray"
+										onClick={(e: React.MouseEvent) => {
+											e.preventDefault();
+											e.stopPropagation();
+											clearProjects();
+										}}
+										aria-label={t("clearProjects")}
+									>
+										<IconClearAll size={14} />
+									</ActionIcon>
+								</Tooltip>
+							) : undefined
+						}
+					/>
+				</Box>
+				<Box style={{ overflow: "auto", minHeight: 0 }}>
+					<RecentTabList filter="project" onNavigate={closeNav} firstTabConnected />
+				</Box>
+				<Box>
+					<NavLink
+						component={Link}
+						to="/sessions"
+						label={t("sessions")}
+						onClick={closeNav}
+						styles={
+							firstSessionTabActive
+								? {
+										root: {
+											borderBottomLeftRadius: 0,
+											borderBottomRightRadius: 0,
+										},
+									}
+								: undefined
+						}
+						rightSection={
+							tabs.some((t) => t.type !== "project") ? (
+								<Tooltip label={t("clearSessions")} position="right" withArrow>
+									<ActionIcon
+										size={20}
+										variant="subtle"
+										color="gray"
+										onClick={(e: React.MouseEvent) => {
+											e.preventDefault();
+											e.stopPropagation();
+											clearSessions();
+										}}
+										aria-label={t("clearSessions")}
+									>
+										<IconClearAll size={14} />
+									</ActionIcon>
+								</Tooltip>
+							) : undefined
+						}
+					/>
+				</Box>
+				<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+					<RecentTabList filter="session" onNavigate={closeNav} firstTabConnected />
+				</Box>
+				<Box>
 					{user?.role === "admin" && (
 						<NavLink component={Link} to="/admin" label={t("admin")} onClick={closeNav} />
 					)}
 					<NavLink component={Link} to="/settings" label={t("settings")} onClick={closeNav} />
-				</Box>
-				<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-					<RecentTabs onNavigate={closeNav} />
 				</Box>
 				<NavLink
 					label={t("logout")}

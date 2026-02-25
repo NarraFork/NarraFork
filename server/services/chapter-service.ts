@@ -1,7 +1,16 @@
 import { resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, containerInstances, narrators, portAllocations, projects } from "../db/schema";
+import {
+	chapters,
+	containerInstances,
+	mergeSessions,
+	narrators,
+	portAllocations,
+	projects,
+	terminalTabs,
+	terminalViewState,
+} from "../db/schema";
 import { chapterLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -274,6 +283,72 @@ export const chapterService = {
 			const [updated] = await db.update(chapters).set(set).where(eq(chapters.id, id)).returning();
 			if (!updated) throw new NotFoundError("Chapter", id);
 			return updated;
+		});
+	},
+
+	/**
+	 * Remove a chapter as part of project deletion.
+	 * Unlike `remove()`, this skips the isRoot guard and deletes ALL narrators
+	 * (instead of detaching them) since the entire project is being destroyed.
+	 */
+	async removeForProjectDeletion(id: string, projectGitPath: string | null) {
+		return chapterLock.acquire(id, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, id),
+			});
+			if (!chapter) return;
+
+			// Delete ALL narrators — no detach since the project is being removed
+			const chapterNarrators = await db.query.narrators.findMany({
+				where: eq(narrators.chapterId, id),
+			});
+			for (const narrator of chapterNarrators) {
+				await narratorService.remove(narrator.id);
+			}
+
+			// Kill running terminals and delete records
+			await terminalService.cleanupForChapter(id);
+
+			// Clean up tables that reference chapters without onDelete cascade
+			await db.delete(terminalTabs).where(eq(terminalTabs.chapterId, id));
+			await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
+			await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
+
+			// Stop and remove containers
+			try {
+				await containerService.removeChapterContainers(id, { deleteVolumes: true });
+			} catch (err) {
+				logger.warn("Failed to remove containers during project delete", {
+					chapterId: id,
+					error: String(err),
+				});
+				await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+			}
+
+			// Clean up git worktree — skip root chapters (their worktreePath is the repo itself)
+			if (chapter.worktreePath && projectGitPath && !chapter.isRoot) {
+				try {
+					await gitService.removeWorktree(projectGitPath, chapter.worktreePath);
+				} catch (err) {
+					logger.warn("Failed to remove worktree during project delete", {
+						chapterId: id,
+						error: String(err),
+					});
+				}
+			}
+
+			// Detach self-referencing FKs pointing to this chapter
+			await db
+				.update(chapters)
+				.set({ parentChapterId: null })
+				.where(eq(chapters.parentChapterId, id));
+			await db
+				.update(chapters)
+				.set({ mergedIntoChapterId: null })
+				.where(eq(chapters.mergedIntoChapterId, id));
+
+			await db.delete(chapters).where(eq(chapters.id, id));
 		});
 	},
 

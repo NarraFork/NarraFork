@@ -1,11 +1,13 @@
-import { Box, Drawer } from "@mantine/core";
+import { Box, Center, Drawer, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { SessionTerminal } from "../../components/terminal/SessionTerminal";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
+import { usePageUnload } from "../../hooks/usePageUnload";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { api } from "../../lib/api";
@@ -26,6 +28,10 @@ function SessionDetailPage() {
 	const location = useLocation();
 	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const isMobile = useMediaQuery("(max-width: 768px)");
+	const { t } = useTranslation("sessions");
+
+	// Unload heavy components when the tab has been hidden for a while
+	const unloaded = usePageUnload();
 
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(sessionId);
@@ -173,6 +179,29 @@ function SessionDetailPage() {
 		document.addEventListener("touchmove", onMove, { passive: false });
 		document.addEventListener("touchend", onEnd);
 	}, []);
+
+	// Mobile layout
+	if (unloaded) {
+		return (
+			<Box
+				h="calc(100dvh - 60px)"
+				mx="calc(var(--mantine-spacing-md) * -1)"
+				my="calc(var(--mantine-spacing-md) * -1)"
+			>
+				<Center h="100%">
+					<Stack align="center" gap="sm">
+						<Loader size="sm" />
+						<Text size="sm" c="dimmed">
+							{t("sessionUnloaded")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("sessionUnloadedHint")}
+						</Text>
+					</Stack>
+				</Center>
+			</Box>
+		);
+	}
 
 	// Mobile layout
 	if (isMobile) {

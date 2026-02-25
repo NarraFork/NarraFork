@@ -24,7 +24,7 @@ import {
 	IconStarFilled,
 	IconX,
 } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -33,19 +33,16 @@ import {
 	useDeleteFavoriteDirectory,
 	useFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
+import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
 	useCreateNarrator,
 	useNarratorsPaginated,
 } from "../../hooks/useNarrator";
 import { useSessionsListWS } from "../../hooks/useNarratorWS";
-import { api } from "../../lib/api";
-import {
-	BUILTIN_MODELS,
-	groupModelsByProvider,
-	type ModelOption,
-	NARRATOR_STATUS_COLORS,
-} from "../../lib/constants";
+import { addRecentTab } from "../../hooks/useRecentTabs";
+
+import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 
 export const Route = createFileRoute("/sessions/")({
 	component: SessionsPage,
@@ -82,37 +79,7 @@ function SessionsPage() {
 	const qc = useQueryClient();
 	const navigate = useNavigate();
 
-	const { data: settingsData } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-	});
-	const customModels = settingsData?.agent?.customModels;
-	const allModels = useMemo(() => {
-		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					.map((m: any) => ({
-						value: String(m.model_id ?? m.modelId ?? ""),
-						label: String(
-							m.model_short_name ??
-								m.modelShortName ??
-								m.model_name ??
-								m.modelName ??
-								m.model_id ??
-								m.modelId ??
-								"",
-						),
-						rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
-					}))
-					.filter((m: ModelOption) => m.value)
-			: BUILTIN_MODELS.map((m) => ({
-					...m,
-				}));
-		const custom = (customModels ?? []).map(
-			(m: { value: string; label: string; provider?: string }) => ({
-				...m,
-				provider: m.provider ?? "openai",
-			}),
-		);
+	const { groupedModels, settingsData } = useAllModels();
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const sessionIds = useMemo(() => sessions.map((s: any) => s.id), [sessions]);
@@ -199,6 +166,13 @@ function SessionsPage() {
 					setCwd("");
 					setSelectedModel("");
 					setPlanMode(false);
+					addRecentTab({
+						type: "session",
+						id: data.id,
+						title: data.title || t("newSession"),
+						subtitle: data.cwd || cwd,
+						status: data.status || "idle",
+					});
 					navigate({ to: "/sessions/$sessionId", params: { sessionId: data.id } });
 				},
 			},
@@ -447,7 +421,7 @@ function SessionsPage() {
 					<Select
 						label={t("model")}
 						description={t("modelHint")}
-						data={groupModelsByProvider(allModels)}
+						data={groupedModels}
 						searchable
 						value={selectedModel || null}
 						onChange={(v) => setSelectedModel(v ?? "")}

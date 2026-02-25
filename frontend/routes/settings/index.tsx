@@ -1,14 +1,10 @@
 import {
-	ActionIcon,
 	Affix,
-	Badge,
 	Button,
 	Group,
 	Loader,
-	NativeSelect,
 	NumberInput,
 	Paper,
-	PasswordInput,
 	Select,
 	Slider,
 	Stack,
@@ -19,23 +15,28 @@ import {
 	Transition,
 } from "@mantine/core";
 import {
-	IconEye,
-	IconEyeOff,
 	IconHandStop,
 	IconPencilCheck,
+	IconRefresh,
 	IconShield,
 	IconShieldOff,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
+import { useLocalPref } from "../../hooks/useLocalPref";
+import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import { BUILTIN_MODELS, groupModelsByProvider, type ModelOption } from "../../lib/constants";
+
+function ensurePrefix(val: string): string {
+	if (!val || val.includes(":")) return val;
+	return `openai:${val}`;
+}
 
 export const Route = createFileRoute("/settings/")({
 	component: SettingsPage,
@@ -53,32 +54,54 @@ function SettingsPage() {
 	});
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const navigate = useNavigate();
 
 	// Per-user preferences (account-independent)
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPref = useUpdateUserPreferences();
 
+	// Fullscreen mode (local-only)
+	const [isFullscreen, setIsFullscreen] = useLocalPref("narrafork_fullscreen");
+	useEffect(() => {
+		const handler = () => {
+			const fs = !!document.fullscreenElement;
+			setIsFullscreen(fs);
+		};
+		document.addEventListener("fullscreenchange", handler);
+		return () => document.removeEventListener("fullscreenchange", handler);
+	}, [setIsFullscreen]);
+
+	// OLED mode (local-only)
+	const [oledMode, setOledMode] = useLocalPref("narrafork_oled");
+
+	// PWA update
+	const [pwaUpdating, setPwaUpdating] = useState(false);
+
+	const handlePwaUpdate = async () => {
+		setPwaUpdating(true);
+		try {
+			// Unregister service worker so stale cache won't be served
+			const reg = await navigator.serviceWorker?.getRegistration();
+			await reg?.unregister();
+			// Purge all caches (workbox precache, runtime, etc.)
+			const keys = await caches.keys();
+			await Promise.all(keys.map((k) => caches.delete(k)));
+		} catch {
+			// ignore — proceed to reload regardless
+		}
+		window.location.reload();
+	};
+
 	// Server
 	const [port, setPort] = useState<number | undefined>();
 	const [projectDir, setProjectDir] = useState("");
 	// Agent
-	const [defaultModel, setDefaultModel] = useState("claude-sonnet");
 	const [permissionMode, setPermissionMode] = useState("default");
-	const [summaryModel, setSummaryModel] = useState("claude-haiku");
-	const [customModels, setCustomModels] = useState<
-		Array<{ value: string; label: string; provider?: string }>
-	>([]);
-	const [newModelValue, setNewModelValue] = useState("");
-	const [newModelLabel, setNewModelLabel] = useState("");
-	const [newModelProvider, setNewModelProvider] = useState("openai");
 	const [maxTurns, setMaxTurns] = useState(200);
-	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
+	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
-	// OpenAI
-	const [openaiApiKey, setOpenaiApiKey] = useState("");
-	const [openaiBaseUrl, setOpenaiBaseUrl] = useState("");
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
 	const [maxContainers, setMaxContainers] = useState(5);
@@ -88,9 +111,8 @@ function SettingsPage() {
 	// Containers
 	const [portStart, setPortStart] = useState(10000);
 	const [portEnd, setPortEnd] = useState(20000);
-	// Editor
-	const [editor, setEditor] = useState("vscode");
-	const [legacyEncoding, setLegacyEncoding] = useState(false);
+	// Editor (kept for backward compat but no longer shown in UI)
+	const [editor] = useState("vscode");
 
 	const [initialized, setInitialized] = useState(false);
 	const [highlight, setHighlight] = useState(false);
@@ -100,11 +122,7 @@ function SettingsPage() {
 	const serverSnapshot = useRef({
 		port: 7778 as number | undefined,
 		projectDir: "",
-		defaultModel: "claude-sonnet",
 		permissionMode: "default",
-		summaryModel: "claude-haiku",
-		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
-		hiddenModels: [] as string[],
 		maxTurns: 200,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
@@ -115,10 +133,7 @@ function SettingsPage() {
 		dormantMinutes: 0,
 		portStart: 10000,
 		portEnd: 20000,
-		editor: "vscode",
 		legacyEncoding: false,
-		openaiApiKey: "",
-		openaiBaseUrl: "",
 	});
 
 	useEffect(() => {
@@ -126,14 +141,10 @@ function SettingsPage() {
 			const snap = {
 				port: settings.server?.port ?? 7778,
 				projectDir: settings.paths?.defaultProjectDir ?? "",
-				defaultModel: settings.agent?.defaultModel ?? "claude-sonnet",
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
-				summaryModel: settings.agent?.summaryModel ?? "claude-haiku",
-				customModels: settings.agent?.customModels ?? [],
-				hiddenModels: settings.agent?.hiddenModels ?? [],
 				maxTurns: settings.agent?.maxTurns ?? 200,
-				subagentExploreModel: settings.agent?.subagentModels?.explore ?? "",
-				subagentPlanModel: settings.agent?.subagentModels?.plan ?? "",
+				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
+				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -141,10 +152,7 @@ function SettingsPage() {
 				dormantMinutes: settings.chapters?.dormantAfterMinutes ?? 0,
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
-				editor: settings.editor?.type ?? "vscode",
-				legacyEncoding: settings.editor?.legacyEncoding ?? false,
-				openaiApiKey: settings.openai?.apiKey ?? "",
-				openaiBaseUrl: settings.openai?.baseUrl ?? "",
+				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 			};
 			serverSnapshot.current = snap;
 			setPort(snap.port);
@@ -152,8 +160,6 @@ function SettingsPage() {
 			setDefaultModel(snap.defaultModel);
 			setPermissionMode(snap.permissionMode);
 			setSummaryModel(snap.summaryModel);
-			setCustomModels(snap.customModels);
-			setHiddenModels(snap.hiddenModels);
 			setMaxTurns(snap.maxTurns);
 			setSubagentExploreModel(snap.subagentExploreModel);
 			setSubagentPlanModel(snap.subagentPlanModel);
@@ -164,10 +170,7 @@ function SettingsPage() {
 			setDormantMinutes(snap.dormantMinutes);
 			setPortStart(snap.portStart);
 			setPortEnd(snap.portEnd);
-			setEditor(snap.editor);
 			setLegacyEncoding(snap.legacyEncoding);
-			setOpenaiApiKey(snap.openaiApiKey);
-			setOpenaiBaseUrl(snap.openaiBaseUrl);
 			setInitialized(true);
 		}
 	}, [settings, initialized]);
@@ -181,8 +184,6 @@ function SettingsPage() {
 			defaultModel !== s.defaultModel ||
 			permissionMode !== s.permissionMode ||
 			summaryModel !== s.summaryModel ||
-			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
-			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			maxTurns !== s.maxTurns ||
 			subagentExploreModel !== s.subagentExploreModel ||
 			subagentPlanModel !== s.subagentPlanModel ||
@@ -193,10 +194,7 @@ function SettingsPage() {
 			dormantMinutes !== s.dormantMinutes ||
 			portStart !== s.portStart ||
 			portEnd !== s.portEnd ||
-			editor !== s.editor ||
-			legacyEncoding !== s.legacyEncoding ||
-			openaiApiKey !== s.openaiApiKey ||
-			openaiBaseUrl !== s.openaiBaseUrl
+			legacyEncoding !== s.legacyEncoding
 		);
 	}, [
 		initialized,
@@ -205,8 +203,6 @@ function SettingsPage() {
 		defaultModel,
 		permissionMode,
 		summaryModel,
-		customModels,
-		hiddenModels,
 		maxTurns,
 		subagentExploreModel,
 		subagentPlanModel,
@@ -217,10 +213,7 @@ function SettingsPage() {
 		dormantMinutes,
 		portStart,
 		portEnd,
-		editor,
 		legacyEncoding,
-		openaiApiKey,
-		openaiBaseUrl,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -233,42 +226,10 @@ function SettingsPage() {
 		prevDirty.current = isDirty;
 	}, [isDirty]);
 
+	// Models from central hook (must be before early returns)
+	const { groupedModels } = useAllModels();
+
 	if (isLoading) return <Loader />;
-
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				.map((m: any) => ({
-					value: String(m.model_id ?? m.modelId ?? ""),
-					label: String(
-						m.model_short_name ??
-							m.modelShortName ??
-							m.model_name ??
-							m.modelName ??
-							m.model_id ??
-							m.modelId ??
-							"",
-					),
-					rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
-				}))
-				.filter((m: ModelOption) => m.value)
-		: BUILTIN_MODELS;
-	const visibleModels = allModels.filter((m) => !hiddenModels.includes(m.value));
-	const groupedModels = groupModelsByProvider(visibleModels, {
-		openai: t("modelProviderOpenAI"),
-	});
-
-	const handleAddModel = () => {
-		const v = newModelValue.trim();
-		const l = newModelLabel.trim();
-		if (!v || !l) return;
-		if (allModels.some((m) => m.value === v)) return;
-		setCustomModels([...customModels, { value: v, label: l, provider }]);
-		setNewModelValue("");
-		setNewModelLabel("");
-	};
-
-	const handleRemoveModel = (value: string) => {
-		setCustomModels(customModels.filter((m) => m.value !== value));
-	};
 
 	const handleSave = () => {
 		updateSettings.mutate(
@@ -279,13 +240,12 @@ function SettingsPage() {
 					defaultModel,
 					defaultPermissionMode: permissionMode,
 					summaryModel,
-					customModels,
-					hiddenModels,
 					maxTurns,
 					subagentModels: {
 						explore: subagentExploreModel,
 						plan: subagentPlanModel,
 					},
+					legacyEncoding,
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -298,11 +258,7 @@ function SettingsPage() {
 					portRangeStart: portStart,
 					portRangeEnd: portEnd,
 				},
-				editor: { type: editor, legacyEncoding },
-				openai: {
-					apiKey: openaiApiKey,
-					baseUrl: openaiBaseUrl,
-				},
+				editor: { type: editor },
 			},
 			{
 				onSuccess: () => {
@@ -312,8 +268,6 @@ function SettingsPage() {
 						defaultModel,
 						permissionMode,
 						summaryModel,
-						customModels: [...customModels],
-						hiddenModels: [...hiddenModels],
 						maxTurns,
 						subagentExploreModel,
 						subagentPlanModel,
@@ -324,10 +278,7 @@ function SettingsPage() {
 						dormantMinutes,
 						portStart,
 						portEnd,
-						editor,
 						legacyEncoding,
-						openaiApiKey,
-						openaiBaseUrl,
 					};
 				},
 			},
@@ -366,7 +317,6 @@ function SettingsPage() {
 						data={groupedModels}
 						searchable
 						value={defaultModel}
-						onChange={(v) => setDefaultModel(v ?? "claude-sonnet")}
 					/>
 					<Select
 						label={t("permissionMode")}
@@ -413,7 +363,6 @@ function SettingsPage() {
 						data={groupedModels}
 						searchable
 						value={summaryModel}
-						onChange={(v) => setSummaryModel(v ?? "claude-haiku")}
 					/>
 					<NumberInput
 						label={t("maxTurns")}
@@ -449,107 +398,15 @@ function SettingsPage() {
 							onChange={(v) => setSubagentPlanModel(v ?? "")}
 						/>
 					</Stack>
-					<Stack gap="xs">
-						<Text size="sm" fw={500}>
-							{t("customModels")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("customModelsDesc")}
-						</Text>
-							const isHidden = hiddenModels.includes(m.value);
-							return (
-								<Group key={m.value} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
-									<TextInput value={m.value} disabled style={{ flex: 1 }} />
-									<TextInput value={m.label} disabled style={{ flex: 1 }} />
-									<Badge size="sm" variant="light" color="violet" w={70}>
-									</Badge>
-									<ActionIcon
-										variant="subtle"
-										color={isHidden ? "gray" : "blue"}
-										onClick={() =>
-											setHiddenModels((prev) =>
-												isHidden ? prev.filter((id) => id !== m.value) : [...prev, m.value],
-											)
-										}
-									>
-										{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-									</ActionIcon>
-								</Group>
-							);
-						})}
-						{customModels.map((m) => (
-							<Group key={m.value} gap="xs">
-								<TextInput value={m.value} disabled style={{ flex: 1 }} />
-								<TextInput value={m.label} disabled style={{ flex: 1 }} />
-								<Badge
-									size="sm"
-									variant="light"
-									w={70}
-								>
-								</Badge>
-								<ActionIcon color="red" variant="subtle" onClick={() => handleRemoveModel(m.value)}>
-									✕
-								</ActionIcon>
-							</Group>
-						))}
-						<Group gap="xs">
-							<TextInput
-								placeholder={t("modelValuePlaceholder")}
-								value={newModelValue}
-								onChange={(e) => setNewModelValue(e.currentTarget.value)}
-								style={{ flex: 1 }}
-							/>
-							<TextInput
-								placeholder={t("modelLabelPlaceholder")}
-								value={newModelLabel}
-								onChange={(e) => setNewModelLabel(e.currentTarget.value)}
-								style={{ flex: 1 }}
-							/>
-								<Badge size="sm" variant="light" color="teal" w={90}>
-									OpenAI
-								</Badge>
-							) : (
-								<NativeSelect
-									size="xs"
-									data={[
-										{ value: "openai", label: "OpenAI" },
-									]}
-									value={newModelProvider}
-									onChange={(e) => setNewModelProvider(e.currentTarget.value)}
-									w={90}
-								/>
-							)}
-							<ActionIcon
-								variant="light"
-								onClick={handleAddModel}
-								disabled={!newModelValue.trim() || !newModelLabel.trim()}
-							>
-								+
-							</ActionIcon>
-						</Group>
-					</Stack>
-				</Stack>
-			</Paper>
-
-			{/* OpenAI */}
-			<Paper withBorder p="md">
-				<Stack>
-					<Title order={4}>{t("openaiSection")}</Title>
-					<Text size="xs" c="dimmed">
-						{t("openaiSectionDesc")}
-					</Text>
-					<PasswordInput
-						label={t("openaiApiKey")}
-						placeholder={t("openaiApiKeyPlaceholder")}
-						value={openaiApiKey}
-						onChange={(e) => setOpenaiApiKey(e.currentTarget.value)}
+					<Switch
+						label={t("legacyEncoding")}
+						description={t("legacyEncodingDesc")}
+						checked={legacyEncoding}
+						onChange={(e) => setLegacyEncoding(e.currentTarget.checked)}
 					/>
-					<TextInput
-						label={t("openaiBaseUrl")}
-						placeholder={t("openaiBaseUrlPlaceholder")}
-						value={openaiBaseUrl}
-						onChange={(e) => setOpenaiBaseUrl(e.currentTarget.value)}
-					/>
+					<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
+						{t("customModels")} →
+					</Button>
 				</Stack>
 			</Paper>
 
@@ -610,30 +467,6 @@ function SettingsPage() {
 						onChange={(v) => setPortEnd(typeof v === "number" ? v : 20000)}
 						min={1024}
 						max={65535}
-					/>
-				</Stack>
-			</Paper>
-
-			{/* Editor */}
-			<Paper withBorder p="md">
-				<Stack>
-					<Title order={4}>{t("editorSection")}</Title>
-					<Select
-						label={t("editorType")}
-						data={[
-							{ value: "vscode", label: "VS Code" },
-							{ value: "cursor", label: "Cursor" },
-							{ value: "windsurf", label: "Windsurf" },
-							{ value: "zed", label: "Zed" },
-						]}
-						value={editor}
-						onChange={(v) => setEditor(v ?? "vscode")}
-					/>
-					<Switch
-						label={t("legacyEncoding")}
-						description={t("legacyEncodingDesc")}
-						checked={legacyEncoding}
-						onChange={(e) => setLegacyEncoding(e.currentTarget.checked)}
 					/>
 				</Stack>
 			</Paper>
@@ -742,6 +575,34 @@ function SettingsPage() {
 				<Stack>
 					<Title order={4}>{t("themeSection")}</Title>
 					<ThemeSwitcher />
+					<Switch
+						label={t("oledMode")}
+						description={t("oledModeDesc")}
+						checked={oledMode}
+						onChange={(e) => setOledMode(e.currentTarget.checked)}
+					/>
+				</Stack>
+			</Paper>
+
+			{/* Display */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("displaySection")}</Title>
+					<Switch
+						label={t("ignoreSafeArea")}
+						description={t("ignoreSafeAreaDesc")}
+						checked={isFullscreen}
+						onChange={(e) => {
+							const on = e.currentTarget.checked;
+							setIsFullscreen(on);
+							localStorage.setItem("narrafork_fullscreen", String(on));
+							if (on) {
+								document.documentElement.requestFullscreen?.().catch(() => {});
+							} else if (document.fullscreenElement) {
+								document.exitFullscreen?.().catch(() => {});
+							}
+						}}
+					/>
 				</Stack>
 			</Paper>
 
@@ -750,6 +611,24 @@ function SettingsPage() {
 				<Stack>
 					<Title order={4}>{t("languageSection")}</Title>
 					<LanguageSwitcher />
+				</Stack>
+			</Paper>
+
+			{/* PWA Update */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("pwaSection")}</Title>
+					<Text size="sm" c="dimmed">
+						{t("pwaForceUpdateDesc")}
+					</Text>
+					<Button
+						leftSection={<IconRefresh size={16} />}
+						variant="default"
+						loading={pwaUpdating}
+						onClick={handlePwaUpdate}
+					>
+						{pwaUpdating ? t("pwaUpdating") : t("pwaForceUpdate")}
+					</Button>
 				</Stack>
 			</Paper>
 

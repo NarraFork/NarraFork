@@ -8,7 +8,7 @@
 		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
 		"dev:all": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
 		"dev:cold": "bun run db:migrate; PORT=7779 bun run server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
-		"build": "bunx vite build --config frontend/vite.config.ts",
+		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts",
 		"build:compile": "bun scripts/build-embedded.ts",
 		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",
 		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts",

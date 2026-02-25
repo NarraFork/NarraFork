@@ -13,14 +13,15 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { StoryNetwork } from "../../components/graph/StoryNetwork";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
-import { useProject } from "../../hooks/useProjects";
+import { useDeleteProject, useProject } from "../../hooks/useProjects";
+import { addRecentTab } from "../../hooks/useRecentTabs";
 
 export const Route = createFileRoute("/projects/$projectId")({
 	component: ProjectDetailPage,
@@ -28,17 +29,33 @@ export const Route = createFileRoute("/projects/$projectId")({
 
 function ProjectDetailPage() {
 	const { projectId } = Route.useParams();
+	const navigate = useNavigate();
 	const { data: project, isLoading: projectLoading } = useProject(projectId);
 	const { data: chapters } = useChapters(projectId);
 	const createChapter = useCreateChapter();
+	const deleteProject = useDeleteProject();
 	const [opened, { open, close }] = useDisclosure(false);
 	const [cleanupOpened, { open: openCleanup, close: closeCleanup }] = useDisclosure(false);
 	const [batchMergeOpened, { open: openBatchMerge, close: closeBatchMerge }] = useDisclosure(false);
+	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
+	const [deleteConfirmName, setDeleteConfirmName] = useState("");
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
 	const { t: tp } = useTranslation("projects");
+
+	// Record project visit in recent tabs
+	useEffect(() => {
+		if (project) {
+			addRecentTab({
+				type: "project",
+				id: projectId,
+				title: project.name,
+				subtitle: project.description || undefined,
+			});
+		}
+	}, [projectId, project]);
 
 	if (projectLoading) return <Loader />;
 	if (!project) return <Text>{tp("projectNotFound")}</Text>;
@@ -63,10 +80,19 @@ function ProjectDetailPage() {
 		);
 	};
 
+	const handleDelete = () => {
+		deleteProject.mutate(projectId, {
+			onSuccess: () => {
+				closeDelete();
+				navigate({ to: "/projects" });
+			},
+		});
+	};
+
 	return (
 		<Box
 			style={{
-				height: "calc(100vh - 60px)",
+				height: "calc(100vh - var(--app-shell-header-offset, 0px) - var(--mantine-spacing-md) * 2)",
 				display: "flex",
 				flexDirection: "column",
 			}}
@@ -80,6 +106,9 @@ function ProjectDetailPage() {
 					</Badge>
 				</Group>
 				<Group gap="xs">
+					<Button variant="light" color="red" size="xs" onClick={openDelete}>
+						{tp("deleteProject")}
+					</Button>
 					<Button
 						variant="light"
 						color="red"
@@ -143,6 +172,32 @@ function ProjectDetailPage() {
 				opened={batchMergeOpened}
 				onClose={closeBatchMerge}
 			/>
+
+			<Modal
+				opened={deleteOpened}
+				onClose={() => {
+					closeDelete();
+					setDeleteConfirmName("");
+				}}
+				title={tp("deleteProject")}
+			>
+				<Stack>
+					<Text size="sm">{tp("deleteProjectConfirm", { name: project.name })}</Text>
+					<TextInput
+						label={tp("deleteProjectTypeName")}
+						value={deleteConfirmName}
+						onChange={(e) => setDeleteConfirmName(e.currentTarget.value)}
+					/>
+					<Button
+						color="red"
+						onClick={handleDelete}
+						loading={deleteProject.isPending}
+						disabled={deleteConfirmName !== project.name}
+					>
+						{tc("delete")}
+					</Button>
+				</Stack>
+			</Modal>
 		</Box>
 	);
 }

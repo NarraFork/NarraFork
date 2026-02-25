@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { extname, resolve } from "node:path";
-import { serveStatic } from "hono/bun";
+
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import { verifyToken } from "./lib/auth";
@@ -11,7 +11,7 @@ import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import { terminalService } from "./services/terminal-service";
-import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
+import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./websocket/ws-handler";
 
 // Catch unhandled errors to prevent silent crashes
 process.on("uncaughtException", (err) => {
@@ -96,15 +96,51 @@ if (isProd) {
 	// Fallback: serve from filesystem (bundle mode or bun run start)
 	if (!hasEmbedded) {
 		const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
+		logger.info(
+			`Static file serving: filesystem mode, dir=${staticDir}, exists=${existsSync(staticDir)}`,
+		);
 		if (existsSync(staticDir)) {
-			app.use("/assets/*", serveStatic({ root: staticDir }));
-			app.use("/sw.js", serveStatic({ root: staticDir }));
-			app.use("/workbox-*.js", serveStatic({ root: staticDir }));
-			app.use("/manifest.webmanifest", serveStatic({ root: staticDir }));
-			app.use("/favicon.svg", serveStatic({ root: staticDir }));
-			app.use("/pwa-*.png", serveStatic({ root: staticDir }));
-			app.use("/apple-touch-icon-*.png", serveStatic({ root: staticDir }));
-			app.get("*", serveStatic({ root: staticDir, path: "index.html" }));
+			// Serve all static files from dist/frontend via a single middleware
+			app.use("*", async (c, next) => {
+				// Skip API and WebSocket routes
+				if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+					return next();
+				}
+
+				const filePath = resolve(staticDir, `.${c.req.path}`);
+				// Security: ensure resolved path is within staticDir
+				if (!filePath.startsWith(staticDir)) {
+					return next();
+				}
+
+				const file = Bun.file(filePath);
+				if (await file.exists()) {
+					const ext = extname(c.req.path);
+					const mime = MIME_TYPES[ext] ?? "application/octet-stream";
+					const isHashed = c.req.path.startsWith("/assets/");
+					return new Response(file, {
+						headers: {
+							"Content-Type": mime,
+							"Cache-Control": isHashed
+								? "public, max-age=31536000, immutable"
+								: "public, max-age=3600",
+						},
+					});
+				}
+
+				// SPA catch-all: serve index.html for non-file routes
+				if (!c.req.path.includes(".")) {
+					const indexFile = Bun.file(resolve(staticDir, "index.html"));
+					return new Response(indexFile, {
+						headers: {
+							"Content-Type": "text/html; charset=utf-8",
+							"Cache-Control": "no-cache",
+						},
+					});
+				}
+
+				return next();
+			});
 		}
 	}
 }
@@ -146,6 +182,9 @@ const _server = Bun.serve({
 
 logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
 
+// Start WebSocket heartbeat (ping/pong) to detect stale connections
+startHeartbeat();
+
 	try {
 			configPath:
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -178,6 +217,7 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 
 // Graceful shutdown
 const shutdown = () => {
+	stopHeartbeat();
 	chapterCleanup.clearAllTimers();
 	process.exit(0);
 };

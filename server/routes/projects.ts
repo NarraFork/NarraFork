@@ -1,9 +1,10 @@
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapters, projects } from "../db/schema";
+import { chapters, explorationGroups, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
 import { gitService } from "../services/git-service";
@@ -74,6 +75,21 @@ projectRoutes.post("/", async (c) => {
 		})
 		.returning();
 
+	// Auto-create root chapter when project has a git repository
+	if (gitPath) {
+		try {
+			await chapterService.createRootChapter({
+				projectId,
+				title: body.name,
+				gitPath,
+				defaultBranch,
+			});
+		} catch (err) {
+			// Non-fatal — project is still usable without root chapter
+			console.warn("Failed to create root chapter:", err);
+		}
+	}
+
 	return c.json(project, 201);
 });
 
@@ -104,13 +120,55 @@ projectRoutes.patch("/:id", async (c) => {
 
 projectRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");
-	// Cascade: remove chapters (which cascade-deletes narrators, messages, etc.)
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, id),
+	});
+	if (!project) throw new NotFoundError("Project", id);
+
 	const projectChapters = await db.query.chapters.findMany({
 		where: eq(chapters.projectId, id),
 	});
-	for (const chapter of projectChapters) {
-		await chapterService.remove(chapter.id);
+
+	// Remove non-root chapters first, then root chapters — full resource cleanup for all
+	const nonRoot = projectChapters.filter((ch) => !ch.isRoot);
+	const root = projectChapters.filter((ch) => ch.isRoot);
+
+	for (const chapter of nonRoot) {
+		try {
+			await chapterService.removeForProjectDeletion(chapter.id, project.gitPath);
+		} catch (err) {
+			logger.warn("Failed to remove chapter during project delete", {
+				chapterId: chapter.id,
+				error: String(err),
+			});
+		}
 	}
+	for (const chapter of root) {
+		try {
+			await chapterService.removeForProjectDeletion(chapter.id, project.gitPath);
+		} catch (err) {
+			logger.warn("Failed to remove root chapter during project delete", {
+				chapterId: chapter.id,
+				error: String(err),
+			});
+		}
+	}
+
+	// Clean up exploration groups (should cascade, but be explicit)
+	await db.delete(explorationGroups).where(eq(explorationGroups.projectId, id));
+
+	// Prune any leftover worktrees in the git repo
+	if (project.gitPath) {
+		try {
+			await gitService.pruneWorktrees(project.gitPath);
+		} catch (err) {
+			logger.warn("Failed to prune worktrees during project delete", {
+				error: String(err),
+			});
+		}
+	}
+
 	await db.delete(projects).where(eq(projects.id, id));
+	logger.info("Project deleted", { projectId: id, name: project.name });
 	return c.json({ ok: true });
 });

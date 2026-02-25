@@ -164,6 +164,15 @@ function AdminPage() {
 
 			<Paper withBorder p="md">
 				<Stack>
+					<Title order={4}>{t("providers")}</Title>
+					<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
+						{t("providers")}
+					</Button>
+				</Stack>
+			</Paper>
+
+			<Paper withBorder p="md">
+				<Stack>
 					<Group>
 						</Button>
 						</Button>
