@@ -55,6 +55,10 @@ export const gitService = {
 		if (result.exitCode !== 0) throw new Error(`Failed to remove worktree: ${result.stderr}`);
 	},
 
+	async pruneWorktrees(repoPath: string): Promise<void> {
+		await exec(["worktree", "prune"], repoPath);
+	},
+
 	async deleteBranch(repoPath: string, branchName: string): Promise<void> {
 		await exec(["branch", "-D", branchName], repoPath);
 	},
@@ -343,6 +347,92 @@ export const gitService = {
 		}
 
 		return parts.join("\n");
+	},
+
+	/**
+	 * Get the file list for a specific commit (stats only, no diff content).
+	 * Fast even for huge commits — only runs numstat + name-status.
+	 */
+	async getCommitFiles(
+		repoPath: string,
+		sha: string,
+	): Promise<
+		Array<{
+			path: string;
+			oldPath?: string;
+			status: "added" | "modified" | "deleted" | "renamed";
+			linesAdded: number;
+			linesRemoved: number;
+		}>
+	> {
+		// Get numstat for per-file stats
+		const numstat = await exec(["diff-tree", "--no-commit-id", "-r", "--numstat", sha], repoPath);
+		// Get name-status for file status (A/M/D/R)
+		const nameStatus = await exec(
+			["diff-tree", "--no-commit-id", "-r", "--name-status", "-M", sha],
+			repoPath,
+		);
+
+		const statusMap = new Map<string, { status: string; oldPath?: string }>();
+		for (const line of nameStatus.stdout.split("\n").filter(Boolean)) {
+			const parts = line.split("\t");
+			const st = parts[0];
+			if (st.startsWith("R")) {
+				statusMap.set(parts[2], { status: "renamed", oldPath: parts[1] });
+			} else {
+				statusMap.set(parts[1], { status: st });
+			}
+		}
+
+		const statLines = numstat.stdout.split("\n").filter(Boolean);
+		return statLines.map((line) => {
+			const [addStr, delStr, filePath] = line.split("\t");
+			const linesAdded = addStr === "-" ? 0 : Number.parseInt(addStr, 10) || 0;
+			const linesRemoved = delStr === "-" ? 0 : Number.parseInt(delStr, 10) || 0;
+
+			const info = statusMap.get(filePath);
+			const rawStatus = info?.status ?? "M";
+			const status =
+				rawStatus === "A" || rawStatus === "added"
+					? "added"
+					: rawStatus === "D" || rawStatus === "deleted"
+						? "deleted"
+						: rawStatus === "renamed"
+							? "renamed"
+							: "modified";
+
+			return {
+				path: filePath,
+				oldPath: info?.oldPath,
+				status: status as "added" | "modified" | "deleted" | "renamed",
+				linesAdded,
+				linesRemoved,
+			};
+		});
+	},
+
+	/**
+	 * Get the diff for a single file in a specific commit.
+	 * Returns the raw unified diff string, truncated if too large.
+	 */
+	async getCommitFileDiff(
+		repoPath: string,
+		sha: string,
+		filePath: string,
+		maxBytes = 200_000,
+	): Promise<{ diff: string; truncated: boolean }> {
+		const result = await exec(
+			["diff-tree", "--no-commit-id", "-p", sha, "--", filePath],
+			repoPath,
+			true,
+		);
+		let diff = result.stdout;
+		let truncated = false;
+		if (diff.length > maxBytes) {
+			diff = diff.slice(0, maxBytes);
+			truncated = true;
+		}
+		return { diff, truncated };
 	},
 
 	async copyFiles(srcDir: string, destDir: string, files: string[]): Promise<void> {

@@ -1,4 +1,4 @@
-import { Badge, Group, Stack, Text, Tooltip } from "@mantine/core";
+import { Badge, Group, Stack, Text, Tooltip, UnstyledButton } from "@mantine/core";
 import { IconGitCommit, IconRobot } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 
@@ -18,6 +18,7 @@ interface Commit {
 interface CommitListProps {
 	commits: Commit[];
 	maxItems?: number;
+	onCommitClick?: (sha: string) => void;
 }
 
 const SOURCE_COLORS: Record<string, string> = {
@@ -42,7 +43,51 @@ function formatRelativeTime(dateStr: string): string {
 	return `${days}d`;
 }
 
-export function CommitList({ commits, maxItems }: CommitListProps) {
+function CommitRow({ commit }: { commit: Commit }) {
+	return (
+		<Group gap={6} wrap="nowrap" align="flex-start">
+			<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+				{commit.sha.slice(0, 7)}
+			</Text>
+
+			{commit.source !== "manual" && (
+				<Tooltip label={commit.source}>
+					<Badge
+						size="xs"
+						variant="dot"
+						color={SOURCE_COLORS[commit.source] ?? "gray"}
+						style={{ flexShrink: 0 }}
+					>
+						{commit.source === "auto" ? <IconRobot size={10} /> : <IconGitCommit size={10} />}
+					</Badge>
+				</Tooltip>
+			)}
+
+			<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
+				{commit.message}
+			</Text>
+
+			{commit.linesAdded != null &&
+				commit.linesRemoved != null &&
+				(commit.linesAdded > 0 || commit.linesRemoved > 0) && (
+					<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+						<Text span c="green" size="xs">
+							+{commit.linesAdded}
+						</Text>{" "}
+						<Text span c="red" size="xs">
+							-{commit.linesRemoved}
+						</Text>
+					</Text>
+				)}
+
+			<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+				{formatRelativeTime(commit.authoredAt)}
+			</Text>
+		</Group>
+	);
+}
+
+export function CommitList({ commits, maxItems, onCommitClick }: CommitListProps) {
 	const { t } = useTranslation("graph");
 	const displayed = maxItems ? commits.slice(0, maxItems) : commits;
 
@@ -55,48 +100,22 @@ export function CommitList({ commits, maxItems }: CommitListProps) {
 	}
 
 	return (
-		<Stack gap={4}>
-			{displayed.map((commit) => (
-				<Group key={commit.id} gap={6} wrap="nowrap" align="flex-start">
-					<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-						{commit.sha.slice(0, 7)}
-					</Text>
-
-					{commit.source !== "manual" && (
-						<Tooltip label={commit.source}>
-							<Badge
-								size="xs"
-								variant="dot"
-								color={SOURCE_COLORS[commit.source] ?? "gray"}
-								style={{ flexShrink: 0 }}
-							>
-								{commit.source === "auto" ? <IconRobot size={10} /> : <IconGitCommit size={10} />}
-							</Badge>
-						</Tooltip>
-					)}
-
-					<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-						{commit.message}
-					</Text>
-
-					{commit.linesAdded != null &&
-						commit.linesRemoved != null &&
-						(commit.linesAdded > 0 || commit.linesRemoved > 0) && (
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-								<Text span c="green" size="xs">
-									+{commit.linesAdded}
-								</Text>{" "}
-								<Text span c="red" size="xs">
-									-{commit.linesRemoved}
-								</Text>
-							</Text>
-						)}
-
-					<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-						{formatRelativeTime(commit.authoredAt)}
-					</Text>
-				</Group>
-			))}
+		<Stack gap={2}>
+			{displayed.map((commit) =>
+				onCommitClick ? (
+					<UnstyledButton
+						key={commit.id}
+						onClick={() => onCommitClick(commit.sha)}
+						py={2}
+						px={4}
+						style={{ borderRadius: 4 }}
+					>
+						<CommitRow commit={commit} />
+					</UnstyledButton>
+				) : (
+					<CommitRow key={commit.id} commit={commit} />
+				),
+			)}
 		</Stack>
 	);
 }

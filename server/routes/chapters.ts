@@ -1,4 +1,7 @@
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { db } from "../db";
+import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import {
@@ -238,15 +241,72 @@ chapterRoutes.get("/:id/commits/:sha", async (c) => {
 	const id = c.req.param("id");
 	const sha = c.req.param("sha");
 
-	await chapterService.getById(id);
+	const chapter = await chapterService.getById(id);
 
-	// Looks up from DB cache only — commit must have been synced previously
 	const commit = await commitSyncService.getCommitBySha(id, sha);
 	if (!commit) throw new NotFoundError("Commit", sha);
 
+	const project = await db.select().from(projects).where(eq(projects.id, chapter.projectId)).get();
+	const repoPath = chapter.worktreePath || project?.gitPath;
+
+	let files: Array<{
+		path: string;
+		oldPath?: string;
+		status: string;
+		linesAdded: number;
+		linesRemoved: number;
+		diff?: string;
+	}> = [];
+	let diffInlined = false;
+
+	if (repoPath) {
+		try {
+			const fileList = await gitService.getCommitFiles(repoPath, sha);
+			const totalLines = fileList.reduce((s, f) => s + f.linesAdded + f.linesRemoved, 0);
+
+			// Small commit: inline all diffs directly (≤30 files and ≤5000 total lines)
+			if (fileList.length <= 30 && totalLines <= 5000) {
+				diffInlined = true;
+				const filesWithDiff = await Promise.all(
+					fileList.map(async (f) => {
+						try {
+							const { diff } = await gitService.getCommitFileDiff(repoPath, sha, f.path);
+							return { ...f, diff };
+						} catch {
+							return { ...f, diff: "" };
+						}
+					}),
+				);
+				files = filesWithDiff;
+			} else {
+				files = fileList;
+			}
+		} catch {
+			// Non-fatal — commit may not be reachable from current worktree
+		}
+	}
+
 	return c.json({
 		...commit,
+		files,
+		diffInlined,
 	});
+});
+
+chapterRoutes.get("/:id/commits/:sha/files/*", async (c) => {
+	const id = c.req.param("id");
+	const sha = c.req.param("sha");
+	// Extract file path from wildcard — everything after /files/
+	const filePath = c.req.path.split("/files/").slice(1).join("/files/");
+	if (!filePath) throw new ValidationError("File path is required");
+
+	const chapter = await chapterService.getById(id);
+	const project = await db.select().from(projects).where(eq(projects.id, chapter.projectId)).get();
+	const repoPath = chapter.worktreePath || project?.gitPath;
+	if (!repoPath) throw new ValidationError("No git repository available");
+
+	const result = await gitService.getCommitFileDiff(repoPath, sha, filePath);
+	return c.json(result);
 });
 
 // === Git Status (commits ahead + uncommitted lines) ===

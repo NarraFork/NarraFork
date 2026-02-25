@@ -9,6 +9,7 @@ interface NodeContextMenuProps {
 		title: string;
 		status: string;
 		role: string;
+		isRoot?: boolean;
 	};
 	onClose: () => void;
 	onFork: (nodeId: string) => void;
@@ -29,6 +30,7 @@ export function NodeContextMenu({
 	onWake,
 }: NodeContextMenuProps) {
 	const { t } = useTranslation("graph");
+	const isRoot = !!nodeData.isRoot;
 
 	return (
 		<>
@@ -62,45 +64,49 @@ export function NodeContextMenu({
 					<UnstyledButton px="xs" py={4} onClick={() => onFork(nodeId)} style={{ borderRadius: 4 }}>
 						<Text size="sm">{t("contextMenu.fork")}</Text>
 					</UnstyledButton>
-					<Divider my={4} />
-					<Text size="xs" fw={600} c="dimmed" px="xs">
-						{t("contextMenu.setRole")}
-					</Text>
-					{(["trunk", "branch", "exploration"] as const).map((role) => (
-						<UnstyledButton
-							key={role}
-							px="xs"
-							py={4}
-							disabled={nodeData.role === role}
-							onClick={() => onSetRole(nodeId, role)}
-							style={{
-								borderRadius: 4,
-								opacity: nodeData.role === role ? 0.5 : 1,
-							}}
-						>
-							<Text size="sm">{t(`contextMenu.role.${role}`)}</Text>
-						</UnstyledButton>
-					))}
-					<Divider my={4} />
-					{nodeData.status === "active" && (
-						<UnstyledButton
-							px="xs"
-							py={4}
-							onClick={() => onDormant(nodeId)}
-							style={{ borderRadius: 4 }}
-						>
-							<Text size="sm">{t("contextMenu.dormant")}</Text>
-						</UnstyledButton>
-					)}
-					{nodeData.status === "dormant" && (
-						<UnstyledButton
-							px="xs"
-							py={4}
-							onClick={() => onWake(nodeId)}
-							style={{ borderRadius: 4 }}
-						>
-							<Text size="sm">{t("contextMenu.wake")}</Text>
-						</UnstyledButton>
+					{!isRoot && (
+						<>
+							<Divider my={4} />
+							<Text size="xs" fw={600} c="dimmed" px="xs">
+								{t("contextMenu.setRole")}
+							</Text>
+							{(["trunk", "branch", "exploration"] as const).map((role) => (
+								<UnstyledButton
+									key={role}
+									px="xs"
+									py={4}
+									disabled={nodeData.role === role}
+									onClick={() => onSetRole(nodeId, role)}
+									style={{
+										borderRadius: 4,
+										opacity: nodeData.role === role ? 0.5 : 1,
+									}}
+								>
+									<Text size="sm">{t(`contextMenu.role.${role}`)}</Text>
+								</UnstyledButton>
+							))}
+							<Divider my={4} />
+							{nodeData.status === "active" && (
+								<UnstyledButton
+									px="xs"
+									py={4}
+									onClick={() => onDormant(nodeId)}
+									style={{ borderRadius: 4 }}
+								>
+									<Text size="sm">{t("contextMenu.dormant")}</Text>
+								</UnstyledButton>
+							)}
+							{nodeData.status === "dormant" && (
+								<UnstyledButton
+									px="xs"
+									py={4}
+									onClick={() => onWake(nodeId)}
+									style={{ borderRadius: 4 }}
+								>
+									<Text size="sm">{t("contextMenu.wake")}</Text>
+								</UnstyledButton>
+							)}
+						</>
 					)}
 				</Stack>
 			</Paper>

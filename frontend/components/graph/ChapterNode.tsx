@@ -1,6 +1,5 @@
 import { Badge, Card, Group, Text } from "@mantine/core";
 import { IconGitCommit } from "@tabler/icons-react";
-import { useNavigate } from "@tanstack/react-router";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
 import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS } from "../../lib/constants";
@@ -19,9 +18,8 @@ interface ChapterNodeData {
 	[key: string]: unknown;
 }
 
-export function ChapterNode({ data, id }: NodeProps) {
+export function ChapterNode({ data }: NodeProps) {
 	const d = data as ChapterNodeData;
-	const navigate = useNavigate();
 	const { t } = useTranslation("graph");
 
 	const role = d.role ?? "branch";
@@ -46,13 +44,12 @@ export function ChapterNode({ data, id }: NodeProps) {
 				style={{
 					width: nodeWidth,
 					height: nodeHeight,
-					cursor: "pointer",
+					cursor: "grab",
 					borderColor,
 					borderWidth: isRoot ? 2 : 1,
 					opacity: isFrozen ? 0.6 : 1,
 					position: "relative",
 				}}
-				onClick={() => navigate({ to: "/chapters/$chapterId", params: { chapterId: id } })}
 			>
 				{d.hasUpstreamUpdates && (
 					<div

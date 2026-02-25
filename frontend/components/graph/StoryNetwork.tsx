@@ -1,11 +1,14 @@
 import {
+	applyNodeChanges,
 	Background,
 	Controls,
+	type Node,
+	type NodeChange,
 	type NodeMouseHandler,
 	type OnConnect,
 	ReactFlow,
 } from "@xyflow/react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import "@xyflow/react/dist/style.css";
 import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useUpdateChapter } from "@frontend/hooks/useChapters";
@@ -60,7 +63,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	const { t } = useTranslation("graph");
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
-	const { nodes, edges, isLoading, error } = useStoryGraph(projectId);
+	const { nodes: graphNodes, edges, isLoading, error } = useStoryGraph(projectId);
 	const { savePosition } = useUpdateGraphPositions(projectId);
 	const createEdge = useCreateChapterEdge();
 	const updateChapter = useUpdateChapter();
@@ -77,6 +80,16 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 
 	const [selectedNode, setSelectedNode] = useState<SelectedNodeData | null>(null);
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+	const [nodes, setNodes] = useState<Node[]>([]);
+
+	// Sync local nodes state when upstream graph data changes
+	useEffect(() => {
+		setNodes(graphNodes as Node[]);
+	}, [graphNodes]);
+
+	const onNodesChange = useCallback((changes: NodeChange[]) => {
+		setNodes((nds) => applyNodeChanges(changes, nds));
+	}, []);
 
 	const onNodeDragStop: NodeMouseHandler = useCallback(
 		(_event, node) => {
@@ -231,6 +244,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 					edges={edges}
 					nodeTypes={nodeTypes}
 					edgeTypes={edgeTypes}
+					onNodesChange={onNodesChange}
 					onNodeDragStop={onNodeDragStop}
 					onNodeClick={onNodeClick}
 					onNodeDoubleClick={onNodeDoubleClick}

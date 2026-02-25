@@ -442,7 +442,7 @@ export const api = {
 
 	// Recent Tabs
 	upsertRecentTab: (tab: {
-		type: "chapter" | "session";
+		type: "chapter" | "session" | "project";
 		id: string;
 		narratorId?: string;
 		title: string;
@@ -454,7 +454,7 @@ export const api = {
 			method: "PUT",
 			body: JSON.stringify(tab),
 		}),
-	removeRecentTab: (type: "chapter" | "session", id: string) =>
+	removeRecentTab: (type: "chapter" | "session" | "project", id: string) =>
 		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),
@@ -593,7 +593,21 @@ export const api = {
 			filesChanged: number | null;
 			linesAdded: number | null;
 			linesRemoved: number | null;
+			files: Array<{
+				path: string;
+				oldPath?: string;
+				status: string;
+				linesAdded: number;
+				linesRemoved: number;
+				diff?: string;
+			}>;
+			diffInlined: boolean;
 		}>(`/chapters/${chapterId}/commits/${sha}`),
+
+	getCommitFileDiff: (chapterId: string, sha: string, filePath: string) =>
+		request<{ diff: string; truncated: boolean }>(
+			`/chapters/${chapterId}/commits/${sha}/files/${filePath}`,
+		),
 
 	// === chapter git status ===
 	getChapterGitStatus: (id: string) =>
