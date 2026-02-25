@@ -640,8 +640,26 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			output:
 				`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
 				`The ${tu.name} was NOT executed to avoid corrupting files. ` +
-				"The response likely hit the output token limit. " +
-				"Please retry with smaller content — split large writes into multiple calls.",
+				"Each tool call's total input must be under 10,000 characters. " +
+				"Use Write for the first section (end with APPEND marker comment), " +
+				"then Edit with old_string targeting the APPEND marker to continue.",
+			isError: true,
+			durationMs: Date.now() - start,
+			broken: true,
+		};
+	}
+
+	// Detect empty input for file-writing tools — a sign of complete truncation
+	// where the stream sent tool name/id but no input chunks at all.
+	const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
+	if (FILE_TOOLS.has(tu.name) && Object.keys(effectiveInput).length === 0) {
+		return {
+			output:
+				`The ${tu.name} call received no input at all (complete truncation). ` +
+				`The ${tu.name} was NOT executed. ` +
+				"Each tool call's total input must be under 10,000 characters. " +
+				"Use Write for the first section (end with APPEND marker comment), " +
+				"then Edit with old_string targeting the APPEND marker to continue.",
 			isError: true,
 			durationMs: Date.now() - start,
 			broken: true,
@@ -748,20 +766,28 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
  * fields with a short placeholder so the DB record is readable.
  */
 function sanitizeBrokenInput(
-	_toolName: string,
+	toolName: string,
 	input: Record<string, unknown>,
 	locale: string,
 ): Record<string, unknown> {
 	const placeholder = getToolMessage("brokenToolCallInputPlaceholder", (locale as Locale) ?? "en");
 	const clean: Record<string, unknown> = {};
+	const isEdit = toolName === "Edit" || toolName === "MultiEdit";
 
 	// If input is just { _raw: "..." }, extract file_path and note the raw length
 	if ("_raw" in input && Object.keys(input).length === 1) {
 		const raw = input._raw as string;
+		const charsNote = `${placeholder} (${raw.length} chars received)`;
 		// Try to extract file_path from the incomplete JSON
 		const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
-		clean.file_path = filePathMatch ? filePathMatch[1] : "[Unknown]";
-		clean.content = `${placeholder} (${raw.length} chars received)`;
+		clean.file_path = filePathMatch ? filePathMatch[1] : "";
+		// Use the correct field names so the frontend can render properly
+		if (isEdit) {
+			clean.old_string = charsNote;
+			clean.new_string = charsNote;
+		} else {
+			clean.content = charsNote;
+		}
 	} else {
 		// Normal case: copy non-content fields, replace content fields
 		for (const [key, value] of Object.entries(input)) {
@@ -772,11 +798,15 @@ function sanitizeBrokenInput(
 				clean[key] = value;
 			}
 		}
-		// Ensure file_path exists for Write/Edit tools
-		if (!("file_path" in clean) && !("old_string" in clean)) {
-			clean.file_path = "[Unknown]";
+		// Ensure file_path is always present
+		if (!("file_path" in clean)) {
+			clean.file_path = "";
 		}
-		if (!("content" in clean) && !("old_string" in clean) && !("new_string" in clean)) {
+		// Ensure content fields exist with correct names for the tool type
+		if (isEdit) {
+			if (!("old_string" in clean)) clean.old_string = placeholder;
+			if (!("new_string" in clean)) clean.new_string = placeholder;
+		} else if (!("content" in clean)) {
 			clean.content = placeholder;
 		}
 	}

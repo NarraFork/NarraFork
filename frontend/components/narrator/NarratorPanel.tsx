@@ -1,64 +1,42 @@
 import {
 	ActionIcon,
-	Alert,
 	Badge,
 	Box,
 	Button,
 	Center,
 	CloseButton,
-	Divider,
 	Group,
 	Image,
 	Loader,
 	Menu,
 	Modal,
 	NativeSelect,
-	Paper,
 	ScrollArea,
 	Stack,
 	Text,
 	Textarea,
 	TextInput,
-	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
-	IconAlertTriangle,
 	IconArchive,
 	IconArrowDown,
 	IconArrowLeft,
 	IconArrowsMinimize,
 	IconCheck,
-	IconChevronDown,
-	IconChevronRight,
 	IconCode,
 	IconCodeOff,
-	IconEye,
-	IconHandStop,
 	IconPaperclip,
-	IconPencilCheck,
-	IconRobot,
 	IconShield,
-	IconShieldOff,
 	IconSparkles,
 	IconTerminal,
-	IconTrash,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import {
-	memo,
-	startTransition,
-	useCallback,
-	useEffect,
-	useLayoutEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import {
@@ -67,1411 +45,39 @@ import {
 	useInterruptNarrator,
 	useNarrator,
 	useNarratorMessages,
-	useToolCallDetail,
 	useUpdateModel,
 	useUpdatePermissionMode,
 } from "../../hooks/useNarrator";
-import { useNarratorWS } from "../../hooks/useNarratorWS";
-import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api, type PaginatedMessages, type TreeMessage } from "../../lib/api";
+import { api, type TreeMessage } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { ChapterBar } from "./ChapterBar";
-import { ContentViewer } from "./ContentViewer";
-import { LazyCollapse } from "./LazyCollapse";
-import { MessageBubble } from "./MessageBubble";
 import {
-	type MessageContextMenuActions,
-	MessageContextMenuCtx,
-	useMessageContextMenu,
-} from "./MessageContextMenuCtx";
-import {
-	findMsgByToolUseIdInTree,
-	insertChildIntoCache,
-	type MessageIndex,
-	mergeToolCallFieldsInTree,
-	removeSubagentStreamingChunk,
-	updateToolCallByIndex,
-	updateToolUseIndex,
-	upsertSubagentStreamingChunk,
-} from "./message-tree-utils";
+	MemoizedPageElements,
+	RenderProgress,
+	renderToolRun,
+	StreamingBubble,
+} from "./MessageRenderer";
+import { findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorForkSelector } from "./NarratorForkSelector";
-
-import type { PendingPermission, ToolCallData } from "./ToolCallCard";
+import type {
+	ContentBlock,
+	MessagesPage,
+	MessagesQueryData,
+	NarratorMsg,
+	NarratorPanelProps,
+	TodoItem,
+} from "./narrator-panel-types";
 import {
-	ElapsedTimer,
-	LatestTodosToolUseIdCtx,
-	STATUS_COLORS,
-	StatusIcon,
-	ToolCallCard,
-} from "./ToolCallCard";
-
-// Inject highlight blink animation
-if (typeof document !== "undefined") {
-	const id = "narrator-highlight-blink";
-	if (!document.getElementById(id)) {
-		const style = document.createElement("style");
-		style.id = id;
-		style.textContent = `@keyframes highlight-blink {
-			0%, 100% { background-color: transparent }
-			25%, 75% { background-color: var(--mantine-color-yellow-light) }
-		}
-		@keyframes indeterminate-slide {
-			0% { transform: translateX(-100%) }
-			100% { transform: translateX(433%) }
-		}
-		@media (max-width: 768px) {
-			.context-ring { width: 14px !important; height: 14px !important; display: flex !important; align-items: center; justify-content: center; }
-			.context-ring svg { width: 14px; height: 14px; display: block; }
-		}`;
-		document.head.appendChild(style);
-	}
-}
-
-interface TodoItem {
-	content?: string;
-	status?: string;
-	activeForm?: string;
-}
-
-type MessagesPage = PaginatedMessages;
-
-interface MessagesQueryData {
-	pages: MessagesPage[];
-	pageParams: unknown[];
-}
-
-// --- Message-level types ---
-
-interface ContentBlock {
-	type: string;
-	text?: string;
-	name?: string;
-	id?: string;
-	input?: Record<string, unknown>;
-	[key: string]: unknown;
-}
-
-interface ToolCallRow {
-	id?: string;
-	toolUseId: string;
-	toolName: string;
-	inputJson?: unknown;
-	outputJson?: unknown;
-	status?: string;
-	durationMs?: number;
-	errorMessage?: string;
-	permissionDecisionReason?: string | null;
-	permissionSuggestions?: unknown[] | null;
-	createdAt?: string;
-	permissionDecidedAt?: string | null;
-}
-
-type NarratorMsg = TreeMessage;
-
-// --- Message-level helpers ---
-
-function isToolOnlyMessage(msg: NarratorMsg): boolean {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return (
-		msg.role === "assistant" &&
-		blocks.length > 0 &&
-		blocks.every(
-			(b: ContentBlock) => b.type === "tool_use" || (b.type === "text" && !b.text?.trim()),
-		)
-	);
-}
-
-/** Check if an assistant message contains at least one tool_use block. */
-function hasToolUse(msg: NarratorMsg): boolean {
-	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some((b: ContentBlock) => b.type === "tool_use");
-}
-
-/** Resolve ALL tool_use blocks from a message (one message may contain multiple tool calls). */
-function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	const results: ToolCallData[] = [];
-	for (const block of blocks) {
-		if (block.type !== "tool_use") continue;
-		const tc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === block.id);
-		const status = tc?.status ?? "running";
-		// Derive startedAt for in-progress tools from persisted timestamps so the
-		// elapsed timer works correctly when re-entering a session.
-		let startedAt: number | undefined;
-		if (status === "running" || status === "pending" || status === "initializing") {
-			const ts = tc?.permissionDecidedAt ?? tc?.createdAt;
-			if (ts) startedAt = new Date(ts).getTime();
-		}
-		results.push({
-			id: tc?.id,
-			toolName: block.name ?? "",
-			toolUseId: block.id,
-			inputJson: tc?.inputJson ?? block.input,
-			outputJson: tc?.outputJson,
-			status,
-			durationMs: tc?.durationMs,
-			errorMessage: tc?.errorMessage,
-			permissionDecisionReason: tc?.permissionDecisionReason,
-			permissionSuggestions: tc?.permissionSuggestions,
-			startedAt,
-		});
-	}
-	return results;
-}
-
-/** Resolve a PendingPermission from a tool call's data or WS state fallback. */
-function resolvePendingPerm(
-	tc: ToolCallData,
-	wsPerm: PendingPermission | null | undefined,
-	wsPermsMap?: Map<string, PendingPermission>,
-): PendingPermission | null {
-	// Prefer WS-sourced permissions — they carry the full (untruncated) inputJson.
-	// The message-list API truncates large inputJson, so building from tc.inputJson
-	// would lose data (e.g. ExitPlanMode plan text).
-	if (wsPermsMap && tc.toolUseId) {
-		const fromMap = wsPermsMap.get(tc.toolUseId);
-		if (fromMap) return fromMap;
-	}
-	if (wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
-		return wsPerm;
-	}
-	// Fallback: build from the tool call record itself (status-driven path,
-	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
-	if (tc.status === "pending" && tc.toolUseId) {
-		return {
-			id: tc.id ?? tc.toolUseId,
-			toolName: tc.toolName,
-			toolUseId: tc.toolUseId,
-			inputJson: tc.inputJson,
-			decisionReason: tc.permissionDecisionReason ?? undefined,
-			suggestions: tc.permissionSuggestions ?? undefined,
-		} as PendingPermission;
-	}
-	return null;
-}
-
-// --- SubagentCard: renders a Task tool call with its child messages (pre-nested from backend) ---
-
-interface SubagentCardProps {
-	toolCall: ToolCallData;
-	childMessages: NarratorMsg[];
-	narratorId: string;
-	inRun?: boolean;
-	isLast?: boolean;
-	isSoleInRun?: boolean;
-	permCb?: PermissionCallbacks;
-	editExpandOverride?: boolean | null;
-	onBgAgentRetry?: (toolUseId: string) => void;
-}
-
-const SubagentCard = memo(
-	function SubagentCard({
-		toolCall,
-		childMessages,
-		narratorId,
-		inRun,
-		isLast,
-		isSoleInRun,
-		permCb,
-		editExpandOverride,
-		onBgAgentRetry,
-	}: SubagentCardProps) {
-		const { t } = useTranslation("narrator");
-		const input = toolCall.inputJson ?? {};
-		const isBackground = !!input.run_in_background;
-		const agentType = input.subagent_type ?? "agent";
-		const isBgWarning = isBackground && !/^explore$/i.test(agentType);
-		const dismissed =
-			(toolCall.toolUseId && permCb?.bgRetryDismissedIds?.has(toolCall.toolUseId)) ?? false;
-		const showBgWarning = isBgWarning && !dismissed && !!onBgAgentRetry;
-		const isTerminal = /^(success|completed|denied|error|fail)$/.test(toolCall.status);
-		const soleAndRunning = !!isSoleInRun && !isTerminal;
-		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
-		const [showPrompt, setShowPrompt] = useState(false);
-		const [showCalls, setShowCalls] = useState(soleAndRunning);
-		const description = input.description ?? input.prompt?.slice(0, 80) ?? "Subagent";
-		const prompt = input.prompt ?? "";
-		const resolvedModel = childMessages[0]?.subagentModel ?? input.model;
-		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
-
-		// Clamp card height to 80% of the nearest scroll container (chat viewport).
-		// Read once after mount via DOM traversal — works regardless of render timing.
-		const cardRef = useRef<HTMLDivElement>(null);
-		const scrollBoxRef = useRef<HTMLDivElement>(null);
-		const [vpHeight, setVpHeight] = useState<number | undefined>();
-		useEffect(() => {
-			const node = cardRef.current;
-			if (!node || vpHeight) return;
-			let el: HTMLElement | null = node.parentElement;
-			while (el) {
-				const ov = getComputedStyle(el).overflowY;
-				if (ov === "scroll" || ov === "auto") {
-					setVpHeight(el.clientHeight * 0.7);
-					return;
-				}
-				el = el.parentElement;
-			}
-		});
-		const prevChildCount = useRef(childMessages.length);
-		useEffect(() => {
-			const el = scrollBoxRef.current;
-			if (!el) return;
-			if (childMessages.length > prevChildCount.current) {
-				el.scrollTop = el.scrollHeight;
-			}
-			prevChildCount.current = childMessages.length;
-		}, [childMessages.length]);
-		// Scroll to bottom after expand animation finishes (LazyCollapse ~200ms)
-		useEffect(() => {
-			if (!expanded) return;
-			const t = setTimeout(() => {
-				const el = scrollBoxRef.current;
-				if (el) el.scrollTop = el.scrollHeight;
-			}, 250);
-			return () => clearTimeout(t);
-		}, [expanded]);
-
-		// Extract result text from outputJson
-		const isTruncatedOutput = toolCall.outputJson?._truncated === true;
-		const { data: fullTc } = useToolCallDetail(
-			narratorId,
-			toolCall.toolUseId ?? "",
-			isTruncatedOutput && expanded,
-		);
-		const resultText = useMemo(() => {
-			const out = toolCall.outputJson;
-			if (!out) return "";
-			if (typeof out === "string") return out;
-			// Handle truncated output from backend
-			if (out._truncated && typeof out.preview === "string") return out.preview;
-			if (Array.isArray(out)) {
-				return out
-					.filter((b: ContentBlock) => b.text)
-					.map((b: ContentBlock) => b.text)
-					.join("\n");
-			}
-			return "";
-		}, [toolCall.outputJson]);
-		const fullResultText = useMemo(() => {
-			if (!fullTc?.outputJson) return undefined;
-			const out = fullTc.outputJson;
-			if (typeof out === "string") return out;
-			if (Array.isArray(out)) {
-				return out
-					.filter((b: ContentBlock) => b.text)
-					.map((b: ContentBlock) => b.text)
-					.join("\n");
-			}
-			return undefined;
-		}, [fullTc?.outputJson]);
-
-		// Determine if this subagent type should render results as markdown
-		const useMarkdown = /^explore$/i.test(agentType);
-		const childToolCalls: {
-			tc: ToolCallData;
-			toolUseId: string | null;
-			msgId: string;
-			childMsg: NarratorMsg;
-		}[] = [];
-		for (const cm of childMessages) {
-			if (!hasToolUse(cm)) continue;
-			for (const tc of resolveAllToolCallsFromMsg(cm)) {
-				childToolCalls.push({ tc, toolUseId: tc.toolUseId ?? null, msgId: cm.id, childMsg: cm });
-			}
-		}
-
-		const totalMs = toolCall.durationMs ?? 0;
-
-		// Find the child tool call that has a pending permission (if any)
-		const permChild =
-			childToolCalls.find((c) => c.tc.status === "pending") ??
-			childToolCalls.find((c) => c.tc.toolUseId && permCb?.pendingPermsMap?.has(c.tc.toolUseId)) ??
-			(permCb?.pendingPermission?.toolUseId
-				? childToolCalls.find((c) => c.tc.toolUseId === permCb.pendingPermission?.toolUseId)
-				: null);
-
-		// Auto-expand the subagent card AND tool calls list when a child needs permission,
-		// then scroll to bottom after LazyCollapse animation finishes
-		const permChildId = permChild?.toolUseId ?? null;
-		useEffect(() => {
-			if (permChildId) {
-				setExpanded(true);
-				setShowCalls(true);
-				const t = setTimeout(() => {
-					const el = scrollBoxRef.current;
-					if (el) el.scrollTop = el.scrollHeight;
-				}, 300);
-				return () => clearTimeout(t);
-			}
-		}, [permChildId]);
-
-		// When subagent finishes: collapse tool calls list
-		useEffect(() => {
-			if (isTerminal) {
-				setShowCalls(false);
-			}
-		}, [isTerminal]);
-
-		// --- Swipe / context-menu for SubagentCard itself ---
-		const parentMsgCtx = useMessageContextMenu();
-		const hasCardActions = !!(parentMsgCtx.onDeleteMessage || parentMsgCtx.onCompactBeforeMessage);
-
-		const swipe = useSwipeMenu({ enabled: hasCardActions });
-
-		const handleViewSession = useCallback(() => {
-			setExpanded(true);
-			setShowCalls(true);
-			swipe.closeSwipe();
-			// Scroll to bottom after expand animation
-			setTimeout(() => {
-				const el = scrollBoxRef.current;
-				if (el) el.scrollTop = el.scrollHeight;
-			}, 300);
-		}, [swipe.closeSwipe]);
-
-		const cardMenuItems = (
-			<>
-				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
-					{t("viewSubagentSession")}
-				</Menu.Item>
-				{parentMsgCtx.onCompactBeforeMessage && (
-					<Menu.Item
-						leftSection={<IconArrowsMinimize size={14} />}
-						onClick={() => {
-							parentMsgCtx.onCompactBeforeMessage?.();
-							swipe.closeSwipe();
-						}}
-					>
-						{t("contextMenu_compactBefore")}
-					</Menu.Item>
-				)}
-				{parentMsgCtx.onDeleteMessage && (
-					<Menu.Item
-						color="red"
-						leftSection={<IconTrash size={14} />}
-						onClick={() => {
-							parentMsgCtx.onDeleteMessage?.();
-							swipe.closeSwipe();
-						}}
-					>
-						{t("contextMenu_delete")}
-					</Menu.Item>
-				)}
-			</>
-		);
-
-		// Prevent child ContentViewers / ToolCallCards from inheriting
-		// the parent message's swipe/context-menu actions
-		const emptyCtx: MessageContextMenuActions = {};
-
-		const content = (
-			<MessageContextMenuCtx.Provider value={emptyCtx}>
-				<Box ref={cardRef}>
-					{/* Header: two-line collapsed view */}
-					<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
-						{/* Line 1: icon | type | model | calls | status | duration | chevron */}
-						<Group gap={6} wrap="nowrap">
-							<ThemeIcon size={18} variant="light" color="indigo" radius="sm">
-								<IconRobot size={12} />
-							</ThemeIcon>
-							<Badge size="xs" variant="light" color="indigo">
-								{agentType}
-							</Badge>
-							{resolvedModel && (
-								<Badge size="xs" variant="light" color="violet">
-									{resolvedModel}
-								</Badge>
-							)}
-							<Box style={{ flex: 1 }} />
-							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-								{childToolCalls.length > 0 && (
-									<Text size="xs" c="dimmed">
-										{childToolCalls.length} calls
-									</Text>
-								)}
-								<Box c={statusColor}>
-									<StatusIcon status={toolCall.status} />
-								</Box>
-								{toolCall.startedAt != null && !isTerminal ? (
-									<ElapsedTimer startedAt={toolCall.startedAt} />
-								) : (
-									totalMs > 0 && (
-										<Text size="xs" c="dimmed" ff="monospace">
-											{(totalMs / 1000).toFixed(1)}s
-										</Text>
-									)
-								)}
-								{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-							</Group>
-						</Group>
-						{/* Line 2: description (truncated when collapsed) */}
-						<Text
-							size="xs"
-							c="dimmed"
-							mt={2}
-							ml={24}
-							truncate={!expanded}
-							style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
-						>
-							{description}
-						</Text>
-					</UnstyledButton>
-					<Box>
-						<LazyCollapse in={expanded}>
-							{/* Background agent warning */}
-							{showBgWarning && (
-								<Alert
-									icon={<IconAlertTriangle size={16} />}
-									color="orange"
-									variant="light"
-									mx="xs"
-									mb={4}
-									p="xs"
-									styles={{ message: { fontSize: 12 } }}
-								>
-									<Group gap="xs" justify="space-between" wrap="nowrap">
-										<Text size="xs">{t("bgAgentWarning")}</Text>
-										<Button
-											size="compact-xs"
-											variant="light"
-											color="orange"
-											style={{ flexShrink: 0 }}
-											onClick={() => onBgAgentRetry(toolCall.toolUseId ?? "")}
-										>
-											{t("bgAgentRetry")}
-										</Button>
-									</Group>
-								</Alert>
-							)}
-							{/* Result — shown directly when expanded */}
-							{resultText && (
-								<Box px="xs" pb={4}>
-									<ContentViewer
-										content={resultText}
-										fullContent={fullResultText}
-										style={{
-											fontSize: 11,
-											maxHeight: 300,
-											overflow: "auto",
-											whiteSpace: "pre-wrap",
-										}}
-										title={`${agentType} — ${description}`}
-										markdown={useMarkdown}
-										contentType={useMarkdown ? "markdown" : "code"}
-									/>
-								</Box>
-							)}
-							{/* Prompt — collapsed by default */}
-							{prompt && (
-								<Box px="xs" pb={4}>
-									<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
-										<Group gap={4}>
-											{showPrompt ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-											<Text size="xs" c="dimmed" fw={500}>
-												Prompt
-											</Text>
-										</Group>
-									</UnstyledButton>
-									<LazyCollapse in={showPrompt}>
-										<Box mt={4}>
-											<ContentViewer
-												content={prompt}
-												style={{
-													fontSize: 11,
-													maxHeight: 200,
-													overflow: "auto",
-													whiteSpace: "pre-wrap",
-												}}
-												title="Prompt"
-											/>
-										</Box>
-									</LazyCollapse>
-								</Box>
-							)}
-							{/* Child tool calls — collapsed by default */}
-							{childToolCalls.length > 0 && (
-								<Box px="xs" pb="xs">
-									<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
-										<Group gap={4}>
-											{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-											<Text size="xs" c="dimmed">
-												{childToolCalls.length} tool calls
-											</Text>
-										</Group>
-									</UnstyledButton>
-									<LazyCollapse in={showCalls}>
-										<Box
-											ref={scrollBoxRef}
-											pl="xs"
-											mt={4}
-											style={{
-												overflow: "hidden auto",
-												maxHeight: vpHeight,
-											}}
-										>
-											{(() => {
-												const els: React.ReactNode[] = [];
-												let ci = 0;
-												while (ci < childToolCalls.length) {
-													const item = childToolCalls[ci];
-													const subCh = filterChildrenByToolUse(
-														item.childMsg?.children,
-														item.tc.toolUseId,
-													);
-													const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Task";
-													if (isSub) {
-														els.push(
-															<div
-																key={item.toolUseId ?? item.tc.toolName}
-																id={
-																	item.toolUseId
-																		? `tool-use-${item.toolUseId}`
-																		: `msg-${item.msgId}`
-																}
-															>
-																<SubagentCard
-																	toolCall={item.tc}
-																	childMessages={subCh ?? []}
-																	narratorId={narratorId}
-																	permCb={permCb}
-																	editExpandOverride={editExpandOverride}
-																	onBgAgentRetry={permCb?.onBgAgentRetry}
-																/>
-															</div>,
-														);
-														ci++;
-														continue;
-													}
-													// Collect consecutive non-subagent calls into a run
-													const run: typeof childToolCalls = [item];
-													let j = ci + 1;
-													while (j < childToolCalls.length) {
-														const nx = childToolCalls[j];
-														const nxCh = filterChildrenByToolUse(
-															nx.childMsg?.children,
-															nx.tc.toolUseId,
-														);
-														if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Task") break;
-														run.push(nx);
-														j++;
-													}
-													if (run.length >= 2) {
-														els.push(
-															<Box
-																key={`crun-${run[0].msgId}`}
-																style={{
-																	border: "1px solid var(--mantine-color-default-border)",
-																	borderRadius: "var(--mantine-radius-sm)",
-																	overflow: "hidden",
-																}}
-															>
-																{run.map((r, ri) => {
-																	const mp = resolvePendingPerm(
-																		r.tc,
-																		permCb?.pendingPermission,
-																		permCb?.pendingPermsMap,
-																	);
-																	return (
-																		<div
-																			key={r.toolUseId ?? r.tc.toolName}
-																			id={
-																				r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
-																			}
-																		>
-																			<ToolCallCard
-																				toolCall={r.tc}
-																				narratorId={narratorId}
-																				inRun
-																				isLast={ri === run.length - 1}
-																				pendingPermission={mp}
-																				onPermissionDecision={permCb?.onPermissionDecision}
-																				onQuestionSubmit={permCb?.onQuestionSubmit}
-																				onQuestionDeny={permCb?.onQuestionDeny}
-																				editExpandOverride={editExpandOverride}
-																			/>
-																		</div>
-																	);
-																})}
-															</Box>,
-														);
-													} else {
-														const r = run[0];
-														const mp = resolvePendingPerm(
-															r.tc,
-															permCb?.pendingPermission,
-															permCb?.pendingPermsMap,
-														);
-														els.push(
-															<div
-																key={r.toolUseId ?? r.tc.toolName}
-																id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
-															>
-																<ToolCallCard
-																	toolCall={r.tc}
-																	narratorId={narratorId}
-																	pendingPermission={mp}
-																	onPermissionDecision={permCb?.onPermissionDecision}
-																	onQuestionSubmit={permCb?.onQuestionSubmit}
-																	onQuestionDeny={permCb?.onQuestionDeny}
-																	editExpandOverride={editExpandOverride}
-																/>
-															</div>,
-														);
-													}
-													ci = j;
-												}
-												return els;
-											})()}
-										</Box>
-									</LazyCollapse>
-								</Box>
-							)}
-						</LazyCollapse>
-					</Box>
-					{inRun && !isLast && <Divider />}
-				</Box>
-			</MessageContextMenuCtx.Provider>
-		);
-
-		const swipeMenu =
-			hasCardActions &&
-			(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
-			(() => {
-				const menuEl = swipe.swipeMenuRef.current;
-				const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
-				return (
-					<Box
-						ref={swipe.swipeMenuRef}
-						style={{
-							position: "fixed",
-							left: pos.left,
-							top: pos.top,
-							transform: "translateY(-50%)",
-							zIndex: 1000,
-							transition: swipe.swipeMenuTransition,
-							pointerEvents: swipe.swipeClosing ? "none" : "auto",
-						}}
-					>
-						<Menu opened withinPortal={false} position="bottom-start">
-							<Menu.Dropdown style={{ position: "relative", width: 180 }}>
-								{cardMenuItems}
-							</Menu.Dropdown>
-						</Menu>
-					</Box>
-				);
-			})();
-
-		const ctxMenu = hasCardActions && (
-			<Menu
-				opened={swipe.ctxMenuOpened}
-				onChange={swipe.setCtxMenuOpened}
-				position="bottom-start"
-				withinPortal
-				styles={{
-					dropdown: {
-						position: "fixed",
-						left: swipe.ctxMenuPos.x,
-						...(swipe.ctxMenuPos.flipY
-							? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
-							: { top: swipe.ctxMenuPos.y }),
-					},
-				}}
-			>
-				<Menu.Target>
-					<div
-						style={{
-							position: "fixed",
-							left: swipe.ctxMenuPos.x,
-							top: swipe.ctxMenuPos.y,
-							pointerEvents: "none",
-						}}
-					/>
-				</Menu.Target>
-				<Menu.Dropdown>{cardMenuItems}</Menu.Dropdown>
-			</Menu>
-		);
-
-		if (inRun) {
-			return (
-				<>
-					<Box
-						ref={swipe.swipeBoxRef}
-						onContextMenu={swipe.handleContextMenu}
-						style={swipe.swipeStyle}
-					>
-						{content}
-					</Box>
-					{swipeMenu}
-					{ctxMenu}
-				</>
-			);
-		}
-
-		return (
-			<>
-				<Box
-					ref={swipe.swipeBoxRef}
-					onContextMenu={swipe.handleContextMenu}
-					style={swipe.swipeStyle}
-				>
-					<Paper withBorder radius="sm" style={{ overflow: "hidden" }}>
-						{content}
-					</Paper>
-				</Box>
-				{swipeMenu}
-				{ctxMenu}
-			</>
-		);
-	},
-	(prev, next) =>
-		prev.toolCall === next.toolCall &&
-		prev.childMessages === next.childMessages &&
-		prev.narratorId === next.narratorId &&
-		prev.inRun === next.inRun &&
-		prev.isLast === next.isLast &&
-		prev.isSoleInRun === next.isSoleInRun &&
-		prev.editExpandOverride === next.editExpandOverride &&
-		prev.permCb?.pendingPermsMap === next.permCb?.pendingPermsMap &&
-		prev.permCb?.bgRetryDismissedIds === next.permCb?.bgRetryDismissedIds,
-);
-
-interface PermissionCallbacks {
-	pendingPermission: PendingPermission | null;
-	pendingPermsMap: Map<string, PendingPermission>;
-	onPermissionDecision: (
-		requestId: string,
-		decision: "allow" | "deny",
-		feedbackText?: string,
-		compactAfter?: boolean,
-	) => void;
-	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
-	onQuestionDeny: (requestId: string) => void;
-	onBgAgentRetry?: (toolUseId: string) => void;
-	bgRetryDismissedIds?: Set<string>;
-}
-
-/** A single tool call item flattened from messages (one message may yield multiple items). */
-interface FlatToolItem {
-	tc: ToolCallData;
-	msg: NarratorMsg;
-	/** Children only exist on subagent (Task) tool calls */
-	children: NarratorMsg[] | undefined;
-	isSubagent: boolean;
-}
-
-/** Filter child messages to only those belonging to a specific tool call. */
-function filterChildrenByToolUse(
-	children: NarratorMsg[] | undefined,
-	toolUseId: string | undefined,
-): NarratorMsg[] | undefined {
-	return children && toolUseId ? children.filter((c) => c.parentToolUseId === toolUseId) : children;
-}
-
-/** Flatten a run of tool-only messages into individual tool call items. */
-function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
-	const items: FlatToolItem[] = [];
-	for (const m of run) {
-		const allTcs = resolveAllToolCallsFromMsg(m);
-		for (const tc of allTcs) {
-			const allChildren = m.children;
-			// When a single message contains multiple parallel Task calls, all subagent
-			// child messages end up in the same `children` array. Filter by parentToolUseId
-			// so each Task only sees its own subagent's messages.
-			const children = filterChildrenByToolUse(allChildren, tc.toolUseId);
-			const isSubagent = tc.toolName === "Task" || (children != null && children.length > 0);
-			items.push({ tc, msg: m, children: isSubagent ? children : undefined, isSubagent });
-		}
-	}
-	return items;
-}
-
-function renderToolRun(
-	run: NarratorMsg[],
-	narratorId: string,
-	permCb: PermissionCallbacks,
-	expandedToolUseId?: string | null,
-	highlightedId?: string | null,
-	editExpandOverride?: boolean | null,
-	onForkFromMessage?: (uuid: string) => void,
-	onDeleteMessage?: (messageId: string) => void,
-	onBranchFromMessage?: (messageId: string) => void,
-	onCompactBeforeMessage?: (messageId: string) => void,
-) {
-	const matchPermission = (tc: ToolCallData) =>
-		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
-	const items = flattenToolRun(run);
-	if (items.length === 0) return null;
-
-	const taskCount = items.filter((it) => it.isSubagent).length;
-	const soleSubagent = taskCount === 1;
-
-	const renderItem = (item: FlatToolItem, idx: number, total: number) => {
-		const key = item.tc.toolUseId ?? `${item.msg.id}-${idx}`;
-		const hlStyle =
-			highlightedId === item.msg.id
-				? {
-						animation: "highlight-blink 1.5s ease",
-						borderRadius: "var(--mantine-radius-sm)",
-					}
-				: undefined;
-
-		// Build context menu actions for this tool call's parent message
-		const ctxActions: MessageContextMenuActions = {};
-		const msgUuid = item.msg.messageUuid;
-		const msgId = item.msg.id;
-		if (msgId && onBranchFromMessage) {
-			ctxActions.onBranchFromMessage = () => onBranchFromMessage(msgId);
-		}
-		if (msgUuid && onForkFromMessage) {
-			ctxActions.onForkFromMessage = () => onForkFromMessage(msgUuid);
-		}
-		if (msgId && onCompactBeforeMessage) {
-			ctxActions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
-		}
-		if (msgId && onDeleteMessage) {
-			ctxActions.onDeleteMessage = () => onDeleteMessage(msgId);
-		}
-
-		if (item.isSubagent) {
-			return (
-				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-					<div
-						id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-						style={hlStyle}
-					>
-						<SubagentCard
-							toolCall={item.tc}
-							childMessages={item.children ?? []}
-							narratorId={narratorId}
-							inRun={total >= 2}
-							isLast={idx === total - 1}
-							isSoleInRun={soleSubagent}
-							permCb={permCb}
-							editExpandOverride={editExpandOverride}
-							onBgAgentRetry={permCb?.onBgAgentRetry}
-						/>
-					</div>
-				</MessageContextMenuCtx.Provider>
-			);
-		}
-		return (
-			<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-				<div
-					id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-					style={hlStyle}
-				>
-					<ToolCallCard
-						toolCall={item.tc}
-						narratorId={narratorId}
-						inRun={total >= 2}
-						isLast={idx === total - 1}
-						pendingPermission={matchPermission(item.tc)}
-						onPermissionDecision={permCb.onPermissionDecision}
-						onQuestionSubmit={permCb.onQuestionSubmit}
-						onQuestionDeny={permCb.onQuestionDeny}
-						forceExpand={expandedToolUseId === item.tc.toolUseId}
-						editExpandOverride={editExpandOverride}
-					/>
-				</div>
-			</MessageContextMenuCtx.Provider>
-		);
-	};
-
-	if (items.length >= 2) {
-		return (
-			<Box
-				key={`tool-run-${run[0].id}`}
-				style={{
-					border: "1px solid var(--mantine-color-default-border)",
-					borderRadius: "var(--mantine-radius-sm)",
-					overflow: "hidden",
-				}}
-			>
-				{items.map((item, idx) => renderItem(item, idx, items.length))}
-			</Box>
-		);
-	}
-
-	return renderItem(items[0], 0, 1);
-}
-
-function renderTreeMessages(
-	messages: NarratorMsg[],
-	narratorId: string,
-	onForkFromMessage: ((uuid: string) => void) | undefined,
-	highlightedId: string | null,
-	permCb: PermissionCallbacks,
-	expandedToolUseId?: string | null,
-	editExpandOverride?: boolean | null,
-	showTokenUsage?: boolean,
-	onDeleteMessage?: (messageId: string) => void,
-	onBranchFromMessage?: (messageId: string) => void,
-	pruneBoundaryMessageId?: string | null,
-	pruneDividerLabel?: string,
-	onCompactBeforeMessage?: (messageId: string) => void,
-): { elements: React.ReactNode[] } {
-	// Messages are already tree-structured from the backend (children nested).
-	// Group consecutive assistant messages with tool_use blocks into visual "runs".
-	// A message with text + tool_use renders its text first, then its tool calls
-	// merge forward with subsequent tool-bearing messages.
-	const elements: React.ReactNode[] = [];
-	let i = 0;
-
-	while (i < messages.length) {
-		const msg = messages[i];
-
-		// Skip deferred streaming chunks — they are rendered after the StreamingBubble
-		if (msg._noMerge && msg.id === STREAMING_CHUNKS_MSG_ID) {
-			i++;
-			continue;
-		}
-
-		if (hasToolUse(msg)) {
-			// Render leading text (non-tool blocks) of this message if it's not tool-only
-			if (!isToolOnlyMessage(msg)) {
-				const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-				const textBlocks = blocks.filter((b: ContentBlock) => b.type !== "tool_use");
-				if (textBlocks.some((b: ContentBlock) => b.type === "text" && b.text?.trim())) {
-					elements.push(
-						<Box
-							key={`${msg.id}-text`}
-							id={`msg-${msg.id}`}
-							style={{
-								borderRadius: "var(--mantine-radius-md)",
-								animation: highlightedId === msg.id ? "highlight-blink 1.5s ease" : undefined,
-							}}
-						>
-							{showTokenUsage && msg.tokensIn != null && (
-								<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-									↑ {(msg.tokensIn as number).toLocaleString()}
-								</Text>
-							)}
-							<MessageBubble
-								narratorId={narratorId}
-								message={{
-									...msg,
-									contentJson: textBlocks,
-									toolCalls: [],
-								}}
-								onForkFromMessage={onForkFromMessage}
-								onBranchFromMessage={onBranchFromMessage}
-								resolvePerm={(tc) =>
-									resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap)
-								}
-								onPermissionDecision={permCb.onPermissionDecision}
-								onQuestionSubmit={permCb.onQuestionSubmit}
-								onQuestionDeny={permCb.onQuestionDeny}
-								onCompactBeforeMessage={onCompactBeforeMessage}
-								onDeleteMessage={onDeleteMessage}
-							/>
-						</Box>,
-					);
-				}
-			}
-
-			// Collect this message and subsequent tool-bearing messages into a run.
-			// Respect _noMerge flag on synthetic streaming messages — when the model
-			// emitted text before these tool chunks, they should render separately.
-			const run: NarratorMsg[] = [msg];
-			let j = i + 1;
-			while (
-				j < messages.length &&
-				hasToolUse(messages[j]) &&
-				isToolOnlyMessage(messages[j]) &&
-				!messages[j]._noMerge
-			) {
-				run.push(messages[j]);
-				j++;
-			}
-			const el = renderToolRun(
-				run,
-				narratorId,
-				permCb,
-				expandedToolUseId,
-				highlightedId,
-				editExpandOverride,
-				onForkFromMessage,
-				onDeleteMessage,
-				onBranchFromMessage,
-				onCompactBeforeMessage,
-			);
-			if (el) elements.push(el);
-
-			// Insert prune divider if any message in this run is the boundary
-			if (pruneBoundaryMessageId && run.some((m) => m.id === pruneBoundaryMessageId)) {
-				elements.push(
-					<Divider
-						key="prune-boundary"
-						my="xs"
-						label={pruneDividerLabel}
-						labelPosition="center"
-						color="yellow.7"
-						styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
-					/>,
-				);
-			}
-
-			i = j;
-		} else {
-			elements.push(
-				<Box
-					key={msg.id}
-					id={`msg-${msg.id}`}
-					style={{
-						borderRadius: "var(--mantine-radius-md)",
-						animation: highlightedId === msg.id ? "highlight-blink 1.5s ease" : undefined,
-					}}
-				>
-					{showTokenUsage && msg.role === "assistant" && msg.tokensIn != null && (
-						<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-							↑ {(msg.tokensIn as number).toLocaleString()}
-						</Text>
-					)}
-					<MessageBubble
-						narratorId={narratorId}
-						message={msg}
-						onForkFromMessage={onForkFromMessage}
-						onBranchFromMessage={onBranchFromMessage}
-						resolvePerm={(tc) =>
-							resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap)
-						}
-						onPermissionDecision={permCb.onPermissionDecision}
-						onQuestionSubmit={permCb.onQuestionSubmit}
-						onQuestionDeny={permCb.onQuestionDeny}
-						onCompactBeforeMessage={onCompactBeforeMessage}
-						onDeleteMessage={onDeleteMessage}
-					/>
-					{showTokenUsage && msg.turnUsageJson != null && (
-						<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
-							Σ {((msg.turnUsageJson as Record<string, number>).input_tokens ?? 0).toLocaleString()}{" "}
-							in ·{" "}
-							{((msg.turnUsageJson as Record<string, number>).output_tokens ?? 0).toLocaleString()}{" "}
-							out
-							{msg.costUsd != null &&
-								(msg.costUsd as number) > 0 &&
-								` · $${(msg.costUsd as number).toFixed(4)}`}
-						</Text>
-					)}
-				</Box>,
-			);
-
-			// Insert prune divider after the boundary message
-			if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
-				elements.push(
-					<Divider
-						key="prune-boundary"
-						my="xs"
-						label={pruneDividerLabel}
-						labelPosition="center"
-						color="yellow.7"
-						styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
-					/>,
-				);
-			}
-
-			i++;
-		}
-	}
-
-	return { elements };
-}
-
-// --- MemoizedPageElements: per-page memoized rendering to avoid re-rendering all pages on WS updates ---
-
-interface PageElementsProps {
-	page: MessagesPage;
-	narratorId: string;
-	onForkFromMessage: ((uuid: string) => void) | undefined;
-	onBranchFromMessage: ((messageId: string) => void) | undefined;
-	highlightedId: string | null;
-	permCb: PermissionCallbacks;
-	expandedToolUseId?: string | null;
-	editExpandOverride?: boolean | null;
-	showTokenUsage?: boolean;
-	/** When set, only render the last N messages of this page (for progressive rendering). */
-	maxMessages?: number;
-	onDeleteMessage?: (messageId: string) => void;
-	onCompactBeforeMessage?: (messageId: string) => void;
-	pruneBoundaryMessageId?: string | null;
-}
-
-const MemoizedPageElements = memo(
-	function PageElements({
-		page,
-		narratorId,
-		onForkFromMessage,
-		onBranchFromMessage,
-		highlightedId,
-		permCb,
-		expandedToolUseId,
-		editExpandOverride,
-		showTokenUsage,
-		maxMessages,
-		onDeleteMessage,
-		onCompactBeforeMessage,
-		pruneBoundaryMessageId,
-	}: PageElementsProps) {
-		const msgs =
-			maxMessages != null && maxMessages < page.messages.length
-				? page.messages.slice(page.messages.length - maxMessages)
-				: page.messages;
-		const { t } = useTranslation("narrator");
-		const { elements } = renderTreeMessages(
-			msgs,
-			narratorId,
-			onForkFromMessage,
-			highlightedId,
-			permCb,
-			expandedToolUseId,
-			editExpandOverride,
-			showTokenUsage,
-			onDeleteMessage,
-			onBranchFromMessage,
-			pruneBoundaryMessageId,
-			t("pruneBoundaryLabel"),
-			onCompactBeforeMessage,
-		);
-		return <>{elements}</>;
-	},
-	(prev, next) =>
-		prev.page === next.page &&
-		prev.narratorId === next.narratorId &&
-		prev.onForkFromMessage === next.onForkFromMessage &&
-		prev.onBranchFromMessage === next.onBranchFromMessage &&
-		prev.permCb.pendingPermsMap === next.permCb.pendingPermsMap &&
-		prev.permCb.bgRetryDismissedIds === next.permCb.bgRetryDismissedIds &&
-		prev.expandedToolUseId === next.expandedToolUseId &&
-		prev.editExpandOverride === next.editExpandOverride &&
-		prev.showTokenUsage === next.showTokenUsage &&
-		prev.maxMessages === next.maxMessages &&
-		prev.pruneBoundaryMessageId === next.pruneBoundaryMessageId,
-);
-
-// --- useProgressiveMessageCount: render messages in batches to avoid blocking the main thread ---
-// Works on the total message count rather than page-element count, so progressive
-// rendering is effective even when all messages fit in a single page.
-
-function useProgressiveMessageCount(
-	totalMessages: number,
-	batchSize: number,
-	skip: boolean,
-	resetKey: string,
-	viewportRef: React.RefObject<HTMLDivElement | null>,
-): { visibleCount: number; done: boolean } {
-	const [count, setCount] = useState(batchSize);
-	const prevTotalRef = useRef(totalMessages);
-	const prevResetKeyRef = useRef(resetKey);
-	const needsSnapRef = useRef(false);
-	// Track the effectiveCount that actually drives DOM rendering, so the
-	// useLayoutEffect can fire on the *same* render that changes the DOM —
-	// not one render later when the queued setCount finally takes effect.
-	const prevEffectiveRef = useRef(count);
-
-	let effectiveCount = count;
-	if (prevResetKeyRef.current !== resetKey) {
-		// Narrator switch — force progressive re-render from scratch.
-		// ⚠️ DO NOT skip progressive rendering even when cached data exists!
-		// The whole point of progressive rendering is to avoid blocking the
-		// main thread when there are many cached messages (100–200+). Rendering
-		// them all at once causes a visible hang / frame drop on entry.
-		prevResetKeyRef.current = resetKey;
-		prevTotalRef.current = totalMessages;
-		setCount(batchSize);
-		effectiveCount = batchSize;
-		needsSnapRef.current = true;
-	} else if (prevTotalRef.current !== totalMessages) {
-		const prevTotal = prevTotalRef.current;
-		prevTotalRef.current = totalMessages;
-		if (count > totalMessages) {
-			// Fewer messages than before (e.g. switched context) — reset
-			setCount(batchSize);
-			effectiveCount = batchSize;
-		} else if (prevTotal === 0 && totalMessages > batchSize) {
-			// Initial data load (was empty, now has messages) — start progressive
-			setCount(batchSize);
-			effectiveCount = batchSize;
-			needsSnapRef.current = true;
-		} else if (totalMessages > count) {
-			// Both loadOlder (large batch) and WS append (small) — render immediately.
-			// overflow-anchor handles scroll compensation for prepended content;
-			// the useLayoutEffect scrollTop=1 hack prevents anchor latching to top.
-			setCount(totalMessages);
-			effectiveCount = totalMessages;
-		}
-	}
-
-	useEffect(() => {
-		if (skip || count >= totalMessages) return;
-		const id = setTimeout(() => {
-			setCount((c) => Math.min(c + batchSize, totalMessages));
-		}, 50);
-		return () => clearTimeout(id);
-	}, [skip, count, totalMessages, batchSize]);
-
-	// After each batch renders to DOM (useLayoutEffect = before browser paint):
-	// 1. Snap to bottom on initial load / narrator switch (needsSnapRef).
-	// 2. Otherwise, ensure scrollTop > 0 so overflow-anchor doesn't latch onto
-	//    the top edge — which would cause the viewport to stick to the top
-	//    instead of compensating for prepended content.
-	//    Done here (not in the timer callback) to avoid racing with the
-	//    browser's anchor recalculation between frames.
-	//
-	// We track effectiveCount via a ref instead of depending on `count` state,
-	// because when loading older messages, effectiveCount is set synchronously
-	// in the render phase (the DOM changes immediately), but the `setCount`
-	// state update only takes effect on the *next* render. If we depended on
-	// `count`, the scrollTop=1 hack would be one frame too late, allowing
-	// overflow-anchor to latch onto the top edge in the intervening paint.
-	const effectiveChanged = prevEffectiveRef.current !== effectiveCount;
-	prevEffectiveRef.current = effectiveCount;
-	useLayoutEffect(() => {
-		if (!effectiveChanged) return;
-		const vp = viewportRef.current;
-		if (!vp) return;
-		if (needsSnapRef.current) {
-			if (effectiveCount < batchSize) return;
-			needsSnapRef.current = false;
-			vp.scrollTop = vp.scrollHeight;
-			return;
-		}
-		// Only apply the scrollTop=1 anchor hack when content actually overflows
-		// the viewport. When content is shorter than the viewport (early batches),
-		// setting scrollTop=1 is meaningless and can trick the auto-load-older
-		// detection into firing prematurely after initialScrollDone.
-		if (vp.scrollTop === 0 && vp.scrollHeight > vp.clientHeight) {
-			vp.scrollTop = 1;
-		}
-	});
-
-	if (skip || totalMessages <= effectiveCount) return { visibleCount: totalMessages, done: true };
-	return { visibleCount: effectiveCount, done: false };
-}
-
-function RenderProgress({ value, indeterminate }: { value?: number; indeterminate?: boolean }) {
-	const pct = value != null ? Math.round(Math.min(value, 1) * 100) : 0;
-	return (
-		<div
-			style={{
-				height: 3,
-				width: "100%",
-				backgroundColor: "var(--mantine-color-default-border)",
-				overflow: "hidden",
-			}}
-		>
-			<div
-				style={
-					indeterminate
-						? {
-								height: "100%",
-								width: "30%",
-								backgroundColor: "var(--mantine-color-indigo-filled)",
-								animation: "indeterminate-slide 1.2s ease-in-out infinite",
-							}
-						: {
-								height: "100%",
-								width: `${pct}%`,
-								backgroundColor: "var(--mantine-color-indigo-filled)",
-								transition: "width 80ms linear",
-							}
-				}
-			/>
-		</div>
-	);
-}
-
-// --- StreamingBubble: isolated component to avoid re-rendering the entire panel on every text delta ---
-
-function StreamingBubble({
-	narratorId,
-	streamingRef,
-	version,
-}: {
-	narratorId: string;
-	streamingRef: React.RefObject<string>;
-	version: number;
-}) {
-	const [text, setText] = useState("");
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: version triggers re-read of streamingRef.current on each streaming tick
-	useEffect(() => {
-		setText(streamingRef.current);
-	}, [version, streamingRef]);
-
-	// Auto-scroll is handled by the ResizeObserver on the content container —
-	// as this bubble grows, the observer fires and scrolls if user is at bottom.
-
-	if (!text) return null;
-
-	return (
-		<MessageBubble
-			narratorId={narratorId}
-			message={{
-				role: "assistant",
-				contentJson: [{ type: "text", text }],
-			}}
-		/>
-	);
-}
-
-/** Sentinel ID for the synthetic streaming-tool-chunks message injected into the cache. */
-const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
-
-/** Remove the synthetic streaming-chunks message from the query cache. */
-function removeStreamingChunksMsg(
-	qc: ReturnType<typeof useQueryClient>,
-	messagesQueryKey: unknown[],
-) {
-	qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-		if (!old?.pages?.length) return old;
-		const firstPage = old.pages[0];
-		if (!firstPage.messages.some((m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID)) return old;
-		const pages = [...old.pages];
-		pages[0] = {
-			...firstPage,
-			messages: firstPage.messages.filter((m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID),
-		};
-		return { ...old, pages };
-	});
-}
-
-const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
-	default: <IconShield size={14} />,
-	acceptEdits: <IconPencilCheck size={14} />,
-	bypassPermissions: <IconShieldOff size={14} />,
-	dontAsk: <IconHandStop size={14} />,
-};
-
-interface NarratorPanelProps {
-	narratorId: string;
-	narrator?: {
-		id: string;
-		chapterId?: string | null;
-		title?: string | null;
-		model: string | null;
-		status: string;
-		totalCostUsd: number | null;
-		permissionMode: string | null;
-		planMode?: boolean | null;
-		todosJson?: TodoItem[] | null;
-		todosToolUseId?: string | null;
-	};
-	onForkFromMessage?: (messageUuid: string) => void;
-	highlightMessageId?: string;
-	/** Write selected chat text to the paired terminal panel. Provided by the session layout when a terminal is open. */
-	onSendToTerminal?: (text: string) => void;
-	/** Ref callback exposed to the parent so the terminal panel can append text into the chat input. */
-	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
-	/** Whether the terminal panel is currently visible. Controls the toggle button state. */
-	terminalOpen?: boolean;
-	/** Callback to toggle terminal panel visibility. When provided, shows the terminal toggle button. */
-	onToggleTerminal?: () => void;
-}
-
-const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
-const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+	ACCEPTED_TYPES,
+	MAX_IMAGE_SIZE,
+	PERM_MODE_ICONS,
+	STREAMING_CHUNKS_MSG_ID,
+} from "./narrator-panel-types";
+import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
+import { useNarratorPanelWS } from "./useNarratorPanelWS";
+import { useProgressiveMessageCount } from "./useProgressiveMessageCount";
 
 export function NarratorPanel({
 	narratorId,
@@ -1510,39 +116,19 @@ export function NarratorPanel({
 		[narratorId, highlightMessageId],
 	);
 
-	// Extract the latest message ID from cache for WS catch-up on reconnect.
-	// Must consider subagent children — they have higher seq values than their
-	// parent top-level message, so using only the top-level ID would cause the
-	// backend to re-send children the client already has (or worse, miss the
-	// correct catch-up point).
-	const lastMessageId = useMemo(() => {
-		const pages = messagesData?.pages;
-		if (!pages?.length) return undefined;
-		const firstPage = pages[0];
-		if (!firstPage?.messages?.length) return undefined;
-		const last = firstPage.messages[firstPage.messages.length - 1];
-		if (!last) return undefined;
-		// Walk into the deepest last child to find the message with the highest seq
-		let deepest: NarratorMsg = last;
-		while (deepest.children?.length) {
-			deepest = deepest.children[deepest.children.length - 1];
-		}
-		return deepest.id as string | undefined;
-	}, [messagesData]);
-
+	// --- Message operations ---
+	const setContextPercentRef =
+		useRef<React.Dispatch<React.SetStateAction<number | null>>>(undefined);
+	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
 	const handleDeleteMessage = useCallback(
 		async (messageId: string) => {
-			// Snapshot for rollback
 			const prev = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
-
-			// Optimistic update
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length) return old;
 				const pages = old.pages.map((page) => ({
 					...page,
 					messages: page.messages.filter((m: NarratorMsg) => m.id !== messageId),
 				}));
-				// Recompute contextPercent from remaining messages
 				let foundCp: number | null = null;
 				for (const page of pages) {
 					for (let i = page.messages.length - 1; i >= 0; i--) {
@@ -1554,14 +140,12 @@ export function NarratorPanel({
 					}
 					if (foundCp != null) break;
 				}
-				setContextPercent(foundCp);
+				setContextPercentRef.current?.(foundCp);
 				return { ...old, pages };
 			});
-
 			try {
 				await api.deleteMessage(narratorId, messageId);
 			} catch {
-				// Rollback on failure
 				qc.setQueryData(messagesQueryKey, prev);
 				notifications.show({
 					title: t("deleteMessageFailed"),
@@ -1588,11 +172,10 @@ export function NarratorPanel({
 		[narratorId, t],
 	);
 
+	// --- Input management ---
 	const [input, setInput] = useState(
 		() => sessionStorage.getItem(`narrafork_draft_${narratorId}`) ?? "",
 	);
-
-	// Persist draft to sessionStorage
 	useEffect(() => {
 		if (input) {
 			sessionStorage.setItem(`narrafork_draft_${narratorId}`, input);
@@ -1600,8 +183,6 @@ export function NarratorPanel({
 			sessionStorage.removeItem(`narrafork_draft_${narratorId}`);
 		}
 	}, [input, narratorId]);
-
-	// Expose appendToInput to parent via ref
 	useEffect(() => {
 		if (appendInputRef) {
 			appendInputRef.current = (text: string) =>
@@ -1611,75 +192,177 @@ export function NarratorPanel({
 			if (appendInputRef) appendInputRef.current = null;
 		};
 	}, [appendInputRef]);
-	const streamingRef = useRef("");
-	const [streamingVersion, setStreamingVersion] = useState(0);
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
-	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
-		() => new Map(),
-	);
-	// Derived single value for backward-compat (first entry or null)
-	const pendingPermission = useMemo<PendingPermission | null>(() => {
-		if (pendingPermsMap.size === 0) return null;
-		return pendingPermsMap.values().next().value ?? null;
-	}, [pendingPermsMap]);
-	const [bufferedText, setBufferedText] = useState<string | null>(null);
-	const [isCompacting, setIsCompacting] = useState(false);
-	const [contextPercent, setContextPercent] = useState<number | null>(null);
-	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
-	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 
-	// Initialize contextPercent and pruneBoundaryMessageId from initial data
-	const contextInitRef = useRef(false);
-	useEffect(() => {
-		if (contextInitRef.current || !messagesData?.pages?.length) return;
-		const firstPage = messagesData.pages[0];
-		// pruneBoundaryMessageId comes from the API response
-		if (firstPage?.pruneBoundaryMessageId) {
-			setPruneBoundaryMessageId(firstPage.pruneBoundaryMessageId);
-		}
-		if (firstPage?.prunedPercent != null) {
-			setPrunedPercent(firstPage.prunedPercent);
-		}
-		const msgs = firstPage?.messages;
-		if (!msgs?.length) return;
-		// Walk backwards to find the last message with contextPercent
-		for (let i = msgs.length - 1; i >= 0; i--) {
-			const cp = (msgs[i] as unknown as Record<string, unknown>).contextPercent;
-			if (cp != null) {
-				setContextPercent(cp as number);
-				break;
+	// --- Scroll state ---
+	const [isAtBottom, setIsAtBottom] = useState(true);
+	const viewportRef = useRef<HTMLDivElement>(null);
+	const contentRef = useRef<HTMLDivElement>(null);
+	const isAtBottomRef = useRef(isAtBottom);
+	isAtBottomRef.current = isAtBottom;
+
+	// --- Scroll helpers ---
+	const followRafRef = useRef(0);
+	const followingRef = useRef(false);
+
+	const startFollowing = useCallback(() => {
+		if (followingRef.current) return;
+		const step = () => {
+			const vp = viewportRef.current;
+			if (!vp) {
+				followingRef.current = false;
+				return;
 			}
-		}
-		contextInitRef.current = true;
-	}, [messagesData]);
+			const target = vp.scrollHeight - vp.clientHeight;
+			const gap = target - vp.scrollTop;
+			if (gap < 1.5) {
+				vp.scrollTop = target;
+				followingRef.current = false;
+				if (!isAtBottomRef.current) {
+					isAtBottomRef.current = true;
+					setIsAtBottom(true);
+					setUnreadCountRef.current?.(0);
+				}
+				return;
+			}
+			vp.scrollTop += Math.max(gap * 0.25, 1.5);
+			followRafRef.current = requestAnimationFrame(step);
+		};
+		followingRef.current = true;
+		followRafRef.current = requestAnimationFrame(step);
+	}, []);
 
-	const [currentTodos, setCurrentTodos] = useState<TodoItem[] | null>(narrator?.todosJson ?? null);
+	const stopFollowing = useCallback(() => {
+		followingRef.current = false;
+		cancelAnimationFrame(followRafRef.current);
+	}, []);
+
+	const scrollToBottom = useCallback(
+		(instant?: boolean) => {
+			const vp = viewportRef.current;
+			if (!vp) return;
+			if (!isAtBottomRef.current) {
+				isAtBottomRef.current = true;
+				setIsAtBottom(true);
+			}
+			setUnreadCountRef.current?.(0);
+			if (instant) {
+				vp.scrollTop = vp.scrollHeight;
+			} else {
+				startFollowing();
+			}
+		},
+		[startFollowing],
+	);
+
+	// --- WebSocket + real-time state ---
+	const wsState = useNarratorPanelWS({
+		narratorId,
+		narratorStatus: narrator?.status,
+		messagesData,
+		messagesQueryKey,
+		isAtBottomRef,
+		scrollToBottom,
+		narratorTodosJson: narrator?.todosJson,
+		narratorTodosToolUseId: narrator?.todosToolUseId,
+	});
+	const {
+		disconnected,
+		reconnect,
+		sendBufferMessage,
+		cancelBuffer,
+		streamingRef,
+		streamingVersion,
+		renderPermCb,
+		bufferedText,
+		setBufferedText,
+		isCompacting,
+		contextPercent,
+		pruneBoundaryMessageId,
+		prunedPercent,
+		currentTodos,
+		todosToolUseId,
+		expandedToolUseId,
+		setExpandedToolUseId,
+		editExpandOverride,
+		setEditExpandOverride,
+		unreadCount,
+		setUnreadCount,
+	} = wsState;
+	setContextPercentRef.current = wsState.setContextPercent;
+	setUnreadCountRef.current = setUnreadCount;
+
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
-	const [todosToolUseId, setTodosToolUseId] = useState<string | null>(
-		narrator?.todosToolUseId ?? null,
-	);
-	const [expandedToolUseId, setExpandedToolUseId] = useState<string | null>(null);
-	const [editExpandOverride, setEditExpandOverride] = useState<boolean | null>(null);
 
-	// Sync todos from props when narrator data refreshes (e.g. page reload)
-	useEffect(() => {
-		if (narrator?.todosJson) setCurrentTodos(narrator.todosJson);
-	}, [narrator?.todosJson]);
-
-	// Clear expandedToolUseId after the card has expanded
-	useEffect(() => {
-		if (!expandedToolUseId) return;
-		const timer = setTimeout(() => setExpandedToolUseId(null), 500);
-		return () => clearTimeout(timer);
-	}, [expandedToolUseId]);
+	const isWorking = narrator?.status === "thinking";
+	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
+	const isWaiting = narrator?.status === "waiting";
+	const isPlanning = narrator?.planMode && narrator?.status === "thinking";
+	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting);
 
 	const activeTodo = useMemo(() => {
 		if (!currentTodos?.length) return null;
 		return currentTodos.find((t: TodoItem) => t.status === "in_progress") ?? null;
 	}, [currentTodos]);
 
-	// Long-press interrupt: hold 600ms to trigger, with progress overlay
+	// --- Image management ---
+	const imagePreviewUrls = useMemo(
+		() => attachedImages.map((f) => URL.createObjectURL(f)),
+		[attachedImages],
+	);
+	useEffect(() => {
+		return () => {
+			for (const url of imagePreviewUrls) URL.revokeObjectURL(url);
+		};
+	}, [imagePreviewUrls]);
+
+	// --- Title editing ---
+	const [editingTitle, setEditingTitle] = useState(false);
+	const [titleValue, setTitleValue] = useState("");
+	const [generatingTitle, setGeneratingTitle] = useState(false);
+	const titleInputRef = useRef<HTMLInputElement>(null);
+	const fileInputRef = useRef<HTMLInputElement>(null);
+
+	const startEditingTitle = () => {
+		setTitleValue(narrator?.title || "");
+		setEditingTitle(true);
+	};
+	useEffect(() => {
+		if (editingTitle) {
+			titleInputRef.current?.focus();
+			titleInputRef.current?.select();
+		}
+	}, [editingTitle]);
+	const saveTitle = async () => {
+		if (generatingTitle) return;
+		const trimmed = titleValue.trim();
+		if (trimmed && trimmed !== narrator?.title) {
+			await api.updateNarratorTitle(narratorId, trimmed);
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+		}
+		setEditingTitle(false);
+	};
+	const handleGenerateTitle = async () => {
+		setGeneratingTitle(true);
+		try {
+			const { title } = await api.generateNarratorTitle(narratorId);
+			setTitleValue(title);
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+		} finally {
+			setGeneratingTitle(false);
+		}
+	};
+	const handleTitleKeyDown = (e: React.KeyboardEvent) => {
+		if (e.key === "Enter") {
+			e.preventDefault();
+			saveTitle();
+		} else if (e.key === "Escape") {
+			setEditingTitle(false);
+		}
+	};
+
+	// --- Long-press interrupt ---
 	const [interruptProgress, setInterruptProgress] = useState(0);
 	const interruptTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const interruptFiredRef = useRef(false);
@@ -1691,8 +374,6 @@ export function NarratorPanel({
 		setInterruptProgress(0);
 		interruptFiredRef.current = false;
 	}, []);
-	// Stable refs for the native touch handler so the callback-ref doesn't
-	// re-bind whenever interruptMutation/narratorId change identity.
 	const interruptMutationRef = useRef(interruptMutation);
 	interruptMutationRef.current = interruptMutation;
 	const narratorIdRef = useRef(narratorId);
@@ -1716,17 +397,8 @@ export function NarratorPanel({
 			}
 		}, 16);
 	}, []);
-	// Callback ref: binds native touchstart with { passive: false } so
-	// preventDefault() reliably suppresses the browser long-press context
-	// menu on touch devices (React synthetic onTouchStart is passive).
-	// We store a cleanup function so that when the interrupt button unmounts
-	// (React calls the ref with null), the native listeners are removed.
-	// Without this, the ternary branch means React may reuse the same DOM
-	// <button> for the send button, and the leftover touchstart handler
-	// (which calls preventDefault()) would swallow touch-initiated clicks.
 	const interruptBtnCleanupRef = useRef<(() => void) | null>(null);
 	const interruptBtnRef = useCallback((btn: HTMLButtonElement | null) => {
-		// Clean up previous listeners (if any) before binding new ones
 		if (interruptBtnCleanupRef.current) {
 			interruptBtnCleanupRef.current();
 			interruptBtnCleanupRef.current = null;
@@ -1762,39 +434,7 @@ export function NarratorPanel({
 	}, []);
 	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
 
-	const isWorking = narrator?.status === "thinking";
-	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
-	const isWaiting = narrator?.status === "waiting";
-	const isPlanning = narrator?.planMode && narrator?.status === "thinking";
-	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting);
-
-	// Memoize blob URLs to avoid creating new ones on every render
-	const imagePreviewUrls = useMemo(
-		() => attachedImages.map((f) => URL.createObjectURL(f)),
-		[attachedImages],
-	);
-	// Revoke old blob URLs when attachedImages changes
-	useEffect(() => {
-		return () => {
-			for (const url of imagePreviewUrls) URL.revokeObjectURL(url);
-		};
-	}, [imagePreviewUrls]);
-	const [highlightedId, setHighlightedId] = useState<string | null>(null);
-	const [editingTitle, setEditingTitle] = useState(false);
-	const [titleValue, setTitleValue] = useState("");
-	const [generatingTitle, setGeneratingTitle] = useState(false);
-	const [isAtBottom, setIsAtBottom] = useState(true);
-	const [unreadCount, setUnreadCount] = useState(0);
-	const viewportRef = useRef<HTMLDivElement>(null);
-	const contentRef = useRef<HTMLDivElement>(null);
-	const titleInputRef = useRef<HTMLInputElement>(null);
-	const fileInputRef = useRef<HTMLInputElement>(null);
-	const highlightScrolledRef = useRef(false);
-	const initialScrollDoneRef = useRef(false);
-	const [initialScrollDone, setInitialScrollDone] = useState(false);
-
-	// Defer heavy message rendering until after the first paint so the shell
-	// (header + input) appears instantly when entering a session.
+	// --- Hydration & message flattening ---
 	const [hydrated, setHydrated] = useState(false);
 	useEffect(() => {
 		const id = requestAnimationFrame(() => {
@@ -1803,14 +443,12 @@ export function NarratorPanel({
 		return () => cancelAnimationFrame(id);
 	}, []);
 
-	// Flatten infinite query pages into a single chronological array (incremental)
 	const prevPagesRef = useRef<MessagesPage[]>([]);
 	const cachedFlatRef = useRef<NarratorMsg[]>([]);
 	const messages = useMemo(() => {
 		if (!hydrated || !messagesData?.pages) return [];
 		const pages = messagesData.pages;
 		const prev = prevPagesRef.current;
-		// Fast path: same page count, only first page (newest) changed
 		if (
 			pages.length === prev.length &&
 			pages.length > 0 &&
@@ -1823,7 +461,6 @@ export function NarratorPanel({
 			cachedFlatRef.current = result;
 			return result;
 		}
-		// Full rebuild (new page loaded, or multiple pages changed)
 		const reversed = [...pages].reverse();
 		const result = reversed.flatMap((page) => page.messages);
 		prevPagesRef.current = pages;
@@ -1831,8 +468,6 @@ export function NarratorPanel({
 		return result;
 	}, [hydrated, messagesData]);
 
-	// Extract the deferred streaming chunks message (when _noMerge is set, it should
-	// render after the StreamingBubble instead of inline with other messages).
 	const deferredStreamingChunks = useMemo(() => {
 		if (!messages.length) return null;
 		const last = messages[messages.length - 1];
@@ -1840,246 +475,7 @@ export function NarratorPanel({
 		return null;
 	}, [messages]);
 
-	// Derive isCompacting from persisted messages on initial load / data refresh
-	useEffect(() => {
-		if (!messages.length) return;
-		const last = messages[messages.length - 1];
-		const blocks = Array.isArray(last.contentJson) ? last.contentJson : [];
-		const compactBlock = blocks.find(
-			(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
-		);
-		if (compactBlock) {
-			setIsCompacting(compactBlock.status === "compacting");
-		}
-	}, [messages]);
-
-	// Build toolUseId → path index for O(1) lookups in WS callbacks (incremental)
-	const prevPagesForIndexRef = useRef<unknown[]>([]);
-	const toolUseIndexRef = useRef<MessageIndex>(new Map());
-	const toolUseIndex = useMemo(() => {
-		if (!hydrated || !messagesData?.pages) return new Map();
-		const result = updateToolUseIndex(
-			toolUseIndexRef.current,
-			prevPagesForIndexRef.current,
-			messagesData.pages,
-		);
-		prevPagesForIndexRef.current = messagesData.pages;
-		return result;
-	}, [hydrated, messagesData]);
-	toolUseIndexRef.current = toolUseIndex;
-
-	// Permission decision handlers — use a ref so they can be defined before useNarratorWS
-	const sendPermissionDecisionRef = useRef<
-		| ((
-				requestId: string,
-				decision: "allow" | "deny",
-				message?: string,
-				answers?: Record<string, string>,
-				feedbackText?: string,
-				compactAfter?: boolean,
-		  ) => void)
-		| null
-	>(null);
-	const sendBufferMessageRef = useRef<((targetNarratorId: string, text: string) => void) | null>(
-		null,
-	);
-
-	// Use ref for pendingPermsMap so callbacks don't depend on it
-	const pendingPermsMapRef = useRef(pendingPermsMap);
-	pendingPermsMapRef.current = pendingPermsMap;
-
-	const handlePermissionDecision = useCallback(
-		(
-			requestId: string,
-			decision: "allow" | "deny",
-			feedbackText?: string,
-			compactAfter?: boolean,
-		) => {
-			sendPermissionDecisionRef.current?.(
-				requestId,
-				decision,
-				undefined,
-				undefined,
-				feedbackText,
-				compactAfter,
-			);
-			// Find the correct toolUseId from the map (match by requestId which is
-			// either the tool call DB id or the toolUseId itself)
-			const map = pendingPermsMapRef.current;
-			let toolUseId: string | undefined;
-			for (const [tuId, perm] of map) {
-				if (perm.id === requestId || tuId === requestId) {
-					toolUseId = tuId;
-					break;
-				}
-			}
-			// Remove only this specific permission from the map
-			if (toolUseId) {
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					return next;
-				});
-			} else {
-				// Fallback: clear all (shouldn't happen normally)
-				setPendingPermsMap(new Map());
-			}
-			if (toolUseId) {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-
-					// When compactAfter is set, remove the message containing ExitPlanMode
-					if (compactAfter) {
-						let anyChanged = false;
-						const pages = old.pages.map((page: MessagesPage) => {
-							const msg = findMsgByToolUseIdInTree(page.messages, toolUseId);
-							if (!msg) return page;
-							anyChanged = true;
-							return {
-								...page,
-								messages: page.messages.filter((m: NarratorMsg) => m.id !== msg.id),
-							};
-						});
-						return anyChanged ? { ...old, pages } : old;
-					}
-
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							status: "running",
-						});
-						if (changed) anyChanged = true;
-						return changed ? { ...page, messages } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
-				});
-			}
-		},
-		[qc, messagesQueryKey],
-	);
-
-	const handleQuestionSubmit = useCallback(
-		(requestId: string, answers: Record<string, string>) => {
-			sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
-			// Find the correct permission from the map
-			const map = pendingPermsMapRef.current;
-			let perm: PendingPermission | undefined;
-			for (const [, p] of map) {
-				if (p.id === requestId || p.toolUseId === requestId) {
-					perm = p;
-					break;
-				}
-			}
-			// Merge answers into the cached toolCalls[].inputJson and clear pending status
-			if (perm?.toolUseId) {
-				const tuId = perm.toolUseId;
-				const mergedInput = { ...perm.inputJson, answers };
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages: m1, changed: c1 } = mergeToolCallFieldsInTree(page.messages, tuId, {
-							inputJson: mergedInput,
-							status: "running",
-						});
-						if (c1) anyChanged = true;
-						return c1 ? { ...page, messages: m1 } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
-				});
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(tuId);
-					return next;
-				});
-			} else {
-				setPendingPermsMap(new Map());
-			}
-		},
-		[qc, messagesQueryKey],
-	);
-
-	const handleQuestionDeny = useCallback(
-		(requestId: string) => {
-			sendPermissionDecisionRef.current?.(requestId, "deny", "User skipped the question");
-			// Find the correct toolUseId from the map
-			const map = pendingPermsMapRef.current;
-			let toolUseId: string | undefined;
-			for (const [tuId, p] of map) {
-				if (p.id === requestId || tuId === requestId) {
-					toolUseId = tuId;
-					break;
-				}
-			}
-			if (toolUseId) {
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					return next;
-				});
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							status: "fail",
-						});
-						if (changed) anyChanged = true;
-						return changed ? { ...page, messages } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
-				});
-			} else {
-				setPendingPermsMap(new Map());
-			}
-		},
-		[qc, messagesQueryKey],
-	);
-
-	const [bgRetryDismissedIds, setBgRetryDismissedIds] = useState<Set<string>>(() => new Set());
-
-	const handleBgAgentRetry = useCallback(
-		(toolUseId: string) => {
-			setBgRetryDismissedIds((prev) => new Set(prev).add(toolUseId));
-			sendBufferMessageRef.current?.(narratorId, t("bgAgentRetryPrompt"));
-			interruptMutation.mutate(narratorId);
-		},
-		[narratorId, interruptMutation, t],
-	);
-
-	// Stable permission callbacks via ref — avoids rebuilding the entire message tree
-	// when callback identities change. Only pendingPermission and bgRetryDismissedIds
-	// (which affect rendered UI) remain as useMemo deps.
-	const permCbRef = useRef<PermissionCallbacks | null>(null);
-	permCbRef.current = {
-		pendingPermission,
-		pendingPermsMap,
-		onPermissionDecision: handlePermissionDecision,
-		onQuestionSubmit: handleQuestionSubmit,
-		onQuestionDeny: handleQuestionDeny,
-		onBgAgentRetry: handleBgAgentRetry,
-		bgRetryDismissedIds,
-	};
-	const stablePermCb = useMemo<PermissionCallbacks>(
-		() => ({
-			pendingPermission: null, // overridden per-render below
-			pendingPermsMap: new Map(), // overridden per-render below
-			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
-			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
-			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
-			onBgAgentRetry: (...args) => permCbRef.current?.onBgAgentRetry?.(...args),
-			bgRetryDismissedIds: new Set(),
-		}),
-		[],
-	);
-
-	// Per-page memoized rendering — only changed pages re-render on WS updates.
-	// highlightedId is intentionally excluded from deps to avoid rebuilding
-	// the entire message tree on every highlight change.
-	// pendingPermission IS included because it changes rarely (only on permission
-	// request/resolve) and must trigger a re-render so the inline permission UI
-	// appears correctly — especially on page reload when loaded via API.
-	// Fork handler: chapter-level fork (if chapter-bound) or narrator-level fork
+	// --- Fork handler ---
 	const handleNarratorFork = useCallback(
 		(messageId: string) => {
 			forkNarratorMutation.mutate(
@@ -2094,15 +490,13 @@ export function NarratorPanel({
 		[narratorId, forkNarratorMutation.mutate, navigate],
 	);
 	const forkHandler = narrator?.chapterId ? onForkFromMessage : undefined;
-	const renderPermCb = useMemo(
-		() => ({ ...stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds }),
-		[stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds],
-	);
 
-	// Progressive rendering: render bottom messages first, then fill upward in batches.
-	// Also used for loadOlder — large prepends trigger progressive rendering with
-	// per-batch scroll compensation instead of rendering all 50 messages at once.
-	// Reset when switching narrator
+	// --- Progressive rendering ---
+	const highlightScrolledRef = useRef(false);
+	const initialScrollDoneRef = useRef(false);
+	const [initialScrollDone, setInitialScrollDone] = useState(false);
+	const [highlightedId, setHighlightedId] = useState<string | null>(null);
+
 	const prevNarratorIdRef = useRef(narratorId);
 	if (prevNarratorIdRef.current !== narratorId) {
 		prevNarratorIdRef.current = narratorId;
@@ -2120,10 +514,7 @@ export function NarratorPanel({
 		viewportRef,
 	);
 
-	// Trim message cache on unmount / narrator switch: keep only the newest
-	// pages totalling ~200 messages to avoid heavy progressive re-renders.
-	// Capture the key inside the effect so cleanup trims the *old* narrator's
-	// cache (not the new one — refs would already point to the new key).
+	// Trim message cache on unmount / narrator switch
 	useEffect(() => {
 		const keyToTrim = messagesQueryKey;
 		return () => {
@@ -2147,17 +538,13 @@ export function NarratorPanel({
 		};
 	}, [messagesQueryKey, qc]);
 
-	// Build visible page elements based on visibleCount (message-level progressive rendering).
+	// --- Visible elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-
-	// Pages are stored newest-first in messagesData.pages; we reverse to display oldest-first.
-	// We walk from the bottom (newest page) upward, allocating visibleCount messages across pages.
 	const visibleElements = useMemo(() => {
 		if (!messagesData?.pages || visibleCount === 0) return [];
 		const pages = messagesData.pages;
-		const reversed = [...pages].reverse(); // oldest-first for display
+		const reversed = [...pages].reverse();
 		if (visibleCount >= messages.length) {
-			// All messages visible — render all pages without maxMessages constraint
 			return reversed.map((page, i) => (
 				<MemoizedPageElements
 					key={`page-${pages.length - 1 - i}`}
@@ -2176,7 +563,6 @@ export function NarratorPanel({
 				/>
 			));
 		}
-		// Partial rendering: walk from newest page (end of reversed) backward
 		const result: React.ReactNode[] = [];
 		let remaining = visibleCount;
 		for (let i = reversed.length - 1; i >= 0 && remaining > 0; i--) {
@@ -2221,17 +607,12 @@ export function NarratorPanel({
 		pruneBoundaryMessageId,
 	]);
 
+	// --- Load older ---
 	const handleLoadOlder = useCallback(() => {
 		if (isFetchingNextPage) return;
 		fetchNextPage();
 	}, [fetchNextPage, isFetchingNextPage]);
 
-	// Auto-load older messages: scrollTop-based detection.
-	// Trigger loadOlder when scrollTop > 0 && scrollTop < viewportHeight (user is
-	// near the top). scrollTop === 0 is never used as a trigger — it's reserved for
-	// the overflow-anchor hack in useProgressiveMessageCount.
-	// The effect tears down when isFetchingNextPage becomes true (preventing
-	// re-trigger during fetch) and re-attaches when the fetch completes.
 	const handleLoadOlderRef = useRef(handleLoadOlder);
 	handleLoadOlderRef.current = handleLoadOlder;
 	useEffect(() => {
@@ -2241,29 +622,16 @@ export function NarratorPanel({
 		if (!vp) return;
 		const check = () => {
 			const st = vp.scrollTop;
-			// Don't fetch at scrollTop 0 (anchor hack territory) or when content
-			// doesn't fill the viewport (scrollHeight <= clientHeight).
 			if (st > 0 && st < vp.clientHeight * 2 && vp.scrollHeight > vp.clientHeight) {
 				handleLoadOlderRef.current();
 			}
 		};
-		// Check immediately — user may already be near the top
 		check();
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
 	}, [autoLoadEnabled, hasNextPage, initialScrollDone, renderDone, isFetchingNextPage]);
 
 	// --- Scroll state: user-input driven ---
-	// isAtBottom is only set to false by user input events (wheel/touch/scrollbar).
-	// Programmatic scrolls (ResizeObserver, scrollToBottom) don't flip it.
-	const isAtBottomRef = useRef(isAtBottom);
-	isAtBottomRef.current = isAtBottom;
-
-	// Smooth-follow refs — declared early so the callback ref closure can read them.
-	const followRafRef = useRef(0);
-	const followingRef = useRef(false);
-
-	// Callback ref to bind user-input listeners as soon as viewport mounts.
 	const lastTouchYRef = useRef(0);
 	const cleanupRef = useRef<(() => void) | null>(null);
 	const viewportCallbackRef = useCallback((node: HTMLDivElement | null) => {
@@ -2277,7 +645,7 @@ export function NarratorPanel({
 			if (atBottom && !isAtBottomRef.current) {
 				isAtBottomRef.current = true;
 				setIsAtBottom(true);
-				setUnreadCount(0);
+				setUnreadCountRef.current?.(0);
 			}
 		};
 		const detachFromBottom = () => {
@@ -2289,7 +657,6 @@ export function NarratorPanel({
 
 		const onWheel = (e: WheelEvent) => {
 			if (e.deltaY < 0) detachFromBottom();
-			// checkAtBottom handled by scrollend for inertia correctness
 		};
 		const onTouchStart = (e: TouchEvent) => {
 			if (e.touches.length > 0) lastTouchYRef.current = e.touches[0].clientY;
@@ -2300,14 +667,9 @@ export function NarratorPanel({
 			const delta = lastTouchYRef.current - cur;
 			lastTouchYRef.current = cur;
 			if (delta < 0) detachFromBottom();
-			// checkAtBottom handled by scrollend for inertia correctness
 		};
 
-		// Generic scroll direction tracking — covers middle-click autoscroll,
-		// Mantine custom scrollbar drag, keyboard scroll, and any other source.
-		// Detach on upward scroll unless the lerp follow loop is driving it.
 		let lastScrollTop = node.scrollTop;
-
 		const onScroll = () => {
 			const cur = node.scrollTop;
 			if (!followingRef.current && cur < lastScrollTop) {
@@ -2315,13 +677,7 @@ export function NarratorPanel({
 			}
 			lastScrollTop = cur;
 		};
-
-		// scrollend fires after ALL scroll types finish (inertia, autoscroll,
-		// scrollbar drag, programmatic). We run checkAtBottom here so that
-		// inertia/middle-click/scrollbar-drag reaching the bottom is detected.
 		const onScrollEnd = () => {
-			// Skip if the lerp follow loop is driving the scroll — that loop
-			// sets isAtBottom itself when it finishes.
 			if (followingRef.current) return;
 			checkAtBottom();
 		};
@@ -2340,68 +696,7 @@ export function NarratorPanel({
 		};
 	}, []);
 
-	// Smooth-follow animation: lerp towards latest scrollHeight each frame.
-	// Shared by ResizeObserver (auto-follow) and scrollToBottom button.
-
-	const startFollowing = useCallback(() => {
-		// If already running, the existing rAF loop will naturally chase the
-		// latest scrollHeight each frame — no need to cancel and restart.
-		if (followingRef.current) return;
-		const step = () => {
-			const vp = viewportRef.current;
-			if (!vp) {
-				followingRef.current = false;
-				return;
-			}
-			const target = vp.scrollHeight - vp.clientHeight;
-			const gap = target - vp.scrollTop;
-			// Use 1.5px threshold to account for sub-pixel rounding on high-DPI displays
-			if (gap < 1.5) {
-				vp.scrollTop = target;
-				followingRef.current = false;
-				if (!isAtBottomRef.current) {
-					isAtBottomRef.current = true;
-					setIsAtBottom(true);
-					setUnreadCount(0);
-				}
-				return;
-			}
-			vp.scrollTop += Math.max(gap * 0.25, 1.5);
-			followRafRef.current = requestAnimationFrame(step);
-		};
-		followingRef.current = true;
-		followRafRef.current = requestAnimationFrame(step);
-	}, []);
-
-	const stopFollowing = useCallback(() => {
-		followingRef.current = false;
-		cancelAnimationFrame(followRafRef.current);
-	}, []);
-
-	const scrollToBottom = useCallback(
-		(instant?: boolean) => {
-			const vp = viewportRef.current;
-			if (!vp) return;
-			// Ensure isAtBottom is true so ResizeObserver keeps following
-			if (!isAtBottomRef.current) {
-				isAtBottomRef.current = true;
-				setIsAtBottom(true);
-			}
-			setUnreadCount(0);
-			if (instant) {
-				vp.scrollTop = vp.scrollHeight;
-			} else {
-				startFollowing();
-			}
-		},
-		[startFollowing],
-	);
-
-	// Initial scroll to bottom — wait for progressive render to finish,
-	// then instant-scroll and mark done. The ref is set synchronously so
-	// ResizeObserver starts working immediately.
-	// Skip if the user has already scrolled up during progressive rendering.
-
+	// --- Initial scroll ---
 	useEffect(() => {
 		if (
 			!initialScrollDoneRef.current &&
@@ -2414,8 +709,6 @@ export function NarratorPanel({
 			setInitialScrollDone(true);
 			scrollToBottom(true);
 		}
-		// If user scrolled away before progressive render finished, still mark
-		// initial scroll as done so loadOlder detection can activate.
 		if (
 			!initialScrollDoneRef.current &&
 			messages.length > 0 &&
@@ -2427,11 +720,7 @@ export function NarratorPanel({
 		}
 	}, [messages, renderDone, scrollToBottom, highlightMessageId]);
 
-	// Auto-scroll via ResizeObserver: when content grows and user is at bottom,
-	// start the lerp follow loop. It chases the latest scrollHeight each frame.
-	// initialScrollDone is a trigger dep: contentRef.current is null on first mount,
-	// so we need the effect to re-run once initialScrollDone flips to true (at which
-	// point the DOM is ready) to actually observe the content element.
+	// --- Auto-scroll via ResizeObserver ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: initialScrollDone is a trigger dep, not read inside
 	useEffect(() => {
 		const content = contentRef.current;
@@ -2442,7 +731,6 @@ export function NarratorPanel({
 			if (isAtBottomRef.current && !highlightMessageId) {
 				startFollowing();
 			} else if (!isAtBottomRef.current && !highlightMessageId) {
-				// Passive recovery: re-check if we're actually at bottom.
 				const vp = viewportRef.current;
 				if (vp && vp.scrollHeight - vp.scrollTop - vp.clientHeight < 30) {
 					isAtBottomRef.current = true;
@@ -2452,11 +740,6 @@ export function NarratorPanel({
 		});
 		contentObserver.observe(content);
 
-		// Viewport resize (e.g. input area appearing after SPA refresh) must
-		// trigger lerp even during progressive render — not gated by initialScrollDone.
-		// During progressive rendering, use instant snap instead of lerp — the header,
-		// status bar, and input box may render late and change the viewport height,
-		// which breaks scroll anchoring. Lerp can't keep up with rapid batch appends.
 		const vp = viewportRef.current;
 		const vpObserver = new ResizeObserver(() => {
 			if (isAtBottomRef.current && !highlightMessageId) {
@@ -2476,7 +759,7 @@ export function NarratorPanel({
 		};
 	}, [highlightMessageId, startFollowing, stopFollowing, initialScrollDone]);
 
-	// Scroll to highlighted message from search — only once on initial load
+	// --- Scroll to highlighted message ---
 	useEffect(() => {
 		if (!highlightMessageId || !messages.length || highlightScrolledRef.current) return;
 		const el = document.getElementById(`msg-${highlightMessageId}`);
@@ -2491,625 +774,10 @@ export function NarratorPanel({
 		});
 	}, [highlightMessageId, messages]);
 
-	// WebSocket for real-time events
-	const {
-		connected,
-		disconnected,
-		sendPermissionDecision,
-		sendBufferMessage,
-		cancelBuffer,
-		reconnect,
-	} = useNarratorWS(
-		narratorId,
-		{
-			onStreamEvent: (wsData: Record<string, unknown>) => {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const ev = wsData.event as Record<string, any> | undefined;
-				if (
-					ev?.type === "content_block_delta" &&
-					ev.delta?.type === "text_delta" &&
-					ev.delta.text &&
-					!ev.subagentToolUseId
-				) {
-					streamingRef.current += ev.delta.text;
-					setStreamingVersion((v) => v + 1);
-				}
-			},
-			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				// Derive compacting state from system compact messages (skip plan subtype)
-				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
-				const compactBlock = blocks.find(
-					(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
-				);
-				if (compactBlock) {
-					setIsCompacting(compactBlock.status === "compacting");
-					// Update context indicator from compacted message
-					if (compactBlock.status === "compacted" && wsData.message?.contextPercent != null) {
-						setContextPercent(wsData.message.contextPercent as number);
-					}
-				} else {
-					setIsCompacting(false);
-				}
-				if (wsData.message?.id && wsData.message?.createdAt) {
-					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
-
-					// Clear streaming buffer BEFORE writing to cache.
-					// qc.setQueryData may synchronously notify subscribers and trigger
-					// a render; if the streaming bubble still holds stale text at that
-					// point the user sees the same content twice (once as the bubble,
-					// once as the persisted message).  By clearing first we guarantee
-					// the bubble is empty before the message appears in the list.
-					if (wsData.message?.role === "assistant" && streamingRef.current) {
-						streamingRef.current = "";
-						setStreamingVersion((v) => v + 1);
-					}
-
-					// Remove synthetic streaming-chunks message when real assistant message arrives
-					if (wsData.message?.role === "assistant") {
-						removeStreamingChunksMsg(qc, messagesQueryKey);
-					}
-
-					// Remove synthetic subagent streaming child when real child message arrives
-					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
-						const ptuId = newMsg.parentToolUseId;
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-							if (!old?.pages?.length) return old;
-							return removeSubagentStreamingChunk(old, ptuId);
-						});
-					}
-
-					// Compact markers inserted via "compact before" may land in the middle
-					// of the conversation (specific seq position). We cannot simply append
-					// them to the end of the cache — check if this is a NEW compact message
-					// and invalidate so React Query refetches the correct order.
-					const isNewCompactMsg =
-						newMsg.role === "system" &&
-						Array.isArray(newMsg.contentJson) &&
-						newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
-
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-
-						// Child message: insert into parent's children array in the tree
-						if (newMsg.parentToolUseId) {
-							return insertChildIntoCache(old, newMsg);
-						}
-
-						// Top-level message: check if it already exists (e.g. compacting → compacted update)
-						const pages = [...old.pages];
-						const firstPage = { ...pages[0] };
-						const existingIdx = firstPage.messages.findIndex(
-							(m: NarratorMsg) => m.id === newMsg.id,
-						);
-						if (existingIdx !== -1) {
-							// Replace in-place (e.g. compact status update)
-							const updated = [...firstPage.messages];
-							updated[existingIdx] = newMsg;
-							firstPage.messages = updated;
-							pages[0] = firstPage;
-							return { ...old, pages };
-						}
-
-						// New compact message — skip cache append, will invalidate below
-						if (isNewCompactMsg) return old;
-
-						// Track unread count when user is scrolled up
-						if (!isAtBottomRef.current && newMsg.role === "assistant") {
-							setUnreadCount((c) => c + 1);
-						}
-
-						// Replace optimistic user message if one exists — revoke blob URLs
-						const optimistic = firstPage.messages.filter(
-							(m: NarratorMsg) => String(m.id).startsWith("optimistic-") && m.role === newMsg.role,
-						);
-						for (const om of optimistic) {
-							if (Array.isArray(om.contentJson)) {
-								for (const block of om.contentJson) {
-									if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
-								}
-							}
-						}
-						const withoutOptimistic = firstPage.messages.filter(
-							(m: NarratorMsg) => !String(m.id).startsWith("optimistic-") || m.role !== newMsg.role,
-						);
-						firstPage.messages = [...withoutOptimistic, newMsg];
-						pages[0] = firstPage;
-						return { ...old, pages };
-					});
-					// New compact message was skipped in cache — refetch to get correct order
-					if (isNewCompactMsg) {
-						qc.invalidateQueries({ queryKey: messagesQueryKey });
-					}
-				} else {
-					qc.invalidateQueries({ queryKey: messagesQueryKey });
-				}
-			},
-			onUserMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				if (!wsData.message?.id || !wsData.message?.createdAt) return;
-				const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
-
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) {
-						return {
-							pages: [{ messages: [newMsg], hasMore: false, nextCursor: null }],
-							pageParams: [undefined],
-						};
-					}
-					const pages = [...old.pages];
-					const firstPage = { ...pages[0] };
-
-					// Skip if already present
-					if (firstPage.messages.some((m: NarratorMsg) => m.id === newMsg.id)) {
-						return old;
-					}
-
-					// Replace optimistic user message if one exists — revoke blob URLs
-					const optimistic = firstPage.messages.filter(
-						(m: NarratorMsg) => String(m.id).startsWith("optimistic-") && m.role === "user",
-					);
-					for (const om of optimistic) {
-						if (Array.isArray(om.contentJson)) {
-							for (const block of om.contentJson) {
-								if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
-							}
-						}
-					}
-					const withoutOptimistic = firstPage.messages.filter(
-						(m: NarratorMsg) => !String(m.id).startsWith("optimistic-") || m.role !== "user",
-					);
-					firstPage.messages = [...withoutOptimistic, newMsg];
-					pages[0] = firstPage;
-					return { ...old, pages };
-				});
-			},
-			onToolCompleted: (
-				toolUseId: string,
-				status: string,
-				output?: unknown,
-				durationMs?: number,
-				updatedInput?: Record<string, unknown>,
-			) => {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					let result = updateToolCallByIndex(
-						old,
-						toolUseId,
-						status,
-						output,
-						toolUseIndexRef.current,
-						durationMs,
-					);
-					// If the server sent an updatedInput (e.g. broken tool call sanitized),
-					// merge it into the tool call's inputJson so the UI shows the clean version.
-					if (updatedInput && result) {
-						let anyChanged = false;
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic cache structure
-						const pages = result.pages.map((page: any) => {
-							const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-								inputJson: updatedInput,
-							});
-							if (changed) anyChanged = true;
-							return changed ? { ...page, messages } : page;
-						});
-						if (anyChanged) result = { ...result, pages } as MessagesQueryData;
-					}
-					return result;
-				});
-			},
-			onToolStarted: (toolUseId: string, _toolName: string, streamStartedAt?: number) => {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							status: "running",
-							startedAt: streamStartedAt ?? Date.now(),
-						});
-						if (changed) anyChanged = true;
-						return changed ? { ...page, messages } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
-				});
-			},
-			onToolUseChunk: (
-				toolUseId: string,
-				toolName: string,
-				inputCharsTotal: number,
-				parentToolUseId?: string,
-				extractedFilePath?: string,
-				contentCharsReceived?: number,
-			) => {
-				// Subagent tool_use_chunk — update child messages in the tree
-				if (parentToolUseId) {
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-						return upsertSubagentStreamingChunk(
-							old,
-							parentToolUseId,
-							narratorId,
-							toolUseId,
-							toolName,
-							inputCharsTotal,
-						);
-					});
-					return;
-				}
-
-				// Top-level tool_use_chunk — update synthetic streaming message
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					const pages = old?.pages?.length ? [...old.pages] : [];
-					const firstPage =
-						pages.length > 0 ? { ...pages[0] } : { messages: [], hasMore: false, nextCursor: null };
-
-					// Find or create the synthetic streaming message
-					const existingIdx = firstPage.messages.findIndex(
-						(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
-					);
-					const existing = existingIdx !== -1 ? firstPage.messages[existingIdx] : null;
-
-					// Build updated content blocks and tool calls
-					const prevBlocks: ContentBlock[] = existing
-						? [...(existing.contentJson as ContentBlock[])]
-						: [];
-					const prevToolCalls = existing ? [...(existing.toolCalls as ToolCallRow[])] : [];
-
-					const blockIdx = prevBlocks.findIndex(
-						(b: ContentBlock) => b.type === "tool_use" && b.id === toolUseId,
-					);
-					if (blockIdx === -1) {
-						// New tool — append block + tool call record
-						prevBlocks.push({ type: "tool_use", id: toolUseId, name: toolName, input: {} });
-						prevToolCalls.push({
-							toolUseId,
-							toolName,
-							inputJson: {},
-							status: "initializing",
-							createdAt: new Date().toISOString(),
-						} as ToolCallRow);
-					}
-					// Update inputCharsTotal on the tool call for display
-					const tcIdx = prevToolCalls.findIndex((tc: ToolCallRow) => tc.toolUseId === toolUseId);
-					if (tcIdx !== -1) {
-						prevToolCalls[tcIdx] = {
-							...prevToolCalls[tcIdx],
-							inputJson: {
-								_streamingChars: inputCharsTotal,
-								...(extractedFilePath && { _streamingFilePath: extractedFilePath }),
-								...(contentCharsReceived != null && {
-									_streamingContentChars: contentCharsReceived,
-								}),
-							},
-						};
-					}
-
-					// If there's streaming text content before these tool chunks,
-					// mark the message so the grouping logic won't merge it
-					// with the preceding tool run.
-					const hasLeadingText = !!streamingRef.current;
-
-					const syntheticMsg: NarratorMsg = {
-						id: STREAMING_CHUNKS_MSG_ID,
-						narratorId,
-						parentToolUseId: null,
-						role: "assistant",
-						contentJson: prevBlocks,
-						contentText: null,
-						toolCalls: prevToolCalls,
-						createdAt: existing?.createdAt ?? new Date().toISOString(),
-						children: [],
-						_noMerge: hasLeadingText,
-					};
-
-					if (existingIdx !== -1) {
-						firstPage.messages = [...firstPage.messages];
-						firstPage.messages[existingIdx] = syntheticMsg;
-					} else {
-						firstPage.messages = [...firstPage.messages, syntheticMsg];
-					}
-					pages[0] = firstPage;
-					return { ...old, pages } as MessagesQueryData;
-				});
-			},
-			onPermissionRequest: (request) => {
-				// Add to the map keyed by toolUseId (supports multiple concurrent permissions)
-				if (request.toolUseId) {
-					setPendingPermsMap((prev) => {
-						const next = new Map(prev);
-						next.set(request.toolUseId, request);
-						return next;
-					});
-				}
-				// Also merge status into the tool call in the cache so the
-				// data-driven matchPermission path works even if tool_completed arrives late
-				// or its merge fails (stale index / tool call not yet in cache).
-				if (request.toolUseId) {
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-						let anyChanged = false;
-						const pages = old.pages.map((page: MessagesPage) => {
-							const { messages, changed } = mergeToolCallFieldsInTree(
-								page.messages,
-								request.toolUseId,
-								{ status: "pending" },
-							);
-							if (changed) anyChanged = true;
-							return changed ? { ...page, messages } : page;
-						});
-						return anyChanged ? { ...old, pages } : old;
-					});
-				}
-			},
-			onPermissionResolved: (_requestId, toolUseId) => {
-				// Remove only the specific permission from the map
-				if (toolUseId) {
-					setPendingPermsMap((prev) => {
-						if (!prev.has(toolUseId)) return prev;
-						const next = new Map(prev);
-						next.delete(toolUseId);
-						return next;
-					});
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-						let anyChanged = false;
-						const pages = old.pages.map((page: MessagesPage) => {
-							const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-								status: "running",
-								startedAt: Date.now(),
-							});
-							if (changed) anyChanged = true;
-							return changed ? { ...page, messages } : page;
-						});
-						return anyChanged ? { ...old, pages } : old;
-					});
-				}
-			},
-			onStatusChange: (status) => {
-				setIsCompacting(false);
-				// When the narrator goes idle (e.g. after interrupt), discard any
-				// partial streaming text that was never persisted as a full message.
-				if (status === "idle" && streamingRef.current) {
-					streamingRef.current = "";
-					setStreamingVersion((v) => v + 1);
-				}
-				if (status === "idle") {
-					removeStreamingChunksMsg(qc, messagesQueryKey);
-				}
-				// Optimistically update narrator cache so status-dependent UI
-				// (yellow spinner, fallback polling) reacts immediately.
-				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, status } : old,
-				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-			},
-			onTitleUpdated: () => {
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-			},
-			onTodosUpdated: (todos, toolUseId) => {
-				setCurrentTodos(todos);
-				if (toolUseId) setTodosToolUseId(toolUseId);
-			},
-			onBufferSet: (text) => {
-				setBufferedText(text);
-			},
-			onBufferCleared: () => {
-				setBufferedText(null);
-			},
-			onPlanModeChanged: (planMode) => {
-				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, planMode } : old,
-				);
-			},
-			onContextUsage: (percentage) => {
-				setContextPercent(percentage);
-			},
-			onPruneBoundary: (boundaryMessageId, prunedPct) => {
-				setPruneBoundaryMessageId(boundaryMessageId);
-				setPrunedPercent(prunedPct);
-			},
-			onGitStatus: (data) => {
-				qc.setQueryData(["chapterGitStatus", data.chapterId], {
-					commitsAhead: data.commitsAhead,
-					baseBranch: data.baseBranch,
-					linesAdded: data.linesAdded,
-					linesRemoved: data.linesRemoved,
-				});
-			},
-			onCompacting: () => {
-				setIsCompacting(true);
-			},
-			onCompactDone: () => {
-				setIsCompacting(false);
-				setPruneBoundaryMessageId(null);
-				setPrunedPercent(null);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
-				qc.invalidateQueries({ queryKey: messagesQueryKey });
-			},
-			onNarratorError: (error) => {
-				notifications.show({
-					title: t("narratorError"),
-					message: error,
-					color: "red",
-					autoClose: 8000,
-				});
-			},
-			onNarratorWarning: (message) => {
-				notifications.show({
-					title: t("narratorRetrying"),
-					message,
-					color: "yellow",
-					autoClose: 10000,
-				});
-			},
-			onCatchUp: (orphanChildren, topLevel) => {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					let result: MessagesQueryData = old;
-					// Insert orphan children into their parent's tree
-					for (const child of orphanChildren) {
-						if (child?.id && child?.parentToolUseId) {
-							result = insertChildIntoCache(result, {
-								...child,
-								children: child.children ?? [],
-							}) as MessagesQueryData;
-						}
-					}
-					// Append new top-level messages
-					if (topLevel.length > 0) {
-						const pages = [...result.pages];
-						const firstPage = { ...pages[0] };
-						const existingIds = new Set(firstPage.messages.map((m: NarratorMsg) => m.id));
-						const newMsgs = topLevel
-							.filter((m: NarratorMsg) => m?.id && m?.createdAt && !existingIds.has(m.id))
-							.map((m: NarratorMsg) => ({ ...m, children: m.children ?? [] }));
-						if (newMsgs.length > 0) {
-							firstPage.messages = [...firstPage.messages, ...newMsgs];
-							pages[0] = firstPage;
-							result = { ...result, pages };
-						}
-					}
-					return result;
-				});
-				// Instant scroll to bottom if user was already there
-				if (isAtBottomRef.current) {
-					requestAnimationFrame(() => scrollToBottom(true));
-				}
-			},
-			onFullReload: () => {
-				qc.invalidateQueries({ queryKey: messagesQueryKey });
-			},
-		},
-		lastMessageId,
-	);
-
-	// Keep ref in sync so early-defined callbacks can use sendPermissionDecision
-	sendPermissionDecisionRef.current = sendPermissionDecision;
-	sendBufferMessageRef.current = sendBufferMessage;
-
-	// Load any existing pending permission on mount/reconnect
-	const prevConnectedRef = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: fetch on mount and reconnect
-	useEffect(() => {
-		// Only fetch when connected transitions to true (not on disconnect)
-		if (!connected && prevConnectedRef.current) {
-			prevConnectedRef.current = false;
-			return;
-		}
-		if (connected) prevConnectedRef.current = true;
-		// Always fetch on mount (connected may still be false initially)
-		api
-			.getPendingPermissions(narratorId)
-			.then((perms) => {
-				if (perms.length > 0) {
-					setPendingPermsMap((prev) => {
-						const next = new Map(prev);
-						for (const p of perms) {
-							if (p.toolUseId) next.set(p.toolUseId, p);
-						}
-						return next;
-					});
-					// Messages use staleTime: Infinity and are only updated via WS.
-					// If the user was away when the permission request arrived, the
-					// cached messages won't contain the assistant message / tool call
-					// that the permission references, so the inline permission UI
-					// would never render. Invalidate to fetch the latest messages.
-					qc.invalidateQueries({ queryKey: messagesQueryKey });
-				}
-			})
-			.catch(() => {});
-		// Hydrate buffered message state for multi-device sync
-		api
-			.getBufferedMessage(narratorId)
-			.then((buf) => setBufferedText(buf?.text ?? null))
-			.catch(() => {});
-	}, [narratorId, connected]);
-
-	// Fallback: when narrator status is "waiting" but we have no pendingPermission
-	// (e.g. WS message was missed, page was refreshed mid-permission), poll the API.
-	useEffect(() => {
-		if (narrator?.status !== "waiting" || pendingPermsMap.size > 0) return;
-		let cancelled = false;
-		const poll = () => {
-			api
-				.getPendingPermissions(narratorId)
-				.then((perms) => {
-					if (cancelled) return;
-					if (perms.length > 0) {
-						setPendingPermsMap((prev) => {
-							const next = new Map(prev);
-							for (const p of perms) {
-								if (p.toolUseId) next.set(p.toolUseId, p);
-							}
-							return next;
-						});
-						qc.invalidateQueries({ queryKey: messagesQueryKey });
-					}
-				})
-				.catch(() => {});
-		};
-		poll();
-		const timer = setInterval(poll, 5000);
-		return () => {
-			cancelled = true;
-			clearInterval(timer);
-		};
-	}, [narratorId, narrator?.status, pendingPermsMap.size, messagesQueryKey, qc.invalidateQueries]);
-
-	// Mark "done" narrator as read (→ idle) when user enters the panel
-	useEffect(() => {
-		if (narrator?.status === "done") {
-			api.markNarratorRead(narratorId).catch(() => {});
-		}
-	}, [narratorId, narrator?.status]);
-
-	// Title editing
-	const startEditingTitle = () => {
-		setTitleValue(narrator?.title || "");
-		setEditingTitle(true);
-	};
-
-	useEffect(() => {
-		if (editingTitle) {
-			titleInputRef.current?.focus();
-			titleInputRef.current?.select();
-		}
-	}, [editingTitle]);
-
-	const saveTitle = async () => {
-		if (generatingTitle) return; // Don't save stale value while AI is generating
-		const trimmed = titleValue.trim();
-		if (trimmed && trimmed !== narrator?.title) {
-			await api.updateNarratorTitle(narratorId, trimmed);
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-		}
-		setEditingTitle(false);
-	};
-
-	const handleGenerateTitle = async () => {
-		setGeneratingTitle(true);
-		try {
-			const { title } = await api.generateNarratorTitle(narratorId);
-			setTitleValue(title);
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-		} finally {
-			setGeneratingTitle(false);
-		}
-	};
-
-	const handleTitleKeyDown = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter") {
-			e.preventDefault();
-			saveTitle();
-		} else if (e.key === "Escape") {
-			setEditingTitle(false);
-		}
-	};
-
-	// Send message via REST, or buffer it if the narrator is already active
+	// --- Send message ---
 	const handleSend = async () => {
 		const msg = input.trim();
 		if (!msg) return;
-
-		// If the narrator is active, buffer the message instead of sending directly
 		if (isActive) {
 			sendBufferMessage(narratorId, msg);
 			setBufferedText(msg);
@@ -3117,14 +785,11 @@ export function NarratorPanel({
 			scrollToBottom(true);
 			return;
 		}
-
 		const images = [...attachedImages];
 		setInput("");
 		setAttachedImages([]);
 		streamingRef.current = "";
-		setStreamingVersion(0);
 
-		// Optimistic: show user message immediately (with image previews)
 		const optimisticBlocks: ContentBlock[] = [
 			...images.map((f) => ({
 				type: "image",
@@ -3158,26 +823,19 @@ export function NarratorPanel({
 			pages[0] = firstPage;
 			return { ...old, pages };
 		});
-
-		// User just sent a message — always snap to bottom
 		scrollToBottom(true);
-
 		try {
 			await api.sendNarratorMessage(narratorId, msg, images.length > 0 ? images : undefined);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : "Failed to send message";
-			notifications.show({
-				title: "Error",
-				message,
-				color: "red",
-			});
+			notifications.show({ title: "Error", message, color: "red" });
 		}
 	};
 
 	const handleCancelBuffer = () => {
 		if (bufferedText) {
 			cancelBuffer(narratorId);
-			setInput(bufferedText); // Restore text to input for re-editing
+			setInput(bufferedText);
 			setBufferedText(null);
 		}
 	};
@@ -3297,7 +955,6 @@ export function NarratorPanel({
 							size="sm"
 							variant="subtle"
 							color="gray"
-							// Two-state toggle: null(default)/true → false(collapse), false → true(expand)
 							onClick={() =>
 								setEditExpandOverride((prev) => (prev === true ? false : prev === false))
 							}
@@ -3501,10 +1158,10 @@ export function NarratorPanel({
 				</Group>
 			)}
 
-			{/* Chapter bar — shown when narrator is bound to a chapter */}
+			{/* Chapter bar */}
 			{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
 
-			{/* Status bar — always visible */}
+			{/* Status bar */}
 			<Group
 				px="md"
 				pt="xs"
@@ -3520,7 +1177,6 @@ export function NarratorPanel({
 					flexShrink: 0,
 				}}
 			>
-				{/* Status indicator — doubles as work indicator when active */}
 				{showWorkIndicator ? (
 					<UnstyledButton
 						disabled={!activeTodo}
@@ -3598,7 +1254,7 @@ export function NarratorPanel({
 				)}
 				{/* Model & Permission selectors */}
 				<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
-					{/* Context usage indicator (all breakpoints) */}
+					{/* Context usage indicator */}
 					{(() => {
 						const m = allModels.find(
 							(x) => (typeof x === "string" ? x : x.value) === narrator.model,
@@ -3939,9 +1595,7 @@ export function NarratorPanel({
 						}
 					}}
 				/>
-				{/* Main input row */}
 				<Group gap="xs" align="end" wrap="nowrap">
-					{/* Attach button */}
 					<Tooltip label={t("attachImage")}>
 						<ActionIcon
 							variant="subtle"
@@ -3952,7 +1606,6 @@ export function NarratorPanel({
 							<IconPaperclip size={18} />
 						</ActionIcon>
 					</Tooltip>
-					{/* Textarea */}
 					<Textarea
 						flex={1}
 						placeholder={t("sendPlaceholder")}

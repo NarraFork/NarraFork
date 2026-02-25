@@ -343,9 +343,24 @@ const toolMessages = {
 	},
 	// Injected as user content when broken tool calls are stripped from history
 	brokenToolCallReminder: {
-		en: "[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context. IMPORTANT: Do NOT retry with the same large content. You MUST split the work into smaller pieces — write files in sections using Write for the first part, then Edit/append for subsequent parts.]",
-		"zh-CN":
-			"[系统提示：你上一次的 {toolNames} 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。重要：不要用相同的大内容重试。你必须将工作拆分为更小的部分——先用 Write 写入文件的第一部分，然后用 Edit/追加写入后续部分。]",
+		en: `[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context.
+
+STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
+1. Each tool call's TOTAL input must be under 10,000 characters (including file_path, old_string, new_string, content — everything).
+2. Write is ONLY for the first section of a new file (< 10,000 chars). End with a unique marker comment: "// APPEND_NEXT_1" (use the file type's comment syntax, e.g. {# APPEND_NEXT_1 #} for Jinja, <!-- APPEND_NEXT_1 --> for HTML).
+3. ALL subsequent parts MUST use Edit — NEVER use Write again for the same file. Use old_string="// APPEND_NEXT_1" (this exact short marker, nothing more) and new_string=<next section + next marker "// APPEND_NEXT_2" if more follows>. Increment the number each time (APPEND_NEXT_1 → APPEND_NEXT_2 → APPEND_NEXT_3 …). Keep old_string as short as possible — just the marker line.
+4. Remove the APPEND marker only in the final Edit call (new_string contains the last section without any marker).
+5. For large replacements: split into multiple small Edit calls with different unique short anchors as old_string.
+6. NEVER write/edit more than 10,000 characters in a single tool call. NEVER use Write to overwrite a file that already exists with content.]`,
+		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。
+
+严格规则——你必须严格遵守以下规则，避免重复截断：
+1. 每次工具调用的总输入必须小于 10,000 字符（包括 file_path、old_string、new_string、content 等所有字段）。
+2. Write 仅用于新文件的第一段（< 10,000 字符），末尾加唯一标记注释 "// APPEND_NEXT_1"（根据文件类型使用对应注释语法，如 Jinja 用 {# APPEND_NEXT_1 #}，HTML 用 <!-- APPEND_NEXT_1 -->）。
+3. 所有后续部分必须使用 Edit——绝对不要对同一文件再次使用 Write。用 old_string="// APPEND_NEXT_1"（就这一行短标记，不要多写）、new_string=<下一段内容，如果还有后续则末尾加 "// APPEND_NEXT_2">。每次递增编号（APPEND_NEXT_1 → APPEND_NEXT_2 → APPEND_NEXT_3 …）。old_string 要尽可能短——只写标记行本身。
+4. 仅在最后一次 Edit 时不再添加 APPEND 标记（new_string 只包含最后一段内容，不带标记）。
+5. 大范围替换：拆分为多个小 Edit，用不同的唯一短锚点作为 old_string。
+6. 绝对不要在单次调用中写入/编辑超过 10,000 字符。绝对不要用 Write 覆盖已有内容的文件。]`,
 	},
 	// Placeholder for broken tool call content in persisted input
 	brokenToolCallInputPlaceholder: {
@@ -354,8 +369,9 @@ const toolMessages = {
 	},
 	// Persisted result for broken tool calls
 	brokenToolCallResult: {
-		en: "Write failed — system requires splitting into smaller segments.",
-		"zh-CN": "写入失败，系统要求改为分小段进行写入",
+		en: "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use APPEND marker to split large writes.",
+		"zh-CN":
+			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用 APPEND 标记分段写入。",
 	},
 } satisfies Record<string, Record<Locale, string>>;
 

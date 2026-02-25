@@ -1,0 +1,126 @@
+import type { QueryClient } from "@tanstack/react-query";
+import type {
+	ContentBlock,
+	FlatToolItem,
+	MessagesQueryData,
+	NarratorMsg,
+	ToolCallRow,
+} from "./narrator-panel-types";
+import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+import type { PendingPermission, ToolCallData } from "./ToolCallCard";
+
+export function isToolOnlyMessage(msg: NarratorMsg): boolean {
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return (
+		msg.role === "assistant" &&
+		blocks.length > 0 &&
+		blocks.every(
+			(b: ContentBlock) => b.type === "tool_use" || (b.type === "text" && !b.text?.trim()),
+		)
+	);
+}
+
+/** Check if an assistant message contains at least one tool_use block. */
+export function hasToolUse(msg: NarratorMsg): boolean {
+	if (msg.role !== "assistant") return false;
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return blocks.some((b: ContentBlock) => b.type === "tool_use");
+}
+
+/** Resolve ALL tool_use blocks from a message (one message may contain multiple tool calls). */
+export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const results: ToolCallData[] = [];
+	for (const block of blocks) {
+		if (block.type !== "tool_use") continue;
+		const tc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === block.id);
+		const status = tc?.status ?? "running";
+		// Derive startedAt for in-progress tools from persisted timestamps so the
+		// elapsed timer works correctly when re-entering a session.
+		let startedAt: number | undefined;
+		if (status === "running" || status === "pending" || status === "initializing") {
+			const ts = tc?.permissionDecidedAt ?? tc?.createdAt;
+			if (ts) startedAt = new Date(ts).getTime();
+		}
+		results.push({
+			id: tc?.id,
+			toolName: block.name ?? "",
+			toolUseId: block.id,
+			inputJson: tc?.inputJson ?? block.input,
+			outputJson: tc?.outputJson,
+			status,
+			durationMs: tc?.durationMs,
+			errorMessage: tc?.errorMessage,
+			permissionDecisionReason: tc?.permissionDecisionReason,
+			permissionSuggestions: tc?.permissionSuggestions,
+			startedAt,
+		});
+	}
+	return results;
+}
+
+/** Resolve a PendingPermission from a tool call's data or WS state fallback. */
+export function resolvePendingPerm(
+	tc: ToolCallData,
+	wsPerm: PendingPermission | null | undefined,
+	wsPermsMap?: Map<string, PendingPermission>,
+): PendingPermission | null {
+	// Prefer WS-sourced permissions — they carry the full (untruncated) inputJson.
+	// The message-list API truncates large inputJson, so building from tc.inputJson
+	// would lose data (e.g. ExitPlanMode plan text).
+	if (wsPermsMap && tc.toolUseId) {
+		const fromMap = wsPermsMap.get(tc.toolUseId);
+		if (fromMap) return fromMap;
+	}
+	if (wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
+		return wsPerm;
+	}
+	// Fallback: build from the tool call record itself (status-driven path,
+	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
+	if (tc.status === "pending" && tc.toolUseId) {
+		return {
+			id: tc.id ?? tc.toolUseId,
+			toolName: tc.toolName,
+			toolUseId: tc.toolUseId,
+			inputJson: tc.inputJson,
+			decisionReason: tc.permissionDecisionReason ?? undefined,
+			suggestions: tc.permissionSuggestions ?? undefined,
+		} as PendingPermission;
+	}
+	return null;
+}
+
+export function filterChildrenByToolUse(
+	children: NarratorMsg[],
+	toolUseId: string | undefined,
+): NarratorMsg[] {
+	if (!toolUseId) return [];
+	return children.filter((c) => c.parentToolUseId === toolUseId);
+}
+
+export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
+	const items: FlatToolItem[] = [];
+	for (const msg of run) {
+		const tcs = resolveAllToolCallsFromMsg(msg);
+		for (const tc of tcs) {
+			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
+			const isSubagent = tc.toolName === "Task" || children.length > 0;
+			items.push({ tc, msg, children, isSubagent });
+		}
+	}
+	return items;
+}
+
+export function removeStreamingChunksMsg(qc: QueryClient, messagesQueryKey: unknown[]): void {
+	qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+		if (!old?.pages?.length) return old;
+		const firstPage = old.pages[0];
+		if (!firstPage.messages.some((m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID)) return old;
+		const pages = [...old.pages];
+		pages[0] = {
+			...firstPage,
+			messages: firstPage.messages.filter((m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID),
+		};
+		return { ...old, pages };
+	});
+}
