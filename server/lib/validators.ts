@@ -251,7 +251,7 @@ export const updateUserPreferencesSchema = z.object({
 });
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "session"]),
+	type: z.enum(["chapter", "session", "project"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	title: z.string().max(200),
@@ -263,7 +263,7 @@ export const recentTabSchema = z.object({
 export const upsertRecentTabSchema = recentTabSchema;
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "session"]),
+	type: z.enum(["chapter", "session", "project"]),
 	id: z.string().min(1).max(50),
 });
 
@@ -271,6 +271,7 @@ export const removeRecentTabSchema = z.object({
 
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
+	z.object({ type: z.literal("pong") }),
 	z.object({
 		type: z.literal("subscribe"),
 		narratorIds: z.array(z.string().min(1)),
@@ -307,6 +308,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 
 // Terminal client → server
 export const terminalWsMessageSchema = z.discriminatedUnion("type", [
+	z.object({ type: z.literal("pong") }),
 	z.object({
 		type: z.literal("subscribe"),
 		terminalIds: z.array(z.string().min(1)),

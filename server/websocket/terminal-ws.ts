@@ -8,6 +8,7 @@ import type { WSData } from "./ws-handler";
 
 export interface TerminalWSData {
 	connectedAt: number;
+	lastPongAt: number;
 	subscribedTerminals: Set<string>;
 }
 
@@ -52,6 +53,11 @@ type TerminalWS = ServerWebSocket<WSData & { channel: "terminal" }>;
 
 const connections = new Set<TerminalWS>();
 
+/** Expose connections for heartbeat iteration. */
+export function getTerminalConnections(): Set<TerminalWS> {
+	return connections;
+}
+
 /** Track the last client that sent input per terminal — only this client's resize is honored */
 const lastActiveClient = new Map<string, TerminalWS>();
 
@@ -63,7 +69,7 @@ export function sendToTerminal(terminalId: string, message: TerminalServerMessag
 			try {
 				ws.send(payload);
 			} catch {
-				// noop
+				connections.delete(ws);
 			}
 		}
 	}
@@ -97,6 +103,7 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 
 export const handleTerminalWS = {
 	open(ws: TerminalWS) {
+		ws.data.lastPongAt = Date.now();
 		connections.add(ws);
 	},
 
@@ -110,7 +117,13 @@ export const handleTerminalWS = {
 		}
 		const msg = result.data;
 
+		// Update heartbeat timestamp on any valid message
+		ws.data.lastPongAt = Date.now();
+
 		switch (msg.type) {
+			case "pong":
+				// Heartbeat response — lastPongAt already updated above
+				break;
 			case "subscribe": {
 				for (const id of msg.terminalIds) {
 					subscribeToTerminal(ws, id);

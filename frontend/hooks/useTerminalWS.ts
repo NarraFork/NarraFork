@@ -73,6 +73,11 @@ class TerminalWSManager {
 		ws.onmessage = (event) => {
 			try {
 				const msg = JSON.parse(event.data);
+				// Respond to server heartbeat ping
+				if (msg.type === "ping") {
+					ws.send(JSON.stringify({ type: "pong" }));
+					return;
+				}
 				this.handleMessage(msg);
 			} catch {
 				// ignore parse errors

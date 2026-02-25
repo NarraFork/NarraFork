@@ -21,12 +21,15 @@ interface NarratorWSCallbacks {
 		toolName: string,
 		inputCharsTotal: number,
 		parentToolUseId?: string,
+		extractedFilePath?: string,
+		contentCharsReceived?: number,
 	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
 		status: string,
 		output?: unknown,
 		durationMs?: number,
+		updatedInput?: Record<string, unknown>,
 	) => void;
 	onTitleUpdated?: (title: string) => void;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -49,6 +52,7 @@ interface NarratorWSCallbacks {
 	onNarratorError?: (error: string) => void;
 	onNarratorWarning?: (message: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
+	onFullReload?: () => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -127,6 +131,11 @@ export function useNarratorWS(
 				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
+					// Respond to server heartbeat ping
+					if (data.type === "ping") {
+						ws.send(JSON.stringify({ type: "pong" }));
+						return;
+					}
 					// Guard: discard messages targeting a different narrator.
 					// This prevents stale in-flight events (e.g. from a pre-fork
 					// narrator) from being applied to the wrong message cache when
@@ -171,6 +180,8 @@ export function useNarratorWS(
 								data.toolName,
 								data.inputCharsTotal,
 								data.parentToolUseId,
+								data.extractedFilePath,
+								data.contentCharsReceived,
 							);
 							break;
 						case "tool_completed":
@@ -179,6 +190,7 @@ export function useNarratorWS(
 								data.status,
 								data.output,
 								data.durationMs,
+								data.updatedInput,
 							);
 							break;
 						case "todos_updated":
@@ -239,6 +251,9 @@ export function useNarratorWS(
 							break;
 						case "catch_up":
 							callbacksRef.current.onCatchUp?.(data.orphanChildren ?? [], data.topLevel ?? []);
+							break;
+						case "full_reload":
+							callbacksRef.current.onFullReload?.();
 							break;
 					}
 				} catch (err) {
@@ -400,6 +415,11 @@ export function useSessionsListWS(
 				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
+					// Respond to server heartbeat ping
+					if (data.type === "ping") {
+						ws.send(JSON.stringify({ type: "pong" }));
+						return;
+					}
 					const nId = data.narratorId;
 					if (data.type === "status_change" || data.type === "narrator:status_changed") {
 						onUpdateRef.current(nId, { type: "status", status: data.status });

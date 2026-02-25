@@ -16,6 +16,7 @@ import type { WSData } from "./ws-handler";
 
 export interface NarratorWSData {
 	connectedAt: number;
+	lastPongAt: number;
 	subscribedNarrators: Set<string>;
 }
 
@@ -113,10 +114,12 @@ export type NarratorServerMessage =
 	  }
 	| { type: "error"; message: string }
 	| { type: "warning"; narratorId: string; message: string }
-	| { type: "context_length_exceeded"; narratorId: string };
+	| { type: "context_length_exceeded"; narratorId: string }
+	| { type: "full_reload"; narratorId: string };
 
 // Client → Server messages
 export type NarratorClientMessage =
+	| { type: "pong" }
 	| { type: "subscribe"; narratorIds: string[]; lastMessageId?: string }
 	| { type: "unsubscribe"; narratorIds: string[] }
 	| {
@@ -141,6 +144,11 @@ type NarratorWS = ServerWebSocket<WSData & { channel: "narrator" }>;
 
 const connections = new Set<NarratorWS>();
 
+/** Expose connections for heartbeat iteration. */
+export function getNarratorConnections(): Set<NarratorWS> {
+	return connections;
+}
+
 // === Event bus → WebSocket broadcast ===
 
 /**
@@ -154,6 +162,7 @@ const ALREADY_BROADCAST_EVENTS = new Set([
 	"narrator:title_updated",
 	"narrator:subagent_started",
 	"narrator:subagent_completed",
+	"user:recent_tabs_changed",
 ]);
 
 function shouldForwardEvent(event: NarraForkEvent): boolean {
@@ -184,7 +193,7 @@ eventBus.onAny((event) => {
 		try {
 			ws.send(JSON.stringify(event));
 		} catch {
-			// Connection might be dead, will be cleaned up on close
+			connections.delete(ws);
 		}
 	}
 });
@@ -198,7 +207,7 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			try {
 				ws.send(payload);
 			} catch {
-				// noop
+				connections.delete(ws);
 			}
 		}
 	}
@@ -208,6 +217,7 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 
 export const handleNarratorWS = {
 	open(ws: NarratorWS) {
+		ws.data.lastPongAt = Date.now();
 		connections.add(ws);
 	},
 
@@ -227,7 +237,13 @@ export const handleNarratorWS = {
 		}
 		const msg = result.data;
 
+		// Update heartbeat timestamp on any valid message
+		ws.data.lastPongAt = Date.now();
+
 		switch (msg.type) {
+			case "pong":
+				// Heartbeat response — lastPongAt already updated above
+				break;
 			case "subscribe": {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.add(id);
@@ -237,7 +253,16 @@ export const handleNarratorWS = {
 					const narratorId = msg.narratorIds[0];
 					narratorService
 						.getMessagesAfter(narratorId, msg.lastMessageId)
-						.then(({ topLevel, orphanChildren }) => {
+						.then(({ topLevel, orphanChildren, hitLimit }) => {
+							// Too many missed messages or reference not found — tell client to reload
+							if (hitLimit) {
+								try {
+									ws.send(JSON.stringify({ type: "full_reload", narratorId }));
+								} catch {
+									connections.delete(ws);
+								}
+								return;
+							}
 							if (topLevel.length === 0 && orphanChildren.length === 0) return;
 							try {
 								ws.send(
@@ -249,7 +274,7 @@ export const handleNarratorWS = {
 									}),
 								);
 							} catch {
-								// connection dead
+								connections.delete(ws);
 							}
 						})
 						.catch((err: unknown) =>

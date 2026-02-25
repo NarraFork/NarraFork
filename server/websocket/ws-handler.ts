@@ -1,7 +1,12 @@
 import type { ServerWebSocket } from "bun";
 import { logger } from "../lib/logger";
-import { handleNarratorWS, type NarratorClientMessage, type NarratorWSData } from "./narrator-ws";
-import { handleTerminalWS, type TerminalWSData } from "./terminal-ws";
+import {
+	getNarratorConnections,
+	handleNarratorWS,
+	type NarratorClientMessage,
+	type NarratorWSData,
+} from "./narrator-ws";
+import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
 
 // === Unified WS data type ===
 
@@ -15,12 +20,97 @@ export type WSData =
  */
 export function resolveWSData(url: URL): WSData | null {
 	if (url.pathname === "/ws/narrator" || url.pathname.startsWith("/ws/narrator?")) {
-		return { channel: "narrator", connectedAt: Date.now(), subscribedNarrators: new Set() };
+		return {
+			channel: "narrator",
+			connectedAt: Date.now(),
+			lastPongAt: Date.now(),
+			subscribedNarrators: new Set(),
+		};
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {
-		return { channel: "terminal", connectedAt: Date.now(), subscribedTerminals: new Set() };
+		return {
+			channel: "terminal",
+			connectedAt: Date.now(),
+			lastPongAt: Date.now(),
+			subscribedTerminals: new Set(),
+		};
 	}
 	return null;
+}
+
+// === Heartbeat ===
+
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_TIMEOUT_MS = 90_000;
+
+const pingPayload = JSON.stringify({ type: "ping" });
+
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+export function startHeartbeat() {
+	if (heartbeatTimer) return;
+	heartbeatTimer = setInterval(() => {
+		const now = Date.now();
+		const staleNarrator: Array<ServerWebSocket<WSData & { channel: "narrator" }>> = [];
+		const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
+
+		for (const ws of getNarratorConnections()) {
+			if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+				staleNarrator.push(ws);
+				continue;
+			}
+			try {
+				ws.send(pingPayload);
+			} catch {
+				staleNarrator.push(ws);
+			}
+		}
+
+		for (const ws of getTerminalConnections()) {
+			if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+				staleTerminal.push(ws);
+				continue;
+			}
+			try {
+				ws.send(pingPayload);
+			} catch {
+				staleTerminal.push(ws);
+			}
+		}
+
+		for (const ws of staleNarrator) {
+			logger.debug("Closing stale narrator WS (heartbeat timeout)", {
+				connectedAt: ws.data.connectedAt,
+				lastPongAt: ws.data.lastPongAt,
+			});
+			getNarratorConnections().delete(ws);
+			try {
+				ws.close(1000, "heartbeat timeout");
+			} catch {
+				// already dead
+			}
+		}
+
+		for (const ws of staleTerminal) {
+			logger.debug("Closing stale terminal WS (heartbeat timeout)", {
+				connectedAt: ws.data.connectedAt,
+				lastPongAt: ws.data.lastPongAt,
+			});
+			getTerminalConnections().delete(ws);
+			try {
+				ws.close(1000, "heartbeat timeout");
+			} catch {
+				// already dead
+			}
+		}
+	}, HEARTBEAT_INTERVAL_MS);
+}
+
+export function stopHeartbeat() {
+	if (heartbeatTimer) {
+		clearInterval(heartbeatTimer);
+		heartbeatTimer = undefined;
+	}
 }
 
 // === Bun WebSocket handlers ===
