@@ -47,7 +47,7 @@ import {
 	IconTerminal,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	memo,
@@ -60,6 +60,7 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
 	useForkNarrator,
@@ -1497,36 +1498,7 @@ export function NarratorPanel({
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
 	const modelMutation = useUpdateModel();
-	const { data: settingsData } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-	});
-	const allModels = useMemo(() => {
-		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					.map((m: any) => ({
-						value: String(m.model_id ?? m.modelId ?? ""),
-						label: String(
-							m.model_short_name ??
-								m.modelShortName ??
-								m.model_name ??
-								m.modelName ??
-								m.model_id ??
-								m.modelId ??
-								"",
-						),
-						rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
-					}))
-					.filter((m: { value: string }) => m.value)
-			: [
-				];
-		const custom = (settingsData?.agent?.customModels ?? []).map(
-			(m: { value: string; label: string; provider?: string }) => ({
-				...m,
-				provider: m.provider ?? "openai",
-			}),
-		);
-	}, [settingsData]);
+	const { visibleModels: allModels } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const { t } = useTranslation("narrator");
@@ -1719,10 +1691,49 @@ export function NarratorPanel({
 		setInterruptProgress(0);
 		interruptFiredRef.current = false;
 	}, []);
-	const startInterruptPress = useCallback(
-		(e: React.TouchEvent | React.MouseEvent) => {
-			// Prevent context menu from firing on long-press (touch devices)
-			if (e.type === "touchstart") e.preventDefault();
+	// Stable refs for the native touch handler so the callback-ref doesn't
+	// re-bind whenever interruptMutation/narratorId change identity.
+	const interruptMutationRef = useRef(interruptMutation);
+	interruptMutationRef.current = interruptMutation;
+	const narratorIdRef = useRef(narratorId);
+	narratorIdRef.current = narratorId;
+	const clearInterruptTimerRef = useRef(clearInterruptTimer);
+	clearInterruptTimerRef.current = clearInterruptTimer;
+
+	const startInterruptPress = useCallback((_e: React.MouseEvent) => {
+		interruptFiredRef.current = false;
+		const start = Date.now();
+		const duration = 600;
+		interruptTimerRef.current = setInterval(() => {
+			const elapsed = Date.now() - start;
+			const pct = Math.min(elapsed / duration, 1);
+			setInterruptProgress(pct);
+			if (pct >= 1 && !interruptFiredRef.current) {
+				interruptFiredRef.current = true;
+				if (interruptTimerRef.current != null) clearInterval(interruptTimerRef.current);
+				interruptTimerRef.current = null;
+				interruptMutationRef.current.mutate(narratorIdRef.current);
+			}
+		}, 16);
+	}, []);
+	// Callback ref: binds native touchstart with { passive: false } so
+	// preventDefault() reliably suppresses the browser long-press context
+	// menu on touch devices (React synthetic onTouchStart is passive).
+	// We store a cleanup function so that when the interrupt button unmounts
+	// (React calls the ref with null), the native listeners are removed.
+	// Without this, the ternary branch means React may reuse the same DOM
+	// <button> for the send button, and the leftover touchstart handler
+	// (which calls preventDefault()) would swallow touch-initiated clicks.
+	const interruptBtnCleanupRef = useRef<(() => void) | null>(null);
+	const interruptBtnRef = useCallback((btn: HTMLButtonElement | null) => {
+		// Clean up previous listeners (if any) before binding new ones
+		if (interruptBtnCleanupRef.current) {
+			interruptBtnCleanupRef.current();
+			interruptBtnCleanupRef.current = null;
+		}
+		if (!btn) return;
+		const onTouchStart = (e: TouchEvent) => {
+			e.preventDefault();
 			interruptFiredRef.current = false;
 			const start = Date.now();
 			const duration = 600;
@@ -1734,19 +1745,28 @@ export function NarratorPanel({
 					interruptFiredRef.current = true;
 					if (interruptTimerRef.current != null) clearInterval(interruptTimerRef.current);
 					interruptTimerRef.current = null;
-					interruptMutation.mutate(narratorId);
+					interruptMutationRef.current.mutate(narratorIdRef.current);
 				}
 			}, 16);
-		},
-		[interruptMutation, narratorId],
-	);
+		};
+		const onTouchEnd = () => clearInterruptTimerRef.current();
+		const onTouchCancel = () => clearInterruptTimerRef.current();
+		btn.addEventListener("touchstart", onTouchStart, { passive: false });
+		btn.addEventListener("touchend", onTouchEnd);
+		btn.addEventListener("touchcancel", onTouchCancel);
+		interruptBtnCleanupRef.current = () => {
+			btn.removeEventListener("touchstart", onTouchStart);
+			btn.removeEventListener("touchend", onTouchEnd);
+			btn.removeEventListener("touchcancel", onTouchCancel);
+		};
+	}, []);
 	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
 
 	const isWorking = narrator?.status === "thinking";
 	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
 	const isPlanning = narrator?.planMode && narrator?.status === "thinking";
-	const showWorkIndicator = !!(activeTodo || isWorking || isWaiting || isCompacting);
+	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting);
 
 	// Memoize blob URLs to avoid creating new ones on every render
 	const imagePreviewUrls = useMemo(
@@ -2647,10 +2667,11 @@ export function NarratorPanel({
 				status: string,
 				output?: unknown,
 				durationMs?: number,
+				updatedInput?: Record<string, unknown>,
 			) => {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
-					return updateToolCallByIndex(
+					let result = updateToolCallByIndex(
 						old,
 						toolUseId,
 						status,
@@ -2658,6 +2679,21 @@ export function NarratorPanel({
 						toolUseIndexRef.current,
 						durationMs,
 					);
+					// If the server sent an updatedInput (e.g. broken tool call sanitized),
+					// merge it into the tool call's inputJson so the UI shows the clean version.
+					if (updatedInput && result) {
+						let anyChanged = false;
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic cache structure
+						const pages = result.pages.map((page: any) => {
+							const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
+								inputJson: updatedInput,
+							});
+							if (changed) anyChanged = true;
+							return changed ? { ...page, messages } : page;
+						});
+						if (anyChanged) result = { ...result, pages } as MessagesQueryData;
+					}
+					return result;
 				});
 			},
 			onToolStarted: (toolUseId: string, _toolName: string, streamStartedAt?: number) => {
@@ -2680,6 +2716,8 @@ export function NarratorPanel({
 				toolName: string,
 				inputCharsTotal: number,
 				parentToolUseId?: string,
+				extractedFilePath?: string,
+				contentCharsReceived?: number,
 			) => {
 				// Subagent tool_use_chunk — update child messages in the tree
 				if (parentToolUseId) {
@@ -2734,7 +2772,13 @@ export function NarratorPanel({
 					if (tcIdx !== -1) {
 						prevToolCalls[tcIdx] = {
 							...prevToolCalls[tcIdx],
-							inputJson: { _streamingChars: inputCharsTotal },
+							inputJson: {
+								_streamingChars: inputCharsTotal,
+								...(extractedFilePath && { _streamingFilePath: extractedFilePath }),
+								...(contentCharsReceived != null && {
+									_streamingContentChars: contentCharsReceived,
+								}),
+							},
 						};
 					}
 
@@ -2929,6 +2973,9 @@ export function NarratorPanel({
 				if (isAtBottomRef.current) {
 					requestAnimationFrame(() => scrollToBottom(true));
 				}
+			},
+			onFullReload: () => {
+				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
 		},
 		lastMessageId,
@@ -3161,7 +3208,7 @@ export function NarratorPanel({
 	};
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter" && !e.shiftKey) {
+		if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 			e.preventDefault();
 			handleSend();
 		}
@@ -3921,17 +3968,21 @@ export function NarratorPanel({
 						const showInterrupt = isActive && !input.trim();
 						return showInterrupt ? (
 							<Button
+								key="interrupt"
+								ref={interruptBtnRef}
 								color="red"
 								variant="light"
 								onMouseDown={startInterruptPress}
 								onMouseUp={clearInterruptTimer}
 								onMouseLeave={clearInterruptTimer}
-								onTouchStart={startInterruptPress}
-								onTouchEnd={clearInterruptTimer}
-								onTouchCancel={clearInterruptTimer}
 								onContextMenu={(e) => e.preventDefault()}
 								loading={interruptMutation.isPending}
-								style={{ position: "relative", overflow: "hidden", userSelect: "none" }}
+								style={{
+									position: "relative",
+									overflow: "hidden",
+									userSelect: "none",
+									touchAction: "none",
+								}}
 							>
 								{interruptProgress > 0 && interruptProgress < 1 && (
 									<div
@@ -3949,7 +4000,11 @@ export function NarratorPanel({
 								<span style={{ position: "relative" }}>{t("interrupt")}</span>
 							</Button>
 						) : (
-							<Button onClick={handleSend} disabled={!input.trim() || (isActive && !!bufferedText)}>
+							<Button
+								key="send"
+								onClick={handleSend}
+								disabled={!input.trim() || (isActive && !!bufferedText)}
+							>
 								{isActive ? t("queue") : tc("send")}
 							</Button>
 						);

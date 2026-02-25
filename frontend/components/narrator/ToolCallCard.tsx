@@ -269,9 +269,16 @@ function basename(p: string): string {
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getSummary(toolName: string, input: any): string {
-	// Synthetic streaming tool call — show character count
+	// Synthetic streaming tool call — show file path + content chars
 	if (input?._streamingChars != null) {
 		const chars = input._streamingChars as number;
+		const filePath = input._streamingFilePath as string | undefined;
+		const contentChars = input._streamingContentChars as number | undefined;
+		if (filePath) {
+			const base = basename(filePath);
+			const displayChars = contentChars ?? chars;
+			return displayChars > 0 ? `${base} (${displayChars} chars)` : base;
+		}
 		return chars > 0 ? `${chars} chars` : "";
 	}
 	const cat = getCategory(toolName);
