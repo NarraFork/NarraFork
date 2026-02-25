@@ -1,7 +1,4 @@
-import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../db";
-import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import {
@@ -19,6 +16,7 @@ import { chapterCleanup } from "../services/chapter-cleanup";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
+import { commitSyncService } from "../services/commit-sync-service";
 import { containerService } from "../services/container-service";
 import { gitService } from "../services/git-service";
 
@@ -205,28 +203,50 @@ chapterRoutes.get("/:id/commits", async (c) => {
 		limit: c.req.query("limit"),
 		since: c.req.query("since"),
 	});
+	const sync = c.req.query("sync") === "true";
 
-	const chapter = await chapterService.getById(id);
+	// Ensure chapter exists
+	await chapterService.getById(id);
 
-	const project = await db.select().from(projects).where(eq(projects.id, chapter.projectId)).get();
-	if (!project?.gitPath) throw new ValidationError("Project has no git path");
-
-	const cwd = chapter.worktreePath || project.gitPath;
-	const args = ["log", `--max-count=${query.limit}`, "--format=%H|%s|%aI"];
-	if (query.since) args.push(`${query.since}..HEAD`);
-
-	const result = Bun.spawnSync(["git", ...args], { cwd });
-	if (result.exitCode !== 0) {
-		throw new ValidationError(`git log failed: ${result.stderr.toString().trim()}`);
-	}
-	const stdout = result.stdout.toString().trim();
-	if (!stdout) return c.json([]);
-
-	const commits = stdout.split("\n").map((line) => {
-		const [sha, message, date] = line.split("|", 3);
-		return { sha, message, date };
+	// Note: query.since is accepted for backward compat but not used in DB query;
+	// the old git-log-based implementation used it as a commit range. If needed,
+	// add authoredAt filtering in commitSyncService.getChapterCommits.
+	const commits = await commitSyncService.getChapterCommits(id, {
+		limit: query.limit,
+		sync,
 	});
-	return c.json(commits);
+
+	return c.json(
+		commits.map((commit) => ({
+			id: commit.id,
+			sha: commit.sha,
+			message: commit.message,
+			authorName: commit.authorName,
+			authorEmail: commit.authorEmail,
+			authoredAt: commit.authoredAt,
+			source: commit.source,
+			narratorId: commit.narratorId,
+			narratorMessageId: commit.narratorMessageId,
+			filesChanged: commit.filesChanged,
+			linesAdded: commit.linesAdded,
+			linesRemoved: commit.linesRemoved,
+		})),
+	);
+});
+
+chapterRoutes.get("/:id/commits/:sha", async (c) => {
+	const id = c.req.param("id");
+	const sha = c.req.param("sha");
+
+	await chapterService.getById(id);
+
+	// Looks up from DB cache only — commit must have been synced previously
+	const commit = await commitSyncService.getCommitBySha(id, sha);
+	if (!commit) throw new NotFoundError("Commit", sha);
+
+	return c.json({
+		...commit,
+	});
 });
 
 // === Git Status (commits ahead + uncommitted lines) ===

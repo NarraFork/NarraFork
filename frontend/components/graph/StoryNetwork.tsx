@@ -41,13 +41,15 @@ interface SelectedNodeData {
 	narratorCount: number;
 	hasContainers: boolean;
 	hasUpstreamUpdates: boolean;
+	commitCount?: number;
+	headCommitSha?: string | null;
 }
 
 interface ContextMenuState {
 	x: number;
 	y: number;
 	nodeId: string;
-	nodeData: { title: string; status: string; role: string };
+	nodeData: { title: string; status: string; role: string; isRoot?: boolean };
 }
 
 interface StoryNetworkProps {
@@ -95,6 +97,8 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 			narratorCount: d.narratorCount ?? 0,
 			hasContainers: d.hasContainers ?? false,
 			hasUpstreamUpdates: d.hasUpstreamUpdates ?? false,
+			commitCount: d.commitCount ?? 0,
+			headCommitSha: d.headCommitSha ?? null,
 		});
 	}, []);
 
@@ -117,6 +121,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 				title: d.title ?? d.label ?? "",
 				status: d.status ?? "",
 				role: d.role ?? "branch",
+				isRoot: d.isRoot ?? false,
 			},
 		});
 	}, []);

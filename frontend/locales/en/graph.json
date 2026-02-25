@@ -5,6 +5,7 @@
 	"noChapters": "No chapters yet.",
 	"narratorCount": "{{count}} narrator(s)",
 	"containers": "containers",
+	"root": "Root",
 	"contextMenu": {
 		"fork": "Fork",
 		"setRole": "Set Role",
@@ -20,6 +21,8 @@
 		"upstreamUpdates": "Upstream updates",
 		"recentCommits": "Recent Commits",
 		"noCommits": "No commits yet.",
-		"openDetails": "Open Details"
+		"openDetails": "Open Details",
+		"commitSummary": "{{count}} commits",
+		"headLabel": "HEAD"
 	}
 }

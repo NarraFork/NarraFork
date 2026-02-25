@@ -1,3 +1,4 @@
+import { CommitList } from "@frontend/components/chapter/CommitList";
 import { useChapterCommits } from "@frontend/hooks/useChapterCommits";
 import { CHAPTER_ROLE_ICONS } from "@frontend/lib/constants";
 import { ActionIcon, Badge, Divider, Group, Paper, Stack, Text, Title } from "@mantine/core";
@@ -15,13 +16,15 @@ interface GraphSidePanelProps {
 		narratorCount: number;
 		hasContainers: boolean;
 		hasUpstreamUpdates: boolean;
+		commitCount?: number;
+		headCommitSha?: string | null;
 	} | null;
 	onClose: () => void;
 }
 
 export function GraphSidePanel({ selectedNode, onClose }: GraphSidePanelProps) {
 	const { t } = useTranslation("graph");
-	const { data: commits } = useChapterCommits(selectedNode?.id, { limit: 5 });
+	const { data: commits } = useChapterCommits(selectedNode?.id, { limit: 8 });
 
 	if (!selectedNode) return null;
 
@@ -66,26 +69,26 @@ export function GraphSidePanel({ selectedNode, onClose }: GraphSidePanelProps) {
 					{selectedNode.branch}
 				</Text>
 
+				{selectedNode.commitCount != null && selectedNode.commitCount > 0 && (
+					<Text size="xs" c="dimmed">
+						{t("sidePanel.commitSummary", { count: selectedNode.commitCount })}
+						{selectedNode.headCommitSha && (
+							<>
+								{` · ${t("sidePanel.headLabel")} `}
+								<Text span ff="monospace" size="xs">
+									{selectedNode.headCommitSha.slice(0, 7)}
+								</Text>
+							</>
+						)}
+					</Text>
+				)}
+
 				<Divider />
 
 				<Text size="sm" fw={500}>
 					{t("sidePanel.recentCommits")}
 				</Text>
-				{commits?.map((commit: { sha: string; message: string; date: string }) => (
-					<Group key={commit.sha} gap="xs" wrap="nowrap">
-						<Text size="xs" c="dimmed" ff="monospace">
-							{commit.sha.slice(0, 7)}
-						</Text>
-						<Text size="xs" lineClamp={1}>
-							{commit.message}
-						</Text>
-					</Group>
-				))}
-				{(!commits || commits.length === 0) && (
-					<Text size="xs" c="dimmed">
-						{t("sidePanel.noCommits")}
-					</Text>
-				)}
+				<CommitList commits={commits ?? []} maxItems={8} />
 
 				<Divider />
 

@@ -84,6 +84,14 @@ export const chapters = sqliteTable(
 			onDelete: "set null",
 		}),
 
+		// Root chapter — represents the project's own git directory, not a worktree
+		isRoot: integer("is_root").default(0),
+
+		// Commit 范围边界（精确定义章节的 commit "窗口"）
+		headCommitSha: text("head_commit_sha"),
+		startCommitSha: text("start_commit_sha"),
+		commitCount: integer("commit_count").default(0),
+
 		// 图可视化
 		color: text("color"),
 		groupLabel: text("group_label"),
@@ -127,6 +135,50 @@ export const chapterEdges = sqliteTable(
 		index("idx_chapter_edges_project").on(table.projectId),
 		index("idx_chapter_edges_source").on(table.sourceId),
 		index("idx_chapter_edges_target").on(table.targetId),
+	],
+);
+
+// === chapter_commits ===
+export const chapterCommits = sqliteTable(
+	"chapter_commits",
+	{
+		id: text("id").primaryKey(),
+		chapterId: text("chapter_id")
+			.notNull()
+			.references(() => chapters.id, { onDelete: "cascade" }),
+		sha: text("sha").notNull(),
+		message: text("message").notNull(),
+		fullMessage: text("full_message"),
+		authorName: text("author_name"),
+		authorEmail: text("author_email"),
+		authoredAt: text("authored_at").notNull(),
+
+		// 来源追踪
+		source: text("source", {
+			enum: ["manual", "auto", "merge", "cherry_pick", "initial"],
+		})
+			.notNull()
+			.default("manual"),
+
+		// narrator 关联
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
+		narratorMessageId: text("narrator_message_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
+			(): any => narratorMessages.id,
+			{ onDelete: "set null" },
+		),
+
+		// diff 统计缓存
+		filesChanged: integer("files_changed"),
+		linesAdded: integer("lines_added"),
+		linesRemoved: integer("lines_removed"),
+
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_chapter_commits_sha").on(table.chapterId, table.sha),
+		index("idx_chapter_commits_chapter").on(table.chapterId, table.authoredAt),
+		index("idx_chapter_commits_narrator").on(table.narratorId),
 	],
 );
 
@@ -201,6 +253,8 @@ export const narratorMessages = sqliteTable(
 		contextPercent: real("context_percent"),
 		meterUsage: real("meter_usage"),
 		meterUnit: text("meter_unit"),
+		// 关联的 commit SHA（auto-commit 时标记在最近的 assistant 消息上）
+		commitSha: text("commit_sha"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [

@@ -7,6 +7,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { terminalService } from "./terminal-service";
@@ -31,6 +32,7 @@ export const chapterCleanup = {
 				where: eq(chapters.id, chapterId),
 			});
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+			if (chapter.isRoot) throw new ValidationError("Cannot make root chapter dormant");
 			if (chapter.status !== "active")
 				throw new ValidationError("Can only make active chapters dormant");
 			if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
@@ -160,6 +162,16 @@ export const chapterCleanup = {
 
 			logger.info("Chapter woken", { chapterId, worktreePath });
 			eventBus.emit({ type: "chapter:woken", chapterId });
+
+			// Sync commits that may have been added externally while dormant
+			try {
+				await commitSyncService.syncChapterCommits(chapterId);
+			} catch (err) {
+				logger.warn("Failed to sync commits after wake (non-fatal)", {
+					chapterId,
+					error: String(err),
+				});
+			}
 		});
 	},
 
@@ -176,6 +188,10 @@ export const chapterCleanup = {
 				});
 				if (!chapter) {
 					report.errors.push({ chapterId, error: "Not found" });
+					continue;
+				}
+				if (chapter.isRoot) {
+					report.skipped.push(chapterId);
 					continue;
 				}
 				if (chapter.status === "merged" || chapter.status === "abandoned") {
@@ -255,7 +271,9 @@ export const chapterCleanup = {
 			orderBy: [asc(chapters.lastAccessedAt)],
 		});
 
-		const active = activeChapters.filter((c) => c.status === "active" && c.worktreePath);
+		const active = activeChapters.filter(
+			(c) => c.status === "active" && c.worktreePath && !c.isRoot,
+		);
 		if (active.length <= maxActive) return [];
 
 		const toDormant = active.slice(0, active.length - maxActive);

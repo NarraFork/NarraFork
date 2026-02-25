@@ -560,10 +560,40 @@ export const api = {
 		if (params?.limit) searchParams.set("limit", String(params.limit));
 		if (params?.since) searchParams.set("since", params.since);
 		const qs = searchParams.toString();
-		return request<Array<{ sha: string; message: string; date: string }>>(
-			`/chapters/${id}/commits${qs ? `?${qs}` : ""}`,
-		);
+		return request<
+			Array<{
+				id: string;
+				sha: string;
+				message: string;
+				authorName: string | null;
+				authorEmail: string | null;
+				authoredAt: string;
+				source: "manual" | "auto" | "merge" | "cherry_pick" | "initial";
+				narratorId: string | null;
+				narratorMessageId: string | null;
+				filesChanged: number | null;
+				linesAdded: number | null;
+				linesRemoved: number | null;
+			}>
+		>(`/chapters/${id}/commits${qs ? `?${qs}` : ""}`);
 	},
+
+	getChapterCommit: (chapterId: string, sha: string) =>
+		request<{
+			id: string;
+			sha: string;
+			message: string;
+			fullMessage: string | null;
+			authorName: string | null;
+			authorEmail: string | null;
+			authoredAt: string;
+			source: "manual" | "auto" | "merge" | "cherry_pick" | "initial";
+			narratorId: string | null;
+			narratorMessageId: string | null;
+			filesChanged: number | null;
+			linesAdded: number | null;
+			linesRemoved: number | null;
+		}>(`/chapters/${chapterId}/commits/${sha}`),
 
 	// === chapter git status ===
 	getChapterGitStatus: (id: string) =>
@@ -674,6 +704,21 @@ export const api = {
 			fromCache: boolean;
 			method: "POST",
 		}),
+	// OpenAI-compatible models
+	openaiListModels: () =>
+		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
+			"/openai/models",
+		),
+	openaiRefreshModels: () =>
+		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
+			"/openai/models/refresh",
+			{ method: "POST" },
+		),
+	openaiRefreshProviderModels: (providerId: string) =>
+		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
+			`/openai/providers/${providerId}/models/refresh`,
+			{ method: "POST" },
+		),
 };
 
 	text: string,

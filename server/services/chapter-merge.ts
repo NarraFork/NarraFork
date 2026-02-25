@@ -7,6 +7,7 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { chapterEdgeService } from "./chapter-edge-service";
+import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { startSession } from "./narrator-session";
 import { terminalService } from "./terminal-service";
@@ -335,6 +336,26 @@ export const chapterMerge = {
 			strategy,
 			commitSha,
 		});
+
+		// Record merge commit in the target chapter
+		if (commitSha) {
+			try {
+				// TODO: use the actual git commit message instead of this synthetic one
+				await commitSyncService.recordCommit({
+					chapterId: targetChapterId,
+					sha: commitSha,
+					message: `Merge ${source?.branch ?? sourceChapterId} (${strategy})`,
+					source: strategy === "cherry-pick" ? "cherry_pick" : "merge",
+				});
+			} catch (err) {
+				logger.warn("Failed to record merge commit (non-fatal)", {
+					targetChapterId,
+					commitSha,
+					error: String(err),
+				});
+			}
+		}
+
 		eventBus.emit({
 			type: "chapter:merged",
 			sourceId: sourceChapterId,

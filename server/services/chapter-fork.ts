@@ -10,6 +10,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { resolveChapterSettings } from "./chapter-service";
+import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
@@ -107,6 +108,22 @@ export const chapterFork = {
 				inheritMode: inheritMode,
 				narratorMessageUuid: input.forkAtMessageUuid,
 			});
+
+			// Copy parent's commit history to the forked chapter
+			try {
+				await commitSyncService.syncChapterCommits(parentChapterId);
+				await commitSyncService.copyCommitsForFork(
+					parentChapterId,
+					chapter.id,
+					forkPoint.commitSha,
+				);
+			} catch (err) {
+				logger.warn("Failed to copy commit history during fork (non-fatal)", {
+					parentChapterId,
+					childChapterId: chapter.id,
+					error: String(err),
+				});
+			}
 
 			// Step 3: Copy project-configured files
 			if (project.copyFiles && parent.worktreePath) {

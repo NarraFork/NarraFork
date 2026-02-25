@@ -4,6 +4,7 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 
 const COMMIT_MSG_TIMEOUT_MS = 30_000;
@@ -38,6 +39,7 @@ export async function autoCommitIfNeeded(
 	chapterId: string,
 	worktreePath: string,
 	locale: Locale,
+	lastAssistantMessageId?: string,
 ): Promise<void> {
 	// Lightweight check — avoid the heavier getStatusSummary just to see if changes exist
 	const status = await gitService.getStatus(worktreePath);
@@ -100,6 +102,24 @@ export async function autoCommitIfNeeded(
 		if (!commitSha) return; // Shouldn't happen since we checked status, but be safe
 
 		logger.info("Auto-commit completed", { narratorId, chapterId, commitSha, commitMessage });
+
+		// Record commit as a first-class entity
+		try {
+			await commitSyncService.recordCommit({
+				chapterId,
+				sha: commitSha,
+				message: commitMessage,
+				source: "auto",
+				narratorId,
+				narratorMessageId: lastAssistantMessageId,
+			});
+		} catch (err) {
+			logger.warn("Failed to record auto-commit in chapter_commits", {
+				chapterId,
+				commitSha,
+				error: String(err),
+			});
+		}
 
 		broadcastToNarrator(narratorId, {
 			type: "auto_commit_done",

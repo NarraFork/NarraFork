@@ -1,5 +1,6 @@
 import { relations } from "drizzle-orm";
 import {
+	chapterCommits,
 	chapterEdges,
 	chapters,
 	containerInstances,
@@ -44,6 +45,7 @@ export const chaptersRelations = relations(chapters, ({ one, many }) => ({
 	terminals: many(terminals),
 	containerInstances: many(containerInstances),
 	portAllocations: many(portAllocations),
+	commits: many(chapterCommits),
 }));
 
 export const chapterEdgesRelations = relations(chapterEdges, ({ one }) => ({
@@ -94,6 +96,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
 	terminals: many(terminals),
+	commits: many(chapterCommits),
 }));
 
 export const narratorMessagesRelations = relations(narratorMessages, ({ one, many }) => ({
@@ -183,5 +186,20 @@ export const mergeSessionsRelations = relations(mergeSessions, ({ one }) => ({
 	targetChapter: one(chapters, {
 		fields: [mergeSessions.targetChapterId],
 		references: [chapters.id],
+	}),
+}));
+
+export const chapterCommitsRelations = relations(chapterCommits, ({ one }) => ({
+	chapter: one(chapters, {
+		fields: [chapterCommits.chapterId],
+		references: [chapters.id],
+	}),
+	narrator: one(narrators, {
+		fields: [chapterCommits.narratorId],
+		references: [narrators.id],
+	}),
+	narratorMessage: one(narratorMessages, {
+		fields: [chapterCommits.narratorMessageId],
+		references: [narratorMessages.id],
 	}),
 }));

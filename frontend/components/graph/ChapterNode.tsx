@@ -1,4 +1,5 @@
 import { Badge, Card, Group, Text } from "@mantine/core";
+import { IconGitCommit } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
@@ -13,6 +14,8 @@ interface ChapterNodeData {
 	role?: string;
 	color?: string;
 	hasUpstreamUpdates?: boolean;
+	isRoot?: boolean;
+	commitCount?: number;
 	[key: string]: unknown;
 }
 
@@ -22,11 +25,15 @@ export function ChapterNode({ data, id }: NodeProps) {
 	const { t } = useTranslation("graph");
 
 	const role = d.role ?? "branch";
+	const isRoot = !!d.isRoot;
 	const isTrunk = role === "trunk";
 	const isFrozen = d.status === "frozen";
-	const roleIcon = CHAPTER_ROLE_ICONS[role] || "";
-	const borderColor =
-		d.color ?? `var(--mantine-color-${CHAPTER_STATUS_COLORS[d.status] ?? "gray"}-4)`;
+	const roleIcon = isRoot ? "📂" : CHAPTER_ROLE_ICONS[role] || "";
+	const borderColor = isRoot
+		? "var(--mantine-color-indigo-6)"
+		: (d.color ?? `var(--mantine-color-${CHAPTER_STATUS_COLORS[d.status] ?? "gray"}-4)`);
+	const nodeWidth = isRoot ? 320 : isTrunk ? 320 : 280;
+	const nodeHeight = isRoot ? 140 : isTrunk ? 140 : 120;
 
 	return (
 		<>
@@ -37,10 +44,11 @@ export function ChapterNode({ data, id }: NodeProps) {
 				radius="md"
 				withBorder
 				style={{
-					width: isTrunk ? 320 : 280,
-					height: isTrunk ? 140 : 120,
+					width: nodeWidth,
+					height: nodeHeight,
 					cursor: "pointer",
 					borderColor,
+					borderWidth: isRoot ? 2 : 1,
 					opacity: isFrozen ? 0.6 : 1,
 					position: "relative",
 				}}
@@ -60,7 +68,7 @@ export function ChapterNode({ data, id }: NodeProps) {
 					/>
 				)}
 				<Group justify="space-between" mb={4}>
-					<Text size="sm" fw={600} lineClamp={1} style={{ maxWidth: isTrunk ? 240 : 200 }}>
+					<Text size="sm" fw={600} lineClamp={1} style={{ maxWidth: nodeWidth - 80 }}>
 						{roleIcon ? `${roleIcon} ` : ""}
 						{d.title}
 					</Text>
@@ -72,7 +80,12 @@ export function ChapterNode({ data, id }: NodeProps) {
 					{d.branch}
 				</Text>
 				<Group gap={8} mt={4}>
-					{role !== "branch" && (
+					{isRoot && (
+						<Badge size="xs" variant="filled" color="indigo">
+							{t("root")}
+						</Badge>
+					)}
+					{!isRoot && role !== "branch" && (
 						<Badge size="xs" variant="outline" color="indigo">
 							{role}
 						</Badge>
@@ -84,6 +97,14 @@ export function ChapterNode({ data, id }: NodeProps) {
 						<Badge size="xs" variant="dot" color="teal">
 							{t("containers")}
 						</Badge>
+					)}
+					{(d.commitCount ?? 0) > 0 && (
+						<Group gap={2}>
+							<IconGitCommit size={12} color="var(--mantine-color-dimmed)" />
+							<Text size="xs" c="dimmed">
+								{d.commitCount}
+							</Text>
+						</Group>
 					)}
 				</Group>
 			</Card>

@@ -5,6 +5,7 @@
 	"noChapters": "暂无章节。",
 	"narratorCount": "{{count}} 个叙述者",
 	"containers": "容器",
+	"root": "根目录",
 	"contextMenu": {
 		"fork": "分叉",
 		"setRole": "设置角色",
@@ -20,6 +21,8 @@
 		"upstreamUpdates": "上游有更新",
 		"recentCommits": "最近提交",
 		"noCommits": "暂无提交。",
-		"openDetails": "打开详情"
+		"openDetails": "打开详情",
+		"commitSummary": "{{count}} 次提交",
+		"headLabel": "HEAD"
 	}
 }

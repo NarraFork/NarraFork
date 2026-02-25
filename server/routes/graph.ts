@@ -19,6 +19,9 @@ export interface GraphNode {
 		narratorCount: number;
 		hasContainers: boolean;
 		hasUpstreamUpdates: boolean;
+		isRoot: boolean;
+		commitCount: number;
+		headCommitSha: string | null;
 	};
 	position: { x: number; y: number };
 }
@@ -41,8 +44,11 @@ export function buildGraph(
 		color: string | null;
 		groupLabel: string | null;
 		explorationGroupId: string | null;
+		isRoot: number | null;
 		positionX: number | null;
 		positionY: number | null;
+		commitCount: number | null;
+		headCommitSha: string | null;
 	}[],
 	narratorCounts: Map<string, number>,
 	containerPresence: Set<string>,
@@ -68,6 +74,9 @@ export function buildGraph(
 			narratorCount: narratorCounts.get(ch.id) ?? 0,
 			hasContainers: containerPresence.has(ch.id),
 			hasUpstreamUpdates: false,
+			isRoot: !!ch.isRoot,
+			commitCount: ch.commitCount ?? 0,
+			headCommitSha: ch.headCommitSha ?? null,
 		},
 		position: {
 			x: ch.positionX ?? 0,
@@ -102,9 +111,12 @@ graphRoutes.get("/:id/graph", async (c) => {
 			color: true,
 			groupLabel: true,
 			explorationGroupId: true,
+			isRoot: true,
 			positionX: true,
 			positionY: true,
 			createdAt: true,
+			commitCount: true,
+			headCommitSha: true,
 		},
 	});
 

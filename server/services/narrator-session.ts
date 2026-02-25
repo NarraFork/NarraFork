@@ -1620,7 +1620,15 @@ async function runAgentLoop(
 
 			// No chained message — auto-commit before finishing
 			if (session._worktreePath && session._chapterId) {
-				await autoCommitIfNeeded(narratorId, session._chapterId, session._worktreePath, locale);
+				await autoCommitIfNeeded(
+					narratorId,
+					session._chapterId,
+					session._worktreePath,
+					locale,
+					// _partialMessageId is the last assistant message built during this turn;
+					// may be undefined if the turn produced no assistant output (e.g. error path)
+					session._partialMessageId,
+				);
 			}
 
 			session.events.emit("event", { type: "done", data: null });

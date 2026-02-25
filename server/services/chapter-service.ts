@@ -10,6 +10,7 @@ import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
 import { chapterCleanup } from "./chapter-cleanup";
+import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
@@ -38,7 +39,76 @@ interface CreateChapterInput {
 	baseBranch?: string;
 }
 
+interface CreateRootChapterInput {
+	projectId: string;
+	title: string;
+	gitPath: string;
+	defaultBranch: string;
+}
+
 export const chapterService = {
+	/**
+	 * Create the root chapter for a project — represents the project's own git directory.
+	 * No worktree or branch is created; it uses the project's gitPath and defaultBranch directly.
+	 */
+	async createRootChapter(input: CreateRootChapterInput) {
+		const now = new Date().toISOString();
+		const id = generateId();
+
+		const [chapter] = await db
+			.insert(chapters)
+			.values({
+				id,
+				projectId: input.projectId,
+				title: input.title,
+				status: "active",
+				role: "trunk",
+				branch: input.defaultBranch,
+				worktreePath: input.gitPath,
+				baseBranch: input.defaultBranch,
+				isRoot: 1,
+				lastAccessedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.returning();
+
+		// Auto-create primary narrator if project setting enabled
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, input.projectId),
+		});
+		const chSettings = resolveChapterSettings(project?.chapterSettings);
+		if (chSettings.autoCreateNarrator) {
+			try {
+				await narratorService.create({
+					chapterId: id,
+					type: "primary",
+					model: settings.agent.defaultModel,
+				});
+			} catch (err) {
+				logger.warn("Failed to auto-create primary narrator for root chapter", {
+					chapterId: id,
+					error: String(err),
+				});
+			}
+		}
+
+		logger.info("Root chapter created", { id, projectId: input.projectId });
+		eventBus.emit({ type: "chapter:created", chapterId: id, projectId: input.projectId });
+
+		// Sync existing commit history for the root chapter
+		try {
+			await commitSyncService.syncChapterCommits(id);
+		} catch (err) {
+			logger.warn("Failed to sync commits for root chapter (non-fatal)", {
+				chapterId: id,
+				error: String(err),
+			});
+		}
+
+		return chapter;
+	},
+
 	async create(input: CreateChapterInput) {
 		const now = new Date().toISOString();
 		const id = generateId();
@@ -109,6 +179,17 @@ export const chapterService = {
 			logger.info("Chapter created", { id, branch: branchName, worktreePath });
 			eventBus.emit({ type: "chapter:created", chapterId: id, projectId: input.projectId });
 			chapterCleanup.scheduleAutoDormant(input.projectId);
+
+			// Sync commit history for the new chapter
+			try {
+				await commitSyncService.syncChapterCommits(id);
+			} catch (err) {
+				logger.warn("Failed to sync commits for new chapter (non-fatal)", {
+					chapterId: id,
+					error: String(err),
+				});
+			}
+
 			return chapter;
 		} catch (err) {
 			logger.error("Chapter creation failed, rolling back", { error: String(err) });
@@ -163,14 +244,32 @@ export const chapterService = {
 			title: string;
 			description: string;
 			status: "active" | "dormant" | "merged" | "abandoned";
+			role: "trunk" | "branch" | "exploration";
+			color: string | null;
+			groupLabel: string | null;
 		}>,
 	) {
 		return chapterLock.acquire(id, async () => {
+			const existing = await this.findById(id);
+
+			// Root chapters: only title and description can be changed
+			if (existing.isRoot) {
+				if (data.status !== undefined) {
+					throw new ValidationError("Cannot change root chapter status");
+				}
+				if (data.role !== undefined) {
+					throw new ValidationError("Cannot change root chapter role");
+				}
+			}
+
 			const now = new Date().toISOString();
 			const set: Record<string, unknown> = { updatedAt: now };
 			if (data.title !== undefined) set.title = data.title;
 			if (data.description !== undefined) set.description = data.description;
 			if (data.status !== undefined) set.status = data.status;
+			if (data.role !== undefined) set.role = data.role;
+			if (data.color !== undefined) set.color = data.color;
+			if (data.groupLabel !== undefined) set.groupLabel = data.groupLabel;
 
 			const [updated] = await db.update(chapters).set(set).where(eq(chapters.id, id)).returning();
 			if (!updated) throw new NotFoundError("Chapter", id);
@@ -181,6 +280,10 @@ export const chapterService = {
 	async remove(id: string) {
 		return chapterLock.acquire(id, async () => {
 			const chapter = await this.findById(id);
+
+			if (chapter.isRoot) {
+				throw new ValidationError("Cannot delete root chapter");
+			}
 
 			// Unbind narrators instead of deleting them — preserve conversation history.
 			// Subagents and archived narrators are deleted; others are detached.
