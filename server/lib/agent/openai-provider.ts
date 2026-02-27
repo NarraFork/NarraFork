@@ -785,6 +785,13 @@ function parseResponsesAPIEvent(
 				acc.emitted = true;
 			}
 		}
+		// Extract usage info for context window tracking
+		const usage = chunk.response?.usage;
+		if (usage?.input_tokens != null) {
+			results.push({
+				usage: { promptTokens: usage.input_tokens, completionTokens: usage.output_tokens },
+			});
+		}
 		return results;
 	}
 
@@ -921,8 +928,13 @@ function parseSSELine(line: string, toolAccum: Map<number, ToolAccumEntry>): Par
 	}
 
 	// Usage-only chunk (sent when stream_options.include_usage is true).
-	// This arrives as a separate chunk with no choices — skip silently.
+	// This arrives as a separate chunk with no choices.
+	// Convert to usage event for context window tracking.
 	if (chunk.usage && (!chunk.choices || chunk.choices.length === 0)) {
+		const promptTokens = chunk.usage.prompt_tokens;
+		if (promptTokens != null) {
+			return [{ usage: { promptTokens, completionTokens: chunk.usage.completion_tokens } }];
+		}
 		return [];
 	}
 

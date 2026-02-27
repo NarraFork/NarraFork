@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import type { Subprocess } from "bun";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
@@ -7,10 +8,44 @@ import { NotFoundError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { BufferManager } from "../terminal/buffer-manager";
-import { dtachService } from "../terminal/dtach-service";
+import { dtachService, findProcessesByArg, getDescendantPids } from "../terminal/dtach-service";
 import { sendToTerminal } from "../websocket/terminal-ws";
 
 const DEFAULT_SHELL = detectShell();
+
+export interface TerminalProcessInfo {
+	pid: number;
+	ppid: number;
+	command: string;
+	state: string;
+	rss: number;
+	cpu: number;
+	elapsed: string;
+}
+
+function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
+	try {
+		const result = execSync(`ps -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime= -p ${pid}`, {
+			encoding: "utf-8",
+			stdio: "pipe",
+		});
+		const line = result.trim();
+		if (!line) return null;
+		const parts = line.split(/\s+/);
+		if (parts.length < 7) return null;
+		return {
+			pid: Number.parseInt(parts[0], 10),
+			ppid: Number.parseInt(parts[1], 10),
+			command: parts[2],
+			state: parts[3],
+			rss: Number.parseInt(parts[4], 10),
+			cpu: Number.parseFloat(parts[5]),
+			elapsed: parts[6],
+		};
+	} catch {
+		return null;
+	}
+}
 
 interface ActiveTerminal {
 	process: Subprocess;
@@ -58,8 +93,26 @@ export const terminalService = {
 				where: eq(narrators.id, narratorId),
 			});
 			if (!narrator) throw new NotFoundError("Narrator", narratorId);
-			cwd = narrator.cwd ?? process.env.HOME ?? "/tmp";
-			if (!narrator.cwd) {
+			if (narrator.chapterId) {
+				const chapter = await db.query.chapters.findFirst({
+					where: eq(chapters.id, narrator.chapterId),
+				});
+				logger.info("Terminal CWD resolution (chapter-bound narrator)", {
+					narratorId,
+					chapterId: narrator.chapterId,
+					chapterFound: !!chapter,
+					worktreePath: chapter?.worktreePath,
+					narratorCwd: narrator.cwd,
+				});
+				if (chapter?.worktreePath) {
+					cwd = chapter.worktreePath;
+				} else {
+					cwd = narrator.cwd ?? process.env.HOME ?? "/tmp";
+				}
+			} else {
+				cwd = narrator.cwd ?? process.env.HOME ?? "/tmp";
+			}
+			if (!cwd || cwd === (process.env.HOME ?? "/tmp")) {
 				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
 			}
 		} else {
@@ -231,6 +284,162 @@ export const terminalService = {
 		});
 	},
 
+	/** List all terminals (admin use) */
+	async listAll() {
+		return db.query.terminals.findMany({
+			orderBy: (t, { desc }) => [desc(t.createdAt)],
+		});
+	},
+
+	/** Find orphan dtach sockets — sockets on disk with no matching running terminal in DB */
+	listOrphanSockets(): { socketPath: string; terminalId: string }[] {
+		if (!dtachService.isAvailable()) return [];
+		const orphans: { socketPath: string; terminalId: string }[] = [];
+		try {
+			const { readdirSync } = require("node:fs");
+			const files: string[] = readdirSync(dtachService.socketsDir);
+			for (const file of files) {
+				const match = file.match(/^terminal-(.+)\.sock$/);
+				if (!match) continue;
+				const terminalId = match[1];
+				const socketPath = dtachService.getSocketPath(terminalId);
+				// Check if the socket is alive but terminal is not in activeTerminals
+				if (dtachService.isSocketAlive(terminalId) && !activeTerminals.has(terminalId)) {
+					orphans.push({ socketPath, terminalId });
+				}
+			}
+		} catch {
+			// sockets dir may not exist
+		}
+		return orphans;
+	},
+
+	/** Kill an orphan dtach socket that has no DB record */
+	killOrphanSocket(terminalId: string) {
+		dtachService.killSession(terminalId);
+		// Clean up buffer file if any
+		const buf = new BufferManager(terminalId);
+		buf.deleteFromDisk();
+	},
+
+	/** Check if a terminal is currently attached (has an active PTY connection) */
+	isAttached(terminalId: string): boolean {
+		return activeTerminals.has(terminalId);
+	},
+
+	/** Get attached status for multiple terminals at once */
+	getAttachedSet(): Set<string> {
+		return new Set(activeTerminals.keys());
+	},
+
+	/**
+	 * Re-attach to a dtach terminal that exists in DB but is not in activeTerminals.
+	 * Returns true if successfully re-attached.
+	 */
+	async reattach(terminalId: string): Promise<boolean> {
+		if (activeTerminals.has(terminalId)) return true; // already attached
+		if (!dtachService.isAvailable()) return false;
+		if (!dtachService.isSocketAlive(terminalId)) return false;
+
+		const terminal = await db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+		});
+		if (!terminal) return false;
+
+		const buffer = new BufferManager(terminalId);
+		buffer.loadFromDisk();
+		buffer.startPeriodicFlush();
+
+		const attached = dtachService.attachSession({
+			terminalId,
+			cols: 80,
+			rows: 24,
+			onData: (text) => onData(terminalId, buffer, text),
+		});
+
+		activeTerminals.set(terminalId, {
+			process: attached.proc,
+			pty: attached.pty,
+			terminalId,
+			buffer,
+			useDtach: true,
+		});
+
+		// Ensure DB status is running
+		await db.update(terminals).set({ status: "running" }).where(eq(terminals.id, terminalId));
+
+		// Monitor attach process
+		attached.proc.exited.then(async (code) => {
+			const active = activeTerminals.get(terminalId);
+			if (!active) return;
+			if (dtachService.isSocketAlive(terminalId)) {
+				active.buffer.saveToDisk();
+				active.pty.close();
+				activeTerminals.delete(terminalId);
+				return;
+			}
+			active.buffer.dispose();
+			activeTerminals.delete(terminalId);
+			attached.pty.close();
+			await db
+				.update(terminals)
+				.set({ status: "exited", exitCode: code ?? 0 })
+				.where(eq(terminals.id, terminalId));
+			sendToTerminal(terminalId, {
+				type: "exit",
+				terminalId,
+				code: code ?? 0,
+			});
+		});
+
+		logger.info("Terminal re-attached", { terminalId });
+		return true;
+	},
+
+	/**
+	 * Re-attach to an orphan dtach socket (no DB record).
+	 * Creates a DB record and attaches. Returns the new terminal record.
+	 */
+	async reattachOrphan(terminalId: string): Promise<unknown> {
+		if (!dtachService.isAvailable() || !dtachService.isSocketAlive(terminalId)) {
+			throw new Error("dtach socket not alive");
+		}
+
+		const id = terminalId;
+		const now = new Date().toISOString();
+		const dtachSocket = dtachService.getSocketPath(terminalId);
+
+		// Check if DB record already exists
+		const existing = await db.query.terminals.findFirst({
+			where: eq(terminals.id, id),
+		});
+
+		if (!existing) {
+			// Create DB record for the orphan
+			await db.insert(terminals).values({
+				id,
+				chapterId: null,
+				narratorId: null,
+				name: `Recovered ${id.slice(0, 8)}`,
+				cwd: process.env.HOME ?? "/tmp",
+				dtachSocket,
+				status: "running",
+				createdAt: now,
+			});
+		} else {
+			await db
+				.update(terminals)
+				.set({ status: "running", dtachSocket })
+				.where(eq(terminals.id, id));
+		}
+
+		// Now reattach
+		const success = await this.reattach(id);
+		if (!success) throw new Error("Failed to reattach");
+
+		return db.query.terminals.findFirst({ where: eq(terminals.id, id) });
+	},
+
 	getScrollback(terminalId: string): string | null {
 		const active = activeTerminals.get(terminalId);
 		if (active) {
@@ -346,5 +555,51 @@ export const terminalService = {
 			}
 		}
 		await db.delete(terminals).where(eq(col, value));
+	},
+
+	/**
+	 * Get the root shell PID for a terminal.
+	 * dtach mode: find the dtach process via socket path, its child is the shell.
+	 * direct mode: the subprocess PID is the shell.
+	 */
+	getShellPid(terminalId: string): number | null {
+		const active = activeTerminals.get(terminalId);
+		if (active) {
+			if (active.useDtach) {
+				// In dtach mode, active.process is the "dtach -a" attach process, not the shell.
+				// The actual shell is a child of the "dtach -n" server process.
+				const socketPath = dtachService.getSocketPath(terminalId);
+				const dtachPids = findProcessesByArg(socketPath);
+				for (const pid of dtachPids) {
+					const children = getDescendantPids(pid);
+					if (children.length > 0) return children[0];
+				}
+				return null;
+			}
+			return active.process.pid ?? null;
+		}
+		// Detached dtach terminal (not in activeTerminals)
+		if (dtachService.isAvailable() && dtachService.isSocketAlive(terminalId)) {
+			const socketPath = dtachService.getSocketPath(terminalId);
+			const dtachPids = findProcessesByArg(socketPath);
+			for (const pid of dtachPids) {
+				const children = getDescendantPids(pid);
+				if (children.length > 0) return children[0];
+			}
+		}
+		return null;
+	},
+
+	/**
+	 * Get process info for a terminal: the shell and all its descendants.
+	 */
+	getProcesses(terminalId: string): TerminalProcessInfo[] {
+		const shellPid = this.getShellPid(terminalId);
+		if (!shellPid) return [];
+
+		const allPids = [shellPid, ...getDescendantPids(shellPid)];
+		return allPids
+			.map((pid) => getProcessInfoByPid(pid))
+			.filter((info): info is TerminalProcessInfo => info !== null);
 	},
 };

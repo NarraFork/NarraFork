@@ -9,10 +9,11 @@ import {
 	findMsgByToolUseIdInTree,
 	insertChildIntoCache,
 	type MessageIndex,
-	mergeToolCallFieldsInTree,
+	mergeFieldsByIndex,
 	removeSubagentStreamingChunk,
 	updateToolCallByIndex,
 	updateToolUseIndex,
+	upsertStreamingToolBlock,
 	upsertSubagentStreamingChunk,
 } from "./message-tree-utils";
 import { removeStreamingChunksMsg } from "./narrator-message-helpers";
@@ -102,6 +103,59 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Streaming state ---
 	const streamingRef = useRef("");
 	const [streamingVersion, setStreamingVersion] = useState(0);
+
+	// RAF-based throttle: coalesce rapid streaming updates into one render per frame
+	const streamingRafRef = useRef(0);
+	const flushStreamingVersion = useCallback(() => {
+		if (!streamingRafRef.current) {
+			streamingRafRef.current = requestAnimationFrame(() => {
+				streamingRafRef.current = 0;
+				setStreamingVersion((v) => v + 1);
+			});
+		}
+	}, []);
+
+	// RAF-based throttle for tool_use_chunk cache updates
+	const pendingToolChunkRef = useRef<
+		Map<
+			string,
+			{
+				toolUseId: string;
+				toolName: string;
+				inputCharsTotal: number;
+				parentToolUseId?: string;
+				extractedFilePath?: string;
+				contentCharsReceived?: number;
+			}
+		>
+	>(new Map());
+	const toolChunkRafRef = useRef(0);
+
+	// Cancel pending RAF handles on unmount
+	useEffect(() => {
+		return () => {
+			if (streamingRafRef.current) cancelAnimationFrame(streamingRafRef.current);
+			if (toolChunkRafRef.current) cancelAnimationFrame(toolChunkRafRef.current);
+		};
+	}, []);
+
+	// Helper: immediately flush streaming version (for clear/reset paths)
+	const clearStreamingState = useCallback(() => {
+		if (streamingRafRef.current) {
+			cancelAnimationFrame(streamingRafRef.current);
+			streamingRafRef.current = 0;
+		}
+		setStreamingVersion((v) => v + 1);
+	}, []);
+
+	// Helper: cancel any pending tool chunk RAF and clear the accumulator
+	const cancelPendingToolChunks = useCallback(() => {
+		pendingToolChunkRef.current.clear();
+		if (toolChunkRafRef.current) {
+			cancelAnimationFrame(toolChunkRafRef.current);
+			toolChunkRafRef.current = 0;
+		}
+	}, []);
 
 	// --- Permission state ---
 	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
@@ -197,6 +251,33 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const pendingPermsMapRef = useRef(pendingPermsMap);
 	pendingPermsMapRef.current = pendingPermsMap;
 
+	/** Find a pending permission by requestId and remove it from the map. Returns the toolUseId. */
+	const resolveAndRemovePerm = useCallback(
+		(requestId: string): { toolUseId: string | undefined; perm: PendingPermission | undefined } => {
+			const map = pendingPermsMapRef.current;
+			let toolUseId: string | undefined;
+			let perm: PendingPermission | undefined;
+			for (const [tuId, p] of map) {
+				if (p.id === requestId || tuId === requestId) {
+					toolUseId = tuId;
+					perm = p;
+					break;
+				}
+			}
+			if (toolUseId) {
+				setPendingPermsMap((prev) => {
+					const next = new Map(prev);
+					next.delete(toolUseId);
+					return next;
+				});
+			} else {
+				setPendingPermsMap(new Map());
+			}
+			return { toolUseId, perm };
+		},
+		[],
+	);
+
 	// --- Permission decision handlers ---
 	const handlePermissionDecision = useCallback(
 		(
@@ -213,23 +294,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				feedbackText,
 				compactAfter,
 			);
-			const map = pendingPermsMapRef.current;
-			let toolUseId: string | undefined;
-			for (const [tuId, perm] of map) {
-				if (perm.id === requestId || tuId === requestId) {
-					toolUseId = tuId;
-					break;
-				}
-			}
-			if (toolUseId) {
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					return next;
-				});
-			} else {
-				setPendingPermsMap(new Map());
-			}
+			const { toolUseId } = resolveAndRemovePerm(requestId);
 			if (toolUseId) {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
@@ -246,94 +311,45 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						});
 						return anyChanged ? { ...old, pages } : old;
 					}
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							status: "running",
-						});
-						if (changed) anyChanged = true;
-						return changed ? { ...page, messages } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
+					return mergeFieldsByIndex(old, toolUseId, { status: "running" }, toolUseIndexRef.current);
 				});
 			}
 		},
-		[qc, messagesQueryKey],
+		[qc, messagesQueryKey, resolveAndRemovePerm],
 	);
 
 	const handleQuestionSubmit = useCallback(
 		(requestId: string, answers: Record<string, string>) => {
 			sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
-			const map = pendingPermsMapRef.current;
-			let perm: PendingPermission | undefined;
-			for (const [, p] of map) {
-				if (p.id === requestId || p.toolUseId === requestId) {
-					perm = p;
-					break;
-				}
-			}
-			if (perm?.toolUseId) {
-				const tuId = perm.toolUseId;
+			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
+			if (toolUseId && perm) {
 				const mergedInput = { ...perm.inputJson, answers };
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages: m1, changed: c1 } = mergeToolCallFieldsInTree(page.messages, tuId, {
-							inputJson: mergedInput,
-							status: "running",
-						});
-						if (c1) anyChanged = true;
-						return c1 ? { ...page, messages: m1 } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ inputJson: mergedInput, status: "running" },
+						toolUseIndexRef.current,
+					);
 				});
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(tuId);
-					return next;
-				});
-			} else {
-				setPendingPermsMap(new Map());
 			}
 		},
-		[qc, messagesQueryKey],
+		[qc, messagesQueryKey, resolveAndRemovePerm],
 	);
 
 	const handleQuestionDeny = useCallback(
 		(requestId: string) => {
 			sendPermissionDecisionRef.current?.(requestId, "deny", "User skipped the question");
-			const map = pendingPermsMapRef.current;
-			let toolUseId: string | undefined;
-			for (const [tuId, p] of map) {
-				if (p.id === requestId || tuId === requestId) {
-					toolUseId = tuId;
-					break;
-				}
-			}
+			const { toolUseId } = resolveAndRemovePerm(requestId);
 			if (toolUseId) {
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					return next;
-				});
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							status: "fail",
-						});
-						if (changed) anyChanged = true;
-						return changed ? { ...page, messages } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
+					return mergeFieldsByIndex(old, toolUseId, { status: "fail" }, toolUseIndexRef.current);
 				});
-			} else {
-				setPendingPermsMap(new Map());
 			}
 		},
-		[qc, messagesQueryKey],
+		[qc, messagesQueryKey, resolveAndRemovePerm],
 	);
 
 	const handleBgAgentRetry = useCallback(
@@ -409,7 +425,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					!ev.subagentToolUseId
 				) {
 					streamingRef.current += ev.delta.text;
-					setStreamingVersion((v) => v + 1);
+					flushStreamingVersion();
 				}
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
@@ -429,16 +445,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant" && streamingRef.current) {
 						streamingRef.current = "";
-						setStreamingVersion((v) => v + 1);
+						clearStreamingState();
 					}
 					if (wsData.message?.role === "assistant") {
+						// Clear pending RAF chunks — real message supersedes synthetic state
+						cancelPendingToolChunks();
 						removeStreamingChunksMsg(qc, messagesQueryKey);
 					}
 					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
 						const ptuId = newMsg.parentToolUseId;
 						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 							if (!old?.pages?.length) return old;
-							return removeSubagentStreamingChunk(old, ptuId);
+							return removeSubagentStreamingChunk(old, ptuId, toolUseIndexRef.current);
 						});
 					}
 					const isNewCompactMsg =
@@ -449,7 +467,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
 						if (newMsg.parentToolUseId) {
-							return insertChildIntoCache(old, newMsg);
+							return insertChildIntoCache(old, newMsg, toolUseIndexRef.current);
 						}
 						const pages = [...old.pages];
 						const firstPage = { ...pages[0] };
@@ -467,20 +485,31 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						if (!isAtBottomRef.current && newMsg.role === "assistant") {
 							setUnreadCount((c) => c + 1);
 						}
-						const optimistic = firstPage.messages.filter(
-							(m: NarratorMsg) => String(m.id).startsWith("optimistic-") && m.role === newMsg.role,
-						);
-						for (const om of optimistic) {
+						// Replace a matching optimistic message by content, or append.
+						// Optimistic messages are only created with role "user", so for
+						// assistant messages this simply appends without scanning.
+						const optimisticIdx =
+							newMsg.role === "user"
+								? firstPage.messages.findIndex(
+										(m: NarratorMsg) =>
+											String(m.id).startsWith("optimistic-") &&
+											m.role === "user" &&
+											m.contentText === newMsg.contentText,
+									)
+								: -1;
+						if (optimisticIdx !== -1) {
+							const updated = [...firstPage.messages];
+							const om = updated[optimisticIdx];
 							if (Array.isArray(om.contentJson)) {
 								for (const block of om.contentJson) {
 									if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
 								}
 							}
+							updated[optimisticIdx] = newMsg;
+							firstPage.messages = updated;
+						} else {
+							firstPage.messages = [...firstPage.messages, newMsg];
 						}
-						const withoutOptimistic = firstPage.messages.filter(
-							(m: NarratorMsg) => !String(m.id).startsWith("optimistic-") || m.role !== newMsg.role,
-						);
-						firstPage.messages = [...withoutOptimistic, newMsg];
 						pages[0] = firstPage;
 						return { ...old, pages };
 					});
@@ -506,20 +535,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (firstPage.messages.some((m: NarratorMsg) => m.id === newMsg.id)) {
 						return old;
 					}
-					const optimistic = firstPage.messages.filter(
-						(m: NarratorMsg) => String(m.id).startsWith("optimistic-") && m.role === "user",
+					// Find the matching optimistic message by content (not by role alone)
+					// to avoid removing unrelated optimistic messages when sending rapidly.
+					const optimisticIdx = firstPage.messages.findIndex(
+						(m: NarratorMsg) =>
+							String(m.id).startsWith("optimistic-") &&
+							m.role === "user" &&
+							m.contentText === newMsg.contentText,
 					);
-					for (const om of optimistic) {
+					if (optimisticIdx !== -1) {
+						const updated = [...firstPage.messages];
+						const om = updated[optimisticIdx];
 						if (Array.isArray(om.contentJson)) {
 							for (const block of om.contentJson) {
 								if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
 							}
 						}
+						updated[optimisticIdx] = newMsg;
+						firstPage.messages = updated;
+					} else {
+						firstPage.messages = [...firstPage.messages, newMsg];
 					}
-					const withoutOptimistic = firstPage.messages.filter(
-						(m: NarratorMsg) => !String(m.id).startsWith("optimistic-") || m.role !== "user",
-					);
-					firstPage.messages = [...withoutOptimistic, newMsg];
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
@@ -531,6 +567,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				durationMs?: number,
 				updatedInput?: Record<string, unknown>,
 			) => {
+				// Discard any pending RAF chunk for this tool — real state takes precedence
+				pendingToolChunkRef.current.delete(toolUseId);
+
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					let result = updateToolCallByIndex(
@@ -542,33 +581,28 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						durationMs,
 					);
 					if (updatedInput && result) {
-						let anyChanged = false;
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic cache structure
-						const pages = result.pages.map((page: any) => {
-							const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-								inputJson: updatedInput,
-							});
-							if (changed) anyChanged = true;
-							return changed ? { ...page, messages } : page;
-						});
-						if (anyChanged) result = { ...result, pages } as MessagesQueryData;
+						result = mergeFieldsByIndex(
+							result,
+							toolUseId,
+							{ inputJson: updatedInput },
+							toolUseIndexRef.current,
+						);
 					}
 					return result;
 				});
 			},
 			onToolStarted: (toolUseId: string, _toolName: string, streamStartedAt?: number) => {
+				// Discard any pending RAF chunk for this tool — real state takes precedence
+				pendingToolChunkRef.current.delete(toolUseId);
+
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-							status: "running",
-							startedAt: streamStartedAt ?? Date.now(),
-						});
-						if (changed) anyChanged = true;
-						return changed ? { ...page, messages } : page;
-					});
-					return anyChanged ? { ...old, pages } : old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ status: "running", startedAt: streamStartedAt ?? Date.now() },
+						toolUseIndexRef.current,
+					);
 				});
 			},
 			onToolUseChunk: (
@@ -579,103 +613,107 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string,
 				contentCharsReceived?: number,
 			) => {
-				if (parentToolUseId) {
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-						return upsertSubagentStreamingChunk(
-							old,
-							parentToolUseId,
-							narratorId,
-							toolUseId,
-							toolName,
-							inputCharsTotal,
-						);
-					});
-					return;
-				}
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					const pages = old?.pages?.length ? [...old.pages] : [];
-					const firstPage =
-						pages.length > 0 ? { ...pages[0] } : { messages: [], hasMore: false, nextCursor: null };
-					const existingIdx = firstPage.messages.findIndex(
-						(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
-					);
-					const existing = existingIdx !== -1 ? firstPage.messages[existingIdx] : null;
-					const prevBlocks: ContentBlock[] = existing
-						? [...(existing.contentJson as ContentBlock[])]
-						: [];
-					const prevToolCalls = existing ? [...(existing.toolCalls as ToolCallRow[])] : [];
-					const blockIdx = prevBlocks.findIndex(
-						(b: ContentBlock) => b.type === "tool_use" && b.id === toolUseId,
-					);
-					if (blockIdx === -1) {
-						prevBlocks.push({ type: "tool_use", id: toolUseId, name: toolName, input: {} });
-						prevToolCalls.push({
-							toolUseId,
-							toolName,
-							inputJson: {},
-							status: "initializing",
-							createdAt: new Date().toISOString(),
-						} as ToolCallRow);
-					}
-					const tcIdx = prevToolCalls.findIndex((tc: ToolCallRow) => tc.toolUseId === toolUseId);
-					if (tcIdx !== -1) {
-						prevToolCalls[tcIdx] = {
-							...prevToolCalls[tcIdx],
-							inputJson: {
-								_streamingChars: inputCharsTotal,
-								...(extractedFilePath && { _streamingFilePath: extractedFilePath }),
-								...(contentCharsReceived != null && {
-									_streamingContentChars: contentCharsReceived,
-								}),
-							},
-						};
-					}
-					const hasLeadingText = !!streamingRef.current;
-					const syntheticMsg: NarratorMsg = {
-						id: STREAMING_CHUNKS_MSG_ID,
-						narratorId,
-						parentToolUseId: null,
-						role: "assistant",
-						contentJson: prevBlocks,
-						contentText: null,
-						toolCalls: prevToolCalls,
-						createdAt: existing?.createdAt ?? new Date().toISOString(),
-						children: [],
-						_noMerge: hasLeadingText,
-					};
-					if (existingIdx !== -1) {
-						firstPage.messages = [...firstPage.messages];
-						firstPage.messages[existingIdx] = syntheticMsg;
-					} else {
-						firstPage.messages = [...firstPage.messages, syntheticMsg];
-					}
-					pages[0] = firstPage;
-					return { ...old, pages } as MessagesQueryData;
+				// Accumulate the latest state for each toolUseId; flush once per frame
+				pendingToolChunkRef.current.set(toolUseId, {
+					toolUseId,
+					toolName,
+					inputCharsTotal,
+					parentToolUseId,
+					extractedFilePath,
+					contentCharsReceived,
 				});
+				if (!toolChunkRafRef.current) {
+					toolChunkRafRef.current = requestAnimationFrame(() => {
+						toolChunkRafRef.current = 0;
+						const pending = pendingToolChunkRef.current;
+						if (pending.size === 0) return;
+						const chunks = [...pending.values()];
+						pending.clear();
+
+						// Apply all pending chunks in a single setQueryData call
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+							let result = old;
+							for (const chunk of chunks) {
+								if (!result) continue;
+								if (chunk.parentToolUseId) {
+									result = upsertSubagentStreamingChunk(
+										result,
+										chunk.parentToolUseId,
+										narratorId,
+										chunk.toolUseId,
+										chunk.toolName,
+										chunk.inputCharsTotal,
+										toolUseIndexRef.current,
+									) as MessagesQueryData;
+									continue;
+								}
+								// Top-level streaming chunk
+								const pages = result.pages?.length ? [...result.pages] : [];
+								const firstPage =
+									pages.length > 0
+										? { ...pages[0] }
+										: { messages: [], hasMore: false, nextCursor: null };
+								const existingIdx = firstPage.messages.findIndex(
+									(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
+								);
+								const existing = existingIdx !== -1 ? firstPage.messages[existingIdx] : null;
+
+								const { blocks, toolCalls } = upsertStreamingToolBlock(
+									existing ? [...(existing.contentJson as ContentBlock[])] : [],
+									existing ? [...(existing.toolCalls as ToolCallRow[])] : [],
+									chunk.toolUseId,
+									chunk.toolName,
+									{
+										_streamingChars: chunk.inputCharsTotal,
+										...(chunk.extractedFilePath && {
+											_streamingFilePath: chunk.extractedFilePath,
+										}),
+										...(chunk.contentCharsReceived != null && {
+											_streamingContentChars: chunk.contentCharsReceived,
+										}),
+									},
+								);
+
+								const hasLeadingText = !!streamingRef.current;
+								const syntheticMsg: NarratorMsg = {
+									id: STREAMING_CHUNKS_MSG_ID,
+									narratorId,
+									parentToolUseId: null,
+									role: "assistant",
+									contentJson: blocks,
+									contentText: null,
+									toolCalls: toolCalls,
+									createdAt: existing?.createdAt ?? new Date().toISOString(),
+									children: [],
+									_noMerge: hasLeadingText,
+								};
+								if (existingIdx !== -1) {
+									firstPage.messages = [...firstPage.messages];
+									firstPage.messages[existingIdx] = syntheticMsg;
+								} else {
+									firstPage.messages = [...firstPage.messages, syntheticMsg];
+								}
+								pages[0] = firstPage;
+								result = { ...result, pages } as MessagesQueryData;
+							}
+							return result;
+						});
+					});
+				}
 			},
 			onPermissionRequest: (request) => {
-				if (request.toolUseId) {
+				const tuId = request.toolUseId;
+				if (tuId) {
 					setPendingPermsMap((prev) => {
 						const next = new Map(prev);
-						next.set(request.toolUseId, request);
+						next.set(tuId, request);
 						return next;
 					});
 				}
-				if (request.toolUseId) {
+				if (tuId) {
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
-						let anyChanged = false;
-						const pages = old.pages.map((page: MessagesPage) => {
-							const { messages, changed } = mergeToolCallFieldsInTree(
-								page.messages,
-								request.toolUseId,
-								{ status: "pending" },
-							);
-							if (changed) anyChanged = true;
-							return changed ? { ...page, messages } : page;
-						});
-						return anyChanged ? { ...old, pages } : old;
+						return mergeFieldsByIndex(old, tuId, { status: "pending" }, toolUseIndexRef.current);
 					});
 				}
 			},
@@ -689,16 +727,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
-						let anyChanged = false;
-						const pages = old.pages.map((page: MessagesPage) => {
-							const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, {
-								status: "running",
-								startedAt: Date.now(),
-							});
-							if (changed) anyChanged = true;
-							return changed ? { ...page, messages } : page;
-						});
-						return anyChanged ? { ...old, pages } : old;
+						return mergeFieldsByIndex(
+							old,
+							toolUseId,
+							{ status: "running", startedAt: Date.now() },
+							toolUseIndexRef.current,
+						);
 					});
 				}
 			},
@@ -706,9 +740,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setIsCompacting(false);
 				if (status === "idle" && streamingRef.current) {
 					streamingRef.current = "";
-					setStreamingVersion((v) => v + 1);
+					clearStreamingState();
 				}
 				if (status === "idle") {
+					// Cancel any pending RAF tool chunk flush
+					cancelPendingToolChunks();
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -748,6 +784,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					linesAdded: data.linesAdded,
 					linesRemoved: data.linesRemoved,
 				});
+				// Also invalidate the detailed git status used by the Git panel
+				qc.invalidateQueries({ queryKey: ["gitStatus", data.chapterId] });
 			},
 			onCompacting: () => {
 				setIsCompacting(true);
@@ -756,10 +794,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setIsCompacting(false);
 				setPruneBoundaryMessageId(null);
 				setPrunedPercent(null);
+				cancelPendingToolChunks();
+				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
 			onNarratorError: (error) => {
+				// Session error may leave synthetic streaming chunks in the cache
+				cancelPendingToolChunks();
+				removeStreamingChunksMsg(qc, messagesQueryKey);
+				if (streamingRef.current) {
+					streamingRef.current = "";
+					clearStreamingState();
+				}
 				notifications.show({
 					title: t("narratorError"),
 					message: error,
@@ -776,15 +823,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onCatchUp: (orphanChildren, topLevel) => {
+				// Clean up any residual streaming chunks from before the disconnect
+				cancelPendingToolChunks();
+				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					let result: MessagesQueryData = old;
 					for (const child of orphanChildren) {
 						if (child?.id && child?.parentToolUseId) {
-							result = insertChildIntoCache(result, {
-								...child,
-								children: child.children ?? [],
-							}) as MessagesQueryData;
+							result = insertChildIntoCache(
+								result,
+								{
+									...child,
+									children: child.children ?? [],
+								},
+								toolUseIndexRef.current,
+							) as MessagesQueryData;
 						}
 					}
 					if (topLevel.length > 0) {
@@ -807,6 +861,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onFullReload: () => {
+				// Clean up synthetic streaming state before full reload
+				cancelPendingToolChunks();
+				removeStreamingChunksMsg(qc, messagesQueryKey);
+				if (streamingRef.current) {
+					streamingRef.current = "";
+					clearStreamingState();
+				}
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
 		},
@@ -880,9 +941,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Mark "done" narrator as read ---
 	useEffect(() => {
 		if (narratorStatus === "done") {
+			// Optimistically update cache so the UI reflects "idle" immediately,
+			// even if the WS event arrives late or is missed entirely.
+			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+				old ? { ...old, status: "idle" } : old,
+			);
 			api.markNarratorRead(narratorId).catch(() => {});
 		}
-	}, [narratorId, narratorStatus]);
+	}, [narratorId, narratorStatus, qc]);
 
 	// --- Derive isCompacting from persisted messages ---
 	useEffect(() => {

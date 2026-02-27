@@ -22,6 +22,8 @@ export type NarraForkEvent =
 	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] }
 	| { type: "chapter:frozen"; chapterId: string }
 	| { type: "chapter:role_changed"; chapterId: string; role: string }
+	| { type: "chapter:files_changed"; chapterId: string; worktreePath: string }
+	| { type: "chapter:commits_updated"; chapterId: string; newCount: number }
 	// 依赖关系
 	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string }
 	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string }
@@ -112,6 +114,21 @@ export type NarraForkEvent =
 	// Auto-commit
 	| {
 			type: "narrator:auto_commit";
+			narratorId: string;
+			chapterId: string;
+			commitSha: string;
+			message: string;
+	  }
+	| {
+			type: "narrator:commit_reminder";
+			narratorId: string;
+			chapterId: string;
+			linesAdded: number;
+			linesRemoved: number;
+			filesChanged: number;
+	  }
+	| {
+			type: "narrator:force_commit";
 			narratorId: string;
 			chapterId: string;
 			commitSha: string;

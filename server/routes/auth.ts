@@ -31,7 +31,7 @@ authRoutes.get("/me", requireAuth, async (c) => {
 	const payload = c.get("user");
 	const user = await db.query.users.findFirst({
 		where: eq(users.id, payload.sub),
-		columns: { id: true, username: true, role: true, createdAt: true },
+		columns: { id: true, username: true, role: true, avatarColor: true, createdAt: true },
 	});
 	if (!user) return c.json({ error: "User not found" }, 404);
 	return c.json(user);

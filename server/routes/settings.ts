@@ -48,6 +48,7 @@ const updateSettingsSchema = z
 					})
 					.partial(),
 				legacyEncoding: z.boolean(),
+				planTimeoutAction: z.enum(["deny", "auto_approve"]),
 			})
 			.partial()
 			.optional(),

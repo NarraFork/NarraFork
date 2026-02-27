@@ -40,6 +40,8 @@ export interface ParsedStreamEvent {
 		input?: string;
 		stop?: boolean;
 	};
+	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
+	usage?: { promptTokens: number; completionTokens?: number };
 	/** Internal: set when Responses API format is detected from the gateway */
 	_responsesApi?: boolean;
 }

@@ -16,8 +16,9 @@ export function useNarrators(opts?: {
 }
 
 export function useNarratorsPaginated(opts?: {
-	standalone?: boolean;
+	standalone?: boolean | "all";
 	status?: string;
+	filter?: string;
 	sortBy?: string;
 	sortOrder?: string;
 	limit?: number;

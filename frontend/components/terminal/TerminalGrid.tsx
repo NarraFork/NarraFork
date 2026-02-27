@@ -32,16 +32,31 @@ const LAYOUT_CONFIGS: Record<TerminalLayout, { template: string; panels: PanelCo
 
 interface TerminalGridProps {
 	layout: TerminalLayout;
-	/** Map of panel index → terminalId */
-	panelTerminals: Map<number, string>;
+	/** Ordered list of terminal IDs to display in panels */
+	terminalIds: string[];
+	/** Which terminal is active (shown in single layout) */
+	activeTerminalId: string | null;
 	onSendToChat?: (text: string) => void;
 	onExit?: (terminalId: string, code: number) => void;
 }
 
-export function TerminalGrid({ layout, panelTerminals, onSendToChat, onExit }: TerminalGridProps) {
+export function TerminalGrid({
+	layout,
+	terminalIds,
+	activeTerminalId,
+	onSendToChat,
+	onExit,
+}: TerminalGridProps) {
 	const isMobile = useMediaQuery("(max-width: 768px)");
 	const effectiveLayout = isMobile ? "single" : layout;
 	const config = LAYOUT_CONFIGS[effectiveLayout];
+
+	// In single layout, show only the active terminal
+	// In multi-panel layouts, distribute terminals across panels in order
+	const panelTerminalIds: (string | undefined)[] =
+		effectiveLayout === "single"
+			? [activeTerminalId ?? terminalIds[0]]
+			: config.panels.map((_, idx) => terminalIds[idx]);
 
 	return (
 		<Box
@@ -54,7 +69,7 @@ export function TerminalGrid({ layout, panelTerminals, onSendToChat, onExit }: T
 			}}
 		>
 			{config.panels.map((panel, idx) => {
-				const terminalId = panelTerminals.get(idx);
+				const terminalId = panelTerminalIds[idx];
 				return (
 					<Box
 						// biome-ignore lint/suspicious/noArrayIndexKey: panels are fixed layout slots, order never changes

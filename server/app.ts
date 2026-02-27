@@ -12,9 +12,12 @@ import { authRoutes } from "./routes/auth";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
 import { favoriteRoutes } from "./routes/favorites";
+import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
+import { notificationSoundRoutes } from "./routes/notification-sounds";
+import { notificationRoutes } from "./routes/notifications";
 import { openaiRoutes } from "./routes/openai";
 import { projectRoutes } from "./routes/projects";
 import { searchRoutes } from "./routes/search";
@@ -51,6 +54,7 @@ app.use("/api/*", requireAuth);
 
 app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);
+app.route("/api/chapters", gitRoutes);
 app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/terminals", terminalRoutes);
@@ -61,6 +65,8 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
+app.route("/api/notification-sounds", notificationSoundRoutes);
+app.route("/api/notifications", notificationRoutes);
 app.route("/api/openai", openaiRoutes);
 
 // Graph routes are nested under projects for RESTful consistency

@@ -1,5 +1,5 @@
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { settings } from "../settings";
+import { getModelContextWindow, settings } from "../settings";
 import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
@@ -138,6 +138,7 @@ export async function* agentLoop(
 				totalChars: number;
 				startedAt: number;
 				extractedFilePath?: string;
+				lastYieldedAt: number;
 			}
 		>();
 
@@ -171,6 +172,7 @@ export async function* agentLoop(
 								inputChunks: [],
 								totalChars: 0,
 								startedAt: Date.now(),
+								lastYieldedAt: Date.now(),
 							});
 							// Yield immediately so the frontend knows the tool name early
 							yield {
@@ -195,24 +197,53 @@ export async function* agentLoop(
 									}
 								}
 
-								// Calculate content chars (total minus file_path JSON overhead)
+								// Throttle: yield at most once per 50ms per tool to reduce WS pressure
+								const now = Date.now();
+								if (now - acc.lastYieldedAt >= 50) {
+									acc.lastYieldedAt = now;
+
+									// Calculate content chars (total minus file_path JSON overhead)
+									let contentChars = acc.totalChars;
+									if (acc.extractedFilePath) {
+										// Rough estimate: subtract the file_path field size
+										const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
+										contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+									}
+
+									yield {
+										type: "tool_use_chunk",
+										toolUseId: id,
+										toolName: acc.name,
+										inputCharsTotal: acc.totalChars,
+										...(acc.extractedFilePath && {
+											extractedFilePath: acc.extractedFilePath,
+										}),
+										...(acc.extractedFilePath && {
+											contentCharsReceived: contentChars,
+										}),
+									};
+								}
+							}
+							if (stop) {
+								// Yield final chunk with latest totals before completing
 								let contentChars = acc.totalChars;
 								if (acc.extractedFilePath) {
-									// Rough estimate: subtract the file_path field size
 									const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
 									contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
 								}
-
 								yield {
 									type: "tool_use_chunk",
 									toolUseId: id,
 									toolName: acc.name,
 									inputCharsTotal: acc.totalChars,
-									...(acc.extractedFilePath && { extractedFilePath: acc.extractedFilePath }),
-									...(acc.extractedFilePath && { contentCharsReceived: contentChars }),
+									...(acc.extractedFilePath && {
+										extractedFilePath: acc.extractedFilePath,
+									}),
+									...(acc.extractedFilePath && {
+										contentCharsReceived: contentChars,
+									}),
 								};
-							}
-							if (stop) {
+
 								const raw = acc.inputChunks.join("");
 								let parsedInput: Record<string, unknown> = {};
 								if (raw) {
@@ -284,6 +315,14 @@ export async function* agentLoop(
 						unitPlural: parsed.metering.unitPlural,
 						usage: parsed.metering.usage,
 					};
+				}
+				// Convert OpenAI usage to context_usage percentage
+				if (parsed.usage) {
+					const contextWindow = getModelContextWindow(config.model, config.provider);
+					if (contextWindow) {
+						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
+						yield { type: "context_usage", percentage: Math.min(percentage, 100) };
+					}
 				}
 				if (parsed.invalidState) {
 					yield {
@@ -577,6 +616,16 @@ export async function* agentLoop(
 		} else {
 			// Append assistant message to history for next turn
 			provider.pushAssistantTurn(history, assistantText, toolUses);
+		}
+
+		// Allow external code (e.g. onExitPlanMode) to inject text into the next
+		// user turn. This text rides alongside the pending tool results so the
+		// model sees both the tool output and the injected message in one request.
+		if (config.getInjectedUserText) {
+			const injected = config.getInjectedUserText();
+			if (injected) {
+				nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
+			}
 		}
 
 		yield { type: "turn_complete", turnIndex };

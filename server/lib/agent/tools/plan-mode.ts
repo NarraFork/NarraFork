@@ -34,11 +34,11 @@ export const exitPlanModeTool: ToolDefinition = {
 					"This is the sole source of truth — do NOT put the plan in your text response instead.",
 			),
 	}),
-	async execute(args, ctx): Promise<ToolResult> {
+	async execute(args, _ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (tool_result event).
+		// The "plan approved" prompt is injected as a user message by the session
+		// layer after the tool completes (via _planApprovedContinue flag).
 		const { plan } = args as { plan: string };
-		const locale = (ctx?.locale as Locale) ?? "en";
-		const suffix = getToolMessage("exitPlanModeApproved", locale);
-		return { output: `${plan}\n\n${suffix}` };
+		return { output: plan };
 	},
 };

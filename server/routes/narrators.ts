@@ -1,7 +1,21 @@
-import { and, asc, type Column, desc, eq, gt, isNull, lt, ne, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	type Column,
+	count as countFn,
+	desc,
+	eq,
+	gt,
+	isNotNull,
+	isNull,
+	lt,
+	ne,
+	or,
+	sql,
+} from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { narrators } from "../db/schema";
+import { chapters, narrators, projects, terminals } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -34,6 +48,7 @@ import {
 	updateSessionPermissionMode,
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
+import { getNarratorPresenceBatch } from "../websocket/narrator-ws";
 
 /** Parse message request supporting both JSON and multipart/form-data (with images) */
 export async function parseMessageRequest(
@@ -74,27 +89,36 @@ narratorRoutes.get("/", async (c) => {
 	const chapterId = c.req.query("chapterId");
 	const standalone = c.req.query("standalone");
 
-	if (standalone === "true") {
-		// Standalone sessions (no chapter) — cursor-based pagination
+	if (standalone === "true" || standalone === "all") {
+		// Paginated session list
+		// standalone=true: only standalone (chapterId IS NULL)
+		// standalone=all: all sessions (standalone + chapter-bound)
 		const status = c.req.query("status");
+		const filter = c.req.query("filter"); // "standalone" | "chapter" | undefined (all)
 		const rawSortBy = c.req.query("sortBy") ?? "updatedAt";
 		const sortOrder = c.req.query("sortOrder") ?? "desc";
 		const rawLimit = Number.parseInt(c.req.query("limit") ?? "20", 10);
 		const limit = Math.min(Number.isNaN(rawLimit) ? 20 : rawLimit, 100);
 		const cursorParam = c.req.query("cursor");
 
-		const baseWhere =
-			status === "archived"
-				? and(
-						isNull(narrators.chapterId),
-						eq(narrators.status, "archived"),
-						ne(narrators.type, "subagent"),
-					)
-				: and(
-						isNull(narrators.chapterId),
-						ne(narrators.status, "archived"),
-						ne(narrators.type, "subagent"),
-					);
+		// Build base where conditions
+		const conditions = [ne(narrators.type, "subagent")];
+
+		if (status === "archived") {
+			conditions.push(eq(narrators.status, "archived"));
+		} else {
+			conditions.push(ne(narrators.status, "archived"));
+		}
+
+		// Filter by standalone vs chapter-bound
+		if (standalone === "true" || filter === "standalone") {
+			conditions.push(isNull(narrators.chapterId));
+		} else if (filter === "chapter") {
+			conditions.push(isNotNull(narrators.chapterId));
+		}
+		// standalone=all with no filter: show all
+
+		const baseWhere = and(...conditions);
 
 		const sortColumnMap: Record<string, Column> = {
 			updatedAt: narrators.updatedAt,
@@ -114,8 +138,6 @@ narratorRoutes.get("/", async (c) => {
 				const decoded = JSON.parse(Buffer.from(cursorParam, "base64url").toString());
 				const cursorVal = decoded.v;
 				const cursorId = decoded.id;
-				// (column > cursorVal) OR (column = cursorVal AND id > cursorId) for asc
-				// (column < cursorVal) OR (column = cursorVal AND id < cursorId) for desc
 				cursorWhere = or(
 					cmpFn(column, cursorVal),
 					and(eq(column, cursorVal), cmpFn(narrators.id, cursorId)),
@@ -138,8 +160,8 @@ narratorRoutes.get("/", async (c) => {
 		const totalCount = countResult[0]?.count ?? 0;
 
 		const hasMore = list.length > limit;
-		const items = hasMore ? list.slice(0, limit) : list;
-		const lastItem = items[items.length - 1];
+		const rawItems = hasMore ? list.slice(0, limit) : list;
+		const lastItem = rawItems[rawItems.length - 1];
 		const nextCursor =
 			hasMore && lastItem
 				? Buffer.from(
@@ -149,6 +171,66 @@ narratorRoutes.get("/", async (c) => {
 						}),
 					).toString("base64url")
 				: null;
+
+		// Enrich items with chapter info, terminal counts, and viewers
+		const narratorIds = rawItems.map((n) => n.id);
+		const chapterIds = rawItems.map((n) => n.chapterId).filter(Boolean) as string[];
+
+		// Batch fetch chapter info
+		const chapterMap = new Map<
+			string,
+			{
+				id: string;
+				title: string;
+				projectId: string;
+				projectName: string | null;
+				status: string;
+				role: string;
+			}
+		>();
+		if (chapterIds.length > 0) {
+			const chapterRows = await db
+				.select({
+					id: chapters.id,
+					title: chapters.title,
+					projectId: chapters.projectId,
+					projectName: projects.name,
+					status: chapters.status,
+					role: chapters.role,
+				})
+				.from(chapters)
+				.leftJoin(projects, eq(chapters.projectId, projects.id))
+				.where(sql`${chapters.id} IN ${chapterIds}`);
+			for (const row of chapterRows) {
+				chapterMap.set(row.id, row);
+			}
+		}
+
+		// Batch fetch active terminal counts
+		const terminalCounts = new Map<string, number>();
+		if (narratorIds.length > 0) {
+			const termRows = await db
+				.select({
+					narratorId: terminals.narratorId,
+					count: countFn(),
+				})
+				.from(terminals)
+				.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
+				.groupBy(terminals.narratorId);
+			for (const row of termRows) {
+				if (row.narratorId) terminalCounts.set(row.narratorId, row.count);
+			}
+		}
+
+		// Batch fetch presence
+		const presenceMap = getNarratorPresenceBatch(narratorIds);
+
+		const items = rawItems.map((n) => ({
+			...n,
+			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
+			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
+			viewers: presenceMap.get(n.id) ?? [],
+		}));
 
 		return c.json({ items, hasMore, nextCursor, totalCount });
 	}

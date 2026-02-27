@@ -252,10 +252,11 @@ export const chapterService = {
 		data: Partial<{
 			title: string;
 			description: string;
-			status: "active" | "dormant" | "merged" | "abandoned";
+			status: "active" | "dormant" | "merged" | "abandoned" | "frozen";
 			role: "trunk" | "branch" | "exploration";
 			color: string | null;
 			groupLabel: string | null;
+			containerConfig: Record<string, unknown> | null;
 		}>,
 	) {
 		return chapterLock.acquire(id, async () => {
@@ -279,6 +280,7 @@ export const chapterService = {
 			if (data.role !== undefined) set.role = data.role;
 			if (data.color !== undefined) set.color = data.color;
 			if (data.groupLabel !== undefined) set.groupLabel = data.groupLabel;
+			if (data.containerConfig !== undefined) set.containerConfig = data.containerConfig;
 
 			const [updated] = await db.update(chapters).set(set).where(eq(chapters.id, id)).returning();
 			if (!updated) throw new NotFoundError("Chapter", id);

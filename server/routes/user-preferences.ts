@@ -26,7 +26,28 @@ const DEFAULTS = {
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	recentTabs: "[]",
+	// Notification defaults
+	notifyOnDone: true,
+	notifyOnWaiting: true,
+	notifyPwaEnabled: false,
+	notifySoundEnabled: true,
+	notifySoundType: "builtin" as const,
+	notifySoundBuiltin: "gentle",
+	notifySoundFileId: null as string | null,
+	notifyDingtalkEnabled: false,
+	notifyDingtalkWebhook: "",
+	notifyDingtalkSecret: "",
+	notifyFeishuEnabled: false,
+	notifyFeishuWebhook: "",
+	notifyFeishuSecret: "",
 };
+
+/** Mask a secret/webhook URL for safe display (show last 4 chars). */
+function maskSecret(val?: string | null): string {
+	if (!val) return "";
+	if (val.length <= 4) return "*".repeat(val.length);
+	return `${"*".repeat(8)}${val.slice(-4)}`;
+}
 
 userPreferencesRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
@@ -63,7 +84,15 @@ userPreferencesRoutes.get("/", async (c) => {
 		}
 	}
 
-	return c.json({ ...pref, recentTabs });
+	return c.json({
+		...pref,
+		recentTabs,
+		// Mask sensitive webhook fields
+		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
+		notifyDingtalkSecret: maskSecret(pref.notifyDingtalkSecret),
+		notifyFeishuWebhook: maskSecret(pref.notifyFeishuWebhook),
+		notifyFeishuSecret: maskSecret(pref.notifyFeishuSecret),
+	});
 });
 
 userPreferencesRoutes.patch("/", async (c) => {
@@ -74,11 +103,43 @@ userPreferencesRoutes.patch("/", async (c) => {
 
 	const now = new Date().toISOString();
 	const id = generateId();
+	const d = parsed.data;
+
+	// Preserve existing secrets when masked values are sent back
+	let dingtalkWebhook = d.notifyDingtalkWebhook ?? null;
+	let dingtalkSecret = d.notifyDingtalkSecret ?? null;
+	let feishuWebhook = d.notifyFeishuWebhook ?? null;
+	let feishuSecret = d.notifyFeishuSecret ?? null;
+
+	if (
+		dingtalkWebhook?.startsWith("*") ||
+		dingtalkSecret?.startsWith("*") ||
+		feishuWebhook?.startsWith("*") ||
+		feishuSecret?.startsWith("*")
+	) {
+		const existing = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+		});
+		if (existing) {
+			if (dingtalkWebhook?.startsWith("*")) dingtalkWebhook = existing.notifyDingtalkWebhook;
+			if (dingtalkSecret?.startsWith("*")) dingtalkSecret = existing.notifyDingtalkSecret;
+			if (feishuWebhook?.startsWith("*")) feishuWebhook = existing.notifyFeishuWebhook;
+			if (feishuSecret?.startsWith("*")) feishuSecret = existing.notifyFeishuSecret;
+		}
+	}
 
 	// Atomic upsert — avoids read-then-write race condition
 	sqlite.run(
-		`INSERT INTO user_preferences (id, user_id, auto_load_older_messages, language, word_wrap_markdown, word_wrap_code, word_wrap_diff, reply_in_user_language, show_token_usage, terminal_theme, terminal_font_size, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO user_preferences (
+			id, user_id,
+			auto_load_older_messages, language, word_wrap_markdown, word_wrap_code, word_wrap_diff,
+			reply_in_user_language, show_token_usage, terminal_theme, terminal_font_size,
+			notify_on_done, notify_on_waiting, notify_pwa_enabled,
+			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
+			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
+			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
+			created_at, updated_at
+		) VALUES (${Array(26).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -89,34 +150,71 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   show_token_usage = COALESCE(?, show_token_usage),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
+		   notify_on_done = COALESCE(?, notify_on_done),
+		   notify_on_waiting = COALESCE(?, notify_on_waiting),
+		   notify_pwa_enabled = COALESCE(?, notify_pwa_enabled),
+		   notify_sound_enabled = COALESCE(?, notify_sound_enabled),
+		   notify_sound_type = COALESCE(?, notify_sound_type),
+		   notify_sound_builtin = COALESCE(?, notify_sound_builtin),
+		   notify_sound_file_id = COALESCE(?, notify_sound_file_id),
+		   notify_dingtalk_enabled = COALESCE(?, notify_dingtalk_enabled),
+		   notify_dingtalk_webhook = COALESCE(?, notify_dingtalk_webhook),
+		   notify_dingtalk_secret = COALESCE(?, notify_dingtalk_secret),
+		   notify_feishu_enabled = COALESCE(?, notify_feishu_enabled),
+		   notify_feishu_webhook = COALESCE(?, notify_feishu_webhook),
+		   notify_feishu_secret = COALESCE(?, notify_feishu_secret),
 		   updated_at = ?`,
 		[
+			// INSERT values
 			id,
 			userId,
-			(parsed.data.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
-			parsed.data.language ?? DEFAULTS.language,
-			(parsed.data.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
-			(parsed.data.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
-			(parsed.data.wordWrapDiff ?? DEFAULTS.wordWrapDiff) ? 1 : 0,
-			(parsed.data.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
-			(parsed.data.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
-			parsed.data.terminalTheme ?? DEFAULTS.terminalTheme,
-			parsed.data.terminalFontSize ?? DEFAULTS.terminalFontSize,
+			(d.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
+			d.language ?? DEFAULTS.language,
+			(d.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
+			(d.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
+			(d.wordWrapDiff ?? DEFAULTS.wordWrapDiff) ? 1 : 0,
+			(d.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
+			(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
+			d.terminalTheme ?? DEFAULTS.terminalTheme,
+			d.terminalFontSize ?? DEFAULTS.terminalFontSize,
+			(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
+			(d.notifyOnWaiting ?? DEFAULTS.notifyOnWaiting) ? 1 : 0,
+			(d.notifyPwaEnabled ?? DEFAULTS.notifyPwaEnabled) ? 1 : 0,
+			(d.notifySoundEnabled ?? DEFAULTS.notifySoundEnabled) ? 1 : 0,
+			d.notifySoundType ?? DEFAULTS.notifySoundType,
+			d.notifySoundBuiltin ?? DEFAULTS.notifySoundBuiltin,
+			d.notifySoundFileId ?? DEFAULTS.notifySoundFileId,
+			(d.notifyDingtalkEnabled ?? DEFAULTS.notifyDingtalkEnabled) ? 1 : 0,
+			dingtalkWebhook ?? DEFAULTS.notifyDingtalkWebhook,
+			dingtalkSecret ?? DEFAULTS.notifyDingtalkSecret,
+			(d.notifyFeishuEnabled ?? DEFAULTS.notifyFeishuEnabled) ? 1 : 0,
+			feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
+			feishuSecret ?? DEFAULTS.notifyFeishuSecret,
 			now,
 			now,
-			parsed.data.autoLoadOlderMessages != null
-				? parsed.data.autoLoadOlderMessages
-					? 1
-					: 0
-				: null,
-			parsed.data.language ?? null,
-			parsed.data.wordWrapMarkdown != null ? (parsed.data.wordWrapMarkdown ? 1 : 0) : null,
-			parsed.data.wordWrapCode != null ? (parsed.data.wordWrapCode ? 1 : 0) : null,
-			parsed.data.wordWrapDiff != null ? (parsed.data.wordWrapDiff ? 1 : 0) : null,
-			parsed.data.replyInUserLanguage != null ? (parsed.data.replyInUserLanguage ? 1 : 0) : null,
-			parsed.data.showTokenUsage != null ? (parsed.data.showTokenUsage ? 1 : 0) : null,
-			parsed.data.terminalTheme ?? null,
-			parsed.data.terminalFontSize ?? null,
+			// ON CONFLICT UPDATE values (null = keep existing)
+			d.autoLoadOlderMessages != null ? (d.autoLoadOlderMessages ? 1 : 0) : null,
+			d.language ?? null,
+			d.wordWrapMarkdown != null ? (d.wordWrapMarkdown ? 1 : 0) : null,
+			d.wordWrapCode != null ? (d.wordWrapCode ? 1 : 0) : null,
+			d.wordWrapDiff != null ? (d.wordWrapDiff ? 1 : 0) : null,
+			d.replyInUserLanguage != null ? (d.replyInUserLanguage ? 1 : 0) : null,
+			d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
+			d.terminalTheme ?? null,
+			d.terminalFontSize ?? null,
+			d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
+			d.notifyOnWaiting != null ? (d.notifyOnWaiting ? 1 : 0) : null,
+			d.notifyPwaEnabled != null ? (d.notifyPwaEnabled ? 1 : 0) : null,
+			d.notifySoundEnabled != null ? (d.notifySoundEnabled ? 1 : 0) : null,
+			d.notifySoundType ?? null,
+			d.notifySoundBuiltin ?? null,
+			d.notifySoundFileId !== undefined ? d.notifySoundFileId : null,
+			d.notifyDingtalkEnabled != null ? (d.notifyDingtalkEnabled ? 1 : 0) : null,
+			dingtalkWebhook,
+			dingtalkSecret,
+			d.notifyFeishuEnabled != null ? (d.notifyFeishuEnabled ? 1 : 0) : null,
+			feishuWebhook,
+			feishuSecret,
 			now,
 		],
 	);

@@ -1,16 +1,32 @@
 import { ChapterForkModal } from "@frontend/components/chapter/ChapterForkModal";
 import { ChapterMergeModal } from "@frontend/components/chapter/ChapterMergeModal";
+import { GitPanel } from "@frontend/components/chapter/GitPanel";
+import { ContainerConfigModal } from "@frontend/components/container/ContainerConfigModal";
 import { ContainerLogs } from "@frontend/components/container/ContainerLogs";
+import { ContainerStatus } from "@frontend/components/container/ContainerStatus";
+import { PodmanInstallModal } from "@frontend/components/container/PodmanInstallModal";
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import {
 	useContainers,
+	usePauseContainers,
+	useRemoveContainers,
 	useStartContainers,
 	useStopContainers,
+	useUnpauseContainers,
 } from "@frontend/hooks/useContainers";
-import { api } from "@frontend/lib/api";
+import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS } from "@frontend/lib/constants";
-import { ActionIcon, Badge, Collapse, Group, Menu, Text, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Collapse,
+	Group,
+	Menu,
+	Text,
+	Tooltip,
+	UnstyledButton,
+} from "@mantine/core";
 import {
 	IconGitCommit,
 	IconGitFork,
@@ -19,11 +35,12 @@ import {
 	IconMoon,
 	IconPackage,
 	IconSettings,
+	IconSourceCode,
 	IconSun,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 interface ChapterBarProps {
@@ -41,6 +58,9 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const updateChapter = useUpdateChapter();
 	const startContainers = useStartContainers();
 	const stopContainers = useStopContainers();
+	const pauseContainers = usePauseContainers();
+	const unpauseContainers = useUnpauseContainers();
+	const removeContainers = useRemoveContainers();
 	const dormantChapter = useMutation({
 		mutationFn: () => api.dormantChapter(chapterId),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["chapters", chapterId] }),
@@ -52,7 +72,17 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 
 	const [forkModalOpen, setForkModalOpen] = useState(false);
 	const [mergeModalOpen, setMergeModalOpen] = useState(false);
+	const [containerConfigOpen, setContainerConfigOpen] = useState(false);
+	const [podmanInstallOpen, setPodmanInstallOpen] = useState(false);
 	const [logsOpen, setLogsOpen] = useState(false);
+	const [containerStatusOpen, setContainerStatusOpen] = useState(false);
+	const [gitPanelOpen, setGitPanelOpen] = useState(false);
+
+	const handleContainerError = useCallback((err: Error) => {
+		if ((err as ApiError).message?.includes("podman is not installed")) {
+			setPodmanInstallOpen(true);
+		}
+	}, []);
 
 	if (!chapter) return null;
 
@@ -91,42 +121,44 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 						(gitStatus.commitsAhead > 0 ||
 							gitStatus.linesAdded > 0 ||
 							gitStatus.linesRemoved > 0) && (
-							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-								{gitStatus.commitsAhead > 0 && (
-									<Tooltip
-										label={tn("chapterBar.commitsAhead", {
-											count: gitStatus.commitsAhead,
-											base: gitStatus.baseBranch,
-										})}
-									>
-										<Badge
-											size="xs"
-											variant="light"
-											color="blue"
-											leftSection={<IconGitCommit size={10} />}
+							<UnstyledButton onClick={() => setGitPanelOpen(!gitPanelOpen)}>
+								<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+									{gitStatus.commitsAhead > 0 && (
+										<Tooltip
+											label={tn("chapterBar.commitsAhead", {
+												count: gitStatus.commitsAhead,
+												base: gitStatus.baseBranch,
+											})}
 										>
-											{gitStatus.commitsAhead}
-										</Badge>
-									</Tooltip>
-								)}
-								{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
-									<Tooltip label={tn("chapterBar.uncommittedLines")}>
-										<Badge size="xs" variant="light" color="yellow">
-											{gitStatus.linesAdded > 0 && (
-												<Text span size="xs" c="green" fw={600}>
-													+{gitStatus.linesAdded}
-												</Text>
-											)}
-											{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
-											{gitStatus.linesRemoved > 0 && (
-												<Text span size="xs" c="red" fw={600}>
-													-{gitStatus.linesRemoved}
-												</Text>
-											)}
-										</Badge>
-									</Tooltip>
-								)}
-							</Group>
+											<Badge
+												size="xs"
+												variant="light"
+												color="blue"
+												leftSection={<IconGitCommit size={10} />}
+											>
+												{gitStatus.commitsAhead}
+											</Badge>
+										</Tooltip>
+									)}
+									{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
+										<Tooltip label={tn("chapterBar.uncommittedLines")}>
+											<Badge size="xs" variant="light" color="yellow">
+												{gitStatus.linesAdded > 0 && (
+													<Text span size="xs" c="green" fw={600}>
+														+{gitStatus.linesAdded}
+													</Text>
+												)}
+												{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
+												{gitStatus.linesRemoved > 0 && (
+													<Text span size="xs" c="red" fw={600}>
+														-{gitStatus.linesRemoved}
+													</Text>
+												)}
+											</Badge>
+										</Tooltip>
+									)}
+								</Group>
+							</UnstyledButton>
 						)}
 					{chapter.status !== "active" && (
 						<Badge size="xs" variant="light" color={chapter.status === "frozen" ? "blue" : "gray"}>
@@ -137,6 +169,20 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 
 				{/* Right: action menus */}
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					{/* Git panel toggle */}
+					{chapter.status === "active" && (
+						<Tooltip label={tn("chapterBar.git")}>
+							<ActionIcon
+								variant={gitPanelOpen ? "light" : "subtle"}
+								color={gitPanelOpen ? "indigo" : "gray"}
+								size="sm"
+								onClick={() => setGitPanelOpen(!gitPanelOpen)}
+							>
+								<IconSourceCode size={15} />
+							</ActionIcon>
+						</Tooltip>
+					)}
+
 					{/* Git menu */}
 					<Menu position="top-end" withinPortal>
 						<Menu.Target>
@@ -164,42 +210,91 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 						</Menu.Dropdown>
 					</Menu>
 
-					{/* Container menu */}
-					{hasContainers && (
-						<Menu position="top-end" withinPortal>
-							<Menu.Target>
-								<Tooltip label={tn("chapterBar.containers")}>
-									<ActionIcon
-										variant="subtle"
-										color={runningContainers.length > 0 ? "green" : "gray"}
-										size="sm"
-									>
-										<IconPackage size={15} />
-									</ActionIcon>
-								</Tooltip>
-							</Menu.Target>
-							<Menu.Dropdown>
-								<Menu.Label>
-									{runningContainers.length > 0
+					{/* Container menu — always visible */}
+					<Menu position="top-end" withinPortal>
+						<Menu.Target>
+							<Tooltip label={tn("chapterBar.containers")}>
+								<ActionIcon
+									variant="subtle"
+									color={runningContainers.length > 0 ? "green" : "gray"}
+									size="sm"
+								>
+									<IconPackage size={15} />
+								</ActionIcon>
+							</Tooltip>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Label>
+								{hasContainers
+									? runningContainers.length > 0
 										? tn("chapterBar.containersRunning", {
 												count: runningContainers.length,
 											})
-										: tn("chapterBar.noContainersRunning")}
-								</Menu.Label>
-								<Menu.Divider />
-								<Menu.Item onClick={() => startContainers.mutate(chapterId)}>
-									{tn("chapterBar.startContainers")}
-								</Menu.Item>
-								<Menu.Item onClick={() => stopContainers.mutate(chapterId)}>
-									{tn("chapterBar.stopContainers")}
-								</Menu.Item>
-								<Menu.Divider />
-								<Menu.Item onClick={() => setLogsOpen(!logsOpen)}>
-									{tn("chapterBar.viewLogs")}
-								</Menu.Item>
-							</Menu.Dropdown>
-						</Menu>
-					)}
+										: tn("chapterBar.noContainersRunning")
+									: tn("chapterBar.containers")}
+							</Menu.Label>
+							{hasContainers && (
+								<>
+									<Menu.Divider />
+									<Menu.Item
+										onClick={() =>
+											startContainers.mutate(chapterId, { onError: handleContainerError })
+										}
+									>
+										{tn("chapterBar.startContainers")}
+									</Menu.Item>
+									<Menu.Item
+										onClick={() =>
+											stopContainers.mutate(chapterId, { onError: handleContainerError })
+										}
+									>
+										{tn("chapterBar.stopContainers")}
+									</Menu.Item>
+									<Menu.Item
+										onClick={() =>
+											pauseContainers.mutate(chapterId, { onError: handleContainerError })
+										}
+									>
+										{tn("chapterBar.pauseContainers")}
+									</Menu.Item>
+									<Menu.Item
+										onClick={() =>
+											unpauseContainers.mutate(chapterId, { onError: handleContainerError })
+										}
+									>
+										{tn("chapterBar.resumeContainers")}
+									</Menu.Item>
+									<Menu.Divider />
+									<Menu.Item onClick={() => setContainerStatusOpen(!containerStatusOpen)}>
+										{tn("chapterBar.containers")}
+									</Menu.Item>
+									<Menu.Item onClick={() => setLogsOpen(!logsOpen)}>
+										{tn("chapterBar.viewLogs")}
+									</Menu.Item>
+									<Menu.Divider />
+									<Menu.Item onClick={() => setContainerConfigOpen(true)}>
+										{tn("chapterBar.editContainerConfig")}
+									</Menu.Item>
+									<Menu.Item
+										color="red"
+										onClick={() =>
+											removeContainers.mutate({ chapterId }, { onError: handleContainerError })
+										}
+									>
+										{tn("chapterBar.removeContainers")}
+									</Menu.Item>
+								</>
+							)}
+							{!hasContainers && (
+								<>
+									<Menu.Divider />
+									<Menu.Item onClick={() => setContainerConfigOpen(true)}>
+										{tn("chapterBar.configureContainers")}
+									</Menu.Item>
+								</>
+							)}
+						</Menu.Dropdown>
+					</Menu>
 
 					{/* Chapter settings menu */}
 					<Menu position="top-end" withinPortal>
@@ -264,6 +359,29 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 				</div>
 			</Collapse>
 
+			{/* Container status collapse */}
+			<Collapse in={containerStatusOpen}>
+				<div
+					style={{
+						padding: "8px 12px",
+						borderBottom: "1px solid var(--mantine-color-default-border)",
+					}}
+				>
+					<ContainerStatus chapterId={chapterId} />
+				</div>
+			</Collapse>
+
+			{/* Git panel collapse */}
+			<Collapse in={gitPanelOpen}>
+				<div
+					style={{
+						borderBottom: "1px solid var(--mantine-color-default-border)",
+					}}
+				>
+					<GitPanel chapterId={chapterId} />
+				</div>
+			</Collapse>
+
 			{/* Modals */}
 			<ChapterForkModal
 				chapterId={chapterId}
@@ -276,6 +394,13 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 				opened={mergeModalOpen}
 				onClose={() => setMergeModalOpen(false)}
 			/>
+			<ContainerConfigModal
+				chapterId={chapterId}
+				currentConfig={chapter.containerConfig}
+				opened={containerConfigOpen}
+				onClose={() => setContainerConfigOpen(false)}
+			/>
+			<PodmanInstallModal opened={podmanInstallOpen} onClose={() => setPodmanInstallOpen(false)} />
 		</>
 	);
 }

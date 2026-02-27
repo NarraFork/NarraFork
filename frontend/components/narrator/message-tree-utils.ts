@@ -13,6 +13,27 @@ interface ToolCall {
 	[key: string]: unknown;
 }
 
+/**
+ * Sync fields into the enriched tool_use block in contentJson that matches
+ * the given toolUseId. This keeps contentJson in sync with toolCalls so that
+ * resolveAllToolCallsFromMsg (which reads enriched blocks first) sees updates
+ * from WS events like tool_completed / tool_started / permission changes.
+ */
+function syncContentJsonFields(
+	contentJson: unknown[],
+	toolUseId: string,
+	fields: Record<string, unknown>,
+): unknown[] {
+	let changed = false;
+	const result = contentJson.map((block) => {
+		const b = block as Record<string, unknown>;
+		if (b.type !== "tool_use" || b.id !== toolUseId) return block;
+		changed = true;
+		return { ...b, ...fields };
+	});
+	return changed ? result : contentJson;
+}
+
 interface CachePage {
 	messages: TreeMessage[];
 	hasMore?: boolean;
@@ -25,7 +46,27 @@ interface InfiniteCache {
 }
 
 /** Insert a child message into the correct parent's children array in the cache */
-export function insertChildIntoCache(old: InfiniteCache, childMsg: TreeMessage): InfiniteCache {
+export function insertChildIntoCache(
+	old: InfiniteCache,
+	childMsg: TreeMessage,
+	index?: MessageIndex,
+): InfiniteCache {
+	// Fast path: use index to locate the parent message by parentToolUseId
+	if (index && childMsg.parentToolUseId) {
+		const entry = index.get(childMsg.parentToolUseId);
+		if (entry) {
+			const pages = [...old.pages];
+			const page = { ...pages[entry.pageIdx] };
+			const { messages, changed } = insertChildAtPath(page.messages, entry.path, childMsg);
+			if (changed) {
+				page.messages = messages;
+				pages[entry.pageIdx] = page;
+				return { ...old, pages };
+			}
+			return old;
+		}
+	}
+	// Fallback: full tree traversal
 	let anyChanged = false;
 	const pages = old.pages.map((page) => {
 		const { messages, changed } = insertChildIntoMessages(page.messages, childMsg);
@@ -33,6 +74,35 @@ export function insertChildIntoCache(old: InfiniteCache, childMsg: TreeMessage):
 		return changed ? { ...page, messages } : page;
 	});
 	return anyChanged ? { ...old, pages } : old;
+}
+
+/** Navigate to a message by path and append a child to it */
+function insertChildAtPath(
+	messages: TreeMessage[],
+	path: number[],
+	childMsg: TreeMessage,
+): { messages: TreeMessage[]; changed: boolean } {
+	if (path.length === 0) return { messages, changed: false };
+	const [idx, ...rest] = path;
+	const msg = messages[idx];
+	if (!msg) return { messages, changed: false };
+
+	if (rest.length === 0) {
+		// This is the target message — append child
+		if (msg.children?.some((c) => c.id === childMsg.id)) {
+			return { messages, changed: false };
+		}
+		const updated = [...messages];
+		updated[idx] = { ...msg, children: [...(msg.children || []), childMsg] };
+		return { messages: updated, changed: true };
+	}
+	// Navigate deeper into children
+	if (!msg.children?.length) return { messages, changed: false };
+	const childResult = insertChildAtPath(msg.children, rest, childMsg);
+	if (!childResult.changed) return { messages, changed: false };
+	const updated = [...messages];
+	updated[idx] = { ...msg, children: childResult.messages };
+	return { messages: updated, changed: true };
 }
 
 function insertChildIntoMessages(
@@ -82,6 +152,13 @@ export function mergeToolCallFieldsInTree(
 			if (tcChanged) {
 				anyChanged = true;
 				result = { ...result, toolCalls: updatedCalls };
+				// Sync enriched contentJson blocks
+				if (Array.isArray(result.contentJson)) {
+					result = {
+						...result,
+						contentJson: syncContentJsonFields(result.contentJson, toolUseId, fields),
+					};
+				}
 			}
 		}
 		if (msg.children?.length) {
@@ -123,7 +200,17 @@ export function updateToolCallInTree(
 			});
 			if (msgChanged) {
 				anyChanged = true;
+				const fields: Record<string, unknown> = { status };
+				if (output !== undefined) fields.outputJson = output;
+				if (durationMs != null) fields.durationMs = durationMs;
 				result = { ...result, toolCalls: updatedCalls };
+				// Sync enriched contentJson blocks
+				if (Array.isArray(result.contentJson)) {
+					result = {
+						...result,
+						contentJson: syncContentJsonFields(result.contentJson, toolUseId, fields),
+					};
+				}
 			}
 		}
 
@@ -229,14 +316,12 @@ function indexMessages(
 	}
 }
 
-/** Navigate to a message by path and update its tool call immutably */
-function updateAtPath(
+/** Navigate to a message by path and merge arbitrary fields into its tool call */
+function mergeAtPath(
 	messages: TreeMessage[],
 	path: number[],
 	toolUseId: string,
-	status: string,
-	output: unknown | undefined,
-	durationMs?: number,
+	fields: Record<string, unknown>,
 ): TreeMessage[] {
 	if (path.length === 0) return messages;
 	const [idx, ...rest] = path;
@@ -247,22 +332,38 @@ function updateAtPath(
 	if (rest.length === 0) {
 		// This is the target message — update its toolCalls
 		if (!(msg.toolCalls as ToolCall[])?.length) return messages;
+		let tcChanged = false;
 		const updatedCalls = (msg.toolCalls as ToolCall[]).map((tc) => {
 			if (tc.toolUseId !== toolUseId) return tc;
-			return {
-				...tc,
-				status,
-				outputJson: output ?? tc.outputJson,
-				...(durationMs != null ? { durationMs } : {}),
-			};
+			tcChanged = true;
+			// For outputJson, keep existing value if the new one is undefined
+			const merged = { ...tc, ...fields };
+			if (fields.outputJson === undefined) merged.outputJson = tc.outputJson;
+			return merged;
 		});
-		updated[idx] = { ...msg, toolCalls: updatedCalls };
+		if (!tcChanged) return messages;
+		// Also update the enriched tool_use block in contentJson so that
+		// resolveAllToolCallsFromMsg (which reads from contentJson first)
+		// picks up the new status/output/etc.
+		let enrichedContent = msg.contentJson;
+		if (Array.isArray(enrichedContent)) {
+			let contentChanged = false;
+			enrichedContent = enrichedContent.map((block: Record<string, unknown>) => {
+				if (block.type !== "tool_use" || block.id !== toolUseId) return block;
+				contentChanged = true;
+				const merged = { ...block, ...fields };
+				if (fields.outputJson === undefined) merged.outputJson = block.outputJson;
+				return merged;
+			});
+			if (!contentChanged) enrichedContent = msg.contentJson;
+		}
+		updated[idx] = { ...msg, toolCalls: updatedCalls, contentJson: enrichedContent };
 	} else {
 		// Navigate deeper into children
 		if (!msg.children?.length) return messages;
 		updated[idx] = {
 			...msg,
-			children: updateAtPath(msg.children, rest, toolUseId, status, output, durationMs),
+			children: mergeAtPath(msg.children, rest, toolUseId, fields),
 		};
 	}
 	return updated;
@@ -277,19 +378,35 @@ export function updateToolCallByIndex(
 	index: MessageIndex,
 	durationMs?: number,
 ): InfiniteCache {
+	return mergeFieldsByIndex(
+		old,
+		toolUseId,
+		{
+			status,
+			outputJson: output,
+			...(durationMs != null ? { durationMs } : {}),
+		},
+		index,
+	);
+}
+
+/**
+ * Merge arbitrary fields into a tool call using the pre-built index for O(1) lookup.
+ * Falls back to full tree traversal when the toolUseId is not in the index.
+ */
+export function mergeFieldsByIndex(
+	old: InfiniteCache,
+	toolUseId: string,
+	fields: Record<string, unknown>,
+	index: MessageIndex,
+): InfiniteCache {
 	const entry = index.get(toolUseId);
 	if (!entry) {
 		// Fallback: tool was added after last index build (e.g. new message via WS)
 		if (!old?.pages?.length) return old;
 		let anyChanged = false;
 		const pages = old.pages.map((page) => {
-			const { messages, changed } = updateToolCallInTree(
-				page.messages,
-				toolUseId,
-				status,
-				output,
-				durationMs,
-			);
+			const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, fields);
 			if (changed) anyChanged = true;
 			return changed ? { ...page, messages } : page;
 		});
@@ -298,7 +415,7 @@ export function updateToolCallByIndex(
 
 	const pages = [...old.pages];
 	const page = { ...pages[entry.pageIdx] };
-	page.messages = updateAtPath(page.messages, entry.path, toolUseId, status, output, durationMs);
+	page.messages = mergeAtPath(page.messages, entry.path, toolUseId, fields);
 	pages[entry.pageIdx] = page;
 	return { ...old, pages };
 }
@@ -309,6 +426,41 @@ export function updateToolCallByIndex(
  */
 export function subagentStreamingId(parentToolUseId: string): string {
 	return `__streaming_subagent_${parentToolUseId}__`;
+}
+
+/**
+ * Upsert a streaming tool_use block into existing content blocks and tool call arrays.
+ * Shared by both top-level streaming chunks and subagent streaming chunks.
+ * Returns new arrays (does not mutate inputs).
+ */
+export function upsertStreamingToolBlock(
+	prevBlocks: ContentBlock[],
+	prevToolCalls: ToolCallRecord[],
+	toolUseId: string,
+	toolName: string,
+	streamingInput: Record<string, unknown>,
+): { blocks: ContentBlock[]; toolCalls: ToolCallRecord[] } {
+	const blocks = [...prevBlocks];
+	const toolCalls = [...prevToolCalls];
+
+	const blockIdx = blocks.findIndex(
+		(b: ContentBlock) => b.type === "tool_use" && b.id === toolUseId,
+	);
+	if (blockIdx === -1) {
+		blocks.push({ type: "tool_use", id: toolUseId, name: toolName, input: {} });
+		toolCalls.push({
+			toolUseId,
+			toolName,
+			inputJson: {},
+			status: "initializing",
+			createdAt: new Date().toISOString(),
+		} as ToolCallRecord);
+	}
+	const tcIdx = toolCalls.findIndex((tc: ToolCallRecord) => tc.toolUseId === toolUseId);
+	if (tcIdx !== -1) {
+		toolCalls[tcIdx] = { ...toolCalls[tcIdx], inputJson: streamingInput };
+	}
+	return { blocks, toolCalls };
 }
 
 /**
@@ -323,9 +475,36 @@ export function upsertSubagentStreamingChunk(
 	toolUseId: string,
 	toolName: string,
 	inputCharsTotal: number,
+	index?: MessageIndex,
 ): InfiniteCache {
 	const syntheticId = subagentStreamingId(parentToolUseId);
 
+	// Fast path: use index to locate the parent message
+	if (index) {
+		const entry = index.get(parentToolUseId);
+		if (entry) {
+			const pages = [...old.pages];
+			const page = { ...pages[entry.pageIdx] };
+			const { messages, changed } = upsertStreamingChildAtPath(
+				page.messages,
+				entry.path,
+				parentToolUseId,
+				syntheticId,
+				narratorId,
+				toolUseId,
+				toolName,
+				inputCharsTotal,
+			);
+			if (changed) {
+				page.messages = messages;
+				pages[entry.pageIdx] = page;
+				return { ...old, pages };
+			}
+			return old;
+		}
+	}
+
+	// Fallback: full tree traversal
 	let anyChanged = false;
 	const pages = old.pages.map((page) => {
 		const { messages, changed } = upsertStreamingChildInMessages(
@@ -341,6 +520,100 @@ export function upsertSubagentStreamingChunk(
 		return changed ? { ...page, messages } : page;
 	});
 	return anyChanged ? { ...old, pages } : old;
+}
+
+/** Navigate to a message by path and upsert a streaming child on it */
+function upsertStreamingChildAtPath(
+	messages: TreeMessage[],
+	path: number[],
+	parentToolUseId: string,
+	syntheticId: string,
+	narratorId: string,
+	toolUseId: string,
+	toolName: string,
+	inputCharsTotal: number,
+): { messages: TreeMessage[]; changed: boolean } {
+	if (path.length === 0) return { messages, changed: false };
+	const [idx, ...rest] = path;
+	const msg = messages[idx];
+	if (!msg) return { messages, changed: false };
+
+	if (rest.length === 0) {
+		// This is the target message — upsert the streaming child
+		return {
+			messages: upsertStreamingChildOnMsg(
+				messages,
+				idx,
+				syntheticId,
+				narratorId,
+				toolUseId,
+				toolName,
+				inputCharsTotal,
+			),
+			changed: true,
+		};
+	}
+	// Navigate deeper
+	if (!msg.children?.length) return { messages, changed: false };
+	const childResult = upsertStreamingChildAtPath(
+		msg.children,
+		rest,
+		parentToolUseId,
+		syntheticId,
+		narratorId,
+		toolUseId,
+		toolName,
+		inputCharsTotal,
+	);
+	if (!childResult.changed) return { messages, changed: false };
+	const updated = [...messages];
+	updated[idx] = { ...msg, children: childResult.messages };
+	return { messages: updated, changed: true };
+}
+
+/** Upsert a streaming child on a specific message (by index in its array) */
+function upsertStreamingChildOnMsg(
+	messages: TreeMessage[],
+	msgIdx: number,
+	syntheticId: string,
+	narratorId: string,
+	toolUseId: string,
+	toolName: string,
+	inputCharsTotal: number,
+): TreeMessage[] {
+	const msg = messages[msgIdx];
+	const children = [...(msg.children || [])];
+	const existingIdx = children.findIndex((c) => c.id === syntheticId);
+	const existing = existingIdx !== -1 ? children[existingIdx] : null;
+
+	const { blocks, toolCalls } = upsertStreamingToolBlock(
+		existing ? [...(existing.contentJson as ContentBlock[])] : [],
+		existing ? [...(existing.toolCalls as ToolCallRecord[])] : [],
+		toolUseId,
+		toolName,
+		{ _streamingChars: inputCharsTotal },
+	);
+
+	const syntheticChild: TreeMessage = {
+		id: syntheticId,
+		narratorId,
+		parentToolUseId: null, // not needed for display
+		role: "assistant",
+		contentJson: blocks,
+		contentText: null,
+		toolCalls: toolCalls,
+		createdAt: existing?.createdAt ?? new Date().toISOString(),
+		children: [],
+	};
+
+	if (existingIdx !== -1) {
+		children[existingIdx] = syntheticChild;
+	} else {
+		children.push(syntheticChild);
+	}
+	const updated = [...messages];
+	updated[msgIdx] = { ...msg, children };
+	return updated;
 }
 
 function upsertStreamingChildInMessages(
@@ -364,43 +637,22 @@ function upsertStreamingChildInMessages(
 			const existingIdx = children.findIndex((c) => c.id === syntheticId);
 			const existing = existingIdx !== -1 ? children[existingIdx] : null;
 
-			// Build updated content blocks and tool calls
-			const prevBlocks: ContentBlock[] = existing
-				? [...(existing.contentJson as ContentBlock[])]
-				: [];
-			const prevToolCalls: ToolCallRecord[] = existing
-				? [...(existing.toolCalls as ToolCallRecord[])]
-				: [];
-
-			const blockIdx = prevBlocks.findIndex(
-				(b: ContentBlock) => b.type === "tool_use" && b.id === toolUseId,
+			const { blocks, toolCalls } = upsertStreamingToolBlock(
+				existing ? [...(existing.contentJson as ContentBlock[])] : [],
+				existing ? [...(existing.toolCalls as ToolCallRecord[])] : [],
+				toolUseId,
+				toolName,
+				{ _streamingChars: inputCharsTotal },
 			);
-			if (blockIdx === -1) {
-				prevBlocks.push({ type: "tool_use", id: toolUseId, name: toolName, input: {} });
-				prevToolCalls.push({
-					toolUseId,
-					toolName,
-					inputJson: {},
-					status: "initializing",
-					createdAt: new Date().toISOString(),
-				} as ToolCallRecord);
-			}
-			const tcIdx = prevToolCalls.findIndex((tc: ToolCallRecord) => tc.toolUseId === toolUseId);
-			if (tcIdx !== -1) {
-				prevToolCalls[tcIdx] = {
-					...prevToolCalls[tcIdx],
-					inputJson: { _streamingChars: inputCharsTotal },
-				};
-			}
 
 			const syntheticChild: TreeMessage = {
 				id: syntheticId,
 				narratorId,
 				parentToolUseId,
 				role: "assistant",
-				contentJson: prevBlocks,
+				contentJson: blocks,
 				contentText: null,
-				toolCalls: prevToolCalls,
+				toolCalls: toolCalls,
 				createdAt: existing?.createdAt ?? new Date().toISOString(),
 				children: [],
 			};
@@ -440,8 +692,31 @@ function upsertStreamingChildInMessages(
 export function removeSubagentStreamingChunk(
 	old: InfiniteCache,
 	parentToolUseId: string,
+	index?: MessageIndex,
 ): InfiniteCache {
 	const syntheticId = subagentStreamingId(parentToolUseId);
+
+	// Fast path: use index
+	if (index) {
+		const entry = index.get(parentToolUseId);
+		if (entry) {
+			const pages = [...old.pages];
+			const page = { ...pages[entry.pageIdx] };
+			const { messages, changed } = removeStreamingChildAtPath(
+				page.messages,
+				entry.path,
+				syntheticId,
+			);
+			if (changed) {
+				page.messages = messages;
+				pages[entry.pageIdx] = page;
+				return { ...old, pages };
+			}
+			return old;
+		}
+	}
+
+	// Fallback: full tree traversal
 	let anyChanged = false;
 	const pages = old.pages.map((page) => {
 		const { messages, changed } = removeStreamingChildInMessages(
@@ -453,6 +728,33 @@ export function removeSubagentStreamingChunk(
 		return changed ? { ...page, messages } : page;
 	});
 	return anyChanged ? { ...old, pages } : old;
+}
+
+/** Navigate to a message by path and remove a streaming child from it */
+function removeStreamingChildAtPath(
+	messages: TreeMessage[],
+	path: number[],
+	syntheticId: string,
+): { messages: TreeMessage[]; changed: boolean } {
+	if (path.length === 0) return { messages, changed: false };
+	const [idx, ...rest] = path;
+	const msg = messages[idx];
+	if (!msg) return { messages, changed: false };
+
+	if (rest.length === 0) {
+		if (!msg.children?.some((c) => c.id === syntheticId)) {
+			return { messages, changed: false };
+		}
+		const updated = [...messages];
+		updated[idx] = { ...msg, children: msg.children.filter((c) => c.id !== syntheticId) };
+		return { messages: updated, changed: true };
+	}
+	if (!msg.children?.length) return { messages, changed: false };
+	const childResult = removeStreamingChildAtPath(msg.children, rest, syntheticId);
+	if (!childResult.changed) return { messages, changed: false };
+	const updated = [...messages];
+	updated[idx] = { ...msg, children: childResult.messages };
+	return { messages: updated, changed: true };
 }
 
 function removeStreamingChildInMessages(

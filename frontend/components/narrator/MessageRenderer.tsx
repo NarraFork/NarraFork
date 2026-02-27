@@ -1,5 +1,5 @@
 import { Box, Divider, Text } from "@mantine/core";
-import { memo, useEffect, useState } from "react";
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { MessageBubble } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
@@ -431,30 +431,30 @@ export function RenderProgress({
 // StreamingBubble — isolated component to avoid re-rendering the entire panel
 // ---------------------------------------------------------------------------
 
-export function StreamingBubble({
-	narratorId,
-	streamingRef,
-	version,
-}: {
-	narratorId: string;
-	streamingRef: React.RefObject<string>;
-	version: number;
-}) {
-	const [text, setText] = useState("");
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: version triggers re-read of streamingRef.current on each streaming tick
-	useEffect(() => {
-		setText(streamingRef.current);
-	}, [version, streamingRef]);
-
-	if (!text) return null;
-	return (
-		<MessageBubble
-			narratorId={narratorId}
-			message={{
-				role: "assistant",
-				contentJson: [{ type: "text", text }],
-			}}
-		/>
-	);
-}
+export const StreamingBubble = memo(
+	function StreamingBubble({
+		narratorId,
+		streamingRef,
+		version,
+	}: {
+		narratorId: string;
+		streamingRef: React.RefObject<string>;
+		version: number;
+	}) {
+		// Read ref directly during render — version change triggers re-render
+		// which picks up the latest accumulated text without an extra useEffect cycle.
+		void version;
+		const text = streamingRef.current;
+		if (!text) return null;
+		return (
+			<MessageBubble
+				narratorId={narratorId}
+				message={{
+					role: "assistant",
+					contentJson: [{ type: "text", text }],
+				}}
+			/>
+		);
+	},
+	(prev, next) => prev.version === next.version,
+);

@@ -62,13 +62,25 @@ function seedGraph() {
 // Empty maps for tests that don't need narrator/container data
 const emptyNarratorCounts = new Map<string, number>();
 const emptyContainerPresence = new Set<string>();
+const emptyEdgeRows: {
+	id: string;
+	sourceId: string;
+	targetId: string;
+	type: string;
+	metadata: unknown;
+}[] = [];
 
 describe("story network graph", () => {
 	it("builds nodes for all chapters", async () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		const { nodes } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
+		const { nodes } = buildGraph(
+			allChapters as any,
+			emptyNarratorCounts,
+			emptyContainerPresence,
+			emptyEdgeRows,
+		);
 		expect(nodes).toHaveLength(3);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		expect(nodes.map((n: any) => n.id).sort()).toEqual(["fork1", "merged1", "root"]);
@@ -78,7 +90,12 @@ describe("story network graph", () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
+		const { edges } = buildGraph(
+			allChapters as any,
+			emptyNarratorCounts,
+			emptyContainerPresence,
+			emptyEdgeRows,
+		);
 		const forkEdges = edges.filter((e) => e.type === "forkEdge");
 		expect(forkEdges).toHaveLength(2); // fork1 and merged1 both have parentChapterId
 		expect(forkEdges.some((e) => e.source === "root" && e.target === "fork1")).toBe(true);
@@ -88,7 +105,12 @@ describe("story network graph", () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
+		const { edges } = buildGraph(
+			allChapters as any,
+			emptyNarratorCounts,
+			emptyContainerPresence,
+			emptyEdgeRows,
+		);
 		const mergeEdges = edges.filter((e) => e.type === "mergeEdge");
 		expect(mergeEdges).toHaveLength(1);
 		expect(mergeEdges[0].source).toBe("merged1");
@@ -99,7 +121,12 @@ describe("story network graph", () => {
 		seedGraph();
 		const allChapters = await db.query.chapters.findMany();
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		const { edges } = buildGraph(allChapters as any, emptyNarratorCounts, emptyContainerPresence);
+		const { edges } = buildGraph(
+			allChapters as any,
+			emptyNarratorCounts,
+			emptyContainerPresence,
+			emptyEdgeRows,
+		);
 		const incomingToRoot = edges.filter((e) => e.target === "root" && e.type === "forkEdge");
 		expect(incomingToRoot).toHaveLength(0);
 	});

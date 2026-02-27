@@ -58,3 +58,13 @@ export function useDeleteNarratorTerminal(narratorId: string) {
 		},
 	});
 }
+
+export function useRenameTerminal(key: { chapterId?: string; narratorId?: string }) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, name }: { id: string; name: string }) => api.renameTerminal(id, name),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["terminals", key] });
+		},
+	});
+}

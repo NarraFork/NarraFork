@@ -1,5 +1,6 @@
 import { Box, Center, Drawer, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -70,17 +71,44 @@ function SessionDetailPage() {
 	}, [sessionId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle]);
 
 	// Mark narrator as read (done → idle) when visiting the session page
+	const qc = useQueryClient();
 	useEffect(() => {
-		api.markNarratorRead(sessionId).catch(() => {});
-	}, [sessionId]);
+		api
+			.markNarratorRead(sessionId)
+			.then(() => {
+				qc.invalidateQueries({ queryKey: ["narrators", sessionId], exact: true });
+			})
+			.catch(() => {});
+	}, [sessionId, qc]);
 
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(sessionId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const hasRunningTerminal = (existingTerminals ?? []).some((t: any) => t.status === "running");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);
+
+	// Intercept browser back button to close mobile terminal drawer instead of navigating away
+	const closedByPopState = useRef(false);
+	useEffect(() => {
+		if (!drawerOpened) return;
+		closedByPopState.current = false;
+		history.pushState({ terminalDrawer: true }, "");
+		const onPopState = () => {
+			closedByPopState.current = true;
+			closeDrawer();
+		};
+		window.addEventListener("popstate", onPopState);
+		return () => {
+			window.removeEventListener("popstate", onPopState);
+			if (!closedByPopState.current) {
+				history.back();
+			}
+		};
+	}, [drawerOpened, closeDrawer]);
 
 	// Desktop terminal panel visibility — restore from localStorage if a running terminal exists
 	const [terminalOpen, setTerminalOpen] = useState(false);
@@ -138,12 +166,14 @@ function SessionDetailPage() {
 		});
 	}, [sessionId]);
 
-	// Auto-close terminal when process exits
+	// Auto-close terminal panel only when the last terminal exits
 	const handleTerminalExit = useCallback(() => {
-		setTerminalOpen(false);
-		localStorage.setItem(terminalStorageKey(sessionId), "false");
-		if (isMobile) closeDrawer();
-	}, [sessionId, isMobile, closeDrawer]);
+		if (runningCount <= 1) {
+			setTerminalOpen(false);
+			localStorage.setItem(terminalStorageKey(sessionId), "false");
+			if (isMobile) closeDrawer();
+		}
+	}, [sessionId, isMobile, closeDrawer, runningCount]);
 
 	// Desktop drag handle for resizing (mouse + touch)
 	const onDragStart = useCallback((e: React.MouseEvent | React.TouchEvent) => {
@@ -275,15 +305,16 @@ function SessionDetailPage() {
 						style={{
 							width: 6,
 							cursor: "col-resize",
-							backgroundColor: "var(--mantine-color-gray-3)",
 							flexShrink: 0,
 							transition: "background-color 0.15s",
+							borderLeft: "1px solid var(--mantine-color-dark-4)",
+							borderRight: "1px solid var(--mantine-color-dark-4)",
 						}}
 						onMouseEnter={(e) => {
-							e.currentTarget.style.backgroundColor = "var(--mantine-color-blue-4)";
+							e.currentTarget.style.backgroundColor = "var(--mantine-color-indigo-9)";
 						}}
 						onMouseLeave={(e) => {
-							e.currentTarget.style.backgroundColor = "var(--mantine-color-gray-3)";
+							e.currentTarget.style.backgroundColor = "transparent";
 						}}
 					/>
 

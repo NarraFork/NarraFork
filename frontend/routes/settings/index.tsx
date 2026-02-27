@@ -1,10 +1,14 @@
 import {
 	Affix,
+	Badge,
 	Button,
+	FileInput,
 	Group,
 	Loader,
 	NumberInput,
 	Paper,
+	PasswordInput,
+	SegmentedControl,
 	Select,
 	Slider,
 	Stack,
@@ -15,8 +19,10 @@ import {
 	Transition,
 } from "@mantine/core";
 import {
+	IconBell,
 	IconHandStop,
 	IconPencilCheck,
+	IconPlayerPlay,
 	IconRefresh,
 	IconShield,
 	IconShieldOff,
@@ -32,6 +38,11 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import {
+	BUILTIN_SOUND_NAMES,
+	playBuiltinSound,
+	playCustomSound,
+} from "../../lib/notification-sound";
 
 function ensurePrefix(val: string): string {
 	if (!val || val.includes(":")) return val;
@@ -74,7 +85,7 @@ function SettingsPage() {
 	// OLED mode (local-only)
 	const [oledMode, setOledMode] = useLocalPref("narrafork_oled");
 
-	// PWA update
+	// PWA cache refresh (does not check for backend updates)
 	const [pwaUpdating, setPwaUpdating] = useState(false);
 
 	const handlePwaUpdate = async () => {
@@ -101,6 +112,7 @@ function SettingsPage() {
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
+	const [planTimeoutAction, setPlanTimeoutAction] = useState("deny");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
@@ -108,6 +120,11 @@ function SettingsPage() {
 	const [sizeWarning, setSizeWarning] = useState(500);
 	const [autoSave, setAutoSave] = useState(true);
 	const [dormantMinutes, setDormantMinutes] = useState(0);
+	// Auto-commit thresholds
+	const [acReminderLines, setAcReminderLines] = useState(1000);
+	const [acReminderFiles, setAcReminderFiles] = useState(10);
+	const [acForceLines, setAcForceLines] = useState(2000);
+	const [acForceFiles, setAcForceFiles] = useState(25);
 	// Containers
 	const [portStart, setPortStart] = useState(10000);
 	const [portEnd, setPortEnd] = useState(20000);
@@ -131,9 +148,14 @@ function SettingsPage() {
 		sizeWarning: 500,
 		autoSave: true,
 		dormantMinutes: 0,
+		acReminderLines: 1000,
+		acReminderFiles: 10,
+		acForceLines: 2000,
+		acForceFiles: 25,
 		portStart: 10000,
 		portEnd: 20000,
 		legacyEncoding: false,
+		planTimeoutAction: "deny",
 	});
 
 	useEffect(() => {
@@ -150,9 +172,14 @@ function SettingsPage() {
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
 				autoSave: settings.chapters?.autoSaveOnDormant ?? true,
 				dormantMinutes: settings.chapters?.dormantAfterMinutes ?? 0,
+				acReminderLines: settings.chapters?.autoCommitReminderLines ?? 1000,
+				acReminderFiles: settings.chapters?.autoCommitReminderFiles ?? 10,
+				acForceLines: settings.chapters?.autoCommitForceLines ?? 2000,
+				acForceFiles: settings.chapters?.autoCommitForceFiles ?? 25,
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
+				planTimeoutAction: settings.agent?.planTimeoutAction ?? "deny",
 			};
 			serverSnapshot.current = snap;
 			setPort(snap.port);
@@ -168,9 +195,14 @@ function SettingsPage() {
 			setSizeWarning(snap.sizeWarning);
 			setAutoSave(snap.autoSave);
 			setDormantMinutes(snap.dormantMinutes);
+			setAcReminderLines(snap.acReminderLines);
+			setAcReminderFiles(snap.acReminderFiles);
+			setAcForceLines(snap.acForceLines);
+			setAcForceFiles(snap.acForceFiles);
 			setPortStart(snap.portStart);
 			setPortEnd(snap.portEnd);
 			setLegacyEncoding(snap.legacyEncoding);
+			setPlanTimeoutAction(snap.planTimeoutAction);
 			setInitialized(true);
 		}
 	}, [settings, initialized]);
@@ -192,9 +224,14 @@ function SettingsPage() {
 			sizeWarning !== s.sizeWarning ||
 			autoSave !== s.autoSave ||
 			dormantMinutes !== s.dormantMinutes ||
+			acReminderLines !== s.acReminderLines ||
+			acReminderFiles !== s.acReminderFiles ||
+			acForceLines !== s.acForceLines ||
+			acForceFiles !== s.acForceFiles ||
 			portStart !== s.portStart ||
 			portEnd !== s.portEnd ||
-			legacyEncoding !== s.legacyEncoding
+			legacyEncoding !== s.legacyEncoding ||
+			planTimeoutAction !== s.planTimeoutAction
 		);
 	}, [
 		initialized,
@@ -211,9 +248,14 @@ function SettingsPage() {
 		sizeWarning,
 		autoSave,
 		dormantMinutes,
+		acReminderLines,
+		acReminderFiles,
+		acForceLines,
+		acForceFiles,
 		portStart,
 		portEnd,
 		legacyEncoding,
+		planTimeoutAction,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -246,6 +288,7 @@ function SettingsPage() {
 						plan: subagentPlanModel,
 					},
 					legacyEncoding,
+					planTimeoutAction,
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -253,6 +296,10 @@ function SettingsPage() {
 					worktreeSizeWarningMb: sizeWarning,
 					autoSaveOnDormant: autoSave,
 					dormantAfterMinutes: dormantMinutes,
+					autoCommitReminderLines: acReminderLines,
+					autoCommitReminderFiles: acReminderFiles,
+					autoCommitForceLines: acForceLines,
+					autoCommitForceFiles: acForceFiles,
 				},
 				containers: {
 					portRangeStart: portStart,
@@ -276,9 +323,14 @@ function SettingsPage() {
 						sizeWarning,
 						autoSave,
 						dormantMinutes,
+						acReminderLines,
+						acReminderFiles,
+						acForceLines,
+						acForceFiles,
 						portStart,
 						portEnd,
 						legacyEncoding,
+						planTimeoutAction,
 					};
 				},
 			},
@@ -404,6 +456,16 @@ function SettingsPage() {
 						checked={legacyEncoding}
 						onChange={(e) => setLegacyEncoding(e.currentTarget.checked)}
 					/>
+					<Select
+						label={t("planTimeoutAction")}
+						description={t("planTimeoutActionDesc")}
+						data={[
+							{ value: "deny", label: t("planTimeoutDeny") },
+							{ value: "auto_approve", label: t("planTimeoutAutoApprove") },
+						]}
+						value={planTimeoutAction}
+						onChange={(v) => setPlanTimeoutAction(v ?? "deny")}
+					/>
 					<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
 						{t("customModels")} →
 					</Button>
@@ -445,6 +507,39 @@ function SettingsPage() {
 						description={t("dormantAfterMinutesDesc")}
 						value={dormantMinutes}
 						onChange={(v) => setDormantMinutes(typeof v === "number" ? v : 0)}
+						min={0}
+					/>
+					<Title order={5} mt="sm">
+						{t("autoCommitSection")}
+					</Title>
+					<NumberInput
+						label={t("autoCommitReminderLines")}
+						description={t("autoCommitReminderLinesDesc")}
+						value={acReminderLines}
+						onChange={(v) => setAcReminderLines(typeof v === "number" ? v : 1000)}
+						min={0}
+						step={50}
+					/>
+					<NumberInput
+						label={t("autoCommitReminderFiles")}
+						description={t("autoCommitReminderFilesDesc")}
+						value={acReminderFiles}
+						onChange={(v) => setAcReminderFiles(typeof v === "number" ? v : 10)}
+						min={0}
+					/>
+					<NumberInput
+						label={t("autoCommitForceLines")}
+						description={t("autoCommitForceLinesDesc")}
+						value={acForceLines}
+						onChange={(v) => setAcForceLines(typeof v === "number" ? v : 2000)}
+						min={0}
+						step={100}
+					/>
+					<NumberInput
+						label={t("autoCommitForceFiles")}
+						description={t("autoCommitForceFilesDesc")}
+						value={acForceFiles}
+						onChange={(v) => setAcForceFiles(typeof v === "number" ? v : 25)}
 						min={0}
 					/>
 				</Stack>
@@ -493,6 +588,9 @@ function SettingsPage() {
 					/>
 				</Stack>
 			</Paper>
+
+			{/* Notifications (per-user preferences) */}
+			<NotificationSettings userPrefs={userPrefs} updateUserPref={updateUserPref} t={t} />
 
 			{/* Word Wrap Defaults (per-user preferences) */}
 			<Paper withBorder p="md">
@@ -659,5 +757,339 @@ function SettingsPage() {
 				}
 			`}</style>
 		</Stack>
+	);
+}
+
+// === Notification Settings Sub-component ===
+
+function NotificationSettings({
+	userPrefs,
+	updateUserPref,
+	t,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
+	userPrefs: any;
+	// biome-ignore lint/suspicious/noExplicitAny: mutation hook type
+	updateUserPref: any;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+	const [pwaPermission, setPwaPermission] = useState(
+		"Notification" in window ? Notification.permission : "denied",
+	);
+	const [testingDingtalk, setTestingDingtalk] = useState(false);
+	const [testingFeishu, setTestingFeishu] = useState(false);
+	const [testResult, setTestResult] = useState<{
+		type: string;
+		ok: boolean;
+		error?: string;
+	} | null>(null);
+	// Local state for webhook fields (only saved on blur to avoid masked-value issues)
+	const [dingtalkWebhook, setDingtalkWebhook] = useState("");
+	const [dingtalkSecret, setDingtalkSecret] = useState("");
+	const [feishuWebhook, setFeishuWebhook] = useState("");
+	const [feishuSecret, setFeishuSecret] = useState("");
+	const [webhookInited, setWebhookInited] = useState(false);
+
+	// Initialize local webhook state from prefs (once)
+	useEffect(() => {
+		if (userPrefs && !webhookInited) {
+			setDingtalkWebhook(userPrefs.notifyDingtalkWebhook ?? "");
+			setDingtalkSecret(userPrefs.notifyDingtalkSecret ?? "");
+			setFeishuWebhook(userPrefs.notifyFeishuWebhook ?? "");
+			setFeishuSecret(userPrefs.notifyFeishuSecret ?? "");
+			setWebhookInited(true);
+		}
+	}, [userPrefs, webhookInited]);
+
+	const soundOptions = BUILTIN_SOUND_NAMES.map((name) => ({
+		value: name,
+		label: t(`notifySound${name.charAt(0).toUpperCase()}${name.slice(1)}`),
+	}));
+
+	const handleRequestPwaPermission = async () => {
+		if (!("Notification" in window)) return;
+		const result = await Notification.requestPermission();
+		setPwaPermission(result);
+		if (result === "granted") {
+			updateUserPref.mutate({ notifyPwaEnabled: true });
+		}
+	};
+
+	const handleSoundUpload = async (file: File | null) => {
+		if (!file) return;
+		try {
+			const result = await api.uploadNotificationSound(file);
+			updateUserPref.mutate({
+				notifySoundType: "custom",
+				notifySoundFileId: result.id,
+			});
+		} catch {
+			// upload failed — ignore
+		}
+	};
+
+	const handleTestDingtalk = async () => {
+		setTestingDingtalk(true);
+		setTestResult(null);
+		try {
+			const res = await api.testDingtalkWebhook(dingtalkWebhook, dingtalkSecret);
+			setTestResult({ type: "dingtalk", ok: res.ok, error: res.error });
+		} catch (err) {
+			setTestResult({
+				type: "dingtalk",
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		setTestingDingtalk(false);
+	};
+
+	const handleTestFeishu = async () => {
+		setTestingFeishu(true);
+		setTestResult(null);
+		try {
+			const res = await api.testFeishuWebhook(feishuWebhook, feishuSecret);
+			setTestResult({ type: "feishu", ok: res.ok, error: res.error });
+		} catch (err) {
+			setTestResult({
+				type: "feishu",
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		setTestingFeishu(false);
+	};
+
+	const saveWebhookField = (field: string, value: string) => {
+		// Don't save masked values back
+		if (value.startsWith("*")) return;
+		updateUserPref.mutate({ [field]: value });
+	};
+
+	return (
+		<Paper withBorder p="md">
+			<Stack>
+				<Group gap="xs">
+					<IconBell size={20} />
+					<Title order={4}>{t("notificationSection")}</Title>
+				</Group>
+
+				{/* Trigger toggles */}
+				<Switch
+					label={t("notifyOnDone")}
+					description={t("notifyOnDoneDesc")}
+					checked={userPrefs?.notifyOnDone ?? true}
+					onChange={(e) => updateUserPref.mutate({ notifyOnDone: e.currentTarget.checked })}
+				/>
+				<Switch
+					label={t("notifyOnWaiting")}
+					description={t("notifyOnWaitingDesc")}
+					checked={userPrefs?.notifyOnWaiting ?? true}
+					onChange={(e) => updateUserPref.mutate({ notifyOnWaiting: e.currentTarget.checked })}
+				/>
+
+				{/* PWA notifications */}
+				<Stack gap="xs" mt="sm">
+					<Text size="sm" fw={600}>
+						{t("notifyPwaEnabled")}
+					</Text>
+					<Switch
+						label={t("notifyPwaEnabledDesc")}
+						checked={userPrefs?.notifyPwaEnabled ?? false}
+						onChange={(e) => updateUserPref.mutate({ notifyPwaEnabled: e.currentTarget.checked })}
+						disabled={pwaPermission === "denied"}
+					/>
+					{pwaPermission === "default" && (
+						<Button variant="light" size="xs" onClick={handleRequestPwaPermission}>
+							{t("notifyPwaRequestPermission")}
+						</Button>
+					)}
+					{pwaPermission === "granted" && (
+						<Badge color="green" variant="light" size="sm">
+							{t("notifyPwaPermissionGranted")}
+						</Badge>
+					)}
+					{pwaPermission === "denied" && (
+						<Text size="xs" c="dimmed">
+							{t("notifyPwaPermissionDenied")}
+						</Text>
+					)}
+				</Stack>
+
+				{/* Sound notifications */}
+				<Stack gap="xs" mt="sm">
+					<Text size="sm" fw={600}>
+						{t("notifySoundEnabled")}
+					</Text>
+					<Switch
+						label={t("notifySoundEnabled")}
+						checked={userPrefs?.notifySoundEnabled ?? true}
+						onChange={(e) => updateUserPref.mutate({ notifySoundEnabled: e.currentTarget.checked })}
+					/>
+					{(userPrefs?.notifySoundEnabled ?? true) && (
+						<>
+							<SegmentedControl
+								value={userPrefs?.notifySoundType ?? "builtin"}
+								onChange={(v) =>
+									updateUserPref.mutate({ notifySoundType: v as "builtin" | "custom" })
+								}
+								data={[
+									{ value: "builtin", label: t("notifySoundBuiltin") },
+									{ value: "custom", label: t("notifySoundCustom") },
+								]}
+								size="xs"
+							/>
+							{(userPrefs?.notifySoundType ?? "builtin") === "builtin" ? (
+								<Group>
+									<Select
+										data={soundOptions}
+										value={userPrefs?.notifySoundBuiltin ?? "gentle"}
+										onChange={(v) => updateUserPref.mutate({ notifySoundBuiltin: v ?? "gentle" })}
+										size="xs"
+										style={{ flex: 1 }}
+									/>
+									<Button
+										variant="subtle"
+										size="xs"
+										leftSection={<IconPlayerPlay size={14} />}
+										onClick={() => playBuiltinSound(userPrefs?.notifySoundBuiltin ?? "gentle")}
+									>
+										{t("notifySoundPreview")}
+									</Button>
+								</Group>
+							) : (
+								<Group>
+									<FileInput
+										placeholder={t("notifySoundUpload")}
+										description={t("notifySoundUploadDesc")}
+										accept="audio/mpeg,audio/wav,audio/ogg,audio/webm"
+										onChange={handleSoundUpload}
+										size="xs"
+										style={{ flex: 1 }}
+									/>
+									{userPrefs?.notifySoundFileId && (
+										<Button
+											variant="subtle"
+											size="xs"
+											leftSection={<IconPlayerPlay size={14} />}
+											onClick={() =>
+												playCustomSound(`/api/notification-sounds/${userPrefs.notifySoundFileId}`)
+											}
+										>
+											{t("notifySoundPreview")}
+										</Button>
+									)}
+								</Group>
+							)}
+						</>
+					)}
+				</Stack>
+
+				{/* DingTalk */}
+				<Stack gap="xs" mt="sm">
+					<Text size="sm" fw={600}>
+						{t("notifyDingtalkSection")}
+					</Text>
+					<Switch
+						label={t("notifyDingtalkEnabled")}
+						checked={userPrefs?.notifyDingtalkEnabled ?? false}
+						onChange={(e) =>
+							updateUserPref.mutate({ notifyDingtalkEnabled: e.currentTarget.checked })
+						}
+					/>
+					{(userPrefs?.notifyDingtalkEnabled ?? false) && (
+						<>
+							<TextInput
+								label={t("notifyDingtalkWebhook")}
+								placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."
+								value={dingtalkWebhook}
+								onChange={(e) => setDingtalkWebhook(e.currentTarget.value)}
+								onBlur={() => saveWebhookField("notifyDingtalkWebhook", dingtalkWebhook)}
+								size="xs"
+							/>
+							<PasswordInput
+								label={t("notifyDingtalkSecret")}
+								description={t("notifyDingtalkSecretDesc")}
+								placeholder="SEC..."
+								value={dingtalkSecret}
+								onChange={(e) => setDingtalkSecret(e.currentTarget.value)}
+								onBlur={() => saveWebhookField("notifyDingtalkSecret", dingtalkSecret)}
+								size="xs"
+							/>
+							<Group>
+								<Button
+									variant="light"
+									size="xs"
+									loading={testingDingtalk}
+									onClick={handleTestDingtalk}
+									disabled={!dingtalkWebhook || dingtalkWebhook.startsWith("*")}
+								>
+									{t("notifyTestConnection")}
+								</Button>
+								{testResult?.type === "dingtalk" && (
+									<Text size="xs" c={testResult.ok ? "green" : "red"}>
+										{testResult.ok
+											? t("notifyTestSuccess")
+											: t("notifyTestFailed", { error: testResult.error })}
+									</Text>
+								)}
+							</Group>
+						</>
+					)}
+				</Stack>
+
+				{/* Feishu */}
+				<Stack gap="xs" mt="sm">
+					<Text size="sm" fw={600}>
+						{t("notifyFeishuSection")}
+					</Text>
+					<Switch
+						label={t("notifyFeishuEnabled")}
+						checked={userPrefs?.notifyFeishuEnabled ?? false}
+						onChange={(e) =>
+							updateUserPref.mutate({ notifyFeishuEnabled: e.currentTarget.checked })
+						}
+					/>
+					{(userPrefs?.notifyFeishuEnabled ?? false) && (
+						<>
+							<TextInput
+								label={t("notifyFeishuWebhook")}
+								placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+								value={feishuWebhook}
+								onChange={(e) => setFeishuWebhook(e.currentTarget.value)}
+								onBlur={() => saveWebhookField("notifyFeishuWebhook", feishuWebhook)}
+								size="xs"
+							/>
+							<PasswordInput
+								label={t("notifyFeishuSecret")}
+								description={t("notifyFeishuSecretDesc")}
+								value={feishuSecret}
+								onChange={(e) => setFeishuSecret(e.currentTarget.value)}
+								onBlur={() => saveWebhookField("notifyFeishuSecret", feishuSecret)}
+								size="xs"
+							/>
+							<Group>
+								<Button
+									variant="light"
+									size="xs"
+									loading={testingFeishu}
+									onClick={handleTestFeishu}
+									disabled={!feishuWebhook || feishuWebhook.startsWith("*")}
+								>
+									{t("notifyTestConnection")}
+								</Button>
+								{testResult?.type === "feishu" && (
+									<Text size="xs" c={testResult.ok ? "green" : "red"}>
+										{testResult.ok
+											? t("notifyTestSuccess")
+											: t("notifyTestFailed", { error: testResult.error })}
+									</Text>
+								)}
+							</Group>
+						</>
+					)}
+				</Stack>
+			</Stack>
+		</Paper>
 	);
 }

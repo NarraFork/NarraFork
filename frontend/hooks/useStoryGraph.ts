@@ -91,6 +91,7 @@ export function useStoryGraph(projectId: string) {
 		queryKey: ["storyGraph", projectId],
 		queryFn: () => api.getProjectGraph(projectId),
 		enabled: !!projectId,
+		refetchInterval: 30_000, // Refresh every 30s to pick up git changes
 	});
 
 	const layoutData = useMemo(() => {

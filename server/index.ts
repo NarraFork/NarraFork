@@ -1,8 +1,12 @@
 import { existsSync } from "node:fs";
 import { extname, resolve } from "node:path";
 
+import { eq } from "drizzle-orm";
+
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
+import { db } from "./db";
+import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import {
 import { logger } from "./lib/logger";
@@ -10,7 +14,9 @@ import { settings } from "./lib/settings";
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
+import "./services/notification-service"; // Register notification event listeners
 import { terminalService } from "./services/terminal-service";
+import { worktreeWatcher } from "./services/worktree-watcher";
 import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./websocket/ws-handler";
 
 // Catch unhandled errors to prevent silent crashes
@@ -153,20 +159,30 @@ const _server = Bun.serve({
 
 		// WebSocket upgrade for /ws/narrator and /ws/terminal
 		if (url.pathname.startsWith("/ws")) {
-			const wsData = resolveWSData(url);
-			if (!wsData) {
-				return new Response("Unknown WebSocket endpoint", { status: 404 });
-			}
-
 			// Verify JWT from query param
 			const token = url.searchParams.get("token");
 			if (!token) {
 				return new Response("Authentication required", { status: 401 });
 			}
+			let payload: Awaited<ReturnType<typeof verifyToken>>;
 			try {
-				await verifyToken(token);
+				payload = await verifyToken(token);
 			} catch {
 				return new Response("Invalid or expired token", { status: 401 });
+			}
+
+			// Look up user info for presence tracking
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, payload.sub),
+				columns: { id: true, username: true, avatarColor: true },
+			});
+			const userInfo = user
+				? { userId: user.id, username: user.username, avatarColor: user.avatarColor }
+				: undefined;
+
+			const wsData = resolveWSData(url, userInfo);
+			if (!wsData) {
+				return new Response("Unknown WebSocket endpoint", { status: 404 });
 			}
 
 			const upgraded = server.upgrade(req, { data: wsData });
@@ -219,6 +235,7 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 const shutdown = () => {
 	stopHeartbeat();
 	chapterCleanup.clearAllTimers();
+	worktreeWatcher.shutdown();
 	process.exit(0);
 };
 process.on("SIGINT", shutdown);

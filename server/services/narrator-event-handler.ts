@@ -7,7 +7,12 @@ import type { AgentEvent } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { narratorService } from "./narrator-service";
+import {
+	enrichToolUseBlocks,
+	narratorService,
+	truncateJson,
+	truncateToolIO,
+} from "./narrator-service";
 
 // === Context types ===
 
@@ -228,11 +233,17 @@ export async function processEvent(
 				with: { toolCalls: true },
 			});
 
+			// Apply the same truncation and enrichment as the HTTP API so WS and REST
+			// clients receive identically shaped messages.
+			const processed = fullMessage
+				? enrichToolUseBlocks(truncateToolIO([fullMessage]))[0]
+				: fullMessage;
+
 			// Subagent: attach model info
 			const broadcastMessage =
-				ctx.subagentModel && fullMessage
-					? { ...fullMessage, subagentModel: ctx.subagentModel }
-					: fullMessage;
+				ctx.subagentModel && processed
+					? { ...processed, subagentModel: ctx.subagentModel }
+					: processed;
 
 			broadcastToNarrator(broadcastTargetId, {
 				type: "message",
@@ -283,7 +294,7 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
 				status,
-				output: event.output,
+				output: truncateJson(event.output, 2000),
 				durationMs: event.durationMs,
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
 			});

@@ -113,6 +113,25 @@ export const api = {
 		request<ApiEntity>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	updateAdminSettings: (data: { registrationOpen: boolean }) =>
 		request<ApiEntity>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
+	listAdminTerminals: () =>
+		request<{
+			terminals: ApiEntity[];
+			orphanSockets: { socketPath: string; terminalId: string }[];
+		}>("/admin/terminals"),
+	killAdminTerminal: (id: string) =>
+		request<ApiEntity>(`/admin/terminals/${id}`, { method: "DELETE" }),
+	killOrphanSocket: (terminalId: string) =>
+		request<ApiEntity>("/admin/terminals/kill-orphan", {
+			method: "POST",
+			body: JSON.stringify({ terminalId }),
+		}),
+	reattachTerminal: (id: string) =>
+		request<ApiEntity>(`/admin/terminals/${id}/reattach`, { method: "POST" }),
+	reattachOrphan: (terminalId: string) =>
+		request<ApiEntity>("/admin/terminals/reattach-orphan", {
+			method: "POST",
+			body: JSON.stringify({ terminalId }),
+		}),
 
 	// Projects
 	listProjects: (status?: string) =>
@@ -157,16 +176,19 @@ export const api = {
 		return request<ApiEntity[]>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	listNarratorsPaginated: (opts?: {
-		standalone?: boolean;
+		standalone?: boolean | "all";
 		status?: string;
+		filter?: string;
 		sortBy?: string;
 		sortOrder?: string;
 		limit?: number;
 		cursor?: string;
 	}) => {
 		const params = new URLSearchParams();
-		if (opts?.standalone) params.set("standalone", "true");
+		if (opts?.standalone === "all") params.set("standalone", "all");
+		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
+		if (opts?.filter) params.set("filter", opts.filter);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
 		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
 		if (opts?.limit) params.set("limit", String(opts.limit));
@@ -332,6 +354,11 @@ export const api = {
 	}) => request<ApiEntity>("/terminals", { method: "POST", body: JSON.stringify(data) }),
 	getTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`),
 	deleteTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`, { method: "DELETE" }),
+	renameTerminal: (id: string, name: string) =>
+		request<ApiEntity>(`/terminals/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify({ name }),
+		}),
 
 	// Terminal Tabs
 	listTerminalTabs: (opts: { chapterId?: string; narratorId?: string }) => {
@@ -414,6 +441,20 @@ export const api = {
 			showTokenUsage: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
+			// Notification preferences
+			notifyOnDone: boolean;
+			notifyOnWaiting: boolean;
+			notifyPwaEnabled: boolean;
+			notifySoundEnabled: boolean;
+			notifySoundType: "builtin" | "custom";
+			notifySoundBuiltin: string;
+			notifySoundFileId: string | null;
+			notifyDingtalkEnabled: boolean;
+			notifyDingtalkWebhook: string;
+			notifyDingtalkSecret: string;
+			notifyFeishuEnabled: boolean;
+			notifyFeishuWebhook: string;
+			notifyFeishuSecret: string;
 			recentTabs: Array<{
 				type: "chapter" | "session";
 				id: string;
@@ -434,10 +475,55 @@ export const api = {
 		showTokenUsage?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
+		// Notification preferences
+		notifyOnDone?: boolean;
+		notifyOnWaiting?: boolean;
+		notifyPwaEnabled?: boolean;
+		notifySoundEnabled?: boolean;
+		notifySoundType?: "builtin" | "custom";
+		notifySoundBuiltin?: string;
+		notifySoundFileId?: string | null;
+		notifyDingtalkEnabled?: boolean;
+		notifyDingtalkWebhook?: string;
+		notifyDingtalkSecret?: string;
+		notifyFeishuEnabled?: boolean;
+		notifyFeishuWebhook?: string;
+		notifyFeishuSecret?: string;
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",
 			body: JSON.stringify(data),
+		}),
+
+	// Notification sounds
+	uploadNotificationSound: async (file: File) => {
+		const formData = new FormData();
+		formData.append("file", file);
+		const token = getToken();
+		const headers: Record<string, string> = {};
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const res = await fetch(`${BASE}/notification-sounds`, {
+			method: "POST",
+			headers,
+			body: formData,
+		});
+		if (!res.ok) {
+			const err = await res.json().catch(() => ({ error: "Upload failed" }));
+			throw new ApiError(err.error ?? "Upload failed", res.status);
+		}
+		return res.json() as Promise<{ id: string; filename: string; mediaType: string }>;
+	},
+	deleteNotificationSound: (id: string) =>
+		request<{ ok: boolean }>(`/notification-sounds/${id}`, { method: "DELETE" }),
+	testDingtalkWebhook: (webhook: string, secret?: string) =>
+		request<{ ok: boolean; error?: string }>("/notifications/test-dingtalk", {
+			method: "POST",
+			body: JSON.stringify({ webhook, secret }),
+		}),
+	testFeishuWebhook: (webhook: string, secret?: string) =>
+		request<{ ok: boolean; error?: string }>("/notifications/test-feishu", {
+			method: "POST",
+			body: JSON.stringify({ webhook, secret }),
 		}),
 
 	// Recent Tabs
@@ -469,6 +555,13 @@ export const api = {
 		}),
 
 	// Containers
+	getPodmanStatus: () =>
+		request<{ installed: boolean; version?: string; platform: string }>("/chapters/podman/status"),
+	installPodman: () =>
+		request<{ ok: boolean; installed?: boolean; version?: string; error?: string }>(
+			"/chapters/podman/install",
+			{ method: "POST" },
+		),
 	getContainers: (chapterId: string) => request<ApiEntity[]>(`/chapters/${chapterId}/containers`),
 	startContainers: (chapterId: string) =>
 		request<ApiEntity>(`/chapters/${chapterId}/containers/start`, { method: "POST" }),
@@ -617,6 +710,51 @@ export const api = {
 			linesAdded: number;
 			linesRemoved: number;
 		}>(`/chapters/${id}/git-status`),
+
+	// === git operations ===
+	getGitStatus: (chapterId: string) => request<ApiEntity>(`/chapters/${chapterId}/git/status`),
+	gitStage: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
+		request<ApiEntity>(`/chapters/${chapterId}/git/stage`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	gitUnstage: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
+		request<ApiEntity>(`/chapters/${chapterId}/git/unstage`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	gitCommit: (chapterId: string, message: string) =>
+		request<ApiEntity>(`/chapters/${chapterId}/git/commit`, {
+			method: "POST",
+			body: JSON.stringify({ message }),
+		}),
+	gitDiscard: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
+		request<ApiEntity>(`/chapters/${chapterId}/git/discard`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	getGitDiff: (chapterId: string, file: string, staged = false) =>
+		request<ApiEntity>(
+			`/chapters/${chapterId}/git/diff?file=${encodeURIComponent(file)}&staged=${staged}`,
+		),
+	getGitStashList: (chapterId: string) =>
+		request<ApiEntity[]>(`/chapters/${chapterId}/git/stash/list`),
+	gitStash: (chapterId: string, body: { action: string; message?: string; index?: number }) =>
+		request<ApiEntity>(`/chapters/${chapterId}/git/stash`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	getGitLog: (chapterId: string, limit = 50, skip = 0) =>
+		request<ApiEntity[]>(`/chapters/${chapterId}/git/log?limit=${limit}&skip=${skip}`),
+	gitReset: (chapterId: string, target: string, mode: "soft" | "hard") =>
+		request<ApiEntity>(`/chapters/${chapterId}/git/reset`, {
+			method: "POST",
+			body: JSON.stringify({ target, mode }),
+		}),
+	gitAiCommitMessage: (chapterId: string) =>
+		request<{ message: string }>(`/chapters/${chapterId}/git/ai-commit-message`, {
+			method: "POST",
+		}),
 
 	// === chapter split ===
 	splitChapter: (

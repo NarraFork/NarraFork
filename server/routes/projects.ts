@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -36,6 +37,13 @@ projectRoutes.post("/", async (c) => {
 	const projectId = generateId();
 
 	let gitPath = body.gitPath?.trim() || null;
+	if (gitPath) {
+		// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
+		if (gitPath.startsWith("~/") || gitPath === "~") {
+			gitPath = gitPath.replace("~", process.env.HOME ?? "/root");
+		}
+		gitPath = resolve(gitPath);
+	}
 	let remoteUrl: string | null = null;
 	let defaultBranch = body.defaultBranch ?? "main";
 	const mode = body.repoMode;

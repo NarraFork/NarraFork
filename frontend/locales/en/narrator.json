@@ -98,10 +98,19 @@
 	"chapterBar.noContainersRunning": "No containers running",
 	"chapterBar.startContainers": "Start Containers",
 	"chapterBar.stopContainers": "Stop Containers",
+	"chapterBar.pauseContainers": "Pause Containers",
+	"chapterBar.resumeContainers": "Resume Containers",
+	"chapterBar.removeContainers": "Remove Containers",
+	"chapterBar.configureContainers": "Configure Containers",
+	"chapterBar.editContainerConfig": "Edit Config",
 	"chapterBar.viewLogs": "View Logs",
 	"chapterBar.settings": "Chapter Settings",
 	"chapterBar.setRole": "Set Role",
 	"chapterBar.openInGraph": "Open in Graph",
 	"chapterBar.commitsAhead": "{{count}} commits ahead of {{base}}",
-	"chapterBar.uncommittedLines": "Uncommitted changes"
+	"chapterBar.uncommittedLines": "Uncommitted changes",
+	"autoCommit.reminderTitle": "Commit Reminder",
+	"autoCommit.reminderBody": "{{filesChanged}} files changed (+{{linesAdded}} / -{{linesRemoved}} lines). Please commit soon.",
+	"autoCommit.forceCommitTitle": "Auto-Committed",
+	"autoCommit.forceCommitBody": "Changes exceeded threshold — auto-committed as {{commitSha}}: {{message}}"
 }

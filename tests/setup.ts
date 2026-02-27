@@ -33,12 +33,24 @@ CREATE TABLE IF NOT EXISTS projects (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS exploration_groups (
+	id TEXT PRIMARY KEY,
+	project_id TEXT NOT NULL REFERENCES projects(id),
+	title TEXT NOT NULL,
+	description TEXT,
+	base_chapter_id TEXT,
+	status TEXT NOT NULL DEFAULT 'active',
+	decided_chapter_id TEXT,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS chapters (
 	id TEXT PRIMARY KEY,
 	project_id TEXT NOT NULL REFERENCES projects(id),
 	title TEXT NOT NULL,
 	description TEXT,
 	status TEXT NOT NULL DEFAULT 'active',
+	role TEXT NOT NULL DEFAULT 'branch',
 	branch TEXT NOT NULL,
 	worktree_path TEXT,
 	base_branch TEXT NOT NULL,
@@ -48,6 +60,16 @@ CREATE TABLE IF NOT EXISTS chapters (
 	merge_commit_sha TEXT,
 	merge_strategy TEXT,
 	container_config TEXT,
+	exploration_group_id TEXT REFERENCES exploration_groups(id),
+	is_root INTEGER DEFAULT 0,
+	head_commit_sha TEXT,
+	start_commit_sha TEXT,
+	commit_count INTEGER DEFAULT 0,
+	color TEXT,
+	group_label TEXT,
+	pinned INTEGER DEFAULT 0,
+	position_x REAL,
+	position_y REAL,
 	last_accessed_at TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL

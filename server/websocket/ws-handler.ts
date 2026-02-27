@@ -18,13 +18,19 @@ export type WSData =
  * Determine channel from the upgrade URL path and build initial WSData.
  * Returns null if the path doesn't match any known WS endpoint.
  */
-export function resolveWSData(url: URL): WSData | null {
+export function resolveWSData(
+	url: URL,
+	userInfo?: { userId: string; username: string; avatarColor: string | null },
+): WSData | null {
 	if (url.pathname === "/ws/narrator" || url.pathname.startsWith("/ws/narrator?")) {
 		return {
 			channel: "narrator",
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedNarrators: new Set(),
+			userId: userInfo?.userId,
+			username: userInfo?.username,
+			avatarColor: userInfo?.avatarColor,
 		};
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {

@@ -11,6 +11,7 @@ import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { terminalService } from "./terminal-service";
+import { worktreeWatcher } from "./worktree-watcher";
 
 export interface CleanupReport {
 	cleaned: string[];
@@ -80,7 +81,10 @@ export const chapterCleanup = {
 				}
 			}
 
-			// Step 4: Remove worktree BEFORE updating DB
+			// Step 4: Stop file watcher before removing worktree
+			worktreeWatcher.unwatchAll(chapter.worktreePath);
+
+			// Step 5: Remove worktree BEFORE updating DB
 			// This ensures we don't lose the worktreePath reference if removal fails
 			try {
 				await gitService.removeWorktree(gitPath, chapter.worktreePath);
@@ -95,7 +99,7 @@ export const chapterCleanup = {
 				});
 			}
 
-			// Step 5: Update DB — external resources already cleaned
+			// Step 6: Update DB — external resources already cleaned
 			const now = new Date().toISOString();
 			await db
 				.update(chapters)

@@ -16,7 +16,7 @@ import { logger } from "../lib/logger";
  * Find PIDs whose command line contains `searchArg`.
  * Uses `pgrep -f` which works on both Linux and macOS.
  */
-function findProcessesByArg(searchArg: string): number[] {
+export function findProcessesByArg(searchArg: string): number[] {
 	const pids: number[] = [];
 	try {
 		const result = execSync(`pgrep -f "${searchArg}"`, {
@@ -37,7 +37,7 @@ function findProcessesByArg(searchArg: string): number[] {
  * Get child PIDs recursively.
  * Uses POSIX-compatible `ps -o pid=,ppid=` which works on both Linux and macOS (BSD ps).
  */
-function getDescendantPids(pid: number): number[] {
+export function getDescendantPids(pid: number): number[] {
 	const descendants: number[] = [];
 	try {
 		// POSIX-compatible: list all processes with pid and ppid columns

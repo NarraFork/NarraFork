@@ -57,3 +57,14 @@ export function useUnpauseContainers() {
 		},
 	});
 }
+
+export function useRemoveContainers() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ chapterId, deleteVolumes }: { chapterId: string; deleteVolumes?: boolean }) =>
+			api.removeContainers(chapterId, { deleteVolumes }),
+		onSuccess: (_, { chapterId }) => {
+			qc.invalidateQueries({ queryKey: ["containers", chapterId] });
+		},
+	});
+}

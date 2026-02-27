@@ -277,6 +277,8 @@ export const narratorMessageRefs = sqliteTable(
 			.references(() => narratorMessages.id),
 		seq: integer("seq").notNull(),
 		isCompact: integer("is_compact").notNull().default(0),
+		/** Pruned percent at the time this message was sent (inherited on fork) */
+		prunedPercent: integer("pruned_percent"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
@@ -430,6 +432,26 @@ export const userPreferences = sqliteTable("user_preferences", {
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	// Notification preferences
+	notifyOnDone: integer("notify_on_done", { mode: "boolean" }).notNull().default(true),
+	notifyOnWaiting: integer("notify_on_waiting", { mode: "boolean" }).notNull().default(true),
+	notifyPwaEnabled: integer("notify_pwa_enabled", { mode: "boolean" }).notNull().default(false),
+	notifySoundEnabled: integer("notify_sound_enabled", { mode: "boolean" }).notNull().default(true),
+	notifySoundType: text("notify_sound_type", { enum: ["builtin", "custom"] })
+		.notNull()
+		.default("builtin"),
+	notifySoundBuiltin: text("notify_sound_builtin").notNull().default("gentle"),
+	notifySoundFileId: text("notify_sound_file_id"),
+	notifyDingtalkEnabled: integer("notify_dingtalk_enabled", { mode: "boolean" })
+		.notNull()
+		.default(false),
+	notifyDingtalkWebhook: text("notify_dingtalk_webhook").notNull().default(""),
+	notifyDingtalkSecret: text("notify_dingtalk_secret").notNull().default(""),
+	notifyFeishuEnabled: integer("notify_feishu_enabled", { mode: "boolean" })
+		.notNull()
+		.default(false),
+	notifyFeishuWebhook: text("notify_feishu_webhook").notNull().default(""),
+	notifyFeishuSecret: text("notify_feishu_secret").notNull().default(""),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -442,6 +464,7 @@ export const users = sqliteTable("users", {
 	role: text("role", { enum: ["admin", "user"] })
 		.notNull()
 		.default("user"),
+	avatarColor: text("avatar_color"),
 	createdAt: text("created_at").notNull(),
 });
 

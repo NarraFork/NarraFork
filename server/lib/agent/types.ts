@@ -171,4 +171,11 @@ export interface AgentConfig {
 		history: unknown[];
 		pendingToolResults: unknown[];
 	} | null>;
+	/**
+	 * Called after tool execution to check if external code (e.g. onExitPlanMode)
+	 * wants to inject text into the next user turn alongside tool results.
+	 * The returned string is used as the user-text portion of pushUserTurn.
+	 * Consumed once per call (caller should clear after returning).
+	 */
+	getInjectedUserText?: () => string | null;
 }

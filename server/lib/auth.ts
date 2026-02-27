@@ -9,6 +9,26 @@ import { settings } from "./settings";
 const JWT_SECRET = settings.auth.jwtSecret;
 const TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
+// Mantine-friendly avatar color palette
+const AVATAR_COLORS = [
+	"#4C6EF5", // indigo
+	"#7950F2", // violet
+	"#BE4BDB", // grape
+	"#E64980", // pink
+	"#FA5252", // red
+	"#FD7E14", // orange
+	"#FAB005", // yellow
+	"#40C057", // green
+	"#12B886", // teal
+	"#15AABF", // cyan
+	"#228BE6", // blue
+	"#845EF7", // violet-light
+];
+
+function randomAvatarColor(): string {
+	return AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
+}
+
 export interface JwtPayload {
 	sub: string;
 	role: "admin" | "user";
@@ -48,14 +68,17 @@ export async function registerUser(username: string, password: string, language?
 	});
 	const now = new Date().toISOString();
 
+	const avatarColor = randomAvatarColor();
+
 	const [user] = await db.transaction(async (tx) => {
 		const [created] = await tx
 			.insert(users)
-			.values({ id, username, passwordHash, role, createdAt: now })
+			.values({ id, username, passwordHash, role, avatarColor, createdAt: now })
 			.returning({
 				id: users.id,
 				username: users.username,
 				role: users.role,
+				avatarColor: users.avatarColor,
 				createdAt: users.createdAt,
 			});
 
@@ -64,6 +87,8 @@ export async function registerUser(username: string, password: string, language?
 			id: generateId(),
 			userId: created.id,
 			language: resolvedLang,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
 		});
 
 		return [created];
@@ -98,6 +123,7 @@ export async function loginUser(username: string, password: string) {
 			id: user.id,
 			username: user.username,
 			role: user.role,
+			avatarColor: user.avatarColor,
 			createdAt: user.createdAt,
 		},
 		token,

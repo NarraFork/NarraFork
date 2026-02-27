@@ -47,6 +47,17 @@ terminalRoutes.get("/:id", async (c) => {
 	return c.json(terminal);
 });
 
+terminalRoutes.patch("/:id", async (c) => {
+	const body = await c.req.json();
+	const name = body?.name;
+	if (typeof name !== "string" || !name.trim()) {
+		throw new ValidationError("name is required");
+	}
+	await terminalService.rename(c.req.param("id"), name.trim());
+	const terminal = await terminalService.getById(c.req.param("id"));
+	return c.json(terminal);
+});
+
 terminalRoutes.delete("/:id", async (c) => {
 	await terminalService.kill(c.req.param("id"));
 	return c.json({ ok: true });
@@ -99,7 +110,7 @@ terminalRoutes.put("/tabs/reorder", async (c) => {
 // === Terminal View State ===
 
 terminalRoutes.get("/view-state", requireAuth, async (c) => {
-	const userId = c.get("userId" as never) as string;
+	const userId = c.get("user").sub;
 	const chapterId = c.req.query("chapterId");
 	const narratorId = c.req.query("narratorId");
 	const state = await terminalViewService.get(userId, {
@@ -110,7 +121,7 @@ terminalRoutes.get("/view-state", requireAuth, async (c) => {
 });
 
 terminalRoutes.put("/view-state", requireAuth, async (c) => {
-	const userId = c.get("userId" as never) as string;
+	const userId = c.get("user").sub;
 	const body = await c.req.json();
 	const parsed = updateTerminalViewStateSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);

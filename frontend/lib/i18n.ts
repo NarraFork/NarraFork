@@ -3,6 +3,7 @@ import enCommon from "@frontend/locales/en/common.json";
 import enContainers from "@frontend/locales/en/containers.json";
 import enDashboard from "@frontend/locales/en/dashboard.json";
 import enExplorations from "@frontend/locales/en/explorations.json";
+import enGit from "@frontend/locales/en/git.json";
 import enGraph from "@frontend/locales/en/graph.json";
 import enNarrator from "@frontend/locales/en/narrator.json";
 import enNav from "@frontend/locales/en/nav.json";
@@ -16,6 +17,7 @@ import zhCommon from "@frontend/locales/zh-CN/common.json";
 import zhContainers from "@frontend/locales/zh-CN/containers.json";
 import zhDashboard from "@frontend/locales/zh-CN/dashboard.json";
 import zhExplorations from "@frontend/locales/zh-CN/explorations.json";
+import zhGit from "@frontend/locales/zh-CN/git.json";
 import zhGraph from "@frontend/locales/zh-CN/graph.json";
 import zhNarrator from "@frontend/locales/zh-CN/narrator.json";
 import zhNav from "@frontend/locales/zh-CN/nav.json";
@@ -34,6 +36,7 @@ const ns = [
 	"containers",
 	"dashboard",
 	"explorations",
+	"git",
 	"graph",
 	"narrator",
 	"nav",
@@ -55,6 +58,7 @@ i18n
 				containers: enContainers,
 				dashboard: enDashboard,
 				explorations: enExplorations,
+				git: enGit,
 				graph: enGraph,
 				narrator: enNarrator,
 				nav: enNav,
@@ -70,6 +74,7 @@ i18n
 				containers: zhContainers,
 				dashboard: zhDashboard,
 				explorations: zhExplorations,
+				git: zhGit,
 				graph: zhGraph,
 				narrator: zhNarrator,
 				nav: zhNav,

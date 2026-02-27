@@ -3,7 +3,10 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { chapterEdges, chapters, explorationGroups } from "../db/schema";
 import { ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { updateGraphPositionsSchema } from "../lib/validators";
+import { commitSyncService } from "../services/commit-sync-service";
+import { gitService } from "../services/git-service";
 
 export interface GraphNode {
 	id: string;
@@ -49,6 +52,7 @@ export function buildGraph(
 		positionY: number | null;
 		commitCount: number | null;
 		headCommitSha: string | null;
+		worktreePath?: string | null;
 	}[],
 	narratorCounts: Map<string, number>,
 	containerPresence: Set<string>,
@@ -117,8 +121,47 @@ graphRoutes.get("/:id/graph", async (c) => {
 			createdAt: true,
 			commitCount: true,
 			headCommitSha: true,
+			worktreePath: true,
 		},
 	});
+
+	// Refresh git info for active chapters with worktrees (lightweight, parallel)
+	const activeChapters = projectChapters.filter((ch) => ch.status === "active" && ch.worktreePath);
+	if (activeChapters.length > 0) {
+		const refreshResults = await Promise.allSettled(
+			activeChapters.map(async (ch) => {
+				const cwd = ch.worktreePath;
+				if (!cwd) return;
+				try {
+					const liveHead = await gitService.getHeadCommit(cwd);
+					if (liveHead && liveHead !== ch.headCommitSha) {
+						// HEAD changed — sync commits and update cache
+						const newCount = await commitSyncService.syncChapterCommits(ch.id);
+						if (newCount > 0 || liveHead !== ch.headCommitSha) {
+							// Re-read updated values from DB
+							const updated = await db.query.chapters.findFirst({
+								where: eq(chapters.id, ch.id),
+								columns: { commitCount: true, headCommitSha: true },
+							});
+							if (updated) {
+								ch.commitCount = updated.commitCount;
+								ch.headCommitSha = updated.headCommitSha;
+							}
+						}
+					}
+				} catch {
+					// Non-fatal — use cached values
+				}
+			}),
+		);
+		const failures = refreshResults.filter((r) => r.status === "rejected");
+		if (failures.length > 0) {
+			logger.debug("Some graph git refreshes failed", {
+				projectId,
+				failCount: failures.length,
+			});
+		}
+	}
 
 	// Get narrator counts and container presence per chapter
 	const chapterIds = projectChapters.map((ch) => ch.id);

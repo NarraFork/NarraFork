@@ -1,7 +1,7 @@
 {
-	"title": "Standalone Sessions",
+	"title": "Sessions",
 	"newSession": "New Session",
-	"noSessions": "No standalone sessions. Create one to start a conversation without a chapter.",
+	"noSessions": "No sessions found. Create one to start a conversation.",
 	"sessionId": "Session {{id}}",
 	"sessionMeta": "{{model}} · {{count}} messages",
 	"newSessionModal": "New Standalone Session",
@@ -33,5 +33,12 @@
 	"sortAscending": "Ascending",
 	"loadingMore": "Loading more...",
 	"sessionUnloaded": "Session paused — tab was inactive",
-	"sessionUnloadedHint": "The connection was released to save resources. It will restore automatically."
+	"sessionUnloadedHint": "The connection was released to save resources. It will restore automatically.",
+	"filterAll": "All",
+	"filterStandalone": "Standalone",
+	"filterChapter": "Chapter",
+	"chapterLabel": "Chapter: {{title}}",
+	"projectLabel": "Project: {{name}}",
+	"activeTerminals": "{{count}} terminal(s)",
+	"viewingNow": "Viewing now"
 }

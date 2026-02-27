@@ -215,9 +215,8 @@ const ALWAYS_ASK_COMMANDS = new Set([
 	"scp",
 	"rsync",
 	// 容器（可挂载宿主文件系统）
-	"docker",
-	"docker-compose",
 	"podman",
+	"podman-compose",
 	"kubectl",
 	// 间接命令执行
 	// xargs 移至 CONDITIONAL_COMMANDS 进行递归分析

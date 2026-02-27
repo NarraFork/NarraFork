@@ -1,3 +1,4 @@
+import { useResizableNav } from "@frontend/hooks/useResizableNav";
 import {
 	ActionIcon,
 	AppShell,
@@ -26,7 +27,7 @@ import {
 	useNavigate,
 	useRouterState,
 } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
@@ -67,6 +68,42 @@ function AuthenticatedLayout() {
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const { width: navWidth, onDragStart: onNavDragStart } = useResizableNav();
+
+	// --- Mobile navbar back-button interception ---
+	// Push a sentinel history entry when the navbar opens so that the browser
+	// back button closes the navbar instead of navigating away.
+	// Uses a ref to track whether the sentinel was consumed by popstate (back
+	// button) vs still on the stack (closed by tap / NavLink navigation).
+	const sentinelOnStack = useRef(false);
+
+	useEffect(() => {
+		if (!opened) return;
+		sentinelOnStack.current = true;
+		history.pushState({ mobileNav: true }, "");
+
+		const onPop = () => {
+			sentinelOnStack.current = false;
+			closeNav();
+		};
+		window.addEventListener("popstate", onPop);
+		return () => {
+			window.removeEventListener("popstate", onPop);
+			// Navbar closed by means other than back button — pop sentinel
+			if (sentinelOnStack.current) {
+				sentinelOnStack.current = false;
+				history.back();
+			}
+		};
+	}, [opened, closeNav]);
+
+	// Close navbar for navigation: consume the sentinel flag so the cleanup
+	// won't history.back() and clobber the Link's navigation. The sentinel
+	// entry stays buried in the stack (harmless, same URL).
+	const closeNavForLink = useCallback(() => {
+		sentinelOnStack.current = false;
+		closeNav();
+	}, [closeNav]);
 
 	// Sync language from backend preference on login / app init
 	useEffect(() => {
@@ -145,7 +182,7 @@ function AuthenticatedLayout() {
 	return (
 		<AppShell
 			header={{ height: 60 }}
-			navbar={{ width: 250, breakpoint: "sm", collapsed: { mobile: !opened } }}
+			navbar={{ width: navWidth, breakpoint: "sm", collapsed: { mobile: !opened } }}
 			padding="md"
 		>
 			<WSConnectionAlert />
@@ -216,13 +253,27 @@ function AuthenticatedLayout() {
 
 			<AppShell.Navbar p="md" style={{ display: "flex", flexDirection: "column" }}>
 				<RecentTabsWSProvider />
+				{/* Drag handle for resizing navbar */}
+				<Box
+					visibleFrom="sm"
+					onMouseDown={onNavDragStart}
+					style={{
+						position: "absolute",
+						top: 0,
+						right: -3,
+						width: 6,
+						height: "100%",
+						cursor: "col-resize",
+						zIndex: 100,
+					}}
+				/>
 				<Box>
-					<NavLink component={Link} to="/" label={t("dashboard")} onClick={closeNav} />
+					<NavLink component={Link} to="/" label={t("dashboard")} onClick={closeNavForLink} />
 					<NavLink
 						component={Link}
 						to="/projects"
 						label={t("projects")}
-						onClick={closeNav}
+						onClick={closeNavForLink}
 						styles={
 							firstProjectTabActive
 								? {
@@ -255,14 +306,14 @@ function AuthenticatedLayout() {
 					/>
 				</Box>
 				<Box style={{ overflow: "auto", minHeight: 0 }}>
-					<RecentTabList filter="project" onNavigate={closeNav} firstTabConnected />
+					<RecentTabList filter="project" onNavigate={closeNavForLink} firstTabConnected />
 				</Box>
 				<Box>
 					<NavLink
 						component={Link}
 						to="/sessions"
 						label={t("sessions")}
-						onClick={closeNav}
+						onClick={closeNavForLink}
 						styles={
 							firstSessionTabActive
 								? {
@@ -295,13 +346,18 @@ function AuthenticatedLayout() {
 					/>
 				</Box>
 				<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-					<RecentTabList filter="session" onNavigate={closeNav} firstTabConnected />
+					<RecentTabList filter="session" onNavigate={closeNavForLink} firstTabConnected />
 				</Box>
 				<Box>
 					{user?.role === "admin" && (
-						<NavLink component={Link} to="/admin" label={t("admin")} onClick={closeNav} />
+						<NavLink component={Link} to="/admin" label={t("admin")} onClick={closeNavForLink} />
 					)}
-					<NavLink component={Link} to="/settings" label={t("settings")} onClick={closeNav} />
+					<NavLink
+						component={Link}
+						to="/settings"
+						label={t("settings")}
+						onClick={closeNavForLink}
+					/>
 				</Box>
 				<NavLink
 					label={t("logout")}

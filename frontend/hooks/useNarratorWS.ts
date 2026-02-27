@@ -1,20 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PendingPermission } from "../components/narrator/ToolCallCard";
 import type { TreeMessage } from "../lib/api";
 import { getToken } from "../lib/api";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 interface NarratorWSCallbacks {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	onMessage?: (data: any) => void;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	onUserMessage?: (data: any) => void;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	onStreamEvent?: (data: any) => void;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	onPermissionRequest?: (request: any) => void;
+	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
+	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
+	onStreamEvent?: (data: { event?: Record<string, unknown>; [key: string]: unknown }) => void;
+	onPermissionRequest?: (request: PendingPermission) => void;
 	onPermissionResolved?: (requestId: string, toolUseId?: string) => void;
 	onStatusChange?: (status: string) => void;
-	onToolProgress?: (toolUseId: string, elapsed: number) => void;
 	onToolStarted?: (toolUseId: string, toolName: string, streamStartedAt?: number) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
@@ -32,8 +28,10 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 	) => void;
 	onTitleUpdated?: (title: string) => void;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	onTodosUpdated?: (todos: any[], toolUseId?: string) => void;
+	onTodosUpdated?: (
+		todos: { id?: string; content?: string; status?: string }[],
+		toolUseId?: string,
+	) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "session_error") => void;
 	onPlanModeChanged?: (planMode: boolean) => void;
@@ -48,11 +46,26 @@ interface NarratorWSCallbacks {
 		linesAdded: number;
 		linesRemoved: number;
 	}) => void;
+	onCommitReminder?: (data: {
+		chapterId: string;
+		linesAdded: number;
+		linesRemoved: number;
+		filesChanged: number;
+	}) => void;
+	onForceCommitDone?: (data: {
+		chapterId: string;
+		commitSha: string;
+		message: string;
+		linesAdded: number;
+		linesRemoved: number;
+		filesChanged: number;
+	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onNarratorError?: (error: string) => void;
 	onNarratorWarning?: (message: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
+	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -164,9 +177,6 @@ export function useNarratorWS(
 						case "narrator:status_changed":
 							callbacksRef.current.onStatusChange?.(data.status);
 							break;
-						case "tool_progress":
-							callbacksRef.current.onToolProgress?.(data.toolUseId, data.elapsed);
-							break;
 						case "tool_started":
 							callbacksRef.current.onToolStarted?.(
 								data.toolUseId,
@@ -238,6 +248,28 @@ export function useNarratorWS(
 								});
 							}
 							break;
+						case "commit_reminder":
+							if (data.chapterId) {
+								callbacksRef.current.onCommitReminder?.({
+									chapterId: data.chapterId,
+									linesAdded: data.linesAdded ?? 0,
+									linesRemoved: data.linesRemoved ?? 0,
+									filesChanged: data.filesChanged ?? 0,
+								});
+							}
+							break;
+						case "force_commit_done":
+							if (data.chapterId) {
+								callbacksRef.current.onForceCommitDone?.({
+									chapterId: data.chapterId,
+									commitSha: data.commitSha ?? "",
+									message: data.message ?? "",
+									linesAdded: data.linesAdded ?? 0,
+									linesRemoved: data.linesRemoved ?? 0,
+									filesChanged: data.filesChanged ?? 0,
+								});
+							}
+							break;
 						case "metering":
 							if (!data.isSubagent) {
 								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
@@ -254,6 +286,11 @@ export function useNarratorWS(
 							break;
 						case "full_reload":
 							callbacksRef.current.onFullReload?.();
+							break;
+						case "commits_updated":
+							if (data.chapterId) {
+								callbacksRef.current.onCommitsUpdated?.(data.chapterId, data.newCount ?? 0);
+							}
 							break;
 					}
 				} catch (err) {
@@ -362,10 +399,11 @@ export function useNarratorWS(
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
 export interface SessionListWSEvent {
-	type: "status" | "title" | "planMode";
+	type: "status" | "title" | "planMode" | "presence";
 	status?: string;
 	title?: string;
 	planMode?: boolean;
+	viewers?: Array<{ userId: string; username: string; avatarColor: string | null }>;
 }
 
 export function useSessionsListWS(
@@ -409,6 +447,10 @@ export function useSessionsListWS(
 				attempts = 0;
 				if (currentIds.length) {
 					ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
+					// Join presence for all subscribed narrators
+					for (const id of currentIds) {
+						ws.send(JSON.stringify({ type: "presence_join", narratorId: id }));
+					}
 				}
 			};
 			ws.onmessage = (event) => {
@@ -427,6 +469,8 @@ export function useSessionsListWS(
 						onUpdateRef.current(nId, { type: "title", title: data.title });
 					} else if (data.type === "plan_mode_changed") {
 						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
+					} else if (data.type === "presence_update") {
+						onUpdateRef.current(nId, { type: "presence", viewers: data.viewers });
 					} else if (data.type.startsWith("user:")) {
 						onGlobalEventRef.current?.(data);
 					}
@@ -461,6 +505,9 @@ export function useSessionsListWS(
 				ws.onclose = null;
 				ws.onerror = null;
 				if (ws.readyState === WebSocket.OPEN && currentIds.length) {
+					for (const id of currentIds) {
+						ws.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
+					}
 					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
 				}
 				ws.close();

@@ -27,32 +27,40 @@ export function hasToolUse(msg: NarratorMsg): boolean {
 	return blocks.some((b: ContentBlock) => b.type === "tool_use");
 }
 
-/** Resolve ALL tool_use blocks from a message (one message may contain multiple tool calls). */
+/** Resolve ALL tool_use blocks from a message (one message may contain multiple tool calls).
+ *  Reads enriched fields directly from contentJson blocks when available (set by
+ *  the backend's enrichToolUseBlocks), falling back to the toolCalls array for
+ *  messages that haven't been enriched (e.g. synthetic streaming chunks). */
 export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	const results: ToolCallData[] = [];
 	for (const block of blocks) {
 		if (block.type !== "tool_use") continue;
-		const tc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === block.id);
-		const status = tc?.status ?? "running";
+		// Enriched blocks carry all fields directly; fall back to toolCalls lookup
+		const isEnriched = block.status !== undefined;
+		const tc = isEnriched
+			? null
+			: msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === block.id);
+		const status = block.status ?? tc?.status ?? "running";
 		// Derive startedAt for in-progress tools from persisted timestamps so the
 		// elapsed timer works correctly when re-entering a session.
 		let startedAt: number | undefined;
 		if (status === "running" || status === "pending" || status === "initializing") {
-			const ts = tc?.permissionDecidedAt ?? tc?.createdAt;
+			const ts =
+				block.permissionDecidedAt ?? tc?.permissionDecidedAt ?? block.tcCreatedAt ?? tc?.createdAt;
 			if (ts) startedAt = new Date(ts).getTime();
 		}
 		results.push({
-			id: tc?.id,
+			id: block.tcId ?? tc?.id,
 			toolName: block.name ?? "",
 			toolUseId: block.id,
-			inputJson: tc?.inputJson ?? block.input,
-			outputJson: tc?.outputJson,
+			inputJson: block.inputJson ?? tc?.inputJson ?? block.input,
+			outputJson: block.outputJson ?? tc?.outputJson,
 			status,
-			durationMs: tc?.durationMs,
-			errorMessage: tc?.errorMessage,
-			permissionDecisionReason: tc?.permissionDecisionReason,
-			permissionSuggestions: tc?.permissionSuggestions,
+			durationMs: block.durationMs ?? tc?.durationMs,
+			errorMessage: block.errorMessage ?? tc?.errorMessage,
+			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
+			permissionSuggestions: block.permissionSuggestions ?? tc?.permissionSuggestions,
 			startedAt,
 		});
 	}

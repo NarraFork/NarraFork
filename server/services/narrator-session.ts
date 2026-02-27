@@ -23,13 +23,18 @@ import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
-import { autoCommitIfNeeded } from "./narrator-auto-commit";
+import {
+	autoCommitIfNeeded,
+	checkCommitThresholds,
+	clearCommitReminderTracking,
+} from "./narrator-auto-commit";
 import { narratorContext } from "./narrator-context";
 import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
+import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state ===
 
@@ -56,8 +61,9 @@ interface ActiveSession {
 	_lastMeterUnit?: string;
 	/** Whether to append language instruction to system prompt */
 	_replyInUserLanguage?: boolean;
-	/** Set when plan compact aborts the current agent loop — the loop should restart with fresh context */
-	_planCompactAborted?: boolean;
+	/** Set when ExitPlanMode completes — the loop should restart with a user message.
+	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
+	_planApprovedContinue?: "continue" | "compact";
 	/** Cached prune boundary from the start of the current agent loop iteration */
 	_pruneBoundaryMessageId?: string | null;
 	/** Cached chapter ID (set when narrator is bound to an active chapter) */
@@ -484,12 +490,16 @@ export async function handlePermission(
 			toolName === "ExitPlanMode" ? EXIT_PLAN_MODE_TIMEOUT_MS : PERMISSION_TIMEOUT_MS;
 
 		const tid = setTimeout(async () => {
+			const autoApprove =
+				toolName === "ExitPlanMode" && settings.agent.planTimeoutAction === "auto_approve";
+
 			logger.warn("Permission request timed out", {
 				narratorId,
 				toolCallId,
 				toolUseId,
 				toolName,
 				timeoutMs,
+				autoApprove,
 			});
 			cleanup();
 			broadcastToNarrator(wsTarget, {
@@ -498,21 +508,43 @@ export async function handlePermission(
 				requestId: toolCallId,
 				toolUseId,
 			});
-			await db
-				.update(narratorToolCalls)
-				.set({
-					status: "fail",
-					errorMessage: "Permission request timed out",
-					permissionDecidedBy: "auto_timeout",
-					permissionDecidedAt: new Date().toISOString(),
-				})
-				.where(eq(narratorToolCalls.id, toolCallId));
-			// Restore narrator status on timeout so the agent loop can continue
-			await narratorService.updateStatus(narratorId, "thinking");
-			if (broadcastTargetId && broadcastTargetId !== narratorId) {
-				await narratorService.updateStatus(broadcastTargetId, "thinking");
+
+			if (autoApprove) {
+				await db
+					.update(narratorToolCalls)
+					.set({
+						status: "running",
+						permissionDecidedBy: "auto_timeout",
+						permissionDecidedAt: new Date().toISOString(),
+					})
+					.where(eq(narratorToolCalls.id, toolCallId));
+				await narratorService.updateStatus(narratorId, "thinking");
+				if (broadcastTargetId && broadcastTargetId !== narratorId) {
+					await narratorService.updateStatus(broadcastTargetId, "thinking");
+				}
+				resolve({ behavior: "allow", updatedInput: input });
+			} else {
+				await db
+					.update(narratorToolCalls)
+					.set({
+						status: "fail",
+						errorMessage: "Permission request timed out",
+						permissionDecidedBy: "auto_timeout",
+						permissionDecidedAt: new Date().toISOString(),
+					})
+					.where(eq(narratorToolCalls.id, toolCallId));
+				// Abort the session so the model doesn't keep looping in plan mode
+				const session = activeSessions.get(narratorId);
+				if (session?.alive) {
+					session.alive = false;
+					session.abortController.abort();
+				}
+				await narratorService.updateStatus(narratorId, "idle");
+				if (broadcastTargetId && broadcastTargetId !== narratorId) {
+					await narratorService.updateStatus(broadcastTargetId, "idle");
+				}
+				resolve({ behavior: "deny", message: "Permission request timed out" });
 			}
-			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, timeoutMs);
 
 		const onAbort = async () => {
@@ -651,6 +683,17 @@ export async function resolvePermission(
 		}
 
 		pending.resolve({ behavior: "allow", updatedInput });
+
+		// If the user attached feedback text, abort the agent loop so it stops
+		// after the current tool completes instead of continuing to the next turn.
+		// The outer while-loop will pick up pendingFeedback and inject the user
+		// message before starting a fresh agent loop iteration.
+		if (feedbackText?.trim()) {
+			const session = activeSessions.get(pending.narratorId);
+			if (session?.alive) {
+				session.abortController.abort();
+			}
+		}
 	} else {
 		const message = denyMessage || feedbackText?.trim() || "Permission denied by user";
 		pending.resolve({ behavior: "deny", message });
@@ -789,6 +832,12 @@ async function createSession(
 	};
 
 	activeSessions.set(narratorId, session);
+
+	// Start file watcher for the worktree (covers terminal/editor changes)
+	if (sessionWorktreePath && sessionChapterId) {
+		worktreeWatcher.watch(sessionWorktreePath, sessionChapterId, narratorId, locale);
+	}
+
 	return session;
 }
 
@@ -1149,9 +1198,13 @@ async function runAgentLoop(
 							await runPlanCompact(narratorId, output);
 							session.conversationId = randomUUID();
 							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-							session._planCompactAborted = true;
+							session._planApprovedContinue = "compact";
 							session.abortController.abort();
 						}
+					} else {
+						// Non-compact: inject a user message into the next turn
+						// so the model sees "plan approved" alongside the tool result.
+						session._planApprovedContinue = "continue";
 					}
 				},
 				onClearCompactSummary: async () => {
@@ -1184,17 +1237,37 @@ async function runAgentLoop(
 										gitService.getUncommittedLineStats(worktreePath),
 									]).then(
 										([gitStatus, ahead, lines]) => {
+											// Strip files array from WS broadcast to avoid
+											// sending huge payloads when many files are changed.
+											// The Git panel fetches the full list via API.
+											const { files: _files, ...statusWithoutFiles } = gitStatus;
 											broadcastToNarrator(narratorId, {
 												type: "git_status",
 												narratorId,
 												chapterId,
 												toolUseId,
-												status: gitStatus,
+												status: statusWithoutFiles as typeof gitStatus,
 												commitsAhead: ahead.count,
 												baseBranch: ahead.baseBranch,
 												linesAdded: lines.added,
 												linesRemoved: lines.removed,
 											});
+
+											// Check commit thresholds (reminder / force-commit)
+											const filesChanged =
+												gitStatus.staged + gitStatus.unstaged + gitStatus.untracked;
+											if (filesChanged > 0) {
+												checkCommitThresholds(narratorId, chapterId, worktreePath, locale, {
+													linesAdded: lines.added,
+													linesRemoved: lines.removed,
+													filesChanged,
+												}).catch((err) => {
+													logger.debug("Commit threshold check failed", {
+														narratorId,
+														error: String(err),
+													});
+												});
+											}
 										},
 										(err) => {
 											logger.debug("Git status tracking failed", {
@@ -1212,7 +1285,7 @@ async function runAgentLoop(
 					const partialId = session._partialMessageId;
 					session._partialMessageId = undefined;
 					if (message === "Aborted") {
-						if (session._planCompactAborted) {
+						if (session._planApprovedContinue === "compact") {
 							logger.info("Agent loop aborted for plan compact", { narratorId });
 							// Still clean up partial message in background
 							if (partialId) {
@@ -1273,6 +1346,13 @@ async function runAgentLoop(
 						locale,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
+				getInjectedUserText: () => {
+					if (session._planApprovedContinue === "continue") {
+						session._planApprovedContinue = undefined;
+						return getToolMessage("exitPlanModeApproved", locale);
+					}
+					return null;
+				},
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {
@@ -1460,8 +1540,8 @@ async function runAgentLoop(
 			// Plan compact aborted the agent loop — reset abort controller and
 			// restart the while-loop so the next iteration builds fresh history
 			// from only post-compact messages.
-			if (session._planCompactAborted) {
-				session._planCompactAborted = false;
+			if (session._planApprovedContinue === "compact") {
+				session._planApprovedContinue = undefined;
 				session.abortController = new AbortController();
 				await narratorService.updateStats(narratorId, 0);
 
@@ -1493,6 +1573,23 @@ async function runAgentLoop(
 			// can start a fresh agent loop iteration without immediately aborting.
 			if (session.abortController.signal.aborted) {
 				session.abortController = new AbortController();
+			}
+
+			// Check for chained feedback BEFORE marking "done" — when the user
+			// approves a permission with attached text, the loop is aborted right
+			// after the tool completes so the feedback is injected immediately
+			// instead of waiting for the entire turn to finish.
+			const fb = pendingFeedback.get(narratorId);
+			if (fb) {
+				pendingFeedback.delete(narratorId);
+				const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
+					{ type: "text", text: fb.feedbackText },
+				]);
+				broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+				session.events.emit("event", { type: "user_message", data: userMsg });
+				await narratorService.updateStatus(narratorId, "thinking");
+				currentText = fb.feedbackText;
+				continue;
 			}
 
 			// Agent loop done — update status
@@ -1558,20 +1655,6 @@ async function runAgentLoop(
 						});
 					}
 				}
-			}
-
-			// Check for chained feedback
-			const fb = pendingFeedback.get(narratorId);
-			if (fb) {
-				pendingFeedback.delete(narratorId);
-				const userMsg = await narratorService.persistUserMessage(narratorId, fb.feedbackText, [
-					{ type: "text", text: fb.feedbackText },
-				]);
-				broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
-				session.events.emit("event", { type: "user_message", data: userMsg });
-				await narratorService.updateStatus(narratorId, "thinking");
-				currentText = fb.feedbackText;
-				continue;
 			}
 
 			// Check for buffered messages
@@ -1643,6 +1726,11 @@ async function runAgentLoop(
 	} finally {
 		session.alive = false;
 		if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
+		clearCommitReminderTracking(narratorId);
+		// Stop file watcher for this narrator
+		if (session._worktreePath) {
+			worktreeWatcher.unwatch(session._worktreePath, narratorId);
+		}
 		activeSessions.delete(narratorId);
 		session.abortController.abort();
 		session.events.emit("event", { type: "done", data: null });

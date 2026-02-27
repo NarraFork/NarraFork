@@ -77,13 +77,24 @@ export function useProgressiveMessageCount(
 	// overflow-anchor to latch onto the top edge in the intervening paint.
 	const effectiveChanged = prevEffectiveRef.current !== effectiveCount;
 	prevEffectiveRef.current = effectiveCount;
+	const isProgressing = !skip && totalMessages > effectiveCount;
+	// Also snap when needsSnapRef was just set (e.g. initial data load where
+	// effectiveCount stays at batchSize — the value didn't change but we still
+	// need to scroll to bottom on the very first batch).
+	const needsInitialSnap = needsSnapRef.current && effectiveCount >= batchSize;
 	useLayoutEffect(() => {
-		if (!effectiveChanged) return;
+		if (!effectiveChanged && !needsInitialSnap) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
 		if (needsSnapRef.current) {
 			if (effectiveCount < batchSize) return;
-			needsSnapRef.current = false;
+			// Keep snapping to bottom throughout the entire progressive rendering
+			// phase — not just the first batch. overflow-anchor alone is unreliable
+			// across rapid successive DOM insertions, causing visible jitter when
+			// switching back to a narrator with many cached messages.
+			if (!isProgressing) {
+				needsSnapRef.current = false;
+			}
 			vp.scrollTop = vp.scrollHeight;
 			return;
 		}

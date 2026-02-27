@@ -75,7 +75,7 @@ function buildMessageTree(flatMessages: any[]): any[] {
 
 /** Truncate a JSON value to a preview string if it exceeds maxLen characters */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function truncateJson(val: any, maxLen: number): any {
+export function truncateJson(val: any, maxLen: number): any {
 	if (val === null || val === undefined) return val;
 	const str = typeof val === "string" ? val : JSON.stringify(val);
 	if (str.length <= maxLen) return val;
@@ -88,7 +88,7 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 
 /** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function truncateToolIO(tree: any[], maxLen = 2000): any[] {
+export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 	return tree.map((msg) => ({
 		...msg,
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -102,6 +102,48 @@ function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 		}),
 		children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
 	}));
+}
+
+/**
+ * Enrich tool_use blocks in contentJson with fields from the toolCalls relation.
+ * This merges status, outputJson, durationMs, etc. directly into the content block
+ * so the frontend can read all tool call data from a single source (contentJson)
+ * without cross-referencing the separate toolCalls array.
+ *
+ * The original toolCalls array is preserved for backward compatibility.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+export function enrichToolUseBlocks(tree: any[]): any[] {
+	return tree.map((msg) => {
+		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) return msg;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const tcMap = new Map<string, any>(msg.toolCalls.map((tc: any) => [tc.toolUseId, tc]));
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const enrichedContent = msg.contentJson.map((block: any) => {
+			if (block.type !== "tool_use") return block;
+			const tc = tcMap.get(block.id);
+			if (!tc) return block;
+			return {
+				...block,
+				// Prefer toolCalls table values (may have been overwritten post-persist)
+				inputJson: tc.inputJson ?? block.input,
+				outputJson: tc.outputJson,
+				status: tc.status,
+				durationMs: tc.durationMs,
+				errorMessage: tc.errorMessage,
+				permissionDecisionReason: tc.permissionDecisionReason,
+				permissionSuggestions: tc.permissionSuggestions,
+				permissionDecidedAt: tc.permissionDecidedAt,
+				tcId: tc.id,
+				tcCreatedAt: tc.createdAt,
+			};
+		});
+		return {
+			...msg,
+			contentJson: enrichedContent,
+			children: msg.children?.length ? enrichToolUseBlocks(msg.children) : msg.children,
+		};
+	});
 }
 
 /**
@@ -165,6 +207,7 @@ async function insertMessageRef(
 	messageId: string,
 	seq: number,
 	isCompact = 0,
+	prunedPercent?: number | null,
 ): Promise<void> {
 	await db.insert(narratorMessageRefs).values({
 		id: generateId(),
@@ -172,6 +215,7 @@ async function insertMessageRef(
 		messageId,
 		seq,
 		isCompact,
+		prunedPercent: prunedPercent ?? null,
 	});
 }
 
@@ -180,6 +224,7 @@ async function appendMessageRef(
 	narratorId: string,
 	messageId: string,
 	isCompact = 0,
+	prunedPercent?: number | null,
 ): Promise<number> {
 	return db.transaction(async (tx) => {
 		const result = await tx
@@ -187,12 +232,24 @@ async function appendMessageRef(
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.narratorId, narratorId));
 		const seq = (result[0]?.maxSeq ?? -1) + 1;
+
+		// Auto-fetch current prunedPercent from narrator if not explicitly provided
+		let resolvedPrunedPercent = prunedPercent ?? null;
+		if (resolvedPrunedPercent == null) {
+			const narrator = await tx.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { prunedPercent: true },
+			});
+			resolvedPrunedPercent = narrator?.prunedPercent ?? null;
+		}
+
 		await tx.insert(narratorMessageRefs).values({
 			id: generateId(),
 			narratorId,
 			messageId,
 			seq,
 			isCompact,
+			prunedPercent: resolvedPrunedPercent,
 		});
 		return seq;
 	});
@@ -354,6 +411,7 @@ export const narratorService = {
 				messageId: narratorMessageRefs.messageId,
 				seq: narratorMessageRefs.seq,
 				isCompact: narratorMessageRefs.isCompact,
+				prunedPercent: narratorMessageRefs.prunedPercent,
 			})
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.narratorId, input.originalSubagentId))
@@ -388,6 +446,7 @@ export const narratorService = {
 						messageId: row.messageId,
 						seq: row.seq,
 						isCompact: row.isCompact,
+						prunedPercent: row.prunedPercent,
 					})),
 				);
 			}
@@ -720,8 +779,10 @@ export const narratorService = {
 
 		await attachSubagentModels(childMessages);
 
-		const tree = filterExitPlanBeforePlanCompact(
-			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		const tree = enrichToolUseBlocks(
+			filterExitPlanBeforePlanCompact(
+				truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+			),
 		);
 
 		return {
@@ -839,8 +900,8 @@ export const narratorService = {
 		await attachSubagentModels(childMsgs);
 
 		// Build tree for new top-level messages
-		const tree = filterExitPlanBeforePlanCompact(
-			truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+		const tree = enrichToolUseBlocks(
+			filterExitPlanBeforePlanCompact(truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs]))),
 		);
 
 		// Orphan children: child messages whose parentToolUseId does NOT belong
@@ -881,7 +942,7 @@ export const narratorService = {
 
 		return {
 			topLevel: tree,
-			orphanChildren: truncateToolIO(orphanChildren),
+			orphanChildren: enrichToolUseBlocks(truncateToolIO(orphanChildren)),
 			hitLimit: false,
 		};
 	},
@@ -989,8 +1050,10 @@ export const narratorService = {
 
 		await attachSubagentModels(childMessages);
 
-		const tree = filterExitPlanBeforePlanCompact(
-			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		const tree = enrichToolUseBlocks(
+			filterExitPlanBeforePlanCompact(
+				truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+			),
 		);
 		return {
 			messages: tree,
@@ -1304,6 +1367,36 @@ export const narratorService = {
 			.returning();
 
 		// Insert into narrator_message_refs junction table
+		await appendMessageRef(narratorId, id);
+		return msg;
+	},
+
+	/**
+	 * Persist a system-injected message into the narrator's chat history.
+	 * Uses role="user" so the SDK includes it in conversation history
+	 * (role="system" is filtered out by buildHistory).
+	 * The `contentBlocks` carry structured metadata for the UI; a text block
+	 * is always prepended so the model can read the plain-text content.
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	async persistSystemMessage(narratorId: string, text: string, contentBlocks?: any[]) {
+		const id = generateId();
+		const now = new Date().toISOString();
+		// Always lead with a text block so the SDK sees the message content,
+		// then append structured metadata blocks for the UI.
+		const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "user",
+				contentJson: blocks,
+				contentText: text,
+				createdAt: now,
+			})
+			.returning();
+
 		await appendMessageRef(narratorId, id);
 		return msg;
 	},
@@ -1744,9 +1837,7 @@ export const narratorService = {
 			if (msg?.contentJson && Array.isArray(msg.contentJson)) {
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const patched = (msg.contentJson as any[]).map((block: any) =>
-					block.type === "tool_use" && block.id === toolUseId
-						? { ...block, input }
-						: block,
+					block.type === "tool_use" && block.id === toolUseId ? { ...block, input } : block,
 				);
 				await db
 					.update(narratorMessages)
@@ -1856,6 +1947,7 @@ export const narratorService = {
 			messageId: string;
 			seq: number;
 			isCompact: number;
+			prunedPercent: number | null;
 		}> = [];
 
 		if (forkMessageId) {
@@ -1873,6 +1965,7 @@ export const narratorService = {
 					messageId: narratorMessageRefs.messageId,
 					seq: narratorMessageRefs.seq,
 					isCompact: narratorMessageRefs.isCompact,
+					prunedPercent: narratorMessageRefs.prunedPercent,
 				})
 				.from(narratorMessageRefs)
 				.where(
@@ -1908,7 +2001,7 @@ export const narratorService = {
 				})
 				.returning();
 
-			// Batch insert refs
+			// Batch insert refs (preserve prunedPercent from parent)
 			if (prefixRows.length > 0) {
 				await tx.insert(narratorMessageRefs).values(
 					prefixRows.map((row) => ({
@@ -1917,8 +2010,32 @@ export const narratorService = {
 						messageId: row.messageId,
 						seq: row.seq,
 						isCompact: row.isCompact,
+						prunedPercent: row.prunedPercent,
 					})),
 				);
+
+				// Inherit prune state from parent if the boundary falls within the copied prefix.
+				// This prevents fork from resetting prunedPercent to 0, which would cause the
+				// new narrator to skip pruning and jump straight to compact.
+				if (parent.pruneBoundaryMessageId) {
+					const boundaryInPrefix = prefixRows.find(
+						(r) => r.messageId === parent.pruneBoundaryMessageId,
+					);
+					if (boundaryInPrefix) {
+						// Recompute prunedPercent relative to the new narrator's ref count
+						const boundaryIdx = prefixRows.indexOf(boundaryInPrefix);
+						const inheritedPrunedPercent = Math.round(
+							((boundaryIdx + 1) / prefixRows.length) * 100,
+						);
+						await tx
+							.update(narrators)
+							.set({
+								pruneBoundaryMessageId: parent.pruneBoundaryMessageId,
+								prunedPercent: inheritedPrunedPercent,
+							})
+							.where(eq(narrators.id, id));
+					}
+				}
 			}
 
 			return created;

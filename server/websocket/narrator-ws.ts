@@ -18,6 +18,9 @@ export interface NarratorWSData {
 	connectedAt: number;
 	lastPongAt: number;
 	subscribedNarrators: Set<string>;
+	userId?: string;
+	username?: string;
+	avatarColor?: string | null;
 }
 
 // Server → Client messages
@@ -35,6 +38,7 @@ export type NarratorServerMessage =
 			status: string;
 			output?: unknown;
 			durationMs?: number;
+			updatedInput?: Record<string, unknown>;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
 	| { type: "permission_resolved"; narratorId: string; requestId: string; toolUseId?: string }
@@ -78,6 +82,8 @@ export type NarratorServerMessage =
 			toolName: string;
 			inputCharsTotal: number;
 			parentToolUseId?: string;
+			extractedFilePath?: string;
+			contentCharsReceived?: number;
 	  }
 	| {
 			type: "subagent_started";
@@ -107,6 +113,24 @@ export type NarratorServerMessage =
 	  }
 	| { type: "auto_commit_failed"; narratorId: string; chapterId: string; error: string }
 	| {
+			type: "commit_reminder";
+			narratorId: string;
+			chapterId: string;
+			linesAdded: number;
+			linesRemoved: number;
+			filesChanged: number;
+	  }
+	| {
+			type: "force_commit_done";
+			narratorId: string;
+			chapterId: string;
+			commitSha: string;
+			message: string;
+			linesAdded: number;
+			linesRemoved: number;
+			filesChanged: number;
+	  }
+	| {
 			type: "catch_up";
 			narratorId: string;
 			orphanChildren: unknown[];
@@ -115,7 +139,13 @@ export type NarratorServerMessage =
 	| { type: "error"; message: string }
 	| { type: "warning"; narratorId: string; message: string }
 	| { type: "context_length_exceeded"; narratorId: string }
-	| { type: "full_reload"; narratorId: string };
+	| { type: "full_reload"; narratorId: string }
+	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }
+	| {
+			type: "presence_update";
+			narratorId: string;
+			viewers: Array<{ userId: string; username: string; avatarColor: string | null }>;
+	  };
 
 // Client → Server messages
 export type NarratorClientMessage =
@@ -136,13 +166,102 @@ export type NarratorClientMessage =
 			decision: MergeDecision;
 	  }
 	| { type: "buffer_message"; narratorId: string; text: string }
-	| { type: "cancel_buffer"; narratorId: string };
+	| { type: "cancel_buffer"; narratorId: string }
+	| { type: "presence_join"; narratorId: string }
+	| { type: "presence_leave"; narratorId: string };
 
 // === Connection registry ===
 
 type NarratorWS = ServerWebSocket<WSData & { channel: "narrator" }>;
 
 const connections = new Set<NarratorWS>();
+
+// === Presence tracking ===
+// Map<narratorId, Map<wsInstance, { userId, username, avatarColor }>>
+const presenceMap = new Map<
+	string,
+	Map<NarratorWS, { userId: string; username: string; avatarColor: string | null }>
+>();
+
+function addPresence(ws: NarratorWS, narratorId: string) {
+	if (!ws.data.userId) return;
+	let viewers = presenceMap.get(narratorId);
+	if (!viewers) {
+		viewers = new Map();
+		presenceMap.set(narratorId, viewers);
+	}
+	viewers.set(ws, {
+		userId: ws.data.userId,
+		username: ws.data.username ?? "",
+		avatarColor: ws.data.avatarColor ?? null,
+	});
+	broadcastPresence(narratorId);
+}
+
+function removePresence(ws: NarratorWS, narratorId: string) {
+	const viewers = presenceMap.get(narratorId);
+	if (!viewers) return;
+	viewers.delete(ws);
+	if (viewers.size === 0) presenceMap.delete(narratorId);
+	else broadcastPresence(narratorId);
+}
+
+function removeAllPresence(ws: NarratorWS) {
+	for (const [narratorId, viewers] of presenceMap) {
+		if (viewers.delete(ws)) {
+			if (viewers.size === 0) presenceMap.delete(narratorId);
+			else broadcastPresence(narratorId);
+		}
+	}
+}
+
+function broadcastPresence(narratorId: string) {
+	const viewers = presenceMap.get(narratorId);
+	// Deduplicate by userId
+	const uniqueViewers = new Map<
+		string,
+		{ userId: string; username: string; avatarColor: string | null }
+	>();
+	if (viewers) {
+		for (const v of viewers.values()) {
+			uniqueViewers.set(v.userId, v);
+		}
+	}
+	broadcastToNarrator(narratorId, {
+		type: "presence_update",
+		narratorId,
+		viewers: [...uniqueViewers.values()],
+	});
+}
+
+/** Get current viewers for a narrator (used by REST API). */
+export function getNarratorPresence(
+	narratorId: string,
+): Array<{ userId: string; username: string; avatarColor: string | null }> {
+	const viewers = presenceMap.get(narratorId);
+	if (!viewers) return [];
+	const unique = new Map<
+		string,
+		{ userId: string; username: string; avatarColor: string | null }
+	>();
+	for (const v of viewers.values()) unique.set(v.userId, v);
+	return [...unique.values()];
+}
+
+/** Get presence for multiple narrators at once (batch). */
+export function getNarratorPresenceBatch(
+	narratorIds: string[],
+): Map<string, Array<{ userId: string; username: string; avatarColor: string | null }>> {
+	const result = new Map<
+		string,
+		Array<{ userId: string; username: string; avatarColor: string | null }>
+	>();
+	for (const id of narratorIds) {
+		const viewers = getNarratorPresence(id);
+		if (viewers.length > 0) result.set(id, viewers);
+	}
+	return result;
+}
 
 /** Expose connections for heartbeat iteration. */
 export function getNarratorConnections(): Set<NarratorWS> {
@@ -339,10 +458,19 @@ export const handleNarratorWS = {
 				});
 				break;
 			}
+			case "presence_join": {
+				addPresence(ws, msg.narratorId);
+				break;
+			}
+			case "presence_leave": {
+				removePresence(ws, msg.narratorId);
+				break;
+			}
 		}
 	},
 
 	close(ws: NarratorWS) {
+		removeAllPresence(ws);
 		connections.delete(ws);
 	},
 };

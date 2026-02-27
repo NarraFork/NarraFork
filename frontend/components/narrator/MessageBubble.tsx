@@ -14,7 +14,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconArrowsMinimize, IconListCheck } from "@tabler/icons-react";
+import { IconArrowsMinimize, IconGitCommit, IconListCheck } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -464,6 +464,37 @@ export const MessageBubble = memo(function MessageBubble({
 			);
 		}
 		return null;
+	}
+
+	// Auto-commit system notices (stored as role="user" so the SDK sees them)
+	if (isUser) {
+		const acBlock = blocks.find(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "auto_commit_reminder" || b.type === "auto_commit_notice",
+		);
+		if (acBlock) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const textBlock = blocks.find((b: any) => b.type === "text");
+			const isReminder = acBlock.type === "auto_commit_reminder";
+			return (
+				<Paper
+					p="xs"
+					radius="sm"
+					style={{
+						backgroundColor: isReminder
+							? "var(--mantine-color-yellow-light)"
+							: "var(--mantine-color-teal-light)",
+					}}
+				>
+					<Group gap={6} align="center">
+						<IconGitCommit size={16} style={{ flexShrink: 0 }} />
+						<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
+							{textBlock?.text ?? message.contentText ?? ""}
+						</Text>
+					</Group>
+				</Paper>
+			);
+		}
 	}
 
 	// User messages — wrap entire bubble in ContentViewer for context menu / swipe

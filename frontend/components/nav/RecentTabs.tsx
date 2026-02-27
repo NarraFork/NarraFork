@@ -11,15 +11,16 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Box, NavLink, Text } from "@mantine/core";
-import { IconFolder, IconGitBranch, IconMessageCircle, IconX } from "@tabler/icons-react";
+import { IconFolder, IconGitBranch, IconMessageCircle } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
 import type { SessionListWSEvent } from "../../hooks/useNarratorWS";
 import { type RecentTab, useRecentTabs } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { triggerNotification } from "../../lib/notification";
 
 const STATUS_COLORS: Record<string, string> = {
 	done: "var(--mantine-color-green-6)",
@@ -84,6 +85,11 @@ interface RecentTabsWSProviderProps {
 export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const { tabs } = useRecentTabs();
 	const qc = useQueryClient();
+	const { data: userPrefs } = useUserPreferences();
+	const tabsRef = useRef(tabs);
+	tabsRef.current = tabs;
+	const userPrefsRef = useRef(userPrefs);
+	userPrefsRef.current = userPrefs;
 
 	const narratorIds = useMemo(() => {
 		const ids: string[] = [];
@@ -105,6 +111,25 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			else return;
 
 			const isPromote = event.type === "status" && event.status === "thinking";
+
+			// Trigger client-side notifications for done/waiting
+			if (
+				event.type === "status" &&
+				(event.status === "done" || event.status === "waiting") &&
+				userPrefsRef.current
+			) {
+				const tab = tabsRef.current.find(
+					(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
+				);
+				if (tab) {
+					triggerNotification(
+						narratorId,
+						tab.title,
+						event.status as "done" | "waiting",
+						userPrefsRef.current,
+					);
+				}
+			}
 
 			qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
 				if (!prev) return prev;
@@ -260,7 +285,6 @@ interface SortableTabItemProps {
 }
 
 function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: SortableTabItemProps) {
-	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const to =
 		tab.type === "project"
@@ -386,19 +410,6 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 						) : (
 							<IconMessageCircle size={14} color={iconColor} />
 						)
-					}
-					rightSection={
-						<IconX
-							size={10}
-							color="var(--mantine-color-dimmed)"
-							style={{ cursor: "pointer", flexShrink: 0 }}
-							onClick={(e: React.MouseEvent) => {
-								e.preventDefault();
-								e.stopPropagation();
-								onRemove(tab.type, tab.id);
-							}}
-							aria-label={t("closeTab")}
-						/>
 					}
 					styles={{
 						root: {

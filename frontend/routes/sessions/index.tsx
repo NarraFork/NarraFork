@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Avatar,
 	Badge,
 	Button,
 	Card,
@@ -7,6 +8,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	SegmentedControl,
 	Select,
 	Stack,
 	Text,
@@ -22,12 +24,14 @@ import {
 	IconSortDescending,
 	IconStar,
 	IconStarFilled,
+	IconTerminal2,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { UserAvatar } from "../../components/UserAvatar";
 import {
 	useCreateFavoriteDirectory,
 	useDeleteFavoriteDirectory,
@@ -51,13 +55,19 @@ export const Route = createFileRoute("/sessions/")({
 function SessionsPage() {
 	const [sortBy, setSortBy] = useState("updatedAt");
 	const [sortOrder, setSortOrder] = useState("desc");
+	const [filter, setFilter] = useState("all"); // "all" | "standalone" | "chapter"
 	const {
 		data: paginatedData,
 		isLoading,
 		hasNextPage,
 		fetchNextPage,
 		isFetchingNextPage,
-	} = useNarratorsPaginated({ standalone: true, sortBy, sortOrder });
+	} = useNarratorsPaginated({
+		standalone: "all",
+		filter: filter === "all" ? undefined : filter,
+		sortBy,
+		sortOrder,
+	});
 	const sessions = useMemo(
 		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
 		[paginatedData],
@@ -85,13 +95,20 @@ function SessionsPage() {
 	const sessionIds = useMemo(() => sessions.map((s: any) => s.id), [sessions]);
 	useSessionsListWS(sessionIds, (narratorId, event) => {
 		if (!narratorId) {
-			// Fallback: no narratorId in event, invalidate all
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			return;
 		}
-		// Targeted update of the specific session in paginated cache
 		qc.setQueryData(
-			["narrators", "paginated", { standalone: true, sortBy, sortOrder }],
+			[
+				"narrators",
+				"paginated",
+				{
+					standalone: "all",
+					filter: filter === "all" ? undefined : filter,
+					sortBy,
+					sortOrder,
+				},
+			],
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(old: any) => {
 				if (!old?.pages) return old;
@@ -108,6 +125,7 @@ function SessionsPage() {
 							...(event.status !== undefined ? { status: event.status } : {}),
 							...(event.title !== undefined ? { title: event.title } : {}),
 							...(event.planMode !== undefined ? { planMode: event.planMode } : {}),
+							...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
 							updatedAt: new Date().toISOString(),
 						};
 					}),
@@ -192,6 +210,16 @@ function SessionsPage() {
 			<Group justify="space-between" visibleFrom="sm">
 				<Title order={2}>{t("title")}</Title>
 				<Group gap="xs">
+					<SegmentedControl
+						size="xs"
+						value={filter}
+						onChange={setFilter}
+						data={[
+							{ value: "all", label: t("filterAll") },
+							{ value: "standalone", label: t("filterStandalone") },
+							{ value: "chapter", label: t("filterChapter") },
+						]}
+					/>
 					<Select
 						size="xs"
 						w={140}
@@ -224,6 +252,17 @@ function SessionsPage() {
 						{t("newSession")}
 					</Button>
 				</Group>
+				<SegmentedControl
+					size="xs"
+					fullWidth
+					value={filter}
+					onChange={setFilter}
+					data={[
+						{ value: "all", label: t("filterAll") },
+						{ value: "standalone", label: t("filterStandalone") },
+						{ value: "chapter", label: t("filterChapter") },
+					]}
+				/>
 				<Group gap="xs">
 					<Select
 						size="xs"
@@ -257,6 +296,13 @@ function SessionsPage() {
 					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 					{sessions.map((session: any) => {
 						const isNavigating = navigatingId === session.id;
+						const viewers: Array<{
+							userId: string;
+							username: string;
+							avatarColor: string | null;
+						}> = session.viewers ?? [];
+						const activeTerminals: number = session.activeTerminalCount ?? 0;
+						const chapter = session.chapter;
 						return (
 							<Card
 								key={session.id}
@@ -280,47 +326,86 @@ function SessionsPage() {
 									e.currentTarget.style.transform = "";
 								}}
 							>
-								<Group justify="space-between">
+								<Group justify="space-between" wrap="nowrap">
 									<div style={{ flex: 1, minWidth: 0 }}>
-										<div>
-											<Group gap="xs">
-												<Text fw={500}>
-													{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
-												</Text>
-												{session.status === "thinking" && (
-													<Loader size={14} color={session.planMode ? "green" : undefined} />
-												)}
-												{session.status === "thinking" && session.planMode && (
-													<Badge size="xs" color="green">
-														{tn("status_planning")}
+										<Group gap="xs" wrap="wrap">
+											<Text fw={500}>
+												{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
+											</Text>
+											{session.status === "thinking" && (
+												<Loader size={14} color={session.planMode ? "green" : undefined} />
+											)}
+											{session.status === "thinking" && session.planMode && (
+												<Badge size="xs" color="green">
+													{tn("status_planning")}
+												</Badge>
+											)}
+											{session.status &&
+												session.status !== "idle" &&
+												session.status !== "thinking" && (
+													<Badge size="xs" color={NARRATOR_STATUS_COLORS[session.status] ?? "gray"}>
+														{tn(`status_${session.status}`)}
 													</Badge>
 												)}
-												{session.status &&
-													session.status !== "idle" &&
-													session.status !== "thinking" && (
-														<Badge
-															size="xs"
-															color={NARRATOR_STATUS_COLORS[session.status] ?? "gray"}
-														>
-															{tn(`status_${session.status}`)}
-														</Badge>
-													)}
-											</Group>
+											{chapter && (
+												<Badge size="xs" variant="outline" color="indigo">
+													{chapter.title}
+												</Badge>
+											)}
+										</Group>
+										<Group gap="xs">
 											<Text size="sm" c="dimmed">
 												{t("sessionMeta", {
 													model: session.model,
 													count: session.messageCount ?? 0,
 												})}
 											</Text>
-											{session.cwd && (
-												<Text size="xs" c="dimmed" truncate>
-													{t("cwdLabel", { path: session.cwd })}
-												</Text>
+											{activeTerminals > 0 && (
+												<Badge
+													size="xs"
+													variant="light"
+													color="teal"
+													leftSection={<IconTerminal2 size={10} />}
+												>
+													{activeTerminals}
+												</Badge>
 											)}
-										</div>
+										</Group>
+										{chapter?.projectName && (
+											<Text size="xs" c="dimmed" truncate>
+												{t("projectLabel", { name: chapter.projectName })}
+											</Text>
+										)}
+										{session.cwd && (
+											<Text size="xs" c="dimmed" truncate>
+												{t("cwdLabel", { path: session.cwd })}
+											</Text>
+										)}
 									</div>
-									<Group>
-										<Text size="xs" c="dimmed">
+									<Group gap="xs" wrap="nowrap">
+										{viewers.length > 0 && (
+											<Tooltip
+												label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
+											>
+												<Avatar.Group spacing="xs">
+													{viewers.slice(0, 3).map((v) => (
+														<UserAvatar
+															key={v.userId}
+															username={v.username}
+															avatarColor={v.avatarColor}
+															size="sm"
+															showTooltip={false}
+														/>
+													))}
+													{viewers.length > 3 && (
+														<Avatar size="sm" radius="xl">
+															+{viewers.length - 3}
+														</Avatar>
+													)}
+												</Avatar.Group>
+											</Tooltip>
+										)}
+										<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
 											{new Date(
 												sortBy === "updatedAt" ? session.updatedAt : session.createdAt,
 											).toLocaleDateString(i18n.language)}
