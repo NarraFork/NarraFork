@@ -63,7 +63,6 @@ import { findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorForkSelector } from "./NarratorForkSelector";
 import type {
 	ContentBlock,
-	MessagesPage,
 	MessagesQueryData,
 	NarratorMsg,
 	NarratorPanelProps,
@@ -205,11 +204,18 @@ export function NarratorPanel({
 	const followRafRef = useRef(0);
 	const followingRef = useRef(false);
 
+	const lastFollowScrollTop = useRef(0);
+
 	const startFollowing = useCallback(() => {
 		if (followingRef.current) return;
 		const step = () => {
 			const vp = viewportRef.current;
 			if (!vp) {
+				followingRef.current = false;
+				return;
+			}
+			// If scrollTop decreased since last frame, user scrolled up — stop following
+			if (vp.scrollTop < lastFollowScrollTop.current) {
 				followingRef.current = false;
 				return;
 			}
@@ -226,9 +232,11 @@ export function NarratorPanel({
 				return;
 			}
 			vp.scrollTop += Math.max(gap * 0.25, 1.5);
+			lastFollowScrollTop.current = vp.scrollTop;
 			followRafRef.current = requestAnimationFrame(step);
 		};
 		followingRef.current = true;
+		lastFollowScrollTop.current = viewportRef.current?.scrollTop ?? 0;
 		followRafRef.current = requestAnimationFrame(step);
 	}, []);
 
@@ -434,7 +442,7 @@ export function NarratorPanel({
 	}, []);
 	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
 
-	// --- Hydration & message flattening ---
+	// --- Hydration & message counting ---
 	const [hydrated, setHydrated] = useState(false);
 	useEffect(() => {
 		const id = requestAnimationFrame(() => {
@@ -443,37 +451,24 @@ export function NarratorPanel({
 		return () => cancelAnimationFrame(id);
 	}, []);
 
-	const prevPagesRef = useRef<MessagesPage[]>([]);
-	const cachedFlatRef = useRef<NarratorMsg[]>([]);
-	const messages = useMemo(() => {
-		if (!hydrated || !messagesData?.pages) return [];
-		const pages = messagesData.pages;
-		const prev = prevPagesRef.current;
-		if (
-			pages.length === prev.length &&
-			pages.length > 0 &&
-			pages.every((p, i) => i === 0 || p === prev[i])
-		) {
-			const cached = cachedFlatRef.current;
-			const oldFirstLen = prev[0]?.messages?.length ?? 0;
-			const result = [...cached.slice(0, cached.length - oldFirstLen), ...pages[0].messages];
-			prevPagesRef.current = pages;
-			cachedFlatRef.current = result;
-			return result;
-		}
-		const reversed = [...pages].reverse();
-		const result = reversed.flatMap((page) => page.messages);
-		prevPagesRef.current = pages;
-		cachedFlatRef.current = result;
-		return result;
+	// Lightweight derived values — avoid full reverse().flatMap() on every update.
+	const totalMessageCount = useMemo(() => {
+		if (!hydrated || !messagesData?.pages) return 0;
+		return messagesData.pages.reduce((sum, p) => sum + (p.messages?.length ?? 0), 0);
+	}, [hydrated, messagesData]);
+
+	const lastMessage = useMemo<NarratorMsg | null>(() => {
+		if (!hydrated || !messagesData?.pages?.length) return null;
+		const firstPage = messagesData.pages[0]; // newest page
+		if (!firstPage?.messages?.length) return null;
+		return firstPage.messages[firstPage.messages.length - 1] ?? null;
 	}, [hydrated, messagesData]);
 
 	const deferredStreamingChunks = useMemo(() => {
-		if (!messages.length) return null;
-		const last = messages[messages.length - 1];
-		if (last.id === STREAMING_CHUNKS_MSG_ID && last._noMerge) return last;
+		if (!lastMessage) return null;
+		if (lastMessage.id === STREAMING_CHUNKS_MSG_ID && lastMessage._noMerge) return lastMessage;
 		return null;
-	}, [messages]);
+	}, [lastMessage]);
 
 	// --- Fork handler ---
 	const handleNarratorFork = useCallback(
@@ -507,7 +502,7 @@ export function NarratorPanel({
 	}
 	const skipProgressive = !!highlightMessageId;
 	const { visibleCount, done: renderDone } = useProgressiveMessageCount(
-		messages.length,
+		totalMessageCount,
 		20,
 		skipProgressive,
 		narratorId,
@@ -544,7 +539,7 @@ export function NarratorPanel({
 		if (!messagesData?.pages || visibleCount === 0) return [];
 		const pages = messagesData.pages;
 		const reversed = [...pages].reverse();
-		if (visibleCount >= messages.length) {
+		if (visibleCount >= totalMessageCount) {
 			return reversed.map((page, i) => (
 				<MemoizedPageElements
 					key={`page-${pages.length - 1 - i}`}
@@ -592,7 +587,7 @@ export function NarratorPanel({
 		return result;
 	}, [
 		messagesData,
-		messages.length,
+		totalMessageCount,
 		visibleCount,
 		narratorId,
 		forkHandler,
@@ -700,7 +695,7 @@ export function NarratorPanel({
 	useEffect(() => {
 		if (
 			!initialScrollDoneRef.current &&
-			messages.length > 0 &&
+			totalMessageCount > 0 &&
 			renderDone &&
 			!highlightMessageId &&
 			isAtBottomRef.current
@@ -711,14 +706,14 @@ export function NarratorPanel({
 		}
 		if (
 			!initialScrollDoneRef.current &&
-			messages.length > 0 &&
+			totalMessageCount > 0 &&
 			renderDone &&
 			!isAtBottomRef.current
 		) {
 			initialScrollDoneRef.current = true;
 			setInitialScrollDone(true);
 		}
-	}, [messages, renderDone, scrollToBottom, highlightMessageId]);
+	}, [totalMessageCount, renderDone, scrollToBottom, highlightMessageId]);
 
 	// --- Auto-scroll via ResizeObserver ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: initialScrollDone is a trigger dep, not read inside
@@ -761,7 +756,7 @@ export function NarratorPanel({
 
 	// --- Scroll to highlighted message ---
 	useEffect(() => {
-		if (!highlightMessageId || !messages.length || highlightScrolledRef.current) return;
+		if (!highlightMessageId || totalMessageCount === 0 || highlightScrolledRef.current) return;
 		const el = document.getElementById(`msg-${highlightMessageId}`);
 		if (!el) return;
 		highlightScrolledRef.current = true;
@@ -772,7 +767,7 @@ export function NarratorPanel({
 				setTimeout(() => setHighlightedId(null), 1600);
 			}, 400);
 		});
-	}, [highlightMessageId, messages]);
+	}, [highlightMessageId, totalMessageCount]);
 
 	// --- Send message ---
 	const handleSend = async () => {
@@ -800,7 +795,7 @@ export function NarratorPanel({
 			{ type: "text", text: msg },
 		];
 		const optimisticMsg: TreeMessage = {
-			id: `optimistic-${Date.now()}`,
+			id: `optimistic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 			narratorId,
 			parentToolUseId: null,
 			role: "user",
@@ -1013,8 +1008,8 @@ export function NarratorPanel({
 						<RenderProgress
 							indeterminate={isFetchingNextPage}
 							value={
-								!isFetchingNextPage && messages.length > 0
-									? visibleCount / messages.length
+								!isFetchingNextPage && totalMessageCount > 0
+									? visibleCount / totalMessageCount
 									: undefined
 							}
 						/>
@@ -1028,7 +1023,10 @@ export function NarratorPanel({
 					px="md"
 					scrollbars="y"
 					styles={{
-						viewport: { overscrollBehavior: "contain", overflowAnchor: "auto" },
+						viewport: {
+							overscrollBehavior: "contain",
+							overflowAnchor: renderDone ? "auto" : "none",
+						},
 						scrollbar: renderDone
 							? undefined
 							: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
@@ -1182,14 +1180,20 @@ export function NarratorPanel({
 						disabled={!activeTodo}
 						onClick={async () => {
 							if (!activeTodo || !todosToolUseId) return;
-							let msg = findMsgByToolUseIdInTree(messages, todosToolUseId);
+							// Search across all pages without flattening
+							let msg: NarratorMsg | null = null;
+							for (const page of messagesData?.pages ?? []) {
+								msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
+								if (msg) break;
+							}
 							if (!msg) {
 								try {
 									await qc.refetchQueries({ queryKey: messagesQueryKey });
 									const freshData = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
-									const freshMessages =
-										freshData?.pages?.flatMap((p: MessagesPage) => p.messages) ?? [];
-									msg = findMsgByToolUseIdInTree(freshMessages, todosToolUseId);
+									for (const page of freshData?.pages ?? []) {
+										msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
+										if (msg) break;
+									}
 								} catch {
 									return;
 								}
@@ -1256,9 +1260,7 @@ export function NarratorPanel({
 				<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
 					{/* Context usage indicator */}
 					{(() => {
-						const m = allModels.find(
-							(x) => (typeof x === "string" ? x : x.value) === narrator.model,
-						);
+						if (contextPercent == null) return null;
 						const pct = Math.min(contextPercent, 100);
 						const r = 9;
 						const circ = 2 * Math.PI * r;

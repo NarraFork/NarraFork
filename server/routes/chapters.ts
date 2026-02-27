@@ -20,7 +20,8 @@ import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { commitSyncService } from "../services/commit-sync-service";
-import { containerService } from "../services/container-service";
+import { requireAdmin } from "../middleware/auth";
+import { containerService, getPodmanStatus, resetPodmanCache } from "../services/container-service";
 import { gitService } from "../services/git-service";
 
 export const chapterRoutes = new Hono();
@@ -142,6 +143,51 @@ chapterRoutes.post("/batch-merge", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const result = await chapterBatchMerge.run({ ...parsed.data, locale });
 	return c.json(result, 201);
+});
+
+// === Podman ===
+
+chapterRoutes.get("/podman/status", (c) => {
+	const status = getPodmanStatus();
+	const platform =
+		process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
+	return c.json({ ...status, platform });
+});
+
+chapterRoutes.post("/podman/install", requireAdmin, async (c) => {
+	const platform = process.platform;
+	let cmd: string;
+	if (platform === "darwin") {
+		cmd = "brew install podman && podman machine init && podman machine start";
+	} else if (platform === "win32") {
+		cmd = "winget install -e --id RedHat.Podman";
+	} else {
+		// Linux — try common package managers
+		cmd = [
+			"(command -v apt-get >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y podman)",
+			"|| (command -v dnf >/dev/null 2>&1 && sudo dnf install -y podman)",
+			"|| (command -v pacman >/dev/null 2>&1 && sudo pacman -S --noconfirm podman)",
+			'|| (echo "No supported package manager found" && exit 1)',
+		].join(" ");
+	}
+
+	const proc = Bun.spawn(["sh", "-c", cmd], {
+		stdout: "pipe",
+		stderr: "pipe",
+		env: process.env,
+	});
+	const [stdout, stderr] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
+	const exitCode = await proc.exited;
+
+	if (exitCode === 0) {
+		resetPodmanCache();
+		const status = getPodmanStatus();
+		return c.json({ ok: true, ...status });
+	}
+	return c.json({ ok: false, error: (stderr || stdout).trim() }, 500);
 });
 
 // === Containers ===

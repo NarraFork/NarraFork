@@ -37,6 +37,8 @@ export interface OpenAIProviderConfig {
 	apiMode?: "responses" | "completions" | "codex";
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
 	codexAccountId?: string;
+	/** Default context window size (tokens) for models in this provider. */
+	defaultContextWindow?: number;
 }
 
 export interface NarraForkSettings {
@@ -54,6 +56,12 @@ export interface NarraForkSettings {
 			plan: string;
 		};
 		legacyEncoding: boolean;
+		/**
+		 * What to do when an ExitPlanMode permission request times out (30 min):
+		 *   - "deny"         — reject the plan and abort the agent loop (default)
+		 *   - "auto_approve" — automatically approve the plan and continue
+		 */
+		planTimeoutAction: "deny" | "auto_approve";
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -61,6 +69,19 @@ export interface NarraForkSettings {
 		worktreeSizeWarningMb: number;
 		autoSaveOnDormant: boolean;
 		dormantAfterMinutes: number;
+		/**
+		 * Uncommitted change thresholds for auto-commit behavior.
+		 * - `reminderLines` / `reminderFiles`: when exceeded, inject a system reminder
+		 *   into the narrator chat urging it to commit soon.
+		 * - `forceCommitLines` / `forceCommitFiles`: when exceeded, NarraFork
+		 *   force-generates a commit message via summaryModel and commits directly,
+		 *   then injects a system message into chat history.
+		 * Set to 0 to disable the respective threshold.
+		 */
+		autoCommitReminderLines: number;
+		autoCommitReminderFiles: number;
+		autoCommitForceLines: number;
+		autoCommitForceFiles: number;
 	};
 	containers: {
 		portRangeStart: number;
@@ -96,6 +117,7 @@ const DEFAULTS: NarraForkSettings = {
 			plan: "",
 		},
 		legacyEncoding: false,
+		planTimeoutAction: "deny",
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -103,6 +125,10 @@ const DEFAULTS: NarraForkSettings = {
 		worktreeSizeWarningMb: 500,
 		autoSaveOnDormant: true,
 		dormantAfterMinutes: 0,
+		autoCommitReminderLines: 1000,
+		autoCommitReminderFiles: 10,
+		autoCommitForceLines: 2000,
+		autoCommitForceFiles: 25,
 	},
 	containers: {
 		portRangeStart: 10000,
@@ -315,4 +341,61 @@ export function resolveProvider(model?: string): string {
 	// If the model is unknown but any OpenAI provider is configured, assume it's an OpenAI model.
 	const providers = settings.openaiProviders ?? [];
 	if (providers.some((p) => p.apiKey)) return providers[0]?.prefix ?? "openai";
+}
+
+// === Context Window Sizes ===
+
+/**
+ * Built-in model context window sizes (tokens).
+ * Reference: https://platform.openai.com/docs/models
+ */
+const BUILTIN_CONTEXT_WINDOWS: Record<string, number> = {
+	// OpenAI models
+	"gpt-4o": 128_000,
+	"gpt-4o-mini": 128_000,
+	"gpt-4-turbo": 128_000,
+	"gpt-4": 8_192,
+	"gpt-3.5-turbo": 16_385,
+	o1: 200_000,
+	"o1-mini": 128_000,
+	"o3-mini": 200_000,
+	// Common third-party models (via OpenAI-compatible APIs)
+	"deepseek-chat": 64_000,
+	"deepseek-reasoner": 64_000,
+	// Claude models (via OpenAI-compatible gateways)
+	"claude-3-5-sonnet": 200_000,
+	"claude-3-opus": 200_000,
+	"claude-sonnet-4": 200_000,
+	"claude-opus-4": 200_000,
+};
+
+/**
+ * Get the context window size for a model.
+ * Falls back to 128k for unknown models.
+ */
+export function getModelContextWindow(model: string, provider: string): number | null {
+	const bareModel = parseModelId(model).model;
+
+	// 1. Check OpenAI provider configuration (future: models config)
+		const config = getOpenaiProviderConfig(provider);
+		if (config?.defaultContextWindow) {
+			return config.defaultContextWindow;
+		}
+	}
+
+	// 2. Check built-in table (exact match)
+	if (BUILTIN_CONTEXT_WINDOWS[bareModel]) {
+		return BUILTIN_CONTEXT_WINDOWS[bareModel];
+	}
+
+	// 3. Fuzzy match (handles -latest, -preview, date suffixes, etc.)
+	const normalizedBare = bareModel.toLowerCase();
+	for (const [pattern, window] of Object.entries(BUILTIN_CONTEXT_WINDOWS)) {
+		if (normalizedBare.startsWith(pattern)) {
+			return window;
+		}
+	}
+
+	// 4. Unknown model — return default 128k (conservative estimate)
+	return 128_000;
 }

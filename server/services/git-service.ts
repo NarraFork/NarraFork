@@ -6,12 +6,39 @@ interface ExecResult {
 	exitCode: number;
 }
 
+/**
+ * Per-worktree mutex to prevent concurrent git write operations.
+ * Read-only operations (status, diff, log) don't need locking.
+ */
+const worktreeLocks = new Map<string, Promise<unknown>>();
+
+async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): Promise<T> {
+	const prev = worktreeLocks.get(worktreePath) ?? Promise.resolve();
+	let resolve: () => void = () => {};
+	const lock = new Promise<void>((r) => {
+		resolve = r;
+	});
+	worktreeLocks.set(worktreePath, lock);
+	await prev;
+	try {
+		return await fn();
+	} finally {
+		resolve();
+		if (worktreeLocks.get(worktreePath) === lock) {
+			worktreeLocks.delete(worktreePath);
+		}
+	}
+}
+
 export interface GitStatusSummary {
 	hasChanges: boolean;
 	staged: number;
 	unstaged: number;
 	untracked: number;
+	/** Capped at 200 entries. Use `totalFiles` for the real count. */
 	files: Array<{ status: string; path: string }>;
+	/** Total number of changed files (may exceed files.length). */
+	totalFiles: number;
 	headSha: string;
 	branch: string;
 }
@@ -260,16 +287,18 @@ export const gitService = {
 	},
 
 	async autoCommit(worktreePath: string, message: string): Promise<string | null> {
-		const status = await this.getStatus(worktreePath);
-		if (!status) return null;
+		return withWorktreeLock(worktreePath, async () => {
+			const status = await this.getStatus(worktreePath);
+			if (!status) return null;
 
-		const addResult = await exec(["add", "-A"], worktreePath);
-		if (addResult.exitCode !== 0) throw new Error(`git add failed: ${addResult.stderr}`);
+			const addResult = await exec(["add", "-A"], worktreePath);
+			if (addResult.exitCode !== 0) throw new Error(`git add failed: ${addResult.stderr}`);
 
-		const commitResult = await exec(["commit", "-m", message], worktreePath);
-		if (commitResult.exitCode !== 0) throw new Error(`git commit failed: ${commitResult.stderr}`);
+			const commitResult = await exec(["commit", "-m", message], worktreePath);
+			if (commitResult.exitCode !== 0) throw new Error(`git commit failed: ${commitResult.stderr}`);
 
-		return this.getHeadCommit(worktreePath);
+			return this.getHeadCommit(worktreePath);
+		});
 	},
 
 	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
@@ -283,13 +312,16 @@ export const gitService = {
 		let staged = 0;
 		let unstaged = 0;
 		let untracked = 0;
+		const MAX_FILES = 200;
 		const files: Array<{ status: string; path: string }> = [];
 
 		for (const line of lines) {
 			const x = line[0]; // index status
 			const y = line[1]; // worktree status
 			const path = line.slice(3);
-			files.push({ status: line.slice(0, 2).trim(), path });
+			if (files.length < MAX_FILES) {
+				files.push({ status: line.slice(0, 2).trim(), path });
+			}
 
 			if (y === "?") {
 				untracked++;
@@ -305,6 +337,7 @@ export const gitService = {
 			unstaged,
 			untracked,
 			files,
+			totalFiles: lines.length,
 			headSha: headResult.stdout,
 			branch: branchResult.stdout,
 		};
@@ -466,5 +499,218 @@ export const gitService = {
 		args.push(url, destPath);
 		const result = await exec(args, ".");
 		if (result.exitCode !== 0) throw new Error(`Failed to clone repo: ${result.stderr}`);
+	},
+
+	// === Stage / Unstage ===
+
+	async stageFiles(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["add", "--", ...files], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git add failed: ${result.stderr}`);
+		});
+	},
+
+	async stageAll(worktreePath: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["add", "-A"], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git add -A failed: ${result.stderr}`);
+		});
+	},
+
+	async unstageFiles(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git reset failed: ${result.stderr}`);
+		});
+	},
+
+	async unstageAll(worktreePath: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["reset", "HEAD"], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git reset failed: ${result.stderr}`);
+		});
+	},
+
+	async commit(worktreePath: string, message: string): Promise<string> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["commit", "-m", message], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git commit failed: ${result.stderr}`);
+			return this.getHeadCommit(worktreePath);
+		});
+	},
+
+	async discardFiles(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		return withWorktreeLock(worktreePath, async () => {
+			const statusResult = await exec(["status", "--porcelain", "--", ...files], worktreePath);
+			const tracked: string[] = [];
+			const untracked: string[] = [];
+			for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
+				const path = line.slice(3);
+				if (line[0] === "?" && line[1] === "?") {
+					untracked.push(path);
+				} else {
+					tracked.push(path);
+				}
+			}
+			if (tracked.length > 0) {
+				const r = await exec(["checkout", "HEAD", "--", ...tracked], worktreePath);
+				if (r.exitCode !== 0) throw new Error(`git checkout failed: ${r.stderr}`);
+			}
+			if (untracked.length > 0) {
+				const r = await exec(["clean", "-f", "--", ...untracked], worktreePath);
+				if (r.exitCode !== 0) throw new Error(`git clean failed: ${r.stderr}`);
+			}
+		});
+	},
+
+	async discardAll(worktreePath: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
+			if (r1.exitCode !== 0) throw new Error(`git checkout failed: ${r1.stderr}`);
+			const r2 = await exec(["clean", "-fd"], worktreePath);
+			if (r2.exitCode !== 0) throw new Error(`git clean failed: ${r2.stderr}`);
+		});
+	},
+
+	async stash(worktreePath: string, message?: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const args = ["stash", "push", "--include-untracked"];
+			if (message) args.push("-m", message);
+			const result = await exec(args, worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git stash failed: ${result.stderr}`);
+		});
+	},
+
+	async stashPop(worktreePath: string): Promise<{ hasConflicts: boolean }> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["stash", "pop"], worktreePath, true);
+			if (result.exitCode !== 0) {
+				// Check for conflicts via string matching + porcelain status fallback
+				if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
+					return { hasConflicts: true };
+				}
+				const statusResult = await exec(["status", "--porcelain"], worktreePath, true);
+				const hasUnmerged = statusResult.stdout
+					.split("\n")
+					.some((l) => l.startsWith("UU") || l.startsWith("AA") || l.startsWith("DD"));
+				if (hasUnmerged) {
+					return { hasConflicts: true };
+				}
+				throw new Error(`git stash pop failed: ${result.stderr}`);
+			}
+			return { hasConflicts: false };
+		});
+	},
+
+	async stashList(
+		worktreePath: string,
+	): Promise<Array<{ index: number; message: string; date: string }>> {
+		const result = await exec(["stash", "list", "--format=%gd%x00%gs%x00%ai"], worktreePath, true);
+		if (!result.stdout.trim()) return [];
+		return result.stdout
+			.trim()
+			.split("\n")
+			.map((line) => {
+				const [ref, message, date] = line.split("\0");
+				const index = Number.parseInt(ref?.replace("stash@{", "").replace("}", "") ?? "0", 10);
+				return { index, message: message ?? "", date: date ?? "" };
+			});
+	},
+
+	async stashDrop(worktreePath: string, index: number): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["stash", "drop", `stash@{${index}}`], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git stash drop failed: ${result.stderr}`);
+		});
+	},
+
+	// === File diff (working tree) ===
+
+	async getFileDiff(
+		worktreePath: string,
+		filePath: string,
+		staged = false,
+		maxBytes = 200_000,
+	): Promise<{ diff: string; truncated: boolean }> {
+		// Check if file is untracked
+		const statusResult = await exec(["status", "--porcelain", "--", filePath], worktreePath, true);
+		const statusLine = statusResult.stdout.trim();
+
+		let diff: string;
+		if (statusLine.startsWith("??")) {
+			// Untracked file — show full content as "new file" diff
+			const r = await exec(["diff", "--no-index", "/dev/null", filePath], worktreePath, true);
+			diff = r.stdout;
+		} else if (staged) {
+			const r = await exec(["diff", "--cached", "--", filePath], worktreePath, true);
+			diff = r.stdout;
+		} else {
+			const r = await exec(["diff", "--", filePath], worktreePath, true);
+			diff = r.stdout;
+		}
+
+		let truncated = false;
+		if (diff.length > maxBytes) {
+			diff = diff.slice(0, maxBytes);
+			truncated = true;
+		}
+		return { diff, truncated };
+	},
+
+	// === Log ===
+
+	async getLog(
+		worktreePath: string,
+		opts: { limit?: number; skip?: number; branch?: string } = {},
+	): Promise<
+		Array<{
+			sha: string;
+			shortSha: string;
+			message: string;
+			author: string;
+			date: string;
+		}>
+	> {
+		const args = [
+			"log",
+			`--max-count=${opts.limit ?? 50}`,
+			`--skip=${opts.skip ?? 0}`,
+			"--format=%H%x00%h%x00%s%x00%an%x00%aI",
+		];
+		if (opts.branch) args.push(opts.branch);
+		const result = await exec(args, worktreePath, true);
+		if (!result.stdout.trim()) return [];
+		return result.stdout
+			.trim()
+			.split("\n")
+			.map((line) => {
+				const [sha, shortSha, message, author, date] = line.split("\0");
+				return {
+					sha: sha ?? "",
+					shortSha: shortSha ?? "",
+					message: message ?? "",
+					author: author ?? "",
+					date: date ?? "",
+				};
+			});
+	},
+
+	// === Reset ===
+
+	async resetSoft(worktreePath: string, target: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["reset", "--soft", target], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git reset --soft failed: ${result.stderr}`);
+		});
+	},
+
+	async resetHard(worktreePath: string, target: string): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["reset", "--hard", target], worktreePath);
+			if (result.exitCode !== 0) throw new Error(`git reset --hard failed: ${result.stderr}`);
+		});
 	},
 };

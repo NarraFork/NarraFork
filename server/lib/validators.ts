@@ -35,6 +35,20 @@ export const createChapterSchema = z.object({
 	baseBranch: gitBranchName.optional(),
 });
 
+export const containerConfigSchema = z.object({
+	composeFile: z.string().max(500).optional(),
+	services: z.array(z.string().min(1)).optional(),
+	ports: z
+		.array(
+			z.object({
+				containerPort: z.number().int().min(1).max(65535),
+				serviceName: z.string().min(1),
+			}),
+		)
+		.optional(),
+	env: z.record(z.string(), z.string()).optional(),
+});
+
 export const updateChapterSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
@@ -42,6 +56,7 @@ export const updateChapterSchema = z.object({
 	role: z.enum(["trunk", "branch", "exploration"]).optional(),
 	color: z.string().max(20).nullable().optional(),
 	groupLabel: z.string().max(100).nullable().optional(),
+	containerConfig: containerConfigSchema.nullable().optional(),
 });
 
 // === Narrators ===
@@ -149,20 +164,6 @@ export const batchMergeSchema = z.object({
 
 // === Containers ===
 
-export const containerConfigSchema = z.object({
-	composeFile: z.string().max(500).optional(),
-	services: z.array(z.string().min(1)).optional(),
-	ports: z
-		.array(
-			z.object({
-				containerPort: z.number().int().min(1).max(65535),
-				serviceName: z.string().min(1),
-			}),
-		)
-		.optional(),
-	env: z.record(z.string(), z.string()).optional(),
-});
-
 export const containerRemoveSchema = z.object({
 	deleteVolumes: z.boolean().optional(),
 });
@@ -248,6 +249,32 @@ export const updateUserPreferencesSchema = z.object({
 	showTokenUsage: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
+	// Notification preferences
+	notifyOnDone: z.boolean().optional(),
+	notifyOnWaiting: z.boolean().optional(),
+	notifyPwaEnabled: z.boolean().optional(),
+	notifySoundEnabled: z.boolean().optional(),
+	notifySoundType: z.enum(["builtin", "custom"]).optional(),
+	notifySoundBuiltin: z.string().max(50).optional(),
+	notifySoundFileId: z.string().max(50).nullable().optional(),
+	notifyDingtalkEnabled: z.boolean().optional(),
+	notifyDingtalkWebhook: z
+		.string()
+		.max(500)
+		.refine((v) => !v || v.startsWith("https://"), {
+			message: "Webhook URL must start with https://",
+		})
+		.optional(),
+	notifyDingtalkSecret: z.string().max(500).optional(),
+	notifyFeishuEnabled: z.boolean().optional(),
+	notifyFeishuWebhook: z
+		.string()
+		.max(500)
+		.refine((v) => !v || v.startsWith("https://"), {
+			message: "Webhook URL must start with https://",
+		})
+		.optional(),
+	notifyFeishuSecret: z.string().max(500).optional(),
 });
 
 export const recentTabSchema = z.object({
@@ -302,6 +329,14 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	}),
 	z.object({
 		type: z.literal("cancel_buffer"),
+		narratorId: z.string().min(1),
+	}),
+	z.object({
+		type: z.literal("presence_join"),
+		narratorId: z.string().min(1),
+	}),
+	z.object({
+		type: z.literal("presence_leave"),
 		narratorId: z.string().min(1),
 	}),
 ]);
@@ -451,4 +486,63 @@ export const cherryPickSchema = z.object({
 export const listCommitsSchema = z.object({
 	since: z.string().optional(),
 	limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+// === Git operations ===
+
+const filePathArray = z.array(z.string().min(1)).min(1);
+
+export const gitStageSchema = z
+	.object({
+		files: filePathArray.optional(),
+		all: z.boolean().optional(),
+	})
+	.refine((d) => (d.files && d.files.length > 0) || d.all, {
+		message: "Provide files array or set all=true",
+	});
+
+export const gitUnstageSchema = z
+	.object({
+		files: filePathArray.optional(),
+		all: z.boolean().optional(),
+	})
+	.refine((d) => (d.files && d.files.length > 0) || d.all, {
+		message: "Provide files array or set all=true",
+	});
+
+export const gitCommitSchema = z.object({
+	message: z.string().min(1).max(500),
+});
+
+export const gitDiscardSchema = z
+	.object({
+		files: filePathArray.optional(),
+		all: z.boolean().optional(),
+	})
+	.refine((d) => (d.files && d.files.length > 0) || d.all, {
+		message: "Provide files array or set all=true",
+	});
+
+export const gitStashSchema = z.object({
+	action: z.enum(["push", "pop", "drop"]),
+	message: z.string().max(200).optional(),
+	index: z.number().int().min(0).optional(),
+});
+
+export const gitResetSchema = z.object({
+	target: z.string().min(1).max(100),
+	mode: z.enum(["soft", "hard"]),
+});
+
+export const gitLogQuerySchema = z.object({
+	limit: z.coerce.number().int().min(1).max(200).default(50),
+	skip: z.coerce.number().int().min(0).default(0),
+});
+
+export const gitDiffQuerySchema = z.object({
+	file: z.string().min(1),
+	staged: z
+		.string()
+		.optional()
+		.transform((v) => v === "true"),
 });
