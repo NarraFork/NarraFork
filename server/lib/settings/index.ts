@@ -86,6 +86,10 @@ export interface NarraForkSettings {
 	containers: {
 		portRangeStart: number;
 		portRangeEnd: number;
+		proxy: {
+			enabled: boolean;
+			port: number;
+		};
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
@@ -133,6 +137,10 @@ const DEFAULTS: NarraForkSettings = {
 	containers: {
 		portRangeStart: 10000,
 		portRangeEnd: 20000,
+		proxy: {
+			enabled: false,
+			port: 7780,
+		},
 	},
 	editor: {
 		type: "vscode",

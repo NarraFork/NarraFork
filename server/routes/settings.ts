@@ -66,6 +66,13 @@ const updateSettingsSchema = z
 			.object({
 				portRangeStart: z.number().int().min(1).max(65535),
 				portRangeEnd: z.number().int().min(1).max(65535),
+				proxy: z
+					.object({
+						enabled: z.boolean(),
+						port: z.number().int().min(1).max(65535),
+					})
+					.partial()
+					.optional(),
 			})
 			.partial()
 			.optional(),

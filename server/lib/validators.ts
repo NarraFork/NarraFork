@@ -34,6 +34,7 @@ export const updateProjectSchema = z.object({
 	defaultBranch: gitBranchName.optional(),
 	startupScript: z.string().max(5000).nullable().optional(),
 	copyFiles: z.string().max(5000).nullable().optional(),
+	proxyDomain: z.string().max(200).nullable().optional(),
 	chapterSettings: z
 		.object({
 			autoCreateNarrator: z.boolean().optional(),

@@ -1,9 +1,10 @@
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { projects } from "../db/schema";
+import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { getUserLanguage } from "../lib/prompt-i18n";
+import { settings } from "../lib/settings";
 import {
 	batchCleanupSchema,
 	batchMergeSchema,
@@ -21,6 +22,7 @@ import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { commitSyncService } from "../services/commit-sync-service";
+import { buildProxyUrl } from "../services/container-proxy";
 import {
 	containerService,
 	getContainerSetupStatus,
@@ -218,7 +220,36 @@ chapterRoutes.get("/:id/compose-info", async (c) => {
 chapterRoutes.get("/:id/containers", async (c) => {
 	const id = c.req.param("id");
 	const instances = await containerService.listByChapter(id);
-	return c.json(instances);
+
+	// Enrich with proxyUrl if proxy mode is active
+	const proxyPort = settings.containers.proxy?.port ?? 7780;
+	let proxyDomain: string | null = null;
+
+	// All instances belong to the same chapter — look up project domain once
+	const hasProxyInstances = instances.some((inst) => !!inst.proxyLabel);
+	if (hasProxyInstances) {
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, id),
+			columns: { projectId: true },
+		});
+		if (chapter) {
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { proxyDomain: true },
+			});
+			proxyDomain = project?.proxyDomain ?? null;
+		}
+	}
+
+	const enriched = instances.map((inst) => {
+		const proxyUrl =
+			inst.proxyLabel && proxyDomain
+				? buildProxyUrl(inst.proxyLabel, proxyDomain, proxyPort)
+				: null;
+		return { ...inst, proxyUrl };
+	});
+
+	return c.json(enriched);
 });
 
 chapterRoutes.post("/:id/containers/start", async (c) => {

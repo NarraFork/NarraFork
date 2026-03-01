@@ -129,6 +129,8 @@ function SettingsPage() {
 	// Containers
 	const [portStart, setPortStart] = useState(10000);
 	const [portEnd, setPortEnd] = useState(20000);
+	const [proxyEnabled, setProxyEnabled] = useState(false);
+	const [proxyPort, setProxyPort] = useState(7780);
 	// Editor (kept for backward compat but no longer shown in UI)
 	const [editor] = useState("vscode");
 
@@ -155,6 +157,8 @@ function SettingsPage() {
 		acForceFiles: 25,
 		portStart: 10000,
 		portEnd: 20000,
+		proxyEnabled: false,
+		proxyPort: 7780,
 		legacyEncoding: false,
 		planTimeoutAction: "deny",
 	});
@@ -179,6 +183,8 @@ function SettingsPage() {
 				acForceFiles: settings.chapters?.autoCommitForceFiles ?? 25,
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
+				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
+				proxyPort: settings.containers?.proxy?.port ?? 7780,
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				planTimeoutAction: settings.agent?.planTimeoutAction ?? "deny",
 			};
@@ -202,6 +208,8 @@ function SettingsPage() {
 			setAcForceFiles(snap.acForceFiles);
 			setPortStart(snap.portStart);
 			setPortEnd(snap.portEnd);
+			setProxyEnabled(snap.proxyEnabled);
+			setProxyPort(snap.proxyPort);
 			setLegacyEncoding(snap.legacyEncoding);
 			setPlanTimeoutAction(snap.planTimeoutAction);
 			setInitialized(true);
@@ -231,6 +239,8 @@ function SettingsPage() {
 			acForceFiles !== s.acForceFiles ||
 			portStart !== s.portStart ||
 			portEnd !== s.portEnd ||
+			proxyEnabled !== s.proxyEnabled ||
+			proxyPort !== s.proxyPort ||
 			legacyEncoding !== s.legacyEncoding ||
 			planTimeoutAction !== s.planTimeoutAction
 		);
@@ -255,6 +265,8 @@ function SettingsPage() {
 		acForceFiles,
 		portStart,
 		portEnd,
+		proxyEnabled,
+		proxyPort,
 		legacyEncoding,
 		planTimeoutAction,
 	]);
@@ -305,6 +317,10 @@ function SettingsPage() {
 				containers: {
 					portRangeStart: portStart,
 					portRangeEnd: portEnd,
+					proxy: {
+						enabled: proxyEnabled,
+						port: proxyPort,
+					},
 				},
 				editor: { type: editor },
 			},
@@ -330,6 +346,8 @@ function SettingsPage() {
 						acForceFiles,
 						portStart,
 						portEnd,
+						proxyEnabled,
+						proxyPort,
 						legacyEncoding,
 						planTimeoutAction,
 					};
@@ -564,6 +582,22 @@ function SettingsPage() {
 						min={1024}
 						max={65535}
 					/>
+					<Switch
+						label={t("proxyEnabled")}
+						description={t("proxyEnabledDesc")}
+						checked={proxyEnabled}
+						onChange={(e) => setProxyEnabled(e.currentTarget.checked)}
+					/>
+					{proxyEnabled && (
+						<NumberInput
+							label={t("proxyPort")}
+							description={t("proxyPortDesc")}
+							value={proxyPort}
+							onChange={(v) => setProxyPort(typeof v === "number" ? v : 7780)}
+							min={1024}
+							max={65535}
+						/>
+					)}
 				</Stack>
 			</Paper>
 

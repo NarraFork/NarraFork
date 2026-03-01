@@ -4,11 +4,13 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, containerInstances } from "../db/schema";
+import { chapters, containerInstances, projects } from "../db/schema";
 import { NotFoundError, PodmanNotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
+import { buildProxyUrl, generateProxyLabel } from "./container-proxy";
 import { type PortMapping, portAllocator } from "./port-allocator";
 
 export interface ContainerConfig {
@@ -16,6 +18,12 @@ export interface ContainerConfig {
 	services?: string[];
 	ports?: Array<{ containerPort: number; serviceName: string }>;
 	env?: Record<string, string>;
+}
+
+interface ProxyInfo {
+	domain: string;
+	port: number;
+	chapterShortId: string;
 }
 
 interface ExecResult {
@@ -562,18 +570,36 @@ function parseComposeYaml(text: string): ComposeServiceInfo[] {
 	return results;
 }
 
-/** Build environment variables for compose, including port mappings. */
+/** Build environment variables for compose, including port mappings or proxy info. */
 export function buildComposeEnv(
 	chapterId: string,
 	portMappings: PortMapping[],
 	config: ContainerConfig | null,
+	proxyInfo?: ProxyInfo,
 ): Record<string, string> {
 	const env: Record<string, string> = {
 		NARRAFORK_CHAPTER_ID: chapterId,
 		NARRAFORK_VOLUME_PREFIX: `nf_${chapterId.slice(0, 12)}`,
 	};
-	for (const { hostPort, containerPort } of portMappings) {
-		env[`PORT_${containerPort}`] = String(hostPort);
+	if (proxyInfo) {
+		// Proxy mode: inject proxy URLs instead of host ports
+		env.NARRAFORK_PROXY = "1";
+		env.NARRAFORK_PROXY_DOMAIN = proxyInfo.domain;
+		if (config?.ports) {
+			for (const { containerPort, serviceName } of config.ports) {
+				const label = generateProxyLabel(proxyInfo.chapterShortId, serviceName, containerPort);
+				env[`NARRAFORK_PROXY_URL_${containerPort}`] = buildProxyUrl(
+					label,
+					proxyInfo.domain,
+					proxyInfo.port,
+				);
+			}
+		}
+	} else {
+		// Legacy mode: inject host port mappings
+		for (const { hostPort, containerPort } of portMappings) {
+			env[`PORT_${containerPort}`] = String(hostPort);
+		}
 	}
 	if (config?.env) {
 		Object.assign(env, config.env);
@@ -601,17 +627,41 @@ export const containerService = {
 			throw new ValidationError(`Cannot start containers: ${hint}`);
 		}
 
-		// Allocate ports
+		// Determine proxy mode: global proxy enabled + project has proxyDomain
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, chapter.projectId),
+			columns: { proxyDomain: true },
+		});
+		const proxyEnabled = settings.containers.proxy?.enabled && !!project?.proxyDomain;
+		const proxyDomain = project?.proxyDomain ?? null;
+
+		// Allocate ports (skip in proxy mode)
 		let portMappings: PortMapping[] = [];
-		if (config?.ports && config.ports.length > 0) {
+		if (!proxyEnabled && config?.ports && config.ports.length > 0) {
 			portMappings = await portAllocator.allocate(chapterId, config.ports);
 		}
 
-		const env = buildComposeEnv(chapterId, portMappings, config);
+		const chapterShortId = chapterId.slice(0, 8);
+		const env = buildComposeEnv(
+			chapterId,
+			portMappings,
+			config,
+			proxyEnabled && proxyDomain
+				? {
+						domain: proxyDomain,
+						port: settings.containers.proxy.port,
+						chapterShortId,
+					}
+				: undefined,
+		);
 
 		// Signal that we're starting (UI can show a spinner)
 		eventBus.emit({ type: "container:starting", chapterId });
-		logger.info("Starting chapter containers in background", { chapterId, composeFile });
+		logger.info("Starting chapter containers in background", {
+			chapterId,
+			composeFile,
+			proxyMode: proxyEnabled,
+		});
 
 		// Run compose up in the background — don't await
 		this._runComposeUp(
@@ -621,6 +671,9 @@ export const containerService = {
 			portMappings,
 			env,
 			config,
+			proxyEnabled && proxyDomain
+				? { domain: proxyDomain, port: settings.containers.proxy.port, chapterShortId }
+				: undefined,
 		).catch(() => {
 			// Errors are already handled inside _runComposeUp via eventBus
 		});
@@ -634,7 +687,9 @@ export const containerService = {
 		portMappings: PortMapping[],
 		env: Record<string, string>,
 		config: ContainerConfig | null,
+		proxyInfo?: ProxyInfo,
 	): Promise<void> {
+		const isProxy = !!proxyInfo;
 		try {
 			const composeArgs = ["compose", "-f", composeFile, "up", "-d"];
 			if (config?.services && config.services.length > 0) {
@@ -651,7 +706,7 @@ export const containerService = {
 			);
 
 			if (result.exitCode !== 0) {
-				await portAllocator.release(chapterId);
+				if (!isProxy) await portAllocator.release(chapterId);
 				const msg = result.stderr || `compose up failed with exit code ${result.exitCode}`;
 				eventBus.emit({ type: "container:error", chapterId, error: msg });
 				return;
@@ -666,6 +721,7 @@ export const containerService = {
 					composeFile,
 					portMappings,
 					env,
+					proxyInfo,
 				);
 			} catch (recordErr) {
 				logger.error("Failed to record container instances, running compose down to clean up", {
@@ -673,7 +729,7 @@ export const containerService = {
 					error: String(recordErr),
 				});
 				await exec(["compose", "-f", composeFile, "down"], worktreePath, env);
-				await portAllocator.release(chapterId);
+				if (!isProxy) await portAllocator.release(chapterId);
 				eventBus.emit({
 					type: "container:error",
 					chapterId,
@@ -682,14 +738,14 @@ export const containerService = {
 				return;
 			}
 
-			logger.info("Chapter containers started", { chapterId });
+			logger.info("Chapter containers started", { chapterId, proxyMode: isProxy });
 			eventBus.emit({ type: "container:started", chapterId });
 		} catch (err) {
 			logger.error("Unexpected error during container start", {
 				chapterId,
 				error: String(err),
 			});
-			await portAllocator.release(chapterId).catch(() => {});
+			if (!isProxy) await portAllocator.release(chapterId).catch(() => {});
 			eventBus.emit({
 				type: "container:error",
 				chapterId,
@@ -794,6 +850,13 @@ export const containerService = {
 		const config = chapter.containerConfig as ContainerConfig | null;
 		const worktreePath = chapter.worktreePath;
 
+		// Check if this chapter was using proxy mode (has proxyLabel records)
+		const existingInstances = await db.query.containerInstances.findMany({
+			where: eq(containerInstances.chapterId, chapterId),
+			columns: { proxyLabel: true },
+		});
+		const wasProxyMode = existingInstances.some((i) => !!i.proxyLabel);
+
 		// Try to run compose down if worktree exists
 		if (worktreePath) {
 			const composeFile = resolveComposeFile(worktreePath, config);
@@ -813,7 +876,10 @@ export const containerService = {
 
 		// Clean up DB records regardless
 		await db.delete(containerInstances).where(eq(containerInstances.chapterId, chapterId));
-		await portAllocator.release(chapterId);
+		// Only release ports if not in proxy mode
+		if (!wasProxyMode) {
+			await portAllocator.release(chapterId);
+		}
 
 		eventBus.emit({ type: "container:stopped", chapterId });
 		logger.info("Chapter containers removed", { chapterId, deleteVolumes: opts.deleteVolumes });
@@ -856,6 +922,7 @@ export const containerService = {
 		composeFile: string,
 		portMappings: PortMapping[],
 		env: Record<string, string>,
+		proxyInfo?: ProxyInfo,
 	): Promise<void> {
 		const result = await exec(
 			["compose", "-f", composeFile, "ps", "--format", "json"],
@@ -899,23 +966,42 @@ export const containerService = {
 					"unknown";
 				const containerId = (container.ID as string) || (container.Id as string) || null;
 
-				// Extract actual port mappings from compose ps output
-				// podman-compose: Ports: [{ host_port, container_port, ... }]
-				// docker compose: Publishers: [{ PublishedPort, TargetPort, ... }]
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
-				const ports = (container.Ports ?? container.Publishers ?? []) as any[];
-				const firstPort = ports[0] as Record<string, unknown> | undefined;
-				const userMapping = portMappings.find((p) => p.serviceName === serviceName);
-				const hostPort =
-					(firstPort?.host_port as number) ??
-					(firstPort?.PublishedPort as number) ??
-					userMapping?.hostPort ??
-					null;
-				const containerPort =
-					(firstPort?.container_port as number) ??
-					(firstPort?.TargetPort as number) ??
-					userMapping?.containerPort ??
-					null;
+				let hostPort: number | null = null;
+				let containerPort: number | null = null;
+				let proxyLabel: string | null = null;
+				let containerIp: string | null = null;
+
+				if (proxyInfo) {
+					// Proxy mode: get container IP, generate proxy label
+					if (containerId) {
+						containerIp = await this._getContainerIp(containerId);
+					}
+					// Determine container port from compose ps output
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+					const ports = (container.Ports ?? container.Publishers ?? []) as any[];
+					const firstPort = ports[0] as Record<string, unknown> | undefined;
+					containerPort =
+						(firstPort?.container_port as number) ?? (firstPort?.TargetPort as number) ?? null;
+					if (containerPort != null) {
+						proxyLabel = generateProxyLabel(proxyInfo.chapterShortId, serviceName, containerPort);
+					}
+				} else {
+					// Legacy mode: extract port mappings
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+					const ports = (container.Ports ?? container.Publishers ?? []) as any[];
+					const firstPort = ports[0] as Record<string, unknown> | undefined;
+					const userMapping = portMappings.find((p) => p.serviceName === serviceName);
+					hostPort =
+						(firstPort?.host_port as number) ??
+						(firstPort?.PublishedPort as number) ??
+						userMapping?.hostPort ??
+						null;
+					containerPort =
+						(firstPort?.container_port as number) ??
+						(firstPort?.TargetPort as number) ??
+						userMapping?.containerPort ??
+						null;
+				}
 
 				await db.insert(containerInstances).values({
 					id: generateId(),
@@ -925,12 +1011,15 @@ export const containerService = {
 					status: "running",
 					hostPort,
 					containerPort,
+					proxyLabel,
+					containerIp,
 					createdAt: now,
 					updatedAt: now,
 				});
 			}
-		} else {
-			// Fallback: create instances from port mappings if ps failed
+		} else if (!proxyInfo) {
+			// Fallback: create instances from port mappings if ps failed (legacy mode only).
+			// In proxy mode we can't create useful records without container IDs for IP lookup.
 			for (const { hostPort, containerPort, serviceName } of portMappings) {
 				await db.insert(containerInstances).values({
 					id: generateId(),
@@ -943,6 +1032,30 @@ export const containerService = {
 					updatedAt: now,
 				});
 			}
+		} else {
+			logger.warn("compose ps failed in proxy mode — no container instances recorded", {
+				chapterId,
+			});
+		}
+	},
+
+	/** @internal Get a container's bridge network IP via podman inspect. */
+	async _getContainerIp(containerId: string): Promise<string | null> {
+		try {
+			const result = await exec(
+				[
+					"inspect",
+					"--format",
+					"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+					containerId,
+				],
+				"/",
+			);
+			const ip = result.stdout.trim();
+			return ip || null;
+		} catch (err) {
+			logger.warn("Failed to get container IP", { containerId, error: String(err) });
+			return null;
 		}
 	},
 };

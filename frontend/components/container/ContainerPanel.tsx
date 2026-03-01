@@ -1,4 +1,5 @@
 import {
+	Anchor,
 	Badge,
 	Button,
 	Code,
@@ -68,11 +69,15 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 							<Text size="xs" fw={500}>
 								{c.serviceName}
 							</Text>
-							{c.hostPort && c.containerPort && (
+							{c.proxyUrl ? (
+								<Anchor size="xs" ff="monospace" href={c.proxyUrl} target="_blank" rel="noopener">
+									{c.proxyUrl}
+								</Anchor>
+							) : c.hostPort && c.containerPort ? (
 								<Text size="xs" c="dimmed" ff="monospace">
 									:{c.hostPort} → :{c.containerPort}
 								</Text>
-							)}
+							) : null}
 						</Group>
 						<Badge size="xs" color={CONTAINER_STATUS_COLORS[c.status] ?? "gray"}>
 							{c.status}

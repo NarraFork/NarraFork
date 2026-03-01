@@ -14,6 +14,7 @@ export const projects = sqliteTable("projects", {
 	startupScript: text("startup_script"),
 	copyFiles: text("copy_files"),
 	chapterSettings: text("chapter_settings", { mode: "json" }),
+	proxyDomain: text("proxy_domain"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -401,6 +402,8 @@ export const containerInstances = sqliteTable("container_instances", {
 		.default("created"),
 	hostPort: integer("host_port"),
 	containerPort: integer("container_port"),
+	proxyLabel: text("proxy_label"),
+	containerIp: text("container_ip"),
 	volumeName: text("volume_name"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),

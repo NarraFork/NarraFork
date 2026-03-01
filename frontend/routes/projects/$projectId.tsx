@@ -20,6 +20,7 @@ import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMer
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { StoryNetwork } from "../../components/graph/StoryNetwork";
 import { ProjectCommandsModal } from "../../components/project/ProjectCommandsModal";
+import { ProjectSettingsModal } from "../../components/project/ProjectSettingsModal";
 import { ProjectSkillsModal } from "../../components/project/ProjectSkillsModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
@@ -42,6 +43,7 @@ function ProjectDetailPage() {
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [commandsOpened, { open: openCommands, close: closeCommands }] = useDisclosure(false);
 	const [skillsOpened, { open: openSkills, close: closeSkills }] = useDisclosure(false);
+	const [settingsOpened, { open: openSettings, close: closeSettings }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [deleteConfirmName, setDeleteConfirmName] = useState("");
@@ -137,6 +139,9 @@ function ProjectDetailPage() {
 					<Button variant="light" size="xs" onClick={openSkills}>
 						{tp("skillsButton")}
 					</Button>
+					<Button variant="light" size="xs" onClick={openSettings}>
+						{tp("settingsButton")}
+					</Button>
 					<Button size="xs" onClick={open} disabled={!hasGitPath}>
 						{t("newChapter")}
 					</Button>
@@ -184,6 +189,12 @@ function ProjectDetailPage() {
 			/>
 			<ProjectCommandsModal projectId={projectId} opened={commandsOpened} onClose={closeCommands} />
 			<ProjectSkillsModal projectId={projectId} opened={skillsOpened} onClose={closeSkills} />
+			<ProjectSettingsModal
+				projectId={projectId}
+				proxyDomain={project.proxyDomain ?? null}
+				opened={settingsOpened}
+				onClose={closeSettings}
+			/>
 
 			<Modal
 				opened={deleteOpened}

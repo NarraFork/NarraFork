@@ -43,5 +43,10 @@
 	"skillsEmpty": "No skills found. Create a .narrafork/skills/<name>/SKILL.md file to get started.",
 	"skillsFiles": "files",
 	"skillsLocation": "Location",
-	"skillsCompanionFiles": "Companion files"
+	"skillsCompanionFiles": "Companion files",
+	"settingsButton": "Settings",
+	"settingsTitle": "Project Settings",
+	"proxyDomain": "Proxy Domain",
+	"proxyDomainDesc": "Base domain for container proxy subdomains. Each container port gets a subdomain like {chapterId}-{service}-{port}.{domain}.",
+	"proxyDomainHint": "Requires wildcard DNS: *.{domain} → server IP. For local dev, use *.localhost or configure dnsmasq."
 }
