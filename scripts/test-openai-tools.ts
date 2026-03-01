@@ -152,7 +152,7 @@ let finishReason = "";
 let reasoningChunks = 0;
 const startTime = Date.now();
 const TIMEOUT_MS = 90_000;
-let foundToolCall = false;
+let _foundToolCall = false;
 
 console.log("\n--- SSE Stream ---");
 
@@ -206,12 +206,12 @@ while (true) {
 			}
 			// Responses API: tool call in item field
 			if (chunk.item?.call_id || chunk.item?.name || chunk.item?.type === "function_call") {
-				foundToolCall = true;
+				_foundToolCall = true;
 				console.log(`  → RESPONSES API ITEM:`, JSON.stringify(chunk.item, null, 2).slice(0, 500));
 			}
 			// Responses API: arguments delta at top level
 			if (typeof chunk.delta === "string" && chunk.id?.startsWith("fc_")) {
-				foundToolCall = true;
+				_foundToolCall = true;
 				console.log(
 					`  → RESPONSES API ARG DELTA:`,
 					JSON.stringify({ id: chunk.id, delta: chunk.delta }),

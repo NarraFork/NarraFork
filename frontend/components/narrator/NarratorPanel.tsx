@@ -50,6 +50,7 @@ import {
 	useNarratorMessages,
 	useUpdateModel,
 	useUpdatePermissionMode,
+	useUpdateReasoningEffort,
 } from "../../hooks/useNarrator";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -106,6 +107,7 @@ export function NarratorPanel({
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
+	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const modelMutation = useUpdateModel();
 	const { visibleModels: allModels } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
@@ -1485,6 +1487,55 @@ export function NarratorPanel({
 								)}
 							</Menu.Dropdown>
 						</Menu>
+						{/* Reasoning Effort (only for Codex models) */}
+						{narrator.model?.startsWith("codex:") && (
+							<Menu position="top-end">
+								<Menu.Target>
+									<NativeSelect
+										size="xs"
+										data={[
+											{ value: "", label: t("reasoning_auto") },
+											{ value: "low", label: t("reasoning_low") },
+											{ value: "medium", label: t("reasoning_medium") },
+											{ value: "high", label: t("reasoning_high") },
+											{ value: "xhigh", label: t("reasoning_xhigh") },
+										]}
+										value={narrator.reasoningEffort ?? ""}
+										onChange={() => {}}
+										onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+										style={{ pointerEvents: "auto" }}
+									/>
+								</Menu.Target>
+								<Menu.Dropdown>
+									<Menu.Label>{t("reasoningEffort")}</Menu.Label>
+									{(["", "low", "medium", "high", "xhigh"] as const).map((effort) => {
+										const selected =
+											narrator.reasoningEffort === effort ||
+											(!narrator.reasoningEffort && effort === "");
+										return (
+											<Menu.Item
+												key={effort}
+												onClick={() =>
+													reasoningEffortMutation.mutate({
+														id: narratorId,
+														reasoningEffort: effort || null,
+													})
+												}
+												rightSection={
+													<IconCheck
+														size={14}
+														style={{ visibility: selected ? "visible" : "hidden" }}
+													/>
+												}
+												fw={selected ? 600 : 400}
+											>
+												{t(effort ? `reasoning_${effort}` : "reasoning_auto")}
+											</Menu.Item>
+										);
+									})}
+								</Menu.Dropdown>
+							</Menu>
+						)}
 						{onToggleTerminal && (
 							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
 								<Indicator
@@ -1508,7 +1559,7 @@ export function NarratorPanel({
 					</Group>
 					{/* Mobile: model & permission */}
 					<Group gap={4} wrap="nowrap" hiddenFrom="sm">
-						<Menu position="top-end">
+						<Menu position="bottom-end" withinPortal>
 							<Menu.Target>
 								<ActionIcon variant="subtle" color="gray" size="sm">
 									<Text size="xs" fw={600}>
@@ -1522,7 +1573,7 @@ export function NarratorPanel({
 									</Text>
 								</ActionIcon>
 							</Menu.Target>
-							<Menu.Dropdown>
+							<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 								{narrator.totalCostUsd != null && narrator.totalCostUsd > 0 && (
 									<>
 										<Menu.Label ta="right">${narrator.totalCostUsd.toFixed(4)}</Menu.Label>
@@ -1574,7 +1625,7 @@ export function NarratorPanel({
 								})()}
 							</Menu.Dropdown>
 						</Menu>
-						<Menu position="top-end">
+						<Menu position="bottom-end" withinPortal>
 							<Menu.Target>
 								<ActionIcon variant="subtle" color="gray" size="sm">
 									{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
@@ -1582,7 +1633,7 @@ export function NarratorPanel({
 									)}
 								</ActionIcon>
 							</Menu.Target>
-							<Menu.Dropdown>
+							<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 								<Menu.Label>{t("permissionMode")}</Menu.Label>
 								{(["default", "acceptEdits", "bypassPermissions", "dontAsk"] as const).map(
 									(mode) => {
@@ -1611,6 +1662,49 @@ export function NarratorPanel({
 								)}
 							</Menu.Dropdown>
 						</Menu>
+						{/* Reasoning Effort (only for Codex models) - Mobile */}
+						{narrator.model?.startsWith("codex:") && (
+							<Menu position="bottom-end" withinPortal>
+								<Menu.Target>
+									<ActionIcon variant="subtle" color="gray" size="sm">
+										<Text size="xs" fw={600}>
+											{(() => {
+												const effortMap = { low: "L", medium: "M", high: "H", xhigh: "X" };
+												return effortMap[narrator.reasoningEffort as keyof typeof effortMap] ?? "A";
+											})()}
+										</Text>
+									</ActionIcon>
+								</Menu.Target>
+								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+									<Menu.Label>{t("reasoningEffort")}</Menu.Label>
+									{(["", "low", "medium", "high", "xhigh"] as const).map((effort) => {
+										const selected =
+											narrator.reasoningEffort === effort ||
+											(!narrator.reasoningEffort && effort === "");
+										return (
+											<Menu.Item
+												key={effort}
+												onClick={() =>
+													reasoningEffortMutation.mutate({
+														id: narratorId,
+														reasoningEffort: effort || null,
+													})
+												}
+												rightSection={
+													<IconCheck
+														size={14}
+														style={{ visibility: selected ? "visible" : "hidden" }}
+													/>
+												}
+												fw={selected ? 600 : 400}
+											>
+												{t(effort ? `reasoning_${effort}` : "reasoning_auto")}
+											</Menu.Item>
+										);
+									})}
+								</Menu.Dropdown>
+							</Menu>
+						)}
 						{onToggleTerminal && (
 							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
 								<Indicator

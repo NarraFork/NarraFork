@@ -530,6 +530,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: [],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		isCatastrophic: false,
+		gitBranchViolations: [],
 	};
 
 	const withNonWhitelisted: BashAnalysis = {
@@ -539,6 +541,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: ["rm"],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		isCatastrophic: false,
+		gitBranchViolations: [],
 	};
 
 	const withExternalPath: BashAnalysis = {
@@ -550,6 +554,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: [],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		isCatastrophic: false,
+		gitBranchViolations: [],
 	};
 
 	const withDangerousPattern: BashAnalysis = {
@@ -565,6 +571,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: ["find"],
 		dangerousPatterns: ["find with -exec"],
 		hasEnvInjection: false,
+		isCatastrophic: false,
+		gitBranchViolations: [],
 	};
 
 	const withEnvInjection: BashAnalysis = {
@@ -574,6 +582,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: ["(env injection)"],
 		dangerousPatterns: ["dangerous env var: LD_PRELOAD"],
 		hasEnvInjection: true,
+		isCatastrophic: false,
+		gitBranchViolations: [],
 	};
 
 	test("default + allWhitelisted + internal paths → ask (default mode asks for all mutations)", () => {

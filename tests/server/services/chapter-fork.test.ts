@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { slugify } from "../../../server/services/chapter-fork";
+import { slugify } from "../../../server/lib/slug";
 
 describe("slugify", () => {
 	it("lowercases and replaces spaces with hyphens", () => {

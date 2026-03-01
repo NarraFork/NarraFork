@@ -46,7 +46,12 @@ function seedNarrator(id = "n1", chapterId: string | null = "ch1") {
 		.run();
 }
 
-function seedMessage(id: string, narratorId: string, role = "user", text = "Hello") {
+function seedMessage(
+	id: string,
+	narratorId: string,
+	role: "user" | "assistant" | "system" = "user",
+	text = "Hello",
+) {
 	db.insert(narratorMessages)
 		.values({
 			id,

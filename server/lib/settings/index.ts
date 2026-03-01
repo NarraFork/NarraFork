@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { migrateLegacyCodexOAuth } from "../codex-manager";
 
 export interface ModelOption {
 	value: string;
@@ -39,6 +40,30 @@ export interface OpenAIProviderConfig {
 	codexAccountId?: string;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
+}
+
+export interface AnthropicProviderConfig {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** User-defined display name, e.g. "Anthropic", "Anthropic Proxy". */
+	name: string;
+	/**
+	 * User-defined provider prefix used in model IDs, e.g. "anthropic".
+	 * Model IDs are formatted as "{prefix}:{model}", e.g. "anthropic:claude-sonnet-4-20250514".
+	 * Must be unique across all providers.
+	 */
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	defaultModel: string;
+	/** Default context window size (tokens) for models in this provider. */
+	defaultContextWindow?: number;
+	/**
+	 * MAX mode — mimic Claude Code CLI protocol.
+	 * When enabled, apiKey is sent as Bearer token (instead of x-api-key),
+	 * with additional Claude Code specific headers, tool name prefixing, etc.
+	 */
+	maxMode?: boolean;
 }
 
 export interface NarraForkSettings {
@@ -104,8 +129,20 @@ export interface NarraForkSettings {
 		configPath: string;
 		defaultModel?: string;
 	};
+	/**
+	 * Codex (ChatGPT Pro/Plus) provider configuration.
+	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
+	 */
+	codex?: {
+		/** Default HTTPS proxy for all Codex requests (can be overridden per-credential). */
+		proxy?: string;
+		/** Load balancing mode: "priority" (use highest priority) or "balanced" (round-robin). */
+		loadBalancingMode?: "priority" | "balanced";
+	};
 	/** Multiple OpenAI-compatible API providers. */
 	openaiProviders?: OpenAIProviderConfig[];
+	/** Anthropic native API providers. */
+	anthropicProviders?: AnthropicProviderConfig[];
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -238,6 +275,26 @@ export function loadSettings(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	// Migrate legacy per-provider codexOAuth to centralized credential pool
+	// biome-ignore lint/suspicious/noExplicitAny: migration needs to read removed fields
+	const legacyProviders = merged.openaiProviders?.filter((p: any) => p.codexOAuth) as
+		| Array<{ codexOAuth?: { refreshToken: string }; codexProxy?: string }>
+		| undefined;
+	if (legacyProviders?.length) {
+		migrateLegacyCodexOAuth(legacyProviders);
+		// Clean up codexOAuth and codexProxy from providers
+		for (const p of merged.openaiProviders ?? []) {
+			// biome-ignore lint/suspicious/noExplicitAny: migration needs to delete removed fields
+			if ((p as any).codexOAuth) {
+				// biome-ignore lint/suspicious/noExplicitAny: migration needs to delete removed fields
+				delete (p as any).codexOAuth;
+				// biome-ignore lint/suspicious/noExplicitAny: migration needs to delete removed fields
+				delete (p as any).codexProxy;
+				needsSave = true;
+			}
+		}
+	}
+
 	if (needsSave) saveSettings(merged);
 
 	return merged;
@@ -266,10 +323,26 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
 
+const BUILTIN_CODEX_MODELS = [
+	"gpt-5.3-codex",
+	"gpt-5.2-codex",
+	"gpt-5.2",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-max",
+	"gpt-5.1-codex-mini",
+];
 
 /** Registry for external model checkers and listers (avoids circular imports). */
 let openaiModelChecker: ((model: string) => boolean) | null = null;
+let anthropicModelChecker: ((model: string) => boolean) | null = null;
+let codexModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
+let anthropicModelLister: (() => string[]) | null = null;
+let codexModelLister: (() => string[]) | null = null;
+
+// Register codex model checker and lister immediately
+registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
+registerCodexModelLister(() => BUILTIN_CODEX_MODELS.map((m) => `codex:${m}`));
 
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
 	openaiModelChecker = checker;
@@ -283,12 +356,30 @@ export function registerOpenaiModelLister(lister: () => string[]): void {
 
 }
 
+export function registerAnthropicModelChecker(checker: (model: string) => boolean): void {
+	anthropicModelChecker = checker;
+}
+
+export function registerAnthropicModelLister(lister: () => string[]): void {
+	anthropicModelLister = lister;
+}
+
+export function registerCodexModelChecker(checker: (model: string) => boolean): void {
+	codexModelChecker = checker;
+}
+
+export function registerCodexModelLister(lister: () => string[]): void {
+	codexModelLister = lister;
+}
+
 /**
  * Get all available model values (provider:id format), excluding hidden models.
  */
 export function getVisibleModels(): string[] {
 	const hidden = new Set(settings.agent.hiddenModels ?? []);
 	const openai = openaiModelLister?.() ?? [];
+	const anthropic = anthropicModelLister?.() ?? [];
+	const codex = codexModelLister?.() ?? [];
 	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
 	const seen = new Set<string>();
 	const result: string[] = [];
@@ -338,13 +429,34 @@ export function openaiProviderPrefix(config: OpenAIProviderConfig): string {
 	return config.prefix;
 }
 
+/**
+ * Get the Anthropic provider config by its prefix.
+ * If prefix is undefined, returns the first provider.
+ */
+export function getAnthropicProviderConfig(prefix?: string): AnthropicProviderConfig | undefined {
+	const providers = settings.anthropicProviders ?? [];
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+/**
+ * Get the provider prefix for a given Anthropic provider config.
+ * Simply returns the config's prefix field.
+ */
+export function anthropicProviderPrefix(config: AnthropicProviderConfig): string {
+	return config.prefix;
+}
+
 /** Resolve provider name for a given model (supports "provider:model" prefix). */
 export function resolveProvider(model?: string): string {
 	const { provider: explicit, model: bare } = parseModelId(model);
 	if (explicit) return explicit;
+	if (BUILTIN_CODEX_MODELS.includes(bare)) return "codex";
 	const custom = settings.agent.customModels ?? [];
 	const found = custom.find((m) => m.value === bare || m.value === model);
 	if (found?.provider) return found.provider;
+	if (anthropicModelChecker?.(bare)) return "anthropic";
+	if (codexModelChecker?.(bare)) return "codex";
 	if (openaiModelChecker?.(bare)) return "openai";
 	// If the model is unknown but any OpenAI provider is configured, assume it's an OpenAI model.
 	const providers = settings.openaiProviders ?? [];
@@ -375,6 +487,13 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number> = {
 	"claude-3-opus": 200_000,
 	"claude-sonnet-4": 200_000,
 	"claude-opus-4": 200_000,
+	// Anthropic native API models
+	"claude-sonnet-4-20250514": 200_000,
+	"claude-opus-4-20250514": 200_000,
+	"claude-haiku-4-20250414": 200_000,
+	"claude-3-5-sonnet-20241022": 200_000,
+	"claude-3-5-haiku-20241022": 200_000,
+	"claude-3-opus-20240229": 200_000,
 };
 
 /**
@@ -384,10 +503,14 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number> = {
 export function getModelContextWindow(model: string, provider: string): number | null {
 	const bareModel = parseModelId(model).model;
 
-	// 1. Check OpenAI provider configuration (future: models config)
-		const config = getOpenaiProviderConfig(provider);
-		if (config?.defaultContextWindow) {
-			return config.defaultContextWindow;
+	// 1. Check provider configuration (OpenAI or Anthropic)
+		const oaiConfig = getOpenaiProviderConfig(provider);
+		if (oaiConfig?.defaultContextWindow) {
+			return oaiConfig.defaultContextWindow;
+		}
+		const anthropicConfig = getAnthropicProviderConfig(provider);
+		if (anthropicConfig?.defaultContextWindow) {
+			return anthropicConfig.defaultContextWindow;
 		}
 	}
 

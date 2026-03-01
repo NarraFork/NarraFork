@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { ValidationError } from "../lib/errors";
 import { loadSettings, type NarraForkSettings, saveSettings } from "../lib/settings";
+import { getAnthropicCachedModelsGrouped } from "./anthropic";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
 const modelOptionSchema = z.object({
@@ -20,6 +21,16 @@ const openaiProviderSchema = z.object({
 	responsesApi: z.boolean().optional(),
 	apiMode: z.enum(["responses", "completions", "codex"]).optional(),
 	codexAccountId: z.string().optional(),
+});
+
+const anthropicProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
+	maxMode: z.boolean().optional(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
@@ -89,6 +100,7 @@ const updateSettingsSchema = z
 			.partial()
 			.optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
+		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 	})
 	.strict();
 
@@ -111,8 +123,13 @@ settingsRoutes.get("/", (c) => {
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
+		anthropicProviders: (s.anthropicProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
+		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 	};
 	return c.json(result);
 });
@@ -136,11 +153,22 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real API keys for Anthropic providers
+	if (validated.anthropicProviders) {
+		const currentProviders = current.anthropicProviders ?? [];
+		for (const p of validated.anthropicProviders) {
+			if (p.apiKey?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.apiKey = existing?.apiKey ?? "";
+			}
+		}
+	}
+
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
-		if (key === "openaiProviders") {
+		if (key === "openaiProviders" || key === "anthropicProviders") {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
@@ -159,6 +187,10 @@ settingsRoutes.patch("/", async (c) => {
 		...merged,
 		auth: { ...merged.auth, jwtSecret: undefined },
 		openaiProviders: (merged.openaiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		anthropicProviders: (merged.anthropicProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),

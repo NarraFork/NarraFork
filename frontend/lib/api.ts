@@ -209,6 +209,7 @@ export const api = {
 		model?: string;
 		systemPrompt?: string;
 		permissionMode?: string;
+		reasoningEffort?: string | null;
 		cwd?: string;
 		planMode?: boolean;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
@@ -272,6 +273,11 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",
 			body: JSON.stringify({ permissionMode }),
+		}),
+	updateNarratorReasoningEffort: (id: string, reasoningEffort: string | null) =>
+		request<{ ok: boolean }>(`/narrators/${id}/reasoning-effort`, {
+			method: "PATCH",
+			body: JSON.stringify({ reasoningEffort }),
 		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
 		request<{ summary: string }>(`/narrators/${narratorId}/compact/${messageId}`),
@@ -934,6 +940,92 @@ export const api = {
 			`/openai/providers/${providerId}/models/refresh`,
 			{ method: "POST" },
 		),
+	// Codex credential pool management
+	codexStatus: () =>
+		request<{
+			entries: Array<{
+				id: string;
+				displayName?: string;
+				accountId?: string;
+				email?: string;
+				priority: number;
+				disabled: boolean;
+				disabledReason?: string;
+				successCount: number;
+				failureCount: number;
+				lastUsedAt?: string;
+				expiresAt?: number;
+			}>;
+			currentId: string;
+			loadBalancingMode: "priority" | "balanced";
+			total: number;
+			available: number;
+			globalProxy?: string;
+		}>("/codex/status"),
+	codexBrowserAuth: () =>
+		request<{ authorizeUrl: string }>("/codex/auth/browser", {
+			method: "POST",
+		}),
+	codexBrowserAuthCancel: () =>
+		request<{ ok: boolean }>("/codex/auth/browser/cancel", { method: "POST" }),
+	codexDeviceAuthStart: () =>
+		request<{
+			deviceAuthId: string;
+			userCode: string;
+			verificationUrl: string;
+		}>("/codex/auth/device/start", {
+			method: "POST",
+		}),
+	codexDeviceAuthPoll: () =>
+		request<{
+			pending: boolean;
+			userCode?: string;
+			verificationUrl?: string;
+		}>("/codex/auth/device/poll", { method: "POST" }),
+	codexDeviceAuthCancel: () =>
+		request<{ ok: boolean }>("/codex/auth/device/cancel", { method: "POST" }),
+	codexCredentialDisable: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}/disable`, { method: "POST" }),
+	codexCredentialEnable: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}/enable`, { method: "POST" }),
+	codexCredentialReset: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}/reset`, { method: "POST" }),
+	codexCredentialDelete: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}`, { method: "DELETE" }),
+	codexCredentialUpdate: (id: string, data: { displayName?: string; priority?: number }) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	codexCredentialRefresh: (id: string) =>
+		request<{ ok: boolean }>(`/codex/credentials/${id}/refresh`, { method: "POST" }),
+	codexSetLoadBalancingMode: (mode: "priority" | "balanced") =>
+		request<{ ok: boolean; mode: string }>("/codex/load-balancing-mode", {
+			method: "POST",
+			body: JSON.stringify({ mode }),
+		}),
+	codexSetGlobalProxy: (proxy?: string) =>
+		request<{ ok: boolean }>("/codex/global-proxy", {
+			method: "POST",
+			body: JSON.stringify({ proxy }),
+		}),
+	codexImportCredentials: (
+		credentials: Array<{
+			refreshToken: string;
+			displayName?: string;
+			priority?: number;
+		}>,
+	) =>
+		request<{ added: number; duplicates: number }>("/codex/import", {
+			method: "POST",
+			body: JSON.stringify({ credentials }),
+		}),
+	// Anthropic models
+	anthropicRefreshProviderModels: (providerId: string) =>
+		request<{
+			models: Array<{ id: string; display_name?: string }>;
+			fromCache: boolean;
+		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
 };
 
 	text: string,

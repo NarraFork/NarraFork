@@ -527,6 +527,8 @@ function NarratorsPage() {
 						onChange={(v) => setSelectedModel(v ?? "")}
 						placeholder={settingsData?.agent?.defaultModel ?? "claude-sonnet"}
 						clearable
+						maxDropdownHeight={320}
+						comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
 					/>
 
 					<Checkbox

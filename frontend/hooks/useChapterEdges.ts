@@ -4,7 +4,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 export function useChapterEdges(projectId: string | undefined) {
 	return useQuery({
 		queryKey: ["chapterEdges", projectId],
-		queryFn: () => api.listChapterEdges({ projectId: projectId! }),
+		queryFn: () => {
+			if (!projectId) throw new Error("projectId is required");
+			return api.listChapterEdges({ projectId });
+		},
 		enabled: !!projectId,
 	});
 }

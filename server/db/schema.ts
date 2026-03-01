@@ -208,6 +208,9 @@ export const narrators = sqliteTable(
 		permissionMode: text("permission_mode", {
 			enum: ["default", "acceptEdits", "bypassPermissions", "dontAsk"],
 		}).default("default"),
+		reasoningEffort: text("reasoning_effort", {
+			enum: ["low", "medium", "high", "xhigh"],
+		}),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),

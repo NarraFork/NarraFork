@@ -3,10 +3,10 @@
  * Usage: bun run scripts/test-responses-history.ts
  */
 
-import { getOpenaiProviderConfig, settings } from "../server/lib/settings";
 import { OpenAIProvider } from "../server/lib/agent/openai-provider";
-import { registerCoreTools } from "../server/lib/agent/tools";
 import { toolRegistry } from "../server/lib/agent/tool-registry";
+import { registerCoreTools } from "../server/lib/agent/tools";
+import { getOpenaiProviderConfig } from "../server/lib/settings";
 
 registerCoreTools();
 const providerConfig = getOpenaiProviderConfig();
@@ -22,13 +22,20 @@ console.log("apiMode:", provider.apiMode);
 const history: unknown[] = [];
 
 // 1. injectSystemPrompt
-provider.injectSystemPrompt(history, "You are a coding assistant.\n\n## CWD\n`/tmp`", "gpt-5", "zh-CN");
+provider.injectSystemPrompt(
+	history,
+	"You are a coding assistant.\n\n## CWD\n`/tmp`",
+	"gpt-5",
+	"zh-CN",
+);
 
 console.log("\n=== After injectSystemPrompt ===");
 console.log(JSON.stringify(history, null, 2));
 
 // 2. First chat() call — simulate what chat() builds
-const tools = provider.formatTools(toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable()));
+const _tools = provider.formatTools(
+	toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable()),
+);
 const messages1 = [...history];
 // In Responses API mode, convertHistoryToResponsesApi is called
 // (but history is already in correct format from injectSystemPrompt)
@@ -37,14 +44,14 @@ messages1.push({ role: "user", content: "读取 package.json" } as any);
 console.log("\n=== Turn 0: messages sent to API ===");
 for (const [i, m] of messages1.entries()) {
 	const msg = m as any;
-	console.log(`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""}`);
+	console.log(
+		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""}`,
+	);
 }
 
 // 3. Simulate model response: text + tool call
 const assistantText = "读取 package.json 文件。";
-const toolUses = [
-	{ toolUseId: "call_abc123", name: "Read", input: { file_path: "package.json" } },
-];
+const toolUses = [{ toolUseId: "call_abc123", name: "Read", input: { file_path: "package.json" } }];
 
 // 4. pushUserTurn (first turn, no tool results)
 provider.pushUserTurn(history, "读取 package.json", "gpt-5", []);
@@ -55,7 +62,9 @@ provider.pushAssistantTurn(history, assistantText, toolUses);
 console.log("\n=== After Turn 0 pushAssistantTurn ===");
 for (const [i, m] of (history as any[]).entries()) {
 	const msg = m as any;
-	console.log(`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""}`);
+	console.log(
+		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""}`,
+	);
 }
 
 // 6. Format tool result
@@ -83,8 +92,16 @@ for (const tr of pendingToolResults) {
 
 for (const [i, m] of (messages2 as any[]).entries()) {
 	const msg = m as any;
-	const preview = msg.content ? String(msg.content).slice(0, 50) : msg.output ? String(msg.output).slice(0, 50) : msg.arguments ? String(msg.arguments).slice(0, 50) : "";
-	console.log(`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""} ${preview}`);
+	const preview = msg.content
+		? String(msg.content).slice(0, 50)
+		: msg.output
+			? String(msg.output).slice(0, 50)
+			: msg.arguments
+				? String(msg.arguments).slice(0, 50)
+				: "";
+	console.log(
+		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""} ${preview}`,
+	);
 }
 
 // 8. Now simulate pushUserTurn for Turn 1 (happens after chat())
@@ -103,8 +120,16 @@ const messages3 = [...history];
 
 for (const [i, m] of (messages3 as any[]).entries()) {
 	const msg = m as any;
-	const preview = msg.content ? String(msg.content).slice(0, 50) : msg.output ? String(msg.output).slice(0, 50) : msg.arguments ? String(msg.arguments).slice(0, 50) : "";
-	console.log(`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""} ${preview}`);
+	const preview = msg.content
+		? String(msg.content).slice(0, 50)
+		: msg.output
+			? String(msg.output).slice(0, 50)
+			: msg.arguments
+				? String(msg.arguments).slice(0, 50)
+				: "";
+	console.log(
+		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""} ${preview}`,
+	);
 }
 
 // Validate structure
@@ -113,7 +138,9 @@ let valid = true;
 for (const [i, m] of (messages3 as any[]).entries()) {
 	const msg = m as any;
 	if (msg.role === "tool") {
-		console.log(`❌ [${i}] Found role="tool" — should be type="function_call_output" in Responses API`);
+		console.log(
+			`❌ [${i}] Found role="tool" — should be type="function_call_output" in Responses API`,
+		);
 		valid = false;
 	}
 	if (msg.role === "system") {
@@ -121,7 +148,9 @@ for (const [i, m] of (messages3 as any[]).entries()) {
 		valid = false;
 	}
 	if (msg.role === "assistant" && msg.tool_calls) {
-		console.log(`❌ [${i}] Found assistant with tool_calls — should be separate function_call items`);
+		console.log(
+			`❌ [${i}] Found assistant with tool_calls — should be separate function_call items`,
+		);
 		valid = false;
 	}
 }

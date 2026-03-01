@@ -50,8 +50,8 @@ const mapEntries: string[] = [];
 
 for (let i = 0; i < relFiles.length; i++) {
 	const rel = relFiles[i];
-	const urlPath = "/" + relative("dist/frontend", rel); // e.g. "/assets/index-B0dw7udb.js"
-	const importPath = "../../" + rel; // relative from server/generated/ to project root
+	const urlPath = `/${relative("dist/frontend", rel)}`; // e.g. "/assets/index-B0dw7udb.js"
+	const importPath = `../../${rel}`; // relative from server/generated/ to project root
 
 	imports.push(`import _f${i} from ${JSON.stringify(importPath)} with { type: "file" };`);
 	mapEntries.push(`\t${JSON.stringify(urlPath)}: _f${i},`);

@@ -55,6 +55,12 @@
 	"perm_bypassPermissions": "Bypass All",
 	"perm_plan": "Plan",
 	"perm_dontAsk": "Don't Ask",
+	"reasoningEffort": "Reasoning Effort",
+	"reasoning_auto": "Auto",
+	"reasoning_low": "Low",
+	"reasoning_medium": "Medium",
+	"reasoning_high": "High",
+	"reasoning_xhigh": "Extra High",
 	"archiveConfirmTitle": "Confirm Archive",
 	"archiveActiveWarning": "Are you sure you want to archive this session? If it is currently active, archiving will interrupt generation and reject pending permission requests.",
 	"confirmArchive": "Confirm",
@@ -104,5 +110,7 @@
 	"autoCommit.forceCommitTitle": "Auto-Committed",
 	"autoCommit.forceCommitBody": "Changes exceeded threshold — auto-committed as {{commitSha}}: {{message}}",
 	"commandSourceUser": "User",
-	"commandSourceProject": "Project"
+	"commandSourceProject": "Project",
+	"subagentBadge": "Subagent",
+	"subagentReadOnly": "Read-only view of subagent session"
 }

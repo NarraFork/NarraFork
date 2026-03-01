@@ -20,6 +20,7 @@ import {
 	IconRobot,
 	IconTrash,
 } from "@tabler/icons-react";
+import { useNavigate } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
@@ -72,6 +73,7 @@ export const SubagentCard = memo(
 		onBgAgentRetry,
 	}: SubagentCardProps) {
 		const { t } = useTranslation("narrator");
+		const navigate = useNavigate();
 		const input = toolCall.inputJson ?? {};
 		const isBackground = !!input.run_in_background;
 		const agentType = input.subagent_type ?? "agent";
@@ -225,16 +227,29 @@ export const SubagentCard = memo(
 
 		const swipe = useSwipeMenu({ enabled: hasCardActions });
 
+		// Resolve the subagent's own narratorId from child messages
+		const subagentNarratorId = useMemo(() => {
+			for (const cm of childMessages) {
+				if (cm.narratorId && cm.narratorId !== narratorId) return cm.narratorId;
+			}
+			return null;
+		}, [childMessages, narratorId]);
+
 		const handleViewSession = useCallback(() => {
-			setExpanded(true);
-			setShowCalls(true);
-			swipe.closeSwipe();
-			// Scroll to bottom after expand animation
-			setTimeout(() => {
-				const el = scrollBoxRef.current;
-				if (el) el.scrollTop = el.scrollHeight;
-			}, 300);
-		}, [swipe.closeSwipe]);
+			if (subagentNarratorId) {
+				navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+				swipe.closeSwipe();
+			} else {
+				// Fallback: expand card inline if we can't resolve the subagent narrator
+				setExpanded(true);
+				setShowCalls(true);
+				swipe.closeSwipe();
+				setTimeout(() => {
+					const el = scrollBoxRef.current;
+					if (el) el.scrollTop = el.scrollHeight;
+				}, 300);
+			}
+		}, [subagentNarratorId, swipe.closeSwipe, navigate]);
 
 		const cardMenuItems = (
 			<>

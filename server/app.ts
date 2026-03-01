@@ -8,9 +8,11 @@ import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
 import { requireAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
+import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
+import { codexRoutes } from "./routes/codex";
 import { favoriteRoutes } from "./routes/favorites";
 import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
@@ -70,6 +72,8 @@ app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/openai", openaiRoutes);
+app.route("/api/codex", codexRoutes);
+app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/skills", skillRoutes);
 
 // Graph routes are nested under projects for RESTful consistency

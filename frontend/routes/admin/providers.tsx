@@ -3,9 +3,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
+import { CodexSection } from "../../components/providers/CodexSection";
 import { CustomModelsSection } from "../../components/providers/CustomModelsSection";
 import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
-import { ensurePrefix, type OpenAIProviderState } from "../../components/providers/types";
+import {
+	type AnthropicProviderState,
+	ensurePrefix,
+	type OpenAIProviderState,
+} from "../../components/providers/types";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
@@ -30,6 +36,10 @@ function ProvidersPage() {
 	const [openaiProviders, setOpenaiProviders] = useState<OpenAIProviderState[]>([]);
 	const [providersInitialized, setProvidersInitialized] = useState(false);
 
+	// Anthropic providers state
+	const [anthropicProviders, setAnthropicProviders] = useState<AnthropicProviderState[]>([]);
+	const [anthropicInitialized, setAnthropicInitialized] = useState(false);
+
 	// Hidden models state
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [hiddenInitialized, setHiddenInitialized] = useState(false);
@@ -43,6 +53,7 @@ function ProvidersPage() {
 	// Server snapshot for dirty detection
 	const serverSnapshot = useRef({
 		openaiProviders: [] as OpenAIProviderState[],
+		anthropicProviders: [] as AnthropicProviderState[],
 		hiddenModels: [] as string[],
 		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
 	});
@@ -66,6 +77,25 @@ function ProvidersPage() {
 			setProvidersInitialized(true);
 		}
 	}, [settings, providersInitialized]);
+
+	// Sync Anthropic providers from settings
+	useEffect(() => {
+		if (settings && !anthropicInitialized) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const providers = (settings.anthropicProviders ?? []).map((p: any) => ({
+				id: p.id ?? "",
+				name: p.name ?? "",
+				prefix: p.prefix ?? "anthropic",
+				apiKey: p.apiKey ?? "",
+				baseUrl: p.baseUrl ?? "",
+				defaultModel: p.defaultModel ?? "",
+				maxMode: p.maxMode ?? false,
+			}));
+			setAnthropicProviders(providers);
+			serverSnapshot.current.anthropicProviders = providers;
+			setAnthropicInitialized(true);
+		}
+	}, [settings, anthropicInitialized]);
 
 	// Sync hidden models from settings
 	useEffect(() => {
@@ -97,28 +127,34 @@ function ProvidersPage() {
 		onSuccess: () => {
 			serverSnapshot.current = {
 				openaiProviders: [...openaiProviders],
+				anthropicProviders: [...anthropicProviders],
 				hiddenModels: [...hiddenModels],
 				customModels: [...customModels],
 			};
 			setProvidersInitialized(true);
+			setAnthropicInitialized(true);
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		},
 	});
 
 	const isDirty = useMemo(() => {
-		if (!providersInitialized || !hiddenInitialized || !customInitialized) return false;
+		if (!providersInitialized || !anthropicInitialized || !hiddenInitialized || !customInitialized)
+			return false;
 		const s = serverSnapshot.current;
 		return (
 			JSON.stringify(openaiProviders) !== JSON.stringify(s.openaiProviders) ||
+			JSON.stringify(anthropicProviders) !== JSON.stringify(s.anthropicProviders) ||
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels)
 		);
 	}, [
 		providersInitialized,
+		anthropicInitialized,
 		hiddenInitialized,
 		customInitialized,
 		openaiProviders,
+		anthropicProviders,
 		hiddenModels,
 		customModels,
 	]);
@@ -135,9 +171,10 @@ function ProvidersPage() {
 	const handleSave = useCallback(() => {
 		updateMutation.mutate({
 			openaiProviders,
+			anthropicProviders,
 			agent: { hiddenModels, customModels },
 		});
-	}, [updateMutation, openaiProviders, hiddenModels, customModels]);
+	}, [updateMutation, openaiProviders, anthropicProviders, hiddenModels, customModels]);
 
 	const toggleHidden = useCallback((modelVal: string) => {
 		setHiddenModels((prev) =>
@@ -178,11 +215,41 @@ function ProvidersPage() {
 		}));
 	}
 
+	// Build Anthropic models from per-provider grouped data
+	const anthropicModelsGrouped: Array<{
+		providerId: string;
+		providerName: string;
+		models: Array<{ id: string }>;
+	}> = settings?.anthropicModelsGrouped ?? [];
+
+	const serverAnthropicProviders: Array<{ id: string; prefix?: string; name?: string }> =
+		settings?.anthropicProviders ?? [];
+
+	const anthropicPrefixMap: Record<string, string> = {};
+	for (const p of serverAnthropicProviders) {
+		anthropicPrefixMap[p.id] = p.prefix ?? "anthropic";
+	}
+
+	const anthropicModelsMap: Record<string, ModelOption[]> = {};
+	for (const group of anthropicModelsGrouped) {
+		const prefix = anthropicPrefixMap[group.providerId] ?? "anthropic";
+		anthropicModelsMap[group.providerId] = group.models.map((m) => ({
+			value: `${prefix}:${m.id}`,
+			label: m.id,
+			provider: prefix,
+		}));
+	}
+
 	// Provider prefix options for custom model add
 	const prefixOptions = [
+		{ value: "codex", label: "Codex" },
 		...serverProviders.map((p) => ({
 			value: p.prefix ?? "openai",
 			label: p.name ?? p.prefix ?? "openai",
+		})),
+		...serverAnthropicProviders.map((p) => ({
+			value: p.prefix ?? "anthropic",
+			label: p.name ?? p.prefix ?? "anthropic",
 		})),
 	];
 	const seenPrefixes = new Set<string>();
@@ -202,10 +269,20 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 				/>
 
+				<CodexSection hiddenModels={hiddenModels} onToggleHidden={toggleHidden} />
+
 				<OpenAIProvidersSection
 					providers={openaiProviders}
 					onProvidersChange={setOpenaiProviders}
 					providerModelsMap={providerModelsMap}
+					hiddenModels={hiddenModels}
+					onToggleHidden={toggleHidden}
+				/>
+
+				<AnthropicProvidersSection
+					providers={anthropicProviders}
+					onProvidersChange={setAnthropicProviders}
+					providerModelsMap={anthropicModelsMap}
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
 				/>

@@ -436,6 +436,23 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Update reasoning effort
+narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
+	const id = c.req.param("id");
+	const { reasoningEffort } = await c.req.json();
+	const validEfforts = ["low", "medium", "high", "xhigh"];
+	if (
+		reasoningEffort !== null &&
+		reasoningEffort !== undefined &&
+		!validEfforts.includes(reasoningEffort)
+	) {
+		throw new ValidationError(`reasoningEffort must be one of: ${validEfforts.join(", ")} or null`);
+	}
+	await narratorService.getById(id); // ensure exists
+	await narratorService.updateReasoningEffort(id, reasoningEffort);
+	return c.json({ ok: true });
+});
+
 // Update narrator title
 narratorRoutes.patch("/:id/title", async (c) => {
 	const id = c.req.param("id");

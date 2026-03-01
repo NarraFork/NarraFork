@@ -1390,7 +1390,7 @@ async function runAgentLoop(
 
 								const trackPromise = ready.then(() => snapshot.track(chapterId, worktreePath));
 
-								active._snapshotBeforeHashes!.set(toolUseId, trackPromise);
+								active._snapshotBeforeHashes?.set(toolUseId, trackPromise);
 
 								// Swallow errors so the unhandled-rejection handler stays quiet
 								trackPromise.catch((err) =>
@@ -1412,7 +1412,7 @@ async function runAgentLoop(
 
 								const beforePromise = active._snapshotBeforeHashes?.get(toolUseId);
 								if (!beforePromise || !messageId) return;
-								active._snapshotBeforeHashes!.delete(toolUseId);
+								active._snapshotBeforeHashes?.delete(toolUseId);
 
 								// Await the before-hash, then capture after-hash (fire-and-forget)
 								beforePromise
@@ -1504,6 +1504,7 @@ async function runAgentLoop(
 				planMode: freshNarrator.planMode ?? false,
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
+				reasoningEffort: freshNarrator.reasoningEffort ?? undefined,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,
@@ -1924,6 +1925,9 @@ export const compactLocks = new Map<string, Promise<void>>();
 /** Per-narrator lock to prevent concurrent prune boundary computations. */
 export const pruneLocks = new Set<string>();
 
+/** Compact operation timeout in milliseconds (5 minutes). */
+const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
+
 /**
  * Run custom compact with concurrency protection.
  * If a compact is already in progress for this narrator, waits for it to finish
@@ -1943,10 +1947,25 @@ export async function runCustomCompact(
 		return;
 	}
 
-	const compactPromise = doRunCustomCompact(narratorId, locale, beforeMessageId);
+	// Wrap compact with timeout to ensure lock is always released
+	const compactPromise = Promise.race([
+		doRunCustomCompact(narratorId, locale, beforeMessageId),
+		new Promise<void>((_, reject) =>
+			setTimeout(
+				() => reject(new Error("Compact operation timed out after 5 minutes")),
+				COMPACT_TIMEOUT_MS,
+			),
+		),
+	]);
 	compactLocks.set(narratorId, compactPromise);
 	try {
 		await compactPromise;
+	} catch (err) {
+		logger.error("Compact operation failed or timed out", {
+			narratorId,
+			error: String(err),
+		});
+		throw err;
 	} finally {
 		compactLocks.delete(narratorId);
 	}

@@ -9,7 +9,10 @@ const CWD = "/home/user/project";
  * 端到端验证：analyzeBashCommand → resolvePermissionDecision
  * 模拟 handlePermission 中的完整链路
  */
-async function fullChain(cmd: string, permMode = "default"): Promise<"allow" | "deny" | "ask"> {
+async function fullChain(
+	cmd: string,
+	permMode = "default",
+): Promise<"allow" | "deny" | "ask" | "fatal"> {
 	const analysis = await analyzeBashCommand(cmd, CWD);
 	return resolvePermissionDecision("Bash", { command: cmd }, permMode, CWD, false, analysis);
 }

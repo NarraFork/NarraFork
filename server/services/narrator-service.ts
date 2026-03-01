@@ -723,7 +723,21 @@ export const narratorService = {
 		return rows.reverse();
 	},
 
+	/**
+	 * Check if a narrator is a subagent.
+	 * Subagent messages all have parentToolUseId set, so query logic differs.
+	 */
+	async isSubagentNarrator(narratorId: string): Promise<boolean> {
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { type: true },
+		});
+		return narrator?.type === "subagent";
+	},
+
 	async getMessagesCursor(narratorId: string, limit = 50, cursor?: string) {
+		const isSubagent = await this.isSubagentNarrator(narratorId);
+
 		// Build cursor condition on seq
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const cursorConditions: any[] = [eq(narratorMessageRefs.narratorId, narratorId)];
@@ -734,7 +748,8 @@ export const narratorService = {
 			}
 		}
 
-		// Query top-level messages via junction table, ordered by seq DESC
+		// Query messages via junction table, ordered by seq DESC.
+		// For subagent narrators, include all messages (they all have parentToolUseId).
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -742,7 +757,9 @@ export const narratorService = {
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(and(...cursorConditions, isNull(narratorMessages.parentToolUseId)))
+			.where(
+				and(...cursorConditions, ...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)])),
+			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(limit + 1);
 
@@ -763,6 +780,15 @@ export const narratorService = {
 		// Sort by seq order from refs (not createdAt)
 		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+
+		// For subagent narrators, clear parentToolUseId so buildMessageTree
+		// treats them as top-level messages. Also fetch their child messages
+		// (nested subagent tool calls within this subagent).
+		if (isSubagent) {
+			for (const msg of topMessages) {
+				(msg as any).parentToolUseId = null;
+			}
+		}
 
 		// Fetch child messages (don't filter by narratorId — forked narrators
 		// share messages whose narratorId points to the original creator)
@@ -803,6 +829,8 @@ export const narratorService = {
 	 *    `insertChildIntoCache` can place them correctly.
 	 */
 	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 40) {
+		const isSubagent = await this.isSubagentNarrator(narratorId);
+
 		// Find the seq of the reference message
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -814,25 +842,22 @@ export const narratorService = {
 		if (!ref) return { topLevel: [], orphanChildren: [], hitLimit: true };
 
 		// Cheap COUNT to decide catch-up vs full-reload before fetching payloads.
-		// We count only top-level messages (parentToolUseId IS NULL) because child
-		// messages inflate the row count dramatically — a single assistant turn with
-		// tool calls can produce dozens of child refs.
+		// For subagent narrators, count all messages (they all have parentToolUseId).
+		const countConditions = [
+			eq(narratorMessageRefs.narratorId, narratorId),
+			gt(narratorMessageRefs.seq, ref.seq),
+		];
+		if (!isSubagent) {
+			countConditions.push(sql`${narratorMessages.parentToolUseId} IS NULL`);
+		}
 		const [{ cnt }] = await db
 			.select({ cnt: sql<number>`count(*)` })
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gt(narratorMessageRefs.seq, ref.seq),
-					sql`${narratorMessages.parentToolUseId} IS NULL`,
-				),
-			);
+			.where(and(...countConditions));
 		if (cnt > limit) return { topLevel: [], orphanChildren: [], hitLimit: true };
 
-		// Fetch ALL messages (top-level + children) with seq > ref.seq.
-		// The COUNT check above already confirmed the top-level count is within
-		// bounds, so we use a generous hard cap here to include child messages.
+		// Fetch ALL messages with seq > ref.seq.
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -856,13 +881,17 @@ export const narratorService = {
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 
-		// Separate top-level vs child messages
+		// Separate top-level vs child messages.
+		// For subagent narrators, treat all messages as top-level (clear parentToolUseId).
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const topMsgs: any[] = [];
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const childMsgs: any[] = [];
 		for (const msg of allMessages) {
-			if (msg.parentToolUseId) {
+			if (isSubagent) {
+				(msg as any).parentToolUseId = null;
+				topMsgs.push(msg);
+			} else if (msg.parentToolUseId) {
 				childMsgs.push(msg);
 			} else {
 				topMsgs.push(msg);
@@ -954,6 +983,8 @@ export const narratorService = {
 	 * with children nested.
 	 */
 	async getMessagesAround(narratorId: string, messageId: string, contextSize = 5) {
+		const isSubagent = await this.isSubagentNarrator(narratorId);
+
 		// Find the target message
 		const target = await db.query.narratorMessages.findFirst({
 			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
@@ -963,8 +994,9 @@ export const narratorService = {
 		}
 
 		// If target is a child message, walk up to find the top-level ancestor
+		// (skip for subagent narrators — all their messages have parentToolUseId)
 		let anchorMessageId = target.id;
-		if (target.parentToolUseId) {
+		if (!isSubagent && target.parentToolUseId) {
 			const parentTc = await db.query.narratorToolCalls.findFirst({
 				where: and(
 					eq(narratorToolCalls.narratorId, narratorId),
@@ -985,7 +1017,8 @@ export const narratorService = {
 			return this.getMessagesCursor(narratorId, 10);
 		}
 
-		// Fetch older top-level messages (seq < anchorSeq)
+		// Fetch older messages (seq < anchorSeq)
+		// For subagent narrators, skip the isNull(parentToolUseId) filter
 		const olderRefRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -994,7 +1027,7 @@ export const narratorService = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					lt(narratorMessageRefs.seq, anchorRef.seq),
-					isNull(narratorMessages.parentToolUseId),
+					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -1004,7 +1037,7 @@ export const narratorService = {
 		const olderRows = hasMore ? olderRefRows.slice(0, contextSize) : olderRefRows;
 		olderRows.reverse();
 
-		// Fetch anchor + all newer top-level messages
+		// Fetch anchor + all newer messages
 		const newerRefRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -1013,7 +1046,7 @@ export const narratorService = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					gte(narratorMessageRefs.seq, anchorRef.seq),
-					isNull(narratorMessages.parentToolUseId),
+					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
@@ -1035,6 +1068,14 @@ export const narratorService = {
 
 		// Sort by seq order
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+
+		// For subagent narrators, clear parentToolUseId so buildMessageTree
+		// treats them as top-level messages
+		if (isSubagent) {
+			for (const msg of topMessages) {
+				(msg as any).parentToolUseId = null;
+			}
+		}
 
 		// Fetch child messages (don't filter by narratorId — shared messages)
 		const parentToolUseIds = collectToolUseIds(topMessages);
@@ -1798,6 +1839,17 @@ export const narratorService = {
 					inArray(narrators.status, ["thinking", "waiting", "idle"]),
 				),
 			);
+	},
+
+	async updateReasoningEffort(
+		narratorId: string,
+		reasoningEffort: "low" | "medium" | "high" | "xhigh" | null,
+	) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ reasoningEffort, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 
 	async updatePlanMode(narratorId: string, planMode: boolean) {

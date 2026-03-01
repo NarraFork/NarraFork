@@ -107,7 +107,15 @@ export type AgentEvent =
 	| { type: "retryable_error"; message: string }
 	| { type: "context_length_exceeded"; message: string }
 	| { type: "stream_reasoning"; text: string }
-	| { type: "context_usage"; percentage: number }
+	| {
+			type: "context_usage";
+			percentage: number;
+			promptTokens?: number;
+			completionTokens?: number;
+			reasoningTokens?: number;
+			cachedInputTokens?: number;
+			contextWindow?: number;
+	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "done" };
@@ -168,6 +176,8 @@ export interface AgentConfig {
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
+	/** Reasoning effort for Codex models (low, medium, high, xhigh) */
+	reasoningEffort?: "low" | "medium" | "high" | "xhigh";
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	permissionHandler: (

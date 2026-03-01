@@ -1,4 +1,6 @@
-import { getOpenaiProviderConfig } from "../settings";
+import { getAnthropicProviderConfig, getOpenaiProviderConfig } from "../settings";
+import { AnthropicProvider } from "./anthropic-provider";
+import { CodexProvider } from "./codex-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { AgentToolUse } from "./types";
 
@@ -42,7 +44,14 @@ export interface ParsedStreamEvent {
 		stop?: boolean;
 	};
 	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
-	usage?: { promptTokens: number; completionTokens?: number };
+	usage?: {
+		promptTokens: number;
+		completionTokens?: number;
+		/** Reasoning tokens (o1/o3 models) */
+		reasoningTokens?: number;
+		/** Cached input tokens (prompt caching) */
+		cachedInputTokens?: number;
+	};
 	/** Internal: set when Responses API format is detected from the gateway */
 	_responsesApi?: boolean;
 }
@@ -60,6 +69,8 @@ export interface ChatParams {
 	signal: AbortSignal;
 	/** Base64-encoded images to attach to the current user message */
 	images?: Array<{ format: string; base64: string }>;
+	/** Reasoning effort for Codex models (low, medium, high, xhigh) */
+	reasoningEffort?: "low" | "medium" | "high" | "xhigh";
 }
 
 // === The adapter interface ===
@@ -116,6 +127,16 @@ export interface ProviderAdapter {
 // === Provider resolution ===
 
 export function getProvider(provider: string): ProviderAdapter {
+	// Codex is a special provider with centralized credential management
+	if (provider === "codex") {
+		return new CodexProvider();
+	}
+		// Check Anthropic providers first
+		const anthropicConfig = getAnthropicProviderConfig(provider);
+		if (anthropicConfig) {
+			return new AnthropicProvider(anthropicConfig);
+		}
+		// Then check OpenAI-compatible providers
 		const config = getOpenaiProviderConfig(provider);
 		if (config) {
 			return new OpenAIProvider(config);

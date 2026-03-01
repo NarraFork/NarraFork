@@ -397,7 +397,7 @@ export const MessageBubble = memo(function MessageBubble({
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
-	const msgId = message.id;
+	const _msgId = message.id;
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages

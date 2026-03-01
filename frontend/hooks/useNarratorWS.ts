@@ -37,7 +37,7 @@ interface NarratorWSCallbacks {
 	onPlanModeChanged?: (planMode: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
-	onContextUsage?: (percentage: number) => void;
+	onContextUsage?: (percentage: number, promptTokens?: number, contextWindow?: number) => void;
 	onPruneBoundary?: (boundaryMessageId: string | null, prunedPercent: number | null) => void;
 	onGitStatus?: (data: {
 		chapterId: string;
@@ -255,7 +255,11 @@ export function useNarratorWS(
 							break;
 						case "context_usage":
 							if (!data.isSubagent) {
-								callbacksRef.current.onContextUsage?.(data.percentage);
+								callbacksRef.current.onContextUsage?.(
+									data.percentage,
+									data.promptTokens,
+									data.contextWindow,
+								);
 							}
 							break;
 						case "prune_boundary":

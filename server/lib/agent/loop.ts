@@ -175,6 +175,7 @@ export async function* agentLoop(
 				tools,
 				toolResults: pendingToolResults,
 				signal: config.signal,
+				reasoningEffort: config.reasoningEffort,
 				...(isFirstTurn && images?.length ? { images } : {}),
 			});
 
@@ -374,7 +375,15 @@ export async function* agentLoop(
 					const contextWindow = getModelContextWindow(config.model, config.provider);
 					if (contextWindow) {
 						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
-						yield { type: "context_usage", percentage: Math.min(percentage, 100) };
+						yield {
+							type: "context_usage",
+							percentage: Math.min(percentage, 100),
+							promptTokens: parsed.usage.promptTokens,
+							completionTokens: parsed.usage.completionTokens,
+							reasoningTokens: parsed.usage.reasoningTokens,
+							cachedInputTokens: parsed.usage.cachedInputTokens,
+							contextWindow,
+						};
 					}
 				}
 				if (parsed.invalidState) {

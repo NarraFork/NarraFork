@@ -17,7 +17,14 @@ app.get("/", async (c) => {
 	}
 	if (projectId) {
 		if (type) {
-			const edges = await chapterEdgeService.getEdgesByType(projectId, type);
+			const validTypes = ["fork", "merge", "dependency", "cherry_pick"] as const;
+			if (!validTypes.includes(type as (typeof validTypes)[number])) {
+				throw new ValidationError(`Invalid type: ${type}`);
+			}
+			const edges = await chapterEdgeService.getEdgesByType(
+				projectId,
+				type as "fork" | "merge" | "dependency" | "cherry_pick",
+			);
 			return c.json(edges);
 		}
 		const edges = await chapterEdgeService.getEdgesByProject(projectId);

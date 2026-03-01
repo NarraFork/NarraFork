@@ -55,6 +55,12 @@
 	"perm_bypassPermissions": "全部允许",
 	"perm_plan": "仅规划",
 	"perm_dontAsk": "全部拒绝",
+	"reasoningEffort": "思考强度",
+	"reasoning_auto": "自动",
+	"reasoning_low": "低",
+	"reasoning_medium": "中",
+	"reasoning_high": "高",
+	"reasoning_xhigh": "超高",
 	"archiveConfirmTitle": "确认归档",
 	"archiveActiveWarning": "确定要归档该会话吗？如果会话正在运行中，归档将中断当前生成并拒绝权限申请。",
 	"confirmArchive": "确认归档",
@@ -104,5 +110,7 @@
 	"autoCommit.forceCommitTitle": "已自动提交",
 	"autoCommit.forceCommitBody": "变更超过阈值，已自动提交 {{commitSha}}：{{message}}",
 	"commandSourceUser": "用户",
-	"commandSourceProject": "项目"
+	"commandSourceProject": "项目",
+	"subagentBadge": "子代理",
+	"subagentReadOnly": "子代理会话的只读视图"
 }

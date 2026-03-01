@@ -163,6 +163,17 @@ export function useUpdatePermissionMode() {
 	});
 }
 
+export function useUpdateReasoningEffort() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, reasoningEffort }: { id: string; reasoningEffort: string | null }) =>
+			api.updateNarratorReasoningEffort(id, reasoningEffort),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useUpdateModel() {
 	const qc = useQueryClient();
 	return useMutation({

@@ -53,7 +53,14 @@ export type NarratorServerMessage =
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
 	| { type: "compact_failed"; narratorId: string; messageId: string }
-	| { type: "context_usage"; narratorId: string; percentage: number; isSubagent?: boolean }
+	| {
+			type: "context_usage";
+			narratorId: string;
+			percentage: number;
+			isSubagent?: boolean;
+			promptTokens?: number;
+			contextWindow?: number;
+	  }
 	| {
 			type: "prune_boundary";
 			narratorId: string;

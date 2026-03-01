@@ -52,7 +52,7 @@ if (!resp.ok) {
 }
 
 const decoder = new TextDecoder();
-const reader = resp.body!.getReader();
+const reader = resp.body?.getReader();
 let buffer = "";
 let lineNum = 0;
 

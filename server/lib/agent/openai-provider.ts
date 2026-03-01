@@ -82,7 +82,13 @@ interface OAIDelta {
 interface OAIStreamChunk {
 	id?: string;
 	choices?: Array<{ index: number; delta: OAIDelta; finish_reason?: string | null }>;
-	usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+	usage?: {
+		prompt_tokens?: number;
+		completion_tokens?: number;
+		total_tokens?: number;
+		completion_tokens_details?: { reasoning_tokens?: number };
+		prompt_tokens_details?: { cached_tokens?: number };
+	};
 	error?: { message?: string; type?: string; code?: string | number };
 	// --- Responses API fields (used by some gateways/proxies) ---
 	/** Responses API: top-level argument delta string for function calls */
@@ -126,23 +132,39 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** The provider config this instance operates with. */
 	private config: OpenAIProviderConfig;
 
-	constructor(config: OpenAIProviderConfig) {
+	/** Optional proxy URL for all requests (used by Codex). */
+	private proxy?: string;
+
+	constructor(config: OpenAIProviderConfig, proxy?: string) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
+		this.proxy = proxy;
 	}
 
 	/** Convenience: does the current mode use Responses API message format? */
 	private get responsesFormat(): boolean {
 		return usesResponsesFormat(this.apiMode);
 	}
+
+	/**
+	 * Proxy-aware fetch. When a proxy is configured, injects it into the request.
+	 */
+	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		if (this.proxy) {
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+			return fetch(input, { ...init, proxy: this.proxy } as any);
+		}
+		return fetch(input, init);
+	}
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {
-			// Responses API & Codex: flat format { type: "function", name, description, parameters }
+			// Responses API & Codex: flat format { type: "function", name, description, parameters, strict }
 			return tools.map((tool) => ({
 				type: "function",
 				name: tool.name,
 				description: tool.description,
 				parameters: zodToJsonSchema(tool.parameters),
+				strict: false, // Strict mode disabled by default (can be made configurable later)
 			}));
 		}
 		// Completions: nested format { type: "function", function: { ... } }
@@ -193,7 +215,7 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
-		const apiKey = this.config.apiKey;
+		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
 		if (!apiKey) {
@@ -257,8 +279,47 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (usesResponsesEndpoint(this.apiMode)) {
 			// Responses API & Codex: POST /responses
 			endpoint = `${baseUrl}/responses`;
-			body = { model, input: messages, stream: true, store: false };
+
+			// Extract instructions from developer/system messages
+			let instructions = "";
+			const inputMessages: OAIMessage[] = [];
+
+			for (const msg of messages) {
+				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
+				const m = msg as any;
+				if (m.role === "developer" || m.role === "system") {
+					// Accumulate instructions from developer/system messages
+					if (typeof m.content === "string") {
+						instructions += (instructions ? "\n\n" : "") + m.content;
+					}
+				} else {
+					inputMessages.push(msg);
+				}
+			}
+
+			body = { model, input: inputMessages, stream: true, store: false };
+			if (instructions) {
+				body.instructions = instructions;
+			}
 			if (tools.length > 0) body.tools = tools;
+
+			// Add reasoning configuration for Codex models
+			if (params.reasoningEffort) {
+				body.reasoning = {
+					effort: params.reasoningEffort,
+					summary: "auto",
+				};
+				body.include = ["reasoning.encrypted_content"];
+			}
+
+			logger.debug("Responses API request body", {
+				model,
+				hasInstructions: !!instructions,
+				instructionsLength: instructions.length,
+				inputMessageCount: inputMessages.length,
+				toolCount: tools.length,
+				reasoningEffort: params.reasoningEffort,
+			});
 		} else {
 			// Completions: POST /chat/completions
 			endpoint = `${baseUrl}/chat/completions`;
@@ -294,7 +355,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			}),
 		});
 
-		const response = await fetch(endpoint, {
+		const response = await this.pfetch(endpoint, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify(body),
@@ -404,7 +465,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 	): Promise<{ text: string; contextPercent?: number }> {
-		const apiKey = this.config.apiKey;
+		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
 		if (!apiKey) {
@@ -415,7 +476,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (usesResponsesEndpoint(this.apiMode)) {
 			// Responses API & Codex: POST /responses (non-streaming)
-			const response = await fetch(`${baseUrl}/responses`, {
+			const response = await this.pfetch(`${baseUrl}/responses`, {
 				method: "POST",
 				headers: this.buildHeaders(apiKey),
 				body: JSON.stringify({
@@ -435,7 +496,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		// Completions: POST /chat/completions
-		const response = await fetch(`${baseUrl}/chat/completions`, {
+		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify({
@@ -466,7 +527,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		model: string,
 		locale?: string,
 	): Promise<string> {
-		const apiKey = this.config.apiKey;
+		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
 		if (!apiKey) {
@@ -478,7 +539,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (usesResponsesEndpoint(this.apiMode)) {
 			// Responses API & Codex
-			const response = await fetch(`${baseUrl}/responses`, {
+			const response = await this.pfetch(`${baseUrl}/responses`, {
 				method: "POST",
 				headers: this.buildHeaders(apiKey),
 				body: JSON.stringify({
@@ -499,7 +560,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		// Completions
-		const response = await fetch(`${baseUrl}/chat/completions`, {
+		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify({
@@ -532,13 +593,34 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (this.apiMode === "codex") {
 			headers.originator = "narrafork";
 			const accountId = this.config.codexAccountId;
-			// Only send ChatGPT-Account-Id to official ChatGPT domains to avoid
-			// leaking the account identifier to third-party proxies.
-			if (accountId && isOfficialChatGPTDomain(this.config.baseUrl)) {
+			// Only send ChatGPT-Account-Id to official ChatGPT domains
+			if (accountId && this.isOfficialChatGPTDomain()) {
 				headers["ChatGPT-Account-Id"] = accountId;
 			}
 		}
 		return headers;
+	}
+
+	/** Check if the base URL points to an official ChatGPT domain. */
+	private isOfficialChatGPTDomain(): boolean {
+		const baseUrl = this.config.baseUrl;
+		if (!baseUrl) return true; // default URL is official
+		try {
+			const host = new URL(baseUrl).hostname;
+			return (
+				host === "chatgpt.com" || host.endsWith(".chatgpt.com") || host.endsWith(".openai.com")
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Get the effective API key for requests.
+	 * For standard API key auth, returns the configured API key.
+	 */
+	private async getEffectiveApiKey(): Promise<string> {
+		return this.config.apiKey;
 	}
 }
 
@@ -692,14 +774,38 @@ function parseResponsesAPIEvent(
 	const type = chunk.type;
 	if (!type) return [];
 
+	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
+	const results: ParsedStreamEvent[] = [];
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic gateway response may have usage at top level
+	const usage = chunk.response?.usage || (chunk as any).usage;
+	if (usage?.input_tokens != null) {
+		logger.debug("OpenAI Responses API usage found", {
+			type,
+			inputTokens: usage.input_tokens,
+			outputTokens: usage.output_tokens,
+			reasoningTokens: usage.output_tokens_details?.reasoning_tokens,
+			cachedInputTokens: usage.input_tokens_details?.cached_tokens,
+		});
+		results.push({
+			usage: {
+				promptTokens: usage.input_tokens,
+				completionTokens: usage.output_tokens,
+				reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? undefined,
+				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
+			},
+		});
+	}
+
 	// ── Text streaming ──
 	if (type === "response.output_text.delta" && typeof chunk.delta === "string") {
-		return [{ text: chunk.delta }];
+		results.push({ text: chunk.delta });
+		return results;
 	}
 
 	// ── Reasoning content ──
 	if (type === "response.reasoning_summary_text.delta" && typeof chunk.delta === "string") {
-		return [{ reasoning: chunk.delta }];
+		results.push({ reasoning: chunk.delta });
+		return results;
 	}
 
 	// ── Function call: output_item.added ──
@@ -711,12 +817,11 @@ function parseResponsesAPIEvent(
 		if (idx != null && callId && name) {
 			toolAccum.set(idx, { callId, name, args: "", emitted: false });
 			logger.debug("Responses API tool call started", { outputIndex: idx, callId, toolName: name });
-			return [
-				{
-					toolUseChunk: { toolUseId: callId, name, input: undefined, stop: false },
-					_responsesApi: true,
-				},
-			];
+			results.push({
+				toolUseChunk: { toolUseId: callId, name, input: undefined, stop: false },
+				_responsesApi: true,
+			});
+			return results;
 		}
 	}
 
@@ -728,16 +833,14 @@ function parseResponsesAPIEvent(
 		const acc = idx != null ? toolAccum.get(idx) : undefined;
 		if (acc && !acc.emitted) {
 			acc.args += chunk.delta;
-			const results: ParsedStreamEvent[] = [
-				{
-					toolUseChunk: {
-						toolUseId: acc.callId,
-						name: acc.name,
-						input: chunk.delta,
-						stop: false,
-					},
+			results.push({
+				toolUseChunk: {
+					toolUseId: acc.callId,
+					name: acc.name,
+					input: chunk.delta,
+					stop: false,
 				},
-			];
+			});
 			// Early completion if args form valid JSON
 			if (isParsableJson(acc.args)) {
 				results.push({
@@ -759,7 +862,8 @@ function parseResponsesAPIEvent(
 				acc.args = chunk.item.arguments;
 			}
 			acc.emitted = true;
-			return [{ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } }];
+			results.push({ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } });
+			return results;
 		}
 	}
 
@@ -773,40 +877,36 @@ function parseResponsesAPIEvent(
 				acc.args = chunk.item.arguments;
 			}
 			acc.emitted = true;
-			return [{ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } }];
+			results.push({ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } });
+			return results;
 		}
 	}
 
 	// ── Response completed ──
 	if (type === "response.completed") {
-		const results: ParsedStreamEvent[] = [];
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
 				results.push({ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } });
 				acc.emitted = true;
 			}
 		}
-		// Extract usage info for context window tracking
-		const usage = chunk.response?.usage;
-		if (usage?.input_tokens != null) {
-			results.push({
-				usage: { promptTokens: usage.input_tokens, completionTokens: usage.output_tokens },
-			});
-		}
+		// Note: usage is already extracted at the top of this function
 		return results;
 	}
 
 	// ── Error states ──
 	if (type === "response.failed") {
 		const errMsg = chunk.response?.error?.message ?? "Response failed";
-		return [{ invalidState: { reason: "api_error", message: errMsg } }];
+		results.push({ invalidState: { reason: "api_error", message: errMsg } });
+		return results;
 	}
 	if (type === "response.incomplete") {
 		const reason = chunk.response?.incomplete_details?.reason ?? "unknown";
-		return [{ invalidState: { reason, message: `Response incomplete: ${reason}` } }];
+		results.push({ invalidState: { reason, message: `Response incomplete: ${reason}` } });
+		return results;
 	}
 
-	return [];
+	return results;
 }
 
 // === SSE stream parser ===
@@ -933,8 +1033,21 @@ function parseSSELine(line: string, toolAccum: Map<number, ToolAccumEntry>): Par
 	// Convert to usage event for context window tracking.
 	if (chunk.usage && (!chunk.choices || chunk.choices.length === 0)) {
 		const promptTokens = chunk.usage.prompt_tokens;
+		logger.debug("OpenAI usage-only chunk", {
+			hasPromptTokens: promptTokens != null,
+			usage: chunk.usage,
+		});
 		if (promptTokens != null) {
-			return [{ usage: { promptTokens, completionTokens: chunk.usage.completion_tokens } }];
+			return [
+				{
+					usage: {
+						promptTokens,
+						completionTokens: chunk.usage.completion_tokens,
+						reasoningTokens: chunk.usage.completion_tokens_details?.reasoning_tokens ?? undefined,
+						cachedInputTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? undefined,
+					},
+				},
+			];
 		}
 		return [];
 	}
@@ -1276,6 +1389,23 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 
 		if (m.role === "system") {
 			result.push({ role: "developer", content: m.content } as unknown as OAIMessage);
+		} else if (m.role === "user") {
+			// Convert user message content to Responses API format
+			const content =
+				typeof m.content === "string"
+					? [{ type: "input_text", text: m.content }]
+					: Array.isArray(m.content)
+						? m.content.map((part: OAIContentPart) => {
+								if (part.type === "text") {
+									return { type: "input_text", text: part.text };
+								}
+								if (part.type === "image_url") {
+									return { type: "input_image", image_url: part.image_url.url };
+								}
+								return part;
+							})
+						: [{ type: "input_text", text: String(m.content ?? "") }];
+			result.push({ role: "user", content } as unknown as OAIMessage);
 		} else if (m.role === "tool") {
 			result.push({
 				type: "function_call_output",
@@ -1285,7 +1415,9 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 		} else if (m.role === "assistant" && m.tool_calls?.length) {
 			// Split assistant message with tool_calls into text + separate function_call items
 			if (m.content) {
-				result.push({ role: "assistant", content: m.content } as OAIMessage);
+				const content =
+					typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
+				result.push({ role: "assistant", content } as unknown as OAIMessage);
 			}
 			for (const tc of m.tool_calls as OAIToolCall[]) {
 				result.push({
@@ -1295,6 +1427,11 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 					arguments: tc.function.arguments,
 				} as unknown as OAIMessage);
 			}
+		} else if (m.role === "assistant") {
+			// Assistant message without tool calls — convert content to array format
+			const content =
+				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
+			result.push({ role: "assistant", content } as unknown as OAIMessage);
 		} else if (m.type === "function_call_output" || m.type === "function_call") {
 			// Already in Responses API format — pass through
 			result.push(msg);
@@ -1303,15 +1440,4 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 		}
 	}
 	return result;
-}
-
-/** Check whether a URL points to an official ChatGPT / OpenAI domain. */
-function isOfficialChatGPTDomain(baseUrl?: string): boolean {
-	if (!baseUrl) return true; // default URL is official
-	try {
-		const host = new URL(baseUrl).hostname;
-		return host === "chatgpt.com" || host.endsWith(".chatgpt.com") || host.endsWith(".openai.com");
-	} catch {
-		return false;
-	}
 }

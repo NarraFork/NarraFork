@@ -70,6 +70,8 @@ export interface UseNarratorPanelWSReturn {
 	isCompacting: boolean;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
+	promptTokens: number | null;
+	contextWindow: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
 	// Todos
@@ -170,6 +172,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [bufferedText, setBufferedText] = useState<string | null>(null);
 	const [isCompacting, setIsCompacting] = useState(false);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
+	const [promptTokens, setPromptTokens] = useState<number | null>(null);
+	const [contextWindow, setContextWindow] = useState<number | null>(null);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 	const [unreadCount, setUnreadCount] = useState(0);
@@ -774,8 +778,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, planMode } : old,
 				);
 			},
-			onContextUsage: (percentage) => {
+			onContextUsage: (percentage, promptTokens, contextWindow) => {
 				setContextPercent(percentage);
+				setPromptTokens(promptTokens ?? null);
+				setContextWindow(contextWindow ?? null);
 			},
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				setPruneBoundaryMessageId(boundaryMessageId);
@@ -996,6 +1002,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		isCompacting,
 		contextPercent,
 		setContextPercent,
+		promptTokens,
+		contextWindow,
 		pruneBoundaryMessageId,
 		prunedPercent,
 		currentTodos,

@@ -38,17 +38,19 @@ function NarratorDetailPage() {
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
+	const isSubagent = (narrator as any)?.type === "subagent";
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const chapterId = isSubagent ? null : ((narrator as any)?.chapterId as string | null | undefined);
 	const { data: chapter } = useChapter(chapterId ?? "");
 
-	// Record recent tab visit
+	// Record recent tab visit (skip for subagent narrators)
 	const narratorTitle = narrator?.title;
 	const narratorCwd = narrator?.cwd;
 	const narratorStatus = narrator?.status;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterTitle = (chapter as any)?.title as string | undefined;
 	useEffect(() => {
-		if (!narratorTitle) return;
+		if (!narratorTitle || isSubagent) return;
 		if (chapterId) {
 			// Chapter-bound narrator: record as chapter tab
 			addRecentTab({
@@ -69,18 +71,19 @@ function NarratorDetailPage() {
 				status: narratorStatus,
 			});
 		}
-	}, [narratorId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle]);
+	}, [narratorId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle, isSubagent]);
 
 	// Mark narrator as read (done → idle) when visiting the narrator page
 	const qc = useQueryClient();
 	useEffect(() => {
+		if (isSubagent) return;
 		api
 			.markNarratorRead(narratorId)
 			.then(() => {
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			})
 			.catch(() => {});
-	}, [narratorId, qc]);
+	}, [narratorId, qc, isSubagent]);
 
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(narratorId);
@@ -260,10 +263,10 @@ function NarratorDetailPage() {
 						narratorId={narratorId}
 						highlightMessageId={highlightMessageId}
 						onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
-						onSendToTerminal={handleSendToTerminal}
-						appendInputRef={appendInputRef}
-						terminalOpen={drawerOpened}
-						onToggleTerminal={drawerOpened ? closeDrawer : openDrawer}
+						onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
+						appendInputRef={isSubagent ? undefined : appendInputRef}
+						terminalOpen={isSubagent ? undefined : drawerOpened}
+						onToggleTerminal={isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawer}
 					/>
 				</Box>
 
@@ -311,14 +314,16 @@ function NarratorDetailPage() {
 					narratorId={narratorId}
 					highlightMessageId={highlightMessageId}
 					onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
-					onSendToTerminal={terminalOpen ? handleSendToTerminal : undefined}
-					appendInputRef={appendInputRef}
-					terminalOpen={terminalOpen}
-					onToggleTerminal={toggleTerminal}
+					onSendToTerminal={
+						isSubagent ? undefined : terminalOpen ? handleSendToTerminal : undefined
+					}
+					appendInputRef={isSubagent ? undefined : appendInputRef}
+					terminalOpen={isSubagent ? undefined : terminalOpen}
+					onToggleTerminal={isSubagent ? undefined : toggleTerminal}
 				/>
 			</Box>
 
-			{terminalOpen && (
+			{!isSubagent && terminalOpen && (
 				<>
 					{/* Drag handle */}
 					<Box
