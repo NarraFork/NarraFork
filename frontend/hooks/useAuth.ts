@@ -17,8 +17,10 @@ export function useCurrentUser() {
 		queryFn: api.me,
 		enabled: !!getToken(),
 		retry: (failureCount, error) => {
-			// Don't retry auth failures, but retry transient server errors
-			if ((error as ApiError)?.status === 401) return false;
+			// Don't retry auth failures or missing user, but retry transient server errors.
+			// 401 = token invalid/expired; 404 = user deleted (DB wipe) while token still valid.
+			const status = (error as ApiError)?.status;
+			if (status === 401 || status === 404) return false;
 			return failureCount < 3;
 		},
 		staleTime: 30_000,

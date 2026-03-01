@@ -10,6 +10,8 @@ export interface ToolContext {
 	locale: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
+	/** Skill scan root — project gitPath or git root resolved from cwd */
+	skillRoot?: string;
 	/** Request permission from the user. Returns true if allowed. */
 	requestPermission: (
 		toolName: string,
@@ -37,12 +39,15 @@ export interface ToolResult {
 
 export interface ToolDefinition {
 	name: string;
-	description: string;
+	description: string | ((config: AgentConfig) => string);
 	parameters: z.ZodType;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;
 }
+
+/** ToolDefinition with description resolved to a plain string (after dynamic evaluation) */
+export type ResolvedToolDefinition = ToolDefinition & { description: string };
 
 // === Permission ===
 
@@ -143,6 +148,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Task",
 	"ContinueTask",
 	"AskUserQuestion",
+	"Skill",
 ]);
 
 // === Agent config ===
@@ -160,6 +166,8 @@ export interface AgentConfig {
 	planMode?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit redirection and ExitPlanMode */
 	planFileId?: string;
+	/** Skill scan root — project gitPath or git root resolved from cwd */
+	skillRoot?: string;
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	permissionHandler: (

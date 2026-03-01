@@ -5,7 +5,7 @@ import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { zodToJsonSchema } from "./tool-registry";
-import type { AgentToolUse, ToolDefinition } from "./types";
+import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
@@ -135,7 +135,7 @@ export class OpenAIProvider implements ProviderAdapter {
 	private get responsesFormat(): boolean {
 		return usesResponsesFormat(this.apiMode);
 	}
-	formatTools(tools: ToolDefinition[]): unknown[] {
+	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {
 			// Responses API & Codex: flat format { type: "function", name, description, parameters }
 			return tools.map((tool) => ({

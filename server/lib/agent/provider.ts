@@ -66,7 +66,7 @@ export interface ChatParams {
 
 export interface ProviderAdapter {
 	/** Convert ToolDefinition[] to provider-specific tool format */
-	formatTools(tools: import("./types").ToolDefinition[]): unknown[];
+	formatTools(tools: import("./types").ResolvedToolDefinition[]): unknown[];
 
 	/** Convert DB messages to provider history + trailing tool results */
 	buildHistory(

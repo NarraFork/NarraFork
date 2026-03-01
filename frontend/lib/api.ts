@@ -905,6 +905,25 @@ export const api = {
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
 			"/openai/models",
 		),
+
+	// Skills
+	listSkills: (projectId: string) =>
+		request<
+			Array<{
+				name: string;
+				description: string;
+				location: string;
+				files: string[];
+			}>
+		>(`/skills?projectId=${projectId}`),
+	getSkill: (projectId: string, name: string) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+		}>(`/skills/${encodeURIComponent(name)}?projectId=${projectId}`),
 	openaiRefreshModels: () =>
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
 			"/openai/models/refresh",

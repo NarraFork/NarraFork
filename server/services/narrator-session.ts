@@ -86,6 +86,10 @@ interface ActiveNarrator {
 	_snapshotInitPromise?: Promise<void>;
 	/** Per-tool-call before-hash promise cache: toolUseId → Promise<tree hash> */
 	_snapshotBeforeHashes?: Map<string, Promise<string>>;
+	/** Cached project git path (for skill loading) */
+	_projectGitPath?: string | null;
+	/** Resolved skill scan root (projectGitPath or git root from cwd) */
+	_skillRoot?: string | null;
 }
 
 const activeNarrators = new Map<string, ActiveNarrator>();
@@ -183,7 +187,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 // Task is auto-allowed when using the parent's cwd — the subagent's
 // individual tools go through their own permission checks. When Task specifies
 // a different workdir, it requires user approval (handled below).
-const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "ContinueTask"];
+const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "ContinueTask", "Skill"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -829,11 +833,17 @@ async function createNarrator(
 	let narratorChapterId: string | undefined;
 	let narratorWorktreePath: string | undefined;
 	let narratorBaseBranch: string | undefined;
+	let projectGitPath: string | null = null;
 	if (narrator.chapterId) {
 		const ch = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
 		});
 		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
+		// Always try to resolve project gitPath for skill loading
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, ch.projectId),
+		});
+		projectGitPath = project?.gitPath ?? null;
 		if (ch.worktreePath) {
 			narratorCwd = ch.worktreePath;
 			narratorChapterId = ch.id;
@@ -841,9 +851,6 @@ async function createNarrator(
 			narratorBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, ch.projectId),
-			});
 			narratorCwd = narrator.cwd || project?.gitPath || process.env.HOME || "/tmp";
 			logger.info("Chapter dormant, using fallback CWD", {
 				chapterId: narrator.chapterId,
@@ -872,6 +879,20 @@ async function createNarrator(
 		planFileId,
 	);
 
+	// Resolve skill root for the Skill tool (projectGitPath or git root from cwd)
+	let skillRoot: string | null = null;
+	try {
+		const { resolveSkillRoot } = await import("./skill-service");
+		skillRoot = await resolveSkillRoot(projectGitPath, narratorCwd);
+		if (skillRoot) {
+			// Pre-populate skill cache so the tool description includes the skill list
+			const { warmSkillCache } = await import("../lib/agent/tools/skill");
+			await warmSkillCache(skillRoot);
+		}
+	} catch {
+		// Skill root resolution failure is non-fatal
+	}
+
 	const abortController = new AbortController();
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
@@ -895,6 +916,8 @@ async function createNarrator(
 		_worktreePath: narratorWorktreePath,
 		_baseBranch: narratorBaseBranch,
 		_planFileId: planFileId,
+		_projectGitPath: projectGitPath,
+		_skillRoot: skillRoot,
 	};
 
 	activeNarrators.set(narratorId, active);
@@ -1365,8 +1388,7 @@ async function runAgentLoop(
 								}
 								const ready = active._snapshotInitPromise;
 
-								const trackPromise = ready
-									.then(() => snapshot.track(chapterId, worktreePath));
+								const trackPromise = ready.then(() => snapshot.track(chapterId, worktreePath));
 
 								active._snapshotBeforeHashes!.set(toolUseId, trackPromise);
 
@@ -1388,18 +1410,14 @@ async function runAgentLoop(
 								const worktreePath = active._worktreePath as string;
 								const messageId = active._partialMessageId;
 
-								const beforePromise =
-									active._snapshotBeforeHashes?.get(toolUseId);
+								const beforePromise = active._snapshotBeforeHashes?.get(toolUseId);
 								if (!beforePromise || !messageId) return;
 								active._snapshotBeforeHashes!.delete(toolUseId);
 
 								// Await the before-hash, then capture after-hash (fire-and-forget)
 								beforePromise
 									.then(async (beforeHash) => {
-										const afterHash = await snapshot.track(
-											chapterId,
-											worktreePath,
-										);
+										const afterHash = await snapshot.track(chapterId, worktreePath);
 										if (afterHash === beforeHash) return;
 										const files = await snapshot.diffFiles(
 											chapterId,
@@ -1485,6 +1503,7 @@ async function runAgentLoop(
 				signal: active.abortController.signal,
 				planMode: freshNarrator.planMode ?? false,
 				planFileId: active._planFileId,
+				skillRoot: active._skillRoot ?? undefined,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,

@@ -89,7 +89,8 @@ export function startHeartbeat() {
 				connectedAt: ws.data.connectedAt,
 				lastPongAt: ws.data.lastPongAt,
 			});
-			getNarratorConnections().delete(ws);
+			// Delegate to the channel handler so presence / stats are cleaned up
+			handleNarratorWS.close(ws);
 			try {
 				ws.close(1000, "heartbeat timeout");
 			} catch {
@@ -102,7 +103,8 @@ export function startHeartbeat() {
 				connectedAt: ws.data.connectedAt,
 				lastPongAt: ws.data.lastPongAt,
 			});
-			getTerminalConnections().delete(ws);
+			// Delegate to the channel handler so subscriptions are cleaned up
+			handleTerminalWS.close(ws);
 			try {
 				ws.close(1000, "heartbeat timeout");
 			} catch {

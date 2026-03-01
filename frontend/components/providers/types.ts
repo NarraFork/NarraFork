@@ -21,15 +21,18 @@ export function ensurePrefix(val: string): string {
 /**
  *
  * Decision logic (in priority order):
- * 1. authMethod === "idc" or hasProfileArn → enterprise (IDC = AWS Identity Center)
+ * 1. authMethod === "idc" or hasProfileArn or hasStartUrl → enterprise
  * 2. subscriptionTitle contains "enterprise" / "business" → enterprise
  * 3. subscriptionTitle contains "pro" / "individual" / "paid" / "builder" / "power" → paid
  * 4. subscriptionTitle contains "free" or is absent → free
  */
 	authMethod?: string;
 	hasProfileArn?: boolean;
+	hasStartUrl?: boolean;
 	subscriptionTitle?: string;
-	if (entry.authMethod === "idc" || entry.hasProfileArn) return "enterprise";
+	if (entry.authMethod === "idc" || entry.hasProfileArn || entry.hasStartUrl) {
+		return "enterprise";
+	}
 
 	const title = entry.subscriptionTitle;
 	if (!title) return "free";

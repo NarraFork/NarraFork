@@ -71,6 +71,8 @@ interface NarratorWSCallbacks {
 const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
+/** If no ping is received within this window, assume the connection is dead. */
+const CLIENT_PING_TIMEOUT_MS = 60_000;
 
 export function useNarratorWS(
 	narratorId: string | undefined,
@@ -81,7 +83,17 @@ export function useNarratorWS(
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
 	const lastMessageIdRef = useRef(lastMessageId);
-	lastMessageIdRef.current = lastMessageId;
+	// Keep in sync with the prop, and allow internal updates from
+	// incoming WS messages so that reconnect catch-up uses the latest cursor.
+	// When the prop becomes undefined (e.g. narrator switch), clear the ref
+	// so reconnect doesn't use a stale cursor from a different narrator.
+	useEffect(() => {
+		if (lastMessageId !== undefined) {
+			lastMessageIdRef.current = lastMessageId;
+		} else {
+			lastMessageIdRef.current = undefined;
+		}
+	}, [lastMessageId]);
 	const [connected, setConnected] = useState(false);
 	const [disconnected, setDisconnected] = useState(false);
 	const disconnectedRef = useRef(false);
@@ -111,6 +123,17 @@ export function useNarratorWS(
 		let cancelled = false;
 		let attempts = 0;
 		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+		let pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+		function resetPingTimeout(ws: WebSocket) {
+			clearTimeout(pingTimeoutTimer);
+			pingTimeoutTimer = setTimeout(() => {
+				// No ping received within the timeout window — assume dead connection
+				if (!cancelled && ws.readyState === WebSocket.OPEN) {
+					ws.close(4000, "ping timeout");
+				}
+			}, CLIENT_PING_TIMEOUT_MS);
+		}
 
 		function connect() {
 			if (cancelled) return;
@@ -131,6 +154,7 @@ export function useNarratorWS(
 				disconnectedRef.current = false;
 				attempts = 0;
 				syncGlobalStatus(true);
+				resetPingTimeout(ws);
 				const subscribeMsg: Record<string, unknown> = {
 					type: "subscribe",
 					narratorIds: [subscribedId],
@@ -144,9 +168,10 @@ export function useNarratorWS(
 				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
-					// Respond to server heartbeat ping
+					// Respond to server heartbeat ping and reset timeout
 					if (data.type === "ping") {
 						ws.send(JSON.stringify({ type: "pong" }));
+						resetPingTimeout(ws);
 						return;
 					}
 					// Guard: discard messages targeting a different narrator.
@@ -157,9 +182,11 @@ export function useNarratorWS(
 					switch (data.type) {
 						case "message":
 							callbacksRef.current.onMessage?.(data);
+							if (data.message?.id) lastMessageIdRef.current = data.message.id;
 							break;
 						case "user_message":
 							callbacksRef.current.onUserMessage?.(data);
+							if (data.message?.id) lastMessageIdRef.current = data.message.id;
 							break;
 						case "stream_event":
 							callbacksRef.current.onStreamEvent?.(data);
@@ -281,9 +308,16 @@ export function useNarratorWS(
 						case "narrator:warning":
 							callbacksRef.current.onNarratorWarning?.(data.message);
 							break;
-						case "catch_up":
-							callbacksRef.current.onCatchUp?.(data.orphanChildren ?? [], data.topLevel ?? []);
+						case "catch_up": {
+							const topLevel: TreeMessage[] = data.topLevel ?? [];
+							const orphanChildren: TreeMessage[] = data.orphanChildren ?? [];
+							callbacksRef.current.onCatchUp?.(orphanChildren, topLevel);
+							// Update cursor to the latest caught-up message
+							if (topLevel.length > 0) {
+								lastMessageIdRef.current = topLevel[topLevel.length - 1].id;
+							}
 							break;
+						}
 						case "full_reload":
 							callbacksRef.current.onFullReload?.();
 							break;
@@ -328,6 +362,7 @@ export function useNarratorWS(
 			cancelled = true;
 			disconnectedRef.current = false;
 			clearTimeout(reconnectTimer);
+			clearTimeout(pingTimeoutTimer);
 			removeWSStatus(wsStatusId);
 			const ws = wsRef.current;
 			if (ws) {
@@ -370,14 +405,18 @@ export function useNarratorWS(
 		[],
 	);
 
-	const sendBufferMessage = useCallback((targetNarratorId: string, text: string) => {
-		wsRef.current?.send(
+	const sendBufferMessage = useCallback((targetNarratorId: string, text: string): boolean => {
+		if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
+		wsRef.current.send(
 			JSON.stringify({ type: "buffer_message", narratorId: targetNarratorId, text }),
 		);
+		return true;
 	}, []);
 
-	const cancelBuffer = useCallback((targetNarratorId: string) => {
-		wsRef.current?.send(JSON.stringify({ type: "cancel_buffer", narratorId: targetNarratorId }));
+	const cancelBuffer = useCallback((targetNarratorId: string): boolean => {
+		if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
+		wsRef.current.send(JSON.stringify({ type: "cancel_buffer", narratorId: targetNarratorId }));
+		return true;
 	}, []);
 
 	const reconnect = useCallback(() => {
@@ -416,19 +455,43 @@ export function useNarratorsListWS(
 	onUpdateRef.current = onUpdate;
 	const onGlobalEventRef = useRef(onGlobalEvent);
 	onGlobalEventRef.current = onGlobalEvent;
+	const [connected, setConnected] = useState(false);
+	const [disconnected, setDisconnected] = useState(false);
+	const disconnectedRef = useRef(false);
+	const [reconnectKey, setReconnectKey] = useState(0);
 
 	// Stable serialized key for dependency comparison
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds; using the array directly would reconnect on every render
+	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds; reconnectKey triggers manual reconnection
 	useEffect(() => {
 		// Connect if we have narrator IDs to subscribe to, or a global event handler
 		if (!narratorIds.length && !onGlobalEventRef.current) return;
 
+		const wsStatusId = "narrator-list";
+
+		function syncGlobalStatus(isConnected: boolean) {
+			setWSStatus(wsStatusId, {
+				label: "Narrator List",
+				connected: isConnected,
+				reconnect: () => setReconnectKey((k) => k + 1),
+			});
+		}
+
 		let cancelled = false;
 		let attempts = 0;
 		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+		let pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
 		const currentIds = narratorIds;
+
+		function resetPingTimeout(ws: WebSocket) {
+			clearTimeout(pingTimeoutTimer);
+			pingTimeoutTimer = setTimeout(() => {
+				if (!cancelled && ws.readyState === WebSocket.OPEN) {
+					ws.close(4000, "ping timeout");
+				}
+			}, CLIENT_PING_TIMEOUT_MS);
+		}
 
 		function connect() {
 			if (cancelled) return;
@@ -444,7 +507,12 @@ export function useNarratorsListWS(
 					ws.close();
 					return;
 				}
+				setConnected(true);
+				setDisconnected(false);
+				disconnectedRef.current = false;
 				attempts = 0;
+				syncGlobalStatus(true);
+				resetPingTimeout(ws);
 				if (currentIds.length) {
 					ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
 				}
@@ -453,9 +521,10 @@ export function useNarratorsListWS(
 				if (cancelled) return;
 				try {
 					const data = JSON.parse(event.data);
-					// Respond to server heartbeat ping
+					// Respond to server heartbeat ping and reset timeout
 					if (data.type === "ping") {
 						ws.send(JSON.stringify({ type: "pong" }));
+						resetPingTimeout(ws);
 						return;
 					}
 					const nId = data.narratorId;
@@ -477,13 +546,23 @@ export function useNarratorsListWS(
 			};
 			ws.onclose = () => {
 				if (cancelled) return;
+				setConnected(false);
+				syncGlobalStatus(false);
 				scheduleReconnect();
 			};
-			ws.onerror = () => {};
+			ws.onerror = () => {
+				if (cancelled) return;
+				setConnected(false);
+			};
 		}
 
 		function scheduleReconnect() {
 			if (cancelled) return;
+			if (attempts >= DISCONNECTED_THRESHOLD && !disconnectedRef.current) {
+				disconnectedRef.current = true;
+				setDisconnected(true);
+				syncGlobalStatus(false);
+			}
 			const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempts, RECONNECT_MAX_DELAY_MS);
 			attempts++;
 			reconnectTimer = setTimeout(connect, delay);
@@ -493,7 +572,10 @@ export function useNarratorsListWS(
 
 		return () => {
 			cancelled = true;
+			disconnectedRef.current = false;
 			clearTimeout(reconnectTimer);
+			clearTimeout(pingTimeoutTimer);
+			removeWSStatus(wsStatusId);
 			const ws = wsRef.current;
 			if (ws) {
 				ws.onopen = null;
@@ -506,5 +588,11 @@ export function useNarratorsListWS(
 				ws.close();
 			}
 		};
-	}, [idsKey]);
+	}, [idsKey, reconnectKey]);
+
+	const reconnect = useCallback(() => {
+		setReconnectKey((k) => k + 1);
+	}, []);
+
+	return { connected, disconnected, reconnect };
 }

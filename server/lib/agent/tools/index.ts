@@ -7,6 +7,7 @@ import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
+import { skillTool } from "./skill";
 import { taskTool } from "./task";
 import { todoWriteTool } from "./todo";
 import { webSearchTool } from "./web-search";
@@ -27,4 +28,5 @@ export function registerCoreTools(): void {
 	toolRegistry.register(taskTool);
 	toolRegistry.register(continueTaskTool);
 	toolRegistry.register(askUserQuestionTool);
+	toolRegistry.register(skillTool);
 }

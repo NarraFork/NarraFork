@@ -23,6 +23,7 @@ import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
+import { skillRoutes } from "./routes/skills";
 import { terminalRoutes } from "./routes/terminals";
 import { uploadRoutes } from "./routes/uploads";
 import { userPreferencesRoutes } from "./routes/user-preferences";
@@ -69,6 +70,7 @@ app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/openai", openaiRoutes);
+app.route("/api/skills", skillRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);

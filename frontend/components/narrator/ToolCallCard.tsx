@@ -963,7 +963,7 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 
 // --- Inline permission UI rendered inside the tool call card ---
 
-function InlinePermission({
+export function InlinePermission({
 	permission,
 	narratorId,
 	onDecision,

@@ -4,7 +4,14 @@ import { StreamStaleError } from "../stream-timeout";
 import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
-import type { AgentConfig, AgentEvent, AgentToolUse, ContentBlock, ToolContext } from "./types";
+import type {
+	AgentConfig,
+	AgentEvent,
+	AgentToolUse,
+	ContentBlock,
+	ResolvedToolDefinition,
+	ToolContext,
+} from "./types";
 import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
@@ -67,7 +74,13 @@ export async function* agentLoop(
 	const provider = getProvider(config.provider);
 	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
 	const locale = (config.locale as Locale) ?? "en";
-	let allTools = toolRegistry.all().filter((t) => !t.isAvailable || t.isAvailable());
+	let allTools: ResolvedToolDefinition[] = toolRegistry
+		.all()
+		.filter((t) => !t.isAvailable || t.isAvailable())
+		.map((t) => ({
+			...t,
+			description: typeof t.description === "function" ? t.description(config) : t.description,
+		}));
 
 	// Apply toolFilter if provided (used by subagents to restrict available tools)
 	if (config.toolFilter) {
@@ -842,6 +855,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		signal: config.signal,
 		locale: config.locale ?? "en",
 		planFileId: config.planFileId,
+		skillRoot: config.skillRoot,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
 	};

@@ -379,6 +379,8 @@ export const handleNarratorWS = {
 					narratorService
 						.getMessagesAfter(narratorId, msg.lastMessageId)
 						.then(({ topLevel, orphanChildren, hitLimit }) => {
+							// Connection may have been removed while the async query ran
+							if (!connections.has(ws)) return;
 							// Too many missed messages or reference not found — tell client to reload
 							if (hitLimit) {
 								try {

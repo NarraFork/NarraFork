@@ -47,8 +47,8 @@ export interface UseNarratorPanelWSReturn {
 	connected: boolean;
 	disconnected: boolean;
 	reconnect: () => void;
-	sendBufferMessage: (narratorId: string, text: string) => void;
-	cancelBuffer: (narratorId: string) => void;
+	sendBufferMessage: (narratorId: string, text: string) => boolean;
+	cancelBuffer: (narratorId: string) => boolean;
 	sendPermissionDecision: (
 		requestId: string,
 		decision: "allow" | "deny",
@@ -245,7 +245,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		  ) => void)
 		| null
 	>(null);
-	const sendBufferMessageRef = useRef<((targetNarratorId: string, text: string) => void) | null>(
+	const sendBufferMessageRef = useRef<((targetNarratorId: string, text: string) => boolean) | null>(
 		null,
 	);
 	const pendingPermsMapRef = useRef(pendingPermsMap);

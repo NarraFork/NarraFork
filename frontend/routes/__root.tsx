@@ -171,7 +171,7 @@ function AuthenticatedLayout() {
 		return <Navigate to="/login" />;
 	}
 
-	// Token exists but auth failed (expired/invalid) → clear token and redirect
+	// Token exists but auth failed (expired/invalid/user gone) → clear token and redirect
 	// Don't clear on transient server errors (502, network issues, etc.)
 	if (isError && (error as ApiError)?.status === 401) {
 		clearToken();
@@ -232,7 +232,11 @@ function AuthenticatedLayout() {
 								position="bottom"
 								withArrow
 							>
-								<Text size="sm" c="dimmed" style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}>
+								<Text
+									size="sm"
+									c="dimmed"
+									style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}
+								>
 									{formatRate(outputStats.charsPerSec)}
 								</Text>
 							</Tooltip>

@@ -36,5 +36,12 @@
 	"commandSave": "Save",
 	"commandCancel": "Cancel",
 	"commandEmpty": "No project commands. Add one to get started.",
-	"commandDuplicateName": "A command with this name already exists"
+	"commandDuplicateName": "A command with this name already exists",
+	"skillsButton": "Skills",
+	"skillsTitle": "Project Skills",
+	"skillsDesc": "Skills are reusable instruction sets that provide domain-specific knowledge to narrators. Place SKILL.md files in .narrafork/skills/<name>/ directory.",
+	"skillsEmpty": "No skills found. Create a .narrafork/skills/<name>/SKILL.md file to get started.",
+	"skillsFiles": "files",
+	"skillsLocation": "Location",
+	"skillsCompanionFiles": "Companion files"
 }

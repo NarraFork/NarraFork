@@ -20,6 +20,7 @@ import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMer
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { StoryNetwork } from "../../components/graph/StoryNetwork";
 import { ProjectCommandsModal } from "../../components/project/ProjectCommandsModal";
+import { ProjectSkillsModal } from "../../components/project/ProjectSkillsModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
@@ -40,6 +41,7 @@ function ProjectDetailPage() {
 	const [batchMergeOpened, { open: openBatchMerge, close: closeBatchMerge }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [commandsOpened, { open: openCommands, close: closeCommands }] = useDisclosure(false);
+	const [skillsOpened, { open: openSkills, close: closeSkills }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [deleteConfirmName, setDeleteConfirmName] = useState("");
@@ -132,6 +134,9 @@ function ProjectDetailPage() {
 					<Button variant="light" size="xs" onClick={openCommands}>
 						{tp("commandsButton")}
 					</Button>
+					<Button variant="light" size="xs" onClick={openSkills}>
+						{tp("skillsButton")}
+					</Button>
 					<Button size="xs" onClick={open} disabled={!hasGitPath}>
 						{t("newChapter")}
 					</Button>
@@ -178,6 +183,7 @@ function ProjectDetailPage() {
 				onClose={closeBatchMerge}
 			/>
 			<ProjectCommandsModal projectId={projectId} opened={commandsOpened} onClose={closeCommands} />
+			<ProjectSkillsModal projectId={projectId} opened={skillsOpened} onClose={closeSkills} />
 
 			<Modal
 				opened={deleteOpened}

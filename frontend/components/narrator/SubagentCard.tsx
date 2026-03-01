@@ -39,7 +39,13 @@ import {
 } from "./narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
-import { ElapsedTimer, STATUS_COLORS, StatusIcon, ToolCallCard } from "./ToolCallCard";
+import {
+	ElapsedTimer,
+	InlinePermission,
+	STATUS_COLORS,
+	StatusIcon,
+	ToolCallCard,
+} from "./ToolCallCard";
 
 export interface SubagentCardProps {
 	toolCall: ToolCallData;
@@ -171,6 +177,13 @@ export const SubagentCard = memo(
 
 		const totalMs = toolCall.durationMs ?? 0;
 
+		// Check if the Task tool call itself has a pending permission (e.g. custom workdir)
+		const selfPerm = resolvePendingPerm(
+			toolCall,
+			permCb?.pendingPermission,
+			permCb?.pendingPermsMap,
+		);
+
 		// Find the child tool call that has a pending permission (if any)
 		const permChild =
 			childToolCalls.find((c) => c.tc.status === "pending") ??
@@ -193,6 +206,11 @@ export const SubagentCard = memo(
 				return () => clearTimeout(t);
 			}
 		}, [permChildId]);
+
+		// Auto-expand when the Task tool itself needs permission (e.g. custom workdir)
+		useEffect(() => {
+			if (selfPerm) setExpanded(true);
+		}, [selfPerm]);
 
 		// When subagent finishes: collapse tool calls list
 		useEffect(() => {
@@ -307,6 +325,18 @@ export const SubagentCard = memo(
 					</UnstyledButton>
 					<Box>
 						<LazyCollapse in={expanded}>
+							{/* Permission request for the Task tool itself (e.g. custom workdir) */}
+							{selfPerm && (
+								<Box mx="xs" mb={4}>
+									<InlinePermission
+										permission={selfPerm}
+										narratorId={narratorId}
+										onDecision={permCb?.onPermissionDecision}
+										onQuestionSubmit={permCb?.onQuestionSubmit}
+										onQuestionDeny={permCb?.onQuestionDeny}
+									/>
+								</Box>
+							)}
 							{/* Background agent warning */}
 							{showBgWarning && (
 								<Alert
@@ -603,7 +633,14 @@ export const SubagentCard = memo(
 					onContextMenu={swipe.handleContextMenu}
 					style={swipe.swipeStyle}
 				>
-					<Paper withBorder radius="sm" style={{ overflow: "hidden" }}>
+					<Paper
+						withBorder
+						radius="sm"
+						style={{
+							overflow: "hidden",
+							...(selfPerm ? { borderColor: "var(--mantine-color-yellow-6)" } : {}),
+						}}
+					>
 						{content}
 					</Paper>
 				</Box>

@@ -36,5 +36,12 @@
 	"commandSave": "保存",
 	"commandCancel": "取消",
 	"commandEmpty": "暂无项目命令，添加一个以开始使用。",
-	"commandDuplicateName": "已存在同名命令"
+	"commandDuplicateName": "已存在同名命令",
+	"skillsButton": "技能",
+	"skillsTitle": "项目技能",
+	"skillsDesc": "技能是为叙述者提供特定领域知识的可复用指令集。将 SKILL.md 文件放置在 .narrafork/skills/<name>/ 目录中。",
+	"skillsEmpty": "未找到技能。创建 .narrafork/skills/<name>/SKILL.md 文件以开始使用。",
+	"skillsFiles": "个文件",
+	"skillsLocation": "位置",
+	"skillsCompanionFiles": "附属文件"
 }
