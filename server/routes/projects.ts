@@ -121,12 +121,36 @@ projectRoutes.patch("/:id", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateProjectSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const body = parsed.data;
+	const { chapterSettings: incomingSettings, ...rest } = parsed.data;
 
 	const now = new Date().toISOString();
+
+	// Merge chapterSettings with existing values instead of overwriting
+	let mergedSettings: Record<string, unknown> | undefined;
+	if (incomingSettings) {
+		const existing = await db.query.projects.findFirst({
+			where: eq(projects.id, id),
+			columns: { chapterSettings: true },
+		});
+		let current: Record<string, unknown> = {};
+		try {
+			current =
+				typeof existing?.chapterSettings === "string"
+					? JSON.parse(existing.chapterSettings)
+					: (existing?.chapterSettings ?? {});
+		} catch {
+			// corrupted JSON — start fresh
+		}
+		mergedSettings = { ...current, ...incomingSettings };
+	}
+
 	const [updated] = await db
 		.update(projects)
-		.set({ ...body, updatedAt: now })
+		.set({
+			...rest,
+			...(mergedSettings !== undefined ? { chapterSettings: mergedSettings } : {}),
+			updatedAt: now,
+		})
 		.where(eq(projects.id, id))
 		.returning();
 	if (!updated) throw new NotFoundError("Project", id);

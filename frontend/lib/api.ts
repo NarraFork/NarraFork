@@ -199,6 +199,10 @@ export const api = {
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+	getNarratorCommands: (id: string) =>
+		request<Array<{ name: string; prompt: string; description?: string; source: string }>>(
+			`/narrators/${id}/commands`,
+		),
 	createNarrator: (data: {
 		chapterId?: string | null;
 		type?: string;
@@ -469,6 +473,7 @@ export const api = {
 				status?: string;
 				lastVisitedAt: number;
 			}>;
+			commands: Array<{ name: string; prompt: string; description?: string }>;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -495,6 +500,8 @@ export const api = {
 		notifyFeishuEnabled?: boolean;
 		notifyFeishuWebhook?: string;
 		notifyFeishuSecret?: string;
+		// Slash commands
+		commands?: Array<{ name: string; prompt: string; description?: string }>;
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",

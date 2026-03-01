@@ -3,6 +3,7 @@ import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
+import { resolveCommand } from "../services/command-service";
 import type { GitStatusSummary } from "../services/git-service";
 import { narratorService } from "../services/narrator-service";
 import {
@@ -345,7 +346,7 @@ export const handleNarratorWS = {
 		connections.add(ws);
 	},
 
-	message(ws: NarratorWS, parsed: NarratorClientMessage) {
+	async message(ws: NarratorWS, parsed: NarratorClientMessage) {
 		const result = narratorWsMessageSchema.safeParse(parsed);
 		if (!result.success) {
 			logger.warn("Invalid narrator WS message", {
@@ -443,12 +444,32 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "buffer_message": {
-				const bufResult = setBufferedMessage(msg.narratorId, msg.text);
+				// Resolve slash commands before buffering
+				let bufferText = msg.text;
+				const userId = ws.data.userId;
+				if (userId) {
+					try {
+						const cmdResult = await resolveCommand(bufferText, msg.narratorId, userId);
+						if (cmdResult.resolved) {
+							bufferText = cmdResult.expandedPrompt;
+						}
+					} catch (err) {
+						logger.warn("Failed to resolve command in buffer message", {
+							narratorId: msg.narratorId,
+							error: String(err),
+						});
+					}
+				} else {
+					logger.warn("Buffer message without userId, skipping command resolution", {
+						narratorId: msg.narratorId,
+					});
+				}
+				const bufResult = setBufferedMessage(msg.narratorId, bufferText);
 				if (bufResult.ok) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
 						narratorId: msg.narratorId,
-						text: msg.text,
+						text: bufferText,
 						bufferedAt: bufResult.bufferedAt,
 					});
 				}

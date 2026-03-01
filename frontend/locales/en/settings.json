@@ -148,5 +148,20 @@
 	"notifyFeishuSecretDesc": "Optional. Signature verification key for the custom bot",
 	"notifyTestConnection": "Test",
 	"notifyTestSuccess": "Test notification sent",
-	"notifyTestFailed": "Test failed: {{error}}"
+	"notifyTestFailed": "Test failed: {{error}}",
+	"commandsSection": "Slash Commands",
+	"commandsSectionDesc": "Define custom slash commands that expand into prompt templates. Type /commandName in the chat input to use them.",
+	"commandName": "Command Name",
+	"commandNamePlaceholder": "e.g. review, refactor",
+	"commandPrompt": "Prompt Template",
+	"commandPromptPlaceholder": "Enter the prompt text. Use {{input}} as a placeholder for user input after the command.",
+	"commandDescription": "Description (optional)",
+	"commandDescriptionPlaceholder": "Brief description shown in the autocomplete list",
+	"commandAdd": "Add Command",
+	"commandDelete": "Delete",
+	"commandEdit": "Edit",
+	"commandSave": "Save",
+	"commandCancel": "Cancel",
+	"commandEmpty": "No commands defined. Add one to get started.",
+	"commandDuplicateName": "A command with this name already exists"
 }

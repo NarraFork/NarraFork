@@ -148,5 +148,20 @@
 	"notifyFeishuSecretDesc": "可选。自定义机器人的签名验证密钥",
 	"notifyTestConnection": "测试",
 	"notifyTestSuccess": "测试通知发送成功",
-	"notifyTestFailed": "测试失败：{{error}}"
+	"notifyTestFailed": "测试失败：{{error}}",
+	"commandsSection": "斜杠命令",
+	"commandsSectionDesc": "定义自定义斜杠命令，输入时自动展开为预设提示词。在聊天输入框中输入 /命令名 即可使用。",
+	"commandName": "命令名称",
+	"commandNamePlaceholder": "例如 review、refactor",
+	"commandPrompt": "提示词模板",
+	"commandPromptPlaceholder": "输入提示词文本。使用 {{input}} 作为用户在命令后输入内容的占位符。",
+	"commandDescription": "描述（可选）",
+	"commandDescriptionPlaceholder": "在补全列表中显示的简短描述",
+	"commandAdd": "添加命令",
+	"commandDelete": "删除",
+	"commandEdit": "编辑",
+	"commandSave": "保存",
+	"commandCancel": "取消",
+	"commandEmpty": "暂无命令，添加一个以开始使用。",
+	"commandDuplicateName": "已存在同名命令"
 }

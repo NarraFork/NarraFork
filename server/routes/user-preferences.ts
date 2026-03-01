@@ -56,11 +56,20 @@ userPreferencesRoutes.get("/", async (c) => {
 	const pref = await db.query.userPreferences.findFirst({
 		where: eq(userPreferences.userId, userId),
 	});
-	if (!pref) return c.json({ ...DEFAULTS, recentTabs: [] });
+	if (!pref) return c.json({ ...DEFAULTS, recentTabs: [], commands: [] });
 	// Parse recentTabs JSON string to array for the response
 	let recentTabs: Record<string, unknown>[] = [];
 	try {
 		recentTabs = JSON.parse(pref.recentTabs);
+	} catch {
+		// corrupted data, reset
+	}
+
+	// Parse commands JSON string to array
+	let commands: unknown[] = [];
+	try {
+		const raw = typeof pref.commands === "string" ? JSON.parse(pref.commands) : pref.commands;
+		commands = Array.isArray(raw) ? raw : [];
 	} catch {
 		// corrupted data, reset
 	}
@@ -96,6 +105,7 @@ userPreferencesRoutes.get("/", async (c) => {
 	return c.json({
 		...pref,
 		recentTabs,
+		commands,
 		// Mask sensitive webhook fields
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
 		notifyDingtalkSecret: maskSecret(pref.notifyDingtalkSecret),
@@ -138,6 +148,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 	}
 
 	// Atomic upsert — avoids read-then-write race condition
+	const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
+
 	sqlite.run(
 		`INSERT INTO user_preferences (
 			id, user_id,
@@ -147,8 +159,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
+			commands,
 			created_at, updated_at
-		) VALUES (${Array(27).fill("?").join(", ")})
+		) VALUES (${Array(28).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -173,6 +186,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   notify_feishu_enabled = COALESCE(?, notify_feishu_enabled),
 		   notify_feishu_webhook = COALESCE(?, notify_feishu_webhook),
 		   notify_feishu_secret = COALESCE(?, notify_feishu_secret),
+		   commands = COALESCE(?, commands),
 		   updated_at = ?`,
 		[
 			// INSERT values
@@ -201,6 +215,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			(d.notifyFeishuEnabled ?? DEFAULTS.notifyFeishuEnabled) ? 1 : 0,
 			feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
 			feishuSecret ?? DEFAULTS.notifyFeishuSecret,
+			commandsJson ?? "[]",
 			now,
 			now,
 			// ON CONFLICT UPDATE values (null = keep existing)
@@ -227,6 +242,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			d.notifyFeishuEnabled != null ? (d.notifyFeishuEnabled ? 1 : 0) : null,
 			feishuWebhook,
 			feishuSecret,
+			commandsJson,
 			now,
 		],
 	);

@@ -21,5 +21,20 @@
 	"deleteProject": "Delete Project",
 	"deleteProjectConfirm": "Are you sure you want to delete \"{{name}}\"? This will remove all chapters, narrators, terminals, and containers. The original repository files will not be affected.",
 	"deleteProjectTypeName": "Type the project name to confirm:",
-	"projectDeleted": "Project deleted"
+	"projectDeleted": "Project deleted",
+	"commandsButton": "Commands",
+	"commandsTitle": "Project Commands",
+	"commandsDesc": "Define slash commands available to all narrators in this project. Project commands override user commands with the same name.",
+	"commandName": "Command Name",
+	"commandNamePlaceholder": "e.g. review, refactor",
+	"commandPrompt": "Prompt Template",
+	"commandPromptPlaceholder": "Enter the prompt text. Use {{input}} as a placeholder.",
+	"commandDescription": "Description (optional)",
+	"commandDescriptionPlaceholder": "Brief description",
+	"commandAdd": "Add Command",
+	"commandDelete": "Delete",
+	"commandSave": "Save",
+	"commandCancel": "Cancel",
+	"commandEmpty": "No project commands. Add one to get started.",
+	"commandDuplicateName": "A command with this name already exists"
 }

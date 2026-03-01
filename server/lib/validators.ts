@@ -5,6 +5,16 @@ const gitBranchName = z.string().regex(/^[a-zA-Z0-9._\-/]+$/, "Invalid branch na
 
 // === Projects ===
 
+export const commandSchema = z.object({
+	name: z
+		.string()
+		.min(1)
+		.max(50)
+		.regex(/^[a-zA-Z0-9_-]+$/),
+	prompt: z.string().min(1).max(10000),
+	description: z.string().max(500).optional(),
+});
+
 export const createProjectSchema = z.object({
 	name: z.string().min(1).max(200),
 	description: z.string().max(2000).optional(),
@@ -24,6 +34,12 @@ export const updateProjectSchema = z.object({
 	defaultBranch: gitBranchName.optional(),
 	startupScript: z.string().max(5000).nullable().optional(),
 	copyFiles: z.string().max(5000).nullable().optional(),
+	chapterSettings: z
+		.object({
+			autoCreateNarrator: z.boolean().optional(),
+			commands: z.array(commandSchema).max(100).optional(),
+		})
+		.optional(),
 });
 
 // === Chapters ===
@@ -276,6 +292,8 @@ export const updateUserPreferencesSchema = z.object({
 		})
 		.optional(),
 	notifyFeishuSecret: z.string().max(500).optional(),
+	// Slash commands
+	commands: z.array(commandSchema).max(100).optional(),
 });
 
 export const recentTabSchema = z.object({

@@ -21,5 +21,20 @@
 	"deleteProject": "删除项目",
 	"deleteProjectConfirm": "确定要删除「{{name}}」吗？这将移除所有章节、叙述者、终端和容器。原始仓库文件不会受到影响。",
 	"deleteProjectTypeName": "输入项目名称以确认：",
-	"projectDeleted": "项目已删除"
+	"projectDeleted": "项目已删除",
+	"commandsButton": "命令",
+	"commandsTitle": "项目命令",
+	"commandsDesc": "定义此项目所有叙述者可用的斜杠命令。同名时项目命令优先于用户命令。",
+	"commandName": "命令名称",
+	"commandNamePlaceholder": "例如 review、refactor",
+	"commandPrompt": "提示词模板",
+	"commandPromptPlaceholder": "输入提示词文本。使用 {{input}} 作为占位符。",
+	"commandDescription": "描述（可选）",
+	"commandDescriptionPlaceholder": "简短描述",
+	"commandAdd": "添加命令",
+	"commandDelete": "删除",
+	"commandSave": "保存",
+	"commandCancel": "取消",
+	"commandEmpty": "暂无项目命令，添加一个以开始使用。",
+	"commandDuplicateName": "已存在同名命令"
 }

@@ -40,6 +40,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorCommands } from "../../hooks/useCommands";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -56,6 +57,7 @@ import { api, type TreeMessage } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { ChapterBar } from "./ChapterBar";
+import { type CommandItem, CommandPopover } from "./CommandPopover";
 import {
 	MemoizedPageElements,
 	RenderProgress,
@@ -192,6 +194,22 @@ export function NarratorPanel({
 			sessionStorage.removeItem(`narrafork_draft_${narratorId}`);
 		}
 	}, [input, narratorId]);
+
+	// --- Command popover ---
+	const { data: commandsList } = useNarratorCommands(narratorId);
+	const commandPopoverVisible =
+		input.startsWith("/") && !input.includes("\n") && (commandsList?.length ?? 0) > 0;
+	const handleCommandSelect = useCallback((cmd: CommandItem) => {
+		if (cmd.prompt.includes("{{input}}")) {
+			// Place cursor where {{input}} would go
+			setInput(`/${cmd.name} `);
+		} else {
+			setInput(cmd.prompt);
+		}
+	}, []);
+	const closeCommandPopover = useCallback(() => {
+		setInput("");
+	}, []);
 	useEffect(() => {
 		if (appendInputRef) {
 			appendInputRef.current = (text: string) =>
@@ -871,6 +889,8 @@ export function NarratorPanel({
 	};
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
+		// Let CommandPopover handle keys when visible
+		if (commandPopoverVisible) return;
 		if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 			e.preventDefault();
 			handleSend();
@@ -1641,17 +1661,25 @@ export function NarratorPanel({
 							<IconPaperclip size={18} />
 						</ActionIcon>
 					</Tooltip>
-					<Textarea
-						flex={1}
-						placeholder={t("sendPlaceholder")}
-						value={input}
-						onChange={(e) => setInput(e.currentTarget.value)}
-						onKeyDown={handleKeyDown}
-						onPaste={handlePaste}
-						autosize
-						minRows={1}
-						maxRows={6}
-					/>
+					<Box style={{ position: "relative", flex: 1 }}>
+						<CommandPopover
+							commands={commandsList ?? []}
+							input={input}
+							visible={commandPopoverVisible}
+							onSelect={handleCommandSelect}
+							onClose={closeCommandPopover}
+						/>
+						<Textarea
+							placeholder={t("sendPlaceholder")}
+							value={input}
+							onChange={(e) => setInput(e.currentTarget.value)}
+							onKeyDown={handleKeyDown}
+							onPaste={handlePaste}
+							autosize
+							minRows={1}
+							maxRows={6}
+						/>
+					</Box>
 					{(() => {
 						const showInterrupt = isActive && !input.trim();
 						return showInterrupt ? (

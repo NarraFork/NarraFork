@@ -25,8 +25,16 @@ import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { terminalService } from "./terminal-service";
 
+/** Slash command definition stored in user preferences or project chapterSettings. */
+export interface Command {
+	name: string;
+	prompt: string;
+	description?: string;
+}
+
 interface ChapterSettings {
 	autoCreateNarrator?: boolean;
+	commands?: Command[];
 }
 
 const DEFAULT_CHAPTER_SETTINGS: ChapterSettings = {

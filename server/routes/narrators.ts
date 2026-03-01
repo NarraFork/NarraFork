@@ -43,6 +43,7 @@ import {
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 } from "../lib/validators";
+import { getAvailableCommands, resolveCommand } from "../services/command-service";
 import { narratorService } from "../services/narrator-service";
 import {
 	closeNarrator,
@@ -264,6 +265,14 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json(narrator);
 });
 
+// Get available commands for a narrator (merged user + project)
+narratorRoutes.get("/:id/commands", async (c) => {
+	const id = c.req.param("id");
+	const userId = c.get("user").sub;
+	const commands = await getAvailableCommands(id, userId);
+	return c.json(commands);
+});
+
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
@@ -279,7 +288,14 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const userMsg = await sendMessage(id, message, images, locale, replyInUserLanguage);
+	// Resolve slash commands before sending
+	let finalMessage = message;
+	const cmdResult = await resolveCommand(message, id, userId);
+	if (cmdResult.resolved) {
+		finalMessage = cmdResult.expandedPrompt;
+	}
+
+	const userMsg = await sendMessage(id, finalMessage, images, locale, replyInUserLanguage);
 	return c.json(userMsg, 201);
 });
 

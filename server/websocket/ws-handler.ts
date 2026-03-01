@@ -152,10 +152,14 @@ export const wsHandlers = {
 		}
 
 		if (channel === "narrator") {
-			handleNarratorWS.message(
-				ws as ServerWebSocket<WSData & { channel: "narrator" }>,
-				parsed as NarratorClientMessage,
-			);
+			handleNarratorWS
+				.message(
+					ws as ServerWebSocket<WSData & { channel: "narrator" }>,
+					parsed as NarratorClientMessage,
+				)
+				.catch((err: unknown) => {
+					logger.warn("Narrator WS message handler error", { error: String(err) });
+				});
 		} else if (channel === "terminal") {
 			handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
 		}

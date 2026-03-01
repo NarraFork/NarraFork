@@ -102,5 +102,7 @@
 	"autoCommit.reminderTitle": "Commit Reminder",
 	"autoCommit.reminderBody": "{{filesChanged}} files changed (+{{linesAdded}} / -{{linesRemoved}} lines). Please commit soon.",
 	"autoCommit.forceCommitTitle": "Auto-Committed",
-	"autoCommit.forceCommitBody": "Changes exceeded threshold — auto-committed as {{commitSha}}: {{message}}"
+	"autoCommit.forceCommitBody": "Changes exceeded threshold — auto-committed as {{commitSha}}: {{message}}",
+	"commandSourceUser": "User",
+	"commandSourceProject": "Project"
 }

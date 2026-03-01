@@ -453,6 +453,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(false),
 	notifyFeishuWebhook: text("notify_feishu_webhook").notNull().default(""),
 	notifyFeishuSecret: text("notify_feishu_secret").notNull().default(""),
+	// Slash commands (JSON array of {name, prompt, description?})
+	commands: text("commands").notNull().default("[]"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

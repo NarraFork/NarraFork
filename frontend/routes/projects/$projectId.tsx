@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { StoryNetwork } from "../../components/graph/StoryNetwork";
+import { ProjectCommandsModal } from "../../components/project/ProjectCommandsModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
@@ -38,6 +39,7 @@ function ProjectDetailPage() {
 	const [cleanupOpened, { open: openCleanup, close: closeCleanup }] = useDisclosure(false);
 	const [batchMergeOpened, { open: openBatchMerge, close: closeBatchMerge }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
+	const [commandsOpened, { open: openCommands, close: closeCommands }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [deleteConfirmName, setDeleteConfirmName] = useState("");
@@ -127,6 +129,9 @@ function ProjectDetailPage() {
 					>
 						{t("batchMerge")}
 					</Button>
+					<Button variant="light" size="xs" onClick={openCommands}>
+						{tp("commandsButton")}
+					</Button>
 					<Button size="xs" onClick={open} disabled={!hasGitPath}>
 						{t("newChapter")}
 					</Button>
@@ -172,6 +177,7 @@ function ProjectDetailPage() {
 				opened={batchMergeOpened}
 				onClose={closeBatchMerge}
 			/>
+			<ProjectCommandsModal projectId={projectId} opened={commandsOpened} onClose={closeCommands} />
 
 			<Modal
 				opened={deleteOpened}

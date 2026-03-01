@@ -31,6 +31,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
@@ -715,6 +716,22 @@ function SettingsPage() {
 				<Stack>
 					<Title order={4}>{t("languageSection")}</Title>
 					<LanguageSwitcher />
+				</Stack>
+			</Paper>
+
+			{/* Slash Commands */}
+			<Paper withBorder p="md">
+				<Stack>
+					<div>
+						<Title order={4}>{t("commandsSection")}</Title>
+						<Text size="xs" c="dimmed">
+							{t("commandsSectionDesc")}
+						</Text>
+					</div>
+					<CommandsEditor
+						commands={(userPrefs?.commands ?? []) as CommandDef[]}
+						onChange={(cmds) => updateUserPref.mutate({ commands: cmds })}
+					/>
 				</Stack>
 			</Paper>
 
