@@ -133,7 +133,7 @@ frontend/
 - 使用 **tab** 缩进，最大行宽 **100** 字符
 - 路径别名：`@server/*` → `./server/*`，`@frontend/*` → `./frontend/*`
 - 全局使用 ESM（`"type": "module"`）
-- `routeTree.gen.ts` 为自动生成文件 — 请勿手动编辑
+- `routeTree.gen.ts` 为自动生成文件 — 请勿手动编辑，也无需手动运行 `generate` 命令，开发服务器启动时会自动生成
 - ID 生成：使用 `@server/lib/id` 中的 `generateId()`（21 字符）或 `generateShortId()`（8 字符）
 - 错误处理：抛出 `@server/lib/errors` 中的 `AppError` 子类 — 全局处理器负责序列化
 - 校验：在 `@server/lib/validators.ts` 中定义 Zod schema，在路由处理器中解析

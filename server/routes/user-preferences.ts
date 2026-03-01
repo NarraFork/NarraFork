@@ -6,6 +6,7 @@ import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import {
+	batchRemoveRecentTabsSchema,
 	removeRecentTabSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
@@ -23,6 +24,7 @@ const DEFAULTS = {
 	wordWrapDiff: true,
 	replyInUserLanguage: true,
 	showTokenUsage: false,
+	showOutputStats: false,
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	recentTabs: "[]",
@@ -63,11 +65,18 @@ userPreferencesRoutes.get("/", async (c) => {
 		// corrupted data, reset
 	}
 
+	// Migrate legacy "session" tab type → "narrator"
+	for (const tab of recentTabs) {
+		if (tab.type === "session") {
+			tab.type = "narrator";
+		}
+	}
+
 	// Enrich tabs with live narrator status from DB (skip project tabs)
 	if (recentTabs.length > 0) {
 		const narratorIds = recentTabs
 			.filter((t) => t.type !== "project")
-			.map((t) => (t.type === "session" ? (t.id as string) : (t.narratorId as string)))
+			.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
 			.filter(Boolean);
 		if (narratorIds.length > 0) {
 			const rows = await db
@@ -76,7 +85,7 @@ userPreferencesRoutes.get("/", async (c) => {
 				.where(inArray(narrators.id, narratorIds));
 			const statusMap = new Map(rows.map((r) => [r.id, r.status]));
 			for (const tab of recentTabs) {
-				const nId = tab.type === "session" ? (tab.id as string) : (tab.narratorId as string);
+				const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
 				if (nId && statusMap.has(nId)) {
 					tab.status = statusMap.get(nId);
 				}
@@ -133,13 +142,13 @@ userPreferencesRoutes.patch("/", async (c) => {
 		`INSERT INTO user_preferences (
 			id, user_id,
 			auto_load_older_messages, language, word_wrap_markdown, word_wrap_code, word_wrap_diff,
-			reply_in_user_language, show_token_usage, terminal_theme, terminal_font_size,
+			reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
 			notify_on_done, notify_on_waiting, notify_pwa_enabled,
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
 			created_at, updated_at
-		) VALUES (${Array(26).fill("?").join(", ")})
+		) VALUES (${Array(27).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -148,6 +157,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   word_wrap_diff = COALESCE(?, word_wrap_diff),
 		   reply_in_user_language = COALESCE(?, reply_in_user_language),
 		   show_token_usage = COALESCE(?, show_token_usage),
+		   show_output_stats = COALESCE(?, show_output_stats),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
 		   notify_on_done = COALESCE(?, notify_on_done),
@@ -175,6 +185,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			(d.wordWrapDiff ?? DEFAULTS.wordWrapDiff) ? 1 : 0,
 			(d.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
 			(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
+			(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
 			d.terminalTheme ?? DEFAULTS.terminalTheme,
 			d.terminalFontSize ?? DEFAULTS.terminalFontSize,
 			(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
@@ -200,6 +211,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			d.wordWrapDiff != null ? (d.wordWrapDiff ? 1 : 0) : null,
 			d.replyInUserLanguage != null ? (d.replyInUserLanguage ? 1 : 0) : null,
 			d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
+			d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
 			d.terminalTheme ?? null,
 			d.terminalFontSize ?? null,
 			d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
@@ -247,6 +259,15 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 		tabs = pref ? JSON.parse(pref.recentTabs) : [];
 	} catch {
 		// corrupted, reset
+	}
+
+	// Migrate legacy "session" tab type → "narrator"
+	for (const t of tabs) {
+		// biome-ignore lint/suspicious/noExplicitAny: legacy data migration
+		if ((t as any).type === "session") {
+			// biome-ignore lint/suspicious/noExplicitAny: legacy data migration
+			(t as any).type = "narrator";
+		}
 	}
 
 	// Upsert: update in place or prepend
@@ -320,6 +341,40 @@ userPreferencesRoutes.delete("/recent-tabs", async (c) => {
 
 	eventBus.emit({ type: "user:recent_tabs_changed", userId });
 	return c.json([]);
+});
+
+/** Batch-remove recent tabs */
+userPreferencesRoutes.post("/recent-tabs/batch-remove", async (c) => {
+	const userId = c.get("user").sub;
+	const body = await c.req.json();
+	const parsed = batchRemoveRecentTabsSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const toRemove = new Set(parsed.data.items.map((i) => `${i.type}:${i.id}`));
+	const now = new Date().toISOString();
+
+	const pref = await db.query.userPreferences.findFirst({
+		where: eq(userPreferences.userId, userId),
+	});
+	if (!pref) return c.json([]);
+
+	let tabs: Record<string, unknown>[] = [];
+	try {
+		tabs = JSON.parse(pref.recentTabs);
+	} catch {
+		return c.json([]);
+	}
+
+	const filtered = tabs.filter((t) => !toRemove.has(`${t.type}:${t.id}`));
+
+	sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+		JSON.stringify(filtered),
+		now,
+		userId,
+	]);
+
+	eventBus.emit({ type: "user:recent_tabs_changed", userId });
+	return c.json(filtered);
 });
 
 /** Reorder recent tabs — receives full ordered array of {type, id} keys */

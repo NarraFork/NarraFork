@@ -11,9 +11,10 @@ import {
 	Table,
 	Text,
 	TextInput,
+	ThemeIcon,
 	Title,
 } from "@mantine/core";
-import { IconPencil, IconTrash } from "@tabler/icons-react";
+import { IconCheck, IconPencil, IconRefresh, IconTrash, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
@@ -98,6 +99,15 @@ function AdminPage() {
 
 			<Paper withBorder p="md">
 				<Stack>
+					<Title order={4}>{t("providers")}</Title>
+					<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
+						{t("providers")}
+					</Button>
+				</Stack>
+			</Paper>
+
+			<Paper withBorder p="md">
+				<Stack>
 					<Title order={4}>{t("registrationSettings")}</Title>
 					<Switch
 						label={t("registrationOpen")}
@@ -171,19 +181,11 @@ function AdminPage() {
 				</Stack>
 			</Paper>
 
-			<Paper withBorder p="md">
-				<Stack>
-					<Title order={4}>{t("providers")}</Title>
-					<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
-						{t("providers")}
-					</Button>
-				</Stack>
-			</Paper>
+			<ContainerSetupPanel t={t} />
 
 			<Paper withBorder p="md">
 				<Stack>
 					<Group>
-						</Button>
 						</Button>
 						</Button>
 						</Button>
@@ -221,5 +223,113 @@ function AdminPage() {
 				</Stack>
 			</Modal>
 		</Stack>
+	);
+}
+
+// === Container Setup Checklist ===
+
+function ContainerSetupPanel({
+	t,
+}: {
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+	const qc = useQueryClient();
+	const { data, isLoading } = useQuery({
+		queryKey: ["containerSetup"],
+		queryFn: () => api.getContainerSetup(),
+		staleTime: Number.POSITIVE_INFINITY,
+	});
+
+	// Refetch with refresh=true to bypass server cache
+	const [rechecking, setRechecking] = useState(false);
+	const recheckFresh = async () => {
+		setRechecking(true);
+		try {
+			const fresh = await api.getContainerSetup(true);
+			qc.setQueryData(["containerSetup"], fresh);
+		} finally {
+			setRechecking(false);
+		}
+	};
+
+	const renderStatus = (ok: boolean, label: string, detail: string) => (
+		<Group gap="xs" wrap="nowrap">
+			<ThemeIcon color={ok ? "green" : "red"} size="sm" variant="light">
+				{ok ? <IconCheck size={14} /> : <IconX size={14} />}
+			</ThemeIcon>
+			<Text size="sm" fw={500} style={{ minWidth: 160 }}>
+				{label}
+			</Text>
+			<Text size="xs" c="dimmed">
+				{detail}
+			</Text>
+		</Group>
+	);
+
+	return (
+		<Paper withBorder p="md">
+			<Stack>
+				<Group justify="space-between">
+					<Title order={4}>{t("containerSetup")}</Title>
+					{data && (
+						<Badge color={data.allReady ? "green" : "red"} variant="light">
+							{data.allReady ? t("containerSetupReady") : t("containerSetupNotReady")}
+						</Badge>
+					)}
+				</Group>
+				<Text size="sm" c="dimmed">
+					{t("containerSetupDesc")}
+				</Text>
+
+				{isLoading ? (
+					<Loader size="sm" />
+				) : data ? (
+					<Stack gap="xs">
+						{renderStatus(
+							data.podman.ok,
+							t("containerSetupPodman"),
+							data.podman.ok
+								? t("containerSetupInstalled", { version: data.podman.version })
+								: t("containerSetupNotInstalled"),
+						)}
+						{renderStatus(
+							data.podmanCompose.ok,
+							t("containerSetupPodmanCompose"),
+							data.podmanCompose.ok
+								? t("containerSetupInstalled", { version: data.podmanCompose.version })
+								: t("containerSetupNotInstalled"),
+						)}
+						{renderStatus(
+							data.composeProvider.ok,
+							t("containerSetupComposeProvider"),
+							data.composeProvider.provider
+								? data.composeProvider.ok
+									? t("containerSetupCorrect", { provider: data.composeProvider.provider })
+									: t("containerSetupIncorrect", { provider: data.composeProvider.provider })
+								: t("containerSetupNotConfigured"),
+						)}
+						{renderStatus(
+							data.passt.ok,
+							t("containerSetupPasst"),
+							data.passt.ok
+								? t("containerSetupInstalled", { version: data.passt.version ?? "" })
+								: t("containerSetupNotInstalled"),
+						)}
+					</Stack>
+				) : null}
+
+				<Group>
+					<Button
+						variant="light"
+						size="xs"
+						leftSection={<IconRefresh size={14} />}
+						onClick={recheckFresh}
+						loading={isLoading || rechecking}
+					>
+						{t("containerSetupRecheck")}
+					</Button>
+				</Group>
+			</Stack>
+		</Paper>
 	);
 }

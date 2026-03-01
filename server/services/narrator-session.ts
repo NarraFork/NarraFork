@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
 import { normalize, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -7,6 +8,7 @@ import {
 	chapters,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorPatches,
 	narrators,
 	narratorToolCalls,
 	projects,
@@ -16,6 +18,7 @@ import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings } from "../lib/settings";
@@ -34,6 +37,7 @@ import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
+import { snapshot } from "./snapshot";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state ===
@@ -42,7 +46,7 @@ import { worktreeWatcher } from "./worktree-watcher";
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "Bash"]);
 
 
-interface ActiveSession {
+interface ActiveNarrator {
 	abortController: AbortController;
 	narratorId: string;
 	conversationId: string;
@@ -70,18 +74,24 @@ interface ActiveSession {
 	_chapterId?: string;
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
 	_worktreePath?: string;
+	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
+	_planFileId?: string;
 	/** Cached base branch (for commits-ahead tracking) */
 	_baseBranch?: string;
 	/** Trailing-edge throttle timer for git status tracking */
 	_gitTrackTimer?: ReturnType<typeof setTimeout>;
 	/** ID of the partial assistant message being incrementally built via block_complete events */
 	_partialMessageId?: string;
+	/** Whether the shadow snapshot repo has been initialised for this session */
+	_snapshotInitialized?: boolean;
+	/** Per-tool-call before-hash promise cache: toolUseId → Promise<tree hash> */
+	_snapshotBeforeHashes?: Map<string, Promise<string>>;
 }
 
-const activeSessions = new Map<string, ActiveSession>();
+const activeNarrators = new Map<string, ActiveNarrator>();
 
-// Lock to prevent concurrent session creation for the same narrator
-const sessionCreationLocks = new Map<string, Promise<ActiveSession>>();
+// Lock to prevent concurrent narrator creation for the same narrator
+const narratorCreationLocks = new Map<string, Promise<ActiveNarrator>>();
 
 interface PendingPermission {
 	resolve: (result: PermissionResult) => void;
@@ -111,7 +121,7 @@ const bufferedMessages = new Map<string, BufferedMessage>();
 
 // === SSE event types yielded to the HTTP response ===
 
-export type SessionEvent =
+export type NarratorEvent =
 	| { type: "user_message"; data: unknown }
 	| { type: "assistant_message"; data: unknown }
 	| { type: "stream_event"; data: unknown }
@@ -213,6 +223,15 @@ export function resolvePermissionDecision(
 
 	// Plan mode: deny mutating tools (except Bash which keeps its normal permission flow)
 	if (planMode && !PLAN_MODE_ALLOWED_TOOLS.has(toolName)) return "deny";
+	// Plan mode: Write/Edit only allowed for .narrafork/ directory (plan file writing)
+	if (planMode && (toolName === "Write" || toolName === "Edit")) {
+		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		const absPath = resolve(cwd, filePath);
+		const narraforkDir = resolve(cwd, ".narrafork");
+		if (!absPath.startsWith(`${narraforkDir}/`) && absPath !== narraforkDir) return "deny";
+		// Path is inside .narrafork/ — auto-allow for plan file writing
+		return "allow";
+	}
 	// Plan mode: Task is allowed but only for explore/plan subagents (general has write access)
 	if (planMode && toolName === "Task" && input.subagent_type === "general") return "deny";
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
@@ -295,6 +314,41 @@ export async function handlePermission(
 	const planMode = narrator?.planMode ?? false;
 	const isChapter = !!narrator?.chapterId;
 
+	// Plan mode: redirect Write/Edit file_path to the locked plan file
+	let effectiveInput = input;
+	if (planMode && (toolName === "Write" || toolName === "Edit")) {
+		const active = activeNarrators.get(narratorId);
+		const planFileId = active?._planFileId;
+		if (planFileId) {
+			const planFileName = `.narrafork/plan-${planFileId}.md`;
+			effectiveInput = { ...input, file_path: planFileName };
+		}
+	}
+
+	// ExitPlanMode with planFile: pre-read file content for the permission UI.
+	// Replace planFile with the resolved plan content so the frontend can display it
+	// and execute() receives a single `plan` parameter (not both plan + planFile).
+	if (toolName === "ExitPlanMode" && !input.plan) {
+		const active = activeNarrators.get(narratorId);
+		const planFileId = active?._planFileId;
+		if (planFileId) {
+			const planFileName = `.narrafork/plan-${planFileId}.md`;
+			const absPath = resolve(cwd, planFileName);
+			try {
+				if (existsSync(absPath)) {
+					const content = readFileSync(absPath, "utf-8");
+					if (content.trim()) {
+						// Drop planFile, inject plan content — execute() sees only `plan`
+						const { planFile: _, ...rest } = effectiveInput;
+						effectiveInput = { ...rest, plan: content };
+					}
+				}
+			} catch {
+				// Ignore read errors — the tool execute will handle them
+			}
+		}
+	}
+
 	// Bash command pre-analysis via tree-sitter AST
 	let bashAnalysis: BashAnalysis | undefined;
 	if (toolName === "Bash" && typeof input.command === "string") {
@@ -308,7 +362,7 @@ export async function handlePermission(
 
 	const decision = resolvePermissionDecision(
 		toolName,
-		input,
+		effectiveInput,
 		permMode,
 		cwd,
 		planMode,
@@ -317,7 +371,7 @@ export async function handlePermission(
 	);
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
-		const fatalMsg = `FATAL: ${reason}. Session terminated for safety.`;
+		const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
 		logger.error("Catastrophic command blocked", {
 			narratorId,
 			toolName,
@@ -357,7 +411,7 @@ export async function handlePermission(
 					eq(narratorToolCalls.toolUseId, toolUseId),
 				),
 			);
-		return { behavior: "allow", updatedInput: input };
+		return { behavior: "allow", updatedInput: effectiveInput };
 	}
 	if (decision === "deny") {
 		// Chapter mode git branch violation — provide specific error message
@@ -451,7 +505,7 @@ export async function handlePermission(
 	broadcastToNarrator(wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
-		request: { id: toolCallId, toolName, toolUseId, inputJson: input, decisionReason },
+		request: { id: toolCallId, toolName, toolUseId, inputJson: effectiveInput, decisionReason },
 	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
 	await narratorService.updateStatus(narratorId, "waiting");
@@ -471,12 +525,12 @@ export async function handlePermission(
 			.update(narratorToolCalls)
 			.set({
 				status: "fail",
-				errorMessage: "Session aborted",
+				errorMessage: "Narrator aborted",
 				permissionDecidedBy: "aborted",
 				permissionDecidedAt: new Date().toISOString(),
 			})
 			.where(eq(narratorToolCalls.id, toolCallId));
-		return { behavior: "deny", message: "Session aborted" };
+		return { behavior: "deny", message: "Narrator aborted" };
 	}
 
 	return new Promise<PermissionResult>((resolve) => {
@@ -522,7 +576,7 @@ export async function handlePermission(
 				if (broadcastTargetId && broadcastTargetId !== narratorId) {
 					await narratorService.updateStatus(broadcastTargetId, "thinking");
 				}
-				resolve({ behavior: "allow", updatedInput: input });
+				resolve({ behavior: "allow", updatedInput: effectiveInput });
 			} else {
 				await db
 					.update(narratorToolCalls)
@@ -533,11 +587,11 @@ export async function handlePermission(
 						permissionDecidedAt: new Date().toISOString(),
 					})
 					.where(eq(narratorToolCalls.id, toolCallId));
-				// Abort the session so the model doesn't keep looping in plan mode
-				const session = activeSessions.get(narratorId);
-				if (session?.alive) {
-					session.alive = false;
-					session.abortController.abort();
+				// Abort the narrator so the model doesn't keep looping in plan mode
+				const active = activeNarrators.get(narratorId);
+				if (active?.alive) {
+					active.alive = false;
+					active.abortController.abort();
 				}
 				await narratorService.updateStatus(narratorId, "idle");
 				if (broadcastTargetId && broadcastTargetId !== narratorId) {
@@ -565,7 +619,7 @@ export async function handlePermission(
 				.update(narratorToolCalls)
 				.set({
 					status: "fail",
-					errorMessage: "Session aborted",
+					errorMessage: "Narrator aborted",
 					permissionDecidedBy: "aborted",
 					permissionDecidedAt: new Date().toISOString(),
 				})
@@ -574,7 +628,7 @@ export async function handlePermission(
 			if (broadcastTargetId && broadcastTargetId !== narratorId) {
 				await narratorService.updateStatus(broadcastTargetId, "thinking");
 			}
-			resolve({ behavior: "deny", message: "Session aborted" });
+			resolve({ behavior: "deny", message: "Narrator aborted" });
 		};
 
 		signal.addEventListener("abort", onAbort, { once: true });
@@ -582,7 +636,7 @@ export async function handlePermission(
 		pendingPermissions.set(toolCallId, {
 			resolve,
 			cleanup,
-			input,
+			input: effectiveInput,
 			narratorId,
 			toolUseId,
 			broadcastTargetId: wsTarget,
@@ -689,9 +743,9 @@ export async function resolvePermission(
 		// The outer while-loop will pick up pendingFeedback and inject the user
 		// message before starting a fresh agent loop iteration.
 		if (feedbackText?.trim()) {
-			const session = activeSessions.get(pending.narratorId);
-			if (session?.alive) {
-				session.abortController.abort();
+			const active = activeNarrators.get(pending.narratorId);
+			if (active?.alive) {
+				active.abortController.abort();
 			}
 		}
 	} else {
@@ -700,35 +754,35 @@ export async function resolvePermission(
 	}
 }
 
-// === Session lifecycle ===
+// === Narrator lifecycle ===
 
 /**
- * Ensure an active session exists for this narrator.
+ * Ensure an active narrator exists for this narrator ID.
  * If one is already alive, return it. Otherwise create a new one.
  */
-async function ensureSession(
+async function ensureNarrator(
 	narratorId: string,
 	locale: Locale,
 	replyInUserLanguage = false,
-): Promise<ActiveSession> {
-	const existing = activeSessions.get(narratorId);
+): Promise<ActiveNarrator> {
+	const existing = activeNarrators.get(narratorId);
 	if (existing?.alive) return existing;
 
-	const pending = sessionCreationLocks.get(narratorId);
+	const pending = narratorCreationLocks.get(narratorId);
 	if (pending) return pending;
 
-	const creation = createSession(narratorId, locale, replyInUserLanguage);
-	sessionCreationLocks.set(narratorId, creation);
+	const creation = createNarrator(narratorId, locale, replyInUserLanguage);
+	narratorCreationLocks.set(narratorId, creation);
 	try {
 		return await creation;
 	} finally {
-		sessionCreationLocks.delete(narratorId);
+		narratorCreationLocks.delete(narratorId);
 	}
 }
 
 /**
  * Build the effective system prompt dynamically.
- * Reads AGENT.md (fallback CLAUDE.md) from disk each time so changes are picked up mid-session.
+ * Reads AGENT.md (fallback CLAUDE.md) from disk each time so changes are picked up mid-conversation.
  */
 async function buildSystemPrompt(
 	narrator: { systemPrompt: string | null; contextSummary: string | null; todosJson?: unknown },
@@ -736,6 +790,7 @@ async function buildSystemPrompt(
 	locale: Locale,
 	replyInUserLanguage: boolean,
 	planMode = false,
+	planFileId?: string,
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
@@ -744,56 +799,62 @@ async function buildSystemPrompt(
 		contextSummary: narrator.contextSummary,
 		todosJson: narrator.todosJson,
 		planMode,
+		planFileId,
 		replyInUserLanguage,
 	});
 }
 
-async function createSession(
+async function createNarrator(
 	narratorId: string,
 	locale: Locale,
 	replyInUserLanguage = false,
-): Promise<ActiveSession> {
-	const existing = activeSessions.get(narratorId);
+): Promise<ActiveNarrator> {
+	const existing = activeNarrators.get(narratorId);
 	if (existing) {
 		existing.abortController.abort();
-		activeSessions.delete(narratorId);
+		activeNarrators.delete(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
 
-	// Use narrator-level session state directly
+	// Use narrator-level state directly
 	const effectiveConversationId = narrator.apiConversationId;
 	const effectiveContextSummary = narrator.contextSummary;
 
 	// Resolve CWD and cache chapter info for git tracking
-	let sessionCwd: string;
-	let sessionChapterId: string | undefined;
-	let sessionWorktreePath: string | undefined;
-	let sessionBaseBranch: string | undefined;
+	let narratorCwd: string;
+	let narratorChapterId: string | undefined;
+	let narratorWorktreePath: string | undefined;
+	let narratorBaseBranch: string | undefined;
 	if (narrator.chapterId) {
 		const ch = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
 		});
 		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
 		if (ch.worktreePath) {
-			sessionCwd = ch.worktreePath;
-			sessionChapterId = ch.id;
-			sessionWorktreePath = ch.worktreePath;
-			sessionBaseBranch = ch.baseBranch;
+			narratorCwd = ch.worktreePath;
+			narratorChapterId = ch.id;
+			narratorWorktreePath = ch.worktreePath;
+			narratorBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
 			const project = await db.query.projects.findFirst({
 				where: eq(projects.id, ch.projectId),
 			});
-			sessionCwd = narrator.cwd || project?.gitPath || process.env.HOME || "/tmp";
+			narratorCwd = narrator.cwd || project?.gitPath || process.env.HOME || "/tmp";
 			logger.info("Chapter dormant, using fallback CWD", {
 				chapterId: narrator.chapterId,
-				sessionCwd,
+				narratorCwd,
 			});
 		}
 	} else {
-		sessionCwd = narrator.cwd || process.env.HOME || "/tmp";
+		narratorCwd = narrator.cwd || process.env.HOME || "/tmp";
 	}
+
+	// Generate planFileId if narrator is already in plan mode (e.g. server restart recovery).
+	// A new ID is generated each time — any previously written plan file from a prior session
+	// becomes orphaned, but the model will use the new file path from the refreshed system prompt.
+	const planFileId = (narrator.planMode ?? false) ? generateShortId() : undefined;
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
@@ -801,44 +862,46 @@ async function createSession(
 			contextSummary: effectiveContextSummary,
 			todosJson: narrator.todosJson,
 		},
-		sessionCwd,
+		narratorCwd,
 		locale,
 		replyInUserLanguage,
 		narrator.planMode ?? false,
+		planFileId,
 	);
 
 	const abortController = new AbortController();
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
 
-	const sessionModel = narrator.model ?? settings.agent.defaultModel;
+	const narratorModel = narrator.model ?? settings.agent.defaultModel;
 
-	const session: ActiveSession = {
+	const active: ActiveNarrator = {
 		abortController,
 		narratorId,
 		conversationId: effectiveConversationId ?? randomUUID(),
-		cwd: sessionCwd,
-		model: sessionModel,
-		provider: resolveProvider(sessionModel),
+		cwd: narratorCwd,
+		model: narratorModel,
+		provider: resolveProvider(narratorModel),
 		systemPrompt: effectiveSystemPrompt,
 		events,
 		alive: true,
 		locale,
 		_usedCompactSummary: usedCompactSummary,
 		_replyInUserLanguage: replyInUserLanguage,
-		_chapterId: sessionChapterId,
-		_worktreePath: sessionWorktreePath,
-		_baseBranch: sessionBaseBranch,
+		_chapterId: narratorChapterId,
+		_worktreePath: narratorWorktreePath,
+		_baseBranch: narratorBaseBranch,
+		_planFileId: planFileId,
 	};
 
-	activeSessions.set(narratorId, session);
+	activeNarrators.set(narratorId, active);
 
 	// Start file watcher for the worktree (covers terminal/editor changes)
-	if (sessionWorktreePath && sessionChapterId) {
-		worktreeWatcher.watch(sessionWorktreePath, sessionChapterId, narratorId, locale);
+	if (narratorWorktreePath && narratorChapterId) {
+		worktreeWatcher.watch(narratorWorktreePath, narratorChapterId, narratorId, locale);
 	}
 
-	return session;
+	return active;
 }
 
 // === Agent loop execution ===
@@ -1062,11 +1125,11 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
  * Runs in the background — kicked off by feedMessage().
  */
 async function runAgentLoop(
-	session: ActiveSession,
+	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
 ): Promise<void> {
-	const { narratorId, locale } = session;
+	const { narratorId, locale } = active;
 	let shouldUpdateTitle = false;
 	let currentText = text;
 	let currentImages = images;
@@ -1080,7 +1143,7 @@ async function runAgentLoop(
 	const TRANSIENT_RETRY_BASE_MS = 3_000;
 
 	try {
-		while (session.alive) {
+		while (active.alive) {
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
@@ -1091,15 +1154,15 @@ async function runAgentLoop(
 
 			// Apply dynamic pruning — strip tool calls from messages at or
 			// before the persisted boundary so the context stays within budget.
-			session._pruneBoundaryMessageId = freshNarrator.pruneBoundaryMessageId ?? null;
+			active._pruneBoundaryMessageId = freshNarrator.pruneBoundaryMessageId ?? null;
 			if (freshNarrator.pruneBoundaryMessageId) {
 				pruneToolCalls(dbMessages, freshNarrator.pruneBoundaryMessageId);
 			}
 
 			const { history, trailingToolResults } = await buildHistory(
 				dbMessages,
-				session.model,
-				session.provider,
+				active.model,
+				active.provider,
 				narratorId,
 			);
 
@@ -1109,32 +1172,33 @@ async function runAgentLoop(
 					contextSummary: freshNarrator.contextSummary,
 					todosJson: freshNarrator.todosJson,
 				},
-				session.cwd,
+				active.cwd,
 				locale,
-				session._replyInUserLanguage ?? false,
+				active._replyInUserLanguage ?? false,
 				freshNarrator.planMode ?? false,
+				active._planFileId,
 			);
-			session.systemPrompt = freshSystemPrompt;
-			session._usedCompactSummary = usedCompactSummary;
+			active.systemPrompt = freshSystemPrompt;
+			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = {
 				narratorId,
 				broadcastTargetId: narratorId,
-				sseEmitter: session.events,
-				conversationId: session.conversationId,
-				getContextUsagePct: () => session._contextUsagePct,
-				getMeterUsage: () => session._lastMeterUsage,
-				getMeterUnit: () => session._lastMeterUnit,
-				getPartialMessageId: () => session._partialMessageId,
+				sseEmitter: active.events,
+				conversationId: active.conversationId,
+				getContextUsagePct: () => active._contextUsagePct,
+				getMeterUsage: () => active._lastMeterUsage,
+				getMeterUnit: () => active._lastMeterUnit,
+				getPartialMessageId: () => active._partialMessageId,
 				setPartialMessageId: (id) => {
-					session._partialMessageId = id;
+					active._partialMessageId = id;
 				},
 				setContextUsagePct: (pct) => {
-					session._contextUsagePct = pct;
+					active._contextUsagePct = pct;
 				},
 				setMeterData: (usage, unit) => {
-					session._lastMeterUsage = usage;
-					session._lastMeterUnit = unit;
+					active._lastMeterUsage = usage;
+					active._lastMeterUnit = unit;
 				},
 			};
 
@@ -1142,14 +1206,14 @@ async function runAgentLoop(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
-				model: session.model,
-				provider: session.provider,
-				getPruneBoundary: () => session._pruneBoundaryMessageId ?? null,
+				model: active.model,
+				provider: active.provider,
+				getPruneBoundary: () => active._pruneBoundaryMessageId ?? null,
 				setPruneBoundary: (id) => {
-					session._pruneBoundaryMessageId = id;
+					active._pruneBoundaryMessageId = id;
 				},
 				onCompactDone: () => {
-					const s = activeSessions.get(narratorId);
+					const s = activeNarrators.get(narratorId);
 					if (s?.alive) {
 						s.conversationId = randomUUID();
 					}
@@ -1177,6 +1241,7 @@ async function runAgentLoop(
 					});
 				},
 				onEnterPlanMode: async () => {
+					active._planFileId = generateShortId();
 					await narratorService.updatePlanMode(narratorId, true);
 					broadcastToNarrator(narratorId, {
 						type: "plan_mode_changed",
@@ -1185,6 +1250,7 @@ async function runAgentLoop(
 					});
 				},
 				onExitPlanMode: async (output) => {
+					active._planFileId = undefined;
 					await narratorService.updatePlanMode(narratorId, false);
 					broadcastToNarrator(narratorId, {
 						type: "plan_mode_changed",
@@ -1196,39 +1262,39 @@ async function runAgentLoop(
 						pendingPlanCompact.delete(narratorId);
 						if (output) {
 							await runPlanCompact(narratorId, output);
-							session.conversationId = randomUUID();
+							active.conversationId = randomUUID();
 							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-							session._planApprovedContinue = "compact";
-							session.abortController.abort();
+							active._planApprovedContinue = "compact";
+							active.abortController.abort();
 						}
 					} else {
 						// Non-compact: inject a user message into the next turn
 						// so the model sees "plan approved" alongside the tool result.
-						session._planApprovedContinue = "continue";
+						active._planApprovedContinue = "continue";
 					}
 				},
 				onClearCompactSummary: async () => {
-					if (!session._usedCompactSummary) return;
+					if (!active._usedCompactSummary) return;
 					await db
 						.update(narrators)
 						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
 						.where(eq(narrators.id, narratorId));
-					session._usedCompactSummary = false;
+					active._usedCompactSummary = false;
 				},
 				onGitTrack:
-					session._worktreePath && session._chapterId
+					active._worktreePath && active._chapterId
 						? (toolName, toolUseId) => {
 								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-								const chapterId = session._chapterId as string;
-								const worktreePath = session._worktreePath as string;
-								const baseBranch = session._baseBranch as string | undefined;
+								const chapterId = active._chapterId as string;
+								const worktreePath = active._worktreePath as string;
+								const baseBranch = active._baseBranch as string | undefined;
 
 								// Throttle: collapse rapid successive calls into one trailing query.
 								// Store the latest toolUseId so the broadcast references the most
 								// recent tool, and clear any pending timer.
-								if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
-								session._gitTrackTimer = setTimeout(() => {
-									session._gitTrackTimer = undefined;
+								if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+								active._gitTrackTimer = setTimeout(() => {
+									active._gitTrackTimer = undefined;
 									Promise.all([
 										gitService.getStatusSummary(worktreePath),
 										baseBranch
@@ -1279,13 +1345,96 @@ async function runAgentLoop(
 								}, 800);
 							}
 						: undefined,
+				onSnapshotBefore:
+					active._worktreePath && active._chapterId
+						? (toolUseId, toolName) => {
+								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+								const chapterId = active._chapterId as string;
+								const worktreePath = active._worktreePath as string;
+
+								if (!active._snapshotBeforeHashes) {
+									active._snapshotBeforeHashes = new Map();
+								}
+
+								// Chain: ensure init completes before track
+								const ready = active._snapshotInitialized
+									? Promise.resolve()
+									: snapshot
+											.init(chapterId, worktreePath)
+											.then(() => {
+												active._snapshotInitialized = true;
+											});
+
+								const trackPromise = ready
+									.then(() => snapshot.track(chapterId, worktreePath));
+
+								active._snapshotBeforeHashes!.set(toolUseId, trackPromise);
+
+								// Swallow errors so the unhandled-rejection handler stays quiet
+								trackPromise.catch((err) =>
+									logger.debug("Snapshot track (before) failed", {
+										narratorId,
+										toolUseId,
+										error: String(err),
+									}),
+								);
+							}
+						: undefined,
+				onSnapshotAfter:
+					active._worktreePath && active._chapterId
+						? (toolUseId, toolName) => {
+								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+								const chapterId = active._chapterId as string;
+								const worktreePath = active._worktreePath as string;
+								const messageId = active._partialMessageId;
+
+								const beforePromise =
+									active._snapshotBeforeHashes?.get(toolUseId);
+								if (!beforePromise || !messageId) return;
+								active._snapshotBeforeHashes!.delete(toolUseId);
+
+								// Await the before-hash, then capture after-hash (fire-and-forget)
+								beforePromise
+									.then(async (beforeHash) => {
+										const afterHash = await snapshot.track(
+											chapterId,
+											worktreePath,
+										);
+										if (afterHash === beforeHash) return;
+										const files = await snapshot.diffFiles(
+											chapterId,
+											worktreePath,
+											beforeHash,
+											afterHash,
+										);
+										if (files.length === 0) return;
+										await db.insert(narratorPatches).values({
+											id: generateShortId(),
+											narratorId,
+											messageId,
+											toolUseId,
+											beforeHash,
+											afterHash,
+											filesJson: files,
+											createdAt: new Date().toISOString(),
+										});
+									})
+									.catch((err) =>
+										logger.debug("Snapshot track (after) failed", {
+											narratorId,
+											toolUseId,
+											error: String(err),
+										}),
+									);
+							}
+						: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message) => {
 					// Clean up partial message
-					const partialId = session._partialMessageId;
-					session._partialMessageId = undefined;
+					const partialId = active._partialMessageId;
+					active._partialMessageId = undefined;
 					if (message === "Aborted") {
-						if (session._planApprovedContinue === "compact") {
+						if (active._planApprovedContinue === "compact") {
 							logger.info("Agent loop aborted for plan compact", { narratorId });
 							// Still clean up partial message in background
 							if (partialId) {
@@ -1296,13 +1445,13 @@ async function runAgentLoop(
 						logger.info("Agent loop aborted (interrupted)", { narratorId });
 						// Broadcast interrupted event FIRST for instant UI feedback,
 						// then run DB cleanup in parallel (non-blocking).
-						session.events.emit("event", {
+						active.events.emit("event", {
 							type: "interrupted",
-							data: { message: "Session interrupted" },
+							data: { message: "Narrator interrupted" },
 						});
 						// Fire-and-forget: DB cleanup runs in background
 						const cleanupTasks = [
-							cleanupOrphanedToolCalls(narratorId, session.locale),
+							cleanupOrphanedToolCalls(narratorId, active.locale),
 							narratorService.updateStatus(narratorId, "idle"),
 						];
 						if (partialId) {
@@ -1321,34 +1470,35 @@ async function runAgentLoop(
 					}
 					logger.error("Agent loop error", { narratorId, error: message });
 					await narratorService.updateStatus(narratorId, "error", message);
-					session.events.emit("event", { type: "error", data: { message } });
+					active.events.emit("event", { type: "error", data: { message } });
 				},
 			};
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
-				conversationId: session.conversationId,
-				model: session.model,
-				provider: session.provider,
-				cwd: session.cwd,
-				systemPrompt: session.systemPrompt ?? undefined,
+				conversationId: active.conversationId,
+				model: active.model,
+				provider: active.provider,
+				cwd: active.cwd,
+				systemPrompt: active.systemPrompt ?? undefined,
 				locale,
-				signal: session.abortController.signal,
+				signal: active.abortController.signal,
 				planMode: freshNarrator.planMode ?? false,
+				planFileId: active._planFileId,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,
-						session.abortController.signal,
+						active.abortController.signal,
 						toolName,
 						input,
 						toolUseId,
-						session.cwd,
+						active.cwd,
 						locale,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getInjectedUserText: () => {
-					if (session._planApprovedContinue === "continue") {
-						session._planApprovedContinue = undefined;
+					if (active._planApprovedContinue === "continue") {
+						active._planApprovedContinue = undefined;
 						return getToolMessage("exitPlanModeApproved", locale);
 					}
 					return null;
@@ -1356,7 +1506,13 @@ async function runAgentLoop(
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {
-					processEvent(event, eventContext, hooks).catch(() => {});
+					processEvent(event, eventContext, hooks).catch((err) => {
+						logger.error("Side-channel event processing error", {
+							narratorId,
+							eventType: event.type,
+							error: String(err),
+						});
+					});
 				},
 			};
 
@@ -1404,7 +1560,7 @@ async function runAgentLoop(
 			});
 
 			// --- Context length exceeded: compact progressively and retry ---
-			if (result.contextLengthExceeded && session.alive) {
+			if (result.contextLengthExceeded && active.alive) {
 				contextOverflowRetries++;
 				if (contextOverflowRetries > MAX_CONTEXT_OVERFLOW_RETRIES) {
 					logger.error("Context length exceeded after max retries", { narratorId });
@@ -1413,7 +1569,7 @@ async function runAgentLoop(
 						"error",
 						"Context too long even after compact",
 					);
-					session.events.emit("event", {
+					active.events.emit("event", {
 						type: "error",
 						data: { message: "Context too long even after compact" },
 					});
@@ -1448,7 +1604,7 @@ async function runAgentLoop(
 
 					try {
 						await runCustomCompact(narratorId, locale, boundaryMessageId);
-						session.conversationId = randomUUID();
+						active.conversationId = randomUUID();
 						broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 						compacted = true;
 						logger.info("Emergency compact succeeded, retrying", {
@@ -1473,7 +1629,7 @@ async function runAgentLoop(
 				// All compact attempts failed — fall through to error state
 				logger.error("All emergency compact attempts failed", { narratorId });
 				await narratorService.updateStatus(narratorId, "error", "Context too long, compact failed");
-				session.events.emit("event", {
+				active.events.emit("event", {
 					type: "error",
 					data: { message: "Context too long, compact failed" },
 				});
@@ -1481,7 +1637,7 @@ async function runAgentLoop(
 			}
 
 			// --- Transient API error: warn frontend and retry with backoff ---
-			if (result.retryableError && session.alive) {
+			if (result.retryableError && active.alive) {
 				transientRetries++;
 				if (transientRetries > MAX_TRANSIENT_RETRIES) {
 					logger.error("Transient error exceeded max retries", {
@@ -1490,7 +1646,7 @@ async function runAgentLoop(
 						retries: transientRetries,
 					});
 					await narratorService.updateStatus(narratorId, "error", result.retryableError);
-					session.events.emit("event", {
+					active.events.emit("event", {
 						type: "error",
 						data: { message: result.retryableError },
 					});
@@ -1519,11 +1675,11 @@ async function runAgentLoop(
 						clearTimeout(timer);
 						resolve();
 					};
-					if (session.abortController.signal.aborted) {
+					if (active.abortController.signal.aborted) {
 						clearTimeout(timer);
 						resolve();
 					} else {
-						session.abortController.signal.addEventListener("abort", onAbort, { once: true });
+						active.abortController.signal.addEventListener("abort", onAbort, { once: true });
 					}
 				});
 
@@ -1540,9 +1696,9 @@ async function runAgentLoop(
 			// Plan compact aborted the agent loop — reset abort controller and
 			// restart the while-loop so the next iteration builds fresh history
 			// from only post-compact messages.
-			if (session._planApprovedContinue === "compact") {
-				session._planApprovedContinue = undefined;
-				session.abortController = new AbortController();
+			if (active._planApprovedContinue === "compact") {
+				active._planApprovedContinue = undefined;
+				active.abortController = new AbortController();
 				await narratorService.updateStats(narratorId, 0);
 
 				// Always persist a user message to kick off plan execution and continue
@@ -1561,7 +1717,7 @@ async function runAgentLoop(
 					narratorId,
 					message: userMsg,
 				});
-				session.events.emit("event", { type: "user_message", data: userMsg });
+				active.events.emit("event", { type: "user_message", data: userMsg });
 				await narratorService.updateStatus(narratorId, "thinking");
 				currentText = promptText;
 				currentImages = undefined;
@@ -1571,8 +1727,8 @@ async function runAgentLoop(
 			// If the loop was interrupted (abort signal fired), reset the abort
 			// controller so that any chained buffered message or feedback below
 			// can start a fresh agent loop iteration without immediately aborting.
-			if (session.abortController.signal.aborted) {
-				session.abortController = new AbortController();
+			if (active.abortController.signal.aborted) {
+				active.abortController = new AbortController();
 			}
 
 			// Check for chained feedback BEFORE marking "done" — when the user
@@ -1586,7 +1742,7 @@ async function runAgentLoop(
 					{ type: "text", text: fb.feedbackText },
 				]);
 				broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
-				session.events.emit("event", { type: "user_message", data: userMsg });
+				active.events.emit("event", { type: "user_message", data: userMsg });
 				await narratorService.updateStatus(narratorId, "thinking");
 				currentText = fb.feedbackText;
 				continue;
@@ -1601,11 +1757,11 @@ async function runAgentLoop(
 			// may have already started a background compact.
 			// Before compacting, check prunedPercent: if < 80%, continue pruning instead.
 			if (
-				session._contextUsagePct != null &&
-				session._contextUsagePct >= COMPACT_CONTEXT_USAGE_PCT &&
+				active._contextUsagePct != null &&
+				active._contextUsagePct >= COMPACT_CONTEXT_USAGE_PCT &&
 				!compactLocks.has(narratorId)
 			) {
-				session._contextUsagePct = undefined;
+				active._contextUsagePct = undefined;
 
 				// Check current prunedPercent — if below threshold, prune further instead of compacting
 				const narrator = await db.query.narrators.findFirst({
@@ -1633,11 +1789,11 @@ async function runAgentLoop(
 						});
 
 						// Fire-and-forget: compact runs in the background.
-						// On completion it resets the session's conversationId so the next
+						// On completion it resets the narrator's conversationId so the next
 						// agent loop iteration starts a fresh API conversation.
 						runCustomCompact(narratorId, locale, boundaryMessageId)
 							.then(() => {
-								const current = activeSessions.get(narratorId);
+								const current = activeNarrators.get(narratorId);
 								if (current?.alive) {
 									current.conversationId = randomUUID();
 								}
@@ -1688,7 +1844,7 @@ async function runAgentLoop(
 						persistBlocks,
 					);
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
-					session.events.emit("event", { type: "user_message", data: userMsg });
+					active.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "thinking");
 					currentText = buffered.text;
 					currentImages = buffered.images;
@@ -1697,51 +1853,51 @@ async function runAgentLoop(
 				broadcastToNarrator(narratorId, {
 					type: "buffer_cleared",
 					narratorId,
-					reason: "session_error",
+					reason: "narrator_error",
 				});
 			}
 
 			// No chained message — auto-commit before finishing
-			if (session._worktreePath && session._chapterId) {
+			if (active._worktreePath && active._chapterId) {
 				await autoCommitIfNeeded(
 					narratorId,
-					session._chapterId,
-					session._worktreePath,
+					active._chapterId,
+					active._worktreePath,
 					locale,
 					// _partialMessageId is the last assistant message built during this turn;
 					// may be undefined if the turn produced no assistant output (e.g. error path)
-					session._partialMessageId,
+					active._partialMessageId,
 				);
 			}
 
-			session.events.emit("event", { type: "done", data: null });
+			active.events.emit("event", { type: "done", data: null });
 			break;
 		}
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
-		logger.error("Narrator session error", { narratorId, error: errorMsg });
+		logger.error("Narrator loop error", { narratorId, error: errorMsg });
 		await narratorService.updateStatus(narratorId, "error", errorMsg);
-		session.events.emit("event", { type: "error", data: { message: errorMsg } });
-		session.events.emit("event", { type: "done", data: null });
+		active.events.emit("event", { type: "error", data: { message: errorMsg } });
+		active.events.emit("event", { type: "done", data: null });
 	} finally {
-		session.alive = false;
-		if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
+		active.alive = false;
+		if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 		clearCommitReminderTracking(narratorId);
 		// Stop file watcher for this narrator
-		if (session._worktreePath) {
-			worktreeWatcher.unwatch(session._worktreePath, narratorId);
+		if (active._worktreePath) {
+			worktreeWatcher.unwatch(active._worktreePath, narratorId);
 		}
-		activeSessions.delete(narratorId);
-		session.abortController.abort();
-		session.events.emit("event", { type: "done", data: null });
-		session.events.removeAllListeners();
+		activeNarrators.delete(narratorId);
+		active.abortController.abort();
+		active.events.emit("event", { type: "done", data: null });
+		active.events.removeAllListeners();
 		if (shouldUpdateTitle) {
 			generateAndSetTitle(narratorId, locale).catch(() => {});
 		}
 	}
 }
 
-// === Custom compact (session rotation) ===
+// === Custom compact (conversation rotation) ===
 
 /** Per-narrator lock to prevent concurrent compact operations. */
 export const compactLocks = new Map<string, Promise<void>>();
@@ -1779,7 +1935,7 @@ export async function runCustomCompact(
 
 /**
  * Internal compact implementation: generate a summary from DB messages and store it.
- * Clears apiConversationId so the next session starts fresh with the summary.
+ * Clears apiConversationId so the next narrator starts fresh with the summary.
  *
  * On failure, rolls back the compacting marker message and broadcasts a failure event.
  */
@@ -1886,7 +2042,7 @@ async function runPlanCompact(narratorId: string, planText: string): Promise<voi
 
 /**
  * Persist a user message and kick off the agent loop in the background.
- * Returns the session and persisted message for SSE subscription.
+ * Returns the active narrator and persisted message for SSE subscription.
  */
 async function feedMessage(
 	narratorId: string,
@@ -1894,8 +2050,8 @@ async function feedMessage(
 	images?: ImageRef[],
 	locale: Locale = "en",
 	replyInUserLanguage = false,
-): Promise<{ session: ActiveSession; userMsg: typeof narratorMessages.$inferSelect }> {
-	const session = await ensureSession(narratorId, locale, replyInUserLanguage);
+): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
@@ -1922,17 +2078,17 @@ async function feedMessage(
 	}
 
 	// Start agent loop in background
-	runAgentLoop(session, prompt, images).catch((err) => {
+	runAgentLoop(active, prompt, images).catch((err) => {
 		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
 	});
 
-	return { session, userMsg };
+	return { active, userMsg };
 }
 
 // === Public API ===
 
 /**
- * Send a message to a narrator session (fire-and-forget).
+ * Send a message to a narrator (fire-and-forget).
  * Persists the user message, broadcasts it via WS, kicks off the agent loop
  * in the background, and returns the persisted user message.
  * All streaming events are delivered exclusively via WebSocket.
@@ -1954,8 +2110,8 @@ export async function sendMessage(
 }
 
 /**
- * Start or feed a message into a session.
- * Yields SessionEvent objects for consumption (used by chapter-merge).
+ * Start or feed a message into a narrator.
+ * Yields NarratorEvent objects for consumption (used by chapter-merge).
  */
 export async function* startSession(
 	narratorId: string,
@@ -1963,11 +2119,11 @@ export async function* startSession(
 	images?: ImageRef[],
 	locale: Locale = "en",
 	replyInUserLanguage = false,
-): AsyncGenerator<SessionEvent> {
-	let session: ActiveSession;
+): AsyncGenerator<NarratorEvent> {
+	let active: ActiveNarrator;
 	let userMsg: typeof narratorMessages.$inferSelect;
 	try {
-		({ session, userMsg } = await feedMessage(
+		({ active, userMsg } = await feedMessage(
 			narratorId,
 			prompt,
 			images,
@@ -1981,12 +2137,12 @@ export async function* startSession(
 		return;
 	}
 
-	// Subscribe to session events and yield them
-	const eventQueue: SessionEvent[] = [];
+	// Subscribe to narrator events and yield them
+	const eventQueue: NarratorEvent[] = [];
 	let resolve: (() => void) | null = null;
 	let done = false;
 
-	const onEvent = (event: SessionEvent) => {
+	const onEvent = (event: NarratorEvent) => {
 		eventQueue.push(event);
 		if (resolve) {
 			const r = resolve;
@@ -1995,7 +2151,7 @@ export async function* startSession(
 		}
 	};
 
-	session.events.on("event", onEvent);
+	active.events.on("event", onEvent);
 
 	// Emit user_message AFTER subscribing so it's not lost
 	// Broadcast to all WS subscribers so other clients see the user message in real-time
@@ -2025,11 +2181,11 @@ export async function* startSession(
 			}
 		}
 	} finally {
-		session.events.off("event", onEvent);
+		active.events.off("event", onEvent);
 	}
 }
 
-// === Session control ===
+// === Narrator control ===
 
 /**
  * Clean up a partial (incomplete) assistant message and its related records.
@@ -2062,7 +2218,7 @@ async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en
 		.update(narratorToolCalls)
 		.set({
 			status: "fail",
-			errorMessage: "Session interrupted by user",
+			errorMessage: "Narrator interrupted by user",
 			outputJson: getToolMessage("interruptedByUser", locale),
 		})
 		.where(
@@ -2073,47 +2229,47 @@ async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en
 		);
 }
 
-export function interruptSession(narratorId: string): boolean {
-	const session = activeSessions.get(narratorId);
-	if (!session) return false;
-	session.abortController.abort();
+export function interruptNarrator(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return false;
+	active.abortController.abort();
 	// Cleanup is handled by the agent loop's onErrorCleanup callback
 	// when it detects the "Aborted" error — no need to duplicate here.
-	logger.info("Narrator session interrupted", { narratorId });
+	logger.info("Narrator interrupted", { narratorId });
 	return true;
 }
 
-/** Gracefully close a streaming session. */
-export function closeSession(narratorId: string): void {
-	const session = activeSessions.get(narratorId);
-	if (!session) return;
-	session.alive = false;
-	if (session._gitTrackTimer) clearTimeout(session._gitTrackTimer);
-	session.abortController.abort();
-	cleanupOrphanedToolCalls(narratorId, session.locale).catch((err) => {
+/** Gracefully close a narrator. */
+export function closeNarrator(narratorId: string): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	active.alive = false;
+	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+	active.abortController.abort();
+	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,
 			error: String(err),
 		});
 	});
-	logger.info("Narrator session closed", { narratorId });
+	logger.info("Narrator closed", { narratorId });
 }
 
-export function isSessionActive(narratorId: string): boolean {
-	return activeSessions.has(narratorId);
+export function isNarratorActive(narratorId: string): boolean {
+	return activeNarrators.has(narratorId);
 }
 
-// === Dynamic session controls ===
+// === Dynamic narrator controls ===
 
-export function updateSessionModel(narratorId: string, model: string): void {
-	const session = activeSessions.get(narratorId);
-	if (session?.alive) {
-		session.model = model;
-		session.provider = resolveProvider(model);
+export function updateNarratorModel(narratorId: string, model: string): void {
+	const active = activeNarrators.get(narratorId);
+	if (active?.alive) {
+		active.model = model;
+		active.provider = resolveProvider(model);
 	}
 }
 
-export function updateSessionPermissionMode(_narratorId: string, _mode: string): void {
+export function updateNarratorPermissionMode(_narratorId: string, _mode: string): void {
 	// Permission mode is read from DB in real-time by handlePermission
 }
 
@@ -2125,7 +2281,7 @@ export function setBufferedMessage(
 	text: string,
 	images?: ImageRef[],
 ): { ok: boolean; bufferedAt: string } {
-	if (!activeSessions.has(narratorId)) {
+	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "" };
 	}
 	const bufferedAt = new Date().toISOString();

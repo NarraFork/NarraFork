@@ -20,6 +20,8 @@ export interface BuildPromptOptions {
 	todosJson?: unknown;
 	/** Whether plan mode is active */
 	planMode?: boolean;
+	/** Plan file ID for plan mode (locks Write/Edit to .narrafork/plan-{id}.md) */
+	planFileId?: string;
 	/** Whether to force language instruction even for English locale */
 	replyInUserLanguage?: boolean;
 }
@@ -39,8 +41,16 @@ export interface BuildPromptResult {
 export async function buildEffectiveSystemPrompt(
 	options: BuildPromptOptions,
 ): Promise<BuildPromptResult> {
-	const { basePrompt, cwd, locale, contextSummary, todosJson, planMode, replyInUserLanguage } =
-		options;
+	const {
+		basePrompt,
+		cwd,
+		locale,
+		contextSummary,
+		todosJson,
+		planMode,
+		planFileId,
+		replyInUserLanguage,
+	} = options;
 
 	let prompt = basePrompt;
 	let usedCompactSummary = false;
@@ -100,7 +110,7 @@ export async function buildEffectiveSystemPrompt(
 	if (planMode) {
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}${getPlanModeSystemReminder(locale)}`;
+		prompt = `${base}${sep}${getPlanModeSystemReminder(locale, planFileId)}`;
 	}
 
 	return { prompt, usedCompactSummary };

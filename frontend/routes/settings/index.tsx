@@ -665,6 +665,12 @@ function SettingsPage() {
 						checked={userPrefs?.showTokenUsage ?? false}
 						onChange={(e) => updateUserPref.mutate({ showTokenUsage: e.currentTarget.checked })}
 					/>
+					<Switch
+						label={t("showOutputStats")}
+						description={t("showOutputStatsDesc")}
+						checked={userPrefs?.showOutputStats ?? false}
+						onChange={(e) => updateUserPref.mutate({ showOutputStats: e.currentTarget.checked })}
+					/>
 				</Stack>
 			</Paper>
 

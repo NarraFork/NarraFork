@@ -13,6 +13,7 @@ import {
 	truncateJson,
 	truncateToolIO,
 } from "./narrator-service";
+import { recordOutputChunk } from "./output-stats";
 
 // === Context types ===
 
@@ -67,6 +68,10 @@ export interface EventHooks {
 	onClearCompactSummary?: () => Promise<void>;
 	/** Git status tracking after file-mutating tools */
 	onGitTrack?: (toolName: string, toolUseId: string) => void;
+	/** Snapshot: record tree hash before a file-mutating tool executes */
+	onSnapshotBefore?: (toolUseId: string, toolName: string) => void;
+	/** Snapshot: record tree hash after a file-mutating tool completes */
+	onSnapshotAfter?: (toolUseId: string, toolName: string) => void;
 	/** Context usage event (prune + compact trigger) */
 	onContextUsage?: (percentage: number) => void;
 	/** Error cleanup (partial message removal, orphaned tool calls) */
@@ -90,6 +95,9 @@ export async function processEvent(
 
 	switch (event.type) {
 		case "stream_text": {
+			// Track AI output character rate
+			recordOutputChunk(event.text.length);
+
 			const streamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
 				delta: { type: "text_delta", text: event.text },
@@ -115,6 +123,10 @@ export async function processEvent(
 		}
 
 		case "tool_call": {
+			// Snapshot: capture tree state before the tool modifies files
+			if (hooks?.onSnapshotBefore) {
+				hooks.onSnapshotBefore(event.toolUseId, event.toolName);
+			}
 			broadcastToNarrator(broadcastTargetId, {
 				type: "tool_started",
 				narratorId: broadcastTargetId,
@@ -304,6 +316,11 @@ export async function processEvent(
 				hooks.onGitTrack(event.toolName, event.toolUseId);
 			}
 
+			// Snapshot: capture tree state after the tool completed
+			if (hooks?.onSnapshotAfter) {
+				hooks.onSnapshotAfter(event.toolUseId, event.toolName);
+			}
+
 			// Main narrator: ExitPlanMode
 			if (!event.isError && event.toolName === "ExitPlanMode" && hooks?.onExitPlanMode) {
 				await hooks.onExitPlanMode(event.output ?? "");
@@ -391,6 +408,11 @@ export async function processEvent(
 
 		case "metering": {
 			ctx.setMeterData(event.usage, event.unit);
+			if (event.credentialId) {
+				try {
+				} catch {
+				}
+			}
 			const isSubagent = !!ctx.parentToolUseId;
 			broadcastToNarrator(broadcastTargetId, {
 				type: "metering",

@@ -2,6 +2,7 @@ import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { OpenAIProviderConfig } from "../settings";
 import { parseModelId } from "../settings";
+import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { zodToJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ToolDefinition } from "./types";
@@ -603,7 +604,7 @@ async function* _parseResponsesAPIStream(
 	const reader = body.getReader();
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			const { done, value } = await readWithTimeout(reader);
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
 
@@ -834,7 +835,7 @@ async function* parseSSEStream(
 	const reader = body.getReader();
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			const { done, value } = await readWithTimeout(reader);
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
 

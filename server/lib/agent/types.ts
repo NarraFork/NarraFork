@@ -8,6 +8,8 @@ export interface ToolContext {
 	signal: AbortSignal;
 	/** Locale for i18n of tool outputs */
 	locale: string;
+	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
+	planFileId?: string;
 	/** Request permission from the user. Returns true if allowed. */
 	requestPermission: (
 		toolName: string,
@@ -101,7 +103,7 @@ export type AgentEvent =
 	| { type: "context_length_exceeded"; message: string }
 	| { type: "stream_reasoning"; text: string }
 	| { type: "context_usage"; percentage: number }
-	| { type: "metering"; unit: string; unitPlural: string; usage: number }
+	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "done" };
 
@@ -129,6 +131,8 @@ export type ContentBlock =
 /** Tools allowed during plan mode. Everything else is auto-denied or description-overridden. */
 export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Read",
+	"Write",
+	"Edit",
 	"Glob",
 	"Grep",
 	"WebSearch",
@@ -154,6 +158,8 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	maxTurns?: number;
 	planMode?: boolean;
+	/** Plan file ID — set during plan mode for Write/Edit redirection and ExitPlanMode */
+	planFileId?: string;
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	permissionHandler: (

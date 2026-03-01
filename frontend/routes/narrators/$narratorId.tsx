@@ -4,8 +4,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
-import { SessionTerminal } from "../../components/terminal/SessionTerminal";
+import { NarratorTerminal } from "../../components/terminal/NarratorTerminal";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { usePageUnload } from "../../hooks/usePageUnload";
@@ -13,8 +14,8 @@ import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { api } from "../../lib/api";
 
-export const Route = createFileRoute("/sessions/$sessionId")({
-	component: SessionDetailPage,
+export const Route = createFileRoute("/narrators/$narratorId")({
+	component: NarratorDetailPage,
 });
 
 const MIN_PANEL_WIDTH = 200;
@@ -24,18 +25,18 @@ function terminalStorageKey(narratorId: string) {
 	return `narrafork_terminal_open_${narratorId}`;
 }
 
-function SessionDetailPage() {
-	const { sessionId } = Route.useParams();
+function NarratorDetailPage() {
+	const { narratorId } = Route.useParams();
 	const location = useLocation();
 	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const isMobile = useMediaQuery("(max-width: 768px)");
-	const { t } = useTranslation("sessions");
+	const { t } = useTranslation("narrators");
 
 	// Unload heavy components when the tab has been hidden for a while
 	const unloaded = usePageUnload();
 
 	// Fetch narrator data for recent tab tracking
-	const { data: narrator } = useNarrator(sessionId);
+	const { data: narrator } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
 	const { data: chapter } = useChapter(chapterId ?? "");
@@ -53,36 +54,36 @@ function SessionDetailPage() {
 			addRecentTab({
 				type: "chapter",
 				id: chapterId,
-				narratorId: sessionId,
+				narratorId: narratorId,
 				title: narratorTitle || "Chapter",
 				subtitle: chapterTitle,
 				status: narratorStatus,
 			});
 		} else {
-			// Standalone session
+			// Standalone narrator
 			addRecentTab({
-				type: "session",
-				id: sessionId,
+				type: "narrator",
+				id: narratorId,
 				title: narratorTitle || "New conversation",
 				subtitle: narratorCwd,
 				status: narratorStatus,
 			});
 		}
-	}, [sessionId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle]);
+	}, [narratorId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle]);
 
-	// Mark narrator as read (done → idle) when visiting the session page
+	// Mark narrator as read (done → idle) when visiting the narrator page
 	const qc = useQueryClient();
 	useEffect(() => {
 		api
-			.markNarratorRead(sessionId)
+			.markNarratorRead(narratorId)
 			.then(() => {
-				qc.invalidateQueries({ queryKey: ["narrators", sessionId], exact: true });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			})
 			.catch(() => {});
-	}, [sessionId, qc]);
+	}, [narratorId, qc]);
 
 	// Check if there's a running terminal for this narrator
-	const { data: existingTerminals } = useNarratorTerminals(sessionId);
+	const { data: existingTerminals } = useNarratorTerminals(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const hasRunningTerminal = (existingTerminals ?? []).some((t: any) => t.status === "running");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -116,7 +117,7 @@ function SessionDetailPage() {
 
 	useEffect(() => {
 		if (initializedRef.current) return;
-		const saved = localStorage.getItem(terminalStorageKey(sessionId));
+		const saved = localStorage.getItem(terminalStorageKey(narratorId));
 		if (saved === "true" && hasRunningTerminal) {
 			setTerminalOpen(true);
 			initializedRef.current = true;
@@ -124,14 +125,14 @@ function SessionDetailPage() {
 			// Data loaded but no saved state or no running terminal
 			initializedRef.current = true;
 		}
-	}, [sessionId, hasRunningTerminal, existingTerminals]);
+	}, [narratorId, hasRunningTerminal, existingTerminals]);
 
 	// Close terminal panel on unmount (navigating away)
 	useEffect(() => {
 		return () => {
-			localStorage.removeItem(terminalStorageKey(sessionId));
+			localStorage.removeItem(terminalStorageKey(narratorId));
 		};
-	}, [sessionId]);
+	}, [narratorId]);
 
 	// Terminal width for desktop (as ratio of container)
 	const [terminalRatio, setTerminalRatio] = useState(DEFAULT_TERMINAL_RATIO);
@@ -152,7 +153,7 @@ function SessionDetailPage() {
 		writeToTerminalRef.current?.(text);
 	}, []);
 
-	// Receive write function from SessionTerminal
+	// Receive write function from NarratorTerminal
 	const handleWriteRef = useCallback((fn: ((text: string) => void) | null) => {
 		writeToTerminalRef.current = fn;
 	}, []);
@@ -161,19 +162,30 @@ function SessionDetailPage() {
 	const toggleTerminal = useCallback(() => {
 		setTerminalOpen((v) => {
 			const next = !v;
-			localStorage.setItem(terminalStorageKey(sessionId), String(next));
+			localStorage.setItem(terminalStorageKey(narratorId), String(next));
 			return next;
 		});
-	}, [sessionId]);
+	}, [narratorId]);
+
+	// Fork-from-message: open ChapterForkModal with the selected message UUID
+	const [forkAtMessageUuid, setForkAtMessageUuid] = useState<string | null>(null);
+	const handleForkFromMessage = useCallback(
+		(messageUuid: string) => {
+			if (!chapterId) return;
+			setForkAtMessageUuid(messageUuid);
+		},
+		[chapterId],
+	);
+	const closeForkModal = useCallback(() => setForkAtMessageUuid(null), []);
 
 	// Auto-close terminal panel only when the last terminal exits
 	const handleTerminalExit = useCallback(() => {
 		if (runningCount <= 1) {
 			setTerminalOpen(false);
-			localStorage.setItem(terminalStorageKey(sessionId), "false");
+			localStorage.setItem(terminalStorageKey(narratorId), "false");
 			if (isMobile) closeDrawer();
 		}
-	}, [sessionId, isMobile, closeDrawer, runningCount]);
+	}, [narratorId, isMobile, closeDrawer, runningCount]);
 
 	// Desktop drag handle for resizing (mouse + touch)
 	const onDragStart = useCallback((e: React.MouseEvent | React.TouchEvent) => {
@@ -222,10 +234,10 @@ function SessionDetailPage() {
 					<Stack align="center" gap="sm">
 						<Loader size="sm" />
 						<Text size="sm" c="dimmed">
-							{t("sessionUnloaded")}
+							{t("narratorUnloaded")}
 						</Text>
 						<Text size="xs" c="dimmed">
-							{t("sessionUnloadedHint")}
+							{t("narratorUnloadedHint")}
 						</Text>
 					</Stack>
 				</Center>
@@ -244,9 +256,10 @@ function SessionDetailPage() {
 			>
 				<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
 					<NarratorPanel
-						key={sessionId}
-						narratorId={sessionId}
+						key={narratorId}
+						narratorId={narratorId}
 						highlightMessageId={highlightMessageId}
+						onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
 						onSendToTerminal={handleSendToTerminal}
 						appendInputRef={appendInputRef}
 						terminalOpen={drawerOpened}
@@ -263,13 +276,21 @@ function SessionDetailPage() {
 					title="Terminal"
 					styles={{ body: { height: "calc(100% - 60px)", padding: 0 } }}
 				>
-					<SessionTerminal
-						narratorId={sessionId}
+					<NarratorTerminal
+						narratorId={narratorId}
 						onSendToChat={handleSendToChat}
 						onWriteRef={handleWriteRef}
 						onExit={handleTerminalExit}
 					/>
 				</Drawer>
+				{chapterId && (
+					<ChapterForkModal
+						chapterId={chapterId}
+						opened={forkAtMessageUuid !== null}
+						onClose={closeForkModal}
+						forkAtMessageUuid={forkAtMessageUuid ?? undefined}
+					/>
+				)}
 			</Box>
 		);
 	}
@@ -286,9 +307,10 @@ function SessionDetailPage() {
 			{/* Chat panel */}
 			<Box style={{ flex: 1, minWidth: MIN_PANEL_WIDTH, overflow: "hidden" }}>
 				<NarratorPanel
-					key={sessionId}
-					narratorId={sessionId}
+					key={narratorId}
+					narratorId={narratorId}
 					highlightMessageId={highlightMessageId}
+					onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
 					onSendToTerminal={terminalOpen ? handleSendToTerminal : undefined}
 					appendInputRef={appendInputRef}
 					terminalOpen={terminalOpen}
@@ -327,14 +349,22 @@ function SessionDetailPage() {
 							overflow: "hidden",
 						}}
 					>
-						<SessionTerminal
-							narratorId={sessionId}
+						<NarratorTerminal
+							narratorId={narratorId}
 							onSendToChat={handleSendToChat}
 							onWriteRef={handleWriteRef}
 							onExit={handleTerminalExit}
 						/>
 					</Box>
 				</>
+			)}
+			{chapterId && (
+				<ChapterForkModal
+					chapterId={chapterId}
+					opened={forkAtMessageUuid !== null}
+					onClose={closeForkModal}
+					forkAtMessageUuid={forkAtMessageUuid ?? undefined}
+				/>
 			)}
 		</Box>
 	);

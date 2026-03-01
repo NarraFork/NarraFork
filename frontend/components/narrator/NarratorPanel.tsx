@@ -7,6 +7,7 @@ import {
 	CloseButton,
 	Group,
 	Image,
+	Indicator,
 	Loader,
 	Menu,
 	Modal,
@@ -29,6 +30,7 @@ import {
 	IconCheck,
 	IconCode,
 	IconCodeOff,
+	IconEraser,
 	IconPaperclip,
 	IconShield,
 	IconSparkles,
@@ -48,6 +50,7 @@ import {
 	useUpdateModel,
 	useUpdatePermissionMode,
 } from "../../hooks/useNarrator";
+import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type TreeMessage } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
@@ -60,7 +63,6 @@ import {
 	StreamingBubble,
 } from "./MessageRenderer";
 import { findMsgByToolUseIdInTree } from "./message-tree-utils";
-import { NarratorForkSelector } from "./NarratorForkSelector";
 import type {
 	ContentBlock,
 	MessagesQueryData,
@@ -110,6 +112,14 @@ export function NarratorPanel({
 	const { t: tc } = useTranslation("common");
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
+
+	// Active terminal count for badge indicator
+	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
+	const activeTerminalCount = useMemo(
+		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
+		[narratorTerminals],
+	);
+
 	const messagesQueryKey = useMemo(
 		() => ["narrators", narratorId, "messages", { around: highlightMessageId }],
 		[narratorId, highlightMessageId],
@@ -471,20 +481,23 @@ export function NarratorPanel({
 	}, [lastMessage]);
 
 	// --- Fork handler ---
-	const handleNarratorFork = useCallback(
-		(messageId: string) => {
+	// Standalone narrators: fork narrator directly (no git involved)
+	const handleStandaloneFork = useCallback(
+		(messageUuid: string) => {
 			forkNarratorMutation.mutate(
-				{ narratorId, forkMessageId: messageId },
+				{ narratorId, forkMessageUuid: messageUuid },
 				{
 					onSuccess: (newNarrator: { id: string }) => {
-						navigate({ to: "/sessions/$narratorId", params: { narratorId: newNarrator.id } });
+						navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
 					},
 				},
 			);
 		},
 		[narratorId, forkNarratorMutation.mutate, navigate],
 	);
-	const forkHandler = narrator?.chapterId ? onForkFromMessage : undefined;
+	// Chapter-bound: use onForkFromMessage (opens ChapterForkModal)
+	// Standalone: use handleStandaloneFork (direct narrator fork)
+	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleStandaloneFork;
 
 	// --- Progressive rendering ---
 	const highlightScrolledRef = useRef(false);
@@ -546,7 +559,6 @@ export function NarratorPanel({
 					page={page}
 					narratorId={narratorId}
 					onForkFromMessage={forkHandler}
-					onBranchFromMessage={handleNarratorFork}
 					highlightedId={highlightedId}
 					permCb={renderPermCb}
 					expandedToolUseId={expandedToolUseId}
@@ -570,7 +582,6 @@ export function NarratorPanel({
 					page={page}
 					narratorId={narratorId}
 					onForkFromMessage={forkHandler}
-					onBranchFromMessage={handleNarratorFork}
 					highlightedId={highlightedId}
 					permCb={renderPermCb}
 					expandedToolUseId={expandedToolUseId}
@@ -591,7 +602,6 @@ export function NarratorPanel({
 		visibleCount,
 		narratorId,
 		forkHandler,
-		handleNarratorFork,
 		renderPermCb,
 		expandedToolUseId,
 		editExpandOverride,
@@ -942,7 +952,6 @@ export function NarratorPanel({
 							{t("disconnected")}
 						</Badge>
 					)}
-					<NarratorForkSelector narratorId={narratorId} />
 				</Group>
 				<Group gap="xs">
 					<Tooltip label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}>
@@ -1329,6 +1338,14 @@ export function NarratorPanel({
 									>
 										{t("triggerCompact")}
 									</Menu.Item>
+									<Menu.Item
+										leftSection={<IconEraser size={14} />}
+										onClick={() => {
+											api.clearContext(narratorId).catch(() => {});
+										}}
+									>
+										{t("clearContext")}
+									</Menu.Item>
 								</Menu.Dropdown>
 							</Menu>
 						);
@@ -1450,14 +1467,22 @@ export function NarratorPanel({
 						</Menu>
 						{onToggleTerminal && (
 							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
-								<ActionIcon
-									variant="subtle"
-									color={terminalOpen ? "blue" : "gray"}
-									size="sm"
-									onClick={onToggleTerminal}
+								<Indicator
+									label={activeTerminalCount}
+									size={14}
+									disabled={activeTerminalCount === 0}
+									offset={2}
+									color="blue"
 								>
-									<IconTerminal size={16} />
-								</ActionIcon>
+									<ActionIcon
+										variant="subtle"
+										color={terminalOpen ? "blue" : "gray"}
+										size="sm"
+										onClick={onToggleTerminal}
+									>
+										<IconTerminal size={16} />
+									</ActionIcon>
+								</Indicator>
 							</Tooltip>
 						)}
 					</Group>
@@ -1568,14 +1593,22 @@ export function NarratorPanel({
 						</Menu>
 						{onToggleTerminal && (
 							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
-								<ActionIcon
-									variant="subtle"
-									color={terminalOpen ? "blue" : "gray"}
-									size="sm"
-									onClick={onToggleTerminal}
+								<Indicator
+									label={activeTerminalCount}
+									size={14}
+									disabled={activeTerminalCount === 0}
+									offset={2}
+									color="blue"
 								>
-									<IconTerminal size={16} />
-								</ActionIcon>
+									<ActionIcon
+										variant="subtle"
+										color={terminalOpen ? "blue" : "gray"}
+										size="sm"
+										onClick={onToggleTerminal}
+									>
+										<IconTerminal size={16} />
+									</ActionIcon>
+								</Indicator>
 							</Tooltip>
 						)}
 					</Group>

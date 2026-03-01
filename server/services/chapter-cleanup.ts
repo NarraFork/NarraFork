@@ -10,6 +10,7 @@ import { settings } from "../lib/settings";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
+import { snapshot } from "./snapshot";
 import { terminalService } from "./terminal-service";
 import { worktreeWatcher } from "./worktree-watcher";
 
@@ -248,6 +249,16 @@ export const chapterCleanup = {
 							error: String(err),
 						});
 					}
+				}
+
+				// Clean up shadow snapshot repository
+				try {
+					await snapshot.destroy(chapterId);
+				} catch (err) {
+					logger.warn("Failed to destroy snapshot repo during cleanup", {
+						chapterId,
+						error: String(err),
+					});
 				}
 
 				const now = new Date().toISOString();

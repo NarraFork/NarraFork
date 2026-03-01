@@ -46,7 +46,7 @@ function DashboardPage() {
 					label={t("standaloneSessions")}
 					value={sessionsData?.totalCount ?? 0}
 					color="violet"
-					to="/sessions"
+					to="/narrators"
 				/>
 			</SimpleGrid>
 

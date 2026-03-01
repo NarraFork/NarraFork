@@ -43,16 +43,20 @@ import {
 	useCreateNarrator,
 	useNarratorsPaginated,
 } from "../../hooks/useNarrator";
-import { useSessionsListWS } from "../../hooks/useNarratorWS";
+import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 
-export const Route = createFileRoute("/sessions/")({
-	component: SessionsPage,
+export const Route = createFileRoute("/narrators/")({
+	component: NarratorsPage,
+	validateSearch: (search: Record<string, unknown>) => ({
+		create: search.create === true || search.create === "true" || false,
+	}),
 });
 
-function SessionsPage() {
+function NarratorsPage() {
+	const { create } = Route.useSearch();
 	const [sortBy, setSortBy] = useState("updatedAt");
 	const [sortOrder, setSortOrder] = useState("desc");
 	const [filter, setFilter] = useState("all"); // "all" | "standalone" | "chapter"
@@ -68,14 +72,14 @@ function SessionsPage() {
 		sortBy,
 		sortOrder,
 	});
-	const sessions = useMemo(
+	const narrators = useMemo(
 		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
 		[paginatedData],
 	);
-	const createSession = useCreateNarrator();
-	const archiveSession = useArchiveNarrator();
+	const createNarrator = useCreateNarrator();
+	const archiveNarrator = useArchiveNarrator();
 	const [opened, { open, close }] = useDisclosure(false);
-	const { t } = useTranslation("sessions");
+	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
 	const { i18n } = useTranslation();
 	const [cwd, setCwd] = useState("");
@@ -89,11 +93,19 @@ function SessionsPage() {
 	const qc = useQueryClient();
 	const navigate = useNavigate();
 
+	// Auto-open create modal when navigated with ?create=true
+	useEffect(() => {
+		if (create) {
+			open();
+			navigate({ to: "/narrators", search: { create: false }, replace: true });
+		}
+	}, [create, open, navigate]);
+
 	const { groupedModels, settingsData } = useAllModels();
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const sessionIds = useMemo(() => sessions.map((s: any) => s.id), [sessions]);
-	useSessionsListWS(sessionIds, (narratorId, event) => {
+	const narratorIds = useMemo(() => narrators.map((s: any) => s.id), [narrators]);
+	useNarratorsListWS(narratorIds, (narratorId, event) => {
 		if (!narratorId) {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			return;
@@ -158,11 +170,11 @@ function SessionsPage() {
 
 	const toggleSortOrder = () => setSortOrder((prev) => (prev === "desc" ? "asc" : "desc"));
 
-	const handleSessionClick = useCallback(
-		(sessionId: string) => {
+	const handleNarratorClick = useCallback(
+		(narratorId: string) => {
 			if (navigatingId) return;
-			setNavigatingId(sessionId);
-			navigate({ to: "/sessions/$sessionId", params: { sessionId } });
+			setNavigatingId(narratorId);
+			navigate({ to: "/narrators/$narratorId", params: { narratorId } });
 		},
 		[navigate, navigatingId],
 	);
@@ -171,7 +183,7 @@ function SessionsPage() {
 	const isFavorited = favorites?.some((f: any) => f.path === cwd);
 
 	const handleCreate = () => {
-		createSession.mutate(
+		createNarrator.mutate(
 			{
 				...(cwd ? { cwd } : {}),
 				...(selectedModel ? { model: selectedModel } : {}),
@@ -185,13 +197,13 @@ function SessionsPage() {
 					setSelectedModel("");
 					setPlanMode(false);
 					addRecentTab({
-						type: "session",
+						type: "narrator",
 						id: data.id,
-						title: data.title || t("newSession"),
+						title: data.title || t("newNarrator"),
 						subtitle: data.cwd || cwd,
 						status: data.status || "idle",
 					});
-					navigate({ to: "/sessions/$sessionId", params: { sessionId: data.id } });
+					navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
 				},
 			},
 		);
@@ -237,10 +249,10 @@ function SessionsPage() {
 							)}
 						</ActionIcon>
 					</Tooltip>
-					<Button variant="subtle" component={Link} to="/sessions/archived">
+					<Button variant="subtle" component={Link} to="/narrators/archived">
 						{t("viewArchived")}
 					</Button>
-					<Button onClick={open}>{t("newSession")}</Button>
+					<Button onClick={open}>{t("newNarrator")}</Button>
 				</Group>
 			</Group>
 
@@ -249,7 +261,7 @@ function SessionsPage() {
 				<Group justify="space-between">
 					<Title order={3}>{t("title")}</Title>
 					<Button size="xs" onClick={open}>
-						{t("newSession")}
+						{t("newNarrator")}
 					</Button>
 				</Group>
 				<SegmentedControl
@@ -281,7 +293,7 @@ function SessionsPage() {
 							)}
 						</ActionIcon>
 					</Tooltip>
-					<Button variant="subtle" size="xs" component={Link} to="/sessions/archived">
+					<Button variant="subtle" size="xs" component={Link} to="/narrators/archived">
 						{t("viewArchived")}
 					</Button>
 				</Group>
@@ -289,23 +301,23 @@ function SessionsPage() {
 
 			{isLoading ? (
 				<Loader />
-			) : !sessions.length ? (
-				<Text c="dimmed">{t("noSessions")}</Text>
+			) : !narrators.length ? (
+				<Text c="dimmed">{t("noNarrators")}</Text>
 			) : (
 				<Stack>
 					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-					{sessions.map((session: any) => {
-						const isNavigating = navigatingId === session.id;
+					{narrators.map((narrator: any) => {
+						const isNavigating = navigatingId === narrator.id;
 						const viewers: Array<{
 							userId: string;
 							username: string;
 							avatarColor: string | null;
-						}> = session.viewers ?? [];
-						const activeTerminals: number = session.activeTerminalCount ?? 0;
-						const chapter = session.chapter;
+						}> = narrator.viewers ?? [];
+						const activeTerminals: number = narrator.activeTerminalCount ?? 0;
+						const chapter = narrator.chapter;
 						return (
 							<Card
-								key={session.id}
+								key={narrator.id}
 								shadow="sm"
 								padding="md"
 								withBorder
@@ -315,7 +327,7 @@ function SessionsPage() {
 									opacity: navigatingId && !isNavigating ? 0.5 : 1,
 									WebkitTapHighlightColor: "transparent",
 								}}
-								onClick={() => handleSessionClick(session.id)}
+								onClick={() => handleNarratorClick(narrator.id)}
 								onPointerDown={(e: React.PointerEvent<HTMLDivElement>) => {
 									e.currentTarget.style.transform = "scale(0.985)";
 								}}
@@ -330,21 +342,24 @@ function SessionsPage() {
 									<div style={{ flex: 1, minWidth: 0 }}>
 										<Group gap="xs" wrap="wrap">
 											<Text fw={500}>
-												{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
+												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 											</Text>
-											{session.status === "thinking" && (
-												<Loader size={14} color={session.planMode ? "green" : undefined} />
+											{narrator.status === "thinking" && (
+												<Loader size={14} color={narrator.planMode ? "green" : undefined} />
 											)}
-											{session.status === "thinking" && session.planMode && (
+											{narrator.status === "thinking" && narrator.planMode && (
 												<Badge size="xs" color="green">
 													{tn("status_planning")}
 												</Badge>
 											)}
-											{session.status &&
-												session.status !== "idle" &&
-												session.status !== "thinking" && (
-													<Badge size="xs" color={NARRATOR_STATUS_COLORS[session.status] ?? "gray"}>
-														{tn(`status_${session.status}`)}
+											{narrator.status &&
+												narrator.status !== "idle" &&
+												narrator.status !== "thinking" && (
+													<Badge
+														size="xs"
+														color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}
+													>
+														{tn(`status_${narrator.status}`)}
 													</Badge>
 												)}
 											{chapter && (
@@ -355,9 +370,9 @@ function SessionsPage() {
 										</Group>
 										<Group gap="xs">
 											<Text size="sm" c="dimmed">
-												{t("sessionMeta", {
-													model: session.model,
-													count: session.messageCount ?? 0,
+												{t("narratorMeta", {
+													model: narrator.model,
+													count: narrator.messageCount ?? 0,
 												})}
 											</Text>
 											{activeTerminals > 0 && (
@@ -376,9 +391,9 @@ function SessionsPage() {
 												{t("projectLabel", { name: chapter.projectName })}
 											</Text>
 										)}
-										{session.cwd && (
+										{narrator.cwd && (
 											<Text size="xs" c="dimmed" truncate>
-												{t("cwdLabel", { path: session.cwd })}
+												{t("cwdLabel", { path: narrator.cwd })}
 											</Text>
 										)}
 									</div>
@@ -407,7 +422,7 @@ function SessionsPage() {
 										)}
 										<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
 											{new Date(
-												sortBy === "updatedAt" ? session.updatedAt : session.createdAt,
+												sortBy === "updatedAt" ? narrator.updatedAt : narrator.createdAt,
 											).toLocaleDateString(i18n.language)}
 										</Text>
 										<Tooltip label={t("archive")}>
@@ -417,7 +432,7 @@ function SessionsPage() {
 												variant="subtle"
 												onClick={(e: React.MouseEvent) => {
 													e.stopPropagation();
-													setConfirmArchiveId(session.id);
+													setConfirmArchiveId(narrator.id);
 												}}
 											>
 												<IconArchive size={16} />
@@ -440,10 +455,10 @@ function SessionsPage() {
 				</Stack>
 			)}
 
-			<Modal opened={opened} onClose={handleClose} title={t("newSessionModal")}>
+			<Modal opened={opened} onClose={handleClose} title={t("newNarratorModal")}>
 				<Stack>
 					<Text size="sm" c="dimmed">
-						{t("newSessionDescription")}
+						{t("newNarratorDescription")}
 					</Text>
 
 					<TextInput
@@ -521,8 +536,8 @@ function SessionsPage() {
 						onChange={(e) => setPlanMode(e.currentTarget.checked)}
 					/>
 
-					<Button onClick={handleCreate} loading={createSession.isPending}>
-						{t("createSession")}
+					<Button onClick={handleCreate} loading={createNarrator.isPending}>
+						{t("createNarrator")}
 					</Button>
 				</Stack>
 			</Modal>
@@ -543,7 +558,7 @@ function SessionsPage() {
 							color="orange"
 							onClick={() => {
 								if (confirmArchiveId) {
-									archiveSession.mutate(confirmArchiveId);
+									archiveNarrator.mutate(confirmArchiveId);
 								}
 								setConfirmArchiveId(null);
 							}}

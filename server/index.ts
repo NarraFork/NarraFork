@@ -13,11 +13,15 @@ import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
+import { ensureRootlessEnv } from "./services/container-service";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
 import { terminalService } from "./services/terminal-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
 import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./websocket/ws-handler";
+
+// Set rootless podman env vars early so all child processes inherit them
+ensureRootlessEnv();
 
 // Catch unhandled errors to prevent silent crashes
 process.on("uncaughtException", (err) => {

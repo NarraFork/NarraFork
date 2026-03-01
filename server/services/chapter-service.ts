@@ -27,12 +27,10 @@ import { terminalService } from "./terminal-service";
 
 interface ChapterSettings {
 	autoCreateNarrator?: boolean;
-	autoForkNarrators?: boolean;
 }
 
 const DEFAULT_CHAPTER_SETTINGS: ChapterSettings = {
 	autoCreateNarrator: true,
-	autoForkNarrators: true,
 };
 
 /** Resolve chapter settings from project, merging with defaults. */

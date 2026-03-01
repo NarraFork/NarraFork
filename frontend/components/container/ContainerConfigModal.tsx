@@ -1,22 +1,22 @@
 import { useUpdateChapter } from "@frontend/hooks/useChapters";
+import { useRemoveContainers } from "@frontend/hooks/useContainers";
+import { api } from "@frontend/lib/api";
 import {
 	ActionIcon,
+	Badge,
 	Button,
+	Code,
 	Group,
+	Loader,
 	Modal,
-	NumberInput,
 	Stack,
 	Text,
 	TextInput,
 } from "@mantine/core";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-
-interface PortEntry {
-	containerPort: number;
-	serviceName: string;
-}
 
 interface EnvEntry {
 	key: string;
@@ -39,21 +39,24 @@ export function ContainerConfigModal({
 }: ContainerConfigModalProps) {
 	const { t } = useTranslation("containers");
 	const updateChapter = useUpdateChapter();
+	const removeContainers = useRemoveContainers();
+
+	const { data: composeInfo, isLoading: composeLoading } = useQuery({
+		queryKey: ["composeInfo", chapterId],
+		queryFn: () => api.getComposeInfo(chapterId),
+		enabled: opened,
+	});
 
 	const [composeFile, setComposeFile] = useState("");
-	const [ports, setPorts] = useState<PortEntry[]>([]);
 	const [envVars, setEnvVars] = useState<EnvEntry[]>([]);
 
-	// Sync form state when modal opens or config changes
 	useEffect(() => {
 		if (opened && currentConfig) {
 			setComposeFile(currentConfig.composeFile ?? "");
-			setPorts(currentConfig.ports?.map((p: PortEntry) => ({ ...p })) ?? []);
 			const env = currentConfig.env ?? {};
 			setEnvVars(Object.entries(env).map(([key, value]) => ({ key, value: value as string })));
 		} else if (opened) {
 			setComposeFile("");
-			setPorts([]);
 			setEnvVars([]);
 		}
 	}, [opened, currentConfig]);
@@ -61,9 +64,6 @@ export function ContainerConfigModal({
 	function handleSave() {
 		const config: Record<string, unknown> = {};
 		if (composeFile.trim()) config.composeFile = composeFile.trim();
-		if (ports.length > 0) {
-			config.ports = ports.filter((p) => p.containerPort > 0 && p.serviceName.trim());
-		}
 		const envObj: Record<string, string> = {};
 		for (const { key, value } of envVars) {
 			if (key.trim()) envObj[key.trim()] = value;
@@ -76,16 +76,63 @@ export function ContainerConfigModal({
 		);
 	}
 
-	function handleRemoveConfig() {
-		updateChapter.mutate(
-			{ id: chapterId, data: { containerConfig: null } },
-			{ onSuccess: onClose },
+	function handleRemoveContainers() {
+		removeContainers.mutate(
+			{ chapterId, deleteVolumes: false },
+			{
+				onSuccess: () => {
+					updateChapter.mutate(
+						{ id: chapterId, data: { containerConfig: null } },
+						{ onSuccess: onClose },
+					);
+				},
+			},
 		);
 	}
+
+	const services = composeInfo?.services ?? [];
 
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("configModal.title")} size="lg">
 			<Stack gap="md">
+				{/* Compose file detected info (read-only) */}
+				{composeLoading ? (
+					<Loader size="xs" />
+				) : services.length > 0 ? (
+					<Stack gap="xs">
+						<Text size="sm" fw={500}>
+							{t("configModal.composeDetected")}
+						</Text>
+						{services.map((svc) => (
+							<Stack key={svc.name} gap={4} pl="xs">
+								<Group gap="xs">
+									<Badge size="xs" variant="light">
+										{svc.name}
+									</Badge>
+									{svc.image && (
+										<Text size="xs" c="dimmed">
+											{svc.image}
+										</Text>
+									)}
+								</Group>
+								{svc.ports.length > 0 && (
+									<Text size="xs" c="dimmed">
+										{t("configModal.ports")}:{" "}
+										{svc.ports.map((p) => `${p.host}:${p.container}`).join(", ")}
+									</Text>
+								)}
+								{Object.keys(svc.environment).length > 0 && (
+									<Code style={{ fontSize: 11 }}>
+										{Object.entries(svc.environment)
+											.map(([k, v]) => `${k}=${v}`)
+											.join("\n")}
+									</Code>
+								)}
+							</Stack>
+						))}
+					</Stack>
+				) : null}
+
 				{/* Compose file path */}
 				<TextInput
 					label={t("configModal.composeFile")}
@@ -94,66 +141,11 @@ export function ContainerConfigModal({
 					onChange={(e) => setComposeFile(e.currentTarget.value)}
 				/>
 
-				{/* Port mappings */}
+				{/* Extra environment variables */}
 				<div>
 					<Group justify="space-between" mb={4}>
 						<Text size="sm" fw={500}>
-							{t("configModal.ports")}
-						</Text>
-						<ActionIcon
-							size="xs"
-							variant="light"
-							onClick={() => setPorts([...ports, { containerPort: 0, serviceName: "" }])}
-						>
-							<IconPlus size={14} />
-						</ActionIcon>
-					</Group>
-					<Stack gap={4}>
-						{ports.map((port, i) => (
-							// biome-ignore lint/suspicious/noArrayIndexKey: stable list with add/remove
-							<Group key={i} gap="xs" wrap="nowrap">
-								<NumberInput
-									size="xs"
-									placeholder={t("configModal.containerPort")}
-									value={port.containerPort || ""}
-									onChange={(val) => {
-										const next = [...ports];
-										next[i] = { ...next[i], containerPort: Number(val) || 0 };
-										setPorts(next);
-									}}
-									min={1}
-									max={65535}
-									style={{ flex: 1 }}
-								/>
-								<TextInput
-									size="xs"
-									placeholder={t("configModal.serviceName")}
-									value={port.serviceName}
-									onChange={(e) => {
-										const next = [...ports];
-										next[i] = { ...next[i], serviceName: e.currentTarget.value };
-										setPorts(next);
-									}}
-									style={{ flex: 1 }}
-								/>
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									color="red"
-									onClick={() => setPorts(ports.filter((_, j) => j !== i))}
-								>
-									<IconTrash size={14} />
-								</ActionIcon>
-							</Group>
-						))}
-					</Stack>
-				</div>
-
-				{/* Environment variables */}
-				<div>
-					<Group justify="space-between" mb={4}>
-						<Text size="sm" fw={500}>
-							{t("configModal.env")}
+							{t("configModal.extraEnv")}
 						</Text>
 						<ActionIcon
 							size="xs"
@@ -163,43 +155,49 @@ export function ContainerConfigModal({
 							<IconPlus size={14} />
 						</ActionIcon>
 					</Group>
-					<Stack gap={4}>
-						{envVars.map((env, i) => (
-							// biome-ignore lint/suspicious/noArrayIndexKey: stable list with add/remove
-							<Group key={i} gap="xs" wrap="nowrap">
-								<TextInput
-									size="xs"
-									placeholder={t("configModal.envKey")}
-									value={env.key}
-									onChange={(e) => {
-										const next = [...envVars];
-										next[i] = { ...next[i], key: e.currentTarget.value };
-										setEnvVars(next);
-									}}
-									style={{ flex: 1 }}
-								/>
-								<TextInput
-									size="xs"
-									placeholder={t("configModal.envValue")}
-									value={env.value}
-									onChange={(e) => {
-										const next = [...envVars];
-										next[i] = { ...next[i], value: e.currentTarget.value };
-										setEnvVars(next);
-									}}
-									style={{ flex: 1 }}
-								/>
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									color="red"
-									onClick={() => setEnvVars(envVars.filter((_, j) => j !== i))}
-								>
-									<IconTrash size={14} />
-								</ActionIcon>
-							</Group>
-						))}
-					</Stack>
+					{envVars.length > 0 ? (
+						<Stack gap={4}>
+							{envVars.map((env, i) => (
+								// biome-ignore lint/suspicious/noArrayIndexKey: stable list with add/remove
+								<Group key={i} gap="xs" wrap="nowrap">
+									<TextInput
+										size="xs"
+										placeholder={t("configModal.envKey")}
+										value={env.key}
+										onChange={(e) => {
+											const next = [...envVars];
+											next[i] = { ...next[i], key: e.currentTarget.value };
+											setEnvVars(next);
+										}}
+										style={{ flex: 1 }}
+									/>
+									<TextInput
+										size="xs"
+										placeholder={t("configModal.envValue")}
+										value={env.value}
+										onChange={(e) => {
+											const next = [...envVars];
+											next[i] = { ...next[i], value: e.currentTarget.value };
+											setEnvVars(next);
+										}}
+										style={{ flex: 1 }}
+									/>
+									<ActionIcon
+										size="xs"
+										variant="subtle"
+										color="red"
+										onClick={() => setEnvVars(envVars.filter((_, j) => j !== i))}
+									>
+										<IconTrash size={14} />
+									</ActionIcon>
+								</Group>
+							))}
+						</Stack>
+					) : (
+						<Text size="xs" c="dimmed">
+							{t("configModal.extraEnvHint")}
+						</Text>
+					)}
 				</div>
 
 				{/* Actions */}
@@ -209,10 +207,10 @@ export function ContainerConfigModal({
 							size="xs"
 							variant="subtle"
 							color="red"
-							onClick={handleRemoveConfig}
-							loading={updateChapter.isPending}
+							onClick={handleRemoveContainers}
+							loading={removeContainers.isPending || updateChapter.isPending}
 						>
-							{t("configModal.removeConfig")}
+							{t("configModal.removeContainers")}
 						</Button>
 					) : (
 						<div />

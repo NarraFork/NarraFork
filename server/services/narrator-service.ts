@@ -262,7 +262,7 @@ async function appendMessageRef(
 
 interface CreateNarratorInput {
 	chapterId?: string | null;
-	type?: "primary" | "secondary";
+	type?: "primary";
 	model?: string;
 	systemPrompt?: string;
 	permissionMode?: string;
@@ -1499,6 +1499,49 @@ export const narratorService = {
 	},
 
 	/**
+	 * Insert a compact marker with empty summary to clear the context.
+	 * Subsequent queries will start loading from after this point,
+	 * effectively discarding all prior messages from the AI's context window.
+	 */
+	async clearContext(narratorId: string) {
+		const id = generateId();
+		const now = new Date().toISOString();
+
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+				contentText: "[Context cleared]",
+				createdAt: now,
+			})
+			.returning();
+
+		await db.transaction(async (tx) => {
+			const result = await tx
+				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId));
+			const seq = (result[0]?.maxSeq ?? -1) + 1;
+			await tx.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId,
+				messageId: id,
+				seq,
+				isCompact: 1,
+			});
+			await tx
+				.update(narrators)
+				.set({ contextSummary: null, apiConversationId: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+		});
+
+		return msg;
+	},
+
+	/**
 	 * Finalize a "compacting" system message to "compacted" with the full summary.
 	 * Atomically updates the message content, sets isCompact=1 on the ref,
 	 * and stores the summary on the narrator — all in one transaction.
@@ -1893,12 +1936,11 @@ export const narratorService = {
 
 	async forkNarrator(
 		parentNarratorId: string,
-		forkMessageId: string | null,
+		forkMessageUuid: string | null,
 		opts?: {
 			title?: string;
 			newChapterId?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
-			type?: "primary" | "secondary";
 			locale?: string;
 		},
 	) {
@@ -1906,6 +1948,13 @@ export const narratorService = {
 
 		if (parent.type === "subagent") {
 			throw new ValidationError("Cannot fork from a subagent narrator");
+		}
+
+		// Chapter-bound narrators must fork via chapter fork (newChapterId required)
+		if (parent.chapterId && !opts?.newChapterId) {
+			throw new ValidationError(
+				"Chapter-bound narrators can only be forked together with a chapter",
+			);
 		}
 
 		const inheritMode = opts?.inheritMode ?? "fresh";
@@ -1918,10 +1967,8 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "dontAsk";
 
-		// Determine fork type
-		const targetChapterId = opts?.newChapterId ?? parent.chapterId ?? null;
-		const forkType: "primary" | "secondary" =
-			opts?.type ?? (targetChapterId ? "secondary" : (parent.type as "primary" | "secondary"));
+		// For chapter forks: new chapter ID; for standalone forks: null (stays standalone)
+		const targetChapterId = opts?.newChapterId ?? null;
 
 		// Handle context inheritance
 		let contextSummary: string | null = null;
@@ -1942,23 +1989,30 @@ export const narratorService = {
 			contextSummary = parent.contextSummary ?? null;
 		}
 
-		// Copy message refs if forkMessageId is provided
+		// Copy message refs if forkMessageUuid is provided
 		let prefixRows: Array<{
 			messageId: string;
 			seq: number;
 			isCompact: number;
 			prunedPercent: number | null;
 		}> = [];
+		let resolvedForkMessageId: string | null = null;
 
-		if (forkMessageId) {
-			// Verify forkMessage belongs to parent narrator (via refs)
+		if (forkMessageUuid) {
+			// Resolve messageUuid → message ID → narrator ref
+			const msg = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.messageUuid, forkMessageUuid),
+			});
+			if (!msg) throw new ValidationError("Fork message not found");
+
 			const forkRef = await db.query.narratorMessageRefs.findFirst({
 				where: and(
 					eq(narratorMessageRefs.narratorId, parentNarratorId),
-					eq(narratorMessageRefs.messageId, forkMessageId),
+					eq(narratorMessageRefs.messageId, msg.id),
 				),
 			});
 			if (!forkRef) throw new ValidationError("Fork message not found in parent narrator's refs");
+			resolvedForkMessageId = forkRef.messageId;
 
 			prefixRows = await db
 				.select({
@@ -1984,12 +2038,12 @@ export const narratorService = {
 				.values({
 					id,
 					chapterId: targetChapterId,
-					type: forkType,
+					type: "primary",
 					model: parent.model ?? "claude-sonnet",
 					systemPrompt,
 					permissionMode: resolvedPermMode,
 					parentNarratorId,
-					forkMessageId: forkMessageId ?? null,
+					forkMessageId: resolvedForkMessageId,
 					inheritMode,
 					apiConversationId,
 					contextSummary,
@@ -2042,51 +2096,8 @@ export const narratorService = {
 		});
 
 		eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
-		logger.info("Narrator forked", { parentNarratorId, newNarratorId: id, forkMessageId });
+		logger.info("Narrator forked", { parentNarratorId, newNarratorId: id, forkMessageUuid });
 		return newNarrator;
-	},
-
-	async listRelatedNarrators(narratorId: string) {
-		// Walk up to find root
-		let rootId = narratorId;
-		let current = await this.getById(narratorId);
-		while (current.parentNarratorId) {
-			rootId = current.parentNarratorId;
-			current = await this.getById(rootId);
-		}
-
-		// Use recursive CTE to find all descendants efficiently (exclude subagents)
-		const rows = await db.all<{
-			id: string;
-			title: string | null;
-			parent_narrator_id: string | null;
-			fork_message_id: string | null;
-			type: string;
-			status: string;
-			message_count: number | null;
-			created_at: string;
-		}>(sql`
-			WITH RECURSIVE tree AS (
-				SELECT id, title, parent_narrator_id, fork_message_id, type, status, message_count, created_at
-				FROM narrators WHERE id = ${rootId} AND type != 'subagent'
-				UNION ALL
-				SELECT n.id, n.title, n.parent_narrator_id, n.fork_message_id, n.type, n.status, n.message_count, n.created_at
-				FROM narrators n JOIN tree t ON n.parent_narrator_id = t.id
-				WHERE n.type != 'subagent'
-			)
-			SELECT * FROM tree ORDER BY created_at ASC
-		`);
-
-		return rows.map((n) => ({
-			id: n.id,
-			title: n.title,
-			parentNarratorId: n.parent_narrator_id,
-			forkMessageId: n.fork_message_id,
-			type: n.type,
-			status: n.status,
-			messageCount: n.message_count,
-			createdAt: n.created_at,
-		}));
 	},
 
 	// === Dynamic pruning boundary ===

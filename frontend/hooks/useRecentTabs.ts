@@ -6,7 +6,7 @@ import { queryClient as globalQC } from "../lib/query-client";
 // === Types ===
 
 export interface RecentTab {
-	type: "chapter" | "session" | "project";
+	type: "chapter" | "narrator" | "project";
 	id: string;
 	/** Primary narrator ID — used for WS subscriptions */
 	narratorId?: string;
@@ -65,7 +65,7 @@ export function useRecentTabs() {
 				if (tab.type === "chapter") {
 					qc.removeQueries({ queryKey: ["chapters", tab.id] });
 					if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-				} else if (tab.type === "session") {
+				} else if (tab.type === "narrator") {
 					qc.removeQueries({ queryKey: ["narrators", tab.id] });
 				}
 				// project tabs: no narrator/chapter cache to evict
@@ -81,24 +81,27 @@ export function useRecentTabs() {
 		},
 	});
 
+	interface ClearArgs {
+		keepFilter?: (t: RecentTab) => boolean;
+		/** Pre-computed items to remove (snapshot before onMutate modifies cache) */
+		toRemove: { type: RecentTab["type"]; id: string }[];
+	}
+
 	const clearMutation = useMutation({
-		mutationFn: (keepFilter?: (t: RecentTab) => boolean) => {
+		mutationFn: ({ keepFilter, toRemove }: ClearArgs) => {
 			if (!keepFilter) return api.clearRecentTabs();
-			// Partial clear: persist only the kept tabs via reorder
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const kept = prev.filter(keepFilter);
-			return api.reorderRecentTabs(kept.map((t) => `${t.type}:${t.id}`));
+			if (toRemove.length === 0) return Promise.resolve([]);
+			return api.batchRemoveRecentTabs(toRemove);
 		},
-		onMutate: async (keepFilter?: (t: RecentTab) => boolean) => {
+		onMutate: async ({ keepFilter }: ClearArgs) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
 			const removed = keepFilter ? prev.filter((t) => !keepFilter(t)) : prev;
-			// Evict page data for removed tabs
 			for (const tab of removed) {
 				if (tab.type === "chapter") {
 					qc.removeQueries({ queryKey: ["chapters", tab.id] });
 					if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-				} else if (tab.type === "session") {
+				} else if (tab.type === "narrator") {
 					qc.removeQueries({ queryKey: ["narrators", tab.id] });
 				}
 			}
@@ -145,14 +148,23 @@ export function useRecentTabs() {
 			[reorderMutation],
 		),
 		clearAll: useCallback(() => {
-			clearMutation.mutate(undefined);
-		}, [clearMutation]),
+			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			clearMutation.mutate({ toRemove: prev.map((t) => ({ type: t.type, id: t.id })) });
+		}, [clearMutation, qc]),
 		clearProjects: useCallback(() => {
-			clearMutation.mutate((t: RecentTab) => t.type !== "project");
-		}, [clearMutation]),
-		clearSessions: useCallback(() => {
-			clearMutation.mutate((t: RecentTab) => t.type === "project");
-		}, [clearMutation]),
+			const keepFilter = (t: RecentTab) => t.type !== "project";
+			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			const toRemove = prev.filter((t) => !keepFilter(t)).map((t) => ({ type: t.type, id: t.id }));
+			clearMutation.mutate({ keepFilter, toRemove });
+		}, [clearMutation, qc]),
+		clearNarrators: useCallback(() => {
+			const activeStatuses = new Set(["thinking", "waiting", "done"]);
+			const keepFilter = (t: RecentTab) =>
+				t.type === "project" || activeStatuses.has(t.status ?? "");
+			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			const toRemove = prev.filter((t) => !keepFilter(t)).map((t) => ({ type: t.type, id: t.id }));
+			clearMutation.mutate({ keepFilter, toRemove });
+		}, [clearMutation, qc]),
 	};
 }
 

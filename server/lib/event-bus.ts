@@ -111,6 +111,8 @@ export type NarraForkEvent =
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }
 	| { type: "container:error"; chapterId: string; error: string }
+	| { type: "container:log"; chapterId: string; line: string }
+	| { type: "container:starting"; chapterId: string }
 	// Auto-commit
 	| {
 			type: "narrator:auto_commit";

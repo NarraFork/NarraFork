@@ -26,8 +26,8 @@ function ChapterRedirect() {
 		const primary = narrators.find((n: any) => n.type === "primary");
 		if (primary) {
 			navigate({
-				to: "/sessions/$sessionId",
-				params: { sessionId: primary.id },
+				to: "/narrators/$narratorId",
+				params: { narratorId: primary.id },
 				replace: true,
 			});
 		}

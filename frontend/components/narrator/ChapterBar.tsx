@@ -2,19 +2,11 @@ import { ChapterForkModal } from "@frontend/components/chapter/ChapterForkModal"
 import { ChapterMergeModal } from "@frontend/components/chapter/ChapterMergeModal";
 import { GitPanel } from "@frontend/components/chapter/GitPanel";
 import { ContainerConfigModal } from "@frontend/components/container/ContainerConfigModal";
-import { ContainerLogs } from "@frontend/components/container/ContainerLogs";
-import { ContainerStatus } from "@frontend/components/container/ContainerStatus";
+import { ContainerPanel } from "@frontend/components/container/ContainerPanel";
 import { PodmanInstallModal } from "@frontend/components/container/PodmanInstallModal";
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
-import {
-	useContainers,
-	usePauseContainers,
-	useRemoveContainers,
-	useStartContainers,
-	useStopContainers,
-	useUnpauseContainers,
-} from "@frontend/hooks/useContainers";
+import { useContainers } from "@frontend/hooks/useContainers";
 import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS } from "@frontend/lib/constants";
 import {
@@ -56,11 +48,6 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const { data: containers } = useContainers(chapterId);
 	const qc = useQueryClient();
 	const updateChapter = useUpdateChapter();
-	const startContainers = useStartContainers();
-	const stopContainers = useStopContainers();
-	const pauseContainers = usePauseContainers();
-	const unpauseContainers = useUnpauseContainers();
-	const removeContainers = useRemoveContainers();
 	const dormantChapter = useMutation({
 		mutationFn: () => api.dormantChapter(chapterId),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["chapters", chapterId] }),
@@ -74,8 +61,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const [mergeModalOpen, setMergeModalOpen] = useState(false);
 	const [containerConfigOpen, setContainerConfigOpen] = useState(false);
 	const [podmanInstallOpen, setPodmanInstallOpen] = useState(false);
-	const [logsOpen, setLogsOpen] = useState(false);
-	const [containerStatusOpen, setContainerStatusOpen] = useState(false);
+	const [containerPanelOpen, setContainerPanelOpen] = useState(false);
 	const [gitPanelOpen, setGitPanelOpen] = useState(false);
 
 	const handleContainerError = useCallback((err: Error) => {
@@ -102,7 +88,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 				style={{
 					borderBottom: "1px solid var(--mantine-color-default-border)",
 					flexShrink: 0,
-					backgroundColor: "var(--mantine-color-dark-7)",
+					backgroundColor: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-7))",
 				}}
 			>
 				{/* Left: chapter info */}
@@ -210,91 +196,23 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 						</Menu.Dropdown>
 					</Menu>
 
-					{/* Container menu — always visible */}
-					<Menu position="top-end" withinPortal>
-						<Menu.Target>
-							<Tooltip label={tn("chapterBar.containers")}>
-								<ActionIcon
-									variant="subtle"
-									color={runningContainers.length > 0 ? "green" : "gray"}
-									size="sm"
-								>
-									<IconPackage size={15} />
-								</ActionIcon>
-							</Tooltip>
-						</Menu.Target>
-						<Menu.Dropdown>
-							<Menu.Label>
-								{hasContainers
-									? runningContainers.length > 0
-										? tn("chapterBar.containersRunning", {
-												count: runningContainers.length,
-											})
-										: tn("chapterBar.noContainersRunning")
-									: tn("chapterBar.containers")}
-							</Menu.Label>
-							{hasContainers && (
-								<>
-									<Menu.Divider />
-									<Menu.Item
-										onClick={() =>
-											startContainers.mutate(chapterId, { onError: handleContainerError })
-										}
-									>
-										{tn("chapterBar.startContainers")}
-									</Menu.Item>
-									<Menu.Item
-										onClick={() =>
-											stopContainers.mutate(chapterId, { onError: handleContainerError })
-										}
-									>
-										{tn("chapterBar.stopContainers")}
-									</Menu.Item>
-									<Menu.Item
-										onClick={() =>
-											pauseContainers.mutate(chapterId, { onError: handleContainerError })
-										}
-									>
-										{tn("chapterBar.pauseContainers")}
-									</Menu.Item>
-									<Menu.Item
-										onClick={() =>
-											unpauseContainers.mutate(chapterId, { onError: handleContainerError })
-										}
-									>
-										{tn("chapterBar.resumeContainers")}
-									</Menu.Item>
-									<Menu.Divider />
-									<Menu.Item onClick={() => setContainerStatusOpen(!containerStatusOpen)}>
-										{tn("chapterBar.containers")}
-									</Menu.Item>
-									<Menu.Item onClick={() => setLogsOpen(!logsOpen)}>
-										{tn("chapterBar.viewLogs")}
-									</Menu.Item>
-									<Menu.Divider />
-									<Menu.Item onClick={() => setContainerConfigOpen(true)}>
-										{tn("chapterBar.editContainerConfig")}
-									</Menu.Item>
-									<Menu.Item
-										color="red"
-										onClick={() =>
-											removeContainers.mutate({ chapterId }, { onError: handleContainerError })
-										}
-									>
-										{tn("chapterBar.removeContainers")}
-									</Menu.Item>
-								</>
-							)}
-							{!hasContainers && (
-								<>
-									<Menu.Divider />
-									<Menu.Item onClick={() => setContainerConfigOpen(true)}>
-										{tn("chapterBar.configureContainers")}
-									</Menu.Item>
-								</>
-							)}
-						</Menu.Dropdown>
-					</Menu>
+					{/* Container toggle + menu */}
+					<Tooltip label={tn("chapterBar.containers")}>
+						<ActionIcon
+							variant={containerPanelOpen ? "light" : "subtle"}
+							color={runningContainers.length > 0 ? "green" : "gray"}
+							size="sm"
+							onClick={() => {
+								if (hasContainers) {
+									setContainerPanelOpen(!containerPanelOpen);
+								} else {
+									setContainerConfigOpen(true);
+								}
+							}}
+						>
+							<IconPackage size={15} />
+						</ActionIcon>
+					</Tooltip>
 
 					{/* Chapter settings menu */}
 					<Menu position="top-end" withinPortal>
@@ -346,28 +264,18 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 				</Group>
 			</Group>
 
-			{/* Container logs collapse */}
-			<Collapse in={logsOpen}>
+			{/* Container panel collapse */}
+			<Collapse in={containerPanelOpen && hasContainers}>
 				<div
 					style={{
-						maxHeight: 200,
-						overflow: "auto",
 						borderBottom: "1px solid var(--mantine-color-default-border)",
 					}}
 				>
-					<ContainerLogs chapterId={chapterId} />
-				</div>
-			</Collapse>
-
-			{/* Container status collapse */}
-			<Collapse in={containerStatusOpen}>
-				<div
-					style={{
-						padding: "8px 12px",
-						borderBottom: "1px solid var(--mantine-color-default-border)",
-					}}
-				>
-					<ContainerStatus chapterId={chapterId} />
+					<ContainerPanel
+						chapterId={chapterId}
+						onOpenConfig={() => setContainerConfigOpen(true)}
+						onContainerError={handleContainerError}
+					/>
 				</div>
 			</Collapse>
 

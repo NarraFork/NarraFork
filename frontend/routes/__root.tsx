@@ -2,6 +2,7 @@ import { useResizableNav } from "@frontend/hooks/useResizableNav";
 import {
 	ActionIcon,
 	AppShell,
+	Badge,
 	Box,
 	Burger,
 	Button,
@@ -17,7 +18,19 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconClearAll, IconLogout, IconSearch, IconX } from "@tabler/icons-react";
+import {
+	IconClearAll,
+	IconDashboard,
+	IconFolders,
+	IconLogout,
+	IconMessageChatbot,
+	IconPlus,
+	IconSearch,
+	IconSettings,
+	IconShieldCog,
+	IconTypography,
+	IconX,
+} from "@tabler/icons-react";
 import type { QueryClient } from "@tanstack/react-query";
 import {
 	createRootRouteWithContext,
@@ -33,6 +46,7 @@ import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useLocalPref } from "../hooks/useLocalPref";
+import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabs } from "../hooks/useRecentTabs";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { type ApiError, clearToken, getToken } from "../lib/api";
@@ -54,6 +68,20 @@ function RootLayout() {
 	return <AuthenticatedLayout />;
 }
 
+/** Format chars/sec as a human-readable rate string. */
+function formatRate(cps: number): string {
+	if (cps === 0) return "0 c/s";
+	if (cps >= 1000) return `${(cps / 1000).toFixed(1)}k c/s`;
+	return `${cps} c/s`;
+}
+
+/** Format total chars with K/M suffix. */
+function formatChars(total: number): string {
+	if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(1)}M`;
+	if (total >= 1_000) return `${(total / 1_000).toFixed(1)}K`;
+	return String(total);
+}
+
 function AuthenticatedLayout() {
 	const [opened, { toggle, close: closeNav }] = useDisclosure();
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
@@ -64,11 +92,12 @@ function AuthenticatedLayout() {
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
-	const { tabs, clearProjects, clearSessions } = useRecentTabs();
+	const { tabs, clearProjects, clearNarrators } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { width: navWidth, onDragStart: onNavDragStart } = useResizableNav();
+	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
 
 	// --- Mobile navbar back-button interception ---
 	// Push a sentinel history entry when the navbar opens so that the browser
@@ -170,9 +199,9 @@ function AuthenticatedLayout() {
 
 	// Check if the first tab in each group is active — used for connected border-radius
 	const projectTabs = tabs.filter((t) => t.type === "project");
-	const sessionTabs = tabs.filter((t) => t.type !== "project");
+	const narratorTabs = tabs.filter((t) => t.type !== "project");
 	const firstProjectTabActive = projectTabs.length > 0 && isTabActive(projectTabs[0], pathname);
-	const firstSessionTabActive = sessionTabs.length > 0 && isTabActive(sessionTabs[0], pathname);
+	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
 
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
@@ -200,6 +229,24 @@ function AuthenticatedLayout() {
 						)}
 					</Group>
 					<Group wrap="nowrap">
+						{prefs?.showOutputStats && (
+							<Tooltip
+								label={`${t("totalOutputChars")}: ${formatChars(outputStats.totalChars)}`}
+								position="bottom"
+								withArrow
+							>
+								<Badge
+									variant="dot"
+									color={outputStats.charsPerSec > 0 ? "green" : "gray"}
+									size="lg"
+									leftSection={<IconTypography size={14} />}
+									visibleFrom="sm"
+									style={{ cursor: "default" }}
+								>
+									{formatRate(outputStats.charsPerSec)}
+								</Badge>
+							</Tooltip>
+						)}
 						{/* Desktop: always show search input */}
 						<TextInput
 							placeholder={t("searchPlaceholder")}
@@ -268,11 +315,18 @@ function AuthenticatedLayout() {
 					}}
 				/>
 				<Box>
-					<NavLink component={Link} to="/" label={t("dashboard")} onClick={closeNavForLink} />
+					<NavLink
+						component={Link}
+						to="/"
+						label={t("dashboard")}
+						leftSection={<IconDashboard size={16} />}
+						onClick={closeNavForLink}
+					/>
 					<NavLink
 						component={Link}
 						to="/projects"
 						label={t("projects")}
+						leftSection={<IconFolders size={16} />}
 						onClick={closeNavForLink}
 						styles={
 							firstProjectTabActive
@@ -311,11 +365,12 @@ function AuthenticatedLayout() {
 				<Box>
 					<NavLink
 						component={Link}
-						to="/sessions"
-						label={t("sessions")}
+						to="/narrators"
+						label={t("narrators")}
+						leftSection={<IconMessageChatbot size={16} />}
 						onClick={closeNavForLink}
 						styles={
-							firstSessionTabActive
+							firstNarratorTabActive
 								? {
 										root: {
 											borderBottomLeftRadius: 0,
@@ -325,8 +380,8 @@ function AuthenticatedLayout() {
 								: undefined
 						}
 						rightSection={
-							tabs.some((t) => t.type !== "project") ? (
-								<Tooltip label={t("clearSessions")} position="right" withArrow>
+							<Group gap={2} wrap="nowrap">
+								<Tooltip label={t("newNarrator")} position="right" withArrow>
 									<ActionIcon
 										size={20}
 										variant="subtle"
@@ -334,28 +389,57 @@ function AuthenticatedLayout() {
 										onClick={(e: React.MouseEvent) => {
 											e.preventDefault();
 											e.stopPropagation();
-											clearSessions();
+											navigate({ to: "/narrators", search: { create: true } });
+											closeNavForLink();
 										}}
-										aria-label={t("clearSessions")}
+										aria-label={t("newNarrator")}
 									>
-										<IconClearAll size={14} />
+										<IconPlus size={14} />
 									</ActionIcon>
 								</Tooltip>
-							) : undefined
+								{tabs.some(
+									(t) =>
+										t.type !== "project" &&
+										!["thinking", "waiting", "done"].includes(t.status ?? ""),
+								) && (
+									<Tooltip label={t("clearNarrators")} position="right" withArrow>
+										<ActionIcon
+											size={20}
+											variant="subtle"
+											color="gray"
+											onClick={(e: React.MouseEvent) => {
+												e.preventDefault();
+												e.stopPropagation();
+												clearNarrators();
+											}}
+											aria-label={t("clearNarrators")}
+										>
+											<IconClearAll size={14} />
+										</ActionIcon>
+									</Tooltip>
+								)}
+							</Group>
 						}
 					/>
 				</Box>
 				<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-					<RecentTabList filter="session" onNavigate={closeNavForLink} firstTabConnected />
+					<RecentTabList filter="narrator" onNavigate={closeNavForLink} firstTabConnected />
 				</Box>
 				<Box>
 					{user?.role === "admin" && (
-						<NavLink component={Link} to="/admin" label={t("admin")} onClick={closeNavForLink} />
+						<NavLink
+							component={Link}
+							to="/admin"
+							label={t("admin")}
+							leftSection={<IconShieldCog size={16} />}
+							onClick={closeNavForLink}
+						/>
 					)}
 					<NavLink
 						component={Link}
 						to="/settings"
 						label={t("settings")}
+						leftSection={<IconSettings size={16} />}
 						onClick={closeNavForLink}
 					/>
 				</Box>

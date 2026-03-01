@@ -6,7 +6,6 @@ import {
 	IconCode,
 	IconCopy,
 	IconDeviceMobileRotated,
-	IconGitBranch,
 	IconGitFork,
 	IconMarkdown,
 	IconTextWrap,
@@ -474,21 +473,9 @@ export const ContentViewer = memo(
 										>
 											{t("copy")}
 										</Menu.Item>
-										{(msgCtx.onBranchFromMessage ||
-											msgCtx.onForkFromMessage ||
+										{(msgCtx.onForkFromMessage ||
 											msgCtx.onCompactBeforeMessage ||
 											msgCtx.onDeleteMessage) && <Menu.Divider />}
-										{msgCtx.onBranchFromMessage && (
-											<Menu.Item
-												leftSection={<IconGitBranch size={14} />}
-												onClick={() => {
-													msgCtx.onBranchFromMessage?.();
-													swipe.closeSwipe();
-												}}
-											>
-												{tNarrator("contextMenu_branch")}
-											</Menu.Item>
-										)}
 										{msgCtx.onForkFromMessage && (
 											<Menu.Item
 												leftSection={<IconGitFork size={14} />}
@@ -648,18 +635,9 @@ export const ContentViewer = memo(
 						>
 							{t("copy")}
 						</Menu.Item>
-						{(msgCtx.onBranchFromMessage ||
-							msgCtx.onForkFromMessage ||
+						{(msgCtx.onForkFromMessage ||
 							msgCtx.onCompactBeforeMessage ||
 							msgCtx.onDeleteMessage) && <Menu.Divider />}
-						{msgCtx.onBranchFromMessage && (
-							<Menu.Item
-								leftSection={<IconGitBranch size={14} />}
-								onClick={msgCtx.onBranchFromMessage}
-							>
-								{tNarrator("contextMenu_branch")}
-							</Menu.Item>
-						)}
 						{msgCtx.onForkFromMessage && (
 							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
 								{tNarrator("contextMenu_fork")}

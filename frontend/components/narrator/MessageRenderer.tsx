@@ -34,7 +34,6 @@ export function renderToolRun(
 	editExpandOverride?: boolean | null,
 	onForkFromMessage?: (uuid: string) => void,
 	onDeleteMessage?: (messageId: string) => void,
-	onBranchFromMessage?: (messageId: string) => void,
 	onCompactBeforeMessage?: (messageId: string) => void,
 ) {
 	const matchPermission = (tc: ToolCallData) =>
@@ -59,9 +58,6 @@ export function renderToolRun(
 		const ctxActions: MessageContextMenuActions = {};
 		const msgUuid = item.msg.messageUuid;
 		const msgId = item.msg.id;
-		if (msgId && onBranchFromMessage) {
-			ctxActions.onBranchFromMessage = () => onBranchFromMessage(msgId);
-		}
 		if (msgUuid && onForkFromMessage) {
 			ctxActions.onForkFromMessage = () => onForkFromMessage(msgUuid);
 		}
@@ -149,7 +145,6 @@ export function renderTreeMessages(
 	editExpandOverride?: boolean | null,
 	showTokenUsage?: boolean,
 	onDeleteMessage?: (messageId: string) => void,
-	onBranchFromMessage?: (messageId: string) => void,
 	pruneBoundaryMessageId?: string | null,
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
@@ -185,9 +180,11 @@ export function renderTreeMessages(
 								animation: highlightedId === msg.id ? "highlight-blink 1.5s ease" : undefined,
 							}}
 						>
-							{showTokenUsage && msg.tokensIn != null && (
+							{showTokenUsage && (msg.tokensIn != null || msg.meterUsage != null) && (
 								<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-									↑ {(msg.tokensIn as number).toLocaleString()}
+									{msg.tokensIn != null
+										? `↑ ${(msg.tokensIn as number).toLocaleString()}`
+										: `${(msg.meterUsage as number).toFixed(2)} credits`}
 								</Text>
 							)}
 							<MessageBubble
@@ -198,7 +195,6 @@ export function renderTreeMessages(
 									toolCalls: [],
 								}}
 								onForkFromMessage={onForkFromMessage}
-								onBranchFromMessage={onBranchFromMessage}
 								resolvePerm={(tc) =>
 									resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap)
 								}
@@ -236,7 +232,6 @@ export function renderTreeMessages(
 				editExpandOverride,
 				onForkFromMessage,
 				onDeleteMessage,
-				onBranchFromMessage,
 				onCompactBeforeMessage,
 			);
 			if (el) elements.push(el);
@@ -266,16 +261,19 @@ export function renderTreeMessages(
 						animation: highlightedId === msg.id ? "highlight-blink 1.5s ease" : undefined,
 					}}
 				>
-					{showTokenUsage && msg.role === "assistant" && msg.tokensIn != null && (
-						<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-							↑ {(msg.tokensIn as number).toLocaleString()}
-						</Text>
-					)}
+					{showTokenUsage &&
+						msg.role === "assistant" &&
+						(msg.tokensIn != null || msg.meterUsage != null) && (
+							<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
+								{msg.tokensIn != null
+									? `↑ ${(msg.tokensIn as number).toLocaleString()}`
+									: `${(msg.meterUsage as number).toFixed(2)} credits`}
+							</Text>
+						)}
 					<MessageBubble
 						narratorId={narratorId}
 						message={msg}
 						onForkFromMessage={onForkFromMessage}
-						onBranchFromMessage={onBranchFromMessage}
 						resolvePerm={(tc) =>
 							resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap)
 						}
@@ -285,17 +283,29 @@ export function renderTreeMessages(
 						onCompactBeforeMessage={onCompactBeforeMessage}
 						onDeleteMessage={onDeleteMessage}
 					/>
-					{showTokenUsage && msg.turnUsageJson != null && (
-						<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
-							Σ {((msg.turnUsageJson as Record<string, number>).input_tokens ?? 0).toLocaleString()}{" "}
-							in ·{" "}
-							{((msg.turnUsageJson as Record<string, number>).output_tokens ?? 0).toLocaleString()}{" "}
-							out
-							{msg.costUsd != null &&
-								(msg.costUsd as number) > 0 &&
-								` · $${(msg.costUsd as number).toFixed(4)}`}
-						</Text>
-					)}
+					{showTokenUsage &&
+						(msg.turnUsageJson != null || (msg.meterUsage != null && msg.tokensIn == null)) && (
+							<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
+								{msg.turnUsageJson != null ? (
+									<>
+										Σ{" "}
+										{(
+											(msg.turnUsageJson as Record<string, number>).input_tokens ?? 0
+										).toLocaleString()}{" "}
+										in ·{" "}
+										{(
+											(msg.turnUsageJson as Record<string, number>).output_tokens ?? 0
+										).toLocaleString()}{" "}
+										out
+										{msg.costUsd != null &&
+											(msg.costUsd as number) > 0 &&
+											` · $${(msg.costUsd as number).toFixed(4)}`}
+									</>
+								) : (
+									`${(msg.meterUsage as number).toFixed(2)} credits`
+								)}
+							</Text>
+						)}
 				</Box>,
 			);
 
@@ -328,7 +338,6 @@ interface PageElementsProps {
 	page: MessagesPage;
 	narratorId: string;
 	onForkFromMessage: ((uuid: string) => void) | undefined;
-	onBranchFromMessage: ((messageId: string) => void) | undefined;
 	highlightedId: string | null;
 	permCb: PermissionCallbacks;
 	expandedToolUseId?: string | null;
@@ -346,7 +355,6 @@ export const MemoizedPageElements = memo(
 		page,
 		narratorId,
 		onForkFromMessage,
-		onBranchFromMessage,
 		highlightedId,
 		permCb,
 		expandedToolUseId,
@@ -372,7 +380,6 @@ export const MemoizedPageElements = memo(
 			editExpandOverride,
 			showTokenUsage,
 			onDeleteMessage,
-			onBranchFromMessage,
 			pruneBoundaryMessageId,
 			t("pruneBoundaryLabel"),
 			onCompactBeforeMessage,
@@ -383,7 +390,6 @@ export const MemoizedPageElements = memo(
 		prev.page === next.page &&
 		prev.narratorId === next.narratorId &&
 		prev.onForkFromMessage === next.onForkFromMessage &&
-		prev.onBranchFromMessage === next.onBranchFromMessage &&
 		prev.permCb.pendingPermsMap === next.permCb.pendingPermsMap &&
 		prev.permCb.bgRetryDismissedIds === next.permCb.bgRetryDismissedIds &&
 		prev.expandedToolUseId === next.expandedToolUseId &&

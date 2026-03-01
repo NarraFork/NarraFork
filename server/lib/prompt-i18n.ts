@@ -399,13 +399,15 @@ export function getToolMessageWithParams(
 
 // --- Plan mode system reminder (injected into system prompt) ---
 
-const planModeSystemReminder: Record<Locale, string> = {
-	en: `<system-reminder>
+const planModeSystemReminder: Record<Locale, (planFile: string) => string> = {
+	en: (planFile) => `<system-reminder>
 # Plan Mode
 
-CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase.
+CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase for project files.
 
-STRICTLY FORBIDDEN: ANY file edits, modifications, or system changes. Do NOT use Write, Edit, or any bash command that modifies files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation. ZERO exceptions.
+STRICTLY FORBIDDEN: ANY project file edits, modifications, or system changes. Do NOT use Write, Edit, or any bash command that modifies project files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation.
+
+**Exception**: You may ONLY write to the designated plan file: \`${planFile}\`. All Write/Edit calls in plan mode are automatically redirected to this file regardless of the path you specify.
 
 ## Your Responsibility
 
@@ -417,22 +419,33 @@ Think, read, search, and construct a well-formed plan that accomplishes the user
 2. **Analyze** — Identify the changes needed, potential risks, and tradeoffs
 3. **Plan** — Formulate a clear, step-by-step implementation plan
 4. **Clarify** — Ask the user questions when weighing tradeoffs or facing ambiguity
-5. **Present** — Call ExitPlanMode with your complete plan when ready
+5. **Present** — Call ExitPlanMode to submit your plan
 
-## CRITICAL: Plan Placement Rule
+## Plan Submission — Two Modes
 
-Your plan MUST be written ENTIRELY inside the ExitPlanMode tool's "plan" parameter. This is the ONLY place the plan is stored, displayed to the user, and used for context reset. Do NOT write the plan in your text response and then call ExitPlanMode with a summary or reference like "see above". The "plan" parameter must be fully self-contained with all steps, details, and reasoning. If you write the plan in your text response instead, the user will lose it when context is reset.
+You have two ways to submit your plan (choose ONE):
+
+### Mode A: Inline (for short/medium plans)
+Call ExitPlanMode with the \`plan\` parameter containing your complete plan text.
+
+### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)
+1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). All Write/Edit calls in plan mode are automatically redirected to this file — you don't need to worry about the file path.
+2. When done, call ExitPlanMode with \`planFile\` set to \`${planFile}\`.
+
+**IMPORTANT**: The plan (whether inline or in the file) must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.
 
 Do NOT make large assumptions about user intent. Ask clarifying questions when needed.
 
 Your turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop for any other reason.
 </system-reminder>`,
-	"zh-CN": `<system-reminder>
+	"zh-CN": (planFile) => `<system-reminder>
 # 计划模式
 
-关键约束：计划模式已激活 — 你处于只读阶段。
+关键约束：计划模式已激活 — 你处于项目文件只读阶段。
 
-严格禁止：任何文件编辑、修改或系统变更。不要使用 Write、Edit 或任何修改文件的 bash 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。零例外。
+严格禁止：任何项目文件的编辑、修改或系统变更。不要使用 Write、Edit 或任何修改项目文件的 bash 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。
+
+**例外**：你唯一可以写入的文件是指定的计划文件：\`${planFile}\`。计划模式下所有 Write/Edit 调用会自动重定向到此文件，无论你指定什么路径。
 
 ## 你的职责
 
@@ -444,11 +457,20 @@ Your turn should only end with either asking the user a question or calling Exit
 2. **分析** — 识别需要的变更、潜在风险和权衡
 3. **规划** — 制定清晰的、分步骤的实施计划
 4. **澄清** — 在权衡取舍或面临歧义时向用户提问
-5. **提交** — 准备好后调用 ExitPlanMode 提交完整计划
+5. **提交** — 调用 ExitPlanMode 提交完整计划
 
-## 关键规则：计划必须写在工具参数中
+## 计划提交 — 两种模式
 
-你的计划必须完整地写在 ExitPlanMode 工具的 "plan" 参数中。这是计划被存储、展示给用户和用于上下文重置的唯一位置。不要在文本回复中写计划然后在 ExitPlanMode 中只写摘要或"见上文"之类的引用。"plan" 参数必须完全自包含，包含所有步骤、细节和推理。如果你把计划写在文本回复中而不是工具参数中，用户在重置上下文时将丢失计划内容。
+你有两种方式提交计划（选择其一）：
+
+### 模式 A：内联（适用于短/中等长度的计划）
+调用 ExitPlanMode，在 \`plan\` 参数中填入完整的计划文本。
+
+### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）
+1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。计划模式下所有 Write/Edit 调用会自动重定向到此文件 — 你无需关心文件路径。
+2. 完成后，调用 ExitPlanMode，将 \`planFile\` 设为 \`${planFile}\`。
+
+**重要**：计划（无论内联还是文件形式）必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。
 
 不要对用户意图做大量假设。需要时请提出澄清问题。
 
@@ -456,8 +478,11 @@ Your turn should only end with either asking the user a question or calling Exit
 </system-reminder>`,
 };
 
-export function getPlanModeSystemReminder(locale: Locale = "en"): string {
-	return planModeSystemReminder[locale] ?? planModeSystemReminder.en;
+export function getPlanModeSystemReminder(locale: Locale = "en", planFileId?: string): string {
+	const fileId = planFileId ?? "unknown";
+	const planFile = `.narrafork/plan-${fileId}.md`;
+	const fn = planModeSystemReminder[locale] ?? planModeSystemReminder.en;
+	return fn(planFile);
 }
 
 // --- Todo management system reminder (injected into system prompt when todos exist) ---

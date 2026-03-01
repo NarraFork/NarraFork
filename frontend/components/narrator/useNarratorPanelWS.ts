@@ -395,13 +395,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		if (!pages?.length) return undefined;
 		const firstPage = pages[0];
 		if (!firstPage?.messages?.length) return undefined;
-		const last = firstPage.messages[firstPage.messages.length - 1];
-		if (!last) return undefined;
-		let deepest: NarratorMsg = last;
-		while (deepest.children?.length) {
-			deepest = deepest.children[deepest.children.length - 1];
+		// Walk backwards to find the last real (non-synthetic) message
+		for (let i = firstPage.messages.length - 1; i >= 0; i--) {
+			const msg = firstPage.messages[i];
+			if (!msg?.id || msg.id === STREAMING_CHUNKS_MSG_ID) continue;
+			let deepest: NarratorMsg = msg;
+			while (deepest.children?.length) {
+				deepest = deepest.children[deepest.children.length - 1];
+			}
+			return deepest.id as string | undefined;
 		}
-		return deepest.id as string | undefined;
+		return undefined;
 	}, [messagesData]);
 
 	// --- WebSocket ---
@@ -886,7 +890,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			prevConnectedRef.current = false;
 			return;
 		}
+		const isReconnect = connected && prevConnectedRef.current === false;
 		if (connected) prevConnectedRef.current = true;
+
+		// On reconnect, if the narrator is no longer thinking, the WS catch-up
+		// may have missed messages (e.g. user switched tabs while AI was running).
+		// Force a refetch so the UI shows the latest state.
+		if (isReconnect && narratorStatus !== "thinking") {
+			qc.invalidateQueries({ queryKey: messagesQueryKey });
+		}
+
 		api
 			.getPendingPermissions(narratorId)
 			.then((perms) => {

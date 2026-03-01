@@ -94,6 +94,8 @@
 	"debugSection": "Debug",
 	"showTokenUsage": "Show token usage per turn",
 	"showTokenUsageDesc": "Display input/output token counts after each conversation turn",
+	"showOutputStats": "Show real-time AI output rate",
+	"showOutputStatsDesc": "Display a live chars/sec indicator in the header bar, averaged over a 3-second window",
 	"terminalSection": "Terminal",
 	"terminalTheme": "Terminal Theme",
 	"terminalThemeAuto": "Auto (follow system)",

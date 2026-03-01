@@ -94,6 +94,8 @@
 	"debugSection": "调试",
 	"showTokenUsage": "显示每轮对话的 Token 用量",
 	"showTokenUsageDesc": "每轮对话结束后显示输入/输出 Token 数量",
+	"showOutputStats": "显示实时 AI 输出速率",
+	"showOutputStatsDesc": "在标题栏显示实时字符/秒指示器，基于 3 秒滑动窗口平均计算",
 	"terminalSection": "终端",
 	"terminalTheme": "终端主题",
 	"terminalThemeAuto": "自动（跟随系统）",

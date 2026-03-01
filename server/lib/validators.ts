@@ -63,7 +63,7 @@ export const updateChapterSchema = z.object({
 
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
-	type: z.enum(["primary", "secondary"]).optional(),
+	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
 	permissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"]).optional(),
@@ -205,10 +205,10 @@ export const updateNarratorTitleSchema = z.object({
 	title: z.string().min(1).max(200),
 });
 
-// === Narrator Fork ===
+// === Narrator Fork (standalone narrators only) ===
 
 export const forkNarratorSchema = z.object({
-	forkMessageId: z.string().min(1),
+	forkMessageUuid: z.string().min(1),
 	title: z.string().min(1).max(200).optional(),
 });
 
@@ -247,6 +247,7 @@ export const updateUserPreferencesSchema = z.object({
 	wordWrapDiff: z.boolean().optional(),
 	replyInUserLanguage: z.boolean().optional(),
 	showTokenUsage: z.boolean().optional(),
+	showOutputStats: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 	// Notification preferences
@@ -278,7 +279,7 @@ export const updateUserPreferencesSchema = z.object({
 });
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "session", "project"]),
+	type: z.enum(["chapter", "narrator", "project"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	title: z.string().max(200),
@@ -290,8 +291,20 @@ export const recentTabSchema = z.object({
 export const upsertRecentTabSchema = recentTabSchema;
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "session", "project"]),
+	type: z.enum(["chapter", "narrator", "session", "project"]),
 	id: z.string().min(1).max(50),
+});
+
+export const batchRemoveRecentTabsSchema = z.object({
+	items: z
+		.array(
+			z.object({
+				type: z.enum(["chapter", "narrator", "session", "project"]),
+				id: z.string().min(1).max(50),
+			}),
+		)
+		.min(1)
+		.max(20),
 });
 
 // === WebSocket Messages ===
@@ -339,6 +352,8 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		type: z.literal("presence_leave"),
 		narratorId: z.string().min(1),
 	}),
+	z.object({ type: z.literal("subscribe_stats") }),
+	z.object({ type: z.literal("unsubscribe_stats") }),
 ]);
 
 // Terminal client → server

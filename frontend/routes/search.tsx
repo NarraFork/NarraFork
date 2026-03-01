@@ -37,14 +37,14 @@ function getResultLink(
 			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId }, hash };
 		}
 		if (result.narratorId) {
-			return { to: "/sessions/$sessionId", params: { sessionId: result.narratorId }, hash };
+			return { to: "/narrators/$narratorId", params: { narratorId: result.narratorId }, hash };
 		}
 	}
 	if (result.type === "narrator") {
 		if (result.chapterId) {
 			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId } };
 		}
-		return { to: "/sessions/$sessionId", params: { sessionId: result.id } };
+		return { to: "/narrators/$narratorId", params: { narratorId: result.id } };
 	}
 	return null;
 }

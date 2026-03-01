@@ -69,6 +69,8 @@ export interface TreeMessage {
 		[key: string]: unknown;
 	} | null;
 	contextPercent?: number | null;
+	meterUsage?: number | null;
+	meterUnit?: string | null;
 	subagentModel?: string | null;
 	createdAt: string;
 	children: TreeMessage[];
@@ -305,6 +307,10 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
 		}),
+	clearContext: (narratorId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/clear-context`, {
+			method: "POST",
+		}),
 	createPlan: (narratorId: string, content: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/plan`, {
 			method: "POST",
@@ -327,14 +333,12 @@ export const api = {
 			body: JSON.stringify({ summary }),
 		}),
 
-	// Narrator Fork
-	forkNarrator: (narratorId: string, forkMessageId: string, title?: string) =>
+	// Narrator Fork (standalone sessions only)
+	forkNarrator: (narratorId: string, forkMessageUuid: string, title?: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork`, {
 			method: "POST",
-			body: JSON.stringify({ forkMessageId, title }),
+			body: JSON.stringify({ forkMessageUuid, title }),
 		}),
-	getRelatedNarrators: (narratorId: string) =>
-		request<ApiEntity[]>(`/narrators/${narratorId}/related`),
 
 	// Terminals
 	listTerminals: (chapterId: string) => {
@@ -439,6 +443,7 @@ export const api = {
 			wordWrapDiff: boolean;
 			replyInUserLanguage: boolean;
 			showTokenUsage: boolean;
+			showOutputStats: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
 			// Notification preferences
@@ -456,7 +461,7 @@ export const api = {
 			notifyFeishuWebhook: string;
 			notifyFeishuSecret: string;
 			recentTabs: Array<{
-				type: "chapter" | "session";
+				type: "chapter" | "narrator";
 				id: string;
 				narratorId?: string;
 				title: string;
@@ -473,6 +478,7 @@ export const api = {
 		wordWrapDiff?: boolean;
 		replyInUserLanguage?: boolean;
 		showTokenUsage?: boolean;
+		showOutputStats?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
 		// Notification preferences
@@ -528,7 +534,7 @@ export const api = {
 
 	// Recent Tabs
 	upsertRecentTab: (tab: {
-		type: "chapter" | "session" | "project";
+		type: "chapter" | "narrator" | "project";
 		id: string;
 		narratorId?: string;
 		title: string;
@@ -540,13 +546,18 @@ export const api = {
 			method: "PUT",
 			body: JSON.stringify(tab),
 		}),
-	removeRecentTab: (type: "chapter" | "session" | "project", id: string) =>
+	removeRecentTab: (type: "chapter" | "narrator" | "project", id: string) =>
 		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),
 	clearRecentTabs: () =>
 		request<ApiEntity[]>("/user-preferences/recent-tabs", {
 			method: "DELETE",
+		}),
+	batchRemoveRecentTabs: (items: { type: string; id: string }[]) =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs/batch-remove", {
+			method: "POST",
+			body: JSON.stringify({ items }),
 		}),
 	reorderRecentTabs: (order: string[]) =>
 		request<ApiEntity[]>("/user-preferences/recent-tabs/reorder", {
@@ -555,6 +566,14 @@ export const api = {
 		}),
 
 	// Containers
+	getContainerSetup: (refresh?: boolean) =>
+		request<{
+			podman: { ok: boolean; version?: string };
+			podmanCompose: { ok: boolean; version?: string };
+			composeProvider: { ok: boolean; provider?: string };
+			passt: { ok: boolean; version?: string };
+			allReady: boolean;
+		}>(`/chapters/container-setup${refresh ? "?refresh=true" : ""}`),
 	getPodmanStatus: () =>
 		request<{ installed: boolean; version?: string; platform: string }>("/chapters/podman/status"),
 	installPodman: () =>
@@ -562,6 +581,15 @@ export const api = {
 			"/chapters/podman/install",
 			{ method: "POST" },
 		),
+	getComposeInfo: (chapterId: string) =>
+		request<{
+			services: Array<{
+				name: string;
+				ports: Array<{ host: number; container: number }>;
+				environment: Record<string, string>;
+				image?: string;
+			}>;
+		}>(`/chapters/${chapterId}/compose-info`),
 	getContainers: (chapterId: string) => request<ApiEntity[]>(`/chapters/${chapterId}/containers`),
 	startContainers: (chapterId: string) =>
 		request<ApiEntity>(`/chapters/${chapterId}/containers/start`, { method: "POST" }),
@@ -843,6 +871,15 @@ export const api = {
 			body: JSON.stringify({ priority }),
 		}),
 			method: "POST",
+			body: JSON.stringify({ mode }),
+		}),
+		id: string,
+		fields: { email?: string; displayName?: string; region?: string },
+	) =>
+			method: "PATCH",
+			body: JSON.stringify(fields),
+		}),
+			method: "POST",
 			body: JSON.stringify({ query }),
 		}),
 			method: "POST",
@@ -852,7 +889,7 @@ export const api = {
 		),
 		request<{
 			models: Array<Record<string, unknown>>;
-			credentialId?: number;
+			credentialId?: string;
 			fromCache: boolean;
 			method: "POST",
 		}),

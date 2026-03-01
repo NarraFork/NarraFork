@@ -78,5 +78,19 @@
 	"closePanel": "关闭面板",
 	"reattachFailed": "重新连接终端失败",
 	"terminalCwd": "工作目录",
-	"terminalProcesses": "进程"
+	"terminalProcesses": "进程",
+	"containerSetup": "容器环境",
+	"containerSetupDesc": "所有检查项必须通过后才能使用容器功能。",
+	"containerSetupPodman": "Podman",
+	"containerSetupPodmanCompose": "podman-compose",
+	"containerSetupComposeProvider": "Compose 提供者",
+	"containerSetupPasst": "passt（无根网络后端）",
+	"containerSetupInstalled": "已安装（{{version}}）",
+	"containerSetupNotInstalled": "未安装",
+	"containerSetupCorrect": "使用 {{provider}}",
+	"containerSetupIncorrect": "当前使用 {{provider}}，应使用 podman-compose",
+	"containerSetupNotConfigured": "未配置",
+	"containerSetupReady": "全部就绪",
+	"containerSetupNotReady": "未就绪",
+	"containerSetupRecheck": "重新检查"
 }

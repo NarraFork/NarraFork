@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { getToken } from "../lib/api";
-import type { SessionListWSEvent } from "./useNarratorWS";
+import type { NarratorListWSEvent } from "./useNarratorWS";
 
 const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
@@ -8,7 +8,7 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 /**
  * Persistent WS connection for RecentTabs real-time updates.
  *
- * Unlike useSessionsListWS, this hook:
+ * Unlike useNarratorsListWS, this hook:
  * - Keeps a single WS connection alive for the entire component lifetime
  * - Sends incremental subscribe/unsubscribe messages when narrator IDs change
  *   (instead of tearing down and rebuilding the connection)
@@ -16,7 +16,7 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
  */
 export function useRecentTabsWS(
 	narratorIds: string[],
-	onUpdate: (narratorId: string, event: SessionListWSEvent) => void,
+	onUpdate: (narratorId: string, event: NarratorListWSEvent) => void,
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
 ) {
 	const wsRef = useRef<WebSocket | null>(null);
@@ -58,7 +58,10 @@ export function useRecentTabsWS(
 				const ids = desiredIdsRef.current;
 				if (ids.length) {
 					ws.send(JSON.stringify({ type: "subscribe", narratorIds: ids }));
-					for (const id of ids) subscribedIdsRef.current.add(id);
+					for (const id of ids) {
+						subscribedIdsRef.current.add(id);
+						ws.send(JSON.stringify({ type: "presence_join", narratorId: id }));
+					}
 				}
 			};
 
@@ -73,6 +76,10 @@ export function useRecentTabsWS(
 						onUpdateRef.current(nId, { type: "title", title: data.title });
 					} else if (data.type === "plan_mode_changed") {
 						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
+					} else if (data.type === "presence_update") {
+						onUpdateRef.current(nId, { type: "presence", viewers: data.viewers });
+					} else if (data.type === "ping") {
+						ws.send(JSON.stringify({ type: "pong" }));
 					} else if (data.type.startsWith("user:")) {
 						onGlobalEventRef.current?.(data);
 					}
@@ -110,6 +117,9 @@ export function useRecentTabsWS(
 				ws.onerror = null;
 				const subbed = [...subscribedIdsRef.current];
 				if (ws.readyState === WebSocket.OPEN && subbed.length) {
+					for (const id of subbed) {
+						ws.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
+					}
 					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: subbed }));
 				}
 				ws.close();
@@ -135,12 +145,18 @@ export function useRecentTabsWS(
 		const toUnsubscribe = [...current].filter((id) => !desired.has(id));
 
 		if (toUnsubscribe.length) {
+			for (const id of toUnsubscribe) {
+				ws.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
+			}
 			ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: toUnsubscribe }));
 			for (const id of toUnsubscribe) current.delete(id);
 		}
 		if (toSubscribe.length) {
 			ws.send(JSON.stringify({ type: "subscribe", narratorIds: toSubscribe }));
-			for (const id of toSubscribe) current.add(id);
+			for (const id of toSubscribe) {
+				current.add(id);
+				ws.send(JSON.stringify({ type: "presence_join", narratorId: id }));
+			}
 		}
 	}, [idsKey]);
 }

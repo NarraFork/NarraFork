@@ -33,6 +33,7 @@ export interface ParsedStreamEvent {
 	contextUsagePercentage?: number;
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
+	credentialId?: string;
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;

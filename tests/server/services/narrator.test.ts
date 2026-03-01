@@ -105,7 +105,7 @@ describe("narrator CRUD", () => {
 			.values({
 				id: "n2",
 				chapterId: "ch1",
-				type: "secondary",
+				type: "primary",
 				inheritMode: "fresh",
 				createdAt: now,
 				updatedAt: now,
@@ -125,7 +125,7 @@ describe("narrator CRUD", () => {
 			.values({
 				id: "n-child",
 				chapterId: "ch1",
-				type: "secondary",
+				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
 				createdAt: now,
@@ -223,7 +223,7 @@ describe("narrator messages and refs", () => {
 			.values({
 				id: "n2",
 				chapterId: "ch1",
-				type: "secondary",
+				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n1",
 				createdAt: now,
@@ -263,7 +263,7 @@ describe("narrator fork via shared refs", () => {
 			.values({
 				id: "n-fork",
 				chapterId: "ch1",
-				type: "secondary",
+				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
 				forkMessageId: "m1",
@@ -301,7 +301,7 @@ describe("narrator fork via shared refs", () => {
 			.values({
 				id: "n-fork",
 				chapterId: "ch1",
-				type: "secondary",
+				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
 				forkMessageId: "m0",
@@ -342,7 +342,7 @@ describe("narrator fork via shared refs", () => {
 			.values({
 				id: "n-fork",
 				chapterId: "ch1",
-				type: "secondary",
+				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
 				createdAt: now,

@@ -14,7 +14,7 @@ import { LayoutSelector, type TerminalLayout } from "./LayoutSelector";
 import { TerminalGrid } from "./TerminalGrid";
 import { TerminalTabBar } from "./TerminalTabBar";
 
-interface SessionTerminalProps {
+interface NarratorTerminalProps {
 	narratorId: string;
 	onSendToChat?: (text: string) => void;
 	onWriteRef?: (write: ((text: string) => void) | null) => void;
@@ -49,12 +49,12 @@ function applyOrder(
 	return ordered;
 }
 
-export function SessionTerminal({
+export function NarratorTerminal({
 	narratorId,
 	onSendToChat,
 	onWriteRef,
 	onExit,
-}: SessionTerminalProps) {
+}: NarratorTerminalProps) {
 	const ctx = useMemo(() => ({ narratorId }), [narratorId]);
 	const { data: terminals } = useNarratorTerminals(narratorId);
 	const createTerminal = useCreateNarratorTerminal(narratorId);

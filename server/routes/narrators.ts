@@ -6,6 +6,7 @@ import {
 	desc,
 	eq,
 	gt,
+	gte,
 	isNotNull,
 	isNull,
 	lt,
@@ -15,7 +16,14 @@ import {
 } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapters, narrators, projects, terminals } from "../db/schema";
+import {
+	chapters,
+	narratorMessages,
+	narratorPatches,
+	narrators,
+	projects,
+	terminals,
+} from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -37,18 +45,19 @@ import {
 } from "../lib/validators";
 import { narratorService } from "../services/narrator-service";
 import {
-	closeSession,
+	closeNarrator,
 	getBufferedMessage,
-	interruptSession,
-	isSessionActive,
+	interruptNarrator,
+	isNarratorActive,
 	resolvePermission,
 	runCustomCompact,
 	sendMessage,
-	updateSessionModel,
-	updateSessionPermissionMode,
+	updateNarratorModel,
+	updateNarratorPermissionMode,
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
-import { getNarratorPresenceBatch } from "../websocket/narrator-ws";
+import { snapshot } from "../services/snapshot";
+import { broadcastToNarrator, getNarratorPresenceBatch } from "../websocket/narrator-ws";
 
 /** Parse message request supporting both JSON and multipart/form-data (with images) */
 export async function parseMessageRequest(
@@ -360,6 +369,15 @@ narratorRoutes.post("/:id/compact", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Clear context — insert an empty compact marker so subsequent queries start fresh
+narratorRoutes.post("/:id/clear-context", async (c) => {
+	const narratorId = c.req.param("id");
+	await narratorService.getById(narratorId);
+	const msg = await narratorService.clearContext(narratorId);
+	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
+	return c.json({ ok: true });
+});
+
 // Create a plan compact message
 narratorRoutes.post("/:id/plan", async (c) => {
 	const narratorId = c.req.param("id");
@@ -373,7 +391,7 @@ narratorRoutes.post("/:id/plan", async (c) => {
 // Interrupt active session
 narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
-	const interrupted = interruptSession(id);
+	const interrupted = interruptNarrator(id);
 	return c.json({ interrupted });
 });
 
@@ -384,7 +402,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateModel(id, parsed.data.model);
-	await updateSessionModel(id, parsed.data.model);
+	await updateNarratorModel(id, parsed.data.model);
 	return c.json({ ok: true });
 });
 
@@ -398,7 +416,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updatePermissionMode(id, permissionMode);
-	await updateSessionPermissionMode(id, permissionMode);
+	await updateNarratorPermissionMode(id, permissionMode);
 	return c.json({ ok: true });
 });
 
@@ -426,7 +444,7 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 // Archive narrator
 narratorRoutes.patch("/:id/archive", async (c) => {
 	const id = c.req.param("id");
-	if (isSessionActive(id)) closeSession(id);
+	if (isNarratorActive(id)) closeNarrator(id);
 	await narratorService.getById(id);
 	await narratorService.updateStatus(id, "archived");
 	return c.json({ ok: true });
@@ -450,26 +468,16 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 	return c.json({ ok: true });
 });
 
-// === Narrator Fork ===
-
-// Fork narrator (create new narrator from a message)
+// Fork standalone narrator (chapter-bound narrators must fork via chapter fork)
 narratorRoutes.post("/:id/fork", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json();
 	const parsed = forkNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageId, {
+	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid, {
 		title: parsed.data.title,
 	});
 	return c.json(newNarrator, 201);
-});
-
-// Get related narrators (fork tree)
-narratorRoutes.get("/:id/related", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id);
-	const related = await narratorService.listRelatedNarrators(id);
-	return c.json(related);
 });
 
 // Get pending permissions
@@ -558,4 +566,162 @@ narratorRoutes.post("/:id/suggest-answers", async (c) => {
 	}
 
 	return c.json({ answers });
+});
+
+// === Snapshot / Patch routes ===
+
+/** List patches for a narrator, optionally filtered by messageId */
+narratorRoutes.get("/:id/patches", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.query("messageId");
+
+	const conditions = [eq(narratorPatches.narratorId, narratorId)];
+	if (messageId) {
+		conditions.push(eq(narratorPatches.messageId, messageId));
+	}
+
+	const patches = await db.query.narratorPatches.findMany({
+		where: and(...conditions),
+		orderBy: asc(narratorPatches.createdAt),
+	});
+
+	return c.json(patches);
+});
+
+/** Get the full diff for a specific patch */
+narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
+	const narratorId = c.req.param("id");
+	const patchId = c.req.param("patchId");
+
+	const patch = await db.query.narratorPatches.findFirst({
+		where: and(eq(narratorPatches.id, patchId), eq(narratorPatches.narratorId, narratorId)),
+	});
+	if (!patch) return c.json({ error: "Patch not found" }, 404);
+
+	// Resolve chapter + worktree
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
+	});
+	if (!narrator?.chapterId) return c.json({ error: "Narrator not bound to a chapter" }, 400);
+
+	const chapter = await db.query.chapters.findFirst({
+		where: eq(chapters.id, narrator.chapterId),
+		columns: { worktreePath: true },
+	});
+	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
+
+	const diff = await snapshot.diff(
+		narrator.chapterId,
+		chapter.worktreePath,
+		patch.beforeHash,
+		patch.afterHash,
+	);
+	return c.json({ diff });
+});
+
+/** Revert file changes from a specific message onwards */
+narratorRoutes.post("/:id/revert", async (c) => {
+	const narratorId = c.req.param("id");
+	const body = await c.req.json<{ messageId: string }>();
+	if (!body.messageId) return c.json({ error: "messageId is required" }, 400);
+
+	// Prevent revert while narrator is actively running
+	if (isNarratorActive(narratorId)) {
+		return c.json({ error: "Cannot revert while narrator is running" }, 409);
+	}
+
+	// Resolve chapter + worktree
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
+	});
+	if (!narrator?.chapterId) return c.json({ error: "Narrator not bound to a chapter" }, 400);
+
+	const chapter = await db.query.chapters.findFirst({
+		where: eq(chapters.id, narrator.chapterId),
+		columns: { worktreePath: true },
+	});
+	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
+
+	const chapterId = narrator.chapterId;
+	const worktreePath = chapter.worktreePath;
+
+	// Find the target message's createdAt to filter patches from that point onwards
+	const targetMessage = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, body.messageId),
+		columns: { createdAt: true },
+	});
+	if (!targetMessage) return c.json({ error: "Message not found" }, 404);
+
+	// Collect all patches at or after the target message (reverse chronological for revert)
+	const allPatches = await db.query.narratorPatches.findMany({
+		where: and(
+			eq(narratorPatches.narratorId, narratorId),
+			gte(narratorPatches.createdAt, targetMessage.createdAt),
+		),
+		orderBy: desc(narratorPatches.createdAt),
+	});
+
+	if (allPatches.length === 0) {
+		return c.json({ snapshotHash: null, patchCount: 0, files: [] });
+	}
+
+	// Save current state for unrevert
+	let snapshotHash: string;
+	try {
+		snapshotHash = await snapshot.track(chapterId, worktreePath);
+	} catch (err) {
+		return c.json({ error: `Failed to save current state: ${err instanceof Error ? err.message : String(err)}` }, 500);
+	}
+
+	// Build PatchInfo array
+	const patchInfos = allPatches.map((p) => ({
+		beforeHash: p.beforeHash,
+		afterHash: p.afterHash,
+		files: p.filesJson as string[],
+	}));
+
+	// Revert
+	try {
+		await snapshot.revert(chapterId, worktreePath, patchInfos);
+	} catch (err) {
+		return c.json({ error: `Revert failed: ${err instanceof Error ? err.message : String(err)}` }, 500);
+	}
+
+	// Collect all affected files
+	const allFiles = [...new Set(patchInfos.flatMap((p) => p.files))];
+
+	return c.json({ snapshotHash, patchCount: allPatches.length, files: allFiles });
+});
+
+/** Unrevert — restore to the state before the last revert */
+narratorRoutes.post("/:id/unrevert", async (c) => {
+	const narratorId = c.req.param("id");
+	const body = await c.req.json<{ snapshotHash: string }>();
+	if (!body.snapshotHash) return c.json({ error: "snapshotHash is required" }, 400);
+
+	if (isNarratorActive(narratorId)) {
+		return c.json({ error: "Cannot unrevert while narrator is running" }, 409);
+	}
+
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
+	});
+	if (!narrator?.chapterId) return c.json({ error: "Narrator not bound to a chapter" }, 400);
+
+	const chapter = await db.query.chapters.findFirst({
+		where: eq(chapters.id, narrator.chapterId),
+		columns: { worktreePath: true },
+	});
+	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
+
+	try {
+		await snapshot.restore(narrator.chapterId, chapter.worktreePath, body.snapshotHash);
+	} catch (err) {
+		return c.json({ error: `Restore failed: ${err instanceof Error ? err.message : String(err)}` }, 500);
+	}
+
+	return c.json({ success: true });
 });

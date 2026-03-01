@@ -1,5 +1,6 @@
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { getModelContextWindow, settings } from "../settings";
+import { StreamStaleError } from "../stream-timeout";
 import { getProvider } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
@@ -29,6 +30,8 @@ const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
 
 function isRetryableError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;
+	// Stream stale timeout is always retryable
+	if (err instanceof StreamStaleError) return true;
 	// Check for known retryable reason/code fields
 	const obj = err as Record<string, unknown>;
 	if (
@@ -127,8 +130,15 @@ export async function* agentLoop(
 		let assistantText = "";
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
+		let credentialId: string | undefined;
 		// Map of tool executions started during streaming (toolUseId → Promise)
 		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
+		// Synchronously queryable map of settled early-exec results (populated via .then())
+		const settledResults = new Map<string, ToolExecResult>();
+		// Track which tool_results have already been yielded during streaming
+		const yieldedToolResults = new Set<string>();
+		// Track tool calls whose input was broken (output cut off mid-stream)
+		const brokenToolUseIds = new Set<string>();
 		// Accumulator for streaming tool use events (input arrives in chunks)
 		const toolUseAccum = new Map<
 			string,
@@ -277,16 +287,17 @@ export async function* agentLoop(
 								// Start tool execution eagerly (don't await — collect later).
 								// Wrap with .catch() so a rejected permissionHandler doesn't
 								// create an unhandled rejection; the error surfaces as isError.
-								earlyExecMap.set(
-									id,
-									executeTool(tu, config).catch(
-										(err): ToolExecResult => ({
-											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-											isError: true,
-											durationMs: 0,
-										}),
-									),
+								// The .then() populates settledResults synchronously so the
+								// streaming loop can drain completed results without awaiting.
+								const execPromise = executeTool(tu, config).catch(
+									(err): ToolExecResult => ({
+										output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+										isError: true,
+										durationMs: 0,
+									}),
 								);
+								execPromise.then((r) => settledResults.set(id, r));
+								earlyExecMap.set(id, execPromise);
 
 								// Notify frontend the tool has started
 								yield {
@@ -296,12 +307,40 @@ export async function* agentLoop(
 									input: parsedInput,
 									streamStartedAt: acc.startedAt,
 								};
+
+								// Drain any tool results that settled during streaming.
+								// This lets fast tools (Read, Glob, etc.) report completion
+								// before the model finishes outputting subsequent tool calls.
+								for (const prevTu of toolUses) {
+									const sr = settledResults.get(prevTu.toolUseId);
+									if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
+									yieldedToolResults.add(prevTu.toolUseId);
+									if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
+									const brokenOverride = sr.broken
+										? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
+										: undefined;
+									yield {
+										type: "tool_result",
+										toolUseId: prevTu.toolUseId,
+										toolName: prevTu.name,
+										output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+										isError: sr.isError ?? false,
+										durationMs: sr.durationMs,
+										brokenInputOverride: brokenOverride,
+										updatedInput: brokenOverride,
+									};
+									if (sr.fatal) {
+										yield { type: "error", message: sr.output };
+										return;
+									}
+								}
 							}
 						}
 					}
 				}
 
 				if (parsed.messageId) messageId = parsed.messageId;
+				if (parsed.credentialId) credentialId = parsed.credentialId;
 				if (parsed.reasoning) {
 					yield { type: "stream_reasoning", text: parsed.reasoning };
 				}
@@ -314,6 +353,7 @@ export async function* agentLoop(
 						unit: parsed.metering.unit,
 						unitPlural: parsed.metering.unitPlural,
 						usage: parsed.metering.usage,
+						credentialId,
 					};
 				}
 				// Convert OpenAI usage to context_usage percentage
@@ -374,6 +414,32 @@ export async function* agentLoop(
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
 			}
 
+			// Drain settled tool results before assistant_message so the DB
+			// has correct tool call statuses when the message is broadcast.
+			for (const tu of toolUses) {
+				const sr = settledResults.get(tu.toolUseId);
+				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
+				yieldedToolResults.add(tu.toolUseId);
+				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
+				const brokenOverride = sr.broken
+					? sanitizeBrokenInput(tu.name, tu.input, locale)
+					: undefined;
+				yield {
+					type: "tool_result",
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+					isError: sr.isError ?? false,
+					durationMs: sr.durationMs,
+					brokenInputOverride: brokenOverride,
+					updatedInput: brokenOverride,
+				};
+				if (sr.fatal) {
+					yield { type: "error", message: sr.output };
+					return;
+				}
+			}
+
 			// Persist the assistant message (only the complete tool calls survive)
 			yield {
 				type: "assistant_message",
@@ -405,6 +471,32 @@ export async function* agentLoop(
 			// Yield block_complete for the text portion (if any) now that streaming is done
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
+			}
+
+			// Drain settled tool results before assistant_message so the DB
+			// has correct tool call statuses when the message is broadcast.
+			for (const tu of toolUses) {
+				const sr = settledResults.get(tu.toolUseId);
+				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
+				yieldedToolResults.add(tu.toolUseId);
+				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
+				const brokenOverride = sr.broken
+					? sanitizeBrokenInput(tu.name, tu.input, locale)
+					: undefined;
+				yield {
+					type: "tool_result",
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+					isError: sr.isError ?? false,
+					durationMs: sr.durationMs,
+					brokenInputOverride: brokenOverride,
+					updatedInput: brokenOverride,
+				};
+				if (sr.fatal) {
+					yield { type: "error", message: sr.output };
+					return;
+				}
 			}
 
 			// Yield the complete assistant message
@@ -443,10 +535,6 @@ export async function* agentLoop(
 				})
 			: "";
 
-		// Track tool calls whose input was broken (output cut off mid-stream).
-		// These will be stripped from the history to avoid polluting context.
-		const brokenToolUseIds = new Set<string>();
-
 		// Group tool calls into runs: consecutive Task calls form a parallel batch,
 		// everything else executes serially (one tool per group).
 		const groups: AgentToolUse[][] = [];
@@ -474,18 +562,6 @@ export async function* agentLoop(
 				// Serial execution (single tool)
 				const tu = group[0];
 				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-
-				// Only yield tool_call if not already yielded during streaming
-				if (!earlyPromise) {
-					yield {
-						type: "tool_call",
-						toolUseId: tu.toolUseId,
-						toolName: tu.name,
-						input: tu.input,
-						streamStartedAt: tu.streamStartedAt,
-					};
-				}
-
 				const result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
 				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 				const isLastTool = toolIndex === toolUses.length - 1;
@@ -495,45 +571,67 @@ export async function* agentLoop(
 				pendingToolResults.push(
 					provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
 				);
-				// For tools with streamStartedAt, compute display duration as
-				// total elapsed minus time spent executing preceding tools.
-				let durationMs = result.durationMs;
-				if (tu.streamStartedAt != null) {
-					const totalElapsed = Date.now() - tu.streamStartedAt;
-					const adjusted = totalElapsed - prevToolsExecMs;
-					durationMs = Math.max(adjusted, result.durationMs);
-				}
-				prevToolsExecMs += result.durationMs;
 
-				// For broken tool calls, sanitize the persisted input and output
-				// so the DB shows a clean message instead of truncated garbage.
-				const brokenInputOverride = result.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
-				const displayOutput = result.broken
-					? getToolMessage("brokenToolCallResult", locale)
-					: result.output;
+				if (yieldedToolResults.has(tu.toolUseId)) {
+					// Already yielded during streaming — just accumulate timing
+					prevToolsExecMs += result.durationMs;
+					toolIndex++;
+					if (result.fatal) {
+						// Fatal was already yielded in the drain loop
+						return;
+					}
+				} else {
+					// Only yield tool_call if not already yielded during streaming
+					if (!earlyPromise) {
+						yield {
+							type: "tool_call",
+							toolUseId: tu.toolUseId,
+							toolName: tu.name,
+							input: tu.input,
+							streamStartedAt: tu.streamStartedAt,
+						};
+					}
 
-				yield {
-					type: "tool_result",
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					output: displayOutput,
-					isError: result.isError ?? false,
-					durationMs,
-					brokenInputOverride,
-					updatedInput: brokenInputOverride,
-				};
-				toolIndex++;
+					// For tools with streamStartedAt, compute display duration as
+					// total elapsed minus time spent executing preceding tools.
+					let durationMs = result.durationMs;
+					if (tu.streamStartedAt != null) {
+						const totalElapsed = Date.now() - tu.streamStartedAt;
+						const adjusted = totalElapsed - prevToolsExecMs;
+						durationMs = Math.max(adjusted, result.durationMs);
+					}
+					prevToolsExecMs += result.durationMs;
 
-				if (result.fatal) {
-					yield { type: "error", message: result.output };
-					return;
+					// For broken tool calls, sanitize the persisted input and output
+					// so the DB shows a clean message instead of truncated garbage.
+					const brokenInputOverride = result.broken
+						? sanitizeBrokenInput(tu.name, tu.input, locale)
+						: undefined;
+					const displayOutput = result.broken
+						? getToolMessage("brokenToolCallResult", locale)
+						: result.output;
+
+					yield {
+						type: "tool_result",
+						toolUseId: tu.toolUseId,
+						toolName: tu.name,
+						output: displayOutput,
+						isError: result.isError ?? false,
+						durationMs,
+						brokenInputOverride,
+						updatedInput: brokenInputOverride,
+					};
+					toolIndex++;
+
+					if (result.fatal) {
+						yield { type: "error", message: result.output };
+						return;
+					}
 				}
 			} else {
 				// Parallel execution (multiple Task calls)
 				for (const tu of group) {
-					if (!earlyExecMap.has(tu.toolUseId)) {
+					if (!earlyExecMap.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
 						yield {
 							type: "tool_call",
 							toolUseId: tu.toolUseId,
@@ -562,23 +660,25 @@ export async function* agentLoop(
 						provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
 					);
 
-					const brokenInputOverride = result.broken
-						? sanitizeBrokenInput(tu.name, tu.input, locale)
-						: undefined;
-					const displayOutput = result.broken
-						? getToolMessage("brokenToolCallResult", locale)
-						: result.output;
+					if (!yieldedToolResults.has(tu.toolUseId)) {
+						const brokenInputOverride = result.broken
+							? sanitizeBrokenInput(tu.name, tu.input, locale)
+							: undefined;
+						const displayOutput = result.broken
+							? getToolMessage("brokenToolCallResult", locale)
+							: result.output;
 
-					yield {
-						type: "tool_result",
-						toolUseId: tu.toolUseId,
-						toolName: tu.name,
-						output: displayOutput,
-						isError: result.isError ?? false,
-						durationMs: result.durationMs,
-						brokenInputOverride,
-						updatedInput: brokenInputOverride,
-					};
+						yield {
+							type: "tool_result",
+							toolUseId: tu.toolUseId,
+							toolName: tu.name,
+							output: displayOutput,
+							isError: result.isError ?? false,
+							durationMs: result.durationMs,
+							brokenInputOverride,
+							updatedInput: brokenInputOverride,
+						};
+					}
 					toolIndex++;
 					if (result.durationMs > maxParallelMs) maxParallelMs = result.durationMs;
 
@@ -741,6 +841,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		cwd: config.cwd,
 		signal: config.signal,
 		locale: config.locale ?? "en",
+		planFileId: config.planFileId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
 	};

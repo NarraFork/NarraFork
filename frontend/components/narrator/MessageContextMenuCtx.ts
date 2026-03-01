@@ -1,7 +1,6 @@
 import { createContext, useContext } from "react";
 
 export interface MessageContextMenuActions {
-	onBranchFromMessage?: () => void;
 	onForkFromMessage?: () => void;
 	onCompactBeforeMessage?: () => void;
 	onDeleteMessage?: () => void;

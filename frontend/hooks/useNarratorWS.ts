@@ -33,7 +33,7 @@ interface NarratorWSCallbacks {
 		toolUseId?: string,
 	) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
-	onBufferCleared?: (reason: "cancelled" | "sent" | "session_error") => void;
+	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onPlanModeChanged?: (planMode: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
@@ -398,7 +398,7 @@ export function useNarratorWS(
  * Subscribe to status/title changes for a list of narrator IDs (used on session list pages).
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
-export interface SessionListWSEvent {
+export interface NarratorListWSEvent {
 	type: "status" | "title" | "planMode" | "presence";
 	status?: string;
 	title?: string;
@@ -406,9 +406,9 @@ export interface SessionListWSEvent {
 	viewers?: Array<{ userId: string; username: string; avatarColor: string | null }>;
 }
 
-export function useSessionsListWS(
+export function useNarratorsListWS(
 	narratorIds: string[],
-	onUpdate: (narratorId: string, event: SessionListWSEvent) => void,
+	onUpdate: (narratorId: string, event: NarratorListWSEvent) => void,
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
 ) {
 	const wsRef = useRef<WebSocket | null>(null);
@@ -447,10 +447,6 @@ export function useSessionsListWS(
 				attempts = 0;
 				if (currentIds.length) {
 					ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
-					// Join presence for all subscribed narrators
-					for (const id of currentIds) {
-						ws.send(JSON.stringify({ type: "presence_join", narratorId: id }));
-					}
 				}
 			};
 			ws.onmessage = (event) => {
@@ -476,7 +472,7 @@ export function useSessionsListWS(
 					}
 				} catch (err) {
 					if (import.meta.env.DEV)
-						console.warn("[useSessionsListWS] Failed to parse WS message:", err);
+						console.warn("[useNarratorsListWS] Failed to parse WS message:", err);
 				}
 			};
 			ws.onclose = () => {
@@ -505,9 +501,6 @@ export function useSessionsListWS(
 				ws.onclose = null;
 				ws.onerror = null;
 				if (ws.readyState === WebSocket.OPEN && currentIds.length) {
-					for (const id of currentIds) {
-						ws.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
-					}
 					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
 				}
 				ws.close();

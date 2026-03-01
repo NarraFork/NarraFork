@@ -14,14 +14,21 @@ import {
 	mergeChapterSchema,
 	updateChapterSchema,
 } from "../lib/validators";
+import { requireAdmin } from "../middleware/auth";
 import { chapterBatchMerge } from "../services/chapter-batch-merge";
 import { chapterCleanup } from "../services/chapter-cleanup";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { commitSyncService } from "../services/commit-sync-service";
-import { requireAdmin } from "../middleware/auth";
-import { containerService, getPodmanStatus, resetPodmanCache } from "../services/container-service";
+import {
+	containerService,
+	getContainerSetupStatus,
+	getPodmanStatus,
+	parseComposeFile,
+	resetPodmanCache,
+	resolveComposeFile,
+} from "../services/container-service";
 import { gitService } from "../services/git-service";
 
 export const chapterRoutes = new Hono();
@@ -46,6 +53,11 @@ chapterRoutes.get("/merge-sessions/:sessionId", async (c) => {
 	const session = await chapterBatchMerge.getSession(sessionId);
 	if (!session) throw new NotFoundError("MergeSession", sessionId);
 	return c.json(session);
+});
+
+chapterRoutes.get("/container-setup", (c) => {
+	const refresh = c.req.query("refresh") === "true";
+	return c.json(getContainerSetupStatus(refresh));
 });
 
 chapterRoutes.get("/:id", async (c) => {
@@ -192,6 +204,17 @@ chapterRoutes.post("/podman/install", requireAdmin, async (c) => {
 
 // === Containers ===
 
+chapterRoutes.get("/:id/compose-info", async (c) => {
+	const id = c.req.param("id");
+	const chapter = await chapterService.getById(id);
+	if (!chapter.worktreePath) return c.json({ services: [] });
+	const config = chapter.containerConfig as { composeFile?: string } | null;
+	const composeFile = resolveComposeFile(chapter.worktreePath, config);
+	if (!composeFile) return c.json({ services: [] });
+	const services = parseComposeFile(chapter.worktreePath, composeFile);
+	return c.json({ services });
+});
+
 chapterRoutes.get("/:id/containers", async (c) => {
 	const id = c.req.param("id");
 	const instances = await containerService.listByChapter(id);
@@ -201,7 +224,7 @@ chapterRoutes.get("/:id/containers", async (c) => {
 chapterRoutes.post("/:id/containers/start", async (c) => {
 	const id = c.req.param("id");
 	await containerService.startChapterContainers(id);
-	return c.json({ ok: true });
+	return c.json({ ok: true, status: "starting" });
 });
 
 chapterRoutes.post("/:id/containers/stop", async (c) => {

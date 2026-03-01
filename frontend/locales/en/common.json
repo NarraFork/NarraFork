@@ -78,5 +78,19 @@
 	"closePanel": "Close panel",
 	"reattachFailed": "Failed to reattach terminal",
 	"terminalCwd": "Working Directory",
-	"terminalProcesses": "Processes"
+	"terminalProcesses": "Processes",
+	"containerSetup": "Container Environment",
+	"containerSetupDesc": "All checks must pass before container features can be used.",
+	"containerSetupPodman": "Podman",
+	"containerSetupPodmanCompose": "podman-compose",
+	"containerSetupComposeProvider": "Compose Provider",
+	"containerSetupPasst": "passt (rootless networking)",
+	"containerSetupInstalled": "Installed ({{version}})",
+	"containerSetupNotInstalled": "Not installed",
+	"containerSetupCorrect": "Using {{provider}}",
+	"containerSetupIncorrect": "Using {{provider}}, should use podman-compose",
+	"containerSetupNotConfigured": "Not configured",
+	"containerSetupReady": "All Ready",
+	"containerSetupNotReady": "Not Ready",
+	"containerSetupRecheck": "Recheck"
 }

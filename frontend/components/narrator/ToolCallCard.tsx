@@ -21,7 +21,6 @@ import {
 	IconChevronRight,
 	IconCode,
 	IconFile,
-	IconGitBranch,
 	IconGitFork,
 	IconListCheck,
 	IconLoader2,
@@ -1197,7 +1196,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const hasActions = !!(
-		msgCtx.onBranchFromMessage ||
 		msgCtx.onForkFromMessage ||
 		msgCtx.onCompactBeforeMessage ||
 		msgCtx.onDeleteMessage
@@ -1208,17 +1206,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const menuItemsNode = hasActions ? (
 		<>
-			{msgCtx.onBranchFromMessage && (
-				<Menu.Item
-					leftSection={<IconGitBranch size={14} />}
-					onClick={() => {
-						msgCtx.onBranchFromMessage?.();
-						swipe.closeSwipe();
-					}}
-				>
-					{tNarrator("contextMenu_branch")}
-				</Menu.Item>
-			)}
 			{msgCtx.onForkFromMessage && (
 				<Menu.Item
 					leftSection={<IconGitFork size={14} />}

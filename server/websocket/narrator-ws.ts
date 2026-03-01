@@ -10,6 +10,7 @@ import {
 	resolvePermission,
 	setBufferedMessage,
 } from "../services/narrator-session";
+import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import type { WSData } from "./ws-handler";
 
 // === Types ===
@@ -18,6 +19,7 @@ export interface NarratorWSData {
 	connectedAt: number;
 	lastPongAt: number;
 	subscribedNarrators: Set<string>;
+	subscribedStats?: boolean;
 	userId?: string;
 	username?: string;
 	avatarColor?: string | null;
@@ -44,7 +46,7 @@ export type NarratorServerMessage =
 	| { type: "permission_resolved"; narratorId: string; requestId: string; toolUseId?: string }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
-	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "session_error" }
+	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
 	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
@@ -168,7 +170,9 @@ export type NarratorClientMessage =
 	| { type: "buffer_message"; narratorId: string; text: string }
 	| { type: "cancel_buffer"; narratorId: string }
 	| { type: "presence_join"; narratorId: string }
-	| { type: "presence_leave"; narratorId: string };
+	| { type: "presence_leave"; narratorId: string }
+	| { type: "subscribe_stats" }
+	| { type: "unsubscribe_stats" };
 
 // === Connection registry ===
 
@@ -290,6 +294,7 @@ function shouldForwardEvent(event: NarraForkEvent): boolean {
 		event.type.startsWith("narrator:") ||
 		event.type.startsWith("chapter:") ||
 		event.type.startsWith("merge:") ||
+		event.type.startsWith("container:") ||
 		event.type.startsWith("user:")
 	);
 }
@@ -466,10 +471,28 @@ export const handleNarratorWS = {
 				removePresence(ws, msg.narratorId);
 				break;
 			}
+			case "subscribe_stats": {
+				if (!ws.data.subscribedStats) {
+					ws.data.subscribedStats = true;
+					addStatsSubscriber();
+				}
+				break;
+			}
+			case "unsubscribe_stats": {
+				if (ws.data.subscribedStats) {
+					ws.data.subscribedStats = false;
+					removeStatsSubscriber();
+				}
+				break;
+			}
 		}
 	},
 
 	close(ws: NarratorWS) {
+		if (ws.data.subscribedStats) {
+			ws.data.subscribedStats = false;
+			removeStatsSubscriber();
+		}
 		removeAllPresence(ws);
 		connections.delete(ws);
 	},

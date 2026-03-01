@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -9,7 +9,6 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
 import { chapterEdgeService } from "./chapter-edge-service";
-import { resolveChapterSettings } from "./chapter-service";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
@@ -23,8 +22,6 @@ export interface ForkChapterInput {
 	forkAtMessageUuid?: string;
 	/** Chapter role: trunk, branch, or exploration. */
 	role?: "trunk" | "branch" | "exploration";
-	/** Override project-level autoForkNarrators setting. */
-	forkNarrators?: boolean;
 	locale?: Locale;
 }
 
@@ -48,8 +45,6 @@ export const chapterFork = {
 		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 		const gitPath = project.gitPath;
 
-		const chSettings = resolveChapterSettings(project.chapterSettings);
-		const shouldForkNarrators = input.forkNarrators ?? chSettings.autoForkNarrators;
 		const inheritMode = input.inheritMode ?? "full";
 		const slug = slugify(input.title);
 		const shortId = generateShortId(6);
@@ -58,10 +53,22 @@ export const chapterFork = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		// Get current commit SHA for fork point
-		const commitSha = parent.worktreePath
-			? await gitService.getHeadCommit(parent.worktreePath)
-			: await gitService.getHeadCommit(gitPath);
+		// Resolve the commit SHA for the fork point.
+		// When forkAtMessageUuid is provided, find the commit associated with that
+		// message (or the nearest earlier message that has a commitSha).
+		let commitSha: string;
+		if (input.forkAtMessageUuid) {
+			commitSha = await this.resolveCommitForMessage(
+				parentChapterId,
+				input.forkAtMessageUuid,
+				gitPath,
+				parent.worktreePath,
+			);
+		} else {
+			commitSha = parent.worktreePath
+				? await gitService.getHeadCommit(parent.worktreePath)
+				: await gitService.getHeadCommit(gitPath);
+		}
 
 		const forkPoint: { commitSha: string; narratorMessageUuid?: string } = { commitSha };
 		if (input.forkAtMessageUuid) {
@@ -71,8 +78,8 @@ export const chapterFork = {
 		const rollback: Array<() => Promise<void>> = [];
 
 		try {
-			// Step 1: Create git branch + worktree
-			await gitService.createBranch(gitPath, branchName, parent.branch);
+			// Step 1: Create git branch at the resolved commit + worktree
+			await gitService.createBranch(gitPath, branchName, commitSha);
 			rollback.push(() => gitService.deleteBranch(gitPath, branchName));
 
 			await gitService.createWorktree(gitPath, worktreePath, branchName);
@@ -133,30 +140,23 @@ export const chapterFork = {
 				}
 			}
 
-			// Step 4: Fork narrators (unified path via narratorService.forkNarrator)
-			if (shouldForkNarrators) {
-				const parentNarrators = await db.query.narrators.findMany({
-					where: eq(narrators.chapterId, parentChapterId),
-				});
-				// Only fork primary/secondary narrators, skip subagents
-				const forkable = parentNarrators.filter(
-					(n) => n.type === "primary" || n.type === "secondary",
+			// Step 4: Fork the chapter's primary narrator
+			const primaryNarrator = await db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, parentChapterId), eq(narrators.type, "primary")),
+			});
+			if (primaryNarrator) {
+				const forked = await narratorService.forkNarrator(
+					primaryNarrator.id,
+					input.forkAtMessageUuid ?? null,
+					{
+						newChapterId: id,
+						inheritMode,
+						locale: input.locale,
+					},
 				);
-				for (const parentNarrator of forkable) {
-					const forked = await narratorService.forkNarrator(
-						parentNarrator.id,
-						input.forkAtMessageUuid ?? null,
-						{
-							newChapterId: id,
-							inheritMode,
-							type: parentNarrator.type as "primary" | "secondary",
-							locale: input.locale,
-						},
-					);
-					rollback.push(async () => {
-						await narratorService.remove(forked.id);
-					});
-				}
+				rollback.push(async () => {
+					await narratorService.remove(forked.id);
+				});
 			}
 
 			// Step 5: Start containers (if parent has containerConfig)
@@ -233,7 +233,7 @@ export const chapterFork = {
 				parentId: parentChapterId,
 				branch: branchName,
 				inheritMode,
-				forkNarrators: shouldForkNarrators,
+				forkCommit: commitSha,
 			});
 
 			eventBus.emit({ type: "chapter:forked", chapterId: id, parentId: parentChapterId });
@@ -249,5 +249,90 @@ export const chapterFork = {
 			}
 			throw err;
 		}
+	},
+
+	/**
+	 * Resolve the git commit SHA for a fork-at-message operation.
+	 *
+	 * Looks up the message identified by `forkAtMessageUuid`, then walks backwards
+	 * through the narrator's message sequence to find the nearest message that has
+	 * an associated `commitSha`. Falls back to HEAD if none found.
+	 */
+	async resolveCommitForMessage(
+		chapterId: string,
+		messageUuid: string,
+		gitPath: string,
+		worktreePath: string | null,
+	): Promise<string> {
+		// Find the primary narrator for this chapter
+		const primaryNarrator = await db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+		});
+		if (!primaryNarrator) {
+			logger.warn("No primary narrator found for commit resolution, using HEAD", { chapterId });
+			return worktreePath
+				? await gitService.getHeadCommit(worktreePath)
+				: await gitService.getHeadCommit(gitPath);
+		}
+
+		// Find the target message's seq in the narrator's refs
+		const targetMsg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.messageUuid, messageUuid),
+		});
+		if (!targetMsg) {
+			logger.warn("Fork message not found, using HEAD", { messageUuid });
+			return worktreePath
+				? await gitService.getHeadCommit(worktreePath)
+				: await gitService.getHeadCommit(gitPath);
+		}
+
+		// If the target message itself has a commitSha, use it directly
+		if (targetMsg.commitSha) {
+			return targetMsg.commitSha;
+		}
+
+		// Find the target message's seq in the narrator's refs
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+				eq(narratorMessageRefs.messageId, targetMsg.id),
+			),
+		});
+		if (!targetRef) {
+			logger.warn("Fork message not in narrator refs, using HEAD", { messageUuid });
+			return worktreePath
+				? await gitService.getHeadCommit(worktreePath)
+				: await gitService.getHeadCommit(gitPath);
+		}
+
+		// Walk backwards from the target message to find the nearest commitSha
+		const rows = await db
+			.select({
+				commitSha: narratorMessages.commitSha,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+					sql`${narratorMessageRefs.seq} <= ${targetRef.seq}`,
+					isNotNull(narratorMessages.commitSha),
+				),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1);
+
+		if (rows.length > 0 && rows[0].commitSha) {
+			return rows[0].commitSha;
+		}
+
+		// No commit found in message history, fall back to HEAD
+		logger.warn("No commitSha found in message history before fork point, using HEAD", {
+			chapterId,
+			messageUuid,
+		});
+		return worktreePath
+			? await gitService.getHeadCommit(worktreePath)
+			: await gitService.getHeadCommit(gitPath);
 	},
 };

@@ -2,7 +2,7 @@
 	"appName": "NarraFork",
 	"dashboard": "Dashboard",
 	"projects": "Projects",
-	"sessions": "Sessions",
+	"narrators": "Narrators",
 	"settings": "Settings",
 	"admin": "Admin",
 	"logout": "Logout",
@@ -14,7 +14,9 @@
 	"recentTabs": "Recent",
 	"clearAll": "Clear",
 	"clearProjects": "Clear projects",
-	"clearSessions": "Clear sessions",
+	"clearNarrators": "Clear idle narrators",
+	"newNarrator": "New narrator",
 	"noRecentTabs": "No recent tabs",
-	"closeTab": "Close tab"
+	"closeTab": "Close tab",
+	"totalOutputChars": "Total AI output chars"
 }

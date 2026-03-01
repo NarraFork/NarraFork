@@ -191,7 +191,7 @@ export const narrators = sqliteTable(
 		apiConversationId: text("api_conversation_id"),
 		// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
 		forkMessageId: text("fork_message_id").references((): any => narratorMessages.id),
-		type: text("type", { enum: ["primary", "secondary", "subagent"] })
+		type: text("type", { enum: ["primary", "subagent"] })
 			.notNull()
 			.default("primary"),
 		subagentType: text("subagent_type", { enum: ["explore", "plan", "general"] }),
@@ -429,6 +429,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
+	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(false),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
@@ -482,6 +483,30 @@ export const userFavoriteDirectories = sqliteTable(
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [index("idx_fav_dirs_user").on(table.userId, table.sortOrder)],
+);
+
+// === narrator_patches (snapshot tracking) ===
+export const narratorPatches = sqliteTable(
+	"narrator_patches",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		messageId: text("message_id")
+			.notNull()
+			.references(() => narratorMessages.id, { onDelete: "cascade" }),
+		toolUseId: text("tool_use_id").notNull(),
+		beforeHash: text("before_hash").notNull(),
+		afterHash: text("after_hash").notNull(),
+		filesJson: text("files_json", { mode: "json" }).notNull().$type<string[]>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_patches_narrator").on(table.narratorId, table.createdAt),
+		index("idx_patches_message").on(table.messageId),
+		index("idx_patches_tool_use").on(table.toolUseId),
+	],
 );
 
 // === merge_sessions ===

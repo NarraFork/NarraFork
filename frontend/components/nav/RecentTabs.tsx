@@ -15,7 +15,7 @@ import { IconFolder, IconGitBranch, IconMessageCircle } from "@tabler/icons-reac
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef, useState } from "react";
-import type { SessionListWSEvent } from "../../hooks/useNarratorWS";
+import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { type RecentTab, useRecentTabs } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -43,7 +43,7 @@ const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done"]);
  */
 function promoteAboveIdle(tabs: RecentTab[], narratorId: string): RecentTab[] {
 	const idx = tabs.findIndex(
-		(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
+		(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 	);
 	if (idx === -1) return tabs;
 
@@ -94,7 +94,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const narratorIds = useMemo(() => {
 		const ids: string[] = [];
 		for (const tab of tabs) {
-			if (tab.type === "session") {
+			if (tab.type === "narrator") {
 				ids.push(tab.id);
 			} else if (tab.type === "chapter" && tab.narratorId) {
 				ids.push(tab.narratorId);
@@ -104,7 +104,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	}, [tabs]);
 
 	const handleWSUpdate = useCallback(
-		(narratorId: string, event: SessionListWSEvent) => {
+		(narratorId: string, event: NarratorListWSEvent) => {
 			const patch: Partial<Pick<RecentTab, "title" | "status">> = {};
 			if (event.type === "title" && event.title) patch.title = event.title;
 			else if (event.type === "status" && event.status) patch.status = event.status;
@@ -119,7 +119,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				userPrefsRef.current
 			) {
 				const tab = tabsRef.current.find(
-					(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
+					(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 				);
 				if (tab) {
 					triggerNotification(
@@ -136,7 +136,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				let changed = false;
 				const next = prev.map((t) => {
 					const match =
-						(t.type === "session" && t.id === narratorId) || t.narratorId === narratorId;
+						(t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId;
 					if (match) {
 						changed = true;
 						return { ...t, ...patch };
@@ -156,7 +156,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				api.reorderRecentTabs(current.map((t) => `${t.type}:${t.id}`)).catch(() => {});
 			}
 			const matched = current?.find(
-				(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
+				(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 			);
 			if (matched) {
 				api.upsertRecentTab(matched).catch(() => {});
@@ -182,7 +182,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 // === Filtered tab list component ===
 
 interface RecentTabListProps {
-	filter: "project" | "session";
+	filter: "project" | "narrator";
 	onNavigate?: () => void;
 	/** When true, the first tab (if active) removes its top border-radius */
 	firstTabConnected?: boolean;
@@ -190,7 +190,7 @@ interface RecentTabListProps {
 
 /**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
- * `filter="project"` shows project tabs; `filter="session"` shows chapter+session tabs.
+ * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
  */
 export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentTabListProps) {
 	const { tabs, removeTab, reorderTabs } = useRecentTabs();
@@ -270,9 +270,9 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 		return pathname === `/projects/${tab.id}`;
 	}
 	if (tab.type === "chapter") {
-		return tab.narratorId ? pathname === `/sessions/${tab.narratorId}` : false;
+		return tab.narratorId ? pathname === `/narrators/${tab.narratorId}` : false;
 	}
-	return pathname === `/sessions/${tab.id}`;
+	return pathname === `/narrators/${tab.id}`;
 }
 
 interface SortableTabItemProps {
@@ -290,8 +290,8 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 		tab.type === "project"
 			? `/projects/${tab.id}`
 			: tab.type === "chapter" && tab.narratorId
-				? `/sessions/${tab.narratorId}`
-				: `/sessions/${tab.id}`;
+				? `/narrators/${tab.narratorId}`
+				: `/narrators/${tab.id}`;
 	const iconColor = STATUS_COLORS[tab.status ?? ""];
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -422,7 +422,7 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 							overflow: "hidden",
 							textOverflow: "ellipsis",
 							whiteSpace: "nowrap",
-							direction: tab.type === "session" ? "rtl" : undefined,
+							direction: tab.type === "narrator" ? "rtl" : undefined,
 							textAlign: "left",
 						},
 					}}

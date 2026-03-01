@@ -1,3 +1,4 @@
+import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
@@ -25,6 +26,13 @@ export function useStartContainers() {
 		onSuccess: (_, chapterId) => {
 			qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 		},
+		onError: (err) => {
+			notifications.show({
+				color: "red",
+				title: "Container start failed",
+				message: err instanceof Error ? err.message : String(err),
+			});
+		},
 	});
 }
 
@@ -34,6 +42,13 @@ export function useStopContainers() {
 		mutationFn: api.stopContainers,
 		onSuccess: (_, chapterId) => {
 			qc.invalidateQueries({ queryKey: ["containers", chapterId] });
+		},
+		onError: (err) => {
+			notifications.show({
+				color: "red",
+				title: "Container stop failed",
+				message: err instanceof Error ? err.message : String(err),
+			});
 		},
 	});
 }
@@ -45,6 +60,13 @@ export function usePauseContainers() {
 		onSuccess: (_, chapterId) => {
 			qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 		},
+		onError: (err) => {
+			notifications.show({
+				color: "red",
+				title: "Container pause failed",
+				message: err instanceof Error ? err.message : String(err),
+			});
+		},
 	});
 }
 
@@ -54,6 +76,13 @@ export function useUnpauseContainers() {
 		mutationFn: api.unpauseContainers,
 		onSuccess: (_, chapterId) => {
 			qc.invalidateQueries({ queryKey: ["containers", chapterId] });
+		},
+		onError: (err) => {
+			notifications.show({
+				color: "red",
+				title: "Container resume failed",
+				message: err instanceof Error ? err.message : String(err),
+			});
 		},
 	});
 }
@@ -65,6 +94,13 @@ export function useRemoveContainers() {
 			api.removeContainers(chapterId, { deleteVolumes }),
 		onSuccess: (_, { chapterId }) => {
 			qc.invalidateQueries({ queryKey: ["containers", chapterId] });
+		},
+		onError: (err) => {
+			notifications.show({
+				color: "red",
+				title: "Container remove failed",
+				message: err instanceof Error ? err.message : String(err),
+			});
 		},
 	});
 }

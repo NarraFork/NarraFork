@@ -137,7 +137,7 @@ async function handleStatusChanged(narratorId: string, status: string): Promise<
 		}
 
 		const isRelevant = tabs.some(
-			(t) => (t.type === "session" && t.id === narratorId) || t.narratorId === narratorId,
+			(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 		);
 		if (!isRelevant) continue;
 

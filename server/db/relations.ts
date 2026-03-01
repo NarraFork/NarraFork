@@ -8,6 +8,7 @@ import {
 	mergeSessions,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorPatches,
 	narrators,
 	narratorToolCalls,
 	portAllocations,
@@ -95,6 +96,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messageRefs: many(narratorMessageRefs),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
+	patches: many(narratorPatches),
 	terminals: many(terminals),
 	commits: many(chapterCommits),
 }));
@@ -106,6 +108,7 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 	}),
 	messageRefs: many(narratorMessageRefs),
 	toolCalls: many(narratorToolCalls),
+	patches: many(narratorPatches),
 }));
 
 export const narratorMessageRefsRelations = relations(narratorMessageRefs, ({ one }) => ({
@@ -126,6 +129,17 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one })
 	}),
 	message: one(narratorMessages, {
 		fields: [narratorToolCalls.messageId],
+		references: [narratorMessages.id],
+	}),
+}));
+
+export const narratorPatchesRelations = relations(narratorPatches, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorPatches.narratorId],
+		references: [narrators.id],
+	}),
+	message: one(narratorMessages, {
+		fields: [narratorPatches.messageId],
 		references: [narratorMessages.id],
 	}),
 }));

@@ -1,5 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { api, type PaginatedNarrators } from "../lib/api";
+import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
 export function useNarrators(opts?: {
 	chapterId?: string;
@@ -23,17 +24,33 @@ export function useNarratorsPaginated(opts?: {
 	sortOrder?: string;
 	limit?: number;
 }) {
-	return useInfiniteQuery({
+	return useInfiniteQuery<PaginatedNarrators>({
 		queryKey: ["narrators", "paginated", { ...opts }],
 		queryFn: ({ pageParam }) =>
-			api.listNarratorsPaginated({
-				...opts,
-				cursor: pageParam,
-			}),
+			api.listNarratorsPaginated({ ...opts, cursor: pageParam as string | undefined }),
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) =>
 			lastPage.hasMore ? (lastPage.nextCursor ?? undefined) : undefined,
-		enabled: !!opts?.standalone,
+	});
+}
+
+// === Narrator Fork (standalone narrators only) ===
+
+export function useForkNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			forkMessageUuid,
+			title,
+		}: {
+			narratorId: string;
+			forkMessageUuid: string;
+			title?: string;
+		}) => api.forkNarrator(narratorId, forkMessageUuid, title),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
 	});
 }
 
@@ -97,8 +114,25 @@ export function useArchiveNarrator() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => api.archiveNarrator(id),
-		onSuccess: () => {
+		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+			// Remove the archived narrator from the sidebar (recent tabs)
+			const tabs =
+				qc.getQueryData<
+					{ type: "chapter" | "narrator" | "project"; id: string; narratorId?: string }[]
+				>(RECENT_TABS_QUERY_KEY) ?? [];
+			const tab = tabs.find(
+				(t) =>
+					(t.type === "narrator" && t.id === narratorId) ||
+					(t.type === "chapter" && t.narratorId === narratorId),
+			);
+			if (tab) {
+				api.removeRecentTab(tab.type, tab.id).catch(() => {});
+				qc.setQueryData(
+					RECENT_TABS_QUERY_KEY,
+					tabs.filter((t) => t !== tab),
+				);
+			}
 		},
 	});
 }
@@ -135,35 +169,6 @@ export function useUpdateModel() {
 		mutationFn: ({ id, model }: { id: string; model: string }) =>
 			api.updateNarratorModel(id, model),
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators"] });
-		},
-	});
-}
-
-// === Narrator Fork ===
-
-export function useRelatedNarrators(narratorId: string) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "related"],
-		queryFn: () => api.getRelatedNarrators(narratorId),
-		enabled: !!narratorId,
-	});
-}
-
-export function useForkNarrator() {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: ({
-			narratorId,
-			forkMessageId,
-			title,
-		}: {
-			narratorId: string;
-			forkMessageId: string;
-			title?: string;
-		}) => api.forkNarrator(narratorId, forkMessageId, title),
-		onSuccess: (_data, vars) => {
-			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId, "related"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});

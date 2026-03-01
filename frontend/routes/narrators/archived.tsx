@@ -15,11 +15,11 @@ import { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorsPaginated, useUnarchiveNarrator } from "../../hooks/useNarrator";
 
-export const Route = createFileRoute("/sessions/archived")({
-	component: ArchivedSessionsPage,
+export const Route = createFileRoute("/narrators/archived")({
+	component: ArchivedNarratorsPage,
 });
 
-function ArchivedSessionsPage() {
+function ArchivedNarratorsPage() {
 	const {
 		data: paginatedData,
 		isLoading,
@@ -27,12 +27,12 @@ function ArchivedSessionsPage() {
 		fetchNextPage,
 		isFetchingNextPage,
 	} = useNarratorsPaginated({ standalone: true, status: "archived" });
-	const sessions = useMemo(
+	const narrators = useMemo(
 		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
 		[paginatedData],
 	);
-	const unarchiveSession = useUnarchiveNarrator();
-	const { t } = useTranslation("sessions");
+	const unarchiveNarrator = useUnarchiveNarrator();
+	const { t } = useTranslation("narrators");
 	const { i18n } = useTranslation();
 
 	const sentinelRef = useRef<HTMLDivElement>(null);
@@ -48,58 +48,58 @@ function ArchivedSessionsPage() {
 	return (
 		<Stack>
 			<Group justify="space-between">
-				<Title order={2}>{t("archivedSessions")}</Title>
-				<Button variant="subtle" component={Link} to="/sessions">
-					{t("backToSessions")}
+				<Title order={2}>{t("archivedNarrators")}</Title>
+				<Button variant="subtle" component={Link} to="/narrators">
+					{t("backToNarrators")}
 				</Button>
 			</Group>
 
 			{isLoading ? (
 				<Loader />
-			) : !sessions.length ? (
-				<Text c="dimmed">{t("noArchivedSessions")}</Text>
+			) : !narrators.length ? (
+				<Text c="dimmed">{t("noArchivedNarrators")}</Text>
 			) : (
 				<Stack>
 					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-					{sessions.map((session: any) => (
+					{narrators.map((narrator: any) => (
 						<Link
-							key={session.id}
-							to="/sessions/$sessionId"
-							params={{ sessionId: session.id }}
+							key={narrator.id}
+							to="/narrators/$narratorId"
+							params={{ narratorId: narrator.id }}
 							style={{ textDecoration: "none", color: "inherit" }}
 						>
 							<Card shadow="sm" padding="md" withBorder>
 								<Group justify="space-between">
 									<div>
 										<Text fw={500}>
-											{session.title || t("sessionId", { id: session.id.slice(0, 8) })}
+											{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 										</Text>
 										<Text size="sm" c="dimmed">
-											{t("sessionMeta", {
-												model: session.model,
-												count: session.messageCount ?? 0,
+											{t("narratorMeta", {
+												model: narrator.model,
+												count: narrator.messageCount ?? 0,
 											})}
 										</Text>
-										{session.cwd && (
+										{narrator.cwd && (
 											<Text size="xs" c="dimmed" truncate>
-												{t("cwdLabel", { path: session.cwd })}
+												{t("cwdLabel", { path: narrator.cwd })}
 											</Text>
 										)}
 									</div>
 									<Group>
 										<Text size="xs" c="dimmed">
-											{new Date(session.createdAt).toLocaleDateString(i18n.language)}
+											{new Date(narrator.createdAt).toLocaleDateString(i18n.language)}
 										</Text>
 										<Tooltip label={t("unarchive")}>
 											<ActionIcon
 												size="sm"
 												color="teal"
 												variant="subtle"
-												loading={unarchiveSession.isPending}
+												loading={unarchiveNarrator.isPending}
 												onClick={(e) => {
 													e.preventDefault();
 													e.stopPropagation();
-													unarchiveSession.mutate(session.id);
+													unarchiveNarrator.mutate(narrator.id);
 												}}
 											>
 												<IconArchiveOff size={16} />

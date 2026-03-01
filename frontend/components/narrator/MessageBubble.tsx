@@ -37,7 +37,6 @@ interface MessageBubbleProps {
 		messageUuid?: string | null;
 	};
 	onForkFromMessage?: (messageUuid: string) => void;
-	onBranchFromMessage?: (messageId: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	resolvePerm?: (tc: any) => PendingPermission | null;
@@ -387,7 +386,6 @@ export const MessageBubble = memo(function MessageBubble({
 	narratorId,
 	message,
 	onForkFromMessage,
-	onBranchFromMessage,
 	resolvePerm,
 	onPermissionDecision,
 	onQuestionSubmit,
@@ -414,9 +412,6 @@ export const MessageBubble = memo(function MessageBubble({
 		const actions: MessageContextMenuActions = {};
 		const msgId = message.id;
 		const msgUuid = message.messageUuid;
-		if (msgId && onBranchFromMessage && !isUser) {
-			actions.onBranchFromMessage = () => onBranchFromMessage(msgId);
-		}
 		if (msgUuid && onForkFromMessage && !isUser) {
 			actions.onForkFromMessage = () => onForkFromMessage(msgUuid);
 		}
@@ -431,7 +426,6 @@ export const MessageBubble = memo(function MessageBubble({
 		isUser,
 		message.id,
 		message.messageUuid,
-		onBranchFromMessage,
 		onForkFromMessage,
 		onCompactBeforeMessage,
 		onDeleteMessage,
