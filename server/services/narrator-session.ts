@@ -82,8 +82,8 @@ interface ActiveNarrator {
 	_gitTrackTimer?: ReturnType<typeof setTimeout>;
 	/** ID of the partial assistant message being incrementally built via block_complete events */
 	_partialMessageId?: string;
-	/** Whether the shadow snapshot repo has been initialised for this session */
-	_snapshotInitialized?: boolean;
+	/** Cached init promise for the shadow snapshot repo (ensures single init) */
+	_snapshotInitPromise?: Promise<void>;
 	/** Per-tool-call before-hash promise cache: toolUseId → Promise<tree hash> */
 	_snapshotBeforeHashes?: Map<string, Promise<string>>;
 }
@@ -498,6 +498,9 @@ export async function handlePermission(
 		.update(narratorToolCalls)
 		.set({
 			status: "pending",
+			// Persist effectiveInput so getPendingPermissions returns enriched data
+			// (e.g. ExitPlanMode with resolved plan content instead of just planFile path)
+			inputJson: effectiveInput,
 			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));
@@ -1356,14 +1359,11 @@ async function runAgentLoop(
 									active._snapshotBeforeHashes = new Map();
 								}
 
-								// Chain: ensure init completes before track
-								const ready = active._snapshotInitialized
-									? Promise.resolve()
-									: snapshot
-											.init(chapterId, worktreePath)
-											.then(() => {
-												active._snapshotInitialized = true;
-											});
+								// Chain: ensure init completes before track (cached promise avoids concurrent inits)
+								if (!active._snapshotInitPromise) {
+									active._snapshotInitPromise = snapshot.init(chapterId, worktreePath);
+								}
+								const ready = active._snapshotInitPromise;
 
 								const trackPromise = ready
 									.then(() => snapshot.track(chapterId, worktreePath));

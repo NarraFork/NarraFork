@@ -10,12 +10,15 @@ import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import {
 import { logger } from "./lib/logger";
+import { projectDbManager } from "./lib/project-db";
 import { settings } from "./lib/settings";
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import { ensureRootlessEnv } from "./services/container-service";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
+import { registerProjectDbSync } from "./services/project-db-sync";
+import { snapshot } from "./services/snapshot";
 import { terminalService } from "./services/terminal-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
 import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./websocket/ws-handler";
@@ -235,11 +238,27 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 	logger.error("Merge session cleanup failed", { error: String(err) });
 });
 
+// Register project DB backup sync (event-driven dual-write)
+registerProjectDbSync();
+
+// Periodic snapshot GC — run once at startup then every 24 hours
+const SNAPSHOT_GC_INTERVAL = 24 * 60 * 60 * 1000;
+snapshot.gcAll().catch((err) => {
+	logger.warn("Initial snapshot GC failed", { error: String(err) });
+});
+const snapshotGcTimer = setInterval(() => {
+	snapshot.gcAll().catch((err) => {
+		logger.warn("Periodic snapshot GC failed", { error: String(err) });
+	});
+}, SNAPSHOT_GC_INTERVAL);
+
 // Graceful shutdown
 const shutdown = () => {
 	stopHeartbeat();
+	clearInterval(snapshotGcTimer);
 	chapterCleanup.clearAllTimers();
 	worktreeWatcher.shutdown();
+	projectDbManager.closeAll();
 	process.exit(0);
 };
 process.on("SIGINT", shutdown);

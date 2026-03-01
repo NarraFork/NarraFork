@@ -37,12 +37,12 @@ function ProjectListPage() {
 	const handleCreate = () => {
 		if (!name.trim()) return;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const data: Record<string, any> = { name: name.trim() };
+		const data: Record<string, any> = {
+			name: name.trim(),
+			repoMode,
+			gitPath: repoPath.trim() || undefined,
+		};
 
-		if (repoMode !== "none") {
-			data.repoMode = repoMode;
-			data.gitPath = repoPath.trim() || undefined;
-		}
 		if (repoMode === "clone") {
 			data.cloneUrl = cloneUrl.trim() || undefined;
 			data.cloneBranch = cloneBranch.trim() || undefined;
@@ -124,7 +124,6 @@ function ProjectListPage() {
 								{ value: "existing", label: t("repoModeExisting") },
 								{ value: "init", label: t("repoModeInit") },
 								{ value: "clone", label: t("repoModeClone") },
-								{ value: "none", label: t("repoModeNone") },
 							]}
 						/>
 					</div>
@@ -144,22 +143,20 @@ function ProjectListPage() {
 							/>
 						</>
 					)}
-					{repoMode !== "none" && (
-						<TextInput
-							label={t("repositoryPath")}
-							placeholder={t("repositoryPathPlaceholder")}
-							value={repoPath}
-							onChange={(e) => setRepoPath(e.currentTarget.value)}
-							description={
-								repoMode === "init"
-									? t("initPathDescription")
-									: repoMode === "clone"
-										? t("clonePathDescription")
-										: t("repositoryPathDescription")
-							}
-							required
-						/>
-					)}
+					<TextInput
+						label={t("repositoryPath")}
+						placeholder={t("repositoryPathPlaceholder")}
+						value={repoPath}
+						onChange={(e) => setRepoPath(e.currentTarget.value)}
+						description={
+							repoMode === "init"
+								? t("initPathDescription")
+								: repoMode === "clone"
+									? t("clonePathDescription")
+									: t("repositoryPathDescription")
+						}
+						required
+					/>
 					<Button onClick={handleCreate} loading={createProject.isPending}>
 						{tc("create")}
 					</Button>

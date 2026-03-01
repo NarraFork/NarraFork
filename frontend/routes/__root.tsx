@@ -2,7 +2,6 @@ import { useResizableNav } from "@frontend/hooks/useResizableNav";
 import {
 	ActionIcon,
 	AppShell,
-	Badge,
 	Box,
 	Burger,
 	Button,
@@ -28,7 +27,6 @@ import {
 	IconSearch,
 	IconSettings,
 	IconShieldCog,
-	IconTypography,
 	IconX,
 } from "@tabler/icons-react";
 import type { QueryClient } from "@tanstack/react-query";
@@ -70,9 +68,8 @@ function RootLayout() {
 
 /** Format chars/sec as a human-readable rate string. */
 function formatRate(cps: number): string {
-	if (cps === 0) return "0 c/s";
-	if (cps >= 1000) return `${(cps / 1000).toFixed(1)}k c/s`;
-	return `${cps} c/s`;
+	if (cps >= 1000) return `${(cps / 1000).toFixed(1)}k`;
+	return String(cps);
 }
 
 /** Format total chars with K/M suffix. */
@@ -229,22 +226,15 @@ function AuthenticatedLayout() {
 						)}
 					</Group>
 					<Group wrap="nowrap">
-						{prefs?.showOutputStats && (
+						{prefs?.showOutputStats && outputStats.charsPerSec > 0 && (
 							<Tooltip
 								label={`${t("totalOutputChars")}: ${formatChars(outputStats.totalChars)}`}
 								position="bottom"
 								withArrow
 							>
-								<Badge
-									variant="dot"
-									color={outputStats.charsPerSec > 0 ? "green" : "gray"}
-									size="lg"
-									leftSection={<IconTypography size={14} />}
-									visibleFrom="sm"
-									style={{ cursor: "default" }}
-								>
+								<Text size="sm" c="dimmed" style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}>
 									{formatRate(outputStats.charsPerSec)}
-								</Badge>
+								</Text>
 							</Tooltip>
 						)}
 						{/* Desktop: always show search input */}
@@ -342,7 +332,7 @@ function AuthenticatedLayout() {
 							tabs.some((t) => t.type === "project") ? (
 								<Tooltip label={t("clearProjects")} position="right" withArrow>
 									<ActionIcon
-										size={20}
+										size={28}
 										variant="subtle"
 										color="gray"
 										onClick={(e: React.MouseEvent) => {
@@ -352,7 +342,7 @@ function AuthenticatedLayout() {
 										}}
 										aria-label={t("clearProjects")}
 									>
-										<IconClearAll size={14} />
+										<IconClearAll size={16} />
 									</ActionIcon>
 								</Tooltip>
 							) : undefined
@@ -380,10 +370,10 @@ function AuthenticatedLayout() {
 								: undefined
 						}
 						rightSection={
-							<Group gap={2} wrap="nowrap">
+							<Group gap={8} wrap="nowrap">
 								<Tooltip label={t("newNarrator")} position="right" withArrow>
 									<ActionIcon
-										size={20}
+										size={28}
 										variant="subtle"
 										color="gray"
 										onClick={(e: React.MouseEvent) => {
@@ -394,7 +384,7 @@ function AuthenticatedLayout() {
 										}}
 										aria-label={t("newNarrator")}
 									>
-										<IconPlus size={14} />
+										<IconPlus size={16} />
 									</ActionIcon>
 								</Tooltip>
 								{tabs.some(
@@ -404,7 +394,7 @@ function AuthenticatedLayout() {
 								) && (
 									<Tooltip label={t("clearNarrators")} position="right" withArrow>
 										<ActionIcon
-											size={20}
+											size={28}
 											variant="subtle"
 											color="gray"
 											onClick={(e: React.MouseEvent) => {
@@ -414,7 +404,7 @@ function AuthenticatedLayout() {
 											}}
 											aria-label={t("clearNarrators")}
 										>
-											<IconClearAll size={14} />
+											<IconClearAll size={16} />
 										</ActionIcon>
 									</Tooltip>
 								)}

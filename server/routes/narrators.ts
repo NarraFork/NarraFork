@@ -672,7 +672,12 @@ narratorRoutes.post("/:id/revert", async (c) => {
 	try {
 		snapshotHash = await snapshot.track(chapterId, worktreePath);
 	} catch (err) {
-		return c.json({ error: `Failed to save current state: ${err instanceof Error ? err.message : String(err)}` }, 500);
+		return c.json(
+			{
+				error: `Failed to save current state: ${err instanceof Error ? err.message : String(err)}`,
+			},
+			500,
+		);
 	}
 
 	// Build PatchInfo array
@@ -684,9 +689,20 @@ narratorRoutes.post("/:id/revert", async (c) => {
 
 	// Revert
 	try {
+		// Re-check right before mutation to narrow the TOCTOU window
+		if (isNarratorActive(narratorId)) {
+			return c.json({ error: "Narrator became active during revert" }, 409);
+		}
 		await snapshot.revert(chapterId, worktreePath, patchInfos);
 	} catch (err) {
-		return c.json({ error: `Revert failed: ${err instanceof Error ? err.message : String(err)}` }, 500);
+		return c.json(
+			{
+				error: `Revert failed: ${err instanceof Error ? err.message : String(err)}`,
+				snapshotHash, // allow unrevert even on partial failure
+				partial: true,
+			},
+			500,
+		);
 	}
 
 	// Collect all affected files
@@ -718,9 +734,16 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
 
 	try {
+		// Re-check right before mutation to narrow the TOCTOU window
+		if (isNarratorActive(narratorId)) {
+			return c.json({ error: "Narrator became active during unrevert" }, 409);
+		}
 		await snapshot.restore(narrator.chapterId, chapter.worktreePath, body.snapshotHash);
 	} catch (err) {
-		return c.json({ error: `Restore failed: ${err instanceof Error ? err.message : String(err)}` }, 500);
+		return c.json(
+			{ error: `Restore failed: ${err instanceof Error ? err.message : String(err)}` },
+			500,
+		);
 	}
 
 	return c.json({ success: true });

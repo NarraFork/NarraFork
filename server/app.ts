@@ -19,6 +19,7 @@ import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
 import { openaiRoutes } from "./routes/openai";
+import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
@@ -71,6 +72,8 @@ app.route("/api/openai", openaiRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);
+// Project DB backup/import routes
+app.route("/api/projects", projectDbRoutes);
 
 app.onError((err, c) => {
 	if (err instanceof AppError) {

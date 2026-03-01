@@ -8,9 +8,9 @@ const gitBranchName = z.string().regex(/^[a-zA-Z0-9._\-/]+$/, "Invalid branch na
 export const createProjectSchema = z.object({
 	name: z.string().min(1).max(200),
 	description: z.string().max(2000).optional(),
-	// Repository mode: "existing" (default), "init", "clone", or omitted for no repo
-	repoMode: z.enum(["existing", "init", "clone"]).optional(),
-	gitPath: z.string().min(1).optional(),
+	// Repository mode: "existing" (default), "init", "clone"
+	repoMode: z.enum(["existing", "init", "clone"]),
+	gitPath: z.string().min(1),
 	defaultBranch: gitBranchName.optional(),
 	// Clone-specific fields
 	cloneUrl: z.string().min(1).optional(),
@@ -560,4 +560,10 @@ export const gitDiffQuerySchema = z.object({
 		.string()
 		.optional()
 		.transform((v) => v === "true"),
+});
+
+// === Project DB (backup/import) ===
+
+export const importProjectSchema = z.object({
+	gitPath: z.string().min(1),
 });

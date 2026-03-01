@@ -6,9 +6,11 @@ import { chapters, explorationGroups, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { projectDbManager } from "../lib/project-db";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
 import { gitService } from "../services/git-service";
+import { ensureGitignoreEntry } from "../services/project-db-sync";
 
 export const projectRoutes = new Hono();
 
@@ -36,37 +38,33 @@ projectRoutes.post("/", async (c) => {
 	const now = new Date().toISOString();
 	const projectId = generateId();
 
-	let gitPath = body.gitPath?.trim() || null;
-	if (gitPath) {
-		// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
-		if (gitPath.startsWith("~/") || gitPath === "~") {
-			gitPath = gitPath.replace("~", process.env.HOME ?? "/root");
-		}
-		gitPath = resolve(gitPath);
+	let gitPath = body.gitPath.trim();
+	// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
+	if (gitPath.startsWith("~/") || gitPath === "~") {
+		gitPath = gitPath.replace("~", process.env.HOME ?? "/root");
 	}
+	gitPath = resolve(gitPath);
+
 	let remoteUrl: string | null = null;
 	let defaultBranch = body.defaultBranch ?? "main";
 	const mode = body.repoMode;
 
-	if (mode === "existing" && gitPath) {
+	if (mode === "existing") {
 		if (!(await gitService.isGitRepo(gitPath))) {
 			throw new ValidationError(`Path is not a git repository: ${gitPath}`);
 		}
-	} else if (mode === "init" && gitPath) {
+	} else if (mode === "init") {
 		await gitService.initRepo(gitPath);
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
 		defaultBranch = body.defaultBranch ?? detectedBranch ?? "main";
-	} else if (mode === "clone" && body.cloneUrl && gitPath) {
+	} else if (mode === "clone") {
+		if (!body.cloneUrl) {
+			throw new ValidationError('cloneUrl is required when repoMode is "clone"');
+		}
 		await gitService.cloneRepo(body.cloneUrl, gitPath, body.cloneBranch);
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
 		remoteUrl = body.cloneUrl;
 		defaultBranch = body.cloneBranch ?? detectedBranch ?? "main";
-	} else if (!mode) {
-		gitPath = null;
-	} else if (mode) {
-		throw new ValidationError(
-			`gitPath is required when repoMode is "${mode}"${mode === "clone" ? " (cloneUrl is also required)" : ""}`,
-		);
 	}
 
 	const [project] = await db
@@ -83,19 +81,28 @@ projectRoutes.post("/", async (c) => {
 		})
 		.returning();
 
-	// Auto-create root chapter when project has a git repository
-	if (gitPath) {
-		try {
-			await chapterService.createRootChapter({
-				projectId,
-				title: body.name,
-				gitPath,
-				defaultBranch,
-			});
-		} catch (err) {
-			// Non-fatal — project is still usable without root chapter
-			console.warn("Failed to create root chapter:", err);
-		}
+	// Auto-create root chapter
+	try {
+		await chapterService.createRootChapter({
+			projectId,
+			title: body.name,
+			gitPath,
+			defaultBranch,
+		});
+	} catch (err) {
+		// Non-fatal — project is still usable without root chapter
+		console.warn("Failed to create root chapter:", err);
+	}
+
+	// Initialize project backup DB + .gitignore
+	try {
+		projectDbManager.openForGitPath(projectId, gitPath);
+		ensureGitignoreEntry(gitPath);
+	} catch (err) {
+		logger.warn("Failed to initialize project backup DB", {
+			projectId,
+			error: String(err),
+		});
 	}
 
 	return c.json(project, 201);

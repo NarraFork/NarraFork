@@ -9,7 +9,7 @@
 	"repositoryPathDescription": "本地已有的 Git 仓库路径",
 	"projectNotFound": "项目未找到",
 	"repoMode": "仓库",
-	"repoModeNone": "稍后添加",
+
 	"repoModeExisting": "已有仓库",
 	"repoModeInit": "新建仓库",
 	"repoModeClone": "克隆远程仓库",

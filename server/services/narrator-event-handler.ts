@@ -49,6 +49,10 @@ export interface EventHandlerContext {
 	parentToolUseId?: string;
 	/** Subagent's resolved model name (attached to broadcast messages) */
 	subagentModel?: string;
+
+	// --- Mutable tracking ---
+	/** Tracks cumulative inputCharsTotal per tool_use for delta computation */
+	toolUseCharsMap?: Map<string, number>;
 }
 
 /**
@@ -139,6 +143,17 @@ export async function processEvent(
 		}
 
 		case "tool_use_chunk": {
+			// Track tool input streaming chars (inputCharsTotal is cumulative,
+			// so compute the delta from the last seen value for this tool)
+			if (event.inputCharsTotal > 0) {
+				const prev = ctx.toolUseCharsMap?.get(event.toolUseId) ?? 0;
+				const delta = event.inputCharsTotal - prev;
+				if (delta > 0) {
+					recordOutputChunk(delta);
+					if (!ctx.toolUseCharsMap) ctx.toolUseCharsMap = new Map();
+					ctx.toolUseCharsMap.set(event.toolUseId, event.inputCharsTotal);
+				}
+			}
 			broadcastToNarrator(broadcastTargetId, {
 				type: "tool_use_chunk",
 				narratorId: broadcastTargetId,

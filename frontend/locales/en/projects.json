@@ -9,7 +9,7 @@
 	"repositoryPathDescription": "Local path to an existing git repository",
 	"projectNotFound": "Project not found",
 	"repoMode": "Repository",
-	"repoModeNone": "Add later",
+
 	"repoModeExisting": "Existing repository",
 	"repoModeInit": "Initialize new",
 	"repoModeClone": "Clone from URL",

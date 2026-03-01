@@ -100,6 +100,16 @@ export const chapterCleanup = {
 				});
 			}
 
+			// Step 5.5: GC snapshot shadow repo to reclaim loose objects
+			try {
+				await snapshot.gc(chapterId);
+			} catch (err) {
+				logger.warn("Snapshot GC failed during dormant", {
+					chapterId,
+					error: String(err),
+				});
+			}
+
 			// Step 6: Update DB — external resources already cleaned
 			const now = new Date().toISOString();
 			await db

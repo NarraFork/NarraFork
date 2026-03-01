@@ -2,6 +2,7 @@ import {
 	copyFileSync,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
@@ -112,11 +113,24 @@ export const snapshot = {
 			copyFileSync(gitignorePath, excludePath);
 		}
 
-		// Also copy the user project's .git/info/exclude if it exists.
-		// Note: for git worktrees, .git is a file (not a directory), so this
-		// path won't exist — worktree excludes live in the main repo's
-		// .git/worktrees/<name>/info/exclude which we don't attempt to resolve.
-		const userExclude = resolve(worktreePath, ".git", "info", "exclude");
+		// Resolve the user project's exclude file.
+		// For git worktrees, .git is a file containing "gitdir: <path>" pointing
+		// to the main repo's .git/worktrees/<name>/ directory.
+		let userExclude = resolve(worktreePath, ".git", "info", "exclude");
+		const dotGitPath = resolve(worktreePath, ".git");
+		try {
+			const st = statSync(dotGitPath);
+			if (st.isFile()) {
+				const content = readFileSync(dotGitPath, "utf-8").trim();
+				const match = content.match(/^gitdir:\s*(.+)$/m);
+				if (match) {
+					userExclude = resolve(match[1], "info", "exclude");
+				}
+			}
+		} catch {
+			// .git doesn't exist or can't be read — use default path
+		}
+
 		if (existsSync(userExclude) && existsSync(gitignorePath)) {
 			// Append user exclude to the shadow exclude
 			const existing = readFileSync(excludePath, "utf-8");
@@ -139,9 +153,7 @@ export const snapshot = {
 			// Re-sync excludes only when .gitignore has changed
 			const gitignorePath = resolve(worktreePath, ".gitignore");
 			try {
-				const mtime = existsSync(gitignorePath)
-					? statSync(gitignorePath).mtimeMs
-					: 0;
+				const mtime = existsSync(gitignorePath) ? statSync(gitignorePath).mtimeMs : 0;
 				if (mtime !== (excludeMtimes.get(chapterId) ?? -1)) {
 					await this.syncExcludes(chapterId, worktreePath);
 					excludeMtimes.set(chapterId, mtime);
@@ -183,11 +195,7 @@ export const snapshot = {
 		toHash: string,
 	): Promise<string> {
 		const dir = shadowDir(chapterId);
-		const result = await execGit(
-			["diff-tree", "-r", "-p", fromHash, toHash],
-			dir,
-			worktreePath,
-		);
+		const result = await execGit(["diff-tree", "-r", "-p", fromHash, toHash], dir, worktreePath);
 		return result.stdout;
 	},
 
@@ -243,5 +251,21 @@ export const snapshot = {
 		const dir = shadowDir(chapterId);
 		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 		excludeMtimes.delete(chapterId);
+	},
+
+	/** Garbage-collect all shadow repositories. */
+	async gcAll(): Promise<void> {
+		if (!existsSync(SNAPSHOTS_DIR)) return;
+		const entries = readdirSync(SNAPSHOTS_DIR, { withFileTypes: true });
+		for (const entry of entries) {
+			if (entry.isDirectory()) {
+				await this.gc(entry.name).catch((err) =>
+					logger.warn("Snapshot GC failed", {
+						chapterId: entry.name,
+						error: String(err),
+					}),
+				);
+			}
+		}
 	},
 };

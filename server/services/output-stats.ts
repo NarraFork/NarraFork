@@ -45,7 +45,7 @@ function computeRate(): number {
 	if (chunks.length === 0) return 0;
 	let sum = 0;
 	for (const c of chunks) sum += c.chars;
-	return Math.round(sum / (WINDOW_MS / 1000));
+	return Math.round((sum / (WINDOW_MS / 1000)) * 10) / 10;
 }
 
 /** Broadcast current stats to all subscribed WS clients. */
