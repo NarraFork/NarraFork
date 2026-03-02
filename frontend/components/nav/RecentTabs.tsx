@@ -35,7 +35,7 @@ const SWIPE_THRESHOLD = 80;
 // Prevents the synthetic click after drag from triggering Link navigation.
 let justDragged = false;
 
-const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done"]);
+const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done", "error", "interrupted"]);
 
 /**
  * Move the tab matching `narratorId` to just after the last active (thinking/waiting/done) tab.

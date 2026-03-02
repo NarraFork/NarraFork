@@ -11,6 +11,7 @@ import {
 	Stack,
 	Text,
 	Textarea,
+	ThemeIcon,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -18,11 +19,47 @@ import { IconArrowsMinimize, IconGitCommit, IconListCheck } from "@tabler/icons-
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import Markdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
 import { MarkdownContent } from "./MarkdownContent";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
-import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
+import {
+	getCategoryColor,
+	getCategoryIcon,
+	type PendingPermission,
+	STATUS_COLORS,
+	StatusIcon,
+	ToolCallCard,
+} from "./ToolCallCard";
+
+const singleLineMdComponents: Components = {
+	p: ({ children }) => <>{children}</>,
+	h1: ({ children }) => <>{children}</>,
+	h2: ({ children }) => <>{children}</>,
+	h3: ({ children }) => <>{children}</>,
+	h4: ({ children }) => <>{children}</>,
+	h5: ({ children }) => <>{children}</>,
+	h6: ({ children }) => <>{children}</>,
+	ul: ({ children }) => <>{children}</>,
+	ol: ({ children }) => <>{children}</>,
+	li: ({ children }) => <>{children}</>,
+	blockquote: ({ children }) => <>{children}</>,
+	code: ({ children }) => <>{children}</>,
+	pre: ({ children }) => <>{children}</>,
+	a: ({ children }) => <>{children}</>,
+	strong: ({ children }) => (
+		<Text span fw={700} size="xs">
+			{children}
+		</Text>
+	),
+	em: ({ children }) => (
+		<Text span fs="italic" size="xs">
+			{children}
+		</Text>
+	),
+};
 
 interface MessageBubbleProps {
 	narratorId?: string;
@@ -547,6 +584,41 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					if (block.type === "image") {
 						return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+					}
+					if (block.type === "reasoning") {
+						const iconColor = getCategoryColor("plan");
+						const Icon = getCategoryIcon("plan");
+						const statusColor = STATUS_COLORS.success ?? "green";
+						const summary =
+							typeof block.text === "string" ? block.text.trim().replace(/\s+/g, " ") : "";
+						return (
+							<Paper key={key} withBorder radius="sm" p="xs">
+								<Group gap={6} wrap="nowrap">
+									<ThemeIcon size={18} variant="light" color={iconColor} radius="sm">
+										<Icon size={12} />
+									</ThemeIcon>
+									<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0 }}>
+										{t("reasoning")}
+									</Text>
+									<Text
+										size="xs"
+										ff="monospace"
+										truncate
+										style={{ flex: 1, minWidth: 0 }}
+										title={summary}
+									>
+										<Markdown remarkPlugins={[remarkGfm]} components={singleLineMdComponents}>
+											{summary}
+										</Markdown>
+									</Text>
+									<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+										<Box c={statusColor}>
+											<StatusIcon status="success" />
+										</Box>
+									</Group>
+								</Group>
+							</Paper>
+						);
 					}
 					if (block.type === "thinking") {
 						return (

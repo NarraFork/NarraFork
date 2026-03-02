@@ -297,6 +297,7 @@ export function NarratorPanel({
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
+		narratorErrorMessage: narrator?.errorMessage ?? null,
 		messagesData,
 		messagesQueryKey,
 		isAtBottomRef,
@@ -310,12 +311,15 @@ export function NarratorPanel({
 		sendBufferMessage,
 		cancelBuffer,
 		streamingRef,
+		streamingReasoningRef,
 		streamingVersion,
 		renderPermCb,
 		bufferedText,
 		setBufferedText,
 		isCompacting,
 		contextPercent,
+		promptTokens,
+		contextWindow,
 		pruneBoundaryMessageId,
 		prunedPercent,
 		currentTodos,
@@ -499,6 +503,12 @@ export function NarratorPanel({
 		if (lastMessage.id === STREAMING_CHUNKS_MSG_ID && lastMessage._noMerge) return lastMessage;
 		return null;
 	}, [lastMessage]);
+
+	const canRetryLastUserMessage =
+		!!lastMessage &&
+		lastMessage.role === "user" &&
+		!String(lastMessage.id).startsWith("optimistic-") &&
+		(narrator?.status === "idle" || narrator?.status === "done" || narrator?.status === "error");
 
 	// --- Fork handler ---
 	// Standalone narrators: fork narrator directly (no git involved)
@@ -799,21 +809,10 @@ export function NarratorPanel({
 		});
 	}, [highlightMessageId, totalMessageCount]);
 
-	// --- Send message ---
-	const handleSend = async () => {
-		const msg = input.trim();
-		if (!msg) return;
-		if (isActive) {
-			sendBufferMessage(narratorId, msg);
-			setBufferedText(msg);
-			setInput("");
-			scrollToBottom(true);
-			return;
-		}
-		const images = [...attachedImages];
-		setInput("");
-		setAttachedImages([]);
+	// --- Send / retry message ---
+	const submitMessage = async (msg: string, images: File[] = []) => {
 		streamingRef.current = "";
+		streamingReasoningRef.current = "";
 
 		const optimisticBlocks: ContentBlock[] = [
 			...images.map((f) => ({
@@ -853,6 +852,32 @@ export function NarratorPanel({
 			await api.sendNarratorMessage(narratorId, msg, images.length > 0 ? images : undefined);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : "Failed to send message";
+			notifications.show({ title: "Error", message, color: "red" });
+		}
+	};
+
+	const handleSend = async () => {
+		const msg = input.trim();
+		if (!msg) return;
+		if (isActive) {
+			sendBufferMessage(narratorId, msg);
+			setBufferedText(msg);
+			setInput("");
+			scrollToBottom(true);
+			return;
+		}
+		const images = [...attachedImages];
+		setInput("");
+		setAttachedImages([]);
+		await submitMessage(msg, images);
+	};
+
+	const handleRetry = async () => {
+		if (!canRetryLastUserMessage) return;
+		try {
+			await api.retryLastMessage(narratorId);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : "Failed to retry";
 			notifications.show({ title: "Error", message, color: "red" });
 		}
 	};
@@ -1069,6 +1094,7 @@ export function NarratorPanel({
 							<StreamingBubble
 								narratorId={narratorId}
 								streamingRef={streamingRef}
+								streamingReasoningRef={streamingReasoningRef}
 								version={streamingVersion}
 							/>
 							{deferredStreamingChunks &&
@@ -1351,7 +1377,21 @@ export function NarratorPanel({
 									{prunedPercent != null && (
 										<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
 									)}
-									<Menu.Label>Context: {contextPercent.toFixed(1)}%</Menu.Label>
+									<Menu.Label>
+										{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
+									</Menu.Label>
+									{promptTokens != null && (
+										<Menu.Label>
+											{contextWindow != null
+												? t("contextUsageTokensWithWindow", {
+														tokens: promptTokens.toLocaleString(),
+														window: contextWindow.toLocaleString(),
+													})
+												: t("contextUsageTokens", {
+														tokens: promptTokens.toLocaleString(),
+													})}
+										</Menu.Label>
+									)}
 									<Menu.Item
 										leftSection={<IconArrowsMinimize size={14} />}
 										onClick={() => {
@@ -1487,8 +1527,8 @@ export function NarratorPanel({
 								)}
 							</Menu.Dropdown>
 						</Menu>
-						{/* Reasoning Effort (only for Codex models) */}
-						{narrator.model?.startsWith("codex:") && (
+						{/* Reasoning Effort (only for models containing "codex") */}
+						{narrator.model?.toLowerCase().includes("codex") && (
 							<Menu position="top-end">
 								<Menu.Target>
 									<NativeSelect
@@ -1775,45 +1815,58 @@ export function NarratorPanel({
 						/>
 					</Box>
 					{(() => {
-						const showInterrupt = isActive && !input.trim();
-						return showInterrupt ? (
-							<Button
-								key="interrupt"
-								ref={interruptBtnRef}
-								color="red"
-								variant="light"
-								onMouseDown={startInterruptPress}
-								onMouseUp={clearInterruptTimer}
-								onMouseLeave={clearInterruptTimer}
-								onContextMenu={(e) => e.preventDefault()}
-								loading={interruptMutation.isPending}
-								style={{
-									position: "relative",
-									overflow: "hidden",
-									userSelect: "none",
-									touchAction: "none",
-								}}
-							>
-								{interruptProgress > 0 && interruptProgress < 1 && (
-									<div
-										style={{
-											position: "absolute",
-											inset: 0,
-											background: "var(--mantine-color-red-filled)",
-											opacity: 0.25,
-											transformOrigin: "left",
-											transform: `scaleX(${interruptProgress})`,
-											pointerEvents: "none",
-										}}
-									/>
-								)}
-								<span style={{ position: "relative" }}>{t("interrupt")}</span>
-							</Button>
-						) : (
+						const hasInput = !!input.trim();
+						const showInterrupt = isActive && !hasInput;
+						const showRetry =
+							!showInterrupt && !hasInput && attachedImages.length === 0 && canRetryLastUserMessage;
+						if (showInterrupt) {
+							return (
+								<Button
+									key="interrupt"
+									ref={interruptBtnRef}
+									color="red"
+									variant="light"
+									onMouseDown={startInterruptPress}
+									onMouseUp={clearInterruptTimer}
+									onMouseLeave={clearInterruptTimer}
+									onContextMenu={(e) => e.preventDefault()}
+									loading={interruptMutation.isPending}
+									style={{
+										position: "relative",
+										overflow: "hidden",
+										userSelect: "none",
+										touchAction: "none",
+									}}
+								>
+									{interruptProgress > 0 && interruptProgress < 1 && (
+										<div
+											style={{
+												position: "absolute",
+												inset: 0,
+												background: "var(--mantine-color-red-filled)",
+												opacity: 0.25,
+												transformOrigin: "left",
+												transform: `scaleX(${interruptProgress})`,
+												pointerEvents: "none",
+											}}
+										/>
+									)}
+									<span style={{ position: "relative" }}>{t("interrupt")}</span>
+								</Button>
+							);
+						}
+						if (showRetry) {
+							return (
+								<Button key="retry" onClick={handleRetry}>
+									{t("retry")}
+								</Button>
+							);
+						}
+						return (
 							<Button
 								key="send"
 								onClick={handleSend}
-								disabled={!input.trim() || (isActive && !!bufferedText)}
+								disabled={!hasInput || (isActive && !!bufferedText)}
 							>
 								{isActive ? t("queue") : tc("send")}
 							</Button>

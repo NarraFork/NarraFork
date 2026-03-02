@@ -11,7 +11,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { settings } from "../lib/settings";
+import { resolveProvider, settings } from "../lib/settings";
 import { deleteNarratorUploads } from "../lib/uploads";
 
 /**
@@ -268,6 +268,7 @@ interface CreateNarratorInput {
 	permissionMode?: string;
 	cwd?: string;
 	planMode?: boolean;
+	reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null;
 }
 
 interface CreateSubagentInput {
@@ -311,15 +312,25 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "dontAsk";
 
+		const resolvedModel = input.model ?? settings.agent.defaultModel;
+		const resolvedProvider = resolveProvider(resolvedModel);
+		const resolvedReasoningEffort =
+			input.reasoningEffort === undefined
+				? resolvedProvider === "codex"
+					? (settings.codex?.defaultReasoningEffort ?? null)
+					: null
+				: input.reasoningEffort;
+
 		const [narrator] = await db
 			.insert(narrators)
 			.values({
 				id,
 				chapterId: input.chapterId ?? null,
 				type,
-				model: input.model ?? settings.agent.defaultModel,
+				model: resolvedModel,
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
+				reasoningEffort: resolvedReasoningEffort,
 				planMode: input.planMode ?? false,
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
@@ -349,6 +360,12 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "dontAsk";
 
+		const resolvedModel = input.model ?? parent.model ?? settings.agent.defaultModel;
+		const resolvedProvider = resolveProvider(resolvedModel);
+		const resolvedReasoningEffort =
+			parent.reasoningEffort ??
+			(resolvedProvider === "codex" ? (settings.codex?.defaultReasoningEffort ?? null) : null);
+
 		const [narrator] = await db
 			.insert(narrators)
 			.values({
@@ -356,9 +373,10 @@ export const narratorService = {
 				chapterId: parent.chapterId ?? null,
 				type: "subagent",
 				subagentType: input.subagentType,
-				model: input.model ?? parent.model ?? settings.agent.defaultModel,
+				model: resolvedModel,
 				systemPrompt: input.systemPrompt ?? null,
 				permissionMode: resolvedPermMode,
+				reasoningEffort: resolvedReasoningEffort,
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				inheritMode: "fresh",
@@ -417,6 +435,12 @@ export const narratorService = {
 			.where(eq(narratorMessageRefs.narratorId, input.originalSubagentId))
 			.orderBy(narratorMessageRefs.seq);
 
+		const resolvedModel = input.model ?? settings.agent.defaultModel;
+		const resolvedProvider = resolveProvider(resolvedModel);
+		const resolvedReasoningEffort =
+			original.reasoningEffort ??
+			(resolvedProvider === "codex" ? (settings.codex?.defaultReasoningEffort ?? null) : null);
+
 		const narrator = await db.transaction(async (tx) => {
 			const [created] = await tx
 				.insert(narrators)
@@ -425,9 +449,10 @@ export const narratorService = {
 					chapterId: original.chapterId ?? null,
 					type: "subagent",
 					subagentType: input.subagentType,
-					model: input.model ?? settings.agent.defaultModel,
+					model: resolvedModel,
 					systemPrompt: input.systemPrompt ?? null,
 					permissionMode: resolvedPermMode,
+					reasoningEffort: resolvedReasoningEffort,
 					parentNarratorId: input.parentNarratorId,
 					forkMessageId: prefixRows.length > 0 ? prefixRows[prefixRows.length - 1].messageId : null,
 					cwd: input.cwd,
@@ -1704,6 +1729,8 @@ export const narratorService = {
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
+			tokensIn?: number;
+			turnUsage?: Record<string, unknown>;
 		},
 	) {
 		const id = generateId();
@@ -1719,7 +1746,8 @@ export const narratorService = {
 				role: "assistant",
 				contentJson: [],
 				contentText: null,
-				tokensIn: null,
+				tokensIn: sdkMessage.tokensIn ?? null,
+				turnUsageJson: sdkMessage.turnUsage ?? null,
 				contextPercent: sdkMessage.contextPercent ?? null,
 				meterUsage: sdkMessage.meterUsage ?? null,
 				meterUnit: sdkMessage.meterUnit ?? null,
@@ -1747,8 +1775,23 @@ export const narratorService = {
 		});
 		if (!existing) return;
 
+		// Keep a stable canonical order for assistant blocks regardless of stream arrival order:
+		// reasoning → text/other non-tool blocks → tool_use.
+		// This avoids cases where streaming tool_use blocks are persisted before reasoning/text.
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const content = [...((existing.contentJson as any[]) ?? []), block];
+		const current = ((existing.contentJson as any[]) ?? []) as any[];
+		let content: any[];
+		if (block.type === "reasoning") {
+			const idx = current.findIndex((b) => b.type !== "reasoning");
+			content =
+				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
+		} else if (block.type === "text") {
+			const idx = current.findIndex((b) => b.type === "tool_use");
+			content =
+				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
+		} else {
+			content = [...current, block];
+		}
 		const contentText = content
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.filter((b: any) => b.type === "text")
@@ -2091,6 +2134,12 @@ export const narratorService = {
 		}
 
 		// Create narrator + copy refs atomically
+		const resolvedModel = parent.model ?? "claude-sonnet";
+		const resolvedProvider = resolveProvider(resolvedModel);
+		const resolvedReasoningEffort =
+			parent.reasoningEffort ??
+			(resolvedProvider === "codex" ? (settings.codex?.defaultReasoningEffort ?? null) : null);
+
 		const newNarrator = await db.transaction(async (tx) => {
 			const [created] = await tx
 				.insert(narrators)
@@ -2098,9 +2147,10 @@ export const narratorService = {
 					id,
 					chapterId: targetChapterId,
 					type: "primary",
-					model: parent.model ?? "claude-sonnet",
+					model: resolvedModel,
 					systemPrompt,
 					permissionMode: resolvedPermMode,
+					reasoningEffort: resolvedReasoningEffort,
 					parentNarratorId,
 					forkMessageId: resolvedForkMessageId,
 					inheritMode,

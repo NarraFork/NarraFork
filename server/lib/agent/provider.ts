@@ -67,6 +67,11 @@ export interface ChatParams {
 	tools: unknown[];
 	toolResults: unknown[];
 	signal: AbortSignal;
+	/**
+	 * Sticky session key for provider-side account affinity.
+	 * For narrator loops this is narratorId.
+	 */
+	stickySessionKey?: string;
 	/** Base64-encoded images to attach to the current user message */
 	images?: Array<{ format: string; base64: string }>;
 	/** Reasoning effort for Codex models (low, medium, high, xhigh) */

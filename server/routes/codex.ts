@@ -2,8 +2,12 @@ import { Hono } from "hono";
 import { getCodexManager, type LoadBalancingMode } from "../lib/codex-manager";
 import { logger } from "../lib/logger";
 import { loadSettings, saveSettings } from "../lib/settings";
+import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const codexRoutes = new Hono();
+
+// All Codex routes require admin privileges
+codexRoutes.use("*", requireAuth, requireAdmin);
 
 /**
  * GET /api/codex/status
@@ -11,12 +15,18 @@ export const codexRoutes = new Hono();
  */
 codexRoutes.get("/status", (c) => {
 	const manager = getCodexManager();
-	const snapshot = manager.snapshot();
 	const settings = loadSettings();
+	const mode = settings.codex?.loadBalancingMode;
+	if (mode === "priority" || mode === "balanced") {
+		manager.setLoadBalancingMode(mode);
+	}
+	const snapshot = manager.snapshot();
+
 	return c.json({
 		...snapshot,
 		globalProxy: settings.codex?.proxy,
-		loadBalancingMode: settings.codex?.loadBalancingMode ?? snapshot.loadBalancingMode,
+		loadBalancingMode: mode ?? snapshot.loadBalancingMode,
+		defaultReasoningEffort: settings.codex?.defaultReasoningEffort,
 	});
 });
 
@@ -66,8 +76,15 @@ codexRoutes.post("/auth/browser/wait", async (c) => {
  * Cancel any pending browser OAuth flow.
  */
 codexRoutes.post("/auth/browser/cancel", (c) => {
-	// Browser OAuth cancellation is handled internally by codex-auth.ts
-	return c.json({ ok: true });
+	try {
+		const { cancelBrowserOAuth } = require("../lib/codex-auth");
+		cancelBrowserOAuth();
+		return c.json({ ok: true });
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		logger.error("Failed to cancel browser OAuth", { error: msg });
+		return c.json({ error: msg }, 500);
+	}
 });
 
 /**
@@ -212,6 +229,23 @@ codexRoutes.post("/credentials/:id/refresh", async (c) => {
 });
 
 /**
+ * POST /api/codex/credentials/:id/usage
+ * Get usage information for a credential.
+ */
+codexRoutes.post("/credentials/:id/usage", async (c) => {
+	const id = c.req.param("id");
+	const manager = getCodexManager();
+	try {
+		const usage = await manager.getUsage(id);
+		return c.json(usage);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		logger.error("Failed to get Codex usage", { error: msg, credentialId: id });
+		return c.json({ error: msg }, 400);
+	}
+});
+
+/**
  * POST /api/codex/load-balancing-mode
  * Set the load balancing mode.
  */
@@ -248,6 +282,40 @@ codexRoutes.post("/global-proxy", async (c) => {
 });
 
 /**
+ * GET /api/codex/default-reasoning-effort
+ * Get default reasoning effort for Codex models.
+ */
+codexRoutes.get("/default-reasoning-effort", (c) => {
+	const settings = loadSettings();
+	return c.json({ reasoningEffort: settings.codex?.defaultReasoningEffort ?? null });
+});
+
+/**
+ * POST /api/codex/default-reasoning-effort
+ * Set default reasoning effort for Codex models.
+ */
+codexRoutes.post("/default-reasoning-effort", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) as {
+		reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null;
+	};
+	const validEfforts = ["low", "medium", "high", "xhigh"] as const;
+	if (
+		body.reasoningEffort !== null &&
+		body.reasoningEffort !== undefined &&
+		!validEfforts.includes(body.reasoningEffort)
+	) {
+		return c.json({ error: "Invalid reasoningEffort. Must be low|medium|high|xhigh or null" }, 400);
+	}
+
+	const settings = loadSettings();
+	settings.codex = settings.codex || {};
+	settings.codex.defaultReasoningEffort = body.reasoningEffort ?? undefined;
+	saveSettings(settings);
+
+	return c.json({ ok: true, reasoningEffort: settings.codex.defaultReasoningEffort ?? null });
+});
+
+/**
  * POST /api/codex/import
  * Import credentials from refresh tokens.
  */
@@ -266,6 +334,5 @@ codexRoutes.post("/import", async (c) => {
 
 	const manager = getCodexManager();
 	const result = manager.importCredentials(body.credentials);
-
 	return c.json(result);
 });

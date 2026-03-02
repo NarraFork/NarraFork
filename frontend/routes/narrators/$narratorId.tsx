@@ -73,17 +73,19 @@ function NarratorDetailPage() {
 		}
 	}, [narratorId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle, isSubagent]);
 
-	// Mark narrator as read (done → idle) when visiting the narrator page
+	// Mark narrator as read (done → idle) when visiting the narrator page.
+	// Preserve error sessions: if errorMessage exists, keep it in error state.
 	const qc = useQueryClient();
+	const narratorErrorMessage = narrator?.errorMessage;
 	useEffect(() => {
-		if (isSubagent) return;
+		if (isSubagent || narratorErrorMessage) return;
 		api
 			.markNarratorRead(narratorId)
 			.then(() => {
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			})
 			.catch(() => {});
-	}, [narratorId, qc, isSubagent]);
+	}, [narratorId, qc, isSubagent, narratorErrorMessage]);
 
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(narratorId);

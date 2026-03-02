@@ -131,6 +131,7 @@ export interface AgentToolUse {
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
 	| { type: "text"; text: string }
+	| { type: "reasoning"; text: string }
 	| {
 			type: "tool_use";
 			toolUseId: string;

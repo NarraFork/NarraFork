@@ -70,6 +70,7 @@ function buildSubagentEventContext(
 	let meterUsage: number | undefined;
 	let meterUnit: string | undefined;
 	let partialMessageId: string | undefined;
+	let tokenUsage: import("./narrator-event-handler").TokenUsageSnapshot | undefined;
 
 	return {
 		narratorId: subagentId,
@@ -81,6 +82,7 @@ function buildSubagentEventContext(
 		getMeterUsage: () => meterUsage,
 		getMeterUnit: () => meterUnit,
 		getPartialMessageId: () => partialMessageId,
+		getTokenUsage: () => tokenUsage,
 		setPartialMessageId: (id) => {
 			partialMessageId = id;
 		},
@@ -90,6 +92,9 @@ function buildSubagentEventContext(
 		setMeterData: (u, un) => {
 			meterUsage = u;
 			meterUnit = un;
+		},
+		setTokenUsage: (u) => {
+			tokenUsage = u;
 		},
 	};
 }
@@ -240,6 +245,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 	let finalText = "";
 	let hasError = false;
+	let narratorReasoningEffort =
+		(await narratorService.getById(narratorId)).reasoningEffort ?? undefined;
 
 	while (true) {
 		const eventContext = buildSubagentEventContext(
@@ -263,6 +270,9 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			systemPrompt,
 			locale,
 			signal,
+			reasoningEffort:
+				narratorReasoningEffort ??
+				(provider === "codex" ? settings.codex?.defaultReasoningEffort : undefined),
 			toolFilter: TOOL_FILTERS[subagentType],
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(
@@ -302,6 +312,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		// Reload fresh state — compact clears prune boundary
 		const freshNarrator = await narratorService.getById(narratorId);
 		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
+		narratorReasoningEffort = freshNarrator.reasoningEffort ?? undefined;
 
 		// Rebuild system prompt with new contextSummary
 		systemPrompt = await buildSubagentSystemPrompt(

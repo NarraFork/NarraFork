@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { normalize, resolve } from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
@@ -63,6 +63,8 @@ interface ActiveNarrator {
 	/** Last reported metering from the provider */
 	_lastMeterUsage?: number;
 	_lastMeterUnit?: string;
+	/** Last reported token usage snapshot from context_usage events */
+	_lastTokenUsage?: import("./narrator-event-handler").TokenUsageSnapshot;
 	/** Whether to append language instruction to system prompt */
 	_replyInUserLanguage?: boolean;
 	/** Set when ExitPlanMode completes — the loop should restart with a user message.
@@ -133,7 +135,10 @@ export type NarratorEvent =
 	| { type: "result"; data: unknown }
 	| { type: "error"; data: { message: string } }
 	| { type: "interrupted"; data: { message: string } }
-	| { type: "context_usage"; data: { percentage: number } }
+	| {
+			type: "context_usage";
+			data: { percentage: number; promptTokens?: number; contextWindow?: number };
+	  }
 	| { type: "done"; data: null };
 
 // === Permission handling ===
@@ -600,9 +605,13 @@ export async function handlePermission(
 					active.alive = false;
 					active.abortController.abort();
 				}
-				await narratorService.updateStatus(narratorId, "idle");
+				await narratorService.updateStatus(narratorId, "error", "Permission request timed out");
 				if (broadcastTargetId && broadcastTargetId !== narratorId) {
-					await narratorService.updateStatus(broadcastTargetId, "idle");
+					await narratorService.updateStatus(
+						broadcastTargetId,
+						"error",
+						"Permission request timed out",
+					);
 				}
 				resolve({ behavior: "deny", message: "Permission request timed out" });
 			}
@@ -1159,14 +1168,15 @@ async function runAgentLoop(
 	let shouldUpdateTitle = false;
 	let currentText = text;
 	let currentImages = images;
+	let loopHadError = false;
 	/** How many times we've retried after emergency compact in this runAgentLoop call. */
 	let contextOverflowRetries = 0;
 	const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 
 	/** How many consecutive transient-error retries in this runAgentLoop call. */
 	let transientRetries = 0;
-	const MAX_TRANSIENT_RETRIES = 5;
-	const TRANSIENT_RETRY_BASE_MS = 3_000;
+	const MAX_TRANSIENT_RETRIES = 10;
+	const TRANSIENT_RETRY_BASE_MS = 5_000;
 
 	try {
 		while (active.alive) {
@@ -1216,6 +1226,7 @@ async function runAgentLoop(
 				getMeterUsage: () => active._lastMeterUsage,
 				getMeterUnit: () => active._lastMeterUnit,
 				getPartialMessageId: () => active._partialMessageId,
+				getTokenUsage: () => active._lastTokenUsage,
 				setPartialMessageId: (id) => {
 					active._partialMessageId = id;
 				},
@@ -1225,6 +1236,9 @@ async function runAgentLoop(
 				setMeterData: (usage, unit) => {
 					active._lastMeterUsage = usage;
 					active._lastMeterUnit = unit;
+				},
+				setTokenUsage: (usage) => {
+					active._lastTokenUsage = usage;
 				},
 			};
 
@@ -1467,11 +1481,16 @@ async function runAgentLoop(
 							type: "interrupted",
 							data: { message: "Narrator interrupted" },
 						});
-						// Fire-and-forget: DB cleanup runs in background
-						const cleanupTasks = [
-							cleanupOrphanedToolCalls(narratorId, active.locale),
-							narratorService.updateStatus(narratorId, "idle"),
-						];
+						// Fire-and-forget: DB cleanup runs in background.
+						// Preserve terminal error state: if status is already error, do not overwrite it.
+						const cleanupTasks = [cleanupOrphanedToolCalls(narratorId, active.locale)];
+						const current = await db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { status: true },
+						});
+						if (current?.status !== "error") {
+							cleanupTasks.push(narratorService.updateStatus(narratorId, "interrupted"));
+						}
 						if (partialId) {
 							cleanupTasks.push(cleanupPartialMessage(partialId, narratorId));
 						}
@@ -1488,9 +1507,14 @@ async function runAgentLoop(
 					}
 					logger.error("Agent loop error", { narratorId, error: message });
 					await narratorService.updateStatus(narratorId, "error", message);
+					loopHadError = true;
 					active.events.emit("event", { type: "error", data: { message } });
 				},
 			};
+
+			const resolvedReasoningEffort =
+				freshNarrator.reasoningEffort ??
+				(active.provider === "codex" ? settings.codex?.defaultReasoningEffort : undefined);
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
@@ -1504,7 +1528,7 @@ async function runAgentLoop(
 				planMode: freshNarrator.planMode ?? false,
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
-				reasoningEffort: freshNarrator.reasoningEffort ?? undefined,
+				reasoningEffort: resolvedReasoningEffort,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,
@@ -1593,6 +1617,7 @@ async function runAgentLoop(
 						type: "error",
 						data: { message: "Context too long even after compact" },
 					});
+					loopHadError = true;
 					break;
 				}
 
@@ -1653,6 +1678,7 @@ async function runAgentLoop(
 					type: "error",
 					data: { message: "Context too long, compact failed" },
 				});
+				loopHadError = true;
 				break;
 			}
 
@@ -1670,10 +1696,11 @@ async function runAgentLoop(
 						type: "error",
 						data: { message: result.retryableError },
 					});
+					loopHadError = true;
 					break;
 				}
 
-				const delayMs = TRANSIENT_RETRY_BASE_MS * 2 ** (transientRetries - 1);
+				const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (transientRetries - 1), 20_000);
 				logger.warn("Transient API error, retrying", {
 					narratorId,
 					error: result.retryableError,
@@ -1770,7 +1797,17 @@ async function runAgentLoop(
 
 			// Agent loop done — update status
 			await narratorService.updateStats(narratorId, 0);
-			await narratorService.updateStatus(narratorId, "done");
+			if (!loopHadError) {
+				const current = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { status: true },
+				});
+				// Only mark done if this loop still owns an active in-flight state.
+				// If status has already moved to idle/error/interrupted/etc, preserve it.
+				if (current && (current.status === "thinking" || current.status === "waiting")) {
+					await narratorService.updateStatus(narratorId, "done");
+				}
+			}
 
 			// Compact if context usage is high (checked after a complete turn).
 			// This is a fallback — the mid-turn compact in the context_usage handler
@@ -1897,6 +1934,7 @@ async function runAgentLoop(
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Narrator loop error", { narratorId, error: errorMsg });
 		await narratorService.updateStatus(narratorId, "error", errorMsg);
+		loopHadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		active.events.emit("event", { type: "done", data: null });
 	} finally {
@@ -2148,6 +2186,79 @@ export async function sendMessage(
 }
 
 /**
+ * Retry the last user message without creating a new message record.
+ * Deletes any assistant/error response that followed the last user message,
+ * then re-runs the agent loop with the existing user message text.
+ */
+export async function retryLastMessage(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ ok: boolean }> {
+	// Find the last top-level message via refs
+	const lastRef = await db
+		.select({
+			messageId: narratorMessageRefs.messageId,
+			seq: narratorMessageRefs.seq,
+		})
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				isNull(narratorMessages.parentToolUseId),
+				inArray(narratorMessages.role, ["user", "assistant"]),
+			),
+		)
+		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+		.limit(1);
+
+	if (!lastRef.length) {
+		throw new NotFoundError("No messages to retry", narratorId);
+	}
+
+	const lastMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, lastRef[0].messageId),
+	});
+	if (!lastMsg || lastMsg.role !== "user") {
+		throw new NotFoundError("Last message is not a user message", narratorId);
+	}
+
+	const prompt = lastMsg.contentText ?? "";
+	if (!prompt.trim()) {
+		throw new NotFoundError("Last user message has no text", narratorId);
+	}
+
+	// Resolve images from the user message's contentJson (if any)
+	const imageRefs: ImageRef[] = [];
+	if (Array.isArray(lastMsg.contentJson)) {
+		for (const block of lastMsg.contentJson as Array<Record<string, unknown>>) {
+			if (
+				block.type === "image" &&
+				typeof block.imageId === "string" &&
+				typeof block.filename === "string" &&
+				typeof block.mediaType === "string"
+			) {
+				imageRefs.push({
+					imageId: block.imageId as string,
+					filename: block.filename as string,
+					mediaType: block.mediaType as string,
+				});
+			}
+		}
+	}
+
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	await narratorService.updateStatus(narratorId, "thinking");
+
+	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
+	});
+
+	return { ok: true };
+}
+
+/**
  * Start or feed a message into a narrator.
  * Yields NarratorEvent objects for consumption (used by chapter-merge).
  */
@@ -2227,15 +2338,15 @@ export async function* startSession(
 
 /**
  * Clean up a partial (incomplete) assistant message and its related records.
- * Runs all three DELETEs in parallel since they target different tables.
+ * Deletes children first to satisfy FK constraints.
  */
 async function cleanupPartialMessage(partialId: string, narratorId: string): Promise<void> {
 	try {
-		await Promise.all([
-			db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId)),
-			db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId)),
-			db.delete(narratorMessages).where(eq(narratorMessages.id, partialId)),
-		]);
+		await db.transaction(async (tx) => {
+			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));
+			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId));
+			await tx.delete(narratorMessages).where(eq(narratorMessages.id, partialId));
+		});
 	} catch (err) {
 		logger.warn("Failed to clean up partial message on error", {
 			narratorId,

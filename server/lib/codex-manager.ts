@@ -12,14 +12,18 @@ import {
 	startBrowserOAuth,
 	startDeviceCodeFlow,
 } from "./codex-auth";
+import { type CodexUsageResult, fetchCodexUsage } from "./codex-usage";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 
 // === Constants ===
 
 const MAX_FAILURES_PER_CREDENTIAL = 3;
+const USAGE_TTL_MS = 15 * 60_000;
 const CREDENTIALS_FILE = "codex-credentials.json";
 const STATS_FILE = "codex-stats.json";
+const SESSION_AFFINITY_TTL_MS = 6 * 60 * 60_000; // 6h
+const MAX_SESSION_AFFINITY_ENTRIES = 2_000;
 
 // === Types ===
 
@@ -37,6 +41,10 @@ export interface CodexCredential {
 	priority: number;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
+	/** Epoch milliseconds when quota resets (from API error.resets_at). */
+	quotaResetsAt?: number;
+	/** Cached usage snapshot persisted with credential. */
+	usage?: CodexUsageResult;
 }
 
 export interface CredentialStats {
@@ -57,6 +65,8 @@ export interface CredentialSnapshot {
 	failureCount: number;
 	lastUsedAt?: string;
 	expiresAt?: number;
+	quotaResetsAt?: number;
+	usage?: CodexUsageResult;
 }
 
 export interface ManagerSnapshot {
@@ -65,6 +75,8 @@ export interface ManagerSnapshot {
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
 	available: number;
+	stickySessionCount: number;
+	usageCache: Record<string, CodexUsageResult>;
 }
 
 export interface CallContext {
@@ -81,14 +93,19 @@ interface PendingDeviceFlow {
 	reject: (error: Error) => void;
 }
 
-// === File paths ===
-
-function getCredentialsPath(): string {
-	return resolve(homedir(), ".narrafork", CREDENTIALS_FILE);
+interface SessionAffinityEntry {
+	credentialId: string;
+	lastUsedAt: number;
 }
 
-function getStatsPath(): string {
-	return resolve(homedir(), ".narrafork", STATS_FILE);
+// === File paths ===
+
+function getCredentialsPath(baseDir = homedir()): string {
+	return resolve(baseDir, ".narrafork", CREDENTIALS_FILE);
+}
+
+function getStatsPath(baseDir = homedir()): string {
+	return resolve(baseDir, ".narrafork", STATS_FILE);
 }
 
 // === Helpers ===
@@ -119,8 +136,10 @@ export class CodexManager {
 	private loadBalancingMode: LoadBalancingMode;
 	private refreshPromises = new Map<string, Promise<CodexCredential>>();
 	private pendingDeviceFlow: PendingDeviceFlow | undefined;
+	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
+	private sessionAffinity = new Map<string, SessionAffinityEntry>();
 
-	constructor() {
+	constructor(private readonly options?: { homeDir?: string }) {
 		this.entries = [];
 		this.stats = new Map();
 		this.currentId = "";
@@ -137,9 +156,30 @@ export class CodexManager {
 
 	// ==================== Credential Selection ====================
 
-	async acquireContext(): Promise<CallContext> {
+	async acquireContext(sessionKey?: string): Promise<CallContext> {
+		this.reviveQuotaResetCredentials();
+		this.pruneSessionAffinity();
 		const total = this.entries.length;
 		const triedIds = new Set<string>();
+		const stickyEnabled = this.loadBalancingMode === "balanced" && !!sessionKey;
+
+		if (stickyEnabled && sessionKey) {
+			const sticky = this.sessionAffinity.get(sessionKey);
+			if (sticky) {
+				const stickyEntry = this.entries.find((e) => e.id === sticky.credentialId);
+				if (!stickyEntry || stickyEntry.disabled) {
+					this.unbindSession(sessionKey);
+				} else {
+					const ctx = await this.tryEnsureToken(stickyEntry);
+					if (ctx) {
+						this.bindSession(sessionKey, ctx.id);
+						return ctx;
+					}
+					triedIds.add(stickyEntry.id);
+					this.unbindSession(sessionKey);
+				}
+			}
+		}
 
 		while (triedIds.size < total) {
 			const entry = this.selectEntry(triedIds);
@@ -150,7 +190,10 @@ export class CodexManager {
 					const healed = this.selectEntry(triedIds);
 					if (healed) {
 						const ctx = await this.tryEnsureToken(healed);
-						if (ctx) return ctx;
+						if (ctx) {
+							if (stickyEnabled && sessionKey) this.bindSession(sessionKey, ctx.id);
+							return ctx;
+						}
 						triedIds.add(healed.id);
 					}
 				}
@@ -158,11 +201,17 @@ export class CodexManager {
 			}
 
 			const ctx = await this.tryEnsureToken(entry);
-			if (ctx) return ctx;
+			if (ctx) {
+				if (stickyEnabled && sessionKey) this.bindSession(sessionKey, ctx.id);
+				return ctx;
+			}
 
 			triedIds.add(entry.id);
 		}
 
+		if (stickyEnabled && sessionKey) {
+			this.unbindSession(sessionKey);
+		}
 		throw new Error(`All Codex credentials exhausted (available: ${this.availableCount}/${total})`);
 	}
 
@@ -242,6 +291,40 @@ export class CodexManager {
 		return promise;
 	}
 
+	private bindSession(sessionKey: string, credentialId: string): void {
+		this.sessionAffinity.set(sessionKey, { credentialId, lastUsedAt: Date.now() });
+		this.pruneSessionAffinity();
+	}
+
+	private unbindSession(sessionKey: string): void {
+		this.sessionAffinity.delete(sessionKey);
+	}
+
+	private evictSessionsByCredential(credentialId: string): void {
+		for (const [sessionKey, binding] of this.sessionAffinity) {
+			if (binding.credentialId === credentialId) {
+				this.sessionAffinity.delete(sessionKey);
+			}
+		}
+	}
+
+	private pruneSessionAffinity(now = Date.now()): void {
+		for (const [sessionKey, binding] of this.sessionAffinity) {
+			if (now - binding.lastUsedAt > SESSION_AFFINITY_TTL_MS) {
+				this.sessionAffinity.delete(sessionKey);
+			}
+		}
+		if (this.sessionAffinity.size <= MAX_SESSION_AFFINITY_ENTRIES) return;
+		const sorted = [...this.sessionAffinity.entries()].sort(
+			(a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
+		);
+		const overflow = this.sessionAffinity.size - MAX_SESSION_AFFINITY_ENTRIES;
+		for (let i = 0; i < overflow; i++) {
+			const item = sorted[i];
+			if (item) this.sessionAffinity.delete(item[0]);
+		}
+	}
+
 	// ==================== Reporting ====================
 
 	reportSuccess(id: string): void {
@@ -263,6 +346,26 @@ export class CodexManager {
 		if (entry && stats.failureCount >= MAX_FAILURES_PER_CREDENTIAL) {
 			entry.disabled = true;
 			entry.disabledReason = "too_many_failures";
+			this.evictSessionsByCredential(id);
+			this.saveCredentials();
+		}
+
+		this.saveStatsDebounced();
+		return this.entries.some((e) => !e.disabled);
+	}
+
+	reportQuotaExhausted(id: string, resetsAt?: number): boolean {
+		const stats = this.stats.get(id) ?? { successCount: 0, failureCount: 0 };
+		stats.failureCount = MAX_FAILURES_PER_CREDENTIAL;
+		stats.lastUsedAt = new Date().toISOString();
+		this.stats.set(id, stats);
+
+		const entry = this.entries.find((e) => e.id === id);
+		if (entry) {
+			entry.disabled = true;
+			entry.disabledReason = "quota_exhausted";
+			entry.quotaResetsAt = resetsAt ?? entry.quotaResetsAt;
+			this.evictSessionsByCredential(id);
 			this.saveCredentials();
 		}
 
@@ -273,10 +376,11 @@ export class CodexManager {
 	// ==================== Self-healing ====================
 
 	private trySelfHeal(): boolean {
+		const revivedQuota = this.reviveQuotaResetCredentials();
 		const hasTooManyFailures = this.entries.some(
 			(e) => e.disabled && e.disabledReason === "too_many_failures",
 		);
-		if (!hasTooManyFailures) return false;
+		if (!hasTooManyFailures) return revivedQuota;
 
 		for (const e of this.entries) {
 			if (e.disabledReason === "too_many_failures") {
@@ -290,13 +394,38 @@ export class CodexManager {
 		return true;
 	}
 
+	private reviveQuotaResetCredentials(now = Date.now()): boolean {
+		let changed = false;
+		for (const e of this.entries) {
+			if (e.disabledReason !== "quota_exhausted") continue;
+			if (!e.quotaResetsAt || e.quotaResetsAt > now) continue;
+			e.disabled = false;
+			e.disabledReason = undefined;
+			e.quotaResetsAt = undefined;
+			const stats = this.stats.get(e.id);
+			if (stats) stats.failureCount = 0;
+			changed = true;
+		}
+		if (changed) {
+			this.saveCredentials();
+			this.saveStatsDebounced();
+		}
+		return changed;
+	}
+
 	// ==================== Admin API ====================
 
 	snapshot(): ManagerSnapshot {
+		this.pruneSessionAffinity();
 		const available = this.entries.filter((e) => !e.disabled).length;
+		const usageCacheObj: Record<string, CodexUsageResult> = {};
+		for (const e of this.entries) {
+			if (e.usage) usageCacheObj[e.id] = e.usage;
+		}
 		return {
 			entries: this.entries.map((e) => {
 				const stats = this.stats.get(e.id);
+				const usage = e.usage;
 				return {
 					id: e.id,
 					displayName: e.displayName,
@@ -309,16 +438,23 @@ export class CodexManager {
 					failureCount: stats?.failureCount ?? 0,
 					lastUsedAt: stats?.lastUsedAt,
 					expiresAt: e.expiresAt,
+					quotaResetsAt: e.quotaResetsAt,
+					usage,
 				};
 			}),
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
 			total: this.entries.length,
 			available,
+			stickySessionCount: this.sessionAffinity.size,
+			usageCache: usageCacheObj,
 		};
 	}
 
 	setLoadBalancingMode(mode: LoadBalancingMode): void {
+		if (this.loadBalancingMode !== mode) {
+			this.sessionAffinity.clear();
+		}
 		this.loadBalancingMode = mode;
 	}
 
@@ -330,8 +466,10 @@ export class CodexManager {
 			const stats = this.stats.get(id);
 			if (stats) stats.failureCount = 0;
 			entry.disabledReason = undefined;
+			entry.quotaResetsAt = undefined;
 		} else {
 			entry.disabledReason = "manual";
+			this.evictSessionsByCredential(id);
 		}
 		this.saveCredentials();
 	}
@@ -348,6 +486,7 @@ export class CodexManager {
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		entry.disabled = false;
 		entry.disabledReason = undefined;
+		entry.quotaResetsAt = undefined;
 		const stats = this.stats.get(id);
 		if (stats) stats.failureCount = 0;
 		this.saveCredentials();
@@ -358,6 +497,8 @@ export class CodexManager {
 		if (idx === -1) throw new Error(`Credential not found: ${id}`);
 		this.entries.splice(idx, 1);
 		this.stats.delete(id);
+		this.usageRefreshPromises.delete(id);
+		this.evictSessionsByCredential(id);
 		if (this.currentId === id && this.entries.length > 0) {
 			this.currentId = this.entries[0].id;
 		}
@@ -468,6 +609,86 @@ export class CodexManager {
 		this.saveCredentials();
 	}
 
+	// ==================== Usage Query ====================
+
+	private isUsageStaleForUse(usage: CodexUsageResult, now = Date.now()): boolean {
+		const queriedAtMs = new Date(usage.queriedAt).getTime();
+		if (!Number.isFinite(queriedAtMs)) return true;
+		const queriedDeadline = queriedAtMs + USAGE_TTL_MS;
+		const primaryResetSec = usage.primary_window?.reset_at;
+		const effectiveDeadline =
+			typeof primaryResetSec === "number"
+				? Math.min(queriedDeadline, primaryResetSec * 1000)
+				: queriedDeadline;
+		return now >= effectiveDeadline;
+	}
+
+	private async refreshUsage(id: string): Promise<CodexUsageResult> {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+
+		// Ensure we have a valid access token
+		if (!entry.accessToken || isExpired(entry)) {
+			const refreshed = await this.deduplicatedRefresh(id, entry);
+			Object.assign(entry, {
+				accessToken: refreshed.accessToken,
+				refreshToken: refreshed.refreshToken,
+				expiresAt: refreshed.expiresAt,
+				accountId: refreshed.accountId,
+			});
+			this.saveCredentials();
+		}
+
+		if (!entry.accountId) {
+			throw new Error("Account ID not available for this credential");
+		}
+
+		const settings = await import("./settings").then((m) => m.loadSettings());
+		const proxy = settings.codex?.proxy;
+
+		if (!entry.accessToken) {
+			throw new Error("Access token not available");
+		}
+
+		const usage = await fetchCodexUsage(entry.accessToken, entry.accountId, proxy);
+		entry.usage = usage;
+		this.saveCredentials();
+		return usage;
+	}
+
+	private async refreshUsageDeduplicated(id: string): Promise<CodexUsageResult> {
+		const existing = this.usageRefreshPromises.get(id);
+		if (existing) return existing;
+		const promise = this.refreshUsage(id).finally(() => {
+			this.usageRefreshPromises.delete(id);
+		});
+		this.usageRefreshPromises.set(id, promise);
+		return promise;
+	}
+
+	async getUsage(id: string): Promise<CodexUsageResult> {
+		return this.refreshUsageDeduplicated(id);
+	}
+
+	/**
+	 * Refresh usage only when the credential is actually used and the cached value is stale.
+	 */
+	async refreshUsageOnUseIfNeeded(id: string): Promise<void> {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+		if (entry.usage && !this.isUsageStaleForUse(entry.usage)) return;
+		await this.refreshUsageDeduplicated(id);
+	}
+
+	private scheduleInitialUsageFetch(id: string): void {
+		void this.refreshUsageDeduplicated(id).catch((err) => {
+			logger.warn("Failed to fetch initial Codex usage for credential", {
+				credentialId: id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+	}
+
 	// ==================== Credential Management ====================
 
 	private addCredentialFromTokens(tokens: CodexTokens): CodexCredential {
@@ -512,6 +733,7 @@ export class CodexManager {
 		}
 
 		this.saveCredentials();
+		this.scheduleInitialUsageFetch(cred.id);
 		return cred;
 	}
 
@@ -549,6 +771,9 @@ export class CodexManager {
 
 		if (added > 0) {
 			this.saveCredentials();
+			for (const e of this.entries) {
+				if (!e.usage) this.scheduleInitialUsageFetch(e.id);
+			}
 		}
 
 		return { added, duplicates };
@@ -558,7 +783,8 @@ export class CodexManager {
 
 	private loadCredentials(): void {
 		try {
-			const path = getCredentialsPath();
+			const baseDir = this.options?.homeDir ?? homedir();
+			const path = getCredentialsPath(baseDir);
 			if (!existsSync(path)) return;
 
 			const raw = JSON.parse(readFileSync(path, "utf-8"));
@@ -590,8 +816,9 @@ export class CodexManager {
 
 	private saveCredentials(): void {
 		try {
-			const path = getCredentialsPath();
-			mkdirSync(resolve(homedir(), ".narrafork"), { recursive: true });
+			const baseDir = this.options?.homeDir ?? homedir();
+			const path = getCredentialsPath(baseDir);
+			mkdirSync(resolve(baseDir, ".narrafork"), { recursive: true });
 			writeFileSync(path, JSON.stringify(this.entries, null, 2));
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
@@ -602,7 +829,8 @@ export class CodexManager {
 
 	private loadStats(): void {
 		try {
-			const path = getStatsPath();
+			const baseDir = this.options?.homeDir ?? homedir();
+			const path = getStatsPath(baseDir);
 			if (!existsSync(path)) return;
 
 			const raw = JSON.parse(readFileSync(path, "utf-8"));
@@ -624,8 +852,9 @@ export class CodexManager {
 
 	private saveStats(): void {
 		try {
-			const path = getStatsPath();
-			mkdirSync(resolve(homedir(), ".narrafork"), { recursive: true });
+			const baseDir = this.options?.homeDir ?? homedir();
+			const path = getStatsPath(baseDir);
+			mkdirSync(resolve(baseDir, ".narrafork"), { recursive: true });
 			const obj: Record<string, CredentialStats> = {};
 			for (const [id, stats] of this.stats) {
 				obj[id] = stats;

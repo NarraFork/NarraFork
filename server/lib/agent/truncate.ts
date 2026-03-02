@@ -73,7 +73,8 @@ export function truncateOutput(
 
 	const hint =
 		`The output was truncated. Full output saved to: ${outputPath}\n` +
-		"Use Read with offset/limit to view specific sections, or Grep to search the full content.";
+		"Use Read with offset/limit for paging, Read with force_full=true for full file retrieval, " +
+		"or use Grep to search the full content.";
 
 	const content = `${preview}\n\n...${omitted} ${unit} truncated...\n\n${hint}`;
 

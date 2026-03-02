@@ -81,12 +81,19 @@ export interface PermissionCallbacks {
 
 import type { ToolCallData } from "./ToolCallCard";
 
-export interface FlatToolItem {
-	tc: ToolCallData;
-	msg: NarratorMsg;
-	children: NarratorMsg[];
-	isSubagent: boolean;
-}
+export type FlatToolItem =
+	| {
+			kind: "tool";
+			tc: ToolCallData;
+			msg: NarratorMsg;
+			children: NarratorMsg[];
+			isSubagent: boolean;
+	  }
+	| {
+			kind: "reasoning";
+			msg: NarratorMsg;
+			reasoningText: string;
+	  };
 
 export interface NarratorPanelProps {
 	narratorId: string;

@@ -86,6 +86,7 @@ export const createNarratorSchema = z.object({
 	permissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"]).optional(),
 	cwd: z.string().min(1).max(4096).optional(),
 	planMode: z.boolean().optional(),
+	reasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
 });
 
 export const sendMessageSchema = z.object({

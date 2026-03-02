@@ -95,6 +95,30 @@ describe("Read", () => {
 		const result = await readTool.execute({ file_path: "nonexistent.txt" }, makeCtx());
 		expect(result.isError).toBe(true);
 	});
+
+	test("force_full bypasses loop truncation for large files", async () => {
+		const target = join(TEST_DIR, "read-force-full.txt");
+		const content = "0123456789".repeat(7000); // 70KB
+		writeFileSync(target, content);
+
+		const result = await readTool.execute(
+			{ file_path: "read-force-full.txt", force_full: true },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.truncated).toBe(true);
+		expect(result.output).toContain("0123456789");
+		expect(result.output).not.toContain("truncated");
+	});
+
+	test("returns error when mixing force_full with line paging", async () => {
+		const result = await readTool.execute(
+			{ file_path: "sample.txt", offset: 1, force_full: true },
+			makeCtx(),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("cannot be combined");
+	});
 });
 
 // ============================================================

@@ -138,6 +138,8 @@ export interface NarraForkSettings {
 		proxy?: string;
 		/** Load balancing mode: "priority" (use highest priority) or "balanced" (round-robin). */
 		loadBalancingMode?: "priority" | "balanced";
+		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
+		defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh";
 	};
 	/** Multiple OpenAI-compatible API providers. */
 	openaiProviders?: OpenAIProviderConfig[];
@@ -269,6 +271,17 @@ export function loadSettings(): NarraForkSettings {
 		if (migrated) needsSave = true;
 	}
 
+	// Normalize nullable codex.defaultReasoningEffort from legacy values
+	if (
+		(merged.codex as { defaultReasoningEffort?: string | null } | undefined)
+			?.defaultReasoningEffort === null
+	) {
+		if (merged.codex) {
+			delete (merged.codex as { defaultReasoningEffort?: string }).defaultReasoningEffort;
+		}
+		needsSave = true;
+	}
+
 	// Clean up legacy openai field from settings.json
 	if (mergedAny.openai !== undefined) {
 		delete mergedAny.openai;
@@ -331,6 +344,11 @@ const BUILTIN_CODEX_MODELS = [
 	"gpt-5.1-codex-max",
 	"gpt-5.1-codex-mini",
 ];
+
+/** Built-in Codex model IDs (without provider prefix). */
+export function getBuiltinCodexModels(): string[] {
+	return [...BUILTIN_CODEX_MODELS];
+}
 
 /** Registry for external model checkers and listers (avoids circular imports). */
 let openaiModelChecker: ((model: string) => boolean) | null = null;
@@ -466,10 +484,32 @@ export function resolveProvider(model?: string): string {
 // === Context Window Sizes ===
 
 /**
- * Built-in model context window sizes (tokens).
+ * Model context window configuration.
  * Reference: https://platform.openai.com/docs/models
+ * Codex models reference: internal/registry/model_definitions_static_data.go
  */
-const BUILTIN_CONTEXT_WINDOWS: Record<string, number> = {
+interface ModelContextConfig {
+	/**
+	 * Total context window size (input + output tokens).
+	 * This is the maximum total tokens the model can process in a single request.
+	 */
+	contextLength: number;
+	/**
+	 * Maximum output/completion tokens the model can generate in a single response.
+	 * This is typically smaller than contextLength to leave room for input tokens.
+	 * If not specified, defaults to contextLength (no separate output limit).
+	 *
+	 * Note: For Codex Responses API, max_completion_tokens parameter is not supported
+	 * and will be stripped from requests. This value is for reference/display only.
+	 */
+	maxCompletionTokens?: number;
+}
+
+/**
+ * Built-in model context window sizes (tokens).
+ * For models with only contextLength specified, maxCompletionTokens defaults to contextLength.
+ */
+const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	// OpenAI models
 	"gpt-4o": 128_000,
 	"gpt-4o-mini": 128_000,
@@ -479,6 +519,15 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number> = {
 	o1: 200_000,
 	"o1-mini": 128_000,
 	"o3-mini": 200_000,
+	// Codex models (ChatGPT Pro/Plus)
+	// NOTE: Requests may fail around ~270k in practice; keep a conservative headroom.
+	"gpt-5-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.1-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.1-codex-max": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.1-codex-mini": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.2-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.2": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.3-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
 	// Common third-party models (via OpenAI-compatible APIs)
 	"deepseek-chat": 64_000,
 	"deepseek-reasoner": 64_000,
@@ -515,18 +564,48 @@ export function getModelContextWindow(model: string, provider: string): number |
 	}
 
 	// 2. Check built-in table (exact match)
-	if (BUILTIN_CONTEXT_WINDOWS[bareModel]) {
-		return BUILTIN_CONTEXT_WINDOWS[bareModel];
+	const builtinConfig = BUILTIN_CONTEXT_WINDOWS[bareModel];
+	if (builtinConfig) {
+		return typeof builtinConfig === "number" ? builtinConfig : builtinConfig.contextLength;
 	}
 
 	// 3. Fuzzy match (handles -latest, -preview, date suffixes, etc.)
 	const normalizedBare = bareModel.toLowerCase();
-	for (const [pattern, window] of Object.entries(BUILTIN_CONTEXT_WINDOWS)) {
+	for (const [pattern, config] of Object.entries(BUILTIN_CONTEXT_WINDOWS)) {
 		if (normalizedBare.startsWith(pattern)) {
-			return window;
+			return typeof config === "number" ? config : config.contextLength;
 		}
 	}
 
 	// 4. Unknown model — return default 128k (conservative estimate)
 	return 128_000;
+}
+
+/**
+ * Get the maximum completion tokens for a model.
+ * Returns null if not specified (meaning no separate limit).
+ */
+export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {
+	const bareModel = parseModelId(model).model;
+
+	// Check built-in table (exact match first)
+	const builtinConfig = BUILTIN_CONTEXT_WINDOWS[bareModel];
+	if (builtinConfig !== undefined) {
+		// Exact match found
+		if (typeof builtinConfig === "object") {
+			return builtinConfig.maxCompletionTokens ?? null;
+		}
+		// Simple number config means no separate completion limit
+		return null;
+	}
+
+	// Fuzzy match (handles -latest, -preview, date suffixes, etc.)
+	const normalizedBare = bareModel.toLowerCase();
+	for (const [pattern, config] of Object.entries(BUILTIN_CONTEXT_WINDOWS)) {
+		if (normalizedBare.startsWith(pattern) && typeof config === "object") {
+			return config.maxCompletionTokens ?? null;
+		}
+	}
+
+	return null;
 }

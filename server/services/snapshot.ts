@@ -243,6 +243,12 @@ export const snapshot = {
 	async gc(chapterId: string): Promise<void> {
 		const dir = shadowDir(chapterId);
 		if (!existsSync(dir)) return;
+		// Check if it's a valid git repository before attempting GC
+		const headPath = resolve(dir, "HEAD");
+		if (!existsSync(headPath)) {
+			logger.warn("Skipping GC for invalid snapshot repo", { chapterId, dir });
+			return;
+		}
 		await execGit(["gc", "--prune=7.days"], dir, dir);
 	},
 

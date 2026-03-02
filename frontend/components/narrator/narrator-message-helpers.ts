@@ -15,7 +15,8 @@ export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 		msg.role === "assistant" &&
 		blocks.length > 0 &&
 		blocks.every(
-			(b: ContentBlock) => b.type === "tool_use" || (b.type === "text" && !b.text?.trim()),
+			(b: ContentBlock) =>
+				b.type === "tool_use" || b.type === "reasoning" || (b.type === "text" && !b.text?.trim()),
 		)
 	);
 }
@@ -109,11 +110,19 @@ export function filterChildrenByToolUse(
 export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
 	const items: FlatToolItem[] = [];
 	for (const msg of run) {
-		const tcs = resolveAllToolCallsFromMsg(msg);
-		for (const tc of tcs) {
+		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		for (const block of blocks) {
+			if (block.type === "reasoning" && typeof block.text === "string" && block.text.trim()) {
+				items.push({ kind: "reasoning", msg, reasoningText: block.text });
+				continue;
+			}
+			if (block.type !== "tool_use") continue;
+			const tcs = resolveAllToolCallsFromMsg(msg);
+			const tc = tcs.find((t) => t.toolUseId === block.id);
+			if (!tc) continue;
 			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
 			const isSubagent = tc.toolName === "Task" || children.length > 0;
-			items.push({ tc, msg, children, isSubagent });
+			items.push({ kind: "tool", tc, msg, children, isSubagent });
 		}
 	}
 	return items;

@@ -51,6 +51,7 @@ import {
 	interruptNarrator,
 	isNarratorActive,
 	resolvePermission,
+	retryLastMessage,
 	runCustomCompact,
 	sendMessage,
 	updateNarratorModel,
@@ -299,6 +300,23 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	return c.json(userMsg, 201);
 });
 
+// Retry last user message — re-run agent loop without creating a new message
+narratorRoutes.post("/:id/retry", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	const result = await retryLastMessage(id, locale, replyInUserLanguage);
+	return c.json(result);
+});
+
 // Get buffered message (for multi-device hydration on page load)
 narratorRoutes.get("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
@@ -496,7 +514,7 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (narrator.status === "done") {
+	if (narrator.status === "done" && !narrator.errorMessage) {
 		await narratorService.updateStatus(id, "idle");
 	}
 	return c.json({ ok: true });

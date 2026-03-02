@@ -14,7 +14,7 @@ export const bashTool: ToolDefinition = {
 	description:
 		"Execute a bash command. Use for git, npm, system commands. " +
 		"Commands run in the Current Working Directory by default — do NOT prepend `cd <cwd> &&` as it is redundant. " +
-		"Output exceeding 2000 lines or 50KB is truncated; full output is saved to a file for retrieval via Read/Grep. " +
+		"Output exceeding 2000 lines or 50KB is truncated; full output is saved to a file for retrieval via Read (offset/limit or force_full=true) or Grep. " +
 		"IMPORTANT: Prefer dedicated tools over Bash when possible — use Read instead of cat/head/tail, " +
 		"Write instead of echo/cat heredoc, Edit instead of sed/awk, Glob instead of find/ls, " +
 		"Grep instead of grep/rg. Only use Bash for operations that genuinely require shell execution. " +

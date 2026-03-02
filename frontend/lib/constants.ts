@@ -26,6 +26,7 @@ export const NARRATOR_STATUS_COLORS: Record<string, string> = {
 	done: "green",
 	archived: "dark",
 	error: "red",
+	interrupted: "orange",
 };
 
 export const CONTAINER_STATUS_COLORS: Record<string, string> = {

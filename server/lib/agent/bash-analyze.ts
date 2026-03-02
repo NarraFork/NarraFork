@@ -113,21 +113,9 @@ const SAFE_COMMANDS = new Set([
 	"printenv",
 	// JSON
 	"jq",
-	// 运行时 / 构建工具（危险参数由 CONDITIONAL_COMMANDS 检测）
-	"node",
-	"python",
-	"python3",
-	"go",
-	"cargo",
-	"bun",
-	"bunx",
-	"npm",
+	// 包执行器（仅允许严格白名单场景，具体由 CONDITIONAL_COMMANDS 进一步约束）
 	"npx",
-	"yarn",
-	"pnpm",
-	"pip",
-	"pip3",
-	"make",
+	"bunx",
 	// 文件操作（路径由 PATH_COMMANDS 提取，外部路径由 isInsideWorktree 拦截）
 	"cp",
 	"mv",
@@ -225,6 +213,19 @@ const ALWAYS_ASK_COMMANDS = new Set([
 	"ruby",
 	"lua",
 	"php",
+	// 运行时 / 构建/包管理工具（可直接或间接执行项目/远程代码）
+	"node",
+	"python",
+	"python3",
+	"go",
+	"cargo",
+	"bun",
+	"npm",
+	"yarn",
+	"pnpm",
+	"pip",
+	"pip3",
+	"make",
 	// source / dot（执行外部脚本）
 	"source",
 	".",
@@ -238,105 +239,105 @@ const ALWAYS_ASK_COMMANDS = new Set([
 ]);
 
 /**
- * npx/bunx 执行的已知安全包名。
- * 这些是常见的开发工具链命令，不会产生破坏性副作用。
+ * npx/bunx 可执行的受控白名单包。
+ * 注意：这里只是第一层筛选，仍需通过参数/来源校验。
  */
 const SAFE_PACKAGE_RUNNERS = new Set([
-	// 测试
-	"vitest",
-	"jest",
-	"mocha",
-	"playwright",
-	"cypress",
 	// 类型检查 / 编译
 	"tsc",
-	"tsup",
-	"tsx",
-	"ts-node",
-	"esbuild",
-	"swc",
+	"typescript",
 	// Lint / 格式化
-	"eslint",
-	"prettier",
 	"biome",
 	"@biomejs/biome",
-	"oxlint",
-	"stylelint",
-	// 构建工具
-	"vite",
-	"webpack",
-	"rollup",
-	"turbo",
-	"nx",
-	// 代码生成 / 脚手架
-	"prisma",
-	"drizzle-kit",
-	"typeorm",
-	"knex",
-	"create-react-app",
-	"create-next-app",
-	"create-vite",
-	// 文档
-	"typedoc",
-	"jsdoc",
-	// 工具
-	"depcheck",
-	"npm-check-updates",
-	"ncu",
-	"sort-package-json",
-	"license-checker",
-	"madge",
-	"size-limit",
-	// 包管理
-	"bun",
-	"pnpm",
-	"yarn",
+	"prettier",
+	"eslint",
+]);
+
+/** 允许通过 npx/bunx 的命令参数（仅只读/检查类）。 */
+const SAFE_PACKAGE_ARGS = new Set([
+	"check",
+	"--check",
+	"--noEmit",
+	"--write=false",
+	"--version",
+	"-v",
+]);
+
+/** 会触发远程拉包或动态来源的高风险参数。 */
+const PACKAGE_RUNNER_DANGEROUS_FLAGS = new Set([
+	"-p",
+	"--package",
+	"--registry",
+	"--userconfig",
+	"--ignore-existing",
 ]);
 
 /**
  * 对 npx/bunx 执行的命令进行递归分类。
- * 已知安全包 → null（放行），否则返回危险描述（拦截）。
+ * 严格模式：仅允许受控白名单包 + 只读参数 + 非远程来源。
  */
 function classifyPackageRunner(tokens: string[], runner: string): string | null {
-	// 跳过 flags（如 npx --yes, npx -p package）
 	let i = 1;
 	while (i < tokens.length && tokens[i].startsWith("-")) {
-		// --package / -p 后面跟包名，跳过
-		if (
-			tokens[i] === "--package" ||
-			tokens[i] === "-p" ||
-			tokens[i] === "--yes" ||
-			tokens[i] === "-y"
-		) {
-			i++;
-			// -p / --package 后面的值也要跳过
-			if ((tokens[i - 1] === "--package" || tokens[i - 1] === "-p") && i < tokens.length) i++;
-		} else {
-			i++;
+		const flag = tokens[i];
+		if (PACKAGE_RUNNER_DANGEROUS_FLAGS.has(flag)) {
+			return `${runner} ${flag} (dynamic package source not allowed)`;
 		}
+		// --package/-p 带参数（虽然上面已拦截，保留健壮性）
+		if (flag === "--package" || flag === "-p") {
+			i += 2;
+			continue;
+		}
+		i++;
 	}
 	const execCmd = tokens[i];
-	if (!execCmd) return null; // 纯 npx（无命令）— 不危险
-
-	// 已知安全包
-	if (SAFE_PACKAGE_RUNNERS.has(execCmd)) return null;
-
-	// 被执行的命令如果在系统级白名单中也放行
-	if (SAFE_COMMANDS.has(execCmd)) return null;
-
-	// 被执行的命令在 ALWAYS_ASK 中 — 危险
-	if (ALWAYS_ASK_COMMANDS.has(execCmd)) return `${runner} ${execCmd} (dangerous command)`;
-
-	// 被执行的命令在 CONDITIONAL_COMMANDS 中 — 递归检查参数
-	if (execCmd in CONDITIONAL_COMMANDS) {
-		const subTokens = tokens.slice(i);
-		const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
-		if (danger) return `${runner} → ${danger}`;
-		return null;
+	if (!execCmd) {
+		return `${runner} (no explicit command)`;
 	}
 
-	// 未知包 — 需要用户确认
-	return `${runner} ${execCmd} (unrecognized package)`;
+	// 禁止 URL / git / file 协议来源
+	if (
+		execCmd.includes("://") ||
+		execCmd.startsWith("git+") ||
+		execCmd.startsWith("file:") ||
+		execCmd.startsWith("http:") ||
+		execCmd.startsWith("https:")
+	) {
+		return `${runner} ${execCmd} (remote source not allowed)`;
+	}
+
+	// 禁止非固定版本（如 @latest, @next）
+	const unstableTagPattern = /@(latest|next|canary|beta|alpha|rc)$/i;
+	if (unstableTagPattern.test(execCmd)) {
+		return `${runner} ${execCmd} (unstable package tag not allowed)`;
+	}
+
+	// 提取包名（去除 @scope/pkg@version 里的版本部分）
+	const packageName = execCmd.startsWith("@")
+		? execCmd.split("@").slice(0, 2).join("@")
+		: execCmd.split("@")[0];
+
+	if (!SAFE_PACKAGE_RUNNERS.has(packageName)) {
+		return `${runner} ${execCmd} (package not in allowlist)`;
+	}
+
+	const cmdArgs = tokens.slice(i + 1);
+	for (const arg of cmdArgs) {
+		if (arg.startsWith("--config") || arg.startsWith("--plugin") || arg.startsWith("--require")) {
+			return `${runner} ${execCmd} ${arg} (dynamic code loading flag)`;
+		}
+		if (arg.startsWith("-")) {
+			if (!SAFE_PACKAGE_ARGS.has(arg)) {
+				return `${runner} ${execCmd} ${arg} (flag not in safe allowlist)`;
+			}
+			continue;
+		}
+		// 非 flag 参数（子命令/目标路径）只允许极少数只读词或当前目录
+		if (arg === "check" || arg === "version" || arg === ".") continue;
+		return `${runner} ${execCmd} ${arg} (argument not in safe allowlist)`;
+	}
+
+	return null;
 }
 
 /**

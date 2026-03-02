@@ -114,6 +114,7 @@ function SettingsPage() {
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [planTimeoutAction, setPlanTimeoutAction] = useState("deny");
+	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
@@ -161,6 +162,7 @@ function SettingsPage() {
 		proxyPort: 7780,
 		legacyEncoding: false,
 		planTimeoutAction: "deny",
+		codexDefaultReasoningEffort: "",
 	});
 
 	useEffect(() => {
@@ -187,6 +189,7 @@ function SettingsPage() {
 				proxyPort: settings.containers?.proxy?.port ?? 7780,
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				planTimeoutAction: settings.agent?.planTimeoutAction ?? "deny",
+				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 			};
 			serverSnapshot.current = snap;
 			setPort(snap.port);
@@ -212,6 +215,7 @@ function SettingsPage() {
 			setProxyPort(snap.proxyPort);
 			setLegacyEncoding(snap.legacyEncoding);
 			setPlanTimeoutAction(snap.planTimeoutAction);
+			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
 			setInitialized(true);
 		}
 	}, [settings, initialized]);
@@ -242,7 +246,8 @@ function SettingsPage() {
 			proxyEnabled !== s.proxyEnabled ||
 			proxyPort !== s.proxyPort ||
 			legacyEncoding !== s.legacyEncoding ||
-			planTimeoutAction !== s.planTimeoutAction
+			planTimeoutAction !== s.planTimeoutAction ||
+			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort
 		);
 	}, [
 		initialized,
@@ -269,6 +274,7 @@ function SettingsPage() {
 		proxyPort,
 		legacyEncoding,
 		planTimeoutAction,
+		codexDefaultReasoningEffort,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -323,6 +329,10 @@ function SettingsPage() {
 					},
 				},
 				editor: { type: editor },
+				codex: {
+					defaultReasoningEffort:
+						(codexDefaultReasoningEffort as "low" | "medium" | "high" | "xhigh") || null,
+				},
 			},
 			{
 				onSuccess: () => {
@@ -350,6 +360,7 @@ function SettingsPage() {
 						proxyPort,
 						legacyEncoding,
 						planTimeoutAction,
+						codexDefaultReasoningEffort,
 					};
 				},
 			},
@@ -484,6 +495,19 @@ function SettingsPage() {
 						]}
 						value={planTimeoutAction}
 						onChange={(v) => setPlanTimeoutAction(v ?? "deny")}
+					/>
+					<Select
+						label={t("codexDefaultReasoningEffort")}
+						description={t("codexDefaultReasoningEffortDesc")}
+						data={[
+							{ value: "auto", label: tn("reasoning_auto") },
+							{ value: "low", label: tn("reasoning_low") },
+							{ value: "medium", label: tn("reasoning_medium") },
+							{ value: "high", label: tn("reasoning_high") },
+							{ value: "xhigh", label: tn("reasoning_xhigh") },
+						]}
+						value={codexDefaultReasoningEffort || "auto"}
+						onChange={(v) => setCodexDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
 					/>
 					<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
 						{t("customModels")} →

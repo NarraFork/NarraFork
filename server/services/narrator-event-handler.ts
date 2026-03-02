@@ -25,6 +25,14 @@ import { recordOutputChunk } from "./output-stats";
  * - Main narrator: broadcastTargetId === narratorId, has sseEmitter
  * - Subagent: broadcastTargetId === parentNarratorId, has parentToolUseId/subagentModel
  */
+export interface TokenUsageSnapshot {
+	promptTokens?: number;
+	completionTokens?: number;
+	reasoningTokens?: number;
+	cachedInputTokens?: number;
+	contextWindow?: number;
+}
+
 export interface EventHandlerContext {
 	/** Narrator ID that owns the messages (subagent's own ID) */
 	narratorId: string;
@@ -40,9 +48,11 @@ export interface EventHandlerContext {
 	getMeterUsage: () => number | undefined;
 	getMeterUnit: () => string | undefined;
 	getPartialMessageId: () => string | undefined;
+	getTokenUsage: () => TokenUsageSnapshot | undefined;
 	setPartialMessageId: (id: string | undefined) => void;
 	setContextUsagePct: (pct: number) => void;
 	setMeterData: (usage: number, unit: string) => void;
+	setTokenUsage: (usage: TokenUsageSnapshot | undefined) => void;
 
 	// --- Subagent-specific ---
 	/** Parent tool_use ID that spawned this subagent */
@@ -174,6 +184,7 @@ export async function processEvent(
 
 			// Ensure a partial message exists for incremental persistence
 			if (!ctx.getPartialMessageId()) {
+				const tokenUsage = ctx.getTokenUsage();
 				const partial = await narratorService.createPartialAssistantMessage(narratorId, {
 					uuid: randomUUID(),
 					session_id: ctx.conversationId,
@@ -181,6 +192,24 @@ export async function processEvent(
 					contextPercent: ctx.getContextUsagePct(),
 					meterUsage: ctx.getMeterUsage(),
 					meterUnit: ctx.getMeterUnit(),
+					tokensIn: tokenUsage?.promptTokens,
+					turnUsage: tokenUsage
+						? {
+								input_tokens: tokenUsage.promptTokens,
+								...(tokenUsage.completionTokens != null && {
+									output_tokens: tokenUsage.completionTokens,
+								}),
+								...(tokenUsage.reasoningTokens != null && {
+									reasoning_tokens: tokenUsage.reasoningTokens,
+								}),
+								...(tokenUsage.cachedInputTokens != null && {
+									cached_input_tokens: tokenUsage.cachedInputTokens,
+								}),
+								...(tokenUsage.contextWindow != null && {
+									context_window: tokenUsage.contextWindow,
+								}),
+							}
+						: undefined,
 				});
 				ctx.setPartialMessageId(partial.id);
 			}
@@ -190,6 +219,11 @@ export async function processEvent(
 			if (block.type === "text") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "text",
+					text: block.text,
+				});
+			} else if (block.type === "reasoning") {
+				await narratorService.appendBlockToMessage(partialId, narratorId, {
+					type: "reasoning",
 					text: block.text,
 				});
 			} else if (block.type === "tool_use") {
@@ -204,19 +238,39 @@ export async function processEvent(
 		}
 
 		case "assistant_message": {
+			const tokenUsage = ctx.getTokenUsage();
+			const turnUsage = tokenUsage
+				? {
+						input_tokens: tokenUsage.promptTokens,
+						...(tokenUsage.completionTokens != null && {
+							output_tokens: tokenUsage.completionTokens,
+						}),
+						...(tokenUsage.reasoningTokens != null && {
+							reasoning_tokens: tokenUsage.reasoningTokens,
+						}),
+						...(tokenUsage.cachedInputTokens != null && {
+							cached_input_tokens: tokenUsage.cachedInputTokens,
+						}),
+						...(tokenUsage.contextWindow != null && {
+							context_window: tokenUsage.contextWindow,
+						}),
+					}
+				: undefined;
 			let savedId: string;
 			const partialId = ctx.getPartialMessageId();
 
 			if (partialId) {
 				// Partial message was already created incrementally via block_complete —
-				// just update the final messageUuid if the provider gave us one.
+				// just update final metadata (messageUuid + token usage).
 				savedId = partialId;
-				if (event.messageId) {
-					await db
-						.update(narratorMessages)
-						.set({ messageUuid: event.messageId })
-						.where(eq(narratorMessages.id, savedId));
-				}
+				await db
+					.update(narratorMessages)
+					.set({
+						...(event.messageId ? { messageUuid: event.messageId } : {}),
+						...(tokenUsage?.promptTokens != null ? { tokensIn: tokenUsage.promptTokens } : {}),
+						...(turnUsage ? { turnUsageJson: turnUsage } : {}),
+					})
+					.where(eq(narratorMessages.id, savedId));
 				ctx.setPartialMessageId(undefined);
 			} else {
 				// No partial message — fallback to full persistence
@@ -236,7 +290,18 @@ export async function processEvent(
 					uuid: event.messageId ?? randomUUID(),
 					session_id: ctx.conversationId,
 					parent_tool_use_id: ctx.parentToolUseId,
-					message: { content },
+					message: {
+						content,
+						usage:
+							tokenUsage?.promptTokens != null
+								? {
+										input_tokens: tokenUsage.promptTokens,
+										...(tokenUsage.completionTokens != null && {
+											output_tokens: tokenUsage.completionTokens,
+										}),
+									}
+								: undefined,
+					},
 					contextPercent: ctx.getContextUsagePct(),
 					meterUsage: ctx.getMeterUsage(),
 					meterUnit: ctx.getMeterUnit(),
@@ -401,17 +466,30 @@ export async function processEvent(
 
 		case "context_usage": {
 			ctx.setContextUsagePct(event.percentage);
+			ctx.setTokenUsage({
+				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+				...(event.completionTokens != null && { completionTokens: event.completionTokens }),
+				...(event.reasoningTokens != null && { reasoningTokens: event.reasoningTokens }),
+				...(event.cachedInputTokens != null && { cachedInputTokens: event.cachedInputTokens }),
+				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
+			});
 
 			const isSubagent = !!ctx.parentToolUseId;
 			broadcastToNarrator(broadcastTargetId, {
 				type: "context_usage",
 				narratorId: broadcastTargetId,
 				percentage: event.percentage,
+				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
 				...(isSubagent && { isSubagent: true }),
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "context_usage",
-				data: { percentage: event.percentage },
+				data: {
+					percentage: event.percentage,
+					...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+					...(event.contextWindow != null && { contextWindow: event.contextWindow }),
+				},
 			});
 
 			// Main narrator: prune + compact trigger

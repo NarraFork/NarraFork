@@ -360,14 +360,24 @@ export class OpenAIProvider implements ProviderAdapter {
 				}
 			}
 
-			body = { model, input: inputMessages, stream: true, store: false };
+			const sanitizedInputMessages = inputMessages.filter((msg) => {
+				if (msg.role !== "assistant") return true;
+				// Responses API rejects assistant role messages with null/empty content and no tool calls.
+				const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+				if (hasToolCalls) return true;
+				if (typeof msg.content === "string") return msg.content.length > 0;
+				if (Array.isArray(msg.content)) return msg.content.length > 0;
+				return false;
+			});
+
+			body = { model, input: sanitizedInputMessages, stream: true, store: false };
 			if (instructions) {
 				body.instructions = instructions;
 			}
 			if (tools.length > 0) body.tools = tools;
 
-			// Add reasoning configuration for Codex models
-			if (params.reasoningEffort) {
+			// Add reasoning configuration for Codex provider requests.
+			if (params.reasoningEffort && this.apiMode === "codex") {
 				body.reasoning = {
 					effort: params.reasoningEffort,
 					summary: "auto",
@@ -379,7 +389,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				model,
 				hasInstructions: !!instructions,
 				instructionsLength: instructions.length,
-				inputMessageCount: inputMessages.length,
+				inputMessageCount: sanitizedInputMessages.length,
 				toolCount: tools.length,
 				reasoningEffort: params.reasoningEffort,
 			});
@@ -1395,9 +1405,17 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 						},
 					})) ?? [];
 
+			const hasText = text.length > 0;
+			if (!hasText && toolCalls.length === 0) {
+				// Skip empty assistant stubs (can happen after interrupted streaming).
+				// Keeping them would become `content: null` in Responses API input and
+				// trigger validation errors.
+				continue;
+			}
+
 			// OpenAI requires assistant messages to have content (string|null) or tool_calls.
 			// Always set content explicitly to avoid sending {role:"assistant"} with no fields.
-			const assistantMsg: OAIMessage = { role: "assistant", content: text || null };
+			const assistantMsg: OAIMessage = { role: "assistant", content: hasText ? text : null };
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
 			history.push(assistantMsg);
 
@@ -1491,10 +1509,20 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 				} as unknown as OAIMessage);
 			}
 		} else if (m.role === "assistant") {
-			// Assistant message without tool calls — convert content to array format
-			const content =
-				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
-			result.push({ role: "assistant", content } as unknown as OAIMessage);
+			// Assistant message without tool calls — convert content to array format.
+			// Skip null/empty content because Responses API rejects role messages
+			// whose content is null.
+			if (typeof m.content === "string") {
+				if (!m.content) continue;
+				result.push({
+					role: "assistant",
+					content: [{ type: "output_text", text: m.content }],
+				} as unknown as OAIMessage);
+				continue;
+			}
+			if (Array.isArray(m.content) && m.content.length > 0) {
+				result.push({ role: "assistant", content: m.content } as unknown as OAIMessage);
+			}
 		} else if (m.type === "function_call_output" || m.type === "function_call") {
 			// Already in Responses API format — pass through
 			result.push(msg);

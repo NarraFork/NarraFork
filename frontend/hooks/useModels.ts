@@ -3,16 +3,6 @@ import { useMemo } from "react";
 import { api } from "../lib/api";
 import { groupModelsByProvider, type ModelOption, mergeModels, modelValue } from "../lib/constants";
 
-// Hardcoded Codex models (no API to fetch them)
-const BUILTIN_CODEX_MODELS = [
-	"gpt-5.3-codex",
-	"gpt-5.2-codex",
-	"gpt-5.2",
-	"gpt-5.1-codex",
-	"gpt-5.1-codex-max",
-	"gpt-5.1-codex-mini",
-];
-
 export interface ProviderModels {
 	prefix: string;
 	name: string;
@@ -133,12 +123,16 @@ export function useAllModels() {
 			}),
 		);
 
-		// --- Codex models (hardcoded) ---
-		const codexModels: ModelOption[] = BUILTIN_CODEX_MODELS.map((id) => ({
-			value: modelValue("codex", id),
-			label: id,
-			provider: "codex",
-		}));
+		// --- Codex models (from backend hardcoded list) ---
+		// Only include codex models when codex credentials are available
+		const codexModelIds: string[] = settingsData?.codexModels ?? [];
+		const codexModels: ModelOption[] = settingsData?.codexAvailable
+			? codexModelIds.map((id) => ({
+					value: modelValue("codex", id),
+					label: id,
+					provider: "codex",
+				}))
+			: [];
 
 		// --- Merge & filter ---
 		const allModels = mergeModels(

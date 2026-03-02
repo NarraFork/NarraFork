@@ -32,6 +32,7 @@ import type { PendingPermission } from "./ToolCallCard";
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
+	narratorErrorMessage?: string | null;
 	messagesData?: { pages: MessagesPage[] };
 	messagesQueryKey: unknown[];
 	/** Ref to isAtBottom state for unread tracking */
@@ -59,6 +60,7 @@ export interface UseNarratorPanelWSReturn {
 	) => void;
 	// Streaming
 	streamingRef: React.RefObject<string>;
+	streamingReasoningRef: React.RefObject<string>;
 	streamingVersion: number;
 	// Permissions
 	pendingPermsMap: Map<string, PendingPermission>;
@@ -91,6 +93,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const {
 		narratorId,
 		narratorStatus,
+		narratorErrorMessage,
 		messagesData,
 		messagesQueryKey,
 		isAtBottomRef,
@@ -104,6 +107,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Streaming state ---
 	const streamingRef = useRef("");
+	const streamingReasoningRef = useRef("");
 	const [streamingVersion, setStreamingVersion] = useState(0);
 
 	// RAF-based throttle: coalesce rapid streaming updates into one render per frame
@@ -159,6 +163,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		}
 	}, []);
 
+	// Helper: once any leading text/reasoning appears, streaming tool chunks should
+	// render after StreamingBubble (not merged into the main message list above it).
+	const markStreamingChunkNoMerge = useCallback(() => {
+		qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+			if (!old?.pages?.length) return old;
+			const pages = [...old.pages];
+			const firstPage = { ...pages[0] };
+			const idx = firstPage.messages.findIndex(
+				(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
+			);
+			if (idx === -1) return old;
+			const current = firstPage.messages[idx];
+			if (current?._noMerge) return old;
+			const updated = [...firstPage.messages];
+			updated[idx] = { ...current, _noMerge: true };
+			firstPage.messages = updated;
+			pages[0] = firstPage;
+			return { ...old, pages };
+		});
+	}, [qc, messagesQueryKey]);
+
 	// --- Permission state ---
 	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
 		() => new Map(),
@@ -212,9 +237,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		const msgs = firstPage?.messages;
 		if (!msgs?.length) return;
 		for (let i = msgs.length - 1; i >= 0; i--) {
-			const cp = (msgs[i] as unknown as Record<string, unknown>).contextPercent;
+			const m = msgs[i] as unknown as Record<string, unknown>;
+			const cp = m.contextPercent;
 			if (cp != null) {
 				setContextPercent(cp as number);
+				// Restore promptTokens / contextWindow from turnUsageJson
+				const tu = m.turnUsageJson as Record<string, number> | null | undefined;
+				if (tu) {
+					if (tu.input_tokens != null) setPromptTokens(tu.input_tokens);
+					if (tu.context_window != null) setContextWindow(tu.context_window);
+				} else if (m.tokensIn != null) {
+					setPromptTokens(m.tokensIn as number);
+				}
 				break;
 			}
 		}
@@ -426,14 +460,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onStreamEvent: (wsData: Record<string, unknown>) => {
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const ev = wsData.event as Record<string, any> | undefined;
-				if (
-					ev?.type === "content_block_delta" &&
-					ev.delta?.type === "text_delta" &&
-					ev.delta.text &&
-					!ev.subagentToolUseId
-				) {
+				if (ev?.type !== "content_block_delta" || !ev.delta?.text || ev.subagentToolUseId) {
+					return;
+				}
+				if (ev.delta.type === "text_delta") {
 					streamingRef.current += ev.delta.text;
 					flushStreamingVersion();
+					markStreamingChunkNoMerge();
+					return;
+				}
+				if (ev.delta.type === "reasoning_delta") {
+					streamingReasoningRef.current += ev.delta.text;
+					flushStreamingVersion();
+					markStreamingChunkNoMerge();
+					return;
 				}
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
@@ -451,8 +491,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				if (wsData.message?.id && wsData.message?.createdAt) {
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
-					if (wsData.message?.role === "assistant" && streamingRef.current) {
-						streamingRef.current = "";
+					if (wsData.message?.role === "assistant") {
+						if (streamingRef.current) {
+							streamingRef.current = "";
+						}
+						if (streamingReasoningRef.current) {
+							streamingReasoningRef.current = "";
+						}
 						clearStreamingState();
 					}
 					if (wsData.message?.role === "assistant") {
@@ -682,7 +727,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 									},
 								);
 
-								const hasLeadingText = !!streamingRef.current;
+								const hasLeadingContent = !!streamingRef.current || !!streamingReasoningRef.current;
 								const syntheticMsg: NarratorMsg = {
 									id: STREAMING_CHUNKS_MSG_ID,
 									narratorId,
@@ -693,7 +738,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 									toolCalls: toolCalls,
 									createdAt: existing?.createdAt ?? new Date().toISOString(),
 									children: [],
-									_noMerge: hasLeadingText,
+									_noMerge: hasLeadingContent,
 								};
 								if (existingIdx !== -1) {
 									firstPage.messages = [...firstPage.messages];
@@ -746,8 +791,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status) => {
 				setIsCompacting(false);
-				if (status === "idle" && streamingRef.current) {
-					streamingRef.current = "";
+				if (status === "idle") {
+					if (streamingRef.current) {
+						streamingRef.current = "";
+					}
+					if (streamingReasoningRef.current) {
+						streamingReasoningRef.current = "";
+					}
 					clearStreamingState();
 				}
 				if (status === "idle") {
@@ -815,8 +865,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				if (streamingRef.current) {
 					streamingRef.current = "";
-					clearStreamingState();
 				}
+				if (streamingReasoningRef.current) {
+					streamingReasoningRef.current = "";
+				}
+				clearStreamingState();
 				notifications.show({
 					title: t("narratorError"),
 					message: error,
@@ -876,8 +929,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				if (streamingRef.current) {
 					streamingRef.current = "";
-					clearStreamingState();
 				}
+				if (streamingReasoningRef.current) {
+					streamingReasoningRef.current = "";
+				}
+				clearStreamingState();
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
 		},
@@ -959,7 +1015,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Mark "done" narrator as read ---
 	useEffect(() => {
-		if (narratorStatus === "done") {
+		// Preserve error sessions: do not auto-clear done->idle when an error exists.
+		if (narratorStatus === "done" && !narratorErrorMessage) {
 			// Optimistically update cache so the UI reflects "idle" immediately,
 			// even if the WS event arrives late or is missed entirely.
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -967,7 +1024,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			);
 			api.markNarratorRead(narratorId).catch(() => {});
 		}
-	}, [narratorId, narratorStatus, qc]);
+	}, [narratorId, narratorStatus, narratorErrorMessage, qc]);
 
 	// --- Derive isCompacting from persisted messages ---
 	useEffect(() => {
@@ -993,6 +1050,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		cancelBuffer,
 		sendPermissionDecision,
 		streamingRef,
+		streamingReasoningRef,
 		streamingVersion,
 		pendingPermsMap,
 		pendingPermission,

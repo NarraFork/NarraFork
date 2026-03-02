@@ -32,6 +32,14 @@ const RETRYABLE_PATTERNS = [
 	"try again",
 ];
 
+const NON_RETRYABLE_PATTERNS = [
+	"usage_limit_reached",
+	"usage limit has been reached",
+	"insufficient_quota",
+	"quota exceeded",
+	'"plan_type":"free"',
+];
+
 /** HTTP status codes that indicate transient server-side issues. */
 const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
 
@@ -46,11 +54,14 @@ function isRetryableError(err: unknown): boolean {
 	) {
 		return true;
 	}
+	// Check error message patterns first: some 429s are hard quota and should NOT retry.
+	const msg = (obj.message ?? obj.error ?? "").toString().toLowerCase();
+	if (NON_RETRYABLE_PATTERNS.some((p) => msg.includes(p))) {
+		return false;
+	}
 	// Check HTTP status codes
 	if (typeof obj.status === "number" && RETRYABLE_STATUS_CODES.has(obj.status)) return true;
 	if (typeof obj.statusCode === "number" && RETRYABLE_STATUS_CODES.has(obj.statusCode)) return true;
-	// Check error message patterns
-	const msg = (obj.message ?? obj.error ?? "").toString().toLowerCase();
 	return RETRYABLE_PATTERNS.some((p) => msg.includes(p));
 }
 
@@ -141,6 +152,7 @@ export async function* agentLoop(
 
 		// Call provider and collect the response
 		let assistantText = "";
+		let assistantReasoning = "";
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
@@ -175,6 +187,7 @@ export async function* agentLoop(
 				tools,
 				toolResults: pendingToolResults,
 				signal: config.signal,
+				stickySessionKey: config.narratorId,
 				reasoningEffort: config.reasoningEffort,
 				...(isFirstTurn && images?.length ? { images } : {}),
 			});
@@ -356,6 +369,7 @@ export async function* agentLoop(
 				if (parsed.messageId) messageId = parsed.messageId;
 				if (parsed.credentialId) credentialId = parsed.credentialId;
 				if (parsed.reasoning) {
+					assistantReasoning += parsed.reasoning;
 					yield { type: "stream_reasoning", text: parsed.reasoning };
 				}
 				if (parsed.contextUsagePercentage != null) {
@@ -395,7 +409,10 @@ export async function* agentLoop(
 				}
 			}
 		} catch (err) {
-			// Even on error, yield block_complete for accumulated text so it can be persisted
+			// Even on error, yield block_complete for accumulated content so it can be persisted
+			if (assistantReasoning) {
+				yield { type: "block_complete", block: { type: "reasoning", text: assistantReasoning } };
+			}
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
 			}
@@ -431,7 +448,10 @@ export async function* agentLoop(
 			const orphanedNames = [...toolUseAccum.values()].map((a) => a.name).join(", ");
 			toolUseAccum.clear();
 
-			// Yield text block if any was accumulated before the truncation
+			// Yield accumulated content before truncation
+			if (assistantReasoning) {
+				yield { type: "block_complete", block: { type: "reasoning", text: assistantReasoning } };
+			}
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
 			}
@@ -490,7 +510,10 @@ export async function* agentLoop(
 		}
 
 		if (!hasOrphanedToolUses) {
-			// Yield block_complete for the text portion (if any) now that streaming is done
+			// Yield block_complete for accumulated content now that streaming is done
+			if (assistantReasoning) {
+				yield { type: "block_complete", block: { type: "reasoning", text: assistantReasoning } };
+			}
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
 			}
