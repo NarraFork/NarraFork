@@ -1866,14 +1866,21 @@ export const narratorService = {
 		errorMessage?: string,
 	) {
 		const now = new Date().toISOString();
+		// Keep error message only when status is explicitly "error".
+		// Any non-error status transition clears stale error text.
+		const normalizedErrorMessage = status === "error" ? (errorMessage ?? null) : null;
 		await db
 			.update(narrators)
-			.set({ status, errorMessage, updatedAt: now })
+			.set({ status, errorMessage: normalizedErrorMessage, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 
 		eventBus.emit(
 			status === "error"
-				? { type: "narrator:error", narratorId, error: errorMessage ?? "Unknown error" }
+				? {
+						type: "narrator:error",
+						narratorId,
+						error: normalizedErrorMessage ?? "Unknown error",
+				  }
 				: { type: "narrator:status_changed", narratorId, status },
 		);
 	},

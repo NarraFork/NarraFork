@@ -492,6 +492,7 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 });
 
 // Mark narrator as read (done → idle)
+// Error sessions are preserved because only status=done can transition.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
