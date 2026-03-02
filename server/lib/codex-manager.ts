@@ -138,8 +138,9 @@ export class CodexManager {
 	private pendingDeviceFlow: PendingDeviceFlow | undefined;
 	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
 	private sessionAffinity = new Map<string, SessionAffinityEntry>();
+	private readonly beforeExitHandler: () => void;
 
-	constructor(private readonly options?: { homeDir?: string }) {
+	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
 		this.stats = new Map();
 		this.currentId = "";
@@ -148,10 +149,16 @@ export class CodexManager {
 		this.loadCredentials();
 		this.loadStats();
 
-		// Flush on exit
-		process.on("beforeExit", () => {
+		this.beforeExitHandler = () => {
 			this.saveStats();
-		});
+		};
+		if (this.options?.registerProcessHooks ?? true) {
+			process.on("beforeExit", this.beforeExitHandler);
+		}
+	}
+
+	dispose(): void {
+		process.off("beforeExit", this.beforeExitHandler);
 	}
 
 	// ==================== Credential Selection ====================
