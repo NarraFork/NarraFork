@@ -4,6 +4,11 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
+interface MergeCheckResult {
+	hasConflicts: boolean;
+	conflictFiles: string[];
+}
+
 interface ChapterMergeModalProps {
 	chapterId: string;
 	projectId: string;
@@ -20,7 +25,7 @@ export function ChapterMergeModal({
 	const [targetId, setTargetId] = useState<string | null>(null);
 	const [strategy, setStrategy] = useState<string>("merge");
 	const [message, setMessage] = useState("");
-	const [conflicts, setConflicts] = useState<Record<string, unknown> | null>(null);
+	const [conflicts, setConflicts] = useState<MergeCheckResult | null>(null);
 	const qc = useQueryClient();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
@@ -49,7 +54,8 @@ export function ChapterMergeModal({
 		.map((ch) => ({ value: ch.id, label: ch.title }));
 
 	const checkConflicts = useMutation({
-		mutationFn: () => api.checkMergeConflicts(chapterId, targetId ?? ""),
+		mutationFn: () =>
+			api.checkMergeConflicts(chapterId, targetId ?? "") as Promise<MergeCheckResult>,
 		onSuccess: (data) => setConflicts(data),
 	});
 

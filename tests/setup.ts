@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS projects (
 	startup_script TEXT,
 	copy_files TEXT,
 	chapter_settings TEXT,
+	proxy_domain TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
@@ -73,6 +74,15 @@ CREATE TABLE IF NOT EXISTS chapters (
 	last_accessed_at TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chapter_edges (
+	id TEXT PRIMARY KEY,
+	project_id TEXT NOT NULL REFERENCES projects(id),
+	source_id TEXT NOT NULL REFERENCES chapters(id),
+	target_id TEXT NOT NULL REFERENCES chapters(id),
+	type TEXT NOT NULL,
+	metadata TEXT,
+	created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS narrators (
 	id TEXT PRIMARY KEY,

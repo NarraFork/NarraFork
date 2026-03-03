@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { getCodexManager, migrateLegacyCodexOAuth } from "../codex-manager";
 
 export interface ModelOption {
 	value: string;
@@ -465,20 +465,90 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 	return config.prefix;
 }
 
+function hasConfiguredOpenaiProvider(): boolean {
+	const providers = settings.openaiProviders ?? [];
+	return providers.some((p) => !!p.apiKey);
+}
+
+function hasConfiguredAnthropicProvider(): boolean {
+	const providers = settings.anthropicProviders ?? [];
+	return providers.some((p) => !!p.apiKey);
+}
+
+}
+
+function hasConfiguredCodexProvider(): boolean {
+	if (!settings.codex) return false;
+	try {
+		return getCodexManager().availableCount > 0;
+	} catch {
+		return false;
+	}
+}
+
+function getConfiguredProviderCandidates(): string[] {
+	const available = new Set<string>();
+	if (hasConfiguredOpenaiProvider()) {
+		for (const p of settings.openaiProviders ?? []) {
+			if (p.apiKey) available.add(p.prefix || "openai");
+		}
+	}
+	if (hasConfiguredAnthropicProvider()) {
+		for (const p of settings.anthropicProviders ?? []) {
+			if (p.apiKey) available.add(p.prefix || "anthropic");
+		}
+	}
+	if (hasConfiguredCodexProvider()) {
+		available.add("codex");
+	}
+	}
+	const result: string[] = [];
+
+	const preferredOpenai = (settings.openaiProviders ?? []).find((p) => p.apiKey)?.prefix;
+	if (preferredOpenai && available.has(preferredOpenai)) {
+		result.push(preferredOpenai);
+	}
+
+	const preferredAnthropic = (settings.anthropicProviders ?? []).find((p) => p.apiKey)?.prefix;
+	if (preferredAnthropic && available.has(preferredAnthropic)) {
+		result.push(preferredAnthropic);
+	}
+
+	if (available.has("codex")) {
+		result.push("codex");
+	}
+
+	}
+
+	for (const provider of available) {
+		if (!result.includes(provider)) result.push(provider);
+	}
+	return result;
+}
+
 /** Resolve provider name for a given model (supports "provider:model" prefix). */
 export function resolveProvider(model?: string): string {
 	const { provider: explicit, model: bare } = parseModelId(model);
 	if (explicit) return explicit;
-	if (BUILTIN_CODEX_MODELS.includes(bare)) return "codex";
-	const custom = settings.agent.customModels ?? [];
-	const found = custom.find((m) => m.value === bare || m.value === model);
-	if (found?.provider) return found.provider;
-	if (anthropicModelChecker?.(bare)) return "anthropic";
-	if (codexModelChecker?.(bare)) return "codex";
-	if (openaiModelChecker?.(bare)) return "openai";
-	// If the model is unknown but any OpenAI provider is configured, assume it's an OpenAI model.
-	const providers = settings.openaiProviders ?? [];
-	if (providers.some((p) => p.apiKey)) return providers[0]?.prefix ?? "openai";
+
+	if (bare) {
+		if (BUILTIN_CODEX_MODELS.includes(bare)) return "codex";
+
+		const custom = settings.agent.customModels ?? [];
+		const found = custom.find((m) => m.value === bare || m.value === model);
+		if (found?.provider) return found.provider;
+
+		if (openaiModelChecker?.(bare)) return "openai";
+		if (anthropicModelChecker?.(bare)) return "anthropic";
+		if (codexModelChecker?.(bare)) return "codex";
+	}
+
+	const configured = getConfiguredProviderCandidates();
+	if (configured.length > 0) {
+		return configured[0];
+	}
+
+	// Preserve legacy fallback when no provider can be inferred.
 }
 
 // === Context Window Sizes ===

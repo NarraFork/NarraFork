@@ -811,7 +811,7 @@ export const narratorService = {
 		// (nested subagent tool calls within this subagent).
 		if (isSubagent) {
 			for (const msg of topMessages) {
-				(msg as any).parentToolUseId = null;
+				msg.parentToolUseId = null;
 			}
 		}
 
@@ -908,13 +908,11 @@ export const narratorService = {
 
 		// Separate top-level vs child messages.
 		// For subagent narrators, treat all messages as top-level (clear parentToolUseId).
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const topMsgs: any[] = [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const childMsgs: any[] = [];
+		const topMsgs = [] as typeof allMessages;
+		const childMsgs = [] as typeof allMessages;
 		for (const msg of allMessages) {
 			if (isSubagent) {
-				(msg as any).parentToolUseId = null;
+				msg.parentToolUseId = null;
 				topMsgs.push(msg);
 			} else if (msg.parentToolUseId) {
 				childMsgs.push(msg);
@@ -963,18 +961,17 @@ export const narratorService = {
 		// in the client's cache). Skip children of completed subagents — those
 		// are already embedded in the parent's tree when the client loads messages.
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const candidateOrphans: any[] = [];
+		const candidateOrphans = [] as typeof childMsgs;
 		const orphanToolUseIds: string[] = [];
 		for (const child of childMsgs) {
+			if (!child.parentToolUseId) continue;
 			if (!newTopToolUseIdSet.has(child.parentToolUseId)) {
 				candidateOrphans.push(child);
 				orphanToolUseIds.push(child.parentToolUseId);
 			}
 		}
 
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		let orphanChildren: any[] = [];
+		let orphanChildren = [] as Array<(typeof childMsgs)[number] & { children: never[] }>;
 		if (candidateOrphans.length > 0) {
 			// Check which parent tool calls are truly finished (success/fail).
 			// The status column is NOT NULL with default "initializing", so
@@ -990,7 +987,7 @@ export const narratorService = {
 			});
 			const completedSet = new Set(completedTcs.map((tc) => tc.toolUseId));
 			orphanChildren = candidateOrphans
-				.filter((c) => !completedSet.has(c.parentToolUseId))
+				.filter((c) => c.parentToolUseId && !completedSet.has(c.parentToolUseId))
 				.map((c) => ({ ...c, children: [] }));
 		}
 
@@ -1098,7 +1095,7 @@ export const narratorService = {
 		// treats them as top-level messages
 		if (isSubagent) {
 			for (const msg of topMessages) {
-				(msg as any).parentToolUseId = null;
+				msg.parentToolUseId = null;
 			}
 		}
 
@@ -1766,8 +1763,10 @@ export const narratorService = {
 	async appendBlockToMessage(
 		messageId: string,
 		narratorId: string,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		block: any,
+		block:
+			| { type: "text"; text: string }
+			| { type: "reasoning"; text: string }
+			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),
@@ -1778,9 +1777,15 @@ export const narratorService = {
 		// Keep a stable canonical order for assistant blocks regardless of stream arrival order:
 		// reasoning → text/other non-tool blocks → tool_use.
 		// This avoids cases where streaming tool_use blocks are persisted before reasoning/text.
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const current = ((existing.contentJson as any[]) ?? []) as any[];
-		let content: any[];
+		type StoredAssistantBlock =
+			| { type: "text"; text: string }
+			| { type: "reasoning"; text: string }
+			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+			| { type: string; text?: unknown; [key: string]: unknown };
+		const current = (
+			Array.isArray(existing.contentJson) ? existing.contentJson : []
+		) as StoredAssistantBlock[];
+		let content: StoredAssistantBlock[];
 		if (block.type === "reasoning") {
 			const idx = current.findIndex((b) => b.type !== "reasoning");
 			content =
@@ -1793,10 +1798,7 @@ export const narratorService = {
 			content = [...current, block];
 		}
 		const contentText = content
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.filter((b: any) => b.type === "text")
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.map((b: any) => b.text)
+			.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
 			.join("\n");
 
 		await db
@@ -1923,7 +1925,7 @@ export const narratorService = {
 						type: "narrator:error",
 						narratorId,
 						error: normalizedErrorMessage ?? "Unknown error",
-				  }
+					}
 				: { type: "narrator:status_changed", narratorId, status },
 		);
 	},
@@ -2216,6 +2218,7 @@ export const narratorService = {
 	 *
 	 * Uses a quadratic ramp: `pruneRatio = t²` where `t = (pct - 90) / 5`.
 	 * At minimum, one message is always pruned once the threshold is reached.
+	 * A single prune pass is capped at 50% of the currently remaining prunable range.
 	 * The boundary never exceeds the compact-keep position (the message returned
 	 * by `getCompactBoundaryMessage`), so compact always has something to work with.
 	 *
@@ -2270,8 +2273,13 @@ export const narratorService = {
 		}
 
 		// Apply ratio to remaining messages — more aggressive as context grows,
-		// and each call prunes further into what's left
-		const additionalPrune = Math.max(1, Math.floor(pruneRatio * remaining));
+		// and each call prunes further into what's left.
+		// Safety cap: a single prune pass cannot remove more than 50% of what's remaining.
+		const maxPruneThisPass = Math.max(1, Math.floor(remaining * 0.5));
+		const additionalPrune = Math.min(
+			maxPruneThisPass,
+			Math.max(1, Math.floor(pruneRatio * remaining)),
+		);
 		const newBoundaryIdx = alreadyPruned + additionalPrune - 1;
 
 		const boundaryMessageId = prunableRefs[newBoundaryIdx].messageId;

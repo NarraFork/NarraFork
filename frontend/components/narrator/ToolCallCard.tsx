@@ -1331,7 +1331,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				>
 					<Box ref={isPlan ? cardRef : undefined}>
 						<Box p="xs">{cardContent}</Box>
-						{!isLast && <Divider />}
+						{!isLast && <Divider color="var(--mantine-color-default-border)" size={1} />}
 					</Box>
 				</Box>
 				{swipeMenu}
@@ -1345,8 +1345,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 			<Box ref={swipe.swipeBoxRef} onContextMenu={swipe.handleContextMenu} style={swipe.swipeStyle}>
 				<Paper
 					ref={isPlan ? cardRef : undefined}
-					withBorder
-					radius="sm"
+					withBorder={!inRun}
+					radius={inRun ? 0 : "sm"}
 					p="xs"
 					style={borderColor ? { borderColor } : undefined}
 				>

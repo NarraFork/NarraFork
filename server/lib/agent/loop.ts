@@ -1,7 +1,7 @@
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { getModelContextWindow, settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
-import { getProvider } from "./provider";
+import { resolveProviderAndModel } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type {
@@ -40,8 +40,57 @@ const NON_RETRYABLE_PATTERNS = [
 	'"plan_type":"free"',
 ];
 
+/** Patterns that indicate the request exceeded model input context. */
+const CONTEXT_OVERFLOW_PATTERNS = [
+	"exceeds the context window",
+	"context window",
+	"context length",
+	"maximum context length",
+	"context_length_exceeded",
+	"input is too long",
+	"prompt is too long",
+	"too many tokens",
+];
+
 /** HTTP status codes that indicate transient server-side issues. */
 const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
+
+function isContextOverflowReason(reason: string): boolean {
+	const r = reason.toLowerCase();
+	return (
+		r.includes("context_length") ||
+		r.includes("context_window") ||
+		r === "input_too_long" ||
+		r === "prompt_too_long" ||
+		r === "context_overflow"
+	);
+}
+
+function isContextOverflowMessage(message: string): boolean {
+	const m = message.toLowerCase();
+	return CONTEXT_OVERFLOW_PATTERNS.some((p) => m.includes(p));
+}
+
+function isContextWindowExceededError(err: unknown): boolean {
+	if (!err || typeof err !== "object") return false;
+	const obj = err as Record<string, unknown>;
+
+	if (typeof obj.code === "string" && isContextOverflowReason(obj.code)) return true;
+	if (typeof obj.reason === "string" && isContextOverflowReason(obj.reason)) return true;
+
+	if (typeof obj.message === "string" && isContextOverflowMessage(obj.message)) return true;
+	if (typeof obj.error === "string" && isContextOverflowMessage(obj.error)) return true;
+
+	const nested = obj.error;
+	if (nested && typeof nested === "object") {
+		const n = nested as Record<string, unknown>;
+		if (typeof n.code === "string" && isContextOverflowReason(n.code)) return true;
+		if (typeof n.type === "string" && isContextOverflowReason(n.type)) return true;
+		if (typeof n.message === "string" && isContextOverflowMessage(n.message)) return true;
+	}
+
+	return false;
+}
 
 function isRetryableError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;
@@ -82,7 +131,10 @@ export async function* agentLoop(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
-	const provider = getProvider(config.provider);
+	const resolvedProvider = resolveProviderAndModel(config.model);
+	const provider = resolvedProvider.adapter;
+	const effectiveModel = resolvedProvider.model;
+	const effectiveProvider = resolvedProvider.provider;
 	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
 	const locale = (config.locale as Locale) ?? "en";
 	let allTools: ResolvedToolDefinition[] = toolRegistry
@@ -120,7 +172,7 @@ export async function* agentLoop(
 
 	// Inject system prompt via provider-specific mechanism
 	if (config.systemPrompt) {
-		provider.injectSystemPrompt(history, config.systemPrompt, config.model, config.locale);
+		provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 	}
 
 	// Extra content to prepend to the next turn's user message (e.g. broken-tool reminder).
@@ -141,7 +193,7 @@ export async function* agentLoop(
 			if (replacement) {
 				history = replacement.history;
 				if (config.systemPrompt) {
-					provider.injectSystemPrompt(history, config.systemPrompt, config.model, config.locale);
+					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 				}
 				pendingToolResults = replacement.pendingToolResults;
 			}
@@ -181,7 +233,7 @@ export async function* agentLoop(
 			const stream = provider.chat({
 				conversationId: config.conversationId,
 				content,
-				model: config.model,
+				model: effectiveModel,
 				cwd: config.cwd,
 				history,
 				tools,
@@ -386,7 +438,7 @@ export async function* agentLoop(
 				}
 				// Convert OpenAI usage to context_usage percentage
 				if (parsed.usage) {
-					const contextWindow = getModelContextWindow(config.model, config.provider);
+					const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (contextWindow) {
 						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
 						yield {
@@ -401,10 +453,16 @@ export async function* agentLoop(
 					}
 				}
 				if (parsed.invalidState) {
+					const reason = String(parsed.invalidState.reason ?? "api_error");
+					const message = String(parsed.invalidState.message ?? "Unknown provider error");
+					if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
+						yield { type: "context_length_exceeded", message };
+						return;
+					}
 					yield {
 						type: "invalid_state",
-						reason: parsed.invalidState.reason,
-						message: parsed.invalidState.message,
+						reason,
+						message,
 					};
 				}
 			}
@@ -427,6 +485,12 @@ export async function* agentLoop(
 				"code" in err &&
 				(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
 			) {
+				yield { type: "context_length_exceeded", message: msg };
+				return;
+			}
+			// Detect context overflow errors from OpenAI/Codex-compatible providers.
+			// Treat as context_length_exceeded so caller can prune/compact+retry.
+			if (isContextWindowExceededError(err)) {
 				yield { type: "context_length_exceeded", message: msg };
 				return;
 			}
@@ -563,9 +627,9 @@ export async function* agentLoop(
 		// This must happen AFTER the API call (not before), because
 		// chat() references the history array directly.
 		if (isFirstTurn) {
-			provider.pushUserTurn(history, userText, config.model, initialToolResults ?? []);
+			provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? []);
 		} else if (pendingToolResults.length > 0) {
-			provider.pushUserTurn(history, "", config.model, pendingToolResults);
+			provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
 		}
 
 		// Execute each tool call

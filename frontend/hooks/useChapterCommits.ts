@@ -7,7 +7,12 @@ export function useChapterCommits(
 ) {
 	return useQuery({
 		queryKey: ["chapterCommits", chapterId, params],
-		queryFn: () => api.getChapterCommits(chapterId!, params),
+		queryFn: () => {
+			if (!chapterId) {
+				throw new Error("chapterId is required");
+			}
+			return api.getChapterCommits(chapterId, params);
+		},
 		enabled: !!chapterId,
 	});
 }

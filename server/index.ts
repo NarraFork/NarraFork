@@ -61,7 +61,11 @@ if (isProd) {
 	let hasEmbedded = false;
 	try {
 		// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
-		const { embeddedAssets } = await import("./generated/embedded-frontend");
+		const generatedFrontendModulePath = "./generated/embedded-frontend";
+		const generatedModule = (await import(generatedFrontendModulePath)) as {
+			embeddedAssets?: Record<string, string>;
+		};
+		const embeddedAssets = generatedModule.embeddedAssets ?? {};
 		const indexPath = embeddedAssets["/index.html"];
 		if (indexPath) {
 			hasEmbedded = true;

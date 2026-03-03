@@ -12,54 +12,27 @@ import {
 	Text,
 	Textarea,
 	ThemeIcon,
+	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconArrowsMinimize, IconGitCommit, IconListCheck } from "@tabler/icons-react";
+import {
+	IconArrowsMinimize,
+	IconBrain,
+	IconChevronDown,
+	IconChevronRight,
+	IconGitCommit,
+	IconListCheck,
+} from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import Markdown, { type Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { api, getToken } from "../../lib/api";
 import { ContentViewer } from "./ContentViewer";
+import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
-import {
-	getCategoryColor,
-	getCategoryIcon,
-	type PendingPermission,
-	STATUS_COLORS,
-	StatusIcon,
-	ToolCallCard,
-} from "./ToolCallCard";
-
-const singleLineMdComponents: Components = {
-	p: ({ children }) => <>{children}</>,
-	h1: ({ children }) => <>{children}</>,
-	h2: ({ children }) => <>{children}</>,
-	h3: ({ children }) => <>{children}</>,
-	h4: ({ children }) => <>{children}</>,
-	h5: ({ children }) => <>{children}</>,
-	h6: ({ children }) => <>{children}</>,
-	ul: ({ children }) => <>{children}</>,
-	ol: ({ children }) => <>{children}</>,
-	li: ({ children }) => <>{children}</>,
-	blockquote: ({ children }) => <>{children}</>,
-	code: ({ children }) => <>{children}</>,
-	pre: ({ children }) => <>{children}</>,
-	a: ({ children }) => <>{children}</>,
-	strong: ({ children }) => (
-		<Text span fw={700} size="xs">
-			{children}
-		</Text>
-	),
-	em: ({ children }) => (
-		<Text span fs="italic" size="xs">
-			{children}
-		</Text>
-	),
-};
+import { getCategoryColor, type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 interface MessageBubbleProps {
 	narratorId?: string;
@@ -298,6 +271,161 @@ function CompactIndicator({
 				)}
 			</Modal>
 		</>
+	);
+}
+
+export function ReasoningSummary({ text }: { text: string }) {
+	const [expanded, setExpanded] = useState(false);
+	const [isOverflow, setIsOverflow] = useState(false);
+	const lineRef = useRef<HTMLDivElement | null>(null);
+	const singleLineText = text.trim().replace(/\s+/g, " ");
+	const headerText = singleLineText.replace(/\*\*/g, "");
+
+	useLayoutEffect(() => {
+		if (!headerText) {
+			setIsOverflow(false);
+			return;
+		}
+
+		const measure = () => {
+			const el = lineRef.current;
+			if (!el) {
+				setIsOverflow(false);
+				return;
+			}
+			setIsOverflow(el.scrollWidth - el.clientWidth > 1);
+		};
+
+		measure();
+		const rafId = requestAnimationFrame(measure);
+		const timeoutId1 = setTimeout(measure, 120);
+		const timeoutId2 = setTimeout(measure, 400);
+
+		const handleResize = () => measure();
+		window.addEventListener("resize", handleResize);
+
+		let ro: ResizeObserver | undefined;
+		if (typeof ResizeObserver !== "undefined" && lineRef.current) {
+			ro = new ResizeObserver(measure);
+			ro.observe(lineRef.current);
+		}
+
+		let cancelled = false;
+		if (document.fonts?.ready) {
+			document.fonts.ready
+				.then(() => {
+					if (!cancelled) measure();
+				})
+				.catch(() => {});
+		}
+
+		return () => {
+			cancelled = true;
+			cancelAnimationFrame(rafId);
+			clearTimeout(timeoutId1);
+			clearTimeout(timeoutId2);
+			window.removeEventListener("resize", handleResize);
+			ro?.disconnect();
+		};
+	}, [headerText]);
+
+	useLayoutEffect(() => {
+		if (!isOverflow && expanded) {
+			setExpanded(false);
+		}
+	}, [isOverflow, expanded]);
+
+	return (
+		<Box style={{ flex: 1, minWidth: 0 }}>
+			{isOverflow ? (
+				<UnstyledButton
+					onClick={() => setExpanded((o) => !o)}
+					w="100%"
+					style={{ display: "block" }}
+				>
+					<Group gap={4} wrap="nowrap" align="center">
+						<Box
+							style={{
+								flex: 1,
+								minWidth: 0,
+								display: "flex",
+								alignItems: "center",
+								height: 18,
+							}}
+						>
+							<div
+								ref={lineRef}
+								style={{
+									width: "100%",
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									fontSize: "var(--mantine-font-size-xs)",
+									fontFamily: "var(--mantine-font-family-monospace)",
+									lineHeight: "18px",
+								}}
+								title={headerText}
+							>
+								{headerText}
+							</div>
+						</Box>
+						<Box
+							style={{
+								display: "inline-flex",
+								alignItems: "center",
+								justifyContent: "center",
+								flexShrink: 0,
+								width: 16,
+								height: 16,
+							}}
+						>
+							{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+						</Box>
+					</Group>
+				</UnstyledButton>
+			) : (
+				<Box
+					style={{
+						flex: 1,
+						minWidth: 0,
+						display: "flex",
+						alignItems: "center",
+						height: 18,
+					}}
+				>
+					<div
+						ref={lineRef}
+						style={{
+							width: "100%",
+							overflow: "hidden",
+							textOverflow: "ellipsis",
+							whiteSpace: "nowrap",
+							fontSize: "var(--mantine-font-size-xs)",
+							fontFamily: "var(--mantine-font-family-monospace)",
+							lineHeight: "18px",
+						}}
+						title={headerText}
+					>
+						{headerText}
+					</div>
+				</Box>
+			)}
+			{isOverflow && (
+				<LazyCollapse in={expanded}>
+					<Box
+						mt={4}
+						style={{
+							lineHeight: 1.35,
+							whiteSpace: "pre-wrap",
+							wordBreak: "break-word",
+							overflowWrap: "anywhere",
+						}}
+					>
+						<MarkdownContent text={text.trim()} />
+					</Box>
+				</LazyCollapse>
+			)}
+		</Box>
 	);
 }
 
@@ -587,35 +715,13 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					if (block.type === "reasoning") {
 						const iconColor = getCategoryColor("plan");
-						const Icon = getCategoryIcon("plan");
-						const statusColor = STATUS_COLORS.success ?? "green";
-						const summary =
-							typeof block.text === "string" ? block.text.trim().replace(/\s+/g, " ") : "";
 						return (
 							<Paper key={key} withBorder radius="sm" p="xs">
-								<Group gap={6} wrap="nowrap">
+								<Group gap={6} wrap="nowrap" align="center">
 									<ThemeIcon size={18} variant="light" color={iconColor} radius="sm">
-										<Icon size={12} />
+										<IconBrain size={12} />
 									</ThemeIcon>
-									<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0 }}>
-										{t("reasoning")}
-									</Text>
-									<Text
-										size="xs"
-										ff="monospace"
-										truncate
-										style={{ flex: 1, minWidth: 0 }}
-										title={summary}
-									>
-										<Markdown remarkPlugins={[remarkGfm]} components={singleLineMdComponents}>
-											{summary}
-										</Markdown>
-									</Text>
-									<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-										<Box c={statusColor}>
-											<StatusIcon status="success" />
-										</Box>
-									</Group>
+									<ReasoningSummary text={typeof block.text === "string" ? block.text : ""} />
 								</Group>
 							</Paper>
 						);

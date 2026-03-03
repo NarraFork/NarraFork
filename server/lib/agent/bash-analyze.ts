@@ -263,6 +263,46 @@ const SAFE_PACKAGE_ARGS = new Set([
 	"-v",
 ]);
 
+/** Biome 特定的只读参数前缀 */
+const BIOME_SAFE_ARG_PREFIXES = [
+	"--max-diagnostics",
+	"--diagnostic-level",
+	"--colors",
+	"--no-colors",
+	"--use-server",
+	"--verbose",
+	"--log-level",
+	"--log-kind",
+	"--config-path",
+	"--reporter",
+	"--formatter-enabled",
+	"--linter-enabled",
+	"--organize-imports-enabled",
+	"--assists-enabled",
+	"--stdin-file-path",
+	"--vcs-enabled",
+	"--vcs-client-kind",
+	"--vcs-use-ignore-file",
+	"--vcs-root",
+	"--vcs-default-branch",
+	"--files-max-size",
+	"--files-ignore-unknown",
+	"--indent-style",
+	"--indent-width",
+	"--line-ending",
+	"--line-width",
+	"--json-formatter-enabled",
+	"--json-formatter-indent-style",
+	"--json-formatter-indent-width",
+	"--json-formatter-line-ending",
+	"--json-formatter-line-width",
+	"--javascript-formatter-enabled",
+	"--javascript-formatter-indent-style",
+	"--javascript-formatter-indent-width",
+	"--javascript-formatter-line-ending",
+	"--javascript-formatter-line-width",
+];
+
 /** 会触发远程拉包或动态来源的高风险参数。 */
 const PACKAGE_RUNNER_DANGEROUS_FLAGS = new Set([
 	"-p",
@@ -321,16 +361,26 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 		return `${runner} ${execCmd} (package not in allowlist)`;
 	}
 
+	const isBiome = packageName === "biome" || packageName === "@biomejs/biome";
+
 	const cmdArgs = tokens.slice(i + 1);
 	for (const arg of cmdArgs) {
 		if (arg.startsWith("--config") || arg.startsWith("--plugin") || arg.startsWith("--require")) {
 			return `${runner} ${execCmd} ${arg} (dynamic code loading flag)`;
 		}
 		if (arg.startsWith("-")) {
-			if (!SAFE_PACKAGE_ARGS.has(arg)) {
-				return `${runner} ${execCmd} ${arg} (flag not in safe allowlist)`;
+			// 检查是否在通用白名单中
+			if (SAFE_PACKAGE_ARGS.has(arg)) {
+				continue;
 			}
-			continue;
+			// Biome 特定参数：检查前缀匹配（支持 --max-diagnostics=200 格式）
+			if (isBiome) {
+				const argName = arg.split("=")[0];
+				if (BIOME_SAFE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					continue;
+				}
+			}
+			return `${runner} ${execCmd} ${arg} (flag not in safe allowlist)`;
 		}
 		// 非 flag 参数（子命令/目标路径）只允许极少数只读词或当前目录
 		if (arg === "check" || arg === "version" || arg === ".") continue;
@@ -703,8 +753,23 @@ async function getParser(): Promise<TreeSitterParser> {
 
 async function initParser(): Promise<TreeSitterParser> {
 	const TreeSitter = await import("web-tree-sitter");
-	const Parser = TreeSitter.Parser ?? TreeSitter.default;
-	const Language = TreeSitter.Language ?? (TreeSitter.default as any)?.Language;
+	const Parser = (TreeSitter.Parser ?? TreeSitter.default) as TreeSitterParserCtor;
+	type TreeSitterModuleLike = {
+		Language?: { load(path: string): Promise<unknown> };
+		default?: { Language?: { load(path: string): Promise<unknown> } };
+	};
+	type TreeSitterParserCtor = {
+		init(options: { locateFile(): string }): Promise<void>;
+		new (): {
+			setLanguage(language: unknown): void;
+			parse(input: string): { rootNode: TreeSitterNode };
+		};
+	};
+	const treeSitterLike = TreeSitter as TreeSitterModuleLike;
+	const Language = treeSitterLike.Language ?? treeSitterLike.default?.Language;
+	if (!Language) {
+		throw new Error("web-tree-sitter Language API is unavailable");
+	}
 
 	const treeSitterWasmPath = require.resolve("web-tree-sitter/tree-sitter.wasm");
 	await Parser.init({
@@ -1184,7 +1249,7 @@ function detectCatastrophic(commands: BashAnalysis["commands"], rawCommand: stri
 				for (const arg of args) {
 					if (arg.startsWith("-")) continue;
 					// rm -rf /, /*, ~, $HOME
-					if (arg === "/" || arg === "/*" || arg === "~" || arg === "$HOME" || arg === "${HOME}") {
+					if (arg === "/" || arg === "/*" || arg === "~" || arg === "$HOME" || arg === `\${HOME}`) {
 						return `rm recursive on critical path: ${arg}`;
 					}
 					if (isCatastrophicPath(arg)) {

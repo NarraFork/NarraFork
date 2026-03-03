@@ -13,7 +13,13 @@ import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
-import { buildContextManagementHooks, handlePermission, pruneToolCalls } from "./narrator-session";
+import {
+	buildContextManagementHooks,
+	COMPACT_CONTEXT_USAGE_PCT,
+	handlePermission,
+	pruneToolCalls,
+	runCustomCompact,
+} from "./narrator-session";
 
 // === Subagent type definitions ===
 
@@ -224,6 +230,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let needsRestart = false;
 	let currentConversationId = randomUUID();
 	let contextLengthExceeded = false;
+	let overflowRetries = 0;
+	const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 
 	// Build context management hooks for general subagents
 	const ctxMgmt = isGeneral
@@ -261,18 +269,19 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			? { onContextUsage: ctxMgmt.onContextUsage }
 			: undefined;
 
+		const resolvedProvider = resolveProvider(model);
 		const config: AgentConfig = {
 			narratorId,
 			conversationId: currentConversationId,
 			model,
-			provider,
+			provider: resolvedProvider,
 			cwd,
 			systemPrompt,
 			locale,
 			signal,
 			reasoningEffort:
 				narratorReasoningEffort ??
-				(provider === "codex" ? settings.codex?.defaultReasoningEffort : undefined),
+				(resolveProvider(model) === "codex" ? settings.codex?.defaultReasoningEffort : undefined),
 			toolFilter: TOOL_FILTERS[subagentType],
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(
@@ -300,9 +309,106 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		});
 
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
-		hasError = result.hasError || !!result.contextLengthExceeded || !!result.retryableError;
+		hasError = result.hasError || !!result.retryableError;
 		if (result.retryableError) finalText = `Error: ${result.retryableError}`;
-		if (result.contextLengthExceeded) contextLengthExceeded = true;
+
+		if (result.contextLengthExceeded) {
+			if (!isGeneral || signal.aborted) {
+				hasError = true;
+				contextLengthExceeded = true;
+				finalText = "Error: context length exceeded";
+				break;
+			}
+
+			overflowRetries++;
+
+			if (overflowRetries > MAX_CONTEXT_OVERFLOW_RETRIES) {
+				hasError = true;
+				contextLengthExceeded = true;
+				finalText = "Error: context length exceeded after compact retries";
+				break;
+			}
+
+			logger.warn("Subagent context length exceeded, attempting emergency recovery", {
+				narratorId,
+				parentNarratorId,
+				attempt: overflowRetries,
+				provider: resolvedProvider,
+				subagentType,
+			});
+
+			if (resolvedProvider === "codex" && overflowRetries === 1) {
+				try {
+					const before = await narratorService.getById(narratorId);
+					const pruneResult = await narratorService.computeAndUpdatePruneBoundary(
+						narratorId,
+						COMPACT_CONTEXT_USAGE_PCT,
+					);
+					if (pruneResult?.boundaryMessageId) {
+						const boundaryAdvanced =
+							pruneResult.boundaryMessageId !== before.pruneBoundaryMessageId;
+						if (boundaryAdvanced) {
+							pruneBoundaryId = pruneResult.boundaryMessageId;
+							const rebuilt = await loadSubagentHistory(
+								narratorId,
+								model,
+								resolvedProvider,
+								pruneBoundaryId,
+							);
+							history = rebuilt.history;
+							trailingToolResults = rebuilt.trailingToolResults;
+							logger.warn("Subagent applied aggressive prune, retrying before compact", {
+								narratorId,
+								boundaryMessageId: pruneResult.boundaryMessageId,
+								prunedPercent: pruneResult.prunedPercent,
+							});
+							continue;
+						}
+					}
+				} catch (pruneErr) {
+					logger.error("Subagent aggressive prune failed", {
+						narratorId,
+						error: String(pruneErr),
+					});
+				}
+			}
+
+			let compacted = false;
+			const maxKeepPairs = 8;
+			for (let keepPairs = 2; keepPairs <= maxKeepPairs; keepPairs++) {
+				const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+					narratorId,
+					keepPairs,
+				);
+				if (!boundaryMessageId) break;
+				try {
+					await runCustomCompact(narratorId, locale as Locale, boundaryMessageId);
+					needsRestart = true;
+					currentConversationId = randomUUID();
+					compacted = true;
+					logger.info("Subagent emergency compact succeeded", {
+						narratorId,
+						keepPairs,
+						parentNarratorId,
+					});
+					break;
+				} catch (compactErr) {
+					logger.error("Subagent emergency compact attempt failed", {
+						narratorId,
+						keepPairs,
+						error: String(compactErr),
+					});
+				}
+			}
+
+			if (compacted) {
+				// Keep hasError=false and continue restart flow below.
+			} else {
+				hasError = true;
+				finalText = "Error: context length exceeded and compact failed";
+				break;
+			}
+		}
 
 		if (!needsRestart || !isGeneral || signal.aborted || hasError) break;
 
@@ -323,7 +429,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		);
 
 		// Reload history from post-compact messages (no prune after compact)
-		const rebuilt = await loadSubagentHistory(narratorId, model, provider, null);
+		const rebuilt = await loadSubagentHistory(narratorId, model, resolvedProvider, null);
 		history = rebuilt.history;
 		trailingToolResults = rebuilt.trailingToolResults;
 	}

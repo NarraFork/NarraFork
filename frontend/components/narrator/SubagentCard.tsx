@@ -84,10 +84,18 @@ export const SubagentCard = memo(
 		const isTerminal = /^(success|completed|denied|error|fail)$/.test(toolCall.status);
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
 		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
+		const prompt = input.prompt ?? "";
+		const promptHasLineBreak = prompt.includes("\n");
+		const [promptFitsOneLine, setPromptFitsOneLine] = useState(false);
+		const promptSummaryRef = useRef<HTMLParagraphElement | null>(null);
+		const promptShownInHeader =
+			!input.description && !!prompt && !promptHasLineBreak && promptFitsOneLine;
+		const description =
+			input.description ??
+			(promptShownInHeader ? prompt : input.prompt?.slice(0, 80)) ??
+			"Subagent";
 		const [showPrompt, setShowPrompt] = useState(false);
 		const [showCalls, setShowCalls] = useState(soleAndRunning);
-		const description = input.description ?? input.prompt?.slice(0, 80) ?? "Subagent";
-		const prompt = input.prompt ?? "";
 		const resolvedModel = childMessages[0]?.subagentModel ?? input.model;
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
@@ -110,6 +118,25 @@ export const SubagentCard = memo(
 			}
 		});
 		const prevChildCount = useRef(childMessages.length);
+		useEffect(() => {
+			if (!prompt || promptHasLineBreak) {
+				setPromptFitsOneLine(false);
+				return;
+			}
+			const node = promptSummaryRef.current;
+			if (!node) return;
+			const parent = node.offsetParent as HTMLElement | null;
+			if (!parent) return;
+			const evaluate = () => {
+				const availableWidth = Math.max(parent.clientWidth - 24, 0);
+				const isSingleLine = node.scrollWidth <= availableWidth + 1;
+				setPromptFitsOneLine(isSingleLine);
+			};
+			evaluate();
+			const resizeObserver = new ResizeObserver(evaluate);
+			resizeObserver.observe(parent);
+			return () => resizeObserver.disconnect();
+		}, [prompt, promptHasLineBreak]);
 		useEffect(() => {
 			const el = scrollBoxRef.current;
 			if (!el) return;
@@ -337,6 +364,24 @@ export const SubagentCard = memo(
 						>
 							{description}
 						</Text>
+						{prompt && !input.description && !promptHasLineBreak && (
+							<Text
+								ref={promptSummaryRef}
+								size="xs"
+								c="dimmed"
+								mt={2}
+								ml={24}
+								lineClamp={1}
+								style={{
+									opacity: 0,
+									position: "absolute",
+									pointerEvents: "none",
+									maxWidth: "calc(100% - 24px)",
+								}}
+							>
+								{prompt}
+							</Text>
+						)}
 					</UnstyledButton>
 					<Box>
 						<LazyCollapse in={expanded}>
@@ -395,8 +440,8 @@ export const SubagentCard = memo(
 									/>
 								</Box>
 							)}
-							{/* Prompt — collapsed by default */}
-							{prompt && (
+							{/* Prompt — 单行可放进标题时不再折叠显示 */}
+							{prompt && !promptShownInHeader && (
 								<Box px="xs" pb={4}>
 									<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
 										<Group gap={4}>
@@ -562,7 +607,7 @@ export const SubagentCard = memo(
 							)}
 						</LazyCollapse>
 					</Box>
-					{inRun && !isLast && <Divider />}
+					{inRun && !isLast && <Divider color="var(--mantine-color-default-border)" size={1} />}
 				</Box>
 			</MessageContextMenuCtx.Provider>
 		);
@@ -649,8 +694,8 @@ export const SubagentCard = memo(
 					style={swipe.swipeStyle}
 				>
 					<Paper
-						withBorder
-						radius="sm"
+						withBorder={!inRun}
+						radius={inRun ? 0 : "sm"}
 						style={{
 							overflow: "hidden",
 							...(selfPerm ? { borderColor: "var(--mantine-color-yellow-6)" } : {}),

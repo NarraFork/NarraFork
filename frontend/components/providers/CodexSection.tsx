@@ -637,6 +637,7 @@ function CredentialList(props: {
 		successCount: number;
 		failureCount: number;
 		lastUsedAt?: string;
+		expiresAt?: number;
 	}>;
 	currentId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic usage cache structure
@@ -678,6 +679,11 @@ function CredentialList(props: {
 		deleteMut,
 		t,
 	} = props;
+	const isMobile = useMediaQuery("(max-width: 768px)");
+
+	if (isMobile) {
+		return <CredentialCards {...props} />;
+	}
 
 	return (
 		<Table>
@@ -859,6 +865,7 @@ function CredentialCards(props: {
 		successCount: number;
 		failureCount: number;
 		lastUsedAt?: string;
+		expiresAt?: number;
 	}>;
 	currentId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic usage cache structure
@@ -870,7 +877,6 @@ function CredentialCards(props: {
 	onSaveEdit: () => void;
 	onCancelEdit: () => void;
 	onEditFormChange: (form: { displayName: string; priority: number }) => void;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	usageMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
@@ -1010,6 +1016,14 @@ function CredentialCards(props: {
 												{entry.lastUsedAt ? relativeTime(entry.lastUsedAt) : "-"}
 											</Text>
 										</Group>
+										{entry.expiresAt && (
+											<Group justify="space-between" wrap="nowrap">
+												<Text size="xs" c="dimmed">
+													{t("codexColExpires")}
+												</Text>
+												<ExpiresDisplay expiresAt={entry.expiresAt} />
+											</Group>
+										)}
 									</Stack>
 
 									{/* Row 3: Usage */}
@@ -1092,6 +1106,7 @@ function CredentialCards(props: {
 
 // Expires display component
 function ExpiresDisplay({ expiresAt }: { expiresAt: number }) {
+	const { t } = useTranslation("settings");
 	const now = Date.now();
 	const diff = expiresAt - now;
 
@@ -1103,7 +1118,7 @@ function ExpiresDisplay({ expiresAt }: { expiresAt: number }) {
 					{relativeTime(new Date(expiresAt).toISOString())}
 				</Text>
 				<Badge size="xs" color="red">
-					Expired
+					{t("codexUsageExpired")}
 				</Badge>
 			</Group>
 		);

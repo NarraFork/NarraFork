@@ -1,9 +1,8 @@
 import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
+import { IconBrain } from "@tabler/icons-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
-import Markdown, { type Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { MessageBubble } from "./MessageBubble";
+import { MessageBubble, ReasoningSummary } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
 	flattenToolRun,
@@ -21,40 +20,7 @@ import type {
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
-import {
-	getCategoryColor,
-	getCategoryIcon,
-	STATUS_COLORS,
-	StatusIcon,
-	ToolCallCard,
-} from "./ToolCallCard";
-
-const singleLineMdComponents: Components = {
-	p: ({ children }) => <>{children}</>,
-	h1: ({ children }) => <>{children}</>,
-	h2: ({ children }) => <>{children}</>,
-	h3: ({ children }) => <>{children}</>,
-	h4: ({ children }) => <>{children}</>,
-	h5: ({ children }) => <>{children}</>,
-	h6: ({ children }) => <>{children}</>,
-	ul: ({ children }) => <>{children}</>,
-	ol: ({ children }) => <>{children}</>,
-	li: ({ children }) => <>{children}</>,
-	blockquote: ({ children }) => <>{children}</>,
-	code: ({ children }) => <>{children}</>,
-	pre: ({ children }) => <>{children}</>,
-	a: ({ children }) => <>{children}</>,
-	strong: ({ children }) => (
-		<Text span fw={700} size="xs">
-			{children}
-		</Text>
-	),
-	em: ({ children }) => (
-		<Text span fs="italic" size="xs">
-			{children}
-		</Text>
-	),
-};
+import { getCategoryColor, ToolCallCard } from "./ToolCallCard";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a group of tool-bearing messages
@@ -70,7 +36,6 @@ export function renderToolRun(
 	onForkFromMessage?: (uuid: string) => void,
 	onDeleteMessage?: (messageId: string) => void,
 	onCompactBeforeMessage?: (messageId: string) => void,
-	reasoningLabel = "Reasoning",
 ) {
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
@@ -109,34 +74,24 @@ export function renderToolRun(
 
 		if (item.kind === "reasoning") {
 			const iconColor = getCategoryColor("plan");
-			const Icon = getCategoryIcon("plan");
-			const statusColor = STATUS_COLORS.success ?? "green";
-			const summary = item.reasoningText.trim().replace(/\s+/g, " ");
 			const header = (
-				<Group gap={6} wrap="nowrap">
+				<Group gap={6} wrap="nowrap" align="center">
 					<ThemeIcon size={18} variant="light" color={iconColor} radius="sm">
-						<Icon size={12} />
+						<IconBrain size={12} />
 					</ThemeIcon>
-					<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0 }}>
-						{reasoningLabel}
-					</Text>
-					<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
-						<Markdown remarkPlugins={[remarkGfm]} components={singleLineMdComponents}>
-							{summary}
-						</Markdown>
-					</Text>
-					<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-						<Box c={statusColor}>
-							<StatusIcon status="success" />
-						</Box>
-					</Group>
+					<ReasoningSummary text={item.reasoningText} />
 				</Group>
 			);
 			return (
 				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
 					<div id={`msg-${item.msg.id}`} style={hlStyle}>
 						{total >= 2 ? (
-							<Box p="xs">{header}</Box>
+							<>
+								<Box p="xs">{header}</Box>
+								{idx !== total - 1 && (
+									<Divider color="var(--mantine-color-default-border)" size={1} />
+								)}
+							</>
 						) : (
 							<Box p="xs">
 								<Paper withBorder radius="sm" p="xs">
@@ -144,7 +99,6 @@ export function renderToolRun(
 								</Paper>
 							</Box>
 						)}
-						{total >= 2 && idx !== total - 1 && <Divider />}
 					</div>
 				</MessageContextMenuCtx.Provider>
 			);
@@ -236,7 +190,6 @@ export function renderTreeMessages(
 	pruneBoundaryMessageId?: string | null,
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
-	reasoningLabel?: string,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -449,7 +402,6 @@ export function renderTreeMessages(
 				onForkFromMessage,
 				onDeleteMessage,
 				onCompactBeforeMessage,
-				reasoningLabel,
 			);
 
 			if (el) elements.push(el);
@@ -575,7 +527,6 @@ export const MemoizedPageElements = memo(
 			pruneBoundaryMessageId,
 			t("pruneBoundaryLabel"),
 			onCompactBeforeMessage,
-			t("reasoning"),
 		);
 		return <>{elements}</>;
 	},

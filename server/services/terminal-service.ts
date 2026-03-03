@@ -152,7 +152,11 @@ export const terminalService = {
 			});
 			proc = Bun.spawn([DEFAULT_SHELL, "-l"], {
 				cwd,
-				env: { ...process.env, TERM: "xterm-256color" },
+				env: {
+					...process.env,
+					HISTFILE: "/dev/null",
+					TERM: "xterm-256color",
+				},
 				terminal: pty,
 			});
 		}

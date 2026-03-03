@@ -39,13 +39,16 @@ const _tools = provider.formatTools(
 const messages1 = [...history];
 // In Responses API mode, convertHistoryToResponsesApi is called
 // (but history is already in correct format from injectSystemPrompt)
-messages1.push({ role: "user", content: "读取 package.json" } as any);
+messages1.push({ role: "user", content: "读取 package.json" } as unknown);
 
 console.log("\n=== Turn 0: messages sent to API ===");
 for (const [i, m] of messages1.entries()) {
-	const msg = m as any;
+	const msg = m as Record<string, unknown>;
+	const roleOrType = String(msg.role ?? msg.type ?? "?");
+	const name = typeof msg.name === "string" ? msg.name : undefined;
+	const callId = typeof msg.call_id === "string" ? msg.call_id : undefined;
 	console.log(
-		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""}`,
+		`  [${i}] ${roleOrType} ${name ? `(${name})` : ""} ${callId ? `call_id=${callId}` : ""}`,
 	);
 }
 
@@ -60,10 +63,13 @@ provider.pushUserTurn(history, "读取 package.json", "gpt-5", []);
 provider.pushAssistantTurn(history, assistantText, toolUses);
 
 console.log("\n=== After Turn 0 pushAssistantTurn ===");
-for (const [i, m] of (history as any[]).entries()) {
-	const msg = m as any;
+for (const [i, m] of history.entries()) {
+	const msg = m as Record<string, unknown>;
+	const roleOrType = String(msg.role ?? msg.type ?? "?");
+	const name = typeof msg.name === "string" ? msg.name : undefined;
+	const callId = typeof msg.call_id === "string" ? msg.call_id : undefined;
 	console.log(
-		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""}`,
+		`  [${i}] ${roleOrType} ${name ? `(${name})` : ""} ${callId ? `call_id=${callId}` : ""}`,
 	);
 }
 
@@ -86,21 +92,21 @@ const messages2 = [...history]; // history doesn't have tool results yet
 // Simulate convertHistoryToResponsesApi (should be no-op if already in correct format)
 // Then append tool results
 for (const tr of pendingToolResults) {
-	(messages2 as any[]).push(tr);
+	messages2.push(tr);
 }
 // No user message (content is "")
 
-for (const [i, m] of (messages2 as any[]).entries()) {
-	const msg = m as any;
-	const preview = msg.content
-		? String(msg.content).slice(0, 50)
-		: msg.output
-			? String(msg.output).slice(0, 50)
-			: msg.arguments
-				? String(msg.arguments).slice(0, 50)
-				: "";
+for (const [i, m] of messages2.entries()) {
+	const msg = m as Record<string, unknown>;
+	const contentPreview = msg.content != null ? String(msg.content).slice(0, 50) : "";
+	const outputPreview = msg.output != null ? String(msg.output).slice(0, 50) : "";
+	const argsPreview = msg.arguments != null ? String(msg.arguments).slice(0, 50) : "";
+	const preview = contentPreview || outputPreview || argsPreview;
+	const roleOrType = String(msg.role ?? msg.type ?? "?");
+	const name = typeof msg.name === "string" ? msg.name : undefined;
+	const callId = typeof msg.call_id === "string" ? msg.call_id : undefined;
 	console.log(
-		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""} ${preview}`,
+		`  [${i}] ${roleOrType} ${name ? `(${name})` : ""} ${callId ? `call_id=${callId}` : ""} ${preview}`,
 	);
 }
 
@@ -116,27 +122,27 @@ const toolResult2 = provider.formatToolResult("call_def456", "grep results...", 
 
 console.log("\n=== Turn 2: messages that chat() would build ===");
 const messages3 = [...history];
-(messages3 as any[]).push(toolResult2);
+messages3.push(toolResult2);
 
-for (const [i, m] of (messages3 as any[]).entries()) {
-	const msg = m as any;
-	const preview = msg.content
-		? String(msg.content).slice(0, 50)
-		: msg.output
-			? String(msg.output).slice(0, 50)
-			: msg.arguments
-				? String(msg.arguments).slice(0, 50)
-				: "";
+for (const [i, m] of messages3.entries()) {
+	const msg = m as Record<string, unknown>;
+	const contentPreview = msg.content != null ? String(msg.content).slice(0, 50) : "";
+	const outputPreview = msg.output != null ? String(msg.output).slice(0, 50) : "";
+	const argsPreview = msg.arguments != null ? String(msg.arguments).slice(0, 50) : "";
+	const preview = contentPreview || outputPreview || argsPreview;
+	const roleOrType = String(msg.role ?? msg.type ?? "?");
+	const name = typeof msg.name === "string" ? msg.name : undefined;
+	const callId = typeof msg.call_id === "string" ? msg.call_id : undefined;
 	console.log(
-		`  [${i}] ${msg.role ?? msg.type ?? "?"} ${msg.name ? `(${msg.name})` : ""} ${msg.call_id ? `call_id=${msg.call_id}` : ""} ${preview}`,
+		`  [${i}] ${roleOrType} ${name ? `(${name})` : ""} ${callId ? `call_id=${callId}` : ""} ${preview}`,
 	);
 }
 
 // Validate structure
 console.log("\n=== Validation ===");
 let valid = true;
-for (const [i, m] of (messages3 as any[]).entries()) {
-	const msg = m as any;
+for (const [i, m] of messages3.entries()) {
+	const msg = m as Record<string, unknown>;
 	if (msg.role === "tool") {
 		console.log(
 			`❌ [${i}] Found role="tool" — should be type="function_call_output" in Responses API`,
@@ -147,7 +153,7 @@ for (const [i, m] of (messages3 as any[]).entries()) {
 		console.log(`❌ [${i}] Found role="system" — should be role="developer" in Responses API`);
 		valid = false;
 	}
-	if (msg.role === "assistant" && msg.tool_calls) {
+	if (msg.role === "assistant" && msg.tool_calls != null) {
 		console.log(
 			`❌ [${i}] Found assistant with tool_calls — should be separate function_call items`,
 		);

@@ -31,17 +31,17 @@ const formatted = provider.formatTools(allTools);
 
 console.log("1. Tool Format Check:");
 console.log(`   Total tools: ${formatted.length}`);
-const firstTool = formatted[0] as any;
+const firstTool = formatted[0] as Record<string, unknown> | undefined;
 console.log(`   First tool structure:`, {
-	type: firstTool.type,
-	hasName: !!firstTool.name,
-	hasDescription: !!firstTool.description,
-	hasParameters: !!firstTool.parameters,
-	hasStrict: "strict" in firstTool,
-	strictValue: firstTool.strict,
+	type: firstTool?.type,
+	hasName: !!firstTool?.name,
+	hasDescription: !!firstTool?.description,
+	hasParameters: !!firstTool?.parameters,
+	hasStrict: firstTool ? "strict" in firstTool : false,
+	strictValue: firstTool?.strict,
 });
 
-if (firstTool.type !== "function" || !firstTool.name || !("strict" in firstTool)) {
+if (!firstTool || firstTool.type !== "function" || !firstTool.name || !("strict" in firstTool)) {
 	console.error("\n❌ Tool format is incorrect for Responses API!");
 	console.error("   Expected: { type: 'function', name, description, parameters, strict }");
 	console.error("   Got:", JSON.stringify(firstTool, null, 2).slice(0, 300));
@@ -100,48 +100,54 @@ const { history, trailingToolResults } = await provider.buildHistory(
 );
 
 console.log("   Converted messages:");
-for (const msg of history as any[]) {
-	const msgType = msg.type || msg.role;
+for (const entry of history) {
+	const msg = entry as Record<string, unknown>;
+	const msgType = String(msg.type ?? msg.role ?? "unknown");
+	const content = msg.content;
 	const preview =
 		msg.type === "function_call"
-			? `${msg.name}(${msg.arguments?.slice(0, 30)}...)`
+			? `${String(msg.name ?? "")}(... )`
 			: msg.type === "function_call_output"
-				? `output for ${msg.call_id}`
-				: Array.isArray(msg.content)
-					? `[${msg.content.length} parts: ${msg.content[0]?.type}]`
-					: typeof msg.content === "string"
-						? msg.content.slice(0, 50)
-						: JSON.stringify(msg.content).slice(0, 50);
+				? `output for ${String(msg.call_id ?? "")}`
+				: Array.isArray(content)
+					? `[${content.length} parts: ${String((content[0] as Record<string, unknown> | undefined)?.type ?? "")}]`
+					: typeof content === "string"
+						? content.slice(0, 50)
+						: JSON.stringify(content).slice(0, 50);
 	console.log(`   - ${msgType}: ${preview}`);
 }
 
 console.log("   Trailing tool results:", trailingToolResults);
 
 // Check format
-const userMsg = (history as any[]).find((m) => m.role === "user");
-const assistantMsg = (history as any[]).find((m) => m.role === "assistant");
-const functionCall = (history as any[]).find((m) => m.type === "function_call");
-const _functionOutput = (history as any[]).find((m) => m.type === "function_call_output");
+const historyRecords = history as Array<Record<string, unknown>>;
+const userMsg = historyRecords.find((m) => m.role === "user");
+const assistantMsg = historyRecords.find((m) => m.role === "assistant");
+const functionCall = historyRecords.find((m) => m.type === "function_call");
+
+const userContent = Array.isArray(userMsg?.content)
+	? (userMsg.content as Array<Record<string, unknown>>)
+	: null;
+const assistantContent = Array.isArray(assistantMsg?.content)
+	? (assistantMsg.content as Array<Record<string, unknown>>)
+	: null;
 
 const checks = [
 	{
 		name: "User content is array",
-		pass: !!userMsg && Array.isArray(userMsg.content),
+		pass: !!userContent,
 	},
 	{
 		name: "User content has input_text",
-		pass: !!userMsg && Array.isArray(userMsg.content) && userMsg.content[0]?.type === "input_text",
+		pass: !!userContent && userContent[0]?.type === "input_text",
 	},
 	{
 		name: "Assistant content is array",
-		pass: !!assistantMsg && Array.isArray(assistantMsg.content),
+		pass: !!assistantContent,
 	},
 	{
 		name: "Assistant content has output_text",
-		pass:
-			!!assistantMsg &&
-			Array.isArray(assistantMsg.content) &&
-			assistantMsg.content[0]?.type === "output_text",
+		pass: !!assistantContent && assistantContent[0]?.type === "output_text",
 	},
 	{
 		name: "Function call has type field",
@@ -152,7 +158,7 @@ const checks = [
 		pass:
 			Array.isArray(trailingToolResults) &&
 			trailingToolResults.length > 0 &&
-			(trailingToolResults[0] as any).type === "function_call_output",
+			(trailingToolResults[0] as Record<string, unknown>).type === "function_call_output",
 	},
 ];
 

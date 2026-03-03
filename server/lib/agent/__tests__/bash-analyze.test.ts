@@ -194,6 +194,12 @@ describe("prompt injection: interpreter code execution", () => {
 	test("pip install → ask", () => expectBlocked("pip install requests"));
 	test("bunx @biomejs/biome check . → allow (strict allowlist)", () =>
 		expectAllowed("bunx @biomejs/biome check ."));
+	test("bunx @biomejs/biome check . --max-diagnostics=200 → allow (biome safe args)", () =>
+		expectAllowed("bunx @biomejs/biome check . --max-diagnostics=200"));
+	test("bunx @biomejs/biome check . --diagnostic-level=error → allow (biome safe args)", () =>
+		expectAllowed("bunx @biomejs/biome check . --diagnostic-level=error"));
+	test("bunx @biomejs/biome check . --no-colors → allow (biome safe args)", () =>
+		expectAllowed("bunx @biomejs/biome check . --no-colors"));
 	test("npx tsc --noEmit → allow (strict allowlist)", () => expectAllowed("npx tsc --noEmit"));
 	test("npx vitest → ask (not in strict safe args)", () => expectBlocked("npx vitest"));
 	test("npx -p vitest vitest → ask (dynamic package source)", () =>

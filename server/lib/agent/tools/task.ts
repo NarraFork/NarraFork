@@ -9,8 +9,10 @@ import baseDescription from "./task.txt" with { type: "text" };
 /** Build a dynamic model list string from all visible models. */
 function getAvailableModelsList(): string {
 	const models = getVisibleModels();
-	return models.length > 0
-		? models.join(", ")
+	if (models.length > 0) {
+		return models.join(", ");
+	}
+	return "(no models configured yet)";
 }
 
 function buildParameters() {

@@ -62,7 +62,7 @@ describe("CodexManager session affinity", () => {
 		expect(manager.snapshot().stickySessionCount).toBe(1);
 	});
 
-	test("balanced 模式不同 session 按 least-used 分配", async () => {
+	test("balanced 模式不同 session 随机分配（不考虑 priority）", async () => {
 		const { manager, tmpHome } = createManagerWithCredentials([
 			{ id: "cred-a", priority: 0 },
 			{ id: "cred-b", priority: 1 },
@@ -71,12 +71,21 @@ describe("CodexManager session affinity", () => {
 
 		manager.setLoadBalancingMode("balanced");
 
-		const s1 = await manager.acquireContext("session-a");
-		manager.reportSuccess(s1.id);
-		const s2 = await manager.acquireContext("session-b");
+		const originalRandom = Math.random;
+		const randomValues = [0.1, 0.9];
+		let randomIndex = 0;
+		Math.random = () => randomValues[randomIndex++] ?? 0;
 
-		expect(s2.id).not.toBe(s1.id);
-		expect(manager.snapshot().stickySessionCount).toBe(2);
+		try {
+			const s1 = await manager.acquireContext("session-a");
+			const s2 = await manager.acquireContext("session-b");
+
+			expect(s1.id).toBe("cred-a");
+			expect(s2.id).toBe("cred-b");
+			expect(manager.snapshot().stickySessionCount).toBe(2);
+		} finally {
+			Math.random = originalRandom;
+		}
 	});
 
 	test("粘性绑定凭据被禁用后自动切换并重绑", async () => {
@@ -103,21 +112,30 @@ describe("CodexManager session affinity", () => {
 		]);
 		tempHomes.push(tmpHome);
 
-		manager.setLoadBalancingMode("balanced");
-		const first = await manager.acquireContext("session-1");
-		manager.reportSuccess(first.id);
-		const second = await manager.acquireContext("session-2");
-		expect(second.id).not.toBe(first.id);
-		expect(manager.snapshot().stickySessionCount).toBe(2);
+		const originalRandom = Math.random;
+		const randomValues = [0.8, 0.1];
+		let randomIndex = 0;
+		Math.random = () => randomValues[randomIndex++] ?? 0;
 
-		manager.setLoadBalancingMode("priority");
-		expect(manager.snapshot().stickySessionCount).toBe(0);
+		try {
+			manager.setLoadBalancingMode("balanced");
+			const first = await manager.acquireContext("session-1");
+			manager.reportSuccess(first.id);
+			const second = await manager.acquireContext("session-2");
+			expect(second.id).not.toBe(first.id);
+			expect(manager.snapshot().stickySessionCount).toBe(2);
 
-		const p1 = await manager.acquireContext("session-1");
-		const p2 = await manager.acquireContext("session-2");
-		expect(p1.id).toBe("cred-a");
-		expect(p2.id).toBe("cred-a");
-		expect(manager.snapshot().stickySessionCount).toBe(0);
+			manager.setLoadBalancingMode("priority");
+			expect(manager.snapshot().stickySessionCount).toBe(0);
+
+			const p1 = await manager.acquireContext("session-1");
+			const p2 = await manager.acquireContext("session-2");
+			expect(p1.id).toBe("cred-a");
+			expect(p2.id).toBe("cred-a");
+			expect(manager.snapshot().stickySessionCount).toBe(0);
+		} finally {
+			Math.random = originalRandom;
+		}
 	});
 
 	test("balanced 无 sessionKey 时保持旧行为且不创建粘性绑定", async () => {
@@ -127,12 +145,21 @@ describe("CodexManager session affinity", () => {
 		]);
 		tempHomes.push(tmpHome);
 
-		manager.setLoadBalancingMode("balanced");
-		const first = await manager.acquireContext();
-		manager.reportSuccess(first.id);
-		const second = await manager.acquireContext();
+		const originalRandom = Math.random;
+		const randomValues = [0.1, 0.9];
+		let randomIndex = 0;
+		Math.random = () => randomValues[randomIndex++] ?? 0;
 
-		expect(second.id).not.toBe(first.id);
-		expect(manager.snapshot().stickySessionCount).toBe(0);
+		try {
+			manager.setLoadBalancingMode("balanced");
+			const first = await manager.acquireContext();
+			manager.reportSuccess(first.id);
+			const second = await manager.acquireContext();
+
+			expect(second.id).not.toBe(first.id);
+			expect(manager.snapshot().stickySessionCount).toBe(0);
+		} finally {
+			Math.random = originalRandom;
+		}
 	});
 });

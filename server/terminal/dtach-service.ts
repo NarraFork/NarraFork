@@ -138,6 +138,7 @@ export const dtachService = {
 			env: {
 				...process.env,
 				...opts.env,
+				HISTFILE: "/dev/null",
 				TERM: "xterm-256color",
 			},
 			stdio: ["ignore", "ignore", "ignore"],

@@ -1,8 +1,18 @@
-import { getAnthropicProviderConfig, getOpenaiProviderConfig } from "../settings";
+import { getCodexManager } from "../codex-manager";
+import { logger } from "../logger";
+import {
+	getAnthropicProviderConfig,
+	getOpenaiProviderConfig,
+	parseModelId,
+	resolveProvider,
+	settings,
+} from "../settings";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { AgentToolUse } from "./types";
+
+}
 
 // === Provider-agnostic DB types (used by buildHistory) ===
 
@@ -131,20 +141,180 @@ export interface ProviderAdapter {
 
 // === Provider resolution ===
 
-export function getProvider(provider: string): ProviderAdapter {
-	// Codex is a special provider with centralized credential management
+function createProviderByName(provider: string): ProviderAdapter | null {
+	}
+	if (provider === "codex") return new CodexProvider();
+
+	const anthropicConfig = getAnthropicProviderConfig(provider);
+	if (anthropicConfig) {
+		return new AnthropicProvider(anthropicConfig);
+	}
+
+	const openaiConfig = getOpenaiProviderConfig(provider);
+	if (openaiConfig) {
+		return new OpenAIProvider(openaiConfig);
+	}
+
+	return null;
+}
+
+	const seen = new Set<string>();
+	const providers: string[] = [];
+
+	for (const p of settings.openaiProviders ?? []) {
+		if (!p.apiKey) continue;
+		if (!seen.has(p.prefix)) {
+			seen.add(p.prefix);
+			providers.push(p.prefix);
+		}
+	}
+
+	for (const p of settings.anthropicProviders ?? []) {
+		if (!p.apiKey) continue;
+		if (!seen.has(p.prefix)) {
+			seen.add(p.prefix);
+			providers.push(p.prefix);
+		}
+	}
+
+	if (!seen.has("codex") && settings.codex) {
+		try {
+			if (getCodexManager().availableCount > 0) {
+				providers.push("codex");
+			}
+		} catch {
+			// Ignore codex manager errors during fallback discovery
+		}
+	}
+
+	return providers;
+}
+
+function defaultModelForProvider(provider: string): string | null {
 	if (provider === "codex") {
-		return new CodexProvider();
-	}
-		// Check Anthropic providers first
-		const anthropicConfig = getAnthropicProviderConfig(provider);
-		if (anthropicConfig) {
-			return new AnthropicProvider(anthropicConfig);
+		const custom = settings.agent.customModels ?? [];
+		const codexCustom = custom.find((m) => m.provider === "codex")?.value;
+		if (codexCustom) {
+			return codexCustom.includes(":") ? codexCustom : `codex:${codexCustom}`;
 		}
-		// Then check OpenAI-compatible providers
-		const config = getOpenaiProviderConfig(provider);
-		if (config) {
-			return new OpenAIProvider(config);
+		return "codex:gpt-5.3-codex";
+	}
+
+	}
+
+	const openai = getOpenaiProviderConfig(provider);
+	if (openai?.defaultModel) {
+		return `${provider}:${openai.defaultModel}`;
+	}
+
+	const anthropic = getAnthropicProviderConfig(provider);
+	if (anthropic?.defaultModel) {
+		return `${provider}:${anthropic.defaultModel}`;
+	}
+
+	const custom = settings.agent.customModels ?? [];
+	const providerCustom = custom.find((m) => m.provider === provider)?.value;
+	if (providerCustom) {
+		return providerCustom.includes(":") ? providerCustom : `${provider}:${providerCustom}`;
+	}
+
+	return null;
+}
+
+export interface ProviderResolution {
+	requestedProvider: string;
+	requestedModel: string;
+	provider: string;
+	adapter: ProviderAdapter;
+	model: string;
+}
+
+function buildResolution(
+	requestedProvider: string,
+	requestedModel: string,
+	provider: string,
+	adapter: ProviderAdapter,
+): ProviderResolution {
+	const bareRequestedModel = parseModelId(requestedModel).model;
+	const model =
+		provider === requestedProvider
+			? requestedModel
+			: (defaultModelForProvider(provider) ?? `${provider}:${bareRequestedModel || "default"}`);
+	return {
+		requestedProvider,
+		requestedModel,
+		provider,
+		adapter,
+		model,
+	};
+}
+
+	requestedProvider: string,
+	requestedModel: string,
+): ProviderResolution | null {
+		const adapter = createProviderByName(name);
+		if (adapter) {
+			return buildResolution(requestedProvider, requestedModel, name, adapter);
 		}
 	}
+	return null;
+}
+
+export function resolveProviderAndModel(model?: string): ProviderResolution {
+	const requestedModel = model ?? settings.agent.defaultModel;
+	const requestedProvider = resolveProvider(requestedModel);
+
+			if (fallback) {
+					requestedProvider,
+					requestedModel,
+					fallbackProvider: fallback.provider,
+					fallbackModel: fallback.model,
+				});
+				return fallback;
+			}
+		}
+
+		}
+
+		if (fallback) {
+				requestedProvider,
+				requestedModel,
+				fallbackProvider: fallback.provider,
+				fallbackModel: fallback.model,
+			});
+			return fallback;
+		}
+
+	}
+
+	const explicit = createProviderByName(requestedProvider);
+	if (explicit) {
+		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
+	}
+
+	if (fallback) {
+		logger.warn("Unknown provider requested, falling back to configured provider", {
+			requestedProvider,
+			requestedModel,
+			fallbackProvider: fallback.provider,
+			fallbackModel: fallback.model,
+		});
+		return fallback;
+	}
+
+			requestedProvider,
+			requestedModel,
+		});
+	}
+
+	throw new Error(
+		`Provider "${requestedProvider}" is not configured, and no fallback provider is available.`,
+	);
+}
+
+export function getProvider(provider: string): ProviderAdapter {
+	const explicit = createProviderByName(provider);
+	if (explicit) return explicit;
+	const fallback = resolveProviderAndModel(`${provider}:default`);
+	return fallback.adapter;
 }

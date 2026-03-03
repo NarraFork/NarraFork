@@ -1,5 +1,5 @@
-import { resolveProvider } from "../settings";
-import { getProvider } from "./provider";
+import { parseModelId, settings } from "../settings";
+import { resolveProviderAndModel } from "./provider";
 import { registerCoreTools } from "./tools";
 import { initTruncateCleanup } from "./truncate";
 
@@ -11,7 +11,7 @@ initTruncateCleanup();
 
 export { agentLoop } from "./loop";
 export type { DbMessage, DbToolCall, ParsedStreamEvent, ProviderAdapter } from "./provider";
-export { getProvider } from "./provider";
+export { getProvider, resolveProviderAndModel } from "./provider";
 export { resolveModel } from "./resolve-model";
 export { toolRegistry } from "./tool-registry";
 export type {
@@ -34,7 +34,13 @@ export async function buildHistory(
 	model: string,
 	narratorId?: string,
 ): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-	return getProvider(provider).buildHistory(dbMessages, model, narratorId);
+	const requestedModel = model || settings.agent.defaultModel;
+	const parsed = parseModelId(requestedModel);
+	const prefixedModel = parsed.provider
+		? requestedModel
+		: `${provider}:${parsed.model || "default"}`;
+	const resolved = resolveProviderAndModel(prefixedModel);
+	return resolved.adapter.buildHistory(dbMessages, resolved.model, narratorId);
 }
 
 /**
@@ -42,14 +48,18 @@ export async function buildHistory(
  * Routes to the correct provider based on the model.
  */
 export async function agentGenerate(text: string, model?: string): Promise<string> {
-	const provider = getProvider(resolveProvider(model));
+	const requestedModel = model ?? settings.agent.defaultModel;
+	const resolved = resolveProviderAndModel(requestedModel);
+	return resolved.adapter.generate(text, resolved.model);
 }
 
 export async function agentGenerateWithMeta(
 	text: string,
 	model?: string,
 ): Promise<{ text: string; contextPercent?: number }> {
-	const provider = getProvider(resolveProvider(model));
+	const requestedModel = model ?? settings.agent.defaultModel;
+	const resolved = resolveProviderAndModel(requestedModel);
+	return resolved.adapter.generateWithMeta(text, resolved.model);
 }
 
 /**
@@ -62,10 +72,7 @@ export async function agentGenerateWithHistory(
 	model?: string,
 	locale?: string,
 ): Promise<string> {
-	const provider = getProvider(resolveProvider(model));
-	return provider.generateWithHistory(
-		systemInstruction,
-		content,
-		locale,
-	);
+	const requestedModel = model ?? settings.agent.defaultModel;
+	const resolved = resolveProviderAndModel(requestedModel);
+	return resolved.adapter.generateWithHistory(systemInstruction, content, resolved.model, locale);
 }

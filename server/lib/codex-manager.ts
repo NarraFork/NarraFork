@@ -19,7 +19,7 @@ import { logger } from "./logger";
 // === Constants ===
 
 const MAX_FAILURES_PER_CREDENTIAL = 3;
-const USAGE_TTL_MS = 15 * 60_000;
+const USAGE_TTL_MS = 5 * 60_000;
 const CREDENTIALS_FILE = "codex-credentials.json";
 const STATS_FILE = "codex-stats.json";
 const SESSION_AFFINITY_TTL_MS = 6 * 60 * 60_000; // 6h
@@ -232,17 +232,9 @@ export class CodexManager {
 		if (available.length === 0) return null;
 
 		if (this.loadBalancingMode === "balanced") {
-			// Least-used, then priority
-			return available.reduce((best, e) => {
-				const bestStats = this.stats.get(best.id);
-				const eStats = this.stats.get(e.id);
-				const bestCount = bestStats?.successCount ?? 0;
-				const eCount = eStats?.successCount ?? 0;
-
-				if (eCount < bestCount) return e;
-				if (eCount === bestCount && e.priority < best.priority) return e;
-				return best;
-			});
+			// Balanced mode: random pick among currently available credentials.
+			const randomIndex = Math.floor(Math.random() * available.length);
+			return available[randomIndex] ?? available[0];
 		}
 
 		// Priority mode: lowest priority number first
@@ -892,6 +884,12 @@ export function getCodexManager(): CodexManager {
 		_instance = new CodexManager();
 	}
 	return _instance;
+}
+
+/** Test helper: replace singleton instance to avoid touching real home dir in tests. */
+export function __setCodexManagerForTests(instance?: CodexManager): void {
+	_instance?.dispose();
+	_instance = instance;
 }
 
 // === Migration helper ===

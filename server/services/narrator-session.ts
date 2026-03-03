@@ -13,7 +13,12 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
-import { buildHistory, type PermissionResult, PLAN_MODE_ALLOWED_TOOLS } from "../lib/agent";
+import {
+	buildHistory,
+	type PermissionResult,
+	PLAN_MODE_ALLOWED_TOOLS,
+	resolveProviderAndModel,
+} from "../lib/agent";
 import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
@@ -1195,10 +1200,12 @@ async function runAgentLoop(
 				pruneToolCalls(dbMessages, freshNarrator.pruneBoundaryMessageId);
 			}
 
+			const resolved = resolveProviderAndModel(active.model);
+			active.provider = resolved.provider;
 			const { history, trailingToolResults } = await buildHistory(
 				dbMessages,
-				active.model,
-				active.provider,
+				resolved.model,
+				resolved.provider,
 				narratorId,
 			);
 
@@ -1246,8 +1253,8 @@ async function runAgentLoop(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
-				model: active.model,
-				provider: active.provider,
+				model: resolved.model,
+				provider: resolved.provider,
 				getPruneBoundary: () => active._pruneBoundaryMessageId ?? null,
 				setPruneBoundary: (id) => {
 					active._pruneBoundaryMessageId = id;
@@ -1514,13 +1521,13 @@ async function runAgentLoop(
 
 			const resolvedReasoningEffort =
 				freshNarrator.reasoningEffort ??
-				(active.provider === "codex" ? settings.codex?.defaultReasoningEffort : undefined);
+				(resolved.provider === "codex" ? settings.codex?.defaultReasoningEffort : undefined);
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
 				conversationId: active.conversationId,
-				model: active.model,
-				provider: active.provider,
+				model: resolved.model,
+				provider: resolved.provider,
 				cwd: active.cwd,
 				systemPrompt: active.systemPrompt ?? undefined,
 				locale,
@@ -1603,7 +1610,7 @@ async function runAgentLoop(
 				hooks,
 			});
 
-			// --- Context length exceeded: compact progressively and retry ---
+			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 			if (result.contextLengthExceeded && active.alive) {
 				contextOverflowRetries++;
 				if (contextOverflowRetries > MAX_CONTEXT_OVERFLOW_RETRIES) {
@@ -1621,14 +1628,60 @@ async function runAgentLoop(
 					break;
 				}
 
-				logger.warn("Context length exceeded, attempting emergency compact", {
+				logger.warn("Context length exceeded, attempting emergency recovery", {
 					narratorId,
 					attempt: contextOverflowRetries,
+					provider: active.provider,
 				});
 				broadcastToNarrator(narratorId, {
 					type: "context_length_exceeded",
 					narratorId,
 				});
+
+				// Codex may fail before context_usage is emitted. In that case, force one
+				// max-strength prune pass first (strip tool calls up to compact boundary),
+				// then retry once before doing heavier compact.
+				if (active.provider === "codex" && contextOverflowRetries === 1) {
+					try {
+						const before = await db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { pruneBoundaryMessageId: true },
+						});
+						const pruneResult = await narratorService.computeAndUpdatePruneBoundary(
+							narratorId,
+							COMPACT_CONTEXT_USAGE_PCT,
+						);
+
+						if (pruneResult) {
+							broadcastToNarrator(narratorId, {
+								type: "prune_boundary",
+								narratorId,
+								boundaryMessageId: pruneResult.boundaryMessageId,
+								prunedPercent: pruneResult.prunedPercent,
+							});
+						}
+
+						const boundaryAdvanced =
+							!!pruneResult && pruneResult.boundaryMessageId !== before?.pruneBoundaryMessageId;
+						if (boundaryAdvanced) {
+							active._pruneBoundaryMessageId = pruneResult.boundaryMessageId;
+							logger.warn(
+								"Context length exceeded, applied aggressive prune and retrying before compact",
+								{
+									narratorId,
+									boundaryMessageId: pruneResult.boundaryMessageId,
+									prunedPercent: pruneResult.prunedPercent,
+								},
+							);
+							continue;
+						}
+					} catch (pruneErr) {
+						logger.error("Aggressive prune before compact failed", {
+							narratorId,
+							error: String(pruneErr),
+						});
+					}
+				}
 
 				// Try compact with increasing keepPairs: 2 → 3 → 4 → ...
 				// Start with keepPairs=2 (most aggressive — compress everything except
