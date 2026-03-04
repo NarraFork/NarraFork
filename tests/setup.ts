@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS narrators (
 	model TEXT DEFAULT 'claude-sonnet',
 	system_prompt TEXT,
 	permission_mode TEXT DEFAULT 'default',
+	reasoning_effort TEXT,
 	plan_mode INTEGER NOT NULL DEFAULT 0,
 	message_count INTEGER DEFAULT 0,
 	total_cost_usd REAL DEFAULT 0,
@@ -107,6 +108,8 @@ CREATE TABLE IF NOT EXISTS narrators (
 	error_message TEXT,
 	todos_json TEXT,
 	todos_tool_use_id TEXT,
+	prune_boundary_message_id TEXT REFERENCES narrator_messages(id),
+	pruned_percent INTEGER,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
@@ -124,6 +127,7 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	context_percent REAL,
 	meter_usage REAL,
 	meter_unit TEXT,
+	commit_sha TEXT,
 	created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS narrator_message_refs (
@@ -131,7 +135,8 @@ CREATE TABLE IF NOT EXISTS narrator_message_refs (
 	narrator_id TEXT NOT NULL REFERENCES narrators(id),
 	message_id TEXT NOT NULL REFERENCES narrator_messages(id),
 	seq INTEGER NOT NULL,
-	is_compact INTEGER NOT NULL DEFAULT 0
+	is_compact INTEGER NOT NULL DEFAULT 0,
+	pruned_percent INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_narrator_refs_unique ON narrator_message_refs(narrator_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_narrator_refs_seq ON narrator_message_refs(narrator_id, seq);

@@ -64,9 +64,22 @@ function seedMessage(
 		.run();
 }
 
-function seedRef(narratorId: string, messageId: string, seq: number, isCompact = 0) {
+function seedRef(
+	narratorId: string,
+	messageId: string,
+	seq: number,
+	isCompact = 0,
+	prunedPercent?: number | null,
+) {
 	db.insert(narratorMessageRefs)
-		.values({ id: `ref-${narratorId}-${messageId}`, narratorId, messageId, seq, isCompact })
+		.values({
+			id: `ref-${narratorId}-${messageId}`,
+			narratorId,
+			messageId,
+			seq,
+			isCompact,
+			prunedPercent: prunedPercent ?? null,
+		})
 		.run();
 }
 

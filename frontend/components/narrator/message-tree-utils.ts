@@ -4,12 +4,19 @@
  * React Query's cached message pages.
  */
 
-import type { ContentBlock, ToolCallRecord, TreeMessage } from "@frontend/lib/api";
+import type {
+	BaseContentBlock,
+	ContentBlock,
+	ToolCallRecord,
+	TreeMessage,
+} from "@frontend/lib/api";
 
 interface ToolCall {
 	toolUseId: string;
 	status?: string;
 	outputJson?: unknown;
+	toolName?: string;
+	inputJson?: unknown;
 	[key: string]: unknown;
 }
 
@@ -20,16 +27,15 @@ interface ToolCall {
  * from WS events like tool_completed / tool_started / permission changes.
  */
 function syncContentJsonFields(
-	contentJson: unknown[],
+	contentJson: ContentBlock[],
 	toolUseId: string,
 	fields: Record<string, unknown>,
-): unknown[] {
+): ContentBlock[] {
 	let changed = false;
 	const result = contentJson.map((block) => {
-		const b = block as Record<string, unknown>;
-		if (b.type !== "tool_use" || b.id !== toolUseId) return block;
+		if (block.type !== "tool_use" || block.id !== toolUseId) return block;
 		changed = true;
-		return { ...b, ...fields };
+		return { ...block, ...fields } as ContentBlock;
 	});
 	return changed ? result : contentJson;
 }
@@ -151,7 +157,7 @@ export function mergeToolCallFieldsInTree(
 			});
 			if (tcChanged) {
 				anyChanged = true;
-				result = { ...result, toolCalls: updatedCalls };
+				result = { ...result, toolCalls: updatedCalls as ToolCallRecord[] };
 				// Sync enriched contentJson blocks
 				if (Array.isArray(result.contentJson)) {
 					result = {
@@ -203,7 +209,7 @@ export function updateToolCallInTree(
 				const fields: Record<string, unknown> = { status };
 				if (output !== undefined) fields.outputJson = output;
 				if (durationMs != null) fields.durationMs = durationMs;
-				result = { ...result, toolCalls: updatedCalls };
+				result = { ...result, toolCalls: updatedCalls as ToolCallRecord[] };
 				// Sync enriched contentJson blocks
 				if (Array.isArray(result.contentJson)) {
 					result = {
@@ -348,16 +354,20 @@ function mergeAtPath(
 		let enrichedContent = msg.contentJson;
 		if (Array.isArray(enrichedContent)) {
 			let contentChanged = false;
-			enrichedContent = enrichedContent.map((block: Record<string, unknown>) => {
+			enrichedContent = enrichedContent.map((block) => {
 				if (block.type !== "tool_use" || block.id !== toolUseId) return block;
 				contentChanged = true;
-				const merged = { ...block, ...fields };
+				const merged: BaseContentBlock = { ...block, ...fields };
 				if (fields.outputJson === undefined) merged.outputJson = block.outputJson;
 				return merged;
 			});
 			if (!contentChanged) enrichedContent = msg.contentJson;
 		}
-		updated[idx] = { ...msg, toolCalls: updatedCalls, contentJson: enrichedContent };
+		updated[idx] = {
+			...msg,
+			toolCalls: updatedCalls as ToolCallRecord[],
+			contentJson: enrichedContent,
+		};
 	} else {
 		// Navigate deeper into children
 		if (!msg.children?.length) return messages;
@@ -587,8 +597,8 @@ function upsertStreamingChildOnMsg(
 	const existing = existingIdx !== -1 ? children[existingIdx] : null;
 
 	const { blocks, toolCalls } = upsertStreamingToolBlock(
-		existing ? [...(existing.contentJson as ContentBlock[])] : [],
-		existing ? [...(existing.toolCalls as ToolCallRecord[])] : [],
+		existing ? [...existing.contentJson] : [],
+		existing ? [...existing.toolCalls] : [],
 		toolUseId,
 		toolName,
 		{ _streamingChars: inputCharsTotal },
@@ -638,8 +648,8 @@ function upsertStreamingChildInMessages(
 			const existing = existingIdx !== -1 ? children[existingIdx] : null;
 
 			const { blocks, toolCalls } = upsertStreamingToolBlock(
-				existing ? [...(existing.contentJson as ContentBlock[])] : [],
-				existing ? [...(existing.toolCalls as ToolCallRecord[])] : [],
+				existing ? [...existing.contentJson] : [],
+				existing ? [...existing.toolCalls] : [],
 				toolUseId,
 				toolName,
 				{ _streamingChars: inputCharsTotal },

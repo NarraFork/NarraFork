@@ -45,10 +45,57 @@ async function request<T>(
 	return response.json();
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: SDK content blocks have dynamic structure
-export type ContentBlock = any;
-// biome-ignore lint/suspicious/noExplicitAny: SDK tool call records have dynamic structure
-export type ToolCallRecord = any;
+export interface BaseContentBlock {
+	type: string;
+	text?: string;
+	thinking?: string;
+	name?: string;
+	id?: string;
+	input?: Record<string, unknown>;
+	inputJson?: unknown;
+	outputJson?: unknown;
+	status?: string;
+	durationMs?: number;
+	errorMessage?: string;
+	permissionDecisionReason?: string | null;
+	permissionSuggestions?: unknown[] | null;
+	permissionDecidedAt?: string | null;
+	tcId?: string;
+	tcCreatedAt?: string;
+	subtype?: string;
+	summary?: string;
+	previewUrl?: string;
+	imageId?: string;
+	filename?: string;
+	mediaType?: string;
+	[key: string]: unknown;
+}
+
+export interface ToolUseContentBlock extends BaseContentBlock {
+	type: "tool_use";
+	id: string;
+	name: string;
+}
+
+export type ContentBlock = BaseContentBlock;
+
+export interface ToolCallRecord {
+	id?: string;
+	toolUseId: string;
+	toolName: string;
+	inputJson?: unknown;
+	outputJson?: unknown;
+	status?: string;
+	durationMs?: number;
+	errorMessage?: string;
+	permissionDecidedBy?: string | null;
+	permissionDecidedAt?: string | null;
+	permissionDenyMessage?: string | null;
+	permissionDecisionReason?: string | null;
+	permissionSuggestions?: unknown[] | null;
+	createdAt?: string;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 

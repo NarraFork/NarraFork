@@ -4,10 +4,11 @@ import type {
 	FlatToolItem,
 	MessagesQueryData,
 	NarratorMsg,
+	PendingPermission,
 	ToolCallRow,
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
-import type { PendingPermission, ToolCallData } from "./ToolCallCard";
+import type { ToolCallData } from "./ToolCallCard";
 
 export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -41,7 +42,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 		const isEnriched = block.status !== undefined;
 		const tc = isEnriched
 			? null
-			: msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === block.id);
+			: msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === (block.id ?? ""));
 		const status = block.status ?? tc?.status ?? "running";
 		// Derive startedAt for in-progress tools from persisted timestamps so the
 		// elapsed timer works correctly when re-entering a session.
@@ -94,7 +95,7 @@ export function resolvePendingPerm(
 			inputJson: tc.inputJson,
 			decisionReason: tc.permissionDecisionReason ?? undefined,
 			suggestions: tc.permissionSuggestions ?? undefined,
-		} as PendingPermission;
+		};
 	}
 	return null;
 }

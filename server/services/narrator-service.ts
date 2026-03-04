@@ -666,10 +666,19 @@ export const narratorService = {
 	},
 
 	/**
-	 * Shared helper: fetch all post-last-compact top-level user/assistant message refs.
-	 * Used by both `getCompactBoundaryMessage` and `computeAndUpdatePruneBoundary`.
+	 * Shared helper: fetch post-last-compact user/assistant message refs used by
+	 * prune/compact boundary calculations.
+	 *
+	 * For primary narrators, only top-level messages are included.
+	 * For subagent narrators, all messages are treated as top-level-equivalent
+	 * (they are stored with parentToolUseId set).
 	 */
-	async _getPostCompactTopLevelRefs(narratorId: string) {
+	async _getPostCompactTopLevelRefs(
+		narratorId: string,
+		options?: { includeChildMessages?: boolean },
+	) {
+		const includeChildMessages = options?.includeChildMessages ?? false;
+
 		const lastCompactRow = await db
 			.select({ seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -693,7 +702,7 @@ export const narratorService = {
 					eq(narratorMessageRefs.narratorId, narratorId),
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNull(narratorMessages.parentToolUseId),
+					...(includeChildMessages ? [] : [isNull(narratorMessages.parentToolUseId)]),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
@@ -708,7 +717,10 @@ export const narratorService = {
 	 * Returns null if there aren't enough messages to make compacting worthwhile.
 	 */
 	async getCompactBoundaryMessage(narratorId: string, keepPairs = 2): Promise<string | null> {
-		const refs = await this._getPostCompactTopLevelRefs(narratorId);
+		const includeChildMessages = await this.isSubagentNarrator(narratorId);
+		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
+			includeChildMessages,
+		});
 
 		// Count how many messages to keep: keepPairs * 2 (user + assistant each)
 		const keepCount = keepPairs * 2;
@@ -2258,7 +2270,10 @@ export const narratorService = {
 		const pruneRatio = t * t;
 
 		// Reuse the shared helper — same data that getCompactBoundaryMessage uses
-		const refs = await this._getPostCompactTopLevelRefs(narratorId);
+		const includeChildMessages = await this.isSubagentNarrator(narratorId);
+		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
+			includeChildMessages,
+		});
 
 		// Compact keeps the last 4 messages (2 pairs). Need at least 6 to have
 		// something prunable (4 kept + at least 2 to prune/compact).

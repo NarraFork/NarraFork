@@ -263,6 +263,14 @@ describe("prompt injection: interpreter code execution", () => {
 	});
 	test("npx tsc --noEmit → allow (strict allowlist)", () => expectAllowed("npx tsc --noEmit"));
 	test("npx tsc src/index.ts → allow (file path)", () => expectAllowed("npx tsc src/index.ts"));
+	test("npx tsc --noEmit --pretty false → allow (tsc safe args)", () =>
+		expectAllowed("npx tsc --noEmit --pretty false"));
+	test("npx tsc --listFiles → allow (tsc safe args)", () => expectAllowed("npx tsc --listFiles"));
+	test("npx tsc --showConfig → allow (tsc safe args)", () => expectAllowed("npx tsc --showConfig"));
+	test("npx tsc --outDir /tmp/out → allow (tsc write args gated by permission mode)", () =>
+		expectAllowed("npx tsc --outDir /tmp/out"));
+	test("npx tsc --incremental → allow (tsc write args gated by permission mode)", () =>
+		expectAllowed("npx tsc --incremental"));
 	test("npx vitest → ask (not in strict safe args)", () => expectBlocked("npx vitest"));
 	test("npx -p vitest vitest → ask (dynamic package source)", () =>
 		expectBlocked("npx -p vitest vitest"));
@@ -763,6 +771,38 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				cwd,
 				false,
 				allSafe,
+			),
+		).toBe("allow");
+	});
+
+	test("default + tsc write args → ask", async () => {
+		const analysis = await analyzeBashCommand("npx tsc --outDir /tmp/out", cwd, false);
+		expect(analysis.allWhitelisted).toBe(true);
+		expect(analysis.hasWriteOperation).toBe(true);
+		expect(
+			resolvePermissionDecision(
+				"Bash",
+				{ command: "npx tsc --outDir /tmp/out" },
+				"default",
+				cwd,
+				false,
+				analysis,
+			),
+		).toBe("ask");
+	});
+
+	test("acceptEdits + tsc write args → allow", async () => {
+		const analysis = await analyzeBashCommand("npx tsc --outDir /tmp/out", cwd, false);
+		expect(analysis.allWhitelisted).toBe(true);
+		expect(analysis.hasWriteOperation).toBe(true);
+		expect(
+			resolvePermissionDecision(
+				"Bash",
+				{ command: "npx tsc --outDir /tmp/out" },
+				"acceptEdits",
+				cwd,
+				false,
+				analysis,
 			),
 		).toBe("allow");
 	});

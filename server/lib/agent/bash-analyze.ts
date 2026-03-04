@@ -312,6 +312,86 @@ const BIOME_WRITE_ARG_PREFIXES = [
 	"--unsafe", // 应用不安全的修复
 ];
 
+/** TypeScript 特定的只读参数前缀 */
+const TSC_SAFE_ARG_PREFIXES = [
+	"--pretty",
+	"--listFiles",
+	"--listFilesOnly",
+	"--explainFiles",
+	"--showConfig",
+	"--traceResolution",
+	"--diagnostics",
+	"--extendedDiagnostics",
+	"--generateTrace",
+	"--sourceMap",
+	"--inlineSourceMap",
+	"--rootDir",
+	"--removeComments",
+	"--importHelpers",
+	"--downlevelIteration",
+	"--isolatedModules",
+	"--strict",
+	"--noImplicitAny",
+	"--strictNullChecks",
+	"--strictFunctionTypes",
+	"--strictBindCallApply",
+	"--strictPropertyInitialization",
+	"--noImplicitThis",
+	"--alwaysStrict",
+	"--noUnusedLocals",
+	"--noUnusedParameters",
+	"--noImplicitReturns",
+	"--noFallthroughCasesInSwitch",
+	"--noUncheckedIndexedAccess",
+	"--noImplicitOverride",
+	"--allowUnusedLabels",
+	"--allowUnreachableCode",
+	"--skipLibCheck",
+	"--skipDefaultLibCheck",
+	"--moduleResolution",
+	"--module",
+	"--target",
+	"--lib",
+	"--jsx",
+	"--jsxFactory",
+	"--jsxFragmentFactory",
+	"--jsxImportSource",
+	"--experimentalDecorators",
+	"--emitDecoratorMetadata",
+	"--resolveJsonModule",
+	"--esModuleInterop",
+	"--allowSyntheticDefaultImports",
+	"--forceConsistentCasingInFileNames",
+	"--allowJs",
+	"--checkJs",
+	"--maxNodeModuleJsDepth",
+	"--types",
+	"--typeRoots",
+	"--paths",
+	"--baseUrl",
+	"--rootDirs",
+	"--preserveSymlinks",
+	"--charset",
+	"--newLine",
+	"--useDefineForClassFields",
+	"--preserveConstEnums",
+	"--preserveValueImports",
+	"--assumeChangesOnlyAffectDirectDependencies",
+];
+
+/** TypeScript 写操作参数 — 只在 acceptEdits 模式下允许 */
+const TSC_WRITE_ARG_PREFIXES = [
+	"--incremental",
+	"--tsBuildInfoFile",
+	"--composite",
+	"--declaration",
+	"--declarationMap",
+	"--emitDeclarationOnly",
+	"--declarationDir",
+	"--outDir",
+	"--outFile",
+];
+
 /** 会触发远程拉包或动态来源的高风险参数。 */
 const PACKAGE_RUNNER_DANGEROUS_FLAGS = new Set([
 	"-p",
@@ -411,6 +491,17 @@ function classifyPackageRunner(tokens: string[], runner: string): PackageRunnerC
 				}
 				// 检查写操作参数
 				if (BIOME_WRITE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					hasWriteOperation = true;
+					continue;
+				}
+			}
+			// TypeScript 特定参数：检查前缀匹配
+			if (isTsc) {
+				const argName = arg.split("=")[0];
+				if (TSC_SAFE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					continue;
+				}
+				if (TSC_WRITE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
 					hasWriteOperation = true;
 					continue;
 				}

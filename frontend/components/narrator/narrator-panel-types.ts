@@ -1,7 +1,12 @@
 import { IconHandStop, IconPencilCheck, IconShield, IconShieldOff } from "@tabler/icons-react";
 import { createElement } from "react";
-import type { PaginatedMessages, TreeMessage } from "../../lib/api";
-import type { PendingPermission } from "./ToolCallCard";
+import type {
+	BaseContentBlock,
+	ToolCallRecord,
+	ToolUseContentBlock,
+	TreeMessage,
+} from "../../lib/api";
+import type { ToolCallData } from "./ToolCallCard";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {
@@ -26,43 +31,38 @@ if (typeof document !== "undefined") {
 }
 
 export interface TodoItem {
+	id?: string;
 	content?: string;
 	status?: string;
 	activeForm?: string;
 }
 
-export type MessagesPage = PaginatedMessages;
+export type MessagesPage = {
+	messages: NarratorMsg[];
+	hasMore: boolean;
+	nextCursor: string | null;
+	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
+};
 
 export interface MessagesQueryData {
 	pages: MessagesPage[];
 	pageParams: unknown[];
 }
 
-export interface ContentBlock {
-	type: string;
-	text?: string;
-	name?: string;
-	id?: string;
-	input?: Record<string, unknown>;
-	[key: string]: unknown;
-}
-
-export interface ToolCallRow {
-	id?: string;
-	toolUseId: string;
-	toolName: string;
-	inputJson?: unknown;
-	outputJson?: unknown;
-	status?: string;
-	durationMs?: number;
-	errorMessage?: string;
-	permissionDecisionReason?: string | null;
-	permissionSuggestions?: unknown[] | null;
-	createdAt?: string;
-	permissionDecidedAt?: string | null;
-}
-
 export type NarratorMsg = TreeMessage;
+export type ContentBlock = BaseContentBlock;
+export type ToolCallRow = ToolCallRecord;
+export type ToolUseBlock = ToolUseContentBlock;
+
+export interface PendingPermission {
+	id: string;
+	toolName: string;
+	toolUseId?: string;
+	inputJson: unknown;
+	decisionReason?: string;
+	suggestions?: unknown[];
+}
 
 export interface PermissionCallbacks {
 	pendingPermission: PendingPermission | null;
@@ -79,8 +79,6 @@ export interface PermissionCallbacks {
 	bgRetryDismissedIds: Set<string>;
 }
 
-import type { ToolCallData } from "./ToolCallCard";
-
 export type FlatToolItem =
 	| {
 			kind: "tool";
@@ -95,36 +93,54 @@ export type FlatToolItem =
 			reasoningText: string;
 	  };
 
+export interface NarratorPanelSnapshot {
+	id: string;
+	chapterId?: string | null;
+	title?: string | null;
+	model: string | null;
+	status: string;
+	totalCostUsd: number | null;
+	permissionMode: string | null;
+	planMode?: boolean | null;
+	todosJson?: TodoItem[] | null;
+	todosToolUseId?: string | null;
+	errorMessage?: string | null;
+	reasoningEffort?: string | null;
+}
+
 export interface NarratorPanelProps {
 	narratorId: string;
-	narrator?: {
-		id: string;
-		chapterId?: string | null;
-		title?: string | null;
-		model: string | null;
-		status: string;
-		totalCostUsd: number | null;
-		permissionMode: string | null;
-		planMode?: boolean | null;
-		todosJson?: TodoItem[] | null;
-		todosToolUseId?: string | null;
-	};
+	narrator?: NarratorPanelSnapshot;
 	onForkFromMessage?: (messageUuid: string) => void;
 	highlightMessageId?: string;
-	/** Write selected chat text to the paired terminal panel. Provided by the session layout when a terminal is open. */
 	onSendToTerminal?: (text: string) => void;
-	/** Ref callback exposed to the parent so the terminal panel can append text into the chat input. */
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
-	/** Whether the terminal panel is currently visible. Controls the toggle button state. */
 	terminalOpen?: boolean;
-	/** Callback to toggle terminal panel visibility. When provided, shows the terminal toggle button. */
 	onToggleTerminal?: () => void;
 }
 
-export const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
+export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
+
+export const SUBAGENT_STREAMING_ID_PREFIX = "__streaming_subagent_";
+
+export function isToolUseBlock(block: ContentBlock): block is ToolUseBlock {
+	return block.type === "tool_use" && typeof block.id === "string";
+}
+
+export function isStreamingChunksMessage(msg: NarratorMsg | null | undefined): boolean {
+	return !!msg && msg.id === STREAMING_CHUNKS_MSG_ID;
+}
+
+export function isSubagentStreamingMessage(msg: NarratorMsg | null | undefined): boolean {
+	return !!msg && msg.id.startsWith(SUBAGENT_STREAMING_ID_PREFIX);
+}
+
+export function isNoMergeMessage(msg: NarratorMsg | null | undefined): boolean {
+	return !!msg?._noMerge;
+}
 
 export const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
 	default: createElement(IconShield, { size: 14 }),

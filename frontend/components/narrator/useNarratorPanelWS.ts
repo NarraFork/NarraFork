@@ -22,12 +22,11 @@ import type {
 	MessagesPage,
 	MessagesQueryData,
 	NarratorMsg,
+	PendingPermission,
 	PermissionCallbacks,
 	TodoItem,
-	ToolCallRow,
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
-import type { PendingPermission } from "./ToolCallCard";
 
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
@@ -361,7 +360,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
 			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
 			if (toolUseId && perm) {
-				const mergedInput = { ...perm.inputJson, answers };
+				const baseInput =
+					perm.inputJson && typeof perm.inputJson === "object" ? perm.inputJson : {};
+				const mergedInput = { ...baseInput, answers };
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(
@@ -558,7 +559,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							const om = updated[optimisticIdx];
 							if (Array.isArray(om.contentJson)) {
 								for (const block of om.contentJson) {
-									if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
+									if (typeof block.previewUrl === "string") {
+										URL.revokeObjectURL(block.previewUrl);
+									}
 								}
 							}
 							updated[optimisticIdx] = newMsg;
@@ -604,9 +607,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						const om = updated[optimisticIdx];
 						if (Array.isArray(om.contentJson)) {
 							for (const block of om.contentJson) {
-								if (block.previewUrl) URL.revokeObjectURL(block.previewUrl);
+								if (typeof block.previewUrl === "string") {
+									URL.revokeObjectURL(block.previewUrl);
+								}
 							}
 						}
+
 						updated[optimisticIdx] = newMsg;
 						firstPage.messages = updated;
 					} else {
@@ -715,8 +721,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								const existing = existingIdx !== -1 ? firstPage.messages[existingIdx] : null;
 
 								const { blocks, toolCalls } = upsertStreamingToolBlock(
-									existing ? [...(existing.contentJson as ContentBlock[])] : [],
-									existing ? [...(existing.toolCalls as ToolCallRow[])] : [],
+									existing ? [...existing.contentJson] : [],
+									existing ? [...existing.toolCalls] : [],
 									chunk.toolUseId,
 									chunk.toolName,
 									{
