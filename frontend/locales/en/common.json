@@ -95,5 +95,12 @@
 	"containerSetupNotConfigured": "Not configured",
 	"containerSetupReady": "All Ready",
 	"containerSetupNotReady": "Not Ready",
-	"containerSetupRecheck": "Recheck"
+	"containerSetupRecheck": "Recheck",
+	"activeTerminals": "{{count}} active terminal(s)",
+	"viewersWatching": "{{count}} people viewing",
+	"containerRunning": "Container running",
+	"containerPaused": "Container paused",
+	"containerStopped": "Container stopped",
+	"containerCreated": "Container created",
+	"containerRemoved": "Container removed"
 }

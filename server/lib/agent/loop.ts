@@ -30,7 +30,31 @@ const RETRYABLE_PATTERNS = [
 	"temporarily unavailable",
 	"capacity",
 	"try again",
+	"socket connection was closed unexpectedly",
+	"connection was closed unexpectedly",
+	"socket hang up",
+	"connection reset",
+	"econnreset",
+	"etimedout",
+	"eai_again",
+	"fetch failed",
+	"failed to fetch",
+	"network error",
 ];
+
+/** Error codes that represent transient network/transport failures. */
+const RETRYABLE_ERROR_CODES = new Set([
+	"ECONNRESET",
+	"EPIPE",
+	"ETIMEDOUT",
+	"EAI_AGAIN",
+	"ENETDOWN",
+	"ENETUNREACH",
+	"ECONNREFUSED",
+	"UND_ERR_SOCKET",
+	"UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_HEADERS_TIMEOUT",
+]);
 
 const NON_RETRYABLE_PATTERNS = [
 	"usage_limit_reached",
@@ -96,22 +120,92 @@ function isRetryableError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;
-	// Check for known retryable reason/code fields
+
 	const obj = err as Record<string, unknown>;
+	const nested = obj.error;
+	const nestedObj =
+		nested && typeof nested === "object" ? (nested as Record<string, unknown>) : undefined;
+	const cause = obj.cause;
+	const causeObj =
+		cause && typeof cause === "object" ? (cause as Record<string, unknown>) : undefined;
+
+	const msgCandidates = [
+		obj.message,
+		typeof obj.error === "string" ? obj.error : undefined,
+		nestedObj?.message,
+		typeof nestedObj?.error === "string" ? nestedObj.error : undefined,
+		causeObj?.message,
+		typeof causeObj?.error === "string" ? causeObj.error : undefined,
+	]
+		.filter((value): value is string => typeof value === "string")
+		.map((value) => value.toLowerCase());
+
+	// Message-based hard quota / plan restrictions should never retry.
+	if (msgCandidates.some((msg) => NON_RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
+		return false;
+	}
+
+	// Check for known retryable reason/code fields.
 	if (
 		obj.reason === "MODEL_TEMPORARILY_UNAVAILABLE" ||
 	) {
 		return true;
 	}
-	// Check error message patterns first: some 429s are hard quota and should NOT retry.
-	const msg = (obj.message ?? obj.error ?? "").toString().toLowerCase();
-	if (NON_RETRYABLE_PATTERNS.some((p) => msg.includes(p))) {
-		return false;
+
+	const directCode =
+		typeof obj.code === "string"
+			? obj.code.toUpperCase()
+			: typeof obj.reason === "string"
+				? obj.reason.toUpperCase()
+				: undefined;
+	if (directCode && RETRYABLE_ERROR_CODES.has(directCode)) {
+		return true;
 	}
-	// Check HTTP status codes
+
+	const nestedCode =
+		typeof nestedObj?.code === "string"
+			? nestedObj.code.toUpperCase()
+			: typeof nestedObj?.type === "string"
+				? nestedObj.type.toUpperCase()
+				: typeof nestedObj?.reason === "string"
+					? nestedObj.reason.toUpperCase()
+					: undefined;
+	if (nestedCode && RETRYABLE_ERROR_CODES.has(nestedCode)) {
+		return true;
+	}
+
+	const causeCode =
+		typeof causeObj?.code === "string"
+			? causeObj.code.toUpperCase()
+			: typeof causeObj?.reason === "string"
+				? causeObj.reason.toUpperCase()
+				: undefined;
+	if (causeCode && RETRYABLE_ERROR_CODES.has(causeCode)) {
+		return true;
+	}
+
+	// Check HTTP status codes.
 	if (typeof obj.status === "number" && RETRYABLE_STATUS_CODES.has(obj.status)) return true;
-	if (typeof obj.statusCode === "number" && RETRYABLE_STATUS_CODES.has(obj.statusCode)) return true;
-	return RETRYABLE_PATTERNS.some((p) => msg.includes(p));
+	if (typeof obj.statusCode === "number" && RETRYABLE_STATUS_CODES.has(obj.statusCode)) {
+		return true;
+	}
+	if (typeof nestedObj?.status === "number" && RETRYABLE_STATUS_CODES.has(nestedObj.status)) {
+		return true;
+	}
+	if (
+		typeof nestedObj?.statusCode === "number" &&
+		RETRYABLE_STATUS_CODES.has(nestedObj.statusCode)
+	) {
+		return true;
+	}
+	if (typeof causeObj?.status === "number" && RETRYABLE_STATUS_CODES.has(causeObj.status)) {
+		return true;
+	}
+	if (typeof causeObj?.statusCode === "number" && RETRYABLE_STATUS_CODES.has(causeObj.statusCode)) {
+		return true;
+	}
+
+	return msgCandidates.some((msg) => RETRYABLE_PATTERNS.some((p) => msg.includes(p)));
 }
 
 /** Minimum interval between tool_output events (ms). */

@@ -5,6 +5,12 @@ import { queryClient as globalQC } from "../lib/query-client";
 
 // === Types ===
 
+export interface RecentTabViewer {
+	userId: string;
+	username: string;
+	avatarColor: string | null;
+}
+
 export interface RecentTab {
 	type: "chapter" | "narrator" | "project";
 	id: string;
@@ -14,6 +20,10 @@ export interface RecentTab {
 	subtitle?: string;
 	status?: string;
 	lastVisitedAt: number;
+	// Runtime-enriched fields (not persisted to DB)
+	activeTerminalCount?: number;
+	viewers?: RecentTabViewer[];
+	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 }
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];

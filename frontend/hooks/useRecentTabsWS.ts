@@ -78,6 +78,16 @@ export function useRecentTabsWS(
 						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
 					} else if (data.type === "presence_update") {
 						onUpdateRef.current(nId, { type: "presence", viewers: data.viewers });
+					} else if (data.type === "terminal_count_changed") {
+						onUpdateRef.current(nId, {
+							type: "terminalCount",
+							activeTerminalCount: data.activeTerminalCount,
+						});
+					} else if (data.type === "container_status_changed") {
+						onUpdateRef.current(nId, {
+							type: "containerStatus",
+							containerStatus: data.containerStatus,
+						});
 					} else if (data.type === "ping") {
 						ws.send(JSON.stringify({ type: "pong" }));
 					} else if (data.type.startsWith("user:")) {

@@ -1,7 +1,8 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
-import { narrators, userPreferences } from "../db/schema";
+import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
+import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -11,6 +12,7 @@ import {
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
+import { getNarratorPresenceBatch } from "../websocket/narrator-ws";
 
 export const userPreferencesRoutes = new Hono();
 
@@ -97,6 +99,64 @@ userPreferencesRoutes.get("/", async (c) => {
 				const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
 				if (nId && statusMap.has(nId)) {
 					tab.status = statusMap.get(nId);
+				}
+			}
+
+			// Enrich with active terminal counts
+			const termRows = await db
+				.select({
+					narratorId: terminals.narratorId,
+					count: countFn(),
+				})
+				.from(terminals)
+				.where(and(inArray(terminals.narratorId, narratorIds), eq(terminals.status, "running")))
+				.groupBy(terminals.narratorId);
+			const termCountMap = new Map(termRows.map((r) => [r.narratorId, r.count]));
+			for (const tab of recentTabs) {
+				const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
+				if (nId && termCountMap.has(nId)) {
+					tab.activeTerminalCount = termCountMap.get(nId);
+				}
+			}
+
+			// Enrich with presence (from in-memory map)
+			const presenceMap = getNarratorPresenceBatch(narratorIds);
+			for (const tab of recentTabs) {
+				const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
+				if (nId) {
+					const viewers = presenceMap.get(nId);
+					if (viewers && viewers.length > 0) {
+						tab.viewers = viewers;
+					}
+				}
+			}
+		}
+
+		// Enrich chapter tabs with container status
+		const chapterIds = recentTabs.filter((t) => t.type === "chapter").map((t) => t.id as string);
+		if (chapterIds.length > 0) {
+			const containerRows = await db
+				.select({
+					chapterId: containerInstances.chapterId,
+					status: containerInstances.status,
+				})
+				.from(containerInstances)
+				.where(inArray(containerInstances.chapterId, chapterIds));
+
+			// Aggregate: pick the most "active" status per chapter
+			const containerStatusMap = new Map<string, string>();
+			for (const row of containerRows) {
+				const existing = containerStatusMap.get(row.chapterId);
+				if (
+					!existing ||
+					(CONTAINER_STATUS_PRIORITY[row.status] ?? 0) > (CONTAINER_STATUS_PRIORITY[existing] ?? 0)
+				) {
+					containerStatusMap.set(row.chapterId, row.status);
+				}
+			}
+			for (const tab of recentTabs) {
+				if (tab.type === "chapter" && containerStatusMap.has(tab.id as string)) {
+					tab.containerStatus = containerStatusMap.get(tab.id as string);
 				}
 			}
 		}

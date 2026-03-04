@@ -442,11 +442,13 @@ export function useNarratorWS(
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
 export interface NarratorListWSEvent {
-	type: "status" | "title" | "planMode" | "presence";
+	type: "status" | "title" | "planMode" | "presence" | "terminalCount" | "containerStatus";
 	status?: string;
 	title?: string;
 	planMode?: boolean;
 	viewers?: Array<{ userId: string; username: string; avatarColor: string | null }>;
+	activeTerminalCount?: number;
+	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 }
 
 export function useNarratorsListWS(

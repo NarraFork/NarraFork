@@ -5,6 +5,7 @@ import { db } from "../db";
 import { chapters, narrators, terminals } from "../db/schema";
 import { detectShell } from "../lib/agent/shell";
 import { NotFoundError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { BufferManager } from "../terminal/buffer-manager";
@@ -56,6 +57,44 @@ interface ActiveTerminal {
 }
 
 const activeTerminals = new Map<string, ActiveTerminal>();
+
+/**
+ * Mark a terminal as exited in DB and emit the lifecycle event.
+ *
+ * @param narratorId - Pass `null` if the terminal has no narrator.
+ *   Pass `undefined` (or omit) to have the function look up the value from DB.
+ * @param chapterId  - Same convention as narratorId.
+ */
+async function markTerminalExited(
+	terminalId: string,
+	exitCode: number | null,
+	narratorId?: string | null,
+	chapterId?: string | null,
+) {
+	await db
+		.update(terminals)
+		.set({ status: "exited", exitCode: exitCode ?? 0 })
+		.where(eq(terminals.id, terminalId));
+	// Resolve narrator/chapter IDs if not provided
+	let nId = narratorId;
+	let cId = chapterId;
+	if (nId === undefined || cId === undefined) {
+		const row = await db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+			columns: { narratorId: true, chapterId: true },
+		});
+		if (row) {
+			if (nId === undefined) nId = row.narratorId;
+			if (cId === undefined) cId = row.chapterId;
+		}
+	}
+	eventBus.emit({
+		type: "terminal:exited",
+		terminalId,
+		narratorId: nId ?? null,
+		chapterId: cId ?? null,
+	});
+}
 
 function onData(id: string, buffer: BufferManager, data: string | Uint8Array) {
 	const text = typeof data === "string" ? data : new TextDecoder().decode(data);
@@ -185,10 +224,7 @@ export const terminalService = {
 			active.buffer.dispose();
 			activeTerminals.delete(id);
 			pty.close();
-			await db
-				.update(terminals)
-				.set({ status: "exited", exitCode: code ?? 0 })
-				.where(eq(terminals.id, id));
+			await markTerminalExited(id, code ?? 0, narratorId ?? null, chapterId ?? null);
 			sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
 			logger.info("Terminal exited", { terminalId: id, code });
 		});
@@ -208,6 +244,12 @@ export const terminalService = {
 			.returning();
 
 		logger.info("Terminal created", { id, chapterId, narratorId, useDtach });
+		eventBus.emit({
+			type: "terminal:created",
+			terminalId: id,
+			narratorId: narratorId ?? null,
+			chapterId: chapterId ?? null,
+		});
 		return terminal;
 	},
 
@@ -251,10 +293,7 @@ export const terminalService = {
 		});
 		if (!terminal) throw new NotFoundError("Terminal", terminalId);
 
-		await db
-			.update(terminals)
-			.set({ status: "exited", exitCode: -1 })
-			.where(eq(terminals.id, terminalId));
+		await markTerminalExited(terminalId, -1, terminal.narratorId, terminal.chapterId);
 
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: -1 });
 		logger.info("Terminal killed", { terminalId });
@@ -385,10 +424,7 @@ export const terminalService = {
 			active.buffer.dispose();
 			activeTerminals.delete(terminalId);
 			attached.pty.close();
-			await db
-				.update(terminals)
-				.set({ status: "exited", exitCode: code ?? 0 })
-				.where(eq(terminals.id, terminalId));
+			await markTerminalExited(terminalId, code ?? 0);
 			sendToTerminal(terminalId, {
 				type: "exit",
 				terminalId,
@@ -511,10 +547,12 @@ export const terminalService = {
 						active.buffer.dispose();
 						activeTerminals.delete(terminal.id);
 						attached.pty.close();
-						await db
-							.update(terminals)
-							.set({ status: "exited", exitCode: code ?? 0 })
-							.where(eq(terminals.id, terminal.id));
+						await markTerminalExited(
+							terminal.id,
+							code ?? 0,
+							terminal.narratorId,
+							terminal.chapterId,
+						);
 						sendToTerminal(terminal.id, {
 							type: "exit",
 							terminalId: terminal.id,
@@ -528,7 +566,7 @@ export const terminalService = {
 			}
 
 			// No dtach or socket dead — mark as exited
-			await db.update(terminals).set({ status: "exited" }).where(eq(terminals.id, terminal.id));
+			await markTerminalExited(terminal.id, null, terminal.narratorId, terminal.chapterId);
 			marked++;
 		}
 

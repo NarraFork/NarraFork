@@ -115,6 +115,19 @@ export type NarraForkEvent =
 	| { type: "container:error"; chapterId: string; error: string }
 	| { type: "container:log"; chapterId: string; line: string }
 	| { type: "container:starting"; chapterId: string }
+	// Terminal lifecycle
+	| {
+			type: "terminal:created";
+			terminalId: string;
+			narratorId: string | null;
+			chapterId: string | null;
+	  }
+	| {
+			type: "terminal:exited";
+			terminalId: string;
+			narratorId: string | null;
+			chapterId: string | null;
+	  }
 	// Auto-commit
 	| {
 			type: "narrator:auto_commit";

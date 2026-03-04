@@ -10,13 +10,20 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Box, NavLink, Text } from "@mantine/core";
-import { IconFolder, IconGitBranch, IconMessageCircle } from "@tabler/icons-react";
+import { Box, Group, NavLink, Text, Tooltip } from "@mantine/core";
+import {
+	IconBox,
+	IconFolder,
+	IconGitBranch,
+	IconMessageCircle,
+	IconTerminal2,
+} from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
-import { type RecentTab, useRecentTabs } from "../../hooks/useRecentTabs";
+import { type RecentTab, type RecentTabViewer, useRecentTabs } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
@@ -26,6 +33,22 @@ const STATUS_COLORS: Record<string, string> = {
 	done: "var(--mantine-color-green-6)",
 	thinking: "var(--mantine-color-blue-6)",
 	waiting: "var(--mantine-color-orange-6)",
+};
+
+const CONTAINER_STATUS_COLORS: Record<string, string> = {
+	running: "var(--mantine-color-green-6)",
+	paused: "var(--mantine-color-yellow-6)",
+	stopped: "var(--mantine-color-red-6)",
+	created: "var(--mantine-color-gray-6)",
+	removed: "var(--mantine-color-gray-6)",
+};
+
+const CONTAINER_STATUS_I18N: Record<string, string> = {
+	running: "containerRunning",
+	paused: "containerPaused",
+	stopped: "containerStopped",
+	created: "containerCreated",
+	removed: "containerRemoved",
 };
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
@@ -105,9 +128,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
-			const patch: Partial<Pick<RecentTab, "title" | "status">> = {};
+			const patch: Partial<
+				Pick<RecentTab, "title" | "status" | "viewers" | "activeTerminalCount" | "containerStatus">
+			> = {};
 			if (event.type === "title" && event.title) patch.title = event.title;
 			else if (event.type === "status" && event.status) patch.status = event.status;
+			else if (event.type === "presence" && event.viewers) patch.viewers = event.viewers;
+			else if (event.type === "terminalCount" && event.activeTerminalCount !== undefined)
+				patch.activeTerminalCount = event.activeTerminalCount;
+			else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else return;
 
 			const isPromote = event.type === "status" && event.status === "thinking";
@@ -286,6 +315,7 @@ interface SortableTabItemProps {
 
 function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: SortableTabItemProps) {
 	const navigate = useNavigate();
+	const { t } = useTranslation("common");
 	const to =
 		tab.type === "project"
 			? `/projects/${tab.id}`
@@ -411,6 +441,7 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 							<IconMessageCircle size={14} color={iconColor} />
 						)
 					}
+					rightSection={tab.type !== "project" ? <TabIndicators tab={tab} t={t} /> : undefined}
 					styles={{
 						root: {
 							cursor: "pointer",
@@ -429,5 +460,92 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 				/>
 			</div>
 		</div>
+	);
+}
+
+// === Indicator components for extra tab info ===
+
+interface TabIndicatorsProps {
+	tab: RecentTab;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}
+
+function TabIndicators({ tab, t }: TabIndicatorsProps) {
+	const hasViewers = tab.viewers && tab.viewers.length >= 2;
+	const hasContainer = tab.type === "chapter" && tab.containerStatus;
+	const hasTerminals = (tab.activeTerminalCount ?? 0) > 0;
+
+	if (!hasViewers && !hasContainer && !hasTerminals) return null;
+
+	return (
+		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+			{hasViewers && <ViewerAvatars viewers={tab.viewers as RecentTabViewer[]} t={t} />}
+			{hasContainer && (
+				<Tooltip
+					label={t(CONTAINER_STATUS_I18N[tab.containerStatus as string] ?? "containerStopped")}
+					withArrow
+					position="right"
+				>
+					<IconBox
+						size={12}
+						color={
+							CONTAINER_STATUS_COLORS[tab.containerStatus as string] ??
+							"var(--mantine-color-gray-6)"
+						}
+					/>
+				</Tooltip>
+			)}
+			{hasTerminals && (
+				<Tooltip
+					label={t("activeTerminals", { count: tab.activeTerminalCount })}
+					withArrow
+					position="right"
+				>
+					<Group gap={1} wrap="nowrap">
+						<IconTerminal2 size={11} style={{ opacity: 0.6 }} />
+						<Text size="xs" c="dimmed" lh={1}>
+							{tab.activeTerminalCount}
+						</Text>
+					</Group>
+				</Tooltip>
+			)}
+		</Group>
+	);
+}
+
+interface ViewerAvatarsProps {
+	viewers: RecentTabViewer[];
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}
+
+const MAX_VISIBLE_AVATARS = 3;
+
+function ViewerAvatars({ viewers, t }: ViewerAvatarsProps) {
+	const visible = viewers.slice(0, MAX_VISIBLE_AVATARS);
+	const overflow = viewers.length - MAX_VISIBLE_AVATARS;
+
+	return (
+		<Tooltip label={t("viewersWatching", { count: viewers.length })} withArrow position="right">
+			<Group gap={-3} wrap="nowrap" style={{ cursor: "default" }}>
+				{visible.map((v) => (
+					<Box
+						key={v.userId}
+						style={{
+							width: 10,
+							height: 10,
+							borderRadius: "50%",
+							backgroundColor: v.avatarColor || "var(--mantine-color-gray-6)",
+							border: "1px solid var(--mantine-color-dark-7)",
+							flexShrink: 0,
+						}}
+					/>
+				))}
+				{overflow > 0 && (
+					<Text size="xs" c="dimmed" lh={1} ml={2}>
+						+{overflow}
+					</Text>
+				)}
+			</Group>
+		</Tooltip>
 	);
 }

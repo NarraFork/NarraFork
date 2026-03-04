@@ -1,4 +1,8 @@
 import type { ServerWebSocket } from "bun";
+import { and, count as countFn, eq } from "drizzle-orm";
+import { db } from "../db";
+import { containerInstances, narrators, terminals } from "../db/schema";
+import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { narratorWsMessageSchema } from "../lib/validators";
@@ -155,6 +159,17 @@ export type NarratorServerMessage =
 			type: "presence_update";
 			narratorId: string;
 			viewers: Array<{ userId: string; username: string; avatarColor: string | null }>;
+	  }
+	| {
+			type: "terminal_count_changed";
+			narratorId: string;
+			activeTerminalCount: number;
+	  }
+	| {
+			type: "container_status_changed";
+			narratorId: string;
+			chapterId: string;
+			containerStatus: string | null;
 	  };
 
 // Client → Server messages
@@ -294,6 +309,12 @@ const ALREADY_BROADCAST_EVENTS = new Set([
 	"narrator:subagent_started",
 	"narrator:subagent_completed",
 	"user:recent_tabs_changed",
+	"terminal:created",
+	"terminal:exited",
+	"container:started",
+	"container:stopped",
+	"container:paused",
+	"container:resumed",
 ]);
 
 function shouldForwardEvent(event: NarraForkEvent): boolean {
@@ -344,6 +365,85 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		}
 	}
 }
+
+// === Terminal count change listener ===
+// When a terminal is created or exits, compute the new running count for its narrator
+// and broadcast to subscribers.
+
+async function broadcastTerminalCount(narratorId: string | null) {
+	if (!narratorId) return;
+	const row = await db
+		.select({ count: countFn() })
+		.from(terminals)
+		.where(and(eq(terminals.narratorId, narratorId), eq(terminals.status, "running")))
+		.get();
+	broadcastToNarrator(narratorId, {
+		type: "terminal_count_changed",
+		narratorId,
+		activeTerminalCount: row?.count ?? 0,
+	});
+}
+
+eventBus.on("terminal:created", (event) => {
+	broadcastTerminalCount(event.narratorId);
+});
+
+eventBus.on("terminal:exited", (event) => {
+	broadcastTerminalCount(event.narratorId);
+});
+
+// === Container status change listener ===
+// When a container starts/stops/pauses/resumes, compute the aggregate status for the chapter
+// and broadcast to subscribers of the chapter's narrator.
+
+async function broadcastContainerStatus(chapterId: string) {
+	// A chapter may have multiple narrators — broadcast to all of them.
+	const chapterNarrators = await db.query.narrators.findMany({
+		where: eq(narrators.chapterId, chapterId),
+		columns: { id: true },
+	});
+	if (chapterNarrators.length === 0) return;
+
+	const rows = await db
+		.select({ status: containerInstances.status })
+		.from(containerInstances)
+		.where(eq(containerInstances.chapterId, chapterId));
+
+	let bestStatus: string | null = null;
+	let bestPriority = -1;
+	for (const row of rows) {
+		const p = CONTAINER_STATUS_PRIORITY[row.status] ?? 0;
+		if (p > bestPriority) {
+			bestPriority = p;
+			bestStatus = row.status;
+		}
+	}
+
+	for (const narrator of chapterNarrators) {
+		broadcastToNarrator(narrator.id, {
+			type: "container_status_changed",
+			narratorId: narrator.id,
+			chapterId,
+			containerStatus: bestStatus,
+		});
+	}
+}
+
+eventBus.on("container:started", (event) => {
+	broadcastContainerStatus(event.chapterId);
+});
+
+eventBus.on("container:stopped", (event) => {
+	broadcastContainerStatus(event.chapterId);
+});
+
+eventBus.on("container:paused", (event) => {
+	broadcastContainerStatus(event.chapterId);
+});
+
+eventBus.on("container:resumed", (event) => {
+	broadcastContainerStatus(event.chapterId);
+});
 
 // === WebSocket handlers ===
 
