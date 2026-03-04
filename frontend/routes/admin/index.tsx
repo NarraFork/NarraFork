@@ -315,6 +315,19 @@ function ContainerSetupPanel({
 								? t("containerSetupInstalled", { version: data.passt.version ?? "" })
 								: t("containerSetupNotInstalled"),
 						)}
+						{renderStatus(
+							data.rootlessNetwork.ok,
+							t("containerSetupRootlessNetwork"),
+							data.rootlessNetwork.backend
+								? data.rootlessNetwork.ok
+									? t("containerSetupRootlessNetworkSupported", {
+											backend: data.rootlessNetwork.backend,
+										})
+									: t("containerSetupRootlessNetworkUnsupported", {
+											backend: data.rootlessNetwork.backend,
+										})
+								: t("containerSetupNotConfigured"),
+						)}
 					</Stack>
 				) : null}
 

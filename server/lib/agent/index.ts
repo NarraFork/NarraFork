@@ -56,10 +56,11 @@ export async function agentGenerate(text: string, model?: string): Promise<strin
 export async function agentGenerateWithMeta(
 	text: string,
 	model?: string,
+	systemInstruction?: string,
 ): Promise<{ text: string; contextPercent?: number }> {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const resolved = resolveProviderAndModel(requestedModel);
-	return resolved.adapter.generateWithMeta(text, resolved.model);
+	return resolved.adapter.generateWithMeta(text, resolved.model, systemInstruction);
 }
 
 /**

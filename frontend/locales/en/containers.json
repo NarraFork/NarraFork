@@ -12,6 +12,7 @@
 	"lines100": "100 lines",
 	"lines500": "500 lines",
 	"noLogs": "No logs available.",
+	"proxyDomainMissingHint": "Container proxy is enabled globally, but this project has no proxy domain configured yet. Set a Proxy Domain in project settings to generate accessible proxy links.",
 	"config": "Config",
 	"cleanup": "Clean Up",
 	"cleanupConfirm": "Stop and remove all containers for this chapter?",

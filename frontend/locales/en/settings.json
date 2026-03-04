@@ -232,6 +232,8 @@
 	"codexImportInvalidJson": "Invalid JSON format",
 	"codexCredentials": "Credentials",
 	"codexCredentialsCount": "{{available}} / {{total}} available",
+	"codexCredentialsAvailable": "Available Credentials",
+	"codexCredentialsUnavailable": "Unavailable Credentials",
 	"codexModePriority": "Priority",
 	"codexModeBalanced": "Balanced",
 	"codexAddBrowser": "Add via Browser",

@@ -102,7 +102,17 @@ export async function fetchCodexUsage(
 			throw new Error(`Failed to fetch usage: ${response.status} ${response.statusText}`);
 		}
 
-		const data = (await response.json()) as CodexUsagePayload;
+		const raw = await response.text();
+		let data: CodexUsagePayload;
+		try {
+			data = JSON.parse(raw) as CodexUsagePayload;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			throw new Error(
+				`Codex usage API returned non-JSON payload: ${message}. ` +
+					`body preview=${raw.slice(0, 500)}`,
+			);
+		}
 
 		// Debug: log the entire response
 		logger.info("Codex usage API response", {

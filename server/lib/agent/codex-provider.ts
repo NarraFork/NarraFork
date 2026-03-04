@@ -294,9 +294,10 @@ export class CodexProvider implements ProviderAdapter {
 	async generateWithMeta(
 		text: string,
 		model: string,
+		systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
 		return this.runWithFailover("generateWithMeta", (provider) =>
-			provider.generateWithMeta(text, model),
+			provider.generateWithMeta(text, model, systemInstruction),
 		);
 	}
 

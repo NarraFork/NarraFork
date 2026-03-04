@@ -110,6 +110,8 @@ export type NarraForkEvent =
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }
+	| { type: "container:paused"; chapterId: string }
+	| { type: "container:resumed"; chapterId: string }
 	| { type: "container:error"; chapterId: string; error: string }
 	| { type: "container:log"; chapterId: string; line: string }
 	| { type: "container:starting"; chapterId: string }

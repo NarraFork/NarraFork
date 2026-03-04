@@ -232,6 +232,8 @@
 	"codexImportInvalidJson": "无效的 JSON 格式",
 	"codexCredentials": "凭据",
 	"codexCredentialsCount": "{{available}} / {{total}} 可用",
+	"codexCredentialsAvailable": "可用凭据",
+	"codexCredentialsUnavailable": "不可用凭据",
 	"codexModePriority": "优先级",
 	"codexModeBalanced": "均衡",
 	"codexAddBrowser": "浏览器添加",

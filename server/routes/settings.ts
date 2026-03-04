@@ -8,6 +8,7 @@ import {
 	type NarraForkSettings,
 	saveSettings,
 } from "../lib/settings";
+import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
@@ -159,6 +160,8 @@ settingsRoutes.patch("/", async (c) => {
 
 	const current = loadSettings();
 	const validated = parsed.data;
+	const oldProxyEnabled = current.containers.proxy.enabled;
+	const oldProxyPort = current.containers.proxy.port;
 
 	// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
 	if (validated.codex?.defaultReasoningEffort === null) {
@@ -204,7 +207,23 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Apply container proxy runtime changes first, then persist settings.
+	// This keeps persisted config and runtime state consistent if start/restart fails.
+	const newProxyEnabled = merged.containers.proxy.enabled;
+	const newProxyPort = merged.containers.proxy.port;
+	if (oldProxyEnabled !== newProxyEnabled || oldProxyPort !== newProxyPort) {
+		try {
+			await ensureContainerProxyRuntime({
+				enabled: newProxyEnabled,
+				port: newProxyPort,
+			});
+		} catch (err) {
+			throw new ValidationError(`Container proxy runtime update failed: ${String(err)}`);
+		}
+	}
+
 	saveSettings(merged);
+
 	// Mask sensitive fields before returning (same logic as GET)
 	const result = {
 		...merged,

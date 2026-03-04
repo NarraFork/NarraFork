@@ -486,6 +486,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (compactBlock.status === "compacted" && wsData.message?.contextPercent != null) {
 						setContextPercent(wsData.message.contextPercent as number);
 					}
+					if (compactBlock.status === "failed") {
+						setIsCompacting(false);
+					}
 				} else {
 					setIsCompacting(false);
 				}

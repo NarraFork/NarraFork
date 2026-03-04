@@ -395,8 +395,8 @@ narratorRoutes.post("/:id/compact", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const beforeMessageId = body.beforeMessageId ?? undefined;
 	// Fire-and-forget — compact may take a while (AI summary generation).
-	// On failure, runCustomCompact rolls back the compacting marker and
-	// broadcasts a compact_failed event via WebSocket so the frontend can react.
+	// On failure, runCustomCompact keeps a failed compact marker, marks narrator error,
+	// and broadcasts a compact_failed event via WebSocket so the frontend can react.
 	runCustomCompact(narratorId, locale, beforeMessageId).catch((err) => {
 		logger.error("Manual compact failed", { narratorId, err: String(err) });
 	});

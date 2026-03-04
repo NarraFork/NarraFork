@@ -124,8 +124,16 @@ export interface ProviderAdapter {
 	/** Simple text generation — no tools, no loop. Returns generated text. */
 	generate(text: string, model: string): Promise<string>;
 
-	/** Like generate() but also returns contextUsagePercentage if available. */
-	generateWithMeta(text: string, model: string): Promise<{ text: string; contextPercent?: number }>;
+	/**
+	 * Like generate() but also returns contextUsagePercentage if available.
+	 * `systemInstruction` is optional and lets providers with a native system/developer
+	 * channel place instructions outside the user text.
+	 */
+	generateWithMeta(
+		text: string,
+		model: string,
+		systemInstruction?: string,
+	): Promise<{ text: string; contextPercent?: number }>;
 
 	/**
 	 * Generate text using a history-based conversation (system instruction + user content).

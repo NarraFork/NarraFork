@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { chapters, containerInstances, portAllocations, projects } from "../../../server/db/schema";
+import { buildProxyUrl } from "../../../server/services/container-proxy";
 import {
 	buildComposeEnv,
 	type ContainerConfig,
 	resolveComposeFile,
+	resolveProxyPortHints,
 } from "../../../server/services/container-service";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -168,6 +170,62 @@ describe("buildComposeEnv", () => {
 	it("returns only base env when no ports and no config", () => {
 		const env = buildComposeEnv("ch1", [], null);
 		expect(Object.keys(env)).toEqual(["NARRAFORK_CHAPTER_ID", "NARRAFORK_VOLUME_PREFIX"]);
+	});
+
+	it("injects proxy mode env and proxy URLs from config ports", () => {
+		const config: ContainerConfig = {
+			ports: [
+				{ serviceName: "web", containerPort: 3000 },
+				{ serviceName: "api", containerPort: 8080 },
+			],
+		};
+		const env = buildComposeEnv("chapter-abcdef123456", [], config, {
+			domain: "dev.localhost",
+			port: 7780,
+			chapterShortId: "chap1234",
+		});
+		expect(env.NARRAFORK_PROXY).toBe("1");
+		expect(env.NARRAFORK_PROXY_DOMAIN).toBe("dev.localhost");
+		expect(env.NARRAFORK_PROXY_URL_3000).toBe(
+			buildProxyUrl("chap1234-web-3000", "dev.localhost", 7780),
+		);
+		expect(env.NARRAFORK_PROXY_URL_8080).toBe(
+			buildProxyUrl("chap1234-api-8080", "dev.localhost", 7780),
+		);
+		expect(env.PORT_3000).toBeUndefined();
+	});
+});
+
+describe("resolveProxyPortHints", () => {
+	it("merges compose/config/inspect ports with de-duplication", () => {
+		const hints = resolveProxyPortHints(
+			new Map([
+				["web", [3000, 8080]],
+				["worker", [7000]],
+			]),
+			new Map([
+				["web", [8080, 9000]],
+				["api", [5000]],
+			]),
+			new Map([
+				["web", [3000, 10000]],
+				["api", [6000]],
+			]),
+		);
+
+		const normalized = hints
+			.map((h) => `${h.serviceName}:${h.containerPort}`)
+			.sort((a, b) => a.localeCompare(b));
+
+		expect(normalized).toEqual([
+			"api:5000",
+			"api:6000",
+			"web:10000",
+			"web:3000",
+			"web:8080",
+			"web:9000",
+			"worker:7000",
+		]);
 	});
 });
 

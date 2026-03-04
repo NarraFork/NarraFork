@@ -48,5 +48,6 @@
 	"settingsTitle": "Project Settings",
 	"proxyDomain": "Proxy Domain",
 	"proxyDomainDesc": "Base domain for container proxy subdomains. Each container port gets a subdomain like {chapterId}-{service}-{port}.{domain}.",
-	"proxyDomainHint": "Requires wildcard DNS: *.{domain} → server IP. For local dev, use *.localhost or configure dnsmasq."
+	"proxyDomainHint": "Requires wildcard DNS: *.{domain} → server IP. For local dev, use *.localhost or configure dnsmasq.",
+	"proxyDomainInvalid": "Please enter a valid domain (e.g. dev.example.com, without http:// or paths)"
 }

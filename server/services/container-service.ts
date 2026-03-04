@@ -26,6 +26,11 @@ interface ProxyInfo {
 	chapterShortId: string;
 }
 
+interface ProxyPortHint {
+	serviceName: string;
+	containerPort: number;
+}
+
 interface ExecResult {
 	stdout: string;
 	stderr: string;
@@ -187,6 +192,7 @@ export interface ContainerSetupStatus {
 	podmanCompose: { ok: boolean; version?: string };
 	composeProvider: { ok: boolean; provider?: string };
 	passt: { ok: boolean; version?: string };
+	rootlessNetwork: { ok: boolean; backend?: string };
 	allReady: boolean;
 }
 
@@ -255,12 +261,30 @@ export function getContainerSetupStatus(refresh = false): ContainerSetupStatus {
 		}
 	}
 
+	let rootlessNetwork: ContainerSetupStatus["rootlessNetwork"] = { ok: false };
+	try {
+		const out = execSync("podman info --format '{{.Host.RootlessNetworkCmd}}'", {
+			encoding: "utf-8",
+			stdio: "pipe",
+			timeout: 5000,
+		}).trim();
+		const backend = out.replace(/^'|'$/g, "").toLowerCase();
+		rootlessNetwork = {
+			ok: backend === "pasta" || backend === "passt",
+			backend: backend || undefined,
+		};
+	} catch {
+		rootlessNetwork = { ok: false };
+	}
+
 	_setupCache = {
 		podman: { ok: podman.installed, version: podman.version },
 		podmanCompose,
 		composeProvider,
 		passt,
-		allReady: podman.installed && podmanCompose.ok && composeProvider.ok && passt.ok,
+		rootlessNetwork,
+		allReady:
+			podman.installed && podmanCompose.ok && composeProvider.ok && passt.ok && rootlessNetwork.ok,
 	};
 	return _setupCache;
 }
@@ -570,6 +594,46 @@ function parseComposeYaml(text: string): ComposeServiceInfo[] {
 	return results;
 }
 
+function extractContainerPortsFromComposePs(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+	portsRaw: any,
+): number[] {
+	const ports = Array.isArray(portsRaw) ? portsRaw : [];
+	const values = new Set<number>();
+	for (const p of ports) {
+		const cp =
+			Number((p as Record<string, unknown>).container_port) ||
+			Number((p as Record<string, unknown>).TargetPort);
+		if (Number.isFinite(cp) && cp > 0) values.add(cp);
+	}
+	return [...values];
+}
+
+export function resolveProxyPortHints(
+	composePortsByService: Map<string, number[]>,
+	configuredPortsByService: Map<string, number[]>,
+	inspectPortsByService: Map<string, number[]>,
+): ProxyPortHint[] {
+	const serviceNames = new Set<string>([
+		...composePortsByService.keys(),
+		...configuredPortsByService.keys(),
+		...inspectPortsByService.keys(),
+	]);
+	const hints: ProxyPortHint[] = [];
+
+	for (const serviceName of serviceNames) {
+		const compose = composePortsByService.get(serviceName) ?? [];
+		const configured = configuredPortsByService.get(serviceName) ?? [];
+		const inspect = inspectPortsByService.get(serviceName) ?? [];
+		const ports = [...new Set([...compose, ...configured, ...inspect])];
+		for (const containerPort of ports) {
+			hints.push({ serviceName, containerPort });
+		}
+	}
+
+	return hints;
+}
+
 /** Build environment variables for compose, including port mappings or proxy info. */
 export function buildComposeEnv(
 	chapterId: string,
@@ -639,6 +703,9 @@ export const containerService = {
 		let portMappings: PortMapping[] = [];
 		if (!proxyEnabled && config?.ports && config.ports.length > 0) {
 			portMappings = await portAllocator.allocate(chapterId, config.ports);
+		} else if (proxyEnabled) {
+			// Switching from legacy port mapping mode to proxy mode — ensure stale allocations are gone.
+			await portAllocator.release(chapterId);
 		}
 
 		const chapterShortId = chapterId.slice(0, 8);
@@ -690,6 +757,14 @@ export const containerService = {
 		proxyInfo?: ProxyInfo,
 	): Promise<void> {
 		const isProxy = !!proxyInfo;
+		const configuredPortsByService = new Map<string, number[]>();
+		if (config?.ports) {
+			for (const { serviceName, containerPort } of config.ports) {
+				const list = configuredPortsByService.get(serviceName) ?? [];
+				if (!list.includes(containerPort)) list.push(containerPort);
+				configuredPortsByService.set(serviceName, list);
+			}
+		}
 		try {
 			const composeArgs = ["compose", "-f", composeFile, "up", "-d"];
 			if (config?.services && config.services.length > 0) {
@@ -712,6 +787,20 @@ export const containerService = {
 				return;
 			}
 
+			// In proxy mode, enrich env with fallback proxy URLs from configured ports
+			// before recording instances (actual labels may be refined from compose/inspect later).
+			if (proxyInfo) {
+				const fallbackHints = resolveProxyPortHints(new Map(), configuredPortsByService, new Map());
+				for (const { serviceName, containerPort } of fallbackHints) {
+					const label = generateProxyLabel(proxyInfo.chapterShortId, serviceName, containerPort);
+					env[`NARRAFORK_PROXY_URL_${containerPort}`] = buildProxyUrl(
+						label,
+						proxyInfo.domain,
+						proxyInfo.port,
+					);
+				}
+			}
+
 			// Record container instances (clear stale records first)
 			try {
 				await db.delete(containerInstances).where(eq(containerInstances.chapterId, chapterId));
@@ -722,6 +811,7 @@ export const containerService = {
 					portMappings,
 					env,
 					proxyInfo,
+					configuredPortsByService,
 				);
 			} catch (recordErr) {
 				logger.error("Failed to record container instances, running compose down to clean up", {
@@ -778,6 +868,7 @@ export const containerService = {
 			.set({ status: "paused", updatedAt: now })
 			.where(eq(containerInstances.chapterId, chapterId));
 
+		eventBus.emit({ type: "container:paused", chapterId });
 		logger.info("Chapter containers paused", { chapterId });
 	},
 
@@ -806,6 +897,7 @@ export const containerService = {
 			.set({ status: "running", updatedAt: now })
 			.where(eq(containerInstances.chapterId, chapterId));
 
+		eventBus.emit({ type: "container:resumed", chapterId });
 		logger.info("Chapter containers unpaused", { chapterId });
 	},
 
@@ -923,6 +1015,7 @@ export const containerService = {
 		portMappings: PortMapping[],
 		env: Record<string, string>,
 		proxyInfo?: ProxyInfo,
+		configuredPortsByService?: Map<string, number[]>,
 	): Promise<void> {
 		const result = await exec(
 			["compose", "-f", composeFile, "ps", "--format", "json"],
@@ -953,6 +1046,8 @@ export const containerService = {
 				}
 			}
 
+			const composePortsByService = new Map<string, number[]>();
+			let proxyRowsRecorded = 0;
 			for (const container of containerList) {
 				// docker compose: Service, Name, ID
 				// podman-compose: Labels["com.docker.compose.service"], Names[], Id
@@ -966,24 +1061,56 @@ export const containerService = {
 					"unknown";
 				const containerId = (container.ID as string) || (container.Id as string) || null;
 
-				let hostPort: number | null = null;
-				let containerPort: number | null = null;
-				let proxyLabel: string | null = null;
-				let containerIp: string | null = null;
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+				const portsRaw = (container.Ports ?? container.Publishers ?? []) as any;
+				const composePorts = extractContainerPortsFromComposePs(portsRaw);
+				composePortsByService.set(serviceName, composePorts);
 
 				if (proxyInfo) {
-					// Proxy mode: get container IP, generate proxy label
+					let containerIp: string | null = null;
 					if (containerId) {
 						containerIp = await this._getContainerIp(containerId);
 					}
-					// Determine container port from compose ps output
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
-					const ports = (container.Ports ?? container.Publishers ?? []) as any[];
-					const firstPort = ports[0] as Record<string, unknown> | undefined;
-					containerPort =
-						(firstPort?.container_port as number) ?? (firstPort?.TargetPort as number) ?? null;
-					if (containerPort != null) {
-						proxyLabel = generateProxyLabel(proxyInfo.chapterShortId, serviceName, containerPort);
+					const configured = configuredPortsByService?.get(serviceName) ?? [];
+					const inspectPorts = containerId ? await this._getContainerExposedPorts(containerId) : [];
+					const hints = resolveProxyPortHints(
+						new Map([[serviceName, composePorts]]),
+						new Map([[serviceName, configured]]),
+						new Map([[serviceName, inspectPorts]]),
+					);
+
+					if (hints.length === 0) {
+						logger.warn("No proxy ports resolved for container", {
+							chapterId,
+							serviceName,
+							containerId,
+							composePorts,
+							configuredPorts: configured,
+							inspectPorts,
+						});
+						continue;
+					}
+
+					for (const { containerPort } of hints) {
+						const proxyLabel = generateProxyLabel(
+							proxyInfo.chapterShortId,
+							serviceName,
+							containerPort,
+						);
+						await db.insert(containerInstances).values({
+							id: generateId(),
+							chapterId,
+							containerId,
+							serviceName,
+							status: "running",
+							hostPort: null,
+							containerPort,
+							proxyLabel,
+							containerIp,
+							createdAt: now,
+							updatedAt: now,
+						});
+						proxyRowsRecorded++;
 					}
 				} else {
 					// Legacy mode: extract port mappings
@@ -991,31 +1118,40 @@ export const containerService = {
 					const ports = (container.Ports ?? container.Publishers ?? []) as any[];
 					const firstPort = ports[0] as Record<string, unknown> | undefined;
 					const userMapping = portMappings.find((p) => p.serviceName === serviceName);
-					hostPort =
+					const hostPort =
 						(firstPort?.host_port as number) ??
 						(firstPort?.PublishedPort as number) ??
 						userMapping?.hostPort ??
 						null;
-					containerPort =
+					const containerPort =
 						(firstPort?.container_port as number) ??
 						(firstPort?.TargetPort as number) ??
 						userMapping?.containerPort ??
 						null;
-				}
 
-				await db.insert(containerInstances).values({
-					id: generateId(),
+					await db.insert(containerInstances).values({
+						id: generateId(),
+						chapterId,
+						containerId,
+						serviceName,
+						status: "running",
+						hostPort,
+						containerPort,
+						proxyLabel: null,
+						containerIp: null,
+						createdAt: now,
+						updatedAt: now,
+					});
+				}
+			}
+
+			if (proxyInfo && proxyRowsRecorded === 0) {
+				logger.warn("compose ps succeeded in proxy mode but no proxy routes were recorded", {
 					chapterId,
-					containerId,
-					serviceName,
-					status: "running",
-					hostPort,
-					containerPort,
-					proxyLabel,
-					containerIp,
-					createdAt: now,
-					updatedAt: now,
 				});
+				throw new ValidationError(
+					"No proxy routes resolved from running containers. Check compose service ports or image EXPOSE settings.",
+				);
 			}
 		} else if (!proxyInfo) {
 			// Fallback: create instances from port mappings if ps failed (legacy mode only).
@@ -1056,6 +1192,31 @@ export const containerService = {
 		} catch (err) {
 			logger.warn("Failed to get container IP", { containerId, error: String(err) });
 			return null;
+		}
+	},
+
+	/** @internal Get exposed container ports via podman inspect. */
+	async _getContainerExposedPorts(containerId: string): Promise<number[]> {
+		try {
+			const result = await exec(
+				["inspect", "--format", "{{json .Config.ExposedPorts}}", containerId],
+				"/",
+			);
+			const raw = result.stdout.trim();
+			if (!raw || raw === "<nil>" || raw === "null") return [];
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const ports: number[] = [];
+			for (const key of Object.keys(parsed)) {
+				const p = Number.parseInt(key.split("/")[0] ?? "", 10);
+				if (Number.isFinite(p) && p > 0) ports.push(p);
+			}
+			return [...new Set(ports)];
+		} catch (err) {
+			logger.warn("Failed to get container exposed ports", {
+				containerId,
+				error: String(err),
+			});
+			return [];
 		}
 	},
 };

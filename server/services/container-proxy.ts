@@ -22,8 +22,14 @@ const registeredDomains = new Set<string>();
 /** The running Bun server instance, if started. */
 let proxyServer: ReturnType<typeof Bun.serve> | null = null;
 
+/** Current listen port of the running proxy server. */
+let proxyServerPort: number | null = null;
+
 /** Stored reference for eventBus cleanup on stop. */
 let eventRefreshHandler: (() => void) | null = null;
+
+/** Debounce timer for cache refresh triggered by lifecycle events. */
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ---------------------------------------------------------------------------
 // Cache management
@@ -255,6 +261,77 @@ export function isPastaBackend(): boolean {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+export type ProxyRuntimeAction = "start" | "stop" | "restart" | "noop";
+
+export function decideContainerProxyRuntimeAction(
+	current: { running: boolean; port: number | null },
+	desired: { enabled: boolean; port: number },
+): ProxyRuntimeAction {
+	if (!desired.enabled) {
+		return current.running ? "stop" : "noop";
+	}
+
+	if (!current.running) return "start";
+	if (current.port == null) return "restart";
+	if (current.port !== desired.port) return "restart";
+	return "noop";
+}
+
+function scheduleCacheRefresh(): void {
+	if (refreshTimer) clearTimeout(refreshTimer);
+	refreshTimer = setTimeout(() => {
+		refreshTimer = null;
+		refreshCache().catch((err) => {
+			logger.warn("Proxy cache refresh failed", { error: String(err) });
+		});
+	}, 500);
+}
+
+export function getContainerProxyRuntimeState(): { running: boolean; port: number | null } {
+	return { running: !!proxyServer, port: proxyServerPort };
+}
+
+export async function ensureContainerProxyRuntime(desired: {
+	enabled: boolean;
+	port: number;
+}): Promise<void> {
+	const state = getContainerProxyRuntimeState();
+	const action = decideContainerProxyRuntimeAction(state, desired);
+
+	if (action === "noop") return;
+	if (action === "start") {
+		await startContainerProxy(desired.port);
+		return;
+	}
+	if (action === "stop") {
+		stopContainerProxy();
+		return;
+	}
+
+	const rollbackPort = state.port;
+	stopContainerProxy();
+	try {
+		await startContainerProxy(desired.port);
+	} catch (err) {
+		logger.error("Container proxy restart failed", {
+			targetPort: desired.port,
+			rollbackPort,
+			error: String(err),
+		});
+		if (rollbackPort != null) {
+			try {
+				await startContainerProxy(rollbackPort);
+			} catch (rollbackErr) {
+				logger.error("Container proxy rollback failed", {
+					rollbackPort,
+					error: String(rollbackErr),
+				});
+			}
+		}
+		throw err;
+	}
+}
+
 export async function startContainerProxy(port?: number): Promise<void> {
 	if (proxyServer) return;
 
@@ -273,17 +350,13 @@ export async function startContainerProxy(port?: number): Promise<void> {
 	await refreshCache();
 
 	// Listen for container lifecycle events to refresh cache (debounced)
-	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	eventRefreshHandler = () => {
-		if (refreshTimer) clearTimeout(refreshTimer);
-		refreshTimer = setTimeout(() => {
-			refreshCache().catch((err) => {
-				logger.warn("Proxy cache refresh failed", { error: String(err) });
-			});
-		}, 500);
+		scheduleCacheRefresh();
 	};
 	eventBus.on("container:started", eventRefreshHandler);
 	eventBus.on("container:stopped", eventRefreshHandler);
+	eventBus.on("container:paused", eventRefreshHandler);
+	eventBus.on("container:resumed", eventRefreshHandler);
 
 	proxyServer = Bun.serve<ProxyWSData>({
 		port: listenPort,
@@ -316,6 +389,7 @@ export async function startContainerProxy(port?: number): Promise<void> {
 		},
 		websocket: wsHandlers,
 	});
+	proxyServerPort = listenPort;
 
 	logger.info(`Container proxy started on port ${listenPort}`, {
 		port: listenPort,
@@ -327,10 +401,17 @@ export function stopContainerProxy(): void {
 	if (proxyServer) {
 		proxyServer.stop();
 		proxyServer = null;
+		proxyServerPort = null;
 		if (eventRefreshHandler) {
 			eventBus.off("container:started", eventRefreshHandler);
 			eventBus.off("container:stopped", eventRefreshHandler);
+			eventBus.off("container:paused", eventRefreshHandler);
+			eventBus.off("container:resumed", eventRefreshHandler);
 			eventRefreshHandler = null;
+		}
+		if (refreshTimer) {
+			clearTimeout(refreshTimer);
+			refreshTimer = null;
 		}
 		cache.clear();
 		registeredDomains.clear();

@@ -9,6 +9,7 @@ import { logger } from "../lib/logger";
 import { projectDbManager } from "../lib/project-db";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
+import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { gitService } from "../services/git-service";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
 
@@ -81,6 +82,15 @@ projectRoutes.post("/", async (c) => {
 		})
 		.returning();
 
+	if (project.proxyDomain) {
+		refreshContainerProxyCache().catch((err) => {
+			logger.warn("Failed to refresh container proxy cache after project create", {
+				projectId,
+				error: String(err),
+			});
+		});
+	}
+
 	// Auto-create root chapter
 	try {
 		await chapterService.createRootChapter({
@@ -125,19 +135,21 @@ projectRoutes.patch("/:id", async (c) => {
 
 	const now = new Date().toISOString();
 
+	const existingProject = await db.query.projects.findFirst({
+		where: eq(projects.id, id),
+		columns: { proxyDomain: true, chapterSettings: true },
+	});
+	if (!existingProject) throw new NotFoundError("Project", id);
+
 	// Merge chapterSettings with existing values instead of overwriting
 	let mergedSettings: Record<string, unknown> | undefined;
 	if (incomingSettings) {
-		const existing = await db.query.projects.findFirst({
-			where: eq(projects.id, id),
-			columns: { chapterSettings: true },
-		});
 		let current: Record<string, unknown> = {};
 		try {
 			current =
-				typeof existing?.chapterSettings === "string"
-					? JSON.parse(existing.chapterSettings)
-					: (existing?.chapterSettings ?? {});
+				typeof existingProject.chapterSettings === "string"
+					? JSON.parse(existingProject.chapterSettings)
+					: (existingProject.chapterSettings ?? {});
 		} catch {
 			// corrupted JSON — start fresh
 		}
@@ -154,6 +166,16 @@ projectRoutes.patch("/:id", async (c) => {
 		.where(eq(projects.id, id))
 		.returning();
 	if (!updated) throw new NotFoundError("Project", id);
+
+	if (existingProject.proxyDomain !== (updated.proxyDomain ?? null)) {
+		refreshContainerProxyCache().catch((err) => {
+			logger.warn("Failed to refresh container proxy cache after project update", {
+				projectId: id,
+				error: String(err),
+			});
+		});
+	}
+
 	return c.json(updated);
 });
 
@@ -208,6 +230,14 @@ projectRoutes.delete("/:id", async (c) => {
 	}
 
 	await db.delete(projects).where(eq(projects.id, id));
+	if (project.proxyDomain) {
+		refreshContainerProxyCache().catch((err) => {
+			logger.warn("Failed to refresh container proxy cache after project delete", {
+				projectId: id,
+				error: String(err),
+			});
+		});
+	}
 	logger.info("Project deleted", { projectId: id, name: project.name });
 	return c.json({ ok: true });
 });

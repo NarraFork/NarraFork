@@ -46,6 +46,9 @@ const OPENAI_IDENTITY: Record<string, string> = {
 // Codex models (gpt-5.x-codex) use a specialized prompt inspired by OpenCode's codex_header.txt.
 // This prompt emphasizes concise, action-oriented behavior with minimal formatting.
 
+const CODEX_DEFAULT_INSTRUCTIONS =
+	"You are NarraFork Narrator. Follow the user's request and answer concisely.";
+
 const CODEX_IDENTITY: Record<string, string> = {
 	en: `You are NarraFork Narrator, an AI coding assistant with access to tools for reading, writing, and editing files, running shell commands, searching codebases, and more.
 
@@ -377,6 +380,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			body = { model, input: responsesInput, stream: true, store: false };
 			if (instructions) {
 				body.instructions = instructions;
+			} else if (this.apiMode === "codex") {
+				// Codex gateway requires non-empty instructions even for pure tool/result turns.
+				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
 			}
 			if (tools.length > 0) body.tools = tools;
 
@@ -541,6 +547,7 @@ export class OpenAIProvider implements ProviderAdapter {
 	async generateWithMeta(
 		text: string,
 		model: string,
+		systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
@@ -552,33 +559,37 @@ export class OpenAIProvider implements ProviderAdapter {
 		const bareModel = parseModelId(model).model;
 
 		if (usesResponsesEndpoint(this.apiMode)) {
-			// Responses API & Codex: POST /responses (non-streaming)
-			const response = await this.pfetch(`${baseUrl}/responses`, {
-				method: "POST",
-				headers: this.buildHeaders(apiKey),
-				body: JSON.stringify({
-					model: bareModel,
-					input: [{ role: "user", content: text }],
-					store: false,
-				}),
-			});
-			if (!response.ok) {
-				const errText = await response.text().catch(() => "");
-				throw new Error(`OpenAI API error ${response.status}: ${errText}`);
-			}
-			const json = (await response.json()) as {
-				output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+			const body: Record<string, unknown> = {
+				model: bareModel,
+				input: [{ role: "user", content: text }],
+				store: false,
 			};
-			return { text: extractResponsesText(json.output), contextPercent: undefined };
+			if (systemInstruction) {
+				body.instructions = systemInstruction;
+			} else if (this.apiMode === "codex") {
+				// Codex gateway requires non-empty instructions on /responses.
+				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
+			}
+			if (this.apiMode === "codex") {
+				// Codex gateway requires stream=true on /responses.
+				body.stream = true;
+			}
+			const resultText = await this.requestResponsesText(baseUrl, apiKey, body);
+			return { text: resultText, contextPercent: undefined };
 		}
 
 		// Completions: POST /chat/completions
+		const messages: Array<{ role: "system" | "user"; content: string }> = [];
+		if (systemInstruction) {
+			messages.push({ role: "system", content: systemInstruction });
+		}
+		messages.push({ role: "user", content: text });
 		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify({
 				model: bareModel,
-				messages: [{ role: "user", content: text }],
+				messages,
 			}),
 		});
 
@@ -587,10 +598,11 @@ export class OpenAIProvider implements ProviderAdapter {
 			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
 		}
 
-		const json = (await response.json()) as {
+		const raw = await response.text();
+		const json = parseJsonWithPreview<{
 			choices?: Array<{ message?: { content?: string } }>;
 			usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-		};
+		}>(raw, "OpenAI chat/completions returned non-JSON payload");
 
 		return {
 			text: json.choices?.[0]?.message?.content ?? "",
@@ -615,25 +627,17 @@ export class OpenAIProvider implements ProviderAdapter {
 		const bareModel = parseModelId(model).model;
 
 		if (usesResponsesEndpoint(this.apiMode)) {
-			// Responses API & Codex
-			const response = await this.pfetch(`${baseUrl}/responses`, {
-				method: "POST",
-				headers: this.buildHeaders(apiKey),
-				body: JSON.stringify({
-					model: bareModel,
-					instructions: systemInstruction,
-					input: [{ role: "user", content: `${reminder}\n\n${content}` }],
-					store: false,
-				}),
-			});
-			if (!response.ok) {
-				const errText = await response.text().catch(() => "");
-				throw new Error(`OpenAI API error ${response.status}: ${errText}`);
-			}
-			const json = (await response.json()) as {
-				output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+			const body: Record<string, unknown> = {
+				model: bareModel,
+				instructions: systemInstruction,
+				input: [{ role: "user", content: `${reminder}\n\n${content}` }],
+				store: false,
 			};
-			return extractResponsesText(json.output);
+			if (this.apiMode === "codex") {
+				// Codex gateway requires stream=true on /responses.
+				body.stream = true;
+			}
+			return this.requestResponsesText(baseUrl, apiKey, body);
 		}
 
 		// Completions
@@ -654,11 +658,62 @@ export class OpenAIProvider implements ProviderAdapter {
 			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
 		}
 
-		const json = (await response.json()) as {
+		const raw = await response.text();
+		const json = parseJsonWithPreview<{
 			choices?: Array<{ message?: { content?: string } }>;
-		};
+		}>(raw, "OpenAI chat/completions returned non-JSON payload");
 
 		return json.choices?.[0]?.message?.content ?? "";
+	}
+
+	/**
+	 * Request /responses and extract plain text result.
+	 * Supports both JSON (non-streaming) and SSE (streaming) responses.
+	 */
+	private async requestResponsesText(
+		baseUrl: string,
+		apiKey: string,
+		body: Record<string, unknown>,
+	): Promise<string> {
+		const response = await this.pfetch(`${baseUrl}/responses`, {
+			method: "POST",
+			headers: this.buildHeaders(apiKey),
+			body: JSON.stringify(body),
+		});
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+		}
+
+		const isStreaming = body.stream === true;
+		if (!isStreaming) {
+			const raw = await response.text();
+			const json = parseResponsesJson(raw);
+			return extractResponsesText(json.output);
+		}
+
+		const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+		const looksJson = contentType.includes("application/json");
+		if (looksJson) {
+			const raw = await response.text();
+			const json = parseResponsesJson(raw);
+			return extractResponsesText(json.output);
+		}
+
+		if (!response.body) {
+			throw new Error("OpenAI API returned no body");
+		}
+
+		let text = "";
+		for await (const evt of _parseResponsesAPIStream(response.body)) {
+			if (evt.text) text += evt.text;
+			if (evt.invalidState) {
+				throw new Error(
+					`OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
+				);
+			}
+		}
+		return text;
 	}
 
 	/** Build common request headers, with Codex-specific extras. */
@@ -699,6 +754,25 @@ export class OpenAIProvider implements ProviderAdapter {
 	private async getEffectiveApiKey(): Promise<string> {
 		return this.config.apiKey;
 	}
+}
+
+/** Parse JSON with a clearer error message and body preview. */
+function parseJsonWithPreview<T>(raw: string, errorPrefix: string): T {
+	try {
+		return JSON.parse(raw) as T;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`${errorPrefix}: ${message}. body preview=${raw.slice(0, 500)}`);
+	}
+}
+
+/** Parse a /responses JSON payload with a clearer error message. */
+function parseResponsesJson(raw: string): {
+	output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+} {
+	return parseJsonWithPreview<{
+		output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 
 /** Extract text from a Responses API output array. */

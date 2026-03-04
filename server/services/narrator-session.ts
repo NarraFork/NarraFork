@@ -281,6 +281,8 @@ export function resolvePermissionDecision(
 		);
 		if (hasExternalBashPath) return "ask";
 		// All commands whitelisted + all paths inside worktree + no dangerous patterns
+		// 如果包含写操作（如 biome --write），只在 acceptEdits 模式下允许
+		if (bashAnalysis.hasWriteOperation && permMode !== "acceptEdits") return "ask";
 		if (permMode === "acceptEdits") return "allow";
 		return "ask";
 	}
@@ -2018,6 +2020,7 @@ export const pruneLocks = new Set<string>();
 
 /** Compact operation timeout in milliseconds (5 minutes). */
 const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
+const COMPACT_FAILURE_TEXT = "[Compact Failed]";
 
 /**
  * Run custom compact with concurrency protection.
@@ -2066,7 +2069,8 @@ export async function runCustomCompact(
  * Internal compact implementation: generate a summary from DB messages and store it.
  * Clears apiConversationId so the next narrator starts fresh with the summary.
  *
- * On failure, rolls back the compacting marker message and broadcasts a failure event.
+ * On failure, finalizes the marker as a failed compact message, marks narrator error,
+ * and broadcasts a failure event.
  */
 async function doRunCustomCompact(
 	narratorId: string,
@@ -2129,17 +2133,38 @@ async function doRunCustomCompact(
 
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 	} catch (err) {
-		// Roll back: remove the compacting marker so it doesn't linger in the UI
-		await narratorService.removeCompactingMessage(narratorId, compactingMsg.id).catch((e) => {
-			logger.error("Failed to clean up compacting message during rollback", {
-				narratorId,
-				messageId: compactingMsg.id,
-				error: String(e),
-			});
+		const errorMsg = err instanceof Error ? err.message : String(err);
+		logger.error("Custom compact failed after retries", {
+			narratorId,
+			messageId: compactingMsg.id,
+			error: errorMsg,
 		});
-		// Clear prune boundary — it may reference messages that a future compact
-		// would place before the compact point, causing pruneToolCalls to silently skip.
+
+		const failedSummary = `${COMPACT_FAILURE_TEXT}\n${errorMsg}`;
+		const failedMsg = await narratorService
+			.finalizeCompactingMessage(compactingMsg.id, narratorId, failedSummary, undefined, {
+				status: "failed",
+				error: errorMsg,
+			})
+			.catch((e) => {
+				logger.error("Failed to finalize failed compact marker", {
+					narratorId,
+					messageId: compactingMsg.id,
+					error: String(e),
+				});
+				return null;
+			});
+
+		if (failedMsg) {
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
+		}
+
 		await narratorService.clearPruneBoundary(narratorId).catch(() => {});
+		await narratorService.updateStatus(narratorId, "error", `Compact failed: ${errorMsg}`);
+		const active = activeNarrators.get(narratorId);
+		if (active?.alive) {
+			active.abortController.abort();
+		}
 		broadcastToNarrator(narratorId, {
 			type: "compact_failed",
 			narratorId,

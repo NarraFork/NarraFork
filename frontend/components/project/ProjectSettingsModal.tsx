@@ -20,16 +20,30 @@ export function ProjectSettingsModal({
 	const { t: tc } = useTranslation("common");
 	const update = useUpdateProject();
 	const [domain, setDomain] = useState(proxyDomain ?? "");
+	const normalized = domain.trim().toLowerCase();
+	const hasInvalidChars = /[^a-z0-9.-]/.test(normalized);
+	const hasConsecutiveDots = normalized.includes("..");
+	const validShape =
+		/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))+$/.test(
+			normalized,
+		);
+	const domainError =
+		normalized.length === 0
+			? null
+			: hasInvalidChars || hasConsecutiveDots || !validShape
+				? t("proxyDomainInvalid")
+				: null;
 
 	useEffect(() => {
 		if (opened) setDomain(proxyDomain ?? "");
 	}, [opened, proxyDomain]);
 
 	const handleSave = () => {
+		if (domainError) return;
 		update.mutate(
 			{
 				id: projectId,
-				data: { proxyDomain: domain.trim() || null },
+				data: { proxyDomain: normalized || null },
 			},
 			{ onSuccess: onClose },
 		);
@@ -44,11 +58,12 @@ export function ProjectSettingsModal({
 					placeholder="dev.example.com"
 					value={domain}
 					onChange={(e) => setDomain(e.currentTarget.value)}
+					error={domainError}
 				/>
 				<Text size="xs" c="dimmed">
 					{t("proxyDomainHint")}
 				</Text>
-				<Button onClick={handleSave} loading={update.isPending}>
+				<Button onClick={handleSave} loading={update.isPending} disabled={!!domainError}>
 					{tc("save")}
 				</Button>
 			</Stack>

@@ -622,6 +622,23 @@ export class CodexManager {
 		return now >= effectiveDeadline;
 	}
 
+	private evaluateQuotaFromUsage(usage: CodexUsageResult): {
+		exhausted: boolean;
+		resetsAt?: number;
+	} {
+		const exhaustedWindows = [usage.primary_window, usage.secondary_window].filter(
+			(window): window is NonNullable<CodexUsageResult["primary_window"]> =>
+				!!window && window.remaining_percent <= 0,
+		);
+		if (exhaustedWindows.length === 0) return { exhausted: false };
+
+		const resetAtCandidates = exhaustedWindows
+			.map((window) => window.reset_at * 1000)
+			.filter((resetAt) => Number.isFinite(resetAt));
+		const resetsAt = resetAtCandidates.length > 0 ? Math.max(...resetAtCandidates) : undefined;
+		return { exhausted: true, resetsAt };
+	}
+
 	private async refreshUsage(id: string): Promise<CodexUsageResult> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
@@ -652,6 +669,12 @@ export class CodexManager {
 		const usage = await fetchCodexUsage(entry.accessToken, entry.accountId, proxy);
 		entry.usage = usage;
 		this.saveCredentials();
+
+		const quotaState = this.evaluateQuotaFromUsage(usage);
+		if (quotaState.exhausted) {
+			this.reportQuotaExhausted(id, quotaState.resetsAt);
+		}
+
 		return usage;
 	}
 

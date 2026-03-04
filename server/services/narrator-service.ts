@@ -1151,10 +1151,10 @@ export const narratorService = {
 		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
-		if (!compactBlock?.summary) {
+		if (!compactBlock) {
 			throw new NotFoundError("CompactSummary", messageId);
 		}
-		return compactBlock.summary;
+		return typeof compactBlock.summary === "string" ? compactBlock.summary : "";
 	},
 
 	/**
@@ -1614,14 +1614,22 @@ export const narratorService = {
 		narratorId: string,
 		summary: string,
 		contextPercent?: number,
+		options?: { status?: "compacted" | "failed"; error?: string },
 	) {
 		const now = new Date().toISOString();
+		const status = options?.status ?? "compacted";
+		const compactBlock: Record<string, unknown> = { type: "compact", status, summary };
+		if (status === "failed" && options?.error) {
+			compactBlock.error = options.error;
+		}
+		const prefix = status === "failed" ? "[Compact Failed]" : "[Compact]";
+
 		return db.transaction(async (tx) => {
 			const [updated] = await tx
 				.update(narratorMessages)
 				.set({
-					contentJson: [{ type: "compact", status: "compacted", summary }],
-					contentText: `[Compact] ${summary.slice(0, 200)}...`,
+					contentJson: [compactBlock],
+					contentText: `${prefix} ${summary.slice(0, 200)}...`,
 					contextPercent: contextPercent ?? null,
 				})
 				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
@@ -1630,7 +1638,7 @@ export const narratorService = {
 
 			await tx
 				.update(narratorMessageRefs)
-				.set({ isCompact: 1 })
+				.set({ isCompact: status === "compacted" ? 1 : 0 })
 				.where(
 					and(
 						eq(narratorMessageRefs.messageId, messageId),
@@ -1638,10 +1646,13 @@ export const narratorService = {
 					),
 				);
 
-			await tx
-				.update(narrators)
-				.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
+			// Only successful compact should reset context summary/API conversation.
+			if (status === "compacted") {
+				await tx
+					.update(narrators)
+					.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
+					.where(eq(narrators.id, narratorId));
+			}
 
 			return updated;
 		});

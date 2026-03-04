@@ -1,4 +1,5 @@
 import {
+	Alert,
 	Anchor,
 	Badge,
 	Button,
@@ -11,7 +12,14 @@ import {
 	Stack,
 	Text,
 } from "@mantine/core";
-import { IconPlayerPlay, IconPlayerStop, IconScript, IconSettings } from "@tabler/icons-react";
+import {
+	IconAlertTriangle,
+	IconPlayerPlay,
+	IconPlayerStop,
+	IconScript,
+	IconSettings,
+} from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useContainerEvents } from "../../hooks/useContainerEvents";
@@ -21,6 +29,7 @@ import {
 	useStartContainers,
 	useStopContainers,
 } from "../../hooks/useContainers";
+import { api } from "../../lib/api";
 import { CONTAINER_STATUS_COLORS } from "../../lib/constants";
 
 interface ContainerPanelProps {
@@ -32,6 +41,21 @@ interface ContainerPanelProps {
 export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: ContainerPanelProps) {
 	const { t } = useTranslation("containers");
 	const { data: containers, isLoading } = useContainers(chapterId);
+	const { data: chapter } = useQuery({
+		queryKey: ["chapters", chapterId],
+		queryFn: () => api.getChapter(chapterId),
+		enabled: !!chapterId,
+	});
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		staleTime: 30_000,
+	});
+	const { data: project } = useQuery({
+		queryKey: ["projects", chapter?.projectId],
+		queryFn: () => api.getProject(chapter?.projectId ?? ""),
+		enabled: !!chapter?.projectId,
+	});
 	const start = useStartContainers();
 	const stop = useStopContainers();
 	const { starting, logs: buildLogs } = useContainerEvents(chapterId);
@@ -55,9 +79,22 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 	// Deduplicated service names for log filter
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
 	const serviceNames = [...new Set((containers ?? []).map((c: any) => c.serviceName as string))];
+	const proxyEnabled = settings?.containers?.proxy?.enabled ?? false;
+	const projectProxyDomain =
+		(project as { proxyDomain?: string | null } | undefined)?.proxyDomain ?? null;
+	const hasProxyUrl = (containers ?? []).some(
+		(c) => !!(c as { proxyUrl?: string | null }).proxyUrl,
+	);
+	const showProxyDomainHint =
+		proxyEnabled && !projectProxyDomain && !!chapter?.containerConfig && !hasProxyUrl;
 
 	return (
 		<Stack gap="xs" p="xs">
+			{showProxyDomainHint && (
+				<Alert icon={<IconAlertTriangle size={14} />} color="yellow" variant="light">
+					<Text size="xs">{t("proxyDomainMissingHint")}</Text>
+				</Alert>
+			)}
 			{/* Service status list */}
 			{isLoading ? (
 				<Loader size="xs" />

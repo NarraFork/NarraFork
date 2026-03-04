@@ -9,6 +9,7 @@ import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureFts } from "./fts";
 import * as relations from "./relations";
+import { runMigrations } from "./run-migrations";
 import * as schema from "./schema";
 
 const dbPath = getDbPath();
@@ -39,6 +40,24 @@ if (!integrity.ok) {
 	}
 }
 
+try {
+	const migrationResult = await runMigrations(sqlite);
+	if (migrationResult.source === "embedded") {
+		logger.info("Database migrated from embedded migration data", {
+			migrationsFolder: migrationResult.folder,
+		});
+	}
+} catch (err) {
+	logger.error("Database migration failed on startup", {
+		error: String(err),
+		stack: (err as Error)?.stack,
+	});
+	throw err;
+}
+
+// FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
+ensureFts(sqlite);
+
 // Periodic WAL checkpoint to prevent WAL file bloat and reduce corruption risk
 const walCheckpointTimer = startWalCheckpointInterval(sqlite);
 
@@ -53,9 +72,6 @@ process.on("exit", () => {
 		// best-effort on exit
 	}
 });
-
-// FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
-ensureFts(sqlite);
 
 export const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 export { sqlite };

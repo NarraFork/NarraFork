@@ -1,10 +1,11 @@
-import { agentGenerate, agentGenerateWithMeta } from "../lib/agent";
+import { agentGenerateWithMeta } from "../lib/agent";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { narratorService } from "./narrator-service";
 
 const SUMMARY_MAX_MESSAGES = 50;
+const COMPACT_MAX_RETRIES = 2;
 
 /** Tool call statuses that indicate the call is still in-flight. */
 const IN_FLIGHT_STATUSES = new Set(["initializing", "pending", "running"]);
@@ -18,7 +19,11 @@ export const narratorContext = {
 	 * prepended to the conversation text so the summary model can incorporate it.
 	 * This prevents losing context that was compacted before the recent messages.
 	 */
-	async generateContextSummary(narratorId: string, locale: Locale = "en"): Promise<string> {
+	async generateContextSummary(
+		narratorId: string,
+		locale: Locale = "en",
+		options?: { throwOnFailure?: boolean },
+	): Promise<string> {
 		const narrator = await narratorService.getById(narratorId);
 		const messages = await narratorService.getMessages(narratorId, SUMMARY_MAX_MESSAGES);
 
@@ -41,14 +46,19 @@ export const narratorContext = {
 
 		try {
 			const summarySuffix = getPrompt("compactSuffix", locale);
-			const summary = await agentGenerate(
-				`${summaryPrompt}\n<conversation>\n${conversationText}\n</conversation>\n\n${summarySuffix}`,
+			const summaryUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${summarySuffix}`;
+			const result = await agentGenerateWithMeta(
+				summaryUserText,
 				settings.agent.summaryModel,
+				summaryPrompt,
 			);
 
-			return summary || "Failed to generate summary.";
+			return result.text || "Failed to generate summary.";
 		} catch (err) {
 			logger.error("Context summary generation failed", { narratorId, error: String(err) });
+			if (options?.throwOnFailure) {
+				throw err;
+			}
 			return "Context summary generation failed. Starting fresh.";
 		}
 	},
@@ -130,25 +140,37 @@ export const narratorContext = {
 		const hasPendingTodos = todos.some((t: { status?: string }) => t.status !== "completed");
 		const todoSkipHint = hasPendingTodos ? `\n\n${getToolMessage("compactTodoSkip", locale)}` : "";
 
-		try {
-			const compactSuffix = getPrompt("compactSuffix", locale);
-			const result = await agentGenerateWithMeta(
-				`${compactPrompt}${todoSkipHint}\n<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`,
-				settings.agent.summaryModel,
-			);
+		const compactSuffix = getPrompt("compactSuffix", locale);
+		const compactSystemPrompt = `${compactPrompt}${todoSkipHint}`;
+		const compactUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`;
 
-			return {
-				summary: result.text || "Failed to generate compact summary.",
-				contextPercent: result.contextPercent,
-			};
-		} catch (err) {
-			logger.error("Compact summary generation failed, falling back to basic summary", {
-				narratorId,
-				error: String(err),
-			});
-			const fallback = await this.generateContextSummary(narratorId, locale);
-			return { summary: fallback };
+		let lastError: unknown;
+		for (let attempt = 1; attempt <= COMPACT_MAX_RETRIES; attempt++) {
+			try {
+				const result = await agentGenerateWithMeta(
+					compactUserText,
+					settings.agent.summaryModel,
+					compactSystemPrompt,
+				);
+				if (!result.text?.trim()) {
+					throw new Error("Compact summary model returned empty output");
+				}
+				return {
+					summary: result.text,
+					contextPercent: result.contextPercent,
+				};
+			} catch (err) {
+				lastError = err;
+				logger.error("Compact summary generation attempt failed", {
+					narratorId,
+					attempt,
+					maxRetries: COMPACT_MAX_RETRIES,
+					error: String(err),
+				});
+			}
 		}
+
+		throw lastError instanceof Error ? lastError : new Error(String(lastError));
 	},
 };
 

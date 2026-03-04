@@ -55,6 +55,7 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const [expanded, setExpanded] = useState(true);
+	const [unavailableExpanded, setUnavailableExpanded] = useState(false);
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
 	const [deviceAuthModal, setDeviceAuthModal] = useState(false);
@@ -87,6 +88,8 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 
 	const codexModelIds: string[] = settingsData?.codexModels ?? [];
 	const entries = status?.entries ?? [];
+	const availableEntries = entries.filter((entry) => !entry.disabled);
+	const unavailableEntries = entries.filter((entry) => entry.disabled);
 	const loadBalancingMode = status?.loadBalancingMode ?? "priority";
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
@@ -541,23 +544,80 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 
 						{/* Credentials list (responsive: cards on mobile, table on desktop) */}
 						{entries.length > 0 && (
-							<CredentialList
-								entries={entries}
-								currentId={status?.currentId}
-								usageCache={usageCache}
-								editingId={editingId}
-								editForm={editForm}
-								onEdit={handleEdit}
-								onSaveEdit={handleSaveEdit}
-								onCancelEdit={() => setEditingId(null)}
-								onEditFormChange={setEditForm}
-								usageMut={usageMut}
-								enableMut={enableMut}
-								disableMut={disableMut}
-								resetMut={resetMut}
-								deleteMut={deleteMut}
-								t={t}
-							/>
+							<Stack gap="xs">
+								{availableEntries.length > 0 && (
+									<Stack gap="xs">
+										<Group justify="space-between">
+											<Text size="sm" fw={500}>
+												{t("codexCredentialsAvailable")}
+											</Text>
+											<Badge size="sm" color="green">
+												{availableEntries.length}
+											</Badge>
+										</Group>
+										<CredentialList
+											entries={availableEntries}
+											currentId={status?.currentId}
+											usageCache={usageCache}
+											editingId={editingId}
+											editForm={editForm}
+											onEdit={handleEdit}
+											onSaveEdit={handleSaveEdit}
+											onCancelEdit={() => setEditingId(null)}
+											onEditFormChange={setEditForm}
+											usageMut={usageMut}
+											enableMut={enableMut}
+											disableMut={disableMut}
+											resetMut={resetMut}
+											deleteMut={deleteMut}
+											t={t}
+										/>
+									</Stack>
+								)}
+
+								{unavailableEntries.length > 0 && (
+									<Stack gap="xs">
+										<Group
+											justify="space-between"
+											style={{ cursor: "pointer" }}
+											onClick={() => setUnavailableExpanded(!unavailableExpanded)}
+										>
+											<Group gap="xs">
+												{unavailableExpanded ? (
+													<IconChevronDown size={16} />
+												) : (
+													<IconChevronRight size={16} />
+												)}
+												<Text size="sm" fw={500}>
+													{t("codexCredentialsUnavailable")}
+												</Text>
+											</Group>
+											<Badge size="sm" color="red">
+												{unavailableEntries.length}
+											</Badge>
+										</Group>
+										<Collapse in={unavailableExpanded}>
+											<CredentialList
+												entries={unavailableEntries}
+												currentId={status?.currentId}
+												usageCache={usageCache}
+												editingId={editingId}
+												editForm={editForm}
+												onEdit={handleEdit}
+												onSaveEdit={handleSaveEdit}
+												onCancelEdit={() => setEditingId(null)}
+												onEditFormChange={setEditForm}
+												usageMut={usageMut}
+												enableMut={enableMut}
+												disableMut={disableMut}
+												resetMut={resetMut}
+												deleteMut={deleteMut}
+												t={t}
+											/>
+										</Collapse>
+									</Stack>
+								)}
+							</Stack>
 						)}
 
 						{/* Models section */}

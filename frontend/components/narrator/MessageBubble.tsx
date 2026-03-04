@@ -17,6 +17,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	IconAlertTriangle,
 	IconArrowsMinimize,
 	IconBrain,
 	IconChevronDown,
@@ -612,6 +613,27 @@ export const MessageBubble = memo(function MessageBubble({
 				);
 			}
 			const isCompacting = compactBlock.status === "compacting";
+			const isFailed = compactBlock.status === "failed";
+			if (isFailed) {
+				return (
+					<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+						<Group gap={6} wrap="nowrap" align="flex-start">
+							<IconAlertTriangle
+								size={16}
+								style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
+							/>
+							<Stack gap={2}>
+								<Text size="xs" fw={600} c="red.8">
+									{t("compactFailed")}
+								</Text>
+								<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
+									{compactBlock.error ?? compactBlock.summary ?? t("compactFailedDesc")}
+								</Text>
+							</Stack>
+						</Group>
+					</Paper>
+				);
+			}
 			const canNavigate = !isCompacting && narratorId && message.id;
 			return (
 				<CompactIndicator

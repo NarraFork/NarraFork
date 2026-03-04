@@ -483,6 +483,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	async generateWithMeta(
 		text: string,
 		model: string,
+		systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const apiKey = this.config.apiKey;
 		const baseUrl = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -496,6 +497,22 @@ export class AnthropicProvider implements ProviderAdapter {
 			? `${ANTHROPIC_BETA_FLAGS},${CONTEXT_1M_BETA}`
 			: ANTHROPIC_BETA_FLAGS;
 
+		const body: {
+			model: string;
+			max_tokens: number;
+			messages: Array<{ role: "user"; content: string }>;
+			service_tier: "standard_only";
+			system?: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
+		} = {
+			model: bareModel,
+			max_tokens: 4096,
+			messages: [{ role: "user", content: text }],
+			service_tier: "standard_only",
+		};
+		if (systemInstruction) {
+			body.system = [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }];
+		}
+
 		const response = await fetch(`${baseUrl}/messages`, {
 			method: "POST",
 			headers: {
@@ -504,12 +521,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				"anthropic-version": "2023-06-01",
 				"anthropic-beta": betaFlags,
 			},
-			body: JSON.stringify({
-				model: bareModel,
-				max_tokens: 4096,
-				messages: [{ role: "user", content: text }],
-				service_tier: "standard_only",
-			}),
+			body: JSON.stringify(body),
 		});
 
 		if (!response.ok) {

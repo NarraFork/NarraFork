@@ -63,6 +63,8 @@ export function useContainerEvents(chapterId: string) {
 						qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 						break;
 					case "container:stopped":
+					case "container:paused":
+					case "container:resumed":
 						qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 						break;
 					case "container:error":

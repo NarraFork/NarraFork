@@ -48,5 +48,6 @@
 	"settingsTitle": "项目设置",
 	"proxyDomain": "代理域名",
 	"proxyDomainDesc": "容器代理子域名的基础域名。每个容器端口会分配一个子域名，格式为 {章节ID}-{服务名}-{端口}.{域名}。",
-	"proxyDomainHint": "需要配置通配符 DNS：*.{域名} → 服务器 IP。本地开发可使用 *.localhost 或配置 dnsmasq。"
+	"proxyDomainHint": "需要配置通配符 DNS：*.{域名} → 服务器 IP。本地开发可使用 *.localhost 或配置 dnsmasq。",
+	"proxyDomainInvalid": "请输入合法域名（示例：dev.example.com，不要包含 http:// 或路径）"
 }

@@ -1,12 +1,13 @@
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDatabase } from "./connection";
+import { runMigrations } from "./run-migrations";
 
 const sqlite = openDatabase();
 
 try {
-	const db = drizzle({ client: sqlite });
-	migrate(db, { migrationsFolder: "./drizzle" });
+	const result = await runMigrations(sqlite);
+	if (result.source === "embedded") {
+		console.log(`Using embedded migrations: ${result.folder}`);
+	}
 	console.log("Migrations complete.");
 	process.exit(0);
 } catch (err) {

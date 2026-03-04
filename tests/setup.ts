@@ -173,6 +173,8 @@ CREATE TABLE IF NOT EXISTS container_instances (
 	status TEXT NOT NULL DEFAULT 'created',
 	host_port INTEGER,
 	container_port INTEGER,
+	proxy_label TEXT,
+	container_ip TEXT,
 	volume_name TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL

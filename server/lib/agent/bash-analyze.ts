@@ -34,6 +34,8 @@ export interface BashAnalysis {
 	catastrophicReason?: string;
 	/** Chapter 模式下检测到的 git 分支违规操作（切换分支、修改其他分支等） */
 	gitBranchViolations: string[];
+	/** 是否包含写操作（如 biome --write）— 只在 acceptEdits 模式下允许 */
+	hasWriteOperation: boolean;
 }
 
 // ── 白名单 ────────────────────────────────────────────────
@@ -303,6 +305,13 @@ const BIOME_SAFE_ARG_PREFIXES = [
 	"--javascript-formatter-line-width",
 ];
 
+/** Biome 写操作参数 — 只在 acceptEdits 模式下允许 */
+const BIOME_WRITE_ARG_PREFIXES = [
+	"--write", // 格式化并写入文件
+	"--fix", // 修复 lint 错误
+	"--unsafe", // 应用不安全的修复
+];
+
 /** 会触发远程拉包或动态来源的高风险参数。 */
 const PACKAGE_RUNNER_DANGEROUS_FLAGS = new Set([
 	"-p",
@@ -312,16 +321,27 @@ const PACKAGE_RUNNER_DANGEROUS_FLAGS = new Set([
 	"--ignore-existing",
 ]);
 
+/** 包执行器分类结果 */
+interface PackageRunnerClassification {
+	/** 错误描述，null 表示安全 */
+	error: string | null;
+	/** 是否包含写操作 */
+	hasWriteOperation: boolean;
+}
+
 /**
  * 对 npx/bunx 执行的命令进行递归分类。
  * 严格模式：仅允许受控白名单包 + 只读参数 + 非远程来源。
  */
-function classifyPackageRunner(tokens: string[], runner: string): string | null {
+function classifyPackageRunner(tokens: string[], runner: string): PackageRunnerClassification {
 	let i = 1;
 	while (i < tokens.length && tokens[i].startsWith("-")) {
 		const flag = tokens[i];
 		if (PACKAGE_RUNNER_DANGEROUS_FLAGS.has(flag)) {
-			return `${runner} ${flag} (dynamic package source not allowed)`;
+			return {
+				error: `${runner} ${flag} (dynamic package source not allowed)`,
+				hasWriteOperation: false,
+			};
 		}
 		// --package/-p 带参数（虽然上面已拦截，保留健壮性）
 		if (flag === "--package" || flag === "-p") {
@@ -332,7 +352,7 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 	}
 	const execCmd = tokens[i];
 	if (!execCmd) {
-		return `${runner} (no explicit command)`;
+		return { error: `${runner} (no explicit command)`, hasWriteOperation: false };
 	}
 
 	// 禁止 URL / git / file 协议来源
@@ -343,13 +363,16 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 		execCmd.startsWith("http:") ||
 		execCmd.startsWith("https:")
 	) {
-		return `${runner} ${execCmd} (remote source not allowed)`;
+		return { error: `${runner} ${execCmd} (remote source not allowed)`, hasWriteOperation: false };
 	}
 
 	// 禁止非固定版本（如 @latest, @next）
 	const unstableTagPattern = /@(latest|next|canary|beta|alpha|rc)$/i;
 	if (unstableTagPattern.test(execCmd)) {
-		return `${runner} ${execCmd} (unstable package tag not allowed)`;
+		return {
+			error: `${runner} ${execCmd} (unstable package tag not allowed)`,
+			hasWriteOperation: false,
+		};
 	}
 
 	// 提取包名（去除 @scope/pkg@version 里的版本部分）
@@ -358,15 +381,21 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 		: execCmd.split("@")[0];
 
 	if (!SAFE_PACKAGE_RUNNERS.has(packageName)) {
-		return `${runner} ${execCmd} (package not in allowlist)`;
+		return { error: `${runner} ${execCmd} (package not in allowlist)`, hasWriteOperation: false };
 	}
 
 	const isBiome = packageName === "biome" || packageName === "@biomejs/biome";
+	const isTsc = packageName === "tsc" || packageName === "typescript";
+
+	let hasWriteOperation = false;
 
 	const cmdArgs = tokens.slice(i + 1);
 	for (const arg of cmdArgs) {
 		if (arg.startsWith("--config") || arg.startsWith("--plugin") || arg.startsWith("--require")) {
-			return `${runner} ${execCmd} ${arg} (dynamic code loading flag)`;
+			return {
+				error: `${runner} ${execCmd} ${arg} (dynamic code loading flag)`,
+				hasWriteOperation: false,
+			};
 		}
 		if (arg.startsWith("-")) {
 			// 检查是否在通用白名单中
@@ -376,18 +405,38 @@ function classifyPackageRunner(tokens: string[], runner: string): string | null 
 			// Biome 特定参数：检查前缀匹配（支持 --max-diagnostics=200 格式）
 			if (isBiome) {
 				const argName = arg.split("=")[0];
+				// 检查只读参数
 				if (BIOME_SAFE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
 					continue;
 				}
+				// 检查写操作参数
+				if (BIOME_WRITE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					hasWriteOperation = true;
+					continue;
+				}
 			}
-			return `${runner} ${execCmd} ${arg} (flag not in safe allowlist)`;
+			return {
+				error: `${runner} ${execCmd} ${arg} (flag not in safe allowlist)`,
+				hasWriteOperation: false,
+			};
 		}
-		// 非 flag 参数（子命令/目标路径）只允许极少数只读词或当前目录
+		// 非 flag 参数（子命令/目标路径）
+		// - 允许只读子命令：check, version
+		// - 允许当前目录：.
+		// - Biome/tsc 允许文件路径参数（只读检查操作）
 		if (arg === "check" || arg === "version" || arg === ".") continue;
-		return `${runner} ${execCmd} ${arg} (argument not in safe allowlist)`;
+		if (isBiome || isTsc) {
+			// Biome/tsc 接受文件路径作为检查目标，这是只读操作
+			// 路径安全性由外层的 isInsideWorktree 检查保证
+			continue;
+		}
+		return {
+			error: `${runner} ${execCmd} ${arg} (argument not in safe allowlist)`,
+			hasWriteOperation: false,
+		};
 	}
 
-	return null;
+	return { error: null, hasWriteOperation };
 }
 
 /**
@@ -679,8 +728,8 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			return null;
 		},
 		// npx/bunx — 包执行器，递归检查被执行的命令
-		npx: (tokens) => classifyPackageRunner(tokens, "npx"),
-		bunx: (tokens) => classifyPackageRunner(tokens, "bunx"),
+		npx: (tokens) => classifyPackageRunner(tokens, "npx").error,
+		bunx: (tokens) => classifyPackageRunner(tokens, "bunx").error,
 	};
 
 /** 需要提取路径参数的命令（写操作） */
@@ -1347,6 +1396,7 @@ export async function analyzeBashCommand(
 	const filePaths: string[] = [];
 	const nonWhitelisted: string[] = [];
 	const dangerousPatterns: string[] = [];
+	let hasWriteOperation = false;
 
 	for (const node of tree.rootNode.descendantsOfType("command")) {
 		if (!node) continue;
@@ -1414,6 +1464,13 @@ export async function analyzeBashCommand(
 					nonWhitelisted.push(cmdName);
 				}
 			}
+			// 检查包执行器的写操作标志
+			if (cmdName === "npx" || cmdName === "bunx") {
+				const classification = classifyPackageRunner(tokens, cmdName);
+				if (classification.hasWriteOperation) {
+					hasWriteOperation = true;
+				}
+			}
 			// 路径提取（条件安全命令中的文件操作）
 			if (PATH_COMMANDS.has(cmdName)) {
 				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
@@ -1475,6 +1532,7 @@ export async function analyzeBashCommand(
 		isCatastrophic: catastrophicReason !== null,
 		catastrophicReason: catastrophicReason ?? undefined,
 		gitBranchViolations,
+		hasWriteOperation,
 	};
 }
 

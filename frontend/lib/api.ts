@@ -587,6 +587,7 @@ export const api = {
 			podmanCompose: { ok: boolean; version?: string };
 			composeProvider: { ok: boolean; provider?: string };
 			passt: { ok: boolean; version?: string };
+			rootlessNetwork: { ok: boolean; backend?: string };
 			allReady: boolean;
 		}>(`/chapters/container-setup${refresh ? "?refresh=true" : ""}`),
 	getPodmanStatus: () =>

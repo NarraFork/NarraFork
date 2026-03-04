@@ -163,7 +163,15 @@ async function exchangeCodeForTokens(
 		const text = await response.text().catch(() => "");
 		throw new Error(`Token exchange failed: ${response.status} ${text}`);
 	}
-	return response.json();
+	const raw = await response.text();
+	try {
+		return JSON.parse(raw) as TokenResponse;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(
+			`Token exchange returned non-JSON payload: ${message}. body preview=${raw.slice(0, 500)}`,
+		);
+	}
 }
 
 /** Refresh an expired access token using the refresh token. */
@@ -188,7 +196,16 @@ export async function refreshCodexToken(
 		const text = await response.text().catch(() => "");
 		throw new Error(`Token refresh failed: ${response.status} ${text}`);
 	}
-	const tokens: TokenResponse = await response.json();
+	const raw = await response.text();
+	let tokens: TokenResponse;
+	try {
+		tokens = JSON.parse(raw) as TokenResponse;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(
+			`Token refresh returned non-JSON payload: ${message}. body preview=${raw.slice(0, 500)}`,
+		);
+	}
 	const accountId = extractAccountId(tokens);
 	return {
 		accessToken: tokens.access_token,
@@ -404,11 +421,25 @@ export async function startDeviceCodeFlow(proxy?: string): Promise<DeviceCodeInf
 		throw new Error(`Failed to initiate device authorization: ${response.status} ${text}`);
 	}
 
-	const data = (await response.json()) as {
+	const raw = await response.text();
+	let data: {
 		device_auth_id: string;
 		user_code: string;
 		interval: string;
 	};
+	try {
+		data = JSON.parse(raw) as {
+			device_auth_id: string;
+			user_code: string;
+			interval: string;
+		};
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(
+			`Device authorization start returned non-JSON payload: ${message}. ` +
+				`body preview=${raw.slice(0, 500)}`,
+		);
+	}
 
 	return {
 		deviceAuthId: data.device_auth_id,
@@ -447,10 +478,23 @@ export async function pollDeviceCodeFlow(
 		);
 
 		if (response.ok) {
-			const data = (await response.json()) as {
+			const raw = await response.text();
+			let data: {
 				authorization_code: string;
 				code_verifier: string;
 			};
+			try {
+				data = JSON.parse(raw) as {
+					authorization_code: string;
+					code_verifier: string;
+				};
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				throw new Error(
+					`Device authorization poll returned non-JSON payload: ${message}. ` +
+						`body preview=${raw.slice(0, 500)}`,
+				);
+			}
 
 			// Exchange for tokens
 			const tokenResponse = await pfetch(
@@ -473,7 +517,17 @@ export async function pollDeviceCodeFlow(
 				throw new Error(`Token exchange failed: ${tokenResponse.status}`);
 			}
 
-			const tokens: TokenResponse = await tokenResponse.json();
+			const tokenRaw = await tokenResponse.text();
+			let tokens: TokenResponse;
+			try {
+				tokens = JSON.parse(tokenRaw) as TokenResponse;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				throw new Error(
+					`Token exchange returned non-JSON payload: ${message}. ` +
+						`body preview=${tokenRaw.slice(0, 500)}`,
+				);
+			}
 			const accountId = extractAccountId(tokens);
 			return {
 				accessToken: tokens.access_token,

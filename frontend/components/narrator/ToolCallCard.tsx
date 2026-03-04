@@ -405,18 +405,18 @@ function ToolHeader({
 	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
 	const content = (
-		<Group gap={6} wrap="nowrap">
+		<Group gap={6} wrap="nowrap" align="center">
 			<ThemeIcon size={18} variant="light" color={color} radius="sm">
 				<Icon size={12} />
 			</ThemeIcon>
-			<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0 }}>
+			<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
 				{toolCall.toolName}
 			</Text>
 			<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
 				{summary}
 			</Text>
-			<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-				<Box c={statusColor}>
+			<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
+				<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
 					<StatusIcon status={toolCall.status} />
 				</Box>
 				{toolCall.startedAt != null &&
@@ -431,7 +431,9 @@ function ToolHeader({
 						</Text>
 					)
 				)}
-				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+				<Box style={{ display: "flex", alignItems: "center" }}>
+					{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+				</Box>
 			</Group>
 		</Group>
 	);

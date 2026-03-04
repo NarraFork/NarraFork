@@ -200,7 +200,69 @@ describe("prompt injection: interpreter code execution", () => {
 		expectAllowed("bunx @biomejs/biome check . --diagnostic-level=error"));
 	test("bunx @biomejs/biome check . --no-colors → allow (biome safe args)", () =>
 		expectAllowed("bunx @biomejs/biome check . --no-colors"));
+	test("bunx @biomejs/biome check server/lib/agent/openai-provider.ts → allow (file path)", () =>
+		expectAllowed("bunx @biomejs/biome check server/lib/agent/openai-provider.ts"));
+	test("bunx @biomejs/biome check src/**/*.ts → allow (glob pattern)", () =>
+		expectAllowed("bunx @biomejs/biome check src/**/*.ts"));
+	test("bunx @biomejs/biome check --write . → ask (write operation in default mode)", async () => {
+		const analysis = await analyzeBashCommand(
+			"bunx @biomejs/biome check --write .",
+			"/test/cwd",
+			false,
+		);
+		expect(analysis.allWhitelisted).toBe(true);
+		expect(analysis.hasWriteOperation).toBe(true);
+		expect(
+			resolvePermissionDecision(
+				"Bash",
+				{ command: "test" },
+				"default",
+				"/test/cwd",
+				false,
+				analysis,
+			),
+		).toBe("ask");
+	});
+	test("bunx @biomejs/biome check --write . → allow (write operation in acceptEdits mode)", async () => {
+		const analysis = await analyzeBashCommand(
+			"bunx @biomejs/biome check --write .",
+			"/test/cwd",
+			false,
+		);
+		expect(analysis.allWhitelisted).toBe(true);
+		expect(analysis.hasWriteOperation).toBe(true);
+		expect(
+			resolvePermissionDecision(
+				"Bash",
+				{ command: "test" },
+				"acceptEdits",
+				"/test/cwd",
+				false,
+				analysis,
+			),
+		).toBe("allow");
+	});
+	test("bunx @biomejs/biome check --write server/lib/agent/__tests__/bash-analyze.test.ts → allow (acceptEdits)", async () => {
+		const analysis = await analyzeBashCommand(
+			"bunx @biomejs/biome check --write server/lib/agent/__tests__/bash-analyze.test.ts",
+			"/test/cwd",
+			false,
+		);
+		expect(analysis.allWhitelisted).toBe(true);
+		expect(analysis.hasWriteOperation).toBe(true);
+		expect(
+			resolvePermissionDecision(
+				"Bash",
+				{ command: "test" },
+				"acceptEdits",
+				"/test/cwd",
+				false,
+				analysis,
+			),
+		).toBe("allow");
+	});
 	test("npx tsc --noEmit → allow (strict allowlist)", () => expectAllowed("npx tsc --noEmit"));
+	test("npx tsc src/index.ts → allow (file path)", () => expectAllowed("npx tsc src/index.ts"));
 	test("npx vitest → ask (not in strict safe args)", () => expectBlocked("npx vitest"));
 	test("npx -p vitest vitest → ask (dynamic package source)", () =>
 		expectBlocked("npx -p vitest vitest"));
@@ -550,6 +612,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		hasWriteOperation: false,
 	};
 
 	const withNonWhitelisted: BashAnalysis = {
@@ -561,6 +624,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		hasWriteOperation: false,
 	};
 
 	const withExternalPath: BashAnalysis = {
@@ -574,6 +638,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		hasWriteOperation: false,
 	};
 
 	const withDangerousPattern: BashAnalysis = {
@@ -591,6 +656,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		hasWriteOperation: false,
 	};
 
 	const withEnvInjection: BashAnalysis = {
@@ -602,6 +668,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: true,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		hasWriteOperation: false,
 	};
 
 	test("default + allWhitelisted + internal paths → ask (default mode asks for all mutations)", () => {
