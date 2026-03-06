@@ -981,6 +981,7 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ query }),
 		}),
+		// biome-ignore lint/suspicious/noExplicitAny: MCP tool response structure varies
 			method: "POST",
 			body: JSON.stringify({ credentials }),
 		}),
@@ -1016,6 +1017,51 @@ export const api = {
 			content: string;
 			files: string[];
 		}>(`/skills/${encodeURIComponent(name)}?projectId=${projectId}`),
+
+	// Global Skills
+	listGlobalSkills: () =>
+		request<
+			Array<{
+				name: string;
+				description: string;
+				location: string;
+				files: string[];
+			}>
+		>("/skills/global"),
+	getGlobalSkill: (name: string) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+		}>(`/skills/global/${encodeURIComponent(name)}`),
+	createGlobalSkill: (data: { name: string; description: string; content: string }) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+		}>("/skills/global", { method: "POST", body: JSON.stringify(data) }),
+	updateGlobalSkill: (
+		currentName: string,
+		data: { name: string; description: string; content: string },
+	) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+		}>(`/skills/global/${encodeURIComponent(currentName)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deleteGlobalSkill: (name: string) =>
+		request<{ ok: boolean }>(`/skills/global/${encodeURIComponent(name)}`, {
+			method: "DELETE",
+		}),
 	openaiRefreshModels: () =>
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
 			"/openai/models/refresh",

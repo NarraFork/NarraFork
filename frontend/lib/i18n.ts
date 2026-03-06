@@ -9,6 +9,7 @@ import enNarrator from "@frontend/locales/en/narrator.json";
 import enNarrators from "@frontend/locales/en/narrators.json";
 import enNav from "@frontend/locales/en/nav.json";
 import enProjects from "@frontend/locales/en/projects.json";
+import enRoutines from "@frontend/locales/en/routines.json";
 import enSearch from "@frontend/locales/en/search.json";
 import enSettings from "@frontend/locales/en/settings.json";
 import enTerminal from "@frontend/locales/en/terminal.json";
@@ -23,6 +24,7 @@ import zhNarrator from "@frontend/locales/zh-CN/narrator.json";
 import zhNarrators from "@frontend/locales/zh-CN/narrators.json";
 import zhNav from "@frontend/locales/zh-CN/nav.json";
 import zhProjects from "@frontend/locales/zh-CN/projects.json";
+import zhRoutines from "@frontend/locales/zh-CN/routines.json";
 import zhSearch from "@frontend/locales/zh-CN/search.json";
 import zhSettings from "@frontend/locales/zh-CN/settings.json";
 import zhTerminal from "@frontend/locales/zh-CN/terminal.json";
@@ -45,6 +47,7 @@ const ns = [
 	"narrators",
 	"settings",
 	"terminal",
+	"routines",
 ] as const;
 
 i18n
@@ -67,6 +70,7 @@ i18n
 				narrators: enNarrators,
 				settings: enSettings,
 				terminal: enTerminal,
+				routines: enRoutines,
 			},
 			"zh-CN": {
 				common: zhCommon,
@@ -83,6 +87,7 @@ i18n
 				narrators: zhNarrators,
 				settings: zhSettings,
 				terminal: zhTerminal,
+				routines: zhRoutines,
 			},
 		},
 		fallbackLng: "en",

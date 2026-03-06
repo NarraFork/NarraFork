@@ -190,7 +190,7 @@ const DEFAULTS: NarraForkSettings = {
 	},
 };
 
-const narraforkDir = resolve(homedir(), ".narrafork");
+export const narraforkDir = resolve(homedir(), ".narrafork");
 const settingsPath = resolve(narraforkDir, "settings.json");
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

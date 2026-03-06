@@ -27,6 +27,7 @@ import {
 	IconSearch,
 	IconSettings,
 	IconShieldCog,
+	IconWand,
 	IconX,
 } from "@tabler/icons-react";
 import type { QueryClient } from "@tanstack/react-query";
@@ -429,6 +430,13 @@ function AuthenticatedLayout() {
 							onClick={closeNavForLink}
 						/>
 					)}
+					<NavLink
+						component={Link}
+						to="/routines"
+						label={t("routines")}
+						leftSection={<IconWand size={16} />}
+						onClick={closeNavForLink}
+					/>
 					<NavLink
 						component={Link}
 						to="/settings"

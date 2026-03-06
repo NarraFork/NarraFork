@@ -1,7 +1,9 @@
-import { access, readdir, readFile, stat } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import matter from "gray-matter";
 import { logger } from "../lib/logger";
+import { narraforkDir } from "../lib/settings";
 
 export interface SkillInfo {
 	name: string;
@@ -156,7 +158,8 @@ async function findGitRoot(startDir: string): Promise<string | null> {
 }
 
 /**
- * Load all skills for a project. Skills are keyed by name; later entries override earlier ones.
+ * Load all skills for a project (project-level only, no global).
+ * Skills are keyed by name; later entries override earlier ones.
  */
 export async function loadProjectSkills(projectGitPath: string): Promise<SkillInfo[]> {
 	const skillMap = new Map<string, SkillInfo>();
@@ -164,6 +167,39 @@ export async function loadProjectSkills(projectGitPath: string): Promise<SkillIn
 	const skills = await scanSkillDirs(projectGitPath);
 	for (const skill of skills) {
 		skillMap.set(skill.name, skill);
+	}
+
+	return Array.from(skillMap.values());
+}
+
+/**
+ * Load global skills from ~/  (scans ~/.narrafork/skills/, ~/.claude/skills/, ~/.agents/skills/).
+ */
+export async function loadGlobalSkills(): Promise<SkillInfo[]> {
+	const skillMap = new Map<string, SkillInfo>();
+	const skills = await scanSkillDirs(homedir());
+	for (const s of skills) skillMap.set(s.name, s);
+	return Array.from(skillMap.values());
+}
+
+/**
+ * Load all skills (global + project-level). Project-level overrides global on name collision.
+ *
+ * Priority chain (low → high):
+ *   ~/.narrafork/skills < ~/.narrafork/skill < ~/.claude/skills < ~/.agents/skills
+ *   < <project>/.narrafork/skills < ... < <project>/.agents/skills
+ */
+export async function loadAllSkills(projectGitPath: string | null): Promise<SkillInfo[]> {
+	const skillMap = new Map<string, SkillInfo>();
+
+	// 1. Global skills (lowest priority)
+	const globalSkills = await scanSkillDirs(homedir());
+	for (const s of globalSkills) skillMap.set(s.name, s);
+
+	// 2. Project-level skills (override global)
+	if (projectGitPath) {
+		const projectSkills = await scanSkillDirs(projectGitPath);
+		for (const s of projectSkills) skillMap.set(s.name, s);
 	}
 
 	return Array.from(skillMap.values());
@@ -183,13 +219,13 @@ export async function resolveSkillRoot(
 }
 
 /**
- * Load a single skill by name from a project.
+ * Load a single skill by name (global + project merged).
  */
 export async function loadSkillByName(
 	projectGitPath: string,
 	name: string,
 ): Promise<SkillInfo | null> {
-	const skills = await loadProjectSkills(projectGitPath);
+	const skills = await loadAllSkills(projectGitPath);
 	return skills.find((s) => s.name === name) ?? null;
 }
 
@@ -208,8 +244,96 @@ export async function readSkillFile(skillLocation: string, filePath: string): Pr
 	return readFile(resolved, "utf-8");
 }
 
+// === Global skill CRUD (writes to ~/.narrafork/skills/) ===
+
+const globalSkillsDir = join(narraforkDir, "skills");
+
+function sanitizeSkillDirName(name: string): string {
+	// Convert to a safe directory name: lowercase, replace spaces/special chars with hyphens
+	return name
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9\u4e00-\u9fff_-]/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-|-$/g, "");
+}
+
+function buildSkillMd(name: string, description: string, content: string): string {
+	return `---\nname: "${name.replace(/"/g, '\\"')}"\ndescription: "${description.replace(/"/g, '\\"')}"\n---\n\n${content}\n`;
+}
+
+export async function createGlobalSkill(
+	name: string,
+	description: string,
+	content: string,
+): Promise<SkillInfo> {
+	const dirName = sanitizeSkillDirName(name);
+	if (!dirName) throw new Error("Invalid skill name");
+
+	const skillDir = join(globalSkillsDir, dirName);
+	const skillFile = join(skillDir, "SKILL.md");
+
+	// Check if directory already exists
+	try {
+		await access(skillDir);
+		throw new Error(`Skill directory already exists: ${dirName}`);
+	} catch (err) {
+		if (err instanceof Error && err.message.includes("already exists")) throw err;
+		// Directory doesn't exist — good
+	}
+
+	await mkdir(skillDir, { recursive: true });
+	await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
+
+	// Invalidate cache
+	skillCache.delete(skillFile);
+
+	const skill = await loadSkillCached(skillFile, skillDir);
+	if (!skill) throw new Error("Failed to create skill — parse error");
+	return skill;
+}
+
+export async function updateGlobalSkill(
+	currentName: string,
+	name: string,
+	description: string,
+	content: string,
+): Promise<SkillInfo> {
+	// Find the existing skill among global skills to get its location
+	const globals = await loadGlobalSkills();
+	const existing = globals.find((s) => s.name === currentName);
+	if (!existing) throw new Error(`Global skill not found: ${currentName}`);
+
+	const skillFile = existing.location;
+	const skillDir = dirname(skillFile);
+
+	await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
+
+	// Invalidate cache
+	skillCache.delete(skillFile);
+
+	const updated = await loadSkillCached(skillFile, skillDir);
+	if (!updated) throw new Error("Failed to update skill — parse error");
+	return updated;
+}
+
+export async function deleteGlobalSkill(name: string): Promise<void> {
+	const globals = await loadGlobalSkills();
+	const existing = globals.find((s) => s.name === name);
+	if (!existing) throw new Error(`Global skill not found: ${name}`);
+
+	const skillDir = dirname(existing.location);
+	skillCache.delete(existing.location);
+	await rm(skillDir, { recursive: true, force: true });
+}
+
 export const skillService = {
 	loadProjectSkills,
+	loadGlobalSkills,
+	loadAllSkills,
 	loadSkillByName,
 	readSkillFile,
+	createGlobalSkill,
+	updateGlobalSkill,
+	deleteGlobalSkill,
 };

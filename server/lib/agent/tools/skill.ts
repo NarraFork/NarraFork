@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { z } from "zod/v4";
-import { loadProjectSkills } from "../../../services/skill-service";
+import { loadAllSkills } from "../../../services/skill-service";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 /** Escape characters that would break XML attribute values or text content. */
@@ -22,7 +22,7 @@ const skillSummaryCache = new Map<string, Array<{ name: string; description: str
  */
 export async function warmSkillCache(skillRoot: string): Promise<void> {
 	try {
-		const skills = await loadProjectSkills(skillRoot);
+		const skills = await loadAllSkills(skillRoot);
 		skillSummaryCache.set(
 			skillRoot,
 			skills.map((s) => ({ name: s.name, description: s.description })),
@@ -67,7 +67,7 @@ export const skillTool: ToolDefinition = {
 		}
 
 		try {
-			const skills = await loadProjectSkills(ctx.skillRoot);
+			const skills = await loadAllSkills(ctx.skillRoot);
 
 			// Refresh cache
 			skillSummaryCache.set(

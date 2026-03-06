@@ -5,6 +5,7 @@
 	"narrators": "Narrators",
 	"settings": "Settings",
 	"admin": "Admin",
+	"routines": "Routines",
 	"logout": "Logout",
 	"logoutConfirmTitle": "Confirm Logout",
 	"logoutConfirmMessage": "Are you sure you want to log out?",
