@@ -2130,7 +2130,7 @@ export const narratorService = {
 			contextSummary = parent.contextSummary ?? null;
 		}
 
-		// Copy message refs if forkMessageUuid is provided
+		// Copy message refs if forkMessageUuid is provided AND inheritance is not fresh
 		let prefixRows: Array<{
 			messageId: string;
 			seq: number;
@@ -2139,7 +2139,7 @@ export const narratorService = {
 		}> = [];
 		let resolvedForkMessageId: string | null = null;
 
-		if (forkMessageUuid) {
+		if (forkMessageUuid && inheritMode !== "fresh") {
 			// Resolve messageUuid → message ID → narrator ref
 			const msg = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.messageUuid, forkMessageUuid),
