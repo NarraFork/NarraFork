@@ -11,11 +11,11 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import "@xyflow/react/dist/style.css";
 import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
-import { useUpdateChapter } from "@frontend/hooks/useChapters";
+import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
 import { useStoryGraph } from "@frontend/hooks/useStoryGraph";
 import { api } from "@frontend/lib/api";
-import { Box } from "@mantine/core";
+import { Box, Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
@@ -78,8 +78,11 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["storyGraph"] }),
 	});
 
+	const deleteChapter = useDeleteChapter();
+
 	const [selectedNode, setSelectedNode] = useState<SelectedNodeData | null>(null);
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
 
 	// Sync local nodes state when upstream graph data changes
@@ -189,6 +192,27 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		[wakeMutation],
 	);
 
+	const handleDelete = useCallback(
+		(nodeId: string) => {
+			setContextMenu(null);
+			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
+			const node = nodes.find((n) => n.id === nodeId);
+			const title = (node?.data as any)?.title ?? nodeId;
+			setDeleteTarget({ id: nodeId, title });
+		},
+		[nodes],
+	);
+
+	const confirmDelete = useCallback(() => {
+		if (!deleteTarget) return;
+		deleteChapter.mutate(deleteTarget.id, {
+			onSuccess: () => {
+				queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+				setDeleteTarget(null);
+			},
+		});
+	}, [deleteTarget, deleteChapter, queryClient]);
+
 	if (isLoading) {
 		return (
 			<Box
@@ -272,12 +296,33 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 						onSetRole={handleSetRole}
 						onDormant={handleDormant}
 						onWake={handleWake}
+						onDelete={handleDelete}
 					/>
 				)}
 			</Box>
 			{selectedNode && (
 				<GraphSidePanel selectedNode={selectedNode} onClose={() => setSelectedNode(null)} />
 			)}
+			<Modal
+				opened={deleteTarget !== null}
+				onClose={() => setDeleteTarget(null)}
+				title={t("contextMenu.deleteConfirmTitle")}
+				centered
+			>
+				<Stack>
+					<Text size="sm">
+						{t("contextMenu.deleteConfirmMessage", { title: deleteTarget?.title ?? "" })}
+					</Text>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={() => setDeleteTarget(null)}>
+							{t("contextMenu.cancel", { defaultValue: "Cancel" })}
+						</Button>
+						<Button color="red" onClick={confirmDelete} loading={deleteChapter.isPending}>
+							{t("contextMenu.delete")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
 		</Box>
 	);
 }

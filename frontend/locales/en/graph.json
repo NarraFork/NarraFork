@@ -18,7 +18,8 @@
 		"wake": "Wake Up",
 		"delete": "Delete",
 		"deleteConfirmTitle": "Delete Chapter",
-		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? This will remove the worktree and branch. This action cannot be undone."
+		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? This will remove the worktree and branch. This action cannot be undone.",
+		"cancel": "Cancel"
 	},
 	"sidePanel": {
 		"upstreamUpdates": "Upstream updates",

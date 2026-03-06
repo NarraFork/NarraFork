@@ -17,6 +17,7 @@
 	"plan": "Plan",
 	"back": "Back",
 	"sendPlaceholder": "Send a message...",
+	"chapterMergedHint": "This chapter has been merged. Wake it up to continue editing.",
 	"interrupt": "Interrupt",
 	"permissionRequest": "Permission Request",
 	"tool": "Tool:",

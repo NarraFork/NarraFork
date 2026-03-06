@@ -16,6 +16,7 @@ interface NodeContextMenuProps {
 	onSetRole: (nodeId: string, role: string) => void;
 	onDormant: (nodeId: string) => void;
 	onWake: (nodeId: string) => void;
+	onDelete: (nodeId: string) => void;
 }
 
 export function NodeContextMenu({
@@ -28,6 +29,7 @@ export function NodeContextMenu({
 	onSetRole,
 	onDormant,
 	onWake,
+	onDelete,
 }: NodeContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const isRoot = !!nodeData.isRoot;
@@ -96,7 +98,7 @@ export function NodeContextMenu({
 									<Text size="sm">{t("contextMenu.dormant")}</Text>
 								</UnstyledButton>
 							)}
-							{nodeData.status === "dormant" && (
+							{(nodeData.status === "dormant" || nodeData.status === "merged") && (
 								<UnstyledButton
 									px="xs"
 									py={4}
@@ -106,6 +108,17 @@ export function NodeContextMenu({
 									<Text size="sm">{t("contextMenu.wake")}</Text>
 								</UnstyledButton>
 							)}
+							<Divider my={4} />
+							<UnstyledButton
+								px="xs"
+								py={4}
+								onClick={() => onDelete(nodeId)}
+								style={{ borderRadius: 4 }}
+							>
+								<Text size="sm" c="red">
+									{t("contextMenu.delete")}
+								</Text>
+							</UnstyledButton>
 						</>
 					)}
 				</Stack>

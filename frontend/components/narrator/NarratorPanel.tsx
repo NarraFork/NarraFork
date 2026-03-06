@@ -41,6 +41,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorCommands } from "../../hooks/useCommands";
+import { useChapter } from "../../hooks/useChapters";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -224,6 +225,12 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
+	const { data: chapterData } = useChapter(chapterId ?? "");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const chapterStatus = (chapterData as any)?.status as string | undefined;
+	const isChapterMerged = chapterStatus === "merged";
 	const forkNarratorMutation = useForkNarrator();
 	const {
 		data: messagesData,
@@ -1811,111 +1818,130 @@ export function NarratorPanel({
 			</Group>
 
 			{/* Input */}
-			<Box px="md" pb="xs" style={{ flexShrink: 0 }}>
-				<input
-					ref={fileInputRef}
-					type="file"
-					accept="image/png,image/jpeg,image/gif,image/webp"
-					multiple
-					style={{ display: "none" }}
-					onChange={(e) => {
-						if (e.target.files) {
-							addImages(Array.from(e.target.files));
-							e.target.value = "";
-						}
+			{isChapterMerged ? (
+				<Box
+					px="md"
+					py="sm"
+					style={{
+						flexShrink: 0,
+						backgroundColor: "var(--mantine-color-dark-6)",
+						opacity: 0.7,
 					}}
-				/>
-				<Group gap="xs" align="end" wrap="nowrap">
-					<Tooltip label={t("attachImage")}>
-						<ActionIcon
-							variant="subtle"
-							color="gray"
-							onClick={() => fileInputRef.current?.click()}
-							mb={4}
-						>
-							<IconPaperclip size={18} />
-						</ActionIcon>
-					</Tooltip>
-					<Box style={{ position: "relative", flex: 1 }}>
-						<CommandPopover
-							commands={commandsList ?? []}
-							input={input}
-							visible={commandPopoverVisible}
-							onSelect={handleCommandSelect}
-							onClose={closeCommandPopover}
-						/>
-						<Textarea
-							ref={textareaRef}
-							placeholder={t("sendPlaceholder")}
-							value={input}
-							onChange={(e) => setInput(e.currentTarget.value)}
-							onKeyDown={handleKeyDown}
-							onPaste={handlePaste}
-							autosize
-							minRows={1}
-							maxRows={6}
-						/>
-					</Box>
-					{(() => {
-						const hasInput = !!input.trim();
-						const showInterrupt = isActive && !hasInput;
-						const showRetry =
-							!showInterrupt && !hasInput && attachedImages.length === 0 && canRetryLastUserMessage;
-						if (showInterrupt) {
+				>
+					<Text size="sm" c="dimmed" ta="center">
+						{t("chapterMergedHint")}
+					</Text>
+				</Box>
+			) : (
+				<Box px="md" pb="xs" style={{ flexShrink: 0 }}>
+					<input
+						ref={fileInputRef}
+						type="file"
+						accept="image/png,image/jpeg,image/gif,image/webp"
+						multiple
+						style={{ display: "none" }}
+						onChange={(e) => {
+							if (e.target.files) {
+								addImages(Array.from(e.target.files));
+								e.target.value = "";
+							}
+						}}
+					/>
+					<Group gap="xs" align="end" wrap="nowrap">
+						<Tooltip label={t("attachImage")}>
+							<ActionIcon
+								variant="subtle"
+								color="gray"
+								onClick={() => fileInputRef.current?.click()}
+								mb={4}
+							>
+								<IconPaperclip size={18} />
+							</ActionIcon>
+						</Tooltip>
+						<Box style={{ position: "relative", flex: 1 }}>
+							<CommandPopover
+								commands={commandsList ?? []}
+								input={input}
+								visible={commandPopoverVisible}
+								onSelect={handleCommandSelect}
+								onClose={closeCommandPopover}
+							/>
+							<Textarea
+								ref={textareaRef}
+								placeholder={t("sendPlaceholder")}
+								value={input}
+								onChange={(e) => setInput(e.currentTarget.value)}
+								onKeyDown={handleKeyDown}
+								onPaste={handlePaste}
+								autosize
+								minRows={1}
+								maxRows={6}
+							/>
+						</Box>
+						{(() => {
+							const hasInput = !!input.trim();
+							const showInterrupt = isActive && !hasInput;
+							const showRetry =
+								!showInterrupt &&
+								!hasInput &&
+								attachedImages.length === 0 &&
+								canRetryLastUserMessage;
+							if (showInterrupt) {
+								return (
+									<Button
+										key="interrupt"
+										ref={interruptBtnRef}
+										color="red"
+										variant="light"
+										onMouseDown={startInterruptPress}
+										onMouseUp={clearInterruptTimer}
+										onMouseLeave={clearInterruptTimer}
+										onContextMenu={(e) => e.preventDefault()}
+										loading={interruptMutation.isPending}
+										style={{
+											position: "relative",
+											overflow: "hidden",
+											userSelect: "none",
+											touchAction: "none",
+										}}
+									>
+										{interruptProgress > 0 && interruptProgress < 1 && (
+											<div
+												style={{
+													position: "absolute",
+													inset: 0,
+													background: "var(--mantine-color-red-filled)",
+													opacity: 0.25,
+													transformOrigin: "left",
+													transform: `scaleX(${interruptProgress})`,
+													pointerEvents: "none",
+												}}
+											/>
+										)}
+										<span style={{ position: "relative" }}>{t("interrupt")}</span>
+									</Button>
+								);
+							}
+							if (showRetry) {
+								return (
+									<Button key="retry" onClick={handleRetry}>
+										{t("retry")}
+									</Button>
+								);
+							}
 							return (
 								<Button
-									key="interrupt"
-									ref={interruptBtnRef}
-									color="red"
-									variant="light"
-									onMouseDown={startInterruptPress}
-									onMouseUp={clearInterruptTimer}
-									onMouseLeave={clearInterruptTimer}
-									onContextMenu={(e) => e.preventDefault()}
-									loading={interruptMutation.isPending}
-									style={{
-										position: "relative",
-										overflow: "hidden",
-										userSelect: "none",
-										touchAction: "none",
-									}}
+									key="send"
+									onClick={handleSend}
+									disabled={!hasInput || (isActive && !!bufferedText)}
 								>
-									{interruptProgress > 0 && interruptProgress < 1 && (
-										<div
-											style={{
-												position: "absolute",
-												inset: 0,
-												background: "var(--mantine-color-red-filled)",
-												opacity: 0.25,
-												transformOrigin: "left",
-												transform: `scaleX(${interruptProgress})`,
-												pointerEvents: "none",
-											}}
-										/>
-									)}
-									<span style={{ position: "relative" }}>{t("interrupt")}</span>
+									{isActive ? t("queue") : tc("send")}
 								</Button>
 							);
-						}
-						if (showRetry) {
-							return (
-								<Button key="retry" onClick={handleRetry}>
-									{t("retry")}
-								</Button>
-							);
-						}
-						return (
-							<Button
-								key="send"
-								onClick={handleSend}
-								disabled={!hasInput || (isActive && !!bufferedText)}
-							>
-								{isActive ? t("queue") : tc("send")}
-							</Button>
-						);
-					})()}
-				</Group>
-			</Box>
+						})()}
+					</Group>
+				</Box>
+			)}
 		</Stack>
 	);
 }
