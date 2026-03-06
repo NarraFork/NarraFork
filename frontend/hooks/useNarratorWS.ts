@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PendingPermission } from "../components/narrator/ToolCallCard";
 import type { TreeMessage } from "../lib/api";
 import { getToken } from "../lib/api";
+import { buildWsUrl } from "../lib/ws";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 interface NarratorWSCallbacks {
@@ -154,10 +155,9 @@ export function useNarratorWS(
 		function connect() {
 			if (cancelled) return;
 
-			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 			const token = getToken();
-			const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-			const ws = new WebSocket(`${protocol}//${window.location.host}/ws/narrator${tokenParam}`);
+			const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
+			const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
 			wsRef.current = ws;
 
 			ws.onopen = () => {
@@ -553,10 +553,9 @@ export function useNarratorsListWS(
 		function connect() {
 			if (cancelled) return;
 
-			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 			const token = getToken();
-			const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-			const ws = new WebSocket(`${protocol}//${window.location.host}/ws/narrator${tokenParam}`);
+			const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
+			const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
 			wsRef.current = ws;
 
 			ws.onopen = () => {

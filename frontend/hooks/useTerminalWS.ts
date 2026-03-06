@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { buildWsUrl } from "../lib/ws";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 // === Types ===
@@ -51,10 +52,9 @@ class TerminalWSManager {
 
 	connect() {
 		if (this.ws?.readyState === WebSocket.OPEN || this.disposed) return;
-		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 		const token = getToken();
-		const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-		const ws = new WebSocket(`${protocol}//${window.location.host}/ws/terminal${tokenParam}`);
+		const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
+		const ws = new WebSocket(buildWsUrl("/ws/terminal", tokenQuery));
 		this.ws = ws;
 
 		ws.onopen = () => {

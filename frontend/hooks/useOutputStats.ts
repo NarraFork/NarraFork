@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { buildWsUrl } from "../lib/ws";
 
 interface OutputStats {
 	charsPerSec: number;
@@ -20,8 +21,7 @@ export function useOutputStats(enabled: boolean): OutputStats {
 		const token = getToken();
 		if (!token) return;
 
-		const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-		const ws = new WebSocket(`${proto}//${window.location.host}/ws/narrator?token=${token}`);
+		const ws = new WebSocket(buildWsUrl("/ws/narrator", `token=${token}`));
 		wsRef.current = ws;
 
 		ws.onopen = () => {

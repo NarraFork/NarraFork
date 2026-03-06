@@ -79,14 +79,16 @@ export default defineConfig(({ mode }) => {
 		},
 		server: {
 			port: vitePort,
+			host: "0.0.0.0",
 			proxy: {
 				"/api": {
 					target: `http://localhost:${backendPort}`,
 					changeOrigin: true,
 				},
 				"/ws": {
-					target: `ws://localhost:${backendPort}`,
+					target: `http://localhost:${backendPort}`,
 					ws: true,
+					changeOrigin: true,
 				},
 			},
 		},

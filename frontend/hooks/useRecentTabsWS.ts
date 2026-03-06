@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { getToken } from "../lib/api";
+import { buildWsUrl } from "../lib/ws";
 import type { NarratorListWSEvent } from "./useNarratorWS";
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -44,10 +45,9 @@ export function useRecentTabsWS(
 		function connect() {
 			if (cancelled) return;
 
-			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 			const token = getToken();
-			const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-			const ws = new WebSocket(`${protocol}//${window.location.host}/ws/narrator${tokenParam}`);
+			const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
+			const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
 			wsRef.current = ws;
 
 			ws.onopen = () => {

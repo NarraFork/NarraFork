@@ -2,6 +2,7 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { buildWsUrl } from "../lib/ws";
 
 const MAX_LOG_LINES = 200;
 
@@ -21,10 +22,9 @@ export function useContainerEvents(chapterId: string) {
 		if (!chapterId) return;
 		cancelledRef.current = false;
 
-		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 		const token = getToken();
-		const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-		const ws = new WebSocket(`${protocol}//${window.location.host}/ws/narrator${tokenParam}`);
+		const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
+		const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
 		wsRef.current = ws;
 
 		ws.onopen = () => {
