@@ -122,6 +122,8 @@
 	"autoCommit.forceCommitBody": "变更超过阈值，已自动提交 {{commitSha}}：{{message}}",
 	"commandSourceUser": "用户",
 	"commandSourceProject": "项目",
+	"commandSourceGlobalSkill": "全局技能",
+	"commandSourceProjectSkill": "项目技能",
 	"subagentBadge": "子代理",
 	"subagentReadOnly": "子代理会话的只读视图",
 	"backgroundBadge": "后台",

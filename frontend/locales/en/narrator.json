@@ -122,6 +122,8 @@
 	"autoCommit.forceCommitBody": "Changes exceeded threshold — auto-committed as {{commitSha}}: {{message}}",
 	"commandSourceUser": "User",
 	"commandSourceProject": "Project",
+	"commandSourceGlobalSkill": "Global Skill",
+	"commandSourceProjectSkill": "Project Skill",
 	"subagentBadge": "Subagent",
 	"subagentReadOnly": "Read-only view of subagent session",
 	"backgroundBadge": "Background",

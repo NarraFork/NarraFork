@@ -1,4 +1,4 @@
-import { Badge, Group, Paper, Text, UnstyledButton } from "@mantine/core";
+import { Badge, Box, Group, Paper, Text, UnstyledButton } from "@mantine/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -7,6 +7,7 @@ export interface CommandItem {
 	prompt: string;
 	description?: string;
 	source: string;
+	type: "command" | "skill";
 }
 
 interface CommandPopoverProps {
@@ -17,6 +18,34 @@ interface CommandPopoverProps {
 	onClose: () => void;
 	/** Ref to the textarea element for positioning */
 	anchorRef?: React.RefObject<HTMLElement | null>;
+}
+
+/** Left color bar based on item type + source */
+function getBarColor(item: CommandItem): string {
+	if (item.type === "skill") {
+		return item.source === "project"
+			? "var(--mantine-color-teal-6)"
+			: "var(--mantine-color-violet-6)";
+	}
+	// command
+	return item.source === "project"
+		? "var(--mantine-color-indigo-6)"
+		: "var(--mantine-color-indigo-4)";
+}
+
+function getSourceBadge(item: CommandItem, t: (key: string) => string) {
+	if (item.type === "skill") {
+		return (
+			<Badge size="xs" variant="light" color={item.source === "project" ? "teal" : "violet"}>
+				{item.source === "project" ? t("commandSourceProjectSkill") : t("commandSourceGlobalSkill")}
+			</Badge>
+		);
+	}
+	return (
+		<Badge size="xs" variant="light" color={item.source === "project" ? "teal" : "gray"}>
+			{item.source === "project" ? t("commandSourceProject") : t("commandSourceUser")}
+		</Badge>
+	);
 }
 
 export function CommandPopover({
@@ -103,20 +132,29 @@ export function CommandPopover({
 		>
 			{filtered.map((cmd, i) => (
 				<UnstyledButton
-					key={cmd.name}
+					key={`${cmd.type}-${cmd.name}`}
 					data-command-item
 					onClick={() => onSelect(cmd)}
 					onMouseEnter={() => setSelectedIndex(i)}
 					style={(theme) => ({
-						display: "block",
+						display: "flex",
 						width: "100%",
-						padding: "6px 10px",
+						padding: 0,
 						backgroundColor: i === selectedIndex ? theme.colors.dark[5] : undefined,
 						borderRadius: 0,
 					})}
 				>
-					<Group gap="xs" wrap="nowrap">
-						<Text size="sm" fw={600} c="indigo.4">
+					{/* Color bar */}
+					<Box
+						style={{
+							width: 3,
+							flexShrink: 0,
+							backgroundColor: getBarColor(cmd),
+							borderRadius: "2px 0 0 2px",
+						}}
+					/>
+					<Group gap="xs" wrap="nowrap" style={{ flex: 1, padding: "6px 10px" }}>
+						<Text size="sm" fw={600} c={cmd.type === "skill" ? "violet.4" : "indigo.4"}>
 							/{cmd.name}
 						</Text>
 						{cmd.description && (
@@ -124,9 +162,7 @@ export function CommandPopover({
 								{cmd.description}
 							</Text>
 						)}
-						<Badge size="xs" variant="light" color={cmd.source === "project" ? "teal" : "gray"}>
-							{cmd.source === "project" ? t("commandSourceProject") : t("commandSourceUser")}
-						</Badge>
+						{getSourceBadge(cmd, t)}
 					</Group>
 				</UnstyledButton>
 			))}

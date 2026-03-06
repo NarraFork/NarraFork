@@ -16,9 +16,9 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import { useProjects } from "../../hooks/useProjects";
@@ -64,6 +64,16 @@ interface SkillSummary {
 
 function RoutinesPage() {
 	const { t } = useTranslation("routines");
+	const qc = useQueryClient();
+
+	// Invalidate skill + command caches when entering the routines page
+	// so any external changes (file edits, etc.) are picked up
+	// biome-ignore lint/correctness/useExhaustiveDependencies: run once on mount
+	useEffect(() => {
+		qc.invalidateQueries({ queryKey: ["global-skills"] });
+		qc.invalidateQueries({ queryKey: ["skills"] });
+		qc.invalidateQueries({ queryKey: ["narrator-commands"] });
+	}, []);
 
 	return (
 		<Container size="md" py="lg">

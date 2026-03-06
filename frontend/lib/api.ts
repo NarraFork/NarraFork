@@ -283,9 +283,10 @@ export const api = {
 	},
 	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
 	getNarratorCommands: (id: string) =>
-		request<Array<{ name: string; prompt: string; description?: string; source: string }>>(
-			`/narrators/${id}/commands`,
-		),
+		request<{
+			commands: Array<{ name: string; prompt: string; description?: string; source: string }>;
+			skills: Array<{ name: string; description: string; source: string }>;
+		}>(`/narrators/${id}/commands`),
 	createNarrator: (data: {
 		chapterId?: string | null;
 		type?: string;

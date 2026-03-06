@@ -3,6 +3,7 @@ import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
 import { logger } from "../lib/logger";
 import type { Command } from "./chapter-service";
+import { loadAllSkills } from "./skill-service";
 
 /** Safely extract commands array from a chapterSettings value. */
 function parseChapterSettingsCommands(raw: unknown): Command[] {
@@ -176,4 +177,66 @@ export async function resolveCommand(
 	});
 
 	return { resolved: true, expandedPrompt: expandedPrompt.trim(), command: cmd };
+}
+
+// === Skill summary for slash menu ===
+
+export interface SkillSummary {
+	name: string;
+	description: string;
+	source: "global" | "project";
+}
+
+/**
+ * Resolve the project gitPath for a narrator (narrator → chapter → project).
+ * Returns null for standalone narrators.
+ */
+async function getProjectGitPathForNarrator(narratorId: string): Promise<string | null> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
+	});
+	if (!narrator?.chapterId) return null;
+
+	const chapter = await db.query.chapters.findFirst({
+		where: eq(chapters.id, narrator.chapterId),
+		columns: { projectId: true },
+	});
+	if (!chapter) return null;
+
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, chapter.projectId),
+		columns: { gitPath: true },
+	});
+	return project?.gitPath ?? null;
+}
+
+/**
+ * Get commands + skills for the slash menu.
+ * Returns both lists so the frontend can render them with different styles.
+ */
+export async function getSlashMenuItems(
+	narratorId: string,
+	userId: string,
+): Promise<{ commands: ResolvedCommand[]; skills: SkillSummary[] }> {
+	const [commands, gitPath] = await Promise.all([
+		getAvailableCommands(narratorId, userId),
+		getProjectGitPathForNarrator(narratorId),
+	]);
+
+	// Load global skills + project skills (merged), then tag source
+	let skills: SkillSummary[] = [];
+	try {
+		const allSkills = await loadAllSkills(gitPath);
+		skills = allSkills.map((s) => ({
+			name: s.name,
+			description: s.description,
+			source:
+				gitPath && s.location.startsWith(gitPath) ? ("project" as const) : ("global" as const),
+		}));
+	} catch {
+		// Non-fatal — skills unavailable
+	}
+
+	return { commands, skills };
 }

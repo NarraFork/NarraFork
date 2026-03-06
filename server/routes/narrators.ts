@@ -44,7 +44,7 @@ import {
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 } from "../lib/validators";
-import { getAvailableCommands, resolveCommand } from "../services/command-service";
+import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import { narratorService } from "../services/narrator-service";
 import {
 	closeNarrator,
@@ -330,12 +330,12 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json(narrator);
 });
 
-// Get available commands for a narrator (merged user + project)
+// Get available commands + skills for the slash menu
 narratorRoutes.get("/:id/commands", async (c) => {
 	const id = c.req.param("id");
 	const userId = c.get("user").sub;
-	const commands = await getAvailableCommands(id, userId);
-	return c.json(commands);
+	const result = await getSlashMenuItems(id, userId);
+	return c.json(result);
 });
 
 // Send message — fire-and-forget; all streaming events delivered via WebSocket

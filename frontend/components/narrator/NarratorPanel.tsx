@@ -330,7 +330,10 @@ export function NarratorPanel({
 	const commandPopoverVisible =
 		input.startsWith("/") && !input.includes("\n") && (commandsList?.length ?? 0) > 0;
 	const handleCommandSelect = useCallback((cmd: CommandItem) => {
-		if (cmd.prompt.includes("{{input}}")) {
+		if (cmd.type === "skill") {
+			// Skill selected — insert a prompt that tells the AI to load this skill
+			setInput(`Please load the "${cmd.name}" skill and apply it to: `);
+		} else if (cmd.prompt.includes("{{input}}")) {
 			// Place cursor where {{input}} would go
 			setInput(`/${cmd.name} `);
 		} else {
