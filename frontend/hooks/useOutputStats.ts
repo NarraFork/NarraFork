@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
-import { buildWsUrl } from "../lib/ws";
+import { buildWsUrl, safeCloseWs } from "../lib/ws";
 
 interface OutputStats {
 	charsPerSec: number;
@@ -54,15 +54,10 @@ export function useOutputStats(enabled: boolean): OutputStats {
 		return () => {
 			clearTimeout(reconnectTimer.current);
 			const ws = wsRef.current;
-			if (ws) {
-				// Unsubscribe before closing
-				if (ws.readyState === WebSocket.OPEN) {
-					ws.send(JSON.stringify({ type: "unsubscribe_stats" }));
-				}
-				ws.onclose = null;
-				ws.close();
-				wsRef.current = null;
-			}
+			safeCloseWs(ws, (w) => {
+				w.send(JSON.stringify({ type: "unsubscribe_stats" }));
+			});
+			wsRef.current = null;
 			setStats({ charsPerSec: 0, totalChars: 0 });
 		};
 	}, [enabled, connect]);

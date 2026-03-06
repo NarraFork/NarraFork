@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PendingPermission } from "../components/narrator/ToolCallCard";
 import type { TreeMessage } from "../lib/api";
 import { getToken } from "../lib/api";
-import { buildWsUrl } from "../lib/ws";
+import { buildWsUrl, safeCloseWs } from "../lib/ws";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 interface NarratorWSCallbacks {
@@ -413,17 +413,9 @@ export function useNarratorWS(
 			clearTimeout(pingTimeoutTimer);
 			removeWSStatus(wsStatusId);
 			const ws = wsRef.current;
-			if (ws) {
-				// Suppress handlers before closing to avoid any late-firing events
-				ws.onopen = null;
-				ws.onmessage = null;
-				ws.onclose = null;
-				ws.onerror = null;
-				if (ws.readyState === WebSocket.OPEN) {
-					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: [subscribedId] }));
-				}
-				ws.close();
-			}
+			safeCloseWs(ws, (w) => {
+				w.send(JSON.stringify({ type: "unsubscribe", narratorIds: [subscribedId] }));
+			});
 		};
 	}, [narratorId, reconnectKey]);
 
@@ -633,16 +625,11 @@ export function useNarratorsListWS(
 			clearTimeout(pingTimeoutTimer);
 			removeWSStatus(wsStatusId);
 			const ws = wsRef.current;
-			if (ws) {
-				ws.onopen = null;
-				ws.onmessage = null;
-				ws.onclose = null;
-				ws.onerror = null;
-				if (ws.readyState === WebSocket.OPEN && currentIds.length) {
-					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
+			safeCloseWs(ws, (w) => {
+				if (currentIds.length) {
+					w.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
 				}
-				ws.close();
-			}
+			});
 		};
 	}, [idsKey, reconnectKey]);
 

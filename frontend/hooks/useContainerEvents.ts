@@ -2,7 +2,7 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
-import { buildWsUrl } from "../lib/ws";
+import { buildWsUrl, safeCloseWs } from "../lib/ws";
 
 const MAX_LOG_LINES = 200;
 
@@ -86,14 +86,7 @@ export function useContainerEvents(chapterId: string) {
 
 		return () => {
 			cancelledRef.current = true;
-			const w = wsRef.current;
-			if (w) {
-				w.onopen = null;
-				w.onmessage = null;
-				w.onclose = null;
-				w.onerror = null;
-				w.close();
-			}
+			safeCloseWs(wsRef.current);
 			wsRef.current = null;
 		};
 	}, [chapterId, qc]);

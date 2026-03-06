@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
-import { buildWsUrl } from "../lib/ws";
+import { buildWsUrl, safeCloseWs } from "../lib/ws";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 // === Types ===
@@ -227,7 +227,7 @@ class TerminalWSManager {
 	dispose() {
 		this.disposed = true;
 		clearTimeout(this.reconnectTimer);
-		this.ws?.close();
+		safeCloseWs(this.ws);
 		this.ws = null;
 		removeWSStatus("terminal");
 	}

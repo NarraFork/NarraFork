@@ -18,3 +18,28 @@ export function buildWsUrl(path: string, query?: string): string {
 	const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 	return `${protocol}//${window.location.host}${path}${query ? `?${query}` : ""}`;
 }
+
+/**
+ * Safely close a WebSocket, suppressing the "closed before established" warning
+ * that occurs when React StrictMode unmounts during the CONNECTING phase.
+ *
+ * Detaches all handlers first, then either closes immediately (if OPEN) or
+ * waits for the connection to open before closing (if CONNECTING).
+ */
+export function safeCloseWs(ws: WebSocket | null, beforeClose?: (ws: WebSocket) => void): void {
+	if (!ws) return;
+	ws.onmessage = null;
+	ws.onerror = null;
+	if (ws.readyState === WebSocket.CONNECTING) {
+		// Wait for the connection to establish, then close it cleanly
+		ws.onopen = () => ws.close();
+		ws.onclose = null;
+	} else {
+		ws.onopen = null;
+		ws.onclose = null;
+		if (ws.readyState === WebSocket.OPEN) {
+			beforeClose?.(ws);
+		}
+		ws.close();
+	}
+}

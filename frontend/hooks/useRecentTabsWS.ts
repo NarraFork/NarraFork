@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { getToken } from "../lib/api";
-import { buildWsUrl } from "../lib/ws";
+import { buildWsUrl, safeCloseWs } from "../lib/ws";
 import type { NarratorListWSEvent } from "./useNarratorWS";
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -128,20 +128,15 @@ export function useRecentTabsWS(
 			cancelled = true;
 			clearTimeout(reconnectTimer);
 			const ws = wsRef.current;
-			if (ws) {
-				ws.onopen = null;
-				ws.onmessage = null;
-				ws.onclose = null;
-				ws.onerror = null;
-				const subbed = [...subscribedIdsRef.current];
-				if (ws.readyState === WebSocket.OPEN && subbed.length) {
+			const subbed = [...subscribedIdsRef.current];
+			safeCloseWs(ws, (w) => {
+				if (subbed.length) {
 					for (const id of subbed) {
-						ws.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
+						w.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
 					}
-					ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: subbed }));
+					w.send(JSON.stringify({ type: "unsubscribe", narratorIds: subbed }));
 				}
-				ws.close();
-			}
+			});
 			subscribedIdsRef.current.clear();
 		};
 	}, []); // Mount-only — connection persists across ID changes
