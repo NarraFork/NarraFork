@@ -1,4 +1,12 @@
-import { Badge, Box, Group, Paper, Text, UnstyledButton } from "@mantine/core";
+import {
+	Badge,
+	Box,
+	Group,
+	Paper,
+	Text,
+	UnstyledButton,
+	useMantineColorScheme,
+} from "@mantine/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -56,6 +64,8 @@ export function CommandPopover({
 	onClose,
 }: CommandPopoverProps) {
 	const { t } = useTranslation("narrator");
+	const { colorScheme } = useMantineColorScheme();
+	const isDark = colorScheme === "dark";
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const listRef = useRef<HTMLDivElement>(null);
 
@@ -136,13 +146,18 @@ export function CommandPopover({
 					data-command-item
 					onClick={() => onSelect(cmd)}
 					onMouseEnter={() => setSelectedIndex(i)}
-					style={(theme) => ({
+					style={{
 						display: "flex",
 						width: "100%",
 						padding: 0,
-						backgroundColor: i === selectedIndex ? theme.colors.dark[5] : undefined,
+						backgroundColor:
+							i === selectedIndex
+								? isDark
+									? "var(--mantine-color-dark-5)"
+									: "var(--mantine-color-gray-1)"
+								: undefined,
 						borderRadius: 0,
-					})}
+					}}
 				>
 					{/* Color bar */}
 					<Box
