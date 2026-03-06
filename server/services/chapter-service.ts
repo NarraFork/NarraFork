@@ -23,7 +23,6 @@ import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
-import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
@@ -369,20 +368,12 @@ export const chapterService = {
 				throw new ValidationError("Cannot delete root chapter");
 			}
 
-			const now = new Date().toISOString();
-
-			// Detach narrators and archive them (read-only, user can delete later)
+			// Delete all narrators bound to this chapter (conversations are removed together)
 			const chapterNarrators = await db.query.narrators.findMany({
 				where: eq(narrators.chapterId, id),
 			});
 			for (const narrator of chapterNarrators) {
-				interruptNarrator(narrator.id);
-			}
-			if (chapterNarrators.length > 0) {
-				await db
-					.update(narrators)
-					.set({ chapterId: null, status: "archived", updatedAt: now })
-					.where(eq(narrators.chapterId, id));
+				await narratorService.remove(narrator.id);
 			}
 
 			// Kill running terminals and delete records
@@ -401,7 +392,7 @@ export const chapterService = {
 				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
 			}
 
-			// Clean up git resources (worktree + branch)
+			// Clean up git resources
 			if (chapter.worktreePath) {
 				const project = await db.query.projects.findFirst({
 					where: eq(projects.id, chapter.projectId),
@@ -428,7 +419,6 @@ export const chapterService = {
 				.set({ mergedIntoChapterId: null })
 				.where(eq(chapters.mergedIntoChapterId, id));
 
-			// Delete the chapter record
 			await db.delete(chapters).where(eq(chapters.id, id));
 			eventBus.emit({ type: "chapter:abandoned", chapterId: id });
 		});
