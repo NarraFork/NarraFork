@@ -208,6 +208,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		deleteChapter.mutate(deleteTarget.id, {
 			onSuccess: () => {
 				queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+				queryClient.invalidateQueries({ queryKey: ["narrators"] });
 				setDeleteTarget(null);
 			},
 		});
