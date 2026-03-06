@@ -3,6 +3,8 @@
  * Supports built-in oscillator-based sounds and custom audio files.
  */
 
+import { getToken } from "./api";
+
 let audioCtx: AudioContext | null = null;
 
 function getAudioContext(): AudioContext {
@@ -105,19 +107,27 @@ export function playBuiltinSound(name: string): void {
 
 // --- Custom audio file playback ---
 
-const audioCache = new Map<string, HTMLAudioElement>();
+const audioCache = new Map<string, string>(); // url -> blobUrl
 
-export function playCustomSound(url: string): void {
-	let audio = audioCache.get(url);
-	if (!audio) {
-		audio = new Audio(url);
-		audio.volume = 0.5;
-		audioCache.set(url, audio);
+export async function playCustomSound(url: string): Promise<void> {
+	let blobUrl = audioCache.get(url);
+	if (!blobUrl) {
+		const token = getToken();
+		const headers: Record<string, string> = {};
+		if (token) headers.Authorization = `Bearer ${token}`;
+		try {
+			const res = await fetch(url, { headers });
+			if (!res.ok) return;
+			const blob = await res.blob();
+			blobUrl = URL.createObjectURL(blob);
+			audioCache.set(url, blobUrl);
+		} catch {
+			return;
+		}
 	}
-	audio.currentTime = 0;
-	audio.play().catch(() => {
-		// Autoplay blocked — ignore
-	});
+	const audio = new Audio(blobUrl);
+	audio.volume = 0.5;
+	audio.play().catch(() => {});
 }
 
 // --- Unified playback ---
