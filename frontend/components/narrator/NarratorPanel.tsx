@@ -361,12 +361,16 @@ export function NarratorPanel({
 	// --- Scroll helpers ---
 	const followRafRef = useRef(0);
 	const followingRef = useRef(false);
-	// Suppress detachFromBottom for programmatic scrollTop changes (e.g. startFollowing snap).
-	// Without this, snapping to a *smaller* scrollTop (viewport grew / content shrank during
-	// resize) fires the onScroll handler which sees scrollTop < lastScrollTop and incorrectly
-	// detaches, causing isAtBottom to oscillate true→false→true on every ResizeObserver
-	// callback — eventually hitting React's "Maximum update depth exceeded" limit.
+	// Suppress detachFromBottom for programmatic scrollTop changes.
+	// - `programmaticScrollRef` is a one-shot flag for individual scrollTop writes
+	//   (e.g. scrollToBottom instant, startFollowing final snap).
+	// - `resizingRef` is a sustained flag that stays true for the entire duration
+	//   of a viewport resize (set by vpObserver, cleared after a 150ms debounce).
+	//   During a resize, multiple scroll events fire from multiple programmatic
+	//   scrollTop writes; a one-shot flag can't cover them all, so we need this
+	//   sustained flag to prevent the oscillation loop.
 	const programmaticScrollRef = useRef(false);
+	const resizingRef = useRef(false);
 
 	const lastFollowScrollTop = useRef(0);
 
@@ -504,6 +508,36 @@ export function NarratorPanel({
 	const [generatingTitle, setGeneratingTitle] = useState(false);
 	const titleInputRef = useRef<HTMLInputElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
+	const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+	// Force react-textarea-autosize to recalculate after viewport width
+	// changes (e.g. DevTools mobile↔desktop toggle). The library recalculates
+	// on window "resize" but can read stale layout during rapid toggles.
+	// Bumping a counter triggers a React re-render → useLayoutEffect inside
+	// TextareaAutosize fires resizeTextarea() with the final layout values.
+	const [, setTextareaResizeTick] = useState(0);
+	useEffect(() => {
+		const ta = textareaRef.current;
+		if (!ta) return;
+		let prevWidth = ta.clientWidth;
+		let timer = 0;
+		const ro = new ResizeObserver(() => {
+			const w = ta.clientWidth;
+			if (w !== prevWidth) {
+				prevWidth = w;
+				clearTimeout(timer);
+				// Wait for layout to settle before triggering re-render
+				timer = window.setTimeout(() => {
+					setTextareaResizeTick((n) => n + 1);
+				}, 100);
+			}
+		});
+		ro.observe(ta);
+		return () => {
+			clearTimeout(timer);
+			ro.disconnect();
+		};
+	}, []);
 
 	const startEditingTitle = () => {
 		setTitleValue(narrator?.title || "");
@@ -846,10 +880,15 @@ export function NarratorPanel({
 		let lastScrollTop = node.scrollTop;
 		const onScroll = () => {
 			const cur = node.scrollTop;
-			// Skip detach check for programmatic scrollTop changes (startFollowing snap,
-			// scrollToBottom instant). Without this guard, snapping to a smaller target
-			// during viewport resize causes isAtBottom to oscillate and eventually
-			// triggers React's "Maximum update depth exceeded" error.
+			// During a viewport resize, suppress all detach checks — multiple
+			// programmatic scrollTop writes fire multiple scroll events and a
+			// one-shot flag can't cover them all.
+			if (resizingRef.current) {
+				lastScrollTop = cur;
+				return;
+			}
+			// One-shot suppression for individual programmatic scrollTop writes
+			// outside of a resize (e.g. scrollToBottom instant).
 			if (programmaticScrollRef.current) {
 				programmaticScrollRef.current = false;
 				lastScrollTop = cur;
@@ -861,7 +900,7 @@ export function NarratorPanel({
 			lastScrollTop = cur;
 		};
 		const onScrollEnd = () => {
-			if (followingRef.current) return;
+			if (followingRef.current || resizingRef.current) return;
 			checkAtBottom();
 		};
 
@@ -909,12 +948,30 @@ export function NarratorPanel({
 		const content = contentRef.current;
 		if (!content) return;
 
+		// Track whether the *viewport* itself is being resized (e.g. DevTools
+		// mobile↔desktop toggle). During a viewport resize both observers fire
+		// in rapid succession; using the RAF-based follow loop in that situation
+		// causes continuous scrollTop writes that force layout thrashing, block
+		// the main thread, and can trigger React's "Maximum update depth" error.
+		let vpResizeTimer = 0;
+
+		const vp = viewportRef.current;
+
 		const contentObserver = new ResizeObserver(() => {
 			if (!initialScrollDoneRef.current) return;
+			// During a viewport resize, only do synchronous snaps — no setState,
+			// no follow loop. setState during ResizeObserver can cause layout →
+			// render → layout loops that hit React's max update depth.
+			if (resizingRef.current) {
+				if (isAtBottomRef.current && !highlightMessageId && vp) {
+					programmaticScrollRef.current = true;
+					vp.scrollTop = vp.scrollHeight - vp.clientHeight;
+				}
+				return;
+			}
 			if (isAtBottomRef.current && !highlightMessageId) {
 				startFollowing();
 			} else if (!isAtBottomRef.current && !highlightMessageId) {
-				const vp = viewportRef.current;
 				if (vp && vp.scrollHeight - vp.scrollTop - vp.clientHeight < 30) {
 					isAtBottomRef.current = true;
 					setIsAtBottom(true);
@@ -923,31 +980,24 @@ export function NarratorPanel({
 		});
 		contentObserver.observe(content);
 
-		const vp = viewportRef.current;
 		const vpObserver = new ResizeObserver(() => {
-			if (isAtBottomRef.current && !highlightMessageId) {
-				if (!initialScrollDoneRef.current && vp) {
-					programmaticScrollRef.current = true;
-					vp.scrollTop = vp.scrollHeight;
-				} else if (vp) {
-					// During viewport resize (e.g. mobile→desktop layout switch), snap
-					// directly instead of going through the RAF follow loop. The follow
-					// loop can set scrollTop to a *smaller* value when scrollHeight
-					// shrinks, which triggers onScroll → detachFromBottom → isAtBottom
-					// oscillation → "Maximum update depth exceeded".
-					const target = vp.scrollHeight - vp.clientHeight;
-					if (Math.abs(target - vp.scrollTop) < 30) {
-						programmaticScrollRef.current = true;
-						vp.scrollTop = target;
-					} else {
-						startFollowing();
-					}
-				}
+			// Mark that a viewport resize is in progress so the content
+			// observer takes the synchronous-snap path, and onScroll
+			// suppresses all detach checks for the duration.
+			resizingRef.current = true;
+			clearTimeout(vpResizeTimer);
+			vpResizeTimer = window.setTimeout(() => { resizingRef.current = false; }, 150);
+
+			if (isAtBottomRef.current && !highlightMessageId && vp) {
+				programmaticScrollRef.current = true;
+				vp.scrollTop = vp.scrollHeight - vp.clientHeight;
 			}
 		});
 		if (vp) vpObserver.observe(vp);
 
 		return () => {
+			clearTimeout(vpResizeTimer);
+			resizingRef.current = false;
 			contentObserver.disconnect();
 			vpObserver.disconnect();
 			stopFollowing();
@@ -1792,6 +1842,7 @@ export function NarratorPanel({
 							onClose={closeCommandPopover}
 						/>
 						<Textarea
+							ref={textareaRef}
 							placeholder={t("sendPlaceholder")}
 							value={input}
 							onChange={(e) => setInput(e.currentTarget.value)}
