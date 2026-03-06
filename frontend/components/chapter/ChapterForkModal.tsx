@@ -1,5 +1,6 @@
 import { Alert, Button, Modal, Select, Stack, Text, Textarea, TextInput } from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
@@ -21,6 +22,7 @@ export function ChapterForkModal({
 	const [description, setDescription] = useState("");
 	const [inheritMode, setInheritMode] = useState<string>("fresh");
 	const qc = useQueryClient();
+	const navigate = useNavigate();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
 
@@ -50,10 +52,13 @@ export function ChapterForkModal({
 				inheritMode,
 				forkAtMessageUuid,
 			}),
-		onSuccess: () => {
+		onSuccess: (data) => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			handleClose();
+			if (data?.id) {
+				navigate({ to: "/chapters/$chapterId", params: { chapterId: data.id } });
+			}
 		},
 	});
 
