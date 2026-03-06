@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -368,43 +368,12 @@ export const chapterService = {
 				throw new ValidationError("Cannot delete root chapter");
 			}
 
-			// Unbind narrators instead of deleting them — preserve conversation history.
-			// Subagents and archived narrators are deleted; others are detached.
+			// Delete all narrators bound to this chapter (conversations are removed together)
 			const chapterNarrators = await db.query.narrators.findMany({
 				where: eq(narrators.chapterId, id),
 			});
-
-			const toDelete = chapterNarrators.filter(
-				(n) => n.type === "subagent" || n.status === "archived",
-			);
-			const toDetach = chapterNarrators.filter(
-				(n) => n.type !== "subagent" && n.status !== "archived",
-			);
-
-			for (const narrator of toDelete) {
+			for (const narrator of chapterNarrators) {
 				await narratorService.remove(narrator.id);
-			}
-
-			if (toDetach.length > 0) {
-				const now = new Date().toISOString();
-				await db
-					.update(narrators)
-					.set({
-						chapterId: null,
-						// Preserve worktree path as cwd so the narrator retains a working directory
-						cwd: chapter.worktreePath ?? narrators.cwd,
-						updatedAt: now,
-					})
-					.where(
-						inArray(
-							narrators.id,
-							toDetach.map((n) => n.id),
-						),
-					);
-				logger.info("Detached narrators from chapter", {
-					chapterId: id,
-					detached: toDetach.map((n) => n.id),
-				});
 			}
 
 			// Kill running terminals and delete records
