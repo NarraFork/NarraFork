@@ -2240,6 +2240,32 @@ export const narratorService = {
 				}
 			}
 
+			// Insert a compact marker for compressed inheritance so the UI shows the summary
+			if (inheritMode === "compressed" && contextSummary) {
+				const compactMsgId = generateId();
+				const compactNow = new Date().toISOString();
+				await tx.insert(narratorMessages).values({
+					id: compactMsgId,
+					narratorId: id,
+					role: "system",
+					contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+					contentText: `[Compressed context from parent conversation]`,
+					createdAt: compactNow,
+				});
+				const maxSeqResult = await tx
+					.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+					.from(narratorMessageRefs)
+					.where(eq(narratorMessageRefs.narratorId, id));
+				const compactSeq = (maxSeqResult[0]?.maxSeq ?? -1) + 1;
+				await tx.insert(narratorMessageRefs).values({
+					id: generateId(),
+					narratorId: id,
+					messageId: compactMsgId,
+					seq: compactSeq,
+					isCompact: 1,
+				});
+			}
+
 			return created;
 		});
 
