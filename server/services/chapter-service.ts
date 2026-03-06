@@ -371,7 +371,7 @@ export const chapterService = {
 
 			const now = new Date().toISOString();
 
-			// Archive all narrators (read-only: preserve conversations but stop interaction)
+			// Detach narrators and archive them (read-only, user can delete later)
 			const chapterNarrators = await db.query.narrators.findMany({
 				where: eq(narrators.chapterId, id),
 			});
@@ -381,7 +381,7 @@ export const chapterService = {
 			if (chapterNarrators.length > 0) {
 				await db
 					.update(narrators)
-					.set({ status: "archived", updatedAt: now })
+					.set({ chapterId: null, status: "archived", updatedAt: now })
 					.where(eq(narrators.chapterId, id));
 			}
 
@@ -401,7 +401,7 @@ export const chapterService = {
 				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
 			}
 
-			// Clean up git worktree (but keep the branch for reference)
+			// Clean up git resources (worktree + branch)
 			if (chapter.worktreePath) {
 				const project = await db.query.projects.findFirst({
 					where: eq(projects.id, chapter.projectId),
@@ -409,19 +409,27 @@ export const chapterService = {
 				if (project?.gitPath) {
 					try {
 						await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+						await gitService.deleteBranch(project.gitPath, chapter.branch);
 					} catch (err) {
-						logger.warn("Failed to clean up git worktree", {
+						logger.warn("Failed to clean up git resources", {
 							error: String(err),
 						});
 					}
 				}
 			}
 
-			// Mark chapter as abandoned (read-only)
+			// Detach self-referencing FKs pointing to this chapter
 			await db
 				.update(chapters)
-				.set({ status: "abandoned", worktreePath: null, updatedAt: now })
-				.where(eq(chapters.id, id));
+				.set({ parentChapterId: null })
+				.where(eq(chapters.parentChapterId, id));
+			await db
+				.update(chapters)
+				.set({ mergedIntoChapterId: null })
+				.where(eq(chapters.mergedIntoChapterId, id));
+
+			// Delete the chapter record
+			await db.delete(chapters).where(eq(chapters.id, id));
 			eventBus.emit({ type: "chapter:abandoned", chapterId: id });
 		});
 	},
