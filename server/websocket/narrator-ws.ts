@@ -28,6 +28,7 @@ export interface NarratorWSData {
 	userId?: string;
 	username?: string;
 	avatarColor?: string | null;
+	avatarImageId?: string | null;
 }
 
 // Server → Client messages
@@ -48,7 +49,13 @@ export type NarratorServerMessage =
 			updatedInput?: Record<string, unknown>;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
-	| { type: "permission_resolved"; narratorId: string; requestId: string; toolUseId?: string }
+	| {
+			type: "permission_resolved";
+			narratorId: string;
+			requestId: string;
+			toolUseId?: string;
+			updatedInput?: Record<string, unknown>;
+	  }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
@@ -107,6 +114,33 @@ export type NarratorServerMessage =
 			subagentType: string;
 	  }
 	| {
+			type: "background_task_started";
+			narratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+			subagentType: string;
+	  }
+	| {
+			type: "background_task_completed";
+			narratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+			resultPreview: string;
+	  }
+	| {
+			type: "background_task_failed";
+			narratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+			error: string;
+	  }
+	| {
+			type: "background_task_cancelled";
+			narratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+	  }
+	| {
 			type: "git_status";
 			narratorId: string;
 			chapterId: string;
@@ -158,7 +192,12 @@ export type NarratorServerMessage =
 	| {
 			type: "presence_update";
 			narratorId: string;
-			viewers: Array<{ userId: string; username: string; avatarColor: string | null }>;
+			viewers: Array<{
+				userId: string;
+				username: string;
+				avatarColor: string | null;
+				avatarImageId: string | null;
+			}>;
 	  }
 	| {
 			type: "terminal_count_changed";
@@ -184,6 +223,7 @@ export type NarratorClientMessage =
 			message?: string;
 			answers?: Record<string, string>;
 			feedbackText?: string;
+			updatedPlan?: string;
 	  }
 	| {
 			type: "merge_decision";
@@ -201,14 +241,18 @@ export type NarratorClientMessage =
 
 type NarratorWS = ServerWebSocket<WSData & { channel: "narrator" }>;
 
+type ViewerInfo = {
+	userId: string;
+	username: string;
+	avatarColor: string | null;
+	avatarImageId: string | null;
+};
+
 const connections = new Set<NarratorWS>();
 
 // === Presence tracking ===
-// Map<narratorId, Map<wsInstance, { userId, username, avatarColor }>>
-const presenceMap = new Map<
-	string,
-	Map<NarratorWS, { userId: string; username: string; avatarColor: string | null }>
->();
+// Map<narratorId, Map<wsInstance, ViewerInfo>>
+const presenceMap = new Map<string, Map<NarratorWS, ViewerInfo>>();
 
 function addPresence(ws: NarratorWS, narratorId: string) {
 	if (!ws.data.userId) return;
@@ -221,6 +265,7 @@ function addPresence(ws: NarratorWS, narratorId: string) {
 		userId: ws.data.userId,
 		username: ws.data.username ?? "",
 		avatarColor: ws.data.avatarColor ?? null,
+		avatarImageId: ws.data.avatarImageId ?? null,
 	});
 	broadcastPresence(narratorId);
 }
@@ -244,11 +289,7 @@ function removeAllPresence(ws: NarratorWS) {
 
 function broadcastPresence(narratorId: string) {
 	const viewers = presenceMap.get(narratorId);
-	// Deduplicate by userId
-	const uniqueViewers = new Map<
-		string,
-		{ userId: string; username: string; avatarColor: string | null }
-	>();
+	const uniqueViewers = new Map<string, ViewerInfo>();
 	if (viewers) {
 		for (const v of viewers.values()) {
 			uniqueViewers.set(v.userId, v);
@@ -262,27 +303,22 @@ function broadcastPresence(narratorId: string) {
 }
 
 /** Get current viewers for a narrator (used by REST API). */
-export function getNarratorPresence(
-	narratorId: string,
-): Array<{ userId: string; username: string; avatarColor: string | null }> {
+export function getNarratorPresence(narratorId: string): ViewerInfo[] {
 	const viewers = presenceMap.get(narratorId);
 	if (!viewers) return [];
-	const unique = new Map<
-		string,
-		{ userId: string; username: string; avatarColor: string | null }
-	>();
+	const unique = new Map<string, ViewerInfo>();
 	for (const v of viewers.values()) unique.set(v.userId, v);
 	return [...unique.values()];
 }
 
 /** Get presence for multiple narrators at once (batch). */
-export function getNarratorPresenceBatch(
-	narratorIds: string[],
-): Map<string, Array<{ userId: string; username: string; avatarColor: string | null }>> {
-	const result = new Map<
-		string,
-		Array<{ userId: string; username: string; avatarColor: string | null }>
-	>();
+/** Return the set of narrator IDs that currently have at least one viewer. */
+export function getNarratorIdsWithPresence(): Set<string> {
+	return new Set(presenceMap.keys());
+}
+
+export function getNarratorPresenceBatch(narratorIds: string[]): Map<string, ViewerInfo[]> {
+	const result = new Map<string, ViewerInfo[]>();
 	for (const id of narratorIds) {
 		const viewers = getNarratorPresence(id);
 		if (viewers.length > 0) result.set(id, viewers);
@@ -308,6 +344,10 @@ const ALREADY_BROADCAST_EVENTS = new Set([
 	"narrator:title_updated",
 	"narrator:subagent_started",
 	"narrator:subagent_completed",
+	"narrator:background_task_started",
+	"narrator:background_task_completed",
+	"narrator:background_task_failed",
+	"narrator:background_task_cancelled",
 	"user:recent_tabs_changed",
 	"terminal:created",
 	"terminal:exited",
@@ -368,7 +408,10 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 
 // === Terminal count change listener ===
 // When a terminal is created or exits, compute the new running count for its narrator
-// and broadcast to subscribers.
+// and broadcast to subscribers. Debounced per-narrator to avoid redundant queries
+// when multiple terminals change rapidly (e.g. batch cleanup).
+
+const pendingTerminalBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
 
 async function broadcastTerminalCount(narratorId: string | null) {
 	if (!narratorId) return;
@@ -384,17 +427,32 @@ async function broadcastTerminalCount(narratorId: string | null) {
 	});
 }
 
+function debouncedTerminalCount(narratorId: string | null) {
+	if (!narratorId) return;
+	const existing = pendingTerminalBroadcasts.get(narratorId);
+	if (existing) clearTimeout(existing);
+	pendingTerminalBroadcasts.set(
+		narratorId,
+		setTimeout(() => {
+			pendingTerminalBroadcasts.delete(narratorId);
+			broadcastTerminalCount(narratorId);
+		}, 100),
+	);
+}
+
 eventBus.on("terminal:created", (event) => {
-	broadcastTerminalCount(event.narratorId);
+	debouncedTerminalCount(event.narratorId);
 });
 
 eventBus.on("terminal:exited", (event) => {
-	broadcastTerminalCount(event.narratorId);
+	debouncedTerminalCount(event.narratorId);
 });
 
 // === Container status change listener ===
 // When a container starts/stops/pauses/resumes, compute the aggregate status for the chapter
-// and broadcast to subscribers of the chapter's narrator.
+// and broadcast to subscribers of the chapter's narrator. Debounced per-chapter.
+
+const pendingContainerBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
 
 async function broadcastContainerStatus(chapterId: string) {
 	// A chapter may have multiple narrators — broadcast to all of them.
@@ -429,20 +487,32 @@ async function broadcastContainerStatus(chapterId: string) {
 	}
 }
 
+function debouncedContainerStatus(chapterId: string) {
+	const existing = pendingContainerBroadcasts.get(chapterId);
+	if (existing) clearTimeout(existing);
+	pendingContainerBroadcasts.set(
+		chapterId,
+		setTimeout(() => {
+			pendingContainerBroadcasts.delete(chapterId);
+			broadcastContainerStatus(chapterId);
+		}, 100),
+	);
+}
+
 eventBus.on("container:started", (event) => {
-	broadcastContainerStatus(event.chapterId);
+	debouncedContainerStatus(event.chapterId);
 });
 
 eventBus.on("container:stopped", (event) => {
-	broadcastContainerStatus(event.chapterId);
+	debouncedContainerStatus(event.chapterId);
 });
 
 eventBus.on("container:paused", (event) => {
-	broadcastContainerStatus(event.chapterId);
+	debouncedContainerStatus(event.chapterId);
 });
 
 eventBus.on("container:resumed", (event) => {
-	broadcastContainerStatus(event.chapterId);
+	debouncedContainerStatus(event.chapterId);
 });
 
 // === WebSocket handlers ===
@@ -539,6 +609,7 @@ export const handleNarratorWS = {
 					msg.answers,
 					msg.feedbackText,
 					msg.compactAfter,
+					msg.updatedPlan,
 				).catch((err) => logger.error("Failed to resolve permission", { error: String(err) }));
 				break;
 			}

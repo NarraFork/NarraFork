@@ -77,7 +77,7 @@ export interface EventHooks {
 	/** EnterPlanMode tool call */
 	onEnterPlanMode?: () => Promise<void>;
 	/** ExitPlanMode completed successfully */
-	onExitPlanMode?: (output: string) => Promise<void>;
+	onExitPlanMode?: (toolUseId: string) => Promise<void>;
 	/** Clear compact summary after first response */
 	onClearCompactSummary?: () => Promise<void>;
 	/** Git status tracking after file-mutating tools */
@@ -403,7 +403,7 @@ export async function processEvent(
 
 			// Main narrator: ExitPlanMode
 			if (!event.isError && event.toolName === "ExitPlanMode" && hooks?.onExitPlanMode) {
-				await hooks.onExitPlanMode(event.output ?? "");
+				await hooks.onExitPlanMode(event.toolUseId);
 			}
 			return null;
 		}
@@ -446,13 +446,19 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
+			const reasoningStreamEvent: Record<string, unknown> = {
+				type: "content_block_delta",
+				delta: { type: "reasoning_delta", text: event.text },
+			};
+			// Subagent: attach linking info so frontend knows which tool_use this belongs to
+			if (ctx.parentToolUseId) {
+				reasoningStreamEvent.subagentToolUseId = ctx.parentToolUseId;
+				reasoningStreamEvent.subagentNarratorId = narratorId;
+			}
 			broadcastToNarrator(broadcastTargetId, {
 				type: "stream_event",
 				narratorId: broadcastTargetId,
-				event: {
-					type: "content_block_delta",
-					delta: { type: "reasoning_delta", text: event.text },
-				},
+				event: reasoningStreamEvent,
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "stream_event",

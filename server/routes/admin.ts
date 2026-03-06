@@ -14,7 +14,14 @@ adminRoutes.use("*", requireAuth, requireAdmin);
 
 adminRoutes.get("/users", async (c) => {
 	const allUsers = await db.query.users.findMany({
-		columns: { id: true, username: true, role: true, avatarColor: true, createdAt: true },
+		columns: {
+			id: true,
+			username: true,
+			role: true,
+			avatarColor: true,
+			avatarImageId: true,
+			createdAt: true,
+		},
 	});
 	return c.json(allUsers);
 });

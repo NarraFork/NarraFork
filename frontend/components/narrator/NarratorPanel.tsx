@@ -55,6 +55,7 @@ import {
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type TreeMessage } from "../../lib/api";
+import type { ModelOption } from "../../lib/constants";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { ChapterBar } from "./ChapterBar";
@@ -77,11 +78,138 @@ import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_SIZE,
 	PERM_MODE_ICONS,
+	PERM_MODES,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
 import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
 import { useProgressiveMessageCount } from "./useProgressiveMessageCount";
+
+/* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
+
+const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
+
+function ModelMenuItems({
+	allModels,
+	currentModel,
+	totalCostUsd,
+	onSelect,
+	label,
+}: {
+	allModels: ModelOption[];
+	currentModel: string | null | undefined;
+	totalCostUsd: number | null | undefined;
+	onSelect: (model: string) => void;
+	label?: string;
+}) {
+	const groups = new Map<string, ModelOption[]>();
+	for (const m of allModels) {
+		if (!groups.has(prov)) groups.set(prov, []);
+		groups.get(prov)?.push(m);
+	}
+	const entries = [...groups.entries()];
+	return (
+		<>
+			{totalCostUsd != null && totalCostUsd > 0 && (
+				<>
+					<Menu.Label ta="right">${totalCostUsd.toFixed(4)}</Menu.Label>
+					<Menu.Divider />
+				</>
+			)}
+			{label && <Menu.Label>{label}</Menu.Label>}
+			{entries.map(([prov, models], gi) => (
+				<span key={prov}>
+					{gi > 0 && <Menu.Divider />}
+					<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
+					{models.map((m) => {
+						const selected = currentModel === m.value;
+						return (
+							<Menu.Item
+								key={m.value}
+								onClick={() => onSelect(m.value)}
+								rightSection={
+									<Group gap={4} wrap="nowrap">
+										{m.rateMultiplier != null && (
+											<Badge size="xs" variant="outline" color="gray">
+												×{m.rateMultiplier}
+											</Badge>
+										)}
+										<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
+									</Group>
+								}
+								fw={selected ? 600 : 400}
+							>
+								{m.label}
+							</Menu.Item>
+						);
+					})}
+				</span>
+			))}
+		</>
+	);
+}
+
+function PermModeMenuItems({
+	currentMode,
+	onSelect,
+	t,
+}: {
+	currentMode: string;
+	onSelect: (mode: string) => void;
+	t: (key: string) => string;
+}) {
+	return (
+		<>
+			{PERM_MODES.map((mode) => {
+				const selected = currentMode === mode;
+				return (
+					<Menu.Item
+						key={mode}
+						leftSection={PERM_MODE_ICONS[mode]}
+						onClick={() => onSelect(mode)}
+						rightSection={
+							<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
+						}
+						fw={selected ? 600 : 400}
+					>
+						{t(`perm_${mode}`)}
+					</Menu.Item>
+				);
+			})}
+		</>
+	);
+}
+
+function ReasoningEffortMenuItems({
+	currentEffort,
+	onSelect,
+	t,
+}: {
+	currentEffort: string | null | undefined;
+	onSelect: (effort: string | null) => void;
+	t: (key: string) => string;
+}) {
+	return (
+		<>
+			<Menu.Label>{t("reasoningEffort")}</Menu.Label>
+			{(["", "low", "medium", "high", "xhigh"] as const).map((effort) => {
+				const selected = (currentEffort ?? "") === effort || (!currentEffort && effort === "");
+				return (
+					<Menu.Item
+						key={effort}
+						onClick={() => onSelect(effort || null)}
+						rightSection={
+							<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
+						}
+						fw={selected ? 600 : 400}
+					>
+						{t(effort ? `reasoning_${effort}` : "reasoning_auto")}
+					</Menu.Item>
+				);
+			})}
+		</>
+	);
+}
 
 export function NarratorPanel({
 	narratorId,
@@ -233,6 +361,12 @@ export function NarratorPanel({
 	// --- Scroll helpers ---
 	const followRafRef = useRef(0);
 	const followingRef = useRef(false);
+	// Suppress detachFromBottom for programmatic scrollTop changes (e.g. startFollowing snap).
+	// Without this, snapping to a *smaller* scrollTop (viewport grew / content shrank during
+	// resize) fires the onScroll handler which sees scrollTop < lastScrollTop and incorrectly
+	// detaches, causing isAtBottom to oscillate true→false→true on every ResizeObserver
+	// callback — eventually hitting React's "Maximum update depth exceeded" limit.
+	const programmaticScrollRef = useRef(false);
 
 	const lastFollowScrollTop = useRef(0);
 
@@ -252,6 +386,7 @@ export function NarratorPanel({
 			const target = vp.scrollHeight - vp.clientHeight;
 			const gap = target - vp.scrollTop;
 			if (gap < 1.5) {
+				programmaticScrollRef.current = true;
 				vp.scrollTop = target;
 				followingRef.current = false;
 				if (!isAtBottomRef.current) {
@@ -285,6 +420,7 @@ export function NarratorPanel({
 			}
 			setUnreadCountRef.current?.(0);
 			if (instant) {
+				programmaticScrollRef.current = true;
 				vp.scrollTop = vp.scrollHeight;
 			} else {
 				startFollowing();
@@ -294,6 +430,8 @@ export function NarratorPanel({
 	);
 
 	// --- WebSocket + real-time state ---
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const isSubagent = (fetchedNarrator as any)?.type === "subagent";
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -304,6 +442,7 @@ export function NarratorPanel({
 		scrollToBottom,
 		narratorTodosJson: narrator?.todosJson,
 		narratorTodosToolUseId: narrator?.todosToolUseId,
+		isSubagent,
 	});
 	const {
 		disconnected,
@@ -707,6 +846,15 @@ export function NarratorPanel({
 		let lastScrollTop = node.scrollTop;
 		const onScroll = () => {
 			const cur = node.scrollTop;
+			// Skip detach check for programmatic scrollTop changes (startFollowing snap,
+			// scrollToBottom instant). Without this guard, snapping to a smaller target
+			// during viewport resize causes isAtBottom to oscillate and eventually
+			// triggers React's "Maximum update depth exceeded" error.
+			if (programmaticScrollRef.current) {
+				programmaticScrollRef.current = false;
+				lastScrollTop = cur;
+				return;
+			}
 			if (!followingRef.current && cur < lastScrollTop) {
 				detachFromBottom();
 			}
@@ -779,9 +927,21 @@ export function NarratorPanel({
 		const vpObserver = new ResizeObserver(() => {
 			if (isAtBottomRef.current && !highlightMessageId) {
 				if (!initialScrollDoneRef.current && vp) {
+					programmaticScrollRef.current = true;
 					vp.scrollTop = vp.scrollHeight;
-				} else {
-					startFollowing();
+				} else if (vp) {
+					// During viewport resize (e.g. mobile→desktop layout switch), snap
+					// directly instead of going through the RAF follow loop. The follow
+					// loop can set scrollTop to a *smaller* value when scrollHeight
+					// shrinks, which triggers onScroll → detachFromBottom → isAtBottom
+					// oscillation → "Maximum update depth exceeded".
+					const target = vp.scrollHeight - vp.clientHeight;
+					if (Math.abs(target - vp.scrollTop) < 30) {
+						programmaticScrollRef.current = true;
+						vp.scrollTop = target;
+					} else {
+						startFollowing();
+					}
 				}
 			}
 		});
@@ -1418,9 +1578,7 @@ export function NarratorPanel({
 							<Menu.Target>
 								<NativeSelect
 									size="xs"
-									data={allModels.map((m) =>
-										typeof m === "string" ? m : { value: m.value, label: m.label },
-									)}
+									data={allModels.map((m) => ({ value: m.value, label: m.label }))}
 									value={narrator.model ?? ""}
 									onChange={() => {}}
 									onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
@@ -1428,54 +1586,12 @@ export function NarratorPanel({
 								/>
 							</Menu.Target>
 							<Menu.Dropdown>
-								{narrator.totalCostUsd != null && narrator.totalCostUsd > 0 && (
-									<>
-										<Menu.Label ta="right">${narrator.totalCostUsd.toFixed(4)}</Menu.Label>
-										<Menu.Divider />
-									</>
-								)}
-								{(() => {
-									const groups = new Map<string, typeof allModels>();
-									for (const m of allModels) {
-										if (!groups.has(prov)) groups.set(prov, []);
-										groups.get(prov)?.push(m);
-									}
-									const entries = [...groups.entries()];
-									return entries.map(([prov, models], gi) => (
-										<span key={prov}>
-											{gi > 0 && <Menu.Divider />}
-											<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-											{models.map((m) => {
-												const val = typeof m === "string" ? m : m.value;
-												const label = typeof m === "string" ? m : m.label;
-												const rate = typeof m === "string" ? undefined : m.rateMultiplier;
-												const selected = narrator.model === val;
-												return (
-													<Menu.Item
-														key={val}
-														onClick={() => modelMutation.mutate({ id: narratorId, model: val })}
-														rightSection={
-															<Group gap={4} wrap="nowrap">
-																{rate != null && (
-																	<Badge size="xs" variant="outline" color="gray">
-																		×{rate}
-																	</Badge>
-																)}
-																<IconCheck
-																	size={14}
-																	style={{ visibility: selected ? "visible" : "hidden" }}
-																/>
-															</Group>
-														}
-														fw={selected ? 600 : 400}
-													>
-														{label}
-													</Menu.Item>
-												);
-											})}
-										</span>
-									));
-								})()}
+								<ModelMenuItems
+									allModels={allModels}
+									currentModel={narrator.model}
+									totalCostUsd={narrator.totalCostUsd}
+									onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+								/>
 							</Menu.Dropdown>
 						</Menu>
 						<Menu position="top-end">
@@ -1487,12 +1603,7 @@ export function NarratorPanel({
 											<IconShield size={14} />
 										)
 									}
-									data={[
-										{ value: "default", label: t("perm_default") },
-										{ value: "acceptEdits", label: t("perm_acceptEdits") },
-										{ value: "bypassPermissions", label: t("perm_bypassPermissions") },
-										{ value: "dontAsk", label: t("perm_dontAsk") },
-									]}
+									data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
 									value={narrator.permissionMode ?? "default"}
 									onChange={() => {}}
 									onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
@@ -1500,31 +1611,11 @@ export function NarratorPanel({
 								/>
 							</Menu.Target>
 							<Menu.Dropdown>
-								{(["default", "acceptEdits", "bypassPermissions", "dontAsk"] as const).map(
-									(mode) => {
-										const selected =
-											narrator.permissionMode === mode ||
-											(!narrator.permissionMode && mode === "default");
-										return (
-											<Menu.Item
-												key={mode}
-												leftSection={PERM_MODE_ICONS[mode]}
-												onClick={() =>
-													permModeMutation.mutate({ id: narratorId, permissionMode: mode })
-												}
-												rightSection={
-													<IconCheck
-														size={14}
-														style={{ visibility: selected ? "visible" : "hidden" }}
-													/>
-												}
-												fw={selected ? 600 : 400}
-											>
-												{t(`perm_${mode}`)}
-											</Menu.Item>
-										);
-									},
-								)}
+								<PermModeMenuItems
+									currentMode={narrator.permissionMode ?? "default"}
+									onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
+									t={t}
+								/>
 							</Menu.Dropdown>
 						</Menu>
 						{/* Reasoning Effort (only for models containing "codex") */}
@@ -1547,32 +1638,13 @@ export function NarratorPanel({
 									/>
 								</Menu.Target>
 								<Menu.Dropdown>
-									<Menu.Label>{t("reasoningEffort")}</Menu.Label>
-									{(["", "low", "medium", "high", "xhigh"] as const).map((effort) => {
-										const selected =
-											narrator.reasoningEffort === effort ||
-											(!narrator.reasoningEffort && effort === "");
-										return (
-											<Menu.Item
-												key={effort}
-												onClick={() =>
-													reasoningEffortMutation.mutate({
-														id: narratorId,
-														reasoningEffort: effort || null,
-													})
-												}
-												rightSection={
-													<IconCheck
-														size={14}
-														style={{ visibility: selected ? "visible" : "hidden" }}
-													/>
-												}
-												fw={selected ? 600 : 400}
-											>
-												{t(effort ? `reasoning_${effort}` : "reasoning_auto")}
-											</Menu.Item>
-										);
-									})}
+									<ReasoningEffortMenuItems
+										currentEffort={narrator.reasoningEffort}
+										onSelect={(e) =>
+											reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+										}
+										t={t}
+									/>
 								</Menu.Dropdown>
 							</Menu>
 						)}
@@ -1604,65 +1676,20 @@ export function NarratorPanel({
 								<ActionIcon variant="subtle" color="gray" size="sm">
 									<Text size="xs" fw={600}>
 										{(() => {
-											const m = allModels.find(
-												(x) => (typeof x === "string" ? x : x.value) === narrator.model,
-											);
-											const label = m ? (typeof m === "string" ? m : m.label) : narrator.model;
-											return (label ?? "?")[0].toUpperCase();
+											const m = allModels.find((x) => x.value === narrator.model);
+											return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
 										})()}
 									</Text>
 								</ActionIcon>
 							</Menu.Target>
 							<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-								{narrator.totalCostUsd != null && narrator.totalCostUsd > 0 && (
-									<>
-										<Menu.Label ta="right">${narrator.totalCostUsd.toFixed(4)}</Menu.Label>
-										<Menu.Divider />
-									</>
-								)}
-								<Menu.Label>{t("modelTooltip")}</Menu.Label>
-								{(() => {
-									const groups = new Map<string, typeof allModels>();
-									for (const m of allModels) {
-										if (!groups.has(prov)) groups.set(prov, []);
-										groups.get(prov)?.push(m);
-									}
-									const entries = [...groups.entries()];
-									return entries.map(([prov, models], gi) => (
-										<span key={prov}>
-											{gi > 0 && <Menu.Divider />}
-											<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-											{models.map((m) => {
-												const val = typeof m === "string" ? m : m.value;
-												const label = typeof m === "string" ? m : m.label;
-												const rate = typeof m === "string" ? undefined : m.rateMultiplier;
-												const selected = narrator.model === val;
-												return (
-													<Menu.Item
-														key={val}
-														onClick={() => modelMutation.mutate({ id: narratorId, model: val })}
-														rightSection={
-															<Group gap={4} wrap="nowrap">
-																{rate != null && (
-																	<Badge size="xs" variant="outline" color="gray">
-																		×{rate}
-																	</Badge>
-																)}
-																<IconCheck
-																	size={14}
-																	style={{ visibility: selected ? "visible" : "hidden" }}
-																/>
-															</Group>
-														}
-														fw={selected ? 600 : 400}
-													>
-														{label}
-													</Menu.Item>
-												);
-											})}
-										</span>
-									));
-								})()}
+								<ModelMenuItems
+									allModels={allModels}
+									currentModel={narrator.model}
+									totalCostUsd={narrator.totalCostUsd}
+									onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+									label={t("modelTooltip")}
+								/>
 							</Menu.Dropdown>
 						</Menu>
 						<Menu position="bottom-end" withinPortal>
@@ -1675,31 +1702,11 @@ export function NarratorPanel({
 							</Menu.Target>
 							<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 								<Menu.Label>{t("permissionMode")}</Menu.Label>
-								{(["default", "acceptEdits", "bypassPermissions", "dontAsk"] as const).map(
-									(mode) => {
-										const selected =
-											narrator.permissionMode === mode ||
-											(!narrator.permissionMode && mode === "default");
-										return (
-											<Menu.Item
-												key={mode}
-												leftSection={PERM_MODE_ICONS[mode]}
-												onClick={() =>
-													permModeMutation.mutate({ id: narratorId, permissionMode: mode })
-												}
-												rightSection={
-													<IconCheck
-														size={14}
-														style={{ visibility: selected ? "visible" : "hidden" }}
-													/>
-												}
-												fw={selected ? 600 : 400}
-											>
-												{t(`perm_${mode}`)}
-											</Menu.Item>
-										);
-									},
-								)}
+								<PermModeMenuItems
+									currentMode={narrator.permissionMode ?? "default"}
+									onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
+									t={t}
+								/>
 							</Menu.Dropdown>
 						</Menu>
 						{/* Reasoning Effort (only for Codex models) - Mobile */}
@@ -1716,32 +1723,13 @@ export function NarratorPanel({
 									</ActionIcon>
 								</Menu.Target>
 								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-									<Menu.Label>{t("reasoningEffort")}</Menu.Label>
-									{(["", "low", "medium", "high", "xhigh"] as const).map((effort) => {
-										const selected =
-											narrator.reasoningEffort === effort ||
-											(!narrator.reasoningEffort && effort === "");
-										return (
-											<Menu.Item
-												key={effort}
-												onClick={() =>
-													reasoningEffortMutation.mutate({
-														id: narratorId,
-														reasoningEffort: effort || null,
-													})
-												}
-												rightSection={
-													<IconCheck
-														size={14}
-														style={{ visibility: selected ? "visible" : "hidden" }}
-													/>
-												}
-												fw={selected ? 600 : 400}
-											>
-												{t(effort ? `reasoning_${effort}` : "reasoning_auto")}
-											</Menu.Item>
-										);
-									})}
+									<ReasoningEffortMenuItems
+										currentEffort={narrator.reasoningEffort}
+										onSelect={(e) =>
+											reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+										}
+										t={t}
+									/>
 								</Menu.Dropdown>
 							</Menu>
 						)}

@@ -65,14 +65,16 @@ export const exitPlanModeTool: ToolDefinition = {
 			};
 		}
 
-		// If planFile is provided, resolve and read it
+		// If planFile is provided, validate it exists and is readable
 		if (planFile) {
-			return readPlanFile(cwd, planFile);
+			const validation = validatePlanFile(cwd, planFile);
+			if (validation.isError) return validation;
+			return { output: "Plan submitted. Awaiting user approval." };
 		}
 
-		// If inline plan is provided, use it directly
+		// If inline plan is provided, return confirmation
 		if (plan) {
-			return { output: plan };
+			return { output: "Plan submitted. Awaiting user approval." };
 		}
 
 		// Neither provided — try to auto-detect the plan file from planFileId
@@ -80,7 +82,9 @@ export const exitPlanModeTool: ToolDefinition = {
 			const autoPath = `.narrafork/plan-${planFileId}.md`;
 			const absPath = resolve(cwd, autoPath);
 			if (existsSync(absPath)) {
-				return readPlanFile(cwd, autoPath);
+				const validation = validatePlanFile(cwd, autoPath);
+				if (validation.isError) return validation;
+				return { output: "Plan submitted. Awaiting user approval." };
 			}
 		}
 
@@ -93,7 +97,7 @@ export const exitPlanModeTool: ToolDefinition = {
 	},
 };
 
-function readPlanFile(cwd: string, planFile: string): ToolResult {
+function validatePlanFile(cwd: string, planFile: string): ToolResult {
 	const absPath = resolve(cwd, planFile);
 
 	// Security: ensure the resolved path is under cwd
@@ -119,7 +123,7 @@ function readPlanFile(cwd: string, planFile: string): ToolResult {
 				isError: true,
 			};
 		}
-		return { output: content };
+		return { output: "" };
 	} catch (err) {
 		return {
 			output: `Error reading plan file: ${err instanceof Error ? err.message : String(err)}`,

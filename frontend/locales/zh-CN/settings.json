@@ -1,5 +1,13 @@
 {
 	"title": "设置",
+	"profileSection": "个人资料",
+	"avatarUpload": "上传头像",
+	"avatarDelete": "删除头像",
+	"avatarDeleteConfirm": "确认删除头像？",
+	"avatarCropTitle": "裁剪头像",
+	"avatarCropConfirm": "确认",
+	"avatarCropCancel": "取消",
+	"avatarZoom": "缩放",
 	"serverSection": "服务器",
 	"serverPort": "服务器端口",
 	"defaultProjectDir": "默认项目目录",

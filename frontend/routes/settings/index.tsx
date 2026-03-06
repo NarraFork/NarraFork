@@ -1,7 +1,9 @@
 import {
 	Affix,
+	Avatar,
 	Badge,
 	Button,
+	FileButton,
 	FileInput,
 	Group,
 	Loader,
@@ -20,21 +22,27 @@ import {
 } from "@mantine/core";
 import {
 	IconBell,
+	IconEye,
 	IconHandStop,
 	IconPencilCheck,
 	IconPlayerPlay,
 	IconRefresh,
 	IconShield,
 	IconShieldOff,
+	IconTrash,
+	IconUpload,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AvatarCropModal } from "../../components/AvatarCropModal";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
+import { UserAvatar } from "../../components/UserAvatar";
+import { useCurrentUser, useDeleteAvatar, useUploadAvatar } from "../../hooks/useAuth";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
@@ -67,6 +75,33 @@ function SettingsPage() {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const navigate = useNavigate();
+
+	// Avatar
+	const { data: currentUser } = useCurrentUser();
+	const uploadAvatar = useUploadAvatar();
+	const deleteAvatar = useDeleteAvatar();
+	const [cropSrc, setCropSrc] = useState<string | null>(null);
+
+	const handleAvatarFileSelected = (file: File | null) => {
+		if (!file) return;
+		const url = URL.createObjectURL(file);
+		setCropSrc(url);
+	};
+
+	const handleCropConfirm = (blob: Blob) => {
+		const file = new File([blob], "avatar.webp", { type: "image/webp" });
+		uploadAvatar.mutate(file, {
+			onSuccess: () => {
+				setCropSrc(null);
+			},
+		});
+	};
+
+	const handleDeleteAvatar = () => {
+		if (window.confirm(t("avatarDeleteConfirm"))) {
+			deleteAvatar.mutate();
+		}
+	};
 
 	// Per-user preferences (account-independent)
 	const { data: userPrefs } = useUserPreferences();
@@ -371,6 +406,69 @@ function SettingsPage() {
 		<Stack>
 			<Title order={2}>{t("title")}</Title>
 
+			{/* Profile */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("profileSection")}</Title>
+					<Group>
+						{currentUser ? (
+							<UserAvatar
+								username={currentUser.username}
+								avatarColor={currentUser.avatarColor}
+								avatarImageId={currentUser.avatarImageId}
+								userId={currentUser.id}
+								size={80}
+								showTooltip={false}
+							/>
+						) : (
+							<Avatar size={80} />
+						)}
+						<Stack gap="xs">
+							<FileButton
+								onChange={handleAvatarFileSelected}
+								accept="image/png,image/jpeg,image/webp"
+							>
+								{(props) => (
+									<Button
+										{...props}
+										variant="light"
+										size="xs"
+										leftSection={<IconUpload size={14} />}
+									>
+										{t("avatarUpload")}
+									</Button>
+								)}
+							</FileButton>
+							{currentUser?.avatarImageId && (
+								<Button
+									variant="subtle"
+									color="red"
+									size="xs"
+									leftSection={<IconTrash size={14} />}
+									onClick={handleDeleteAvatar}
+									loading={deleteAvatar.isPending}
+								>
+									{t("avatarDelete")}
+								</Button>
+							)}
+						</Stack>
+					</Group>
+				</Stack>
+			</Paper>
+
+			{cropSrc && (
+				<AvatarCropModal
+					opened={!!cropSrc}
+					onClose={() => {
+						URL.revokeObjectURL(cropSrc);
+						setCropSrc(null);
+					}}
+					imageSrc={cropSrc}
+					onConfirm={handleCropConfirm}
+					loading={uploadAvatar.isPending}
+				/>
+			)}
+
 			{/* Server */}
 			<Paper withBorder p="md">
 				<Stack>
@@ -406,6 +504,7 @@ function SettingsPage() {
 							{ value: "default", label: tn("perm_default") },
 							{ value: "acceptEdits", label: tn("perm_acceptEdits") },
 							{ value: "bypassPermissions", label: tn("perm_bypassPermissions") },
+							{ value: "readOnly", label: tn("perm_readOnly") },
 							{ value: "dontAsk", label: tn("perm_dontAsk") },
 						]}
 						leftSection={
@@ -415,6 +514,8 @@ function SettingsPage() {
 								<IconPencilCheck size={14} />
 							) : permissionMode === "bypassPermissions" ? (
 								<IconShieldOff size={14} />
+							) : permissionMode === "readOnly" ? (
+								<IconEye size={14} />
 							) : permissionMode === "dontAsk" ? (
 								<IconHandStop size={14} />
 							) : (
@@ -426,6 +527,7 @@ function SettingsPage() {
 								default: <IconShield size={14} />,
 								acceptEdits: <IconPencilCheck size={14} />,
 								bypassPermissions: <IconShieldOff size={14} />,
+								readOnly: <IconEye size={14} />,
 								dontAsk: <IconHandStop size={14} />,
 							};
 							return (

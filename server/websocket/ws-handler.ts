@@ -20,7 +20,12 @@ export type WSData =
  */
 export function resolveWSData(
 	url: URL,
-	userInfo?: { userId: string; username: string; avatarColor: string | null },
+	userInfo?: {
+		userId: string;
+		username: string;
+		avatarColor: string | null;
+		avatarImageId: string | null;
+	},
 ): WSData | null {
 	if (url.pathname === "/ws/narrator" || url.pathname.startsWith("/ws/narrator?")) {
 		return {
@@ -31,6 +36,7 @@ export function resolveWSData(
 			userId: userInfo?.userId,
 			username: userInfo?.username,
 			avatarColor: userInfo?.avatarColor,
+			avatarImageId: userInfo?.avatarImageId,
 		};
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {

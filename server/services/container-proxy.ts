@@ -70,7 +70,7 @@ export async function refreshCache(): Promise<void> {
 
 	for (const inst of instances) {
 		if (inst.proxyLabel && inst.containerIp && inst.containerPort != null) {
-			cache.set(inst.proxyLabel, {
+			cache.set(inst.proxyLabel.toLowerCase(), {
 				containerIp: inst.containerIp,
 				containerPort: inst.containerPort,
 				chapterId: inst.chapterId,

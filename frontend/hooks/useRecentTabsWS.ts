@@ -18,12 +18,15 @@ export function useRecentTabsWS(
 	narratorIds: string[],
 	onUpdate: (narratorId: string, event: NarratorListWSEvent) => void,
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
+	onReconnect?: () => void,
 ) {
 	const wsRef = useRef<WebSocket | null>(null);
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
 	const onGlobalEventRef = useRef(onGlobalEvent);
 	onGlobalEventRef.current = onGlobalEvent;
+	const onReconnectRef = useRef(onReconnect);
+	onReconnectRef.current = onReconnect;
 
 	// Track which IDs are currently subscribed on the server side
 	const subscribedIdsRef = useRef<Set<string>>(new Set());
@@ -52,6 +55,7 @@ export function useRecentTabsWS(
 					ws.close();
 					return;
 				}
+				const isReconnect = attempts > 0;
 				attempts = 0;
 				// Re-subscribe to all currently desired IDs
 				subscribedIdsRef.current.clear();
@@ -62,6 +66,10 @@ export function useRecentTabsWS(
 						subscribedIdsRef.current.add(id);
 						ws.send(JSON.stringify({ type: "presence_join", narratorId: id }));
 					}
+				}
+				// On reconnect, notify caller to refresh stale data
+				if (isReconnect) {
+					onReconnectRef.current?.();
 				}
 			};
 

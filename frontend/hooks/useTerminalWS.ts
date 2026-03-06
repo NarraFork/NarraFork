@@ -14,7 +14,7 @@ import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 interface TerminalWSCallbacks {
 	onOutput?: (data: string) => void;
-	onScrollback?: (data: string) => void;
+	onScrollback?: (data: string, dims: { cols: number; rows: number }) => void;
 	onExit?: (code: number) => void;
 	onError?: (message: string) => void;
 	onRequestResize?: () => void;
@@ -147,7 +147,10 @@ class TerminalWSManager {
 					callbacks.onOutput?.(msg.data as string);
 					break;
 				case "scrollback":
-					callbacks.onScrollback?.(msg.data as string);
+					callbacks.onScrollback?.(msg.data as string, {
+						cols: (msg.cols as number) || 80,
+						rows: (msg.rows as number) || 24,
+					});
 					break;
 				case "exit":
 					callbacks.onExit?.(msg.code as number);
@@ -260,7 +263,7 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 		const listener: Listener = {
 			callbacks: {
 				onOutput: (data) => callbacksRef.current.onOutput?.(data),
-				onScrollback: (data) => callbacksRef.current.onScrollback?.(data),
+				onScrollback: (data, dims) => callbacksRef.current.onScrollback?.(data, dims),
 				onExit: (code) => callbacksRef.current.onExit?.(code),
 				onError: (msg) => callbacksRef.current.onError?.(msg),
 				onRequestResize: () => callbacksRef.current.onRequestResize?.(),

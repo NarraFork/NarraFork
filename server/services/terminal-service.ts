@@ -266,6 +266,18 @@ export const terminalService = {
 		const active = activeTerminals.get(terminalId);
 		if (!active) return;
 		active.pty.resize(cols, rows);
+		// Bun.Terminal.resize() updates the PTY window size but does not send
+		// SIGWINCH to the child. dtach relies on SIGWINCH to forward the new
+		// size from the attach process to the master session's child PTY.
+		if (active.useDtach && active.process.pid) {
+			try {
+				process.kill(active.process.pid, "SIGWINCH");
+			} catch {
+				// process may have exited
+			}
+		}
+		// Buffer resize is async (waits for pending writes) — fire and forget
+		active.buffer.resize(cols, rows);
 	},
 
 	async kill(terminalId: string) {
@@ -480,16 +492,21 @@ export const terminalService = {
 		return db.query.terminals.findFirst({ where: eq(terminals.id, id) });
 	},
 
-	getScrollback(terminalId: string): string | null {
+	async getScrollback(
+		terminalId: string,
+	): Promise<{ data: string; cols: number; rows: number } | null> {
 		const active = activeTerminals.get(terminalId);
 		if (active) {
-			const contents = active.buffer.getContents();
-			return contents || null;
+			const contents = await active.buffer.getContents();
+			if (!contents) return null;
+			return { data: contents, cols: active.buffer.cols, rows: active.buffer.rows };
 		}
 		// Try loading from disk (detached terminal)
 		const buf = new BufferManager(terminalId);
 		if (buf.loadFromDisk()) {
-			return buf.getContents() || null;
+			const contents = await buf.getContents();
+			if (!contents) return null;
+			return { data: contents, cols: buf.cols, rows: buf.rows };
 		}
 		return null;
 	},

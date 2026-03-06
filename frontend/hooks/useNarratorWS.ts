@@ -9,7 +9,11 @@ interface NarratorWSCallbacks {
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onStreamEvent?: (data: { event?: Record<string, unknown>; [key: string]: unknown }) => void;
 	onPermissionRequest?: (request: PendingPermission) => void;
-	onPermissionResolved?: (requestId: string, toolUseId?: string) => void;
+	onPermissionResolved?: (
+		requestId: string,
+		toolUseId?: string,
+		updatedInput?: Record<string, unknown>,
+	) => void;
 	onStatusChange?: (status: string) => void;
 	onToolStarted?: (toolUseId: string, toolName: string, streamStartedAt?: number) => void;
 	onToolUseChunk?: (
@@ -66,6 +70,18 @@ interface NarratorWSCallbacks {
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
+	onBackgroundTaskStarted?: (
+		taskNarratorId: string,
+		toolUseId: string,
+		subagentType: string,
+	) => void;
+	onBackgroundTaskCompleted?: (
+		taskNarratorId: string,
+		toolUseId: string,
+		resultPreview: string,
+	) => void;
+	onBackgroundTaskFailed?: (taskNarratorId: string, toolUseId: string, error: string) => void;
+	onBackgroundTaskCancelled?: (taskNarratorId: string, toolUseId: string) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -198,7 +214,11 @@ export function useNarratorWS(
 							}
 							break;
 						case "permission_resolved":
-							callbacksRef.current.onPermissionResolved?.(data.requestId, data.toolUseId);
+							callbacksRef.current.onPermissionResolved?.(
+								data.requestId,
+								data.toolUseId,
+								data.updatedInput,
+							);
 							break;
 						case "status_change":
 						case "narrator:status_changed":
@@ -330,6 +350,30 @@ export function useNarratorWS(
 								callbacksRef.current.onCommitsUpdated?.(data.chapterId, data.newCount ?? 0);
 							}
 							break;
+						case "background_task_started":
+							callbacksRef.current.onBackgroundTaskStarted?.(
+								data.taskNarratorId,
+								data.toolUseId,
+								data.subagentType,
+							);
+							break;
+						case "background_task_completed":
+							callbacksRef.current.onBackgroundTaskCompleted?.(
+								data.taskNarratorId,
+								data.toolUseId,
+								data.resultPreview,
+							);
+							break;
+						case "background_task_failed":
+							callbacksRef.current.onBackgroundTaskFailed?.(
+								data.taskNarratorId,
+								data.toolUseId,
+								data.error,
+							);
+							break;
+						case "background_task_cancelled":
+							callbacksRef.current.onBackgroundTaskCancelled?.(data.taskNarratorId, data.toolUseId);
+							break;
 					}
 				} catch (err) {
 					if (import.meta.env.DEV) console.warn("[useNarratorWS] Failed to parse WS message:", err);
@@ -391,6 +435,7 @@ export function useNarratorWS(
 			answers?: Record<string, string>,
 			feedbackText?: string,
 			compactAfter?: boolean,
+			updatedPlan?: string,
 		): boolean => {
 			if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
 			wsRef.current.send(
@@ -402,6 +447,7 @@ export function useNarratorWS(
 					answers,
 					feedbackText,
 					compactAfter,
+					updatedPlan,
 				}),
 			);
 			return true;
@@ -446,7 +492,12 @@ export interface NarratorListWSEvent {
 	status?: string;
 	title?: string;
 	planMode?: boolean;
-	viewers?: Array<{ userId: string; username: string; avatarColor: string | null }>;
+	viewers?: Array<{
+		userId: string;
+		username: string;
+		avatarColor: string | null;
+		avatarImageId: string | null;
+	}>;
 	activeTerminalCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 }

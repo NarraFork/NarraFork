@@ -51,7 +51,8 @@ export function useRecentTabs() {
 			let next: RecentTab[];
 			if (idx >= 0) {
 				next = [...prev];
-				next[idx] = tab;
+				// Merge: preserve runtime-enriched fields from the existing entry
+				next[idx] = { ...prev[idx], ...tab };
 			} else {
 				next = [tab, ...prev].slice(0, 20);
 			}
@@ -189,7 +190,8 @@ export function addRecentTab(tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisit
 	let next: RecentTab[];
 	if (idx >= 0) {
 		next = [...prev];
-		next[idx] = entry;
+		// Merge: preserve runtime-enriched fields from the existing entry
+		next[idx] = { ...prev[idx], ...entry };
 	} else {
 		next = [entry, ...prev].slice(0, 20);
 	}

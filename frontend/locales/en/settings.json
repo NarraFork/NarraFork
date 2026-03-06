@@ -1,5 +1,13 @@
 {
 	"title": "Settings",
+	"profileSection": "Profile",
+	"avatarUpload": "Upload Avatar",
+	"avatarDelete": "Remove Avatar",
+	"avatarDeleteConfirm": "Remove your avatar image?",
+	"avatarCropTitle": "Crop Avatar",
+	"avatarCropConfirm": "Confirm",
+	"avatarCropCancel": "Cancel",
+	"avatarZoom": "Zoom",
 	"serverSection": "Server",
 	"serverPort": "Server Port",
 	"defaultProjectDir": "Default Project Directory",

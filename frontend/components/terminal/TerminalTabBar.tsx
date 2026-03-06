@@ -8,7 +8,14 @@ import {
 } from "@dnd-kit/core";
 import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ActionIcon, Group, TextInput, Tooltip, UnstyledButton } from "@mantine/core";
+import {
+	ActionIcon,
+	Group,
+	TextInput,
+	Tooltip,
+	UnstyledButton,
+	useMantineColorScheme,
+} from "@mantine/core";
 import { IconGripVertical, IconPlus, IconX } from "@tabler/icons-react";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -45,6 +52,7 @@ function SortableTab({
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tab.id,
 	});
+	const { colorScheme } = useMantineColorScheme();
 	const [editing, setEditing] = useState(false);
 	const [editName, setEditName] = useState(tab.name);
 	const inputRef = useRef<HTMLInputElement>(null);
@@ -81,7 +89,11 @@ function SortableTab({
 					borderBottom: isActive
 						? "2px solid var(--mantine-color-indigo-6)"
 						: "2px solid transparent",
-					backgroundColor: isActive ? "var(--mantine-color-dark-6)" : "transparent",
+					backgroundColor: isActive
+						? colorScheme === "dark"
+							? "var(--mantine-color-dark-6)"
+							: "var(--mantine-color-gray-1)"
+						: "transparent",
 					borderRadius: "4px 4px 0 0",
 					fontSize: 13,
 					whiteSpace: "nowrap",

@@ -55,6 +55,7 @@
 	"perm_default": "逐项询问",
 	"perm_acceptEdits": "允许编辑",
 	"perm_bypassPermissions": "全部允许",
+	"perm_readOnly": "只读",
 	"perm_plan": "仅规划",
 	"perm_dontAsk": "全部拒绝",
 	"reasoningEffort": "思考强度",
@@ -95,6 +96,10 @@
 	"expandEdits": "展开编辑",
 	"collapseEdits": "折叠编辑",
 	"acceptAndResetContext": "接受并重置上下文",
+	"planEdit": "编辑计划",
+	"planEditDone": "完成编辑",
+	"planEditReset": "重置",
+	"planEdited": "已编辑",
 	"pruneBoundaryLabel": "↑ 以上工具调用详情已被裁剪以节省上下文",
 	"prunedPercent": "已裁剪: {{percent}}%",
 	"contextUsagePercent": "上下文: {{percent}}%",
@@ -118,5 +123,12 @@
 	"commandSourceUser": "用户",
 	"commandSourceProject": "项目",
 	"subagentBadge": "子代理",
-	"subagentReadOnly": "子代理会话的只读视图"
+	"subagentReadOnly": "子代理会话的只读视图",
+	"backgroundBadge": "后台",
+	"backgroundRunning": "后台运行中...",
+	"backgroundCompleted": "后台任务已完成",
+	"backgroundFailed": "后台任务失败",
+	"backgroundCancelled": "后台任务已取消",
+	"backgroundTaskCompletedTitle": "后台任务完成",
+	"backgroundTaskFailedTitle": "后台任务失败"
 }

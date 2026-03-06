@@ -34,6 +34,12 @@ function buildParameters() {
 			.describe(
 				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
 			),
+		background: z
+			.boolean()
+			.optional()
+			.describe(
+				"If true, run the task in the background without blocking the parent narrator. Returns a task ID immediately that can be checked later with CheckBackgroundTask. The background task runs independently and its results can be retrieved when complete. Best for long-running exploration or analysis tasks that don't need to block the current conversation.",
+			),
 	});
 }
 
@@ -46,12 +52,13 @@ export const taskTool: ToolDefinition = {
 		return buildParameters();
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { prompt, subagent_type, model, workdir } = args as {
+		const { prompt, subagent_type, model, workdir, background } = args as {
 			prompt: string;
 			description?: string;
 			subagent_type: "explore" | "plan" | "general";
 			model?: string;
 			workdir?: string;
+			background?: boolean;
 		};
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
@@ -75,6 +82,7 @@ export const taskTool: ToolDefinition = {
 				signal: ctx.signal,
 				locale: ctx.locale,
 				model: model || undefined,
+				background: background || false,
 			});
 			return { output: result };
 		} catch (err) {

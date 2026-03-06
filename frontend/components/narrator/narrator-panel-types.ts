@@ -1,4 +1,10 @@
-import { IconHandStop, IconPencilCheck, IconShield, IconShieldOff } from "@tabler/icons-react";
+import {
+	IconEye,
+	IconHandStop,
+	IconPencilCheck,
+	IconShield,
+	IconShieldOff,
+} from "@tabler/icons-react";
 import { createElement } from "react";
 import type {
 	BaseContentBlock,
@@ -72,6 +78,7 @@ export interface PermissionCallbacks {
 		decision: "allow" | "deny",
 		feedbackText?: string,
 		compactAfter?: boolean,
+		updatedPlan?: string,
 	) => void;
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny: (requestId: string) => void;
@@ -142,9 +149,18 @@ export function isNoMergeMessage(msg: NarratorMsg | null | undefined): boolean {
 	return !!msg?._noMerge;
 }
 
+export const PERM_MODES = [
+	"default",
+	"acceptEdits",
+	"bypassPermissions",
+	"readOnly",
+	"dontAsk",
+] as const;
+
 export const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
 	default: createElement(IconShield, { size: 14 }),
 	acceptEdits: createElement(IconPencilCheck, { size: 14 }),
 	bypassPermissions: createElement(IconShieldOff, { size: 14 }),
+	readOnly: createElement(IconEye, { size: 14 }),
 	dontAsk: createElement(IconHandStop, { size: 14 }),
 };

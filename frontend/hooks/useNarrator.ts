@@ -23,6 +23,10 @@ export function useNarratorsPaginated(opts?: {
 	sortBy?: string;
 	sortOrder?: string;
 	limit?: number;
+	hasTerminals?: boolean;
+	hasContainers?: boolean;
+	hasRunningContainers?: boolean;
+	hasViewers?: boolean;
 }) {
 	return useInfiniteQuery<PaginatedNarrators>({
 		queryKey: ["narrators", "paginated", { ...opts }],

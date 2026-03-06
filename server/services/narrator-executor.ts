@@ -72,6 +72,11 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 			}
 			break;
 		}
+		if (event.type === "invalid_state") {
+			finalText = `Error: ${event.message}`;
+			hasError = true;
+			break;
+		}
 	}
 
 	return { finalText, hasError, shouldUpdateTitle, contextLengthExceeded, retryableError };

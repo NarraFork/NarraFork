@@ -1,6 +1,10 @@
 const BASE = "/api";
 const TOKEN_KEY = "narrafork_token";
 
+export function getAvatarUrl(userId: string, avatarImageId: string): string {
+	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
+}
+
 export class ApiError extends Error {
 	status: number;
 	constructor(message: string, status: number) {
@@ -155,6 +159,30 @@ export const api = {
 		}),
 	me: () => request<ApiEntity>("/auth/me"),
 
+	// Avatar
+	uploadAvatar: async (file: File) => {
+		const formData = new FormData();
+		formData.append("file", file);
+		const token = getToken();
+		const headers: Record<string, string> = {};
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const res = await fetch(`${BASE}/auth/me/avatar`, {
+			method: "PATCH",
+			headers,
+			body: formData,
+		});
+		if (res.status === 401) {
+			clearToken();
+			throw new ApiError("Unauthorized", 401);
+		}
+		if (!res.ok) {
+			const err = await res.json().catch(() => ({ error: "Upload failed" }));
+			throw new ApiError(err.error ?? "Upload failed", res.status);
+		}
+		return res.json() as Promise<{ ok: boolean; avatarImageId: string }>;
+	},
+	deleteAvatar: () => request<{ ok: boolean }>("/auth/me/avatar", { method: "DELETE" }),
+
 	// Admin
 	listUsers: () => request<ApiEntity[]>("/admin/users"),
 	deleteUser: (id: string) => request<ApiEntity>(`/admin/users/${id}`, { method: "DELETE" }),
@@ -232,6 +260,10 @@ export const api = {
 		sortOrder?: string;
 		limit?: number;
 		cursor?: string;
+		hasTerminals?: boolean;
+		hasContainers?: boolean;
+		hasRunningContainers?: boolean;
+		hasViewers?: boolean;
 	}) => {
 		const params = new URLSearchParams();
 		if (opts?.standalone === "all") params.set("standalone", "all");
@@ -242,6 +274,10 @@ export const api = {
 		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
 		if (opts?.limit) params.set("limit", String(opts.limit));
 		if (opts?.cursor) params.set("cursor", opts.cursor);
+		if (opts?.hasTerminals) params.set("hasTerminals", "true");
+		if (opts?.hasContainers) params.set("hasContainers", "true");
+		if (opts?.hasRunningContainers) params.set("hasRunningContainers", "true");
+		if (opts?.hasViewers) params.set("hasViewers", "true");
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},

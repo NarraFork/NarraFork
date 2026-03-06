@@ -83,7 +83,9 @@ export const createNarratorSchema = z.object({
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
-	permissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "dontAsk"]).optional(),
+	permissionMode: z
+		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"])
+		.optional(),
 	cwd: z.string().min(1).max(4096).optional(),
 	planMode: z.boolean().optional(),
 	reasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
@@ -349,6 +351,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		answers: z.record(z.string(), z.string()).optional(),
 		feedbackText: z.string().optional(),
 		compactAfter: z.boolean().optional(),
+		updatedPlan: z.string().optional(),
 	}),
 	z.object({
 		type: z.literal("merge_decision"),

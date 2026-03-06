@@ -318,6 +318,10 @@ const toolMessages = {
 		en: "Non-interactive session: all risky operations are denied",
 		"zh-CN": "非交互式会话：所有高风险操作已被拒绝",
 	},
+	permissionDeniedReadOnly: {
+		en: "Read-only mode: only read operations are allowed. Write, edit, and other mutating tools are denied.",
+		"zh-CN": "只读模式：仅允许读取操作。写入、编辑及其他修改类工具已被拒绝。",
+	},
 	// Plan mode disabled tool description (injected in loop.ts)
 	planModeToolDisabled: {
 		en: "[PLAN MODE] This tool is disabled during plan mode. Focus on reading and analyzing code, then call ExitPlanMode with your plan.",

@@ -79,6 +79,19 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 /** HTTP status codes that indicate transient server-side issues. */
 const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
 
+/** Reasons from invalidState that indicate a transient server-side issue worth retrying. */
+const RETRYABLE_INVALID_STATE_REASONS = new Set([
+	"server_error",
+	"internal_error",
+	"internal_server_error",
+	"service_unavailable",
+	"temporarily_unavailable",
+]);
+
+function isRetryableInvalidStateReason(reason: string): boolean {
+	return RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase());
+}
+
 function isContextOverflowReason(reason: string): boolean {
 	const r = reason.toLowerCase();
 	return (
@@ -553,6 +566,10 @@ export async function* agentLoop(
 						yield { type: "context_length_exceeded", message };
 						return;
 					}
+					if (isRetryableInvalidStateReason(reason)) {
+						yield { type: "retryable_error", message };
+						return;
+					}
 					yield {
 						type: "invalid_state",
 						reason,
@@ -833,6 +850,7 @@ export async function* agentLoop(
 				}
 			} else {
 				// Parallel execution (multiple Task calls)
+				// Yield tool_call events for tools not already started during streaming
 				for (const tu of group) {
 					if (!earlyExecMap.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
 						yield {
@@ -845,17 +863,33 @@ export async function* agentLoop(
 					}
 				}
 
-				const results = await Promise.all(
-					group.map((tu) => earlyExecMap.get(tu.toolUseId) ?? executeTool(tu, config)),
-				);
+				// Start all executions concurrently, but yield results as each completes
+				// (instead of waiting for all via Promise.all) so the frontend can update
+				// individual tool cards immediately.
+				const execEntries = group.map((tu) => ({
+					tu,
+					promise: earlyExecMap.get(tu.toolUseId) ?? executeTool(tu, config),
+				}));
+
+				// Wrap each promise to carry its index so we know which resolved
+				const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
+
+				const settled = new Array<ToolExecResult | undefined>(group.length);
+				let remaining = new Set(indexed);
 				let hasFatal = false;
 				let maxParallelMs = 0;
 
-				for (let j = 0; j < group.length; j++) {
-					const tu = group[j];
-					const result = results[j];
+				while (remaining.size > 0) {
+					const winner = await Promise.race(remaining);
+					const { i, result } = winner;
+					settled[i] = result;
+
+					// Remove the settled promise from the race set
+					remaining = new Set([...remaining].filter((p) => p !== indexed[i]));
+
+					const tu = group[i];
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
-					const isLastTool = toolIndex === toolUses.length - 1;
+					const isLastTool = toolIndex === toolUses.length - 1 && remaining.size === 0;
 					const outputForModel =
 						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
 
@@ -890,7 +924,8 @@ export async function* agentLoop(
 				prevToolsExecMs += maxParallelMs;
 
 				if (hasFatal) {
-					const fatalMsg = results.find((r) => r.fatal)?.output ?? "Fatal tool error";
+					const fatalResult = settled.find((r) => r?.fatal);
+					const fatalMsg = fatalResult?.output ?? "Fatal tool error";
 					yield { type: "error", message: fatalMsg };
 					return;
 				}

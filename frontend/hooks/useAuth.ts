@@ -62,3 +62,23 @@ export function useLogout() {
 		},
 	};
 }
+
+export function useUploadAvatar() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.uploadAvatar,
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["auth", "me"] });
+		},
+	});
+}
+
+export function useDeleteAvatar() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.deleteAvatar,
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["auth", "me"] });
+		},
+	});
+}

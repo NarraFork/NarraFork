@@ -18,7 +18,7 @@ export type TerminalServerMessage =
 	| { type: "exit"; terminalId: string; code: number }
 	| { type: "error"; terminalId: string; message: string }
 	| { type: "requestResize"; terminalId: string }
-	| { type: "scrollback"; terminalId: string; data: string }
+	| { type: "scrollback"; terminalId: string; data: string; cols: number; rows: number }
 	| {
 			type: "bufferState";
 			terminalId: string;
@@ -79,24 +79,33 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 	ws.data.subscribedTerminals.add(terminalId);
 
 	// Replay scrollback buffer so the client sees previous output
-	const scrollback = terminalService.getScrollback(terminalId);
-	if (scrollback) {
-		try {
-			ws.send(JSON.stringify({ type: "scrollback", terminalId, data: scrollback }));
-		} catch {
-			// connection may be dead
+	terminalService.getScrollback(terminalId).then((scrollback) => {
+		if (scrollback) {
+			try {
+				ws.send(
+					JSON.stringify({
+						type: "scrollback",
+						terminalId,
+						data: scrollback.data,
+						cols: scrollback.cols,
+						rows: scrollback.rows,
+					}),
+				);
+			} catch {
+				// connection may be dead
+			}
 		}
-	}
 
-	// Send current buffer state
-	const bufferState = terminalService.getBufferState(terminalId);
-	if (bufferState) {
-		try {
-			ws.send(JSON.stringify({ type: "bufferState", terminalId, ...bufferState }));
-		} catch {
-			// noop
+		// Send current buffer state after scrollback
+		const bufferState = terminalService.getBufferState(terminalId);
+		if (bufferState) {
+			try {
+				ws.send(JSON.stringify({ type: "bufferState", terminalId, ...bufferState }));
+			} catch {
+				// noop
+			}
 		}
-	}
+	});
 }
 
 // === WebSocket handlers ===

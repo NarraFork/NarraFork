@@ -1,6 +1,8 @@
 import { toolRegistry } from "../tool-registry";
 import { askUserQuestionTool } from "./ask-user-question";
 import { bashTool } from "./bash";
+import { cancelBackgroundTaskTool } from "./cancel-background-task";
+import { checkBackgroundTaskTool } from "./check-background-task";
 import { continueTaskTool } from "./continue-task";
 import { editTool } from "./edit";
 import { globTool } from "./glob";
@@ -27,6 +29,8 @@ export function registerCoreTools(): void {
 	toolRegistry.register(exitPlanModeTool);
 	toolRegistry.register(taskTool);
 	toolRegistry.register(continueTaskTool);
+	toolRegistry.register(checkBackgroundTaskTool);
+	toolRegistry.register(cancelBackgroundTaskTool);
 	toolRegistry.register(askUserQuestionTool);
 	toolRegistry.register(skillTool);
 }

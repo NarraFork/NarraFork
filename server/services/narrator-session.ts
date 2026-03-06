@@ -40,6 +40,12 @@ import { narratorContext } from "./narrator-context";
 import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
+import {
+	handleContextOverflow,
+	handleTransientError,
+	MAX_CONTEXT_OVERFLOW_RETRIES,
+	MAX_TRANSIENT_RETRIES,
+} from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { snapshot } from "./snapshot";
@@ -109,6 +115,7 @@ interface PendingPermission {
 	cleanup: () => void;
 	input: Record<string, unknown>;
 	narratorId: string;
+	toolName: string;
 	toolUseId: string;
 	/** For subagent permissions: broadcast to parent narrator's WS channel instead of own. */
 	broadcastTargetId: string;
@@ -197,7 +204,15 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 // Task is auto-allowed when using the parent's cwd — the subagent's
 // individual tools go through their own permission checks. When Task specifies
 // a different workdir, it requires user approval (handled below).
-const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "ContinueTask", "Skill"];
+const ALWAYS_ALLOW_TOOLS = [
+	"TodoWrite",
+	"EnterPlanMode",
+	"WebSearch",
+	"ContinueTask",
+	"CheckBackgroundTask",
+	"CancelBackgroundTask",
+	"Skill",
+];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -252,7 +267,7 @@ export function resolvePermissionDecision(
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
 	// Task: auto-allow when using parent's cwd; ask when workdir differs.
-	// bypassPermissions still bypasses this; dontAsk denies it.
+	// bypassPermissions still bypasses this; dontAsk/readOnly denies it.
 	if (toolName === "Task") {
 		const workdir = input.workdir;
 		if (typeof workdir === "string" && workdir) {
@@ -260,15 +275,44 @@ export function resolvePermissionDecision(
 			const normalizedCwd = normalize(resolve(cwd));
 			if (resolved !== normalizedCwd) {
 				if (permMode === "bypassPermissions") return "allow";
-				if (permMode === "dontAsk") return "deny";
+				if (permMode === "dontAsk" || permMode === "readOnly") return "deny";
 				return "ask";
 			}
+		}
+		// readOnly: allow explore/plan subagents (read-only), deny general (has write access)
+		if (permMode === "readOnly") {
+			return input.subagent_type === "general" ? "deny" : "allow";
 		}
 		return "allow";
 	}
 
 	if (permMode === "bypassPermissions") return "allow";
 	if (permMode === "dontAsk") return "deny";
+
+	// readOnly: auto-allow read-only tools, auto-deny everything else.
+	// Bash gets special handling — whitelisted read-only commands are allowed.
+	if (permMode === "readOnly") {
+		if (READ_ONLY_TOOLS.includes(toolName)) {
+			const toolPaths = extractToolPaths(toolName, input);
+			const hasExternalPath =
+				toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
+			if (!hasExternalPath || allPathsInTruncateDir(cwd, toolPaths)) return "allow";
+			return "deny";
+		}
+		if (toolName === "Bash") {
+			if (!bashAnalysis) return "deny";
+			if (bashAnalysis.nonWhitelisted.length > 0) return "deny";
+			if (bashAnalysis.dangerousPatterns.length > 0) return "deny";
+			if (bashAnalysis.hasEnvInjection) return "deny";
+			if (bashAnalysis.hasWriteOperation) return "deny";
+			const hasExternalBashPath = bashAnalysis.filePaths.some(
+				(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+			);
+			if (hasExternalBashPath) return "deny";
+			return "allow";
+		}
+		return "deny";
+	}
 
 	// Bash: AST-based command-level security
 	if (toolName === "Bash") {
@@ -435,7 +479,9 @@ export async function handlePermission(
 		const denyMsg =
 			isChapter && branchViolations?.length
 				? `DENIED: Chapter mode restricts git branch operations. Violations: ${branchViolations.join("; ")}. You may only work on the current branch.`
-				: getToolMessage("permissionDeniedNonInteractive", locale);
+				: permMode === "readOnly"
+					? getToolMessage("permissionDeniedReadOnly", locale)
+					: getToolMessage("permissionDeniedNonInteractive", locale);
 		const decisionReason =
 			isChapter && branchViolations?.length ? branchViolations.join("; ") : undefined;
 		logger.debug("Permission auto-denied", {
@@ -661,6 +707,7 @@ export async function handlePermission(
 			cleanup,
 			input: effectiveInput,
 			narratorId,
+			toolName,
 			toolUseId,
 			broadcastTargetId: wsTarget,
 		});
@@ -675,6 +722,7 @@ export async function resolvePermission(
 	answers?: Record<string, string>,
 	feedbackText?: string,
 	compactAfter?: boolean,
+	updatedPlan?: string,
 ): Promise<void> {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -696,12 +744,22 @@ export async function resolvePermission(
 	// Clean up timeout + abort listener to prevent stale handlers from firing
 	pending.cleanup();
 
+	// Build updatedInput early so we can include it in the broadcast
+	let updatedInput: Record<string, unknown> | undefined;
+	if (answers) {
+		updatedInput = { ...pending.input, answers };
+	} else if (updatedPlan !== undefined && pending.toolName === "ExitPlanMode") {
+		updatedInput = { ...pending.input, plan: updatedPlan };
+	}
+
 	// Broadcast to all subscribers so other tabs can clear the permission banner
 	broadcastToNarrator(pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
 		toolUseId: pending.toolUseId,
+		// Include answers so other clients can update the tool call display
+		...(updatedInput ? { updatedInput } : {}),
 	});
 
 	try {
@@ -738,17 +796,18 @@ export async function resolvePermission(
 				feedbackText: feedbackText.trim(),
 			});
 		}
-		const updatedInput = answers ? { ...pending.input, answers } : pending.input;
+		const effectiveUpdatedInput = updatedInput ?? pending.input;
 
-		if (answers) {
+		if (updatedInput) {
 			try {
 				await db
 					.update(narratorToolCalls)
-					.set({ inputJson: updatedInput })
+					.set({ inputJson: effectiveUpdatedInput })
 					.where(eq(narratorToolCalls.toolUseId, pending.toolUseId));
 			} catch (err) {
-				logger.error("Failed to persist AskUserQuestion answers", {
+				logger.error("Failed to persist updated tool call input", {
 					requestId,
+					toolName: pending.toolName,
 					error: String(err),
 				});
 			}
@@ -759,7 +818,7 @@ export async function resolvePermission(
 			pendingPlanCompact.add(pending.narratorId);
 		}
 
-		pending.resolve({ behavior: "allow", updatedInput });
+		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
 
 		// If the user attached feedback text, abort the agent loop so it stops
 		// after the current tool completes instead of continuing to the next turn.
@@ -1015,13 +1074,10 @@ export function pruneToolCalls(
 	const boundaryIdx = dbMessages.findIndex((m) => m.id === boundaryMessageId);
 	if (boundaryIdx < 0) return;
 
-	// Collect IDs of top-level messages at or before the boundary
-	const pruneIds = new Set(
-		dbMessages
-			.slice(0, boundaryIdx + 1)
-			.filter((m) => !m.parentToolUseId)
-			.map((m) => m.id),
-	);
+	// Collect IDs of messages at or before the boundary.
+	// For subagent narrators all messages have parentToolUseId set, so we
+	// must NOT filter by !parentToolUseId — otherwise nothing gets pruned.
+	const pruneIds = new Set(dbMessages.slice(0, boundaryIdx + 1).map((m) => m.id));
 
 	for (const msg of dbMessages) {
 		if (pruneIds.has(msg.id) && msg.toolCalls?.length) {
@@ -1056,6 +1112,8 @@ export interface ContextManagementOptions {
 	locale: Locale;
 	model: string;
 	provider: string;
+	/** Whether this narrator is a subagent (all messages have parentToolUseId) */
+	isSubagent?: boolean;
 	/** Mutable getter/setter for the cached prune boundary */
 	getPruneBoundary: () => string | null;
 	setPruneBoundary: (id: string | null) => void;
@@ -1073,8 +1131,16 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	onContextUsage: NonNullable<EventHooks["onContextUsage"]>;
 	onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]>;
 } {
-	const { narratorId, locale, model, provider, getPruneBoundary, setPruneBoundary, onCompactDone } =
-		opts;
+	const {
+		narratorId,
+		locale,
+		model,
+		provider,
+		isSubagent: isSubagentNarrator,
+		getPruneBoundary,
+		setPruneBoundary,
+		onCompactDone,
+	} = opts;
 
 	const onContextUsage = (percentage: number) => {
 		// Dynamic pruning: 95–98%
@@ -1153,7 +1219,12 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		const newBoundary = row?.pruneBoundaryMessageId ?? null;
 		if (newBoundary === getPruneBoundary()) return null;
 		setPruneBoundary(newBoundary);
-		const msgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+		const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+		// Subagent messages all have parentToolUseId set — clear it so
+		// buildHistory treats them as top-level (same as loadSubagentHistory).
+		const msgs = isSubagentNarrator
+			? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
+			: rawMsgs;
 		if (newBoundary) pruneToolCalls(msgs, newBoundary);
 		const result = await buildHistory(msgs, model, provider, narratorId);
 		return { history: result.history, pendingToolResults: result.trailingToolResults };
@@ -1178,12 +1249,9 @@ async function runAgentLoop(
 	let loopHadError = false;
 	/** How many times we've retried after emergency compact in this runAgentLoop call. */
 	let contextOverflowRetries = 0;
-	const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 
 	/** How many consecutive transient-error retries in this runAgentLoop call. */
 	let transientRetries = 0;
-	const MAX_TRANSIENT_RETRIES = 10;
-	const TRANSIENT_RETRY_BASE_MS = 5_000;
 
 	try {
 		while (active.alive) {
@@ -1298,7 +1366,7 @@ async function runAgentLoop(
 						planMode: true,
 					});
 				},
-				onExitPlanMode: async (output) => {
+				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
 					await narratorService.updatePlanMode(narratorId, false);
 					broadcastToNarrator(narratorId, {
@@ -1306,11 +1374,12 @@ async function runAgentLoop(
 						narratorId,
 						planMode: false,
 					});
-					// Plan compact logic
+					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					if (pendingPlanCompact.has(narratorId)) {
 						pendingPlanCompact.delete(narratorId);
-						if (output) {
-							await runPlanCompact(narratorId, output);
+						const planText = await narratorService.getToolCallPlanText(toolUseId);
+						if (planText) {
+							await runPlanCompact(narratorId, planText);
 							active.conversationId = randomUUID();
 							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 							active._planApprovedContinue = "compact";
@@ -1614,120 +1683,29 @@ async function runAgentLoop(
 
 			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 			if (result.contextLengthExceeded && active.alive) {
-				contextOverflowRetries++;
-				if (contextOverflowRetries > MAX_CONTEXT_OVERFLOW_RETRIES) {
-					logger.error("Context length exceeded after max retries", { narratorId });
-					await narratorService.updateStatus(
-						narratorId,
-						"error",
-						"Context too long even after compact",
-					);
-					active.events.emit("event", {
-						type: "error",
-						data: { message: "Context too long even after compact" },
-					});
-					loopHadError = true;
-					break;
-				}
-
-				logger.warn("Context length exceeded, attempting emergency recovery", {
+				const overflow = await handleContextOverflow({
 					narratorId,
-					attempt: contextOverflowRetries,
+					locale,
 					provider: active.provider,
+					overflowRetries: contextOverflowRetries,
+					maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
+					onBroadcast(event) {
+						broadcastToNarrator(narratorId, event as Parameters<typeof broadcastToNarrator>[1]);
+					},
 				});
-				broadcastToNarrator(narratorId, {
-					type: "context_length_exceeded",
-					narratorId,
-				});
+				contextOverflowRetries = overflow.overflowRetries;
 
-				// Codex may fail before context_usage is emitted. In that case, force one
-				// max-strength prune pass first (strip tool calls up to compact boundary),
-				// then retry once before doing heavier compact.
-				if (active.provider === "codex" && contextOverflowRetries === 1) {
-					try {
-						const before = await db.query.narrators.findFirst({
-							where: eq(narrators.id, narratorId),
-							columns: { pruneBoundaryMessageId: true },
-						});
-						const pruneResult = await narratorService.computeAndUpdatePruneBoundary(
-							narratorId,
-							COMPACT_CONTEXT_USAGE_PCT,
-						);
-
-						if (pruneResult) {
-							broadcastToNarrator(narratorId, {
-								type: "prune_boundary",
-								narratorId,
-								boundaryMessageId: pruneResult.boundaryMessageId,
-								prunedPercent: pruneResult.prunedPercent,
-							});
-						}
-
-						const boundaryAdvanced =
-							!!pruneResult && pruneResult.boundaryMessageId !== before?.pruneBoundaryMessageId;
-						if (boundaryAdvanced) {
-							active._pruneBoundaryMessageId = pruneResult.boundaryMessageId;
-							logger.warn(
-								"Context length exceeded, applied aggressive prune and retrying before compact",
-								{
-									narratorId,
-									boundaryMessageId: pruneResult.boundaryMessageId,
-									prunedPercent: pruneResult.prunedPercent,
-								},
-							);
-							continue;
-						}
-					} catch (pruneErr) {
-						logger.error("Aggressive prune before compact failed", {
-							narratorId,
-							error: String(pruneErr),
-						});
-					}
+				if (overflow.action === "retry_pruned") {
+					active._pruneBoundaryMessageId = overflow.boundaryMessageId;
+					continue;
 				}
-
-				// Try compact with increasing keepPairs: 2 → 3 → 4 → ...
-				// Start with keepPairs=2 (most aggressive — compress everything except
-				// the last 2 pairs). If the compact API call itself fails because the
-				// input to summarize is too large, increase keepPairs so less content
-				// is fed into the compact request.
-				let compacted = false;
-				const maxKeepPairs = 8;
-				for (let keepPairs = 2; keepPairs <= maxKeepPairs; keepPairs++) {
-					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
-						narratorId,
-						keepPairs,
-					);
-					if (!boundaryMessageId) {
-						logger.warn("No compact boundary found", { narratorId, keepPairs });
-						break; // Not enough messages — no point trying larger keepPairs
-					}
-
-					try {
-						await runCustomCompact(narratorId, locale, boundaryMessageId);
-						active.conversationId = randomUUID();
-						broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-						compacted = true;
-						logger.info("Emergency compact succeeded, retrying", {
-							narratorId,
-							keepPairs,
-						});
-						break;
-					} catch (compactErr) {
-						logger.error("Emergency compact attempt failed", {
-							narratorId,
-							keepPairs,
-							error: String(compactErr),
-						});
-					}
-				}
-
-				if (compacted) {
-					// Retry: continue the while-loop which rebuilds history from post-compact messages
+				if (overflow.action === "retry_compacted") {
+					active.conversationId = overflow.newConversationId;
 					continue;
 				}
 
-				// All compact attempts failed — fall through to error state
-				logger.error("All emergency compact attempts failed", { narratorId });
+				// All attempts failed
+				logger.error("Context length exceeded after max retries", { narratorId });
 				await narratorService.updateStatus(narratorId, "error", "Context too long, compact failed");
 				active.events.emit("event", {
 					type: "error",
@@ -1740,52 +1718,23 @@ async function runAgentLoop(
 			// --- Transient API error: warn frontend and retry with backoff ---
 			if (result.retryableError && active.alive) {
 				transientRetries++;
-				if (transientRetries > MAX_TRANSIENT_RETRIES) {
-					logger.error("Transient error exceeded max retries", {
-						narratorId,
-						error: result.retryableError,
-						retries: transientRetries,
-					});
-					await narratorService.updateStatus(narratorId, "error", result.retryableError);
-					active.events.emit("event", {
-						type: "error",
-						data: { message: result.retryableError },
-					});
-					loopHadError = true;
-					break;
-				}
-
-				const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (transientRetries - 1), 20_000);
-				logger.warn("Transient API error, retrying", {
+				const { shouldRetry } = await handleTransientError({
 					narratorId,
 					error: result.retryableError,
-					attempt: transientRetries,
-					delayMs,
+					retryCount: transientRetries,
+					maxRetries: MAX_TRANSIENT_RETRIES,
+					signal: active.abortController.signal,
 				});
-
-				// Notify frontend about the retry
-				eventBus.emit({
-					type: "narrator:warning",
-					narratorId,
-					message: result.retryableError,
+				if (shouldRetry) {
+					continue;
+				}
+				await narratorService.updateStatus(narratorId, "error", result.retryableError);
+				active.events.emit("event", {
+					type: "error",
+					data: { message: result.retryableError },
 				});
-
-				// Wait before retrying (abort-aware)
-				await new Promise<void>((resolve) => {
-					const timer = setTimeout(resolve, delayMs);
-					const onAbort = () => {
-						clearTimeout(timer);
-						resolve();
-					};
-					if (active.abortController.signal.aborted) {
-						clearTimeout(timer);
-						resolve();
-					} else {
-						active.abortController.signal.addEventListener("abort", onAbort, { once: true });
-					}
-				});
-
-				continue;
+				loopHadError = true;
+				break;
 			}
 
 			// Reset transient retry counter on success

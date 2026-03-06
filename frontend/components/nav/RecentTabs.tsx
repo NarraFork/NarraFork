@@ -10,13 +10,15 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Box, Group, NavLink, Text, Tooltip } from "@mantine/core";
+import { Box, Group, NavLink, Paper, Stack, Text, Tooltip, UnstyledButton } from "@mantine/core";
 import {
+	IconArrowUp,
 	IconBox,
 	IconFolder,
 	IconGitBranch,
 	IconMessageCircle,
 	IconTerminal2,
+	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
@@ -203,7 +205,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		[qc],
 	);
 
-	useRecentTabsWS(narratorIds, handleWSUpdate, handleGlobalEvent);
+	const handleReconnect = useCallback(() => {
+		// After WS reconnect, refresh all tab data to catch up on missed events
+		qc.invalidateQueries({ queryKey: QUERY_KEY });
+	}, [qc]);
+
+	useRecentTabsWS(narratorIds, handleWSUpdate, handleGlobalEvent, handleReconnect);
 
 	return null;
 }
@@ -224,6 +231,13 @@ interface RecentTabListProps {
 export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentTabListProps) {
 	const { tabs, removeTab, reorderTabs } = useRecentTabs();
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const { t } = useTranslation("nav");
+
+	const [ctxMenu, setCtxMenu] = useState<{
+		x: number;
+		y: number;
+		tab: RecentTab;
+	} | null>(null);
 
 	const filtered = useMemo(
 		() =>
@@ -270,6 +284,38 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 		[removeTab],
 	);
 
+	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
+		e.preventDefault();
+		e.stopPropagation();
+		setCtxMenu({ x: e.clientX, y: e.clientY, tab });
+	}, []);
+
+	const handleMoveToTop = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		const idx = filtered.findIndex((t) => t.type === tab.type && t.id === tab.id);
+		if (idx <= 0) {
+			setCtxMenu(null);
+			return;
+		}
+		const reordered = [...filtered];
+		const [moved] = reordered.splice(idx, 1);
+		reordered.unshift(moved);
+		const otherGroup = tabs.filter((t) =>
+			filter === "project" ? t.type !== "project" : t.type === "project",
+		);
+		const full =
+			filter === "project" ? [...reordered, ...otherGroup] : [...otherGroup, ...reordered];
+		reorderTabs(full);
+		setCtxMenu(null);
+	}, [ctxMenu, filtered, tabs, filter, reorderTabs]);
+
+	const handleCtxClose = useCallback(() => {
+		if (!ctxMenu) return;
+		removeTab(ctxMenu.tab.type, ctxMenu.tab.id);
+		setCtxMenu(null);
+	}, [ctxMenu, removeTab]);
+
 	if (filtered.length === 0) return null;
 
 	const sortIds = filtered.map(tabSortId);
@@ -285,11 +331,25 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 							active={isTabActive(tab, pathname)}
 							onRemove={handleRemove}
 							onNavigate={onNavigate}
+							onContextMenu={handleContextMenu}
 							connectTop={firstTabConnected && i === 0}
 						/>
 					))}
 				</SortableContext>
 			</DndContext>
+			{ctxMenu && (
+				<TabContextMenu
+					x={ctxMenu.x}
+					y={ctxMenu.y}
+					onClose={() => setCtxMenu(null)}
+					onMoveToTop={handleMoveToTop}
+					onRemove={handleCtxClose}
+					isFirst={
+						filtered.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
+					}
+					t={t}
+				/>
+			)}
 		</Box>
 	);
 }
@@ -309,11 +369,19 @@ interface SortableTabItemProps {
 	active: boolean;
 	onRemove: (type: RecentTab["type"], id: string) => void;
 	onNavigate?: () => void;
+	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	/** When true and active, remove top border-radius to connect with nav above */
 	connectTop?: boolean;
 }
 
-function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: SortableTabItemProps) {
+function SortableTabItem({
+	tab,
+	active,
+	onRemove,
+	onNavigate,
+	onContextMenu,
+	connectTop,
+}: SortableTabItemProps) {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
 	const to =
@@ -354,6 +422,14 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 			}
 		},
 		[tab.type, tab.id, onRemove],
+	);
+
+	// Right-click context menu
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			onContextMenu(e, tab);
+		},
+		[onContextMenu, tab],
 	);
 
 	// Swipe-right to close (mobile) — only when not dragging
@@ -423,6 +499,7 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 					active={active}
 					onClick={handleClick}
 					onAuxClick={handleAuxClick}
+					onContextMenu={handleContextMenu}
 					onTouchStart={handleTouchStart}
 					onTouchMove={handleTouchMove}
 					onTouchEnd={handleTouchEnd}
@@ -431,7 +508,24 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 							{tab.title}
 						</Text>
 					}
-					description={tab.subtitle}
+					description={
+						<>
+							{tab.subtitle && (
+								<Text
+									size="xs"
+									c="dimmed"
+									truncate
+									style={{
+										direction: tab.type === "narrator" ? "rtl" : undefined,
+										textAlign: "left",
+									}}
+								>
+									{tab.subtitle}
+								</Text>
+							)}
+							{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
+						</>
+					}
 					leftSection={
 						tab.type === "project" ? (
 							<IconFolder size={14} />
@@ -441,7 +535,6 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 							<IconMessageCircle size={14} color={iconColor} />
 						)
 					}
-					rightSection={tab.type !== "project" ? <TabIndicators tab={tab} t={t} /> : undefined}
 					styles={{
 						root: {
 							cursor: "pointer",
@@ -449,13 +542,6 @@ function SortableTabItem({ tab, active, onRemove, onNavigate, connectTop }: Sort
 						},
 						label: { overflow: "hidden" },
 						section: { marginInlineEnd: 4 },
-						description: {
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							direction: tab.type === "narrator" ? "rtl" : undefined,
-							textAlign: "left",
-						},
 					}}
 				/>
 			</div>
@@ -547,5 +633,64 @@ function ViewerAvatars({ viewers, t }: ViewerAvatarsProps) {
 				)}
 			</Group>
 		</Tooltip>
+	);
+}
+
+// === Tab context menu ===
+
+interface TabContextMenuProps {
+	x: number;
+	y: number;
+	onClose: () => void;
+	onMoveToTop: () => void;
+	onRemove: () => void;
+	isFirst: boolean;
+	t: (key: string) => string;
+}
+
+function TabContextMenu({ x, y, onClose, onMoveToTop, onRemove, isFirst, t }: TabContextMenuProps) {
+	return (
+		<>
+			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
+			<div
+				style={{ position: "fixed", inset: 0, zIndex: 999 }}
+				onClick={onClose}
+				onContextMenu={(e) => {
+					e.preventDefault();
+					onClose();
+				}}
+				onKeyDown={() => {}}
+				role="presentation"
+			/>
+			<Paper
+				shadow="md"
+				p={4}
+				withBorder
+				style={{
+					position: "fixed",
+					left: x,
+					top: y,
+					zIndex: 1000,
+					minWidth: 140,
+				}}
+			>
+				<Stack gap={2}>
+					{!isFirst && (
+						<UnstyledButton px="xs" py={4} onClick={onMoveToTop} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconArrowUp size={14} />
+								<Text size="sm">{t("moveToTop")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					<UnstyledButton px="xs" py={4} onClick={onRemove} style={{ borderRadius: 4 }}>
+						<Group gap={8} wrap="nowrap">
+							<IconX size={14} />
+							<Text size="sm">{t("closeTab")}</Text>
+						</Group>
+					</UnstyledButton>
+				</Stack>
+			</Paper>
+		</>
 	);
 }

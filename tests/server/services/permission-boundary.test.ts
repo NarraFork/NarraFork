@@ -153,10 +153,6 @@ describe("resolvePermissionDecision", () => {
 		expect(resolvePermissionDecision("TodoWrite", {}, "acceptEdits", CWD)).toBe("allow");
 	});
 
-	test("TodoRead is allowed in default mode (no external paths)", () => {
-		expect(resolvePermissionDecision("TodoRead", {}, "default", CWD)).toBe("allow");
-	});
-
 	test("EnterPlanMode is always allowed", () => {
 		expect(resolvePermissionDecision("EnterPlanMode", {}, "default", CWD)).toBe("allow");
 	});

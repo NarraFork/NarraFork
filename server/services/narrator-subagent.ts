@@ -12,14 +12,14 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
-import { narratorService } from "./narrator-service";
 import {
-	buildContextManagementHooks,
-	COMPACT_CONTEXT_USAGE_PCT,
-	handlePermission,
-	pruneToolCalls,
-	runCustomCompact,
-} from "./narrator-session";
+	handleContextOverflow,
+	handleTransientError,
+	MAX_CONTEXT_OVERFLOW_RETRIES,
+	MAX_TRANSIENT_RETRIES,
+} from "./narrator-recovery";
+import { narratorService } from "./narrator-service";
+import { buildContextManagementHooks, handlePermission, pruneToolCalls } from "./narrator-session";
 
 // === Subagent type definitions ===
 
@@ -30,6 +30,8 @@ const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "Bash"]);
 const GENERAL_EXCLUDED = new Set([
 	"Task",
 	"ContinueTask",
+	"CheckBackgroundTask",
+	"CancelBackgroundTask",
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"TodoWrite",
@@ -223,33 +225,32 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		initialTrailingToolResults: trailingToolResults,
 	} = opts;
 
-	const isGeneral = subagentType === "general";
-
 	// Mutable state for compact/prune
 	let pruneBoundaryId: string | null = null;
 	let needsRestart = false;
 	let currentConversationId = randomUUID();
 	let contextLengthExceeded = false;
 	let overflowRetries = 0;
-	const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 
-	// Build context management hooks for general subagents
-	const ctxMgmt = isGeneral
-		? buildContextManagementHooks({
-				narratorId,
-				locale: locale as Locale,
-				model,
-				provider,
-				getPruneBoundary: () => pruneBoundaryId,
-				setPruneBoundary: (id) => {
-					pruneBoundaryId = id;
-				},
-				onCompactDone: () => {
-					needsRestart = true;
-					currentConversationId = randomUUID();
-				},
-			})
-		: null;
+	// Transient error retry state
+	let transientRetries = 0;
+
+	// Build context management hooks (prune + compact) for all subagent types
+	const ctxMgmt = buildContextManagementHooks({
+		narratorId,
+		locale: locale as Locale,
+		model,
+		provider,
+		isSubagent: true,
+		getPruneBoundary: () => pruneBoundaryId,
+		setPruneBoundary: (id) => {
+			pruneBoundaryId = id;
+		},
+		onCompactDone: () => {
+			needsRestart = true;
+			currentConversationId = randomUUID();
+		},
+	});
 
 	let finalText = "";
 	let hasError = false;
@@ -265,9 +266,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			model,
 		);
 
-		const hooks: EventHooks | undefined = ctxMgmt
-			? { onContextUsage: ctxMgmt.onContextUsage }
-			: undefined;
+		const hooks: EventHooks = { onContextUsage: ctxMgmt.onContextUsage };
 
 		const resolvedProvider = resolveProvider(model);
 		const config: AgentConfig = {
@@ -294,7 +293,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					locale as Locale,
 					parentNarratorId,
 				),
-			onBeforeTurn: ctxMgmt?.onBeforeTurn,
+			onBeforeTurn: ctxMgmt.onBeforeTurn,
 		};
 
 		needsRestart = false;
@@ -309,108 +308,75 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		});
 
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
-		hasError = result.hasError || !!result.retryableError;
-		if (result.retryableError) finalText = `Error: ${result.retryableError}`;
+		hasError = result.hasError;
+		if (result.retryableError && !result.hasError) {
+			// Don't mark as error yet — try transient retry below
+		}
 
+		// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 		if (result.contextLengthExceeded) {
-			if (!isGeneral || signal.aborted) {
+			if (signal.aborted) {
 				hasError = true;
 				contextLengthExceeded = true;
 				finalText = "Error: context length exceeded";
 				break;
 			}
 
-			overflowRetries++;
-
-			if (overflowRetries > MAX_CONTEXT_OVERFLOW_RETRIES) {
-				hasError = true;
-				contextLengthExceeded = true;
-				finalText = "Error: context length exceeded after compact retries";
-				break;
-			}
-
-			logger.warn("Subagent context length exceeded, attempting emergency recovery", {
+			const overflow = await handleContextOverflow({
 				narratorId,
-				parentNarratorId,
-				attempt: overflowRetries,
+				locale: locale as Locale,
 				provider: resolvedProvider,
-				subagentType,
+				overflowRetries,
+				maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
 			});
+			overflowRetries = overflow.overflowRetries;
 
-			if (resolvedProvider === "codex" && overflowRetries === 1) {
-				try {
-					const before = await narratorService.getById(narratorId);
-					const pruneResult = await narratorService.computeAndUpdatePruneBoundary(
-						narratorId,
-						COMPACT_CONTEXT_USAGE_PCT,
-					);
-					if (pruneResult?.boundaryMessageId) {
-						const boundaryAdvanced =
-							pruneResult.boundaryMessageId !== before.pruneBoundaryMessageId;
-						if (boundaryAdvanced) {
-							pruneBoundaryId = pruneResult.boundaryMessageId;
-							const rebuilt = await loadSubagentHistory(
-								narratorId,
-								model,
-								resolvedProvider,
-								pruneBoundaryId,
-							);
-							history = rebuilt.history;
-							trailingToolResults = rebuilt.trailingToolResults;
-							logger.warn("Subagent applied aggressive prune, retrying before compact", {
-								narratorId,
-								boundaryMessageId: pruneResult.boundaryMessageId,
-								prunedPercent: pruneResult.prunedPercent,
-							});
-							continue;
-						}
-					}
-				} catch (pruneErr) {
-					logger.error("Subagent aggressive prune failed", {
-						narratorId,
-						error: String(pruneErr),
-					});
-				}
-			}
-
-			let compacted = false;
-			const maxKeepPairs = 8;
-			for (let keepPairs = 2; keepPairs <= maxKeepPairs; keepPairs++) {
-				const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+			if (overflow.action === "retry_pruned") {
+				pruneBoundaryId = overflow.boundaryMessageId;
+				const rebuilt = await loadSubagentHistory(
 					narratorId,
-					keepPairs,
+					model,
+					resolvedProvider,
+					pruneBoundaryId,
 				);
-				if (!boundaryMessageId) break;
-				try {
-					await runCustomCompact(narratorId, locale as Locale, boundaryMessageId);
-					needsRestart = true;
-					currentConversationId = randomUUID();
-					compacted = true;
-					logger.info("Subagent emergency compact succeeded", {
-						narratorId,
-						keepPairs,
-						parentNarratorId,
-					});
-					break;
-				} catch (compactErr) {
-					logger.error("Subagent emergency compact attempt failed", {
-						narratorId,
-						keepPairs,
-						error: String(compactErr),
-					});
-				}
+				history = rebuilt.history;
+				trailingToolResults = rebuilt.trailingToolResults;
+				continue;
 			}
-
-			if (compacted) {
-				// Keep hasError=false and continue restart flow below.
+			if (overflow.action === "retry_compacted") {
+				needsRestart = true;
+				currentConversationId = overflow.newConversationId;
+				// Continue to the restart-after-compact flow below
 			} else {
 				hasError = true;
+				contextLengthExceeded = true;
 				finalText = "Error: context length exceeded and compact failed";
 				break;
 			}
 		}
 
-		if (!needsRestart || !isGeneral || signal.aborted || hasError) break;
+		// --- Transient API error: retry with exponential backoff ---
+		if (result.retryableError && !signal.aborted) {
+			transientRetries++;
+			const { shouldRetry } = await handleTransientError({
+				narratorId,
+				error: result.retryableError,
+				retryCount: transientRetries,
+				maxRetries: MAX_TRANSIENT_RETRIES,
+				signal,
+			});
+			if (shouldRetry) {
+				continue;
+			}
+			hasError = true;
+			finalText = `Error: ${result.retryableError}`;
+			break;
+		}
+
+		// Reset transient retry counter on success
+		transientRetries = 0;
+
+		if (!needsRestart || signal.aborted || hasError) break;
 
 		// Compact completed mid-turn — restart with fresh history
 		logger.info("Subagent restarting after compact", { narratorId, parentNarratorId });
@@ -437,6 +403,236 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	return { finalText, hasError, contextLengthExceeded };
 }
 
+// === Background task management ===
+
+/** In-memory map of background task AbortControllers for cancellation support. */
+const backgroundTaskAbortControllers = new Map<string, AbortController>();
+
+/** Maximum background task execution time (30 minutes). */
+const BACKGROUND_TASK_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Execute a background task (fire-and-forget).
+ * Updates narrator status and broadcasts events on completion/failure.
+ */
+async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
+	const { narratorId, parentNarratorId, toolUseId } = opts;
+
+	// Set a maximum execution timeout
+	const timeoutId = setTimeout(() => {
+		const ctrl = backgroundTaskAbortControllers.get(narratorId);
+		if (ctrl) ctrl.abort("Background task timeout");
+	}, BACKGROUND_TASK_TIMEOUT_MS);
+
+	try {
+		const result = await executeSubagent(opts);
+
+		const finalText = result.contextLengthExceeded
+			? "Error: context length exceeded"
+			: result.finalText;
+		const hasError = result.hasError || !!result.contextLengthExceeded;
+
+		// Finalize the subagent narrator status
+		await finalizeSubagent(
+			narratorId,
+			parentNarratorId,
+			toolUseId,
+			hasError,
+			hasError ? finalText : null,
+		);
+
+		// Update background-specific fields
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({
+				backgroundStatus: hasError ? "failed" : "completed",
+				backgroundResult: finalText || "(no output)",
+				backgroundCompletedAt: now,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, narratorId));
+
+		if (hasError) {
+			eventBus.emit({
+				type: "narrator:background_task_failed",
+				narratorId: parentNarratorId,
+				parentNarratorId,
+				taskNarratorId: narratorId,
+				toolUseId,
+				error: finalText,
+			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "background_task_failed",
+				narratorId: parentNarratorId,
+				taskNarratorId: narratorId,
+				toolUseId,
+				error: finalText,
+			});
+		} else {
+			eventBus.emit({
+				type: "narrator:background_task_completed",
+				narratorId: parentNarratorId,
+				parentNarratorId,
+				taskNarratorId: narratorId,
+				toolUseId,
+				resultPreview: (finalText || "").slice(0, 500),
+			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "background_task_completed",
+				narratorId: parentNarratorId,
+				taskNarratorId: narratorId,
+				toolUseId,
+				resultPreview: (finalText || "").slice(0, 500),
+			});
+		}
+	} catch (err) {
+		const errorText = err instanceof Error ? err.message : String(err);
+		logger.error("Background task execution failed", { narratorId, error: errorText });
+
+		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText);
+
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({
+				backgroundStatus: "failed",
+				backgroundResult: errorText,
+				backgroundCompletedAt: now,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, narratorId));
+
+		eventBus.emit({
+			type: "narrator:background_task_failed",
+			narratorId: parentNarratorId,
+			parentNarratorId,
+			taskNarratorId: narratorId,
+			toolUseId,
+			error: errorText,
+		});
+		broadcastToNarrator(parentNarratorId, {
+			type: "background_task_failed",
+			narratorId: parentNarratorId,
+			taskNarratorId: narratorId,
+			toolUseId,
+			error: errorText,
+		});
+	} finally {
+		clearTimeout(timeoutId);
+		backgroundTaskAbortControllers.delete(narratorId);
+	}
+}
+
+/**
+ * Cancel a running background task.
+ * Returns true if the task was found and cancelled.
+ */
+export async function cancelBackgroundTask(taskNarratorId: string): Promise<boolean> {
+	const ctrl = backgroundTaskAbortControllers.get(taskNarratorId);
+	if (!ctrl) return false;
+
+	ctrl.abort("Cancelled by user");
+
+	const narrator = await narratorService.getById(taskNarratorId);
+	const now = new Date().toISOString();
+	await db
+		.update(narrators)
+		.set({
+			backgroundStatus: "cancelled",
+			backgroundCompletedAt: now,
+			status: "interrupted",
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, taskNarratorId));
+
+	const parentNarratorId = narrator.parentNarratorId;
+	if (parentNarratorId) {
+		eventBus.emit({
+			type: "narrator:background_task_cancelled",
+			narratorId: parentNarratorId,
+			parentNarratorId,
+			taskNarratorId,
+			toolUseId: "",
+		});
+		broadcastToNarrator(parentNarratorId, {
+			type: "background_task_cancelled",
+			narratorId: parentNarratorId,
+			taskNarratorId,
+			toolUseId: "",
+		});
+	}
+
+	backgroundTaskAbortControllers.delete(taskNarratorId);
+	return true;
+}
+
+/**
+ * Get the status of a background task.
+ */
+export async function getBackgroundTaskStatus(taskNarratorId: string): Promise<{
+	status: string;
+	result: string | null;
+	completedAt: string | null;
+	isRunning: boolean;
+} | null> {
+	const narrator = await narratorService.getById(taskNarratorId);
+	if (!narrator.isBackground) return null;
+
+	return {
+		status: narrator.backgroundStatus ?? "unknown",
+		result: narrator.backgroundResult ?? null,
+		completedAt: narrator.backgroundCompletedAt ?? null,
+		isRunning: backgroundTaskAbortControllers.has(taskNarratorId),
+	};
+}
+
+/**
+ * Wait for a background task to complete (with timeout).
+ * Returns the task status when done or when timeout expires.
+ */
+export function waitForBackgroundTask(
+	taskNarratorId: string,
+	timeoutMs = 30000,
+): Promise<{ status: string; result: string | null }> {
+	return new Promise((resolve) => {
+		const timeout = setTimeout(() => {
+			cleanup();
+			resolve({ status: "running", result: null });
+		}, timeoutMs);
+
+		const WATCHED_EVENTS = new Set([
+			"narrator:background_task_completed",
+			"narrator:background_task_failed",
+			"narrator:background_task_cancelled",
+		]);
+
+		const handler = (event: import("../lib/event-bus").NarraForkEvent) => {
+			if (!WATCHED_EVENTS.has(event.type)) return;
+			if (!("taskNarratorId" in event) || event.taskNarratorId !== taskNarratorId) return;
+			cleanup();
+			getBackgroundTaskStatus(taskNarratorId).then((s) => {
+				resolve({ status: s?.status ?? "unknown", result: s?.result ?? null });
+			});
+		};
+
+		const cleanup = () => {
+			clearTimeout(timeout);
+			eventBus.offAny(handler);
+		};
+
+		// Check if already completed
+		getBackgroundTaskStatus(taskNarratorId).then((s) => {
+			if (s && s.status !== "running") {
+				cleanup();
+				resolve({ status: s.status, result: s.result });
+				return;
+			}
+			eventBus.onAny(handler);
+		});
+	});
+}
+
 // === Subagent runner ===
 
 export interface RunSubagentInput {
@@ -448,10 +644,13 @@ export interface RunSubagentInput {
 	signal: AbortSignal;
 	locale: string;
 	model?: string;
+	background?: boolean;
 }
 
 /**
- * Run a subagent synchronously (from the parent narrator's perspective).
+ * Run a subagent synchronously (from the parent narrator's perspective),
+ * or in background mode (fire-and-forget, returns immediately with a task ID).
+ *
  * Creates a subagent narrator, runs the agent loop, persists all messages,
  * and returns the final text result.
  */
@@ -465,6 +664,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		signal,
 		locale,
 		model: explicitModel,
+		background,
 	} = input;
 
 	const systemPrompt = await buildSubagentSystemPrompt(subagentType, cwd, locale as Locale);
@@ -486,11 +686,76 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	const model = subagent.model ?? settings.agent.defaultModel;
 	const provider = resolveProvider(model);
 
-	// 2. Broadcast subagent_started
-	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType);
-
-	// 3. Persist subagent's user message (linked to parent's tool_use)
+	// 2. Persist subagent's user message (linked to parent's tool_use)
 	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
+
+	if (background) {
+		// --- Background mode: fire-and-forget ---
+
+		// Mark narrator and tool_call as background
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ isBackground: true, backgroundStatus: "running", updatedAt: now })
+			.where(eq(narrators.id, subagentId));
+
+		// Broadcast background task started
+		broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType);
+		eventBus.emit({
+			type: "narrator:background_task_started",
+			narratorId: parentNarratorId,
+			parentNarratorId,
+			taskNarratorId: subagentId,
+			toolUseId,
+			subagentType,
+		});
+		broadcastToNarrator(parentNarratorId, {
+			type: "background_task_started",
+			narratorId: parentNarratorId,
+			taskNarratorId: subagentId,
+			toolUseId,
+			subagentType,
+		});
+
+		// Create an independent AbortController for the background task
+		// (parent's signal should not cancel background tasks)
+		const bgAbort = new AbortController();
+
+		// Store the abort controller for later cancellation
+		backgroundTaskAbortControllers.set(subagentId, bgAbort);
+
+		// Fire-and-forget execution
+		executeBackgroundTask({
+			narratorId: subagentId,
+			parentNarratorId,
+			toolUseId,
+			subagentType,
+			prompt,
+			cwd,
+			model,
+			provider,
+			locale,
+			signal: bgAbort.signal,
+			systemPrompt,
+			initialHistory: [],
+		}).catch((err) => {
+			logger.error("Background task unexpected error", {
+				subagentId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+
+		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
+		return (
+			resultPrefix +
+			"Background task started. Use CheckBackgroundTask with this ID to check status or get results."
+		);
+	}
+
+	// --- Foreground mode (existing behavior) ---
+
+	// 3. Broadcast subagent_started
+	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType);
 
 	// 4. Run via unified executor (with compact/prune for general)
 	let finalText = "";

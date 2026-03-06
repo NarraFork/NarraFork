@@ -346,10 +346,12 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 		}
 	}
 
-	// Upsert: update in place or prepend
+	// Upsert: merge into existing or prepend
 	const idx = tabs.findIndex((t) => t.type === tab.type && t.id === tab.id);
 	if (idx >= 0) {
-		tabs[idx] = tab;
+		// Merge: preserve any fields already in the stored tab (e.g. runtime-enriched fields
+		// that were previously persisted via WS-triggered upserts)
+		tabs[idx] = { ...tabs[idx], ...tab };
 	} else {
 		tabs.unshift(tab);
 	}

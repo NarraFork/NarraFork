@@ -1888,7 +1888,7 @@ export const narratorService = {
 
 	async updatePermissionMode(
 		narratorId: string,
-		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "dontAsk",
+		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "readOnly" | "dontAsk",
 	) {
 		const now = new Date().toISOString();
 		await db
@@ -2015,6 +2015,20 @@ export const narratorService = {
 					.where(eq(narratorMessages.id, tc.messageId));
 			}
 		}
+	},
+
+	/**
+	 * Retrieve the plan text from an ExitPlanMode tool call's inputJson.
+	 * The plan content is stored in inputJson.plan by handlePermission (which
+	 * resolves planFile → inline plan content before persisting).
+	 */
+	async getToolCallPlanText(toolUseId: string): Promise<string | null> {
+		const tc = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			columns: { inputJson: true },
+		});
+		const plan = (tc?.inputJson as Record<string, unknown> | null)?.plan;
+		return typeof plan === "string" && plan.trim() ? plan : null;
 	},
 
 	async remove(narratorId: string) {

@@ -96,6 +96,7 @@ interface ToolCallCardProps {
 		decision: "allow" | "deny",
 		feedbackText?: string,
 		compactAfter?: boolean,
+		updatedPlan?: string,
 	) => void;
 	/** Callback when user submits answers to AskUserQuestion */
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
@@ -980,6 +981,7 @@ export function InlinePermission({
 		decision: "allow" | "deny",
 		feedbackText?: string,
 		compactAfter?: boolean,
+		updatedPlan?: string,
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;
@@ -988,6 +990,8 @@ export function InlinePermission({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const [feedback, setFeedback] = useState("");
+	const [editing, setEditing] = useState(false);
+	const [editedPlan, setEditedPlan] = useState<string | null>(null);
 
 	// AskUserQuestion: render the full question form inline
 	if (permission.toolName === "AskUserQuestion" && Array.isArray(permission.inputJson?.questions)) {
@@ -1010,13 +1014,54 @@ export function InlinePermission({
 			? permission.inputJson.plan
 			: null;
 
+	const isExitPlan = permission.toolName === "ExitPlanMode";
+	const planEdited = editedPlan !== null && editedPlan !== planText;
+
+	const handleAllow = (compactAfter?: boolean) => {
+		onDecision?.(
+			permission.id,
+			"allow",
+			feedback || undefined,
+			compactAfter,
+			planEdited ? (editedPlan ?? undefined) : undefined,
+		);
+	};
+
+	const handleStartEdit = () => {
+		if (planText && editedPlan === null) {
+			setEditedPlan(planText);
+		}
+		setEditing(true);
+	};
+
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
 		<Box mt="xs">
-			{planText && (
+			{planText && !editing && (
 				<Box mb="xs" style={{ minHeight: 0, maxHeight: planMaxHeight, overflow: "auto" }}>
-					<ContentViewer content={planText} markdown contentType="markdown" title="Plan" />
+					{planEdited && (
+						<Badge size="xs" color="indigo" variant="light" mb={4}>
+							{t("planEdited")}
+						</Badge>
+					)}
+					<ContentViewer
+						content={editedPlan ?? planText}
+						markdown
+						contentType="markdown"
+						title="Plan"
+					/>
 				</Box>
+			)}
+			{planText && editing && (
+				<Textarea
+					mb="xs"
+					value={editedPlan ?? planText}
+					onChange={(e) => setEditedPlan(e.currentTarget.value)}
+					autosize
+					minRows={8}
+					maxRows={30}
+					styles={{ input: { fontFamily: "monospace", fontSize: "var(--mantine-font-size-xs)" } }}
+				/>
 			)}
 			{permission.decisionReason && (
 				<Text size="xs" c="dimmed" mb={4}>
@@ -1034,21 +1079,41 @@ export function InlinePermission({
 				mb="xs"
 			/>
 			<Group gap="sm">
-				<Button
-					size="sm"
-					color="green"
-					onClick={() => onDecision?.(permission.id, "allow", feedback || undefined)}
-				>
+				<Button size="sm" color="green" onClick={() => handleAllow()}>
 					{tc("allow")}
 				</Button>
-				{permission.toolName === "ExitPlanMode" && (
+				{isExitPlan && (
+					<Button size="sm" color="teal" variant="light" onClick={() => handleAllow(true)}>
+						{t("acceptAndResetContext")}
+					</Button>
+				)}
+				{isExitPlan && planText && (
 					<Button
 						size="sm"
-						color="teal"
+						color="indigo"
 						variant="light"
-						onClick={() => onDecision?.(permission.id, "allow", feedback || undefined, true)}
+						onClick={() => {
+							if (editing) {
+								setEditing(false);
+							} else {
+								handleStartEdit();
+							}
+						}}
 					>
-						{t("acceptAndResetContext")}
+						{editing ? t("planEditDone") : t("planEdit")}
+					</Button>
+				)}
+				{planEdited && (
+					<Button
+						size="sm"
+						color="gray"
+						variant="subtle"
+						onClick={() => {
+							setEditedPlan(null);
+							setEditing(false);
+						}}
+					>
+						{t("planEditReset")}
 					</Button>
 				)}
 				<Button

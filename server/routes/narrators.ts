@@ -18,6 +18,7 @@ import { Hono } from "hono";
 import { db } from "../db";
 import {
 	chapters,
+	containerInstances,
 	narratorMessages,
 	narratorPatches,
 	narrators,
@@ -59,7 +60,11 @@ import {
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
 import { snapshot } from "../services/snapshot";
-import { broadcastToNarrator, getNarratorPresenceBatch } from "../websocket/narrator-ws";
+import {
+	broadcastToNarrator,
+	getNarratorIdsWithPresence,
+	getNarratorPresenceBatch,
+} from "../websocket/narrator-ws";
 
 /** Parse message request supporting both JSON and multipart/form-data (with images) */
 export async function parseMessageRequest(
@@ -112,6 +117,12 @@ narratorRoutes.get("/", async (c) => {
 		const limit = Math.min(Number.isNaN(rawLimit) ? 20 : rawLimit, 100);
 		const cursorParam = c.req.query("cursor");
 
+		// Presence-based filters
+		const hasTerminals = c.req.query("hasTerminals") === "true";
+		const hasContainers = c.req.query("hasContainers") === "true";
+		const hasRunningContainers = c.req.query("hasRunningContainers") === "true";
+		const hasViewers = c.req.query("hasViewers") === "true";
+
 		// Build base where conditions
 		const conditions = [ne(narrators.type, "subagent")];
 
@@ -128,6 +139,37 @@ narratorRoutes.get("/", async (c) => {
 			conditions.push(isNotNull(narrators.chapterId));
 		}
 		// standalone=all with no filter: show all
+
+		// Filter: has active terminals
+		if (hasTerminals) {
+			conditions.push(
+				sql`EXISTS (SELECT 1 FROM terminals WHERE terminals.narrator_id = ${narrators.id} AND terminals.status = 'running')`,
+			);
+		}
+
+		// Filter: has containers (via chapter)
+		if (hasContainers) {
+			conditions.push(
+				sql`EXISTS (SELECT 1 FROM container_instances WHERE container_instances.chapter_id = ${narrators.chapterId})`,
+			);
+		}
+
+		// Filter: has running containers (via chapter)
+		if (hasRunningContainers) {
+			conditions.push(
+				sql`EXISTS (SELECT 1 FROM container_instances WHERE container_instances.chapter_id = ${narrators.chapterId} AND container_instances.status = 'running')`,
+			);
+		}
+
+		// Filter: has viewers (in-memory presence)
+		if (hasViewers) {
+			const viewedIds = getNarratorIdsWithPresence();
+			if (viewedIds.size === 0) {
+				// No narrators have viewers — return empty result
+				return c.json({ items: [], hasMore: false, nextCursor: null, totalCount: 0 });
+			}
+			conditions.push(sql`${narrators.id} IN ${[...viewedIds]}`);
+		}
 
 		const baseWhere = and(...conditions);
 
@@ -233,6 +275,26 @@ narratorRoutes.get("/", async (c) => {
 			}
 		}
 
+		// Batch fetch container counts per chapter (total + running)
+		const containerCounts = new Map<string, { total: number; running: number }>();
+		if (chapterIds.length > 0) {
+			const containerRows = await db
+				.select({
+					chapterId: containerInstances.chapterId,
+					total: countFn(),
+					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
+				})
+				.from(containerInstances)
+				.where(sql`${containerInstances.chapterId} IN ${chapterIds}`)
+				.groupBy(containerInstances.chapterId);
+			for (const row of containerRows) {
+				containerCounts.set(row.chapterId, {
+					total: row.total,
+					running: row.running ?? 0,
+				});
+			}
+		}
+
 		// Batch fetch presence
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 
@@ -240,6 +302,8 @@ narratorRoutes.get("/", async (c) => {
 			...n,
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
+			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
+			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
 			viewers: presenceMap.get(n.id) ?? [],
 		}));
 
@@ -444,7 +508,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	const id = c.req.param("id");
 	const { permissionMode } = await c.req.json();
-	const validModes = ["default", "acceptEdits", "bypassPermissions", "dontAsk"];
+	const validModes = ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"];
 	if (!permissionMode || !validModes.includes(permissionMode)) {
 		throw new ValidationError(`permissionMode must be one of: ${validModes.join(", ")}`);
 	}
@@ -511,9 +575,11 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 
 // Mark narrator as read (done → idle)
 // Error sessions are preserved because only status=done can transition.
+// Subagents are skipped — their done/error status must be preserved for ContinueTask.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
+	if (narrator.type === "subagent") return c.json({ ok: true });
 	if (narrator.status === "done" && !narrator.errorMessage) {
 		await narratorService.updateStatus(id, "idle");
 	}
@@ -796,6 +862,49 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 			{ error: `Restore failed: ${err instanceof Error ? err.message : String(err)}` },
 			500,
 		);
+	}
+
+	return c.json({ success: true });
+});
+
+// === Background task routes ===
+
+/**
+ * GET /api/narrators/:id/background-tasks
+ * List all background tasks spawned by this narrator.
+ */
+narratorRoutes.get("/:id/background-tasks", async (c) => {
+	const parentNarratorId = c.req.param("id");
+	const tasks = await db
+		.select({
+			id: narrators.id,
+			subagentType: narrators.subagentType,
+			backgroundStatus: narrators.backgroundStatus,
+			backgroundResult: narrators.backgroundResult,
+			backgroundCompletedAt: narrators.backgroundCompletedAt,
+			status: narrators.status,
+			createdAt: narrators.createdAt,
+			title: narrators.title,
+		})
+		.from(narrators)
+		.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, true)))
+		.orderBy(desc(narrators.createdAt));
+
+	return c.json(tasks);
+});
+
+/**
+ * POST /api/narrators/:id/background-tasks/:taskId/cancel
+ * Cancel a running background task.
+ */
+narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
+	const taskId = c.req.param("taskId");
+
+	const { cancelBackgroundTask } = await import("../services/narrator-subagent");
+	const cancelled = await cancelBackgroundTask(taskId);
+
+	if (!cancelled) {
+		return c.json({ error: "Task is not running or does not exist" }, 404);
 	}
 
 	return c.json({ success: true });

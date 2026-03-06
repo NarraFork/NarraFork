@@ -75,7 +75,7 @@ export const SubagentCard = memo(
 		const { t } = useTranslation("narrator");
 		const navigate = useNavigate();
 		const input = toolCall.inputJson ?? {};
-		const isBackground = !!input.run_in_background;
+		const isBackground = !!input.background || !!input.run_in_background;
 		const agentType = input.subagent_type ?? "agent";
 		const isBgWarning = isBackground && !/^explore$/i.test(agentType);
 		const dismissed =
@@ -326,6 +326,11 @@ export const SubagentCard = memo(
 							<Badge size="xs" variant="light" color="indigo">
 								{agentType}
 							</Badge>
+							{isBackground && (
+								<Badge size="xs" variant="light" color="blue">
+									{t("backgroundBadge")}
+								</Badge>
+							)}
 							{resolvedModel && (
 								<Badge size="xs" variant="light" color="violet">
 									{resolvedModel}

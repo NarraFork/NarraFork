@@ -156,6 +156,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Bash",
 	"Task",
 	"ContinueTask",
+	"CheckBackgroundTask",
+	"CancelBackgroundTask",
 	"AskUserQuestion",
 	"Skill",
 ]);

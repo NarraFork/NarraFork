@@ -6,8 +6,10 @@ import {
 	Card,
 	Checkbox,
 	Group,
+	Indicator,
 	Loader,
 	Modal,
+	Popover,
 	SegmentedControl,
 	Select,
 	Stack,
@@ -19,7 +21,11 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import {
 	IconArchive,
+	IconBox,
+	IconEye,
+	IconFilter,
 	IconFolder,
+	IconPlayerPlay,
 	IconSortAscending,
 	IconSortDescending,
 	IconStar,
@@ -47,19 +53,71 @@ import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import { formatRelativeTime } from "../../lib/format";
+
+interface NarratorSearchParams {
+	create?: boolean;
+	sortBy?: string;
+	sortOrder?: string;
+	filter?: string;
+	hasTerminals?: boolean;
+	hasContainers?: boolean;
+	hasRunningContainers?: boolean;
+	hasViewers?: boolean;
+}
+
+const parseBool = (v: unknown) => v === true || v === "true";
 
 export const Route = createFileRoute("/narrators/")({
 	component: NarratorsPage,
-	validateSearch: (search: Record<string, unknown>) => ({
-		create: search.create === true || search.create === "true" || false,
+	validateSearch: (search: Record<string, unknown>): NarratorSearchParams => ({
+		create: parseBool(search.create) || undefined,
+		sortBy: typeof search.sortBy === "string" ? search.sortBy : undefined,
+		sortOrder: typeof search.sortOrder === "string" ? search.sortOrder : undefined,
+		filter: typeof search.filter === "string" ? search.filter : undefined,
+		hasTerminals: parseBool(search.hasTerminals) || undefined,
+		hasContainers: parseBool(search.hasContainers) || undefined,
+		hasRunningContainers: parseBool(search.hasRunningContainers) || undefined,
+		hasViewers: parseBool(search.hasViewers) || undefined,
 	}),
 });
 
 function NarratorsPage() {
-	const { create } = Route.useSearch();
-	const [sortBy, setSortBy] = useState("updatedAt");
-	const [sortOrder, setSortOrder] = useState("desc");
-	const [filter, setFilter] = useState("all"); // "all" | "standalone" | "chapter"
+	const search = Route.useSearch();
+	const navigate = useNavigate();
+
+	const sortBy = search.sortBy ?? "updatedAt";
+	const sortOrder = search.sortOrder ?? "desc";
+	const filter = search.filter ?? "all";
+	const hasTerminals = search.hasTerminals ?? false;
+	const hasContainers = search.hasContainers ?? false;
+	const hasRunningContainers = search.hasRunningContainers ?? false;
+	const hasViewers = search.hasViewers ?? false;
+
+	// Helper to update search params while preserving others
+	const setSearch = useCallback(
+		(patch: Partial<NarratorSearchParams>) => {
+			navigate({
+				to: "/narrators",
+				search: (prev: NarratorSearchParams) => {
+					const next = { ...prev, ...patch };
+					// Strip defaults to keep URL clean
+					if (next.sortBy === "updatedAt") next.sortBy = undefined;
+					if (next.sortOrder === "desc") next.sortOrder = undefined;
+					if (next.filter === "all") next.filter = undefined;
+					if (!next.hasTerminals) next.hasTerminals = undefined;
+					if (!next.hasContainers) next.hasContainers = undefined;
+					if (!next.hasRunningContainers) next.hasRunningContainers = undefined;
+					if (!next.hasViewers) next.hasViewers = undefined;
+					if (!next.create) next.create = undefined;
+					return next;
+				},
+				replace: true,
+			});
+		},
+		[navigate],
+	);
+
 	const {
 		data: paginatedData,
 		isLoading,
@@ -71,6 +129,10 @@ function NarratorsPage() {
 		filter: filter === "all" ? undefined : filter,
 		sortBy,
 		sortOrder,
+		hasTerminals: hasTerminals || undefined,
+		hasContainers: hasContainers || undefined,
+		hasRunningContainers: hasRunningContainers || undefined,
+		hasViewers: hasViewers || undefined,
 	});
 	const narrators = useMemo(
 		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
@@ -81,7 +143,6 @@ function NarratorsPage() {
 	const [opened, { open, close }] = useDisclosure(false);
 	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
-	const { i18n } = useTranslation();
 	const [cwd, setCwd] = useState("");
 	const [selectedModel, setSelectedModel] = useState("");
 	const [planMode, setPlanMode] = useState(false);
@@ -91,15 +152,14 @@ function NarratorsPage() {
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
 	const qc = useQueryClient();
-	const navigate = useNavigate();
 
 	// Auto-open create modal when navigated with ?create=true
 	useEffect(() => {
-		if (create) {
+		if (search.create) {
 			open();
-			navigate({ to: "/narrators", search: { create: false }, replace: true });
+			setSearch({ create: undefined });
 		}
-	}, [create, open, navigate]);
+	}, [search.create, open, setSearch]);
 
 	const { groupedModels, settingsData } = useAllModels();
 
@@ -119,6 +179,10 @@ function NarratorsPage() {
 					filter: filter === "all" ? undefined : filter,
 					sortBy,
 					sortOrder,
+					hasTerminals: hasTerminals || undefined,
+					hasContainers: hasContainers || undefined,
+					hasRunningContainers: hasRunningContainers || undefined,
+					hasViewers: hasViewers || undefined,
 				},
 			],
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -168,7 +232,13 @@ function NarratorsPage() {
 		[t],
 	);
 
-	const toggleSortOrder = () => setSortOrder((prev) => (prev === "desc" ? "asc" : "desc"));
+	const activeFilterCount =
+		(hasTerminals ? 1 : 0) +
+		(hasContainers ? 1 : 0) +
+		(hasRunningContainers ? 1 : 0) +
+		(hasViewers ? 1 : 0);
+
+	const toggleSortOrder = () => setSearch({ sortOrder: sortOrder === "desc" ? "asc" : "desc" });
 
 	const handleNarratorClick = useCallback(
 		(narratorId: string) => {
@@ -225,19 +295,79 @@ function NarratorsPage() {
 					<SegmentedControl
 						size="xs"
 						value={filter}
-						onChange={setFilter}
+						onChange={(v) => setSearch({ filter: v })}
 						data={[
 							{ value: "all", label: t("filterAll") },
 							{ value: "standalone", label: t("filterStandalone") },
 							{ value: "chapter", label: t("filterChapter") },
 						]}
 					/>
+					<Popover width={220} position="bottom-end" shadow="md">
+						<Popover.Target>
+							<Indicator size={16} label={activeFilterCount} disabled={activeFilterCount === 0}>
+								<ActionIcon variant="subtle" size="sm">
+									<IconFilter size={16} />
+								</ActionIcon>
+							</Indicator>
+						</Popover.Target>
+						<Popover.Dropdown>
+							<Stack gap="xs">
+								<Text size="xs" fw={500} c="dimmed">
+									{t("filterMenuTitle")}
+								</Text>
+								<Checkbox
+									size="xs"
+									label={
+										<Group gap={6}>
+											<IconTerminal2 size={14} />
+											{t("filterHasTerminals")}
+										</Group>
+									}
+									checked={hasTerminals}
+									onChange={(e) => setSearch({ hasTerminals: e.currentTarget.checked })}
+								/>
+								<Checkbox
+									size="xs"
+									label={
+										<Group gap={6}>
+											<IconBox size={14} />
+											{t("filterHasContainers")}
+										</Group>
+									}
+									checked={hasContainers}
+									onChange={(e) => setSearch({ hasContainers: e.currentTarget.checked })}
+								/>
+								<Checkbox
+									size="xs"
+									label={
+										<Group gap={6}>
+											<IconPlayerPlay size={14} />
+											{t("filterHasRunningContainers")}
+										</Group>
+									}
+									checked={hasRunningContainers}
+									onChange={(e) => setSearch({ hasRunningContainers: e.currentTarget.checked })}
+								/>
+								<Checkbox
+									size="xs"
+									label={
+										<Group gap={6}>
+											<IconEye size={14} />
+											{t("filterHasViewers")}
+										</Group>
+									}
+									checked={hasViewers}
+									onChange={(e) => setSearch({ hasViewers: e.currentTarget.checked })}
+								/>
+							</Stack>
+						</Popover.Dropdown>
+					</Popover>
 					<Select
 						size="xs"
 						w={140}
 						data={sortOptions}
 						value={sortBy}
-						onChange={(v) => v && setSortBy(v)}
+						onChange={(v) => v && setSearch({ sortBy: v })}
 						allowDeselect={false}
 					/>
 					<Tooltip label={sortOrder === "desc" ? t("sortDescending") : t("sortAscending")}>
@@ -260,15 +390,77 @@ function NarratorsPage() {
 			<Stack gap="xs" hiddenFrom="sm">
 				<Group justify="space-between">
 					<Title order={3}>{t("title")}</Title>
-					<Button size="xs" onClick={open}>
-						{t("newNarrator")}
-					</Button>
+					<Group gap="xs">
+						<Popover width={220} position="bottom-end" shadow="md">
+							<Popover.Target>
+								<Indicator size={16} label={activeFilterCount} disabled={activeFilterCount === 0}>
+									<ActionIcon variant="subtle" size="sm">
+										<IconFilter size={16} />
+									</ActionIcon>
+								</Indicator>
+							</Popover.Target>
+							<Popover.Dropdown>
+								<Stack gap="xs">
+									<Text size="xs" fw={500} c="dimmed">
+										{t("filterMenuTitle")}
+									</Text>
+									<Checkbox
+										size="xs"
+										label={
+											<Group gap={6}>
+												<IconTerminal2 size={14} />
+												{t("filterHasTerminals")}
+											</Group>
+										}
+										checked={hasTerminals}
+										onChange={(e) => setSearch({ hasTerminals: e.currentTarget.checked })}
+									/>
+									<Checkbox
+										size="xs"
+										label={
+											<Group gap={6}>
+												<IconBox size={14} />
+												{t("filterHasContainers")}
+											</Group>
+										}
+										checked={hasContainers}
+										onChange={(e) => setSearch({ hasContainers: e.currentTarget.checked })}
+									/>
+									<Checkbox
+										size="xs"
+										label={
+											<Group gap={6}>
+												<IconPlayerPlay size={14} />
+												{t("filterHasRunningContainers")}
+											</Group>
+										}
+										checked={hasRunningContainers}
+										onChange={(e) => setSearch({ hasRunningContainers: e.currentTarget.checked })}
+									/>
+									<Checkbox
+										size="xs"
+										label={
+											<Group gap={6}>
+												<IconEye size={14} />
+												{t("filterHasViewers")}
+											</Group>
+										}
+										checked={hasViewers}
+										onChange={(e) => setSearch({ hasViewers: e.currentTarget.checked })}
+									/>
+								</Stack>
+							</Popover.Dropdown>
+						</Popover>
+						<Button size="xs" onClick={open}>
+							{t("newNarrator")}
+						</Button>
+					</Group>
 				</Group>
 				<SegmentedControl
 					size="xs"
 					fullWidth
 					value={filter}
-					onChange={setFilter}
+					onChange={(v) => setSearch({ filter: v })}
 					data={[
 						{ value: "all", label: t("filterAll") },
 						{ value: "standalone", label: t("filterStandalone") },
@@ -281,7 +473,7 @@ function NarratorsPage() {
 						style={{ flex: 1 }}
 						data={sortOptions}
 						value={sortBy}
-						onChange={(v) => v && setSortBy(v)}
+						onChange={(v) => v && setSearch({ sortBy: v })}
 						allowDeselect={false}
 					/>
 					<Tooltip label={sortOrder === "desc" ? t("sortDescending") : t("sortAscending")}>
@@ -312,8 +504,11 @@ function NarratorsPage() {
 							userId: string;
 							username: string;
 							avatarColor: string | null;
+							avatarImageId: string | null;
 						}> = narrator.viewers ?? [];
 						const activeTerminals: number = narrator.activeTerminalCount ?? 0;
+						const containers: number = narrator.containerCount ?? 0;
+						const runningContainers: number = narrator.runningContainerCount ?? 0;
 						const chapter = narrator.chapter;
 						return (
 							<Card
@@ -338,12 +533,44 @@ function NarratorsPage() {
 									e.currentTarget.style.transform = "";
 								}}
 							>
-								<Group justify="space-between" wrap="nowrap">
-									<div style={{ flex: 1, minWidth: 0 }}>
-										<Group gap="xs" wrap="wrap">
-											<Text fw={500}>
+								{/* ── Desktop card layout ── */}
+								<Stack gap={4} visibleFrom="sm">
+									<Group justify="space-between" wrap="nowrap">
+										<Group gap="xs" style={{ minWidth: 0 }}>
+											<Text fw={500} truncate>
 												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 											</Text>
+											{chapter && (
+												<Badge size="xs" variant="outline" color="indigo">
+													{chapter.title}
+												</Badge>
+											)}
+										</Group>
+										<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+											{viewers.length > 0 && (
+												<Tooltip
+													label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
+												>
+													<Avatar.Group spacing="xs">
+														{viewers.slice(0, 3).map((v) => (
+															<UserAvatar
+																key={v.userId}
+																username={v.username}
+																avatarColor={v.avatarColor}
+																avatarImageId={v.avatarImageId}
+																userId={v.userId}
+																size="sm"
+																showTooltip={false}
+															/>
+														))}
+														{viewers.length > 3 && (
+															<Avatar size="sm" radius="xl">
+																+{viewers.length - 3}
+															</Avatar>
+														)}
+													</Avatar.Group>
+												</Tooltip>
+											)}
 											{narrator.status === "thinking" && (
 												<Loader size={14} color={narrator.planMode ? "green" : undefined} />
 											)}
@@ -362,69 +589,179 @@ function NarratorsPage() {
 														{tn(`status_${narrator.status}`)}
 													</Badge>
 												)}
-											{chapter && (
-												<Badge size="xs" variant="outline" color="indigo">
-													{chapter.title}
-												</Badge>
-											)}
-										</Group>
-										<Group gap="xs">
-											<Text size="sm" c="dimmed">
-												{t("narratorMeta", {
-													model: narrator.model,
-													count: narrator.messageCount ?? 0,
-												})}
-											</Text>
-											{activeTerminals > 0 && (
-												<Badge
-													size="xs"
-													variant="light"
-													color="teal"
-													leftSection={<IconTerminal2 size={10} />}
+											<Tooltip label={t("archive")}>
+												<ActionIcon
+													size="sm"
+													color="orange"
+													variant="subtle"
+													onClick={(e: React.MouseEvent) => {
+														e.stopPropagation();
+														setConfirmArchiveId(narrator.id);
+													}}
 												>
-													{activeTerminals}
+													<IconArchive size={16} />
+												</ActionIcon>
+											</Tooltip>
+										</Group>
+									</Group>
+									<Group gap="xs" wrap="nowrap">
+										<Text size="sm" c="dimmed" truncate>
+											{t("narratorMeta", {
+												model: narrator.model,
+												count: narrator.messageCount ?? 0,
+											})}
+										</Text>
+										{activeTerminals > 0 && (
+											<Badge
+												size="xs"
+												variant="light"
+												color="teal"
+												leftSection={<IconTerminal2 size={10} />}
+											>
+												{activeTerminals}
+											</Badge>
+										)}
+										{containers > 0 && (
+											<Badge
+												size="xs"
+												variant="light"
+												color={runningContainers > 0 ? "green" : "gray"}
+												leftSection={<IconBox size={10} />}
+											>
+												{runningContainers}/{containers}
+											</Badge>
+										)}
+										<Text size="xs" c="dimmed" style={{ marginLeft: "auto", whiteSpace: "nowrap" }}>
+											{formatRelativeTime(
+												sortBy === "updatedAt" ? narrator.updatedAt : narrator.createdAt,
+											)}
+										</Text>
+									</Group>
+									{(chapter?.projectName || narrator.cwd) && (
+										<Text size="xs" c="dimmed" truncate>
+											{[
+												chapter?.projectName &&
+													t("projectLabel", {
+														name: chapter.projectName,
+													}),
+												narrator.cwd && t("cwdLabel", { path: narrator.cwd }),
+											]
+												.filter(Boolean)
+												.join(" · ")}
+										</Text>
+									)}
+								</Stack>
+
+								{/* ── Mobile card layout ── */}
+								<Stack gap={4} hiddenFrom="sm">
+									<Group justify="space-between" wrap="nowrap">
+										<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
+											{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
+										</Text>
+										<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+											{narrator.status === "thinking" && (
+												<Loader size={12} color={narrator.planMode ? "green" : undefined} />
+											)}
+											{narrator.status === "thinking" && narrator.planMode && (
+												<Badge size="xs" color="green">
+													{tn("status_planning")}
 												</Badge>
 											)}
+											{narrator.status &&
+												narrator.status !== "idle" &&
+												narrator.status !== "thinking" && (
+													<Badge
+														size="xs"
+														color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}
+													>
+														{tn(`status_${narrator.status}`)}
+													</Badge>
+												)}
 										</Group>
-										{chapter?.projectName && (
-											<Text size="xs" c="dimmed" truncate>
-												{t("projectLabel", { name: chapter.projectName })}
-											</Text>
-										)}
-										{narrator.cwd && (
-											<Text size="xs" c="dimmed" truncate>
-												{t("cwdLabel", { path: narrator.cwd })}
-											</Text>
-										)}
-									</div>
+									</Group>
 									<Group gap="xs" wrap="nowrap">
-										{viewers.length > 0 && (
-											<Tooltip
-												label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
-											>
-												<Avatar.Group spacing="xs">
-													{viewers.slice(0, 3).map((v) => (
-														<UserAvatar
-															key={v.userId}
-															username={v.username}
-															avatarColor={v.avatarColor}
-															size="sm"
-															showTooltip={false}
-														/>
-													))}
-													{viewers.length > 3 && (
-														<Avatar size="sm" radius="xl">
-															+{viewers.length - 3}
-														</Avatar>
-													)}
-												</Avatar.Group>
-											</Tooltip>
-										)}
-										<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
-											{new Date(
-												sortBy === "updatedAt" ? narrator.updatedAt : narrator.createdAt,
-											).toLocaleDateString(i18n.language)}
+										<Text size="xs" c="dimmed" truncate>
+											{t("narratorMeta", {
+												model: narrator.model,
+												count: narrator.messageCount ?? 0,
+											})}
 										</Text>
+										{activeTerminals > 0 && (
+											<Badge
+												size="xs"
+												variant="light"
+												color="teal"
+												leftSection={<IconTerminal2 size={10} />}
+											>
+												{activeTerminals}
+											</Badge>
+										)}
+										{containers > 0 && (
+											<Badge
+												size="xs"
+												variant="light"
+												color={runningContainers > 0 ? "green" : "gray"}
+												leftSection={<IconBox size={10} />}
+											>
+												{runningContainers}/{containers}
+											</Badge>
+										)}
+									</Group>
+									{chapter && (
+										<Badge
+											size="xs"
+											variant="outline"
+											color="indigo"
+											style={{ alignSelf: "flex-start" }}
+										>
+											{chapter.title}
+										</Badge>
+									)}
+									{(chapter?.projectName || narrator.cwd) && (
+										<Text size="xs" c="dimmed" truncate>
+											{[
+												chapter?.projectName &&
+													t("projectLabel", {
+														name: chapter.projectName,
+													}),
+												narrator.cwd && t("cwdLabel", { path: narrator.cwd }),
+											]
+												.filter(Boolean)
+												.join(" · ")}
+										</Text>
+									)}
+									<Group justify="space-between" wrap="nowrap" mt={2}>
+										<Group gap="xs" wrap="nowrap">
+											{viewers.length > 0 && (
+												<Tooltip
+													label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
+												>
+													<Avatar.Group spacing="xs">
+														{viewers.slice(0, 3).map((v) => (
+															<UserAvatar
+																key={v.userId}
+																username={v.username}
+																avatarColor={v.avatarColor}
+																avatarImageId={v.avatarImageId}
+																userId={v.userId}
+																size="sm"
+																showTooltip={false}
+															/>
+														))}
+														{viewers.length > 3 && (
+															<Avatar size="sm" radius="xl">
+																+{viewers.length - 3}
+															</Avatar>
+														)}
+													</Avatar.Group>
+												</Tooltip>
+											)}
+											<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+												{formatRelativeTime(
+													sortBy === "updatedAt" ? narrator.updatedAt : narrator.createdAt,
+												)}
+											</Text>
+										</Group>
 										<Tooltip label={t("archive")}>
 											<ActionIcon
 												size="sm"
@@ -439,7 +776,7 @@ function NarratorsPage() {
 											</ActionIcon>
 										</Tooltip>
 									</Group>
-								</Group>
+								</Stack>
 							</Card>
 						);
 					})}

@@ -40,6 +40,8 @@ export interface UseNarratorPanelWSOptions {
 	/** Narrator prop for initial todos */
 	narratorTodosJson?: TodoItem[] | null;
 	narratorTodosToolUseId?: string | null;
+	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for ContinueTask */
+	isSubagent?: boolean;
 }
 
 export interface UseNarratorPanelWSReturn {
@@ -56,6 +58,7 @@ export interface UseNarratorPanelWSReturn {
 		answers?: Record<string, string>,
 		feedbackText?: string,
 		compactAfter?: boolean,
+		updatedPlan?: string,
 	) => void;
 	// Streaming
 	streamingRef: React.RefObject<string>;
@@ -99,6 +102,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		scrollToBottom,
 		narratorTodosJson,
 		narratorTodosToolUseId,
+		isSubagent,
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -279,6 +283,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				answers?: Record<string, string>,
 				feedbackText?: string,
 				compactAfter?: boolean,
+				updatedPlan?: string,
 		  ) => void)
 		| null
 	>(null);
@@ -322,6 +327,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			decision: "allow" | "deny",
 			feedbackText?: string,
 			compactAfter?: boolean,
+			updatedPlan?: string,
 		) => {
 			sendPermissionDecisionRef.current?.(
 				requestId,
@@ -330,8 +336,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				undefined,
 				feedbackText,
 				compactAfter,
+				updatedPlan,
 			);
-			const { toolUseId } = resolveAndRemovePerm(requestId);
+			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
 			if (toolUseId) {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
@@ -348,7 +355,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						});
 						return anyChanged ? { ...old, pages } : old;
 					}
-					return mergeFieldsByIndex(old, toolUseId, { status: "running" }, toolUseIndexRef.current);
+					// Optimistically update inputJson when plan was edited
+					const inputUpdate =
+						updatedPlan !== undefined && perm?.inputJson
+							? { inputJson: { ...perm.inputJson, plan: updatedPlan } }
+							: {};
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ status: "running", ...inputUpdate },
+						toolUseIndexRef.current,
+					);
 				});
 			}
 		},
@@ -779,7 +796,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
-			onPermissionResolved: (_requestId, toolUseId) => {
+			onPermissionResolved: (_requestId, toolUseId, updatedInput) => {
 				if (toolUseId) {
 					setPendingPermsMap((prev) => {
 						if (!prev.has(toolUseId)) return prev;
@@ -792,7 +809,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						return mergeFieldsByIndex(
 							old,
 							toolUseId,
-							{ status: "running", startedAt: Date.now() },
+							{
+								status: "running",
+								startedAt: Date.now(),
+								// Sync answers from other clients (e.g. AskUserQuestion)
+								...(updatedInput ? { inputJson: updatedInput } : {}),
+							},
 							toolUseIndexRef.current,
 						);
 					});
@@ -945,6 +967,53 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearStreamingState();
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
+			onBackgroundTaskCompleted: (_taskNarratorId, toolUseId, resultPreview) => {
+				// Update the tool call status in cache to reflect completion
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const result = updateToolCallByIndex(
+						old,
+						toolUseId,
+						"success",
+						[{ type: "text", text: resultPreview }],
+						toolUseIndexRef.current,
+					);
+					return result;
+				});
+			},
+			onBackgroundTaskFailed: (_taskNarratorId, toolUseId, error) => {
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					let result = updateToolCallByIndex(
+						old,
+						toolUseId,
+						"fail",
+						[{ type: "text", text: error }],
+						toolUseIndexRef.current,
+					);
+					if (result) {
+						result = mergeFieldsByIndex(
+							result,
+							toolUseId,
+							{ errorMessage: error },
+							toolUseIndexRef.current,
+						);
+					}
+					return result;
+				});
+			},
+			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					return updateToolCallByIndex(
+						old,
+						toolUseId,
+						"fail",
+						[{ type: "text", text: "Cancelled" }],
+						toolUseIndexRef.current,
+					);
+				});
+			},
 		},
 		lastMessageId,
 	);
@@ -1024,6 +1093,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Mark "done" narrator as read ---
 	useEffect(() => {
+		// Subagents must stay in done/error so ContinueTask can pick them up.
+		if (isSubagent) return;
 		// Preserve error sessions: do not auto-clear done->idle when an error exists.
 		if (narratorStatus === "done" && !narratorErrorMessage) {
 			// Optimistically update cache so the UI reflects "idle" immediately,
@@ -1033,7 +1104,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			);
 			api.markNarratorRead(narratorId).catch(() => {});
 		}
-	}, [narratorId, narratorStatus, narratorErrorMessage, qc]);
+	}, [narratorId, narratorStatus, narratorErrorMessage, isSubagent, qc]);
 
 	// --- Derive isCompacting from persisted messages ---
 	useEffect(() => {

@@ -79,6 +79,7 @@ export async function registerUser(username: string, password: string, language?
 				username: users.username,
 				role: users.role,
 				avatarColor: users.avatarColor,
+				avatarImageId: users.avatarImageId,
 				createdAt: users.createdAt,
 			});
 
@@ -124,6 +125,7 @@ export async function loginUser(username: string, password: string) {
 			username: user.username,
 			role: user.role,
 			avatarColor: user.avatarColor,
+			avatarImageId: user.avatarImageId,
 			createdAt: user.createdAt,
 		},
 		token,

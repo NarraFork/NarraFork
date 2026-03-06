@@ -107,6 +107,38 @@ export type NarraForkEvent =
 			parentNarratorId: string;
 			toolUseId: string;
 	  }
+	// Background task lifecycle
+	| {
+			type: "narrator:background_task_started";
+			narratorId: string;
+			parentNarratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+			subagentType: string;
+	  }
+	| {
+			type: "narrator:background_task_completed";
+			narratorId: string;
+			parentNarratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+			resultPreview: string;
+	  }
+	| {
+			type: "narrator:background_task_failed";
+			narratorId: string;
+			parentNarratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+			error: string;
+	  }
+	| {
+			type: "narrator:background_task_cancelled";
+			narratorId: string;
+			parentNarratorId: string;
+			taskNarratorId: string;
+			toolUseId: string;
+	  }
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }

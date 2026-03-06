@@ -1,6 +1,7 @@
 import { Badge, Group, Stack, Text, Tooltip, UnstyledButton } from "@mantine/core";
 import { IconGitCommit, IconRobot } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
+import { formatRelativeTime } from "../../lib/format";
 
 interface Commit {
 	id: string;
@@ -28,20 +29,6 @@ const SOURCE_COLORS: Record<string, string> = {
 	cherry_pick: "grape",
 	initial: "blue",
 };
-
-function formatRelativeTime(dateStr: string): string {
-	const ts = new Date(dateStr).getTime();
-	if (Number.isNaN(ts)) return "";
-	const diff = Date.now() - ts;
-	if (diff < 0) return "<1m";
-	const mins = Math.floor(diff / 60000);
-	if (mins < 1) return "<1m";
-	if (mins < 60) return `${mins}m`;
-	const hours = Math.floor(mins / 60);
-	if (hours < 24) return `${hours}h`;
-	const days = Math.floor(hours / 24);
-	return `${days}d`;
-}
 
 function CommitRow({ commit }: { commit: Commit }) {
 	return (

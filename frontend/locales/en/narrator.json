@@ -55,6 +55,7 @@
 	"perm_default": "Default",
 	"perm_acceptEdits": "Accept Edits",
 	"perm_bypassPermissions": "Bypass All",
+	"perm_readOnly": "Read Only",
 	"perm_plan": "Plan",
 	"perm_dontAsk": "Don't Ask",
 	"reasoningEffort": "Reasoning Effort",
@@ -95,6 +96,10 @@
 	"expandEdits": "Expand edits",
 	"collapseEdits": "Collapse edits",
 	"acceptAndResetContext": "Accept & Reset Context",
+	"planEdit": "Edit Plan",
+	"planEditDone": "Done Editing",
+	"planEditReset": "Reset",
+	"planEdited": "Edited",
 	"pruneBoundaryLabel": "↑ Tool call details above are pruned to save context",
 	"prunedPercent": "Pruned: {{percent}}%",
 	"contextUsagePercent": "Context: {{percent}}%",
@@ -118,5 +123,12 @@
 	"commandSourceUser": "User",
 	"commandSourceProject": "Project",
 	"subagentBadge": "Subagent",
-	"subagentReadOnly": "Read-only view of subagent session"
+	"subagentReadOnly": "Read-only view of subagent session",
+	"backgroundBadge": "Background",
+	"backgroundRunning": "Running in background...",
+	"backgroundCompleted": "Background task completed",
+	"backgroundFailed": "Background task failed",
+	"backgroundCancelled": "Background task cancelled",
+	"backgroundTaskCompletedTitle": "Background Task Completed",
+	"backgroundTaskFailedTitle": "Background Task Failed"
 }

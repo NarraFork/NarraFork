@@ -126,6 +126,13 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		// We set this flag during write() to distinguish those from real user input.
 		const writingRef = useRef(false);
 
+		// Pending data queue: buffers WS data arriving before xterm is initialized
+		type PendingData =
+			| { type: "output"; data: string }
+			| { type: "scrollback"; data: string; dims: { cols: number; rows: number } };
+		const pendingDataRef = useRef<PendingData[]>([]);
+		const termReadyRef = useRef(false);
+
 		// Pinch-to-zoom state
 		const pinchingRef = useRef(false);
 		const pinchBaseDistRef = useRef(0);
@@ -183,14 +190,34 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 		const { write, resize, disconnected } = useTerminalWS(terminalId, {
 			onOutput: (data) => {
+				if (!termReadyRef.current) {
+					pendingDataRef.current.push({ type: "output", data });
+					return;
+				}
 				writingRef.current = true;
 				termRef.current?.write(data);
 				writingRef.current = false;
 			},
-			onScrollback: (data) => {
+			onScrollback: (data, dims) => {
+				if (!termReadyRef.current) {
+					// Scrollback is a full snapshot — replace all pending data
+					pendingDataRef.current = [{ type: "scrollback", data, dims }];
+					return;
+				}
+				const term = termRef.current;
+				const fitAddon = fitAddonRef.current;
+				if (!term) return;
 				writingRef.current = true;
-				termRef.current?.write(data);
+				// Resize to match the server-side buffer dimensions so line wrapping is correct
+				term.resize(dims.cols, dims.rows);
+				term.reset();
+				term.write(data);
 				writingRef.current = false;
+				// Fit back to actual container size and notify server
+				if (fitAddon) {
+					fitAddon.fit();
+					resize(term.cols, term.rows);
+				}
 			},
 			onExit: (code) => {
 				termRef.current?.write(`\r\n${t("processExited", { code })}\r\n`);
@@ -247,6 +274,24 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 			termRef.current = term;
 			fitAddonRef.current = fitAddon;
+			termReadyRef.current = true;
+
+			// Flush any data received before xterm was ready
+			if (pendingDataRef.current.length > 0) {
+				writingRef.current = true;
+				for (const pending of pendingDataRef.current) {
+					if (pending.type === "scrollback") {
+						term.resize(pending.dims.cols, pending.dims.rows);
+						term.reset();
+					}
+					term.write(pending.data);
+				}
+				writingRef.current = false;
+				pendingDataRef.current = [];
+				// Fit to actual container size after replaying scrollback
+				fitAddon.fit();
+				resize(term.cols, term.rows);
+			}
 
 			term.onData((data) => {
 				// During term.write() (PTY output processing), xterm.js may
@@ -483,6 +528,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			container.addEventListener("touchend", onLongPressEnd, { passive: true });
 
 			return () => {
+				termReadyRef.current = false;
+				pendingDataRef.current = [];
 				disposeOsc52();
 				selDisposable.dispose();
 				resizeObserver.disconnect();

@@ -12,22 +12,9 @@ import { IconDots } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitLog, useGitReset } from "../../hooks/useGit";
+import { formatRelativeTime } from "../../lib/format";
 
 const LIMIT = 50;
-
-function formatRelativeTime(dateStr: string): string {
-	const ts = new Date(dateStr).getTime();
-	if (Number.isNaN(ts)) return "";
-	const diff = Date.now() - ts;
-	if (diff < 0) return "<1m";
-	const mins = Math.floor(diff / 60000);
-	if (mins < 1) return "<1m";
-	if (mins < 60) return `${mins}m`;
-	const hours = Math.floor(mins / 60);
-	if (hours < 24) return `${hours}h`;
-	const days = Math.floor(hours / 24);
-	return `${days}d`;
-}
 
 export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");

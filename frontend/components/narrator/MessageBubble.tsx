@@ -55,6 +55,8 @@ interface MessageBubbleProps {
 		requestId: string,
 		decision: "allow" | "deny",
 		feedbackText?: string,
+		compactAfter?: boolean,
+		updatedPlan?: string,
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;

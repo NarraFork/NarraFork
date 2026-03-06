@@ -206,7 +206,7 @@ export const narrators = sqliteTable(
 		model: text("model").default("claude-sonnet"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
-			enum: ["default", "acceptEdits", "bypassPermissions", "dontAsk"],
+			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"],
 		}).default("default"),
 		reasoningEffort: text("reasoning_effort", {
 			enum: ["low", "medium", "high", "xhigh"],
@@ -229,6 +229,13 @@ export const narrators = sqliteTable(
 			(): any => narratorMessages.id,
 		),
 		prunedPercent: integer("pruned_percent"),
+		// Background task fields
+		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
+		backgroundStatus: text("background_status", {
+			enum: ["running", "completed", "failed", "cancelled"],
+		}),
+		backgroundResult: text("background_result"),
+		backgroundCompletedAt: text("background_completed_at"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -318,6 +325,7 @@ export const narratorToolCalls = sqliteTable(
 		permissionDenyMessage: text("permission_deny_message"),
 		permissionDecisionReason: text("permission_decision_reason"),
 		permissionSuggestions: text("permission_suggestions", { mode: "json" }),
+		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -474,6 +482,7 @@ export const users = sqliteTable("users", {
 		.notNull()
 		.default("user"),
 	avatarColor: text("avatar_color"),
+	avatarImageId: text("avatar_image_id"),
 	createdAt: text("created_at").notNull(),
 });
 
