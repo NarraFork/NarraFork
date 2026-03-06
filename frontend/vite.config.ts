@@ -85,6 +85,12 @@ export default defineConfig(({ mode }) => {
 					target: `http://localhost:${backendPort}`,
 					changeOrigin: true,
 				},
+				// NOTE: WS proxy via Vite does NOT work when Vite runs under
+				// `bunx` because Bun's node:http compat layer mishandles HTTP 101
+				// upgrade responses.  WebSocket connections are routed directly to
+				// the backend via the VITE_BACKEND_WS env var instead (see
+				// frontend/lib/ws.ts).  The entry below is kept so that if Vite is
+				// ever run with real Node.js, the proxy will work out of the box.
 				"/ws": {
 					target: `http://localhost:${backendPort}`,
 					ws: true,

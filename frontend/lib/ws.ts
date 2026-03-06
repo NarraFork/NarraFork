@@ -1,16 +1,19 @@
 /**
  * Build a WebSocket URL for the given path (e.g. "/ws/narrator").
  *
- * In development, when the page is served through an IDE port-forward that
- * does NOT proxy WebSocket upgrades, set `VITE_WS_URL` to the backend
- * origin (e.g. "ws://localhost:7779") so WS connections bypass the
- * port-forward and hit the backend directly.
+ * Bun's `node:http` compatibility layer does not correctly handle HTTP 101
+ * upgrade responses (it fires `response` instead of `upgrade`), which breaks
+ * Vite's http-proxy WebSocket forwarding when Vite runs under `bunx`.
  *
- * Falls back to deriving the URL from `window.location` (works when the
- * browser talks to Vite or the production server directly).
+ * To work around this, set `VITE_BACKEND_WS` to the backend origin
+ * (e.g. "ws://localhost:7778") so WebSocket connections bypass Vite's proxy
+ * and connect to the backend directly.
+ *
+ * In production (or when the env var is unset and the page is served by the
+ * backend itself), the URL is derived from `window.location`.
  */
 export function buildWsUrl(path: string, query?: string): string {
-	const override = import.meta.env.VITE_WS_URL as string | undefined;
+	const override = import.meta.env.VITE_BACKEND_WS as string | undefined;
 	if (override) {
 		const base = override.replace(/\/+$/, "");
 		return `${base}${path}${query ? `?${query}` : ""}`;
