@@ -18,7 +18,7 @@
 		"wake": "唤醒",
 		"delete": "删除",
 		"deleteConfirmTitle": "删除章节",
-		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，此操作不可撤销。",
+		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，对话将保留为只读。",
 		"cancel": "取消"
 	},
 	"sidePanel": {

@@ -1,5 +1,16 @@
-import { Alert, Button, Modal, Select, Stack, Text, Textarea, TextInput } from "@mantine/core";
+import {
+	Alert,
+	Button,
+	Group,
+	Modal,
+	Select,
+	Stack,
+	Text,
+	Textarea,
+	TextInput,
+} from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
@@ -20,7 +31,12 @@ export function ChapterForkModal({
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
 	const [inheritMode, setInheritMode] = useState<string>("fresh");
+	const [forkedChapter, setForkedChapter] = useState<{
+		id: string;
+		title: string;
+	} | null>(null);
 	const qc = useQueryClient();
+	const navigate = useNavigate();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
 
@@ -35,6 +51,7 @@ export function ChapterForkModal({
 		setTitle("");
 		setDescription("");
 		setInheritMode("fresh");
+		setForkedChapter(null);
 	};
 
 	const handleClose = () => {
@@ -50,12 +67,50 @@ export function ChapterForkModal({
 				inheritMode,
 				forkAtMessageUuid,
 			}),
-		onSuccess: () => {
+		onSuccess: (data) => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
-			handleClose();
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			if (data?.id) {
+				setForkedChapter({ id: data.id, title: data.title ?? title.trim() });
+			} else {
+				handleClose();
+			}
 		},
 	});
+
+	const goToForkedChapter = async () => {
+		if (!forkedChapter) return;
+		// Find the primary narrator of the new chapter
+		const narrators = await api.listNarrators({ chapterId: forkedChapter.id });
+		const primary = narrators?.find(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+			(n: any) => n.type === "primary",
+		);
+		handleClose();
+		if (primary?.id) {
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: primary.id } });
+		} else {
+			navigate({ to: "/chapters/$chapterId", params: { chapterId: forkedChapter.id } });
+		}
+	};
+
+	// Success prompt: ask user whether to navigate to the new branch
+	if (forkedChapter) {
+		return (
+			<Modal opened={opened} onClose={handleClose} title={t("forkSuccess")} centered>
+				<Stack>
+					<Text size="sm">{t("forkNavigatePrompt", { title: forkedChapter.title })}</Text>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={handleClose}>
+							{t("stayHere")}
+						</Button>
+						<Button onClick={goToForkedChapter}>{t("goToFork")}</Button>
+					</Group>
+				</Stack>
+			</Modal>
+		);
+	}
 
 	return (
 		<Modal opened={opened} onClose={handleClose} title={t("forkChapter")}>

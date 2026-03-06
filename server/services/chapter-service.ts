@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -23,6 +23,7 @@ import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
+import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
@@ -368,43 +369,20 @@ export const chapterService = {
 				throw new ValidationError("Cannot delete root chapter");
 			}
 
-			// Unbind narrators instead of deleting them — preserve conversation history.
-			// Subagents and archived narrators are deleted; others are detached.
+			const now = new Date().toISOString();
+
+			// Detach narrators and archive them (read-only, user can delete later)
 			const chapterNarrators = await db.query.narrators.findMany({
 				where: eq(narrators.chapterId, id),
 			});
-
-			const toDelete = chapterNarrators.filter(
-				(n) => n.type === "subagent" || n.status === "archived",
-			);
-			const toDetach = chapterNarrators.filter(
-				(n) => n.type !== "subagent" && n.status !== "archived",
-			);
-
-			for (const narrator of toDelete) {
-				await narratorService.remove(narrator.id);
+			for (const narrator of chapterNarrators) {
+				interruptNarrator(narrator.id);
 			}
-
-			if (toDetach.length > 0) {
-				const now = new Date().toISOString();
+			if (chapterNarrators.length > 0) {
 				await db
 					.update(narrators)
-					.set({
-						chapterId: null,
-						// Preserve worktree path as cwd so the narrator retains a working directory
-						cwd: chapter.worktreePath ?? narrators.cwd,
-						updatedAt: now,
-					})
-					.where(
-						inArray(
-							narrators.id,
-							toDetach.map((n) => n.id),
-						),
-					);
-				logger.info("Detached narrators from chapter", {
-					chapterId: id,
-					detached: toDetach.map((n) => n.id),
-				});
+					.set({ chapterId: null, status: "archived", updatedAt: now })
+					.where(eq(narrators.chapterId, id));
 			}
 
 			// Kill running terminals and delete records
@@ -423,7 +401,7 @@ export const chapterService = {
 				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
 			}
 
-			// Clean up git resources
+			// Clean up git resources (worktree + branch)
 			if (chapter.worktreePath) {
 				const project = await db.query.projects.findFirst({
 					where: eq(projects.id, chapter.projectId),
@@ -450,6 +428,7 @@ export const chapterService = {
 				.set({ mergedIntoChapterId: null })
 				.where(eq(chapters.mergedIntoChapterId, id));
 
+			// Delete the chapter record
 			await db.delete(chapters).where(eq(chapters.id, id));
 			eventBus.emit({ type: "chapter:abandoned", chapterId: id });
 		});
