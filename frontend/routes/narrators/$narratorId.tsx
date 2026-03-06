@@ -50,14 +50,15 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterTitle = (chapter as any)?.title as string | undefined;
 	useEffect(() => {
-		if (!narratorTitle || isSubagent) return;
+		if (!narrator || isSubagent) return;
+		const displayTitle = narratorTitle || chapterTitle || "Chapter";
 		if (chapterId) {
 			// Chapter-bound narrator: record as chapter tab
 			addRecentTab({
 				type: "chapter",
 				id: chapterId,
 				narratorId: narratorId,
-				title: narratorTitle || "Chapter",
+				title: displayTitle,
 				subtitle: chapterTitle,
 				status: narratorStatus,
 			});
@@ -66,12 +67,21 @@ function NarratorDetailPage() {
 			addRecentTab({
 				type: "narrator",
 				id: narratorId,
-				title: narratorTitle || "New conversation",
+				title: displayTitle || "New conversation",
 				subtitle: narratorCwd,
 				status: narratorStatus,
 			});
 		}
-	}, [narratorId, chapterId, narratorTitle, narratorCwd, narratorStatus, chapterTitle, isSubagent]);
+	}, [
+		narratorId,
+		chapterId,
+		narrator,
+		narratorTitle,
+		narratorCwd,
+		narratorStatus,
+		chapterTitle,
+		isSubagent,
+	]);
 
 	// Mark narrator as read (done → idle) when visiting the narrator page.
 	// Preserve error sessions: if errorMessage exists, keep it in error state.

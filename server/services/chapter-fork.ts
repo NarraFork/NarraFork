@@ -149,6 +149,7 @@ export const chapterFork = {
 					primaryNarrator.id,
 					input.forkAtMessageUuid ?? null,
 					{
+						title: input.title,
 						newChapterId: id,
 						inheritMode,
 						locale: input.locale,
