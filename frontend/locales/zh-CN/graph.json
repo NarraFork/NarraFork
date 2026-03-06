@@ -15,7 +15,10 @@
 			"exploration": "探索"
 		},
 		"dormant": "休眠",
-		"wake": "唤醒"
+		"wake": "唤醒",
+		"delete": "删除",
+		"deleteConfirmTitle": "删除章节",
+		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，此操作不可撤销。"
 	},
 	"sidePanel": {
 		"upstreamUpdates": "上游有更新",

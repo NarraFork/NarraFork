@@ -90,8 +90,10 @@ export function buildGraph(
 
 	const edges: GraphEdge[] = edgeRows.map((e) => ({
 		id: e.id,
-		source: e.sourceId,
-		target: e.targetId,
+		// Swap source/target for merge edges so dagre ranks the merge destination
+		// (trunk) above the merged branch in top-to-bottom layout
+		source: e.type === "merge" ? e.targetId : e.sourceId,
+		target: e.type === "merge" ? e.sourceId : e.targetId,
 		type: e.type,
 		metadata: e.metadata,
 	}));

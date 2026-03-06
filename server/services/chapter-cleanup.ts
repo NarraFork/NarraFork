@@ -128,7 +128,8 @@ export const chapterCleanup = {
 				where: eq(chapters.id, chapterId),
 			});
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
-			if (chapter.status !== "dormant") throw new ValidationError("Can only wake dormant chapters");
+			if (chapter.status !== "dormant" && chapter.status !== "merged")
+				throw new ValidationError("Can only wake dormant or merged chapters");
 
 			const gitPath = await getProjectGitPath(chapter.projectId);
 			if (!gitPath) throw new ValidationError("Project has no git repository configured");
@@ -144,7 +145,16 @@ export const chapterCleanup = {
 			try {
 				await db
 					.update(chapters)
-					.set({ status: "active", worktreePath, lastAccessedAt: now, updatedAt: now })
+					.set({
+						status: "active",
+						worktreePath,
+						lastAccessedAt: now,
+						updatedAt: now,
+						// Clear merge metadata when waking a merged chapter
+						...(chapter.status === "merged"
+							? { mergedIntoChapterId: null, mergeCommitSha: null, mergeStrategy: null }
+							: {}),
+					})
 					.where(eq(chapters.id, chapterId));
 			} catch (dbErr) {
 				logger.error("DB update failed during wake, removing orphan worktree", {

@@ -15,7 +15,10 @@
 			"exploration": "Exploration"
 		},
 		"dormant": "Set Dormant",
-		"wake": "Wake Up"
+		"wake": "Wake Up",
+		"delete": "Delete",
+		"deleteConfirmTitle": "Delete Chapter",
+		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? This will remove the worktree and branch. This action cannot be undone."
 	},
 	"sidePanel": {
 		"upstreamUpdates": "Upstream updates",
