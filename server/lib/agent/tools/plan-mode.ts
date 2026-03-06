@@ -55,6 +55,8 @@ export const exitPlanModeTool: ToolDefinition = {
 		const { plan, planFile } = args as { plan?: string; planFile?: string };
 		const cwd = ctx?.cwd ?? process.cwd();
 		const planFileId = ctx?.planFileId;
+		const locale = (ctx?.locale as Locale) ?? "en";
+		const ok = { output: getToolMessage("exitPlanModeOutput", locale) };
 
 		// Validate: exactly one of plan or planFile must be provided.
 		// Exception: if neither is provided but a plan file exists on disk, use it automatically.
@@ -69,12 +71,12 @@ export const exitPlanModeTool: ToolDefinition = {
 		if (planFile) {
 			const validation = validatePlanFile(cwd, planFile);
 			if (validation.isError) return validation;
-			return { output: "Plan submitted. Awaiting user approval." };
+			return ok;
 		}
 
 		// If inline plan is provided, return confirmation
 		if (plan) {
-			return { output: "Plan submitted. Awaiting user approval." };
+			return ok;
 		}
 
 		// Neither provided — try to auto-detect the plan file from planFileId
@@ -84,7 +86,7 @@ export const exitPlanModeTool: ToolDefinition = {
 			if (existsSync(absPath)) {
 				const validation = validatePlanFile(cwd, autoPath);
 				if (validation.isError) return validation;
-				return { output: "Plan submitted. Awaiting user approval." };
+				return ok;
 			}
 		}
 

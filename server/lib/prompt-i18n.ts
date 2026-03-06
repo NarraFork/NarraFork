@@ -296,6 +296,10 @@ const toolMessages = {
 		en: "Entered plan mode. Analyze and plan before making changes.",
 		"zh-CN": "已进入计划模式。请先分析和规划，再进行修改。",
 	},
+	exitPlanModeOutput: {
+		en: "Plan approved.",
+		"zh-CN": "计划已批准。",
+	},
 	exitPlanModeApproved: {
 		en: "The user approved your plan. You may now begin execution.",
 		"zh-CN": "用户批准了你的计划，可以开始执行。",

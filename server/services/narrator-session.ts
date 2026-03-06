@@ -1067,6 +1067,10 @@ function triggerMidTurnCompact(
  *
  * Mutates the messages in place.
  */
+/** Tool names whose tool_use + tool_result pairs should survive pruning
+ *  so the model retains critical context (e.g. the approved plan). */
+const PRUNE_PROTECTED_TOOLS = new Set(["ExitPlanMode"]);
+
 export function pruneToolCalls(
 	dbMessages: import("../lib/agent/provider").DbMessage[],
 	boundaryMessageId: string,
@@ -1081,7 +1085,8 @@ export function pruneToolCalls(
 
 	for (const msg of dbMessages) {
 		if (pruneIds.has(msg.id) && msg.toolCalls?.length) {
-			msg.toolCalls = [];
+			const kept = msg.toolCalls.filter((tc) => PRUNE_PROTECTED_TOOLS.has(tc.toolName));
+			msg.toolCalls = kept.length > 0 ? kept : [];
 		}
 	}
 }

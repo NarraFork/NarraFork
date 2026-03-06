@@ -882,20 +882,14 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 }
 
 function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight?: number }) {
-	// Plan content from inputJson.plan is shown by InlinePermission during approval.
-	// Here we only render after completion, using outputJson or falling back to inputJson.plan.
+	// Plan content lives in inputJson.plan (populated by handlePermission).
+	// outputJson is just a short confirmation message after approval.
 	const planText =
 		toolCall.status === "success" || toolCall.status === "fail"
-			? typeof toolCall.outputJson === "string"
-				? toolCall.outputJson
-				: toolCall.outputJson?._truncated
-					? (toolCall.outputJson.preview as string)
-					: typeof toolCall.inputJson?.plan === "string"
-						? toolCall.inputJson.plan
-						: ""
+			? typeof toolCall.inputJson?.plan === "string"
+				? toolCall.inputJson.plan
+				: ""
 			: "";
-
-	const outputTruncated = isTruncated(toolCall.outputJson);
 
 	if (!planText) {
 		return null;
@@ -909,7 +903,6 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 				contentType="markdown"
 				title={`Plan — ${toolCall.toolName}`}
 			/>
-			{outputTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 		</Box>
 	);
 }
