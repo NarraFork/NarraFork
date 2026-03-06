@@ -23,6 +23,7 @@ import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
+import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
@@ -368,12 +369,20 @@ export const chapterService = {
 				throw new ValidationError("Cannot delete root chapter");
 			}
 
-			// Delete all narrators bound to this chapter (conversations are removed together)
+			const now = new Date().toISOString();
+
+			// Detach narrators and archive them (read-only, user can delete later)
 			const chapterNarrators = await db.query.narrators.findMany({
 				where: eq(narrators.chapterId, id),
 			});
 			for (const narrator of chapterNarrators) {
-				await narratorService.remove(narrator.id);
+				interruptNarrator(narrator.id);
+			}
+			if (chapterNarrators.length > 0) {
+				await db
+					.update(narrators)
+					.set({ chapterId: null, status: "archived", updatedAt: now })
+					.where(eq(narrators.chapterId, id));
 			}
 
 			// Kill running terminals and delete records

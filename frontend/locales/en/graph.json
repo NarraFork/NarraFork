@@ -18,7 +18,7 @@
 		"wake": "Wake Up",
 		"delete": "Delete",
 		"deleteConfirmTitle": "Delete Chapter",
-		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? This will remove the worktree, branch, and all conversations. This action cannot be undone.",
+		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? The worktree and branch will be removed. Conversations will be preserved as read-only.",
 		"cancel": "Cancel"
 	},
 	"sidePanel": {

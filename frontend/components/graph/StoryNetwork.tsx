@@ -13,6 +13,7 @@ import "@xyflow/react/dist/style.css";
 import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
+import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import { useStoryGraph } from "@frontend/hooks/useStoryGraph";
 import { api } from "@frontend/lib/api";
 import { Box, Button, Group, Modal, Stack, Text } from "@mantine/core";
@@ -79,6 +80,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	});
 
 	const deleteChapter = useDeleteChapter();
+	const { removeTab } = useRecentTabs();
 
 	const [selectedNode, setSelectedNode] = useState<SelectedNodeData | null>(null);
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -209,10 +211,12 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 			onSuccess: () => {
 				queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
 				queryClient.invalidateQueries({ queryKey: ["narrators"] });
+				// Remove the chapter tab from recent tabs to prevent ghost entries
+				removeTab("chapter", deleteTarget.id);
 				setDeleteTarget(null);
 			},
 		});
-	}, [deleteTarget, deleteChapter, queryClient]);
+	}, [deleteTarget, deleteChapter, queryClient, removeTab]);
 
 	if (isLoading) {
 		return (
