@@ -51,9 +51,9 @@ function NarratorDetailPage() {
 	const chapterTitle = (chapter as any)?.title as string | undefined;
 	useEffect(() => {
 		if (!narrator || isSubagent) return;
-		const displayTitle = narratorTitle || chapterTitle || "Chapter";
 		if (chapterId) {
 			// Chapter-bound narrator: record as chapter tab
+			const displayTitle = narratorTitle || chapterTitle || "Chapter";
 			addRecentTab({
 				type: "chapter",
 				id: chapterId,
@@ -67,7 +67,7 @@ function NarratorDetailPage() {
 			addRecentTab({
 				type: "narrator",
 				id: narratorId,
-				title: displayTitle || "New conversation",
+				title: narratorTitle || "New conversation",
 				subtitle: narratorCwd,
 				status: narratorStatus,
 			});
