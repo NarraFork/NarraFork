@@ -16,9 +16,9 @@
 		},
 		"dormant": "休眠",
 		"wake": "唤醒",
-		"delete": "删除",
-		"deleteConfirmTitle": "删除章节",
-		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，此操作不可撤销。",
+		"delete": "归档",
+		"deleteConfirmTitle": "归档章节",
+		"deleteConfirmMessage": "确定要归档章节「{{title}}」吗？章节和对话将变为只读，工作树将被移除。",
 		"cancel": "取消"
 	},
 	"sidePanel": {

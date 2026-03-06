@@ -16,9 +16,9 @@
 		},
 		"dormant": "Set Dormant",
 		"wake": "Wake Up",
-		"delete": "Delete",
-		"deleteConfirmTitle": "Delete Chapter",
-		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? This will remove the worktree and branch. This action cannot be undone.",
+		"delete": "Archive",
+		"deleteConfirmTitle": "Archive Chapter",
+		"deleteConfirmMessage": "Are you sure you want to archive chapter \"{{title}}\"? The chapter and conversations will become read-only, and the worktree will be removed.",
 		"cancel": "Cancel"
 	},
 	"sidePanel": {
