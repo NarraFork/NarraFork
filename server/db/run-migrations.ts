@@ -78,7 +78,13 @@ async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolder> {
  */
 function isAlreadyExistsError(err: unknown): boolean {
 	const msg = String(err);
-	return msg.includes("already exists");
+	if (msg.includes("already exists")) return true;
+	// DrizzleError wraps the original SQLiteError in `cause`
+	if (err instanceof Error && err.cause) {
+		const causeMsg = String(err.cause);
+		if (causeMsg.includes("already exists")) return true;
+	}
+	return false;
 }
 
 /**
