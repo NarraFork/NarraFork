@@ -62,14 +62,29 @@ export const bashTool: ToolDefinition = {
 		}
 
 		try {
-			const shell = detectShell();
-			const proc = spawn(command, {
-				shell,
-				cwd,
-				env: { ...process.env, HOME: getHome() },
-				stdio: ["ignore", "pipe", "pipe"],
-				detached: true,
-			});
+			const shellInfo = detectShell();
+			const env = { ...process.env, HOME: getHome(), ...shellInfo.extraEnv };
+
+			// On Windows with Git Bash we must use login-shell mode so that
+			// /etc/profile is sourced and PATH is properly converted from
+			// Windows format to POSIX format.  Without this, tools like node,
+			// npm, git etc. are invisible to the spawned bash process.
+			let spawnArgs: [string, string[], object];
+			if (shellInfo.loginWrap) {
+				spawnArgs = [
+					shellInfo.path,
+					["--login", "-c", command],
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+				];
+			} else {
+				spawnArgs = [
+					command,
+					[],
+					{ shell: shellInfo.path, cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+				];
+			}
+
+			const proc = spawn(...spawnArgs);
 
 			let output = "";
 			let timedOut = false;

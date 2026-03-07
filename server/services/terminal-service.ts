@@ -15,7 +15,7 @@ import { spawnBunTerminal } from "../terminal/runtime-bun";
 import { spawnPortablePty } from "../terminal/runtime-pty";
 import { sendToTerminal } from "../websocket/terminal-ws";
 
-const DEFAULT_SHELL = detectShell();
+const DEFAULT_SHELL = detectShell().path;
 
 export interface TerminalProcessInfo {
 	pid: number;

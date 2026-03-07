@@ -66,30 +66,81 @@ export async function killTree(
 
 const SHELL_BLACKLIST = new Set(["fish", "nu"]);
 
+export interface ShellInfo {
+	/** Path to the shell executable. */
+	path: string;
+	/**
+	 * Extra environment variables to inject when spawning commands with this shell.
+	 * For Git Bash on Windows this includes MSYS2_PATH_TYPE=inherit so that
+	 * /etc/profile converts and inherits the Windows PATH.
+	 */
+	extraEnv: Record<string, string>;
+	/**
+	 * Whether to wrap the command as `bash --login -c '<command>'` instead of
+	 * using Node's `shell` option.  Required for Git Bash on Windows so that
+	 * /etc/profile is sourced and PATH is properly set up.
+	 */
+	loginWrap: boolean;
+}
+
 /**
  * Pick a shell suitable for non-interactive command execution.
  *
  * Reads $SHELL but filters out shells with incompatible syntax (fish, nu).
  * Falls back to platform-appropriate defaults. Result is cached.
  */
-let _cachedShell: string | undefined;
-export function detectShell(): string {
-	if (_cachedShell) return _cachedShell;
+let _cachedShellInfo: ShellInfo | undefined;
+export function detectShell(): ShellInfo {
+	if (_cachedShellInfo) return _cachedShellInfo;
+
+	let shellPath: string | undefined;
+	const extraEnv: Record<string, string> = {};
+	let loginWrap = false;
+
 	const env = process.env.SHELL;
 	if (env) {
 		const name = path.basename(env);
 		if (!SHELL_BLACKLIST.has(name)) {
-			_cachedShell = env;
-			return env;
+			shellPath = env;
 		}
 	}
-	// Platform fallbacks
-	if (process.platform === "win32") {
-		_cachedShell = Bun.which("bash") ?? Bun.which("sh") ?? "cmd.exe";
-	} else if (process.platform === "darwin") {
-		_cachedShell = "/bin/zsh";
-	} else {
-		_cachedShell = Bun.which("bash") ?? "/bin/sh";
+
+	if (!shellPath) {
+		if (process.platform === "win32") {
+			shellPath = Bun.which("bash") ?? Bun.which("sh") ?? "cmd.exe";
+		} else if (process.platform === "darwin") {
+			shellPath = "/bin/zsh";
+		} else {
+			shellPath = Bun.which("bash") ?? "/bin/sh";
+		}
 	}
-	return _cachedShell;
+
+	// Git Bash on Windows: enable login-shell wrapping so /etc/profile is
+	// sourced and PATH is converted from Windows to POSIX format.
+	if (process.platform === "win32" && isGitBash(shellPath)) {
+		loginWrap = true;
+		// Tell MSYS2/Git Bash to inherit the Windows PATH entries
+		extraEnv.MSYS2_PATH_TYPE = "inherit";
+	}
+
+	_cachedShellInfo = { path: shellPath, extraEnv, loginWrap };
+	return _cachedShellInfo;
+}
+
+/** Check whether a shell path points to Git Bash / MSYS2 bash. */
+function isGitBash(shellPath: string): boolean {
+	const lower = shellPath.toLowerCase().replace(/\\/g, "/");
+	return (
+		lower.endsWith("/bash.exe") ||
+		lower.endsWith("/bash") ||
+		lower.includes("/git/") ||
+		lower.includes("/msys")
+	);
+}
+
+/**
+ * @deprecated Use `detectShell().path` instead. Kept for backward compat.
+ */
+export function detectShellPath(): string {
+	return detectShell().path;
 }

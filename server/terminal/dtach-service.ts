@@ -136,7 +136,7 @@ export const dtachService = {
 	}): Promise<{ proc: import("bun").Subprocess }> {
 		this.init();
 		const socketPath = this.getSocketPath(opts.terminalId);
-		const shell = detectShell();
+		const shell = detectShell().path;
 
 		// dtach -n: create new session without attaching
 		// -z: disable suspend (Ctrl+Z doesn't detach)
