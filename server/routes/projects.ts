@@ -6,6 +6,7 @@ import { chapters, explorationGroups, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getHome } from "../lib/platform";
 import { projectDbManager } from "../lib/project-db";
 import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
@@ -42,7 +43,7 @@ projectRoutes.post("/", async (c) => {
 	let gitPath = body.gitPath.trim();
 	// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
 	if (gitPath.startsWith("~/") || gitPath === "~") {
-		gitPath = gitPath.replace("~", process.env.HOME ?? "/root");
+		gitPath = gitPath.replace("~", getHome());
 	}
 	gitPath = resolve(gitPath);
 

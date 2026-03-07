@@ -154,6 +154,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"Bash",
+	"Shell",
 	"Task",
 	"ContinueTask",
 	"CheckBackgroundTask",

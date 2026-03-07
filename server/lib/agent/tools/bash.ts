@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
+import { getHome, IS_WINDOWS } from "../../platform";
 import { detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -9,18 +10,25 @@ import type { ToolDefinition, ToolResult } from "../types";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
 
+/** Platform-aware tool name: "Shell" on Windows, "Bash" elsewhere. */
+export const SHELL_TOOL_NAME = IS_WINDOWS ? "Shell" : "Bash";
+
+const shellLower = IS_WINDOWS ? "shell" : "bash";
+const shellExamples = IS_WINDOWS
+	? "Use Read instead of type/Get-Content, Write instead of echo/Set-Content, Edit instead of (Get-Content).Replace, Glob instead of dir/Get-ChildItem, Grep instead of Select-String."
+	: "Use Read instead of cat/head/tail, Write instead of echo/cat heredoc, Edit instead of sed/awk, Glob instead of find/ls, Grep instead of grep/rg.";
+
 export const bashTool: ToolDefinition = {
-	name: "Bash",
+	name: SHELL_TOOL_NAME,
 	description:
-		"Execute a bash command. Use for git, npm, system commands. " +
+		`Execute a ${shellLower} command. Use for git, npm, system commands. ` +
 		"Commands run in the Current Working Directory by default — do NOT prepend `cd <cwd> &&` as it is redundant. " +
 		"Output exceeding 2000 lines or 50KB is truncated; full output is saved to a file for retrieval via Read (offset/limit or force_full=true) or Grep. " +
-		"IMPORTANT: Prefer dedicated tools over Bash when possible — use Read instead of cat/head/tail, " +
-		"Write instead of echo/cat heredoc, Edit instead of sed/awk, Glob instead of find/ls, " +
-		"Grep instead of grep/rg. Only use Bash for operations that genuinely require shell execution. " +
+		`IMPORTANT: Prefer dedicated tools over ${SHELL_TOOL_NAME} when possible — ${shellExamples} ` +
+		`Only use ${SHELL_TOOL_NAME} for operations that genuinely require shell execution. ` +
 		"AVOID using `cd <directory> && <command>` — use the `workdir` parameter instead.",
 	parameters: z.object({
-		command: z.string().describe("Bash command to execute"),
+		command: z.string().describe(`${SHELL_TOOL_NAME} command to execute`),
 		timeout: z
 			.number()
 			.optional()
@@ -61,14 +69,54 @@ export const bashTool: ToolDefinition = {
 		}
 
 		try {
-			const shell = detectShell();
-			const proc = spawn(command, {
-				shell,
-				cwd,
-				env: { ...process.env, HOME: process.env.HOME ?? "/root" },
-				stdio: ["ignore", "pipe", "pipe"],
-				detached: true,
-			});
+			const shellInfo = detectShell();
+			const isWin = process.platform === "win32";
+
+			// Build env: spread process.env then apply overrides.
+			// On Windows, the PATH variable is typically named "Path" (title-case).
+			// When we spread process.env into a plain object the case-insensitive
+			// proxy is lost, so bash (which expects uppercase "PATH") won't see it.
+			// Fix: always set an uppercase PATH from the original process.env.PATH
+			// (the proxy handles case-insensitive lookup).
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				HOME: getHome(),
+				...shellInfo.extraEnv,
+			};
+			if (isWin && !env.PATH && process.env.PATH) {
+				env.PATH = process.env.PATH;
+			}
+
+			// On Windows with Git Bash we must use login-shell mode so that
+			// /etc/profile is sourced and PATH is properly converted from
+			// Windows format to POSIX format.  Without this, tools like node,
+			// npm, git etc. are invisible to the spawned bash process.
+			//
+			// `detached` is only useful on Unix (creates a new process group for
+			// clean tree-kill via negative PID).  On Windows it creates a new
+			// console window and can break stdio pipes, so we skip it.
+			let spawnArgs: [string, string[], object];
+			if (shellInfo.loginWrap) {
+				spawnArgs = [
+					shellInfo.path,
+					["--login", "-c", command],
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				];
+			} else {
+				spawnArgs = [
+					command,
+					[],
+					{
+						shell: shellInfo.path,
+						cwd,
+						env,
+						stdio: ["ignore", "pipe", "pipe"],
+						detached: !isWin,
+					},
+				];
+			}
+
+			const proc = spawn(...spawnArgs);
 
 			let output = "";
 			let timedOut = false;

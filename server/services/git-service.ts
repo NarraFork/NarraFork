@@ -1,4 +1,7 @@
+import { cpSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { logger } from "../lib/logger";
+import { DEV_NULL } from "../lib/platform";
 
 interface ExecResult {
 	stdout: string;
@@ -138,13 +141,11 @@ export const gitService = {
 			const files = untracked.stdout.split("\n").filter(Boolean);
 			for (const file of files) {
 				try {
-					const proc = Bun.spawn(["wc", "-l", file], {
-						cwd: worktreePath,
-						stdout: "pipe",
-						stderr: "pipe",
-					});
-					const out = await new Response(proc.stdout).text();
-					added += Number.parseInt(out.trim(), 10) || 0;
+					const filePath = join(worktreePath, file);
+					const content = await Bun.file(filePath).text();
+					const lineCount = content.split("\n").length;
+					// Subtract 1 if file ends with newline (matching wc -l behavior)
+					added += content.endsWith("\n") ? lineCount - 1 : lineCount;
 				} catch {
 					// skip unreadable files
 				}
@@ -375,7 +376,7 @@ export const gitService = {
 		const untrackedFiles = untrackedResult.stdout.split("\n").filter(Boolean);
 		for (const file of untrackedFiles) {
 			// --no-index always exits 1 when diff is found — silence the expected error log
-			const showResult = await exec(["diff", "--no-index", "/dev/null", file], worktreePath, true);
+			const showResult = await exec(["diff", "--no-index", DEV_NULL, file], worktreePath, true);
 			if (showResult.stdout && !addPart(showResult.stdout)) break;
 		}
 
@@ -470,24 +471,23 @@ export const gitService = {
 
 	async copyFiles(srcDir: string, destDir: string, files: string[]): Promise<void> {
 		for (const file of files) {
-			const srcPath = `${srcDir}/${file}`;
-			const destPath = `${destDir}/${file}`;
+			const srcPath = join(srcDir, file);
+			const destPath = join(destDir, file);
 			try {
-				const destParent = destPath.substring(0, destPath.lastIndexOf("/"));
-				await Bun.spawn(["mkdir", "-p", destParent]).exited;
-				await Bun.spawn(["cp", "-r", srcPath, destPath]).exited;
+				mkdirSync(dirname(destPath), { recursive: true });
+				cpSync(srcPath, destPath, { recursive: true });
 			} catch (err) {
 				logger.warn("Failed to copy file", { file, error: String(err) });
 			}
 		}
 	},
 
-	async initRepo(path: string): Promise<void> {
-		await Bun.spawn(["mkdir", "-p", path]).exited;
-		const result = await exec(["init"], path);
+	async initRepo(repoPath: string): Promise<void> {
+		mkdirSync(repoPath, { recursive: true });
+		const result = await exec(["init"], repoPath);
 		if (result.exitCode !== 0) throw new Error(`Failed to init repo: ${result.stderr}`);
 		// Create initial empty commit so branches can be created
-		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], path);
+		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], repoPath);
 		if (commitResult.exitCode !== 0) {
 			throw new Error(`Failed to create initial commit: ${commitResult.stderr}`);
 		}
@@ -642,7 +642,7 @@ export const gitService = {
 		let diff: string;
 		if (statusLine.startsWith("??")) {
 			// Untracked file — show full content as "new file" diff
-			const r = await exec(["diff", "--no-index", "/dev/null", filePath], worktreePath, true);
+			const r = await exec(["diff", "--no-index", DEV_NULL, filePath], worktreePath, true);
 			diff = r.stdout;
 		} else if (staged) {
 			const r = await exec(["diff", "--cached", "--", filePath], worktreePath, true);

@@ -695,7 +695,9 @@ export const api = {
 			allReady: boolean;
 		}>(`/chapters/container-setup${refresh ? "?refresh=true" : ""}`),
 	getPodmanStatus: () =>
-		request<{ installed: boolean; version?: string; platform: string }>("/chapters/podman/status"),
+		request<{ installed: boolean; version?: string; platform: string; supported: boolean }>(
+			"/chapters/podman/status",
+		),
 	installPodman: () =>
 		request<{ ok: boolean; installed?: boolean; version?: string; error?: string }>(
 			"/chapters/podman/install",
@@ -1273,6 +1275,19 @@ export const api = {
 			models: Array<{ id: string; display_name?: string }>;
 			fromCache: boolean;
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
+
+	// Health / platform
+	health: () => request<{ status: string; platform: "windows" | "macos" | "linux" }>("/health"),
+
+	// Filesystem browsing
+	fsBrowse: (path?: string) =>
+		request<{
+			path: string | null;
+			entries: Array<{ name: string; path: string }>;
+			drives?: Array<{ name: string; path: string }>;
+			parent?: string | null;
+			sep: string;
+		}>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
 };
 
 	text: string,

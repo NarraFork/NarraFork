@@ -14,6 +14,7 @@ import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
 import { codexRoutes } from "./routes/codex";
 import { favoriteRoutes } from "./routes/favorites";
+import { fsRoutes } from "./routes/fs";
 import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
 import { mcpRoutes } from "./routes/mcp";
@@ -43,7 +44,13 @@ app.use(
 
 // Public routes (no auth required)
 app.route("/api/auth", authRoutes);
-app.get("/api/health", (c) => c.json({ status: "ok" }));
+app.get("/api/health", (c) =>
+	c.json({
+		status: "ok",
+		platform:
+			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
+	}),
+);
 
 app.get("/api/auth/status", async (c) => {
 	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
@@ -68,6 +75,7 @@ app.route("/api/search", searchRoutes);
 app.route("/api/mcp", mcpRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
+app.route("/api/fs", fsRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);

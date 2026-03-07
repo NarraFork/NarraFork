@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { type AgentConfig, buildHistory, type ToolDefinition } from "../lib/agent";
+import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -23,8 +24,8 @@ import { buildContextManagementHooks, handlePermission, pruneToolCalls } from ".
 
 // === Subagent type definitions ===
 
-/** Tools available to explore/plan subagents (read-only + Bash for shell inspection) */
-const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "Bash"]);
+/** Tools available to explore/plan subagents (read-only + Shell/Bash for shell inspection) */
+const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", SHELL_TOOL_NAME]);
 
 /** Tools excluded from general subagents (no nesting, no plan mode) */
 const GENERAL_EXCLUDED = new Set([

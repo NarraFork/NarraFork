@@ -35,5 +35,6 @@
 	"podman.installButton": "Install Podman",
 	"podman.installFailed": "Installation failed",
 	"podman.installSuccess": "Podman installed successfully ({{version}})",
+	"podman.unsupportedPlatform": "Container management is only supported on Linux.",
 	"podman.close": "Close"
 }

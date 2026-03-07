@@ -35,5 +35,6 @@
 	"podman.installButton": "安装 Podman",
 	"podman.installFailed": "安装失败",
 	"podman.installSuccess": "Podman 安装成功（{{version}}）",
+	"podman.unsupportedPlatform": "容器管理仅支持 Linux 平台。",
 	"podman.close": "关闭"
 }

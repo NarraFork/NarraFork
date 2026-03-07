@@ -9,6 +9,9 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { detectShell } from "../lib/agent/shell";
 import { logger } from "../lib/logger";
+import { DEV_NULL, IS_WINDOWS } from "../lib/platform";
+import type { TerminalRuntime } from "./runtime";
+import { spawnBunTerminal } from "./runtime-bun";
 
 // === Process tree utilities ===
 
@@ -106,11 +109,15 @@ export const dtachService = {
 
 	isAvailable(): boolean {
 		if (_available === null) {
-			try {
-				execSync("which dtach", { encoding: "utf-8", stdio: "pipe" });
-				_available = true;
-			} catch {
+			if (IS_WINDOWS) {
 				_available = false;
+			} else {
+				try {
+					execSync("which dtach", { encoding: "utf-8", stdio: "pipe" });
+					_available = true;
+				} catch {
+					_available = false;
+				}
 			}
 			logger.info("dtach availability", { available: _available });
 		}
@@ -129,7 +136,7 @@ export const dtachService = {
 	}): Promise<{ proc: import("bun").Subprocess }> {
 		this.init();
 		const socketPath = this.getSocketPath(opts.terminalId);
-		const shell = detectShell();
+		const shell = detectShell().path;
 
 		// dtach -n: create new session without attaching
 		// -z: disable suspend (Ctrl+Z doesn't detach)
@@ -138,7 +145,7 @@ export const dtachService = {
 			env: {
 				...process.env,
 				...opts.env,
-				HISTFILE: "/dev/null",
+				HISTFILE: DEV_NULL,
 				TERM: "xterm-256color",
 			},
 			stdio: ["ignore", "ignore", "ignore"],
@@ -157,28 +164,17 @@ export const dtachService = {
 		cols: number;
 		rows: number;
 		onData: (data: string) => void;
-	}): { pty: InstanceType<typeof Bun.Terminal>; proc: import("bun").Subprocess } {
+	}): TerminalRuntime {
 		const socketPath = this.getSocketPath(opts.terminalId);
 
-		const pty = new Bun.Terminal({
+		return spawnBunTerminal({
+			cmd: ["sh", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath],
+			cwd: process.cwd(),
+			env: { ...process.env, TERM: "xterm-256color" },
 			cols: opts.cols,
 			rows: opts.rows,
-			data(_term, data) {
-				const text = typeof data === "string" ? data : new TextDecoder().decode(data);
-				if (text) opts.onData(text);
-			},
+			onData: opts.onData,
 		});
-
-		// Attach to dtach session through PTY — use sh -c for POSIX compatibility
-		const proc = Bun.spawn(
-			["sh", "-c", 'stty -echoctl && exec dtach -a "$1" -z', "_", socketPath],
-			{
-				env: { ...process.env, TERM: "xterm-256color" },
-				terminal: pty,
-			},
-		);
-
-		return { pty, proc };
 	},
 
 	/** Check if a dtach socket is still alive */

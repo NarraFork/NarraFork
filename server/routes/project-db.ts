@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { getHome } from "../lib/platform";
 import { getProjectDbPath } from "../lib/project-db";
 import { importProjectSchema } from "../lib/validators";
 import { fullSync } from "../services/project-db-sync";
@@ -48,7 +49,7 @@ projectDbRoutes.post("/import", async (c) => {
 
 	let gitPath = parsed.data.gitPath.trim();
 	if (gitPath.startsWith("~/") || gitPath === "~") {
-		gitPath = gitPath.replace("~", process.env.HOME ?? "/root");
+		gitPath = gitPath.replace("~", getHome());
 	}
 	gitPath = resolve(gitPath);
 

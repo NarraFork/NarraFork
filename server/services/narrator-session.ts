@@ -15,11 +15,13 @@ import {
 } from "../db/schema";
 import { buildHistory, type PermissionResult, resolveProviderAndModel } from "../lib/agent";
 import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
+import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getHome } from "../lib/platform";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
@@ -49,7 +51,7 @@ import { worktreeWatcher } from "./worktree-watcher";
 // === In-memory state ===
 
 // Tools that may modify files on disk — git status is tracked after these complete
-const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "Bash"]);
+const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
 
 
 interface ActiveNarrator {
@@ -186,7 +188,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Glob":
 		case "Grep":
 			return typeof input.path === "string" ? [input.path] : [];
-		case "Bash": {
+		case SHELL_TOOL_NAME: {
 			const paths: string[] = [];
 			if (typeof input.workdir === "string") paths.push(input.workdir);
 			if (Array.isArray(input._filePaths)) {
@@ -244,10 +246,11 @@ export function resolvePermissionDecision(
 	planFileId?: string,
 ): "allow" | "deny" | "ask" | "fatal" {
 	// Catastrophic commands are ALWAYS blocked — no override possible
-	if (toolName === "Bash" && bashAnalysis?.isCatastrophic) return "fatal";
+	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
 
 	// Chapter mode: git branch violations are hard-denied (no bypass)
-	if (toolName === "Bash" && isChapter && bashAnalysis?.gitBranchViolations?.length) return "deny";
+	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchViolations?.length)
+		return "deny";
 
 	// Plan mode: identical to readOnly, except Write/Edit to the designated plan file is allowed.
 	// All other decisions delegate to the readOnly branch below via permMode aliasing.
@@ -289,7 +292,7 @@ export function resolvePermissionDecision(
 	if (effectiveMode === "dontAsk") return "deny";
 
 	// readOnly: auto-allow read-only tools, auto-deny everything else.
-	// Bash gets special handling — whitelisted read-only commands are allowed.
+	// Bash/Shell gets special handling — whitelisted read-only commands are allowed.
 	if (effectiveMode === "readOnly") {
 		if (READ_ONLY_TOOLS.includes(toolName)) {
 			const toolPaths = extractToolPaths(toolName, input);
@@ -298,7 +301,7 @@ export function resolvePermissionDecision(
 			if (!hasExternalPath || allPathsInTruncateDir(cwd, toolPaths)) return "allow";
 			return "deny";
 		}
-		if (toolName === "Bash") {
+		if (toolName === SHELL_TOOL_NAME) {
 			if (!bashAnalysis) return "deny";
 			if (bashAnalysis.nonWhitelisted.length > 0) return "deny";
 			if (bashAnalysis.dangerousPatterns.length > 0) return "deny";
@@ -313,8 +316,8 @@ export function resolvePermissionDecision(
 		return "deny";
 	}
 
-	// Bash: AST-based command-level security
-	if (toolName === "Bash") {
+	// Bash/Shell: AST-based command-level security
+	if (toolName === SHELL_TOOL_NAME) {
 		if (!bashAnalysis) return "ask";
 		if (bashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (bashAnalysis.dangerousPatterns.length > 0) return "ask";
@@ -411,7 +414,7 @@ export async function handlePermission(
 
 	// Bash command pre-analysis via tree-sitter AST
 	let bashAnalysis: BashAnalysis | undefined;
-	if (toolName === "Bash" && typeof input.command === "string") {
+	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
 		try {
 			bashAnalysis = await analyzeBashCommand(input.command, cwd, isChapter);
 		} catch (err) {
@@ -930,14 +933,14 @@ async function createNarrator(
 			narratorBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = narrator.cwd || project?.gitPath || process.env.HOME || "/tmp";
+			narratorCwd = narrator.cwd || project?.gitPath || getHome();
 			logger.info("Chapter dormant, using fallback CWD", {
 				chapterId: narrator.chapterId,
 				narratorCwd,
 			});
 		}
 	} else {
-		narratorCwd = narrator.cwd || process.env.HOME || "/tmp";
+		narratorCwd = narrator.cwd || getHome();
 	}
 
 	// Generate planFileId if narrator is already in plan mode (e.g. server restart recovery).

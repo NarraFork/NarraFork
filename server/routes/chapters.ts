@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { supportsContainers } from "../lib/platform";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import {
@@ -171,10 +172,13 @@ chapterRoutes.get("/podman/status", (c) => {
 	const status = getPodmanStatus();
 	const platform =
 		process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-	return c.json({ ...status, platform });
+	return c.json({ ...status, platform, supported: supportsContainers() });
 });
 
 chapterRoutes.post("/podman/install", requireAdmin, async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ ok: false, error: "Container management is only supported on Linux" }, 400);
+	}
 	const platform = process.platform;
 	let cmd: string;
 	if (platform === "darwin") {
@@ -259,30 +263,45 @@ chapterRoutes.get("/:id/containers", async (c) => {
 });
 
 chapterRoutes.post("/:id/containers/start", async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ error: "Container management is only supported on Linux" }, 400);
+	}
 	const id = c.req.param("id");
 	await containerService.startChapterContainers(id);
 	return c.json({ ok: true, status: "starting" });
 });
 
 chapterRoutes.post("/:id/containers/stop", async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ error: "Container management is only supported on Linux" }, 400);
+	}
 	const id = c.req.param("id");
 	await containerService.stopChapterContainers(id);
 	return c.json({ ok: true });
 });
 
 chapterRoutes.post("/:id/containers/pause", async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ error: "Container management is only supported on Linux" }, 400);
+	}
 	const id = c.req.param("id");
 	await containerService.pauseChapterContainers(id);
 	return c.json({ ok: true });
 });
 
 chapterRoutes.post("/:id/containers/unpause", async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ error: "Container management is only supported on Linux" }, 400);
+	}
 	const id = c.req.param("id");
 	await containerService.unpauseChapterContainers(id);
 	return c.json({ ok: true });
 });
 
 chapterRoutes.get("/:id/containers/logs", async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ error: "Container management is only supported on Linux" }, 400);
+	}
 	const id = c.req.param("id");
 	const tail = c.req.query("tail");
 	const service = c.req.query("service");
@@ -294,6 +313,9 @@ chapterRoutes.get("/:id/containers/logs", async (c) => {
 });
 
 chapterRoutes.post("/:id/containers/remove", async (c) => {
+	if (!supportsContainers()) {
+		return c.json({ error: "Container management is only supported on Linux" }, 400);
+	}
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = containerRemoveSchema.safeParse(body);

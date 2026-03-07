@@ -14,7 +14,6 @@ import {
 	Select,
 	Stack,
 	Text,
-	TextInput,
 	Title,
 	Tooltip,
 } from "@mantine/core";
@@ -37,6 +36,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DirectoryPicker } from "../../components/common/DirectoryPicker";
 import { UserAvatar } from "../../components/UserAvatar";
 import {
 	useCreateFavoriteDirectory,
@@ -50,6 +50,7 @@ import {
 	useNarratorsPaginated,
 } from "../../hooks/useNarrator";
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
+import { usePlatform } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
@@ -148,6 +149,7 @@ function NarratorsPage() {
 	const [startInPlanMode, setStartInPlanMode] = useState(false);
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
 	const [navigatingId, setNavigatingId] = useState<string | null>(null);
+	const platform = usePlatform();
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -806,14 +808,16 @@ function NarratorsPage() {
 						{t("newNarratorDescription")}
 					</Text>
 
-					<TextInput
+					<DirectoryPicker
 						label={t("workingDirectory")}
 						description={t("workingDirectoryHint")}
-						placeholder={t("workingDirectoryPlaceholder")}
+						placeholder={
+							platform === "windows" ? "E:\\Code\\my-project" : "/home/user/projects/my-project"
+						}
 						leftSection={<IconFolder size={16} />}
 						value={cwd}
-						onChange={(e) => setCwd(e.currentTarget.value)}
-						rightSection={
+						onChange={setCwd}
+						rightSectionExtra={
 							cwd ? (
 								isFavorited ? (
 									<IconStarFilled size={16} style={{ color: "var(--mantine-color-yellow-5)" }} />

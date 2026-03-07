@@ -1,5 +1,4 @@
 import { execSync } from "node:child_process";
-import type { Subprocess } from "bun";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, terminals } from "../db/schema";
@@ -8,11 +7,15 @@ import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { DEV_NULL, getHome, IS_WINDOWS } from "../lib/platform";
 import { BufferManager } from "../terminal/buffer-manager";
 import { dtachService, findProcessesByArg, getDescendantPids } from "../terminal/dtach-service";
+import type { TerminalRuntime, TerminalSpawnOptions } from "../terminal/runtime";
+import { spawnBunTerminal } from "../terminal/runtime-bun";
+import { spawnPortablePty } from "../terminal/runtime-pty";
 import { sendToTerminal } from "../websocket/terminal-ws";
 
-const DEFAULT_SHELL = detectShell();
+const DEFAULT_SHELL = detectShell().path;
 
 export interface TerminalProcessInfo {
 	pid: number;
@@ -49,8 +52,7 @@ function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
 }
 
 interface ActiveTerminal {
-	process: Subprocess;
-	pty: InstanceType<typeof Bun.Terminal>;
+	runtime: TerminalRuntime;
 	terminalId: string;
 	buffer: BufferManager;
 	useDtach: boolean;
@@ -146,12 +148,12 @@ export const terminalService = {
 				if (chapter?.worktreePath) {
 					cwd = chapter.worktreePath;
 				} else {
-					cwd = narrator.cwd ?? process.env.HOME ?? "/tmp";
+					cwd = narrator.cwd ?? getHome();
 				}
 			} else {
-				cwd = narrator.cwd ?? process.env.HOME ?? "/tmp";
+				cwd = narrator.cwd ?? getHome();
 			}
-			if (!cwd || cwd === (process.env.HOME ?? "/tmp")) {
+			if (!cwd || cwd === getHome()) {
 				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
 			}
 		} else {
@@ -164,46 +166,40 @@ export const terminalService = {
 		buffer.startPeriodicFlush();
 		const useDtach = dtachService.isAvailable();
 
-		let pty: InstanceType<typeof Bun.Terminal>;
-		let proc: Subprocess;
+		let runtime: TerminalRuntime;
 		let dtachSocket: string | null = null;
 
 		if (useDtach) {
 			// dtach mode: create detached session, then attach via PTY
 			await dtachService.createSession({ terminalId: id, cwd });
 			dtachSocket = dtachService.getSocketPath(id);
-			const attached = dtachService.attachSession({
+			runtime = dtachService.attachSession({
 				terminalId: id,
 				cols,
 				rows,
 				onData: (text) => onData(id, buffer, text),
 			});
-			pty = attached.pty;
-			proc = attached.proc;
 		} else {
-			// Direct mode: Bun.Terminal + Bun.spawn
-			pty = new Bun.Terminal({
-				cols,
-				rows,
-				data(_term, data) {
-					onData(id, buffer, data);
-				},
-			});
-			proc = Bun.spawn([DEFAULT_SHELL, "-l"], {
+			// Direct mode: platform-appropriate PTY
+			const spawnOpts: TerminalSpawnOptions = {
+				cmd: [DEFAULT_SHELL, "-l"],
 				cwd,
 				env: {
 					...process.env,
-					HISTFILE: "/dev/null",
+					HISTFILE: DEV_NULL,
 					TERM: "xterm-256color",
 				},
-				terminal: pty,
-			});
+				cols,
+				rows,
+				onData: (data) => onData(id, buffer, data),
+			};
+			runtime = IS_WINDOWS ? spawnPortablePty(spawnOpts) : spawnBunTerminal(spawnOpts);
 		}
 
-		activeTerminals.set(id, { process: proc, pty, terminalId: id, buffer, useDtach });
+		activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });
 
-		// Monitor attach process exit
-		proc.exited.then(async (code) => {
+		// Monitor process exit
+		runtime.exited.then(async (code) => {
 			const active = activeTerminals.get(id);
 			if (!active) return;
 
@@ -213,7 +209,7 @@ export const terminalService = {
 				if (dtachService.isSocketAlive(id)) {
 					// Detached — save buffer but keep terminal "running"
 					active.buffer.saveToDisk();
-					active.pty.close();
+					active.runtime.close();
 					activeTerminals.delete(id);
 					logger.info("dtach attach process exited, session still alive", { terminalId: id });
 					return;
@@ -223,7 +219,7 @@ export const terminalService = {
 			// Shell actually exited
 			active.buffer.dispose();
 			activeTerminals.delete(id);
-			pty.close();
+			runtime.close();
 			await markTerminalExited(id, code ?? 0, narratorId ?? null, chapterId ?? null);
 			sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
 			logger.info("Terminal exited", { terminalId: id, code });
@@ -259,19 +255,18 @@ export const terminalService = {
 			logger.warn("Terminal write: no active terminal", { terminalId });
 			return;
 		}
-		active.pty.write(new TextEncoder().encode(data));
+		active.runtime.write(data);
 	},
 
 	resize(terminalId: string, cols: number, rows: number) {
 		const active = activeTerminals.get(terminalId);
 		if (!active) return;
-		active.pty.resize(cols, rows);
-		// Bun.Terminal.resize() updates the PTY window size but does not send
-		// SIGWINCH to the child. dtach relies on SIGWINCH to forward the new
-		// size from the attach process to the master session's child PTY.
-		if (active.useDtach && active.process.pid) {
+		active.runtime.resize(cols, rows);
+		// Bun.Terminal.resize() does not send SIGWINCH to the child.
+		// dtach relies on SIGWINCH to forward the new size. Only on Unix.
+		if (active.useDtach && !IS_WINDOWS && active.runtime.pid) {
 			try {
-				process.kill(active.process.pid, "SIGWINCH");
+				process.kill(active.runtime.pid, "SIGWINCH");
 			} catch {
 				// process may have exited
 			}
@@ -287,8 +282,8 @@ export const terminalService = {
 			if (active.useDtach) {
 				dtachService.killSession(terminalId);
 			}
-			active.process.kill();
-			active.pty.close();
+			active.runtime.kill();
+			active.runtime.close();
 			activeTerminals.delete(terminalId);
 		} else if (dtachService.isAvailable()) {
 			// Terminal might be detached (no active entry) but dtach session alive
@@ -405,7 +400,7 @@ export const terminalService = {
 		buffer.loadFromDisk();
 		buffer.startPeriodicFlush();
 
-		const attached = dtachService.attachSession({
+		const runtime = dtachService.attachSession({
 			terminalId,
 			cols: 80,
 			rows: 24,
@@ -413,8 +408,7 @@ export const terminalService = {
 		});
 
 		activeTerminals.set(terminalId, {
-			process: attached.proc,
-			pty: attached.pty,
+			runtime,
 			terminalId,
 			buffer,
 			useDtach: true,
@@ -424,18 +418,18 @@ export const terminalService = {
 		await db.update(terminals).set({ status: "running" }).where(eq(terminals.id, terminalId));
 
 		// Monitor attach process
-		attached.proc.exited.then(async (code) => {
+		runtime.exited.then(async (code) => {
 			const active = activeTerminals.get(terminalId);
 			if (!active) return;
 			if (dtachService.isSocketAlive(terminalId)) {
 				active.buffer.saveToDisk();
-				active.pty.close();
+				active.runtime.close();
 				activeTerminals.delete(terminalId);
 				return;
 			}
 			active.buffer.dispose();
 			activeTerminals.delete(terminalId);
-			attached.pty.close();
+			runtime.close();
 			await markTerminalExited(terminalId, code ?? 0);
 			sendToTerminal(terminalId, {
 				type: "exit",
@@ -473,7 +467,7 @@ export const terminalService = {
 				chapterId: null,
 				narratorId: null,
 				name: `Recovered ${id.slice(0, 8)}`,
-				cwd: process.env.HOME ?? "/tmp",
+				cwd: getHome(),
 				dtachSocket,
 				status: "running",
 				createdAt: now,
@@ -536,7 +530,7 @@ export const terminalService = {
 					buffer.loadFromDisk();
 					buffer.startPeriodicFlush();
 
-					const attached = dtachService.attachSession({
+					const runtime = dtachService.attachSession({
 						terminalId: terminal.id,
 						cols: 80,
 						rows: 24,
@@ -544,26 +538,25 @@ export const terminalService = {
 					});
 
 					activeTerminals.set(terminal.id, {
-						process: attached.proc,
-						pty: attached.pty,
+						runtime,
 						terminalId: terminal.id,
 						buffer,
 						useDtach: true,
 					});
 
 					// Monitor attach process
-					attached.proc.exited.then(async (code) => {
+					runtime.exited.then(async (code) => {
 						const active = activeTerminals.get(terminal.id);
 						if (!active) return;
 						if (dtachService.isSocketAlive(terminal.id)) {
 							active.buffer.saveToDisk();
-							active.pty.close();
+							active.runtime.close();
 							activeTerminals.delete(terminal.id);
 							return;
 						}
 						active.buffer.dispose();
 						activeTerminals.delete(terminal.id);
-						attached.pty.close();
+						runtime.close();
 						await markTerminalExited(
 							terminal.id,
 							code ?? 0,
@@ -635,7 +628,7 @@ export const terminalService = {
 				}
 				return null;
 			}
-			return active.process.pid ?? null;
+			return active.runtime.pid ?? null;
 		}
 		// Detached dtach terminal (not in activeTerminals)
 		if (dtachService.isAvailable() && dtachService.isSocketAlive(terminalId)) {

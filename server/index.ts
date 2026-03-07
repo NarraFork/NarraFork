@@ -35,8 +35,12 @@ process.on("unhandledRejection", (reason) => {
 	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
 });
 
-const port = Number(process.env.PORT) || settings.server.port;
-const host = process.env.HOST || "localhost";
+// CLI flags: --port=XXXX --host=XXXX
+const cliPort = process.argv.find((a) => a.startsWith("--port="))?.split("=")[1];
+const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1];
+
+const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
+const host = cliHost || process.env.HOST || "localhost";
 const isProd = process.env.NODE_ENV === "production";
 
 // MIME type lookup for embedded static files
