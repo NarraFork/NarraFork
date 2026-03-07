@@ -767,7 +767,6 @@ export const api = {
 		}),
 	dormantChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/dormant`, { method: "POST" }),
 	wakeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/wake`, { method: "POST" }),
-	unmergeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/unmerge`, { method: "POST" }),
 
 	// === chapter edges ===
 	listChapterEdges: (params: { projectId?: string; chapterId?: string; type?: string }) => {

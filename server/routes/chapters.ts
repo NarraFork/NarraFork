@@ -122,12 +122,6 @@ chapterRoutes.post("/:id/ai-resolve", async (c) => {
 	return c.json(result);
 });
 
-chapterRoutes.post("/:id/unmerge", async (c) => {
-	const id = c.req.param("id");
-	const result = await chapterMerge.unmerge(id);
-	return c.json(result);
-});
-
 // === Dormant / Wake ===
 
 chapterRoutes.post("/:id/dormant", async (c) => {

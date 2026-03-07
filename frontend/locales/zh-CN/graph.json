@@ -16,7 +16,6 @@
 		},
 		"dormant": "休眠",
 		"wake": "唤醒",
-		"unmerge": "取消合并",
 		"delete": "删除",
 		"deleteConfirmTitle": "删除章节",
 		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，对话将保留为只读。",
