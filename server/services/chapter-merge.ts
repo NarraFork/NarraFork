@@ -407,26 +407,33 @@ export const chapterMerge = {
 
 		const gitPath = await getProjectGitPath(source.projectId);
 
-		// Step 1: Verify the merge commit is still the HEAD of the target branch.
-		// If someone has committed on top, a hard reset would discard their work.
+		// Step 1: Undo the merge on the target branch.
+		// Prefer reset --hard (clean history) when HEAD is still the merge commit.
+		// Fall back to git revert when the target has advanced (preserves later commits).
 		const headSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
-		if (headSha !== source.mergeCommitSha) {
-			throw new ValidationError(
-				"Target branch has new commits after the merge — cannot safely unmerge. " +
-					"Use git revert manually if needed.",
-			);
+		if (headSha === source.mergeCommitSha) {
+			// HEAD is the merge commit — safe to reset
+			await gitService.resetHard(target.worktreePath, `${source.mergeCommitSha}~1`);
+			logger.info("Reset target branch to before merge commit", {
+				sourceChapterId,
+				targetChapterId: target.id,
+				mergeCommitSha: source.mergeCommitSha,
+			});
+		} else {
+			// Target has new commits — revert instead to preserve them
+			const isMerge = await gitService.isMergeCommit(target.worktreePath, source.mergeCommitSha);
+			const revertSha = isMerge
+				? await gitService.revertMergeCommit(target.worktreePath, source.mergeCommitSha)
+				: await gitService.revertCommit(target.worktreePath, source.mergeCommitSha);
+			logger.info("Reverted merge commit on target (target had advanced)", {
+				sourceChapterId,
+				targetChapterId: target.id,
+				mergeCommitSha: source.mergeCommitSha,
+				revertSha,
+			});
 		}
 
-		// Step 2: Reset target branch to the parent of the merge commit
-		await gitService.resetHard(target.worktreePath, `${source.mergeCommitSha}~1`);
-
-		logger.info("Reset target branch to before merge commit", {
-			sourceChapterId,
-			targetChapterId: target.id,
-			mergeCommitSha: source.mergeCommitSha,
-		});
-
-		// Sync target chapter's commit list after reset
+		// Step 2: Sync target chapter's commit list after undo
 		try {
 			await commitSyncService.syncChapterCommits(target.id);
 		} catch (err) {
