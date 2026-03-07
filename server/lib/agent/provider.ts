@@ -42,6 +42,8 @@ export interface ParsedStreamEvent {
 	messageId?: string;
 	conversationId?: string;
 	reasoning?: string;
+	/** Provider metadata for reasoning continuation (Codex encrypted content, item ID) */
+	reasoningMetadata?: import("./types").ReasoningProviderMetadata;
 	contextUsagePercentage?: number;
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
@@ -119,7 +121,15 @@ export interface ProviderAdapter {
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void;
 
 	/** Append an assistant turn to history (mutates in place) */
-	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void;
+	pushAssistantTurn(
+		history: unknown[],
+		text: string,
+		toolUses: AgentToolUse[],
+		reasoningBlocks?: Array<{
+			text: string;
+			providerMetadata?: import("./types").ReasoningProviderMetadata;
+		}>,
+	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */
 	generate(text: string, model: string): Promise<string>;

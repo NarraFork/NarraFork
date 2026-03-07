@@ -2014,7 +2014,11 @@ export const narratorService = {
 		narratorId: string,
 		block:
 			| { type: "text"; text: string }
-			| { type: "reasoning"; text: string }
+			| {
+					type: "reasoning";
+					text: string;
+					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+			  }
 			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
@@ -2028,7 +2032,11 @@ export const narratorService = {
 		// This avoids cases where streaming tool_use blocks are persisted before reasoning/text.
 		type StoredAssistantBlock =
 			| { type: "text"; text: string }
-			| { type: "reasoning"; text: string }
+			| {
+					type: "reasoning";
+					text: string;
+					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+			  }
 			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
 			| { type: string; text?: unknown; [key: string]: unknown };
 		const current = (

@@ -12,7 +12,7 @@ import type {
 	ResolvedToolDefinition,
 	ToolContext,
 } from "./types";
-import { PLAN_MODE_ALLOWED_TOOLS } from "./types";
+import { PLAN_MODE_ALLOWED_TOOLS, type ReasoningProviderMetadata } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
@@ -227,6 +227,22 @@ const OUTPUT_THROTTLE_MS = 100;
 /** Tools that can safely run in parallel when multiple appear in the same turn. */
 const PARALLEL_TOOLS = new Set(["Task"]);
 
+type ReasoningBlockEntry = { text: string; providerMetadata?: ReasoningProviderMetadata };
+
+/** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
+function collectReasoningBlocks(
+	map: Map<string, ReasoningBlockEntry>,
+): ReasoningBlockEntry[] | undefined {
+	if (map.size === 0) return undefined;
+	const blocks: ReasoningBlockEntry[] = [];
+	for (const entry of map.values()) {
+		if (entry.text || entry.providerMetadata) {
+			blocks.push(entry);
+		}
+	}
+	return blocks.length > 0 ? blocks : undefined;
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -311,7 +327,15 @@ export async function* agentLoop(
 
 		// Call provider and collect the response
 		let assistantText = "";
-		let assistantReasoning = "";
+		/**
+		 * Reasoning blocks accumulated during streaming, keyed by itemId.
+		 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
+		 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
+		 */
+		const reasoningBlockMap = new Map<
+			string,
+			{ text: string; providerMetadata?: ReasoningProviderMetadata }
+		>();
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
@@ -528,8 +552,38 @@ export async function* agentLoop(
 				if (parsed.messageId) messageId = parsed.messageId;
 				if (parsed.credentialId) credentialId = parsed.credentialId;
 				if (parsed.reasoning) {
-					assistantReasoning += parsed.reasoning;
-					yield { type: "stream_reasoning", text: parsed.reasoning };
+					const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
+					const existing = reasoningBlockMap.get(itemKey);
+					if (existing) {
+						existing.text += parsed.reasoning;
+						if (parsed.reasoningMetadata) {
+							existing.providerMetadata = parsed.reasoningMetadata;
+						}
+					} else {
+						reasoningBlockMap.set(itemKey, {
+							text: parsed.reasoning,
+							providerMetadata: parsed.reasoningMetadata,
+						});
+					}
+					yield {
+						type: "stream_reasoning",
+						text: parsed.reasoning,
+						providerMetadata: parsed.reasoningMetadata,
+					};
+				} else if (parsed.reasoningMetadata) {
+					// Metadata-only event (e.g. final encrypted_content from output_item.done).
+					// Update the stored metadata without emitting a streaming event.
+					const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
+					const existing = reasoningBlockMap.get(itemKey);
+					if (existing) {
+						existing.providerMetadata = parsed.reasoningMetadata;
+					} else {
+						// Metadata arrived before any text — create an empty-text entry
+						reasoningBlockMap.set(itemKey, {
+							text: "",
+							providerMetadata: parsed.reasoningMetadata,
+						});
+					}
 				}
 				if (parsed.contextUsagePercentage != null) {
 					yield { type: "context_usage", percentage: parsed.contextUsagePercentage };
@@ -579,8 +633,17 @@ export async function* agentLoop(
 			}
 		} catch (err) {
 			// Even on error, yield block_complete for accumulated content so it can be persisted
-			if (assistantReasoning) {
-				yield { type: "block_complete", block: { type: "reasoning", text: assistantReasoning } };
+			for (const entry of reasoningBlockMap.values()) {
+				if (entry.text || entry.providerMetadata) {
+					yield {
+						type: "block_complete",
+						block: {
+							type: "reasoning",
+							text: entry.text,
+							providerMetadata: entry.providerMetadata,
+						},
+					};
+				}
 			}
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
@@ -624,8 +687,17 @@ export async function* agentLoop(
 			toolUseAccum.clear();
 
 			// Yield accumulated content before truncation
-			if (assistantReasoning) {
-				yield { type: "block_complete", block: { type: "reasoning", text: assistantReasoning } };
+			for (const entry of reasoningBlockMap.values()) {
+				if (entry.text || entry.providerMetadata) {
+					yield {
+						type: "block_complete",
+						block: {
+							type: "reasoning",
+							text: entry.text,
+							providerMetadata: entry.providerMetadata,
+						},
+					};
+				}
 			}
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
@@ -668,7 +740,12 @@ export async function* agentLoop(
 			if (toolUses.length === 0) {
 				// No complete tool calls at all — push the text-only assistant turn
 				// and inject a reminder so the model retries with a different strategy.
-				provider.pushAssistantTurn(history, assistantText, []);
+				provider.pushAssistantTurn(
+					history,
+					assistantText,
+					[],
+					collectReasoningBlocks(reasoningBlockMap),
+				);
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
 					toolNames: orphanedNames,
 				});
@@ -686,8 +763,17 @@ export async function* agentLoop(
 
 		if (!hasOrphanedToolUses) {
 			// Yield block_complete for accumulated content now that streaming is done
-			if (assistantReasoning) {
-				yield { type: "block_complete", block: { type: "reasoning", text: assistantReasoning } };
+			for (const entry of reasoningBlockMap.values()) {
+				if (entry.text || entry.providerMetadata) {
+					yield {
+						type: "block_complete",
+						block: {
+							type: "reasoning",
+							text: entry.text,
+							providerMetadata: entry.providerMetadata,
+						},
+					};
+				}
 			}
 			if (assistantText) {
 				yield { type: "block_complete", block: { type: "text", text: assistantText } };
@@ -941,7 +1027,12 @@ export async function* agentLoop(
 			pendingToolResults = pendingToolResults.filter(
 				(tr) => !brokenToolUseIds.has((tr as { toolUseId: string }).toolUseId),
 			);
-			provider.pushAssistantTurn(history, assistantText, cleanToolUses);
+			provider.pushAssistantTurn(
+				history,
+				assistantText,
+				cleanToolUses,
+				collectReasoningBlocks(reasoningBlockMap),
+			);
 
 			// Inject a user-side reminder so the model knows what happened and
 			// switches strategy instead of blindly retrying the same large write.
@@ -953,7 +1044,12 @@ export async function* agentLoop(
 			});
 		} else {
 			// Append assistant message to history for next turn
-			provider.pushAssistantTurn(history, assistantText, toolUses);
+			provider.pushAssistantTurn(
+				history,
+				assistantText,
+				toolUses,
+				collectReasoningBlocks(reasoningBlockMap),
+			);
 		}
 
 		// Allow external code (e.g. onExitPlanMode) to inject text into the next

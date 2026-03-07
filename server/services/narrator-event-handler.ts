@@ -266,6 +266,7 @@ export async function processEvent(
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "reasoning",
 					text: block.text,
+					providerMetadata: block.providerMetadata,
 				});
 			} else if (block.type === "tool_use") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {

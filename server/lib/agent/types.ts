@@ -106,7 +106,7 @@ export type AgentEvent =
 	| { type: "error"; message: string }
 	| { type: "retryable_error"; message: string }
 	| { type: "context_length_exceeded"; message: string }
-	| { type: "stream_reasoning"; text: string }
+	| { type: "stream_reasoning"; text: string; providerMetadata?: ReasoningProviderMetadata }
 	| {
 			type: "context_usage";
 			percentage: number;
@@ -128,10 +128,20 @@ export interface AgentToolUse {
 	streamStartedAt?: number;
 }
 
+/** Provider-specific metadata attached to reasoning blocks for continuation support. */
+export interface ReasoningProviderMetadata {
+	openai?: {
+		/** The reasoning item ID from the Responses API */
+		itemId?: string;
+		/** Encrypted reasoning content for continuation across turns */
+		reasoningEncryptedContent?: string | null;
+	};
+}
+
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
 	| { type: "text"; text: string }
-	| { type: "reasoning"; text: string }
+	| { type: "reasoning"; text: string; providerMetadata?: ReasoningProviderMetadata }
 	| {
 			type: "tool_use";
 			toolUseId: string;

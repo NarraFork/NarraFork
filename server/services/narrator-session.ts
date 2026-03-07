@@ -1092,9 +1092,30 @@ export function pruneToolCalls(
 	const pruneIds = new Set(dbMessages.slice(0, boundaryIdx + 1).map((m) => m.id));
 
 	for (const msg of dbMessages) {
-		if (pruneIds.has(msg.id) && msg.toolCalls?.length) {
+		if (!pruneIds.has(msg.id)) continue;
+
+		if (msg.toolCalls?.length) {
 			const kept = msg.toolCalls.filter((tc) => PRUNE_PROTECTED_TOOLS.has(tc.toolName));
 			msg.toolCalls = kept.length > 0 ? kept : [];
+		}
+
+		// Strip reasoning providerMetadata (encrypted_content) from pruned messages.
+		// Old encrypted content cannot be used for continuation and wastes tokens.
+		// The reasoning summary text is preserved for context.
+		// Skip if the message still has protected tool calls — their reasoning item
+		// must be preserved to satisfy Responses API pairing requirements.
+		if (Array.isArray(msg.contentJson) && !msg.toolCalls?.length) {
+			let mutated = false;
+			const blocks = msg.contentJson as Array<{ type: string; providerMetadata?: unknown }>;
+			for (const block of blocks) {
+				if (block.type === "reasoning" && block.providerMetadata) {
+					block.providerMetadata = undefined;
+					mutated = true;
+				}
+			}
+			if (mutated) {
+				msg.contentJson = [...blocks];
+			}
 		}
 	}
 }

@@ -274,7 +274,15 @@ export class CodexProvider implements ProviderAdapter {
 		dummy.pushUserTurn(history, content, model, toolResults);
 	}
 
-	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void {
+	pushAssistantTurn(
+		history: unknown[],
+		text: string,
+		toolUses: AgentToolUse[],
+		reasoningBlocks?: Array<{
+			text: string;
+			providerMetadata?: import("./types").ReasoningProviderMetadata;
+		}>,
+	): void {
 		const dummy = new OpenAIProvider({
 			id: "codex",
 			name: "Codex",
@@ -284,7 +292,7 @@ export class CodexProvider implements ProviderAdapter {
 			defaultModel: "gpt-5.3-codex",
 			apiMode: "codex",
 		});
-		dummy.pushAssistantTurn(history, text, toolUses);
+		dummy.pushAssistantTurn(history, text, toolUses, reasoningBlocks);
 	}
 
 	async generate(text: string, model: string): Promise<string> {

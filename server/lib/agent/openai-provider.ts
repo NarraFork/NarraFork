@@ -120,6 +120,11 @@ interface OAIMessage {
 	content?: string | OAIContentPart[] | null;
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
+	/** Reasoning blocks from the assistant message (used for Responses API replay). */
+	_reasoningBlocks?: Array<{
+		text: string;
+		providerMetadata?: import("./types").ReasoningProviderMetadata;
+	}>;
 }
 
 interface OAIToolCall {
@@ -263,6 +268,15 @@ export class OpenAIProvider implements ProviderAdapter {
 					output: tr.content,
 				})),
 			};
+		}
+		// Chat Completions path: strip _reasoningBlocks from assistant messages
+		// to avoid sending unknown fields to strict OpenAI-compatible backends.
+		for (const msg of result.history) {
+			// biome-ignore lint/suspicious/noExplicitAny: OAIMessage has _reasoningBlocks
+			const m = msg as any;
+			if (m._reasoningBlocks) {
+				delete m._reasoningBlocks;
+			}
 		}
 		return result;
 	}
@@ -506,9 +520,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 	}
 
-	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void {
+	pushAssistantTurn(
+		history: unknown[],
+		text: string,
+		toolUses: AgentToolUse[],
+		reasoningBlocks?: Array<{
+			text: string;
+			providerMetadata?: import("./types").ReasoningProviderMetadata;
+		}>,
+	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
+			// Emit reasoning items before text/tool_calls for Responses API
+			if (reasoningBlocks?.length) {
+				const emittedIds = new Set<string>();
+				emitReasoningItems(reasoningBlocks, h, emittedIds);
+			}
 			if (text) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
 				h.push({ role: "assistant", content: text } as any);
@@ -833,6 +860,8 @@ async function* _parseResponsesAPIStream(
 
 	// Tool call accumulators keyed by output_index (matches OpenAI SSE structure)
 	const toolAccum = new Map<number, ResponsesToolAccum>();
+	// Reasoning item accumulators keyed by output_index
+	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 
 	const reader = body.getReader();
 	try {
@@ -864,7 +893,7 @@ async function* _parseResponsesAPIStream(
 					continue;
 				}
 
-				const events = parseResponsesAPIEvent(chunk, toolAccum);
+				const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -874,7 +903,7 @@ async function* _parseResponsesAPIStream(
 		if (buffer.trim()?.startsWith("data: ")) {
 			try {
 				const chunk = JSON.parse(buffer.trim().slice(6));
-				const events = parseResponsesAPIEvent(chunk, toolAccum);
+				const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -906,6 +935,8 @@ interface ResponsesAPIChunk {
 	delta?: string;
 	output_index?: number;
 	content_index?: number;
+	/** Present on reasoning_summary_text.delta / reasoning_summary_part.added */
+	summary_index?: number;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	response?: any;
 }
@@ -918,9 +949,18 @@ interface ResponsesToolAccum {
 	emitted: boolean;
 }
 
+/** Accumulator for a Responses API reasoning item, keyed by output_index. */
+interface ResponsesReasoningAccum {
+	/** The canonical item ID from the API (e.g. "rs_...") */
+	itemId: string;
+	/** Encrypted reasoning content for continuation */
+	encryptedContent?: string | null;
+}
+
 function parseResponsesAPIEvent(
 	chunk: ResponsesAPIChunk,
 	toolAccum: Map<number, ResponsesToolAccum>,
+	reasoningAccum: Map<number, ResponsesReasoningAccum>,
 ): ParsedStreamEvent[] {
 	const type = chunk.type;
 	if (!type) return [];
@@ -953,9 +993,67 @@ function parseResponsesAPIEvent(
 		return results;
 	}
 
-	// ── Reasoning content ──
+	// ── Reasoning: output_item.added (type=reasoning) ──
+	// Track the reasoning item's id and encrypted_content for continuation.
+	if (type === "response.output_item.added" && chunk.item?.type === "reasoning") {
+		const idx = chunk.output_index;
+		if (idx != null) {
+			reasoningAccum.set(idx, {
+				itemId: chunk.item.id ?? "",
+				encryptedContent: chunk.item.encrypted_content ?? null,
+			});
+			logger.debug("Responses API reasoning item started", {
+				outputIndex: idx,
+				itemId: chunk.item.id,
+				hasEncryptedContent: !!chunk.item.encrypted_content,
+			});
+		}
+		return results;
+	}
+
+	// ── Reasoning: output_item.done (type=reasoning) ──
+	// Update encrypted_content with the final value from the done event and
+	// emit a metadata-only event so the loop can persist the final value.
+	if (type === "response.output_item.done" && chunk.item?.type === "reasoning") {
+		const idx = chunk.output_index;
+		if (idx != null) {
+			const acc = reasoningAccum.get(idx);
+			if (acc) {
+				const finalEncrypted = chunk.item.encrypted_content ?? acc.encryptedContent;
+				acc.encryptedContent = finalEncrypted;
+				// Emit a metadata-only event (no reasoning text) so the loop captures
+				// the final encrypted_content for persistence / continuation.
+				results.push({
+					reasoningMetadata: {
+						openai: {
+							itemId: acc.itemId,
+							reasoningEncryptedContent: finalEncrypted,
+						},
+					},
+				});
+			}
+		}
+		return results;
+	}
+
+	// ── Reasoning content (summary text delta) ──
 	if (type === "response.reasoning_summary_text.delta" && typeof chunk.delta === "string") {
-		results.push({ reasoning: chunk.delta });
+		// Look up the active reasoning item to attach metadata
+		const idx = chunk.output_index;
+		const acc = idx != null ? reasoningAccum.get(idx) : findActiveReasoningAccum(reasoningAccum);
+		if (acc) {
+			results.push({
+				reasoning: chunk.delta,
+				reasoningMetadata: {
+					openai: {
+						itemId: acc.itemId,
+						reasoningEncryptedContent: acc.encryptedContent,
+					},
+				},
+			});
+		} else {
+			results.push({ reasoning: chunk.delta });
+		}
 		return results;
 	}
 
@@ -1436,6 +1534,18 @@ function findAccByCallId(
 	return undefined;
 }
 
+/** Find the active reasoning accumulator (fallback when output_index is missing from delta). */
+function findActiveReasoningAccum(
+	reasoningAccum: Map<number, ResponsesReasoningAccum>,
+): ResponsesReasoningAccum | undefined {
+	// Return the last entry (most recently added)
+	let latest: ResponsesReasoningAccum | undefined;
+	for (const [, acc] of reasoningAccum) {
+		latest = acc;
+	}
+	return latest;
+}
+
 // === History builder ===
 
 function buildOAIHistory(dbMessages: DbMessage[]): {
@@ -1468,6 +1578,19 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 				.map((b: { text: string }) => b.text);
 			const text = textParts.join("\n") || msg.contentText || "";
 
+			// Extract reasoning blocks with their provider metadata for Responses API replay
+			const reasoningBlocks = content
+				.filter((b: { type: string }) => b.type === "reasoning")
+				.map(
+					(b: {
+						text: string;
+						providerMetadata?: import("./types").ReasoningProviderMetadata;
+					}) => ({
+						text: b.text,
+						providerMetadata: b.providerMetadata,
+					}),
+				);
+
 			const completedToolUseIds = new Set(
 				msg.toolCalls
 					?.filter((tc) => tc.status === "success" || tc.status === "fail")
@@ -1498,6 +1621,10 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			// Always set content explicitly to avoid sending {role:"assistant"} with no fields.
 			const assistantMsg: OAIMessage = { role: "assistant", content: hasText ? text : null };
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+			// Attach reasoning blocks for Responses API replay (stripped in buildHistory for Chat Completions)
+			if (reasoningBlocks.length > 0) {
+				assistantMsg._reasoningBlocks = reasoningBlocks;
+			}
 			history.push(assistantMsg);
 
 			// Collect tool results
@@ -1534,6 +1661,72 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 	return { history, trailingToolResults: pendingToolResults };
 }
 
+/**
+ * Emit Responses API reasoning items from stored reasoning blocks.
+ * Groups blocks by itemId — multiple summary parts with the same itemId
+ * are merged into a single reasoning item with multiple summary entries.
+ * Blocks without provider metadata (e.g. from non-Codex providers) are skipped.
+ */
+function emitReasoningItems(
+	reasoningBlocks:
+		| Array<{
+				text: string;
+				providerMetadata?: import("./types").ReasoningProviderMetadata;
+		  }>
+		| undefined,
+	// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
+	result: any[],
+	emittedIds: Set<string>,
+): void {
+	if (!reasoningBlocks?.length) return;
+
+	// Group by itemId for deduplication
+	const grouped = new Map<
+		string,
+		{
+			itemId: string;
+			encryptedContent?: string | null;
+			summaryTexts: string[];
+		}
+	>();
+
+	for (const block of reasoningBlocks) {
+		const itemId = block.providerMetadata?.openai?.itemId;
+		if (!itemId) continue; // Skip blocks without provider metadata
+		if (emittedIds.has(itemId)) continue; // Already emitted in a previous message
+
+		let group = grouped.get(itemId);
+		if (!group) {
+			group = {
+				itemId,
+				encryptedContent: block.providerMetadata?.openai?.reasoningEncryptedContent,
+				summaryTexts: [],
+			};
+			grouped.set(itemId, group);
+		}
+		if (block.text) {
+			group.summaryTexts.push(block.text);
+		}
+		// Update encrypted content if this block has a newer value
+		if (block.providerMetadata?.openai?.reasoningEncryptedContent != null) {
+			group.encryptedContent = block.providerMetadata.openai.reasoningEncryptedContent;
+		}
+	}
+
+	for (const [itemId, group] of grouped) {
+		emittedIds.add(itemId);
+		result.push({
+			type: "reasoning",
+			id: group.itemId,
+			encrypted_content: group.encryptedContent ?? null,
+			summary: group.summaryTexts.map((text) => ({
+				type: "summary_text",
+				text,
+			})),
+		});
+	}
+}
+
 // === Responses API history converter ===
 
 /**
@@ -1545,6 +1738,8 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
  */
 function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 	const result: OAIMessage[] = [];
+	// Track emitted reasoning item IDs to deduplicate (same itemId across multiple blocks)
+	const emittedReasoningIds = new Set<string>();
 	for (const msg of messages) {
 		// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
 		const m = msg as any;
@@ -1575,7 +1770,9 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 				output: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
 			} as unknown as OAIMessage);
 		} else if (m.role === "assistant" && m.tool_calls?.length) {
-			// Split assistant message with tool_calls into text + separate function_call items
+			// Split assistant message with tool_calls into reasoning + text + separate function_call items
+			// Emit reasoning items first (before text/tool_calls)
+			emitReasoningItems(m._reasoningBlocks, result, emittedReasoningIds);
 			if (m.content) {
 				const content =
 					typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
@@ -1593,6 +1790,8 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 			// Assistant message without tool calls — convert content to array format.
 			// Skip null/empty content because Responses API rejects role messages
 			// whose content is null.
+			// Emit reasoning items first
+			emitReasoningItems(m._reasoningBlocks, result, emittedReasoningIds);
 			if (typeof m.content === "string") {
 				if (!m.content) continue;
 				result.push({
