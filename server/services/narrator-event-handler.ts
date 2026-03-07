@@ -488,6 +488,9 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
+			// Track AI reasoning output character rate
+			recordOutputChunk(event.text.length);
+
 			const reasoningStreamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
 				delta: { type: "reasoning_delta", text: event.text },

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
 	and,
 	asc,
@@ -27,6 +28,7 @@ import {
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
+import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
 	getToolMessage,
@@ -579,9 +581,76 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	if (!permissionMode || !validModes.includes(permissionMode)) {
 		throw new ValidationError(`permissionMode must be one of: ${validModes.join(", ")}`);
 	}
-	await narratorService.getById(id); // ensure exists
+	const narrator = await narratorService.getById(id);
+	const currentMode = narrator.permissionMode;
 	await narratorService.updatePermissionMode(id, permissionMode);
 	await updateNarratorPermissionMode(id, permissionMode);
+
+	// Persist synthetic tool call messages so the model sees mode transitions
+	// when context is rebuilt from message history.
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+
+	if (permissionMode === "plan" && currentMode !== "plan") {
+		// Entering plan mode — synthetic EnterPlanMode
+		const toolUseId = `toolu_manual_${generateShortId()}`;
+		const msg = await narratorService.persistAssistantMessage(id, {
+			uuid: randomUUID(),
+			session_id: randomUUID(),
+			parent_tool_use_id: null,
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						id: toolUseId,
+						name: "EnterPlanMode",
+						input: {},
+					},
+				],
+			},
+		});
+		await narratorService.updateToolCallResult(toolUseId, {
+			output: getToolMessage("enterPlanModeOutput", locale as Locale),
+			status: "success",
+		});
+		const fullMsg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, msg.id),
+			with: { toolCalls: true },
+		});
+		if (fullMsg) {
+			broadcastToNarrator(id, { type: "message", narratorId: id, message: fullMsg });
+		}
+	} else if (currentMode === "plan" && permissionMode !== "plan") {
+		// Leaving plan mode — synthetic ExitPlanMode
+		const toolUseId = `toolu_manual_${generateShortId()}`;
+		const msg = await narratorService.persistAssistantMessage(id, {
+			uuid: randomUUID(),
+			session_id: randomUUID(),
+			parent_tool_use_id: null,
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						id: toolUseId,
+						name: "ExitPlanMode",
+						input: {},
+					},
+				],
+			},
+		});
+		await narratorService.updateToolCallResult(toolUseId, {
+			output: getToolMessage("exitPlanModeOutput", locale as Locale),
+			status: "success",
+		});
+		const fullMsg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, msg.id),
+			with: { toolCalls: true },
+		});
+		if (fullMsg) {
+			broadcastToNarrator(id, { type: "message", narratorId: id, message: fullMsg });
+		}
+	}
+
 	return c.json({ ok: true });
 });
 

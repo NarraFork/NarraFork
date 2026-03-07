@@ -2131,10 +2131,31 @@ export const narratorService = {
 			| "dontAsk",
 	) {
 		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ permissionMode, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
+
+		// When manually switching to plan mode, save the current mode so it can be restored on exit
+		if (permissionMode === "plan") {
+			const current = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { permissionMode: true },
+			});
+			const prevMode = current?.permissionMode ?? "default";
+			if (prevMode !== "plan") {
+				await db
+					.update(narrators)
+					.set({ permissionMode, previousPermissionMode: prevMode, updatedAt: now })
+					.where(eq(narrators.id, narratorId));
+			} else {
+				await db
+					.update(narrators)
+					.set({ permissionMode, updatedAt: now })
+					.where(eq(narrators.id, narratorId));
+			}
+		} else {
+			await db
+				.update(narrators)
+				.set({ permissionMode, previousPermissionMode: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+		}
 
 		// 同步权限模式到所有活跃的 subagent
 		await db

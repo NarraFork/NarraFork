@@ -1417,8 +1417,19 @@ async function runAgentLoop(
 				},
 				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
-					// Restore previous permission mode
-					const restoreMode = (active._previousPermissionMode ?? "default") as
+					// Restore previous permission mode — check in-memory first, then DB
+					let restoreMode = active._previousPermissionMode;
+					if (!restoreMode) {
+						const row = await db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { previousPermissionMode: true },
+						});
+						restoreMode = row?.previousPermissionMode ?? undefined;
+					}
+					// If the previous mode would block plan execution, fall back to default
+					const BLOCKED_MODES = new Set(["readOnly", "plan", "dontAsk"]);
+					const resolved = restoreMode && !BLOCKED_MODES.has(restoreMode) ? restoreMode : "default";
+					const finalMode = resolved as
 						| "default"
 						| "acceptEdits"
 						| "bypassPermissions"
@@ -1430,7 +1441,7 @@ async function runAgentLoop(
 					await db
 						.update(narrators)
 						.set({
-							permissionMode: restoreMode,
+							permissionMode: finalMode,
 							previousPermissionMode: null,
 							updatedAt: now,
 						})
@@ -1438,7 +1449,7 @@ async function runAgentLoop(
 					broadcastToNarrator(narratorId, {
 						type: "permission_mode_changed",
 						narratorId,
-						permissionMode: restoreMode,
+						permissionMode: finalMode,
 					});
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					if (pendingPlanCompact.has(narratorId)) {
@@ -2569,7 +2580,10 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 	}
 }
 
-export function updateNarratorPermissionMode(narratorId: string, mode: string): void {
+export async function updateNarratorPermissionMode(
+	narratorId: string,
+	mode: string,
+): Promise<void> {
 	// Permission mode is read from DB in real-time by handlePermission.
 	// When switching to/from plan mode, manage the plan file ID on the active narrator.
 	const active = activeNarrators.get(narratorId);
@@ -2578,8 +2592,11 @@ export function updateNarratorPermissionMode(narratorId: string, mode: string): 
 		if (!active._planFileId) {
 			active._planFileId = generateShortId();
 		}
+		// _previousPermissionMode is also persisted in DB by narratorService.updatePermissionMode,
+		// so onExitPlanMode will read it from DB if the in-memory value is missing.
 	} else {
 		active._planFileId = undefined;
+		active._previousPermissionMode = undefined;
 	}
 }
 
