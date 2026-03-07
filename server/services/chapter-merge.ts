@@ -527,6 +527,16 @@ export const chapterMerge = {
 			});
 		}
 
+		// Step 6: Remove merge summary messages injected into the target narrator
+		try {
+			await mergeSummaryService.cleanupForSource(sourceChapterId);
+		} catch (err) {
+			logger.warn("Failed to clean up merge summary messages during unmerge", {
+				sourceChapterId,
+				error: String(err),
+			});
+		}
+
 		eventBus.emit({ type: "chapter:woken", chapterId: sourceChapterId });
 
 		return { ok: true };

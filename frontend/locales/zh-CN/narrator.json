@@ -147,6 +147,8 @@
 	"mergeSummaryBranch": "分支",
 	"mergeSummaryStrategy": "策略",
 	"unmerge": "撤回合并 (reset)",
+	"unmergeConfirmTitle": "确认撤回合并",
+	"unmergeConfirmDesc": "这将把目标分支重置到合并 \"{{branch}}\" 之前的状态。源分支将恢复为活跃状态。此操作不可撤销。",
 	"unmergeSuccess": "撤回合并成功",
 	"unmergeSuccessDesc": "合并已回退，分支已恢复为活跃状态。",
 	"unmergeFailed": "撤回合并失败"

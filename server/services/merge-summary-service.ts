@@ -1,12 +1,18 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narratorMessages, narrators, projects, users } from "../db/schema";
+import {
+	chapters,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	projects,
+	users,
+} from "../db/schema";
 import { agentGenerateWithMeta } from "../lib/agent";
-import { eventBus } from "../lib/event-bus";
-import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 
 /** Maximum number of commits to include in the summary input. */
@@ -67,9 +73,11 @@ interface MergeSummaryInput {
 
 export const mergeSummaryService = {
 	/**
-	 * Asynchronously generate a merge summary and inject it as a system message
-	 * into the target chapter's primary narrator. Fire-and-forget — errors are logged
-	 * but never propagated to the caller.
+	 * Asynchronously generate a merge summary and inject it as a message
+	 * into the target chapter's primary narrator. Uses role="user" so the
+	 * SDK includes it in conversation history (role="system" is filtered
+	 * out by buildHistory). Fire-and-forget — errors are logged but never
+	 * propagated to the caller.
 	 */
 	async generateAndInject(input: MergeSummaryInput): Promise<void> {
 		const { sourceChapterId, targetChapterId, userId, strategy, commitSha } = input;
@@ -175,32 +183,21 @@ export const mergeSummaryService = {
 			const header = locale === "zh-CN" ? headerZh : headerEn;
 			const fullContent = `${header}\n\n${summary}`;
 
-			// Insert as a system message into the target narrator
-			const msgId = generateId();
-			const now = new Date().toISOString();
-
-			await db.insert(narratorMessages).values({
-				id: msgId,
-				narratorId: primaryNarrator.id,
-				role: "system",
-				contentJson: [
-					{
-						type: "merge_summary",
-						sourceBranch: source.branch,
-						sourceChapterId,
-						targetBranch: target.branch,
-						strategy,
-						commitSha: commitSha ?? null,
-						mergedBy: username ?? null,
-						summary,
-					},
-				],
-				contentText: fullContent,
-				createdAt: now,
-			});
-
-			// Append to narrator's message refs
-			await narratorService.appendMessageRefPublic(primaryNarrator.id, msgId);
+			// Insert via persistSystemMessage (role="user" + text block) so the
+			// SDK includes it in conversation history. Append a structured
+			// merge_summary block for the UI to render as a card.
+			const msg = await narratorService.persistSystemMessage(primaryNarrator.id, fullContent, [
+				{
+					type: "merge_summary",
+					sourceBranch: source.branch,
+					sourceChapterId,
+					targetBranch: target.branch,
+					strategy,
+					commitSha: commitSha ?? null,
+					mergedBy: username ?? null,
+					summary,
+				},
+			]);
 
 			logger.info("Merge summary injected", {
 				sourceChapterId,
@@ -209,13 +206,12 @@ export const mergeSummaryService = {
 				summaryLength: summary.length,
 			});
 
-			// Broadcast so the frontend can show the new message
-			eventBus.emit({
-				type: "chapter:merge_summary",
-				sourceId: sourceChapterId,
-				targetId: targetChapterId,
+			// Broadcast as a standard "message" event so the chat UI picks it up
+			// in real-time (same pattern as auto-commit messages).
+			broadcastToNarrator(primaryNarrator.id, {
+				type: "message",
 				narratorId: primaryNarrator.id,
-				summary,
+				message: msg,
 			});
 		} catch (err) {
 			logger.error("Merge summary generation failed (non-fatal)", {
@@ -224,5 +220,46 @@ export const mergeSummaryService = {
 				error: err instanceof Error ? err.message : String(err),
 			});
 		}
+	},
+
+	/**
+	 * Remove merge_summary messages for a given source chapter from all narrators.
+	 * Called during unmerge to clean up stale summary cards.
+	 *
+	 * Uses a JSON content search to find messages containing the sourceChapterId
+	 * in a merge_summary block, then deletes the message and its refs.
+	 */
+	async cleanupForSource(sourceChapterId: string): Promise<number> {
+		// Find messages whose contentJson contains a merge_summary block
+		// referencing this source chapter. SQLite JSON: content_json is stored
+		// as text, so we use LIKE for a simple substring match.
+		const rows = await db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(
+				and(
+					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+				),
+			);
+
+		if (rows.length === 0) return 0;
+
+		const ids = rows.map((r) => r.id);
+
+		// Delete refs first (FK), then messages
+		await db.transaction(async (tx) => {
+			for (const id of ids) {
+				await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id));
+				await tx.delete(narratorMessages).where(eq(narratorMessages.id, id));
+			}
+		});
+
+		logger.info("Cleaned up merge summary messages", {
+			sourceChapterId,
+			deletedCount: ids.length,
+		});
+
+		return ids.length;
 	},
 };
