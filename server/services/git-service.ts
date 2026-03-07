@@ -729,7 +729,12 @@ export const gitService = {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
 			if (result.exitCode !== 0) {
-				throw new Error(`git revert failed: ${result.stderr}`);
+				// Abort the failed revert to leave worktree clean
+				await exec(["revert", "--abort"], worktreePath);
+				throw new Error(
+					`git revert produced conflicts — the merge cannot be automatically undone. ` +
+						`Resolve manually with: git revert -m 1 ${commitSha}`,
+				);
 			}
 			const head = await exec(["rev-parse", "HEAD"], worktreePath);
 			return head.stdout.trim();
@@ -741,7 +746,11 @@ export const gitService = {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
 			if (result.exitCode !== 0) {
-				throw new Error(`git revert failed: ${result.stderr}`);
+				await exec(["revert", "--abort"], worktreePath);
+				throw new Error(
+					`git revert produced conflicts — the merge cannot be automatically undone. ` +
+						`Resolve manually with: git revert ${commitSha}`,
+				);
 			}
 			const head = await exec(["rev-parse", "HEAD"], worktreePath);
 			return head.stdout.trim();

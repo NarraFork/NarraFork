@@ -422,15 +422,23 @@ export const chapterMerge = {
 		} else {
 			// Target has new commits — revert instead to preserve them
 			const isMerge = await gitService.isMergeCommit(target.worktreePath, source.mergeCommitSha);
-			const revertSha = isMerge
-				? await gitService.revertMergeCommit(target.worktreePath, source.mergeCommitSha)
-				: await gitService.revertCommit(target.worktreePath, source.mergeCommitSha);
-			logger.info("Reverted merge commit on target (target had advanced)", {
-				sourceChapterId,
-				targetChapterId: target.id,
-				mergeCommitSha: source.mergeCommitSha,
-				revertSha,
-			});
+			try {
+				const revertSha = isMerge
+					? await gitService.revertMergeCommit(target.worktreePath, source.mergeCommitSha)
+					: await gitService.revertCommit(target.worktreePath, source.mergeCommitSha);
+				logger.info("Reverted merge commit on target (target had advanced)", {
+					sourceChapterId,
+					targetChapterId: target.id,
+					mergeCommitSha: source.mergeCommitSha,
+					revertSha,
+				});
+			} catch (err) {
+				throw new ValidationError(
+					`Cannot automatically unmerge: revert of ${source.mergeCommitSha.slice(0, 7)} ` +
+						`conflicts with later commits on the target branch. ` +
+						`Please resolve manually in the target worktree.`,
+				);
+			}
 		}
 
 		// Step 2: Sync target chapter's commit list after undo
