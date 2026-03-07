@@ -54,7 +54,10 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	});
 	const wakeChapter = useMutation({
 		mutationFn: () => api.wakeChapter(chapterId),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["chapters", chapterId] }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["chapters", chapterId] });
+			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+		},
 	});
 
 	const [forkModalOpen, setForkModalOpen] = useState(false);
