@@ -102,5 +102,11 @@
 	"containerPaused": "容器已暂停",
 	"containerStopped": "容器已停止",
 	"containerCreated": "容器已创建",
-	"containerRemoved": "容器已移除"
+	"containerRemoved": "容器已移除",
+	"browse": "浏览",
+	"selectDirectory": "选择目录",
+	"selectThisDirectory": "选择此目录",
+	"goUp": "上一级",
+	"emptyDirectory": "空目录",
+	"cancel": "取消"
 }

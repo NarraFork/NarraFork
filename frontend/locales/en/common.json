@@ -102,5 +102,11 @@
 	"containerPaused": "Container paused",
 	"containerStopped": "Container stopped",
 	"containerCreated": "Container created",
-	"containerRemoved": "Container removed"
+	"containerRemoved": "Container removed",
+	"browse": "Browse",
+	"selectDirectory": "Select Directory",
+	"selectThisDirectory": "Select This Directory",
+	"goUp": "Go up",
+	"emptyDirectory": "Empty directory",
+	"cancel": "Cancel"
 }

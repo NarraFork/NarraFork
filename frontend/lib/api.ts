@@ -1275,6 +1275,19 @@ export const api = {
 			models: Array<{ id: string; display_name?: string }>;
 			fromCache: boolean;
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
+
+	// Health / platform
+	health: () => request<{ status: string; platform: "windows" | "macos" | "linux" }>("/health"),
+
+	// Filesystem browsing
+	fsBrowse: (path?: string) =>
+		request<{
+			path: string;
+			entries: Array<{ name: string; path: string }>;
+			drives?: Array<{ name: string; path: string }>;
+			parent?: string | null;
+			sep: string;
+		}>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
 };
 
 	text: string,

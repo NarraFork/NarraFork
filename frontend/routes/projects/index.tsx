@@ -16,6 +16,8 @@ import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DirectoryPicker } from "../../components/common/DirectoryPicker";
+import { usePlatform } from "../../hooks/usePlatform";
 import { useCreateProject, useProjects } from "../../hooks/useProjects";
 
 export const Route = createFileRoute("/projects/")({
@@ -33,6 +35,10 @@ function ProjectListPage() {
 	const [cloneBranch, setCloneBranch] = useState("");
 	const { t } = useTranslation("projects");
 	const { t: tc } = useTranslation("common");
+	const platform = usePlatform();
+
+	const pathPlaceholder =
+		platform === "windows" ? "E:\\Code\\my-repo" : "/home/user/projects/my-repo";
 
 	const handleCreate = () => {
 		if (!name.trim()) return;
@@ -143,11 +149,11 @@ function ProjectListPage() {
 							/>
 						</>
 					)}
-					<TextInput
+					<DirectoryPicker
 						label={t("repositoryPath")}
-						placeholder={t("repositoryPathPlaceholder")}
+						placeholder={pathPlaceholder}
 						value={repoPath}
-						onChange={(e) => setRepoPath(e.currentTarget.value)}
+						onChange={setRepoPath}
 						description={
 							repoMode === "init"
 								? t("initPathDescription")

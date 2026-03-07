@@ -5,7 +5,6 @@
 	"projectName": "Project Name",
 	"projectNamePlaceholder": "My Project",
 	"repositoryPath": "Repository Path",
-	"repositoryPathPlaceholder": "/path/to/my-repo",
 	"repositoryPathDescription": "Local path to an existing git repository",
 	"projectNotFound": "Project not found",
 	"repoMode": "Repository",
