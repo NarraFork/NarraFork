@@ -299,12 +299,16 @@ function MergeSummaryCard({
 }) {
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
+	const [confirmOpen, { open: openConfirm, close: closeConfirm }] = useDisclosure(false);
 	const qc = useQueryClient();
 
 	const unmergeMutation = useMutation({
 		mutationFn: () => api.unmergeChapter(block.sourceChapterId),
 		onSuccess: () => {
+			closeConfirm();
 			close();
+			// The backend deletes the merge_summary message during unmerge,
+			// so invalidating messages will remove this card from the list.
 			onDelete?.();
 			qc.invalidateQueries({ queryKey: ["storyGraph"] });
 			qc.invalidateQueries({ queryKey: ["chapters"] });
@@ -402,17 +406,31 @@ function MergeSummaryCard({
 
 				{block.sourceChapterId && (
 					<Group justify="flex-end" mt="md">
-						<Button
-							color="orange"
-							variant="light"
-							size="xs"
-							loading={unmergeMutation.isPending}
-							onClick={() => unmergeMutation.mutate()}
-						>
+						<Button color="orange" variant="light" size="xs" onClick={openConfirm}>
 							{t("unmerge")}
 						</Button>
 					</Group>
 				)}
+			</Modal>
+
+			{/* Confirmation dialog for unmerge */}
+			<Modal opened={confirmOpen} onClose={closeConfirm} title={t("unmergeConfirmTitle")} size="sm">
+				<Text size="sm" mb="md">
+					{t("unmergeConfirmDesc", { branch: block.sourceBranch })}
+				</Text>
+				<Group justify="flex-end">
+					<Button variant="default" size="xs" onClick={closeConfirm}>
+						{t("cancel")}
+					</Button>
+					<Button
+						color="orange"
+						size="xs"
+						loading={unmergeMutation.isPending}
+						onClick={() => unmergeMutation.mutate()}
+					>
+						{t("unmerge")}
+					</Button>
+				</Group>
 			</Modal>
 		</>
 	);
@@ -753,13 +771,16 @@ export const MessageBubble = memo(function MessageBubble({
 		onDeleteBlock,
 	]);
 
-	// System messages (compact indicators / plan cards / merge summaries)
+	// Merge summary cards — rendered for both role="system" (legacy) and role="user"
+	// (new: persistSystemMessage uses role="user" so the SDK includes it in context).
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const mergeSummaryBlock = blocks.find((b: any) => b.type === "merge_summary");
+	if (mergeSummaryBlock) {
+		return <MergeSummaryCard block={mergeSummaryBlock} onDelete={invalidateMessages} />;
+	}
+
+	// System messages (compact indicators / plan cards)
 	if (message.role === "system") {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const mergeSummaryBlock = blocks.find((b: any) => b.type === "merge_summary");
-		if (mergeSummaryBlock) {
-			return <MergeSummaryCard block={mergeSummaryBlock} onDelete={invalidateMessages} />;
-		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (compactBlock) {

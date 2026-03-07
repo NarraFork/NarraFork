@@ -19,13 +19,6 @@ export type NarraForkEvent =
 			newForkChapterId: string;
 			commitSha: string;
 	  }
-	| {
-			type: "chapter:merge_summary";
-			sourceId: string;
-			targetId: string;
-			narratorId: string;
-			summary: string;
-	  }
 	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] } // TODO: not yet emitted
 	| { type: "chapter:frozen"; chapterId: string } // TODO: not yet emitted
 	| { type: "chapter:role_changed"; chapterId: string; role: string } // TODO: not yet emitted

@@ -149,6 +149,8 @@
 	"mergeSummaryBranch": "Branch",
 	"mergeSummaryStrategy": "Strategy",
 	"unmerge": "Unmerge (reset)",
+	"unmergeConfirmTitle": "Confirm Unmerge",
+	"unmergeConfirmDesc": "This will reset the target branch to before the merge of \"{{branch}}\". The source branch will be restored to active. This cannot be undone.",
 	"unmergeSuccess": "Unmerge successful",
 	"unmergeSuccessDesc": "The merge has been reverted and the branch is active again.",
 	"unmergeFailed": "Unmerge failed"
