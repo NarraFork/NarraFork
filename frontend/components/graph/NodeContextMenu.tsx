@@ -16,6 +16,7 @@ interface NodeContextMenuProps {
 	onSetRole: (nodeId: string, role: string) => void;
 	onDormant: (nodeId: string) => void;
 	onWake: (nodeId: string) => void;
+	onUnmerge: (nodeId: string) => void;
 	onDelete: (nodeId: string) => void;
 }
 
@@ -29,6 +30,7 @@ export function NodeContextMenu({
 	onSetRole,
 	onDormant,
 	onWake,
+	onUnmerge,
 	onDelete,
 }: NodeContextMenuProps) {
 	const { t } = useTranslation("graph");
@@ -106,6 +108,18 @@ export function NodeContextMenu({
 									style={{ borderRadius: 4 }}
 								>
 									<Text size="sm">{t("contextMenu.wake")}</Text>
+								</UnstyledButton>
+							)}
+							{nodeData.status === "merged" && (
+								<UnstyledButton
+									px="xs"
+									py={4}
+									onClick={() => onUnmerge(nodeId)}
+									style={{ borderRadius: 4 }}
+								>
+									<Text size="sm" c="orange">
+										{t("contextMenu.unmerge")}
+									</Text>
 								</UnstyledButton>
 							)}
 							<Divider my={4} />

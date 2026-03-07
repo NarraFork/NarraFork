@@ -80,6 +80,11 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["storyGraph"] }),
 	});
 
+	const unmergeMutation = useMutation({
+		mutationFn: (id: string) => api.unmergeChapter(id),
+		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["storyGraph"] }),
+	});
+
 	const deleteChapter = useDeleteChapter();
 	const { removeTab } = useRecentTabs();
 
@@ -201,6 +206,14 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		[wakeMutation],
 	);
 
+	const handleUnmerge = useCallback(
+		(nodeId: string) => {
+			setContextMenu(null);
+			unmergeMutation.mutate(nodeId);
+		},
+		[unmergeMutation],
+	);
+
 	const handleDelete = useCallback(
 		(nodeId: string) => {
 			setContextMenu(null);
@@ -308,6 +321,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 						onSetRole={handleSetRole}
 						onDormant={handleDormant}
 						onWake={handleWake}
+						onUnmerge={handleUnmerge}
 						onDelete={handleDelete}
 					/>
 				)}

@@ -713,4 +713,39 @@ export const gitService = {
 			if (result.exitCode !== 0) throw new Error(`git reset --hard failed: ${result.stderr}`);
 		});
 	},
+
+	// === Revert ===
+
+	/** Revert a merge commit (using -m 1 to specify the mainline parent) */
+	async revertMergeCommit(worktreePath: string, commitSha: string): Promise<string> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
+			if (result.exitCode !== 0) {
+				throw new Error(`git revert failed: ${result.stderr}`);
+			}
+			// Return the revert commit SHA
+			const head = await exec(["rev-parse", "HEAD"], worktreePath);
+			return head.stdout.trim();
+		});
+	},
+
+	/** Revert a regular (non-merge) commit */
+	async revertCommit(worktreePath: string, commitSha: string): Promise<string> {
+		return withWorktreeLock(worktreePath, async () => {
+			const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
+			if (result.exitCode !== 0) {
+				throw new Error(`git revert failed: ${result.stderr}`);
+			}
+			const head = await exec(["rev-parse", "HEAD"], worktreePath);
+			return head.stdout.trim();
+		});
+	},
+
+	/** Check if a commit is a merge commit (has more than one parent) */
+	async isMergeCommit(worktreePath: string, commitSha: string): Promise<boolean> {
+		const result = await exec(["cat-file", "-p", commitSha], worktreePath);
+		if (result.exitCode !== 0) return false;
+		const parentLines = result.stdout.split("\n").filter((l) => l.startsWith("parent "));
+		return parentLines.length > 1;
+	},
 };

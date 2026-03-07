@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects } from "../db/schema";
@@ -371,6 +372,109 @@ export const chapterMerge = {
 	): Promise<AiResolveResult> {
 		await this.markMerged(sourceChapterId, targetChapterId, strategy, commitSha);
 		return { resolved: true, mergeResult: { success: true, commitSha } };
+	},
+
+	/**
+	 * Unmerge a chapter: revert the merge commit on the target branch,
+	 * then wake the source chapter back to active.
+	 */
+	async unmerge(sourceChapterId: string): Promise<{ revertCommitSha: string }> {
+		const source = await db.query.chapters.findFirst({
+			where: eq(chapters.id, sourceChapterId),
+		});
+		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
+		if (source.status !== "merged") {
+			throw new ValidationError("Can only unmerge chapters with merged status");
+		}
+		if (!source.mergedIntoChapterId) {
+			throw new ValidationError("Chapter has no merge target recorded");
+		}
+		if (!source.mergeCommitSha) {
+			throw new ValidationError("Chapter has no merge commit SHA recorded — cannot revert");
+		}
+
+		const target = await db.query.chapters.findFirst({
+			where: eq(chapters.id, source.mergedIntoChapterId),
+		});
+		if (!target) throw new NotFoundError("Chapter", source.mergedIntoChapterId);
+		if (!target.worktreePath) {
+			throw new ValidationError("Target chapter has no active worktree — cannot revert");
+		}
+
+		const gitPath = await getProjectGitPath(source.projectId);
+
+		// Step 1: Revert the merge commit on the target branch
+		const isMerge = await gitService.isMergeCommit(target.worktreePath, source.mergeCommitSha);
+		const revertCommitSha = isMerge
+			? await gitService.revertMergeCommit(target.worktreePath, source.mergeCommitSha)
+			: await gitService.revertCommit(target.worktreePath, source.mergeCommitSha);
+
+		logger.info("Reverted merge commit on target", {
+			sourceChapterId,
+			targetChapterId: target.id,
+			mergeCommitSha: source.mergeCommitSha,
+			revertCommitSha,
+		});
+
+		// Record the revert commit on the target chapter
+		try {
+			await commitSyncService.recordCommit({
+				chapterId: target.id,
+				sha: revertCommitSha,
+				message: `Revert merge of ${source.branch}`,
+				source: "merge",
+			});
+		} catch (err) {
+			logger.warn("Failed to record revert commit (non-fatal)", {
+				targetChapterId: target.id,
+				revertCommitSha,
+				error: String(err),
+			});
+		}
+
+		// Step 2: Re-create worktree for the source chapter
+		const branchSuffix = source.branch.split("/").slice(1).join("/");
+		const worktreePath = resolve(gitPath, ".worktrees", branchSuffix);
+		await gitService.createWorktree(gitPath, worktreePath, source.branch);
+
+		// Step 3: Update source chapter DB state
+		const now = new Date().toISOString();
+		try {
+			await db
+				.update(chapters)
+				.set({
+					status: "active",
+					worktreePath,
+					mergedIntoChapterId: null,
+					mergeCommitSha: null,
+					mergeStrategy: null,
+					lastAccessedAt: now,
+					updatedAt: now,
+				})
+				.where(eq(chapters.id, sourceChapterId));
+		} catch (dbErr) {
+			// Clean up orphan worktree on DB failure
+			try {
+				await gitService.removeWorktree(gitPath, worktreePath);
+			} catch {
+				// best effort
+			}
+			throw dbErr;
+		}
+
+		// Step 4: Remove merge edges
+		try {
+			await chapterEdgeService.deleteMergeEdgesBySource(sourceChapterId);
+		} catch (err) {
+			logger.warn("Failed to remove merge edges during unmerge", {
+				sourceChapterId,
+				error: String(err),
+			});
+		}
+
+		eventBus.emit({ type: "chapter:woken", chapterId: sourceChapterId });
+
+		return { revertCommitSha };
 	},
 };
 
