@@ -141,5 +141,13 @@
 	"backgroundFailed": "后台任务失败",
 	"backgroundCancelled": "后台任务已取消",
 	"backgroundTaskCompletedTitle": "后台任务完成",
-	"backgroundTaskFailedTitle": "后台任务失败"
+	"backgroundTaskFailedTitle": "后台任务失败",
+	"mergeSummaryLabel": "分支已合并",
+	"mergeSummaryTitle": "合并摘要",
+	"mergeSummaryBranch": "分支",
+	"mergeSummaryStrategy": "策略",
+	"unmerge": "撤回合并 (reset)",
+	"unmergeSuccess": "撤回合并成功",
+	"unmergeSuccessDesc": "合并已回退，分支已恢复为活跃状态。",
+	"unmergeFailed": "撤回合并失败"
 }
