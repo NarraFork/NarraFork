@@ -105,6 +105,9 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 		queryFn: () => api.fsBrowse(currentPath),
 	});
 
+	const hasDrives = (data?.drives?.length ?? 0) > 0;
+	const isAtDriveRoot = !data?.path && hasDrives;
+
 	const navigateTo = useCallback((path: string) => {
 		setCurrentPath(path);
 	}, []);
@@ -112,12 +115,11 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 	const goUp = useCallback(() => {
 		if (data?.parent) {
 			setCurrentPath(data.parent);
-		} else if (data?.drives) {
-			// Already at root with drives — nowhere to go
-		} else {
+		} else if (hasDrives) {
+			// Go back to drive selection
 			setCurrentPath(undefined);
 		}
-	}, [data]);
+	}, [data, hasDrives]);
 
 	// Build breadcrumb segments from current path
 	const breadcrumbs = data?.path ? buildBreadcrumbs(data.path, data.sep) : [];
@@ -129,24 +131,30 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 				<ActionIcon
 					variant="subtle"
 					onClick={goUp}
-					disabled={!data?.parent && !data?.drives}
+					disabled={isAtDriveRoot || (!data?.parent && !hasDrives)}
 					aria-label={t("goUp")}
 				>
 					<IconArrowUp size={18} />
 				</ActionIcon>
 				<ScrollArea type="auto" style={{ flex: 1 }} offsetScrollbars={false}>
-					<Breadcrumbs separator={data?.sep || "/"} styles={{ separator: { margin: "0 2px" } }}>
-						{breadcrumbs.map((seg) => (
-							<UnstyledButton
-								key={seg.path}
-								onClick={() => navigateTo(seg.path)}
-								fz="sm"
-								style={{ whiteSpace: "nowrap" }}
-							>
-								{seg.name}
-							</UnstyledButton>
-						))}
-					</Breadcrumbs>
+					{isAtDriveRoot ? (
+						<Text size="sm" c="dimmed">
+							{t("selectDrive")}
+						</Text>
+					) : (
+						<Breadcrumbs separator={data?.sep || "/"} styles={{ separator: { margin: "0 2px" } }}>
+							{breadcrumbs.map((seg) => (
+								<UnstyledButton
+									key={seg.path}
+									onClick={() => navigateTo(seg.path)}
+									fz="sm"
+									style={{ whiteSpace: "nowrap" }}
+								>
+									{seg.name}
+								</UnstyledButton>
+							))}
+						</Breadcrumbs>
+					)}
 				</ScrollArea>
 			</Group>
 
@@ -160,24 +168,25 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 				)}
 				{data && (
 					<Stack gap={2}>
-						{/* Drive letters (Windows) */}
-						{data.drives?.map((drive) => (
-							<UnstyledButton
-								key={drive.path}
-								onClick={() => navigateTo(drive.path)}
-								px="sm"
-								py={6}
-								style={{ borderRadius: 4 }}
-								className="dir-entry"
-							>
-								<Group gap="xs" wrap="nowrap">
-									<IconDeviceDesktop size={18} style={{ flexShrink: 0 }} />
-									<Text size="sm" truncate>
-										{drive.name}
-									</Text>
-								</Group>
-							</UnstyledButton>
-						))}
+						{/* Drive letters (Windows) — only show at drive root */}
+						{isAtDriveRoot &&
+							data.drives?.map((drive) => (
+								<UnstyledButton
+									key={drive.path}
+									onClick={() => navigateTo(drive.path)}
+									px="sm"
+									py={6}
+									style={{ borderRadius: 4 }}
+									className="dir-entry"
+								>
+									<Group gap="xs" wrap="nowrap">
+										<IconDeviceDesktop size={18} style={{ flexShrink: 0 }} />
+										<Text size="sm" truncate>
+											{drive.name}
+										</Text>
+									</Group>
+								</UnstyledButton>
+							))}
 						{/* Subdirectories */}
 						{data.entries.map((entry) => (
 							<UnstyledButton

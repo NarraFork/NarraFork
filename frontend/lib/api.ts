@@ -1282,7 +1282,7 @@ export const api = {
 	// Filesystem browsing
 	fsBrowse: (path?: string) =>
 		request<{
-			path: string;
+			path: string | null;
 			entries: Array<{ name: string; path: string }>;
 			drives?: Array<{ name: string; path: string }>;
 			parent?: string | null;

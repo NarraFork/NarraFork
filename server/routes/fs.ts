@@ -16,12 +16,15 @@ export const fsRoutes = new Hono();
 fsRoutes.get("/browse", (c) => {
 	const rawPath = c.req.query("path");
 	const isWin = process.platform === "win32";
+	const drives = isWin ? getWindowsDrives() : [];
 
-	// No path: return home + drives (Windows) or home contents
+	// No path: on Windows show drives only; on Unix show home contents
 	if (!rawPath) {
+		if (isWin) {
+			return c.json({ path: null, entries: [], drives, sep });
+		}
 		const home = homedir();
 		const entries = listDirs(home);
-		const drives = isWin ? getWindowsDrives() : [];
 		return c.json({ path: home, entries, drives, sep });
 	}
 
@@ -44,7 +47,7 @@ fsRoutes.get("/browse", (c) => {
 	// Compute parent (null if at root)
 	const parent = getParent(absPath, isWin);
 
-	return c.json({ path: absPath, entries, parent, sep });
+	return c.json({ path: absPath, entries, drives, parent, sep });
 });
 
 /** List immediate subdirectories of a path. */

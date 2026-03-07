@@ -108,5 +108,6 @@
 	"selectThisDirectory": "选择此目录",
 	"goUp": "上一级",
 	"emptyDirectory": "空目录",
+	"selectDrive": "选择磁盘",
 	"cancel": "取消"
 }
