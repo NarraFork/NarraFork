@@ -1,4 +1,5 @@
 import { api } from "@frontend/lib/api";
+import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	Badge,
 	Box,
@@ -38,13 +39,6 @@ const STATUS_ICONS: Record<string, typeof IconFile> = {
 	deleted: IconFileMinus,
 	modified: IconPencil,
 	renamed: IconFileSymlink,
-};
-
-const STATUS_COLORS: Record<string, string> = {
-	added: "green",
-	deleted: "red",
-	modified: "yellow",
-	renamed: "blue",
 };
 
 function DiffBlock({ diff }: { diff: string }) {
@@ -128,7 +122,7 @@ function FileDiffRow({
 	const hasInline = inlineDiff != null;
 	const [expanded, setExpanded] = useState(hasInline);
 	const StatusIcon = STATUS_ICONS[file.status] ?? IconFile;
-	const statusColor = STATUS_COLORS[file.status] ?? "gray";
+	const statusColor = statusRegistry.gitFileStatus(file.status).color;
 
 	// Only fetch diff when expanded AND no inline diff was provided
 	const { data: diffData, isLoading } = useQuery({
@@ -238,7 +232,7 @@ export function CommitDetailModal({
 							<Text size="xs" c="dimmed">
 								{new Date(data.authoredAt).toLocaleString()}
 							</Text>
-							<Badge size="xs" variant="light" color={STATUS_COLORS[data.source] ?? "gray"}>
+							<Badge size="xs" variant="light" color="gray">
 								{data.source}
 							</Badge>
 						</Group>

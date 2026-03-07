@@ -1,3 +1,4 @@
+import { statusRegistry } from "@frontend/lib/status-registry";
 import { type EdgeProps, getSmoothStepPath } from "@xyflow/react";
 
 export function MergeEdge({
@@ -26,7 +27,7 @@ export function MergeEdge({
 			style={{
 				...style,
 				strokeWidth: 2,
-				stroke: "#40c057",
+				stroke: statusRegistry.edgeType("merge").color,
 				strokeDasharray: "5,5",
 			}}
 			className="react-flow__edge-path animated"

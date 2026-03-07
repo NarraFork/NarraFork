@@ -115,13 +115,8 @@ interface ToolCallCardProps {
 
 export const TOOL_CARD_BG = "color-mix(in srgb, var(--mantine-color-body) 50%, transparent)";
 
-export const STATUS_COLORS: Record<string, string> = {
-	initializing: "gray",
-	pending: "yellow",
-	running: "blue",
-	success: "green",
-	fail: "red",
-};
+import { TOOL_CALL_STATUS_COLORS as STATUS_COLORS } from "@frontend/lib/status-registry";
+export { STATUS_COLORS };
 
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit"]);
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);

@@ -1,3 +1,4 @@
+import { statusRegistry } from "@frontend/lib/status-registry";
 import { BaseEdge, type EdgeProps, getSmoothStepPath } from "@xyflow/react";
 
 export function CherryPickEdge({
@@ -24,7 +25,7 @@ export function CherryPickEdge({
 			{...props}
 			path={edgePath}
 			style={{
-				stroke: "#7950f2",
+				stroke: statusRegistry.edgeType("cherry_pick").color,
 				strokeWidth: 2,
 				strokeDasharray: "4 4",
 				...style,

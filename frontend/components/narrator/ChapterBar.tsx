@@ -8,7 +8,7 @@ import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useContainers } from "@frontend/hooks/useContainers";
 import { type ApiError, api } from "@frontend/lib/api";
-import { CHAPTER_ROLE_ICONS } from "@frontend/lib/constants";
+import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
 import {
 	ActionIcon,
 	Badge,
@@ -42,6 +42,7 @@ interface ChapterBarProps {
 export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const { t } = useTranslation("chapters");
 	const { t: tn } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 	const navigate = useNavigate();
 	const { data: chapter } = useChapter(chapterId);
 	const { data: gitStatus } = useChapterGitStatus(chapterId);
@@ -150,8 +151,12 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 							</UnstyledButton>
 						)}
 					{chapter.status !== "active" && (
-						<Badge size="xs" variant="light" color={chapter.status === "frozen" ? "blue" : "gray"}>
-							{chapter.status}
+						<Badge
+							size="xs"
+							variant="light"
+							color={statusRegistry.chapterStatus(chapter.status).color}
+						>
+							{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
 						</Badge>
 					)}
 				</Group>

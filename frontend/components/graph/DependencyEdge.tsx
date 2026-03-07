@@ -1,3 +1,4 @@
+import { statusRegistry } from "@frontend/lib/status-registry";
 import { BaseEdge, type EdgeProps, getSmoothStepPath } from "@xyflow/react";
 
 export function DependencyEdge({
@@ -24,7 +25,7 @@ export function DependencyEdge({
 			{...props}
 			path={edgePath}
 			style={{
-				stroke: "#fd7e14",
+				stroke: statusRegistry.edgeType("dependency").color,
 				strokeWidth: 2,
 				strokeDasharray: "8 4",
 				...style,

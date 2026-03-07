@@ -2,7 +2,7 @@ import { Badge, Card, Group, Text } from "@mantine/core";
 import { IconGitCommit } from "@tabler/icons-react";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
-import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS } from "../../lib/constants";
+import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
 
 interface ChapterNodeData {
 	title: string;
@@ -21,6 +21,7 @@ interface ChapterNodeData {
 export function ChapterNode({ data }: NodeProps) {
 	const d = data as ChapterNodeData;
 	const { t } = useTranslation("graph");
+	const { t: tc } = useTranslation("common");
 
 	const role = d.role ?? "branch";
 	const isRoot = !!d.isRoot;
@@ -69,7 +70,7 @@ export function ChapterNode({ data }: NodeProps) {
 							width: 8,
 							height: 8,
 							borderRadius: "50%",
-							backgroundColor: "#fd7e14",
+							backgroundColor: statusRegistry.edgeType("dependency").color,
 						}}
 					/>
 				)}
@@ -79,7 +80,7 @@ export function ChapterNode({ data }: NodeProps) {
 						{d.title}
 					</Text>
 					<Badge size="xs" color={CHAPTER_STATUS_COLORS[d.status] ?? "gray"}>
-						{d.status}
+						{tc(statusRegistry.chapterStatus(d.status).i18nKey)}
 					</Badge>
 				</Group>
 				<Text size="xs" c="dimmed" lineClamp={1}>

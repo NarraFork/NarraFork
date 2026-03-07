@@ -1,3 +1,4 @@
+import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	ActionIcon,
 	Badge,
@@ -22,14 +23,6 @@ import {
 	useGitUnstage,
 } from "../../hooks/useGit";
 import { GitFileDiff } from "./GitFileDiff";
-
-const STATUS_COLORS: Record<string, string> = {
-	M: "yellow",
-	A: "green",
-	D: "red",
-	R: "blue",
-	"??": "gray",
-};
 
 /** Max files to render per section to avoid UI freeze. */
 const MAX_DISPLAY_FILES = 80;
@@ -246,7 +239,7 @@ function FileRow({
 	t: (key: string) => string;
 }) {
 	const statusChar = file.status.replace(/\s/g, "") || "M";
-	const color = STATUS_COLORS[statusChar] ?? STATUS_COLORS.M;
+	const color = statusRegistry.gitFileStatus(statusChar).color;
 
 	return (
 		<Group
