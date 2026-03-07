@@ -27,6 +27,8 @@ export interface GraphEdge {
 	source: string;
 	target: string;
 	type?: string;
+	sourceHandle?: string;
+	targetHandle?: string;
 	data?: {
 		type?: "fork" | "merge" | "dependency" | "cherry_pick";
 		[key: string]: unknown;
@@ -66,7 +68,12 @@ function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
 	const autoNodeIds = new Set(autoNodes.map((n) => n.id));
 	for (const edge of edges) {
 		if (autoNodeIds.has(edge.source) && autoNodeIds.has(edge.target)) {
-			g.setEdge(edge.source, edge.target);
+			// Only fork edges participate in dagre vertical ranking.
+			// Merge edges connect horizontally and should not affect the hierarchy.
+			const edgeType = edge.type ?? edge.data?.type;
+			if (edgeType !== "merge") {
+				g.setEdge(edge.source, edge.target);
+			}
 		}
 	}
 
@@ -86,6 +93,61 @@ function applyDagreLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
 	return [...manualNodes, ...layoutAutoNodes];
 }
 
+function assignAdaptiveHandles(
+	edge: GraphEdge,
+	sourceNode: GraphNode,
+	targetNode: GraphNode,
+): GraphEdge {
+	const dx = targetNode.position.x - sourceNode.position.x;
+	const dy = targetNode.position.y - sourceNode.position.y;
+	const absDx = Math.abs(dx);
+	const absDy = Math.abs(dy);
+
+	if (absDx > absDy * 0.8) {
+		if (dx > 0) {
+			return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
+		}
+		return { ...edge, sourceHandle: "left-src", targetHandle: "right" };
+	}
+
+	if (dy > 0) {
+		return { ...edge, sourceHandle: "bottom-src", targetHandle: "top" };
+	}
+	return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
+}
+
+function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): GraphEdge[] {
+	const nodeMap = new Map<string, GraphNode>();
+	for (const node of nodes) {
+		nodeMap.set(node.id, node);
+	}
+
+	return edges.map((edge) => {
+		const sourceNode = nodeMap.get(edge.source);
+		const targetNode = nodeMap.get(edge.target);
+		if (!sourceNode || !targetNode) return edge;
+
+		const edgeType = edge.type ?? edge.data?.type;
+
+		if (edgeType === "fork") {
+			return { ...edge, sourceHandle: "bottom-src", targetHandle: "top" };
+		}
+
+		if (edgeType === "merge") {
+			const dx = targetNode.position.x - sourceNode.position.x;
+			if (dx > 0) {
+				return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
+			}
+			if (dx < 0) {
+				return { ...edge, sourceHandle: "left-src", targetHandle: "right" };
+			}
+			return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
+		}
+
+		return assignAdaptiveHandles(edge, sourceNode, targetNode);
+	});
+}
+
 export function useStoryGraph(projectId: string) {
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["storyGraph", projectId],
@@ -102,9 +164,10 @@ export function useStoryGraph(projectId: string) {
 				explorationGroups: [] as ExplorationGroup[],
 			};
 		const layoutNodes = applyDagreLayout(data.nodes as GraphNode[], data.edges as GraphEdge[]);
+		const layoutEdges = assignEdgeHandles(layoutNodes, data.edges as GraphEdge[]);
 		return {
 			nodes: layoutNodes,
-			edges: data.edges as GraphEdge[],
+			edges: layoutEdges,
 			explorationGroups: (data.explorationGroups ?? []) as ExplorationGroup[],
 		};
 	}, [data]);
