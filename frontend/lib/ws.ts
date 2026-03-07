@@ -2,24 +2,49 @@
  * Build a WebSocket URL for the given path (e.g. "/ws/narrator").
  *
  * Bun's `node:http` compatibility layer does not correctly handle HTTP 101
- * upgrade responses (it fires `response` instead of `upgrade`), which breaks
- * Vite's http-proxy WebSocket forwarding when Vite runs under `bunx`.
+ * upgrade responses, which breaks Vite's http-proxy WebSocket forwarding
+ * when Vite runs under `bunx`.
  *
- * To work around this, set `VITE_BACKEND_WS` to the backend origin
- * (e.g. "ws://localhost:7778") so WebSocket connections bypass Vite's proxy
- * and connect to the backend directly.
+ * To work around this, in dev mode we detect whether the page is being
+ * accessed directly via the Vite dev server (localhost + Vite port).  If so,
+ * we rewrite the WS URL to point at the backend port directly, bypassing
+ * Vite's broken proxy.
  *
- * In production (or when the env var is unset and the page is served by the
- * backend itself), the URL is derived from `window.location`.
+ * When accessed through a reverse proxy (or in production), the URL is
+ * derived from `window.location` so it always goes through the same host
+ * the page was loaded from.
  */
+
+declare const __DEV_VITE_PORT__: string | undefined;
+declare const __DEV_BACKEND_PORT__: string | undefined;
+
 export function buildWsUrl(path: string, query?: string): string {
-	const override = import.meta.env.VITE_BACKEND_WS as string | undefined;
-	if (override) {
-		const base = override.replace(/\/+$/, "");
-		return `${base}${path}${query ? `?${query}` : ""}`;
+	const suffix = query ? `?${query}` : "";
+
+	// Dev mode: if we're hitting the Vite dev server directly on localhost,
+	// bypass its broken WS proxy and connect to the backend port instead.
+	if (
+		typeof __DEV_VITE_PORT__ === "string" &&
+		typeof __DEV_BACKEND_PORT__ === "string" &&
+		isLocalViteDirect(__DEV_VITE_PORT__)
+	) {
+		return `ws://${window.location.hostname}:${__DEV_BACKEND_PORT__}${path}${suffix}`;
 	}
+
+	// Production / reverse-proxy: derive from the page URL.
 	const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-	return `${protocol}//${window.location.host}${path}${query ? `?${query}` : ""}`;
+	return `${protocol}//${window.location.host}${path}${suffix}`;
+}
+
+/**
+ * Returns true when the browser is talking directly to the Vite dev server
+ * (i.e. localhost/127.0.0.1 on the expected Vite port).
+ * When behind a reverse proxy the host/port will differ, so this returns false.
+ */
+function isLocalViteDirect(vitePort: string): boolean {
+	const { hostname, port } = window.location;
+	const isLocal = hostname === "localhost" || hostname === "127.0.0.1";
+	return isLocal && port === vitePort;
 }
 
 /**

@@ -90,7 +90,7 @@ function AuthenticatedLayout() {
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
-	const { tabs, clearProjects, clearNarrators } = useRecentTabs();
+	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -343,7 +343,7 @@ function AuthenticatedLayout() {
 										onClick={(e: React.MouseEvent) => {
 											e.preventDefault();
 											e.stopPropagation();
-											clearProjects();
+											clearTabs("projects");
 										}}
 										aria-label={t("clearProjects")}
 									>
@@ -405,7 +405,7 @@ function AuthenticatedLayout() {
 											onClick={(e: React.MouseEvent) => {
 												e.preventDefault();
 												e.stopPropagation();
-												clearNarrators();
+												clearTabs("inactive_narrators");
 											}}
 											aria-label={t("clearNarrators")}
 										>

@@ -106,6 +106,10 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 		fields: [narratorMessages.narratorId],
 		references: [narrators.id],
 	}),
+	creator: one(users, {
+		fields: [narratorMessages.createdBy],
+		references: [users.id],
+	}),
 	messageRefs: many(narratorMessageRefs),
 	toolCalls: many(narratorToolCalls),
 	patches: many(narratorPatches),

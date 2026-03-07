@@ -4,6 +4,7 @@ import {
 	Button,
 	Collapse,
 	Group,
+	NumberInput,
 	Paper,
 	PasswordInput,
 	SegmentedControl,
@@ -35,6 +36,8 @@ interface OpenAIProvidersSectionProps {
 	providerModelsMap: Record<string, ModelOption[]>;
 	hiddenModels: string[];
 	onToggleHidden: (modelVal: string) => void;
+	modelContextWindows: Record<string, number>;
+	onContextWindowChange: (modelVal: string, size: number | null) => void;
 }
 
 export function OpenAIProvidersSection({
@@ -43,6 +46,8 @@ export function OpenAIProvidersSection({
 	providerModelsMap,
 	hiddenModels,
 	onToggleHidden,
+	modelContextWindows,
+	onContextWindowChange,
 }: OpenAIProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -240,6 +245,18 @@ export function OpenAIProvidersSection({
 														>
 															<TextInput value={m.value} disabled style={{ flex: 1 }} />
 															<TextInput value={m.label} disabled style={{ flex: 1 }} />
+															<NumberInput
+																placeholder={t("contextWindowPlaceholder")}
+																value={modelContextWindows[m.value] || ""}
+																onChange={(v) =>
+																	onContextWindowChange(m.value, typeof v === "number" ? v : null)
+																}
+																min={1}
+																step={1000}
+																suffix={` ${t("contextWindowSuffix")}`}
+																w={180}
+																size="xs"
+															/>
 															<ActionIcon
 																variant="subtle"
 																color={isHidden ? "gray" : "blue"}

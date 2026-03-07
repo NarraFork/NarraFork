@@ -123,10 +123,19 @@ export interface TreeMessage {
 	meterUsage?: number | null;
 	meterUnit?: string | null;
 	subagentModel?: string | null;
+	commandText?: string | null;
+	creator?: {
+		id: string;
+		username: string;
+		avatarColor?: string | null;
+		avatarImageId?: string | null;
+	} | null;
 	createdAt: string;
 	children: TreeMessage[];
 	/** Synthetic flag: when true, tool run grouping should not merge this message with the preceding run. */
 	_noMerge?: boolean;
+	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
+	_blockOriginalIndices?: number[];
 }
 
 export interface PaginatedNarrators {
@@ -284,7 +293,18 @@ export const api = {
 	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
 	getNarratorCommands: (id: string) =>
 		request<{
-			commands: Array<{ name: string; prompt: string; description?: string; source: string }>;
+			commands: Array<{
+				name: string;
+				prompt: string;
+				description?: string;
+				source: string;
+				params?: Array<{
+					name: string;
+					description?: string;
+					required?: boolean;
+					defaultValue?: string;
+				}>;
+			}>;
 			skills: Array<{ name: string; description: string; source: string }>;
 		}>(`/narrators/${id}/commands`),
 	createNarrator: (data: {
@@ -295,7 +315,6 @@ export const api = {
 		permissionMode?: string;
 		reasoningEffort?: string | null;
 		cwd?: string;
-		planMode?: boolean;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	archiveNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/archive`, { method: "PATCH" }),
@@ -422,6 +441,11 @@ export const api = {
 			{
 				method: "DELETE",
 			},
+		),
+	deleteMessageBlock: (narratorId: string, messageId: string, blockIndex: number) =>
+		request<{ ok: boolean; messageDeleted: boolean }>(
+			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}`,
+			{ method: "DELETE" },
 		),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
@@ -649,19 +673,15 @@ export const api = {
 		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),
-	clearRecentTabs: () =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs", {
-			method: "DELETE",
-		}),
-	batchRemoveRecentTabs: (items: { type: string; id: string }[]) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs/batch-remove", {
-			method: "POST",
-			body: JSON.stringify({ items }),
-		}),
-	reorderRecentTabs: (order: string[]) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs/reorder", {
+	moveRecentTab: (key: string, target: { toIndex: number } | { position: "top" | "above_idle" }) =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",
-			body: JSON.stringify({ order }),
+			body: JSON.stringify({ key, ...target }),
+		}),
+	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators") =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs/clear", {
+			method: "POST",
+			body: JSON.stringify({ scope }),
 		}),
 
 	// Containers

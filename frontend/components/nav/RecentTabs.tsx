@@ -10,7 +10,17 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Box, Group, NavLink, Paper, Stack, Text, Tooltip, UnstyledButton } from "@mantine/core";
+import {
+	Avatar,
+	Box,
+	Group,
+	NavLink,
+	Paper,
+	Stack,
+	Text,
+	Tooltip,
+	UnstyledButton,
+} from "@mantine/core";
 import {
 	IconArrowUp,
 	IconBox,
@@ -30,6 +40,7 @@ import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { triggerNotification } from "../../lib/notification";
+import { UserAvatar } from "../UserAvatar";
 
 const STATUS_COLORS: Record<string, string> = {
 	done: "var(--mantine-color-green-6)",
@@ -60,39 +71,6 @@ const SWIPE_THRESHOLD = 80;
 // Prevents the synthetic click after drag from triggering Link navigation.
 let justDragged = false;
 
-const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done", "error", "interrupted"]);
-
-/**
- * Move the tab matching `narratorId` to just after the last active (thinking/waiting/done) tab.
- * This places it above all idle tabs without disturbing the order of other active tabs.
- */
-function promoteAboveIdle(tabs: RecentTab[], narratorId: string): RecentTab[] {
-	const idx = tabs.findIndex(
-		(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
-	);
-	if (idx === -1) return tabs;
-
-	// Find the position right after the last active tab (excluding the target itself)
-	let lastActiveIdx = -1;
-	for (let i = 0; i < tabs.length; i++) {
-		if (i === idx) continue;
-		if (ACTIVE_STATUSES.has(tabs[i].status ?? "")) {
-			lastActiveIdx = i;
-		}
-	}
-
-	// Insert after the last active tab; if none, insert at position 0
-	const insertAt =
-		lastActiveIdx === -1 ? 0 : lastActiveIdx < idx ? lastActiveIdx + 1 : lastActiveIdx;
-
-	if (idx === insertAt) return tabs;
-
-	const result = [...tabs];
-	const [moved] = result.splice(idx, 1);
-	result.splice(insertAt, 0, moved);
-	return result;
-}
-
 function tabSortId(tab: RecentTab) {
 	return `${tab.type}:${tab.id}`;
 }
@@ -115,6 +93,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	tabsRef.current = tabs;
 	const userPrefsRef = useRef(userPrefs);
 	userPrefsRef.current = userPrefs;
+	const lastRevisionRef = useRef(0);
 
 	const narratorIds = useMemo(() => {
 		const ids: string[] = [];
@@ -141,8 +120,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else return;
 
-			const isPromote = event.type === "status" && event.status === "thinking";
-
 			// Trigger client-side notifications for done/waiting
 			if (
 				event.type === "status" &&
@@ -162,6 +139,16 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
+			// When a narrator starts thinking, ask server to promote it above idle tabs
+			if (event.type === "status" && event.status === "thinking") {
+				const tab = tabsRef.current.find(
+					(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
+				);
+				if (tab) {
+					api.moveRecentTab(`${tab.type}:${tab.id}`, { position: "above_idle" }).catch(() => {});
+				}
+			}
+
 			qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
 				if (!prev) return prev;
 				let changed = false;
@@ -174,32 +161,40 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					}
 					return t;
 				});
-				if (!changed) return prev;
-
-				if (isPromote) {
-					return promoteAboveIdle(next, narratorId);
-				}
-				return next;
+				return changed ? next : prev;
 			});
-
-			const current = qc.getQueryData<RecentTab[]>(QUERY_KEY);
-			if (isPromote && current) {
-				api.reorderRecentTabs(current.map((t) => `${t.type}:${t.id}`)).catch(() => {});
-			}
-			const matched = current?.find(
-				(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
-			);
-			if (matched) {
-				api.upsertRecentTab(matched).catch(() => {});
-			}
 		},
 		[qc],
 	);
 
 	const handleGlobalEvent = useCallback(
-		(event: { type: string }) => {
-			if (event.type === "user:recent_tabs_changed") {
-				qc.invalidateQueries({ queryKey: QUERY_KEY });
+		(event: { type: string; [key: string]: unknown }) => {
+			if (event.type === "user:recent_tabs_snapshot" && Array.isArray(event.tabs)) {
+				const revision = (event.revision as number) ?? 0;
+				if (revision > 0 && revision < lastRevisionRef.current) return;
+				lastRevisionRef.current = revision || Date.now();
+
+				const serverTabs = event.tabs as RecentTab[];
+				qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
+					if (!prev) return serverTabs;
+					// Merge: server owns structure + order, preserve local runtime fields
+					const runtimeMap = new Map<
+						string,
+						Pick<RecentTab, "status" | "viewers" | "activeTerminalCount" | "containerStatus">
+					>();
+					for (const t of prev) {
+						runtimeMap.set(`${t.type}:${t.id}`, {
+							status: t.status,
+							viewers: t.viewers,
+							activeTerminalCount: t.activeTerminalCount,
+							containerStatus: t.containerStatus,
+						});
+					}
+					return serverTabs.map((t) => {
+						const runtime = runtimeMap.get(`${t.type}:${t.id}`);
+						return runtime ? { ...t, ...runtime } : t;
+					});
+				});
 			}
 		},
 		[qc],
@@ -229,7 +224,7 @@ interface RecentTabListProps {
  * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
  */
 export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentTabListProps) {
-	const { tabs, removeTab, reorderTabs } = useRecentTabs();
+	const { tabs, removeTab, moveTab } = useRecentTabs();
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { t } = useTranslation("nav");
 
@@ -261,20 +256,15 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 			const oldIndex = filtered.findIndex((t) => tabSortId(t) === active.id);
 			const newIndex = filtered.findIndex((t) => tabSortId(t) === over.id);
 			if (oldIndex === -1 || newIndex === -1) return;
-			// Reorder within this group, keep the other group intact
-			const reordered = [...filtered];
-			const [moved] = reordered.splice(oldIndex, 1);
-			reordered.splice(newIndex, 0, moved);
-			const otherGroup = tabs.filter((t) =>
-				filter === "project" ? t.type !== "project" : t.type === "project",
-			);
-			// Invariant: projects always precede sessions in the persisted array,
-			// matching the visual layout in __root.tsx (project list above session list).
-			const full =
-				filter === "project" ? [...reordered, ...otherGroup] : [...otherGroup, ...reordered];
-			reorderTabs(full);
+
+			// Compute the global index in the full tabs array based on the target tab's actual position.
+			const targetTab = filtered[newIndex];
+			const globalIndex = tabs.findIndex((t) => tabSortId(t) === tabSortId(targetTab));
+			if (globalIndex === -1) return;
+
+			moveTab(active.id as string, { toIndex: globalIndex });
 		},
-		[filtered, tabs, filter, reorderTabs],
+		[filtered, tabs, moveTab],
 	);
 
 	const handleRemove = useCallback(
@@ -293,22 +283,9 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 	const handleMoveToTop = useCallback(() => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
-		const idx = filtered.findIndex((t) => t.type === tab.type && t.id === tab.id);
-		if (idx <= 0) {
-			setCtxMenu(null);
-			return;
-		}
-		const reordered = [...filtered];
-		const [moved] = reordered.splice(idx, 1);
-		reordered.unshift(moved);
-		const otherGroup = tabs.filter((t) =>
-			filter === "project" ? t.type !== "project" : t.type === "project",
-		);
-		const full =
-			filter === "project" ? [...reordered, ...otherGroup] : [...otherGroup, ...reordered];
-		reorderTabs(full);
+		moveTab(tabSortId(tab), { position: "top" });
 		setCtxMenu(null);
-	}, [ctxMenu, filtered, tabs, filter, reorderTabs]);
+	}, [ctxMenu, moveTab]);
 
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
@@ -538,7 +515,12 @@ function SortableTabItem({
 					styles={{
 						root: {
 							cursor: "pointer",
-							...(connectTop && active ? { borderTopLeftRadius: 0, borderTopRightRadius: 0 } : {}),
+							...(connectTop && active
+								? {
+										borderTopLeftRadius: 0,
+										borderTopRightRadius: 0,
+									}
+								: {}),
 						},
 						label: { overflow: "hidden" },
 						section: { marginInlineEnd: 4 },
@@ -612,26 +594,44 @@ function ViewerAvatars({ viewers, t }: ViewerAvatarsProps) {
 
 	return (
 		<Tooltip label={t("viewersWatching", { count: viewers.length })} withArrow position="right">
-			<Group gap={-3} wrap="nowrap" style={{ cursor: "default" }}>
+			<Avatar.Group spacing={4}>
 				{visible.map((v) => (
-					<Box
+					<UserAvatar
 						key={v.userId}
-						style={{
-							width: 10,
-							height: 10,
-							borderRadius: "50%",
-							backgroundColor: v.avatarColor || "var(--mantine-color-gray-6)",
-							border: "1px solid var(--mantine-color-dark-7)",
-							flexShrink: 0,
+						username={v.username}
+						avatarColor={v.avatarColor}
+						avatarImageId={v.avatarImageId}
+						userId={v.userId}
+						size={16}
+						radius="xl"
+						showTooltip={false}
+						styles={{
+							root: {
+								border: "1.5px solid var(--mantine-color-dark-7)",
+								fontSize: 8,
+								minWidth: 16,
+								minHeight: 16,
+							},
 						}}
 					/>
 				))}
 				{overflow > 0 && (
-					<Text size="xs" c="dimmed" lh={1} ml={2}>
+					<Avatar
+						size={16}
+						radius="xl"
+						styles={{
+							root: {
+								border: "1.5px solid var(--mantine-color-dark-7)",
+								fontSize: 8,
+								minWidth: 16,
+								minHeight: 16,
+							},
+						}}
+					>
 						+{overflow}
-					</Text>
+					</Avatar>
 				)}
-			</Group>
+			</Avatar.Group>
 		</Tooltip>
 	);
 }

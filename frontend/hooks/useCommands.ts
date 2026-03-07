@@ -15,6 +15,7 @@ export function useNarratorCommands(narratorId: string | undefined) {
 				description: c.description,
 				source: c.source,
 				type: "command" as const,
+				params: c.params,
 			}));
 			const skills: CommandItem[] = (data.skills ?? []).map((s) => ({
 				name: s.name,

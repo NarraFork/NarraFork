@@ -8,6 +8,7 @@ import {
 	Paper,
 	ScrollArea,
 	Skeleton,
+	Spoiler,
 	Stack,
 	Text,
 	Textarea,
@@ -29,6 +30,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
+import { UserAvatar } from "../UserAvatar";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
@@ -46,6 +48,15 @@ interface MessageBubbleProps {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls?: any[];
 		messageUuid?: string | null;
+		commandText?: string | null;
+		creator?: {
+			id: string;
+			username: string;
+			avatarColor?: string | null;
+			avatarImageId?: string | null;
+		} | null;
+		/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
+		_blockOriginalIndices?: number[];
 	};
 	onForkFromMessage?: (messageUuid: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
@@ -61,7 +72,7 @@ interface MessageBubbleProps {
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
-	onDeleteMessage?: (messageId: string) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -282,7 +293,18 @@ export function ReasoningSummary({ text }: { text: string }) {
 	const [isOverflow, setIsOverflow] = useState(false);
 	const lineRef = useRef<HTMLDivElement | null>(null);
 	const singleLineText = text.trim().replace(/\s+/g, " ");
-	const headerText = singleLineText.replace(/\*\*/g, "");
+	const boldMatch = singleLineText.match(/^\*\*(.+?)\*\*/);
+	const headerText = boldMatch ? boldMatch[1] : singleLineText.replace(/\*\*/g, "");
+	const trailingText = boldMatch ? singleLineText.slice(boldMatch[0].length).trim() : "";
+	const hasTrailingContent = trailingText.length > 0;
+
+	const autoExpandedRef = useRef(false);
+	useLayoutEffect(() => {
+		if (hasTrailingContent && !autoExpandedRef.current) {
+			autoExpandedRef.current = true;
+			setExpanded(true);
+		}
+	}, [hasTrailingContent]);
 
 	useLayoutEffect(() => {
 		if (!headerText) {
@@ -332,15 +354,17 @@ export function ReasoningSummary({ text }: { text: string }) {
 		};
 	}, [headerText]);
 
+	const canExpand = isOverflow || hasTrailingContent;
+
 	useLayoutEffect(() => {
-		if (!isOverflow && expanded) {
+		if (!canExpand && expanded) {
 			setExpanded(false);
 		}
-	}, [isOverflow, expanded]);
+	}, [canExpand, expanded]);
 
 	return (
 		<Box style={{ flex: 1, minWidth: 0 }}>
-			{isOverflow ? (
+			{canExpand ? (
 				<UnstyledButton
 					onClick={() => setExpanded((o) => !o)}
 					w="100%"
@@ -413,7 +437,7 @@ export function ReasoningSummary({ text }: { text: string }) {
 					</div>
 				</Box>
 			)}
-			{isOverflow && (
+			{canExpand && (
 				<LazyCollapse in={expanded}>
 					<Box
 						mt={4}
@@ -424,7 +448,7 @@ export function ReasoningSummary({ text }: { text: string }) {
 							overflowWrap: "anywhere",
 						}}
 					>
-						<MarkdownContent text={text.trim()} />
+						<MarkdownContent text={hasTrailingContent ? trailingText : text.trim()} />
 					</Box>
 				</LazyCollapse>
 			)}
@@ -559,7 +583,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onQuestionSubmit,
 	onQuestionDeny,
 	onCompactBeforeMessage,
-	onDeleteMessage,
+	onDeleteBlock,
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
@@ -569,7 +593,7 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
-	// query instead of firing another delete request via onDeleteMessage.
+	// query instead of firing another delete request via onDeleteBlock.
 	const invalidateMessages = useCallback(
 		() => qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] }),
 		[qc, narratorId],
@@ -586,8 +610,8 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgId && onCompactBeforeMessage) {
 			actions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
 		}
-		if (msgId && onDeleteMessage) {
-			actions.onDeleteMessage = () => onDeleteMessage(msgId);
+		if (msgId && onDeleteBlock) {
+			actions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
 		return actions;
 	}, [
@@ -596,7 +620,7 @@ export const MessageBubble = memo(function MessageBubble({
 		message.messageUuid,
 		onForkFromMessage,
 		onCompactBeforeMessage,
-		onDeleteMessage,
+		onDeleteBlock,
 	]);
 
 	// System messages (compact indicators / plan cards)
@@ -688,33 +712,84 @@ export const MessageBubble = memo(function MessageBubble({
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.map((b: any) => b.text)
 			.join("\n\n");
+		const hasCommand = !!message.commandText;
 		return (
 			<MessageContextMenuCtx.Provider value={ctxActions}>
-				<ContentViewer content={fullText} markdown contentType="markdown">
+				<ContentViewer content={fullText} markdown contentType="markdown" blockIndex={0}>
 					<Paper
 						p="sm"
 						radius="md"
 						style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
 					>
 						<Stack gap={4}>
-							<Text size="xs" fw={600} c="indigo">
-								{t("you")}
-							</Text>
-							{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-							{blocks.map((block: any, i: number) => {
-								const key = block.id ?? `${block.type}-${i}`;
-								if (block.type === "text") {
-									return (
-										<Text key={key} size="sm" style={{ whiteSpace: "pre-wrap" }}>
-											{block.text}
+							<Group gap={6}>
+								{message.creator && (
+									<UserAvatar
+										username={message.creator.username}
+										avatarColor={message.creator.avatarColor}
+										avatarImageId={message.creator.avatarImageId}
+										userId={message.creator.id}
+										size={20}
+										showTooltip={false}
+									/>
+								)}
+								<Text size="xs" fw={600} c="indigo">
+									{message.creator?.username ?? t("you")}
+								</Text>
+							</Group>
+							{hasCommand ? (
+								<>
+									<Text size="sm" fw={500} c="indigo.4" style={{ fontFamily: "monospace" }}>
+										{message.commandText}
+									</Text>
+									<Spoiler
+										maxHeight={0}
+										showLabel={t("showExpandedPrompt")}
+										hideLabel={t("hideExpandedPrompt")}
+										styles={{
+											control: { fontSize: "var(--mantine-font-size-xs)" },
+										}}
+									>
+										<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+											{fullText}
 										</Text>
-									);
-								}
-								if (block.type === "image") {
-									return <ImageBlock key={key} block={block} narratorId={narratorId} />;
-								}
-								return null;
-							})}
+									</Spoiler>
+									{blocks
+										.filter(
+											// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+											(b: any) => b.type === "image",
+										)
+										.map(
+											// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+											(block: any, i: number) => (
+												<ImageBlock
+													// biome-ignore lint/suspicious/noArrayIndexKey: filtered image blocks have no stable id
+													key={`cmd-img-${i}`}
+													block={block}
+													narratorId={narratorId}
+												/>
+											),
+										)}
+								</>
+							) : (
+								<>
+									{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+									{blocks.map((block: any, i: number) => {
+										const key = block.id ?? `${block.type}-${i}`;
+										if (block.type === "text") {
+											return (
+												<Text key={key} size="sm" style={{ whiteSpace: "pre-wrap" }}>
+													{block.text}
+												</Text>
+											);
+										}
+										if (block.type === "image") {
+											return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+										}
+										return null;
+									})}
+								</>
+							)}
 						</Stack>
 					</Paper>
 				</ContentViewer>
@@ -730,9 +805,18 @@ export const MessageBubble = memo(function MessageBubble({
 				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 				{blocks.map((block: any, i: number) => {
 					const key = block.id ?? `${block.type}-${i}`;
+					const realIndex = message._blockOriginalIndices?.[i] ?? i;
 					if (block.type === "text") {
 						if (!block.text?.trim()) return null;
-						return <ContentViewer key={key} content={block.text} markdown contentType="markdown" />;
+						return (
+							<ContentViewer
+								key={key}
+								content={block.text}
+								markdown
+								contentType="markdown"
+								blockIndex={realIndex}
+							/>
+						);
 					}
 					if (block.type === "image") {
 						return <ImageBlock key={key} block={block} narratorId={narratorId} />;
@@ -741,8 +825,8 @@ export const MessageBubble = memo(function MessageBubble({
 						const iconColor = getCategoryColor("plan");
 						return (
 							<Paper key={key} withBorder radius="sm" p="xs">
-								<Group gap={6} wrap="nowrap" align="center">
-									<ThemeIcon size={18} variant="light" color={iconColor} radius="sm">
+								<Group gap={6} wrap="nowrap" align="flex-start">
+									<ThemeIcon size={18} variant="light" color={iconColor} radius="sm" mt={1}>
 										<IconBrain size={12} />
 									</ThemeIcon>
 									<ReasoningSummary text={typeof block.text === "string" ? block.text : ""} />
@@ -792,6 +876,7 @@ export const MessageBubble = memo(function MessageBubble({
 								onPermissionDecision={onPermissionDecision}
 								onQuestionSubmit={onQuestionSubmit}
 								onQuestionDeny={onQuestionDeny}
+								blockIndex={realIndex}
 							/>
 						);
 					}

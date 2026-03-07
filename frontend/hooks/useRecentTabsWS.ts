@@ -82,8 +82,11 @@ export function useRecentTabsWS(
 						onUpdateRef.current(nId, { type: "status", status: data.status });
 					} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
 						onUpdateRef.current(nId, { type: "title", title: data.title });
-					} else if (data.type === "plan_mode_changed") {
-						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
+					} else if (data.type === "permission_mode_changed") {
+						onUpdateRef.current(nId, {
+							type: "permissionMode",
+							permissionMode: data.permissionMode,
+						});
 					} else if (data.type === "presence_update") {
 						onUpdateRef.current(nId, { type: "presence", viewers: data.viewers });
 					} else if (data.type === "terminal_count_changed") {

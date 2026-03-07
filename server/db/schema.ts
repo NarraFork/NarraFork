@@ -206,8 +206,9 @@ export const narrators = sqliteTable(
 		model: text("model").default("claude-sonnet"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
-			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"],
+			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"],
 		}).default("default"),
+		previousPermissionMode: text("previous_permission_mode"),
 		reasoningEffort: text("reasoning_effort", {
 			enum: ["low", "medium", "high", "xhigh"],
 		}),
@@ -266,6 +267,10 @@ export const narratorMessages = sqliteTable(
 		meterUnit: text("meter_unit"),
 		// 关联的 commit SHA（auto-commit 时标记在最近的 assistant 消息上）
 		commitSha: text("commit_sha"),
+		// 斜杠命令原始文本（展示用），如 "/translate typescript some code"
+		commandText: text("command_text"),
+		// 发送此消息的用户 ID（仅 role="user" 时有值）
+		createdBy: text("created_by").references(() => users.id),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [

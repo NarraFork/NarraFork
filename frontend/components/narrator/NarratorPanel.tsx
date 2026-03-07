@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Avatar,
 	Badge,
 	Box,
 	Button,
@@ -40,8 +41,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarratorCommands } from "../../hooks/useCommands";
 import { useChapter } from "../../hooks/useChapters";
+import { useNarratorCommands } from "../../hooks/useCommands";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -59,7 +60,9 @@ import { api, type TreeMessage } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { SelectionPopover } from "../common/SelectionPopover";
+import { UserAvatar } from "../UserAvatar";
 import { ChapterBar } from "./ChapterBar";
+import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import {
 	MemoizedPageElements,
@@ -268,31 +271,27 @@ export function NarratorPanel({
 	const setContextPercentRef =
 		useRef<React.Dispatch<React.SetStateAction<number | null>>>(undefined);
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
-	const handleDeleteMessage = useCallback(
-		async (messageId: string) => {
+	const handleDeleteBlock = useCallback(
+		async (messageId: string, blockIndex: number) => {
 			const prev = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length) return old;
 				const pages = old.pages.map((page) => ({
 					...page,
-					messages: page.messages.filter((m: NarratorMsg) => m.id !== messageId),
+					messages: page.messages
+						.map((m: NarratorMsg) => {
+							if (m.id !== messageId) return m;
+							const blocks = Array.isArray(m.contentJson) ? [...m.contentJson] : [];
+							blocks.splice(blockIndex, 1);
+							if (blocks.length === 0) return null;
+							return { ...m, contentJson: blocks };
+						})
+						.filter(Boolean) as NarratorMsg[],
 				}));
-				let foundCp: number | null = null;
-				for (const page of pages) {
-					for (let i = page.messages.length - 1; i >= 0; i--) {
-						const cp = (page.messages[i] as unknown as Record<string, unknown>).contextPercent;
-						if (cp != null) {
-							foundCp = cp as number;
-							break;
-						}
-					}
-					if (foundCp != null) break;
-				}
-				setContextPercentRef.current?.(foundCp);
 				return { ...old, pages };
 			});
 			try {
-				await api.deleteMessage(narratorId, messageId);
+				await api.deleteMessageBlock(narratorId, messageId, blockIndex);
 			} catch {
 				qc.setQueryData(messagesQueryKey, prev);
 				notifications.show({
@@ -334,17 +333,31 @@ export function NarratorPanel({
 
 	// --- Command popover ---
 	const { data: commandsList } = useNarratorCommands(narratorId);
+	// Show command popover only when typing command name (no space yet)
 	const commandPopoverVisible =
-		input.startsWith("/") && !input.includes("\n") && (commandsList?.length ?? 0) > 0;
+		input.startsWith("/") &&
+		!input.includes("\n") &&
+		!input.includes(" ") &&
+		(commandsList?.length ?? 0) > 0;
+	// Matched command for param helper (after space is typed)
+	const matchedCommand = useMemo(() => {
+		if (!input.startsWith("/") || !commandsList?.length) return null;
+		const spaceIdx = input.indexOf(" ");
+		if (spaceIdx === -1) return null;
+		const cmdName = input.slice(1, spaceIdx);
+		return (
+			commandsList.find(
+				(c) => c.name.toLowerCase() === cmdName.toLowerCase() && c.type === "command",
+			) ?? null
+		);
+	}, [input, commandsList]);
 	const handleCommandSelect = useCallback((cmd: CommandItem) => {
 		if (cmd.type === "skill") {
 			// Skill selected — insert a prompt that tells the AI to load this skill
 			setInput(`Please load the "${cmd.name}" skill and apply it to: `);
-		} else if (cmd.prompt.includes("{{input}}")) {
-			// Place cursor where {{input}} would go
-			setInput(`/${cmd.name} `);
 		} else {
-			setInput(cmd.prompt);
+			// Always keep command format — user can continue typing or press space for params
+			setInput(`/${cmd.name}`);
 		}
 	}, []);
 	const closeCommandPopover = useCallback(() => {
@@ -483,6 +496,7 @@ export function NarratorPanel({
 		setEditExpandOverride,
 		unreadCount,
 		setUnreadCount,
+		viewers,
 	} = wsState;
 	setContextPercentRef.current = wsState.setContextPercent;
 	setUnreadCountRef.current = setUnreadCount;
@@ -493,7 +507,7 @@ export function NarratorPanel({
 	const isWorking = narrator?.status === "thinking";
 	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
-	const isPlanning = narrator?.planMode && narrator?.status === "thinking";
+	const isPlanning = narrator?.permissionMode === "plan" && narrator?.status === "thinking";
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting);
 
 	const activeTodo = useMemo(() => {
@@ -777,7 +791,7 @@ export function NarratorPanel({
 					expandedToolUseId={expandedToolUseId}
 					editExpandOverride={editExpandOverride}
 					showTokenUsage={showTokenUsage}
-					onDeleteMessage={handleDeleteMessage}
+					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>
@@ -801,7 +815,7 @@ export function NarratorPanel({
 					editExpandOverride={editExpandOverride}
 					showTokenUsage={showTokenUsage}
 					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
-					onDeleteMessage={handleDeleteMessage}
+					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>,
@@ -820,7 +834,7 @@ export function NarratorPanel({
 		editExpandOverride,
 		highlightedId,
 		showTokenUsage,
-		handleDeleteMessage,
+		handleDeleteBlock,
 		handleCompactBefore,
 		pruneBoundaryMessageId,
 	]);
@@ -996,7 +1010,9 @@ export function NarratorPanel({
 			// suppresses all detach checks for the duration.
 			resizingRef.current = true;
 			clearTimeout(vpResizeTimer);
-			vpResizeTimer = window.setTimeout(() => { resizingRef.current = false; }, 150);
+			vpResizeTimer = window.setTimeout(() => {
+				resizingRef.current = false;
+			}, 150);
 
 			if (isAtBottomRef.current && !highlightMessageId && vp) {
 				programmaticScrollRef.current = true;
@@ -1034,6 +1050,10 @@ export function NarratorPanel({
 		streamingRef.current = "";
 		streamingReasoningRef.current = "";
 
+		// Detect slash command for optimistic display
+		const isSlashCommand = msg.startsWith("/") && /^\/[a-zA-Z0-9_-]+(\s|$)/.test(msg);
+		const commandText = isSlashCommand ? msg : null;
+
 		const optimisticBlocks: ContentBlock[] = [
 			...images.map((f) => ({
 				type: "image",
@@ -1050,6 +1070,7 @@ export function NarratorPanel({
 			role: "user",
 			contentJson: optimisticBlocks,
 			contentText: msg,
+			commandText,
 			toolCalls: [],
 			createdAt: new Date().toISOString(),
 			children: [],
@@ -1535,6 +1556,29 @@ export function NarratorPanel({
 				)}
 				{/* Model & Permission selectors */}
 				<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
+					{/* Viewers */}
+					{viewers.length > 1 && (
+						<Tooltip label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}>
+							<Avatar.Group spacing="xs">
+								{viewers.slice(0, 3).map((v) => (
+									<UserAvatar
+										key={v.userId}
+										username={v.username}
+										avatarColor={v.avatarColor}
+										avatarImageId={v.avatarImageId}
+										userId={v.userId}
+										size={22}
+										showTooltip={false}
+									/>
+								))}
+								{viewers.length > 3 && (
+									<Avatar size={22} radius="xl">
+										+{viewers.length - 3}
+									</Avatar>
+								)}
+							</Avatar.Group>
+						</Tooltip>
+					)}
 					{/* Context usage indicator */}
 					{(() => {
 						if (contextPercent == null) return null;
@@ -1866,6 +1910,13 @@ export function NarratorPanel({
 								onSelect={handleCommandSelect}
 								onClose={closeCommandPopover}
 							/>
+							{matchedCommand && (
+								<CommandParamHelper
+									command={matchedCommand}
+									input={input}
+									visible={!commandPopoverVisible}
+								/>
+							)}
 							<Textarea
 								ref={textareaRef}
 								placeholder={t("sendPlaceholder")}
@@ -1918,7 +1969,9 @@ export function NarratorPanel({
 												}}
 											/>
 										)}
-										<span style={{ position: "relative" }}>{t("interrupt")}</span>
+										<span style={{ position: "relative" }}>
+											{bufferedText ? t("interruptCutInLine") : t("interrupt")}
+										</span>
 									</Button>
 								);
 							}

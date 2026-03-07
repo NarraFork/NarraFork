@@ -115,6 +115,9 @@ async function finalizeSubagent(
 	hasError: boolean,
 	errorText: string | null,
 ): Promise<void> {
+	// Clean up any remaining buffered message
+	subagentBufferedMessages.delete(subagentId);
+
 	const now = new Date().toISOString();
 	await db
 		.update(narrators)
@@ -206,7 +209,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	hasError: boolean;
 	contextLengthExceeded?: boolean;
 }> {
-	const {
+	let {
 		narratorId,
 		parentNarratorId,
 		toolUseId,
@@ -294,6 +297,44 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					parentNarratorId,
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
+			getInjectedUserText: () => {
+				const buf = subagentBufferedMessages.get(narratorId);
+				if (!buf) return null;
+				subagentBufferedMessages.delete(narratorId);
+				// Persist user message in the background (fire-and-forget).
+				// The text is injected into the next turn immediately.
+				narratorService
+					.persistSubagentUserMessage(narratorId, buf.text, toolUseId)
+					.then((userMsg) => {
+						broadcastToNarrator(parentNarratorId, {
+							type: "user_message",
+							narratorId: parentNarratorId,
+							message: userMsg,
+						});
+						broadcastToNarrator(narratorId, {
+							type: "user_message",
+							narratorId,
+							message: { ...userMsg, parentToolUseId: null },
+						});
+					})
+					.catch((err) => {
+						logger.error("Failed to persist injected subagent user message", {
+							narratorId,
+							error: String(err),
+						});
+					});
+				broadcastToNarrator(parentNarratorId, {
+					type: "buffer_cleared",
+					narratorId: parentNarratorId,
+					reason: "sent",
+				});
+				broadcastToNarrator(narratorId, {
+					type: "buffer_cleared",
+					narratorId,
+					reason: "sent",
+				});
+				return buf.text;
+			},
 		};
 
 		needsRestart = false;
@@ -376,6 +417,51 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		// Reset transient retry counter on success
 		transientRetries = 0;
 
+		// --- Check for buffered user message (sent from subagent page) ---
+		const buffered = subagentBufferedMessages.get(narratorId);
+		if (buffered && !signal.aborted && !hasError) {
+			subagentBufferedMessages.delete(narratorId);
+			// Persist and broadcast the user message
+			const userMsg = await narratorService.persistSubagentUserMessage(
+				narratorId,
+				buffered.text,
+				toolUseId,
+			);
+			// Broadcast to parent (as child message) and to subagent's own page
+			broadcastToNarrator(parentNarratorId, {
+				type: "user_message",
+				narratorId: parentNarratorId,
+				message: userMsg,
+			});
+			broadcastToNarrator(narratorId, {
+				type: "user_message",
+				narratorId,
+				message: { ...userMsg, parentToolUseId: null },
+			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "buffer_cleared",
+				narratorId: parentNarratorId,
+				reason: "sent",
+			});
+			broadcastToNarrator(narratorId, {
+				type: "buffer_cleared",
+				narratorId,
+				reason: "sent",
+			});
+			// Reload history with the new user message and continue the loop
+			prompt = buffered.text;
+			const rebuilt = await loadSubagentHistory(
+				narratorId,
+				model,
+				resolveProvider(model),
+				pruneBoundaryId,
+			);
+			history = rebuilt.history;
+			trailingToolResults = rebuilt.trailingToolResults;
+			currentConversationId = randomUUID();
+			continue;
+		}
+
 		if (!needsRestart || signal.aborted || hasError) break;
 
 		// Compact completed mid-turn — restart with fresh history
@@ -407,6 +493,55 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 /** In-memory map of background task AbortControllers for cancellation support. */
 const backgroundTaskAbortControllers = new Map<string, AbortController>();
+
+/** In-memory map of foreground subagent AbortControllers for interrupt support. */
+const foregroundSubagentAbortControllers = new Map<string, AbortController>();
+
+/**
+ * Buffered user messages for running subagents.
+ * When a user sends a message from the subagent page, it is stored here
+ * and injected into the agent loop via getInjectedUserText on the next turn.
+ */
+const subagentBufferedMessages = new Map<string, { text: string; bufferedAt: string }>();
+
+/**
+ * Buffer a user message for a running foreground subagent.
+ * Returns false if the subagent is not currently running.
+ */
+export function bufferSubagentMessage(
+	subagentId: string,
+	text: string,
+): { ok: boolean; bufferedAt: string } {
+	if (!foregroundSubagentAbortControllers.has(subagentId)) {
+		return { ok: false, bufferedAt: "" };
+	}
+	const bufferedAt = new Date().toISOString();
+	subagentBufferedMessages.set(subagentId, { text, bufferedAt });
+	return { ok: true, bufferedAt };
+}
+
+/** Cancel a buffered subagent message. */
+export function clearSubagentBufferedMessage(subagentId: string): void {
+	subagentBufferedMessages.delete(subagentId);
+}
+
+/** Get the current buffered message for a subagent (for REST hydration). */
+export function getSubagentBufferedMessage(
+	subagentId: string,
+): { text: string; bufferedAt: string } | null {
+	return subagentBufferedMessages.get(subagentId) ?? null;
+}
+
+/**
+ * Interrupt a running foreground subagent.
+ * Returns true if the subagent was found and aborted.
+ */
+export function interruptForegroundSubagent(subagentId: string): boolean {
+	const ctrl = foregroundSubagentAbortControllers.get(subagentId);
+	if (!ctrl) return false;
+	ctrl.abort("Interrupted by user");
+	return true;
+}
 
 /** Maximum background task execution time (30 minutes). */
 const BACKGROUND_TASK_TIMEOUT_MS = 30 * 60 * 1000;
@@ -757,6 +892,12 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	// 3. Broadcast subagent_started
 	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType);
 
+	// Create an independent AbortController so the subagent can be interrupted
+	// from its own page without aborting the parent narrator.
+	const fgAbort = new AbortController();
+	foregroundSubagentAbortControllers.set(subagentId, fgAbort);
+	const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
+
 	// 4. Run via unified executor (with compact/prune for general)
 	let finalText = "";
 	let hasError = false;
@@ -772,13 +913,19 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			model,
 			provider,
 			locale,
-			signal,
+			signal: combinedSignal,
 			systemPrompt,
 			initialHistory: [],
 		});
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
 		hasError = result.hasError || !!result.contextLengthExceeded;
+		// Detect subagent-only interrupt (not parent abort)
+		if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
+			hasError = true;
+			finalText = "Subagent interrupted by user";
+		}
 	} finally {
+		foregroundSubagentAbortControllers.delete(subagentId);
 		await finalizeSubagent(
 			subagentId,
 			parentNarratorId,
@@ -854,6 +1001,11 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	// 5. Load forked subagent's history
 	const { history, trailingToolResults } = await loadSubagentHistory(forkedId, model, provider);
 
+	// Create an independent AbortController for interrupt support
+	const fgAbort = new AbortController();
+	foregroundSubagentAbortControllers.set(forkedId, fgAbort);
+	const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
+
 	// 6. Run via unified executor (with compact/prune for general)
 	let finalText = "";
 	let hasError = false;
@@ -869,14 +1021,20 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 			model,
 			provider,
 			locale,
-			signal,
+			signal: combinedSignal,
 			systemPrompt: original.systemPrompt ?? "",
 			initialHistory: history,
 			initialTrailingToolResults: trailingToolResults,
 		});
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
 		hasError = result.hasError || !!result.contextLengthExceeded;
+		// Detect subagent-only interrupt (not parent abort)
+		if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
+			hasError = true;
+			finalText = "Subagent interrupted by user";
+		}
 	} finally {
+		foregroundSubagentAbortControllers.delete(forkedId);
 		await finalizeSubagent(
 			forkedId,
 			parentNarratorId,

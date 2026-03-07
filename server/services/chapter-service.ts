@@ -27,10 +27,18 @@ import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
+export interface CommandParam {
+	name: string;
+	description?: string;
+	required?: boolean;
+	defaultValue?: string;
+}
+
 export interface Command {
 	name: string;
 	prompt: string;
 	description?: string;
+	params?: CommandParam[];
 }
 
 interface ChapterSettings {

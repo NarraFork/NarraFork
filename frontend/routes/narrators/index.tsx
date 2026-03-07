@@ -145,7 +145,7 @@ function NarratorsPage() {
 	const { t: tn } = useTranslation("narrator");
 	const [cwd, setCwd] = useState("");
 	const [selectedModel, setSelectedModel] = useState("");
-	const [planMode, setPlanMode] = useState(false);
+	const [startInPlanMode, setStartInPlanMode] = useState(false);
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
 	const [navigatingId, setNavigatingId] = useState<string | null>(null);
 	const { data: favorites } = useFavoriteDirectories();
@@ -200,7 +200,9 @@ function NarratorsPage() {
 							...item,
 							...(event.status !== undefined ? { status: event.status } : {}),
 							...(event.title !== undefined ? { title: event.title } : {}),
-							...(event.planMode !== undefined ? { planMode: event.planMode } : {}),
+							...(event.permissionMode !== undefined
+								? { permissionMode: event.permissionMode }
+								: {}),
 							...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
 							updatedAt: new Date().toISOString(),
 						};
@@ -257,7 +259,7 @@ function NarratorsPage() {
 			{
 				...(cwd ? { cwd } : {}),
 				...(selectedModel ? { model: selectedModel } : {}),
-				...(planMode ? { planMode: true } : {}),
+				...(startInPlanMode ? { permissionMode: "plan" as const } : {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -265,7 +267,7 @@ function NarratorsPage() {
 					close();
 					setCwd("");
 					setSelectedModel("");
-					setPlanMode(false);
+					setStartInPlanMode(false);
 					addRecentTab({
 						type: "narrator",
 						id: data.id,
@@ -283,7 +285,7 @@ function NarratorsPage() {
 		close();
 		setCwd("");
 		setSelectedModel("");
-		setPlanMode(false);
+		setStartInPlanMode(false);
 	};
 
 	return (
@@ -572,9 +574,12 @@ function NarratorsPage() {
 												</Tooltip>
 											)}
 											{narrator.status === "thinking" && (
-												<Loader size={14} color={narrator.planMode ? "green" : undefined} />
+												<Loader
+													size={14}
+													color={narrator.permissionMode === "plan" ? "green" : undefined}
+												/>
 											)}
-											{narrator.status === "thinking" && narrator.planMode && (
+											{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
 												<Badge size="xs" color="green">
 													{tn("status_planning")}
 												</Badge>
@@ -660,9 +665,12 @@ function NarratorsPage() {
 										</Text>
 										<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 											{narrator.status === "thinking" && (
-												<Loader size={12} color={narrator.planMode ? "green" : undefined} />
+												<Loader
+													size={12}
+													color={narrator.permissionMode === "plan" ? "green" : undefined}
+												/>
 											)}
-											{narrator.status === "thinking" && narrator.planMode && (
+											{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
 												<Badge size="xs" color="green">
 													{tn("status_planning")}
 												</Badge>
@@ -871,8 +879,8 @@ function NarratorsPage() {
 					<Checkbox
 						label={t("startInPlanMode")}
 						description={t("startInPlanModeHint")}
-						checked={planMode}
-						onChange={(e) => setPlanMode(e.currentTarget.checked)}
+						checked={startInPlanMode}
+						onChange={(e) => setStartInPlanMode(e.currentTarget.checked)}
 					/>
 
 					<Button onClick={handleCreate} loading={createNarrator.isPending}>

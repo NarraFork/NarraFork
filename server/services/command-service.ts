@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
 import { logger } from "../lib/logger";
-import type { Command } from "./chapter-service";
+import type { Command, CommandParam } from "./chapter-service";
 import { loadAllSkills } from "./skill-service";
 
 /** Safely extract commands array from a chapterSettings value. */
@@ -20,12 +20,14 @@ export interface ResolvedCommand {
 	prompt: string;
 	description?: string;
 	source: "user" | "project";
+	params?: CommandParam[];
 }
 
 interface CommandResolveResult {
 	resolved: true;
 	expandedPrompt: string;
 	command: ResolvedCommand;
+	rawCommand: string;
 }
 
 interface CommandNotResolved {
@@ -147,6 +149,30 @@ function mergeCommands(userCmds: Command[], projectCmds: Command[]): ResolvedCom
 }
 
 /**
+ * Parse positional arguments from user input based on command param definitions.
+ * The first N-1 params each consume one whitespace-delimited token;
+ * the last param consumes all remaining text.
+ */
+function parseCommandArgs(input: string, params: CommandParam[]): Record<string, string> | null {
+	if (!params.length) return null;
+	const tokens = input.split(/\s+/).filter(Boolean);
+	const result: Record<string, string> = {};
+
+	for (let i = 0; i < params.length; i++) {
+		if (i === params.length - 1) {
+			// Last param gets all remaining text
+			result[params[i].name] = tokens.slice(i).join(" ");
+		} else if (i < tokens.length) {
+			result[params[i].name] = tokens[i];
+		} else {
+			// Missing token — use default or empty
+			result[params[i].name] = params[i].defaultValue ?? "";
+		}
+	}
+	return result;
+}
+
+/**
  * Check if a prompt is a slash command and resolve it.
  * Returns the expanded prompt text if matched, or null.
  */
@@ -163,7 +189,16 @@ export async function resolveCommand(
 	if (!cmd) return { resolved: false };
 
 	let expandedPrompt = cmd.prompt;
-	if (expandedPrompt.includes("{{input}}")) {
+
+	if (cmd.params?.length) {
+		// Multi-param mode: parse positional args and substitute {{paramName}}
+		const args = parseCommandArgs(parsed.input, cmd.params);
+		if (args) {
+			for (const [key, value] of Object.entries(args)) {
+				expandedPrompt = expandedPrompt.replaceAll(`{{${key}}}`, value);
+			}
+		}
+	} else if (expandedPrompt.includes("{{input}}")) {
 		expandedPrompt = expandedPrompt.replaceAll("{{input}}", parsed.input);
 	} else if (parsed.input) {
 		// If no placeholder but user provided input, append it
@@ -176,7 +211,12 @@ export async function resolveCommand(
 		narratorId,
 	});
 
-	return { resolved: true, expandedPrompt: expandedPrompt.trim(), command: cmd };
+	return {
+		resolved: true,
+		expandedPrompt: expandedPrompt.trim(),
+		command: cmd,
+		rawCommand: prompt,
+	};
 }
 
 // === Skill summary for slash menu ===

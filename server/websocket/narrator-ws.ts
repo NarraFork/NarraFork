@@ -59,7 +59,7 @@ export type NarratorServerMessage =
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
-	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean }
+	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
@@ -348,7 +348,6 @@ const ALREADY_BROADCAST_EVENTS = new Set([
 	"narrator:background_task_completed",
 	"narrator:background_task_failed",
 	"narrator:background_task_cancelled",
-	"user:recent_tabs_changed",
 	"terminal:created",
 	"terminal:exited",
 	"container:started",
@@ -402,6 +401,19 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			} catch {
 				connections.delete(ws);
 			}
+		}
+	}
+}
+
+/** Broadcast a message to all WS connections belonging to a specific user. */
+export function broadcastToUser(userId: string, data: unknown): void {
+	const msg = JSON.stringify(data);
+	for (const ws of connections) {
+		if (ws.data.userId !== userId) continue;
+		try {
+			ws.send(msg);
+		} catch {
+			connections.delete(ws);
 		}
 	}
 }
@@ -626,11 +638,13 @@ export const handleNarratorWS = {
 			case "buffer_message": {
 				// Resolve slash commands before buffering
 				let bufferText = msg.text;
+				let commandText: string | null = null;
 				const userId = ws.data.userId;
 				if (userId) {
 					try {
 						const cmdResult = await resolveCommand(bufferText, msg.narratorId, userId);
 						if (cmdResult.resolved) {
+							commandText = msg.text;
 							bufferText = cmdResult.expandedPrompt;
 						}
 					} catch (err) {
@@ -644,7 +658,22 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				const bufResult = setBufferedMessage(msg.narratorId, bufferText);
+				let bufResult = setBufferedMessage(
+					msg.narratorId,
+					bufferText,
+					undefined,
+					commandText,
+					userId,
+				);
+				// Fallback: try buffering for a running foreground subagent
+				if (!bufResult.ok) {
+					try {
+						const { bufferSubagentMessage } = await import("../services/narrator-subagent");
+						bufResult = bufferSubagentMessage(msg.narratorId, bufferText);
+					} catch {
+						// ignore
+					}
+				}
 				if (bufResult.ok) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
@@ -657,6 +686,12 @@ export const handleNarratorWS = {
 			}
 			case "cancel_buffer": {
 				clearBufferedMessage(msg.narratorId);
+				try {
+					const { clearSubagentBufferedMessage } = await import("../services/narrator-subagent");
+					clearSubagentBufferedMessage(msg.narratorId);
+				} catch {
+					// ignore
+				}
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,

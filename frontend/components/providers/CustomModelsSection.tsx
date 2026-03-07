@@ -3,6 +3,7 @@ import {
 	Badge,
 	Group,
 	NativeSelect,
+	NumberInput,
 	Paper,
 	Stack,
 	Text,
@@ -22,6 +23,8 @@ interface CustomModelsSectionProps {
 	hiddenModels: string[];
 	onToggleHidden: (modelVal: string) => void;
 	prefixOptions: Array<{ value: string; label: string }>;
+	modelContextWindows: Record<string, number>;
+	onContextWindowChange: (modelVal: string, size: number | null) => void;
 }
 
 export function CustomModelsSection({
@@ -30,6 +33,8 @@ export function CustomModelsSection({
 	hiddenModels,
 	onToggleHidden,
 	prefixOptions,
+	modelContextWindows,
+	onContextWindowChange,
 }: CustomModelsSectionProps) {
 	const { t } = useTranslation("settings");
 	const [newModelValue, setNewModelValue] = useState("");
@@ -87,6 +92,16 @@ export function CustomModelsSection({
 							>
 								{m.provider ?? "openai"}
 							</Badge>
+							<NumberInput
+								placeholder={t("contextWindowPlaceholder")}
+								value={modelContextWindows[m.value] || ""}
+								onChange={(v) => onContextWindowChange(m.value, typeof v === "number" ? v : null)}
+								min={1}
+								step={1000}
+								suffix={` ${t("contextWindowSuffix")}`}
+								w={180}
+								size="xs"
+							/>
 							<ActionIcon
 								variant="subtle"
 								color={isHidden ? "gray" : "blue"}

@@ -87,6 +87,12 @@ export interface NarraForkSettings {
 		 *   - "auto_approve" — automatically approve the plan and continue
 		 */
 		planTimeoutAction: "deny" | "auto_approve";
+		/**
+		 * Per-model context window overrides (tokens).
+		 * Key is the full model value ("provider:modelId"), value is the context window size.
+		 * Takes highest priority in getModelContextWindow().
+		 */
+		modelContextWindows: Record<string, number>;
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -161,6 +167,7 @@ const DEFAULTS: NarraForkSettings = {
 		},
 		legacyEncoding: false,
 		planTimeoutAction: "deny",
+		modelContextWindows: {},
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -621,6 +628,17 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
  */
 export function getModelContextWindow(model: string, provider: string): number | null {
 	const bareModel = parseModelId(model).model;
+	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
+
+	// 0. Check per-model user overrides (highest priority)
+	const userOverrides = settings.agent.modelContextWindows ?? {};
+	if (userOverrides[fullModelValue]) {
+		return userOverrides[fullModelValue];
+	}
+	// Also try the raw model string in case it already has provider prefix
+	if (model !== fullModelValue && userOverrides[model]) {
+		return userOverrides[model];
+	}
 
 	// 1. Check provider configuration (OpenAI or Anthropic)
 		const oaiConfig = getOpenaiProviderConfig(provider);

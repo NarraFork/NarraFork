@@ -28,6 +28,13 @@ import type {
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 
+export interface ViewerInfo {
+	userId: string;
+	username: string;
+	avatarColor: string | null;
+	avatarImageId: string | null;
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
@@ -89,6 +96,8 @@ export interface UseNarratorPanelWSReturn {
 	// Unread
 	unreadCount: number;
 	setUnreadCount: React.Dispatch<React.SetStateAction<number>>;
+	// Viewers
+	viewers: ViewerInfo[];
 }
 
 export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarratorPanelWSReturn {
@@ -205,6 +214,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 	const [unreadCount, setUnreadCount] = useState(0);
+
+	// --- Viewers ---
+	const [viewers, setViewers] = useState<ViewerInfo[]>([]);
 
 	// --- Todos ---
 	const [currentTodos, setCurrentTodos] = useState<TodoItem[] | null>(narratorTodosJson ?? null);
@@ -613,11 +625,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 					// Find the matching optimistic message by content (not by role alone)
 					// to avoid removing unrelated optimistic messages when sending rapidly.
+					// For slash commands, match by commandText since contentText differs
+					// (optimistic has raw command, server has expanded prompt).
 					const optimisticIdx = firstPage.messages.findIndex(
 						(m: NarratorMsg) =>
 							String(m.id).startsWith("optimistic-") &&
 							m.role === "user" &&
-							m.contentText === newMsg.contentText,
+							(m.contentText === newMsg.contentText ||
+								(m.commandText && newMsg.commandText && m.commandText === newMsg.commandText)),
 					);
 					if (optimisticIdx !== -1) {
 						const updated = [...firstPage.messages];
@@ -854,9 +869,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBufferCleared: () => {
 				setBufferedText(null);
 			},
-			onPlanModeChanged: (planMode) => {
+			onPermissionModeChanged: (permissionMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, planMode } : old,
+					old ? { ...old, permissionMode } : old,
 				);
 			},
 			onContextUsage: (percentage, promptTokens, contextWindow) => {
@@ -1014,6 +1029,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
+			onPresenceUpdate: (v) => {
+				setViewers(v);
+			},
 		},
 		lastMessageId,
 	);
@@ -1152,5 +1170,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setEditExpandOverride,
 		unreadCount,
 		setUnreadCount,
+		viewers,
 	};
 }

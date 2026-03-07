@@ -233,7 +233,7 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			narrator.totalCostUsd,
 			narrator.lastMessageAt,
 			narrator.status,
-			narrator.planMode ? 1 : 0,
+			narrator.permissionMode === "plan" ? 1 : 0,
 			narrator.cwd,
 			narrator.errorMessage,
 			jsonCol(narrator.todosJson),

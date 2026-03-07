@@ -343,6 +343,34 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
 
+	// Running subagent: buffer the message for injection into the agent loop
+	if (
+		narrator.type === "subagent" &&
+		(narrator.status === "thinking" || narrator.status === "waiting")
+	) {
+		const { message } = await parseMessageRequest(c, id);
+		const userId = c.get("user").sub;
+		// Resolve slash commands before buffering
+		let bufferText = message;
+		const cmdResult = await resolveCommand(message, id, userId);
+		if (cmdResult.resolved) {
+			bufferText = cmdResult.expandedPrompt;
+		}
+		const { bufferSubagentMessage } = await import("../services/narrator-subagent");
+		const result = bufferSubagentMessage(id, bufferText);
+		if (!result.ok) {
+			throw new ValidationError("Subagent is not running in foreground");
+		}
+		// Broadcast buffer_set so the frontend shows the queued state
+		broadcastToNarrator(id, {
+			type: "buffer_set",
+			narratorId: id,
+			text: message,
+			bufferedAt: result.bufferedAt,
+		});
+		return c.json({ buffered: true, bufferedAt: result.bufferedAt }, 202);
+	}
+
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -355,12 +383,22 @@ narratorRoutes.post("/:id/messages", async (c) => {
 
 	// Resolve slash commands before sending
 	let finalMessage = message;
+	let commandText: string | null = null;
 	const cmdResult = await resolveCommand(message, id, userId);
 	if (cmdResult.resolved) {
 		finalMessage = cmdResult.expandedPrompt;
+		commandText = cmdResult.rawCommand;
 	}
 
-	const userMsg = await sendMessage(id, finalMessage, images, locale, replyInUserLanguage);
+	const userMsg = await sendMessage(
+		id,
+		finalMessage,
+		images,
+		locale,
+		replyInUserLanguage,
+		commandText,
+		userId,
+	);
 	return c.json(userMsg, 201);
 });
 
@@ -368,6 +406,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 narratorRoutes.post("/:id/retry", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
+
+	if (
+		narrator.type === "subagent" &&
+		(narrator.status === "thinking" || narrator.status === "waiting")
+	) {
+		throw new ValidationError("Cannot retry on a running subagent");
+	}
 
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -384,7 +429,12 @@ narratorRoutes.post("/:id/retry", async (c) => {
 // Get buffered message (for multi-device hydration on page load)
 narratorRoutes.get("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
-	const buffered = getBufferedMessage(id);
+	let buffered = getBufferedMessage(id);
+	// Fallback: check subagent buffer
+	if (!buffered) {
+		const { getSubagentBufferedMessage } = await import("../services/narrator-subagent");
+		buffered = getSubagentBufferedMessage(id);
+	}
 	return c.json(buffered ? { text: buffered.text, bufferedAt: buffered.bufferedAt } : null);
 });
 
@@ -429,6 +479,18 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const result = await narratorService.deleteCompactMessage(narratorId, messageId);
+	return c.json({ ok: true, ...result });
+});
+
+// Delete a single content block from a message
+narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const blockIndex = Number.parseInt(c.req.param("blockIndex"), 10);
+	if (Number.isNaN(blockIndex) || blockIndex < 0) {
+		throw new ValidationError("Invalid block index");
+	}
+	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex);
 	return c.json({ ok: true, ...result });
 });
 
@@ -489,7 +551,12 @@ narratorRoutes.post("/:id/plan", async (c) => {
 // Interrupt active session
 narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
-	const interrupted = interruptNarrator(id);
+	let interrupted = interruptNarrator(id);
+	if (!interrupted) {
+		// Fallback: try interrupting a foreground subagent
+		const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
+		interrupted = interruptForegroundSubagent(id);
+	}
 	return c.json({ interrupted });
 });
 
@@ -508,7 +575,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	const id = c.req.param("id");
 	const { permissionMode } = await c.req.json();
-	const validModes = ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"];
+	const validModes = ["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"];
 	if (!permissionMode || !validModes.includes(permissionMode)) {
 		throw new ValidationError(`permissionMode must be one of: ${validModes.join(", ")}`);
 	}

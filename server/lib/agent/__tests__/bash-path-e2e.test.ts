@@ -14,7 +14,7 @@ async function fullChain(
 	permMode = "default",
 ): Promise<"allow" | "deny" | "ask" | "fatal"> {
 	const analysis = await analyzeBashCommand(cmd, CWD);
-	return resolvePermissionDecision("Bash", { command: cmd }, permMode, CWD, false, analysis);
+	return resolvePermissionDecision("Bash", { command: cmd }, permMode, CWD, analysis);
 }
 
 describe("e2e: ls/grep pipe — project internal", () => {

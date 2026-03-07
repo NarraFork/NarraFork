@@ -37,6 +37,7 @@ import { createContext, memo, useContext, useEffect, useMemo, useRef, useState }
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
@@ -106,9 +107,13 @@ interface ToolCallCardProps {
 	forceExpand?: boolean;
 	/** Override expand state for edit tools (true=expand all, false=collapse all, undefined=default) */
 	editExpandOverride?: boolean | null;
+	/** Block index within the parent message's contentJson array */
+	blockIndex?: number;
 }
 
 // --- Constants ---
+
+export const TOOL_CARD_BG = "color-mix(in srgb, var(--mantine-color-body) 50%, transparent)";
 
 export const STATUS_COLORS: Record<string, string> = {
 	initializing: "gray",
@@ -255,6 +260,39 @@ function extractField(val: any, ...keys: string[]): string {
 	return "";
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function extractNumericField(val: any, ...keys: string[]): number | undefined {
+	if (!val) return undefined;
+	if (!isTruncated(val)) {
+		for (const k of keys) {
+			if (typeof val[k] === "number") return val[k];
+		}
+		return undefined;
+	}
+	for (const k of keys) {
+		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*(\\d+)`);
+		const m = val.preview?.match(re);
+		if (m) return Number(m[1]);
+	}
+	return undefined;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function extractBoolField(val: any, ...keys: string[]): boolean {
+	if (!val) return false;
+	if (!isTruncated(val)) {
+		for (const k of keys) {
+			if (val[k] === true) return true;
+		}
+		return false;
+	}
+	for (const k of keys) {
+		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*true`);
+		if (val.preview?.match(re)) return true;
+	}
+	return false;
+}
+
 // --- Helper: extract a human-readable summary for the header ---
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -287,8 +325,16 @@ function getSummary(toolName: string, input: any): string {
 			const fp = getFilePath(input);
 			if (!fp) return toolName;
 			const base = basename(fp);
-			if (toolName === "Edit" || toolName === "MultiEdit") return base;
-			if (toolName === "Write") return base;
+			if (toolName === "Read") {
+				const offset = extractNumericField(input, "offset");
+				const limit = extractNumericField(input, "limit");
+				const forceFull = extractBoolField(input, "force_full", "forceFull");
+				if (forceFull) return `${base} (full)`;
+				if (offset != null && limit != null) return `${base} (${offset}~${offset + limit - 1})`;
+				if (offset != null) return `${base} (${offset}~)`;
+				if (limit != null) return `${base} (1~${limit})`;
+				return base;
+			}
 			return base;
 		}
 		case "bash": {
@@ -406,9 +452,9 @@ function ToolHeader({
 	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
 	const content = (
-		<Group gap={6} wrap="nowrap" align="center">
-			<ThemeIcon size={18} variant="light" color={color} radius="sm">
-				<Icon size={12} />
+		<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
+			<ThemeIcon size={16} variant="light" color={color} radius="sm">
+				<Icon size={10} />
 			</ThemeIcon>
 			<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
 				{toolCall.toolName}
@@ -439,12 +485,16 @@ function ToolHeader({
 		</Group>
 	);
 
-	if (!onToggle) {
-		return <Box style={{ cursor: "default" }}>{content}</Box>;
-	}
-
 	return (
-		<UnstyledButton onClick={onToggle} w="100%">
+		<UnstyledButton
+			onClick={onToggle}
+			w="100%"
+			style={{
+				...(onToggle ? {} : { cursor: "default", pointerEvents: "none" as const }),
+				display: "flex",
+				alignItems: "center",
+			}}
+		>
 			{content}
 		</UnstyledButton>
 	);
@@ -482,6 +532,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const lang = fp ? getShikiLang(fp) : undefined;
 
 	// For Write tool, display the written content from input instead of the result prompt
 	const writeContent = isWrite
@@ -505,6 +556,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					content={`--- old\n${oldString}\n+++ new\n${newString ?? ""}`}
 					title={fp ? basename(fp) : "Diff"}
 					contentType="diff"
+					language={lang}
 					diff={{
 						oldStr: oldString,
 						newStr: newString ?? "",
@@ -515,6 +567,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 							newStr={newString ?? ""}
 							maxHeight={200}
 							wordWrap={wordWrap}
+							language={lang}
 						/>
 					)}
 				/>
@@ -525,6 +578,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						content={toolCall.inputJson.preview}
 						style={codeStyle}
 						title={fp ? basename(fp) : "Edit"}
+						language={lang}
 					/>
 					<TruncatedBadge fullLength={toolCall.inputJson.fullLength} />
 				</>
@@ -535,6 +589,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						content={writeContent}
 						style={codeStyle}
 						title={fp ? basename(fp) : "Write"}
+						language={lang}
 					/>
 					{inputIsTruncated && <TruncatedBadge fullLength={toolCall.inputJson.fullLength} />}
 				</>
@@ -548,6 +603,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						content={outputText}
 						style={codeStyle}
 						title={fp ? basename(fp) : "Output"}
+						language={lang}
 					/>
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
@@ -557,6 +613,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					content={JSON.stringify(toolCall.inputJson, null, 2)}
 					style={codeStyle}
 					title={fp ? basename(fp) : "Edit"}
+					language="json"
 				/>
 			)}
 		</Box>
@@ -882,6 +939,7 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 }
 
 function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight?: number }) {
+	const { t } = useTranslation("narrator");
 	// Plan content lives in inputJson.plan (populated by handlePermission).
 	// outputJson is just a short confirmation message after approval.
 	const planText =
@@ -891,8 +949,44 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 				: ""
 			: "";
 
+	const isDenied = toolCall.status === "fail" && toolCall.toolName === "ExitPlanMode";
+	// User feedback is stored in errorMessage when the plan is denied
+	const denyFeedback = isDenied ? toolCall.errorMessage : undefined;
+	const [planExpanded, setPlanExpanded] = useState(!isDenied);
+
 	if (!planText) {
 		return null;
+	}
+
+	// Denied plan: show feedback + collapsed plan content
+	if (isDenied) {
+		return (
+			<Box mt="xs">
+				{denyFeedback && denyFeedback !== "Permission denied by user" && (
+					<Text size="xs" c="yellow" mb={4}>
+						{denyFeedback}
+					</Text>
+				)}
+				<UnstyledButton onClick={() => setPlanExpanded((o) => !o)} w="100%">
+					<Group gap={4} mb={4}>
+						{planExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+						<Text size="xs" c="dimmed">
+							{t("planDeniedToggle")}
+						</Text>
+					</Group>
+				</UnstyledButton>
+				<LazyCollapse in={planExpanded}>
+					<Box style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}>
+						<ContentViewer
+							content={planText}
+							markdown
+							contentType="markdown"
+							title={`Plan — ${toolCall.toolName}`}
+						/>
+					</Box>
+				</LazyCollapse>
+			</Box>
+		);
 	}
 
 	return (
@@ -1173,6 +1267,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	onQuestionDeny,
 	forceExpand,
 	editExpandOverride,
+	blockIndex,
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName);
 	const isEdit = isEditTool(toolCall.toolName);
@@ -1181,16 +1276,18 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isStreaming = toolCall.inputJson?._streamingChars != null;
 	// Auto-expand: permission pending, todo tools, or edit tools.
 	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
+	// Denied ExitPlanMode defaults to collapsed — plan content is folded inside PlanDetail.
 	const isFailed = toolCall.status === "fail";
 	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
+	const isDeniedPlan = isFailed && toolCall.toolName === "ExitPlanMode";
 	const defaultOpen =
 		!isStreaming &&
 		(!!pendingPermission ||
 			toolCall.status === "pending" ||
 			cat === "todo" ||
-			cat === "plan" ||
+			(cat === "plan" && !isDeniedPlan) ||
 			(isEdit && !isFailedEdit) ||
-			(isFailed && !isEdit));
+			(isFailed && !isEdit && !isDeniedPlan));
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Clamp plan card height to 70% of the nearest scroll container (same as SubagentCard)
@@ -1258,7 +1355,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const hasActions = !!(
 		msgCtx.onForkFromMessage ||
 		msgCtx.onCompactBeforeMessage ||
-		msgCtx.onDeleteMessage
+		(msgCtx.onDeleteBlock && blockIndex != null)
 	);
 
 	// --- Swipe & context-menu state ---
@@ -1288,12 +1385,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 					{tNarrator("contextMenu_compactBefore")}
 				</Menu.Item>
 			)}
-			{msgCtx.onDeleteMessage && (
+			{msgCtx.onDeleteBlock && blockIndex != null && (
 				<Menu.Item
 					color="red"
 					leftSection={<IconTrash size={14} />}
 					onClick={() => {
-						msgCtx.onDeleteMessage?.();
+						msgCtx.onDeleteBlock?.(blockIndex);
 						swipe.closeSwipe();
 					}}
 				>
@@ -1408,7 +1505,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 					withBorder={!inRun}
 					radius={inRun ? 0 : "sm"}
 					p="xs"
-					style={borderColor ? { borderColor } : undefined}
+					style={{
+						backgroundColor: TOOL_CARD_BG,
+						...(borderColor ? { borderColor } : {}),
+					}}
 				>
 					{cardContent}
 				</Paper>
@@ -1460,11 +1560,11 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 		: undefined;
 
 	return (
-		<Paper withBorder radius="sm" p="xs">
+		<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
 			<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%">
-				<Group gap={6} wrap="nowrap">
-					<ThemeIcon size={18} variant="light" color={color} radius="sm">
-						<Icon size={12} />
+				<Group gap={5} wrap="nowrap">
+					<ThemeIcon size={16} variant="light" color={color} radius="sm">
+						<Icon size={10} />
 					</ThemeIcon>
 					<Text size="xs" fw={600} c="dimmed">
 						{label}

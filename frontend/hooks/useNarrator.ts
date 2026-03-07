@@ -106,7 +106,6 @@ export function useCreateNarrator() {
 			systemPrompt?: string;
 			permissionMode?: string;
 			cwd?: string;
-			planMode?: boolean;
 		}) => api.createNarrator(data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });

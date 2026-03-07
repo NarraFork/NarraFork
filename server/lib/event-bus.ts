@@ -182,9 +182,7 @@ export type NarraForkEvent =
 			chapterId: string;
 			commitSha: string;
 			message: string;
-	  }
-	// User preferences
-	| { type: "user:recent_tabs_changed"; userId: string };
+	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 
@@ -201,7 +199,7 @@ class NarraForkEventBus {
 		this.emitter.setMaxListeners(100);
 	}
 
-	private static SILENT_EVENTS: Set<string> = new Set(["user:recent_tabs_changed"]);
+	private static SILENT_EVENTS: Set<string> = new Set([]);
 
 	emit(event: NarraForkEvent): void {
 		if (!NarraForkEventBus.SILENT_EVENTS.has(event.type)) {

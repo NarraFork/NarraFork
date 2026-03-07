@@ -20,7 +20,7 @@ import type {
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
-import { getCategoryColor, ToolCallCard } from "./ToolCallCard";
+import { getCategoryColor, TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a group of tool-bearing messages
@@ -34,8 +34,8 @@ export function renderToolRun(
 	highlightedId?: string | null,
 	editExpandOverride?: boolean | null,
 	onForkFromMessage?: (uuid: string) => void,
-	onDeleteMessage?: (messageId: string) => void,
 	onCompactBeforeMessage?: (messageId: string) => void,
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
 ) {
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
@@ -68,16 +68,16 @@ export function renderToolRun(
 		if (msgId && onCompactBeforeMessage) {
 			ctxActions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
 		}
-		if (msgId && onDeleteMessage) {
-			ctxActions.onDeleteMessage = () => onDeleteMessage(msgId);
+		if (msgId && onDeleteBlock) {
+			ctxActions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
 
 		if (item.kind === "reasoning") {
 			const iconColor = getCategoryColor("plan");
 			const header = (
-				<Group gap={6} wrap="nowrap" align="center">
-					<ThemeIcon size={18} variant="light" color={iconColor} radius="sm">
-						<IconBrain size={12} />
+				<Group gap={5} wrap="nowrap" align="flex-start">
+					<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
+						<IconBrain size={10} />
 					</ThemeIcon>
 					<ReasoningSummary text={item.reasoningText} />
 				</Group>
@@ -121,6 +121,7 @@ export function renderToolRun(
 							permCb={permCb}
 							editExpandOverride={editExpandOverride}
 							onBgAgentRetry={permCb?.onBgAgentRetry}
+							blockIndex={item.blockIndex}
 						/>
 					</div>
 				</MessageContextMenuCtx.Provider>
@@ -143,6 +144,7 @@ export function renderToolRun(
 						onQuestionDeny={permCb.onQuestionDeny}
 						forceExpand={expandedToolUseId === item.tc.toolUseId}
 						editExpandOverride={editExpandOverride}
+						blockIndex={item.blockIndex}
 					/>
 				</div>
 			</MessageContextMenuCtx.Provider>
@@ -157,6 +159,7 @@ export function renderToolRun(
 					border: "1px solid var(--mantine-color-default-border)",
 					borderRadius: "var(--mantine-radius-sm)",
 					overflow: "hidden",
+					backgroundColor: TOOL_CARD_BG,
 				}}
 			>
 				{items.map((item, idx) => renderItem(item, idx, items.length))}
@@ -186,10 +189,10 @@ export function renderTreeMessages(
 	expandedToolUseId?: string | null,
 	editExpandOverride?: boolean | null,
 	showTokenUsage?: boolean,
-	onDeleteMessage?: (messageId: string) => void,
 	pruneBoundaryMessageId?: string | null,
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -245,7 +248,7 @@ export function renderTreeMessages(
 				onQuestionSubmit={permCb.onQuestionSubmit}
 				onQuestionDeny={permCb.onQuestionDeny}
 				onCompactBeforeMessage={onCompactBeforeMessage}
-				onDeleteMessage={onDeleteMessage}
+				onDeleteBlock={onDeleteBlock}
 			/>
 			{showTokenUsage &&
 				(targetMsg.turnUsageJson != null ||
@@ -293,13 +296,18 @@ export function renderTreeMessages(
 			// For mixed messages, render reasoning + text/image first so the order becomes:
 			// reasoning → text/image → tool calls.
 			if (!toolOnly) {
-				const reasoningBlocks = blocks.filter(
-					(b: ContentBlock) => b.type === "reasoning" && !!b.text?.trim(),
-				);
-				const otherBlocks = blocks.filter(
-					(b: ContentBlock) => b.type !== "tool_use" && b.type !== "reasoning",
-				);
-				const leadingBlocks = [...reasoningBlocks, ...otherBlocks];
+				const reasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
+				const otherEntries: { block: ContentBlock; origIdx: number }[] = [];
+				blocks.forEach((b: ContentBlock, idx: number) => {
+					if (b.type === "reasoning" && !!b.text?.trim()) {
+						reasoningEntries.push({ block: b, origIdx: idx });
+					} else if (b.type !== "tool_use") {
+						otherEntries.push({ block: b, origIdx: idx });
+					}
+				});
+				const leadingEntries = [...reasoningEntries, ...otherEntries];
+				const leadingBlocks = leadingEntries.map((e) => e.block);
+				const leadingOriginalIndices = leadingEntries.map((e) => e.origIdx);
 				if (hasVisibleBlocks(leadingBlocks)) {
 					elements.push(
 						<Box
@@ -323,6 +331,7 @@ export function renderTreeMessages(
 									...msg,
 									contentJson: leadingBlocks,
 									toolCalls: [],
+									_blockOriginalIndices: leadingOriginalIndices,
 								}}
 								onForkFromMessage={onForkFromMessage}
 								resolvePerm={(tc) =>
@@ -332,7 +341,7 @@ export function renderTreeMessages(
 								onQuestionSubmit={permCb.onQuestionSubmit}
 								onQuestionDeny={permCb.onQuestionDeny}
 								onCompactBeforeMessage={onCompactBeforeMessage}
-								onDeleteMessage={onDeleteMessage}
+								onDeleteBlock={onDeleteBlock}
 							/>
 						</Box>,
 					);
@@ -344,10 +353,17 @@ export function renderTreeMessages(
 			// emitted text before these tool chunks, they should render separately.
 			const runStartMsg: NarratorMsg =
 				!toolOnly && hasTool
-					? {
-							...msg,
-							contentJson: blocks.filter((b: ContentBlock) => b.type === "tool_use"),
-						}
+					? (() => {
+							const toolEntries: { block: ContentBlock; origIdx: number }[] = [];
+							blocks.forEach((b: ContentBlock, idx: number) => {
+								if (b.type === "tool_use") toolEntries.push({ block: b, origIdx: idx });
+							});
+							return {
+								...msg,
+								contentJson: toolEntries.map((e) => e.block),
+								_blockOriginalIndices: toolEntries.map((e) => e.origIdx),
+							};
+						})()
 					: msg;
 			const run: NarratorMsg[] = [runStartMsg];
 			let trailingContentMsg: NarratorMsg | null = null;
@@ -372,20 +388,30 @@ export function renderTreeMessages(
 				const tailToolOnly = isToolOnlyMessage(tailMsg);
 				if (!tailHasTool && tailHasReasoning && !tailToolOnly && !tailMsg._noMerge) {
 					const tailBlocks = Array.isArray(tailMsg.contentJson) ? tailMsg.contentJson : [];
-					const tailReasoningBlocks = tailBlocks.filter(
-						(b: ContentBlock) => b.type === "reasoning" && !!b.text?.trim(),
-					);
-					if (tailReasoningBlocks.length > 0) {
-						run.push({ ...tailMsg, contentJson: tailReasoningBlocks, toolCalls: [] });
+					const tailReasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
+					const tailContentEntries: { block: ContentBlock; origIdx: number }[] = [];
+					tailBlocks.forEach((b: ContentBlock, idx: number) => {
+						if (b.type === "reasoning" && !!b.text?.trim()) {
+							tailReasoningEntries.push({ block: b, origIdx: idx });
+						} else if (b.type !== "tool_use") {
+							tailContentEntries.push({ block: b, origIdx: idx });
+						}
+					});
+					if (tailReasoningEntries.length > 0) {
+						run.push({
+							...tailMsg,
+							contentJson: tailReasoningEntries.map((e) => e.block),
+							toolCalls: [],
+							_blockOriginalIndices: tailReasoningEntries.map((e) => e.origIdx),
+						});
 					}
-					const tailContentBlocks = tailBlocks.filter(
-						(b: ContentBlock) => b.type !== "reasoning" && b.type !== "tool_use",
-					);
+					const tailContentBlocks = tailContentEntries.map((e) => e.block);
 					if (hasVisibleBlocks(tailContentBlocks)) {
 						trailingContentMsg = {
 							...tailMsg,
 							contentJson: tailContentBlocks,
 							toolCalls: [],
+							_blockOriginalIndices: tailContentEntries.map((e) => e.origIdx),
 						};
 					}
 					j++;
@@ -400,8 +426,8 @@ export function renderTreeMessages(
 				highlightedId,
 				editExpandOverride,
 				onForkFromMessage,
-				onDeleteMessage,
 				onCompactBeforeMessage,
+				onDeleteBlock,
 			);
 
 			if (el) elements.push(el);
@@ -489,7 +515,7 @@ interface PageElementsProps {
 	showTokenUsage?: boolean;
 	/** When set, only render the last N messages of this page (for progressive rendering). */
 	maxMessages?: number;
-	onDeleteMessage?: (messageId: string) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	pruneBoundaryMessageId?: string | null;
 }
@@ -505,7 +531,7 @@ export const MemoizedPageElements = memo(
 		editExpandOverride,
 		showTokenUsage,
 		maxMessages,
-		onDeleteMessage,
+		onDeleteBlock,
 		onCompactBeforeMessage,
 		pruneBoundaryMessageId,
 	}: PageElementsProps) {
@@ -523,10 +549,10 @@ export const MemoizedPageElements = memo(
 			expandedToolUseId,
 			editExpandOverride,
 			showTokenUsage,
-			onDeleteMessage,
 			pruneBoundaryMessageId,
 			t("pruneBoundaryLabel"),
 			onCompactBeforeMessage,
+			onDeleteBlock,
 		);
 		return <>{elements}</>;
 	},

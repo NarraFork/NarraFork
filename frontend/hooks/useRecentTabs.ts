@@ -9,6 +9,7 @@ export interface RecentTabViewer {
 	userId: string;
 	username: string;
 	avatarColor: string | null;
+	avatarImageId: string | null;
 }
 
 export interface RecentTab {
@@ -42,35 +43,13 @@ export function useRecentTabs() {
 		staleTime: 60_000,
 	});
 
-	const upsertMutation = useMutation({
-		mutationFn: (tab: RecentTab) => api.upsertRecentTab(tab),
-		onMutate: async (tab) => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const idx = prev.findIndex((t) => t.type === tab.type && t.id === tab.id);
-			let next: RecentTab[];
-			if (idx >= 0) {
-				next = [...prev];
-				// Merge: preserve runtime-enriched fields from the existing entry
-				next[idx] = { ...prev[idx], ...tab };
-			} else {
-				next = [tab, ...prev].slice(0, 20);
-			}
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
-			return { prev };
-		},
-		onError: (_err, _tab, ctx) => {
-			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
-		},
-	});
-
+	// --- Remove a single tab (optimistic) ---
 	const removeMutation = useMutation({
 		mutationFn: ({ type, id }: { type: RecentTab["type"]; id: string }) =>
 			api.removeRecentTab(type, id),
 		onMutate: async ({ type, id }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			// Evict page data for the closed tab
 			const tab = prev.find((t) => t.type === type && t.id === id);
 			if (tab) {
 				if (tab.type === "chapter") {
@@ -79,7 +58,6 @@ export function useRecentTabs() {
 				} else if (tab.type === "narrator") {
 					qc.removeQueries({ queryKey: ["narrators", tab.id] });
 				}
-				// project tabs: no narrator/chapter cache to evict
 			}
 			qc.setQueryData(
 				RECENT_TABS_QUERY_KEY,
@@ -90,33 +68,29 @@ export function useRecentTabs() {
 		onError: (_err, _vars, ctx) => {
 			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
 		},
+		// No onSuccess — WS snapshot will deliver the authoritative list
 	});
 
-	interface ClearArgs {
-		keepFilter?: (t: RecentTab) => boolean;
-		/** Pre-computed items to remove (snapshot before onMutate modifies cache) */
-		toRemove: { type: RecentTab["type"]; id: string }[];
-	}
-
-	const clearMutation = useMutation({
-		mutationFn: ({ keepFilter, toRemove }: ClearArgs) => {
-			if (!keepFilter) return api.clearRecentTabs();
-			if (toRemove.length === 0) return Promise.resolve([]);
-			return api.batchRemoveRecentTabs(toRemove);
-		},
-		onMutate: async ({ keepFilter }: ClearArgs) => {
+	// --- Move a tab (optimistic) ---
+	const moveMutation = useMutation({
+		mutationFn: (args: {
+			key: string;
+			target: { toIndex: number } | { position: "top" | "above_idle" };
+		}) => api.moveRecentTab(args.key, args.target),
+		onMutate: async ({ key, target }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const removed = keepFilter ? prev.filter((t) => !keepFilter(t)) : prev;
-			for (const tab of removed) {
-				if (tab.type === "chapter") {
-					qc.removeQueries({ queryKey: ["chapters", tab.id] });
-					if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-				} else if (tab.type === "narrator") {
-					qc.removeQueries({ queryKey: ["narrators", tab.id] });
-				}
+			const idx = prev.findIndex((t) => `${t.type}:${t.id}` === key);
+			if (idx === -1) return { prev };
+			const next = [...prev];
+			const [moved] = next.splice(idx, 1);
+			if ("toIndex" in target) {
+				next.splice(Math.min(target.toIndex, next.length), 0, moved);
+			} else {
+				// top or above_idle — just put at top for optimistic (server will do exact placement)
+				next.unshift(moved);
 			}
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, keepFilter ? prev.filter(keepFilter) : []);
+			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
 			return { prev };
 		},
 		onError: (_err, _vars, ctx) => {
@@ -124,13 +98,36 @@ export function useRecentTabs() {
 		},
 	});
 
-	const reorderMutation = useMutation({
-		mutationFn: (reordered: RecentTab[]) =>
-			api.reorderRecentTabs(reordered.map((t) => `${t.type}:${t.id}`)),
-		onMutate: async (reordered) => {
+	// --- Clear tabs by scope (optimistic) ---
+	const clearMutation = useMutation({
+		mutationFn: (scope: "all" | "projects" | "inactive_narrators") => api.clearRecentTabs(scope),
+		onMutate: async (scope) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, reordered);
+			if (scope === "all") {
+				for (const tab of prev) evictTabCache(qc, tab);
+				qc.setQueryData(RECENT_TABS_QUERY_KEY, []);
+			} else if (scope === "projects") {
+				for (const tab of prev) {
+					if (tab.type === "project") evictTabCache(qc, tab);
+				}
+				qc.setQueryData(
+					RECENT_TABS_QUERY_KEY,
+					prev.filter((t) => t.type !== "project"),
+				);
+			} else {
+				// inactive_narrators — keep projects + active tabs
+				const ACTIVE = new Set(["thinking", "waiting", "done"]);
+				const kept: RecentTab[] = [];
+				for (const tab of prev) {
+					if (tab.type === "project" || ACTIVE.has(tab.status ?? "")) {
+						kept.push(tab);
+					} else {
+						evictTabCache(qc, tab);
+					}
+				}
+				qc.setQueryData(RECENT_TABS_QUERY_KEY, kept);
+			}
 			return { prev };
 		},
 		onError: (_err, _vars, ctx) => {
@@ -140,65 +137,59 @@ export function useRecentTabs() {
 
 	return {
 		tabs,
-		addTab: useCallback(
-			(tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number }) => {
-				upsertMutation.mutate({ ...tab, lastVisitedAt: tab.lastVisitedAt ?? Date.now() });
-			},
-			[upsertMutation],
-		),
 		removeTab: useCallback(
-			(type: RecentTab["type"], id: string) => {
-				removeMutation.mutate({ type, id });
-			},
+			(type: RecentTab["type"], id: string) => removeMutation.mutate({ type, id }),
 			[removeMutation],
 		),
-		reorderTabs: useCallback(
-			(reordered: RecentTab[]) => {
-				reorderMutation.mutate(reordered);
-			},
-			[reorderMutation],
+		moveTab: useCallback(
+			(key: string, target: { toIndex: number } | { position: "top" | "above_idle" }) =>
+				moveMutation.mutate({ key, target }),
+			[moveMutation],
 		),
-		clearAll: useCallback(() => {
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			clearMutation.mutate({ toRemove: prev.map((t) => ({ type: t.type, id: t.id })) });
-		}, [clearMutation, qc]),
-		clearProjects: useCallback(() => {
-			const keepFilter = (t: RecentTab) => t.type !== "project";
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const toRemove = prev.filter((t) => !keepFilter(t)).map((t) => ({ type: t.type, id: t.id }));
-			clearMutation.mutate({ keepFilter, toRemove });
-		}, [clearMutation, qc]),
-		clearNarrators: useCallback(() => {
-			const activeStatuses = new Set(["thinking", "waiting", "done"]);
-			const keepFilter = (t: RecentTab) =>
-				t.type === "project" || activeStatuses.has(t.status ?? "");
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const toRemove = prev.filter((t) => !keepFilter(t)).map((t) => ({ type: t.type, id: t.id }));
-			clearMutation.mutate({ keepFilter, toRemove });
-		}, [clearMutation, qc]),
+		clearTabs: useCallback(
+			(scope: "all" | "projects" | "inactive_narrators") => clearMutation.mutate(scope),
+			[clearMutation],
+		),
 	};
+}
+
+function evictTabCache(qc: ReturnType<typeof useQueryClient>, tab: RecentTab) {
+	if (tab.type === "chapter") {
+		qc.removeQueries({ queryKey: ["chapters", tab.id] });
+		if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
+	} else if (tab.type === "narrator") {
+		qc.removeQueries({ queryKey: ["narrators", tab.id] });
+	}
 }
 
 // === Standalone helper for use in effects (fire-and-forget) ===
 
 export function addRecentTab(tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number }) {
 	const entry: RecentTab = { ...tab, lastVisitedAt: tab.lastVisitedAt ?? Date.now() };
-
-	// Optimistic cache update
-	const prev = globalQC.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-	const idx = prev.findIndex((t) => t.type === entry.type && t.id === entry.id);
-	let next: RecentTab[];
-	if (idx >= 0) {
-		next = [...prev];
-		// Merge: preserve runtime-enriched fields from the existing entry
-		next[idx] = { ...prev[idx], ...entry };
-	} else {
-		next = [entry, ...prev].slice(0, 20);
-	}
-	globalQC.setQueryData(RECENT_TABS_QUERY_KEY, next);
-
-	// Persist to backend
 	api.upsertRecentTab(entry).catch((err) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);
+	});
+}
+
+/**
+ * Update a recent tab's fields in the local cache only — no server request.
+ * Used by route effects to keep tab metadata fresh without triggering upserts.
+ */
+export function updateRecentTabLocal(
+	type: RecentTab["type"],
+	id: string,
+	patch: Partial<Pick<RecentTab, "title" | "subtitle" | "status">>,
+) {
+	globalQC.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (prev) => {
+		if (!prev) return prev;
+		let changed = false;
+		const next = prev.map((t) => {
+			if (t.type === type && t.id === id) {
+				changed = true;
+				return { ...t, ...patch };
+			}
+			return t;
+		});
+		return changed ? next : prev;
 	});
 }

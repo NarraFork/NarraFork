@@ -218,7 +218,6 @@ describe("prompt injection: interpreter code execution", () => {
 				{ command: "test" },
 				"default",
 				"/test/cwd",
-				false,
 				analysis,
 			),
 		).toBe("ask");
@@ -237,7 +236,6 @@ describe("prompt injection: interpreter code execution", () => {
 				{ command: "test" },
 				"acceptEdits",
 				"/test/cwd",
-				false,
 				analysis,
 			),
 		).toBe("allow");
@@ -256,7 +254,6 @@ describe("prompt injection: interpreter code execution", () => {
 				{ command: "test" },
 				"acceptEdits",
 				"/test/cwd",
-				false,
 				analysis,
 			),
 		).toBe("allow");
@@ -681,7 +678,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 
 	test("default + allWhitelisted + internal paths → ask (default mode asks for all mutations)", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "git status" }, "default", cwd, false, allSafe),
+			resolvePermissionDecision("Bash", { command: "git status" }, "default", cwd, allSafe),
 		).toBe("ask");
 	});
 
@@ -692,7 +689,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "cat /etc/passwd" },
 				"default",
 				cwd,
-				false,
 				withExternalPath,
 			),
 		).toBe("ask");
@@ -705,7 +701,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "rm -rf foo" },
 				"default",
 				cwd,
-				false,
 				withNonWhitelisted,
 			),
 		).toBe("ask");
@@ -713,7 +708,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 
 	test("default + no analysis → ask (conservative)", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "anything" }, "default", cwd, false, undefined),
+			resolvePermissionDecision("Bash", { command: "anything" }, "default", cwd, undefined),
 		).toBe("ask");
 	});
 
@@ -724,7 +719,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "find . -exec rm" },
 				"default",
 				cwd,
-				false,
 				withDangerousPattern,
 			),
 		).toBe("ask");
@@ -737,7 +731,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "LD_PRELOAD=... ls" },
 				"default",
 				cwd,
-				false,
 				withEnvInjection,
 			),
 		).toBe("ask");
@@ -750,7 +743,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "rm -rf /" },
 				"bypassPermissions",
 				cwd,
-				false,
 				withNonWhitelisted,
 			),
 		).toBe("allow");
@@ -758,7 +750,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 
 	test("dontAsk → deny regardless", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "git status" }, "dontAsk", cwd, false, allSafe),
+			resolvePermissionDecision("Bash", { command: "git status" }, "dontAsk", cwd, allSafe),
 		).toBe("deny");
 	});
 
@@ -769,7 +761,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "git status" },
 				"acceptEdits",
 				cwd,
-				false,
 				allSafe,
 			),
 		).toBe("allow");
@@ -785,7 +776,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "npx tsc --outDir /tmp/out" },
 				"default",
 				cwd,
-				false,
 				analysis,
 			),
 		).toBe("ask");
@@ -801,7 +791,6 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				{ command: "npx tsc --outDir /tmp/out" },
 				"acceptEdits",
 				cwd,
-				false,
 				analysis,
 			),
 		).toBe("allow");
@@ -935,7 +924,6 @@ describe("catastrophic: resolvePermissionDecision returns fatal", () => {
 			{ command: "rm -rf /" },
 			"bypassPermissions",
 			cwd,
-			false,
 			analysis,
 		);
 		expect(decision).toBe("fatal");
@@ -948,7 +936,6 @@ describe("catastrophic: resolvePermissionDecision returns fatal", () => {
 			{ command: "dd if=/dev/zero of=/dev/sda" },
 			"default",
 			cwd,
-			false,
 			analysis,
 		);
 		expect(decision).toBe("fatal");
@@ -961,7 +948,6 @@ describe("catastrophic: resolvePermissionDecision returns fatal", () => {
 			{ command: "mkfs.ext4 /dev/sda1" },
 			"dontAsk",
 			cwd,
-			false,
 			analysis,
 		);
 		expect(decision).toBe("fatal");
@@ -974,7 +960,6 @@ describe("catastrophic: resolvePermissionDecision returns fatal", () => {
 			{ command: "rm -rf node_modules" },
 			"default",
 			cwd,
-			false,
 			analysis,
 		);
 		expect(decision).toBe("ask");
@@ -1396,7 +1381,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git checkout main" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true, // isChapter
 			);
@@ -1410,7 +1394,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git status" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true,
 			);
@@ -1424,7 +1407,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git add . && git commit -m 'fix'" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true,
 			);
@@ -1438,7 +1420,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git push origin" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true,
 			);
@@ -1452,7 +1433,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git push --force" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true,
 			);
@@ -1466,7 +1446,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git checkout main" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				false, // not chapter
 			);
@@ -1481,7 +1460,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git checkout main" },
 				"bypassPermissions",
 				cwd,
-				false,
 				analysis,
 				true,
 			);
@@ -1496,7 +1474,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "git status && git checkout develop" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true,
 			);
@@ -1510,7 +1487,6 @@ describe("Chapter mode - git branch restrictions", () => {
 				{ command: "rm -rf /" },
 				"default",
 				cwd,
-				false,
 				analysis,
 				true,
 			);

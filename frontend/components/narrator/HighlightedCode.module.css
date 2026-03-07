@@ -1,0 +1,28 @@
+.root {
+	border-radius: var(--mantine-radius-sm);
+	background-color: var(--mantine-color-body);
+	border: 1px solid var(--mantine-color-default-border);
+	overflow: auto;
+
+	pre {
+		margin: 0;
+		padding: var(--mantine-spacing-xs);
+		font-family: var(--mantine-font-family-monospace);
+		font-size: 11px;
+		line-height: 1.55;
+		white-space: pre;
+		tab-size: 4;
+		/* Override shiki's inline background-color on <pre> */
+		background: transparent;
+
+		code {
+			font-family: inherit;
+			font-size: inherit;
+			background: none;
+
+			span {
+				white-space: break-spaces;
+			}
+		}
+	}
+}

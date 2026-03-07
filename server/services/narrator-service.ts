@@ -6,6 +6,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -267,7 +268,6 @@ interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
-	planMode?: boolean;
 	reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null;
 }
 
@@ -310,6 +310,7 @@ export const narratorService = {
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
+			| "plan"
 			| "dontAsk";
 
 		const resolvedModel = input.model ?? settings.agent.defaultModel;
@@ -331,7 +332,6 @@ export const narratorService = {
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
-				planMode: input.planMode ?? false,
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
@@ -358,6 +358,7 @@ export const narratorService = {
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
+			| "plan"
 			| "dontAsk";
 
 		const resolvedModel = input.model ?? parent.model ?? settings.agent.defaultModel;
@@ -381,7 +382,6 @@ export const narratorService = {
 				cwd: input.cwd,
 				inheritMode: "fresh",
 				status: "thinking",
-				planMode: false,
 				createdAt: now,
 				updatedAt: now,
 			})
@@ -421,6 +421,7 @@ export const narratorService = {
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
+			| "plan"
 			| "dontAsk";
 
 		// Copy all message refs from the original subagent
@@ -811,7 +812,7 @@ export const narratorService = {
 		const messageIds = pageRows.map((r) => r.messageId);
 		const topMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
+			with: { toolCalls: true, creator: true },
 		});
 
 		// Sort by seq order from refs (not createdAt)
@@ -834,7 +835,7 @@ export const narratorService = {
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
 						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true },
+						with: { toolCalls: true, creator: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -912,7 +913,7 @@ export const narratorService = {
 		const messageIds = refRows.map((r) => r.messageId);
 		const allMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
+			with: { toolCalls: true, creator: true },
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
@@ -950,7 +951,7 @@ export const narratorService = {
 							)})`
 						: undefined,
 				),
-				with: { toolCalls: true },
+				with: { toolCalls: true, creator: true },
 				orderBy: (m, { asc }) => [asc(m.createdAt)],
 				limit: 500,
 			});
@@ -1097,7 +1098,7 @@ export const narratorService = {
 
 		const topMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, allIds),
-			with: { toolCalls: true },
+			with: { toolCalls: true, creator: true },
 		});
 
 		// Sort by seq order
@@ -1117,7 +1118,7 @@ export const narratorService = {
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
 						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true },
+						with: { toolCalls: true, creator: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -1338,6 +1339,214 @@ export const narratorService = {
 	},
 
 	/**
+	 * Delete a single content block from a message by index.
+	 * If the message becomes empty after removal, the entire message is deleted
+	 * (without cascading to subsequent messages).
+	 * Handles copy-on-write when the message is shared by multiple narrators.
+	 */
+	async deleteMessageBlock(narratorId: string, messageId: string, blockIndex: number) {
+		// Verify the message belongs to this narrator
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!targetRef) throw new NotFoundError("Message", messageId);
+
+		const message = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+		});
+		if (!message) throw new NotFoundError("Message", messageId);
+
+		const blocks = Array.isArray(message.contentJson)
+			? (message.contentJson as { type: string; id?: string; text?: string }[])
+			: [];
+		if (blockIndex < 0 || blockIndex >= blocks.length) {
+			throw new ValidationError(`Block index ${blockIndex} out of range (0..${blocks.length - 1})`);
+		}
+
+		const removedBlock = blocks[blockIndex];
+		const remaining = blocks.filter((_, i) => i !== blockIndex);
+
+		// Check if this message is shared by multiple narrators
+		const refCount = await db
+			.select({ count: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.messageId, messageId));
+		const isShared = (refCount[0]?.count ?? 0) > 1;
+
+		let messageDeleted = false;
+
+		await db.transaction(async (tx) => {
+			// Helper: clean up a tool_use block's associated records
+			const cleanToolUseBlock = async (block: { type: string; id?: string }, msgId: string) => {
+				if (block.type !== "tool_use" || !block.id) return;
+				// Delete tool call record for THIS message only
+				await tx
+					.delete(narratorToolCalls)
+					.where(
+						and(eq(narratorToolCalls.messageId, msgId), eq(narratorToolCalls.toolUseId, block.id)),
+					);
+				// Delete sub-agent child messages ONLY if no other narrator refs them
+				const children = await tx
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.where(eq(narratorMessages.parentToolUseId, block.id));
+				if (children.length > 0) {
+					const childIds = children.map((c) => c.id);
+					// Check if any other narrator still references these children
+					const otherRefs = await tx
+						.select({ messageId: narratorMessageRefs.messageId })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								inArray(narratorMessageRefs.messageId, childIds),
+								ne(narratorMessageRefs.narratorId, narratorId),
+							),
+						)
+						.limit(1);
+					if (otherRefs.length === 0) {
+						// No other narrator references — safe to delete
+						await tx
+							.delete(narratorToolCalls)
+							.where(inArray(narratorToolCalls.messageId, childIds));
+						await tx
+							.delete(narratorMessageRefs)
+							.where(inArray(narratorMessageRefs.messageId, childIds));
+						await tx.delete(narratorMessages).where(inArray(narratorMessages.id, childIds));
+					} else {
+						// Other narrators still reference — only remove THIS narrator's refs
+						await tx
+							.delete(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, narratorId),
+									inArray(narratorMessageRefs.messageId, childIds),
+								),
+							);
+					}
+				}
+			};
+
+			if (remaining.length === 0) {
+				// No blocks left — delete the entire message (this one only, no cascade)
+				messageDeleted = true;
+
+				// Clean up tool_use associations from the removed block
+				await cleanToolUseBlock(removedBlock, messageId);
+
+				// Remove ref for this narrator
+				await tx
+					.delete(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
+					);
+
+				// If message is now orphaned, delete it
+				if (!isShared) {
+					await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId));
+					await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+				}
+			} else if (isShared) {
+				// Copy-on-write: create a new message for this narrator
+				const newId = generateId();
+				const contentText = remaining
+					.filter((b) => b.type === "text")
+					.map((b) => b.text ?? "")
+					.join("\n");
+
+				await tx.insert(narratorMessages).values({
+					id: newId,
+					narratorId: message.narratorId,
+					messageUuid: message.messageUuid,
+					parentToolUseId: message.parentToolUseId,
+					role: message.role,
+					contentJson: remaining,
+					contentText: contentText || null,
+					tokensIn: message.tokensIn,
+					costUsd: message.costUsd,
+					turnUsageJson: message.turnUsageJson,
+					contextPercent: message.contextPercent,
+					meterUsage: message.meterUsage,
+					meterUnit: message.meterUnit,
+					commitSha: message.commitSha,
+					createdAt: message.createdAt,
+				});
+
+				// Update ref to point to new message
+				await tx
+					.update(narratorMessageRefs)
+					.set({ messageId: newId })
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
+					);
+
+				// Copy retained tool_use blocks' tool_calls to new messageId
+				const remainingToolUseIds = remaining
+					.filter((b): b is typeof b & { id: string } => b.type === "tool_use" && !!b.id)
+					.map((b) => b.id);
+				if (remainingToolUseIds.length > 0) {
+					const existingCalls = await tx
+						.select()
+						.from(narratorToolCalls)
+						.where(
+							and(
+								eq(narratorToolCalls.messageId, messageId),
+								inArray(narratorToolCalls.toolUseId, remainingToolUseIds),
+							),
+						);
+					if (existingCalls.length > 0) {
+						await tx.insert(narratorToolCalls).values(
+							existingCalls.map((tc) => ({
+								...tc,
+								id: generateId(),
+								messageId: newId,
+							})),
+						);
+					}
+				}
+
+				// Clean up tool_use associations from the removed block (on new message)
+				await cleanToolUseBlock(removedBlock, newId);
+			} else {
+				// Not shared — update in place
+				const contentText = remaining
+					.filter((b) => b.type === "text")
+					.map((b) => b.text ?? "")
+					.join("\n");
+
+				await tx
+					.update(narratorMessages)
+					.set({ contentJson: remaining, contentText: contentText || null })
+					.where(eq(narratorMessages.id, messageId));
+
+				// Clean up tool_use associations from the removed block
+				await cleanToolUseBlock(removedBlock, messageId);
+			}
+
+			// Reset conversation state since history changed
+			await tx
+				.update(narrators)
+				.set({
+					apiConversationId: null,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+
+		return { messageDeleted };
+	},
+
+	/**
 	 * Remove a compacting/compact message by ID without touching narrator's contextSummary.
 	 * Used for rollback when compact generation fails mid-way.
 	 */
@@ -1425,8 +1634,14 @@ export const narratorService = {
 		}));
 	},
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	async persistUserMessage(narratorId: string, text: string, contentBlocks?: any[]) {
+	async persistUserMessage(
+		narratorId: string,
+		text: string,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		contentBlocks?: any[],
+		commandText?: string | null,
+		createdBy?: string | null,
+	) {
 		const id = generateId();
 		const now = new Date().toISOString();
 		const [msg] = await db
@@ -1437,13 +1652,24 @@ export const narratorService = {
 				role: "user",
 				contentJson: contentBlocks ?? [{ type: "text", text }],
 				contentText: text,
+				commandText: commandText ?? null,
+				createdBy: createdBy ?? null,
 				createdAt: now,
 			})
 			.returning();
 
 		// Insert into narrator_message_refs junction table
 		await appendMessageRef(narratorId, id);
-		return msg;
+
+		// Attach creator info for WS broadcast
+		if (createdBy) {
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, createdBy),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			});
+			return { ...msg, creator: user ?? null };
+		}
+		return { ...msg, creator: null };
 	},
 
 	/**
@@ -1888,7 +2114,13 @@ export const narratorService = {
 
 	async updatePermissionMode(
 		narratorId: string,
-		permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "readOnly" | "dontAsk",
+		permissionMode:
+			| "default"
+			| "acceptEdits"
+			| "bypassPermissions"
+			| "readOnly"
+			| "plan"
+			| "dontAsk",
 	) {
 		const now = new Date().toISOString();
 		await db
@@ -1917,14 +2149,6 @@ export const narratorService = {
 		await db
 			.update(narrators)
 			.set({ reasoningEffort, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updatePlanMode(narratorId: string, planMode: boolean) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ planMode, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 	},
 

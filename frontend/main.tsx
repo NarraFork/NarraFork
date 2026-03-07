@@ -18,7 +18,10 @@ const theme = createTheme({
 		NavLink: {
 			styles: {
 				root: {
-					borderRadius: "var(--mantine-radius-sm)",
+					borderTopLeftRadius: "var(--mantine-radius-sm)",
+					borderTopRightRadius: "var(--mantine-radius-sm)",
+					borderBottomLeftRadius: "var(--mantine-radius-sm)",
+					borderBottomRightRadius: "var(--mantine-radius-sm)",
 				},
 			},
 		},

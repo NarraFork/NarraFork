@@ -10,12 +10,20 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+export interface CommandParam {
+	name: string;
+	description?: string;
+	required?: boolean;
+	defaultValue?: string;
+}
+
 export interface CommandItem {
 	name: string;
 	prompt: string;
 	description?: string;
 	source: string;
 	type: "command" | "skill";
+	params?: CommandParam[];
 }
 
 interface CommandPopoverProps {
@@ -100,6 +108,18 @@ export function CommandPopover({
 				e.preventDefault();
 				setSelectedIndex((i) => (i - 1 + filtered.length) % filtered.length);
 			} else if (e.key === "Enter" && !e.shiftKey) {
+				// If input exactly matches a no-param command, let Enter bubble to send
+				const selected = filtered[selectedIndex];
+				const exactMatch = selected && selected.name.toLowerCase() === query;
+				const hasParams =
+					selected?.type === "command" &&
+					(selected.params?.length ||
+						selected.prompt.includes("{{input}}") ||
+						selected.prompt.includes("{{"));
+				if (exactMatch && !hasParams) {
+					// Don't intercept — let the send handler fire
+					return;
+				}
 				e.preventDefault();
 				e.stopPropagation();
 				onSelect(filtered[selectedIndex]);
@@ -111,7 +131,7 @@ export function CommandPopover({
 				onSelect(filtered[selectedIndex]);
 			}
 		},
-		[visible, filtered, selectedIndex, onSelect, onClose],
+		[visible, filtered, selectedIndex, onSelect, onClose, query],
 	);
 
 	useEffect(() => {
@@ -172,9 +192,9 @@ export function CommandPopover({
 						<Text size="sm" fw={600} c={cmd.type === "skill" ? "violet.4" : "indigo.4"}>
 							/{cmd.name}
 						</Text>
-						{cmd.description && (
+						{(cmd.description || cmd.prompt) && (
 							<Text size="xs" c="dimmed" truncate="end" style={{ flex: 1 }}>
-								{cmd.description}
+								{cmd.description || cmd.prompt}
 							</Text>
 						)}
 						{getSourceBadge(cmd, t)}

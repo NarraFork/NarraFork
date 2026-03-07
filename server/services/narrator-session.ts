@@ -13,12 +13,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
-import {
-	buildHistory,
-	type PermissionResult,
-	PLAN_MODE_ALLOWED_TOOLS,
-	resolveProviderAndModel,
-} from "../lib/agent";
+import { buildHistory, type PermissionResult, resolveProviderAndModel } from "../lib/agent";
 import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
@@ -89,6 +84,8 @@ interface ActiveNarrator {
 	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
 	_planFileId?: string;
+	/** Permission mode before entering plan mode — used to restore on ExitPlanMode */
+	_previousPermissionMode?: string;
 	/** Cached base branch (for commits-ahead tracking) */
 	_baseBranch?: string;
 	/** Trailing-edge throttle timer for git status tracking */
@@ -134,6 +131,8 @@ interface BufferedMessage {
 	text: string;
 	images?: ImageRef[];
 	bufferedAt: string;
+	commandText?: string | null;
+	createdBy?: string | null;
 }
 const bufferedMessages = new Map<string, BufferedMessage>();
 
@@ -240,9 +239,9 @@ export function resolvePermissionDecision(
 	input: Record<string, unknown>,
 	permMode: string,
 	cwd: string,
-	planMode = false,
 	bashAnalysis?: BashAnalysis,
 	isChapter = false,
+	planFileId?: string,
 ): "allow" | "deny" | "ask" | "fatal" {
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === "Bash" && bashAnalysis?.isCatastrophic) return "fatal";
@@ -250,19 +249,19 @@ export function resolvePermissionDecision(
 	// Chapter mode: git branch violations are hard-denied (no bypass)
 	if (toolName === "Bash" && isChapter && bashAnalysis?.gitBranchViolations?.length) return "deny";
 
-	// Plan mode: deny mutating tools (except Bash which keeps its normal permission flow)
-	if (planMode && !PLAN_MODE_ALLOWED_TOOLS.has(toolName)) return "deny";
-	// Plan mode: Write/Edit only allowed for .narrafork/ directory (plan file writing)
-	if (planMode && (toolName === "Write" || toolName === "Edit")) {
-		const filePath = typeof input.file_path === "string" ? input.file_path : "";
-		const absPath = resolve(cwd, filePath);
-		const narraforkDir = resolve(cwd, ".narrafork");
-		if (!absPath.startsWith(`${narraforkDir}/`) && absPath !== narraforkDir) return "deny";
-		// Path is inside .narrafork/ — auto-allow for plan file writing
-		return "allow";
+	// Plan mode: identical to readOnly, except Write/Edit to the designated plan file is allowed.
+	// All other decisions delegate to the readOnly branch below via permMode aliasing.
+	if (permMode === "plan" && (toolName === "Write" || toolName === "Edit")) {
+		if (planFileId) {
+			const filePath = typeof input.file_path === "string" ? input.file_path : "";
+			const absPath = resolve(cwd, filePath);
+			const planFilePath = resolve(cwd, `.narrafork/plan-${planFileId}.md`);
+			if (absPath === planFilePath) return "allow";
+		}
+		return "deny";
 	}
-	// Plan mode: Task is allowed but only for explore/plan subagents (general has write access)
-	if (planMode && toolName === "Task" && input.subagent_type === "general") return "deny";
+	// For all other tools, plan mode behaves exactly like readOnly
+	const effectiveMode = permMode === "plan" ? "readOnly" : permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
@@ -274,24 +273,24 @@ export function resolvePermissionDecision(
 			const resolved = normalize(resolve(cwd, workdir));
 			const normalizedCwd = normalize(resolve(cwd));
 			if (resolved !== normalizedCwd) {
-				if (permMode === "bypassPermissions") return "allow";
-				if (permMode === "dontAsk" || permMode === "readOnly") return "deny";
+				if (effectiveMode === "bypassPermissions") return "allow";
+				if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
 				return "ask";
 			}
 		}
 		// readOnly: allow explore/plan subagents (read-only), deny general (has write access)
-		if (permMode === "readOnly") {
+		if (effectiveMode === "readOnly") {
 			return input.subagent_type === "general" ? "deny" : "allow";
 		}
 		return "allow";
 	}
 
-	if (permMode === "bypassPermissions") return "allow";
-	if (permMode === "dontAsk") return "deny";
+	if (effectiveMode === "bypassPermissions") return "allow";
+	if (effectiveMode === "dontAsk") return "deny";
 
 	// readOnly: auto-allow read-only tools, auto-deny everything else.
 	// Bash gets special handling — whitelisted read-only commands are allowed.
-	if (permMode === "readOnly") {
+	if (effectiveMode === "readOnly") {
 		if (READ_ONLY_TOOLS.includes(toolName)) {
 			const toolPaths = extractToolPaths(toolName, input);
 			const hasExternalPath =
@@ -326,8 +325,8 @@ export function resolvePermissionDecision(
 		if (hasExternalBashPath) return "ask";
 		// All commands whitelisted + all paths inside worktree + no dangerous patterns
 		// 如果包含写操作（如 biome --write），只在 acceptEdits 模式下允许
-		if (bashAnalysis.hasWriteOperation && permMode !== "acceptEdits") return "ask";
-		if (permMode === "acceptEdits") return "allow";
+		if (bashAnalysis.hasWriteOperation && effectiveMode !== "acceptEdits") return "ask";
+		if (effectiveMode === "acceptEdits") return "allow";
 		return "ask";
 	}
 
@@ -335,10 +334,11 @@ export function resolvePermissionDecision(
 	const hasExternalPath = toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
 
 	if (!hasExternalPath) {
-		if (permMode === "default") {
+		if (effectiveMode === "default") {
 			return READ_ONLY_TOOLS.includes(toolName) ? "allow" : "ask";
 		}
-		if (permMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName)) return "allow";
+		if (effectiveMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName))
+			return "allow";
 	}
 
 	// Read-only access to the truncated-output temp directory is always safe —
@@ -365,18 +365,18 @@ export async function handlePermission(
 	broadcastTargetId?: string,
 ): Promise<PermissionResult> {
 	const wsTarget = broadcastTargetId ?? narratorId;
-	// Read permission mode and plan mode from DB in real-time
+	// Read permission mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { permissionMode: true, planMode: true, chapterId: true },
+		columns: { permissionMode: true, chapterId: true },
 	});
 	const permMode = narrator?.permissionMode ?? "default";
-	const planMode = narrator?.planMode ?? false;
+	const isPlanMode = permMode === "plan";
 	const isChapter = !!narrator?.chapterId;
 
 	// Plan mode: redirect Write/Edit file_path to the locked plan file
 	let effectiveInput = input;
-	if (planMode && (toolName === "Write" || toolName === "Edit")) {
+	if (isPlanMode && (toolName === "Write" || toolName === "Edit")) {
 		const active = activeNarrators.get(narratorId);
 		const planFileId = active?._planFileId;
 		if (planFileId) {
@@ -420,14 +420,16 @@ export async function handlePermission(
 		}
 	}
 
+	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
+
 	const decision = resolvePermissionDecision(
 		toolName,
 		effectiveInput,
 		permMode,
 		cwd,
-		planMode,
 		bashAnalysis,
 		isChapter,
+		planFileId,
 	);
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
@@ -824,7 +826,9 @@ export async function resolvePermission(
 		// after the current tool completes instead of continuing to the next turn.
 		// The outer while-loop will pick up pendingFeedback and inject the user
 		// message before starting a fresh agent loop iteration.
-		if (feedbackText?.trim()) {
+		// Exception: ExitPlanMode already aborts via onExitPlanMode — aborting
+		// here would race and prevent the tool_result from being processed.
+		if (feedbackText?.trim() && pending.toolName !== "ExitPlanMode") {
 			const active = activeNarrators.get(pending.narratorId);
 			if (active?.alive) {
 				active.abortController.abort();
@@ -939,7 +943,8 @@ async function createNarrator(
 	// Generate planFileId if narrator is already in plan mode (e.g. server restart recovery).
 	// A new ID is generated each time — any previously written plan file from a prior session
 	// becomes orphaned, but the model will use the new file path from the refreshed system prompt.
-	const planFileId = (narrator.planMode ?? false) ? generateShortId() : undefined;
+	const isPlanMode = narrator.permissionMode === "plan";
+	const planFileId = isPlanMode ? generateShortId() : undefined;
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
@@ -950,7 +955,7 @@ async function createNarrator(
 		narratorCwd,
 		locale,
 		replyInUserLanguage,
-		narrator.planMode ?? false,
+		isPlanMode,
 		planFileId,
 	);
 
@@ -1293,7 +1298,7 @@ async function runAgentLoop(
 				active.cwd,
 				locale,
 				active._replyInUserLanguage ?? false,
-				freshNarrator.planMode ?? false,
+				freshNarrator.permissionMode === "plan",
 				active._planFileId,
 			);
 			active.systemPrompt = freshSystemPrompt;
@@ -1364,20 +1369,52 @@ async function runAgentLoop(
 				},
 				onEnterPlanMode: async () => {
 					active._planFileId = generateShortId();
-					await narratorService.updatePlanMode(narratorId, true);
+					// Save current permission mode and switch to plan
+					const current = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { permissionMode: true },
+					});
+					const prevMode = current?.permissionMode ?? "default";
+					active._previousPermissionMode = prevMode;
+					const now = new Date().toISOString();
+					await db
+						.update(narrators)
+						.set({
+							permissionMode: "plan",
+							previousPermissionMode: prevMode,
+							updatedAt: now,
+						})
+						.where(eq(narrators.id, narratorId));
 					broadcastToNarrator(narratorId, {
-						type: "plan_mode_changed",
+						type: "permission_mode_changed",
 						narratorId,
-						planMode: true,
+						permissionMode: "plan",
 					});
 				},
 				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
-					await narratorService.updatePlanMode(narratorId, false);
+					// Restore previous permission mode
+					const restoreMode = (active._previousPermissionMode ?? "default") as
+						| "default"
+						| "acceptEdits"
+						| "bypassPermissions"
+						| "readOnly"
+						| "plan"
+						| "dontAsk";
+					active._previousPermissionMode = undefined;
+					const now = new Date().toISOString();
+					await db
+						.update(narrators)
+						.set({
+							permissionMode: restoreMode,
+							previousPermissionMode: null,
+							updatedAt: now,
+						})
+						.where(eq(narrators.id, narratorId));
 					broadcastToNarrator(narratorId, {
-						type: "plan_mode_changed",
+						type: "permission_mode_changed",
 						narratorId,
-						planMode: false,
+						permissionMode: restoreMode,
 					});
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					if (pendingPlanCompact.has(narratorId)) {
@@ -1391,9 +1428,12 @@ async function runAgentLoop(
 							active.abortController.abort();
 						}
 					} else {
-						// Non-compact: inject a user message into the next turn
-						// so the model sees "plan approved" alongside the tool result.
+						// Non-compact: abort the current agent loop and persist a user
+						// message so the next iteration starts with an explicit
+						// "plan approved, begin execution" prompt — this prevents the
+						// model from ignoring the tool result and asking the user again.
 						active._planApprovedContinue = "continue";
+						active.abortController.abort();
 					}
 				},
 				onClearCompactSummary: async () => {
@@ -1549,9 +1589,22 @@ async function runAgentLoop(
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
 					if (message === "Aborted") {
-						if (active._planApprovedContinue === "compact") {
-							logger.info("Agent loop aborted for plan compact", { narratorId });
-							// Still clean up partial message in background
+						if (
+							active._planApprovedContinue === "compact" ||
+							active._planApprovedContinue === "continue"
+						) {
+							logger.info("Agent loop aborted for plan approval", {
+								narratorId,
+								mode: active._planApprovedContinue,
+							});
+							// Mark any orphaned tool calls (e.g. ExitPlanMode) as success
+							// since the abort was intentional after approval.
+							completeOrphanedToolCalls(narratorId).catch((err) => {
+								logger.warn("Failed to complete orphaned tool calls after plan approval", {
+									narratorId,
+									error: String(err),
+								});
+							});
 							if (partialId) {
 								cleanupPartialMessage(partialId, narratorId);
 							}
@@ -1608,7 +1661,7 @@ async function runAgentLoop(
 				systemPrompt: active.systemPrompt ?? undefined,
 				locale,
 				signal: active.abortController.signal,
-				planMode: freshNarrator.planMode ?? false,
+				planMode: freshNarrator.permissionMode === "plan",
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
@@ -1624,10 +1677,6 @@ async function runAgentLoop(
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getInjectedUserText: () => {
-					if (active._planApprovedContinue === "continue") {
-						active._planApprovedContinue = undefined;
-						return getToolMessage("exitPlanModeApproved", locale);
-					}
 					return null;
 				},
 				// onEvent receives only side-channel events (tool_output, tool_progress)
@@ -1749,16 +1798,24 @@ async function runAgentLoop(
 				shouldUpdateTitle = true;
 			}
 
-			// Plan compact aborted the agent loop — reset abort controller and
-			// restart the while-loop so the next iteration builds fresh history
-			// from only post-compact messages.
-			if (active._planApprovedContinue === "compact") {
+			// Plan approved — abort was triggered by onExitPlanMode so we persist
+			// a user message and restart the loop to drive plan execution.
+			if (
+				active._planApprovedContinue === "compact" ||
+				active._planApprovedContinue === "continue"
+			) {
+				const isCompact = active._planApprovedContinue === "compact";
 				active._planApprovedContinue = undefined;
 				active.abortController = new AbortController();
-				await narratorService.updateStats(narratorId, 0);
 
-				// Always persist a user message to kick off plan execution and continue
-				const continuePrompt = getToolMessage("planCompactContinue", locale);
+				if (isCompact) {
+					await narratorService.updateStats(narratorId, 0);
+				}
+
+				const continuePrompt = getToolMessage(
+					isCompact ? "planCompactContinue" : "exitPlanModeApproved",
+					locale,
+				);
 
 				// Check for chained feedback — use it instead of the default prompt
 				const fb = pendingFeedback.get(narratorId);
@@ -1908,6 +1965,8 @@ async function runAgentLoop(
 						narratorId,
 						buffered.text,
 						persistBlocks,
+						buffered.commandText,
+						buffered.createdBy,
 					);
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 					active.events.emit("event", { type: "user_message", data: userMsg });
@@ -2158,6 +2217,8 @@ async function feedMessage(
 	images?: ImageRef[],
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	commandText?: string | null,
+	userId?: string | null,
 ): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 
@@ -2176,7 +2237,13 @@ async function feedMessage(
 		}
 	}
 	persistBlocks.push({ type: "text", text: prompt });
-	const userMsg = await narratorService.persistUserMessage(narratorId, prompt, persistBlocks);
+	const userMsg = await narratorService.persistUserMessage(
+		narratorId,
+		prompt,
+		persistBlocks,
+		commandText,
+		userId,
+	);
 
 	await narratorService.updateStatus(narratorId, "thinking");
 
@@ -2207,8 +2274,18 @@ export async function sendMessage(
 	images?: ImageRef[],
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	commandText?: string | null,
+	userId?: string | null,
 ): Promise<typeof narratorMessages.$inferSelect> {
-	const { userMsg } = await feedMessage(narratorId, prompt, images, locale, replyInUserLanguage);
+	const { userMsg } = await feedMessage(
+		narratorId,
+		prompt,
+		images,
+		locale,
+		replyInUserLanguage,
+		commandText,
+		userId,
+	);
 	broadcastToNarrator(narratorId, {
 		type: "user_message",
 		narratorId,
@@ -2410,6 +2487,24 @@ async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en
 		);
 }
 
+/**
+ * Mark orphaned tool calls as success — used when the agent loop is
+ * intentionally aborted after plan approval (the tool did complete
+ * successfully but the result event was never yielded).
+ */
+async function completeOrphanedToolCalls(narratorId: string): Promise<void> {
+	const staleStatuses = ["initializing", "pending", "running"] as const;
+	await db
+		.update(narratorToolCalls)
+		.set({ status: "success" })
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				inArray(narratorToolCalls.status, [...staleStatuses]),
+			),
+		);
+}
+
 export function interruptNarrator(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active) return false;
@@ -2450,8 +2545,18 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 	}
 }
 
-export function updateNarratorPermissionMode(_narratorId: string, _mode: string): void {
-	// Permission mode is read from DB in real-time by handlePermission
+export function updateNarratorPermissionMode(narratorId: string, mode: string): void {
+	// Permission mode is read from DB in real-time by handlePermission.
+	// When switching to/from plan mode, manage the plan file ID on the active narrator.
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	if (mode === "plan") {
+		if (!active._planFileId) {
+			active._planFileId = generateShortId();
+		}
+	} else {
+		active._planFileId = undefined;
+	}
 }
 
 // === Buffered message API ===
@@ -2461,12 +2566,14 @@ export function setBufferedMessage(
 	narratorId: string,
 	text: string,
 	images?: ImageRef[],
+	commandText?: string | null,
+	createdBy?: string | null,
 ): { ok: boolean; bufferedAt: string } {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "" };
 	}
 	const bufferedAt = new Date().toISOString();
-	bufferedMessages.set(narratorId, { text, images, bufferedAt });
+	bufferedMessages.set(narratorId, { text, images, bufferedAt, commandText, createdBy });
 	return { ok: true, bufferedAt };
 }
 

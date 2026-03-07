@@ -48,6 +48,9 @@ import {
 	ToolCallCard,
 } from "./ToolCallCard";
 
+const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
+const stripSubagentId = (text: string) => text.replace(SUBAGENT_ID_RE, "").trim();
+
 export interface SubagentCardProps {
 	toolCall: ToolCallData;
 	childMessages: NarratorMsg[];
@@ -58,6 +61,8 @@ export interface SubagentCardProps {
 	permCb?: PermissionCallbacks;
 	editExpandOverride?: boolean | null;
 	onBgAgentRetry?: (toolUseId: string) => void;
+	/** Block index within the parent message's contentJson array */
+	blockIndex?: number;
 }
 
 export const SubagentCard = memo(
@@ -71,6 +76,7 @@ export const SubagentCard = memo(
 		permCb,
 		editExpandOverride,
 		onBgAgentRetry,
+		blockIndex,
 	}: SubagentCardProps) {
 		const { t } = useTranslation("narrator");
 		const navigate = useNavigate();
@@ -165,28 +171,31 @@ export const SubagentCard = memo(
 		const resultText = useMemo(() => {
 			const out = toolCall.outputJson;
 			if (!out) return "";
-			if (typeof out === "string") return out;
+			let raw = "";
+			if (typeof out === "string") raw = out;
 			// Handle truncated output from backend
-			if (out._truncated && typeof out.preview === "string") return out.preview;
-			if (Array.isArray(out)) {
-				return out
+			else if (out._truncated && typeof out.preview === "string") raw = out.preview;
+			else if (Array.isArray(out)) {
+				raw = out
 					.filter((b: ContentBlock) => b.text)
 					.map((b: ContentBlock) => b.text)
 					.join("\n");
 			}
-			return "";
+			return stripSubagentId(raw);
 		}, [toolCall.outputJson]);
 		const fullResultText = useMemo(() => {
 			if (!fullTc?.outputJson) return undefined;
 			const out = fullTc.outputJson;
-			if (typeof out === "string") return out;
-			if (Array.isArray(out)) {
-				return out
+			let raw = "";
+			if (typeof out === "string") raw = out;
+			else if (Array.isArray(out)) {
+				raw = out
 					.filter((b: ContentBlock) => b.text)
 					.map((b: ContentBlock) => b.text)
 					.join("\n");
 			}
-			return undefined;
+			const stripped = stripSubagentId(raw);
+			return stripped || undefined;
 		}, [fullTc?.outputJson]);
 
 		// Determine if this subagent type should render results as markdown
@@ -250,7 +259,7 @@ export const SubagentCard = memo(
 
 		// --- Swipe / context-menu for SubagentCard itself ---
 		const parentMsgCtx = useMessageContextMenu();
-		const hasCardActions = !!(parentMsgCtx.onDeleteMessage || parentMsgCtx.onCompactBeforeMessage);
+		const hasCardActions = !!(parentMsgCtx.onDeleteBlock || parentMsgCtx.onCompactBeforeMessage);
 
 		const swipe = useSwipeMenu({ enabled: hasCardActions });
 
@@ -294,12 +303,12 @@ export const SubagentCard = memo(
 						{t("contextMenu_compactBefore")}
 					</Menu.Item>
 				)}
-				{parentMsgCtx.onDeleteMessage && (
+				{parentMsgCtx.onDeleteBlock && blockIndex != null && (
 					<Menu.Item
 						color="red"
 						leftSection={<IconTrash size={14} />}
 						onClick={() => {
-							parentMsgCtx.onDeleteMessage?.();
+							parentMsgCtx.onDeleteBlock?.(blockIndex);
 							swipe.closeSwipe();
 						}}
 					>
@@ -319,9 +328,9 @@ export const SubagentCard = memo(
 					{/* Header: two-line collapsed view */}
 					<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
 						{/* Line 1: icon | type | model | calls | status | duration | chevron */}
-						<Group gap={6} wrap="nowrap">
-							<ThemeIcon size={18} variant="light" color="indigo" radius="sm">
-								<IconRobot size={12} />
+						<Group gap={5} wrap="nowrap">
+							<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
+								<IconRobot size={10} />
 							</ThemeIcon>
 							<Badge size="xs" variant="light" color="indigo">
 								{agentType}
@@ -363,7 +372,7 @@ export const SubagentCard = memo(
 							size="xs"
 							c="dimmed"
 							mt={2}
-							ml={24}
+							ml={21}
 							truncate={!expanded}
 							style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
 						>
@@ -375,13 +384,13 @@ export const SubagentCard = memo(
 								size="xs"
 								c="dimmed"
 								mt={2}
-								ml={24}
+								ml={21}
 								lineClamp={1}
 								style={{
 									opacity: 0,
 									position: "absolute",
 									pointerEvents: "none",
-									maxWidth: "calc(100% - 24px)",
+									maxWidth: "calc(100% - 21px)",
 								}}
 							>
 								{prompt}
@@ -427,25 +436,7 @@ export const SubagentCard = memo(
 									</Group>
 								</Alert>
 							)}
-							{/* Result — shown directly when expanded */}
-							{resultText && (
-								<Box px="xs" pb={4}>
-									<ContentViewer
-										content={resultText}
-										fullContent={fullResultText}
-										style={{
-											fontSize: 11,
-											maxHeight: 300,
-											overflow: "auto",
-											whiteSpace: "pre-wrap",
-										}}
-										title={`${agentType} — ${description}`}
-										markdown={useMarkdown}
-										contentType={useMarkdown ? "markdown" : "code"}
-									/>
-								</Box>
-							)}
-							{/* Prompt — 单行可放进标题时不再折叠显示 */}
+							{/* Prompt — shown first when expanded */}
 							{prompt && !promptShownInHeader && (
 								<Box px="xs" pb={4}>
 									<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
@@ -472,7 +463,7 @@ export const SubagentCard = memo(
 									</LazyCollapse>
 								</Box>
 							)}
-							{/* Child tool calls — collapsed by default */}
+							{/* Child tool calls — in the middle */}
 							{childToolCalls.length > 0 && (
 								<Box px="xs" pb="xs">
 									<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
@@ -608,6 +599,24 @@ export const SubagentCard = memo(
 											})()}
 										</Box>
 									</LazyCollapse>
+								</Box>
+							)}
+							{/* Result — shown at the bottom */}
+							{resultText && (
+								<Box px="xs" pb={4}>
+									<ContentViewer
+										content={resultText}
+										fullContent={fullResultText}
+										style={{
+											fontSize: 11,
+											maxHeight: 300,
+											overflow: "auto",
+											whiteSpace: "pre-wrap",
+										}}
+										title={`${agentType} — ${description}`}
+										markdown={useMarkdown}
+										contentType={useMarkdown ? "markdown" : "code"}
+									/>
 								</Box>
 							)}
 						</LazyCollapse>

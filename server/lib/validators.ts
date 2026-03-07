@@ -13,6 +13,17 @@ export const commandSchema = z.object({
 		.regex(/^[a-zA-Z0-9_-]+$/),
 	prompt: z.string().min(1).max(10000),
 	description: z.string().max(500).optional(),
+	params: z
+		.array(
+			z.object({
+				name: z.string().min(1).max(50),
+				description: z.string().max(500).optional(),
+				required: z.boolean().optional(),
+				defaultValue: z.string().max(1000).optional(),
+			}),
+		)
+		.max(20)
+		.optional(),
 });
 
 export const createProjectSchema = z.object({
@@ -84,10 +95,9 @@ export const createNarratorSchema = z.object({
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
 	permissionMode: z
-		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"])
+		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"])
 		.optional(),
 	cwd: z.string().min(1).max(4096).optional(),
-	planMode: z.boolean().optional(),
 	reasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
 });
 
@@ -310,23 +320,27 @@ export const recentTabSchema = z.object({
 	lastVisitedAt: z.number(),
 });
 
-export const upsertRecentTabSchema = recentTabSchema;
+export const upsertRecentTabSchema = recentTabSchema.extend({
+	/** When true, only update an existing tab — skip if not already present. */
+	updateOnly: z.boolean().optional(),
+});
 
 export const removeRecentTabSchema = z.object({
 	type: z.enum(["chapter", "narrator", "session", "project"]),
 	id: z.string().min(1).max(50),
 });
 
-export const batchRemoveRecentTabsSchema = z.object({
-	items: z
-		.array(
-			z.object({
-				type: z.enum(["chapter", "narrator", "session", "project"]),
-				id: z.string().min(1).max(50),
-			}),
-		)
-		.min(1)
-		.max(20),
+export const moveRecentTabSchema = z.object({
+	/** Tab key in "type:id" format */
+	key: z.string().min(1).max(100),
+	/** Target index (0-based), or a named position */
+	toIndex: z.number().int().min(0).max(20).optional(),
+	/** Named position — mutually exclusive with toIndex */
+	position: z.enum(["top", "above_idle"]).optional(),
+});
+
+export const clearRecentTabsSchema = z.object({
+	scope: z.enum(["all", "projects", "inactive_narrators"]),
 });
 
 // === WebSocket Messages ===

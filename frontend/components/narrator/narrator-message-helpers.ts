@@ -112,9 +112,12 @@ export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
 	const items: FlatToolItem[] = [];
 	for (const msg of run) {
 		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-		for (const block of blocks) {
+		const origIndices = msg._blockOriginalIndices;
+		for (let bi = 0; bi < blocks.length; bi++) {
+			const block = blocks[bi];
+			const realIndex = origIndices?.[bi] ?? bi;
 			if (block.type === "reasoning" && typeof block.text === "string" && block.text.trim()) {
-				items.push({ kind: "reasoning", msg, reasoningText: block.text });
+				items.push({ kind: "reasoning", msg, reasoningText: block.text, blockIndex: realIndex });
 				continue;
 			}
 			if (block.type !== "tool_use") continue;
@@ -123,7 +126,7 @@ export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
 			if (!tc) continue;
 			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
 			const isSubagent = tc.toolName === "Task" || children.length > 0;
-			items.push({ kind: "tool", tc, msg, children, isSubagent });
+			items.push({ kind: "tool", tc, msg, children, isSubagent, blockIndex: realIndex });
 		}
 	}
 	return items;

@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { DiffView } from "./DiffView";
+import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 
@@ -51,6 +52,10 @@ interface ContentViewerProps {
 	children?: ReactNode;
 	/** Render function receiving wordWrap state, used instead of children when wrap control is needed */
 	renderContent?: (wordWrap: boolean) => ReactNode;
+	/** Shiki language id for syntax highlighting (e.g. "typescript"). */
+	language?: string;
+	/** Block index within the parent message's contentJson array */
+	blockIndex?: number;
 }
 
 /** Sticky wrapper: zero-height, sticks to the top of the nearest scroll
@@ -127,6 +132,8 @@ export const ContentViewer = memo(
 			contentType = "code",
 			children,
 			renderContent,
+			language,
+			blockIndex,
 		},
 		ref,
 	) {
@@ -411,6 +418,12 @@ export const ContentViewer = memo(
 									maxHeight: style?.maxHeight,
 									overflowY: style?.maxHeight ? "auto" : undefined,
 								})
+							) : language && language !== "text" ? (
+								<HighlightedCode
+									code={content}
+									lang={language}
+									style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
+								/>
 							) : (
 								<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
 									{content}
@@ -475,7 +488,7 @@ export const ContentViewer = memo(
 										</Menu.Item>
 										{(msgCtx.onForkFromMessage ||
 											msgCtx.onCompactBeforeMessage ||
-											msgCtx.onDeleteMessage) && <Menu.Divider />}
+											msgCtx.onDeleteBlock) && <Menu.Divider />}
 										{msgCtx.onForkFromMessage && (
 											<Menu.Item
 												leftSection={<IconGitFork size={14} />}
@@ -498,12 +511,12 @@ export const ContentViewer = memo(
 												{tNarrator("contextMenu_compactBefore")}
 											</Menu.Item>
 										)}
-										{msgCtx.onDeleteMessage && (
+										{msgCtx.onDeleteBlock && blockIndex != null && (
 											<Menu.Item
 												color="red"
 												leftSection={<IconTrash size={14} />}
 												onClick={() => {
-													msgCtx.onDeleteMessage?.();
+													msgCtx.onDeleteBlock?.(blockIndex);
 													swipe.closeSwipe();
 												}}
 											>
@@ -566,10 +579,25 @@ export const ContentViewer = memo(
 								newStr={diff.newStr}
 								maxHeight={undefined}
 								wordWrap={wordWrap}
+								language={language}
 							/>
 						</Box>
 					) : markdown ? (
 						renderMarkdown(modalContent, { flex: 1, minHeight: 0, overflow: "auto" })
+					) : language && language !== "text" ? (
+						<HighlightedCode
+							code={modalContent}
+							lang={language}
+							style={{
+								...style,
+								...wrapStyle,
+								maxHeight: undefined,
+								overflow: "auto",
+								fontSize: isMobile ? 11 : 12,
+								flex: 1,
+								minHeight: 0,
+							}}
+						/>
 					) : (
 						<Code
 							block
@@ -637,7 +665,7 @@ export const ContentViewer = memo(
 						</Menu.Item>
 						{(msgCtx.onForkFromMessage ||
 							msgCtx.onCompactBeforeMessage ||
-							msgCtx.onDeleteMessage) && <Menu.Divider />}
+							msgCtx.onDeleteBlock) && <Menu.Divider />}
 						{msgCtx.onForkFromMessage && (
 							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
 								{tNarrator("contextMenu_fork")}
@@ -651,11 +679,11 @@ export const ContentViewer = memo(
 								{tNarrator("contextMenu_compactBefore")}
 							</Menu.Item>
 						)}
-						{msgCtx.onDeleteMessage && (
+						{msgCtx.onDeleteBlock && blockIndex != null && (
 							<Menu.Item
 								color="red"
 								leftSection={<IconTrash size={14} />}
-								onClick={msgCtx.onDeleteMessage}
+								onClick={() => msgCtx.onDeleteBlock?.(blockIndex)}
 							>
 								{tNarrator("contextMenu_delete")}
 							</Menu.Item>

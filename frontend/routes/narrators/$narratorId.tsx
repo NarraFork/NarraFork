@@ -49,6 +49,8 @@ function NarratorDetailPage() {
 	const narratorStatus = narrator?.status;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterTitle = (chapter as any)?.title as string | undefined;
+
+	// First visit: register the tab on the server (once per narratorId)
 	useEffect(() => {
 		if (!narrator || isSubagent) return;
 		if (chapterId) {
@@ -63,7 +65,6 @@ function NarratorDetailPage() {
 				status: narratorStatus,
 			});
 		} else {
-			// Standalone narrator
 			addRecentTab({
 				type: "narrator",
 				id: narratorId,

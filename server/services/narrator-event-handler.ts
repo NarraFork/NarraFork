@@ -6,7 +6,7 @@ import { narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import {
 	enrichToolUseBlocks,
 	narratorService,
@@ -92,6 +92,47 @@ export interface EventHooks {
 	onErrorCleanup?: (message: string) => Promise<void>;
 }
 
+// === Dual broadcast for subagent self-subscription ===
+
+/**
+ * Broadcast a message to the primary target (parent narrator for subagents)
+ * AND, when the sender is a subagent, also broadcast a "self" copy to the
+ * subagent's own narratorId so that clients viewing the subagent page
+ * directly can receive streaming events.
+ *
+ * The self-copy replaces `narratorId` with the subagent's own ID and strips
+ * subagent-specific linking fields so it looks like a normal narrator event.
+ */
+function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage): void {
+	// Primary broadcast (to parent narrator's subscribers)
+	broadcastToNarrator(ctx.broadcastTargetId, message);
+
+	// Self-broadcast for subagents: send to subagent's own narratorId
+	if (ctx.parentToolUseId && ctx.narratorId !== ctx.broadcastTargetId) {
+		// biome-ignore lint/suspicious/noExplicitAny: shallow clone with dynamic field overrides
+		const selfMsg: any = { ...message, narratorId: ctx.narratorId };
+		// Strip subagent linking fields from the nested event (if present)
+		if (selfMsg.event && typeof selfMsg.event === "object") {
+			const { subagentToolUseId, subagentNarratorId, ...cleanEvent } = selfMsg.event;
+			selfMsg.event = cleanEvent;
+		}
+		// Strip parentToolUseId from tool_use_chunk self-copy
+		if (selfMsg.parentToolUseId) {
+			delete selfMsg.parentToolUseId;
+		}
+		// Strip isSubagent flag from context_usage / metering self-copy
+		if (selfMsg.isSubagent) {
+			delete selfMsg.isSubagent;
+		}
+		// Strip parentToolUseId from the message payload so the subagent page
+		// treats it as a top-level message (not a child of some tool_use)
+		if (selfMsg.message?.parentToolUseId) {
+			selfMsg.message = { ...selfMsg.message, parentToolUseId: null };
+		}
+		broadcastToNarrator(ctx.narratorId, selfMsg);
+	}
+}
+
 // === Unified event processor ===
 
 /**
@@ -121,7 +162,7 @@ export async function processEvent(
 				streamEvent.subagentToolUseId = ctx.parentToolUseId;
 				streamEvent.subagentNarratorId = narratorId;
 			}
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "stream_event",
 				narratorId: broadcastTargetId,
 				event: streamEvent,
@@ -141,7 +182,7 @@ export async function processEvent(
 			if (hooks?.onSnapshotBefore) {
 				hooks.onSnapshotBefore(event.toolUseId, event.toolName);
 			}
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "tool_started",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
@@ -164,7 +205,7 @@ export async function processEvent(
 					ctx.toolUseCharsMap.set(event.toolUseId, event.inputCharsTotal);
 				}
 			}
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "tool_use_chunk",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
@@ -337,7 +378,7 @@ export async function processEvent(
 					? { ...processed, subagentModel: ctx.subagentModel }
 					: processed;
 
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "message",
 				narratorId: broadcastTargetId,
 				message: broadcastMessage,
@@ -381,7 +422,7 @@ export async function processEvent(
 				});
 			}
 
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "tool_completed",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
@@ -409,7 +450,7 @@ export async function processEvent(
 		}
 
 		case "tool_output": {
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "tool_output",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
@@ -419,7 +460,7 @@ export async function processEvent(
 		}
 
 		case "tool_progress": {
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "tool_progress",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
@@ -455,7 +496,7 @@ export async function processEvent(
 				reasoningStreamEvent.subagentToolUseId = ctx.parentToolUseId;
 				reasoningStreamEvent.subagentNarratorId = narratorId;
 			}
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "stream_event",
 				narratorId: broadcastTargetId,
 				event: reasoningStreamEvent,
@@ -481,7 +522,7 @@ export async function processEvent(
 			});
 
 			const isSubagent = !!ctx.parentToolUseId;
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "context_usage",
 				narratorId: broadcastTargetId,
 				percentage: event.percentage,
@@ -513,7 +554,7 @@ export async function processEvent(
 				}
 			}
 			const isSubagent = !!ctx.parentToolUseId;
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "metering",
 				narratorId: broadcastTargetId,
 				unit: event.unit,
@@ -537,7 +578,7 @@ export async function processEvent(
 					message: event.message,
 				},
 			};
-			broadcastToNarrator(broadcastTargetId, {
+			dualBroadcast(ctx, {
 				type: "stream_event",
 				narratorId: broadcastTargetId,
 			});

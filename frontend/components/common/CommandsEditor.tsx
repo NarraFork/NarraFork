@@ -1,12 +1,30 @@
-import { ActionIcon, Button, Group, Paper, Stack, Text, Textarea, TextInput } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Button,
+	Group,
+	Paper,
+	Stack,
+	Text,
+	Textarea,
+	TextInput,
+} from "@mantine/core";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+
+export interface CommandParamDef {
+	name: string;
+	description?: string;
+	required?: boolean;
+	defaultValue?: string;
+}
 
 export interface CommandDef {
 	name: string;
 	prompt: string;
 	description?: string;
+	params?: CommandParamDef[];
 }
 
 interface CommandsEditorProps {
@@ -41,7 +59,10 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 
 	const handleEdit = (index: number) => {
 		setEditIndex(index);
-		setDraft({ ...commands[index] });
+		setDraft({
+			...commands[index],
+			params: commands[index].params?.map((p) => ({ ...p })),
+		});
 		setError("");
 	};
 
@@ -56,10 +77,20 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 		}
 
 		const updated = [...commands];
+		const cleanParams = (draft.params ?? []).filter((p) => p.name.trim());
 		const entry: CommandDef = {
 			name,
 			prompt,
 			...(draft.description?.trim() ? { description: draft.description.trim() } : {}),
+			...(cleanParams.length > 0
+				? {
+						params: cleanParams.map((p) => ({
+							name: p.name.trim(),
+							...(p.description?.trim() ? { description: p.description.trim() } : {}),
+							...(p.defaultValue?.trim() ? { defaultValue: p.defaultValue.trim() } : {}),
+						})),
+					}
+				: {}),
 		};
 
 		if (editIndex === -1) {
@@ -112,6 +143,15 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 									{cmd.prompt.slice(0, 100)}
 									{cmd.prompt.length > 100 ? "…" : ""}
 								</Text>
+								{cmd.params && cmd.params.length > 0 && (
+									<Group gap={4} mt={4}>
+										{cmd.params.map((p) => (
+											<Badge key={p.name} size="xs" variant="light" color="indigo">
+												{p.name}
+											</Badge>
+										))}
+									</Group>
+								)}
 							</div>
 							<Group gap={4}>
 								<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(i)}>
@@ -164,6 +204,87 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 							}}
 							size="xs"
 						/>
+
+						{/* Parameters editor */}
+						<Stack gap={4}>
+							<Text size="xs" fw={600}>
+								{t("commandParamsLabel")}
+							</Text>
+							{(draft.params ?? []).map((param, pi) => (
+								// biome-ignore lint/suspicious/noArrayIndexKey: params are reordered by index
+								<Group key={pi} gap={4} wrap="nowrap" align="flex-end">
+									<TextInput
+										placeholder={t("commandParamNamePlaceholder")}
+										value={param.name}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => {
+												const params = [...(d.params ?? [])];
+												params[pi] = { ...params[pi], name: val };
+												return { ...d, params };
+											});
+										}}
+										size="xs"
+										style={{ flex: 1 }}
+									/>
+									<TextInput
+										placeholder={t("commandParamDescPlaceholder")}
+										value={param.description ?? ""}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => {
+												const params = [...(d.params ?? [])];
+												params[pi] = { ...params[pi], description: val };
+												return { ...d, params };
+											});
+										}}
+										size="xs"
+										style={{ flex: 2 }}
+									/>
+									<TextInput
+										placeholder={t("commandParamDefaultPlaceholder")}
+										value={param.defaultValue ?? ""}
+										onChange={(e) => {
+											const val = e.currentTarget.value;
+											setDraft((d) => {
+												const params = [...(d.params ?? [])];
+												params[pi] = { ...params[pi], defaultValue: val };
+												return { ...d, params };
+											});
+										}}
+										size="xs"
+										style={{ flex: 1 }}
+									/>
+									<ActionIcon
+										variant="subtle"
+										color="red"
+										size="sm"
+										onClick={() => {
+											setDraft((d) => ({
+												...d,
+												params: (d.params ?? []).filter((_, j) => j !== pi),
+											}));
+										}}
+									>
+										<IconTrash size={14} />
+									</ActionIcon>
+								</Group>
+							))}
+							<Button
+								variant="subtle"
+								size="compact-xs"
+								leftSection={<IconPlus size={12} />}
+								onClick={() => {
+									setDraft((d) => ({
+										...d,
+										params: [...(d.params ?? []), { name: "" }],
+									}));
+								}}
+								style={{ alignSelf: "flex-start" }}
+							>
+								{t("commandAddParam")}
+							</Button>
+						</Stack>
 						<Group gap="xs">
 							<Button
 								size="xs"

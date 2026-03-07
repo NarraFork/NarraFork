@@ -14,6 +14,15 @@ export default defineConfig(({ mode }) => {
 
 	return {
 		root: resolve(__dirname),
+		define: isDev
+			? {
+					__DEV_VITE_PORT__: JSON.stringify(vitePort),
+					__DEV_BACKEND_PORT__: JSON.stringify(backendPort),
+				}
+			: {
+					__DEV_VITE_PORT__: "undefined",
+					__DEV_BACKEND_PORT__: "undefined",
+				},
 		plugins: [
 			TanStackRouterVite({
 				target: "react",
@@ -87,10 +96,10 @@ export default defineConfig(({ mode }) => {
 				},
 				// NOTE: WS proxy via Vite does NOT work when Vite runs under
 				// `bunx` because Bun's node:http compat layer mishandles HTTP 101
-				// upgrade responses.  WebSocket connections are routed directly to
-				// the backend via the VITE_BACKEND_WS env var instead (see
-				// frontend/lib/ws.ts).  The entry below is kept so that if Vite is
-				// ever run with real Node.js, the proxy will work out of the box.
+				// upgrade responses.  In dev mode, frontend/lib/ws.ts detects
+				// local direct access and rewrites WS URLs to the backend port.
+				// The entry below is kept so that if Vite is ever run with real
+				// Node.js, the proxy will work out of the box.
 				"/ws": {
 					target: `http://localhost:${backendPort}`,
 					ws: true,

@@ -1,7 +1,8 @@
-import { Box } from "@mantine/core";
+import { Box, useComputedColorScheme } from "@mantine/core";
 import type { Change } from "diff";
 import { diffLines as computeLineDiff, diffWordsWithSpace } from "diff";
-import { memo, useMemo } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
+import { type BundledLanguage, bundledLanguages, codeToTokens, type ThemedToken } from "shiki";
 
 // --- Types ---
 
@@ -12,6 +13,8 @@ interface DiffViewProps {
 	maxHeight?: number;
 	/** Enable word-wrap. Defaults to false (horizontal scroll). */
 	wordWrap?: boolean;
+	/** Shiki language id for syntax highlighting */
+	language?: string;
 }
 
 type DiffLine = {
@@ -37,23 +40,33 @@ const containerStyle = {
 	tabSize: 4,
 } as const;
 
-const removedLineStyle = {
-	backgroundColor: "var(--mantine-color-red-light)",
-} as const;
-
-const addedLineStyle = {
-	backgroundColor: "var(--mantine-color-green-light)",
-} as const;
-
-const removedWordStyle = {
+// Dark mode: Mantine's light variants work well against dark backgrounds.
+// Light mode: Mantine's light variants are too pale — use explicit rgba with
+// higher opacity so syntax-highlighted text remains legible.
+const darkRemovedLine = { backgroundColor: "var(--mantine-color-red-light)" } as const;
+const darkAddedLine = { backgroundColor: "var(--mantine-color-green-light)" } as const;
+const darkRemovedWord = {
 	backgroundColor: "var(--mantine-color-red-light-hover)",
 	borderRadius: 2,
 } as const;
-
-const addedWordStyle = {
+const darkAddedWord = {
 	backgroundColor: "var(--mantine-color-green-light-hover)",
 	borderRadius: 2,
 } as const;
+
+const lightRemovedLine = { backgroundColor: "rgba(255, 99, 71, 0.13)" } as const;
+const lightAddedLine = { backgroundColor: "rgba(46, 160, 67, 0.13)" } as const;
+const lightRemovedWord = { backgroundColor: "rgba(255, 99, 71, 0.25)", borderRadius: 2 } as const;
+const lightAddedWord = { backgroundColor: "rgba(46, 160, 67, 0.25)", borderRadius: 2 } as const;
+
+function getDiffStyles(isDark: boolean) {
+	return {
+		removedLine: isDark ? darkRemovedLine : lightRemovedLine,
+		addedLine: isDark ? darkAddedLine : lightAddedLine,
+		removedWord: isDark ? darkRemovedWord : lightRemovedWord,
+		addedWord: isDark ? darkAddedWord : lightAddedWord,
+	};
+}
 
 const gutterStyle = {
 	display: "inline-block",
@@ -140,10 +153,85 @@ function computeDiff(oldStr: string, newStr: string): DiffLine[] {
 	return result;
 }
 
-const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
+// --- Shiki token map: line content → tokens ---
+
+type TokenMap = Map<string, ThemedToken[]>;
+
+function useTokenMap(
+	lines: DiffLine[],
+	language: string | undefined,
+	theme: string,
+): TokenMap | null {
+	const [tokenMap, setTokenMap] = useState<TokenMap | null>(null);
+
+	const effectiveLang =
+		language && language !== "text" && language in bundledLanguages ? language : null;
+
+	// Build the full source text for tokenisation (all unique lines)
+	const sourceText = useMemo(() => {
+		if (!effectiveLang) return null;
+		// Reconstruct a plausible source from all lines so shiki gets proper context
+		return lines.map((l) => l.content).join("\n");
+	}, [effectiveLang, lines]);
+
+	useEffect(() => {
+		if (!effectiveLang || !sourceText) {
+			setTokenMap(null);
+			return;
+		}
+
+		let cancelled = false;
+		codeToTokens(sourceText, {
+			lang: effectiveLang as BundledLanguage,
+			theme,
+		}).then((result) => {
+			if (cancelled) return;
+			const map: TokenMap = new Map();
+			for (let i = 0; i < result.tokens.length && i < lines.length; i++) {
+				// Key by index to handle duplicate lines correctly
+				map.set(String(i), result.tokens[i]);
+			}
+			setTokenMap(map);
+		});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [effectiveLang, sourceText, lines, theme]);
+
+	return tokenMap;
+}
+
+// --- Highlighted line rendering ---
+
+function renderTokens(tokens: ThemedToken[]) {
+	return tokens.map((token, i) => (
+		<span
+			// biome-ignore lint/suspicious/noArrayIndexKey: tokens are positional
+			key={i}
+			style={{ color: token.color ?? "inherit" }}
+		>
+			{token.content}
+		</span>
+	));
+}
+
+const DiffLineRow = memo(function DiffLineRow({
+	line,
+	tokens,
+	diffStyles,
+}: {
+	line: DiffLine;
+	tokens?: ThemedToken[];
+	diffStyles: ReturnType<typeof getDiffStyles>;
+}) {
 	const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
 	const lineStyle =
-		line.type === "removed" ? removedLineStyle : line.type === "added" ? addedLineStyle : undefined;
+		line.type === "removed"
+			? diffStyles.removedLine
+			: line.type === "added"
+				? diffStyles.addedLine
+				: undefined;
 	const gutterColor =
 		line.type === "removed"
 			? "var(--mantine-color-red-text)"
@@ -159,7 +247,7 @@ const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
 					if (wc.removed) {
 						return (
 							// biome-ignore lint/suspicious/noArrayIndexKey: diff word chunks lack stable IDs
-							<span key={j} style={removedWordStyle}>
+							<span key={j} style={diffStyles.removedWord}>
 								{wc.value}
 							</span>
 						);
@@ -167,7 +255,7 @@ const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
 					if (wc.added) {
 						return (
 							// biome-ignore lint/suspicious/noArrayIndexKey: diff word chunks lack stable IDs
-							<span key={j} style={addedWordStyle}>
+							<span key={j} style={diffStyles.addedWord}>
 								{wc.value}
 							</span>
 						);
@@ -175,6 +263,8 @@ const DiffLineRow = memo(function DiffLineRow({ line }: { line: DiffLine }) {
 					// biome-ignore lint/suspicious/noArrayIndexKey: diff word chunks lack stable IDs
 					return <span key={j}>{wc.value}</span>;
 				})
+			) : tokens ? (
+				renderTokens(tokens)
 			) : (
 				<span
 					style={line.type === "context" ? { color: "var(--mantine-color-dimmed)" } : undefined}
@@ -193,8 +283,14 @@ export const DiffView = memo(function DiffView({
 	newStr,
 	maxHeight,
 	wordWrap,
+	language,
 }: DiffViewProps) {
+	const computedScheme = useComputedColorScheme("dark");
+	const isDark = computedScheme === "dark";
+	const theme = isDark ? "github-dark-default" : "github-light-default";
+	const diffStyles = getDiffStyles(isDark);
 	const lines = useMemo(() => computeDiff(oldStr, newStr), [oldStr, newStr]);
+	const tokenMap = useTokenMap(lines, language, theme);
 
 	if (lines.length === 0) return null;
 
@@ -223,10 +319,17 @@ export const DiffView = memo(function DiffView({
 
 	return (
 		<Box style={style}>
-			{lines.map((line, i) => (
-				// biome-ignore lint/suspicious/noArrayIndexKey: diff lines are computed once and never reordered
-				<DiffLineRow key={i} line={line} />
-			))}
+			{lines.map((line, i) => {
+				const key = `${line.type}-${i}`;
+				return (
+					<DiffLineRow
+						key={key}
+						line={line}
+						tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
+						diffStyles={diffStyles}
+					/>
+				);
+			})}
 			{truncated && (
 				<div style={{ textAlign: "center", opacity: 0.6, paddingTop: 4 }}>
 					... diff truncated at {MAX_DIFF_LINES} lines ...

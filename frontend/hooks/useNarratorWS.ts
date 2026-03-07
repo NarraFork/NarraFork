@@ -39,7 +39,7 @@ interface NarratorWSCallbacks {
 	) => void;
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
-	onPlanModeChanged?: (planMode: boolean) => void;
+	onPermissionModeChanged?: (permissionMode: string) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number, promptTokens?: number, contextWindow?: number) => void;
@@ -83,6 +83,14 @@ interface NarratorWSCallbacks {
 	) => void;
 	onBackgroundTaskFailed?: (taskNarratorId: string, toolUseId: string, error: string) => void;
 	onBackgroundTaskCancelled?: (taskNarratorId: string, toolUseId: string) => void;
+	onPresenceUpdate?: (
+		viewers: Array<{
+			userId: string;
+			username: string;
+			avatarColor: string | null;
+			avatarImageId: string | null;
+		}>,
+	) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -179,6 +187,7 @@ export function useNarratorWS(
 					subscribeMsg.lastMessageId = lastMessageIdRef.current;
 				}
 				ws.send(JSON.stringify(subscribeMsg));
+				ws.send(JSON.stringify({ type: "presence_join", narratorId: subscribedId }));
 			};
 			ws.onmessage = (event) => {
 				if (cancelled) return;
@@ -263,8 +272,8 @@ export function useNarratorWS(
 						case "buffer_cleared":
 							callbacksRef.current.onBufferCleared?.(data.reason);
 							break;
-						case "plan_mode_changed":
-							callbacksRef.current.onPlanModeChanged?.(data.planMode);
+						case "permission_mode_changed":
+							callbacksRef.current.onPermissionModeChanged?.(data.permissionMode);
 							break;
 						case "compacting":
 							callbacksRef.current.onCompacting?.();
@@ -374,6 +383,9 @@ export function useNarratorWS(
 						case "background_task_cancelled":
 							callbacksRef.current.onBackgroundTaskCancelled?.(data.taskNarratorId, data.toolUseId);
 							break;
+						case "presence_update":
+							callbacksRef.current.onPresenceUpdate?.(data.viewers ?? []);
+							break;
 					}
 				} catch (err) {
 					if (import.meta.env.DEV) console.warn("[useNarratorWS] Failed to parse WS message:", err);
@@ -414,6 +426,7 @@ export function useNarratorWS(
 			removeWSStatus(wsStatusId);
 			const ws = wsRef.current;
 			safeCloseWs(ws, (w) => {
+				w.send(JSON.stringify({ type: "presence_leave", narratorId: subscribedId }));
 				w.send(JSON.stringify({ type: "unsubscribe", narratorIds: [subscribedId] }));
 			});
 		};
@@ -480,10 +493,10 @@ export function useNarratorWS(
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
 export interface NarratorListWSEvent {
-	type: "status" | "title" | "planMode" | "presence" | "terminalCount" | "containerStatus";
+	type: "status" | "title" | "permissionMode" | "presence" | "terminalCount" | "containerStatus";
 	status?: string;
 	title?: string;
-	planMode?: boolean;
+	permissionMode?: string;
 	viewers?: Array<{
 		userId: string;
 		username: string;
@@ -580,8 +593,11 @@ export function useNarratorsListWS(
 						onUpdateRef.current(nId, { type: "status", status: data.status });
 					} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
 						onUpdateRef.current(nId, { type: "title", title: data.title });
-					} else if (data.type === "plan_mode_changed") {
-						onUpdateRef.current(nId, { type: "planMode", planMode: data.planMode });
+					} else if (data.type === "permission_mode_changed") {
+						onUpdateRef.current(nId, {
+							type: "permissionMode",
+							permissionMode: data.permissionMode,
+						});
 					} else if (data.type === "presence_update") {
 						onUpdateRef.current(nId, { type: "presence", viewers: data.viewers });
 					} else if (data.type.startsWith("user:")) {

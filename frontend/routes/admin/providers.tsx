@@ -50,12 +50,17 @@ function ProvidersPage() {
 	>([]);
 	const [customInitialized, setCustomInitialized] = useState(false);
 
+	// Model context windows state
+	const [modelContextWindows, setModelContextWindows] = useState<Record<string, number>>({});
+	const [contextWindowsInitialized, setContextWindowsInitialized] = useState(false);
+
 	// Server snapshot for dirty detection
 	const serverSnapshot = useRef({
 		openaiProviders: [] as OpenAIProviderState[],
 		anthropicProviders: [] as AnthropicProviderState[],
 		hiddenModels: [] as string[],
 		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
+		modelContextWindows: {} as Record<string, number>,
 	});
 
 	// Sync providers from settings
@@ -122,6 +127,16 @@ function ProvidersPage() {
 		}
 	}, [settings, customInitialized]);
 
+	// Sync model context windows from settings
+	useEffect(() => {
+		if (settings && !contextWindowsInitialized) {
+			const windows = (settings.agent?.modelContextWindows as Record<string, number>) ?? {};
+			setModelContextWindows(windows);
+			serverSnapshot.current.modelContextWindows = windows;
+			setContextWindowsInitialized(true);
+		}
+	}, [settings, contextWindowsInitialized]);
+
 	const updateMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: () => {
@@ -130,6 +145,7 @@ function ProvidersPage() {
 				anthropicProviders: [...anthropicProviders],
 				hiddenModels: [...hiddenModels],
 				customModels: [...customModels],
+				modelContextWindows: { ...modelContextWindows },
 			};
 			setProvidersInitialized(true);
 			setAnthropicInitialized(true);
@@ -139,24 +155,33 @@ function ProvidersPage() {
 	});
 
 	const isDirty = useMemo(() => {
-		if (!providersInitialized || !anthropicInitialized || !hiddenInitialized || !customInitialized)
+		if (
+			!providersInitialized ||
+			!anthropicInitialized ||
+			!hiddenInitialized ||
+			!customInitialized ||
+			!contextWindowsInitialized
+		)
 			return false;
 		const s = serverSnapshot.current;
 		return (
 			JSON.stringify(openaiProviders) !== JSON.stringify(s.openaiProviders) ||
 			JSON.stringify(anthropicProviders) !== JSON.stringify(s.anthropicProviders) ||
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
-			JSON.stringify(customModels) !== JSON.stringify(s.customModels)
+			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
+			JSON.stringify(modelContextWindows) !== JSON.stringify(s.modelContextWindows)
 		);
 	}, [
 		providersInitialized,
 		anthropicInitialized,
 		hiddenInitialized,
 		customInitialized,
+		contextWindowsInitialized,
 		openaiProviders,
 		anthropicProviders,
 		hiddenModels,
 		customModels,
+		modelContextWindows,
 	]);
 
 	const [highlight, setHighlight] = useState(false);
@@ -169,17 +194,66 @@ function ProvidersPage() {
 	}, [isDirty]);
 
 	const handleSave = useCallback(() => {
+		// Migrate modelContextWindows keys when prefix changes
+		const migratedWindows = { ...modelContextWindows };
+		for (const provider of openaiProviders) {
+			const original = serverSnapshot.current.openaiProviders.find((p) => p.id === provider.id);
+			if (original && original.prefix !== provider.prefix) {
+				const oldPrefix = original.prefix;
+				const newPrefix = provider.prefix;
+				for (const key of Object.keys(migratedWindows)) {
+					if (key.startsWith(`${oldPrefix}:`)) {
+						const model = key.slice(oldPrefix.length + 1);
+						migratedWindows[`${newPrefix}:${model}`] = migratedWindows[key];
+						delete migratedWindows[key];
+					}
+				}
+			}
+		}
+		for (const provider of anthropicProviders) {
+			const original = serverSnapshot.current.anthropicProviders.find((p) => p.id === provider.id);
+			if (original && original.prefix !== provider.prefix) {
+				const oldPrefix = original.prefix;
+				const newPrefix = provider.prefix;
+				for (const key of Object.keys(migratedWindows)) {
+					if (key.startsWith(`${oldPrefix}:`)) {
+						const model = key.slice(oldPrefix.length + 1);
+						migratedWindows[`${newPrefix}:${model}`] = migratedWindows[key];
+						delete migratedWindows[key];
+					}
+				}
+			}
+		}
+
 		updateMutation.mutate({
 			openaiProviders,
 			anthropicProviders,
-			agent: { hiddenModels, customModels },
+			agent: { hiddenModels, customModels, modelContextWindows: migratedWindows },
 		});
-	}, [updateMutation, openaiProviders, anthropicProviders, hiddenModels, customModels]);
+	}, [
+		updateMutation,
+		openaiProviders,
+		anthropicProviders,
+		hiddenModels,
+		customModels,
+		modelContextWindows,
+	]);
 
 	const toggleHidden = useCallback((modelVal: string) => {
 		setHiddenModels((prev) =>
 			prev.includes(modelVal) ? prev.filter((id) => id !== modelVal) : [...prev, modelVal],
 		);
+	}, []);
+
+	const handleContextWindowChange = useCallback((modelVal: string, size: number | null) => {
+		setModelContextWindows((prev) => {
+			if (size == null) {
+				const next = { ...prev };
+				delete next[modelVal];
+				return next;
+			}
+			return { ...prev, [modelVal]: size };
+		});
 	}, []);
 
 	// Redirect non-admin users
@@ -277,6 +351,8 @@ function ProvidersPage() {
 					providerModelsMap={providerModelsMap}
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
 				/>
 
 				<AnthropicProvidersSection
@@ -285,6 +361,8 @@ function ProvidersPage() {
 					providerModelsMap={anthropicModelsMap}
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
 				/>
 
 				<CustomModelsSection
@@ -293,6 +371,8 @@ function ProvidersPage() {
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
 					prefixOptions={uniquePrefixOptions}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
 				/>
 			</Stack>
 
