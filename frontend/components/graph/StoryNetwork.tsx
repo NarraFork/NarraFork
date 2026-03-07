@@ -21,6 +21,7 @@ import { Box, Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
+import { ChapterForkModal } from "../chapter/ChapterForkModal";
 import { ChapterNode } from "./ChapterNode";
 import { CherryPickEdge } from "./CherryPickEdge";
 import { DependencyEdge } from "./DependencyEdge";
@@ -76,6 +77,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+	const [forkTarget, setForkTarget] = useState<string | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
 	const nodesRef = useRef<Node[]>(nodes);
 	nodesRef.current = nodes;
@@ -261,9 +263,9 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	const handleFork = useCallback(
 		(nodeId: string) => {
 			setContextMenu(null);
-			navigate({ to: "/chapters/$chapterId", params: { chapterId: nodeId } });
+			setForkTarget(nodeId);
 		},
-		[navigate],
+		[],
 	);
 
 	const handleSetRole = useCallback(
@@ -431,6 +433,17 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 					</Group>
 				</Stack>
 			</Modal>
+			{forkTarget && (
+				<ChapterForkModal
+					chapterId={forkTarget}
+					opened
+					onClose={() => setForkTarget(null)}
+					onForkSuccess={() => {
+						setForkTarget(null);
+						queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+					}}
+				/>
+			)}
 		</Box>
 	);
 }
