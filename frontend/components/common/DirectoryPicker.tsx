@@ -45,7 +45,6 @@ export function DirectoryPicker({
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
 
 	const handleOpen = () => {
-		// Start browsing from current value if set, otherwise let API decide (home dir)
 		setBrowsePath(value || undefined);
 		open();
 	};
@@ -106,17 +105,23 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 	});
 
 	const hasDrives = (data?.drives?.length ?? 0) > 0;
+	// At drive root when path is null (initial) or undefined
 	const isAtDriveRoot = !data?.path && hasDrives;
 
 	const navigateTo = useCallback((path: string) => {
 		setCurrentPath(path);
 	}, []);
 
+	// Go back to drive selection screen
+	const goToDrives = useCallback(() => {
+		setCurrentPath(undefined);
+	}, []);
+
 	const goUp = useCallback(() => {
 		if (data?.parent) {
 			setCurrentPath(data.parent);
 		} else if (hasDrives) {
-			// Go back to drive selection
+			// At drive root (e.g. C:\) — go back to drive selection
 			setCurrentPath(undefined);
 		}
 	}, [data, hasDrives]);
@@ -126,35 +131,38 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 
 	return (
 		<Stack gap="sm">
-			{/* Current path display */}
+			{/* Breadcrumb navigation bar */}
 			<Group gap="xs" wrap="nowrap">
-				<ActionIcon
-					variant="subtle"
-					onClick={goUp}
-					disabled={isAtDriveRoot || (!data?.parent && !hasDrives)}
-					aria-label={t("goUp")}
-				>
+				<ActionIcon variant="subtle" onClick={goUp} disabled={isAtDriveRoot} aria-label={t("goUp")}>
 					<IconArrowUp size={18} />
 				</ActionIcon>
 				<ScrollArea type="auto" style={{ flex: 1 }} offsetScrollbars={false}>
-					{isAtDriveRoot ? (
-						<Text size="sm" c="dimmed">
-							{t("selectDrive")}
-						</Text>
-					) : (
-						<Breadcrumbs separator={data?.sep || "/"} styles={{ separator: { margin: "0 2px" } }}>
-							{breadcrumbs.map((seg) => (
-								<UnstyledButton
-									key={seg.path}
-									onClick={() => navigateTo(seg.path)}
-									fz="sm"
-									style={{ whiteSpace: "nowrap" }}
-								>
-									{seg.name}
-								</UnstyledButton>
-							))}
-						</Breadcrumbs>
-					)}
+					<Breadcrumbs separator={data?.sep || "/"} styles={{ separator: { margin: "0 2px" } }}>
+						{/* On Windows, always show a clickable "Computer" root to go back to drives */}
+						{hasDrives && (
+							<UnstyledButton
+								onClick={goToDrives}
+								fz="sm"
+								fw={isAtDriveRoot ? 600 : undefined}
+								style={{ whiteSpace: "nowrap" }}
+							>
+								<Group gap={4} wrap="nowrap">
+									<IconDeviceDesktop size={14} />
+									{t("computer")}
+								</Group>
+							</UnstyledButton>
+						)}
+						{breadcrumbs.map((seg) => (
+							<UnstyledButton
+								key={seg.path}
+								onClick={() => navigateTo(seg.path)}
+								fz="sm"
+								style={{ whiteSpace: "nowrap" }}
+							>
+								{seg.name}
+							</UnstyledButton>
+						))}
+					</Breadcrumbs>
 				</ScrollArea>
 			</Group>
 
@@ -168,7 +176,7 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 				)}
 				{data && (
 					<Stack gap={2}>
-						{/* Drive letters (Windows) — only show at drive root */}
+						{/* Drive letters (Windows) — show at drive root */}
 						{isAtDriveRoot &&
 							data.drives?.map((drive) => (
 								<UnstyledButton
@@ -205,7 +213,7 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 								</Group>
 							</UnstyledButton>
 						))}
-						{!data.drives?.length && !data.entries.length && (
+						{!isAtDriveRoot && !data.entries.length && (
 							<Text c="dimmed" size="sm" ta="center" mt="xl">
 								{t("emptyDirectory")}
 							</Text>
@@ -242,18 +250,20 @@ function buildBreadcrumbs(fullPath: string, sep: string): Array<{ name: string; 
 	const parts = fullPath.split(sep).filter(Boolean);
 	const result: Array<{ name: string; path: string }> = [];
 
-	// Windows drive root: "C:" → "C:\"
+	// Windows: "C:\Users\foo" → ["C:", "Users", "foo"]
 	if (sep === "\\" && /^[A-Z]:$/i.test(parts[0])) {
-		result.push({ name: parts[0], path: `${parts[0]}\\` });
+		let accumulated = `${parts[0]}\\`;
+		result.push({ name: `${parts[0]}\\`, path: accumulated });
 		for (let i = 1; i < parts.length; i++) {
-			const path = result[result.length - 1].path + parts[i] + (i < parts.length - 1 ? sep : "");
-			result.push({ name: parts[i], path });
+			accumulated = `${accumulated}${parts[i]}\\`;
+			result.push({ name: parts[i], path: accumulated.replace(/\\$/, "") });
 		}
 	} else {
-		// Unix: starts with /
+		// Unix: "/home/user/projects" → ["/", "home", "user", "projects"]
+		result.push({ name: "/", path: "/" });
 		for (let i = 0; i < parts.length; i++) {
 			const path = `/${parts.slice(0, i + 1).join("/")}`;
-			result.push({ name: i === 0 ? `/${parts[0]}` : parts[i], path });
+			result.push({ name: parts[i], path });
 		}
 	}
 
