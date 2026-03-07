@@ -2668,4 +2668,9 @@ export const narratorService = {
 			.set({ pruneBoundaryMessageId: null, prunedPercent: null, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 	},
+
+	/** Public wrapper for appendMessageRef — used by external services to add messages. */
+	async appendMessageRefPublic(narratorId: string, messageId: string): Promise<number> {
+		return appendMessageRef(narratorId, messageId);
+	},
 };

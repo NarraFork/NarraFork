@@ -7,7 +7,7 @@ export type NarraForkEvent =
 	// Chapter lifecycle
 	| { type: "chapter:created"; chapterId: string; projectId: string }
 	| { type: "chapter:forked"; chapterId: string; parentId: string }
-	| { type: "chapter:merged"; sourceId: string; targetId: string }
+	| { type: "chapter:merged"; sourceId: string; targetId: string; userId?: string }
 	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] } // TODO: not yet emitted
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
@@ -18,6 +18,13 @@ export type NarraForkEvent =
 			continuationChapterId: string;
 			newForkChapterId: string;
 			commitSha: string;
+	  }
+	| {
+			type: "chapter:merge_summary";
+			sourceId: string;
+			targetId: string;
+			narratorId: string;
+			summary: string;
 	  }
 	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] } // TODO: not yet emitted
 	| { type: "chapter:frozen"; chapterId: string } // TODO: not yet emitted

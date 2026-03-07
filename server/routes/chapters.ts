@@ -109,7 +109,8 @@ chapterRoutes.post("/:id/merge", async (c) => {
 	const id = c.req.param("id");
 	const parsed = mergeChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const result = await chapterMerge.merge(id, parsed.data);
+	const userId = c.get("user").sub;
+	const result = await chapterMerge.merge(id, parsed.data, userId);
 	return c.json(result);
 });
 
@@ -119,7 +120,7 @@ chapterRoutes.post("/:id/ai-resolve", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
-	const result = await chapterMerge.aiResolveConflicts(id, parsed.data, locale);
+	const result = await chapterMerge.aiResolveConflicts(id, parsed.data, locale, userId);
 	return c.json(result);
 });
 
@@ -162,7 +163,7 @@ chapterRoutes.post("/batch-merge", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
-	const result = await chapterBatchMerge.run({ ...parsed.data, locale });
+	const result = await chapterBatchMerge.run({ ...parsed.data, locale, userId });
 	return c.json(result, 201);
 });
 

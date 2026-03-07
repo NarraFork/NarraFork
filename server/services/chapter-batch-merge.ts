@@ -19,6 +19,7 @@ export interface BatchMergeInput {
 	description?: string;
 	strategy?: "merge" | "squash" | "cherry-pick";
 	locale?: Locale;
+	userId?: string;
 }
 
 export type MergeDecision = "continue" | "cancel";
@@ -131,6 +132,7 @@ export const chapterBatchMerge = {
 			sourceChapterIds,
 			strategy,
 			input.locale,
+			input.userId,
 		).catch((err) => {
 			logger.error("Batch merge processQueue unhandled error", {
 				mergeSessionId,
@@ -148,6 +150,7 @@ export const chapterBatchMerge = {
 		sourceChapterIds: string[],
 		strategy: "merge" | "squash" | "cherry-pick",
 		locale?: Locale,
+		userId?: string,
 	): Promise<void> {
 		const total = sourceChapterIds.length;
 		let mergedCount = 0;
@@ -170,10 +173,14 @@ export const chapterBatchMerge = {
 					.where(eq(mergeSessions.id, mergeSessionId));
 
 				// Try merge
-				const result = await chapterMerge.merge(sourceId, {
-					targetChapterId,
-					strategy,
-				});
+				const result = await chapterMerge.merge(
+					sourceId,
+					{
+						targetChapterId,
+						strategy,
+					},
+					userId,
+				);
 
 				if (result.success) {
 					mergedCount++;
@@ -250,6 +257,7 @@ export const chapterBatchMerge = {
 					sourceId,
 					{ targetChapterId, strategy },
 					locale,
+					userId,
 				);
 
 				if (!aiResult.resolved) {
