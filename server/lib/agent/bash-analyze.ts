@@ -118,6 +118,11 @@ const SAFE_COMMANDS = new Set([
 	// 包执行器（仅允许严格白名单场景，具体由 CONDITIONAL_COMMANDS 进一步约束）
 	"npx",
 	"bunx",
+	// 包管理工具（只读子命令由 CONDITIONAL_COMMANDS 放行，危险子命令拦截）
+	"npm",
+	"bun",
+	"yarn",
+	"pnpm",
 	// 文件操作（路径由 PATH_COMMANDS 提取，外部路径由 isInsideWorktree 拦截）
 	"cp",
 	"mv",
@@ -216,15 +221,12 @@ const ALWAYS_ASK_COMMANDS = new Set([
 	"lua",
 	"php",
 	// 运行时 / 构建/包管理工具（可直接或间接执行项目/远程代码）
+	// npm/bun/yarn/pnpm 移至 CONDITIONAL_COMMANDS 以允许只读子命令（ls/list/view 等）
 	"node",
 	"python",
 	"python3",
 	"go",
 	"cargo",
-	"bun",
-	"npm",
-	"yarn",
-	"pnpm",
 	"pip",
 	"pip3",
 	"make",
@@ -600,15 +602,65 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (tokens.includes("-c") || tokens.includes("-")) return "python3 with -c flag";
 			return null;
 		},
-		// npm — run/exec 执行任意脚本/命令
+		// npm — 只读子命令放行，写操作/脚本执行拦截
 		npm: (tokens) => {
 			if (tokens.includes("exec")) return "npm exec (executes arbitrary package)";
 			const sub = tokens[1];
+			if (!sub) return null; // bare `npm` — safe (shows help)
+			// 只读子命令 — 安全
+			const npmReadOnly = new Set([
+				"ls",
+				"list",
+				"ll",
+				"la",
+				"view",
+				"info",
+				"show",
+				"outdated",
+				"search",
+				"find",
+				"help",
+				"config",
+				"get",
+				"prefix",
+				"root",
+				"bin",
+				"version",
+				"--version",
+				"-v",
+				"explain",
+				"why",
+				"fund",
+				"audit",
+				"doctor",
+				"ping",
+				"whoami",
+				"token",
+				"pack",
+				"diff",
+				"pkg",
+				"query",
+				"completion",
+				"explore",
+			]);
+			if (npmReadOnly.has(sub)) return null;
+			// 危险子命令
 			if (sub === "run" || sub === "run-script") return `npm ${sub} (runs project script)`;
-			// npm test / npm start 等是 run 的别名
 			if (sub === "test" || sub === "start" || sub === "stop" || sub === "restart")
 				return `npm ${sub} (runs project script)`;
-			return null;
+			if (sub === "install" || sub === "i" || sub === "ci" || sub === "add")
+				return `npm ${sub} (installs packages)`;
+			if (sub === "uninstall" || sub === "remove" || sub === "rm" || sub === "un" || sub === "r")
+				return `npm ${sub} (removes packages)`;
+			if (sub === "update" || sub === "up" || sub === "upgrade")
+				return `npm ${sub} (updates packages)`;
+			if (sub === "publish") return "npm publish (publishes package)";
+			if (sub === "link" || sub === "ln") return `npm ${sub} (creates symlink)`;
+			if (sub === "prune") return "npm prune (removes extraneous packages)";
+			if (sub === "rebuild" || sub === "rb") return `npm ${sub} (rebuilds packages)`;
+			if (sub === "cache" && tokens.includes("clean")) return "npm cache clean";
+			// 未知子命令 — 保守拦截
+			return `npm ${sub} (unknown npm subcommand)`;
 		},
 		// pip install 可以执行 setup.py
 		pip: (tokens) => {
@@ -637,14 +689,31 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			if (tokens.includes("run")) return "cargo run";
 			return null;
 		},
-		// bun — run 执行项目脚本，-e 执行任意代码
+		// bun — 只读子命令放行，脚本执行/-e 拦截
 		bun: (tokens) => {
 			if (tokens.includes("-e") || tokens.includes("--eval")) return "bun with -e flag";
 			const sub = tokens[1];
+			if (!sub) return null; // bare `bun` — safe (shows help)
+			// 版本/帮助 flags
+			if (sub === "--version" || sub === "-v" || sub === "--help" || sub === "-h") return null;
+			// 只读子命令
+			const bunReadOnly = new Set(["pm", "--version", "-v", "--help", "-h", "--revision"]);
+			if (bunReadOnly.has(sub)) return null;
+			// 危险子命令
 			if (sub === "run") return "bun run (runs project script)";
-			// bun test 等是内置命令但也执行项目配置
-			if (sub === "test") return "bun test (runs project script)";
-			return null;
+			if (sub === "test") return "bun test (runs project tests)";
+			if (sub === "install" || sub === "i" || sub === "add")
+				return `bun ${sub} (installs packages)`;
+			if (sub === "remove" || sub === "rm") return `bun ${sub} (removes packages)`;
+			if (sub === "update") return "bun update (updates packages)";
+			if (sub === "link") return "bun link (creates symlink)";
+			if (sub === "build") return "bun build (bundles code)";
+			if (sub === "init") return "bun init (initializes project)";
+			if (sub === "create") return "bun create (scaffolds project)";
+			if (sub === "upgrade") return "bun upgrade (upgrades bun itself)";
+			if (sub === "patch") return "bun patch (patches packages)";
+			// 未知子命令 — 可能是脚本名（bun <script>），保守拦截
+			return `bun ${sub} (unknown bun subcommand)`;
 		},
 		// find -exec / -execdir — 提取被执行的命令进行递归分类
 		find: (tokens) => {
@@ -801,22 +870,81 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 		unzip: (_tokens) => null,
 		gzip: (_tokens) => null,
 		gunzip: (_tokens) => null,
-		// yarn/pnpm — run 执行项目脚本
+		// yarn — 只读子命令放行，脚本执行拦截
 		yarn: (tokens) => {
 			const sub = tokens[1];
+			if (!sub) return null;
+			// 只读子命令
+			const yarnReadOnly = new Set([
+				"list",
+				"info",
+				"why",
+				"outdated",
+				"config",
+				"--version",
+				"-v",
+				"--help",
+				"-h",
+				"audit",
+				"licenses",
+				"bin",
+				"versions",
+				"policies",
+				"workspaces",
+			]);
+			if (yarnReadOnly.has(sub)) return null;
+			// 危险子命令
 			if (sub === "run") return "yarn run (runs project script)";
 			if (sub === "test" || sub === "start" || sub === "stop")
 				return `yarn ${sub} (runs project script)`;
+			if (sub === "add") return "yarn add (installs packages)";
+			if (sub === "remove") return "yarn remove (removes packages)";
+			if (sub === "install") return "yarn install (installs all packages)";
+			if (sub === "upgrade" || sub === "up") return `yarn ${sub} (updates packages)`;
+			if (sub === "link") return "yarn link (creates symlink)";
+			if (sub === "publish") return "yarn publish (publishes package)";
+			if (sub === "cache" && tokens.includes("clean")) return "yarn cache clean";
 			// yarn <script-name> 也是 run 的隐式别名，但无法区分子命令和脚本名
-			// 保守处理：只拦截明确的 run/test/start
-			return null;
+			// 保守处理：未知子命令拦截
+			return `yarn ${sub} (unknown yarn subcommand)`;
 		},
+		// pnpm — 只读子命令放行，脚本执行拦截
 		pnpm: (tokens) => {
 			const sub = tokens[1];
+			if (!sub) return null;
+			// 只读子命令
+			const pnpmReadOnly = new Set([
+				"list",
+				"ls",
+				"ll",
+				"la",
+				"why",
+				"outdated",
+				"audit",
+				"config",
+				"--version",
+				"-v",
+				"--help",
+				"-h",
+				"root",
+				"bin",
+				"store",
+			]);
+			if (pnpmReadOnly.has(sub)) return null;
+			// 危险子命令
 			if (sub === "run") return "pnpm run (runs project script)";
 			if (sub === "test" || sub === "start" || sub === "stop")
 				return `pnpm ${sub} (runs project script)`;
-			return null;
+			if (sub === "add" || sub === "install" || sub === "i")
+				return `pnpm ${sub} (installs packages)`;
+			if (sub === "remove" || sub === "rm" || sub === "un" || sub === "uninstall")
+				return `pnpm ${sub} (removes packages)`;
+			if (sub === "update" || sub === "up") return `pnpm ${sub} (updates packages)`;
+			if (sub === "link" || sub === "ln") return `pnpm ${sub} (creates symlink)`;
+			if (sub === "publish") return "pnpm publish (publishes package)";
+			if (sub === "rebuild" || sub === "rb") return `pnpm ${sub} (rebuilds packages)`;
+			if (sub === "prune") return "pnpm prune (removes extraneous packages)";
+			return `pnpm ${sub} (unknown pnpm subcommand)`;
 		},
 		// npx/bunx — 包执行器，递归检查被执行的命令
 		npx: (tokens) => classifyPackageRunner(tokens, "npx").error,
@@ -1825,14 +1953,10 @@ const PS_ALWAYS_ASK_CMDLETS = new Set([
 	"install-module",
 	"install-package",
 	"install-script",
-	// 运行时
+	// 运行时（npm/bun/yarn/pnpm 由 SAFE_COMMANDS + CONDITIONAL_COMMANDS 处理）
 	"node",
 	"python",
 	"python3",
-	"bun",
-	"npm",
-	"yarn",
-	"pnpm",
 	// 系统控制
 	"restart-computer",
 	"stop-computer",
