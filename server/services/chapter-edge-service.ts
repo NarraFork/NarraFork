@@ -141,6 +141,16 @@ class ChapterEdgeService {
 	}
 
 	/**
+	 * Delete all merge edges where the given chapter is the source (the merged branch).
+	 * Called when waking a merged chapter to remove stale merge lines.
+	 */
+	async deleteMergeEdgesBySource(chapterId: string) {
+		await db
+			.delete(chapterEdges)
+			.where(and(eq(chapterEdges.sourceId, chapterId), eq(chapterEdges.type, "merge")));
+	}
+
+	/**
 	 * Get all edges for a project.
 	 */
 	async getEdgesByProject(projectId: string) {

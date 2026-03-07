@@ -8,13 +8,14 @@ import {
 	type OnConnect,
 	ReactFlow,
 } from "@xyflow/react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "@xyflow/react/dist/style.css";
 import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
 import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
-import { useStoryGraph } from "@frontend/hooks/useStoryGraph";
+import type { GraphNode } from "@frontend/hooks/useStoryGraph";
+import { assignEdgeHandles, useStoryGraph } from "@frontend/hooks/useStoryGraph";
 import { api } from "@frontend/lib/api";
 import { Box, Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -86,6 +87,12 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
+
+	// Recompute edge handles whenever local node positions change
+	const computedEdges = useMemo(
+		() => assignEdgeHandles(nodes as GraphNode[], edges),
+		[nodes, edges],
+	);
 
 	// Sync local nodes state when upstream graph data changes
 	useEffect(() => {
@@ -270,7 +277,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 			<Box style={{ flex: 1, position: "relative" }}>
 				<ReactFlow
 					nodes={nodes}
-					edges={edges}
+					edges={computedEdges}
 					nodeTypes={nodeTypes}
 					edgeTypes={edgeTypes}
 					onNodesChange={onNodesChange}
