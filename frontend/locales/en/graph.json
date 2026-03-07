@@ -16,6 +16,7 @@
 		},
 		"dormant": "Set Dormant",
 		"wake": "Wake Up",
+		"unmerge": "Unmerge",
 		"delete": "Delete",
 		"deleteConfirmTitle": "Delete Chapter",
 		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? The worktree and branch will be removed. Conversations will be preserved as read-only.",
