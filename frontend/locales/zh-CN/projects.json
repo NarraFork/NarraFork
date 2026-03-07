@@ -5,7 +5,7 @@
 	"projectName": "项目名称",
 	"projectNamePlaceholder": "我的项目",
 	"repositoryPath": "仓库路径",
-	"repositoryPathPlaceholder": "/home/user/projects/my-repo",
+	"repositoryPathPlaceholder": "/path/to/my-repo",
 	"repositoryPathDescription": "本地已有的 Git 仓库路径",
 	"projectNotFound": "项目未找到",
 	"repoMode": "仓库",
