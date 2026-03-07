@@ -146,6 +146,6 @@ chmod +x dist/narrafork-*
 ## 相关命令
 
 - `bun run build` - 仅构建前端
-- `bun run build:compile` - 构建当前平台的可执行文件
 - `bun run build:cross` - 构建所有平台
+- `bun run build:cross --platform=linux-x64` - 构建指定平台
 - `bun run start` - 开发模式运行（不编译）

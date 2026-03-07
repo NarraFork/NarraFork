@@ -1,5 +1,6 @@
 import {
 	Affix,
+	Anchor,
 	Avatar,
 	Badge,
 	Button,
@@ -22,6 +23,7 @@ import {
 } from "@mantine/core";
 import {
 	IconBell,
+	IconBrandGithub,
 	IconEye,
 	IconHandStop,
 	IconNotebook,
@@ -939,6 +941,31 @@ function SettingsPage() {
 								{healthData.platform}
 							</Text>
 						)}
+					</Group>
+					<Group gap="xs">
+						<Text size="sm" c="dimmed">
+							{t("authorsLabel")}:
+						</Text>
+						<Group gap="xs">
+							<Anchor href="https://github.com/domexie" target="_blank" size="sm">
+								<Group gap={4}>
+									<IconBrandGithub size={14} />
+									domexie
+								</Group>
+							</Anchor>
+							<Anchor href="https://github.com/FxRayHughes" target="_blank" size="sm">
+								<Group gap={4}>
+									<IconBrandGithub size={14} />
+									FxRayHughes
+								</Group>
+							</Anchor>
+							<Anchor href="https://github.com/FoskyM" target="_blank" size="sm">
+								<Group gap={4}>
+									<IconBrandGithub size={14} />
+									FoskyM
+								</Group>
+							</Anchor>
+						</Group>
 					</Group>
 				</Stack>
 			</Paper>

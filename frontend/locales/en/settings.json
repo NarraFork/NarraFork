@@ -310,5 +310,6 @@
 	"versionSection": "About",
 	"versionLabel": "Version",
 	"versionCommit": "Commit",
-	"versionPlatform": "Platform"
+	"versionPlatform": "Platform",
+	"authorsLabel": "Authors"
 }

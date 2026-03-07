@@ -9,7 +9,6 @@
 		"dev:all": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
 		"dev:cold": "bun run db:migrate; PORT=7779 bun run server/index.ts & bunx vite --config frontend/vite.config.ts & wait",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts",
-		"build:compile": "bun scripts/build-embedded.ts",
 		"build:cross": "bun scripts/build-cross-platform.ts",
 		"build:macos": "bun scripts/build-cross-platform.ts --platform=darwin",
 		"build:macos-arm64": "bun scripts/build-cross-platform.ts --platform=darwin-arm64",

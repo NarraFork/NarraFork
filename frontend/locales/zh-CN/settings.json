@@ -310,5 +310,6 @@
 	"versionSection": "关于",
 	"versionLabel": "版本",
 	"versionCommit": "提交",
-	"versionPlatform": "平台"
+	"versionPlatform": "平台",
+	"authorsLabel": "作者"
 }
