@@ -10,6 +10,7 @@ import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
+import { mergeSummaryService } from "./merge-summary-service";
 import { startSession } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 
@@ -85,7 +86,11 @@ export const chapterMerge = {
 		};
 	},
 
-	async merge(sourceChapterId: string, input: MergeChapterInput): Promise<MergeResult> {
+	async merge(
+		sourceChapterId: string,
+		input: MergeChapterInput,
+		userId?: string,
+	): Promise<MergeResult> {
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
 		});
@@ -121,7 +126,13 @@ export const chapterMerge = {
 			if (result.success) {
 				// Git succeeded — persist to DB with retry on failure
 				try {
-					await this.markMerged(sourceChapterId, input.targetChapterId, strategy, result.commitSha);
+					await this.markMerged(
+						sourceChapterId,
+						input.targetChapterId,
+						strategy,
+						result.commitSha,
+						userId,
+					);
 				} catch (dbErr) {
 					logger.error("Failed to mark chapter as merged after successful git merge, retrying", {
 						sourceChapterId,
@@ -135,6 +146,7 @@ export const chapterMerge = {
 							input.targetChapterId,
 							strategy,
 							result.commitSha,
+							userId,
 						);
 					} catch (retryErr) {
 						// DB is inconsistent but git merge succeeded — log and
@@ -169,6 +181,7 @@ export const chapterMerge = {
 		sourceChapterId: string,
 		input: MergeChapterInput,
 		locale: Locale = "en",
+		userId?: string,
 	): Promise<AiResolveResult> {
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
@@ -214,6 +227,7 @@ export const chapterMerge = {
 						input.targetChapterId,
 						strategy,
 						cpResult.commitSha,
+						userId,
 					);
 				}
 				conflictFiles = cpResult.conflictFiles ?? [];
@@ -226,6 +240,7 @@ export const chapterMerge = {
 						input.targetChapterId,
 						strategy,
 						commitSha ?? undefined,
+						userId,
 					);
 				}
 				conflictFiles = mergeResult.conflictFiles;
@@ -264,6 +279,7 @@ export const chapterMerge = {
 					input.targetChapterId,
 					strategy,
 					commitSha ?? undefined,
+					userId,
 				);
 			} catch (err) {
 				logger.error("AI conflict resolution failed", { error: String(err) });
@@ -282,6 +298,7 @@ export const chapterMerge = {
 		targetChapterId: string,
 		strategy: string,
 		commitSha?: string,
+		userId?: string,
 	): Promise<void> {
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
@@ -361,7 +378,25 @@ export const chapterMerge = {
 			type: "chapter:merged",
 			sourceId: sourceChapterId,
 			targetId: targetChapterId,
+			userId,
 		});
+
+		// Fire-and-forget: generate merge summary asynchronously
+		mergeSummaryService
+			.generateAndInject({
+				sourceChapterId,
+				targetChapterId,
+				userId,
+				strategy,
+				commitSha,
+			})
+			.catch((err) => {
+				logger.error("Merge summary fire-and-forget failed", {
+					sourceChapterId,
+					targetChapterId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
 	},
 
 	async markMergedResult(
@@ -369,8 +404,9 @@ export const chapterMerge = {
 		targetChapterId: string,
 		strategy: string,
 		commitSha?: string,
+		userId?: string,
 	): Promise<AiResolveResult> {
-		await this.markMerged(sourceChapterId, targetChapterId, strategy, commitSha);
+		await this.markMerged(sourceChapterId, targetChapterId, strategy, commitSha, userId);
 		return { resolved: true, mergeResult: { success: true, commitSha } };
 	},
 

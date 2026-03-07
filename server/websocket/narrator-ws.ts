@@ -209,6 +209,13 @@ export type NarratorServerMessage =
 			narratorId: string;
 			chapterId: string;
 			containerStatus: string | null;
+	  }
+	| {
+			type: "merge_summary";
+			narratorId: string;
+			sourceChapterId: string;
+			targetChapterId: string;
+			summary: string;
 	  };
 
 // Client → Server messages
@@ -496,6 +503,17 @@ eventBus.on("container:log", (event) => {
 
 eventBus.on("container:error", (event) => {
 	broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
+});
+
+// Merge summary — broadcast to subscribers of the target chapter's narrator
+eventBus.on("chapter:merge_summary", (event) => {
+	broadcastToNarrator(event.narratorId, {
+		type: "merge_summary",
+		narratorId: event.narratorId,
+		sourceChapterId: event.sourceId,
+		targetChapterId: event.targetId,
+		summary: event.summary,
+	});
 });
 
 // === WebSocket handlers ===

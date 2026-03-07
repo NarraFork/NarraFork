@@ -4,7 +4,13 @@ import { userPreferences } from "../db/schema";
 import { IS_WINDOWS } from "./platform";
 
 export type Locale = "en" | "zh-CN";
-export type PromptKey = "title" | "quickTitle" | "compact" | "compactSuffix" | "conflictResolution";
+export type PromptKey =
+	| "title"
+	| "quickTitle"
+	| "compact"
+	| "compactSuffix"
+	| "conflictResolution"
+	| "mergeSummary";
 export type SubagentType = "explore" | "plan" | "general";
 
 /** Platform-aware shell label used in prompts shown to the AI model. */
@@ -123,6 +129,24 @@ Do NOT run git add or git commit — just resolve the conflicts in the files.`,
 3. 确保解决后的代码可以编译且逻辑正确
 
 不要运行 git add 或 git commit —— 只需解决文件中的冲突。`,
+	},
+	mergeSummary: {
+		en: `You are a merge summary generator. Given the commit history of a branch that was just merged, produce a concise summary describing what the branch accomplished. This summary will be injected into the parent branch's narrator context so it can be aware of the merged work.
+
+Focus on:
+- What features, fixes, or changes were implemented
+- Key files and modules affected
+- Any notable technical decisions
+
+Keep it under 300 words. Be factual and specific. Output ONLY the summary text.`,
+		"zh-CN": `你是一个合并摘要生成器。根据刚刚合并的分支的提交历史，生成一个简洁的摘要，描述该分支完成了什么工作。此摘要将注入到父分支的叙述者上下文中，使其感知到已合并的工作内容。
+
+重点关注：
+- 实现了哪些功能、修复或变更
+- 涉及的关键文件和模块
+- 任何值得注意的技术决策
+
+控制在 300 字以内。保持客观和具体。只输出摘要文本。`,
 	},
 };
 
