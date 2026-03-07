@@ -64,23 +64,34 @@ export const bashTool: ToolDefinition = {
 		try {
 			const shellInfo = detectShell();
 			const env = { ...process.env, HOME: getHome(), ...shellInfo.extraEnv };
+			const isWin = process.platform === "win32";
 
 			// On Windows with Git Bash we must use login-shell mode so that
 			// /etc/profile is sourced and PATH is properly converted from
 			// Windows format to POSIX format.  Without this, tools like node,
 			// npm, git etc. are invisible to the spawned bash process.
+			//
+			// `detached` is only useful on Unix (creates a new process group for
+			// clean tree-kill via negative PID).  On Windows it creates a new
+			// console window and can break stdio pipes, so we skip it.
 			let spawnArgs: [string, string[], object];
 			if (shellInfo.loginWrap) {
 				spawnArgs = [
 					shellInfo.path,
 					["--login", "-c", command],
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
 				];
 			} else {
 				spawnArgs = [
 					command,
 					[],
-					{ shell: shellInfo.path, cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+					{
+						shell: shellInfo.path,
+						cwd,
+						env,
+						stdio: ["ignore", "pipe", "pipe"],
+						detached: !isWin,
+					},
 				];
 			}
 
