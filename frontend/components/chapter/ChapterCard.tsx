@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
-import { CHAPTER_STATUS_COLORS } from "../../lib/constants";
+import { CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
 
 interface ChapterCardProps {
 	chapter: {
@@ -18,6 +18,7 @@ interface ChapterCardProps {
 
 export function ChapterCard({ chapter }: ChapterCardProps) {
 	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 	const qc = useQueryClient();
 
 	const dormant = useMutation({
@@ -47,7 +48,7 @@ export function ChapterCard({ chapter }: ChapterCardProps) {
 				<Group justify="space-between" mb="xs">
 					<Text fw={500}>{chapter.title}</Text>
 					<Badge size="sm" color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>
-						{chapter.status}
+						{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
 					</Badge>
 				</Group>
 				<Code>{chapter.branch}</Code>

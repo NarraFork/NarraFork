@@ -1,3 +1,4 @@
+import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	Badge,
 	Button,
@@ -89,8 +90,8 @@ function ProjectListPage() {
 						>
 							<Group justify="space-between" mb="xs">
 								<Text fw={500}>{project.name}</Text>
-								<Badge color={project.status === "active" ? "green" : "gray"}>
-									{project.status}
+								<Badge color={statusRegistry.projectStatus(project.status).color}>
+									{tc(statusRegistry.projectStatus(project.status).i18nKey)}
 								</Badge>
 							</Group>
 							{project.description && (

@@ -10,6 +10,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	Avatar,
 	Box,
@@ -42,19 +43,7 @@ import { api } from "../../lib/api";
 import { triggerNotification } from "../../lib/notification";
 import { UserAvatar } from "../UserAvatar";
 
-const STATUS_COLORS: Record<string, string> = {
-	done: "var(--mantine-color-green-6)",
-	thinking: "var(--mantine-color-blue-6)",
-	waiting: "var(--mantine-color-orange-6)",
-};
-
-const CONTAINER_STATUS_COLORS: Record<string, string> = {
-	running: "var(--mantine-color-green-6)",
-	paused: "var(--mantine-color-yellow-6)",
-	stopped: "var(--mantine-color-red-6)",
-	created: "var(--mantine-color-gray-6)",
-	removed: "var(--mantine-color-gray-6)",
-};
+const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
 
 const CONTAINER_STATUS_I18N: Record<string, string> = {
 	running: "containerRunning",
@@ -367,7 +356,9 @@ function SortableTabItem({
 			: tab.type === "chapter" && tab.narratorId
 				? `/narrators/${tab.narratorId}`
 				: `/narrators/${tab.id}`;
-	const iconColor = STATUS_COLORS[tab.status ?? ""];
+	const iconColor = tab.status
+		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		: undefined;
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tabSortId(tab),
@@ -556,10 +547,7 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 				>
 					<IconBox
 						size={12}
-						color={
-							CONTAINER_STATUS_COLORS[tab.containerStatus as string] ??
-							"var(--mantine-color-gray-6)"
-						}
+						color={mantineVar(statusRegistry.containerStatus(tab.containerStatus as string).color)}
 					/>
 				</Tooltip>
 			)}

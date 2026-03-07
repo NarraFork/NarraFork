@@ -1,41 +1,12 @@
-export const CHAPTER_STATUS_COLORS: Record<string, string> = {
-	active: "green",
-	dormant: "yellow",
-	merged: "blue",
-	abandoned: "gray",
-	frozen: "cyan",
-};
-
-export const CHAPTER_ROLE_ICONS: Record<string, string> = {
-	trunk: "🏠",
-	branch: "",
-	exploration: "🔬",
-};
-
-export const EDGE_TYPE_COLORS: Record<string, string> = {
-	fork: "#4c6ef5",
-	merge: "#40c057",
-	dependency: "#fd7e14",
-	cherry_pick: "#7950f2",
-};
-
-export const NARRATOR_STATUS_COLORS: Record<string, string> = {
-	idle: "gray",
-	thinking: "blue",
-	waiting: "yellow",
-	done: "green",
-	archived: "dark",
-	error: "red",
-	interrupted: "orange",
-};
-
-export const CONTAINER_STATUS_COLORS: Record<string, string> = {
-	created: "gray",
-	running: "green",
-	paused: "yellow",
-	stopped: "red",
-	removed: "gray",
-};
+export {
+	CHAPTER_ROLE_ICONS,
+	CHAPTER_STATUS_COLORS,
+	CONTAINER_STATUS_COLORS,
+	EDGE_TYPE_COLORS,
+	NARRATOR_STATUS_COLORS,
+	statusRegistry,
+	TOOL_CALL_STATUS_COLORS,
+} from "./status-registry";
 
 export type ModelOption = {
 	value: string;

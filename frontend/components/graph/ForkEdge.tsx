@@ -1,3 +1,4 @@
+import { statusRegistry } from "@frontend/lib/status-registry";
 import { type EdgeProps, getBezierPath } from "@xyflow/react";
 
 export function ForkEdge({
@@ -23,7 +24,7 @@ export function ForkEdge({
 	return (
 		<path
 			id={id}
-			style={{ ...style, strokeWidth: 2, stroke: "#4c6ef5" }}
+			style={{ ...style, strokeWidth: 2, stroke: statusRegistry.edgeType("fork").color }}
 			className="react-flow__edge-path"
 			d={edgePath}
 			markerEnd={markerEnd}
