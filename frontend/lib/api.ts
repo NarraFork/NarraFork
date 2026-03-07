@@ -695,7 +695,9 @@ export const api = {
 			allReady: boolean;
 		}>(`/chapters/container-setup${refresh ? "?refresh=true" : ""}`),
 	getPodmanStatus: () =>
-		request<{ installed: boolean; version?: string; platform: string }>("/chapters/podman/status"),
+		request<{ installed: boolean; version?: string; platform: string; supported: boolean }>(
+			"/chapters/podman/status",
+		),
 	installPodman: () =>
 		request<{ ok: boolean; installed?: boolean; version?: string; error?: string }>(
 			"/chapters/podman/install",

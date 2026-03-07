@@ -40,6 +40,13 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 			<Stack gap="md">
 				{isLoading ? (
 					<Loader size="sm" />
+				) : status?.supported === false ? (
+					<Group gap="xs">
+						<ThemeIcon color="gray" size="sm" variant="light">
+							<IconX size={14} />
+						</ThemeIcon>
+						<Text size="sm">{t("podman.unsupportedPlatform")}</Text>
+					</Group>
 				) : status?.installed ? (
 					<Group gap="xs">
 						<ThemeIcon color="green" size="sm" variant="light">
@@ -83,7 +90,7 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 				)}
 
 				<Group justify="flex-end">
-					{!status?.installed && (
+					{!status?.installed && status?.supported !== false && (
 						<Button
 							onClick={() => install.mutate()}
 							loading={install.isPending}
