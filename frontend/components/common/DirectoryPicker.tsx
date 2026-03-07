@@ -2,6 +2,7 @@ import {
 	ActionIcon,
 	Breadcrumbs,
 	Button,
+	Divider,
 	Group,
 	Loader,
 	Modal,
@@ -176,25 +177,25 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 				)}
 				{data && (
 					<Stack gap={2}>
-						{/* Drive letters (Windows) — show at drive root */}
-						{isAtDriveRoot &&
-							data.drives?.map((drive) => (
-								<UnstyledButton
-									key={drive.path}
-									onClick={() => navigateTo(drive.path)}
-									px="sm"
-									py={6}
-									style={{ borderRadius: 4 }}
-									className="dir-entry"
-								>
-									<Group gap="xs" wrap="nowrap">
-										<IconDeviceDesktop size={18} style={{ flexShrink: 0 }} />
-										<Text size="sm" truncate>
+						{/* Drive letters (Windows) — horizontal row, always visible when drives exist */}
+						{hasDrives && (
+							<>
+								<Group gap="xs" px="sm" py={4} wrap="wrap">
+									{data.drives?.map((drive) => (
+										<Button
+											key={drive.path}
+											variant={data.path?.startsWith(drive.path) ? "light" : "subtle"}
+											size="compact-sm"
+											leftSection={<IconDeviceDesktop size={14} />}
+											onClick={() => navigateTo(drive.path)}
+										>
 											{drive.name}
-										</Text>
-									</Group>
-								</UnstyledButton>
-							))}
+										</Button>
+									))}
+								</Group>
+								<Divider />
+							</>
+						)}
 						{/* Subdirectories */}
 						{data.entries.map((entry) => (
 							<UnstyledButton
@@ -213,7 +214,7 @@ function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserP
 								</Group>
 							</UnstyledButton>
 						))}
-						{!isAtDriveRoot && !data.entries.length && (
+						{data.path && !data.entries.length && (
 							<Text c="dimmed" size="sm" ta="center" mt="xl">
 								{t("emptyDirectory")}
 							</Text>
