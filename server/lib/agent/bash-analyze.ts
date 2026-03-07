@@ -1874,7 +1874,7 @@ const PS_CATASTROPHIC_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
  */
 export function analyzePowerShellCommand(
 	command: string,
-	cwd: string,
+	_cwd: string,
 	isChapter = false,
 ): BashAnalysis {
 	const commands: BashAnalysis["commands"] = [];
@@ -1983,9 +1983,7 @@ export function analyzePowerShellCommand(
 
 	// Pipe-to-shell 检测（PowerShell 版本）
 	if (/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i.test(command)) {
-		const match = command.match(
-			/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i,
-		);
+		const match = command.match(/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i);
 		if (match) {
 			dangerousPatterns.push(`pipe to ${match[1]}`);
 			if (!nonWhitelisted.includes(match[1])) nonWhitelisted.push(match[1]);
@@ -1993,8 +1991,9 @@ export function analyzePowerShellCommand(
 	}
 
 	// 环境变量注入检测（PowerShell 版本）
-	const hasEnvInjection =
-		/\$env:(LD_PRELOAD|NODE_OPTIONS|BASH_ENV|PROMPT_COMMAND)\b/i.test(command);
+	const hasEnvInjection = /\$env:(LD_PRELOAD|NODE_OPTIONS|BASH_ENV|PROMPT_COMMAND)\b/i.test(
+		command,
+	);
 	if (hasEnvInjection && nonWhitelisted.length === 0) {
 		nonWhitelisted.push("(env injection)");
 	}
@@ -2006,9 +2005,7 @@ export function analyzePowerShellCommand(
 		commands,
 		filePaths,
 		allWhitelisted:
-			nonWhitelisted.length === 0 &&
-			dangerousPatterns.length === 0 &&
-			!hasEnvInjection,
+			nonWhitelisted.length === 0 && dangerousPatterns.length === 0 && !hasEnvInjection,
 		nonWhitelisted,
 		dangerousPatterns,
 		hasEnvInjection,

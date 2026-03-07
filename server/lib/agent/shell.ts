@@ -298,7 +298,6 @@ function isWslBash(bashPath: string): boolean {
 	return lower.includes("/system32/") || lower.includes("/syswow64/");
 }
 
-
 /** Check whether a shell path points to PowerShell (pwsh or powershell.exe). */
 export function isPowerShell(shellPath: string): boolean {
 	const lower = path.basename(shellPath).toLowerCase();
