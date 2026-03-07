@@ -63,8 +63,22 @@ export const bashTool: ToolDefinition = {
 
 		try {
 			const shellInfo = detectShell();
-			const env = { ...process.env, HOME: getHome(), ...shellInfo.extraEnv };
 			const isWin = process.platform === "win32";
+
+			// Build env: spread process.env then apply overrides.
+			// On Windows, the PATH variable is typically named "Path" (title-case).
+			// When we spread process.env into a plain object the case-insensitive
+			// proxy is lost, so bash (which expects uppercase "PATH") won't see it.
+			// Fix: always set an uppercase PATH from the original process.env.PATH
+			// (the proxy handles case-insensitive lookup).
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				HOME: getHome(),
+				...shellInfo.extraEnv,
+			};
+			if (isWin && !env.PATH && process.env.PATH) {
+				env.PATH = process.env.PATH;
+			}
 
 			// On Windows with Git Bash we must use login-shell mode so that
 			// /etc/profile is sourced and PATH is properly converted from
