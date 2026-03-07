@@ -7,6 +7,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
@@ -173,7 +174,19 @@ export const chapterCleanup = {
 				throw dbErr;
 			}
 
-			// Step 3: Restore containers (non-fatal — chapter is already usable)
+			// Step 3: Remove merge edges when waking a merged chapter
+			if (chapter.status === "merged") {
+				try {
+					await chapterEdgeService.deleteMergeEdgesBySource(chapterId);
+				} catch (err) {
+					logger.warn("Failed to remove merge edges during wake", {
+						chapterId,
+						error: String(err),
+					});
+				}
+			}
+
+			// Step 4: Restore containers (non-fatal — chapter is already usable)
 			if (chapter.containerConfig) {
 				try {
 					await containerService.unpauseChapterContainers(chapterId);

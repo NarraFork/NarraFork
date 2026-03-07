@@ -116,7 +116,7 @@ function assignAdaptiveHandles(
 	return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
 }
 
-function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): GraphEdge[] {
+export function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): GraphEdge[] {
 	const nodeMap = new Map<string, GraphNode>();
 	for (const node of nodes) {
 		nodeMap.set(node.id, node);
@@ -178,10 +178,9 @@ export function useStoryGraph(projectId: string) {
 				explorationGroups: [] as ExplorationGroup[],
 			};
 		const layoutNodes = applyDagreLayout(data.nodes as GraphNode[], data.edges as GraphEdge[]);
-		const layoutEdges = assignEdgeHandles(layoutNodes, data.edges as GraphEdge[]);
 		return {
 			nodes: layoutNodes,
-			edges: layoutEdges,
+			edges: data.edges as GraphEdge[],
 			explorationGroups: (data.explorationGroups ?? []) as ExplorationGroup[],
 		};
 	}, [data]);
