@@ -134,14 +134,28 @@ function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): GraphEdge[] 
 		}
 
 		if (edgeType === "merge") {
-			const dx = targetNode.position.x - sourceNode.position.x;
-			if (dx > 0) {
-				return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
-			}
-			if (dx < 0) {
+			// source = branch being merged, target = merge destination (trunk/root)
+			// Connect from the side of the branch facing the root,
+			// into the side of the root facing the branch.
+			const dx = sourceNode.position.x - targetNode.position.x;
+			const dy = sourceNode.position.y - targetNode.position.y;
+			const absDx = Math.abs(dx);
+			const absDy = Math.abs(dy);
+
+			if (absDx >= absDy) {
+				if (dx < 0) {
+					// Branch is left of root → branch right side → root left side
+					return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
+				}
+				// Branch is right of root → branch left side → root right side
 				return { ...edge, sourceHandle: "left-src", targetHandle: "right" };
 			}
-			return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
+			if (dy < 0) {
+				// Branch is above root → branch bottom → root top
+				return { ...edge, sourceHandle: "bottom-src", targetHandle: "top" };
+			}
+			// Branch is below root → branch top → root bottom
+			return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
 		}
 
 		return assignAdaptiveHandles(edge, sourceNode, targetNode);
