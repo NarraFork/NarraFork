@@ -21,6 +21,7 @@ import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMer
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
 import { StoryNetwork } from "../../components/graph/StoryNetwork";
 import { ProjectCommandsModal } from "../../components/project/ProjectCommandsModal";
+import { ProjectRoutinesModal } from "../../components/project/ProjectRoutinesModal";
 import { ProjectSettingsModal } from "../../components/project/ProjectSettingsModal";
 import { ProjectSkillsModal } from "../../components/project/ProjectSkillsModal";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
@@ -44,6 +45,7 @@ function ProjectDetailPage() {
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [commandsOpened, { open: openCommands, close: closeCommands }] = useDisclosure(false);
 	const [skillsOpened, { open: openSkills, close: closeSkills }] = useDisclosure(false);
+	const [routinesOpened, { open: openRoutines, close: closeRoutines }] = useDisclosure(false);
 	const [settingsOpened, { open: openSettings, close: closeSettings }] = useDisclosure(false);
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
@@ -140,6 +142,9 @@ function ProjectDetailPage() {
 					<Button variant="light" size="xs" onClick={openSkills}>
 						{tp("skillsButton")}
 					</Button>
+					<Button variant="light" size="xs" onClick={openRoutines}>
+						{tp("routinesButton")}
+					</Button>
 					<Button variant="light" size="xs" onClick={openSettings}>
 						{tp("settingsButton")}
 					</Button>
@@ -190,6 +195,7 @@ function ProjectDetailPage() {
 			/>
 			<ProjectCommandsModal projectId={projectId} opened={commandsOpened} onClose={closeCommands} />
 			<ProjectSkillsModal projectId={projectId} opened={skillsOpened} onClose={closeSkills} />
+			<ProjectRoutinesModal projectId={projectId} opened={routinesOpened} onClose={closeRoutines} />
 			<ProjectSettingsModal
 				projectId={projectId}
 				proxyDomain={project.proxyDomain ?? null}

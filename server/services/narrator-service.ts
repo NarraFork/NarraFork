@@ -14,6 +14,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { resolveProvider, settings } from "../lib/settings";
 import { deleteNarratorUploads } from "../lib/uploads";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 /**
  * For child messages belonging to subagent narrators, attach the subagent's
@@ -317,7 +318,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			input.reasoningEffort === undefined
-				? resolvedProvider === "codex"
+				? resolvedProvider === "codex" || resolvedProvider === "openai"
 					? (settings.codex?.defaultReasoningEffort ?? null)
 					: null
 				: input.reasoningEffort;
@@ -365,7 +366,9 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??
-			(resolvedProvider === "codex" ? (settings.codex?.defaultReasoningEffort ?? null) : null);
+			(resolvedProvider === "codex" || resolvedProvider === "openai"
+				? (settings.codex?.defaultReasoningEffort ?? null)
+				: null);
 
 		const [narrator] = await db
 			.insert(narrators)
@@ -440,7 +443,9 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			original.reasoningEffort ??
-			(resolvedProvider === "codex" ? (settings.codex?.defaultReasoningEffort ?? null) : null);
+			(resolvedProvider === "codex" || resolvedProvider === "openai"
+				? (settings.codex?.defaultReasoningEffort ?? null)
+				: null);
 
 		const narrator = await db.transaction(async (tx) => {
 			const [created] = await tx
@@ -2181,6 +2186,14 @@ export const narratorService = {
 			.where(eq(narrators.id, narratorId));
 	},
 
+	async updatePruneEnabled(narratorId: string, pruneEnabled: boolean) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ pruneEnabled, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
 	async updateStatus(
 		narratorId: string,
 		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
@@ -2204,6 +2217,20 @@ export const narratorService = {
 					}
 				: { type: "narrator:status_changed", narratorId, status },
 		);
+
+		// Direct WS broadcast (canonical push path)
+		if (status === "error") {
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: normalizedErrorMessage ?? "Unknown error",
+			});
+		}
+		broadcastToNarrator(narratorId, {
+			type: "status_change",
+			narratorId,
+			status,
+		});
 	},
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -2430,7 +2457,9 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??
-			(resolvedProvider === "codex" ? (settings.codex?.defaultReasoningEffort ?? null) : null);
+			(resolvedProvider === "codex" || resolvedProvider === "openai"
+				? (settings.codex?.defaultReasoningEffort ?? null)
+				: null);
 
 		const newNarrator = await db.transaction(async (tx) => {
 			const [created] = await tx
@@ -2523,6 +2552,11 @@ export const narratorService = {
 		});
 
 		eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
+		broadcastToNarrator(parentNarratorId, {
+			type: "narrator_forked",
+			narratorId: id,
+			parentNarratorId,
+		});
 		logger.info("Narrator forked", { parentNarratorId, newNarratorId: id, forkMessageUuid });
 		return newNarrator;
 	},
@@ -2549,8 +2583,11 @@ export const narratorService = {
 
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { pruneBoundaryMessageId: true },
+			columns: { pruneBoundaryMessageId: true, pruneEnabled: true },
 		});
+
+		// If pruning is disabled for this narrator, skip entirely.
+		if (narrator && !narrator.pruneEnabled) return null;
 
 		if (contextPct < PRUNE_START) {
 			if (narrator?.pruneBoundaryMessageId) {

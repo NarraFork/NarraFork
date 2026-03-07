@@ -100,27 +100,36 @@ export function useRecentTabs() {
 
 	// --- Clear tabs by scope (optimistic) ---
 	const clearMutation = useMutation({
-		mutationFn: (scope: "all" | "projects" | "inactive_narrators") => api.clearRecentTabs(scope),
-		onMutate: async (scope) => {
+		mutationFn: ({
+			scope,
+			keepTabKey,
+		}: {
+			scope: "all" | "projects" | "inactive_narrators";
+			keepTabKey?: string;
+		}) => api.clearRecentTabs(scope, keepTabKey),
+		onMutate: async ({ scope, keepTabKey }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			const isKept = (t: RecentTab) => (keepTabKey ? `${t.type}:${t.id}` === keepTabKey : false);
 			if (scope === "all") {
-				for (const tab of prev) evictTabCache(qc, tab);
-				qc.setQueryData(RECENT_TABS_QUERY_KEY, []);
+				for (const tab of prev) {
+					if (!isKept(tab)) evictTabCache(qc, tab);
+				}
+				qc.setQueryData(RECENT_TABS_QUERY_KEY, keepTabKey ? prev.filter(isKept) : []);
 			} else if (scope === "projects") {
 				for (const tab of prev) {
-					if (tab.type === "project") evictTabCache(qc, tab);
+					if (tab.type === "project" && !isKept(tab)) evictTabCache(qc, tab);
 				}
 				qc.setQueryData(
 					RECENT_TABS_QUERY_KEY,
-					prev.filter((t) => t.type !== "project"),
+					prev.filter((t) => t.type !== "project" || isKept(t)),
 				);
 			} else {
-				// inactive_narrators — keep projects + active tabs
+				// inactive_narrators — keep projects + active tabs + kept tab
 				const ACTIVE = new Set(["thinking", "waiting", "done"]);
 				const kept: RecentTab[] = [];
 				for (const tab of prev) {
-					if (tab.type === "project" || ACTIVE.has(tab.status ?? "")) {
+					if (isKept(tab) || tab.type === "project" || ACTIVE.has(tab.status ?? "")) {
 						kept.push(tab);
 					} else {
 						evictTabCache(qc, tab);
@@ -147,7 +156,8 @@ export function useRecentTabs() {
 			[moveMutation],
 		),
 		clearTabs: useCallback(
-			(scope: "all" | "projects" | "inactive_narrators") => clearMutation.mutate(scope),
+			(scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
+				clearMutation.mutate({ scope, keepTabKey }),
 			[clearMutation],
 		),
 	};

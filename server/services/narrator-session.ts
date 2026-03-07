@@ -1685,7 +1685,9 @@ async function runAgentLoop(
 
 			const resolvedReasoningEffort =
 				freshNarrator.reasoningEffort ??
-				(resolved.provider === "codex" ? settings.codex?.defaultReasoningEffort : undefined);
+				(resolved.provider === "codex" || resolved.provider === "openai"
+					? settings.codex?.defaultReasoningEffort
+					: undefined);
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,

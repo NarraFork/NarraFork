@@ -111,6 +111,8 @@
 	"selectDrive": "选择磁盘",
 	"computer": "此电脑",
 	"cancel": "取消",
+	"version": "版本",
+	"versionWithNumber": "v{{version}}",
 	"status": {
 		"chapterActive": "活跃",
 		"chapterDormant": "休眠",

@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS chapters (
 	pinned INTEGER DEFAULT 0,
 	position_x REAL,
 	position_y REAL,
+	panel_expanded INTEGER DEFAULT 0,
+	panel_width REAL,
+	panel_height REAL,
 	last_accessed_at TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
@@ -110,6 +113,7 @@ CREATE TABLE IF NOT EXISTS narrators (
 	todos_tool_use_id TEXT,
 	prune_boundary_message_id TEXT REFERENCES narrator_messages(id),
 	pruned_percent INTEGER,
+	prune_enabled INTEGER NOT NULL DEFAULT 1,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );

@@ -6,6 +6,8 @@
 	"narratorCount": "{{count}} 个叙述者",
 	"containers": "容器",
 	"root": "根目录",
+	"expandNarrator": "展开对话",
+	"collapseNarrator": "收起对话",
 	"contextMenu": {
 		"fork": "分叉",
 		"setRole": "设置角色",

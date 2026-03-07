@@ -26,7 +26,7 @@ const DEFAULTS = {
 	wordWrapDiff: true,
 	replyInUserLanguage: true,
 	showTokenUsage: false,
-	showOutputStats: false,
+	showOutputStats: true,
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	recentTabs: "[]",
@@ -458,15 +458,41 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 	const parsed = clearRecentTabsSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const { scope } = parsed.data;
+	const { scope, keepTabKey } = parsed.data;
 	const now = new Date().toISOString();
 
+	// Helper: check if a tab matches the keepTabKey
+	const isKept = (t: Record<string, unknown>) =>
+		keepTabKey ? `${t.type}:${t.id}` === keepTabKey : false;
+
 	if (scope === "all") {
+		if (keepTabKey) {
+			// Keep the single tab that matches keepTabKey
+			let kept: Record<string, unknown>[] = [];
+			const pref = await db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+			});
+			if (pref) {
+				try {
+					const tabs: Record<string, unknown>[] = JSON.parse(pref.recentTabs);
+					kept = tabs.filter(isKept);
+				} catch {
+					// corrupted
+				}
+			}
+			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+				JSON.stringify(kept),
+				now,
+				userId,
+			]);
+			const enriched = await broadcastTabsSnapshot(userId, kept);
+			return c.json(enriched);
+		}
 		sqlite.run(`UPDATE user_preferences SET recent_tabs = '[]', updated_at = ? WHERE user_id = ?`, [
 			now,
 			userId,
 		]);
-		broadcastToUser(userId, { type: "user:recent_tabs_snapshot", tabs: [] });
+		broadcastToUser(userId, { type: "user:recent_tabs_snapshot", tabs: [], revision: Date.now() });
 		return c.json([]);
 	}
 
@@ -494,7 +520,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 		const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done"]);
 
 		if (scope === "projects") {
-			filtered = tabs.filter((t) => t.type !== "project");
+			filtered = tabs.filter((t) => t.type !== "project" || isKept(t));
 		} else {
 			// inactive_narrators: keep projects + active narrator/chapter tabs
 			// Need live status from DB for accurate filtering
@@ -513,6 +539,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 			}
 
 			filtered = tabs.filter((t) => {
+				if (isKept(t)) return true;
 				if (t.type === "project") return true;
 				const nId = t.type === "narrator" ? (t.id as string) : (t.narratorId as string);
 				const status = nId ? statusMap.get(nId) : undefined;

@@ -3,7 +3,7 @@ import { and, count as countFn, eq } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, terminals } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
-import { eventBus, type NarraForkEvent } from "../lib/event-bus";
+import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
@@ -86,8 +86,8 @@ export type NarratorServerMessage =
 			usage: number;
 			isSubagent?: boolean;
 	  }
-	// Narrator fork events forwarded via eventBus.onAny
-	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
+	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
+	| { type: "narrator_error"; narratorId: string; error: string }
 	| {
 			type: "tool_started";
 			narratorId: string;
@@ -333,63 +333,6 @@ export function getNarratorConnections(): Set<NarratorWS> {
 
 // === Event bus → WebSocket broadcast ===
 
-/**
- * Events that are already pushed to WS clients via broadcastToNarrator()
- * in narrator-session.ts / narrator-title.ts. Forwarding them again from
- * the event bus would cause duplicate delivery.
- */
-const ALREADY_BROADCAST_EVENTS = new Set([
-	"narrator:message",
-	"narrator:permission_request",
-	"narrator:title_updated",
-	"narrator:subagent_started",
-	"narrator:subagent_completed",
-	"narrator:background_task_started",
-	"narrator:background_task_completed",
-	"narrator:background_task_failed",
-	"narrator:background_task_cancelled",
-	"terminal:created",
-	"terminal:exited",
-	"container:started",
-	"container:stopped",
-	"container:paused",
-	"container:resumed",
-]);
-
-function shouldForwardEvent(event: NarraForkEvent): boolean {
-	if (ALREADY_BROADCAST_EVENTS.has(event.type)) return false;
-	return (
-		event.type.startsWith("narrator:") ||
-		event.type.startsWith("chapter:") ||
-		event.type.startsWith("merge:") ||
-		event.type.startsWith("container:") ||
-		event.type.startsWith("user:")
-	);
-}
-
-function eventToNarratorId(event: NarraForkEvent): string | null {
-	if ("narratorId" in event) return event.narratorId;
-	return null;
-}
-
-eventBus.onAny((event) => {
-	if (!shouldForwardEvent(event)) return;
-
-	const narratorId = eventToNarratorId(event);
-
-	for (const ws of connections) {
-		// If event has a narratorId, only send to subscribers of that narrator
-		// Otherwise (chapter/merge events), broadcast to all narrator WS clients
-		if (narratorId && !ws.data.subscribedNarrators.has(narratorId)) continue;
-
-		try {
-			ws.send(JSON.stringify(event));
-		} catch {
-			connections.delete(ws);
-		}
-	}
-});
-
 // === Public API for services to push messages directly ===
 
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
@@ -412,6 +355,18 @@ export function broadcastToUser(userId: string, data: unknown): void {
 		if (ws.data.userId !== userId) continue;
 		try {
 			ws.send(msg);
+		} catch {
+			connections.delete(ws);
+		}
+	}
+}
+
+/** Broadcast a message to ALL narrator WS connections (not filtered by subscription). */
+export function broadcastToAll(message: Record<string, unknown>): void {
+	const payload = JSON.stringify(message);
+	for (const ws of connections) {
+		try {
+			ws.send(payload);
 		} catch {
 			connections.delete(ws);
 		}
@@ -513,18 +468,34 @@ function debouncedContainerStatus(chapterId: string) {
 
 eventBus.on("container:started", (event) => {
 	debouncedContainerStatus(event.chapterId);
+	broadcastToAll({ type: "container:started", chapterId: event.chapterId });
 });
 
 eventBus.on("container:stopped", (event) => {
 	debouncedContainerStatus(event.chapterId);
+	broadcastToAll({ type: "container:stopped", chapterId: event.chapterId });
 });
 
 eventBus.on("container:paused", (event) => {
 	debouncedContainerStatus(event.chapterId);
+	broadcastToAll({ type: "container:paused", chapterId: event.chapterId });
 });
 
 eventBus.on("container:resumed", (event) => {
 	debouncedContainerStatus(event.chapterId);
+	broadcastToAll({ type: "container:resumed", chapterId: event.chapterId });
+});
+
+eventBus.on("container:starting", (event) => {
+	broadcastToAll({ type: "container:starting", chapterId: event.chapterId });
+});
+
+eventBus.on("container:log", (event) => {
+	broadcastToAll({ type: "container:log", chapterId: event.chapterId, line: event.line });
+});
+
+eventBus.on("container:error", (event) => {
+	broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
 });
 
 // === WebSocket handlers ===

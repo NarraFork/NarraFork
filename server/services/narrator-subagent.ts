@@ -284,7 +284,9 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			signal,
 			reasoningEffort:
 				narratorReasoningEffort ??
-				(resolveProvider(model) === "codex" ? settings.codex?.defaultReasoningEffort : undefined),
+				(resolvedProvider === "codex" || resolvedProvider === "openai"
+					? settings.codex?.defaultReasoningEffort
+					: undefined),
 			toolFilter: TOOL_FILTERS[subagentType],
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(

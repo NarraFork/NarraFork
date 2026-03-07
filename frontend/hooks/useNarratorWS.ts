@@ -217,7 +217,6 @@ export function useNarratorWS(
 							callbacksRef.current.onStreamEvent?.(data);
 							break;
 						case "permission_request":
-						case "narrator:permission_request":
 							if (data.request) {
 								callbacksRef.current.onPermissionRequest?.(data.request);
 							}
@@ -230,7 +229,6 @@ export function useNarratorWS(
 							);
 							break;
 						case "status_change":
-						case "narrator:status_changed":
 							callbacksRef.current.onStatusChange?.(data.status);
 							break;
 						case "tool_started":
@@ -263,7 +261,6 @@ export function useNarratorWS(
 							callbacksRef.current.onTodosUpdated?.(data.todos, data.toolUseId);
 							break;
 						case "title_updated":
-						case "narrator:title_updated":
 							callbacksRef.current.onTitleUpdated?.(data.title);
 							break;
 						case "buffer_set":
@@ -335,10 +332,10 @@ export function useNarratorWS(
 								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
 							}
 							break;
-						case "narrator:error":
+						case "narrator_error":
 							callbacksRef.current.onNarratorError?.(data.error);
 							break;
-						case "narrator:warning":
+						case "warning":
 							callbacksRef.current.onNarratorWarning?.(data.message);
 							break;
 						case "catch_up": {
@@ -589,9 +586,9 @@ export function useNarratorsListWS(
 						return;
 					}
 					const nId = data.narratorId;
-					if (data.type === "status_change" || data.type === "narrator:status_changed") {
+					if (data.type === "status_change") {
 						onUpdateRef.current(nId, { type: "status", status: data.status });
-					} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
+					} else if (data.type === "title_updated") {
 						onUpdateRef.current(nId, { type: "title", title: data.title });
 					} else if (data.type === "permission_mode_changed") {
 						onUpdateRef.current(nId, {

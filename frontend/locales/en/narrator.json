@@ -106,6 +106,8 @@
 	"planDeniedToggle": "Show rejected plan",
 	"pruneBoundaryLabel": "↑ Tool call details above are pruned to save context",
 	"prunedPercent": "Pruned: {{percent}}%",
+	"pruneEnabled": "Auto-prune",
+	"pruneEnabledTooltip": "Dynamically prunes the earliest tool call arguments and results to make efficient use of the context window. The trade-off is that pruning invalidates the prompt cache — disable this if cached billing matters to you.",
 	"contextUsagePercent": "Context: {{percent}}%",
 	"contextUsageTokens": "{{tokens}} tokens",
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",

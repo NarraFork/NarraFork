@@ -671,6 +671,18 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Update prune enabled
+narratorRoutes.patch("/:id/prune-enabled", async (c) => {
+	const id = c.req.param("id");
+	const { pruneEnabled } = await c.req.json();
+	if (typeof pruneEnabled !== "boolean") {
+		throw new ValidationError("pruneEnabled must be a boolean");
+	}
+	await narratorService.getById(id);
+	await narratorService.updatePruneEnabled(id, pruneEnabled);
+	return c.json({ ok: true });
+});
+
 // Update narrator title
 narratorRoutes.patch("/:id/title", async (c) => {
 	const id = c.req.param("id");
@@ -730,6 +742,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid, {
 		title: parsed.data.title,
+		inheritMode: parsed.data.inheritMode ?? "full",
 	});
 	return c.json(newNarrator, 201);
 });

@@ -23,6 +23,7 @@ import {
 	IconFolders,
 	IconLogout,
 	IconMessageChatbot,
+	IconMessageReport,
 	IconPlus,
 	IconSearch,
 	IconSettings,
@@ -39,7 +40,7 @@ import {
 	useNavigate,
 	useRouterState,
 } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
@@ -165,6 +166,12 @@ function AuthenticatedLayout() {
 		}
 	}, []);
 
+	// Find the active tab key so clearTabs can preserve it
+	const activeTabKey = useMemo(() => {
+		const active = tabs.find((tab) => isTabActive(tab, pathname));
+		return active ? `${active.type}:${active.id}` : undefined;
+	}, [tabs, pathname]);
+
 	const hasToken = !!getToken();
 
 	// No token → redirect to login (useCurrentUser is disabled, won't fire)
@@ -242,6 +249,18 @@ function AuthenticatedLayout() {
 								</Text>
 							</Tooltip>
 						)}
+						<Tooltip label={t("feedback")} position="bottom" withArrow>
+							<ActionIcon
+								variant="subtle"
+								color="gray"
+								component="a"
+								href="https://github.com/Narrafork/narrafork-issue/issues"
+								target="_blank"
+								rel="noopener noreferrer"
+							>
+								<IconMessageReport size={20} />
+							</ActionIcon>
+						</Tooltip>
 						{/* Desktop: always show search input */}
 						<TextInput
 							placeholder={t("searchPlaceholder")}
@@ -343,7 +362,7 @@ function AuthenticatedLayout() {
 										onClick={(e: React.MouseEvent) => {
 											e.preventDefault();
 											e.stopPropagation();
-											clearTabs("projects");
+											clearTabs("projects", activeTabKey);
 										}}
 										aria-label={t("clearProjects")}
 									>
@@ -405,7 +424,7 @@ function AuthenticatedLayout() {
 											onClick={(e: React.MouseEvent) => {
 												e.preventDefault();
 												e.stopPropagation();
-												clearTabs("inactive_narrators");
+												clearTabs("inactive_narrators", activeTabKey);
 											}}
 											aria-label={t("clearNarrators")}
 										>
@@ -452,6 +471,9 @@ function AuthenticatedLayout() {
 					color="red"
 					variant="subtle"
 				/>
+				<Text size="xs" c="dimmed" ta="center" mt={4}>
+					v{__APP_VERSION__}
+				</Text>
 			</AppShell.Navbar>
 
 			<AppShell.Main>

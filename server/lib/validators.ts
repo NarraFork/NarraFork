@@ -50,6 +50,12 @@ export const updateProjectSchema = z.object({
 		.object({
 			autoCreateNarrator: z.boolean().optional(),
 			commands: z.array(commandSchema).max(100).optional(),
+			routines: z
+				.object({
+					disabledRoutines: z.array(z.string()).optional(),
+					enabledRoutines: z.array(z.string()).optional(),
+				})
+				.optional(),
 		})
 		.optional(),
 });
@@ -240,6 +246,7 @@ export const updateNarratorTitleSchema = z.object({
 export const forkNarratorSchema = z.object({
 	forkMessageUuid: z.string().min(1),
 	title: z.string().min(1).max(200).optional(),
+	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 });
 
 export const updateNarratorModelSchema = z.object({
@@ -341,6 +348,8 @@ export const moveRecentTabSchema = z.object({
 
 export const clearRecentTabsSchema = z.object({
 	scope: z.enum(["all", "projects", "inactive_narrators"]),
+	/** Optional tab key ("type:id") to keep even if it would otherwise be cleared */
+	keepTabKey: z.string().optional(),
 });
 
 // === WebSocket Messages ===
@@ -475,6 +484,9 @@ export const updateGraphPositionsSchema = z.object({
 				chapterId: z.string().min(1),
 				x: z.number().finite(),
 				y: z.number().finite(),
+				panelExpanded: z.boolean().optional(),
+				panelWidth: z.number().finite().optional(),
+				panelHeight: z.number().finite().optional(),
 			}),
 		)
 		.max(500),

@@ -8,37 +8,37 @@ export type NarraForkEvent =
 	| { type: "chapter:created"; chapterId: string; projectId: string }
 	| { type: "chapter:forked"; chapterId: string; parentId: string }
 	| { type: "chapter:merged"; sourceId: string; targetId: string }
-	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] }
+	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] } // TODO: not yet emitted
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
 	| { type: "chapter:abandoned"; chapterId: string }
 	| {
-			type: "chapter:split";
+			type: "chapter:split"; // TODO: not yet emitted
 			prefixChapterId: string;
 			continuationChapterId: string;
 			newForkChapterId: string;
 			commitSha: string;
 	  }
-	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] }
-	| { type: "chapter:frozen"; chapterId: string }
-	| { type: "chapter:role_changed"; chapterId: string; role: string }
+	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] } // TODO: not yet emitted
+	| { type: "chapter:frozen"; chapterId: string } // TODO: not yet emitted
+	| { type: "chapter:role_changed"; chapterId: string; role: string } // TODO: not yet emitted
 	| { type: "chapter:files_changed"; chapterId: string; worktreePath: string }
 	| { type: "chapter:commits_updated"; chapterId: string; newCount: number }
 	// 依赖关系
-	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string }
-	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string }
+	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string } // TODO: not yet emitted
+	| { type: "dependency:removed"; edgeId: string; sourceId: string; targetId: string } // TODO: not yet emitted
 	| {
-			type: "dependency:upstream_updated";
+			type: "dependency:upstream_updated"; // TODO: not yet emitted
 			edgeId: string;
 			targetChapterId: string;
 			newCommitCount: number;
 	  }
-	| { type: "dependency:synced"; edgeId: string; targetChapterId: string; strategy: string }
+	| { type: "dependency:synced"; edgeId: string; targetChapterId: string; strategy: string } // TODO: not yet emitted
 	// 探索组
-	| { type: "exploration:created"; groupId: string; chapterIds: string[] }
-	| { type: "exploration:decided"; groupId: string; decidedChapterId: string }
-	| { type: "exploration:abandoned"; groupId: string }
-	| { type: "exploration:chapter_added"; groupId: string; chapterId: string }
+	| { type: "exploration:created"; groupId: string; chapterIds: string[] } // TODO: not yet emitted
+	| { type: "exploration:decided"; groupId: string; decidedChapterId: string } // TODO: not yet emitted
+	| { type: "exploration:abandoned"; groupId: string } // TODO: not yet emitted
+	| { type: "exploration:chapter_added"; groupId: string; chapterId: string } // TODO: not yet emitted
 	// Batch merge session
 	| {
 			type: "merge:started";

@@ -382,6 +382,11 @@ export const api = {
 			method: "PATCH",
 			body: JSON.stringify({ reasoningEffort }),
 		}),
+	updateNarratorPruneEnabled: (id: string, pruneEnabled: boolean) =>
+		request<{ ok: boolean }>(`/narrators/${id}/prune-enabled`, {
+			method: "PATCH",
+			body: JSON.stringify({ pruneEnabled }),
+		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
 		request<{ summary: string }>(`/narrators/${narratorId}/compact/${messageId}`),
 	sendNarratorMessage: async (narratorId: string, message: string, images?: File[]) => {
@@ -454,10 +459,15 @@ export const api = {
 		}),
 
 	// Narrator Fork (standalone sessions only)
-	forkNarrator: (narratorId: string, forkMessageUuid: string, title?: string) =>
+	forkNarrator: (
+		narratorId: string,
+		forkMessageUuid: string,
+		title?: string,
+		inheritMode?: "full" | "compressed" | "fresh",
+	) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork`, {
 			method: "POST",
-			body: JSON.stringify({ forkMessageUuid, title }),
+			body: JSON.stringify({ forkMessageUuid, title, inheritMode }),
 		}),
 
 	// Terminals
@@ -678,10 +688,10 @@ export const api = {
 			method: "PATCH",
 			body: JSON.stringify({ key, ...target }),
 		}),
-	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators") =>
+	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<ApiEntity[]>("/user-preferences/recent-tabs/clear", {
 			method: "POST",
-			body: JSON.stringify({ scope }),
+			body: JSON.stringify({ scope, keepTabKey }),
 		}),
 
 	// Containers
@@ -791,7 +801,14 @@ export const api = {
 	// === graph positions ===
 	updateGraphPositions: (
 		projectId: string,
-		positions: Array<{ chapterId: string; x: number; y: number }>,
+		positions: Array<{
+			chapterId: string;
+			x: number;
+			y: number;
+			panelExpanded?: boolean;
+			panelWidth?: number;
+			panelHeight?: number;
+		}>,
 	) =>
 		request<{ ok: boolean }>(`/projects/${projectId}/graph/positions`, {
 			method: "PATCH",
@@ -1277,7 +1294,13 @@ export const api = {
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
 
 	// Health / platform
-	health: () => request<{ status: string; platform: "windows" | "macos" | "linux" }>("/health"),
+	health: () =>
+		request<{
+			status: string;
+			version: string;
+			commit: string;
+			platform: "windows" | "macos" | "linux";
+		}>("/health"),
 
 	// Filesystem browsing
 	fsBrowse: (path?: string) =>
@@ -1288,6 +1311,44 @@ export const api = {
 			parent?: string | null;
 			sep: string;
 		}>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+
+	// Routines
+	getRoutines: () =>
+		request<{
+			routines: Array<{
+				id: string;
+				type: "command" | "skill";
+				category: string;
+				name: string;
+				descriptionEn: string;
+				descriptionZh: string;
+				enabled: boolean;
+			}>;
+		}>("/routines"),
+	toggleRoutine: (id: string, enabled: boolean) =>
+		request<{ ok: boolean }>(`/routines/${id}/toggle`, {
+			method: "POST",
+			body: JSON.stringify({ enabled }),
+		}),
+	getProjectRoutines: (projectId: string) =>
+		request<{
+			routines: Array<{
+				id: string;
+				type: "command" | "skill";
+				category: string;
+				name: string;
+				descriptionEn: string;
+				descriptionZh: string;
+				enabled: boolean;
+				override: "global" | "enabled" | "disabled";
+				globalEnabled: boolean;
+			}>;
+		}>(`/routines/project/${projectId}`),
+	toggleProjectRoutine: (projectId: string, id: string, action: "enable" | "disable" | "reset") =>
+		request<{ ok: boolean }>(`/routines/project/${projectId}/${id}/toggle`, {
+			method: "POST",
+			body: JSON.stringify({ action }),
+		}),
 };
 
 	text: string,

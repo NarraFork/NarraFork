@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { COMPACT_CONTEXT_USAGE_PCT, runCustomCompact } from "./narrator-session";
 
@@ -206,6 +207,7 @@ export async function handleTransientError(opts: {
 
 	// Notify frontend
 	eventBus.emit({ type: "narrator:warning", narratorId, message: error });
+	broadcastToNarrator(narratorId, { type: "warning", narratorId, message: error });
 
 	// Abort-aware backoff
 	await abortableSleep(delayMs, signal);

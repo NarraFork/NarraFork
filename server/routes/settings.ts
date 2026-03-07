@@ -117,6 +117,12 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		routines: z
+			.object({
+				disabledRoutines: z.array(z.string()),
+			})
+			.partial()
+			.optional(),
 	})
 	.strict();
 

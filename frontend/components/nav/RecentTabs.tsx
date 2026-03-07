@@ -28,6 +28,7 @@ import {
 	IconFolder,
 	IconGitBranch,
 	IconMessageCircle,
+	IconMessageCircleFilled,
 	IconTerminal2,
 	IconX,
 } from "@tabler/icons-react";
@@ -77,9 +78,13 @@ interface RecentTabsWSProviderProps {
 export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const { tabs } = useRecentTabs();
 	const qc = useQueryClient();
+	const navigate = useNavigate();
+	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { data: userPrefs } = useUserPreferences();
 	const tabsRef = useRef(tabs);
 	tabsRef.current = tabs;
+	const pathnameRef = useRef(pathname);
+	pathnameRef.current = pathname;
 	const userPrefsRef = useRef(userPrefs);
 	userPrefsRef.current = userPrefs;
 	const lastRevisionRef = useRef(0);
@@ -164,6 +169,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				lastRevisionRef.current = revision || Date.now();
 
 				const serverTabs = event.tabs as RecentTab[];
+
+				// If the current page's tab was removed, navigate to dashboard
+				const currentPath = pathnameRef.current;
+				const currentTabStillExists = serverTabs.some((t) => isTabActive(t, currentPath));
+				const wasInTab = tabsRef.current.some((t) => isTabActive(t, currentPath));
+				if (wasInTab && !currentTabStillExists) {
+					navigate({ to: "/" });
+				}
+
 				qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
 					if (!prev) return serverTabs;
 					// Merge: server owns structure + order, preserve local runtime fields
@@ -186,7 +200,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				});
 			}
 		},
-		[qc],
+		[qc, navigate],
 	);
 
 	const handleReconnect = useCallback(() => {
@@ -215,6 +229,7 @@ interface RecentTabListProps {
 export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentTabListProps) {
 	const { tabs, removeTab, moveTab } = useRecentTabs();
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
 
 	const [ctxMenu, setCtxMenu] = useState<{
@@ -256,11 +271,16 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 		[filtered, tabs, moveTab],
 	);
 
+	/** Remove a tab and navigate to dashboard if it was the active page. */
 	const handleRemove = useCallback(
 		(type: RecentTab["type"], id: string) => {
+			const tab = tabs.find((t) => t.type === type && t.id === id);
+			if (tab && isTabActive(tab, pathname)) {
+				navigate({ to: "/" });
+			}
 			removeTab(type, id);
 		},
-		[removeTab],
+		[removeTab, tabs, pathname, navigate],
 	);
 
 	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
@@ -278,9 +298,13 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
-		removeTab(ctxMenu.tab.type, ctxMenu.tab.id);
+		const { tab } = ctxMenu;
+		if (isTabActive(tab, pathname)) {
+			navigate({ to: "/" });
+		}
+		removeTab(tab.type, tab.id);
 		setCtxMenu(null);
-	}, [ctxMenu, removeTab]);
+	}, [ctxMenu, removeTab, pathname, navigate]);
 
 	if (filtered.length === 0) return null;
 
@@ -359,6 +383,7 @@ function SortableTabItem({
 	const iconColor = tab.status
 		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
 		: undefined;
+	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tabSortId(tab),
@@ -498,7 +523,13 @@ function SortableTabItem({
 						tab.type === "project" ? (
 							<IconFolder size={14} />
 						) : tab.type === "chapter" ? (
-							<IconGitBranch size={14} color={iconColor} />
+							<IconGitBranch
+								size={14}
+								color={iconColor}
+								fill={filledStatus ? "currentColor" : "none"}
+							/>
+						) : filledStatus ? (
+							<IconMessageCircleFilled size={14} color={iconColor} />
 						) : (
 							<IconMessageCircle size={14} color={iconColor} />
 						)

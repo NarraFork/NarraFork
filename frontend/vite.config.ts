@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
@@ -6,6 +7,9 @@ import { VitePWA } from "vite-plugin-pwa";
 
 const vitePort = Number(process.env.VITE_PORT) || 7778;
 const backendPort = Number(process.env.BACKEND_PORT) || 7779;
+
+const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
+const appVersion = pkg.version ?? "0.0.0";
 
 export default defineConfig(({ mode }) => {
 	const isDev = mode === "development";
@@ -18,10 +22,12 @@ export default defineConfig(({ mode }) => {
 			? {
 					__DEV_VITE_PORT__: JSON.stringify(vitePort),
 					__DEV_BACKEND_PORT__: JSON.stringify(backendPort),
+					__APP_VERSION__: JSON.stringify(appVersion),
 				}
 			: {
 					__DEV_VITE_PORT__: "undefined",
 					__DEV_BACKEND_PORT__: "undefined",
+					__APP_VERSION__: JSON.stringify(appVersion),
 				},
 		plugins: [
 			TanStackRouterVite({

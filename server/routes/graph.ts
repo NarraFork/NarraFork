@@ -20,11 +20,15 @@ export interface GraphNode {
 		groupLabel: string | null;
 		explorationGroupId: string | null;
 		narratorCount: number;
+		narratorId: string | null;
 		hasContainers: boolean;
 		hasUpstreamUpdates: boolean;
 		isRoot: boolean;
 		commitCount: number;
 		headCommitSha: string | null;
+		panelExpanded: boolean;
+		panelWidth: number | null;
+		panelHeight: number | null;
 	};
 	position: { x: number; y: number };
 }
@@ -52,9 +56,13 @@ export function buildGraph(
 		positionY: number | null;
 		commitCount: number | null;
 		headCommitSha: string | null;
+		panelExpanded: number | null;
+		panelWidth: number | null;
+		panelHeight: number | null;
 		worktreePath?: string | null;
 	}[],
 	narratorCounts: Map<string, number>,
+	narratorIds: Map<string, string>,
 	containerPresence: Set<string>,
 	edgeRows: {
 		id: string;
@@ -76,11 +84,15 @@ export function buildGraph(
 			groupLabel: ch.groupLabel,
 			explorationGroupId: ch.explorationGroupId,
 			narratorCount: narratorCounts.get(ch.id) ?? 0,
+			narratorId: narratorIds.get(ch.id) ?? null,
 			hasContainers: containerPresence.has(ch.id),
 			hasUpstreamUpdates: false,
 			isRoot: !!ch.isRoot,
 			commitCount: ch.commitCount ?? 0,
 			headCommitSha: ch.headCommitSha ?? null,
+			panelExpanded: !!ch.panelExpanded,
+			panelWidth: ch.panelWidth ?? null,
+			panelHeight: ch.panelHeight ?? null,
 		},
 		position: {
 			x: ch.positionX ?? 0,
@@ -122,6 +134,9 @@ graphRoutes.get("/:id/graph", async (c) => {
 			commitCount: true,
 			headCommitSha: true,
 			worktreePath: true,
+			panelExpanded: true,
+			panelWidth: true,
+			panelHeight: true,
 		},
 	});
 
@@ -182,9 +197,14 @@ graphRoutes.get("/:id/graph", async (c) => {
 		: [];
 
 	const narratorCounts = new Map<string, number>();
+	const narratorIds = new Map<string, string>();
 	for (const n of allNarrators) {
 		if (n.chapterId) {
 			narratorCounts.set(n.chapterId, (narratorCounts.get(n.chapterId) ?? 0) + 1);
+			// Keep the first narrator ID per chapter
+			if (!narratorIds.has(n.chapterId)) {
+				narratorIds.set(n.chapterId, n.id);
+			}
 		}
 	}
 
@@ -208,7 +228,13 @@ graphRoutes.get("/:id/graph", async (c) => {
 		.all();
 
 	// Build graph
-	const { nodes, edges } = buildGraph(projectChapters, narratorCounts, containerPresence, edgeRows);
+	const { nodes, edges } = buildGraph(
+		projectChapters,
+		narratorCounts,
+		narratorIds,
+		containerPresence,
+		edgeRows,
+	);
 
 	return c.json({ nodes, edges, explorationGroups: groups });
 });
@@ -234,10 +260,11 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 	}
 
 	for (const pos of parsed.data.positions) {
-		await db
-			.update(chapters)
-			.set({ positionX: pos.x, positionY: pos.y })
-			.where(eq(chapters.id, pos.chapterId));
+		const updates: Record<string, unknown> = { positionX: pos.x, positionY: pos.y };
+		if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
+		if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;
+		if (pos.panelHeight !== undefined) updates.panelHeight = pos.panelHeight;
+		await db.update(chapters).set(updates).where(eq(chapters.id, pos.chapterId));
 	}
 
 	return c.json({ ok: true });

@@ -296,5 +296,19 @@
 	"codexPlanFreeDesc": "免费版，用量受限",
 	"codexPlanPlusDesc": "ChatGPT Plus 订阅",
 	"codexPlanTeamDesc": "团队订阅",
-	"codexPlanProDesc": "专业订阅"
+	"codexPlanProDesc": "专业订阅",
+	"routinesSection": "内置套路",
+	"routinesDesc": "启用或禁用斜杠菜单中可用的内置命令和技能",
+	"routineEnabled": "启用",
+	"routineDisabled": "禁用",
+	"routineGlobalOff": "全局：关",
+	"routineType.command": "命令",
+	"routineType.skill": "技能",
+	"routineCategory.code-quality": "代码质量",
+	"routineCategory.testing": "测试",
+	"routineCategory.workflow": "工作流",
+	"versionSection": "关于",
+	"versionLabel": "版本",
+	"versionCommit": "提交",
+	"versionPlatform": "平台"
 }

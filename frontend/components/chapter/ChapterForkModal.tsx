@@ -20,6 +20,8 @@ interface ChapterForkModalProps {
 	opened: boolean;
 	onClose: () => void;
 	forkAtMessageUuid?: string;
+	/** If provided, called on successful fork instead of showing the navigation prompt */
+	onForkSuccess?: (newChapterId: string) => void;
 }
 
 export function ChapterForkModal({
@@ -27,6 +29,7 @@ export function ChapterForkModal({
 	opened,
 	onClose,
 	forkAtMessageUuid,
+	onForkSuccess,
 }: ChapterForkModalProps) {
 	const [title, setTitle] = useState("");
 	const [description, setDescription] = useState("");
@@ -71,7 +74,11 @@ export function ChapterForkModal({
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			if (data?.id) {
+			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			if (onForkSuccess && data?.id) {
+				handleClose();
+				onForkSuccess(data.id);
+			} else if (data?.id) {
 				setForkedChapter({ id: data.id, title: data.title ?? title.trim() });
 			} else {
 				handleClose();

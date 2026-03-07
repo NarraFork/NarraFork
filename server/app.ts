@@ -6,6 +6,7 @@ import { users } from "./db/schema";
 import { AppError } from "./lib/errors";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
+import { APP_VERSION, GIT_COMMIT } from "./lib/version";
 import { requireAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
 import { anthropicRoutes } from "./routes/anthropic";
@@ -24,6 +25,7 @@ import { notificationRoutes } from "./routes/notifications";
 import { openaiRoutes } from "./routes/openai";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
+import { routineRoutes } from "./routes/routines";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { skillRoutes } from "./routes/skills";
@@ -47,6 +49,8 @@ app.route("/api/auth", authRoutes);
 app.get("/api/health", (c) =>
 	c.json({
 		status: "ok",
+		version: APP_VERSION,
+		commit: GIT_COMMIT,
 		platform:
 			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
 	}),
@@ -83,6 +87,7 @@ app.route("/api/openai", openaiRoutes);
 app.route("/api/codex", codexRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/skills", skillRoutes);
+app.route("/api/routines", routineRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);

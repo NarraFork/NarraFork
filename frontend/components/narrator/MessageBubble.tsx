@@ -693,12 +693,14 @@ export const MessageBubble = memo(function MessageBubble({
 							: "var(--mantine-color-teal-light)",
 					}}
 				>
-					<Group gap={6} align="center">
-						<IconGitCommit size={16} style={{ flexShrink: 0 }} />
-						<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
-							{textBlock?.text ?? message.contentText ?? ""}
-						</Text>
-					</Group>
+			<Group gap={6} align="center">
+					<IconGitCommit size={16} style={{ flexShrink: 0 }} />
+					<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
+						{(textBlock?.text ?? message.contentText ?? "")
+							.replace(/<\/?system-reminder>/g, "")
+							.trim()}
+					</Text>
+				</Group>
 				</Paper>
 			);
 		}

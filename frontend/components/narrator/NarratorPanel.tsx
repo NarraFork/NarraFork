@@ -15,6 +15,7 @@ import {
 	NativeSelect,
 	ScrollArea,
 	Stack,
+	Switch,
 	Text,
 	Textarea,
 	TextInput,
@@ -52,6 +53,7 @@ import {
 	useNarratorMessages,
 	useUpdateModel,
 	useUpdatePermissionMode,
+	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
 } from "../../hooks/useNarrator";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
@@ -224,6 +226,7 @@ export function NarratorPanel({
 	appendInputRef,
 	terminalOpen,
 	onToggleTerminal,
+	compact,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -247,6 +250,7 @@ export function NarratorPanel({
 	const permModeMutation = useUpdatePermissionMode();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const modelMutation = useUpdateModel();
+	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const { visibleModels: allModels } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
@@ -1656,6 +1660,29 @@ export function NarratorPanel({
 													})}
 										</Menu.Label>
 									)}
+									<Menu.Divider />
+									<Tooltip
+										label={t("pruneEnabledTooltip")}
+										multiline
+										w={260}
+										withArrow
+										position="top"
+									>
+										<Menu.Label>
+											<Switch
+												size="xs"
+												label={t("pruneEnabled")}
+												checked={narrator.pruneEnabled ?? true}
+												onChange={(e) => {
+													pruneEnabledMutation.mutate({
+														id: narratorId,
+														pruneEnabled: e.currentTarget.checked,
+													});
+												}}
+											/>
+										</Menu.Label>
+									</Tooltip>
+									<Menu.Divider />
 									<Menu.Item
 										leftSection={<IconArrowsMinimize size={14} />}
 										onClick={() => {
@@ -1677,104 +1704,106 @@ export function NarratorPanel({
 						);
 					})()}
 					{/* Desktop selects */}
-					<Group gap={6} wrap="nowrap" visibleFrom="sm">
-						<Menu position="top-end">
-							<Menu.Target>
-								<NativeSelect
-									size="xs"
-									data={allModels.map((m) => ({ value: m.value, label: m.label }))}
-									value={narrator.model ?? ""}
-									onChange={() => {}}
-									onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-									style={{ pointerEvents: "auto" }}
-								/>
-							</Menu.Target>
-							<Menu.Dropdown>
-								<ModelMenuItems
-									allModels={allModels}
-									currentModel={narrator.model}
-									totalCostUsd={narrator.totalCostUsd}
-									onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-								/>
-							</Menu.Dropdown>
-						</Menu>
-						<Menu position="top-end">
-							<Menu.Target>
-								<NativeSelect
-									size="xs"
-									leftSection={
-										PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-											<IconShield size={14} />
-										)
-									}
-									data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
-									value={narrator.permissionMode ?? "default"}
-									onChange={() => {}}
-									onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-									style={{ pointerEvents: "auto" }}
-								/>
-							</Menu.Target>
-							<Menu.Dropdown>
-								<PermModeMenuItems
-									currentMode={narrator.permissionMode ?? "default"}
-									onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
-									t={t}
-								/>
-							</Menu.Dropdown>
-						</Menu>
-						{/* Reasoning Effort (only for models containing "codex") */}
-						{narrator.model?.toLowerCase().includes("codex") && (
+					{!compact && (
+						<Group gap={6} wrap="nowrap" visibleFrom="sm">
 							<Menu position="top-end">
 								<Menu.Target>
 									<NativeSelect
 										size="xs"
-										data={[
-											{ value: "", label: t("reasoning_auto") },
-											{ value: "low", label: t("reasoning_low") },
-											{ value: "medium", label: t("reasoning_medium") },
-											{ value: "high", label: t("reasoning_high") },
-											{ value: "xhigh", label: t("reasoning_xhigh") },
-										]}
-										value={narrator.reasoningEffort ?? ""}
+										data={allModels.map((m) => ({ value: m.value, label: m.label }))}
+										value={narrator.model ?? ""}
 										onChange={() => {}}
 										onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
 										style={{ pointerEvents: "auto" }}
 									/>
 								</Menu.Target>
 								<Menu.Dropdown>
-									<ReasoningEffortMenuItems
-										currentEffort={narrator.reasoningEffort}
-										onSelect={(e) =>
-											reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+									<ModelMenuItems
+										allModels={allModels}
+										currentModel={narrator.model}
+										totalCostUsd={narrator.totalCostUsd}
+										onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+									/>
+								</Menu.Dropdown>
+							</Menu>
+							<Menu position="top-end">
+								<Menu.Target>
+									<NativeSelect
+										size="xs"
+										leftSection={
+											PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+												<IconShield size={14} />
+											)
 										}
+										data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
+										value={narrator.permissionMode ?? "default"}
+										onChange={() => {}}
+										onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+										style={{ pointerEvents: "auto" }}
+									/>
+								</Menu.Target>
+								<Menu.Dropdown>
+									<PermModeMenuItems
+										currentMode={narrator.permissionMode ?? "default"}
+										onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
 										t={t}
 									/>
 								</Menu.Dropdown>
 							</Menu>
-						)}
-						{onToggleTerminal && (
-							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
-								<Indicator
-									label={activeTerminalCount}
-									size={14}
-									disabled={activeTerminalCount === 0}
-									offset={2}
-									color="blue"
-								>
-									<ActionIcon
-										variant="subtle"
-										color={terminalOpen ? "blue" : "gray"}
-										size="sm"
-										onClick={onToggleTerminal}
+							{/* Reasoning Effort (only for models containing "codex") */}
+							{narrator.model?.toLowerCase().includes("codex") && (
+								<Menu position="top-end">
+									<Menu.Target>
+										<NativeSelect
+											size="xs"
+											data={[
+												{ value: "", label: t("reasoning_auto") },
+												{ value: "low", label: t("reasoning_low") },
+												{ value: "medium", label: t("reasoning_medium") },
+												{ value: "high", label: t("reasoning_high") },
+												{ value: "xhigh", label: t("reasoning_xhigh") },
+											]}
+											value={narrator.reasoningEffort ?? ""}
+											onChange={() => {}}
+											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+											style={{ pointerEvents: "auto" }}
+										/>
+									</Menu.Target>
+									<Menu.Dropdown>
+										<ReasoningEffortMenuItems
+											currentEffort={narrator.reasoningEffort}
+											onSelect={(e) =>
+												reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+											}
+											t={t}
+										/>
+									</Menu.Dropdown>
+								</Menu>
+							)}
+							{onToggleTerminal && (
+								<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
+									<Indicator
+										label={activeTerminalCount}
+										size={14}
+										disabled={activeTerminalCount === 0}
+										offset={2}
+										color="blue"
 									>
-										<IconTerminal size={16} />
-									</ActionIcon>
-								</Indicator>
-							</Tooltip>
-						)}
-					</Group>
+										<ActionIcon
+											variant="subtle"
+											color={terminalOpen ? "blue" : "gray"}
+											size="sm"
+											onClick={onToggleTerminal}
+										>
+											<IconTerminal size={16} />
+										</ActionIcon>
+									</Indicator>
+								</Tooltip>
+							)}
+						</Group>
+					)}
 					{/* Mobile: model & permission */}
-					<Group gap={4} wrap="nowrap" hiddenFrom="sm">
+					<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
 						<Menu position="bottom-end" withinPortal>
 							<Menu.Target>
 								<ActionIcon variant="subtle" color="gray" size="sm">

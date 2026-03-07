@@ -126,6 +126,8 @@ export interface NarratorPanelProps {
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
 	terminalOpen?: boolean;
 	onToggleTerminal?: () => void;
+	/** Force compact (mobile-style) toolbar layout regardless of viewport width */
+	compact?: boolean;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;

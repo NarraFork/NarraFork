@@ -541,6 +541,27 @@ function NarratorsPage() {
 								<Stack gap={4} visibleFrom="sm">
 									<Group justify="space-between" wrap="nowrap">
 										<Group gap="xs" style={{ minWidth: 0 }}>
+											{narrator.status === "thinking" && (
+												<Loader
+													size={14}
+													color={narrator.permissionMode === "plan" ? "green" : undefined}
+												/>
+											)}
+											{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
+												<Badge size="xs" color="green">
+													{tn("status_planning")}
+												</Badge>
+											)}
+											{narrator.status &&
+												narrator.status !== "idle" &&
+												narrator.status !== "thinking" && (
+													<Badge
+														size="xs"
+														color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}
+													>
+														{tn(`status_${narrator.status}`)}
+													</Badge>
+												)}
 											<Text fw={500} truncate>
 												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 											</Text>
@@ -575,27 +596,6 @@ function NarratorsPage() {
 													</Avatar.Group>
 												</Tooltip>
 											)}
-											{narrator.status === "thinking" && (
-												<Loader
-													size={14}
-													color={narrator.permissionMode === "plan" ? "green" : undefined}
-												/>
-											)}
-											{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
-												<Badge size="xs" color="green">
-													{tn("status_planning")}
-												</Badge>
-											)}
-											{narrator.status &&
-												narrator.status !== "idle" &&
-												narrator.status !== "thinking" && (
-													<Badge
-														size="xs"
-														color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}
-													>
-														{tn(`status_${narrator.status}`)}
-													</Badge>
-												)}
 											<Tooltip label={t("archive")}>
 												<ActionIcon
 													size="sm"
@@ -661,33 +661,28 @@ function NarratorsPage() {
 
 								{/* ── Mobile card layout ── */}
 								<Stack gap={4} hiddenFrom="sm">
-									<Group justify="space-between" wrap="nowrap">
+									<Group gap={6} wrap="nowrap">
+										{narrator.status === "thinking" && (
+											<Loader
+												size={12}
+												color={narrator.permissionMode === "plan" ? "green" : undefined}
+											/>
+										)}
+										{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
+											<Badge size="xs" color="green">
+												{tn("status_planning")}
+											</Badge>
+										)}
+										{narrator.status &&
+											narrator.status !== "idle" &&
+											narrator.status !== "thinking" && (
+												<Badge size="xs" color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}>
+													{tn(`status_${narrator.status}`)}
+												</Badge>
+											)}
 										<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
 											{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 										</Text>
-										<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
-											{narrator.status === "thinking" && (
-												<Loader
-													size={12}
-													color={narrator.permissionMode === "plan" ? "green" : undefined}
-												/>
-											)}
-											{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
-												<Badge size="xs" color="green">
-													{tn("status_planning")}
-												</Badge>
-											)}
-											{narrator.status &&
-												narrator.status !== "idle" &&
-												narrator.status !== "thinking" && (
-													<Badge
-														size="xs"
-														color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}
-													>
-														{tn(`status_${narrator.status}`)}
-													</Badge>
-												)}
-										</Group>
 									</Group>
 									<Group gap="xs" wrap="nowrap">
 										<Text size="xs" c="dimmed" truncate>

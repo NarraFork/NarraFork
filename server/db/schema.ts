@@ -99,6 +99,9 @@ export const chapters = sqliteTable(
 		pinned: integer("pinned").default(0),
 		positionX: real("position_x"),
 		positionY: real("position_y"),
+		panelExpanded: integer("panel_expanded").default(0),
+		panelWidth: real("panel_width"),
+		panelHeight: real("panel_height"),
 
 		lastAccessedAt: text("last_accessed_at"),
 		createdAt: text("created_at").notNull(),
@@ -230,6 +233,7 @@ export const narrators = sqliteTable(
 			(): any => narratorMessages.id,
 		),
 		prunedPercent: integer("pruned_percent"),
+		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(true),
 		// Background task fields
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		backgroundStatus: text("background_status", {
@@ -448,7 +452,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
-	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(false),
+	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	recentTabs: text("recent_tabs").notNull().default("[]"),

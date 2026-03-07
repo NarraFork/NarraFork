@@ -39,6 +39,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
+import { RoutinesSection } from "../../components/settings/RoutinesSection";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
 import { UserAvatar } from "../../components/UserAvatar";
@@ -75,6 +76,13 @@ function SettingsPage() {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const navigate = useNavigate();
+
+	// Version / health info
+	const { data: healthData } = useQuery({
+		queryKey: ["health"],
+		queryFn: api.health,
+		staleTime: 5 * 60 * 1000,
+	});
 
 	// Avatar
 	const { data: currentUser } = useCurrentUser();
@@ -143,13 +151,13 @@ function SettingsPage() {
 	const [port, setPort] = useState<number | undefined>();
 	const [projectDir, setProjectDir] = useState("");
 	// Agent
-	const [permissionMode, setPermissionMode] = useState("default");
+	const [permissionMode, setPermissionMode] = useState("acceptEdits");
 	const [maxTurns, setMaxTurns] = useState(200);
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [planTimeoutAction, setPlanTimeoutAction] = useState("deny");
-	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("");
+	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
@@ -178,7 +186,7 @@ function SettingsPage() {
 	const serverSnapshot = useRef({
 		port: 7778 as number | undefined,
 		projectDir: "",
-		permissionMode: "default",
+		permissionMode: "acceptEdits",
 		maxTurns: 200,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
@@ -197,7 +205,7 @@ function SettingsPage() {
 		proxyPort: 7780,
 		legacyEncoding: false,
 		planTimeoutAction: "deny",
-		codexDefaultReasoningEffort: "",
+		codexDefaultReasoningEffort: "high",
 	});
 
 	useEffect(() => {
@@ -621,6 +629,9 @@ function SettingsPage() {
 				</Stack>
 			</Paper>
 
+			{/* Built-in Routines */}
+			<RoutinesSection />
+
 			{/* Chapters */}
 			<Paper withBorder p="md">
 				<Stack>
@@ -901,6 +912,37 @@ function SettingsPage() {
 				</Stack>
 			</Paper>
 
+			{/* About / Version */}
+			<Paper withBorder p="md">
+				<Stack>
+					<Title order={4}>{t("versionSection")}</Title>
+					<Group gap="lg">
+						<Text size="sm">
+							<Text span c="dimmed">
+								{t("versionLabel")}:
+							</Text>{" "}
+							v{__APP_VERSION__}
+						</Text>
+						{healthData?.commit && (
+							<Text size="sm">
+								<Text span c="dimmed">
+									{t("versionCommit")}:
+								</Text>{" "}
+								{healthData.commit}
+							</Text>
+						)}
+						{healthData?.platform && (
+							<Text size="sm">
+								<Text span c="dimmed">
+									{t("versionPlatform")}:
+								</Text>{" "}
+								{healthData.platform}
+							</Text>
+						)}
+					</Group>
+				</Stack>
+			</Paper>
+
 			<Affix position={{ bottom: 24, right: 24 }}>
 				<Transition transition="slide-up" mounted={isDirty}>
 					{(styles) => (
@@ -1133,7 +1175,7 @@ function NotificationSettings({
 									<FileInput
 										placeholder={t("notifySoundUpload")}
 										description={t("notifySoundUploadDesc")}
-										accept="audio/mpeg,audio/wav,audio/ogg,audio/webm"
+										accept="audio/mpeg,audio/wav,audio/x-wav,audio/ogg,audio/webm"
 										onChange={handleSoundUpload}
 										size="xs"
 										style={{ flex: 1 }}

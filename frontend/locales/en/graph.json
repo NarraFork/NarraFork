@@ -6,6 +6,8 @@
 	"narratorCount": "{{count}} narrator(s)",
 	"containers": "containers",
 	"root": "Root",
+	"expandNarrator": "Expand conversation",
+	"collapseNarrator": "Collapse conversation",
 	"contextMenu": {
 		"fork": "Fork",
 		"setRole": "Set Role",

@@ -7,11 +7,18 @@ import { Hono } from "hono";
 
 const SOUNDS_DIR = resolve(homedir(), ".narrafork", "notification-sounds");
 
-const ALLOWED_MIME_TYPES = new Set(["audio/mpeg", "audio/wav", "audio/ogg", "audio/webm"]);
+const ALLOWED_MIME_TYPES = new Set([
+	"audio/mpeg",
+	"audio/wav",
+	"audio/x-wav", // Non-standard but common variant
+	"audio/ogg",
+	"audio/webm",
+]);
 
 const MIME_TO_EXT: Record<string, string> = {
 	"audio/mpeg": ".mp3",
 	"audio/wav": ".wav",
+	"audio/x-wav": ".wav", // Treat x-wav as standard wav
 	"audio/ogg": ".ogg",
 	"audio/webm": ".webm",
 };

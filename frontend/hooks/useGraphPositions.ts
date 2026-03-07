@@ -2,20 +2,40 @@ import { api } from "@frontend/lib/api";
 import { useMutation } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef } from "react";
 
+interface PendingUpdate {
+	x: number;
+	y: number;
+	panelExpanded?: boolean;
+	panelWidth?: number;
+	panelHeight?: number;
+}
+
 export function useUpdateGraphPositions(projectId: string) {
-	const pendingRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+	const pendingRef = useRef<Map<string, PendingUpdate>>(new Map());
 	const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	const mutation = useMutation({
-		mutationFn: (positions: Array<{ chapterId: string; x: number; y: number }>) =>
-			api.updateGraphPositions(projectId, positions),
+		mutationFn: (
+			positions: Array<{
+				chapterId: string;
+				x: number;
+				y: number;
+				panelExpanded?: boolean;
+				panelWidth?: number;
+				panelHeight?: number;
+			}>,
+		) => api.updateGraphPositions(projectId, positions),
 	});
 
 	const flush = useCallback(() => {
 		if (pendingRef.current.size === 0) return;
-		const positions = Array.from(pendingRef.current.entries()).map(([chapterId, pos]) => ({
+		const positions = Array.from(pendingRef.current.entries()).map(([chapterId, upd]) => ({
 			chapterId,
-			...pos,
+			x: upd.x,
+			y: upd.y,
+			panelExpanded: upd.panelExpanded,
+			panelWidth: upd.panelWidth,
+			panelHeight: upd.panelHeight,
 		}));
 		pendingRef.current.clear();
 		mutation.mutate(positions);
@@ -27,14 +47,42 @@ export function useUpdateGraphPositions(projectId: string) {
 		};
 	}, []);
 
+	const scheduleFlush = useCallback(() => {
+		if (timerRef.current) clearTimeout(timerRef.current);
+		timerRef.current = setTimeout(flush, 500);
+	}, [flush]);
+
 	const savePosition = useCallback(
 		(chapterId: string, x: number, y: number) => {
-			pendingRef.current.set(chapterId, { x, y });
-			if (timerRef.current) clearTimeout(timerRef.current);
-			timerRef.current = setTimeout(flush, 500);
+			const existing = pendingRef.current.get(chapterId);
+			pendingRef.current.set(chapterId, { ...existing, x, y });
+			scheduleFlush();
 		},
-		[flush],
+		[scheduleFlush],
 	);
 
-	return { savePosition };
+	const savePanelState = useCallback(
+		(
+			chapterId: string,
+			x: number,
+			y: number,
+			panelExpanded: boolean,
+			panelWidth?: number,
+			panelHeight?: number,
+		) => {
+			const existing = pendingRef.current.get(chapterId);
+			pendingRef.current.set(chapterId, {
+				...existing,
+				x,
+				y,
+				panelExpanded,
+				panelWidth,
+				panelHeight,
+			});
+			scheduleFlush();
+		},
+		[scheduleFlush],
+	);
+
+	return { savePosition, savePanelState };
 }

@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
@@ -634,6 +634,45 @@ export function resolveProxyPortHints(
 	return hints;
 }
 
+const PROXY_OVERRIDE_FILENAME = ".narrafork-proxy-override.yml";
+
+/**
+ * Generate a compose override file that strips all port mappings via `!reset`.
+ * Used in proxy mode so containers don't bind host ports.
+ * Returns the override file path, or null if no services found.
+ */
+function generateProxyOverride(worktreePath: string, composeFile: string): string | null {
+	const services = parseComposeFile(worktreePath, composeFile);
+	if (services.length === 0) return null;
+
+	const lines = ["services:"];
+	for (const svc of services) {
+		lines.push(`  ${svc.name}:`);
+		lines.push("    ports: !reset []");
+	}
+	lines.push("");
+
+	const overridePath = resolve(worktreePath, PROXY_OVERRIDE_FILENAME);
+	writeFileSync(overridePath, lines.join("\n"), "utf-8");
+	return overridePath;
+}
+
+/** Remove the proxy override file if it exists. */
+function cleanupProxyOverride(worktreePath: string): void {
+	try {
+		unlinkSync(resolve(worktreePath, PROXY_OVERRIDE_FILENAME));
+	} catch {
+		// Ignore — file may not exist
+	}
+}
+
+/** Build podman compose args with optional override file. */
+function buildComposeFileArgs(composeFile: string, overrideFile: string | null): string[] {
+	const args = ["compose", "-f", composeFile];
+	if (overrideFile) args.push("-f", overrideFile);
+	return args;
+}
+
 /** Build environment variables for compose, including port mappings or proxy info. */
 export function buildComposeEnv(
 	chapterId: string,
@@ -765,8 +804,17 @@ export const containerService = {
 				configuredPortsByService.set(serviceName, list);
 			}
 		}
+
+		// In proxy mode, generate an override file that strips all port mappings
+		// so containers don't bind host ports (traffic goes through the reverse proxy).
+		let overrideFile: string | null = null;
+		if (isProxy) {
+			overrideFile = generateProxyOverride(worktreePath, composeFile);
+		}
+		const fileArgs = buildComposeFileArgs(composeFile, overrideFile);
+
 		try {
-			const composeArgs = ["compose", "-f", composeFile, "up", "-d"];
+			const composeArgs = [...fileArgs, "up", "-d"];
 			if (config?.services && config.services.length > 0) {
 				composeArgs.push(...config.services);
 			}
@@ -812,13 +860,14 @@ export const containerService = {
 					env,
 					proxyInfo,
 					configuredPortsByService,
+					overrideFile,
 				);
 			} catch (recordErr) {
 				logger.error("Failed to record container instances, running compose down to clean up", {
 					chapterId,
 					error: String(recordErr),
 				});
-				await exec(["compose", "-f", composeFile, "down"], worktreePath, env);
+				await exec([...fileArgs, "down"], worktreePath, env);
 				if (!isProxy) await portAllocator.release(chapterId);
 				eventBus.emit({
 					type: "container:error",
@@ -841,6 +890,8 @@ export const containerService = {
 				chapterId,
 				error: err instanceof Error ? err.message : String(err),
 			});
+		} finally {
+			if (overrideFile) cleanupProxyOverride(worktreePath);
 		}
 	},
 
@@ -1016,12 +1067,10 @@ export const containerService = {
 		env: Record<string, string>,
 		proxyInfo?: ProxyInfo,
 		configuredPortsByService?: Map<string, number[]>,
+		overrideFile?: string | null,
 	): Promise<void> {
-		const result = await exec(
-			["compose", "-f", composeFile, "ps", "--format", "json"],
-			worktreePath,
-			env,
-		);
+		const fileArgs = buildComposeFileArgs(composeFile, overrideFile ?? null);
+		const result = await exec([...fileArgs, "ps", "--format", "json"], worktreePath, env);
 
 		const now = new Date().toISOString();
 

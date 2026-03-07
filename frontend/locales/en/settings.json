@@ -296,5 +296,19 @@
 	"codexPlanFreeDesc": "Free tier with limited usage",
 	"codexPlanPlusDesc": "ChatGPT Plus subscription",
 	"codexPlanTeamDesc": "Team subscription",
-	"codexPlanProDesc": "Pro subscription"
+	"codexPlanProDesc": "Pro subscription",
+	"routinesSection": "Built-in Routines",
+	"routinesDesc": "Enable or disable built-in commands and skills available in the slash menu",
+	"routineEnabled": "Enabled",
+	"routineDisabled": "Disabled",
+	"routineGlobalOff": "Global: off",
+	"routineType.command": "Command",
+	"routineType.skill": "Skill",
+	"routineCategory.code-quality": "Code Quality",
+	"routineCategory.testing": "Testing",
+	"routineCategory.workflow": "Workflow",
+	"versionSection": "About",
+	"versionLabel": "Version",
+	"versionCommit": "Commit",
+	"versionPlatform": "Platform"
 }

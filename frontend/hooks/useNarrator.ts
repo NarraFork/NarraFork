@@ -47,11 +47,13 @@ export function useForkNarrator() {
 			narratorId,
 			forkMessageUuid,
 			title,
+			inheritMode,
 		}: {
 			narratorId: string;
 			forkMessageUuid: string;
 			title?: string;
-		}) => api.forkNarrator(narratorId, forkMessageUuid, title),
+			inheritMode?: "full" | "compressed" | "fresh";
+		}) => api.forkNarrator(narratorId, forkMessageUuid, title, inheritMode),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
@@ -182,6 +184,17 @@ export function useUpdateModel() {
 	return useMutation({
 		mutationFn: ({ id, model }: { id: string; model: string }) =>
 			api.updateNarratorModel(id, model),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useUpdatePruneEnabled() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, pruneEnabled }: { id: string; pruneEnabled: boolean }) =>
+			api.updateNarratorPruneEnabled(id, pruneEnabled),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
