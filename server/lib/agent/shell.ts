@@ -88,6 +88,11 @@ export interface ShellInfo {
  *
  * Reads $SHELL but filters out shells with incompatible syntax (fish, nu).
  * Falls back to platform-appropriate defaults. Result is cached.
+ *
+ * On Windows the priority is:
+ *   1. Git Bash (from Git for Windows / MSYS2) — NOT WSL bash
+ *   2. PowerShell (pwsh or powershell.exe)
+ *   3. cmd.exe (last resort)
  */
 let _cachedShellInfo: ShellInfo | undefined;
 export function detectShell(): ShellInfo {
@@ -97,44 +102,91 @@ export function detectShell(): ShellInfo {
 	const extraEnv: Record<string, string> = {};
 	let loginWrap = false;
 
-	const env = process.env.SHELL;
-	if (env) {
-		const name = path.basename(env);
-		if (!SHELL_BLACKLIST.has(name)) {
-			shellPath = env;
+	if (process.platform === "win32") {
+		shellPath = findGitBash() ?? Bun.which("pwsh") ?? "powershell.exe";
+		if (isGitBash(shellPath)) {
+			loginWrap = true;
+			extraEnv.MSYS2_PATH_TYPE = "inherit";
 		}
-	}
-
-	if (!shellPath) {
-		if (process.platform === "win32") {
-			shellPath = Bun.which("bash") ?? Bun.which("sh") ?? "cmd.exe";
-		} else if (process.platform === "darwin") {
-			shellPath = "/bin/zsh";
-		} else {
-			shellPath = Bun.which("bash") ?? "/bin/sh";
+	} else {
+		const env = process.env.SHELL;
+		if (env) {
+			const name = path.basename(env);
+			if (!SHELL_BLACKLIST.has(name)) {
+				shellPath = env;
+			}
 		}
-	}
-
-	// Git Bash on Windows: enable login-shell wrapping so /etc/profile is
-	// sourced and PATH is converted from Windows to POSIX format.
-	if (process.platform === "win32" && isGitBash(shellPath)) {
-		loginWrap = true;
-		// Tell MSYS2/Git Bash to inherit the Windows PATH entries
-		extraEnv.MSYS2_PATH_TYPE = "inherit";
+		if (!shellPath) {
+			if (process.platform === "darwin") {
+				shellPath = "/bin/zsh";
+			} else {
+				shellPath = Bun.which("bash") ?? "/bin/sh";
+			}
+		}
 	}
 
 	_cachedShellInfo = { path: shellPath, extraEnv, loginWrap };
 	return _cachedShellInfo;
 }
 
+// ── Windows Git Bash detection ───────────────────────────────────────────────
+
+/**
+ * Locate Git Bash's bash.exe on Windows, carefully avoiding WSL's bash.exe.
+ *
+ * WSL's bash lives at `C:\Windows\System32\bash.exe` (or SysWOW64).
+ * Git Bash lives under the Git for Windows install dir, e.g.
+ *   `C:\Program Files\Git\bin\bash.exe`
+ *   `C:\Program Files\Git\usr\bin\bash.exe`
+ *
+ * We check well-known install locations first, then fall back to
+ * `Bun.which("bash")` but reject anything under System32/SysWOW64.
+ */
+function findGitBash(): string | undefined {
+	const { existsSync } = require("node:fs") as typeof import("node:fs");
+
+	// Well-known Git for Windows install paths
+	const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+	const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+	const localAppData = process.env.LOCALAPPDATA ?? "";
+
+	const candidates = [
+		path.join(programFiles, "Git", "bin", "bash.exe"),
+		path.join(programFiles, "Git", "usr", "bin", "bash.exe"),
+		path.join(programFilesX86, "Git", "bin", "bash.exe"),
+		path.join(programFilesX86, "Git", "usr", "bin", "bash.exe"),
+		...(localAppData
+			? [
+					path.join(localAppData, "Programs", "Git", "bin", "bash.exe"),
+					path.join(localAppData, "Programs", "Git", "usr", "bin", "bash.exe"),
+				]
+			: []),
+	];
+
+	for (const candidate of candidates) {
+		if (existsSync(candidate)) return candidate;
+	}
+
+	// Fallback: Bun.which("bash") but reject WSL bash
+	const found = Bun.which("bash");
+	if (found && !isWslBash(found)) return found;
+
+	return undefined;
+}
+
+/** Check whether a bash path is WSL's bash (System32/SysWOW64). */
+function isWslBash(bashPath: string): boolean {
+	const lower = bashPath.toLowerCase().replace(/\\/g, "/");
+	return lower.includes("/system32/") || lower.includes("/syswow64/");
+}
+
 /** Check whether a shell path points to Git Bash / MSYS2 bash. */
 function isGitBash(shellPath: string): boolean {
 	const lower = shellPath.toLowerCase().replace(/\\/g, "/");
 	return (
-		lower.endsWith("/bash.exe") ||
-		lower.endsWith("/bash") ||
-		lower.includes("/git/") ||
-		lower.includes("/msys")
+		(lower.endsWith("/bash.exe") || lower.endsWith("/bash")) &&
+		(lower.includes("/git/") || lower.includes("/msys")) &&
+		!isWslBash(shellPath)
 	);
 }
 
