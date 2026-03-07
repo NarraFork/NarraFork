@@ -130,53 +130,23 @@ export function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): Graph
 		const edgeType = edge.type ?? edge.data?.type;
 
 		if (edgeType === "fork") {
-			// source = parent, target = child
-			// Connect from the side of the parent facing the child,
-			// into the side of the child facing the parent.
-			const dx = targetNode.position.x - sourceNode.position.x;
+			// Fork: always vertical. Pick top or bottom based on child position.
 			const dy = targetNode.position.y - sourceNode.position.y;
-			const absDx = Math.abs(dx);
-			const absDy = Math.abs(dy);
-
-			if (absDy >= absDx) {
-				if (dy > 0) {
-					// Child is below parent (default fork direction)
-					return { ...edge, sourceHandle: "bottom-src", targetHandle: "top" };
-				}
-				// Child is above parent
-				return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
+			if (dy >= 0) {
+				return { ...edge, sourceHandle: "bottom-src", targetHandle: "top" };
 			}
-			if (dx > 0) {
-				// Child is right of parent
-				return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
-			}
-			// Child is left of parent
-			return { ...edge, sourceHandle: "left-src", targetHandle: "right" };
+			return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
 		}
 
 		if (edgeType === "merge") {
-			// source = branch being merged, target = merge destination (trunk/root)
-			// Connect from the side of the branch facing the root,
-			// into the side of the root facing the branch.
+			// Merge: always horizontal. Pick left or right based on branch position.
 			const dx = sourceNode.position.x - targetNode.position.x;
-			const dy = sourceNode.position.y - targetNode.position.y;
-			const absDx = Math.abs(dx);
-			const absDy = Math.abs(dy);
-
-			if (absDx >= absDy) {
-				if (dx < 0) {
-					// Branch is left of root → branch right side → root left side
-					return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
-				}
-				// Branch is right of root → branch left side → root right side
-				return { ...edge, sourceHandle: "left-src", targetHandle: "right" };
+			if (dx <= 0) {
+				// Branch is left of root → branch right side → root left side
+				return { ...edge, sourceHandle: "right-src", targetHandle: "left" };
 			}
-			if (dy < 0) {
-				// Branch is above root → branch bottom → root top
-				return { ...edge, sourceHandle: "bottom-src", targetHandle: "top" };
-			}
-			// Branch is below root → branch top → root bottom
-			return { ...edge, sourceHandle: "top-src", targetHandle: "bottom" };
+			// Branch is right of root → branch left side → root right side
+			return { ...edge, sourceHandle: "left-src", targetHandle: "right" };
 		}
 
 		return assignAdaptiveHandles(edge, sourceNode, targetNode);
