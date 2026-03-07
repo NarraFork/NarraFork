@@ -42,7 +42,7 @@ projectRoutes.post("/", async (c) => {
 	let gitPath = body.gitPath.trim();
 	// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
 	if (gitPath.startsWith("~/") || gitPath === "~") {
-		gitPath = gitPath.replace("~", process.env.HOME ?? "/root");
+		gitPath = gitPath.replace("~", getHome());
 	}
 	gitPath = resolve(gitPath);
 
