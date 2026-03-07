@@ -33,9 +33,18 @@ export function ChapterNode({ data }: NodeProps) {
 	const nodeWidth = isRoot ? 320 : isTrunk ? 320 : 280;
 	const nodeHeight = isRoot ? 140 : isTrunk ? 140 : 120;
 
+	const handleStyle = { opacity: 0, width: 8, height: 8 };
+
 	return (
 		<>
-			<Handle type="target" position={Position.Top} />
+			<Handle type="target" position={Position.Top} id="top" style={handleStyle} />
+			<Handle type="source" position={Position.Top} id="top-src" style={handleStyle} />
+			<Handle type="target" position={Position.Bottom} id="bottom" style={handleStyle} />
+			<Handle type="source" position={Position.Bottom} id="bottom-src" style={handleStyle} />
+			<Handle type="target" position={Position.Left} id="left" style={handleStyle} />
+			<Handle type="source" position={Position.Left} id="left-src" style={handleStyle} />
+			<Handle type="target" position={Position.Right} id="right" style={handleStyle} />
+			<Handle type="source" position={Position.Right} id="right-src" style={handleStyle} />
 			<Card
 				shadow="sm"
 				padding="xs"
@@ -105,7 +114,6 @@ export function ChapterNode({ data }: NodeProps) {
 					)}
 				</Group>
 			</Card>
-			<Handle type="source" position={Position.Bottom} />
 		</>
 	);
 }
