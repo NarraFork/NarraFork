@@ -38,6 +38,7 @@ interface OpenAIProvidersSectionProps {
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	isDirty?: boolean;
 }
 
 export function OpenAIProvidersSection({
@@ -48,6 +49,7 @@ export function OpenAIProvidersSection({
 	onToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
+	isDirty,
 }: OpenAIProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -97,6 +99,14 @@ export function OpenAIProvidersSection({
 
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
+			if (isDirty) {
+				notifications.show({
+					color: "yellow",
+					title: t("refreshModelsSaveFirst"),
+					message: "",
+				});
+				return;
+			}
 			setRefreshingProvider(providerId);
 			try {
 				await api.openaiRefreshProviderModels(providerId);
@@ -108,7 +118,7 @@ export function OpenAIProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t],
+		[qc, t, isDirty],
 	);
 
 	return (
@@ -211,9 +221,21 @@ export function OpenAIProvidersSection({
 												data={[
 													{ label: t("openaiApiModeResponses"), value: "responses" },
 													{ label: t("openaiApiModeCompletions"), value: "completions" },
+													{ label: t("openaiApiModeCodex"), value: "codex" },
 												]}
 											/>
 										</Stack>
+										{p.apiMode === "codex" && (
+											<TextInput
+												label={t("openaiCodexAccountId")}
+												description={t("openaiCodexAccountIdDesc")}
+												placeholder={t("openaiCodexAccountIdPlaceholder")}
+												value={p.codexAccountId}
+												onChange={(e) =>
+													updateProvider(p.id, "codexAccountId", e.currentTarget.value)
+												}
+											/>
+										)}
 										<Group gap="xs">
 											<Button
 												size="xs"

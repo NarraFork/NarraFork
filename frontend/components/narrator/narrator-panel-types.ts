@@ -115,6 +115,7 @@ export interface NarratorPanelSnapshot {
 	todosToolUseId?: string | null;
 	errorMessage?: string | null;
 	reasoningEffort?: string | null;
+	fastMode?: boolean;
 }
 
 export interface NarratorPanelProps {

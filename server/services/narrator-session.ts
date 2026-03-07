@@ -23,7 +23,7 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
-import { resolveProvider, settings } from "../lib/settings";
+import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -1685,9 +1685,10 @@ async function runAgentLoop(
 
 			const resolvedReasoningEffort =
 				freshNarrator.reasoningEffort ??
-				(resolved.provider === "codex" || resolved.provider === "openai"
-					? settings.codex?.defaultReasoningEffort
-					: undefined);
+				(usesCodexApiMode(resolved.provider) ? settings.codex?.defaultReasoningEffort : undefined);
+
+			const resolvedServiceTier =
+				freshNarrator.fastMode && usesCodexApiMode(resolved.provider) ? "priority" : undefined;
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
@@ -1702,6 +1703,7 @@ async function runAgentLoop(
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
+				serviceTier: resolvedServiceTier,
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,

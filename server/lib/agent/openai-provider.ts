@@ -189,9 +189,9 @@ interface OAIStreamChunk {
  * Supports three API modes:
  *   - "responses"   — Native OpenAI Responses API (/responses endpoint)
  *   - "completions"  — Standard Chat Completions API (/chat/completions)
- *   - "codex"        — Codex gateway: Responses API message format sent to
- *                       /chat/completions, with SSE auto-detection for the
- *                       response stream format.
+ *   - "codex"        — Codex gateway over the /responses endpoint, with
+ *                       Codex-specific instructions, headers, reasoning config,
+ *                       and response stream handling.
  */
 export class OpenAIProvider implements ProviderAdapter {
 	/**
@@ -407,6 +407,11 @@ export class OpenAIProvider implements ProviderAdapter {
 					summary: "auto",
 				};
 				body.include = ["reasoning.encrypted_content"];
+			}
+
+			// Add service_tier for Codex fast mode (priority processing).
+			if (params.serviceTier && this.apiMode === "codex") {
+				body.service_tier = params.serviceTier;
 			}
 
 			logger.debug("Responses API request body", {

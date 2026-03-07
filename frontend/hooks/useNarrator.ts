@@ -179,6 +179,17 @@ export function useUpdateReasoningEffort() {
 	});
 }
 
+export function useUpdateFastMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, fastMode }: { id: string; fastMode: boolean }) =>
+			api.updateNarratorFastMode(id, fastMode),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useUpdateModel() {
 	const qc = useQueryClient();
 	return useMutation({

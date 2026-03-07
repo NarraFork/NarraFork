@@ -52,12 +52,20 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		);
 	}
 
-	const stagedFiles = status.files.filter(
-		(f) => !f.status.startsWith("?") && status.staged > 0 && isStagedFile(f.status),
-	);
-	const unstagedFiles = status.files.filter(
-		(f) => f.status.startsWith("?") || !isStagedFile(f.status),
-	);
+	const stagedFiles = status.files
+		.filter((f) => !f.status.startsWith("?") && isStagedFile(f.status))
+		.map((f) => ({
+			...f,
+			displayLinesAdded: f.stagedLinesAdded,
+			displayLinesRemoved: f.stagedLinesRemoved,
+		}));
+	const unstagedFiles = status.files
+		.filter((f) => f.status.startsWith("?") || isUnstagedFile(f.status))
+		.map((f) => ({
+			...f,
+			displayLinesAdded: f.unstagedLinesAdded,
+			displayLinesRemoved: f.unstagedLinesRemoved,
+		}));
 
 	// Cap displayed files to avoid rendering thousands of rows
 	const displayStaged = stagedFiles.slice(0, MAX_DISPLAY_FILES);
@@ -68,8 +76,18 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const totalFiles = status.totalFiles ?? status.files.length;
 	const serverCapped = totalFiles > status.files.length;
 
-	function isStagedFile(fileStatus: string): boolean {
-		return /^[MADRC] /.test(fileStatus) || /^[MADRC]$/.test(fileStatus);
+	/** Porcelain status XY: X is index status, Y is worktree status.
+	 *  A file is staged if X is one of M/A/D/R/C (not space or ?). */
+	function isStagedFile(s: string): boolean {
+		const x = s[0];
+		return x !== " " && x !== "?" && /[MADRC]/.test(x);
+	}
+
+	/** A file has unstaged changes if Y (second char) is not space,
+	 *  or it's untracked (??) */
+	function isUnstagedFile(s: string): boolean {
+		const y = s[1];
+		return y !== " " || s.startsWith("?");
 	}
 
 	function handleCommit() {
@@ -232,7 +250,12 @@ function FileRow({
 	onClick,
 	t,
 }: {
-	file: { status: string; path: string };
+	file: {
+		status: string;
+		path: string;
+		displayLinesAdded: number;
+		displayLinesRemoved: number;
+	};
 	action: "stage" | "unstage";
 	onAction: () => void;
 	onClick: () => void;
@@ -256,6 +279,20 @@ function FileRow({
 			<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }} ff="monospace">
 				{file.path}
 			</Text>
+			{(file.displayLinesAdded > 0 || file.displayLinesRemoved > 0) && (
+				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+					{file.displayLinesAdded > 0 && (
+						<Text size="xs" c="green" ff="monospace">
+							+{file.displayLinesAdded}
+						</Text>
+					)}
+					{file.displayLinesRemoved > 0 && (
+						<Text size="xs" c="red" ff="monospace">
+							-{file.displayLinesRemoved}
+						</Text>
+					)}
+				</Group>
+			)}
 			<Tooltip label={action === "stage" ? t("stageFile") : t("unstageFile")}>
 				<ActionIcon
 					size="xs"

@@ -190,8 +190,10 @@ export interface AgentConfig {
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
-	/** Reasoning effort for Codex models (low, medium, high, xhigh) */
+	/** Reasoning effort for Codex-mode providers (low, medium, high, xhigh) */
 	reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+	/** Service tier for Codex-mode providers — "priority" enables fast mode */
+	serviceTier?: string;
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	permissionHandler: (

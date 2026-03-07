@@ -7,7 +7,17 @@ export interface GitStatusSummary {
 	staged: number;
 	unstaged: number;
 	untracked: number;
-	files: Array<{ status: string; path: string }>;
+	files: Array<{
+		/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
+		status: string;
+		path: string;
+		linesAdded: number;
+		linesRemoved: number;
+		stagedLinesAdded: number;
+		stagedLinesRemoved: number;
+		unstagedLinesAdded: number;
+		unstagedLinesRemoved: number;
+	}>;
 	/** Total changed files (may exceed files.length when capped server-side). */
 	totalFiles: number;
 	headSha: string;

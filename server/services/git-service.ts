@@ -33,17 +33,33 @@ async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): 
 	}
 }
 
+export interface GitStatusFile {
+	/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
+	status: string;
+	path: string;
+	linesAdded: number;
+	linesRemoved: number;
+	stagedLinesAdded: number;
+	stagedLinesRemoved: number;
+	unstagedLinesAdded: number;
+	unstagedLinesRemoved: number;
+}
+
 export interface GitStatusSummary {
 	hasChanges: boolean;
 	staged: number;
 	unstaged: number;
 	untracked: number;
 	/** Capped at 200 entries. Use `totalFiles` for the real count. */
-	files: Array<{ status: string; path: string }>;
+	files: GitStatusFile[];
 	/** Total number of changed files (may exceed files.length). */
 	totalFiles: number;
 	headSha: string;
 	branch: string;
+}
+
+function stripTrailingLineBreaks(text: string): string {
+	return text.replace(/[\r\n]+$/, "");
 }
 
 async function exec(args: string[], cwd: string, silent = false): Promise<ExecResult> {
@@ -53,10 +69,129 @@ async function exec(args: string[], cwd: string, silent = false): Promise<ExecRe
 		new Response(proc.stderr).text(),
 	]);
 	const exitCode = await proc.exited;
+	const trimmedStdout = stripTrailingLineBreaks(stdout);
+	const trimmedStderr = stripTrailingLineBreaks(stderr);
 	if (exitCode !== 0 && !silent) {
-		logger.error("git command failed", { args: args.join(" "), cwd, stderr, exitCode });
+		logger.error("git command failed", {
+			args: args.join(" "),
+			cwd,
+			stderr: trimmedStderr,
+			exitCode,
+		});
 	}
-	return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+	return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode };
+}
+
+interface LineStats {
+	added: number;
+	removed: number;
+}
+
+function parseNulSeparatedPaths(output: string): string[] {
+	return output.split("\0").filter(Boolean);
+}
+
+function countTextLines(content: string): number {
+	if (!content) return 0;
+	const lineCount = content.split("\n").length;
+	return content.endsWith("\n") ? lineCount - 1 : lineCount;
+}
+
+async function getUntrackedLineStatsMap(
+	worktreePath: string,
+	files: string[],
+): Promise<Map<string, LineStats>> {
+	const entries = await Promise.all(
+		files.map(async (file) => {
+			try {
+				const filePath = join(worktreePath, file);
+				const content = await Bun.file(filePath).text();
+				return [file, { added: countTextLines(content), removed: 0 }] as const;
+			} catch {
+				return [file, { added: 0, removed: 0 }] as const;
+			}
+		}),
+	);
+	return new Map(entries);
+}
+
+function parseNumstatZ(
+	output: string,
+): Array<{ path: string; oldPath?: string; added: number; removed: number }> {
+	const entries: Array<{ path: string; oldPath?: string; added: number; removed: number }> = [];
+	let offset = 0;
+
+	while (offset < output.length) {
+		const recordEnd = output.indexOf("\0", offset);
+		if (recordEnd === -1) break;
+		const record = output.slice(offset, recordEnd);
+		offset = recordEnd + 1;
+		if (!record) continue;
+
+		const firstTab = record.indexOf("\t");
+		const secondTab = record.indexOf("\t", firstTab + 1);
+		if (firstTab === -1 || secondTab === -1) continue;
+
+		const addedStr = record.slice(0, firstTab);
+		const removedStr = record.slice(firstTab + 1, secondTab);
+		const pathField = record.slice(secondTab + 1);
+		const added = addedStr === "-" ? 0 : Number.parseInt(addedStr, 10) || 0;
+		const removed = removedStr === "-" ? 0 : Number.parseInt(removedStr, 10) || 0;
+
+		if (pathField) {
+			entries.push({ path: pathField, added, removed });
+			continue;
+		}
+
+		const oldPathEnd = output.indexOf("\0", offset);
+		if (oldPathEnd === -1) break;
+		const oldPath = output.slice(offset, oldPathEnd);
+		offset = oldPathEnd + 1;
+
+		const newPathEnd = output.indexOf("\0", offset);
+		if (newPathEnd === -1) break;
+		const newPath = output.slice(offset, newPathEnd);
+		offset = newPathEnd + 1;
+
+		entries.push({ path: newPath, oldPath, added, removed });
+	}
+
+	return entries;
+}
+
+function buildLineStatsMap(output: string): Map<string, LineStats> {
+	return new Map(
+		parseNumstatZ(output).map(({ path, added, removed }) => [path, { added, removed }]),
+	);
+}
+
+function parsePorcelainStatusZ(
+	output: string,
+): Array<{ status: string; path: string; oldPath?: string }> {
+	const entries: Array<{ status: string; path: string; oldPath?: string }> = [];
+	let offset = 0;
+
+	while (offset < output.length) {
+		const entryEnd = output.indexOf("\0", offset);
+		if (entryEnd === -1) break;
+		const entry = output.slice(offset, entryEnd);
+		offset = entryEnd + 1;
+		if (!entry) continue;
+
+		const status = entry.slice(0, 2);
+		const path = entry.slice(3);
+		let oldPath: string | undefined;
+		if (status.includes("R") || status.includes("C")) {
+			const oldPathEnd = output.indexOf("\0", offset);
+			if (oldPathEnd === -1) break;
+			oldPath = output.slice(offset, oldPathEnd);
+			offset = oldPathEnd + 1;
+		}
+
+		entries.push({ status, path, oldPath });
+	}
+
+	return entries;
 }
 
 export const gitService = {
@@ -117,10 +252,10 @@ export const gitService = {
 
 	async getUncommittedLineStats(worktreePath: string): Promise<{ added: number; removed: number }> {
 		// staged + unstaged diff against HEAD
-		const tracked = await exec(["diff", "HEAD", "--numstat"], worktreePath, true);
+		const tracked = await exec(["diff", "HEAD", "--numstat", "-z"], worktreePath, true);
 		// untracked files
 		const untracked = await exec(
-			["ls-files", "--others", "--exclude-standard"],
+			["ls-files", "--others", "--exclude-standard", "-z"],
 			worktreePath,
 			true,
 		);
@@ -129,26 +264,20 @@ export const gitService = {
 		let removed = 0;
 
 		if (tracked.exitCode === 0 && tracked.stdout) {
-			for (const line of tracked.stdout.split("\n").filter(Boolean)) {
-				const [a, r] = line.split("\t");
-				if (a !== "-") added += Number.parseInt(a, 10) || 0;
-				if (r !== "-") removed += Number.parseInt(r, 10) || 0;
+			for (const entry of parseNumstatZ(tracked.stdout)) {
+				added += entry.added;
+				removed += entry.removed;
 			}
 		}
 
-		// count lines in untracked files
 		if (untracked.exitCode === 0 && untracked.stdout) {
-			const files = untracked.stdout.split("\n").filter(Boolean);
-			for (const file of files) {
-				try {
-					const filePath = join(worktreePath, file);
-					const content = await Bun.file(filePath).text();
-					const lineCount = content.split("\n").length;
-					// Subtract 1 if file ends with newline (matching wc -l behavior)
-					added += content.endsWith("\n") ? lineCount - 1 : lineCount;
-				} catch {
-					// skip unreadable files
-				}
+			const untrackedStats = await getUntrackedLineStatsMap(
+				worktreePath,
+				parseNulSeparatedPaths(untracked.stdout),
+			);
+			for (const stats of untrackedStats.values()) {
+				added += stats.added;
+				removed += stats.removed;
 			}
 		}
 
@@ -303,25 +432,61 @@ export const gitService = {
 	},
 
 	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
-		const [statusResult, headResult, branchResult] = await Promise.all([
-			exec(["status", "--porcelain"], worktreePath),
+		const [
+			statusResult,
+			headResult,
+			branchResult,
+			stagedNumstat,
+			unstagedNumstat,
+			untrackedResult,
+		] = await Promise.all([
+			exec(["status", "--porcelain", "-z"], worktreePath),
 			exec(["rev-parse", "HEAD"], worktreePath),
 			exec(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
+			exec(["diff", "--cached", "--numstat", "-z"], worktreePath, true),
+			exec(["diff", "--numstat", "-z"], worktreePath, true),
+			exec(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath, true),
 		]);
 
-		const lines = statusResult.stdout.split("\n").filter(Boolean);
+		const stagedLineStats =
+			stagedNumstat.exitCode === 0
+				? buildLineStatsMap(stagedNumstat.stdout)
+				: new Map<string, LineStats>();
+		const unstagedLineStats =
+			unstagedNumstat.exitCode === 0
+				? buildLineStatsMap(unstagedNumstat.stdout)
+				: new Map<string, LineStats>();
+		const untrackedPaths =
+			untrackedResult.exitCode === 0 ? parseNulSeparatedPaths(untrackedResult.stdout) : [];
+		const untrackedLineStats = await getUntrackedLineStatsMap(worktreePath, untrackedPaths);
+
+		for (const [path, stats] of untrackedLineStats) {
+			unstagedLineStats.set(path, stats);
+		}
+
+		const entries = parsePorcelainStatusZ(statusResult.stdout);
 		let staged = 0;
 		let unstaged = 0;
 		let untracked = 0;
 		const MAX_FILES = 200;
-		const files: Array<{ status: string; path: string }> = [];
+		const files: GitStatusFile[] = [];
 
-		for (const line of lines) {
-			const x = line[0]; // index status
-			const y = line[1]; // worktree status
-			const path = line.slice(3);
+		for (const entry of entries) {
+			const x = entry.status[0]; // index status
+			const y = entry.status[1]; // worktree status
 			if (files.length < MAX_FILES) {
-				files.push({ status: line.slice(0, 2).trim(), path });
+				const stagedStats = stagedLineStats.get(entry.path) ?? { added: 0, removed: 0 };
+				const unstagedStats = unstagedLineStats.get(entry.path) ?? { added: 0, removed: 0 };
+				files.push({
+					status: entry.status,
+					path: entry.path,
+					linesAdded: stagedStats.added + unstagedStats.added,
+					linesRemoved: stagedStats.removed + unstagedStats.removed,
+					stagedLinesAdded: stagedStats.added,
+					stagedLinesRemoved: stagedStats.removed,
+					unstagedLinesAdded: unstagedStats.added,
+					unstagedLinesRemoved: unstagedStats.removed,
+				});
 			}
 
 			if (y === "?") {
@@ -333,12 +498,12 @@ export const gitService = {
 		}
 
 		return {
-			hasChanges: lines.length > 0,
+			hasChanges: entries.length > 0,
 			staged,
 			unstaged,
 			untracked,
 			files,
-			totalFiles: lines.length,
+			totalFiles: entries.length,
 			headSha: headResult.stdout,
 			branch: branchResult.stdout,
 		};

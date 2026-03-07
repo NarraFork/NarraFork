@@ -8,7 +8,7 @@ import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
-import { resolveProvider, settings } from "../lib/settings";
+import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
@@ -258,8 +258,9 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 	let finalText = "";
 	let hasError = false;
-	let narratorReasoningEffort =
-		(await narratorService.getById(narratorId)).reasoningEffort ?? undefined;
+	const initialNarrator = await narratorService.getById(narratorId);
+	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
+	let narratorFastMode = initialNarrator.fastMode ?? false;
 
 	while (true) {
 		const eventContext = buildSubagentEventContext(
@@ -273,6 +274,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const hooks: EventHooks = { onContextUsage: ctxMgmt.onContextUsage };
 
 		const resolvedProvider = resolveProvider(model);
+		const resolvedServiceTier =
+			narratorFastMode && usesCodexApiMode(resolvedProvider) ? "priority" : undefined;
 		const config: AgentConfig = {
 			narratorId,
 			conversationId: currentConversationId,
@@ -284,9 +287,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			signal,
 			reasoningEffort:
 				narratorReasoningEffort ??
-				(resolvedProvider === "codex" || resolvedProvider === "openai"
-					? settings.codex?.defaultReasoningEffort
-					: undefined),
+				(usesCodexApiMode(resolvedProvider) ? settings.codex?.defaultReasoningEffort : undefined),
+			serviceTier: resolvedServiceTier,
 			toolFilter: TOOL_FILTERS[subagentType],
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(
@@ -474,6 +476,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const freshNarrator = await narratorService.getById(narratorId);
 		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
 		narratorReasoningEffort = freshNarrator.reasoningEffort ?? undefined;
+		narratorFastMode = freshNarrator.fastMode ?? false;
 
 		// Rebuild system prompt with new contextSummary
 		systemPrompt = await buildSubagentSystemPrompt(

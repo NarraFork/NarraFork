@@ -29,6 +29,7 @@ import {
 	IconArrowDown,
 	IconArrowLeft,
 	IconArrowsMinimize,
+	IconBolt,
 	IconCheck,
 	IconCode,
 	IconCodeOff,
@@ -51,6 +52,7 @@ import {
 	useInterruptNarrator,
 	useNarrator,
 	useNarratorMessages,
+	useUpdateFastMode,
 	useUpdateModel,
 	useUpdatePermissionMode,
 	useUpdatePruneEnabled,
@@ -249,15 +251,30 @@ export function NarratorPanel({
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
+	const fastModeMutation = useUpdateFastMode();
 	const modelMutation = useUpdateModel();
 	const pruneEnabledMutation = useUpdatePruneEnabled();
-	const { visibleModels: allModels } = useAllModels();
+	const { visibleModels: allModels, settingsData } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
+	const codexCapableProviders = useMemo(() => {
+		const providers = new Set<string>();
+		if (settingsData?.codexAvailable) providers.add("codex");
+		for (const provider of settingsData?.openaiProviders ?? []) {
+			if (provider?.prefix && (provider.apiMode ?? "responses") === "codex") {
+				providers.add(provider.prefix);
+			}
+		}
+		return providers;
+	}, [settingsData]);
+	const supportsCodexControls = useMemo(() => {
+		const providerPrefix = narrator?.model?.split(":")[0];
+		return !!providerPrefix && codexCapableProviders.has(providerPrefix);
+	}, [codexCapableProviders, narrator?.model]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1750,8 +1767,8 @@ export function NarratorPanel({
 									/>
 								</Menu.Dropdown>
 							</Menu>
-							{/* Reasoning Effort (only for models containing "codex") */}
-							{narrator.model?.toLowerCase().includes("codex") && (
+							{/* Reasoning Effort (only for Codex-mode providers) */}
+							{supportsCodexControls && (
 								<Menu position="top-end">
 									<Menu.Target>
 										<NativeSelect
@@ -1779,6 +1796,24 @@ export function NarratorPanel({
 										/>
 									</Menu.Dropdown>
 								</Menu>
+							)}
+							{/* Fast Mode toggle (only for Codex-mode providers) */}
+							{supportsCodexControls && (
+								<Tooltip label={t("fast_mode_tooltip")}>
+									<ActionIcon
+										variant="subtle"
+										color={narrator.fastMode ? "yellow" : "gray"}
+										size="sm"
+										onClick={() =>
+											fastModeMutation.mutate({
+												id: narratorId,
+												fastMode: !narrator.fastMode,
+											})
+										}
+									>
+										<IconBolt size={16} />
+									</ActionIcon>
+								</Tooltip>
 							)}
 							{onToggleTerminal && (
 								<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
@@ -1842,8 +1877,8 @@ export function NarratorPanel({
 								/>
 							</Menu.Dropdown>
 						</Menu>
-						{/* Reasoning Effort (only for Codex models) - Mobile */}
-						{narrator.model?.startsWith("codex:") && (
+						{/* Reasoning Effort (only for Codex-mode providers) - Mobile */}
+						{supportsCodexControls && (
 							<Menu position="bottom-end" withinPortal>
 								<Menu.Target>
 									<ActionIcon variant="subtle" color="gray" size="sm">
@@ -1865,6 +1900,24 @@ export function NarratorPanel({
 									/>
 								</Menu.Dropdown>
 							</Menu>
+						)}
+						{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
+						{supportsCodexControls && (
+							<Tooltip label={t("fast_mode_tooltip")}>
+								<ActionIcon
+									variant="subtle"
+									color={narrator.fastMode ? "yellow" : "gray"}
+									size="sm"
+									onClick={() =>
+										fastModeMutation.mutate({
+											id: narratorId,
+											fastMode: !narrator.fastMode,
+										})
+									}
+								>
+									<IconBolt size={16} />
+								</ActionIcon>
+							</Tooltip>
 						)}
 						{onToggleTerminal && (
 							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>

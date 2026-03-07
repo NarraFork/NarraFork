@@ -458,6 +458,13 @@ export function getOpenaiProviderConfig(prefix?: string): OpenAIProviderConfig |
 	return providers.find((p) => p.prefix === prefix);
 }
 
+/** Whether a provider uses Codex API mode and supports Codex-only controls. */
+export function usesCodexApiMode(prefix?: string): boolean {
+	if (!prefix) return false;
+	if (prefix === "codex") return true;
+	return getOpenaiProviderConfig(prefix)?.apiMode === "codex";
+}
+
 /**
  * Get the provider prefix for a given OpenAI provider config.
  * Simply returns the config's prefix field.

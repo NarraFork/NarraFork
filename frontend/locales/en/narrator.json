@@ -67,6 +67,8 @@
 	"reasoning_medium": "Medium",
 	"reasoning_high": "High",
 	"reasoning_xhigh": "Extra High",
+	"fast_mode": "Fast Mode",
+	"fast_mode_tooltip": "Enable priority processing tier for faster inference (service_tier: priority)",
 	"archiveConfirmTitle": "Confirm Archive",
 	"archiveActiveWarning": "Are you sure you want to archive this session? If it is currently active, archiving will interrupt generation and reject pending permission requests.",
 	"confirmArchive": "Confirm",

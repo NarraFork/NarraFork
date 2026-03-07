@@ -105,6 +105,7 @@ export const createNarratorSchema = z.object({
 		.optional(),
 	cwd: z.string().min(1).max(4096).optional(),
 	reasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
+	fastMode: z.boolean().optional(),
 });
 
 export const sendMessageSchema = z.object({

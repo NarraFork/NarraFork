@@ -12,7 +12,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { resolveProvider, settings } from "../lib/settings";
+import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import { deleteNarratorUploads } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
@@ -270,6 +270,7 @@ interface CreateNarratorInput {
 	permissionMode?: string;
 	cwd?: string;
 	reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null;
+	fastMode?: boolean;
 }
 
 interface CreateSubagentInput {
@@ -318,7 +319,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			input.reasoningEffort === undefined
-				? resolvedProvider === "codex" || resolvedProvider === "openai"
+				? usesCodexApiMode(resolvedProvider)
 					? (settings.codex?.defaultReasoningEffort ?? null)
 					: null
 				: input.reasoningEffort;
@@ -333,6 +334,7 @@ export const narratorService = {
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
+				fastMode: input.fastMode ?? false,
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
@@ -366,7 +368,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??
-			(resolvedProvider === "codex" || resolvedProvider === "openai"
+			(usesCodexApiMode(resolvedProvider)
 				? (settings.codex?.defaultReasoningEffort ?? null)
 				: null);
 
@@ -381,6 +383,7 @@ export const narratorService = {
 				systemPrompt: input.systemPrompt ?? null,
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
+				fastMode: parent.fastMode ?? false,
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				inheritMode: "fresh",
@@ -443,7 +446,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			original.reasoningEffort ??
-			(resolvedProvider === "codex" || resolvedProvider === "openai"
+			(usesCodexApiMode(resolvedProvider)
 				? (settings.codex?.defaultReasoningEffort ?? null)
 				: null);
 
@@ -459,6 +462,7 @@ export const narratorService = {
 					systemPrompt: input.systemPrompt ?? null,
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,
+					fastMode: original.fastMode ?? false,
 					parentNarratorId: input.parentNarratorId,
 					forkMessageId: prefixRows.length > 0 ? prefixRows[prefixRows.length - 1].messageId : null,
 					cwd: input.cwd,
@@ -2186,6 +2190,14 @@ export const narratorService = {
 			.where(eq(narrators.id, narratorId));
 	},
 
+	async updateFastMode(narratorId: string, fastMode: boolean) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ fastMode, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
 	async updatePruneEnabled(narratorId: string, pruneEnabled: boolean) {
 		const now = new Date().toISOString();
 		await db
@@ -2457,7 +2469,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??
-			(resolvedProvider === "codex" || resolvedProvider === "openai"
+			(usesCodexApiMode(resolvedProvider)
 				? (settings.codex?.defaultReasoningEffort ?? null)
 				: null);
 
@@ -2472,6 +2484,7 @@ export const narratorService = {
 					systemPrompt,
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,
+					fastMode: parent.fastMode ?? false,
 					parentNarratorId,
 					forkMessageId: resolvedForkMessageId,
 					inheritMode,

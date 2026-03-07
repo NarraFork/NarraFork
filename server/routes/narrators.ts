@@ -671,6 +671,18 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Update fast mode
+narratorRoutes.patch("/:id/fast-mode", async (c) => {
+	const id = c.req.param("id");
+	const { fastMode } = await c.req.json();
+	if (typeof fastMode !== "boolean") {
+		throw new ValidationError("fastMode must be a boolean");
+	}
+	await narratorService.getById(id); // ensure exists
+	await narratorService.updateFastMode(id, fastMode);
+	return c.json({ ok: true });
+});
+
 // Update prune enabled
 narratorRoutes.patch("/:id/prune-enabled", async (c) => {
 	const id = c.req.param("id");

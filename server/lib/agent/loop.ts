@@ -372,6 +372,7 @@ export async function* agentLoop(
 				signal: config.signal,
 				stickySessionKey: config.narratorId,
 				reasoningEffort: config.reasoningEffort,
+				serviceTier: config.serviceTier,
 				...(isFirstTurn && images?.length ? { images } : {}),
 			});
 

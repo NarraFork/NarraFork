@@ -314,6 +314,7 @@ export const api = {
 		systemPrompt?: string;
 		permissionMode?: string;
 		reasoningEffort?: string | null;
+		fastMode?: boolean;
 		cwd?: string;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	archiveNarrator: (id: string) =>
@@ -381,6 +382,11 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${id}/reasoning-effort`, {
 			method: "PATCH",
 			body: JSON.stringify({ reasoningEffort }),
+		}),
+	updateNarratorFastMode: (id: string, fastMode: boolean) =>
+		request<{ ok: boolean }>(`/narrators/${id}/fast-mode`, {
+			method: "PATCH",
+			body: JSON.stringify({ fastMode }),
 		}),
 	updateNarratorPruneEnabled: (id: string, pruneEnabled: boolean) =>
 		request<{ ok: boolean }>(`/narrators/${id}/prune-enabled`, {

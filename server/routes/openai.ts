@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
 import {
+	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
 	openaiProviderPrefix,
 	registerOpenaiModelChecker,
@@ -130,6 +131,21 @@ registerOpenaiModelLister(() => {
 	return result;
 });
 
+function defaultBaseUrl(config: OpenAIProviderConfig): string {
+	return config.apiMode === "codex"
+		? "https://chatgpt.com/backend-api/codex"
+		: "https://api.openai.com/v1";
+}
+
+function isOfficialCodexDomain(baseUrl: string): boolean {
+	try {
+		const host = new URL(baseUrl).hostname;
+		return host === "chatgpt.com" || host.endsWith(".chatgpt.com") || host.endsWith(".openai.com");
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Build a list of candidate URLs for the /models endpoint.
  */
@@ -157,13 +173,23 @@ function buildModelsUrls(baseUrl: string): string[] {
 /** Fetch models from a specific OpenAI-compatible provider. */
 async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIModelInfo[]> {
 	const apiKey = config.apiKey;
-	const baseUrl = (config.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+	const baseUrl = (config.baseUrl || defaultBaseUrl(config)).replace(/\/+$/, "");
 
 	if (!apiKey) {
 		throw new Error(`OpenAI API key not configured for provider "${config.name}"`);
 	}
 
-	const headers = { Authorization: `Bearer ${apiKey}` };
+	if (config.apiMode === "codex" && isOfficialCodexDomain(baseUrl)) {
+		return getBuiltinCodexModels().map((id) => ({ id }));
+	}
+
+	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
+	if (config.apiMode === "codex") {
+		headers.originator = "narrafork";
+		if (config.codexAccountId && isOfficialCodexDomain(baseUrl)) {
+			headers["ChatGPT-Account-Id"] = config.codexAccountId;
+		}
+	}
 	const candidateUrls = buildModelsUrls(baseUrl);
 	const errors: string[] = [];
 
