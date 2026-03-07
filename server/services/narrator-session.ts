@@ -14,7 +14,8 @@ import {
 	projects,
 } from "../db/schema";
 import { buildHistory, type PermissionResult, resolveProviderAndModel } from "../lib/agent";
-import { analyzeBashCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
+import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
+import { detectShell } from "../lib/agent/shell";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { NotFoundError } from "../lib/errors";
@@ -412,11 +413,12 @@ export async function handlePermission(
 		}
 	}
 
-	// Bash command pre-analysis via tree-sitter AST
+	// Shell command pre-analysis (tree-sitter AST for bash, regex for PowerShell)
 	let bashAnalysis: BashAnalysis | undefined;
 	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
 		try {
-			bashAnalysis = await analyzeBashCommand(input.command, cwd, isChapter);
+			const shellType = detectShell().type;
+			bashAnalysis = await analyzeShellCommand(input.command, cwd, shellType, isChapter);
 		} catch (err) {
 			logger.warn("Bash command analysis failed, falling back to ask", { err });
 			// Analysis failure → conservative: ask user

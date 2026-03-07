@@ -120,7 +120,7 @@ export { STATUS_COLORS };
 
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit"]);
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
-const BASH_TOOLS = new Set(["Bash", "Execute"]);
+const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const TODO_TOOLS = new Set(["TodoWrite"]);
@@ -638,7 +638,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<ContentViewer
 						content={outputText}
 						style={termStyle}
-						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Bash"}
+						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Shell"}
 					/>
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>

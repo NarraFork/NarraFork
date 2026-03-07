@@ -1637,4 +1637,469 @@ export {
 	DANGEROUS_ENV_VARS,
 	GIT_READONLY_SUBCOMMANDS,
 	GIT_CURRENT_BRANCH_SAFE,
+	PS_SAFE_CMDLETS,
+	PS_ALWAYS_ASK_CMDLETS,
 };
+
+// ── PowerShell 命令分析 ──────────────────────────────────
+
+/**
+ * PowerShell 安全 cmdlet — 只读/无副作用操作，可自动放行。
+ * 包含完整 cmdlet 名和常用别名。
+ */
+const PS_SAFE_CMDLETS = new Set([
+	// 文件浏览（只读）
+	"get-childitem",
+	"gci",
+	"dir",
+	"ls",
+	"get-content",
+	"gc",
+	"cat",
+	"type",
+	"get-item",
+	"gi",
+	"get-itemproperty",
+	"gp",
+	"test-path",
+	"resolve-path",
+	"split-path",
+	"join-path",
+	"convert-path",
+	// 搜索
+	"select-string",
+	"sls",
+	// 输出
+	"write-output",
+	"echo",
+	"write-host",
+	"write-verbose",
+	"write-debug",
+	"write-warning",
+	"out-string",
+	"out-null",
+	"format-list",
+	"fl",
+	"format-table",
+	"ft",
+	"format-wide",
+	"fw",
+	// 系统信息（只读）
+	"get-date",
+	"get-location",
+	"gl",
+	"pwd",
+	"get-command",
+	"gcm",
+	"get-alias",
+	"gal",
+	"get-help",
+	"help",
+	"get-host",
+	"get-process",
+	"gps",
+	"ps",
+	"get-variable",
+	"gv",
+	"get-module",
+	"gmo",
+	"get-executionpolicy",
+	"get-culture",
+	"get-uiculture",
+	// 文本处理（只读）
+	"select-object",
+	"select",
+	"where-object",
+	"where",
+	"?",
+	"foreach-object",
+	"foreach",
+	"%",
+	"sort-object",
+	"sort",
+	"group-object",
+	"group",
+	"measure-object",
+	"measure",
+	"compare-object",
+	"diff",
+	"compare",
+	// 类型转换
+	"convertto-json",
+	"convertfrom-json",
+	"convertto-csv",
+	"convertfrom-csv",
+	"convertto-xml",
+	"convertto-html",
+	// 版本控制（git 通过 PowerShell 调用）
+	"git",
+	// 数学
+	"get-random",
+	// 路径工具
+	"get-psdrive",
+]);
+
+/**
+ * PowerShell 危险 cmdlet — 始终需要用户确认。
+ */
+const PS_ALWAYS_ASK_CMDLETS = new Set([
+	// 删除
+	"remove-item",
+	"ri",
+	"rm",
+	"rmdir",
+	"del",
+	"erase",
+	"rd",
+	"clear-content",
+	"clc",
+	"clear-item",
+	"cli",
+	"clear-itemproperty",
+	"clp",
+	// 文件写入
+	"set-content",
+	"sc",
+	"add-content",
+	"ac",
+	"out-file",
+	// 文件操作
+	"copy-item",
+	"cp",
+	"copy",
+	"cpi",
+	"move-item",
+	"mv",
+	"move",
+	"mi",
+	"rename-item",
+	"ren",
+	"rni",
+	"new-item",
+	"ni",
+	"mkdir",
+	"md",
+	// 进程管理
+	"stop-process",
+	"kill",
+	"spps",
+	"start-process",
+	"saps",
+	"start",
+	// 代码执行
+	"invoke-expression",
+	"iex",
+	"invoke-command",
+	"icm",
+	"start-job",
+	"sajb",
+	// 网络（可能下载执行）
+	"invoke-webrequest",
+	"iwr",
+	"curl",
+	"wget",
+	"invoke-restmethod",
+	"irm",
+	// 服务管理
+	"start-service",
+	"sasv",
+	"stop-service",
+	"spsv",
+	"restart-service",
+	"set-service",
+	// 注册表
+	"set-itemproperty",
+	"sp",
+	"new-itemproperty",
+	"remove-itemproperty",
+	"rp",
+	// 权限
+	"set-acl",
+	"set-executionpolicy",
+	// 脚本执行
+	"powershell",
+	"pwsh",
+	"cmd",
+	"cmd.exe",
+	// 包管理
+	"install-module",
+	"install-package",
+	"install-script",
+	// 运行时
+	"node",
+	"python",
+	"python3",
+	"bun",
+	"npm",
+	"yarn",
+	"pnpm",
+	// 系统控制
+	"restart-computer",
+	"stop-computer",
+]);
+
+/**
+ * PowerShell 灾难性命令模式 — 即使 bypassPermissions 也必须拒绝。
+ */
+const PS_CATASTROPHIC_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+	{
+		pattern: /remove-item\s+.*-recurse.*[/\\]\s*$/i,
+		reason: "Remove-Item -Recurse on root path",
+	},
+	{
+		pattern: /remove-item\s+.*-recurse.*\$env:systemroot/i,
+		reason: "Remove-Item -Recurse on system root",
+	},
+	{
+		pattern: /format-volume/i,
+		reason: "Format-Volume (disk format)",
+	},
+	{
+		pattern: /clear-disk/i,
+		reason: "Clear-Disk (disk wipe)",
+	},
+	{
+		pattern: /restart-computer\s*.*-force/i,
+		reason: "Restart-Computer -Force",
+	},
+	{
+		pattern: /stop-computer\s*.*-force/i,
+		reason: "Stop-Computer -Force",
+	},
+];
+
+/**
+ * 基于正则的 PowerShell 命令分析。
+ * 不使用 AST 解析器，而是通过 token 化和模式匹配来分类命令。
+ */
+export function analyzePowerShellCommand(
+	command: string,
+	cwd: string,
+	isChapter = false,
+): BashAnalysis {
+	const commands: BashAnalysis["commands"] = [];
+	const filePaths: string[] = [];
+	const nonWhitelisted: string[] = [];
+	const dangerousPatterns: string[] = [];
+	let hasWriteOperation = false;
+
+	// 灾难性命令检测
+	let catastrophicReason: string | undefined;
+	for (const { pattern, reason } of PS_CATASTROPHIC_PATTERNS) {
+		if (pattern.test(command)) {
+			catastrophicReason = reason;
+			break;
+		}
+	}
+
+	// 将命令按 ; 和 && 和 || 分割为子命令（不按 | 分割，因为 PowerShell 管道很常见）
+	const subCommands = command
+		.split(/\s*(?:;|&&|\|\|)\s*/)
+		.map((s) => s.trim())
+		.filter(Boolean);
+
+	for (const sub of subCommands) {
+		// 提取管道中的每个命令
+		const pipeSegments = splitPowerShellPipeline(sub);
+
+		for (const segment of pipeSegments) {
+			const tokens = tokenizePowerShell(segment);
+			if (tokens.length === 0) continue;
+
+			commands.push({ tokens, text: segment, fullText: sub });
+
+			const cmdName = tokens[0];
+			const cmdLower = cmdName.toLowerCase();
+
+			// 检查是否是 git 命令（PowerShell 中也可以直接调用 git）
+			if (cmdLower === "git") {
+				if (cmdLower in CONDITIONAL_COMMANDS) {
+					const danger = CONDITIONAL_COMMANDS[cmdLower](tokens, sub);
+					if (danger) {
+						if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+						dangerousPatterns.push(danger);
+					}
+				}
+				continue;
+			}
+
+			// PowerShell 安全 cmdlet
+			if (PS_SAFE_CMDLETS.has(cmdLower)) {
+				continue;
+			}
+
+			// PowerShell 危险 cmdlet
+			if (PS_ALWAYS_ASK_CMDLETS.has(cmdLower)) {
+				if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				if (
+					cmdLower === "set-content" ||
+					cmdLower === "sc" ||
+					cmdLower === "add-content" ||
+					cmdLower === "ac" ||
+					cmdLower === "out-file"
+				) {
+					hasWriteOperation = true;
+				}
+				continue;
+			}
+
+			// 检查 bunx/npx（PowerShell 中也可以调用）
+			if (cmdLower === "bunx" || cmdLower === "npx") {
+				if (cmdLower in CONDITIONAL_COMMANDS) {
+					const danger = CONDITIONAL_COMMANDS[cmdLower](tokens, sub);
+					if (danger) {
+						if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+						dangerousPatterns.push(danger);
+					}
+				} else if (!SAFE_COMMANDS.has(cmdLower)) {
+					if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				}
+				continue;
+			}
+
+			// 检查是否是 bash 白名单中的命令（PowerShell 也能调用外部程序）
+			if (SAFE_COMMANDS.has(cmdLower)) {
+				if (cmdLower in CONDITIONAL_COMMANDS) {
+					const danger = CONDITIONAL_COMMANDS[cmdLower](tokens, sub);
+					if (danger) {
+						if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+						dangerousPatterns.push(danger);
+					}
+				}
+				continue;
+			}
+
+			if (ALWAYS_ASK_COMMANDS.has(cmdLower)) {
+				if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				continue;
+			}
+
+			// 未知命令 — 需要确认
+			if (!nonWhitelisted.includes(cmdName)) {
+				nonWhitelisted.push(cmdName);
+			}
+		}
+	}
+
+	// Pipe-to-shell 检测（PowerShell 版本）
+	if (/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i.test(command)) {
+		const match = command.match(
+			/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i,
+		);
+		if (match) {
+			dangerousPatterns.push(`pipe to ${match[1]}`);
+			if (!nonWhitelisted.includes(match[1])) nonWhitelisted.push(match[1]);
+		}
+	}
+
+	// 环境变量注入检测（PowerShell 版本）
+	const hasEnvInjection =
+		/\$env:(LD_PRELOAD|NODE_OPTIONS|BASH_ENV|PROMPT_COMMAND)\b/i.test(command);
+	if (hasEnvInjection && nonWhitelisted.length === 0) {
+		nonWhitelisted.push("(env injection)");
+	}
+
+	// Chapter 模式下的 git 分支违规检测
+	const gitBranchViolations = isChapter ? detectGitBranchViolations(commands) : [];
+
+	return {
+		commands,
+		filePaths,
+		allWhitelisted:
+			nonWhitelisted.length === 0 &&
+			dangerousPatterns.length === 0 &&
+			!hasEnvInjection,
+		nonWhitelisted,
+		dangerousPatterns,
+		hasEnvInjection,
+		isCatastrophic: catastrophicReason !== undefined,
+		catastrophicReason,
+		gitBranchViolations,
+		hasWriteOperation,
+	};
+}
+
+/**
+ * 简单的 PowerShell 命令 token 化。
+ * 按空格分割，但尊重引号内的空格。
+ */
+function tokenizePowerShell(command: string): string[] {
+	const tokens: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (ch === "'" && !inDouble) {
+			inSingle = !inSingle;
+			current += ch;
+		} else if (ch === '"' && !inSingle) {
+			inDouble = !inDouble;
+			current += ch;
+		} else if ((ch === " " || ch === "\t") && !inSingle && !inDouble) {
+			if (current) {
+				tokens.push(current);
+				current = "";
+			}
+		} else {
+			current += ch;
+		}
+	}
+	if (current) tokens.push(current);
+	return tokens;
+}
+
+/**
+ * Split a PowerShell command by pipe operator, respecting quotes and parentheses.
+ */
+function splitPowerShellPipeline(command: string): string[] {
+	const segments: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
+	let parenDepth = 0;
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (ch === "'" && !inDouble) {
+			inSingle = !inSingle;
+			current += ch;
+		} else if (ch === '"' && !inSingle) {
+			inDouble = !inDouble;
+			current += ch;
+		} else if (ch === "(" && !inSingle && !inDouble) {
+			parenDepth++;
+			current += ch;
+		} else if (ch === ")" && !inSingle && !inDouble) {
+			parenDepth = Math.max(0, parenDepth - 1);
+			current += ch;
+		} else if (ch === "|" && !inSingle && !inDouble && parenDepth === 0) {
+			const trimmed = current.trim();
+			if (trimmed) segments.push(trimmed);
+			current = "";
+		} else {
+			current += ch;
+		}
+	}
+	const trimmed = current.trim();
+	if (trimmed) segments.push(trimmed);
+	return segments;
+}
+
+/**
+ * 统一的命令分析入口 — 根据 shell 类型选择合适的分析器。
+ * @param shellType 当前使用的 shell 类型
+ */
+export async function analyzeShellCommand(
+	command: string,
+	cwd: string,
+	shellType: "bash" | "powershell" | "cmd",
+	isChapter = false,
+): Promise<BashAnalysis> {
+	if (shellType === "powershell") {
+		return analyzePowerShellCommand(command, cwd, isChapter);
+	}
+	// bash 和 cmd 都使用 bash 分析器（cmd 上的命令通常也是 unix-like 工具）
+	return analyzeBashCommand(command, cwd, isChapter);
+}

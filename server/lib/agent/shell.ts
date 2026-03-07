@@ -66,9 +66,13 @@ export async function killTree(
 
 const SHELL_BLACKLIST = new Set(["fish", "nu"]);
 
+export type ShellType = "bash" | "powershell" | "cmd";
+
 export interface ShellInfo {
 	/** Path to the shell executable. */
 	path: string;
+	/** Which kind of shell this is. */
+	type: ShellType;
 	/**
 	 * Extra environment variables to inject when spawning commands with this shell.
 	 * For Git Bash on Windows this includes MSYS2_PATH_TYPE=inherit so that
@@ -101,12 +105,17 @@ export function detectShell(): ShellInfo {
 	let shellPath: string | undefined;
 	const extraEnv: Record<string, string> = {};
 	let loginWrap = false;
+	let type: ShellType = "bash";
 
 	if (process.platform === "win32") {
-		shellPath = findGitBash() ?? Bun.which("pwsh") ?? "powershell.exe";
-		if (isGitBash(shellPath)) {
+		shellPath = findGitBash();
+		if (shellPath) {
 			loginWrap = true;
 			extraEnv.MSYS2_PATH_TYPE = "inherit";
+			type = "bash";
+		} else {
+			shellPath = Bun.which("pwsh") ?? "powershell.exe";
+			type = "powershell";
 		}
 	} else {
 		const env = process.env.SHELL;
@@ -123,10 +132,16 @@ export function detectShell(): ShellInfo {
 				shellPath = Bun.which("bash") ?? "/bin/sh";
 			}
 		}
+		type = "bash";
 	}
 
-	_cachedShellInfo = { path: shellPath, extraEnv, loginWrap };
+	_cachedShellInfo = { path: shellPath, type, extraEnv, loginWrap };
 	return _cachedShellInfo;
+}
+
+/** Reset the cached shell info (for testing). */
+export function _resetShellCache(): void {
+	_cachedShellInfo = undefined;
 }
 
 // ── Windows Git Bash detection ───────────────────────────────────────────────
@@ -139,13 +154,17 @@ export function detectShell(): ShellInfo {
  *   `C:\Program Files\Git\bin\bash.exe`
  *   `C:\Program Files\Git\usr\bin\bash.exe`
  *
- * We check well-known install locations first, then fall back to
- * `Bun.which("bash")` but reject anything under System32/SysWOW64.
+ * Detection strategy (in order):
+ *   1. Well-known install paths (Program Files, LocalAppData)
+ *   2. GIT_INSTALL_ROOT environment variable (set by Scoop and some installers)
+ *   3. Scan all environment variables for paths containing a Git installation
+ *   4. `git --exec-path` to reverse-locate the Git install directory
+ *   5. `Bun.which("bash")` but reject anything under System32/SysWOW64
  */
 function findGitBash(): string | undefined {
 	const { existsSync } = require("node:fs") as typeof import("node:fs");
 
-	// Well-known Git for Windows install paths
+	// 1. Well-known Git for Windows install paths
 	const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
 	const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
 	const localAppData = process.env.LOCALAPPDATA ?? "";
@@ -167,10 +186,109 @@ function findGitBash(): string | undefined {
 		if (existsSync(candidate)) return candidate;
 	}
 
-	// Fallback: Bun.which("bash") but reject WSL bash
-	const found = Bun.which("bash");
-	if (found && !isWslBash(found)) return found;
+	// 2. GIT_INSTALL_ROOT (set by Scoop, Chocolatey, and some custom installers)
+	const gitInstallRoot = process.env.GIT_INSTALL_ROOT;
+	if (gitInstallRoot) {
+		for (const sub of ["bin\\bash.exe", "usr\\bin\\bash.exe"]) {
+			const p = path.join(gitInstallRoot, sub);
+			if (existsSync(p)) return p;
+		}
+	}
 
+	// 3. Scan all environment variables for Git installation paths.
+	//    Many tools (Scoop, Chocolatey, portable Git) add Git paths to PATH or
+	//    custom env vars. We look for any value containing a directory with
+	//    `\Git\` and check for bash.exe inside it.
+	const found = findGitBashFromEnvVars(existsSync);
+	if (found) return found;
+
+	// 4. Ask git itself where it's installed
+	const fromGit = findGitBashViaGitExecPath(existsSync);
+	if (fromGit) return fromGit;
+
+	// 5. Fallback: Bun.which("bash") but reject WSL bash
+	const whichBash = Bun.which("bash");
+	if (whichBash && !isWslBash(whichBash)) return whichBash;
+
+	return undefined;
+}
+
+/**
+ * Scan all environment variables for paths that contain a Git installation.
+ * Looks for `\Git\` in PATH-like variables and individual path values.
+ */
+function findGitBashFromEnvVars(existsSync: (p: string) => boolean): string | undefined {
+	const checked = new Set<string>();
+
+	for (const [, value] of Object.entries(process.env)) {
+		if (!value) continue;
+
+		// Split on ; (Windows PATH separator) to handle PATH-like variables
+		const segments = value.includes(";") ? value.split(";") : [value];
+
+		for (const segment of segments) {
+			const trimmed = segment.trim();
+			if (!trimmed) continue;
+
+			// Look for segments containing \Git\ or ending with \Git
+			const lower = trimmed.toLowerCase().replace(/\//g, "\\");
+			const gitIdx = lower.indexOf("\\git\\");
+			const endsWithGit = lower.endsWith("\\git");
+			if (gitIdx < 0 && !endsWithGit) continue;
+
+			// Extract the Git root directory
+			let gitRoot: string;
+			if (gitIdx >= 0) {
+				gitRoot = trimmed.slice(0, gitIdx + 4); // include \Git
+			} else {
+				gitRoot = trimmed;
+			}
+
+			if (checked.has(gitRoot.toLowerCase())) continue;
+			checked.add(gitRoot.toLowerCase());
+
+			// Skip WSL paths
+			if (isWslBash(gitRoot)) continue;
+
+			for (const sub of ["bin\\bash.exe", "usr\\bin\\bash.exe"]) {
+				const p = path.join(gitRoot, sub);
+				if (existsSync(p)) return p;
+			}
+		}
+	}
+
+	return undefined;
+}
+
+/**
+ * Use `git --exec-path` to find the Git installation directory,
+ * then look for bash.exe relative to it.
+ */
+function findGitBashViaGitExecPath(existsSync: (p: string) => boolean): string | undefined {
+	try {
+		const execPath = execSync("git --exec-path", {
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 3000,
+		}).trim();
+		if (!execPath) return undefined;
+
+		// git --exec-path returns something like:
+		//   C:\Program Files\Git\mingw64\libexec\git-core
+		// We need to go up to the Git root
+		let dir = execPath;
+		for (let i = 0; i < 5; i++) {
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+			for (const sub of ["bin\\bash.exe", "usr\\bin\\bash.exe"]) {
+				const p = path.join(dir, sub);
+				if (existsSync(p)) return p;
+			}
+		}
+	} catch {
+		// git not found or timed out
+	}
 	return undefined;
 }
 
@@ -180,14 +298,11 @@ function isWslBash(bashPath: string): boolean {
 	return lower.includes("/system32/") || lower.includes("/syswow64/");
 }
 
-/** Check whether a shell path points to Git Bash / MSYS2 bash. */
-function isGitBash(shellPath: string): boolean {
-	const lower = shellPath.toLowerCase().replace(/\\/g, "/");
-	return (
-		(lower.endsWith("/bash.exe") || lower.endsWith("/bash")) &&
-		(lower.includes("/git/") || lower.includes("/msys")) &&
-		!isWslBash(shellPath)
-	);
+
+/** Check whether a shell path points to PowerShell (pwsh or powershell.exe). */
+export function isPowerShell(shellPath: string): boolean {
+	const lower = path.basename(shellPath).toLowerCase();
+	return lower === "pwsh" || lower === "pwsh.exe" || lower === "powershell.exe";
 }
 
 /**

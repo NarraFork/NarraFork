@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { detectShell } from "../lib/agent/shell";
 import { IS_WINDOWS } from "../lib/platform";
 import {
 	getPlanModeSystemReminder,
@@ -64,15 +65,21 @@ export async function buildEffectiveSystemPrompt(
 		prompt = `${base}${sep}## Conversation Context\n\n${contextSummary}`;
 	}
 
-	// 2. Inject current working directory
+	// 2. Inject current working directory + shell type info
 	{
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
+		const shellInfo = detectShell();
 		const shellLabel = IS_WINDOWS ? "Shell" : "Bash";
 		const toolList = IS_WINDOWS
 			? `All tools (Shell, Read, Write, Edit, Glob, Grep)`
 			: `All tools (Bash, Read, Write, Edit, Glob, Grep)`;
-		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\`\n\n${toolList} already use this as their default working directory. Do NOT \`cd\` into it in ${shellLabel} commands — it is redundant.`;
+		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\n${toolList} already use this as their default working directory. Do NOT \`cd\` into it in ${shellLabel} commands — it is redundant.`;
+		// When running PowerShell on Windows, add guidance for the AI
+		if (shellInfo.type === "powershell") {
+			cwdSection += `\n\nNote: The Shell tool uses PowerShell on this system. Use PowerShell syntax (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, ls, cat). Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands when possible.`;
+		}
+		prompt = `${base}${sep}${cwdSection}`;
 	}
 
 	// 3. Inject AGENT.md (fallback to CLAUDE.md) if present

@@ -102,6 +102,13 @@ export const bashTool: ToolDefinition = {
 					["--login", "-c", command],
 					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
 				];
+			} else if (shellInfo.type === "powershell") {
+				// PowerShell: use -NoProfile -Command for clean, predictable execution
+				spawnArgs = [
+					shellInfo.path,
+					["-NoProfile", "-NonInteractive", "-Command", command],
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				];
 			} else {
 				spawnArgs = [
 					command,
