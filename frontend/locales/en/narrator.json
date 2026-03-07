@@ -143,5 +143,13 @@
 	"backgroundFailed": "Background task failed",
 	"backgroundCancelled": "Background task cancelled",
 	"backgroundTaskCompletedTitle": "Background Task Completed",
-	"backgroundTaskFailedTitle": "Background Task Failed"
+	"backgroundTaskFailedTitle": "Background Task Failed",
+	"mergeSummaryLabel": "Branch Merged",
+	"mergeSummaryTitle": "Merge Summary",
+	"mergeSummaryBranch": "Branch",
+	"mergeSummaryStrategy": "Strategy",
+	"unmerge": "Unmerge (reset)",
+	"unmergeSuccess": "Unmerge successful",
+	"unmergeSuccessDesc": "The merge has been reverted and the branch is active again.",
+	"unmergeFailed": "Unmerge failed"
 }

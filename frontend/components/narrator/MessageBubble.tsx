@@ -24,9 +24,10 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconGitCommit,
+	IconGitMerge,
 	IconListCheck,
 } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
@@ -281,6 +282,135 @@ function CompactIndicator({
 								</Button>
 							</>
 						)}
+					</Group>
+				)}
+			</Modal>
+		</>
+	);
+}
+
+function MergeSummaryCard({
+	block,
+	onDelete,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	block: any;
+	onDelete?: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [opened, { open, close }] = useDisclosure(false);
+	const qc = useQueryClient();
+
+	const unmergeMutation = useMutation({
+		mutationFn: () => api.unmergeChapter(block.sourceChapterId),
+		onSuccess: () => {
+			close();
+			onDelete?.();
+			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["chapters"] });
+			notifications.show({
+				title: t("unmergeSuccess"),
+				message: t("unmergeSuccessDesc"),
+				color: "green",
+			});
+		},
+		onError: (err) => {
+			notifications.show({
+				title: t("unmergeFailed"),
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
+		},
+	});
+
+	const header = block.mergedBy
+		? `${block.sourceBranch} → ${block.targetBranch} (${block.mergedBy})`
+		: `${block.sourceBranch} → ${block.targetBranch}`;
+
+	return (
+		<>
+			<Paper
+				p="xs"
+				radius="sm"
+				style={{
+					backgroundColor: "var(--mantine-color-indigo-light)",
+					cursor: "pointer",
+				}}
+				onClick={open}
+				onContextMenu={(e) => {
+					if (!block.sourceChapterId) return;
+					e.preventDefault();
+					open();
+				}}
+			>
+				<Group gap={6} wrap="nowrap">
+					<IconGitMerge
+						size={16}
+						style={{ flexShrink: 0, color: "var(--mantine-color-indigo-6)" }}
+					/>
+					<Text size="xs" c="indigo" lineClamp={1}>
+						{t("mergeSummaryLabel")} — {header}
+					</Text>
+				</Group>
+			</Paper>
+
+			<Modal
+				opened={opened}
+				onClose={close}
+				title={
+					<Group gap="xs">
+						<IconGitMerge size={18} style={{ color: "var(--mantine-color-indigo-6)" }} />
+						<Text fw={600}>{t("mergeSummaryTitle")}</Text>
+					</Group>
+				}
+				size="lg"
+			>
+				<Stack gap="xs" mb="md">
+					<Group gap="xs">
+						<Text size="sm" c="dimmed">
+							{t("mergeSummaryBranch")}:
+						</Text>
+						<Text size="sm" fw={500}>
+							{header}
+						</Text>
+					</Group>
+					{block.strategy && (
+						<Group gap="xs">
+							<Text size="sm" c="dimmed">
+								{t("mergeSummaryStrategy")}:
+							</Text>
+							<Text size="sm">{block.strategy}</Text>
+						</Group>
+					)}
+					{block.commitSha && (
+						<Group gap="xs">
+							<Text size="sm" c="dimmed">
+								Commit:
+							</Text>
+							<Text size="sm" ff="monospace">
+								{block.commitSha.slice(0, 8)}
+							</Text>
+						</Group>
+					)}
+				</Stack>
+
+				{block.summary && (
+					<ScrollArea.Autosize mah="60vh">
+						<MarkdownContent text={block.summary} />
+					</ScrollArea.Autosize>
+				)}
+
+				{block.sourceChapterId && (
+					<Group justify="flex-end" mt="md">
+						<Button
+							color="orange"
+							variant="light"
+							size="xs"
+							loading={unmergeMutation.isPending}
+							onClick={() => unmergeMutation.mutate()}
+						>
+							{t("unmerge")}
+						</Button>
 					</Group>
 				)}
 			</Modal>
@@ -623,8 +753,13 @@ export const MessageBubble = memo(function MessageBubble({
 		onDeleteBlock,
 	]);
 
-	// System messages (compact indicators / plan cards)
+	// System messages (compact indicators / plan cards / merge summaries)
 	if (message.role === "system") {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const mergeSummaryBlock = blocks.find((b: any) => b.type === "merge_summary");
+		if (mergeSummaryBlock) {
+			return <MergeSummaryCard block={mergeSummaryBlock} onDelete={invalidateMessages} />;
+		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (compactBlock) {
@@ -693,14 +828,14 @@ export const MessageBubble = memo(function MessageBubble({
 							: "var(--mantine-color-teal-light)",
 					}}
 				>
-			<Group gap={6} align="center">
-					<IconGitCommit size={16} style={{ flexShrink: 0 }} />
-					<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
-						{(textBlock?.text ?? message.contentText ?? "")
-							.replace(/<\/?system-reminder>/g, "")
-							.trim()}
-					</Text>
-				</Group>
+					<Group gap={6} align="center">
+						<IconGitCommit size={16} style={{ flexShrink: 0 }} />
+						<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
+							{(textBlock?.text ?? message.contentText ?? "")
+								.replace(/<\/?system-reminder>/g, "")
+								.trim()}
+						</Text>
+					</Group>
 				</Paper>
 			);
 		}
