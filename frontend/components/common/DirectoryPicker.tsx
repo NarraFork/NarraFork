@@ -25,6 +25,9 @@ interface DirectoryPickerProps {
 	placeholder?: string;
 	description?: string;
 	required?: boolean;
+	/** Extra element rendered before the browse button in rightSection */
+	rightSectionExtra?: React.ReactNode;
+	leftSection?: React.ReactNode;
 }
 
 export function DirectoryPicker({
@@ -34,6 +37,8 @@ export function DirectoryPicker({
 	placeholder,
 	description,
 	required,
+	rightSectionExtra,
+	leftSection,
 }: DirectoryPickerProps) {
 	const { t } = useTranslation("common");
 	const [opened, { open, close }] = useDisclosure(false);
@@ -50,6 +55,19 @@ export function DirectoryPicker({
 		close();
 	};
 
+	const rightContent = rightSectionExtra ? (
+		<Group gap={2} wrap="nowrap">
+			{rightSectionExtra}
+			<ActionIcon variant="subtle" onClick={handleOpen} aria-label={t("browse")}>
+				<IconFolderOpen size={18} />
+			</ActionIcon>
+		</Group>
+	) : (
+		<ActionIcon variant="subtle" onClick={handleOpen} aria-label={t("browse")}>
+			<IconFolderOpen size={18} />
+		</ActionIcon>
+	);
+
 	return (
 		<>
 			<TextInput
@@ -59,11 +77,9 @@ export function DirectoryPicker({
 				required={required}
 				value={value}
 				onChange={(e) => onChange(e.currentTarget.value)}
-				rightSection={
-					<ActionIcon variant="subtle" onClick={handleOpen} aria-label={t("browse")}>
-						<IconFolderOpen size={18} />
-					</ActionIcon>
-				}
+				leftSection={leftSection}
+				rightSection={rightContent}
+				rightSectionWidth={rightSectionExtra ? 64 : undefined}
 			/>
 			<Modal opened={opened} onClose={close} title={t("selectDirectory")} size="lg">
 				<DirectoryBrowser initialPath={browsePath} onSelect={handleSelect} onCancel={close} />
