@@ -43,7 +43,12 @@ app.use(
 
 // Public routes (no auth required)
 app.route("/api/auth", authRoutes);
-app.get("/api/health", (c) => c.json({ status: "ok" }));
+app.get("/api/health", (c) =>
+	c.json({
+		status: "ok",
+		platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
+	}),
+);
 
 app.get("/api/auth/status", async (c) => {
 	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
