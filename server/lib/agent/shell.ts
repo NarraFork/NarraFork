@@ -1,4 +1,4 @@
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, execSync } from "node:child_process";
 import path from "node:path";
 
 const SIGKILL_DELAY_MS = 200;
@@ -16,6 +16,24 @@ export async function killTree(
 ): Promise<void> {
 	const pid = proc.pid;
 	if (!pid || opts?.exited?.()) return;
+
+	if (process.platform === "win32") {
+		// Windows: no process-group signals; kill directly then try taskkill /T
+		try {
+			proc.kill();
+			await Bun.sleep(SIGKILL_DELAY_MS);
+			if (!opts?.exited?.()) {
+				try {
+					execSync(`taskkill /T /F /PID ${pid}`, { stdio: "ignore", timeout: 5000 });
+				} catch {
+					/* best effort */
+				}
+			}
+		} catch {
+			// Process already gone
+		}
+		return;
+	}
 
 	try {
 		// Kill the entire process group (negative pid)
@@ -66,7 +84,9 @@ export function detectShell(): string {
 		}
 	}
 	// Platform fallbacks
-	if (process.platform === "darwin") {
+	if (process.platform === "win32") {
+		_cachedShell = Bun.which("bash") ?? Bun.which("sh") ?? "cmd.exe";
+	} else if (process.platform === "darwin") {
 		_cachedShell = "/bin/zsh";
 	} else {
 		_cachedShell = Bun.which("bash") ?? "/bin/sh";

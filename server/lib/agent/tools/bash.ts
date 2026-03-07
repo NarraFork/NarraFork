@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
+import { getHome } from "../../platform";
 import { detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -65,7 +66,7 @@ export const bashTool: ToolDefinition = {
 			const proc = spawn(command, {
 				shell,
 				cwd,
-				env: { ...process.env, HOME: process.env.HOME ?? "/root" },
+				env: { ...process.env, HOME: getHome() },
 				stdio: ["ignore", "pipe", "pipe"],
 				detached: true,
 			});

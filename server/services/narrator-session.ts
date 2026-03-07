@@ -20,6 +20,7 @@ import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getHome } from "../lib/platform";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
@@ -930,14 +931,14 @@ async function createNarrator(
 			narratorBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = narrator.cwd || project?.gitPath || process.env.HOME || "/tmp";
+			narratorCwd = narrator.cwd || project?.gitPath || getHome();
 			logger.info("Chapter dormant, using fallback CWD", {
 				chapterId: narrator.chapterId,
 				narratorCwd,
 			});
 		}
 	} else {
-		narratorCwd = narrator.cwd || process.env.HOME || "/tmp";
+		narratorCwd = narrator.cwd || getHome();
 	}
 
 	// Generate planFileId if narrator is already in plan mode (e.g. server restart recovery).

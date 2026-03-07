@@ -44,6 +44,7 @@
 		"@xterm/headless": "5.5.0",
 		"@xterm/xterm": "5.5.0",
 		"@xyflow/react": "^12.10.0",
+		"bun-pty": "^0.4.8",
 		"diff": "^8.0.3",
 		"drizzle-orm": "^0.44.0",
 		"gray-matter": "^4.0.3",
