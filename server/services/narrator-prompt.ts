@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { IS_WINDOWS } from "../lib/platform";
 import {
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
@@ -67,7 +68,11 @@ export async function buildEffectiveSystemPrompt(
 	{
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (Bash, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in Bash commands — it is redundant.`;
+		const shellLabel = IS_WINDOWS ? "Shell" : "Bash";
+		const toolList = IS_WINDOWS
+			? `All tools (Shell, Read, Write, Edit, Glob, Grep)`
+			: `All tools (Bash, Read, Write, Edit, Glob, Grep)`;
+		prompt = `${base}${sep}## Current Working Directory\n\n\`${cwd}\`\n\n${toolList} already use this as their default working directory. Do NOT \`cd\` into it in ${shellLabel} commands — it is redundant.`;
 	}
 
 	// 3. Inject AGENT.md (fallback to CLAUDE.md) if present

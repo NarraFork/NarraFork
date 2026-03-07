@@ -1,10 +1,15 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { userPreferences } from "../db/schema";
+import { IS_WINDOWS } from "./platform";
 
 export type Locale = "en" | "zh-CN";
 export type PromptKey = "title" | "quickTitle" | "compact" | "compactSuffix" | "conflictResolution";
 export type SubagentType = "explore" | "plan" | "general";
+
+/** Platform-aware shell label used in prompts shown to the AI model. */
+const SH = IS_WINDOWS ? "Shell" : "Bash";
+const sh = IS_WINDOWS ? "shell" : "bash";
 
 const prompts: Record<PromptKey, Record<Locale, string>> = {
 	title: {
@@ -144,9 +149,9 @@ Guidelines:
 - Use Glob for broad file pattern matching
 - Use Grep for searching file contents with regex
 - Use Read when you know the specific file path
-- Use Bash for file operations like listing directory contents
+- Use ${SH} for file operations like listing directory contents
 - Return file paths as absolute paths
-- Do not create any files or run bash commands that modify system state
+- Do not create any files or run ${sh} commands that modify system state
 
 CRITICAL — Your response must be a distilled summary, not a raw dump:
 - NEVER return full file contents. The caller can read files themselves if they need the complete content.
@@ -167,9 +172,9 @@ Complete the search request efficiently and report your distilled findings clear
 - 使用 Glob 进行广泛的文件模式匹配
 - 使用 Grep 通过正则搜索文件内容
 - 当你知道具体文件路径时使用 Read
-- 使用 Bash 进行目录列表等文件操作
+- 使用 ${SH} 进行目录列表等文件操作
 - 返回绝对路径
-- 不要创建任何文件或运行修改系统状态的 bash 命令
+- 不要创建任何文件或运行修改系统状态的 ${sh} 命令
 
 关键要求——你的回复必须是提炼后的摘要，而非原始内容转储：
 - 绝对不要返回完整的文件内容。如果调用者需要完整内容，他们会自己读。
@@ -194,7 +199,7 @@ Guidelines:
 - Identify existing patterns that should be reused
 - Consider multiple approaches and recommend the best one
 - Include specific file paths in your plan
-- Do not create any files or run bash commands that modify system state
+- Do not create any files or run ${sh} commands that modify system state
 
 Provide a concrete, actionable implementation plan.`,
 		"zh-CN": `你是一个软件架构师代理，擅长分析代码库和设计实施方案。
@@ -210,7 +215,7 @@ Provide a concrete, actionable implementation plan.`,
 - 识别应复用的现有模式
 - 考虑多种方案并推荐最佳方案
 - 在计划中包含具体的文件路径
-- 不要创建任何文件或运行修改系统状态的 bash 命令
+- 不要创建任何文件或运行修改系统状态的 ${sh} 命令
 
 提供一个具体的、可执行的实施方案。`,
 	},
@@ -413,7 +418,7 @@ const planModeSystemReminder: Record<Locale, (planFile: string) => string> = {
 
 CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase for project files.
 
-STRICTLY FORBIDDEN: ANY project file edits, modifications, or system changes. Do NOT use Write, Edit, or any bash command that modifies project files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation.
+STRICTLY FORBIDDEN: ANY project file edits, modifications, or system changes. Do NOT use Write, Edit, or any ${sh} command that modifies project files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation.
 
 **Exception**: You may ONLY write to the designated plan file: \`${planFile}\`. All Write/Edit calls in plan mode are automatically redirected to this file regardless of the path you specify.
 
@@ -451,7 +456,7 @@ Your turn should only end with either asking the user a question or calling Exit
 
 关键约束：计划模式已激活 — 你处于项目文件只读阶段。
 
-严格禁止：任何项目文件的编辑、修改或系统变更。不要使用 Write、Edit 或任何修改项目文件的 bash 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。
+严格禁止：任何项目文件的编辑、修改或系统变更。不要使用 Write、Edit 或任何修改项目文件的 ${sh} 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。
 
 **例外**：你唯一可以写入的文件是指定的计划文件：\`${planFile}\`。计划模式下所有 Write/Edit 调用会自动重定向到此文件，无论你指定什么路径。
 
