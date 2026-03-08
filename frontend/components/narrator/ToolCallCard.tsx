@@ -667,7 +667,12 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					in {searchPath}
 				</Text>
 			)}
-			{toolCall.outputJson && (
+			{toolCall.status === "fail" && toolCall.errorMessage && (
+				<Text size="xs" c="red" mt={4} style={{ whiteSpace: "pre-wrap" }}>
+					{toolCall.errorMessage}
+				</Text>
+			)}
+			{toolCall.status !== "fail" && toolCall.outputJson && (
 				<>
 					<Text size="xs" fw={500} mt={4} mb={2}>
 						{t("output")}
