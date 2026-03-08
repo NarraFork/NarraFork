@@ -155,19 +155,18 @@ export const mergeSummaryService = {
 				locale = userLocale;
 			}
 
-			// Clean up any existing merge_summary for this source chapter
-			// (handles re-merge: wake → merge again should replace the old card)
-			const { deletedCount: oldDeleted } = await this.cleanupForSource(sourceChapterId);
-			if (oldDeleted > 0) {
-				logger.info("Cleaned up old merge summary before re-merge", {
-					sourceChapterId,
-					deletedCount: oldDeleted,
-				});
-				broadcastToNarrator(primaryNarrator.id, {
-					type: "full_reload",
-					narratorId: primaryNarrator.id,
-				});
-			}
+			// Count existing merge_summary messages for this source chapter
+			// to determine the merge round (wake → re-merge produces round 2+).
+			const existingSummaries = await db
+				.select({ id: narratorMessages.id })
+				.from(narratorMessages)
+				.where(
+					and(
+						sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+						sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+					),
+				);
+			const mergeRound = existingSummaries.length + 1;
 
 			// Use pre-collected data when available (collected before merge).
 			// Fall back to git queries (may return empty for fast-forward merges).
@@ -245,6 +244,7 @@ export const mergeSummaryService = {
 						strategy,
 						commitSha: commitSha ?? null,
 						mergedBy: username ?? null,
+						mergeRound,
 						summary,
 					},
 				],

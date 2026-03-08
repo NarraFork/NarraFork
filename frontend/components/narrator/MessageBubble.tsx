@@ -370,7 +370,8 @@ function MergeSummaryCard({
 						style={{ flexShrink: 0, color: "var(--mantine-color-indigo-6)" }}
 					/>
 					<Text size="xs" c="indigo" lineClamp={1}>
-						{t("mergeSummaryLabel")} — {header}
+						{t("mergeSummaryLabel")}
+						{block.mergeRound > 1 && ` #${block.mergeRound}`} — {header}
 					</Text>
 				</Group>
 			</Paper>
@@ -381,7 +382,10 @@ function MergeSummaryCard({
 				title={
 					<Group gap="xs">
 						<IconGitMerge size={18} style={{ color: "var(--mantine-color-indigo-6)" }} />
-						<Text fw={600}>{t("mergeSummaryTitle")}</Text>
+						<Text fw={600}>
+							{t("mergeSummaryTitle")}
+							{block.mergeRound > 1 && ` #${block.mergeRound}`}
+						</Text>
 					</Group>
 				}
 				size="lg"
