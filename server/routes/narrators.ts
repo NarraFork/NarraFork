@@ -32,7 +32,7 @@ import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { resolvePath } from "../lib/platform-path";
+import { pathsEqual, resolvePath } from "../lib/platform-path";
 import {
 	getToolMessage,
 	getUserLanguage,
@@ -1098,6 +1098,15 @@ narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
 		throw new ValidationError("Whitelist directory path must be absolute");
 	}
 	const normalizedPath = resolvePath(parsed.data.path);
+	// Deduplicate: check if this narrator already has a whitelist entry for the same path
+	// (handles Windows case-insensitive paths via pathsEqual)
+	const existing = await db.query.narratorWhitelistDirs.findMany({
+		where: eq(narratorWhitelistDirs.narratorId, id),
+		columns: { id: true, path: true },
+	});
+	if (existing.some((e) => pathsEqual(e.path, normalizedPath))) {
+		throw new ValidationError("This directory is already in the whitelist");
+	}
 	const now = new Date().toISOString();
 	const dir = {
 		id: generateId(),
