@@ -4,7 +4,7 @@
  * 解析 bash 命令字符串，提取所有子命令、文件路径，
  * 并根据白名单 + 危险模式检测判断是否可以自动放行。
  */
-import { resolve } from "node:path";
+import { resolvePath, toForwardSlash } from "../platform-path";
 
 // ── 类型定义 ──────────────────────────────────────────────
 
@@ -1058,7 +1058,14 @@ async function initParser(): Promise<TreeSitterParser> {
 
 /** 检测命令是否使用绝对路径或相对路径执行 */
 function isPathExecution(cmdName: string): boolean {
-	return cmdName.startsWith("/") || cmdName.startsWith("./") || cmdName.startsWith("../");
+	const fwd = toForwardSlash(cmdName);
+	// Unix absolute, relative, or Windows drive-letter absolute (e.g. C:/...)
+	return (
+		fwd.startsWith("/") ||
+		fwd.startsWith("./") ||
+		fwd.startsWith("../") ||
+		/^[a-zA-Z]:[\\/]/.test(cmdName)
+	);
 }
 
 /** 检测 pipeline 中是否存在 pipe-to-shell 模式 */
@@ -1164,7 +1171,7 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 				patternSeen = true;
 				continue;
 			} // skip pattern
-			paths.push(resolve(cwd, arg));
+			paths.push(resolvePath(cwd, arg));
 		}
 		return paths;
 	}
@@ -1173,7 +1180,7 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 		// find [path...] [expression] — 路径在表达式之前
 		for (const arg of args) {
 			if (arg.startsWith("-") || arg.startsWith("(") || arg.startsWith("!")) break;
-			paths.push(resolve(cwd, arg));
+			paths.push(resolvePath(cwd, arg));
 		}
 		return paths;
 	}
@@ -1182,7 +1189,7 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 	for (const arg of args) {
 		if (arg.startsWith("-")) continue;
 		if (cmdName === "chmod" && arg.startsWith("+")) continue;
-		paths.push(resolve(cwd, arg));
+		paths.push(resolvePath(cwd, arg));
 	}
 	return paths;
 }
@@ -1211,6 +1218,14 @@ const CATASTROPHIC_PATHS = new Set([
 	"/var",
 ]);
 
+/** Windows 系统关键路径（小写，正斜杠格式） */
+const WINDOWS_CATASTROPHIC_SUFFIXES = [
+	"/windows",
+	"/windows/system32",
+	"/program files",
+	"/program files (x86)",
+];
+
 /** 块设备前缀 */
 const BLOCK_DEVICE_PREFIXES = [
 	"/dev/sd",
@@ -1234,8 +1249,14 @@ function isBlockDevice(path: string): boolean {
 }
 
 function isCatastrophicPath(p: string): boolean {
-	const normalized = p.replace(/\/+$/, "") || "/";
-	return CATASTROPHIC_PATHS.has(normalized);
+	const normalized = toForwardSlash(p).replace(/\/+$/, "") || "/";
+	if (CATASTROPHIC_PATHS.has(normalized)) return true;
+	// Windows: check drive roots (e.g. "C:/") and system directories
+	const lower = normalized.toLowerCase();
+	if (/^[a-z]:$/.test(lower) || /^[a-z]:\/$/.test(lower)) return true;
+	return WINDOWS_CATASTROPHIC_SUFFIXES.some(
+		(suffix) => lower.endsWith(suffix) && /^[a-z]:/.test(lower),
+	);
 }
 
 // ── Chapter 模式 Git 分支违规检测 ─────────────────────────

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod/v4";
+import { isInsidePath } from "../../platform-path";
 import { getToolMessage, type Locale } from "../../prompt-i18n";
 import type { ToolDefinition, ToolResult } from "../types";
 
@@ -103,7 +104,7 @@ function validatePlanFile(cwd: string, planFile: string): ToolResult {
 	const absPath = resolve(cwd, planFile);
 
 	// Security: ensure the resolved path is under cwd
-	if (!absPath.startsWith(`${cwd}/`)) {
+	if (!isInsidePath(cwd, absPath)) {
 		return {
 			output: "Error: planFile must be within the working directory.",
 			isError: true,

@@ -100,6 +100,15 @@ export interface ToolCallRecord {
 	createdAt?: string;
 }
 
+export interface WhitelistDir {
+	id: string;
+	narratorId: string;
+	path: string;
+	accessLevel: "readOnly" | "readWrite" | "full";
+	enabled: boolean;
+	createdAt: string;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 
@@ -378,6 +387,23 @@ export const api = {
 			method: "PATCH",
 			body: JSON.stringify({ permissionMode }),
 		}),
+	// Whitelist directories
+	getWhitelistDirs: (id: string) => request<WhitelistDir[]>(`/narrators/${id}/whitelist-dirs`),
+	createWhitelistDir: (
+		id: string,
+		data: { path: string; accessLevel?: string; enabled?: boolean },
+	) =>
+		request<WhitelistDir>(`/narrators/${id}/whitelist-dirs`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateWhitelistDir: (dirId: string, data: { accessLevel?: string; enabled?: boolean }) =>
+		request<{ ok: boolean }>(`/narrators/whitelist-dirs/${dirId}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteWhitelistDir: (dirId: string) =>
+		request<{ ok: boolean }>(`/narrators/whitelist-dirs/${dirId}`, { method: "DELETE" }),
 	updateNarratorReasoningEffort: (id: string, reasoningEffort: string | null) =>
 		request<{ ok: boolean }>(`/narrators/${id}/reasoning-effort`, {
 			method: "PATCH",

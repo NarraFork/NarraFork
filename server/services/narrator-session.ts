@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { normalize, resolve } from "node:path";
+import { resolve } from "node:path";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -11,6 +11,7 @@ import {
 	narratorPatches,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistDirs,
 	projects,
 } from "../db/schema";
 import { buildHistory, type PermissionResult, resolveProviderAndModel } from "../lib/agent";
@@ -23,6 +24,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
+import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
@@ -161,16 +163,12 @@ const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const EXIT_PLAN_MODE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes — plans need longer review
 
 export function isInsideWorktree(cwd: string, filePath: string): boolean {
-	const resolved = normalize(resolve(cwd, filePath));
-	const base = normalize(cwd).replace(/\/+$/, "");
-	return resolved === base || resolved.startsWith(`${base}/`);
+	return isInsidePath(cwd, resolve(cwd, filePath));
 }
 
 /** Check if a path points inside the truncated-output temp directory. */
-function isInsideTruncateDir(cwd: string, filePath: string): boolean {
-	const resolved = normalize(resolve(cwd, filePath));
-	const base = normalize(TRUNCATE_OUTPUT_DIR).replace(/\/+$/, "");
-	return resolved === base || resolved.startsWith(`${base}/`);
+function isInsideTruncateDir(_cwd: string, filePath: string): boolean {
+	return isInsidePath(TRUNCATE_OUTPUT_DIR, resolve(_cwd, filePath));
 }
 
 /** Check if ALL paths target only the truncated-output directory (read-only safe zone). */
@@ -200,6 +198,116 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		default:
 			return [];
 	}
+}
+
+function resolveToolCwd(cwd: string, input: Record<string, unknown>): string {
+	if (typeof input.workdir === "string" && input.workdir) {
+		return resolvePath(cwd, input.workdir);
+	}
+	return resolvePath(cwd);
+}
+
+function getShellScopePaths(
+	cwd: string,
+	input: Record<string, unknown>,
+	bashAnalysis?: BashAnalysis,
+): string[] {
+	const paths = new Set<string>();
+	if (typeof input.workdir === "string" && input.workdir) {
+		const workdir = resolvePath(cwd, input.workdir);
+		if (!pathsEqual(workdir, cwd)) paths.add(workdir);
+	}
+	for (const p of bashAnalysis?.filePaths ?? []) paths.add(p);
+	return [...paths];
+}
+
+/**
+ * Check if a file path falls inside any enabled whitelist directory.
+ * Returns the best (most permissive) access level, or null if not whitelisted.
+ */
+function whitelistAccessForPath(
+	cwd: string,
+	filePath: string,
+	whitelistDirs: WhitelistDir[],
+): "readOnly" | "readWrite" | "full" | null {
+	if (whitelistDirs.length === 0) return null;
+	const absPath = resolvePath(cwd, filePath);
+	const levels = ["readOnly", "readWrite", "full"] as const;
+	let best: (typeof levels)[number] | null = null;
+	for (const dir of whitelistDirs) {
+		if (!dir.enabled) continue;
+		if (isInsidePath(dir.path, absPath)) {
+			if (dir.accessLevel === "full") return "full"; // can't get better
+			if (!best || levels.indexOf(dir.accessLevel) > levels.indexOf(best)) {
+				best = dir.accessLevel;
+			}
+		}
+	}
+	return best;
+}
+
+/**
+ * Check if ALL given paths are covered by whitelist at the required access level.
+ * `requiredLevel`: "readOnly" means read is enough, "readWrite" means write needed.
+ */
+function allPathsWhitelisted(
+	cwd: string,
+	paths: string[],
+	whitelistDirs: WhitelistDir[],
+	requiredLevel: "readOnly" | "readWrite" | "full",
+): boolean {
+	if (paths.length === 0 || whitelistDirs.length === 0) return false;
+	const levels = ["readOnly", "readWrite", "full"] as const;
+	const reqIdx = levels.indexOf(requiredLevel);
+	return paths.every((p) => {
+		const access = whitelistAccessForPath(cwd, p, whitelistDirs);
+		return access !== null && levels.indexOf(access) >= reqIdx;
+	});
+}
+
+function resolveWhitelistDecision(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	whitelistDirs: WhitelistDir[],
+	bashAnalysis?: BashAnalysis,
+): "allow" | null {
+	if (whitelistDirs.length === 0) return null;
+
+	if (toolName === "Task") {
+		const workdir = input.workdir;
+		if (typeof workdir !== "string" || !workdir) return null;
+		const resolvedWorkdir = resolvePath(cwd, workdir);
+		if (pathsEqual(resolvedWorkdir, cwd)) return null;
+		const access = whitelistAccessForPath(cwd, resolvedWorkdir, whitelistDirs);
+		if (!access) return null;
+		const isGeneral = input.subagent_type === "general";
+		if (!isGeneral) return "allow";
+		return access === "full" ? "allow" : null;
+	}
+
+	if (toolName === SHELL_TOOL_NAME) {
+		if (!bashAnalysis) return null;
+		if (bashAnalysis.nonWhitelisted.length > 0) return null;
+		if (bashAnalysis.dangerousPatterns.length > 0) return null;
+		if (bashAnalysis.hasEnvInjection) return null;
+		const shellPaths = getShellScopePaths(cwd, input, bashAnalysis).filter(
+			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+		);
+		if (shellPaths.length === 0) return null;
+		const requiredLevel = bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly";
+		return allPathsWhitelisted(cwd, shellPaths, whitelistDirs, requiredLevel) ? "allow" : null;
+	}
+
+	const toolPaths = extractToolPaths(toolName, input);
+	if (toolPaths.length === 0) return null;
+	const externalToolPaths = toolPaths.filter(
+		(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+	);
+	if (externalToolPaths.length === 0) return null;
+	const isReadTool = READ_ONLY_TOOLS.includes(toolName);
+	const requiredLevel = isReadTool ? "readOnly" : "readWrite";
+	return allPathsWhitelisted(cwd, externalToolPaths, whitelistDirs, requiredLevel) ? "allow" : null;
 }
 
 // and does not access the local filesystem or execute arbitrary commands.
@@ -236,16 +344,36 @@ const READ_ONLY_TOOLS = ["Read", "Grep", "Glob"];
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
 
-// TODO: refactor resolvePermissionDecision params into an options object when adding more flags
+export interface WhitelistDir {
+	path: string;
+	accessLevel: "readOnly" | "readWrite" | "full";
+	enabled: boolean;
+}
+
+export interface PermissionDecisionOpts {
+	toolName: string;
+	input: Record<string, unknown>;
+	permMode: string;
+	cwd: string;
+	bashAnalysis?: BashAnalysis;
+	isChapter?: boolean;
+	planFileId?: string;
+	whitelistDirs?: WhitelistDir[];
+}
+
 export function resolvePermissionDecision(
-	toolName: string,
-	input: Record<string, unknown>,
-	permMode: string,
-	cwd: string,
-	bashAnalysis?: BashAnalysis,
-	isChapter = false,
-	planFileId?: string,
+	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
+	const {
+		toolName,
+		input,
+		permMode,
+		cwd,
+		bashAnalysis,
+		isChapter = false,
+		planFileId,
+		whitelistDirs = [],
+	} = opts;
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
 
@@ -258,9 +386,9 @@ export function resolvePermissionDecision(
 	if (permMode === "plan" && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileId) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
-			const absPath = resolve(cwd, filePath);
-			const planFilePath = resolve(cwd, `.narrafork/plan-${planFileId}.md`);
-			if (absPath === planFilePath) return "allow";
+			const absPath = resolvePath(cwd, filePath);
+			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
+			if (pathsEqual(absPath, planFilePath)) return "allow";
 		}
 		return "deny";
 	}
@@ -269,14 +397,23 @@ export function resolvePermissionDecision(
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
+	const whitelistDecision = resolveWhitelistDecision(
+		toolName,
+		input,
+		cwd,
+		whitelistDirs,
+		bashAnalysis,
+	);
+	if (whitelistDecision) return whitelistDecision;
+
 	// Task: auto-allow when using parent's cwd; ask when workdir differs.
 	// bypassPermissions still bypasses this; dontAsk/readOnly denies it.
 	if (toolName === "Task") {
 		const workdir = input.workdir;
 		if (typeof workdir === "string" && workdir) {
-			const resolved = normalize(resolve(cwd, workdir));
-			const normalizedCwd = normalize(resolve(cwd));
-			if (resolved !== normalizedCwd) {
+			const resolved = resolvePath(cwd, workdir);
+			const normalizedCwd = resolvePath(cwd);
+			if (!pathsEqual(resolved, normalizedCwd)) {
 				if (effectiveMode === "bypassPermissions") return "allow";
 				if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
 				return "ask";
@@ -293,7 +430,7 @@ export function resolvePermissionDecision(
 	if (effectiveMode === "dontAsk") return "deny";
 
 	// readOnly: auto-allow read-only tools, auto-deny everything else.
-	// Bash/Shell gets special handling — whitelisted read-only commands are allowed.
+	// Bash/Shell gets special handling — read-only commands inside allowed paths are allowed.
 	if (effectiveMode === "readOnly") {
 		if (READ_ONLY_TOOLS.includes(toolName)) {
 			const toolPaths = extractToolPaths(toolName, input);
@@ -308,10 +445,10 @@ export function resolvePermissionDecision(
 			if (bashAnalysis.dangerousPatterns.length > 0) return "deny";
 			if (bashAnalysis.hasEnvInjection) return "deny";
 			if (bashAnalysis.hasWriteOperation) return "deny";
-			const hasExternalBashPath = bashAnalysis.filePaths.some(
+			const externalBashPaths = getShellScopePaths(cwd, input, bashAnalysis).filter(
 				(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 			);
-			if (hasExternalBashPath) return "deny";
+			if (externalBashPaths.length > 0) return "deny";
 			return "allow";
 		}
 		return "deny";
@@ -323,12 +460,11 @@ export function resolvePermissionDecision(
 		if (bashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (bashAnalysis.dangerousPatterns.length > 0) return "ask";
 		if (bashAnalysis.hasEnvInjection) return "ask";
-		const hasExternalBashPath = bashAnalysis.filePaths.some(
+		const externalBashPaths = getShellScopePaths(cwd, input, bashAnalysis).filter(
 			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 		);
-		if (hasExternalBashPath) return "ask";
+		if (externalBashPaths.length > 0) return "ask";
 		// All commands whitelisted + all paths inside worktree + no dangerous patterns
-		// 如果包含写操作（如 biome --write），只在 acceptEdits 模式下允许
 		if (bashAnalysis.hasWriteOperation && effectiveMode !== "acceptEdits") return "ask";
 		if (effectiveMode === "acceptEdits") return "allow";
 		return "ask";
@@ -418,7 +554,8 @@ export async function handlePermission(
 	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
 		try {
 			const shellType = detectShell().type;
-			bashAnalysis = await analyzeShellCommand(input.command, cwd, shellType, isChapter);
+			const shellCwd = resolveToolCwd(cwd, effectiveInput);
+			bashAnalysis = await analyzeShellCommand(input.command, shellCwd, shellType, isChapter);
 		} catch (err) {
 			logger.warn("Bash command analysis failed, falling back to ask", { err });
 			// Analysis failure → conservative: ask user
@@ -427,15 +564,25 @@ export async function handlePermission(
 
 	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
 
-	const decision = resolvePermissionDecision(
+	// Load enabled whitelist directories for this narrator
+	const wlRows = await db.query.narratorWhitelistDirs.findMany({
+		where: and(
+			eq(narratorWhitelistDirs.narratorId, narratorId),
+			eq(narratorWhitelistDirs.enabled, true),
+		),
+		columns: { path: true, accessLevel: true, enabled: true },
+	});
+
+	const decision = resolvePermissionDecision({
 		toolName,
-		effectiveInput,
+		input: effectiveInput,
 		permMode,
 		cwd,
 		bashAnalysis,
 		isChapter,
 		planFileId,
-	);
+		whitelistDirs: wlRows as WhitelistDir[],
+	});
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
 		const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
@@ -559,7 +706,7 @@ export async function handlePermission(
 
 	// Build decisionReason for Task with custom workdir
 	if (toolName === "Task" && typeof input.workdir === "string" && input.workdir) {
-		const resolvedWorkdir = normalize(resolve(cwd, input.workdir));
+		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
 

@@ -213,13 +213,13 @@ describe("prompt injection: interpreter code execution", () => {
 		expect(analysis.allWhitelisted).toBe(true);
 		expect(analysis.hasWriteOperation).toBe(true);
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "test" },
-				"default",
-				"/test/cwd",
-				analysis,
-			),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "test" },
+				permMode: "default",
+				cwd: "/test/cwd",
+				bashAnalysis: analysis,
+			}),
 		).toBe("ask");
 	});
 	test("bunx @biomejs/biome check --write . → allow (write operation in acceptEdits mode)", async () => {
@@ -231,13 +231,13 @@ describe("prompt injection: interpreter code execution", () => {
 		expect(analysis.allWhitelisted).toBe(true);
 		expect(analysis.hasWriteOperation).toBe(true);
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "test" },
-				"acceptEdits",
-				"/test/cwd",
-				analysis,
-			),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "test" },
+				permMode: "acceptEdits",
+				cwd: "/test/cwd",
+				bashAnalysis: analysis,
+			}),
 		).toBe("allow");
 	});
 	test("bunx @biomejs/biome check --write server/lib/agent/__tests__/bash-analyze.test.ts → allow (acceptEdits)", async () => {
@@ -249,13 +249,13 @@ describe("prompt injection: interpreter code execution", () => {
 		expect(analysis.allWhitelisted).toBe(true);
 		expect(analysis.hasWriteOperation).toBe(true);
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "test" },
-				"acceptEdits",
-				"/test/cwd",
-				analysis,
-			),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "test" },
+				permMode: "acceptEdits",
+				cwd: "/test/cwd",
+				bashAnalysis: analysis,
+			}),
 		).toBe("allow");
 	});
 	test("npx tsc --noEmit → allow (strict allowlist)", () => expectAllowed("npx tsc --noEmit"));
@@ -678,91 +678,109 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 
 	test("default + allWhitelisted + internal paths → ask (default mode asks for all mutations)", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "git status" }, "default", cwd, allSafe),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: allSafe,
+			}),
 		).toBe("ask");
 	});
 
 	test("default + allWhitelisted + external path → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "cat /etc/passwd" },
-				"default",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "cat /etc/passwd" },
+				permMode: "default",
 				cwd,
-				withExternalPath,
-			),
+				bashAnalysis: withExternalPath,
+			}),
 		).toBe("ask");
 	});
 
 	test("default + non-whitelisted command → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "rm -rf foo" },
-				"default",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "rm -rf foo" },
+				permMode: "default",
 				cwd,
-				withNonWhitelisted,
-			),
+				bashAnalysis: withNonWhitelisted,
+			}),
 		).toBe("ask");
 	});
 
 	test("default + no analysis → ask (conservative)", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "anything" }, "default", cwd, undefined),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "anything" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: undefined,
+			}),
 		).toBe("ask");
 	});
 
 	test("default + dangerous pattern → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "find . -exec rm" },
-				"default",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "find . -exec rm" },
+				permMode: "default",
 				cwd,
-				withDangerousPattern,
-			),
+				bashAnalysis: withDangerousPattern,
+			}),
 		).toBe("ask");
 	});
 
 	test("default + env injection → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "LD_PRELOAD=... ls" },
-				"default",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "LD_PRELOAD=... ls" },
+				permMode: "default",
 				cwd,
-				withEnvInjection,
-			),
+				bashAnalysis: withEnvInjection,
+			}),
 		).toBe("ask");
 	});
 
 	test("bypassPermissions → allow regardless", () => {
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "rm -rf /" },
-				"bypassPermissions",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "rm -rf /" },
+				permMode: "bypassPermissions",
 				cwd,
-				withNonWhitelisted,
-			),
+				bashAnalysis: withNonWhitelisted,
+			}),
 		).toBe("allow");
 	});
 
 	test("dontAsk → deny regardless", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "git status" }, "dontAsk", cwd, allSafe),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status" },
+				permMode: "dontAsk",
+				cwd,
+				bashAnalysis: allSafe,
+			}),
 		).toBe("deny");
 	});
 
 	test("acceptEdits + allWhitelisted + internal → allow", () => {
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "git status" },
-				"acceptEdits",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status" },
+				permMode: "acceptEdits",
 				cwd,
-				allSafe,
-			),
+				bashAnalysis: allSafe,
+			}),
 		).toBe("allow");
 	});
 
@@ -771,13 +789,13 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(analysis.allWhitelisted).toBe(true);
 		expect(analysis.hasWriteOperation).toBe(true);
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "npx tsc --outDir /tmp/out" },
-				"default",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "npx tsc --outDir /tmp/out" },
+				permMode: "default",
 				cwd,
-				analysis,
-			),
+				bashAnalysis: analysis,
+			}),
 		).toBe("ask");
 	});
 
@@ -786,13 +804,13 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(analysis.allWhitelisted).toBe(true);
 		expect(analysis.hasWriteOperation).toBe(true);
 		expect(
-			resolvePermissionDecision(
-				"Bash",
-				{ command: "npx tsc --outDir /tmp/out" },
-				"acceptEdits",
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "npx tsc --outDir /tmp/out" },
+				permMode: "acceptEdits",
 				cwd,
-				analysis,
-			),
+				bashAnalysis: analysis,
+			}),
 		).toBe("allow");
 	});
 });
@@ -919,49 +937,49 @@ describe("catastrophic: resolvePermissionDecision returns fatal", () => {
 
 	test("bypassPermissions still returns fatal for catastrophic", async () => {
 		const analysis = await analyzeBashCommand("rm -rf /", cwd);
-		const decision = resolvePermissionDecision(
-			"Bash",
-			{ command: "rm -rf /" },
-			"bypassPermissions",
+		const decision = resolvePermissionDecision({
+			toolName: "Bash",
+			input: { command: "rm -rf /" },
+			permMode: "bypassPermissions",
 			cwd,
-			analysis,
-		);
+			bashAnalysis: analysis,
+		});
 		expect(decision).toBe("fatal");
 	});
 
 	test("default mode returns fatal for catastrophic", async () => {
 		const analysis = await analyzeBashCommand("dd if=/dev/zero of=/dev/sda", cwd);
-		const decision = resolvePermissionDecision(
-			"Bash",
-			{ command: "dd if=/dev/zero of=/dev/sda" },
-			"default",
+		const decision = resolvePermissionDecision({
+			toolName: "Bash",
+			input: { command: "dd if=/dev/zero of=/dev/sda" },
+			permMode: "default",
 			cwd,
-			analysis,
-		);
+			bashAnalysis: analysis,
+		});
 		expect(decision).toBe("fatal");
 	});
 
 	test("dontAsk still returns fatal (not just deny)", async () => {
 		const analysis = await analyzeBashCommand("mkfs.ext4 /dev/sda1", cwd);
-		const decision = resolvePermissionDecision(
-			"Bash",
-			{ command: "mkfs.ext4 /dev/sda1" },
-			"dontAsk",
+		const decision = resolvePermissionDecision({
+			toolName: "Bash",
+			input: { command: "mkfs.ext4 /dev/sda1" },
+			permMode: "dontAsk",
 			cwd,
-			analysis,
-		);
+			bashAnalysis: analysis,
+		});
 		expect(decision).toBe("fatal");
 	});
 
 	test("non-catastrophic rm still returns ask (not fatal)", async () => {
 		const analysis = await analyzeBashCommand("rm -rf node_modules", cwd);
-		const decision = resolvePermissionDecision(
-			"Bash",
-			{ command: "rm -rf node_modules" },
-			"default",
+		const decision = resolvePermissionDecision({
+			toolName: "Bash",
+			input: { command: "rm -rf node_modules" },
+			permMode: "default",
 			cwd,
-			analysis,
-		);
+			bashAnalysis: analysis,
+		});
 		expect(decision).toBe("ask");
 	});
 });
@@ -1376,120 +1394,120 @@ describe("Chapter mode - git branch restrictions", () => {
 	describe("resolvePermissionDecision integration", () => {
 		test("chapter mode + branch violation → deny", async () => {
 			const analysis = await chapterAnalyze("git checkout main");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git checkout main" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git checkout main" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true, // isChapter
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("deny");
 		});
 
 		test("chapter mode + safe git command → ask (default mode)", async () => {
 			const analysis = await chapterAnalyze("git status");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git status" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("ask");
 		});
 
 		test("chapter mode + git add/commit → ask (default mode)", async () => {
 			const analysis = await chapterAnalyze("git add . && git commit -m 'fix'");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git add . && git commit -m 'fix'" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git add . && git commit -m 'fix'" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("ask");
 		});
 
 		test("chapter mode + git push (normal) → ask (default mode)", async () => {
 			const analysis = await chapterAnalyze("git push origin");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git push origin" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git push origin" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("ask");
 		});
 
 		test("chapter mode + git push --force → deny", async () => {
 			const analysis = await chapterAnalyze("git push --force");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git push --force" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git push --force" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("deny");
 		});
 
 		test("non-chapter mode + git checkout → ask (default mode asks for bash)", async () => {
 			const analysis = await normalAnalyze("git checkout main");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git checkout main" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git checkout main" },
+				permMode: "default",
 				cwd,
-				analysis,
-				false, // not chapter
-			);
+				bashAnalysis: analysis,
+				isChapter: false,
+			});
 			// default mode asks for all bash commands
 			expect(decision).toBe("ask");
 		});
 
 		test("bypassPermissions does NOT bypass chapter branch restrictions", async () => {
 			const analysis = await chapterAnalyze("git checkout main");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git checkout main" },
-				"bypassPermissions",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git checkout main" },
+				permMode: "bypassPermissions",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			// Branch violations are checked BEFORE bypassPermissions
 			expect(decision).toBe("deny");
 		});
 
 		test("chapter mode + mixed command with branch violation → deny", async () => {
 			const analysis = await chapterAnalyze("git status && git checkout develop");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "git status && git checkout develop" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status && git checkout develop" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("deny");
 		});
 
 		test("catastrophic still takes priority over chapter deny", async () => {
 			const analysis = await chapterAnalyze("rm -rf /");
-			const decision = resolvePermissionDecision(
-				"Bash",
-				{ command: "rm -rf /" },
-				"default",
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "rm -rf /" },
+				permMode: "default",
 				cwd,
-				analysis,
-				true,
-			);
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
 			expect(decision).toBe("fatal");
 		});
 	});

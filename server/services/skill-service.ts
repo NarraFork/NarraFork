@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import matter from "gray-matter";
 import { logger } from "../lib/logger";
+import { isInsidePath } from "../lib/platform-path";
 import { narraforkDir } from "../lib/settings";
 
 export interface SkillInfo {
@@ -238,7 +239,7 @@ export async function readSkillFile(skillLocation: string, filePath: string): Pr
 	const resolved = resolve(skillDir, filePath);
 	// Security: ensure the resolved path is within the skill directory
 	// resolve() normalises ".." segments AND handles absolute filePath values
-	if (!resolved.startsWith(`${skillDir}/`) && resolved !== skillDir) {
+	if (!isInsidePath(skillDir, resolved)) {
 		throw new Error("Path traversal not allowed");
 	}
 	return readFile(resolved, "utf-8");
