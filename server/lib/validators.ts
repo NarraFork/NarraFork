@@ -106,6 +106,7 @@ export const createNarratorSchema = z.object({
 	cwd: z.string().min(1).max(4096).optional(),
 	reasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
 	fastMode: z.boolean().optional(),
+	relaxedPlan: z.boolean().optional(),
 });
 
 export const sendMessageSchema = z.object({
@@ -184,6 +185,8 @@ export const forkChapterSchema = z.object({
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	forkAtMessageUuid: z.string().optional(),
 	role: z.enum(["trunk", "branch", "exploration"]).default("branch"),
+	positionX: z.number().optional(),
+	positionY: z.number().optional(),
 });
 
 export const mergeChapterSchema = z.object({

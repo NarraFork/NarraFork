@@ -53,6 +53,8 @@ export interface BaseContentBlock {
 	type: string;
 	text?: string;
 	thinking?: string;
+	/** Only present on reasoning blocks when translation is enabled */
+	translatedText?: string;
 	name?: string;
 	id?: string;
 	input?: Record<string, unknown>;
@@ -413,6 +415,11 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${id}/fast-mode`, {
 			method: "PATCH",
 			body: JSON.stringify({ fastMode }),
+		}),
+	updateNarratorRelaxedPlan: (id: string, relaxedPlan: boolean) =>
+		request<{ ok: boolean }>(`/narrators/${id}/relaxed-plan`, {
+			method: "PATCH",
+			body: JSON.stringify({ relaxedPlan }),
 		}),
 	updateNarratorPruneEnabled: (id: string, pruneEnabled: boolean) =>
 		request<{ ok: boolean }>(`/narrators/${id}/prune-enabled`, {
@@ -785,6 +792,8 @@ export const api = {
 			inheritMode?: string;
 			forkAtMessageUuid?: string;
 			role?: string;
+			positionX?: number;
+			positionY?: number;
 		},
 	) => request<ApiEntity>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
 	checkMergeConflicts: (id: string, targetChapterId: string) =>
@@ -1328,6 +1337,9 @@ export const api = {
 		request<{
 			models: Array<{ id: string; owned_by?: string }>;
 			fromCache: boolean;
+
+		request<{ quotaBalance: number; quotaTotalGranted: number }>(
+		),
 
 	// Health / platform
 	health: () =>

@@ -100,6 +100,7 @@ export type FlatToolItem =
 			kind: "reasoning";
 			msg: NarratorMsg;
 			reasoningText: string;
+			translatedText?: string;
 			blockIndex: number;
 	  };
 

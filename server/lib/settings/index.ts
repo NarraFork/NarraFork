@@ -103,6 +103,10 @@ export interface NarraForkSettings {
 		 * Takes highest priority in getModelContextWindow().
 		 */
 		modelContextWindows: Record<string, number>;
+		/** Translate reasoning/thinking blocks via summaryModel after each block completes. */
+		translateReasoning: boolean;
+		/** Default value for the relaxed plan toggle on new narrators. */
+		defaultRelaxedPlan: boolean;
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -183,6 +187,8 @@ const DEFAULTS: NarraForkSettings = {
 		legacyEncoding: false,
 		planTimeoutAction: "deny",
 		modelContextWindows: {},
+		translateReasoning: false,
+		defaultRelaxedPlan: false,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,

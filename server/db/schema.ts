@@ -216,6 +216,7 @@ export const narrators = sqliteTable(
 			enum: ["low", "medium", "high", "xhigh"],
 		}),
 		fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
+		relaxedPlan: integer("relaxed_plan", { mode: "boolean" }).notNull().default(false),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),

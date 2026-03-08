@@ -359,6 +359,10 @@ export interface PermissionDecisionOpts {
 	isChapter?: boolean;
 	planFileId?: string;
 	whitelistDirs?: WhitelistDir[];
+	/** When true (plan + relaxedPlan toggle), inherit previousPermissionMode instead of readOnly */
+	relaxedPlan?: boolean;
+	/** The permission mode saved before entering plan mode */
+	previousPermissionMode?: string;
 }
 
 export function resolvePermissionDecision(
@@ -373,6 +377,8 @@ export function resolvePermissionDecision(
 		isChapter = false,
 		planFileId,
 		whitelistDirs = [],
+		relaxedPlan = false,
+		previousPermissionMode,
 	} = opts;
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
@@ -381,8 +387,7 @@ export function resolvePermissionDecision(
 	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchViolations?.length)
 		return "deny";
 
-	// Plan mode: identical to readOnly, except Write/Edit to the designated plan file is allowed.
-	// All other decisions delegate to the readOnly branch below via permMode aliasing.
+	// Plan mode: Write/Edit to the designated plan file is always allowed.
 	if (permMode === "plan" && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileId) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
@@ -390,10 +395,19 @@ export function resolvePermissionDecision(
 			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
 			if (pathsEqual(absPath, planFilePath)) return "allow";
 		}
-		return "deny";
+		// Strict plan: deny non-plan-file writes. Relaxed plan: delegate to inherited mode.
+		if (!relaxedPlan) return "deny";
 	}
-	// For all other tools, plan mode behaves exactly like readOnly
-	const effectiveMode = permMode === "plan" ? "readOnly" : permMode;
+
+	// For all other tools in plan mode:
+	// - strict plan → behave like readOnly
+	// - relaxed plan → inherit the permission mode from before entering plan
+	const effectiveMode =
+		permMode === "plan"
+			? relaxedPlan
+				? (previousPermissionMode ?? "default")
+				: "readOnly"
+			: permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
@@ -415,10 +429,8 @@ export function resolvePermissionDecision(
 		const resolvedWorkdir =
 			typeof workdir === "string" && workdir ? resolvePath(cwd, workdir) : null;
 		const normalizedCwd = resolvePath(cwd);
-		const isOutsideCwd =
-			resolvedWorkdir !== null && !isInsidePath(normalizedCwd, resolvedWorkdir);
-		const isDifferentDir =
-			resolvedWorkdir !== null && !pathsEqual(resolvedWorkdir, normalizedCwd);
+		const isOutsideCwd = resolvedWorkdir !== null && !isInsidePath(normalizedCwd, resolvedWorkdir);
+		const isDifferentDir = resolvedWorkdir !== null && !pathsEqual(resolvedWorkdir, normalizedCwd);
 
 		if (effectiveMode === "readOnly") {
 			// general subagents have write access — always deny in readOnly
@@ -517,9 +529,15 @@ export async function handlePermission(
 	// Read permission mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { permissionMode: true, chapterId: true },
+		columns: {
+			permissionMode: true,
+			chapterId: true,
+			relaxedPlan: true,
+			previousPermissionMode: true,
+		},
 	});
 	const permMode = narrator?.permissionMode ?? "default";
+	const isRelaxedPlan = !!narrator?.relaxedPlan;
 	const isPlanMode = permMode === "plan";
 	const isChapter = !!narrator?.chapterId;
 
@@ -591,6 +609,8 @@ export async function handlePermission(
 		isChapter,
 		planFileId,
 		whitelistDirs: wlRows as WhitelistDir[],
+		relaxedPlan: isRelaxedPlan,
+		previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
 	});
 	logger.debug("Permission decision", {
 		narratorId,
@@ -1504,6 +1524,8 @@ async function runAgentLoop(
 				broadcastTargetId: narratorId,
 				sseEmitter: active.events,
 				conversationId: active.conversationId,
+				locale: active.locale,
+				providerPrefix: resolved.provider,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
 				getMeterUnit: () => active._lastMeterUnit,
@@ -1871,6 +1893,7 @@ async function runAgentLoop(
 				locale,
 				signal: active.abortController.signal,
 				planMode: freshNarrator.permissionMode === "plan",
+				relaxedPlan: !!freshNarrator.relaxedPlan,
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
@@ -2223,6 +2246,14 @@ async function runAgentLoop(
 		if (active._worktreePath) {
 			worktreeWatcher.unwatch(active._worktreePath, narratorId);
 		}
+		// Persist conversationId so the next activation can resume the API session
+		// (avoids cache miss from generating a new random UUID every time).
+		narratorService.updateConversationId(narratorId, active.conversationId).catch((err) => {
+			logger.error("Failed to persist conversationId", {
+				narratorId,
+				error: String(err),
+			});
+		});
 		activeNarrators.delete(narratorId);
 		active.abortController.abort();
 		active.events.emit("event", { type: "done", data: null });

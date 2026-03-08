@@ -57,7 +57,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 		mutationFn: () => api.wakeChapter(chapterId),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters", chapterId] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 

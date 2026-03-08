@@ -153,9 +153,9 @@ export function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): Graph
 	});
 }
 
-export function useStoryGraph(projectId: string) {
+export function useNarraFlow(projectId: string) {
 	const { data, isLoading, error } = useQuery({
-		queryKey: ["storyGraph", projectId],
+		queryKey: ["narraFlow", projectId],
 		queryFn: () => api.getProjectGraph(projectId),
 		enabled: !!projectId,
 		refetchInterval: 30_000, // Refresh every 30s to pick up git changes

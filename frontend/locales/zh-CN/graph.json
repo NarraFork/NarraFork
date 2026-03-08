@@ -1,5 +1,5 @@
 {
-	"storyNetwork": "故事网络",
+	"storyNetwork": "叙事线",
 	"loading": "加载图谱中…",
 	"loadFailed": "加载图谱失败：{{message}}",
 	"noChapters": "暂无章节。",
@@ -23,6 +23,34 @@
 		"deleteConfirmTitle": "删除章节",
 		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，对话将保留为只读。",
 		"cancel": "取消"
+	},
+	"controls": {
+		"selectMode": "选择模式",
+		"panMode": "平移模式"
+	},
+	"selection": {
+		"fork": "分叉",
+		"merge": "合并",
+		"mergeInto": "合并到已有节点",
+		"mergeNewTitle": "合并：{{titles}}",
+		"mergeSuccess": "合并完成",
+		"mergeFailed": "合并失败：{{message}}"
+	},
+	"forkDraft": {
+		"titlePlaceholder": "新分支标题",
+		"descriptionPlaceholder": "这个分叉的用途…",
+		"contextInheritance": "上下文",
+		"fresh": "清空",
+		"compressed": "压缩",
+		"full": "完整",
+		"confirm": "分叉",
+		"cancel": "取消",
+		"failed": "分叉失败：{{message}}"
+	},
+	"mergeDraft": {
+		"titlePlaceholder": "合并提交标题",
+		"descriptionPlaceholder": "合并说明…",
+		"failed": "合并失败：{{message}}"
 	},
 	"sidePanel": {
 		"upstreamUpdates": "上游有更新",

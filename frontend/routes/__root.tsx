@@ -44,6 +44,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
+import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useLocalPref } from "../hooks/useLocalPref";
@@ -225,6 +226,7 @@ function AuthenticatedLayout() {
 			padding="md"
 		>
 			<WSConnectionAlert />
+			<VersionUpdateBanner />
 			<AppShell.Header>
 				<Group h="100%" px="md" justify="space-between" wrap="nowrap">
 					<Group wrap="nowrap">

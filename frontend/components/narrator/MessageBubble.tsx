@@ -25,6 +25,7 @@ import {
 	IconChevronRight,
 	IconGitCommit,
 	IconGitMerge,
+	IconLanguage,
 	IconListCheck,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -317,7 +318,7 @@ function MergeSummaryCard({
 			// The backend deletes the merge_summary message during unmerge,
 			// so invalidating messages will remove this card from the list.
 			onDelete?.();
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			notifications.show({
 				title: t("unmergeSuccess"),
@@ -467,11 +468,28 @@ function MergeSummaryCard({
 	);
 }
 
-export function ReasoningSummary({ text }: { text: string }) {
+export function ReasoningSummary({
+	text,
+	translatedText,
+}: {
+	text: string;
+	translatedText?: string;
+}) {
+	const { t } = useTranslation("narrator");
 	const [expanded, setExpanded] = useState(false);
 	const [isOverflow, setIsOverflow] = useState(false);
+	const [showTranslation, setShowTranslation] = useState(!!translatedText);
+	const prevTranslatedRef = useRef(translatedText);
+	// Auto-switch to translation when it arrives via WS update
+	useEffect(() => {
+		if (translatedText && !prevTranslatedRef.current) {
+			setShowTranslation(true);
+		}
+		prevTranslatedRef.current = translatedText;
+	}, [translatedText]);
 	const lineRef = useRef<HTMLDivElement | null>(null);
-	const singleLineText = text.trim().replace(/\s+/g, " ");
+	const displayText = showTranslation && translatedText ? translatedText : text;
+	const singleLineText = displayText.trim().replace(/\s+/g, " ");
 	const boldMatch = singleLineText.match(/^\*\*(.+?)\*\*/);
 	const headerText = boldMatch ? boldMatch[1] : singleLineText.replace(/\*\*/g, "");
 	const trailingText = boldMatch ? singleLineText.slice(boldMatch[0].length).trim() : "";
@@ -627,8 +645,23 @@ export function ReasoningSummary({ text }: { text: string }) {
 							overflowWrap: "anywhere",
 						}}
 					>
-						<MarkdownContent text={hasTrailingContent ? trailingText : text.trim()} />
+						<MarkdownContent text={hasTrailingContent ? trailingText : displayText.trim()} />
 					</Box>
+					{translatedText && (
+						<UnstyledButton
+							onClick={(e) => {
+								e.stopPropagation();
+								setShowTranslation((v) => !v);
+							}}
+							mt={4}
+							style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+						>
+							<IconLanguage size={12} style={{ opacity: 0.5 }} />
+							<Text size="xs" c="dimmed">
+								{showTranslation ? t("showOriginal") : t("showTranslated")}
+							</Text>
+						</UnstyledButton>
+					)}
 				</LazyCollapse>
 			)}
 		</Box>
@@ -816,7 +849,7 @@ export const MessageBubble = memo(function MessageBubble({
 		);
 	}
 
-	// System messages (compact indicators / plan cards)
+	// System messages (compact indicators / plan cards / error notices)
 	if (message.role === "system") {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
@@ -861,6 +894,23 @@ export const MessageBubble = memo(function MessageBubble({
 					messageId={canNavigate ? message.id : undefined}
 					onDelete={canNavigate ? invalidateMessages : undefined}
 				/>
+			);
+		}
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const errorBlock = blocks.find((b: any) => b.type === "error");
+		if (errorBlock) {
+			return (
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+					<Group gap={6} wrap="nowrap" align="flex-start">
+						<IconAlertTriangle
+							size={16}
+							style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
+						/>
+						<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
+							{errorBlock.message ?? t("unknownError")}
+						</Text>
+					</Group>
+				</Paper>
 			);
 		}
 		return null;
@@ -1018,32 +1068,48 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					if (block.type === "reasoning") {
 						const iconColor = getCategoryColor("plan");
+						const reasoningText = typeof block.text === "string" ? block.text : "";
 						return (
-							<Paper key={key} withBorder radius="sm" p="xs">
-								<Group gap={6} wrap="nowrap" align="flex-start">
-									<ThemeIcon size={18} variant="light" color={iconColor} radius="sm" mt={1}>
-										<IconBrain size={12} />
-									</ThemeIcon>
-									<ReasoningSummary text={typeof block.text === "string" ? block.text : ""} />
-								</Group>
-							</Paper>
+							<ContentViewer
+								key={key}
+								content={reasoningText}
+								markdown
+								contentType="markdown"
+								blockIndex={realIndex}
+							>
+								<Paper withBorder radius="sm" p="xs">
+									<Group gap={6} wrap="nowrap" align="flex-start">
+										<ThemeIcon size={18} variant="light" color={iconColor} radius="sm" mt={1}>
+											<IconBrain size={12} />
+										</ThemeIcon>
+										<ReasoningSummary text={reasoningText} translatedText={block.translatedText} />
+									</Group>
+								</Paper>
+							</ContentViewer>
 						);
 					}
 					if (block.type === "thinking") {
 						return (
-							<Paper
+							<ContentViewer
 								key={key}
-								p="xs"
-								radius="sm"
-								style={{ backgroundColor: "var(--mantine-color-yellow-light)" }}
+								content={block.thinking ?? ""}
+								markdown
+								contentType="markdown"
+								blockIndex={realIndex}
 							>
-								<Text size="xs" c="dimmed" fw={500} mb={2}>
-									{t("thinking")}
-								</Text>
-								<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-									{block.thinking}
-								</Text>
-							</Paper>
+								<Paper
+									p="xs"
+									radius="sm"
+									style={{ backgroundColor: "var(--mantine-color-yellow-light)" }}
+								>
+									<Text size="xs" c="dimmed" fw={500} mb={2}>
+										{t("thinking")}
+									</Text>
+									<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+										{block.thinking}
+									</Text>
+								</Paper>
+							</ContentViewer>
 						);
 					}
 					if (block.type === "tool_use") {

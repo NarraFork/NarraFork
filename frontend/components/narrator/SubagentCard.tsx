@@ -198,8 +198,8 @@ export const SubagentCard = memo(
 			return stripped || undefined;
 		}, [fullTc?.outputJson]);
 
-		// Determine if this subagent type should render results as markdown
-		const useMarkdown = /^explore$/i.test(agentType);
+		// Render all subagent results as markdown
+		const useMarkdown = true;
 		const childToolCalls: {
 			tc: ToolCallData;
 			toolUseId: string | null;

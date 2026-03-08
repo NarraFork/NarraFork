@@ -200,7 +200,7 @@ function NarratorDetailPage() {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 			if (data?.id) {
 				const narrators = await api.listNarrators({ chapterId: data.id });
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
@@ -384,18 +384,11 @@ function NarratorDetailPage() {
 						onMouseDown={onDragStart}
 						onTouchStart={onDragStart}
 						style={{
+							position: "relative",
 							width: 6,
 							cursor: "col-resize",
 							flexShrink: 0,
-							transition: "background-color 0.15s",
-							borderLeft: "1px solid var(--mantine-color-dark-4)",
 							borderRight: "1px solid var(--mantine-color-dark-4)",
-						}}
-						onMouseEnter={(e) => {
-							e.currentTarget.style.backgroundColor = "var(--mantine-color-indigo-9)";
-						}}
-						onMouseLeave={(e) => {
-							e.currentTarget.style.backgroundColor = "transparent";
 						}}
 					/>
 

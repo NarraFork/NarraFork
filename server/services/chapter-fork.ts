@@ -31,6 +31,9 @@ export interface ForkChapterInput {
 	/** Chapter role: trunk, branch, or exploration. */
 	role?: "trunk" | "branch" | "exploration";
 	locale?: Locale;
+	/** Explicit graph position — if provided, skip auto-layout calculation. */
+	positionX?: number;
+	positionY?: number;
 }
 
 export const chapterFork = {
@@ -130,24 +133,33 @@ export const chapterFork = {
 			const VERTICAL_GAP = 60;
 			const HORIZONTAL_SPACING = NODE_WIDTH + 80;
 
-			const parentX = parent.positionX ?? 0;
-			const parentY = parent.positionY ?? 0;
-			const parentHeight =
-				parent.panelExpanded && parent.panelHeight
-					? parent.panelHeight
-					: parent.panelExpanded
-						? DEFAULT_PANEL_HEIGHT
-						: DEFAULT_NODE_HEIGHT;
+			let positionX: number;
+			let positionY: number;
 
-			// Count existing children to offset horizontally and avoid overlap
-			const existingSiblings = await db
-				.select({ id: chapters.id })
-				.from(chapters)
-				.where(eq(chapters.parentChapterId, parentChapterId));
-			const siblingIndex = existingSiblings.length; // 0-based: this will be the Nth child
+			if (input.positionX != null && input.positionY != null) {
+				// Use explicit position from the client (e.g. inline fork draft node)
+				positionX = input.positionX;
+				positionY = input.positionY;
+			} else {
+				const parentX = parent.positionX ?? 0;
+				const parentY = parent.positionY ?? 0;
+				const parentHeight =
+					parent.panelExpanded && parent.panelHeight
+						? parent.panelHeight
+						: parent.panelExpanded
+							? DEFAULT_PANEL_HEIGHT
+							: DEFAULT_NODE_HEIGHT;
 
-			const positionX = parentX + siblingIndex * HORIZONTAL_SPACING;
-			const positionY = parentY + parentHeight + VERTICAL_GAP;
+				// Count existing children to offset horizontally and avoid overlap
+				const existingSiblings = await db
+					.select({ id: chapters.id })
+					.from(chapters)
+					.where(eq(chapters.parentChapterId, parentChapterId));
+				const siblingIndex = existingSiblings.length; // 0-based: this will be the Nth child
+
+				positionX = parentX + siblingIndex * HORIZONTAL_SPACING;
+				positionY = parentY + parentHeight + VERTICAL_GAP;
+			}
 
 			// Create DB record
 			const [chapter] = await db

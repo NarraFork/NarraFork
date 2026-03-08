@@ -117,7 +117,13 @@ export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
 			const block = blocks[bi];
 			const realIndex = origIndices?.[bi] ?? bi;
 			if (block.type === "reasoning" && typeof block.text === "string" && block.text.trim()) {
-				items.push({ kind: "reasoning", msg, reasoningText: block.text, blockIndex: realIndex });
+				items.push({
+					kind: "reasoning",
+					msg,
+					reasoningText: block.text,
+					translatedText: block.translatedText,
+					blockIndex: realIndex,
+				});
 				continue;
 			}
 			if (block.type !== "tool_use") continue;

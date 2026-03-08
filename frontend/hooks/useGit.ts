@@ -109,7 +109,7 @@ export function useGitCommit(chapterId: string) {
 			qc.invalidateQueries({ queryKey: ["gitStatus", chapterId] });
 			qc.invalidateQueries({ queryKey: ["gitLog", chapterId] });
 			qc.invalidateQueries({ queryKey: ["gitStashList", chapterId] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }
@@ -144,7 +144,7 @@ export function useGitReset(chapterId: string) {
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["gitStatus", chapterId] });
 			qc.invalidateQueries({ queryKey: ["gitLog", chapterId] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }

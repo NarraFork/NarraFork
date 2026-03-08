@@ -1,7 +1,7 @@
 {
 	"appName": "NarraFork",
 	"dashboard": "仪表盘",
-	"projects": "项目",
+	"projects": "叙事线",
 	"narrators": "叙述者",
 	"settings": "设置",
 	"admin": "管理",
@@ -14,7 +14,7 @@
 	"searchPlaceholder": "搜索章节与消息...",
 	"recentTabs": "最近访问",
 	"clearAll": "清空",
-	"clearProjects": "清空项目",
+	"clearProjects": "清空叙事线",
 	"clearNarrators": "清空空闲叙述者",
 	"newNarrator": "新建会话",
 	"noRecentTabs": "暂无最近访问",

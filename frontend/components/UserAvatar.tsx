@@ -23,7 +23,24 @@ export function UserAvatar({
 	const avatar = blobUrl ? (
 		<Avatar {...props} src={blobUrl} alt={username} />
 	) : (
-		<Avatar {...props} style={{ ...props.style, backgroundColor: avatarColor ?? undefined }}>
+		<Avatar
+			{...props}
+			style={{
+				...props.style,
+				backgroundColor: avatarColor ?? undefined,
+			}}
+			styles={{
+				...props.styles,
+				placeholder: {
+					lineHeight: 1,
+					...(typeof props.styles === "object" &&
+					props.styles !== null &&
+					"placeholder" in props.styles
+						? (props.styles as Record<string, React.CSSProperties>).placeholder
+						: {}),
+				},
+			}}
+		>
 			{initials}
 		</Avatar>
 	);

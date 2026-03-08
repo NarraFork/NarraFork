@@ -74,7 +74,7 @@ export function ChapterForkModal({
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 			if (onForkSuccess && data?.id) {
 				handleClose();
 				onForkSuccess(data.id);

@@ -30,7 +30,7 @@ export function ChapterCard({ chapter }: ChapterCardProps) {
 		mutationFn: () => api.wakeChapter(chapter.id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 

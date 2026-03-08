@@ -274,7 +274,8 @@ export async function* agentLoop(
 	}
 
 	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
-	if (config.planMode) {
+	// When relaxedPlan is enabled, skip this — tools remain fully available.
+	if (config.planMode && !config.relaxedPlan) {
 		const disabledDesc = getToolMessage("planModeToolDisabled", locale);
 		allTools = allTools.map((t) =>
 			PLAN_MODE_ALLOWED_TOOLS.has(t.name)
@@ -597,6 +598,7 @@ export async function* agentLoop(
 						usage: parsed.metering.usage,
 						credentialId,
 					};
+				}
 				}
 				// Convert OpenAI usage to context_usage percentage
 				if (parsed.usage) {

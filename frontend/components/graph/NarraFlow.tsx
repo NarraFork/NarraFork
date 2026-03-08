@@ -1,36 +1,45 @@
 import {
 	applyNodeChanges,
 	Background,
+	ControlButton,
 	Controls,
+	type Edge,
 	type Node,
 	type NodeChange,
 	type NodeMouseHandler,
 	type OnConnect,
 	ReactFlow,
+	useReactFlow,
 } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "@xyflow/react/dist/style.css";
+import "@frontend/styles/react-flow-controls.css";
 import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
+import type { GraphNode } from "@frontend/hooks/useNarraFlow";
+import { assignEdgeHandles, useNarraFlow } from "@frontend/hooks/useNarraFlow";
 import { useNarratorsListWS } from "@frontend/hooks/useNarratorWS";
 import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
-import type { GraphNode } from "@frontend/hooks/useStoryGraph";
-import { assignEdgeHandles, useStoryGraph } from "@frontend/hooks/useStoryGraph";
 import { api } from "@frontend/lib/api";
-import { Box, Button, Group, Modal, Stack, Text } from "@mantine/core";
+import { Box, Button, Group, Modal, Stack, Text, useMantineColorScheme } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
+import { IconHandGrab, IconPointer } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-import { ChapterForkModal } from "../chapter/ChapterForkModal";
 import { ChapterNode } from "./ChapterNode";
 import { CherryPickEdge } from "./CherryPickEdge";
 import { DependencyEdge } from "./DependencyEdge";
+import type { DraftMode } from "./DraftNode";
+import { DraftNode } from "./DraftNode";
 import { ForkEdge } from "./ForkEdge";
+import { LassoSelection } from "./LassoSelection";
 import { MergeEdge } from "./MergeEdge";
 import { NodeContextMenu } from "./NodeContextMenu";
+import { SelectionToolbar } from "./SelectionToolbar";
 
-const nodeTypes = { chapterNode: ChapterNode };
+const nodeTypes = { chapterNode: ChapterNode, draftNode: DraftNode };
 const edgeTypes = {
 	fork: ForkEdge,
 	merge: MergeEdge,
@@ -45,32 +54,65 @@ interface ContextMenuState {
 	nodeData: { title: string; status: string; role: string; isRoot?: boolean };
 }
 
-interface StoryNetworkProps {
+const PAN_SPEED = 1.5;
+
+/** Mounted inside <ReactFlow> — intercepts Ctrl+wheel (vertical pan) and Shift+wheel (horizontal pan). */
+function ModifierWheelPan() {
+	const { getViewport, setViewport } = useReactFlow();
+
+	useEffect(() => {
+		const pane = document.querySelector(".react-flow") as HTMLElement | null;
+		if (!pane) return;
+
+		const onWheel = (e: WheelEvent) => {
+			if (!e.ctrlKey && !e.shiftKey) return;
+			// Stop React Flow's zoom handler from seeing this event
+			e.preventDefault();
+			e.stopPropagation();
+			const { x, y, zoom } = getViewport();
+			const delta = e.deltaY || e.deltaX;
+			if (e.shiftKey) {
+				setViewport({ x: x - delta * PAN_SPEED, y, zoom });
+			} else {
+				setViewport({ x, y: y - delta * PAN_SPEED, zoom });
+			}
+		};
+
+		// Capture phase so we intercept before React Flow's bubble-phase zoom handler
+		pane.addEventListener("wheel", onWheel, { passive: false, capture: true });
+		return () => pane.removeEventListener("wheel", onWheel, { capture: true });
+	}, [getViewport, setViewport]);
+
+	return null;
+}
+
+interface NarraFlowProps {
 	projectId: string;
 }
 
-export function StoryNetwork({ projectId }: StoryNetworkProps) {
+export function NarraFlow({ projectId }: NarraFlowProps) {
 	const { t } = useTranslation("graph");
+	const { colorScheme } = useMantineColorScheme();
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
-	const { nodes: graphNodes, edges, isLoading, error } = useStoryGraph(projectId);
+	const { nodes: graphNodes, edges, isLoading, error } = useNarraFlow(projectId);
 	const { savePosition, savePanelState } = useUpdateGraphPositions(projectId);
 	const createEdge = useCreateChapterEdge();
 	const updateChapter = useUpdateChapter();
 
 	const dormantMutation = useMutation({
 		mutationFn: (id: string) => api.dormantChapter(id),
-		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["storyGraph"] }),
+		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["narraFlow"] }),
 	});
 
 	const wakeMutation = useMutation({
 		mutationFn: (id: string) => api.wakeChapter(id),
-		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["storyGraph"] }),
+		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["narraFlow"] }),
 	});
 
 	const unmergeMutation = useMutation({
 		mutationFn: (id: string) => api.unmergeChapter(id),
-		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["storyGraph"] }),
+		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["narraFlow"] }),
 	});
 
 	const deleteChapter = useDeleteChapter();
@@ -78,8 +120,11 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
-	const [forkTarget, setForkTarget] = useState<string | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
+
+	// PC drag mode toggle: "select" = left-click drag draws lasso, "pan" = left-click drag pans
+	const [pcDragMode, setPcDragMode] = useState<"select" | "pan">("select");
+	const flowWrapperRef = useRef<HTMLDivElement>(null);
 	const nodesRef = useRef<Node[]>(nodes);
 	nodesRef.current = nodes;
 	const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
@@ -191,14 +236,50 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	}, [nodes, expandedNodes, liveStatuses, handleToggleExpand]);
 
 	// Recompute edge handles whenever local node positions change
-	const computedEdges = useMemo(
-		() => assignEdgeHandles(nodes as GraphNode[], edges),
-		[nodes, edges],
-	);
+	// Include temporary dashed edges for draft nodes (fork: parent→draft, merge: sources→draft)
+	const computedEdges = useMemo(() => {
+		const baseEdges = assignEdgeHandles(nodes as GraphNode[], edges);
+		const draftEdges: Edge[] = [];
+		for (const n of nodes) {
+			if (n.type !== "draftNode") continue;
+			const draftMode = n.data?.mode as DraftMode | undefined;
+			if (draftMode === "fork" && n.data?.parentChapterId) {
+				draftEdges.push({
+					id: `__draft_edge_${n.id}`,
+					source: n.data.parentChapterId as string,
+					target: n.id,
+					type: "fork",
+					sourceHandle: "bottom-src",
+					targetHandle: "top",
+					animated: true,
+					style: { strokeDasharray: "6 3", opacity: 0.5 },
+				});
+			} else if (draftMode === "merge") {
+				const sources = (n.data?.sourceChapterIds as string[]) ?? [];
+				for (const srcId of sources) {
+					draftEdges.push({
+						id: `__draft_edge_${n.id}_${srcId}`,
+						source: srcId,
+						target: n.id,
+						type: "merge",
+						sourceHandle: "right-src",
+						targetHandle: "left",
+						animated: true,
+						style: { strokeDasharray: "6 3", opacity: 0.5 },
+					});
+				}
+			}
+		}
+		return [...baseEdges, ...draftEdges];
+	}, [nodes, edges]);
 
 	// Sync local nodes state when upstream graph data changes
+	// Preserve any local-only draft nodes (type === "draftNode")
 	useEffect(() => {
-		setNodes(graphNodes as Node[]);
+		setNodes((prev) => {
+			const drafts = prev.filter((n) => n.type === "draftNode");
+			return [...(graphNodes as Node[]), ...drafts];
+		});
 	}, [graphNodes]);
 
 	const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -248,6 +329,8 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 
 	const onNodeDragStop: NodeMouseHandler = useCallback(
 		(_event, node) => {
+			// Don't persist positions for temporary draft nodes
+			if (node.type === "draftNode") return;
 			savePosition(node.id, node.position.x, node.position.y);
 		},
 		[savePosition],
@@ -255,6 +338,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 
 	const onNodeDoubleClick: NodeMouseHandler = useCallback(
 		(_event, node) => {
+			if (node.type === "draftNode") return;
 			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
 			const d = node.data as any;
 			if (d.narratorId) {
@@ -267,6 +351,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 	);
 
 	const onNodeContextMenu: NodeMouseHandler = useCallback((event, node) => {
+		if (node.type === "draftNode") return;
 		event.preventDefault();
 		// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
 		const d = node.data as any;
@@ -300,10 +385,201 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		setContextMenu(null);
 	}, []);
 
-	const handleFork = useCallback((nodeId: string) => {
-		setContextMenu(null);
-		setForkTarget(nodeId);
+	const onLassoSelect = useCallback((selectedIds: Set<string>) => {
+		setNodes((nds) =>
+			nds.map((n) => ({
+				...n,
+				selected: selectedIds.has(n.id),
+			})),
+		);
 	}, []);
+
+	// Derive selected node IDs from nodes state (exclude draft nodes)
+	const selectedNodeIds = useMemo(
+		() => nodes.filter((n) => n.selected && n.type !== "draftNode").map((n) => n.id),
+		[nodes],
+	);
+
+	// --- Unified draft node logic (fork + merge) ---
+	const draftIdCounter = useRef(0);
+
+	const removeDraft = useCallback((draftNodeId: string) => {
+		setNodes((nds) => nds.filter((n) => n.id !== draftNodeId));
+	}, []);
+
+	const handleDraftConfirm = useCallback(
+		(
+			draftNodeId: string,
+			payload: {
+				title: string;
+				description: string;
+				inheritMode: string;
+				mode: DraftMode;
+				parentChapterId?: string;
+				sourceChapterIds?: string[];
+				targetChapterId?: string;
+			},
+		) => {
+			if (payload.mode === "fork" && payload.parentChapterId) {
+				const draftNode = nodesRef.current.find((n) => n.id === draftNodeId);
+				const draftX = draftNode?.position?.x ?? 0;
+				const draftY = draftNode?.position?.y ?? 0;
+
+				api
+					.forkChapter(payload.parentChapterId, {
+						title: payload.title,
+						description: payload.description || undefined,
+						inheritMode: payload.inheritMode,
+						positionX: draftX,
+						positionY: draftY,
+					})
+					.then(() => {
+						removeDraft(draftNodeId);
+						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+						queryClient.invalidateQueries({ queryKey: ["chapters"] });
+						queryClient.invalidateQueries({ queryKey: ["narrators"] });
+					})
+					.catch((err) => {
+						notifications.show({
+							message: t("forkDraft.failed", {
+								message: err instanceof Error ? err.message : "unknown",
+							}),
+							color: "red",
+						});
+					});
+			} else if (payload.mode === "merge" && payload.sourceChapterIds?.length) {
+				// For merge-new: first source is base, rest are sources
+				// For merge-into: targetChapterId is base, all sourceChapterIds are sources
+				const baseId = payload.targetChapterId ?? payload.sourceChapterIds[0];
+				const sourceIds = payload.targetChapterId
+					? payload.sourceChapterIds
+					: payload.sourceChapterIds.slice(1);
+
+				api
+					.batchMerge({
+						baseChapterId: baseId,
+						sourceChapterIds: sourceIds,
+						title: payload.title,
+					})
+					.then(() => {
+						removeDraft(draftNodeId);
+						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+						queryClient.invalidateQueries({ queryKey: ["chapters"] });
+						notifications.show({ message: t("selection.mergeSuccess"), color: "green" });
+						setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+					})
+					.catch((err) => {
+						notifications.show({
+							message: t("mergeDraft.failed", {
+								message: err instanceof Error ? err.message : "unknown",
+							}),
+							color: "red",
+						});
+					});
+			}
+		},
+		[queryClient, t, removeDraft],
+	);
+
+	/** Compute bounding box center-bottom for a set of node IDs */
+	const getBboxBottom = useCallback((nodeIds: string[]) => {
+		let maxY = Number.NEGATIVE_INFINITY;
+		let sumX = 0;
+		let count = 0;
+		for (const id of nodeIds) {
+			const n = nodesRef.current.find((nd) => nd.id === id);
+			if (!n) continue;
+			const h = n.measured?.height ?? n.height ?? 120;
+			const w = n.measured?.width ?? n.width ?? 280;
+			maxY = Math.max(maxY, n.position.y + h);
+			sumX += n.position.x + w / 2;
+			count++;
+		}
+		return { x: count > 0 ? sumX / count - 140 : 0, y: maxY + 60 };
+	}, []);
+
+	const spawnDraft = useCallback(
+		(
+			mode: DraftMode,
+			position: { x: number; y: number },
+			extra: Partial<{
+				parentChapterId: string;
+				sourceChapterIds: string[];
+				targetChapterId: string;
+				defaultTitle: string;
+			}>,
+		) => {
+			const draftId = `__draft_${++draftIdCounter.current}`;
+			const draftNode: Node = {
+				id: draftId,
+				type: "draftNode",
+				position,
+				data: {
+					mode,
+					...extra,
+					onConfirm: handleDraftConfirm,
+					onCancel: removeDraft,
+				},
+				selected: false,
+			};
+			setNodes((nds) => [...nds, draftNode]);
+		},
+		[handleDraftConfirm, removeDraft],
+	);
+
+	const handleFork = useCallback(
+		(nodeId: string) => {
+			setContextMenu(null);
+			const sourceNode = nodesRef.current.find((n) => n.id === nodeId);
+			const sourceX = sourceNode?.position?.x ?? 0;
+			const sourceY = sourceNode?.position?.y ?? 0;
+			const sourceH = sourceNode?.measured?.height ?? sourceNode?.height ?? 120;
+			spawnDraft("fork", { x: sourceX, y: sourceY + sourceH + 60 }, { parentChapterId: nodeId });
+		},
+		[spawnDraft],
+	);
+
+	const handleMergeNew = useCallback(
+		(nodeIds: string[]) => {
+			if (nodeIds.length < 2) return;
+			const titles = nodeIds
+				.map((id) => {
+					const n = nodesRef.current.find((nd) => nd.id === id);
+					// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
+					return (n?.data as any)?.title ?? id.slice(0, 6);
+				})
+				.join(", ");
+			const pos = getBboxBottom(nodeIds);
+			spawnDraft("merge", pos, {
+				sourceChapterIds: nodeIds,
+				defaultTitle: t("selection.mergeNewTitle", { titles }),
+			});
+			// Clear selection so toolbar hides
+			setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+		},
+		[spawnDraft, getBboxBottom, t],
+	);
+
+	const handleMergeInto = useCallback(
+		(sourceNodeIds: string[], targetNodeId: string) => {
+			if (sourceNodeIds.length === 0) return;
+			const titles = sourceNodeIds
+				.map((id) => {
+					const n = nodesRef.current.find((nd) => nd.id === id);
+					// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
+					return (n?.data as any)?.title ?? id.slice(0, 6);
+				})
+				.join(", ");
+			const pos = getBboxBottom([...sourceNodeIds, targetNodeId]);
+			spawnDraft("merge", pos, {
+				sourceChapterIds: sourceNodeIds,
+				targetChapterId: targetNodeId,
+				defaultTitle: t("selection.mergeNewTitle", { titles }),
+			});
+			setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+		},
+		[spawnDraft, getBboxBottom, t],
+	);
 
 	const handleSetRole = useCallback(
 		(nodeId: string, role: string) => {
@@ -352,7 +628,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		if (!deleteTarget) return;
 		deleteChapter.mutate(deleteTarget.id, {
 			onSuccess: () => {
-				queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 				queryClient.invalidateQueries({ queryKey: ["narrators"] });
 				// Remove the chapter tab from recent tabs to prevent ghost entries
 				removeTab("chapter", deleteTarget.id);
@@ -410,8 +686,9 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 
 	return (
 		<Box style={{ height: "100%", display: "flex" }}>
-			<Box style={{ flex: 1, position: "relative" }}>
+			<Box ref={flowWrapperRef} style={{ flex: 1, position: "relative" }}>
 				<ReactFlow
+					colorMode={colorScheme === "auto" ? "system" : colorScheme}
 					nodes={nodesWithExpand}
 					edges={computedEdges}
 					nodeTypes={nodeTypes}
@@ -425,14 +702,32 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 					nodesDraggable
 					nodesConnectable
 					elementsSelectable
+					panOnDrag={pcDragMode === "pan" ? true : [1]}
+					selectionOnDrag={false}
+					panOnScroll={false}
 					fitView
 					fitViewOptions={{ padding: 0.2 }}
 					minZoom={0.1}
 					maxZoom={4}
 					proOptions={{ hideAttribution: true }}
 				>
+					<ModifierWheelPan />
+					<LassoSelection pcDragMode={pcDragMode} onSelect={onLassoSelect} />
+					<SelectionToolbar
+						selectedNodeIds={selectedNodeIds}
+						onFork={handleFork}
+						onMergeNew={handleMergeNew}
+						onMergeInto={handleMergeInto}
+					/>
 					<Background />
-					<Controls />
+					<Controls>
+						<ControlButton
+							title={pcDragMode === "select" ? t("controls.selectMode") : t("controls.panMode")}
+							onClick={() => setPcDragMode((m) => (m === "select" ? "pan" : "select"))}
+						>
+							{pcDragMode === "select" ? <IconPointer size={16} /> : <IconHandGrab size={16} />}
+						</ControlButton>
+					</Controls>
 				</ReactFlow>
 				{contextMenu && (
 					<NodeContextMenu
@@ -470,17 +765,6 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 					</Group>
 				</Stack>
 			</Modal>
-			{forkTarget && (
-				<ChapterForkModal
-					chapterId={forkTarget}
-					opened
-					onClose={() => setForkTarget(null)}
-					onForkSuccess={() => {
-						setForkTarget(null);
-						queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
-					}}
-				/>
-			)}
 		</Box>
 	);
 }

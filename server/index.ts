@@ -260,6 +260,9 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 // Register project DB backup sync (event-driven dual-write)
 registerProjectDbSync();
 
+	.catch((err) => {
+	});
+
 // Start container proxy if enabled
 if (settings.containers.proxy?.enabled) {
 	startContainerProxy().catch((err) => {

@@ -19,7 +19,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
 import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
-import { StoryNetwork } from "../../components/graph/StoryNetwork";
+import { NarraFlow } from "../../components/graph/NarraFlow";
 import { ProjectCommandsModal } from "../../components/project/ProjectCommandsModal";
 import { ProjectRoutinesModal } from "../../components/project/ProjectRoutinesModal";
 import { ProjectSettingsModal } from "../../components/project/ProjectSettingsModal";
@@ -158,7 +158,7 @@ function ProjectDetailPage() {
 
 			{/* Graph canvas */}
 			<Box style={{ flex: 1, minHeight: 0 }}>
-				<StoryNetwork projectId={projectId} />
+				<NarraFlow projectId={projectId} />
 			</Box>
 
 			{/* New chapter modal */}

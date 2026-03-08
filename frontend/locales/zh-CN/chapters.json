@@ -18,7 +18,7 @@
 	"forkTitlePlaceholder": "新分支标题",
 	"forkDescriptionPlaceholder": "这个分叉的内容...",
 	"contextInheritance": "上下文继承",
-	"inheritFresh": "全新（无上下文）",
+	"inheritFresh": "清空（无上下文）",
 	"inheritCompressed": "压缩（摘要）",
 	"inheritFull": "完整（完整历史）",
 	"forkFailed": "分叉失败",

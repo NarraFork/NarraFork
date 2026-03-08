@@ -239,6 +239,17 @@ export function useUpdateFastMode() {
 	});
 }
 
+export function useUpdateRelaxedPlan() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, relaxedPlan }: { id: string; relaxedPlan: boolean }) =>
+			api.updateNarratorRelaxedPlan(id, relaxedPlan),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useUpdateModel() {
 	const qc = useQueryClient();
 	return useMutation({

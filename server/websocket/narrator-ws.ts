@@ -60,6 +60,7 @@ export type NarratorServerMessage =
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
+	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
@@ -209,6 +210,10 @@ export type NarratorServerMessage =
 			narratorId: string;
 			chapterId: string;
 			containerStatus: string | null;
+	  }
+	| {
+			narratorId: string;
+			quotaBalance: number | null;
 	  };
 
 // Client → Server messages

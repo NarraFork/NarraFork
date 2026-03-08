@@ -37,15 +37,51 @@ const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.2 (external, cli)";
 const TOOL_PREFIX = "mcp_";
 
 /**
- * Global cache_control counter — matches opencode's `cc()` pattern.
- * The first 4 content blocks (across system, messages, and tools) get ephemeral cache.
+ * Apply cache_control breakpoints to maximize Anthropic prompt caching.
+ *
+ * Anthropic caches everything up to (and including) the last block with
+ * `cache_control`. We place breakpoints at:
+ *   1. The system prompt block (rarely changes)
+ *   2. The last tool definition (tool list rarely changes)
+ *   3–4. The last 2 content blocks in the message history (stable prefix)
+ *
+ * This ensures the entire prefix (system + tools + all prior messages) is
+ * cached across turns. New user/assistant messages are appended after the
+ * cached prefix, so the cache stays valid.
  */
-function createCacheCounter() {
-	let count = 0;
-	return () => {
-		count++;
-		return count <= 4 ? CACHE_CONTROL : {};
-	};
+function applyCacheBreakpoints(
+	systemBlocks: Array<Record<string, unknown>> | undefined,
+	messages: AnthropicMessage[],
+	tools: Array<Record<string, unknown>> | undefined,
+): void {
+	// Breakpoint 1: system prompt (last block)
+	if (systemBlocks && systemBlocks.length > 0) {
+		Object.assign(systemBlocks[systemBlocks.length - 1], CACHE_CONTROL);
+	}
+
+	// Breakpoint 2: last tool definition
+	if (tools && tools.length > 0) {
+		Object.assign(tools[tools.length - 1], CACHE_CONTROL);
+	}
+
+	// Breakpoints 3–4: last 2 content blocks in message history.
+	// Walk backwards through messages to find the last N blocks that can
+	// carry cache_control. We skip the very last message (the current user
+	// turn) since it changes every request — caching it would be pointless.
+	const TARGET_MSG_BREAKPOINTS = 2;
+	let placed = 0;
+	// Start from the second-to-last message (the last message is the new user turn)
+	for (let i = messages.length - 2; i >= 0 && placed < TARGET_MSG_BREAKPOINTS; i--) {
+		const content = messages[i].content;
+		if (Array.isArray(content) && content.length > 0) {
+			Object.assign(content[content.length - 1], CACHE_CONTROL);
+			placed++;
+		} else if (typeof content === "string") {
+			// Convert to array format so we can attach cache_control
+			messages[i].content = [{ type: "text", text: content, ...CACHE_CONTROL }];
+			placed++;
+		}
+	}
 }
 
 // === MAX mode helpers ===
@@ -319,34 +355,11 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const model = parseModelId(params.model).model;
 
-		// Apply cache_control using a global counter (matching opencode's cc() pattern).
-		// The counter is shared across system blocks, message blocks, and tool definitions.
-		const cc = createCacheCounter();
+		// Build system as array of text blocks
+		const systemBlocks = systemPrompt ? [{ type: "text" as const, text: systemPrompt }] : undefined;
 
-		// Build system as array of text blocks with cache_control
-		const systemBlocks = systemPrompt
-			? [{ type: "text" as const, text: systemPrompt, ...cc() }]
-			: undefined;
-
-		// Apply cache_control to message content blocks
-		for (const msg of messages) {
-			if (typeof msg.content === "string") {
-				msg.content = [{ type: "text", text: msg.content, ...cc() }];
-			} else if (Array.isArray(msg.content)) {
-				for (const part of msg.content) {
-					Object.assign(part, cc());
-				}
-			}
-		}
-
-		// Apply cache_control to tool definitions
-		const cachedTools =
-			tools.length > 0
-				? tools.map((t) => ({
-						...t,
-						...cc(),
-					}))
-				: undefined;
+		// Build tool definitions (without cache_control yet)
+		const cachedTools = tools.length > 0 ? tools.map((t) => ({ ...t })) : undefined;
 
 		const isMax = !!this.config.maxMode;
 
@@ -359,6 +372,9 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isMax) {
 			prefixMessageToolNames(messages);
 		}
+
+		// Apply cache_control breakpoints at optimal positions for prefix caching
+		applyCacheBreakpoints(systemBlocks, messages, cachedTools);
 
 		const body: Record<string, unknown> = {
 			model,

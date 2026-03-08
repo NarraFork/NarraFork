@@ -1,5 +1,5 @@
 {
-	"storyNetwork": "Story Network",
+	"storyNetwork": "NarraFlow",
 	"loading": "Loading graph…",
 	"loadFailed": "Failed to load graph: {{message}}",
 	"noChapters": "No chapters yet.",
@@ -23,6 +23,34 @@
 		"deleteConfirmTitle": "Delete Chapter",
 		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? The worktree and branch will be removed. Conversations will be preserved as read-only.",
 		"cancel": "Cancel"
+	},
+	"controls": {
+		"selectMode": "Select mode",
+		"panMode": "Pan mode"
+	},
+	"selection": {
+		"fork": "Fork",
+		"merge": "Merge",
+		"mergeInto": "Merge into existing",
+		"mergeNewTitle": "Merged: {{titles}}",
+		"mergeSuccess": "Merge completed",
+		"mergeFailed": "Merge failed: {{message}}"
+	},
+	"forkDraft": {
+		"titlePlaceholder": "New branch title",
+		"descriptionPlaceholder": "What this fork is about...",
+		"contextInheritance": "Context",
+		"fresh": "Fresh",
+		"compressed": "Compressed",
+		"full": "Full",
+		"confirm": "Fork",
+		"cancel": "Cancel",
+		"failed": "Fork failed: {{message}}"
+	},
+	"mergeDraft": {
+		"titlePlaceholder": "Merge commit title",
+		"descriptionPlaceholder": "Merge description...",
+		"failed": "Merge failed: {{message}}"
 	},
 	"sidePanel": {
 		"upstreamUpdates": "Upstream updates",

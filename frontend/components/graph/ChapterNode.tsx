@@ -59,7 +59,7 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 			queryClient.invalidateQueries({ queryKey: ["chapters"] });
 			queryClient.invalidateQueries({ queryKey: ["graph"] });
 			queryClient.invalidateQueries({ queryKey: ["narrators"] });
-			queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 			if (data?.id) {
 				notifications.show({
 					title: tch("forkSuccess"),

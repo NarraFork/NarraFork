@@ -596,7 +596,9 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 
-	if (permissionMode === "plan" && currentMode !== "plan") {
+	const isPlanLike = (m: string | null) => m === "plan";
+
+	if (isPlanLike(permissionMode) && !isPlanLike(currentMode)) {
 		// Entering plan mode — synthetic EnterPlanMode
 		const toolUseId = `toolu_manual_${generateShortId()}`;
 		const msg = await narratorService.persistAssistantMessage(id, {
@@ -625,7 +627,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 		if (fullMsg) {
 			broadcastToNarrator(id, { type: "message", narratorId: id, message: fullMsg });
 		}
-	} else if (currentMode === "plan" && permissionMode !== "plan") {
+	} else if (isPlanLike(currentMode) && !isPlanLike(permissionMode)) {
 		// Leaving plan mode — synthetic ExitPlanMode
 		const toolUseId = `toolu_manual_${generateShortId()}`;
 		const msg = await narratorService.persistAssistantMessage(id, {
@@ -685,6 +687,19 @@ narratorRoutes.patch("/:id/fast-mode", async (c) => {
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateFastMode(id, fastMode);
+	return c.json({ ok: true });
+});
+
+// Update relaxed plan toggle
+narratorRoutes.patch("/:id/relaxed-plan", async (c) => {
+	const id = c.req.param("id");
+	const { relaxedPlan } = await c.req.json();
+	if (typeof relaxedPlan !== "boolean") {
+		throw new ValidationError("relaxedPlan must be a boolean");
+	}
+	await narratorService.getById(id); // ensure exists
+	await narratorService.updateRelaxedPlan(id, relaxedPlan);
+	broadcastToNarrator(id, { type: "relaxed_plan_changed", narratorId: id, relaxedPlan });
 	return c.json({ ok: true });
 });
 

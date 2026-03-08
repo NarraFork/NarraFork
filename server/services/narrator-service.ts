@@ -271,6 +271,7 @@ interface CreateNarratorInput {
 	cwd?: string;
 	reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null;
 	fastMode?: boolean;
+	relaxedPlan?: boolean;
 }
 
 interface CreateSubagentInput {
@@ -335,6 +336,7 @@ export const narratorService = {
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: input.fastMode ?? false,
+				relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
@@ -384,6 +386,7 @@ export const narratorService = {
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: parent.fastMode ?? false,
+				relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				inheritMode: "fresh",
@@ -463,6 +466,7 @@ export const narratorService = {
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,
 					fastMode: original.fastMode ?? false,
+					relaxedPlan: original.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
 					parentNarratorId: input.parentNarratorId,
 					forkMessageId: prefixRows.length > 0 ? prefixRows[prefixRows.length - 1].messageId : null,
 					cwd: input.cwd,
@@ -2094,6 +2098,33 @@ export const narratorService = {
 		}
 	},
 
+	/**
+	 * Patch a reasoning block's translatedText within an existing message.
+	 * Finds the reasoning block at the given index and sets its translatedText field.
+	 */
+	async patchReasoningTranslation(
+		messageId: string,
+		reasoningIndex: number,
+		translatedText: string,
+	) {
+		const existing = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { contentJson: true },
+		});
+		if (!existing) return;
+
+		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON content blocks
+		const block = content[reasoningIndex] as any;
+		if (!block || block.type !== "reasoning") return;
+
+		block.translatedText = translatedText;
+		await db
+			.update(narratorMessages)
+			.set({ contentJson: content })
+			.where(eq(narratorMessages.id, messageId));
+	},
+
 	async updateConversationId(narratorId: string, apiConversationId: string) {
 		const now = new Date().toISOString();
 		await db
@@ -2201,6 +2232,14 @@ export const narratorService = {
 		await db
 			.update(narrators)
 			.set({ fastMode, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
+	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ relaxedPlan, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
 	},
 
@@ -2491,6 +2530,7 @@ export const narratorService = {
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,
 					fastMode: parent.fastMode ?? false,
+					relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
 					parentNarratorId,
 					forkMessageId: resolvedForkMessageId,
 					inheritMode,

@@ -77,6 +77,7 @@
 	"reasoning_xhigh": "超高",
 	"fast_mode": "快速模式",
 	"fast_mode_tooltip": "启用优先处理层级以获得更快的推理速度（service_tier: priority）",
+	"relaxed_plan_tooltip": "宽松规划：规划模式下工具仍然可用",
 	"archiveConfirmTitle": "确认归档",
 	"archiveActiveWarning": "确定要归档该会话吗？如果会话正在运行中，归档将中断当前生成并拒绝权限申请。",
 	"confirmArchive": "确认归档",
@@ -161,5 +162,7 @@
 	"unmergeConfirmDesc": "这将把目标分支重置到合并 \"{{branch}}\" 之前的状态。源分支将恢复为活跃状态。此操作不可撤销。",
 	"unmergeSuccess": "撤回合并成功",
 	"unmergeSuccessDesc": "合并已回退，分支已恢复为活跃状态。",
-	"unmergeFailed": "撤回合并失败"
+	"unmergeFailed": "撤回合并失败",
+	"showOriginal": "显示原文",
+	"showTranslated": "显示翻译"
 }

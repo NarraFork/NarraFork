@@ -24,7 +24,7 @@ export function useCreateChapter() {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		onSuccess: (data: any) => {
 			qc.invalidateQueries({ queryKey: ["chapters", { projectId: data.projectId }] });
-			qc.invalidateQueries({ queryKey: ["storyGraph", data.projectId] });
+			qc.invalidateQueries({ queryKey: ["narraFlow", data.projectId] });
 		},
 	});
 }
@@ -37,7 +37,7 @@ export function useUpdateChapter() {
 		onSuccess: (_, { id }) => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["chapters", id] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }
@@ -48,7 +48,7 @@ export function useDeleteChapter() {
 		mutationFn: api.deleteChapter,
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
-			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }

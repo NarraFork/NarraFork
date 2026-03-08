@@ -40,6 +40,7 @@ interface NarratorWSCallbacks {
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
+	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number, promptTokens?: number, contextWindow?: number) => void;
@@ -272,6 +273,9 @@ export function useNarratorWS(
 						case "permission_mode_changed":
 							callbacksRef.current.onPermissionModeChanged?.(data.permissionMode);
 							break;
+						case "relaxed_plan_changed":
+							callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan);
+							break;
 						case "compacting":
 							callbacksRef.current.onCompacting?.();
 							break;
@@ -331,6 +335,7 @@ export function useNarratorWS(
 							if (!data.isSubagent) {
 								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
 							}
+							break;
 							break;
 						case "narrator_error":
 							callbacksRef.current.onNarratorError?.(data.error);

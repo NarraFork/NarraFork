@@ -4,8 +4,10 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
+import { agentGenerateWithMeta } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import {
 	enrichToolUseBlocks,
@@ -42,6 +44,9 @@ export interface EventHandlerContext {
 	sseEmitter?: EventEmitter;
 	/** Conversation/session ID for message persistence */
 	conversationId: string;
+	/** Locale for the narrator session (used for reasoning translation) */
+	locale?: string;
+	providerPrefix?: string;
 
 	// --- Mutable state accessors ---
 	getContextUsagePct: () => number | undefined;
@@ -131,6 +136,87 @@ function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage)
 		}
 		broadcastToNarrator(ctx.narratorId, selfMsg);
 	}
+}
+
+// === Reasoning translation ===
+
+const LOCALE_NAMES: Record<string, string> = {
+	"zh-CN": "简体中文",
+	zh: "简体中文",
+	ja: "日本語",
+	ko: "한국어",
+};
+
+/**
+ * Translate a reasoning block's text via the summary model, then patch the
+ * message in DB and broadcast the updated message to connected clients.
+ * Runs as fire-and-forget — errors are logged but never propagate.
+ */
+function translateReasoningBlock(
+	messageId: string,
+	narratorId: string,
+	broadcastTargetId: string,
+	reasoningText: string,
+	ctx: EventHandlerContext,
+): void {
+	const locale = ctx.locale || "en";
+	// Skip translation for English content when locale is English
+	if (locale === "en") return;
+
+	const langName = LOCALE_NAMES[locale] || locale;
+
+	(async () => {
+		try {
+			const result = await agentGenerateWithMeta(
+				reasoningText,
+				settings.agent.summaryModel,
+				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
+			);
+			const translated = result.text?.trim();
+			if (!translated) return;
+
+			// Find the reasoning block index in the message
+			const msg = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true },
+			});
+			if (!msg) return;
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			// Find the last reasoning block whose text matches (in case of multiple)
+			let targetIdx = -1;
+			for (let i = blocks.length - 1; i >= 0; i--) {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON content blocks
+				const b = blocks[i] as any;
+				if (b.type === "reasoning" && b.text === reasoningText) {
+					targetIdx = i;
+					break;
+				}
+			}
+			if (targetIdx === -1) return;
+
+			await narratorService.patchReasoningTranslation(messageId, targetIdx, translated);
+
+			// Broadcast updated message so frontend picks up the translation
+			const fullMessage = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				with: { toolCalls: true },
+			});
+			if (fullMessage) {
+				const processed = enrichToolUseBlocks(truncateToolIO([fullMessage]))[0];
+				dualBroadcast(ctx, {
+					type: "message",
+					narratorId: broadcastTargetId,
+					message: processed,
+				});
+			}
+		} catch (err) {
+			logger.warn("Reasoning translation failed", {
+				narratorId,
+				messageId,
+				error: String(err),
+			});
+		}
+	})();
 }
 
 // === Unified event processor ===
@@ -268,6 +354,10 @@ export async function processEvent(
 					text: block.text,
 					providerMetadata: block.providerMetadata,
 				});
+				// Fire-and-forget reasoning translation
+				if (settings.agent.translateReasoning && block.text) {
+					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx);
+				}
 			} else if (block.type === "tool_use") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "tool_use",
@@ -566,6 +656,20 @@ export async function processEvent(
 				usage: event.usage,
 				...(isSubagent && { isSubagent: true }),
 			});
+			return null;
+		}
+
+			dualBroadcast(ctx, {
+				narratorId: broadcastTargetId,
+				quotaBalance: event.quotaBalance,
+			});
+			// Update the global in-memory quota cache so the provider management page
+			// can display the latest balance without an extra network round-trip.
+			if (ctx.providerPrefix) {
+				try {
+				} catch {
+				}
+			}
 			return null;
 		}
 

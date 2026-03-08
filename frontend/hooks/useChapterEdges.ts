@@ -23,7 +23,7 @@ export function useCreateChapterEdge() {
 		}) => api.createChapterEdge(data),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["chapterEdges"] });
-			queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }
@@ -34,7 +34,7 @@ export function useDeleteChapterEdge() {
 		mutationFn: (id: string) => api.deleteChapterEdge(id),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["chapterEdges"] });
-			queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }

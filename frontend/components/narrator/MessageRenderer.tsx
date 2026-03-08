@@ -2,6 +2,7 @@ import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
 import { IconBrain } from "@tabler/icons-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
+import { ContentViewer } from "./ContentViewer";
 import { MessageBubble, ReasoningSummary } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
@@ -79,26 +80,33 @@ export function renderToolRun(
 					<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
 						<IconBrain size={10} />
 					</ThemeIcon>
-					<ReasoningSummary text={item.reasoningText} />
+					<ReasoningSummary text={item.reasoningText} translatedText={item.translatedText} />
 				</Group>
 			);
 			return (
 				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
 					<div id={`msg-${item.msg.id}`} style={hlStyle}>
-						{total >= 2 ? (
-							<>
-								<Box p="xs">{header}</Box>
-								{idx !== total - 1 && (
-									<Divider color="var(--mantine-color-default-border)" size={1} />
-								)}
-							</>
-						) : (
-							<Box p="xs">
-								<Paper withBorder radius="sm" p="xs">
-									{header}
-								</Paper>
-							</Box>
-						)}
+						<ContentViewer
+							content={item.reasoningText}
+							markdown
+							contentType="markdown"
+							blockIndex={item.blockIndex}
+						>
+							{total >= 2 ? (
+								<>
+									<Box p="xs">{header}</Box>
+									{idx !== total - 1 && (
+										<Divider color="var(--mantine-color-default-border)" size={1} />
+									)}
+								</>
+							) : (
+								<Box p="xs">
+									<Paper withBorder radius="sm" p="xs">
+										{header}
+									</Paper>
+								</Box>
+							)}
+						</ContentViewer>
 					</div>
 				</MessageContextMenuCtx.Provider>
 			);

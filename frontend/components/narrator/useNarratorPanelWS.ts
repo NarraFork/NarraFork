@@ -874,6 +874,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, permissionMode } : old,
 				);
 			},
+			onRelaxedPlanChanged: (relaxedPlan) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, relaxedPlan } : old,
+				);
+			},
 			onContextUsage: (percentage, promptTokens, contextWindow) => {
 				setContextPercent(percentage);
 				setPromptTokens(promptTokens ?? null);
@@ -882,6 +887,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				setPruneBoundaryMessageId(boundaryMessageId);
 				setPrunedPercent(prunedPct);
+			},
 			},
 			onGitStatus: (data) => {
 				qc.setQueryData(["chapterGitStatus", data.chapterId], {

@@ -1,7 +1,7 @@
 {
 	"appName": "NarraFork",
 	"dashboard": "Dashboard",
-	"projects": "Projects",
+	"projects": "NarraFlow",
 	"narrators": "Narrators",
 	"settings": "Settings",
 	"admin": "Admin",
@@ -14,7 +14,7 @@
 	"searchPlaceholder": "Search chapters & messages...",
 	"recentTabs": "Recent",
 	"clearAll": "Clear",
-	"clearProjects": "Clear projects",
+	"clearProjects": "Clear narraflows",
 	"clearNarrators": "Clear idle narrators",
 	"newNarrator": "New narrator",
 	"noRecentTabs": "No recent tabs",

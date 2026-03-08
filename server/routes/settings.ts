@@ -74,6 +74,8 @@ const updateSettingsSchema = z
 					})
 					.partial(),
 				legacyEncoding: z.boolean(),
+				translateReasoning: z.boolean(),
+				defaultRelaxedPlan: z.boolean(),
 				planTimeoutAction: z.enum(["deny", "auto_approve"]),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
 			})

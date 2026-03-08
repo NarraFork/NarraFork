@@ -43,6 +43,7 @@
 	"landscape": "横屏模式",
 	"source": "查看源码",
 	"rendered": "查看渲染",
+	"versionUpdate": "新版本（{{version}}）已发布。",
 	"wsDisconnected": "实时连接已断开，部分更新可能无法显示。",
 	"wsReconnect": "重新连接",
 	"providers": "供应商",
