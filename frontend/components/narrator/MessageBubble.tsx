@@ -291,10 +291,17 @@ function CompactIndicator({
 
 function MergeSummaryCard({
 	block,
+	creator,
 	onDelete,
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	block: any;
+	creator?: {
+		id: string;
+		username: string;
+		avatarColor?: string | null;
+		avatarImageId?: string | null;
+	} | null;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -348,12 +355,23 @@ function MergeSummaryCard({
 				}}
 			>
 				<Group gap={6} wrap="nowrap">
+					{creator && (
+						<UserAvatar
+							username={creator.username}
+							avatarColor={creator.avatarColor}
+							avatarImageId={creator.avatarImageId}
+							userId={creator.id}
+							size={16}
+							showTooltip={false}
+						/>
+					)}
 					<IconGitMerge
 						size={16}
 						style={{ flexShrink: 0, color: "var(--mantine-color-indigo-6)" }}
 					/>
 					<Text size="xs" c="indigo" lineClamp={1}>
-						{t("mergeSummaryLabel")} — {header}
+						{t("mergeSummaryLabel")}
+						{block.mergeRound > 1 && ` #${block.mergeRound}`} — {header}
 					</Text>
 				</Group>
 			</Paper>
@@ -364,7 +382,10 @@ function MergeSummaryCard({
 				title={
 					<Group gap="xs">
 						<IconGitMerge size={18} style={{ color: "var(--mantine-color-indigo-6)" }} />
-						<Text fw={600}>{t("mergeSummaryTitle")}</Text>
+						<Text fw={600}>
+							{t("mergeSummaryTitle")}
+							{block.mergeRound > 1 && ` #${block.mergeRound}`}
+						</Text>
 					</Group>
 				}
 				size="lg"
@@ -374,6 +395,16 @@ function MergeSummaryCard({
 						<Text size="sm" c="dimmed">
 							{t("mergeSummaryBranch")}:
 						</Text>
+						{creator && (
+							<UserAvatar
+								username={creator.username}
+								avatarColor={creator.avatarColor}
+								avatarImageId={creator.avatarImageId}
+								userId={creator.id}
+								size={20}
+								showTooltip
+							/>
+						)}
 						<Text size="sm" fw={500}>
 							{header}
 						</Text>
@@ -404,7 +435,7 @@ function MergeSummaryCard({
 					</ScrollArea.Autosize>
 				)}
 
-				{block.sourceChapterId && (
+				{block.sourceChapterId && block.isLatest !== false && (
 					<Group justify="flex-end" mt="md">
 						<Button color="orange" variant="light" size="xs" onClick={openConfirm}>
 							{t("unmerge")}
@@ -776,7 +807,13 @@ export const MessageBubble = memo(function MessageBubble({
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const mergeSummaryBlock = blocks.find((b: any) => b.type === "merge_summary");
 	if (mergeSummaryBlock) {
-		return <MergeSummaryCard block={mergeSummaryBlock} onDelete={invalidateMessages} />;
+		return (
+			<MergeSummaryCard
+				block={mergeSummaryBlock}
+				creator={message.creator}
+				onDelete={invalidateMessages}
+			/>
+		);
 	}
 
 	// System messages (compact indicators / plan cards)

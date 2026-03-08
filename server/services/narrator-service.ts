@@ -1688,8 +1688,13 @@ export const narratorService = {
 	 * The `contentBlocks` carry structured metadata for the UI; a text block
 	 * is always prepended so the model can read the plain-text content.
 	 */
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	async persistSystemMessage(narratorId: string, text: string, contentBlocks?: any[]) {
+	async persistSystemMessage(
+		narratorId: string,
+		text: string,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		contentBlocks?: any[],
+		createdBy?: string,
+	) {
 		const id = generateId();
 		const now = new Date().toISOString();
 		// Always lead with a text block so the SDK sees the message content,
@@ -1703,6 +1708,7 @@ export const narratorService = {
 				role: "user",
 				contentJson: blocks,
 				contentText: text,
+				createdBy: createdBy ?? null,
 				createdAt: now,
 			})
 			.returning();
