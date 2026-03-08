@@ -1,10 +1,10 @@
 import { Box, Center, Drawer, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
-import { useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useLocation } from "@tanstack/react-router";
+import { notifications } from "@mantine/notifications";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, useLocation, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { NarratorTerminal } from "../../components/terminal/NarratorTerminal";
 import { useChapter } from "../../hooks/useChapters";
@@ -183,16 +183,65 @@ function NarratorDetailPage() {
 		});
 	}, [narratorId]);
 
-	// Fork-from-message: open ChapterForkModal with the selected message UUID
-	const [forkAtMessageUuid, setForkAtMessageUuid] = useState<string | null>(null);
+	const { t: tc } = useTranslation("chapters");
+	const { t: tCommon } = useTranslation("common");
+	const navigate = useNavigate();
+
+	// Fork-from-message: directly fork without modal
+	const forkFromMessage = useMutation({
+		mutationFn: (messageUuid: string) => {
+			if (!chapterId) throw new Error("No chapter");
+			return api.forkChapter(chapterId, {
+				inheritMode: "full",
+				forkAtMessageUuid: messageUuid,
+			});
+		},
+		onSuccess: async (data) => {
+			qc.invalidateQueries({ queryKey: ["chapters"] });
+			qc.invalidateQueries({ queryKey: ["graph"] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["storyGraph"] });
+			if (data?.id) {
+				const narrators = await api.listNarrators({ chapterId: data.id });
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+				const primary = narrators?.find((n: any) => n.type === "primary");
+				notifications.show({
+					title: tc("forkSuccess"),
+					message: tc("forkCreatedClick", { title: data.title ?? "Fork" }),
+					color: "green",
+					autoClose: 6000,
+					onClick: () => {
+						if (primary?.id) {
+							navigate({
+								to: "/narrators/$narratorId",
+								params: { narratorId: primary.id },
+							});
+						} else {
+							navigate({
+								to: "/chapters/$chapterId",
+								params: { chapterId: data.id },
+							});
+						}
+					},
+					style: { cursor: "pointer" },
+				});
+			}
+		},
+		onError: (err) => {
+			notifications.show({
+				title: tc("forkFailed"),
+				message: err instanceof Error ? err.message : tCommon("unknownError"),
+				color: "red",
+			});
+		},
+	});
 	const handleForkFromMessage = useCallback(
 		(messageUuid: string) => {
 			if (!chapterId) return;
-			setForkAtMessageUuid(messageUuid);
+			forkFromMessage.mutate(messageUuid);
 		},
-		[chapterId],
+		[chapterId, forkFromMessage],
 	);
-	const closeForkModal = useCallback(() => setForkAtMessageUuid(null), []);
 
 	// Auto-close terminal panel only when the last terminal exits
 	const handleTerminalExit = useCallback(() => {
@@ -299,14 +348,6 @@ function NarratorDetailPage() {
 						onExit={handleTerminalExit}
 					/>
 				</Drawer>
-				{chapterId && (
-					<ChapterForkModal
-						chapterId={chapterId}
-						opened={forkAtMessageUuid !== null}
-						onClose={closeForkModal}
-						forkAtMessageUuid={forkAtMessageUuid ?? undefined}
-					/>
-				)}
 			</Box>
 		);
 	}
@@ -375,14 +416,6 @@ function NarratorDetailPage() {
 						/>
 					</Box>
 				</>
-			)}
-			{chapterId && (
-				<ChapterForkModal
-					chapterId={chapterId}
-					opened={forkAtMessageUuid !== null}
-					onClose={closeForkModal}
-					forkAtMessageUuid={forkAtMessageUuid ?? undefined}
-				/>
 			)}
 		</Box>
 	);

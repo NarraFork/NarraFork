@@ -252,6 +252,58 @@ export const snapshot = {
 		await execGit(["gc", "--prune=7.days"], dir, dir);
 	},
 
+	/**
+	 * Apply a tree hash from one chapter's shadow repo onto an arbitrary worktree.
+	 * Used during fork to restore the file state the model saw at a specific message.
+	 *
+	 * `checkout-index` only writes files present in the tree — it won't remove files
+	 * that exist in the worktree but were deleted by the model. To handle deletions,
+	 * we compare the snapshot tree against the worktree's current HEAD tree and
+	 * remove files that are absent from the snapshot.
+	 */
+	async applyTreeToWorktree(
+		sourceChapterId: string,
+		targetWorktreePath: string,
+		treeHash: string,
+	): Promise<void> {
+		return withLock(sourceChapterId, async () => {
+			const dir = shadowDir(sourceChapterId);
+
+			// 1. List files in the snapshot tree (from shadow repo)
+			const snapshotFiles = await execGit(
+				["ls-tree", "-r", "--name-only", treeHash],
+				dir,
+				targetWorktreePath,
+			);
+			const snapshotSet = new Set(snapshotFiles.stdout.split("\n").filter(Boolean));
+
+			// 2. List files in the worktree's current HEAD tree (from the real git repo).
+			// NOTE: We use Bun.spawn directly here instead of execGit because execGit
+			// injects --git-dir/--work-tree pointing to the shadow repo, but we need
+			// to query the target worktree's own git repository.
+			const headProc = Bun.spawn(["git", "ls-tree", "-r", "--name-only", "HEAD"], {
+				cwd: targetWorktreePath,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const headStdout = await new Response(headProc.stdout).text();
+			await headProc.exited;
+			const headFiles = headStdout.trim().split("\n").filter(Boolean);
+
+			// 3. Delete files present in HEAD but absent from the snapshot (model deleted them)
+			for (const file of headFiles) {
+				if (!snapshotSet.has(file)) {
+					const filePath = resolve(targetWorktreePath, file);
+					if (existsSync(filePath)) rmSync(filePath);
+				}
+			}
+
+			// 4. Write snapshot files to the worktree
+			await execGit(["read-tree", treeHash], dir, targetWorktreePath);
+			await execGit(["checkout-index", "-a", "-f"], dir, targetWorktreePath);
+		});
+	},
+
 	/** Remove the shadow repository entirely. */
 	async destroy(chapterId: string): Promise<void> {
 		const dir = shadowDir(chapterId);

@@ -170,6 +170,8 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new AnthropicProvider(anthropicConfig);
 	}
 
+	}
+
 	const openaiConfig = getOpenaiProviderConfig(provider);
 	if (openaiConfig) {
 		return new OpenAIProvider(openaiConfig);
@@ -191,6 +193,13 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 
 	for (const p of settings.anthropicProviders ?? []) {
 		if (!p.apiKey) continue;
+		if (!seen.has(p.prefix)) {
+			seen.add(p.prefix);
+			providers.push(p.prefix);
+		}
+	}
+
+		if (!p.apiKey || !p.baseUrl) continue;
 		if (!seen.has(p.prefix)) {
 			seen.add(p.prefix);
 			providers.push(p.prefix);
@@ -230,6 +239,8 @@ function defaultModelForProvider(provider: string): string | null {
 	const anthropic = getAnthropicProviderConfig(provider);
 	if (anthropic?.defaultModel) {
 		return `${provider}:${anthropic.defaultModel}`;
+	}
+
 	}
 
 	const custom = settings.agent.customModels ?? [];

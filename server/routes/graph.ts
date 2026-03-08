@@ -21,6 +21,7 @@ export interface GraphNode {
 		explorationGroupId: string | null;
 		narratorCount: number;
 		narratorId: string | null;
+		narratorStatus: string | null;
 		hasContainers: boolean;
 		hasUpstreamUpdates: boolean;
 		isRoot: boolean;
@@ -63,6 +64,7 @@ export function buildGraph(
 	}[],
 	narratorCounts: Map<string, number>,
 	narratorIds: Map<string, string>,
+	narratorStatuses: Map<string, string>,
 	containerPresence: Set<string>,
 	edgeRows: {
 		id: string;
@@ -85,6 +87,7 @@ export function buildGraph(
 			explorationGroupId: ch.explorationGroupId,
 			narratorCount: narratorCounts.get(ch.id) ?? 0,
 			narratorId: narratorIds.get(ch.id) ?? null,
+			narratorStatus: narratorStatuses.get(ch.id) ?? null,
 			hasContainers: containerPresence.has(ch.id),
 			hasUpstreamUpdates: false,
 			isRoot: !!ch.isRoot,
@@ -184,7 +187,7 @@ graphRoutes.get("/:id/graph", async (c) => {
 	const allNarrators = chapterIds.length
 		? await db.query.narrators.findMany({
 				where: (n, { inArray }) => inArray(n.chapterId, chapterIds),
-				columns: { id: true, chapterId: true },
+				columns: { id: true, chapterId: true, status: true },
 			})
 		: [];
 
@@ -198,12 +201,14 @@ graphRoutes.get("/:id/graph", async (c) => {
 
 	const narratorCounts = new Map<string, number>();
 	const narratorIds = new Map<string, string>();
+	const narratorStatuses = new Map<string, string>();
 	for (const n of allNarrators) {
 		if (n.chapterId) {
 			narratorCounts.set(n.chapterId, (narratorCounts.get(n.chapterId) ?? 0) + 1);
-			// Keep the first narrator ID per chapter
+			// Keep the first narrator ID and status per chapter
 			if (!narratorIds.has(n.chapterId)) {
 				narratorIds.set(n.chapterId, n.id);
+				if (n.status) narratorStatuses.set(n.chapterId, n.status);
 			}
 		}
 	}
@@ -232,6 +237,7 @@ graphRoutes.get("/:id/graph", async (c) => {
 		projectChapters,
 		narratorCounts,
 		narratorIds,
+		narratorStatuses,
 		containerPresence,
 		edgeRows,
 	);

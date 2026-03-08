@@ -417,9 +417,14 @@ function SortableTabItem({
 		[tab.type, tab.id, onRemove],
 	);
 
-	// Right-click context menu
+	// Right-click context menu — suppress on touch devices (long-press fires contextmenu)
+	const isTouching = useRef(false);
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
+			if (isTouching.current) {
+				e.preventDefault();
+				return;
+			}
 			onContextMenu(e, tab);
 		},
 		[onContextMenu, tab],
@@ -434,6 +439,7 @@ function SortableTabItem({
 	const [exiting, setExiting] = useState(false);
 
 	const handleTouchStart = useCallback((e: React.TouchEvent) => {
+		isTouching.current = true;
 		touchStartX.current = e.touches[0].clientX;
 		touchStartY.current = e.touches[0].clientY;
 		directionLocked.current = null;
@@ -457,6 +463,10 @@ function SortableTabItem({
 	);
 
 	const handleTouchEnd = useCallback(() => {
+		// Defer clearing so the contextmenu event (fired after touchend) still sees the flag
+		setTimeout(() => {
+			isTouching.current = false;
+		}, 0);
 		if (!swiping.current || isDragging) {
 			swiping.current = false;
 			return;

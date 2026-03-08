@@ -95,6 +95,7 @@ function seedGraph() {
 // Empty maps for tests that don't need narrator/container data
 const emptyNarratorCounts = new Map<string, number>();
 const emptyNarratorIds = new Map<string, string>();
+const emptyNarratorStatuses = new Map<string, string>();
 const emptyContainerPresence = new Set<string>();
 function pickNodeIds(nodes: GraphNode[]): string[] {
 	return nodes.map((n) => n.id).sort();
@@ -109,6 +110,7 @@ describe("story network graph", () => {
 			allChapters,
 			emptyNarratorCounts,
 			emptyNarratorIds,
+			emptyNarratorStatuses,
 			emptyContainerPresence,
 			edgeRows,
 		);
@@ -124,6 +126,7 @@ describe("story network graph", () => {
 			allChapters,
 			emptyNarratorCounts,
 			emptyNarratorIds,
+			emptyNarratorStatuses,
 			emptyContainerPresence,
 			edgeRows,
 		);
@@ -140,6 +143,7 @@ describe("story network graph", () => {
 			allChapters,
 			emptyNarratorCounts,
 			emptyNarratorIds,
+			emptyNarratorStatuses,
 			emptyContainerPresence,
 			edgeRows,
 		);
@@ -157,6 +161,7 @@ describe("story network graph", () => {
 			allChapters,
 			emptyNarratorCounts,
 			emptyNarratorIds,
+			emptyNarratorStatuses,
 			emptyContainerPresence,
 			edgeRows,
 		);

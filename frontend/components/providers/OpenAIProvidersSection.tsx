@@ -38,7 +38,7 @@ interface OpenAIProvidersSectionProps {
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
-	isDirty?: boolean;
+	isProviderDirty?: (providerId: string) => boolean;
 }
 
 export function OpenAIProvidersSection({
@@ -49,7 +49,7 @@ export function OpenAIProvidersSection({
 	onToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
-	isDirty,
+	isProviderDirty,
 }: OpenAIProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -99,7 +99,7 @@ export function OpenAIProvidersSection({
 
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
-			if (isDirty) {
+			if (isProviderDirty?.(providerId)) {
 				notifications.show({
 					color: "yellow",
 					title: t("refreshModelsSaveFirst"),
@@ -118,7 +118,7 @@ export function OpenAIProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t, isDirty],
+		[qc, t, isProviderDirty],
 	);
 
 	return (

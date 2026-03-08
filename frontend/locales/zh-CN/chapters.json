@@ -23,6 +23,7 @@
 	"inheritFull": "完整（完整历史）",
 	"forkFailed": "分叉失败",
 	"forkSuccess": "分叉已创建",
+	"forkCreatedClick": "\"{{title}}\" 已创建，点击打开。",
 	"forkNavigatePrompt": "章节「{{title}}」已创建，是否跳转到它的对话？",
 	"stayHere": "留在当前",
 	"goToFork": "前往分叉",

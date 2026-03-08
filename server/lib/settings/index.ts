@@ -66,6 +66,16 @@ export interface AnthropicProviderConfig {
 	maxMode?: boolean;
 }
 
+	/** Unique short ID (8 chars). */
+	id: string;
+	name: string;
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	/** Default model (bare name without prefix). */
+	defaultModel: string;
+}
+
 export interface NarraForkSettings {
 	server: { port: number };
 	paths: { defaultProjectDir: string };
@@ -409,6 +419,10 @@ export function registerCodexModelLister(lister: () => string[]): void {
 	codexModelLister = lister;
 }
 
+}
+
+}
+
 /**
  * Get all available model values (provider:id format), excluding hidden models.
  */
@@ -491,6 +505,16 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 	return config.prefix;
 }
 
+/**
+ * If prefix is undefined, returns the first provider.
+ */
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+	return config.prefix;
+}
+
 function hasConfiguredOpenaiProvider(): boolean {
 	const providers = settings.openaiProviders ?? [];
 	return providers.some((p) => !!p.apiKey);
@@ -512,6 +536,11 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
+	return providers.some((p) => !!p.apiKey && !!p.baseUrl);
+}
+
+}
+
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
 	if (hasConfiguredOpenaiProvider()) {
@@ -526,6 +555,8 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
+	}
+		}
 	}
 	}
 	const result: string[] = [];

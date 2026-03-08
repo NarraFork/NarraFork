@@ -1,7 +1,14 @@
 import { resolve } from "node:path";
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
+import {
+	chapters,
+	narratorMessageRefs,
+	narratorMessages,
+	narratorPatches,
+	narrators,
+	projects,
+} from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -14,9 +21,10 @@ import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { portAllocator } from "./port-allocator";
+import { snapshot } from "./snapshot";
 
 export interface ForkChapterInput {
-	title: string;
+	title?: string;
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
@@ -46,7 +54,9 @@ export const chapterFork = {
 		const gitPath = project.gitPath;
 
 		const inheritMode = input.inheritMode ?? "full";
-		const slug = slugify(input.title);
+		const autoTitle = `${parent.title.slice(0, 180)}-fork-${generateShortId(6)}`;
+		const title = input.title || autoTitle;
+		const slug = slugify(title);
 		const shortId = generateShortId(6);
 		const branchName = `chapter/${slug}-${shortId}`;
 		const worktreePath = resolve(gitPath, ".worktrees", `${slug}-${shortId}`);
@@ -85,13 +95,67 @@ export const chapterFork = {
 			await gitService.createWorktree(gitPath, worktreePath, branchName);
 			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
 
-			// Step 2: Create DB record
+			// Step 1.5: Restore file state to match what the model saw at the fork message.
+			// The worktree is at the resolved commit, but the model may have made file
+			// changes (via Write/Edit/Bash) that weren't committed yet at that point.
+			// Those changes are tracked in narrator_patches as snapshot tree hashes.
+			if (input.forkAtMessageUuid) {
+				try {
+					const snapshotHash = await this.resolveSnapshotHashForMessage(
+						parentChapterId,
+						input.forkAtMessageUuid,
+					);
+					if (snapshotHash) {
+						await snapshot.applyTreeToWorktree(parentChapterId, worktreePath, snapshotHash);
+						logger.info("Applied snapshot to forked worktree", {
+							parentChapterId,
+							childChapterId: id,
+							snapshotHash,
+						});
+					}
+				} catch (err) {
+					// Non-fatal: degrade to commit-only state rather than failing the fork
+					logger.warn("Failed to apply snapshot during fork (non-fatal)", {
+						parentChapterId,
+						childChapterId: id,
+						error: String(err),
+					});
+				}
+			}
+
+			// Step 2: Compute initial graph position below the parent node
+			const NODE_WIDTH = 280;
+			const DEFAULT_NODE_HEIGHT = 120;
+			const DEFAULT_PANEL_HEIGHT = 640;
+			const VERTICAL_GAP = 60;
+			const HORIZONTAL_SPACING = NODE_WIDTH + 80;
+
+			const parentX = parent.positionX ?? 0;
+			const parentY = parent.positionY ?? 0;
+			const parentHeight =
+				parent.panelExpanded && parent.panelHeight
+					? parent.panelHeight
+					: parent.panelExpanded
+						? DEFAULT_PANEL_HEIGHT
+						: DEFAULT_NODE_HEIGHT;
+
+			// Count existing children to offset horizontally and avoid overlap
+			const existingSiblings = await db
+				.select({ id: chapters.id })
+				.from(chapters)
+				.where(eq(chapters.parentChapterId, parentChapterId));
+			const siblingIndex = existingSiblings.length; // 0-based: this will be the Nth child
+
+			const positionX = parentX + siblingIndex * HORIZONTAL_SPACING;
+			const positionY = parentY + parentHeight + VERTICAL_GAP;
+
+			// Create DB record
 			const [chapter] = await db
 				.insert(chapters)
 				.values({
 					id,
 					projectId: parent.projectId,
-					title: input.title,
+					title,
 					description: input.description,
 					status: "active",
 					role: input.role ?? "branch",
@@ -100,6 +164,8 @@ export const chapterFork = {
 					baseBranch: parent.branch,
 					parentChapterId,
 					forkPoint,
+					positionX,
+					positionY,
 					lastAccessedAt: now,
 					createdAt: now,
 					updatedAt: now,
@@ -149,7 +215,7 @@ export const chapterFork = {
 					primaryNarrator.id,
 					input.forkAtMessageUuid ?? null,
 					{
-						title: input.title,
+						title,
 						newChapterId: id,
 						inheritMode,
 						locale: input.locale,
@@ -335,5 +401,52 @@ export const chapterFork = {
 		return worktreePath
 			? await gitService.getHeadCommit(worktreePath)
 			: await gitService.getHeadCommit(gitPath);
+	},
+
+	/**
+	 * Find the snapshot tree hash representing the file state at a specific message.
+	 *
+	 * Walks the narrator_patches table (joined via narrator_message_refs) to find
+	 * the last patch whose associated message seq <= the fork message's seq.
+	 * Returns the patch's afterHash, or null if no patches exist before that point.
+	 */
+	async resolveSnapshotHashForMessage(
+		chapterId: string,
+		messageUuid: string,
+	): Promise<string | null> {
+		const primaryNarrator = await db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+		});
+		if (!primaryNarrator) return null;
+
+		const targetMsg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.messageUuid, messageUuid),
+		});
+		if (!targetMsg) return null;
+
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+				eq(narratorMessageRefs.messageId, targetMsg.id),
+			),
+		});
+		if (!targetRef) return null;
+
+		// Find the last patch whose message is at or before the fork point
+		const rows = await db
+			.select({ afterHash: narratorPatches.afterHash })
+			.from(narratorPatches)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+					eq(narratorMessageRefs.messageId, narratorPatches.messageId),
+				),
+			)
+			.where(sql`${narratorMessageRefs.seq} <= ${targetRef.seq}`)
+			.orderBy(desc(narratorPatches.createdAt), desc(narratorPatches.id))
+			.limit(1);
+
+		return rows.length > 0 ? rows[0].afterHash : null;
 	},
 };

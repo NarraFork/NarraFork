@@ -115,6 +115,31 @@ export function useAllModels() {
 			anthropicByProvider.push({ prefix, name, models });
 		}
 
+			providerId: string;
+			providerName: string;
+			models: Array<Record<string, unknown>>;
+
+
+
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const id = String(m.model_id ?? m.modelId ?? "");
+				if (!id) continue;
+				const rawRate = m.rate_multiplier ?? m.rateMultiplier;
+				const opt: ModelOption = {
+					value: `${prefix}:${id}`,
+					label: String(
+						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
+					),
+					provider: prefix,
+					rateMultiplier: typeof rawRate === "number" ? rawRate : undefined,
+				};
+				models.push(opt);
+			}
+		}
+
 		// --- Custom models ---
 		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? []).map(
 			(m: { value: string; label: string; provider?: string }) => ({

@@ -179,7 +179,7 @@ export const updateTerminalViewStateSchema = z
 // === Fork / Merge / Cleanup ===
 
 export const forkChapterSchema = z.object({
-	title: z.string().min(1).max(200),
+	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	forkAtMessageUuid: z.string().optional(),

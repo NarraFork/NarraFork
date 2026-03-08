@@ -13,6 +13,7 @@ import "@xyflow/react/dist/style.css";
 import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
+import { useNarratorsListWS } from "@frontend/hooks/useNarratorWS";
 import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import type { GraphNode } from "@frontend/hooks/useStoryGraph";
 import { assignEdgeHandles, useStoryGraph } from "@frontend/hooks/useStoryGraph";
@@ -129,14 +130,53 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		[savePanelState],
 	);
 
-	// Inject expand state and callback into node data
+	// Subscribe to narrator status changes via WebSocket
+	const narratorIdMap = useMemo(() => {
+		const map = new Map<string, string>(); // narratorId → chapterId
+		for (const node of graphNodes) {
+			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
+			const nId = (node as any).data?.narratorId as string | undefined;
+			if (nId) map.set(nId, node.id);
+		}
+		return map;
+	}, [graphNodes]);
+
+	const narratorIdsForWS = useMemo(() => [...narratorIdMap.keys()], [narratorIdMap]);
+
+	const [liveStatuses, setLiveStatuses] = useState<Map<string, string>>(new Map());
+
+	const handleNarratorWSUpdate = useCallback(
+		(narratorId: string, event: { type: string; status?: string }) => {
+			if (event.type === "status" && event.status) {
+				const chapterId = narratorIdMap.get(narratorId);
+				if (chapterId) {
+					setLiveStatuses((prev) => {
+						const next = new Map(prev);
+						next.set(chapterId, event.status as string);
+						return next;
+					});
+				}
+			}
+		},
+		[narratorIdMap],
+	);
+
+	useNarratorsListWS(narratorIdsForWS, handleNarratorWSUpdate);
+
+	// Inject expand state, live narrator status, and callback into node data
 	const nodesWithExpand = useMemo(() => {
 		return nodes.map((node) => {
 			const isExpanded = expandedNodes.has(node.id);
 			const size = panelSizesRef.current.get(node.id);
+			const liveStatus = liveStatuses.get(node.id);
 			return {
 				...node,
-				data: { ...node.data, expanded: isExpanded, onToggleExpand: handleToggleExpand },
+				data: {
+					...node.data,
+					expanded: isExpanded,
+					onToggleExpand: handleToggleExpand,
+					...(liveStatus ? { narratorStatus: liveStatus } : {}),
+				},
 				...(isExpanded
 					? {
 							dragHandle: ".chapter-node-drag-handle",
@@ -148,7 +188,7 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 					: {}),
 			};
 		});
-	}, [nodes, expandedNodes, handleToggleExpand]);
+	}, [nodes, expandedNodes, liveStatuses, handleToggleExpand]);
 
 	// Recompute edge handles whenever local node positions change
 	const computedEdges = useMemo(
@@ -260,13 +300,10 @@ export function StoryNetwork({ projectId }: StoryNetworkProps) {
 		setContextMenu(null);
 	}, []);
 
-	const handleFork = useCallback(
-		(nodeId: string) => {
-			setContextMenu(null);
-			setForkTarget(nodeId);
-		},
-		[],
-	);
+	const handleFork = useCallback((nodeId: string) => {
+		setContextMenu(null);
+		setForkTarget(nodeId);
+	}, []);
 
 	const handleSetRole = useCallback(
 		(nodeId: string, role: string) => {

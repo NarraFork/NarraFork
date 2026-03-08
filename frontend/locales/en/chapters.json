@@ -23,6 +23,7 @@
 	"inheritFull": "Full (complete history)",
 	"forkFailed": "Fork failed",
 	"forkSuccess": "Fork Created",
+	"forkCreatedClick": "\"{{title}}\" created. Click to open.",
 	"forkNavigatePrompt": "Chapter \"{{title}}\" has been created. Go to its conversation?",
 	"stayHere": "Stay here",
 	"goToFork": "Go to fork",

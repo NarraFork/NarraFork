@@ -21,5 +21,6 @@
 	"closeTab": "Close tab",
 	"moveToTop": "Move to top",
 	"totalOutputChars": "Total AI output chars",
-	"feedback": "Feedback"
+	"feedback": "Feedback",
+	"licenses": "Licenses"
 }

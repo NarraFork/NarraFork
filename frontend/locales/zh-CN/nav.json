@@ -21,5 +21,6 @@
 	"closeTab": "关闭标签",
 	"moveToTop": "移到最上方",
 	"totalOutputChars": "AI 输出总字符数",
-	"feedback": "反馈问题"
+	"feedback": "反馈问题",
+	"licenses": "开源协议"
 }

@@ -407,21 +407,30 @@ export function resolvePermissionDecision(
 	if (whitelistDecision) return whitelistDecision;
 
 	// Task: auto-allow when using parent's cwd; ask when workdir differs.
-	// bypassPermissions still bypasses this; dontAsk/readOnly denies it.
+	// bypassPermissions still bypasses this; dontAsk denies it.
+	// readOnly: explore/plan subagents within cwd subtree are allowed,
+	// outside cwd requires user approval, general subagents are always denied.
 	if (toolName === "Task") {
 		const workdir = input.workdir;
-		if (typeof workdir === "string" && workdir) {
-			const resolved = resolvePath(cwd, workdir);
-			const normalizedCwd = resolvePath(cwd);
-			if (!pathsEqual(resolved, normalizedCwd)) {
-				if (effectiveMode === "bypassPermissions") return "allow";
-				if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
-				return "ask";
-			}
-		}
-		// readOnly: allow explore/plan subagents (read-only), deny general (has write access)
+		const resolvedWorkdir =
+			typeof workdir === "string" && workdir ? resolvePath(cwd, workdir) : null;
+		const normalizedCwd = resolvePath(cwd);
+		const isOutsideCwd =
+			resolvedWorkdir !== null && !isInsidePath(normalizedCwd, resolvedWorkdir);
+		const isDifferentDir =
+			resolvedWorkdir !== null && !pathsEqual(resolvedWorkdir, normalizedCwd);
+
 		if (effectiveMode === "readOnly") {
-			return input.subagent_type === "general" ? "deny" : "allow";
+			// general subagents have write access — always deny in readOnly
+			if (input.subagent_type === "general") return "deny";
+			// explore/plan: workdir outside cwd needs user approval
+			if (isOutsideCwd) return "ask";
+			return "allow";
+		}
+		if (isDifferentDir) {
+			if (effectiveMode === "bypassPermissions") return "allow";
+			if (effectiveMode === "dontAsk") return "deny";
+			return "ask";
 		}
 		return "allow";
 	}

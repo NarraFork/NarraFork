@@ -1,11 +1,17 @@
 import { ActionIcon, Badge, Card, Group, Text, Tooltip } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { IconGitCommit, IconMessage, IconMinimize } from "@tabler/icons-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
-import { ChapterForkModal } from "../chapter/ChapterForkModal";
+import { api } from "../../lib/api";
+import {
+	CHAPTER_ROLE_ICONS,
+	CHAPTER_STATUS_COLORS,
+	NARRATOR_STATUS_COLORS,
+	statusRegistry,
+} from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 
 export interface ChapterNodeData {
@@ -14,6 +20,7 @@ export interface ChapterNodeData {
 	branch: string;
 	narratorCount: number;
 	narratorId?: string | null;
+	narratorStatus?: string | null;
 	hasContainers: boolean;
 	role?: string;
 	color?: string;
@@ -38,17 +45,44 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 	const d = data as ChapterNodeData;
 	const { t } = useTranslation("graph");
 	const { t: tc } = useTranslation("common");
+	const { t: tch } = useTranslation("chapters");
 	const queryClient = useQueryClient();
 
-	// Fork-from-message state (ChapterForkModal)
-	const [forkAtMessageUuid, setForkAtMessageUuid] = useState<string | null>(null);
-	const handleForkFromMessage = useCallback((messageUuid: string) => {
-		setForkAtMessageUuid(messageUuid);
-	}, []);
-	const closeForkModal = useCallback(() => setForkAtMessageUuid(null), []);
-	const handleForkSuccess = useCallback(() => {
-		queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
-	}, [queryClient]);
+	// Fork-from-message: directly fork without modal
+	const forkFromMessage = useMutation({
+		mutationFn: (messageUuid: string) =>
+			api.forkChapter(id, {
+				inheritMode: "full",
+				forkAtMessageUuid: messageUuid,
+			}),
+		onSuccess: (data) => {
+			queryClient.invalidateQueries({ queryKey: ["chapters"] });
+			queryClient.invalidateQueries({ queryKey: ["graph"] });
+			queryClient.invalidateQueries({ queryKey: ["narrators"] });
+			queryClient.invalidateQueries({ queryKey: ["storyGraph"] });
+			if (data?.id) {
+				notifications.show({
+					title: tch("forkSuccess"),
+					message: tch("forkCreatedClick", { title: data.title ?? "Fork" }),
+					color: "green",
+					autoClose: 6000,
+				});
+			}
+		},
+		onError: (err) => {
+			notifications.show({
+				title: tch("forkFailed"),
+				message: err instanceof Error ? err.message : "Unknown error",
+				color: "red",
+			});
+		},
+	});
+	const handleForkFromMessage = useCallback(
+		(messageUuid: string) => {
+			forkFromMessage.mutate(messageUuid);
+		},
+		[forkFromMessage],
+	);
 
 	const role = d.role ?? "branch";
 	const isRoot = !!d.isRoot;
@@ -210,9 +244,19 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 										{role}
 									</Badge>
 								)}
-								<Text size="xs" c="dimmed">
-									{t("narratorCount", { count: d.narratorCount })}
-								</Text>
+								{d.narratorStatus ? (
+									<Badge
+										size="xs"
+										variant="dot"
+										color={NARRATOR_STATUS_COLORS[d.narratorStatus] ?? "gray"}
+									>
+										{d.narratorStatus}
+									</Badge>
+								) : (
+									<Text size="xs" c="dimmed">
+										{t("narratorCount", { count: d.narratorCount })}
+									</Text>
+								)}
 								{d.hasContainers && (
 									<Badge size="xs" variant="dot" color="teal">
 										{t("containers")}
@@ -254,15 +298,6 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					</div>
 				)}
 			</Card>
-			{expanded && (
-				<ChapterForkModal
-					chapterId={id}
-					opened={forkAtMessageUuid !== null}
-					onClose={closeForkModal}
-					forkAtMessageUuid={forkAtMessageUuid ?? undefined}
-					onForkSuccess={handleForkSuccess}
-				/>
-			)}
 		</>
 	);
 }

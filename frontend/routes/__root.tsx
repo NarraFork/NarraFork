@@ -1,6 +1,7 @@
 import { useResizableNav } from "@frontend/hooks/useResizableNav";
 import {
 	ActionIcon,
+	Anchor,
 	AppShell,
 	Box,
 	Burger,
@@ -62,8 +63,12 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 function RootLayout() {
 	const location = useRouterState({ select: (s) => s.location });
 	const isLoginPage = location.pathname === "/login";
+	const isPublicPage = location.pathname === "/licenses";
 
 	if (isLoginPage) return <Outlet />;
+
+	// Public pages: show inside AppShell if logged in, bare otherwise
+	if (isPublicPage && !getToken()) return <Outlet />;
 
 	return <AuthenticatedLayout />;
 }
@@ -473,6 +478,9 @@ function AuthenticatedLayout() {
 				/>
 				<Text size="xs" c="dimmed" ta="center" mt={4}>
 					v{__APP_VERSION__}
+					<Anchor component={Link} to="/licenses" size="xs" c="dimmed" td="underline" ml={8} onClick={closeNavForLink}>
+						{t("licenses")}
+					</Anchor>
 				</Text>
 			</AppShell.Navbar>
 

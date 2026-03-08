@@ -38,7 +38,7 @@ interface AnthropicProvidersSectionProps {
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
-	isDirty?: boolean;
+	isProviderDirty?: (providerId: string) => boolean;
 }
 
 export function AnthropicProvidersSection({
@@ -49,7 +49,7 @@ export function AnthropicProvidersSection({
 	onToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
-	isDirty,
+	isProviderDirty,
 }: AnthropicProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -98,7 +98,7 @@ export function AnthropicProvidersSection({
 
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
-			if (isDirty) {
+			if (isProviderDirty?.(providerId)) {
 				notifications.show({
 					color: "yellow",
 					title: t("refreshModelsSaveFirst"),
@@ -121,7 +121,7 @@ export function AnthropicProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t, isDirty],
+		[qc, t, isProviderDirty],
 	);
 
 	return (

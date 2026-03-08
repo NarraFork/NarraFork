@@ -1,6 +1,6 @@
 import { settings } from "@server/lib/settings";
+import chardet from "chardet";
 import iconv from "iconv-lite";
-import jschardet from "jschardet";
 
 /**
  * Encoding-aware file reading.
@@ -10,8 +10,8 @@ import jschardet from "jschardet";
  *
  * Returns `{ text, encoding }` so callers can write back in the same encoding.
  */
-/** Minimum confidence from jschardet to trust the detected encoding. */
-const CONFIDENCE_THRESHOLD = 0.7;
+/** Minimum confidence from chardet to trust the detected encoding (0–100). */
+const CONFIDENCE_THRESHOLD = 70;
 
 export async function readFileText(path: string): Promise<{ text: string; encoding: string }> {
 	const file = Bun.file(path);
@@ -21,9 +21,10 @@ export async function readFileText(path: string): Promise<{ text: string; encodi
 	}
 
 	const buffer = Buffer.from(await file.arrayBuffer());
-	const detected = jschardet.detect(buffer);
+	const results = chardet.analyse(buffer);
+	const best = results[0];
 	const encoding =
-		detected.confidence >= CONFIDENCE_THRESHOLD ? normalizeEncoding(detected.encoding) : "utf-8";
+		best && best.confidence >= CONFIDENCE_THRESHOLD ? normalizeEncoding(best.name) : "utf-8";
 	const text = iconv.decode(buffer, encoding);
 	return { text, encoding };
 }
@@ -47,11 +48,11 @@ export async function writeFileText(
 	await Bun.write(path, encoded);
 }
 
-/** Normalize encoding names from jschardet to iconv-lite compatible names */
+/** Normalize encoding names from chardet to iconv-lite compatible names */
 function normalizeEncoding(enc: string | null): string {
 	if (!enc) return "utf-8";
 	const lower = enc.toLowerCase();
-	// jschardet may return these aliases
+	// chardet may return these aliases
 	const map: Record<string, string> = {
 		"utf-8": "utf-8",
 		ascii: "utf-8",

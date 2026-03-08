@@ -1,5 +1,6 @@
 import {
 	Alert,
+	Anchor,
 	Button,
 	Center,
 	Loader,
@@ -11,7 +12,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { createFileRoute, Navigate, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, Navigate, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAuthStatus, useLogin, useRegister } from "../hooks/useAuth";
@@ -175,6 +176,17 @@ function LoginPage() {
 						)}
 					</Stack>
 				</form>
+				<Anchor
+					component={Link}
+					to="/licenses"
+					size="xs"
+					c="dimmed"
+					ta="center"
+					mt="md"
+					display="block"
+				>
+					{t("licensesTitle")}
+				</Anchor>
 			</Paper>
 		</Center>
 	);

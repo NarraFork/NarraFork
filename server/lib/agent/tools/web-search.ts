@@ -1,5 +1,24 @@
 import { z } from "zod/v4";
+import { logger } from "../../logger";
 import type { ToolDefinition, ToolResult } from "../types";
+
+
+	const baseUrl = config.baseUrl.replace(/\/+$/, "");
+	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${config.apiKey}`,
+		},
+		body: JSON.stringify({ query }),
+	});
+
+	if (!response.ok) {
+		const errText = await response.text().catch(() => "");
+	}
+
+	return (await response.json()) as McpResponse;
+}
 
 export const webSearchTool: ToolDefinition = {
 	name: "WebSearch",
@@ -13,12 +32,22 @@ export const webSearchTool: ToolDefinition = {
 	async execute(args): Promise<ToolResult> {
 		const { query } = args as { query: string };
 
+
 			return {
+				output:
 				isError: true,
 			};
 		}
 
 		try {
+			let response: McpResponse | undefined;
+				try {
+						});
+					} else {
+					}
+				}
+			} else {
+			}
 
 			if (response.error) {
 				return {

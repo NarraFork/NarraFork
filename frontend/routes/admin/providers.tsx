@@ -40,6 +40,7 @@ function ProvidersPage() {
 	const [anthropicProviders, setAnthropicProviders] = useState<AnthropicProviderState[]>([]);
 	const [anthropicInitialized, setAnthropicInitialized] = useState(false);
 
+
 	// Hidden models state
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [hiddenInitialized, setHiddenInitialized] = useState(false);
@@ -101,6 +102,16 @@ function ProvidersPage() {
 			setAnthropicInitialized(true);
 		}
 	}, [settings, anthropicInitialized]);
+
+	useEffect(() => {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				id: p.id ?? "",
+				name: p.name ?? "",
+				apiKey: p.apiKey ?? "",
+				baseUrl: p.baseUrl ?? "",
+				defaultModel: p.defaultModel ?? "",
+			}));
+		}
 
 	// Sync hidden models from settings
 	useEffect(() => {
@@ -184,6 +195,32 @@ function ProvidersPage() {
 		modelContextWindows,
 	]);
 
+	const isOpenaiProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = openaiProviders.find((p) => p.id === providerId);
+			const saved = serverSnapshot.current.openaiProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[openaiProviders],
+	);
+
+	const isAnthropicProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = anthropicProviders.find((p) => p.id === providerId);
+			const saved = serverSnapshot.current.anthropicProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[anthropicProviders],
+	);
+
+		(providerId: string) => {
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+	);
+
 	const [highlight, setHighlight] = useState(false);
 	useEffect(() => {
 		if (isDirty) {
@@ -212,6 +249,18 @@ function ProvidersPage() {
 		}
 		for (const provider of anthropicProviders) {
 			const original = serverSnapshot.current.anthropicProviders.find((p) => p.id === provider.id);
+			if (original && original.prefix !== provider.prefix) {
+				const oldPrefix = original.prefix;
+				const newPrefix = provider.prefix;
+				for (const key of Object.keys(migratedWindows)) {
+					if (key.startsWith(`${oldPrefix}:`)) {
+						const model = key.slice(oldPrefix.length + 1);
+						migratedWindows[`${newPrefix}:${model}`] = migratedWindows[key];
+						delete migratedWindows[key];
+					}
+				}
+			}
+		}
 			if (original && original.prefix !== provider.prefix) {
 				const oldPrefix = original.prefix;
 				const newPrefix = provider.prefix;
@@ -314,6 +363,25 @@ function ProvidersPage() {
 		}));
 	}
 
+		providerId: string;
+		providerName: string;
+		models: Array<Record<string, unknown>>;
+
+
+	}
+
+		const models: ModelOption[] = [];
+		for (const m of group.models) {
+			const id = String(m.model_id ?? m.modelId ?? "");
+			if (!id) continue;
+			models.push({
+				value: `${prefix}:${id}`,
+				label: String(m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id),
+				provider: prefix,
+			});
+		}
+	}
+
 	// Provider prefix options for custom model add
 	const prefixOptions = [
 		{ value: "codex", label: "Codex" },
@@ -324,6 +392,7 @@ function ProvidersPage() {
 		...serverAnthropicProviders.map((p) => ({
 			value: p.prefix ?? "anthropic",
 			label: p.name ?? p.prefix ?? "anthropic",
+		})),
 		})),
 	];
 	const seenPrefixes = new Set<string>();
@@ -337,6 +406,12 @@ function ProvidersPage() {
 		<>
 			<Stack>
 				<Title order={2}>{t("providersTitle")}</Title>
+
+					hiddenModels={hiddenModels}
+					onToggleHidden={toggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
+				/>
 
 					settings={settings}
 					hiddenModels={hiddenModels}
@@ -353,7 +428,7 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
-					isDirty={isDirty}
+					isProviderDirty={isOpenaiProviderDirty}
 				/>
 
 				<AnthropicProvidersSection
@@ -364,7 +439,7 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
-					isDirty={isDirty}
+					isProviderDirty={isAnthropicProviderDirty}
 				/>
 
 				<CustomModelsSection

@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -10,6 +10,71 @@ const backendPort = Number(process.env.BACKEND_PORT) || 7779;
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
 const appVersion = pkg.version ?? "0.0.0";
+
+/** Collect direct dependency license info at build time. */
+function collectLicenses() {
+	const deps = pkg.dependencies ?? {};
+	const devDeps = pkg.devDependencies ?? {};
+	const all = { ...deps, ...devDeps };
+	const nodeModules = resolve(__dirname, "..", "node_modules");
+	const results: Array<{
+		name: string;
+		version: string;
+		license: string;
+		author: string;
+		repository: string;
+		isDev: boolean;
+		licenseText: string;
+	}> = [];
+
+	const licenseFileNames = [
+		"LICENSE",
+		"LICENSE.md",
+		"LICENSE.txt",
+		"license",
+		"LICENCE",
+		"LICENCE.md",
+		"License",
+		"LICENSE-MIT",
+	];
+
+	for (const name of Object.keys(all)) {
+		try {
+			const depPkgPath = join(nodeModules, name, "package.json");
+			if (!existsSync(depPkgPath)) continue;
+			const depPkg = JSON.parse(readFileSync(depPkgPath, "utf8"));
+			const repo = depPkg.repository?.url ?? depPkg.repository ?? depPkg.homepage ?? "";
+			const repoStr = (typeof repo === "string" ? repo : (repo.url ?? ""))
+				.replace(/^git\+/, "")
+				.replace(/\.git$/, "");
+
+			let licenseText = "";
+			const depDir = join(nodeModules, name);
+			for (const candidate of licenseFileNames) {
+				const lp = join(depDir, candidate);
+				if (existsSync(lp)) {
+					licenseText = readFileSync(lp, "utf8");
+					break;
+				}
+			}
+
+			results.push({
+				name,
+				version: depPkg.version ?? "",
+				license: depPkg.license ?? "UNKNOWN",
+				author: typeof depPkg.author === "string" ? depPkg.author : (depPkg.author?.name ?? ""),
+				repository: repoStr,
+				isDev: name in devDeps,
+				licenseText,
+			});
+		} catch {
+			// skip unreadable packages
+		}
+	}
+	return results;
+}
+
+const licenseData = collectLicenses();
 
 export default defineConfig(({ mode }) => {
 	const isDev = mode === "development";
@@ -23,11 +88,13 @@ export default defineConfig(({ mode }) => {
 					__DEV_VITE_PORT__: JSON.stringify(vitePort),
 					__DEV_BACKEND_PORT__: JSON.stringify(backendPort),
 					__APP_VERSION__: JSON.stringify(appVersion),
+					__LICENSE_DATA__: JSON.stringify(licenseData),
 				}
 			: {
 					__DEV_VITE_PORT__: "undefined",
 					__DEV_BACKEND_PORT__: "undefined",
 					__APP_VERSION__: JSON.stringify(appVersion),
+					__LICENSE_DATA__: JSON.stringify(licenseData),
 				},
 		plugins: [
 			TanStackRouterVite({
