@@ -7,6 +7,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
@@ -568,7 +569,14 @@ export const chapterMerge = {
 
 		// Step 6: Remove merge summary messages injected into the target narrator
 		try {
-			await mergeSummaryService.cleanupForSource(sourceChapterId);
+			const { deletedCount, narratorIds } =
+				await mergeSummaryService.cleanupForSource(sourceChapterId);
+			if (deletedCount > 0) {
+				// Notify all affected narrators to reload messages
+				for (const nid of narratorIds) {
+					broadcastToNarrator(nid, { type: "full_reload", narratorId: nid });
+				}
+			}
 		} catch (err) {
 			logger.warn("Failed to clean up merge summary messages during unmerge", {
 				sourceChapterId,

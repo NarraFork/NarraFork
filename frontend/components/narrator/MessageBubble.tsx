@@ -291,10 +291,17 @@ function CompactIndicator({
 
 function MergeSummaryCard({
 	block,
+	creator,
 	onDelete,
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	block: any;
+	creator?: {
+		id: string;
+		username: string;
+		avatarColor?: string | null;
+		avatarImageId?: string | null;
+	} | null;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -348,6 +355,16 @@ function MergeSummaryCard({
 				}}
 			>
 				<Group gap={6} wrap="nowrap">
+					{creator && (
+						<UserAvatar
+							username={creator.username}
+							avatarColor={creator.avatarColor}
+							avatarImageId={creator.avatarImageId}
+							userId={creator.id}
+							size={16}
+							showTooltip={false}
+						/>
+					)}
 					<IconGitMerge
 						size={16}
 						style={{ flexShrink: 0, color: "var(--mantine-color-indigo-6)" }}
@@ -374,6 +391,16 @@ function MergeSummaryCard({
 						<Text size="sm" c="dimmed">
 							{t("mergeSummaryBranch")}:
 						</Text>
+						{creator && (
+							<UserAvatar
+								username={creator.username}
+								avatarColor={creator.avatarColor}
+								avatarImageId={creator.avatarImageId}
+								userId={creator.id}
+								size={20}
+								showTooltip
+							/>
+						)}
 						<Text size="sm" fw={500}>
 							{header}
 						</Text>
@@ -776,7 +803,13 @@ export const MessageBubble = memo(function MessageBubble({
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const mergeSummaryBlock = blocks.find((b: any) => b.type === "merge_summary");
 	if (mergeSummaryBlock) {
-		return <MergeSummaryCard block={mergeSummaryBlock} onDelete={invalidateMessages} />;
+		return (
+			<MergeSummaryCard
+				block={mergeSummaryBlock}
+				creator={message.creator}
+				onDelete={invalidateMessages}
+			/>
+		);
 	}
 
 	// System messages (compact indicators / plan cards)

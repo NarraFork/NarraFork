@@ -136,19 +136,37 @@ export const mergeSummaryService = {
 				return;
 			}
 
-			// Resolve user info
+			// Resolve user info (include avatar fields for WebSocket broadcast)
 			let username: string | undefined;
+			let userAvatarColor: string | null = null;
+			let userAvatarImageId: string | null = null;
 			let locale: Locale = "en";
 			if (userId) {
 				const [user, userLocale] = await Promise.all([
 					db.query.users.findFirst({
 						where: eq(users.id, userId),
-						columns: { username: true },
+						columns: { username: true, avatarColor: true, avatarImageId: true },
 					}),
 					getUserLanguage(userId),
 				]);
 				username = user?.username;
+				userAvatarColor = user?.avatarColor ?? null;
+				userAvatarImageId = user?.avatarImageId ?? null;
 				locale = userLocale;
+			}
+
+			// Clean up any existing merge_summary for this source chapter
+			// (handles re-merge: wake → merge again should replace the old card)
+			const { deletedCount: oldDeleted } = await this.cleanupForSource(sourceChapterId);
+			if (oldDeleted > 0) {
+				logger.info("Cleaned up old merge summary before re-merge", {
+					sourceChapterId,
+					deletedCount: oldDeleted,
+				});
+				broadcastToNarrator(primaryNarrator.id, {
+					type: "full_reload",
+					narratorId: primaryNarrator.id,
+				});
 			}
 
 			// Use pre-collected data when available (collected before merge).
@@ -215,18 +233,23 @@ export const mergeSummaryService = {
 			// Insert via persistSystemMessage (role="user" + text block) so the
 			// SDK includes it in conversation history. Append a structured
 			// merge_summary block for the UI to render as a card.
-			const msg = await narratorService.persistSystemMessage(primaryNarrator.id, fullContent, [
-				{
-					type: "merge_summary",
-					sourceBranch: source.branch,
-					sourceChapterId,
-					targetBranch: target.branch,
-					strategy,
-					commitSha: commitSha ?? null,
-					mergedBy: username ?? null,
-					summary,
-				},
-			]);
+			const msg = await narratorService.persistSystemMessage(
+				primaryNarrator.id,
+				fullContent,
+				[
+					{
+						type: "merge_summary",
+						sourceBranch: source.branch,
+						sourceChapterId,
+						targetBranch: target.branch,
+						strategy,
+						commitSha: commitSha ?? null,
+						mergedBy: username ?? null,
+						summary,
+					},
+				],
+				userId,
+			);
 
 			logger.info("Merge summary injected", {
 				sourceChapterId,
@@ -237,10 +260,23 @@ export const mergeSummaryService = {
 
 			// Broadcast as a standard "message" event so the chat UI picks it up
 			// in real-time (same pattern as auto-commit messages).
+			// Attach creator info so the frontend can render the merger's avatar.
+			const broadcastMsg = {
+				...msg,
+				creator:
+					userId && username
+						? {
+								id: userId,
+								username,
+								avatarColor: userAvatarColor,
+								avatarImageId: userAvatarImageId,
+							}
+						: null,
+			};
 			broadcastToNarrator(primaryNarrator.id, {
 				type: "message",
 				narratorId: primaryNarrator.id,
-				message: msg,
+				message: broadcastMsg,
 			});
 		} catch (err) {
 			logger.error("Merge summary generation failed (non-fatal)", {
@@ -257,13 +293,18 @@ export const mergeSummaryService = {
 	 *
 	 * Uses a JSON content search to find messages containing the sourceChapterId
 	 * in a merge_summary block, then deletes the message and its refs.
+	 *
+	 * Returns the count of deleted messages and the affected narrator IDs
+	 * so callers can broadcast reload notifications.
 	 */
-	async cleanupForSource(sourceChapterId: string): Promise<number> {
+	async cleanupForSource(
+		sourceChapterId: string,
+	): Promise<{ deletedCount: number; narratorIds: string[] }> {
 		// Find messages whose contentJson contains a merge_summary block
 		// referencing this source chapter. SQLite JSON: content_json is stored
 		// as text, so we use LIKE for a simple substring match.
 		const rows = await db
-			.select({ id: narratorMessages.id })
+			.select({ id: narratorMessages.id, narratorId: narratorMessages.narratorId })
 			.from(narratorMessages)
 			.where(
 				and(
@@ -272,9 +313,10 @@ export const mergeSummaryService = {
 				),
 			);
 
-		if (rows.length === 0) return 0;
+		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
 
 		const ids = rows.map((r) => r.id);
+		const narratorIds = [...new Set(rows.map((r) => r.narratorId))];
 
 		// Delete refs first (FK), then messages
 		await db.transaction(async (tx) => {
@@ -289,6 +331,6 @@ export const mergeSummaryService = {
 			deletedCount: ids.length,
 		});
 
-		return ids.length;
+		return { deletedCount: ids.length, narratorIds };
 	},
 };
