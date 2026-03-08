@@ -172,19 +172,20 @@ export const mergeSummaryService = {
 
 			// Build the input for the summary model
 			const commitList = commitMessages.map((m, i) => `${i + 1}. ${m}`).join("\n");
+			const isZh = locale === "zh-CN";
 			const userText = [
-				`Branch: ${source.branch}`,
-				`Merged into: ${target.branch}`,
-				`Strategy: ${strategy}`,
-				commitSha ? `Merge commit: ${commitSha}` : null,
-				username ? `Merged by: ${username}` : null,
-				source.title ? `Chapter title: ${source.title}` : null,
-				source.description ? `Description: ${source.description}` : null,
+				`${isZh ? "分支" : "Branch"}: ${source.branch}`,
+				`${isZh ? "合并到" : "Merged into"}: ${target.branch}`,
+				`${isZh ? "策略" : "Strategy"}: ${strategy}`,
+				commitSha ? `${isZh ? "合并提交" : "Merge commit"}: ${commitSha}` : null,
+				username ? `${isZh ? "合并者" : "Merged by"}: ${username}` : null,
+				source.title ? `${isZh ? "章节标题" : "Chapter title"}: ${source.title}` : null,
+				source.description ? `${isZh ? "描述" : "Description"}: ${source.description}` : null,
 				``,
-				`Commits (${commitMessages.length}):`,
+				`${isZh ? "提交记录" : "Commits"} (${commitMessages.length}):`,
 				commitList,
 				``,
-				`Diff summary:`,
+				`${isZh ? "变更统计" : "Diff summary"}:`,
 				diffStat,
 			]
 				.filter((l) => l !== null)
