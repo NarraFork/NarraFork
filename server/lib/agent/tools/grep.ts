@@ -1,12 +1,17 @@
 import { existsSync, readdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod/v4";
+import { logger } from "../../logger";
 import { IS_WINDOWS } from "../../platform";
 import { toForwardSlash } from "../../platform-path";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const MAX_LINE_LENGTH = 2000;
 const MAX_MATCHES = 100;
+
+const RG_INSTALL_HINT = IS_WINDOWS
+	? "ripgrep (rg) is not installed. Install it with:\n\n  winget install BurntSushi.ripgrep.MSVC\n\nThen restart NarraFork."
+	: "ripgrep (rg) is not installed. Install it with your package manager, e.g.:\n\n  # macOS\n  brew install ripgrep\n\n  # Ubuntu/Debian\n  sudo apt install ripgrep\n\nThen restart NarraFork.";
 
 /**
  * Scan the WinGet packages directory for any ripgrep package folder.
@@ -32,8 +37,8 @@ function findRgInWinGet(): string | undefined {
 	return undefined;
 }
 
-/** Resolve the ripgrep binary path. Checks system paths, then falls back to PATH. */
-function findRg(): string {
+/** Resolve the ripgrep binary path. Returns null when rg cannot be found. */
+function findRg(): string | null {
 	if (IS_WINDOWS) {
 		// 1. Static well-known paths (scoop, chocolatey, cargo, Program Files)
 		const winPaths = [
@@ -51,8 +56,8 @@ function findRg(): string {
 		// 3. Ask the OS to find it on PATH
 		const which = Bun.which("rg");
 		if (which) return which;
-		// 4. Last resort — hope it's on PATH at spawn time
-		return "rg.exe";
+		// Not found
+		return null;
 	}
 	const systemPaths = [
 		"/usr/bin/rg",
@@ -63,10 +68,22 @@ function findRg(): string {
 	for (const p of systemPaths) {
 		if (existsSync(p)) return p;
 	}
-	return "rg";
+	// Last check via PATH
+	const which = Bun.which("rg");
+	if (which) return which;
+	return null;
 }
 
 const RG_PATH = findRg();
+
+// Log a warning at startup so the user sees it in the server console
+if (!RG_PATH) {
+	logger.warn(
+		IS_WINDOWS
+			? "ripgrep (rg) not found — Grep tool will be unavailable. Install: winget install BurntSushi.ripgrep.MSVC"
+			: "ripgrep (rg) not found — Grep tool will be unavailable. Install via your package manager (e.g. brew install ripgrep, apt install ripgrep).",
+	);
+}
 
 const shellLabel = IS_WINDOWS ? "Shell" : "Bash";
 
@@ -94,6 +111,10 @@ export const grepTool: ToolDefinition = {
 			.describe('File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")'),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		if (!RG_PATH) {
+			return { output: RG_INSTALL_HINT, isError: true };
+		}
+
 		const {
 			pattern,
 			path: searchPathArg,
