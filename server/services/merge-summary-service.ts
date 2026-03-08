@@ -10,7 +10,7 @@ import {
 } from "../db/schema";
 import { agentGenerateWithMeta } from "../lib/agent";
 import { logger } from "../lib/logger";
-import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
+import { getMergeSummaryLabel, getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
@@ -172,23 +172,24 @@ export const mergeSummaryService = {
 
 			// Build the input for the summary model
 			const commitList = commitMessages.map((m, i) => `${i + 1}. ${m}`).join("\n");
-			const isZh = locale === "zh-CN";
+			const l = (key: Parameters<typeof getMergeSummaryLabel>[0]) =>
+				getMergeSummaryLabel(key, locale);
 			const userText = [
-				`${isZh ? "分支" : "Branch"}: ${source.branch}`,
-				`${isZh ? "合并到" : "Merged into"}: ${target.branch}`,
-				`${isZh ? "策略" : "Strategy"}: ${strategy}`,
-				commitSha ? `${isZh ? "合并提交" : "Merge commit"}: ${commitSha}` : null,
-				username ? `${isZh ? "合并者" : "Merged by"}: ${username}` : null,
-				source.title ? `${isZh ? "章节标题" : "Chapter title"}: ${source.title}` : null,
-				source.description ? `${isZh ? "描述" : "Description"}: ${source.description}` : null,
+				`${l("branch")}: ${source.branch}`,
+				`${l("mergedInto")}: ${target.branch}`,
+				`${l("strategy")}: ${strategy}`,
+				commitSha ? `${l("mergeCommit")}: ${commitSha}` : null,
+				username ? `${l("mergedBy")}: ${username}` : null,
+				source.title ? `${l("chapterTitle")}: ${source.title}` : null,
+				source.description ? `${l("description")}: ${source.description}` : null,
 				``,
-				`${isZh ? "提交记录" : "Commits"} (${commitMessages.length}):`,
+				`${l("commits")} (${commitMessages.length}):`,
 				commitList,
 				``,
-				`${isZh ? "变更统计" : "Diff summary"}:`,
+				`${l("diffSummary")}:`,
 				diffStat,
 			]
-				.filter((l) => l !== null)
+				.filter((line) => line !== null)
 				.join("\n");
 
 			const systemPrompt = getPrompt("mergeSummary", locale);
@@ -208,9 +209,7 @@ export const mergeSummaryService = {
 
 			// Build the system message content
 			const mergedByText = username ? ` by ${username}` : "";
-			const headerEn = `[Branch Merged] "${source.branch}" → "${target.branch}"${mergedByText} (${strategy})`;
-			const headerZh = `[分支已合并] "${source.branch}" → "${target.branch}"${mergedByText} (${strategy})`;
-			const header = locale === "zh-CN" ? headerZh : headerEn;
+			const header = `[${l("headerMerged")}] "${source.branch}" → "${target.branch}"${mergedByText} (${strategy})`;
 			const fullContent = `${header}\n\n${summary}`;
 
 			// Insert via persistSystemMessage (role="user" + text block) so the
