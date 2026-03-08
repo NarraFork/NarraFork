@@ -76,6 +76,9 @@ function findRg(): string | null {
 
 const RG_PATH = findRg();
 
+/** Whether ripgrep is available on this system. */
+export const isRgAvailable = RG_PATH !== null;
+
 // Log a warning at startup so the user sees it in the server console
 if (!RG_PATH) {
 	logger.warn(
