@@ -558,3 +558,26 @@ export const mergeSessions = sqliteTable("merge_sessions", {
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
+
+// === narrator_whitelist_dirs ===
+export const narratorWhitelistDirs = sqliteTable(
+	"narrator_whitelist_dirs",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		accessLevel: text("access_level", {
+			enum: ["readOnly", "readWrite", "full"],
+		})
+			.notNull()
+			.default("readOnly"),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_whitelist_dirs_narrator").on(table.narratorId),
+		uniqueIndex("idx_whitelist_dirs_narrator_path").on(table.narratorId, table.path),
+	],
+);

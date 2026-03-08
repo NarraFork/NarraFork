@@ -11,7 +11,7 @@ import {
 	narratorPatches,
 	narrators,
 	narratorToolCalls,
-	portAllocations,
+	narratorWhitelistDirs,
 	projects,
 	terminals,
 	terminalTabs,
@@ -99,6 +99,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	patches: many(narratorPatches),
 	terminals: many(terminals),
 	commits: many(chapterCommits),
+	whitelistDirs: many(narratorWhitelistDirs),
 }));
 
 export const narratorMessagesRelations = relations(narratorMessages, ({ one, many }) => ({
@@ -219,5 +220,12 @@ export const chapterCommitsRelations = relations(chapterCommits, ({ one }) => ({
 	narratorMessage: one(narratorMessages, {
 		fields: [chapterCommits.narratorMessageId],
 		references: [narratorMessages.id],
+	}),
+}));
+
+export const narratorWhitelistDirsRelations = relations(narratorWhitelistDirs, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorWhitelistDirs.narratorId],
+		references: [narrators.id],
 	}),
 }));
