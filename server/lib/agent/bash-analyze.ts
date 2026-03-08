@@ -1030,8 +1030,8 @@ async function initParser(): Promise<TreeSitterParser> {
 	const TreeSitter = await import("web-tree-sitter");
 	const Parser = (TreeSitter.Parser ?? TreeSitter.default) as TreeSitterParserCtor;
 	type TreeSitterModuleLike = {
-		Language?: { load(path: string): Promise<unknown> };
-		default?: { Language?: { load(path: string): Promise<unknown> } };
+		Language?: { load(path: string | Uint8Array): Promise<unknown> };
+		default?: { Language?: { load(path: string | Uint8Array): Promise<unknown> } };
 	};
 	type TreeSitterParserCtor = {
 		init(options: { locateFile(): string }): Promise<void>;
@@ -1054,9 +1054,12 @@ async function initParser(): Promise<TreeSitterParser> {
 		},
 	});
 
+	// Load bash language WASM — use Bun.file() to read as bytes for maximum
+	// compatibility with compiled single-executable mode ($bunfs paths).
 	const bashWasmPath =
 		embeddedBashWasm ?? require.resolve("tree-sitter-bash/tree-sitter-bash.wasm");
-	const bashLanguage = await Language.load(bashWasmPath);
+	const bashBytes = await Bun.file(bashWasmPath).arrayBuffer();
+	const bashLanguage = await Language.load(new Uint8Array(bashBytes));
 
 	const parser = new Parser();
 	parser.setLanguage(bashLanguage);

@@ -583,6 +583,19 @@ export async function handlePermission(
 		planFileId,
 		whitelistDirs: wlRows as WhitelistDir[],
 	});
+	logger.debug("Permission decision", {
+		narratorId,
+		toolName,
+		decision,
+		permMode,
+		cwd,
+		whitelistDirCount: wlRows.length,
+		whitelistDirs: wlRows.map((d) => ({ path: d.path, accessLevel: d.accessLevel })),
+		bashAnalysisAvailable: !!bashAnalysis,
+		bashFilePaths: bashAnalysis?.filePaths,
+		bashNonWhitelisted: bashAnalysis?.nonWhitelisted,
+		bashHasWrite: bashAnalysis?.hasWriteOperation,
+	});
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
 		const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
