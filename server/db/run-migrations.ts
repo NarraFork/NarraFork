@@ -77,13 +77,11 @@ async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolder> {
  * migration hash — the schema is identical but Drizzle sees it as a new migration.
  */
 function isAlreadyExistsError(err: unknown): boolean {
-	const msg = String(err);
-	if (msg.includes("already exists")) return true;
+	const alreadyExistsPatterns = ["already exists", "duplicate column name"];
+	const check = (msg: string) => alreadyExistsPatterns.some((p) => msg.includes(p));
+	if (check(String(err))) return true;
 	// DrizzleError wraps the original SQLiteError in `cause`
-	if (err instanceof Error && err.cause) {
-		const causeMsg = String(err.cause);
-		if (causeMsg.includes("already exists")) return true;
-	}
+	if (err instanceof Error && err.cause && check(String(err.cause))) return true;
 	return false;
 }
 
