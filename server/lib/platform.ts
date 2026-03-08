@@ -40,3 +40,27 @@ export function supportsDtach(): boolean {
 export function supportsContainers(): boolean {
 	return IS_LINUX;
 }
+
+// ── WSL flag ─────────────────────────────────────────────────────────────────
+
+/**
+ * Whether WSL (Windows Subsystem for Linux) is allowed.
+ *
+ * Controlled by the `--wsl=true|false` CLI flag. Defaults to `false`.
+ * When false, the shell detector will reject WSL bash and the system prompt
+ * will instruct the AI not to suggest WSL migration.
+ */
+let _allowWsl = false;
+
+/** Initialise the WSL flag from CLI args. Call once at startup. */
+export function initWslFlag(): void {
+	const arg = process.argv.find((a) => a.startsWith("--wsl="));
+	if (arg) {
+		_allowWsl = arg.split("=")[1]?.toLowerCase() === "true";
+	}
+}
+
+/** Whether WSL usage is permitted (default: false). */
+export function isWslAllowed(): boolean {
+	return _allowWsl;
+}

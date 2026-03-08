@@ -10,8 +10,13 @@ import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import {
 import { logger } from "./lib/logger";
+import { initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
 import { settings } from "./lib/settings";
+
+// Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
+initWslFlag();
+
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import { startContainerProxy, stopContainerProxy } from "./services/container-proxy";

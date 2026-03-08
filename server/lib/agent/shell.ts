@@ -1,5 +1,6 @@
 import { type ChildProcess, execSync } from "node:child_process";
 import path from "node:path";
+import { isWslAllowed } from "../platform";
 
 const SIGKILL_DELAY_MS = 200;
 
@@ -206,9 +207,9 @@ function findGitBash(): string | undefined {
 	const fromGit = findGitBashViaGitExecPath(existsSync);
 	if (fromGit) return fromGit;
 
-	// 5. Fallback: Bun.which("bash") but reject WSL bash
+	// 5. Fallback: Bun.which("bash") but reject WSL bash unless --wsl=true
 	const whichBash = Bun.which("bash");
-	if (whichBash && !isWslBash(whichBash)) return whichBash;
+	if (whichBash && (isWslAllowed() || !isWslBash(whichBash))) return whichBash;
 
 	return undefined;
 }
@@ -247,8 +248,8 @@ function findGitBashFromEnvVars(existsSync: (p: string) => boolean): string | un
 			if (checked.has(gitRoot.toLowerCase())) continue;
 			checked.add(gitRoot.toLowerCase());
 
-			// Skip WSL paths
-			if (isWslBash(gitRoot)) continue;
+			// Skip WSL paths unless --wsl=true
+			if (!isWslAllowed() && isWslBash(gitRoot)) continue;
 
 			for (const sub of ["bin\\bash.exe", "usr\\bin\\bash.exe"]) {
 				const p = path.join(gitRoot, sub);
