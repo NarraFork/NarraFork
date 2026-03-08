@@ -590,3 +590,24 @@ export function getAutoCommitMessage(
 	}
 	return msg;
 }
+
+// --- Merge summary labels (used in merge-summary-service) ---
+
+const mergeSummaryLabels = {
+	branch: { en: "Branch", "zh-CN": "分支" },
+	mergedInto: { en: "Merged into", "zh-CN": "合并到" },
+	strategy: { en: "Strategy", "zh-CN": "策略" },
+	mergeCommit: { en: "Merge commit", "zh-CN": "合并提交" },
+	mergedBy: { en: "Merged by", "zh-CN": "合并者" },
+	chapterTitle: { en: "Chapter title", "zh-CN": "章节标题" },
+	description: { en: "Description", "zh-CN": "描述" },
+	commits: { en: "Commits", "zh-CN": "提交记录" },
+	diffSummary: { en: "Diff summary", "zh-CN": "变更统计" },
+	headerMerged: { en: "Branch Merged", "zh-CN": "分支已合并" },
+} satisfies Record<string, Record<Locale, string>>;
+
+export type MergeSummaryLabelKey = keyof typeof mergeSummaryLabels;
+
+export function getMergeSummaryLabel(key: MergeSummaryLabelKey, locale: Locale = "en"): string {
+	return mergeSummaryLabels[key][locale] ?? mergeSummaryLabels[key].en;
+}
