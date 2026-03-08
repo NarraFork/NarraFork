@@ -117,6 +117,17 @@ export const permissionDecisionSchema = z.object({
 	message: z.string().optional(),
 });
 
+export const createWhitelistDirSchema = z.object({
+	path: z.string().min(1).max(4096),
+	accessLevel: z.enum(["readOnly", "readWrite", "full"]).default("readOnly"),
+	enabled: z.boolean().default(true),
+});
+
+export const updateWhitelistDirSchema = z.object({
+	accessLevel: z.enum(["readOnly", "readWrite", "full"]).optional(),
+	enabled: z.boolean().optional(),
+});
+
 // === Terminals ===
 
 export const createTerminalSchema = z

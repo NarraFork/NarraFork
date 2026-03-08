@@ -148,129 +148,253 @@ describe("resolvePermissionDecision", () => {
 	// --- Always-allow tools ---
 
 	test("TodoWrite is always allowed regardless of mode", () => {
-		expect(resolvePermissionDecision("TodoWrite", {}, "default", CWD)).toBe("allow");
-		expect(resolvePermissionDecision("TodoWrite", {}, "dontAsk", CWD)).toBe("allow");
-		expect(resolvePermissionDecision("TodoWrite", {}, "acceptEdits", CWD)).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "TodoWrite",
+				input: {},
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "TodoWrite",
+				input: {},
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "TodoWrite",
+				input: {},
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("EnterPlanMode is always allowed", () => {
-		expect(resolvePermissionDecision("EnterPlanMode", {}, "default", CWD)).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "EnterPlanMode",
+				input: {},
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("ExitPlanMode always requires user approval", () => {
-		expect(resolvePermissionDecision("ExitPlanMode", {}, "dontAsk", CWD)).toBe("ask");
-		expect(resolvePermissionDecision("ExitPlanMode", {}, "default", CWD)).toBe("ask");
-		expect(resolvePermissionDecision("ExitPlanMode", {}, "bypassPermissions", CWD)).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "ExitPlanMode",
+				input: {},
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "ExitPlanMode",
+				input: {},
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "ExitPlanMode",
+				input: {},
+				permMode: "bypassPermissions",
+				cwd: CWD,
+			}),
+		).toBe("ask");
 	});
 
 	// --- bypassPermissions mode ---
 
 	test("bypassPermissions allows everything", () => {
 		expect(
-			resolvePermissionDecision("Bash", { command: "rm -rf /" }, "bypassPermissions", CWD),
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "rm -rf /" },
+				permMode: "bypassPermissions",
+				cwd: CWD,
+			}),
 		).toBe("allow");
 		expect(
-			resolvePermissionDecision("Read", { file_path: "/etc/shadow" }, "bypassPermissions", CWD),
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "/etc/shadow" },
+				permMode: "bypassPermissions",
+				cwd: CWD,
+			}),
 		).toBe("allow");
 	});
 
 	// --- dontAsk mode ---
 
 	test("dontAsk denies everything (except always-allow)", () => {
-		expect(resolvePermissionDecision("Read", { file_path: "src/a.ts" }, "dontAsk", CWD)).toBe(
-			"deny",
-		);
-		expect(resolvePermissionDecision("Bash", { command: "ls" }, "dontAsk", CWD)).toBe("deny");
-		expect(resolvePermissionDecision("Edit", { file_path: "f.ts" }, "dontAsk", CWD)).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "src/a.ts" },
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "ls" },
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "f.ts" },
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("deny");
 	});
 
 	// --- default mode: internal paths ---
 
 	test("default mode: Read inside worktree → allow", () => {
-		expect(resolvePermissionDecision("Read", { file_path: "src/index.ts" }, "default", CWD)).toBe(
-			"allow",
-		);
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "src/index.ts" },
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("default mode: Write inside worktree → ask", () => {
 		expect(
-			resolvePermissionDecision("Write", { file_path: "out.txt", content: "x" }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: "out.txt", content: "x" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: Edit inside worktree → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Edit",
-				{ file_path: "src/a.ts", old_string: "a", new_string: "b" },
-				"default",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "src/a.ts", old_string: "a", new_string: "b" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: Glob without path → allow (uses cwd)", () => {
-		expect(resolvePermissionDecision("Glob", { pattern: "*.ts" }, "default", CWD)).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Glob",
+				input: { pattern: "*.ts" },
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("default mode: Grep without path → allow (uses cwd)", () => {
-		expect(resolvePermissionDecision("Grep", { pattern: "foo" }, "default", CWD)).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Grep",
+				input: { pattern: "foo" },
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("default mode: Bash always asks", () => {
-		expect(resolvePermissionDecision("Bash", { command: "echo hi" }, "default", CWD)).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "echo hi" },
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("ask");
 	});
 
 	// --- default mode: external paths ---
 
 	test("default mode: Read outside worktree → ask", () => {
-		expect(resolvePermissionDecision("Read", { file_path: "/etc/passwd" }, "default", CWD)).toBe(
-			"ask",
-		);
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "/etc/passwd" },
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("ask");
 	});
 
 	test("default mode: Write outside worktree → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Write",
-				{ file_path: "/tmp/evil.sh", content: "bad" },
-				"default",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: "/tmp/evil.sh", content: "bad" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: Edit outside worktree → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Edit",
-				{ file_path: "/etc/hosts", old_string: "a", new_string: "b" },
-				"default",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "/etc/hosts", old_string: "a", new_string: "b" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: path traversal escape → ask", () => {
 		expect(
-			resolvePermissionDecision("Read", { file_path: "../../etc/passwd" }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "../../etc/passwd" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: Glob with external path → ask", () => {
 		expect(
-			resolvePermissionDecision("Glob", { pattern: "*.ts", path: "/other" }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "Glob",
+				input: { pattern: "*.ts", path: "/other" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: Grep with external path → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Grep",
-				{ pattern: "secret", path: "/home/user/other" },
-				"default",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Grep",
+				input: { pattern: "secret", path: "/home/user/other" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
@@ -278,34 +402,56 @@ describe("resolvePermissionDecision", () => {
 
 	test("acceptEdits mode: Edit inside worktree → allow", () => {
 		expect(
-			resolvePermissionDecision(
-				"Edit",
-				{ file_path: "src/a.ts", old_string: "a", new_string: "b" },
-				"acceptEdits",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "src/a.ts", old_string: "a", new_string: "b" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
 		).toBe("allow");
 	});
 
 	test("acceptEdits mode: Read inside worktree → allow", () => {
-		expect(resolvePermissionDecision("Read", { file_path: "lib/b.ts" }, "acceptEdits", CWD)).toBe(
-			"allow",
-		);
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "lib/b.ts" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("acceptEdits mode: Glob without path → allow", () => {
-		expect(resolvePermissionDecision("Glob", { pattern: "**/*.ts" }, "acceptEdits", CWD)).toBe(
-			"allow",
-		);
+		expect(
+			resolvePermissionDecision({
+				toolName: "Glob",
+				input: { pattern: "**/*.ts" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("acceptEdits mode: Bash always asks", () => {
-		expect(resolvePermissionDecision("Bash", { command: "ls" }, "acceptEdits", CWD)).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "ls" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
+		).toBe("ask");
 	});
 
 	test("acceptEdits mode: non-listed tool asks", () => {
 		expect(
-			resolvePermissionDecision("WebFetch", { url: "https://example.com" }, "acceptEdits", CWD),
+			resolvePermissionDecision({
+				toolName: "WebFetch",
+				input: { url: "https://example.com" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
@@ -313,24 +459,34 @@ describe("resolvePermissionDecision", () => {
 
 	test("acceptEdits mode: Edit outside worktree → ask", () => {
 		expect(
-			resolvePermissionDecision(
-				"Edit",
-				{ file_path: "/etc/hosts", old_string: "a", new_string: "b" },
-				"acceptEdits",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "/etc/hosts", old_string: "a", new_string: "b" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("acceptEdits mode: Read outside worktree → ask", () => {
 		expect(
-			resolvePermissionDecision("Read", { file_path: "/etc/passwd" }, "acceptEdits", CWD),
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "/etc/passwd" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("acceptEdits mode: Grep with external path → ask", () => {
 		expect(
-			resolvePermissionDecision("Grep", { pattern: "x", path: "/var/log" }, "acceptEdits", CWD),
+			resolvePermissionDecision({
+				toolName: "Grep",
+				input: { pattern: "x", path: "/var/log" },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
@@ -339,24 +495,34 @@ describe("resolvePermissionDecision", () => {
 	test("default mode: tool with no path params (WebFetch) → ask", () => {
 		// No path to check → not external → but default mode asks for non-readonly tools
 		expect(
-			resolvePermissionDecision("WebFetch", { url: "https://example.com" }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "WebFetch",
+				input: { url: "https://example.com" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("unknown permission mode falls through to ask", () => {
 		expect(
-			resolvePermissionDecision("Read", { file_path: "a.ts" }, "unknownMode" as string, CWD),
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "a.ts" },
+				permMode: "unknownMode" as string,
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("prefix-matching trap: project-v2 path is external", () => {
 		expect(
-			resolvePermissionDecision(
-				"Read",
-				{ file_path: "/home/user/project-v2/secret.ts" },
-				"default",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: "/home/user/project-v2/secret.ts" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
@@ -364,58 +530,95 @@ describe("resolvePermissionDecision", () => {
 
 	test("default mode: Read in truncate output dir → allow", () => {
 		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
-		expect(resolvePermissionDecision("Read", { file_path: filePath }, "default", CWD)).toBe(
-			"allow",
-		);
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: filePath },
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("default mode: Grep in truncate output dir → allow", () => {
 		expect(
-			resolvePermissionDecision("Grep", { pattern: "error", path: TRUNCATE_DIR }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "Grep",
+				input: { pattern: "error", path: TRUNCATE_DIR },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("allow");
 	});
 
 	test("default mode: Glob in truncate output dir → allow", () => {
 		expect(
-			resolvePermissionDecision("Glob", { pattern: "tool_*", path: TRUNCATE_DIR }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "Glob",
+				input: { pattern: "tool_*", path: TRUNCATE_DIR },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("allow");
 	});
 
 	test("acceptEdits mode: Read in truncate output dir → allow", () => {
 		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
-		expect(resolvePermissionDecision("Read", { file_path: filePath }, "acceptEdits", CWD)).toBe(
-			"allow",
-		);
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: filePath },
+				permMode: "acceptEdits",
+				cwd: CWD,
+			}),
+		).toBe("allow");
 	});
 
 	test("default mode: Write to truncate output dir → ask (not read-only)", () => {
 		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
 		expect(
-			resolvePermissionDecision("Write", { file_path: filePath, content: "x" }, "default", CWD),
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: filePath, content: "x" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("default mode: Edit in truncate output dir → ask (not read-only)", () => {
 		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
 		expect(
-			resolvePermissionDecision(
-				"Edit",
-				{ file_path: filePath, old_string: "a", new_string: "b" },
-				"default",
-				CWD,
-			),
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: filePath, old_string: "a", new_string: "b" },
+				permMode: "default",
+				cwd: CWD,
+			}),
 		).toBe("ask");
 	});
 
 	test("dontAsk mode: Read in truncate output dir → deny (dontAsk overrides)", () => {
 		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
-		expect(resolvePermissionDecision("Read", { file_path: filePath }, "dontAsk", CWD)).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: filePath },
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("deny");
 	});
 
 	test("bypassPermissions mode: Read in truncate output dir → allow", () => {
 		const filePath = join(TRUNCATE_DIR, "tool_1234_abcd1234");
 		expect(
-			resolvePermissionDecision("Read", { file_path: filePath }, "bypassPermissions", CWD),
+			resolvePermissionDecision({
+				toolName: "Read",
+				input: { file_path: filePath },
+				permMode: "bypassPermissions",
+				cwd: CWD,
+			}),
 		).toBe("allow");
 	});
 });

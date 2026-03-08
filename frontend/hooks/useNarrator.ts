@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type PaginatedNarrators } from "../lib/api";
+import { api, type PaginatedNarrators, type WhitelistDir } from "../lib/api";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
 export function useNarrators(opts?: {
@@ -164,6 +164,55 @@ export function useUpdatePermissionMode() {
 			api.updateNarratorPermissionMode(id, permissionMode),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+// ── Whitelist directories ──
+
+export function useWhitelistDirs(narratorId: string) {
+	return useQuery<WhitelistDir[]>({
+		queryKey: ["whitelist-dirs", narratorId],
+		queryFn: () => api.getWhitelistDirs(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateWhitelistDir() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			path,
+			accessLevel,
+		}: {
+			narratorId: string;
+			path: string;
+			accessLevel?: string;
+		}) => api.createWhitelistDir(narratorId, { path, accessLevel }),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["whitelist-dirs", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateWhitelistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ dirId, ...data }: { dirId: string; accessLevel?: string; enabled?: boolean }) =>
+			api.updateWhitelistDir(dirId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["whitelist-dirs", narratorId] });
+		},
+	});
+}
+
+export function useDeleteWhitelistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (dirId: string) => api.deleteWhitelistDir(dirId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["whitelist-dirs", narratorId] });
 		},
 	});
 }

@@ -12,6 +12,7 @@ import {
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistDirs,
+	portAllocations,
 	projects,
 	terminals,
 	terminalTabs,

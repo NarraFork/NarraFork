@@ -13,7 +13,9 @@ import {
 	Menu,
 	Modal,
 	NativeSelect,
+	Popover,
 	ScrollArea,
+	SegmentedControl,
 	Stack,
 	Switch,
 	Text,
@@ -34,10 +36,12 @@ import {
 	IconCode,
 	IconCodeOff,
 	IconEraser,
+	IconFolderPlus,
 	IconPaperclip,
 	IconShield,
 	IconSparkles,
 	IconTerminal,
+	IconTrash,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -48,6 +52,8 @@ import { useNarratorCommands } from "../../hooks/useCommands";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
+	useCreateWhitelistDir,
+	useDeleteWhitelistDir,
 	useForkNarrator,
 	useInterruptNarrator,
 	useNarrator,
@@ -57,6 +63,8 @@ import {
 	useUpdatePermissionMode,
 	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
+	useUpdateWhitelistDir,
+	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -185,6 +193,130 @@ function PermModeMenuItems({
 				);
 			})}
 		</>
+	);
+}
+
+const ACCESS_LEVELS = ["readOnly", "readWrite", "full"] as const;
+
+function WhitelistDirsPopover({
+	narratorId,
+	t,
+}: {
+	narratorId: string;
+	t: (key: string) => string;
+}) {
+	const { data: dirs = [] } = useWhitelistDirs(narratorId);
+	const createMut = useCreateWhitelistDir();
+	const updateMut = useUpdateWhitelistDir(narratorId);
+	const deleteMut = useDeleteWhitelistDir(narratorId);
+	const [newPath, setNewPath] = useState("");
+	const [opened, { toggle, close }] = useDisclosure(false);
+
+	return (
+		<Popover
+			opened={opened}
+			onClose={close}
+			position="top-end"
+			width={380}
+			shadow="md"
+			withinPortal
+		>
+			<Popover.Target>
+				<Tooltip label={t("whitelist_dirs")}>
+					<ActionIcon variant="subtle" color="gray" size="sm" onClick={toggle}>
+						<IconFolderPlus size={16} />
+					</ActionIcon>
+				</Tooltip>
+			</Popover.Target>
+			<Popover.Dropdown>
+				<Stack gap={8}>
+					<Text size="sm" fw={600}>
+						{t("whitelist_dirs_title")}
+					</Text>
+					{dirs.length === 0 && (
+						<Text size="xs" c="dimmed">
+							{t("whitelist_dirs_empty")}
+						</Text>
+					)}
+					{dirs.map((dir) => (
+						<Group key={dir.id} gap={6} wrap="nowrap" align="center">
+							<Switch
+								size="xs"
+								checked={dir.enabled}
+								onChange={(e) =>
+									updateMut.mutate({
+										dirId: dir.id,
+										enabled: e.currentTarget.checked,
+									})
+								}
+							/>
+							<Text
+								size="xs"
+								style={{
+									flex: 1,
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									opacity: dir.enabled ? 1 : 0.5,
+								}}
+								title={dir.path}
+							>
+								{dir.path}
+							</Text>
+							<SegmentedControl
+								size="xs"
+								value={dir.accessLevel}
+								onChange={(v) =>
+									updateMut.mutate({
+										dirId: dir.id,
+										accessLevel: v as (typeof ACCESS_LEVELS)[number],
+									})
+								}
+								data={ACCESS_LEVELS.map((l) => ({
+									value: l,
+									label: t(`whitelist_access_${l}`),
+								}))}
+								style={{ flexShrink: 0 }}
+							/>
+							<ActionIcon
+								variant="subtle"
+								color="red"
+								size="xs"
+								onClick={() => deleteMut.mutate(dir.id)}
+							>
+								<IconTrash size={14} />
+							</ActionIcon>
+						</Group>
+					))}
+					<Group gap={4} wrap="nowrap">
+						<TextInput
+							size="xs"
+							placeholder={t("whitelist_dirs_placeholder")}
+							value={newPath}
+							onChange={(e) => setNewPath(e.currentTarget.value)}
+							onKeyDown={(e) => {
+								if (e.key === "Enter" && newPath.trim()) {
+									createMut.mutate({ narratorId, path: newPath.trim() });
+									setNewPath("");
+								}
+							}}
+							style={{ flex: 1 }}
+						/>
+						<Button
+							size="xs"
+							variant="light"
+							disabled={!newPath.trim()}
+							onClick={() => {
+								createMut.mutate({ narratorId, path: newPath.trim() });
+								setNewPath("");
+							}}
+						>
+							{t("whitelist_dirs_add")}
+						</Button>
+					</Group>
+				</Stack>
+			</Popover.Dropdown>
+		</Popover>
 	);
 }
 
@@ -1767,6 +1899,7 @@ export function NarratorPanel({
 									/>
 								</Menu.Dropdown>
 							</Menu>
+							<WhitelistDirsPopover narratorId={narratorId} t={t} />
 							{/* Reasoning Effort (only for Codex-mode providers) */}
 							{supportsCodexControls && (
 								<Menu position="top-end">
@@ -1877,6 +2010,7 @@ export function NarratorPanel({
 								/>
 							</Menu.Dropdown>
 						</Menu>
+						<WhitelistDirsPopover narratorId={narratorId} t={t} />
 						{/* Reasoning Effort (only for Codex-mode providers) - Mobile */}
 						{supportsCodexControls && (
 							<Menu position="bottom-end" withinPortal>

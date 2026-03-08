@@ -23,12 +23,13 @@ import {
 	narratorMessages,
 	narratorPatches,
 	narrators,
+	narratorWhitelistDirs,
 	projects,
 	terminals,
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
-import { generateShortId } from "../lib/id";
+import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
 	getToolMessage,
@@ -39,12 +40,14 @@ import {
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
 	createNarratorSchema,
+	createWhitelistDirSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
+	updateWhitelistDirSchema,
 } from "../lib/validators";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import { narratorService } from "../services/narrator-service";
@@ -1069,4 +1072,54 @@ narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	}
 
 	return c.json({ success: true });
+});
+
+// ── Whitelist directories ──────────────────────────────────
+
+narratorRoutes.get("/:id/whitelist-dirs", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id); // ensure exists
+	const dirs = await db.query.narratorWhitelistDirs.findMany({
+		where: eq(narratorWhitelistDirs.narratorId, id),
+		orderBy: asc(narratorWhitelistDirs.createdAt),
+	});
+	return c.json(dirs);
+});
+
+narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const body = await c.req.json();
+	const parsed = createWhitelistDirSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const now = new Date().toISOString();
+	const dir = {
+		id: generateId(),
+		narratorId: id,
+		path: parsed.data.path,
+		accessLevel: parsed.data.accessLevel,
+		enabled: parsed.data.enabled,
+		createdAt: now,
+	};
+	await db.insert(narratorWhitelistDirs).values(dir);
+	return c.json(dir, 201);
+});
+
+narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
+	const dirId = c.req.param("dirId");
+	const body = await c.req.json();
+	const parsed = updateWhitelistDirSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const updates: Record<string, unknown> = {};
+	if (parsed.data.accessLevel !== undefined) updates.accessLevel = parsed.data.accessLevel;
+	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
+	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
+	await db.update(narratorWhitelistDirs).set(updates).where(eq(narratorWhitelistDirs.id, dirId));
+	return c.json({ ok: true });
+});
+
+narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
+	const dirId = c.req.param("dirId");
+	await db.delete(narratorWhitelistDirs).where(eq(narratorWhitelistDirs.id, dirId));
+	return c.json({ ok: true });
 });

@@ -11,6 +11,7 @@ import {
 	narratorPatches,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistDirs,
 	projects,
 } from "../db/schema";
 import { buildHistory, type PermissionResult, resolveProviderAndModel } from "../lib/agent";
@@ -199,6 +200,50 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 	}
 }
 
+/**
+ * Check if a file path falls inside any enabled whitelist directory.
+ * Returns the best (most permissive) access level, or null if not whitelisted.
+ */
+function whitelistAccessForPath(
+	cwd: string,
+	filePath: string,
+	whitelistDirs: WhitelistDir[],
+): "readOnly" | "readWrite" | "full" | null {
+	if (whitelistDirs.length === 0) return null;
+	const absPath = resolvePath(cwd, filePath);
+	const levels = ["readOnly", "readWrite", "full"] as const;
+	let best: (typeof levels)[number] | null = null;
+	for (const dir of whitelistDirs) {
+		if (!dir.enabled) continue;
+		if (isInsidePath(dir.path, absPath)) {
+			if (dir.accessLevel === "full") return "full"; // can't get better
+			if (!best || levels.indexOf(dir.accessLevel) > levels.indexOf(best)) {
+				best = dir.accessLevel;
+			}
+		}
+	}
+	return best;
+}
+
+/**
+ * Check if ALL given paths are covered by whitelist at the required access level.
+ * `requiredLevel`: "readOnly" means read is enough, "readWrite" means write needed.
+ */
+function allPathsWhitelisted(
+	cwd: string,
+	paths: string[],
+	whitelistDirs: WhitelistDir[],
+	requiredLevel: "readOnly" | "readWrite" | "full",
+): boolean {
+	if (paths.length === 0 || whitelistDirs.length === 0) return false;
+	const levels = ["readOnly", "readWrite", "full"] as const;
+	const reqIdx = levels.indexOf(requiredLevel);
+	return paths.every((p) => {
+		const access = whitelistAccessForPath(cwd, p, whitelistDirs);
+		return access !== null && levels.indexOf(access) >= reqIdx;
+	});
+}
+
 // and does not access the local filesystem or execute arbitrary commands.
 // Task is auto-allowed when using the parent's cwd — the subagent's
 // individual tools go through their own permission checks. When Task specifies
@@ -233,16 +278,36 @@ const READ_ONLY_TOOLS = ["Read", "Grep", "Glob"];
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
 
-// TODO: refactor resolvePermissionDecision params into an options object when adding more flags
+export interface WhitelistDir {
+	path: string;
+	accessLevel: "readOnly" | "readWrite" | "full";
+	enabled: boolean;
+}
+
+export interface PermissionDecisionOpts {
+	toolName: string;
+	input: Record<string, unknown>;
+	permMode: string;
+	cwd: string;
+	bashAnalysis?: BashAnalysis;
+	isChapter?: boolean;
+	planFileId?: string;
+	whitelistDirs?: WhitelistDir[];
+}
+
 export function resolvePermissionDecision(
-	toolName: string,
-	input: Record<string, unknown>,
-	permMode: string,
-	cwd: string,
-	bashAnalysis?: BashAnalysis,
-	isChapter = false,
-	planFileId?: string,
+	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
+	const {
+		toolName,
+		input,
+		permMode,
+		cwd,
+		bashAnalysis,
+		isChapter = false,
+		planFileId,
+		whitelistDirs = [],
+	} = opts;
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
 
@@ -297,6 +362,8 @@ export function resolvePermissionDecision(
 			const hasExternalPath =
 				toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
 			if (!hasExternalPath || allPathsInTruncateDir(cwd, toolPaths)) return "allow";
+			// External paths — check whitelist (readOnly is sufficient for read tools)
+			if (allPathsWhitelisted(cwd, toolPaths, whitelistDirs, "readOnly")) return "allow";
 			return "deny";
 		}
 		if (toolName === SHELL_TOOL_NAME) {
@@ -305,10 +372,13 @@ export function resolvePermissionDecision(
 			if (bashAnalysis.dangerousPatterns.length > 0) return "deny";
 			if (bashAnalysis.hasEnvInjection) return "deny";
 			if (bashAnalysis.hasWriteOperation) return "deny";
-			const hasExternalBashPath = bashAnalysis.filePaths.some(
+			const externalBashPaths = bashAnalysis.filePaths.filter(
 				(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 			);
-			if (hasExternalBashPath) return "deny";
+			if (externalBashPaths.length > 0) {
+				// Check whitelist for external bash paths (readOnly for read-only commands)
+				if (!allPathsWhitelisted(cwd, externalBashPaths, whitelistDirs, "readOnly")) return "deny";
+			}
 			return "allow";
 		}
 		return "deny";
@@ -320,11 +390,15 @@ export function resolvePermissionDecision(
 		if (bashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (bashAnalysis.dangerousPatterns.length > 0) return "ask";
 		if (bashAnalysis.hasEnvInjection) return "ask";
-		const hasExternalBashPath = bashAnalysis.filePaths.some(
+		const externalBashPaths = bashAnalysis.filePaths.filter(
 			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 		);
-		if (hasExternalBashPath) return "ask";
-		// All commands whitelisted + all paths inside worktree + no dangerous patterns
+		if (externalBashPaths.length > 0) {
+			// Check whitelist — need readWrite if write ops, readOnly otherwise
+			const reqLevel = bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly";
+			if (!allPathsWhitelisted(cwd, externalBashPaths, whitelistDirs, reqLevel)) return "ask";
+		}
+		// All commands whitelisted + all paths inside worktree/whitelist + no dangerous patterns
 		// 如果包含写操作（如 biome --write），只在 acceptEdits 模式下允许
 		if (bashAnalysis.hasWriteOperation && effectiveMode !== "acceptEdits") return "ask";
 		if (effectiveMode === "acceptEdits") return "allow";
@@ -350,6 +424,20 @@ export function resolvePermissionDecision(
 		allPathsInTruncateDir(cwd, toolPaths)
 	) {
 		return "allow";
+	}
+
+	// External paths — check whitelist before falling back to "ask"
+	if (hasExternalPath && toolPaths.length > 0) {
+		const isReadTool = READ_ONLY_TOOLS.includes(toolName);
+		const reqLevel = isReadTool ? "readOnly" : "readWrite";
+		if (allPathsWhitelisted(cwd, toolPaths, whitelistDirs, reqLevel)) {
+			// Whitelisted external path — apply same logic as internal paths
+			if (effectiveMode === "default") {
+				return isReadTool ? "allow" : "ask";
+			}
+			if (effectiveMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName))
+				return "allow";
+		}
 	}
 
 	return "ask";
@@ -424,15 +512,25 @@ export async function handlePermission(
 
 	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
 
-	const decision = resolvePermissionDecision(
+	// Load enabled whitelist directories for this narrator
+	const wlRows = await db.query.narratorWhitelistDirs.findMany({
+		where: and(
+			eq(narratorWhitelistDirs.narratorId, narratorId),
+			eq(narratorWhitelistDirs.enabled, true),
+		),
+		columns: { path: true, accessLevel: true, enabled: true },
+	});
+
+	const decision = resolvePermissionDecision({
 		toolName,
-		effectiveInput,
+		input: effectiveInput,
 		permMode,
 		cwd,
 		bashAnalysis,
 		isChapter,
 		planFileId,
-	);
+		whitelistDirs: wlRows as WhitelistDir[],
+	});
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
 		const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
