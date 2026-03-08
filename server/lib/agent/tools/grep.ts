@@ -1,26 +1,58 @@
-import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { existsSync, readdirSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod/v4";
 import { IS_WINDOWS } from "../../platform";
+import { toForwardSlash } from "../../platform-path";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const MAX_LINE_LENGTH = 2000;
 const MAX_MATCHES = 100;
 
+/**
+ * Scan the WinGet packages directory for any ripgrep package folder.
+ * The folder name contains a version-dependent hash (e.g.
+ * `BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe`)
+ * so we cannot hard-code it — instead we glob for `BurntSushi.ripgrep*`.
+ */
+function findRgInWinGet(): string | undefined {
+	const localAppData = process.env.LOCALAPPDATA;
+	if (!localAppData) return undefined;
+	const packagesDir = join(localAppData, "Microsoft", "WinGet", "Packages");
+	try {
+		const entries = readdirSync(packagesDir);
+		for (const entry of entries) {
+			if (entry.toLowerCase().startsWith("burntsushi.ripgrep")) {
+				const candidate = join(packagesDir, entry, "rg.exe");
+				if (existsSync(candidate)) return candidate;
+			}
+		}
+	} catch {
+		// Directory doesn't exist or not readable
+	}
+	return undefined;
+}
+
 /** Resolve the ripgrep binary path. Checks system paths, then falls back to PATH. */
 function findRg(): string {
 	if (IS_WINDOWS) {
-		// On Windows, rg may be installed via scoop, chocolatey, or cargo
+		// 1. Static well-known paths (scoop, chocolatey, cargo, Program Files)
 		const winPaths = [
-			`${process.env.LOCALAPPDATA ?? ""}\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\rg.exe`,
 			`${process.env.USERPROFILE ?? ""}\\scoop\\shims\\rg.exe`,
+			`${process.env.ProgramData ?? "C:\\ProgramData"}\\chocolatey\\bin\\rg.exe`,
 			`${process.env.ProgramFiles ?? "C:\\Program Files"}\\ripgrep\\rg.exe`,
 			`${process.env.USERPROFILE ?? ""}\\.cargo\\bin\\rg.exe`,
 		];
 		for (const p of winPaths) {
 			if (p && existsSync(p)) return p;
 		}
-		return "rg";
+		// 2. WinGet packages (dynamic folder name)
+		const winget = findRgInWinGet();
+		if (winget) return winget;
+		// 3. Ask the OS to find it on PATH
+		const which = Bun.which("rg");
+		if (which) return which;
+		// 4. Last resort — hope it's on PATH at spawn time
+		return "rg.exe";
 	}
 	const systemPaths = [
 		"/usr/bin/rg",
@@ -148,11 +180,14 @@ export const grepTool: ToolDefinition = {
 			for (const line of lines) {
 				if (!line) continue;
 
-				const [filePath, lineNumStr, ...lineTextParts] = line.split("|");
-				if (!filePath || !lineNumStr || lineTextParts.length === 0) continue;
+				const [rawFilePath, lineNumStr, ...lineTextParts] = line.split("|");
+				if (!rawFilePath || !lineNumStr || lineTextParts.length === 0) continue;
 
 				const lineNum = parseInt(lineNumStr, 10);
 				const lineText = lineTextParts.join("|");
+
+				// Normalise backslashes so paths are consistent across platforms
+				const filePath = toForwardSlash(rawFilePath);
 
 				const file = Bun.file(filePath);
 				const stats = await file.stat().catch(() => null);
