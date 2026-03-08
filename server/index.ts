@@ -41,7 +41,10 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
 const host = cliHost || process.env.HOST || "localhost";
-const isProd = process.env.NODE_ENV === "production";
+// Compiled single-executable binaries are always treated as production.
+// Bun embeds files under $bunfs — if our entry point lives there, we're compiled.
+const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
+const isProd = isCompiledBinary || process.env.NODE_ENV === "production";
 
 // MIME type lookup for embedded static files
 const MIME_TYPES: Record<string, string> = {

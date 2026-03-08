@@ -33,7 +33,8 @@ import { terminalRoutes } from "./routes/terminals";
 import { uploadRoutes } from "./routes/uploads";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 
-const isProd = process.env.NODE_ENV === "production";
+const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
+const isProd = isCompiledBinary || process.env.NODE_ENV === "production";
 
 const app = new Hono();
 
