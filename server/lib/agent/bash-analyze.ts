@@ -1150,6 +1150,20 @@ const GREP_LIKE_FLAGS_WITH_VALUE = new Set([
 	"--type-not", // rg/ag
 ]);
 
+/** 从 fullText 中提取重定向目标路径（>, >>, 2>, &> 等） */
+const REDIRECT_REGEX = /(?:>>|[012]>|&>|>\|?)[ \t]*([^\s;|&)]+)/g;
+
+function extractRedirectTargets(fullText: string, cwd: string): string[] {
+	const paths: string[] = [];
+	for (const match of fullText.matchAll(REDIRECT_REGEX)) {
+		const target = match[1];
+		// 忽略 /dev/null 等特殊设备
+		if (target.startsWith("/dev/")) continue;
+		paths.push(resolvePath(cwd, target));
+	}
+	return paths;
+}
+
 function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string[] {
 	const paths: string[] = [];
 	const args = tokens.slice(1);
@@ -1682,6 +1696,10 @@ export async function analyzeBashCommand(
 			if (!nonWhitelisted.includes(cmdName)) {
 				nonWhitelisted.push(cmdName);
 			}
+			// 写操作标记
+			if (PATH_COMMANDS_WRITE.has(cmdName)) {
+				hasWriteOperation = true;
+			}
 			// 路径提取（即使命令被拦截，也需要记录路径用于 UI 展示）
 			if (PATH_COMMANDS.has(cmdName)) {
 				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
@@ -1704,6 +1722,10 @@ export async function analyzeBashCommand(
 					nonWhitelisted.push(cmdName);
 				}
 			}
+			// 写操作标记
+			if (PATH_COMMANDS_WRITE.has(cmdName)) {
+				hasWriteOperation = true;
+			}
 			// 检查包执行器的写操作标志
 			if (cmdName === "npx" || cmdName === "bunx") {
 				const classification = classifyPackageRunner(tokens, cmdName);
@@ -1720,6 +1742,10 @@ export async function analyzeBashCommand(
 
 		// 4. SAFE_COMMANDS — 放行
 		if (SAFE_COMMANDS.has(cmdName)) {
+			// 写操作标记（mkdir, cp, mv, touch 等）
+			if (PATH_COMMANDS_WRITE.has(cmdName)) {
+				hasWriteOperation = true;
+			}
 			// 路径提取
 			if (PATH_COMMANDS.has(cmdName)) {
 				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
@@ -1730,6 +1756,15 @@ export async function analyzeBashCommand(
 		// 5. 未知命令 — 需要确认
 		if (!nonWhitelisted.includes(cmdName)) {
 			nonWhitelisted.push(cmdName);
+		}
+	}
+
+	// 重定向检测：遍历所有 redirected_statement 节点，提取目标路径并标记写操作
+	for (const redir of tree.rootNode.descendantsOfType("redirected_statement")) {
+		const redirectTargets = extractRedirectTargets(redir.text, cwd);
+		if (redirectTargets.length > 0) {
+			hasWriteOperation = true;
+			filePaths.push(...redirectTargets);
 		}
 	}
 
