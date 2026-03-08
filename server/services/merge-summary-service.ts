@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -158,7 +158,7 @@ export const mergeSummaryService = {
 			// Count existing merge_summary messages for this source chapter
 			// to determine the merge round (wake → re-merge produces round 2+).
 			const existingSummaries = await db
-				.select({ id: narratorMessages.id })
+				.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
 				.from(narratorMessages)
 				.where(
 					and(
@@ -167,6 +167,22 @@ export const mergeSummaryService = {
 					),
 				);
 			const mergeRound = existingSummaries.length + 1;
+
+			// Mark existing merge_summary messages as historical (isLatest: false)
+			// so the frontend hides the unmerge button on old cards.
+			if (existingSummaries.length > 0) {
+				for (const row of existingSummaries) {
+					const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					const updated = blocks.map((b: any) =>
+						b.type === "merge_summary" ? { ...b, isLatest: false } : b,
+					);
+					await db
+						.update(narratorMessages)
+						.set({ contentJson: updated })
+						.where(eq(narratorMessages.id, row.id));
+				}
+			}
 
 			// Use pre-collected data when available (collected before merge).
 			// Fall back to git queries (may return empty for fast-forward merges).
@@ -245,6 +261,7 @@ export const mergeSummaryService = {
 						commitSha: commitSha ?? null,
 						mergedBy: username ?? null,
 						mergeRound,
+						isLatest: true,
 						summary,
 					},
 				],
@@ -304,7 +321,7 @@ export const mergeSummaryService = {
 		// referencing this source chapter. SQLite JSON: content_json is stored
 		// as text, so we use LIKE for a simple substring match.
 		const rows = await db
-			.select({ id: narratorMessages.id, narratorId: narratorMessages.narratorId })
+			.select({ id: narratorMessages.id })
 			.from(narratorMessages)
 			.where(
 				and(
@@ -316,7 +333,14 @@ export const mergeSummaryService = {
 		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
 
 		const ids = rows.map((r) => r.id);
-		const narratorIds = [...new Set(rows.map((r) => r.narratorId))];
+
+		// Get ALL narrators referencing these messages (via refs junction table),
+		// not just the original narratorId — messages can be shared via fork.
+		const refRows = await db
+			.select({ narratorId: narratorMessageRefs.narratorId })
+			.from(narratorMessageRefs)
+			.where(inArray(narratorMessageRefs.messageId, ids));
+		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
 
 		// Delete refs first (FK), then messages
 		await db.transaction(async (tx) => {
@@ -328,6 +352,84 @@ export const mergeSummaryService = {
 
 		logger.info("Cleaned up merge summary messages", {
 			sourceChapterId,
+			deletedCount: ids.length,
+		});
+
+		return { deletedCount: ids.length, narratorIds };
+	},
+
+	/**
+	 * Remove the merge_summary message for a specific merge (identified by commitSha).
+	 * Called during unmerge to clean up only the card for that particular merge,
+	 * preserving historical cards from earlier merge rounds.
+	 */
+	async cleanupForMerge(
+		sourceChapterId: string,
+		commitSha: string,
+	): Promise<{ deletedCount: number; narratorIds: string[] }> {
+		const rows = await db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(
+				and(
+					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+					sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`,
+				),
+			);
+
+		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
+
+		const ids = rows.map((r) => r.id);
+
+		// Get ALL narrators referencing these messages (via refs junction table)
+		const refRows = await db
+			.select({ narratorId: narratorMessageRefs.narratorId })
+			.from(narratorMessageRefs)
+			.where(inArray(narratorMessageRefs.messageId, ids));
+		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
+
+		await db.transaction(async (tx) => {
+			for (const id of ids) {
+				await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id));
+				await tx.delete(narratorMessages).where(eq(narratorMessages.id, id));
+			}
+		});
+
+		// After removing the latest card, restore isLatest on the most recent
+		// remaining merge_summary for this source chapter (if any).
+		const remaining = await db
+			.select({ id: narratorMessages.id, createdAt: narratorMessages.createdAt })
+			.from(narratorMessages)
+			.where(
+				and(
+					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+				),
+			)
+			.orderBy(sql`${narratorMessages.createdAt} DESC`)
+			.limit(1);
+
+		if (remaining.length > 0) {
+			const latest = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, remaining[0].id),
+			});
+			if (latest?.contentJson) {
+				const blocks = Array.isArray(latest.contentJson) ? latest.contentJson : [];
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				const updated = blocks.map((b: any) =>
+					b.type === "merge_summary" ? { ...b, isLatest: true } : b,
+				);
+				await db
+					.update(narratorMessages)
+					.set({ contentJson: updated })
+					.where(eq(narratorMessages.id, remaining[0].id));
+			}
+		}
+
+		logger.info("Cleaned up merge summary for specific merge", {
+			sourceChapterId,
+			commitSha,
 			deletedCount: ids.length,
 		});
 

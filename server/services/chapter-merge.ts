@@ -567,10 +567,13 @@ export const chapterMerge = {
 			});
 		}
 
-		// Step 6: Remove merge summary messages injected into the target narrator
+		// Step 6: Remove merge summary message for THIS specific merge only
+		// (preserves historical cards from earlier merge rounds)
 		try {
-			const { deletedCount, narratorIds } =
-				await mergeSummaryService.cleanupForSource(sourceChapterId);
+			const { deletedCount, narratorIds } = await mergeSummaryService.cleanupForMerge(
+				sourceChapterId,
+				source.mergeCommitSha,
+			);
 			if (deletedCount > 0) {
 				// Notify all affected narrators to reload messages
 				for (const nid of narratorIds) {

@@ -435,7 +435,7 @@ function MergeSummaryCard({
 					</ScrollArea.Autosize>
 				)}
 
-				{block.sourceChapterId && (
+				{block.sourceChapterId && block.isLatest !== false && (
 					<Group justify="flex-end" mt="md">
 						<Button color="orange" variant="light" size="xs" onClick={openConfirm}>
 							{t("unmerge")}
