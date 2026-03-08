@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { detectShell } from "../lib/agent/shell";
-import { IS_WINDOWS } from "../lib/platform";
+import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
@@ -78,6 +78,10 @@ export async function buildEffectiveSystemPrompt(
 		// When running PowerShell on Windows, add guidance for the AI
 		if (shellInfo.type === "powershell") {
 			cwdSection += `\n\nNote: The Shell tool uses PowerShell on this system. Use PowerShell syntax (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, ls, cat). Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands when possible.`;
+		}
+		// On Windows, forbid WSL suggestions unless --wsl=true
+		if (IS_WINDOWS && !isWslAllowed()) {
+			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows. Use Windows-native paths (backslashes or forward slashes) and Windows-compatible commands.`;
 		}
 		prompt = `${base}${sep}${cwdSection}`;
 	}

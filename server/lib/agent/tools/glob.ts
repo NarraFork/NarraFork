@@ -1,4 +1,6 @@
+import { isAbsolute, resolve } from "node:path";
 import { z } from "zod/v4";
+import { toForwardSlash } from "../../platform-path";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const MAX_RESULTS = 500;
@@ -12,13 +14,20 @@ export const globTool: ToolDefinition = {
 		path: z.string().optional().describe("Base directory to search from. Defaults to cwd"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { pattern, path } = args as { pattern: string; path?: string };
-		const cwd = path ?? ctx.cwd;
+		const { pattern, path: pathArg } = args as { pattern: string; path?: string };
+		// Resolve relative paths against the narrator's cwd
+		let cwd: string;
+		if (pathArg) {
+			cwd = isAbsolute(pathArg) ? pathArg : resolve(ctx.cwd, pathArg);
+		} else {
+			cwd = ctx.cwd;
+		}
 		try {
 			const glob = new Bun.Glob(pattern);
 			const results: string[] = [];
 			for await (const entry of glob.scan({ cwd, dot: false })) {
-				results.push(entry);
+				// Normalise backslashes to forward slashes for consistent output
+				results.push(toForwardSlash(entry));
 				if (results.length >= MAX_RESULTS) break;
 			}
 			if (results.length === 0) return { output: "No matches found" };
