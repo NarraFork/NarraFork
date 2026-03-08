@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import {
 	and,
 	asc,
@@ -31,6 +32,7 @@ import { agentGenerateWithHistory } from "../lib/agent";
 import { ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { resolvePath } from "../lib/platform-path";
 import {
 	getToolMessage,
 	getUserLanguage,
@@ -1092,11 +1094,15 @@ narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
 	const body = await c.req.json();
 	const parsed = createWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	if (!isAbsolute(parsed.data.path)) {
+		throw new ValidationError("Whitelist directory path must be absolute");
+	}
+	const normalizedPath = resolvePath(parsed.data.path);
 	const now = new Date().toISOString();
 	const dir = {
 		id: generateId(),
 		narratorId: id,
-		path: parsed.data.path,
+		path: normalizedPath,
 		accessLevel: parsed.data.accessLevel,
 		enabled: parsed.data.enabled,
 		createdAt: now,

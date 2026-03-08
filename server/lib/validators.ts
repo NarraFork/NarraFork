@@ -118,7 +118,7 @@ export const permissionDecisionSchema = z.object({
 });
 
 export const createWhitelistDirSchema = z.object({
-	path: z.string().min(1).max(4096),
+	path: z.string().trim().min(1).max(4096),
 	accessLevel: z.enum(["readOnly", "readWrite", "full"]).default("readOnly"),
 	enabled: z.boolean().default(true),
 });

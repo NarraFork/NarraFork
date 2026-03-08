@@ -22,11 +22,13 @@ export function toForwardSlash(p: string): string {
 
 /**
  * Strip trailing slashes (both `/` and `\`) from a path string.
- * Returns `"/"` (or the drive root on Windows, e.g. `"C:/"`) when the
- * input is a root path.
+ * Preserves filesystem roots such as `/` and `C:/`.
  */
 export function stripTrailingSlash(p: string): string {
-	return p.replace(/[/\\]+$/, "") || "/";
+	const normalized = toForwardSlash(p);
+	if (normalized === "/") return "/";
+	if (/^[a-zA-Z]:\/$/.test(normalized)) return normalized;
+	return normalized.replace(/\/+$/, "");
 }
 
 /**
@@ -41,11 +43,32 @@ export function resolvePath(...segments: string[]): string {
 }
 
 /**
+ * Normalize a path for string comparison.
+ * On Windows (or Windows-style paths), comparisons should be case-insensitive.
+ */
+export function normalizePathForComparison(p: string): string {
+	const normalized = stripTrailingSlash(resolvePath(p));
+	if (
+		process.platform === "win32" ||
+		/^[a-zA-Z]:/.test(normalized) ||
+		normalized.startsWith("//")
+	) {
+		return normalized.toLowerCase();
+	}
+	return normalized;
+}
+
+/** Compare two paths using platform-aware normalization rules. */
+export function pathsEqual(a: string, b: string): boolean {
+	return normalizePathForComparison(a) === normalizePathForComparison(b);
+}
+
+/**
  * Check whether `child` is equal to or nested inside `parent`.
  * Both paths are resolved & normalised with forward slashes first.
  */
 export function isInsidePath(parent: string, child: string): boolean {
-	const p = stripTrailingSlash(resolvePath(parent));
-	const c = resolvePath(child);
+	const p = normalizePathForComparison(parent);
+	const c = normalizePathForComparison(child);
 	return c === p || c.startsWith(`${p}/`);
 }

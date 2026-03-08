@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BashAnalysis } from "../../../server/lib/agent/bash-analyze";
 import {
 	extractToolPaths,
 	isInsideWorktree,
@@ -8,6 +9,21 @@ import {
 } from "../../../server/services/narrator-session";
 
 const TRUNCATE_DIR = join(tmpdir(), "narrafork-tool-output");
+
+function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
+	return {
+		commands: [],
+		filePaths: [],
+		allWhitelisted: true,
+		nonWhitelisted: [],
+		dangerousPatterns: [],
+		hasEnvInjection: false,
+		isCatastrophic: false,
+		gitBranchViolations: [],
+		hasWriteOperation: false,
+		...partial,
+	};
+}
 
 // ============================================================
 // isInsideWorktree
@@ -34,6 +50,11 @@ describe("isInsideWorktree", () => {
 
 	test("dot path (current dir) returns true", () => {
 		expect(isInsideWorktree(CWD, ".")).toBe(true);
+	});
+
+	test("windows-style path comparison is case-insensitive", () => {
+		expect(isInsideWorktree("C:/Users/Ray/Repo", "c:/users/ray/repo/src/index.ts")).toBe(true);
+		expect(isInsideWorktree("C:/Users/Ray/Repo", "C:/Users/Ray/Repo-2/file.txt")).toBe(false);
 	});
 
 	test("absolute path outside worktree", () => {
@@ -330,6 +351,43 @@ describe("resolvePermissionDecision", () => {
 		).toBe("ask");
 	});
 
+	test("default mode: Bash in readWrite whitelisted workdir → allow", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "touch out.txt", workdir: "/mnt/shared" },
+				permMode: "default",
+				cwd: CWD,
+				bashAnalysis: makeBashAnalysis({ hasWriteOperation: true, filePaths: [] }),
+				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+			}),
+		).toBe("allow");
+	});
+
+	test("default mode: Task with full-whitelisted workdir → allow", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Task",
+				input: { subagent_type: "general", workdir: "/mnt/shared" },
+				permMode: "default",
+				cwd: CWD,
+				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "full", enabled: true }],
+			}),
+		).toBe("allow");
+	});
+
+	test("default mode: Task with readWrite-whitelisted workdir still asks for general subagent", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Task",
+				input: { subagent_type: "general", workdir: "/mnt/shared" },
+				permMode: "default",
+				cwd: CWD,
+				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+			}),
+		).toBe("ask");
+	});
+
 	// --- default mode: external paths ---
 
 	test("default mode: Read outside worktree → ask", () => {
@@ -363,6 +421,18 @@ describe("resolvePermissionDecision", () => {
 				cwd: CWD,
 			}),
 		).toBe("ask");
+	});
+
+	test("default mode: Write in readWrite whitelisted external dir → allow", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: "/mnt/shared/out.txt", content: "x" },
+				permMode: "default",
+				cwd: CWD,
+				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+			}),
+		).toBe("allow");
 	});
 
 	test("default mode: path traversal escape → ask", () => {
