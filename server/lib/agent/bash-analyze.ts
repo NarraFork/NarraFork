@@ -4,6 +4,13 @@
  * 解析 bash 命令字符串，提取所有子命令、文件路径，
  * 并根据白名单 + 危险模式检测判断是否可以自动放行。
  */
+
+import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
+
+// Embed WASM files for compiled single-executable mode.
+// `import ... with { type: "file" }` makes Bun include these in $bunfs.
+// At runtime we prefer the embedded path; fall back to require.resolve for dev.
+import embeddedTreeSitterWasm from "web-tree-sitter/tree-sitter.wasm" with { type: "file" };
 import { resolvePath, toForwardSlash } from "../platform-path";
 
 // ── 类型定义 ──────────────────────────────────────────────
@@ -1039,14 +1046,16 @@ async function initParser(): Promise<TreeSitterParser> {
 		throw new Error("web-tree-sitter Language API is unavailable");
 	}
 
-	const treeSitterWasmPath = require.resolve("web-tree-sitter/tree-sitter.wasm");
+	const treeSitterWasmPath =
+		embeddedTreeSitterWasm ?? require.resolve("web-tree-sitter/tree-sitter.wasm");
 	await Parser.init({
 		locateFile() {
 			return treeSitterWasmPath;
 		},
 	});
 
-	const bashWasmPath = require.resolve("tree-sitter-bash/tree-sitter-bash.wasm");
+	const bashWasmPath =
+		embeddedBashWasm ?? require.resolve("tree-sitter-bash/tree-sitter-bash.wasm");
 	const bashLanguage = await Language.load(bashWasmPath);
 
 	const parser = new Parser();
