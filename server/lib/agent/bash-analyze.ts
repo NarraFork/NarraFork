@@ -1046,20 +1046,41 @@ async function initParser(): Promise<TreeSitterParser> {
 		throw new Error("web-tree-sitter Language API is unavailable");
 	}
 
-	const treeSitterWasmPath =
-		embeddedTreeSitterWasm ?? require.resolve("web-tree-sitter/tree-sitter.wasm");
+	// In compiled single-executable mode, embedded WASM paths point to $bunfs
+	// which web-tree-sitter's internal fs.readFileSync cannot resolve (path
+	// contains `../` that breaks under the virtual FS).  We extract both WASM
+	// files to a real temp directory so the standard Node fs APIs work.
+	let treeSitterWasmPath: string;
+	let bashWasmBytes: Uint8Array;
+
+	const isEmbedded =
+		typeof embeddedTreeSitterWasm === "string" && embeddedTreeSitterWasm.includes("~BUN");
+
+	if (isEmbedded) {
+		const { mkdtempSync, writeFileSync } = await import("node:fs");
+		const { join } = await import("node:path");
+		const tmpDir = mkdtempSync(join(globalThis.process?.env?.TEMP || "/tmp", "narrafork-wasm-"));
+		// tree-sitter.wasm — Parser.init needs a real filesystem path
+		const tsWasmBuf = await Bun.file(embeddedTreeSitterWasm).arrayBuffer();
+		treeSitterWasmPath = join(tmpDir, "tree-sitter.wasm");
+		writeFileSync(treeSitterWasmPath, new Uint8Array(tsWasmBuf));
+		// tree-sitter-bash.wasm — Language.load accepts Uint8Array directly
+		const bashBuf = await Bun.file(embeddedBashWasm).arrayBuffer();
+		bashWasmBytes = new Uint8Array(bashBuf);
+	} else {
+		treeSitterWasmPath = require.resolve("web-tree-sitter/tree-sitter.wasm");
+		const bashWasmPath = require.resolve("tree-sitter-bash/tree-sitter-bash.wasm");
+		const bashBuf = await Bun.file(bashWasmPath).arrayBuffer();
+		bashWasmBytes = new Uint8Array(bashBuf);
+	}
+
 	await Parser.init({
 		locateFile() {
 			return treeSitterWasmPath;
 		},
 	});
 
-	// Load bash language WASM — use Bun.file() to read as bytes for maximum
-	// compatibility with compiled single-executable mode ($bunfs paths).
-	const bashWasmPath =
-		embeddedBashWasm ?? require.resolve("tree-sitter-bash/tree-sitter-bash.wasm");
-	const bashBytes = await Bun.file(bashWasmPath).arrayBuffer();
-	const bashLanguage = await Language.load(new Uint8Array(bashBytes));
+	const bashLanguage = await Language.load(bashWasmBytes);
 
 	const parser = new Parser();
 	parser.setLanguage(bashLanguage);
