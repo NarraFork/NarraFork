@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { normalize, resolve } from "node:path";
+import { resolve } from "node:path";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -23,6 +23,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
+import { isInsidePath, resolvePath } from "../lib/platform-path";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
@@ -161,16 +162,12 @@ const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const EXIT_PLAN_MODE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes — plans need longer review
 
 export function isInsideWorktree(cwd: string, filePath: string): boolean {
-	const resolved = normalize(resolve(cwd, filePath));
-	const base = normalize(cwd).replace(/\/+$/, "");
-	return resolved === base || resolved.startsWith(`${base}/`);
+	return isInsidePath(cwd, resolve(cwd, filePath));
 }
 
 /** Check if a path points inside the truncated-output temp directory. */
-function isInsideTruncateDir(cwd: string, filePath: string): boolean {
-	const resolved = normalize(resolve(cwd, filePath));
-	const base = normalize(TRUNCATE_OUTPUT_DIR).replace(/\/+$/, "");
-	return resolved === base || resolved.startsWith(`${base}/`);
+function isInsideTruncateDir(_cwd: string, filePath: string): boolean {
+	return isInsidePath(TRUNCATE_OUTPUT_DIR, resolve(_cwd, filePath));
 }
 
 /** Check if ALL paths target only the truncated-output directory (read-only safe zone). */
@@ -258,8 +255,8 @@ export function resolvePermissionDecision(
 	if (permMode === "plan" && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileId) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
-			const absPath = resolve(cwd, filePath);
-			const planFilePath = resolve(cwd, `.narrafork/plan-${planFileId}.md`);
+			const absPath = resolvePath(cwd, filePath);
+			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
 			if (absPath === planFilePath) return "allow";
 		}
 		return "deny";
@@ -274,8 +271,8 @@ export function resolvePermissionDecision(
 	if (toolName === "Task") {
 		const workdir = input.workdir;
 		if (typeof workdir === "string" && workdir) {
-			const resolved = normalize(resolve(cwd, workdir));
-			const normalizedCwd = normalize(resolve(cwd));
+			const resolved = resolvePath(cwd, workdir);
+			const normalizedCwd = resolvePath(cwd);
 			if (resolved !== normalizedCwd) {
 				if (effectiveMode === "bypassPermissions") return "allow";
 				if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
@@ -559,7 +556,7 @@ export async function handlePermission(
 
 	// Build decisionReason for Task with custom workdir
 	if (toolName === "Task" && typeof input.workdir === "string" && input.workdir) {
-		const resolvedWorkdir = normalize(resolve(cwd, input.workdir));
+		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
 

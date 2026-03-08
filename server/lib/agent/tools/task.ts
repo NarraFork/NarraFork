@@ -1,5 +1,5 @@
-import { normalize, resolve } from "node:path";
 import { z } from "zod/v4";
+import { resolvePath } from "../../platform-path";
 import { getVisibleModels } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
@@ -62,7 +62,7 @@ export const taskTool: ToolDefinition = {
 		};
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
-		const resolvedWorkdir = workdir ? normalize(resolve(ctx.cwd, workdir)) : ctx.cwd;
+		const resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;
 
 		// Lazy import to avoid circular dependency at module load time
 		const { runSubagent } = await import("@server/services/narrator-subagent");

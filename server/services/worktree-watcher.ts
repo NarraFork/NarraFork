@@ -1,6 +1,7 @@
 import { type FSWatcher, watch } from "node:fs";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { toForwardSlash } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { commitSyncService } from "./commit-sync-service";
@@ -32,9 +33,8 @@ const IGNORE_PATTERNS = [
 
 function shouldIgnore(filename: string | null): boolean {
 	if (!filename) return true;
-	return IGNORE_PATTERNS.some(
-		(p) => filename === p || filename.startsWith(`${p}/`) || filename.startsWith(`${p}\\`),
-	);
+	const fwd = toForwardSlash(filename);
+	return IGNORE_PATTERNS.some((p) => fwd === p || fwd.startsWith(`${p}/`));
 }
 
 interface WatcherEntry {

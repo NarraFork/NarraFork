@@ -9,6 +9,7 @@ import { NotFoundError, PodmanNotFoundError, ValidationError } from "../lib/erro
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { isInsidePath } from "../lib/platform-path";
 import { settings } from "../lib/settings";
 import { buildProxyUrl, generateProxyLabel } from "./container-proxy";
 import { type PortMapping, portAllocator } from "./port-allocator";
@@ -429,7 +430,7 @@ export function resolveComposeFile(
 	if (config?.composeFile) {
 		const p = resolve(worktreePath, config.composeFile);
 		// Prevent path traversal — resolved path must stay within worktree
-		if (!p.startsWith(`${worktreePath}/`) && p !== worktreePath) return null;
+		if (!isInsidePath(worktreePath, p)) return null;
 		return existsSync(p) ? p : null;
 	}
 	for (const name of ["compose.yml", "compose.yaml"]) {
