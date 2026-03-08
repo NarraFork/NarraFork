@@ -10,7 +10,7 @@ import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
-import { mergeSummaryService } from "./merge-summary-service";
+import { collectMergeContext, mergeSummaryService } from "./merge-summary-service";
 import { startSession } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 
@@ -113,6 +113,18 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
+		// Collect commit messages and diff stat BEFORE the merge — after merge,
+		// the commit range baseBranch..branch may be empty (fast-forward).
+		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
+			(err) => {
+				logger.warn("Failed to collect pre-merge context (non-fatal)", {
+					sourceChapterId,
+					error: String(err),
+				});
+				return { commits: [] as string[], diffStat: "" };
+			},
+		);
+
 		// Lock the target worktree to prevent concurrent git operations
 		return worktreeLock.acquire(targetWorktree, async () => {
 			let result: MergeResult;
@@ -132,6 +144,7 @@ export const chapterMerge = {
 						strategy,
 						result.commitSha,
 						userId,
+						mergeContext,
 					);
 				} catch (dbErr) {
 					logger.error("Failed to mark chapter as merged after successful git merge, retrying", {
@@ -147,6 +160,7 @@ export const chapterMerge = {
 							strategy,
 							result.commitSha,
 							userId,
+							mergeContext,
 						);
 					} catch (retryErr) {
 						// DB is inconsistent but git merge succeeded — log and
@@ -209,6 +223,17 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
+		// Collect commit messages and diff stat BEFORE the merge
+		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
+			(err) => {
+				logger.warn("Failed to collect pre-merge context for AI resolve (non-fatal)", {
+					sourceChapterId,
+					error: String(err),
+				});
+				return { commits: [] as string[], diffStat: "" };
+			},
+		);
+
 		// Lock the target worktree for the entire AI resolution
 		return worktreeLock.acquire(targetWorktree, async () => {
 			let conflictFiles: string[];
@@ -228,6 +253,7 @@ export const chapterMerge = {
 						strategy,
 						cpResult.commitSha,
 						userId,
+						mergeContext,
 					);
 				}
 				conflictFiles = cpResult.conflictFiles ?? [];
@@ -241,6 +267,7 @@ export const chapterMerge = {
 						strategy,
 						commitSha ?? undefined,
 						userId,
+						mergeContext,
 					);
 				}
 				conflictFiles = mergeResult.conflictFiles;
@@ -280,6 +307,7 @@ export const chapterMerge = {
 					strategy,
 					commitSha ?? undefined,
 					userId,
+					mergeContext,
 				);
 			} catch (err) {
 				logger.error("AI conflict resolution failed", { error: String(err) });
@@ -299,6 +327,7 @@ export const chapterMerge = {
 		strategy: string,
 		commitSha?: string,
 		userId?: string,
+		mergeContext?: { commits: string[]; diffStat: string },
 	): Promise<void> {
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
@@ -389,6 +418,8 @@ export const chapterMerge = {
 				userId,
 				strategy,
 				commitSha,
+				preCollectedCommits: mergeContext?.commits,
+				preCollectedDiffStat: mergeContext?.diffStat,
 			})
 			.catch((err) => {
 				logger.error("Merge summary fire-and-forget failed", {
@@ -405,8 +436,16 @@ export const chapterMerge = {
 		strategy: string,
 		commitSha?: string,
 		userId?: string,
+		mergeContext?: { commits: string[]; diffStat: string },
 	): Promise<AiResolveResult> {
-		await this.markMerged(sourceChapterId, targetChapterId, strategy, commitSha, userId);
+		await this.markMerged(
+			sourceChapterId,
+			targetChapterId,
+			strategy,
+			commitSha,
+			userId,
+			mergeContext,
+		);
 		return { resolved: true, mergeResult: { success: true, commitSha } };
 	},
 

@@ -69,6 +69,27 @@ interface MergeSummaryInput {
 	userId?: string;
 	strategy: string;
 	commitSha?: string;
+	/** Pre-collected commit messages (collected before merge to avoid empty range). */
+	preCollectedCommits?: string[];
+	/** Pre-collected diff stat (collected before merge). */
+	preCollectedDiffStat?: string;
+}
+
+/**
+ * Collect commit messages and diff stat for a branch before merge.
+ * Must be called BEFORE the git merge — after merge, the commit range
+ * `baseBranch..branch` may be empty (especially for fast-forward merges).
+ */
+export async function collectMergeContext(
+	gitPath: string,
+	branch: string,
+	baseBranch: string,
+): Promise<{ commits: string[]; diffStat: string }> {
+	const [commits, diffStat] = await Promise.all([
+		getCommitMessages(gitPath, branch, baseBranch),
+		getDiffStat(gitPath, branch, baseBranch),
+	]);
+	return { commits, diffStat };
 }
 
 export const mergeSummaryService = {
@@ -130,11 +151,19 @@ export const mergeSummaryService = {
 				locale = userLocale;
 			}
 
-			// Gather commit messages and diff stat
-			const [commitMessages, diffStat] = await Promise.all([
-				getCommitMessages(project.gitPath, source.branch, source.baseBranch),
-				getDiffStat(project.gitPath, source.branch, source.baseBranch),
-			]);
+			// Use pre-collected data when available (collected before merge).
+			// Fall back to git queries (may return empty for fast-forward merges).
+			let commitMessages: string[];
+			let diffStat: string;
+			if (input.preCollectedCommits && input.preCollectedCommits.length > 0) {
+				commitMessages = input.preCollectedCommits;
+				diffStat = input.preCollectedDiffStat ?? "";
+			} else {
+				[commitMessages, diffStat] = await Promise.all([
+					getCommitMessages(project.gitPath, source.branch, source.baseBranch),
+					getDiffStat(project.gitPath, source.branch, source.baseBranch),
+				]);
+			}
 
 			if (commitMessages.length === 0) {
 				logger.debug("Merge summary: no commits to summarize", { sourceChapterId });
