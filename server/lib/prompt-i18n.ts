@@ -138,7 +138,7 @@ Focus on:
 - Key files and modules affected
 - Any notable technical decisions
 
-Keep it under 300 words. Be factual and specific. Output ONLY the summary text.`,
+Keep it under 300 words. Be factual and specific. Output ONLY the summary text. Always respond in English.`,
 		"zh-CN": `你是一个合并摘要生成器。根据刚刚合并的分支的提交历史，生成一个简洁的摘要，描述该分支完成了什么工作。此摘要将注入到父分支的叙述者上下文中，使其感知到已合并的工作内容。
 
 重点关注：
@@ -146,7 +146,7 @@ Keep it under 300 words. Be factual and specific. Output ONLY the summary text.`
 - 涉及的关键文件和模块
 - 任何值得注意的技术决策
 
-控制在 300 字以内。保持客观和具体。只输出摘要文本。`,
+控制在 300 字以内。保持客观和具体。只输出摘要文本。始终使用简体中文回复。`,
 	},
 };
 
