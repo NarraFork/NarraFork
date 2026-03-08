@@ -86,9 +86,12 @@ function isAlreadyExistsError(err: unknown): boolean {
 }
 
 /**
- * Read the journal from the resolved migrations folder and manually stamp all
- * migrations as applied in the `__drizzle_migrations` table. This lets Drizzle
- * skip them on subsequent runs.
+ * Read the journal from the resolved migrations folder, execute each migration's
+ * SQL statements (skipping individual statements that fail with "already exists"
+ * or "duplicate column name"), then stamp the migration as applied.
+ *
+ * This handles the case where a database was partially migrated — some objects
+ * already exist but others (e.g. new tables in the same migration) do not.
  */
 function stampMigrationsAsApplied(sqlite: Database, migrationsFolder: string): void {
 	const journalPath = join(migrationsFolder, "meta", "_journal.json");
@@ -111,19 +114,40 @@ function stampMigrationsAsApplied(sqlite: Database, migrationsFolder: string): v
 		const sqlPath = join(migrationsFolder, `${entry.tag}.sql`);
 		if (!existsSync(sqlPath)) continue;
 		const content = readFileSync(sqlPath, "utf-8");
-		// Drizzle uses a hex-encoded hash of the SQL content
 		const hash = hashMigrationContent(content);
 
-		// Only insert if not already recorded
+		// Skip if already recorded
 		const existing = sqlite
 			.query("SELECT 1 FROM __drizzle_migrations WHERE hash = ?")
 			.get(hash);
-		if (!existing) {
-			sqlite.run(
-				"INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)",
-				[hash, entry.when],
-			);
+		if (existing) continue;
+
+		// Execute each statement individually, tolerating already-exists errors
+		// so partial migrations (some objects exist, some don't) are handled correctly.
+		const statements = content
+			.split("--> statement-breakpoint")
+			.map((s) => s.trim())
+			.filter(Boolean);
+
+		for (const stmt of statements) {
+			try {
+				sqlite.run(stmt);
+			} catch (err) {
+				if (isAlreadyExistsError(err)) {
+					logger.debug("Skipping already-applied migration statement", {
+						tag: entry.tag,
+						stmt: stmt.slice(0, 80),
+					});
+				} else {
+					throw err;
+				}
+			}
 		}
+
+		sqlite.run(
+			"INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)",
+			[hash, entry.when],
+		);
 	}
 }
 
