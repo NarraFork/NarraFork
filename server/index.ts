@@ -47,8 +47,9 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
 const host = cliHost || process.env.HOST || "localhost";
 // Compiled single-executable binaries are always treated as production.
-// Bun embeds files under $bunfs — if our entry point lives there, we're compiled.
-const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
+// Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
+const isCompiledBinary =
+	import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
 // Also treat as production when dist/frontend exists (handles Windows where
 // NODE_ENV=production inline syntax doesn't work)
 const hasFrontendBuild = existsSync(
@@ -132,8 +133,11 @@ if (isProd) {
 				return next();
 			});
 		}
-	} catch {
+	} catch (err) {
 		// Generated file doesn't exist — fall through to filesystem mode
+		logger.debug("Embedded frontend not available, falling back to filesystem", {
+			error: String(err),
+		});
 	}
 
 	// Fallback: serve from filesystem (bundle mode or bun run start)
@@ -239,7 +243,11 @@ const _server = Bun.serve({
 	websocket: wsHandlers,
 });
 
-logger.info(`NarraFork server running on http://${host}:${port}`, { isProd });
+logger.info(`NarraFork server running on http://${host}:${port}`, {
+	isProd,
+	isCompiledBinary,
+	metaUrl: import.meta.url,
+});
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
