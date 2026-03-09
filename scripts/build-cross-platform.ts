@@ -93,8 +93,9 @@ const mapEntries: string[] = [];
 
 for (let i = 0; i < relFiles.length; i++) {
 	const rel = relFiles[i];
-	const urlPath = `/${relative("dist/frontend", rel)}`;
-	const importPath = `../../${rel}`;
+	// Always use forward slashes for URL paths (Windows path.relative returns backslashes)
+	const urlPath = `/${relative("dist/frontend", rel).replaceAll("\\", "/")}`;
+	const importPath = `../../${rel.replaceAll("\\", "/")}`;
 
 	imports.push(`import _f${i} from ${JSON.stringify(importPath)} with { type: "file" };`);
 	mapEntries.push(`\t${JSON.stringify(urlPath)}: _f${i},`);

@@ -83,7 +83,14 @@ if (isProd) {
 		const generatedModule = (await import(generatedFrontendModulePath)) as {
 			embeddedAssets?: Record<string, string>;
 		};
-		const embeddedAssets = generatedModule.embeddedAssets ?? {};
+		const rawAssets = generatedModule.embeddedAssets ?? {};
+		// Normalise keys: on Windows the build script may produce backslash
+		// keys (e.g. "/assets\\index-abc.js") — convert them to forward slashes
+		// so they match browser request paths.
+		const embeddedAssets: Record<string, string> = {};
+		for (const [key, value] of Object.entries(rawAssets)) {
+			embeddedAssets[key.replaceAll("\\", "/")] = value;
+		}
 		const indexPath = embeddedAssets["/index.html"];
 		if (indexPath) {
 			hasEmbedded = true;
