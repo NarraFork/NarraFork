@@ -49,7 +49,12 @@ const host = cliHost || process.env.HOST || "localhost";
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs — if our entry point lives there, we're compiled.
 const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
-const isProd = isCompiledBinary || process.env.NODE_ENV === "production";
+// Also treat as production when dist/frontend exists (handles Windows where
+// NODE_ENV=production inline syntax doesn't work)
+const hasFrontendBuild = existsSync(
+	resolve(import.meta.dir, "..", "dist", "frontend", "index.html"),
+);
+const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasFrontendBuild;
 
 // MIME type lookup for embedded static files
 const MIME_TYPES: Record<string, string> = {

@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -34,7 +36,10 @@ import { uploadRoutes } from "./routes/uploads";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 
 const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
-const isProd = isCompiledBinary || process.env.NODE_ENV === "production";
+const hasFrontendBuild = existsSync(
+	resolve(import.meta.dir, "..", "dist", "frontend", "index.html"),
+);
+const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasFrontendBuild;
 
 const app = new Hono();
 
