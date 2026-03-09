@@ -47,9 +47,9 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
 const host = cliHost || process.env.HOST || "localhost";
 // Compiled single-executable binaries are always treated as production.
-// Bun embeds files under $bunfs — if our entry point lives there, we're compiled.
-// On Windows the URL may be file:///C:/$bunfs/ or similar, so check for $bunfs anywhere.
-const isCompiledBinary = import.meta.url.includes("$bunfs/");
+// Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
+const isCompiledBinary =
+	import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
 // Also treat as production when dist/frontend exists (handles Windows where
 // NODE_ENV=production inline syntax doesn't work)
 const hasFrontendBuild = existsSync(
