@@ -12,12 +12,54 @@ interface HighlightedCodeProps {
 	style?: CSSProperties;
 }
 
-// In-memory cache: key = theme + "\0" + lang + "\0" + code
-const htmlCache = new Map<string, string>();
-const MAX_CACHE = 256;
+type CacheEntry = {
+	html: string;
+	size: number;
+};
+
+const htmlCache = new Map<string, CacheEntry>();
+let htmlCacheBytes = 0;
+const MAX_CACHE_ENTRIES = 64;
+const MAX_CACHE_BYTES = 2 * 1024 * 1024;
+const MAX_CACHEABLE_CODE_CHARS = 20_000;
 
 function cacheKey(theme: string, lang: string, code: string) {
 	return `${theme}\0${lang}\0${code}`;
+}
+
+function peekCachedHtml(key: string): string | null {
+	return htmlCache.get(key)?.html ?? null;
+}
+
+function getCachedHtml(key: string): string | null {
+	const entry = htmlCache.get(key);
+	if (!entry) return null;
+	htmlCache.delete(key);
+	htmlCache.set(key, entry);
+	return entry.html;
+}
+
+function evictOldestCachedHtml() {
+	const oldestKey = htmlCache.keys().next().value;
+	if (!oldestKey) return;
+	const oldest = htmlCache.get(oldestKey);
+	if (!oldest) return;
+	htmlCacheBytes -= oldest.size;
+	htmlCache.delete(oldestKey);
+}
+
+function setCachedHtml(key: string, html: string) {
+	const existing = htmlCache.get(key);
+	if (existing) {
+		htmlCacheBytes -= existing.size;
+		htmlCache.delete(key);
+	}
+	const entry = { html, size: html.length * 2 };
+	htmlCache.set(key, entry);
+	htmlCacheBytes += entry.size;
+	while (htmlCache.size > MAX_CACHE_ENTRIES || htmlCacheBytes > MAX_CACHE_BYTES) {
+		evictOldestCachedHtml();
+	}
 }
 
 /**
@@ -34,8 +76,8 @@ export const HighlightedCode = memo(function HighlightedCode({
 	const theme = computedScheme === "light" ? "github-light-default" : "github-dark-default";
 	const effectiveLang = lang && lang in bundledLanguages ? lang : "text";
 	const key = cacheKey(theme, effectiveLang, code);
-	const cached = htmlCache.get(key);
-	const [html, setHtml] = useState<string | null>(cached ?? null);
+	const shouldCache = code.length <= MAX_CACHEABLE_CODE_CHARS;
+	const [html, setHtml] = useState<string | null>(() => peekCachedHtml(key));
 
 	useEffect(() => {
 		if (effectiveLang === "text") {
@@ -43,31 +85,35 @@ export const HighlightedCode = memo(function HighlightedCode({
 			return;
 		}
 
-		const existing = htmlCache.get(key);
+		const existing = shouldCache ? getCachedHtml(key) : null;
 		if (existing) {
 			setHtml(existing);
 			return;
 		}
 
+		setHtml(null);
 		let cancelled = false;
 		codeToHtml(code, {
 			lang: effectiveLang,
 			theme,
-		}).then((result) => {
-			if (cancelled) return;
-			// Evict oldest entries when cache is full
-			if (htmlCache.size >= MAX_CACHE) {
-				const first = htmlCache.keys().next().value;
-				if (first !== undefined) htmlCache.delete(first);
-			}
-			htmlCache.set(key, result);
-			setHtml(result);
-		});
+		})
+			.then((result) => {
+				if (cancelled) return;
+				if (shouldCache) {
+					setCachedHtml(key, result);
+				}
+				setHtml(result);
+			})
+			.catch(() => {
+				if (!cancelled) {
+					setHtml(null);
+				}
+			});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [key, effectiveLang, code, theme]);
+	}, [key, effectiveLang, code, theme, shouldCache]);
 
 	// Plain text or pending — use Mantine Code
 	if (!html) {

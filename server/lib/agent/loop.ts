@@ -40,6 +40,12 @@ const RETRYABLE_PATTERNS = [
 	"fetch failed",
 	"failed to fetch",
 	"network error",
+	"unable to connect",
+	"the operation timed out",
+	"server_error",
+	"internal_server_error",
+	"the server had an error",
+	"internal server error",
 ];
 
 /** Error codes that represent transient network/transport failures. */
@@ -54,6 +60,10 @@ const RETRYABLE_ERROR_CODES = new Set([
 	"UND_ERR_SOCKET",
 	"UND_ERR_CONNECT_TIMEOUT",
 	"UND_ERR_HEADERS_TIMEOUT",
+	// Bun-specific error codes (PascalCase instead of Node.js SCREAMING_SNAKE_CASE)
+	"CONNECTIONREFUSED",
+	"CONNECTIONRESET",
+	"CONNECTIONABORTED",
 ]);
 
 const NON_RETRYABLE_PATTERNS = [
@@ -77,7 +87,7 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 ];
 
 /** HTTP status codes that indicate transient server-side issues. */
-const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 529]);
 
 /** Reasons from invalidState that indicate a transient server-side issue worth retrying. */
 const RETRYABLE_INVALID_STATE_REASONS = new Set([
@@ -273,6 +283,12 @@ export async function* agentLoop(
 		allTools = allTools.filter(config.toolFilter);
 	}
 
+	// Codex provider uses native web_search — remove the WebSearch function tool
+	// to avoid duplicate search capabilities.
+	if (effectiveProvider === "codex") {
+		allTools = allTools.filter((t) => t.name !== "WebSearch");
+	}
+
 	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
 	// When relaxedPlan is enabled, skip this — tools remain fully available.
 	if (config.planMode && !config.relaxedPlan) {
@@ -360,6 +376,11 @@ export async function* agentLoop(
 				lastYieldedAt: number;
 			}
 		>();
+		// Accumulator for native web search calls (Codex web_search tool)
+		const webSearchAccum = new Map<
+			string,
+			{ query?: string; queries?: string[]; emitted: boolean }
+		>();
 
 		try {
 			const stream = provider.chat({
@@ -411,17 +432,22 @@ export async function* agentLoop(
 								acc.totalChars += input.length;
 
 								// For Write/Edit tools, try to extract file_path from first chunk
+								let filePathJustExtracted = false;
 								if (!acc.extractedFilePath && (acc.name === "Write" || acc.name === "Edit")) {
 									const raw = acc.inputChunks.join("");
 									const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
 									if (filePathMatch) {
 										acc.extractedFilePath = filePathMatch[1];
+										filePathJustExtracted = true;
 									}
 								}
 
-								// Throttle: yield at most once per 50ms per tool to reduce WS pressure
+								// Throttle: yield at most once per 50ms per tool to reduce WS pressure.
+								// Bypass throttle when file_path is first extracted so the frontend
+								// can display the path immediately instead of waiting for the next
+								// content chunk.
 								const now = Date.now();
-								if (now - acc.lastYieldedAt >= 50) {
+								if (filePathJustExtracted || now - acc.lastYieldedAt >= 50) {
 									acc.lastYieldedAt = now;
 
 									// Calculate content chars (total minus file_path JSON overhead)
@@ -540,6 +566,7 @@ export async function* agentLoop(
 										durationMs: sr.durationMs,
 										brokenInputOverride: brokenOverride,
 										updatedInput: brokenOverride,
+										metadata: sr.metadata,
 									};
 									if (sr.fatal) {
 										yield { type: "error", message: sr.output };
@@ -615,6 +642,38 @@ export async function* agentLoop(
 							contextWindow,
 						};
 					}
+				}
+				if (parsed.webSearch) {
+					const ws = parsed.webSearch;
+					if (!webSearchAccum.has(ws.id)) {
+						webSearchAccum.set(ws.id, { emitted: false });
+					}
+					// biome-ignore lint/style/noNonNullAssertion: just set above
+					const acc = webSearchAccum.get(ws.id)!;
+					// Update query info when available (from output_item.done)
+					if (ws.query) acc.query = ws.query;
+					if (ws.queries) acc.queries = ws.queries;
+					// Emit block_complete when search is done (use accumulated query data
+					// since query info may arrive in earlier events than the completed status)
+					if (ws.status === "completed" && (acc.query || acc.queries) && !acc.emitted) {
+						acc.emitted = true;
+						yield {
+							type: "block_complete",
+							block: {
+								type: "web_search",
+								id: ws.id,
+								query: acc.query,
+								queries: acc.queries,
+							},
+						};
+					}
+					yield {
+						type: "web_search",
+						id: ws.id,
+						status: ws.status,
+						query: ws.query,
+						queries: ws.queries,
+					};
 				}
 				if (parsed.invalidState) {
 					const reason = String(parsed.invalidState.reason ?? "api_error");
@@ -725,6 +784,7 @@ export async function* agentLoop(
 					durationMs: sr.durationMs,
 					brokenInputOverride: brokenOverride,
 					updatedInput: brokenOverride,
+					metadata: sr.metadata,
 				};
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
@@ -801,6 +861,7 @@ export async function* agentLoop(
 					durationMs: sr.durationMs,
 					brokenInputOverride: brokenOverride,
 					updatedInput: brokenOverride,
+					metadata: sr.metadata,
 				};
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
@@ -929,6 +990,7 @@ export async function* agentLoop(
 						durationMs,
 						brokenInputOverride,
 						updatedInput: brokenInputOverride,
+						metadata: result.metadata,
 					};
 					toolIndex++;
 
@@ -1003,6 +1065,7 @@ export async function* agentLoop(
 							durationMs: result.durationMs,
 							brokenInputOverride,
 							updatedInput: brokenInputOverride,
+							metadata: result.metadata,
 						};
 					}
 					toolIndex++;
@@ -1084,6 +1147,8 @@ interface ToolExecResult {
 	 *  The loop will strip this tool_use + tool_result from the history sent
 	 *  to the model and inject a user-side reminder instead. */
 	broken?: boolean;
+	/** Optional metadata from the tool (e.g. line numbers for Edit). */
+	metadata?: Record<string, unknown>;
 }
 
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
@@ -1127,8 +1192,8 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 				`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
 				`The ${tu.name} was NOT executed to avoid corrupting files. ` +
 				"Each tool call's total input must be under 10,000 characters. " +
-				"Use Write for the first section (end with APPEND marker comment), " +
-				"then Edit with old_string targeting the APPEND marker to continue.",
+				"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
+				"then Edit to fill each marker with real content.",
 			isError: true,
 			durationMs: Date.now() - start,
 			broken: true,
@@ -1144,8 +1209,8 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 				`The ${tu.name} call received no input at all (complete truncation). ` +
 				`The ${tu.name} was NOT executed. ` +
 				"Each tool call's total input must be under 10,000 characters. " +
-				"Use Write for the first section (end with APPEND marker comment), " +
-				"then Edit with old_string targeting the APPEND marker to continue.",
+				"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
+				"then Edit to fill each marker with real content.",
 			isError: true,
 			durationMs: Date.now() - start,
 			broken: true,
@@ -1227,6 +1292,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
+				metadata: result.metadata,
 			};
 		}
 		const truncated = truncateOutput(result.output);
@@ -1235,6 +1301,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			isError: result.isError,
 			fatal: result.fatal,
 			durationMs: Date.now() - start,
+			metadata: result.metadata,
 		};
 	} catch (err) {
 		return {

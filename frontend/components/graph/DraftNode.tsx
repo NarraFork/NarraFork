@@ -30,7 +30,7 @@ export interface DraftNodeData {
 	[key: string]: unknown;
 }
 
-const WIDTH = 280;
+export const DRAFT_NODE_WIDTH = 280;
 const inheritOptions = ["fresh", "compressed", "full"] as const;
 
 function DraftNodeInner({ id, data }: NodeProps) {
@@ -39,7 +39,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 	const { t } = useTranslation("graph");
 	const [title, setTitle] = useState(d.defaultTitle ?? "");
 	const [description, setDescription] = useState("");
-	const [inheritMode, setInheritMode] = useState<string>("fresh");
+	const [inheritMode, setInheritMode] = useState<string>("full");
 	const [loading, setLoading] = useState(false);
 	const inputRef = useRef<HTMLInputElement>(null);
 
@@ -89,20 +89,27 @@ function DraftNodeInner({ id, data }: NodeProps) {
 	return (
 		<>
 			<Handle type="target" position={Position.Top} id="top" style={handleStyle} />
+			<Handle type="source" position={Position.Top} id="top-src" style={handleStyle} />
+			<Handle type="target" position={Position.Bottom} id="bottom" style={handleStyle} />
 			<Handle type="source" position={Position.Bottom} id="bottom-src" style={handleStyle} />
+			<Handle type="target" position={Position.Left} id="left" style={handleStyle} />
+			<Handle type="source" position={Position.Left} id="left-src" style={handleStyle} />
+			<Handle type="target" position={Position.Right} id="right" style={handleStyle} />
+			<Handle type="source" position={Position.Right} id="right-src" style={handleStyle} />
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: need keyboard + stop propagation */}
 			<div
-				className="nodrag nowheel"
+				className="nowheel"
 				onKeyDown={handleKeyDown}
 				style={{
-					width: WIDTH,
-					background: "var(--mantine-color-dark-7)",
-					border: `2px dashed ${borderColor}`,
+					width: DRAFT_NODE_WIDTH,
+				background: "var(--mantine-color-body)",
+				border: `2px dashed ${borderColor}`,
 					borderRadius: 8,
 					padding: 12,
 					display: "flex",
 					flexDirection: "column",
 					gap: 8,
+					cursor: "grab",
 				}}
 			>
 				{/* Mode label */}
@@ -121,6 +128,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 				{/* Title */}
 				<input
 					ref={setInputRef}
+					className="nodrag"
 					type="text"
 					placeholder={isFork ? t("forkDraft.titlePlaceholder") : t("mergeDraft.titlePlaceholder")}
 					value={title}
@@ -129,8 +137,8 @@ function DraftNodeInner({ id, data }: NodeProps) {
 						width: "100%",
 						padding: "6px 8px",
 						borderRadius: 4,
-						border: "1px solid var(--mantine-color-dark-4)",
-						background: "var(--mantine-color-dark-6)",
+					border: "1px solid var(--mantine-color-default-border)",
+					background: "var(--mantine-color-default)",
 						color: "var(--mantine-color-text)",
 						fontSize: 13,
 						outline: "none",
@@ -139,6 +147,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 
 				{/* Description */}
 				<textarea
+					className="nodrag"
 					placeholder={
 						isFork ? t("forkDraft.descriptionPlaceholder") : t("mergeDraft.descriptionPlaceholder")
 					}
@@ -149,8 +158,8 @@ function DraftNodeInner({ id, data }: NodeProps) {
 						width: "100%",
 						padding: "6px 8px",
 						borderRadius: 4,
-						border: "1px solid var(--mantine-color-dark-4)",
-						background: "var(--mantine-color-dark-6)",
+					border: "1px solid var(--mantine-color-default-border)",
+					background: "var(--mantine-color-default)",
 						color: "var(--mantine-color-text)",
 						fontSize: 12,
 						outline: "none",
@@ -161,7 +170,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 
 				{/* Inherit mode pills — fork only */}
 				{isFork && (
-					<div style={{ display: "flex", gap: 4 }}>
+					<div className="nodrag" style={{ display: "flex", gap: 4 }}>
 						<span
 							style={{
 								fontSize: 11,
@@ -184,7 +193,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 									border:
 										inheritMode === opt
 											? `1px solid ${borderColor}`
-											: "1px solid var(--mantine-color-dark-4)",
+											: "1px solid var(--mantine-color-default-border)",
 									background: inheritMode === opt ? accentFilled : "transparent",
 									color: inheritMode === opt ? "white" : "var(--mantine-color-dimmed)",
 									fontSize: 11,
@@ -199,14 +208,14 @@ function DraftNodeInner({ id, data }: NodeProps) {
 				)}
 
 				{/* Actions */}
-				<div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+				<div className="nodrag" style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
 					<button
 						type="button"
 						onClick={handleCancel}
 						style={{
 							padding: "4px 14px",
 							borderRadius: 4,
-							border: "1px solid var(--mantine-color-dark-4)",
+							border: "1px solid var(--mantine-color-default-border)",
 							background: "transparent",
 							color: "var(--mantine-color-dimmed)",
 							fontSize: 12,
@@ -223,7 +232,7 @@ function DraftNodeInner({ id, data }: NodeProps) {
 							padding: "4px 14px",
 							borderRadius: 4,
 							border: "none",
-							background: !title.trim() || loading ? "var(--mantine-color-dark-4)" : accentFilled,
+							background: !title.trim() || loading ? "var(--mantine-color-default-border)" : accentFilled,
 							color: !title.trim() || loading ? "var(--mantine-color-dimmed)" : "white",
 							fontSize: 12,
 							cursor: !title.trim() || loading ? "not-allowed" : "pointer",

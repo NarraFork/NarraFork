@@ -76,6 +76,29 @@ export interface AnthropicProviderConfig {
 	defaultModel: string;
 }
 
+export interface McpServerConfig {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** User-defined display name. */
+	name: string;
+	/** Transport type. */
+	transport: "stdio" | "streamable-http" | "sse";
+	/** stdio: executable command. */
+	command?: string;
+	/** stdio: command arguments. */
+	args?: string[];
+	/** stdio: working directory. */
+	cwd?: string;
+	/** Environment variables passed to the MCP server process or HTTP requests. */
+	env?: Record<string, string>;
+	/** sse/streamable-http: server URL. */
+	url?: string;
+	/** sse/streamable-http: custom request headers. */
+	headers?: Record<string, string>;
+	/** Whether this server is enabled. */
+	enabled: boolean;
+}
+
 export interface NarraForkSettings {
 	server: { port: number };
 	paths: { defaultProjectDir: string };
@@ -170,6 +193,8 @@ export interface NarraForkSettings {
 	openaiProviders?: OpenAIProviderConfig[];
 	/** Anthropic native API providers. */
 	anthropicProviders?: AnthropicProviderConfig[];
+	/** External MCP server configurations. */
+	mcpServers?: McpServerConfig[];
 }
 
 const DEFAULTS: NarraForkSettings = {

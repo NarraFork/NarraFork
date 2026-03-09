@@ -84,19 +84,7 @@ function NarratorDetailPage() {
 		isSubagent,
 	]);
 
-	// Mark narrator as read (done → idle) when visiting the narrator page.
-	// Preserve error sessions: if errorMessage exists, keep it in error state.
 	const qc = useQueryClient();
-	const narratorErrorMessage = narrator?.errorMessage;
-	useEffect(() => {
-		if (isSubagent || narratorErrorMessage) return;
-		api
-			.markNarratorRead(narratorId)
-			.then(() => {
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-			})
-			.catch(() => {});
-	}, [narratorId, qc, isSubagent, narratorErrorMessage]);
 
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(narratorId);
@@ -253,6 +241,7 @@ function NarratorDetailPage() {
 	}, [narratorId, isMobile, closeDrawer, runningCount]);
 
 	// Desktop drag handle for resizing (mouse + touch)
+	const dragCleanupRef = useRef<(() => void) | null>(null);
 	const onDragStart = useCallback((e: React.MouseEvent | React.TouchEvent) => {
 		e.preventDefault();
 		dragging.current = true;
@@ -277,6 +266,7 @@ function NarratorDetailPage() {
 			document.removeEventListener("touchend", onEnd);
 			document.body.style.cursor = "";
 			document.body.style.userSelect = "";
+			dragCleanupRef.current = null;
 		};
 
 		document.body.style.cursor = "col-resize";
@@ -285,6 +275,14 @@ function NarratorDetailPage() {
 		document.addEventListener("mouseup", onEnd);
 		document.addEventListener("touchmove", onMove, { passive: false });
 		document.addEventListener("touchend", onEnd);
+		dragCleanupRef.current = onEnd;
+	}, []);
+
+	// Cleanup drag listeners on unmount (in case user navigates mid-drag)
+	useEffect(() => {
+		return () => {
+			dragCleanupRef.current?.();
+		};
 	}, []);
 
 	// Mobile layout

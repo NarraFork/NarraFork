@@ -111,6 +111,23 @@ describe("Read", () => {
 		expect(result.output).not.toContain("truncated");
 	});
 
+	test("force_full caps output at ~100k chars", async () => {
+		const target = join(TEST_DIR, "read-force-full-large.txt");
+		// Create a file well over 100k chars (200k+ with line numbers)
+		const lines = Array.from({ length: 15000 }, (_, i) => `line ${i}: ${"x".repeat(20)}`);
+		writeFileSync(target, lines.join("\n"));
+
+		const result = await readTool.execute(
+			{ file_path: "read-force-full-large.txt", force_full: true },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.truncated).toBe(true);
+		expect(result.output.length).toBeLessThanOrEqual(110_000); // some slack for the suffix
+		expect(result.output).toContain("output capped at");
+		expect(result.output).toContain("Use offset/limit to read the rest");
+	});
+
 	test("returns error when mixing force_full with line paging", async () => {
 		const result = await readTool.execute(
 			{ file_path: "sample.txt", offset: 1, force_full: true },
@@ -263,15 +280,16 @@ describe("Edit", () => {
 describe("Edit replace() — fuzzy matching", () => {
 	test("exact match (SimpleReplacer)", () => {
 		const result = replace("foo bar baz", "bar", "qux");
-		expect(result).toBe("foo qux baz");
+		expect(result.content).toBe("foo qux baz");
+		expect(result.startLine).toBe(1);
 	});
 
 	test("line-trimmed match (LineTrimmedReplacer)", () => {
 		// File has 4-space indent, search has 2-space indent
 		const content = "function test() {\n    const x = 1;\n    return x;\n}";
 		const result = replace(content, "  const x = 1;\n  return x;", "  const y = 2;\n  return y;");
-		expect(result).toContain("const y = 2");
-		expect(result).toContain("return y");
+		expect(result.content).toContain("const y = 2");
+		expect(result.content).toContain("return y");
 	});
 
 	test("block-anchor match (BlockAnchorReplacer)", () => {
@@ -294,13 +312,13 @@ describe("Edit replace() — fuzzy matching", () => {
 		].join("\n");
 		const newStr = "function hello() { return 6; }";
 		const result = replace(content, oldStr, newStr);
-		expect(result).toBe("function hello() { return 6; }");
+		expect(result.content).toBe("function hello() { return 6; }");
 	});
 
 	test("whitespace-normalized match (WhitespaceNormalizedReplacer)", () => {
 		const content = "const   x   =   1;";
 		const result = replace(content, "const x = 1;", "const x = 2;");
-		expect(result).toBe("const x = 2;");
+		expect(result.content).toBe("const x = 2;");
 	});
 
 	test("indentation-flexible match (IndentationFlexibleReplacer)", () => {
@@ -311,20 +329,20 @@ describe("Edit replace() — fuzzy matching", () => {
 			"if (true) {\n    doSomething();\n}",
 			"if (false) {\n    doNothing();\n}",
 		);
-		expect(result).toContain("doNothing");
+		expect(result.content).toContain("doNothing");
 	});
 
 	test("escape-normalized match (EscapeNormalizedReplacer)", () => {
 		const content = 'console.log("hello\\nworld");';
 		// Search with literal escape sequences
 		const result = replace(content, 'console.log("hello\\nworld");', 'console.log("goodbye");');
-		expect(result).toBe('console.log("goodbye");');
+		expect(result.content).toBe('console.log("goodbye");');
 	});
 
 	test("trimmed-boundary match (TrimmedBoundaryReplacer)", () => {
 		const content = "hello world";
 		const result = replace(content, "  hello world  ", "goodbye");
-		expect(result).toBe("goodbye");
+		expect(result.content).toBe("goodbye");
 	});
 
 	test("context-aware match (ContextAwareReplacer)", () => {
@@ -346,17 +364,17 @@ describe("Edit replace() — fuzzy matching", () => {
 			"}",
 		].join("\n");
 		const result = replace(content, oldStr, "class Foo {}");
-		expect(result).toBe("class Foo {}");
+		expect(result.content).toBe("class Foo {}");
 	});
 
 	test("multi-occurrence with replace_all (MultiOccurrenceReplacer)", () => {
 		const result = replace("aaa bbb aaa ccc aaa", "aaa", "xxx", true);
-		expect(result).toBe("xxx bbb xxx ccc xxx");
+		expect(result.content).toBe("xxx bbb xxx ccc xxx");
 	});
 
 	test("replace_all with exact match", () => {
 		const result = replace("aaa bbb aaa", "aaa", "xxx", true);
-		expect(result).toBe("xxx bbb xxx");
+		expect(result.content).toBe("xxx bbb xxx");
 	});
 
 	test("throws on not found", () => {

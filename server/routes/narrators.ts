@@ -450,7 +450,15 @@ narratorRoutes.get("/:id/messages", async (c) => {
 	const id = c.req.param("id");
 	const around = c.req.query("around") || undefined;
 	if (around) {
-		const result = await narratorService.getMessagesAround(id, around);
+		const parseWindowSize = (raw: string | undefined, fallback: number) => {
+			const parsed = Number.parseInt(raw ?? "", 10);
+			if (Number.isNaN(parsed)) return fallback;
+			return Math.min(Math.max(parsed, 0), 100);
+		};
+		const result = await narratorService.getMessagesAround(id, around, {
+			before: parseWindowSize(c.req.query("before"), 5),
+			after: parseWindowSize(c.req.query("after"), 20),
+		});
 		return c.json(result);
 	}
 	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
@@ -542,6 +550,7 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 	await narratorService.getById(narratorId);
 	const msg = await narratorService.clearContext(narratorId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
+	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	return c.json({ ok: true });
 });
 

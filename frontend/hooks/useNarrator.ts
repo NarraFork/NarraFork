@@ -1,5 +1,10 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type PaginatedNarrators, type WhitelistDir } from "../lib/api";
+import {
+	api,
+	type MessagesAroundOptions,
+	type PaginatedNarrators,
+	type WhitelistDir,
+} from "../lib/api";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
 export function useNarrators(opts?: {
@@ -60,6 +65,41 @@ export function useForkNarrator() {
 	});
 }
 
+export const DEFAULT_MESSAGES_AROUND_BEFORE = 5;
+export const DEFAULT_MESSAGES_AROUND_AFTER = 20;
+
+export interface NarratorMessagesAroundOptions extends MessagesAroundOptions {}
+
+function normalizeAroundOptions(
+	around?: NarratorMessagesAroundOptions,
+): NarratorMessagesAroundOptions | undefined {
+	if (!around?.messageId) return undefined;
+	return {
+		messageId: around.messageId,
+		before: around.before ?? DEFAULT_MESSAGES_AROUND_BEFORE,
+		after: around.after ?? DEFAULT_MESSAGES_AROUND_AFTER,
+	};
+}
+
+export function getNarratorMessagesQueryKey(
+	narratorId: string,
+	around?: NarratorMessagesAroundOptions,
+) {
+	const normalizedAround = normalizeAroundOptions(around);
+	return [
+		"narrators",
+		narratorId,
+		"messages",
+		normalizedAround
+			? {
+					around: normalizedAround.messageId,
+					before: normalizedAround.before,
+					after: normalizedAround.after,
+				}
+			: { around: undefined },
+	] as const;
+}
+
 export function useNarrator(id: string) {
 	return useQuery({
 		queryKey: ["narrators", id],
@@ -68,15 +108,20 @@ export function useNarrator(id: string) {
 	});
 }
 
-export function useNarratorMessages(narratorId: string, around?: string) {
+export function useNarratorMessages(narratorId: string, around?: NarratorMessagesAroundOptions) {
+	const normalizedAround = normalizeAroundOptions(around);
 	return useInfiniteQuery({
-		queryKey: ["narrators", narratorId, "messages", { around }],
+		queryKey: getNarratorMessagesQueryKey(narratorId, normalizedAround),
 		queryFn: ({ pageParam }) => {
-			// First page: use `around` if provided, otherwise fetch latest 20
-			if (!pageParam && around) {
-				return api.getNarratorMessages(narratorId, undefined, undefined, around);
+			// First page: use the bounded around-window when deep-linking to a message,
+			// otherwise fetch the latest page.
+			if (!pageParam && normalizedAround) {
+				return api.getNarratorMessages(narratorId, { around: normalizedAround });
 			}
-			return api.getNarratorMessages(narratorId, pageParam ? 50 : 20, pageParam);
+			return api.getNarratorMessages(narratorId, {
+				limit: pageParam ? 50 : 20,
+				cursor: pageParam,
+			});
 		},
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),

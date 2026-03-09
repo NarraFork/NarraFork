@@ -22,6 +22,21 @@ import {
 import { narratorService } from "./narrator-service";
 import { buildContextManagementHooks, handlePermission, pruneToolCalls } from "./narrator-session";
 
+// === In-memory state (declared at module scope for consistent initialization order) ===
+
+/** In-memory map of background task AbortControllers for cancellation support. */
+const backgroundTaskAbortControllers = new Map<string, AbortController>();
+
+/** In-memory map of foreground subagent AbortControllers for interrupt support. */
+const foregroundSubagentAbortControllers = new Map<string, AbortController>();
+
+/**
+ * Buffered user messages for running subagents.
+ * When a user sends a message from the subagent page, it is stored here
+ * and injected into the agent loop via getInjectedUserText on the next turn.
+ */
+const subagentBufferedMessages = new Map<string, { text: string; bufferedAt: string }>();
+
 // === Subagent type definitions ===
 
 /** Tools available to explore/plan subagents (read-only + Shell/Bash for shell inspection) */
@@ -496,19 +511,6 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 }
 
 // === Background task management ===
-
-/** In-memory map of background task AbortControllers for cancellation support. */
-const backgroundTaskAbortControllers = new Map<string, AbortController>();
-
-/** In-memory map of foreground subagent AbortControllers for interrupt support. */
-const foregroundSubagentAbortControllers = new Map<string, AbortController>();
-
-/**
- * Buffered user messages for running subagents.
- * When a user sends a message from the subagent page, it is stored here
- * and injected into the agent loop via getInjectedUserText on the next turn.
- */
-const subagentBufferedMessages = new Map<string, { text: string; bufferedAt: string }>();
 
 /**
  * Buffer a user message for a running foreground subagent.

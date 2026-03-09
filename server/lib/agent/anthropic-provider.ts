@@ -5,7 +5,7 @@ import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { zodToJsonSchema } from "./tool-registry";
-import type { AgentToolUse, ResolvedToolDefinition } from "./types";
+import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
 // === Claude Code protocol constants ===
 
@@ -429,7 +429,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`Anthropic API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
 		}
 
 		if (!response.body) {
@@ -542,7 +542,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`Anthropic API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
 		}
 
 		const json = (await response.json()) as {
@@ -597,7 +597,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`Anthropic API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
 		}
 
 		const json = (await response.json()) as {
@@ -887,6 +887,20 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const parts: AnthropicContentPart[] = [];
+
+			// Web search blocks — inject as user context before the assistant message
+			const webSearchBlocks = content.filter(
+				(b: { type: string }) => b.type === "web_search",
+			) as Array<{ type: "web_search"; query?: string; queries?: string[] }>;
+			if (webSearchBlocks.length > 0) {
+				const searchSummary = webSearchBlocks
+					.map((ws) => {
+						const q = ws.query || ws.queries?.join(", ") || "unknown";
+						return `[Web search: ${q}]`;
+					})
+					.join("\n");
+				history.push({ role: "user", content: searchSummary });
+			}
 
 			// Text blocks
 			const textParts = content

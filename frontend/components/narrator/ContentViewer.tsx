@@ -1,5 +1,5 @@
 import { ActionIcon, Box, Code, CopyButton, Group, Menu, Modal, Tooltip } from "@mantine/core";
-import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import { useDisclosure } from "@mantine/hooks";
 import {
 	IconArrowsMaximize,
 	IconArrowsMinimize,
@@ -14,24 +14,58 @@ import {
 } from "@tabler/icons-react";
 import {
 	type CSSProperties,
+	createContext,
 	forwardRef,
 	memo,
 	type ReactNode,
 	useCallback,
+	useContext,
 	useEffect,
 	useImperativeHandle,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
-import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { DiffView } from "./DiffView";
 import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 
 export type CodeContentType = "markdown" | "code" | "diff";
+
+interface ContentViewerEnvironment {
+	isMobile: boolean;
+	defaultWraps: Record<CodeContentType, boolean>;
+}
+
+const DEFAULT_CONTENT_VIEWER_ENV: ContentViewerEnvironment = {
+	isMobile: false,
+	defaultWraps: {
+		markdown: true,
+		code: true,
+		diff: true,
+	},
+};
+
+const ContentViewerEnvironmentContext = createContext<ContentViewerEnvironment>(
+	DEFAULT_CONTENT_VIEWER_ENV,
+);
+
+export function ContentViewerEnvironmentProvider({
+	value,
+	children,
+}: {
+	value: ContentViewerEnvironment;
+	children: ReactNode;
+}) {
+	return (
+		<ContentViewerEnvironmentContext.Provider value={value}>
+			{children}
+		</ContentViewerEnvironmentContext.Provider>
+	);
+}
 
 interface ContentViewerProps {
 	/** Text content to display and copy */
@@ -140,13 +174,8 @@ export const ContentViewer = memo(
 		const { t } = useTranslation("common");
 		const { t: tNarrator } = useTranslation("narrator");
 		const msgCtx = useMessageContextMenu();
-		const { data: userPrefs } = useUserPreferences();
-		const defaultWrap =
-			contentType === "markdown"
-				? (userPrefs?.wordWrapMarkdown ?? true)
-				: contentType === "diff"
-					? (userPrefs?.wordWrapDiff ?? true)
-					: (userPrefs?.wordWrapCode ?? true);
+		const contentViewerEnv = useContext(ContentViewerEnvironmentContext);
+		const defaultWrap = contentViewerEnv.defaultWraps[contentType] ?? true;
 		const [fullscreen, { open, close }] = useDisclosure(false);
 		const [hovered, setHovered] = useState(false);
 		const [wordWrap, setWordWrap] = useState(defaultWrap);
@@ -156,17 +185,21 @@ export const ContentViewer = memo(
 		const actionBarRef = useRef<HTMLDivElement>(null);
 		const modalBodyRef = useRef<HTMLDivElement>(null);
 		const instanceId = useRef(nextInstanceId++);
+		const isMobile = contentViewerEnv.isMobile;
 
-		const handle: ContentViewerHandle = {
-			openFullscreen: () => open(),
-			toggleWrap: () => {
-				userToggled.current = true;
-				setWordWrap((v) => !v);
-			},
-			getContent: () => fullContent ?? content,
-		};
+		const handle = useMemo<ContentViewerHandle>(
+			() => ({
+				openFullscreen: () => open(),
+				toggleWrap: () => {
+					userToggled.current = true;
+					setWordWrap((v) => !v);
+				},
+				getContent: () => fullContent ?? content,
+			}),
+			[content, fullContent, open],
+		);
 
-		useImperativeHandle(ref, () => handle);
+		useImperativeHandle(ref, () => handle, [handle]);
 
 		// Register in global registry so parents can resolve via DOM lookup
 		useEffect(() => {
@@ -175,7 +208,7 @@ export const ContentViewer = memo(
 			return () => {
 				handleRegistry.delete(id);
 			};
-		});
+		}, [handle]);
 
 		// Sync with user preferences once they load (unless user already toggled manually)
 		useEffect(() => {
@@ -183,7 +216,6 @@ export const ContentViewer = memo(
 				setWordWrap(defaultWrap);
 			}
 		}, [defaultWrap]);
-		const isMobile = useMediaQuery("(max-width: 768px)");
 
 		// Browser-native landscape: request fullscreen + lock orientation
 		const toggleLandscape = useCallback(async () => {

@@ -31,10 +31,11 @@
 	"selection": {
 		"fork": "Fork",
 		"merge": "Merge",
-		"mergeInto": "Merge into existing",
+		"mergeInto": "Merge into",
 		"mergeNewTitle": "Merged: {{titles}}",
 		"mergeSuccess": "Merge completed",
-		"mergeFailed": "Merge failed: {{message}}"
+		"mergeFailed": "Merge failed: {{message}}",
+		"newTerminal": "New Terminal"
 	},
 	"forkDraft": {
 		"titlePlaceholder": "New branch title",
@@ -51,6 +52,14 @@
 		"titlePlaceholder": "Merge commit title",
 		"descriptionPlaceholder": "Merge description...",
 		"failed": "Merge failed: {{message}}"
+	},
+	"terminal": {
+		"minimize": "Minimize terminal",
+		"close": "Close terminal",
+		"closeConfirmTitle": "Close Terminal",
+		"closeConfirmMessage": "This terminal has running processes. Are you sure you want to close it?",
+		"cancel": "Cancel",
+		"confirmClose": "Close"
 	},
 	"sidePanel": {
 		"upstreamUpdates": "Upstream updates",

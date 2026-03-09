@@ -9,7 +9,12 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { DEV_NULL, getHome, IS_WINDOWS } from "../lib/platform";
 import { BufferManager } from "../terminal/buffer-manager";
-import { dtachService, findProcessesByArg, getDescendantPids } from "../terminal/dtach-service";
+import {
+	dtachService,
+	findProcessesByArg,
+	getDescendantPids,
+	ProcessSnapshot,
+} from "../terminal/dtach-service";
 import type { TerminalRuntime, TerminalSpawnOptions } from "../terminal/runtime";
 import { spawnBunTerminal } from "../terminal/runtime-bun";
 import { spawnPortablePty } from "../terminal/runtime-pty";
@@ -312,6 +317,26 @@ export const terminalService = {
 		});
 		if (!terminal) throw new NotFoundError("Terminal", terminalId);
 		await db.update(terminals).set({ name }).where(eq(terminals.id, terminalId));
+	},
+
+	async updateGraphState(
+		terminalId: string,
+		state: {
+			graphOpened?: boolean;
+			graphX?: number;
+			graphY?: number;
+			graphWidth?: number;
+			graphHeight?: number;
+		},
+	) {
+		const updates: Record<string, unknown> = {};
+		if (state.graphOpened !== undefined) updates.graphOpened = state.graphOpened ? 1 : 0;
+		if (state.graphX !== undefined) updates.graphX = state.graphX;
+		if (state.graphY !== undefined) updates.graphY = state.graphY;
+		if (state.graphWidth !== undefined) updates.graphWidth = state.graphWidth;
+		if (state.graphHeight !== undefined) updates.graphHeight = state.graphHeight;
+		if (Object.keys(updates).length === 0) return;
+		await db.update(terminals).set(updates).where(eq(terminals.id, terminalId));
 	},
 
 	async getById(id: string) {
@@ -653,5 +678,58 @@ export const terminalService = {
 		return allPids
 			.map((pid) => getProcessInfoByPid(pid))
 			.filter((info): info is TerminalProcessInfo => info !== null);
+	},
+
+	/**
+	 * Batch-get process info for multiple terminals using a single ps snapshot.
+	 * Returns a Map from terminalId to its process list.
+	 */
+	getProcessesBatch(terminalIds: string[]): Map<string, TerminalProcessInfo[]> {
+		const result = new Map<string, TerminalProcessInfo[]>();
+		if (terminalIds.length === 0) return result;
+
+		const snapshot = new ProcessSnapshot();
+
+		for (const terminalId of terminalIds) {
+			const shellPid = this._getShellPidWithSnapshot(terminalId, snapshot);
+			if (!shellPid) {
+				result.set(terminalId, []);
+				continue;
+			}
+			const allPids = [shellPid, ...snapshot.getDescendants(shellPid)];
+			const processes = allPids
+				.map((pid) => snapshot.getInfo(pid))
+				.filter((info): info is TerminalProcessInfo => info !== null);
+			result.set(terminalId, processes);
+		}
+		return result;
+	},
+
+	/**
+	 * getShellPid variant that uses a pre-built ProcessSnapshot instead of execSync.
+	 */
+	_getShellPidWithSnapshot(terminalId: string, snapshot: ProcessSnapshot): number | null {
+		const active = activeTerminals.get(terminalId);
+		if (active) {
+			if (active.useDtach) {
+				const socketPath = dtachService.getSocketPath(terminalId);
+				const dtachPids = findProcessesByArg(socketPath);
+				for (const pid of dtachPids) {
+					const children = snapshot.getChildren(pid);
+					if (children.length > 0) return children[0];
+				}
+				return null;
+			}
+			return active.runtime.pid ?? null;
+		}
+		if (dtachService.isAvailable() && dtachService.isSocketAlive(terminalId)) {
+			const socketPath = dtachService.getSocketPath(terminalId);
+			const dtachPids = findProcessesByArg(socketPath);
+			for (const pid of dtachPids) {
+				const children = snapshot.getChildren(pid);
+				if (children.length > 0) return children[0];
+			}
+		}
+		return null;
 	},
 };

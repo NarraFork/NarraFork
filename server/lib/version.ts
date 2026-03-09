@@ -7,7 +7,6 @@ let commitHash = "";
 
 // Try reading from generated build info (compiled binary)
 try {
-	// @ts-expect-error — build-info.ts only exists after build:cross
 	const { buildVersion, buildCommit } = await import("@server/generated/build-info");
 	version = buildVersion;
 	commitHash = buildCommit;

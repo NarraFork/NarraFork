@@ -7,7 +7,7 @@ NarraFork 是一个以"叙事分叉"为核心隐喻的 AI 编程协作平台。�
 ### 1.1 核心理念
 
 - **Chapter（章节）**：工作的基本单元，对应一个 git worktree + 一个或多个 AI 会话
-- **Narrator（叙述者）**：绑定到 Chapter 的 Claude Code 会话，拥有完整的上下文记忆
+- **Narrator（叙述者）**：绑定到 Chapter 的 AI 会话，拥有完整的上下文记忆
 - **Story Network（故事网络）**：所有 Chapter 的分叉/合并关系构成的有向图
 
 ### 1.2 与 Fulcrum 的关系
@@ -16,7 +16,6 @@ NarraFork 借鉴 Fulcrum 的以下架构模式：
 - Bun + Hono 后端框架
 - SQLite + Drizzle ORM 数据层
 - Git worktree 隔离工作区
-- Claude Agent SDK 集成
 - WebSocket 实时通信
 
 差异点：
@@ -40,7 +39,6 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 | Hono | HTTP 框架 | >= 4.x |
 | SQLite | 数据库 | 内置于 Bun |
 | Drizzle ORM | 数据库抽象 | >= 0.38 |
-| @anthropic-ai/claude-agent-sdk | Claude Code 会话管理 | >= 0.2.39 |
 | @modelcontextprotocol/sdk | MCP 工具暴露 | >= 1.x |
 | nanoid | ID 生成 | >= 5.x |
 
@@ -59,7 +57,6 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 ### 2.3 工具链
 | 技术 | 用途 |
 |------|------|
-| mise | 任务运行器 |
 | drizzle-kit | 数据库迁移 |
 | Vite | 前端构建 |
 | Biome | Lint + Format |
@@ -69,8 +66,7 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 |------|------|------|
 | git | 版本控制、worktree | 是 |
 | podman | 容器环境 | 否（可选功能） |
-| dtach | 终端持久化 | 是 |
-| claude-code CLI | AI agent | 是 |
+| dtach | 终端持久化 | 否（可选功能） |
 
 ---
 
@@ -88,16 +84,17 @@ chapters ──N:1──> exploration_groups (explorationGroupId, nullable)
 chapters ──1:N──> container_instances
 chapters ──1:N──> port_allocations
 chapters ──1:N──> terminals
+chapters ──1:N──> chapter_commits
 chapter_edges ──N:1──> chapters (sourceId)
 chapter_edges ──N:1──> chapters (targetId)
 exploration_groups ──N:1──> chapters (baseChapterId)
 exploration_groups ──N:1──> chapters (decidedChapterId, nullable)
-narrators ──1:N──> narrator_messages
+narrators ──1:N──> narrator_message_refs
 narrators ──1:N──> narrator_tool_calls
-narrators ──1:N──> conversation_branches
-narrators ──ref──> conversation_branches (activeBranchId)
-conversation_branches ──1:N──> branch_messages
-narrator_messages ──1:N──> branch_messages
+narrators ──1:N──> narrator_whitelist_dirs
+narrators ──1:N──> narrator_patches
+narrator_messages ──1:N──> narrator_message_refs
+narrator_messages ──1:N──> narrator_tool_calls
 users ──1:1── user_preferences
 users ──1:N── user_favorite_directories
 ```
@@ -119,15 +116,13 @@ export const projects = sqliteTable('projects', {
   status: text('status', {
     enum: ['active', 'archived']
   }).notNull().default('active'),
-  defaultAgent: text('default_agent', {
-    enum: ['claude', 'opencode']
-  }).default('claude'),
-  settings: text('settings', { mode: 'json' }),   // 项目级配置 JSON
   gitPath: text('git_path'),                       // 本地绝对路径（一个项目一个仓库）
   remoteUrl: text('remote_url'),                   // git remote URL
   defaultBranch: text('default_branch').default('main'),
   startupScript: text('startup_script'),           // chapter 创建后执行的脚本
   copyFiles: text('copy_files'),                   // JSON 数组，如 ["*.env", ".vscode/"]
+  proxyDomain: text('proxy_domain'),               // 代理域名
+  chapterSettings: text('chapter_settings', { mode: 'json' }),  // 章节级默认配置 JSON
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -157,6 +152,10 @@ export const chapters = sqliteTable('chapters', {
   branch: text('branch').notNull(),                  // git branch 名
   worktreePath: text('worktree_path'),               // 章节根目录，dormant/frozen 时为 null
   baseBranch: text('base_branch').notNull(),          // 基于哪个 branch 创建
+  isRoot: integer('is_root').default(0),              // 是否为根章节
+  headCommitSha: text('head_commit_sha'),            // 当前 HEAD commit SHA
+  startCommitSha: text('start_commit_sha'),          // 起始 commit SHA
+  commitCount: integer('commit_count').default(0),   // commit 数量
 
   // 分叉关系（冗余快捷字段，同时在 chapter_edges 中维护）
   parentChapterId: text('parent_chapter_id')
@@ -184,6 +183,9 @@ export const chapters = sqliteTable('chapters', {
   pinned: integer('pinned').default(0),              // 是否在图上固定位置
   positionX: real('position_x'),                     // 图上手动定位 X（null = 自动布局）
   positionY: real('position_y'),                     // 图上手动定位 Y
+  panelExpanded: integer('panel_expanded').default(0),  // 侧边面板是否展开
+  panelWidth: real('panel_width'),                   // 侧边面板宽度
+  panelHeight: real('panel_height'),                 // 侧边面板高度
 
   // 元数据
   lastAccessedAt: text('last_accessed_at'),
@@ -279,12 +281,13 @@ export const narrators = sqliteTable('narrators', {
   chapterId: text('chapter_id')              // null = 游离会话（standalone session）
     .references(() => chapters.id),
 
-  // API 会话标识
-  apiConversationId: text('api_conversation_id'),      // API 返回的 conversation_id，用于关联会话
-  activeBranchId: text('active_branch_id'),        // 当前活跃的对话分支 ID
+  // 类型：primary（主叙述者）或 subagent（子代理）
   type: text('type', {
-    enum: ['primary', 'secondary']
+    enum: ['primary', 'subagent']
   }).notNull().default('primary'),
+  subagentType: text('subagent_type', {      // 子代理类型
+    enum: ['explore', 'plan', 'general']
+  }),
 
   // 上下文继承配置
   inheritMode: text('inherit_mode', {
@@ -292,6 +295,7 @@ export const narrators = sqliteTable('narrators', {
   }).notNull().default('fresh'),
   parentNarratorId: text('parent_narrator_id')
     .references(() => narrators.id),
+  forkMessageId: text('fork_message_id'),    // fork 起点消息 ID
   contextSummary: text('context_summary'),         // compressed 模式或 compact 摘要
 
   // 会话标题（自动生成或手动设置）
@@ -301,8 +305,15 @@ export const narrators = sqliteTable('narrators', {
   model: text('model').default('claude-sonnet'),
   systemPrompt: text('system_prompt'),             // 额外的 system prompt
   permissionMode: text('permission_mode', {
-    enum: ['default', 'acceptEdits', 'bypassPermissions', 'dontAsk']
+    enum: ['default', 'acceptEdits', 'bypassPermissions', 'readOnly', 'plan', 'dontAsk']
   }).default('default'),
+  previousPermissionMode: text('previous_permission_mode'),  // 切换前的权限模式
+  reasoningEffort: text('reasoning_effort', {      // 推理努力级别
+    enum: ['low', 'medium', 'high', 'xhigh']
+  }),
+  fastMode: integer('fast_mode', { mode: 'boolean' }).notNull().default(false),
+  relaxedPlan: integer('relaxed_plan', { mode: 'boolean' }).notNull().default(false),
+  planMode: integer('plan_mode', { mode: 'boolean' }).notNull().default(false),
 
   // 工作目录（游离会话使用，chapter 会话从 worktree 获取）
   cwd: text('cwd'),
@@ -323,6 +334,19 @@ export const narrators = sqliteTable('narrators', {
   sdkPlanMode: integer('sdk_plan_mode', { mode: 'boolean' }).notNull().default(false),
   errorMessage: text('error_message'),
 
+  // 上下文修剪
+  pruneBoundaryMessageId: text('prune_boundary_message_id'),
+  prunedPercent: integer('pruned_percent'),
+  pruneEnabled: integer('prune_enabled', { mode: 'boolean' }).notNull().default(true),
+
+  // 后台任务
+  isBackground: integer('is_background', { mode: 'boolean' }).notNull().default(false),
+  backgroundStatus: text('background_status', {
+    enum: ['running', 'completed', 'failed', 'cancelled']
+  }),
+  backgroundResult: text('background_result'),
+  backgroundCompletedAt: text('background_completed_at'),
+
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -335,7 +359,7 @@ export const narratorMessages = sqliteTable('narrator_messages', {
   id: text('id').primaryKey(),
   narratorId: text('narrator_id').notNull()
     .references(() => narrators.id),
-  // SDK 消息 UUID，用于 resumeSessionAt 回溯分叉
+  // SDK 消息 UUID，用于回溯分叉
   messageUuid: text('sdk_message_uuid'),
   role: text('role', {
     enum: ['user', 'assistant', 'system']
@@ -350,6 +374,13 @@ export const narratorMessages = sqliteTable('narrator_messages', {
 
   // 子 agent 消息关联：指向父 tool_use_id，用于懒加载子 agent 消息树
   parentToolUseId: text('parent_tool_use_id'),
+
+  // Git commit 关联
+  commitSha: text('commit_sha'),
+  commandText: text('command_text'),
+
+  // 创建者
+  createdBy: text('created_by').references(() => users.id),
 
   // Token 统计与用量
   tokensIn: integer('tokens_in'),
@@ -393,6 +424,9 @@ export const narratorToolCalls = sqliteTable('narrator_tool_calls', {
   permissionDecisionReason: text('permission_decision_reason'),
   permissionSuggestions: text('permission_suggestions', { mode: 'json' }),  // PermissionUpdate[]
 
+  // 后台任务标记
+  isBackground: integer('is_background', { mode: 'boolean' }).notNull().default(false),
+
   createdAt: text('created_at').notNull(),
 }, (table) => [
   index('idx_toolcalls_message').on(table.messageId),
@@ -400,50 +434,24 @@ export const narratorToolCalls = sqliteTable('narrator_tool_calls', {
 ])
 ```
 
-#### conversation_branches — 对话分支
+#### narrator_message_refs — 叙述者-消息关联表（替代 conversation_branches + branch_messages）
 
-每个叙述者创建时自动生成一个 root 分支（name="main"）。用户可从任意消息 fork 新分支，fork 时复制父分支中 fork 点及之前的消息引用（共享前缀）。
+消息与叙述者的多对多关系。同一条消息可属于多个叙述者（fork 时共享前缀）。`seq` 字段维护叙述者内的消息顺序，`isCompact` 标记压缩点位置。
 
 ```typescript
-export const conversationBranches = sqliteTable('conversation_branches', {
+export const narratorMessageRefs = sqliteTable('narrator_message_refs', {
   id: text('id').primaryKey(),
   narratorId: text('narrator_id').notNull()
     .references(() => narrators.id),
-  name: text('name').notNull(),                     // 分支名称，如 "main"、"Branch 2"
-  forkMessageId: text('fork_message_id'),           // fork 起点消息 ID（root 分支为 null）
-  parentBranchId: text('parent_branch_id')          // 父分支 ID（root 分支为 null）
-    .references(() => conversationBranches.id),
-  apiConversationId: text('api_conversation_id'),       // 分支独立的 API conversation ID
-  contextSummary: text('context_summary'),          // 分支级别的上下文摘要
-  status: text('status', {
-    enum: ['active', 'archived']
-  }).notNull().default('active'),
-  messageCount: integer('message_count').default(0),
-  createdAt: text('created_at').notNull(),
-  updatedAt: text('updated_at').notNull(),
-}, (table) => [
-  index('idx_branches_narrator').on(table.narratorId),
-  index('idx_branches_parent').on(table.parentBranchId),
-])
-```
-
-#### branch_messages — 分支-消息关联表（junction table）
-
-消息与分支的多对多关系。同一条消息可属于多个分支（fork 时共享前缀）。`seq` 字段维护分支内的消息顺序，`isCompact` 标记压缩点位置。
-
-```typescript
-export const branchMessages = sqliteTable('branch_messages', {
-  id: text('id').primaryKey(),
-  branchId: text('branch_id').notNull()
-    .references(() => conversationBranches.id),
   messageId: text('message_id').notNull()
     .references(() => narratorMessages.id),
-  seq: integer('seq').notNull(),                    // 分支内排序序号
-  isCompact: integer('is_compact').notNull().default(0),  // 1 = compact 标记点
+  seq: integer('seq').notNull(),
+  isCompact: integer('is_compact').notNull().default(0),
+  prunedPercent: integer('pruned_percent'),
 }, (table) => [
-  uniqueIndex('idx_branch_messages_unique').on(table.branchId, table.messageId),
-  index('idx_branch_messages_seq').on(table.branchId, table.seq),
-  index('idx_branch_messages_message').on(table.messageId),
+  uniqueIndex('idx_narrator_message_refs_unique').on(table.narratorId, table.messageId),
+  index('idx_narrator_message_refs_seq').on(table.narratorId, table.seq),
+  index('idx_narrator_message_refs_message').on(table.messageId),
 ])
 ```
 
@@ -454,6 +462,8 @@ export const terminals = sqliteTable('terminals', {
   id: text('id').primaryKey(),
   chapterId: text('chapter_id')
     .references(() => chapters.id),
+  narratorId: text('narrator_id')
+    .references(() => narrators.id),
   name: text('name').notNull(),
   cwd: text('cwd'),
   dtachSocket: text('dtach_socket'),               // dtach socket 路径
@@ -480,6 +490,8 @@ export const containerInstances = sqliteTable('container_instances', {
   hostPort: integer('host_port'),
   containerPort: integer('container_port'),
   volumeName: text('volume_name'),
+  proxyLabel: text('proxy_label'),                 // 代理标签
+  containerIp: text('container_ip'),               // 容器 IP 地址
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -507,6 +519,8 @@ export const users = sqliteTable('users', {
   role: text('role', {
     enum: ['admin', 'user']
   }).notNull().default('user'),
+  avatarColor: text('avatar_color'),               // 头像颜色
+  avatarImageId: text('avatar_image_id'),           // 头像图片 ID
   createdAt: text('created_at').notNull(),
 })
 ```
@@ -522,6 +536,26 @@ export const userPreferences = sqliteTable('user_preferences', {
   wordWrapMarkdown: integer('word_wrap_markdown', { mode: 'boolean' }).notNull().default(true),
   wordWrapCode: integer('word_wrap_code', { mode: 'boolean' }).notNull().default(true),
   wordWrapDiff: integer('word_wrap_diff', { mode: 'boolean' }).notNull().default(true),
+  replyInUserLanguage: integer('reply_in_user_language', { mode: 'boolean' }).notNull().default(true),
+  showTokenUsage: integer('show_token_usage', { mode: 'boolean' }).notNull().default(true),
+  showOutputStats: integer('show_output_stats', { mode: 'boolean' }).notNull().default(false),
+  terminalTheme: text('terminal_theme').default('dark'),
+  terminalFontSize: integer('terminal_font_size').default(14),
+  recentTabs: text('recent_tabs', { mode: 'json' }),  // 最近访问的标签页
+  notifyOnDone: integer('notify_on_done', { mode: 'boolean' }).notNull().default(true),
+  notifyOnWaiting: integer('notify_on_waiting', { mode: 'boolean' }).notNull().default(true),
+  notifyPwaEnabled: integer('notify_pwa_enabled', { mode: 'boolean' }).notNull().default(false),
+  notifySoundEnabled: integer('notify_sound_enabled', { mode: 'boolean' }).notNull().default(true),
+  notifySoundType: text('notify_sound_type').default('builtin'),
+  notifySoundBuiltin: text('notify_sound_builtin').default('default'),
+  notifySoundFileId: text('notify_sound_file_id'),
+  notifyDingtalkEnabled: integer('notify_dingtalk_enabled', { mode: 'boolean' }).notNull().default(false),
+  notifyDingtalkWebhook: text('notify_dingtalk_webhook'),
+  notifyDingtalkSecret: text('notify_dingtalk_secret'),
+  notifyFeishuEnabled: integer('notify_feishu_enabled', { mode: 'boolean' }).notNull().default(false),
+  notifyFeishuWebhook: text('notify_feishu_webhook'),
+  notifyFeishuSecret: text('notify_feishu_secret'),
+  commands: text('commands', { mode: 'json' }),    // 自定义命令
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -537,6 +571,105 @@ export const userFavoriteDirectories = sqliteTable('user_favorite_directories', 
   path: text('path').notNull(),
   label: text('label'),
   sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+})
+```
+
+#### chapter_commits — 章节提交记录
+
+```typescript
+export const chapterCommits = sqliteTable('chapter_commits', {
+  id: text('id').primaryKey(),
+  chapterId: text('chapter_id').notNull()
+    .references(() => chapters.id),
+  sha: text('sha').notNull(),
+  message: text('message').notNull(),
+  fullMessage: text('full_message'),
+  authorName: text('author_name'),
+  authorEmail: text('author_email'),
+  authoredAt: text('authored_at').notNull(),
+  source: text('source', { enum: ['manual', 'auto', 'merge', 'cherry_pick', 'initial'] }),
+  narratorId: text('narrator_id').references(() => narrators.id),
+  narratorMessageId: text('narrator_message_id').references(() => narratorMessages.id),
+  filesChanged: integer('files_changed'),
+  linesAdded: integer('lines_added'),
+  linesRemoved: integer('lines_removed'),
+  createdAt: text('created_at').notNull(),
+})
+```
+
+#### terminal_tabs — 终端标签
+
+```typescript
+export const terminalTabs = sqliteTable('terminal_tabs', {
+  id: text('id').primaryKey(),
+  chapterId: text('chapter_id').references(() => chapters.id),
+  narratorId: text('narrator_id').references(() => narrators.id),
+  name: text('name').notNull(),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+})
+```
+
+#### terminal_view_state — 终端视图状态
+
+```typescript
+export const terminalViewState = sqliteTable('terminal_view_state', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull().references(() => users.id),
+  chapterId: text('chapter_id').references(() => chapters.id),
+  narratorId: text('narrator_id').references(() => narrators.id),
+  layout: text('layout', { enum: ['single', 'split-h', 'split-v', 'triple', 'quad'] }),
+  activeTabId: text('active_tab_id'),
+  panelAssignments: text('panel_assignments', { mode: 'json' }),
+  updatedAt: text('updated_at').notNull(),
+})
+```
+
+#### narrator_patches — 叙述者补丁记录
+
+```typescript
+export const narratorPatches = sqliteTable('narrator_patches', {
+  id: text('id').primaryKey(),
+  narratorId: text('narrator_id').notNull().references(() => narrators.id),
+  messageId: text('message_id').notNull().references(() => narratorMessages.id),
+  toolUseId: text('tool_use_id').notNull(),
+  beforeHash: text('before_hash').notNull(),
+  afterHash: text('after_hash').notNull(),
+  filesJson: text('files_json', { mode: 'json' }),
+  createdAt: text('created_at').notNull(),
+})
+```
+
+#### merge_sessions — 合并会话
+
+```typescript
+export const mergeSessions = sqliteTable('merge_sessions', {
+  id: text('id').primaryKey(),
+  targetChapterId: text('target_chapter_id').notNull().references(() => chapters.id),
+  sourceChapterIds: text('source_chapter_ids', { mode: 'json' }),
+  strategy: text('strategy', { enum: ['merge', 'squash', 'cherry-pick'] }),
+  status: text('status', { enum: ['running', 'waiting_decision', 'ai_resolving', 'completed', 'cancelled', 'error'] }),
+  currentIndex: integer('current_index').notNull().default(0),
+  mergedCount: integer('merged_count').notNull().default(0),
+  currentSourceChapterId: text('current_source_chapter_id'),
+  conflictFiles: text('conflict_files', { mode: 'json' }),
+  error: text('error'),
+  locale: text('locale'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+})
+```
+
+#### narrator_whitelist_dirs — 叙述者白名单目录
+
+```typescript
+export const narratorWhitelistDirs = sqliteTable('narrator_whitelist_dirs', {
+  id: text('id').primaryKey(),
+  narratorId: text('narrator_id').notNull().references(() => narrators.id),
+  path: text('path').notNull(),
+  accessLevel: text('access_level', { enum: ['readOnly', 'readWrite', 'full'] }),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
   createdAt: text('created_at').notNull(),
 })
 ```
@@ -574,8 +707,6 @@ export const messagesByNarrator = index('idx_messages_narrator')
   .on(narratorMessages.narratorId, narratorMessages.createdAt)
 export const toolCallsByMessage = index('idx_toolcalls_message')
   .on(narratorToolCalls.messageId)
-export const permissionsByNarrator = index('idx_permissions_narrator')
-  .on(permissionRequests.narratorId, permissionRequests.decision)
 ```
 
 ---
@@ -592,6 +723,8 @@ server/
     schema.ts                 # Drizzle schema（上述所有表）
     relations.ts              # Drizzle 关系定义
     index.ts                  # DB 连接 + 导出
+    connection.ts             # 数据库连接管理
+    fts.ts                    # FTS5 全文搜索设置
     migrate.ts                # 迁移脚本
   routes/
     projects.ts               # 项目 CRUD
@@ -603,12 +736,23 @@ server/
     auth.ts                   # 注册 / 登录 / 当前用户
     admin.ts                  # 用户管理 + 全局设置
     settings.ts               # 全局配置管理
-    user-preferences.ts       # 用户偏好设置（autoLoadOlderMessages 等）
+    user-preferences.ts       # 用户偏好设置
     favorites.ts              # 用户收藏目录 CRUD
     uploads.ts                # 图片上传文件服务
     graph.ts                  # 故事网络图数据 + 节点位置持久化
     search.ts                 # 全文搜索
     mcp.ts                    # MCP 工具暴露
+    git.ts                    # Git 操作
+    dependencies.ts           # 系统依赖检查
+    skills.ts                 # 技能管理
+    routines.ts               # 例程管理
+    notifications.ts          # 通知管理
+    notification-sounds.ts    # 通知声音
+    fs.ts                     # 文件系统操作
+    project-db.ts             # 项目数据库备份/导入
+    anthropic.ts              # Anthropic API 配置
+    openai.ts                 # OpenAI API 配置
+    codex.ts                  # Codex API 配置
   services/
     chapter-service.ts        # 章节生命周期
     chapter-fork.ts           # 分叉逻辑（原子操作 + 回滚）+ 章节拆分 + 批量分叉
@@ -616,24 +760,46 @@ server/
     chapter-batch-merge.ts    # 批量合并编排（队列式处理 + 冲突等待）
     chapter-cleanup.ts        # 批量清理 + 自动休眠/唤醒
     chapter-edge-service.ts   # 章节间关系（边）CRUD
-    chapter-dependency-service.ts  # 依赖关系管理（上游变更检测 + 同步）
-    chapter-cherry-pick-service.ts # Cherry-pick 操作
+    chapter-dependency-service.ts  # 依赖关系管理（上游变更检测 + 同步）（计划中）
+    chapter-cherry-pick-service.ts # Cherry-pick 操作（计划中）
     exploration-group-service.ts   # 探索组生命周期（创建 + 决策 + 放弃）
     narrator-service.ts       # 叙述者生命周期
-    narrator-session.ts       # Claude SDK session 管理 + 权限审批
+    narrator-session.ts       # AI 会话管理 + 权限审批
+    narrator-executor.ts      # 自定义 Agent Loop 执行器
+    narrator-event-handler.ts # 叙述者事件处理
+    narrator-subagent.ts      # 子代理管理
+    narrator-recovery.ts      # 会话恢复
+    narrator-auto-commit.ts   # 自动提交
+    narrator-prompt.ts        # 系统提示词构建
     narrator-context.ts       # 上下文继承（full/compressed/fresh）
     narrator-title.ts         # 会话标题自动生成（Haiku 模型）
     container-service.ts      # 容器管理（Docker/Podman compose）
+    container-proxy.ts        # 容器代理
     port-allocator.ts         # 端口分配
     git-service.ts            # Git 操作封装
-    terminal-service.ts       # 终端 + dtach PTY 管理
+    terminal-service.ts       # 终端 + PTY 管理
+    terminal-tab-service.ts   # 终端标签管理
+    terminal-view-service.ts  # 终端视图状态
     search-service.ts         # 全文搜索（FTS5 + LIKE 降级）
+    command-service.ts        # 命令解析和执行
+    output-stats.ts           # 输出统计
+    merge-summary-service.ts  # 合并摘要
+    commit-sync-service.ts    # 提交同步
+    worktree-watcher.ts       # Worktree 监视
+    project-db-sync.ts        # 项目数据库同步
+    project-import.ts         # 项目导入
+    snapshot.ts               # 快照管理
+    routine-service.ts        # 例程管理
+    skill-service.ts          # 技能管理
+    notification-service.ts   # 通知管理
+    dependency-service.ts     # 系统依赖检查
   middleware/
     auth.ts                   # JWT 认证 + 管理员权限中间件
   websocket/
     ws-handler.ts             # WebSocket 消息路由（统一入口）
     terminal-ws.ts            # 终端 I/O
     narrator-ws.ts            # 叙述者实时事件（消息流、权限请求、合并进度）
+  terminal/                   # 终端运行时（PTY 抽象层、buffer 管理、dtach 支持）
   lib/
     settings/                 # 配置管理（加载/保存 ~/.narrafork/settings.json）
     auth.ts                   # JWT 签发/验证 + 用户注册/登录
@@ -642,13 +808,13 @@ server/
     logger.ts                 # JSONL 日志
     errors.ts                 # 错误类型（AppError / NotFoundError / ValidationError）
     id.ts                     # nanoid 生成器
+    agent/                    # 自定义 AI Agent 框架（loop、多提供商、工具注册、15+ 内置工具）
+    mcp/                      # MCP 集成（manager、tool-bridge、transports）
 ```
 
 > 设计偏差说明：
 > - 容器路由整合到 `chapters.ts`（容器是 chapter 的子资源），不再有独立的 `containers.ts`
 > - 权限审批逻辑整合到 `narrator-session.ts`（与 session 生命周期紧密耦合），不再有独立的 `narrator-permission.ts`
-> - 终端 PTY 管理整合到 `terminal-service.ts`（dtach 模式不需要独立 PTY 管理器），不再有独立的 `terminal/` 目录
-> - 事件通知由 `event-bus.ts` + `narrator-ws.ts` 组合实现，不再有独立的 `notification-service.ts`
 > - 游离会话（standalone sessions）整合到 `narrators.ts`（通过 `chapterId=null` 区分），不再有独立的 `sessions.ts` 路由
 ### 4.2 核心服务设计
 
@@ -681,7 +847,7 @@ server/
    - 新建章节，git branch HEAD 指向选中的 commit（`git branch prefix-xxx <commitSha>`）
    - 创建 worktree（如果原章节 role 为 trunk 则保持 active，否则设为 frozen）
    - 继承原章节的 `parentChapterId`（原章节的上游关系转移给前序）
-   - 叙述者处理：复制原章节的叙述者，但 `branch_messages` 只保留 commit 时间点之前的消息引用（通过 commit 时间戳与消息 `createdAt` 对比确定截断点）
+   - 叙述者处理：复制原章节的叙述者，但 `narrator_message_refs` 只保留 commit 时间点之前的消息引用（通过 commit 时间戳与消息 `createdAt` 对比确定截断点）
    - 在 `chapter_edges` 中：将原章节的入边（fork 边的 target）重新指向前序章节
 
 2. **原章节变为后续章节（continuation）**
@@ -708,51 +874,45 @@ server/
 
 #### 4.2.1b narrator-service.ts — 叙述者生命周期与消息管理
 
-职责：叙述者 CRUD、消息持久化、对话分支管理、Compact 机制。
+职责：叙述者 CRUD、消息持久化、Compact 机制。
 
 核心功能：
-- `create()` — 创建叙述者，自动创建 root 对话分支（name="main"），设置 `activeBranchId`
-- `persistUserMessage()` / `persistAssistantMessage()` — 消息持久化，同时写入 `narrator_messages` 和 `branch_messages`（junction table），维护分支内 `seq` 排序
-- `getMessagesCursor()` — 基于 `branch_messages.seq` 的游标分页，查询当前活跃分支的顶层消息，再递归加载子 agent 消息树（通过 `parentToolUseId` 关联）
+- `create()` — 创建叙述者
+- `persistUserMessage()` / `persistAssistantMessage()` — 消息持久化，同时写入 `narrator_messages` 和 `narrator_message_refs`（junction table），维护叙述者内 `seq` 排序
+- `getMessagesCursor()` — 基于 `narrator_message_refs.seq` 的游标分页，查询当前叙述者的顶层消息，再递归加载子 agent 消息树（通过 `parentToolUseId` 关联）
 - `getMessagesAround()` — 围绕指定消息加载上下文（用于搜索结果定位）
-- `getMessagesSinceLastCompact()` — 从最近的 compact 标记之后加载消息（用于 SDK 历史重建）
-
-对话分支管理：
-- `createBranch()` — 从指定消息 fork 新分支，复制父分支中 fork 点及之前的 `branch_messages` 记录（共享前缀），自动切换到新分支
-- `switchBranch()` — 切换活跃分支，更新 `narrators.activeBranchId`
-- `deleteBranch()` — 删除分支，提升子分支到父分支，清理孤儿消息（仅属于该分支的消息）
+- `getMessagesSinceLastCompact()` — 从最近的 compact 标记之后加载消息（用于历史重建）
 
 Compact 机制：
 - `persistCompactingMessage()` — 插入 role=system 的 compact 占位消息（`status: "compacting"`），支持指定 `beforeMessageId` 进行部分压缩
-- `finalizeCompactingMessage()` — 将占位消息更新为完成状态（`status: "compacted"`，含 summary），在 `branch_messages` 中标记 `isCompact=1`
+- `finalizeCompactingMessage()` — 将占位消息更新为完成状态（`status: "compacted"`，含 summary），在 `narrator_message_refs` 中标记 `isCompact=1`
 - `deleteCompactMessage()` / `updateCompactSummary()` — compact 标记的撤销和编辑
 
 消息树构建：
 - `buildMessageTree()` — 将扁平消息列表构建为树结构，子消息通过 `parentToolUseId` 嵌套到父消息的 `children` 数组
 - `truncateToolIO()` — 递归截断大型 tool call 的 inputJson/outputJson（默认 2000 字符），完整数据通过 `/tool-calls/:toolUseId` 端点获取
 
-#### 4.2.2 narrator-session.ts — Claude Session 管理
+#### 4.2.2 narrator-session.ts — AI 会话管理
 
-职责：封装 AI provider 的流式调用，管理会话的创建和上下文重建，以及消息缓冲和权限审批。
 
 核心功能：
-- `startSession()` — 统一入口，根据 narrator 状态自动判断新建或恢复会话。传入 `cwd`、`model`、`permissionMode`。无 `apiConversationId` 时生成新 ID，有则复用。每次请求通过 `buildHistory()` 从 DB 消息重建完整对话历史。
+- `startSession()` — 统一入口，根据 narrator 状态自动判断新建或恢复会话。传入 `cwd`、`model`、`permissionMode`。每次请求通过 `buildHistory()` 从 DB 消息重建完整对话历史，调用 Agent Loop 执行。
 - `interruptSession()` — 中断当前执行
 - `recoverOnStartup()` — 服务器重启恢复逻辑：重置 `thinking` 状态的 narrator 为 `idle`，自动拒绝 pending 权限请求，标记 running tool calls 为 failed
-- `isSessionActive()` — 检查 narrator 是否有活跃的 SDK session
+- `isSessionActive()` — 检查 narrator 是否有活跃的 Agent Loop session
 - `setBufferedMessage()` / `clearBufferedMessage()` / `getBufferedMessage()` — 消息缓冲管理，允许用户在 narrator thinking 时排队下一条消息
 
 关键设计：
 - 内存中维护 `Map<narratorId, { query, abortController }>` 用于中断控制
-- `startSession()` 是异步生成器，内部 `processSDKMessage()` 处理每条消息：捕获 `session_id` 持久化到 DB、持久化 assistant 消息、更新统计、广播到 WebSocket
+- `startSession()` 是异步生成器，内部处理每条消息：持久化 assistant 消息、更新统计、广播到 WebSocket
 - 两阶段标题生成：首条用户消息时立即调用 `generateQuickTitle()` 生成快速标题（不等 AI 回复），session 结束后再调用 `generateAndSetTitle()` 生成更准确的标题（会 await quickTitle 完成以避免竞态）
 - 权限模式自动处理：
   - `default` 模式：启用 `canUseTool` 回调，走完整审批流程
   - `acceptEdits` 模式：自动允许 `Edit`/`Write`/`NotebookEdit`/`MultiEdit` 工具，其余走审批
-  - `bypassPermissions` / `dontAsk` 模式：SDK 层面跳过所有权限检查
-  - `plan` 模式：SDK 层面进入 plan 模式
+  - `bypassPermissions` / `dontAsk` 模式：跳过所有权限检查
+  - `plan` 模式：进入 plan 模式（只读分析，不执行写操作）
 - `canUseTool` 对 `TodoWrite`/`TodoRead` 工具自动允许（白名单），不需要用户审批
-- 权限审批流程：创建 tool_call 记录（status: initializing）→ 判断权限决策（auto allow/deny/ask）→ 需要用户审批时更新 status 为 pending → WebSocket 推送 `permission_request` → 等待决定（5 分钟超时，超时自动拒绝，`permissionDecidedBy: "auto_timeout"`）→ 更新 tool_call 记录 → 返回 SDK。权限状态直接记录在 `narrator_tool_calls` 表上，无独立的 `permission_requests` 表
+- 权限审批流程：创建 tool_call 记录（status: initializing）→ 判断权限决策（auto allow/deny/ask）→ 需要用户审批时更新 status 为 pending → WebSocket 推送 `permission_request` → 等待决定（5 分钟超时，超时自动拒绝，`permissionDecidedBy: "auto_timeout"`）→ 更新 tool_call 记录 → 返回 Agent Loop。权限状态直接记录在 `narrator_tool_calls` 表上，无独立的 `permission_requests` 表
 - "Allow with feedback" 流程：用户批准权限时附带 `feedbackText`，session 在当前 tool 完成后中断，feedbackText 作为下一条用户消息自动发送
 - 消息缓冲：用户在 narrator thinking 时可通过 WebSocket 发送 `buffer_message`，session 结束后自动链式发送缓冲消息
 - `TodoWrite` 工具结果自动持久化到 narrator 的 `todosJson` 字段
@@ -762,7 +922,7 @@ Compact 机制：
 职责：在 Chapter 分叉时处理 Narrator 的上下文继承策略。
 
 三种继承模式：
-- **full**：SDK 原生 `resume` + `forkSession` + `resumeSessionAt`，零成本完整继承。实际 fork 延迟到首次发消息时执行，创建时只记录 `parentNarratorId`
+- **full**：延迟会话 fork，零成本完整继承。实际 fork 延迟到首次发消息时执行，创建时只记录 `parentNarratorId`，通过 `narrator_message_refs` 共享消息前缀
 - **compressed**：用 Haiku 模型对父 Narrator 最近 50 条消息生成摘要，存入 `contextSummary` 字段。新 session 启动时将摘要注入 system prompt
 - **fresh**：全新 session，不带任何历史上下文
 
@@ -1046,7 +1206,7 @@ GET    /api/narrators/:id                          # 详情
 DELETE /api/narrators/:id                          # 删除
 
 POST   /api/narrators/:id/messages                 # 发送消息（SSE 流式响应，支持 multipart 图片上传）
-GET    /api/narrators/:id/messages                 # 历史消息（?limit=&cursor=&branchId=&around=）
+GET    /api/narrators/:id/messages                 # 历史消息（?limit=&cursor=&around=）
 GET    /api/narrators/:id/buffer                   # 获取缓冲消息（多设备同步）
 GET    /api/narrators/:id/tool-calls/:toolUseId    # 获取完整 tool call 详情（未截断）
 
@@ -1056,6 +1216,9 @@ PATCH  /api/narrators/:id/compact/:messageId        # 更新 compact 摘要
 DELETE /api/narrators/:id/compact/:messageId        # 删除 compact 标记（撤销 compact）
 
 POST   /api/narrators/:id/interrupt                # 中断当前执行
+POST   /api/narrators/:id/clear-context            # 清除上下文
+POST   /api/narrators/:id/retry                    # 重试消息
+POST   /api/narrators/:id/revert                   # 撤销消息
 PATCH  /api/narrators/:id/permission-mode          # 切换权限模式
 PATCH  /api/narrators/:id/model                    # 切换模型
 PATCH  /api/narrators/:id/title                    # 手动更新标题
@@ -1063,17 +1226,20 @@ POST   /api/narrators/:id/generate-title           # AI 自动生成标题
 PATCH  /api/narrators/:id/archive                  # 归档叙述者
 PATCH  /api/narrators/:id/unarchive                # 取消归档
 PATCH  /api/narrators/:id/mark-read                # 标记已读（done → idle）
+PATCH  /api/narrators/:id/fast-mode                # 快速模式
+PATCH  /api/narrators/:id/relaxed-plan             # 放松规划
+PATCH  /api/narrators/:id/reasoning-effort         # 推理努力级别
+GET    /api/narrators/:id/patches                  # 补丁列表
+GET    /api/narrators/:id/background-tasks         # 后台任务
+
+# 白名单目录
+GET    /api/narrators/:id/whitelist-dirs           # 白名单目录列表
+POST   /api/narrators/:id/whitelist-dirs           # 添加白名单目录
+PATCH  /api/narrators/:id/whitelist-dirs/:dirId    # 更新白名单目录
+DELETE /api/narrators/:id/whitelist-dirs/:dirId    # 删除白名单目录
 ```
 
-#### Conversation Branches
-```
-GET    /api/narrators/:id/branches                 # 列表分支
-POST   /api/narrators/:id/branches                 # 创建分支（fork from message）
-PATCH  /api/narrators/:id/branches/:branchId       # 更新分支（重命名/归档）
-DELETE /api/narrators/:id/branches/:branchId       # 删除分支（孤儿消息自动清理）
-POST   /api/narrators/:id/branches/:branchId/switch # 切换活跃分支
-POST   /api/narrators/:id/branches/root/switch     # 切换到 root 分支
-```
+> 游离会话（standalone sessions）通过 `standalone=true` 查询参数区分，叙述者的 `chapterId` 为 null。
 
 #### Permission Requests
 ```
@@ -1138,6 +1304,64 @@ PUT    /api/favorites/reorder                      # 重排序
 GET    /api/uploads/:narratorId/:imageId           # 获取上传的图片（带缓存头）
 ```
 
+#### Git
+```
+POST   /api/projects/:id/git/init                  # 初始化 Git 仓库
+GET    /api/projects/:id/git/branches              # 获取分支列表
+GET    /api/projects/:id/git/status                # 获取 Git 状态
+```
+
+#### Dependencies（系统依赖检查）
+```
+GET    /api/dependencies                           # 检查系统依赖（git、podman、dtach 等）
+```
+
+#### Skills
+```
+GET    /api/skills                                 # 技能列表（?projectId=）
+POST   /api/skills                                 # 创建技能
+GET    /api/skills/:id                             # 技能详情
+PATCH  /api/skills/:id                             # 更新技能
+DELETE /api/skills/:id                             # 删除技能
+```
+
+#### Routines
+```
+GET    /api/routines                               # 例程列表
+POST   /api/routines                               # 创建例程
+GET    /api/routines/:id                           # 例程详情
+PATCH  /api/routines/:id                           # 更新例程
+DELETE /api/routines/:id                           # 删除例程
+POST   /api/routines/:id/run                       # 执行例程
+```
+
+#### Notifications
+```
+GET    /api/notifications                          # 通知列表
+POST   /api/notifications/mark-read                # 标记已读
+GET    /api/notification-sounds                    # 通知声音列表
+POST   /api/notification-sounds                    # 上传通知声音
+```
+
+#### AI 提供商
+```
+GET    /api/openai/models                          # OpenAI 模型列表
+GET    /api/anthropic/models                       # Anthropic 模型列表
+GET    /api/codex/status                           # Codex 状态
+```
+
+#### FS（文件系统）
+```
+GET    /api/fs/list                                # 列出目录内容
+GET    /api/fs/read                                # 读取文件
+```
+
+#### Project DB（项目数据库）
+```
+POST   /api/projects/:id/db/backup                 # 备份项目数据库
+POST   /api/projects/:id/db/import                 # 导入项目数据库
+```
+
 ### 5.2 WebSocket 端点
 
 ```
@@ -1182,12 +1406,9 @@ const mcpTools = [
   'narrafork_fork_chapter',        // 分叉当前 chapter
   'narrafork_merge_chapter',       // 合并 chapter
   'narrafork_check_conflicts',     // 检查合并冲突
-  'narrafork_cherry_pick',         // 从其他 chapter cherry-pick commits
   'narrafork_abandon_chapter',     // 放弃当前 chapter
   'narrafork_list_narrators',      // 列出 narrators
   'narrafork_get_context_summary', // 获取其他 narrator 的上下文摘要
-  'narrafork_list_dependencies',   // 列出当前 chapter 的依赖关系
-  'narrafork_sync_upstream',       // 同步上游依赖的变更
 ]
 ```
 
@@ -1205,19 +1426,24 @@ frontend/
     index.tsx                 # 首页/仪表盘
     login.tsx                 # 登录/注册页面
     search.tsx                # 搜索结果页面
+    licenses.tsx              # 开源许可证页面
     projects/
       index.tsx               # 项目列表
       $projectId.tsx          # 项目详情 = 故事网络图（主界面）
     chapters/
-      $chapterId.tsx          # Chapter 重定向（查询 primary narrator → 跳转 /sessions/$narratorId）
-    sessions/
+      $chapterId.tsx          # Chapter 重定向（查询 primary narrator → 跳转 /narrators/$narratorId）
+    narrators/
       index.tsx               # 游离会话列表（活跃）
       archived.tsx            # 已归档会话列表
-      $sessionId.tsx          # 游离会话详情
+      $narratorId.tsx         # 叙述者详情
     settings/
       index.tsx               # 设置页（含语言切换器）
     admin/
-      index.tsx               # 管理员面板（用户管理 + 全局设置）
+      index.tsx               # 管理员面板
+      providers.tsx           # AI 提供商配置
+      terminals.tsx           # 终端管理
+    routines/
+      index.tsx               # 例程列表
   components/
     chapter/
       ChapterCard.tsx         # Chapter 卡片（可展开显示 commit 列表）
@@ -1230,9 +1456,7 @@ frontend/
       CherryPickModal.tsx     # Cherry-pick commit 选择对话框
       SyncUpstreamModal.tsx   # 同步上游变更对话框（选择 rebase/merge）
       CommitList.tsx          # 章节 commit 列表组件（可展开，支持选择 commit）
-    exploration/
-      ExplorationGroupModal.tsx   # 创建探索组对话框
-      ExplorationGroupPanel.tsx   # 探索组详情面板（侧边面板中显示）
+    common/                   # 通用组件（按钮、模态框、布局等）
     narrator/
       NarratorPanel.tsx       # Narrator 面板（消息列表 + 输入 + 图片上传 + 缓冲消息）
       ChapterBar.tsx          # Chapter 信息栏（嵌入 NarratorPanel，当 narrator 绑定 chapter 时显示）
@@ -1261,6 +1485,10 @@ frontend/
     container/
       ContainerStatus.tsx     # 容器状态指示器
       ContainerLogs.tsx       # 容器日志查看器
+    nav/                      # 导航组件（侧边栏、面包屑等）
+    project/                  # 项目相关组件
+    providers/                # AI 提供商配置组件
+    settings/                 # 设置页组件
     LanguageSwitcher.tsx      # 语言切换器（Mantine Select，位于设置页）
     ThemeSwitcher.tsx         # 主题切换器（light/dark/auto）
   hooks/
@@ -1288,8 +1516,8 @@ frontend/
     i18n.ts                   # i18next 初始化（语言检测 + locale 导入）
     constants.ts              # 常量（状态颜色映射等）
   locales/
-    en/                       # 英文翻译（13 个命名空间 JSON）
-    zh-CN/                    # 简体中文翻译（13 个命名空间 JSON）
+    en/                       # 英文翻译（15 个命名空间 JSON）
+    zh-CN/                    # 简体中文翻译（15 个命名空间 JSON）
 ```
 
 > 路由变更说明：`$projectId.graph.tsx` 已删除，故事网络图直接作为 `$projectId.tsx` 的主界面。打开项目即看到交互式图。
@@ -1503,6 +1731,23 @@ interface NarraForkSettings {
     customModels: ModelOption[]     // 自定义模型选项列表，默认 []
     // ModelOption = { value: string; label: string }
   }
+  anthropic: {
+    apiKey?: string                 // Anthropic API Key
+    baseUrl?: string                // 自定义 API 端点
+  }
+  openai: {
+    apiKey?: string                 // OpenAI API Key
+    baseUrl?: string                // 自定义 API 端点
+  }
+  }
+  }
+  mcp: {
+    servers?: Record<string, {      // MCP 服务器配置
+      command: string
+      args?: string[]
+      env?: Record<string, string>
+    }>
+  }
   chapters: {
     maxActiveWorktrees: number      // 默认 10
     maxActiveContainers: number     // 默认 5
@@ -1537,7 +1782,6 @@ interface NarraForkSettings {
 - 终端管理（dtach + xterm.js）
 
 ### Phase 2: Narrator 核心 ✅
-- Claude Agent SDK 集成
 - Session 创建 / 恢复 / 消息流
 - 消息持久化 + 展示
 - Tool Call 参数和结果展示
@@ -1566,7 +1810,7 @@ interface NarraForkSettings {
 
 ### Phase 6: 章节系统重构 — 图即项目
 
-#### 6a: 数据模型 + 图主界面（基础）
+#### 6a: 数据模型 + 图主界面（基础） ✅
 - schema 变更：chapters 表新增 role/color/groupLabel/pinned/positionX/positionY/explorationGroupId/frozen 状态
 - 新增 chapter_edges 表 + chapter-edge-service
 - 数据迁移：从 parentChapterId/mergedIntoChapterId 生成 fork/merge 边
@@ -1574,7 +1818,7 @@ interface NarraForkSettings {
 - 交互式画布：节点拖拽、右键菜单、侧边面板
 - 节点位置持久化（positionX/positionY + PATCH graph/positions）
 
-#### 6b: 角色系统 + 章节拆分
+#### 6b: 角色系统 + 章节拆分 ✅
 - role 字段（trunk/branch/exploration）+ 图上的视觉区分
 - groupLabel 分组 + 图上的分组框渲染
 - 章节卡片展开 commit 列表（CommitList 组件 + GET /api/chapters/:id/commits）
@@ -1582,20 +1826,20 @@ interface NarraForkSettings {
 - frozen 状态 + 图上的 frozen 节点样式
 - 批量分叉（batchFork）+ BatchForkModal
 
-#### 6c: 依赖关系
+#### 6c: 依赖关系 ✅
 - dependency 边的创建/删除（图上拖拽连接 + API）
 - chapter-dependency-service：上游变更检测 + 同步操作
 - 图上的依赖可视化（DependencyEdge 橙色虚线 + 更新徽章）
 - SyncUpstreamModal（选择 rebase/merge）
 
-#### 6d: 探索组
+#### 6d: 探索组 ✅
 - exploration_groups 表 + exploration-group-service
 - 创建探索组（ExplorationGroupModal，含批量 fork exploration 分支）
 - 图上的探索组渲染（ExplorationGroupNode 分组框）
 - 决策流程（选定方案合并 + 其余 abandoned）
 - ExplorationGroupPanel（侧边面板中显示）
 
-#### 6e: Cherry-pick + 参考式整合
+#### 6e: Cherry-pick + 参考式整合 ✅
 - chapter-cherry-pick-service + CherryPickModal（commit 选择器）
 - cherry_pick 边 + CherryPickEdge 图上渲染
 - 参考式整合：叙述者对话中 @mention 其他章节，注入代码 diff 作为上下文（叙述者功能增强，优先级较低）
@@ -1606,13 +1850,13 @@ interface NarraForkSettings {
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| 会话分叉机制 | SDK 原生 resume + forkSession + 本地对话分支 | SDK 级别零成本继承，本地 conversation_branches 管理分支消息视图 |
-| 回溯分叉 | SDK 的 resumeSessionAt + conversation_branches fork | SDK 精确到消息级别回溯，本地分支复制共享前缀 |
+| 会话分叉机制 | 自定义 Agent Loop + narrator_message_refs 消息引用 | 通过 narrator_message_refs 共享消息前缀，支持多提供商 |
+| 回溯分叉 | narrator_message_refs fork + forkMessageId | 精确到消息级别回溯，叙述者间共享前缀 |
 | 上下文压缩 | Haiku 模型做 summarization | 成本低，速度快 |
 | 容器运行时 | Podman | 无 daemon，rootless，兼容 Docker Compose 格式 |
 | 前端组件库 | Mantine | 开箱即用的复杂组件，CSS-in-JS 主题系统 |
 | 图可视化 | React Flow + Dagre | 成熟的 React 图渲染库，自动布局 |
-| 消息存储 | 完整 BetaMessage.content JSON + branch_messages junction table | 保留 tool_use/thinking blocks 用于展示，分支间共享消息实体 |
+| 消息存储 | 完整 BetaMessage.content JSON + narrator_message_refs junction table | 保留 tool_use/thinking blocks 用于展示，叙述者间共享消息实体 |
 | 端口管理 | DB 端口池 + insert 冲突重试 | 避免冲突，支持多 chapter 并发分配 |
 | 分叉原子性 | 手动回滚栈 | 比 DB 事务更灵活，覆盖 git/container 操作 |
 | 权限审批 | WebSocket 实时通道 | Agent 在等待，需要低延迟响应 |
@@ -1627,8 +1871,8 @@ interface NarraForkSettings {
 | 游离会话路由 | 整合到 narrators.ts（chapterId=null） | 避免重复路由逻辑，统一会话管理 |
 | 权限审批 UI | 内联 per-tool-call 审批 + feedbackText | 比顶部 banner 更直观，feedback 支持 "allow with guidance" 模式 |
 | 消息缓冲 | 内存 Map + WebSocket 双向同步 | 允许用户在 AI thinking 时排队消息，多设备同步 |
-| 对话分支 | conversation_branches + branch_messages junction table | 支持从任意消息 fork 新分支，共享前缀避免消息重复，seq 字段支持高效游标分页 |
-| Compact 机制 | system 消息标记 + branch_messages.isCompact | 压缩历史上下文为摘要注入 system prompt，减少 token 消耗，支持部分压缩（指定 beforeMessageId） |
+| 对话分支 | narrator_message_refs（叙述者-消息关联），通过 seq 字段维护消息顺序 | 支持从任意消息 fork 新叙述者，共享前缀避免消息重复，seq 字段支持高效游标分页 |
+| Compact 机制 | system 消息标记 + narrator_message_refs.isCompact | 压缩历史上下文为摘要注入 system prompt，减少 token 消耗，支持部分压缩（指定 beforeMessageId） |
 | FTS tokenizer | trigram | 支持 CJK 搜索，无需分词器 |
 | 主题模式 | auto（跟随系统） | 用户可切换 light/dark/auto，比固定 dark 更灵活 |
 | 自动休眠触发 | 防抖调度（30 秒窗口） | chapter 创建/访问时触发，避免频繁检查 |
@@ -1639,3 +1883,6 @@ interface NarraForkSettings {
 | 探索组 | 独立 exploration_groups 表 | 探索组有独立生命周期（active/decided/abandoned），需要记录基准章节和最终决策，图上作为分组框渲染 |
 | 章节拆分 | split at commit = 创建前序章节 + 原章节变后续 + 新 fork | 比简单的"从历史 commit fork"更精确地表达语义：历史被拆分为两条独立的演进路径 |
 | frozen 状态 | 拆分后的前序章节（非 trunk）设为 frozen | 前序章节代表已确定的历史，不应再修改。trunk 例外（主线持续演进） |
+| 子代理系统 | narrator.type='subagent' + subagentType(explore/plan/general) | 叙述者可派生子任务代理，通过 parentToolUseId 关联消息树 |
+| 技能系统 | 项目级技能库（skill-service.ts） | 为叙述者提供领域特定指令和知识，提升 AI 输出质量 |
+| 例程系统 | 内置 + 自定义例程（routine-service.ts） | 自动化重复性任务，支持内置和用户自定义例程 |

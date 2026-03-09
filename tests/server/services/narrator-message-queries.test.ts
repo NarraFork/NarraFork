@@ -334,7 +334,7 @@ describe("narratorService message query regressions", () => {
 		expect(second.orphanChildren).toHaveLength(0);
 	});
 
-	it("getMessagesAround 以子消息所属顶层消息为锚点并正确返回上下文窗口", async () => {
+	it("getMessagesAround 以子消息所属顶层消息为锚点并返回有界上下文窗口", async () => {
 		seedBase();
 
 		insertMessage({
@@ -365,19 +365,78 @@ describe("narratorService message query regressions", () => {
 			contentJson: [{ type: "text", text: "child target" }],
 		});
 		insertMessage({
-			id: "m-newer",
+			id: "m-newer-0",
 			seq: 4,
-			contentJson: [{ type: "text", text: "newer" }],
+			contentJson: [{ type: "text", text: "newer0" }],
+		});
+		insertMessage({
+			id: "m-newer-1",
+			seq: 5,
+			contentJson: [{ type: "text", text: "newer1" }],
 		});
 
-		const around = await narratorService.getMessagesAround("n1", "c-target", 1);
+		const around = await narratorService.getMessagesAround("n1", "c-target", {
+			before: 1,
+			after: 1,
+		});
 		expect(around.hasMore).toBe(true);
 		expect(around.nextCursor).toBe("1");
+		expect(around.hasMoreAfter).toBe(true);
 		expect(around.messages.map((m: { id: string }) => m.id)).toEqual([
 			"m-older-1",
 			"m-parent",
-			"m-newer",
+			"m-newer-0",
 		]);
 		expect(around.messages[1]?.children?.map((c: { id: string }) => c.id)).toEqual(["c-target"]);
+	});
+
+	it("getMessagesAround 支持通过 refs 定位 fork 继承的共享消息", async () => {
+		seedBase("n1");
+		db.insert(narrators)
+			.values({
+				id: "n2",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "full",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+
+		insertMessage({
+			id: "shared-parent",
+			seq: 0,
+			narratorId: "n1",
+			contentJson: [{ type: "tool_use", id: "tu-shared", name: "Task", input: {} }],
+		});
+		insertToolCall({
+			messageId: "shared-parent",
+			toolUseId: "tu-shared",
+			toolName: "Task",
+			status: "running",
+			narratorId: "n1",
+		});
+		insertMessage({
+			id: "shared-child",
+			seq: 1,
+			narratorId: "n1",
+			parentToolUseId: "tu-shared",
+			contentJson: [{ type: "text", text: "shared child" }],
+		});
+		db.insert(narratorMessageRefs)
+			.values([
+				{ id: "ref-n2-shared-parent", narratorId: "n2", messageId: "shared-parent", seq: 0 },
+				{ id: "ref-n2-shared-child", narratorId: "n2", messageId: "shared-child", seq: 1 },
+			])
+			.run();
+
+		const around = await narratorService.getMessagesAround("n2", "shared-child", {
+			before: 0,
+			after: 0,
+		});
+		expect(around.messages.map((m: { id: string }) => m.id)).toEqual(["shared-parent"]);
+		expect(around.messages[0]?.children?.map((c: { id: string }) => c.id)).toEqual([
+			"shared-child",
+		]);
 	});
 });

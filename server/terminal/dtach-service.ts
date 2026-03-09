@@ -15,6 +15,79 @@ import { spawnBunTerminal } from "./runtime-bun";
 
 // === Process tree utilities ===
 
+export interface ProcessInfo {
+	pid: number;
+	ppid: number;
+	command: string;
+	state: string;
+	rss: number;
+	cpu: number;
+	elapsed: string;
+}
+
+/**
+ * Snapshot of all system processes, built from a single `ps` call.
+ * Provides efficient tree traversal and info lookup without repeated execSync.
+ */
+export class ProcessSnapshot {
+	private infoByPid = new Map<number, ProcessInfo>();
+	private childrenByPid = new Map<number, number[]>();
+
+	constructor() {
+		try {
+			const result = execSync("ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=", {
+				encoding: "utf-8",
+				stdio: "pipe",
+			});
+			for (const line of result.trim().split("\n")) {
+				const parts = line.trim().split(/\s+/);
+				if (parts.length < 7) continue;
+				const pid = Number.parseInt(parts[0], 10);
+				const ppid = Number.parseInt(parts[1], 10);
+				if (Number.isNaN(pid) || Number.isNaN(ppid)) continue;
+				this.infoByPid.set(pid, {
+					pid,
+					ppid,
+					command: parts[2],
+					state: parts[3],
+					rss: Number.parseInt(parts[4], 10),
+					cpu: Number.parseFloat(parts[5]),
+					elapsed: parts[6],
+				});
+				let list = this.childrenByPid.get(ppid);
+				if (!list) {
+					list = [];
+					this.childrenByPid.set(ppid, list);
+				}
+				list.push(pid);
+			}
+		} catch {
+			// ignore — snapshot will be empty
+		}
+	}
+
+	getInfo(pid: number): ProcessInfo | null {
+		return this.infoByPid.get(pid) ?? null;
+	}
+
+	getDescendants(pid: number): number[] {
+		const descendants: number[] = [];
+		const queue = [...(this.childrenByPid.get(pid) ?? [])];
+		while (queue.length > 0) {
+			const child = queue.shift();
+			if (child === undefined) break;
+			descendants.push(child);
+			const grandchildren = this.childrenByPid.get(child);
+			if (grandchildren) queue.push(...grandchildren);
+		}
+		return descendants;
+	}
+
+	getChildren(pid: number): number[] {
+		return this.childrenByPid.get(pid) ?? [];
+	}
+}
+
 /**
  * Find PIDs whose command line contains `searchArg`.
  * Uses `pgrep -f` which works on both Linux and macOS.

@@ -14,7 +14,14 @@ import {
 	ThemeIcon,
 	Title,
 } from "@mantine/core";
-import { IconCheck, IconPencil, IconRefresh, IconTrash, IconX } from "@tabler/icons-react";
+import {
+	IconCheck,
+	IconPencil,
+	IconRefresh,
+	IconTrash,
+	IconWand,
+	IconX,
+} from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
@@ -30,6 +37,7 @@ function AdminPage() {
 	const { data: user } = useCurrentUser();
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
+	const { t: ts } = useTranslation("settings");
 	const qc = useQueryClient();
 
 	const [editingUser, setEditingUser] = useState<{ id: string; username: string } | null>(null);
@@ -96,6 +104,14 @@ function AdminPage() {
 	return (
 		<Stack>
 			<Title order={2}>{t("adminPanel")}</Title>
+
+			<Button
+				variant="light"
+				leftSection={<IconWand size={16} />}
+				onClick={() => window.dispatchEvent(new CustomEvent("narrafork:open-wizard"))}
+			>
+				{ts("wizardReopen")}
+			</Button>
 
 			<Paper withBorder p="md">
 				<Stack>

@@ -2,6 +2,7 @@ import {
 	ActionIcon,
 	Badge,
 	Button,
+	Checkbox,
 	Collapse,
 	Group,
 	Modal,
@@ -32,7 +33,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
@@ -75,6 +76,17 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
+	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+	const deviceAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+	// Cleanup device-auth polling interval on unmount
+	useEffect(() => {
+		return () => {
+			if (deviceAuthIntervalRef.current) {
+				clearInterval(deviceAuthIntervalRef.current);
+			}
+		};
+	}, []);
 
 	const { data: settingsData } = useQuery({
 		queryKey: ["admin", "settings"],
@@ -185,6 +197,46 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 			notifications.show({ message: err.message, color: "red" });
 		},
 	});
+	const batchDeleteMut = useMutation({
+		mutationFn: (ids: string[]) => api.codexCredentialBatchDelete(ids),
+		onSuccess: (data) => {
+			setSelectedIds(new Set());
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			notifications.show({
+				message: t("codexBatchDeleteSuccess", { count: data.removed.length }),
+				color: "green",
+			});
+		},
+	});
+
+	const toggleSelect = (id: string) => {
+		setSelectedIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(id)) next.delete(id);
+			else next.add(id);
+			return next;
+		});
+	};
+
+	const toggleSelectAll = (entryIds: string[]) => {
+		setSelectedIds((prev) => {
+			const allSelected = entryIds.every((id) => prev.has(id));
+			const next = new Set(prev);
+			if (allSelected) {
+				for (const id of entryIds) next.delete(id);
+			} else {
+				for (const id of entryIds) next.add(id);
+			}
+			return next;
+		});
+	};
+
+	const handleBatchDelete = () => {
+		if (selectedIds.size === 0) return;
+		if (confirm(t("codexBatchDeleteConfirm", { count: selectedIds.size }))) {
+			batchDeleteMut.mutate([...selectedIds]);
+		}
+	};
 
 	const handleBrowserAuth = async () => {
 		const initialCount = entries.length;
@@ -271,11 +323,12 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 	};
 
 	const pollDeviceAuth = async () => {
-		const interval = setInterval(async () => {
+		deviceAuthIntervalRef.current = setInterval(async () => {
 			try {
 				const result = await api.codexDeviceAuthPoll();
 				if (!result.pending) {
-					clearInterval(interval);
+					if (deviceAuthIntervalRef.current) clearInterval(deviceAuthIntervalRef.current);
+					deviceAuthIntervalRef.current = null;
 					setDeviceAuthModal(false);
 					setDeviceAuthData(null);
 					qc.invalidateQueries({ queryKey: ["codex", "status"] });
@@ -285,7 +338,8 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 					});
 				}
 			} catch {
-				clearInterval(interval);
+				if (deviceAuthIntervalRef.current) clearInterval(deviceAuthIntervalRef.current);
+				deviceAuthIntervalRef.current = null;
 			}
 		}, 3000);
 	};
@@ -551,9 +605,23 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 											<Text size="sm" fw={500}>
 												{t("codexCredentialsAvailable")}
 											</Text>
-											<Badge size="sm" color="green">
-												{availableEntries.length}
-											</Badge>
+											<Group gap="xs">
+												{selectedIds.size > 0 && (
+													<Button
+														size="compact-xs"
+														color="red"
+														variant="light"
+														leftSection={<IconTrash size={14} />}
+														onClick={handleBatchDelete}
+														loading={batchDeleteMut.isPending}
+													>
+														{t("codexBatchDelete")} ({selectedIds.size})
+													</Button>
+												)}
+												<Badge size="sm" color="green">
+													{availableEntries.length}
+												</Badge>
+											</Group>
 										</Group>
 										<CredentialList
 											entries={availableEntries}
@@ -570,6 +638,9 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 											disableMut={disableMut}
 											resetMut={resetMut}
 											deleteMut={deleteMut}
+											selectedIds={selectedIds}
+											onToggleSelect={toggleSelect}
+											onToggleSelectAll={toggleSelectAll}
 											t={t}
 										/>
 									</Stack>
@@ -612,6 +683,9 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 												disableMut={disableMut}
 												resetMut={resetMut}
 												deleteMut={deleteMut}
+												selectedIds={selectedIds}
+												onToggleSelect={toggleSelect}
+												onToggleSelectAll={toggleSelectAll}
 												t={t}
 											/>
 										</Collapse>
@@ -720,6 +794,9 @@ function CredentialList(props: {
 	resetMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	deleteMut: any;
+	selectedIds: Set<string>;
+	onToggleSelect: (id: string) => void;
+	onToggleSelectAll: (entryIds: string[]) => void;
 	t: (key: string) => string;
 }) {
 	const {
@@ -737,6 +814,9 @@ function CredentialList(props: {
 		disableMut,
 		resetMut,
 		deleteMut,
+		selectedIds,
+		onToggleSelect,
+		onToggleSelectAll,
 		t,
 	} = props;
 	const isMobile = useMediaQuery("(max-width: 768px)");
@@ -745,10 +825,23 @@ function CredentialList(props: {
 		return <CredentialCards {...props} />;
 	}
 
+	const entryIds = entries.map((e) => e.id);
+	const allSelected = entryIds.length > 0 && entryIds.every((id) => selectedIds.has(id));
+	const someSelected = entryIds.some((id) => selectedIds.has(id)) && !allSelected;
+
 	return (
 		<Table>
 			<Table.Thead>
 				<Table.Tr>
+					<Table.Th w={40}>
+						<Checkbox
+							size="xs"
+							checked={allSelected}
+							indeterminate={someSelected}
+							onChange={() => onToggleSelectAll(entryIds)}
+							aria-label={t("codexSelectAll")}
+						/>
+					</Table.Th>
 					<Table.Th>{t("codexColName")}</Table.Th>
 					<Table.Th>{t("codexColAccount")}</Table.Th>
 					<Table.Th>{t("codexColPriority")}</Table.Th>
@@ -766,6 +859,13 @@ function CredentialList(props: {
 					const isCurrent = entry.id === currentId;
 					return (
 						<Table.Tr key={entry.id}>
+							<Table.Td>
+								<Checkbox
+									size="xs"
+									checked={selectedIds.has(entry.id)}
+									onChange={() => onToggleSelect(entry.id)}
+								/>
+							</Table.Td>
 							<Table.Td>
 								{isEditing ? (
 									<TextInput
@@ -947,6 +1047,9 @@ function CredentialCards(props: {
 	resetMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	deleteMut: any;
+	selectedIds: Set<string>;
+	onToggleSelect: (id: string) => void;
+	onToggleSelectAll: (entryIds: string[]) => void;
 	t: (key: string) => string;
 }) {
 	const {
@@ -964,6 +1067,8 @@ function CredentialCards(props: {
 		disableMut,
 		resetMut,
 		deleteMut,
+		selectedIds,
+		onToggleSelect,
 		t,
 	} = props;
 
@@ -987,9 +1092,14 @@ function CredentialCards(props: {
 						}
 					>
 						<Stack gap="xs">
-							{/* Row 1: ID + Display name + Status */}
+							{/* Row 1: Checkbox + ID + Display name + Status */}
 							<Group justify="space-between" wrap="wrap">
 								<Group gap="xs">
+									<Checkbox
+										size="xs"
+										checked={selectedIds.has(entry.id)}
+										onChange={() => onToggleSelect(entry.id)}
+									/>
 									<Text size="xs" c="dimmed" ff="monospace">
 										{entry.id}
 									</Text>

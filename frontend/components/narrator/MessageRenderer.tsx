@@ -214,6 +214,7 @@ export function renderTreeMessages(
 			if (b.type === "text") return !!b.text?.trim();
 			if (b.type === "image") return true;
 			if (b.type === "reasoning") return !!b.text?.trim();
+			if (b.type === "web_search") return true;
 			if (b.type === "thinking") {
 				const thinking = (b as { thinking?: string }).thinking;
 				return typeof thinking === "string" ? thinking.trim().length > 0 : true;
@@ -620,11 +621,17 @@ export const StreamingBubble = memo(
 		narratorId,
 		streamingRef,
 		streamingReasoningRef,
+		webSearchRef,
 		version,
 	}: {
 		narratorId: string;
 		streamingRef: React.RefObject<string>;
 		streamingReasoningRef?: React.RefObject<string>;
+		webSearchRef?: React.RefObject<{
+			id: string;
+			status: "in_progress" | "searching" | "completed";
+			query?: string;
+		} | null>;
 		version: number;
 	}) {
 		// Read ref directly during render — version change triggers re-render
@@ -632,8 +639,18 @@ export const StreamingBubble = memo(
 		void version;
 		const text = streamingRef.current;
 		const reasoning = streamingReasoningRef?.current;
-		if (!text && !reasoning) return null;
-		const blocks: { type: string; text?: string; reasoning?: string }[] = [];
+		const webSearch = webSearchRef?.current;
+		if (!text && !reasoning && !webSearch) return null;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic block shapes
+		const blocks: any[] = [];
+		if (webSearch) {
+			blocks.push({
+				type: "web_search",
+				id: webSearch.id,
+				status: webSearch.status,
+				query: webSearch.query,
+			});
+		}
 		if (reasoning) blocks.push({ type: "reasoning", text: reasoning });
 		if (text) blocks.push({ type: "text", text });
 		return (

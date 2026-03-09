@@ -281,6 +281,7 @@ export const narratorMessages = sqliteTable(
 	},
 	(table) => [
 		index("idx_messages_narrator").on(table.narratorId, table.createdAt),
+		index("idx_messages_parent_tool_use_lookup").on(table.parentToolUseId),
 		index("idx_messages_parent_tool_use").on(table.narratorId, table.parentToolUseId),
 		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
 	],
@@ -341,6 +342,7 @@ export const narratorToolCalls = sqliteTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
 	],
 );
@@ -359,11 +361,17 @@ export const terminals = sqliteTable(
 			.notNull()
 			.default("running"),
 		exitCode: integer("exit_code"),
+		graphOpened: integer("graph_opened").notNull().default(0),
+		graphX: real("graph_x"),
+		graphY: real("graph_y"),
+		graphWidth: real("graph_width"),
+		graphHeight: real("graph_height"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
 		index("idx_terminals_chapter").on(table.chapterId),
 		index("idx_terminals_narrator").on(table.narratorId),
+		index("idx_terminals_status").on(table.status),
 	],
 );
 
@@ -480,6 +488,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	notifyFeishuSecret: text("notify_feishu_secret").notNull().default(""),
 	// Slash commands (JSON array of {name, prompt, description?})
 	commands: text("commands").notNull().default("[]"),
+	// Setup wizard
+	setupWizardCompleted: integer("setup_wizard_completed", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });

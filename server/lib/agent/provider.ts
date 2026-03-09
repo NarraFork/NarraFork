@@ -64,6 +64,14 @@ export interface ParsedStreamEvent {
 		/** Cached input tokens (prompt caching) */
 		cachedInputTokens?: number;
 	};
+	/** Web search lifecycle event from Responses API (Codex native web_search tool) */
+	webSearch?: {
+		id: string;
+		status: "in_progress" | "searching" | "completed";
+		/** Search query (available on completion) */
+		query?: string;
+		queries?: string[];
+	};
 	/** Internal: set when Responses API format is detected from the gateway */
 	_responsesApi?: boolean;
 }

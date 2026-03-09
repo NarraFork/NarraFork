@@ -24,6 +24,7 @@ export function SelectionPopover({
 	const selectedTextRef = useRef("");
 	const popoverRef = useRef<HTMLDivElement>(null);
 	const [copied, setCopied] = useState(false);
+	const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const { t } = useTranslation("common");
 
 	const handleMouseUp = useCallback(() => {
@@ -109,11 +110,18 @@ export function SelectionPopover({
 		if (selectedTextRef.current) {
 			navigator.clipboard.writeText(selectedTextRef.current);
 			setCopied(true);
-			setTimeout(() => {
+			copyTimerRef.current = setTimeout(() => {
 				setPosition(null);
 				setCopied(false);
 			}, 600);
 		}
+	}, []);
+
+	// Cleanup copy timer on unmount
+	useEffect(() => {
+		return () => {
+			if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+		};
 	}, []);
 
 	if (!position) return null;

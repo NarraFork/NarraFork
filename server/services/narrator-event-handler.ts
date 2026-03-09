@@ -365,6 +365,13 @@ export async function processEvent(
 					name: block.name,
 					input: block.input,
 				});
+			} else if (block.type === "web_search") {
+				await narratorService.appendBlockToMessage(partialId, narratorId, {
+					type: "web_search",
+					id: block.id,
+					query: block.query,
+					queries: block.queries,
+				});
 			}
 			return null;
 		}
@@ -495,7 +502,9 @@ export async function processEvent(
 			const status = event.isError ? "fail" : "success";
 			try {
 				await narratorService.updateToolCallResult(event.toolUseId, {
-					output: event.output,
+					output: event.metadata
+						? { _text: event.output, _metadata: event.metadata }
+						: event.output,
 					status,
 					errorMessage: event.isError ? event.output : undefined,
 					durationMs: event.durationMs,
@@ -521,6 +530,7 @@ export async function processEvent(
 				output: truncateJson(event.output, 2000),
 				durationMs: event.durationMs,
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
+				...(event.metadata && { metadata: event.metadata }),
 			});
 
 			// Main narrator: git tracking
@@ -700,6 +710,18 @@ export async function processEvent(
 			logger.warn("Context length exceeded by API", {
 				narratorId,
 				message: event.message,
+			});
+			return null;
+		}
+
+		case "web_search": {
+			dualBroadcast(ctx, {
+				type: "web_search",
+				narratorId: broadcastTargetId,
+				id: event.id,
+				status: event.status,
+				query: event.query,
+				queries: event.queries,
 			});
 			return null;
 		}

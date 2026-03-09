@@ -138,7 +138,21 @@ export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
 	return items;
 }
 
-export function removeStreamingChunksMsg(qc: QueryClient, messagesQueryKey: unknown[]): void {
+export function revokeContentBlockPreviewUrls(
+	blocks: Array<{ previewUrl?: unknown }> | null | undefined,
+): void {
+	if (!Array.isArray(blocks)) return;
+	for (const block of blocks) {
+		if (typeof block?.previewUrl === "string") {
+			URL.revokeObjectURL(block.previewUrl);
+		}
+	}
+}
+
+export function removeStreamingChunksMsg(
+	qc: QueryClient,
+	messagesQueryKey: readonly unknown[],
+): void {
 	qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 		if (!old?.pages?.length) return old;
 		const firstPage = old.pages[0];

@@ -93,11 +93,13 @@ adminRoutes.get("/terminals", async (c) => {
 	const terminals = await terminalService.listAll();
 	const orphanSockets = terminalService.listOrphanSockets();
 	const attachedSet = terminalService.getAttachedSet();
-	// Annotate each terminal with whether it's currently attached + process info
+	// Batch-fetch process info with a single ps snapshot
+	const runningIds = terminals.filter((t) => t.status === "running").map((t) => t.id);
+	const processMap = terminalService.getProcessesBatch(runningIds);
 	const annotated = terminals.map((t) => ({
 		...t,
 		attached: attachedSet.has(t.id),
-		processes: t.status === "running" ? terminalService.getProcesses(t.id) : [],
+		processes: processMap.get(t.id) ?? [],
 	}));
 	return c.json({ terminals: annotated, orphanSockets });
 });
@@ -106,6 +108,23 @@ adminRoutes.delete("/terminals/:id", async (c) => {
 	const id = c.req.param("id");
 	await terminalService.kill(id);
 	return c.json({ ok: true });
+});
+
+adminRoutes.post("/terminals/batch-kill", async (c) => {
+	const { ids } = await c.req.json();
+	if (!Array.isArray(ids) || ids.length === 0 || !ids.every((id) => typeof id === "string")) {
+		throw new AppError("ids must be a non-empty string array", 400, "VALIDATION_ERROR");
+	}
+	const results: { id: string; ok: boolean; error?: string }[] = [];
+	for (const id of ids) {
+		try {
+			await terminalService.kill(id);
+			results.push({ id, ok: true });
+		} catch (e) {
+			results.push({ id, ok: false, error: e instanceof Error ? e.message : "unknown" });
+		}
+	}
+	return c.json({ results });
 });
 
 adminRoutes.post("/terminals/kill-orphan", async (c) => {

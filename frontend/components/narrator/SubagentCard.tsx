@@ -47,6 +47,7 @@ import {
 	StatusIcon,
 	ToolCallCard,
 } from "./ToolCallCard";
+import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
 const stripSubagentId = (text: string) => text.replace(SUBAGENT_ID_RE, "").trim();
@@ -105,24 +106,10 @@ export const SubagentCard = memo(
 		const resolvedModel = childMessages[0]?.subagentModel ?? input.model;
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
-		// Clamp card height to 80% of the nearest scroll container (chat viewport).
-		// Read once after mount via DOM traversal — works regardless of render timing.
+		// Clamp card height to 70% of the nearest scroll container (chat viewport).
 		const cardRef = useRef<HTMLDivElement>(null);
 		const scrollBoxRef = useRef<HTMLDivElement>(null);
-		const [vpHeight, setVpHeight] = useState<number | undefined>();
-		useEffect(() => {
-			const node = cardRef.current;
-			if (!node || vpHeight) return;
-			let el: HTMLElement | null = node.parentElement;
-			while (el) {
-				const ov = getComputedStyle(el).overflowY;
-				if (ov === "scroll" || ov === "auto") {
-					setVpHeight(el.clientHeight * 0.7);
-					return;
-				}
-				el = el.parentElement;
-			}
-		});
+		const vpHeight = useNearestScrollContainerHeight(cardRef, 0.7);
 		const prevChildCount = useRef(childMessages.length);
 		useEffect(() => {
 			if (!prompt || promptHasLineBreak) {

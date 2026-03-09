@@ -1,5 +1,21 @@
 import type { z } from "zod/v4";
 
+// === API error with HTTP status ===
+
+/**
+ * Error thrown by provider adapters when the upstream API returns a non-OK
+ * HTTP response.  Carries the numeric `status` so that `isRetryableError()`
+ * in the agent loop can inspect it without parsing the message string.
+ */
+export class ApiError extends Error {
+	readonly status: number;
+	constructor(status: number, message: string) {
+		super(message);
+		this.name = "ApiError";
+		this.status = status;
+	}
+}
+
 // === Tool system ===
 
 export interface ToolContext {
@@ -84,6 +100,8 @@ export type AgentEvent =
 			brokenInputOverride?: Record<string, unknown>;
 			/** Updated input to display in the UI (for broken calls, the sanitized version). */
 			updatedInput?: Record<string, unknown>;
+			/** Optional metadata from the tool (e.g. line numbers for Edit). */
+			metadata?: Record<string, unknown>;
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
@@ -118,6 +136,13 @@ export type AgentEvent =
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "invalid_state"; reason: string; message: string }
+	| {
+			type: "web_search";
+			id: string;
+			status: "in_progress" | "searching" | "completed";
+			query?: string;
+			queries?: string[];
+	  }
 	| { type: "done" };
 
 export interface AgentToolUse {
@@ -153,6 +178,12 @@ export type ContentBlock =
 			name: string;
 			input: Record<string, unknown>;
 			streamStartedAt?: number;
+	  }
+	| {
+			type: "web_search";
+			id: string;
+			query?: string;
+			queries?: string[];
 	  };
 
 // === Plan mode constants ===

@@ -44,6 +44,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
+import { SetupWizard } from "../components/settings/SetupWizard";
 import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
@@ -103,6 +104,25 @@ function AuthenticatedLayout() {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { width: navWidth, onDragStart: onNavDragStart } = useResizableNav();
 	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
+
+	// --- Setup wizard ---
+	const [wizardOpen, setWizardOpen] = useState(false);
+	const [wizardMinimized, setWizardMinimized] = useState(false);
+	useEffect(() => {
+		if (user?.role === "admin" && prefs && prefs.setupWizardCompleted === false) {
+			setWizardOpen(true);
+		}
+	}, [user?.role, prefs]);
+
+	// Listen for open-wizard events from other pages
+	useEffect(() => {
+		const handler = () => {
+			setWizardMinimized(false);
+			setWizardOpen(true);
+		};
+		window.addEventListener("narrafork:open-wizard", handler);
+		return () => window.removeEventListener("narrafork:open-wizard", handler);
+	}, []);
 
 	// --- Mobile navbar back-button interception ---
 	// Push a sentinel history entry when the navbar opens so that the browser
@@ -480,7 +500,15 @@ function AuthenticatedLayout() {
 				/>
 				<Text size="xs" c="dimmed" ta="center" mt={4}>
 					v{__APP_VERSION__}
-					<Anchor component={Link} to="/licenses" size="xs" c="dimmed" td="underline" ml={8} onClick={closeNavForLink}>
+					<Anchor
+						component={Link}
+						to="/licenses"
+						size="xs"
+						c="dimmed"
+						td="underline"
+						ml={8}
+						onClick={closeNavForLink}
+					>
 						{t("licenses")}
 					</Anchor>
 				</Text>
@@ -507,6 +535,23 @@ function AuthenticatedLayout() {
 					</Button>
 				</Group>
 			</Modal>
+
+			<SetupWizard
+				opened={wizardOpen}
+				minimized={wizardMinimized}
+				onClose={() => {
+					setWizardOpen(false);
+					setWizardMinimized(false);
+				}}
+				onMinimize={() => {
+					setWizardOpen(false);
+					setWizardMinimized(true);
+				}}
+				onRestore={() => {
+					setWizardMinimized(false);
+					setWizardOpen(true);
+				}}
+			/>
 		</AppShell>
 	);
 }

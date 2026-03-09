@@ -242,7 +242,24 @@ graphRoutes.get("/:id/graph", async (c) => {
 		edgeRows,
 	);
 
-	return c.json({ nodes, edges, explorationGroups: groups });
+	// Get terminals that are opened in the graph
+	const openedTerminals = chapterIds.length
+		? await db.query.terminals.findMany({
+				where: (t, { and, inArray, eq }) =>
+					and(inArray(t.chapterId, chapterIds), eq(t.graphOpened, 1), eq(t.status, "running")),
+				columns: {
+					id: true,
+					chapterId: true,
+					name: true,
+					graphX: true,
+					graphY: true,
+					graphWidth: true,
+					graphHeight: true,
+				},
+			})
+		: [];
+
+	return c.json({ nodes, edges, explorationGroups: groups, openedTerminals });
 });
 
 graphRoutes.patch("/:id/graph/positions", async (c) => {

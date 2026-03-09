@@ -184,7 +184,6 @@ export const mergeSummaryService = {
 				}
 			}
 
-
 			// Use pre-collected data when available (collected before merge).
 			// Fall back to git queries (may return empty for fast-forward merges).
 			let commitMessages: string[];
@@ -342,7 +341,6 @@ export const mergeSummaryService = {
 			.from(narratorMessageRefs)
 			.where(inArray(narratorMessageRefs.messageId, ids));
 		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
-
 
 		// Delete refs first (FK), then messages
 		await db.transaction(async (tx) => {

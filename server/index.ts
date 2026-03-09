@@ -10,6 +10,8 @@ import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import {
 import { logger } from "./lib/logger";
+import { mcpManager } from "./lib/mcp/manager";
+import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
 import { settings } from "./lib/settings";
@@ -271,6 +273,16 @@ startHeartbeat();
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });
 });
+
+// Initialize external MCP servers
+mcpManager
+	.initialize()
+	.then(() => {
+		syncMcpTools();
+	})
+	.catch((err) => {
+		logger.error("MCP server initialization failed", { error: String(err) });
+	});
 
 // Clean up stale narrator states from previous server run
 recoverNarrators().catch((err) => {

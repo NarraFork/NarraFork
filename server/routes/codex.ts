@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { getCodexManager, type LoadBalancingMode } from "../lib/codex-manager";
+import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
@@ -174,6 +175,21 @@ codexRoutes.post("/credentials/:id/reset", (c) => {
 		const msg = err instanceof Error ? err.message : String(err);
 		return c.json({ error: msg }, 404);
 	}
+});
+
+/**
+ * DELETE /api/codex/credentials/batch
+ * Remove multiple credentials at once.
+ */
+codexRoutes.delete("/credentials/batch", async (c) => {
+	const body = await c.req.json<{ ids?: string[] }>();
+	const ids = body?.ids;
+	if (!Array.isArray(ids) || ids.length === 0) {
+		throw new ValidationError("ids must be a non-empty array");
+	}
+	const manager = getCodexManager();
+	const result = manager.removeCredentials(ids);
+	return c.json(result);
 });
 
 /**

@@ -84,6 +84,21 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 			target.closest(".react-flow__edge") === null &&
 			target.closest(".react-flow__handle") === null;
 
+		/**
+		 * Looser check for touch-initiated lasso (contextmenu / long-press).
+		 * Fixed-position overlays (e.g. SelectionToolbar) live inside the
+		 * .react-flow container in the DOM but outside .react-flow__pane,
+		 * so the strict isOnPane check fails when the touch lands on them.
+		 * We accept any target inside the ReactFlow root that isn't a
+		 * node / edge / handle.
+		 */
+		const canStartTouchLasso = (target: HTMLElement) =>
+			el.contains(target) &&
+			target.closest(".react-flow__node") === null &&
+			target.closest(".react-flow__edge") === null &&
+			target.closest(".react-flow__handle") === null &&
+			target.closest(".react-flow__controls") === null;
+
 		/** Cancel d3-zoom's ongoing pan. */
 		const cancelPan = () => {
 			const renderer = el.querySelector(".react-flow__renderer");
@@ -159,10 +174,13 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 		const onContextMenu = (e: Event) => {
 			const target = e.target as HTMLElement;
 			if (!el.contains(target)) return;
-			if (!isOnPane(target)) return;
+			if (!canStartTouchLasso(target)) return;
 
 			e.preventDefault();
 			e.stopPropagation();
+			// Clear previous selection so the toolbar disappears immediately,
+			// preventing it from capturing subsequent touch events.
+			onSelectRef.current(new Set());
 			cancelPan();
 			beginLasso((e as MouseEvent).clientX, (e as MouseEvent).clientY);
 		};

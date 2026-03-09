@@ -27,6 +27,11 @@ export function useUpdateGraphPositions(projectId: string) {
 		) => api.updateGraphPositions(projectId, positions),
 	});
 
+	// Store mutate in a ref so flush/scheduleFlush/savePosition/savePanelState
+	// never depend on the mutation object (which changes every render).
+	const mutateRef = useRef(mutation.mutate);
+	mutateRef.current = mutation.mutate;
+
 	const flush = useCallback(() => {
 		if (pendingRef.current.size === 0) return;
 		const positions = Array.from(pendingRef.current.entries()).map(([chapterId, upd]) => ({
@@ -38,8 +43,8 @@ export function useUpdateGraphPositions(projectId: string) {
 			panelHeight: upd.panelHeight,
 		}));
 		pendingRef.current.clear();
-		mutation.mutate(positions);
-	}, [mutation]);
+		mutateRef.current(positions);
+	}, []);
 
 	useEffect(() => {
 		return () => {

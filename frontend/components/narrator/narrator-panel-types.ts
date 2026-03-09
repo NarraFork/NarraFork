@@ -48,6 +48,7 @@ export type MessagesPage = {
 	messages: NarratorMsg[];
 	hasMore: boolean;
 	nextCursor: string | null;
+	hasMoreAfter?: boolean;
 	pruneBoundaryMessageId?: string | null;
 	prunedPercent?: number | null;
 };

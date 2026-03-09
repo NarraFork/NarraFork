@@ -39,7 +39,13 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let retryableError: string | undefined;
 
 	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
-		if (config.signal.aborted) break;
+		// When aborted, still process tool_result events so their status is
+		// persisted to the DB (running → success/fail).  Without this, tools
+		// that finished executing after the abort signal would stay "running"
+		// forever — this happens when the user approves a permission request
+		// with feedback text attached, which aborts the loop right after the
+		// tool starts executing.
+		if (config.signal.aborted && event.type !== "tool_result") break;
 
 		try {
 			const result = await processEvent(event, eventContext, hooks);
@@ -53,6 +59,9 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 				error: String(err),
 			});
 		}
+
+		// After processing a tool_result under abort, stop consuming further events.
+		if (config.signal.aborted) break;
 
 		if (event.type === "assistant_message") {
 			finalText = event.text || "";

@@ -355,6 +355,11 @@ const toolMessages = {
 		en: "Read-only mode: only read operations are allowed. Write, edit, and other mutating tools are denied.",
 		"zh-CN": "只读模式：仅允许读取操作。写入、编辑及其他修改类工具已被拒绝。",
 	},
+	permissionDeniedPlanMode: {
+		en: "[PLAN MODE] This operation is denied in plan mode. You are in plan mode — writing and editing files (except the plan file) is not allowed. Focus on reading and analyzing code to form your plan, then call ExitPlanMode to submit it.",
+		"zh-CN":
+			"[计划模式] 此操作在计划模式下被拒绝。你当前处于计划模式——不允许写入或编辑文件（计划文件除外）。请专注于阅读和分析代码以形成你的计划，然后调用 ExitPlanMode 提交计划。",
+	},
 	// Plan mode disabled tool description (injected in loop.ts)
 	planModeToolDisabled: {
 		en: "[PLAN MODE] This tool is disabled during plan mode. Focus on reading and analyzing code, then call ExitPlanMode with your plan.",
@@ -384,20 +389,18 @@ const toolMessages = {
 
 STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 1. Each tool call's TOTAL input must be under 10,000 characters (including file_path, old_string, new_string, content — everything).
-2. Write is ONLY for the first section of a new file (< 10,000 chars). End with a unique marker comment: "// APPEND_NEXT_1" (use the file type's comment syntax, e.g. {# APPEND_NEXT_1 #} for Jinja, <!-- APPEND_NEXT_1 --> for HTML).
-3. ALL subsequent parts MUST use Edit — NEVER use Write again for the same file. Use old_string="// APPEND_NEXT_1" (this exact short marker, nothing more) and new_string=<next section + next marker "// APPEND_NEXT_2" if more follows>. Increment the number each time (APPEND_NEXT_1 → APPEND_NEXT_2 → APPEND_NEXT_3 …). Keep old_string as short as possible — just the marker line.
-4. Remove the APPEND marker only in the final Edit call (new_string contains the last section without any marker).
-5. For large replacements: split into multiple small Edit calls with different unique short anchors as old_string.
-6. NEVER write/edit more than 10,000 characters in a single tool call. NEVER use Write to overwrite a file that already exists with content.]`,
+2. SKELETON-FIRST approach for new files: Use Write to create the file with a SKELETON — include the real opening code, then place numbered splice markers where large sections will go, then the real closing code. The skeleton itself must be under 10,000 chars. Use the file type's comment syntax for markers (e.g. // SPLICE_1 for JS/TS, {# SPLICE_1 #} for Jinja, <!-- SPLICE_1 --> for HTML). Number markers sequentially: SPLICE_1, SPLICE_2, SPLICE_3, etc.
+3. FILL via Edit: For each marker, call Edit with old_string="// SPLICE_1" (just the marker, nothing more) and new_string=<the real content for that section>. If a section is still too large, replace the marker with partial content + a new sub-marker (e.g. SPLICE_1a, SPLICE_1b).
+4. NEVER write/edit more than 10,000 characters in a single tool call. NEVER use Write to overwrite a file that already exists with content.
+5. For large replacements in existing files: split into multiple small Edit calls with different unique short anchors as old_string.]`,
 		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。
 
 严格规则——你必须严格遵守以下规则，避免重复截断：
 1. 每次工具调用的总输入必须小于 10,000 字符（包括 file_path、old_string、new_string、content 等所有字段）。
-2. Write 仅用于新文件的第一段（< 10,000 字符），末尾加唯一标记注释 "// APPEND_NEXT_1"（根据文件类型使用对应注释语法，如 Jinja 用 {# APPEND_NEXT_1 #}，HTML 用 <!-- APPEND_NEXT_1 -->）。
-3. 所有后续部分必须使用 Edit——绝对不要对同一文件再次使用 Write。用 old_string="// APPEND_NEXT_1"（就这一行短标记，不要多写）、new_string=<下一段内容，如果还有后续则末尾加 "// APPEND_NEXT_2">。每次递增编号（APPEND_NEXT_1 → APPEND_NEXT_2 → APPEND_NEXT_3 …）。old_string 要尽可能短——只写标记行本身。
-4. 仅在最后一次 Edit 时不再添加 APPEND 标记（new_string 只包含最后一段内容，不带标记）。
-5. 大范围替换：拆分为多个小 Edit，用不同的唯一短锚点作为 old_string。
-6. 绝对不要在单次调用中写入/编辑超过 10,000 字符。绝对不要用 Write 覆盖已有内容的文件。]`,
+2. 骨架优先策略（新文件）：用 Write 创建文件骨架——包含真实的开头代码，然后在需要大段内容的位置放置编号的拼接标记，最后是真实的结尾代码。骨架本身必须小于 10,000 字符。根据文件类型使用对应注释语法（如 JS/TS 用 // SPLICE_1，Jinja 用 {# SPLICE_1 #}，HTML 用 <!-- SPLICE_1 -->）。标记按顺序编号：SPLICE_1、SPLICE_2、SPLICE_3 等。
+3. 用 Edit 填充：对每个标记，调用 Edit，old_string="// SPLICE_1"（只写标记本身，不要多写），new_string=<该段的真实内容>。如果某段仍然过大，将标记替换为部分内容 + 新的子标记（如 SPLICE_1a、SPLICE_1b）。
+4. 绝对不要在单次调用中写入/编辑超过 10,000 字符。绝对不要用 Write 覆盖已有内容的文件。
+5. 大范围替换已有文件：拆分为多个小 Edit，用不同的唯一短锚点作为 old_string。]`,
 	},
 	// Placeholder for broken tool call content in persisted input
 	brokenToolCallInputPlaceholder: {
@@ -406,9 +409,9 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 	},
 	// Persisted result for broken tool calls
 	brokenToolCallResult: {
-		en: "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use APPEND marker to split large writes.",
+		en: "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use skeleton-first approach: Write a skeleton with SPLICE markers, then Edit to fill each marker.",
 		"zh-CN":
-			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用 APPEND 标记分段写入。",
+			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。",
 	},
 } satisfies Record<string, Record<Locale, string>>;
 

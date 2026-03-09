@@ -505,6 +505,35 @@ export class CodexManager {
 		this.saveStats();
 	}
 
+	removeCredentials(ids: string[]): { removed: string[]; notFound: string[] } {
+		const removed: string[] = [];
+		const notFound: string[] = [];
+		for (const id of ids) {
+			const idx = this.entries.findIndex((e) => e.id === id);
+			if (idx === -1) {
+				notFound.push(id);
+				continue;
+			}
+			this.entries.splice(idx, 1);
+			this.stats.delete(id);
+			this.usageRefreshPromises.delete(id);
+			this.evictSessionsByCredential(id);
+			removed.push(id);
+		}
+		if (
+			this.currentId &&
+			!this.entries.find((e) => e.id === this.currentId) &&
+			this.entries.length > 0
+		) {
+			this.currentId = this.entries[0].id;
+		}
+		if (removed.length > 0) {
+			this.saveCredentials();
+			this.saveStats();
+		}
+		return { removed, notFound };
+	}
+
 	updateCredential(id: string, fields: { displayName?: string; priority?: number }): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);

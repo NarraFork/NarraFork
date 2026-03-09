@@ -16,7 +16,10 @@ import {
 	upsertStreamingToolBlock,
 	upsertSubagentStreamingChunk,
 } from "./message-tree-utils";
-import { removeStreamingChunksMsg } from "./narrator-message-helpers";
+import {
+	removeStreamingChunksMsg,
+	revokeContentBlockPreviewUrls,
+} from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesPage,
@@ -40,7 +43,7 @@ export interface UseNarratorPanelWSOptions {
 	narratorStatus?: string;
 	narratorErrorMessage?: string | null;
 	messagesData?: { pages: MessagesPage[] };
-	messagesQueryKey: unknown[];
+	messagesQueryKey: readonly unknown[];
 	/** Ref to isAtBottom state for unread tracking */
 	isAtBottomRef: React.RefObject<boolean>;
 	scrollToBottom: (instant?: boolean) => void;
@@ -71,6 +74,12 @@ export interface UseNarratorPanelWSReturn {
 	streamingRef: React.RefObject<string>;
 	streamingReasoningRef: React.RefObject<string>;
 	streamingVersion: number;
+	topLevelStreamingChunks: NarratorMsg | null;
+	webSearchRef: React.RefObject<{
+		id: string;
+		status: "in_progress" | "searching" | "completed";
+		query?: string;
+	} | null>;
 	// Permissions
 	pendingPermsMap: Map<string, PendingPermission>;
 	pendingPermission: PendingPermission | null;
@@ -100,6 +109,22 @@ export interface UseNarratorPanelWSReturn {
 	viewers: ViewerInfo[];
 }
 
+function applyPendingPermissionsToCache(
+	old: MessagesQueryData | undefined,
+	perms: PendingPermission[],
+	index: MessageIndex,
+): MessagesQueryData | undefined {
+	if (!old?.pages?.length || perms.length === 0) return old;
+	let result = old as MessagesQueryData | undefined;
+	for (const perm of perms) {
+		if (!perm.toolUseId || !result) continue;
+		result = mergeFieldsByIndex(result, perm.toolUseId, { status: "pending" }, index) as
+			| MessagesQueryData
+			| undefined;
+	}
+	return result;
+}
+
 export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarratorPanelWSReturn {
 	const {
 		narratorId,
@@ -121,6 +146,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const streamingRef = useRef("");
 	const streamingReasoningRef = useRef("");
 	const [streamingVersion, setStreamingVersion] = useState(0);
+	const [topLevelChunksVersion, bumpTopLevelStreamingChunksVersion] = useState(0);
+	// Native web search status (Codex web_search tool) — stored as ref to avoid extra re-renders;
+	// streamingVersion bump handles the render trigger.
+	const webSearchRef = useRef<{
+		id: string;
+		status: "in_progress" | "searching" | "completed";
+		query?: string;
+	} | null>(null);
 
 	// RAF-based throttle: coalesce rapid streaming updates into one render per frame
 	const streamingRafRef = useRef(0);
@@ -147,6 +180,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			}
 		>
 	>(new Map());
+	const topLevelStreamingChunkRef = useRef<
+		Map<
+			string,
+			{
+				toolUseId: string;
+				toolName: string;
+				inputCharsTotal: number;
+				extractedFilePath?: string;
+				contentCharsReceived?: number;
+			}
+		>
+	>(new Map());
+	const topLevelStreamingCreatedAtRef = useRef<string | null>(null);
 	const toolChunkRafRef = useRef(0);
 
 	// Cancel pending RAF handles on unmount
@@ -166,35 +212,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setStreamingVersion((v) => v + 1);
 	}, []);
 
-	// Helper: cancel any pending tool chunk RAF and clear the accumulator
-	const cancelPendingToolChunks = useCallback(() => {
+	// Helper: cancel any pending tool chunk RAF and clear temporary streaming tool state.
+	const cancelPendingToolChunks = useCallback((notify = true) => {
 		pendingToolChunkRef.current.clear();
+		const hadTopLevelChunks = topLevelStreamingChunkRef.current.size > 0;
+		topLevelStreamingChunkRef.current.clear();
+		topLevelStreamingCreatedAtRef.current = null;
 		if (toolChunkRafRef.current) {
 			cancelAnimationFrame(toolChunkRafRef.current);
 			toolChunkRafRef.current = 0;
 		}
+		if (notify && hadTopLevelChunks) {
+			bumpTopLevelStreamingChunksVersion((v) => v + 1);
+		}
 	}, []);
-
-	// Helper: once any leading text/reasoning appears, streaming tool chunks should
-	// render after StreamingBubble (not merged into the main message list above it).
-	const markStreamingChunkNoMerge = useCallback(() => {
-		qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-			if (!old?.pages?.length) return old;
-			const pages = [...old.pages];
-			const firstPage = { ...pages[0] };
-			const idx = firstPage.messages.findIndex(
-				(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
-			);
-			if (idx === -1) return old;
-			const current = firstPage.messages[idx];
-			if (current?._noMerge) return old;
-			const updated = [...firstPage.messages];
-			updated[idx] = { ...current, _noMerge: true };
-			firstPage.messages = updated;
-			pages[0] = firstPage;
-			return { ...old, pages };
-		});
-	}, [qc, messagesQueryKey]);
 
 	// --- Permission state ---
 	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
@@ -285,6 +316,68 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		return result;
 	}, [hydrated, messagesData]);
 	toolUseIndexRef.current = toolUseIndex;
+
+	const topLevelStreamingChunks: NarratorMsg | null = useMemo(() => {
+		// topLevelChunksVersion triggers recalculation when chunks are added/cleared
+		void topLevelChunksVersion;
+		const chunks = [...topLevelStreamingChunkRef.current.values()];
+		if (chunks.length === 0) return null;
+
+		let blocks: ContentBlock[] = [];
+		let toolCalls = [] as NonNullable<NarratorMsg["toolCalls"]>;
+		for (const chunk of chunks) {
+			// biome-ignore lint/suspicious/noExplicitAny: extended sentinel fields
+			const ext = chunk as any;
+			if (ext._started) {
+				// Tool has been promoted to "started" or "completed" — render as a real
+				// tool call card with actual input instead of the streaming indicator.
+				const inputJson = ext._input ?? {};
+				const next = upsertStreamingToolBlock(
+					blocks,
+					toolCalls,
+					chunk.toolUseId,
+					chunk.toolName,
+					inputJson,
+				);
+				blocks = next.blocks;
+				toolCalls = next.toolCalls;
+				// Patch status, timing, and output so the card reflects real state
+				const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+				if (tcIdx !== -1) {
+					toolCalls[tcIdx] = {
+						...toolCalls[tcIdx],
+						status: ext._status ?? "running",
+						...(ext._startedAt && { startedAt: ext._startedAt }),
+						...(ext._output !== undefined && { outputJson: ext._output }),
+						...(ext._durationMs != null && { durationMs: ext._durationMs }),
+						...(ext._metadata && { _metadata: ext._metadata }),
+					};
+				}
+			} else {
+				const next = upsertStreamingToolBlock(blocks, toolCalls, chunk.toolUseId, chunk.toolName, {
+					_streamingChars: chunk.inputCharsTotal,
+					...(chunk.extractedFilePath && { _streamingFilePath: chunk.extractedFilePath }),
+					...(chunk.contentCharsReceived != null && {
+						_streamingContentChars: chunk.contentCharsReceived,
+					}),
+				});
+				blocks = next.blocks;
+				toolCalls = next.toolCalls;
+			}
+		}
+
+		return {
+			id: STREAMING_CHUNKS_MSG_ID,
+			narratorId,
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: blocks,
+			contentText: null,
+			toolCalls,
+			createdAt: topLevelStreamingCreatedAtRef.current ?? new Date().toISOString(),
+			children: [],
+		};
+	}, [topLevelChunksVersion, narratorId]);
 
 	// --- Permission decision refs ---
 	const sendPermissionDecisionRef = useRef<
@@ -457,13 +550,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds],
 	);
 
+	const firstPageHasMoreAfter = messagesData?.pages?.[0]?.hasMoreAfter ?? false;
+
 	// --- lastMessageId for WS catch-up ---
 	const lastMessageId = useMemo(() => {
+		if (firstPageHasMoreAfter) return undefined;
 		const pages = messagesData?.pages;
 		if (!pages?.length) return undefined;
 		const firstPage = pages[0];
 		if (!firstPage?.messages?.length) return undefined;
-		// Walk backwards to find the last real (non-synthetic) message
+		// Walk backwards to find the last real (non-synthetic) message.
+		// When the initial page is a bounded around-window with newer messages omitted,
+		// skip catch-up entirely so WS subscribe does not immediately refill the tail.
 		for (let i = firstPage.messages.length - 1; i >= 0; i--) {
 			const msg = firstPage.messages[i];
 			if (!msg?.id || msg.id === STREAMING_CHUNKS_MSG_ID) continue;
@@ -474,7 +572,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			return deepest.id as string | undefined;
 		}
 		return undefined;
-	}, [messagesData]);
+	}, [firstPageHasMoreAfter, messagesData]);
 
 	// --- WebSocket ---
 	const {
@@ -496,13 +594,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (ev.delta.type === "text_delta") {
 					streamingRef.current += ev.delta.text;
 					flushStreamingVersion();
-					markStreamingChunkNoMerge();
 					return;
 				}
 				if (ev.delta.type === "reasoning_delta") {
 					streamingReasoningRef.current += ev.delta.text;
 					flushStreamingVersion();
-					markStreamingChunkNoMerge();
 					return;
 				}
 			},
@@ -531,11 +627,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						if (streamingReasoningRef.current) {
 							streamingReasoningRef.current = "";
 						}
+						webSearchRef.current = null;
 						clearStreamingState();
-					}
-					if (wsData.message?.role === "assistant") {
-						// Clear pending RAF chunks — real message supersedes synthetic state
-						cancelPendingToolChunks();
+						// Clear pending RAF chunks — real message supersedes synthetic state.
+						// Notify (bump version) so topLevelStreamingChunks memo recomputes
+						// to null immediately, since onToolStarted/onToolCompleted no longer
+						// remove individual entries from the streaming ref.
+						cancelPendingToolChunks(true);
 						removeStreamingChunksMsg(qc, messagesQueryKey);
 					}
 					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
@@ -586,13 +684,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						if (optimisticIdx !== -1) {
 							const updated = [...firstPage.messages];
 							const om = updated[optimisticIdx];
-							if (Array.isArray(om.contentJson)) {
-								for (const block of om.contentJson) {
-									if (typeof block.previewUrl === "string") {
-										URL.revokeObjectURL(block.previewUrl);
-									}
-								}
-							}
+							revokeContentBlockPreviewUrls(om.contentJson);
 							updated[optimisticIdx] = newMsg;
 							firstPage.messages = updated;
 						} else {
@@ -637,13 +729,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (optimisticIdx !== -1) {
 						const updated = [...firstPage.messages];
 						const om = updated[optimisticIdx];
-						if (Array.isArray(om.contentJson)) {
-							for (const block of om.contentJson) {
-								if (typeof block.previewUrl === "string") {
-									URL.revokeObjectURL(block.previewUrl);
-								}
-							}
-						}
+						revokeContentBlockPreviewUrls(om.contentJson);
 
 						updated[optimisticIdx] = newMsg;
 						firstPage.messages = updated;
@@ -660,9 +746,32 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				output?: unknown,
 				durationMs?: number,
 				updatedInput?: Record<string, unknown>,
+				metadata?: Record<string, unknown>,
 			) => {
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
+
+				// Update the streaming chunk entry if it still exists (assistant_message
+				// may not have arrived yet). Patch status/output/duration so the card
+				// renders as completed while we wait for the real message.
+				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+				if (streamingEntry) {
+					topLevelStreamingChunkRef.current.set(toolUseId, {
+						...streamingEntry,
+						inputCharsTotal: -1,
+						extractedFilePath: undefined,
+						contentCharsReceived: undefined,
+						_started: true,
+						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+						_input: updatedInput ?? (streamingEntry as any)._input,
+						_status: status,
+						_output: output,
+						_durationMs: durationMs,
+						_metadata: metadata,
+						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+					} as any);
+					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				}
 
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
@@ -682,12 +791,49 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							toolUseIndexRef.current,
 						);
 					}
+					if (metadata && result) {
+						result = mergeFieldsByIndex(
+							result,
+							toolUseId,
+							{ _metadata: metadata },
+							toolUseIndexRef.current,
+						);
+					}
 					return result;
 				});
 			},
-			onToolStarted: (toolUseId: string, _toolName: string, streamStartedAt?: number) => {
+			onToolStarted: (
+				toolUseId: string,
+				toolName: string,
+				streamStartedAt?: number,
+				input?: Record<string, unknown>,
+			) => {
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
+
+				// Promote the streaming chunk to a "started" state: remove the synthetic
+				// _streamingChars marker so ToolCallCard renders it as a real (expandable)
+				// tool card with the actual input. The chunk stays in the ref until
+				// onMessage's cancelPendingToolChunks() clears it, preventing the card
+				// from disappearing when assistant_message hasn't arrived yet.
+				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+				if (streamingEntry) {
+					// Replace with a sentinel that marks it as "started" (no longer streaming).
+					// We set inputCharsTotal to -1 as a flag — the memo builder will detect
+					// this and produce a non-streaming tool call card.
+					topLevelStreamingChunkRef.current.set(toolUseId, {
+						...streamingEntry,
+						toolName,
+						inputCharsTotal: -1, // sentinel: no longer streaming
+						extractedFilePath: undefined,
+						contentCharsReceived: undefined,
+						_started: true,
+						_input: input,
+						_startedAt: streamStartedAt,
+						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+					} as any);
+					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				}
 
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
@@ -724,12 +870,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						const chunks = [...pending.values()];
 						pending.clear();
 
-						// Apply all pending chunks in a single setQueryData call
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-							let result = old;
-							for (const chunk of chunks) {
-								if (!result) continue;
-								if (chunk.parentToolUseId) {
+						let topLevelChanged = false;
+						const subagentChunks = chunks.filter((chunk) => !!chunk.parentToolUseId);
+						if (subagentChunks.length > 0) {
+							qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+								let result = old;
+								for (const chunk of subagentChunks) {
+									if (!chunk.parentToolUseId || !result) continue;
 									result = upsertSubagentStreamingChunk(
 										result,
 										chunk.parentToolUseId,
@@ -739,59 +886,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 										chunk.inputCharsTotal,
 										toolUseIndexRef.current,
 									) as MessagesQueryData;
-									continue;
 								}
-								// Top-level streaming chunk
-								const pages = result.pages?.length ? [...result.pages] : [];
-								const firstPage =
-									pages.length > 0
-										? { ...pages[0] }
-										: { messages: [], hasMore: false, nextCursor: null };
-								const existingIdx = firstPage.messages.findIndex(
-									(m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID,
-								);
-								const existing = existingIdx !== -1 ? firstPage.messages[existingIdx] : null;
-
-								const { blocks, toolCalls } = upsertStreamingToolBlock(
-									existing ? [...existing.contentJson] : [],
-									existing ? [...existing.toolCalls] : [],
-									chunk.toolUseId,
-									chunk.toolName,
-									{
-										_streamingChars: chunk.inputCharsTotal,
-										...(chunk.extractedFilePath && {
-											_streamingFilePath: chunk.extractedFilePath,
-										}),
-										...(chunk.contentCharsReceived != null && {
-											_streamingContentChars: chunk.contentCharsReceived,
-										}),
-									},
-								);
-
-								const hasLeadingContent = !!streamingRef.current || !!streamingReasoningRef.current;
-								const syntheticMsg: NarratorMsg = {
-									id: STREAMING_CHUNKS_MSG_ID,
-									narratorId,
-									parentToolUseId: null,
-									role: "assistant",
-									contentJson: blocks,
-									contentText: null,
-									toolCalls: toolCalls,
-									createdAt: existing?.createdAt ?? new Date().toISOString(),
-									children: [],
-									_noMerge: hasLeadingContent,
-								};
-								if (existingIdx !== -1) {
-									firstPage.messages = [...firstPage.messages];
-									firstPage.messages[existingIdx] = syntheticMsg;
-								} else {
-									firstPage.messages = [...firstPage.messages, syntheticMsg];
-								}
-								pages[0] = firstPage;
-								result = { ...result, pages } as MessagesQueryData;
+								return result;
+							});
+						}
+						for (const chunk of chunks) {
+							if (chunk.parentToolUseId) continue;
+							if (!topLevelStreamingCreatedAtRef.current) {
+								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
 							}
-							return result;
-						});
+							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
+								toolUseId: chunk.toolUseId,
+								toolName: chunk.toolName,
+								inputCharsTotal: chunk.inputCharsTotal,
+								extractedFilePath: chunk.extractedFilePath,
+								contentCharsReceived: chunk.contentCharsReceived,
+							});
+							topLevelChanged = true;
+						}
+						if (topLevelChanged) {
+							bumpTopLevelStreamingChunksVersion((v) => v + 1);
+						}
 					});
 				}
 			},
@@ -844,11 +959,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (streamingReasoningRef.current) {
 						streamingReasoningRef.current = "";
 					}
+					webSearchRef.current = null;
 					clearStreamingState();
 				}
 				if (status === "idle") {
-					// Cancel any pending RAF tool chunk flush
-					cancelPendingToolChunks();
+					// Cancel any pending RAF tool chunk flush.
+					cancelPendingToolChunks(false);
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -889,6 +1005,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setPrunedPercent(prunedPct);
 			},
 			},
+			onWebSearch: (id, status, query) => {
+				webSearchRef.current = { id, status, query };
+				flushStreamingVersion();
+			},
 			onGitStatus: (data) => {
 				qc.setQueryData(["chapterGitStatus", data.chapterId], {
 					commitsAhead: data.commitsAhead,
@@ -912,8 +1032,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
 			onNarratorError: (error) => {
-				// Session error may leave synthetic streaming chunks in the cache
-				cancelPendingToolChunks();
+				// Session error may leave synthetic streaming chunks in the cache.
+				cancelPendingToolChunks(false);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				if (streamingRef.current) {
 					streamingRef.current = "";
@@ -921,6 +1041,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (streamingReasoningRef.current) {
 					streamingReasoningRef.current = "";
 				}
+				webSearchRef.current = null;
 				clearStreamingState();
 				notifications.show({
 					title: t("narratorError"),
@@ -976,8 +1097,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onFullReload: () => {
-				// Clean up synthetic streaming state before full reload
-				cancelPendingToolChunks();
+				// Clean up synthetic streaming state before full reload.
+				cancelPendingToolChunks(false);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				if (streamingRef.current) {
 					streamingRef.current = "";
@@ -985,6 +1106,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (streamingReasoningRef.current) {
 					streamingReasoningRef.current = "";
 				}
+				webSearchRef.current = null;
 				clearStreamingState();
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
@@ -1059,8 +1181,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 		// On reconnect, if the narrator is no longer thinking, the WS catch-up
 		// may have missed messages (e.g. user switched tabs while AI was running).
-		// Force a refetch so the UI shows the latest state.
-		if (isReconnect && narratorStatus !== "thinking") {
+		// Skip this for bounded around-windows, where refetching would still keep a
+		// truncated view and only add network churn.
+		if (isReconnect && narratorStatus !== "thinking" && !firstPageHasMoreAfter) {
 			qc.invalidateQueries({ queryKey: messagesQueryKey });
 		}
 
@@ -1075,7 +1198,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						}
 						return next;
 					});
-					qc.invalidateQueries({ queryKey: messagesQueryKey });
+					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+						applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+					);
 				}
 			})
 			.catch(() => {});
@@ -1102,7 +1227,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							}
 							return next;
 						});
-						qc.invalidateQueries({ queryKey: messagesQueryKey });
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+							applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+						);
 					}
 				})
 				.catch(() => {});
@@ -1113,7 +1240,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			cancelled = true;
 			clearInterval(timer);
 		};
-	}, [narratorId, narratorStatus, pendingPermsMap.size, messagesQueryKey, qc.invalidateQueries]);
+	}, [narratorId, narratorStatus, pendingPermsMap.size, messagesQueryKey, qc]);
 
 	// --- Mark "done" narrator as read ---
 	useEffect(() => {
@@ -1156,6 +1283,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		streamingRef,
 		streamingReasoningRef,
 		streamingVersion,
+		topLevelStreamingChunks,
+		webSearchRef,
 		pendingPermsMap,
 		pendingPermission,
 		renderPermCb,

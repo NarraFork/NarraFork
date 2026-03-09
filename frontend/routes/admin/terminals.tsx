@@ -2,6 +2,8 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
+	Button,
+	Checkbox,
 	Collapse,
 	Group,
 	Loader,
@@ -22,7 +24,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TerminalPanel } from "../../components/terminal/TerminalPanel";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -38,8 +40,8 @@ function AdminTerminalsPage() {
 	const { t } = useTranslation("common");
 	const qc = useQueryClient();
 
-	// Which terminal is currently open in the embedded panel
 	const [openTerminalId, setOpenTerminalId] = useState<string | null>(null);
+	const [selected, setSelected] = useState<Set<string>>(new Set());
 
 	const { data, isLoading, refetch } = useQuery({
 		queryKey: ["admin", "terminals"],
@@ -52,6 +54,15 @@ function AdminTerminalsPage() {
 		mutationFn: api.killAdminTerminal,
 		onSuccess: (_, id) => {
 			if (openTerminalId === id) setOpenTerminalId(null);
+			qc.invalidateQueries({ queryKey: ["admin", "terminals"] });
+		},
+	});
+
+	const batchKill = useMutation({
+		mutationFn: api.batchKillAdminTerminals,
+		onSuccess: (_data, killedIds) => {
+			setSelected(new Set());
+			if (openTerminalId && killedIds.includes(openTerminalId)) setOpenTerminalId(null);
 			qc.invalidateQueries({ queryKey: ["admin", "terminals"] });
 		},
 	});
@@ -79,6 +90,15 @@ function AdminTerminalsPage() {
 		},
 	});
 
+	const toggleSelect = useCallback((id: string) => {
+		setSelected((prev) => {
+			const next = new Set(prev);
+			if (next.has(id)) next.delete(id);
+			else next.add(id);
+			return next;
+		});
+	}, []);
+
 	if (user && user.role !== "admin") {
 		navigate({ to: "/" });
 		return null;
@@ -90,6 +110,19 @@ function AdminTerminalsPage() {
 	const orphanSockets = data?.orphanSockets ?? [];
 	const runningTerminals = terminals.filter((t: { status: string }) => t.status === "running");
 	const exitedTerminals = terminals.filter((t: { status: string }) => t.status !== "running");
+
+	const allRunningSelected =
+		runningTerminals.length > 0 &&
+		runningTerminals.every((t: { id: string }) => selected.has(t.id));
+	const someRunningSelected = runningTerminals.some((t: { id: string }) => selected.has(t.id));
+
+	const toggleSelectAll = () => {
+		if (allRunningSelected) {
+			setSelected(new Set());
+		} else {
+			setSelected(new Set(runningTerminals.map((t: { id: string }) => t.id)));
+		}
+	};
 
 	return (
 		<Stack>
@@ -199,9 +232,27 @@ function AdminTerminalsPage() {
 			{/* Running terminals */}
 			<Paper withBorder p="md">
 				<Stack>
-					<Title order={4}>
-						{t("running")} ({runningTerminals.length})
-					</Title>
+					<Group justify="space-between">
+						<Title order={4}>
+							{t("running")} ({runningTerminals.length})
+						</Title>
+						{selected.size > 0 && (
+							<Button
+								color="red"
+								size="xs"
+								variant="light"
+								leftSection={<IconTrash size={14} />}
+								loading={batchKill.isPending}
+								onClick={() => {
+									if (confirm(t("confirmBatchKill", { count: selected.size }))) {
+										batchKill.mutate([...selected]);
+									}
+								}}
+							>
+								{t("batchKill")} ({selected.size})
+							</Button>
+						)}
+					</Group>
 					{runningTerminals.length === 0 ? (
 						<Text c="dimmed" size="sm">
 							{t("noTerminals")}
@@ -211,6 +262,11 @@ function AdminTerminalsPage() {
 							terminals={runningTerminals}
 							t={t}
 							openTerminalId={openTerminalId}
+							selected={selected}
+							onToggleSelect={toggleSelect}
+							allSelected={allRunningSelected}
+							someSelected={someRunningSelected}
+							onToggleSelectAll={toggleSelectAll}
 							onConnect={(id, attached) => {
 								if (!attached) {
 									reattachTerminal.mutate(id);
@@ -249,6 +305,11 @@ function TerminalTable({
 	terminals,
 	t,
 	openTerminalId,
+	selected,
+	onToggleSelect,
+	allSelected,
+	someSelected,
+	onToggleSelectAll,
 	onConnect,
 	reattachPending,
 	onKill,
@@ -256,17 +317,34 @@ function TerminalTable({
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	terminals: any[];
-	t: (key: string) => string;
+	t: (key: string, opts?: Record<string, unknown>) => string;
 	openTerminalId?: string | null;
+	selected?: Set<string>;
+	onToggleSelect?: (id: string) => void;
+	allSelected?: boolean;
+	someSelected?: boolean;
+	onToggleSelectAll?: () => void;
 	onConnect?: (id: string, attached: boolean) => void;
 	reattachPending?: boolean;
 	onKill?: (id: string) => void;
 	killPending?: boolean;
 }) {
+	const selectable = !!onToggleSelect;
 	return (
 		<Table>
 			<Table.Thead>
 				<Table.Tr>
+					{selectable && (
+						<Table.Th w={40}>
+							<Checkbox
+								size="xs"
+								aria-label={t("selectAll")}
+								checked={allSelected}
+								indeterminate={someSelected && !allSelected}
+								onChange={onToggleSelectAll}
+							/>
+						</Table.Th>
+					)}
 					<Table.Th>{t("terminalName")}</Table.Th>
 					<Table.Th>{t("terminalStatus")}</Table.Th>
 					<Table.Th>{t("terminalProcesses")}</Table.Th>
@@ -286,6 +364,16 @@ function TerminalTable({
 								: undefined
 						}
 					>
+						{selectable && (
+							<Table.Td>
+								<Checkbox
+									size="xs"
+									aria-label={term.name}
+									checked={selected?.has(term.id) ?? false}
+									onChange={() => onToggleSelect?.(term.id)}
+								/>
+							</Table.Td>
+						)}
 						<Table.Td>
 							<Text size="sm">{term.name}</Text>
 							<Text size="xs" c="dimmed" ff="monospace">

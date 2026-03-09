@@ -4,6 +4,7 @@ import {
 	createTerminalSchema,
 	createTerminalTabSchema,
 	reorderTerminalTabsSchema,
+	updateTerminalGraphStateSchema,
 	updateTerminalTabSchema,
 	updateTerminalViewStateSchema,
 } from "../lib/validators";
@@ -14,7 +15,7 @@ import { terminalViewService } from "../services/terminal-view-service";
 
 export const terminalRoutes = new Hono();
 
-// === Terminal CRUD ===
+// === Terminal CRUD (collection) ===
 
 terminalRoutes.get("/", async (c) => {
 	const chapterId = c.req.query("chapterId");
@@ -40,27 +41,6 @@ terminalRoutes.post("/", async (c) => {
 		rows: parsed.data.rows,
 	});
 	return c.json(terminal, 201);
-});
-
-terminalRoutes.get("/:id", async (c) => {
-	const terminal = await terminalService.getById(c.req.param("id"));
-	return c.json(terminal);
-});
-
-terminalRoutes.patch("/:id", async (c) => {
-	const body = await c.req.json();
-	const name = body?.name;
-	if (typeof name !== "string" || !name.trim()) {
-		throw new ValidationError("name is required");
-	}
-	await terminalService.rename(c.req.param("id"), name.trim());
-	const terminal = await terminalService.getById(c.req.param("id"));
-	return c.json(terminal);
-});
-
-terminalRoutes.delete("/:id", async (c) => {
-	await terminalService.kill(c.req.param("id"));
-	return c.json({ ok: true });
 });
 
 // === Terminal Tabs ===
@@ -127,4 +107,44 @@ terminalRoutes.put("/view-state", requireAuth, async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const state = await terminalViewService.upsert(userId, parsed.data);
 	return c.json(state);
+});
+
+// === Terminal by ID (must be AFTER static paths to avoid shadowing) ===
+
+terminalRoutes.get("/:id", async (c) => {
+	const terminal = await terminalService.getById(c.req.param("id"));
+	return c.json(terminal);
+});
+
+terminalRoutes.get("/:id/processes", async (c) => {
+	const processes = terminalService.getProcesses(c.req.param("id"));
+	return c.json(processes);
+});
+
+terminalRoutes.patch("/:id", async (c) => {
+	const body = await c.req.json();
+	const id = c.req.param("id");
+
+	// Name update
+	if (body?.name !== undefined) {
+		const name = body.name;
+		if (typeof name !== "string" || !name.trim()) {
+			throw new ValidationError("name must be a non-empty string");
+		}
+		await terminalService.rename(id, name.trim());
+	}
+
+	// Graph state update
+	const parsed = updateTerminalGraphStateSchema.safeParse(body);
+	if (parsed.success && Object.keys(parsed.data).length > 0) {
+		await terminalService.updateGraphState(id, parsed.data);
+	}
+
+	const terminal = await terminalService.getById(id);
+	return c.json(terminal);
+});
+
+terminalRoutes.delete("/:id", async (c) => {
+	await terminalService.kill(c.req.param("id"));
+	return c.json({ ok: true });
 });

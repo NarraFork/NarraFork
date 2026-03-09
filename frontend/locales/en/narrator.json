@@ -164,5 +164,8 @@
 	"unmergeSuccessDesc": "The merge has been reverted and the branch is active again.",
 	"unmergeFailed": "Unmerge failed",
 	"showOriginal": "Original",
-	"showTranslated": "Translated"
+	"showTranslated": "Translated",
+	"webSearched": "Searched the web:",
+	"webSearching": "Searching the web…",
+	"webSearchPreparing": "Preparing web search…"
 }

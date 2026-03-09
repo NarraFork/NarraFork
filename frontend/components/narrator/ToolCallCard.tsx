@@ -43,6 +43,7 @@ import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
  * Context carrying the toolUseId of the narrator's latest TodoWrite call.
@@ -68,6 +69,8 @@ export interface ToolCallData {
 	permissionSuggestions?: any[] | null;
 	/** Timestamp (Date.now()) when the tool started running — used for live elapsed timer */
 	startedAt?: number;
+	/** Optional metadata from the tool (e.g. line numbers for Edit) */
+	_metadata?: Record<string, unknown>;
 }
 
 export interface PendingPermission {
@@ -539,6 +542,12 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const oldString = inputIsTruncated ? undefined : toolCall.inputJson?.old_string;
 	const newString = inputIsTruncated ? undefined : toolCall.inputJson?.new_string;
 
+	// Extract startLine from metadata (set by Edit tool on completion)
+	const startLine =
+		typeof toolCall._metadata?.startLine === "number"
+			? (toolCall._metadata.startLine as number)
+			: undefined;
+
 	return (
 		<Box mt="xs">
 			{fp && (
@@ -563,6 +572,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 							maxHeight={200}
 							wordWrap={wordWrap}
 							language={lang}
+							startLine={startLine}
 						/>
 					)}
 				/>
@@ -1290,23 +1300,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 			(isFailed && !isEdit && !isDeniedPlan));
 	const [opened, setOpened] = useState(defaultOpen);
 
-	// Clamp plan card height to 70% of the nearest scroll container (same as SubagentCard)
+	// Clamp plan card height to 85% of the nearest scroll container.
 	const cardRef = useRef<HTMLDivElement>(null);
-	const [vpHeight, setVpHeight] = useState<number | undefined>();
-	useEffect(() => {
-		if (!isPlan || vpHeight) return;
-		const node = cardRef.current;
-		if (!node) return;
-		let el: HTMLElement | null = node.parentElement;
-		while (el) {
-			const ov = getComputedStyle(el).overflowY;
-			if (ov === "scroll" || ov === "auto") {
-				setVpHeight(el.clientHeight * 0.85);
-				return;
-			}
-			el = el.parentElement;
-		}
-	});
+	const vpHeight = useNearestScrollContainerHeight(cardRef, 0.85, isPlan);
 
 	// Auto-expand when a permission request arrives or tool call enters pending state
 	useEffect(() => {

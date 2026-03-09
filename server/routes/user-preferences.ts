@@ -65,7 +65,9 @@ function migrateTabTypes(tabs: Record<string, unknown>[]): void {
 }
 
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
-async function enrichTabs(tabs: Record<string, unknown>[]): Promise<Record<string, unknown>[]> {
+export async function enrichTabs(
+	tabs: Record<string, unknown>[],
+): Promise<Record<string, unknown>[]> {
 	if (tabs.length === 0) return tabs;
 
 	migrateTabTypes(tabs);
@@ -151,7 +153,7 @@ async function enrichTabs(tabs: Record<string, unknown>[]): Promise<Record<strin
 }
 
 /** Enrich tabs and broadcast a snapshot to all of the user's WS connections. */
-async function broadcastTabsSnapshot(
+export async function broadcastTabsSnapshot(
 	userId: string,
 	tabs: Record<string, unknown>[],
 ): Promise<Record<string, unknown>[]> {
@@ -247,9 +249,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
-			commands,
+			commands, setup_wizard_completed,
 			created_at, updated_at
-		) VALUES (${Array(28).fill("?").join(", ")})
+		) VALUES (${Array(29).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -275,6 +277,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   notify_feishu_webhook = COALESCE(?, notify_feishu_webhook),
 		   notify_feishu_secret = COALESCE(?, notify_feishu_secret),
 		   commands = COALESCE(?, commands),
+		   setup_wizard_completed = COALESCE(?, setup_wizard_completed),
 		   updated_at = ?`,
 		[
 			// INSERT values
@@ -304,6 +307,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
 			feishuSecret ?? DEFAULTS.notifyFeishuSecret,
 			commandsJson ?? "[]",
+			d.setupWizardCompleted ? 1 : 0,
 			now,
 			now,
 			// ON CONFLICT UPDATE values (null = keep existing)
@@ -331,6 +335,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			feishuWebhook,
 			feishuSecret,
 			commandsJson,
+			d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
 			now,
 		],
 	);

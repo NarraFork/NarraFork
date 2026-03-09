@@ -125,6 +125,12 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 			if (block.type !== "tool_use") return block;
 			const tc = tcMap.get(block.id);
 			if (!tc) return block;
+			// Extract _metadata from structured outputJson (Edit tool stores { _text, _metadata })
+			const outputJson = tc.outputJson;
+			const _metadata =
+				outputJson && typeof outputJson === "object" && !Array.isArray(outputJson)
+					? outputJson._metadata
+					: undefined;
 			return {
 				...block,
 				// Prefer toolCalls table values (may have been overwritten post-persist)
@@ -138,6 +144,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				permissionDecidedAt: tc.permissionDecidedAt,
 				tcId: tc.id,
 				tcCreatedAt: tc.createdAt,
+				...(_metadata && { _metadata }),
 			};
 		});
 		return {
@@ -819,7 +826,7 @@ export const narratorService = {
 		pageRows.reverse(); // chronological order
 
 		if (pageRows.length === 0) {
-			return { messages: [], hasMore, nextCursor: null };
+			return { messages: [], hasMore, nextCursor: null, hasMoreAfter: false };
 		}
 
 		const messageIds = pageRows.map((r) => r.messageId);
@@ -866,6 +873,7 @@ export const narratorService = {
 			messages: tree,
 			hasMore,
 			nextCursor: hasMore ? String(pageRows[0].seq) : null,
+			hasMoreAfter: false,
 		};
 	},
 
@@ -1025,48 +1033,79 @@ export const narratorService = {
 	},
 
 	/**
-	 * Fetch messages around a target message ID (tree-structured).
-	 * If the target is a child message, finds its top-level ancestor first.
-	 * Returns `contextSize` top-level messages before + the target's top-level + all after,
-	 * with children nested.
+	 * Fetch a bounded top-level message window around a target message ID.
+	 * If the target is a child message, resolve its top-level ancestor first.
+	 * Older pagination remains cursor-based via `hasMore` / `nextCursor`; newer
+	 * messages are intentionally bounded to keep permalink/search hydration light.
 	 */
-	async getMessagesAround(narratorId: string, messageId: string, contextSize = 5) {
+	async getMessagesAround(
+		narratorId: string,
+		messageId: string,
+		opts: { before?: number; after?: number } = {},
+	) {
+		const before = Math.max(0, opts.before ?? 5);
+		const after = Math.max(0, opts.after ?? 20);
+		const fallbackLimit = Math.max(before + after + 1, 10);
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 
-		// Find the target message
-		const target = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+		// Resolve the target via narrator_message_refs so shared prefix messages in
+		// forked narrators can still be located by permalink/search result.
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { seq: true },
 		});
-		if (!target) {
-			return this.getMessagesCursor(narratorId, 10);
+		if (!targetRef) {
+			return this.getMessagesCursor(narratorId, fallbackLimit);
 		}
 
-		// If target is a child message, walk up to find the top-level ancestor
-		// (skip for subagent narrators — all their messages have parentToolUseId)
+		const target = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+		});
+		if (!target) {
+			return this.getMessagesCursor(narratorId, fallbackLimit);
+		}
+
+		// If target is a child message, walk up to find the top-level ancestor.
+		// (Skip for subagent narrators — all their messages have parentToolUseId.)
 		let anchorMessageId = target.id;
 		if (!isSubagent && target.parentToolUseId) {
-			const parentTc = await db.query.narratorToolCalls.findFirst({
-				where: and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, target.parentToolUseId),
-				),
-			});
+			const [parentTc] = await db
+				.select({ messageId: narratorToolCalls.messageId })
+				.from(narratorToolCalls)
+				.innerJoin(
+					narratorMessageRefs,
+					eq(narratorToolCalls.messageId, narratorMessageRefs.messageId),
+				)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, target.parentToolUseId),
+					),
+				)
+				.limit(1);
 			if (parentTc) anchorMessageId = parentTc.messageId;
 		}
 
-		// Find the anchor's seq in the refs
-		const anchorRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, anchorMessageId),
-			),
-		});
+		const anchorRef =
+			anchorMessageId === target.id
+				? targetRef
+				: await db.query.narratorMessageRefs.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, anchorMessageId),
+						),
+						columns: { seq: true },
+					});
 		if (!anchorRef) {
-			return this.getMessagesCursor(narratorId, 10);
+			return this.getMessagesCursor(narratorId, fallbackLimit);
 		}
 
-		// Fetch older messages (seq < anchorSeq)
-		// For subagent narrators, skip the isNull(parentToolUseId) filter
+		const topLevelFilter = isSubagent ? undefined : isNull(narratorMessages.parentToolUseId);
+
+		// Fetch older top-level messages (seq < anchorSeq).
 		const olderRefRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -1075,17 +1114,17 @@ export const narratorService = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					lt(narratorMessageRefs.seq, anchorRef.seq),
-					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
+					...(topLevelFilter ? [topLevelFilter] : []),
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(contextSize + 1);
+			.limit(before + 1);
 
-		const hasMore = olderRefRows.length > contextSize;
-		const olderRows = hasMore ? olderRefRows.slice(0, contextSize) : olderRefRows;
+		const hasMore = olderRefRows.length > before;
+		const olderRows = hasMore ? olderRefRows.slice(0, before) : olderRefRows;
 		olderRows.reverse();
 
-		// Fetch anchor + all newer messages
+		// Fetch a bounded number of newer top-level messages (seq > anchorSeq).
 		const newerRefRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -1093,39 +1132,42 @@ export const narratorService = {
 			.where(
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
-					gte(narratorMessageRefs.seq, anchorRef.seq),
-					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
+					gt(narratorMessageRefs.seq, anchorRef.seq),
+					...(topLevelFilter ? [topLevelFilter] : []),
 				),
 			)
-			.orderBy(narratorMessageRefs.seq);
+			.orderBy(narratorMessageRefs.seq)
+			.limit(after + 1);
+		const hasMoreAfter = newerRefRows.length > after;
+		const newerRows = hasMoreAfter ? newerRefRows.slice(0, after) : newerRefRows;
 
-		const allIds = [...olderRows.map((r) => r.messageId), ...newerRefRows.map((r) => r.messageId)];
-		if (allIds.length === 0) {
-			return { messages: [], hasMore, nextCursor: null };
-		}
+		const allRows = [
+			...olderRows,
+			{ messageId: anchorMessageId, seq: anchorRef.seq },
+			...newerRows,
+		];
+		const allIds = allRows.map((r) => r.messageId);
 
-		// Build seq map for ordering
-		const seqMap = new Map<string, number>();
-		for (const r of olderRows) seqMap.set(r.messageId, r.seq);
-		for (const r of newerRefRows) seqMap.set(r.messageId, r.seq);
+		// Build seq map for ordering.
+		const seqMap = new Map<string, number>(allRows.map((r) => [r.messageId, r.seq]));
 
 		const topMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, allIds),
 			with: { toolCalls: true, creator: true },
 		});
 
-		// Sort by seq order
+		// Sort by seq order.
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 
-		// For subagent narrators, clear parentToolUseId so buildMessageTree
-		// treats them as top-level messages
+		// For subagent narrators, clear parentToolUseId so buildMessageTree treats
+		// them as top-level messages.
 		if (isSubagent) {
 			for (const msg of topMessages) {
 				msg.parentToolUseId = null;
 			}
 		}
 
-		// Fetch child messages (don't filter by narratorId — shared messages)
+		// Fetch child messages (don't filter by narratorId — shared messages).
 		const parentToolUseIds = collectToolUseIds(topMessages);
 		const childMessages =
 			parentToolUseIds.length > 0
@@ -1147,7 +1189,8 @@ export const narratorService = {
 		return {
 			messages: tree,
 			hasMore,
-			nextCursor: hasMore ? String(olderRows[0]?.seq) : null,
+			nextCursor: hasMore ? String(olderRows[0]?.seq ?? anchorRef.seq) : null,
+			hasMoreAfter,
 		};
 	},
 
@@ -2038,7 +2081,8 @@ export const narratorService = {
 					text: string;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 			  }
-			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> },
+			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+			| { type: "web_search"; id: string; query?: string; queries?: string[] },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),
@@ -2282,6 +2326,39 @@ export const narratorService = {
 				narratorId,
 				error: normalizedErrorMessage ?? "Unknown error",
 			});
+
+			// Persist a system-level error message visible in the UI but excluded
+			try {
+				const errText = normalizedErrorMessage ?? "Unknown error";
+				const msgId = generateId();
+				await db.insert(narratorMessages).values({
+					id: msgId,
+					narratorId,
+					role: "system",
+					contentJson: [{ type: "error", message: errText }],
+					contentText: `[Error] ${errText}`,
+					createdAt: now,
+				});
+				await appendMessageRef(narratorId, msgId);
+				broadcastToNarrator(narratorId, {
+					type: "message",
+					narratorId,
+					message: {
+						id: msgId,
+						narratorId,
+						role: "system",
+						contentJson: [{ type: "error", message: errText }],
+						contentText: `[Error] ${errText}`,
+						createdAt: now,
+						children: [],
+					},
+				});
+			} catch (e) {
+				logger.warn("Failed to persist error system message", {
+					narratorId,
+					error: String(e),
+				});
+			}
 		}
 		broadcastToNarrator(narratorId, {
 			type: "status_change",

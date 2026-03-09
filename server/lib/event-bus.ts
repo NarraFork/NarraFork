@@ -182,7 +182,11 @@ export type NarraForkEvent =
 			chapterId: string;
 			commitSha: string;
 			message: string;
-	  };
+	  }
+	// MCP server lifecycle
+	| { type: "mcp:server_connected"; serverId: string; name: string; toolCount: number }
+	| { type: "mcp:server_disconnected"; serverId: string; name: string; reason?: string }
+	| { type: "mcp:server_error"; serverId: string; name: string; error: string };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

@@ -16,7 +16,10 @@ function classifyCodexError(
 	if (
 		lower.includes("usage_limit_reached") ||
 		(lower.includes("usage limit") && lower.includes("reached")) ||
-		lower.includes('"plan_type":"free"')
+		lower.includes('"plan_type":"free"') ||
+		lower.includes("insufficient_balance") ||
+		lower.includes("insufficient balance") ||
+		(lower.includes("402") && lower.includes("insufficient"))
 	) {
 		const resetsAtMatch = msg.match(/"resets_at"\s*:\s*(\d+)/);
 		const parsedSec = resetsAtMatch?.[1] ? Number.parseInt(resetsAtMatch[1], 10) : Number.NaN;

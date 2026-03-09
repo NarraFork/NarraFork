@@ -302,4 +302,27 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 	);
 }
 
-export const ChapterNode = memo(ChapterNodeInner);
+function areChapterNodePropsEqual(prev: NodeProps, next: NodeProps) {
+	const prevData = prev.data as ChapterNodeData;
+	const nextData = next.data as ChapterNodeData;
+
+	return (
+		prev.id === next.id &&
+		prevData.title === nextData.title &&
+		prevData.status === nextData.status &&
+		prevData.branch === nextData.branch &&
+		prevData.narratorCount === nextData.narratorCount &&
+		prevData.narratorId === nextData.narratorId &&
+		prevData.narratorStatus === nextData.narratorStatus &&
+		prevData.hasContainers === nextData.hasContainers &&
+		prevData.role === nextData.role &&
+		prevData.color === nextData.color &&
+		prevData.hasUpstreamUpdates === nextData.hasUpstreamUpdates &&
+		prevData.isRoot === nextData.isRoot &&
+		prevData.commitCount === nextData.commitCount &&
+		prevData.expanded === nextData.expanded &&
+		prevData.onToggleExpand === nextData.onToggleExpand
+	);
+}
+
+export const ChapterNode = memo(ChapterNodeInner, areChapterNodePropsEqual);

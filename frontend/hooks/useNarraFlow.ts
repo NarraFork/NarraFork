@@ -153,6 +153,16 @@ export function assignEdgeHandles(nodes: GraphNode[], edges: GraphEdge[]): Graph
 	});
 }
 
+export interface OpenedTerminal {
+	id: string;
+	chapterId: string;
+	name: string;
+	graphX: number | null;
+	graphY: number | null;
+	graphWidth: number | null;
+	graphHeight: number | null;
+}
+
 export function useNarraFlow(projectId: string) {
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["narraFlow", projectId],
@@ -167,12 +177,14 @@ export function useNarraFlow(projectId: string) {
 				nodes: [] as GraphNode[],
 				edges: [] as GraphEdge[],
 				explorationGroups: [] as ExplorationGroup[],
+				openedTerminals: [] as OpenedTerminal[],
 			};
 		const layoutNodes = applyDagreLayout(data.nodes as GraphNode[], data.edges as GraphEdge[]);
 		return {
 			nodes: layoutNodes,
 			edges: data.edges as GraphEdge[],
 			explorationGroups: (data.explorationGroups ?? []) as ExplorationGroup[],
+			openedTerminals: (data.openedTerminals ?? []) as OpenedTerminal[],
 		};
 	}, [data]);
 

@@ -1,7 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
-import { db } from "../db";
-import { containerInstances, narrators, terminals } from "../db/schema";
+import { db, sqlite } from "../db";
+import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -89,6 +89,14 @@ export type NarratorServerMessage =
 	  }
 	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
 	| { type: "narrator_error"; narratorId: string; error: string }
+	| {
+			type: "web_search";
+			narratorId: string;
+			id: string;
+			status: "in_progress" | "searching" | "completed";
+			query?: string;
+			queries?: string[];
+	  }
 	| {
 			type: "tool_started";
 			narratorId: string;
@@ -501,6 +509,55 @@ eventBus.on("container:log", (event) => {
 
 eventBus.on("container:error", (event) => {
 	broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
+});
+
+// === Recent tabs title sync ===
+// When a narrator title changes, update the stored title in every user's recent_tabs
+// and broadcast a fresh snapshot so the sidebar reflects the new title immediately.
+
+eventBus.on("narrator:title_updated", async (event) => {
+	try {
+		const { broadcastTabsSnapshot } = await import("../routes/user-preferences");
+		const rows = db
+			.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
+			.from(userPreferences)
+			.all();
+
+		for (const row of rows) {
+			let tabs: Record<string, unknown>[];
+			try {
+				tabs = JSON.parse(row.recentTabs);
+			} catch {
+				continue;
+			}
+			if (!Array.isArray(tabs)) continue;
+
+			let changed = false;
+			for (const tab of tabs) {
+				const isMatch =
+					(tab.type === "narrator" && tab.id === event.narratorId) ||
+					(tab.type === "chapter" && tab.narratorId === event.narratorId);
+				if (isMatch && tab.title !== event.title) {
+					tab.title = event.title;
+					changed = true;
+				}
+			}
+			if (!changed) continue;
+
+			const now = new Date().toISOString();
+			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+				JSON.stringify(tabs),
+				now,
+				row.userId,
+			]);
+			broadcastTabsSnapshot(row.userId, tabs);
+		}
+	} catch (err) {
+		logger.error("Failed to sync recent tabs after title update", {
+			narratorId: event.narratorId,
+			error: String(err),
+		});
+	}
 });
 
 // === WebSocket handlers ===

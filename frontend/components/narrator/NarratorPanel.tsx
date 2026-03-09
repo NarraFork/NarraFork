@@ -24,7 +24,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
 	IconArchive,
@@ -39,6 +39,7 @@ import {
 	IconExternalLink,
 	IconFolderPlus,
 	IconLock,
+	IconLockOpen,
 	IconPaperclip,
 	IconShield,
 	IconSparkles,
@@ -53,6 +54,9 @@ import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useAllModels } from "../../hooks/useModels";
 import {
+	DEFAULT_MESSAGES_AROUND_AFTER,
+	DEFAULT_MESSAGES_AROUND_BEFORE,
+	getNarratorMessagesQueryKey,
 	useArchiveNarrator,
 	useCreateWhitelistDir,
 	useDeleteWhitelistDir,
@@ -79,6 +83,7 @@ import { UserAvatar } from "../UserAvatar";
 import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
+import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
 	MemoizedPageElements,
 	RenderProgress,
@@ -86,6 +91,7 @@ import {
 	StreamingBubble,
 } from "./MessageRenderer";
 import { findMsgByToolUseIdInTree } from "./message-tree-utils";
+import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesQueryData,
@@ -375,13 +381,24 @@ export function NarratorPanel({
 	const chapterStatus = (chapterData as any)?.status as string | undefined;
 	const isChapterMerged = chapterStatus === "merged";
 	const forkNarratorMutation = useForkNarrator();
+	const aroundOptions = useMemo(
+		() =>
+			highlightMessageId
+				? {
+						messageId: highlightMessageId,
+						before: DEFAULT_MESSAGES_AROUND_BEFORE,
+						after: DEFAULT_MESSAGES_AROUND_AFTER,
+					}
+				: undefined,
+		[highlightMessageId],
+	);
 	const {
 		data: messagesData,
 		isLoading: messagesLoading,
 		hasNextPage,
 		fetchNextPage,
 		isFetchingNextPage,
-	} = useNarratorMessages(narratorId, highlightMessageId);
+	} = useNarratorMessages(narratorId, aroundOptions);
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
@@ -393,6 +410,23 @@ export function NarratorPanel({
 	const { visibleModels: allModels, settingsData } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
+	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
+	const contentViewerEnvironment = useMemo(
+		() => ({
+			isMobile: isMobileViewport,
+			defaultWraps: {
+				markdown: userPrefs?.wordWrapMarkdown ?? true,
+				code: userPrefs?.wordWrapCode ?? true,
+				diff: userPrefs?.wordWrapDiff ?? true,
+			},
+		}),
+		[
+			isMobileViewport,
+			userPrefs?.wordWrapCode,
+			userPrefs?.wordWrapDiff,
+			userPrefs?.wordWrapMarkdown,
+		],
+	);
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: tt } = useTranslation("terminal");
@@ -420,8 +454,8 @@ export function NarratorPanel({
 	);
 
 	const messagesQueryKey = useMemo(
-		() => ["narrators", narratorId, "messages", { around: highlightMessageId }],
-		[narratorId, highlightMessageId],
+		() => getNarratorMessagesQueryKey(narratorId, aroundOptions),
+		[narratorId, aroundOptions],
 	);
 
 	// --- Message operations ---
@@ -636,6 +670,8 @@ export function NarratorPanel({
 		streamingRef,
 		streamingReasoningRef,
 		streamingVersion,
+		topLevelStreamingChunks,
+		webSearchRef,
 		renderPermCb,
 		bufferedText,
 		setBufferedText,
@@ -849,14 +885,21 @@ export function NarratorPanel({
 		if (!hydrated || !messagesData?.pages?.length) return null;
 		const firstPage = messagesData.pages[0]; // newest page
 		if (!firstPage?.messages?.length) return null;
-		return firstPage.messages[firstPage.messages.length - 1] ?? null;
-	}, [hydrated, messagesData]);
-
-	const deferredStreamingChunks = useMemo(() => {
-		if (!lastMessage) return null;
-		if (lastMessage.id === STREAMING_CHUNKS_MSG_ID && lastMessage._noMerge) return lastMessage;
+		for (let i = firstPage.messages.length - 1; i >= 0; i--) {
+			const msg = firstPage.messages[i];
+			if (!msg || msg.id === STREAMING_CHUNKS_MSG_ID) continue;
+			// Skip error system messages so they don't hide the retry button
+			if (
+				msg.role === "system" &&
+				Array.isArray(msg.contentJson) &&
+				msg.contentJson.some((b: { type: string }) => b.type === "error")
+			) {
+				continue;
+			}
+			return msg;
+		}
 		return null;
-	}, [lastMessage]);
+	}, [hydrated, messagesData]);
 
 	const canRetryLastUserMessage =
 		!!lastMessage &&
@@ -1220,8 +1263,9 @@ export function NarratorPanel({
 			})),
 			{ type: "text", text: msg },
 		];
+		const optimisticId = `optimistic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const optimisticMsg: TreeMessage = {
-			id: `optimistic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+			id: optimisticId,
 			narratorId,
 			parentToolUseId: null,
 			role: "user",
@@ -1249,8 +1293,22 @@ export function NarratorPanel({
 		try {
 			await api.sendNarratorMessage(narratorId, msg, images.length > 0 ? images : undefined);
 		} catch (err) {
+			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				if (!old?.pages?.length) return old;
+				const pages = [...old.pages];
+				const firstPage = { ...pages[0] };
+				const nextMessages = firstPage.messages.filter(
+					(existing: NarratorMsg) => existing.id !== optimisticId,
+				);
+				if (nextMessages.length === firstPage.messages.length) return old;
+				firstPage.messages = nextMessages;
+				pages[0] = firstPage;
+				return { ...old, pages };
+			});
 			const message = err instanceof Error ? err.message : "Failed to send message";
 			notifications.show({ title: "Error", message, color: "red" });
+		} finally {
+			revokeContentBlockPreviewUrls(optimisticBlocks);
 		}
 	};
 
@@ -1332,560 +1390,699 @@ export function NarratorPanel({
 		);
 
 	return (
-		<Stack h="100%" gap={0} style={{ overflow: "hidden" }}>
-			{/* Header */}
-			<Group
-				justify="space-between"
-				py="xs"
-				px="md"
-				style={{ borderBottom: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
-			>
-				<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
-					{compact ? (
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="gray"
-							onClick={() => navigate({ to: "/narrators/$narratorId", params: { narratorId } })}
-						>
-							<IconExternalLink size={16} />
-						</ActionIcon>
-					) : (
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="gray"
-							onClick={() => navigate({ to: ".." })}
-						>
-							<IconArrowLeft size={16} />
-						</ActionIcon>
-					)}
-					<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
-						{editingTitle ? (
-							<TextInput
-								ref={titleInputRef}
-								value={titleValue}
-								onChange={(e) => setTitleValue(e.currentTarget.value)}
-								onKeyDown={handleTitleKeyDown}
-								onBlur={saveTitle}
-								size="xs"
-								style={{ flex: 1, maxWidth: 500 }}
-							/>
-						) : (
-							<Text
-								size="sm"
-								fw={500}
-								onDoubleClick={startEditingTitle}
-								style={{
-									cursor: "pointer",
-									overflow: "hidden",
-									textOverflow: "ellipsis",
-									whiteSpace: "nowrap",
-									maxWidth: 500,
-								}}
-								title={narrator.title || t("untitled")}
-							>
-								{narrator.title || t("untitled")}
-							</Text>
-						)}
-						<ActionIcon
-							size="xs"
-							variant="subtle"
-							onClick={handleGenerateTitle}
-							loading={generatingTitle}
-							title={t("generateTitle")}
-						>
-							<IconSparkles size={12} />
-						</ActionIcon>
-					</Group>
-					{disconnected && (
-						<Badge
-							size="xs"
-							variant="dot"
-							color="red"
-							style={{ cursor: "pointer" }}
-							onClick={reconnect}
-							title={t("reconnect")}
-						>
-							{t("disconnected")}
-						</Badge>
-					)}
-				</Group>
-				<Group gap="xs">
-					<Tooltip label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}>
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="gray"
-							onClick={() =>
-								setEditExpandOverride((prev) => (prev === true ? false : prev === false))
-							}
-						>
-							{editExpandOverride === false ? <IconCode size={16} /> : <IconCodeOff size={16} />}
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("archiveNarrator")}>
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="orange"
-							loading={archiveMutation.isPending}
-							onClick={() => {
-								openArchiveConfirm();
-							}}
-						>
-							<IconArchive size={16} />
-						</ActionIcon>
-					</Tooltip>
-				</Group>
-			</Group>
-
-			<Modal
-				opened={archiveConfirmOpened}
-				onClose={closeArchiveConfirm}
-				title={t("archiveConfirmTitle")}
-				centered
-			>
-				<Stack>
-					<Text size="sm">{t("archiveActiveWarning")}</Text>
-					<Group justify="flex-end">
-						<Button variant="default" onClick={closeArchiveConfirm}>
-							{t("cancel")}
-						</Button>
-						<Button
-							color="orange"
-							onClick={async () => {
-								if (isActive) {
-									await interruptMutation.mutateAsync(narratorId);
-								}
-								archiveMutation.mutate(narratorId);
-								closeArchiveConfirm();
-							}}
-						>
-							{t("confirmArchive")}
-						</Button>
-					</Group>
-				</Stack>
-			</Modal>
-
-			{/* Messages */}
-			<Box pos="relative" style={{ flex: 1, minHeight: 0 }}>
-				{(isFetchingNextPage || !renderDone) && (
-					<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
-						<RenderProgress
-							indeterminate={isFetchingNextPage}
-							value={
-								!isFetchingNextPage && totalMessageCount > 0
-									? visibleCount / totalMessageCount
-									: undefined
-							}
-						/>
-					</Box>
-				)}
-				<ScrollArea
-					h="100%"
-					type="always"
-					viewportRef={viewportCallbackRef}
-					py="sm"
-					px="md"
-					scrollbars="y"
-					styles={{
-						viewport: {
-							overscrollBehavior: "contain",
-							overflowAnchor: renderDone ? "auto" : "none",
-						},
-						scrollbar: renderDone
-							? undefined
-							: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
-					}}
-				>
-					<LatestTodosToolUseIdCtx.Provider value={todosToolUseId}>
-						<Stack gap="sm" ref={contentRef}>
-							{visibleElements}
-							<StreamingBubble
-								narratorId={narratorId}
-								streamingRef={streamingRef}
-								streamingReasoningRef={streamingReasoningRef}
-								version={streamingVersion}
-							/>
-							{deferredStreamingChunks &&
-								renderToolRun([deferredStreamingChunks], narratorId, renderPermCb)}
-						</Stack>
-					</LatestTodosToolUseIdCtx.Provider>
-				</ScrollArea>
-
-				{onSendToTerminal && (
-					<SelectionPopover
-						containerRef={contentRef}
-						onAction={onSendToTerminal}
-						label={tt("sendToTerminal")}
-					/>
-				)}
-
-				{/* Scroll to bottom button */}
-				<Box
-					style={{
-						position: "absolute",
-						bottom: 12,
-						right: 24,
-						zIndex: 10,
-						transform: isAtBottom ? "translateY(80px)" : "translateY(0)",
-						opacity: isAtBottom ? 0 : 1,
-						transition: "transform 200ms ease, opacity 200ms ease",
-						pointerEvents: isAtBottom ? "none" : "auto",
-					}}
-				>
-					{unreadCount > 0 && (
-						<Badge
-							size="sm"
-							circle
-							color="indigo"
-							style={{
-								position: "absolute",
-								top: -6,
-								right: -6,
-								zIndex: 1,
-								pointerEvents: "none",
-							}}
-						>
-							{unreadCount > 99 ? "99+" : unreadCount}
-						</Badge>
-					)}
-					<ActionIcon
-						variant="filled"
-						color="gray"
-						radius="xl"
-						size="lg"
-						onClick={() => scrollToBottom()}
-						title={
-							unreadCount > 0
-								? t("scrollToBottomWithCount", { count: unreadCount })
-								: t("scrollToBottom")
-						}
-					>
-						<IconArrowDown size={18} />
-					</ActionIcon>
-				</Box>
-			</Box>
-
-			{/* Image previews */}
-			{attachedImages.length > 0 && (
+		<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
+			<Stack h="100%" gap={0} style={{ overflow: "hidden" }}>
+				{/* Header */}
 				<Group
-					pt="xs"
+					justify="space-between"
+					py="xs"
 					px="md"
-					pb={0}
-					gap="xs"
-					style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
+					style={{ borderBottom: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 				>
-					{attachedImages.map((file, i) => (
-						<Box key={`${file.name}-${i}`} pos="relative" style={{ display: "inline-block" }}>
-							<Image
-								src={imagePreviewUrls[i]}
-								alt={file.name}
-								radius="sm"
-								h={60}
-								w={60}
-								fit="cover"
-							/>
-							<CloseButton
+					<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
+						{compact ? (
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="gray"
+								onClick={() => navigate({ to: "/narrators/$narratorId", params: { narratorId } })}
+							>
+								<IconExternalLink size={16} />
+							</ActionIcon>
+						) : (
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="gray"
+								onClick={() => navigate({ to: ".." })}
+							>
+								<IconArrowLeft size={16} />
+							</ActionIcon>
+						)}
+						<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
+							{editingTitle ? (
+								<TextInput
+									ref={titleInputRef}
+									value={titleValue}
+									onChange={(e) => setTitleValue(e.currentTarget.value)}
+									onKeyDown={handleTitleKeyDown}
+									onBlur={saveTitle}
+									size="xs"
+									style={{ flex: 1, maxWidth: 500 }}
+								/>
+							) : (
+								<Text
+									size="sm"
+									fw={500}
+									onDoubleClick={startEditingTitle}
+									style={{
+										cursor: "pointer",
+										overflow: "hidden",
+										textOverflow: "ellipsis",
+										whiteSpace: "nowrap",
+										maxWidth: 500,
+									}}
+									title={narrator.title || t("untitled")}
+								>
+									{narrator.title || t("untitled")}
+								</Text>
+							)}
+							<ActionIcon
 								size="xs"
-								radius="xl"
-								variant="filled"
-								color="dark"
-								style={{ position: "absolute", top: -6, right: -6 }}
-								onClick={() => setAttachedImages((prev) => prev.filter((_, j) => j !== i))}
-								title={t("removeImage")}
+								variant="subtle"
+								onClick={handleGenerateTitle}
+								loading={generatingTitle}
+								title={t("generateTitle")}
+							>
+								<IconSparkles size={12} />
+							</ActionIcon>
+						</Group>
+						{disconnected && (
+							<Badge
+								size="xs"
+								variant="dot"
+								color="red"
+								style={{ cursor: "pointer" }}
+								onClick={reconnect}
+								title={t("reconnect")}
+							>
+								{t("disconnected")}
+							</Badge>
+						)}
+					</Group>
+					<Group gap="xs">
+						<Tooltip label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="gray"
+								onClick={() =>
+									setEditExpandOverride((prev) => (prev === true ? false : prev === false))
+								}
+							>
+								{editExpandOverride === false ? <IconCode size={16} /> : <IconCodeOff size={16} />}
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={t("archiveNarrator")}>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="orange"
+								loading={archiveMutation.isPending}
+								onClick={() => {
+									openArchiveConfirm();
+								}}
+							>
+								<IconArchive size={16} />
+							</ActionIcon>
+						</Tooltip>
+					</Group>
+				</Group>
+
+				<Modal
+					opened={archiveConfirmOpened}
+					onClose={closeArchiveConfirm}
+					title={t("archiveConfirmTitle")}
+					centered
+				>
+					<Stack>
+						<Text size="sm">{t("archiveActiveWarning")}</Text>
+						<Group justify="flex-end">
+							<Button variant="default" onClick={closeArchiveConfirm}>
+								{t("cancel")}
+							</Button>
+							<Button
+								color="orange"
+								onClick={async () => {
+									if (isActive) {
+										await interruptMutation.mutateAsync(narratorId);
+									}
+									archiveMutation.mutate(narratorId);
+									closeArchiveConfirm();
+								}}
+							>
+								{t("confirmArchive")}
+							</Button>
+						</Group>
+					</Stack>
+				</Modal>
+
+				{/* Messages */}
+				<Box pos="relative" style={{ flex: 1, minHeight: 0 }}>
+					{(isFetchingNextPage || !renderDone) && (
+						<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
+							<RenderProgress
+								indeterminate={isFetchingNextPage}
+								value={
+									!isFetchingNextPage && totalMessageCount > 0
+										? visibleCount / totalMessageCount
+										: undefined
+								}
 							/>
 						</Box>
-					))}
-				</Group>
-			)}
+					)}
+					<ScrollArea
+						h="100%"
+						type="always"
+						viewportRef={viewportCallbackRef}
+						py="sm"
+						px="md"
+						scrollbars="y"
+						styles={{
+							viewport: {
+								overscrollBehavior: "contain",
+								overflowAnchor: renderDone ? "auto" : "none",
+							},
+							scrollbar: renderDone
+								? undefined
+								: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
+						}}
+					>
+						<LatestTodosToolUseIdCtx.Provider value={todosToolUseId}>
+							<Stack gap="sm" ref={contentRef}>
+								{visibleElements}
+								<StreamingBubble
+									narratorId={narratorId}
+									streamingRef={streamingRef}
+									streamingReasoningRef={streamingReasoningRef}
+									webSearchRef={webSearchRef}
+									version={streamingVersion}
+								/>
+								{topLevelStreamingChunks &&
+									renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb)}
+							</Stack>
+						</LatestTodosToolUseIdCtx.Provider>
+					</ScrollArea>
 
-			{/* Buffered message indicator */}
-			{bufferedText && (
+					{onSendToTerminal && (
+						<SelectionPopover
+							containerRef={contentRef}
+							onAction={onSendToTerminal}
+							label={tt("sendToTerminal")}
+						/>
+					)}
+
+					{/* Scroll to bottom button */}
+					<Box
+						style={{
+							position: "absolute",
+							bottom: 12,
+							right: 24,
+							zIndex: 10,
+							transform: isAtBottom ? "translateY(80px)" : "translateY(0)",
+							opacity: isAtBottom ? 0 : 1,
+							transition: "transform 200ms ease, opacity 200ms ease",
+							pointerEvents: isAtBottom ? "none" : "auto",
+						}}
+					>
+						{unreadCount > 0 && (
+							<Badge
+								size="sm"
+								circle
+								color="indigo"
+								style={{
+									position: "absolute",
+									top: -6,
+									right: -6,
+									zIndex: 1,
+									pointerEvents: "none",
+								}}
+							>
+								{unreadCount > 99 ? "99+" : unreadCount}
+							</Badge>
+						)}
+						<ActionIcon
+							variant="filled"
+							color="gray"
+							radius="xl"
+							size="lg"
+							onClick={() => scrollToBottom()}
+							title={
+								unreadCount > 0
+									? t("scrollToBottomWithCount", { count: unreadCount })
+									: t("scrollToBottom")
+							}
+						>
+							<IconArrowDown size={18} />
+						</ActionIcon>
+					</Box>
+				</Box>
+
+				{/* Image previews */}
+				{attachedImages.length > 0 && (
+					<Group
+						pt="xs"
+						px="md"
+						pb={0}
+						gap="xs"
+						style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
+					>
+						{attachedImages.map((file, i) => (
+							<Box key={`${file.name}-${i}`} pos="relative" style={{ display: "inline-block" }}>
+								<Image
+									src={imagePreviewUrls[i]}
+									alt={file.name}
+									radius="sm"
+									h={60}
+									w={60}
+									fit="cover"
+								/>
+								<CloseButton
+									size="xs"
+									radius="xl"
+									variant="filled"
+									color="dark"
+									style={{ position: "absolute", top: -6, right: -6 }}
+									onClick={() => setAttachedImages((prev) => prev.filter((_, j) => j !== i))}
+									title={t("removeImage")}
+								/>
+							</Box>
+						))}
+					</Group>
+				)}
+
+				{/* Buffered message indicator */}
+				{bufferedText && (
+					<Group
+						px="md"
+						py={4}
+						gap="xs"
+						style={{
+							borderTop:
+								attachedImages.length > 0
+									? undefined
+									: "1px solid var(--mantine-color-default-border)",
+							backgroundColor: "var(--mantine-color-blue-light)",
+							flexShrink: 0,
+						}}
+					>
+						<Loader size={14} color="blue" />
+						<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
+							{t("bufferedMessage")}: {bufferedText}
+						</Text>
+						<CloseButton size="xs" onClick={handleCancelBuffer} title={t("cancelBuffer")} />
+					</Group>
+				)}
+
+				{/* Chapter bar */}
+				{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
+
+				{/* Status bar */}
 				<Group
 					px="md"
-					py={4}
+					pt="xs"
+					pb="xs"
 					gap="xs"
+					justify="space-between"
+					wrap="nowrap"
 					style={{
 						borderTop:
-							attachedImages.length > 0
+							attachedImages.length > 0 || bufferedText
 								? undefined
 								: "1px solid var(--mantine-color-default-border)",
-						backgroundColor: "var(--mantine-color-blue-light)",
 						flexShrink: 0,
 					}}
 				>
-					<Loader size={14} color="blue" />
-					<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-						{t("bufferedMessage")}: {bufferedText}
-					</Text>
-					<CloseButton size="xs" onClick={handleCancelBuffer} title={t("cancelBuffer")} />
-				</Group>
-			)}
-
-			{/* Chapter bar */}
-			{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
-
-			{/* Status bar */}
-			<Group
-				px="md"
-				pt="xs"
-				pb="xs"
-				gap="xs"
-				justify="space-between"
-				wrap="nowrap"
-				style={{
-					borderTop:
-						attachedImages.length > 0 || bufferedText
-							? undefined
-							: "1px solid var(--mantine-color-default-border)",
-					flexShrink: 0,
-				}}
-			>
-				{showWorkIndicator ? (
-					<UnstyledButton
-						disabled={!activeTodo}
-						onClick={async () => {
-							if (!activeTodo || !todosToolUseId) return;
-							// Search across all pages without flattening
-							let msg: NarratorMsg | null = null;
-							for (const page of messagesData?.pages ?? []) {
-								msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
-								if (msg) break;
-							}
-							if (!msg) {
-								try {
-									await qc.refetchQueries({ queryKey: messagesQueryKey });
-									const freshData = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
-									for (const page of freshData?.pages ?? []) {
-										msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
-										if (msg) break;
+					{showWorkIndicator ? (
+						<UnstyledButton
+							disabled={!activeTodo}
+							onClick={async () => {
+								if (!activeTodo || !todosToolUseId) return;
+								// Search across all pages without flattening
+								let msg: NarratorMsg | null = null;
+								for (const page of messagesData?.pages ?? []) {
+									msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
+									if (msg) break;
+								}
+								if (!msg) {
+									try {
+										await qc.refetchQueries({ queryKey: messagesQueryKey });
+										const freshData = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
+										for (const page of freshData?.pages ?? []) {
+											msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
+											if (msg) break;
+										}
+									} catch {
+										return;
 									}
-								} catch {
-									return;
 								}
-							}
-							if (!msg) return;
-							setExpandedToolUseId(todosToolUseId);
-							const el =
-								document.getElementById(`tool-use-${todosToolUseId}`) ??
-								document.getElementById(`msg-${msg.id}`);
-							if (el) {
-								el.scrollIntoView({ behavior: "smooth", block: "center" });
-								setTimeout(() => {
-									setHighlightedId(msg.id);
-									setTimeout(() => setHighlightedId(null), 1600);
-								}, 400);
-							}
-						}}
-						style={{ minWidth: 0, flex: 1 }}
-					>
-						<Group gap={6} wrap="nowrap">
-							<Loader
-								size={14}
-								color={
-									isCompacting ? "orange" : isWaiting ? "yellow" : isPlanning ? "green" : "blue"
+								if (!msg) return;
+								setExpandedToolUseId(todosToolUseId);
+								const el =
+									document.getElementById(`tool-use-${todosToolUseId}`) ??
+									document.getElementById(`msg-${msg.id}`);
+								if (el) {
+									el.scrollIntoView({ behavior: "smooth", block: "center" });
+									setTimeout(() => {
+										setHighlightedId(msg.id);
+										setTimeout(() => setHighlightedId(null), 1600);
+									}, 400);
 								}
-								style={{ flexShrink: 0 }}
+							}}
+							style={{ minWidth: 0, flex: 1 }}
+						>
+							<Group gap={6} wrap="nowrap">
+								<Loader
+									size={14}
+									color={
+										isCompacting ? "orange" : isWaiting ? "yellow" : isPlanning ? "green" : "blue"
+									}
+									style={{ flexShrink: 0 }}
+								/>
+								<Text
+									size="xs"
+									c={isCompacting ? "orange" : isWaiting ? "yellow" : isPlanning ? "green" : "blue"}
+									truncate
+								>
+									{isCompacting
+										? t("compacting")
+										: activeTodo
+											? activeTodo.content || activeTodo.activeForm
+											: isWaiting
+												? t("status_waiting")
+												: isPlanning
+													? t("planning")
+													: t("thinking")}
+								</Text>
+							</Group>
+						</UnstyledButton>
+					) : (
+						<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+							<Box
+								w={8}
+								h={8}
+								style={{
+									borderRadius: "50%",
+									backgroundColor: `var(--mantine-color-${
+										NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"
+									}-filled)`,
+									flexShrink: 0,
+								}}
 							/>
-							<Text
-								size="xs"
-								c={isCompacting ? "orange" : isWaiting ? "yellow" : isPlanning ? "green" : "blue"}
-								truncate
-							>
-								{isCompacting
-									? t("compacting")
-									: activeTodo
-										? activeTodo.content || activeTodo.activeForm
-										: isWaiting
-											? t("status_waiting")
-											: isPlanning
-												? t("planning")
-												: t("thinking")}
+							<Text size="xs" c="dimmed">
+								{t(`status_${narrator.status}`)}
 							</Text>
 						</Group>
-					</UnstyledButton>
-				) : (
-					<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
-						<Box
-							w={8}
-							h={8}
-							style={{
-								borderRadius: "50%",
-								backgroundColor: `var(--mantine-color-${
-									NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"
-								}-filled)`,
-								flexShrink: 0,
-							}}
-						/>
-						<Text size="xs" c="dimmed">
-							{t(`status_${narrator.status}`)}
-						</Text>
-					</Group>
-				)}
-				{/* Model & Permission selectors */}
-				<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
-					{/* Viewers */}
-					{viewers.length > 1 && (
-						<Tooltip label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}>
-							<Avatar.Group spacing="xs">
-								{viewers.slice(0, 3).map((v) => (
-									<UserAvatar
-										key={v.userId}
-										username={v.username}
-										avatarColor={v.avatarColor}
-										avatarImageId={v.avatarImageId}
-										userId={v.userId}
-										size={22}
-										showTooltip={false}
-									/>
-								))}
-								{viewers.length > 3 && (
-									<Avatar size={22} radius="xl">
-										+{viewers.length - 3}
-									</Avatar>
-								)}
-							</Avatar.Group>
-						</Tooltip>
 					)}
-					{/* Context usage indicator */}
-					{(() => {
-						if (contextPercent == null) return null;
-						const pct = Math.min(contextPercent, 100);
-						const r = 9;
-						const circ = 2 * Math.PI * r;
-						const offset = circ * (1 - pct / 100);
-						const color =
-							pct >= 99
-								? "var(--mantine-color-red-6)"
-								: pct >= 95
-									? "var(--mantine-color-yellow-6)"
-									: "var(--mantine-color-blue-6)";
-						return (
-							<Menu position="top-start">
-								<Menu.Target>
-									<Box
-										style={{
-											position: "relative",
-											width: 24,
-											height: 24,
-											flexShrink: 0,
-											cursor: "pointer",
-										}}
-										className="context-ring"
-									>
-										<svg
-											width={24}
-											height={24}
-											viewBox="0 0 24 24"
-											role="img"
-											aria-label={`Context: ${contextPercent.toFixed(1)}%`}
+					{/* Model & Permission selectors */}
+					<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
+						{/* Viewers */}
+						{viewers.length > 1 && (
+							<Tooltip label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}>
+								<Avatar.Group spacing="xs">
+									{viewers.slice(0, 3).map((v) => (
+										<UserAvatar
+											key={v.userId}
+											username={v.username}
+											avatarColor={v.avatarColor}
+											avatarImageId={v.avatarImageId}
+											userId={v.userId}
+											size={22}
+											showTooltip={false}
+										/>
+									))}
+									{viewers.length > 3 && (
+										<Avatar size={22} radius="xl">
+											+{viewers.length - 3}
+										</Avatar>
+									)}
+								</Avatar.Group>
+							</Tooltip>
+						)}
+						{/* Context usage indicator */}
+						{(() => {
+							if (contextPercent == null) return null;
+							const pct = Math.min(contextPercent, 100);
+							const r = 9;
+							const circ = 2 * Math.PI * r;
+							const offset = circ * (1 - pct / 100);
+							const color =
+								pct >= 99
+									? "var(--mantine-color-red-6)"
+									: pct >= 95
+										? "var(--mantine-color-yellow-6)"
+										: "var(--mantine-color-blue-6)";
+							return (
+								<Menu position="top-start">
+									<Menu.Target>
+										<Box
+											style={{
+												position: "relative",
+												width: 24,
+												height: 24,
+												flexShrink: 0,
+												cursor: "pointer",
+											}}
+											className="context-ring"
 										>
-											<title>{`Context: ${contextPercent.toFixed(1)}%`}</title>
-											<circle
-												cx={12}
-												cy={12}
-												r={r}
-												fill="none"
-												stroke="light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))"
-												strokeWidth={2.5}
-											/>
-											<circle
-												cx={12}
-												cy={12}
-												r={r}
-												fill="none"
-												stroke={color}
-												strokeWidth={2.5}
-												strokeDasharray={circ}
-												strokeDashoffset={offset}
-												strokeLinecap="round"
-												transform="rotate(-90 12 12)"
-												style={{ transition: "stroke-dashoffset 0.3s ease" }}
-											/>
-										</svg>
-									</Box>
-								</Menu.Target>
-								<Menu.Dropdown>
-									{prunedPercent != null && (
-										<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
-									)}
-									<Menu.Label>
-										{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-									</Menu.Label>
-									{promptTokens != null && (
+											<svg
+												width={24}
+												height={24}
+												viewBox="0 0 24 24"
+												role="img"
+												aria-label={`Context: ${contextPercent.toFixed(1)}%`}
+											>
+												<title>{`Context: ${contextPercent.toFixed(1)}%`}</title>
+												<circle
+													cx={12}
+													cy={12}
+													r={r}
+													fill="none"
+													stroke="light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))"
+													strokeWidth={2.5}
+												/>
+												<circle
+													cx={12}
+													cy={12}
+													r={r}
+													fill="none"
+													stroke={color}
+													strokeWidth={2.5}
+													strokeDasharray={circ}
+													strokeDashoffset={offset}
+													strokeLinecap="round"
+													transform="rotate(-90 12 12)"
+													style={{ transition: "stroke-dashoffset 0.3s ease" }}
+												/>
+											</svg>
+										</Box>
+									</Menu.Target>
+									<Menu.Dropdown>
+										{prunedPercent != null && (
+											<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
+										)}
 										<Menu.Label>
-											{contextWindow != null
-												? t("contextUsageTokensWithWindow", {
-														tokens: promptTokens.toLocaleString(),
-														window: contextWindow.toLocaleString(),
-													})
-												: t("contextUsageTokens", {
-														tokens: promptTokens.toLocaleString(),
-													})}
+											{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
 										</Menu.Label>
-									)}
-									<Menu.Divider />
-									<Tooltip
-										label={t("pruneEnabledTooltip")}
-										multiline
-										w={260}
-										withArrow
-										position="top"
-									>
-										<Menu.Label>
-											<Switch
+										{promptTokens != null && (
+											<Menu.Label>
+												{contextWindow != null
+													? t("contextUsageTokensWithWindow", {
+															tokens: promptTokens.toLocaleString(),
+															window: contextWindow.toLocaleString(),
+														})
+													: t("contextUsageTokens", {
+															tokens: promptTokens.toLocaleString(),
+														})}
+											</Menu.Label>
+										)}
+										<Menu.Divider />
+										<Tooltip
+											label={t("pruneEnabledTooltip")}
+											multiline
+											w={260}
+											withArrow
+											position="top"
+										>
+											<Menu.Label>
+												<Switch
+													size="xs"
+													label={t("pruneEnabled")}
+													checked={narrator.pruneEnabled ?? true}
+													onChange={(e) => {
+														pruneEnabledMutation.mutate({
+															id: narratorId,
+															pruneEnabled: e.currentTarget.checked,
+														});
+													}}
+												/>
+											</Menu.Label>
+										</Tooltip>
+										<Menu.Divider />
+										<Menu.Item
+											leftSection={<IconArrowsMinimize size={14} />}
+											onClick={() => {
+												api.triggerCompact(narratorId).catch(() => {});
+											}}
+										>
+											{t("triggerCompact")}
+										</Menu.Item>
+										<Menu.Item
+											leftSection={<IconEraser size={14} />}
+											onClick={() => {
+												api.clearContext(narratorId).catch(() => {});
+											}}
+										>
+											{t("clearContext")}
+										</Menu.Item>
+									</Menu.Dropdown>
+								</Menu>
+							);
+						})()}
+								<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
+								</Text>
+							</Tooltip>
+						)}
+						{/* Desktop selects */}
+						{!compact && (
+							<Group gap={6} wrap="nowrap" visibleFrom="sm">
+								<Menu position="top-end">
+									<Menu.Target>
+										<NativeSelect
+											size="xs"
+											data={allModels.map((m) => ({ value: m.value, label: m.label }))}
+											value={narrator.model ?? ""}
+											onChange={() => {}}
+											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+											style={{ pointerEvents: "auto" }}
+										/>
+									</Menu.Target>
+									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+										<ModelMenuItems
+											allModels={allModels}
+											currentModel={narrator.model}
+											totalCostUsd={narrator.totalCostUsd}
+											onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+										/>
+									</Menu.Dropdown>
+								</Menu>
+								<Menu position="top-end">
+									<Menu.Target>
+										<NativeSelect
+											size="xs"
+											leftSection={
+												PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+													<IconShield size={14} />
+												)
+											}
+											data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
+											value={narrator.permissionMode ?? "default"}
+											onChange={() => {}}
+											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+											style={{ pointerEvents: "auto" }}
+										/>
+									</Menu.Target>
+									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+										<PermModeMenuItems
+											currentMode={narrator.permissionMode ?? "default"}
+											onSelect={(m) =>
+												permModeMutation.mutate({ id: narratorId, permissionMode: m })
+											}
+											t={t}
+										/>
+									</Menu.Dropdown>
+								</Menu>
+								<WhitelistDirsPopover narratorId={narratorId} t={t} />
+								{/* Reasoning Effort (only for Codex-mode providers) */}
+								{supportsCodexControls && (
+									<Menu position="top-end">
+										<Menu.Target>
+											<NativeSelect
 												size="xs"
-												label={t("pruneEnabled")}
-												checked={narrator.pruneEnabled ?? true}
-												onChange={(e) => {
-													pruneEnabledMutation.mutate({
-														id: narratorId,
-														pruneEnabled: e.currentTarget.checked,
-													});
-												}}
+												data={[
+													{ value: "", label: t("reasoning_auto") },
+													{ value: "low", label: t("reasoning_low") },
+													{ value: "medium", label: t("reasoning_medium") },
+													{ value: "high", label: t("reasoning_high") },
+													{ value: "xhigh", label: t("reasoning_xhigh") },
+												]}
+												value={narrator.reasoningEffort ?? ""}
+												onChange={() => {}}
+												onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+												style={{ pointerEvents: "auto" }}
 											/>
-										</Menu.Label>
+										</Menu.Target>
+										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+											<ReasoningEffortMenuItems
+												currentEffort={narrator.reasoningEffort}
+												onSelect={(e) =>
+													reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+												}
+												t={t}
+											/>
+										</Menu.Dropdown>
+									</Menu>
+								)}
+								{/* Fast Mode toggle (only for Codex-mode providers) */}
+								{supportsCodexControls && (
+									<Tooltip label={t("fast_mode_tooltip")}>
+										<ActionIcon
+											variant="subtle"
+											color={narrator.fastMode ? "yellow" : "gray"}
+											size="sm"
+											onClick={() =>
+												fastModeMutation.mutate({
+													id: narratorId,
+													fastMode: !narrator.fastMode,
+												})
+											}
+										>
+											<IconBolt size={16} />
+										</ActionIcon>
 									</Tooltip>
-									<Menu.Divider />
-									<Menu.Item
-										leftSection={<IconArrowsMinimize size={14} />}
-										onClick={() => {
-											api.triggerCompact(narratorId).catch(() => {});
-										}}
-									>
-										{t("triggerCompact")}
-									</Menu.Item>
-									<Menu.Item
-										leftSection={<IconEraser size={14} />}
-										onClick={() => {
-											api.clearContext(narratorId).catch(() => {});
-										}}
-									>
-										{t("clearContext")}
-									</Menu.Item>
-								</Menu.Dropdown>
-							</Menu>
-						);
-					})()}
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
-							</Text>
-						</Tooltip>
-					)}
-					{/* Desktop selects */}
-					{!compact && (
-						<Group gap={6} wrap="nowrap" visibleFrom="sm">
-							<Menu position="top-end">
+								)}
+								{/* Relaxed Plan toggle (only visible in plan mode) */}
+								{narrator.permissionMode === "plan" && (
+									<Tooltip label={t("relaxed_plan_tooltip")}>
+										<ActionIcon
+											variant="subtle"
+											color={narrator.relaxedPlan ? "teal" : "gray"}
+											size="sm"
+											onClick={() =>
+												relaxedPlanMutation.mutate({
+													id: narratorId,
+													relaxedPlan: !narrator.relaxedPlan,
+												})
+											}
+										>
+											{narrator.relaxedPlan ? <IconLockOpen size={16} /> : <IconLock size={16} />}
+										</ActionIcon>
+									</Tooltip>
+								)}
+								{onToggleTerminal && (
+									<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
+										<Indicator
+											label={activeTerminalCount}
+											size={14}
+											disabled={activeTerminalCount === 0}
+											offset={2}
+											color="blue"
+										>
+											<ActionIcon
+												variant="subtle"
+												color={terminalOpen ? "blue" : "gray"}
+												size="sm"
+												onClick={onToggleTerminal}
+											>
+												<IconTerminal size={16} />
+											</ActionIcon>
+										</Indicator>
+									</Tooltip>
+								)}
+							</Group>
+						)}
+						{/* Mobile: model & permission */}
+						<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
+							<Menu position="bottom-end" withinPortal>
 								<Menu.Target>
-									<NativeSelect
-										size="xs"
-										data={allModels.map((m) => ({ value: m.value, label: m.label }))}
-										value={narrator.model ?? ""}
-										onChange={() => {}}
-										onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-										style={{ pointerEvents: "auto" }}
-									/>
+									<ActionIcon variant="subtle" color="gray" size="sm">
+										<Text size="xs" fw={600}>
+											{(() => {
+												const m = allModels.find((x) => x.value === narrator.model);
+												return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
+											})()}
+										</Text>
+									</ActionIcon>
 								</Menu.Target>
 								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 									<ModelMenuItems
@@ -1893,26 +2090,20 @@ export function NarratorPanel({
 										currentModel={narrator.model}
 										totalCostUsd={narrator.totalCostUsd}
 										onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+										label={t("modelTooltip")}
 									/>
 								</Menu.Dropdown>
 							</Menu>
-							<Menu position="top-end">
+							<Menu position="bottom-end" withinPortal>
 								<Menu.Target>
-									<NativeSelect
-										size="xs"
-										leftSection={
-											PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-												<IconShield size={14} />
-											)
-										}
-										data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
-										value={narrator.permissionMode ?? "default"}
-										onChange={() => {}}
-										onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-										style={{ pointerEvents: "auto" }}
-									/>
+									<ActionIcon variant="subtle" color="gray" size="sm">
+										{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+											<IconShield size={16} />
+										)}
+									</ActionIcon>
 								</Menu.Target>
 								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+									<Menu.Label>{t("permissionMode")}</Menu.Label>
 									<PermModeMenuItems
 										currentMode={narrator.permissionMode ?? "default"}
 										onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
@@ -1921,24 +2112,20 @@ export function NarratorPanel({
 								</Menu.Dropdown>
 							</Menu>
 							<WhitelistDirsPopover narratorId={narratorId} t={t} />
-							{/* Reasoning Effort (only for Codex-mode providers) */}
+							{/* Reasoning Effort (only for Codex-mode providers) - Mobile */}
 							{supportsCodexControls && (
-								<Menu position="top-end">
+								<Menu position="bottom-end" withinPortal>
 									<Menu.Target>
-										<NativeSelect
-											size="xs"
-											data={[
-												{ value: "", label: t("reasoning_auto") },
-												{ value: "low", label: t("reasoning_low") },
-												{ value: "medium", label: t("reasoning_medium") },
-												{ value: "high", label: t("reasoning_high") },
-												{ value: "xhigh", label: t("reasoning_xhigh") },
-											]}
-											value={narrator.reasoningEffort ?? ""}
-											onChange={() => {}}
-											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-											style={{ pointerEvents: "auto" }}
-										/>
+										<ActionIcon variant="subtle" color="gray" size="sm">
+											<Text size="xs" fw={600}>
+												{(() => {
+													const effortMap = { low: "L", medium: "M", high: "H", xhigh: "X" };
+													return (
+														effortMap[narrator.reasoningEffort as keyof typeof effortMap] ?? "A"
+													);
+												})()}
+											</Text>
+										</ActionIcon>
 									</Menu.Target>
 									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 										<ReasoningEffortMenuItems
@@ -1951,7 +2138,7 @@ export function NarratorPanel({
 									</Menu.Dropdown>
 								</Menu>
 							)}
-							{/* Fast Mode toggle (only for Codex-mode providers) */}
+							{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
 							{supportsCodexControls && (
 								<Tooltip label={t("fast_mode_tooltip")}>
 									<ActionIcon
@@ -1969,7 +2156,7 @@ export function NarratorPanel({
 									</ActionIcon>
 								</Tooltip>
 							)}
-							{/* Relaxed Plan toggle (only visible in plan mode) */}
+							{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
 							{narrator.permissionMode === "plan" && (
 								<Tooltip label={t("relaxed_plan_tooltip")}>
 									<ActionIcon
@@ -1983,10 +2170,7 @@ export function NarratorPanel({
 											})
 										}
 									>
-										<IconLock
-											size={16}
-											style={narrator.relaxedPlan ? { opacity: 0.5 } : undefined}
-										/>
+										{narrator.relaxedPlan ? <IconLockOpen size={16} /> : <IconLock size={16} />}
 									</ActionIcon>
 								</Tooltip>
 							)}
@@ -2011,266 +2195,144 @@ export function NarratorPanel({
 								</Tooltip>
 							)}
 						</Group>
-					)}
-					{/* Mobile: model & permission */}
-					<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
-						<Menu position="bottom-end" withinPortal>
-							<Menu.Target>
-								<ActionIcon variant="subtle" color="gray" size="sm">
-									<Text size="xs" fw={600}>
-										{(() => {
-											const m = allModels.find((x) => x.value === narrator.model);
-											return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
-										})()}
-									</Text>
-								</ActionIcon>
-							</Menu.Target>
-							<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-								<ModelMenuItems
-									allModels={allModels}
-									currentModel={narrator.model}
-									totalCostUsd={narrator.totalCostUsd}
-									onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-									label={t("modelTooltip")}
-								/>
-							</Menu.Dropdown>
-						</Menu>
-						<Menu position="bottom-end" withinPortal>
-							<Menu.Target>
-								<ActionIcon variant="subtle" color="gray" size="sm">
-									{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-										<IconShield size={16} />
-									)}
-								</ActionIcon>
-							</Menu.Target>
-							<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-								<Menu.Label>{t("permissionMode")}</Menu.Label>
-								<PermModeMenuItems
-									currentMode={narrator.permissionMode ?? "default"}
-									onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
-									t={t}
-								/>
-							</Menu.Dropdown>
-						</Menu>
-						<WhitelistDirsPopover narratorId={narratorId} t={t} />
-						{/* Reasoning Effort (only for Codex-mode providers) - Mobile */}
-						{supportsCodexControls && (
-							<Menu position="bottom-end" withinPortal>
-								<Menu.Target>
-									<ActionIcon variant="subtle" color="gray" size="sm">
-										<Text size="xs" fw={600}>
-											{(() => {
-												const effortMap = { low: "L", medium: "M", high: "H", xhigh: "X" };
-												return effortMap[narrator.reasoningEffort as keyof typeof effortMap] ?? "A";
-											})()}
-										</Text>
-									</ActionIcon>
-								</Menu.Target>
-								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-									<ReasoningEffortMenuItems
-										currentEffort={narrator.reasoningEffort}
-										onSelect={(e) =>
-											reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
-										}
-										t={t}
-									/>
-								</Menu.Dropdown>
-							</Menu>
-						)}
-						{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-						{supportsCodexControls && (
-							<Tooltip label={t("fast_mode_tooltip")}>
-								<ActionIcon
-									variant="subtle"
-									color={narrator.fastMode ? "yellow" : "gray"}
-									size="sm"
-									onClick={() =>
-										fastModeMutation.mutate({
-											id: narratorId,
-											fastMode: !narrator.fastMode,
-										})
-									}
-								>
-									<IconBolt size={16} />
-								</ActionIcon>
-							</Tooltip>
-						)}
-						{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
-						{narrator.permissionMode === "plan" && (
-							<Tooltip label={t("relaxed_plan_tooltip")}>
-								<ActionIcon
-									variant="subtle"
-									color={narrator.relaxedPlan ? "teal" : "gray"}
-									size="sm"
-									onClick={() =>
-										relaxedPlanMutation.mutate({
-											id: narratorId,
-											relaxedPlan: !narrator.relaxedPlan,
-										})
-									}
-								>
-									<IconLock size={16} style={narrator.relaxedPlan ? { opacity: 0.5 } : undefined} />
-								</ActionIcon>
-							</Tooltip>
-						)}
-						{onToggleTerminal && (
-							<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
-								<Indicator
-									label={activeTerminalCount}
-									size={14}
-									disabled={activeTerminalCount === 0}
-									offset={2}
-									color="blue"
-								>
-									<ActionIcon
-										variant="subtle"
-										color={terminalOpen ? "blue" : "gray"}
-										size="sm"
-										onClick={onToggleTerminal}
-									>
-										<IconTerminal size={16} />
-									</ActionIcon>
-								</Indicator>
-							</Tooltip>
-						)}
 					</Group>
 				</Group>
-			</Group>
 
-			{/* Input */}
-			{isChapterMerged ? (
-				<Box
-					px="md"
-					py="sm"
-					style={{
-						flexShrink: 0,
-						backgroundColor: "var(--mantine-color-dark-6)",
-						opacity: 0.7,
-					}}
-				>
-					<Text size="sm" c="dimmed" ta="center">
-						{t("chapterMergedHint")}
-					</Text>
-				</Box>
-			) : (
-				<Box px="md" pb="xs" style={{ flexShrink: 0 }}>
-					<input
-						ref={fileInputRef}
-						type="file"
-						accept="image/png,image/jpeg,image/gif,image/webp"
-						multiple
-						style={{ display: "none" }}
-						onChange={(e) => {
-							if (e.target.files) {
-								addImages(Array.from(e.target.files));
-								e.target.value = "";
-							}
+				{/* Input */}
+				{isChapterMerged ? (
+					<Box
+						px="md"
+						py="sm"
+						style={{
+							flexShrink: 0,
+							backgroundColor: "var(--mantine-color-dark-6)",
+							opacity: 0.7,
 						}}
-					/>
-					<Group gap="xs" align="end" wrap="nowrap">
-						<Tooltip label={t("attachImage")}>
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								onClick={() => fileInputRef.current?.click()}
-								mb={4}
-							>
-								<IconPaperclip size={18} />
-							</ActionIcon>
-						</Tooltip>
-						<Box style={{ position: "relative", flex: 1 }}>
-							<CommandPopover
-								commands={commandsList ?? []}
-								input={input}
-								visible={commandPopoverVisible}
-								onSelect={handleCommandSelect}
-								onClose={closeCommandPopover}
-							/>
-							{matchedCommand && (
-								<CommandParamHelper
-									command={matchedCommand}
+					>
+						<Text size="sm" c="dimmed" ta="center">
+							{t("chapterMergedHint")}
+						</Text>
+					</Box>
+				) : (
+					<Box px="md" pb="xs" style={{ flexShrink: 0 }}>
+						<input
+							ref={fileInputRef}
+							type="file"
+							accept="image/png,image/jpeg,image/gif,image/webp"
+							multiple
+							style={{ display: "none" }}
+							onChange={(e) => {
+								if (e.target.files) {
+									addImages(Array.from(e.target.files));
+									e.target.value = "";
+								}
+							}}
+						/>
+						<Group gap="xs" align="end" wrap="nowrap">
+							<Tooltip label={t("attachImage")}>
+								<ActionIcon
+									variant="subtle"
+									color="gray"
+									onClick={() => fileInputRef.current?.click()}
+									mb={4}
+								>
+									<IconPaperclip size={18} />
+								</ActionIcon>
+							</Tooltip>
+							<Box style={{ position: "relative", flex: 1 }}>
+								<CommandPopover
+									commands={commandsList ?? []}
 									input={input}
-									visible={!commandPopoverVisible}
+									visible={commandPopoverVisible}
+									onSelect={handleCommandSelect}
+									onClose={closeCommandPopover}
 								/>
-							)}
-							<Textarea
-								ref={textareaRef}
-								placeholder={t("sendPlaceholder")}
-								value={input}
-								onChange={(e) => setInput(e.currentTarget.value)}
-								onKeyDown={handleKeyDown}
-								onPaste={handlePaste}
-								autosize
-								minRows={1}
-								maxRows={6}
-							/>
-						</Box>
-						{(() => {
-							const hasInput = !!input.trim();
-							const showInterrupt = isActive && !hasInput;
-							const showRetry =
-								!showInterrupt &&
-								!hasInput &&
-								attachedImages.length === 0 &&
-								canRetryLastUserMessage;
-							if (showInterrupt) {
+								{matchedCommand && (
+									<CommandParamHelper
+										command={matchedCommand}
+										input={input}
+										visible={!commandPopoverVisible}
+									/>
+								)}
+								<Textarea
+									ref={textareaRef}
+									placeholder={t("sendPlaceholder")}
+									value={input}
+									onChange={(e) => setInput(e.currentTarget.value)}
+									onKeyDown={handleKeyDown}
+									onPaste={handlePaste}
+									autosize
+									minRows={1}
+									maxRows={6}
+								/>
+							</Box>
+							{(() => {
+								const hasInput = !!input.trim();
+								const showInterrupt = isActive && !hasInput;
+								const showRetry =
+									!showInterrupt &&
+									!hasInput &&
+									attachedImages.length === 0 &&
+									canRetryLastUserMessage;
+								if (showInterrupt) {
+									return (
+										<Button
+											key="interrupt"
+											ref={interruptBtnRef}
+											color="red"
+											variant="light"
+											onMouseDown={startInterruptPress}
+											onMouseUp={clearInterruptTimer}
+											onMouseLeave={clearInterruptTimer}
+											onContextMenu={(e) => e.preventDefault()}
+											loading={interruptMutation.isPending}
+											style={{
+												position: "relative",
+												overflow: "hidden",
+												userSelect: "none",
+												touchAction: "none",
+											}}
+										>
+											{interruptProgress > 0 && interruptProgress < 1 && (
+												<div
+													style={{
+														position: "absolute",
+														inset: 0,
+														background: "var(--mantine-color-red-filled)",
+														opacity: 0.25,
+														transformOrigin: "left",
+														transform: `scaleX(${interruptProgress})`,
+														pointerEvents: "none",
+													}}
+												/>
+											)}
+											<span style={{ position: "relative" }}>
+												{bufferedText ? t("interruptCutInLine") : t("interrupt")}
+											</span>
+										</Button>
+									);
+								}
+								if (showRetry) {
+									return (
+										<Button key="retry" onClick={handleRetry}>
+											{t("retry")}
+										</Button>
+									);
+								}
 								return (
 									<Button
-										key="interrupt"
-										ref={interruptBtnRef}
-										color="red"
-										variant="light"
-										onMouseDown={startInterruptPress}
-										onMouseUp={clearInterruptTimer}
-										onMouseLeave={clearInterruptTimer}
-										onContextMenu={(e) => e.preventDefault()}
-										loading={interruptMutation.isPending}
-										style={{
-											position: "relative",
-											overflow: "hidden",
-											userSelect: "none",
-											touchAction: "none",
-										}}
+										key="send"
+										onClick={handleSend}
+										disabled={!hasInput || (isActive && !!bufferedText)}
 									>
-										{interruptProgress > 0 && interruptProgress < 1 && (
-											<div
-												style={{
-													position: "absolute",
-													inset: 0,
-													background: "var(--mantine-color-red-filled)",
-													opacity: 0.25,
-													transformOrigin: "left",
-													transform: `scaleX(${interruptProgress})`,
-													pointerEvents: "none",
-												}}
-											/>
-										)}
-										<span style={{ position: "relative" }}>
-											{bufferedText ? t("interruptCutInLine") : t("interrupt")}
-										</span>
+										{isActive ? t("queue") : tc("send")}
 									</Button>
 								);
-							}
-							if (showRetry) {
-								return (
-									<Button key="retry" onClick={handleRetry}>
-										{t("retry")}
-									</Button>
-								);
-							}
-							return (
-								<Button
-									key="send"
-									onClick={handleSend}
-									disabled={!hasInput || (isActive && !!bufferedText)}
-								>
-									{isActive ? t("queue") : tc("send")}
-								</Button>
-							);
-						})()}
-					</Group>
-				</Box>
-			)}
-		</Stack>
+							})()}
+						</Group>
+					</Box>
+				)}
+			</Stack>
+		</ContentViewerEnvironmentProvider>
 	);
 }

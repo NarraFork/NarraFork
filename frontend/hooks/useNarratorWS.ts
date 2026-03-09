@@ -16,7 +16,12 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 	) => void;
 	onStatusChange?: (status: string) => void;
-	onToolStarted?: (toolUseId: string, toolName: string, streamStartedAt?: number) => void;
+	onToolStarted?: (
+		toolUseId: string,
+		toolName: string,
+		streamStartedAt?: number,
+		input?: Record<string, unknown>,
+	) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
 		toolName: string,
@@ -31,6 +36,7 @@ interface NarratorWSCallbacks {
 		output?: unknown,
 		durationMs?: number,
 		updatedInput?: Record<string, unknown>,
+		metadata?: Record<string, unknown>,
 	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (
@@ -67,6 +73,12 @@ interface NarratorWSCallbacks {
 		filesChanged: number;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
+	onWebSearch?: (
+		id: string,
+		status: "in_progress" | "searching" | "completed",
+		query?: string,
+		queries?: string[],
+	) => void;
 	onNarratorError?: (error: string) => void;
 	onNarratorWarning?: (message: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
@@ -237,6 +249,7 @@ export function useNarratorWS(
 								data.toolUseId,
 								data.toolName,
 								data.streamStartedAt,
+								data.input,
 							);
 							break;
 						case "tool_use_chunk":
@@ -256,6 +269,7 @@ export function useNarratorWS(
 								data.output,
 								data.durationMs,
 								data.updatedInput,
+								data.metadata,
 							);
 							break;
 						case "todos_updated":
@@ -336,6 +350,9 @@ export function useNarratorWS(
 								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
 							}
 							break;
+							break;
+						case "web_search":
+							callbacksRef.current.onWebSearch?.(data.id, data.status, data.query, data.queries);
 							break;
 						case "narrator_error":
 							callbacksRef.current.onNarratorError?.(data.error);

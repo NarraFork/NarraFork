@@ -534,6 +534,8 @@ export async function handlePermission(
 			chapterId: true,
 			relaxedPlan: true,
 			previousPermissionMode: true,
+			type: true,
+			parentNarratorId: true,
 		},
 	});
 	const permMode = narrator?.permissionMode ?? "default";
@@ -591,10 +593,15 @@ export async function handlePermission(
 
 	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
 
-	// Load enabled whitelist directories for this narrator
+	// Load enabled whitelist directories for this narrator.
+	// Subagents inherit their parent narrator's whitelist directories.
+	const whitelistOwnerId =
+		narrator?.type === "subagent" && narrator.parentNarratorId
+			? narrator.parentNarratorId
+			: narratorId;
 	const wlRows = await db.query.narratorWhitelistDirs.findMany({
 		where: and(
-			eq(narratorWhitelistDirs.narratorId, narratorId),
+			eq(narratorWhitelistDirs.narratorId, whitelistOwnerId),
 			eq(narratorWhitelistDirs.enabled, true),
 		),
 		columns: { path: true, accessLevel: true, enabled: true },
@@ -675,9 +682,11 @@ export async function handlePermission(
 		const denyMsg =
 			isChapter && branchViolations?.length
 				? `DENIED: Chapter mode restricts git branch operations. Violations: ${branchViolations.join("; ")}. You may only work on the current branch.`
-				: permMode === "readOnly"
-					? getToolMessage("permissionDeniedReadOnly", locale)
-					: getToolMessage("permissionDeniedNonInteractive", locale);
+				: permMode === "plan"
+					? getToolMessage("permissionDeniedPlanMode", locale)
+					: permMode === "readOnly"
+						? getToolMessage("permissionDeniedReadOnly", locale)
+						: getToolMessage("permissionDeniedNonInteractive", locale);
 		const decisionReason =
 			isChapter && branchViolations?.length ? branchViolations.join("; ") : undefined;
 		logger.debug("Permission auto-denied", {

@@ -41,7 +41,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
-import { RoutinesSection } from "../../components/settings/RoutinesSection";
+import { DependencyStatus } from "../../components/settings/DependencyStatus";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
 import { UserAvatar } from "../../components/UserAvatar";
@@ -92,17 +92,27 @@ function SettingsPage() {
 	const deleteAvatar = useDeleteAvatar();
 	const [cropSrc, setCropSrc] = useState<string | null>(null);
 
+	const clearCropSrc = () => {
+		setCropSrc((prev) => {
+			if (prev) URL.revokeObjectURL(prev);
+			return null;
+		});
+	};
+
 	const handleAvatarFileSelected = (file: File | null) => {
 		if (!file) return;
 		const url = URL.createObjectURL(file);
-		setCropSrc(url);
+		setCropSrc((prev) => {
+			if (prev) URL.revokeObjectURL(prev);
+			return url;
+		});
 	};
 
 	const handleCropConfirm = (blob: Blob) => {
 		const file = new File([blob], "avatar.webp", { type: "image/webp" });
 		uploadAvatar.mutate(file, {
 			onSuccess: () => {
-				setCropSrc(null);
+				clearCropSrc();
 			},
 		});
 	};
@@ -485,10 +495,7 @@ function SettingsPage() {
 			{cropSrc && (
 				<AvatarCropModal
 					opened={!!cropSrc}
-					onClose={() => {
-						URL.revokeObjectURL(cropSrc);
-						setCropSrc(null);
-					}}
+					onClose={clearCropSrc}
 					imageSrc={cropSrc}
 					onConfirm={handleCropConfirm}
 					loading={uploadAvatar.isPending}
@@ -658,9 +665,6 @@ function SettingsPage() {
 					</Button>
 				</Stack>
 			</Paper>
-
-			{/* Built-in Routines */}
-			<RoutinesSection />
 
 			{/* Chapters */}
 			<Paper withBorder p="md">
@@ -941,6 +945,9 @@ function SettingsPage() {
 					</Button>
 				</Stack>
 			</Paper>
+
+			{/* System Dependencies */}
+			<DependencyStatus />
 
 			{/* About / Version */}
 			<Paper withBorder p="md">

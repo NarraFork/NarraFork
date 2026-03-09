@@ -15,6 +15,8 @@ interface DiffViewProps {
 	wordWrap?: boolean;
 	/** Shiki language id for syntax highlighting */
 	language?: string;
+	/** 1-based line number where the old text starts in the original file */
+	startLine?: number;
 }
 
 type DiffLine = {
@@ -22,6 +24,10 @@ type DiffLine = {
 	content: string;
 	/** Word-level changes for modified lines */
 	wordChanges?: Change[];
+	/** 1-based line number in the old file (undefined for added lines) */
+	oldLineNo?: number;
+	/** 1-based line number in the new file (undefined for removed lines) */
+	newLineNo?: number;
 };
 
 // --- Styles (inline, Mantine dark-theme compatible) ---
@@ -90,9 +96,11 @@ function splitIntoLines(value: string): string[] {
 
 const MAX_DIFF_LINES = 500;
 
-function computeDiff(oldStr: string, newStr: string): DiffLine[] {
+function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
 	const changes = computeLineDiff(oldStr, newStr);
 	const result: DiffLine[] = [];
+	let oldLine = startLine;
+	let newLine = startLine;
 
 	for (let i = 0; i < changes.length; i++) {
 		if (result.length >= MAX_DIFF_LINES) break;
@@ -101,7 +109,9 @@ function computeDiff(oldStr: string, newStr: string): DiffLine[] {
 		if (!change.added && !change.removed) {
 			// Context lines
 			for (const line of splitIntoLines(change.value)) {
-				result.push({ type: "context", content: line });
+				result.push({ type: "context", content: line, oldLineNo: oldLine, newLineNo: newLine });
+				oldLine++;
+				newLine++;
 			}
 			continue;
 		}
@@ -120,25 +130,32 @@ function computeDiff(oldStr: string, newStr: string): DiffLine[] {
 						type: "removed",
 						content: removedLines[j],
 						wordChanges: wc.filter((c) => !c.added),
+						oldLineNo: oldLine,
 					});
+					oldLine++;
 					result.push({
 						type: "added",
 						content: addedLines[j],
 						wordChanges: wc.filter((c) => !c.removed),
+						newLineNo: newLine,
 					});
+					newLine++;
 				}
 				// Remaining unpaired lines
 				for (let j = maxPaired; j < removedLines.length; j++) {
-					result.push({ type: "removed", content: removedLines[j] });
+					result.push({ type: "removed", content: removedLines[j], oldLineNo: oldLine });
+					oldLine++;
 				}
 				for (let j = maxPaired; j < addedLines.length; j++) {
-					result.push({ type: "added", content: addedLines[j] });
+					result.push({ type: "added", content: addedLines[j], newLineNo: newLine });
+					newLine++;
 				}
 				i++; // skip the added chunk
 			} else {
 				// Pure removal
 				for (const line of splitIntoLines(change.value)) {
-					result.push({ type: "removed", content: line });
+					result.push({ type: "removed", content: line, oldLineNo: oldLine });
+					oldLine++;
 				}
 			}
 			continue;
@@ -146,7 +163,8 @@ function computeDiff(oldStr: string, newStr: string): DiffLine[] {
 
 		// Pure addition (not preceded by removal)
 		for (const line of splitIntoLines(change.value)) {
-			result.push({ type: "added", content: line });
+			result.push({ type: "added", content: line, newLineNo: newLine });
+			newLine++;
 		}
 	}
 
@@ -216,14 +234,28 @@ function renderTokens(tokens: ThemedToken[]) {
 	));
 }
 
+const lineNoStyle = {
+	display: "inline-block",
+	minWidth: "3ch",
+	textAlign: "right" as const,
+	userSelect: "none" as const,
+	flexShrink: 0,
+	opacity: 0.4,
+	fontSize: "inherit",
+	fontFamily: "inherit",
+	paddingRight: "0.5ch",
+} as const;
+
 const DiffLineRow = memo(function DiffLineRow({
 	line,
 	tokens,
 	diffStyles,
+	showLineNumbers,
 }: {
 	line: DiffLine;
 	tokens?: ThemedToken[];
 	diffStyles: ReturnType<typeof getDiffStyles>;
+	showLineNumbers?: boolean;
 }) {
 	const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
 	const lineStyle =
@@ -241,6 +273,12 @@ const DiffLineRow = memo(function DiffLineRow({
 
 	return (
 		<div style={lineStyle}>
+			{showLineNumbers && (
+				<>
+					<span style={lineNoStyle}>{line.oldLineNo ?? ""}</span>
+					<span style={lineNoStyle}>{line.newLineNo ?? ""}</span>
+				</>
+			)}
 			<span style={{ ...gutterStyle, color: gutterColor }}>{prefix}</span>
 			{line.wordChanges ? (
 				line.wordChanges.map((wc, j) => {
@@ -284,13 +322,15 @@ export const DiffView = memo(function DiffView({
 	maxHeight,
 	wordWrap,
 	language,
+	startLine,
 }: DiffViewProps) {
 	const computedScheme = useComputedColorScheme("dark");
 	const isDark = computedScheme === "dark";
 	const theme = isDark ? "github-dark-default" : "github-light-default";
 	const diffStyles = getDiffStyles(isDark);
-	const lines = useMemo(() => computeDiff(oldStr, newStr), [oldStr, newStr]);
+	const lines = useMemo(() => computeDiff(oldStr, newStr, startLine), [oldStr, newStr, startLine]);
 	const tokenMap = useTokenMap(lines, language, theme);
+	const showLineNumbers = startLine != null;
 
 	if (lines.length === 0) return null;
 
@@ -327,6 +367,7 @@ export const DiffView = memo(function DiffView({
 						line={line}
 						tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
 						diffStyles={diffStyles}
+						showLineNumbers={showLineNumbers}
 					/>
 				);
 			})}

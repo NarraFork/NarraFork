@@ -313,12 +313,18 @@ const REPLACERS: Replacer[] = [
 
 // ── Core replace function ───────────────────────────────────────
 
+export interface ReplaceResult {
+	content: string;
+	/** 1-based line number where the first replacement occurred */
+	startLine: number;
+}
+
 export function replace(
 	content: string,
 	oldString: string,
 	newString: string,
 	replaceAll = false,
-): string {
+): ReplaceResult {
 	if (oldString === newString) {
 		throw new Error("No changes to apply: old_string and new_string are identical.");
 	}
@@ -330,10 +336,16 @@ export function replace(
 			const index = content.indexOf(search);
 			if (index === -1) continue;
 			notFound = false;
-			if (replaceAll) return content.replaceAll(search, newString);
+			const startLine = content.substring(0, index).split("\n").length;
+			if (replaceAll) {
+				return { content: content.replaceAll(search, newString), startLine };
+			}
 			const lastIndex = content.lastIndexOf(search);
 			if (index !== lastIndex) continue; // not unique via this replacer, try next
-			return content.substring(0, index) + newString + content.substring(index + search.length);
+			return {
+				content: content.substring(0, index) + newString + content.substring(index + search.length),
+				startLine,
+			};
 		}
 	}
 
@@ -416,9 +428,19 @@ export const editTool: ToolDefinition = {
 			const normalizedOld = normalizeLineEndings(old_string);
 			const normalizedNew = normalizeLineEndings(new_string);
 
-			const updated = replace(content, normalizedOld, normalizedNew, replace_all);
-			await writeFileText(resolvedPath, updated, encoding);
-			return { output: `Edited ${file_path}`, title: file_path };
+			const result = replace(content, normalizedOld, normalizedNew, replace_all);
+			await writeFileText(resolvedPath, result.content, encoding);
+			const oldLines = normalizedOld.split("\n").length;
+			const newLines = normalizedNew.split("\n").length;
+			return {
+				output: `Edited ${file_path}`,
+				title: file_path,
+				metadata: {
+					startLine: result.startLine,
+					endLine: result.startLine + oldLines - 1,
+					newEndLine: result.startLine + newLines - 1,
+				},
+			};
 		} catch (err) {
 			return {
 				output: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,

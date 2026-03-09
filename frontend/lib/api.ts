@@ -156,10 +156,17 @@ export interface PaginatedNarrators {
 	totalCount: number;
 }
 
+export interface MessagesAroundOptions {
+	messageId: string;
+	before?: number;
+	after?: number;
+}
+
 export interface PaginatedMessages {
 	messages: TreeMessage[];
 	hasMore: boolean;
 	nextCursor: string | null;
+	hasMoreAfter?: boolean;
 	pruneBoundaryMessageId?: string | null;
 	prunedPercent?: number | null;
 }
@@ -217,6 +224,11 @@ export const api = {
 		}>("/admin/terminals"),
 	killAdminTerminal: (id: string) =>
 		request<ApiEntity>(`/admin/terminals/${id}`, { method: "DELETE" }),
+	batchKillAdminTerminals: (ids: string[]) =>
+		request<{ results: { id: string; ok: boolean; error?: string }[] }>(
+			"/admin/terminals/batch-kill",
+			{ method: "POST", body: JSON.stringify({ ids }) },
+		),
 	killOrphanSocket: (terminalId: string) =>
 		request<ApiEntity>("/admin/terminals/kill-orphan", {
 			method: "POST",
@@ -334,13 +346,22 @@ export const api = {
 		request<ApiEntity>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
 	markNarratorRead: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
-	getNarratorMessages: (id: string, limit?: number, cursor?: string, around?: string) => {
+	getNarratorMessages: (
+		id: string,
+		opts?: {
+			limit?: number;
+			cursor?: string;
+			around?: MessagesAroundOptions;
+		},
+	) => {
 		const params = new URLSearchParams();
-		if (around) {
-			params.set("around", around);
+		if (opts?.around) {
+			params.set("around", opts.around.messageId);
+			if (opts.around.before != null) params.set("before", String(opts.around.before));
+			if (opts.around.after != null) params.set("after", String(opts.around.after));
 		} else {
-			if (limit) params.set("limit", String(limit));
-			if (cursor) params.set("cursor", cursor);
+			if (opts?.limit) params.set("limit", String(opts.limit));
+			if (opts?.cursor) params.set("cursor", opts.cursor);
 		}
 		const qs = params.toString();
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
@@ -526,11 +547,27 @@ export const api = {
 		rows?: number;
 	}) => request<ApiEntity>("/terminals", { method: "POST", body: JSON.stringify(data) }),
 	getTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`),
+	getTerminalProcesses: (id: string) =>
+		request<{ pid: number; command: string }[]>(`/terminals/${id}/processes`),
 	deleteTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`, { method: "DELETE" }),
 	renameTerminal: (id: string, name: string) =>
 		request<ApiEntity>(`/terminals/${id}`, {
 			method: "PATCH",
 			body: JSON.stringify({ name }),
+		}),
+	updateTerminalGraphState: (
+		id: string,
+		state: {
+			graphOpened?: boolean;
+			graphX?: number;
+			graphY?: number;
+			graphWidth?: number;
+			graphHeight?: number;
+		},
+	) =>
+		request<ApiEntity>(`/terminals/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(state),
 		}),
 
 	// Terminal Tabs
@@ -580,6 +617,7 @@ export const api = {
 			nodes: ApiEntity[];
 			edges: ApiEntity[];
 			explorationGroups?: ApiEntity[];
+			openedTerminals?: ApiEntity[];
 		}>(`/projects/${projectId}/graph`),
 
 	// Search
@@ -639,6 +677,7 @@ export const api = {
 				lastVisitedAt: number;
 			}>;
 			commands: Array<{ name: string; prompt: string; description?: string }>;
+			setupWizardCompleted: boolean;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -667,6 +706,8 @@ export const api = {
 		notifyFeishuSecret?: string;
 		// Slash commands
 		commands?: Array<{ name: string; prompt: string; description?: string }>;
+		// Setup wizard
+		setupWizardCompleted?: boolean;
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",
@@ -1081,6 +1122,61 @@ export const api = {
 			"/openai/models",
 		),
 
+	// External MCP server management
+	mcpListServers: () =>
+		request<{
+			servers: Array<{
+				id: string;
+				name: string;
+				transport: string;
+				enabled: boolean;
+				status: string;
+				error?: string;
+				tools: Array<{ name: string; description?: string; inputSchema?: unknown }>;
+			}>;
+		}>("/mcp/servers"),
+	mcpCreateServer: (data: Record<string, unknown>) =>
+		request<Record<string, unknown>>("/mcp/servers", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	mcpUpdateServer: (id: string, data: Record<string, unknown>) =>
+		request<Record<string, unknown>>(`/mcp/servers/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	mcpDeleteServer: (id: string) =>
+		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
+	mcpConnectServer: (id: string) =>
+		request<Record<string, unknown>>(`/mcp/servers/${id}/connect`, { method: "POST" }),
+	mcpDisconnectServer: (id: string) =>
+		request<{ ok: boolean }>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
+	mcpTestConnection: (data: Record<string, unknown>) =>
+		request<{
+			ok: boolean;
+			tools?: Array<{ name: string; description?: string }>;
+			error?: string;
+		}>("/mcp/servers/test", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	mcpListAllTools: () =>
+		request<{
+			tools: Array<{
+				name: string;
+				description?: string;
+				inputSchema?: unknown;
+				serverName: string;
+				serverId: string;
+				source: string;
+			}>;
+		}>("/mcp/tools"),
+	mcpImportServers: (json: unknown) =>
+		request<{ added: number; skipped: number }>("/mcp/servers/import", {
+			method: "POST",
+			body: JSON.stringify({ json }),
+		}),
+
 	// Skills
 	listSkills: (projectId: string) =>
 		request<
@@ -1259,6 +1355,11 @@ export const api = {
 		request<{ ok: boolean }>(`/codex/credentials/${id}/reset`, { method: "POST" }),
 	codexCredentialDelete: (id: string) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, { method: "DELETE" }),
+	codexCredentialBatchDelete: (ids: string[]) =>
+		request<{ removed: string[]; notFound: string[] }>("/codex/credentials/batch", {
+			method: "DELETE",
+			body: JSON.stringify({ ids }),
+		}),
 	codexCredentialUpdate: (id: string, data: { displayName?: string; priority?: number }) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",
@@ -1349,6 +1450,29 @@ export const api = {
 			commit: string;
 			platform: "windows" | "macos" | "linux";
 		}>("/health"),
+
+	// Dependencies
+	checkDependencies: () =>
+		request<{
+			platform: "windows" | "macos" | "linux";
+			packageManager?: string;
+			dependencies: Array<{
+				name: string;
+				required: boolean;
+				installed: boolean;
+				version?: string;
+				platformSupported: boolean;
+				installCommands: Record<string, string>;
+			}>;
+			allRequiredMet: boolean;
+		}>("/dependencies"),
+
+	installDependency: (name: string) =>
+		request<{
+			ok: boolean;
+			error?: string;
+			dependency?: { name: string; installed: boolean; version?: string };
+		}>(`/dependencies/${name}/install`, { method: "POST" }),
 
 	// Filesystem browsing
 	fsBrowse: (path?: string) =>

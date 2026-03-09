@@ -108,10 +108,30 @@ export function playBuiltinSound(name: string): void {
 // --- Custom audio file playback ---
 
 const audioCache = new Map<string, string>(); // url -> blobUrl
+const MAX_AUDIO_CACHE_ENTRIES = 3;
+
+function touchAudioCache(url: string, blobUrl: string) {
+	audioCache.delete(url);
+	audioCache.set(url, blobUrl);
+}
+
+function trimAudioCache() {
+	while (audioCache.size > MAX_AUDIO_CACHE_ENTRIES) {
+		const oldestUrl = audioCache.keys().next().value;
+		if (!oldestUrl) break;
+		const oldestBlobUrl = audioCache.get(oldestUrl);
+		if (oldestBlobUrl) {
+			URL.revokeObjectURL(oldestBlobUrl);
+		}
+		audioCache.delete(oldestUrl);
+	}
+}
 
 export async function playCustomSound(url: string): Promise<void> {
 	let blobUrl = audioCache.get(url);
-	if (!blobUrl) {
+	if (blobUrl) {
+		touchAudioCache(url, blobUrl);
+	} else {
 		const token = getToken();
 		const headers: Record<string, string> = {};
 		if (token) headers.Authorization = `Bearer ${token}`;
@@ -120,7 +140,8 @@ export async function playCustomSound(url: string): Promise<void> {
 			if (!res.ok) return;
 			const blob = await res.blob();
 			blobUrl = URL.createObjectURL(blob);
-			audioCache.set(url, blobUrl);
+			touchAudioCache(url, blobUrl);
+			trimAudioCache();
 		} catch {
 			return;
 		}

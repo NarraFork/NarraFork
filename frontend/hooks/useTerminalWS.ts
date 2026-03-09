@@ -124,7 +124,10 @@ class TerminalWSManager {
 	}
 
 	private syncGlobalStatus() {
-		if (this.listeners.size === 0) return;
+		if (this.listeners.size === 0) {
+			removeWSStatus("terminal");
+			return;
+		}
 		setWSStatus("terminal", {
 			label: "Terminal",
 			connected: this._connected,
@@ -192,6 +195,7 @@ class TerminalWSManager {
 					this.send({ type: "unsubscribe", terminalIds: [terminalId] });
 				}
 			}
+			disposeManagerIfIdle(this);
 		};
 	}
 
@@ -224,12 +228,24 @@ class TerminalWSManager {
 		for (const cb of this.statusListeners) cb();
 	}
 
-	dispose() {
-		this.disposed = true;
+	hasListeners() {
+		return this.listeners.size > 0;
+	}
+
+	releaseConnection() {
 		clearTimeout(this.reconnectTimer);
+		this.reconnectAttempts = 0;
+		this._connected = false;
+		this._disconnected = false;
 		safeCloseWs(this.ws);
 		this.ws = null;
 		removeWSStatus("terminal");
+	}
+
+	dispose() {
+		this.disposed = true;
+		this.releaseConnection();
+		this.statusListeners.clear();
 	}
 }
 
@@ -242,6 +258,14 @@ function getManager(): TerminalWSManager {
 		manager.connect();
 	}
 	return manager;
+}
+
+function disposeManagerIfIdle(target: TerminalWSManager) {
+	if (target.hasListeners()) return;
+	target.dispose();
+	if (manager === target) {
+		manager = null;
+	}
 }
 
 // === React Hooks ===
@@ -280,8 +304,8 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 		setDisconnected(mgr.disconnected);
 
 		return () => {
-			unsubscribe();
 			unsubStatus();
+			unsubscribe();
 		};
 	}, [terminalId]);
 

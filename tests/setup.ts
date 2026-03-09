@@ -101,7 +101,10 @@ CREATE TABLE IF NOT EXISTS narrators (
 	model TEXT DEFAULT 'claude-sonnet',
 	system_prompt TEXT,
 	permission_mode TEXT DEFAULT 'default',
+	previous_permission_mode TEXT,
 	reasoning_effort TEXT,
+	fast_mode INTEGER NOT NULL DEFAULT 0,
+	relaxed_plan INTEGER NOT NULL DEFAULT 0,
 	plan_mode INTEGER NOT NULL DEFAULT 0,
 	message_count INTEGER DEFAULT 0,
 	total_cost_usd REAL DEFAULT 0,
@@ -114,6 +117,10 @@ CREATE TABLE IF NOT EXISTS narrators (
 	prune_boundary_message_id TEXT REFERENCES narrator_messages(id),
 	pruned_percent INTEGER,
 	prune_enabled INTEGER NOT NULL DEFAULT 1,
+	is_background INTEGER NOT NULL DEFAULT 0,
+	background_status TEXT,
+	background_result TEXT,
+	background_completed_at TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
@@ -132,6 +139,8 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	meter_usage REAL,
 	meter_unit TEXT,
 	commit_sha TEXT,
+	command_text TEXT,
+	created_by TEXT REFERENCES users(id),
 	created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS narrator_message_refs (
@@ -161,6 +170,7 @@ CREATE TABLE IF NOT EXISTS narrator_tool_calls (
 	permission_deny_message TEXT,
 	permission_decision_reason TEXT,
 	permission_suggestions TEXT,
+	is_background INTEGER NOT NULL DEFAULT 0,
 	created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS terminals (

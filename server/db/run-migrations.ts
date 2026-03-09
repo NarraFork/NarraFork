@@ -117,9 +117,7 @@ function stampMigrationsAsApplied(sqlite: Database, migrationsFolder: string): v
 		const hash = hashMigrationContent(content);
 
 		// Skip if already recorded
-		const existing = sqlite
-			.query("SELECT 1 FROM __drizzle_migrations WHERE hash = ?")
-			.get(hash);
+		const existing = sqlite.query("SELECT 1 FROM __drizzle_migrations WHERE hash = ?").get(hash);
 		if (existing) continue;
 
 		// Execute each statement individually, tolerating already-exists errors
@@ -144,10 +142,10 @@ function stampMigrationsAsApplied(sqlite: Database, migrationsFolder: string): v
 			}
 		}
 
-		sqlite.run(
-			"INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)",
-			[hash, entry.when],
-		);
+		sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
+			hash,
+			entry.when,
+		]);
 	}
 }
 

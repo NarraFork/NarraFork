@@ -31,10 +31,11 @@
 	"selection": {
 		"fork": "分叉",
 		"merge": "合并",
-		"mergeInto": "合并到已有节点",
+		"mergeInto": "合并到",
 		"mergeNewTitle": "合并：{{titles}}",
 		"mergeSuccess": "合并完成",
-		"mergeFailed": "合并失败：{{message}}"
+		"mergeFailed": "合并失败：{{message}}",
+		"newTerminal": "新建终端"
 	},
 	"forkDraft": {
 		"titlePlaceholder": "新分支标题",
@@ -51,6 +52,14 @@
 		"titlePlaceholder": "合并提交标题",
 		"descriptionPlaceholder": "合并说明…",
 		"failed": "合并失败：{{message}}"
+	},
+	"terminal": {
+		"minimize": "最小化终端",
+		"close": "关闭终端",
+		"closeConfirmTitle": "关闭终端",
+		"closeConfirmMessage": "该终端中有正在运行的进程，确定要关闭吗？",
+		"cancel": "取消",
+		"confirmClose": "关闭"
 	},
 	"sidePanel": {
 		"upstreamUpdates": "上游有更新",

@@ -508,7 +508,7 @@ export const chapterMerge = {
 					mergeCommitSha: source.mergeCommitSha,
 					revertSha,
 				});
-			} catch (err) {
+			} catch {
 				throw new ValidationError(
 					`Cannot automatically unmerge: revert of ${source.mergeCommitSha.slice(0, 7)} ` +
 						`conflicts with later commits on the target branch. ` +

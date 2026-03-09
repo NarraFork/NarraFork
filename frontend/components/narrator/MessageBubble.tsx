@@ -27,6 +27,7 @@ import {
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
+	IconWorldSearch,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -518,36 +519,32 @@ export function ReasoningSummary({
 			setIsOverflow(el.scrollWidth - el.clientWidth > 1);
 		};
 
-		measure();
-		const rafId = requestAnimationFrame(measure);
-		const timeoutId1 = setTimeout(measure, 120);
-		const timeoutId2 = setTimeout(measure, 400);
-
-		const handleResize = () => measure();
-		window.addEventListener("resize", handleResize);
-
-		let ro: ResizeObserver | undefined;
-		if (typeof ResizeObserver !== "undefined" && lineRef.current) {
-			ro = new ResizeObserver(measure);
-			ro.observe(lineRef.current);
-		}
-
+		const lineEl = lineRef.current;
+		const containerEl = lineEl?.parentElement ?? null;
 		let cancelled = false;
-		if (document.fonts?.ready) {
-			document.fonts.ready
-				.then(() => {
-					if (!cancelled) measure();
-				})
-				.catch(() => {});
+		const measureIfActive = () => {
+			if (!cancelled) measure();
+		};
+		const rafId1 = requestAnimationFrame(measureIfActive);
+		const rafId2 = requestAnimationFrame(() => requestAnimationFrame(measureIfActive));
+
+		let resizeObserver: ResizeObserver | undefined;
+		if (typeof ResizeObserver !== "undefined") {
+			resizeObserver = new ResizeObserver(measure);
+			if (lineEl) resizeObserver.observe(lineEl);
+			if (containerEl && containerEl !== lineEl) resizeObserver.observe(containerEl);
 		}
+
+		const fontSet = document.fonts;
+		const handleFontsDone = () => measure();
+		fontSet?.addEventListener?.("loadingdone", handleFontsDone);
 
 		return () => {
 			cancelled = true;
-			cancelAnimationFrame(rafId);
-			clearTimeout(timeoutId1);
-			clearTimeout(timeoutId2);
-			window.removeEventListener("resize", handleResize);
-			ro?.disconnect();
+			cancelAnimationFrame(rafId1);
+			cancelAnimationFrame(rafId2);
+			resizeObserver?.disconnect();
+			fontSet?.removeEventListener?.("loadingdone", handleFontsDone);
 		};
 	}, [headerText]);
 
@@ -1110,6 +1107,32 @@ export const MessageBubble = memo(function MessageBubble({
 									</Text>
 								</Paper>
 							</ContentViewer>
+						);
+					}
+					if (block.type === "web_search") {
+						const query = block.query ?? (block.queries as string[] | undefined)?.join(", ");
+						const isSearching = block.status && block.status !== "completed";
+						return (
+							<Paper key={key} withBorder radius="sm" p="xs">
+								<Group gap={6} wrap="nowrap" align="center">
+									<ThemeIcon size={18} variant="light" color="teal" radius="sm">
+										<IconWorldSearch size={12} />
+									</ThemeIcon>
+									{isSearching && <Loader size={12} color="teal" type="dots" />}
+									<Text size="xs" c="dimmed">
+										{isSearching
+											? block.status === "searching"
+												? t("webSearching")
+												: t("webSearchPreparing")
+											: t("webSearched")}
+										{query && (
+											<Text span fw={500} c="teal" ml={4}>
+												{query}
+											</Text>
+										)}
+									</Text>
+								</Group>
+							</Paper>
 						);
 					}
 					if (block.type === "tool_use") {
