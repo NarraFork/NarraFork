@@ -1026,11 +1026,6 @@ export const MessageBubble = memo(function MessageBubble({
 							autosize
 							minRows={2}
 							maxRows={10}
-							styles={{
-								input: {
-									backgroundColor: "var(--mantine-color-dark-6)",
-								},
-							}}
 						/>
 						<Group gap="xs" justify="flex-end">
 							<Button size="xs" variant="subtle" onClick={cancelEditing}>
