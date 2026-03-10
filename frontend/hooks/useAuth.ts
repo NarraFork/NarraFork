@@ -82,3 +82,13 @@ export function useDeleteAvatar() {
 		},
 	});
 }
+
+export function useUpdateProfile() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.updateProfile,
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["auth", "me"] });
+		},
+	});
+}

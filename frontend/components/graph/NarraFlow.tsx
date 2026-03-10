@@ -11,6 +11,7 @@ import {
 	ReactFlow,
 	type ReactFlowInstance,
 	useReactFlow,
+	type Viewport,
 } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "@xyflow/react/dist/style.css";
@@ -22,6 +23,7 @@ import { useNarraFlow } from "@frontend/hooks/useNarraFlow";
 import { useNarratorsListWS } from "@frontend/hooks/useNarratorWS";
 import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/hooks/useTerminals";
+import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
 import { Box, Button, Group, Modal, Stack, Text, useMantineColorScheme } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -161,6 +163,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const { colorScheme } = useMantineColorScheme();
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
+	const { data: prefs } = useUserPreferences();
 	const { nodes: graphNodes, edges, isLoading, error, openedTerminals } = useNarraFlow(projectId);
 	const { savePosition, savePanelState } = useUpdateGraphPositions(projectId);
 	const createEdge = useCreateChapterEdge();
@@ -207,6 +210,46 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const flowWrapperRef = useRef<HTMLDivElement>(null);
 	const reactFlowRef = useRef<ReactFlowInstance | null>(null);
 	const focusAppliedRef = useRef(false);
+	const viewportSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const nodesRef = useRef<Node[]>(nodes);
+	nodesRef.current = nodes;
+	const computedEdgesRef = useRef<Edge[]>(computedEdges);
+	computedEdgesRef.current = computedEdges;
+	const movedNodeIdsRef = useRef<Set<string>>(new Set());
+
+	// Parse server-side viewport map and keep in a ref for synchronous access
+	const savedViewportsRef = useRef<Record<string, Viewport>>({});
+	useMemo(() => {
+		try {
+			const raw = (prefs as Record<string, unknown> | undefined)?.graphViewports;
+			if (typeof raw === "string") {
+				savedViewportsRef.current = JSON.parse(raw);
+			} else if (raw && typeof raw === "object") {
+				savedViewportsRef.current = raw as Record<string, Viewport>;
+			}
+		} catch {
+			savedViewportsRef.current = {};
+		}
+	}, [prefs]);
+
+	// Debounced viewport save — fires after user stops panning/zooming
+	const handleMoveEnd = useCallback(
+		(_event: unknown, viewport: Viewport) => {
+			if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+			viewportSaveTimerRef.current = setTimeout(() => {
+				savedViewportsRef.current[projectId] = viewport;
+				api.saveGraphViewport(projectId, viewport);
+			}, 500);
+		},
+		[projectId],
+	);
+
+	// Cleanup viewport save timer on unmount
+	useEffect(() => {
+		return () => {
+			if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+		};
+	}, []);
 
 	// Reset the guard when the target chapter changes so consecutive
 	// navigations back from different narrators each trigger a focus.
@@ -227,11 +270,51 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			instance.fitView({ padding: 0.3, duration: 300, nodes: [targetNode] });
 		});
 	}, [focusChapterId]);
-	const nodesRef = useRef<Node[]>(nodes);
-	nodesRef.current = nodes;
-	const computedEdgesRef = useRef<Edge[]>(computedEdges);
-	computedEdgesRef.current = computedEdges;
-	const movedNodeIdsRef = useRef<Set<string>>(new Set());
+
+	// Restore saved viewport or fitView on init
+	const restoreViewport = useCallback(
+		(instance: ReactFlowInstance) => {
+			if (focusChapterId) {
+				tryFocusChapter();
+				return;
+			}
+			const saved = savedViewportsRef.current[projectId];
+			if (saved) {
+				instance.setViewport(saved);
+				return;
+			}
+			instance.fitView({ padding: 0.2 });
+		},
+		[projectId, focusChapterId, tryFocusChapter],
+	);
+
+	const handleInit = useCallback(
+		(instance: ReactFlowInstance) => {
+			reactFlowRef.current = instance;
+			restoreViewport(instance);
+		},
+		[restoreViewport],
+	);
+
+	// When projectId changes without remount (e.g. switching projects in nav),
+	// save the old viewport and restore the new project's viewport.
+	const prevProjectIdRef = useRef(projectId);
+	useEffect(() => {
+		if (prevProjectIdRef.current === projectId) return;
+		const instance = reactFlowRef.current;
+		// Save viewport for the project we're leaving
+		if (instance) {
+			const vp = instance.getViewport();
+			savedViewportsRef.current[prevProjectIdRef.current] = vp;
+			api.saveGraphViewport(prevProjectIdRef.current, vp);
+		}
+		prevProjectIdRef.current = projectId;
+		// Restore viewport for the new project once nodes are ready
+		if (instance) {
+			restoreViewport(instance);
+		}
+	}, [projectId, restoreViewport]);
+
 	const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
 	const expandedNodesRef = useRef(expandedNodes);
 	expandedNodesRef.current = expandedNodes;
@@ -586,10 +669,22 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 		// Fast path: if the upstream array reference is the same, nothing changed.
 		// Exception: if local nodes are empty but graphNodes has data (e.g. component
-		// mounted with cached query data), we must still initialise.
-		if (prev === graphNodes && nodesRef.current.length > 0) return;
+		// re-mounted with cached query data), we must still initialise.
+		const isFirstInit = nodesRef.current.length === 0 && graphNodes.length > 0;
+		if (prev === graphNodes && !isFirstInit) return;
 
 		const currentNodeMap = new Map(nodesRef.current.map((n) => [n.id, n]));
+
+		// On first initialisation after remount, treat all nodes as changed so
+		// we don't skip the update due to identical references.
+		if (isFirstInit) {
+			const nextNodes = [...(graphNodes as Node[]), ...localOnly];
+			nodesRef.current = nextNodes;
+			movedNodeIdsRef.current.clear();
+			setNodes(nextNodes);
+			recomputeEdges(nextNodes, { full: true });
+			return;
+		}
 
 		// Build a set of node IDs whose server data actually changed so we can
 		// skip touching nodes that are identical.
@@ -1097,18 +1192,35 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					? payload.sourceChapterIds
 					: payload.sourceChapterIds.slice(1);
 
+				// All chapters involved as sources (to collapse after merge)
+				const allSourceIds = payload.sourceChapterIds;
+
 				api
 					.batchMerge({
 						baseChapterId: baseId,
 						sourceChapterIds: sourceIds,
 						title: payload.title,
 					})
-					.then(() => {
+					.then((res) => {
 						removeDraft(draftNodeId);
 						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 						queryClient.invalidateQueries({ queryKey: ["chapters"] });
 						notifications.show({ message: t("selection.mergeSuccess"), color: "green" });
 						setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+
+						// Collapse merged source nodes, expand the target node
+						const targetId = res?.targetChapterId;
+						if (targetId || allSourceIds.length) {
+							setExpandedNodes((prev) => {
+								const next = new Set(prev);
+								for (const id of allSourceIds) {
+									next.delete(id);
+									panelSizesRef.current.delete(id);
+								}
+								if (targetId) next.add(targetId);
+								return next;
+							});
+						}
 					})
 					.catch((err) => {
 						notifications.show({
@@ -1222,22 +1334,41 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const handleMergeInto = useCallback(
 		(sourceNodeIds: string[], targetNodeId: string) => {
 			if (sourceNodeIds.length === 0) return;
-			const titles = sourceNodeIds
-				.map((id) => {
-					const n = nodesRef.current.find((nd) => nd.id === id);
-					// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
-					return (n?.data as any)?.title ?? id.slice(0, 6);
+
+			// Merge directly into the existing target chapter — no draft node, no new chapter
+			api
+				.batchMerge({
+					baseChapterId: targetNodeId,
+					sourceChapterIds: sourceNodeIds,
+					targetChapterId: targetNodeId,
 				})
-				.join(", ");
-			const pos = getBboxBottom([...sourceNodeIds, targetNodeId]);
-			spawnDraft("merge", pos, {
-				sourceChapterIds: sourceNodeIds,
-				targetChapterId: targetNodeId,
-				defaultTitle: t("selection.mergeNewTitle", { titles }),
-			});
-			setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+				.then(() => {
+					queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+					queryClient.invalidateQueries({ queryKey: ["chapters"] });
+					notifications.show({ message: t("selection.mergeSuccess"), color: "green" });
+					setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+
+					// Collapse merged source nodes, expand the target node
+					setExpandedNodes((prev) => {
+						const next = new Set(prev);
+						for (const id of sourceNodeIds) {
+							next.delete(id);
+							panelSizesRef.current.delete(id);
+						}
+						next.add(targetNodeId);
+						return next;
+					});
+				})
+				.catch((err) => {
+					notifications.show({
+						message: t("mergeDraft.failed", {
+							message: err instanceof Error ? err.message : "unknown",
+						}),
+						color: "red",
+					});
+				});
 		},
-		[spawnDraft, getBboxBottom, t],
+		[queryClient, t],
 	);
 
 	const handleSetRole = useCallback(
@@ -1346,10 +1477,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		<Box style={{ height: "100%", display: "flex" }}>
 			<Box ref={flowWrapperRef} style={{ flex: 1, position: "relative" }}>
 				<ReactFlow
-					onInit={(instance) => {
-						reactFlowRef.current = instance;
-						tryFocusChapter();
-					}}
+					onInit={handleInit}
+					onMoveEnd={handleMoveEnd}
 					colorMode={colorScheme === "auto" ? "system" : colorScheme}
 					nodes={nodesWithExpand}
 					edges={computedEdges}
@@ -1368,8 +1497,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					panOnDrag={pcDragMode === "pan" ? true : [1]}
 					selectionOnDrag={false}
 					panOnScroll={false}
-					fitView
-					fitViewOptions={{ padding: 0.2 }}
 					minZoom={0.1}
 					maxZoom={4}
 					proOptions={{ hideAttribution: true }}

@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.0.6",
+	"version": "0.0.7",
 	"private": true,
 	"scripts": {
 		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
@@ -15,6 +15,7 @@
 		"build:macos-x64": "bun scripts/build-cross-platform.ts --platform=darwin-x64",
 		"build:linux": "bun scripts/build-cross-platform.ts --platform=linux",
 		"build:linux-x64": "bun scripts/build-cross-platform.ts --platform=linux-x64",
+		"build:linux-x64-baseline": "bun scripts/build-cross-platform.ts --platform=linux-x64-baseline",
 		"build:linux-arm64": "bun scripts/build-cross-platform.ts --platform=linux-arm64",
 		"build:windows": "bun scripts/build-cross-platform.ts --platform=windows",
 		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",

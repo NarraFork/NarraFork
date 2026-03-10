@@ -488,6 +488,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	notifyFeishuSecret: text("notify_feishu_secret").notNull().default(""),
 	// Slash commands (JSON array of {name, prompt, description?})
 	commands: text("commands").notNull().default("[]"),
+	// Graph viewport positions per project (JSON: { [projectId]: { x, y, zoom } })
+	graphViewports: text("graph_viewports").notNull().default("{}"),
 	// Setup wizard
 	setupWizardCompleted: integer("setup_wizard_completed", { mode: "boolean" })
 		.notNull()
@@ -506,6 +508,8 @@ export const users = sqliteTable("users", {
 		.default("user"),
 	avatarColor: text("avatar_color"),
 	avatarImageId: text("avatar_image_id"),
+	gitUsername: text("git_username"),
+	gitEmail: text("git_email"),
 	createdAt: text("created_at").notNull(),
 });
 

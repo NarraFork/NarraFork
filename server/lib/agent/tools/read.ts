@@ -83,6 +83,11 @@ export const readTool: ToolDefinition = {
 				title: file_path,
 				// Mark as pre-truncated to signal loop layer: do not apply global 50KB truncation.
 				truncated: !!force_full,
+				metadata: {
+					totalLines: lines.length,
+					readLines: slice.length,
+					forceFull: !!force_full,
+				},
 			};
 		} catch (err) {
 			return {

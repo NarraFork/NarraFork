@@ -82,6 +82,8 @@ describe("whitelist - basics", () => {
 	test("grep pattern file → allow", () => expectAllowed("grep pattern file"));
 	test("echo hello → allow", () => expectAllowed("echo hello"));
 	test("pwd → allow", () => expectAllowed("pwd"));
+	test("sleep 5 → allow", () => expectAllowed("sleep 5"));
+	test("dir → allow", () => expectAllowed("dir"));
 
 	test("rm -rf → block", () => expectBlocked("rm -rf node_modules"));
 	test("sudo anything → block", () => expectBlocked("sudo ls"));

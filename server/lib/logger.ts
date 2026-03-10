@@ -8,9 +8,16 @@ const narraforkDir = resolve(homedir(), ".narrafork");
 mkdirSync(narraforkDir, { recursive: true });
 const logPath = resolve(narraforkDir, "server.log");
 
+const consoleMethods: Record<LogLevel, (msg: string) => void> = {
+	debug: (msg) => console.debug(msg),
+	info: (msg) => console.info(msg),
+	warn: (msg) => console.warn(msg),
+	error: (msg) => console.error(msg),
+};
+
 function log(level: LogLevel, message: string, data?: Record<string, unknown>) {
 	const entry = JSON.stringify({ ts: new Date().toISOString(), level, msg: message, ...data });
-	console.error(entry);
+	consoleMethods[level](entry);
 	try {
 		appendFileSync(logPath, `${entry}\n`);
 	} catch {

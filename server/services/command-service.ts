@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
+import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { logger } from "../lib/logger";
 import type { Command, CommandParam } from "./chapter-service";
 import { loadAllSkills } from "./skill-service";
@@ -34,7 +35,13 @@ interface CommandNotResolved {
 	resolved: false;
 }
 
-type ResolveResult = CommandResolveResult | CommandNotResolved;
+interface LoadToolResult {
+	resolved: true;
+	loadTool: string;
+	rawCommand: string;
+}
+
+export type ResolveResult = CommandResolveResult | CommandNotResolved | LoadToolResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
 function parseCommandInput(prompt: string): { name: string; input: string } | null {
@@ -184,6 +191,18 @@ export async function resolveCommand(
 	const parsed = parseCommandInput(prompt);
 	if (!parsed) return { resolved: false };
 
+	// Handle /load <toolName> — load an optional tool into the session
+	if (parsed.name.toLowerCase() === "load") {
+		const toolId = parsed.input.trim().toLowerCase();
+		if (!toolId) return { resolved: false };
+		// Match against builtin tool routines by id
+		const toolRoutine = getBuiltinToolRoutines().find((r) => r.id === toolId);
+		if (toolRoutine?.tool) {
+			return { resolved: true, loadTool: toolRoutine.tool.toolName, rawCommand: prompt };
+		}
+		return { resolved: false };
+	}
+
 	const commands = await getAvailableCommands(narratorId, userId);
 	const cmd = commands.find((c) => c.name.toLowerCase() === parsed.name.toLowerCase());
 	if (!cmd) return { resolved: false };
@@ -251,14 +270,21 @@ async function getProjectGitPathForNarrator(narratorId: string): Promise<string 
 	return project?.gitPath ?? null;
 }
 
+export interface OptionalToolMenuItem {
+	id: string;
+	toolName: string;
+	descriptionEn: string;
+	descriptionZh: string;
+}
+
 /**
- * Get commands + skills for the slash menu.
- * Returns both lists so the frontend can render them with different styles.
+ * Get commands + skills + optional tools for the slash menu.
+ * Returns all lists so the frontend can render them with different styles.
  */
 export async function getSlashMenuItems(
 	narratorId: string,
 	userId: string,
-): Promise<{ commands: ResolvedCommand[]; skills: SkillSummary[] }> {
+): Promise<{ commands: ResolvedCommand[]; skills: SkillSummary[]; tools: OptionalToolMenuItem[] }> {
 	const [commands, gitPath] = await Promise.all([
 		getAvailableCommands(narratorId, userId),
 		getProjectGitPathForNarrator(narratorId),
@@ -278,5 +304,15 @@ export async function getSlashMenuItems(
 		// Non-fatal — skills unavailable
 	}
 
-	return { commands, skills };
+	// Optional tools available via /load
+	const tools: OptionalToolMenuItem[] = getBuiltinToolRoutines()
+		.filter((r) => r.tool)
+		.map((r) => ({
+			id: r.id,
+			toolName: r.tool?.toolName ?? "",
+			descriptionEn: r.tool?.descriptionEn ?? "",
+			descriptionZh: r.tool?.descriptionZh ?? "",
+		}));
+
+	return { commands, skills, tools };
 }

@@ -9,6 +9,7 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
+import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
@@ -22,20 +23,30 @@ import {
 import { narratorService } from "./narrator-service";
 import { buildContextManagementHooks, handlePermission, pruneToolCalls } from "./narrator-session";
 
-// === In-memory state (declared at module scope for consistent initialization order) ===
+// === In-memory state ===
+// Use `let` + lazy getter to avoid TDZ issues under Bun --hot reload,
+// where a stale dynamic-import resolution can reference the module binding
+// before the const initializer has executed.
 
-/** In-memory map of background task AbortControllers for cancellation support. */
-const backgroundTaskAbortControllers = new Map<string, AbortController>();
+let _backgroundTaskAbortControllers: Map<string, AbortController> | undefined;
+function getBackgroundAbortControllers() {
+	if (!_backgroundTaskAbortControllers) _backgroundTaskAbortControllers = new Map();
+	return _backgroundTaskAbortControllers;
+}
 
-/** In-memory map of foreground subagent AbortControllers for interrupt support. */
-const foregroundSubagentAbortControllers = new Map<string, AbortController>();
+let _foregroundSubagentAbortControllers: Map<string, AbortController> | undefined;
+function getForegroundAbortControllers() {
+	if (!_foregroundSubagentAbortControllers) _foregroundSubagentAbortControllers = new Map();
+	return _foregroundSubagentAbortControllers;
+}
 
-/**
- * Buffered user messages for running subagents.
- * When a user sends a message from the subagent page, it is stored here
- * and injected into the agent loop via getInjectedUserText on the next turn.
- */
-const subagentBufferedMessages = new Map<string, { text: string; bufferedAt: string }>();
+let _subagentBufferedMessages:
+	| Map<string, { text: string; images?: ImageRef[]; bufferedAt: string }>
+	| undefined;
+function getSubagentBufferedMessages() {
+	if (!_subagentBufferedMessages) _subagentBufferedMessages = new Map();
+	return _subagentBufferedMessages;
+}
 
 // === Subagent type definitions ===
 
@@ -132,7 +143,7 @@ async function finalizeSubagent(
 	errorText: string | null,
 ): Promise<void> {
 	// Clean up any remaining buffered message
-	subagentBufferedMessages.delete(subagentId);
+	getSubagentBufferedMessages().delete(subagentId);
 
 	const now = new Date().toISOString();
 	await db
@@ -318,13 +329,13 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
 			getInjectedUserText: () => {
-				const buf = subagentBufferedMessages.get(narratorId);
+				const buf = getSubagentBufferedMessages().get(narratorId);
 				if (!buf) return null;
-				subagentBufferedMessages.delete(narratorId);
+				getSubagentBufferedMessages().delete(narratorId);
 				// Persist user message in the background (fire-and-forget).
 				// The text is injected into the next turn immediately.
 				narratorService
-					.persistSubagentUserMessage(narratorId, buf.text, toolUseId)
+					.persistSubagentUserMessage(narratorId, buf.text, toolUseId, buf.images)
 					.then((userMsg) => {
 						broadcastToNarrator(parentNarratorId, {
 							type: "user_message",
@@ -438,14 +449,15 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		transientRetries = 0;
 
 		// --- Check for buffered user message (sent from subagent page) ---
-		const buffered = subagentBufferedMessages.get(narratorId);
+		const buffered = getSubagentBufferedMessages().get(narratorId);
 		if (buffered && !signal.aborted && !hasError) {
-			subagentBufferedMessages.delete(narratorId);
+			getSubagentBufferedMessages().delete(narratorId);
 			// Persist and broadcast the user message
 			const userMsg = await narratorService.persistSubagentUserMessage(
 				narratorId,
 				buffered.text,
 				toolUseId,
+				buffered.images,
 			);
 			// Broadcast to parent (as child message) and to subagent's own page
 			broadcastToNarrator(parentNarratorId, {
@@ -519,25 +531,26 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 export function bufferSubagentMessage(
 	subagentId: string,
 	text: string,
+	images?: ImageRef[],
 ): { ok: boolean; bufferedAt: string } {
-	if (!foregroundSubagentAbortControllers.has(subagentId)) {
+	if (!getForegroundAbortControllers().has(subagentId)) {
 		return { ok: false, bufferedAt: "" };
 	}
 	const bufferedAt = new Date().toISOString();
-	subagentBufferedMessages.set(subagentId, { text, bufferedAt });
+	getSubagentBufferedMessages().set(subagentId, { text, images, bufferedAt });
 	return { ok: true, bufferedAt };
 }
 
 /** Cancel a buffered subagent message. */
 export function clearSubagentBufferedMessage(subagentId: string): void {
-	subagentBufferedMessages.delete(subagentId);
+	getSubagentBufferedMessages().delete(subagentId);
 }
 
 /** Get the current buffered message for a subagent (for REST hydration). */
 export function getSubagentBufferedMessage(
 	subagentId: string,
-): { text: string; bufferedAt: string } | null {
-	return subagentBufferedMessages.get(subagentId) ?? null;
+): { text: string; images?: ImageRef[]; bufferedAt: string } | null {
+	return getSubagentBufferedMessages().get(subagentId) ?? null;
 }
 
 /**
@@ -545,7 +558,7 @@ export function getSubagentBufferedMessage(
  * Returns true if the subagent was found and aborted.
  */
 export function interruptForegroundSubagent(subagentId: string): boolean {
-	const ctrl = foregroundSubagentAbortControllers.get(subagentId);
+	const ctrl = getForegroundAbortControllers().get(subagentId);
 	if (!ctrl) return false;
 	ctrl.abort("Interrupted by user");
 	return true;
@@ -563,7 +576,7 @@ async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
 
 	// Set a maximum execution timeout
 	const timeoutId = setTimeout(() => {
-		const ctrl = backgroundTaskAbortControllers.get(narratorId);
+		const ctrl = getBackgroundAbortControllers().get(narratorId);
 		if (ctrl) ctrl.abort("Background task timeout");
 	}, BACKGROUND_TASK_TIMEOUT_MS);
 
@@ -663,7 +676,7 @@ async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
 		});
 	} finally {
 		clearTimeout(timeoutId);
-		backgroundTaskAbortControllers.delete(narratorId);
+		getBackgroundAbortControllers().delete(narratorId);
 	}
 }
 
@@ -672,7 +685,7 @@ async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
  * Returns true if the task was found and cancelled.
  */
 export async function cancelBackgroundTask(taskNarratorId: string): Promise<boolean> {
-	const ctrl = backgroundTaskAbortControllers.get(taskNarratorId);
+	const ctrl = getBackgroundAbortControllers().get(taskNarratorId);
 	if (!ctrl) return false;
 
 	ctrl.abort("Cancelled by user");
@@ -706,7 +719,7 @@ export async function cancelBackgroundTask(taskNarratorId: string): Promise<bool
 		});
 	}
 
-	backgroundTaskAbortControllers.delete(taskNarratorId);
+	getBackgroundAbortControllers().delete(taskNarratorId);
 	return true;
 }
 
@@ -726,7 +739,7 @@ export async function getBackgroundTaskStatus(taskNarratorId: string): Promise<{
 		status: narrator.backgroundStatus ?? "unknown",
 		result: narrator.backgroundResult ?? null,
 		completedAt: narrator.backgroundCompletedAt ?? null,
-		isRunning: backgroundTaskAbortControllers.has(taskNarratorId),
+		isRunning: getBackgroundAbortControllers().has(taskNarratorId),
 	};
 }
 
@@ -865,7 +878,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		const bgAbort = new AbortController();
 
 		// Store the abort controller for later cancellation
-		backgroundTaskAbortControllers.set(subagentId, bgAbort);
+		getBackgroundAbortControllers().set(subagentId, bgAbort);
 
 		// Fire-and-forget execution
 		executeBackgroundTask({
@@ -903,7 +916,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	// Create an independent AbortController so the subagent can be interrupted
 	// from its own page without aborting the parent narrator.
 	const fgAbort = new AbortController();
-	foregroundSubagentAbortControllers.set(subagentId, fgAbort);
+	getForegroundAbortControllers().set(subagentId, fgAbort);
 	const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
 
 	// 4. Run via unified executor (with compact/prune for general)
@@ -933,7 +946,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			finalText = "Subagent interrupted by user";
 		}
 	} finally {
-		foregroundSubagentAbortControllers.delete(subagentId);
+		getForegroundAbortControllers().delete(subagentId);
 		await finalizeSubagent(
 			subagentId,
 			parentNarratorId,
@@ -1011,7 +1024,7 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 
 	// Create an independent AbortController for interrupt support
 	const fgAbort = new AbortController();
-	foregroundSubagentAbortControllers.set(forkedId, fgAbort);
+	getForegroundAbortControllers().set(forkedId, fgAbort);
 	const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
 
 	// 6. Run via unified executor (with compact/prune for general)
@@ -1042,7 +1055,7 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 			finalText = "Subagent interrupted by user";
 		}
 	} finally {
-		foregroundSubagentAbortControllers.delete(forkedId);
+		getForegroundAbortControllers().delete(forkedId);
 		await finalizeSubagent(
 			forkedId,
 			parentNarratorId,

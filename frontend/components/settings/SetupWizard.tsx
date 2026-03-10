@@ -45,6 +45,7 @@ if (typeof document !== "undefined" && !document.getElementById("wizard-fab-styl
 interface SetupWizardProps {
 	opened: boolean;
 	minimized: boolean;
+	initialStep?: number;
 	onClose: () => void;
 	onMinimize: () => void;
 	onRestore: () => void;
@@ -53,6 +54,7 @@ interface SetupWizardProps {
 export function SetupWizard({
 	opened,
 	minimized,
+	initialStep,
 	onClose,
 	onMinimize,
 	onRestore,
@@ -60,6 +62,13 @@ export function SetupWizard({
 	const { t } = useTranslation("settings");
 	const [step, setStep] = useState(0);
 	const updatePrefs = useUpdateUserPreferences();
+
+	// Jump to a specific step when initialStep changes (e.g. from beta-trial page)
+	useEffect(() => {
+		if (initialStep != null && opened) {
+			setStep(initialStep);
+		}
+	}, [initialStep, opened]);
 
 	const finish = () => {
 		updatePrefs.mutate({ setupWizardCompleted: true });
@@ -276,6 +285,11 @@ function ProviderStep({ onMinimize }: { onMinimize: () => void }) {
 		navigate({ to: "/admin/providers" });
 	};
 
+	const handleGoToBetaTrial = () => {
+		onMinimize();
+		navigate({ to: "/admin/beta-trial" });
+	};
+
 	return (
 		<Stack gap="md">
 			<Text size="sm" c="dimmed">
@@ -292,9 +306,18 @@ function ProviderStep({ onMinimize }: { onMinimize: () => void }) {
 					</Badge>
 				)}
 			</Group>
-			<Button variant="light" onClick={handleGoToProviders}>
-				{t("wizardProviderGoToAdmin")}
-			</Button>
+			<Group>
+				<Button variant="light" onClick={handleGoToProviders}>
+					{t("wizardProviderGoToAdmin")}
+				</Button>
+				<Button
+					variant="gradient"
+					gradient={{ from: "grape", to: "orange", deg: 135 }}
+					onClick={handleGoToBetaTrial}
+				>
+					{t("betaTrialButton")}
+				</Button>
+			</Group>
 		</Stack>
 	);
 }

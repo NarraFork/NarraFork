@@ -36,12 +36,17 @@ const PLATFORMS = [
 	{ target: "bun-darwin-arm64", name: `narrafork-${VERSION}-macos-arm64` },
 	{ target: "bun-darwin-x64", name: `narrafork-${VERSION}-macos-x64` },
 	{ target: "bun-linux-x64", name: `narrafork-${VERSION}-linux-x64` },
+	{ target: "bun-linux-x64-baseline", name: `narrafork-${VERSION}-linux-x64-baseline` },
 	{ target: "bun-linux-arm64", name: `narrafork-${VERSION}-linux-arm64` },
 	{ target: "bun-windows-x64", name: `narrafork-${VERSION}-windows-x64.exe` },
 ];
 
 const selectedPlatforms = platformArg
-	? PLATFORMS.filter((p) => p.target.includes(platformArg))
+	? PLATFORMS.filter((p) => {
+			// Exact suffix match to avoid "linux-x64" matching "linux-x64-baseline"
+			const suffix = p.target.replace("bun-", "");
+			return suffix === platformArg || p.target === platformArg;
+		})
 	: PLATFORMS;
 
 if (selectedPlatforms.length === 0) {

@@ -25,7 +25,8 @@ fsRoutes.get("/browse", (c) => {
 		}
 		const home = homedir();
 		const entries = listDirs(home);
-		return c.json({ path: home, entries, drives, sep });
+		const parent = getParent(home, isWin);
+		return c.json({ path: home, entries, drives, parent, sep });
 	}
 
 	const absPath = resolve(rawPath);

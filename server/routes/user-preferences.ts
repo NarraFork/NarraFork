@@ -152,6 +152,44 @@ export async function enrichTabs(
 	return tabs;
 }
 
+/**
+ * Remove a chapter (or narrator) tab from every user's recent_tabs and broadcast updated snapshots.
+ * Called by chapter-service when a chapter is deleted so ghost tabs don't linger.
+ */
+export async function removeTabFromAllUsers(
+	tabType: "chapter" | "narrator",
+	tabId: string,
+): Promise<void> {
+	const rows = db
+		.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
+		.from(userPreferences)
+		.all();
+
+	const now = new Date().toISOString();
+
+	for (const row of rows) {
+		let tabs: Record<string, unknown>[];
+		try {
+			tabs = JSON.parse(row.recentTabs);
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(tabs)) continue;
+
+		const filtered = tabs.filter(
+			(t: Record<string, unknown>) => !(t.type === tabType && t.id === tabId),
+		);
+		if (filtered.length === tabs.length) continue; // nothing removed
+
+		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+			JSON.stringify(filtered),
+			now,
+			row.userId,
+		]);
+		broadcastTabsSnapshot(row.userId, filtered);
+	}
+}
+
 /** Enrich tabs and broadcast a snapshot to all of the user's WS connections. */
 export async function broadcastTabsSnapshot(
 	userId: string,
@@ -610,8 +648,6 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 			if (position === "top") {
 				tabs.unshift(moved);
 			} else if (position === "above_idle") {
-				// Insert after the last active tab (thinking/waiting/done)
-				const ACTIVE = new Set(["thinking", "waiting", "done", "error", "interrupted"]);
 				// Need live status from DB
 				const narratorIds = tabs
 					.filter((t) => t.type !== "project")
@@ -626,14 +662,24 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 					for (const r of rows) statusMap.set(r.id, r.status);
 				}
 
-				let lastActiveIdx = -1;
+				// Find the first idle tab and insert just above it
+				const IDLE_STATUSES = new Set(["idle"]);
+				let firstIdleIdx = -1;
 				for (let i = 0; i < tabs.length; i++) {
 					const nId =
 						tabs[i].type === "narrator" ? (tabs[i].id as string) : (tabs[i].narratorId as string);
 					const status = nId ? statusMap.get(nId) : undefined;
-					if (status && ACTIVE.has(status)) lastActiveIdx = i;
+					if (status && IDLE_STATUSES.has(status)) {
+						firstIdleIdx = i;
+						break;
+					}
 				}
-				tabs.splice(lastActiveIdx + 1, 0, moved);
+				if (firstIdleIdx === -1) {
+					// No idle tabs — append at end
+					tabs.push(moved);
+				} else {
+					tabs.splice(firstIdleIdx, 0, moved);
+				}
 			} else if (toIndex != null) {
 				// toIndex — clamp to valid range
 				const target = Math.min(toIndex, tabs.length);
@@ -655,4 +701,60 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 
 	const enriched = await broadcastTabsSnapshot(userId, result);
 	return c.json(enriched);
+});
+
+// --- Graph viewport persistence (per-project) ---
+
+userPreferencesRoutes.patch("/graph-viewports", async (c) => {
+	const userId = c.get("user").sub;
+	const body = await c.req.json();
+	const projectId = body?.projectId;
+	const viewport = body?.viewport; // { x, y, zoom }
+	if (
+		typeof projectId !== "string" ||
+		!projectId ||
+		typeof viewport?.x !== "number" ||
+		typeof viewport?.y !== "number" ||
+		typeof viewport?.zoom !== "number"
+	) {
+		throw new ValidationError("Invalid viewport data");
+	}
+
+	const now = new Date().toISOString();
+	const id = generateId();
+
+	// Use BEGIN IMMEDIATE to prevent concurrent read-modify-write races
+	sqlite.run("BEGIN IMMEDIATE");
+	try {
+		const existing = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { graphViewports: true },
+		});
+
+		let viewports: Record<string, { x: number; y: number; zoom: number }> = {};
+		try {
+			if (existing?.graphViewports) {
+				viewports = JSON.parse(existing.graphViewports);
+			}
+		} catch {
+			// corrupted, reset
+		}
+
+		viewports[projectId] = { x: viewport.x, y: viewport.y, zoom: viewport.zoom };
+
+		sqlite.run(
+			`INSERT INTO user_preferences (id, user_id, graph_viewports, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (user_id) DO UPDATE SET
+			   graph_viewports = ?,
+			   updated_at = ?`,
+			[id, userId, JSON.stringify(viewports), now, now, JSON.stringify(viewports), now],
+		);
+		sqlite.run("COMMIT");
+	} catch (err) {
+		sqlite.run("ROLLBACK");
+		throw err;
+	}
+
+	return c.json({ ok: true });
 });

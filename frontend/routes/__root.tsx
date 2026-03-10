@@ -115,8 +115,11 @@ function AuthenticatedLayout() {
 	}, [user?.role, prefs]);
 
 	// Listen for open-wizard events from other pages
+	const [wizardInitialStep, setWizardInitialStep] = useState<number | undefined>();
 	useEffect(() => {
-		const handler = () => {
+		const handler = (e: Event) => {
+			const step = (e as CustomEvent).detail?.step as number | undefined;
+			setWizardInitialStep(step);
 			setWizardMinimized(false);
 			setWizardOpen(true);
 		};
@@ -539,13 +542,16 @@ function AuthenticatedLayout() {
 			<SetupWizard
 				opened={wizardOpen}
 				minimized={wizardMinimized}
+				initialStep={wizardInitialStep}
 				onClose={() => {
 					setWizardOpen(false);
 					setWizardMinimized(false);
+					setWizardInitialStep(undefined);
 				}}
 				onMinimize={() => {
 					setWizardOpen(false);
 					setWizardMinimized(true);
+					setWizardInitialStep(undefined);
 				}}
 				onRestore={() => {
 					setWizardMinimized(false);

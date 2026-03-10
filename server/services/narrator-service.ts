@@ -7,6 +7,9 @@ import {
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistDirs,
+	terminals,
+	terminalTabs,
+	terminalViewState,
 	users,
 } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -14,7 +17,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
-import { deleteNarratorUploads } from "../lib/uploads";
+import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 /**
@@ -513,9 +516,29 @@ export const narratorService = {
 	/**
 	 * Persist a user message for a subagent, linked to the parent's tool_use via parentToolUseId.
 	 */
-	async persistSubagentUserMessage(narratorId: string, text: string, parentToolUseId: string) {
+	async persistSubagentUserMessage(
+		narratorId: string,
+		text: string,
+		parentToolUseId: string,
+		images?: ImageRef[],
+	) {
 		const id = generateId();
 		const now = new Date().toISOString();
+		const contentJson: Array<
+			| { type: "text"; text: string }
+			| { type: "image"; imageId: string; filename: string; mediaType: string }
+		> = [];
+		if (images?.length) {
+			for (const img of images) {
+				contentJson.push({
+					type: "image",
+					imageId: img.imageId,
+					filename: img.filename,
+					mediaType: img.mediaType,
+				});
+			}
+		}
+		contentJson.push({ type: "text", text });
 		const [msg] = await db
 			.insert(narratorMessages)
 			.values({
@@ -523,7 +546,7 @@ export const narratorService = {
 				narratorId,
 				parentToolUseId,
 				role: "user",
-				contentJson: [{ type: "text", text }],
+				contentJson,
 				contentText: text,
 				createdAt: now,
 			})
@@ -2550,6 +2573,11 @@ export const narratorService = {
 
 		// Delete in dependency order within a transaction
 		await db.transaction(async (tx) => {
+			// Clean up terminal-related records that reference this narrator
+			await tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId));
+			await tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId));
+			await tx.delete(terminals).where(eq(terminals.narratorId, narratorId));
+
 			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
 			// Delete narrator_message_refs for this narrator
 			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));

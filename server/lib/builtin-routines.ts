@@ -28,13 +28,21 @@ export interface BuiltinSkillDef {
 	content: string;
 }
 
+export interface BuiltinToolDef {
+	/** The tool name as registered in the toolRegistry (e.g. "Terminal"). */
+	toolName: string;
+	descriptionEn: string;
+	descriptionZh: string;
+}
+
 export interface BuiltinRoutine {
 	/** Unique stable identifier, e.g. "review", "tdd". */
 	id: string;
-	type: "command" | "skill";
+	type: "command" | "skill" | "tool";
 	category: string;
 	command?: BuiltinCommandDef;
 	skill?: BuiltinSkillDef;
+	tool?: BuiltinToolDef;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +193,18 @@ Rules:
 - Commit after each green-refactor cycle.`,
 		},
 	},
+
+	// ── Tools (optional agent tools) ─────────────────────────────────────
+	{
+		id: "terminal",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "Terminal",
+			descriptionEn: "Interactive terminal — read buffer, send input, list terminals",
+			descriptionZh: "交互式终端 — 读取缓冲区、发送输入、列出终端",
+		},
+	},
 ];
 
 // ---------------------------------------------------------------------------
@@ -205,6 +225,10 @@ export function getBuiltinCommandRoutines(): BuiltinRoutine[] {
 
 export function getBuiltinSkillRoutines(): BuiltinRoutine[] {
 	return BUILTIN_ROUTINES.filter((r) => r.type === "skill");
+}
+
+export function getBuiltinToolRoutines(): BuiltinRoutine[] {
+	return BUILTIN_ROUTINES.filter((r) => r.type === "tool");
 }
 
 /** Get all unique categories. */

@@ -84,5 +84,8 @@
 	"mcpImportError": "Import failed: {{error}}",
 	"mcpImportInvalidJson": "Invalid JSON format.",
 	"mcpBuiltinTools": "Built-in MCP Tools",
-	"mcpEnv": "Environment Variables"
+	"mcpEnv": "Environment Variables",
+	"tabOptionalTools": "Optional Tools",
+	"optionalToolsDesc": "Optional agent tools that can be loaded into a narrator session via /load command. Enable them here to make them available by default.",
+	"noOptionalTools": "No optional tools available."
 }

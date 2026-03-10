@@ -26,6 +26,7 @@ export const bashTool: ToolDefinition = {
 		`Execute a ${shellLower} command. Use for git, npm, system commands. ` +
 		"Commands run in the Current Working Directory by default — do NOT prepend `cd <cwd> &&` as it is redundant. " +
 		"Output exceeding 2000 lines or 50KB is truncated; full output is saved to a file for retrieval via Read (offset/limit or force_full=true) or Grep. " +
+		"IMPORTANT: When output is truncated, you MUST use Read on the saved file to get the full content — do NOT re-run the command or redirect to a file. " +
 		`IMPORTANT: Prefer dedicated tools over ${SHELL_TOOL_NAME} when possible — ${shellExamples} ` +
 		`Only use ${SHELL_TOOL_NAME} for operations that genuinely require shell execution. ` +
 		"AVOID using `cd <directory> && <command>` — use the `workdir` parameter instead.",

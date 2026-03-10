@@ -1,5 +1,6 @@
 import { cpSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
@@ -203,7 +204,7 @@ export const gitService = {
 
 	async createBranch(repoPath: string, branchName: string, baseBranch: string): Promise<void> {
 		const result = await exec(["branch", branchName, baseBranch], repoPath);
-		if (result.exitCode !== 0) throw new Error(`Failed to create branch: ${result.stderr}`);
+		if (result.exitCode !== 0) throw new GitError(`Failed to create branch: ${result.stderr}`);
 	},
 
 	async createWorktree(repoPath: string, worktreePath: string, branchName: string): Promise<void> {
@@ -226,7 +227,7 @@ export const gitService = {
 
 	async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
 		const result = await exec(["worktree", "remove", worktreePath, "--force"], repoPath);
-		if (result.exitCode !== 0) throw new Error(`Failed to remove worktree: ${result.stderr}`);
+		if (result.exitCode !== 0) throw new GitError(`Failed to remove worktree: ${result.stderr}`);
 	},
 
 	async pruneWorktrees(repoPath: string): Promise<void> {
@@ -249,7 +250,7 @@ export const gitService = {
 
 	async getHeadCommit(repoPath: string): Promise<string> {
 		const result = await exec(["rev-parse", "HEAD"], repoPath);
-		if (result.exitCode !== 0) throw new Error(`Failed to get HEAD commit: ${result.stderr}`);
+		if (result.exitCode !== 0) throw new GitError(`Failed to get HEAD commit: ${result.stderr}`);
 		return result.stdout;
 	},
 
@@ -300,7 +301,7 @@ export const gitService = {
 
 	async getMergeBase(repoPath: string, branchA: string, branchB: string): Promise<string> {
 		const result = await exec(["merge-base", branchA, branchB], repoPath);
-		if (result.exitCode !== 0) throw new Error(`Failed to get merge base: ${result.stderr}`);
+		if (result.exitCode !== 0) throw new GitError(`Failed to get merge base: ${result.stderr}`);
 		return result.stdout;
 	},
 
@@ -347,13 +348,13 @@ export const gitService = {
 				const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
 				return { success: false, conflictFiles };
 			}
-			throw new Error(`Merge failed: ${result.stderr}`);
+			throw new GitError(`Merge failed: ${result.stderr}`);
 		}
 
 		if (strategy === "squash") {
 			const commitResult = await exec(["commit", "-m", message], worktreePath);
 			if (commitResult.exitCode !== 0)
-				throw new Error(`Squash commit failed: ${commitResult.stderr}`);
+				throw new GitError(`Squash commit failed: ${commitResult.stderr}`);
 		}
 
 		const sha = await this.getHeadCommit(worktreePath);
@@ -371,7 +372,7 @@ export const gitService = {
 			["rev-list", "--reverse", `${baseSha}..${sourceBranch}`],
 			repoPath,
 		);
-		if (logResult.exitCode !== 0) throw new Error(`Failed to list commits: ${logResult.stderr}`);
+		if (logResult.exitCode !== 0) throw new GitError(`Failed to list commits: ${logResult.stderr}`);
 
 		const commits = logResult.stdout.split("\n").filter(Boolean);
 		if (commits.length === 0) return { success: true };
@@ -385,7 +386,7 @@ export const gitService = {
 					await exec(["cherry-pick", "--abort"], worktreePath);
 					return { success: false, conflictFiles };
 				}
-				throw new Error(`Cherry-pick failed: ${result.stderr}`);
+				throw new GitError(`Cherry-pick failed: ${result.stderr}`);
 			}
 		}
 
@@ -414,7 +415,7 @@ export const gitService = {
 				const conflictFiles = await this.getConflictFiles(worktreePath);
 				return { hasConflicts: true, conflictFiles };
 			}
-			throw new Error(`Merge failed: ${result.stderr}`);
+			throw new GitError(`Merge failed: ${result.stderr}`);
 		}
 		return { hasConflicts: false, conflictFiles: [] };
 	},
@@ -436,10 +437,11 @@ export const gitService = {
 			if (!status) return null;
 
 			const addResult = await exec(["add", "-A"], worktreePath);
-			if (addResult.exitCode !== 0) throw new Error(`git add failed: ${addResult.stderr}`);
+			if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
 
 			const commitResult = await exec(["commit", "-m", message], worktreePath);
-			if (commitResult.exitCode !== 0) throw new Error(`git commit failed: ${commitResult.stderr}`);
+			if (commitResult.exitCode !== 0)
+				throw new GitError(`git commit failed: ${commitResult.stderr}`);
 
 			return this.getHeadCommit(worktreePath);
 		});
@@ -664,11 +666,11 @@ export const gitService = {
 	async initRepo(repoPath: string): Promise<void> {
 		mkdirSync(repoPath, { recursive: true });
 		const result = await exec(["init"], repoPath);
-		if (result.exitCode !== 0) throw new Error(`Failed to init repo: ${result.stderr}`);
+		if (result.exitCode !== 0) throw new GitError(`Failed to init repo: ${result.stderr}`);
 		// Create initial empty commit so branches can be created
 		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], repoPath);
 		if (commitResult.exitCode !== 0) {
-			throw new Error(`Failed to create initial commit: ${commitResult.stderr}`);
+			throw new GitError(`Failed to create initial commit: ${commitResult.stderr}`);
 		}
 	},
 
@@ -677,7 +679,7 @@ export const gitService = {
 		if (branch) args.push("--branch", branch);
 		args.push(url, destPath);
 		const result = await exec(args, ".");
-		if (result.exitCode !== 0) throw new Error(`Failed to clone repo: ${result.stderr}`);
+		if (result.exitCode !== 0) throw new GitError(`Failed to clone repo: ${result.stderr}`);
 	},
 
 	// === Stage / Unstage ===
@@ -686,14 +688,14 @@ export const gitService = {
 		if (files.length === 0) return;
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["add", "--", ...files], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git add failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git add failed: ${result.stderr}`);
 		});
 	},
 
 	async stageAll(worktreePath: string): Promise<void> {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["add", "-A"], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git add -A failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git add -A failed: ${result.stderr}`);
 		});
 	},
 
@@ -701,21 +703,21 @@ export const gitService = {
 		if (files.length === 0) return;
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git reset failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 		});
 	},
 
 	async unstageAll(worktreePath: string): Promise<void> {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["reset", "HEAD"], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git reset failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 		});
 	},
 
 	async commit(worktreePath: string, message: string): Promise<string> {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["commit", "-m", message], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git commit failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
 			return this.getHeadCommit(worktreePath);
 		});
 	},
@@ -736,11 +738,11 @@ export const gitService = {
 			}
 			if (tracked.length > 0) {
 				const r = await exec(["checkout", "HEAD", "--", ...tracked], worktreePath);
-				if (r.exitCode !== 0) throw new Error(`git checkout failed: ${r.stderr}`);
+				if (r.exitCode !== 0) throw new GitError(`git checkout failed: ${r.stderr}`);
 			}
 			if (untracked.length > 0) {
 				const r = await exec(["clean", "-f", "--", ...untracked], worktreePath);
-				if (r.exitCode !== 0) throw new Error(`git clean failed: ${r.stderr}`);
+				if (r.exitCode !== 0) throw new GitError(`git clean failed: ${r.stderr}`);
 			}
 		});
 	},
@@ -748,9 +750,9 @@ export const gitService = {
 	async discardAll(worktreePath: string): Promise<void> {
 		return withWorktreeLock(worktreePath, async () => {
 			const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
-			if (r1.exitCode !== 0) throw new Error(`git checkout failed: ${r1.stderr}`);
+			if (r1.exitCode !== 0) throw new GitError(`git checkout failed: ${r1.stderr}`);
 			const r2 = await exec(["clean", "-fd"], worktreePath);
-			if (r2.exitCode !== 0) throw new Error(`git clean failed: ${r2.stderr}`);
+			if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
 		});
 	},
 
@@ -759,7 +761,7 @@ export const gitService = {
 			const args = ["stash", "push", "--include-untracked"];
 			if (message) args.push("-m", message);
 			const result = await exec(args, worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git stash failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
 		});
 	},
 
@@ -778,7 +780,7 @@ export const gitService = {
 				if (hasUnmerged) {
 					return { hasConflicts: true };
 				}
-				throw new Error(`git stash pop failed: ${result.stderr}`);
+				throw new GitError(`git stash pop failed: ${result.stderr}`);
 			}
 			return { hasConflicts: false };
 		});
@@ -802,7 +804,7 @@ export const gitService = {
 	async stashDrop(worktreePath: string, index: number): Promise<void> {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["stash", "drop", `stash@{${index}}`], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git stash drop failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git stash drop failed: ${result.stderr}`);
 		});
 	},
 
@@ -882,14 +884,14 @@ export const gitService = {
 	async resetSoft(worktreePath: string, target: string): Promise<void> {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["reset", "--soft", target], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git reset --soft failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git reset --soft failed: ${result.stderr}`);
 		});
 	},
 
 	async resetHard(worktreePath: string, target: string): Promise<void> {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["reset", "--hard", target], worktreePath);
-			if (result.exitCode !== 0) throw new Error(`git reset --hard failed: ${result.stderr}`);
+			if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
 		});
 	},
 
@@ -910,7 +912,7 @@ export const gitService = {
 			if (result.exitCode !== 0) {
 				// Abort the failed revert to leave worktree clean
 				await exec(["revert", "--abort"], worktreePath);
-				throw new Error(
+				throw new GitError(
 					`git revert produced conflicts — the merge cannot be automatically undone. ` +
 						`Resolve manually with: git revert -m 1 ${commitSha}`,
 				);
@@ -926,7 +928,7 @@ export const gitService = {
 			const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
 			if (result.exitCode !== 0) {
 				await exec(["revert", "--abort"], worktreePath);
-				throw new Error(
+				throw new GitError(
 					`git revert produced conflicts — the merge cannot be automatically undone. ` +
 						`Resolve manually with: git revert ${commitSha}`,
 				);

@@ -20,6 +20,7 @@
 	"sendPlaceholder": "发送消息...",
 	"chapterMergedHint": "本章节已合并，需重新唤醒后才能继续编辑。",
 	"interrupt": "中断",
+	"interruptHoldHint": "长按按钮以中断",
 	"interruptCutInLine": "插队",
 	"terminateProcess": "终止进程",
 	"permissionRequest": "权限请求",
@@ -181,5 +182,7 @@
 	"webSearched": "搜索了网络：",
 	"webSearching": "正在搜索网络…",
 	"webSearchPreparing": "准备搜索网络…",
-	"backToGraph": "返回故事网络"
+	"backToGraph": "返回故事网络",
+	"toolLoaded": "工具已加载",
+	"toolAlreadyLoaded": "工具已加载过"
 }

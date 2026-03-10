@@ -18,7 +18,9 @@ import { buildHistory, type PermissionResult, resolveProviderAndModel } from "..
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { detectShell } from "../lib/agent/shell";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
+import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
+import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
@@ -105,6 +107,8 @@ interface ActiveNarrator {
 	_projectGitPath?: string | null;
 	/** Resolved skill scan root (projectGitPath or git root from cwd) */
 	_skillRoot?: string | null;
+	/** Optional tools enabled for this session (tool names, e.g. "Terminal") */
+	_enabledOptionalTools: Set<string>;
 }
 
 const activeNarrators = new Map<string, ActiveNarrator>();
@@ -1215,7 +1219,16 @@ async function createNarrator(
 		_planFileId: planFileId,
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
+		_enabledOptionalTools: new Set(),
 	};
+
+	// Auto-load optional tools whose routines are globally enabled (not in disabledRoutines)
+	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
+	for (const routine of getBuiltinToolRoutines()) {
+		if (routine.tool && !disabledRoutines.has(routine.id)) {
+			active._enabledOptionalTools.add(routine.tool.toolName);
+		}
+	}
 
 	activeNarrators.set(narratorId, active);
 
@@ -1615,6 +1628,8 @@ async function runAgentLoop(
 						columns: { permissionMode: true },
 					});
 					const prevMode = current?.permissionMode ?? "default";
+					// Guard: if already in plan mode, don't overwrite previousPermissionMode
+					if (prevMode === "plan") return;
 					active._previousPermissionMode = prevMode;
 					const now = new Date().toISOString();
 					await db
@@ -1633,14 +1648,22 @@ async function runAgentLoop(
 				},
 				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
+					// Guard: if not currently in plan mode, the model called ExitPlanMode
+					// without a matching EnterPlanMode — skip permission mode restoration
+					// and plan-continuation logic to avoid accidentally resetting the
+					// user's chosen mode or aborting the agent loop.
+					const currentRow = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { permissionMode: true, previousPermissionMode: true },
+					});
+					if (currentRow?.permissionMode !== "plan") {
+						active._previousPermissionMode = undefined;
+						return;
+					}
 					// Restore previous permission mode — check in-memory first, then DB
 					let restoreMode = active._previousPermissionMode;
 					if (!restoreMode) {
-						const row = await db.query.narrators.findFirst({
-							where: eq(narrators.id, narratorId),
-							columns: { previousPermissionMode: true },
-						});
-						restoreMode = row?.previousPermissionMode ?? undefined;
+						restoreMode = currentRow.previousPermissionMode ?? undefined;
 					}
 					// If the previous mode would block plan execution, fall back to default
 					const BLOCKED_MODES = new Set(["readOnly", "plan", "dontAsk"]);
@@ -1921,6 +1944,13 @@ async function runAgentLoop(
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
+				// Exclude optional tools that haven't been loaded for this session
+				toolFilter: (tool) => {
+					if (OPTIONAL_TOOLS.has(tool.name)) {
+						return active._enabledOptionalTools.has(tool.name);
+					}
+					return true;
+				},
 				permissionHandler: (toolName, input, toolUseId) =>
 					handlePermission(
 						narratorId,
@@ -3215,4 +3245,28 @@ export async function recoverOnStartup(): Promise<void> {
 			count: staleCompacting.length,
 		});
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Optional tool management
+// ---------------------------------------------------------------------------
+
+/**
+ * Enable an optional tool for a narrator session.
+ * Returns true if the tool was newly enabled, false if already enabled or unknown.
+ */
+export function loadOptionalTool(narratorId: string, toolName: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return false;
+	if (!OPTIONAL_TOOLS.has(toolName)) return false;
+	if (active._enabledOptionalTools.has(toolName)) return false;
+	active._enabledOptionalTools.add(toolName);
+	logger.info("Optional tool loaded", { narratorId, toolName });
+	return true;
+}
+
+/** Get the set of enabled optional tool names for a narrator session. */
+export function getEnabledOptionalTools(narratorId: string): Set<string> {
+	const active = activeNarrators.get(narratorId);
+	return active?._enabledOptionalTools ?? new Set();
 }

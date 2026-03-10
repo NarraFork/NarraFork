@@ -65,6 +65,9 @@ describe("Read", () => {
 		expect(result.output).toContain("line five");
 		// Line numbers should be present
 		expect(result.output).toMatch(/\d+│line one/);
+		// Metadata should include line counts
+		expect(result.metadata).toMatchObject({ forceFull: false });
+		expect(result.metadata?.totalLines).toBe(result.metadata?.readLines);
 	});
 
 	test("reads with absolute path", async () => {
@@ -109,6 +112,7 @@ describe("Read", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.output).toContain("0123456789");
 		expect(result.output).not.toContain("truncated");
+		expect(result.metadata?.forceFull).toBe(true);
 	});
 
 	test("force_full caps output at ~100k chars", async () => {

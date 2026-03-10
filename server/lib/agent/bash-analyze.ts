@@ -56,6 +56,7 @@ const SAFE_COMMANDS = new Set([
 	"git",
 	// 文件浏览（只读）
 	"ls",
+	"dir",
 	"tree",
 	"pwd",
 	"cat",
@@ -114,6 +115,8 @@ const SAFE_COMMANDS = new Set([
 	"false",
 	"[",
 	"[[",
+	// 延时（无副作用）
+	"sleep",
 	// 目录操作
 	"cd",
 	"pushd",

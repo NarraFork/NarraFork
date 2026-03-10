@@ -42,6 +42,7 @@ import {
 	useUpdateMcpServer,
 } from "../../hooks/useMcp";
 import { useProjects } from "../../hooks/useProjects";
+import { useRoutines, useToggleRoutine } from "../../hooks/useRoutines";
 import {
 	useCreateGlobalSkill,
 	useDeleteGlobalSkill,
@@ -97,6 +98,7 @@ function RoutinesPage() {
 			<Tabs defaultValue="commands" keepMounted={false}>
 				<Tabs.List mb="md">
 					<Tabs.Tab value="commands">{t("tabCommands")}</Tabs.Tab>
+					<Tabs.Tab value="optional-tools">{t("tabOptionalTools")}</Tabs.Tab>
 					<Tabs.Tab value="global-skills">{t("tabGlobalSkills")}</Tabs.Tab>
 					<Tabs.Tab value="project-skills">{t("tabProjectSkills")}</Tabs.Tab>
 					<Tabs.Tab value="mcp-tools">{t("tabMcpTools")}</Tabs.Tab>
@@ -104,6 +106,9 @@ function RoutinesPage() {
 
 				<Tabs.Panel value="commands">
 					<CommandsTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="optional-tools">
+					<OptionalToolsTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="global-skills">
 					<GlobalSkillsTab />
@@ -116,6 +121,59 @@ function RoutinesPage() {
 				</Tabs.Panel>
 			</Tabs>
 		</Container>
+	);
+}
+
+// === Tab: Optional Tools ===
+
+function OptionalToolsTab() {
+	const { t, i18n } = useTranslation("routines");
+	const { data } = useRoutines();
+	const toggleMutation = useToggleRoutine();
+	const isZh = i18n.language?.startsWith("zh");
+
+	const toolRoutines = data?.routines?.filter((r) => r.type === "tool") ?? [];
+
+	return (
+		<Stack>
+			<Text size="sm" c="dimmed">
+				{t("optionalToolsDesc")}
+			</Text>
+			{toolRoutines.length === 0 && (
+				<Text size="sm" c="dimmed">
+					{t("noOptionalTools")}
+				</Text>
+			)}
+			{toolRoutines.map((routine) => (
+				<Paper key={routine.id} withBorder p="sm">
+					<Group justify="space-between" wrap="nowrap">
+						<div style={{ flex: 1, minWidth: 0 }}>
+							<Group gap="xs">
+								<Text size="sm" fw={600}>
+									{routine.name}
+								</Text>
+								<Badge size="xs" variant="light" color="yellow">
+									/load {routine.id}
+								</Badge>
+							</Group>
+							<Text size="xs" c="dimmed">
+								{isZh ? routine.descriptionZh : routine.descriptionEn}
+							</Text>
+						</div>
+						<Switch
+							checked={routine.enabled}
+							onChange={(e) =>
+								toggleMutation.mutate({
+									id: routine.id,
+									enabled: e.currentTarget.checked,
+								})
+							}
+							size="sm"
+						/>
+					</Group>
+				</Paper>
+			))}
+		</Stack>
 	);
 }
 

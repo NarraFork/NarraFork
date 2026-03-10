@@ -213,13 +213,20 @@ export const batchCleanupSchema = z.object({
 	deleteBranch: z.boolean().optional(),
 });
 
-export const batchMergeSchema = z.object({
-	baseChapterId: z.string().min(1),
-	sourceChapterIds: z.array(z.string().min(1)).min(1),
-	title: z.string().min(1).max(200),
-	description: z.string().max(2000).optional(),
-	strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),
-});
+export const batchMergeSchema = z
+	.object({
+		baseChapterId: z.string().min(1),
+		sourceChapterIds: z.array(z.string().min(1)).min(1),
+		title: z.string().max(200).default(""),
+		description: z.string().max(2000).optional(),
+		strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),
+		/** If provided, merge directly into this existing chapter instead of forking */
+		targetChapterId: z.string().min(1).optional(),
+	})
+	.refine((data) => data.targetChapterId || (data.title && data.title.length > 0), {
+		message: "title is required when not merging into an existing chapter",
+		path: ["title"],
+	});
 
 // === Containers ===
 
@@ -256,6 +263,11 @@ export const adminUpdateUserSchema = z.object({
 		.regex(/^[a-zA-Z0-9_-]+$/, "Alphanumeric, hyphens, underscores only")
 		.optional(),
 	password: z.string().min(8).max(128).optional(),
+});
+
+export const updateProfileSchema = z.object({
+	gitUsername: z.string().max(100).optional(),
+	gitEmail: z.string().email().max(254).optional().or(z.literal("")),
 });
 
 // === Narrator title ===

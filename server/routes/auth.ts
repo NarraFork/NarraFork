@@ -3,16 +3,16 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { users } from "../db/schema";
 import { loginUser, registerUser } from "../lib/auth";
-import { ValidationError } from "../lib/errors";
+import { formatZodError, ValidationError } from "../lib/errors";
 import { deleteAvatarImage, saveAvatarImage } from "../lib/uploads";
-import { loginSchema, registerSchema } from "../lib/validators";
+import { loginSchema, registerSchema, updateProfileSchema } from "../lib/validators";
 import { requireAuth } from "../middleware/auth";
 
 export const authRoutes = new Hono();
 
 authRoutes.post("/register", async (c) => {
 	const parsed = registerSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 	const { user, token, language } = await registerUser(
 		parsed.data.username,
 		parsed.data.password,
@@ -23,7 +23,7 @@ authRoutes.post("/register", async (c) => {
 
 authRoutes.post("/login", async (c) => {
 	const parsed = loginSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 	const { user, token, language } = await loginUser(parsed.data.username, parsed.data.password);
 	return c.json({ user, token, language });
 });
@@ -38,11 +38,30 @@ authRoutes.get("/me", requireAuth, async (c) => {
 			role: true,
 			avatarColor: true,
 			avatarImageId: true,
+			gitUsername: true,
+			gitEmail: true,
 			createdAt: true,
 		},
 	});
 	if (!user) return c.json({ error: "User not found" }, 404);
 	return c.json(user);
+});
+
+authRoutes.patch("/me", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const parsed = updateProfileSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const update: Record<string, string | null> = {};
+	if (parsed.data.gitUsername !== undefined) {
+		update.gitUsername = parsed.data.gitUsername || null;
+	}
+	if (parsed.data.gitEmail !== undefined) {
+		update.gitEmail = parsed.data.gitEmail || null;
+	}
+	if (Object.keys(update).length > 0) {
+		await db.update(users).set(update).where(eq(users.id, payload.sub));
+	}
+	return c.json({ ok: true });
 });
 
 authRoutes.patch("/me/avatar", requireAuth, async (c) => {

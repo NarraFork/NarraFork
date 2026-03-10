@@ -22,7 +22,7 @@ export interface CommandItem {
 	prompt: string;
 	description?: string;
 	source: string;
-	type: "command" | "skill";
+	type: "command" | "skill" | "tool";
 	params?: CommandParam[];
 }
 
@@ -42,6 +42,9 @@ function getBarColor(item: CommandItem): string {
 		return item.source === "project"
 			? "var(--mantine-color-teal-6)"
 			: "var(--mantine-color-violet-6)";
+	}
+	if (item.type === "tool") {
+		return "var(--mantine-color-yellow-6)";
 	}
 	// command
 	return item.source === "project"
@@ -79,10 +82,19 @@ export function CommandPopover({
 
 	// Filter commands based on input after /
 	const query = input.startsWith("/") ? input.slice(1).toLowerCase() : "";
-	const filtered = useMemo(
-		() => commands.filter((c) => c.name.toLowerCase().startsWith(query)),
-		[commands, query],
-	);
+	const filtered = useMemo(() => {
+		// When query starts with "load " (with space), show only the sub-items (load <tool>)
+		if (query.startsWith("load ")) {
+			return commands.filter(
+				(c) => c.name.toLowerCase().startsWith(query) && c.name.toLowerCase() !== "load",
+			);
+		}
+		// Otherwise, hide the sub-items (load <tool>) and only show the parent /load entry
+		return commands.filter((c) => {
+			if (c.type === "tool" && c.name.includes(" ")) return false;
+			return c.name.toLowerCase().startsWith(query);
+		});
+	}, [commands, query]);
 
 	// Reset selection when filter changes
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on query change

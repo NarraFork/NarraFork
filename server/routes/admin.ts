@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { users } from "../db/schema";
-import { AppError } from "../lib/errors";
+import { AppError, formatZodError } from "../lib/errors";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { adminUpdateSettingsSchema, adminUpdateUserSchema } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
@@ -29,7 +29,7 @@ adminRoutes.get("/users", async (c) => {
 adminRoutes.patch("/users/:id", async (c) => {
 	const id = c.req.param("id");
 	const parsed = adminUpdateUserSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new AppError(parsed.error.message, 400, "VALIDATION_ERROR");
+	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
 
 	const { username, password } = parsed.data;
 	if (!username && !password) {
@@ -79,7 +79,7 @@ adminRoutes.delete("/users/:id", async (c) => {
 
 adminRoutes.patch("/settings", async (c) => {
 	const parsed = adminUpdateSettingsSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new AppError(parsed.error.message, 400, "VALIDATION_ERROR");
+	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
 
 	const current = loadSettings();
 	current.auth.registrationOpen = parsed.data.registrationOpen;

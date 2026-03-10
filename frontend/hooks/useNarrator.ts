@@ -166,21 +166,22 @@ export function useArchiveNarrator() {
 		mutationFn: (id: string) => api.archiveNarrator(id),
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			// Remove the archived narrator from the sidebar (recent tabs)
+			// Remove all tabs associated with the archived narrator from the sidebar
 			const tabs =
 				qc.getQueryData<
 					{ type: "chapter" | "narrator" | "project"; id: string; narratorId?: string }[]
 				>(RECENT_TABS_QUERY_KEY) ?? [];
-			const tab = tabs.find(
-				(t) =>
-					(t.type === "narrator" && t.id === narratorId) ||
-					(t.type === "chapter" && t.narratorId === narratorId),
-			);
-			if (tab) {
-				api.removeRecentTab(tab.type, tab.id).catch(() => {});
+			const isMatch = (t: (typeof tabs)[number]) =>
+				(t.type === "narrator" && t.id === narratorId) ||
+				(t.type === "chapter" && t.narratorId === narratorId);
+			const matched = tabs.filter(isMatch);
+			if (matched.length > 0) {
+				for (const tab of matched) {
+					api.removeRecentTab(tab.type, tab.id).catch(() => {});
+				}
 				qc.setQueryData(
 					RECENT_TABS_QUERY_KEY,
-					tabs.filter((t) => t !== tab),
+					tabs.filter((t) => !isMatch(t)),
 				);
 			}
 		},

@@ -1,6 +1,7 @@
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { mergeSessions } from "../db/schema";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -14,12 +15,14 @@ export interface BatchMergeInput {
 	baseChapterId: string;
 	/** Chapters to merge into the forked chapter, in order */
 	sourceChapterIds: string[];
-	/** Title for the new forked chapter */
+	/** Title for the new forked chapter (only used when creating a new chapter) */
 	title: string;
 	description?: string;
 	strategy?: "merge" | "squash" | "cherry-pick";
 	locale?: Locale;
 	userId?: string;
+	/** If provided, merge directly into this existing chapter instead of forking a new one */
+	targetChapterId?: string;
 }
 
 export type MergeDecision = "continue" | "cancel";
@@ -94,14 +97,29 @@ export const chapterBatchMerge = {
 		// Deduplicate source chapters while preserving order
 		const sourceChapterIds = [...new Set(input.sourceChapterIds)];
 
-		// Step 1: Fork base chapter
-		const forkedChapter = await chapterFork.fork(input.baseChapterId, {
-			title: input.title,
-			description: input.description,
-			inheritMode: "fresh",
-		});
+		let targetChapterId: string;
 
-		const targetChapterId = forkedChapter.id;
+		if (input.targetChapterId) {
+			// Merge into existing chapter — no fork
+			const target = await chapterService.getById(input.targetChapterId);
+			if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
+			if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+			if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+			// Ensure target belongs to the same project as the base chapter
+			const base = await chapterService.getById(input.baseChapterId);
+			if (base && target.projectId !== base.projectId) {
+				throw new ValidationError("Target chapter must be in the same project as the base chapter");
+			}
+			targetChapterId = target.id;
+		} else {
+			// Step 1: Fork base chapter (merge-new flow)
+			const forkedChapter = await chapterFork.fork(input.baseChapterId, {
+				title: input.title,
+				description: input.description,
+				inheritMode: "fresh",
+			});
+			targetChapterId = forkedChapter.id;
+		}
 		const now = new Date().toISOString();
 
 		// Persist session to DB
@@ -126,11 +144,13 @@ export const chapterBatchMerge = {
 		});
 
 		// Step 2: Process merges in background (fire-and-forget)
+		const isExistingTarget = !!input.targetChapterId;
 		this.processQueue(
 			mergeSessionId,
 			targetChapterId,
 			sourceChapterIds,
 			strategy,
+			isExistingTarget,
 			input.locale,
 			input.userId,
 		).catch((err) => {
@@ -149,6 +169,7 @@ export const chapterBatchMerge = {
 		targetChapterId: string,
 		sourceChapterIds: string[],
 		strategy: "merge" | "squash" | "cherry-pick",
+		isExistingTarget: boolean,
 		locale?: Locale,
 		userId?: string,
 	): Promise<void> {
@@ -227,13 +248,13 @@ export const chapterBatchMerge = {
 				const decision = await waitForDecision(mergeSessionId);
 
 				if (decision === "cancel") {
-					// Rollback: delete the forked chapter entirely
+					// Rollback: delete the forked chapter entirely (skip if merging into existing)
 					eventBus.emit({
 						type: "merge:cancelled",
 						mergeSessionId,
 						reason: "User cancelled on conflict",
 					});
-					await this.rollback(mergeSessionId, targetChapterId, "User cancelled");
+					await this.rollback(mergeSessionId, targetChapterId, "User cancelled", isExistingTarget);
 					return;
 				}
 
@@ -276,6 +297,7 @@ export const chapterBatchMerge = {
 						mergeSessionId,
 						targetChapterId,
 						aiResult.error ?? "AI resolution failed",
+						isExistingTarget,
 					);
 					return;
 				}
@@ -332,21 +354,34 @@ export const chapterBatchMerge = {
 				sourceChapterId: currentSourceId,
 				error: String(err),
 			});
-			// Rollback: delete the forked chapter
-			await this.rollback(mergeSessionId, targetChapterId, String(err));
+			// Rollback: delete the forked chapter (skip if merging into existing)
+			await this.rollback(mergeSessionId, targetChapterId, String(err), isExistingTarget);
 		}
 	},
 
-	/** Delete the forked chapter on cancellation/failure and update session status. */
-	async rollback(mergeSessionId: string, targetChapterId: string, reason: string): Promise<void> {
-		try {
-			await chapterService.remove(targetChapterId);
-			logger.info("Batch merge rolled back", { mergeSessionId, targetChapterId });
-		} catch (err) {
-			logger.error("Failed to rollback batch merge", {
+	/** Delete the forked chapter on cancellation/failure and update session status.
+	 *  When isExistingTarget is true, skip chapter deletion (the target existed before the merge). */
+	async rollback(
+		mergeSessionId: string,
+		targetChapterId: string,
+		reason: string,
+		isExistingTarget = false,
+	): Promise<void> {
+		if (!isExistingTarget) {
+			try {
+				await chapterService.remove(targetChapterId);
+				logger.info("Batch merge rolled back", { mergeSessionId, targetChapterId });
+			} catch (err) {
+				logger.error("Failed to rollback batch merge", {
+					mergeSessionId,
+					targetChapterId,
+					error: String(err),
+				});
+			}
+		} else {
+			logger.info("Batch merge into existing chapter failed, skipping chapter deletion", {
 				mergeSessionId,
 				targetChapterId,
-				error: String(err),
 			});
 		}
 		const now = new Date().toISOString();

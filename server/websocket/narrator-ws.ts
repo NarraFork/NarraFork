@@ -680,7 +680,7 @@ export const handleNarratorWS = {
 				if (userId) {
 					try {
 						const cmdResult = await resolveCommand(bufferText, msg.narratorId, userId);
-						if (cmdResult.resolved) {
+						if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 							commandText = msg.text;
 							bufferText = cmdResult.expandedPrompt;
 						}

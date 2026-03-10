@@ -57,7 +57,7 @@ function buildSkillMd(name: string, description: string, content: string): strin
 
 export interface RoutineStatus {
 	id: string;
-	type: "command" | "skill";
+	type: "command" | "skill" | "tool";
 	category: string;
 	name: string;
 	descriptionEn: string;
@@ -88,13 +88,13 @@ function isProjectEnabled(
 }
 
 function routineToStatus(r: BuiltinRoutine, enabled: boolean): RoutineStatus {
-	const def = r.type === "command" ? r.command : r.skill;
+	const def = r.type === "command" ? r.command : r.type === "skill" ? r.skill : r.tool;
 	if (!def) throw new Error(`Routine ${r.id} missing definition`);
 	return {
 		id: r.id,
 		type: r.type,
 		category: r.category,
-		name: def.name,
+		name: "toolName" in def ? def.toolName : def.name,
 		descriptionEn: def.descriptionEn,
 		descriptionZh: def.descriptionZh,
 		enabled,
@@ -131,7 +131,7 @@ export async function enableRoutineGlobal(routineId: string, userId: string): Pr
 	const { saveSettings } = await import("../lib/settings");
 	saveSettings({ ...settings, routines: { ...settings.routines, disabledRoutines: newDisabled } });
 
-	// Materialize
+	// Materialize (tool type needs no materialization — just the settings flag)
 	if (routine.type === "command" && routine.command) {
 		await addGlobalCommand(routine, userId);
 	} else if (routine.type === "skill" && routine.skill) {

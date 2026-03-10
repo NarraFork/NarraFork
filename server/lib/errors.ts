@@ -31,3 +31,18 @@ export class ContainerError extends AppError {
 		super(message, 502, "CONTAINER_ERROR");
 	}
 }
+
+export class GitError extends AppError {
+	constructor(message: string) {
+		super(message, 422, "GIT_ERROR");
+	}
+}
+
+/** Convert a Zod error into a human-readable single-line message. */
+export function formatZodError(error: {
+	issues: Array<{ path: PropertyKey[]; message: string }>;
+}): string {
+	return error.issues
+		.map((i) => (i.path.length ? `${i.path.map(String).join(".")}: ${i.message}` : i.message))
+		.join("; ");
+}

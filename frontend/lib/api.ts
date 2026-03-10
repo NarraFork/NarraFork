@@ -209,6 +209,8 @@ export const api = {
 		return res.json() as Promise<{ ok: boolean; avatarImageId: string }>;
 	},
 	deleteAvatar: () => request<{ ok: boolean }>("/auth/me/avatar", { method: "DELETE" }),
+	updateProfile: (data: { gitUsername?: string; gitEmail?: string }) =>
+		request<{ ok: boolean }>("/auth/me", { method: "PATCH", body: JSON.stringify(data) }),
 
 	// Admin
 	listUsers: () => request<ApiEntity[]>("/admin/users"),
@@ -329,6 +331,12 @@ export const api = {
 				}>;
 			}>;
 			skills: Array<{ name: string; description: string; source: string }>;
+			tools: Array<{
+				id: string;
+				toolName: string;
+				descriptionEn: string;
+				descriptionZh: string;
+			}>;
 		}>(`/narrators/${id}/commands`),
 	createNarrator: (data: {
 		chapterId?: string | null;
@@ -782,6 +790,11 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ scope, keepTabKey }),
 		}),
+	saveGraphViewport: (projectId: string, viewport: { x: number; y: number; zoom: number }) =>
+		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
+			method: "PATCH",
+			body: JSON.stringify({ projectId, viewport }),
+		}),
 
 	// Containers
 	getContainerSetup: (refresh?: boolean) =>
@@ -861,8 +874,9 @@ export const api = {
 	batchMerge: (data: {
 		baseChapterId: string;
 		sourceChapterIds: string[];
-		title: string;
+		title?: string;
 		strategy?: string;
+		targetChapterId?: string;
 	}) =>
 		request<ApiEntity>("/chapters/batch-merge", {
 			method: "POST",
@@ -1498,7 +1512,7 @@ export const api = {
 		request<{
 			routines: Array<{
 				id: string;
-				type: "command" | "skill";
+				type: "command" | "skill" | "tool";
 				category: string;
 				name: string;
 				descriptionEn: string;
@@ -1515,7 +1529,7 @@ export const api = {
 		request<{
 			routines: Array<{
 				id: string;
-				type: "command" | "skill";
+				type: "command" | "skill" | "tool";
 				category: string;
 				name: string;
 				descriptionEn: string;

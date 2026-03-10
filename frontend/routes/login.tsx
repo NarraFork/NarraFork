@@ -60,8 +60,23 @@ function LoginPage() {
 		}
 	};
 
+	const validateRegisterFields = (): string | null => {
+		const u = username.trim();
+		if (u.length < 3) return t("usernameTooShort");
+		if (u.length > 50) return t("usernameTooLong");
+		if (!/^[a-zA-Z0-9_-]+$/.test(u)) return t("usernameInvalidChars");
+		if (password.length < 8) return t("passwordTooShort");
+		if (password.length > 128) return t("passwordTooLong");
+		return null;
+	};
+
 	const handleRegister = async () => {
 		setError("");
+		const validationError = validateRegisterFields();
+		if (validationError) {
+			setError(validationError);
+			return;
+		}
 		try {
 			await register.mutateAsync({ username, password, language: i18n.language });
 			navigate({ to: "/" });

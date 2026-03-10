@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { detectShell } from "../lib/agent/shell";
 import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
@@ -35,7 +36,7 @@ export interface BuildPromptResult {
 
 /**
  * Build the effective system prompt by appending standard sections:
- * context summary → CWD → AGENT.md/CLAUDE.md → language → todos → plan mode.
+ * context summary → CWD → AGENT.md/CLAUDE.md → ~/.claude/CLAUDE.md → language → todos → plan mode.
  *
  * Used by both main narrators and subagents. Subagents simply omit the
  * optional fields (contextSummary, todosJson, planMode) to get a minimal prompt.
@@ -117,6 +118,20 @@ export async function buildEffectiveSystemPrompt(
 			const sep = base ? "\n\n" : "";
 			prompt = `${base}${sep}## Project Instructions\n\n${agentMdContent}`;
 		}
+	}
+	try {
+		let globalMd = await readFile(join(homedir(), ".claude", "CLAUDE.md"), "utf-8");
+		if (globalMd) {
+			const MAX_GLOBAL_MD = 50_000;
+			if (globalMd.length > MAX_GLOBAL_MD) {
+				globalMd = globalMd.slice(0, MAX_GLOBAL_MD);
+			}
+			const base = prompt ?? "";
+			const sep = base ? "\n\n" : "";
+			prompt = `${base}${sep}## Global Instructions\n\n${globalMd}`;
+		}
+	} catch {
+		// file not found, skip
 	}
 
 	// 4. Append language instruction

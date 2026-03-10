@@ -18,6 +18,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
+import { removeTabFromAllUsers } from "../routes/user-preferences";
 import { chapterCleanup } from "./chapter-cleanup";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
@@ -443,6 +444,14 @@ export const chapterService = {
 
 			await db.delete(chapters).where(eq(chapters.id, id));
 			eventBus.emit({ type: "chapter:abandoned", chapterId: id });
+
+			// Remove this chapter from every user's recent tabs so ghost entries don't linger
+			removeTabFromAllUsers("chapter", id).catch((err) => {
+				logger.warn("Failed to clean up recent tabs after chapter delete", {
+					chapterId: id,
+					error: String(err),
+				});
+			});
 		});
 	},
 };

@@ -20,6 +20,7 @@
 	"sendPlaceholder": "Send a message...",
 	"chapterMergedHint": "This chapter has been merged. Wake it up to continue editing.",
 	"interrupt": "Interrupt",
+	"interruptHoldHint": "Hold the button to interrupt",
 	"interruptCutInLine": "Cut in line",
 	"terminateProcess": "Terminate process",
 	"permissionRequest": "Permission Request",
@@ -181,5 +182,7 @@
 	"webSearched": "Searched the web:",
 	"webSearching": "Searching the web…",
 	"webSearchPreparing": "Preparing web search…",
-	"backToGraph": "Back to graph"
+	"backToGraph": "Back to graph",
+	"toolLoaded": "Tool loaded",
+	"toolAlreadyLoaded": "Tool already loaded"
 }

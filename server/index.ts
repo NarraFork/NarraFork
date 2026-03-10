@@ -12,7 +12,7 @@ import {
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
-import { initWslFlag } from "./lib/platform";
+import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
 import { settings } from "./lib/settings";
 
@@ -250,6 +250,27 @@ logger.info(`NarraFork server running on http://${host}:${port}`, {
 	isCompiledBinary,
 	metaUrl: import.meta.url,
 });
+
+// Print welcome banner to stdout & auto-open browser on Windows
+{
+	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
+	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
+	const modeStr = isProd ? "production" : "development";
+	const url = `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
+	console.log("");
+	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
+	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
+	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
+	console.log("");
+
+	if (IS_WINDOWS) {
+		try {
+			Bun.spawn(["cmd", "/c", "start", url], { stdio: ["ignore", "ignore", "ignore"] });
+		} catch {
+			// Failed to auto-open browser, not critical
+		}
+	}
+}
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();

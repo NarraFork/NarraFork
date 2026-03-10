@@ -133,6 +133,7 @@ const TODO_TOOLS = new Set(["TodoWrite"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
+const TERMINAL_TOOLS = new Set(["Terminal"]);
 
 export type ToolCategory =
 	| "file"
@@ -143,6 +144,7 @@ export type ToolCategory =
 	| "taskOutput"
 	| "ask"
 	| "plan"
+	| "terminal"
 	| "generic";
 
 export function isEditTool(name: string): boolean {
@@ -158,6 +160,7 @@ export function getCategory(name: string): ToolCategory {
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
+	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	return "generic";
 }
 
@@ -179,6 +182,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 			return IconPlayerPlay;
 		case "plan":
 			return IconMap;
+		case "terminal":
+			return IconTerminal2;
 		default:
 			return IconCode;
 	}
@@ -202,6 +207,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "blue";
 		case "plan":
 			return "grape";
+		case "terminal":
+			return "yellow";
 		default:
 			return "gray";
 	}
@@ -307,7 +314,7 @@ function basename(p: string): string {
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function getSummary(toolName: string, input: any): string {
+function getSummary(toolName: string, input: any, metadata?: Record<string, unknown>): string {
 	// Synthetic streaming tool call — show file path + content chars
 	if (input?._streamingChars != null) {
 		const chars = input._streamingChars as number;
@@ -324,16 +331,20 @@ function getSummary(toolName: string, input: any): string {
 	switch (cat) {
 		case "file": {
 			const fp = getFilePath(input);
-			if (!fp) return toolName;
+			if (!fp) return "";
 			const base = basename(fp);
 			if (toolName === "Read") {
 				const offset = extractNumericField(input, "offset");
 				const limit = extractNumericField(input, "limit");
 				const forceFull = extractBoolField(input, "force_full", "forceFull");
-				if (forceFull) return `${base} (full)`;
+				const totalLines =
+					typeof metadata?.totalLines === "number" ? metadata.totalLines : undefined;
+				if (forceFull) return `${base} (force_full)`;
 				if (offset != null && limit != null) return `${base} (${offset}~${offset + limit - 1})`;
 				if (offset != null) return `${base} (${offset}~)`;
 				if (limit != null) return `${base} (1~${limit})`;
+				// No paging params — file was short enough to read in full
+				if (totalLines != null) return `${base} (${totalLines}L)`;
 				return base;
 			}
 			return base;
@@ -379,6 +390,22 @@ function getSummary(toolName: string, input: any): string {
 		}
 		case "plan":
 			return toolName === "ExitPlanMode" ? "Plan ready" : "Enter plan mode";
+		case "terminal": {
+			const action = extractField(input, "action");
+			const tid = extractField(input, "terminal_id");
+			const short = tid ? tid.slice(0, 8) : "";
+			if (action === "list") return "List terminals";
+			if (action === "read") return short ? `Read ${short}…` : "Read";
+			if (action === "write") {
+				const inp = extractField(input, "input");
+				if (inp) {
+					const preview = inp.length > 50 ? `${inp.slice(0, 47)}...` : inp;
+					return preview;
+				}
+				return short ? `Write ${short}…` : "Write";
+			}
+			return action || "Terminal";
+		}
 		default:
 			return toolName;
 	}
@@ -447,10 +474,19 @@ function ToolHeader({
 	const Icon = getCategoryIcon(cat);
 	const color = getCategoryColor(cat);
 	const summary = useMemo(
-		() => getSummary(toolCall.toolName, toolCall.inputJson),
-		[toolCall.toolName, toolCall.inputJson],
+		() => getSummary(toolCall.toolName, toolCall.inputJson, toolCall._metadata),
+		[toolCall.toolName, toolCall.inputJson, toolCall._metadata],
 	);
 	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
+
+	// For Terminal tool, show "Terminal Read" / "Terminal Write" / "Terminal List" as the label
+	const displayName = useMemo(() => {
+		if (cat === "terminal") {
+			const action = extractField(toolCall.inputJson, "action");
+			if (action) return `Terminal ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
+		}
+		return toolCall.toolName;
+	}, [cat, toolCall.toolName, toolCall.inputJson]);
 
 	const content = (
 		<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
@@ -458,7 +494,7 @@ function ToolHeader({
 				<Icon size={10} />
 			</ThemeIcon>
 			<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-				{toolCall.toolName}
+				{displayName}
 			</Text>
 			<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
 				{summary}
@@ -829,6 +865,80 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const action = extractField(toolCall.inputJson, "action");
+	const terminalId = extractField(toolCall.inputJson, "terminal_id");
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+
+	if (action === "write") {
+		const input = extractField(toolCall.inputJson, "input");
+		return (
+			<Box mt="xs">
+				{terminalId && (
+					<Text size="xs" c="dimmed" mb={2}>
+						Terminal: <Code style={{ fontSize: 11 }}>{terminalId}</Code>
+					</Text>
+				)}
+				{input && (
+					<ContentViewer
+						content={input}
+						style={{ ...termStyle, maxHeight: 60 }}
+						title="Terminal Input"
+					/>
+				)}
+				{toolCall.outputJson && (
+					<Text size="xs" c="dimmed" mt={4}>
+						{outputText}
+					</Text>
+				)}
+				{toolCall.errorMessage && !toolCall.outputJson && (
+					<Text size="xs" c="red" mt={4}>
+						{toolCall.errorMessage}
+					</Text>
+				)}
+			</Box>
+		);
+	}
+
+	if (action === "read") {
+		return (
+			<Box mt="xs">
+				{terminalId && (
+					<Text size="xs" c="dimmed" mb={2}>
+						Terminal: <Code style={{ fontSize: 11 }}>{terminalId}</Code>
+					</Text>
+				)}
+				{toolCall.outputJson && (
+					<>
+						<ContentViewer content={outputText} style={termStyle} title="Terminal Buffer" />
+						{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
+					</>
+				)}
+				{toolCall.errorMessage && !toolCall.outputJson && (
+					<Text size="xs" c="red" mt={4}>
+						{toolCall.errorMessage}
+					</Text>
+				)}
+			</Box>
+		);
+	}
+
+	// action === "list" or fallback
+	return (
+		<Box mt="xs">
+			{toolCall.outputJson && (
+				<ContentViewer content={outputText} style={codeStyle} title="Terminals" />
+			)}
+			{toolCall.errorMessage && !toolCall.outputJson && (
+				<Text size="xs" c="red" mt={4}>
+					{toolCall.errorMessage}
+				</Text>
+			)}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -1111,6 +1221,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <AskDetail toolCall={toolCall} />;
 		case "plan":
 			return <PlanDetail toolCall={toolCall} />;
+		case "terminal":
+			return <TerminalDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}

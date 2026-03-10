@@ -84,5 +84,8 @@
 	"mcpImportError": "导入失败：{{error}}",
 	"mcpImportInvalidJson": "无效的 JSON 格式。",
 	"mcpBuiltinTools": "内置 MCP 工具",
-	"mcpEnv": "环境变量"
+	"mcpEnv": "环境变量",
+	"tabOptionalTools": "可选工具",
+	"optionalToolsDesc": "可选的 Agent 工具，可通过 /load 命令加载到叙述者会话中。在此启用后将默认可用。",
+	"noOptionalTools": "暂无可选工具。"
 }
