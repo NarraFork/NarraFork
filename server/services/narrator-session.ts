@@ -2746,6 +2746,94 @@ function extractImageRefs(contentJson: unknown): ImageRef[] {
 }
 
 /**
+ * Edit a user message and regenerate the response.
+ * Updates the message content, deletes everything after it, and re-runs the agent loop.
+ */
+export async function editAndRegenerate(
+	narratorId: string,
+	messageId: string,
+	newContent: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ ok: boolean }> {
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+	});
+	if (!targetRef) throw new NotFoundError("Message", messageId);
+
+	const targetMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (!targetMsg) throw new NotFoundError("Message", messageId);
+	if (targetMsg.role !== "user") {
+		throw new NotFoundError("Can only edit user messages", messageId);
+	}
+
+	// Update the message content
+	const now = new Date().toISOString();
+	const newContentJson = [{ type: "text", text: newContent }];
+
+	// Preserve existing images in contentJson
+	const existingImages = extractImageRefs(targetMsg.contentJson);
+	for (const img of existingImages) {
+		newContentJson.push({
+			type: "image",
+			imageId: img.imageId,
+			filename: img.filename,
+			mediaType: img.mediaType,
+		} as { type: string; text?: string; imageId?: string; filename?: string; mediaType?: string });
+	}
+
+	await db
+		.update(narratorMessages)
+		.set({
+			contentText: newContent,
+			contentJson: newContentJson,
+			updatedAt: now,
+		})
+		.where(eq(narratorMessages.id, messageId));
+
+	// Broadcast the updated message
+	const updatedMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (updatedMsg) {
+		broadcastToNarrator(narratorId, {
+			type: "message_updated",
+			narratorId,
+			message: updatedMsg,
+		});
+	}
+
+	// Delete everything after this message
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
+	if (deletedMessageIds.length > 0) {
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
+			narratorId,
+			deletedMessageIds,
+		});
+	}
+
+	const imageRefs = existingImages;
+
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	await narratorService.updateStatus(narratorId, "thinking");
+
+	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
+			narratorId,
+			error: String(err),
+		});
+	});
+
+	return { ok: true };
+}
+
+/**
  * Start or feed a message into a narrator.
  * Yields NarratorEvent objects for consumption (used by chapter-merge).
  */

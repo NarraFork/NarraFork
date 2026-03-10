@@ -58,6 +58,7 @@ import {
 	getBufferedMessage,
 	interruptNarrator,
 	isNarratorActive,
+	editAndRegenerate,
 	regenerateFromMessage,
 	resolvePermission,
 	retryLastMessage,
@@ -456,6 +457,37 @@ narratorRoutes.post("/:id/regenerate/:messageId", async (c) => {
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await regenerateFromMessage(id, messageId, locale, replyInUserLanguage);
+	return c.json(result);
+});
+
+// Edit a user message and regenerate the response
+narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
+	const id = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const { content } = await c.req.json();
+
+	if (!content || typeof content !== "string") {
+		throw new ValidationError("content is required");
+	}
+
+	const narrator = await narratorService.getById(id);
+
+	if (
+		narrator.type === "subagent" &&
+		(narrator.status === "thinking" || narrator.status === "waiting")
+	) {
+		throw new ValidationError("Cannot edit on a running subagent");
+	}
+
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage);
 	return c.json(result);
 });
 

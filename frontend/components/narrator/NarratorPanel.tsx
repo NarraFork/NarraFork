@@ -524,6 +524,18 @@ export function NarratorPanel({
 		[narratorId, t],
 	);
 
+	const handleEditAndRegenerate = useCallback(
+		async (messageId: string, newContent: string) => {
+			try {
+				await api.editAndRegenerate(narratorId, messageId, newContent);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
+				notifications.show({ title: t("editFailed"), message, color: "red" });
+			}
+		},
+		[narratorId, t],
+	);
+
 	// --- Input management ---
 	const [input, setInput] = useState(
 		() => sessionStorage.getItem(`narrafork_draft_${narratorId}`) ?? "",

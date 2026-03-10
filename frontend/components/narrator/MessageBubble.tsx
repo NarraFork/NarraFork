@@ -77,6 +77,7 @@ interface MessageBubbleProps {
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRegenerateFromMessage?: (messageId: string) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string) => void;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -795,12 +796,40 @@ export const MessageBubble = memo(function MessageBubble({
 	onCompactBeforeMessage,
 	onDeleteBlock,
 	onRegenerateFromMessage,
+	onEditAndRegenerate,
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const _msgId = message.id;
+
+	// Edit mode state for user messages
+	const [isEditing, setIsEditing] = useState(false);
+	const [editContent, setEditContent] = useState("");
+
+	// Initialize edit content when entering edit mode
+	const startEditing = useCallback(() => {
+		const textBlocks = blocks.filter((b: { type: string }) => b.type === "text");
+		const fullText = textBlocks
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			.map((b: any) => b.text)
+			.join("\n\n");
+		setEditContent(fullText);
+		setIsEditing(true);
+	}, [blocks]);
+
+	const cancelEditing = useCallback(() => {
+		setIsEditing(false);
+		setEditContent("");
+	}, []);
+
+	const submitEdit = useCallback(() => {
+		if (!message.id || !onEditAndRegenerate || !editContent.trim()) return;
+		onEditAndRegenerate(message.id, editContent.trim());
+		setIsEditing(false);
+		setEditContent("");
+	}, [message.id, onEditAndRegenerate, editContent]);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
@@ -827,6 +856,9 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgId && onRegenerateFromMessage) {
 			actions.onRegenerateFromMessage = () => onRegenerateFromMessage(msgId);
 		}
+		if (isUser && msgId && onEditAndRegenerate) {
+			actions.onEditMessage = startEditing;
+		}
 		return actions;
 	}, [
 		isUser,
@@ -836,6 +868,8 @@ export const MessageBubble = memo(function MessageBubble({
 		onCompactBeforeMessage,
 		onDeleteBlock,
 		onRegenerateFromMessage,
+		onEditAndRegenerate,
+		startEditing,
 	]);
 
 	// Merge summary cards — rendered for both role="system" (legacy) and role="user"
@@ -961,6 +995,60 @@ export const MessageBubble = memo(function MessageBubble({
 			.map((b: any) => b.text)
 			.join("\n\n");
 		const hasCommand = !!message.commandText;
+
+		// Edit mode UI
+		if (isEditing) {
+			return (
+				<Paper
+					p="sm"
+					radius="md"
+					style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
+				>
+					<Stack gap="xs">
+						<Group gap={6}>
+							{message.creator && (
+								<UserAvatar
+									username={message.creator.username}
+									avatarColor={message.creator.avatarColor}
+									avatarImageId={message.creator.avatarImageId}
+									userId={message.creator.id}
+									size={20}
+									showTooltip={false}
+								/>
+							)}
+							<Text size="xs" fw={600} c="indigo">
+								{message.creator?.username ?? t("you")}
+							</Text>
+						</Group>
+						<Textarea
+							value={editContent}
+							onChange={(e) => setEditContent(e.currentTarget.value)}
+							autosize
+							minRows={2}
+							maxRows={10}
+							styles={{
+								input: {
+									backgroundColor: "var(--mantine-color-dark-6)",
+								},
+							}}
+						/>
+						<Group gap="xs" justify="flex-end">
+							<Button size="xs" variant="subtle" onClick={cancelEditing}>
+								{t("editCancel")}
+							</Button>
+							<Button
+								size="xs"
+								onClick={submitEdit}
+								disabled={!editContent.trim()}
+							>
+								{t("editSubmit")}
+							</Button>
+						</Group>
+					</Stack>
+				</Paper>
+			);
+		}
+
 		return (
 			<MessageContextMenuCtx.Provider value={ctxActions}>
 				<ContentViewer content={fullText} markdown contentType="markdown" blockIndex={0}>
