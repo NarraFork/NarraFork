@@ -351,6 +351,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						...(ext._output !== undefined && { outputJson: ext._output }),
 						...(ext._durationMs != null && { durationMs: ext._durationMs }),
 						...(ext._metadata && { _metadata: ext._metadata }),
+						...(ext._longRunning && { _longRunning: true }),
 					};
 				}
 			} else {
@@ -803,7 +804,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onToolLongRunning: (toolUseId: string, _elapsed: number) => {
-				// Mark the tool call as long-running so the UI can show a terminate button
+				// Mark the tool call as long-running so the UI can show a terminate button.
+				// Update both the streaming chunk (if still active) and the query cache.
+				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+				if (streamingEntry) {
+					topLevelStreamingChunkRef.current.set(toolUseId, {
+						...streamingEntry,
+						_longRunning: true,
+						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+					} as any);
+					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				}
+
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(

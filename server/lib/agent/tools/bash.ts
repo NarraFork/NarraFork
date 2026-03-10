@@ -184,6 +184,8 @@ export const bashTool: ToolDefinition = {
 			// so the UI can show a terminate button.
 			let lastOutputLen = 0;
 			let longRunningFired = false;
+			let watchdogKilled = false;
+			const watchdogStart = Date.now();
 			const watchdogTimer = setInterval(() => {
 				if (exited) return;
 
@@ -192,12 +194,22 @@ export const bashTool: ToolDefinition = {
 				const hadOutput = currentLen > lastOutputLen;
 				lastOutputLen = currentLen;
 
-				// Check if PID is still alive
+				// Check if PID is still alive (cross-platform)
 				let pidAlive = false;
 				if (proc.pid) {
 					try {
-						process.kill(proc.pid, 0);
-						pidAlive = true;
+						if (process.platform === "win32") {
+							// On Windows, process.kill(pid, 0) is unreliable.
+							// Use tasklist for accurate check.
+							const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${proc.pid}`, "/NH"], {
+								stdout: "pipe",
+								stderr: "ignore",
+							});
+							pidAlive = result.stdout.toString().includes(String(proc.pid));
+						} else {
+							process.kill(proc.pid, 0);
+							pidAlive = true;
+						}
 					} catch {
 						pidAlive = false;
 					}
@@ -205,7 +217,7 @@ export const bashTool: ToolDefinition = {
 
 				// Kill if process is dead and no recent output (zombie/leaked)
 				if (!pidAlive && !hadOutput && !exited) {
-					timedOut = true;
+					watchdogKilled = true;
 					void kill();
 					return;
 				}
@@ -219,7 +231,6 @@ export const bashTool: ToolDefinition = {
 					}
 				}
 			}, WATCHDOG_INTERVAL_MS);
-			const watchdogStart = Date.now();
 
 			// Wait for process to finish
 			try {
@@ -233,12 +244,14 @@ export const bashTool: ToolDefinition = {
 			// Append metadata about abnormal termination so the LLM knows what happened
 			const meta: string[] = [];
 			if (timedOut) meta.push(`Command timed out after ${timeoutMs}ms`);
+			if (watchdogKilled)
+				meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 			if (aborted) meta.push("Command was aborted by user");
 			if (meta.length > 0) {
 				output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 			}
 
-			const exitCode = proc.exitCode ?? (timedOut || aborted ? 1 : 0);
+			const exitCode = proc.exitCode ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
 			if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 			const truncated = truncateOutput(output || "(no output)");
