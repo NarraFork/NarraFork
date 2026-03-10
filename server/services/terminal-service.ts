@@ -35,23 +35,25 @@ export interface TerminalProcessInfo {
 function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
 	try {
 		if (IS_WINDOWS) {
-			// Use wmic to get process info on Windows
+			// Use PowerShell to get process info on Windows
+			const pwsh = Bun.which("pwsh") ?? Bun.which("powershell.exe");
+			if (!pwsh) return null;
 			const result = execSync(
-				`wmic process where "ProcessId=${pid}" get ProcessId,ParentProcessId,Name,WorkingSetSize /FORMAT:CSV`,
-				{ encoding: "utf-8", stdio: "pipe", timeout: 5000 },
+				`"${pwsh}" -NoProfile -NonInteractive -Command "Get-Process -Id ${pid} -ErrorAction SilentlyContinue | ForEach-Object { \\"$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)\\" }"`,
+				{ encoding: "utf-8", stdio: "pipe", timeout: 10000 },
 			);
-			// CSV: "Node,Name,ParentProcessId,ProcessId,WorkingSetSize"
-			const lines = result.trim().split(/\r?\n/).filter(Boolean);
-			if (lines.length < 2) return null;
-			const cols = lines[1].split(",");
-			if (cols.length < 5) return null;
+			const line = result.trim();
+			if (!line) return null;
+			const parts = line.split("|");
+			if (parts.length < 5) return null;
+			const ppid = Number.parseInt(parts[1], 10);
 			return {
-				pid: Number.parseInt(cols[3], 10),
-				ppid: Number.parseInt(cols[2], 10),
-				command: cols[1] || "",
+				pid: Number.parseInt(parts[0], 10),
+				ppid: Number.isNaN(ppid) ? 0 : ppid,
+				command: parts[2] || "",
 				state: "running",
-				rss: Math.round((Number.parseInt(cols[4], 10) || 0) / 1024),
-				cpu: 0,
+				rss: Math.round((Number.parseInt(parts[3], 10) || 0) / 1024),
+				cpu: Number.parseFloat(parts[4]) || 0,
 				elapsed: "",
 			};
 		}

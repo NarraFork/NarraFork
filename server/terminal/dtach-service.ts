@@ -26,21 +26,44 @@ export interface ProcessInfo {
 }
 
 /**
- * Resolve a PowerShell executable path on Windows.
- * Prefers `pwsh` (PowerShell 7+) over `powershell.exe` (Windows PowerShell 5.x).
- * Returns null if neither is found.
+ * Resolve the best command runner for process queries on Windows.
+ *
+ * Priority:
+ *   1. Git Bash — has MSYS2 `ps` that understands Unix-style flags
+ *   2. PowerShell (pwsh / powershell.exe)
+ *   3. null — nothing available, process queries will return empty
  */
-let _cachedPwsh: string | null | undefined;
-function findPowerShell(): string | null {
-	if (_cachedPwsh !== undefined) return _cachedPwsh;
-	_cachedPwsh = Bun.which("pwsh") ?? Bun.which("powershell.exe") ?? null;
-	return _cachedPwsh;
+type WinRunner = { type: "gitbash"; bash: string } | { type: "powershell"; pwsh: string } | null;
+let _cachedWinRunner: WinRunner | undefined;
+function getWinRunner(): WinRunner {
+	if (_cachedWinRunner !== undefined) return _cachedWinRunner;
+	const shell = detectShell();
+	if (shell.loginWrap) {
+		// loginWrap === true means Git Bash was detected
+		_cachedWinRunner = { type: "gitbash", bash: shell.path };
+	} else {
+		const pwsh = Bun.which("pwsh") ?? Bun.which("powershell.exe") ?? null;
+		_cachedWinRunner = pwsh ? { type: "powershell", pwsh } : null;
+	}
+	return _cachedWinRunner;
+}
+
+/** Run a command via Git Bash and return stdout, or null on failure. */
+function runGitBash(bash: string, command: string, timeoutMs = 10000): string | null {
+	try {
+		return execSync(`"${bash}" --login -c '${command.replace(/'/g, "'\\''")}'`, {
+			encoding: "utf-8",
+			stdio: "pipe",
+			timeout: timeoutMs,
+			env: { ...process.env, MSYS2_PATH_TYPE: "inherit" },
+		});
+	} catch {
+		return null;
+	}
 }
 
 /** Run a PowerShell command and return stdout, or null on failure. */
-function runPowerShell(command: string, timeoutMs = 10000): string | null {
-	const pwsh = findPowerShell();
-	if (!pwsh) return null;
+function runPowerShell(pwsh: string, command: string, timeoutMs = 10000): string | null {
 	try {
 		return execSync(`"${pwsh}" -NoProfile -NonInteractive -Command "${command}"`, {
 			encoding: "utf-8",
@@ -53,8 +76,8 @@ function runPowerShell(command: string, timeoutMs = 10000): string | null {
 }
 
 /**
- * Snapshot of all system processes, built from a single `ps` call (Unix)
- * or PowerShell (Windows).
+ * Snapshot of all system processes.
+ * Unix: single `ps` call. Windows: Git Bash `ps` → PowerShell fallback.
  * Provides efficient tree traversal and info lookup without repeated execSync.
  */
 export class ProcessSnapshot {
@@ -79,7 +102,51 @@ export class ProcessSnapshot {
 			stdio: "pipe",
 			timeout: 5000,
 		});
-		for (const line of result.trim().split("\n")) {
+		this._parseUnixPs(result);
+	}
+
+	private _buildFromWindows(): void {
+		const runner = getWinRunner();
+		if (!runner) return;
+
+		if (runner.type === "gitbash") {
+			// MSYS2 ps supports -ax -o flags just like Unix
+			const result = runGitBash(runner.bash, "ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=");
+			if (result) {
+				this._parseUnixPs(result);
+				return;
+			}
+			// Git Bash ps failed — don't fallback, just return empty
+			return;
+		}
+
+		// PowerShell fallback
+		const result = runPowerShell(
+			runner.pwsh,
+			'Get-Process | ForEach-Object { "$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)" }',
+		);
+		if (!result) return;
+		for (const line of result.trim().split(/\r?\n/)) {
+			const parts = line.split("|");
+			if (parts.length < 5) continue;
+			const pid = Number.parseInt(parts[0], 10);
+			const ppid = Number.parseInt(parts[1], 10);
+			if (Number.isNaN(pid)) continue;
+			this.infoByPid.set(pid, {
+				pid,
+				ppid: Number.isNaN(ppid) ? 0 : ppid,
+				command: parts[2] || "",
+				state: "running",
+				rss: Math.round((Number.parseInt(parts[3], 10) || 0) / 1024),
+				cpu: Number.parseFloat(parts[4]) || 0,
+				elapsed: "",
+			});
+			if (!Number.isNaN(ppid)) this._addChild(ppid, pid);
+		}
+	}
+
+	private _parseUnixPs(output: string): void {
+		for (const line of output.trim().split(/\r?\n/)) {
 			const parts = line.trim().split(/\s+/);
 			if (parts.length < 7) continue;
 			const pid = Number.parseInt(parts[0], 10);
@@ -95,32 +162,6 @@ export class ProcessSnapshot {
 				elapsed: parts[6],
 			});
 			this._addChild(ppid, pid);
-		}
-	}
-
-	private _buildFromWindows(): void {
-		const result = runPowerShell(
-			`Get-Process | ForEach-Object { \\\"$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)\\\" }`,
-		);
-		if (!result) return; // PowerShell not available — snapshot stays empty
-		for (const line of result.trim().split(/\r?\n/)) {
-			const parts = line.split("|");
-			if (parts.length < 5) continue;
-			const pid = Number.parseInt(parts[0], 10);
-			const ppid = Number.parseInt(parts[1], 10);
-			if (Number.isNaN(pid)) continue;
-			this.infoByPid.set(pid, {
-				pid,
-				ppid: Number.isNaN(ppid) ? 0 : ppid,
-				command: parts[2] || "",
-				state: "running",
-				rss: Math.round((Number.parseInt(parts[3], 10) || 0) / 1024), // bytes → KB
-				cpu: Number.parseFloat(parts[4]) || 0,
-				elapsed: "",
-			});
-			if (!Number.isNaN(ppid)) {
-				this._addChild(ppid, pid);
-			}
 		}
 	}
 
@@ -157,14 +198,31 @@ export class ProcessSnapshot {
 
 /**
  * Find PIDs whose command line contains `searchArg`.
- * Uses `pgrep -f` on Unix, PowerShell on Windows.
+ * Unix: `pgrep -f`. Windows: Git Bash `pgrep` → PowerShell fallback.
  */
 export function findProcessesByArg(searchArg: string): number[] {
 	const pids: number[] = [];
 	try {
 		if (IS_WINDOWS) {
+			const runner = getWinRunner();
+			if (!runner) return pids;
+
+			if (runner.type === "gitbash") {
+				const result = runGitBash(runner.bash, `pgrep -f "${searchArg}"`);
+				if (result) {
+					for (const line of result.trim().split(/\r?\n/)) {
+						const pid = Number.parseInt(line, 10);
+						if (!Number.isNaN(pid)) pids.push(pid);
+					}
+					return pids;
+				}
+				return pids;
+			}
+
+			// PowerShell fallback
 			const escaped = searchArg.replace(/'/g, "''").replace(/"/g, '\\"');
 			const result = runPowerShell(
+				runner.pwsh,
 				`Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${escaped}*' } | ForEach-Object { $_.ProcessId }`,
 			);
 			if (!result) return pids;
@@ -191,31 +249,43 @@ export function findProcessesByArg(searchArg: string): number[] {
 
 /**
  * Get child PIDs recursively.
- * Uses POSIX `ps` on Unix, PowerShell on Windows.
+ * Unix: `ps`. Windows: Git Bash `ps` → PowerShell fallback.
  */
 export function getDescendantPids(pid: number): number[] {
 	const descendants: number[] = [];
 	try {
-		// Build parent→children map from a process listing
 		const children = new Map<number, number[]>();
 
 		if (IS_WINDOWS) {
-			const result = runPowerShell(
-				`Get-CimInstance Win32_Process | ForEach-Object { \\\"$($_.ProcessId)|$($_.ParentProcessId)\\\" }`,
-			);
-			if (!result) return descendants;
-			for (const line of result.trim().split(/\r?\n/)) {
-				const parts = line.split("|");
-				if (parts.length < 2) continue;
-				const childPid = Number.parseInt(parts[0], 10);
-				const parentPid = Number.parseInt(parts[1], 10);
-				if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
-				let list = children.get(parentPid);
-				if (!list) {
-					list = [];
-					children.set(parentPid, list);
+			const runner = getWinRunner();
+			if (!runner) return descendants;
+
+			if (runner.type === "gitbash") {
+				const result = runGitBash(runner.bash, "ps -ax -o pid=,ppid=");
+				if (result) {
+					parseUnixPidPpid(result, children);
 				}
-				list.push(childPid);
+				// If Git Bash ps failed, return empty
+				if (children.size === 0) return descendants;
+			} else {
+				const result = runPowerShell(
+					runner.pwsh,
+					'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)" }',
+				);
+				if (!result) return descendants;
+				for (const line of result.trim().split(/\r?\n/)) {
+					const parts = line.split("|");
+					if (parts.length < 2) continue;
+					const childPid = Number.parseInt(parts[0], 10);
+					const parentPid = Number.parseInt(parts[1], 10);
+					if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
+					let list = children.get(parentPid);
+					if (!list) {
+						list = [];
+						children.set(parentPid, list);
+					}
+					list.push(childPid);
+				}
 			}
 		} else {
 			const result = execSync("ps -ax -o pid=,ppid=", {
@@ -223,19 +293,7 @@ export function getDescendantPids(pid: number): number[] {
 				stdio: "pipe",
 				timeout: 5000,
 			});
-			for (const line of result.trim().split("\n")) {
-				const parts = line.trim().split(/\s+/);
-				if (parts.length < 2) continue;
-				const childPid = Number.parseInt(parts[0], 10);
-				const parentPid = Number.parseInt(parts[1], 10);
-				if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
-				let list = children.get(parentPid);
-				if (!list) {
-					list = [];
-					children.set(parentPid, list);
-				}
-				list.push(childPid);
-			}
+			parseUnixPidPpid(result, children);
 		}
 
 		// BFS to collect all descendants
@@ -251,6 +309,23 @@ export function getDescendantPids(pid: number): number[] {
 		// ignore
 	}
 	return descendants;
+}
+
+/** Parse Unix `ps -o pid=,ppid=` output into a parent→children map. */
+function parseUnixPidPpid(output: string, children: Map<number, number[]>): void {
+	for (const line of output.trim().split(/\r?\n/)) {
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 2) continue;
+		const childPid = Number.parseInt(parts[0], 10);
+		const parentPid = Number.parseInt(parts[1], 10);
+		if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
+		let list = children.get(parentPid);
+		if (!list) {
+			list = [];
+			children.set(parentPid, list);
+		}
+		list.push(childPid);
+	}
 }
 
 function killProcessTree(pid: number): void {
