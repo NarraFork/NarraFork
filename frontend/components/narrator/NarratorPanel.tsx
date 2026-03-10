@@ -934,6 +934,22 @@ export function NarratorPanel({
 		!String(lastMessage.id).startsWith("optimistic-") &&
 		(narrator?.status === "idle" || narrator?.status === "done" || narrator?.status === "error");
 
+	// Find the last user message ID for edit confirmation logic
+	const lastUserMessageId = useMemo(() => {
+		if (!hydrated || !messagesData?.pages) return undefined;
+		for (const page of messagesData.pages) {
+			for (let i = page.messages.length - 1; i >= 0; i--) {
+				const msg = page.messages[i];
+				if (msg?.role === "user" && !String(msg.id).startsWith("optimistic-")) {
+					return msg.id;
+				}
+			}
+		}
+		return undefined;
+	}, [hydrated, messagesData]);
+
+	const hasChapter = !!narrator?.chapterId;
+
 	// --- Fork handler ---
 	// Standalone narrators: fork narrator directly (no git involved)
 	const handleStandaloneFork = useCallback(
@@ -1023,6 +1039,8 @@ export function NarratorPanel({
 					onRegenerateFromMessage={handleRegenerate}
 					onEditAndRegenerate={handleEditAndRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
+					lastUserMessageId={lastUserMessageId}
+					hasChapter={hasChapter}
 				/>
 			));
 		}
@@ -1049,6 +1067,8 @@ export function NarratorPanel({
 					onRegenerateFromMessage={handleRegenerate}
 					onEditAndRegenerate={handleEditAndRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
+					lastUserMessageId={lastUserMessageId}
+					hasChapter={hasChapter}
 				/>,
 			);
 			remaining -= maxMsg;
@@ -1070,6 +1090,8 @@ export function NarratorPanel({
 		handleRegenerate,
 		handleEditAndRegenerate,
 		pruneBoundaryMessageId,
+		lastUserMessageId,
+		hasChapter,
 	]);
 
 	// --- Load older ---

@@ -78,6 +78,10 @@ interface MessageBubbleProps {
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRegenerateFromMessage?: (messageId: string) => void;
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
+	/** Whether this is the last user message in the conversation */
+	isLastUserMessage?: boolean;
+	/** Whether the narrator is bound to a chapter (has git support) */
+	hasChapter?: boolean;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -797,6 +801,8 @@ export const MessageBubble = memo(function MessageBubble({
 	onDeleteBlock,
 	onRegenerateFromMessage,
 	onEditAndRegenerate,
+	isLastUserMessage,
+	hasChapter,
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
@@ -828,8 +834,16 @@ export const MessageBubble = memo(function MessageBubble({
 
 	const handleConfirmClick = useCallback(() => {
 		if (!editContent.trim()) return;
+		// If this is the last user message, no confirmation needed
+		if (isLastUserMessage) {
+			if (!message.id || !onEditAndRegenerate) return;
+			onEditAndRegenerate(message.id, editContent.trim(), false);
+			setIsEditing(false);
+			setEditContent("");
+			return;
+		}
 		setShowConfirmModal(true);
-	}, [editContent]);
+	}, [editContent, isLastUserMessage, message.id, onEditAndRegenerate]);
 
 	const submitEdit = useCallback(
 		(rollback: boolean) => {
@@ -1057,18 +1071,39 @@ export const MessageBubble = memo(function MessageBubble({
 						size="sm"
 					>
 						<Stack gap="md">
-							<Text size="sm">{t("editConfirmDesc")}</Text>
-							<Stack gap="xs">
-								<Button fullWidth onClick={() => submitEdit(false)}>
-									{t("editConfirmKeep")}
-								</Button>
-								<Button fullWidth variant="light" color="orange" onClick={() => submitEdit(true)}>
-									{t("editConfirmRollback")}
-								</Button>
-								<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
-									{t("editCancel")}
-								</Button>
-							</Stack>
+							{hasChapter ? (
+								<>
+									<Text size="sm">{t("editConfirmDesc")}</Text>
+									<Stack gap="xs">
+										<Button fullWidth onClick={() => submitEdit(false)}>
+											{t("editConfirmKeep")}
+										</Button>
+										<Button
+											fullWidth
+											variant="light"
+											color="orange"
+											onClick={() => submitEdit(true)}
+										>
+											{t("editConfirmRollback")}
+										</Button>
+										<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+											{t("editCancel")}
+										</Button>
+									</Stack>
+								</>
+							) : (
+								<>
+									<Text size="sm">{t("editConfirmStandaloneDesc")}</Text>
+									<Stack gap="xs">
+										<Button fullWidth onClick={() => submitEdit(false)}>
+											{t("editConfirmProceed")}
+										</Button>
+										<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+											{t("editCancel")}
+										</Button>
+									</Stack>
+								</>
+							)}
 						</Stack>
 					</Modal>
 				</>

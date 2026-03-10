@@ -203,6 +203,8 @@ export function renderTreeMessages(
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
 	onRegenerateFromMessage?: (messageId: string) => void,
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
+	lastUserMessageId?: string,
+	hasChapter?: boolean,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -262,6 +264,8 @@ export function renderTreeMessages(
 				onDeleteBlock={onDeleteBlock}
 				onRegenerateFromMessage={onRegenerateFromMessage}
 				onEditAndRegenerate={onEditAndRegenerate}
+				isLastUserMessage={targetMsg.id === lastUserMessageId}
+				hasChapter={hasChapter}
 			/>
 			{showTokenUsage &&
 				(targetMsg.turnUsageJson != null ||
@@ -357,6 +361,8 @@ export function renderTreeMessages(
 								onDeleteBlock={onDeleteBlock}
 								onRegenerateFromMessage={onRegenerateFromMessage}
 								onEditAndRegenerate={onEditAndRegenerate}
+								isLastUserMessage={msg.id === lastUserMessageId}
+								hasChapter={hasChapter}
 							/>
 						</Box>,
 					);
@@ -535,6 +541,8 @@ interface PageElementsProps {
 	onRegenerateFromMessage?: (messageId: string) => void;
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
 	pruneBoundaryMessageId?: string | null;
+	lastUserMessageId?: string;
+	hasChapter?: boolean;
 }
 
 export const MemoizedPageElements = memo(
@@ -553,6 +561,8 @@ export const MemoizedPageElements = memo(
 		onRegenerateFromMessage,
 		onEditAndRegenerate,
 		pruneBoundaryMessageId,
+		lastUserMessageId,
+		hasChapter,
 	}: PageElementsProps) {
 		const msgs =
 			maxMessages != null && maxMessages < page.messages.length
@@ -574,6 +584,8 @@ export const MemoizedPageElements = memo(
 			onDeleteBlock,
 			onRegenerateFromMessage,
 			onEditAndRegenerate,
+			lastUserMessageId,
+			hasChapter,
 		);
 		return <>{elements}</>;
 	},
@@ -587,6 +599,8 @@ export const MemoizedPageElements = memo(
 		prev.editExpandOverride === next.editExpandOverride &&
 		prev.showTokenUsage === next.showTokenUsage &&
 		prev.maxMessages === next.maxMessages &&
+		prev.lastUserMessageId === next.lastUserMessageId &&
+		prev.hasChapter === next.hasChapter &&
 		prev.pruneBoundaryMessageId === next.pruneBoundaryMessageId,
 );
 
