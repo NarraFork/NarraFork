@@ -57,6 +57,9 @@ export interface ToolDefinition {
 	name: string;
 	description: string | ((config: AgentConfig) => string);
 	parameters: z.ZodType;
+	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
+	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
+	rawJsonSchema?: Record<string, unknown>;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;

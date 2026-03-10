@@ -39,13 +39,12 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let retryableError: string | undefined;
 
 	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
-		// When aborted, still process tool_result events so their status is
-		// persisted to the DB (running → success/fail).  Without this, tools
-		// that finished executing after the abort signal would stay "running"
-		// forever — this happens when the user approves a permission request
-		// with feedback text attached, which aborts the loop right after the
-		// tool starts executing.
-		if (config.signal.aborted && event.type !== "tool_result") break;
+		// When aborted, still process tool_result and error events so:
+		// - tool_result: status is persisted to the DB (running → success/fail)
+		// - error("Aborted"): onErrorCleanup is called to clean up orphaned tool calls
+		// Without this, tools that finished executing after the abort signal would
+		// stay "running" forever, and orphaned tool calls would never be cleaned up.
+		if (config.signal.aborted && event.type !== "tool_result" && event.type !== "error") break;
 
 		try {
 			const result = await processEvent(event, eventContext, hooks);
@@ -60,7 +59,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 			});
 		}
 
-		// After processing a tool_result under abort, stop consuming further events.
+		// After processing a tool_result or error under abort, stop consuming further events.
 		if (config.signal.aborted) break;
 
 		if (event.type === "assistant_message") {

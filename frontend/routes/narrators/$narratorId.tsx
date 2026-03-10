@@ -2,7 +2,7 @@ import { Box, Center, Drawer, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useLocation, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
@@ -27,6 +27,9 @@ function terminalStorageKey(narratorId: string) {
 
 function NarratorDetailPage() {
 	const { narratorId } = Route.useParams();
+	// biome-ignore lint/suspicious/noExplicitAny: loose search params
+	const search = useSearch({ strict: false }) as any;
+	const from = search?.from as string | undefined;
 	const location = useLocation();
 	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	const isMobile = useMediaQuery("(max-width: 768px)");
@@ -42,6 +45,8 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = isSubagent ? null : ((narrator as any)?.chapterId as string | null | undefined);
 	const { data: chapter } = useChapter(chapterId ?? "");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const projectId = (chapter as any)?.projectId as string | undefined;
 
 	// Record recent tab visit (skip for subagent narrators)
 	const narratorTitle = narrator?.title;
@@ -174,6 +179,18 @@ function NarratorDetailPage() {
 	const { t: tc } = useTranslation("chapters");
 	const { t: tCommon } = useTranslation("common");
 	const navigate = useNavigate();
+
+	// When navigated from narraflow graph, show minimize button to return to graph
+	const onMinimize = useCallback(() => {
+		if (projectId && chapterId) {
+			navigate({
+				to: "/projects/$projectId",
+				params: { projectId },
+				search: { focus: chapterId },
+			});
+		}
+	}, [navigate, projectId, chapterId]);
+	const showMinimize = from === "graph" && !!projectId && !!chapterId;
 
 	// Fork-from-message: directly fork without modal
 	const forkFromMessage = useMutation({
@@ -327,6 +344,7 @@ function NarratorDetailPage() {
 						appendInputRef={isSubagent ? undefined : appendInputRef}
 						terminalOpen={isSubagent ? undefined : drawerOpened}
 						onToggleTerminal={isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawer}
+						onMinimize={showMinimize ? onMinimize : undefined}
 					/>
 				</Box>
 
@@ -372,6 +390,7 @@ function NarratorDetailPage() {
 					appendInputRef={isSubagent ? undefined : appendInputRef}
 					terminalOpen={isSubagent ? undefined : terminalOpen}
 					onToggleTerminal={isSubagent ? undefined : toggleTerminal}
+					onMinimize={showMinimize ? onMinimize : undefined}
 				/>
 			</Box>
 

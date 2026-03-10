@@ -167,5 +167,6 @@
 	"showTranslated": "Translated",
 	"webSearched": "Searched the web:",
 	"webSearching": "Searching the web…",
-	"webSearchPreparing": "Preparing web search…"
+	"webSearchPreparing": "Preparing web search…",
+	"backToGraph": "Back to graph"
 }

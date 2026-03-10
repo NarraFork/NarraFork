@@ -168,7 +168,7 @@ export function useNarraFlow(projectId: string) {
 		queryKey: ["narraFlow", projectId],
 		queryFn: () => api.getProjectGraph(projectId),
 		enabled: !!projectId,
-		refetchInterval: 30_000, // Refresh every 30s to pick up git changes
+		refetchInterval: 60_000, // Fallback polling for external git changes not covered by WS events
 	});
 
 	const layoutData = useMemo(() => {

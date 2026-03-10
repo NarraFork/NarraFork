@@ -1,7 +1,7 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod/v4";
 import { toolRegistry } from "../agent/tool-registry";
-import type { ToolDefinition, ToolResult } from "../agent/types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../agent/types";
 import { logger } from "../logger";
 import { mcpManager } from "./manager";
 
@@ -36,6 +36,87 @@ function createPassthroughSchema(inputSchema?: Tool["inputSchema"]): z.ZodType {
 }
 
 /**
+ * Clean an MCP inputSchema for use as rawJsonSchema sent to AI providers.
+ * is known to accept, recursively cleaning nested schemas.
+ */
+function cleanMcpSchema(inputSchema?: Tool["inputSchema"]): Record<string, unknown> | undefined {
+	if (!inputSchema) return undefined;
+
+	const ALLOWED_KEYS = new Set([
+		"type",
+		"description",
+		"properties",
+		"required",
+		"items",
+		"enum",
+		"const",
+		"anyOf",
+		"oneOf",
+		"allOf",
+		"minimum",
+		"maximum",
+		"minLength",
+		"maxLength",
+		"minItems",
+		"maxItems",
+		"default",
+		"additionalProperties",
+		"nullable",
+	]);
+
+	function cleanNode(node: Record<string, unknown>): Record<string, unknown> {
+		const cleaned: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(node)) {
+			if (!ALLOWED_KEYS.has(key)) continue;
+			if (key === "properties" && typeof value === "object" && value !== null) {
+				const props: Record<string, unknown> = {};
+				for (const [pKey, pVal] of Object.entries(value as Record<string, unknown>)) {
+					if (typeof pVal === "object" && pVal !== null) {
+						props[pKey] = cleanNode(pVal as Record<string, unknown>);
+					} else {
+						props[pKey] = pVal;
+					}
+				}
+				cleaned[key] = props;
+			} else if (key === "items" && typeof value === "object" && value !== null) {
+				cleaned[key] = cleanNode(value as Record<string, unknown>);
+			} else if (key === "additionalProperties" && typeof value === "object" && value !== null) {
+				cleaned[key] = cleanNode(value as Record<string, unknown>);
+			} else if ((key === "anyOf" || key === "oneOf" || key === "allOf") && Array.isArray(value)) {
+				cleaned[key] = value.map((v) =>
+					typeof v === "object" && v !== null ? cleanNode(v as Record<string, unknown>) : v,
+				);
+			} else {
+				cleaned[key] = value;
+			}
+		}
+		// Ensure `type` exists on property nodes
+		if (!cleaned.type && !cleaned.anyOf && !cleaned.oneOf && !cleaned.allOf && !cleaned.const) {
+			cleaned.type = "string";
+		}
+		return cleaned;
+	}
+
+	const result: Record<string, unknown> = { type: "object" };
+	if (inputSchema.properties) {
+		const props: Record<string, unknown> = {};
+		for (const [key, val] of Object.entries(inputSchema.properties)) {
+			if (typeof val === "object" && val !== null) {
+				props[key] = cleanNode(val as Record<string, unknown>);
+			} else {
+				props[key] = val;
+			}
+		}
+		result.properties = props;
+	}
+	if (Array.isArray(inputSchema.required) && inputSchema.required.length > 0) {
+		result.required = inputSchema.required;
+	}
+	result.additionalProperties = false;
+	return result;
+}
+
+/**
  * Sync MCP tools into the tool registry.
  * Removes stale MCP tools and registers new ones.
  */
@@ -54,20 +135,29 @@ export function syncMcpTools(): void {
 			name,
 			description: `[MCP: ${serverName}] ${tool.description ?? tool.name}`,
 			parameters: createPassthroughSchema(tool.inputSchema),
+			rawJsonSchema: cleanMcpSchema(tool.inputSchema),
 			isAvailable: () => {
 				// Check if the server is still connected
 				const statuses = mcpManager.getServerStatuses();
 				return statuses.some((s) => s.id === serverId && s.status === "connected");
 			},
-			async execute(args: Record<string, unknown>): Promise<ToolResult> {
+			async execute(args: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
 				try {
 					const result = await mcpManager.callTool(serverId, tool.name, args);
-					const text = result.content
-						.filter((c) => c.type === "text" && c.text)
-						.map((c) => c.text)
-						.join("\n\n");
+					// Handle all content types: text, image, resource
+					const parts: string[] = [];
+					for (const c of result.content) {
+						if (c.type === "text" && c.text) {
+							parts.push(c.text);
+						} else if (c.type === "image" && c.data) {
+							parts.push(`[image: ${c.mimeType ?? "image/png"}, ${c.data.length} bytes base64]`);
+						} else if (c.type === "resource" && c.resource) {
+							const res = c.resource as { uri?: string; text?: string };
+							parts.push(res.text ?? `[resource: ${res.uri ?? "unknown"}]`);
+						}
+					}
 					return {
-						output: text || "(no output)",
+						output: parts.join("\n\n") || "(no output)",
 						isError: result.isError,
 					};
 				} catch (err) {

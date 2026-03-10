@@ -131,6 +131,8 @@ export interface NarratorPanelProps {
 	onToggleTerminal?: () => void;
 	/** Force compact (mobile-style) toolbar layout regardless of viewport width */
 	compact?: boolean;
+	/** When provided, replaces the back arrow with a minimize button (e.g. return to narraflow) */
+	onMinimize?: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;

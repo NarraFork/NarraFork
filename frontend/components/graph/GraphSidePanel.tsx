@@ -106,7 +106,11 @@ export function GraphSidePanel({ selectedNode, onClose }: GraphSidePanelProps) {
 
 					<Divider />
 
-					<Link to="/chapters/$chapterId" params={{ chapterId: selectedNode.id }}>
+					<Link
+						to="/chapters/$chapterId"
+						params={{ chapterId: selectedNode.id }}
+						search={{ from: "graph" }}
+					>
 						<Group gap={4}>
 							<Text size="sm">{t("sidePanel.openDetails")}</Text>
 							<IconExternalLink size={14} />

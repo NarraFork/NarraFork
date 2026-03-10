@@ -15,7 +15,16 @@ export function VersionUpdateBanner() {
 			variant="light"
 			withCloseButton
 			onClose={dismiss}
-			style={{ borderRadius: 0 }}
+			style={{
+				position: "fixed",
+				top: 8,
+				left: "50%",
+				transform: "translateX(-50%)",
+				zIndex: 1000,
+				maxWidth: 500,
+				width: "calc(100% - 32px)",
+				borderRadius: "var(--mantine-radius-sm)",
+			}}
 		>
 			<Group justify="space-between" wrap="nowrap">
 				<Text size="sm">{t("versionUpdate", { version: serverVersion })}</Text>

@@ -167,5 +167,6 @@
 	"showTranslated": "显示翻译",
 	"webSearched": "搜索了网络：",
 	"webSearching": "正在搜索网络…",
-	"webSearchPreparing": "准备搜索网络…"
+	"webSearchPreparing": "准备搜索网络…",
+	"backToGraph": "返回故事网络"
 }

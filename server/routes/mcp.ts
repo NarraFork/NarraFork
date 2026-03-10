@@ -364,6 +364,7 @@ mcpRoutes.post("/servers/import", async (c) => {
 	}
 
 	// Normalize: accept { mcpServers: { ... } } or { servers: { ... } } or bare { name: { ... } }
+	// Also accept single server config object (JetBrains format): { type: "sse", url: "..." }
 	// biome-ignore lint/suspicious/noExplicitAny: flexible import format
 	let serverMap: Record<string, any> = {};
 	if (json.mcpServers && typeof json.mcpServers === "object") {
@@ -371,13 +372,32 @@ mcpRoutes.post("/servers/import", async (c) => {
 	} else if (json.servers && typeof json.servers === "object" && !Array.isArray(json.servers)) {
 		serverMap = json.servers;
 	} else {
-		// Try treating the whole object as a server map (each key = server name)
-		const keys = Object.keys(json);
-		const looksLikeServerMap = keys.length > 0 && keys.every((k) => typeof json[k] === "object");
-		if (looksLikeServerMap) {
-			serverMap = json;
+		// Check if this is a single server config (has url/command or type field)
+		const isSingleServer =
+			typeof json.url === "string" ||
+			typeof json.command === "string" ||
+			(typeof json.type === "string" && ["stdio", "sse", "streamable-http"].includes(json.type));
+		if (isSingleServer) {
+			// Wrap as a named server map; derive name from url host or command
+			let autoName = "imported-server";
+			if (typeof json.url === "string") {
+				try {
+					const u = new URL(json.url);
+					autoName = u.hostname === "localhost" ? `localhost-${u.port}` : u.hostname;
+				} catch {}
+			} else if (typeof json.command === "string") {
+				autoName = json.command.split("/").pop() ?? "imported-server";
+			}
+			serverMap = { [autoName]: json };
 		} else {
-			return c.json({ error: "Unrecognized format" }, 400);
+			// Try treating the whole object as a server map (each key = server name)
+			const keys = Object.keys(json);
+			const looksLikeServerMap = keys.length > 0 && keys.every((k) => typeof json[k] === "object");
+			if (looksLikeServerMap) {
+				serverMap = json;
+			} else {
+				return c.json({ error: "Unrecognized format" }, 400);
+			}
 		}
 	}
 
@@ -395,10 +415,24 @@ mcpRoutes.post("/servers/import", async (c) => {
 			continue;
 		}
 
-		// Detect transport type
+		// Detect transport type — support both "transport" and "type" fields
+		const rawTransport = cfg.transport ?? cfg.type;
 		let transport: McpServerConfig["transport"] = "stdio";
-		if (cfg.url && !cfg.command) {
-			transport = cfg.transport === "sse" ? "sse" : "streamable-http";
+		if (rawTransport === "sse") {
+			transport = "sse";
+		} else if (rawTransport === "streamable-http") {
+			transport = "streamable-http";
+		} else if (cfg.url && !cfg.command) {
+			transport = "streamable-http";
+		}
+
+		// Filter out null/undefined header values (e.g. JetBrains format)
+		let headers: Record<string, string> | undefined;
+		if (cfg.headers && typeof cfg.headers === "object") {
+			const filtered: [string, string][] = Object.entries(cfg.headers).filter(
+				(entry): entry is [string, string] => entry[1] != null && typeof entry[1] === "string",
+			);
+			headers = filtered.length > 0 ? Object.fromEntries(filtered) : undefined;
 		}
 
 		const config: McpServerConfig = {
@@ -411,7 +445,7 @@ mcpRoutes.post("/servers/import", async (c) => {
 			cwd: cfg.cwd,
 			env: cfg.env && typeof cfg.env === "object" ? cfg.env : undefined,
 			url: cfg.url,
-			headers: cfg.headers && typeof cfg.headers === "object" ? cfg.headers : undefined,
+			headers,
 		};
 
 		added.push(config);

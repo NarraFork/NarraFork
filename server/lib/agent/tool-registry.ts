@@ -30,6 +30,17 @@ export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
 	return convertNode(schema);
 }
 
+/**
+ * Resolve the JSON Schema for a tool definition.
+ * Prefers `rawJsonSchema` (set by MCP tools) over Zod conversion.
+ */
+export function resolveToolJsonSchema(tool: {
+	parameters: z.ZodType;
+	rawJsonSchema?: Record<string, unknown>;
+}): Record<string, unknown> {
+	return tool.rawJsonSchema ?? zodToJsonSchema(tool.parameters);
+}
+
 function convertNode(schema: z.ZodType): Record<string, unknown> {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const def = (schema as any)._zod?.def;
@@ -82,6 +93,13 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 			type: "object",
 			additionalProperties: convertNode(def.valueType),
 		};
+	} else if (schema instanceof z.ZodAny || schema instanceof z.ZodUnknown) {
+		// z.any() / z.unknown() — emit a permissive type so providers don't reject
+		result = { type: "string" };
+	} else if (schema instanceof z.ZodNullable) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const inner = convertNode((schema as any).unwrap());
+		result = { anyOf: [inner, { type: "null" }] };
 	} else {
 		result = {};
 	}

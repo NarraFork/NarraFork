@@ -105,7 +105,11 @@ export default defineConfig(({ mode }) => {
 			}),
 			react(),
 			VitePWA({
+				strategies: "injectManifest",
+				srcDir: ".",
+				filename: "src-sw.ts",
 				registerType: "autoUpdate",
+				injectRegister: "auto",
 				includeAssets: ["favicon.svg", "apple-touch-icon-180x180.png"],
 				manifest: {
 					name: appName,
@@ -135,15 +139,8 @@ export default defineConfig(({ mode }) => {
 						},
 					],
 				},
-				workbox: {
+				injectManifest: {
 					globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
-					navigateFallback: "index.html",
-					runtimeCaching: [
-						{
-							urlPattern: /^https?:\/\/.*\/api\//,
-							handler: "NetworkOnly",
-						},
-					],
 				},
 			}),
 		],

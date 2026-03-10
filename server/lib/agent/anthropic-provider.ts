@@ -4,7 +4,7 @@ import type { AnthropicProviderConfig } from "../settings";
 import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
-import { zodToJsonSchema } from "./tool-registry";
+import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
 // === Claude Code protocol constants ===
@@ -244,7 +244,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			(tool): AnthropicTool => ({
 				name: tool.name,
 				description: tool.description,
-				input_schema: zodToJsonSchema(tool.parameters),
+				input_schema: resolveToolJsonSchema(tool),
 			}),
 		);
 	}

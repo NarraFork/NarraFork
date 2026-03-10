@@ -679,14 +679,28 @@ export async function handlePermission(
 	if (decision === "deny") {
 		// Chapter mode git branch violation — provide specific error message
 		const branchViolations = bashAnalysis?.gitBranchViolations;
+		// In readOnly mode, read-only tools (Read/Grep/Glob) and read-only bash commands
+		// are only denied when their paths fall outside the allowed worktree scope.
+		// Use a path-specific message instead of the generic "read-only mode" message.
+		const isReadToolPathDenied =
+			(permMode === "readOnly" || permMode === "plan") &&
+			(READ_ONLY_TOOLS.includes(toolName) ||
+				(toolName === SHELL_TOOL_NAME &&
+					bashAnalysis &&
+					!bashAnalysis.hasWriteOperation &&
+					bashAnalysis.nonWhitelisted.length === 0 &&
+					!bashAnalysis.dangerousPatterns.length &&
+					!bashAnalysis.hasEnvInjection));
 		const denyMsg =
 			isChapter && branchViolations?.length
 				? `DENIED: Chapter mode restricts git branch operations. Violations: ${branchViolations.join("; ")}. You may only work on the current branch.`
-				: permMode === "plan"
-					? getToolMessage("permissionDeniedPlanMode", locale)
-					: permMode === "readOnly"
-						? getToolMessage("permissionDeniedReadOnly", locale)
-						: getToolMessage("permissionDeniedNonInteractive", locale);
+				: isReadToolPathDenied
+					? getToolMessage("permissionDeniedPathOutsideScope", locale)
+					: permMode === "plan"
+						? getToolMessage("permissionDeniedPlanMode", locale)
+						: permMode === "readOnly"
+							? getToolMessage("permissionDeniedReadOnly", locale)
+							: getToolMessage("permissionDeniedNonInteractive", locale);
 		const decisionReason =
 			isChapter && branchViolations?.length ? branchViolations.join("; ") : undefined;
 		logger.debug("Permission auto-denied", {
@@ -1849,12 +1863,12 @@ async function runAgentLoop(
 						}
 						logger.info("Agent loop aborted (interrupted)", { narratorId });
 						// Broadcast interrupted event FIRST for instant UI feedback,
-						// then run DB cleanup in parallel (non-blocking).
+						// then await DB cleanup so orphaned tool calls are resolved
+						// before the caller checks narrator status.
 						active.events.emit("event", {
 							type: "interrupted",
 							data: { message: "Narrator interrupted" },
 						});
-						// Fire-and-forget: DB cleanup runs in background.
 						// Preserve terminal error state: if status is already error, do not overwrite it.
 						const cleanupTasks = [cleanupOrphanedToolCalls(narratorId, active.locale)];
 						const current = await db.query.narrators.findFirst({
@@ -1867,7 +1881,7 @@ async function runAgentLoop(
 						if (partialId) {
 							cleanupTasks.push(cleanupPartialMessage(partialId, narratorId));
 						}
-						Promise.all(cleanupTasks).catch((err) => {
+						await Promise.all(cleanupTasks).catch((err) => {
 							logger.warn("Post-interrupt cleanup failed", {
 								narratorId,
 								error: String(err),
@@ -2845,8 +2859,28 @@ export function getBufferedMessage(narratorId: string): BufferedMessage | null {
 
 // === Startup recovery ===
 
+/**
+ * Guard against running recovery during Bun --hot reloads.
+ * In --hot mode the process stays alive but modules are re-evaluated,
+ * so activeNarrators is reset to an empty Map while agent loops are
+ * still running in the background.  Running recovery in that state
+ * would incorrectly mark in-flight tool calls as "server restart".
+ *
+ * We use a globalThis flag that survives module re-evaluation (the
+ * process is the same) to detect hot reloads vs. cold starts.
+ */
+const HOT_RELOAD_GUARD = Symbol.for("narrafork.narrator.initialized");
+
 /** Clean up stale in-progress states left by a previous server run. */
 export async function recoverOnStartup(): Promise<void> {
+	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
+	if ((globalThis as any)[HOT_RELOAD_GUARD]) {
+		logger.info("Skipping narrator recovery (hot reload detected)");
+		return;
+	}
+	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
+	(globalThis as any)[HOT_RELOAD_GUARD] = true;
+
 	const now = new Date().toISOString();
 	const migrations = [
 		["active", "idle"],

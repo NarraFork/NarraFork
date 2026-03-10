@@ -370,6 +370,7 @@ export function NarratorPanel({
 	terminalOpen,
 	onToggleTerminal,
 	compact,
+	onMinimize,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -1405,10 +1406,22 @@ export function NarratorPanel({
 								size="sm"
 								variant="subtle"
 								color="gray"
-								onClick={() => navigate({ to: "/narrators/$narratorId", params: { narratorId } })}
+								onClick={() =>
+									navigate({
+										to: "/narrators/$narratorId",
+										params: { narratorId },
+										search: { from: "graph" },
+									})
+								}
 							>
 								<IconExternalLink size={16} />
 							</ActionIcon>
+						) : onMinimize ? (
+							<Tooltip label={t("backToGraph")} position="right">
+								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
+									<IconArrowsMinimize size={16} />
+								</ActionIcon>
+							</Tooltip>
 						) : (
 							<ActionIcon
 								size="sm"

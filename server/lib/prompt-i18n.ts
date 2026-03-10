@@ -355,6 +355,10 @@ const toolMessages = {
 		en: "Read-only mode: only read operations are allowed. Write, edit, and other mutating tools are denied.",
 		"zh-CN": "只读模式：仅允许读取操作。写入、编辑及其他修改类工具已被拒绝。",
 	},
+	permissionDeniedPathOutsideScope: {
+		en: "DENIED: The target path is outside the allowed working directory. Read and shell operations are restricted to the project worktree.",
+		"zh-CN": "已拒绝：目标路径超出允许的工作目录范围。读取和 Shell 操作仅限于项目工作树内。",
+	},
 	permissionDeniedPlanMode: {
 		en: "[PLAN MODE] This operation is denied in plan mode. You are in plan mode — writing and editing files (except the plan file) is not allowed. Focus on reading and analyzing code to form your plan, then call ExitPlanMode to submit it.",
 		"zh-CN":

@@ -5,18 +5,11 @@ import { resolve } from "node:path";
 let version = "0.0.0";
 let commitHash = "";
 
-// Try reading from generated build info (compiled binary)
-try {
-	const { buildVersion, buildCommit } = await import("@server/generated/build-info");
-	version = buildVersion;
-	commitHash = buildCommit;
-} catch {
-	// Not a compiled build — read from package.json at dev time
-	const pkgPath = resolve(import.meta.dir, "../../package.json");
-	if (existsSync(pkgPath)) {
-		const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-		version = pkg.version ?? "0.0.0";
-	}
+// Dev mode: read from package.json + git directly
+const pkgPath = resolve(import.meta.dir, "../../package.json");
+if (existsSync(pkgPath)) {
+	const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+	version = pkg.version ?? "0.0.0";
 
 	try {
 		commitHash = execSync("git rev-parse --short HEAD", {
@@ -24,6 +17,15 @@ try {
 		}).trim();
 	} catch {
 		// git not available
+	}
+} else {
+	// Compiled binary: no package.json, use generated build info
+	try {
+		const { buildVersion, buildCommit } = await import("@server/generated/build-info");
+		version = buildVersion;
+		commitHash = buildCommit;
+	} catch {
+		// no build info either
 	}
 }
 

@@ -43,7 +43,7 @@
 	"landscape": "Landscape",
 	"source": "View source",
 	"rendered": "View rendered",
-	"versionUpdate": "A new version ({{version}}) is available.",
+	"versionUpdate": "Server updated to {{version}}. Refresh to sync.",
 	"wsDisconnected": "Real-time connection lost. Some updates may not appear.",
 	"wsReconnect": "Reconnect",
 	"providers": "Providers",

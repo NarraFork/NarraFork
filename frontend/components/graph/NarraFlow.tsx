@@ -153,9 +153,10 @@ function isLocalEdgeId(edgeId: string) {
 
 interface NarraFlowProps {
 	projectId: string;
+	focusChapterId?: string;
 }
 
-export function NarraFlow({ projectId }: NarraFlowProps) {
+export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const { t } = useTranslation("graph");
 	const { colorScheme } = useMantineColorScheme();
 	const navigate = useNavigate();
@@ -205,6 +206,27 @@ export function NarraFlow({ projectId }: NarraFlowProps) {
 	);
 	const flowWrapperRef = useRef<HTMLDivElement>(null);
 	const reactFlowRef = useRef<ReactFlowInstance | null>(null);
+	const focusAppliedRef = useRef(false);
+
+	// Reset the guard when the target chapter changes so consecutive
+	// navigations back from different narrators each trigger a focus.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally re-run when focusChapterId changes
+	useEffect(() => {
+		focusAppliedRef.current = false;
+	}, [focusChapterId]);
+
+	// Shared helper: focus the graph on a specific chapter node (used by both
+	// the useEffect watcher and the onInit callback to cover all timing cases).
+	const tryFocusChapter = useCallback(() => {
+		if (!focusChapterId || focusAppliedRef.current || !reactFlowRef.current) return;
+		const targetNode = nodesRef.current.find((n) => n.id === focusChapterId);
+		if (!targetNode) return;
+		focusAppliedRef.current = true;
+		const instance = reactFlowRef.current;
+		requestAnimationFrame(() => {
+			instance.fitView({ padding: 0.3, duration: 300, nodes: [targetNode] });
+		});
+	}, [focusChapterId]);
 	const nodesRef = useRef<Node[]>(nodes);
 	nodesRef.current = nodes;
 	const computedEdgesRef = useRef<Edge[]>(computedEdges);
@@ -248,6 +270,14 @@ export function NarraFlow({ projectId }: NarraFlowProps) {
 		}
 		if (restored.size > 0) setExpandedNodes(restored);
 	}, [graphNodes]);
+
+	// Focus on a specific chapter node when navigating back from narrator page.
+	// `nodes` is intentionally in the dep array: tryFocusChapter reads nodesRef
+	// which updates when nodes change, so we need to re-attempt when new nodes arrive.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: re-attempt focus when nodes update
+	useEffect(() => {
+		tryFocusChapter();
+	}, [tryFocusChapter, nodes]);
 
 	const handleToggleExpand = useCallback(
 		(chapterId: string) => {
@@ -540,13 +570,60 @@ export function NarraFlow({ projectId }: NarraFlowProps) {
 		return renderedNodes;
 	}, [nodes, expandedNodes, liveStatuses, handleToggleExpand]);
 
-	// Sync local nodes state when upstream graph data changes
-	// Preserve any local-only draft/terminal nodes
+	// Sync local nodes state when upstream graph data changes.
+	// Incrementally merge: preserve positions of nodes the user has dragged,
+	// keep local-only draft/terminal nodes, and only update nodes whose data
+	// actually changed — so React Flow doesn't re-render the entire graph and
+	// lose focus / input state inside DraftNode etc.
+	const prevGraphNodesRef = useRef(graphNodes);
 	useEffect(() => {
+		const prev = prevGraphNodesRef.current;
+		prevGraphNodesRef.current = graphNodes;
+
 		const localOnly = nodesRef.current.filter(
 			(n) => n.type === "draftNode" || n.type === "terminalNode",
 		);
-		const nextNodes = [...(graphNodes as Node[]), ...localOnly];
+
+		// Fast path: if the upstream array reference is the same, nothing changed.
+		// Exception: if local nodes are empty but graphNodes has data (e.g. component
+		// mounted with cached query data), we must still initialise.
+		if (prev === graphNodes && nodesRef.current.length > 0) return;
+
+		const currentNodeMap = new Map(nodesRef.current.map((n) => [n.id, n]));
+
+		// Build a set of node IDs whose server data actually changed so we can
+		// skip touching nodes that are identical.
+		const prevMap = new Map(prev.map((n) => [n.id, n]));
+		const changedIds = new Set<string>();
+		const incomingIds = new Set<string>();
+		for (const node of graphNodes) {
+			incomingIds.add(node.id);
+			const old = prevMap.get(node.id);
+			if (old !== node) changedIds.add(node.id);
+		}
+		// Detect removed nodes
+		for (const old of prev) {
+			if (!incomingIds.has(old.id)) changedIds.add(old.id);
+		}
+
+		// If nothing actually changed, skip the update entirely.
+		if (changedIds.size === 0) return;
+
+		const mergedServerNodes = (graphNodes as Node[]).map((incoming) => {
+			const existing = currentNodeMap.get(incoming.id);
+			// If this node wasn't changed, reuse the existing object identity
+			// to avoid unnecessary React re-renders.
+			if (existing && !changedIds.has(incoming.id)) {
+				return existing;
+			}
+			// If the user has dragged this node, preserve their position.
+			if (existing && movedNodeIdsRef.current.has(incoming.id)) {
+				return { ...incoming, position: existing.position };
+			}
+			return incoming;
+		});
+
+		const nextNodes = [...mergedServerNodes, ...localOnly];
 		nodesRef.current = nextNodes;
 		movedNodeIdsRef.current.clear();
 		setNodes(nextNodes);
@@ -683,7 +760,11 @@ export function NarraFlow({ projectId }: NarraFlowProps) {
 			if (d.narratorId) {
 				handleToggleExpand(node.id);
 			} else {
-				navigate({ to: "/chapters/$chapterId", params: { chapterId: node.id } });
+				navigate({
+					to: "/chapters/$chapterId",
+					params: { chapterId: node.id },
+					search: { from: "graph" },
+				});
 			}
 		},
 		[handleToggleExpand, navigate],
@@ -1267,6 +1348,7 @@ export function NarraFlow({ projectId }: NarraFlowProps) {
 				<ReactFlow
 					onInit={(instance) => {
 						reactFlowRef.current = instance;
+						tryFocusChapter();
 					}}
 					colorMode={colorScheme === "auto" ? "system" : colorScheme}
 					nodes={nodesWithExpand}

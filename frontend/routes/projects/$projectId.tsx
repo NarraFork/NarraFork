@@ -14,7 +14,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
@@ -34,6 +34,9 @@ export const Route = createFileRoute("/projects/$projectId")({
 
 function ProjectDetailPage() {
 	const { projectId } = Route.useParams();
+	// biome-ignore lint/suspicious/noExplicitAny: loose search params
+	const search = useSearch({ strict: false }) as any;
+	const focus = search?.focus as string | undefined;
 	const navigate = useNavigate();
 	const { data: project, isLoading: projectLoading } = useProject(projectId);
 	const { data: chapters } = useChapters(projectId);
@@ -158,7 +161,7 @@ function ProjectDetailPage() {
 
 			{/* Graph canvas */}
 			<Box style={{ flex: 1, minHeight: 0 }}>
-				<NarraFlow projectId={projectId} />
+				<NarraFlow projectId={projectId} focusChapterId={focus} />
 			</Box>
 
 			{/* New chapter modal */}

@@ -275,6 +275,7 @@ terminalService.recoverOnStartup().catch((err) => {
 });
 
 // Initialize external MCP servers
+mcpManager.onToolsChanged = () => syncMcpTools();
 mcpManager
 	.initialize()
 	.then(() => {
@@ -326,6 +327,7 @@ const shutdown = () => {
 	chapterCleanup.clearAllTimers();
 	worktreeWatcher.shutdown();
 	projectDbManager.closeAll();
+	mcpManager.shutdown().catch(() => {});
 	process.exit(0);
 };
 process.on("SIGINT", shutdown);
