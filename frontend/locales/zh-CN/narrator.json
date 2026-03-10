@@ -103,6 +103,8 @@
 	"contextMenu_toggleWrap": "切换自动换行",
 	"contextMenu_copyBlock": "复制此块",
 	"contextMenu_delete": "删除消息",
+	"contextMenu_regenerate": "从此处重新生成",
+	"regenerateFailed": "重新生成失败",
 	"deleteMessageFailed": "删除失败",
 	"deleteMessageFailedDesc": "消息删除失败，请重试。",
 	"compactFailed": "压缩失败",

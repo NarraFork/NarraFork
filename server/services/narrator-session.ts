@@ -2603,10 +2603,7 @@ export async function retryLastMessage(
 	}
 
 	// Delete any messages after the last user message (old assistant responses)
-	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
-		narratorId,
-		lastMsg.id,
-	);
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id);
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -2657,10 +2654,7 @@ export async function regenerateFromMessage(
 	if (targetMsg.role === "user") {
 		// Delete everything after this user message, then re-run
 		userMsg = targetMsg;
-		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
-			narratorId,
-			messageId,
-		);
+		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
 		if (deletedMessageIds.length > 0) {
 			broadcastToNarrator(narratorId, {
 				type: "messages_deleted",

@@ -1146,9 +1146,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (!old?.pages?.length) return old;
 					const pages = old.pages.map((page) => ({
 						...page,
-						messages: page.messages.filter(
-							(m: NarratorMsg) => !deletedSet.has(m.id),
-						),
+						messages: page.messages.filter((m: NarratorMsg) => !deletedSet.has(m.id)),
 					}));
 					return { ...old, pages };
 				});
