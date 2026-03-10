@@ -26,8 +26,35 @@ export interface ProcessInfo {
 }
 
 /**
+ * Resolve a PowerShell executable path on Windows.
+ * Prefers `pwsh` (PowerShell 7+) over `powershell.exe` (Windows PowerShell 5.x).
+ * Returns null if neither is found.
+ */
+let _cachedPwsh: string | null | undefined;
+function findPowerShell(): string | null {
+	if (_cachedPwsh !== undefined) return _cachedPwsh;
+	_cachedPwsh = Bun.which("pwsh") ?? Bun.which("powershell.exe") ?? null;
+	return _cachedPwsh;
+}
+
+/** Run a PowerShell command and return stdout, or null on failure. */
+function runPowerShell(command: string, timeoutMs = 10000): string | null {
+	const pwsh = findPowerShell();
+	if (!pwsh) return null;
+	try {
+		return execSync(`"${pwsh}" -NoProfile -NonInteractive -Command "${command}"`, {
+			encoding: "utf-8",
+			stdio: "pipe",
+			timeout: timeoutMs,
+		});
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Snapshot of all system processes, built from a single `ps` call (Unix)
- * or `wmic` / `tasklist` (Windows).
+ * or PowerShell (Windows).
  * Provides efficient tree traversal and info lookup without repeated execSync.
  */
 export class ProcessSnapshot {
@@ -72,20 +99,10 @@ export class ProcessSnapshot {
 	}
 
 	private _buildFromWindows(): void {
-		// Use PowerShell to get process info in a parseable format.
-		// Output: "PID|PPID|Name|WS|CPU\n" per process.
-		const psCmd = [
-			"powershell.exe",
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			`Get-Process | ForEach-Object { "$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)" }`,
-		];
-		const result = execSync(psCmd.join(" "), {
-			encoding: "utf-8",
-			stdio: "pipe",
-			timeout: 10000,
-		});
+		const result = runPowerShell(
+			`Get-Process | ForEach-Object { \\\"$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)\\\" }`,
+		);
+		if (!result) return; // PowerShell not available — snapshot stays empty
 		for (const line of result.trim().split(/\r?\n/)) {
 			const parts = line.split("|");
 			if (parts.length < 5) continue;
@@ -140,29 +157,23 @@ export class ProcessSnapshot {
 
 /**
  * Find PIDs whose command line contains `searchArg`.
- * Uses `pgrep -f` on Unix, `wmic` on Windows.
+ * Uses `pgrep -f` on Unix, PowerShell on Windows.
  */
 export function findProcessesByArg(searchArg: string): number[] {
 	const pids: number[] = [];
 	try {
-		let result: string;
 		if (IS_WINDOWS) {
-			// Use wmic to search command lines (wmic is available on all Windows versions)
-			const escaped = searchArg.replace(/'/g, "''");
-			result = execSync(
-				`wmic process where "CommandLine like '%${escaped}%'" get ProcessId /FORMAT:LIST`,
-				{ encoding: "utf-8", stdio: "pipe", timeout: 5000 },
+			const escaped = searchArg.replace(/'/g, "''").replace(/"/g, '\\"');
+			const result = runPowerShell(
+				`Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${escaped}*' } | ForEach-Object { $_.ProcessId }`,
 			);
-			// wmic LIST format: "ProcessId=1234\r\n"
-			for (const line of result.split(/\r?\n/)) {
-				const match = line.match(/ProcessId=(\d+)/);
-				if (match) {
-					const pid = Number.parseInt(match[1], 10);
-					if (!Number.isNaN(pid)) pids.push(pid);
-				}
+			if (!result) return pids;
+			for (const line of result.trim().split(/\r?\n/)) {
+				const pid = Number.parseInt(line.trim(), 10);
+				if (!Number.isNaN(pid)) pids.push(pid);
 			}
 		} else {
-			result = execSync(`pgrep -f "${searchArg}"`, {
+			const result = execSync(`pgrep -f "${searchArg}"`, {
 				encoding: "utf-8",
 				stdio: "pipe",
 				timeout: 5000,
@@ -180,54 +191,53 @@ export function findProcessesByArg(searchArg: string): number[] {
 
 /**
  * Get child PIDs recursively.
- * Uses POSIX `ps` on Unix, `wmic` on Windows.
+ * Uses POSIX `ps` on Unix, PowerShell on Windows.
  */
 export function getDescendantPids(pid: number): number[] {
 	const descendants: number[] = [];
 	try {
-		let rawLines: string[];
+		// Build parent→children map from a process listing
+		const children = new Map<number, number[]>();
+
 		if (IS_WINDOWS) {
-			const result = execSync("wmic process get ProcessId,ParentProcessId /FORMAT:CSV", {
-				encoding: "utf-8",
-				stdio: "pipe",
-				timeout: 5000,
-			});
-			// CSV format: "Node,ParentProcessId,ProcessId\r\n"
-			rawLines = result.trim().split(/\r?\n/).slice(1); // skip header
+			const result = runPowerShell(
+				`Get-CimInstance Win32_Process | ForEach-Object { \\\"$($_.ProcessId)|$($_.ParentProcessId)\\\" }`,
+			);
+			if (!result) return descendants;
+			for (const line of result.trim().split(/\r?\n/)) {
+				const parts = line.split("|");
+				if (parts.length < 2) continue;
+				const childPid = Number.parseInt(parts[0], 10);
+				const parentPid = Number.parseInt(parts[1], 10);
+				if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
+				let list = children.get(parentPid);
+				if (!list) {
+					list = [];
+					children.set(parentPid, list);
+				}
+				list.push(childPid);
+			}
 		} else {
 			const result = execSync("ps -ax -o pid=,ppid=", {
 				encoding: "utf-8",
 				stdio: "pipe",
 				timeout: 5000,
 			});
-			rawLines = result.trim().split("\n");
-		}
-
-		// Build parent→children map
-		const children = new Map<number, number[]>();
-		for (const line of rawLines) {
-			let childPid: number;
-			let parentPid: number;
-			if (IS_WINDOWS) {
-				// CSV: "NODE,ParentProcessId,ProcessId"
-				const cols = line.split(",");
-				if (cols.length < 3) continue;
-				parentPid = Number.parseInt(cols[1], 10);
-				childPid = Number.parseInt(cols[2], 10);
-			} else {
+			for (const line of result.trim().split("\n")) {
 				const parts = line.trim().split(/\s+/);
 				if (parts.length < 2) continue;
-				childPid = Number.parseInt(parts[0], 10);
-				parentPid = Number.parseInt(parts[1], 10);
+				const childPid = Number.parseInt(parts[0], 10);
+				const parentPid = Number.parseInt(parts[1], 10);
+				if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
+				let list = children.get(parentPid);
+				if (!list) {
+					list = [];
+					children.set(parentPid, list);
+				}
+				list.push(childPid);
 			}
-			if (Number.isNaN(childPid) || Number.isNaN(parentPid)) continue;
-			let list = children.get(parentPid);
-			if (!list) {
-				list = [];
-				children.set(parentPid, list);
-			}
-			list.push(childPid);
 		}
+
 		// BFS to collect all descendants
 		const queue = children.get(pid) ?? [];
 		while (queue.length > 0) {
