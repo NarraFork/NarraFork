@@ -34,6 +34,29 @@ export interface TerminalProcessInfo {
 
 function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
 	try {
+		if (IS_WINDOWS) {
+			// Use PowerShell to get process info on Windows
+			const pwsh = Bun.which("pwsh") ?? Bun.which("powershell.exe");
+			if (!pwsh) return null;
+			const result = execSync(
+				`"${pwsh}" -NoProfile -NonInteractive -Command "Get-Process -Id ${pid} -ErrorAction SilentlyContinue | ForEach-Object { \\"$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)\\" }"`,
+				{ encoding: "utf-8", stdio: "pipe", timeout: 10000 },
+			);
+			const line = result.trim();
+			if (!line) return null;
+			const parts = line.split("|");
+			if (parts.length < 5) return null;
+			const ppid = Number.parseInt(parts[1], 10);
+			return {
+				pid: Number.parseInt(parts[0], 10),
+				ppid: Number.isNaN(ppid) ? 0 : ppid,
+				command: parts[2] || "",
+				state: "running",
+				rss: Math.round((Number.parseInt(parts[3], 10) || 0) / 1024),
+				cpu: Number.parseFloat(parts[4]) || 0,
+				elapsed: "",
+			};
+		}
 		const result = execSync(`ps -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime= -p ${pid}`, {
 			encoding: "utf-8",
 			stdio: "pipe",

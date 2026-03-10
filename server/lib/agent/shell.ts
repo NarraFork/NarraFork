@@ -115,8 +115,21 @@ export function detectShell(): ShellInfo {
 			extraEnv.MSYS2_PATH_TYPE = "inherit";
 			type = "bash";
 		} else {
-			shellPath = Bun.which("pwsh") ?? "powershell.exe";
-			type = "powershell";
+			const pwsh = Bun.which("pwsh");
+			if (pwsh) {
+				shellPath = pwsh;
+			} else {
+				// Try Windows PowerShell (always present on modern Windows)
+				const winPwsh = Bun.which("powershell.exe");
+				if (winPwsh) {
+					shellPath = winPwsh;
+				} else {
+					// Last resort: cmd.exe
+					shellPath = "cmd.exe";
+					type = "cmd";
+				}
+			}
+			if (type !== "cmd") type = "powershell";
 		}
 	} else {
 		const env = process.env.SHELL;
