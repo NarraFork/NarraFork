@@ -1149,6 +1149,8 @@ export const MessageBubble = memo(function MessageBubble({
 							errorMessage: tc?.errorMessage,
 							permissionDecisionReason: tc?.permissionDecisionReason,
 							permissionSuggestions: tc?.permissionSuggestions,
+							startedAt: tc?.startedAt,
+							_longRunning: tc?._longRunning,
 						};
 						const perm = resolvePerm?.(toolCallData) ?? null;
 						return (

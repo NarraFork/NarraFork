@@ -649,24 +649,10 @@ function BashTerminateButton({
 	const [elapsed, setElapsed] = useState(0);
 	useEffect(() => {
 		if (!isBash || !isRunning || toolCall.startedAt == null) {
-			if (isBash && toolCall.status === "running") {
-				console.log("[BashTerminate] skipped:", {
-					isBash,
-					isRunning,
-					status: toolCall.status,
-					startedAt: toolCall.startedAt,
-					narratorId,
-					toolName: toolCall.toolName,
-				});
-			}
 			setElapsed(0);
 			return;
 		}
-		const update = () => {
-			const e = Date.now() - (toolCall.startedAt ?? Date.now());
-			console.log("[BashTerminate] tick:", { elapsed: e, startedAt: toolCall.startedAt });
-			setElapsed(e);
-		};
+		const update = () => setElapsed(Date.now() - (toolCall.startedAt ?? Date.now()));
 		update();
 		const timer = setInterval(update, 5_000);
 		return () => clearInterval(timer);

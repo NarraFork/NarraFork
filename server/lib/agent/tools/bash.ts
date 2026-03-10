@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
-import { logger } from "../../logger";
 import { getHome, IS_WINDOWS } from "../../platform";
 import { detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
@@ -206,17 +205,6 @@ export const bashTool: ToolDefinition = {
 					}
 				}
 
-				logger.debug("bash watchdog tick", {
-					elapsed,
-					hadOutput,
-					pidAlive,
-					exited,
-					outputLen: currentLen,
-					longRunningFired,
-					hasEmitLongRunning: !!ctx.emitLongRunning,
-					toolUseId: ctx.currentToolUseId,
-				});
-
 				// Kill if process is dead and no recent output (zombie/leaked)
 				if (!pidAlive && !hadOutput && !exited) {
 					watchdogKilled = true;
@@ -229,10 +217,6 @@ export const bashTool: ToolDefinition = {
 					longRunningFired = true;
 					const toolUseId = ctx.currentToolUseId;
 					if (toolUseId) {
-						logger.debug("bash watchdog: emitting tool_long_running", {
-							toolUseId,
-							elapsed,
-						});
 						ctx.emitLongRunning?.(toolUseId, elapsed);
 					}
 				}
