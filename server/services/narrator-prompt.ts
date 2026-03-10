@@ -75,13 +75,28 @@ export async function buildEffectiveSystemPrompt(
 			? `All tools (Shell, Read, Write, Edit, Glob, Grep)`
 			: `All tools (Bash, Read, Write, Edit, Glob, Grep)`;
 		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\n${toolList} already use this as their default working directory. Do NOT \`cd\` into it in ${shellLabel} commands — it is redundant.`;
-		// When running PowerShell on Windows, add guidance for the AI
-		if (shellInfo.type === "powershell") {
-			cwdSection += `\n\nNote: The Shell tool uses PowerShell on this system. Use PowerShell syntax (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, ls, cat). Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands when possible.`;
+
+		// Windows Git Bash: warn about MSYS2 path mangling and forbid cmd builtins
+		if (IS_WINDOWS && shellInfo.loginWrap) {
+			cwdSection += `\n\nCRITICAL — Windows Git Bash Shell Rules:
+- The Shell tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
+- NEVER use Windows cmd builtins or utilities in the Shell tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
+- Use the dedicated tools instead: Grep (uses ripgrep), Glob, Read, Write, Edit. These work correctly on all platforms.
+- For shell commands, use Unix-style equivalents available in Git Bash: \`ls\`, \`cat\`, \`cp\`, \`mv\`, \`rm\`, \`find\`, \`grep\`, \`mkdir\`, \`touch\`, \`head\`, \`tail\`, \`wc\`.
+- Use \`git\`, \`node\`, \`npm\`, \`bun\`, \`python\` etc. directly — they work fine in Git Bash.`;
 		}
+
+		// Windows PowerShell guidance
+		if (IS_WINDOWS && shellInfo.type === "powershell") {
+			cwdSection += `\n\nCRITICAL — Windows PowerShell Shell Rules:
+- The Shell tool uses PowerShell on this system. Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
+- NEVER use Windows cmd builtins: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`. They may behave unexpectedly in PowerShell.
+- Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands whenever possible.`;
+		}
+
 		// On Windows, forbid WSL suggestions unless --wsl=true
 		if (IS_WINDOWS && !isWslAllowed()) {
-			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows. Use Windows-native paths (backslashes or forward slashes) and Windows-compatible commands.`;
+			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows.`;
 		}
 		prompt = `${base}${sep}${cwdSection}`;
 	}

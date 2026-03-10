@@ -34,6 +34,27 @@ export interface TerminalProcessInfo {
 
 function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
 	try {
+		if (IS_WINDOWS) {
+			// Use wmic to get process info on Windows
+			const result = execSync(
+				`wmic process where "ProcessId=${pid}" get ProcessId,ParentProcessId,Name,WorkingSetSize /FORMAT:CSV`,
+				{ encoding: "utf-8", stdio: "pipe", timeout: 5000 },
+			);
+			// CSV: "Node,Name,ParentProcessId,ProcessId,WorkingSetSize"
+			const lines = result.trim().split(/\r?\n/).filter(Boolean);
+			if (lines.length < 2) return null;
+			const cols = lines[1].split(",");
+			if (cols.length < 5) return null;
+			return {
+				pid: Number.parseInt(cols[3], 10),
+				ppid: Number.parseInt(cols[2], 10),
+				command: cols[1] || "",
+				state: "running",
+				rss: Math.round((Number.parseInt(cols[4], 10) || 0) / 1024),
+				cpu: 0,
+				elapsed: "",
+			};
+		}
 		const result = execSync(`ps -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime= -p ${pid}`, {
 			encoding: "utf-8",
 			stdio: "pipe",
