@@ -1138,15 +1138,6 @@ export const MessageBubble = memo(function MessageBubble({
 					if (block.type === "tool_use") {
 						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 						const tc = message.toolCalls?.find((t: any) => t.toolUseId === block.id);
-						if (tc?.toolName === "Shell" || tc?.toolName === "Bash") {
-							console.log("[MB] bash tc:", {
-								toolUseId: block.id,
-								status: tc?.status,
-								startedAt: tc?.startedAt,
-								_longRunning: tc?._longRunning,
-								tcKeys: tc ? Object.keys(tc) : [],
-							});
-						}
 						const toolCallData = {
 							id: tc?.id,
 							toolName: block.name,
