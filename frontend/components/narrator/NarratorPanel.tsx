@@ -52,6 +52,7 @@ import { startTransition, useCallback, useEffect, useMemo, useRef, useState } fr
 import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
+import { useInputHistory } from "../../hooks/useInputHistory";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -515,6 +516,7 @@ export function NarratorPanel({
 	const [input, setInput] = useState(
 		() => sessionStorage.getItem(`narrafork_draft_${narratorId}`) ?? "",
 	);
+	const inputHistory = useInputHistory(`narrafork_input_history_${narratorId}`);
 	useEffect(() => {
 		if (input) {
 			sessionStorage.setItem(`narrafork_draft_${narratorId}`, input);
@@ -1316,6 +1318,7 @@ export function NarratorPanel({
 	const handleSend = async () => {
 		const msg = input.trim();
 		if (!msg) return;
+		inputHistory.push(msg);
 		if (isActive) {
 			sendBufferMessage(narratorId, msg);
 			setBufferedText(msg);
@@ -1380,6 +1383,19 @@ export function NarratorPanel({
 		if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 			e.preventDefault();
 			handleSend();
+			return;
+		}
+		// 上下箭头翻阅输入历史（仅在单行且光标在首/末位置时触发）
+		if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+			const textarea = e.currentTarget as HTMLTextAreaElement;
+			const isMultiLine = textarea.value.includes("\n");
+			if (isMultiLine) return;
+			const direction = e.key === "ArrowUp" ? "up" : "down";
+			const result = inputHistory.navigate(direction, input);
+			if (result !== null) {
+				e.preventDefault();
+				setInput(result);
+			}
 		}
 	};
 
@@ -2271,7 +2287,10 @@ export function NarratorPanel({
 									ref={textareaRef}
 									placeholder={t("sendPlaceholder")}
 									value={input}
-									onChange={(e) => setInput(e.currentTarget.value)}
+									onChange={(e) => {
+										setInput(e.currentTarget.value);
+										inputHistory.reset();
+									}}
 									onKeyDown={handleKeyDown}
 									onPaste={handlePaste}
 									autosize
