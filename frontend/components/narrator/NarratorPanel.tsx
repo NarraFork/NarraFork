@@ -1021,6 +1021,7 @@ export function NarratorPanel({
 					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
 					onRegenerateFromMessage={handleRegenerate}
+					onEditAndRegenerate={handleEditAndRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>
 			));
@@ -1046,6 +1047,7 @@ export function NarratorPanel({
 					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
 					onRegenerateFromMessage={handleRegenerate}
+					onEditAndRegenerate={handleEditAndRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>,
 			);
@@ -1066,6 +1068,7 @@ export function NarratorPanel({
 		handleDeleteBlock,
 		handleCompactBefore,
 		handleRegenerate,
+		handleEditAndRegenerate,
 		pruneBoundaryMessageId,
 	]);
 
