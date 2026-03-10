@@ -9,6 +9,8 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
+const WATCHDOG_INTERVAL_MS = 15_000;
+const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
 /** Platform-aware tool name: "Shell" on Windows, "Bash" elsewhere. */
 export const SHELL_TOOL_NAME = IS_WINDOWS ? "Shell" : "Bash";
@@ -177,11 +179,54 @@ export const bashTool: ToolDefinition = {
 				void kill();
 			}, timeoutMs);
 
+			// Watchdog: periodically check process health (Redisson-style renew/kill).
+			// If the process has been running ≥60s, emit a long-running notification
+			// so the UI can show a terminate button.
+			let lastOutputLen = 0;
+			let longRunningFired = false;
+			const watchdogTimer = setInterval(() => {
+				if (exited) return;
+
+				const elapsed = Date.now() - watchdogStart;
+				const currentLen = output.length;
+				const hadOutput = currentLen > lastOutputLen;
+				lastOutputLen = currentLen;
+
+				// Check if PID is still alive
+				let pidAlive = false;
+				if (proc.pid) {
+					try {
+						process.kill(proc.pid, 0);
+						pidAlive = true;
+					} catch {
+						pidAlive = false;
+					}
+				}
+
+				// Kill if process is dead and no recent output (zombie/leaked)
+				if (!pidAlive && !hadOutput && !exited) {
+					timedOut = true;
+					void kill();
+					return;
+				}
+
+				// Notify UI once when process exceeds long-running threshold
+				if (!longRunningFired && elapsed >= LONG_RUNNING_THRESHOLD_MS) {
+					longRunningFired = true;
+					const toolUseId = ctx.currentToolUseId;
+					if (toolUseId) {
+						ctx.emitLongRunning?.(toolUseId, elapsed);
+					}
+				}
+			}, WATCHDOG_INTERVAL_MS);
+			const watchdogStart = Date.now();
+
 			// Wait for process to finish
 			try {
 				await exitPromise;
 			} finally {
 				clearTimeout(timer);
+				clearInterval(watchdogTimer);
 				ctx.signal.removeEventListener("abort", abortHandler);
 			}
 

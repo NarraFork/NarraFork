@@ -802,6 +802,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return result;
 				});
 			},
+			onToolLongRunning: (toolUseId: string, _elapsed: number) => {
+				// Mark the tool call as long-running so the UI can show a terminate button
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ _longRunning: true },
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onToolStarted: (
 				toolUseId: string,
 				toolName: string,

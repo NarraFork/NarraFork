@@ -570,6 +570,16 @@ export async function processEvent(
 			return null;
 		}
 
+		case "tool_long_running": {
+			dualBroadcast(ctx, {
+				type: "tool_long_running",
+				narratorId: broadcastTargetId,
+				toolUseId: event.toolUseId,
+				elapsed: event.elapsed,
+			});
+			return null;
+		}
+
 		case "error": {
 			if (hooks?.onErrorCleanup) {
 				await hooks.onErrorCleanup(event.message);

@@ -21,6 +21,7 @@
 	"chapterMergedHint": "本章节已合并，需重新唤醒后才能继续编辑。",
 	"interrupt": "中断",
 	"interruptCutInLine": "插队",
+	"terminateProcess": "终止进程",
 	"permissionRequest": "权限请求",
 	"tool": "工具：",
 	"questionFromNarrator": "叙述者有问题要问你",

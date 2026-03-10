@@ -39,6 +39,7 @@ export type NarratorServerMessage =
 	| { type: "status_change"; narratorId: string; status: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; narratorId: string; toolUseId: string; output: string }
+	| { type: "tool_long_running"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_completed";
 			narratorId: string;

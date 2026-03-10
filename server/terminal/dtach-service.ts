@@ -38,6 +38,7 @@ export class ProcessSnapshot {
 			const result = execSync("ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=", {
 				encoding: "utf-8",
 				stdio: "pipe",
+				timeout: 5000,
 			});
 			for (const line of result.trim().split("\n")) {
 				const parts = line.trim().split(/\s+/);
@@ -98,6 +99,7 @@ export function findProcessesByArg(searchArg: string): number[] {
 		const result = execSync(`pgrep -f "${searchArg}"`, {
 			encoding: "utf-8",
 			stdio: "pipe",
+			timeout: 5000,
 		});
 		for (const line of result.trim().split("\n")) {
 			const pid = Number.parseInt(line, 10);
@@ -120,6 +122,7 @@ export function getDescendantPids(pid: number): number[] {
 		const result = execSync("ps -ax -o pid=,ppid=", {
 			encoding: "utf-8",
 			stdio: "pipe",
+			timeout: 5000,
 		});
 		// Build parent→children map
 		const children = new Map<number, number[]>();
@@ -186,7 +189,7 @@ export const dtachService = {
 				_available = false;
 			} else {
 				try {
-					execSync("which dtach", { encoding: "utf-8", stdio: "pipe" });
+					execSync("which dtach", { encoding: "utf-8", stdio: "pipe", timeout: 3000 });
 					_available = true;
 				} catch {
 					_available = false;

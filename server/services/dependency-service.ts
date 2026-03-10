@@ -8,6 +8,7 @@
 
 import { execSync } from "node:child_process";
 import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { safeSpawn } from "../lib/spawn";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -186,19 +187,10 @@ async function install(
 	const cmd = commands[pm];
 	const shell = IS_WINDOWS ? ["cmd", "/c", cmd] : ["sh", "-c", cmd];
 
-	const proc = Bun.spawn(shell, {
-		stdout: "pipe",
-		stderr: "pipe",
-		env: process.env,
-	});
-	const [stdout, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	const exitCode = await proc.exited;
+	const result = await safeSpawn({ cmd: shell, env: process.env as Record<string, string> });
 
-	if (exitCode !== 0) {
-		return { ok: false, error: (stderr || stdout).trim().slice(0, 500) };
+	if (result.exitCode !== 0) {
+		return { ok: false, error: (result.stderr || result.stdout).trim().slice(0, 500) };
 	}
 
 	// Re-check the dependency after installation

@@ -3,6 +3,7 @@ import { db } from "../db";
 import { chapterCommits, chapters, narratorMessages, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { safeSpawn } from "../lib/spawn";
 import { gitService } from "./git-service";
 
 type CommitSource = "manual" | "auto" | "merge" | "cherry_pick" | "initial";
@@ -67,13 +68,11 @@ async function getCommitLog(
 	}
 	args.push("--");
 
-	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-	const stdout = await new Response(proc.stdout).text();
-	await proc.exited;
+	const result = await safeSpawn({ cmd: ["git", ...args], cwd });
 
-	if (!stdout.trim()) return [];
+	if (!result.stdout.trim()) return [];
 
-	const blocks = stdout.split(delim).filter((b) => b.trim());
+	const blocks = result.stdout.split(delim).filter((b) => b.trim());
 	const commits: RawCommit[] = [];
 
 	for (const block of blocks) {
@@ -101,24 +100,19 @@ async function getCommitDiffStats(
 	cwd: string,
 	sha: string,
 ): Promise<{ filesChanged: number; linesAdded: number; linesRemoved: number }> {
-	// Use git show --shortstat instead of git diff sha~1..sha
-	// because sha~1 doesn't exist for the initial commit
-	const proc = Bun.spawn(["git", "show", "--shortstat", "--format=", sha], {
+	const result = await safeSpawn({
+		cmd: ["git", "show", "--shortstat", "--format=", sha],
 		cwd,
-		stdout: "pipe",
-		stderr: "pipe",
 	});
-	const stdout = await new Response(proc.stdout).text();
-	const exitCode = await proc.exited;
 
-	if (exitCode !== 0 || !stdout.trim()) {
+	if (result.exitCode !== 0 || !result.stdout.trim()) {
 		return { filesChanged: 0, linesAdded: 0, linesRemoved: 0 };
 	}
 
 	// Parse: " 3 files changed, 10 insertions(+), 2 deletions(-)"
-	const filesMatch = stdout.match(/(\d+) files? changed/);
-	const addMatch = stdout.match(/(\d+) insertions?\(\+\)/);
-	const delMatch = stdout.match(/(\d+) deletions?\(-\)/);
+	const filesMatch = result.stdout.match(/(\d+) files? changed/);
+	const addMatch = result.stdout.match(/(\d+) insertions?\(\+\)/);
+	const delMatch = result.stdout.match(/(\d+) deletions?\(-\)/);
 
 	return {
 		filesChanged: filesMatch ? Number.parseInt(filesMatch[1], 10) : 0,

@@ -15,6 +15,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
+import { safeSpawn } from "../lib/spawn";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
@@ -279,24 +280,17 @@ export const chapterFork = {
 			// Step 6: Execute startup script (if project has one)
 			if (project.startupScript) {
 				try {
-					const proc = Bun.spawn(["sh", "-c", project.startupScript], {
+					const result = await safeSpawn({
+						cmd: ["sh", "-c", project.startupScript],
 						cwd: worktreePath,
-						stdout: "pipe",
-						stderr: "pipe",
 						env: { ...process.env, NARRAFORK_CHAPTER_ID: id },
+						timeout: 60_000,
 					});
-					const timeout = setTimeout(() => {
-						proc.kill();
-						logger.warn("Startup script timed out during fork", { chapterId: id });
-					}, 60_000);
-					const exitCode = await proc.exited;
-					clearTimeout(timeout);
-					if (exitCode !== 0) {
-						const stderr = await new Response(proc.stderr).text();
+					if (result.exitCode !== 0) {
 						logger.warn("Startup script failed during fork (non-fatal)", {
 							chapterId: id,
-							exitCode,
-							stderr: stderr.trim(),
+							exitCode: result.exitCode,
+							stderr: result.stderr.trim(),
 						});
 					}
 				} catch (err) {

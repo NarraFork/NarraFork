@@ -21,6 +21,7 @@
 	"chapterMergedHint": "This chapter has been merged. Wake it up to continue editing.",
 	"interrupt": "Interrupt",
 	"interruptCutInLine": "Cut in line",
+	"terminateProcess": "Terminate process",
 	"permissionRequest": "Permission Request",
 	"tool": "Tool:",
 	"questionFromNarrator": "Narrator has a question",

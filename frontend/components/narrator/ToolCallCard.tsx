@@ -26,6 +26,7 @@ import {
 	IconLoader2,
 	IconMap,
 	IconPlayerPlay,
+	IconPlayerStop,
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
@@ -35,7 +36,7 @@ import {
 } from "@tabler/icons-react";
 import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useToolCallDetail } from "../../hooks/useNarrator";
+import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
@@ -71,6 +72,8 @@ export interface ToolCallData {
 	startedAt?: number;
 	/** Optional metadata from the tool (e.g. line numbers for Edit) */
 	_metadata?: Record<string, unknown>;
+	/** Set by watchdog when process has been running ≥60s — shows terminate button */
+	_longRunning?: boolean;
 }
 
 export interface PendingPermission {
@@ -625,11 +628,15 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
+function BashDetail({ toolCall, narratorId }: { toolCall: ToolCallData; narratorId?: string }) {
 	const { t } = useTranslation("common");
+	const { t: tNarrator } = useTranslation("narrator");
 	const cmd = extractField(toolCall.inputJson, "command");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const interruptMutation = useInterruptNarrator();
+
+	const showTerminate = toolCall._longRunning && toolCall.status === "running" && !!narratorId;
 
 	return (
 		<Box mt="xs">
@@ -657,6 +664,19 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 				<Text size="xs" c="red" mt={4}>
 					{toolCall.errorMessage}
 				</Text>
+			)}
+			{showTerminate && (
+				<Button
+					size="xs"
+					variant="light"
+					color="red"
+					mt={6}
+					leftSection={<IconPlayerStop size={14} />}
+					loading={interruptMutation.isPending}
+					onClick={() => interruptMutation.mutate(narratorId)}
+				>
+					{tNarrator("terminateProcess")}
+				</Button>
 			)}
 		</Box>
 	);
@@ -1037,13 +1057,13 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
+function DetailRenderer({ toolCall, narratorId }: { toolCall: ToolCallData; narratorId?: string }) {
 	const cat = getCategory(toolCall.toolName);
 	switch (cat) {
 		case "file":
 			return <FileDetail toolCall={toolCall} />;
 		case "bash":
-			return <BashDetail toolCall={toolCall} />;
+			return <BashDetail toolCall={toolCall} narratorId={narratorId} />;
 		case "search":
 			return <SearchDetail toolCall={toolCall} />;
 		case "webSearch":
@@ -1257,7 +1277,7 @@ function LazyDetailRenderer({
 		};
 	}, [toolCall, fullTc]);
 
-	return <DetailRenderer toolCall={resolvedToolCall} />;
+	return <DetailRenderer toolCall={resolvedToolCall} narratorId={narratorId} />;
 }
 
 // --- Swipe / context-menu constants ---

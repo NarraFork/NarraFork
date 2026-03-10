@@ -38,6 +38,8 @@ export interface ToolContext {
 	emitProgress?: (toolUseId: string, elapsed: number) => void;
 	/** Emit real-time output for streaming tool results (e.g. bash). Receives cumulative output. */
 	emitOutput?: (output: string) => void;
+	/** Emit a long-running process notification (≥60s). UI can show a terminate button. */
+	emitLongRunning?: (toolUseId: string, elapsed: number) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
 	currentToolUseId?: string;
 }
@@ -108,6 +110,7 @@ export type AgentEvent =
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
+	| { type: "tool_long_running"; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_use_chunk";
 			toolUseId: string;

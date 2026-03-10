@@ -38,6 +38,7 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
 	) => void;
+	onToolLongRunning?: (toolUseId: string, elapsed: number) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (
 		todos: { id?: string; content?: string; status?: string }[],
@@ -271,6 +272,9 @@ export function useNarratorWS(
 								data.updatedInput,
 								data.metadata,
 							);
+							break;
+						case "tool_long_running":
+							callbacksRef.current.onToolLongRunning?.(data.toolUseId, data.elapsed);
 							break;
 						case "todos_updated":
 							callbacksRef.current.onTodosUpdated?.(data.todos, data.toolUseId);

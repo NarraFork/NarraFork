@@ -11,6 +11,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isInsidePath } from "../lib/platform-path";
 import { settings } from "../lib/settings";
+import { safeSpawn } from "../lib/spawn";
 import { buildProxyUrl, generateProxyLabel } from "./container-proxy";
 import { type PortMapping, portAllocator } from "./port-allocator";
 
@@ -324,27 +325,21 @@ async function exec(
 	env?: Record<string, string>,
 ): Promise<ExecResult> {
 	ensurePodman();
-	const proc = Bun.spawn(["podman", ...args], {
+	const result = await safeSpawn({
+		cmd: ["podman", ...args],
 		cwd,
-		stdout: "pipe",
-		stderr: "pipe",
 		env: { ...process.env, ...env },
 	});
-	const [stdout, rawStderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	const exitCode = await proc.exited;
-	const stderr = cleanStderr(rawStderr);
-	if (exitCode !== 0) {
+	const stderr = cleanStderr(result.stderr);
+	if (result.exitCode !== 0) {
 		logger.error("Container command failed", {
 			cmd: ["podman", ...args].join(" "),
 			cwd,
 			stderr,
-			exitCode,
+			exitCode: result.exitCode,
 		});
 	}
-	return { stdout: stdout.trim(), stderr, exitCode };
+	return { stdout: result.stdout.trim(), stderr, exitCode: result.exitCode };
 }
 
 /**

@@ -11,6 +11,7 @@ import {
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { logger } from "../lib/logger";
+import { safeSpawn } from "../lib/spawn";
 
 const SNAPSHOTS_DIR = resolve(homedir(), ".narrafork", "snapshots");
 
@@ -38,24 +39,18 @@ async function execGit(
 	workTree: string,
 	silent = false,
 ): Promise<ExecResult> {
-	const proc = Bun.spawn(["git", "--git-dir", gitDir, "--work-tree", workTree, ...args], {
-		stdout: "pipe",
-		stderr: "pipe",
+	const result = await safeSpawn({
+		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
 	});
-	const [stdout, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	const exitCode = await proc.exited;
-	if (exitCode !== 0 && !silent) {
+	if (result.exitCode !== 0 && !silent) {
 		logger.error("snapshot git command failed", {
 			args: args.join(" "),
 			gitDir,
-			stderr: stderr.trim(),
-			exitCode,
+			stderr: result.stderr.trim(),
+			exitCode: result.exitCode,
 		});
 	}
-	return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+	return { stdout: result.stdout.trim(), stderr: result.stderr.trim(), exitCode: result.exitCode };
 }
 
 // --- Per-chapter concurrency lock ---
@@ -278,17 +273,14 @@ export const snapshot = {
 			const snapshotSet = new Set(snapshotFiles.stdout.split("\n").filter(Boolean));
 
 			// 2. List files in the worktree's current HEAD tree (from the real git repo).
-			// NOTE: We use Bun.spawn directly here instead of execGit because execGit
+			// NOTE: We use safeSpawn directly here instead of execGit because execGit
 			// injects --git-dir/--work-tree pointing to the shadow repo, but we need
 			// to query the target worktree's own git repository.
-			const headProc = Bun.spawn(["git", "ls-tree", "-r", "--name-only", "HEAD"], {
+			const headResult = await safeSpawn({
+				cmd: ["git", "ls-tree", "-r", "--name-only", "HEAD"],
 				cwd: targetWorktreePath,
-				stdout: "pipe",
-				stderr: "pipe",
 			});
-			const headStdout = await new Response(headProc.stdout).text();
-			await headProc.exited;
-			const headFiles = headStdout.trim().split("\n").filter(Boolean);
+			const headFiles = headResult.stdout.trim().split("\n").filter(Boolean);
 
 			// 3. Delete files present in HEAD but absent from the snapshot (model deleted them)
 			for (const file of headFiles) {

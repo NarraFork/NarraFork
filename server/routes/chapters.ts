@@ -6,6 +6,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { supportsContainers } from "../lib/platform";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
+import { safeSpawn } from "../lib/spawn";
 import {
 	batchCleanupSchema,
 	batchMergeSchema,
@@ -196,23 +197,17 @@ chapterRoutes.post("/podman/install", requireAdmin, async (c) => {
 		].join(" ");
 	}
 
-	const proc = Bun.spawn(["sh", "-c", cmd], {
-		stdout: "pipe",
-		stderr: "pipe",
-		env: process.env,
+	const result = await safeSpawn({
+		cmd: ["sh", "-c", cmd],
+		env: process.env as Record<string, string>,
 	});
-	const [stdout, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	const exitCode = await proc.exited;
 
-	if (exitCode === 0) {
+	if (result.exitCode === 0) {
 		resetPodmanCache();
 		const status = getPodmanStatus();
 		return c.json({ ok: true, ...status });
 	}
-	return c.json({ ok: false, error: (stderr || stdout).trim() }, 500);
+	return c.json({ ok: false, error: (result.stderr || result.stdout).trim() }, 500);
 });
 
 // === Containers ===

@@ -2,6 +2,7 @@ import { cpSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { logger } from "../lib/logger";
 import { DEV_NULL } from "../lib/platform";
+import { safeSpawn } from "../lib/spawn";
 
 interface ExecResult {
 	stdout: string;
@@ -63,23 +64,18 @@ function stripTrailingLineBreaks(text: string): string {
 }
 
 async function exec(args: string[], cwd: string, silent = false): Promise<ExecResult> {
-	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	const exitCode = await proc.exited;
-	const trimmedStdout = stripTrailingLineBreaks(stdout);
-	const trimmedStderr = stripTrailingLineBreaks(stderr);
-	if (exitCode !== 0 && !silent) {
+	const result = await safeSpawn({ cmd: ["git", ...args], cwd });
+	const trimmedStdout = stripTrailingLineBreaks(result.stdout);
+	const trimmedStderr = stripTrailingLineBreaks(result.stderr);
+	if (result.exitCode !== 0 && !silent) {
 		logger.error("git command failed", {
 			args: args.join(" "),
 			cwd,
 			stderr: trimmedStderr,
-			exitCode,
+			exitCode: result.exitCode,
 		});
 	}
-	return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode };
+	return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode: result.exitCode };
 }
 
 interface LineStats {
