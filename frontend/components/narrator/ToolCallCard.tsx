@@ -636,7 +636,22 @@ function BashDetail({ toolCall, narratorId }: { toolCall: ToolCallData; narrator
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const interruptMutation = useInterruptNarrator();
 
-	const showTerminate = toolCall._longRunning && toolCall.status === "running" && !!narratorId;
+	// Show terminate button when the command has been running for ≥60s.
+	// Uses a timer so the button appears automatically without relying on WS push.
+	const isRunning = toolCall.status === "running" && !!narratorId;
+	const [elapsed, setElapsed] = useState(0);
+	useEffect(() => {
+		if (!isRunning || toolCall.startedAt == null) {
+			setElapsed(0);
+			return;
+		}
+		const update = () => setElapsed(Date.now() - (toolCall.startedAt ?? Date.now()));
+		update();
+		const timer = setInterval(update, 5_000);
+		return () => clearInterval(timer);
+	}, [isRunning, toolCall.startedAt]);
+
+	const showTerminate = isRunning && (toolCall._longRunning || elapsed >= 60_000);
 
 	return (
 		<Box mt="xs">
