@@ -628,20 +628,27 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-function BashDetail({ toolCall, narratorId }: { toolCall: ToolCallData; narratorId?: string }) {
-	const { t } = useTranslation("common");
+/**
+ * Terminate button for long-running bash/shell commands.
+ * Rendered outside LazyCollapse so it's always visible without expanding the card.
+ * Uses a local timer to detect ≥60s elapsed — no dependency on WS push.
+ */
+function BashTerminateButton({
+	toolCall,
+	narratorId,
+}: {
+	toolCall: ToolCallData;
+	narratorId?: string;
+}) {
 	const { t: tNarrator } = useTranslation("narrator");
-	const cmd = extractField(toolCall.inputJson, "command");
-	const outputText = resolveDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const interruptMutation = useInterruptNarrator();
 
-	// Show terminate button when the command has been running for ≥60s.
-	// Uses a timer so the button appears automatically without relying on WS push.
+	const isBash = BASH_TOOLS.has(toolCall.toolName);
 	const isRunning = toolCall.status === "running" && !!narratorId;
+
 	const [elapsed, setElapsed] = useState(0);
 	useEffect(() => {
-		if (!isRunning || toolCall.startedAt == null) {
+		if (!isBash || !isRunning || toolCall.startedAt == null) {
 			setElapsed(0);
 			return;
 		}
@@ -649,9 +656,31 @@ function BashDetail({ toolCall, narratorId }: { toolCall: ToolCallData; narrator
 		update();
 		const timer = setInterval(update, 5_000);
 		return () => clearInterval(timer);
-	}, [isRunning, toolCall.startedAt]);
+	}, [isBash, isRunning, toolCall.startedAt]);
 
-	const showTerminate = isRunning && (toolCall._longRunning || elapsed >= 60_000);
+	if (!isBash || !isRunning || elapsed < 60_000) return null;
+
+	return (
+		<Box mt={4} mb={2}>
+			<Button
+				size="xs"
+				variant="light"
+				color="red"
+				leftSection={<IconPlayerStop size={14} />}
+				loading={interruptMutation.isPending}
+				onClick={() => narratorId && interruptMutation.mutate(narratorId)}
+			>
+				{tNarrator("terminateProcess")}
+			</Button>
+		</Box>
+	);
+}
+
+function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("common");
+	const cmd = extractField(toolCall.inputJson, "command");
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	return (
 		<Box mt="xs">
@@ -679,19 +708,6 @@ function BashDetail({ toolCall, narratorId }: { toolCall: ToolCallData; narrator
 				<Text size="xs" c="red" mt={4}>
 					{toolCall.errorMessage}
 				</Text>
-			)}
-			{showTerminate && (
-				<Button
-					size="xs"
-					variant="light"
-					color="red"
-					mt={6}
-					leftSection={<IconPlayerStop size={14} />}
-					loading={interruptMutation.isPending}
-					onClick={() => interruptMutation.mutate(narratorId)}
-				>
-					{tNarrator("terminateProcess")}
-				</Button>
 			)}
 		</Box>
 	);
@@ -1072,13 +1088,13 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-function DetailRenderer({ toolCall, narratorId }: { toolCall: ToolCallData; narratorId?: string }) {
+function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 	const cat = getCategory(toolCall.toolName);
 	switch (cat) {
 		case "file":
 			return <FileDetail toolCall={toolCall} />;
 		case "bash":
-			return <BashDetail toolCall={toolCall} narratorId={narratorId} />;
+			return <BashDetail toolCall={toolCall} />;
 		case "search":
 			return <SearchDetail toolCall={toolCall} />;
 		case "webSearch":
@@ -1292,7 +1308,7 @@ function LazyDetailRenderer({
 		};
 	}, [toolCall, fullTc]);
 
-	return <DetailRenderer toolCall={resolvedToolCall} narratorId={narratorId} />;
+	return <DetailRenderer toolCall={resolvedToolCall} />;
 }
 
 // --- Swipe / context-menu constants ---
@@ -1440,12 +1456,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 		<>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
 			{!isStreaming && (
-				<LazyCollapse in={opened}>
-					<Box style={planStyle}>
-						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-					</Box>
-					{permissionUI}
-				</LazyCollapse>
+				<>
+					<BashTerminateButton toolCall={toolCall} narratorId={narratorId} />
+					<LazyCollapse in={opened}>
+						<Box style={planStyle}>
+							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+						</Box>
+						{permissionUI}
+					</LazyCollapse>
+				</>
 			)}
 		</>
 	);
