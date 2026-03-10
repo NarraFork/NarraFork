@@ -77,7 +77,7 @@ interface MessageBubbleProps {
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRegenerateFromMessage?: (messageId: string) => void;
-	onEditAndRegenerate?: (messageId: string, newContent: string) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -807,6 +807,7 @@ export const MessageBubble = memo(function MessageBubble({
 	// Edit mode state for user messages
 	const [isEditing, setIsEditing] = useState(false);
 	const [editContent, setEditContent] = useState("");
+	const [showConfirmModal, setShowConfirmModal] = useState(false);
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
@@ -822,14 +823,24 @@ export const MessageBubble = memo(function MessageBubble({
 	const cancelEditing = useCallback(() => {
 		setIsEditing(false);
 		setEditContent("");
+		setShowConfirmModal(false);
 	}, []);
 
-	const submitEdit = useCallback(() => {
-		if (!message.id || !onEditAndRegenerate || !editContent.trim()) return;
-		onEditAndRegenerate(message.id, editContent.trim());
-		setIsEditing(false);
-		setEditContent("");
-	}, [message.id, onEditAndRegenerate, editContent]);
+	const handleConfirmClick = useCallback(() => {
+		if (!editContent.trim()) return;
+		setShowConfirmModal(true);
+	}, [editContent]);
+
+	const submitEdit = useCallback(
+		(rollback: boolean) => {
+			if (!message.id || !onEditAndRegenerate || !editContent.trim()) return;
+			onEditAndRegenerate(message.id, editContent.trim(), rollback);
+			setIsEditing(false);
+			setEditContent("");
+			setShowConfirmModal(false);
+		},
+		[message.id, onEditAndRegenerate, editContent],
+	);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
@@ -999,48 +1010,68 @@ export const MessageBubble = memo(function MessageBubble({
 		// Edit mode UI
 		if (isEditing) {
 			return (
-				<Paper
-					p="sm"
-					radius="md"
-					style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
-				>
-					<Stack gap="xs">
-						<Group gap={6}>
-							{message.creator && (
-								<UserAvatar
-									username={message.creator.username}
-									avatarColor={message.creator.avatarColor}
-									avatarImageId={message.creator.avatarImageId}
-									userId={message.creator.id}
-									size={20}
-									showTooltip={false}
-								/>
-							)}
-							<Text size="xs" fw={600} c="indigo">
-								{message.creator?.username ?? t("you")}
-							</Text>
-						</Group>
-						<Textarea
-							value={editContent}
-							onChange={(e) => setEditContent(e.currentTarget.value)}
-							autosize
-							minRows={2}
-							maxRows={10}
-						/>
-						<Group gap="xs" justify="flex-end">
-							<Button size="xs" variant="subtle" onClick={cancelEditing}>
-								{t("editCancel")}
-							</Button>
-							<Button
-								size="xs"
-								onClick={submitEdit}
-								disabled={!editContent.trim()}
-							>
-								{t("editSubmit")}
-							</Button>
-						</Group>
-					</Stack>
-				</Paper>
+				<>
+					<Paper
+						p="sm"
+						radius="md"
+						style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
+					>
+						<Stack gap="xs">
+							<Group gap={6}>
+								{message.creator && (
+									<UserAvatar
+										username={message.creator.username}
+										avatarColor={message.creator.avatarColor}
+										avatarImageId={message.creator.avatarImageId}
+										userId={message.creator.id}
+										size={20}
+										showTooltip={false}
+									/>
+								)}
+								<Text size="xs" fw={600} c="indigo">
+									{message.creator?.username ?? t("you")}
+								</Text>
+							</Group>
+							<Textarea
+								value={editContent}
+								onChange={(e) => setEditContent(e.currentTarget.value)}
+								autosize
+								minRows={2}
+								maxRows={10}
+							/>
+							<Group gap="xs" justify="flex-end">
+								<Button size="xs" variant="subtle" onClick={cancelEditing}>
+									{t("editCancel")}
+								</Button>
+								<Button size="xs" onClick={handleConfirmClick} disabled={!editContent.trim()}>
+									{t("editSubmit")}
+								</Button>
+							</Group>
+						</Stack>
+					</Paper>
+					<Modal
+						opened={showConfirmModal}
+						onClose={() => setShowConfirmModal(false)}
+						title={t("editConfirmTitle")}
+						centered
+						size="sm"
+					>
+						<Stack gap="md">
+							<Text size="sm">{t("editConfirmDesc")}</Text>
+							<Stack gap="xs">
+								<Button fullWidth onClick={() => submitEdit(false)}>
+									{t("editConfirmKeep")}
+								</Button>
+								<Button fullWidth variant="light" color="orange" onClick={() => submitEdit(true)}>
+									{t("editConfirmRollback")}
+								</Button>
+								<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+									{t("editCancel")}
+								</Button>
+							</Stack>
+						</Stack>
+					</Modal>
+				</>
 			);
 		}
 

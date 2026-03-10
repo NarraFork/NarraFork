@@ -2748,6 +2748,8 @@ function extractImageRefs(contentJson: unknown): ImageRef[] {
 /**
  * Edit a user message and regenerate the response.
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
+ * If rollback is true and the narrator is bound to a chapter, resets git to the state
+ * before the original message was sent.
  */
 export async function editAndRegenerate(
 	narratorId: string,
@@ -2755,6 +2757,7 @@ export async function editAndRegenerate(
 	newContent: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	rollback = false,
 ): Promise<{ ok: boolean }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
@@ -2770,6 +2773,44 @@ export async function editAndRegenerate(
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "user") {
 		throw new NotFoundError("Can only edit user messages", messageId);
+	}
+
+	// If rollback requested, try to reset git to the commit before this message
+	if (rollback) {
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.chapterId) {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				with: { project: true },
+			});
+			if (chapter?.worktreePath && chapter.project?.gitPath) {
+				// Find the commit that was HEAD when this message was created
+				// We look for commits before the message creation time
+				try {
+					const msgCreatedAt = new Date(targetMsg.createdAt).toISOString();
+					// Get the commit that was current before this message
+					const result = await gitService.exec(
+						["log", "--before", msgCreatedAt, "--format=%H", "-1"],
+						chapter.worktreePath,
+					);
+					const commitHash = result.stdout.trim();
+					if (commitHash) {
+						// Reset to that commit (hard reset to discard all changes)
+						await gitService.exec(["reset", "--hard", commitHash], chapter.worktreePath);
+						logger.info("Git rollback completed", {
+							narratorId,
+							chapterId: narrator.chapterId,
+							commitHash,
+						});
+					}
+				} catch (err) {
+					logger.warn("Git rollback failed, continuing without rollback", {
+						narratorId,
+						error: String(err),
+					});
+				}
+			}
+		}
 	}
 
 	// Update the message content

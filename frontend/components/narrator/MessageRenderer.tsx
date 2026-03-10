@@ -202,7 +202,7 @@ export function renderTreeMessages(
 	onCompactBeforeMessage?: (messageId: string) => void,
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
 	onRegenerateFromMessage?: (messageId: string) => void,
-	onEditAndRegenerate?: (messageId: string, newContent: string) => void,
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -533,7 +533,7 @@ interface PageElementsProps {
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onRegenerateFromMessage?: (messageId: string) => void;
-	onEditAndRegenerate?: (messageId: string, newContent: string) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
 	pruneBoundaryMessageId?: string | null;
 }
 

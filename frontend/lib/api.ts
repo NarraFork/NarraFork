@@ -486,10 +486,10 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/regenerate/${messageId}`, {
 			method: "POST",
 		}),
-	editAndRegenerate: (narratorId: string, messageId: string, content: string) =>
+	editAndRegenerate: (narratorId: string, messageId: string, content: string, rollback: boolean) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-and-regenerate/${messageId}`, {
 			method: "POST",
-			body: JSON.stringify({ content }),
+			body: JSON.stringify({ content, rollback }),
 		}),
 	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact`, {

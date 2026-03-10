@@ -525,9 +525,9 @@ export function NarratorPanel({
 	);
 
 	const handleEditAndRegenerate = useCallback(
-		async (messageId: string, newContent: string) => {
+		async (messageId: string, newContent: string, rollback: boolean) => {
 			try {
-				await api.editAndRegenerate(narratorId, messageId, newContent);
+				await api.editAndRegenerate(narratorId, messageId, newContent, rollback);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
 				notifications.show({ title: t("editFailed"), message, color: "red" });

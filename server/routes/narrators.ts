@@ -55,10 +55,10 @@ import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import { narratorService } from "../services/narrator-service";
 import {
 	closeNarrator,
+	editAndRegenerate,
 	getBufferedMessage,
 	interruptNarrator,
 	isNarratorActive,
-	editAndRegenerate,
 	regenerateFromMessage,
 	resolvePermission,
 	retryLastMessage,
@@ -464,7 +464,7 @@ narratorRoutes.post("/:id/regenerate/:messageId", async (c) => {
 narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const { content } = await c.req.json();
+	const { content, rollback } = await c.req.json();
 
 	if (!content || typeof content !== "string") {
 		throw new ValidationError("content is required");
@@ -487,7 +487,14 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage);
+	const result = await editAndRegenerate(
+		id,
+		messageId,
+		content,
+		locale,
+		replyInUserLanguage,
+		!!rollback,
+	);
 	return c.json(result);
 });
 
