@@ -2602,10 +2602,132 @@ export async function retryLastMessage(
 		throw new NotFoundError("Last user message has no text", narratorId);
 	}
 
-	// Resolve images from the user message's contentJson (if any)
+	// Delete any messages after the last user message (old assistant responses)
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id);
+	if (deletedMessageIds.length > 0) {
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
+			narratorId,
+			deletedMessageIds,
+		});
+	}
+
+	const imageRefs = extractImageRefs(lastMsg.contentJson);
+
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	await narratorService.updateStatus(narratorId, "thinking");
+
+	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
+	});
+
+	return { ok: true };
+}
+
+/**
+ * Regenerate from a specific message.
+ * - If the target is a user message: delete everything after it, re-run agent loop with its text.
+ * - If the target is an assistant message: find the preceding user message,
+ *   delete the assistant message and everything after it, re-run agent loop.
+ */
+export async function regenerateFromMessage(
+	narratorId: string,
+	messageId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ ok: boolean }> {
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+	});
+	if (!targetRef) throw new NotFoundError("Message", messageId);
+
+	const targetMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (!targetMsg) throw new NotFoundError("Message", messageId);
+
+	let userMsg: typeof targetMsg;
+
+	if (targetMsg.role === "user") {
+		// Delete everything after this user message, then re-run
+		userMsg = targetMsg;
+		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
+		if (deletedMessageIds.length > 0) {
+			broadcastToNarrator(narratorId, {
+				type: "messages_deleted",
+				narratorId,
+				deletedMessageIds,
+			});
+		}
+	} else {
+		// Find the user message before this assistant message
+		const prevUserRef = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					isNull(narratorMessages.parentToolUseId),
+					eq(narratorMessages.role, "user"),
+					sql`${narratorMessageRefs.seq} < ${targetRef.seq}`,
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+
+		if (!prevUserRef.length) {
+			throw new NotFoundError("No preceding user message found", messageId);
+		}
+
+		const prevUser = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, prevUserRef[0].messageId),
+		});
+		if (!prevUser) throw new NotFoundError("User message", prevUserRef[0].messageId);
+
+		userMsg = prevUser;
+
+		// Delete the target assistant message and everything after it
+		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
+			narratorId,
+			prevUser.id,
+		);
+		if (deletedMessageIds.length > 0) {
+			broadcastToNarrator(narratorId, {
+				type: "messages_deleted",
+				narratorId,
+				deletedMessageIds,
+			});
+		}
+	}
+
+	const prompt = userMsg.contentText ?? "";
+	if (!prompt.trim()) {
+		throw new NotFoundError("User message has no text", narratorId);
+	}
+
+	const imageRefs = extractImageRefs(userMsg.contentJson);
+
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	await narratorService.updateStatus(narratorId, "thinking");
+
+	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+		logger.error("runAgentLoop unhandled error (regenerate)", { narratorId, error: String(err) });
+	});
+
+	return { ok: true };
+}
+
+/** Extract image refs from a message's contentJson. */
+function extractImageRefs(contentJson: unknown): ImageRef[] {
 	const imageRefs: ImageRef[] = [];
-	if (Array.isArray(lastMsg.contentJson)) {
-		for (const block of lastMsg.contentJson as Array<Record<string, unknown>>) {
+	if (Array.isArray(contentJson)) {
+		for (const block of contentJson as Array<Record<string, unknown>>) {
 			if (
 				block.type === "image" &&
 				typeof block.imageId === "string" &&
@@ -2620,12 +2742,133 @@ export async function retryLastMessage(
 			}
 		}
 	}
+	return imageRefs;
+}
+
+/**
+ * Edit a user message and regenerate the response.
+ * Updates the message content, deletes everything after it, and re-runs the agent loop.
+ * If rollback is true and the narrator is bound to a chapter, resets git to the state
+ * before the original message was sent.
+ */
+export async function editAndRegenerate(
+	narratorId: string,
+	messageId: string,
+	newContent: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	rollback = false,
+): Promise<{ ok: boolean }> {
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+	});
+	if (!targetRef) throw new NotFoundError("Message", messageId);
+
+	const targetMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (!targetMsg) throw new NotFoundError("Message", messageId);
+	if (targetMsg.role !== "user") {
+		throw new NotFoundError("Can only edit user messages", messageId);
+	}
+
+	// If rollback requested, try to reset git to the commit before this message
+	if (rollback) {
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.chapterId) {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				with: { project: true },
+			});
+			if (chapter?.worktreePath && chapter.project?.gitPath) {
+				// Find the commit that was HEAD when this message was created
+				// We look for commits before the message creation time
+				try {
+					const msgCreatedAt = new Date(targetMsg.createdAt).toISOString();
+					// Get the commit that was current before this message
+					const result = await gitService.exec(
+						["log", "--before", msgCreatedAt, "--format=%H", "-1"],
+						chapter.worktreePath,
+					);
+					const commitHash = result.stdout.trim();
+					if (commitHash) {
+						// Reset to that commit (hard reset to discard all changes)
+						await gitService.exec(["reset", "--hard", commitHash], chapter.worktreePath);
+						logger.info("Git rollback completed", {
+							narratorId,
+							chapterId: narrator.chapterId,
+							commitHash,
+						});
+					}
+				} catch (err) {
+					logger.warn("Git rollback failed, continuing without rollback", {
+						narratorId,
+						error: String(err),
+					});
+				}
+			}
+		}
+	}
+
+	// Update the message content
+	const now = new Date().toISOString();
+	const newContentJson = [{ type: "text", text: newContent }];
+
+	// Preserve existing images in contentJson
+	const existingImages = extractImageRefs(targetMsg.contentJson);
+	for (const img of existingImages) {
+		newContentJson.push({
+			type: "image",
+			imageId: img.imageId,
+			filename: img.filename,
+			mediaType: img.mediaType,
+		} as { type: string; text?: string; imageId?: string; filename?: string; mediaType?: string });
+	}
+
+	await db
+		.update(narratorMessages)
+		.set({
+			contentText: newContent,
+			contentJson: newContentJson,
+			updatedAt: now,
+		})
+		.where(eq(narratorMessages.id, messageId));
+
+	// Broadcast the updated message
+	const updatedMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (updatedMsg) {
+		broadcastToNarrator(narratorId, {
+			type: "message_updated",
+			narratorId,
+			message: updatedMsg,
+		});
+	}
+
+	// Delete everything after this message
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
+	if (deletedMessageIds.length > 0) {
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
+			narratorId,
+			deletedMessageIds,
+		});
+	}
+
+	const imageRefs = existingImages;
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "thinking");
 
-	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
-		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
+	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
+			narratorId,
+			error: String(err),
+		});
 	});
 
 	return { ok: true };

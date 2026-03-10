@@ -482,6 +482,15 @@ export const api = {
 	},
 	retryLastMessage: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
+	regenerateFromMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/regenerate/${messageId}`, {
+			method: "POST",
+		}),
+	editAndRegenerate: (narratorId: string, messageId: string, content: string, rollback: boolean) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-and-regenerate/${messageId}`, {
+			method: "POST",
+			body: JSON.stringify({ content, rollback }),
+		}),
 	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact`, {
 			method: "POST",

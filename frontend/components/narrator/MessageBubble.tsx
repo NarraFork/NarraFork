@@ -76,6 +76,12 @@ interface MessageBubbleProps {
 	onQuestionDeny?: (requestId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onRegenerateFromMessage?: (messageId: string) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
+	/** Whether this is the last user message in the conversation */
+	isLastUserMessage?: boolean;
+	/** Whether the narrator is bound to a chapter (has git support) */
+	hasChapter?: boolean;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -793,12 +799,62 @@ export const MessageBubble = memo(function MessageBubble({
 	onQuestionDeny,
 	onCompactBeforeMessage,
 	onDeleteBlock,
+	onRegenerateFromMessage,
+	onEditAndRegenerate,
+	isLastUserMessage,
+	hasChapter,
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const _msgId = message.id;
+
+	// Edit mode state for user messages
+	const [isEditing, setIsEditing] = useState(false);
+	const [editContent, setEditContent] = useState("");
+	const [showConfirmModal, setShowConfirmModal] = useState(false);
+
+	// Initialize edit content when entering edit mode
+	const startEditing = useCallback(() => {
+		const textBlocks = blocks.filter((b: { type: string }) => b.type === "text");
+		const fullText = textBlocks
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			.map((b: any) => b.text)
+			.join("\n\n");
+		setEditContent(fullText);
+		setIsEditing(true);
+	}, [blocks]);
+
+	const cancelEditing = useCallback(() => {
+		setIsEditing(false);
+		setEditContent("");
+		setShowConfirmModal(false);
+	}, []);
+
+	const handleConfirmClick = useCallback(() => {
+		if (!editContent.trim()) return;
+		// If this is the last user message, no confirmation needed
+		if (isLastUserMessage) {
+			if (!message.id || !onEditAndRegenerate) return;
+			onEditAndRegenerate(message.id, editContent.trim(), false);
+			setIsEditing(false);
+			setEditContent("");
+			return;
+		}
+		setShowConfirmModal(true);
+	}, [editContent, isLastUserMessage, message.id, onEditAndRegenerate]);
+
+	const submitEdit = useCallback(
+		(rollback: boolean) => {
+			if (!message.id || !onEditAndRegenerate || !editContent.trim()) return;
+			onEditAndRegenerate(message.id, editContent.trim(), rollback);
+			setIsEditing(false);
+			setEditContent("");
+			setShowConfirmModal(false);
+		},
+		[message.id, onEditAndRegenerate, editContent],
+	);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
@@ -822,6 +878,12 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgId && onDeleteBlock) {
 			actions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
+		if (msgId && onRegenerateFromMessage) {
+			actions.onRegenerateFromMessage = () => onRegenerateFromMessage(msgId);
+		}
+		if (isUser && msgId && onEditAndRegenerate) {
+			actions.onEditMessage = startEditing;
+		}
 		return actions;
 	}, [
 		isUser,
@@ -830,6 +892,9 @@ export const MessageBubble = memo(function MessageBubble({
 		onForkFromMessage,
 		onCompactBeforeMessage,
 		onDeleteBlock,
+		onRegenerateFromMessage,
+		onEditAndRegenerate,
+		startEditing,
 	]);
 
 	// Merge summary cards — rendered for both role="system" (legacy) and role="user"
@@ -955,6 +1020,96 @@ export const MessageBubble = memo(function MessageBubble({
 			.map((b: any) => b.text)
 			.join("\n\n");
 		const hasCommand = !!message.commandText;
+
+		// Edit mode UI
+		if (isEditing) {
+			return (
+				<>
+					<Paper
+						p="sm"
+						radius="md"
+						style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
+					>
+						<Stack gap="xs">
+							<Group gap={6}>
+								{message.creator && (
+									<UserAvatar
+										username={message.creator.username}
+										avatarColor={message.creator.avatarColor}
+										avatarImageId={message.creator.avatarImageId}
+										userId={message.creator.id}
+										size={20}
+										showTooltip={false}
+									/>
+								)}
+								<Text size="xs" fw={600} c="indigo">
+									{message.creator?.username ?? t("you")}
+								</Text>
+							</Group>
+							<Textarea
+								value={editContent}
+								onChange={(e) => setEditContent(e.currentTarget.value)}
+								autosize
+								minRows={2}
+								maxRows={10}
+							/>
+							<Group gap="xs" justify="flex-end">
+								<Button size="xs" variant="subtle" onClick={cancelEditing}>
+									{t("editCancel")}
+								</Button>
+								<Button size="xs" onClick={handleConfirmClick} disabled={!editContent.trim()}>
+									{t("editSubmit")}
+								</Button>
+							</Group>
+						</Stack>
+					</Paper>
+					<Modal
+						opened={showConfirmModal}
+						onClose={() => setShowConfirmModal(false)}
+						title={t("editConfirmTitle")}
+						centered
+						size="sm"
+					>
+						<Stack gap="md">
+							{hasChapter ? (
+								<>
+									<Text size="sm">{t("editConfirmDesc")}</Text>
+									<Stack gap="xs">
+										<Button fullWidth onClick={() => submitEdit(false)}>
+											{t("editConfirmKeep")}
+										</Button>
+										<Button
+											fullWidth
+											variant="light"
+											color="orange"
+											onClick={() => submitEdit(true)}
+										>
+											{t("editConfirmRollback")}
+										</Button>
+										<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+											{t("editCancel")}
+										</Button>
+									</Stack>
+								</>
+							) : (
+								<>
+									<Text size="sm">{t("editConfirmStandaloneDesc")}</Text>
+									<Stack gap="xs">
+										<Button fullWidth onClick={() => submitEdit(false)}>
+											{t("editConfirmProceed")}
+										</Button>
+										<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+											{t("editCancel")}
+										</Button>
+									</Stack>
+								</>
+							)}
+						</Stack>
+					</Modal>
+				</>
+			);
+		}
+
 		return (
 			<MessageContextMenuCtx.Provider value={ctxActions}>
 				<ContentViewer content={fullText} markdown contentType="markdown" blockIndex={0}>

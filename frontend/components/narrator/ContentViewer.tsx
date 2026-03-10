@@ -6,8 +6,10 @@ import {
 	IconCode,
 	IconCopy,
 	IconDeviceMobileRotated,
+	IconEdit,
 	IconGitFork,
 	IconMarkdown,
+	IconRefresh,
 	IconTextWrap,
 	IconTextWrapDisabled,
 	IconTrash,
@@ -520,7 +522,31 @@ export const ContentViewer = memo(
 										</Menu.Item>
 										{(msgCtx.onForkFromMessage ||
 											msgCtx.onCompactBeforeMessage ||
-											msgCtx.onDeleteBlock) && <Menu.Divider />}
+											msgCtx.onDeleteBlock ||
+											msgCtx.onRegenerateFromMessage ||
+											msgCtx.onEditMessage) && <Menu.Divider />}
+										{msgCtx.onEditMessage && (
+											<Menu.Item
+												leftSection={<IconEdit size={14} />}
+												onClick={() => {
+													msgCtx.onEditMessage?.();
+													swipe.closeSwipe();
+												}}
+											>
+												{tNarrator("contextMenu_edit")}
+											</Menu.Item>
+										)}
+										{msgCtx.onRegenerateFromMessage && (
+											<Menu.Item
+												leftSection={<IconRefresh size={14} />}
+												onClick={() => {
+													msgCtx.onRegenerateFromMessage?.();
+													swipe.closeSwipe();
+												}}
+											>
+												{tNarrator("contextMenu_regenerate")}
+											</Menu.Item>
+										)}
 										{msgCtx.onForkFromMessage && (
 											<Menu.Item
 												leftSection={<IconGitFork size={14} />}
@@ -697,7 +723,22 @@ export const ContentViewer = memo(
 						</Menu.Item>
 						{(msgCtx.onForkFromMessage ||
 							msgCtx.onCompactBeforeMessage ||
-							msgCtx.onDeleteBlock) && <Menu.Divider />}
+							msgCtx.onDeleteBlock ||
+							msgCtx.onRegenerateFromMessage ||
+							msgCtx.onEditMessage) && <Menu.Divider />}
+						{msgCtx.onEditMessage && (
+							<Menu.Item leftSection={<IconEdit size={14} />} onClick={msgCtx.onEditMessage}>
+								{tNarrator("contextMenu_edit")}
+							</Menu.Item>
+						)}
+						{msgCtx.onRegenerateFromMessage && (
+							<Menu.Item
+								leftSection={<IconRefresh size={14} />}
+								onClick={msgCtx.onRegenerateFromMessage}
+							>
+								{tNarrator("contextMenu_regenerate")}
+							</Menu.Item>
+						)}
 						{msgCtx.onForkFromMessage && (
 							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
 								{tNarrator("contextMenu_fork")}

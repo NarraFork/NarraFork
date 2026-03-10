@@ -1396,6 +1396,98 @@ export const narratorService = {
 	},
 
 	/**
+	 * Delete all messages strictly AFTER the given message (by seq order).
+	 * The target message itself is preserved.
+	 * Returns the list of deleted message IDs for WS broadcast.
+	 */
+	async deleteMessagesAfter(narratorId: string, messageId: string) {
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!targetRef) throw new NotFoundError("Message", messageId);
+
+		const refsToRemove = await db
+			.select({
+				id: narratorMessageRefs.id,
+				messageId: narratorMessageRefs.messageId,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gt(narratorMessageRefs.seq, targetRef.seq),
+				),
+			);
+
+		if (refsToRemove.length === 0) return { deletedCount: 0, deletedMessageIds: [] };
+
+		const refIds = refsToRemove.map((r) => r.id);
+		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
+
+		await db.transaction(async (tx) => {
+			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
+
+			const orphanRows = await tx
+				.select({ id: narratorMessages.id })
+				.from(narratorMessages)
+				.where(
+					and(
+						inArray(narratorMessages.id, messageIds),
+						sql`NOT EXISTS (
+							SELECT 1 FROM narrator_message_refs nmr
+							WHERE nmr.message_id = ${narratorMessages.id}
+						)`,
+					),
+				);
+
+			const orphanIds = orphanRows.map((r) => r.id);
+			if (orphanIds.length > 0) {
+				const orphanMsgs = await tx
+					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+					.from(narratorMessages)
+					.where(inArray(narratorMessages.id, orphanIds));
+
+				const toolUseIds: string[] = [];
+				for (const msg of orphanMsgs) {
+					const blocks = Array.isArray(msg.contentJson)
+						? (msg.contentJson as { type: string; id?: string }[])
+						: [];
+					for (const b of blocks) {
+						if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
+					}
+				}
+
+				if (toolUseIds.length > 0) {
+					const childRows = await tx
+						.select({ id: narratorMessages.id })
+						.from(narratorMessages)
+						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
+					for (const c of childRows) orphanIds.push(c.id);
+				}
+
+				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
+				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+			}
+
+			const now = new Date().toISOString();
+			await tx
+				.update(narrators)
+				.set({
+					apiConversationId: null,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+
+		return { deletedCount: refsToRemove.length, deletedMessageIds: messageIds };
+	},
+
+	/**
 	 * Delete a single content block from a message by index.
 	 * If the message becomes empty after removal, the entire message is deleted
 	 * (without cascading to subsequent messages).

@@ -512,6 +512,30 @@ export function NarratorPanel({
 		[narratorId, t],
 	);
 
+	const handleRegenerate = useCallback(
+		async (messageId: string) => {
+			try {
+				await api.regenerateFromMessage(narratorId, messageId);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to regenerate";
+				notifications.show({ title: t("regenerateFailed"), message, color: "red" });
+			}
+		},
+		[narratorId, t],
+	);
+
+	const handleEditAndRegenerate = useCallback(
+		async (messageId: string, newContent: string, rollback: boolean) => {
+			try {
+				await api.editAndRegenerate(narratorId, messageId, newContent, rollback);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
+				notifications.show({ title: t("editFailed"), message, color: "red" });
+			}
+		},
+		[narratorId, t],
+	);
+
 	// --- Input management ---
 	const [input, setInput] = useState(
 		() => sessionStorage.getItem(`narrafork_draft_${narratorId}`) ?? "",
@@ -910,6 +934,22 @@ export function NarratorPanel({
 		!String(lastMessage.id).startsWith("optimistic-") &&
 		(narrator?.status === "idle" || narrator?.status === "done" || narrator?.status === "error");
 
+	// Find the last user message ID for edit confirmation logic
+	const lastUserMessageId = useMemo(() => {
+		if (!hydrated || !messagesData?.pages) return undefined;
+		for (const page of messagesData.pages) {
+			for (let i = page.messages.length - 1; i >= 0; i--) {
+				const msg = page.messages[i];
+				if (msg?.role === "user" && !String(msg.id).startsWith("optimistic-")) {
+					return msg.id;
+				}
+			}
+		}
+		return undefined;
+	}, [hydrated, messagesData]);
+
+	const hasChapter = !!narrator?.chapterId;
+
 	// --- Fork handler ---
 	// Standalone narrators: fork narrator directly (no git involved)
 	const handleStandaloneFork = useCallback(
@@ -996,7 +1036,11 @@ export function NarratorPanel({
 					showTokenUsage={showTokenUsage}
 					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
+					onRegenerateFromMessage={handleRegenerate}
+					onEditAndRegenerate={handleEditAndRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
+					lastUserMessageId={lastUserMessageId}
+					hasChapter={hasChapter}
 				/>
 			));
 		}
@@ -1020,7 +1064,11 @@ export function NarratorPanel({
 					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
 					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
+					onRegenerateFromMessage={handleRegenerate}
+					onEditAndRegenerate={handleEditAndRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
+					lastUserMessageId={lastUserMessageId}
+					hasChapter={hasChapter}
 				/>,
 			);
 			remaining -= maxMsg;
@@ -1039,7 +1087,11 @@ export function NarratorPanel({
 		showTokenUsage,
 		handleDeleteBlock,
 		handleCompactBefore,
+		handleRegenerate,
+		handleEditAndRegenerate,
 		pruneBoundaryMessageId,
+		lastUserMessageId,
+		hasChapter,
 	]);
 
 	// --- Load older ---

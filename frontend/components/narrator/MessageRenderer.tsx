@@ -201,6 +201,10 @@ export function renderTreeMessages(
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
+	onRegenerateFromMessage?: (messageId: string) => void,
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
+	lastUserMessageId?: string,
+	hasChapter?: boolean,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -258,6 +262,10 @@ export function renderTreeMessages(
 				onQuestionDeny={permCb.onQuestionDeny}
 				onCompactBeforeMessage={onCompactBeforeMessage}
 				onDeleteBlock={onDeleteBlock}
+				onRegenerateFromMessage={onRegenerateFromMessage}
+				onEditAndRegenerate={onEditAndRegenerate}
+				isLastUserMessage={targetMsg.id === lastUserMessageId}
+				hasChapter={hasChapter}
 			/>
 			{showTokenUsage &&
 				(targetMsg.turnUsageJson != null ||
@@ -351,6 +359,10 @@ export function renderTreeMessages(
 								onQuestionDeny={permCb.onQuestionDeny}
 								onCompactBeforeMessage={onCompactBeforeMessage}
 								onDeleteBlock={onDeleteBlock}
+								onRegenerateFromMessage={onRegenerateFromMessage}
+								onEditAndRegenerate={onEditAndRegenerate}
+								isLastUserMessage={msg.id === lastUserMessageId}
+								hasChapter={hasChapter}
 							/>
 						</Box>,
 					);
@@ -526,7 +538,11 @@ interface PageElementsProps {
 	maxMessages?: number;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
+	onRegenerateFromMessage?: (messageId: string) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
 	pruneBoundaryMessageId?: string | null;
+	lastUserMessageId?: string;
+	hasChapter?: boolean;
 }
 
 export const MemoizedPageElements = memo(
@@ -542,7 +558,11 @@ export const MemoizedPageElements = memo(
 		maxMessages,
 		onDeleteBlock,
 		onCompactBeforeMessage,
+		onRegenerateFromMessage,
+		onEditAndRegenerate,
 		pruneBoundaryMessageId,
+		lastUserMessageId,
+		hasChapter,
 	}: PageElementsProps) {
 		const msgs =
 			maxMessages != null && maxMessages < page.messages.length
@@ -562,6 +582,10 @@ export const MemoizedPageElements = memo(
 			t("pruneBoundaryLabel"),
 			onCompactBeforeMessage,
 			onDeleteBlock,
+			onRegenerateFromMessage,
+			onEditAndRegenerate,
+			lastUserMessageId,
+			hasChapter,
 		);
 		return <>{elements}</>;
 	},
@@ -575,6 +599,8 @@ export const MemoizedPageElements = memo(
 		prev.editExpandOverride === next.editExpandOverride &&
 		prev.showTokenUsage === next.showTokenUsage &&
 		prev.maxMessages === next.maxMessages &&
+		prev.lastUserMessageId === next.lastUserMessageId &&
+		prev.hasChapter === next.hasChapter &&
 		prev.pruneBoundaryMessageId === next.pruneBoundaryMessageId,
 );
 
