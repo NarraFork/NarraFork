@@ -1139,6 +1139,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearStreamingState();
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
+			onMessagesDeleted: (deletedMessageIds: string[]) => {
+				// Remove deleted messages from cache
+				const deletedSet = new Set(deletedMessageIds);
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = old.pages.map((page) => ({
+						...page,
+						messages: page.messages.filter(
+							(m: NarratorMsg) => !deletedSet.has(m.id),
+						),
+					}));
+					return { ...old, pages };
+				});
+			},
 			onBackgroundTaskCompleted: (_taskNarratorId, toolUseId, resultPreview) => {
 				// Update the tool call status in cache to reflect completion
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {

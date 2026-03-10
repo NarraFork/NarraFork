@@ -201,6 +201,7 @@ export function renderTreeMessages(
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
+	onRegenerateFromMessage?: (messageId: string) => void,
 ): { elements: React.ReactNode[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
@@ -258,6 +259,7 @@ export function renderTreeMessages(
 				onQuestionDeny={permCb.onQuestionDeny}
 				onCompactBeforeMessage={onCompactBeforeMessage}
 				onDeleteBlock={onDeleteBlock}
+				onRegenerateFromMessage={onRegenerateFromMessage}
 			/>
 			{showTokenUsage &&
 				(targetMsg.turnUsageJson != null ||
@@ -351,6 +353,7 @@ export function renderTreeMessages(
 								onQuestionDeny={permCb.onQuestionDeny}
 								onCompactBeforeMessage={onCompactBeforeMessage}
 								onDeleteBlock={onDeleteBlock}
+								onRegenerateFromMessage={onRegenerateFromMessage}
 							/>
 						</Box>,
 					);
@@ -526,6 +529,7 @@ interface PageElementsProps {
 	maxMessages?: number;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
+	onRegenerateFromMessage?: (messageId: string) => void;
 	pruneBoundaryMessageId?: string | null;
 }
 
@@ -542,6 +546,7 @@ export const MemoizedPageElements = memo(
 		maxMessages,
 		onDeleteBlock,
 		onCompactBeforeMessage,
+		onRegenerateFromMessage,
 		pruneBoundaryMessageId,
 	}: PageElementsProps) {
 		const msgs =
@@ -562,6 +567,7 @@ export const MemoizedPageElements = memo(
 			t("pruneBoundaryLabel"),
 			onCompactBeforeMessage,
 			onDeleteBlock,
+			onRegenerateFromMessage,
 		);
 		return <>{elements}</>;
 	},

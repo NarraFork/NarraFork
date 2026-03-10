@@ -58,6 +58,7 @@ import {
 	getBufferedMessage,
 	interruptNarrator,
 	isNarratorActive,
+	regenerateFromMessage,
 	resolvePermission,
 	retryLastMessage,
 	runCustomCompact,
@@ -430,6 +431,31 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await retryLastMessage(id, locale, replyInUserLanguage);
+	return c.json(result);
+});
+
+// Regenerate from a specific message — delete everything after it and re-run
+narratorRoutes.post("/:id/regenerate/:messageId", async (c) => {
+	const id = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const narrator = await narratorService.getById(id);
+
+	if (
+		narrator.type === "subagent" &&
+		(narrator.status === "thinking" || narrator.status === "waiting")
+	) {
+		throw new ValidationError("Cannot regenerate on a running subagent");
+	}
+
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	const result = await regenerateFromMessage(id, messageId, locale, replyInUserLanguage);
 	return c.json(result);
 });
 

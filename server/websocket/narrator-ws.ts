@@ -89,6 +89,7 @@ export type NarratorServerMessage =
 			usage: number;
 			isSubagent?: boolean;
 	  }
+	| { type: "messages_deleted"; narratorId: string; deletedMessageIds: string[] }
 	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
 	| { type: "narrator_error"; narratorId: string; error: string }
 	| {

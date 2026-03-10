@@ -76,6 +76,7 @@ interface MessageBubbleProps {
 	onQuestionDeny?: (requestId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onRegenerateFromMessage?: (messageId: string) => void;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -793,6 +794,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onQuestionDeny,
 	onCompactBeforeMessage,
 	onDeleteBlock,
+	onRegenerateFromMessage,
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
@@ -822,6 +824,9 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgId && onDeleteBlock) {
 			actions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
+		if (msgId && onRegenerateFromMessage) {
+			actions.onRegenerateFromMessage = () => onRegenerateFromMessage(msgId);
+		}
 		return actions;
 	}, [
 		isUser,
@@ -830,6 +835,7 @@ export const MessageBubble = memo(function MessageBubble({
 		onForkFromMessage,
 		onCompactBeforeMessage,
 		onDeleteBlock,
+		onRegenerateFromMessage,
 	]);
 
 	// Merge summary cards — rendered for both role="system" (legacy) and role="user"

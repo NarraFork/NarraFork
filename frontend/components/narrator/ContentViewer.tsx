@@ -8,6 +8,7 @@ import {
 	IconDeviceMobileRotated,
 	IconGitFork,
 	IconMarkdown,
+	IconRefresh,
 	IconTextWrap,
 	IconTextWrapDisabled,
 	IconTrash,
@@ -520,7 +521,19 @@ export const ContentViewer = memo(
 										</Menu.Item>
 										{(msgCtx.onForkFromMessage ||
 											msgCtx.onCompactBeforeMessage ||
-											msgCtx.onDeleteBlock) && <Menu.Divider />}
+											msgCtx.onDeleteBlock ||
+											msgCtx.onRegenerateFromMessage) && <Menu.Divider />}
+										{msgCtx.onRegenerateFromMessage && (
+											<Menu.Item
+												leftSection={<IconRefresh size={14} />}
+												onClick={() => {
+													msgCtx.onRegenerateFromMessage?.();
+													swipe.closeSwipe();
+												}}
+											>
+												{tNarrator("contextMenu_regenerate")}
+											</Menu.Item>
+										)}
 										{msgCtx.onForkFromMessage && (
 											<Menu.Item
 												leftSection={<IconGitFork size={14} />}
@@ -697,7 +710,16 @@ export const ContentViewer = memo(
 						</Menu.Item>
 						{(msgCtx.onForkFromMessage ||
 							msgCtx.onCompactBeforeMessage ||
-							msgCtx.onDeleteBlock) && <Menu.Divider />}
+							msgCtx.onDeleteBlock ||
+							msgCtx.onRegenerateFromMessage) && <Menu.Divider />}
+						{msgCtx.onRegenerateFromMessage && (
+							<Menu.Item
+								leftSection={<IconRefresh size={14} />}
+								onClick={msgCtx.onRegenerateFromMessage}
+							>
+								{tNarrator("contextMenu_regenerate")}
+							</Menu.Item>
+						)}
 						{msgCtx.onForkFromMessage && (
 							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
 								{tNarrator("contextMenu_fork")}
