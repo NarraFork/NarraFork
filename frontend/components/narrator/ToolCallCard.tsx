@@ -26,6 +26,7 @@ import {
 	IconLoader2,
 	IconMap,
 	IconPlayerPlay,
+	IconPlayerStop,
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
@@ -35,7 +36,7 @@ import {
 } from "@tabler/icons-react";
 import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useToolCallDetail } from "../../hooks/useNarrator";
+import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
@@ -71,6 +72,8 @@ export interface ToolCallData {
 	startedAt?: number;
 	/** Optional metadata from the tool (e.g. line numbers for Edit) */
 	_metadata?: Record<string, unknown>;
+	/** Set by watchdog when process has been running ≥60s — shows terminate button */
+	_longRunning?: boolean;
 }
 
 export interface PendingPermission {
@@ -621,6 +624,58 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					language="json"
 				/>
 			)}
+		</Box>
+	);
+}
+
+/**
+ * Terminate button for long-running bash/shell commands.
+ * Rendered outside LazyCollapse so it's always visible without expanding the card.
+ * Uses a local timer to detect ≥60s elapsed — no dependency on WS push.
+ */
+function BashTerminateButton({
+	toolCall,
+	narratorId,
+}: {
+	toolCall: ToolCallData;
+	narratorId?: string;
+}) {
+	const { t: tNarrator } = useTranslation("narrator");
+	const interruptMutation = useInterruptNarrator();
+
+	const isBash = BASH_TOOLS.has(toolCall.toolName);
+	const isRunning = toolCall.status === "running" && !!narratorId;
+
+	// 本地 5s 轮询计算已运行时长。startedAt 来自 tool_started WS 事件，
+	// 由 MessageBubble 从 message.toolCalls 传入。不依赖 WS 的 _longRunning 推送，
+	// 因为 WS 可能因心跳超时断开。
+	const [elapsed, setElapsed] = useState(0);
+	useEffect(() => {
+		if (!isBash || !isRunning || toolCall.startedAt == null) {
+			setElapsed(0);
+			return;
+		}
+		const update = () => setElapsed(Date.now() - (toolCall.startedAt ?? Date.now()));
+		update();
+		const timer = setInterval(update, 5_000);
+		return () => clearInterval(timer);
+	}, [isBash, isRunning, toolCall.startedAt]);
+
+	// 60_000 与后端 LONG_RUNNING_THRESHOLD_MS 保持一致
+	if (!isBash || !isRunning || elapsed < 60_000) return null;
+
+	return (
+		<Box mt={4} mb={2}>
+			<Button
+				size="xs"
+				variant="light"
+				color="red"
+				leftSection={<IconPlayerStop size={14} />}
+				loading={interruptMutation.isPending}
+				onClick={() => narratorId && interruptMutation.mutate(narratorId)}
+			>
+				{tNarrator("terminateProcess")}
+			</Button>
 		</Box>
 	);
 }
@@ -1405,12 +1460,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 		<>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
 			{!isStreaming && (
-				<LazyCollapse in={opened}>
-					<Box style={planStyle}>
-						<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
-					</Box>
-					{permissionUI}
-				</LazyCollapse>
+				<>
+					<BashTerminateButton toolCall={toolCall} narratorId={narratorId} />
+					<LazyCollapse in={opened}>
+						<Box style={planStyle}>
+							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+						</Box>
+						{permissionUI}
+					</LazyCollapse>
+				</>
 			)}
 		</>
 	);

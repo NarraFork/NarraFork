@@ -9,6 +9,8 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
+const WATCHDOG_INTERVAL_MS = 15_000;
+const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
 /** Platform-aware tool name: "Shell" on Windows, "Bash" elsewhere. */
 export const SHELL_TOOL_NAME = IS_WINDOWS ? "Shell" : "Bash";
@@ -177,23 +179,72 @@ export const bashTool: ToolDefinition = {
 				void kill();
 			}, timeoutMs);
 
+			// Watchdog: periodically check process health (Redisson-style renew/kill).
+			// If the process has been running ≥60s, emit a long-running notification
+			// so the UI can show a terminate button.
+			// 看门狗状态：输出增量检测、长时间运行通知去重、异常终止标记
+			let lastOutputLen = 0;
+			let longRunningFired = false;
+			let watchdogKilled = false;
+			const watchdogStart = Date.now();
+			const watchdogTimer = setInterval(() => {
+				if (exited) return;
+
+				const elapsed = Date.now() - watchdogStart;
+				const currentLen = output.length;
+				const hadOutput = currentLen > lastOutputLen;
+				lastOutputLen = currentLen;
+
+				// Check if PID is still alive
+				let pidAlive = false;
+				if (proc.pid) {
+					try {
+						process.kill(proc.pid, 0);
+						pidAlive = true;
+					} catch {
+						pidAlive = false;
+					}
+				}
+
+				// Kill if process is dead and no recent output (zombie/leaked)
+				if (!pidAlive && !hadOutput && !exited) {
+					watchdogKilled = true;
+					void kill();
+					return;
+				}
+
+				// Notify UI once when process exceeds long-running threshold.
+				// ctx.emitLongRunning 由 loop.ts 注入，触发链路：
+				// tool_long_running AgentEvent → narrator-event-handler → WS → 前端终止按钮
+				if (!longRunningFired && elapsed >= LONG_RUNNING_THRESHOLD_MS) {
+					longRunningFired = true;
+					const toolUseId = ctx.currentToolUseId;
+					if (toolUseId) {
+						ctx.emitLongRunning?.(toolUseId, elapsed);
+					}
+				}
+			}, WATCHDOG_INTERVAL_MS);
+
 			// Wait for process to finish
 			try {
 				await exitPromise;
 			} finally {
 				clearTimeout(timer);
+				clearInterval(watchdogTimer);
 				ctx.signal.removeEventListener("abort", abortHandler);
 			}
 
 			// Append metadata about abnormal termination so the LLM knows what happened
 			const meta: string[] = [];
 			if (timedOut) meta.push(`Command timed out after ${timeoutMs}ms`);
+			if (watchdogKilled)
+				meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 			if (aborted) meta.push("Command was aborted by user");
 			if (meta.length > 0) {
 				output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 			}
 
-			const exitCode = proc.exitCode ?? (timedOut || aborted ? 1 : 0);
+			const exitCode = proc.exitCode ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
 			if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 			const truncated = truncateOutput(output || "(no output)");

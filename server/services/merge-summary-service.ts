@@ -12,6 +12,7 @@ import { agentGenerateWithMeta } from "../lib/agent";
 import { logger } from "../lib/logger";
 import { getMergeSummaryLabel, getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
+import { safeSpawn } from "../lib/spawn";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 
@@ -27,8 +28,8 @@ async function getCommitMessages(
 	branch: string,
 	baseBranch: string,
 ): Promise<string[]> {
-	const proc = Bun.spawn(
-		[
+	const result = await safeSpawn({
+		cmd: [
 			"git",
 			"log",
 			`--format=%s`,
@@ -36,11 +37,9 @@ async function getCommitMessages(
 			`${baseBranch}..${branch}`,
 			"--",
 		],
-		{ cwd: gitPath, stdout: "pipe", stderr: "pipe" },
-	);
-	const stdout = await new Response(proc.stdout).text();
-	await proc.exited;
-	return stdout
+		cwd: gitPath,
+	});
+	return result.stdout
 		.trim()
 		.split("\n")
 		.filter((l) => l.trim());
@@ -50,16 +49,13 @@ async function getCommitMessages(
  * Get diff stat summary for a branch relative to its base.
  */
 async function getDiffStat(gitPath: string, branch: string, baseBranch: string): Promise<string> {
-	const proc = Bun.spawn(["git", "diff", "--stat", `${baseBranch}...${branch}`], {
+	const result = await safeSpawn({
+		cmd: ["git", "diff", "--stat", `${baseBranch}...${branch}`],
 		cwd: gitPath,
-		stdout: "pipe",
-		stderr: "pipe",
 	});
-	const stdout = await new Response(proc.stdout).text();
-	await proc.exited;
 	// Take only the summary line (last line) + up to 30 file lines
-	const lines = stdout.trim().split("\n");
-	if (lines.length <= 31) return stdout.trim();
+	const lines = result.stdout.trim().split("\n");
+	if (lines.length <= 31) return result.stdout.trim();
 	return [...lines.slice(0, 30), "...", lines[lines.length - 1]].join("\n");
 }
 

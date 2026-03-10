@@ -351,6 +351,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						...(ext._output !== undefined && { outputJson: ext._output }),
 						...(ext._durationMs != null && { durationMs: ext._durationMs }),
 						...(ext._metadata && { _metadata: ext._metadata }),
+						...(ext._longRunning && { _longRunning: true }),
 					};
 				}
 			} else {
@@ -800,6 +801,34 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						);
 					}
 					return result;
+				});
+			},
+			onToolLongRunning: (toolUseId: string, _elapsed: number) => {
+				// Mark the tool call as long-running so the UI can show a terminate button.
+				// Update both the streaming chunk (if still active) and the query cache.
+
+				// 更新流式 chunk 的 _longRunning 标记，使 topLevelStreamingChunks memo
+				// 重算时传递给 ToolCallCard（streaming 阶段的渲染路径）
+				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+				if (streamingEntry) {
+					topLevelStreamingChunkRef.current.set(toolUseId, {
+						...streamingEntry,
+						_longRunning: true,
+						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+					} as any);
+					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				}
+
+				// 同时更新已持久化的消息缓存，确保 streaming chunk 被清除后
+				// _longRunning 状态仍保留（query cache 渲染路径）
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ _longRunning: true },
+						toolUseIndexRef.current,
+					);
 				});
 			},
 			onToolStarted: (

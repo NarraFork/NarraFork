@@ -37,6 +37,7 @@ function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
 		const result = execSync(`ps -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime= -p ${pid}`, {
 			encoding: "utf-8",
 			stdio: "pipe",
+			timeout: 5000,
 		});
 		const line = result.trim();
 		if (!line) return null;

@@ -570,6 +570,17 @@ export async function processEvent(
 			return null;
 		}
 
+		// 转发看门狗的长时间运行通知到 WS，前端收到后在 ToolCallCard 上显示终止按钮
+		case "tool_long_running": {
+			dualBroadcast(ctx, {
+				type: "tool_long_running",
+				narratorId: broadcastTargetId,
+				toolUseId: event.toolUseId,
+				elapsed: event.elapsed,
+			});
+			return null;
+		}
+
 		case "error": {
 			if (hooks?.onErrorCleanup) {
 				await hooks.onErrorCleanup(event.message);

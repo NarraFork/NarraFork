@@ -1249,6 +1249,14 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		currentToolUseId: tu.toolUseId,
 	};
 
+	// Wire up emitLongRunning: notify UI when a process exceeds 60s
+	if (config.onEvent) {
+		const onEvent = config.onEvent;
+		ctx.emitLongRunning = (toolUseId: string, elapsed: number) => {
+			onEvent({ type: "tool_long_running", toolUseId, elapsed });
+		};
+	}
+
 	// Wire up emitOutput: throttled streaming of tool output to the UI
 	let pendingOutputTimer: ReturnType<typeof setTimeout> | undefined;
 	if (config.onEvent) {
