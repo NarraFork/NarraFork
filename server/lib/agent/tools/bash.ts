@@ -194,22 +194,12 @@ export const bashTool: ToolDefinition = {
 				const hadOutput = currentLen > lastOutputLen;
 				lastOutputLen = currentLen;
 
-				// Check if PID is still alive (cross-platform)
+				// Check if PID is still alive
 				let pidAlive = false;
 				if (proc.pid) {
 					try {
-						if (process.platform === "win32") {
-							// On Windows, process.kill(pid, 0) is unreliable.
-							// Use tasklist for accurate check.
-							const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${proc.pid}`, "/NH"], {
-								stdout: "pipe",
-								stderr: "ignore",
-							});
-							pidAlive = result.stdout.toString().includes(String(proc.pid));
-						} else {
-							process.kill(proc.pid, 0);
-							pidAlive = true;
-						}
+						process.kill(proc.pid, 0);
+						pidAlive = true;
 					} catch {
 						pidAlive = false;
 					}

@@ -76,19 +76,12 @@ export interface SafeSpawnOptions {
 
 /**
  * Check whether a PID is still alive.
- * On Windows uses `tasklist`, on Unix uses `kill -0`.
+ * Uses `process.kill(pid, 0)` which works cross-platform:
+ * signal 0 doesn't send a real signal — it just checks if the process exists.
+ * Throws ESRCH if the process doesn't exist (both Unix and Windows).
  */
 function isPidAlive(pid: number): boolean {
 	try {
-		if (process.platform === "win32") {
-			const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
-				stdout: "pipe",
-				stderr: "ignore",
-			});
-			const out = result.stdout.toString();
-			return out.includes(String(pid));
-		}
-		// Unix: kill -0 checks existence without sending a signal
 		process.kill(pid, 0);
 		return true;
 	} catch {
