@@ -1149,7 +1149,10 @@ export const MessageBubble = memo(function MessageBubble({
 							errorMessage: tc?.errorMessage,
 							permissionDecisionReason: tc?.permissionDecisionReason,
 							permissionSuggestions: tc?.permissionSuggestions,
+							// startedAt: 工具开始执行的时间戳（由 mergeFieldsByIndex 写入），
+							// 用于 BashTerminateButton 本地计时器计算已运行时长
 							startedAt: tc?.startedAt,
+							// _longRunning: 由 WS tool_long_running 事件通过 mergeFieldsByIndex 设置
 							_longRunning: tc?._longRunning,
 						};
 						const perm = resolvePerm?.(toolCallData) ?? null;

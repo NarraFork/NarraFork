@@ -646,6 +646,9 @@ function BashTerminateButton({
 	const isBash = BASH_TOOLS.has(toolCall.toolName);
 	const isRunning = toolCall.status === "running" && !!narratorId;
 
+	// 本地 5s 轮询计算已运行时长。startedAt 来自 tool_started WS 事件，
+	// 由 MessageBubble 从 message.toolCalls 传入。不依赖 WS 的 _longRunning 推送，
+	// 因为 WS 可能因心跳超时断开。
 	const [elapsed, setElapsed] = useState(0);
 	useEffect(() => {
 		if (!isBash || !isRunning || toolCall.startedAt == null) {
@@ -658,6 +661,7 @@ function BashTerminateButton({
 		return () => clearInterval(timer);
 	}, [isBash, isRunning, toolCall.startedAt]);
 
+	// 60_000 与后端 LONG_RUNNING_THRESHOLD_MS 保持一致
 	if (!isBash || !isRunning || elapsed < 60_000) return null;
 
 	return (

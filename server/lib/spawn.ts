@@ -118,7 +118,8 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		} catch {
 			/* already gone */
 		}
-		// On Windows, also try taskkill to clean up the entire process tree
+		// Windows: proc.kill() 只终止主进程，不会杀子进程树。
+		// taskkill /T /F 确保整个进程树被清理（如 sh.exe → git.exe 链）。
 		if (process.platform === "win32" && proc.pid) {
 			try {
 				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
@@ -190,7 +191,8 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 				return;
 			}
 
-			// Fire onLongRunning once after ≥60s
+			// 60s 阈值后触发一次回调，通知调用方进程长时间运行。
+			// 在 agent 工具层中，此回调经 事件总线 → WS 推送到前端显示终止按钮。
 			if (!longRunningFired && elapsed >= 60_000 && opts.onLongRunning) {
 				longRunningFired = true;
 				opts.onLongRunning(elapsed);
@@ -199,8 +201,9 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 	}
 
 	try {
-		// Drain both streams in parallel, then await exit.
-		// This order is critical: reading streams first prevents pipe-buffer deadlock.
+		// 关键：先并行读完 stdout/stderr 再 await exit。
+		// Windows 管道缓冲区仅 4KB，如果不先消费输出，子进程 write() 会阻塞，
+		// 而 await proc.exited 又在等子进程退出 → 死锁。
 		const [stdout, stderr] = await Promise.all([
 			drainStream(proc.stdout, trackOutput),
 			drainStream(proc.stderr, trackOutput),
@@ -242,6 +245,7 @@ async function drainStream(
 			if (done) break;
 			const text = decoder.decode(value, { stream: true });
 			chunks.push(text);
+			// onChunk 回调更新 currentOutputLength，供看门狗判断进程是否仍有输出
 			onChunk(text);
 		}
 		// Flush any remaining bytes

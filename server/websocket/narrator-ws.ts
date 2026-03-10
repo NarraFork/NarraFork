@@ -39,6 +39,7 @@ export type NarratorServerMessage =
 	| { type: "status_change"; narratorId: string; status: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; narratorId: string; toolUseId: string; output: string }
+	// 看门狗检测到 bash/shell 进程运行 ≥60s 时推送，前端据此显示终止按钮
 	| { type: "tool_long_running"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_completed";

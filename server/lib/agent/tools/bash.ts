@@ -182,6 +182,7 @@ export const bashTool: ToolDefinition = {
 			// Watchdog: periodically check process health (Redisson-style renew/kill).
 			// If the process has been running ≥60s, emit a long-running notification
 			// so the UI can show a terminate button.
+			// 看门狗状态：输出增量检测、长时间运行通知去重、异常终止标记
 			let lastOutputLen = 0;
 			let longRunningFired = false;
 			let watchdogKilled = false;
@@ -212,7 +213,9 @@ export const bashTool: ToolDefinition = {
 					return;
 				}
 
-				// Notify UI once when process exceeds long-running threshold
+				// Notify UI once when process exceeds long-running threshold.
+				// ctx.emitLongRunning 由 loop.ts 注入，触发链路：
+				// tool_long_running AgentEvent → narrator-event-handler → WS → 前端终止按钮
 				if (!longRunningFired && elapsed >= LONG_RUNNING_THRESHOLD_MS) {
 					longRunningFired = true;
 					const toolUseId = ctx.currentToolUseId;

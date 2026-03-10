@@ -806,6 +806,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onToolLongRunning: (toolUseId: string, _elapsed: number) => {
 				// Mark the tool call as long-running so the UI can show a terminate button.
 				// Update both the streaming chunk (if still active) and the query cache.
+
+				// 更新流式 chunk 的 _longRunning 标记，使 topLevelStreamingChunks memo
+				// 重算时传递给 ToolCallCard（streaming 阶段的渲染路径）
 				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
 				if (streamingEntry) {
 					topLevelStreamingChunkRef.current.set(toolUseId, {
@@ -816,6 +819,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					bumpTopLevelStreamingChunksVersion((v) => v + 1);
 				}
 
+				// 同时更新已持久化的消息缓存，确保 streaming chunk 被清除后
+				// _longRunning 状态仍保留（query cache 渲染路径）
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(

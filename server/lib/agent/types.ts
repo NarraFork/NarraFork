@@ -110,6 +110,7 @@ export type AgentEvent =
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
+	// 由 bash 工具看门狗在进程运行 ≥60s 时触发，经 event-handler → WS 推送到前端显示终止按钮
 	| { type: "tool_long_running"; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_use_chunk";
