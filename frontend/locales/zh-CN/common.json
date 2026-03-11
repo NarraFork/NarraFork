@@ -180,5 +180,16 @@
 	"unexpectedError": "发生了意外错误",
 	"somethingWentWrong": "出了点问题",
 	"retry": "重试",
-	"backToHome": "返回首页"
+	"backToHome": "返回首页",
+	"homeDirectory": "主目录",
+	"rootDirectory": "根目录",
+	"desktop": "桌面",
+	"documents": "文档",
+	"downloads": "下载",
+	"refresh": "刷新",
+	"showHiddenDirs": "显示隐藏目录",
+	"hideHiddenDirs": "隐藏隐藏目录",
+	"editPath": "编辑路径",
+	"quickAccess": "快捷访问",
+	"pathBarPlaceholder": "输入路径..."
 }

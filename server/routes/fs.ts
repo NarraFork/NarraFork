@@ -9,14 +9,17 @@ import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
 export const fsRoutes = new Hono();
 
 /**
- * GET /api/fs/browse?path=...
+ * GET /api/fs/browse?path=...&showHidden=1
  *
  * List directories under the given path. If no path is provided, returns
  * the user's home directory contents. On Windows with no path, also
  * returns available drive letters as top-level entries.
+ *
+ * Pass showHidden=1 to include hidden directories (dotfiles on Unix).
  */
 fsRoutes.get("/browse", (c) => {
 	const rawPath = c.req.query("path");
+	const showHidden = c.req.query("showHidden") === "1";
 	const isWin = process.platform === "win32";
 	const drives = isWin ? getWindowsDrives() : [];
 
@@ -26,7 +29,7 @@ fsRoutes.get("/browse", (c) => {
 			return c.json({ path: null, entries: [], drives, sep });
 		}
 		const home = homedir();
-		const entries = listDirs(home);
+		const entries = listDirs(home, showHidden);
 		const parent = getParent(home, isWin);
 		return c.json({ path: home, entries, drives, parent, sep });
 	}
@@ -46,11 +49,45 @@ fsRoutes.get("/browse", (c) => {
 		throw new ValidationError(`Cannot access: ${absPath}`);
 	}
 
-	const entries = listDirs(absPath);
+	const entries = listDirs(absPath, showHidden);
 	// Compute parent (null if at root)
 	const parent = getParent(absPath, isWin);
 
 	return c.json({ path: absPath, entries, drives, parent, sep });
+});
+
+/**
+ * GET /api/fs/shortcuts
+ *
+ * Return well-known quick-access directories (home, desktop, documents, downloads, root).
+ * Only includes paths that actually exist on the system.
+ */
+fsRoutes.get("/shortcuts", (c) => {
+	const home = homedir();
+	const isWin = process.platform === "win32";
+
+	const candidates: { key: string; path: string }[] = [
+		{ key: "home", path: home },
+		{ key: "desktop", path: join(home, "Desktop") },
+		{ key: "documents", path: join(home, "Documents") },
+		{ key: "downloads", path: join(home, "Downloads") },
+	];
+
+	if (!isWin) {
+		candidates.push({ key: "root", path: "/" });
+	}
+
+	const shortcuts = candidates.filter((c) => {
+		try {
+			return existsSync(c.path) && statSync(c.path).isDirectory();
+		} catch {
+			return false;
+		}
+	});
+
+	const drives = isWin ? getWindowsDrives() : [];
+
+	return c.json({ shortcuts, drives, sep });
 });
 
 /**
@@ -131,14 +168,15 @@ fsRoutes.post("/reveal", async (c) => {
 });
 
 /** List immediate subdirectories of a path. */
-function listDirs(dir: string): { name: string; path: string }[] {
+function listDirs(dir: string, showHidden = false): { name: string; path: string }[] {
 	try {
 		const items = readdirSync(dir, { withFileTypes: true });
 		return items
 			.filter((d) => {
 				if (!d.isDirectory()) return false;
-				// Skip hidden dirs on Unix, skip system dirs on Windows
-				if (d.name.startsWith(".")) return false;
+				// Skip hidden dirs on Unix unless showHidden is true
+				if (!showHidden && d.name.startsWith(".")) return false;
+				// Always skip system dirs on Windows
 				if (d.name === "$RECYCLE.BIN" || d.name === "System Volume Information") return false;
 				return true;
 			})

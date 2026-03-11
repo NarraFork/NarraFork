@@ -1620,14 +1620,26 @@ export const api = {
 		}>(`/dependencies/${name}/install`, { method: "POST" }),
 
 	// Filesystem browsing
-	fsBrowse: (path?: string) =>
-		request<{
+	fsBrowse: (path?: string, opts?: { showHidden?: boolean }) => {
+		const params = new URLSearchParams();
+		if (path) params.set("path", path);
+		if (opts?.showHidden) params.set("showHidden", "1");
+		const qs = params.toString();
+		return request<{
 			path: string | null;
 			entries: Array<{ name: string; path: string }>;
 			drives?: Array<{ name: string; path: string }>;
 			parent?: string | null;
 			sep: string;
-		}>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+		}>(`/fs/browse${qs ? `?${qs}` : ""}`);
+	},
+
+	fsShortcuts: () =>
+		request<{
+			shortcuts: Array<{ key: string; path: string }>;
+			drives?: Array<{ name: string; path: string }>;
+			sep: string;
+		}>("/fs/shortcuts"),
 
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {

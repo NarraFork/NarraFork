@@ -180,5 +180,16 @@
 	"unexpectedError": "An unexpected error occurred",
 	"somethingWentWrong": "Something went wrong",
 	"retry": "Retry",
-	"backToHome": "Back to Home"
+	"backToHome": "Back to Home",
+	"homeDirectory": "Home",
+	"rootDirectory": "Root",
+	"desktop": "Desktop",
+	"documents": "Documents",
+	"downloads": "Downloads",
+	"refresh": "Refresh",
+	"showHiddenDirs": "Show hidden directories",
+	"hideHiddenDirs": "Hide hidden directories",
+	"editPath": "Edit path",
+	"quickAccess": "Quick Access",
+	"pathBarPlaceholder": "Enter path..."
 }

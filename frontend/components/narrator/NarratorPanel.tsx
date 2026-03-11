@@ -83,7 +83,7 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type TreeMessage } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
-import { PathInput } from "../common/PathInput";
+import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { UserAvatar } from "../UserAvatar";
 import { ChapterBar } from "./ChapterBar";
@@ -299,7 +299,7 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 					</ActionIcon>
 				</Group>
 			))}
-			<PathInput
+			<PathInputWithBrowse
 				placeholder={t("whitelist_dirs_placeholder")}
 				onConfirm={(path) => createWl.mutate({ narratorId, path })}
 			/>
@@ -358,7 +358,7 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 					</ActionIcon>
 				</Group>
 			))}
-			<PathInput
+			<PathInputWithBrowse
 				placeholder={t("blacklist_dirs_placeholder")}
 				onConfirm={(path) => createBl.mutate({ narratorId, path })}
 			/>
