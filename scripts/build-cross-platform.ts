@@ -39,6 +39,7 @@ const PLATFORMS = [
 	{ target: "bun-linux-x64-baseline", name: `narrafork-${VERSION}-linux-x64-baseline` },
 	{ target: "bun-linux-arm64", name: `narrafork-${VERSION}-linux-arm64` },
 	{ target: "bun-windows-x64", name: `narrafork-${VERSION}-windows-x64.exe` },
+	{ target: "bun-windows-x64-baseline", name: `narrafork-${VERSION}-windows-x64-baseline.exe` },
 ];
 
 const selectedPlatforms = platformArg
