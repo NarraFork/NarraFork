@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.0.8",
+	"version": "0.0.9",
 	"private": true,
 	"scripts": {
 		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
@@ -63,6 +63,7 @@
 		"react-i18next": "^16.5.4",
 		"react-markdown": "^10.1.0",
 		"remark-gfm": "^4.0.1",
+		"sharp": "^0.34.5",
 		"shiki": "^4.0.1",
 		"tree-sitter-bash": "0.25.0",
 		"web-tree-sitter": "0.25.10",
@@ -75,6 +76,7 @@
 		"@types/dagre": "^0.7.53",
 		"@types/react": "^19.1.0",
 		"@types/react-dom": "^19.1.0",
+		"@types/sharp": "^0.32.0",
 		"@vitejs/plugin-react": "^4.4.0",
 		"better-sqlite3": "^12.6.2",
 		"drizzle-kit": "^0.31.0",

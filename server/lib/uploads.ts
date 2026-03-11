@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, resolve } from "node:path";
+import sharp from "sharp";
 import { ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
@@ -69,9 +70,54 @@ export function getImagePath(narratorId: string, imageId: string): string | null
 	return filePath;
 }
 
+const MAX_IMAGE_LONG_EDGE = 1568;
+
+/**
+ * Read an image file and return its base64 encoding.
+ * If the image's long edge exceeds MAX_IMAGE_LONG_EDGE, it is downscaled
+ * (preserving aspect ratio) before encoding. GIF is passed through as-is
+ * since sharp doesn't handle animated GIF resize well.
+ */
 export async function imageToBase64(filePath: string): Promise<string> {
-	const buffer = await Bun.file(filePath).arrayBuffer();
-	return Buffer.from(buffer).toString("base64");
+	const buf = Buffer.from(await Bun.file(filePath).arrayBuffer());
+	const ext = extname(filePath).toLowerCase();
+
+	// Skip resize for GIF (may be animated)
+	if (ext === ".gif") {
+		return buf.toString("base64");
+	}
+
+	try {
+		const img = sharp(buf);
+		const meta = await img.metadata();
+		const w = meta.width ?? 0;
+		const h = meta.height ?? 0;
+		const longEdge = Math.max(w, h);
+
+		if (longEdge > MAX_IMAGE_LONG_EDGE) {
+			const resized = await img
+				.resize({
+					width: w >= h ? MAX_IMAGE_LONG_EDGE : undefined,
+					height: h > w ? MAX_IMAGE_LONG_EDGE : undefined,
+					fit: "inside",
+					withoutEnlargement: true,
+				})
+				.toFormat(meta.format === "png" ? "png" : "jpeg", {
+					quality: 85,
+				})
+				.toBuffer();
+			logger.debug("Image resized for AI provider", {
+				filePath,
+				original: `${w}x${h}`,
+				resized: `${resized.length} bytes`,
+			});
+			return resized.toString("base64");
+		}
+	} catch {
+		// If sharp fails (corrupt image, unsupported format), fall through to raw base64
+	}
+
+	return buf.toString("base64");
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {
