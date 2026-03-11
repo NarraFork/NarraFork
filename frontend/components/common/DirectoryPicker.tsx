@@ -46,6 +46,7 @@ interface DirectoryPickerProps {
 	label?: string;
 	placeholder?: string;
 	description?: string;
+	error?: string;
 	required?: boolean;
 	disabled?: boolean;
 	/** Extra element rendered before the browse button in rightSection */
@@ -59,6 +60,7 @@ export function DirectoryPicker({
 	label,
 	placeholder,
 	description,
+	error,
 	required,
 	disabled,
 	rightSectionExtra,
@@ -102,6 +104,7 @@ export function DirectoryPicker({
 				label={label}
 				placeholder={placeholder}
 				description={description}
+				error={error}
 				required={required}
 				disabled={disabled}
 				value={value}
