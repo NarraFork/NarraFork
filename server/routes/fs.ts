@@ -263,10 +263,18 @@ function parseXdgUserDirs(home: string): Record<string, string> {
 	return _xdgCache;
 }
 
-/** Windows Known Folder GUIDs for Desktop, Documents, Downloads. */
-const WINDOWS_KNOWN_FOLDERS: Record<string, string> = {
-	desktop: "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
-	documents: "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+/**
+ * Mapping from our key names to Windows SpecialFolder enum names.
+ * Note: "Documents" is "MyDocuments" in the enum; "Downloads" has no enum entry.
+ */
+const WINDOWS_SPECIAL_FOLDER: Record<string, string | null> = {
+	desktop: "Desktop",
+	documents: "MyDocuments",
+	downloads: null, // No SpecialFolder enum for Downloads
+};
+
+/** Known Folder GUIDs — used as fallback for folders not in SpecialFolder enum. */
+const WINDOWS_KNOWN_FOLDER_GUID: Record<string, string> = {
 	downloads: "{374DE290-123F-4565-9164-39C4925E467B}",
 };
 
@@ -275,32 +283,57 @@ const _winFolderCache: Record<string, string | null> = {};
 
 /**
  * Resolve a Windows Known Folder path via PowerShell.
- * Falls back to home + English name if PowerShell fails.
+ *
+ * Strategy:
+ * 1. Try Environment.GetFolderPath with the correct SpecialFolder enum name
+ * 2. For Downloads (no enum), use Shell.Application COM object with GUID
+ * 3. Fall back to USERPROFILE\Downloads etc.
  */
 function resolveWindowsKnownFolder(key: string, home: string): string | null {
 	if (key in _winFolderCache) return _winFolderCache[key];
 
-	const guid = WINDOWS_KNOWN_FOLDERS[key];
-	if (!guid) {
-		_winFolderCache[key] = null;
-		return null;
-	}
+	const specialFolder = WINDOWS_SPECIAL_FOLDER[key];
 
-	try {
-		const result = execSync(
-			`powershell -NoProfile -Command "[Environment]::GetFolderPath('${key.charAt(0).toUpperCase() + key.slice(1)}')"`,
-			{ encoding: "utf-8", timeout: 3000 },
-		).trim();
-		if (result && existsSync(result)) {
-			_winFolderCache[key] = result;
-			return result;
+	// Method 1: SpecialFolder enum (Desktop, MyDocuments)
+	if (specialFolder) {
+		try {
+			const result = execSync(
+				`powershell -NoProfile -Command "[Environment]::GetFolderPath('${specialFolder}')"`,
+				{ encoding: "utf-8", timeout: 3000 },
+			).trim();
+			if (result && existsSync(result)) {
+				_winFolderCache[key] = result;
+				return result;
+			}
+		} catch {
+			// PowerShell failed
 		}
-	} catch {
-		// PowerShell not available or failed
 	}
 
-	// Fallback to English name under home
-	const fallback = join(home, key.charAt(0).toUpperCase() + key.slice(1));
+	// Method 2: Known Folder GUID via Shell.Application (for Downloads etc.)
+	const guid = WINDOWS_KNOWN_FOLDER_GUID[key];
+	if (guid) {
+		try {
+			const result = execSync(
+				`powershell -NoProfile -Command "(New-Object -ComObject Shell.Application).NameSpace('shell:${key}').Self.Path"`,
+				{ encoding: "utf-8", timeout: 3000 },
+			).trim();
+			if (result && existsSync(result)) {
+				_winFolderCache[key] = result;
+				return result;
+			}
+		} catch {
+			// Shell.Application failed
+		}
+	}
+
+	// Method 3: Fallback to English name under home
+	const englishNames: Record<string, string> = {
+		desktop: "Desktop",
+		documents: "Documents",
+		downloads: "Downloads",
+	};
+	const fallback = join(home, englishNames[key] || key);
 	_winFolderCache[key] = existsSync(fallback) ? fallback : null;
 	return _winFolderCache[key];
 }
