@@ -329,8 +329,9 @@ export const ContentViewer = memo(
 				)}
 			</CopyButton>
 		);
-		const copyBtn = makeCopyBtn(content);
-		/** Content used in fullscreen modal (untruncated when available) */
+		/** Prefer untruncated content everywhere it's available */
+		const inlineContent = fullContent ?? content;
+		const copyBtn = makeCopyBtn(inlineContent);
 		const modalContent = fullContent ?? content;
 		const modalCopyBtn = fullContent ? makeCopyBtn(modalContent) : copyBtn;
 
@@ -443,24 +444,25 @@ export const ContentViewer = memo(
 						</div>
 					)}
 
-					{/* Inline content */}
+					{/* Inline content — prefer fullContent when available so truncated
+				    previews are replaced once the full payload has been fetched. */}
 					{renderContent
 						? renderContent(wordWrap)
 						: (children ??
 							(markdown ? (
-								renderMarkdown(content, {
+								renderMarkdown(fullContent ?? content, {
 									maxHeight: style?.maxHeight,
 									overflowY: style?.maxHeight ? "auto" : undefined,
 								})
 							) : language && language !== "text" ? (
 								<HighlightedCode
-									code={content}
+									code={fullContent ?? content}
 									lang={language}
 									style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
 								/>
 							) : (
 								<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
-									{content}
+									{fullContent ?? content}
 								</Code>
 							)))}
 				</Box>
