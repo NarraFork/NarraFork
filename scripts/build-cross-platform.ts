@@ -45,7 +45,13 @@ const selectedPlatforms = platformArg
 	? PLATFORMS.filter((p) => {
 			// Exact suffix match to avoid "linux-x64" matching "linux-x64-baseline"
 			const suffix = p.target.replace("bun-", "");
-			return suffix === platformArg || p.target === platformArg;
+			return (
+				suffix === platformArg ||
+				p.target === platformArg ||
+				// Allow short aliases like "windows" to match "windows-x64"
+				(suffix.startsWith(`${platformArg}-`) &&
+					!PLATFORMS.some((q) => q.target.replace("bun-", "") === platformArg))
+			);
 		})
 	: PLATFORMS;
 
