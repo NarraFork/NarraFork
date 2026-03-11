@@ -1,4 +1,5 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import {
 	api,
 	type BlacklistDir,
@@ -136,11 +137,23 @@ export function useNarratorMessages(narratorId: string, around?: NarratorMessage
 }
 
 export function useToolCallDetail(narratorId: string, toolUseId: string, enabled: boolean) {
+	const qc = useQueryClient();
+
+	// When disabled (e.g. card collapsed), remove cached data to free memory.
+	useEffect(() => {
+		if (!enabled && narratorId && toolUseId) {
+			qc.removeQueries({
+				queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
+			});
+		}
+	}, [enabled, qc, narratorId, toolUseId]);
+
 	return useQuery({
 		queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
 		queryFn: () => api.getToolCallDetail(narratorId, toolUseId),
 		enabled: !!narratorId && !!toolUseId && enabled,
 		staleTime: 5 * 60 * 1000,
+		gcTime: 0,
 	});
 }
 
