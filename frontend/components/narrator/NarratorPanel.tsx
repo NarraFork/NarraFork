@@ -795,7 +795,7 @@ export function NarratorPanel({
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting);
 
 	const activeTodo = useMemo(() => {
-		if (!currentTodos?.length) return null;
+		if (!Array.isArray(currentTodos) || !currentTodos.length) return null;
 		return currentTodos.find((t: TodoItem) => t.status === "in_progress") ?? null;
 	}, [currentTodos]);
 
