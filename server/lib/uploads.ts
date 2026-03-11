@@ -72,29 +72,51 @@ export function getImagePath(narratorId: string, imageId: string): string | null
 
 const MAX_IMAGE_LONG_EDGE = 1568;
 
+const FORMAT_TO_MIME: Record<string, string> = {
+	png: "image/png",
+	jpeg: "image/jpeg",
+	jpg: "image/jpeg",
+	gif: "image/gif",
+	webp: "image/webp",
+};
+
+export interface ImageBase64Result {
+	base64: string;
+	/** The real media type detected from file content (may differ from the stored mediaType). */
+	detectedMediaType?: string;
+}
+
 /**
- * Read an image file and return its base64 encoding.
+ * Read an image file and return its base64 encoding + detected real format.
  * If the image's long edge exceeds MAX_IMAGE_LONG_EDGE, it is downscaled
  * (preserving aspect ratio) before encoding. GIF is passed through as-is
  * since sharp doesn't handle animated GIF resize well.
+ *
+ * The returned `detectedMediaType` reflects the actual file content (e.g. a
+ * file named `.jpg` that is really PNG will return `image/png`). Callers
+ * should prefer this over the stored mediaType when sending to AI providers.
  */
-export async function imageToBase64(filePath: string): Promise<string> {
+export async function imageToBase64(filePath: string): Promise<ImageBase64Result> {
 	const buf = Buffer.from(await Bun.file(filePath).arrayBuffer());
 	const ext = extname(filePath).toLowerCase();
 
 	// Skip resize for GIF (may be animated)
 	if (ext === ".gif") {
-		return buf.toString("base64");
+		return { base64: buf.toString("base64"), detectedMediaType: "image/gif" };
 	}
 
 	try {
 		const img = sharp(buf);
 		const meta = await img.metadata();
+		const realFormat = meta.format ?? "";
+		const detectedMediaType = FORMAT_TO_MIME[realFormat];
 		const w = meta.width ?? 0;
 		const h = meta.height ?? 0;
 		const longEdge = Math.max(w, h);
 
 		if (longEdge > MAX_IMAGE_LONG_EDGE) {
+			// Resize and re-encode in the real format (not the extension-based one)
+			const outputFormat = realFormat === "png" ? "png" : "jpeg";
 			const resized = await img
 				.resize({
 					width: w >= h ? MAX_IMAGE_LONG_EDGE : undefined,
@@ -102,22 +124,26 @@ export async function imageToBase64(filePath: string): Promise<string> {
 					fit: "inside",
 					withoutEnlargement: true,
 				})
-				.toFormat(meta.format === "png" ? "png" : "jpeg", {
-					quality: 85,
-				})
+				.toFormat(outputFormat, { quality: 85 })
 				.toBuffer();
 			logger.debug("Image resized for AI provider", {
 				filePath,
 				original: `${w}x${h}`,
 				resized: `${resized.length} bytes`,
+				realFormat,
 			});
-			return resized.toString("base64");
+			return {
+				base64: resized.toString("base64"),
+				detectedMediaType: FORMAT_TO_MIME[outputFormat] ?? detectedMediaType,
+			};
 		}
+
+		return { base64: buf.toString("base64"), detectedMediaType };
 	} catch {
 		// If sharp fails (corrupt image, unsupported format), fall through to raw base64
 	}
 
-	return buf.toString("base64");
+	return { base64: buf.toString("base64") };
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {

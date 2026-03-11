@@ -2459,16 +2459,18 @@ async function runAgentLoop(
 					const filePath = getImagePath(narratorId, img.imageId);
 					if (filePath) {
 						try {
-							const b64 = await imageToBase64(filePath);
+							const result = await imageToBase64(filePath);
 							const mimeToFormat: Record<string, string> = {
 								"image/png": "png",
 								"image/jpeg": "jpeg",
 								"image/gif": "gif",
 								"image/webp": "webp",
 							};
+							// Prefer detected real format over stored mediaType
+							const effectiveMime = result.detectedMediaType ?? img.mediaType;
 							resolved.push({
-								format: mimeToFormat[img.mediaType] ?? "png",
-								base64: b64,
+								format: mimeToFormat[effectiveMime] ?? "png",
+								base64: result.base64,
 							});
 						} catch {
 							// Image file may have been deleted — skip silently
