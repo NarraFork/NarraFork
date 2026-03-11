@@ -7,6 +7,7 @@ import {
 } from "../lib/db-resilience";
 import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
+import { ensureColumns } from "./ensure-columns";
 import { ensureFts } from "./fts";
 import * as relations from "./relations";
 import { runMigrations } from "./run-migrations";
@@ -54,6 +55,9 @@ try {
 	});
 	throw err;
 }
+
+// Patch missing columns for databases created by older versions
+ensureColumns(sqlite);
 
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
 ensureFts(sqlite);
