@@ -115,10 +115,32 @@ interface ActiveNarrator {
 	_enabledOptionalTools: Set<string>;
 }
 
-const activeNarrators = new Map<string, ActiveNarrator>();
+// Use globalThis to survive Bun --hot reloads.  Module-level variables are
+// re-initialised on hot reload, but agent loops spawned by the previous module
+// evaluation are still running in the background.  Losing the Map reference
+// means the old loop's finally-block deletes from a *new* empty Map while the
+// new code creates a second ActiveNarrator for the same narrator — leading to
+// two concurrent loops and status clobbering.
+
+/** Retrieve (or lazily create) a globalThis-pinned collection that survives --hot reloads. */
+function hotSafe<T>(key: string, factory: () => T): T {
+	const sym = Symbol.for(key);
+	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
+	const g = globalThis as any;
+	if (!g[sym]) g[sym] = factory();
+	return g[sym];
+}
+
+const activeNarrators = hotSafe<Map<string, ActiveNarrator>>(
+	"narrafork.activeNarrators",
+	() => new Map(),
+);
 
 // Lock to prevent concurrent narrator creation for the same narrator
-const narratorCreationLocks = new Map<string, Promise<ActiveNarrator>>();
+const narratorCreationLocks = hotSafe<Map<string, Promise<ActiveNarrator>>>(
+	"narrafork.narratorCreationLocks",
+	() => new Map(),
+);
 
 interface PendingPermission {
 	resolve: (result: PermissionResult) => void;
@@ -131,13 +153,19 @@ interface PendingPermission {
 	broadcastTargetId: string;
 }
 
-const pendingPermissions = new Map<string, PendingPermission>();
+const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
+	"narrafork.pendingPermissions",
+	() => new Map(),
+);
 
 // Feedback queued by "allow with feedback" — keyed by narratorId
-const pendingFeedback = new Map<string, { toolUseId: string; feedbackText: string }>();
+const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: string }>>(
+	"narrafork.pendingFeedback",
+	() => new Map(),
+);
 
 // Tracks narrators that should run plan compact after ExitPlanMode completes — keyed by narratorId
-const pendingPlanCompact = new Set<string>();
+const pendingPlanCompact = hotSafe<Set<string>>("narrafork.pendingPlanCompact", () => new Set());
 
 // Buffered message queued by user while narrator is thinking — keyed by narratorId
 interface BufferedMessage {
@@ -147,7 +175,10 @@ interface BufferedMessage {
 	commandText?: string | null;
 	createdBy?: string | null;
 }
-const bufferedMessages = new Map<string, BufferedMessage>();
+const bufferedMessages = hotSafe<Map<string, BufferedMessage>>(
+	"narrafork.bufferedMessages",
+	() => new Map(),
+);
 
 // === SSE event types yielded to the HTTP response ===
 
@@ -1320,6 +1351,25 @@ export async function resolvePermission(
 	}
 }
 
+/**
+ * Auto-approve all pending permission requests for a narrator and its subagents.
+ * Called when the user switches permission mode to bypassPermissions.
+ */
+export async function resolveAllPendingPermissions(narratorId: string): Promise<number> {
+	const toResolve: string[] = [];
+	for (const [requestId, pending] of pendingPermissions) {
+		// Match requests belonging to this narrator directly,
+		// or subagent requests that broadcast to this narrator (broadcastTargetId).
+		if (pending.narratorId === narratorId || pending.broadcastTargetId === narratorId) {
+			toResolve.push(requestId);
+		}
+	}
+	for (const requestId of toResolve) {
+		await resolvePermission(requestId, "allow");
+	}
+	return toResolve.length;
+}
+
 // === Narrator lifecycle ===
 
 /**
@@ -2436,15 +2486,10 @@ async function runAgentLoop(
 			// Agent loop done — update status
 			await narratorService.updateStats(narratorId, 0);
 			if (!loopHadError) {
-				const current = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { status: true },
-				});
-				// Only mark done if this loop still owns an active in-flight state.
-				// If status has already moved to idle/error/interrupted/etc, preserve it.
-				if (current && (current.status === "thinking" || current.status === "waiting")) {
-					await narratorService.updateStatus(narratorId, "done");
-				}
+				// Atomically transition thinking/waiting → done.
+				// If status has already moved (e.g. another loop took over after
+				// hot reload, or user interrupted), the CAS is a no-op.
+				await narratorService.compareAndSetStatus(narratorId, ["thinking", "waiting"], "done");
 			}
 
 			// Compact if context usage is high (checked after a complete turn).
@@ -2605,10 +2650,13 @@ async function runAgentLoop(
 // === Custom compact (conversation rotation) ===
 
 /** Per-narrator lock to prevent concurrent compact operations. */
-export const compactLocks = new Map<string, Promise<void>>();
+export const compactLocks = hotSafe<Map<string, Promise<void>>>(
+	"narrafork.compactLocks",
+	() => new Map(),
+);
 
 /** Per-narrator lock to prevent concurrent prune boundary computations. */
-export const pruneLocks = new Set<string>();
+export const pruneLocks = hotSafe<Set<string>>("narrafork.pruneLocks", () => new Set());
 
 /** Compact operation timeout in milliseconds (5 minutes). */
 const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -2706,20 +2754,14 @@ async function doRunCustomCompact(
 		}
 		await narratorService.clearPruneBoundary(narratorId);
 
-		// Only transition to idle if the narrator is still in "done" state.
-		// If a pending/buffered message already kicked off a new loop iteration
-		// (status = "thinking"), we must not overwrite it — the compact ran as a
-		// fire-and-forget background task and the new loop owns the status now.
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true },
-		});
-		if (!current || current.status === "done") {
-			await narratorService.updateStatus(narratorId, "idle");
-		} else {
+		// Atomically transition done → idle.  If a pending/buffered message
+		// already kicked off a new loop iteration (status = "thinking"), the
+		// CAS is a no-op — the compact ran as a fire-and-forget background
+		// task and the new loop owns the status now.
+		const transitioned = await narratorService.compareAndSetStatus(narratorId, "done", "idle");
+		if (!transitioned) {
 			logger.info("Skipping idle transition after compact — narrator already moved on", {
 				narratorId,
-				currentStatus: current.status,
 			});
 		}
 

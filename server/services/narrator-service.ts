@@ -1,5 +1,5 @@
 import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, sql } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import {
 	chapters,
 	narratorMessageRefs,
@@ -2529,6 +2529,49 @@ export const narratorService = {
 			narratorId,
 			status,
 		});
+	},
+
+	/**
+	 * Atomically update narrator status only if the current DB status matches one
+	 * of the expected values.  Uses a single SQL UPDATE … WHERE to avoid the
+	 * TOCTOU race that exists in the read-then-write pattern.
+	 *
+	 * Returns `true` when the row was actually updated, `false` when the status
+	 * had already moved on (no-op).
+	 */
+	async compareAndSetStatus(
+		narratorId: string,
+		expectedStatus: string | string[],
+		newStatus: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
+		errorMessage?: string,
+	): Promise<boolean> {
+		const now = new Date().toISOString();
+		const normalizedErrorMessage = newStatus === "error" ? (errorMessage ?? null) : null;
+		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+		const placeholders = expected.map(() => "?").join(",");
+		const result = sqlite
+			.prepare(
+				`UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+			)
+			.run(newStatus, normalizedErrorMessage, now, narratorId, ...expected);
+
+		if (result.changes === 0) return false;
+
+		eventBus.emit(
+			newStatus === "error"
+				? {
+						type: "narrator:error",
+						narratorId,
+						error: normalizedErrorMessage ?? "Unknown error",
+					}
+				: { type: "narrator:status_changed", narratorId, status: newStatus },
+		);
+		broadcastToNarrator(narratorId, {
+			type: "status_change",
+			narratorId,
+			status: newStatus,
+		});
+		return true;
 	},
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
