@@ -67,6 +67,7 @@ import {
 	retryLastMessage,
 	runCustomCompact,
 	sendMessage,
+	setBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
 } from "../services/narrator-session";
@@ -355,34 +356,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
 
-	// Running subagent: buffer the message for injection into the agent loop
-	if (
-		narrator.type === "subagent" &&
-		(narrator.status === "thinking" || narrator.status === "waiting")
-	) {
-		const { message } = await parseMessageRequest(c, id);
-		const userId = c.get("user").sub;
-		// Resolve slash commands before buffering
-		let bufferText = message;
-		const cmdResult = await resolveCommand(message, id, userId);
-		if (cmdResult.resolved) {
-			bufferText = cmdResult.expandedPrompt;
-		}
-		const { bufferSubagentMessage } = await import("../services/narrator-subagent");
-		const result = bufferSubagentMessage(id, bufferText);
-		if (!result.ok) {
-			throw new ValidationError("Subagent is not running in foreground");
-		}
-		// Broadcast buffer_set so the frontend shows the queued state
-		broadcastToNarrator(id, {
-			type: "buffer_set",
-			narratorId: id,
-			text: message,
-			bufferedAt: result.bufferedAt,
-		});
-		return c.json({ buffered: true, bufferedAt: result.bufferedAt }, 202);
-	}
-
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -390,17 +363,55 @@ narratorRoutes.post("/:id/messages", async (c) => {
 
 	const { message, images } = await parseMessageRequest(c, id);
 	const userId = c.get("user").sub;
-	const locale = await getUserLanguage(userId);
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	// Resolve slash commands before sending
+	// Resolve slash commands
 	let finalMessage = message;
 	let commandText: string | null = null;
 	const cmdResult = await resolveCommand(message, id, userId);
-	if (cmdResult.resolved) {
+	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 		finalMessage = cmdResult.expandedPrompt;
 		commandText = cmdResult.rawCommand;
 	}
+
+	// Running narrator: buffer the message for execution after the current turn
+	if (narrator.status === "thinking" || narrator.status === "waiting") {
+		if (narrator.type === "subagent") {
+			const { bufferSubagentMessage } = await import("../services/narrator-subagent");
+			const result = bufferSubagentMessage(id, finalMessage);
+			if (!result.ok) {
+				throw new ValidationError("Subagent is not running in foreground");
+			}
+			broadcastToNarrator(id, {
+				type: "buffer_set",
+				narratorId: id,
+				text: message,
+				bufferedAt: result.bufferedAt,
+			});
+			return c.json({ buffered: true, bufferedAt: result.bufferedAt }, 202);
+		}
+
+		// Primary narrator: buffer via setBufferedMessage
+		const result = setBufferedMessage(
+			id,
+			finalMessage,
+			images.length > 0 ? images : undefined,
+			commandText,
+			userId,
+		);
+		if (result.ok) {
+			broadcastToNarrator(id, {
+				type: "buffer_set",
+				narratorId: id,
+				text: message,
+				bufferedAt: result.bufferedAt,
+			});
+			return c.json({ buffered: true, bufferedAt: result.bufferedAt }, 202);
+		}
+		// Narrator not active in memory — fall through to normal send
+	}
+
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const userMsg = await sendMessage(
 		id,
