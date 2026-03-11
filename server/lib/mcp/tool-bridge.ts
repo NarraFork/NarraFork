@@ -145,7 +145,17 @@ export function syncMcpTools(): void {
 				const statuses = mcpManager.getServerStatuses();
 				return statuses.some((s) => s.id === serverId && s.status === "connected");
 			},
-			async execute(args: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
+			async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+				const start = Date.now();
+				// Trigger long-running notification after 60s (same threshold as bash tool)
+				let longRunningTimer: ReturnType<typeof setTimeout> | undefined;
+				if (ctx.currentToolUseId && ctx.emitLongRunning) {
+					const toolUseId = ctx.currentToolUseId;
+					longRunningTimer = setTimeout(() => {
+						ctx.emitLongRunning?.(toolUseId, Date.now() - start);
+					}, 60_000);
+				}
+
 				try {
 					// Strip any params not in the original MCP schema (e.g. dummy "confirm")
 					const cleanArgs: Record<string, unknown> = {};
@@ -154,7 +164,7 @@ export function syncMcpTools(): void {
 							cleanArgs[k] = v;
 						}
 					}
-					const result = await mcpManager.callTool(serverId, tool.name, cleanArgs);
+					const result = await mcpManager.callTool(serverId, tool.name, cleanArgs, ctx.signal);
 					// Handle all content types: text, image, resource
 					const parts: string[] = [];
 					for (const c of result.content) {
@@ -172,10 +182,18 @@ export function syncMcpTools(): void {
 						isError: result.isError,
 					};
 				} catch (err) {
+					if (ctx.signal.aborted) {
+						return {
+							output: "MCP tool call was aborted by user",
+							isError: true,
+						};
+					}
 					return {
 						output: `MCP tool error: ${err instanceof Error ? err.message : String(err)}`,
 						isError: true,
 					};
+				} finally {
+					if (longRunningTimer) clearTimeout(longRunningTimer);
 				}
 			},
 		};

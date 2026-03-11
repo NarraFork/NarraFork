@@ -670,11 +670,11 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 }
 
 /**
- * Terminate button for long-running bash/shell commands.
+ * Terminate button for long-running tool calls (bash commands and MCP tools).
  * Rendered outside LazyCollapse so it's always visible without expanding the card.
  * Uses a local timer to detect ≥60s elapsed — no dependency on WS push.
  */
-function BashTerminateButton({
+function LongRunningTerminateButton({
 	toolCall,
 	narratorId,
 }: {
@@ -685,6 +685,8 @@ function BashTerminateButton({
 	const interruptMutation = useInterruptNarrator();
 
 	const isBash = BASH_TOOLS.has(toolCall.toolName);
+	const isMcp = toolCall.toolName.startsWith("mcp__");
+	const isLongRunnable = isBash || isMcp;
 	const isRunning = toolCall.status === "running" && !!narratorId;
 
 	// 本地 5s 轮询计算已运行时长。startedAt 来自 tool_started WS 事件，
@@ -692,7 +694,7 @@ function BashTerminateButton({
 	// 因为 WS 可能因心跳超时断开。
 	const [elapsed, setElapsed] = useState(0);
 	useEffect(() => {
-		if (!isBash || !isRunning || toolCall.startedAt == null) {
+		if (!isLongRunnable || !isRunning || toolCall.startedAt == null) {
 			setElapsed(0);
 			return;
 		}
@@ -700,10 +702,10 @@ function BashTerminateButton({
 		update();
 		const timer = setInterval(update, 5_000);
 		return () => clearInterval(timer);
-	}, [isBash, isRunning, toolCall.startedAt]);
+	}, [isLongRunnable, isRunning, toolCall.startedAt]);
 
 	// 60_000 与后端 LONG_RUNNING_THRESHOLD_MS 保持一致
-	if (!isBash || !isRunning || elapsed < 60_000) return null;
+	if (!isLongRunnable || !isRunning || elapsed < 60_000) return null;
 
 	return (
 		<Box mt={4} mb={2}>
@@ -1578,7 +1580,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
 			{!isStreaming && (
 				<>
-					<BashTerminateButton toolCall={toolCall} narratorId={narratorId} />
+					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />
 					<LazyCollapse in={opened}>
 						<Box style={planStyle}>
 							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />

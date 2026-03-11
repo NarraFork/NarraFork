@@ -231,6 +231,7 @@ class McpManager {
 		serverId: string,
 		toolName: string,
 		args: Record<string, unknown>,
+		signal?: AbortSignal,
 	): Promise<{
 		content: Array<{
 			type: string;
@@ -246,7 +247,11 @@ class McpManager {
 			throw new Error(`MCP server "${serverId}" is not connected`);
 		}
 
-		const result = await entry.client.callTool({ name: toolName, arguments: args });
+		const result = await entry.client.callTool(
+			{ name: toolName, arguments: args },
+			undefined,
+			signal ? { signal } : undefined,
+		);
 		return {
 			content: (result.content ?? []) as Array<{
 				type: string;
