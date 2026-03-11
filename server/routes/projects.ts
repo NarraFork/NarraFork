@@ -1,9 +1,23 @@
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { db } from "../db";
-import { chapters, explorationGroups, projects } from "../db/schema";
+import {
+	chapters,
+	containerInstances,
+	explorationGroups,
+	mergeSessions,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	portAllocations,
+	projects,
+	terminals,
+	terminalTabs,
+	terminalViewState,
+} from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -314,6 +328,86 @@ projectRoutes.delete("/:id", async (c) => {
 				error: String(err),
 			});
 		}
+	}
+
+	// Fallback cleanup: ensure all FK-dependent rows are gone even if
+	// removeForProjectDeletion partially failed for some chapters.
+	const remainingChapterIds = (
+		await db.query.chapters.findMany({
+			where: eq(chapters.projectId, id),
+			columns: { id: true },
+		})
+	).map((ch) => ch.id);
+
+	if (remainingChapterIds.length > 0) {
+		const remainingNarratorIds = (
+			await db.query.narrators.findMany({
+				where: inArray(narrators.chapterId, remainingChapterIds),
+				columns: { id: true },
+			})
+		).map((n) => n.id);
+
+		// Also collect standalone child narrators (subagents) whose parent belongs to this project
+		let allNarratorIds = [...remainingNarratorIds];
+		if (allNarratorIds.length > 0) {
+			const childNarrators = (
+				await db.query.narrators.findMany({
+					where: inArray(narrators.parentNarratorId, allNarratorIds),
+					columns: { id: true },
+				})
+			).map((n) => n.id);
+			allNarratorIds = [...new Set([...allNarratorIds, ...childNarrators])];
+		}
+
+		await db.transaction(async (tx) => {
+			if (allNarratorIds.length > 0) {
+				// Break narrator self-references
+				await tx
+					.update(narrators)
+					.set({ parentNarratorId: null, forkMessageId: null, pruneBoundaryMessageId: null })
+					.where(inArray(narrators.id, allNarratorIds));
+
+				// Delete tables referencing narrators / messages
+				await tx
+					.delete(terminalViewState)
+					.where(inArray(terminalViewState.narratorId, allNarratorIds));
+				await tx.delete(terminalTabs).where(inArray(terminalTabs.narratorId, allNarratorIds));
+				await tx.delete(terminals).where(inArray(terminals.narratorId, allNarratorIds));
+				await tx
+					.delete(narratorToolCalls)
+					.where(inArray(narratorToolCalls.narratorId, allNarratorIds));
+				await tx
+					.delete(narratorMessageRefs)
+					.where(inArray(narratorMessageRefs.narratorId, allNarratorIds));
+				await tx
+					.delete(narratorMessages)
+					.where(inArray(narratorMessages.narratorId, allNarratorIds));
+				await tx.delete(narrators).where(inArray(narrators.id, allNarratorIds));
+			}
+
+			// Delete tables referencing chapters
+			await tx
+				.delete(terminalViewState)
+				.where(inArray(terminalViewState.chapterId, remainingChapterIds));
+			await tx.delete(terminalTabs).where(inArray(terminalTabs.chapterId, remainingChapterIds));
+			await tx.delete(terminals).where(inArray(terminals.chapterId, remainingChapterIds));
+			await tx
+				.delete(containerInstances)
+				.where(inArray(containerInstances.chapterId, remainingChapterIds));
+			await tx
+				.delete(portAllocations)
+				.where(inArray(portAllocations.chapterId, remainingChapterIds));
+			await tx
+				.delete(mergeSessions)
+				.where(inArray(mergeSessions.targetChapterId, remainingChapterIds));
+
+			// Break chapter self-references before deleting
+			await tx
+				.update(chapters)
+				.set({ parentChapterId: null, mergedIntoChapterId: null })
+				.where(inArray(chapters.id, remainingChapterIds));
+			await tx.delete(chapters).where(inArray(chapters.id, remainingChapterIds));
+		});
 	}
 
 	await db.delete(projects).where(eq(projects.id, id));
