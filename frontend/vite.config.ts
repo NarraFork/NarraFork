@@ -144,7 +144,13 @@ export default defineConfig(({ mode }) => {
 				},
 			}),
 		],
+		// Target Safari 14+ to support iPadOS / older macOS WebKit views
+		// used when accessing NarraFork as a PWA or via in-app browsers.
+		esbuild: {
+			target: "safari14",
+		},
 		build: {
+			target: ["es2020", "safari14"],
 			outDir: resolve(__dirname, "..", "dist", "frontend"),
 			emptyOutDir: true,
 			rollupOptions: {

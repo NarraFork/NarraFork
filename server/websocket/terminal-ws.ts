@@ -212,6 +212,17 @@ export const handleTerminalWS = {
 					})
 					.catch((err) => {
 						logger.error("Failed to kill terminal via WS", { error: String(err) });
+						try {
+							ws.send(
+								JSON.stringify({
+									type: "error",
+									terminalId: msg.terminalId,
+									message: String(err instanceof Error ? err.message : err),
+								}),
+							);
+						} catch {
+							// connection may be dead
+						}
 					});
 				break;
 			}
@@ -227,6 +238,17 @@ export const handleTerminalWS = {
 					})
 					.catch((err) => {
 						logger.error("Failed to rename terminal via WS", { error: String(err) });
+						try {
+							ws.send(
+								JSON.stringify({
+									type: "error",
+									terminalId: msg.terminalId,
+									message: String(err instanceof Error ? err.message : err),
+								}),
+							);
+						} catch {
+							// connection may be dead
+						}
 					});
 				break;
 			}

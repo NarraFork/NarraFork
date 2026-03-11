@@ -520,6 +520,29 @@ export async function processEvent(
 					toolUseId: event.toolUseId,
 					error: String(err),
 				});
+				// Retry once — transient DB lock / busy errors are common with SQLite
+				try {
+					await narratorService.updateToolCallResult(event.toolUseId, {
+						output: event.metadata
+							? { _text: event.output, _metadata: event.metadata }
+							: event.output,
+						status,
+						errorMessage: event.isError ? event.output : undefined,
+						durationMs: event.durationMs,
+					});
+					if (event.brokenInputOverride) {
+						await narratorService.overwriteToolCallInput(
+							event.toolUseId,
+							event.brokenInputOverride,
+						);
+					}
+				} catch (retryErr) {
+					logger.error("CRITICAL: tool_result persist failed after retry", {
+						narratorId,
+						toolUseId: event.toolUseId,
+						error: String(retryErr),
+					});
+				}
 			}
 
 			dualBroadcast(ctx, {

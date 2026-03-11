@@ -305,6 +305,12 @@ export const gitService = {
 		return result.stdout;
 	},
 
+	/** Check if commitA is an ancestor of commitB (i.e. commitB contains commitA) */
+	async isAncestor(repoPath: string, commitA: string, commitB: string): Promise<boolean> {
+		const result = await exec(["merge-base", "--is-ancestor", commitA, commitB], repoPath, true);
+		return result.exitCode === 0;
+	},
+
 	/** Simulate merge using merge-tree to detect conflicts without modifying worktree */
 	async mergeTree(
 		repoPath: string,
@@ -335,14 +341,50 @@ export const gitService = {
 		sourceBranch: string,
 		strategy: "merge" | "squash",
 		message: string,
-	): Promise<{ success: boolean; commitSha?: string; conflictFiles?: string[] }> {
-		const args =
-			strategy === "squash"
-				? ["merge", "--squash", sourceBranch]
-				: ["merge", "--no-ff", "-m", message, sourceBranch];
+		options?: { fastForward?: boolean },
+	): Promise<{
+		success: boolean;
+		commitSha?: string;
+		conflictFiles?: string[];
+		isFastForward?: boolean;
+	}> {
+		let args: string[];
+		if (strategy === "squash") {
+			args = ["merge", "--squash", sourceBranch];
+		} else if (options?.fastForward) {
+			args = ["merge", "--ff-only", sourceBranch];
+		} else {
+			args = ["merge", "--no-ff", "-m", message, sourceBranch];
+		}
 
 		const result = await exec(args, worktreePath);
 		if (result.exitCode !== 0) {
+			if (options?.fastForward) {
+				// ff-only failed — fall back to --no-ff
+				const fallbackArgs = ["merge", "--no-ff", "-m", message, sourceBranch];
+				const fallbackResult = await exec(fallbackArgs, worktreePath);
+				if (fallbackResult.exitCode !== 0) {
+					if (
+						fallbackResult.stdout.includes("CONFLICT") ||
+						fallbackResult.stderr.includes("CONFLICT")
+					) {
+						const statusResult = await exec(
+							["diff", "--name-only", "--diff-filter=U"],
+							worktreePath,
+						);
+						const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
+						return { success: false, conflictFiles };
+					}
+					throw new GitError(`Merge failed: ${fallbackResult.stderr}`);
+				}
+				if (strategy === "squash") {
+					const commitResult = await exec(["commit", "-m", message], worktreePath);
+					if (commitResult.exitCode !== 0)
+						throw new GitError(`Squash commit failed: ${commitResult.stderr}`);
+				}
+				const sha = await this.getHeadCommit(worktreePath);
+				return { success: true, commitSha: sha, isFastForward: false };
+			}
 			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
 				const statusResult = await exec(["diff", "--name-only", "--diff-filter=U"], worktreePath);
 				const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
@@ -358,7 +400,7 @@ export const gitService = {
 		}
 
 		const sha = await this.getHeadCommit(worktreePath);
-		return { success: true, commitSha: sha };
+		return { success: true, commitSha: sha, isFastForward: !!options?.fastForward };
 	},
 
 	/** Cherry-pick commits from source branch onto current branch */
@@ -674,12 +716,86 @@ export const gitService = {
 		}
 	},
 
+	async stageAndCommit(repoPath: string, files: string[], message: string): Promise<void> {
+		const addResult = await exec(["add", ...files], repoPath);
+		if (addResult.exitCode !== 0) {
+			throw new GitError(`Failed to stage files: ${addResult.stderr}`);
+		}
+		const commitResult = await exec(["commit", "-m", message], repoPath);
+		if (commitResult.exitCode !== 0) {
+			throw new GitError(`Failed to commit: ${commitResult.stderr}`);
+		}
+	},
+
+	async commitGitignoreIfDirty(repoPath: string): Promise<void> {
+		const statusResult = await exec(["status", "--porcelain", ".gitignore"], repoPath);
+		if (statusResult.stdout.trim()) {
+			await this.stageAndCommit(repoPath, [".gitignore"], "Update .gitignore for NarraFork");
+		}
+	},
+
 	async cloneRepo(url: string, destPath: string, branch?: string): Promise<void> {
 		const args = ["clone"];
 		if (branch) args.push("--branch", branch);
 		args.push(url, destPath);
 		const result = await exec(args, ".");
 		if (result.exitCode !== 0) throw new GitError(`Failed to clone repo: ${result.stderr}`);
+	},
+
+	/**
+	 * Clone a repo with `--progress`, streaming stderr lines to a callback.
+	 * Git writes progress (counting objects, compressing, receiving, resolving)
+	 * to stderr using `\r` for in-place updates.
+	 */
+	async cloneRepoStreaming(
+		url: string,
+		destPath: string,
+		branch: string | undefined,
+		onProgress: (line: string) => void,
+	): Promise<void> {
+		const args = ["clone", "--progress"];
+		if (branch) args.push("--branch", branch);
+		args.push(url, destPath);
+
+		const proc = Bun.spawn(["git", ...args], {
+			cwd: ".",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		// Read stderr in streaming fashion — git progress uses \r for in-place updates
+		const reader = proc.stderr.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				// Split on \r or \n — git uses \r for progress updates
+				const parts = buffer.split(/[\r\n]+/);
+				buffer = parts.pop() ?? "";
+				for (const part of parts) {
+					const trimmed = part.trim();
+					if (trimmed) onProgress(trimmed);
+				}
+			}
+			// Flush remaining
+			const final = decoder.decode();
+			buffer += final;
+			if (buffer.trim()) onProgress(buffer.trim());
+		} finally {
+			reader.releaseLock();
+		}
+
+		// Drain stdout to avoid pipe deadlock
+		await new Response(proc.stdout).text();
+
+		const exitCode = await proc.exited;
+		if (exitCode !== 0) {
+			throw new GitError(`Failed to clone repo (exit code ${exitCode})`);
+		}
 	},
 
 	// === Stage / Unstage ===

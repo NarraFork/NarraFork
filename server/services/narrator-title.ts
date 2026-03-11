@@ -30,8 +30,8 @@ export async function persistTitle(narratorId: string, title: string): Promise<b
  * Generate a title for a narrator session using the summary model.
  */
 export async function generateTitle(narratorId: string, locale: Locale = "en"): Promise<string> {
-	const HEAD_COUNT = 2;
-	const TAIL_COUNT = 4;
+	const HEAD_COUNT = 1;
+	const TAIL_COUNT = 6;
 
 	// Two targeted queries with SQL-level filtering (no over-fetch)
 	const [head, tail] = await Promise.all([
@@ -50,9 +50,10 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 		.map((m, i) => {
 			const role = m.role === "assistant" ? "Assistant" : "User";
 			const text = m.contentText ?? "";
-			const maxLen = i >= head.length ? 600 : 300;
+			const isRecent = i >= head.length;
+			const maxLen = isRecent ? 800 : 200;
 			const truncated = text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
-			const section = i >= head.length ? "(recent) " : "";
+			const section = isRecent ? "(recent) " : "(early) ";
 			return `${section}[${role}]: ${truncated}`;
 		})
 		.join("\n\n");

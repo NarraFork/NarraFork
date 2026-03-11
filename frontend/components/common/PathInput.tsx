@@ -1,39 +1,87 @@
 import { Combobox, Group, Loader, Text, TextInput, useCombobox } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
-import { IconFolder } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
+import { IconFolder, IconFolderPlus } from "@tabler/icons-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
-interface PathInputProps {
-	/** Called when the user confirms a path (Enter key or option click). */
-	onConfirm: (path: string) => void;
+interface PathInputBaseProps {
 	placeholder?: string;
 	/** Auto-focus on mount */
 	autoFocus?: boolean;
+	label?: string;
+	description?: string;
+	disabled?: boolean;
+	required?: boolean;
+	leftSection?: React.ReactNode;
+	rightSection?: React.ReactNode;
+	rightSectionWidth?: number;
 }
+
+interface UncontrolledPathInputProps extends PathInputBaseProps {
+	/** Called when the user confirms a path (Enter key or option click). Clears after confirm. */
+	onConfirm: (path: string) => void;
+	value?: undefined;
+	onChange?: undefined;
+}
+
+interface ControlledPathInputProps extends PathInputBaseProps {
+	/** Controlled value */
+	value: string;
+	/** Called on every change (typing or option selection) */
+	onChange: (path: string) => void;
+	onConfirm?: undefined;
+}
+
+type PathInputProps = UncontrolledPathInputProps | ControlledPathInputProps;
 
 /**
  * A path input with real-time filesystem autocomplete.
  *
  * Typing triggers a browse request for the parent directory, then filters
  * child entries by the trailing segment. Clicking an option fills it in
- * and immediately browses into it. Enter confirms the current value.
+ * and immediately browses into it.
+ *
+ * When the typed trailing segment doesn't match any existing directory,
+ * a "Create <name>" option appears at the bottom of the dropdown.
+ *
+ * Two modes:
+ * - Uncontrolled: pass `onConfirm` — Enter confirms and clears the input.
+ * - Controlled: pass `value` + `onChange` — behaves like a normal input with autocomplete.
  *
  * Supports both Unix (`/`) and Windows (`C:\`) path formats.
  */
-export function PathInput({ onConfirm, placeholder, autoFocus }: PathInputProps) {
-	const [value, setValue] = useState("");
+export function PathInput(props: PathInputProps) {
+	const {
+		placeholder,
+		autoFocus,
+		label,
+		description,
+		disabled,
+		required,
+		leftSection,
+		rightSection: rightSectionProp,
+		rightSectionWidth,
+	} = props;
+	const isControlled = props.value !== undefined;
+	const { t } = useTranslation("common");
+	const queryClient = useQueryClient();
+
+	const [internalValue, setInternalValue] = useState("");
+	const value = isControlled ? props.value : internalValue;
+	const setValue = isControlled ? (v: string) => props.onChange(v) : setInternalValue;
+
 	const [debounced] = useDebouncedValue(value, 150);
 	const inputRef = useRef<HTMLInputElement>(null);
+	// Track whether the user has interacted — prevents auto-opening on mount
+	// when a controlled value is already populated.
+	const interactedRef = useRef(false);
 	const combobox = useCombobox({
 		onDropdownClose: () => combobox.resetSelectedOption(),
 	});
 
 	// Parse the input into a browsable directory and a trailing filter segment.
-	// e.g. "/home/user/pro" → dir="/home/user", filter="pro"
-	// e.g. "/home/user/"    → dir="/home/user", filter=""
-	// e.g. "C:\Users\foo"   → dir="C:\Users",   filter="foo"
 	const parsed = parsePath(debounced);
 
 	const {
@@ -53,36 +101,76 @@ export function PathInput({ onConfirm, placeholder, autoFocus }: PathInputProps)
 	const options =
 		data?.entries.filter((e) => !filterLower || e.name.toLowerCase().includes(filterLower)) ?? [];
 
-	// Open dropdown when we have options
+	// Show "Create <name>" option when:
+	// - there's a filter segment typed (user is typing a name)
+	// - the parent directory exists (we got data back)
+	// - no existing entry matches the filter exactly
+	const canCreate =
+		parsed.filter.length > 0 &&
+		!!data?.path &&
+		!data.entries.some((e) => e.name.toLowerCase() === filterLower);
+
+	const mkdirMutation = useMutation({
+		mutationFn: ({ parent, name }: { parent: string; name: string }) => api.fsMkdir(parent, name),
+		onSuccess: (result) => {
+			queryClient.invalidateQueries({ queryKey: ["fs-browse", parsed.dir] });
+			// Fill in the newly created path
+			const sep = data?.sep || "/";
+			const next = result.path.endsWith(sep) ? result.path : result.path + sep;
+			setValue(next);
+			combobox.closeDropdown();
+			setTimeout(() => inputRef.current?.focus(), 0);
+		},
+	});
+
+	// Determine if dropdown should show (has options or can create)
+	const hasDropdownContent = options.length > 0 || canCreate;
+
+	// Open dropdown when we have content (only after user interaction)
 	// biome-ignore lint/correctness/useExhaustiveDependencies: combobox methods are unstable refs — depend only on data triggers
 	useEffect(() => {
-		if (options.length > 0 && value.length > 0) {
+		if (!interactedRef.current) return;
+		if (hasDropdownContent && value.length > 0) {
 			combobox.openDropdown();
 		} else {
 			combobox.closeDropdown();
 		}
-	}, [options.length, value.length]);
+	}, [hasDropdownContent, value.length]);
 
 	useEffect(() => {
 		if (autoFocus) inputRef.current?.focus();
 	}, [autoFocus]);
 
+	const CREATE_OPTION_VALUE = "__create__";
+
 	const handleOptionSubmit = useCallback(
-		(optionPath: string) => {
+		(optionValue: string) => {
+			if (optionValue === CREATE_OPTION_VALUE) {
+				// Create the directory
+				if (data?.path && parsed.filter) {
+					mkdirMutation.mutate({ parent: data.path, name: parsed.filter });
+				}
+				return;
+			}
 			// Fill the path and append separator so user can keep drilling down
 			const sep = data?.sep || "/";
-			const next = optionPath.endsWith(sep) ? optionPath : optionPath + sep;
+			const next = optionValue.endsWith(sep) ? optionValue : optionValue + sep;
 			setValue(next);
 			combobox.closeDropdown();
 			// Re-focus so user can keep typing
 			setTimeout(() => inputRef.current?.focus(), 0);
 		},
-		[data?.sep, combobox],
+		[data?.sep, data?.path, parsed.filter, combobox, setValue, mkdirMutation],
 	);
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") {
-			// If dropdown is open but no option is actively highlighted, confirm the typed value
+			if (isControlled) {
+				// Controlled mode: just close dropdown on Enter
+				combobox.closeDropdown();
+				return;
+			}
+			// Uncontrolled mode: confirm and clear
 			if (combobox.dropdownOpened) {
 				const idx = combobox.getSelectedOptionIndex();
 				if (idx === -1) {
@@ -90,7 +178,7 @@ export function PathInput({ onConfirm, placeholder, autoFocus }: PathInputProps)
 					combobox.closeDropdown();
 					const v = value.trim();
 					if (v) {
-						onConfirm(v);
+						props.onConfirm(v);
 						setValue("");
 					}
 				}
@@ -99,7 +187,7 @@ export function PathInput({ onConfirm, placeholder, autoFocus }: PathInputProps)
 				e.preventDefault();
 				const v = value.trim();
 				if (v) {
-					onConfirm(v);
+					props.onConfirm(v);
 					setValue("");
 				}
 			}
@@ -112,26 +200,34 @@ export function PathInput({ onConfirm, placeholder, autoFocus }: PathInputProps)
 				<TextInput
 					ref={inputRef}
 					size="xs"
+					label={label}
+					description={description}
 					placeholder={placeholder}
+					disabled={disabled}
+					required={required}
 					value={value}
 					onChange={(e) => {
+						interactedRef.current = true;
 						setValue(e.currentTarget.value);
 						combobox.openDropdown();
 						combobox.resetSelectedOption();
 					}}
 					onFocus={() => {
-						if (options.length > 0) combobox.openDropdown();
+						interactedRef.current = true;
+						if (hasDropdownContent) combobox.openDropdown();
 					}}
 					onBlur={() => combobox.closeDropdown()}
 					onKeyDown={handleKeyDown}
-					rightSection={isFetching ? <Loader size={14} /> : undefined}
+					leftSection={leftSection}
+					rightSection={rightSectionProp ?? (isFetching ? <Loader size={14} /> : undefined)}
+					rightSectionWidth={rightSectionWidth}
 					styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
 					style={{ flex: 1 }}
 				/>
 			</Combobox.Target>
 			<Combobox.Dropdown>
 				<Combobox.Options mah={250} style={{ overflowY: "auto" }}>
-					{options.length === 0 && (
+					{options.length === 0 && !canCreate && (
 						<Combobox.Empty>
 							<Text size="xs" c="dimmed">
 								—
@@ -148,6 +244,19 @@ export function PathInput({ onConfirm, placeholder, autoFocus }: PathInputProps)
 							</Group>
 						</Combobox.Option>
 					))}
+					{canCreate && (
+						<Combobox.Option value={CREATE_OPTION_VALUE} disabled={mkdirMutation.isPending}>
+							<Group gap={8} wrap="nowrap">
+								<IconFolderPlus
+									size={14}
+									style={{ flexShrink: 0, color: "var(--mantine-color-indigo-5)" }}
+								/>
+								<Text size="xs" c="indigo" truncate>
+									{mkdirMutation.isPending ? `${t("create")}…` : `${t("create")} ${parsed.filter}`}
+								</Text>
+							</Group>
+						</Combobox.Option>
+					)}
 				</Combobox.Options>
 			</Combobox.Dropdown>
 		</Combobox>

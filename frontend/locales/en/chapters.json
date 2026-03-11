@@ -39,6 +39,8 @@
 	"conflictsDescription": "{{count}} file(s) have conflicts. You may proceed, and the AI narrator can help resolve them.",
 	"noConflicts": "No conflicts",
 	"mergeClean": "Merge can proceed cleanly.",
+	"fastForward": "Fast-forward",
+	"fastForwardDescription": "Target branch has no divergent commits. Merge will fast-forward without creating a merge commit.",
 	"conflictCheckFailed": "Conflict check failed",
 	"mergeFailed": "Merge failed",
 	"checkConflicts": "Check Conflicts",

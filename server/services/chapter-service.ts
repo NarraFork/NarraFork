@@ -288,6 +288,11 @@ export const chapterService = {
 				}
 			}
 
+			// Trunk role is reserved for the root chapter (project source directory)
+			if (data.role === "trunk" && !existing.isRoot) {
+				throw new ValidationError("Trunk role is reserved for the root chapter");
+			}
+
 			const now = new Date().toISOString();
 			const set: Record<string, unknown> = { updatedAt: now };
 			if (data.title !== undefined) set.title = data.title;

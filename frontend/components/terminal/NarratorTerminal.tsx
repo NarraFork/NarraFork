@@ -49,6 +49,14 @@ function applyOrder(
 	return ordered;
 }
 
+const LAYOUT_PANEL_COUNT: Record<TerminalLayout, number> = {
+	single: 1,
+	"split-h": 2,
+	"split-v": 2,
+	triple: 3,
+	quad: 4,
+};
+
 export function NarratorTerminal({
 	narratorId,
 	onSendToChat,
@@ -152,8 +160,12 @@ export function NarratorTerminal({
 	const handleLayoutChange = useCallback(
 		(newLayout: TerminalLayout) => {
 			viewState.update({ layout: newLayout });
+			const needed = LAYOUT_PANEL_COUNT[newLayout] - runningTerminals.length;
+			for (let i = 0; i < needed; i++) {
+				createTerminal.mutate({ name: `Terminal ${runningTerminals.length + i + 1}` });
+			}
 		},
-		[viewState],
+		[viewState, runningTerminals.length, createTerminal],
 	);
 
 	const handleTabSelect = useCallback(
@@ -190,7 +202,7 @@ export function NarratorTerminal({
 
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-			<Group gap={4} px={4} py={2} justify="space-between" style={{ flexShrink: 0 }}>
+			<Group gap={4} px={4} py={2} wrap="nowrap" style={{ flexShrink: 0 }}>
 				<TerminalTabBar
 					tabs={tabs}
 					activeTabId={activeId}
@@ -201,7 +213,9 @@ export function NarratorTerminal({
 					onReorder={handleReorder}
 					createPending={createTerminal.isPending}
 				/>
-				<LayoutSelector value={layout} onChange={handleLayoutChange} />
+				<Box style={{ flexShrink: 0 }}>
+					<LayoutSelector value={layout} onChange={handleLayoutChange} />
+				</Box>
 			</Group>
 			<Box style={{ flex: 1, minHeight: 0 }}>
 				<TerminalGrid

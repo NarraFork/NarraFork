@@ -46,12 +46,12 @@ process.on("unhandledRejection", (reason) => {
 const cliPort = process.argv.find((a) => a.startsWith("--port="))?.split("=")[1];
 const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1];
 
+const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
 const host = cliHost || process.env.HOST || "localhost";
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
-const isCompiledBinary =
-	import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
 // Also treat as production when dist/frontend exists (handles Windows where
 // NODE_ENV=production inline syntax doesn't work)
 const hasFrontendBuild = existsSync(
@@ -194,58 +194,112 @@ if (isProd) {
 	}
 }
 
-const _server = Bun.serve({
-	port,
-	hostname: host,
-	idleTimeout: 255,
-	async fetch(req, server) {
-		const url = new URL(req.url);
+// Try to start the server, with automatic port fallback when the default port is busy.
+const MAX_PORT_RETRIES = 10;
 
-		// WebSocket upgrade for /ws/narrator and /ws/terminal
-		if (url.pathname.startsWith("/ws")) {
-			// Verify JWT from query param
-			const token = url.searchParams.get("token");
-			if (!token) {
-				return new Response("Authentication required", { status: 401 });
+function startServer(listenPort: number) {
+	return Bun.serve({
+		port: listenPort,
+		hostname: host,
+		idleTimeout: 255,
+		async fetch(req, server) {
+			const url = new URL(req.url);
+
+			// WebSocket upgrade for /ws/narrator and /ws/terminal
+			if (url.pathname.startsWith("/ws")) {
+				// Verify JWT from query param
+				const token = url.searchParams.get("token");
+				if (!token) {
+					return new Response("Authentication required", { status: 401 });
+				}
+				let payload: Awaited<ReturnType<typeof verifyToken>>;
+				try {
+					payload = await verifyToken(token);
+				} catch {
+					return new Response("Invalid or expired token", { status: 401 });
+				}
+
+				// Look up user info for presence tracking
+				const user = await db.query.users.findFirst({
+					where: eq(users.id, payload.sub),
+					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				});
+				const userInfo = user
+					? {
+							userId: user.id,
+							username: user.username,
+							avatarColor: user.avatarColor,
+							avatarImageId: user.avatarImageId,
+						}
+					: undefined;
+
+				const wsData = resolveWSData(url, userInfo);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
 			}
-			let payload: Awaited<ReturnType<typeof verifyToken>>;
-			try {
-				payload = await verifyToken(token);
-			} catch {
-				return new Response("Invalid or expired token", { status: 401 });
-			}
 
-			// Look up user info for presence tracking
-			const user = await db.query.users.findFirst({
-				where: eq(users.id, payload.sub),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			});
-			const userInfo = user
-				? {
-						userId: user.id,
-						username: user.username,
-						avatarColor: user.avatarColor,
-						avatarImageId: user.avatarImageId,
-					}
-				: undefined;
+			// Everything else goes to Hono
+			return app.fetch(req);
+		},
+		websocket: wsHandlers,
+	});
+}
 
-			const wsData = resolveWSData(url, userInfo);
-			if (!wsData) {
-				return new Response("Unknown WebSocket endpoint", { status: 404 });
-			}
+let actualPort = port;
+let _server: ReturnType<typeof startServer>;
 
-			const upgraded = server.upgrade(req, { data: wsData });
-			if (upgraded) return undefined;
-			return new Response("WebSocket upgrade failed", { status: 400 });
+if (portExplicit) {
+	// User explicitly specified a port — fail hard if it's busy
+	try {
+		_server = startServer(port);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+			logger.error(`Port ${port} is already in use. Cannot start server.`);
+			console.error(
+				`\x1b[31mError: Port ${port} is already in use.\x1b[0m\nPlease free the port or choose a different one with --port=XXXX.`,
+			);
+			process.exit(1);
 		}
+		throw err;
+	}
+} else {
+	// Default port — try fallback ports if busy
+	let started = false;
+	for (let attempt = 0; attempt <= MAX_PORT_RETRIES; attempt++) {
+		const tryPort = port + attempt;
+		try {
+			_server = startServer(tryPort);
+			actualPort = tryPort;
+			started = true;
+			if (attempt > 0) {
+				logger.warn(`Default port ${port} was in use, automatically switched to port ${tryPort}`);
+				console.warn(`\x1b[33m⚠ Port ${port} is in use. Using port ${tryPort} instead.\x1b[0m`);
+			}
+			break;
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+				continue;
+			}
+			throw err;
+		}
+	}
+	if (!started) {
+		logger.error(`Could not find an available port (tried ${port}–${port + MAX_PORT_RETRIES}).`);
+		console.error(
+			`\x1b[31mError: Could not find an available port (tried ${port}–${port + MAX_PORT_RETRIES}).\x1b[0m\nPlease specify a port with --port=XXXX.`,
+		);
+		process.exit(1);
+	}
+}
 
-		// Everything else goes to Hono
-		return app.fetch(req);
-	},
-	websocket: wsHandlers,
-});
-
-logger.info(`NarraFork server running on http://${host}:${port}`, {
+logger.info(`NarraFork server running on http://${host}:${actualPort}`, {
 	isProd,
 	isCompiledBinary,
 	metaUrl: import.meta.url,
@@ -256,7 +310,7 @@ logger.info(`NarraFork server running on http://${host}:${port}`, {
 	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
-	const url = `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
+	const url = `http://${host === "0.0.0.0" ? "localhost" : host}:${actualPort}`;
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);

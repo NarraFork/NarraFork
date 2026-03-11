@@ -21,6 +21,12 @@ export interface McpServerStatus {
 	id: string;
 	name: string;
 	transport: McpServerConfig["transport"];
+	command?: string;
+	args?: string[];
+	cwd?: string;
+	url?: string;
+	env?: Record<string, string>;
+	headers?: Record<string, string>;
 	enabled: boolean;
 	status: "connected" | "disconnected" | "connecting" | "error";
 	error?: string;
@@ -262,6 +268,12 @@ class McpManager {
 				id: cfg.id,
 				name: cfg.name,
 				transport: cfg.transport,
+				command: cfg.command,
+				args: cfg.args,
+				cwd: cfg.cwd,
+				url: cfg.url,
+				env: cfg.env,
+				headers: cfg.headers,
 				enabled: cfg.enabled,
 				status: entry?.status ?? "disconnected",
 				error: entry?.error,

@@ -14,7 +14,12 @@ export const enterPlanModeTool: ToolDefinition = {
 		"simple tasks, bug fixes, or straightforward changes — handle those directly in the current context. " +
 		"In plan mode, focus on reading relevant files and forming an actionable implementation plan " +
 		"without making any edits or running commands. Call ExitPlanMode with your plan when ready.",
-	parameters: z.object({}),
+	parameters: z.object({
+		confirm: z
+			.literal(true)
+			.default(true)
+			.describe("Confirm entering plan mode. Always pass true."),
+	}),
 	async execute(_args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (assistant_message event).
 		const locale = (ctx?.locale as Locale) ?? "en";

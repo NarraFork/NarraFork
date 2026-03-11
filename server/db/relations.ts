@@ -6,6 +6,7 @@ import {
 	containerInstances,
 	explorationGroups,
 	mergeSessions,
+	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorPatches,
@@ -101,6 +102,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	terminals: many(terminals),
 	commits: many(chapterCommits),
 	whitelistDirs: many(narratorWhitelistDirs),
+	blacklistDirs: many(narratorBlacklistDirs),
 }));
 
 export const narratorMessagesRelations = relations(narratorMessages, ({ one, many }) => ({
@@ -227,6 +229,13 @@ export const chapterCommitsRelations = relations(chapterCommits, ({ one }) => ({
 export const narratorWhitelistDirsRelations = relations(narratorWhitelistDirs, ({ one }) => ({
 	narrator: one(narrators, {
 		fields: [narratorWhitelistDirs.narratorId],
+		references: [narrators.id],
+	}),
+}));
+
+export const narratorBlacklistDirsRelations = relations(narratorBlacklistDirs, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorBlacklistDirs.narratorId],
 		references: [narrators.id],
 	}),
 }));

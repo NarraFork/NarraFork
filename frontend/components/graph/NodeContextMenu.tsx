@@ -74,7 +74,7 @@ export function NodeContextMenu({
 							<Text size="xs" fw={600} c="dimmed" px="xs">
 								{t("contextMenu.setRole")}
 							</Text>
-							{(["trunk", "branch", "exploration"] as const).map((role) => (
+							{(["branch", "exploration"] as const).map((role) => (
 								<UnstyledButton
 									key={role}
 									px="xs"

@@ -849,16 +849,17 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 	}
 }
 
-/** Ensure .narrafork/ is in the project's .gitignore. */
+/** Ensure .narrafork/ and .worktrees/ are in the project's .gitignore. */
 export function ensureGitignoreEntry(gitPath: string): void {
-	const entry = ".narrafork/";
+	const entries = [".narrafork/", ".worktrees/"];
 	const gitignorePath = resolve(gitPath, ".gitignore");
 	if (existsSync(gitignorePath)) {
 		const content = readFileSync(gitignorePath, "utf-8");
-		if (content.includes(entry)) return;
-		writeFileSync(gitignorePath, `${content.trimEnd()}\n${entry}\n`);
+		const missing = entries.filter((e) => !content.includes(e));
+		if (missing.length === 0) return;
+		writeFileSync(gitignorePath, `${content.trimEnd()}\n${missing.join("\n")}\n`);
 	} else {
-		writeFileSync(gitignorePath, `${entry}\n`);
+		writeFileSync(gitignorePath, `${entries.join("\n")}\n`);
 	}
 }
 

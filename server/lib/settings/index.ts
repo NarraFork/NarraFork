@@ -130,6 +130,18 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/** Global whitelist directories — merged with project and narrator level. */
+		whitelistDirs?: Array<{
+			path: string;
+			accessLevel: "readOnly" | "readWrite" | "full";
+			enabled?: boolean;
+		}>;
+		/** Global blacklist directories — merged with project and narrator level. */
+		blacklistDirs?: Array<{
+			path: string;
+			denyLevel: "denyWrite" | "denyAll";
+			enabled?: boolean;
+		}>;
 	};
 	chapters: {
 		maxActiveWorktrees: number;

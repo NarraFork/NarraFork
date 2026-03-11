@@ -117,6 +117,10 @@
 	"selectThisDirectory": "选择此目录",
 	"goUp": "上一级",
 	"emptyDirectory": "空目录",
+	"noMatchingDirectories": "没有匹配的目录",
+	"filteringBy": "筛选: {{filter}}",
+	"newFolder": "新建文件夹",
+	"newFolderPlaceholder": "文件夹名称",
 	"selectDrive": "选择磁盘",
 	"computer": "此电脑",
 	"cancel": "取消",
@@ -171,5 +175,10 @@
 		"gitDeleted": "已删除",
 		"gitRenamed": "已重命名",
 		"gitUntracked": "未跟踪"
-	}
+	},
+	"operationFailed": "操作失败",
+	"unexpectedError": "发生了意外错误",
+	"somethingWentWrong": "出了点问题",
+	"retry": "重试",
+	"backToHome": "返回首页"
 }

@@ -7,6 +7,7 @@ import { api } from "../../lib/api";
 interface MergeCheckResult {
 	hasConflicts: boolean;
 	conflictFiles: string[];
+	isFastForward: boolean;
 }
 
 interface ChapterMergeModalProps {
@@ -114,8 +115,13 @@ export function ChapterMergeModal({
 				)}
 
 				{conflicts && !conflicts.hasConflicts && (
-					<Alert color="green" title={t("noConflicts")}>
-						<Text size="sm">{t("mergeClean")}</Text>
+					<Alert
+						color="green"
+						title={conflicts.isFastForward ? t("fastForward") : t("noConflicts")}
+					>
+						<Text size="sm">
+							{conflicts.isFastForward ? t("fastForwardDescription") : t("mergeClean")}
+						</Text>
 					</Alert>
 				)}
 

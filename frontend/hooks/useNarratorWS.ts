@@ -14,6 +14,8 @@ interface NarratorWSCallbacks {
 		requestId: string,
 		toolUseId?: string,
 		updatedInput?: Record<string, unknown>,
+		decision?: "allow" | "deny",
+		feedbackText?: string,
 	) => void;
 	onStatusChange?: (status: string) => void;
 	onToolStarted?: (
@@ -242,6 +244,8 @@ export function useNarratorWS(
 								data.requestId,
 								data.toolUseId,
 								data.updatedInput,
+								data.decision,
+								data.feedbackText,
 							);
 							break;
 						case "status_change":

@@ -74,7 +74,13 @@ export type ResolvedToolDefinition = ToolDefinition & { description: string };
 
 export type PermissionResult =
 	| { behavior: "allow"; updatedInput?: Record<string, unknown> }
-	| { behavior: "deny"; message?: string; fatal?: boolean };
+	| {
+			behavior: "deny";
+			message?: string;
+			fatal?: boolean;
+			/** When true, `message` is already a complete user-facing string — skip wrapping. */
+			rawMessage?: boolean;
+	  };
 
 // === Agent events (yielded by the loop) ===
 

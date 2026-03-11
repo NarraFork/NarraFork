@@ -1,5 +1,6 @@
 import { type AgentConfig, agentLoop } from "../lib/agent";
 import { logger } from "../lib/logger";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
 
 export interface ExecuteLoopOptions {
@@ -57,6 +58,14 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 				eventType: event.type,
 				error: String(err),
 			});
+			// For critical events, notify frontend about persistence issues
+			if (event.type === "block_complete" || event.type === "tool_result") {
+				broadcastToNarrator(config.narratorId, {
+					type: "warning",
+					narratorId: config.narratorId,
+					message: `Failed to persist ${event.type}: ${String(err)}`,
+				});
+			}
 		}
 
 		// After processing a tool_result or error under abort, stop consuming further events.

@@ -7,11 +7,11 @@ import {
 	Select,
 	Stack,
 	Text,
-	TextInput,
 	Title,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import { useDebouncedCallback } from "@mantine/hooks";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
 const TOTAL_STEPS = 5;
@@ -340,11 +341,16 @@ function BasicSettingsStep() {
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
 	});
 
-	const handleBlur = () => {
+	const debouncedSaveDir = useDebouncedCallback((path: string) => {
 		save.mutate({
-			paths: { defaultProjectDir: projectDir },
+			paths: { defaultProjectDir: path },
 			agent: { defaultModel },
 		});
+	}, 500);
+
+	const handleDirChange = (path: string) => {
+		setProjectDir(path);
+		debouncedSaveDir(path);
 	};
 
 	return (
@@ -352,12 +358,7 @@ function BasicSettingsStep() {
 			<Text size="sm" c="dimmed">
 				{t("wizardBasicDesc")}
 			</Text>
-			<TextInput
-				label={t("defaultProjectDir")}
-				value={projectDir}
-				onChange={(e) => setProjectDir(e.currentTarget.value)}
-				onBlur={handleBlur}
-			/>
+			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={handleDirChange} />
 			<Select
 				label={t("defaultModel")}
 				data={groupedModels}

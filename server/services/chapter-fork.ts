@@ -29,8 +29,8 @@ export interface ForkChapterInput {
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
-	/** Chapter role: trunk, branch, or exploration. */
-	role?: "trunk" | "branch" | "exploration";
+	/** Chapter role: branch or exploration (trunk is reserved for the root chapter). */
+	role?: "branch" | "exploration";
 	locale?: Locale;
 	/** Explicit graph position — if provided, skip auto-layout calculation. */
 	positionX?: number;

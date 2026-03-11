@@ -63,6 +63,7 @@ export interface BaseContentBlock {
 	status?: string;
 	durationMs?: number;
 	errorMessage?: string;
+	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
 	permissionSuggestions?: unknown[] | null;
 	permissionDecidedAt?: string | null;
@@ -107,6 +108,15 @@ export interface WhitelistDir {
 	narratorId: string;
 	path: string;
 	accessLevel: "readOnly" | "readWrite" | "full";
+	enabled: boolean;
+	createdAt: string;
+}
+
+export interface BlacklistDir {
+	id: string;
+	narratorId: string;
+	path: string;
+	denyLevel: "denyWrite" | "denyAll";
 	enabled: boolean;
 	createdAt: string;
 }
@@ -250,6 +260,96 @@ export const api = {
 	getProject: (id: string) => request<ApiEntity>(`/projects/${id}`),
 	createProject: (data: Record<string, unknown>) =>
 		request<ApiEntity>("/projects", { method: "POST", body: JSON.stringify(data) }),
+	/**
+	 * Create a project with clone mode — returns an SSE stream.
+	 * Events: "progress" (clone output), "complete" (project JSON), "error".
+	 */
+	createProjectStream: (
+		data: Record<string, unknown>,
+		onProgress: (message: string) => void,
+	): Promise<ApiEntity> => {
+		return new Promise((resolve, reject) => {
+			const headers: Record<string, string> = { "Content-Type": "application/json" };
+			const token = getToken();
+			if (token) headers.Authorization = `Bearer ${token}`;
+
+			fetch(`${BASE}/projects`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(data),
+			})
+				.then((response) => {
+					if (response.status === 401) {
+						clearToken();
+						reject(new ApiError("Unauthorized", 401));
+						return;
+					}
+					if (
+						!response.ok &&
+						!response.headers.get("content-type")?.includes("text/event-stream")
+					) {
+						response
+							.json()
+							.then((err) => reject(new ApiError(err.error ?? "Request failed", response.status)))
+							.catch(() => reject(new ApiError("Request failed", response.status)));
+						return;
+					}
+
+					const reader = response.body?.getReader();
+					if (!reader) {
+						reject(new ApiError("No response body", 500));
+						return;
+					}
+
+					const decoder = new TextDecoder();
+					let buffer = "";
+
+					const pump = (): void => {
+						reader
+							.read()
+							.then(({ done, value }) => {
+								if (done) {
+									reject(new ApiError("Stream ended without completion", 500));
+									return;
+								}
+								buffer += decoder.decode(value, { stream: true });
+								const lines = buffer.split("\n");
+								buffer = lines.pop() ?? "";
+
+								let eventType = "";
+								for (const line of lines) {
+									if (line.startsWith("event:")) {
+										eventType = line.slice(6).trim();
+									} else if (line.startsWith("data:")) {
+										const jsonStr = line.slice(5).trim();
+										if (!jsonStr) continue;
+										try {
+											const parsed = JSON.parse(jsonStr);
+											if (eventType === "progress") {
+												onProgress(parsed.message);
+											} else if (eventType === "complete") {
+												reader.cancel().catch(() => {});
+												resolve(parsed);
+												return;
+											} else if (eventType === "error") {
+												reader.cancel().catch(() => {});
+												reject(new ApiError(parsed.error ?? "Clone failed", 500));
+												return;
+											}
+										} catch {
+											// skip malformed JSON
+										}
+									}
+								}
+								pump();
+							})
+							.catch(reject);
+					};
+					pump();
+				})
+				.catch(reject);
+		});
+	},
 	updateProject: (id: string, data: Record<string, unknown>) =>
 		request<ApiEntity>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	deleteProject: (id: string) => request<ApiEntity>(`/projects/${id}`, { method: "DELETE" }),
@@ -378,6 +478,8 @@ export const api = {
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
 	interruptNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
+	leaveNarrator: (id: string) =>
+		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
 	getBufferedMessage: (id: string) =>
 		request<{ text: string; bufferedAt: string } | null>(`/narrators/${id}/buffer`),
 	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
@@ -435,6 +537,20 @@ export const api = {
 		}),
 	deleteWhitelistDir: (dirId: string) =>
 		request<{ ok: boolean }>(`/narrators/whitelist-dirs/${dirId}`, { method: "DELETE" }),
+	// Blacklist directories
+	getBlacklistDirs: (id: string) => request<BlacklistDir[]>(`/narrators/${id}/blacklist-dirs`),
+	createBlacklistDir: (id: string, data: { path: string; denyLevel?: string; enabled?: boolean }) =>
+		request<BlacklistDir>(`/narrators/${id}/blacklist-dirs`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateBlacklistDir: (dirId: string, data: { denyLevel?: string; enabled?: boolean }) =>
+		request<{ ok: boolean }>(`/narrators/blacklist-dirs/${dirId}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteBlacklistDir: (dirId: string) =>
+		request<{ ok: boolean }>(`/narrators/blacklist-dirs/${dirId}`, { method: "DELETE" }),
 	updateNarratorReasoningEffort: (id: string, reasoningEffort: string | null) =>
 		request<{ ok: boolean }>(`/narrators/${id}/reasoning-effort`, {
 			method: "PATCH",
@@ -1152,6 +1268,12 @@ export const api = {
 				id: string;
 				name: string;
 				transport: string;
+				command?: string;
+				args?: string[];
+				cwd?: string;
+				url?: string;
+				env?: Record<string, string>;
+				headers?: Record<string, string>;
 				enabled: boolean;
 				status: string;
 				error?: string;
@@ -1506,6 +1628,12 @@ export const api = {
 			parent?: string | null;
 			sep: string;
 		}>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+
+	fsMkdir: (parent: string, name: string) =>
+		request<{ path: string }>("/fs/mkdir", {
+			method: "POST",
+			body: JSON.stringify({ parent, name }),
+		}),
 
 	// Routines
 	getRoutines: () =>

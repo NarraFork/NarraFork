@@ -202,6 +202,7 @@ function ProjectDetailPage() {
 			<ProjectSettingsModal
 				projectId={projectId}
 				proxyDomain={project.proxyDomain ?? null}
+				chapterSettings={project.chapterSettings}
 				opened={settingsOpened}
 				onClose={closeSettings}
 			/>

@@ -403,27 +403,101 @@ export async function* agentLoop(
 					assistantText += parsed.text;
 					yield { type: "stream_text", text: parsed.text };
 				}
-				if (parsed.toolUses) toolUses.push(...parsed.toolUses);
+				if (parsed.toolUses) {
+					// ── Tool use dedup ──
+					// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
+					// `parsed.toolUseChunk` path. This commonly happens for tools with
+					// empty or very small parameters (e.g. EnterPlanMode). Without dedup,
+					// the tool would be executed twice and yield duplicate events.
+					//
+					// Strategy:
+					// 1. Skip any toolUse whose ID is already in `toolUses` (streaming
+					//    path completed it first).
+					// 2. Remove matching entries from `toolUseAccum` (streaming accumulator)
+					//    so the streaming stop handler doesn't re-process them.
+					// 3. Yield block_complete + tool_call + start eager execution here,
+					//    mirroring what the streaming stop path would have done.
+					for (const tu of parsed.toolUses) {
+						// Skip duplicates — the streaming path may have already
+						// completed this tool call via toolUseChunk stop.
+						if (toolUses.some((t) => t.toolUseId === tu.toolUseId)) continue;
+
+						toolUses.push(tu);
+
+						// If this tool was also being streamed via toolUseChunk, remove it
+						// from the accumulator so it isn't flagged as orphaned.
+						// the same call — especially for tools with empty parameters.
+						const wasStreaming = toolUseAccum.has(tu.toolUseId);
+						if (wasStreaming) {
+							toolUseAccum.delete(tu.toolUseId);
+						}
+
+						// Yield block_complete so the tool call is persisted
+						// (the streaming path would have done this on stop, but
+						// non-streaming toolUses skip that path entirely).
+						yield {
+							type: "block_complete",
+							block: {
+								type: "tool_use",
+								toolUseId: tu.toolUseId,
+								name: tu.name,
+								input: tu.input,
+							} satisfies ContentBlock,
+						};
+
+						// Start eager execution (same as the streaming stop path)
+						if (!earlyExecMap.has(tu.toolUseId)) {
+							const execPromise = executeTool(tu, config).catch(
+								(err): ToolExecResult => ({
+									output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+									isError: true,
+									durationMs: 0,
+								}),
+							);
+							execPromise.then((r) => settledResults.set(tu.toolUseId, r));
+							earlyExecMap.set(tu.toolUseId, execPromise);
+						}
+
+						yield {
+							type: "tool_call",
+							toolUseId: tu.toolUseId,
+							toolName: tu.name,
+							input: tu.input,
+						};
+					}
+				}
 
 				// Handle streaming tool use chunks
 				if (parsed.toolUseChunk) {
 					const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
 					if (id) {
 						if (!toolUseAccum.has(id) && name) {
-							toolUseAccum.set(id, {
-								name,
-								inputChunks: [],
-								totalChars: 0,
-								startedAt: Date.now(),
-								lastYieldedAt: Date.now(),
-							});
-							// Yield immediately so the frontend knows the tool name early
-							yield {
-								type: "tool_use_chunk",
-								toolUseId: id,
-								toolName: name,
-								inputCharsTotal: 0,
-							};
+							// Don't create accumulator if this tool was already
+							// completed via non-streaming parsed.toolUses
+							if (toolUses.some((t) => t.toolUseId === id)) {
+								// Still yield the chunk so the frontend sees it
+								yield {
+									type: "tool_use_chunk",
+									toolUseId: id,
+									toolName: name,
+									inputCharsTotal: 0,
+								};
+							} else {
+								toolUseAccum.set(id, {
+									name,
+									inputChunks: [],
+									totalChars: 0,
+									startedAt: Date.now(),
+									lastYieldedAt: Date.now(),
+								});
+								// Yield immediately so the frontend knows the tool name early
+								yield {
+									type: "tool_use_chunk",
+									toolUseId: id,
+									toolName: name,
+									inputCharsTotal: 0,
+								};
+							}
 						}
 						const acc = toolUseAccum.get(id);
 						if (acc) {
@@ -507,8 +581,17 @@ export async function* agentLoop(
 									input: parsedInput,
 									streamStartedAt: acc.startedAt,
 								};
-								toolUses.push(tu);
+								// Skip if already added via non-streaming parsed.toolUses
+								const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
+								if (!alreadyAdded) {
+									toolUses.push(tu);
+								}
 								toolUseAccum.delete(id);
+
+								// If already handled via non-streaming parsed.toolUses,
+								// skip block_complete / execution / tool_call — they were
+								// already yielded in the parsed.toolUses handler above.
+								if (alreadyAdded) continue;
 
 								// Block is complete — yield for immediate persistence
 								yield {
@@ -1166,11 +1249,14 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	// Permission check
 	const permission = await config.permissionHandler(tu.name, tu.input, tu.toolUseId);
 	if (permission.behavior === "deny") {
-		const userMessage = permission.message
-			? getToolMessageWithParams("permissionDeniedWithMessage", locale, {
-					message: permission.message,
-				})
-			: getToolMessage("permissionDeniedByUser", locale);
+		const userMessage =
+			permission.rawMessage && permission.message
+				? permission.message
+				: permission.message
+					? getToolMessageWithParams("permissionDeniedWithMessage", locale, {
+							message: permission.message,
+						})
+					: getToolMessage("permissionDeniedByUser", locale);
 		return {
 			output: userMessage,
 			isError: true,
@@ -1337,19 +1423,17 @@ function sanitizeBrokenInput(
 	const clean: Record<string, unknown> = {};
 	const isEdit = toolName === "Edit" || toolName === "MultiEdit";
 
-	// If input is just { _raw: "..." }, extract file_path and note the raw length
+	// If input is just { _raw: "..." }, extract file_path from the incomplete JSON
 	if ("_raw" in input && Object.keys(input).length === 1) {
 		const raw = input._raw as string;
-		const charsNote = `${placeholder} (${raw.length} chars received)`;
-		// Try to extract file_path from the incomplete JSON
 		const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
 		clean.file_path = filePathMatch ? filePathMatch[1] : "";
 		// Use the correct field names so the frontend can render properly
 		if (isEdit) {
-			clean.old_string = charsNote;
-			clean.new_string = charsNote;
+			clean.old_string = placeholder;
+			clean.new_string = placeholder;
 		} else {
-			clean.content = charsNote;
+			clean.content = placeholder;
 		}
 	} else {
 		// Normal case: copy non-content fields, replace content fields

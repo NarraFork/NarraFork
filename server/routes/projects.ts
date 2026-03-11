@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { db } from "../db";
 import { chapters, explorationGroups, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -51,6 +52,94 @@ projectRoutes.post("/", async (c) => {
 	let defaultBranch = body.defaultBranch ?? "main";
 	const mode = body.repoMode;
 
+	// For clone mode, use SSE to stream progress
+	if (mode === "clone") {
+		if (!body.cloneUrl) {
+			throw new ValidationError('cloneUrl is required when repoMode is "clone"');
+		}
+		const cloneUrl = body.cloneUrl;
+		const cloneBranch = body.cloneBranch;
+
+		return streamSSE(c, async (stream) => {
+			let sseId = 0;
+			try {
+				await gitService.cloneRepoStreaming(cloneUrl, gitPath, cloneBranch, (line) => {
+					stream
+						.writeSSE({
+							id: String(sseId++),
+							event: "progress",
+							data: JSON.stringify({ message: line }),
+						})
+						.catch(() => {});
+				});
+
+				const detectedBranch = await gitService.getCurrentBranch(gitPath);
+				remoteUrl = cloneUrl;
+				defaultBranch = cloneBranch ?? detectedBranch ?? "main";
+
+				const [project] = await db
+					.insert(projects)
+					.values({
+						id: projectId,
+						name: body.name,
+						description: body.description,
+						gitPath,
+						remoteUrl,
+						defaultBranch,
+						createdAt: now,
+						updatedAt: now,
+					})
+					.returning();
+
+				if (project.proxyDomain) {
+					refreshContainerProxyCache().catch((err) => {
+						logger.warn("Failed to refresh container proxy cache after project create", {
+							projectId,
+							error: String(err),
+						});
+					});
+				}
+
+				try {
+					await chapterService.createRootChapter({
+						projectId,
+						title: body.name,
+						gitPath,
+						defaultBranch,
+					});
+				} catch (err) {
+					console.warn("Failed to create root chapter:", err);
+				}
+
+				try {
+					projectDbManager.openForGitPath(projectId, gitPath);
+					ensureGitignoreEntry(gitPath);
+					await gitService.commitGitignoreIfDirty(gitPath);
+				} catch (err) {
+					logger.warn("Failed to initialize project backup DB", {
+						projectId,
+						error: String(err),
+					});
+				}
+
+				await stream.writeSSE({
+					id: String(sseId++),
+					event: "complete",
+					data: JSON.stringify(project),
+				});
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				await stream
+					.writeSSE({
+						id: String(sseId++),
+						event: "error",
+						data: JSON.stringify({ error: message }),
+					})
+					.catch(() => {});
+			}
+		});
+	}
+
 	if (mode === "existing") {
 		if (!(await gitService.isGitRepo(gitPath))) {
 			throw new ValidationError(`Path is not a git repository: ${gitPath}`);
@@ -59,14 +148,10 @@ projectRoutes.post("/", async (c) => {
 		await gitService.initRepo(gitPath);
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
 		defaultBranch = body.defaultBranch ?? detectedBranch ?? "main";
-	} else if (mode === "clone") {
-		if (!body.cloneUrl) {
-			throw new ValidationError('cloneUrl is required when repoMode is "clone"');
-		}
-		await gitService.cloneRepo(body.cloneUrl, gitPath, body.cloneBranch);
-		const detectedBranch = await gitService.getCurrentBranch(gitPath);
-		remoteUrl = body.cloneUrl;
-		defaultBranch = body.cloneBranch ?? detectedBranch ?? "main";
+
+		// Commit .gitignore as part of initial repo setup so fork branches inherit it
+		ensureGitignoreEntry(gitPath);
+		await gitService.stageAndCommit(gitPath, [".gitignore"], "Add .gitignore");
 	}
 
 	const [project] = await db
@@ -109,6 +194,7 @@ projectRoutes.post("/", async (c) => {
 	try {
 		projectDbManager.openForGitPath(projectId, gitPath);
 		ensureGitignoreEntry(gitPath);
+		await gitService.commitGitignoreIfDirty(gitPath);
 	} catch (err) {
 		logger.warn("Failed to initialize project backup DB", {
 			projectId,

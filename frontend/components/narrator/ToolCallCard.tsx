@@ -65,6 +65,7 @@ export interface ToolCallData {
 	status: string;
 	durationMs?: number;
 	errorMessage?: string;
+	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	permissionSuggestions?: any[] | null;
@@ -323,7 +324,11 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		if (filePath) {
 			const base = basename(filePath);
 			const displayChars = contentChars ?? chars;
-			return displayChars > 0 ? `${base} (${displayChars} chars)` : base;
+			// Don't show tiny char counts during the initial streaming phase —
+			// the API may be validating output completeness and only a few bytes
+			// (JSON delimiters) have arrived. The ToolHeader renders a dedicated
+			// streaming indicator instead.
+			return displayChars > 10 ? `${base} (${displayChars} chars)` : base;
 		}
 		return chars > 0 ? `${chars} chars` : "";
 	}
@@ -1125,8 +1130,8 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 			: "";
 
 	const isDenied = toolCall.status === "fail" && toolCall.toolName === "ExitPlanMode";
-	// User feedback is stored in errorMessage when the plan is denied
-	const denyFeedback = isDenied ? toolCall.errorMessage : undefined;
+	// User feedback is stored in permissionDenyMessage (raw user input, not the full system prompt)
+	const denyFeedback = isDenied ? (toolCall.permissionDenyMessage ?? undefined) : undefined;
 	const [planExpanded, setPlanExpanded] = useState(!isDenied);
 
 	if (!planText) {
@@ -1653,7 +1658,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 					style={swipe.swipeStyle}
 				>
 					<Box ref={isPlan ? cardRef : undefined}>
-						<Box p="xs">{cardContent}</Box>
+						<Box p="xs" className={isStreaming ? "tool-card-shimmer" : undefined}>
+							{cardContent}
+						</Box>
 						{!isLast && <Divider color="var(--mantine-color-default-border)" size={1} />}
 					</Box>
 				</Box>
@@ -1671,6 +1678,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					withBorder={!inRun}
 					radius={inRun ? 0 : "sm"}
 					p="xs"
+					className={isStreaming ? "tool-card-shimmer" : undefined}
 					style={{
 						backgroundColor: TOOL_CARD_BG,
 						...(borderColor ? { borderColor } : {}),
@@ -1765,13 +1773,35 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 	);
 });
 
-// CSS keyframe for spinner — inject once
+// CSS keyframes — inject once
 if (typeof document !== "undefined") {
 	const id = "tool-call-spin";
 	if (!document.getElementById(id)) {
 		const style = document.createElement("style");
 		style.id = id;
-		style.textContent = "@keyframes spin { to { transform: rotate(360deg) } }";
+		style.textContent = `
+@keyframes spin { to { transform: rotate(360deg) } }
+@keyframes tool-shimmer { to { transform: translateX(100%) } }
+.tool-card-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.tool-card-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    light-dark(rgba(0,0,0,.04), rgba(255,255,255,.04)) 40%,
+    light-dark(rgba(0,0,0,.07), rgba(255,255,255,.07)) 50%,
+    light-dark(rgba(0,0,0,.04), rgba(255,255,255,.04)) 60%,
+    transparent 100%
+  );
+  animation: tool-shimmer 2s ease-in-out infinite;
+  pointer-events: none;
+}`;
 		document.head.appendChild(style);
 	}
 }

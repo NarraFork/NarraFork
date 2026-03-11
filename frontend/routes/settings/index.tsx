@@ -1,54 +1,29 @@
-import {
-	Accordion,
-	Affix,
-	Anchor,
-	Avatar,
-	Badge,
-	Button,
-	FileButton,
-	FileInput,
-	Group,
-	Loader,
-	NumberInput,
-	PasswordInput,
-	SegmentedControl,
-	Select,
-	Slider,
-	Stack,
-	Switch,
-	Text,
-	TextInput,
-	Title,
-	Transition,
-} from "@mantine/core";
+import { Accordion, Affix, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import {
 	IconBell,
-	IconBrandGithub,
+	IconBox,
+	IconBrain,
 	IconChevronDown,
 	IconChevronUp,
-	IconDeviceFloppy,
-	IconEye,
-	IconHandStop,
-	IconNotebook,
-	IconPencilCheck,
-	IconPlayerPlay,
-	IconRefresh,
-	IconShield,
-	IconShieldOff,
-	IconTrash,
-	IconUpload,
+	IconCpu,
+	IconInfoCircle,
+	IconPalette,
+	IconServer,
+	IconUser,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
-import { DirListEditor } from "../../components/common/DirListEditor";
-import { LanguageSwitcher } from "../../components/LanguageSwitcher";
-import { DependencyStatus } from "../../components/settings/DependencyStatus";
-import { ThemeSwitcher } from "../../components/ThemeSwitcher";
-import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
-import { UserAvatar } from "../../components/UserAvatar";
+import { AboutSection } from "../../components/settings/AboutSection";
+import { AgentSection } from "../../components/settings/AgentSection";
+import { AppearanceSection } from "../../components/settings/AppearanceSection";
+import { ChaptersContainersSection } from "../../components/settings/ChaptersContainersSection";
+import { ModelsSection } from "../../components/settings/ModelsSection";
+import { NotificationSection } from "../../components/settings/NotificationSection";
+import { ProfileSection } from "../../components/settings/ProfileSection";
+import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
 import {
 	useCurrentUser,
 	useDeleteAvatar,
@@ -59,11 +34,6 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import {
-	BUILTIN_SOUND_NAMES,
-	playBuiltinSound,
-	playCustomSound,
-} from "../../lib/notification-sound";
 
 /** Ensure a model value has a "provider:" prefix. */
 function ensurePrefix(val: string): string {
@@ -73,20 +43,12 @@ function ensurePrefix(val: string): string {
 
 const ALL_SECTIONS = [
 	"profile",
-	"server",
+	"models",
 	"agent",
-	"chapters",
-	"containers",
-	"session",
+	"chaptersContainers",
 	"notifications",
-	"wordWrap",
-	"terminal",
-	"debug",
-	"theme",
-	"display",
-	"language",
-	"pwa",
-	"deps",
+	"appearance",
+	"serverSystem",
 	"about",
 ];
 
@@ -105,11 +67,10 @@ function SettingsPage() {
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
 	});
 	const { t } = useTranslation("settings");
-	const { t: tn } = useTranslation("narrator");
 	const navigate = useNavigate();
 
-	// Accordion state — all collapsed by default
-	const [openSections, setOpenSections] = useState<string[]>([]);
+	// Accordion state — profile & about expanded by default
+	const [openSections, setOpenSections] = useState<string[]>(["profile", "about"]);
 
 	// Version / health info
 	const { data: healthData } = useQuery({
@@ -190,7 +151,7 @@ function SettingsPage() {
 	// OLED mode (local-only)
 	const [oledMode, setOledMode] = useLocalPref("narrafork_oled");
 
-	// PWA cache refresh (does not check for backend updates)
+	// PWA cache refresh
 	const [pwaUpdating, setPwaUpdating] = useState(false);
 
 	const handlePwaUpdate = async () => {
@@ -225,7 +186,6 @@ function SettingsPage() {
 	const [globalBlacklistDirs, setGlobalBlacklistDirs] = useState<
 		Array<{ path: string; denyLevel: string; enabled?: boolean }>
 	>([]);
-	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
 	const [maxContainers, setMaxContainers] = useState(5);
@@ -538,482 +498,108 @@ function SettingsPage() {
 			<Accordion multiple variant="separated" value={openSections} onChange={setOpenSections}>
 				{/* Profile */}
 				<Accordion.Item value="profile">
-					<Accordion.Control>{t("profileSection")}</Accordion.Control>
+					<Accordion.Control icon={<IconUser size={20} />}>{t("profileSection")}</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<Group>
-								{currentUser ? (
-									<UserAvatar
-										username={currentUser.username}
-										avatarColor={currentUser.avatarColor}
-										avatarImageId={currentUser.avatarImageId}
-										userId={currentUser.id}
-										size={80}
-										showTooltip={false}
-									/>
-								) : (
-									<Avatar size={80} />
-								)}
-								<Stack gap="xs">
-									<FileButton
-										onChange={handleAvatarFileSelected}
-										accept="image/png,image/jpeg,image/webp"
-									>
-										{(props) => (
-											<Button
-												{...props}
-												variant="light"
-												size="xs"
-												leftSection={<IconUpload size={14} />}
-											>
-												{t("avatarUpload")}
-											</Button>
-										)}
-									</FileButton>
-									{currentUser?.avatarImageId && (
-										<Button
-											variant="subtle"
-											color="red"
-											size="xs"
-											leftSection={<IconTrash size={14} />}
-											onClick={handleDeleteAvatar}
-											loading={deleteAvatar.isPending}
-										>
-											{t("avatarDelete")}
-										</Button>
-									)}
-								</Stack>
-							</Group>
-							<TextInput
-								label={t("gitUsername")}
-								placeholder={t("gitUsernamePlaceholder")}
-								leftSection={<IconBrandGithub size={16} />}
-								value={gitUsername}
-								onChange={(e) => {
-									setGitUsername(e.currentTarget.value);
-									setGitDirty(true);
-								}}
-							/>
-							<TextInput
-								label={t("gitEmail")}
-								placeholder={t("gitEmailPlaceholder")}
-								value={gitEmail}
-								onChange={(e) => {
-									setGitEmail(e.currentTarget.value);
-									setGitDirty(true);
-								}}
-							/>
-							{gitDirty && (
-								<Group>
-									<Button
-										size="xs"
-										leftSection={<IconDeviceFloppy size={14} />}
-										onClick={handleGitSave}
-										loading={updateProfile.isPending}
-									>
-										{t("common:save")}
-									</Button>
-								</Group>
-							)}
-						</Stack>
+						<ProfileSection
+							currentUser={currentUser}
+							gitUsername={gitUsername}
+							setGitUsername={setGitUsername}
+							gitEmail={gitEmail}
+							setGitEmail={setGitEmail}
+							gitDirty={gitDirty}
+							setGitDirty={setGitDirty}
+							handleAvatarFileSelected={handleAvatarFileSelected}
+							handleDeleteAvatar={handleDeleteAvatar}
+							handleGitSave={handleGitSave}
+							uploadAvatar={uploadAvatar}
+							deleteAvatar={deleteAvatar}
+							updateProfile={updateProfile}
+						/>
 					</Accordion.Panel>
 				</Accordion.Item>
 
-				{/* Server */}
-				<Accordion.Item value="server">
-					<Accordion.Control>{t("serverSection")}</Accordion.Control>
+				{/* Models */}
+				<Accordion.Item value="models">
+					<Accordion.Control icon={<IconCpu size={20} />}>{t("modelsSection")}</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<NumberInput
-								label={t("serverPort")}
-								value={port}
-								onChange={(v) => setPort(typeof v === "number" ? v : 7778)}
-								min={1024}
-								max={65535}
-							/>
-							<TextInput
-								label={t("defaultProjectDir")}
-								value={projectDir}
-								onChange={(e) => setProjectDir(e.currentTarget.value)}
-							/>
-						</Stack>
+						<ModelsSection
+							defaultModel={defaultModel}
+							setDefaultModel={setDefaultModel}
+							summaryModel={summaryModel}
+							setSummaryModel={setSummaryModel}
+							subagentExploreModel={subagentExploreModel}
+							setSubagentExploreModel={setSubagentExploreModel}
+							subagentPlanModel={subagentPlanModel}
+							setSubagentPlanModel={setSubagentPlanModel}
+							codexDefaultReasoningEffort={codexDefaultReasoningEffort}
+							setCodexDefaultReasoningEffort={setCodexDefaultReasoningEffort}
+							groupedModels={groupedModels}
+							navigate={navigate}
+						/>
 					</Accordion.Panel>
 				</Accordion.Item>
 
-				{/* Agent */}
+				{/* AI Agent */}
 				<Accordion.Item value="agent">
-					<Accordion.Control>{t("agentSection")}</Accordion.Control>
+					<Accordion.Control icon={<IconBrain size={20} />}>{t("agentSection")}</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<Select
-								label={t("defaultModel")}
-								data={groupedModels}
-								searchable
-								value={defaultModel}
-							/>
-							<Select
-								label={t("permissionMode")}
-								data={[
-									{
-										value: "default",
-										label: tn("perm_default"),
-									},
-									{
-										value: "acceptEdits",
-										label: tn("perm_acceptEdits"),
-									},
-									{
-										value: "bypassPermissions",
-										label: tn("perm_bypassPermissions"),
-									},
-									{
-										value: "readOnly",
-										label: tn("perm_readOnly"),
-									},
-									{
-										value: "plan",
-										label: tn("perm_plan"),
-									},
-									{
-										value: "dontAsk",
-										label: tn("perm_dontAsk"),
-									},
-								]}
-								leftSection={
-									permissionMode === "default" ? (
-										<IconShield size={14} />
-									) : permissionMode === "acceptEdits" ? (
-										<IconPencilCheck size={14} />
-									) : permissionMode === "bypassPermissions" ? (
-										<IconShieldOff size={14} />
-									) : permissionMode === "readOnly" ? (
-										<IconEye size={14} />
-									) : permissionMode === "plan" ? (
-										<IconNotebook size={14} />
-									) : permissionMode === "dontAsk" ? (
-										<IconHandStop size={14} />
-									) : (
-										<IconShield size={14} />
-									)
-								}
-								renderOption={({ option, checked }) => {
-									const icons: Record<string, React.ReactNode> = {
-										default: <IconShield size={14} />,
-										acceptEdits: <IconPencilCheck size={14} />,
-										bypassPermissions: <IconShieldOff size={14} />,
-										readOnly: <IconEye size={14} />,
-										plan: <IconNotebook size={14} />,
-										dontAsk: <IconHandStop size={14} />,
-									};
-									return (
-										<Group gap="xs" wrap="nowrap">
-											{icons[option.value] ?? <IconShield size={14} />}
-											<Text size="sm" fw={checked ? 600 : 400}>
-												{option.label}
-											</Text>
-										</Group>
-									);
-								}}
-								value={permissionMode}
-								onChange={(v) => setPermissionMode(v ?? "default")}
-							/>
-							<Select
-								label={t("summaryModel")}
-								data={groupedModels}
-								searchable
-								value={summaryModel}
-							/>
-							<NumberInput
-								label={t("maxTurns")}
-								description={t("maxTurnsDesc")}
-								value={maxTurns}
-								onChange={(v) => setMaxTurns(typeof v === "number" ? v : 200)}
-								min={1}
-								max={1000}
-							/>
-							<Stack gap="xs">
-								<Text size="sm" fw={500}>
-									{t("subagentModels")}
-								</Text>
-								<Text size="xs" c="dimmed">
-									{t("subagentModelsDesc")}
-								</Text>
-								<Select
-									label={t("subagentExploreModel")}
-									data={groupedModels}
-									searchable
-									clearable
-									placeholder={t("subagentModelInherit")}
-									value={subagentExploreModel || null}
-									onChange={(v) => setSubagentExploreModel(v ?? "")}
-								/>
-								<Select
-									label={t("subagentPlanModel")}
-									data={groupedModels}
-									searchable
-									clearable
-									placeholder={t("subagentModelInherit")}
-									value={subagentPlanModel || null}
-									onChange={(v) => setSubagentPlanModel(v ?? "")}
-								/>
-							</Stack>
-							<Switch
-								label={t("legacyEncoding")}
-								description={t("legacyEncodingDesc")}
-								checked={legacyEncoding}
-								onChange={(e) => setLegacyEncoding(e.currentTarget.checked)}
-							/>
-							<Switch
-								label={t("translateReasoning")}
-								description={t("translateReasoningDesc")}
-								checked={translateReasoning}
-								onChange={(e) => setTranslateReasoning(e.currentTarget.checked)}
-							/>
-							<Switch
-								label={t("defaultRelaxedPlan")}
-								description={t("defaultRelaxedPlanDesc")}
-								checked={defaultRelaxedPlan}
-								onChange={(e) => setDefaultRelaxedPlan(e.currentTarget.checked)}
-							/>
-							<Select
-								label={t("planTimeoutAction")}
-								description={t("planTimeoutActionDesc")}
-								data={[
-									{
-										value: "deny",
-										label: t("planTimeoutDeny"),
-									},
-									{
-										value: "auto_approve",
-										label: t("planTimeoutAutoApprove"),
-									},
-								]}
-								value={planTimeoutAction}
-								onChange={(v) => setPlanTimeoutAction(v ?? "deny")}
-							/>
-							<Select
-								label={t("codexDefaultReasoningEffort")}
-								description={t("codexDefaultReasoningEffortDesc")}
-								data={[
-									{
-										value: "auto",
-										label: tn("reasoning_auto"),
-									},
-									{
-										value: "low",
-										label: tn("reasoning_low"),
-									},
-									{
-										value: "medium",
-										label: tn("reasoning_medium"),
-									},
-									{
-										value: "high",
-										label: tn("reasoning_high"),
-									},
-									{
-										value: "xhigh",
-										label: tn("reasoning_xhigh"),
-									},
-								]}
-								value={codexDefaultReasoningEffort || "auto"}
-								onChange={(v) => setCodexDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
-							/>
-							<Button
-								variant="light"
-								onClick={() =>
-									navigate({
-										to: "/admin/providers",
-									})
-								}
-							>
-								{t("customModels")} →
-							</Button>
-							<Title order={5} mt="sm">
-								{t("globalWhitelistDirs")}
-							</Title>
-							<Text size="xs" c="dimmed">
-								{t("globalWhitelistDirsDesc")}
-							</Text>
-							<DirListEditor
-								dirs={globalWhitelistDirs}
-								onChange={setGlobalWhitelistDirs}
-								mode="whitelist"
-								labels={{
-									empty: t("dirListEmpty"),
-									add: t("dirListAdd"),
-									placeholder: t("dirListPlaceholder"),
-									levels: {
-										readOnly: t("dirAccessReadOnly"),
-										readWrite: t("dirAccessReadWrite"),
-										full: t("dirAccessFull"),
-									},
-								}}
-							/>
-							<Title order={5} mt="sm">
-								{t("globalBlacklistDirs")}
-							</Title>
-							<Text size="xs" c="dimmed">
-								{t("globalBlacklistDirsDesc")}
-							</Text>
-							<DirListEditor
-								dirs={globalBlacklistDirs}
-								onChange={setGlobalBlacklistDirs}
-								mode="blacklist"
-								labels={{
-									empty: t("dirListEmpty"),
-									add: t("dirListAdd"),
-									placeholder: t("dirListPlaceholder"),
-									levels: {
-										denyWrite: t("dirDenyWrite"),
-										denyAll: t("dirDenyAll"),
-									},
-								}}
-							/>
-						</Stack>
+						<AgentSection
+							permissionMode={permissionMode}
+							setPermissionMode={setPermissionMode}
+							maxTurns={maxTurns}
+							setMaxTurns={setMaxTurns}
+							legacyEncoding={legacyEncoding}
+							setLegacyEncoding={setLegacyEncoding}
+							translateReasoning={translateReasoning}
+							setTranslateReasoning={setTranslateReasoning}
+							defaultRelaxedPlan={defaultRelaxedPlan}
+							setDefaultRelaxedPlan={setDefaultRelaxedPlan}
+							planTimeoutAction={planTimeoutAction}
+							setPlanTimeoutAction={setPlanTimeoutAction}
+							globalWhitelistDirs={globalWhitelistDirs}
+							setGlobalWhitelistDirs={setGlobalWhitelistDirs}
+							globalBlacklistDirs={globalBlacklistDirs}
+							setGlobalBlacklistDirs={setGlobalBlacklistDirs}
+							userPrefs={userPrefs}
+							updateUserPref={updateUserPref}
+						/>
 					</Accordion.Panel>
 				</Accordion.Item>
 
-				{/* Chapters */}
-				<Accordion.Item value="chapters">
-					<Accordion.Control>{t("chaptersSection")}</Accordion.Control>
+				{/* Chapters & Containers */}
+				<Accordion.Item value="chaptersContainers">
+					<Accordion.Control icon={<IconBox size={20} />}>
+						{t("chaptersAndContainersSection")}
+					</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<NumberInput
-								label={t("maxActiveWorktrees")}
-								value={maxWorktrees}
-								onChange={(v) => setMaxWorktrees(typeof v === "number" ? v : 10)}
-								min={1}
-								max={50}
-							/>
-							<NumberInput
-								label={t("maxActiveContainers")}
-								value={maxContainers}
-								onChange={(v) => setMaxContainers(typeof v === "number" ? v : 5)}
-								min={1}
-								max={20}
-							/>
-							<NumberInput
-								label={t("worktreeSizeWarning")}
-								value={sizeWarning}
-								onChange={(v) => setSizeWarning(typeof v === "number" ? v : 500)}
-								min={100}
-								suffix=" MB"
-							/>
-							<Switch
-								label={t("autoSaveOnDormant")}
-								checked={autoSave}
-								onChange={(e) => setAutoSave(e.currentTarget.checked)}
-							/>
-							<NumberInput
-								label={t("dormantAfterMinutes")}
-								description={t("dormantAfterMinutesDesc")}
-								value={dormantMinutes}
-								onChange={(v) => setDormantMinutes(typeof v === "number" ? v : 0)}
-								min={0}
-							/>
-							<Title order={5} mt="sm">
-								{t("autoCommitSection")}
-							</Title>
-							<NumberInput
-								label={t("autoCommitReminderLines")}
-								description={t("autoCommitReminderLinesDesc")}
-								value={acReminderLines}
-								onChange={(v) => setAcReminderLines(typeof v === "number" ? v : 1000)}
-								min={0}
-								step={50}
-							/>
-							<NumberInput
-								label={t("autoCommitReminderFiles")}
-								description={t("autoCommitReminderFilesDesc")}
-								value={acReminderFiles}
-								onChange={(v) => setAcReminderFiles(typeof v === "number" ? v : 10)}
-								min={0}
-							/>
-							<NumberInput
-								label={t("autoCommitForceLines")}
-								description={t("autoCommitForceLinesDesc")}
-								value={acForceLines}
-								onChange={(v) => setAcForceLines(typeof v === "number" ? v : 2000)}
-								min={0}
-								step={100}
-							/>
-							<NumberInput
-								label={t("autoCommitForceFiles")}
-								description={t("autoCommitForceFilesDesc")}
-								value={acForceFiles}
-								onChange={(v) => setAcForceFiles(typeof v === "number" ? v : 25)}
-								min={0}
-							/>
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Containers */}
-				<Accordion.Item value="containers">
-					<Accordion.Control>{t("containersSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<NumberInput
-								label={t("portRangeStart")}
-								value={portStart}
-								onChange={(v) => setPortStart(typeof v === "number" ? v : 10000)}
-								min={1024}
-								max={65535}
-							/>
-							<NumberInput
-								label={t("portRangeEnd")}
-								value={portEnd}
-								onChange={(v) => setPortEnd(typeof v === "number" ? v : 20000)}
-								min={1024}
-								max={65535}
-							/>
-							<Switch
-								label={t("proxyEnabled")}
-								description={t("proxyEnabledDesc")}
-								checked={proxyEnabled}
-								onChange={(e) => setProxyEnabled(e.currentTarget.checked)}
-							/>
-							{proxyEnabled && (
-								<NumberInput
-									label={t("proxyPort")}
-									description={t("proxyPortDesc")}
-									value={proxyPort}
-									onChange={(v) => setProxyPort(typeof v === "number" ? v : 7780)}
-									min={1024}
-									max={65535}
-								/>
-							)}
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Session */}
-				<Accordion.Item value="session">
-					<Accordion.Control>{t("sessionSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<Switch
-								label={t("autoLoadOlderMessages")}
-								description={t("autoLoadOlderMessagesDesc")}
-								checked={userPrefs?.autoLoadOlderMessages ?? true}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										autoLoadOlderMessages: e.currentTarget.checked,
-									})
-								}
-							/>
-							<Switch
-								label={t("replyInUserLanguage")}
-								description={t("replyInUserLanguageDesc")}
-								checked={userPrefs?.replyInUserLanguage ?? true}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										replyInUserLanguage: e.currentTarget.checked,
-									})
-								}
-							/>
-						</Stack>
+						<ChaptersContainersSection
+							maxWorktrees={maxWorktrees}
+							setMaxWorktrees={setMaxWorktrees}
+							maxContainers={maxContainers}
+							setMaxContainers={setMaxContainers}
+							sizeWarning={sizeWarning}
+							setSizeWarning={setSizeWarning}
+							autoSave={autoSave}
+							setAutoSave={setAutoSave}
+							dormantMinutes={dormantMinutes}
+							setDormantMinutes={setDormantMinutes}
+							acReminderLines={acReminderLines}
+							setAcReminderLines={setAcReminderLines}
+							acReminderFiles={acReminderFiles}
+							setAcReminderFiles={setAcReminderFiles}
+							acForceLines={acForceLines}
+							setAcForceLines={setAcForceLines}
+							acForceFiles={acForceFiles}
+							setAcForceFiles={setAcForceFiles}
+							portStart={portStart}
+							setPortStart={setPortStart}
+							portEnd={portEnd}
+							setPortEnd={setPortEnd}
+							proxyEnabled={proxyEnabled}
+							setProxyEnabled={setProxyEnabled}
+							proxyPort={proxyPort}
+							setProxyPort={setProxyPort}
+						/>
 					</Accordion.Panel>
 				</Accordion.Item>
 
@@ -1023,275 +609,51 @@ function SettingsPage() {
 						{t("notificationSection")}
 					</Accordion.Control>
 					<Accordion.Panel>
-						<NotificationSettings userPrefs={userPrefs} updateUserPref={updateUserPref} t={t} />
+						<NotificationSection userPrefs={userPrefs} updateUserPref={updateUserPref} />
 					</Accordion.Panel>
 				</Accordion.Item>
 
-				{/* Word Wrap Defaults */}
-				<Accordion.Item value="wordWrap">
-					<Accordion.Control>{t("wordWrapSection")}</Accordion.Control>
+				{/* Appearance */}
+				<Accordion.Item value="appearance">
+					<Accordion.Control icon={<IconPalette size={20} />}>
+						{t("appearanceSection")}
+					</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<Switch
-								label={t("wordWrapMarkdown")}
-								checked={userPrefs?.wordWrapMarkdown ?? true}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										wordWrapMarkdown: e.currentTarget.checked,
-									})
-								}
-							/>
-							<Switch
-								label={t("wordWrapCode")}
-								checked={userPrefs?.wordWrapCode ?? true}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										wordWrapCode: e.currentTarget.checked,
-									})
-								}
-							/>
-							<Switch
-								label={t("wordWrapDiff")}
-								checked={userPrefs?.wordWrapDiff ?? true}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										wordWrapDiff: e.currentTarget.checked,
-									})
-								}
-							/>
-						</Stack>
+						<AppearanceSection
+							userPrefs={userPrefs}
+							updateUserPref={updateUserPref}
+							oledMode={oledMode}
+							setOledMode={setOledMode}
+							isFullscreen={isFullscreen}
+							setIsFullscreen={setIsFullscreen}
+						/>
 					</Accordion.Panel>
 				</Accordion.Item>
 
-				{/* Terminal */}
-				<Accordion.Item value="terminal">
-					<Accordion.Control>{t("terminalSection")}</Accordion.Control>
+				{/* Server & System */}
+				<Accordion.Item value="serverSystem">
+					<Accordion.Control icon={<IconServer size={20} />}>
+						{t("serverAndSystemSection")}
+					</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<Select
-								label={t("terminalTheme")}
-								data={[
-									{
-										value: "auto",
-										label: t("terminalThemeAuto"),
-									},
-									...TERMINAL_THEMES.map((th) => ({
-										value: th.key,
-										label: th.label,
-									})),
-								]}
-								value={userPrefs?.terminalTheme ?? "auto"}
-								onChange={(v) =>
-									updateUserPref.mutate({
-										terminalTheme: v ?? "auto",
-									})
-								}
-							/>
-							<Stack gap={4}>
-								<Text size="sm" fw={500}>
-									{t("terminalFontSize")}
-								</Text>
-								<Group>
-									<Slider
-										value={localFontSize ?? userPrefs?.terminalFontSize ?? 14}
-										onChange={setLocalFontSize}
-										onChangeEnd={(v) => {
-											setLocalFontSize(null);
-											updateUserPref.mutate({
-												terminalFontSize: v,
-											});
-										}}
-										min={8}
-										max={32}
-										step={1}
-										style={{ flex: 1 }}
-										marks={[
-											{
-												value: 8,
-												label: "8",
-											},
-											{
-												value: 14,
-												label: "14",
-											},
-											{
-												value: 20,
-												label: "20",
-											},
-											{
-												value: 32,
-												label: "32",
-											},
-										]}
-									/>
-								</Group>
-							</Stack>
-						</Stack>
+						<ServerSystemSection
+							port={port}
+							setPort={setPort}
+							projectDir={projectDir}
+							setProjectDir={setProjectDir}
+							pwaUpdating={pwaUpdating}
+							handlePwaUpdate={handlePwaUpdate}
+						/>
 					</Accordion.Panel>
 				</Accordion.Item>
 
-				{/* Debug */}
-				<Accordion.Item value="debug">
-					<Accordion.Control>{t("debugSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<Switch
-								label={t("showTokenUsage")}
-								description={t("showTokenUsageDesc")}
-								checked={userPrefs?.showTokenUsage ?? false}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										showTokenUsage: e.currentTarget.checked,
-									})
-								}
-							/>
-							<Switch
-								label={t("showOutputStats")}
-								description={t("showOutputStatsDesc")}
-								checked={userPrefs?.showOutputStats ?? false}
-								onChange={(e) =>
-									updateUserPref.mutate({
-										showOutputStats: e.currentTarget.checked,
-									})
-								}
-							/>
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Theme */}
-				<Accordion.Item value="theme">
-					<Accordion.Control>{t("themeSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<ThemeSwitcher />
-							<Switch
-								label={t("oledMode")}
-								description={t("oledModeDesc")}
-								checked={oledMode}
-								onChange={(e) => setOledMode(e.currentTarget.checked)}
-							/>
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Display */}
-				<Accordion.Item value="display">
-					<Accordion.Control>{t("displaySection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<Switch
-								label={t("ignoreSafeArea")}
-								description={t("ignoreSafeAreaDesc")}
-								checked={isFullscreen}
-								onChange={(e) => {
-									const on = e.currentTarget.checked;
-									setIsFullscreen(on);
-									localStorage.setItem("narrafork_fullscreen", String(on));
-									if (on) {
-										document.documentElement.requestFullscreen?.().catch(() => {});
-									} else if (document.fullscreenElement) {
-										document.exitFullscreen?.().catch(() => {});
-									}
-								}}
-							/>
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Language */}
-				<Accordion.Item value="language">
-					<Accordion.Control>{t("languageSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<LanguageSwitcher />
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* PWA Update */}
-				<Accordion.Item value="pwa">
-					<Accordion.Control>{t("pwaSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<Stack>
-							<Text size="sm" c="dimmed">
-								{t("pwaForceUpdateDesc")}
-							</Text>
-							<Button
-								leftSection={<IconRefresh size={16} />}
-								variant="default"
-								loading={pwaUpdating}
-								onClick={handlePwaUpdate}
-							>
-								{pwaUpdating ? t("pwaUpdating") : t("pwaForceUpdate")}
-							</Button>
-						</Stack>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* System Dependencies */}
-				<Accordion.Item value="deps">
-					<Accordion.Control>{t("depsSection")}</Accordion.Control>
-					<Accordion.Panel>
-						<DependencyStatus />
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* About / Version */}
+				{/* About */}
 				<Accordion.Item value="about">
-					<Accordion.Control>{t("versionSection")}</Accordion.Control>
+					<Accordion.Control icon={<IconInfoCircle size={20} />}>
+						{t("versionSection")}
+					</Accordion.Control>
 					<Accordion.Panel>
-						<Stack>
-							<Group gap="lg">
-								<Text size="sm">
-									<Text span c="dimmed">
-										{t("versionLabel")}:
-									</Text>{" "}
-									v{__APP_VERSION__}
-								</Text>
-								{healthData?.commit && (
-									<Text size="sm">
-										<Text span c="dimmed">
-											{t("versionCommit")}:
-										</Text>{" "}
-										{healthData.commit}
-									</Text>
-								)}
-								{healthData?.platform && (
-									<Text size="sm">
-										<Text span c="dimmed">
-											{t("versionPlatform")}:
-										</Text>{" "}
-										{healthData.platform}
-									</Text>
-								)}
-							</Group>
-							<Group gap="xs">
-								<Text size="sm" c="dimmed">
-									{t("authorsLabel")}:
-								</Text>
-								<Group gap="xs">
-									<Anchor href="https://github.com/domexie" target="_blank" size="sm">
-										<Group gap={4}>
-											<IconBrandGithub size={14} />
-											domexie
-										</Group>
-									</Anchor>
-									<Anchor href="https://github.com/FxRayHughes" target="_blank" size="sm">
-										<Group gap={4}>
-											<IconBrandGithub size={14} />
-											FxRayHughes
-										</Group>
-									</Anchor>
-									<Anchor href="https://github.com/FoskyM" target="_blank" size="sm">
-										<Group gap={4}>
-											<IconBrandGithub size={14} />
-											FoskyM
-										</Group>
-									</Anchor>
-								</Group>
-							</Group>
-						</Stack>
+						<AboutSection healthData={healthData} />
 					</Accordion.Panel>
 				</Accordion.Item>
 			</Accordion>
@@ -1332,377 +694,6 @@ function SettingsPage() {
 					100% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
 				}
 			`}</style>
-		</Stack>
-	);
-}
-
-// === Notification Settings Sub-component ===
-
-function NotificationSettings({
-	userPrefs,
-	updateUserPref,
-	t,
-}: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
-	userPrefs: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation hook type
-	updateUserPref: any;
-	t: (key: string, opts?: Record<string, unknown>) => string;
-}) {
-	const [pwaPermission, setPwaPermission] = useState(
-		"Notification" in window ? Notification.permission : "denied",
-	);
-	const [testingDingtalk, setTestingDingtalk] = useState(false);
-	const [testingFeishu, setTestingFeishu] = useState(false);
-	const [testResult, setTestResult] = useState<{
-		type: string;
-		ok: boolean;
-		error?: string;
-	} | null>(null);
-	// Local state for webhook fields (only saved on blur)
-	const [dingtalkWebhook, setDingtalkWebhook] = useState("");
-	const [dingtalkSecret, setDingtalkSecret] = useState("");
-	const [feishuWebhook, setFeishuWebhook] = useState("");
-	const [feishuSecret, setFeishuSecret] = useState("");
-	const [webhookInited, setWebhookInited] = useState(false);
-
-	// Initialize local webhook state from prefs (once)
-	useEffect(() => {
-		if (userPrefs && !webhookInited) {
-			setDingtalkWebhook(userPrefs.notifyDingtalkWebhook ?? "");
-			setDingtalkSecret(userPrefs.notifyDingtalkSecret ?? "");
-			setFeishuWebhook(userPrefs.notifyFeishuWebhook ?? "");
-			setFeishuSecret(userPrefs.notifyFeishuSecret ?? "");
-			setWebhookInited(true);
-		}
-	}, [userPrefs, webhookInited]);
-
-	const soundOptions = BUILTIN_SOUND_NAMES.map((name) => ({
-		value: name,
-		label: t(`notifySound${name.charAt(0).toUpperCase()}${name.slice(1)}`),
-	}));
-
-	const handleRequestPwaPermission = async () => {
-		if (!("Notification" in window)) return;
-		const result = await Notification.requestPermission();
-		setPwaPermission(result);
-		if (result === "granted") {
-			updateUserPref.mutate({ notifyPwaEnabled: true });
-		}
-	};
-
-	const handleSoundUpload = async (file: File | null) => {
-		if (!file) return;
-		try {
-			const result = await api.uploadNotificationSound(file);
-			updateUserPref.mutate({
-				notifySoundType: "custom",
-				notifySoundFileId: result.id,
-			});
-		} catch {
-			// upload failed — ignore
-		}
-	};
-
-	const handleTestDingtalk = async () => {
-		setTestingDingtalk(true);
-		setTestResult(null);
-		try {
-			const res = await api.testDingtalkWebhook(dingtalkWebhook, dingtalkSecret);
-			setTestResult({
-				type: "dingtalk",
-				ok: res.ok,
-				error: res.error,
-			});
-		} catch (err) {
-			setTestResult({
-				type: "dingtalk",
-				ok: false,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-		setTestingDingtalk(false);
-	};
-
-	const handleTestFeishu = async () => {
-		setTestingFeishu(true);
-		setTestResult(null);
-		try {
-			const res = await api.testFeishuWebhook(feishuWebhook, feishuSecret);
-			setTestResult({
-				type: "feishu",
-				ok: res.ok,
-				error: res.error,
-			});
-		} catch (err) {
-			setTestResult({
-				type: "feishu",
-				ok: false,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-		setTestingFeishu(false);
-	};
-
-	const saveWebhookField = (field: string, value: string) => {
-		// Don't save masked values back
-		if (value.startsWith("*")) return;
-		updateUserPref.mutate({ [field]: value });
-	};
-
-	return (
-		<Stack>
-			{/* Trigger toggles */}
-			<Switch
-				label={t("notifyOnDone")}
-				description={t("notifyOnDoneDesc")}
-				checked={userPrefs?.notifyOnDone ?? true}
-				onChange={(e) =>
-					updateUserPref.mutate({
-						notifyOnDone: e.currentTarget.checked,
-					})
-				}
-			/>
-			<Switch
-				label={t("notifyOnWaiting")}
-				description={t("notifyOnWaitingDesc")}
-				checked={userPrefs?.notifyOnWaiting ?? true}
-				onChange={(e) =>
-					updateUserPref.mutate({
-						notifyOnWaiting: e.currentTarget.checked,
-					})
-				}
-			/>
-
-			{/* PWA notifications */}
-			<Stack gap="xs" mt="sm">
-				<Text size="sm" fw={600}>
-					{t("notifyPwaEnabled")}
-				</Text>
-				<Switch
-					label={t("notifyPwaEnabledDesc")}
-					checked={userPrefs?.notifyPwaEnabled ?? false}
-					onChange={(e) =>
-						updateUserPref.mutate({
-							notifyPwaEnabled: e.currentTarget.checked,
-						})
-					}
-					disabled={pwaPermission === "denied"}
-				/>
-				{pwaPermission === "default" && (
-					<Button variant="light" size="xs" onClick={handleRequestPwaPermission}>
-						{t("notifyPwaRequestPermission")}
-					</Button>
-				)}
-				{pwaPermission === "granted" && (
-					<Badge color="green" variant="light" size="sm">
-						{t("notifyPwaPermissionGranted")}
-					</Badge>
-				)}
-				{pwaPermission === "denied" && (
-					<Text size="xs" c="dimmed">
-						{t("notifyPwaPermissionDenied")}
-					</Text>
-				)}
-			</Stack>
-
-			{/* Sound notifications */}
-			<Stack gap="xs" mt="sm">
-				<Text size="sm" fw={600}>
-					{t("notifySoundEnabled")}
-				</Text>
-				<Switch
-					label={t("notifySoundEnabled")}
-					checked={userPrefs?.notifySoundEnabled ?? true}
-					onChange={(e) =>
-						updateUserPref.mutate({
-							notifySoundEnabled: e.currentTarget.checked,
-						})
-					}
-				/>
-				{(userPrefs?.notifySoundEnabled ?? true) && (
-					<>
-						<SegmentedControl
-							value={userPrefs?.notifySoundType ?? "builtin"}
-							onChange={(v) =>
-								updateUserPref.mutate({
-									notifySoundType: v as "builtin" | "custom",
-								})
-							}
-							data={[
-								{
-									value: "builtin",
-									label: t("notifySoundBuiltin"),
-								},
-								{
-									value: "custom",
-									label: t("notifySoundCustom"),
-								},
-							]}
-							size="xs"
-						/>
-						{(userPrefs?.notifySoundType ?? "builtin") === "builtin" ? (
-							<Group>
-								<Select
-									data={soundOptions}
-									value={userPrefs?.notifySoundBuiltin ?? "gentle"}
-									onChange={(v) =>
-										updateUserPref.mutate({
-											notifySoundBuiltin: v ?? "gentle",
-										})
-									}
-									size="xs"
-									style={{ flex: 1 }}
-								/>
-								<Button
-									variant="subtle"
-									size="xs"
-									leftSection={<IconPlayerPlay size={14} />}
-									onClick={() => playBuiltinSound(userPrefs?.notifySoundBuiltin ?? "gentle")}
-								>
-									{t("notifySoundPreview")}
-								</Button>
-							</Group>
-						) : (
-							<Group>
-								<FileInput
-									placeholder={t("notifySoundUpload")}
-									description={t("notifySoundUploadDesc")}
-									accept="audio/mpeg,audio/wav,audio/x-wav,audio/ogg,audio/webm"
-									onChange={handleSoundUpload}
-									size="xs"
-									style={{ flex: 1 }}
-								/>
-								{userPrefs?.notifySoundFileId && (
-									<Button
-										variant="subtle"
-										size="xs"
-										leftSection={<IconPlayerPlay size={14} />}
-										onClick={() =>
-											playCustomSound(`/api/notification-sounds/${userPrefs.notifySoundFileId}`)
-										}
-									>
-										{t("notifySoundPreview")}
-									</Button>
-								)}
-							</Group>
-						)}
-					</>
-				)}
-			</Stack>
-
-			{/* DingTalk */}
-			<Stack gap="xs" mt="sm">
-				<Text size="sm" fw={600}>
-					{t("notifyDingtalkSection")}
-				</Text>
-				<Switch
-					label={t("notifyDingtalkEnabled")}
-					checked={userPrefs?.notifyDingtalkEnabled ?? false}
-					onChange={(e) =>
-						updateUserPref.mutate({
-							notifyDingtalkEnabled: e.currentTarget.checked,
-						})
-					}
-				/>
-				{(userPrefs?.notifyDingtalkEnabled ?? false) && (
-					<>
-						<TextInput
-							label={t("notifyDingtalkWebhook")}
-							placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."
-							value={dingtalkWebhook}
-							onChange={(e) => setDingtalkWebhook(e.currentTarget.value)}
-							onBlur={() => saveWebhookField("notifyDingtalkWebhook", dingtalkWebhook)}
-							size="xs"
-						/>
-						<PasswordInput
-							label={t("notifyDingtalkSecret")}
-							description={t("notifyDingtalkSecretDesc")}
-							placeholder="SEC..."
-							value={dingtalkSecret}
-							onChange={(e) => setDingtalkSecret(e.currentTarget.value)}
-							onBlur={() => saveWebhookField("notifyDingtalkSecret", dingtalkSecret)}
-							size="xs"
-						/>
-						<Group>
-							<Button
-								variant="light"
-								size="xs"
-								loading={testingDingtalk}
-								onClick={handleTestDingtalk}
-								disabled={!dingtalkWebhook || dingtalkWebhook.startsWith("*")}
-							>
-								{t("notifyTestConnection")}
-							</Button>
-							{testResult?.type === "dingtalk" && (
-								<Text size="xs" c={testResult.ok ? "green" : "red"}>
-									{testResult.ok
-										? t("notifyTestSuccess")
-										: t("notifyTestFailed", {
-												error: testResult.error,
-											})}
-								</Text>
-							)}
-						</Group>
-					</>
-				)}
-			</Stack>
-
-			{/* Feishu */}
-			<Stack gap="xs" mt="sm">
-				<Text size="sm" fw={600}>
-					{t("notifyFeishuSection")}
-				</Text>
-				<Switch
-					label={t("notifyFeishuEnabled")}
-					checked={userPrefs?.notifyFeishuEnabled ?? false}
-					onChange={(e) =>
-						updateUserPref.mutate({
-							notifyFeishuEnabled: e.currentTarget.checked,
-						})
-					}
-				/>
-				{(userPrefs?.notifyFeishuEnabled ?? false) && (
-					<>
-						<TextInput
-							label={t("notifyFeishuWebhook")}
-							placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
-							value={feishuWebhook}
-							onChange={(e) => setFeishuWebhook(e.currentTarget.value)}
-							onBlur={() => saveWebhookField("notifyFeishuWebhook", feishuWebhook)}
-							size="xs"
-						/>
-						<PasswordInput
-							label={t("notifyFeishuSecret")}
-							description={t("notifyFeishuSecretDesc")}
-							value={feishuSecret}
-							onChange={(e) => setFeishuSecret(e.currentTarget.value)}
-							onBlur={() => saveWebhookField("notifyFeishuSecret", feishuSecret)}
-							size="xs"
-						/>
-						<Group>
-							<Button
-								variant="light"
-								size="xs"
-								loading={testingFeishu}
-								onClick={handleTestFeishu}
-								disabled={!feishuWebhook || feishuWebhook.startsWith("*")}
-							>
-								{t("notifyTestConnection")}
-							</Button>
-							{testResult?.type === "feishu" && (
-								<Text size="xs" c={testResult.ok ? "green" : "red"}>
-									{testResult.ok
-										? t("notifyTestSuccess")
-										: t("notifyTestFailed", {
-												error: testResult.error,
-											})}
-								</Text>
-							)}
-						</Group>
-					</>
-				)}
-			</Stack>
 		</Stack>
 	);
 }

@@ -1,6 +1,6 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 
@@ -49,6 +49,40 @@ fsRoutes.get("/browse", (c) => {
 	const parent = getParent(absPath, isWin);
 
 	return c.json({ path: absPath, entries, drives, parent, sep });
+});
+
+/**
+ * POST /api/fs/mkdir
+ *
+ * Create a new directory. Body: { parent: string, name: string }
+ */
+fsRoutes.post("/mkdir", async (c) => {
+	const body = await c.req.json<{ parent?: string; name?: string }>();
+	const { parent, name } = body;
+
+	if (!parent || !name) {
+		throw new ValidationError("parent and name are required");
+	}
+
+	// Validate folder name: no path separators or special chars
+	const invalidChars = /[/\\<>:"|?*]/;
+	const hasControlChars = [...name].some((ch) => ch.charCodeAt(0) < 32);
+	if (invalidChars.test(name) || hasControlChars) {
+		throw new ValidationError("Invalid folder name");
+	}
+
+	const absParent = resolve(parent);
+	if (!existsSync(absParent) || !statSync(absParent).isDirectory()) {
+		throw new ValidationError(`Parent directory does not exist: ${absParent}`);
+	}
+
+	const newPath = join(absParent, name);
+	if (existsSync(newPath)) {
+		throw new ValidationError(`Already exists: ${basename(newPath)}`);
+	}
+
+	mkdirSync(newPath);
+	return c.json({ path: newPath });
 });
 
 /** List immediate subdirectories of a path. */

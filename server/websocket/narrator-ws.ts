@@ -56,7 +56,9 @@ export type NarratorServerMessage =
 			narratorId: string;
 			requestId: string;
 			toolUseId?: string;
+			decision?: "allow" | "deny";
 			updatedInput?: Record<string, unknown>;
+			feedbackText?: string;
 	  }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
@@ -659,13 +661,35 @@ export const handleNarratorWS = {
 					msg.feedbackText,
 					msg.compactAfter,
 					msg.updatedPlan,
-				).catch((err) => logger.error("Failed to resolve permission", { error: String(err) }));
+				).catch((err) => {
+					logger.error("Failed to resolve permission", { error: String(err) });
+					try {
+						ws.send(
+							JSON.stringify({
+								type: "error",
+								message: `Failed to resolve permission: ${String(err)}`,
+							}),
+						);
+					} catch {
+						// connection may be dead
+					}
+				});
 				break;
 			}
 			case "merge_decision": {
-				resolveMergeDecision(msg.mergeSessionId, msg.decision).catch((err) =>
-					logger.error("Failed to resolve merge decision", { error: String(err) }),
-				);
+				resolveMergeDecision(msg.mergeSessionId, msg.decision).catch((err) => {
+					logger.error("Failed to resolve merge decision", { error: String(err) });
+					try {
+						ws.send(
+							JSON.stringify({
+								type: "error",
+								message: `Failed to resolve merge decision: ${String(err)}`,
+							}),
+						);
+					} catch {
+						// connection may be dead
+					}
+				});
 				logger.debug("Merge decision received via WS", {
 					mergeSessionId: msg.mergeSessionId,
 					decision: msg.decision,
@@ -718,6 +742,17 @@ export const handleNarratorWS = {
 						text: bufferText,
 						bufferedAt: bufResult.bufferedAt,
 					});
+				} else {
+					try {
+						ws.send(
+							JSON.stringify({
+								type: "error",
+								message: "Failed to buffer message: narrator is not active",
+							}),
+						);
+					} catch {
+						// connection may be dead
+					}
 				}
 				break;
 			}

@@ -117,6 +117,10 @@
 	"selectThisDirectory": "Select This Directory",
 	"goUp": "Go up",
 	"emptyDirectory": "Empty directory",
+	"noMatchingDirectories": "No matching directories",
+	"filteringBy": "Filtering: {{filter}}",
+	"newFolder": "New Folder",
+	"newFolderPlaceholder": "Folder name",
 	"selectDrive": "Select a drive",
 	"computer": "Computer",
 	"cancel": "Cancel",
@@ -171,5 +175,10 @@
 		"gitDeleted": "Deleted",
 		"gitRenamed": "Renamed",
 		"gitUntracked": "Untracked"
-	}
+	},
+	"operationFailed": "Operation failed",
+	"unexpectedError": "An unexpected error occurred",
+	"somethingWentWrong": "Something went wrong",
+	"retry": "Retry",
+	"backToHome": "Back to Home"
 }

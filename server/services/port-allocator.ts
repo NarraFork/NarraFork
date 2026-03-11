@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { portAllocations } from "../db/schema";
+import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 
@@ -54,8 +55,9 @@ export const portAllocator = {
 			if (hostPort === null) {
 				// Release any ports we just allocated in this batch
 				await this.release(chapterId);
-				throw new Error(
+				throw new AppError(
 					`Port pool exhausted: no available ports in range ${portRangeStart}-${portRangeEnd}`,
+					500,
 				);
 			}
 

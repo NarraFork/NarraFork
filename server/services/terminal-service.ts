@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, terminals } from "../db/schema";
 import { detectShell } from "../lib/agent/shell";
-import { NotFoundError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -32,7 +32,10 @@ export interface TerminalProcessInfo {
 	elapsed: string;
 }
 
-function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
+/** Batch-fetch process info for multiple PIDs in a single ps call. */
+function getProcessInfoBatch(pids: number[]): Map<number, TerminalProcessInfo> {
+	const result = new Map<number, TerminalProcessInfo>();
+	if (pids.length === 0) return result;
 	try {
 		if (IS_WINDOWS) {
 			// Use PowerShell to get process info on Windows
@@ -57,27 +60,30 @@ function getProcessInfoByPid(pid: number): TerminalProcessInfo | null {
 				elapsed: "",
 			};
 		}
-		const result = execSync(`ps -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime= -p ${pid}`, {
+		const output = execSync(`ps -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime= -p ${pids.join(",")}`, {
 			encoding: "utf-8",
 			stdio: "pipe",
 			timeout: 5000,
 		});
-		const line = result.trim();
-		if (!line) return null;
-		const parts = line.split(/\s+/);
-		if (parts.length < 7) return null;
-		return {
-			pid: Number.parseInt(parts[0], 10),
-			ppid: Number.parseInt(parts[1], 10),
-			command: parts[2],
-			state: parts[3],
-			rss: Number.parseInt(parts[4], 10),
-			cpu: Number.parseFloat(parts[5]),
-			elapsed: parts[6],
-		};
+		for (const line of output.trim().split("\n")) {
+			const parts = line.trim().split(/\s+/);
+			if (parts.length < 7) continue;
+			const pid = Number.parseInt(parts[0], 10);
+			if (Number.isNaN(pid)) continue;
+			result.set(pid, {
+				pid,
+				ppid: Number.parseInt(parts[1], 10),
+				command: parts[2],
+				state: parts[3],
+				rss: Number.parseInt(parts[4], 10),
+				cpu: Number.parseFloat(parts[5]),
+				elapsed: parts[6],
+			});
+		}
 	} catch {
-		return null;
+		// fallback: empty
 	}
+	return result;
 }
 
 interface ActiveTerminal {
@@ -155,7 +161,7 @@ export const terminalService = {
 			});
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 			if (!chapter.worktreePath) {
-				throw new Error("Chapter has no worktree (dormant?)");
+				throw new ValidationError("Chapter has no worktree (dormant?)");
 			}
 			cwd = chapter.worktreePath;
 		} else if (narratorId) {
@@ -186,7 +192,7 @@ export const terminalService = {
 				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
 			}
 		} else {
-			throw new Error("Either chapterId or narratorId is required");
+			throw new ValidationError("Either chapterId or narratorId is required");
 		}
 
 		const id = generateId();
@@ -497,7 +503,7 @@ export const terminalService = {
 	 */
 	async reattachOrphan(terminalId: string): Promise<unknown> {
 		if (!dtachService.isAvailable() || !dtachService.isSocketAlive(terminalId)) {
-			throw new Error("dtach socket not alive");
+			throw new AppError("dtach socket not alive", 500);
 		}
 
 		const id = terminalId;
@@ -530,7 +536,7 @@ export const terminalService = {
 
 		// Now reattach
 		const success = await this.reattach(id);
-		if (!success) throw new Error("Failed to reattach");
+		if (!success) throw new AppError("Failed to reattach", 500);
 
 		return db.query.terminals.findFirst({ where: eq(terminals.id, id) });
 	},
@@ -699,9 +705,10 @@ export const terminalService = {
 		if (!shellPid) return [];
 
 		const allPids = [shellPid, ...getDescendantPids(shellPid)];
+		const infoMap = getProcessInfoBatch(allPids);
 		return allPids
-			.map((pid) => getProcessInfoByPid(pid))
-			.filter((info): info is TerminalProcessInfo => info !== null);
+			.map((pid) => infoMap.get(pid))
+			.filter((info): info is TerminalProcessInfo => info !== undefined);
 	},
 
 	/**

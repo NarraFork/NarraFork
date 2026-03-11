@@ -36,7 +36,7 @@ export interface BuildPromptResult {
 
 /**
  * Build the effective system prompt by appending standard sections:
- * context summary → CWD → AGENT.md/CLAUDE.md → ~/.claude/CLAUDE.md → language → todos → plan mode.
+ * context summary → CWD → AGENT.md/CLAUDE.md → ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → todos → plan mode.
  *
  * Used by both main narrators and subagents. Subagents simply omit the
  * optional fields (contextSummary, todosJson, planMode) to get a minimal prompt.
@@ -119,8 +119,21 @@ export async function buildEffectiveSystemPrompt(
 			prompt = `${base}${sep}## Project Instructions\n\n${agentMdContent}`;
 		}
 	}
-	try {
-		let globalMd = await readFile(join(homedir(), ".claude", "CLAUDE.md"), "utf-8");
+	// 3b. Inject global AGENT.md (fallback to CLAUDE.md): ~/.agents/AGENT.md > ~/.claude/CLAUDE.md
+	{
+		let globalMd: string | null = null;
+		const globalCandidates = [
+			join(homedir(), ".agents", "AGENT.md"),
+			join(homedir(), ".claude", "CLAUDE.md"),
+		];
+		for (const candidate of globalCandidates) {
+			try {
+				globalMd = await readFile(candidate, "utf-8");
+				break;
+			} catch {
+				// file not found, try next
+			}
+		}
 		if (globalMd) {
 			const MAX_GLOBAL_MD = 50_000;
 			if (globalMd.length > MAX_GLOBAL_MD) {
@@ -130,8 +143,6 @@ export async function buildEffectiveSystemPrompt(
 			const sep = base ? "\n\n" : "";
 			prompt = `${base}${sep}## Global Instructions\n\n${globalMd}`;
 		}
-	} catch {
-		// file not found, skip
 	}
 
 	// 4. Append language instruction

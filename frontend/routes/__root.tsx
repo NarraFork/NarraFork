@@ -7,6 +7,7 @@ import {
 	Burger,
 	Button,
 	Center,
+	Container,
 	Group,
 	Loader,
 	Modal,
@@ -35,10 +36,12 @@ import {
 import type { QueryClient } from "@tanstack/react-query";
 import {
 	createRootRouteWithContext,
+	type ErrorComponentProps,
 	Link,
 	Navigate,
 	Outlet,
 	useNavigate,
+	useRouter,
 	useRouterState,
 } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -60,7 +63,40 @@ interface RouterContext {
 
 export const Route = createRootRouteWithContext<RouterContext>()({
 	component: RootLayout,
+	errorComponent: RootErrorBoundary,
 });
+
+function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
+	const router = useRouter();
+	const { t } = useTranslation("common");
+
+	return (
+		<Center h="100vh">
+			<Container size="sm" ta="center">
+				<Title order={2} mb="md">
+					{t("somethingWentWrong")}
+				</Title>
+				<Text c="dimmed" mb="xl">
+					{error.message || t("unexpectedError")}
+				</Text>
+				<Group justify="center">
+					<Button
+						variant="default"
+						onClick={() => {
+							reset();
+							router.invalidate();
+						}}
+					>
+						{t("retry")}
+					</Button>
+					<Button component={Link} to="/">
+						{t("backToHome")}
+					</Button>
+				</Group>
+			</Container>
+		</Center>
+	);
+}
 
 function RootLayout() {
 	const location = useRouterState({ select: (s) => s.location });

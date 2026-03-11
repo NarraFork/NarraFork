@@ -3,6 +3,20 @@ import { z } from "zod";
 // Reusable: valid git branch name (no flags, no special chars)
 const gitBranchName = z.string().regex(/^[a-zA-Z0-9._\-/]+$/, "Invalid branch name");
 
+/** Reusable schema for whitelist directory entries (global / project level). */
+export const whitelistDirEntrySchema = z.object({
+	path: z.string().trim().min(1).max(4096),
+	accessLevel: z.enum(["readOnly", "readWrite", "full"]).default("readOnly"),
+	enabled: z.boolean().default(true),
+});
+
+/** Reusable schema for blacklist directory entries (global / project level). */
+export const blacklistDirEntrySchema = z.object({
+	path: z.string().trim().min(1).max(4096),
+	denyLevel: z.enum(["denyWrite", "denyAll"]).default("denyAll"),
+	enabled: z.boolean().default(true),
+});
+
 // === Projects ===
 
 export const commandSchema = z.object({
@@ -56,6 +70,8 @@ export const updateProjectSchema = z.object({
 					enabledRoutines: z.array(z.string()).optional(),
 				})
 				.optional(),
+			whitelistDirs: z.array(whitelistDirEntrySchema).max(50).optional(),
+			blacklistDirs: z.array(blacklistDirEntrySchema).max(50).optional(),
 		})
 		.optional(),
 });
@@ -129,6 +145,17 @@ export const updateWhitelistDirSchema = z.object({
 	enabled: z.boolean().optional(),
 });
 
+export const createBlacklistDirSchema = z.object({
+	path: z.string().trim().min(1).max(4096),
+	denyLevel: z.enum(["denyWrite", "denyAll"]).default("denyAll"),
+	enabled: z.boolean().default(true),
+});
+
+export const updateBlacklistDirSchema = z.object({
+	denyLevel: z.enum(["denyWrite", "denyAll"]).optional(),
+	enabled: z.boolean().optional(),
+});
+
 // === Terminals ===
 
 export const createTerminalSchema = z
@@ -192,7 +219,7 @@ export const forkChapterSchema = z.object({
 	description: z.string().max(2000).optional(),
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	forkAtMessageUuid: z.string().optional(),
-	role: z.enum(["trunk", "branch", "exploration"]).default("branch"),
+	role: z.enum(["branch", "exploration"]).default("branch"),
 	positionX: z.number().optional(),
 	positionY: z.number().optional(),
 });
@@ -547,7 +574,7 @@ export const batchForkSchema = z.object({
 				title: z.string().min(1).max(200),
 				description: z.string().max(2000).optional(),
 				inheritMode: z.enum(["full", "compressed", "fresh"]).default("full"),
-				role: z.enum(["trunk", "branch", "exploration"]).default("branch"),
+				role: z.enum(["branch", "exploration"]).default("branch"),
 			}),
 		)
 		.min(1)

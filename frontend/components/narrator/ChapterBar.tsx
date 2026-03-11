@@ -232,17 +232,21 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 							</Tooltip>
 						</Menu.Target>
 						<Menu.Dropdown>
-							<Menu.Label>{tn("chapterBar.setRole")}</Menu.Label>
-							{(["trunk", "branch", "exploration"] as const).map((role) => (
-								<Menu.Item
-									key={role}
-									disabled={chapter.role === role}
-									onClick={() => updateChapter.mutate({ id: chapterId, data: { role } })}
-								>
-									{CHAPTER_ROLE_ICONS[role]} {t(`role.${role}`)}
-								</Menu.Item>
-							))}
-							<Menu.Divider />
+							{!chapter.isRoot && (
+								<>
+									<Menu.Label>{tn("chapterBar.setRole")}</Menu.Label>
+									{(["branch", "exploration"] as const).map((role) => (
+										<Menu.Item
+											key={role}
+											disabled={chapter.role === role}
+											onClick={() => updateChapter.mutate({ id: chapterId, data: { role } })}
+										>
+											{CHAPTER_ROLE_ICONS[role]} {t(`role.${role}`)}
+										</Menu.Item>
+									))}
+									<Menu.Divider />
+								</>
+							)}
 							{chapter.status === "active" && (
 								<Menu.Item
 									leftSection={<IconMoon size={14} />}

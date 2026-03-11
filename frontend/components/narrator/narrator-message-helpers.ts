@@ -61,6 +61,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			status,
 			durationMs: block.durationMs ?? tc?.durationMs,
 			errorMessage: block.errorMessage ?? tc?.errorMessage,
+			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
 			permissionSuggestions: block.permissionSuggestions ?? tc?.permissionSuggestions,
 			startedAt,

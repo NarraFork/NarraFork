@@ -10,7 +10,10 @@ import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dn
 import { CSS } from "@dnd-kit/utilities";
 import {
 	ActionIcon,
+	Button,
 	Group,
+	Popover,
+	Text,
 	TextInput,
 	Tooltip,
 	UnstyledButton,
@@ -19,6 +22,7 @@ import {
 import { IconGripVertical, IconPlus, IconX } from "@tabler/icons-react";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { api } from "../../lib/api";
 
 interface Tab {
 	id: string;
@@ -53,8 +57,10 @@ function SortableTab({
 		id: tab.id,
 	});
 	const { colorScheme } = useMantineColorScheme();
+	const { t } = useTranslation("terminal");
 	const [editing, setEditing] = useState(false);
 	const [editName, setEditName] = useState(tab.name);
+	const [confirmOpen, setConfirmOpen] = useState(false);
 	const inputRef = useRef<HTMLInputElement>(null);
 
 	const style = {
@@ -71,67 +77,117 @@ function SortableTab({
 		setEditing(false);
 	};
 
+	const tryClose = async () => {
+		try {
+			const processes = await api.getTerminalProcesses(tab.id);
+			if (processes.length > 1) {
+				setConfirmOpen(true);
+				return;
+			}
+		} catch {
+			// Can't check — close directly
+		}
+		onClose();
+	};
+
 	return (
 		<div ref={setNodeRef} style={style}>
-			<UnstyledButton
-				onClick={onSelect}
-				onDoubleClick={() => {
-					setEditName(tab.name);
-					setEditing(true);
-					setTimeout(() => inputRef.current?.select(), 0);
-				}}
-				px={8}
-				py={4}
-				style={{
-					display: "flex",
-					alignItems: "center",
-					gap: 4,
-					borderBottom: isActive
-						? "2px solid var(--mantine-color-indigo-6)"
-						: "2px solid transparent",
-					backgroundColor: isActive
-						? colorScheme === "dark"
-							? "var(--mantine-color-dark-6)"
-							: "var(--mantine-color-gray-1)"
-						: "transparent",
-					borderRadius: "4px 4px 0 0",
-					fontSize: 13,
-					whiteSpace: "nowrap",
-					color: isActive ? "var(--mantine-color-text)" : "var(--mantine-color-dimmed)",
-				}}
-			>
-				<span {...attributes} {...listeners} style={{ cursor: "grab", display: "flex" }}>
-					<IconGripVertical size={12} />
-				</span>
-				{editing ? (
-					<TextInput
-						ref={inputRef}
-						value={editName}
-						onChange={(e) => setEditName(e.currentTarget.value)}
-						onBlur={commitRename}
-						onKeyDown={(e) => {
-							if (e.key === "Enter") commitRename();
-							if (e.key === "Escape") setEditing(false);
+			<Popover opened={confirmOpen} onChange={setConfirmOpen} position="bottom" withArrow>
+				<Popover.Target>
+					<UnstyledButton
+						onClick={onSelect}
+						onMouseDown={(e: React.MouseEvent) => {
+							if (e.button === 1) {
+								e.preventDefault();
+								tryClose();
+							}
 						}}
-						size="xs"
-						variant="unstyled"
-						styles={{ input: { fontSize: 13, padding: 0, height: 20, minHeight: 20 } }}
-						onClick={(e) => e.stopPropagation()}
-					/>
-				) : (
-					<span>{tab.name}</span>
-				)}
-				<ActionIcon
-					size={16}
-					variant="subtle"
-					onClick={(e) => {
-						e.stopPropagation();
-						onClose();
-					}}
-				>
-					<IconX size={10} />
-				</ActionIcon>
-			</UnstyledButton>
+						onDoubleClick={() => {
+							setEditName(tab.name);
+							setEditing(true);
+							setTimeout(() => inputRef.current?.select(), 0);
+						}}
+						px={8}
+						py={4}
+						style={{
+							display: "flex",
+							alignItems: "center",
+							gap: 4,
+							borderBottom: isActive
+								? "2px solid var(--mantine-color-indigo-6)"
+								: "2px solid transparent",
+							backgroundColor: isActive
+								? colorScheme === "dark"
+									? "var(--mantine-color-dark-6)"
+									: "var(--mantine-color-gray-1)"
+								: "transparent",
+							borderRadius: "4px 4px 0 0",
+							fontSize: 13,
+							whiteSpace: "nowrap",
+							color: isActive ? "var(--mantine-color-text)" : "var(--mantine-color-dimmed)",
+						}}
+					>
+						<span {...attributes} {...listeners} style={{ cursor: "grab", display: "flex" }}>
+							<IconGripVertical size={12} />
+						</span>
+						{editing ? (
+							<TextInput
+								ref={inputRef}
+								value={editName}
+								onChange={(e) => setEditName(e.currentTarget.value)}
+								onBlur={commitRename}
+								onKeyDown={(e) => {
+									if (e.key === "Enter") commitRename();
+									if (e.key === "Escape") setEditing(false);
+								}}
+								size="xs"
+								variant="unstyled"
+								styles={{
+									input: {
+										fontSize: 13,
+										padding: 0,
+										height: 20,
+										minHeight: 20,
+									},
+								}}
+								onClick={(e) => e.stopPropagation()}
+							/>
+						) : (
+							<span>{tab.name}</span>
+						)}
+						<ActionIcon
+							size={16}
+							variant="subtle"
+							onClick={(e) => {
+								e.stopPropagation();
+								tryClose();
+							}}
+						>
+							<IconX size={10} />
+						</ActionIcon>
+					</UnstyledButton>
+				</Popover.Target>
+				<Popover.Dropdown p="sm">
+					<Text size="sm" mb="xs">
+						{t("closeConfirmMessage")}
+					</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button size="compact-xs" variant="default" onClick={() => setConfirmOpen(false)}>
+							{t("cancel")}
+						</Button>
+						<Button
+							size="compact-xs"
+							color="red"
+							onClick={() => {
+								setConfirmOpen(false);
+								onClose();
+							}}
+						>
+							{t("confirmClose")}
+						</Button>
+					</Group>
+				</Popover.Dropdown>
+			</Popover>
 		</div>
 	);
 }
@@ -165,23 +221,40 @@ export function TerminalTabBar({
 	);
 
 	return (
-		<Group gap={0} wrap="nowrap" style={{ overflowX: "auto", flexShrink: 0 }}>
-			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-				<SortableContext items={tabs.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
-					{tabs.map((tab) => (
-						<SortableTab
-							key={tab.id}
-							tab={tab}
-							isActive={tab.id === activeTabId}
-							onSelect={() => onSelect(tab.id)}
-							onClose={() => onClose(tab.id)}
-							onRename={(name) => onRename(tab.id, name)}
-						/>
-					))}
-				</SortableContext>
-			</DndContext>
+		<Group gap={0} wrap="nowrap" style={{ overflow: "hidden", flex: 1, minWidth: 0 }}>
+			<div
+				style={{
+					display: "flex",
+					overflowX: "auto",
+					flex: 1,
+					minWidth: 0,
+					scrollbarWidth: "none",
+				}}
+			>
+				<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+					<SortableContext items={tabs.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
+						{tabs.map((tab) => (
+							<SortableTab
+								key={tab.id}
+								tab={tab}
+								isActive={tab.id === activeTabId}
+								onSelect={() => onSelect(tab.id)}
+								onClose={() => onClose(tab.id)}
+								onRename={(name) => onRename(tab.id, name)}
+							/>
+						))}
+					</SortableContext>
+				</DndContext>
+			</div>
 			<Tooltip label={t("newTerminal")}>
-				<ActionIcon variant="subtle" onClick={onCreate} loading={createPending} ml={4} size="sm">
+				<ActionIcon
+					variant="subtle"
+					onClick={onCreate}
+					loading={createPending}
+					ml={4}
+					size="sm"
+					style={{ flexShrink: 0 }}
+				>
 					<IconPlus size={14} />
 				</ActionIcon>
 			</Tooltip>

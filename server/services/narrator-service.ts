@@ -144,6 +144,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				durationMs: tc.durationMs,
 				errorMessage: tc.errorMessage,
 				permissionDecisionReason: tc.permissionDecisionReason,
+				permissionDenyMessage: tc.permissionDenyMessage,
 				permissionSuggestions: tc.permissionSuggestions,
 				permissionDecidedAt: tc.permissionDecidedAt,
 				tcId: tc.id,

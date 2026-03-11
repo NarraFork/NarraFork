@@ -8,6 +8,7 @@ import {
 	type NarraForkSettings,
 	saveSettings,
 } from "../lib/settings";
+import { blacklistDirEntrySchema, whitelistDirEntrySchema } from "../lib/validators";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
@@ -78,6 +79,8 @@ const updateSettingsSchema = z
 				defaultRelaxedPlan: z.boolean(),
 				planTimeoutAction: z.enum(["deny", "auto_approve"]),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
+				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
+				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 			})
 			.partial()
 			.optional(),

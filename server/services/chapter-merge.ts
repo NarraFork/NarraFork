@@ -21,6 +21,7 @@ export interface MergeCheckResult {
 	conflictFiles: string[];
 	sourceBranch: string;
 	targetBranch: string;
+	isFastForward: boolean;
 }
 
 export interface MergeChapterInput {
@@ -33,6 +34,9 @@ export interface MergeResult {
 	success: boolean;
 	commitSha?: string;
 	conflictFiles?: string[];
+	isFastForward?: boolean;
+	/** Set when git merge succeeded but a non-fatal post-merge step failed. */
+	warning?: string;
 }
 
 export interface AiResolveResult {
@@ -71,6 +75,10 @@ export const chapterMerge = {
 		const gitPath = await getProjectGitPath(source.projectId);
 
 		const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
+
+		// Fast-forward is possible when the target branch tip is an ancestor of the source branch tip
+		const isFastForward = await gitService.isAncestor(gitPath, target.branch, source.branch);
+
 		const { hasConflicts, conflictFiles } = await gitService.mergeTree(
 			gitPath,
 			baseSha,
@@ -84,6 +92,7 @@ export const chapterMerge = {
 			conflictFiles,
 			sourceBranch: source.branch,
 			targetBranch: target.branch,
+			isFastForward: !hasConflicts && isFastForward,
 		};
 	},
 
@@ -114,6 +123,10 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
+		// Check if fast-forward is possible (only for "merge" strategy)
+		const canFastForward =
+			strategy === "merge" && (await gitService.isAncestor(gitPath, target.branch, source.branch));
+
 		// Collect commit messages and diff stat BEFORE the merge — after merge,
 		// the commit range baseBranch..branch may be empty (fast-forward).
 		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
@@ -126,6 +139,9 @@ export const chapterMerge = {
 			},
 		);
 
+		// Record target HEAD before merge for reliable unmerge
+		const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+
 		// Lock the target worktree to prevent concurrent git operations
 		return worktreeLock.acquire(targetWorktree, async () => {
 			let result: MergeResult;
@@ -133,7 +149,9 @@ export const chapterMerge = {
 				const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
 				result = await gitService.cherryPick(targetWorktree, gitPath, source.branch, baseSha);
 			} else {
-				result = await gitService.merge(targetWorktree, source.branch, strategy, message);
+				result = await gitService.merge(targetWorktree, source.branch, strategy, message, {
+					fastForward: canFastForward,
+				});
 			}
 
 			if (result.success) {
@@ -146,6 +164,7 @@ export const chapterMerge = {
 						result.commitSha,
 						userId,
 						mergeContext,
+						preMergeTargetSha,
 					);
 				} catch (dbErr) {
 					logger.error("Failed to mark chapter as merged after successful git merge, retrying", {
@@ -162,14 +181,19 @@ export const chapterMerge = {
 							result.commitSha,
 							userId,
 							mergeContext,
+							preMergeTargetSha,
 						);
 					} catch (retryErr) {
-						// DB is inconsistent but git merge succeeded — log and
-						// return success so the caller doesn't retry the git op.
+						// DB is inconsistent but git merge succeeded — return success
+						// with a warning so the caller doesn't retry the git operation.
 						logger.error("Retry also failed, DB state may be inconsistent", {
 							sourceChapterId,
 							error: String(retryErr),
 						});
+						return {
+							...result,
+							warning: `Git merge succeeded but database update failed: ${String(retryErr)}`,
+						};
 					}
 				}
 			} else if (result.conflictFiles) {
@@ -224,6 +248,9 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
+		// Record target HEAD before merge for reliable unmerge
+		const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+
 		// Collect commit messages and diff stat BEFORE the merge
 		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
 			(err) => {
@@ -255,6 +282,7 @@ export const chapterMerge = {
 						cpResult.commitSha,
 						userId,
 						mergeContext,
+						preMergeTargetSha,
 					);
 				}
 				conflictFiles = cpResult.conflictFiles ?? [];
@@ -269,6 +297,7 @@ export const chapterMerge = {
 						commitSha ?? undefined,
 						userId,
 						mergeContext,
+						preMergeTargetSha,
 					);
 				}
 				conflictFiles = mergeResult.conflictFiles;
@@ -309,6 +338,7 @@ export const chapterMerge = {
 					commitSha ?? undefined,
 					userId,
 					mergeContext,
+					preMergeTargetSha,
 				);
 			} catch (err) {
 				logger.error("AI conflict resolution failed", { error: String(err) });
@@ -329,6 +359,7 @@ export const chapterMerge = {
 		commitSha?: string,
 		userId?: string,
 		mergeContext?: { commits: string[]; diffStat: string },
+		preMergeTargetSha?: string,
 	): Promise<void> {
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
@@ -357,6 +388,7 @@ export const chapterMerge = {
 				mergedIntoChapterId: targetChapterId,
 				mergeCommitSha: commitSha,
 				mergeStrategy: strategy as "merge" | "squash" | "cherry-pick",
+				preMergeTargetSha: preMergeTargetSha ?? null,
 				updatedAt: now,
 			})
 			.where(eq(chapters.id, sourceChapterId));
@@ -374,7 +406,13 @@ export const chapterMerge = {
 					},
 				);
 			} catch (err) {
-				console.error("Failed to create merge edge:", err);
+				// Edge is auxiliary data — log but don't fail the merge operation,
+				// otherwise the retry path in merge() could create duplicate edges.
+				logger.error("Failed to create merge edge (non-fatal)", {
+					sourceChapterId,
+					targetChapterId,
+					error: String(err),
+				});
 			}
 		}
 
@@ -438,6 +476,7 @@ export const chapterMerge = {
 		commitSha?: string,
 		userId?: string,
 		mergeContext?: { commits: string[]; diffStat: string },
+		preMergeTargetSha?: string,
 	): Promise<AiResolveResult> {
 		await this.markMerged(
 			sourceChapterId,
@@ -446,6 +485,7 @@ export const chapterMerge = {
 			commitSha,
 			userId,
 			mergeContext,
+			preMergeTargetSha,
 		);
 		return { resolved: true, mergeResult: { success: true, commitSha } };
 	},
@@ -484,16 +524,19 @@ export const chapterMerge = {
 		const gitPath = await getProjectGitPath(source.projectId);
 
 		// Step 1: Undo the merge on the target branch.
-		// Prefer reset --hard (clean history) when HEAD is still the merge commit.
+		// When preMergeTargetSha is available and HEAD hasn't advanced past the merge,
+		// reset directly to it (handles fast-forward merges that introduce multiple commits).
 		// Fall back to git revert when the target has advanced (preserves later commits).
 		const headSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
 		if (headSha === source.mergeCommitSha) {
 			// HEAD is the merge commit — safe to reset
-			await gitService.resetHard(target.worktreePath, `${source.mergeCommitSha}~1`);
+			const resetTarget = source.preMergeTargetSha ?? `${source.mergeCommitSha}~1`;
+			await gitService.resetHard(target.worktreePath, resetTarget);
 			logger.info("Reset target branch to before merge commit", {
 				sourceChapterId,
 				targetChapterId: target.id,
 				mergeCommitSha: source.mergeCommitSha,
+				resetTarget,
 			});
 		} else {
 			// Target has new commits — revert instead to preserve them
@@ -543,6 +586,7 @@ export const chapterMerge = {
 					mergedIntoChapterId: null,
 					mergeCommitSha: null,
 					mergeStrategy: null,
+					preMergeTargetSha: null,
 					lastAccessedAt: now,
 					updatedAt: now,
 				})

@@ -11,7 +11,7 @@ import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { usePageUnload } from "../../hooks/usePageUnload";
 import { addRecentTab } from "../../hooks/useRecentTabs";
-import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
 import { api } from "../../lib/api";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
@@ -91,12 +91,20 @@ function NarratorDetailPage() {
 
 	const qc = useQueryClient();
 
+	// Notify backend when leaving this narrator page so interrupted status resets to idle
+	useEffect(() => {
+		return () => {
+			api.leaveNarrator(narratorId).catch(() => {});
+		};
+	}, [narratorId]);
+
 	// Check if there's a running terminal for this narrator
 	const { data: existingTerminals } = useNarratorTerminals(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const hasRunningTerminal = (existingTerminals ?? []).some((t: any) => t.status === "running");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
+	const createTerminal = useCreateNarratorTerminal(narratorId);
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);
@@ -148,7 +156,13 @@ function NarratorDetailPage() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const dragging = useRef(false);
 
-	// Cross-component communication refs
+	// Mobile: open drawer and auto-create terminal if none running
+	const openDrawerWithTerminal = useCallback(() => {
+		if (!hasRunningTerminal) {
+			createTerminal.mutate({ name: "Terminal 1" });
+		}
+		openDrawer();
+	}, [hasRunningTerminal, createTerminal, openDrawer]);
 	const writeToTerminalRef = useRef<((text: string) => void) | null>(null);
 	const appendInputRef = useRef<((text: string) => void) | null>(null);
 
@@ -167,14 +181,15 @@ function NarratorDetailPage() {
 		writeToTerminalRef.current = fn;
 	}, []);
 
-	// Toggle terminal and persist
+	// Toggle terminal and persist; auto-create a terminal when opening with none running
 	const toggleTerminal = useCallback(() => {
-		setTerminalOpen((v) => {
-			const next = !v;
-			localStorage.setItem(terminalStorageKey(narratorId), String(next));
-			return next;
-		});
-	}, [narratorId]);
+		const willOpen = !terminalOpen;
+		setTerminalOpen(willOpen);
+		localStorage.setItem(terminalStorageKey(narratorId), String(willOpen));
+		if (willOpen && !hasRunningTerminal) {
+			createTerminal.mutate({ name: "Terminal 1" });
+		}
+	}, [narratorId, terminalOpen, hasRunningTerminal, createTerminal]);
 
 	const { t: tc } = useTranslation("chapters");
 	const { t: tCommon } = useTranslation("common");
@@ -343,7 +358,9 @@ function NarratorDetailPage() {
 						onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
 						appendInputRef={isSubagent ? undefined : appendInputRef}
 						terminalOpen={isSubagent ? undefined : drawerOpened}
-						onToggleTerminal={isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawer}
+						onToggleTerminal={
+							isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawerWithTerminal
+						}
 						onMinimize={showMinimize ? onMinimize : undefined}
 					/>
 				</Box>

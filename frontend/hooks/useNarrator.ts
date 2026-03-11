@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	api,
+	type BlacklistDir,
 	type MessagesAroundOptions,
 	type PaginatedNarrators,
 	type WhitelistDir,
@@ -259,6 +260,53 @@ export function useDeleteWhitelistDir(narratorId: string) {
 		mutationFn: (dirId: string) => api.deleteWhitelistDir(dirId),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["whitelist-dirs", narratorId] });
+		},
+	});
+}
+
+export function useBlacklistDirs(narratorId: string) {
+	return useQuery<BlacklistDir[]>({
+		queryKey: ["blacklist-dirs", narratorId],
+		queryFn: () => api.getBlacklistDirs(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateBlacklistDir() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			path,
+			denyLevel,
+		}: {
+			narratorId: string;
+			path: string;
+			denyLevel?: string;
+		}) => api.createBlacklistDir(narratorId, { path, denyLevel }),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["blacklist-dirs", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateBlacklistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ dirId, ...data }: { dirId: string; denyLevel?: string; enabled?: boolean }) =>
+			api.updateBlacklistDir(dirId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["blacklist-dirs", narratorId] });
+		},
+	});
+}
+
+export function useDeleteBlacklistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (dirId: string) => api.deleteBlacklistDir(dirId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["blacklist-dirs", narratorId] });
 		},
 	});
 }

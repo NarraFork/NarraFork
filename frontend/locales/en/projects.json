@@ -4,6 +4,7 @@
 	"noProjects": "No narraflows yet. Create one to get started.",
 	"projectName": "NarraFlow Name",
 	"projectNamePlaceholder": "My NarraFlow",
+	"projectNameRequired": "Name is required",
 	"repositoryPath": "Repository Path",
 	"repositoryPathDescription": "Local path to an existing git repository",
 	"projectNotFound": "NarraFlow not found",
@@ -17,6 +18,7 @@
 	"cloneBranch": "Branch (optional)",
 	"initPathDescription": "Path where the new repository will be created",
 	"clonePathDescription": "Local path to clone into",
+	"cloning": "Cloning repository…",
 	"notGitRepoTitle": "Not a Git Repository",
 	"notGitRepoMessage": "The selected path is not a git repository:\n{{path}}\n\nYou can initialize a new git repository at this location and create the narraflow.",
 	"notGitRepoInitAndCreate": "Initialize & Create",
@@ -55,5 +57,9 @@
 	"proxyDomain": "Proxy Domain",
 	"proxyDomainDesc": "Base domain for container proxy subdomains. Each container port gets a subdomain like {chapterId}-{service}-{port}.{domain}.",
 	"proxyDomainHint": "Requires wildcard DNS: *.{domain} → server IP. For local dev, use *.localhost or configure dnsmasq.",
-	"proxyDomainInvalid": "Please enter a valid domain (e.g. dev.example.com, without http:// or paths)"
+	"proxyDomainInvalid": "Please enter a valid domain (e.g. dev.example.com, without http:// or paths)",
+	"projectWhitelistDirs": "Whitelist Directories",
+	"projectWhitelistDirsDesc": "Directories auto-allowed for narrators in this project.",
+	"projectBlacklistDirs": "Blacklist Directories",
+	"projectBlacklistDirsDesc": "Directories blocked for narrators in this project."
 }

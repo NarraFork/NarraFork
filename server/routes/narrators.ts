@@ -21,6 +21,7 @@ import { db } from "../db";
 import {
 	chapters,
 	containerInstances,
+	narratorBlacklistDirs,
 	narratorMessages,
 	narratorPatches,
 	narrators,
@@ -41,12 +42,14 @@ import {
 } from "../lib/prompt-i18n";
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
+	createBlacklistDirSchema,
 	createNarratorSchema,
 	createWhitelistDirSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,
+	updateBlacklistDirSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateWhitelistDirSchema,
@@ -641,6 +644,16 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	return c.json({ interrupted });
 });
 
+// User left the narrator page — reset interrupted status to idle
+narratorRoutes.post("/:id/leave", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator?.status === "interrupted") {
+		await narratorService.updateStatus(id, "idle");
+	}
+	return c.json({ ok: true });
+});
+
 // Update model
 narratorRoutes.patch("/:id/model", async (c) => {
 	const id = c.req.param("id");
@@ -685,7 +698,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 						type: "tool_use",
 						id: toolUseId,
 						name: "EnterPlanMode",
-						input: {},
+						input: { confirm: true },
 					},
 				],
 			},
@@ -1225,5 +1238,66 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
 	await db.delete(narratorWhitelistDirs).where(eq(narratorWhitelistDirs.id, dirId));
+	return c.json({ ok: true });
+});
+
+// ── Blacklist directories ──────────────────────────────────
+
+narratorRoutes.get("/:id/blacklist-dirs", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id); // ensure exists
+	const dirs = await db.query.narratorBlacklistDirs.findMany({
+		where: eq(narratorBlacklistDirs.narratorId, id),
+		orderBy: asc(narratorBlacklistDirs.createdAt),
+	});
+	return c.json(dirs);
+});
+
+narratorRoutes.post("/:id/blacklist-dirs", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const body = await c.req.json();
+	const parsed = createBlacklistDirSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	if (!isAbsolute(parsed.data.path)) {
+		throw new ValidationError("Blacklist directory path must be absolute");
+	}
+	const normalizedPath = resolvePath(parsed.data.path);
+	const existing = await db.query.narratorBlacklistDirs.findMany({
+		where: eq(narratorBlacklistDirs.narratorId, id),
+		columns: { id: true, path: true },
+	});
+	if (existing.some((e) => pathsEqual(e.path, normalizedPath))) {
+		throw new ValidationError("This directory is already in the blacklist");
+	}
+	const now = new Date().toISOString();
+	const dir = {
+		id: generateId(),
+		narratorId: id,
+		path: normalizedPath,
+		denyLevel: parsed.data.denyLevel,
+		enabled: parsed.data.enabled,
+		createdAt: now,
+	};
+	await db.insert(narratorBlacklistDirs).values(dir);
+	return c.json(dir, 201);
+});
+
+narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
+	const dirId = c.req.param("dirId");
+	const body = await c.req.json();
+	const parsed = updateBlacklistDirSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const updates: Record<string, unknown> = {};
+	if (parsed.data.denyLevel !== undefined) updates.denyLevel = parsed.data.denyLevel;
+	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
+	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
+	await db.update(narratorBlacklistDirs).set(updates).where(eq(narratorBlacklistDirs.id, dirId));
+	return c.json({ ok: true });
+});
+
+narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
+	const dirId = c.req.param("dirId");
+	await db.delete(narratorBlacklistDirs).where(eq(narratorBlacklistDirs.id, dirId));
 	return c.json({ ok: true });
 });

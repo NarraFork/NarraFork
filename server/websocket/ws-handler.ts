@@ -91,10 +91,6 @@ export function startHeartbeat() {
 		}
 
 		for (const ws of staleNarrator) {
-			logger.debug("Closing stale narrator WS (heartbeat timeout)", {
-				connectedAt: ws.data.connectedAt,
-				lastPongAt: ws.data.lastPongAt,
-			});
 			// Delegate to the channel handler so presence / stats are cleaned up
 			handleNarratorWS.close(ws);
 			try {
@@ -152,10 +148,20 @@ export const wsHandlers = {
 					channel,
 					text: text.slice(0, 200),
 				});
+				try {
+					ws.send(JSON.stringify({ type: "error", message: "Missing message type" }));
+				} catch {
+					// connection may be dead
+				}
 				return;
 			}
 		} catch {
 			logger.warn("Invalid WebSocket JSON", { channel, text: text.slice(0, 200) });
+			try {
+				ws.send(JSON.stringify({ type: "error", message: "Invalid message format" }));
+			} catch {
+				// connection may be dead
+			}
 			return;
 		}
 
@@ -167,6 +173,11 @@ export const wsHandlers = {
 				)
 				.catch((err: unknown) => {
 					logger.warn("Narrator WS message handler error", { error: String(err) });
+					try {
+						ws.send(JSON.stringify({ type: "error", message: "Internal error" }));
+					} catch {
+						// connection may be dead
+					}
 				});
 		} else if (channel === "terminal") {
 			handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);

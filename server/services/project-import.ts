@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { projects } from "../db/schema";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getProjectDbPath } from "../lib/project-db";
 
@@ -59,7 +60,7 @@ function getColumns(pdb: Database, table: string): string[] {
 export async function importProject(gitPath: string): Promise<ImportResult> {
 	const dbPath = getProjectDbPath(gitPath);
 	if (!existsSync(dbPath)) {
-		throw new Error(`Project database not found at ${dbPath}`);
+		throw new NotFoundError("Project database", dbPath);
 	}
 
 	// Open project DB directly (read-only for import)
@@ -69,7 +70,7 @@ export async function importProject(gitPath: string): Promise<ImportResult> {
 		// Read project record
 		const projectRows = readAll(pdb, "projects");
 		if (projectRows.length === 0) {
-			throw new Error("Project database contains no project record");
+			throw new ValidationError("Project database contains no project record");
 		}
 		const projectRow = projectRows[0];
 		const projectId = projectRow.id as string;

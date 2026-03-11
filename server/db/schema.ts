@@ -78,6 +78,7 @@ export const chapters = sqliteTable(
 		),
 		mergeCommitSha: text("merge_commit_sha"),
 		mergeStrategy: text("merge_strategy", { enum: ["merge", "squash", "cherry-pick"] }),
+		preMergeTargetSha: text("pre_merge_target_sha"),
 		containerConfig: text("container_config", { mode: "json" }),
 
 		// 探索组
@@ -596,5 +597,28 @@ export const narratorWhitelistDirs = sqliteTable(
 	(table) => [
 		index("idx_whitelist_dirs_narrator").on(table.narratorId),
 		uniqueIndex("idx_whitelist_dirs_narrator_path").on(table.narratorId, table.path),
+	],
+);
+
+// === narrator_blacklist_dirs ===
+export const narratorBlacklistDirs = sqliteTable(
+	"narrator_blacklist_dirs",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		denyLevel: text("deny_level", {
+			enum: ["denyWrite", "denyAll"],
+		})
+			.notNull()
+			.default("denyAll"),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_blacklist_dirs_narrator").on(table.narratorId),
+		uniqueIndex("idx_blacklist_dirs_narrator_path").on(table.narratorId, table.path),
 	],
 );

@@ -6,6 +6,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
+	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorPatches,
@@ -27,7 +28,7 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
-import { getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
@@ -314,6 +315,110 @@ function resolveWhitelistDecision(
 	return allPathsWhitelisted(cwd, externalToolPaths, whitelistDirs, requiredLevel) ? "allow" : null;
 }
 
+/**
+ * Check if a file path falls inside any enabled blacklist directory.
+ * Returns the matching dir entry (most restrictive), or null if not blacklisted.
+ */
+function blacklistMatchForPath(
+	cwd: string,
+	filePath: string,
+	blacklistDirs: BlacklistDir[],
+): BlacklistDir | null {
+	if (blacklistDirs.length === 0) return null;
+	const absPath = resolvePath(cwd, filePath);
+	let worst: BlacklistDir | null = null;
+	for (const dir of blacklistDirs) {
+		if (!dir.enabled) continue;
+		if (isInsidePath(dir.path, absPath)) {
+			if (dir.denyLevel === "denyAll") return dir; // can't get worse
+			if (!worst) worst = dir;
+		}
+	}
+	return worst;
+}
+
+/** Result from blacklist decision: "deny" + human-readable reason with source info. */
+interface BlacklistDecisionResult {
+	decision: "deny";
+	reason: string;
+}
+
+const BLACKLIST_SOURCE_LABELS: Record<string, string> = {
+	global: "global",
+	project: "project",
+	narrator: "narrator",
+};
+
+function formatBlacklistReason(dir: BlacklistDir, matchedPath: string): string {
+	const src = dir.source ? (BLACKLIST_SOURCE_LABELS[dir.source] ?? dir.source) : "unknown";
+	const level = dir.denyLevel === "denyAll" ? "block all access" : "block write access";
+	return `Blacklisted by ${src}-level rule: "${dir.path}" (${level}), matched path: ${matchedPath}`;
+}
+
+/**
+ * Check if ANY of the given paths are blocked by the blacklist for the given operation.
+ * Returns the first matching reason, or null.
+ */
+function findBlacklistedPath(
+	cwd: string,
+	paths: string[],
+	blacklistDirs: BlacklistDir[],
+	operation: "read" | "write",
+): string | null {
+	if (paths.length === 0 || blacklistDirs.length === 0) return null;
+	for (const p of paths) {
+		const match = blacklistMatchForPath(cwd, p, blacklistDirs);
+		if (!match) continue;
+		if (match.denyLevel === "denyAll" || operation === "write") {
+			return formatBlacklistReason(match, resolvePath(cwd, p));
+		}
+	}
+	return null;
+}
+
+function resolveBlacklistDecision(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	blacklistDirs: BlacklistDir[],
+	bashAnalysis?: BashAnalysis,
+): BlacklistDecisionResult | null {
+	if (blacklistDirs.length === 0) return null;
+
+	if (toolName === "Task") {
+		const workdir = input.workdir;
+		if (typeof workdir !== "string" || !workdir) return null;
+		const resolvedWorkdir = resolvePath(cwd, workdir);
+		if (pathsEqual(resolvedWorkdir, cwd)) return null;
+		const match = blacklistMatchForPath(cwd, resolvedWorkdir, blacklistDirs);
+		if (!match) return null;
+		// denyAll blocks everything; denyWrite blocks general subagents (which have write access)
+		if (match.denyLevel === "denyAll") {
+			return { decision: "deny", reason: formatBlacklistReason(match, resolvedWorkdir) };
+		}
+		if (input.subagent_type === "general") {
+			return { decision: "deny", reason: formatBlacklistReason(match, resolvedWorkdir) };
+		}
+		return null;
+	}
+
+	if (toolName === SHELL_TOOL_NAME) {
+		if (!bashAnalysis) return null;
+		const shellPaths = getShellScopePaths(cwd, input, bashAnalysis);
+		if (shellPaths.length === 0) return null;
+		const operation = bashAnalysis.hasWriteOperation ? "write" : "read";
+		const reason = findBlacklistedPath(cwd, shellPaths, blacklistDirs, operation);
+		return reason ? { decision: "deny", reason } : null;
+	}
+
+	const toolPaths = extractToolPaths(toolName, input);
+	if (toolPaths.length === 0) return null;
+	const isReadTool = READ_ONLY_TOOLS.includes(toolName);
+	const operation = isReadTool ? "read" : "write";
+	const reason = findBlacklistedPath(cwd, toolPaths, blacklistDirs, operation);
+	return reason ? { decision: "deny", reason } : null;
+}
+
 // and does not access the local filesystem or execute arbitrary commands.
 // Task is auto-allowed when using the parent's cwd — the subagent's
 // individual tools go through their own permission checks. When Task specifies
@@ -354,6 +459,20 @@ export interface WhitelistDir {
 	enabled: boolean;
 }
 
+export interface BlacklistDir {
+	path: string;
+	denyLevel: "denyWrite" | "denyAll";
+	enabled: boolean;
+	/** Which layer this entry comes from (for user-facing messages). */
+	source?: "global" | "project" | "narrator";
+}
+
+/** Metadata collected during permission decision (side-channel output). */
+export interface PermissionDecisionMeta {
+	/** When a blacklist rule triggered, describes the source and matched path. */
+	blacklistReason?: string;
+}
+
 export interface PermissionDecisionOpts {
 	toolName: string;
 	input: Record<string, unknown>;
@@ -363,10 +482,13 @@ export interface PermissionDecisionOpts {
 	isChapter?: boolean;
 	planFileId?: string;
 	whitelistDirs?: WhitelistDir[];
+	blacklistDirs?: BlacklistDir[];
 	/** When true (plan + relaxedPlan toggle), inherit previousPermissionMode instead of readOnly */
 	relaxedPlan?: boolean;
 	/** The permission mode saved before entering plan mode */
 	previousPermissionMode?: string;
+	/** Mutable object to collect metadata about the decision (e.g. blacklist source). */
+	meta?: PermissionDecisionMeta;
 }
 
 export function resolvePermissionDecision(
@@ -381,8 +503,10 @@ export function resolvePermissionDecision(
 		isChapter = false,
 		planFileId,
 		whitelistDirs = [],
+		blacklistDirs = [],
 		relaxedPlan = false,
 		previousPermissionMode,
+		meta,
 	} = opts;
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
@@ -414,6 +538,19 @@ export function resolvePermissionDecision(
 			: permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
+
+	// Blacklist takes priority over whitelist — deny if any path is blocked.
+	const blacklistResult = resolveBlacklistDecision(
+		toolName,
+		input,
+		cwd,
+		blacklistDirs,
+		bashAnalysis,
+	);
+	if (blacklistResult) {
+		if (meta) meta.blacklistReason = blacklistResult.reason;
+		return "deny";
+	}
 
 	const whitelistDecision = resolveWhitelistDecision(
 		toolName,
@@ -597,20 +734,93 @@ export async function handlePermission(
 
 	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
 
-	// Load enabled whitelist directories for this narrator.
-	// Subagents inherit their parent narrator's whitelist directories.
-	const whitelistOwnerId =
+	// Load enabled whitelist/blacklist directories for this narrator.
+	// Subagents inherit their parent narrator's directories.
+	// Three-layer merge: global settings → project chapterSettings → narrator DB rows.
+	const dirOwnerId =
 		narrator?.type === "subagent" && narrator.parentNarratorId
 			? narrator.parentNarratorId
 			: narratorId;
+
+	// Layer 1: global settings
+	const globalWl: WhitelistDir[] = (settings.agent.whitelistDirs ?? [])
+		.filter((d) => d.enabled !== false)
+		.map((d) => ({ path: d.path, accessLevel: d.accessLevel, enabled: true }));
+	const globalBl: BlacklistDir[] = (settings.agent.blacklistDirs ?? [])
+		.filter((d) => d.enabled !== false)
+		.map((d) => ({
+			path: d.path,
+			denyLevel: d.denyLevel,
+			enabled: true,
+			source: "global" as const,
+		}));
+
+	// Layer 2: project chapterSettings (if narrator belongs to a chapter)
+	let projectWl: WhitelistDir[] = [];
+	let projectBl: BlacklistDir[] = [];
+	if (narrator?.chapterId) {
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { projectId: true },
+		});
+		if (chapter?.projectId) {
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { chapterSettings: true },
+			});
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+			const cs = project?.chapterSettings as any;
+			if (cs?.whitelistDirs) {
+				projectWl = cs.whitelistDirs
+					.filter((d: any) => d.enabled !== false)
+					.map((d: any) => ({
+						path: d.path,
+						accessLevel: d.accessLevel ?? "readOnly",
+						enabled: true,
+					}));
+			}
+			if (cs?.blacklistDirs) {
+				projectBl = cs.blacklistDirs
+					.filter((d: any) => d.enabled !== false)
+					.map((d: any) => ({
+						path: d.path,
+						denyLevel: d.denyLevel ?? "denyAll",
+						enabled: true,
+						source: "project" as const,
+					}));
+			}
+		}
+	}
+
+	// Layer 3: narrator-level DB rows
 	const wlRows = await db.query.narratorWhitelistDirs.findMany({
 		where: and(
-			eq(narratorWhitelistDirs.narratorId, whitelistOwnerId),
+			eq(narratorWhitelistDirs.narratorId, dirOwnerId),
 			eq(narratorWhitelistDirs.enabled, true),
 		),
 		columns: { path: true, accessLevel: true, enabled: true },
 	});
+	const blRows = await db.query.narratorBlacklistDirs.findMany({
+		where: and(
+			eq(narratorBlacklistDirs.narratorId, dirOwnerId),
+			eq(narratorBlacklistDirs.enabled, true),
+		),
+		columns: { path: true, denyLevel: true, enabled: true },
+	});
 
+	// Merge all layers
+	const mergedWhitelist: WhitelistDir[] = [
+		...globalWl,
+		...projectWl,
+		...(wlRows as WhitelistDir[]),
+	];
+	const mergedBlacklist: BlacklistDir[] = [
+		...globalBl,
+		...projectBl,
+		...blRows.map((r) => ({ ...r, source: "narrator" as const })),
+	];
+
+	const permMeta: PermissionDecisionMeta = {};
 	const decision = resolvePermissionDecision({
 		toolName,
 		input: effectiveInput,
@@ -619,9 +829,11 @@ export async function handlePermission(
 		bashAnalysis,
 		isChapter,
 		planFileId,
-		whitelistDirs: wlRows as WhitelistDir[],
+		whitelistDirs: mergedWhitelist,
+		blacklistDirs: mergedBlacklist,
 		relaxedPlan: isRelaxedPlan,
 		previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
+		meta: permMeta,
 	});
 	logger.debug("Permission decision", {
 		narratorId,
@@ -629,8 +841,10 @@ export async function handlePermission(
 		decision,
 		permMode,
 		cwd,
-		whitelistDirCount: wlRows.length,
-		whitelistDirs: wlRows.map((d) => ({ path: d.path, accessLevel: d.accessLevel })),
+		whitelistDirCount: mergedWhitelist.length,
+		blacklistDirCount: mergedBlacklist.length,
+		whitelistDirs: mergedWhitelist.map((d) => ({ path: d.path, accessLevel: d.accessLevel })),
+		blacklistDirs: mergedBlacklist.map((d) => ({ path: d.path, denyLevel: d.denyLevel })),
 		bashAnalysisAvailable: !!bashAnalysis,
 		bashFilePaths: bashAnalysis?.filePaths,
 		bashNonWhitelisted: bashAnalysis?.nonWhitelisted,
@@ -681,6 +895,32 @@ export async function handlePermission(
 		return { behavior: "allow", updatedInput: effectiveInput };
 	}
 	if (decision === "deny") {
+		// Blacklist-triggered deny — use the specific reason from the blacklist check
+		if (permMeta.blacklistReason) {
+			const denyMsg = `DENIED: ${permMeta.blacklistReason}`;
+			logger.debug("Permission denied by blacklist", {
+				narratorId,
+				toolName,
+				toolUseId,
+				reason: permMeta.blacklistReason,
+			});
+			await db
+				.update(narratorToolCalls)
+				.set({
+					status: "fail",
+					errorMessage: denyMsg,
+					permissionDecidedBy: "auto",
+					permissionDecidedAt: new Date().toISOString(),
+					permissionDecisionReason: permMeta.blacklistReason,
+				})
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+					),
+				);
+			return { behavior: "deny", message: denyMsg };
+		}
 		// Chapter mode git branch violation — provide specific error message
 		const branchViolations = bashAnalysis?.gitBranchViolations;
 		// In readOnly mode, read-only tools (Read/Grep/Glob) and read-only bash commands
@@ -981,8 +1221,12 @@ export async function resolvePermission(
 		narratorId: pending.broadcastTargetId,
 		requestId,
 		toolUseId: pending.toolUseId,
+		decision,
 		// Include answers so other clients can update the tool call display
 		...(updatedInput ? { updatedInput } : {}),
+		...(decision === "deny" && (denyMessage || feedbackText?.trim())
+			? { feedbackText: denyMessage || feedbackText?.trim() }
+			: {}),
 	});
 
 	try {
@@ -1056,8 +1300,20 @@ export async function resolvePermission(
 			}
 		}
 	} else {
-		const message = denyMessage || feedbackText?.trim() || "Permission denied by user";
-		pending.resolve({ behavior: "deny", message });
+		const userFeedback = denyMessage || feedbackText?.trim();
+		// ExitPlanMode denial: use a plan-specific message so the model knows it's still in plan mode
+		if (pending.toolName === "ExitPlanMode") {
+			const locale = activeNarrators.get(pending.narratorId)?.locale ?? "en";
+			const planDenyMsg = userFeedback
+				? getToolMessageWithParams("exitPlanModeDeniedWithMessage", locale, {
+						message: userFeedback,
+					})
+				: getToolMessage("exitPlanModeDenied", locale);
+			pending.resolve({ behavior: "deny", message: planDenyMsg, rawMessage: true });
+		} else {
+			const message = userFeedback || "Permission denied by user";
+			pending.resolve({ behavior: "deny", message });
+		}
 	}
 }
 
@@ -2290,7 +2546,6 @@ async function runAgentLoop(
 		await narratorService.updateStatus(narratorId, "error", errorMsg);
 		loopHadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
-		active.events.emit("event", { type: "done", data: null });
 	} finally {
 		active.alive = false;
 		if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
@@ -2547,8 +2802,14 @@ async function feedMessage(
 	}
 
 	// Start agent loop in background
-	runAgentLoop(active, prompt, images).catch((err) => {
+	runAgentLoop(active, prompt, images).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
+		await narratorService.updateStatus(narratorId, "error", String(err));
+		broadcastToNarrator(narratorId, {
+			type: "narrator_error",
+			narratorId,
+			error: String(err),
+		});
 	});
 
 	return { active, userMsg };
@@ -2647,8 +2908,14 @@ export async function retryLastMessage(
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "thinking");
 
-	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
+		await narratorService.updateStatus(narratorId, "error", String(err));
+		broadcastToNarrator(narratorId, {
+			type: "narrator_error",
+			narratorId,
+			error: String(err),
+		});
 	});
 
 	return { ok: true };
@@ -2746,8 +3013,14 @@ export async function regenerateFromMessage(
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "thinking");
 
-	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
+	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (regenerate)", { narratorId, error: String(err) });
+		await narratorService.updateStatus(narratorId, "error", String(err));
+		broadcastToNarrator(narratorId, {
+			type: "narrator_error",
+			narratorId,
+			error: String(err),
+		});
 	});
 
 	return { ok: true };
@@ -2894,12 +3167,20 @@ export async function editAndRegenerate(
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "thinking");
 
-	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch((err) => {
-		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
-			narratorId,
-			error: String(err),
-		});
-	});
+	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch(
+		async (err) => {
+			logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
+				narratorId,
+				error: String(err),
+			});
+			await narratorService.updateStatus(narratorId, "error", String(err));
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		},
+	);
 
 	return { ok: true };
 }

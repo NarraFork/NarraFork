@@ -39,6 +39,8 @@
 	"conflictsDescription": "{{count}} 个文件有冲突。您可以继续操作，AI 叙述者可以帮助解决冲突。",
 	"noConflicts": "无冲突",
 	"mergeClean": "可以顺利合并。",
+	"fastForward": "快进合并",
+	"fastForwardDescription": "目标分支没有分叉提交，合并将以快进方式进行，不会产生合并提交。",
 	"conflictCheckFailed": "冲突检查失败",
 	"mergeFailed": "合并失败",
 	"checkConflicts": "检查冲突",

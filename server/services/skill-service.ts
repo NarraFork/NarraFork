@@ -2,6 +2,7 @@ import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/p
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import matter from "gray-matter";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isInsidePath } from "../lib/platform-path";
 import { narraforkDir } from "../lib/settings";
@@ -240,7 +241,7 @@ export async function readSkillFile(skillLocation: string, filePath: string): Pr
 	// Security: ensure the resolved path is within the skill directory
 	// resolve() normalises ".." segments AND handles absolute filePath values
 	if (!isInsidePath(skillDir, resolved)) {
-		throw new Error("Path traversal not allowed");
+		throw new ValidationError("Path traversal not allowed");
 	}
 	return readFile(resolved, "utf-8");
 }
@@ -269,7 +270,7 @@ export async function createGlobalSkill(
 	content: string,
 ): Promise<SkillInfo> {
 	const dirName = sanitizeSkillDirName(name);
-	if (!dirName) throw new Error("Invalid skill name");
+	if (!dirName) throw new ValidationError("Invalid skill name");
 
 	const skillDir = join(globalSkillsDir, dirName);
 	const skillFile = join(skillDir, "SKILL.md");
@@ -277,9 +278,9 @@ export async function createGlobalSkill(
 	// Check if directory already exists
 	try {
 		await access(skillDir);
-		throw new Error(`Skill directory already exists: ${dirName}`);
+		throw new ValidationError(`Skill directory already exists: ${dirName}`);
 	} catch (err) {
-		if (err instanceof Error && err.message.includes("already exists")) throw err;
+		if (err instanceof ValidationError) throw err;
 		// Directory doesn't exist — good
 	}
 
@@ -290,7 +291,7 @@ export async function createGlobalSkill(
 	skillCache.delete(skillFile);
 
 	const skill = await loadSkillCached(skillFile, skillDir);
-	if (!skill) throw new Error("Failed to create skill — parse error");
+	if (!skill) throw new AppError("Failed to create skill — parse error", 500);
 	return skill;
 }
 
@@ -303,7 +304,7 @@ export async function updateGlobalSkill(
 	// Find the existing skill among global skills to get its location
 	const globals = await loadGlobalSkills();
 	const existing = globals.find((s) => s.name === currentName);
-	if (!existing) throw new Error(`Global skill not found: ${currentName}`);
+	if (!existing) throw new NotFoundError("Global skill", currentName);
 
 	const skillFile = existing.location;
 	const skillDir = dirname(skillFile);
@@ -314,14 +315,14 @@ export async function updateGlobalSkill(
 	skillCache.delete(skillFile);
 
 	const updated = await loadSkillCached(skillFile, skillDir);
-	if (!updated) throw new Error("Failed to update skill — parse error");
+	if (!updated) throw new AppError("Failed to update skill — parse error", 500);
 	return updated;
 }
 
 export async function deleteGlobalSkill(name: string): Promise<void> {
 	const globals = await loadGlobalSkills();
 	const existing = globals.find((s) => s.name === name);
-	if (!existing) throw new Error(`Global skill not found: ${name}`);
+	if (!existing) throw new NotFoundError("Global skill", name);
 
 	const skillDir = dirname(existing.location);
 	skillCache.delete(existing.location);

@@ -18,7 +18,7 @@ import {
 	getAllBuiltinRoutines,
 	getBuiltinRoutine,
 } from "../lib/builtin-routines";
-import { NotFoundError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { narraforkDir, settings } from "../lib/settings";
@@ -89,7 +89,7 @@ function isProjectEnabled(
 
 function routineToStatus(r: BuiltinRoutine, enabled: boolean): RoutineStatus {
 	const def = r.type === "command" ? r.command : r.type === "skill" ? r.skill : r.tool;
-	if (!def) throw new Error(`Routine ${r.id} missing definition`);
+	if (!def) throw new ValidationError(`Routine ${r.id} missing definition`);
 	return {
 		id: r.id,
 		type: r.type,
@@ -325,7 +325,7 @@ export function getProjectRoutineStatusesWithOverride(projectRoutines?: {
 
 function buildCommandFromRoutine(routine: BuiltinRoutine): Command {
 	const cmd = routine.command;
-	if (!cmd) throw new Error(`Routine ${routine.id} is not a command`);
+	if (!cmd) throw new ValidationError(`Routine ${routine.id} is not a command`);
 	return {
 		name: cmd.name,
 		prompt: cmd.prompt,

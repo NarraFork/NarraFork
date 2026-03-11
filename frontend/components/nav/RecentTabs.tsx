@@ -531,17 +531,17 @@ function SortableTabItem({
 					}
 					leftSection={
 						tab.type === "project" ? (
-							<IconFolder size={14} />
+							<IconFolder size={16} />
 						) : tab.type === "chapter" ? (
 							<IconGitBranch
-								size={14}
+								size={16}
 								color={iconColor}
 								fill={filledStatus ? "currentColor" : "none"}
 							/>
 						) : filledStatus ? (
-							<IconMessageCircleFilled size={14} color={iconColor} />
+							<IconMessageCircleFilled size={16} color={iconColor} />
 						) : (
-							<IconMessageCircle size={14} color={iconColor} />
+							<IconMessageCircle size={16} color={iconColor} />
 						)
 					}
 					styles={{
@@ -555,7 +555,6 @@ function SortableTabItem({
 								: {}),
 						},
 						label: { overflow: "hidden" },
-						section: { marginInlineEnd: 4 },
 					}}
 				/>
 			</div>

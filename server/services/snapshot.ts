@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
 
@@ -87,7 +88,7 @@ export const snapshot = {
 		// --git-dir is already set by execGit, so just pass --bare
 		const result = await execGit(["init", "--bare"], dir, worktreePath);
 		if (result.exitCode !== 0) {
-			throw new Error(`snapshot init failed: ${result.stderr}`);
+			throw new GitError(`snapshot init failed: ${result.stderr}`);
 		}
 		await this.syncExcludes(chapterId, worktreePath);
 	},
@@ -160,7 +161,7 @@ export const snapshot = {
 			await execGit(["add", "-A"], dir, worktreePath);
 			const result = await execGit(["write-tree"], dir, worktreePath);
 			if (result.exitCode !== 0) {
-				throw new Error(`snapshot write-tree failed: ${result.stderr}`);
+				throw new GitError(`snapshot write-tree failed: ${result.stderr}`);
 			}
 			return result.stdout;
 		});

@@ -4,6 +4,7 @@
 	"noProjects": "暂无叙事线，创建一个以开始。",
 	"projectName": "叙事线名称",
 	"projectNamePlaceholder": "我的叙事线",
+	"projectNameRequired": "请输入名称",
 	"repositoryPath": "仓库路径",
 	"repositoryPathDescription": "本地已有的 Git 仓库路径",
 	"projectNotFound": "叙事线未找到",
@@ -17,6 +18,7 @@
 	"cloneBranch": "分支（可选）",
 	"initPathDescription": "新仓库将创建在此路径",
 	"clonePathDescription": "克隆到本地的路径",
+	"cloning": "正在克隆仓库…",
 	"notGitRepoTitle": "非 Git 仓库",
 	"notGitRepoMessage": "所选路径不是 Git 仓库：\n{{path}}\n\n可以在此位置初始化一个新的 Git 仓库并创建叙事线。",
 	"notGitRepoInitAndCreate": "初始化并创建",
@@ -55,5 +57,9 @@
 	"proxyDomain": "代理域名",
 	"proxyDomainDesc": "容器代理子域名的基础域名。每个容器端口会分配一个子域名，格式为 {章节ID}-{服务名}-{端口}.{域名}。",
 	"proxyDomainHint": "需要配置通配符 DNS：*.{域名} → 服务器 IP。本地开发可使用 *.localhost 或配置 dnsmasq。",
-	"proxyDomainInvalid": "请输入合法域名（示例：dev.example.com，不要包含 http:// 或路径）"
+	"proxyDomainInvalid": "请输入合法域名（示例：dev.example.com，不要包含 http:// 或路径）",
+	"projectWhitelistDirs": "白名单目录",
+	"projectWhitelistDirsDesc": "对本项目叙述者自动放行的目录。",
+	"projectBlacklistDirs": "黑名单目录",
+	"projectBlacklistDirsDesc": "对本项目叙述者禁止访问的目录。"
 }

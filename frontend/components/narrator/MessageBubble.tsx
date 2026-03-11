@@ -1,6 +1,7 @@
 import {
 	Box,
 	Button,
+	CloseButton,
 	Group,
 	Image,
 	Loader,
@@ -140,6 +141,59 @@ function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) 
 				onClick={() => window.open(src, "_blank")}
 			/>
 		</Box>
+	);
+}
+
+function ErrorNotice({
+	message,
+	narratorId,
+	messageId,
+	onDismiss,
+}: {
+	message: string;
+	narratorId: string;
+	messageId: string;
+	onDismiss?: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [dismissing, setDismissing] = useState(false);
+
+	const handleDismiss = async () => {
+		setDismissing(true);
+		try {
+			await api.deleteMessage(narratorId, messageId);
+			onDismiss?.();
+		} catch {
+			notifications.show({
+				title: t("deleteMessageFailed"),
+				message: t("deleteMessageFailedDesc"),
+				color: "red",
+				autoClose: 5000,
+			});
+		} finally {
+			setDismissing(false);
+		}
+	};
+
+	return (
+		<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+			<Group gap={6} wrap="nowrap" align="flex-start">
+				<IconAlertTriangle
+					size={16}
+					style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-red-7)" }}
+				/>
+				<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap", flex: 1 }}>
+					{message}
+				</Text>
+				<CloseButton
+					size="xs"
+					variant="subtle"
+					c="red.7"
+					disabled={dismissing}
+					onClick={handleDismiss}
+				/>
+			</Group>
+		</Paper>
 	);
 }
 
@@ -960,19 +1014,14 @@ export const MessageBubble = memo(function MessageBubble({
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const errorBlock = blocks.find((b: any) => b.type === "error");
-		if (errorBlock) {
+		if (errorBlock && narratorId && message.id) {
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
-					<Group gap={6} wrap="nowrap" align="flex-start">
-						<IconAlertTriangle
-							size={16}
-							style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
-						/>
-						<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
-							{errorBlock.message ?? t("unknownError")}
-						</Text>
-					</Group>
-				</Paper>
+				<ErrorNotice
+					message={errorBlock.message ?? t("unknownError")}
+					narratorId={narratorId}
+					messageId={message.id}
+					onDismiss={invalidateMessages}
+				/>
 			);
 		}
 		return null;
