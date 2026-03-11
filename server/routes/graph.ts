@@ -30,6 +30,7 @@ export interface GraphNode {
 		panelExpanded: boolean;
 		panelWidth: number | null;
 		panelHeight: number | null;
+		worktreePath: string | null;
 	};
 	position: { x: number; y: number };
 }
@@ -96,6 +97,7 @@ export function buildGraph(
 			panelExpanded: !!ch.panelExpanded,
 			panelWidth: ch.panelWidth ?? null,
 			panelHeight: ch.panelHeight ?? null,
+			worktreePath: ch.worktreePath ?? null,
 		},
 		position: {
 			x: ch.positionX ?? 0,
