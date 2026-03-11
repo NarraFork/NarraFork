@@ -4,21 +4,37 @@
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-03-11
+
 ### Added
 - 三级黑名单目录系统（全局/项目/叙述者级别），限制 AI 访问敏感目录
 - Git clone SSE 流式传输，支持进度条实时显示
 - 终端工具（Terminal Tool），AI agent 可直接与 PTY 终端交互
 - PathInput 组件，支持路径自动补全和内联创建目录
-- 消息编辑与重新生成功能，支持一键重试和从任意消息重新生成
-- 编辑确认弹窗，区分章节绑定与独立叙述者的 keep/rollback 选项
-- 输入历史导航，支持上下箭头键浏览历史输入
 
 ### Changed
 - 设置页面重构为分区组件（About/Agent/Appearance/Models/Notification 等）
 - 快进合并检测 + 可靠的 unmerge（通过 preMergeTargetSha 追踪）
 - 标题生成加权最近消息，提高标题相关性
-- 终端进程查询从 wmic 迁移到 powershell，增加 git bash 支持
 - trunk 角色仅限 root chapter
+
+### Fixed
+- Code review 修复 — 7 个已验证问题
+- 错误边界 + 全局 mutation 错误处理器（i18n）
+- SSE reader 在流完成时正确取消
+- 合并 DB 失败返回 warning 而非 500
+- 离开叙述者重置 interrupted 状态
+- Plan mode deny 反馈（i18n）
+
+## [0.0.7] - 2026-03-10
+
+### Added
+- 消息编辑与重新生成功能，支持一键重试和从任意消息重新生成
+- 编辑确认弹窗，区分章节绑定与独立叙述者的 keep/rollback 选项
+- 输入历史导航，支持上下箭头键浏览历史输入
+
+### Changed
+- 终端进程查询从 wmic 迁移到 powershell，增加 git bash 支持
 
 ### Fixed
 - Windows shell 检测和进程处理改进
@@ -26,12 +42,6 @@
 - 终止按钮移到 LazyCollapse 外部，无需展开即可见
 - toolCallData 构建缺少 startedAt 和 _longRunning 字段
 - Windows 上 Git for Windows 进程泄漏 + Redisson 风格看门狗续期机制
-- Code review 修复 — 7 个已验证问题
-- 错误边界 + 全局 mutation 错误处理器（i18n）
-- SSE reader 在流完成时正确取消
-- 合并 DB 失败返回 warning 而非 500
-- 离开叙述者重置 interrupted 状态
-- Plan mode deny 反馈（i18n）
 
 ## [0.0.6] - 2026-03-10
 
