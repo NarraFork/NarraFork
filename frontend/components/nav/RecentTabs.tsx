@@ -37,6 +37,7 @@ import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
+import { usePlatform } from "../../hooks/usePlatform";
 import { type RecentTab, type RecentTabViewer, useRecentTabs } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -306,6 +307,29 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 		setCtxMenu(null);
 	}, [ctxMenu, removeTab, pathname, navigate]);
 
+	const platform = usePlatform();
+
+	const handleReveal = useCallback(async () => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		try {
+			if (tab.type === "chapter") {
+				const chapter = await api.getChapter(tab.id);
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				const wt = (chapter as any)?.worktreePath;
+				if (wt) await api.fsReveal(wt);
+			} else if (tab.type === "narrator") {
+				const narrator = await api.getNarrator(tab.id);
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				const cwd = (narrator as any)?.cwd;
+				if (cwd) await api.fsReveal(cwd);
+			}
+		} catch {
+			// ignore
+		}
+	}, [ctxMenu]);
+
 	if (filtered.length === 0) return null;
 
 	const sortIds = filtered.map(tabSortId);
@@ -334,6 +358,8 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 					onClose={() => setCtxMenu(null)}
 					onMoveToTop={handleMoveToTop}
 					onRemove={handleCtxClose}
+					onReveal={handleReveal}
+					canReveal={platform !== "linux" && ctxMenu.tab.type !== "project"}
 					isFirst={
 						filtered.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
 					}
@@ -672,11 +698,23 @@ interface TabContextMenuProps {
 	onClose: () => void;
 	onMoveToTop: () => void;
 	onRemove: () => void;
+	onReveal: () => void;
+	canReveal: boolean;
 	isFirst: boolean;
 	t: (key: string) => string;
 }
 
-function TabContextMenu({ x, y, onClose, onMoveToTop, onRemove, isFirst, t }: TabContextMenuProps) {
+function TabContextMenu({
+	x,
+	y,
+	onClose,
+	onMoveToTop,
+	onRemove,
+	onReveal,
+	canReveal,
+	isFirst,
+	t,
+}: TabContextMenuProps) {
 	return (
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
@@ -717,6 +755,14 @@ function TabContextMenu({ x, y, onClose, onMoveToTop, onRemove, isFirst, t }: Ta
 							<Text size="sm">{t("closeTab")}</Text>
 						</Group>
 					</UnstyledButton>
+					{canReveal && (
+						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconFolder size={14} />
+								<Text size="sm">{t("revealInExplorer")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
 				</Stack>
 			</Paper>
 		</>

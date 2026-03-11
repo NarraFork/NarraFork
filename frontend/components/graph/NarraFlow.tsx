@@ -62,7 +62,13 @@ interface ContextMenuState {
 	x: number;
 	y: number;
 	nodeId: string;
-	nodeData: { title: string; status: string; role: string; isRoot?: boolean };
+	nodeData: {
+		title: string;
+		status: string;
+		role: string;
+		isRoot?: boolean;
+		worktreePath?: string | null;
+	};
 }
 
 const PAN_SPEED = 1.5;
@@ -879,6 +885,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				status: d.status ?? "",
 				role: d.role ?? "branch",
 				isRoot: d.isRoot ?? false,
+				worktreePath: d.worktreePath ?? null,
 			},
 		});
 	}, []);
@@ -1413,6 +1420,18 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[nodes],
 	);
 
+	const handleReveal = useCallback(
+		(nodeId: string) => {
+			setContextMenu(null);
+			const node = nodes.find((n) => n.id === nodeId);
+			const path = (node?.data as { worktreePath?: string | null } | undefined)?.worktreePath;
+			if (path) {
+				api.fsReveal(path).catch(() => {});
+			}
+		},
+		[nodes],
+	);
+
 	const confirmDelete = useCallback(() => {
 		if (!deleteTarget) return;
 		deleteChapter.mutate(deleteTarget.id, {
@@ -1536,6 +1555,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						onWake={handleWake}
 						onUnmerge={handleUnmerge}
 						onDelete={handleDelete}
+						onReveal={handleReveal}
 					/>
 				)}
 			</Box>

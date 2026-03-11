@@ -1635,6 +1635,12 @@ export const api = {
 			body: JSON.stringify({ parent, name }),
 		}),
 
+	fsReveal: (path: string) =>
+		request<{ ok: true }>("/fs/reveal", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+
 	// Routines
 	getRoutines: () =>
 		request<{

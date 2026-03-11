@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
+import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
 
 export const fsRoutes = new Hono();
 
@@ -83,6 +85,49 @@ fsRoutes.post("/mkdir", async (c) => {
 
 	mkdirSync(newPath);
 	return c.json({ path: newPath });
+});
+
+/**
+ * POST /api/fs/reveal
+ *
+ * Open a directory in the system file manager.
+ * Body: { path: string }
+ *
+ * - macOS: `open <path>`
+ * - Windows: `explorer <path>`
+ * - Linux: not supported (returns 400)
+ */
+fsRoutes.post("/reveal", async (c) => {
+	const body = await c.req.json<{ path?: string }>();
+	const { path: rawPath } = body;
+
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const absPath = resolve(rawPath);
+	if (!existsSync(absPath) || !statSync(absPath).isDirectory()) {
+		throw new ValidationError(`Directory does not exist: ${absPath}`);
+	}
+
+	let cmd: string;
+	let args: string[];
+
+	if (IS_MACOS) {
+		cmd = "open";
+		args = [absPath];
+	} else if (IS_WINDOWS) {
+		cmd = "explorer";
+		args = [absPath];
+	} else {
+		throw new ValidationError("Opening file manager is not supported on this platform");
+	}
+
+	// Fire-and-forget — don't wait for the file manager to close
+	const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+	child.unref();
+
+	return c.json({ ok: true });
 });
 
 /** List immediate subdirectories of a path. */

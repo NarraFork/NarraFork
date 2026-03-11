@@ -1,5 +1,6 @@
 import { Divider, Paper, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useTranslation } from "react-i18next";
+import { usePlatform } from "../../hooks/usePlatform";
 
 interface NodeContextMenuProps {
 	x: number;
@@ -10,6 +11,7 @@ interface NodeContextMenuProps {
 		status: string;
 		role: string;
 		isRoot?: boolean;
+		worktreePath?: string | null;
 	};
 	onClose: () => void;
 	onFork: (nodeId: string) => void;
@@ -18,6 +20,7 @@ interface NodeContextMenuProps {
 	onWake: (nodeId: string) => void;
 	onUnmerge: (nodeId: string) => void;
 	onDelete: (nodeId: string) => void;
+	onReveal: (nodeId: string) => void;
 }
 
 export function NodeContextMenu({
@@ -32,9 +35,12 @@ export function NodeContextMenu({
 	onWake,
 	onUnmerge,
 	onDelete,
+	onReveal,
 }: NodeContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const isRoot = !!nodeData.isRoot;
+	const platform = usePlatform();
+	const canReveal = platform !== "linux" && !!nodeData.worktreePath;
 
 	return (
 		<>
@@ -68,6 +74,16 @@ export function NodeContextMenu({
 					<UnstyledButton px="xs" py={4} onClick={() => onFork(nodeId)} style={{ borderRadius: 4 }}>
 						<Text size="sm">{t("contextMenu.fork")}</Text>
 					</UnstyledButton>
+					{canReveal && (
+						<UnstyledButton
+							px="xs"
+							py={4}
+							onClick={() => onReveal(nodeId)}
+							style={{ borderRadius: 4 }}
+						>
+							<Text size="sm">{t("contextMenu.revealInExplorer")}</Text>
+						</UnstyledButton>
+					)}
 					{!isRoot && (
 						<>
 							<Divider my={4} />
