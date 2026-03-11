@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { execSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
-import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 
 export const fsRoutes = new Hono();
 
@@ -60,18 +60,26 @@ fsRoutes.get("/browse", (c) => {
  * GET /api/fs/shortcuts
  *
  * Return well-known quick-access directories (home, desktop, documents, downloads, root).
+ * Uses platform-specific APIs to resolve actual paths:
+ * - Linux: XDG user-dirs ($XDG_DESKTOP_DIR etc., falls back to ~/Desktop)
+ * - macOS: ~/Desktop, ~/Documents, ~/Downloads (standard on macOS)
+ * - Windows: Known Folder GUIDs via PowerShell, falls back to USERPROFILE subfolders
+ *
  * Only includes paths that actually exist on the system.
  */
 fsRoutes.get("/shortcuts", (c) => {
 	const home = homedir();
 	const isWin = process.platform === "win32";
 
-	const candidates: { key: string; path: string }[] = [
-		{ key: "home", path: home },
-		{ key: "desktop", path: join(home, "Desktop") },
-		{ key: "documents", path: join(home, "Documents") },
-		{ key: "downloads", path: join(home, "Downloads") },
-	];
+	const desktop = resolveUserDir("desktop", home);
+	const documents = resolveUserDir("documents", home);
+	const downloads = resolveUserDir("downloads", home);
+
+	const candidates: { key: string; path: string }[] = [{ key: "home", path: home }];
+
+	if (desktop) candidates.push({ key: "desktop", path: desktop });
+	if (documents) candidates.push({ key: "documents", path: documents });
+	if (downloads) candidates.push({ key: "downloads", path: downloads });
 
 	if (!isWin) {
 		candidates.push({ key: "root", path: "/" });
@@ -211,4 +219,130 @@ function getWindowsDrives(): { name: string; path: string }[] {
 		}
 	}
 	return drives;
+}
+
+// ── XDG / system directory resolution ────────────────────────────────────────
+
+/** Cache for resolved XDG user dirs (parsed once from user-dirs.dirs). */
+let _xdgCache: Record<string, string> | null = null;
+
+/**
+ * Parse ~/.config/user-dirs.dirs (XDG user directories config on Linux).
+ * Format: XDG_DESKTOP_DIR="$HOME/Desktop"
+ */
+function parseXdgUserDirs(home: string): Record<string, string> {
+	if (_xdgCache) return _xdgCache;
+	_xdgCache = {};
+
+	const configHome = process.env.XDG_CONFIG_HOME || join(home, ".config");
+	const filePath = join(configHome, "user-dirs.dirs");
+
+	try {
+		if (!existsSync(filePath)) return _xdgCache;
+		const content = readFileSync(filePath, "utf-8");
+		for (const line of content.split("\n")) {
+			const trimmed = line.trim();
+			if (trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+			const eqIdx = trimmed.indexOf("=");
+			const key = trimmed.slice(0, eqIdx).trim();
+			let val = trimmed.slice(eqIdx + 1).trim();
+			// Remove surrounding quotes
+			if (
+				(val.startsWith('"') && val.endsWith('"')) ||
+				(val.startsWith("'") && val.endsWith("'"))
+			) {
+				val = val.slice(1, -1);
+			}
+			// Expand $HOME
+			val = val.replace(/\$HOME/g, home);
+			_xdgCache[key] = val;
+		}
+	} catch {
+		// ignore parse errors
+	}
+	return _xdgCache;
+}
+
+/** Windows Known Folder GUIDs for Desktop, Documents, Downloads. */
+const WINDOWS_KNOWN_FOLDERS: Record<string, string> = {
+	desktop: "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+	documents: "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+	downloads: "{374DE290-123F-4565-9164-39C4925E467B}",
+};
+
+/** Cache for Windows known folder paths. */
+const _winFolderCache: Record<string, string | null> = {};
+
+/**
+ * Resolve a Windows Known Folder path via PowerShell.
+ * Falls back to home + English name if PowerShell fails.
+ */
+function resolveWindowsKnownFolder(key: string, home: string): string | null {
+	if (key in _winFolderCache) return _winFolderCache[key];
+
+	const guid = WINDOWS_KNOWN_FOLDERS[key];
+	if (!guid) {
+		_winFolderCache[key] = null;
+		return null;
+	}
+
+	try {
+		const result = execSync(
+			`powershell -NoProfile -Command "[Environment]::GetFolderPath('${key.charAt(0).toUpperCase() + key.slice(1)}')"`,
+			{ encoding: "utf-8", timeout: 3000 },
+		).trim();
+		if (result && existsSync(result)) {
+			_winFolderCache[key] = result;
+			return result;
+		}
+	} catch {
+		// PowerShell not available or failed
+	}
+
+	// Fallback to English name under home
+	const fallback = join(home, key.charAt(0).toUpperCase() + key.slice(1));
+	_winFolderCache[key] = existsSync(fallback) ? fallback : null;
+	return _winFolderCache[key];
+}
+
+/**
+ * Resolve a well-known user directory (desktop, documents, downloads)
+ * using platform-appropriate APIs.
+ *
+ * - Linux: XDG user-dirs.dirs → env vars → fallback ~/Desktop etc.
+ * - macOS: ~/Desktop, ~/Documents, ~/Downloads (always English on macOS)
+ * - Windows: Environment.GetFolderPath via PowerShell → fallback USERPROFILE subfolders
+ */
+function resolveUserDir(key: "desktop" | "documents" | "downloads", home: string): string | null {
+	const xdgMap: Record<string, string> = {
+		desktop: "XDG_DESKTOP_DIR",
+		documents: "XDG_DOCUMENTS_DIR",
+		downloads: "XDG_DOWNLOAD_DIR",
+	};
+
+	const englishName: Record<string, string> = {
+		desktop: "Desktop",
+		documents: "Documents",
+		downloads: "Downloads",
+	};
+
+	if (IS_WINDOWS) {
+		return resolveWindowsKnownFolder(key, home);
+	}
+
+	if (IS_LINUX) {
+		// 1. Check XDG env var directly (rare but possible)
+		const envKey = xdgMap[key];
+		const envVal = process.env[envKey];
+		if (envVal && existsSync(envVal)) return envVal;
+
+		// 2. Parse user-dirs.dirs
+		const xdgDirs = parseXdgUserDirs(home);
+		const xdgVal = xdgDirs[envKey];
+		if (xdgVal && existsSync(xdgVal)) return xdgVal;
+	}
+
+	// macOS always uses English names; Linux fallback
+	const fallback = join(home, englishName[key]);
+	return existsSync(fallback) ? fallback : null;
 }

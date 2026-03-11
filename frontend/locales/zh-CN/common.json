@@ -186,10 +186,13 @@
 	"desktop": "桌面",
 	"documents": "文档",
 	"downloads": "下载",
-	"refresh": "刷新",
 	"showHiddenDirs": "显示隐藏目录",
 	"hideHiddenDirs": "隐藏隐藏目录",
 	"editPath": "编辑路径",
 	"quickAccess": "快捷访问",
+	"favorites": "收藏夹",
+	"addToFavorites": "添加到收藏",
+	"removeFromFavorites": "取消收藏",
+	"noFavorites": "暂无收藏",
 	"pathBarPlaceholder": "输入路径..."
 }

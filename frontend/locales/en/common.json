@@ -186,10 +186,13 @@
 	"desktop": "Desktop",
 	"documents": "Documents",
 	"downloads": "Downloads",
-	"refresh": "Refresh",
 	"showHiddenDirs": "Show hidden directories",
 	"hideHiddenDirs": "Hide hidden directories",
 	"editPath": "Edit path",
 	"quickAccess": "Quick Access",
+	"favorites": "Favorites",
+	"addToFavorites": "Add to favorites",
+	"removeFromFavorites": "Remove from favorites",
+	"noFavorites": "No favorites yet",
 	"pathBarPlaceholder": "Enter path..."
 }

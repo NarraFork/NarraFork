@@ -1,6 +1,5 @@
 import {
 	ActionIcon,
-	Box,
 	Button,
 	Divider,
 	Group,
@@ -26,10 +25,18 @@ import {
 	IconHome,
 	IconPencil,
 	IconRefresh,
+	IconStar,
+	IconStarFilled,
+	IconTrash,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useCreateFavoriteDirectory,
+	useDeleteFavoriteDirectory,
+	useFavoriteDirectories,
+} from "../../hooks/useFavoriteDirectories";
 import { api } from "../../lib/api";
 import { PathInput } from "./PathInput";
 
@@ -138,17 +145,24 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const [editValue, setEditValue] = useState("");
 	const editInputRef = useRef<HTMLInputElement>(null);
 
-	// Shortcuts
+	// Shortcuts (system dirs)
 	const { data: shortcutsData } = useQuery({
 		queryKey: ["fs-shortcuts"],
 		queryFn: () => api.fsShortcuts(),
 		staleTime: 60_000,
 	});
 
+	// Favorites
+	const { data: favorites = [] } = useFavoriteDirectories();
+	const addFavorite = useCreateFavoriteDirectory();
+	const removeFavorite = useDeleteFavoriteDirectory();
+
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["fs-browse", currentPath, showHidden],
 		queryFn: () => api.fsBrowse(currentPath, { showHidden }),
 	});
+
+	const isFavorited = favorites.some((f) => f.path === (data?.path ?? ""));
 
 	const mkdirMutation = useMutation({
 		mutationFn: ({ parent, name }: { parent: string; name: string }) => api.fsMkdir(parent, name),
@@ -202,7 +216,6 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 		mkdirMutation.mutate({ parent: data.path, name });
 	}, [newFolderName, data?.path, mkdirMutation]);
 
-	// Start editing the path bar
 	const startEditing = useCallback(() => {
 		setEditValue(data?.path ?? "");
 		setEditing(true);
@@ -212,7 +225,6 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 		}, 0);
 	}, [data?.path]);
 
-	// Commit the edited path
 	const commitEdit = useCallback(() => {
 		const v = editValue.trim();
 		if (v) {
@@ -224,6 +236,16 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const cancelEdit = useCallback(() => {
 		setEditing(false);
 	}, []);
+
+	const toggleFavorite = useCallback(() => {
+		if (!data?.path) return;
+		const existing = favorites.find((f) => f.path === data.path);
+		if (existing) {
+			removeFavorite.mutate(existing.id);
+		} else {
+			addFavorite.mutate({ path: data.path });
+		}
+	}, [data?.path, favorites, addFavorite, removeFavorite]);
 
 	// Shortcut label mapping
 	const shortcutLabel = useCallback(
@@ -251,7 +273,6 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 		}
 	}, []);
 
-	// Double-click on entry to select it directly
 	const handleEntryDoubleClick = useCallback(
 		(entryPath: string) => {
 			onSelect(entryPath);
@@ -302,7 +323,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 
 			<Divider />
 
-			{/* ── Path bar ── */}
+			{/* ── Path bar with star ── */}
 			<Group gap={4} px="sm" py={6} wrap="nowrap">
 				{editing ? (
 					<TextInput
@@ -341,26 +362,45 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 					</UnstyledButton>
 				)}
 				{!editing && (
-					<Tooltip label={t("editPath")} openDelay={400}>
-						<ActionIcon variant="subtle" size="sm" onClick={startEditing}>
-							<IconPencil size={14} />
-						</ActionIcon>
-					</Tooltip>
+					<>
+						<Tooltip label={t("editPath")} openDelay={400}>
+							<ActionIcon variant="subtle" size="sm" onClick={startEditing}>
+								<IconPencil size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip
+							label={isFavorited ? t("removeFromFavorites") : t("addToFavorites")}
+							openDelay={400}
+						>
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								onClick={toggleFavorite}
+								disabled={!data?.path}
+								color={isFavorited ? "yellow" : undefined}
+							>
+								{isFavorited ? <IconStarFilled size={14} /> : <IconStar size={14} />}
+							</ActionIcon>
+						</Tooltip>
+					</>
 				)}
 			</Group>
 
 			<Divider />
 
-			{/* ── Main content: shortcuts sidebar + directory listing ── */}
+			{/* ── Main content: sidebar + directory listing ── */}
 			<Group gap={0} wrap="nowrap" align="stretch" style={{ minHeight: 350 }}>
-				{/* Shortcuts sidebar */}
-				<Box
+				{/* Sidebar: shortcuts + favorites */}
+				<ScrollArea
 					style={{
-						width: 140,
+						width: 150,
 						flexShrink: 0,
 						borderRight: "1px solid var(--mantine-color-dark-4)",
 					}}
+					h={350}
+					type="auto"
 				>
+					{/* System shortcuts */}
 					<Text size="xs" fw={600} c="dimmed" px="xs" py={6}>
 						{t("quickAccess")}
 					</Text>
@@ -395,7 +435,51 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 							/>
 						))}
 					</Stack>
-				</Box>
+
+					{/* Favorites */}
+					<Divider my={4} />
+					<Text size="xs" fw={600} c="dimmed" px="xs" py={6}>
+						{t("favorites")}
+					</Text>
+					<Stack gap={0}>
+						{favorites.length === 0 && (
+							<Text size="xs" c="dimmed" px="xs" py={4}>
+								{t("noFavorites")}
+							</Text>
+						)}
+						{favorites.map((fav) => {
+							const label = fav.label || fav.path.split(/[/\\]/).filter(Boolean).pop() || fav.path;
+							return (
+								<NavLink
+									key={fav.id}
+									label={label}
+									leftSection={<IconStarFilled size={14} color="var(--mantine-color-yellow-5)" />}
+									active={data?.path === fav.path}
+									onClick={() => navigateTo(fav.path)}
+									rightSection={
+										<ActionIcon
+											variant="subtle"
+											size="xs"
+											color="red"
+											onClick={(e) => {
+												e.stopPropagation();
+												removeFavorite.mutate(fav.id);
+											}}
+										>
+											<IconTrash size={12} />
+										</ActionIcon>
+									}
+									py={4}
+									styles={{
+										label: { fontSize: 12 },
+										root: { borderRadius: 0 },
+									}}
+									title={fav.path}
+								/>
+							);
+						})}
+					</Stack>
+				</ScrollArea>
 
 				{/* Directory listing */}
 				<ScrollArea style={{ flex: 1 }} h={350} type="auto" offsetScrollbars>
