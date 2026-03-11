@@ -4,7 +4,6 @@ import {
 	Badge,
 	Box,
 	Button,
-	Center,
 	CloseButton,
 	Group,
 	Image,
@@ -16,6 +15,7 @@ import {
 	Popover,
 	ScrollArea,
 	SegmentedControl,
+	Skeleton,
 	Stack,
 	Switch,
 	Text,
@@ -97,6 +97,7 @@ import {
 	StreamingBubble,
 } from "./MessageRenderer";
 import { findMsgByToolUseIdInTree } from "./message-tree-utils";
+import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
@@ -1568,12 +1569,7 @@ export function NarratorPanel({
 		}
 	};
 
-	if (!narrator || messagesLoading)
-		return (
-			<Center h="100%">
-				<Loader />
-			</Center>
-		);
+	if (!narrator || messagesLoading) return <NarratorPanelSkeleton />;
 
 	return (
 		<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
@@ -1742,6 +1738,60 @@ export function NarratorPanel({
 										: undefined
 								}
 							/>
+						</Box>
+					)}
+					{/* Skeleton overlay during progressive rendering to prevent jitter */}
+					{!renderDone && (
+						<Box
+							pos="absolute"
+							top={0}
+							left={0}
+							right={0}
+							bottom={0}
+							py="sm"
+							px="md"
+							style={{
+								zIndex: 2,
+								backgroundColor: "var(--mantine-color-body)",
+							}}
+						>
+							<Stack gap="md">
+								<Group align="flex-start" gap="sm">
+									<Skeleton height={28} width={28} circle />
+									<Box style={{ flex: 1 }}>
+										<Skeleton height={14} width={60} mb={6} radius="sm" />
+										<Skeleton height={36} radius="sm" />
+									</Box>
+								</Group>
+								<Group align="flex-start" gap="sm">
+									<Skeleton height={28} width={28} circle />
+									<Box style={{ flex: 1 }}>
+										<Skeleton height={14} width={80} mb={6} radius="sm" />
+										<Skeleton height={16} width="95%" mb={4} radius="sm" />
+										<Skeleton height={16} width="88%" mb={4} radius="sm" />
+										<Skeleton height={16} width="72%" mb={4} radius="sm" />
+										<Skeleton height={80} width="100%" mt={8} radius="sm" />
+										<Skeleton height={16} width="90%" mt={8} radius="sm" />
+										<Skeleton height={16} width="60%" radius="sm" />
+									</Box>
+								</Group>
+								<Group align="flex-start" gap="sm">
+									<Skeleton height={28} width={28} circle />
+									<Box style={{ flex: 1 }}>
+										<Skeleton height={14} width={60} mb={6} radius="sm" />
+										<Skeleton height={24} width="70%" radius="sm" />
+									</Box>
+								</Group>
+								<Group align="flex-start" gap="sm">
+									<Skeleton height={28} width={28} circle />
+									<Box style={{ flex: 1 }}>
+										<Skeleton height={14} width={80} mb={6} radius="sm" />
+										<Skeleton height={16} width="92%" mb={4} radius="sm" />
+										<Skeleton height={16} width="85%" mb={4} radius="sm" />
+										<Skeleton height={16} width="45%" radius="sm" />
+									</Box>
+								</Group>
+							</Stack>
 						</Box>
 					)}
 					<ScrollArea
