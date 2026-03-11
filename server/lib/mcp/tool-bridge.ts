@@ -131,6 +131,10 @@ export function syncMcpTools(): void {
 	const mcpTools = mcpManager.getAvailableTools();
 	for (const { serverId, serverName, tool } of mcpTools) {
 		const name = buildToolName(serverName, tool.name);
+		// Track original property names so we can strip injected dummy params before calling MCP
+		const originalProps = new Set(
+			tool.inputSchema?.properties ? Object.keys(tool.inputSchema.properties) : [],
+		);
 		const def: ToolDefinition = {
 			name,
 			description: `[MCP: ${serverName}] ${tool.description ?? tool.name}`,
@@ -143,7 +147,14 @@ export function syncMcpTools(): void {
 			},
 			async execute(args: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
 				try {
-					const result = await mcpManager.callTool(serverId, tool.name, args);
+					// Strip any params not in the original MCP schema (e.g. dummy "confirm")
+					const cleanArgs: Record<string, unknown> = {};
+					for (const [k, v] of Object.entries(args)) {
+						if (originalProps.size === 0 || originalProps.has(k)) {
+							cleanArgs[k] = v;
+						}
+					}
+					const result = await mcpManager.callTool(serverId, tool.name, cleanArgs);
 					// Handle all content types: text, image, resource
 					const parts: string[] = [];
 					for (const c of result.content) {
