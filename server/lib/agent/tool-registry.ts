@@ -159,5 +159,39 @@ function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
 	return result;
 }
 
+/**
+ * Ensure a JSON Schema has at least one required property.
+ * parameters, so we inject a dummy `confirm` property when needed.
+ */
+export function ensureNonEmptySchema(schema: Record<string, unknown>): Record<string, unknown> {
+	const props = schema.properties as Record<string, unknown> | undefined;
+	const required = schema.required as string[] | undefined;
+
+	// Already has required params — nothing to do
+	if (required && required.length > 0) return schema;
+
+	// Has no properties at all — inject a dummy
+	if (!props || Object.keys(props).length === 0) {
+		return {
+			...schema,
+			properties: {
+				confirm: {
+					type: "boolean",
+					description: "Dummy parameter (always pass true)",
+					const: true,
+					default: true,
+				},
+			},
+			required: ["confirm"],
+		};
+	}
+
+	// Has properties but none required — pick the first one and make it required
+	return {
+		...schema,
+		required: [Object.keys(props)[0]],
+	};
+}
+
 /** Singleton registry */
 export const toolRegistry = new ToolRegistry();
