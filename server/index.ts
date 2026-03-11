@@ -34,6 +34,34 @@ import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./webs
 // Set rootless podman env vars early so all child processes inherit them
 ensureRootlessEnv();
 
+// Verify git is available — it's a hard requirement for NarraFork
+{
+	let gitAvailable = false;
+	let gitVersion = "";
+	try {
+		const gitCheck = Bun.spawnSync(["git", "--version"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (gitCheck.exitCode === 0) {
+			gitAvailable = true;
+			gitVersion = new TextDecoder().decode(gitCheck.stdout).trim();
+		}
+	} catch {
+		// ENOENT — git binary not found
+	}
+	if (!gitAvailable) {
+		logger.error("git is not available. NarraFork requires git to be installed and in PATH.");
+		console.error(
+			"\x1b[31mError: git is not available.\x1b[0m\n" +
+				"NarraFork requires git to be installed and available in your system PATH.\n" +
+				"Please install git and try again: https://git-scm.com/downloads",
+		);
+		process.exit(1);
+	}
+	logger.info(`Git detected: ${gitVersion}`);
+}
+
 // Catch unhandled errors to prevent silent crashes
 process.on("uncaughtException", (err) => {
 	logger.error("Uncaught exception", { error: String(err), stack: err?.stack });

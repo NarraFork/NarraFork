@@ -99,12 +99,25 @@ function isPidAlive(pid: number): boolean {
  * and renews or kills based on output activity and PID liveness.
  */
 export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult> {
-	const proc = Bun.spawn(opts.cmd, {
-		cwd: opts.cwd,
-		env: opts.env,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
+	let proc: ReturnType<typeof Bun.spawn>;
+	try {
+		proc = Bun.spawn(opts.cmd, {
+			cwd: opts.cwd,
+			env: opts.env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+	} catch (err) {
+		// ENOENT means the executable was not found in PATH (e.g. git not installed)
+		if (err instanceof Error && err.message.includes("ENOENT")) {
+			const cmd = opts.cmd[0];
+			throw new Error(
+				`Command "${cmd}" not found. Please ensure it is installed and available in your system PATH.`,
+				{ cause: err },
+			);
+		}
+		throw err;
+	}
 
 	let killed = false;
 	let hardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -205,8 +218,8 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		// Windows 管道缓冲区仅 4KB，如果不先消费输出，子进程 write() 会阻塞，
 		// 而 await proc.exited 又在等子进程退出 → 死锁。
 		const [stdout, stderr] = await Promise.all([
-			drainStream(proc.stdout, trackOutput),
-			drainStream(proc.stderr, trackOutput),
+			drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput),
+			drainStream(proc.stderr as ReadableStream<Uint8Array>, trackOutput),
 		]);
 		const exitCode = await proc.exited;
 

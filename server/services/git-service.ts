@@ -65,18 +65,29 @@ function stripTrailingLineBreaks(text: string): string {
 }
 
 async function exec(args: string[], cwd: string, silent = false): Promise<ExecResult> {
-	const result = await safeSpawn({ cmd: ["git", ...args], cwd });
-	const trimmedStdout = stripTrailingLineBreaks(result.stdout);
-	const trimmedStderr = stripTrailingLineBreaks(result.stderr);
-	if (result.exitCode !== 0 && !silent) {
-		logger.error("git command failed", {
-			args: args.join(" "),
-			cwd,
-			stderr: trimmedStderr,
-			exitCode: result.exitCode,
-		});
+	try {
+		const result = await safeSpawn({ cmd: ["git", ...args], cwd });
+		const trimmedStdout = stripTrailingLineBreaks(result.stdout);
+		const trimmedStderr = stripTrailingLineBreaks(result.stderr);
+		if (result.exitCode !== 0 && !silent) {
+			logger.error("git command failed", {
+				args: args.join(" "),
+				cwd,
+				stderr: trimmedStderr,
+				exitCode: result.exitCode,
+			});
+		}
+		return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode: result.exitCode };
+	} catch (err) {
+		// When silent, swallow spawn errors (e.g. git not found) and return a
+		// synthetic failure result so callers that check exitCode still work.
+		if (silent) {
+			const msg = err instanceof Error ? err.message : String(err);
+			logger.debug("git command spawn failed (silent)", { args: args.join(" "), cwd, error: msg });
+			return { stdout: "", stderr: msg, exitCode: -1 };
+		}
+		throw err;
 	}
-	return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode: result.exitCode };
 }
 
 interface LineStats {
