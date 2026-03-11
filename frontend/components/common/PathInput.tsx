@@ -12,6 +12,7 @@ interface PathInputBaseProps {
 	autoFocus?: boolean;
 	label?: string;
 	description?: string;
+	error?: string;
 	disabled?: boolean;
 	required?: boolean;
 	leftSection?: React.ReactNode;
@@ -58,6 +59,7 @@ export function PathInput(props: PathInputProps) {
 		autoFocus,
 		label,
 		description,
+		error,
 		disabled,
 		required,
 		leftSection,
@@ -202,6 +204,7 @@ export function PathInput(props: PathInputProps) {
 					size="xs"
 					label={label}
 					description={description}
+					error={error}
 					placeholder={placeholder}
 					disabled={disabled}
 					required={required}
