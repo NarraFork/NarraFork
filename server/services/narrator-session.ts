@@ -6,12 +6,14 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
+	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorPatches,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 	projects,
 } from "../db/schema";
@@ -167,15 +169,16 @@ const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: s
 // Tracks narrators that should run plan compact after ExitPlanMode completes — keyed by narratorId
 const pendingPlanCompact = hotSafe<Set<string>>("narrafork.pendingPlanCompact", () => new Set());
 
-// Buffered message queued by user while narrator is thinking — keyed by narratorId
+// Buffered message queue — keyed by narratorId, supports multiple queued messages
 interface BufferedMessage {
+	id: string;
 	text: string;
 	images?: ImageRef[];
 	bufferedAt: string;
 	commandText?: string | null;
 	createdBy?: string | null;
 }
-const bufferedMessages = hotSafe<Map<string, BufferedMessage>>(
+const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 	"narrafork.bufferedMessages",
 	() => new Map(),
 );
@@ -197,9 +200,6 @@ export type NarratorEvent =
 	| { type: "done"; data: null };
 
 // === Permission handling ===
-
-const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-const EXIT_PLAN_MODE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes — plans need longer review
 
 export function isInsideWorktree(cwd: string, filePath: string): boolean {
 	return isInsidePath(cwd, resolve(cwd, filePath));
@@ -501,10 +501,27 @@ export interface BlacklistDir {
 	source?: "global" | "project" | "narrator";
 }
 
+export interface CommandWhitelistEntry {
+	pattern: string;
+	enabled: boolean;
+	source?: "global" | "project" | "narrator";
+}
+
+export interface CommandBlacklistEntry {
+	pattern: string;
+	denyPrompt?: string | null;
+	enabled: boolean;
+	source?: "global" | "project" | "narrator";
+}
+
 /** Metadata collected during permission decision (side-channel output). */
 export interface PermissionDecisionMeta {
 	/** When a blacklist rule triggered, describes the source and matched path. */
 	blacklistReason?: string;
+	/** When a command blacklist rule triggered. */
+	commandBlacklistReason?: string;
+	/** The denyPrompt from the matched command blacklist entry. */
+	commandBlacklistDenyPrompt?: string;
 }
 
 export interface PermissionDecisionOpts {
@@ -517,12 +534,88 @@ export interface PermissionDecisionOpts {
 	planFileId?: string;
 	whitelistDirs?: WhitelistDir[];
 	blacklistDirs?: BlacklistDir[];
+	commandWhitelist?: CommandWhitelistEntry[];
+	commandBlacklist?: CommandBlacklistEntry[];
 	/** When true (plan + relaxedPlan toggle), inherit previousPermissionMode instead of readOnly */
 	relaxedPlan?: boolean;
 	/** The permission mode saved before entering plan mode */
 	previousPermissionMode?: string;
 	/** Mutable object to collect metadata about the decision (e.g. blacklist source). */
 	meta?: PermissionDecisionMeta;
+}
+
+// ── Command pattern matching ──────────────────────────────
+
+/** Simple glob match supporting `*` wildcard. */
+function globMatch(text: string, pattern: string): boolean {
+	if (pattern === "*") return true;
+	if (!pattern.includes("*")) return text === pattern;
+	const regex = new RegExp(
+		`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`,
+	);
+	return regex.test(text);
+}
+
+/**
+ * Match a command's tokens against a pattern string.
+ * Pattern can be a single command name ("npm"), a glob ("docker*"),
+ * or a multi-token prefix ("npm run", "git push --force").
+ */
+function matchCommandPattern(tokens: string[], pattern: string): boolean {
+	const parts = pattern.split(/\s+/);
+	if (parts.length > tokens.length) return false;
+	return parts.every((part, i) => globMatch(tokens[i], part));
+}
+
+/**
+ * Check if any command in the bash analysis matches a command blacklist entry.
+ * Returns the first match or null.
+ */
+function resolveCommandBlacklistMatch(
+	bashAnalysis: BashAnalysis,
+	commandBlacklist: CommandBlacklistEntry[],
+): {
+	pattern: string;
+	command: string;
+	denyPrompt?: string | null;
+	source?: string;
+} | null {
+	if (commandBlacklist.length === 0) return null;
+	for (const cmd of bashAnalysis.commands) {
+		for (const entry of commandBlacklist) {
+			if (matchCommandPattern(cmd.tokens, entry.pattern)) {
+				return {
+					pattern: entry.pattern,
+					command: cmd.text,
+					denyPrompt: entry.denyPrompt,
+					source: entry.source,
+				};
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Check if all non-whitelisted commands are covered by the command whitelist.
+ * Returns true if the command whitelist fully covers all nonWhitelisted commands
+ * (and there are no dangerous patterns / env injection).
+ */
+function isCommandWhitelistCovered(
+	bashAnalysis: BashAnalysis,
+	commandWhitelist: CommandWhitelistEntry[],
+): boolean {
+	if (commandWhitelist.length === 0) return false;
+	if (bashAnalysis.allWhitelisted) return false; // already whitelisted, no need
+	if (bashAnalysis.dangerousPatterns.length > 0) return false;
+	if (bashAnalysis.hasEnvInjection) return false;
+	if (bashAnalysis.nonWhitelisted.length === 0) return false;
+
+	return bashAnalysis.nonWhitelisted.every((cmdName) => {
+		const cmd = bashAnalysis.commands.find((c) => c.tokens[0] === cmdName);
+		if (!cmd) return false;
+		return commandWhitelist.some((entry) => matchCommandPattern(cmd.tokens, entry.pattern));
+	});
 }
 
 export function resolvePermissionDecision(
@@ -538,6 +631,8 @@ export function resolvePermissionDecision(
 		planFileId,
 		whitelistDirs = [],
 		blacklistDirs = [],
+		commandWhitelist = [],
+		commandBlacklist = [],
 		relaxedPlan = false,
 		previousPermissionMode,
 		meta,
@@ -573,6 +668,21 @@ export function resolvePermissionDecision(
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
+	// Command blacklist — deny if any sub-command matches (priority over all whitelists).
+	if (toolName === SHELL_TOOL_NAME && bashAnalysis && commandBlacklist.length > 0) {
+		const cmdBlMatch = resolveCommandBlacklistMatch(bashAnalysis, commandBlacklist);
+		if (cmdBlMatch) {
+			if (meta) {
+				const src = cmdBlMatch.source ? ` (${cmdBlMatch.source} level)` : "";
+				meta.commandBlacklistReason = `Command "${cmdBlMatch.command}" is blocked by command blacklist${src}. Pattern: "${cmdBlMatch.pattern}"`;
+				if (cmdBlMatch.denyPrompt) {
+					meta.commandBlacklistDenyPrompt = cmdBlMatch.denyPrompt;
+				}
+			}
+			return "deny";
+		}
+	}
+
 	// Blacklist takes priority over whitelist — deny if any path is blocked.
 	const blacklistResult = resolveBlacklistDecision(
 		toolName,
@@ -594,6 +704,22 @@ export function resolvePermissionDecision(
 		bashAnalysis,
 	);
 	if (whitelistDecision) return whitelistDecision;
+
+	// Command whitelist — if all non-whitelisted commands are covered, treat as whitelisted.
+	let effectiveBashAnalysis = bashAnalysis;
+	if (
+		toolName === SHELL_TOOL_NAME &&
+		bashAnalysis &&
+		isCommandWhitelistCovered(bashAnalysis, commandWhitelist)
+	) {
+		// All nonWhitelisted commands are covered by command whitelist.
+		// Create a patched analysis so downstream logic sees them as whitelisted.
+		effectiveBashAnalysis = {
+			...bashAnalysis,
+			allWhitelisted: true,
+			nonWhitelisted: [],
+		};
+	}
 
 	// Task: auto-allow when using parent's cwd; ask when workdir differs.
 	// bypassPermissions still bypasses this; dontAsk denies it.
@@ -636,12 +762,12 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 		if (toolName === SHELL_TOOL_NAME) {
-			if (!bashAnalysis) return "deny";
-			if (bashAnalysis.nonWhitelisted.length > 0) return "deny";
-			if (bashAnalysis.dangerousPatterns.length > 0) return "deny";
-			if (bashAnalysis.hasEnvInjection) return "deny";
-			if (bashAnalysis.hasWriteOperation) return "deny";
-			const externalBashPaths = getShellScopePaths(cwd, input, bashAnalysis).filter(
+			if (!effectiveBashAnalysis) return "deny";
+			if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "deny";
+			if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "deny";
+			if (effectiveBashAnalysis.hasEnvInjection) return "deny";
+			if (effectiveBashAnalysis.hasWriteOperation) return "deny";
+			const externalBashPaths = getShellScopePaths(cwd, input, effectiveBashAnalysis).filter(
 				(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 			);
 			if (externalBashPaths.length > 0) return "deny";
@@ -652,16 +778,16 @@ export function resolvePermissionDecision(
 
 	// Bash/Shell: AST-based command-level security
 	if (toolName === SHELL_TOOL_NAME) {
-		if (!bashAnalysis) return "ask";
-		if (bashAnalysis.nonWhitelisted.length > 0) return "ask";
-		if (bashAnalysis.dangerousPatterns.length > 0) return "ask";
-		if (bashAnalysis.hasEnvInjection) return "ask";
-		const externalBashPaths = getShellScopePaths(cwd, input, bashAnalysis).filter(
+		if (!effectiveBashAnalysis) return "ask";
+		if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "ask";
+		if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "ask";
+		if (effectiveBashAnalysis.hasEnvInjection) return "ask";
+		const externalBashPaths = getShellScopePaths(cwd, input, effectiveBashAnalysis).filter(
 			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 		);
 		if (externalBashPaths.length > 0) return "ask";
 		// All commands whitelisted + all paths inside worktree + no dangerous patterns
-		if (bashAnalysis.hasWriteOperation && effectiveMode !== "acceptEdits") return "ask";
+		if (effectiveBashAnalysis.hasWriteOperation && effectiveMode !== "acceptEdits") return "ask";
 		if (effectiveMode === "acceptEdits") return "allow";
 		return "ask";
 	}
@@ -792,6 +918,8 @@ export async function handlePermission(
 	// Layer 2: project chapterSettings (if narrator belongs to a chapter)
 	let projectWl: WhitelistDir[] = [];
 	let projectBl: BlacklistDir[] = [];
+	let projectCmdWl: CommandWhitelistEntry[] = [];
+	let projectCmdBl: CommandBlacklistEntry[] = [];
 	if (narrator?.chapterId) {
 		const chapter = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
@@ -819,6 +947,25 @@ export async function handlePermission(
 					.map((d: any) => ({
 						path: d.path,
 						denyLevel: d.denyLevel ?? "denyAll",
+						enabled: true,
+						source: "project" as const,
+					}));
+			}
+			if (cs?.commandWhitelist) {
+				projectCmdWl = cs.commandWhitelist
+					.filter((d: any) => d.enabled !== false)
+					.map((d: any) => ({
+						pattern: d.pattern,
+						enabled: true,
+						source: "project" as const,
+					}));
+			}
+			if (cs?.commandBlacklist) {
+				projectCmdBl = cs.commandBlacklist
+					.filter((d: any) => d.enabled !== false)
+					.map((d: any) => ({
+						pattern: d.pattern,
+						denyPrompt: d.denyPrompt,
 						enabled: true,
 						source: "project" as const,
 					}));
@@ -854,6 +1001,49 @@ export async function handlePermission(
 		...blRows.map((r) => ({ ...r, source: "narrator" as const })),
 	];
 
+	// ── Command whitelist/blacklist: three-layer merge ──
+	// Layer 1: global settings
+	const globalCmdWl: CommandWhitelistEntry[] = (settings.agent.commandWhitelist ?? [])
+		.filter((d) => d.enabled !== false)
+		.map((d) => ({ pattern: d.pattern, enabled: true, source: "global" as const }));
+	const globalCmdBl: CommandBlacklistEntry[] = (settings.agent.commandBlacklist ?? [])
+		.filter((d) => d.enabled !== false)
+		.map((d) => ({
+			pattern: d.pattern,
+			denyPrompt: d.denyPrompt,
+			enabled: true,
+			source: "global" as const,
+		}));
+
+	// Layer 2: already extracted from project chapterSettings above
+
+	// Layer 3: narrator-level DB rows
+	const cmdWlRows = await db.query.narratorWhitelistCmds.findMany({
+		where: and(
+			eq(narratorWhitelistCmds.narratorId, dirOwnerId),
+			eq(narratorWhitelistCmds.enabled, true),
+		),
+		columns: { pattern: true, enabled: true },
+	});
+	const cmdBlRows = await db.query.narratorBlacklistCmds.findMany({
+		where: and(
+			eq(narratorBlacklistCmds.narratorId, dirOwnerId),
+			eq(narratorBlacklistCmds.enabled, true),
+		),
+		columns: { pattern: true, denyPrompt: true, enabled: true },
+	});
+
+	const mergedCmdWhitelist: CommandWhitelistEntry[] = [
+		...globalCmdWl,
+		...projectCmdWl,
+		...cmdWlRows.map((r) => ({ ...r, source: "narrator" as const })),
+	];
+	const mergedCmdBlacklist: CommandBlacklistEntry[] = [
+		...globalCmdBl,
+		...projectCmdBl,
+		...cmdBlRows.map((r) => ({ ...r, source: "narrator" as const })),
+	];
+
 	const permMeta: PermissionDecisionMeta = {};
 	const decision = resolvePermissionDecision({
 		toolName,
@@ -865,6 +1055,8 @@ export async function handlePermission(
 		planFileId,
 		whitelistDirs: mergedWhitelist,
 		blacklistDirs: mergedBlacklist,
+		commandWhitelist: mergedCmdWhitelist,
+		commandBlacklist: mergedCmdBlacklist,
 		relaxedPlan: isRelaxedPlan,
 		previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
 		meta: permMeta,
@@ -946,6 +1138,35 @@ export async function handlePermission(
 					permissionDecidedBy: "auto",
 					permissionDecidedAt: new Date().toISOString(),
 					permissionDecisionReason: permMeta.blacklistReason,
+				})
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+					),
+				);
+			return { behavior: "deny", message: denyMsg };
+		}
+		// Command blacklist-triggered deny
+		if (permMeta.commandBlacklistReason) {
+			let denyMsg = `DENIED: ${permMeta.commandBlacklistReason}`;
+			if (permMeta.commandBlacklistDenyPrompt) {
+				denyMsg += `\n${permMeta.commandBlacklistDenyPrompt}`;
+			}
+			logger.debug("Permission denied by command blacklist", {
+				narratorId,
+				toolName,
+				toolUseId,
+				reason: permMeta.commandBlacklistReason,
+			});
+			await db
+				.update(narratorToolCalls)
+				.set({
+					status: "fail",
+					errorMessage: denyMsg,
+					permissionDecidedBy: "auto",
+					permissionDecidedAt: new Date().toISOString(),
+					permissionDecisionReason: permMeta.commandBlacklistReason,
 				})
 				.where(
 					and(
@@ -1097,75 +1318,9 @@ export async function handlePermission(
 
 	return new Promise<PermissionResult>((resolve) => {
 		const cleanup = () => {
-			clearTimeout(tid);
 			signal.removeEventListener("abort", onAbort);
 			pendingPermissions.delete(toolCallId);
 		};
-
-		const timeoutMs =
-			toolName === "ExitPlanMode" ? EXIT_PLAN_MODE_TIMEOUT_MS : PERMISSION_TIMEOUT_MS;
-
-		const tid = setTimeout(async () => {
-			const autoApprove =
-				toolName === "ExitPlanMode" && settings.agent.planTimeoutAction === "auto_approve";
-
-			logger.warn("Permission request timed out", {
-				narratorId,
-				toolCallId,
-				toolUseId,
-				toolName,
-				timeoutMs,
-				autoApprove,
-			});
-			cleanup();
-			broadcastToNarrator(wsTarget, {
-				type: "permission_resolved",
-				narratorId: wsTarget,
-				requestId: toolCallId,
-				toolUseId,
-			});
-
-			if (autoApprove) {
-				await db
-					.update(narratorToolCalls)
-					.set({
-						status: "running",
-						permissionDecidedBy: "auto_timeout",
-						permissionDecidedAt: new Date().toISOString(),
-					})
-					.where(eq(narratorToolCalls.id, toolCallId));
-				await narratorService.updateStatus(narratorId, "thinking");
-				if (broadcastTargetId && broadcastTargetId !== narratorId) {
-					await narratorService.updateStatus(broadcastTargetId, "thinking");
-				}
-				resolve({ behavior: "allow", updatedInput: effectiveInput });
-			} else {
-				await db
-					.update(narratorToolCalls)
-					.set({
-						status: "fail",
-						errorMessage: "Permission request timed out",
-						permissionDecidedBy: "auto_timeout",
-						permissionDecidedAt: new Date().toISOString(),
-					})
-					.where(eq(narratorToolCalls.id, toolCallId));
-				// Abort the narrator so the model doesn't keep looping in plan mode
-				const active = activeNarrators.get(narratorId);
-				if (active?.alive) {
-					active.alive = false;
-					active.abortController.abort();
-				}
-				await narratorService.updateStatus(narratorId, "error", "Permission request timed out");
-				if (broadcastTargetId && broadcastTargetId !== narratorId) {
-					await narratorService.updateStatus(
-						broadcastTargetId,
-						"error",
-						"Permission request timed out",
-					);
-				}
-				resolve({ behavior: "deny", message: "Permission request timed out" });
-			}
-		}, timeoutMs);
 
 		const onAbort = async () => {
 			logger.debug("Permission request aborted", {
@@ -2105,9 +2260,15 @@ async function runAgentLoop(
 									active._snapshotBeforeHashes = new Map();
 								}
 
-								// Chain: ensure init completes before track (cached promise avoids concurrent inits)
+								// Chain: ensure init completes before track (cached promise avoids concurrent inits).
+								// If init rejects, clear the cache so the next tool call retries.
 								if (!active._snapshotInitPromise) {
-									active._snapshotInitPromise = snapshot.init(chapterId, worktreePath);
+									active._snapshotInitPromise = snapshot
+										.init(chapterId, worktreePath)
+										.catch((err) => {
+											active._snapshotInitPromise = undefined;
+											throw err;
+										});
 								}
 								const ready = active._snapshotInitPromise;
 
@@ -2483,14 +2644,8 @@ async function runAgentLoop(
 				}
 			}
 
-			// Agent loop done — update status
+			// Agent loop done — update stats (always, even if we continue with buffered messages)
 			await narratorService.updateStats(narratorId, 0);
-			if (!loopHadError) {
-				// Atomically transition thinking/waiting → done.
-				// If status has already moved (e.g. another loop took over after
-				// hot reload, or user interrupted), the CAS is a no-op.
-				await narratorService.compareAndSetStatus(narratorId, ["thinking", "waiting"], "done");
-			}
 
 			// Compact if context usage is high (checked after a complete turn).
 			// This is a fallback — the mid-turn compact in the context_usage handler
@@ -2553,16 +2708,26 @@ async function runAgentLoop(
 				}
 			}
 
-			// Check for buffered messages
-			const buffered = bufferedMessages.get(narratorId);
+			// Check for buffered messages BEFORE transitioning to "done" —
+			// this prevents spurious notifications when there are queued messages.
+			const queue = bufferedMessages.get(narratorId);
+			const buffered = queue?.[0];
 			if (buffered) {
-				bufferedMessages.delete(narratorId);
+				queue?.shift();
+				if (queue?.length === 0) bufferedMessages.delete(narratorId);
 				const finalNarrator = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),
 					columns: { status: true },
 				});
 				if (finalNarrator?.status !== "error") {
-					broadcastToNarrator(narratorId, { type: "buffer_cleared", narratorId, reason: "sent" });
+					// Broadcast which message was consumed + remaining queue snapshot
+					const remaining = toBufferSummary(getBufferedMessages(narratorId));
+					broadcastToNarrator(narratorId, {
+						type: "buffer_consumed",
+						narratorId,
+						messageId: buffered.id,
+						remaining,
+					});
 					const persistBlocks: Array<
 						| { type: "text"; text: string }
 						| { type: "image"; imageId: string; filename: string; mediaType: string }
@@ -2597,6 +2762,14 @@ async function runAgentLoop(
 					narratorId,
 					reason: "narrator_error",
 				});
+			}
+
+			// No buffered messages — now transition to "done" (triggers notifications)
+			if (!loopHadError) {
+				// Atomically transition thinking/waiting → done.
+				// If status has already moved (e.g. another loop took over after
+				// hot reload, or user interrupted), the CAS is a no-op.
+				await narratorService.compareAndSetStatus(narratorId, ["thinking", "waiting"], "done");
 			}
 
 			// No chained message — auto-commit before finishing
@@ -3463,32 +3636,70 @@ export async function updateNarratorPermissionMode(
 	}
 }
 
-// === Buffered message API ===
+// === Buffered message queue API ===
 
-/** Set a buffered message to auto-send when the current turn completes. */
-export function setBufferedMessage(
+/** Push a message onto the queue. Returns the generated message id. */
+export function pushBufferedMessage(
 	narratorId: string,
 	text: string,
 	images?: ImageRef[],
 	commandText?: string | null,
 	createdBy?: string | null,
-): { ok: boolean; bufferedAt: string } {
+): { ok: boolean; bufferedAt: string; id: string } {
 	if (!activeNarrators.has(narratorId)) {
-		return { ok: false, bufferedAt: "" };
+		return { ok: false, bufferedAt: "", id: "" };
 	}
+	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
-	bufferedMessages.set(narratorId, { text, images, bufferedAt, commandText, createdBy });
-	return { ok: true, bufferedAt };
+	const queue = bufferedMessages.get(narratorId) ?? [];
+	queue.push({ id, text, images, bufferedAt, commandText, createdBy });
+	bufferedMessages.set(narratorId, queue);
+	return { ok: true, bufferedAt, id };
 }
 
-/** Cancel a buffered message. */
-export function clearBufferedMessage(narratorId: string): void {
+/** Edit a queued message in-place. */
+export function updateBufferedMessage(
+	narratorId: string,
+	messageId: string,
+	text: string,
+	images?: ImageRef[],
+): boolean {
+	const queue = bufferedMessages.get(narratorId);
+	if (!queue) return false;
+	const msg = queue.find((m) => m.id === messageId);
+	if (!msg) return false;
+	msg.text = text;
+	if (images !== undefined) msg.images = images;
+	msg.bufferedAt = new Date().toISOString();
+	return true;
+}
+
+/** Remove a single queued message. */
+export function removeBufferedMessage(narratorId: string, messageId: string): boolean {
+	const queue = bufferedMessages.get(narratorId);
+	if (!queue) return false;
+	const idx = queue.findIndex((m) => m.id === messageId);
+	if (idx === -1) return false;
+	queue.splice(idx, 1);
+	if (queue.length === 0) bufferedMessages.delete(narratorId);
+	return true;
+}
+
+/** Clear the entire queue. */
+export function clearBufferedMessages(narratorId: string): void {
 	bufferedMessages.delete(narratorId);
 }
 
-/** Get the current buffered message (for REST hydration). */
-export function getBufferedMessage(narratorId: string): BufferedMessage | null {
-	return bufferedMessages.get(narratorId) ?? null;
+/** Get the full queue (for REST hydration). */
+export function getBufferedMessages(narratorId: string): BufferedMessage[] {
+	return bufferedMessages.get(narratorId) ?? [];
+}
+
+/** Project a buffer queue to the minimal shape needed for WS broadcast / REST responses. */
+export function toBufferSummary(
+	msgs: readonly Pick<BufferedMessage, "id" | "text" | "bufferedAt">[],
+): Array<{ id: string; text: string; bufferedAt: string }> {
+	return msgs.map((m) => ({ id: m.id, text: m.text, bufferedAt: m.bufferedAt }));
 }
 
 // === Startup recovery ===

@@ -46,7 +46,11 @@ interface NarratorWSCallbacks {
 		todos: { id?: string; content?: string; status?: string }[],
 		toolUseId?: string,
 	) => void;
-	onBufferSet?: (text: string, bufferedAt: string) => void;
+	onBufferSet?: (messages: Array<{ id: string; text: string; bufferedAt: string }>) => void;
+	onBufferConsumed?: (
+		messageId: string,
+		remaining: Array<{ id: string; text: string; bufferedAt: string }>,
+	) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
@@ -289,7 +293,10 @@ export function useNarratorWS(
 							callbacksRef.current.onTitleUpdated?.(data.title);
 							break;
 						case "buffer_set":
-							callbacksRef.current.onBufferSet?.(data.text, data.bufferedAt);
+							callbacksRef.current.onBufferSet?.(data.messages);
+							break;
+						case "buffer_consumed":
+							callbacksRef.current.onBufferConsumed?.(data.messageId, data.remaining);
 							break;
 						case "buffer_cleared":
 							callbacksRef.current.onBufferCleared?.(data.reason);

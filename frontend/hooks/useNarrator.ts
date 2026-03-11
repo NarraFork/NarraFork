@@ -2,9 +2,11 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import { useEffect } from "react";
 import {
 	api,
+	type BlacklistCmd,
 	type BlacklistDir,
 	type MessagesAroundOptions,
 	type PaginatedNarrators,
+	type WhitelistCmd,
 	type WhitelistDir,
 } from "../lib/api";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
@@ -320,6 +322,104 @@ export function useDeleteBlacklistDir(narratorId: string) {
 		mutationFn: (dirId: string) => api.deleteBlacklistDir(dirId),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["blacklist-dirs", narratorId] });
+		},
+	});
+}
+
+// ── Command whitelist ──
+
+export function useCmdWhitelist(narratorId: string) {
+	return useQuery<WhitelistCmd[]>({
+		queryKey: ["cmd-whitelist", narratorId],
+		queryFn: () => api.getCmdWhitelist(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateCmdWhitelist() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, pattern }: { narratorId: string; pattern: string }) =>
+			api.createCmdWhitelist(narratorId, { pattern }),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["cmd-whitelist", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateCmdWhitelist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ entryId, ...data }: { entryId: string; pattern?: string; enabled?: boolean }) =>
+			api.updateCmdWhitelist(entryId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-whitelist", narratorId] });
+		},
+	});
+}
+
+export function useDeleteCmdWhitelist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (entryId: string) => api.deleteCmdWhitelist(entryId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-whitelist", narratorId] });
+		},
+	});
+}
+
+// ── Command blacklist ──
+
+export function useCmdBlacklist(narratorId: string) {
+	return useQuery<BlacklistCmd[]>({
+		queryKey: ["cmd-blacklist", narratorId],
+		queryFn: () => api.getCmdBlacklist(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateCmdBlacklist() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			pattern,
+			denyPrompt,
+		}: {
+			narratorId: string;
+			pattern: string;
+			denyPrompt?: string;
+		}) => api.createCmdBlacklist(narratorId, { pattern, denyPrompt }),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["cmd-blacklist", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateCmdBlacklist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			entryId,
+			...data
+		}: {
+			entryId: string;
+			pattern?: string;
+			denyPrompt?: string | null;
+			enabled?: boolean;
+		}) => api.updateCmdBlacklist(entryId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-blacklist", narratorId] });
+		},
+	});
+}
+
+export function useDeleteCmdBlacklist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (entryId: string) => api.deleteCmdBlacklist(entryId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-blacklist", narratorId] });
 		},
 	});
 }

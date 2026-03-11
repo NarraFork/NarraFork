@@ -121,6 +121,23 @@ export interface BlacklistDir {
 	createdAt: string;
 }
 
+export interface WhitelistCmd {
+	id: string;
+	narratorId: string;
+	pattern: string;
+	enabled: boolean;
+	createdAt: string;
+}
+
+export interface BlacklistCmd {
+	id: string;
+	narratorId: string;
+	pattern: string;
+	denyPrompt: string | null;
+	enabled: boolean;
+	createdAt: string;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 
@@ -480,8 +497,19 @@ export const api = {
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
-	getBufferedMessage: (id: string) =>
-		request<{ text: string; bufferedAt: string } | null>(`/narrators/${id}/buffer`),
+	getBufferedMessages: (id: string) =>
+		request<Array<{ id: string; text: string; bufferedAt: string }>>(`/narrators/${id}/buffer`),
+	updateBufferedMessage: (narratorId: string, messageId: string, text: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ text }),
+		}),
+	removeBufferedMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
+			method: "DELETE",
+		}),
+	clearBufferedMessages: (narratorId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer`, { method: "DELETE" }),
 	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
 	approvePermission: (requestId: string) =>
 		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),
@@ -551,6 +579,40 @@ export const api = {
 		}),
 	deleteBlacklistDir: (dirId: string) =>
 		request<{ ok: boolean }>(`/narrators/blacklist-dirs/${dirId}`, { method: "DELETE" }),
+	// Command whitelist
+	getCmdWhitelist: (id: string) => request<WhitelistCmd[]>(`/narrators/${id}/cmd-whitelist`),
+	createCmdWhitelist: (id: string, data: { pattern: string; enabled?: boolean }) =>
+		request<WhitelistCmd>(`/narrators/${id}/cmd-whitelist`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateCmdWhitelist: (entryId: string, data: { pattern?: string; enabled?: boolean }) =>
+		request<{ ok: boolean }>(`/narrators/cmd-whitelist/${entryId}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteCmdWhitelist: (entryId: string) =>
+		request<{ ok: boolean }>(`/narrators/cmd-whitelist/${entryId}`, { method: "DELETE" }),
+	// Command blacklist
+	getCmdBlacklist: (id: string) => request<BlacklistCmd[]>(`/narrators/${id}/cmd-blacklist`),
+	createCmdBlacklist: (
+		id: string,
+		data: { pattern: string; denyPrompt?: string; enabled?: boolean },
+	) =>
+		request<BlacklistCmd>(`/narrators/${id}/cmd-blacklist`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateCmdBlacklist: (
+		entryId: string,
+		data: { pattern?: string; denyPrompt?: string | null; enabled?: boolean },
+	) =>
+		request<{ ok: boolean }>(`/narrators/cmd-blacklist/${entryId}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteCmdBlacklist: (entryId: string) =>
+		request<{ ok: boolean }>(`/narrators/cmd-blacklist/${entryId}`, { method: "DELETE" }),
 	updateNarratorReasoningEffort: (id: string, reasoningEffort: string | null) =>
 		request<{ ok: boolean }>(`/narrators/${id}/reasoning-effort`, {
 			method: "PATCH",

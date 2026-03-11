@@ -76,7 +76,7 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 
 const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
-const host = cliHost || process.env.HOST || "localhost";
+const host = cliHost || process.env.HOST || settings.server.host;
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
 const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");

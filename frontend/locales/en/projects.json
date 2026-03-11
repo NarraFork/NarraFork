@@ -61,5 +61,9 @@
 	"projectWhitelistDirs": "Whitelist Directories",
 	"projectWhitelistDirsDesc": "Directories auto-allowed for narrators in this project.",
 	"projectBlacklistDirs": "Blacklist Directories",
-	"projectBlacklistDirsDesc": "Directories blocked for narrators in this project."
+	"projectBlacklistDirsDesc": "Directories blocked for narrators in this project.",
+	"projectCommandWhitelist": "Command Whitelist",
+	"projectCommandWhitelistDesc": "Commands auto-allowed for narrators in this project.",
+	"projectCommandBlacklist": "Command Blacklist",
+	"projectCommandBlacklistDesc": "Commands auto-denied for narrators in this project."
 }

@@ -11,9 +11,13 @@ import { resolveCommand } from "../services/command-service";
 import type { GitStatusSummary } from "../services/git-service";
 import { narratorService } from "../services/narrator-service";
 import {
-	clearBufferedMessage,
+	clearBufferedMessages,
+	getBufferedMessages,
+	pushBufferedMessage,
+	removeBufferedMessage,
 	resolvePermission,
-	setBufferedMessage,
+	toBufferSummary,
+	updateBufferedMessage,
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import type { WSData } from "./ws-handler";
@@ -61,7 +65,17 @@ export type NarratorServerMessage =
 			feedbackText?: string;
 	  }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
-	| { type: "buffer_set"; narratorId: string; text: string; bufferedAt: string }
+	| {
+			type: "buffer_set";
+			narratorId: string;
+			messages: Array<{ id: string; text: string; bufferedAt: string }>;
+	  }
+	| {
+			type: "buffer_consumed";
+			narratorId: string;
+			messageId: string;
+			remaining: Array<{ id: string; text: string; bufferedAt: string }>;
+	  }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
@@ -251,6 +265,8 @@ export type NarratorClientMessage =
 	  }
 	| { type: "buffer_message"; narratorId: string; text: string }
 	| { type: "cancel_buffer"; narratorId: string }
+	| { type: "update_buffer"; narratorId: string; messageId: string; text: string }
+	| { type: "remove_buffer"; narratorId: string; messageId: string }
 	| { type: "presence_join"; narratorId: string }
 	| { type: "presence_leave"; narratorId: string }
 	| { type: "subscribe_stats" }
@@ -719,7 +735,7 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				let bufResult = setBufferedMessage(
+				let bufResult = pushBufferedMessage(
 					msg.narratorId,
 					bufferText,
 					undefined,
@@ -727,20 +743,28 @@ export const handleNarratorWS = {
 					userId,
 				);
 				// Fallback: try buffering for a running foreground subagent
+				let usedSubagent = false;
 				if (!bufResult.ok) {
 					try {
-						const { bufferSubagentMessage } = await import("../services/narrator-subagent");
-						bufResult = bufferSubagentMessage(msg.narratorId, bufferText);
+						const { pushSubagentBufferedMessage } = await import("../services/narrator-subagent");
+						bufResult = pushSubagentBufferedMessage(msg.narratorId, bufferText);
+						usedSubagent = bufResult.ok;
 					} catch {
 						// ignore
 					}
 				}
 				if (bufResult.ok) {
+					let messages: Array<{ id: string; text: string; bufferedAt: string }>;
+					if (usedSubagent) {
+						const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
+						messages = toBufferSummary(getSubagentBufferedMessages(msg.narratorId));
+					} else {
+						messages = toBufferSummary(getBufferedMessages(msg.narratorId));
+					}
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
 						narratorId: msg.narratorId,
-						text: bufferText,
-						bufferedAt: bufResult.bufferedAt,
+						messages,
 					});
 				} else {
 					try {
@@ -757,10 +781,10 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "cancel_buffer": {
-				clearBufferedMessage(msg.narratorId);
+				clearBufferedMessages(msg.narratorId);
 				try {
-					const { clearSubagentBufferedMessage } = await import("../services/narrator-subagent");
-					clearSubagentBufferedMessage(msg.narratorId);
+					const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
+					clearSubagentBufferedMessages(msg.narratorId);
 				} catch {
 					// ignore
 				}
@@ -769,6 +793,30 @@ export const handleNarratorWS = {
 					narratorId: msg.narratorId,
 					reason: "cancelled",
 				});
+				break;
+			}
+			case "update_buffer": {
+				const ok = updateBufferedMessage(msg.narratorId, msg.messageId, msg.text);
+				if (ok) {
+					const messages = toBufferSummary(getBufferedMessages(msg.narratorId));
+					broadcastToNarrator(msg.narratorId, {
+						type: "buffer_set",
+						narratorId: msg.narratorId,
+						messages,
+					});
+				}
+				break;
+			}
+			case "remove_buffer": {
+				const ok = removeBufferedMessage(msg.narratorId, msg.messageId);
+				if (ok) {
+					const messages = toBufferSummary(getBufferedMessages(msg.narratorId));
+					broadcastToNarrator(msg.narratorId, {
+						type: "buffer_set",
+						narratorId: msg.narratorId,
+						messages,
+					});
+				}
 				break;
 			}
 			case "presence_join": {

@@ -1,12 +1,16 @@
-import { Button, NumberInput, Stack, Text, Title } from "@mantine/core";
+import { Autocomplete, Button, NumberInput, Stack, Text, Title } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
+const HOST_PRESETS = ["localhost", "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
+
 export interface ServerSystemSectionProps {
 	port: number | undefined;
 	setPort: (v: number | undefined) => void;
+	host: string;
+	setHost: (v: string) => void;
 	projectDir: string;
 	setProjectDir: (v: string) => void;
 	pwaUpdating: boolean;
@@ -16,6 +20,8 @@ export interface ServerSystemSectionProps {
 export function ServerSystemSection({
 	port,
 	setPort,
+	host,
+	setHost,
 	projectDir,
 	setProjectDir,
 	pwaUpdating,
@@ -33,6 +39,13 @@ export function ServerSystemSection({
 				onChange={(v) => setPort(typeof v === "number" ? v : 7778)}
 				min={1024}
 				max={65535}
+			/>
+			<Autocomplete
+				label={t("serverHost")}
+				description={t("serverHostDesc")}
+				value={host}
+				onChange={setHost}
+				data={HOST_PRESETS}
 			/>
 			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={setProjectDir} />
 

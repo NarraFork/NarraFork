@@ -20,7 +20,7 @@ import {
 	IconRobot,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useSearch } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
@@ -81,6 +81,9 @@ export const SubagentCard = memo(
 	}: SubagentCardProps) {
 		const { t } = useTranslation("narrator");
 		const navigate = useNavigate();
+		// biome-ignore lint/suspicious/noExplicitAny: loose search params
+		const routeSearch = useSearch({ strict: false }) as any;
+		const fromParam = routeSearch?.from as string | undefined;
 		const input = toolCall.inputJson ?? {};
 		const isBackground = !!input.background || !!input.run_in_background;
 		const agentType = input.subagent_type ?? "agent";
@@ -260,7 +263,11 @@ export const SubagentCard = memo(
 
 		const handleViewSession = useCallback(() => {
 			if (subagentNarratorId) {
-				navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+				navigate({
+					to: "/narrators/$narratorId",
+					params: { narratorId: subagentNarratorId },
+					search: fromParam ? { from: fromParam } : undefined,
+				});
 				swipe.closeSwipe();
 			} else {
 				// Fallback: expand card inline if we can't resolve the subagent narrator
@@ -272,7 +279,7 @@ export const SubagentCard = memo(
 					if (el) el.scrollTop = el.scrollHeight;
 				}, 300);
 			}
-		}, [subagentNarratorId, swipe.closeSwipe, navigate]);
+		}, [subagentNarratorId, swipe.closeSwipe, navigate, fromParam]);
 
 		const cardMenuItems = (
 			<>

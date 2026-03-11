@@ -43,10 +43,22 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isSubagent = (narrator as any)?.type === "subagent";
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const parentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = isSubagent ? null : ((narrator as any)?.chapterId as string | null | undefined);
 	const { data: chapter } = useChapter(chapterId ?? "");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const projectId = (chapter as any)?.projectId as string | undefined;
+
+	// For subagents: fetch parent narrator to resolve chapter/project for graph navigation
+	const { data: parentNarrator } = useNarrator(
+		isSubagent && parentNarratorId ? parentNarratorId : "",
+	);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const parentChapterId = (parentNarrator as any)?.chapterId as string | null | undefined;
+	const { data: parentChapter } = useChapter(parentChapterId ?? "");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const parentProjectId = (parentChapter as any)?.projectId as string | undefined;
 
 	// Record recent tab visit (skip for subagent narrators)
 	const narratorTitle = narrator?.title;
@@ -207,6 +219,29 @@ function NarratorDetailPage() {
 	}, [navigate, projectId, chapterId]);
 	const showMinimize = from === "graph" && !!projectId && !!chapterId;
 
+	// Subagent back navigation: return to parent narrator, or to graph if opened from graph
+	const onBack = useCallback(() => {
+		if (isSubagent) {
+			if (from === "graph" && parentProjectId && parentChapterId) {
+				navigate({
+					to: "/projects/$projectId",
+					params: { projectId: parentProjectId },
+					search: { focus: parentChapterId },
+				});
+			} else if (parentNarratorId) {
+				navigate({
+					to: "/narrators/$narratorId",
+					params: { narratorId: parentNarratorId },
+					search: from ? { from } : undefined,
+				});
+			} else {
+				navigate({ to: ".." });
+			}
+		} else {
+			navigate({ to: ".." });
+		}
+	}, [isSubagent, from, parentProjectId, parentChapterId, parentNarratorId, navigate]);
+
 	// Fork-from-message: directly fork without modal
 	const forkFromMessage = useMutation({
 		mutationFn: (messageUuid: string) => {
@@ -362,6 +397,7 @@ function NarratorDetailPage() {
 							isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawerWithTerminal
 						}
 						onMinimize={showMinimize ? onMinimize : undefined}
+						onBack={isSubagent ? onBack : undefined}
 					/>
 				</Box>
 
@@ -408,6 +444,7 @@ function NarratorDetailPage() {
 					terminalOpen={isSubagent ? undefined : terminalOpen}
 					onToggleTerminal={isSubagent ? undefined : toggleTerminal}
 					onMinimize={showMinimize ? onMinimize : undefined}
+					onBack={isSubagent ? onBack : undefined}
 				/>
 			</Box>
 

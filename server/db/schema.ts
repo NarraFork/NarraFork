@@ -635,3 +635,40 @@ export const narratorBlacklistDirs = sqliteTable(
 		uniqueIndex("idx_blacklist_dirs_narrator_path").on(table.narratorId, table.path),
 	],
 );
+
+// === narrator_whitelist_cmds ===
+export const narratorWhitelistCmds = sqliteTable(
+	"narrator_whitelist_cmds",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		pattern: text("pattern").notNull(),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_whitelist_cmds_narrator").on(table.narratorId),
+		uniqueIndex("idx_whitelist_cmds_narrator_pattern").on(table.narratorId, table.pattern),
+	],
+);
+
+// === narrator_blacklist_cmds ===
+export const narratorBlacklistCmds = sqliteTable(
+	"narrator_blacklist_cmds",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		pattern: text("pattern").notNull(),
+		denyPrompt: text("deny_prompt"),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_blacklist_cmds_narrator").on(table.narratorId),
+		uniqueIndex("idx_blacklist_cmds_narrator_pattern").on(table.narratorId, table.pattern),
+	],
+);

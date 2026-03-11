@@ -9,6 +9,7 @@ import {
 } from "@tabler/icons-react";
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
@@ -27,8 +28,6 @@ export interface AgentSectionProps {
 	setTranslateReasoning: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
-	planTimeoutAction: string;
-	setPlanTimeoutAction: (v: string) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -36,6 +35,16 @@ export interface AgentSectionProps {
 	globalBlacklistDirs: Array<{ path: string; denyLevel: string; enabled?: boolean }>;
 	setGlobalBlacklistDirs: (
 		v: Array<{ path: string; denyLevel: string; enabled?: boolean }>,
+	) => void;
+	globalCommandWhitelist: Array<{ pattern: string; enabled?: boolean }>;
+	setGlobalCommandWhitelist: (v: Array<{ pattern: string; enabled?: boolean }>) => void;
+	globalCommandBlacklist: Array<{
+		pattern: string;
+		denyPrompt?: string;
+		enabled?: boolean;
+	}>;
+	setGlobalCommandBlacklist: (
+		v: Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>,
 	) => void;
 	userPrefs: AnyPrefs;
 	updateUserPref: AnyMutation;
@@ -121,16 +130,6 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
-			/>
-			<Select
-				label={t("planTimeoutAction")}
-				description={t("planTimeoutActionDesc")}
-				data={[
-					{ value: "deny", label: t("planTimeoutDeny") },
-					{ value: "auto_approve", label: t("planTimeoutAutoApprove") },
-				]}
-				value={props.planTimeoutAction}
-				onChange={(v) => props.setPlanTimeoutAction(v ?? "deny")}
 			/>
 			{/* Session */}
 			<Title order={5} mt="sm">
@@ -221,6 +220,40 @@ export function AgentSection(props: AgentSectionProps) {
 						denyWrite: t("dirDenyWrite"),
 						denyAll: t("dirDenyAll"),
 					},
+				}}
+			/>
+			{/* Command Access Control */}
+			<Title order={5} mt="sm">
+				{t("globalCommandWhitelist")}
+			</Title>
+			<Text size="xs" c="dimmed">
+				{t("globalCommandWhitelistDesc")}
+			</Text>
+			<CmdListEditor
+				commands={props.globalCommandWhitelist}
+				onChange={props.setGlobalCommandWhitelist}
+				mode="whitelist"
+				labels={{
+					empty: t("cmdListEmpty"),
+					add: t("cmdListAdd"),
+					placeholder: t("cmdListPlaceholder"),
+				}}
+			/>
+			<Title order={5} mt="sm">
+				{t("globalCommandBlacklist")}
+			</Title>
+			<Text size="xs" c="dimmed">
+				{t("globalCommandBlacklistDesc")}
+			</Text>
+			<CmdListEditor
+				commands={props.globalCommandBlacklist}
+				onChange={props.setGlobalCommandBlacklist}
+				mode="blacklist"
+				labels={{
+					empty: t("cmdListEmpty"),
+					add: t("cmdListAdd"),
+					placeholder: t("cmdListPlaceholder"),
+					denyPromptPlaceholder: t("cmdDenyPromptPlaceholder"),
 				}}
 			/>
 		</Stack>

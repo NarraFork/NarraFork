@@ -2,6 +2,7 @@ import { Button, Modal, Stack, Text, TextInput, Title } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateProject } from "../../hooks/useProjects";
+import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
 
 interface ProjectSettingsModalProps {
@@ -57,6 +58,12 @@ export function ProjectSettingsModal({
 	const [blacklistDirs, setBlacklistDirs] = useState<
 		Array<{ path: string; denyLevel: string; enabled?: boolean }>
 	>(cs.blacklistDirs ?? []);
+	const [commandWhitelist, setCommandWhitelist] = useState<
+		Array<{ pattern: string; enabled?: boolean }>
+	>(cs.commandWhitelist ?? []);
+	const [commandBlacklist, setCommandBlacklist] = useState<
+		Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>
+	>(cs.commandBlacklist ?? []);
 
 	useEffect(() => {
 		if (opened) {
@@ -74,6 +81,8 @@ export function ProjectSettingsModal({
 					: (chapterSettings ?? {});
 			setWhitelistDirs(fresh.whitelistDirs ?? []);
 			setBlacklistDirs(fresh.blacklistDirs ?? []);
+			setCommandWhitelist(fresh.commandWhitelist ?? []);
+			setCommandBlacklist(fresh.commandBlacklist ?? []);
 		}
 	}, [opened, proxyDomain, chapterSettings]);
 
@@ -84,7 +93,12 @@ export function ProjectSettingsModal({
 				id: projectId,
 				data: {
 					proxyDomain: normalized || null,
-					chapterSettings: { whitelistDirs, blacklistDirs },
+					chapterSettings: {
+						whitelistDirs,
+						blacklistDirs,
+						commandWhitelist,
+						commandBlacklist,
+					},
 				},
 			},
 			{ onSuccess: onClose },
@@ -146,6 +160,41 @@ export function ProjectSettingsModal({
 							denyWrite: ts("dirDenyWrite"),
 							denyAll: ts("dirDenyAll"),
 						},
+					}}
+				/>
+
+				<Title order={5} mt="sm">
+					{t("projectCommandWhitelist")}
+				</Title>
+				<Text size="xs" c="dimmed">
+					{t("projectCommandWhitelistDesc")}
+				</Text>
+				<CmdListEditor
+					commands={commandWhitelist}
+					onChange={setCommandWhitelist}
+					mode="whitelist"
+					labels={{
+						empty: ts("cmdListEmpty"),
+						add: ts("cmdListAdd"),
+						placeholder: ts("cmdListPlaceholder"),
+					}}
+				/>
+
+				<Title order={5} mt="sm">
+					{t("projectCommandBlacklist")}
+				</Title>
+				<Text size="xs" c="dimmed">
+					{t("projectCommandBlacklistDesc")}
+				</Text>
+				<CmdListEditor
+					commands={commandBlacklist}
+					onChange={setCommandBlacklist}
+					mode="blacklist"
+					labels={{
+						empty: ts("cmdListEmpty"),
+						add: ts("cmdListAdd"),
+						placeholder: ts("cmdListPlaceholder"),
+						denyPromptPlaceholder: ts("cmdDenyPromptPlaceholder"),
 					}}
 				/>
 

@@ -85,9 +85,14 @@ export const snapshot = {
 		const dir = shadowDir(chapterId);
 		if (existsSync(resolve(dir, "HEAD"))) return;
 		mkdirSync(dir, { recursive: true });
-		// --git-dir is already set by execGit, so just pass --bare
-		const result = await execGit(["init", "--bare"], dir, worktreePath);
+		// Use safeSpawn directly — execGit injects --work-tree which is
+		// incompatible with `git init --bare` (bare repos have no work tree).
+		const result = await safeSpawn({
+			cmd: ["git", "init", "--bare", dir],
+		});
 		if (result.exitCode !== 0) {
+			// Clean up the empty directory so GC doesn't warn about it forever
+			rmSync(dir, { recursive: true, force: true });
 			throw new GitError(`snapshot init failed: ${result.stderr}`);
 		}
 		await this.syncExcludes(chapterId, worktreePath);
@@ -158,7 +163,10 @@ export const snapshot = {
 				// Non-fatal — proceed with stale excludes
 			}
 
-			await execGit(["add", "-A"], dir, worktreePath);
+			const addResult = await execGit(["add", "-A"], dir, worktreePath);
+			if (addResult.exitCode !== 0) {
+				throw new GitError(`snapshot add failed: ${addResult.stderr}`);
+			}
 			const result = await execGit(["write-tree"], dir, worktreePath);
 			if (result.exitCode !== 0) {
 				throw new GitError(`snapshot write-tree failed: ${result.stderr}`);
@@ -180,6 +188,9 @@ export const snapshot = {
 			dir,
 			worktreePath,
 		);
+		if (result.exitCode !== 0) {
+			throw new GitError(`snapshot diff-tree failed: ${result.stderr}`);
+		}
 		return result.stdout.split("\n").filter(Boolean);
 	},
 
@@ -192,6 +203,9 @@ export const snapshot = {
 	): Promise<string> {
 		const dir = shadowDir(chapterId);
 		const result = await execGit(["diff-tree", "-r", "-p", fromHash, toHash], dir, worktreePath);
+		if (result.exitCode !== 0) {
+			throw new GitError(`snapshot diff failed: ${result.stderr}`);
+		}
 		return result.stdout;
 	},
 
@@ -204,7 +218,12 @@ export const snapshot = {
 			const dir = shadowDir(chapterId);
 			for (const patch of patches) {
 				// Load the before-tree into the index once per patch
-				await execGit(["read-tree", patch.beforeHash], dir, worktreePath);
+				const readResult = await execGit(["read-tree", patch.beforeHash], dir, worktreePath);
+				if (readResult.exitCode !== 0) {
+					throw new GitError(
+						`snapshot read-tree failed for ${patch.beforeHash}: ${readResult.stderr}`,
+					);
+				}
 
 				for (const file of patch.files) {
 					const lsResult = await execGit(
@@ -215,7 +234,10 @@ export const snapshot = {
 					);
 					if (lsResult.stdout) {
 						// File existed in the before snapshot — restore it from index
-						await execGit(["checkout-index", "-f", "--", file], dir, worktreePath);
+						const coResult = await execGit(["checkout-index", "-f", "--", file], dir, worktreePath);
+						if (coResult.exitCode !== 0) {
+							throw new GitError(`snapshot checkout-index failed for ${file}: ${coResult.stderr}`);
+						}
 					} else {
 						// File was newly created — delete it
 						const filePath = resolve(worktreePath, file);
@@ -230,8 +252,14 @@ export const snapshot = {
 	async restore(chapterId: string, worktreePath: string, treeHash: string): Promise<void> {
 		return withLock(chapterId, async () => {
 			const dir = shadowDir(chapterId);
-			await execGit(["read-tree", treeHash], dir, worktreePath);
-			await execGit(["checkout-index", "-a", "-f"], dir, worktreePath);
+			const readResult = await execGit(["read-tree", treeHash], dir, worktreePath);
+			if (readResult.exitCode !== 0) {
+				throw new GitError(`snapshot read-tree failed for ${treeHash}: ${readResult.stderr}`);
+			}
+			const coResult = await execGit(["checkout-index", "-a", "-f"], dir, worktreePath);
+			if (coResult.exitCode !== 0) {
+				throw new GitError(`snapshot checkout-index failed: ${coResult.stderr}`);
+			}
 		});
 	},
 
@@ -242,7 +270,8 @@ export const snapshot = {
 		// Check if it's a valid git repository before attempting GC
 		const headPath = resolve(dir, "HEAD");
 		if (!existsSync(headPath)) {
-			logger.warn("Skipping GC for invalid snapshot repo", { chapterId, dir });
+			logger.warn("Removing invalid snapshot repo (missing HEAD)", { chapterId, dir });
+			rmSync(dir, { recursive: true, force: true });
 			return;
 		}
 		await execGit(["gc", "--prune=7.days"], dir, dir);
@@ -271,6 +300,9 @@ export const snapshot = {
 				dir,
 				targetWorktreePath,
 			);
+			if (snapshotFiles.exitCode !== 0) {
+				throw new GitError(`snapshot ls-tree failed for ${treeHash}: ${snapshotFiles.stderr}`);
+			}
 			const snapshotSet = new Set(snapshotFiles.stdout.split("\n").filter(Boolean));
 
 			// 2. List files in the worktree's current HEAD tree (from the real git repo).
@@ -281,6 +313,11 @@ export const snapshot = {
 				cmd: ["git", "ls-tree", "-r", "--name-only", "HEAD"],
 				cwd: targetWorktreePath,
 			});
+			if (headResult.exitCode !== 0) {
+				throw new GitError(
+					`git ls-tree HEAD failed in ${targetWorktreePath}: ${headResult.stderr}`,
+				);
+			}
 			const headFiles = headResult.stdout.trim().split("\n").filter(Boolean);
 
 			// 3. Delete files present in HEAD but absent from the snapshot (model deleted them)
@@ -292,8 +329,14 @@ export const snapshot = {
 			}
 
 			// 4. Write snapshot files to the worktree
-			await execGit(["read-tree", treeHash], dir, targetWorktreePath);
-			await execGit(["checkout-index", "-a", "-f"], dir, targetWorktreePath);
+			const readResult = await execGit(["read-tree", treeHash], dir, targetWorktreePath);
+			if (readResult.exitCode !== 0) {
+				throw new GitError(`snapshot read-tree failed for ${treeHash}: ${readResult.stderr}`);
+			}
+			const coResult = await execGit(["checkout-index", "-a", "-f"], dir, targetWorktreePath);
+			if (coResult.exitCode !== 0) {
+				throw new GitError(`snapshot checkout-index failed: ${coResult.stderr}`);
+			}
 		});
 	},
 

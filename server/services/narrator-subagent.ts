@@ -6,6 +6,7 @@ import { type AgentConfig, buildHistory, type ToolDefinition } from "../lib/agen
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
@@ -21,7 +22,12 @@ import {
 	MAX_TRANSIENT_RETRIES,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
-import { buildContextManagementHooks, handlePermission, pruneToolCalls } from "./narrator-session";
+import {
+	buildContextManagementHooks,
+	handlePermission,
+	pruneToolCalls,
+	toBufferSummary,
+} from "./narrator-session";
 
 // === In-memory state ===
 // Use `let` + lazy getter to avoid TDZ issues under Bun --hot reload,
@@ -40,10 +46,15 @@ function getForegroundAbortControllers() {
 	return _foregroundSubagentAbortControllers;
 }
 
-let _subagentBufferedMessages:
-	| Map<string, { text: string; images?: ImageRef[]; bufferedAt: string }>
-	| undefined;
-function getSubagentBufferedMessages() {
+interface SubagentBufferedMessage {
+	id: string;
+	text: string;
+	images?: ImageRef[];
+	bufferedAt: string;
+}
+
+let _subagentBufferedMessages: Map<string, SubagentBufferedMessage[]> | undefined;
+function getSubagentBufferedMessagesMap() {
 	if (!_subagentBufferedMessages) _subagentBufferedMessages = new Map();
 	return _subagentBufferedMessages;
 }
@@ -142,8 +153,8 @@ async function finalizeSubagent(
 	hasError: boolean,
 	errorText: string | null,
 ): Promise<void> {
-	// Clean up any remaining buffered message
-	getSubagentBufferedMessages().delete(subagentId);
+	// Clean up any remaining buffered messages
+	getSubagentBufferedMessagesMap().delete(subagentId);
 
 	const now = new Date().toISOString();
 	await db
@@ -329,9 +340,11 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
 			getInjectedUserText: () => {
-				const buf = getSubagentBufferedMessages().get(narratorId);
+				const queue = getSubagentBufferedMessagesMap().get(narratorId);
+				const buf = queue?.[0];
 				if (!buf) return null;
-				getSubagentBufferedMessages().delete(narratorId);
+				queue?.shift();
+				if (queue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
 				// Persist user message in the background (fire-and-forget).
 				// The text is injected into the next turn immediately.
 				narratorService
@@ -354,15 +367,18 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 							error: String(err),
 						});
 					});
+				const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
 				broadcastToNarrator(parentNarratorId, {
-					type: "buffer_cleared",
+					type: "buffer_consumed",
 					narratorId: parentNarratorId,
-					reason: "sent",
+					messageId: buf.id,
+					remaining,
 				});
 				broadcastToNarrator(narratorId, {
-					type: "buffer_cleared",
+					type: "buffer_consumed",
 					narratorId,
-					reason: "sent",
+					messageId: buf.id,
+					remaining,
 				});
 				return buf.text;
 			},
@@ -449,9 +465,11 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		transientRetries = 0;
 
 		// --- Check for buffered user message (sent from subagent page) ---
-		const buffered = getSubagentBufferedMessages().get(narratorId);
+		const bufQueue = getSubagentBufferedMessagesMap().get(narratorId);
+		const buffered = bufQueue?.[0];
 		if (buffered && !signal.aborted && !hasError) {
-			getSubagentBufferedMessages().delete(narratorId);
+			bufQueue?.shift();
+			if (bufQueue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
 			// Persist and broadcast the user message
 			const userMsg = await narratorService.persistSubagentUserMessage(
 				narratorId,
@@ -470,15 +488,18 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				narratorId,
 				message: { ...userMsg, parentToolUseId: null },
 			});
+			const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
 			broadcastToNarrator(parentNarratorId, {
-				type: "buffer_cleared",
+				type: "buffer_consumed",
 				narratorId: parentNarratorId,
-				reason: "sent",
+				messageId: buffered.id,
+				remaining,
 			});
 			broadcastToNarrator(narratorId, {
-				type: "buffer_cleared",
+				type: "buffer_consumed",
 				narratorId,
-				reason: "sent",
+				messageId: buffered.id,
+				remaining,
 			});
 			// Reload history with the new user message and continue the loop
 			prompt = buffered.text;
@@ -525,32 +546,33 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 // === Background task management ===
 
 /**
- * Buffer a user message for a running foreground subagent.
+ * Push a user message onto the subagent buffer queue.
  * Returns false if the subagent is not currently running.
  */
-export function bufferSubagentMessage(
+export function pushSubagentBufferedMessage(
 	subagentId: string,
 	text: string,
 	images?: ImageRef[],
-): { ok: boolean; bufferedAt: string } {
+): { ok: boolean; bufferedAt: string; id: string } {
 	if (!getForegroundAbortControllers().has(subagentId)) {
-		return { ok: false, bufferedAt: "" };
+		return { ok: false, bufferedAt: "", id: "" };
 	}
+	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
-	getSubagentBufferedMessages().set(subagentId, { text, images, bufferedAt });
-	return { ok: true, bufferedAt };
+	const queue = getSubagentBufferedMessagesMap().get(subagentId) ?? [];
+	queue.push({ id, text, images, bufferedAt });
+	getSubagentBufferedMessagesMap().set(subagentId, queue);
+	return { ok: true, bufferedAt, id };
 }
 
-/** Cancel a buffered subagent message. */
-export function clearSubagentBufferedMessage(subagentId: string): void {
-	getSubagentBufferedMessages().delete(subagentId);
+/** Clear the entire subagent buffer queue. */
+export function clearSubagentBufferedMessages(subagentId: string): void {
+	getSubagentBufferedMessagesMap().delete(subagentId);
 }
 
-/** Get the current buffered message for a subagent (for REST hydration). */
-export function getSubagentBufferedMessage(
-	subagentId: string,
-): { text: string; images?: ImageRef[]; bufferedAt: string } | null {
-	return getSubagentBufferedMessages().get(subagentId) ?? null;
+/** Get the full subagent buffer queue (for REST hydration). */
+export function getSubagentBufferedMessages(subagentId: string): SubagentBufferedMessage[] {
+	return getSubagentBufferedMessagesMap().get(subagentId) ?? [];
 }
 
 /**

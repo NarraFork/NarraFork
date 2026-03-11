@@ -8,7 +8,12 @@ import {
 	type NarraForkSettings,
 	saveSettings,
 } from "../lib/settings";
-import { blacklistDirEntrySchema, whitelistDirEntrySchema } from "../lib/validators";
+import {
+	blacklistDirEntrySchema,
+	commandBlacklistEntrySchema,
+	commandWhitelistEntrySchema,
+	whitelistDirEntrySchema,
+} from "../lib/validators";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
@@ -53,7 +58,10 @@ const anthropicProviderSchema = z.object({
 const updateSettingsSchema = z
 	.object({
 		server: z
-			.object({ port: z.number().int().min(1).max(65535) })
+			.object({
+				port: z.number().int().min(1).max(65535),
+				host: z.string().min(1).max(255),
+			})
 			.partial()
 			.optional(),
 		paths: z
@@ -77,10 +85,11 @@ const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				translateReasoning: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
-				planTimeoutAction: z.enum(["deny", "auto_approve"]),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
+				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
+				commandBlacklist: z.array(commandBlacklistEntrySchema).max(50),
 			})
 			.partial()
 			.optional(),

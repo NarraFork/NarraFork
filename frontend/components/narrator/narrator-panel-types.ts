@@ -133,6 +133,10 @@ export interface NarratorPanelProps {
 	compact?: boolean;
 	/** When provided, replaces the back arrow with a minimize button (e.g. return to narraflow) */
 	onMinimize?: () => void;
+	/** Custom back navigation handler (e.g. subagent → parent narrator) */
+	onBack?: () => void;
+	/** When true, shows a skeleton overlay instead of messages (e.g. during node resize) */
+	isResizing?: boolean;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;

@@ -3,7 +3,7 @@ import { notifications } from "@mantine/notifications";
 import { IconGitCommit, IconMessage, IconMinimize } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import {
@@ -112,6 +112,11 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 
 	const handleStyle = { opacity: 0, width: 8, height: 8 };
 
+	// Track node resize to show skeleton overlay in NarratorPanel
+	const [isResizing, setIsResizing] = useState(false);
+	const onResizeStart = useCallback(() => setIsResizing(true), []);
+	const onResizeEnd = useCallback(() => setIsResizing(false), []);
+
 	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over NarratorPanel
 	const panelWheelRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
@@ -137,6 +142,8 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					minWidth={MIN_RESIZE_WIDTH}
 					minHeight={MIN_RESIZE_HEIGHT}
 					position="bottom-right"
+					onResizeStart={onResizeStart}
+					onResizeEnd={onResizeEnd}
 					style={{
 						background: "transparent",
 						border: "none",
@@ -293,6 +300,7 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 							key={d.narratorId}
 							narratorId={d.narratorId}
 							compact
+							isResizing={isResizing}
 							onForkFromMessage={handleForkFromMessage}
 						/>
 					</div>

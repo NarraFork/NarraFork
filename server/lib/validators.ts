@@ -17,6 +17,19 @@ export const blacklistDirEntrySchema = z.object({
 	enabled: z.boolean().default(true),
 });
 
+/** Reusable schema for command whitelist entries (global / project level). */
+export const commandWhitelistEntrySchema = z.object({
+	pattern: z.string().trim().min(1).max(200),
+	enabled: z.boolean().default(true),
+});
+
+/** Reusable schema for command blacklist entries (global / project level). */
+export const commandBlacklistEntrySchema = z.object({
+	pattern: z.string().trim().min(1).max(200),
+	denyPrompt: z.string().max(2000).optional(),
+	enabled: z.boolean().default(true),
+});
+
 // === Projects ===
 
 export const commandSchema = z.object({
@@ -25,7 +38,7 @@ export const commandSchema = z.object({
 		.min(1)
 		.max(50)
 		.regex(/^[a-zA-Z0-9_-]+$/),
-	prompt: z.string().min(1).max(10000),
+	prompt: z.string().min(1).max(400000),
 	description: z.string().max(500).optional(),
 	params: z
 		.array(
@@ -72,6 +85,8 @@ export const updateProjectSchema = z.object({
 				.optional(),
 			whitelistDirs: z.array(whitelistDirEntrySchema).max(50).optional(),
 			blacklistDirs: z.array(blacklistDirEntrySchema).max(50).optional(),
+			commandWhitelist: z.array(commandWhitelistEntrySchema).max(50).optional(),
+			commandBlacklist: z.array(commandBlacklistEntrySchema).max(50).optional(),
 		})
 		.optional(),
 });
@@ -154,6 +169,36 @@ export const createBlacklistDirSchema = z.object({
 export const updateBlacklistDirSchema = z.object({
 	denyLevel: z.enum(["denyWrite", "denyAll"]).optional(),
 	enabled: z.boolean().optional(),
+});
+
+// === Narrator command whitelist/blacklist ===
+
+export const createWhitelistCmdSchema = z.object({
+	pattern: z.string().trim().min(1).max(200),
+	enabled: z.boolean().default(true),
+});
+
+export const updateWhitelistCmdSchema = z.object({
+	pattern: z.string().trim().min(1).max(200).optional(),
+	enabled: z.boolean().optional(),
+});
+
+export const createBlacklistCmdSchema = z.object({
+	pattern: z.string().trim().min(1).max(200),
+	denyPrompt: z.string().max(2000).optional(),
+	enabled: z.boolean().default(true),
+});
+
+export const updateBlacklistCmdSchema = z.object({
+	pattern: z.string().trim().min(1).max(200).optional(),
+	denyPrompt: z.string().max(2000).nullable().optional(),
+	enabled: z.boolean().optional(),
+});
+
+// === Buffered messages ===
+
+export const updateBufferedMessageSchema = z.object({
+	text: z.string().min(1).max(100_000),
 });
 
 // === Terminals ===
@@ -462,6 +507,17 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({
 		type: z.literal("cancel_buffer"),
 		narratorId: z.string().min(1),
+	}),
+	z.object({
+		type: z.literal("update_buffer"),
+		narratorId: z.string().min(1),
+		messageId: z.string().min(1),
+		text: z.string().min(1).max(100_000),
+	}),
+	z.object({
+		type: z.literal("remove_buffer"),
+		narratorId: z.string().min(1),
+		messageId: z.string().min(1),
 	}),
 	z.object({
 		type: z.literal("presence_join"),

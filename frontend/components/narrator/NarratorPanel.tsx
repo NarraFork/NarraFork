@@ -41,10 +41,12 @@ import {
 	IconLock,
 	IconLockOpen,
 	IconPaperclip,
+	IconPencil,
 	IconShield,
 	IconSparkles,
 	IconTerminal,
 	IconTrash,
+	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -60,15 +62,23 @@ import {
 	getNarratorMessagesQueryKey,
 	useArchiveNarrator,
 	useBlacklistDirs,
+	useCmdBlacklist,
+	useCmdWhitelist,
 	useCreateBlacklistDir,
+	useCreateCmdBlacklist,
+	useCreateCmdWhitelist,
 	useCreateWhitelistDir,
 	useDeleteBlacklistDir,
+	useDeleteCmdBlacklist,
+	useDeleteCmdWhitelist,
 	useDeleteWhitelistDir,
 	useForkNarrator,
 	useInterruptNarrator,
 	useNarrator,
 	useNarratorMessages,
 	useUpdateBlacklistDir,
+	useUpdateCmdBlacklist,
+	useUpdateCmdWhitelist,
 	useUpdateFastMode,
 	useUpdateModel,
 	useUpdatePermissionMode,
@@ -215,6 +225,46 @@ function PermModeMenuItems({
 const ACCESS_LEVELS = ["readOnly", "readWrite", "full"] as const;
 const DENY_LEVELS = ["denyWrite", "denyAll"] as const;
 
+function CmdPatternInput({
+	placeholder,
+	onConfirm,
+}: {
+	placeholder: string;
+	onConfirm: (pattern: string) => void;
+}) {
+	const [value, setValue] = useState("");
+	return (
+		<>
+			<TextInput
+				size="xs"
+				placeholder={placeholder}
+				value={value}
+				onChange={(e) => setValue(e.currentTarget.value)}
+				onKeyDown={(e) => {
+					if (e.key === "Enter" && value.trim()) {
+						onConfirm(value.trim());
+						setValue("");
+					}
+				}}
+				style={{ flex: 1 }}
+			/>
+			<Button
+				size="xs"
+				variant="light"
+				disabled={!value.trim()}
+				onClick={() => {
+					if (value.trim()) {
+						onConfirm(value.trim());
+						setValue("");
+					}
+				}}
+			>
+				+
+			</Button>
+		</>
+	);
+}
+
 function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: string) => string }) {
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const { data: wlDirs = [] } = useWhitelistDirs(narratorId);
@@ -227,8 +277,18 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 	const updateBl = useUpdateBlacklistDir(narratorId);
 	const deleteBl = useDeleteBlacklistDir(narratorId);
 
+	const { data: cmdWl = [] } = useCmdWhitelist(narratorId);
+	const createCmdWl = useCreateCmdWhitelist();
+	const updateCmdWl = useUpdateCmdWhitelist(narratorId);
+	const deleteCmdWl = useDeleteCmdWhitelist(narratorId);
+
+	const { data: cmdBl = [] } = useCmdBlacklist(narratorId);
+	const createCmdBl = useCreateCmdBlacklist();
+	const updateCmdBl = useUpdateCmdBlacklist(narratorId);
+	const deleteCmdBl = useDeleteCmdBlacklist(narratorId);
+
 	const [opened, { toggle, close }] = useDisclosure(false);
-	const badgeCount = wlDirs.length + blDirs.length;
+	const badgeCount = wlDirs.length + blDirs.length + cmdWl.length + cmdBl.length;
 
 	const trigger = (
 		<Tooltip label={t("path_rules")}>
@@ -362,6 +422,107 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 				placeholder={t("blacklist_dirs_placeholder")}
 				onConfirm={(path) => createBl.mutate({ narratorId, path })}
 			/>
+
+			{/* ── Command Whitelist ── */}
+			<Text size="xs" fw={600} mt={4}>
+				{t("cmd_whitelist_title")}
+			</Text>
+			{cmdWl.length === 0 && (
+				<Text size="xs" c="dimmed">
+					{t("cmd_whitelist_empty")}
+				</Text>
+			)}
+			{cmdWl.map((cmd) => (
+				<Group key={cmd.id} gap={6} wrap="nowrap" align="center">
+					<Switch
+						size="xs"
+						checked={cmd.enabled}
+						onChange={(e) =>
+							updateCmdWl.mutate({ entryId: cmd.id, enabled: e.currentTarget.checked })
+						}
+					/>
+					<Text
+						size="xs"
+						style={{
+							flex: 1,
+							overflow: "hidden",
+							textOverflow: "ellipsis",
+							whiteSpace: "nowrap",
+							opacity: cmd.enabled ? 1 : 0.5,
+						}}
+						title={cmd.pattern}
+					>
+						{cmd.pattern}
+					</Text>
+					<ActionIcon
+						variant="subtle"
+						color="red"
+						size="xs"
+						onClick={() => deleteCmdWl.mutate(cmd.id)}
+					>
+						<IconTrash size={14} />
+					</ActionIcon>
+				</Group>
+			))}
+			<Group gap={4} wrap="nowrap">
+				<CmdPatternInput
+					placeholder={t("cmd_whitelist_placeholder")}
+					onConfirm={(pattern) => createCmdWl.mutate({ narratorId, pattern })}
+				/>
+			</Group>
+
+			{/* ── Command Blacklist ── */}
+			<Text size="xs" fw={600} mt={4}>
+				{t("cmd_blacklist_title")}
+			</Text>
+			{cmdBl.length === 0 && (
+				<Text size="xs" c="dimmed">
+					{t("cmd_blacklist_empty")}
+				</Text>
+			)}
+			{cmdBl.map((cmd) => (
+				<Group key={cmd.id} gap={6} wrap="nowrap" align="center">
+					<Switch
+						size="xs"
+						checked={cmd.enabled}
+						onChange={(e) =>
+							updateCmdBl.mutate({ entryId: cmd.id, enabled: e.currentTarget.checked })
+						}
+					/>
+					<Text
+						size="xs"
+						style={{
+							flex: 1,
+							overflow: "hidden",
+							textOverflow: "ellipsis",
+							whiteSpace: "nowrap",
+							opacity: cmd.enabled ? 1 : 0.5,
+						}}
+						title={cmd.pattern}
+					>
+						{cmd.pattern}
+					</Text>
+					{cmd.denyPrompt && (
+						<Text size="xs" c="dimmed" title={cmd.denyPrompt}>
+							💬
+						</Text>
+					)}
+					<ActionIcon
+						variant="subtle"
+						color="red"
+						size="xs"
+						onClick={() => deleteCmdBl.mutate(cmd.id)}
+					>
+						<IconTrash size={14} />
+					</ActionIcon>
+				</Group>
+			))}
+			<Group gap={4} wrap="nowrap">
+				<CmdPatternInput
+					placeholder={t("cmd_blacklist_placeholder")}
+					onConfirm={(pattern) => createCmdBl.mutate({ narratorId, pattern })}
+				/>
+			</Group>
 		</Stack>
 	);
 
@@ -433,6 +594,8 @@ export function NarratorPanel({
 	onToggleTerminal,
 	compact,
 	onMinimize,
+	onBack,
+	isResizing,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -765,8 +928,8 @@ export function NarratorPanel({
 		topLevelStreamingChunks,
 		webSearchRef,
 		renderPermCb,
-		bufferedText,
-		setBufferedText,
+		queuedMessages,
+		setQueuedMessages,
 		isCompacting,
 		contextPercent,
 		promptTokens,
@@ -1096,6 +1259,7 @@ export function NarratorPanel({
 	// --- Visible elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
 	const visibleElements = useMemo(() => {
+		if (isResizing) return [];
 		if (!messagesData?.pages || visibleCount === 0) return [];
 		const pages = messagesData.pages;
 		const reversed = [...pages].reverse();
@@ -1152,6 +1316,7 @@ export function NarratorPanel({
 		}
 		return result;
 	}, [
+		isResizing,
 		messagesData,
 		totalMessageCount,
 		visibleCount,
@@ -1482,7 +1647,10 @@ export function NarratorPanel({
 					images.length > 0 ? images : undefined,
 				);
 				if (result?.buffered) {
-					setBufferedText(msg);
+					setQueuedMessages((prev) => [
+						...prev,
+						{ id: result.id, text: msg, bufferedAt: result.bufferedAt },
+					]);
 					scrollToBottom(true);
 				}
 			} catch {
@@ -1491,7 +1659,7 @@ export function NarratorPanel({
 					setAttachedImages(images);
 				}
 				sendBufferMessage(narratorId, msg);
-				setBufferedText(msg);
+				// Optimistic: WS buffer_set will sync the real state
 				scrollToBottom(true);
 			}
 			return;
@@ -1512,12 +1680,62 @@ export function NarratorPanel({
 		}
 	};
 
-	const handleCancelBuffer = () => {
-		if (bufferedText) {
+	const handleCancelAllQueued = () => {
+		if (queuedMessages.length > 0) {
 			cancelBuffer(narratorId);
-			setInput(bufferedText);
-			setBufferedText(null);
+			// Restore the first queued message text to the input
+			setInput(queuedMessages[0].text);
+			setQueuedMessages([]);
 		}
+	};
+
+	const handleRemoveQueued = (messageId: string) => {
+		const msg = queuedMessages.find((m) => m.id === messageId);
+		const snapshot = queuedMessages;
+		setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
+		// If removing the only message, restore its text to input
+		if (queuedMessages.length === 1 && msg) {
+			setInput(msg.text);
+		}
+		api.removeBufferedMessage(narratorId, messageId).catch(() => {
+			// Rollback on failure
+			setQueuedMessages(snapshot);
+			if (queuedMessages.length === 1 && msg) {
+				setInput("");
+			}
+		});
+	};
+
+	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
+	const [editingQueuedText, setEditingQueuedText] = useState("");
+
+	const handleStartEditQueued = (msg: { id: string; text: string }) => {
+		setEditingQueuedId(msg.id);
+		setEditingQueuedText(msg.text);
+	};
+
+	const handleSaveEditQueued = () => {
+		if (!editingQueuedId || !editingQueuedText.trim()) return;
+		const trimmed = editingQueuedText.trim();
+		const snapshot = queuedMessages;
+		setQueuedMessages((prev) =>
+			prev.map((m) =>
+				m.id === editingQueuedId
+					? { ...m, text: trimmed, bufferedAt: new Date().toISOString() }
+					: m,
+			),
+		);
+		setEditingQueuedId(null);
+		setEditingQueuedText("");
+		api.updateBufferedMessage(narratorId, editingQueuedId, trimmed).catch(() => {
+			// Rollback on failure
+			setQueuedMessages(snapshot);
+		});
+	};
+
+	const handleCancelEditQueued = () => {
+		setEditingQueuedId(null);
+		setEditingQueuedText("");
 	};
 
 	const addImages = (files: File[]) => {
@@ -1622,7 +1840,7 @@ export function NarratorPanel({
 								size="sm"
 								variant="subtle"
 								color="gray"
-								onClick={() => navigate({ to: ".." })}
+								onClick={onBack ?? (() => navigate({ to: ".." }))}
 							>
 								<IconArrowLeft size={16} />
 							</ActionIcon>
@@ -1741,7 +1959,7 @@ export function NarratorPanel({
 				</Modal>
 
 				{/* Messages */}
-				<Box pos="relative" style={{ flex: 1, minHeight: 0 }}>
+				<Box pos="relative" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
 					{(isFetchingNextPage || !renderDone) && (
 						<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
 							<RenderProgress
@@ -1754,8 +1972,8 @@ export function NarratorPanel({
 							/>
 						</Box>
 					)}
-					{/* Skeleton overlay during progressive rendering to prevent jitter */}
-					{!renderDone && (
+					{/* Skeleton overlay during progressive rendering or node resize to prevent jitter */}
+					{(!renderDone || isResizing) && (
 						<Box
 							pos="absolute"
 							top={0}
@@ -1930,27 +2148,115 @@ export function NarratorPanel({
 					</Group>
 				)}
 
-				{/* Buffered message indicator */}
-				{bufferedText && (
-					<Group
-						px="md"
-						py={4}
-						gap="xs"
+				{/* Queued messages indicator */}
+				{queuedMessages.length > 0 && (
+					<Stack
+						gap={0}
 						style={{
 							borderTop:
 								attachedImages.length > 0
 									? undefined
 									: "1px solid var(--mantine-color-default-border)",
-							backgroundColor: "var(--mantine-color-blue-light)",
 							flexShrink: 0,
 						}}
 					>
-						<Loader size={14} color="blue" />
-						<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-							{t("bufferedMessage")}: {bufferedText}
-						</Text>
-						<CloseButton size="xs" onClick={handleCancelBuffer} title={t("cancelBuffer")} />
-					</Group>
+						{queuedMessages.map((msg, index) => (
+							<Group
+								key={msg.id}
+								px="md"
+								py={4}
+								gap="xs"
+								style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
+							>
+								{editingQueuedId === msg.id ? (
+									<>
+										<Text size="xs" c="dimmed" w={16} ta="center">
+											{index + 1}
+										</Text>
+										<Textarea
+											size="xs"
+											value={editingQueuedText}
+											onChange={(e) => setEditingQueuedText(e.currentTarget.value)}
+											onKeyDown={(e) => {
+												if (e.key === "Enter" && !e.shiftKey) {
+													e.preventDefault();
+													handleSaveEditQueued();
+												}
+												if (e.key === "Escape") handleCancelEditQueued();
+											}}
+											autosize
+											minRows={1}
+											maxRows={4}
+											style={{ flex: 1 }}
+											autoFocus
+										/>
+										<ActionIcon
+											size="xs"
+											variant="subtle"
+											color="green"
+											onClick={handleSaveEditQueued}
+										>
+											<IconCheck size={12} />
+										</ActionIcon>
+										<ActionIcon
+											size="xs"
+											variant="subtle"
+											color="gray"
+											onClick={handleCancelEditQueued}
+										>
+											<IconX size={12} />
+										</ActionIcon>
+									</>
+								) : (
+									<>
+										<Text size="xs" c="dimmed" w={16} ta="center">
+											{index + 1}
+										</Text>
+										<Loader
+											size={14}
+											color="blue"
+											style={{ visibility: index === 0 ? "visible" : "hidden" }}
+										/>
+										<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
+											{index === 0 ? `${t("bufferedMessage")}: ` : ""}
+											{msg.text}
+										</Text>
+										<ActionIcon
+											size="xs"
+											variant="subtle"
+											color="blue"
+											onClick={() => handleStartEditQueued(msg)}
+											title={tc("edit")}
+										>
+											<IconPencil size={12} />
+										</ActionIcon>
+										<CloseButton
+											size="xs"
+											onClick={() => handleRemoveQueued(msg.id)}
+											title={t("cancelBuffer")}
+										/>
+									</>
+								)}
+							</Group>
+						))}
+						{queuedMessages.length > 1 && (
+							<Group
+								px="md"
+								py={2}
+								justify="flex-end"
+								style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
+							>
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									color="red"
+									onClick={handleCancelAllQueued}
+								>
+									{t("clearAllQueued")}
+								</Button>
+							</Group>
+						)}
+					</Stack>
 				)}
 
 				{/* Chapter bar */}
@@ -1966,7 +2272,7 @@ export function NarratorPanel({
 					wrap="nowrap"
 					style={{
 						borderTop:
-							attachedImages.length > 0 || bufferedText
+							attachedImages.length > 0 || queuedMessages.length > 0
 								? undefined
 								: "1px solid var(--mantine-color-default-border)",
 						flexShrink: 0,
@@ -2579,7 +2885,7 @@ export function NarratorPanel({
 												/>
 											)}
 											<span style={{ position: "relative" }}>
-												{bufferedText ? t("interruptCutInLine") : t("interrupt")}
+												{queuedMessages.length > 0 ? t("interruptCutInLine") : t("interrupt")}
 											</span>
 										</Button>
 									);
@@ -2592,12 +2898,12 @@ export function NarratorPanel({
 									);
 								}
 								return (
-									<Button
-										key="send"
-										onClick={handleSend}
-										disabled={!hasInput || (isActive && !!bufferedText)}
-									>
-										{isActive ? t("queue") : tc("send")}
+									<Button key="send" onClick={handleSend} disabled={!hasInput}>
+										{isActive
+											? queuedMessages.length > 0
+												? `${t("queue")} (${queuedMessages.length})`
+												: t("queue")
+											: tc("send")}
 									</Button>
 								);
 							})()}

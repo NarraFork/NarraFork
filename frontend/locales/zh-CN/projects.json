@@ -61,5 +61,9 @@
 	"projectWhitelistDirs": "白名单目录",
 	"projectWhitelistDirsDesc": "对本项目叙述者自动放行的目录。",
 	"projectBlacklistDirs": "黑名单目录",
-	"projectBlacklistDirsDesc": "对本项目叙述者禁止访问的目录。"
+	"projectBlacklistDirsDesc": "对本项目叙述者禁止访问的目录。",
+	"projectCommandWhitelist": "命令白名单",
+	"projectCommandWhitelistDesc": "此项目中叙述者自动放行的命令。",
+	"projectCommandBlacklist": "命令黑名单",
+	"projectCommandBlacklistDesc": "此项目中叙述者自动拒绝的命令。"
 }

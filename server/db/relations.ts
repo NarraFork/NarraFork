@@ -6,12 +6,14 @@ import {
 	containerInstances,
 	explorationGroups,
 	mergeSessions,
+	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorPatches,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 	portAllocations,
 	projects,
@@ -109,6 +111,8 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	commits: many(chapterCommits),
 	whitelistDirs: many(narratorWhitelistDirs),
 	blacklistDirs: many(narratorBlacklistDirs),
+	whitelistCmds: many(narratorWhitelistCmds),
+	blacklistCmds: many(narratorBlacklistCmds),
 }));
 
 export const narratorMessagesRelations = relations(narratorMessages, ({ one, many }) => ({
@@ -242,6 +246,20 @@ export const narratorWhitelistDirsRelations = relations(narratorWhitelistDirs, (
 export const narratorBlacklistDirsRelations = relations(narratorBlacklistDirs, ({ one }) => ({
 	narrator: one(narrators, {
 		fields: [narratorBlacklistDirs.narratorId],
+		references: [narrators.id],
+	}),
+}));
+
+export const narratorWhitelistCmdsRelations = relations(narratorWhitelistCmds, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorWhitelistCmds.narratorId],
+		references: [narrators.id],
+	}),
+}));
+
+export const narratorBlacklistCmdsRelations = relations(narratorBlacklistCmds, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorBlacklistCmds.narratorId],
 		references: [narrators.id],
 	}),
 }));

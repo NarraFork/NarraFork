@@ -21,16 +21,18 @@ import { db } from "../db";
 import {
 	chapters,
 	containerInstances,
+	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorMessages,
 	narratorPatches,
 	narrators,
+	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 	projects,
 	terminals,
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
-import { ValidationError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { pathsEqual, resolvePath } from "../lib/platform-path";
@@ -42,33 +44,42 @@ import {
 } from "../lib/prompt-i18n";
 import { type ImageRef, saveUploadedImage } from "../lib/uploads";
 import {
+	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
+	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,
+	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
+	updateBufferedMessageSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
+	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import { narratorService } from "../services/narrator-service";
 import {
+	clearBufferedMessages,
 	closeNarrator,
 	editAndRegenerate,
-	getBufferedMessage,
+	getBufferedMessages,
 	interruptNarrator,
 	isNarratorActive,
+	pushBufferedMessage,
 	regenerateFromMessage,
+	removeBufferedMessage,
 	resolveAllPendingPermissions,
 	resolvePermission,
 	retryLastMessage,
 	runCustomCompact,
 	sendMessage,
-	setBufferedMessage,
+	toBufferSummary,
+	updateBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
 } from "../services/narrator-session";
@@ -377,22 +388,24 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// Running narrator: buffer the message for execution after the current turn
 	if (narrator.status === "thinking" || narrator.status === "waiting") {
 		if (narrator.type === "subagent") {
-			const { bufferSubagentMessage } = await import("../services/narrator-subagent");
-			const result = bufferSubagentMessage(id, finalMessage);
+			const { pushSubagentBufferedMessage, getSubagentBufferedMessages } = await import(
+				"../services/narrator-subagent"
+			);
+			const result = pushSubagentBufferedMessage(id, finalMessage);
 			if (!result.ok) {
 				throw new ValidationError("Subagent is not running in foreground");
 			}
+			const messages = toBufferSummary(getSubagentBufferedMessages(id));
 			broadcastToNarrator(id, {
 				type: "buffer_set",
 				narratorId: id,
-				text: message,
-				bufferedAt: result.bufferedAt,
+				messages,
 			});
-			return c.json({ buffered: true, bufferedAt: result.bufferedAt }, 202);
+			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 
-		// Primary narrator: buffer via setBufferedMessage
-		const result = setBufferedMessage(
+		// Primary narrator: push onto buffer queue
+		const result = pushBufferedMessage(
 			id,
 			finalMessage,
 			images.length > 0 ? images : undefined,
@@ -400,13 +413,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			userId,
 		);
 		if (result.ok) {
+			const messages = toBufferSummary(getBufferedMessages(id));
 			broadcastToNarrator(id, {
 				type: "buffer_set",
 				narratorId: id,
-				text: message,
-				bufferedAt: result.bufferedAt,
+				messages,
 			});
-			return c.json({ buffered: true, bufferedAt: result.bufferedAt }, 202);
+			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 		// Narrator not active in memory — fall through to normal send
 	}
@@ -513,16 +526,49 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	return c.json(result);
 });
 
-// Get buffered message (for multi-device hydration on page load)
+// Get buffered message queue (for multi-device hydration on page load)
 narratorRoutes.get("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
-	let buffered = getBufferedMessage(id);
+	let messages = toBufferSummary(getBufferedMessages(id));
 	// Fallback: check subagent buffer
-	if (!buffered) {
-		const { getSubagentBufferedMessage } = await import("../services/narrator-subagent");
-		buffered = getSubagentBufferedMessage(id);
+	if (messages.length === 0) {
+		const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
+		messages = toBufferSummary(getSubagentBufferedMessages(id));
 	}
-	return c.json(buffered ? { text: buffered.text, bufferedAt: buffered.bufferedAt } : null);
+	return c.json(messages);
+});
+
+// Edit a queued buffered message
+narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	const body = await c.req.json();
+	const parsed = updateBufferedMessageSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const ok = updateBufferedMessage(id, mid, parsed.data.text.trim());
+	if (!ok) throw new NotFoundError("Buffered message", mid);
+	const messages = toBufferSummary(getBufferedMessages(id));
+	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages });
+	return c.json({ ok: true });
+});
+
+// Remove a single queued buffered message
+narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	const ok = removeBufferedMessage(id, mid);
+	if (!ok) throw new NotFoundError("Buffered message", mid);
+	const messages = toBufferSummary(getBufferedMessages(id));
+	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages });
+	return c.json({ ok: true });
+});
+
+// Clear entire buffer queue
+narratorRoutes.delete("/:id/buffer", async (c) => {
+	const id = c.req.param("id");
+	clearBufferedMessages(id);
+	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
+	return c.json({ ok: true });
 });
 
 // Get message history (cursor-based pagination, newest first)
@@ -1081,9 +1127,10 @@ narratorRoutes.post("/:id/revert", async (c) => {
 		return c.json({ snapshotHash: null, patchCount: 0, files: [] });
 	}
 
-	// Save current state for unrevert
+	// Save current state for unrevert (ensure shadow repo exists first)
 	let snapshotHash: string;
 	try {
+		await snapshot.init(chapterId, worktreePath);
 		snapshotHash = await snapshot.track(chapterId, worktreePath);
 	} catch (err) {
 		return c.json(
@@ -1327,5 +1374,117 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
 	await db.delete(narratorBlacklistDirs).where(eq(narratorBlacklistDirs.id, dirId));
+	return c.json({ ok: true });
+});
+
+// ── Command whitelist ──────────────────────────────────────
+
+narratorRoutes.get("/:id/cmd-whitelist", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const cmds = await db.query.narratorWhitelistCmds.findMany({
+		where: eq(narratorWhitelistCmds.narratorId, id),
+		orderBy: asc(narratorWhitelistCmds.createdAt),
+	});
+	return c.json(cmds);
+});
+
+narratorRoutes.post("/:id/cmd-whitelist", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const body = await c.req.json();
+	const parsed = createWhitelistCmdSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const existing = await db.query.narratorWhitelistCmds.findMany({
+		where: eq(narratorWhitelistCmds.narratorId, id),
+		columns: { id: true, pattern: true },
+	});
+	if (existing.some((e) => e.pattern === parsed.data.pattern)) {
+		throw new ValidationError("This pattern is already in the command whitelist");
+	}
+	const entry = {
+		id: generateId(),
+		narratorId: id,
+		pattern: parsed.data.pattern,
+		enabled: parsed.data.enabled,
+		createdAt: new Date().toISOString(),
+	};
+	await db.insert(narratorWhitelistCmds).values(entry);
+	return c.json(entry, 201);
+});
+
+narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
+	const entryId = c.req.param("entryId");
+	const body = await c.req.json();
+	const parsed = updateWhitelistCmdSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const updates: Record<string, unknown> = {};
+	if (parsed.data.pattern !== undefined) updates.pattern = parsed.data.pattern;
+	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
+	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
+	await db.update(narratorWhitelistCmds).set(updates).where(eq(narratorWhitelistCmds.id, entryId));
+	return c.json({ ok: true });
+});
+
+narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
+	const entryId = c.req.param("entryId");
+	await db.delete(narratorWhitelistCmds).where(eq(narratorWhitelistCmds.id, entryId));
+	return c.json({ ok: true });
+});
+
+// ── Command blacklist ──────────────────────────────────────
+
+narratorRoutes.get("/:id/cmd-blacklist", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const cmds = await db.query.narratorBlacklistCmds.findMany({
+		where: eq(narratorBlacklistCmds.narratorId, id),
+		orderBy: asc(narratorBlacklistCmds.createdAt),
+	});
+	return c.json(cmds);
+});
+
+narratorRoutes.post("/:id/cmd-blacklist", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const body = await c.req.json();
+	const parsed = createBlacklistCmdSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const existing = await db.query.narratorBlacklistCmds.findMany({
+		where: eq(narratorBlacklistCmds.narratorId, id),
+		columns: { id: true, pattern: true },
+	});
+	if (existing.some((e) => e.pattern === parsed.data.pattern)) {
+		throw new ValidationError("This pattern is already in the command blacklist");
+	}
+	const entry = {
+		id: generateId(),
+		narratorId: id,
+		pattern: parsed.data.pattern,
+		denyPrompt: parsed.data.denyPrompt ?? null,
+		enabled: parsed.data.enabled,
+		createdAt: new Date().toISOString(),
+	};
+	await db.insert(narratorBlacklistCmds).values(entry);
+	return c.json(entry, 201);
+});
+
+narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
+	const entryId = c.req.param("entryId");
+	const body = await c.req.json();
+	const parsed = updateBlacklistCmdSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const updates: Record<string, unknown> = {};
+	if (parsed.data.pattern !== undefined) updates.pattern = parsed.data.pattern;
+	if (parsed.data.denyPrompt !== undefined) updates.denyPrompt = parsed.data.denyPrompt;
+	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
+	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
+	await db.update(narratorBlacklistCmds).set(updates).where(eq(narratorBlacklistCmds.id, entryId));
+	return c.json({ ok: true });
+});
+
+narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
+	const entryId = c.req.param("entryId");
+	await db.delete(narratorBlacklistCmds).where(eq(narratorBlacklistCmds.id, entryId));
 	return c.json({ ok: true });
 });
