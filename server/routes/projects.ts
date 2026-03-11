@@ -28,6 +28,7 @@ import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { gitService } from "../services/git-service";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
+import { removeTabFromAllUsers } from "./user-preferences";
 
 export const projectRoutes = new Hono();
 
@@ -411,6 +412,7 @@ projectRoutes.delete("/:id", async (c) => {
 	}
 
 	await db.delete(projects).where(eq(projects.id, id));
+	await removeTabFromAllUsers("project", id);
 	if (project.proxyDomain) {
 		refreshContainerProxyCache().catch((err) => {
 			logger.warn("Failed to refresh container proxy cache after project delete", {

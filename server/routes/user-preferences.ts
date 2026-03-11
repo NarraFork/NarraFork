@@ -157,7 +157,7 @@ export async function enrichTabs(
  * Called by chapter-service when a chapter is deleted so ghost tabs don't linger.
  */
 export async function removeTabFromAllUsers(
-	tabType: "chapter" | "narrator",
+	tabType: "chapter" | "narrator" | "project",
 	tabId: string,
 ): Promise<void> {
 	const rows = db
