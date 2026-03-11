@@ -63,6 +63,7 @@ import {
 	interruptNarrator,
 	isNarratorActive,
 	regenerateFromMessage,
+	resolveAllPendingPermissions,
 	resolvePermission,
 	retryLastMessage,
 	runCustomCompact,
@@ -697,6 +698,12 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	await narratorService.updatePermissionMode(id, permissionMode);
 	await updateNarratorPermissionMode(id, permissionMode);
 
+	// When switching to bypassPermissions, auto-approve all pending permission requests
+	// for this narrator and its subagents so they don't stay stuck waiting.
+	if (permissionMode === "bypassPermissions") {
+		await resolveAllPendingPermissions(id);
+	}
+
 	// Persist synthetic tool call messages so the model sees mode transitions
 	// when context is rebuilt from message history.
 	const userId = c.get("user").sub;
@@ -867,7 +874,9 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const narrator = await narratorService.getById(id);
 	if (narrator.type === "subagent") return c.json({ ok: true });
 	if (narrator.status === "done" && !narrator.errorMessage) {
-		await narratorService.updateStatus(id, "idle");
+		// Atomic CAS: only transition done→idle if status is still "done".
+		// Avoids clobbering a "thinking" state set by a concurrent sendMessage.
+		await narratorService.compareAndSetStatus(id, "done", "idle");
 	}
 	return c.json({ ok: true });
 });
