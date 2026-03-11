@@ -807,6 +807,7 @@ export const gitService = {
 		const reader = proc.stderr.getReader();
 		const decoder = new TextDecoder();
 		let buffer = "";
+		const recentStderrLines: string[] = [];
 
 		try {
 			while (true) {
@@ -818,13 +819,21 @@ export const gitService = {
 				buffer = parts.pop() ?? "";
 				for (const part of parts) {
 					const trimmed = part.trim();
-					if (trimmed) onProgress(trimmed);
+					if (trimmed) {
+						onProgress(trimmed);
+						recentStderrLines.push(trimmed);
+						if (recentStderrLines.length > 5) recentStderrLines.shift();
+					}
 				}
 			}
 			// Flush remaining
 			const final = decoder.decode();
 			buffer += final;
-			if (buffer.trim()) onProgress(buffer.trim());
+			if (buffer.trim()) {
+				onProgress(buffer.trim());
+				recentStderrLines.push(buffer.trim());
+				if (recentStderrLines.length > 5) recentStderrLines.shift();
+			}
 		} finally {
 			reader.releaseLock();
 		}
@@ -834,7 +843,12 @@ export const gitService = {
 
 		const exitCode = await proc.exited;
 		if (exitCode !== 0) {
-			throw new GitError(`Failed to clone repo (exit code ${exitCode})`);
+			const detail =
+				recentStderrLines.find((l) => l.startsWith("fatal:")) ||
+				recentStderrLines[recentStderrLines.length - 1] ||
+				"";
+			const suffix = detail ? `: ${detail}` : "";
+			throw new GitError(`Failed to clone repo (exit code ${exitCode})${suffix}`);
 		}
 	},
 
