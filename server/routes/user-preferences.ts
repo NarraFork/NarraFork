@@ -44,6 +44,7 @@ const DEFAULTS = {
 	notifyFeishuEnabled: false,
 	notifyFeishuWebhook: "",
 	notifyFeishuSecret: "",
+	sendMode: "enter" as const,
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -287,9 +288,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
-			commands, setup_wizard_completed,
+			commands, send_mode, setup_wizard_completed,
 			created_at, updated_at
-		) VALUES (${Array(29).fill("?").join(", ")})
+		) VALUES (${Array(30).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -315,6 +316,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   notify_feishu_webhook = COALESCE(?, notify_feishu_webhook),
 		   notify_feishu_secret = COALESCE(?, notify_feishu_secret),
 		   commands = COALESCE(?, commands),
+		   send_mode = COALESCE(?, send_mode),
 		   setup_wizard_completed = COALESCE(?, setup_wizard_completed),
 		   updated_at = ?`,
 		[
@@ -345,6 +347,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
 			feishuSecret ?? DEFAULTS.notifyFeishuSecret,
 			commandsJson ?? "[]",
+			d.sendMode ?? DEFAULTS.sendMode,
 			d.setupWizardCompleted ? 1 : 0,
 			now,
 			now,
@@ -373,6 +376,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			feishuWebhook,
 			feishuSecret,
 			commandsJson,
+			d.sendMode ?? null,
 			d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
 			now,
 		],

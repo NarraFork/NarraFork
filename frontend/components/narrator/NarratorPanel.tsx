@@ -1550,9 +1550,23 @@ export function NarratorPanel({
 		// but still allow Enter to reach our send handler (CommandPopover
 		// calls stopPropagation when it consumes Enter for selection).
 		if (commandPopoverVisible && e.key !== "Enter") return;
-		if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-			e.preventDefault();
-			handleSend();
+
+		const ctrlEnterMode = (userPrefs?.sendMode ?? "enter") === "ctrl+enter";
+
+		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+			if (ctrlEnterMode) {
+				// Ctrl+Enter mode: Ctrl/Cmd+Enter sends, plain Enter inserts newline
+				if (e.ctrlKey || e.metaKey) {
+					e.preventDefault();
+					handleSend();
+				}
+			} else {
+				// Enter mode (default): Enter sends, Shift/Ctrl/Cmd+Enter inserts newline
+				if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+					e.preventDefault();
+					handleSend();
+				}
+			}
 			return;
 		}
 		// 上下箭头翻阅输入历史（仅在单行且光标在首/末位置时触发）

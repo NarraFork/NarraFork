@@ -384,6 +384,8 @@ export const updateUserPreferencesSchema = z.object({
 	notifyFeishuSecret: z.string().max(500).optional(),
 	// Slash commands
 	commands: z.array(commandSchema).max(100).optional(),
+	// Send mode
+	sendMode: z.enum(["enter", "ctrl+enter"]).optional(),
 	// Setup wizard
 	setupWizardCompleted: z.boolean().optional(),
 });

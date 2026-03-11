@@ -500,6 +500,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	commands: text("commands").notNull().default("[]"),
 	// Graph viewport positions per project (JSON: { [projectId]: { x, y, zoom } })
 	graphViewports: text("graph_viewports").notNull().default("{}"),
+	// Send mode: "enter" = Enter sends, "ctrl+enter" = Ctrl+Enter sends
+	sendMode: text("send_mode", { enum: ["enter", "ctrl+enter"] })
+		.notNull()
+		.default("enter"),
 	// Setup wizard
 	setupWizardCompleted: integer("setup_wizard_completed", { mode: "boolean" })
 		.notNull()

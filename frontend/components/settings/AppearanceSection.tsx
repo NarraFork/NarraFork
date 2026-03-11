@@ -1,4 +1,4 @@
-import { Group, Select, Slider, Stack, Switch, Text, Title } from "@mantine/core";
+import { Group, SegmentedControl, Select, Slider, Stack, Switch, Text, Title } from "@mantine/core";
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -134,6 +134,27 @@ export function AppearanceSection({
 				{t("languageSubSection")}
 			</Title>
 			<LanguageSwitcher />
+
+			{/* Input */}
+			<Title order={5} mt="sm">
+				{t("inputSubSection")}
+			</Title>
+			<Stack gap={4}>
+				<Text size="sm" fw={500}>
+					{t("sendMode")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("sendModeDesc")}
+				</Text>
+				<SegmentedControl
+					value={userPrefs?.sendMode ?? "enter"}
+					onChange={(v) => updateUserPref.mutate({ sendMode: v })}
+					data={[
+						{ value: "enter", label: t("sendModeEnter") },
+						{ value: "ctrl+enter", label: t("sendModeCtrlEnter") },
+					]}
+				/>
+			</Stack>
 		</Stack>
 	);
 }

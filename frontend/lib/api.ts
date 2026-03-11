@@ -814,6 +814,7 @@ export const api = {
 				lastVisitedAt: number;
 			}>;
 			commands: Array<{ name: string; prompt: string; description?: string }>;
+			sendMode: "enter" | "ctrl+enter";
 			setupWizardCompleted: boolean;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
@@ -843,6 +844,8 @@ export const api = {
 		notifyFeishuSecret?: string;
 		// Slash commands
 		commands?: Array<{ name: string; prompt: string; description?: string }>;
+		// Send mode
+		sendMode?: "enter" | "ctrl+enter";
 		// Setup wizard
 		setupWizardCompleted?: boolean;
 	}) =>
