@@ -1647,10 +1647,8 @@ export function NarratorPanel({
 					images.length > 0 ? images : undefined,
 				);
 				if (result?.buffered) {
-					setQueuedMessages((prev) => [
-						...prev,
-						{ id: result.id, text: msg, bufferedAt: result.bufferedAt },
-					]);
+					// Don't optimistically insert — the WS buffer_set broadcast
+					// from the server will sync the authoritative queue state.
 					scrollToBottom(true);
 				}
 			} catch {
