@@ -153,8 +153,8 @@ export async function enrichTabs(
 }
 
 /**
- * Remove a chapter (or narrator) tab from every user's recent_tabs and broadcast updated snapshots.
- * Called by chapter-service when a chapter is deleted so ghost tabs don't linger.
+ * Remove a tab (chapter, narrator, or project) from every user's recent_tabs and broadcast updated snapshots.
+ * Called when the corresponding entity is deleted so ghost tabs don't linger.
  */
 export async function removeTabFromAllUsers(
 	tabType: "chapter" | "narrator" | "project",

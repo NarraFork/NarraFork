@@ -412,7 +412,12 @@ projectRoutes.delete("/:id", async (c) => {
 	}
 
 	await db.delete(projects).where(eq(projects.id, id));
-	await removeTabFromAllUsers("project", id);
+	removeTabFromAllUsers("project", id).catch((err) => {
+		logger.warn("Failed to remove project tab from users", {
+			projectId: id,
+			error: String(err),
+		});
+	});
 	if (project.proxyDomain) {
 		refreshContainerProxyCache().catch((err) => {
 			logger.warn("Failed to refresh container proxy cache after project delete", {
