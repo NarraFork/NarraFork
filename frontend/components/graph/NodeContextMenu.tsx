@@ -15,6 +15,7 @@ interface NodeContextMenuProps {
 	};
 	onClose: () => void;
 	onFork: (nodeId: string) => void;
+	onReview: (nodeId: string) => void;
 	onSetRole: (nodeId: string, role: string) => void;
 	onDormant: (nodeId: string) => void;
 	onWake: (nodeId: string) => void;
@@ -30,6 +31,7 @@ export function NodeContextMenu({
 	nodeData,
 	onClose,
 	onFork,
+	onReview,
 	onSetRole,
 	onDormant,
 	onWake,
@@ -82,6 +84,18 @@ export function NodeContextMenu({
 							style={{ borderRadius: 4 }}
 						>
 							<Text size="sm">{t("contextMenu.revealInExplorer")}</Text>
+						</UnstyledButton>
+					)}
+					{nodeData.status === "active" && nodeData.role !== "review" && (
+						<UnstyledButton
+							px="xs"
+							py={4}
+							onClick={() => onReview(nodeId)}
+							style={{ borderRadius: 4 }}
+						>
+							<Text size="sm" c="yellow">
+								{t("contextMenu.review")}
+							</Text>
 						</UnstyledButton>
 					)}
 					{!isRoot && (

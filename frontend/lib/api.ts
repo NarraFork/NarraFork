@@ -640,6 +640,10 @@ export const api = {
 				method: "DELETE",
 			},
 		),
+	dismissErrorMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/error-messages/${messageId}`, {
+			method: "DELETE",
+		}),
 	deleteMessageBlock: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<{ ok: boolean; messageDeleted: boolean }>(
 			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}`,
@@ -1001,6 +1005,22 @@ export const api = {
 	dormantChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/dormant`, { method: "POST" }),
 	wakeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/wake`, { method: "POST" }),
 	unmergeChapter: (id: string) => request<ApiEntity>(`/chapters/${id}/unmerge`, { method: "POST" }),
+
+	// === reviews ===
+	createReview: (
+		chapterId: string,
+		data: { title?: string; locale?: string; positionX?: number; positionY?: number },
+	) =>
+		request<ApiEntity>(`/chapters/${chapterId}/review`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	convertReviewToSubagent: (reviewId: string) =>
+		request<ApiEntity>(`/reviews/${reviewId}/convert-to-subagent`, { method: "POST" }),
+	promoteReview: (reviewId: string) =>
+		request<ApiEntity>(`/reviews/${reviewId}/promote`, { method: "POST" }),
+	dismissReview: (reviewId: string) =>
+		request<ApiEntity>(`/reviews/${reviewId}/dismiss`, { method: "POST" }),
 
 	// === chapter edges ===
 	listChapterEdges: (params: { projectId?: string; chapterId?: string; type?: string }) => {

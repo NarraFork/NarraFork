@@ -12,6 +12,10 @@ export type NarraForkEvent =
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
 	| { type: "chapter:abandoned"; chapterId: string }
+	| { type: "review:created"; reviewChapterId: string; sourceChapterId: string }
+	| { type: "review:concluded"; reviewChapterId: string; sourceChapterId: string }
+	| { type: "review:converted"; reviewChapterId: string; action: "subagent" | "promote" }
+	| { type: "review:dismissed"; reviewChapterId: string }
 	| {
 			type: "chapter:split"; // TODO: not yet emitted
 			prefixChapterId: string;

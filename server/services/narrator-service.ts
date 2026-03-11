@@ -1420,6 +1420,53 @@ export const narratorService = {
 	},
 
 	/**
+	 * Dismiss a single system error message (type="error") without affecting
+	 * surrounding messages or resetting conversation state.
+	 */
+	async dismissErrorMessage(narratorId: string, messageId: string) {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) throw new NotFoundError("Message", messageId);
+
+		// Verify it's actually an error system message
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true },
+		});
+		if (
+			!msg ||
+			msg.role !== "system" ||
+			!Array.isArray(msg.contentJson) ||
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			!(msg.contentJson as any[]).some((b: any) => b.type === "error")
+		) {
+			throw new ValidationError("Message is not an error notice");
+		}
+
+		await db.transaction(async (tx) => {
+			await tx
+				.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				);
+			// Delete the message itself only if no other narrator references it
+			const otherRef = await tx.query.narratorMessageRefs.findFirst({
+				where: eq(narratorMessageRefs.messageId, messageId),
+			});
+			if (!otherRef) {
+				await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+			}
+		});
+	},
+
+	/**
 	 * Delete all messages strictly AFTER the given message (by seq order).
 	 * The target message itself is preserved.
 	 * Returns the list of deleted message IDs for WS broadcast.

@@ -224,6 +224,13 @@ export const forkChapterSchema = z.object({
 	positionY: z.number().optional(),
 });
 
+export const createReviewSchema = z.object({
+	title: z.string().min(1).max(200).optional(),
+	locale: z.enum(["en", "zh-CN"]).optional(),
+	positionX: z.number().optional(),
+	positionY: z.number().optional(),
+});
+
 export const mergeChapterSchema = z.object({
 	targetChapterId: z.string().min(1),
 	strategy: z.enum(["merge", "squash", "cherry-pick"]).optional(),

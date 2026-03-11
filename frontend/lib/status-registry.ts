@@ -37,12 +37,13 @@ const chapterStatusMap: StatusMap<ChapterStatus> = {
 // Chapter Role
 // ---------------------------------------------------------------------------
 
-export type ChapterRole = "trunk" | "branch" | "exploration";
+export type ChapterRole = "trunk" | "branch" | "exploration" | "review";
 
 const chapterRoleMap: StatusMap<ChapterRole> = {
 	trunk: { color: "indigo", icon: "🏠", i18nKey: "status.roleTrunk" },
 	branch: { color: "gray", icon: "", i18nKey: "status.roleBranch" },
 	exploration: { color: "violet", icon: "🔬", i18nKey: "status.roleExploration" },
+	review: { color: "yellow", icon: "🔍", i18nKey: "status.roleReview" },
 };
 
 // ---------------------------------------------------------------------------
@@ -113,13 +114,14 @@ const projectStatusMap: StatusMap<ProjectStatus> = {
 // Edge Type
 // ---------------------------------------------------------------------------
 
-export type EdgeType = "fork" | "merge" | "dependency" | "cherry_pick";
+export type EdgeType = "fork" | "merge" | "dependency" | "cherry_pick" | "review";
 
 const edgeTypeMap: StatusMap<EdgeType> = {
 	fork: { color: "#4c6ef5", icon: "", i18nKey: "status.edgeFork" },
 	merge: { color: "#40c057", icon: "", i18nKey: "status.edgeMerge" },
 	dependency: { color: "#fd7e14", icon: "", i18nKey: "status.edgeDependency" },
 	cherry_pick: { color: "#7950f2", icon: "", i18nKey: "status.edgeCherryPick" },
+	review: { color: "#fab005", icon: "", i18nKey: "status.edgeReview" },
 };
 
 // ---------------------------------------------------------------------------
@@ -207,6 +209,7 @@ export const CHAPTER_ROLE_ICONS: Record<string, string> = {
 	trunk: chapterRoleMap.trunk.icon,
 	branch: chapterRoleMap.branch.icon,
 	exploration: chapterRoleMap.exploration.icon,
+	review: chapterRoleMap.review.icon,
 };
 export const NARRATOR_STATUS_COLORS = colorOnly(narratorStatusMap);
 export const CONTAINER_STATUS_COLORS = colorOnly(containerStatusMap);

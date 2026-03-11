@@ -59,7 +59,7 @@ export const chapters = sqliteTable(
 			.default("active"),
 
 		// 角色（视觉和语义标签，不限制操作能力）
-		role: text("role", { enum: ["trunk", "branch", "exploration"] })
+		role: text("role", { enum: ["trunk", "branch", "exploration", "review"] })
 			.notNull()
 			.default("branch"),
 
@@ -104,6 +104,15 @@ export const chapters = sqliteTable(
 		panelWidth: real("panel_width"),
 		panelHeight: real("panel_height"),
 
+		// Review 相关
+		// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
+		reviewSourceChapterId: text("review_source_chapter_id").references((): any => chapters.id, {
+			onDelete: "set null",
+		}),
+		reviewStatus: text("review_status", {
+			enum: ["reviewing", "concluded", "converted", "dismissed"],
+		}),
+
 		lastAccessedAt: text("last_accessed_at"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -130,7 +139,7 @@ export const chapterEdges = sqliteTable(
 			.notNull()
 			.references(() => chapters.id, { onDelete: "cascade" }),
 		type: text("type", {
-			enum: ["fork", "merge", "dependency", "cherry_pick"],
+			enum: ["fork", "merge", "dependency", "cherry_pick", "review"],
 		}).notNull(),
 		metadata: text("metadata", { mode: "json" }),
 		createdAt: text("created_at").notNull(),
@@ -199,7 +208,7 @@ export const narrators = sqliteTable(
 		type: text("type", { enum: ["primary", "subagent"] })
 			.notNull()
 			.default("primary"),
-		subagentType: text("subagent_type", { enum: ["explore", "plan", "general"] }),
+		subagentType: text("subagent_type", { enum: ["explore", "plan", "general", "review"] }),
 		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()

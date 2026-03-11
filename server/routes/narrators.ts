@@ -596,6 +596,14 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	return c.json({ ok: true, ...result });
 });
 
+// Dismiss a single error system message
+narratorRoutes.delete("/:id/error-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissErrorMessage(narratorId, messageId);
+	return c.json({ ok: true });
+});
+
 // Update a compact message summary
 narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");

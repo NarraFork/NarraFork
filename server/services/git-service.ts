@@ -618,6 +618,25 @@ export const gitService = {
 	},
 
 	/**
+	 * Get diff between two refs (commits, branches, tags).
+	 * Useful for review: shows all changes between a base and head.
+	 * Truncates at maxBytes to avoid blowing up token budgets.
+	 */
+	async getDiffBetweenRefs(
+		repoPath: string,
+		baseRef: string,
+		headRef: string,
+		maxBytes = 100_000,
+	): Promise<string> {
+		const result = await exec(["diff", `${baseRef}..${headRef}`], repoPath, true);
+		if (!result.stdout) return "";
+		if (result.stdout.length > maxBytes) {
+			return `${result.stdout.slice(0, maxBytes)}\n\n[diff truncated — exceeded size limit]`;
+		}
+		return result.stdout;
+	},
+
+	/**
 	 * Get the file list for a specific commit (stats only, no diff content).
 	 * Fast even for huge commits — only runs numstat + name-status.
 	 */

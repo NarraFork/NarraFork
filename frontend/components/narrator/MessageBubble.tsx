@@ -161,7 +161,7 @@ function ErrorNotice({
 	const handleDismiss = async () => {
 		setDismissing(true);
 		try {
-			await api.deleteMessage(narratorId, messageId);
+			await api.dismissErrorMessage(narratorId, messageId);
 			onDismiss?.();
 		} catch {
 			notifications.show({

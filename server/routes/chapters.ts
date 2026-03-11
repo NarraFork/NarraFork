@@ -12,6 +12,7 @@ import {
 	batchMergeSchema,
 	containerRemoveSchema,
 	createChapterSchema,
+	createReviewSchema,
 	forkChapterSchema,
 	listCommitsSchema,
 	mergeChapterSchema,
@@ -34,6 +35,7 @@ import {
 	resolveComposeFile,
 } from "../services/container-service";
 import { gitService } from "../services/git-service";
+import { reviewService } from "../services/review-service";
 
 export const chapterRoutes = new Hono();
 
@@ -93,6 +95,18 @@ chapterRoutes.post("/:id/fork", async (c) => {
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const chapter = await chapterFork.fork(id, { ...parsed.data, locale });
+	return c.json(chapter, 201);
+});
+
+// === Review ===
+
+chapterRoutes.post("/:id/review", async (c) => {
+	const id = c.req.param("id");
+	const parsed = createReviewSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	const locale = parsed.data.locale ?? (await getUserLanguage(userId));
+	const chapter = await reviewService.createReview(id, { ...parsed.data, locale });
 	return c.json(chapter, 201);
 });
 

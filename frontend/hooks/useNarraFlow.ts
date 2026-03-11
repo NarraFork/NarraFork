@@ -30,7 +30,7 @@ export interface GraphEdge {
 	sourceHandle?: string;
 	targetHandle?: string;
 	data?: {
-		type?: "fork" | "merge" | "dependency" | "cherry_pick";
+		type?: "fork" | "merge" | "dependency" | "cherry_pick" | "review";
 		[key: string]: unknown;
 	};
 }

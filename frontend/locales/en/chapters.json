@@ -27,6 +27,18 @@
 	"forkNavigatePrompt": "Chapter \"{{title}}\" has been created. Go to its conversation?",
 	"stayHere": "Stay here",
 	"goToFork": "Go to fork",
+	"reviewStatus": {
+		"reviewing": "Reviewing",
+		"concluded": "Concluded",
+		"converted": "Converted",
+		"dismissed": "Dismissed"
+	},
+	"reviewActions": {
+		"continueChat": "Continue Chat",
+		"sendToSource": "Send to Source",
+		"promoteToChapter": "Promote to Chapter",
+		"dismiss": "Dismiss Review"
+	},
 	"mergeChapter": "Merge Chapter",
 	"mergeInto": "Merge into",
 	"selectTarget": "Select target chapter",

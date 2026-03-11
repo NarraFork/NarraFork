@@ -40,6 +40,8 @@ import { ForkEdge } from "./ForkEdge";
 import { LassoSelection } from "./LassoSelection";
 import { MergeEdge } from "./MergeEdge";
 import { NodeContextMenu } from "./NodeContextMenu";
+import { ReviewEdge } from "./ReviewEdge";
+import { ReviewNode } from "./ReviewNode";
 import type { TerminalBubble } from "./SelectionToolbar";
 import { SelectionToolbar } from "./SelectionToolbar";
 import { TerminalEdge } from "./TerminalEdge";
@@ -49,6 +51,7 @@ const nodeTypes = {
 	chapterNode: ChapterNode,
 	draftNode: DraftNode,
 	terminalNode: TerminalNode,
+	reviewNode: ReviewNode,
 };
 const edgeTypes = {
 	fork: ForkEdge,
@@ -56,6 +59,7 @@ const edgeTypes = {
 	dependency: DependencyEdge,
 	cherry_pick: CherryPickEdge,
 	terminal: TerminalEdge,
+	review: ReviewEdge,
 };
 
 interface ContextMenuState {
@@ -1317,6 +1321,26 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[spawnDraft],
 	);
 
+	const handleReview = useCallback(
+		async (nodeId: string) => {
+			setContextMenu(null);
+			try {
+				const sourceNode = nodesRef.current.find((n) => n.id === nodeId);
+				const posX = (sourceNode?.position?.x ?? 0) + 380;
+				const posY = sourceNode?.position?.y ?? 0;
+				await api.createReview(nodeId, { positionX: posX, positionY: posY });
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["graph"] });
+			} catch (err) {
+				notifications.show({
+					message: err instanceof Error ? err.message : "Failed to create review",
+					color: "red",
+				});
+			}
+		},
+		[queryClient],
+	);
+
 	const handleMergeNew = useCallback(
 		(nodeIds: string[]) => {
 			if (nodeIds.length < 2) return;
@@ -1550,6 +1574,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						nodeData={contextMenu.nodeData}
 						onClose={() => setContextMenu(null)}
 						onFork={handleFork}
+						onReview={handleReview}
 						onSetRole={handleSetRole}
 						onDormant={handleDormant}
 						onWake={handleWake}

@@ -10,6 +10,7 @@
 	"collapseNarrator": "收起对话",
 	"contextMenu": {
 		"fork": "分叉",
+		"review": "请求审查",
 		"setRole": "设置角色",
 		"role": {
 			"trunk": "主线",

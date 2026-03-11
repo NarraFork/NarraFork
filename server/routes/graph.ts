@@ -62,6 +62,8 @@ export function buildGraph(
 		panelWidth: number | null;
 		panelHeight: number | null;
 		worktreePath?: string | null;
+		reviewSourceChapterId?: string | null;
+		reviewStatus?: string | null;
 	}[],
 	narratorCounts: Map<string, number>,
 	narratorIds: Map<string, string>,
@@ -77,7 +79,7 @@ export function buildGraph(
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
 	const nodes: GraphNode[] = projectChapters.map((ch) => ({
 		id: ch.id,
-		type: "chapterNode",
+		type: ch.role === "review" ? "reviewNode" : "chapterNode",
 		data: {
 			title: ch.title,
 			status: ch.status,
@@ -98,6 +100,8 @@ export function buildGraph(
 			panelWidth: ch.panelWidth ?? null,
 			panelHeight: ch.panelHeight ?? null,
 			worktreePath: ch.worktreePath ?? null,
+			reviewSourceChapterId: ch.reviewSourceChapterId ?? null,
+			reviewStatus: ch.reviewStatus ?? null,
 		},
 		position: {
 			x: ch.positionX ?? 0,
@@ -142,6 +146,8 @@ graphRoutes.get("/:id/graph", async (c) => {
 			panelExpanded: true,
 			panelWidth: true,
 			panelHeight: true,
+			reviewSourceChapterId: true,
+			reviewStatus: true,
 		},
 	});
 

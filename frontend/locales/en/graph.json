@@ -10,6 +10,7 @@
 	"collapseNarrator": "Collapse conversation",
 	"contextMenu": {
 		"fork": "Fork",
+		"review": "Request Review",
 		"setRole": "Set Role",
 		"role": {
 			"trunk": "Trunk",

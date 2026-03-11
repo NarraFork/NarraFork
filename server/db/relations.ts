@@ -37,6 +37,12 @@ export const chaptersRelations = relations(chapters, ({ one, many }) => ({
 		relationName: "chapterParent",
 	}),
 	childChapters: many(chapters, { relationName: "chapterParent" }),
+	reviewSourceChapter: one(chapters, {
+		fields: [chapters.reviewSourceChapterId],
+		references: [chapters.id],
+		relationName: "reviewSource",
+	}),
+	reviewChapters: many(chapters, { relationName: "reviewSource" }),
 	explorationGroup: one(explorationGroups, {
 		fields: [chapters.explorationGroupId],
 		references: [explorationGroups.id],

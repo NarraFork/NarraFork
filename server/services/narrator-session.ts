@@ -51,6 +51,7 @@ import {
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
+import { reviewService } from "./review-service";
 import { snapshot } from "./snapshot";
 import { worktreeWatcher } from "./worktree-watcher";
 
@@ -88,6 +89,8 @@ interface ActiveNarrator {
 	_pruneBoundaryMessageId?: string | null;
 	/** Cached chapter ID (set when narrator is bound to an active chapter) */
 	_chapterId?: string;
+	/** Cached chapter role (trunk/branch/exploration/review) */
+	_chapterRole?: string;
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
 	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
@@ -1387,6 +1390,7 @@ async function createNarrator(
 	// Resolve CWD and cache chapter info for git tracking
 	let narratorCwd: string;
 	let narratorChapterId: string | undefined;
+	let narratorChapterRole: string | undefined;
 	let narratorWorktreePath: string | undefined;
 	let narratorBaseBranch: string | undefined;
 	let projectGitPath: string | null = null;
@@ -1403,6 +1407,7 @@ async function createNarrator(
 		if (ch.worktreePath) {
 			narratorCwd = ch.worktreePath;
 			narratorChapterId = ch.id;
+			narratorChapterRole = ch.role;
 			narratorWorktreePath = ch.worktreePath;
 			narratorBaseBranch = ch.baseBranch;
 		} else {
@@ -1470,6 +1475,7 @@ async function createNarrator(
 		_usedCompactSummary: usedCompactSummary,
 		_replyInUserLanguage: replyInUserLanguage,
 		_chapterId: narratorChapterId,
+		_chapterRole: narratorChapterRole,
 		_worktreePath: narratorWorktreePath,
 		_baseBranch: narratorBaseBranch,
 		_planFileId: planFileId,
@@ -2401,6 +2407,30 @@ async function runAgentLoop(
 				await narratorService.updateStatus(narratorId, "thinking");
 				currentText = fb.feedbackText;
 				continue;
+			}
+
+			// Review git state check — if the review narrator modified files,
+			// reset and re-inject a message to continue the loop.
+			if (active._chapterRole === "review" && active._chapterId && active.alive) {
+				const gitCheck = await reviewService.checkAndResetGitState(active._chapterId);
+				if (!gitCheck.clean && gitCheck.message) {
+					const userMsg = await narratorService.persistUserMessage(narratorId, gitCheck.message, [
+						{ type: "text", text: gitCheck.message },
+					]);
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: userMsg,
+					});
+					active.events.emit("event", { type: "user_message", data: userMsg });
+					await narratorService.updateStatus(narratorId, "thinking");
+					currentText = gitCheck.message;
+					continue;
+				}
+				// Git is clean and loop ended normally — conclude the review
+				if (!result.hasError) {
+					await reviewService.concludeReview(active._chapterId);
+				}
 			}
 
 			// Agent loop done — update status
@@ -3360,6 +3390,14 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 	if (active?.alive) {
 		active.model = model;
 		active.provider = resolveProvider(model);
+	}
+}
+
+/** Update the cached chapter role for a live narrator (e.g. after promote). */
+export function updateNarratorChapterRole(narratorId: string, role: string): void {
+	const active = activeNarrators.get(narratorId);
+	if (active) {
+		active._chapterRole = role;
 	}
 }
 

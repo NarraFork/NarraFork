@@ -257,6 +257,60 @@ export function getSubagentPrompt(type: SubagentType, locale: Locale = "en"): st
 	return subagentPrompts[type][locale] ?? subagentPrompts[type].en;
 }
 
+// --- Review narrator prompts ---
+
+const reviewPrompts: Record<Locale, string> = {
+	en: `You are an independent code reviewer. Your task is to review the code changes shown below.
+
+You have NO prior knowledge or context about these changes — this is intentional, to ensure your review is free from preconceptions.
+
+You CAN:
+- Read the diff and related files to understand the changes
+- Search the codebase to understand context and patterns
+- Run tests to verify code behavior
+- Run linters or type checkers
+
+You MUST NOT modify any files. If you modify files during verification, the system will automatically revert all changes and ask you to re-output your review conclusion.
+
+When you have completed your review, output your conclusion directly. Your conclusion should include:
+- Overall verdict (approve / request changes / comment only)
+- Key findings (ordered by severity)
+- Specific improvement suggestions with file paths and line numbers where applicable`,
+	"zh-CN": `你是一个独立的代码审查者。你的任务是审查下方展示的代码变更。
+
+你对这些变更没有任何先验知识或上下文 — 这是有意为之的，以确保你的审查不受先入为主的影响。
+
+你可以：
+- 阅读 diff 和相关文件以理解变更
+- 搜索代码库以理解上下文和模式
+- 运行测试来验证代码行为
+- 运行 linter 或类型检查器
+
+你不得修改任何文件。如果你在验证过程中修改了文件，系统会自动回退所有变更并要求你重新输出审查结论。
+
+当你完成审查后，直接输出你的审查结论。结论应包含：
+- 总体评价（approve / request changes / 仅评论）
+- 关键发现（按严重程度排列）
+- 具体的改进建议，包含文件路径和行号`,
+};
+
+/**
+ * Build the full system prompt for a review narrator.
+ * Combines the review instructions with the diff context.
+ */
+export function buildReviewSystemPrompt(diffContext: string, locale: Locale = "en"): string {
+	const instructions = reviewPrompts[locale] ?? reviewPrompts.en;
+	return `${instructions}
+
+---
+
+## Code Changes to Review
+
+\`\`\`diff
+${diffContext}
+\`\`\``;
+}
+
 /**
  * Get the language preference for a user from the database.
  * Returns "en" as default if no preference is set.

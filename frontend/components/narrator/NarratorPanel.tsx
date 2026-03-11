@@ -1899,6 +1899,8 @@ export function NarratorPanel({
 									h={60}
 									w={60}
 									fit="cover"
+									style={{ cursor: "pointer" }}
+									onClick={() => window.open(imagePreviewUrls[i], "_blank")}
 								/>
 								<CloseButton
 									size="xs"
