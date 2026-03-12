@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { clearPwaCacheAndReload } from "../lib/pwa";
 
 /**
  * Periodically checks the backend version against the frontend build version.
@@ -45,15 +46,7 @@ export function useVersionCheck(intervalMs = 5 * 60_000) {
 	}, [serverVersion]);
 
 	const refresh = useCallback(async () => {
-		try {
-			const reg = await navigator.serviceWorker?.getRegistration();
-			await reg?.unregister();
-			const keys = await caches.keys();
-			await Promise.all(keys.map((k) => caches.delete(k)));
-		} catch {
-			// proceed to reload regardless
-		}
-		window.location.reload();
+		await clearPwaCacheAndReload();
 	}, []);
 
 	const dismiss = useCallback(() => setDismissed(true), []);

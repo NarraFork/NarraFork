@@ -196,5 +196,19 @@
 	"addToFavorites": "Add to favorites",
 	"removeFromFavorites": "Remove from favorites",
 	"noFavorites": "No favorites yet",
-	"pathBarPlaceholder": "Enter path..."
+	"pathBarPlaceholder": "Enter path...",
+
+	"updateAvailable": "Update available: v{{version}}",
+	"updateSavings": "{{percent}}% smaller",
+	"updateDeltaInfo": "Delta update: {{diffBlocks}}/{{totalBlocks}} blocks changed ({{downloadSize}} of {{totalSize}})",
+	"updateDownloadTitle": "Download Update",
+	"updatePhaseChecking": "Checking for updates...",
+	"updatePhaseDownloading": "Downloading update...",
+	"updatePhaseApplying": "Verifying update...",
+	"updatePhaseComplete": "Download complete",
+	"updatePhaseError": "Download failed",
+	"updateDownloadComplete": "Update downloaded successfully!",
+	"updateApplyInstructions": "Run the following command to apply the update:",
+	"updateReadyToApply": "Update is ready. Click the button below to restart and apply.",
+	"updateApplyNow": "Restart & Apply Update"
 }

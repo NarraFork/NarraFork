@@ -85,5 +85,36 @@
 		"typescript": "^5.9.3",
 		"vite": "^6.3.0",
 		"vite-plugin-pwa": "^1.2.0"
-	}
+	},
+	"name": "narrafork",
+	"private": true,
+	"scripts": {
+		"approve": "bun server/scripts/approve-all.ts",
+		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts",
+		"build:cross": "bun scripts/build-cross-platform.ts",
+		"build:launcher": "bun scripts/build-launcher.ts",
+		"build:launcher:linux-x64": "bun scripts/build-launcher.ts --platform=linux-x64",
+		"build:linux": "bun scripts/build-cross-platform.ts --platform=linux",
+		"build:linux-arm64": "bun scripts/build-cross-platform.ts --platform=linux-arm64",
+		"build:linux-x64": "bun scripts/build-cross-platform.ts --platform=linux-x64",
+		"build:linux-x64-baseline": "bun scripts/build-cross-platform.ts --platform=linux-x64-baseline",
+		"build:macos": "bun scripts/build-cross-platform.ts --platform=darwin",
+		"build:macos-arm64": "bun scripts/build-cross-platform.ts --platform=darwin-arm64",
+		"build:macos-x64": "bun scripts/build-cross-platform.ts --platform=darwin-x64",
+		"build:windows": "bun scripts/build-cross-platform.ts --platform=windows",
+		"check": "bunx @biomejs/biome check .",
+		"db:generate": "bunx drizzle-kit generate",
+		"db:migrate": "bun server/db/migrate.ts",
+		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
+		"dev:all": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts \u0026 bunx vite --config frontend/vite.config.ts \u0026 wait",
+		"dev:cold": "bun run db:migrate; PORT=7779 bun run server/index.ts \u0026 bunx vite --config frontend/vite.config.ts \u0026 wait",
+		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
+		"format": "bunx @biomejs/biome check --write .",
+		"start": "NODE_ENV=production bun run db:migrate \u0026\u0026 NODE_ENV=production bun server/index.ts",
+		"start:dev": "NODE_ENV=production bun run db:migrate \u0026\u0026 (NODE_ENV=production bun server/index.ts \u0026) \u0026\u0026 VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts",
+		"test": "bun test",
+		"test:watch": "bun test --watch"
+	},
+	"type": "module",
+	"version": "0.0.8"
 }
