@@ -206,5 +206,7 @@
 	"updatePhaseComplete": "下载完成",
 	"updatePhaseError": "下载失败",
 	"updateDownloadComplete": "更新下载成功！",
-	"updateApplyInstructions": "运行以下命令应用更新："
+	"updateApplyInstructions": "运行以下命令应用更新：",
+	"updateReadyToApply": "更新已就绪，点击下方按钮重启并应用。",
+	"updateApplyNow": "重启并应用更新"
 }

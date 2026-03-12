@@ -1711,9 +1711,13 @@ export const api = {
 			totalBlocks?: number;
 		}>("/update/check"),
 	getUpdateVersion: () =>
-		request<{ version: string; platform: string; arch: string }>("/update/version"),
+		request<{ version: string; platform: string; arch: string; canHotRestart: boolean }>(
+			"/update/version",
+		),
 	getUpdateDirectory: () => request<{ directory: string }>("/update/directory"),
 	cleanupUpdates: () => request<{ success: boolean }>("/update/cleanup", { method: "POST" }),
+	restartForUpdate: () =>
+		request<{ success: boolean; error?: string }>("/update/restart", { method: "POST" }),
 };
 
 	text: string,

@@ -736,3 +736,66 @@ export function cleanupOldUpdates(): void {
 		} catch {}
 	}
 }
+
+/**
+ * Check if running under launcher (supports hot restart)
+ */
+export function isRunningUnderLauncher(): boolean {
+	return !!process.env.NARRAFORK_LAUNCHER_PID;
+}
+
+/**
+ * Request launcher to restart with new version
+ */
+export function requestRestart(): boolean {
+	if (!isRunningUnderLauncher()) {
+		logger.warn("Cannot request restart: not running under launcher");
+		return false;
+	}
+
+	try {
+		// Send IPC message to launcher
+		if (process.send) {
+			process.send({ type: "restart" });
+			logger.info("Restart request sent to launcher");
+			return true;
+		}
+	} catch (err) {
+		logger.error("Failed to send restart request", { error: String(err) });
+	}
+
+	return false;
+}
+
+/**
+ * Apply update and restart (for launcher mode)
+ */
+export async function applyUpdateAndRestart(): Promise<{ success: boolean; error?: string }> {
+	if (!isRunningUnderLauncher()) {
+		return {
+			success: false,
+			error: "Hot restart only available when running under launcher",
+		};
+	}
+
+	// Check if update is downloaded
+	if (!existsSync(UPDATE_DIR)) {
+		return { success: false, error: "No update downloaded" };
+	}
+
+	const files = require("node:fs").readdirSync(UPDATE_DIR) as string[];
+	const updateFile = files.find(
+		(f: string) => f.startsWith("narrafork-") && !f.endsWith(".blockmap") && !f.endsWith(".tmp"),
+	);
+
+	if (!updateFile) {
+		return { success: false, error: "No update file found" };
+	}
+
+	// Request restart - launcher will apply the update
+	if (requestRestart()) {
+		return { success: true };
+	}
+
+	return { success: false, error: "Failed to request restart" };
+}

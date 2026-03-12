@@ -206,5 +206,7 @@
 	"updatePhaseComplete": "Download complete",
 	"updatePhaseError": "Download failed",
 	"updateDownloadComplete": "Update downloaded successfully!",
-	"updateApplyInstructions": "Run the following command to apply the update:"
+	"updateApplyInstructions": "Run the following command to apply the update:",
+	"updateReadyToApply": "Update is ready. Click the button below to restart and apply.",
+	"updateApplyNow": "Restart & Apply Update"
 }

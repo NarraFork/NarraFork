@@ -12,9 +12,21 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconCheck, IconCopy, IconDownload, IconRocket, IconX } from "@tabler/icons-react";
+import {
+	IconCheck,
+	IconCopy,
+	IconDownload,
+	IconRefresh,
+	IconRocket,
+	IconX,
+} from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
-import { useUpdateCheck, useUpdateDownload } from "../hooks/useUpdateCheck";
+import {
+	useUpdateCheck,
+	useUpdateDownload,
+	useUpdateRestart,
+	useUpdateVersion,
+} from "../hooks/useUpdateCheck";
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
@@ -37,13 +49,24 @@ export function UpdateAvailableBanner() {
 	} = useUpdateCheck();
 
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
+	const { data: versionInfo } = useUpdateVersion();
+	const { restart, isRestarting } = useUpdateRestart();
 
 	if (!updateAvailable) return null;
+
+	const canHotRestart = versionInfo?.canHotRestart ?? false;
 
 	const handleDownload = () => {
 		if (releaseInfo) {
 			open();
 			download(releaseInfo);
+		}
+	};
+
+	const handleRestart = async () => {
+		const result = await restart();
+		if (!result.success) {
+			// Show error - the manual instructions will be displayed
 		}
 	};
 
@@ -148,28 +171,45 @@ export function UpdateAvailableBanner() {
 								{t("updateDownloadComplete")}
 							</Alert>
 
-							<Text size="sm">{t("updateApplyInstructions")}</Text>
+							{canHotRestart ? (
+								<>
+									<Text size="sm">{t("updateReadyToApply")}</Text>
+									<Button
+										fullWidth
+										color="indigo"
+										leftSection={<IconRefresh size={16} />}
+										onClick={handleRestart}
+										loading={isRestarting}
+									>
+										{t("updateApplyNow")}
+									</Button>
+								</>
+							) : (
+								<>
+									<Text size="sm">{t("updateApplyInstructions")}</Text>
 
-							{result.instructions.command && (
-								<Group gap="xs" align="flex-start">
-									<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
-										{result.instructions.command}
-									</Code>
-									<CopyButton value={result.instructions.command}>
-										{({ copied, copy }) => (
-											<Tooltip label={copied ? t("copied") : t("copy")}>
-												<Button
-													size="xs"
-													variant="subtle"
-													color={copied ? "green" : "gray"}
-													onClick={copy}
-												>
-													{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-												</Button>
-											</Tooltip>
-										)}
-									</CopyButton>
-								</Group>
+									{result.instructions.command && (
+										<Group gap="xs" align="flex-start">
+											<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+												{result.instructions.command}
+											</Code>
+											<CopyButton value={result.instructions.command}>
+												{({ copied, copy }) => (
+													<Tooltip label={copied ? t("copied") : t("copy")}>
+														<Button
+															size="xs"
+															variant="subtle"
+															color={copied ? "green" : "gray"}
+															onClick={copy}
+														>
+															{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+														</Button>
+													</Tooltip>
+												)}
+											</CopyButton>
+										</Group>
+									)}
+								</>
 							)}
 						</Stack>
 					)}

@@ -5,11 +5,13 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { APP_VERSION } from "../lib/version";
 import {
+	applyUpdateAndRestart,
 	checkForUpdate,
 	cleanupOldUpdates,
 	downloadUpdate,
 	getUpdateDirectory,
 	getUpdateInstructions,
+	isRunningUnderLauncher,
 	type UpdateProgress,
 } from "../services/update-service";
 
@@ -33,6 +35,7 @@ updateRoutes.get("/version", (c) => {
 		version: APP_VERSION,
 		platform: process.platform,
 		arch: process.arch,
+		canHotRestart: isRunningUnderLauncher(),
 	});
 });
 
@@ -95,4 +98,31 @@ updateRoutes.post("/cleanup", (c) => {
  */
 updateRoutes.get("/directory", (c) => {
 	return c.json({ directory: getUpdateDirectory() });
+});
+
+/**
+ * POST /api/update/restart
+ * Apply downloaded update and restart (launcher mode only).
+ */
+updateRoutes.post("/restart", async (c) => {
+	if (!isRunningUnderLauncher()) {
+		return c.json(
+			{
+				success: false,
+				error: "Hot restart only available when running under launcher. Please restart manually.",
+			},
+			400,
+		);
+	}
+
+	const result = await applyUpdateAndRestart();
+
+	if (result.success) {
+		// Give time for response to be sent before restart
+		setTimeout(() => {
+			process.exit(0);
+		}, 100);
+	}
+
+	return c.json(result);
 });

@@ -179,3 +179,33 @@ export function useUpdateCleanup() {
 		},
 	});
 }
+
+export function useUpdateVersion() {
+	return useQuery({
+		queryKey: ["update-version"],
+		queryFn: () => api.getUpdateVersion(),
+		staleTime: Number.POSITIVE_INFINITY,
+	});
+}
+
+export function useUpdateRestart() {
+	const [isRestarting, setIsRestarting] = useState(false);
+
+	const restart = useCallback(async () => {
+		setIsRestarting(true);
+		try {
+			const result = await api.restartForUpdate();
+			if (!result.success) {
+				setIsRestarting(false);
+				return result;
+			}
+			// Server will restart, page will reload automatically when connection is lost
+			return result;
+		} catch (err) {
+			setIsRestarting(false);
+			return { success: false, error: String(err) };
+		}
+	}, []);
+
+	return { restart, isRestarting };
+}
