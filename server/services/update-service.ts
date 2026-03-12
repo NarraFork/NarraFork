@@ -103,16 +103,43 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 	const platform = getPlatform();
 
 	try {
-		const checkUrl = `${serverUrl}/api/check/${channel}?platform=${platform}`;
+		// Support both old API (/api/check/) and new API (/api/v1/{product}/check/)
+		const product = settings.update?.product ?? "narrafork";
+		let checkUrl: string;
+
+		// Try new API format first
+		if (serverUrl.includes("/api/v1/")) {
+			checkUrl = `${serverUrl}/check/${channel}?platform=${platform}&version=${APP_VERSION}`;
+		} else {
+			// New server with product support
+			checkUrl = `${serverUrl}/api/v1/${product}/check/${channel}?platform=${platform}&version=${APP_VERSION}`;
+		}
+
 		logger.debug("Checking for updates", { url: checkUrl });
 
-		const response = await fetch(checkUrl);
+		let response = await fetch(checkUrl);
+
+		// Fallback to legacy API if new API fails
+		if (!response.ok && response.status === 404) {
+			const legacyUrl = `${serverUrl}/api/check/${channel}?platform=${platform}`;
+			logger.debug("Trying legacy API", { url: legacyUrl });
+			response = await fetch(legacyUrl);
+		}
+
 		if (!response.ok) {
 			logger.warn("Update check failed", { status: response.status });
 			return { updateAvailable: false, currentVersion: APP_VERSION };
 		}
 
-		const releaseInfo = (await response.json()) as ReleaseInfo;
+		// Handle new API response format
+		const data = (await response.json()) as ReleaseInfo & { updateAvailable?: boolean };
+
+		// New API returns updateAvailable field
+		if (data.updateAvailable === false) {
+			return { updateAvailable: false, currentVersion: APP_VERSION };
+		}
+
+		const releaseInfo = data;
 		const latestVersion = releaseInfo.version;
 
 		if (!latestVersion || latestVersion === APP_VERSION) {
@@ -213,7 +240,17 @@ export async function downloadUpdate(
 	}
 
 	const channel = settings.update?.channel ?? "stable";
+	const product = settings.update?.product ?? "narrafork";
 	const execPath = getCurrentExecutablePath();
+
+	// Build download base URL (support both old and new API)
+	let downloadBaseUrl: string;
+	if (serverUrl.includes("/api/v1/")) {
+		downloadBaseUrl = `${serverUrl}/download/${channel}/${releaseInfo.version}`;
+	} else {
+		// Try new API format
+		downloadBaseUrl = `${serverUrl}/api/v1/${product}/download/${channel}/${releaseInfo.version}`;
+	}
 
 	// Ensure update directory exists
 	mkdirSync(UPDATE_DIR, { recursive: true });
@@ -238,32 +275,43 @@ export async function downloadUpdate(
 		if (execPath && existsSync(execPath)) {
 			try {
 				// Download new blockmap
-				const blockmapUrl = `${serverUrl}/${channel}/${releaseInfo.path}.blockmap`;
+				const blockmapUrl = `${downloadBaseUrl}/${releaseInfo.path}.blockmap`;
 				const blockmapResponse = await fetch(blockmapUrl);
+
+				// Fallback to legacy URL if new API fails
+				let blockmapBuffer: Buffer;
 				if (blockmapResponse.ok) {
-					const blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
-					newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
-
-					// Generate local blockmap
-					const localResult = await generateBlockmap(execPath);
-					localBlockmap = localResult.blockmap;
-
-					// Calculate diff
-					diff = calculateDiff(localBlockmap, newBlockmap);
-					const diffSize = calculateDiffSize(diff);
-					const totalSize = calculateTotalSize(newBlockmap);
-
-					// Use delta if it saves at least 20% of download
-					if (diffSize < totalSize * 0.8) {
-						useDelta = true;
-						logger.info("Using delta update", {
-							diffBlocks: diff.length,
-							totalBlocks: newBlockmap.files[0]?.checksums.length,
-							diffSize,
-							totalSize,
-							savings: `${Math.round((1 - diffSize / totalSize) * 100)}%`,
-						});
+					blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
+				} else {
+					const legacyUrl = `${serverUrl}/${channel}/${releaseInfo.path}.blockmap`;
+					const legacyResponse = await fetch(legacyUrl);
+					if (!legacyResponse.ok) {
+						throw new Error("Blockmap not available");
 					}
+					blockmapBuffer = Buffer.from(await legacyResponse.arrayBuffer());
+				}
+
+				newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
+
+				// Generate local blockmap
+				const localResult = await generateBlockmap(execPath);
+				localBlockmap = localResult.blockmap;
+
+				// Calculate diff
+				diff = calculateDiff(localBlockmap, newBlockmap);
+				const diffSize = calculateDiffSize(diff);
+				const totalSize = calculateTotalSize(newBlockmap);
+
+				// Use delta if it saves at least 20% of download
+				if (diffSize < totalSize * 0.8) {
+					useDelta = true;
+					logger.info("Using delta update", {
+						diffBlocks: diff.length,
+						totalBlocks: newBlockmap.files[0]?.checksums.length,
+						diffSize,
+						totalSize,
+						savings: `${Math.round((1 - diffSize / totalSize) * 100)}%`,
+					});
 				}
 			} catch (err) {
 				logger.debug("Delta update not available, falling back to full download", {
@@ -272,11 +320,15 @@ export async function downloadUpdate(
 			}
 		}
 
+		// Build file download URL
+		const fileDownloadUrl = `${downloadBaseUrl}/${releaseInfo.path}`;
+		const legacyFileUrl = `${serverUrl}/${channel}/${releaseInfo.path}`;
+
 		if (useDelta && newBlockmap && localBlockmap && diff.length > 0 && execPath) {
 			// Delta download
 			await downloadDelta(
 				execPath,
-				`${serverUrl}/${channel}/${releaseInfo.path}`,
+				fileDownloadUrl,
 				tempPath,
 				localBlockmap,
 				newBlockmap,
@@ -284,12 +336,13 @@ export async function downloadUpdate(
 				onProgress,
 			);
 		} else {
-			// Full download
+			// Full download - try new API first, fallback to legacy
 			await downloadFull(
-				`${serverUrl}/${channel}/${releaseInfo.path}`,
+				fileDownloadUrl,
 				tempPath,
 				releaseInfo.files[0]?.size ?? 0,
 				onProgress,
+				legacyFileUrl,
 			);
 		}
 
@@ -560,8 +613,15 @@ async function downloadFull(
 	outputPath: string,
 	totalSize: number,
 	onProgress?: (progress: UpdateProgress) => void,
+	fallbackUrl?: string,
 ): Promise<void> {
-	const response = await fetch(url);
+	let response = await fetch(url);
+
+	// Try fallback URL if primary fails
+	if (!response.ok && fallbackUrl) {
+		response = await fetch(fallbackUrl);
+	}
+
 	if (!response.ok) {
 		throw new Error(`Download failed: ${response.status}`);
 	}

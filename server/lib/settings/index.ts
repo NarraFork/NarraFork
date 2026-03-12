@@ -211,6 +211,8 @@ export interface NarraForkSettings {
 	update?: {
 		/** Update server URL. */
 		serverUrl: string;
+		/** Product ID for multi-product update servers. */
+		product: string;
 		/** Update channel: stable or beta. */
 		channel: "stable" | "beta";
 		/** Auto-check interval in minutes (0 to disable). */
@@ -272,6 +274,7 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	update: {
 		serverUrl: "",
+		product: "narrafork",
 		channel: "stable",
 		checkIntervalMinutes: 60,
 		autoDownload: false,
