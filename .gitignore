@@ -18,3 +18,4 @@ analyze2/
 *.heapsnapshot
 script/
 scripts/
+.release.local.json
