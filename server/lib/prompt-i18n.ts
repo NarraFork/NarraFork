@@ -624,44 +624,6 @@ export function getTodoSystemReminder(locale: Locale = "en"): string {
 	return todoSystemReminder[locale] ?? todoSystemReminder.en;
 }
 
-// --- Auto-commit threshold messages (injected into chat history) ---
-
-const autoCommitMessages = {
-	/** Reminder injected when uncommitted changes exceed the soft threshold. */
-	commitReminder: {
-		en: `<system-reminder>
-⚠️ You have a large number of uncommitted changes ({linesAdded} lines added, {linesRemoved} lines removed across {filesChanged} files). Please organize your work and make a commit soon to avoid losing progress. Use git add and git commit to save your changes.
-</system-reminder>`,
-		"zh-CN": `<system-reminder>
-⚠️ 你有大量未提交的修改（{filesChanged} 个文件，新增 {linesAdded} 行，删除 {linesRemoved} 行）。请尽快梳理并提交一次，以免丢失进度。使用 git add 和 git commit 保存你的修改。
-</system-reminder>`,
-	},
-	/** System message recorded after a forced auto-commit (threshold exceeded). */
-	forceCommitted: {
-		en: `[Auto-commit] Uncommitted changes exceeded the safety threshold ({linesAdded}+ / {linesRemoved}− across {filesChanged} files). NarraFork automatically committed: {commitSha} — "{commitMessage}"`,
-		"zh-CN": `[自动提交] 未提交修改超过安全阈值（{filesChanged} 个文件，+{linesAdded} / −{linesRemoved} 行）。NarraFork 已自动提交：{commitSha} — "{commitMessage}"`,
-	},
-	/** System message recorded after an end-of-turn auto-commit. */
-	turnEndCommitted: {
-		en: `[Auto-commit] NarraFork committed remaining changes at end of turn: {commitSha} — "{commitMessage}"`,
-		"zh-CN": `[自动提交] NarraFork 在轮次结束时提交了剩余修改：{commitSha} — "{commitMessage}"`,
-	},
-} satisfies Record<string, Record<Locale, string>>;
-
-export type AutoCommitMessageKey = keyof typeof autoCommitMessages;
-
-export function getAutoCommitMessage(
-	key: AutoCommitMessageKey,
-	locale: Locale = "en",
-	params: Record<string, string | number> = {},
-): string {
-	let msg = autoCommitMessages[key][locale] ?? autoCommitMessages[key].en;
-	for (const [k, v] of Object.entries(params)) {
-		msg = msg.replaceAll(`{${k}}`, String(v));
-	}
-	return msg;
-}
-
 // --- Merge summary labels (used in merge-summary-service) ---
 
 const mergeSummaryLabels = {

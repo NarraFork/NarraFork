@@ -164,29 +164,6 @@ export type NarraForkEvent =
 			narratorId: string | null;
 			chapterId: string | null;
 	  }
-	// Auto-commit
-	| {
-			type: "narrator:auto_commit";
-			narratorId: string;
-			chapterId: string;
-			commitSha: string;
-			message: string;
-	  }
-	| {
-			type: "narrator:commit_reminder";
-			narratorId: string;
-			chapterId: string;
-			linesAdded: number;
-			linesRemoved: number;
-			filesChanged: number;
-	  }
-	| {
-			type: "narrator:force_commit";
-			narratorId: string;
-			chapterId: string;
-			commitSha: string;
-			message: string;
-	  }
 	// MCP server lifecycle
 	| { type: "mcp:server_connected"; serverId: string; name: string; toolCount: number }
 	| { type: "mcp:server_disconnected"; serverId: string; name: string; reason?: string }

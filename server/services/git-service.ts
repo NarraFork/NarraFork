@@ -259,6 +259,16 @@ export const gitService = {
 		return result.exitCode === 0;
 	},
 
+	/**
+	 * Get the content of a file at HEAD (last committed version).
+	 * Returns null if the file is not tracked or HEAD doesn't exist.
+	 */
+	async getFileAtHead(cwd: string, filePath: string): Promise<string | null> {
+		const result = await exec(["show", `HEAD:${filePath}`], cwd, true);
+		if (result.exitCode !== 0) return null;
+		return result.stdout;
+	},
+
 	async getHeadCommit(repoPath: string): Promise<string> {
 		const result = await exec(["rev-parse", "HEAD"], repoPath);
 		if (result.exitCode !== 0) throw new GitError(`Failed to get HEAD commit: ${result.stderr}`);

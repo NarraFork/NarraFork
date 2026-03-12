@@ -6,16 +6,9 @@ import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
-import { checkCommitThresholds } from "./narrator-auto-commit";
 
 /** Debounce interval for file change events (ms). */
 const DEBOUNCE_MS = 1500;
-
-/** Minimum interval between commit threshold checks per narrator (ms). */
-const THRESHOLD_CHECK_INTERVAL_MS = 10_000;
-
-/** Tracks last threshold check time per narrator to avoid excessive checks. */
-const lastThresholdCheck = new Map<string, number>();
 
 /**
  * Patterns to ignore when receiving fs.watch events.
@@ -120,7 +113,6 @@ export const worktreeWatcher = {
 		if (!entry) return;
 
 		entry.narratorIds.delete(narratorId);
-		lastThresholdCheck.delete(narratorId);
 		if (entry.narratorIds.size === 0) {
 			this._removeEntry(worktreePath);
 			logger.info("Worktree watcher stopped (no narrators left)", { worktreePath });
@@ -192,27 +184,6 @@ export const worktreeWatcher = {
 				linesAdded: lineStats.added,
 				linesRemoved: lineStats.removed,
 			});
-		}
-
-		// Check commit thresholds for each narrator (rate-limited)
-		const filesChanged = statusSummary.staged + statusSummary.unstaged + statusSummary.untracked;
-		if (filesChanged > 0) {
-			const now = Date.now();
-			for (const narratorId of narratorIds) {
-				const lastCheck = lastThresholdCheck.get(narratorId) ?? 0;
-				if (now - lastCheck < THRESHOLD_CHECK_INTERVAL_MS) continue;
-				lastThresholdCheck.set(narratorId, now);
-				checkCommitThresholds(narratorId, chapterId, worktreePath, locale, {
-					linesAdded: lineStats.added,
-					linesRemoved: lineStats.removed,
-					filesChanged,
-				}).catch((err) => {
-					logger.debug("Commit threshold check failed (watcher)", {
-						narratorId,
-						error: String(err),
-					});
-				});
-			}
 		}
 
 		// Detect new commits (HEAD changed)

@@ -543,7 +543,26 @@ export const userFavoriteDirectories = sqliteTable(
 	(table) => [index("idx_fav_dirs_user").on(table.userId, table.sortOrder)],
 );
 
-// === narrator_patches (snapshot tracking) ===
+// === narrator_file_snapshots (per-file original content tracking) ===
+export const narratorFileSnapshots = sqliteTable(
+	"narrator_file_snapshots",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		filePath: text("file_path").notNull(),
+		originalContent: text("original_content"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_file_snapshots_narrator").on(table.narratorId),
+		uniqueIndex("idx_file_snapshots_narrator_file").on(table.narratorId, table.filePath),
+	],
+);
+
+// === narrator_patches (DEPRECATED — replaced by narrator_file_snapshots) ===
+// Kept for backward compatibility with existing databases. No longer written to.
 export const narratorPatches = sqliteTable(
 	"narrator_patches",
 	{

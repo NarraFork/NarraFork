@@ -10,7 +10,6 @@ import {
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
-	narratorPatches,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -36,11 +35,7 @@ import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
-import {
-	autoCommitIfNeeded,
-	checkCommitThresholds,
-	clearCommitReminderTracking,
-} from "./narrator-auto-commit";
+
 import { narratorContext } from "./narrator-context";
 import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
@@ -54,13 +49,27 @@ import {
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
-import { snapshot } from "./snapshot";
+
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state ===
 
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
+
+/** Parse `git status --porcelain` output into a set of file paths. */
+function parsePorcelainFiles(output: string): Set<string> {
+	const files = new Set<string>();
+	for (const line of output.split("\n")) {
+		if (line.length < 4) continue;
+		// Porcelain format: XY filename  (or XY orig -> renamed)
+		const filePart = line.slice(3);
+		// Handle renames: "old -> new"
+		const arrowIdx = filePart.indexOf(" -> ");
+		files.add(arrowIdx >= 0 ? filePart.slice(arrowIdx + 4) : filePart);
+	}
+	return files;
+}
 
 
 interface ActiveNarrator {
@@ -105,10 +114,10 @@ interface ActiveNarrator {
 	_gitTrackTimer?: ReturnType<typeof setTimeout>;
 	/** ID of the partial assistant message being incrementally built via block_complete events */
 	_partialMessageId?: string;
-	/** Cached init promise for the shadow snapshot repo (ensures single init) */
-	_snapshotInitPromise?: Promise<void>;
-	/** Per-tool-call before-hash promise cache: toolUseId → Promise<tree hash> */
-	_snapshotBeforeHashes?: Map<string, Promise<string>>;
+	/** Per-tool-call before git status cache: toolUseId → Promise<Set<filePath>> (Bash snapshot) */
+	_bashBeforeStatus?: Map<string, Promise<Set<string>>>;
+	/** Whether the narrator's cwd is inside a git repo (enables Bash file tracking) */
+	_isInGitRepo?: boolean;
 	/** Cached project git path (for skill loading) */
 	_projectGitPath?: string | null;
 	/** Resolved skill scan root (projectGitPath or git root from cwd) */
@@ -1660,6 +1669,17 @@ async function createNarrator(
 		// Skill root resolution failure is non-fatal
 	}
 
+	// For standalone narrators, only enable Bash git-status-based file tracking
+	// if cwd is inside a git repo. This prevents running `git status` on non-repo dirs.
+	let narratorIsInGitRepo = !!narratorChapterId;
+	if (!narratorChapterId) {
+		try {
+			narratorIsInGitRepo = await gitService.isGitRepo(narratorCwd);
+		} catch {
+			// Non-fatal — Bash file tracking just won't be enabled
+		}
+	}
+
 	const abortController = new AbortController();
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
@@ -1683,6 +1703,7 @@ async function createNarrator(
 		_chapterRole: narratorChapterRole,
 		_worktreePath: narratorWorktreePath,
 		_baseBranch: narratorBaseBranch,
+		_isInGitRepo: narratorIsInGitRepo,
 		_planFileId: planFileId,
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
@@ -2222,22 +2243,6 @@ async function runAgentLoop(
 												linesAdded: lines.added,
 												linesRemoved: lines.removed,
 											});
-
-											// Check commit thresholds (reminder / force-commit)
-											const filesChanged =
-												gitStatus.staged + gitStatus.unstaged + gitStatus.untracked;
-											if (filesChanged > 0) {
-												checkCommitThresholds(narratorId, chapterId, worktreePath, locale, {
-													linesAdded: lines.added,
-													linesRemoved: lines.removed,
-													filesChanged,
-												}).catch((err) => {
-													logger.debug("Commit threshold check failed", {
-														narratorId,
-														error: String(err),
-													});
-												});
-											}
 										},
 										(err) => {
 											logger.debug("Git status tracking failed", {
@@ -2249,87 +2254,83 @@ async function runAgentLoop(
 								}, 800);
 							}
 						: undefined,
-				onSnapshotBefore:
-					active._worktreePath && active._chapterId
-						? (toolUseId, toolName) => {
-								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-								const chapterId = active._chapterId as string;
-								const worktreePath = active._worktreePath as string;
+				onSnapshotBefore: active._isInGitRepo
+					? (toolUseId, toolName) => {
+							// Only Bash needs before/after git status diff.
+							// Write/Edit record snapshots directly in their execute().
+							if (toolName !== SHELL_TOOL_NAME) return;
 
-								if (!active._snapshotBeforeHashes) {
-									active._snapshotBeforeHashes = new Map();
-								}
+							if (!active._bashBeforeStatus) {
+								active._bashBeforeStatus = new Map();
+							}
 
-								// Chain: ensure init completes before track (cached promise avoids concurrent inits).
-								// If init rejects, clear the cache so the next tool call retries.
-								if (!active._snapshotInitPromise) {
-									active._snapshotInitPromise = snapshot
-										.init(chapterId, worktreePath)
-										.catch((err) => {
-											active._snapshotInitPromise = undefined;
-											throw err;
+							const statusPromise = gitService
+								.getStatus(active.cwd)
+								.then((output) => parsePorcelainFiles(output));
+
+							active._bashBeforeStatus.set(toolUseId, statusPromise);
+
+							// Swallow errors so the unhandled-rejection handler stays quiet
+							statusPromise.catch((err) =>
+								logger.debug("Bash before-status failed", {
+									narratorId,
+									toolUseId,
+									error: String(err),
+								}),
+							);
+						}
+					: undefined,
+				onSnapshotAfter: active._isInGitRepo
+					? (toolUseId, toolName) => {
+							// Only Bash needs before/after git status diff
+							if (toolName !== SHELL_TOOL_NAME) return;
+
+							const beforePromise = active._bashBeforeStatus?.get(toolUseId);
+							if (!beforePromise) return;
+							active._bashBeforeStatus?.delete(toolUseId);
+
+							// Fire-and-forget: diff before/after status, snapshot new/changed files
+							beforePromise
+								.then(async (beforeFiles) => {
+									const afterOutput = await gitService.getStatus(active.cwd);
+									const afterFiles = parsePorcelainFiles(afterOutput);
+
+									// Find files that are new or changed (in after but not in before)
+									const changedFiles: string[] = [];
+									for (const f of afterFiles) {
+										if (!beforeFiles.has(f)) {
+											changedFiles.push(f);
+										}
+									}
+									if (changedFiles.length === 0) return;
+
+									// Record snapshots for changed files.
+									// For Bash, we use `git show HEAD:<path>` to recover the last
+									// committed version as the "original" content. This covers the
+									// common case of Bash modifying tracked files. For untracked
+									// files (truly new), originalContent will be null.
+									const { ensureFileSnapshot } = await import("./file-snapshot-service");
+									const cwd = active.cwd;
+									for (const filePath of changedFiles) {
+										await ensureFileSnapshot(narratorId, filePath, async () => {
+											// Try to get the last committed version of this file
+											try {
+												return await gitService.getFileAtHead(cwd, filePath);
+											} catch {
+												return null;
+											}
 										});
-								}
-								const ready = active._snapshotInitPromise;
-
-								const trackPromise = ready.then(() => snapshot.track(chapterId, worktreePath));
-
-								active._snapshotBeforeHashes?.set(toolUseId, trackPromise);
-
-								// Swallow errors so the unhandled-rejection handler stays quiet
-								trackPromise.catch((err) =>
-									logger.debug("Snapshot track (before) failed", {
+									}
+								})
+								.catch((err) =>
+									logger.debug("Bash after-status snapshot failed", {
 										narratorId,
 										toolUseId,
 										error: String(err),
 									}),
 								);
-							}
-						: undefined,
-				onSnapshotAfter:
-					active._worktreePath && active._chapterId
-						? (toolUseId, toolName) => {
-								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-								const chapterId = active._chapterId as string;
-								const worktreePath = active._worktreePath as string;
-								const messageId = active._partialMessageId;
-
-								const beforePromise = active._snapshotBeforeHashes?.get(toolUseId);
-								if (!beforePromise || !messageId) return;
-								active._snapshotBeforeHashes?.delete(toolUseId);
-
-								// Await the before-hash, then capture after-hash (fire-and-forget)
-								beforePromise
-									.then(async (beforeHash) => {
-										const afterHash = await snapshot.track(chapterId, worktreePath);
-										if (afterHash === beforeHash) return;
-										const files = await snapshot.diffFiles(
-											chapterId,
-											worktreePath,
-											beforeHash,
-											afterHash,
-										);
-										if (files.length === 0) return;
-										await db.insert(narratorPatches).values({
-											id: generateShortId(),
-											narratorId,
-											messageId,
-											toolUseId,
-											beforeHash,
-											afterHash,
-											filesJson: files,
-											createdAt: new Date().toISOString(),
-										});
-									})
-									.catch((err) =>
-										logger.debug("Snapshot track (after) failed", {
-											narratorId,
-											toolUseId,
-											error: String(err),
-										}),
-									);
-							}
-						: undefined,
+						}
+					: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message) => {
 					// Clean up partial message
@@ -2774,19 +2775,6 @@ async function runAgentLoop(
 				await narratorService.compareAndSetStatus(narratorId, ["thinking", "waiting"], "done");
 			}
 
-			// No chained message — auto-commit before finishing
-			if (active._worktreePath && active._chapterId) {
-				await autoCommitIfNeeded(
-					narratorId,
-					active._chapterId,
-					active._worktreePath,
-					locale,
-					// _partialMessageId is the last assistant message built during this turn;
-					// may be undefined if the turn produced no assistant output (e.g. error path)
-					active._partialMessageId,
-				);
-			}
-
 			active.events.emit("event", { type: "done", data: null });
 			break;
 		}
@@ -2799,7 +2787,6 @@ async function runAgentLoop(
 	} finally {
 		active.alive = false;
 		if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-		clearCommitReminderTracking(narratorId);
 		// Stop file watcher for this narrator
 		if (active._worktreePath) {
 			worktreeWatcher.unwatch(active._worktreePath, narratorId);
@@ -3325,42 +3312,13 @@ export async function editAndRegenerate(
 		throw new NotFoundError("Can only edit user messages", messageId);
 	}
 
-	// If rollback requested, try to reset git to the commit before this message
+	// File rollback is now handled automatically by deleteMessagesAfter via snapshot revert.
+	// The `rollback` parameter is kept for API compatibility but is no longer needed —
+	// snapshot-based revert is always applied when messages with file changes are deleted.
 	if (rollback) {
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				with: { project: true },
-			});
-			if (chapter?.worktreePath && chapter.project?.gitPath) {
-				// Find the commit that was HEAD when this message was created
-				// We look for commits before the message creation time
-				try {
-					const msgCreatedAt = new Date(targetMsg.createdAt).toISOString();
-					// Get the commit that was current before this message
-					const result = await gitService.exec(
-						["log", "--before", msgCreatedAt, "--format=%H", "-1"],
-						chapter.worktreePath,
-					);
-					const commitHash = result.stdout.trim();
-					if (commitHash) {
-						// Reset to that commit (hard reset to discard all changes)
-						await gitService.exec(["reset", "--hard", commitHash], chapter.worktreePath);
-						logger.info("Git rollback completed", {
-							narratorId,
-							chapterId: narrator.chapterId,
-							commitHash,
-						});
-					}
-				} catch (err) {
-					logger.warn("Git rollback failed, continuing without rollback", {
-						narratorId,
-						error: String(err),
-					});
-				}
-			}
-		}
+		logger.debug("editAndRegenerate: rollback param is now a no-op (auto-revert via snapshot)", {
+			narratorId,
+		});
 	}
 
 	// Update the message content

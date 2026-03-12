@@ -11,7 +11,6 @@ import {
 	mergeSessions,
 	narratorMessageRefs,
 	narratorMessages,
-	narratorPatches,
 	narrators,
 	narratorToolCalls,
 	projects,
@@ -310,17 +309,6 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 		allToolCalls.push(...rows);
 	}
 
-	// Load patches for these messages
-	const allPatches: (typeof narratorPatches.$inferSelect)[] = [];
-	for (let i = 0; i < messageIds.length; i += BATCH) {
-		const batch = messageIds.slice(i, i + BATCH);
-		const rows = await db
-			.select()
-			.from(narratorPatches)
-			.where(inArray(narratorPatches.messageId, batch));
-		allPatches.push(...rows);
-	}
-
 	// Write all to project DB in a single transaction
 	const msgStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_messages
@@ -340,11 +328,6 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
 		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-	const patchStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_patches
-		(id, narrator_id, message_id, tool_use_id, before_hash, after_hash, files_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 
 	const tx = pdb.transaction(() => {
@@ -388,18 +371,6 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 				tc.permissionDecisionReason,
 				jsonCol(tc.permissionSuggestions),
 				tc.createdAt,
-			);
-		}
-		for (const p of allPatches) {
-			patchStmt.run(
-				p.id,
-				p.narratorId,
-				p.messageId,
-				p.toolUseId,
-				p.beforeHash,
-				p.afterHash,
-				jsonCol(p.filesJson),
-				p.createdAt,
 			);
 		}
 	});
@@ -519,16 +490,6 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 		allToolCalls.push(...rows);
 	}
 
-	const allPatches: (typeof narratorPatches.$inferSelect)[] = [];
-	for (let i = 0; i < messageIds.length; i += BATCH) {
-		const batch = messageIds.slice(i, i + BATCH);
-		const rows = await db
-			.select()
-			.from(narratorPatches)
-			.where(inArray(narratorPatches.messageId, batch));
-		allPatches.push(...rows);
-	}
-
 	const msgStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_messages
 		(id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json,
@@ -548,15 +509,9 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
-	const patchStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_patches
-		(id, narrator_id, message_id, tool_use_id, before_hash, after_hash, files_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
 
 	const tx = pdb.transaction(() => {
 		// Delete existing data for this narrator first
-		pdb.run("DELETE FROM narrator_patches WHERE narrator_id = ?", [narratorId]);
 		pdb.run("DELETE FROM narrator_tool_calls WHERE narrator_id = ?", [narratorId]);
 		pdb.run("DELETE FROM narrator_message_refs WHERE narrator_id = ?", [narratorId]);
 		// Don't delete narrator_messages here — they may be shared with other narrators.
@@ -602,18 +557,6 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 				tc.permissionDecisionReason,
 				jsonCol(tc.permissionSuggestions),
 				tc.createdAt,
-			);
-		}
-		for (const p of allPatches) {
-			patchStmt.run(
-				p.id,
-				p.narratorId,
-				p.messageId,
-				p.toolUseId,
-				p.beforeHash,
-				p.afterHash,
-				jsonCol(p.filesJson),
-				p.createdAt,
 			);
 		}
 	});
@@ -834,12 +777,6 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 		case "narrator:forked": {
 			await syncNarrator(event.narratorId);
 			await syncNarratorMessages(event.narratorId);
-			break;
-		}
-		case "narrator:auto_commit":
-		case "narrator:force_commit": {
-			await syncChapterCommits(event.chapterId);
-			debouncedNarratorSync(event.narratorId);
 			break;
 		}
 

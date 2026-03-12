@@ -8,9 +8,9 @@ import {
 	mergeSessions,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
+	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
-	narratorPatches,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -106,7 +106,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messageRefs: many(narratorMessageRefs),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
-	patches: many(narratorPatches),
+	fileSnapshots: many(narratorFileSnapshots),
 	terminals: many(terminals),
 	commits: many(chapterCommits),
 	whitelistDirs: many(narratorWhitelistDirs),
@@ -126,7 +126,6 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 	}),
 	messageRefs: many(narratorMessageRefs),
 	toolCalls: many(narratorToolCalls),
-	patches: many(narratorPatches),
 }));
 
 export const narratorMessageRefsRelations = relations(narratorMessageRefs, ({ one }) => ({
@@ -151,14 +150,10 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one })
 	}),
 }));
 
-export const narratorPatchesRelations = relations(narratorPatches, ({ one }) => ({
+export const narratorFileSnapshotsRelations = relations(narratorFileSnapshots, ({ one }) => ({
 	narrator: one(narrators, {
-		fields: [narratorPatches.narratorId],
+		fields: [narratorFileSnapshots.narratorId],
 		references: [narrators.id],
-	}),
-	message: one(narratorMessages, {
-		fields: [narratorPatches.messageId],
-		references: [narratorMessages.id],
 	}),
 }));
 

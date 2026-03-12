@@ -65,20 +65,6 @@ interface NarratorWSCallbacks {
 		linesAdded: number;
 		linesRemoved: number;
 	}) => void;
-	onCommitReminder?: (data: {
-		chapterId: string;
-		linesAdded: number;
-		linesRemoved: number;
-		filesChanged: number;
-	}) => void;
-	onForceCommitDone?: (data: {
-		chapterId: string;
-		commitSha: string;
-		message: string;
-		linesAdded: number;
-		linesRemoved: number;
-		filesChanged: number;
-	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onWebSearch?: (
 		id: string,
@@ -337,28 +323,6 @@ export function useNarratorWS(
 									baseBranch: data.baseBranch ?? "",
 									linesAdded: data.linesAdded ?? 0,
 									linesRemoved: data.linesRemoved ?? 0,
-								});
-							}
-							break;
-						case "commit_reminder":
-							if (data.chapterId) {
-								callbacksRef.current.onCommitReminder?.({
-									chapterId: data.chapterId,
-									linesAdded: data.linesAdded ?? 0,
-									linesRemoved: data.linesRemoved ?? 0,
-									filesChanged: data.filesChanged ?? 0,
-								});
-							}
-							break;
-						case "force_commit_done":
-							if (data.chapterId) {
-								callbacksRef.current.onForceCommitDone?.({
-									chapterId: data.chapterId,
-									commitSha: data.commitSha ?? "",
-									message: data.message ?? "",
-									linesAdded: data.linesAdded ?? 0,
-									linesRemoved: data.linesRemoved ?? 0,
-									filesChanged: data.filesChanged ?? 0,
 								});
 							}
 							break;

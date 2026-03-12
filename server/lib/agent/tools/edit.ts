@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { z } from "zod/v4";
+import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText, writeFileText } from "./encoding";
 
@@ -404,6 +405,19 @@ export const editTool: ToolDefinition = {
 					isError: true,
 				};
 			}
+
+			// Record original content before editing (non-fatal)
+			await ensureFileSnapshot(ctx.narratorId, file_path, async () => {
+				try {
+					const file = Bun.file(resolvedPath);
+					if (await file.exists()) {
+						return (await readFileText(resolvedPath)).text;
+					}
+				} catch {
+					// File doesn't exist or can't be read
+				}
+				return null;
+			});
 
 			// Create-new-file mode: old_string is empty
 			if (old_string === "") {

@@ -233,6 +233,8 @@ function resolveDisplayText(val: any): string {
 	if (val === null || val === undefined) return "";
 	if (isTruncated(val)) return val.preview;
 	if (typeof val === "string") return val;
+	// Structured output from tools like Read/Edit: { _text, _metadata }
+	if (typeof val._text === "string") return val._text;
 	return JSON.stringify(val, null, 2);
 }
 

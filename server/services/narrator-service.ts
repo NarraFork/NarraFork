@@ -19,6 +19,7 @@ import { logger } from "../lib/logger";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { revertPatchesForMessages, revertPatchForToolUse } from "./snapshot-revert";
 
 /**
  * For child messages belonging to subagent narrators, attach the subagent's
@@ -1346,10 +1347,13 @@ export const narratorService = {
 				),
 			);
 
-		if (refsToRemove.length === 0) return;
+		if (refsToRemove.length === 0) return { deletedCount: 0 };
 
 		const refIds = refsToRemove.map((r) => r.id);
 		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
+
+		// Auto-revert file changes before deleting messages
+		await revertPatchesForMessages(narratorId, messageIds);
 
 		await db.transaction(async (tx) => {
 			// Remove refs for this narrator
@@ -1498,6 +1502,9 @@ export const narratorService = {
 		const refIds = refsToRemove.map((r) => r.id);
 		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
 
+		// Auto-revert file changes before deleting messages
+		await revertPatchesForMessages(narratorId, messageIds);
+
 		await db.transaction(async (tx) => {
 			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
 
@@ -1588,6 +1595,11 @@ export const narratorService = {
 
 		const removedBlock = blocks[blockIndex];
 		const remaining = blocks.filter((_, i) => i !== blockIndex);
+
+		// Auto-revert file changes if the removed block is a tool_use
+		if (removedBlock.type === "tool_use" && removedBlock.id) {
+			await revertPatchForToolUse(narratorId, removedBlock.id);
+		}
 
 		// Check if this message is shared by multiple narrators
 		const refCount = await db
@@ -2696,6 +2708,7 @@ export const narratorService = {
 			await tx.delete(narrators).where(eq(narrators.id, narratorId));
 		});
 		await deleteNarratorUploads(narratorId);
+
 		logger.info("Narrator removed", { narratorId });
 	},
 

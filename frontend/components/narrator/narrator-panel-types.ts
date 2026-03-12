@@ -140,6 +140,7 @@ export interface NarratorPanelProps {
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+export const MAX_IMAGE_LONG_EDGE = 1568;
 export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";

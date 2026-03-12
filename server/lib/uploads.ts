@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, resolve } from "node:path";
-import sharp from "sharp";
 import { ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
@@ -70,15 +69,40 @@ export function getImagePath(narratorId: string, imageId: string): string | null
 	return filePath;
 }
 
-const MAX_IMAGE_LONG_EDGE = 1568;
-
-const FORMAT_TO_MIME: Record<string, string> = {
-	png: "image/png",
-	jpeg: "image/jpeg",
-	jpg: "image/jpeg",
-	gif: "image/gif",
-	webp: "image/webp",
-};
+/**
+ * Detect the real image MIME type from file content magic bytes.
+ * Returns undefined if the format is unrecognized.
+ */
+function detectImageMime(buf: Buffer): string | undefined {
+	if (buf.length < 4) return undefined;
+	// PNG: 89 50 4E 47
+	if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+		return "image/png";
+	}
+	// JPEG: FF D8 FF
+	if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+		return "image/jpeg";
+	}
+	// GIF: 47 49 46 38
+	if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) {
+		return "image/gif";
+	}
+	// WebP: RIFF....WEBP
+	if (
+		buf.length >= 12 &&
+		buf[0] === 0x52 &&
+		buf[1] === 0x49 &&
+		buf[2] === 0x46 &&
+		buf[3] === 0x46 &&
+		buf[8] === 0x57 &&
+		buf[9] === 0x45 &&
+		buf[10] === 0x42 &&
+		buf[11] === 0x50
+	) {
+		return "image/webp";
+	}
+	return undefined;
+}
 
 export interface ImageBase64Result {
 	base64: string;
@@ -88,62 +112,31 @@ export interface ImageBase64Result {
 
 /**
  * Read an image file and return its base64 encoding + detected real format.
- * If the image's long edge exceeds MAX_IMAGE_LONG_EDGE, it is downscaled
- * (preserving aspect ratio) before encoding. GIF is passed through as-is
- * since sharp doesn't handle animated GIF resize well.
- *
  * The returned `detectedMediaType` reflects the actual file content (e.g. a
  * file named `.jpg` that is really PNG will return `image/png`). Callers
  * should prefer this over the stored mediaType when sending to AI providers.
  */
 export async function imageToBase64(filePath: string): Promise<ImageBase64Result> {
 	const buf = Buffer.from(await Bun.file(filePath).arrayBuffer());
-	const ext = extname(filePath).toLowerCase();
-
-	// Skip resize for GIF (may be animated)
-	if (ext === ".gif") {
-		return { base64: buf.toString("base64"), detectedMediaType: "image/gif" };
-	}
-
-	try {
-		const img = sharp(buf);
-		const meta = await img.metadata();
-		const realFormat = meta.format ?? "";
-		const detectedMediaType = FORMAT_TO_MIME[realFormat];
-		const w = meta.width ?? 0;
-		const h = meta.height ?? 0;
-		const longEdge = Math.max(w, h);
-
-		if (longEdge > MAX_IMAGE_LONG_EDGE) {
-			// Resize and re-encode in the real format (not the extension-based one)
-			const outputFormat = realFormat === "png" ? "png" : "jpeg";
-			const resized = await img
-				.resize({
-					width: w >= h ? MAX_IMAGE_LONG_EDGE : undefined,
-					height: h > w ? MAX_IMAGE_LONG_EDGE : undefined,
-					fit: "inside",
-					withoutEnlargement: true,
-				})
-				.toFormat(outputFormat, { quality: 85 })
-				.toBuffer();
-			logger.debug("Image resized for AI provider", {
+	const detectedMediaType = detectImageMime(buf);
+	if (detectedMediaType) {
+		const ext = extname(filePath).toLowerCase();
+		const extMime: Record<string, string> = {
+			".png": "image/png",
+			".jpg": "image/jpeg",
+			".jpeg": "image/jpeg",
+			".gif": "image/gif",
+			".webp": "image/webp",
+		};
+		if (extMime[ext] && extMime[ext] !== detectedMediaType) {
+			logger.debug("Image format mismatch: extension vs content", {
 				filePath,
-				original: `${w}x${h}`,
-				resized: `${resized.length} bytes`,
-				realFormat,
+				extension: ext,
+				detected: detectedMediaType,
 			});
-			return {
-				base64: resized.toString("base64"),
-				detectedMediaType: FORMAT_TO_MIME[outputFormat] ?? detectedMediaType,
-			};
 		}
-
-		return { base64: buf.toString("base64"), detectedMediaType };
-	} catch {
-		// If sharp fails (corrupt image, unsupported format), fall through to raw base64
 	}
-
-	return { base64: buf.toString("base64") };
+	return { base64: buf.toString("base64"), detectedMediaType };
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {

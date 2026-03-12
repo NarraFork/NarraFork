@@ -1,14 +1,8 @@
-import { resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	narratorMessageRefs,
-	narratorMessages,
-	narratorPatches,
-	narrators,
-	projects,
-} from "../db/schema";
+import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -19,10 +13,10 @@ import { safeSpawn } from "../lib/spawn";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
+import { rebuildFileStatesAtMessage } from "./file-state-rebuild";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { portAllocator } from "./port-allocator";
-import { snapshot } from "./snapshot";
 
 export interface ForkChapterInput {
 	title?: string;
@@ -102,24 +96,29 @@ export const chapterFork = {
 			// Step 1.5: Restore file state to match what the model saw at the fork message.
 			// The worktree is at the resolved commit, but the model may have made file
 			// changes (via Write/Edit/Bash) that weren't committed yet at that point.
-			// Those changes are tracked in narrator_patches as snapshot tree hashes.
+			// Those changes are tracked in narrator_file_snapshots + narrator_tool_calls.
 			if (input.forkAtMessageUuid) {
 				try {
-					const snapshotHash = await this.resolveSnapshotHashForMessage(
+					const fileStates = await this.resolveFileStatesForMessage(
 						parentChapterId,
 						input.forkAtMessageUuid,
 					);
-					if (snapshotHash) {
-						await snapshot.applyTreeToWorktree(parentChapterId, worktreePath, snapshotHash);
-						logger.info("Applied snapshot to forked worktree", {
+					if (fileStates.size > 0) {
+						for (const [filePath, content] of fileStates) {
+							if (content === null) continue; // Skip files that didn't exist
+							const absPath = resolve(worktreePath, filePath);
+							mkdirSync(dirname(absPath), { recursive: true });
+							await Bun.write(absPath, content);
+						}
+						logger.info("Applied file snapshots to forked worktree", {
 							parentChapterId,
 							childChapterId: id,
-							snapshotHash,
+							fileCount: fileStates.size,
 						});
 					}
 				} catch (err) {
 					// Non-fatal: degrade to commit-only state rather than failing the fork
-					logger.warn("Failed to apply snapshot during fork (non-fatal)", {
+					logger.warn("Failed to apply file snapshots during fork (non-fatal)", {
 						parentChapterId,
 						childChapterId: id,
 						error: String(err),
@@ -410,25 +409,25 @@ export const chapterFork = {
 	},
 
 	/**
-	 * Find the snapshot tree hash representing the file state at a specific message.
+	 * Rebuild the file state at a specific message by replaying Write/Edit
+	 * tool calls from narrator_file_snapshots + narrator_tool_calls.
 	 *
-	 * Walks the narrator_patches table (joined via narrator_message_refs) to find
-	 * the last patch whose associated message seq <= the fork message's seq.
-	 * Returns the patch's afterHash, or null if no patches exist before that point.
+	 * Returns a Map of filePath → content for all files the narrator touched
+	 * up to (and including) the fork message.
 	 */
-	async resolveSnapshotHashForMessage(
+	async resolveFileStatesForMessage(
 		chapterId: string,
 		messageUuid: string,
-	): Promise<string | null> {
+	): Promise<Map<string, string | null>> {
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
 		});
-		if (!primaryNarrator) return null;
+		if (!primaryNarrator) return new Map();
 
 		const targetMsg = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.messageUuid, messageUuid),
 		});
-		if (!targetMsg) return null;
+		if (!targetMsg) return new Map();
 
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -436,23 +435,8 @@ export const chapterFork = {
 				eq(narratorMessageRefs.messageId, targetMsg.id),
 			),
 		});
-		if (!targetRef) return null;
+		if (!targetRef) return new Map();
 
-		// Find the last patch whose message is at or before the fork point
-		const rows = await db
-			.select({ afterHash: narratorPatches.afterHash })
-			.from(narratorPatches)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-					eq(narratorMessageRefs.messageId, narratorPatches.messageId),
-				),
-			)
-			.where(sql`${narratorMessageRefs.seq} <= ${targetRef.seq}`)
-			.orderBy(desc(narratorPatches.createdAt), desc(narratorPatches.id))
-			.limit(1);
-
-		return rows.length > 0 ? rows[0].afterHash : null;
+		return rebuildFileStatesAtMessage(primaryNarrator.id, targetMsg.id);
 	},
 };

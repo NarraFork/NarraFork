@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { extname, resolve } from "node:path";
 
 import { eq } from "drizzle-orm";
@@ -26,7 +27,6 @@ import { ensureRootlessEnv } from "./services/container-service";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
 import { registerProjectDbSync } from "./services/project-db-sync";
-import { snapshot } from "./services/snapshot";
 import { terminalService } from "./services/terminal-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
 import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./websocket/ws-handler";
@@ -411,22 +411,21 @@ if (settings.containers.proxy?.enabled) {
 	});
 }
 
-// Periodic snapshot GC — run once at startup then every 24 hours
-const SNAPSHOT_GC_INTERVAL = 24 * 60 * 60 * 1000;
-snapshot.gcAll().catch((err) => {
-	logger.warn("Initial snapshot GC failed", { error: String(err) });
-});
-const snapshotGcTimer = setInterval(() => {
-	snapshot.gcAll().catch((err) => {
-		logger.warn("Periodic snapshot GC failed", { error: String(err) });
-	});
-}, SNAPSHOT_GC_INTERVAL);
+// One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
+const legacySnapshotsDir = resolve(homedir(), ".narrafork", "snapshots");
+if (existsSync(legacySnapshotsDir)) {
+	try {
+		rmSync(legacySnapshotsDir, { recursive: true, force: true });
+		logger.info("Removed legacy snapshot directory", { path: legacySnapshotsDir });
+	} catch (err) {
+		logger.warn("Failed to remove legacy snapshot directory", { error: String(err) });
+	}
+}
 
 // Graceful shutdown
 const shutdown = () => {
 	stopHeartbeat();
 	stopContainerProxy();
-	clearInterval(snapshotGcTimer);
 	chapterCleanup.clearAllTimers();
 	worktreeWatcher.shutdown();
 	projectDbManager.closeAll();

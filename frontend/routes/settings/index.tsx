@@ -198,11 +198,6 @@ function SettingsPage() {
 	const [sizeWarning, setSizeWarning] = useState(500);
 	const [autoSave, setAutoSave] = useState(true);
 	const [dormantMinutes, setDormantMinutes] = useState(0);
-	// Auto-commit thresholds
-	const [acReminderLines, setAcReminderLines] = useState(1000);
-	const [acReminderFiles, setAcReminderFiles] = useState(10);
-	const [acForceLines, setAcForceLines] = useState(2000);
-	const [acForceFiles, setAcForceFiles] = useState(25);
 	// Containers
 	const [portStart, setPortStart] = useState(10000);
 	const [portEnd, setPortEnd] = useState(20000);
@@ -228,10 +223,6 @@ function SettingsPage() {
 		sizeWarning: 500,
 		autoSave: true,
 		dormantMinutes: 0,
-		acReminderLines: 1000,
-		acReminderFiles: 10,
-		acForceLines: 2000,
-		acForceFiles: 25,
 		portStart: 10000,
 		portEnd: 20000,
 		proxyEnabled: false,
@@ -276,10 +267,6 @@ function SettingsPage() {
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
 				autoSave: settings.chapters?.autoSaveOnDormant ?? true,
 				dormantMinutes: settings.chapters?.dormantAfterMinutes ?? 0,
-				acReminderLines: settings.chapters?.autoCommitReminderLines ?? 1000,
-				acReminderFiles: settings.chapters?.autoCommitReminderFiles ?? 10,
-				acForceLines: settings.chapters?.autoCommitForceLines ?? 2000,
-				acForceFiles: settings.chapters?.autoCommitForceFiles ?? 25,
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
 				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
@@ -308,10 +295,6 @@ function SettingsPage() {
 			setSizeWarning(snap.sizeWarning);
 			setAutoSave(snap.autoSave);
 			setDormantMinutes(snap.dormantMinutes);
-			setAcReminderLines(snap.acReminderLines);
-			setAcReminderFiles(snap.acReminderFiles);
-			setAcForceLines(snap.acForceLines);
-			setAcForceFiles(snap.acForceFiles);
 			setPortStart(snap.portStart);
 			setPortEnd(snap.portEnd);
 			setProxyEnabled(snap.proxyEnabled);
@@ -346,10 +329,6 @@ function SettingsPage() {
 			sizeWarning !== s.sizeWarning ||
 			autoSave !== s.autoSave ||
 			dormantMinutes !== s.dormantMinutes ||
-			acReminderLines !== s.acReminderLines ||
-			acReminderFiles !== s.acReminderFiles ||
-			acForceLines !== s.acForceLines ||
-			acForceFiles !== s.acForceFiles ||
 			portStart !== s.portStart ||
 			portEnd !== s.portEnd ||
 			proxyEnabled !== s.proxyEnabled ||
@@ -379,10 +358,6 @@ function SettingsPage() {
 		sizeWarning,
 		autoSave,
 		dormantMinutes,
-		acReminderLines,
-		acReminderFiles,
-		acForceLines,
-		acForceFiles,
 		portStart,
 		portEnd,
 		proxyEnabled,
@@ -440,10 +415,6 @@ function SettingsPage() {
 					worktreeSizeWarningMb: sizeWarning,
 					autoSaveOnDormant: autoSave,
 					dormantAfterMinutes: dormantMinutes,
-					autoCommitReminderLines: acReminderLines,
-					autoCommitReminderFiles: acReminderFiles,
-					autoCommitForceLines: acForceLines,
-					autoCommitForceFiles: acForceFiles,
 				},
 				containers: {
 					portRangeStart: portStart,
@@ -475,10 +446,6 @@ function SettingsPage() {
 						sizeWarning,
 						autoSave,
 						dormantMinutes,
-						acReminderLines,
-						acReminderFiles,
-						acForceLines,
-						acForceFiles,
 						portStart,
 						portEnd,
 						proxyEnabled,
@@ -609,14 +576,6 @@ function SettingsPage() {
 							setAutoSave={setAutoSave}
 							dormantMinutes={dormantMinutes}
 							setDormantMinutes={setDormantMinutes}
-							acReminderLines={acReminderLines}
-							setAcReminderLines={setAcReminderLines}
-							acReminderFiles={acReminderFiles}
-							setAcReminderFiles={setAcReminderFiles}
-							acForceLines={acForceLines}
-							setAcForceLines={setAcForceLines}
-							acForceFiles={acForceFiles}
-							setAcForceFiles={setAcForceFiles}
 							portStart={portStart}
 							setPortStart={setPortStart}
 							portEnd={portEnd}

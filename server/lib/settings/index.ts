@@ -154,19 +154,6 @@ export interface NarraForkSettings {
 		worktreeSizeWarningMb: number;
 		autoSaveOnDormant: boolean;
 		dormantAfterMinutes: number;
-		/**
-		 * Uncommitted change thresholds for auto-commit behavior.
-		 * - `reminderLines` / `reminderFiles`: when exceeded, inject a system reminder
-		 *   into the narrator chat urging it to commit soon.
-		 * - `forceCommitLines` / `forceCommitFiles`: when exceeded, NarraFork
-		 *   force-generates a commit message via summaryModel and commits directly,
-		 *   then injects a system message into chat history.
-		 * Set to 0 to disable the respective threshold.
-		 */
-		autoCommitReminderLines: number;
-		autoCommitReminderFiles: number;
-		autoCommitForceLines: number;
-		autoCommitForceFiles: number;
 	};
 	containers: {
 		portRangeStart: number;
@@ -237,10 +224,6 @@ const DEFAULTS: NarraForkSettings = {
 		worktreeSizeWarningMb: 500,
 		autoSaveOnDormant: true,
 		dormantAfterMinutes: 0,
-		autoCommitReminderLines: 1000,
-		autoCommitReminderFiles: 10,
-		autoCommitForceLines: 2000,
-		autoCommitForceFiles: 25,
 	},
 	containers: {
 		portRangeStart: 10000,

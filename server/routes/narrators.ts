@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { mkdirSync, unlinkSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import {
 	and,
 	asc,
@@ -23,9 +24,11 @@ import {
 	containerInstances,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
+	narratorFileSnapshots,
+	narratorMessageRefs,
 	narratorMessages,
-	narratorPatches,
 	narrators,
+	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 	projects,
@@ -62,6 +65,12 @@ import {
 	updateWhitelistDirSchema,
 } from "../lib/validators";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
+import {
+	getAffectedFiles,
+	rebuildFileState,
+	rebuildFileStatesExcluding,
+	rebuildFileStatesUpToSeq,
+} from "../services/file-state-rebuild";
 import { narratorService } from "../services/narrator-service";
 import {
 	clearBufferedMessages,
@@ -84,7 +93,7 @@ import {
 	updateNarratorPermissionMode,
 } from "../services/narrator-session";
 import { generateTitle } from "../services/narrator-title";
-import { snapshot } from "../services/snapshot";
+import { resolveNarratorCwd } from "../services/snapshot-revert";
 import {
 	broadcastToNarrator,
 	getNarratorIdsWithPresence,
@@ -1030,54 +1039,38 @@ narratorRoutes.post("/:id/suggest-answers", async (c) => {
 
 // === Snapshot / Patch routes ===
 
-/** List patches for a narrator, optionally filtered by messageId */
+/** List file snapshots for a narrator */
 narratorRoutes.get("/:id/patches", async (c) => {
 	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
 
-	const conditions = [eq(narratorPatches.narratorId, narratorId)];
-	if (messageId) {
-		conditions.push(eq(narratorPatches.messageId, messageId));
-	}
-
-	const patches = await db.query.narratorPatches.findMany({
-		where: and(...conditions),
-		orderBy: asc(narratorPatches.createdAt),
+	const snapshots = await db.query.narratorFileSnapshots.findMany({
+		where: eq(narratorFileSnapshots.narratorId, narratorId),
+		orderBy: asc(narratorFileSnapshots.createdAt),
 	});
 
-	return c.json(patches);
+	return c.json(snapshots);
 });
 
-/** Get the full diff for a specific patch */
+/** Get the diff for a specific file snapshot (original vs current rebuilt state) */
 narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	const narratorId = c.req.param("id");
 	const patchId = c.req.param("patchId");
 
-	const patch = await db.query.narratorPatches.findFirst({
-		where: and(eq(narratorPatches.id, patchId), eq(narratorPatches.narratorId, narratorId)),
+	const snap = await db.query.narratorFileSnapshots.findFirst({
+		where: and(
+			eq(narratorFileSnapshots.id, patchId),
+			eq(narratorFileSnapshots.narratorId, narratorId),
+		),
 	});
-	if (!patch) return c.json({ error: "Patch not found" }, 404);
+	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
 
-	// Resolve chapter + worktree
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
+	const currentContent = await rebuildFileState(narratorId, snap.filePath);
+	const original = snap.originalContent ?? "(file did not exist)";
+	const current = currentContent ?? "(file deleted)";
+
+	return c.json({
+		diff: `--- a/${snap.filePath}\n+++ b/${snap.filePath}\n\nOriginal:\n${original}\n\nCurrent:\n${current}`,
 	});
-	if (!narrator?.chapterId) return c.json({ error: "Narrator not bound to a chapter" }, 400);
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { worktreePath: true },
-	});
-	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
-
-	const diff = await snapshot.diff(
-		narrator.chapterId,
-		chapter.worktreePath,
-		patch.beforeHash,
-		patch.afterHash,
-	);
-	return c.json({ diff });
 });
 
 /** Revert file changes from a specific message onwards */
@@ -1091,123 +1084,118 @@ narratorRoutes.post("/:id/revert", async (c) => {
 		return c.json({ error: "Cannot revert while narrator is running" }, 409);
 	}
 
-	// Resolve chapter + worktree
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
-	});
-	if (!narrator?.chapterId) return c.json({ error: "Narrator not bound to a chapter" }, 400);
+	const cwd = await resolveNarratorCwd(narratorId);
+	if (!cwd) return c.json({ error: "Narrator has no working directory" }, 400);
 
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { worktreePath: true },
-	});
-	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
-
-	const chapterId = narrator.chapterId;
-	const worktreePath = chapter.worktreePath;
-
-	// Find the target message's createdAt to filter patches from that point onwards
-	const targetMessage = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, body.messageId),
-		columns: { createdAt: true },
-	});
-	if (!targetMessage) return c.json({ error: "Message not found" }, 404);
-
-	// Collect all patches at or after the target message (reverse chronological for revert)
-	const allPatches = await db.query.narratorPatches.findMany({
+	// Find the target message's ref to get its seq
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
-			eq(narratorPatches.narratorId, narratorId),
-			gte(narratorPatches.createdAt, targetMessage.createdAt),
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, body.messageId),
 		),
-		orderBy: desc(narratorPatches.createdAt),
+		columns: { seq: true },
 	});
+	if (!targetRef) return c.json({ error: "Message not found" }, 404);
 
-	if (allPatches.length === 0) {
-		return c.json({ snapshotHash: null, patchCount: 0, files: [] });
-	}
-
-	// Save current state for unrevert (ensure shadow repo exists first)
-	let snapshotHash: string;
-	try {
-		await snapshot.init(chapterId, worktreePath);
-		snapshotHash = await snapshot.track(chapterId, worktreePath);
-	} catch (err) {
-		return c.json(
-			{
-				error: `Failed to save current state: ${err instanceof Error ? err.message : String(err)}`,
-			},
-			500,
+	// Find all tool calls at or after the target message
+	const toolCallsToRevert = await db
+		.select({
+			toolUseId: narratorToolCalls.toolUseId,
+			toolName: narratorToolCalls.toolName,
+			inputJson: narratorToolCalls.inputJson,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				gte(narratorMessageRefs.seq, targetRef.seq),
+			),
 		);
+
+	const affectedFiles = getAffectedFiles(toolCallsToRevert);
+	if (affectedFiles.length === 0) {
+		return c.json({ fileCount: 0, files: [] });
 	}
 
-	// Build PatchInfo array
-	const patchInfos = allPatches.map((p) => ({
-		beforeHash: p.beforeHash,
-		afterHash: p.afterHash,
-		files: p.filesJson as string[],
-	}));
+	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
 
-	// Revert
 	try {
-		// Re-check right before mutation to narrow the TOCTOU window
+		// Re-check right before mutation
 		if (isNarratorActive(narratorId)) {
 			return c.json({ error: "Narrator became active during revert" }, 409);
 		}
-		await snapshot.revert(chapterId, worktreePath, patchInfos);
+
+		const fileStates = await rebuildFileStatesExcluding(narratorId, affectedFiles, excludeIds);
+
+		// Write files to disk
+		const writtenFiles: string[] = [];
+
+		for (const [filePath, content] of fileStates) {
+			const absPath = resolve(cwd, filePath);
+			try {
+				if (content === null) {
+					const file = Bun.file(absPath);
+					if (await file.exists()) unlinkSync(absPath);
+				} else {
+					mkdirSync(dirname(absPath), { recursive: true });
+					await Bun.write(absPath, content);
+				}
+				writtenFiles.push(filePath);
+			} catch (err) {
+				logger.warn("Failed to write reverted file", { filePath, error: String(err) });
+			}
+		}
+
+		return c.json({ fileCount: writtenFiles.length, files: writtenFiles });
 	} catch (err) {
 		return c.json(
-			{
-				error: `Revert failed: ${err instanceof Error ? err.message : String(err)}`,
-				snapshotHash, // allow unrevert even on partial failure
-				partial: true,
-			},
+			{ error: `Revert failed: ${err instanceof Error ? err.message : String(err)}` },
 			500,
 		);
 	}
-
-	// Collect all affected files
-	const allFiles = [...new Set(patchInfos.flatMap((p) => p.files))];
-
-	return c.json({ snapshotHash, patchCount: allPatches.length, files: allFiles });
 });
 
-/** Unrevert — restore to the state before the last revert */
+/** Unrevert — rebuild current (full) file state and write to disk */
 narratorRoutes.post("/:id/unrevert", async (c) => {
 	const narratorId = c.req.param("id");
-	const body = await c.req.json<{ snapshotHash: string }>();
-	if (!body.snapshotHash) return c.json({ error: "snapshotHash is required" }, 400);
 
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Cannot unrevert while narrator is running" }, 409);
 	}
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
-	});
-	if (!narrator?.chapterId) return c.json({ error: "Narrator not bound to a chapter" }, 400);
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { worktreePath: true },
-	});
-	if (!chapter?.worktreePath) return c.json({ error: "Chapter has no worktree" }, 400);
+	const cwd = await resolveNarratorCwd(narratorId);
+	if (!cwd) return c.json({ error: "Narrator has no working directory" }, 400);
 
 	try {
-		// Re-check right before mutation to narrow the TOCTOU window
 		if (isNarratorActive(narratorId)) {
 			return c.json({ error: "Narrator became active during unrevert" }, 409);
 		}
-		await snapshot.restore(narrator.chapterId, chapter.worktreePath, body.snapshotHash);
+
+		// Rebuild full file state (all tool calls included)
+		const fileStates = await rebuildFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
+
+		for (const [filePath, content] of fileStates) {
+			if (content === null) continue;
+			const absPath = resolve(cwd, filePath);
+			mkdirSync(dirname(absPath), { recursive: true });
+			await Bun.write(absPath, content);
+		}
+
+		return c.json({ success: true });
 	} catch (err) {
 		return c.json(
 			{ error: `Restore failed: ${err instanceof Error ? err.message : String(err)}` },
 			500,
 		);
 	}
-
-	return c.json({ success: true });
 });
 
 // === Background task routes ===

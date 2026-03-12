@@ -180,33 +180,6 @@ export type NarratorServerMessage =
 			linesAdded?: number;
 			linesRemoved?: number;
 	  }
-	| { type: "auto_commit_started"; narratorId: string; chapterId: string }
-	| {
-			type: "auto_commit_done";
-			narratorId: string;
-			chapterId: string;
-			commitSha: string;
-			message: string;
-	  }
-	| { type: "auto_commit_failed"; narratorId: string; chapterId: string; error: string }
-	| {
-			type: "commit_reminder";
-			narratorId: string;
-			chapterId: string;
-			linesAdded: number;
-			linesRemoved: number;
-			filesChanged: number;
-	  }
-	| {
-			type: "force_commit_done";
-			narratorId: string;
-			chapterId: string;
-			commitSha: string;
-			message: string;
-			linesAdded: number;
-			linesRemoved: number;
-			filesChanged: number;
-	  }
 	| {
 			type: "catch_up";
 			narratorId: string;

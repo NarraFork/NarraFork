@@ -24,7 +24,6 @@ import {
 	IconBrain,
 	IconChevronDown,
 	IconChevronRight,
-	IconGitCommit,
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
@@ -53,6 +52,7 @@ interface MessageBubbleProps {
 		toolCalls?: any[];
 		messageUuid?: string | null;
 		commandText?: string | null;
+		createdAt?: string | null;
 		creator?: {
 			id: string;
 			username: string;
@@ -1027,39 +1027,6 @@ export const MessageBubble = memo(function MessageBubble({
 		return null;
 	}
 
-	// Auto-commit system notices (stored as role="user" so the SDK sees them)
-	if (isUser) {
-		const acBlock = blocks.find(
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(b: any) => b.type === "auto_commit_reminder" || b.type === "auto_commit_notice",
-		);
-		if (acBlock) {
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const textBlock = blocks.find((b: any) => b.type === "text");
-			const isReminder = acBlock.type === "auto_commit_reminder";
-			return (
-				<Paper
-					p="xs"
-					radius="sm"
-					style={{
-						backgroundColor: isReminder
-							? "var(--mantine-color-yellow-light)"
-							: "var(--mantine-color-teal-light)",
-					}}
-				>
-					<Group gap={6} align="center">
-						<IconGitCommit size={16} style={{ flexShrink: 0 }} />
-						<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
-							{(textBlock?.text ?? message.contentText ?? "")
-								.replace(/<\/?system-reminder>/g, "")
-								.trim()}
-						</Text>
-					</Group>
-				</Paper>
-			);
-		}
-	}
-
 	// User messages — wrap entire bubble in ContentViewer for context menu / swipe
 	if (isUser) {
 		const fullText = blocks
@@ -1182,6 +1149,29 @@ export const MessageBubble = memo(function MessageBubble({
 								<Text size="xs" fw={600} c="indigo">
 									{message.creator?.username ?? t("you")}
 								</Text>
+								{message.createdAt && (
+									<Text size="xs" c="dimmed" ml="auto">
+										{(() => {
+											const d = new Date(message.createdAt);
+											const now = new Date();
+											const isToday =
+												d.getFullYear() === now.getFullYear() &&
+												d.getMonth() === now.getMonth() &&
+												d.getDate() === now.getDate();
+											return isToday
+												? d.toLocaleTimeString([], {
+														hour: "2-digit",
+														minute: "2-digit",
+													})
+												: d.toLocaleString([], {
+														month: "2-digit",
+														day: "2-digit",
+														hour: "2-digit",
+														minute: "2-digit",
+													});
+										})()}
+									</Text>
+								)}
 							</Group>
 							{hasCommand ? (
 								<>

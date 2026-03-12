@@ -118,6 +118,7 @@ import type {
 } from "./narrator-panel-types";
 import {
 	ACCEPTED_TYPES,
+	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
 	PERM_MODE_ICONS,
 	PERM_MODES,
@@ -224,6 +225,55 @@ function PermModeMenuItems({
 
 const ACCESS_LEVELS = ["readOnly", "readWrite", "full"] as const;
 const DENY_LEVELS = ["denyWrite", "denyAll"] as const;
+
+/**
+ * Resize an image file using an offscreen canvas if its long edge exceeds maxEdge.
+ * Returns the original file if no resize is needed.
+ */
+function resizeImageIfNeeded(file: File, maxEdge: number): Promise<File> {
+	return new Promise((resolve, reject) => {
+		const img = document.createElement("img");
+		const url = URL.createObjectURL(file);
+		img.onload = () => {
+			URL.revokeObjectURL(url);
+			const { naturalWidth: w, naturalHeight: h } = img;
+			if (Math.max(w, h) <= maxEdge) {
+				resolve(file);
+				return;
+			}
+			const scale = maxEdge / Math.max(w, h);
+			const nw = Math.round(w * scale);
+			const nh = Math.round(h * scale);
+			const canvas = document.createElement("canvas");
+			canvas.width = nw;
+			canvas.height = nh;
+			const ctx = canvas.getContext("2d");
+			if (!ctx) {
+				resolve(file);
+				return;
+			}
+			ctx.drawImage(img, 0, 0, nw, nh);
+			// Use the real content type for output (PNG stays PNG, others become JPEG)
+			const outputType = file.type === "image/png" ? "image/png" : "image/jpeg";
+			canvas.toBlob(
+				(blob) => {
+					if (!blob) {
+						resolve(file);
+						return;
+					}
+					resolve(new File([blob], file.name, { type: outputType }));
+				},
+				outputType,
+				0.85,
+			);
+		};
+		img.onerror = () => {
+			URL.revokeObjectURL(url);
+			reject(new Error("Failed to load image"));
+		};
+		img.src = url;
+	});
+}
 
 function CmdPatternInput({
 	placeholder,
@@ -1736,15 +1786,28 @@ export function NarratorPanel({
 		setEditingQueuedText("");
 	};
 
-	const addImages = (files: File[]) => {
+	const addImages = async (files: File[]) => {
 		const valid = files.filter((f) => {
 			if (!ACCEPTED_TYPES.includes(f.type)) return false;
 			if (f.size > MAX_IMAGE_SIZE) return false;
 			return true;
 		});
-		if (valid.length > 0) {
-			setAttachedImages((prev) => [...prev, ...valid]);
+		if (valid.length === 0) return;
+		const processed: File[] = [];
+		for (const f of valid) {
+			// GIF: skip resize (may be animated)
+			if (f.type === "image/gif") {
+				processed.push(f);
+				continue;
+			}
+			try {
+				const resized = await resizeImageIfNeeded(f, MAX_IMAGE_LONG_EDGE);
+				processed.push(resized);
+			} catch {
+				processed.push(f); // fallback to original on error
+			}
 		}
+		setAttachedImages((prev) => [...prev, ...processed]);
 	};
 
 	const handlePaste = (e: React.ClipboardEvent) => {

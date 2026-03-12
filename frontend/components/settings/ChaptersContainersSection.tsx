@@ -12,14 +12,6 @@ export interface ChaptersContainersSectionProps {
 	setAutoSave: (v: boolean) => void;
 	dormantMinutes: number;
 	setDormantMinutes: (v: number) => void;
-	acReminderLines: number;
-	setAcReminderLines: (v: number) => void;
-	acReminderFiles: number;
-	setAcReminderFiles: (v: number) => void;
-	acForceLines: number;
-	setAcForceLines: (v: number) => void;
-	acForceFiles: number;
-	setAcForceFiles: (v: number) => void;
 	portStart: number;
 	setPortStart: (v: number) => void;
 	portEnd: number;
@@ -68,41 +60,6 @@ export function ChaptersContainersSection(props: ChaptersContainersSectionProps)
 				description={t("dormantAfterMinutesDesc")}
 				value={props.dormantMinutes}
 				onChange={(v) => props.setDormantMinutes(typeof v === "number" ? v : 0)}
-				min={0}
-			/>
-
-			{/* Auto-Commit Thresholds */}
-			<Title order={5} mt="sm">
-				{t("autoCommitSection")}
-			</Title>
-			<NumberInput
-				label={t("autoCommitReminderLines")}
-				description={t("autoCommitReminderLinesDesc")}
-				value={props.acReminderLines}
-				onChange={(v) => props.setAcReminderLines(typeof v === "number" ? v : 1000)}
-				min={0}
-				step={50}
-			/>
-			<NumberInput
-				label={t("autoCommitReminderFiles")}
-				description={t("autoCommitReminderFilesDesc")}
-				value={props.acReminderFiles}
-				onChange={(v) => props.setAcReminderFiles(typeof v === "number" ? v : 10)}
-				min={0}
-			/>
-			<NumberInput
-				label={t("autoCommitForceLines")}
-				description={t("autoCommitForceLinesDesc")}
-				value={props.acForceLines}
-				onChange={(v) => props.setAcForceLines(typeof v === "number" ? v : 2000)}
-				min={0}
-				step={100}
-			/>
-			<NumberInput
-				label={t("autoCommitForceFiles")}
-				description={t("autoCommitForceFilesDesc")}
-				value={props.acForceFiles}
-				onChange={(v) => props.setAcForceFiles(typeof v === "number" ? v : 25)}
 				min={0}
 			/>
 
