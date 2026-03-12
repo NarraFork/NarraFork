@@ -156,15 +156,8 @@ function SettingsPage() {
 
 	const handlePwaUpdate = async () => {
 		setPwaUpdating(true);
-		try {
-			const reg = await navigator.serviceWorker?.getRegistration();
-			await reg?.unregister();
-			const keys = await caches.keys();
-			await Promise.allSettled(keys.map((k) => caches.delete(k)));
-		} catch {
-			// ignore — proceed to reload regardless
-		}
-		window.location.reload();
+		const { clearPwaCacheAndReload } = await import("@frontend/lib/pwa");
+		await clearPwaCacheAndReload();
 	};
 
 	// Server

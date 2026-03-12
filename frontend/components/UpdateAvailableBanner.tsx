@@ -64,6 +64,10 @@ export function UpdateAvailableBanner() {
 	};
 
 	const handleRestart = async () => {
+		// Clear PWA cache before restart to ensure fresh assets after update
+		const { clearPwaCache } = await import("@frontend/lib/pwa");
+		await clearPwaCache();
+
 		const result = await restart();
 		if (!result.success) {
 			// Show error - the manual instructions will be displayed
