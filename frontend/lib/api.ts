@@ -1690,6 +1690,30 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ action }),
 		}),
+
+	// Update
+	checkUpdate: () =>
+		request<{
+			updateAvailable: boolean;
+			currentVersion: string;
+			latestVersion?: string;
+			releaseInfo?: {
+				version: string;
+				releaseDate: string;
+				releaseNotes?: string;
+				path: string;
+				sha512: string;
+				files: Array<{ url: string; size: number; sha512: string }>;
+			};
+			downloadSize?: number;
+			totalSize?: number;
+			diffBlocks?: number;
+			totalBlocks?: number;
+		}>("/update/check"),
+	getUpdateVersion: () =>
+		request<{ version: string; platform: string; arch: string }>("/update/version"),
+	getUpdateDirectory: () => request<{ directory: string }>("/update/directory"),
+	cleanupUpdates: () => request<{ success: boolean }>("/update/cleanup", { method: "POST" }),
 };
 
 	text: string,
