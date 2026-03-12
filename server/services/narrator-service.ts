@@ -2812,7 +2812,7 @@ export const narratorService = {
 		}
 
 		// Create narrator + copy refs atomically
-		const resolvedModel = parent.model ?? "claude-sonnet";
+		const resolvedModel = parent.model ?? "claude-sonnet-4.5";
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??

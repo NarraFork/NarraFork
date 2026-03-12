@@ -1,5 +1,6 @@
 {
 	"storyNetwork": "NarraFlow",
+	"rulerPlaceholder": "Ruler Flow — coming soon",
 	"loading": "Loading graph…",
 	"loadFailed": "Failed to load graph: {{message}}",
 	"noChapters": "No chapters yet.",
@@ -70,5 +71,15 @@
 		"openDetails": "Open Details",
 		"commitSummary": "{{count}} commits",
 		"headLabel": "HEAD"
+	},
+	"ruler": {
+		"commitCount": "{{count}} commits",
+		"chapterCount": "{{count}} chapter(s)",
+		"activeCount": "{{count}} active",
+		"forkFromHere": "Fork from here",
+		"mergeToTrunk": "Merge to trunk",
+		"abandon": "Abandon",
+		"resetView": "Reset view (Home)",
+		"noCommitsOnBranch": "No commits on this branch"
 	}
 }

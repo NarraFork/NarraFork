@@ -16,6 +16,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
+import { ensurePrefix } from "../../components/providers/types";
 import { AboutSection } from "../../components/settings/AboutSection";
 import { AgentSection } from "../../components/settings/AgentSection";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
@@ -34,12 +35,6 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-
-/** Ensure a model value has a "provider:" prefix. */
-function ensurePrefix(val: string): string {
-	if (!val || val.includes(":")) return val;
-	return `openai:${val}`;
-}
 
 const ALL_SECTIONS = [
 	"profile",
@@ -164,6 +159,7 @@ function SettingsPage() {
 	const [port, setPort] = useState<number | undefined>();
 	const [host, setHost] = useState("localhost");
 	const [projectDir, setProjectDir] = useState("");
+	const [openBrowser, setOpenBrowser] = useState("app");
 	// Agent
 	const [permissionMode, setPermissionMode] = useState("acceptEdits");
 	const [maxTurns, setMaxTurns] = useState(200);
@@ -206,6 +202,8 @@ function SettingsPage() {
 	// Snapshot of server values for dirty comparison
 	const serverSnapshot = useRef({
 		port: 7778 as number | undefined,
+		host: "localhost",
+		openBrowser: "app",
 		projectDir: "",
 		permissionMode: "acceptEdits",
 		maxTurns: 200,
@@ -250,6 +248,7 @@ function SettingsPage() {
 			const snap = {
 				port: settings.server?.port ?? 7778,
 				host: settings.server?.host ?? "localhost",
+				openBrowser: settings.server?.openBrowser ?? "app",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				maxTurns: settings.agent?.maxTurns ?? 200,
@@ -276,6 +275,7 @@ function SettingsPage() {
 			serverSnapshot.current = snap;
 			setPort(snap.port);
 			setHost(snap.host);
+			setOpenBrowser(snap.openBrowser);
 			setProjectDir(snap.projectDir);
 			setDefaultModel(snap.defaultModel);
 			setPermissionMode(snap.permissionMode);
@@ -310,6 +310,7 @@ function SettingsPage() {
 		return (
 			port !== s.port ||
 			host !== s.host ||
+			openBrowser !== s.openBrowser ||
 			projectDir !== s.projectDir ||
 			defaultModel !== s.defaultModel ||
 			permissionMode !== s.permissionMode ||
@@ -339,6 +340,7 @@ function SettingsPage() {
 		initialized,
 		port,
 		host,
+		openBrowser,
 		projectDir,
 		defaultModel,
 		permissionMode,
@@ -383,7 +385,7 @@ function SettingsPage() {
 	const handleSave = () => {
 		updateSettings.mutate(
 			{
-				server: { port, host },
+				server: { port, host, openBrowser },
 				paths: { defaultProjectDir: projectDir },
 				agent: {
 					defaultModel,
@@ -427,6 +429,8 @@ function SettingsPage() {
 				onSuccess: () => {
 					serverSnapshot.current = {
 						port,
+						host,
+						openBrowser,
 						projectDir,
 						defaultModel,
 						permissionMode,
@@ -621,6 +625,8 @@ function SettingsPage() {
 							setHost={setHost}
 							projectDir={projectDir}
 							setProjectDir={setProjectDir}
+							openBrowser={openBrowser}
+							setOpenBrowser={setOpenBrowser}
 							pwaUpdating={pwaUpdating}
 							handlePwaUpdate={handlePwaUpdate}
 						/>

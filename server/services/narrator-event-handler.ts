@@ -402,14 +402,16 @@ export async function processEvent(
 				// Partial message was already created incrementally via block_complete —
 				// just update final metadata (messageUuid + token usage).
 				savedId = partialId;
-				await db
-					.update(narratorMessages)
-					.set({
-						...(event.messageId ? { messageUuid: event.messageId } : {}),
-						...(tokenUsage?.promptTokens != null ? { tokensIn: tokenUsage.promptTokens } : {}),
-						...(turnUsage ? { turnUsageJson: turnUsage } : {}),
-					})
-					.where(eq(narratorMessages.id, savedId));
+				const updates: Record<string, unknown> = {};
+				if (event.messageId) updates.messageUuid = event.messageId;
+				if (tokenUsage?.promptTokens != null) updates.tokensIn = tokenUsage.promptTokens;
+				if (turnUsage) updates.turnUsageJson = turnUsage;
+				if (Object.keys(updates).length > 0) {
+					await db
+						.update(narratorMessages)
+						.set(updates)
+						.where(eq(narratorMessages.id, savedId));
+				}
 				ctx.setPartialMessageId(undefined);
 			} else {
 				// No partial message — fallback to full persistence

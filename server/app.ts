@@ -30,6 +30,7 @@ import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
 import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
+import { rulerRoutes } from "./routes/ruler";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { skillRoutes } from "./routes/skills";
@@ -103,6 +104,8 @@ app.route("/api/update", updateRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);
+// Ruler routes (new NarraFlow) nested under projects
+app.route("/api/projects", rulerRoutes);
 // Project DB backup/import routes
 app.route("/api/projects", projectDbRoutes);
 

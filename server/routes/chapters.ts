@@ -126,6 +126,17 @@ chapterRoutes.post("/:id/merge", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const userId = c.get("user").sub;
 	const result = await chapterMerge.merge(id, parsed.data, userId);
+	if (!result.success) {
+		return c.json(
+			{
+				...result,
+				error: result.conflictFiles?.length
+					? `Merge conflicts in ${result.conflictFiles.length} file(s): ${result.conflictFiles.slice(0, 5).join(", ")}${result.conflictFiles.length > 5 ? "…" : ""}`
+					: "Merge failed",
+			},
+			409,
+		);
+	}
 	return c.json(result);
 });
 

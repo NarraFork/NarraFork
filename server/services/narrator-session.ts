@@ -1792,7 +1792,7 @@ function triggerMidTurnCompact(
  */
 /** Tool names whose tool_use + tool_result pairs should survive pruning
  *  so the model retains critical context (e.g. the approved plan). */
-const PRUNE_PROTECTED_TOOLS = new Set(["ExitPlanMode"]);
+const PRUNE_PROTECTED_TOOLS = new Set(["ExitPlanMode", "Skill"]);
 
 export function pruneToolCalls(
 	dbMessages: import("../lib/agent/provider").DbMessage[],
@@ -2895,11 +2895,20 @@ async function doRunCustomCompact(
 	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
 
+	// Pass the main session's prune boundary so generateCompactSummary can
+	// start with tool calls already stripped for messages the main loop pruned.
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { pruneBoundaryMessageId: true },
+	});
+	const pruneBoundaryMessageId = narrator?.pruneBoundaryMessageId ?? null;
+
 	try {
 		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
 			narratorId,
 			locale,
 			messages,
+			pruneBoundaryMessageId,
 		);
 
 		// Finalize the compacting marker — atomically sets isCompact=1,

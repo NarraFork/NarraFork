@@ -1228,8 +1228,10 @@ export function NarratorPanel({
 	const lastUserMessageId = useMemo(() => {
 		if (!hydrated || !messagesData?.pages) return undefined;
 		for (const page of messagesData.pages) {
-			for (let i = page.messages.length - 1; i >= 0; i--) {
-				const msg = page.messages[i];
+			const msgs = page.messages;
+			if (!msgs) continue;
+			for (let i = msgs.length - 1; i >= 0; i--) {
+				const msg = msgs[i];
 				if (msg?.role === "user" && !String(msg.id).startsWith("optimistic-")) {
 					return msg.id;
 				}
@@ -1339,6 +1341,7 @@ export function NarratorPanel({
 		let remaining = visibleCount;
 		for (let i = reversed.length - 1; i >= 0 && remaining > 0; i--) {
 			const page = reversed[i];
+			if (!page?.messages) continue;
 			const pageLen = page.messages.length;
 			const maxMsg = Math.min(remaining, pageLen);
 			result.unshift(

@@ -1,4 +1,12 @@
-import { Autocomplete, Button, NumberInput, Stack, Text, Title } from "@mantine/core";
+import {
+	Autocomplete,
+	Button,
+	NumberInput,
+	SegmentedControl,
+	Stack,
+	Text,
+	Title,
+} from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { PathInput } from "../common/PathInput";
@@ -13,6 +21,8 @@ export interface ServerSystemSectionProps {
 	setHost: (v: string) => void;
 	projectDir: string;
 	setProjectDir: (v: string) => void;
+	openBrowser: string;
+	setOpenBrowser: (v: string) => void;
 	pwaUpdating: boolean;
 	handlePwaUpdate: () => void;
 }
@@ -24,6 +34,8 @@ export function ServerSystemSection({
 	setHost,
 	projectDir,
 	setProjectDir,
+	openBrowser,
+	setOpenBrowser,
 	pwaUpdating,
 	handlePwaUpdate,
 }: ServerSystemSectionProps) {
@@ -48,6 +60,23 @@ export function ServerSystemSection({
 				data={HOST_PRESETS}
 			/>
 			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={setProjectDir} />
+			<div>
+				<Text size="sm" fw={500} mb={4}>
+					{t("openBrowser")}
+				</Text>
+				<Text size="xs" c="dimmed" mb={6}>
+					{t("openBrowserDesc")}
+				</Text>
+				<SegmentedControl
+					value={openBrowser}
+					onChange={setOpenBrowser}
+					data={[
+						{ label: t("openBrowserOff"), value: "off" },
+						{ label: t("openBrowserBrowser"), value: "browser" },
+						{ label: t("openBrowserApp"), value: "app" },
+					]}
+				/>
+			</div>
 
 			{/* System Dependencies */}
 			<Title order={5} mt="sm">

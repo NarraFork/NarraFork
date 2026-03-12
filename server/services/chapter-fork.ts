@@ -23,6 +23,8 @@ export interface ForkChapterInput {
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
 	forkAtMessageUuid?: string;
+	/** Explicit commit SHA to fork from (ruler mode). Overrides forkAtMessageUuid. */
+	startCommitSha?: string;
 	/** Chapter role: branch or exploration (trunk is reserved for the root chapter). */
 	role?: "branch" | "exploration";
 	locale?: Locale;
@@ -62,10 +64,11 @@ export const chapterFork = {
 		const id = generateId();
 
 		// Resolve the commit SHA for the fork point.
-		// When forkAtMessageUuid is provided, find the commit associated with that
-		// message (or the nearest earlier message that has a commitSha).
+		// Priority: startCommitSha (ruler mode) > forkAtMessageUuid > parent HEAD
 		let commitSha: string;
-		if (input.forkAtMessageUuid) {
+		if (input.startCommitSha) {
+			commitSha = input.startCommitSha;
+		} else if (input.forkAtMessageUuid) {
 			commitSha = await this.resolveCommitForMessage(
 				parentChapterId,
 				input.forkAtMessageUuid,

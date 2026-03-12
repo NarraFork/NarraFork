@@ -8,6 +8,9 @@ export const projects = sqliteTable("projects", {
 	status: text("status", { enum: ["active", "archived"] })
 		.notNull()
 		.default("active"),
+	flowMode: text("flow_mode", { enum: ["classic", "ruler"] })
+		.notNull()
+		.default("classic"),
 	gitPath: text("git_path"),
 	remoteUrl: text("remote_url"),
 	defaultBranch: text("default_branch").default("main"),
@@ -216,7 +219,7 @@ export const narrators = sqliteTable(
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
 		contextSummary: text("context_summary"),
-		model: text("model").default("claude-sonnet"),
+		model: text("model").default("claude-sonnet-4.5"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
 			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"],

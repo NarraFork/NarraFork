@@ -366,20 +366,8 @@ export const chapterMerge = {
 		});
 		const now = new Date().toISOString();
 
-		// Clean up source chapter's worktree — merged chapters don't need one
-		if (source?.worktreePath) {
-			try {
-				const gitPath = await getProjectGitPath(source.projectId);
-				await terminalService.cleanupForChapter(sourceChapterId);
-				await gitService.removeWorktree(gitPath, source.worktreePath);
-			} catch (err) {
-				logger.warn("Failed to clean up source worktree after merge", {
-					sourceChapterId,
-					error: String(err),
-				});
-			}
-		}
-
+		// Update DB FIRST — if this fails the worktree is still intact and the
+		// chapter remains active, so the user doesn't lose their working directory.
 		await db
 			.update(chapters)
 			.set({
@@ -392,6 +380,22 @@ export const chapterMerge = {
 				updatedAt: now,
 			})
 			.where(eq(chapters.id, sourceChapterId));
+
+		// Clean up source chapter's worktree AFTER DB update — merged chapters
+		// don't need one.  Failure here is non-fatal: the worktree is orphaned
+		// but the DB state is already consistent.
+		if (source?.worktreePath) {
+			try {
+				const gitPath = await getProjectGitPath(source.projectId);
+				await terminalService.cleanupForChapter(sourceChapterId);
+				await gitService.removeWorktree(gitPath, source.worktreePath);
+			} catch (err) {
+				logger.warn("Failed to clean up source worktree after merge", {
+					sourceChapterId,
+					error: String(err),
+				});
+			}
+		}
 
 		// Create merge edge in chapter_edges
 		if (source) {

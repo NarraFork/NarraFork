@@ -33,6 +33,8 @@ export interface AnthropicProviderState {
 /** Ensure a model value has a "provider:" prefix. */
 export function ensurePrefix(val: string): string {
 	if (!val || val.includes(":")) return val;
+	if (["claude-haiku-4.5", "claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"].includes(val))
+	// Legacy short names — map to full IDs
 	return `openai:${val}`;
 }
 

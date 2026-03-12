@@ -1121,6 +1121,59 @@ export const api = {
 			body: JSON.stringify({ positions }),
 		}),
 
+	// === ruler (new NarraFlow) ===
+	getRulerData: (projectId: string, opts?: { limit?: number; skip?: number }) => {
+		const params = new URLSearchParams();
+		if (opts?.limit) params.set("limit", String(opts.limit));
+		if (opts?.skip) params.set("skip", String(opts.skip));
+		const qs = params.toString();
+		return request<ApiEntity>(`/projects/${projectId}/ruler${qs ? `?${qs}` : ""}`);
+	},
+	getRulerSegment: (projectId: string, fromSha: string, toSha?: string) => {
+		const params = new URLSearchParams({ from: fromSha });
+		if (toSha) params.set("to", toSha);
+		return request<ApiEntity>(`/projects/${projectId}/ruler/segment?${params}`);
+	},
+	getSubRulerData: (projectId: string, chapterId: string, opts?: { limit?: number }) => {
+		const params = new URLSearchParams({ chapterId });
+		if (opts?.limit) params.set("limit", String(opts.limit));
+		return request<ApiEntity>(`/projects/${projectId}/ruler/sub?${params}`);
+	},
+	updateRulerPositions: (
+		projectId: string,
+		positions: Array<{ chapterId: string; x: number; y: number }>,
+	) =>
+		request<{ success: boolean }>(`/projects/${projectId}/ruler/positions`, {
+			method: "PATCH",
+			body: JSON.stringify({ positions }),
+		}),
+	rulerFork: (
+		projectId: string,
+		data: {
+			startCommitSha: string;
+			title?: string;
+			inheritMode?: string;
+			parentChapterId?: string;
+		},
+	) =>
+		request<ApiEntity>(`/projects/${projectId}/ruler/fork`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	rulerMerge: (
+		projectId: string,
+		data: { sourceChapterId: string; strategy?: string; message?: string },
+	) =>
+		request<ApiEntity>(`/projects/${projectId}/ruler/merge`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	rulerAbandon: (projectId: string, chapterId: string) =>
+		request<{ success: boolean }>(`/projects/${projectId}/ruler/abandon`, {
+			method: "POST",
+			body: JSON.stringify({ chapterId }),
+		}),
+
 	// === chapter commits ===
 	getChapterCommits: (id: string, params?: { limit?: number; since?: string }) => {
 		const searchParams = new URLSearchParams();

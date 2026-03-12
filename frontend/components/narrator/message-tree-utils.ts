@@ -60,7 +60,7 @@ export function insertChildIntoCache(
 	// Fast path: use index to locate the parent message by parentToolUseId
 	if (index && childMsg.parentToolUseId) {
 		const entry = index.get(childMsg.parentToolUseId);
-		if (entry) {
+		if (entry && entry.pageIdx < old.pages.length && old.pages[entry.pageIdx]) {
 			const pages = [...old.pages];
 			const page = { ...pages[entry.pageIdx] };
 			const { messages, changed } = insertChildAtPath(page.messages, entry.path, childMsg);
@@ -423,6 +423,16 @@ export function mergeFieldsByIndex(
 		return anyChanged ? { ...old, pages } : old;
 	}
 
+	if (entry.pageIdx >= old.pages.length || !old.pages[entry.pageIdx]) {
+		// Index is stale (page was trimmed or removed) — fall back to full traversal
+		let anyChanged = false;
+		const pages = old.pages.map((page) => {
+			const { messages, changed } = mergeToolCallFieldsInTree(page.messages, toolUseId, fields);
+			if (changed) anyChanged = true;
+			return changed ? { ...page, messages } : page;
+		});
+		return anyChanged ? { ...old, pages } : old;
+	}
 	const pages = [...old.pages];
 	const page = { ...pages[entry.pageIdx] };
 	page.messages = mergeAtPath(page.messages, entry.path, toolUseId, fields);
@@ -492,7 +502,7 @@ export function upsertSubagentStreamingChunk(
 	// Fast path: use index to locate the parent message
 	if (index) {
 		const entry = index.get(parentToolUseId);
-		if (entry) {
+		if (entry && entry.pageIdx < old.pages.length && old.pages[entry.pageIdx]) {
 			const pages = [...old.pages];
 			const page = { ...pages[entry.pageIdx] };
 			const { messages, changed } = upsertStreamingChildAtPath(
@@ -709,7 +719,7 @@ export function removeSubagentStreamingChunk(
 	// Fast path: use index
 	if (index) {
 		const entry = index.get(parentToolUseId);
-		if (entry) {
+		if (entry && entry.pageIdx < old.pages.length && old.pages[entry.pageIdx]) {
 			const pages = [...old.pages];
 			const page = { ...pages[entry.pageIdx] };
 			const { messages, changed } = removeStreamingChildAtPath(

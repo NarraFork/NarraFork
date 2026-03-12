@@ -1,5 +1,3 @@
-import { getCodexManager } from "../codex-manager";
-import { logger } from "../logger";
 import {
 	getAnthropicProviderConfig,
 	getOpenaiProviderConfig,
@@ -188,45 +186,6 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	return null;
 }
 
-	const seen = new Set<string>();
-	const providers: string[] = [];
-
-	for (const p of settings.openaiProviders ?? []) {
-		if (!p.apiKey) continue;
-		if (!seen.has(p.prefix)) {
-			seen.add(p.prefix);
-			providers.push(p.prefix);
-		}
-	}
-
-	for (const p of settings.anthropicProviders ?? []) {
-		if (!p.apiKey) continue;
-		if (!seen.has(p.prefix)) {
-			seen.add(p.prefix);
-			providers.push(p.prefix);
-		}
-	}
-
-		if (!p.apiKey || !p.baseUrl) continue;
-		if (!seen.has(p.prefix)) {
-			seen.add(p.prefix);
-			providers.push(p.prefix);
-		}
-	}
-
-	if (!seen.has("codex") && settings.codex) {
-		try {
-			if (getCodexManager().availableCount > 0) {
-				providers.push("codex");
-			}
-		} catch {
-			// Ignore codex manager errors during fallback discovery
-		}
-	}
-
-	return providers;
-}
-
 function defaultModelForProvider(provider: string): string | null {
 	if (provider === "codex") {
 		const custom = settings.agent.customModels ?? [];
@@ -288,40 +247,17 @@ function buildResolution(
 	};
 }
 
-	requestedProvider: string,
-	requestedModel: string,
-): ProviderResolution | null {
-		const adapter = createProviderByName(name);
-		if (adapter) {
-			return buildResolution(requestedProvider, requestedModel, name, adapter);
-		}
-	}
-	return null;
-}
-
 export function resolveProviderAndModel(model?: string): ProviderResolution {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const requestedProvider = resolveProvider(requestedModel);
 
-			if (fallback) {
-					requestedProvider,
-					requestedModel,
-					fallbackProvider: fallback.provider,
-					fallbackModel: fallback.model,
-				});
-				return fallback;
-			}
+			throw new Error(
+					`Please choose a different model or remove the environment variable.`,
+			);
 		}
 
-		}
-
-		if (fallback) {
-				requestedProvider,
-				requestedModel,
-				fallbackProvider: fallback.provider,
-				fallbackModel: fallback.model,
-			});
-			return fallback;
+			throw new Error(
+			);
 		}
 
 	}
@@ -331,23 +267,9 @@ export function resolveProviderAndModel(model?: string): ProviderResolution {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
 	}
 
-	if (fallback) {
-		logger.warn("Unknown provider requested, falling back to configured provider", {
-			requestedProvider,
-			requestedModel,
-			fallbackProvider: fallback.provider,
-			fallbackModel: fallback.model,
-		});
-		return fallback;
-	}
-
-			requestedProvider,
-			requestedModel,
-		});
-	}
-
 	throw new Error(
-		`Provider "${requestedProvider}" is not configured, and no fallback provider is available.`,
+		`Provider "${requestedProvider}" is not configured. ` +
+			`Please check your provider settings or choose a different model.`,
 	);
 }
 

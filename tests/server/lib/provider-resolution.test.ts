@@ -155,19 +155,19 @@ describe("getProvider fallback behavior", () => {
 	});
 
 		addOpenaiProvider("deepseek");
-		expect(provider.constructor.name).toBe("OpenAIProvider");
 	});
 
+	});
+
+	test("unknown provider 直接报错而非静默回退", () => {
+		addOpenaiProvider("deepseek");
+		expect(() => getProvider("unknown-provider")).toThrow(
+			/Provider "unknown-provider" is not configured/,
 		);
 	});
 
-		addOpenaiProvider("deepseek");
-		const provider = getProvider("unknown-provider");
-		expect(provider.constructor.name).toBe("OpenAIProvider");
-	});
-
 		expect(() => getProvider("unknown-provider")).toThrow(
-			'Provider "unknown-provider" is not configured, and no fallback provider is available.',
+			/Provider "unknown-provider" is not configured/,
 		);
 	});
 
@@ -197,9 +197,7 @@ describe("resolveProviderAndModel behavior", () => {
 	});
 
 		addOpenaiProvider("deepseek");
-		expect(resolved.provider).toBe("deepseek");
-		expect(resolved.adapter.constructor.name).toBe("OpenAIProvider");
-		expect(resolved.model).toBe("deepseek:gpt-4o");
+		);
 	});
 
 	test("provider 未变更时保留原模型", () => {

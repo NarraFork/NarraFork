@@ -13,7 +13,7 @@ import {
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
-import { IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
 import { settings } from "./lib/settings";
 
@@ -333,7 +333,61 @@ logger.info(`NarraFork server running on http://${host}:${actualPort}`, {
 	metaUrl: import.meta.url,
 });
 
-// Print welcome banner to stdout & auto-open browser on Windows
+/** Open a URL in the user's default browser. */
+function openInBrowser(url: string) {
+	try {
+		if (IS_WINDOWS) {
+			Bun.spawn(["cmd", "/c", "start", url], { stdio: ["ignore", "ignore", "ignore"] });
+		} else if (IS_MACOS) {
+			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
+		} else {
+			Bun.spawn(["xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] });
+		}
+	} catch {
+		// Not critical — user can open manually
+	}
+}
+
+/** Try to open the URL in Chromium's --app mode (frameless window); fall back to default browser. */
+async function openAsApp(url: string) {
+	const candidates: string[][] = IS_WINDOWS
+		? [
+				["cmd", "/c", "start", "", "msedge", `--app=${url}`],
+				["cmd", "/c", "start", "", "chrome", `--app=${url}`],
+			]
+		: IS_MACOS
+			? [
+					["open", "-a", "Google Chrome", url, "--args", `--app=${url}`],
+					["open", "-a", "Microsoft Edge", url, "--args", `--app=${url}`],
+					["open", "-a", "Chromium", url, "--args", `--app=${url}`],
+				]
+			: [
+					["google-chrome", `--app=${url}`],
+					["google-chrome-stable", `--app=${url}`],
+					["chromium", `--app=${url}`],
+					["chromium-browser", `--app=${url}`],
+					["microsoft-edge", `--app=${url}`],
+				];
+
+	for (const cmd of candidates) {
+		try {
+			const proc = Bun.spawn(cmd, { stdio: ["ignore", "ignore", "ignore"] });
+			// On Unix, check if the process exits immediately with an error
+			if (!IS_WINDOWS) {
+				// Give it a moment to fail (e.g. command not found)
+				const exited = proc.exited;
+				const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
+				const result = await Promise.race([exited, timeout]);
+				if (result !== null && result !== 0) continue;
+			}
+			return;
+		} catch {}
+	}
+	// All --app candidates failed, fall back to default browser
+	openInBrowser(url);
+}
+
+// Print welcome banner to stdout & auto-open browser
 {
 	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
@@ -345,12 +399,11 @@ logger.info(`NarraFork server running on http://${host}:${actualPort}`, {
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
 
-	if (IS_WINDOWS) {
-		try {
-			Bun.spawn(["cmd", "/c", "start", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} catch {
-			// Failed to auto-open browser, not critical
-		}
+	const openMode = settings.server.openBrowser;
+	if (openMode === "app") {
+		openAsApp(url);
+	} else if (openMode === "browser") {
+		openInBrowser(url);
 	}
 }
 

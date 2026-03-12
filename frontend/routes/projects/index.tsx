@@ -37,6 +37,7 @@ function ProjectListPage() {
 	const [name, setName] = useState("");
 	const [nameError, setNameError] = useState("");
 	const [repoMode, setRepoMode] = useState<string>("existing");
+	const [flowMode, setFlowMode] = useState<string>("classic");
 	const [repoPath, setRepoPath] = useState("");
 	const [repoPathError, setRepoPathError] = useState("");
 	const [cloneUrl, setCloneUrl] = useState("");
@@ -55,6 +56,7 @@ function ProjectListPage() {
 		setName("");
 		setNameError("");
 		setRepoMode("existing");
+		setFlowMode("classic");
 		setRepoPath("");
 		setRepoPathError("");
 		setCloneUrl("");
@@ -115,6 +117,7 @@ function ProjectListPage() {
 		const data: Record<string, any> = {
 			name: name.trim(),
 			repoMode,
+			flowMode,
 			gitPath: repoPath.trim() || undefined,
 		};
 
@@ -233,6 +236,21 @@ function ProjectListPage() {
 									? t("repoModeInitDesc")
 									: t("repoModeCloneDesc")}
 						</Text>
+					</div>
+					<div>
+						<Text size="sm" fw={500} mb={4}>
+							{t("flowMode", "Flow Mode")}
+						</Text>
+						<SegmentedControl
+							fullWidth
+							value={flowMode}
+							onChange={setFlowMode}
+							data={[
+								{ value: "classic", label: t("flowModeClassic", "Classic") },
+								{ value: "ruler", label: t("flowModeRuler", "Ruler") },
+							]}
+							disabled={isCloning}
+						/>
 					</div>
 					{repoMode === "clone" && (
 						<>

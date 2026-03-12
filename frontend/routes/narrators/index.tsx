@@ -869,7 +869,7 @@ function NarratorsPage() {
 						searchable
 						value={selectedModel || null}
 						onChange={(v) => setSelectedModel(v ?? "")}
-						placeholder={settingsData?.agent?.defaultModel ?? "claude-sonnet"}
+						placeholder={settingsData?.agent?.defaultModel ?? "claude-sonnet-4.5"}
 						clearable
 						maxDropdownHeight={320}
 						comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}

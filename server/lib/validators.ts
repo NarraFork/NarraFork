@@ -63,6 +63,7 @@ export const createProjectSchema = z.object({
 	// Clone-specific fields
 	cloneUrl: z.string().min(1).optional(),
 	cloneBranch: gitBranchName.optional(),
+	flowMode: z.enum(["classic", "ruler"]).default("classic"),
 });
 
 export const updateProjectSchema = z.object({
@@ -264,9 +265,33 @@ export const forkChapterSchema = z.object({
 	description: z.string().max(2000).optional(),
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	forkAtMessageUuid: z.string().optional(),
+	/** Explicit commit SHA to fork from (ruler mode). Overrides forkAtMessageUuid. */
+	startCommitSha: z.string().optional(),
+	/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
+	parentChapterId: z.string().optional(),
 	role: z.enum(["branch", "exploration"]).default("branch"),
 	positionX: z.number().optional(),
 	positionY: z.number().optional(),
+});
+
+export const rulerMergeSchema = z.object({
+	sourceChapterId: z.string().min(1),
+	strategy: z.enum(["merge", "squash"]).default("merge"),
+	message: z.string().max(500).optional(),
+});
+
+export const rulerAbandonSchema = z.object({
+	chapterId: z.string().min(1),
+});
+
+export const updateRulerPositionsSchema = z.object({
+	positions: z.array(
+		z.object({
+			chapterId: z.string().min(1),
+			x: z.number(),
+			y: z.number(),
+		}),
+	),
 });
 
 export const createReviewSchema = z.object({

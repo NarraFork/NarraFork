@@ -118,38 +118,29 @@ export async function handleContextOverflow(opts: {
 		}
 	}
 
-	// ── Step 2: Emergency compact with increasing keepPairs ──────────────
-	const maxKeepPairs = 8;
-	for (let keepPairs = 2; keepPairs <= maxKeepPairs; keepPairs++) {
-		const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
-			narratorId,
-			keepPairs,
-		);
-		if (!boundaryMessageId) {
-			logger.warn("No compact boundary found", { narratorId, keepPairs });
-			break;
-		}
-
-		try {
-			await runCustomCompact(narratorId, locale, boundaryMessageId);
-			const newConversationId = randomUUID();
-			onBroadcast?.({ type: "compact_done", narratorId });
-			logger.info("Emergency compact succeeded, retrying", {
-				narratorId,
-				keepPairs,
-			});
-			return { action: "retry_compacted", newConversationId, overflowRetries };
-		} catch (compactErr) {
-			logger.error("Emergency compact attempt failed", {
-				narratorId,
-				keepPairs,
-				error: String(compactErr),
-			});
-		}
+	// ── Step 2: Emergency compact ────────────────────────────────────────
+	// generateCompactSummary now handles progressive input fitting internally
+	// (pruning tool calls + dropping old messages to fit the summary model's
+	// context window), so a single compact attempt with keepPairs=2 suffices.
+	const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+	if (!boundaryMessageId) {
+		logger.warn("No compact boundary found", { narratorId });
+		return { action: "failed", overflowRetries };
 	}
 
-	// All attempts exhausted
-	logger.error("All emergency compact attempts failed", { narratorId });
+	try {
+		await runCustomCompact(narratorId, locale, boundaryMessageId);
+		const newConversationId = randomUUID();
+		onBroadcast?.({ type: "compact_done", narratorId });
+		logger.info("Emergency compact succeeded, retrying", { narratorId });
+		return { action: "retry_compacted", newConversationId, overflowRetries };
+	} catch (compactErr) {
+		logger.error("Emergency compact failed", {
+			narratorId,
+			error: String(compactErr),
+		});
+	}
+
 	return { action: "failed", overflowRetries };
 }
 

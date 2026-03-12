@@ -1,5 +1,6 @@
 {
 	"storyNetwork": "叙事线",
+	"rulerPlaceholder": "标尺模式 — 即将推出",
 	"loading": "加载图谱中…",
 	"loadFailed": "加载图谱失败：{{message}}",
 	"noChapters": "暂无章节。",
@@ -70,5 +71,15 @@
 		"openDetails": "打开详情",
 		"commitSummary": "{{count}} 次提交",
 		"headLabel": "HEAD"
+	},
+	"ruler": {
+		"commitCount": "{{count}} 次提交",
+		"chapterCount": "{{count}} 个章节",
+		"activeCount": "{{count}} 个活跃",
+		"forkFromHere": "从此处分叉",
+		"mergeToTrunk": "合并到主线",
+		"abandon": "放弃",
+		"resetView": "重置视图 (Home)",
+		"noCommitsOnBranch": "该分支暂无提交"
 	}
 }

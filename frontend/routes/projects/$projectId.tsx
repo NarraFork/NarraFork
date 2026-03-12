@@ -24,6 +24,7 @@ import { ProjectCommandsModal } from "../../components/project/ProjectCommandsMo
 import { ProjectRoutinesModal } from "../../components/project/ProjectRoutinesModal";
 import { ProjectSettingsModal } from "../../components/project/ProjectSettingsModal";
 import { ProjectSkillsModal } from "../../components/project/ProjectSkillsModal";
+import { RulerFlow } from "../../components/ruler/RulerFlow";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
@@ -161,7 +162,11 @@ function ProjectDetailPage() {
 
 			{/* Graph canvas */}
 			<Box style={{ flex: 1, minHeight: 0 }}>
-				<NarraFlow projectId={projectId} focusChapterId={focus} />
+				{project?.flowMode === "ruler" ? (
+					<RulerFlow projectId={projectId} focusChapterId={focus} />
+				) : (
+					<NarraFlow projectId={projectId} focusChapterId={focus} />
+				)}
 			</Box>
 
 			{/* New chapter modal */}

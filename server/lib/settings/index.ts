@@ -100,7 +100,12 @@ export interface McpServerConfig {
 }
 
 export interface NarraForkSettings {
-	server: { port: number; host: string };
+	server: {
+		port: number;
+		host: string;
+		/** Browser launch behaviour on server start: "off" | "browser" | "app" */
+		openBrowser: "off" | "browser" | "app";
+	};
 	paths: { defaultProjectDir: string };
 	agent: {
 		defaultModel: string;
@@ -215,7 +220,7 @@ export interface NarraForkSettings {
 }
 
 const DEFAULTS: NarraForkSettings = {
-	server: { port: 7778, host: "localhost" },
+	server: { port: 7778, host: "localhost", openBrowser: "app" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
 		defaultPermissionMode: "acceptEdits",
@@ -414,6 +419,15 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
 
+	"claude-haiku-4.5",
+	"claude-sonnet-4.5",
+	"claude-opus-4.5",
+	"claude-opus-4.6",
+	// Legacy short names (for resolveProvider backward compat)
+	"claude-haiku",
+	"claude-sonnet",
+	"claude-opus",
+];
 const BUILTIN_CODEX_MODELS = [
 	"gpt-5.4",
 	"gpt-5.3-codex",
