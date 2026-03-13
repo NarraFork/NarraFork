@@ -149,6 +149,7 @@ export type AgentEvent =
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "invalid_state"; reason: string; message: string }
+	| { type: "output_truncated"; message: string }
 	| {
 			type: "web_search";
 			id: string;

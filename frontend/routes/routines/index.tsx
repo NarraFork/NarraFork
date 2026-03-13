@@ -357,19 +357,28 @@ function GlobalSkillsTab() {
 						label={t("skillName")}
 						placeholder={t("skillNamePlaceholder")}
 						value={draft.name}
-						onChange={(e) => setDraft((d) => ({ ...d, name: e.currentTarget.value }))}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, name: val }));
+						}}
 					/>
 					<TextInput
 						label={t("skillDescription")}
 						placeholder={t("skillDescriptionPlaceholder")}
 						value={draft.description}
-						onChange={(e) => setDraft((d) => ({ ...d, description: e.currentTarget.value }))}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, description: val }));
+						}}
 					/>
 					<Textarea
 						label={t("skillContent")}
 						placeholder={t("skillContentPlaceholder")}
 						value={draft.content}
-						onChange={(e) => setDraft((d) => ({ ...d, content: e.currentTarget.value }))}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, content: val }));
+						}}
 						autosize
 						minRows={8}
 						maxRows={20}

@@ -451,6 +451,10 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 	logger.error("Merge session cleanup failed", { error: String(err) });
 });
 
+// Clean up leftover share directories from previous server runs
+import { cleanupStaleShares } from "./lib/shares";
+cleanupStaleShares();
+
 // Register project DB backup sync (event-driven dual-write)
 registerProjectDbSync();
 

@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PendingPermission } from "../components/narrator/ToolCallCard";
 import type { TreeMessage } from "../lib/api";
-import { getToken } from "../lib/api";
-import { buildWsUrl, safeCloseWs } from "../lib/ws";
-import { removeWSStatus, setWSStatus } from "../lib/ws-status";
+import {
+	type ListenerHandle,
+	narratorWSManager,
+	type SubscriptionHandle,
+} from "../lib/narrator-ws-manager";
 
 interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
@@ -23,6 +25,7 @@ interface NarratorWSCallbacks {
 		toolName: string,
 		streamStartedAt?: number,
 		input?: Record<string, unknown>,
+		parentToolUseId?: string,
 	) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
@@ -39,8 +42,9 @@ interface NarratorWSCallbacks {
 		durationMs?: number,
 		updatedInput?: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
+		parentToolUseId?: string,
 	) => void;
-	onToolLongRunning?: (toolUseId: string, elapsed: number) => void;
+	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (
 		todos: { id?: string; content?: string; status?: string }[],
@@ -116,25 +120,14 @@ interface NarratorWSCallbacks {
 	}) => void;
 }
 
-const RECONNECT_BASE_DELAY_MS = 1000;
-const RECONNECT_MAX_DELAY_MS = 30_000;
-const DISCONNECTED_THRESHOLD = 3;
-/** If no ping is received within this window, assume the connection is dead. */
-const CLIENT_PING_TIMEOUT_MS = 60_000;
-
 export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
 	lastMessageId?: string,
 ) {
-	const wsRef = useRef<WebSocket | null>(null);
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
 	const lastMessageIdRef = useRef(lastMessageId);
-	// Keep in sync with the prop, and allow internal updates from
-	// incoming WS messages so that reconnect catch-up uses the latest cursor.
-	// When the prop becomes undefined (e.g. narrator switch), clear the ref
-	// so reconnect doesn't use a stale cursor from a different narrator.
 	useEffect(() => {
 		if (lastMessageId !== undefined) {
 			lastMessageIdRef.current = lastMessageId;
@@ -142,327 +135,308 @@ export function useNarratorWS(
 			lastMessageIdRef.current = undefined;
 		}
 	}, [lastMessageId]);
-	const [connected, setConnected] = useState(false);
-	const [disconnected, setDisconnected] = useState(false);
-	const disconnectedRef = useRef(false);
-	const [reconnectKey, setReconnectKey] = useState(0);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectKey triggers manual reconnection
+	const [connected, setConnected] = useState(narratorWSManager.connected);
+	const [disconnected, setDisconnected] = useState(narratorWSManager.disconnected);
+
 	useEffect(() => {
 		if (!narratorId) return;
 
-		const wsStatusId = `narrator:${narratorId}`;
-		// Capture the narratorId for this effect invocation so we can guard
-		// against stale messages that arrive after the user navigated away
-		// (e.g. in-flight events from a pre-fork narrator).
 		const subscribedId = narratorId;
 
-		function syncGlobalStatus(isConnected: boolean) {
-			setWSStatus(wsStatusId, {
-				label: `Narrator`,
-				connected: isConnected,
-				reconnect: () => setReconnectKey((k) => k + 1),
-			});
-		}
+		// Subscribe to this narrator
+		const subHandle: SubscriptionHandle = narratorWSManager.subscribe(
+			[subscribedId],
+			lastMessageIdRef.current ? { lastMessageId: lastMessageIdRef.current } : undefined,
+		);
 
-		// Per-invocation flag: set to true when this effect is cleaned up.
-		// Each effect run gets its own `cancelled` captured by its closures,
-		// preventing stale onclose handlers from spawning duplicate connections.
-		let cancelled = false;
-		let attempts = 0;
-		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-		let pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		// Join presence
+		narratorWSManager.joinPresence(subscribedId, subHandle._id);
 
-		function resetPingTimeout(ws: WebSocket) {
-			clearTimeout(pingTimeoutTimer);
-			pingTimeoutTimer = setTimeout(() => {
-				// No ping received within the timeout window — assume dead connection
-				if (!cancelled && ws.readyState === WebSocket.OPEN) {
-					ws.close(4000, "ping timeout");
-				}
-			}, CLIENT_PING_TIMEOUT_MS);
-		}
+		// Register message listener
+		const listenerHandle: ListenerHandle = narratorWSManager.addListener(
+			{ narratorIds: [subscribedId] },
+			(data) => {
+				// Guard: discard messages targeting a different narrator
+				if (data.narratorId && data.narratorId !== subscribedId) return;
 
-		function connect() {
-			if (cancelled) return;
-
-			const token = getToken();
-			const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
-			const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
-			wsRef.current = ws;
-
-			ws.onopen = () => {
-				if (cancelled) {
-					ws.close();
-					return;
-				}
-				setConnected(true);
-				setDisconnected(false);
-				disconnectedRef.current = false;
-				attempts = 0;
-				syncGlobalStatus(true);
-				resetPingTimeout(ws);
-				const subscribeMsg: Record<string, unknown> = {
-					type: "subscribe",
-					narratorIds: [subscribedId],
-				};
-				if (lastMessageIdRef.current) {
-					subscribeMsg.lastMessageId = lastMessageIdRef.current;
-				}
-				ws.send(JSON.stringify(subscribeMsg));
-				ws.send(JSON.stringify({ type: "presence_join", narratorId: subscribedId }));
-			};
-			ws.onmessage = (event) => {
-				if (cancelled) return;
-				try {
-					const data = JSON.parse(event.data);
-					// Respond to server heartbeat ping and reset timeout
-					if (data.type === "ping") {
-						ws.send(JSON.stringify({ type: "pong" }));
-						resetPingTimeout(ws);
-						return;
-					}
-					// Guard: discard messages targeting a different narrator.
-					// This prevents stale in-flight events (e.g. from a pre-fork
-					// narrator) from being applied to the wrong message cache when
-					// the user navigates between narrators.
-					if (data.narratorId && data.narratorId !== subscribedId) return;
-					switch (data.type) {
-						case "message":
-							callbacksRef.current.onMessage?.(data);
-							if (data.message?.id) lastMessageIdRef.current = data.message.id;
-							break;
-						case "user_message":
-							callbacksRef.current.onUserMessage?.(data);
-							if (data.message?.id) lastMessageIdRef.current = data.message.id;
-							break;
-						case "stream_event":
-							callbacksRef.current.onStreamEvent?.(data);
-							break;
-						case "permission_request":
-							if (data.request) {
-								callbacksRef.current.onPermissionRequest?.(data.request);
-							}
-							break;
-						case "permission_resolved":
-							callbacksRef.current.onPermissionResolved?.(
-								data.requestId,
-								data.toolUseId,
-								data.updatedInput,
-								data.decision,
-								data.feedbackText,
-							);
-							break;
-						case "status_change":
-							callbacksRef.current.onStatusChange?.(data.status);
-							break;
-						case "tool_started":
-							callbacksRef.current.onToolStarted?.(
-								data.toolUseId,
-								data.toolName,
-								data.streamStartedAt,
-								data.input,
-							);
-							break;
-						case "tool_use_chunk":
-							callbacksRef.current.onToolUseChunk?.(
-								data.toolUseId,
-								data.toolName,
-								data.inputCharsTotal,
-								data.parentToolUseId,
-								data.extractedFilePath,
-								data.contentCharsReceived,
-							);
-							break;
-						case "tool_completed":
-							callbacksRef.current.onToolCompleted?.(
-								data.toolUseId,
-								data.status,
-								data.output,
-								data.durationMs,
-								data.updatedInput,
-								data.metadata,
-							);
-							break;
-						case "tool_long_running":
-							callbacksRef.current.onToolLongRunning?.(data.toolUseId, data.elapsed);
-							break;
-						case "todos_updated":
-							callbacksRef.current.onTodosUpdated?.(data.todos, data.toolUseId);
-							break;
-						case "title_updated":
-							callbacksRef.current.onTitleUpdated?.(data.title);
-							break;
-						case "buffer_set":
-							callbacksRef.current.onBufferSet?.(data.messages);
-							break;
-						case "buffer_consumed":
-							callbacksRef.current.onBufferConsumed?.(data.messageId, data.remaining);
-							break;
-						case "buffer_cleared":
-							callbacksRef.current.onBufferCleared?.(data.reason);
-							break;
-						case "permission_mode_changed":
-							callbacksRef.current.onPermissionModeChanged?.(data.permissionMode);
-							break;
-						case "relaxed_plan_changed":
-							callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan);
-							break;
-						case "compacting":
-							callbacksRef.current.onCompacting?.();
-							break;
-						case "compact_done":
-						case "compact_failed":
-							callbacksRef.current.onCompactDone?.();
-							break;
-						case "context_usage":
-							if (!data.isSubagent) {
-								callbacksRef.current.onContextUsage?.(
-									data.percentage,
-									data.promptTokens,
-									data.contextWindow,
-								);
-							}
-							break;
-						case "prune_boundary":
-							callbacksRef.current.onPruneBoundary?.(
-								data.boundaryMessageId ?? null,
-								data.prunedPercent ?? null,
-							);
-							break;
-						case "git_status":
-							if (data.chapterId) {
-								callbacksRef.current.onGitStatus?.({
-									chapterId: data.chapterId,
-									commitsAhead: data.commitsAhead ?? 0,
-									baseBranch: data.baseBranch ?? "",
-									linesAdded: data.linesAdded ?? 0,
-									linesRemoved: data.linesRemoved ?? 0,
-								});
-							}
-							break;
-						case "metering":
-							if (!data.isSubagent) {
-								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
-							}
-							break;
-							break;
-						case "web_search":
-							callbacksRef.current.onWebSearch?.(data.id, data.status, data.query, data.queries);
-							break;
-						case "narrator_error":
-							callbacksRef.current.onNarratorError?.(data.error);
-							break;
-						case "warning":
-							callbacksRef.current.onNarratorWarning?.(data.message);
-							break;
-						case "catch_up": {
-							const topLevel: TreeMessage[] = data.topLevel ?? [];
-							const orphanChildren: TreeMessage[] = data.orphanChildren ?? [];
-							callbacksRef.current.onCatchUp?.(orphanChildren, topLevel);
-							// Update cursor to the latest caught-up message
-							if (topLevel.length > 0) {
-								lastMessageIdRef.current = topLevel[topLevel.length - 1].id;
-							}
-							break;
+				switch (data.type) {
+					case "message":
+						callbacksRef.current.onMessage?.(
+							data as { message?: TreeMessage; [key: string]: unknown },
+						);
+						if ((data.message as TreeMessage | undefined)?.id) {
+							const msgId = (data.message as TreeMessage).id;
+							lastMessageIdRef.current = msgId;
+							narratorWSManager.updateLastMessageId(subscribedId, msgId);
 						}
-						case "full_reload":
-							callbacksRef.current.onFullReload?.();
-							break;
-						case "messages_deleted":
-							if (data.deletedMessageIds) {
-								callbacksRef.current.onMessagesDeleted?.(data.deletedMessageIds);
-							}
-							break;
-						case "message_updated":
-							if (data.message) {
-								callbacksRef.current.onMessageUpdated?.(data.message as TreeMessage);
-							}
-							break;
-						case "commits_updated":
-							if (data.chapterId) {
-								callbacksRef.current.onCommitsUpdated?.(data.chapterId, data.newCount ?? 0);
-							}
-							break;
-						case "background_task_started":
-							callbacksRef.current.onBackgroundTaskStarted?.(
-								data.taskNarratorId,
-								data.toolUseId,
-								data.subagentType,
+						break;
+					case "user_message":
+						callbacksRef.current.onUserMessage?.(
+							data as { message?: TreeMessage; [key: string]: unknown },
+						);
+						if ((data.message as TreeMessage | undefined)?.id) {
+							const msgId = (data.message as TreeMessage).id;
+							lastMessageIdRef.current = msgId;
+							narratorWSManager.updateLastMessageId(subscribedId, msgId);
+						}
+						break;
+					case "stream_event":
+						callbacksRef.current.onStreamEvent?.(data);
+						break;
+					case "permission_request":
+						if (data.request) {
+							callbacksRef.current.onPermissionRequest?.(data.request as PendingPermission);
+						}
+						break;
+					case "permission_resolved":
+						callbacksRef.current.onPermissionResolved?.(
+							data.requestId as string,
+							data.toolUseId as string | undefined,
+							data.updatedInput as Record<string, unknown> | undefined,
+							data.decision as "allow" | "deny" | undefined,
+							data.feedbackText as string | undefined,
+						);
+						break;
+					case "status_change":
+						callbacksRef.current.onStatusChange?.(data.status as string);
+						break;
+					case "tool_started":
+						callbacksRef.current.onToolStarted?.(
+							data.toolUseId as string,
+							data.toolName as string,
+							data.streamStartedAt as number | undefined,
+							data.input as Record<string, unknown> | undefined,
+							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "tool_use_chunk":
+						callbacksRef.current.onToolUseChunk?.(
+							data.toolUseId as string,
+							data.toolName as string,
+							data.inputCharsTotal as number,
+							data.parentToolUseId as string | undefined,
+							data.extractedFilePath as string | undefined,
+							data.contentCharsReceived as number | undefined,
+						);
+						break;
+					case "tool_completed":
+						callbacksRef.current.onToolCompleted?.(
+							data.toolUseId as string,
+							data.status as string,
+							data.output,
+							data.durationMs as number | undefined,
+							data.updatedInput as Record<string, unknown> | undefined,
+							data.metadata as Record<string, unknown> | undefined,
+							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "tool_long_running":
+						callbacksRef.current.onToolLongRunning?.(
+							data.toolUseId as string,
+							data.elapsed as number,
+							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "todos_updated":
+						callbacksRef.current.onTodosUpdated?.(
+							data.todos as { id?: string; content?: string; status?: string }[],
+							data.toolUseId as string | undefined,
+						);
+						break;
+					case "title_updated":
+						callbacksRef.current.onTitleUpdated?.(data.title as string);
+						break;
+					case "buffer_set":
+						callbacksRef.current.onBufferSet?.(
+							data.messages as Array<{
+								id: string;
+								text: string;
+								bufferedAt: string;
+							}>,
+						);
+						break;
+					case "buffer_consumed":
+						callbacksRef.current.onBufferConsumed?.(
+							data.messageId as string,
+							data.remaining as Array<{
+								id: string;
+								text: string;
+								bufferedAt: string;
+							}>,
+						);
+						break;
+					case "buffer_cleared":
+						callbacksRef.current.onBufferCleared?.(
+							data.reason as "cancelled" | "sent" | "narrator_error",
+						);
+						break;
+					case "permission_mode_changed":
+						callbacksRef.current.onPermissionModeChanged?.(data.permissionMode as string);
+						break;
+					case "relaxed_plan_changed":
+						callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
+						break;
+					case "compacting":
+						callbacksRef.current.onCompacting?.();
+						break;
+					case "compact_done":
+					case "compact_failed":
+						callbacksRef.current.onCompactDone?.();
+						break;
+					case "context_usage":
+						if (!data.isSubagent) {
+							callbacksRef.current.onContextUsage?.(
+								data.percentage as number,
+								data.promptTokens as number | undefined,
+								data.contextWindow as number | undefined,
 							);
-							break;
-						case "background_task_completed":
-							callbacksRef.current.onBackgroundTaskCompleted?.(
-								data.taskNarratorId,
-								data.toolUseId,
-								data.resultPreview,
-							);
-							break;
-						case "background_task_failed":
-							callbacksRef.current.onBackgroundTaskFailed?.(
-								data.taskNarratorId,
-								data.toolUseId,
-								data.error,
-							);
-							break;
-						case "background_task_cancelled":
-							callbacksRef.current.onBackgroundTaskCancelled?.(data.taskNarratorId, data.toolUseId);
-							break;
-						case "presence_update":
-							callbacksRef.current.onPresenceUpdate?.(data.viewers ?? []);
-							break;
-						case "streaming_snapshot":
-							callbacksRef.current.onStreamingSnapshot?.({
-								streamingText: data.streamingText ?? "",
-								streamingReasoning: data.streamingReasoning ?? "",
-								toolChunks: data.toolChunks ?? [],
+						}
+						break;
+					case "prune_boundary":
+						callbacksRef.current.onPruneBoundary?.(
+							(data.boundaryMessageId as string) ?? null,
+							(data.prunedPercent as number) ?? null,
+						);
+						break;
+					case "git_status":
+						if (data.chapterId) {
+							callbacksRef.current.onGitStatus?.({
+								chapterId: data.chapterId as string,
+								commitsAhead: (data.commitsAhead as number) ?? 0,
+								baseBranch: (data.baseBranch as string) ?? "",
+								linesAdded: (data.linesAdded as number) ?? 0,
+								linesRemoved: (data.linesRemoved as number) ?? 0,
 							});
-							break;
+						}
+						break;
+					case "metering":
+						if (!data.isSubagent) {
+							callbacksRef.current.onMetering?.(
+								data.unit as string,
+								data.unitPlural as string,
+								data.usage as number,
+							);
+						}
+						break;
+						break;
+					case "web_search":
+						callbacksRef.current.onWebSearch?.(
+							data.id as string,
+							data.status as "in_progress" | "searching" | "completed",
+							data.query as string | undefined,
+							data.queries as string[] | undefined,
+						);
+						break;
+					case "narrator_error":
+						callbacksRef.current.onNarratorError?.(data.error as string);
+						break;
+					case "warning":
+						callbacksRef.current.onNarratorWarning?.(data.message as string);
+						break;
+					case "catch_up": {
+						const topLevel = (data.topLevel ?? []) as TreeMessage[];
+						const orphanChildren = (data.orphanChildren ?? []) as TreeMessage[];
+						callbacksRef.current.onCatchUp?.(orphanChildren, topLevel);
+						if (topLevel.length > 0) {
+							const lastId = topLevel[topLevel.length - 1].id;
+							lastMessageIdRef.current = lastId;
+							narratorWSManager.updateLastMessageId(subscribedId, lastId);
+						}
+						break;
 					}
-				} catch (err) {
-					if (import.meta.env.DEV) console.warn("[useNarratorWS] Failed to parse WS message:", err);
+					case "full_reload":
+						callbacksRef.current.onFullReload?.();
+						break;
+					case "messages_deleted":
+						if (data.deletedMessageIds) {
+							callbacksRef.current.onMessagesDeleted?.(data.deletedMessageIds as string[]);
+						}
+						break;
+					case "message_updated":
+						if (data.message) {
+							callbacksRef.current.onMessageUpdated?.(data.message as TreeMessage);
+						}
+						break;
+					case "commits_updated":
+						if (data.chapterId) {
+							callbacksRef.current.onCommitsUpdated?.(
+								data.chapterId as string,
+								(data.newCount as number) ?? 0,
+							);
+						}
+						break;
+					case "background_task_started":
+						callbacksRef.current.onBackgroundTaskStarted?.(
+							data.taskNarratorId as string,
+							data.toolUseId as string,
+							data.subagentType as string,
+						);
+						break;
+					case "background_task_completed":
+						callbacksRef.current.onBackgroundTaskCompleted?.(
+							data.taskNarratorId as string,
+							data.toolUseId as string,
+							data.resultPreview as string,
+						);
+						break;
+					case "background_task_failed":
+						callbacksRef.current.onBackgroundTaskFailed?.(
+							data.taskNarratorId as string,
+							data.toolUseId as string,
+							data.error as string,
+						);
+						break;
+					case "background_task_cancelled":
+						callbacksRef.current.onBackgroundTaskCancelled?.(
+							data.taskNarratorId as string,
+							data.toolUseId as string,
+						);
+						break;
+					case "presence_update":
+						callbacksRef.current.onPresenceUpdate?.(
+							(data.viewers ?? []) as Array<{
+								userId: string;
+								username: string;
+								avatarColor: string | null;
+								avatarImageId: string | null;
+							}>,
+						);
+						break;
+					case "streaming_snapshot":
+						callbacksRef.current.onStreamingSnapshot?.({
+							streamingText: (data.streamingText as string) ?? "",
+							streamingReasoning: (data.streamingReasoning as string) ?? "",
+							toolChunks: (data.toolChunks ?? []) as Array<{
+								toolUseId: string;
+								toolName: string;
+								inputCharsTotal: number;
+								parentToolUseId?: string;
+								extractedFilePath?: string;
+								contentCharsReceived?: number;
+								started?: boolean;
+								input?: unknown;
+								streamStartedAt?: number;
+							}>,
+						});
+						break;
 				}
-			};
+			},
+		);
 
-			ws.onclose = () => {
-				if (cancelled) return;
-				setConnected(false);
-				syncGlobalStatus(false);
-				scheduleReconnect();
-			};
-			ws.onerror = () => {
-				if (cancelled) return;
-				setConnected(false);
-			};
-		}
-
-		function scheduleReconnect() {
-			if (cancelled) return;
-			if (attempts >= DISCONNECTED_THRESHOLD && !disconnectedRef.current) {
-				disconnectedRef.current = true;
-				setDisconnected(true);
-				syncGlobalStatus(false);
-			}
-			const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempts, RECONNECT_MAX_DELAY_MS);
-			attempts++;
-			reconnectTimer = setTimeout(connect, delay);
-		}
-
-		connect();
+		// Connection state tracking
+		const unsubConnection = narratorWSManager.onConnectionChange((conn) => {
+			setConnected(conn);
+			setDisconnected(narratorWSManager.disconnected);
+		});
 
 		return () => {
-			cancelled = true;
-			disconnectedRef.current = false;
-			clearTimeout(reconnectTimer);
-			clearTimeout(pingTimeoutTimer);
-			removeWSStatus(wsStatusId);
-			const ws = wsRef.current;
-			safeCloseWs(ws, (w) => {
-				w.send(JSON.stringify({ type: "presence_leave", narratorId: subscribedId }));
-				w.send(JSON.stringify({ type: "unsubscribe", narratorIds: [subscribedId] }));
-			});
+			unsubConnection();
+			narratorWSManager.removeListener(listenerHandle);
+			narratorWSManager.leavePresence(subscribedId, subHandle._id);
+			narratorWSManager.unsubscribe(subHandle);
 		};
-	}, [narratorId, reconnectKey]);
+	}, [narratorId]);
 
 	const sendPermissionDecision = useCallback(
 		(
@@ -474,40 +448,37 @@ export function useNarratorWS(
 			compactAfter?: boolean,
 			updatedPlan?: string,
 		): boolean => {
-			if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
-			wsRef.current.send(
-				JSON.stringify({
-					type: "permission_decision",
-					requestId,
-					decision,
-					message,
-					answers,
-					feedbackText,
-					compactAfter,
-					updatedPlan,
-				}),
-			);
-			return true;
+			return narratorWSManager.send({
+				type: "permission_decision",
+				requestId,
+				decision,
+				message,
+				answers,
+				feedbackText,
+				compactAfter,
+				updatedPlan,
+			});
 		},
 		[],
 	);
 
 	const sendBufferMessage = useCallback((targetNarratorId: string, text: string): boolean => {
-		if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
-		wsRef.current.send(
-			JSON.stringify({ type: "buffer_message", narratorId: targetNarratorId, text }),
-		);
-		return true;
+		return narratorWSManager.send({
+			type: "buffer_message",
+			narratorId: targetNarratorId,
+			text,
+		});
 	}, []);
 
 	const cancelBuffer = useCallback((targetNarratorId: string): boolean => {
-		if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
-		wsRef.current.send(JSON.stringify({ type: "cancel_buffer", narratorId: targetNarratorId }));
-		return true;
+		return narratorWSManager.send({
+			type: "cancel_buffer",
+			narratorId: targetNarratorId,
+		});
 	}, []);
 
 	const reconnect = useCallback(() => {
-		setReconnectKey((k) => k + 1);
+		narratorWSManager.reconnect();
 	}, []);
 
 	return {
@@ -544,145 +515,74 @@ export function useNarratorsListWS(
 	onUpdate: (narratorId: string, event: NarratorListWSEvent) => void,
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
 ) {
-	const wsRef = useRef<WebSocket | null>(null);
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
 	const onGlobalEventRef = useRef(onGlobalEvent);
 	onGlobalEventRef.current = onGlobalEvent;
-	const [connected, setConnected] = useState(false);
-	const [disconnected, setDisconnected] = useState(false);
-	const disconnectedRef = useRef(false);
-	const [reconnectKey, setReconnectKey] = useState(0);
+	const [connected, setConnected] = useState(narratorWSManager.connected);
+	const [disconnected, setDisconnected] = useState(narratorWSManager.disconnected);
 
-	// Stable serialized key for dependency comparison
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds; reconnectKey triggers manual reconnection
+	// Subscription handle ref — persists across ID changes
+	const subHandleRef = useRef<SubscriptionHandle | null>(null);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds
 	useEffect(() => {
-		// Connect if we have narrator IDs to subscribe to, or a global event handler
 		if (!narratorIds.length && !onGlobalEventRef.current) return;
 
-		const wsStatusId = "narrator-list";
-
-		function syncGlobalStatus(isConnected: boolean) {
-			setWSStatus(wsStatusId, {
-				label: "Narrator List",
-				connected: isConnected,
-				reconnect: () => setReconnectKey((k) => k + 1),
-			});
+		// First mount or IDs changed — manage subscription
+		if (!subHandleRef.current) {
+			subHandleRef.current = narratorWSManager.subscribe(narratorIds);
+		} else {
+			narratorWSManager.updateSubscription(subHandleRef.current, narratorIds);
 		}
 
-		let cancelled = false;
-		let attempts = 0;
-		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-		let pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
-		const currentIds = narratorIds;
+		// We don't return cleanup here — that's handled by the mount-only effect below
+	}, [idsKey]);
 
-		function resetPingTimeout(ws: WebSocket) {
-			clearTimeout(pingTimeoutTimer);
-			pingTimeoutTimer = setTimeout(() => {
-				if (!cancelled && ws.readyState === WebSocket.OPEN) {
-					ws.close(4000, "ping timeout");
-				}
-			}, CLIENT_PING_TIMEOUT_MS);
-		}
-
-		function connect() {
-			if (cancelled) return;
-
-			const token = getToken();
-			const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
-			const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
-			wsRef.current = ws;
-
-			ws.onopen = () => {
-				if (cancelled) {
-					ws.close();
-					return;
-				}
-				setConnected(true);
-				setDisconnected(false);
-				disconnectedRef.current = false;
-				attempts = 0;
-				syncGlobalStatus(true);
-				resetPingTimeout(ws);
-				if (currentIds.length) {
-					ws.send(JSON.stringify({ type: "subscribe", narratorIds: currentIds }));
-				}
-			};
-			ws.onmessage = (event) => {
-				if (cancelled) return;
-				try {
-					const data = JSON.parse(event.data);
-					// Respond to server heartbeat ping and reset timeout
-					if (data.type === "ping") {
-						ws.send(JSON.stringify({ type: "pong" }));
-						resetPingTimeout(ws);
-						return;
-					}
-					const nId = data.narratorId;
-					if (data.type === "status_change") {
-						onUpdateRef.current(nId, { type: "status", status: data.status });
-					} else if (data.type === "title_updated") {
-						onUpdateRef.current(nId, { type: "title", title: data.title });
-					} else if (data.type === "permission_mode_changed") {
-						onUpdateRef.current(nId, {
-							type: "permissionMode",
-							permissionMode: data.permissionMode,
-						});
-					} else if (data.type === "presence_update") {
-						onUpdateRef.current(nId, { type: "presence", viewers: data.viewers });
-					} else if (data.type.startsWith("user:")) {
-						onGlobalEventRef.current?.(data);
-					}
-				} catch (err) {
-					if (import.meta.env.DEV)
-						console.warn("[useNarratorsListWS] Failed to parse WS message:", err);
-				}
-			};
-			ws.onclose = () => {
-				if (cancelled) return;
-				setConnected(false);
-				syncGlobalStatus(false);
-				scheduleReconnect();
-			};
-			ws.onerror = () => {
-				if (cancelled) return;
-				setConnected(false);
-			};
-		}
-
-		function scheduleReconnect() {
-			if (cancelled) return;
-			if (attempts >= DISCONNECTED_THRESHOLD && !disconnectedRef.current) {
-				disconnectedRef.current = true;
-				setDisconnected(true);
-				syncGlobalStatus(false);
+	// Mount-only: set up listener + connection tracking, cleanup on unmount
+	useEffect(() => {
+		const listenerHandle = narratorWSManager.addListener({ narratorIds: "*" }, (data) => {
+			const nId = data.narratorId as string | undefined;
+			if (data.type === "status_change") {
+				if (nId) onUpdateRef.current(nId, { type: "status", status: data.status as string });
+			} else if (data.type === "title_updated") {
+				if (nId) onUpdateRef.current(nId, { type: "title", title: data.title as string });
+			} else if (data.type === "permission_mode_changed") {
+				if (nId)
+					onUpdateRef.current(nId, {
+						type: "permissionMode",
+						permissionMode: data.permissionMode as string,
+					});
+			} else if (data.type === "presence_update") {
+				if (nId)
+					onUpdateRef.current(nId, {
+						type: "presence",
+						viewers: data.viewers as NarratorListWSEvent["viewers"],
+					});
+			} else if ((data.type as string).startsWith("user:")) {
+				onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
 			}
-			const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempts, RECONNECT_MAX_DELAY_MS);
-			attempts++;
-			reconnectTimer = setTimeout(connect, delay);
-		}
+		});
 
-		connect();
+		const unsubConnection = narratorWSManager.onConnectionChange((conn) => {
+			setConnected(conn);
+			setDisconnected(narratorWSManager.disconnected);
+		});
 
 		return () => {
-			cancelled = true;
-			disconnectedRef.current = false;
-			clearTimeout(reconnectTimer);
-			clearTimeout(pingTimeoutTimer);
-			removeWSStatus(wsStatusId);
-			const ws = wsRef.current;
-			safeCloseWs(ws, (w) => {
-				if (currentIds.length) {
-					w.send(JSON.stringify({ type: "unsubscribe", narratorIds: currentIds }));
-				}
-			});
+			unsubConnection();
+			narratorWSManager.removeListener(listenerHandle);
+			if (subHandleRef.current) {
+				narratorWSManager.unsubscribe(subHandleRef.current);
+				subHandleRef.current = null;
+			}
 		};
-	}, [idsKey, reconnectKey]);
+	}, []);
 
 	const reconnect = useCallback(() => {
-		setReconnectKey((k) => k + 1);
+		narratorWSManager.reconnect();
 	}, []);
 
 	return { connected, disconnected, reconnect };

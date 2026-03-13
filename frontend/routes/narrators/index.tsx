@@ -52,6 +52,7 @@ import {
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
+import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { formatRelativeTime } from "../../lib/format";
@@ -154,14 +155,20 @@ function NarratorsPage() {
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
 	const qc = useQueryClient();
+	const requireSetup = useSetupWizardGuard();
+
+	const guardedOpen = useCallback(() => {
+		if (!requireSetup()) return;
+		open();
+	}, [requireSetup, open]);
 
 	// Auto-open create modal when navigated with ?create=true
 	useEffect(() => {
 		if (search.create) {
-			open();
+			guardedOpen();
 			setSearch({ create: undefined });
 		}
-	}, [search.create, open, setSearch]);
+	}, [search.create, guardedOpen, setSearch]);
 
 	const { groupedModels, settingsData } = useAllModels();
 
@@ -386,7 +393,7 @@ function NarratorsPage() {
 					<Button variant="subtle" component={Link} to="/narrators/archived">
 						{t("viewArchived")}
 					</Button>
-					<Button onClick={open}>{t("newNarrator")}</Button>
+					<Button onClick={guardedOpen}>{t("newNarrator")}</Button>
 				</Group>
 			</Group>
 
@@ -455,7 +462,7 @@ function NarratorsPage() {
 								</Stack>
 							</Popover.Dropdown>
 						</Popover>
-						<Button size="xs" onClick={open}>
+						<Button size="xs" onClick={guardedOpen}>
 							{t("newNarrator")}
 						</Button>
 					</Group>

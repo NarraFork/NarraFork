@@ -42,6 +42,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let contextLengthExceeded = false;
 	let retryableError: string | undefined;
 	let lastToolNames: string[] = [];
+	let interrupted = false;
 
 	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
 		// When aborted, still process tool_result and error events so:
@@ -87,6 +88,11 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 			retryableError = event.message;
 			break;
 		}
+		if (event.type === "output_truncated") {
+			// Provider confirmed the output was cut off by max_tokens —
+			// mark as interrupted directly, no need for AI judgement.
+			interrupted = true;
+		}
 		if (event.type === "error") {
 			if (event.message !== "Aborted") {
 				finalText = `Error: ${event.message}`;
@@ -104,10 +110,11 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	// Smart interruption check: detect truncated output and flag for auto-continue.
 	// Skip when the previous assistant turn only called TodoWrite — that's a normal
 	// end-of-session pattern where the model updates todos and stops.
-	let interrupted = false;
+	// Also skip when already flagged by output_truncated (provider-confirmed truncation).
 	const skipInterruptionCheck =
 		lastToolNames.length > 0 && lastToolNames.every((n) => n === "TodoWrite");
 	if (
+		!interrupted &&
 		settings.agent.smartInterruptionCheck &&
 		!hasError &&
 		!contextLengthExceeded &&

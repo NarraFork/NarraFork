@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { getToken } from "../lib/api";
-import { buildWsUrl, safeCloseWs } from "../lib/ws";
+import { useEffect, useRef, useState } from "react";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 interface OutputStats {
 	charsPerSec: number;
@@ -8,59 +7,40 @@ interface OutputStats {
 }
 
 /**
- * Subscribe to real-time AI output character rate stats via the narrator WS.
- * Only connects when `enabled` is true.
+ * Subscribe to real-time AI output character rate stats via the global
+ * NarratorWSManager.  Only subscribes when `enabled` is true.
  */
 export function useOutputStats(enabled: boolean): OutputStats {
 	const [stats, setStats] = useState<OutputStats>({ charsPerSec: 0, totalChars: 0 });
-	const wsRef = useRef<WebSocket | null>(null);
-	const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-	const connect = useCallback(() => {
-		if (!enabled) return;
-		const token = getToken();
-		if (!token) return;
-
-		const ws = new WebSocket(buildWsUrl("/ws/narrator", `token=${token}`));
-		wsRef.current = ws;
-
-		ws.onopen = () => {
-			ws.send(JSON.stringify({ type: "subscribe_stats" }));
-		};
-
-		ws.onmessage = (e) => {
-			try {
-				const msg = JSON.parse(e.data);
-				if (msg.type === "output_stats") {
-					setStats({ charsPerSec: msg.charsPerSec, totalChars: msg.totalChars });
-				}
-			} catch {
-				// ignore parse errors
-			}
-		};
-
-		ws.onclose = () => {
-			wsRef.current = null;
-			if (enabled) {
-				reconnectTimer.current = setTimeout(connect, 3000);
-			}
-		};
-	}, [enabled]);
+	const subscribedRef = useRef(false);
 
 	useEffect(() => {
-		if (enabled) {
-			connect();
+		if (!enabled) {
+			setStats({ charsPerSec: 0, totalChars: 0 });
+			return;
 		}
-		return () => {
-			clearTimeout(reconnectTimer.current);
-			const ws = wsRef.current;
-			safeCloseWs(ws, (w) => {
-				w.send(JSON.stringify({ type: "unsubscribe_stats" }));
+
+		// Subscribe to stats
+		narratorWSManager.subscribeStats();
+		subscribedRef.current = true;
+
+		// Listen for output_stats messages
+		const handle = narratorWSManager.addListener({ types: ["output_stats"] }, (data) => {
+			setStats({
+				charsPerSec: data.charsPerSec as number,
+				totalChars: data.totalChars as number,
 			});
-			wsRef.current = null;
+		});
+
+		return () => {
+			narratorWSManager.removeListener(handle);
+			if (subscribedRef.current) {
+				narratorWSManager.unsubscribeStats();
+				subscribedRef.current = false;
+			}
 			setStats({ charsPerSec: 0, totalChars: 0 });
 		};
-	}, [enabled, connect]);
+	}, [enabled]);
 
 	return stats;
 }

@@ -219,6 +219,13 @@ export interface NarraForkSettings {
 		/** Automatically download updates when available. */
 		autoDownload: boolean;
 	};
+	/** File sharing configuration (ShareFile tool). */
+	shares?: {
+		/** Default expiry time in hours for shared files (default: 24). */
+		defaultExpiryHours: number;
+		/** Maximum file/folder size in MB allowed for sharing (default: 500). */
+		maxFileSizeMb: number;
+	};
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -273,6 +280,10 @@ const DEFAULTS: NarraForkSettings = {
 		channel: "stable",
 		checkIntervalMinutes: 60,
 		autoDownload: false,
+	},
+	shares: {
+		defaultExpiryHours: 24,
+		maxFileSizeMb: 500,
 	},
 };
 

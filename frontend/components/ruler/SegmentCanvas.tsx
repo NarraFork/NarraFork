@@ -80,6 +80,10 @@ const DEFAULT_PANEL_WIDTH = 420;
 const DEFAULT_PANEL_HEIGHT = 520;
 const MIN_PANEL_WIDTH = 300;
 const MIN_PANEL_HEIGHT = 200;
+/** Cards (collapsed) are rendered within 3× the cross-axis viewport */
+const CARD_CROSS_MULTIPLIER = 3;
+/** Expanded narrator panels are rendered within 1.5× the cross-axis viewport */
+const PANEL_CROSS_MULTIPLIER = 1.5;
 
 export const SegmentCanvas = memo(
 	function SegmentCanvas({
@@ -255,6 +259,15 @@ export const SegmentCanvas = memo(
 						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
 						const cardHeight = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
 
+						// Cross-axis visibility culling: panels use 1.5× viewport, cards use 3×
+						const multiplier = isPanelOpen ? PANEL_CROSS_MULTIPLIER : CARD_CROSS_MULTIPLIER;
+						const bufferHalf = (viewHeight * multiplier - viewHeight) / 2;
+						const cullTop = viewTop - bufferHalf;
+						const cullBottom = viewTop + viewHeight + bufferHalf;
+						const cardTop = ch.layoutY + 30; // CARD_TOP_OFFSET
+						const cardBottom = cardTop + cardHeight;
+						if (cardBottom < cullTop || cardTop > cullBottom) return null;
+
 						return (
 							<Box key={ch.id}>
 								<ChapterCard
@@ -367,8 +380,8 @@ export const SegmentCanvas = memo(
 		);
 	},
 	(prev, next) => {
-		// Skip re-render when only camera-driven props change (scale, viewTop, viewHeight).
-		// These are cosmetic during zoom/pan and will be correct on the next full render.
+		// Skip re-render when only camera-driven cosmetic props change (scale).
+		// viewTop/viewHeight are NOT skipped because they drive cross-axis card culling.
 		if (prev.projectId !== next.projectId) return false;
 		if (prev.fromSha !== next.fromSha) return false;
 		if (prev.toSha !== next.toSha) return false;
@@ -380,6 +393,8 @@ export const SegmentCanvas = memo(
 		if (prev.onChapterContextMenu !== next.onChapterContextMenu) return false;
 		if (prev.tickPositions !== next.tickPositions) return false;
 		if (prev.onFitToView !== next.onFitToView) return false;
+		if (prev.viewTop !== next.viewTop) return false;
+		if (prev.viewHeight !== next.viewHeight) return false;
 		return true;
 	},
 );

@@ -24,7 +24,10 @@ interface RulerFlowProps {
 }
 
 const TICK_WIDTH = 2;
-const VIEWPORT_BUFFER = 200;
+/** Multiplier of viewport size used as off-screen buffer for commit ticks on the ruler */
+const TICK_VIEWPORT_MULTIPLIER = 5;
+/** Multiplier of viewport size used as off-screen buffer for expanded segment canvases */
+const SEGMENT_VIEWPORT_MULTIPLIER = 3;
 const AUTO_EXPAND_SCALE = 1.4;
 const AUTO_COLLAPSE_SCALE = 0.9;
 
@@ -367,8 +370,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const mViewport = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
 			// Use collapsed-state positions (index * COLLAPSED_GAP) for visibility check
 			// so the result doesn't depend on current expanded state.
-			const visStart = -mPan / s - VIEWPORT_BUFFER / s;
-			const visEnd = (-mPan + mViewport) / s + VIEWPORT_BUFFER / s;
+			const worldViewportMain = mViewport / s;
+			const autoBuffer = (worldViewportMain * SEGMENT_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
+			const visStart = -mPan / s - autoBuffer;
+			const visEnd = -mPan / s + worldViewportMain + autoBuffer;
 			const next = new Set<string>();
 			for (const seg of segs) {
 				if (!seg.isExpandable) continue;
@@ -911,15 +916,33 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const mainPan = isHorizontal ? panX : panY;
 	const crossPan = isHorizontal ? panY : panX;
 
-	// Pre-compute visible ticks to avoid per-tick work in render
+	// Pre-compute visible ticks to avoid per-tick work in render.
+	// Commit ticks use a generous 5× viewport buffer so the ruler never pops in during scroll.
+	// Expanded segments (cards / panels) use a 3× viewport buffer.
 	const { visibleTicks, expandedTicks } = useMemo(() => {
-		const visStart = -mainPan / scale - VIEWPORT_BUFFER / scale;
-		const visEnd = (-mainPan + mainViewport) / scale + VIEWPORT_BUFFER / scale;
+		const worldViewportMain = mainViewport / scale;
+		const worldViewStart = -mainPan / scale;
+
+		const tickBuffer = (worldViewportMain * TICK_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
+		const tickStart = worldViewStart - tickBuffer;
+		const tickEnd = worldViewStart + worldViewportMain + tickBuffer;
+
+		const segBuffer = (worldViewportMain * SEGMENT_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
+		const segStart = worldViewStart - segBuffer;
+		const segEnd = worldViewStart + worldViewportMain + segBuffer;
+
 		const visible: typeof layout.ticks = [];
 		const expanded: typeof layout.ticks = [];
 		for (const tick of layout.ticks) {
-			if (tick.x >= visStart && tick.x <= visEnd) visible.push(tick);
-			if (tick.isExpanded && tick.segment) expanded.push(tick);
+			if (tick.x >= tickStart && tick.x <= tickEnd) visible.push(tick);
+			if (tick.isExpanded && tick.segment) {
+				// Cull expanded segments by main-axis visibility (3× viewport)
+				const nextTick = layout.ticks[tick.index + 1];
+				const segEndX = nextTick ? nextTick.x : tick.x + 400;
+				if (segEndX >= segStart && tick.x <= segEnd) {
+					expanded.push(tick);
+				}
+			}
 		}
 		return { visibleTicks: visible, expandedTicks: expanded };
 	}, [layout.ticks, mainPan, scale, mainViewport]);

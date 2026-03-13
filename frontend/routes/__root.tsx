@@ -56,6 +56,7 @@ import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabs } from "../hooks/useRecentTabs";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { type ApiError, clearToken, getToken } from "../lib/api";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 interface RouterContext {
 	queryClient: QueryClient;
@@ -140,6 +141,12 @@ function AuthenticatedLayout() {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { width: navWidth, onDragStart: onNavDragStart } = useResizableNav();
 	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
+
+	// --- Global narrator WebSocket connection ---
+	useEffect(() => {
+		narratorWSManager.connect();
+		return () => narratorWSManager.disconnect();
+	}, []);
 
 	// --- Setup wizard ---
 	const [wizardOpen, setWizardOpen] = useState(false);

@@ -404,7 +404,7 @@ function ProvidersPage() {
 
 	return (
 		<>
-			<Stack>
+			<Stack pb={80}>
 				<Title order={2}>{t("providersTitle")}</Title>
 
 					hiddenModels={hiddenModels}

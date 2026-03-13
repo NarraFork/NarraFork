@@ -88,6 +88,7 @@ function insertChildAtPath(
 	path: number[],
 	childMsg: TreeMessage,
 ): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	if (path.length === 0) return { messages, changed: false };
 	const [idx, ...rest] = path;
 	const msg = messages[idx];
@@ -115,6 +116,7 @@ function insertChildIntoMessages(
 	messages: TreeMessage[],
 	childMsg: TreeMessage,
 ): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
 		// Check if this message contains the parent tool call
@@ -145,6 +147,7 @@ export function mergeToolCallFieldsInTree(
 	toolUseId: string,
 	fields: Record<string, unknown>,
 ): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
 		let result = msg;
@@ -187,6 +190,7 @@ export function updateToolCallInTree(
 	output?: unknown,
 	durationMs?: number,
 ): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
 		let msgChanged = false;
@@ -239,6 +243,7 @@ export function findMsgByToolUseIdInTree(
 	messages: TreeMessage[],
 	toolUseId: string,
 ): TreeMessage | null {
+	if (!Array.isArray(messages)) return null;
 	for (const msg of messages) {
 		if ((msg.toolCalls as ToolCall[])?.some((tc) => tc.toolUseId === toolUseId)) return msg;
 		if (msg.children?.length) {
@@ -307,6 +312,7 @@ function indexMessages(
 	path: number[],
 	index: MessageIndex,
 ) {
+	if (!Array.isArray(messages)) return;
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		if (msg.toolCalls) {
@@ -329,6 +335,7 @@ function mergeAtPath(
 	toolUseId: string,
 	fields: Record<string, unknown>,
 ): TreeMessage[] {
+	if (!Array.isArray(messages)) return [];
 	if (path.length === 0) return messages;
 	const [idx, ...rest] = path;
 	const updated = [...messages];
@@ -496,6 +503,8 @@ export function upsertSubagentStreamingChunk(
 	toolName: string,
 	inputCharsTotal: number,
 	index?: MessageIndex,
+	extractedFilePath?: string,
+	contentCharsReceived?: number,
 ): InfiniteCache {
 	const syntheticId = subagentStreamingId(parentToolUseId);
 
@@ -514,6 +523,8 @@ export function upsertSubagentStreamingChunk(
 				toolUseId,
 				toolName,
 				inputCharsTotal,
+				extractedFilePath,
+				contentCharsReceived,
 			);
 			if (changed) {
 				page.messages = messages;
@@ -535,6 +546,8 @@ export function upsertSubagentStreamingChunk(
 			toolUseId,
 			toolName,
 			inputCharsTotal,
+			extractedFilePath,
+			contentCharsReceived,
 		);
 		if (changed) anyChanged = true;
 		return changed ? { ...page, messages } : page;
@@ -552,6 +565,8 @@ function upsertStreamingChildAtPath(
 	toolUseId: string,
 	toolName: string,
 	inputCharsTotal: number,
+	extractedFilePath?: string,
+	contentCharsReceived?: number,
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (path.length === 0) return { messages, changed: false };
 	const [idx, ...rest] = path;
@@ -564,11 +579,14 @@ function upsertStreamingChildAtPath(
 			messages: upsertStreamingChildOnMsg(
 				messages,
 				idx,
+				parentToolUseId,
 				syntheticId,
 				narratorId,
 				toolUseId,
 				toolName,
 				inputCharsTotal,
+				extractedFilePath,
+				contentCharsReceived,
 			),
 			changed: true,
 		};
@@ -584,6 +602,8 @@ function upsertStreamingChildAtPath(
 		toolUseId,
 		toolName,
 		inputCharsTotal,
+		extractedFilePath,
+		contentCharsReceived,
 	);
 	if (!childResult.changed) return { messages, changed: false };
 	const updated = [...messages];
@@ -595,29 +615,36 @@ function upsertStreamingChildAtPath(
 function upsertStreamingChildOnMsg(
 	messages: TreeMessage[],
 	msgIdx: number,
+	parentToolUseId: string,
 	syntheticId: string,
 	narratorId: string,
 	toolUseId: string,
 	toolName: string,
 	inputCharsTotal: number,
+	extractedFilePath?: string,
+	contentCharsReceived?: number,
 ): TreeMessage[] {
 	const msg = messages[msgIdx];
 	const children = [...(msg.children || [])];
 	const existingIdx = children.findIndex((c) => c.id === syntheticId);
 	const existing = existingIdx !== -1 ? children[existingIdx] : null;
 
+	const streamingInput: Record<string, unknown> = { _streamingChars: inputCharsTotal };
+	if (extractedFilePath) streamingInput._streamingFilePath = extractedFilePath;
+	if (contentCharsReceived != null) streamingInput._streamingContentChars = contentCharsReceived;
+
 	const { blocks, toolCalls } = upsertStreamingToolBlock(
 		existing ? [...existing.contentJson] : [],
 		existing ? [...existing.toolCalls] : [],
 		toolUseId,
 		toolName,
-		{ _streamingChars: inputCharsTotal },
+		streamingInput,
 	);
 
 	const syntheticChild: TreeMessage = {
 		id: syntheticId,
 		narratorId,
-		parentToolUseId: null, // not needed for display
+		parentToolUseId,
 		role: "assistant",
 		contentJson: blocks,
 		contentText: null,
@@ -644,7 +671,10 @@ function upsertStreamingChildInMessages(
 	toolUseId: string,
 	toolName: string,
 	inputCharsTotal: number,
+	extractedFilePath?: string,
+	contentCharsReceived?: number,
 ): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
 		// Check if this message contains the parent tool call
@@ -657,12 +687,17 @@ function upsertStreamingChildInMessages(
 			const existingIdx = children.findIndex((c) => c.id === syntheticId);
 			const existing = existingIdx !== -1 ? children[existingIdx] : null;
 
+			const streamingInput: Record<string, unknown> = { _streamingChars: inputCharsTotal };
+			if (extractedFilePath) streamingInput._streamingFilePath = extractedFilePath;
+			if (contentCharsReceived != null)
+				streamingInput._streamingContentChars = contentCharsReceived;
+
 			const { blocks, toolCalls } = upsertStreamingToolBlock(
 				existing ? [...existing.contentJson] : [],
 				existing ? [...existing.toolCalls] : [],
 				toolUseId,
 				toolName,
-				{ _streamingChars: inputCharsTotal },
+				streamingInput,
 			);
 
 			const syntheticChild: TreeMessage = {
@@ -695,6 +730,8 @@ function upsertStreamingChildInMessages(
 				toolUseId,
 				toolName,
 				inputCharsTotal,
+				extractedFilePath,
+				contentCharsReceived,
 			);
 			if (childResult.changed) {
 				anyChanged = true;
@@ -782,6 +819,7 @@ function removeStreamingChildInMessages(
 	parentToolUseId: string,
 	syntheticId: string,
 ): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
 		const hasParentTool = (msg.toolCalls as ToolCall[])?.some(

@@ -16,7 +16,6 @@ import {
 	IconArrowLeft,
 	IconArrowRight,
 	IconCheck,
-	IconPlayerSkipForward,
 	IconRocket,
 	IconWand,
 } from "@tabler/icons-react";
@@ -77,15 +76,57 @@ export function SetupWizard({
 		onClose();
 	};
 
+	// --- Provider count (shared between ProviderStep gate and BasicSettingsStep gate) ---
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+
+	const providerCount =
+		(settings?.openaiProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
+		(settings?.anthropicProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
+			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
+		)?.length ?? 0) +
+		(settings?.codexAvailable ? 1 : 0);
+
+	// Track whether both models are set in BasicSettingsStep
+	const [basicStepValid, setBasicStepValid] = useState(false);
+
+	// Determine if "Next" should be disabled for the current step
+	const isNextDisabled = () => {
+		if (step === 2) return providerCount === 0;
+		if (step === 3) return !basicStepValid;
+		return false;
+	};
+
+	// Tooltip for disabled next button
+	const nextDisabledReason = () => {
+		if (step === 2 && providerCount === 0) return t("wizardProviderRequired");
+		if (step === 3 && !basicStepValid) return t("wizardModelsRequired");
+		return undefined;
+	};
+
+	const nextButton = (
+		<Button
+			rightSection={<IconArrowRight size={16} />}
+			onClick={() => setStep((s) => s + 1)}
+			disabled={isNextDisabled()}
+		>
+			{t("wizardNext")}
+		</Button>
+	);
+
 	return (
 		<>
 			<Modal
 				opened={opened}
-				onClose={finish}
+				onClose={() => {}}
 				title={t("wizardTitle")}
 				size="lg"
 				centered
 				closeOnClickOutside={false}
+				closeOnEscape={false}
+				withCloseButton={false}
 			>
 				<Stack gap="md">
 					<StepIndicator current={step} total={TOTAL_STEPS} />
@@ -93,8 +134,8 @@ export function SetupWizard({
 					<Box mih={260}>
 						{step === 0 && <WelcomeStep />}
 						{step === 1 && <DepsStep />}
-						{step === 2 && <ProviderStep onMinimize={onMinimize} />}
-						{step === 3 && <BasicSettingsStep />}
+						{step === 2 && <ProviderStep onMinimize={onMinimize} providerCount={providerCount} />}
+						{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
 						{step === 4 && <CompleteStep />}
 					</Box>
 
@@ -111,21 +152,14 @@ export function SetupWizard({
 							)}
 						</Group>
 						<Group>
-							<Button
-								variant="subtle"
-								color="gray"
-								leftSection={<IconPlayerSkipForward size={16} />}
-								onClick={finish}
-							>
-								{t("wizardSkip")}
-							</Button>
 							{step < TOTAL_STEPS - 1 ? (
-								<Button
-									rightSection={<IconArrowRight size={16} />}
-									onClick={() => setStep((s) => s + 1)}
-								>
-									{t("wizardNext")}
-								</Button>
+								isNextDisabled() ? (
+									<Tooltip label={nextDisabledReason()} withArrow>
+										<span>{nextButton}</span>
+									</Tooltip>
+								) : (
+									nextButton
+								)
 							) : (
 								<Button color="green" rightSection={<IconCheck size={16} />} onClick={finish}>
 									{t("wizardFinish")}
@@ -266,20 +300,15 @@ function DepsStep() {
 	);
 }
 
-function ProviderStep({ onMinimize }: { onMinimize: () => void }) {
+function ProviderStep({
+	onMinimize,
+	providerCount,
+}: {
+	onMinimize: () => void;
+	providerCount: number;
+}) {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-	});
-
-	const providerCount =
-		(settings?.openaiProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
-		(settings?.anthropicProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
-			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
-		)?.length ?? 0) +
-		(settings?.codexAvailable ? 1 : 0);
 
 	const handleGoToProviders = () => {
 		onMinimize();
@@ -307,6 +336,11 @@ function ProviderStep({ onMinimize }: { onMinimize: () => void }) {
 					</Badge>
 				)}
 			</Group>
+			{providerCount === 0 && (
+				<Text size="xs" c="orange">
+					{t("wizardProviderRequired")}
+				</Text>
+			)}
 			<Group>
 				<Button variant="light" onClick={handleGoToProviders}>
 					{t("wizardProviderGoToAdmin")}
@@ -323,7 +357,7 @@ function ProviderStep({ onMinimize }: { onMinimize: () => void }) {
 	);
 }
 
-function BasicSettingsStep() {
+function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) => void }) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const { data: settings } = useQuery({
@@ -335,6 +369,8 @@ function BasicSettingsStep() {
 	const [projectDir, setProjectDir] = useState(settings?.paths?.defaultProjectDir ?? "");
 	const [defaultModel, setDefaultModel] = useState(
 	);
+	const [summaryModel, setSummaryModel] = useState(
+	);
 
 	const save = useMutation({
 		mutationFn: (data: Record<string, unknown>) => api.updateSettings(data),
@@ -344,7 +380,7 @@ function BasicSettingsStep() {
 	const debouncedSaveDir = useDebouncedCallback((path: string) => {
 		save.mutate({
 			paths: { defaultProjectDir: path },
-			agent: { defaultModel },
+			agent: { defaultModel, summaryModel },
 		});
 	}, 500);
 
@@ -352,6 +388,11 @@ function BasicSettingsStep() {
 		setProjectDir(path);
 		debouncedSaveDir(path);
 	};
+
+	// Report validity to parent
+	useEffect(() => {
+		onValidChange(!!defaultModel && !!summaryModel);
+	}, [defaultModel, summaryModel, onValidChange]);
 
 	return (
 		<Stack gap="md">
@@ -365,13 +406,34 @@ function BasicSettingsStep() {
 				searchable
 				value={defaultModel}
 				onChange={(v) => {
+					const val = v ?? "";
 					setDefaultModel(val);
 					save.mutate({
 						paths: { defaultProjectDir: projectDir },
-						agent: { defaultModel: val },
+						agent: { defaultModel: val, summaryModel },
 					});
 				}}
 			/>
+			<Select
+				label={t("summaryModel")}
+				description={t("wizardSummaryModelDesc")}
+				data={groupedModels}
+				searchable
+				value={summaryModel}
+				onChange={(v) => {
+					const val = v ?? "";
+					setSummaryModel(val);
+					save.mutate({
+						paths: { defaultProjectDir: projectDir },
+						agent: { defaultModel, summaryModel: val },
+					});
+				}}
+			/>
+			{(!defaultModel || !summaryModel) && (
+				<Text size="xs" c="orange">
+					{t("wizardModelsRequired")}
+				</Text>
+			)}
 		</Stack>
 	);
 }

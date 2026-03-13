@@ -24,6 +24,7 @@ import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../components/common/DirectoryPicker";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useCreateProject, useCreateProjectStream, useProjects } from "../../hooks/useProjects";
+import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 
 export const Route = createFileRoute("/projects/")({
 	component: ProjectListPage,
@@ -46,6 +47,12 @@ function ProjectListPage() {
 	const { t } = useTranslation("projects");
 	const { t: tc } = useTranslation("common");
 	const platform = usePlatform();
+
+	const requireSetup = useSetupWizardGuard();
+	const guardedOpen = () => {
+		if (!requireSetup()) return;
+		open();
+	};
 
 	const pathPlaceholder =
 		platform === "windows" ? "E:\\Code\\my-repo" : "/home/user/projects/my-repo";
@@ -153,7 +160,7 @@ function ProjectListPage() {
 		<Stack>
 			<Group justify="space-between">
 				<Title order={2}>{t("title")}</Title>
-				<Button onClick={open}>{t("newProject")}</Button>
+				<Button onClick={guardedOpen}>{t("newProject")}</Button>
 			</Group>
 
 			{!projects?.length ? (

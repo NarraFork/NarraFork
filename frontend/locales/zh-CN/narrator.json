@@ -155,6 +155,7 @@
 	"contextUsageTokens": "{{tokens}} tokens",
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",
 	"truncatedPreview": "内容已截断 ({{size}}) — 展开以加载完整数据",
+	"toolStartedAt": "开始于 {{time}}",
 	"chapterBar.git": "Git",
 	"chapterBar.containers": "容器",
 	"chapterBar.configureContainers": "配置容器",

@@ -205,6 +205,16 @@ Rules:
 			descriptionZh: "交互式终端 — 读取缓冲区、发送输入、列出终端",
 		},
 	},
+	{
+		id: "share_file",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ShareFile",
+			descriptionEn: "Share files/directories — generate temporary download links",
+			descriptionZh: "分享文件/目录 — 生成临时下载链接",
+		},
+	},
 ];
 
 // ---------------------------------------------------------------------------

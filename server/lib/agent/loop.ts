@@ -113,6 +113,11 @@ function isContextOverflowReason(reason: string): boolean {
 	);
 }
 
+function isOutputTruncationReason(reason: string): boolean {
+	const r = reason.toLowerCase();
+	return r === "max_tokens" || r === "max_output_tokens" || r === "length";
+}
+
 function isContextOverflowMessage(message: string): boolean {
 	const m = message.toLowerCase();
 	return CONTEXT_OVERFLOW_PATTERNS.some((p) => m.includes(p));
@@ -769,11 +774,19 @@ export async function* agentLoop(
 						yield { type: "retryable_error", message };
 						return;
 					}
-					yield {
-						type: "invalid_state",
-						reason,
-						message,
-					};
+					// Output truncated by max_tokens — not an error, let smart
+					// interruption check handle the auto-continue.
+					if (isOutputTruncationReason(reason)) {
+						yield { type: "output_truncated", message };
+						// Don't return — fall through to yield assistant_message
+						// so the truncated content is persisted normally.
+					} else {
+						yield {
+							type: "invalid_state",
+							reason,
+							message,
+						};
+					}
 				}
 			}
 		} catch (err) {

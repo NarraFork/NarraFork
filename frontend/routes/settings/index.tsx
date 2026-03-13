@@ -470,7 +470,7 @@ function SettingsPage() {
 	};
 
 	return (
-		<Stack>
+		<Stack pb={80}>
 			<Group justify="space-between">
 				<Title order={2}>{t("title")}</Title>
 				<Button

@@ -157,11 +157,12 @@ export function removeStreamingChunksMsg(
 	qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 		if (!old?.pages?.length) return old;
 		const firstPage = old.pages[0];
-		if (!firstPage.messages.some((m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID)) return old;
+		const msgs = Array.isArray(firstPage.messages) ? firstPage.messages : [];
+		if (!msgs.some((m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID)) return old;
 		const pages = [...old.pages];
 		pages[0] = {
 			...firstPage,
-			messages: firstPage.messages.filter((m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID),
+			messages: msgs.filter((m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID),
 		};
 		return { ...old, pages };
 	});

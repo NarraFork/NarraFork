@@ -591,10 +591,11 @@ export const MemoizedPageElements = memo(
 		lastUserMessageId,
 		hasChapter,
 	}: PageElementsProps) {
+		const rawMsgs = Array.isArray(page.messages) ? page.messages : [];
 		const msgs =
-			maxMessages != null && maxMessages < (page.messages?.length ?? 0)
-				? page.messages.slice(page.messages.length - maxMessages)
-				: (page.messages ?? []);
+			maxMessages != null && maxMessages < rawMsgs.length
+				? rawMsgs.slice(rawMsgs.length - maxMessages)
+				: rawMsgs;
 		const { t } = useTranslation("narrator");
 		const { elements } = renderTreeMessages(
 			msgs,

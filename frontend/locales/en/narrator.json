@@ -155,6 +155,7 @@
 	"contextUsageTokens": "{{tokens}} tokens",
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",
 	"truncatedPreview": "Content truncated ({{size}}) — expand to load full data",
+	"toolStartedAt": "Started at {{time}}",
 	"chapterBar.git": "Git",
 	"chapterBar.containers": "Containers",
 	"chapterBar.configureContainers": "Configure Containers",

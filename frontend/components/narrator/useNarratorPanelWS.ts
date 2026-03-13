@@ -765,30 +765,31 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				durationMs?: number,
 				updatedInput?: Record<string, unknown>,
 				metadata?: Record<string, unknown>,
+				parentToolUseId?: string,
 			) => {
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
 
-				// Update the streaming chunk entry if it still exists (assistant_message
-				// may not have arrived yet). Patch status/output/duration so the card
-				// renders as completed while we wait for the real message.
-				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-				if (streamingEntry) {
-					topLevelStreamingChunkRef.current.set(toolUseId, {
-						...streamingEntry,
-						inputCharsTotal: -1,
-						extractedFilePath: undefined,
-						contentCharsReceived: undefined,
-						_started: true,
-						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-						_input: updatedInput ?? (streamingEntry as any)._input,
-						_status: status,
-						_output: output,
-						_durationMs: durationMs,
-						_metadata: metadata,
-						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-					} as any);
-					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				// Update the streaming chunk entry if it still exists (top-level only)
+				if (!parentToolUseId) {
+					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+					if (streamingEntry) {
+						topLevelStreamingChunkRef.current.set(toolUseId, {
+							...streamingEntry,
+							inputCharsTotal: -1,
+							extractedFilePath: undefined,
+							contentCharsReceived: undefined,
+							_started: true,
+							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+							_input: updatedInput ?? (streamingEntry as any)._input,
+							_status: status,
+							_output: output,
+							_durationMs: durationMs,
+							_metadata: metadata,
+							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+						} as any);
+						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+					}
 				}
 
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
@@ -820,20 +821,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return result;
 				});
 			},
-			onToolLongRunning: (toolUseId: string, _elapsed: number) => {
+			onToolLongRunning: (toolUseId: string, _elapsed: number, parentToolUseId?: string) => {
 				// Mark the tool call as long-running so the UI can show a terminate button.
 				// Update both the streaming chunk (if still active) and the query cache.
 
 				// 更新流式 chunk 的 _longRunning 标记，使 topLevelStreamingChunks memo
 				// 重算时传递给 ToolCallCard（streaming 阶段的渲染路径）
-				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-				if (streamingEntry) {
-					topLevelStreamingChunkRef.current.set(toolUseId, {
-						...streamingEntry,
-						_longRunning: true,
-						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-					} as any);
-					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				if (!parentToolUseId) {
+					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+					if (streamingEntry) {
+						topLevelStreamingChunkRef.current.set(toolUseId, {
+							...streamingEntry,
+							_longRunning: true,
+							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+						} as any);
+						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+					}
 				}
 
 				// 同时更新已持久化的消息缓存，确保 streaming chunk 被清除后
@@ -853,42 +856,43 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				toolName: string,
 				streamStartedAt?: number,
 				input?: Record<string, unknown>,
+				parentToolUseId?: string,
 			) => {
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
 
-				// Promote the streaming chunk to a "started" state: remove the synthetic
-				// _streamingChars marker so ToolCallCard renders it as a real (expandable)
-				// tool card with the actual input. The chunk stays in the ref until
-				// onMessage's cancelPendingToolChunks() clears it, preventing the card
-				// from disappearing when assistant_message hasn't arrived yet.
-				const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-				if (streamingEntry) {
-					// Replace with a sentinel that marks it as "started" (no longer streaming).
-					// We set inputCharsTotal to -1 as a flag — the memo builder will detect
-					// this and produce a non-streaming tool call card.
-					topLevelStreamingChunkRef.current.set(toolUseId, {
-						...streamingEntry,
-						toolName,
-						inputCharsTotal: -1, // sentinel: no longer streaming
-						extractedFilePath: undefined,
-						contentCharsReceived: undefined,
-						_started: true,
-						_input: input,
-						_startedAt: streamStartedAt,
-						// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-					} as any);
-					bumpTopLevelStreamingChunksVersion((v) => v + 1);
+				if (!parentToolUseId) {
+					// Top-level tool: promote the streaming chunk to a "started" state
+					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
+					if (streamingEntry) {
+						topLevelStreamingChunkRef.current.set(toolUseId, {
+							...streamingEntry,
+							toolName,
+							inputCharsTotal: -1, // sentinel: no longer streaming
+							extractedFilePath: undefined,
+							contentCharsReceived: undefined,
+							_started: true,
+							_input: input,
+							_startedAt: streamStartedAt,
+							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+						} as any);
+						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+					}
 				}
 
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ status: "running", startedAt: streamStartedAt ?? Date.now() },
-						toolUseIndexRef.current,
-					);
+					// For subagent tools, also replace the synthetic _streamingChars inputJson
+					// with the real input so ToolCallCard stops showing the shimmer and renders
+					// the actual tool card content.
+					const fields: Record<string, unknown> = {
+						status: "running",
+						startedAt: streamStartedAt ?? Date.now(),
+					};
+					if (parentToolUseId && input) {
+						fields.inputJson = input;
+					}
+					return mergeFieldsByIndex(old, toolUseId, fields, toolUseIndexRef.current);
 				});
 			},
 			onToolUseChunk: (
@@ -931,6 +935,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 										chunk.toolName,
 										chunk.inputCharsTotal,
 										toolUseIndexRef.current,
+										chunk.extractedFilePath,
+										chunk.contentCharsReceived,
 									) as MessagesQueryData;
 								}
 								return result;
@@ -1278,6 +1284,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 									chunk.toolName,
 									chunk.inputCharsTotal,
 									toolUseIndexRef.current,
+									chunk.extractedFilePath,
+									chunk.contentCharsReceived,
 								) as MessagesQueryData;
 							});
 						} else if (chunk.started) {

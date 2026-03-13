@@ -237,6 +237,8 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "NotebookEdit":
 		case "MultiEdit":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
+		case "ShareFile":
+			return typeof input.path === "string" ? [input.path] : [];
 		case "Glob":
 		case "Grep":
 			return typeof input.path === "string" ? [input.path] : [];
@@ -491,8 +493,8 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Grep",
 ];
 
-/** Read-only tools that are safe to auto-allow for the truncated-output directory. */
-const READ_ONLY_TOOLS = ["Read", "Grep", "Glob"];
+/** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
+const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile"];
 
 /**
  * Pure decision logic for permission handling.

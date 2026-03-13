@@ -12,6 +12,7 @@ import {
 	Text,
 	Textarea,
 	ThemeIcon,
+	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import {
@@ -485,6 +486,14 @@ function ToolHeader({
 		[toolCall.toolName, toolCall.inputJson, toolCall._metadata],
 	);
 	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
+	const { t } = useTranslation("narrator");
+
+	const startedAtLabel = useMemo(() => {
+		if (toolCall.startedAt == null) return null;
+		return t("toolStartedAt", {
+			time: new Date(toolCall.startedAt).toLocaleTimeString(),
+		});
+	}, [toolCall.startedAt, t]);
 
 	// For Terminal tool, show "Terminal Read" / "Terminal Write" / "Terminal List" as the label
 	const displayName = useMemo(() => {
@@ -507,21 +516,25 @@ function ToolHeader({
 				{summary}
 			</Text>
 			<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
-				<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
-					<StatusIcon status={toolCall.status} />
-				</Box>
-				{toolCall.startedAt != null &&
-				(toolCall.status === "running" ||
-					toolCall.status === "pending" ||
-					toolCall.status === "initializing") ? (
-					<ElapsedTimer startedAt={toolCall.startedAt} />
-				) : (
-					toolCall.durationMs != null && (
-						<Text size="xs" c="dimmed" ff="monospace">
-							{(toolCall.durationMs / 1000).toFixed(1)}s
-						</Text>
-					)
-				)}
+				<Tooltip label={startedAtLabel} disabled={!startedAtLabel} position="top" withArrow fz="xs">
+					<Group gap={4} wrap="nowrap" align="center">
+						<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
+							<StatusIcon status={toolCall.status} />
+						</Box>
+						{toolCall.startedAt != null &&
+						(toolCall.status === "running" ||
+							toolCall.status === "pending" ||
+							toolCall.status === "initializing") ? (
+							<ElapsedTimer startedAt={toolCall.startedAt} />
+						) : (
+							toolCall.durationMs != null && (
+								<Text size="xs" c="dimmed" ff="monospace">
+									{(toolCall.durationMs / 1000).toFixed(1)}s
+								</Text>
+							)
+						)}
+					</Group>
+				</Tooltip>
 				<Box style={{ display: "flex", alignItems: "center" }}>
 					{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 				</Box>

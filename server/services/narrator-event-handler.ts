@@ -340,6 +340,7 @@ export async function processEvent(
 				toolName: event.toolName,
 				input: event.input,
 				streamStartedAt: event.streamStartedAt,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
 		}
@@ -640,6 +641,7 @@ export async function processEvent(
 				durationMs: event.durationMs,
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
 				...(event.metadata && { metadata: event.metadata }),
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 
 			// Main narrator: git tracking
@@ -686,6 +688,7 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
 				elapsed: event.elapsed,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
 		}
@@ -830,6 +833,14 @@ export async function processEvent(
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "stream_event",
+			});
+			return null;
+		}
+
+		case "output_truncated": {
+			logger.info("Agent output truncated by max_tokens", {
+				narratorId,
+				message: event.message,
 			});
 			return null;
 		}
