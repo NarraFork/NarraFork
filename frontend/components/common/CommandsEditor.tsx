@@ -41,12 +41,12 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 	const [error, setError] = useState("");
 
 	const validateName = useCallback(
-		(name: string, excludeIndex?: number) => {
-			if (!/^[a-zA-Z0-9_-]+$/.test(name)) return false;
+		(name: string, excludeIndex?: number): "ok" | "invalid" | "duplicate" => {
+			if (!/^[a-zA-Z0-9_-]+$/.test(name)) return "invalid";
 			const duplicate = commands.some(
 				(c, i) => i !== excludeIndex && c.name.toLowerCase() === name.toLowerCase(),
 			);
-			return !duplicate;
+			return duplicate ? "duplicate" : "ok";
 		},
 		[commands],
 	);
@@ -67,12 +67,13 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 	};
 
 	const handleSave = () => {
-		const name = draft.name.trim();
+		const name = draft.name.trim().replace(/^\/+/, "");
 		const prompt = draft.prompt.trim();
 		if (!name || !prompt) return;
 
-		if (!validateName(name, editIndex === -1 ? undefined : (editIndex as number))) {
-			setError(t("commandDuplicateName"));
+		const result = validateName(name, editIndex === -1 ? undefined : (editIndex as number));
+		if (result !== "ok") {
+			setError(t(result === "duplicate" ? "commandDuplicateName" : "commandInvalidName"));
 			return;
 		}
 
@@ -174,7 +175,7 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 							placeholder={t("commandNamePlaceholder")}
 							value={draft.name}
 							onChange={(e) => {
-								const val = e.currentTarget.value;
+								const val = e.currentTarget.value.replace(/^\/+/, "");
 								setDraft((d) => ({ ...d, name: val }));
 								setError("");
 							}}

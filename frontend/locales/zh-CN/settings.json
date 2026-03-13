@@ -247,6 +247,7 @@
 	"commandCancel": "取消",
 	"commandEmpty": "暂无命令，添加一个以开始使用。",
 	"commandDuplicateName": "已存在同名命令",
+	"commandInvalidName": "命令名称只能包含字母、数字、连字符和下划线",
 	"commandParamsLabel": "参数（可选）",
 	"commandParamNamePlaceholder": "参数名",
 	"commandParamDescPlaceholder": "描述",

@@ -1,5 +1,6 @@
 import { Box, Text } from "@mantine/core";
 import { useMemo } from "react";
+import type { RulerEdge, RulerOrientation } from "./types";
 
 interface OffscreenCard {
 	id: string;
@@ -17,7 +18,9 @@ interface OffscreenBubblesProps {
 	scale: number;
 	viewportWidth: number;
 	viewportHeight: number;
-	rulerHeight: number;
+	rulerThickness: number;
+	orientation?: RulerOrientation;
+	edge?: RulerEdge;
 	/** Called when user clicks a bubble — receives the world-space center of the group */
 	onNavigate?: (worldX: number, worldY: number) => void;
 }
@@ -50,11 +53,25 @@ export function OffscreenBubbles({
 	scale,
 	viewportWidth,
 	viewportHeight,
-	rulerHeight,
+	rulerThickness,
+	orientation = "horizontal",
+	edge = "start",
 	onNavigate,
 }: OffscreenBubblesProps) {
 	const bubbles = useMemo(() => {
-		const canvasHeight = viewportHeight - rulerHeight;
+		const isH = orientation === "horizontal";
+		// Compute the canvas area (excluding the ruler track)
+		let canvasTop = 0;
+		let canvasLeft = 0;
+		let canvasWidth = viewportWidth;
+		let canvasHeight = viewportHeight;
+		if (isH) {
+			canvasHeight -= rulerThickness;
+			if (edge === "start") canvasTop = rulerThickness;
+		} else {
+			canvasWidth -= rulerThickness;
+			if (edge === "start") canvasLeft = rulerThickness;
+		}
 
 		// Step 1: compute raw bubble for each offscreen card
 		const raw: Array<{
@@ -71,10 +88,10 @@ export function OffscreenBubbles({
 			const sx = card.worldX * scale + panX;
 			const sy = card.worldY * scale + panY;
 
-			const isOffLeft = sx + 220 * scale < 0;
-			const isOffRight = sx > viewportWidth;
-			const isOffTop = sy + 72 * scale < 0;
-			const isOffBottom = sy > canvasHeight;
+			const isOffLeft = sx + 220 * scale < canvasLeft;
+			const isOffRight = sx > canvasLeft + canvasWidth;
+			const isOffTop = sy + 72 * scale < canvasTop;
+			const isOffBottom = sy > canvasTop + canvasHeight;
 
 			if (!isOffLeft && !isOffRight && !isOffTop && !isOffBottom) continue;
 
@@ -84,25 +101,31 @@ export function OffscreenBubbles({
 
 			if (isOffTop && !isOffLeft && !isOffRight) {
 				direction = "top";
-				bx = Math.max(BUBBLE_MARGIN, Math.min(viewportWidth - BUBBLE_SIZE - BUBBLE_MARGIN, sx));
-				by = TOP_BADGE_HEIGHT + BUBBLE_MARGIN;
+				bx = Math.max(
+					canvasLeft + BUBBLE_MARGIN,
+					Math.min(canvasLeft + canvasWidth - BUBBLE_SIZE - BUBBLE_MARGIN, sx),
+				);
+				by = canvasTop + TOP_BADGE_HEIGHT + BUBBLE_MARGIN;
 			} else if (isOffBottom && !isOffLeft && !isOffRight) {
 				direction = "bottom";
-				bx = Math.max(BUBBLE_MARGIN, Math.min(viewportWidth - BUBBLE_SIZE - BUBBLE_MARGIN, sx));
-				by = canvasHeight - BUBBLE_SIZE - BUBBLE_MARGIN;
+				bx = Math.max(
+					canvasLeft + BUBBLE_MARGIN,
+					Math.min(canvasLeft + canvasWidth - BUBBLE_SIZE - BUBBLE_MARGIN, sx),
+				);
+				by = canvasTop + canvasHeight - BUBBLE_SIZE - BUBBLE_MARGIN;
 			} else if (isOffLeft) {
 				direction = "left";
-				bx = BUBBLE_MARGIN;
+				bx = canvasLeft + BUBBLE_MARGIN;
 				by = Math.max(
-					TOP_BADGE_HEIGHT + BUBBLE_MARGIN,
-					Math.min(canvasHeight - BUBBLE_SIZE - BUBBLE_MARGIN, sy),
+					canvasTop + TOP_BADGE_HEIGHT + BUBBLE_MARGIN,
+					Math.min(canvasTop + canvasHeight - BUBBLE_SIZE - BUBBLE_MARGIN, sy),
 				);
 			} else {
 				direction = "right";
-				bx = viewportWidth - BUBBLE_SIZE - BUBBLE_MARGIN;
+				bx = canvasLeft + canvasWidth - BUBBLE_SIZE - BUBBLE_MARGIN;
 				by = Math.max(
-					TOP_BADGE_HEIGHT + BUBBLE_MARGIN,
-					Math.min(canvasHeight - BUBBLE_SIZE - BUBBLE_MARGIN, sy),
+					canvasTop + TOP_BADGE_HEIGHT + BUBBLE_MARGIN,
+					Math.min(canvasTop + canvasHeight - BUBBLE_SIZE - BUBBLE_MARGIN, sy),
 				);
 			}
 
@@ -110,7 +133,7 @@ export function OffscreenBubbles({
 				id: card.id,
 				title: card.title,
 				screenX: bx,
-				screenY: by + rulerHeight,
+				screenY: by,
 				direction,
 				worldX: card.worldX,
 				worldY: card.worldY,
@@ -155,7 +178,7 @@ export function OffscreenBubbles({
 		}
 
 		return merged;
-	}, [cards, panX, panY, scale, viewportWidth, viewportHeight, rulerHeight]);
+	}, [cards, panX, panY, scale, viewportWidth, viewportHeight, rulerThickness, orientation, edge]);
 
 	if (bubbles.length === 0) return null;
 

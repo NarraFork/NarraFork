@@ -29,8 +29,9 @@ export interface ForkChapterInput {
 	role?: "branch" | "exploration";
 	locale?: Locale;
 	/** Explicit graph position — if provided, skip auto-layout calculation. */
-	positionX?: number;
-	positionY?: number;
+	anchorCommitSha?: string;
+	axisOffset?: number;
+	crossOffset?: number;
 }
 
 export const chapterFork = {
@@ -129,39 +130,31 @@ export const chapterFork = {
 				}
 			}
 
-			// Step 2: Compute initial graph position below the parent node
-			const NODE_WIDTH = 280;
-			const DEFAULT_NODE_HEIGHT = 120;
-			const DEFAULT_PANEL_HEIGHT = 640;
-			const VERTICAL_GAP = 60;
-			const HORIZONTAL_SPACING = NODE_WIDTH + 80;
+			// Step 2: Compute initial graph position
+			const CROSS_SPACING = 360;
 
-			let positionX: number;
-			let positionY: number;
+			let anchorCommitSha: string | null;
+			let axisOffset: number;
+			let crossOffset: number;
 
-			if (input.positionX != null && input.positionY != null) {
-				// Use explicit position from the client (e.g. inline fork draft node)
-				positionX = input.positionX;
-				positionY = input.positionY;
+			if (input.anchorCommitSha != null) {
+				// Use explicit position from the client
+				anchorCommitSha = input.anchorCommitSha;
+				axisOffset = input.axisOffset ?? 0;
+				crossOffset = input.crossOffset ?? 0;
 			} else {
-				const parentX = parent.positionX ?? 0;
-				const parentY = parent.positionY ?? 0;
-				const parentHeight =
-					parent.panelExpanded && parent.panelHeight
-						? parent.panelHeight
-						: parent.panelExpanded
-							? DEFAULT_PANEL_HEIGHT
-							: DEFAULT_NODE_HEIGHT;
+				// Default: anchor to the fork commit, offset cross-axis by sibling count
+				anchorCommitSha = commitSha;
+				axisOffset = 0;
 
-				// Count existing children to offset horizontally and avoid overlap
+				// Count existing children to offset and avoid overlap
 				const existingSiblings = await db
 					.select({ id: chapters.id })
 					.from(chapters)
 					.where(eq(chapters.parentChapterId, parentChapterId));
 				const siblingIndex = existingSiblings.length; // 0-based: this will be the Nth child
 
-				positionX = parentX + siblingIndex * HORIZONTAL_SPACING;
-				positionY = parentY + parentHeight + VERTICAL_GAP;
+				crossOffset = siblingIndex * CROSS_SPACING;
 			}
 
 			// Create DB record
@@ -179,8 +172,9 @@ export const chapterFork = {
 					baseBranch: parent.branch,
 					parentChapterId,
 					forkPoint,
-					positionX,
-					positionY,
+					anchorCommitSha,
+					axisOffset,
+					crossOffset,
 					lastAccessedAt: now,
 					createdAt: now,
 					updatedAt: now,

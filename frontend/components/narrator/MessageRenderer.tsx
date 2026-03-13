@@ -27,17 +27,35 @@ import { getCategoryColor, TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 // renderToolRun — renders a group of tool-bearing messages
 // ---------------------------------------------------------------------------
 
+export interface RenderToolRunOptions {
+	expandedToolUseId?: string | null;
+	highlightedId?: string | null;
+	editExpandOverride?: boolean | null;
+	onForkFromMessage?: (uuid: string) => void;
+	onCompactBeforeMessage?: (messageId: string) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	/** Extra styles applied to the outer tool-run container (used for visual merging). */
+	containerStyle?: React.CSSProperties;
+	/** Extra className applied to the outer tool-run container. */
+	containerClassName?: string;
+}
+
 export function renderToolRun(
 	run: NarratorMsg[],
 	narratorId: string,
 	permCb: PermissionCallbacks,
-	expandedToolUseId?: string | null,
-	highlightedId?: string | null,
-	editExpandOverride?: boolean | null,
-	onForkFromMessage?: (uuid: string) => void,
-	onCompactBeforeMessage?: (messageId: string) => void,
-	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
+	opts: RenderToolRunOptions = {},
 ) {
+	const {
+		expandedToolUseId,
+		highlightedId,
+		editExpandOverride,
+		onForkFromMessage,
+		onCompactBeforeMessage,
+		onDeleteBlock,
+		containerStyle,
+		containerClassName,
+	} = opts;
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
 	const items = flattenToolRun(run);
@@ -163,11 +181,14 @@ export function renderToolRun(
 		return (
 			<Box
 				key={`tool-run-${run[0].id}`}
+				data-tool-run
+				className={containerClassName}
 				style={{
 					border: "1px solid var(--mantine-color-default-border)",
 					borderRadius: "var(--mantine-radius-sm)",
 					overflow: "hidden",
 					backgroundColor: TOOL_CARD_BG,
+					...containerStyle,
 				}}
 			>
 				{items.map((item, idx) => renderItem(item, idx, items.length))}
@@ -175,7 +196,16 @@ export function renderToolRun(
 		);
 	}
 
-	return renderItem(items[0], 0, 1);
+	return (
+		<div
+			key={`tool-run-${run[0].id}`}
+			data-tool-run
+			className={containerClassName}
+			style={containerStyle}
+		>
+			{renderItem(items[0], 0, 1)}
+		</div>
+	);
 }
 
 function hasReasoningBlock(msg: NarratorMsg): boolean {
@@ -439,17 +469,14 @@ export function renderTreeMessages(
 				}
 			}
 
-			const el = renderToolRun(
-				run,
-				narratorId,
-				permCb,
+			const el = renderToolRun(run, narratorId, permCb, {
 				expandedToolUseId,
 				highlightedId,
 				editExpandOverride,
 				onForkFromMessage,
 				onCompactBeforeMessage,
 				onDeleteBlock,
-			);
+			});
 
 			if (el) elements.push(el);
 

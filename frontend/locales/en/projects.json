@@ -52,6 +52,7 @@
 	"commandCancel": "Cancel",
 	"commandEmpty": "No narraflow commands. Add one to get started.",
 	"commandDuplicateName": "A command with this name already exists",
+	"commandInvalidName": "Command name can only contain letters, numbers, hyphens and underscores",
 	"skillsButton": "Skills",
 	"routinesButton": "Routines",
 	"routinesTitle": "Built-in Routines",

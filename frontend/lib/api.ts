@@ -975,7 +975,16 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ scope, keepTabKey }),
 		}),
-	saveGraphViewport: (projectId: string, viewport: { x: number; y: number; zoom: number }) =>
+	saveGraphViewport: (
+		projectId: string,
+		viewport: {
+			x: number;
+			y: number;
+			zoom: number;
+			rulerOrientation?: "horizontal" | "vertical";
+			rulerEdge?: "start" | "end";
+		},
+	) =>
 		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
 			method: "PATCH",
 			body: JSON.stringify({ projectId, viewport }),
@@ -1040,8 +1049,9 @@ export const api = {
 			inheritMode?: string;
 			forkAtMessageUuid?: string;
 			role?: string;
-			positionX?: number;
-			positionY?: number;
+			anchorCommitSha?: string;
+			axisOffset?: number;
+			crossOffset?: number;
 		},
 	) => request<ApiEntity>(`/chapters/${id}/fork`, { method: "POST", body: JSON.stringify(data) }),
 	checkMergeConflicts: (id: string, targetChapterId: string) =>
@@ -1074,7 +1084,13 @@ export const api = {
 	// === reviews ===
 	createReview: (
 		chapterId: string,
-		data: { title?: string; locale?: string; positionX?: number; positionY?: number },
+		data: {
+			title?: string;
+			locale?: string;
+			anchorCommitSha?: string;
+			axisOffset?: number;
+			crossOffset?: number;
+		},
 	) =>
 		request<ApiEntity>(`/chapters/${chapterId}/review`, {
 			method: "POST",
@@ -1109,8 +1125,9 @@ export const api = {
 		projectId: string,
 		positions: Array<{
 			chapterId: string;
-			x: number;
-			y: number;
+			anchorCommitSha?: string;
+			axisOffset: number;
+			crossOffset: number;
 			panelExpanded?: boolean;
 			panelWidth?: number;
 			panelHeight?: number;
@@ -1141,7 +1158,14 @@ export const api = {
 	},
 	updateRulerPositions: (
 		projectId: string,
-		positions: Array<{ chapterId: string; x: number; y: number }>,
+		positions: Array<{
+			chapterId: string;
+			anchorCommitSha: string;
+			axisOffset: number;
+			crossOffset: number;
+			width?: number;
+			height?: number;
+		}>,
 	) =>
 		request<{ success: boolean }>(`/projects/${projectId}/ruler/positions`, {
 			method: "PATCH",

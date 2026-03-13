@@ -97,6 +97,52 @@ export interface EventHooks {
 	onErrorCleanup?: (message: string) => Promise<void>;
 }
 
+// === Streaming snapshot: track in-progress streaming state per narrator ===
+// Allows newly-subscribing clients to restore tool_use_chunk / text streaming
+// state when switching between narrator sessions.
+
+export interface ToolChunkSnapshot {
+	toolUseId: string;
+	toolName: string;
+	inputCharsTotal: number;
+	parentToolUseId?: string;
+	extractedFilePath?: string;
+	contentCharsReceived?: number;
+	/** Whether tool_started has fired (tool is executing) */
+	started?: boolean;
+	/** Input payload from tool_started */
+	input?: unknown;
+	/** Timestamp from tool_started */
+	streamStartedAt?: number;
+}
+
+export interface StreamingSnapshot {
+	streamingText: string;
+	streamingReasoning: string;
+	toolChunks: Map<string, ToolChunkSnapshot>;
+}
+
+const streamingSnapshots = new Map<string, StreamingSnapshot>();
+
+function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
+	let snap = streamingSnapshots.get(narratorId);
+	if (!snap) {
+		snap = { streamingText: "", streamingReasoning: "", toolChunks: new Map() };
+		streamingSnapshots.set(narratorId, snap);
+	}
+	return snap;
+}
+
+/** Retrieve the current streaming snapshot for a narrator (if any). */
+export function getStreamingSnapshot(narratorId: string): StreamingSnapshot | undefined {
+	return streamingSnapshots.get(narratorId);
+}
+
+/** Clear the streaming snapshot for a narrator (session end / error). */
+export function clearStreamingSnapshot(narratorId: string): void {
+	streamingSnapshots.delete(narratorId);
+}
+
 // === Dual broadcast for subagent self-subscription ===
 
 /**
@@ -239,6 +285,11 @@ export async function processEvent(
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 
+			// Snapshot: accumulate streaming text (top-level only)
+			if (!ctx.parentToolUseId) {
+				getOrCreateSnapshot(broadcastTargetId).streamingText += event.text;
+			}
+
 			const streamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
 				delta: { type: "text_delta", text: event.text },
@@ -268,6 +319,20 @@ export async function processEvent(
 			if (hooks?.onSnapshotBefore) {
 				hooks.onSnapshotBefore(event.toolUseId, event.toolName);
 			}
+			// Snapshot: mark tool as started (executing)
+			{
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const existing = snap.toolChunks.get(event.toolUseId);
+				snap.toolChunks.set(event.toolUseId, {
+					toolUseId: event.toolUseId,
+					toolName: event.toolName,
+					inputCharsTotal: existing?.inputCharsTotal ?? 0,
+					...(existing?.parentToolUseId && { parentToolUseId: existing.parentToolUseId }),
+					started: true,
+					input: event.input,
+					streamStartedAt: event.streamStartedAt,
+				});
+			}
 			dualBroadcast(ctx, {
 				type: "tool_started",
 				narratorId: broadcastTargetId,
@@ -290,6 +355,22 @@ export async function processEvent(
 					if (!ctx.toolUseCharsMap) ctx.toolUseCharsMap = new Map();
 					ctx.toolUseCharsMap.set(event.toolUseId, event.inputCharsTotal);
 				}
+			}
+			// Snapshot: track active tool chunk
+			{
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const existing = snap.toolChunks.get(event.toolUseId);
+				snap.toolChunks.set(event.toolUseId, {
+					...existing,
+					toolUseId: event.toolUseId,
+					toolName: event.toolName,
+					inputCharsTotal: event.inputCharsTotal,
+					...(event.extractedFilePath && { extractedFilePath: event.extractedFilePath }),
+					...(event.contentCharsReceived != null && {
+						contentCharsReceived: event.contentCharsReceived,
+					}),
+					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				});
 			}
 			dualBroadcast(ctx, {
 				type: "tool_use_chunk",
@@ -377,6 +458,9 @@ export async function processEvent(
 		}
 
 		case "assistant_message": {
+			// Snapshot: clear streaming state — this turn's text + tools are done
+			clearStreamingSnapshot(broadcastTargetId);
+
 			const tokenUsage = ctx.getTokenUsage();
 			const turnUsage = tokenUsage
 				? {
@@ -407,10 +491,7 @@ export async function processEvent(
 				if (tokenUsage?.promptTokens != null) updates.tokensIn = tokenUsage.promptTokens;
 				if (turnUsage) updates.turnUsageJson = turnUsage;
 				if (Object.keys(updates).length > 0) {
-					await db
-						.update(narratorMessages)
-						.set(updates)
-						.where(eq(narratorMessages.id, savedId));
+					await db.update(narratorMessages).set(updates).where(eq(narratorMessages.id, savedId));
 				}
 				ctx.setPartialMessageId(undefined);
 			} else {
@@ -501,6 +582,9 @@ export async function processEvent(
 		}
 
 		case "tool_result": {
+			// Snapshot: remove completed tool from active chunks
+			streamingSnapshots.get(broadcastTargetId)?.toolChunks.delete(event.toolUseId);
+
 			const status = event.isError ? "fail" : "success";
 			try {
 				await narratorService.updateToolCallResult(event.toolUseId, {
@@ -607,6 +691,9 @@ export async function processEvent(
 		}
 
 		case "error": {
+			// Snapshot: clear streaming state on error
+			clearStreamingSnapshot(broadcastTargetId);
+
 			if (hooks?.onErrorCleanup) {
 				await hooks.onErrorCleanup(event.message);
 			} else if (event.message !== "Aborted") {
@@ -626,6 +713,11 @@ export async function processEvent(
 		case "stream_reasoning": {
 			// Track AI reasoning output character rate
 			recordOutputChunk(event.text.length);
+
+			// Snapshot: accumulate streaming reasoning (top-level only)
+			if (!ctx.parentToolUseId) {
+				getOrCreateSnapshot(broadcastTargetId).streamingReasoning += event.text;
+			}
 
 			const reasoningStreamEvent: Record<string, unknown> = {
 				type: "content_block_delta",

@@ -80,6 +80,10 @@
 		"mergeToTrunk": "合并到主线",
 		"abandon": "放弃",
 		"resetView": "重置视图 (Home)",
-		"noCommitsOnBranch": "该分支暂无提交"
+		"noCommitsOnBranch": "该分支暂无提交",
+		"horizontal": "水平尺子",
+		"vertical": "垂直尺子",
+		"edgeStart": "尺子在起始侧",
+		"edgeEnd": "尺子在末尾侧"
 	}
 }

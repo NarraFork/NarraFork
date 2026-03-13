@@ -32,7 +32,11 @@ export interface GraphNode {
 		panelHeight: number | null;
 		worktreePath: string | null;
 	};
-	position: { x: number; y: number };
+	position: {
+		anchorCommitSha: string | null;
+		axisOffset: number;
+		crossOffset: number;
+	};
 }
 
 export interface GraphEdge {
@@ -54,8 +58,9 @@ export function buildGraph(
 		groupLabel: string | null;
 		explorationGroupId: string | null;
 		isRoot: number | null;
-		positionX: number | null;
-		positionY: number | null;
+		anchorCommitSha: string | null;
+		axisOffset: number | null;
+		crossOffset: number | null;
 		commitCount: number | null;
 		headCommitSha: string | null;
 		panelExpanded: number | null;
@@ -104,8 +109,9 @@ export function buildGraph(
 			reviewStatus: ch.reviewStatus ?? null,
 		},
 		position: {
-			x: ch.positionX ?? 0,
-			y: ch.positionY ?? 0,
+			anchorCommitSha: ch.anchorCommitSha ?? null,
+			axisOffset: ch.axisOffset ?? 0,
+			crossOffset: ch.crossOffset ?? 0,
 		},
 	}));
 
@@ -137,8 +143,9 @@ graphRoutes.get("/:id/graph", async (c) => {
 			groupLabel: true,
 			explorationGroupId: true,
 			isRoot: true,
-			positionX: true,
-			positionY: true,
+			anchorCommitSha: true,
+			axisOffset: true,
+			crossOffset: true,
 			createdAt: true,
 			commitCount: true,
 			headCommitSha: true,
@@ -291,7 +298,11 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 	}
 
 	for (const pos of parsed.data.positions) {
-		const updates: Record<string, unknown> = { positionX: pos.x, positionY: pos.y };
+		const updates: Record<string, unknown> = {
+			anchorCommitSha: pos.anchorCommitSha ?? null,
+			axisOffset: pos.axisOffset,
+			crossOffset: pos.crossOffset,
+		};
 		if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
 		if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;
 		if (pos.panelHeight !== undefined) updates.panelHeight = pos.panelHeight;

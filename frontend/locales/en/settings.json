@@ -247,6 +247,7 @@
 	"commandCancel": "Cancel",
 	"commandEmpty": "No commands defined. Add one to get started.",
 	"commandDuplicateName": "A command with this name already exists",
+	"commandInvalidName": "Command name can only contain letters, numbers, hyphens and underscores",
 	"commandParamsLabel": "Parameters (optional)",
 	"commandParamNamePlaceholder": "Param name",
 	"commandParamDescPlaceholder": "Description",

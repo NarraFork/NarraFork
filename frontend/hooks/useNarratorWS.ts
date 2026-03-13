@@ -99,6 +99,21 @@ interface NarratorWSCallbacks {
 			avatarImageId: string | null;
 		}>,
 	) => void;
+	onStreamingSnapshot?: (snapshot: {
+		streamingText: string;
+		streamingReasoning: string;
+		toolChunks: Array<{
+			toolUseId: string;
+			toolName: string;
+			inputCharsTotal: number;
+			parentToolUseId?: string;
+			extractedFilePath?: string;
+			contentCharsReceived?: number;
+			started?: boolean;
+			input?: unknown;
+			streamStartedAt?: number;
+		}>;
+	}) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -395,6 +410,13 @@ export function useNarratorWS(
 							break;
 						case "presence_update":
 							callbacksRef.current.onPresenceUpdate?.(data.viewers ?? []);
+							break;
+						case "streaming_snapshot":
+							callbacksRef.current.onStreamingSnapshot?.({
+								streamingText: data.streamingText ?? "",
+								streamingReasoning: data.streamingReasoning ?? "",
+								toolChunks: data.toolChunks ?? [],
+							});
 							break;
 					}
 				} catch (err) {

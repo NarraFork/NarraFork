@@ -66,8 +66,9 @@ CREATE TABLE IF NOT EXISTS chapters (
 	color TEXT,
 	group_label TEXT,
 	pinned INTEGER DEFAULT 0,
-	position_x REAL,
-	position_y REAL,
+	anchor_commit_sha TEXT,
+	axis_offset REAL DEFAULT 0,
+	cross_offset REAL DEFAULT 0,
 	last_accessed_at TEXT,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL

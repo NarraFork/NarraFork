@@ -108,7 +108,7 @@ import {
 } from "./MessageRenderer";
 import { findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
+import { hasToolUse, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesQueryData,
@@ -1218,6 +1218,10 @@ export function NarratorPanel({
 		return null;
 	}, [hydrated, messagesData]);
 
+	// Whether the last visible message ends with a tool run — used to visually
+	// merge the streaming tool chunks into the preceding run (no gap / shared border).
+	const lastMessageIsToolRun = !!lastMessage && hasToolUse(lastMessage);
+
 	const canRetryLastUserMessage =
 		!!lastMessage &&
 		lastMessage.role === "user" &&
@@ -1273,6 +1277,23 @@ export function NarratorPanel({
 		if (initialScrollDoneRef.current) {
 			initialScrollDoneRef.current = false;
 			setInitialScrollDone(false);
+		}
+	}
+
+	// Pre-render trim: on mount (key={narratorId} causes full remount on switch),
+	// if the incoming narrator already has too many cached pages from a previous
+	// visit, drop the oldest ones before the first paint to avoid a heavy render.
+	const mountTrimmedRef = useRef(false);
+	if (!mountTrimmedRef.current) {
+		mountTrimmedRef.current = true;
+		const MAX_PAGES_ON_SWITCH = 3;
+		const cached = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
+		if (cached?.pages && cached.pages.length > MAX_PAGES_ON_SWITCH) {
+			qc.setQueryData(messagesQueryKey, {
+				...cached,
+				pages: cached.pages.slice(0, MAX_PAGES_ON_SWITCH),
+				pageParams: cached.pageParams.slice(0, MAX_PAGES_ON_SWITCH),
+			});
 		}
 	}
 	const skipProgressive = !!highlightMessageId;
@@ -1388,6 +1409,14 @@ export function NarratorPanel({
 		lastUserMessageId,
 		hasChapter,
 	]);
+
+	// Whether streaming tool chunks should visually merge into the preceding tool run.
+	// Only merge when there is no streaming text/reasoning between them.
+	const mergeStreaming =
+		!!topLevelStreamingChunks &&
+		lastMessageIsToolRun &&
+		!streamingRef.current &&
+		!streamingReasoningRef.current;
 
 	// --- Load older ---
 	const handleLoadOlder = useCallback(() => {
@@ -2118,7 +2147,9 @@ export function NarratorPanel({
 									version={streamingVersion}
 								/>
 								{topLevelStreamingChunks &&
-									renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb)}
+									renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb, {
+										containerClassName: mergeStreaming ? "merge-top" : undefined,
+									})}
 							</Stack>
 						</LatestTodosToolUseIdCtx.Provider>
 					</ScrollArea>

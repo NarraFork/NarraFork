@@ -290,8 +290,11 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			startCommitSha: true,
 			mergeCommitSha: true,
 			headCommitSha: true,
-			positionX: true,
-			positionY: true,
+			anchorCommitSha: true,
+			axisOffset: true,
+			crossOffset: true,
+			panelWidth: true,
+			panelHeight: true,
 			color: true,
 			reviewSourceChapterId: true,
 			reviewStatus: true,
@@ -346,8 +349,11 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			narratorStatus: narrator?.status ?? null,
 			reviewSourceChapterId: ch.reviewSourceChapterId,
 			reviewStatus: ch.reviewStatus,
-			localX: ch.positionX ?? 0,
-			localY: ch.positionY ?? 0,
+			anchorCommitSha: ch.anchorCommitSha ?? ch.startCommitSha ?? null,
+			axisOffset: ch.axisOffset ?? 0,
+			crossOffset: ch.crossOffset ?? 0,
+			panelWidth: ch.panelWidth ?? null,
+			panelHeight: ch.panelHeight ?? null,
 		};
 	});
 
@@ -362,9 +368,16 @@ rulerRoutes.patch("/:id/ruler/positions", async (c) => {
 	const { positions } = parsed.data;
 
 	for (const pos of positions) {
+		const updates: Record<string, unknown> = {
+			anchorCommitSha: pos.anchorCommitSha,
+			axisOffset: pos.axisOffset,
+			crossOffset: pos.crossOffset,
+		};
+		if (pos.width != null) updates.panelWidth = pos.width;
+		if (pos.height != null) updates.panelHeight = pos.height;
 		await db
 			.update(chapters)
-			.set({ positionX: pos.x, positionY: pos.y })
+			.set(updates)
 			.where(and(eq(chapters.id, pos.chapterId), eq(chapters.projectId, projectId)));
 	}
 

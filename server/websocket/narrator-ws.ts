@@ -9,6 +9,7 @@ import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import { resolveCommand } from "../services/command-service";
 import type { GitStatusSummary } from "../services/git-service";
+import { getStreamingSnapshot } from "../services/narrator-event-handler";
 import { narratorService } from "../services/narrator-service";
 import {
 	clearBufferedMessages,
@@ -215,6 +216,23 @@ export type NarratorServerMessage =
 	| {
 			narratorId: string;
 			quotaBalance: number | null;
+	  }
+	| {
+			type: "streaming_snapshot";
+			narratorId: string;
+			streamingText: string;
+			streamingReasoning: string;
+			toolChunks: Array<{
+				toolUseId: string;
+				toolName: string;
+				inputCharsTotal: number;
+				parentToolUseId?: string;
+				extractedFilePath?: string;
+				contentCharsReceived?: number;
+				started?: boolean;
+				input?: unknown;
+				streamStartedAt?: number;
+			}>;
 	  };
 
 // Client → Server messages
@@ -589,6 +607,25 @@ export const handleNarratorWS = {
 			case "subscribe": {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.add(id);
+				}
+				// Send streaming snapshot: restore in-progress tool chunks + text
+				for (const id of msg.narratorIds) {
+					const snap = getStreamingSnapshot(id);
+					if (snap && (snap.streamingText || snap.streamingReasoning || snap.toolChunks.size > 0)) {
+						try {
+							ws.send(
+								JSON.stringify({
+									type: "streaming_snapshot",
+									narratorId: id,
+									streamingText: snap.streamingText,
+									streamingReasoning: snap.streamingReasoning,
+									toolChunks: [...snap.toolChunks.values()],
+								}),
+							);
+						} catch {
+							connections.delete(ws);
+						}
+					}
 				}
 				// Catch-up: send messages the client missed while disconnected
 				if (msg.lastMessageId && msg.narratorIds.length === 1) {

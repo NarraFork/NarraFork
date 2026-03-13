@@ -52,6 +52,7 @@
 	"commandCancel": "取消",
 	"commandEmpty": "暂无叙事线命令，添加一个以开始使用。",
 	"commandDuplicateName": "已存在同名命令",
+	"commandInvalidName": "命令名称只能包含字母、数字、连字符和下划线",
 	"skillsButton": "技能",
 	"routinesButton": "套路",
 	"routinesTitle": "内置套路",

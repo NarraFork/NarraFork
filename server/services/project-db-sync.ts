@@ -90,8 +90,8 @@ async function syncChapter(chapterId: string): Promise<void> {
 		 base_branch, parent_chapter_id, fork_point, merged_into_chapter_id,
 		 merge_commit_sha, merge_strategy, container_config, exploration_group_id,
 		 is_root, head_commit_sha, start_commit_sha, commit_count, color, group_label,
-		 pinned, position_x, position_y, last_accessed_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 pinned, anchor_commit_sha, axis_offset, cross_offset, last_accessed_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			row.id,
 			row.projectId,
@@ -116,8 +116,9 @@ async function syncChapter(chapterId: string): Promise<void> {
 			row.color,
 			row.groupLabel,
 			row.pinned,
-			row.positionX,
-			row.positionY,
+			row.anchorCommitSha,
+			row.axisOffset,
+			row.crossOffset,
 			row.lastAccessedAt,
 			row.createdAt,
 			row.updatedAt,

@@ -1245,6 +1245,71 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPresenceUpdate: (v) => {
 				setViewers(v);
 			},
+			onStreamingSnapshot: (snapshot) => {
+				// Restore streaming text
+				if (snapshot.streamingText) {
+					streamingRef.current = snapshot.streamingText;
+				}
+				if (snapshot.streamingReasoning) {
+					streamingReasoningRef.current = snapshot.streamingReasoning;
+				}
+				if (snapshot.streamingText || snapshot.streamingReasoning) {
+					flushStreamingVersion();
+				}
+
+				// Restore tool chunks
+				if (snapshot.toolChunks.length > 0) {
+					let topLevelChanged = false;
+					for (const chunk of snapshot.toolChunks) {
+						if (chunk.parentToolUseId) {
+							// Subagent chunk — upsert into message cache
+							qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+								if (!old?.pages?.length || !chunk.parentToolUseId) return old;
+								return upsertSubagentStreamingChunk(
+									old,
+									chunk.parentToolUseId,
+									narratorId,
+									chunk.toolUseId,
+									chunk.toolName,
+									chunk.inputCharsTotal,
+									toolUseIndexRef.current,
+								) as MessagesQueryData;
+							});
+						} else if (chunk.started) {
+							// Tool already started executing — render as real tool card
+							if (!topLevelStreamingCreatedAtRef.current) {
+								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
+							}
+							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
+								toolUseId: chunk.toolUseId,
+								toolName: chunk.toolName,
+								inputCharsTotal: -1, // sentinel: no longer streaming
+								_started: true,
+								_input: chunk.input,
+								_startedAt: chunk.streamStartedAt,
+								// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
+							} as any);
+							topLevelChanged = true;
+						} else {
+							// Still streaming input — render as streaming indicator
+							if (!topLevelStreamingCreatedAtRef.current) {
+								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
+							}
+							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
+								toolUseId: chunk.toolUseId,
+								toolName: chunk.toolName,
+								inputCharsTotal: chunk.inputCharsTotal,
+								extractedFilePath: chunk.extractedFilePath,
+								contentCharsReceived: chunk.contentCharsReceived,
+							});
+							topLevelChanged = true;
+						}
+					}
+					if (topLevelChanged) {
+						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+					}
+				}
+			},
 		},
 		lastMessageId,
 	);

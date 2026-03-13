@@ -179,7 +179,22 @@ export function useNarraFlow(projectId: string) {
 				explorationGroups: [] as ExplorationGroup[],
 				openedTerminals: [] as OpenedTerminal[],
 			};
-		const layoutNodes = applyDagreLayout(data.nodes as GraphNode[], data.edges as GraphEdge[]);
+		// Map server position format (anchorCommitSha/axisOffset/crossOffset) to React Flow x/y.
+		// In classic mode, axisOffset → x, crossOffset → y.
+		const mappedNodes = (
+			data.nodes as Array<
+				Omit<GraphNode, "position"> & {
+					position: { anchorCommitSha?: string | null; axisOffset: number; crossOffset: number };
+				}
+			>
+		).map((n) => ({
+			...n,
+			position: {
+				x: n.position.axisOffset ?? 0,
+				y: n.position.crossOffset ?? 0,
+			},
+		}));
+		const layoutNodes = applyDagreLayout(mappedNodes, data.edges as GraphEdge[]);
 		return {
 			nodes: layoutNodes,
 			edges: data.edges as GraphEdge[],

@@ -26,8 +26,13 @@ export function triggerNotification(
 	if (status === "done" && !prefs.notifyOnDone) return;
 	if (status === "waiting" && !prefs.notifyOnWaiting) return;
 
-	// PWA browser notification
-	if (prefs.notifyPwaEnabled && "Notification" in window && Notification.permission === "granted") {
+	// PWA browser notification — only when page is not focused
+	if (
+		prefs.notifyPwaEnabled &&
+		!document.hasFocus() &&
+		"Notification" in window &&
+		Notification.permission === "granted"
+	) {
 		const body =
 			status === "done"
 				? `${narratorTitle} has finished`

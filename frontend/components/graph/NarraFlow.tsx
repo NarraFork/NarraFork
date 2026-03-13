@@ -1178,8 +1178,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						title: payload.title,
 						description: payload.description || undefined,
 						inheritMode: payload.inheritMode,
-						positionX: draftX,
-						positionY: draftY,
+						axisOffset: draftX,
+						crossOffset: draftY,
 					})
 					.then(() => {
 						removeDraft(draftNodeId);
@@ -1328,7 +1328,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				const sourceNode = nodesRef.current.find((n) => n.id === nodeId);
 				const posX = (sourceNode?.position?.x ?? 0) + 380;
 				const posY = sourceNode?.position?.y ?? 0;
-				await api.createReview(nodeId, { positionX: posX, positionY: posY });
+				await api.createReview(nodeId, { axisOffset: posX, crossOffset: posY });
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 				queryClient.invalidateQueries({ queryKey: ["graph"] });
 			} catch (err) {

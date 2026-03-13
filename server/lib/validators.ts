@@ -270,8 +270,9 @@ export const forkChapterSchema = z.object({
 	/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
 	parentChapterId: z.string().optional(),
 	role: z.enum(["branch", "exploration"]).default("branch"),
-	positionX: z.number().optional(),
-	positionY: z.number().optional(),
+	anchorCommitSha: z.string().optional(),
+	axisOffset: z.number().optional(),
+	crossOffset: z.number().min(0).optional(),
 });
 
 export const rulerMergeSchema = z.object({
@@ -288,8 +289,11 @@ export const updateRulerPositionsSchema = z.object({
 	positions: z.array(
 		z.object({
 			chapterId: z.string().min(1),
-			x: z.number(),
-			y: z.number(),
+			anchorCommitSha: z.string().min(1),
+			axisOffset: z.number(),
+			crossOffset: z.number().min(0),
+			width: z.number().positive().optional(),
+			height: z.number().positive().optional(),
 		}),
 	),
 });
@@ -297,8 +301,9 @@ export const updateRulerPositionsSchema = z.object({
 export const createReviewSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	locale: z.enum(["en", "zh-CN"]).optional(),
-	positionX: z.number().optional(),
-	positionY: z.number().optional(),
+	anchorCommitSha: z.string().optional(),
+	axisOffset: z.number().optional(),
+	crossOffset: z.number().min(0).optional(),
 });
 
 export const mergeChapterSchema = z.object({
@@ -636,8 +641,9 @@ export const updateGraphPositionsSchema = z.object({
 		.array(
 			z.object({
 				chapterId: z.string().min(1),
-				x: z.number().finite(),
-				y: z.number().finite(),
+				anchorCommitSha: z.string().optional(),
+				axisOffset: z.number().finite(),
+				crossOffset: z.number().finite().min(0),
 				panelExpanded: z.boolean().optional(),
 				panelWidth: z.number().finite().optional(),
 				panelHeight: z.number().finite().optional(),

@@ -1805,6 +1805,28 @@ if (typeof document !== "undefined") {
   );
   animation: tool-shimmer 2s ease-in-out infinite;
   pointer-events: none;
+}
+/* Streaming tool-chunk merge: top half */
+[data-tool-run].merge-top {
+  margin-top: calc(-1 * var(--mantine-spacing-sm) - 1px);
+  border-top-left-radius: 0 !important;
+  border-top-right-radius: 0 !important;
+  border-top: none !important;
+}
+[data-tool-run].merge-top > * .mantine-Paper-root:first-of-type {
+  border-top-left-radius: 0 !important;
+  border-top-right-radius: 0 !important;
+  border-top: none !important;
+}
+/* Streaming tool-chunk merge: bottom half — tool run immediately before .merge-top */
+[data-tool-run]:has(+ [data-tool-run].merge-top) {
+  border-bottom-left-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+  overflow: visible !important;
+}
+[data-tool-run]:has(+ [data-tool-run].merge-top) .mantine-Paper-root {
+  border-bottom-left-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
 }`;
 		document.head.appendChild(style);
 	}

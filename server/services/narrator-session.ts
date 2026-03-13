@@ -37,7 +37,12 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
 
 import { narratorContext } from "./narrator-context";
-import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
+import {
+	clearStreamingSnapshot,
+	type EventHandlerContext,
+	type EventHooks,
+	processEvent,
+} from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
@@ -1593,6 +1598,7 @@ async function createNarrator(
 	if (existing) {
 		existing.abortController.abort();
 		activeNarrators.delete(narratorId);
+		clearStreamingSnapshot(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -2800,6 +2806,7 @@ async function runAgentLoop(
 			});
 		});
 		activeNarrators.delete(narratorId);
+		clearStreamingSnapshot(narratorId);
 		active.abortController.abort();
 		active.events.emit("event", { type: "done", data: null });
 		active.events.removeAllListeners();
@@ -3554,6 +3561,7 @@ export function closeNarrator(narratorId: string): void {
 	active.alive = false;
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
+	clearStreamingSnapshot(narratorId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,

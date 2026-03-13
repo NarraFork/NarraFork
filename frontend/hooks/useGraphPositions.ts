@@ -3,8 +3,9 @@ import { useMutation } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef } from "react";
 
 interface PendingUpdate {
-	x: number;
-	y: number;
+	anchorCommitSha?: string;
+	axisOffset: number;
+	crossOffset: number;
 	panelExpanded?: boolean;
 	panelWidth?: number;
 	panelHeight?: number;
@@ -18,8 +19,9 @@ export function useUpdateGraphPositions(projectId: string) {
 		mutationFn: (
 			positions: Array<{
 				chapterId: string;
-				x: number;
-				y: number;
+				anchorCommitSha?: string;
+				axisOffset: number;
+				crossOffset: number;
 				panelExpanded?: boolean;
 				panelWidth?: number;
 				panelHeight?: number;
@@ -36,8 +38,9 @@ export function useUpdateGraphPositions(projectId: string) {
 		if (pendingRef.current.size === 0) return;
 		const positions = Array.from(pendingRef.current.entries()).map(([chapterId, upd]) => ({
 			chapterId,
-			x: upd.x,
-			y: upd.y,
+			anchorCommitSha: upd.anchorCommitSha,
+			axisOffset: upd.axisOffset,
+			crossOffset: upd.crossOffset,
 			panelExpanded: upd.panelExpanded,
 			panelWidth: upd.panelWidth,
 			panelHeight: upd.panelHeight,
@@ -58,9 +61,14 @@ export function useUpdateGraphPositions(projectId: string) {
 	}, [flush]);
 
 	const savePosition = useCallback(
-		(chapterId: string, x: number, y: number) => {
+		(chapterId: string, axisOffset: number, crossOffset: number, anchorCommitSha?: string) => {
 			const existing = pendingRef.current.get(chapterId);
-			pendingRef.current.set(chapterId, { ...existing, x, y });
+			pendingRef.current.set(chapterId, {
+				...existing,
+				anchorCommitSha,
+				axisOffset,
+				crossOffset: Math.max(0, crossOffset),
+			});
 			scheduleFlush();
 		},
 		[scheduleFlush],
@@ -69,17 +77,19 @@ export function useUpdateGraphPositions(projectId: string) {
 	const savePanelState = useCallback(
 		(
 			chapterId: string,
-			x: number,
-			y: number,
+			axisOffset: number,
+			crossOffset: number,
 			panelExpanded: boolean,
 			panelWidth?: number,
 			panelHeight?: number,
+			anchorCommitSha?: string,
 		) => {
 			const existing = pendingRef.current.get(chapterId);
 			pendingRef.current.set(chapterId, {
 				...existing,
-				x,
-				y,
+				anchorCommitSha,
+				axisOffset,
+				crossOffset: Math.max(0, crossOffset),
 				panelExpanded,
 				panelWidth,
 				panelHeight,

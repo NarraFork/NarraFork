@@ -17,8 +17,9 @@ import { closeNarrator, updateNarratorChapterRole } from "./narrator-session";
 export interface CreateReviewInput {
 	title?: string;
 	locale?: Locale;
-	positionX?: number;
-	positionY?: number;
+	anchorCommitSha?: string;
+	axisOffset?: number;
+	crossOffset?: number;
 }
 
 export const reviewService = {
@@ -55,11 +56,11 @@ export const reviewService = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		// Compute position (offset from source)
-		const NODE_WIDTH = 280;
-		const HORIZONTAL_OFFSET = NODE_WIDTH + 100;
-		const positionX = input.positionX ?? (source.positionX ?? 0) + HORIZONTAL_OFFSET;
-		const positionY = input.positionY ?? source.positionY ?? 0;
+		// Compute position (anchor to same commit as source, offset cross-axis)
+		const CROSS_OFFSET = 380;
+		const anchorCommitSha = input.anchorCommitSha ?? source.anchorCommitSha ?? sourceHeadSha;
+		const axisOffset = input.axisOffset ?? source.axisOffset ?? 0;
+		const crossOffset = input.crossOffset ?? (source.crossOffset ?? 0) + CROSS_OFFSET;
 
 		const rollback: Array<() => Promise<void>> = [];
 
@@ -89,8 +90,9 @@ export const reviewService = {
 					forkPoint: { commitSha: sourceHeadSha },
 					startCommitSha: sourceHeadSha,
 					headCommitSha: sourceHeadSha,
-					positionX,
-					positionY,
+					anchorCommitSha,
+					axisOffset,
+					crossOffset,
 					lastAccessedAt: now,
 					createdAt: now,
 					updatedAt: now,

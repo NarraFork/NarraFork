@@ -101,8 +101,10 @@ export const chapters = sqliteTable(
 		color: text("color"),
 		groupLabel: text("group_label"),
 		pinned: integer("pinned").default(0),
-		positionX: real("position_x"),
-		positionY: real("position_y"),
+		// 位置坐标系：锚定到 commit + 轴上偏移 + 离轴距离
+		anchorCommitSha: text("anchor_commit_sha"),
+		axisOffset: real("axis_offset").default(0),
+		crossOffset: real("cross_offset").default(0),
 		panelExpanded: integer("panel_expanded").default(0),
 		panelWidth: real("panel_width"),
 		panelHeight: real("panel_height"),

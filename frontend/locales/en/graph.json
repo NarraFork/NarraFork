@@ -80,6 +80,10 @@
 		"mergeToTrunk": "Merge to trunk",
 		"abandon": "Abandon",
 		"resetView": "Reset view (Home)",
-		"noCommitsOnBranch": "No commits on this branch"
+		"noCommitsOnBranch": "No commits on this branch",
+		"horizontal": "Horizontal ruler",
+		"vertical": "Vertical ruler",
+		"edgeStart": "Ruler at start",
+		"edgeEnd": "Ruler at end"
 	}
 }

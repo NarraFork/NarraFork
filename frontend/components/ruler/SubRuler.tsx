@@ -7,6 +7,7 @@ import { api } from "../../lib/api";
 import { computeElasticLayout } from "./elastic-layout";
 import { TickContextMenu } from "./RulerContextMenus";
 import { SegmentCanvas } from "./SegmentCanvas";
+import type { RulerOrientation } from "./types";
 
 interface SubRulerProps {
 	projectId: string;
@@ -16,6 +17,7 @@ interface SubRulerProps {
 	width: number;
 	/** Nesting depth (0 = direct child of main ruler) */
 	depth: number;
+	orientation?: RulerOrientation;
 	/** Callback when user wants to navigate up */
 	onBreadcrumbClick?: (depth: number) => void;
 }
@@ -23,9 +25,17 @@ interface SubRulerProps {
 const SUB_RULER_HEIGHT = 36;
 const TICK_WIDTH = 2;
 
-export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: SubRulerProps) {
+export function SubRuler({
+	projectId,
+	chapterId,
+	chapterTitle,
+	width,
+	depth,
+	orientation = "horizontal",
+}: SubRulerProps) {
 	const { t } = useTranslation("graph");
 	const queryClient = useQueryClient();
+	const isH = orientation === "horizontal";
 	const { data, isLoading } = useSubRulerData(projectId, chapterId);
 	const [expandedSegments, setExpandedSegments] = useState<Set<string>>(new Set());
 	const scrollX = 0;
@@ -114,13 +124,22 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 			<Box
 				style={{
 					position: "relative",
-					height: SUB_RULER_HEIGHT,
+					...(isH
+						? { height: SUB_RULER_HEIGHT }
+						: { width: SUB_RULER_HEIGHT, minHeight: layout.totalWidth || 60 }),
 					background: "var(--mantine-color-dark-7)",
-					borderTop: "1px solid var(--mantine-color-indigo-9)",
-					borderBottom: "1px solid var(--mantine-color-indigo-9)",
+					...(isH
+						? {
+								borderTop: "1px solid var(--mantine-color-indigo-9)",
+								borderBottom: "1px solid var(--mantine-color-indigo-9)",
+							}
+						: {
+								borderLeft: "1px solid var(--mantine-color-indigo-9)",
+								borderRight: "1px solid var(--mantine-color-indigo-9)",
+							}),
 					overflow: "hidden",
 					borderRadius: 4,
-					margin: "0 4px",
+					margin: isH ? "0 4px" : "4px 0",
 				}}
 			>
 				<Box
@@ -128,13 +147,17 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 						position: "absolute",
 						top: 0,
 						left: 0,
-						width: layout.totalWidth,
-						height: "100%",
-						transform: `translateX(${scrollX}px)`,
+						...(isH
+							? { width: layout.totalWidth, height: "100%", transform: `translateX(${scrollX}px)` }
+							: {
+									height: layout.totalWidth,
+									width: "100%",
+									transform: `translateY(${scrollX}px)`,
+								}),
 					}}
 				>
 					{layout.ticks.map((tick) => {
-						const x = tick.x;
+						const pos = tick.x;
 						const commit = commits[tick.index];
 						const segment = tick.segment;
 						const hasActive = segment && segment.activeChapterCount > 0;
@@ -146,11 +169,11 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 								key={tick.sha}
 								style={{
 									position: "absolute",
-									left: x,
-									top: 0,
-									height: "100%",
+									...(isH
+										? { left: pos, top: 0, height: "100%" }
+										: { top: pos, left: 0, width: "100%" }),
 									display: "flex",
-									flexDirection: "column",
+									flexDirection: isH ? "column" : "row",
 									alignItems: "center",
 									cursor: isExpandable ? "pointer" : "default",
 								}}
@@ -169,12 +192,12 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 							>
 								<Box
 									style={{
-										width: TICK_WIDTH,
-										height: hasActive ? 16 : 10,
+										...(isH
+											? { width: TICK_WIDTH, height: hasActive ? 16 : 10, marginTop: 3 }
+											: { height: TICK_WIDTH, width: hasActive ? 16 : 10, marginLeft: 3 }),
 										background: hasActive
 											? "var(--mantine-color-indigo-5)"
 											: "var(--mantine-color-dark-2)",
-										marginTop: 3,
 										borderRadius: 1,
 									}}
 								/>
@@ -189,7 +212,7 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 												: hasActive
 													? "var(--mantine-color-indigo-5)"
 													: "var(--mantine-color-dark-3)",
-											marginTop: 2,
+											...(isH ? { marginTop: 2 } : { marginLeft: 2 }),
 											border: isExpanded ? "1px solid var(--mantine-color-indigo-3)" : "none",
 											transition: "all 150ms ease",
 										}}
@@ -206,7 +229,7 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 				const seg = tick.segment;
 				if (!seg) return null;
 				const nextTick = layout.ticks[tick.index + 1];
-				const segWidth = nextTick ? nextTick.x - tick.x : 300;
+				const segSize = nextTick ? nextTick.x - tick.x : 300;
 
 				return (
 					<Box key={`sub-seg-${tick.sha}`} style={{ marginLeft: 4, marginRight: 4 }}>
@@ -214,9 +237,10 @@ export function SubRuler({ projectId, chapterId, chapterTitle, width, depth }: S
 							projectId={projectId}
 							fromSha={tick.sha}
 							toSha={seg.toSha}
-							x={0}
-							width={Math.min(segWidth, width - 8)}
+							mainPos={0}
+							mainSize={Math.min(segSize, width - 8)}
 							segment={seg}
+							orientation={orientation}
 						/>
 					</Box>
 				);
