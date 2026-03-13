@@ -24,14 +24,29 @@ const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 /** OAuth beta flag required for Claude Pro/Max OAuth authentication. */
 const OAUTH_BETA = "oauth-2025-04-20";
 
+/** Beta flag for adaptive thinking (Opus 4.6 / Sonnet 4.6). */
+const ADAPTIVE_THINKING_BETA = "adaptive-thinking-2026-01-28";
+
+/** Beta flag for effort parameter support. */
+const EFFORT_BETA = "effort-2025-11-24";
+
+/** Beta flag for prompt caching scope. */
+const PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05";
+
+/** Beta flag for redacted thinking content. */
+const REDACT_THINKING_BETA = "redact-thinking-2026-02-12";
+
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
 
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
 
-/** User-Agent string mimicking Claude Code CLI (MAX mode). */
-const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.2 (external, cli)";
+/** User-Agent string matching Claude Code. */
+const CLAUDE_CODE_USER_AGENT = "claude-code/2.1.71";
+
+/** User-Agent string for MAX mode (mimics Claude Code CLI). */
+const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.71 (external, cli)";
 
 /** Tool name prefix required by Claude Code endpoint (MAX mode). */
 const TOOL_PREFIX = "mcp_";
@@ -74,8 +89,19 @@ function applyCacheBreakpoints(
 	for (let i = messages.length - 2; i >= 0 && placed < TARGET_MSG_BREAKPOINTS; i--) {
 		const content = messages[i].content;
 		if (Array.isArray(content) && content.length > 0) {
-			Object.assign(content[content.length - 1], CACHE_CONTROL);
-			placed++;
+			// Find the last block that is NOT thinking/redacted_thinking
+			let targetIdx = -1;
+			for (let j = content.length - 1; j >= 0; j--) {
+				const blockType = (content[j] as { type?: string }).type;
+				if (blockType !== "thinking" && blockType !== "redacted_thinking") {
+					targetIdx = j;
+					break;
+				}
+			}
+			if (targetIdx >= 0) {
+				Object.assign(content[targetIdx], CACHE_CONTROL);
+				placed++;
+			}
 		} else if (typeof content === "string") {
 			// Convert to array format so we can attach cache_control
 			messages[i].content = [{ type: "text", text: content, ...CACHE_CONTROL }];
@@ -163,7 +189,9 @@ type AnthropicContentPart =
 			content: string;
 			is_error?: boolean;
 			cache_control?: CacheControl;
-	  };
+	  }
+	| { type: "thinking"; thinking: string; signature: string }
+	| { type: "redacted_thinking"; data: string };
 
 interface AnthropicMessage {
 	role: "user" | "assistant";
@@ -183,6 +211,115 @@ function supports1mContext(model: string): boolean {
 	return lower.includes("sonnet") || lower.includes("opus-4-6") || lower.includes("opus-4.6");
 }
 
+// === Model capability detection ===
+
+/** Whether a model supports extended thinking (Claude 3.7 Sonnet, Haiku 4.5+, Opus 4+, Sonnet 4+). */
+function supportsThinking(model: string): boolean {
+	const lower = model.toLowerCase();
+	// Claude 3.7 Sonnet
+	if (lower.includes("3-7") || lower.includes("3.7")) return true;
+	// Claude 4+ families (opus-4, sonnet-4, haiku-4)
+	if (lower.includes("opus-4") || lower.includes("sonnet-4") || lower.includes("haiku-4")) {
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Whether a model supports adaptive thinking (Opus 4.6 / Sonnet 4.6).
+ * Adaptive thinking lets the model dynamically decide how much to think.
+ */
+function supportsAdaptiveThinking(model: string): boolean {
+	const lower = model.toLowerCase();
+	return (
+		lower.includes("opus-4-6") ||
+		lower.includes("opus-4.6") ||
+		lower.includes("sonnet-4-6") ||
+		lower.includes("sonnet-4.6")
+	);
+}
+
+/** Whether a model supports the effort parameter (Opus 4.6 / Sonnet 4.6). */
+function supportsEffort(model: string): boolean {
+	return supportsAdaptiveThinking(model);
+}
+
+/**
+ * Get max_tokens limits for a model.
+ * Returns { default, upperLimit } matching Claude Code behavior.
+ */
+function getTokenLimits(model: string): { default: number; upperLimit: number } {
+	const lower = model.toLowerCase();
+	// Opus 4.5/4.6, Sonnet 4/4.6, Haiku 4
+	if (lower.includes("opus-4") || lower.includes("sonnet-4") || lower.includes("haiku-4")) {
+		return { default: 32_000, upperLimit: 64_000 };
+	}
+	// Default for older models
+	return { default: 32_000, upperLimit: 32_000 };
+}
+
+/**
+ * Map reasoning effort to Anthropic thinking configuration.
+ *
+ * For models supporting adaptive thinking (Opus 4.6, Sonnet 4.6):
+ *   - Uses `{ type: "adaptive" }` which lets the model decide thinking depth
+ *
+ * For older models with thinking support:
+ *   - Uses `{ type: "enabled", budget_tokens: N }` with effort-based budgets
+ *
+ * Effort mapping (budget_tokens for non-adaptive models):
+ *   - "low"    → 4096
+ *   - "medium" → 10240
+ *   - "high"   → 32000 (default)
+ *   - "xhigh"  → upperLimit - 1 (63999)
+ */
+function buildThinkingConfig(
+	model: string,
+	reasoningEffort: string | undefined,
+	maxTokens: number,
+): { type: "enabled"; budget_tokens: number } | { type: "adaptive" } | undefined {
+	if (!supportsThinking(model)) return undefined;
+
+	// Adaptive thinking for newer models
+	if (supportsAdaptiveThinking(model)) {
+		return { type: "adaptive" };
+	}
+
+	// Budget-based thinking for older models
+	const limits = getTokenLimits(model);
+	const budgetMap: Record<string, number> = {
+		low: 4096,
+		medium: 10240,
+		high: 32000,
+		xhigh: limits.upperLimit - 1,
+	};
+
+	const budget = budgetMap[reasoningEffort ?? "high"] ?? 32000;
+	// Budget must be >= 1 and < max_tokens
+	const clampedBudget = Math.max(1, Math.min(budget, maxTokens - 1));
+
+	return { type: "enabled", budget_tokens: clampedBudget };
+}
+
+/**
+ * Map reasoning effort to Anthropic effort parameter value.
+ * Only for models that support the effort API (Opus 4.6, Sonnet 4.6).
+ *
+ * Mapping: low → low, medium → medium, high → high, xhigh → max
+ */
+function mapEffortParam(
+	reasoningEffort: string | undefined,
+): "low" | "medium" | "high" | "max" | undefined {
+	if (!reasoningEffort) return undefined;
+	const map: Record<string, "low" | "medium" | "high" | "max"> = {
+		low: "low",
+		medium: "medium",
+		high: "high",
+		xhigh: "max",
+	};
+	return map[reasoningEffort];
+}
+
 // === SSE event types ===
 
 interface AnthropicStreamEvent {
@@ -191,7 +328,12 @@ interface AnthropicStreamEvent {
 	message?: {
 		id?: string;
 		model?: string;
-		usage?: { input_tokens?: number; output_tokens?: number };
+		usage?: {
+			input_tokens?: number;
+			output_tokens?: number;
+			cache_read_input_tokens?: number;
+			cache_creation_input_tokens?: number;
+		};
 	};
 	content_block?: {
 		type?: string;
@@ -199,12 +341,16 @@ interface AnthropicStreamEvent {
 		name?: string;
 		text?: string;
 		input?: Record<string, unknown>;
+		thinking?: string;
+		signature?: string;
 	};
 	delta?: {
 		type?: string;
 		text?: string;
 		partial_json?: string;
 		stop_reason?: string;
+		thinking?: string;
+		signature?: string;
 	};
 	usage?: { input_tokens?: number; output_tokens?: number };
 	error?: { type?: string; message?: string };
@@ -355,6 +501,14 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const model = parseModelId(params.model).model;
 
+		// Determine max_tokens based on model capabilities
+		const tokenLimits = getTokenLimits(model);
+		const maxTokens = tokenLimits.upperLimit;
+
+		// Build thinking configuration
+		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort, maxTokens);
+		const thinkingEnabled = !!thinkingConfig;
+
 		// Build system as array of text blocks
 		const systemBlocks = systemPrompt ? [{ type: "text" as const, text: systemPrompt }] : undefined;
 
@@ -379,10 +533,29 @@ export class AnthropicProvider implements ProviderAdapter {
 		const body: Record<string, unknown> = {
 			model,
 			messages,
-			max_tokens: 32_000,
+			max_tokens: maxTokens,
 			stream: true,
-			service_tier: "standard_only",
 		};
+
+		// Add thinking configuration
+		if (thinkingConfig) {
+			body.thinking = thinkingConfig;
+		}
+
+		// Temperature: only set when thinking is disabled (API requirement)
+		if (!thinkingEnabled) {
+			body.temperature = 1;
+		}
+
+		// Effort parameter for supported models
+		if (supportsEffort(model) && params.reasoningEffort) {
+			const effort = mapEffortParam(params.reasoningEffort);
+			if (effort) {
+				// output_config is the container for effort in the API
+				body.output_config = { effort };
+			}
+		}
+
 		if (systemBlocks) {
 			body.system = systemBlocks;
 		}
@@ -390,10 +563,25 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.tools = cachedTools;
 		}
 
+		// Add metadata if provided
+		if (params.metadata) {
+			body.metadata = params.metadata;
+		}
+
 		// Build headers matching Claude Code protocol
-		const betaFlags = supports1mContext(model)
-			? `${ANTHROPIC_BETA_FLAGS},${CONTEXT_1M_BETA}`
-			: ANTHROPIC_BETA_FLAGS;
+		const betaParts: string[] = [ANTHROPIC_BETA_FLAGS];
+		if (supports1mContext(model)) {
+			betaParts.push(CONTEXT_1M_BETA);
+		}
+		if (thinkingConfig?.type === "adaptive") {
+			betaParts.push(ADAPTIVE_THINKING_BETA);
+		}
+		if (supportsEffort(model) && params.reasoningEffort) {
+			betaParts.push(EFFORT_BETA);
+		}
+		betaParts.push(PROMPT_CACHING_SCOPE_BETA);
+		betaParts.push(REDACT_THINKING_BETA);
+		const betaFlags = betaParts.join(",");
 
 		let reqUrl: string;
 		let reqHeaders: Record<string, string>;
@@ -408,6 +596,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				"x-api-key": apiKey,
 				"anthropic-version": "2023-06-01",
 				"anthropic-beta": betaFlags,
+				"user-agent": CLAUDE_CODE_USER_AGENT,
 			};
 		}
 
@@ -418,6 +607,9 @@ export class AnthropicProvider implements ProviderAdapter {
 			messageCount: messages.length,
 			hasSystem: !!systemPrompt,
 			maxMode: isMax,
+			maxTokens,
+			thinkingType: thinkingConfig?.type,
+			reasoningEffort: params.reasoningEffort,
 		});
 
 		const response = await fetch(reqUrl, {
@@ -469,9 +661,25 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 	}
 
-	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void {
+	pushAssistantTurn(
+		history: unknown[],
+		text: string,
+		toolUses: AgentToolUse[],
+		reasoningBlocks?: Array<{
+			text: string;
+			providerMetadata?: import("./types").ReasoningProviderMetadata;
+		}>,
+	): void {
 		const h = history as AnthropicMessage[];
 		const parts: AnthropicContentPart[] = [];
+
+		// Thinking blocks go first (matching Claude Code ordering)
+		if (reasoningBlocks) {
+			for (const rb of reasoningBlocks) {
+				const sig = rb.providerMetadata?.anthropic?.signature ?? "";
+				parts.push({ type: "thinking", thinking: rb.text, signature: sig });
+			}
+		}
 
 		if (text) {
 			parts.push({ type: "text", text });
@@ -517,13 +725,11 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: string;
 			max_tokens: number;
 			messages: Array<{ role: "user"; content: string }>;
-			service_tier: "standard_only";
 			system?: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
 		} = {
 			model: bareModel,
 			max_tokens: 4096,
 			messages: [{ role: "user", content: text }],
-			service_tier: "standard_only",
 		};
 		if (systemInstruction) {
 			body.system = [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }];
@@ -536,6 +742,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				"x-api-key": apiKey,
 				"anthropic-version": "2023-06-01",
 				"anthropic-beta": betaFlags,
+				"user-agent": CLAUDE_CODE_USER_AGENT,
 			},
 			body: JSON.stringify(body),
 		});
@@ -547,7 +754,12 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const json = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
-			usage?: { input_tokens?: number; output_tokens?: number };
+			usage?: {
+				input_tokens?: number;
+				output_tokens?: number;
+				cache_read_input_tokens?: number;
+				cache_creation_input_tokens?: number;
+			};
 		};
 
 		const resultText =
@@ -585,13 +797,13 @@ export class AnthropicProvider implements ProviderAdapter {
 				"x-api-key": apiKey,
 				"anthropic-version": "2023-06-01",
 				"anthropic-beta": betaFlags,
+				"user-agent": CLAUDE_CODE_USER_AGENT,
 			},
 			body: JSON.stringify({
 				model: bareModel,
 				max_tokens: 4096,
 				system: [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }],
 				messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
-				service_tier: "standard_only",
 			}),
 		});
 
@@ -625,6 +837,7 @@ async function* parseAnthropicSSEStream(
 
 	// Tool call accumulators keyed by content block index
 	const toolAccum = new Map<number, ToolAccumEntry>();
+	const thinkingAccum = new Map<number, ThinkingAccumEntry>();
 
 	const reader = body.getReader();
 	try {
@@ -661,7 +874,7 @@ async function* parseAnthropicSSEStream(
 					continue;
 				}
 
-				const events = parseAnthropicEvent(event, toolAccum);
+				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -672,7 +885,7 @@ async function* parseAnthropicSSEStream(
 		if (buffer.trim()?.startsWith("data: ")) {
 			try {
 				const event = JSON.parse(buffer.trim().slice(6));
-				const events = parseAnthropicEvent(event, toolAccum);
+				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -703,9 +916,13 @@ function isParsableJson(s: string): boolean {
 	}
 }
 
+/** Accumulator for thinking block signature (keyed by content_block index). */
+type ThinkingAccumEntry = { signature: string };
+
 function parseAnthropicEvent(
 	event: AnthropicStreamEvent,
 	toolAccum: Map<number, ToolAccumEntry>,
+	thinkingAccum: Map<number, ThinkingAccumEntry>,
 ): ParsedStreamEvent[] {
 	const type = event.type;
 	if (!type) return [];
@@ -721,6 +938,9 @@ function parseAnthropicEvent(
 				usage: {
 					promptTokens: event.message.usage.input_tokens,
 					completionTokens: event.message.usage.output_tokens,
+					cachedInputTokens:
+						(event.message.usage.cache_read_input_tokens ?? 0) +
+						(event.message.usage.cache_creation_input_tokens ?? 0),
 				},
 			});
 		}
@@ -750,6 +970,11 @@ function parseAnthropicEvent(
 				},
 			];
 		}
+		// Thinking block start — initialize signature accumulator
+		if (block.type === "thinking") {
+			thinkingAccum.set(idx, { signature: "" });
+			return [];
+		}
 		return [];
 	}
 
@@ -765,6 +990,15 @@ function parseAnthropicEvent(
 		// Thinking delta (extended thinking)
 		if (event.delta.type === "thinking_delta" && event.delta.text) {
 			return [{ reasoning: event.delta.text }];
+		}
+
+		// Signature delta — accumulate for thinking block verification
+		if (event.delta.type === "signature_delta" && event.delta.signature) {
+			const acc = thinkingAccum.get(idx);
+			if (acc) {
+				acc.signature += event.delta.signature;
+			}
+			return [];
 		}
 
 		// Tool use input delta
@@ -802,6 +1036,20 @@ function parseAnthropicEvent(
 		if (acc && !acc.emitted) {
 			acc.emitted = true;
 			return [{ toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true } }];
+		}
+		// Thinking block stop — emit signature as reasoning metadata
+		const thinkAcc = thinkingAccum.get(idx);
+		if (thinkAcc) {
+			thinkingAccum.delete(idx);
+			if (thinkAcc.signature) {
+				return [
+					{
+						reasoningMetadata: {
+							anthropic: { signature: thinkAcc.signature },
+						},
+					},
+				];
+			}
 		}
 		return [];
 	}
@@ -900,6 +1148,35 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 					})
 					.join("\n");
 				history.push({ role: "user", content: searchSummary });
+			}
+
+			// Thinking / redacted_thinking blocks go first (matching Claude Code ordering)
+			for (const b of content) {
+				const block = b as {
+					type: string;
+					thinking?: string;
+					text?: string;
+					signature?: string;
+					data?: string;
+					providerMetadata?: { anthropic?: { signature?: string } };
+				};
+				if (block.type === "thinking" && block.thinking) {
+					parts.push({
+						type: "thinking",
+						thinking: block.thinking,
+						signature: block.signature ?? "",
+					});
+				} else if (block.type === "reasoning" && block.text) {
+					// DB stores thinking as "reasoning" blocks with signature in providerMetadata
+					const sig = block.providerMetadata?.anthropic?.signature ?? "";
+					parts.push({
+						type: "thinking",
+						thinking: block.text,
+						signature: sig,
+					});
+				} else if (block.type === "redacted_thinking" && block.data) {
+					parts.push({ type: "redacted_thinking", data: block.data });
+				}
 			}
 
 			// Text blocks

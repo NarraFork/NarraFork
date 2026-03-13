@@ -157,6 +157,7 @@ export type AgentEvent =
 			query?: string;
 			queries?: string[];
 	  }
+	| { type: "model_switched"; model: string; provider: string }
 	| { type: "done" };
 
 export interface AgentToolUse {
@@ -174,6 +175,10 @@ export interface ReasoningProviderMetadata {
 		itemId?: string;
 		/** Encrypted reasoning content for continuation across turns */
 		reasoningEncryptedContent?: string | null;
+	};
+	anthropic?: {
+		/** Signature for thinking block verification (must be echoed back in subsequent turns) */
+		signature?: string;
 	};
 }
 
@@ -242,10 +247,12 @@ export interface AgentConfig {
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
-	/** Reasoning effort for Codex-mode providers (low, medium, high, xhigh) */
+	/** Reasoning effort — maps to thinking budget (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: "low" | "medium" | "high" | "xhigh";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
+	metadata?: { user_id: string };
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	permissionHandler: (
@@ -270,4 +277,10 @@ export interface AgentConfig {
 	 * Consumed once per call (caller should clear after returning).
 	 */
 	getInjectedUserText?: () => string | null;
+	/**
+	 * Called before each non-first turn to check if the model should be switched.
+	 * When a new model is returned, the loop re-resolves the provider and rebuilds
+	 * history/tools if the provider changed.
+	 */
+	getModelOverride?: () => string | null;
 }

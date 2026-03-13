@@ -9,7 +9,13 @@ import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
-import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
+import {
+	isAnthropicProvider,
+	resolveDefaultReasoningEffort,
+	resolveProvider,
+	settings,
+	usesCodexApiMode,
+} from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
@@ -280,8 +286,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	const ctxMgmt = buildContextManagementHooks({
 		narratorId,
 		locale: locale as Locale,
-		model,
-		provider,
+		getModel: () => model,
+		getProvider: () => provider,
 		isSubagent: true,
 		getPruneBoundary: () => pruneBoundaryId,
 		setPruneBoundary: (id) => {
@@ -322,10 +328,11 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			systemPrompt,
 			locale,
 			signal,
-			reasoningEffort:
-				narratorReasoningEffort ??
-				(usesCodexApiMode(resolvedProvider) ? settings.codex?.defaultReasoningEffort : undefined),
+			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
 			serviceTier: resolvedServiceTier,
+			metadata: isAnthropicProvider(resolvedProvider)
+				? { user_id: `narrafork_${narratorId}_session_${currentConversationId}` }
+				: undefined,
 			toolFilter: TOOL_FILTERS[subagentType],
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(

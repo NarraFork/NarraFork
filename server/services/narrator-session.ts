@@ -30,7 +30,13 @@ import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
-import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
+import {
+	isAnthropicProvider,
+	resolveDefaultReasoningEffort,
+	resolveProvider,
+	settings,
+	usesCodexApiMode,
+} from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -1867,8 +1873,10 @@ function appendTodosContext(text: string, todosJson: unknown): string {
 export interface ContextManagementOptions {
 	narratorId: string;
 	locale: Locale;
-	model: string;
-	provider: string;
+	/** Dynamic getter for the current model (supports mid-loop model switching) */
+	getModel: () => string;
+	/** Dynamic getter for the current provider (supports mid-loop model switching) */
+	getProvider: () => string;
 	/** Whether this narrator is a subagent (all messages have parentToolUseId) */
 	isSubagent?: boolean;
 	/** Mutable getter/setter for the cached prune boundary */
@@ -1891,8 +1899,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	const {
 		narratorId,
 		locale,
-		model,
-		provider,
+		getModel,
+		getProvider,
 		isSubagent: isSubagentNarrator,
 		getPruneBoundary,
 		setPruneBoundary,
@@ -1983,7 +1991,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
 			: rawMsgs;
 		if (newBoundary) pruneToolCalls(msgs, newBoundary);
-		const result = await buildHistory(msgs, model, provider, narratorId);
+		const result = await buildHistory(msgs, getModel(), getProvider(), narratorId);
 		return { history: result.history, pendingToolResults: result.trailingToolResults };
 	};
 
@@ -2086,8 +2094,8 @@ async function runAgentLoop(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
-				model: resolved.model,
-				provider: resolved.provider,
+				getModel: () => resolveProviderAndModel(active.model).model,
+				getProvider: () => resolveProviderAndModel(active.model).provider,
 				getPruneBoundary: () => active._pruneBoundaryMessageId ?? null,
 				setPruneBoundary: (id) => {
 					active._pruneBoundaryMessageId = id;
@@ -2409,8 +2417,7 @@ async function runAgentLoop(
 			};
 
 			const resolvedReasoningEffort =
-				freshNarrator.reasoningEffort ??
-				(usesCodexApiMode(resolved.provider) ? settings.codex?.defaultReasoningEffort : undefined);
+				freshNarrator.reasoningEffort ?? resolveDefaultReasoningEffort(resolved.provider);
 
 			const resolvedServiceTier =
 				freshNarrator.fastMode && usesCodexApiMode(resolved.provider) ? "priority" : undefined;
@@ -2430,6 +2437,9 @@ async function runAgentLoop(
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
+				metadata: isAnthropicProvider(resolved.provider)
+					? { user_id: `narrafork_${narratorId}_session_${active.conversationId}` }
+					: undefined,
 				// Exclude optional tools that haven't been loaded for this session
 				toolFilter: (tool) => {
 					if (OPTIONAL_TOOLS.has(tool.name)) {
@@ -2449,6 +2459,13 @@ async function runAgentLoop(
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getInjectedUserText: () => {
+					return null;
+				},
+				getModelOverride: () => {
+					// active.model is updated in real-time by updateNarratorModel()
+					if (active.model !== config.model) {
+						return active.model;
+					}
 					return null;
 				},
 				// onEvent receives only side-channel events (tool_output, tool_progress)
@@ -3617,6 +3634,11 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 	if (active?.alive) {
 		active.model = model;
 		active.provider = resolveProvider(model);
+		broadcastToNarrator(narratorId, {
+			type: "model_changed",
+			narratorId,
+			model,
+		});
 	}
 }
 

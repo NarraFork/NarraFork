@@ -64,6 +64,11 @@ export interface AnthropicProviderConfig {
 	 * with additional Claude Code specific headers, tool name prefixing, etc.
 	 */
 	maxMode?: boolean;
+	/**
+	 * Default reasoning effort for Anthropic models when narrator reasoningEffort is unset.
+	 * Maps to thinking budget (low/medium/high) or effort parameter (xhigh → max).
+	 */
+	defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh";
 }
 
 	/** Unique short ID (8 chars). */
@@ -555,6 +560,29 @@ export function usesCodexApiMode(prefix?: string): boolean {
 	if (!prefix) return false;
 	if (prefix === "codex") return true;
 	return getOpenaiProviderConfig(prefix)?.apiMode === "codex";
+}
+
+/** Whether a provider is an Anthropic provider (supports thinking/effort controls). */
+export function isAnthropicProvider(prefix?: string): boolean {
+	if (!prefix) return false;
+	return !!getAnthropicProviderConfig(prefix);
+}
+
+/**
+ * Resolve the default reasoning effort for a provider.
+ * Checks Codex settings first, then Anthropic provider config.
+ * Returns undefined if no default is configured.
+ */
+export function resolveDefaultReasoningEffort(
+	provider?: string,
+): "low" | "medium" | "high" | "xhigh" | undefined {
+	if (usesCodexApiMode(provider)) {
+		return settings.codex?.defaultReasoningEffort;
+	}
+	if (isAnthropicProvider(provider)) {
+		return getAnthropicProviderConfig(provider)?.defaultReasoningEffort;
+	}
+	return undefined;
 }
 
 /**
