@@ -17,6 +17,8 @@ interface SegmentChapter {
 	narratorId: string | null;
 	narratorStatus: string | null;
 	reviewStatus: string | null;
+	startCommitSha: string | null;
+	mergeCommitSha: string | null;
 	anchorCommitSha: string | null;
 	axisOffset: number;
 	crossOffset: number;
@@ -34,6 +36,8 @@ export interface CardWorldInfo {
 	title: string;
 	worldX: number;
 	worldY: number;
+	worldW: number;
+	worldH: number;
 	status: string;
 }
 
@@ -64,6 +68,10 @@ interface SegmentCanvasProps {
 	cardRegistry?: React.MutableRefObject<Map<string, CardWorldInfo[]>>;
 	/** Callback to open chapter context menu at screen coordinates (lifted out of transform) */
 	onChapterContextMenu?: (state: ChapterContextMenuState) => void;
+	/** Map of commit SHA → main-axis world position, for drawing connector lines */
+	tickPositions?: Map<string, number>;
+	/** Request the parent to fit a world-space rect into the viewport */
+	onFitToView?: (worldX: number, worldY: number, worldW: number, worldH: number) => void;
 }
 
 const NODE_WIDTH = 220;
@@ -73,241 +81,428 @@ const DEFAULT_PANEL_HEIGHT = 520;
 const MIN_PANEL_WIDTH = 300;
 const MIN_PANEL_HEIGHT = 200;
 
-export function SegmentCanvas({
-	projectId,
-	fromSha,
-	toSha,
-	mainPos,
-	mainSize,
-	segment,
-	scale = 1,
-	orientation = "horizontal",
-	viewTop = 0,
-	viewHeight = 800,
-	cardRegistry,
-	onChapterContextMenu,
-}: SegmentCanvasProps) {
-	const queryClient = useQueryClient();
-	const isH = orientation === "horizontal";
-	const { data, isLoading } = useQuery({
-		queryKey: ["rulerSegment", projectId, fromSha],
-		queryFn: () => api.getRulerSegment(projectId, fromSha, toSha) as Promise<SegmentData>,
-		staleTime: 30_000,
-	});
-
-	const [expandedChapters, setExpandedChapters] = useState<Set<string>>(new Set());
-	const [openNarratorId, setOpenNarratorId] = useState<string | null>(null);
-
-	const toggleChapterExpand = useCallback((chId: string) => {
-		setExpandedChapters((prev) => {
-			const next = new Set(prev);
-			if (next.has(chId)) next.delete(chId);
-			else next.add(chId);
-			return next;
+export const SegmentCanvas = memo(
+	function SegmentCanvas({
+		projectId,
+		fromSha,
+		toSha,
+		mainPos,
+		mainSize,
+		segment: _segment,
+		scale = 1,
+		orientation = "horizontal",
+		viewTop = 0,
+		viewHeight = 800,
+		cardRegistry,
+		onChapterContextMenu,
+		tickPositions,
+		onFitToView,
+	}: SegmentCanvasProps) {
+		const queryClient = useQueryClient();
+		const isH = orientation === "horizontal";
+		const { data, isLoading } = useQuery({
+			queryKey: ["rulerSegment", projectId, fromSha],
+			queryFn: () => api.getRulerSegment(projectId, fromSha, toSha) as Promise<SegmentData>,
+			staleTime: 30_000,
 		});
-	}, []);
 
-	const chapters = data?.chapters ?? [];
+		const [expandedChapters, setExpandedChapters] = useState<Set<string>>(new Set());
+		const [openNarratorId, setOpenNarratorId] = useState<string | null>(null);
+		const prevOpenNarratorIdRef = useRef<string | null>(null);
 
-	const laid = useMemo(() => {
-		const padding = 20;
-		const gap = 16;
-		const cols = Math.max(1, Math.floor((mainSize - padding * 2) / (NODE_WIDTH + gap)));
-		return chapters.map((ch, i) => {
-			const hasPosition = ch.axisOffset !== 0 || ch.crossOffset !== 0;
-			if (hasPosition) return { ...ch, layoutX: ch.axisOffset, layoutY: ch.crossOffset };
-			const col = i % cols;
-			const row = Math.floor(i / cols);
-			return {
-				...ch,
-				layoutX: padding + col * (NODE_WIDTH + gap),
-				layoutY: padding + row * (NODE_HEIGHT + gap),
-			};
-		});
-	}, [chapters, mainSize]);
+		const toggleChapterExpand = useCallback((chId: string) => {
+			setExpandedChapters((prev) => {
+				const next = new Set(prev);
+				if (next.has(chId)) next.delete(chId);
+				else next.add(chId);
+				return next;
+			});
+		}, []);
 
-	// Write card world positions to shared registry (no re-render)
-	const cardInfos = useMemo(
-		() =>
-			laid.map((ch) => ({
-				id: ch.id,
-				title: ch.title,
-				worldX: (isH ? mainPos : 0) + ch.layoutX,
-				worldY: (isH ? 0 : mainPos) + ch.layoutY + 30,
-				status: ch.status,
-			})),
-		[laid, mainPos, isH],
-	);
+		const chapters = data?.chapters ?? [];
 
-	useEffect(() => {
-		if (cardRegistry) {
-			cardRegistry.current.set(fromSha, cardInfos);
-			return () => {
-				cardRegistry.current.delete(fromSha);
-			};
+		const laid = useMemo(() => {
+			const padding = 20;
+			const gap = 16;
+			if (isH) {
+				// Horizontal: mainSize is X-axis, tile cards along X
+				const cols = Math.max(1, Math.floor((mainSize - padding * 2) / (NODE_WIDTH + gap)));
+				return chapters.map((ch, i) => {
+					if (ch.axisOffset !== 0 || ch.crossOffset !== 0)
+						return { ...ch, layoutX: ch.axisOffset, layoutY: ch.crossOffset };
+					const col = i % cols;
+					const row = Math.floor(i / cols);
+					return {
+						...ch,
+						layoutX: padding + col * (NODE_WIDTH + gap),
+						layoutY: padding + row * (NODE_HEIGHT + gap),
+					};
+				});
+			}
+			// Vertical: mainSize is Y-axis, tile cards along Y
+			const rows = Math.max(1, Math.floor((mainSize - padding * 2) / (NODE_HEIGHT + gap)));
+			return chapters.map((ch, i) => {
+				if (ch.axisOffset !== 0 || ch.crossOffset !== 0)
+					return { ...ch, layoutX: ch.axisOffset, layoutY: ch.crossOffset };
+				const row = i % rows;
+				const col = Math.floor(i / rows);
+				return {
+					...ch,
+					layoutX: padding + col * (NODE_WIDTH + gap),
+					layoutY: padding + row * (NODE_HEIGHT + gap),
+				};
+			});
+		}, [chapters, mainSize, isH]);
+
+		// Write card world positions to shared registry (no re-render)
+		const cardInfos = useMemo(
+			() =>
+				laid.map((ch) => {
+					const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
+					return {
+						id: ch.id,
+						title: ch.title,
+						worldX: (isH ? mainPos : 0) + ch.layoutX,
+						worldY: (isH ? 0 : mainPos) + ch.layoutY + 30,
+						worldW: isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH,
+						worldH: isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT,
+						status: ch.status,
+					};
+				}),
+			[laid, mainPos, isH, openNarratorId],
+		);
+
+		useEffect(() => {
+			if (cardRegistry) {
+				cardRegistry.current.set(fromSha, cardInfos);
+				return () => {
+					cardRegistry.current.delete(fromSha);
+				};
+			}
+		}, [cardInfos, cardRegistry, fromSha]);
+
+		// When a narrator panel opens, request the parent to fit the expanded card into view
+		useEffect(() => {
+			const prev = prevOpenNarratorIdRef.current;
+			prevOpenNarratorIdRef.current = openNarratorId;
+			if (!openNarratorId || openNarratorId === prev || !onFitToView) return;
+			const ch = laid.find((c) => c.narratorId === openNarratorId);
+			if (!ch) return;
+			const panelW = ch.panelWidth ?? DEFAULT_PANEL_WIDTH;
+			const panelH = ch.panelHeight ?? DEFAULT_PANEL_HEIGHT;
+			// Card world position: mainPos offsets the segment, +30 is the card top offset
+			const worldX = (isH ? mainPos : 0) + ch.layoutX;
+			const worldY = (isH ? 0 : mainPos) + ch.layoutY + 30;
+			onFitToView(worldX, worldY, panelW, panelH);
+		}, [openNarratorId, laid, mainPos, isH, onFitToView]);
+
+		// Segment spans the full visible viewport in the cross-axis direction
+		const segCrossStart = viewTop - 20;
+		const segCrossSize = viewHeight + 40;
+
+		const containerStyle: React.CSSProperties = {
+			position: "absolute",
+			background: "rgba(67, 56, 202, 0.04)",
+			pointerEvents: "none",
+		};
+		if (isH) {
+			Object.assign(containerStyle, {
+				left: mainPos,
+				top: segCrossStart,
+				width: mainSize,
+				height: segCrossSize,
+			});
+		} else {
+			Object.assign(containerStyle, {
+				top: mainPos,
+				left: segCrossStart,
+				height: mainSize,
+				width: segCrossSize,
+			});
 		}
-	}, [cardInfos, cardRegistry, fromSha]);
 
-	// Segment spans the full visible viewport in the cross-axis direction
-	const segCrossStart = viewTop - 20;
-	const segCrossSize = viewHeight + 40;
+		return (
+			<Box style={containerStyle}>
+				{/* Content layer with pointer events restored */}
+				<Box
+					style={{
+						position: "relative",
+						...(isH ? { top: -segCrossStart } : { left: -segCrossStart }),
+						pointerEvents: "auto",
+					}}
+				>
+					{isLoading && (
+						<Box style={{ display: "flex", justifyContent: "center", paddingTop: 40 }}>
+							<Loader size="sm" />
+						</Box>
+					)}
 
-	const containerStyle: React.CSSProperties = {
-		position: "absolute",
-		background: "rgba(67, 56, 202, 0.04)",
-		pointerEvents: "none",
-	};
-	if (isH) {
-		Object.assign(containerStyle, {
-			left: mainPos,
-			top: segCrossStart,
-			width: mainSize,
-			height: segCrossSize,
-			borderLeft: "1px dashed var(--mantine-color-indigo-8)",
-			borderRight: "1px dashed var(--mantine-color-indigo-8)",
-		});
-	} else {
-		Object.assign(containerStyle, {
-			top: mainPos,
-			left: segCrossStart,
-			height: mainSize,
-			width: segCrossSize,
-			borderTop: "1px dashed var(--mantine-color-indigo-8)",
-			borderBottom: "1px dashed var(--mantine-color-indigo-8)",
-		});
+					{/* Connector lines: tick → chapter card */}
+					{!isLoading && laid.length > 0 && (
+						<ConnectorLines
+							chapters={laid}
+							mainPos={mainPos}
+							isH={isH}
+							scale={scale}
+							tickPositions={tickPositions}
+							openNarratorId={openNarratorId}
+						/>
+					)}
+
+					{laid.map((ch) => {
+						const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
+						const isSubRulerOpen = expandedChapters.has(ch.id);
+						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
+						const cardHeight = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
+
+						return (
+							<Box key={ch.id}>
+								<ChapterCard
+									chapter={ch}
+									x={ch.layoutX}
+									y={ch.layoutY}
+									width={cardWidth}
+									height={cardHeight}
+									isExpanded={isSubRulerOpen}
+									isPanelOpen={isPanelOpen}
+									scale={scale}
+									onClick={() => {
+										if (ch.narratorId) {
+											setOpenNarratorId(openNarratorId === ch.narratorId ? null : ch.narratorId);
+										}
+									}}
+									onDoubleClick={() => toggleChapterExpand(ch.id)}
+									onContextMenu={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										onChapterContextMenu?.({
+											x: e.clientX,
+											y: e.clientY,
+											chapter: ch,
+											fromSha,
+										});
+									}}
+									onDragEnd={(newX, newY) => {
+										const clampedY = Math.max(0, newY);
+										queryClient.setQueryData<SegmentData>(
+											["rulerSegment", projectId, fromSha],
+											(old) => {
+												if (!old) return old;
+												return {
+													...old,
+													chapters: old.chapters.map((c) =>
+														c.id === ch.id ? { ...c, axisOffset: newX, crossOffset: clampedY } : c,
+													),
+												};
+											},
+										);
+										api.updateRulerPositions(projectId, [
+											{
+												chapterId: ch.id,
+												anchorCommitSha: ch.anchorCommitSha ?? fromSha,
+												axisOffset: newX,
+												crossOffset: clampedY,
+											},
+										]);
+									}}
+									onResizeEnd={(newW, newH, dx, dy) => {
+										const newAxisOffset = ch.layoutX + dx;
+										const newCrossOffset = Math.max(0, ch.layoutY + dy);
+										queryClient.setQueryData<SegmentData>(
+											["rulerSegment", projectId, fromSha],
+											(old) => {
+												if (!old) return old;
+												return {
+													...old,
+													chapters: old.chapters.map((c) =>
+														c.id === ch.id
+															? {
+																	...c,
+																	panelWidth: newW,
+																	panelHeight: newH,
+																	axisOffset: newAxisOffset,
+																	crossOffset: newCrossOffset,
+																}
+															: c,
+													),
+												};
+											},
+										);
+										api.updateRulerPositions(projectId, [
+											{
+												chapterId: ch.id,
+												anchorCommitSha: ch.anchorCommitSha ?? fromSha,
+												axisOffset: newAxisOffset,
+												crossOffset: newCrossOffset,
+												width: newW,
+												height: newH,
+											},
+										]);
+									}}
+								/>
+								{isSubRulerOpen && ch.status === "active" && (
+									<Box
+										style={{
+											position: "absolute",
+											left: ch.layoutX,
+											top: ch.layoutY + 30 + cardHeight + 4,
+											width: Math.min(cardWidth + 100, mainSize - ch.layoutX - 8),
+										}}
+									>
+										<SubRuler
+											projectId={projectId}
+											chapterId={ch.id}
+											chapterTitle={ch.title}
+											width={Math.min(cardWidth + 100, mainSize - ch.layoutX - 8)}
+											depth={0}
+											orientation={orientation}
+										/>
+									</Box>
+								)}
+							</Box>
+						);
+					})}
+				</Box>
+			</Box>
+		);
+	},
+	(prev, next) => {
+		// Skip re-render when only camera-driven props change (scale, viewTop, viewHeight).
+		// These are cosmetic during zoom/pan and will be correct on the next full render.
+		if (prev.projectId !== next.projectId) return false;
+		if (prev.fromSha !== next.fromSha) return false;
+		if (prev.toSha !== next.toSha) return false;
+		if (prev.mainPos !== next.mainPos) return false;
+		if (prev.mainSize !== next.mainSize) return false;
+		if (prev.segment !== next.segment) return false;
+		if (prev.orientation !== next.orientation) return false;
+		if (prev.cardRegistry !== next.cardRegistry) return false;
+		if (prev.onChapterContextMenu !== next.onChapterContextMenu) return false;
+		if (prev.tickPositions !== next.tickPositions) return false;
+		if (prev.onFitToView !== next.onFitToView) return false;
+		return true;
+	},
+);
+
+// --- Connector lines from ruler ticks to chapter cards ---
+
+interface ConnectorLinesProps {
+	chapters: Array<{
+		id: string;
+		status: string;
+		startCommitSha: string | null;
+		mergeCommitSha?: string | null;
+		anchorCommitSha: string | null;
+		layoutX: number;
+		layoutY: number;
+		panelWidth: number | null;
+		panelHeight: number | null;
+		narratorId: string | null;
+	}>;
+	mainPos: number;
+	isH: boolean;
+	scale: number;
+	tickPositions?: Map<string, number>;
+	openNarratorId: string | null;
+}
+
+const CARD_TOP_OFFSET = 30; // ChapterCard uses top: currentY + 30
+
+function ConnectorLines({
+	chapters,
+	mainPos,
+	isH,
+	scale,
+	tickPositions,
+	openNarratorId,
+}: ConnectorLinesProps) {
+	if (!tickPositions || chapters.length === 0) return null;
+
+	const lines: React.ReactNode[] = [];
+
+	for (const ch of chapters) {
+		const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
+		const cardW = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
+		const cardH = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
+		const isMerged = ch.status === "merged";
+		const strokeColor = isMerged ? "rgba(99, 102, 241, 0.25)" : "rgba(99, 102, 241, 0.45)";
+
+		// --- Fork line: startCommitSha tick → card leading edge ---
+		const forkSha = ch.startCommitSha;
+		if (forkSha) {
+			const forkTickMain = tickPositions.get(forkSha);
+			if (forkTickMain != null) {
+				const tm = forkTickMain - mainPos;
+				const cardCross = isH
+					? ch.layoutY + CARD_TOP_OFFSET + cardH / 2
+					: ch.layoutX + CARD_TOP_OFFSET + cardW / 2;
+				const cardMain = isH ? ch.layoutX : ch.layoutY;
+
+				// Quadratic bezier: control point at the L-corner (tm, cardCross)
+				// gives a smooth curve from ruler straight down to card straight in.
+				const forkPath = isH
+					? `M ${tm} 0 Q ${tm} ${cardCross}, ${cardMain} ${cardCross}`
+					: `M 0 ${tm} Q ${cardCross} ${tm}, ${cardCross} ${cardMain}`;
+
+				lines.push(
+					<path
+						key={`fork-${ch.id}`}
+						d={forkPath}
+						fill="none"
+						stroke={strokeColor}
+						strokeWidth={1.5 / scale}
+						strokeDasharray={isMerged ? `${4 / scale} ${3 / scale}` : undefined}
+					/>,
+				);
+			}
+		}
+
+		// --- Merge line: card trailing edge → mergeCommitSha tick ---
+		if (isMerged && ch.mergeCommitSha) {
+			const mergeTickMain = tickPositions.get(ch.mergeCommitSha);
+			if (mergeTickMain != null) {
+				const mm = mergeTickMain - mainPos;
+				const cardCross = isH
+					? ch.layoutY + CARD_TOP_OFFSET + cardH / 2
+					: ch.layoutX + CARD_TOP_OFFSET + cardW / 2;
+				const cardTrailMain = isH ? ch.layoutX + cardW : ch.layoutY + cardH;
+
+				const mergePath = isH
+					? `M ${cardTrailMain} ${cardCross} Q ${mm} ${cardCross}, ${mm} 0`
+					: `M ${cardCross} ${cardTrailMain} Q ${cardCross} ${mm}, 0 ${mm}`;
+
+				lines.push(
+					<path
+						key={`merge-${ch.id}`}
+						d={mergePath}
+						fill="none"
+						stroke="rgba(99, 102, 241, 0.25)"
+						strokeWidth={1.5 / scale}
+						strokeDasharray={`${4 / scale} ${3 / scale}`}
+					/>,
+				);
+			}
+		}
 	}
 
+	if (lines.length === 0) return null;
+
 	return (
-		<Box style={containerStyle}>
-			{/* Content layer with pointer events restored */}
-			<Box
-				style={{
-					position: "relative",
-					...(isH ? { top: -segCrossStart } : { left: -segCrossStart }),
-					pointerEvents: "auto",
-				}}
-			>
-				{isLoading && (
-					<Box style={{ display: "flex", justifyContent: "center", paddingTop: 40 }}>
-						<Loader size="sm" />
-					</Box>
-				)}
-
-				{laid.map((ch) => {
-					const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
-					const isSubRulerOpen = expandedChapters.has(ch.id);
-					const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
-					const cardHeight = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
-
-					return (
-						<Box key={ch.id}>
-							<ChapterCard
-								chapter={ch}
-								x={ch.layoutX}
-								y={ch.layoutY}
-								width={cardWidth}
-								height={cardHeight}
-								isExpanded={isSubRulerOpen}
-								isPanelOpen={isPanelOpen}
-								scale={scale}
-								onClick={() => {
-									if (ch.narratorId) {
-										setOpenNarratorId(openNarratorId === ch.narratorId ? null : ch.narratorId);
-									}
-								}}
-								onDoubleClick={() => toggleChapterExpand(ch.id)}
-								onContextMenu={(e) => {
-									e.preventDefault();
-									e.stopPropagation();
-									onChapterContextMenu?.({
-										x: e.clientX,
-										y: e.clientY,
-										chapter: ch,
-										fromSha,
-									});
-								}}
-								onDragEnd={(newX, newY) => {
-									const clampedY = Math.max(0, newY);
-									queryClient.setQueryData<SegmentData>(
-										["rulerSegment", projectId, fromSha],
-										(old) => {
-											if (!old) return old;
-											return {
-												...old,
-												chapters: old.chapters.map((c) =>
-													c.id === ch.id ? { ...c, axisOffset: newX, crossOffset: clampedY } : c,
-												),
-											};
-										},
-									);
-									api.updateRulerPositions(projectId, [
-										{
-											chapterId: ch.id,
-											anchorCommitSha: ch.anchorCommitSha ?? fromSha,
-											axisOffset: newX,
-											crossOffset: clampedY,
-										},
-									]);
-								}}
-								onResizeEnd={(newW, newH, dx, dy) => {
-									const newAxisOffset = ch.layoutX + dx;
-									const newCrossOffset = Math.max(0, ch.layoutY + dy);
-									queryClient.setQueryData<SegmentData>(
-										["rulerSegment", projectId, fromSha],
-										(old) => {
-											if (!old) return old;
-											return {
-												...old,
-												chapters: old.chapters.map((c) =>
-													c.id === ch.id
-														? {
-																...c,
-																panelWidth: newW,
-																panelHeight: newH,
-																axisOffset: newAxisOffset,
-																crossOffset: newCrossOffset,
-															}
-														: c,
-												),
-											};
-										},
-									);
-									api.updateRulerPositions(projectId, [
-										{
-											chapterId: ch.id,
-											anchorCommitSha: ch.anchorCommitSha ?? fromSha,
-											axisOffset: newAxisOffset,
-											crossOffset: newCrossOffset,
-											width: newW,
-											height: newH,
-										},
-									]);
-								}}
-							/>
-							{isSubRulerOpen && ch.status === "active" && (
-								<Box
-									style={{
-										position: "absolute",
-										left: ch.layoutX,
-										top: ch.layoutY + 30 + cardHeight + 4,
-										width: Math.min(cardWidth + 100, mainSize - ch.layoutX - 8),
-									}}
-								>
-									<SubRuler
-										projectId={projectId}
-										chapterId={ch.id}
-										chapterTitle={ch.title}
-										width={Math.min(cardWidth + 100, mainSize - ch.layoutX - 8)}
-										depth={0}
-										orientation={orientation}
-									/>
-								</Box>
-							)}
-						</Box>
-					);
-				})}
-			</Box>
-		</Box>
+		<svg
+			role="img"
+			aria-label="Chapter connector lines"
+			style={{
+				position: "absolute",
+				top: 0,
+				left: 0,
+				width: "100%",
+				height: "100%",
+				overflow: "visible",
+				pointerEvents: "none",
+			}}
+		>
+			{lines}
+		</svg>
 	);
 }
 
@@ -347,6 +542,7 @@ function ChapterCard({
 	const dragStartRef = useRef({ x: 0, y: 0, origX: 0, origY: 0 });
 	const pointerDownTargetRef = useRef<EventTarget | null>(null);
 	const headerRef = useRef<HTMLDivElement>(null);
+	const cardRef = useRef<HTMLDivElement>(null);
 	const [dragOffset, setDragOffset] = useState({ dx: 0, dy: 0 });
 
 	// Reset drag offset when props position changes (after optimistic update lands)
@@ -447,7 +643,7 @@ function ChapterCard({
 				? "var(--mantine-color-yellow-6)"
 				: isActive
 					? "var(--mantine-color-indigo-6)"
-					: "var(--mantine-color-dark-4)";
+					: "light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-4))";
 
 	const currentX = x + dragOffset.dx + resizeDelta.dx;
 	const currentY = y + dragOffset.dy + resizeDelta.dy;
@@ -499,6 +695,7 @@ function ChapterCard({
 
 	return (
 		<Card
+			ref={cardRef}
 			shadow="sm"
 			padding="xs"
 			radius="md"
@@ -513,7 +710,7 @@ function ChapterCard({
 				borderWidth: isPanelOpen ? 2 : isReview ? 2 : 1,
 				borderStyle: isReview ? "dashed" : "solid",
 				opacity: isActive ? 1 : 0.6,
-				cursor: isDraggingRef.current ? "grabbing" : "grab",
+				cursor: isDraggingRef.current ? "grabbing" : isPanelOpen ? "default" : "grab",
 				display: "flex",
 				flexDirection: "column",
 				overflow: "hidden",
@@ -524,16 +721,21 @@ function ChapterCard({
 				userSelect: "none",
 			}}
 			onPointerDown={(e) => {
+				// Only start drag from header area or when panel is closed (compact card)
 				if (e.button !== 0) return;
 				pointerDownTargetRef.current = e.target;
-				isDraggingRef.current = true;
-				dragStartRef.current = {
-					x: e.clientX,
-					y: e.clientY,
-					origX: currentX,
-					origY: currentY,
-				};
-				(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+				const headerEl = headerRef.current;
+				const isFromHeader = headerEl && e.target instanceof Node && headerEl.contains(e.target);
+				if (!isPanelOpen || isFromHeader) {
+					isDraggingRef.current = true;
+					dragStartRef.current = {
+						x: e.clientX,
+						y: e.clientY,
+						origX: currentX,
+						origY: currentY,
+					};
+					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+				}
 				e.stopPropagation();
 			}}
 			onPointerMove={(e) => {
@@ -636,7 +838,8 @@ function ChapterCard({
 						flex: 1,
 						minHeight: 0,
 						overflow: "hidden",
-						borderTop: "1px solid var(--mantine-color-dark-4)",
+						borderTop:
+							"1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 						marginTop: 6,
 						position: "relative",
 					}}

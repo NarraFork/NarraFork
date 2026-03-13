@@ -481,6 +481,11 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		"zh-CN":
 			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。",
 	},
+	// Auto-continue prompt when smart interruption check detects truncated output
+	interruptionContinue: {
+		en: "Your previous response appears to have been cut off. Please continue from where you left off.",
+		"zh-CN": "你上一条回复似乎被截断了，请从中断处继续。",
+	},
 } satisfies Record<string, Record<Locale, string>>;
 
 export type ToolMessageKey = keyof typeof toolMessages;

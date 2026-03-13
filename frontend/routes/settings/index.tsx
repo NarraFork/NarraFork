@@ -168,6 +168,7 @@ function SettingsPage() {
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [translateReasoning, setTranslateReasoning] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
+	const [smartInterruptionCheck, setSmartInterruptionCheck] = useState(true);
 	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
 	const [globalWhitelistDirs, setGlobalWhitelistDirs] = useState<
 		Array<{ path: string; accessLevel: string; enabled?: boolean }>
@@ -221,6 +222,7 @@ function SettingsPage() {
 		legacyEncoding: false,
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
+		smartInterruptionCheck: true,
 		codexDefaultReasoningEffort: "high",
 		globalWhitelistDirs: [] as Array<{
 			path: string;
@@ -266,6 +268,7 @@ function SettingsPage() {
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
+				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
@@ -295,6 +298,7 @@ function SettingsPage() {
 			setLegacyEncoding(snap.legacyEncoding);
 			setTranslateReasoning(snap.translateReasoning);
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
+			setSmartInterruptionCheck(snap.smartInterruptionCheck);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
 			setGlobalWhitelistDirs(snap.globalWhitelistDirs);
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
@@ -330,6 +334,7 @@ function SettingsPage() {
 			legacyEncoding !== s.legacyEncoding ||
 			translateReasoning !== s.translateReasoning ||
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
+			smartInterruptionCheck !== s.smartInterruptionCheck ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort ||
 			JSON.stringify(globalWhitelistDirs) !== JSON.stringify(s.globalWhitelistDirs) ||
 			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
@@ -360,6 +365,7 @@ function SettingsPage() {
 		legacyEncoding,
 		translateReasoning,
 		defaultRelaxedPlan,
+		smartInterruptionCheck,
 		codexDefaultReasoningEffort,
 		globalWhitelistDirs,
 		globalBlacklistDirs,
@@ -399,6 +405,7 @@ function SettingsPage() {
 					legacyEncoding,
 					translateReasoning,
 					defaultRelaxedPlan,
+					smartInterruptionCheck,
 					whitelistDirs: globalWhitelistDirs,
 					blacklistDirs: globalBlacklistDirs,
 					commandWhitelist: globalCommandWhitelist,
@@ -450,6 +457,7 @@ function SettingsPage() {
 						legacyEncoding,
 						translateReasoning,
 						defaultRelaxedPlan,
+						smartInterruptionCheck,
 						codexDefaultReasoningEffort,
 						globalWhitelistDirs,
 						globalBlacklistDirs,
@@ -542,6 +550,8 @@ function SettingsPage() {
 							setTranslateReasoning={setTranslateReasoning}
 							defaultRelaxedPlan={defaultRelaxedPlan}
 							setDefaultRelaxedPlan={setDefaultRelaxedPlan}
+							smartInterruptionCheck={smartInterruptionCheck}
+							setSmartInterruptionCheck={setSmartInterruptionCheck}
 							globalWhitelistDirs={globalWhitelistDirs}
 							setGlobalWhitelistDirs={setGlobalWhitelistDirs}
 							globalBlacklistDirs={globalBlacklistDirs}

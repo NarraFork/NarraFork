@@ -1,6 +1,6 @@
 import { Alert, Button, Group, Text } from "@mantine/core";
 import { IconPlugConnectedX, IconRefresh } from "@tabler/icons-react";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { getDisconnected, hasDisconnected, onWSStatusChange } from "../lib/ws-status";
 
@@ -19,6 +19,20 @@ function getSnapshot() {
 export function WSConnectionAlert() {
 	const anyDisconnected = useSyncExternalStore(subscribe, getSnapshot);
 	const { t } = useTranslation("common");
+
+	// When the page regains visibility while disconnected, auto-reconnect all
+	useEffect(() => {
+		if (!anyDisconnected) return;
+		function handleVisibility() {
+			if (document.visibilityState === "visible") {
+				for (const entry of getDisconnected()) {
+					entry.reconnect?.();
+				}
+			}
+		}
+		document.addEventListener("visibilitychange", handleVisibility);
+		return () => document.removeEventListener("visibilitychange", handleVisibility);
+	}, [anyDisconnected]);
 
 	if (!anyDisconnected) return null;
 

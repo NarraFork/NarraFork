@@ -763,4 +763,28 @@ export const terminalService = {
 		}
 		return null;
 	},
+
+	/**
+	 * Kill all active terminals synchronously (best-effort).
+	 * Called during graceful shutdown to avoid zombie PTY processes.
+	 */
+	shutdownAll() {
+		for (const [id, active] of activeTerminals) {
+			try {
+				active.buffer.dispose(true);
+				if (active.useDtach) {
+					dtachService.killSession(id);
+				}
+				active.runtime.kill();
+				active.runtime.close();
+			} catch {
+				// best effort — we're shutting down
+			}
+		}
+		const count = activeTerminals.size;
+		activeTerminals.clear();
+		if (count > 0) {
+			logger.info("Shutdown: killed active terminals", { count });
+		}
+	},
 };

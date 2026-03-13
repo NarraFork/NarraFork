@@ -86,6 +86,7 @@ const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				translateReasoning: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
+				smartInterruptionCheck: z.boolean(),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),

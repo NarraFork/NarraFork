@@ -146,7 +146,7 @@ export const chapterFork = {
 			} else {
 				// Default: anchor to the fork commit
 				anchorCommitSha = commitSha;
-				axisOffset = 0;
+				axisOffset = 40; // slight main-axis offset so the fork line isn't perfectly straight
 
 				// Find all chapters already anchored to this commit to avoid overlap
 				const existing = await db
@@ -178,6 +178,7 @@ export const chapterFork = {
 					baseBranch: parent.branch,
 					parentChapterId,
 					forkPoint,
+					startCommitSha: commitSha,
 					anchorCommitSha,
 					axisOffset,
 					crossOffset,

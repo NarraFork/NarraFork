@@ -1,5 +1,6 @@
-import { type AgentConfig, agentLoop } from "../lib/agent";
+import { type AgentConfig, agentGenerateWithMeta, agentLoop } from "../lib/agent";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
 
@@ -21,6 +22,8 @@ export interface ExecuteLoopResult {
 	contextLengthExceeded?: boolean;
 	/** Set when the error is transient and the caller should retry after a delay. */
 	retryableError?: string;
+	/** Set when smart interruption check detected the output was cut off. */
+	interrupted?: boolean;
 }
 
 /**
@@ -38,6 +41,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let shouldUpdateTitle = false;
 	let contextLengthExceeded = false;
 	let retryableError: string | undefined;
+	let lastToolNames: string[] = [];
 
 	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
 		// When aborted, still process tool_result and error events so:
@@ -73,6 +77,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 
 		if (event.type === "assistant_message") {
 			finalText = event.text || "";
+			lastToolNames = event.toolUses.map((tu) => tu.name);
 		}
 		if (event.type === "context_length_exceeded") {
 			contextLengthExceeded = true;
@@ -96,5 +101,73 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 		}
 	}
 
-	return { finalText, hasError, shouldUpdateTitle, contextLengthExceeded, retryableError };
+	// Smart interruption check: detect truncated output and flag for auto-continue.
+	// Skip when the previous assistant turn only called TodoWrite — that's a normal
+	// end-of-session pattern where the model updates todos and stops.
+	let interrupted = false;
+	const skipInterruptionCheck =
+		lastToolNames.length > 0 && lastToolNames.every((n) => n === "TodoWrite");
+	if (
+		settings.agent.smartInterruptionCheck &&
+		!hasError &&
+		!contextLengthExceeded &&
+		!retryableError &&
+		!config.signal.aborted &&
+		!skipInterruptionCheck
+	) {
+		interrupted = await checkOutputInterruption(finalText, config.narratorId);
+	}
+
+	return {
+		finalText,
+		hasError,
+		shouldUpdateTitle,
+		contextLengthExceeded,
+		retryableError,
+		interrupted,
+	};
+}
+
+/**
+ * Check whether the assistant's final output was interrupted/truncated.
+ *
+ * 1. No content at all → definitely interrupted.
+ * 2. Has content → ask the summary model to judge (reply "pass" or "retry").
+ */
+async function checkOutputInterruption(text: string, narratorId: string): Promise<boolean> {
+	if (!text.trim()) {
+		logger.info("Smart interruption check: empty output, marking as interrupted", {
+			narratorId,
+		});
+		return true;
+	}
+
+	try {
+		const systemPrompt =
+			"You are an output completeness checker. " +
+			"The user will provide the final assistant message from an AI coding session. " +
+			"Determine if the message appears to have been cut off mid-sentence, mid-code-block, " +
+			"or mid-thought (i.e. the output was interrupted/truncated before the assistant finished). " +
+			"Reply with EXACTLY one word: pass (if the output looks complete) or retry (if it looks interrupted). " +
+			"No explanation.";
+
+		const snippet = text.length > 2000 ? text.slice(-2000) : text;
+		const result = await agentGenerateWithMeta(snippet, settings.agent.summaryModel, systemPrompt);
+		const verdict = result.text.trim().toLowerCase();
+
+		if (verdict === "retry") {
+			logger.info("Smart interruption check: summary model flagged as interrupted", {
+				narratorId,
+			});
+			return true;
+		}
+
+		return false;
+	} catch (err) {
+		logger.error("Smart interruption check failed, skipping", {
+			narratorId,
+			error: String(err),
+		});
+		return false;
+	}
 }

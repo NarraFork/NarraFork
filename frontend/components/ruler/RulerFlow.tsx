@@ -9,10 +9,10 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { type RulerData, useRulerData } from "../../hooks/useRuler";
+import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import { computeElasticLayout, type TickPosition } from "./elastic-layout";
+import { COLLAPSED_GAP, computeElasticLayout, type TickPosition } from "./elastic-layout";
 import { OffscreenBubbles } from "./OffscreenBubbles";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
 import { type ChapterContextMenuState, SegmentCanvas } from "./SegmentCanvas";
@@ -25,6 +25,8 @@ interface RulerFlowProps {
 
 const TICK_WIDTH = 2;
 const VIEWPORT_BUFFER = 200;
+const AUTO_EXPAND_SCALE = 1.4;
+const AUTO_COLLAPSE_SCALE = 0.9;
 
 interface Camera {
 	panX: number;
@@ -34,16 +36,87 @@ interface Camera {
 	edge: RulerEdge;
 }
 
-/** Clamp camera so the cross-axis viewport never enters negative world space (crossOffset < 0). */
-function clampCamera(cam: Camera): Camera {
+interface ClampBounds {
+	maxContentCross: number;
+	crossViewportSize: number;
+	maxContentMain: number;
+	mainViewportSize: number;
+}
+
+/** Compute the hard min/max for each axis. */
+function getMainBounds(opts: ClampBounds, scale: number) {
+	const max = opts.mainViewportSize; // viewport right edge touches x=0
+	const min = -opts.maxContentMain * scale; // viewport left edge touches last content
+	return { min, max };
+}
+
+function getCrossBounds(opts: ClampBounds, scale: number) {
+	const PADDING = 200;
+	const max = 0;
+	const min =
+		opts.maxContentCross > 0
+			? Math.min(0, -(opts.maxContentCross + PADDING) * scale + opts.crossViewportSize)
+			: 0;
+	return { min, max };
+}
+
+/** Hard clamp — snaps to bounds. Used for navigation targets and bounce destinations. */
+function clampCamera(cam: Camera, opts?: ClampBounds): Camera {
 	const isH = cam.orientation === "horizontal";
-	// crossPan is the screen-space offset of world origin along the cross axis.
-	// When crossPan > 0, negative world space is visible — clamp to 0.
-	const crossPan = isH ? cam.panY : cam.panX;
-	if (crossPan > 0) {
-		return isH ? { ...cam, panY: 0 } : { ...cam, panX: 0 };
+	let mainPan = isH ? cam.panX : cam.panY;
+	let crossPan = isH ? cam.panY : cam.panX;
+
+	if (opts) {
+		const cb = getCrossBounds(opts, cam.scale);
+		crossPan = Math.max(cb.min, Math.min(cb.max, crossPan));
+
+		if (opts.maxContentMain > 0) {
+			const mb = getMainBounds(opts, cam.scale);
+			mainPan = Math.max(mb.min, Math.min(mb.max, mainPan));
+		}
 	}
-	return cam;
+
+	if (isH) {
+		const changed = mainPan !== cam.panX || crossPan !== cam.panY;
+		return changed ? { ...cam, panX: mainPan, panY: crossPan } : cam;
+	}
+	const changed = mainPan !== cam.panY || crossPan !== cam.panX;
+	return changed ? { ...cam, panX: crossPan, panY: mainPan } : cam;
+}
+
+/**
+ * Soft clamp — allows overscroll with rubber-band resistance.
+ * The further past the boundary, the harder it is to drag.
+ */
+const RUBBER_BAND_FACTOR = 0.3;
+
+function rubberBand(value: number, min: number, max: number): number {
+	if (value > max) return max + (value - max) * RUBBER_BAND_FACTOR;
+	if (value < min) return min + (value - min) * RUBBER_BAND_FACTOR;
+	return value;
+}
+
+function softClampCamera(cam: Camera, opts?: ClampBounds): Camera {
+	const isH = cam.orientation === "horizontal";
+	let mainPan = isH ? cam.panX : cam.panY;
+	let crossPan = isH ? cam.panY : cam.panX;
+
+	if (opts) {
+		const cb = getCrossBounds(opts, cam.scale);
+		crossPan = rubberBand(crossPan, cb.min, cb.max);
+
+		if (opts.maxContentMain > 0) {
+			const mb = getMainBounds(opts, cam.scale);
+			mainPan = rubberBand(mainPan, mb.min, mb.max);
+		}
+	}
+
+	if (isH) {
+		const changed = mainPan !== cam.panX || crossPan !== cam.panY;
+		return changed ? { ...cam, panX: mainPan, panY: crossPan } : cam;
+	}
+	const changed = mainPan !== cam.panY || crossPan !== cam.panX;
+	return changed ? { ...cam, panX: crossPan, panY: mainPan } : cam;
 }
 
 export function RulerFlow({ projectId }: RulerFlowProps) {
@@ -95,14 +168,65 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		setCamera(savedCamera);
 	}, [savedCamera, prefs]);
 
-	// Batched camera update: write to ref immediately, schedule one rAF for state
-	const scheduleRender = useCallback(() => {
+	// DOM refs for direct transform updates (bypass React re-render during pan/zoom)
+	const tickStripRef = useRef<HTMLDivElement>(null);
+	const worldLayerRef = useRef<HTMLDivElement>(null);
+	const headerLayerRef = useRef<HTMLDivElement>(null);
+
+	// Direct DOM update — moves transforms without triggering React reconciliation.
+	// Only pan/scale changes use this path; layout changes still go through setCamera.
+	const applyTransformToDOM = useCallback(() => {
+		const cam = cameraRef.current;
+		const isH = cam.orientation === "horizontal";
+		const { panX: px, panY: py, scale: s } = cam;
+
+		// Tick strip — translate + scale; update counter-scale CSS variable for ticks
+		const strip = tickStripRef.current;
+		if (strip) {
+			strip.style.transform = isH
+				? `translateX(${px}px) scaleX(${s})`
+				: `translateY(${py}px) scaleY(${s})`;
+			strip.style.setProperty("--ruler-counter-scale", String(1 / s));
+		}
+
+		// World layer (2D canvas)
+		const world = worldLayerRef.current;
+		if (world) {
+			world.style.transform = `translate(${px}px, ${py}px) scale(${s})`;
+		}
+
+		// Segment headers — each child is positioned by screen-space main coordinate
+		const hdr = headerLayerRef.current;
+		if (hdr) {
+			const mainPan = isH ? px : py;
+			for (let i = 0; i < hdr.children.length; i++) {
+				const child = hdr.children[i] as HTMLElement;
+				const worldMain = Number(child.dataset.worldMain);
+				const worldSize = Number(child.dataset.worldSize);
+				if (Number.isNaN(worldMain)) continue;
+				const screenMain = worldMain * s + mainPan;
+				const screenSize = worldSize * s;
+				if (isH) {
+					child.style.left = `${screenMain}px`;
+					child.style.width = `${screenSize}px`;
+				} else {
+					child.style.top = `${screenMain}px`;
+					child.style.height = `${screenSize}px`;
+				}
+			}
+		}
+	}, []);
+
+	// Lightweight render: only updates DOM transforms, no React re-render.
+	// Used during continuous interactions (zoom, pan, scroll animations).
+	// Full React re-render happens only when interaction settles (via setCamera).
+	const scheduleLightRender = useCallback(() => {
 		if (rafIdRef.current) return;
 		rafIdRef.current = requestAnimationFrame(() => {
 			rafIdRef.current = 0;
-			setCamera({ ...cameraRef.current });
+			applyTransformToDOM();
 		});
-	}, []);
+	}, [applyTransformToDOM]);
 
 	// Debounced save to server
 	const cameraSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -124,20 +248,157 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	}, [camera, projectId]);
 
 	// --- Expanded segments ---
-	const [expandedSegments, setExpandedSegments] = useState<Set<string>>(new Set());
+	// Two separate sets: manually toggled by user vs. auto-expanded by zoom level.
+	// The effective expanded set is the union of both.
+	// Auto-expand is driven entirely by refs to avoid re-render during zoom.
+	const [manualExpanded, setManualExpanded] = useState<Set<string>>(new Set());
+	const [autoExpanded, setAutoExpanded] = useState<Set<string>>(new Set());
+	const manualExpandedRef = useRef(manualExpanded);
+	manualExpandedRef.current = manualExpanded;
+	const expandedSegments = useMemo(() => {
+		if (autoExpanded.size === 0) return manualExpanded;
+		if (manualExpanded.size === 0) return autoExpanded;
+		const merged = new Set(manualExpanded);
+		for (const sha of autoExpanded) merged.add(sha);
+		return merged;
+	}, [manualExpanded, autoExpanded]);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const wheelCleanupRef = useRef<(() => void) | null>(null);
 	const isPanningRef = useRef(false);
 	const panStartRef = useRef({ x: 0, y: 0, camX: 0, camY: 0 });
 	const queryClient = useQueryClient();
+	const segmentsRef = useRef<RulerSegment[]>([]);
 
 	// --- Offscreen card tracking (ref-based, no re-render) ---
 	const cardRegistryRef = useRef<
 		Map<
 			string,
-			Array<{ id: string; title: string; worldX: number; worldY: number; status: string }>
+			Array<{
+				id: string;
+				title: string;
+				worldX: number;
+				worldY: number;
+				worldW: number;
+				worldH: number;
+				status: string;
+			}>
 		>
 	>(new Map());
+
+	/** Total main-axis content length (commit ruler), updated after layout computation. */
+	const totalMainRef = useRef(0);
+
+	/** Gather current content bounds + viewport size into a ClampBounds object. */
+	const getBounds = useCallback((): ClampBounds | undefined => {
+		const cam = cameraRef.current;
+		const isH = cam.orientation === "horizontal";
+		let maxCross = 0;
+		for (const cards of cardRegistryRef.current.values()) {
+			for (const c of cards) {
+				const bottom = isH ? c.worldY + c.worldH : c.worldX + c.worldW;
+				if (bottom > maxCross) maxCross = bottom;
+			}
+		}
+		const el = containerRef.current;
+		const crossVp = isH
+			? (el?.clientHeight ?? 800) - RULER_THICKNESS
+			: (el?.clientWidth ?? 1200) - RULER_THICKNESS;
+		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+		const maxMain = totalMainRef.current;
+		const hasContent = maxCross > 0 || maxMain > 0;
+		return hasContent
+			? {
+					maxContentCross: maxCross,
+					crossViewportSize: crossVp,
+					maxContentMain: maxMain,
+					mainViewportSize: mainVp,
+				}
+			: undefined;
+	}, []);
+
+	/** Hard clamp — snap to bounds. For navigation, animation targets, etc. */
+	const hardClamp = useCallback((cam: Camera) => clampCamera(cam, getBounds()), [getBounds]);
+
+	/** Soft clamp — rubber-band resistance during active interaction. */
+	const softClamp = useCallback((cam: Camera) => softClampCamera(cam, getBounds()), [getBounds]);
+
+	/** Animate back to hard-clamped position after overscroll. */
+	const bounceRafRef = useRef(0);
+	const animateBounce = useCallback(() => {
+		cancelAnimationFrame(bounceRafRef.current);
+		const start = { ...cameraRef.current };
+		const target = hardClamp(start);
+		if (start.panX === target.panX && start.panY === target.panY) return;
+
+		const duration = 250;
+		const t0 = performance.now();
+		const step = (now: number) => {
+			const t = Math.min(1, (now - t0) / duration);
+			const e = 1 - (1 - t) ** 3; // ease-out cubic
+			const cam: Camera = {
+				...start,
+				panX: start.panX + (target.panX - start.panX) * e,
+				panY: start.panY + (target.panY - start.panY) * e,
+			};
+			cameraRef.current = cam;
+			if (t < 1) {
+				scheduleLightRender();
+				bounceRafRef.current = requestAnimationFrame(step);
+			} else {
+				// Final frame: commit to state
+				setCamera({ ...cam });
+			}
+		};
+		bounceRafRef.current = requestAnimationFrame(step);
+	}, [hardClamp, scheduleLightRender]);
+
+	// --- Auto-expand: called once when zoom/scroll interaction settles ---
+	// Reads everything from refs — zero React deps, zero re-renders during zoom.
+	const checkAutoExpand = useCallback(() => {
+		const cam = cameraRef.current;
+		const s = cam.scale;
+		const segs = segmentsRef.current;
+		const manual = manualExpandedRef.current;
+
+		if (s >= AUTO_EXPAND_SCALE) {
+			const isH = cam.orientation === "horizontal";
+			const mPan = isH ? cam.panX : cam.panY;
+			const el = containerRef.current;
+			const mViewport = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+			// Use collapsed-state positions (index * COLLAPSED_GAP) for visibility check
+			// so the result doesn't depend on current expanded state.
+			const visStart = -mPan / s - VIEWPORT_BUFFER / s;
+			const visEnd = (-mPan + mViewport) / s + VIEWPORT_BUFFER / s;
+			const next = new Set<string>();
+			for (const seg of segs) {
+				if (!seg.isExpandable) continue;
+				const collapsedX = seg.fromIndex * COLLAPSED_GAP;
+				if (collapsedX >= visStart && collapsedX <= visEnd && !manual.has(seg.fromSha)) {
+					next.add(seg.fromSha);
+				}
+			}
+			setAutoExpanded((prev) => {
+				if (prev.size === next.size && [...next].every((v) => prev.has(v))) return prev;
+				return next;
+			});
+		} else if (s <= AUTO_COLLAPSE_SCALE) {
+			setAutoExpanded((prev) => (prev.size === 0 ? prev : new Set()));
+		}
+	}, []);
+
+	// --- Smooth scroll state for main-axis wheel scrolling ---
+	const smoothScrollRef = useRef({
+		targetMainPan: 0,
+		animating: false,
+		rafId: 0,
+	});
+
+	// Keep target in sync when camera changes from other sources (drag, navigate, etc.)
+	const syncSmoothTarget = useCallback(() => {
+		const cam = cameraRef.current;
+		const isH = cam.orientation === "horizontal";
+		smoothScrollRef.current.targetMainPan = isH ? cam.panX : cam.panY;
+	}, []);
 
 	// --- Context menu ---
 	const [tickMenu, setTickMenu] = useState<{
@@ -163,7 +424,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// --- Actions ---
 	const resetCamera = useCallback(() => {
 		const cam = cameraRef.current;
-		cameraRef.current = clampCamera({
+		cameraRef.current = hardClamp({
 			panX: 40,
 			panY: 0,
 			scale: 1,
@@ -171,7 +432,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			edge: cam.edge,
 		});
 		setCamera({ ...cameraRef.current });
-	}, []);
+		syncSmoothTarget();
+	}, [hardClamp, syncSmoothTarget]);
 
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
@@ -182,55 +444,132 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	}, [resetCamera]);
 
 	const animFrameRef = useRef(0);
-	const navigateToWorld = useCallback((worldX: number, worldY: number) => {
-		const el = containerRef.current;
-		const vw = el?.clientWidth ?? 1200;
-		const vh = el?.clientHeight ?? 800;
-		const cam = cameraRef.current;
-		const s = cam.scale;
-		const isH = cam.orientation === "horizontal";
-		// worldX/worldY are always in CSS coordinate space (X=horizontal, Y=vertical)
-		// Canvas area excludes the ruler track
-		const canvasW = isH ? vw : vw - RULER_THICKNESS;
-		const canvasH = isH ? vh - RULER_THICKNESS : vh;
-		const target: Camera = clampCamera({
-			...cam,
-			panX: canvasW / 2 - worldX * s,
-			panY: canvasH / 2 - worldY * s,
-		});
-
-		// Animate over ~300ms
-		const start = cameraRef.current;
-		const duration = 300;
-		const t0 = performance.now();
-
-		const step = (now: number) => {
-			const elapsed = now - t0;
-			const t = Math.min(1, elapsed / duration);
-			// ease-out cubic
-			const e = 1 - (1 - t) ** 3;
-			const cam = clampCamera({
-				...start,
-				panX: start.panX + (target.panX - start.panX) * e,
-				panY: start.panY + (target.panY - start.panY) * e,
-				scale: start.scale + (target.scale - start.scale) * e,
+	const navigateToWorld = useCallback(
+		(worldX: number, worldY: number) => {
+			const el = containerRef.current;
+			const vw = el?.clientWidth ?? 1200;
+			const vh = el?.clientHeight ?? 800;
+			const cam = cameraRef.current;
+			const s = cam.scale;
+			const isH = cam.orientation === "horizontal";
+			// worldX/worldY are always in CSS coordinate space (X=horizontal, Y=vertical)
+			// Canvas area excludes the ruler track
+			const canvasW = isH ? vw : vw - RULER_THICKNESS;
+			const canvasH = isH ? vh - RULER_THICKNESS : vh;
+			const target: Camera = hardClamp({
+				...cam,
+				panX: canvasW / 2 - worldX * s,
+				panY: canvasH / 2 - worldY * s,
 			});
-			cameraRef.current = cam;
-			setCamera({ ...cam });
-			if (t < 1) {
-				animFrameRef.current = requestAnimationFrame(step);
-			}
-		};
 
-		cancelAnimationFrame(animFrameRef.current);
-		animFrameRef.current = requestAnimationFrame(step);
-	}, []);
+			// Animate over ~300ms
+			const start = cameraRef.current;
+			const duration = 300;
+			const t0 = performance.now();
+
+			const step = (now: number) => {
+				const elapsed = now - t0;
+				const t = Math.min(1, elapsed / duration);
+				// ease-out cubic
+				const e = 1 - (1 - t) ** 3;
+				const cam = hardClamp({
+					...start,
+					panX: start.panX + (target.panX - start.panX) * e,
+					panY: start.panY + (target.panY - start.panY) * e,
+					scale: start.scale + (target.scale - start.scale) * e,
+				});
+				cameraRef.current = cam;
+				if (t < 1) {
+					scheduleLightRender();
+					animFrameRef.current = requestAnimationFrame(step);
+				} else {
+					setCamera({ ...cam });
+					syncSmoothTarget();
+				}
+			};
+
+			cancelAnimationFrame(animFrameRef.current);
+			animFrameRef.current = requestAnimationFrame(step);
+		},
+		[hardClamp, syncSmoothTarget, scheduleLightRender],
+	);
+
+	/**
+	 * Fit a world-space rectangle into the viewport.
+	 * If the rect already fits at the current scale, do nothing.
+	 * Otherwise, zoom out (clamped to min 0.3) so the rect fits, and center it.
+	 */
+	const fitRectToView = useCallback(
+		(worldX: number, worldY: number, worldW: number, worldH: number) => {
+			const el = containerRef.current;
+			const vw = el?.clientWidth ?? 1200;
+			const vh = el?.clientHeight ?? 800;
+			const cam = cameraRef.current;
+			const isH = cam.orientation === "horizontal";
+			const canvasW = isH ? vw : vw - RULER_THICKNESS;
+			const canvasH = isH ? vh - RULER_THICKNESS : vh;
+
+			const PADDING = 40;
+			const neededW = (worldW + PADDING * 2) * cam.scale;
+			const neededH = (worldH + PADDING * 2) * cam.scale;
+
+			// Already fits — don't touch anything
+			if (neededW <= canvasW && neededH <= canvasH) return;
+
+			// Need to zoom out
+			const targetScale = Math.max(
+				0.3,
+				Math.min(canvasW / (worldW + PADDING * 2), canvasH / (worldH + PADDING * 2)),
+			);
+
+			const centerX = worldX + worldW / 2;
+			const centerY = worldY + worldH / 2;
+			const target: Camera = hardClamp({
+				...cam,
+				scale: targetScale,
+				panX: canvasW / 2 - centerX * targetScale,
+				panY: canvasH / 2 - centerY * targetScale,
+			});
+
+			// Animate
+			const start = cameraRef.current;
+			const duration = 300;
+			const t0 = performance.now();
+
+			const step = (now: number) => {
+				const elapsed = now - t0;
+				const t = Math.min(1, elapsed / duration);
+				const e = 1 - (1 - t) ** 3;
+				const cam = hardClamp({
+					...start,
+					panX: start.panX + (target.panX - start.panX) * e,
+					panY: start.panY + (target.panY - start.panY) * e,
+					scale: start.scale + (target.scale - start.scale) * e,
+				});
+				cameraRef.current = cam;
+				if (t < 1) {
+					scheduleLightRender();
+					animFrameRef.current = requestAnimationFrame(step);
+				} else {
+					setCamera({ ...cam });
+					syncSmoothTarget();
+				}
+			};
+
+			cancelAnimationFrame(animFrameRef.current);
+			animFrameRef.current = requestAnimationFrame(step);
+		},
+		[hardClamp, syncSmoothTarget, scheduleLightRender],
+	);
 
 	const handleForkFromCommit = useCallback(
 		async (commitSha: string) => {
 			try {
 				await api.rulerFork(projectId, { startCommitSha: commitSha });
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+				queryClient.invalidateQueries({
+					queryKey: ["rulerSegment", projectId, commitSha],
+				});
 			} catch {
 				/* global handler */
 			}
@@ -307,6 +646,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	);
 
 	// --- Input handlers ---
+	const wheelBounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const containerCallbackRef = useCallback(
 		(el: HTMLDivElement | null) => {
 			wheelCleanupRef.current?.();
@@ -315,6 +655,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			if (!el) return;
 
 			const onWheel = (e: WheelEvent) => {
+				cancelAnimationFrame(bounceRafRef.current);
 				const cam = cameraRef.current;
 				const isH = cam.orientation === "horizontal";
 				const oldPanX = cam.panX;
@@ -334,21 +675,103 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					const mainPan = isH ? cam.panX : cam.panY;
 					const crossPan = isH ? cam.panY : cam.panX;
 					const worldMain = (canvasMouseMain - mainPan) / cam.scale;
-					const worldCross = (canvasMouseCross - crossPan) / cam.scale;
+
+					// Cross-axis zoom anchor: min of mouse world-cross and the
+					// furthest chapter card cross coordinate (so zoom doesn't
+					// overshoot past content into empty space).
+					let worldMouseCross = (canvasMouseCross - crossPan) / cam.scale;
+					let maxCardCross = 0;
+					for (const cards of cardRegistryRef.current.values()) {
+						for (const c of cards) {
+							const cc = isH ? c.worldY + c.worldH : c.worldX + c.worldW;
+							if (cc > maxCardCross) maxCardCross = cc;
+						}
+					}
+					if (maxCardCross > 0) {
+						worldMouseCross = Math.min(worldMouseCross, maxCardCross);
+					}
+
 					const newMainPan = canvasMouseMain - worldMain * newScale;
-					const newCrossPan = canvasMouseCross - worldCross * newScale;
-					cameraRef.current = clampCamera({
+					const newCrossPan = canvasMouseCross - worldMouseCross * newScale;
+					cameraRef.current = softClamp({
 						...cam,
 						panX: isH ? newMainPan : newCrossPan,
 						panY: isH ? newCrossPan : newMainPan,
 						scale: newScale,
 					});
+					scheduleLightRender();
+					// Sync smooth scroll target after zoom
+					syncSmoothTarget();
 				} else {
-					cameraRef.current = clampCamera({
-						...cam,
-						panX: cam.panX - e.deltaX,
-						panY: cam.panY - e.deltaY,
-					});
+					e.preventDefault();
+					// Map deltaY (primary wheel axis) to main-axis scrolling with smooth animation.
+					// deltaX still maps to cross-axis for trackpad two-finger horizontal swipes.
+					const delta = e.deltaY + (isH ? e.deltaX : 0);
+					const crossDelta = isH ? 0 : e.deltaX;
+
+					const ss = smoothScrollRef.current;
+					// If not currently animating, seed target from current camera
+					if (!ss.animating) {
+						ss.targetMainPan = isH ? cam.panX : cam.panY;
+					}
+					ss.targetMainPan -= delta;
+
+					// Apply cross-axis immediately (no smoothing needed for minor trackpad input)
+					if (crossDelta !== 0) {
+						const crossCam = softClamp({
+							...cameraRef.current,
+							...(isH
+								? { panY: cameraRef.current.panY - crossDelta }
+								: { panX: cameraRef.current.panX - crossDelta }),
+						});
+						cameraRef.current = crossCam;
+					}
+
+					// Start smooth animation loop if not already running
+					if (!ss.animating) {
+						ss.animating = true;
+						const smoothStep = () => {
+							const cur = cameraRef.current;
+							const curMain = cur.orientation === "horizontal" ? cur.panX : cur.panY;
+							const diff = ss.targetMainPan - curMain;
+
+							// Lerp factor — higher = snappier, lower = smoother
+							const LERP = 0.18;
+							if (Math.abs(diff) < 0.5) {
+								// Close enough — snap and stop
+								const finalCam = softClamp({
+									...cur,
+									...(cur.orientation === "horizontal"
+										? { panX: ss.targetMainPan }
+										: { panY: ss.targetMainPan }),
+								});
+								cameraRef.current = finalCam;
+								scheduleLightRender();
+								ss.animating = false;
+
+								// Trigger bounce check
+								if (wheelBounceTimerRef.current) clearTimeout(wheelBounceTimerRef.current);
+								wheelBounceTimerRef.current = setTimeout(() => {
+									wheelBounceTimerRef.current = null;
+									// Commit camera to React state after scroll settles
+									setCamera({ ...cameraRef.current });
+									animateBounce();
+									checkAutoExpand();
+								}, 120);
+								return;
+							}
+
+							const newMain = curMain + diff * LERP;
+							const newCam = softClamp({
+								...cur,
+								...(cur.orientation === "horizontal" ? { panX: newMain } : { panY: newMain }),
+							});
+							cameraRef.current = newCam;
+							scheduleLightRender();
+							ss.rafId = requestAnimationFrame(smoothStep);
+						};
+						ss.rafId = requestAnimationFrame(smoothStep);
+					}
 				}
 				// If panning is active, rebase the drag origin so the ongoing drag
 				// doesn't overwrite the pan offset that zoom/scroll just applied.
@@ -357,17 +780,32 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					panStartRef.current.camX += newCam.panX - oldPanX;
 					panStartRef.current.camY += newCam.panY - oldPanY;
 				}
-				scheduleRender();
+
+				// Bounce back after wheel activity stops (for zoom case; smooth scroll handles its own)
+				if (e.ctrlKey || e.metaKey) {
+					if (wheelBounceTimerRef.current) clearTimeout(wheelBounceTimerRef.current);
+					wheelBounceTimerRef.current = setTimeout(() => {
+						wheelBounceTimerRef.current = null;
+						// Commit camera to React state after zoom interaction settles
+						setCamera({ ...cameraRef.current });
+						animateBounce();
+						checkAutoExpand();
+					}, 120);
+				}
 			};
 
 			el.addEventListener("wheel", onWheel, { passive: false });
-			wheelCleanupRef.current = () => el.removeEventListener("wheel", onWheel);
+			wheelCleanupRef.current = () => {
+				el.removeEventListener("wheel", onWheel);
+				cancelAnimationFrame(smoothScrollRef.current.rafId);
+				smoothScrollRef.current.animating = false;
+			};
 		},
-		[scheduleRender],
+		[scheduleLightRender, softClamp, animateBounce, syncSmoothTarget, checkAutoExpand],
 	);
-
 	const handlePointerDown = useCallback((e: React.PointerEvent) => {
 		if (e.button === 1 || (e.button === 0 && e.currentTarget === e.target)) {
+			cancelAnimationFrame(bounceRafRef.current);
 			isPanningRef.current = true;
 			panStartRef.current = {
 				x: e.clientX,
@@ -383,22 +821,29 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const handlePointerMove = useCallback(
 		(e: React.PointerEvent) => {
 			if (!isPanningRef.current) return;
-			cameraRef.current = clampCamera({
+			cameraRef.current = softClamp({
 				...cameraRef.current,
 				panX: panStartRef.current.camX + (e.clientX - panStartRef.current.x),
 				panY: panStartRef.current.camY + (e.clientY - panStartRef.current.y),
 			});
-			scheduleRender();
+			scheduleLightRender();
 		},
-		[scheduleRender],
+		[scheduleLightRender, softClamp],
 	);
 
 	const handlePointerUp = useCallback(() => {
-		isPanningRef.current = false;
-	}, []);
+		if (isPanningRef.current) {
+			isPanningRef.current = false;
+			// Commit final camera to React state
+			setCamera({ ...cameraRef.current });
+			syncSmoothTarget();
+			animateBounce();
+			checkAutoExpand();
+		}
+	}, [animateBounce, syncSmoothTarget, checkAutoExpand]);
 
 	const toggleSegment = useCallback((fromSha: string) => {
-		setExpandedSegments((prev) => {
+		setManualExpanded((prev) => {
 			const next = new Set(prev);
 			if (next.has(fromSha)) next.delete(fromSha);
 			else next.add(fromSha);
@@ -408,7 +853,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const toggleOrientation = useCallback(() => {
 		const cam = cameraRef.current;
-		const next = clampCamera({
+		const next = hardClamp({
 			...cam,
 			orientation: cam.orientation === "horizontal" ? "vertical" : "horizontal",
 			panX: 40,
@@ -416,14 +861,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		});
 		cameraRef.current = next;
 		setCamera({ ...next });
-	}, []);
+	}, [hardClamp]);
 
 	const toggleEdge = useCallback(() => {
 		const cam = cameraRef.current;
-		const next = clampCamera({ ...cam, edge: cam.edge === "start" ? "end" : "start" });
+		const next = hardClamp({ ...cam, edge: cam.edge === "start" ? "end" : "start" });
 		cameraRef.current = next;
 		setCamera({ ...next });
-	}, []);
+	}, [hardClamp]);
 
 	// --- Layout computation ---
 	const rulerData = (data as RulerData) ?? { commits: [], segments: [], activeChapters: [] };
@@ -431,10 +876,26 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const segments = rulerData.segments ?? [];
 
 	const commitShas = useMemo(() => commits.map((c) => c.sha), [commits]);
+
 	const layout = useMemo(
 		() => computeElasticLayout(commitShas, segments, expandedSegments),
 		[commitShas, segments, expandedSegments],
 	);
+
+	// Keep ref in sync so checkAutoExpand reads latest segments
+	segmentsRef.current = segments;
+
+	// Keep totalMainRef in sync for clamp calculations
+	totalMainRef.current = layout.totalWidth;
+
+	// Build sha → main-axis world position map for connector lines
+	const tickPositions = useMemo(() => {
+		const map = new Map<string, number>();
+		for (const tick of layout.ticks) {
+			map.set(tick.sha, tick.x);
+		}
+		return map;
+	}, [layout.ticks]);
 
 	// --- Derived values ---
 	const { panX, panY, scale, orientation, edge } = camera;
@@ -481,12 +942,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		);
 	}
 
-	const totalMainSize = layout.totalWidth * scale;
-
 	// --- Ruler track positioning ---
 	const rulerTrackStyle: React.CSSProperties = {
 		position: "absolute",
-		background: "var(--mantine-color-dark-6)",
+		background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
 		zIndex: 10,
 		overflow: "hidden",
 	};
@@ -513,7 +972,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// --- Canvas area positioning (the area beside the ruler) ---
 	const canvasStyle: React.CSSProperties = {
 		position: "absolute",
-		background: "var(--mantine-color-dark-8)",
+		background: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-8))",
 		overflow: "hidden",
 	};
 	if (isHorizontal) {
@@ -535,22 +994,27 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	}
 
 	// --- Tick strip inside ruler track ---
-	const tickStripStyle: React.CSSProperties = {
+	// Uses translate + scale; individual ticks are at world coordinates with counter-scale.
+	// During zoom, applyTransformToDOM updates the strip transform and --ruler-counter-scale
+	// CSS variable so ticks stay visually correct without React re-renders.
+	const tickStripStyle: React.CSSProperties & Record<string, string | number> = {
 		position: "absolute",
 		top: 0,
 		left: 0,
+		transformOrigin: "0 0",
+		"--ruler-counter-scale": 1 / scale,
 	};
 	if (isHorizontal) {
 		Object.assign(tickStripStyle, {
-			width: totalMainSize,
+			width: layout.totalWidth,
 			height: "100%",
-			transform: `translateX(${panX}px)`,
+			transform: `translateX(${panX}px) scaleX(${scale})`,
 		});
 	} else {
 		Object.assign(tickStripStyle, {
 			width: "100%",
-			height: totalMainSize,
-			transform: `translateY(${panY}px)`,
+			height: layout.totalWidth,
+			transform: `translateY(${panY}px) scaleY(${scale})`,
 		});
 	}
 
@@ -562,7 +1026,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	return (
 		<Box
 			ref={containerCallbackRef}
-			style={{ width: "100%", height: "100%", overflow: "hidden", position: "relative" }}
+			style={{
+				width: "100%",
+				height: "100%",
+				overflow: "hidden",
+				position: "relative",
+				touchAction: "none",
+			}}
 		>
 			{/* Ruler track */}
 			<Box style={rulerTrackStyle}>
@@ -579,13 +1049,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				>
 					{t("ruler.commitCount", { count: commits.length })}
 				</Text>
-				<Box style={tickStripStyle}>
+				<Box ref={tickStripRef} style={tickStripStyle}>
 					{visibleTicks.map((tick) => (
 						<RulerTick
 							key={tick.sha}
 							tick={tick}
 							commit={commits[tick.index]}
-							scale={scale}
+							showLabel={scale > 0.4}
 							orientation={orientation}
 							onToggle={toggleSegment}
 							onContextMenu={(cx, cy) =>
@@ -613,6 +1083,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}}
 			>
 				<Box
+					ref={worldLayerRef}
 					style={{
 						position: "absolute",
 						top: 0,
@@ -644,6 +1115,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								viewHeight={worldViewHeight}
 								cardRegistry={cardRegistryRef}
 								onChapterContextMenu={setChapterMenu}
+								tickPositions={tickPositions}
+								onFitToView={fitRectToView}
 							/>
 						);
 					})}
@@ -659,50 +1132,57 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			</Box>
 
 			{/* Segment headers — fixed at edge of canvas, only main-axis follows camera */}
-			{expandedTicks.map((tick) => {
-				const seg = tick.segment;
-				if (!seg) return null;
-				const screenMain = tick.x * scale + mainPan;
-				const nextTick = layout.ticks[tick.index + 1];
-				const segScreenSize = (nextTick ? nextTick.x - tick.x : 400) * scale;
-				const headerStyle: React.CSSProperties = {
-					position: "absolute",
-					zIndex: 5,
-					pointerEvents: "none",
-				};
-				if (isHorizontal) {
-					Object.assign(headerStyle, {
-						top: (edge === "start" ? RULER_THICKNESS : 0) + 2,
-						left: screenMain,
-						width: segScreenSize,
-					});
-				} else {
-					Object.assign(headerStyle, {
-						left: (edge === "start" ? RULER_THICKNESS : 0) + 2,
-						top: screenMain,
-						height: segScreenSize,
-					});
-				}
-				return (
-					<Group
-						key={`seg-hdr-${tick.sha}`}
-						gap={4}
-						px={8}
-						py={4}
-						style={headerStyle}
-						wrap={isHorizontal ? "nowrap" : "wrap"}
-					>
-						<Badge size="xs" variant="light" color="indigo">
-							{t("ruler.chapterCount", { count: seg.totalChapterCount })}
-						</Badge>
-						{seg.activeChapterCount > 0 && (
-							<Badge size="xs" variant="filled" color="indigo">
-								{t("ruler.activeCount", { count: seg.activeChapterCount })}
+			<Box
+				ref={headerLayerRef}
+				style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5 }}
+			>
+				{expandedTicks.map((tick) => {
+					const seg = tick.segment;
+					if (!seg) return null;
+					const screenMain = tick.x * scale + mainPan;
+					const nextTick = layout.ticks[tick.index + 1];
+					const segWorldSize = nextTick ? nextTick.x - tick.x : 400;
+					const segScreenSize = segWorldSize * scale;
+					const headerStyle: React.CSSProperties = {
+						position: "absolute",
+						pointerEvents: "none",
+					};
+					if (isHorizontal) {
+						Object.assign(headerStyle, {
+							top: (edge === "start" ? RULER_THICKNESS : 0) + 2,
+							left: screenMain,
+							width: segScreenSize,
+						});
+					} else {
+						Object.assign(headerStyle, {
+							left: (edge === "start" ? RULER_THICKNESS : 0) + 2,
+							top: screenMain,
+							height: segScreenSize,
+						});
+					}
+					return (
+						<Group
+							key={`seg-hdr-${tick.sha}`}
+							gap={4}
+							px={8}
+							py={4}
+							style={headerStyle}
+							wrap={isHorizontal ? "nowrap" : "wrap"}
+							data-world-main={tick.x}
+							data-world-size={segWorldSize}
+						>
+							<Badge size="xs" variant="light" color="indigo">
+								{t("ruler.chapterCount", { count: seg.totalChapterCount })}
 							</Badge>
-						)}
-					</Group>
-				);
-			})}
+							{seg.activeChapterCount > 0 && (
+								<Badge size="xs" variant="filled" color="indigo">
+									{t("ruler.activeCount", { count: seg.activeChapterCount })}
+								</Badge>
+							)}
+						</Group>
+					);
+				})}
+			</Box>
 
 			<OffscreenBubbles
 				cards={Array.from(cardRegistryRef.current.values()).flat()}
@@ -775,7 +1255,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 interface RulerTickProps {
 	tick: TickPosition;
 	commit: { shortSha: string; message: string } | undefined;
-	scale: number;
+	showLabel: boolean;
 	orientation: RulerOrientation;
 	onToggle: (sha: string) => void;
 	onContextMenu: (x: number, y: number) => void;
@@ -784,7 +1264,7 @@ interface RulerTickProps {
 const RulerTick = memo(function RulerTick({
 	tick,
 	commit,
-	scale,
+	showLabel,
 	orientation,
 	onToggle,
 	onContextMenu,
@@ -792,8 +1272,10 @@ const RulerTick = memo(function RulerTick({
 	const segment = tick.segment;
 	const hasActive = segment && segment.activeChapterCount > 0;
 	const isExpandable = segment?.isExpandable;
-	const pos = tick.x * scale;
 	const isH = orientation === "horizontal";
+	// Position at world coordinate; the parent strip's CSS transform handles scaling.
+	// Counter-scale via CSS variable (updated by applyTransformToDOM) keeps content readable.
+	const pos = tick.x;
 
 	return (
 		<Box
@@ -802,8 +1284,12 @@ const RulerTick = memo(function RulerTick({
 				...(isH ? { left: pos, top: 0, height: "100%" } : { top: pos, left: 0, width: "100%" }),
 				display: "flex",
 				flexDirection: isH ? "column" : "row",
-				alignItems: "center",
+				alignItems: isH ? "flex-start" : "flex-start",
 				cursor: isExpandable ? "pointer" : "default",
+				transform: isH
+					? "scaleX(var(--ruler-counter-scale, 1))"
+					: "scaleY(var(--ruler-counter-scale, 1))",
+				transformOrigin: "0 0",
 			}}
 			onClick={isExpandable ? () => onToggle(tick.sha) : undefined}
 			onContextMenu={(e) => {
@@ -816,11 +1302,14 @@ const RulerTick = memo(function RulerTick({
 					...(isH
 						? { width: TICK_WIDTH, height: hasActive ? 20 : 14, marginTop: 4 }
 						: { height: TICK_WIDTH, width: hasActive ? 20 : 14, marginLeft: 4 }),
-					background: hasActive ? "var(--mantine-color-indigo-5)" : "var(--mantine-color-dark-1)",
+					background: hasActive
+						? "var(--mantine-color-indigo-5)"
+						: "light-dark(var(--mantine-color-gray-5), var(--mantine-color-dark-1))",
 					borderRadius: 1,
+					flexShrink: 0,
 				}}
 			/>
-			{scale > 0.4 && (
+			{showLabel && (
 				<Text
 					size="9px"
 					c={hasActive ? "indigo.4" : "dimmed"}
@@ -830,11 +1319,16 @@ const RulerTick = memo(function RulerTick({
 						textOverflow: "ellipsis",
 						maxWidth: isH ? 76 : undefined,
 						maxHeight: isH ? undefined : 76,
-						textAlign: "center",
+						textAlign: isH ? "left" : "center",
 						lineHeight: 1.2,
 						...(isH
-							? { marginTop: 2 }
-							: { marginLeft: 2, writingMode: "vertical-rl", transform: "rotate(180deg)" }),
+							? { marginTop: 2, marginLeft: -TICK_WIDTH / 2 }
+							: {
+									marginLeft: 2,
+									marginTop: -TICK_WIDTH / 2,
+									writingMode: "vertical-rl",
+									transform: "rotate(180deg)",
+								}),
 					}}
 				>
 					{commit?.shortSha}
@@ -850,8 +1344,10 @@ const RulerTick = memo(function RulerTick({
 							? "var(--mantine-color-indigo-4)"
 							: hasActive
 								? "var(--mantine-color-indigo-5)"
-								: "var(--mantine-color-dark-3)",
-						...(isH ? { marginTop: 2 } : { marginLeft: 2 }),
+								: "light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-3))",
+						...(isH
+							? { marginTop: 2, marginLeft: -(tick.isExpanded ? 10 : 6) / 2 + TICK_WIDTH / 2 }
+							: { marginLeft: 2, marginTop: -(tick.isExpanded ? 10 : 6) / 2 + TICK_WIDTH / 2 }),
 						border: tick.isExpanded ? "2px solid var(--mantine-color-indigo-3)" : "none",
 						transition: "all 150ms ease",
 					}}

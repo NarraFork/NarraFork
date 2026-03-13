@@ -2008,6 +2008,10 @@ async function runAgentLoop(
 	/** How many consecutive transient-error retries in this runAgentLoop call. */
 	let transientRetries = 0;
 
+	/** How many consecutive smart-interruption auto-continues in this runAgentLoop call. */
+	let interruptionRetries = 0;
+	const MAX_INTERRUPTION_RETRIES = 3;
+
 	try {
 		while (active.alive) {
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
@@ -2564,6 +2568,35 @@ async function runAgentLoop(
 
 			if (result.shouldUpdateTitle) {
 				shouldUpdateTitle = true;
+			}
+
+			// Smart interruption check — auto-continue if output was truncated
+			if (result.interrupted && active.alive) {
+				interruptionRetries++;
+				if (interruptionRetries > MAX_INTERRUPTION_RETRIES) {
+					logger.warn("Smart interruption check: max retries reached, stopping", {
+						narratorId,
+						retries: interruptionRetries,
+					});
+				} else {
+					const continueText = getToolMessage("interruptionContinue", locale);
+					const userMsg = await narratorService.persistUserMessage(narratorId, continueText, [
+						{ type: "text", text: continueText },
+					]);
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: userMsg,
+					});
+					active.events.emit("event", { type: "user_message", data: userMsg });
+					await narratorService.updateStatus(narratorId, "thinking");
+					currentText = continueText;
+					currentImages = undefined;
+					continue;
+				}
+			} else {
+				// Reset counter on successful non-interrupted output
+				interruptionRetries = 0;
 			}
 
 			// Plan approved — abort was triggered by onExitPlanMode so we persist

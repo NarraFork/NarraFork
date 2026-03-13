@@ -127,7 +127,7 @@ export function SubRuler({
 					...(isH
 						? { height: SUB_RULER_HEIGHT }
 						: { width: SUB_RULER_HEIGHT, minHeight: layout.totalWidth || 60 }),
-					background: "var(--mantine-color-dark-7)",
+					background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-7))",
 					...(isH
 						? {
 								borderTop: "1px solid var(--mantine-color-indigo-9)",
@@ -197,7 +197,7 @@ export function SubRuler({
 											: { height: TICK_WIDTH, width: hasActive ? 16 : 10, marginLeft: 3 }),
 										background: hasActive
 											? "var(--mantine-color-indigo-5)"
-											: "var(--mantine-color-dark-2)",
+											: "light-dark(var(--mantine-color-gray-5), var(--mantine-color-dark-2))",
 										borderRadius: 1,
 									}}
 								/>
@@ -211,7 +211,7 @@ export function SubRuler({
 												? "var(--mantine-color-indigo-4)"
 												: hasActive
 													? "var(--mantine-color-indigo-5)"
-													: "var(--mantine-color-dark-3)",
+													: "light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-3))",
 											...(isH ? { marginTop: 2 } : { marginLeft: 2 }),
 											border: isExpanded ? "1px solid var(--mantine-color-indigo-3)" : "none",
 											transition: "all 150ms ease",

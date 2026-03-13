@@ -129,6 +129,8 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/** Smart output interruption check — auto-detect and retry interrupted model output. */
+		smartInterruptionCheck: boolean;
 		/** Global whitelist directories — merged with project and narrator level. */
 		whitelistDirs?: Array<{
 			path: string;
@@ -235,6 +237,7 @@ const DEFAULTS: NarraForkSettings = {
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
+		smartInterruptionCheck: true,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,

@@ -1,6 +1,30 @@
 import { Box, Text } from "@mantine/core";
 import { IconEyeCheck, IconGitBranch, IconGitMerge } from "@tabler/icons-react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+
+/** Adjust menu position so it stays within the viewport. */
+function useMenuPosition(x: number, y: number) {
+	const ref = useRef<HTMLDivElement>(null);
+	const [pos, setPos] = useState({ left: x, top: y });
+
+	useLayoutEffect(() => {
+		const el = ref.current;
+		if (!el) return;
+		const rect = el.getBoundingClientRect();
+		const vw = window.innerWidth;
+		const vh = window.innerHeight;
+		let left = x;
+		let top = y;
+		if (left + rect.width > vw - 8) left = vw - rect.width - 8;
+		if (top + rect.height > vh - 8) top = vh - rect.height - 8;
+		if (left < 8) left = 8;
+		if (top < 8) top = 8;
+		setPos({ left, top });
+	}, [x, y]);
+
+	return { ref, pos };
+}
 
 interface TickContextMenuProps {
 	x: number;
@@ -21,19 +45,21 @@ export function TickContextMenu({
 	onFork,
 }: TickContextMenuProps) {
 	const { t } = useTranslation("graph");
+	const { ref, pos } = useMenuPosition(x, y);
 	return (
 		<Box
+			ref={ref}
 			style={{
 				position: "fixed",
-				left: x,
-				top: y,
+				left: pos.left,
+				top: pos.top,
 				zIndex: 1000,
-				background: "var(--mantine-color-dark-6)",
-				border: "1px solid var(--mantine-color-dark-4)",
+				background: "light-dark(var(--mantine-color-white), var(--mantine-color-dark-6))",
+				border: "1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 				borderRadius: 8,
 				padding: 4,
 				minWidth: 180,
-				boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+				boxShadow: "0 4px 12px light-dark(rgba(0,0,0,0.1), rgba(0,0,0,0.3))",
 			}}
 			onClick={(e) => e.stopPropagation()}
 		>
@@ -47,7 +73,7 @@ export function TickContextMenu({
 			<Box
 				style={{
 					height: 1,
-					background: "var(--mantine-color-dark-4)",
+					background: "light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 					margin: "2px 0",
 				}}
 			/>
@@ -92,22 +118,24 @@ export function ChapterContextMenu({
 	onAbandon,
 }: ChapterContextMenuProps) {
 	const { t } = useTranslation("graph");
+	const { ref, pos } = useMenuPosition(x, y);
 	const isActive = chapterStatus === "active";
 	const isReview = chapterRole === "review";
 
 	return (
 		<Box
+			ref={ref}
 			style={{
 				position: "fixed",
-				left: x,
-				top: y,
+				left: pos.left,
+				top: pos.top,
 				zIndex: 1000,
-				background: "var(--mantine-color-dark-6)",
-				border: "1px solid var(--mantine-color-dark-4)",
+				background: "light-dark(var(--mantine-color-white), var(--mantine-color-dark-6))",
+				border: "1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 				borderRadius: 8,
 				padding: 4,
 				minWidth: 180,
-				boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+				boxShadow: "0 4px 12px light-dark(rgba(0,0,0,0.1), rgba(0,0,0,0.3))",
 			}}
 			onClick={(e) => e.stopPropagation()}
 		>
@@ -120,7 +148,7 @@ export function ChapterContextMenu({
 			<Box
 				style={{
 					height: 1,
-					background: "var(--mantine-color-dark-4)",
+					background: "light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 					margin: "2px 0",
 				}}
 			/>

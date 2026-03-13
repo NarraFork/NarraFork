@@ -1,5 +1,5 @@
 import { Box, Text } from "@mantine/core";
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import type { RulerEdge, RulerOrientation } from "./types";
 
 interface OffscreenCard {
@@ -46,7 +46,7 @@ const TOP_BADGE_HEIGHT = 32;
 /** Bubbles within this screen-pixel distance get merged */
 const MERGE_DISTANCE = 40;
 
-export function OffscreenBubbles({
+export const OffscreenBubbles = memo(function OffscreenBubbles({
 	cards,
 	panX,
 	panY,
@@ -201,7 +201,7 @@ export function OffscreenBubbles({
 						justifyContent: "center",
 						zIndex: 15,
 						cursor: "pointer",
-						boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+						boxShadow: "0 2px 8px light-dark(rgba(0,0,0,0.15), rgba(0,0,0,0.4))",
 					}}
 					title={b.titles.join("\n")}
 					onClick={() => onNavigate?.(b.avgWorldX, b.avgWorldY)}
@@ -213,7 +213,7 @@ export function OffscreenBubbles({
 			))}
 		</>
 	);
-}
+});
 
 function directionArrow(d: Direction): string {
 	switch (d) {

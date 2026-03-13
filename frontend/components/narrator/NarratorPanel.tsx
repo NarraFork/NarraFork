@@ -1880,11 +1880,19 @@ export function NarratorPanel({
 			}
 			return;
 		}
-		// 上下箭头翻阅输入历史（仅在单行且光标在首/末位置时触发）
+		// 上下箭头翻阅输入历史
 		if (e.key === "ArrowUp" || e.key === "ArrowDown") {
 			const textarea = e.currentTarget as HTMLTextAreaElement;
-			const isMultiLine = textarea.value.includes("\n");
-			if (isMultiLine) return;
+			const { selectionStart, value } = textarea;
+			if (e.key === "ArrowUp") {
+				// 光标在第一行时才触发
+				const textBeforeCursor = value.slice(0, selectionStart);
+				if (textBeforeCursor.includes("\n")) return;
+			} else {
+				// 光标在最后一行时才触发
+				const textAfterCursor = value.slice(selectionStart);
+				if (textAfterCursor.includes("\n")) return;
+			}
 			const direction = e.key === "ArrowUp" ? "up" : "down";
 			const result = inputHistory.navigate(direction, input);
 			if (result !== null) {

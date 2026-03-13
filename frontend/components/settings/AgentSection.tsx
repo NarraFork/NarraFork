@@ -28,6 +28,8 @@ export interface AgentSectionProps {
 	setTranslateReasoning: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
+	smartInterruptionCheck: boolean;
+	setSmartInterruptionCheck: (v: boolean) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -130,6 +132,12 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("smartInterruptionCheck")}
+				description={t("smartInterruptionCheckDesc")}
+				checked={props.smartInterruptionCheck}
+				onChange={(e) => props.setSmartInterruptionCheck(e.currentTarget.checked)}
 			/>
 			{/* Session */}
 			<Title order={5} mt="sm">

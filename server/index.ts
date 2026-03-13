@@ -479,11 +479,36 @@ if (existsSync(legacySnapshotsDir)) {
 const shutdown = () => {
 	stopHeartbeat();
 	stopContainerProxy();
+	terminalService.shutdownAll();
 	chapterCleanup.clearAllTimers();
 	worktreeWatcher.shutdown();
 	projectDbManager.closeAll();
 	mcpManager.shutdown().catch(() => {});
+	// Explicitly stop the HTTP server so the port is released immediately.
+	// On Windows, process.exit() alone may not close the socket in time,
+	// leaving a zombie process holding the port.
+	try {
+		_server?.stop(true);
+	} catch {
+		// best effort
+	}
 	process.exit(0);
 };
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+
+let shuttingDown = false;
+const safeShutdown = () => {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	shutdown();
+};
+process.on("SIGINT", safeShutdown);
+process.on("SIGTERM", safeShutdown);
+// On Windows, closing the console window may not deliver SIGINT/SIGTERM.
+// "exit" fires when the event loop drains or process.exit() is called elsewhere.
+process.on("exit", () => {
+	try {
+		_server?.stop(true);
+	} catch {
+		// best effort
+	}
+});
