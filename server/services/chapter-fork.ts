@@ -131,7 +131,8 @@ export const chapterFork = {
 			}
 
 			// Step 2: Compute initial graph position
-			const CROSS_SPACING = 360;
+			// Place close to the ruler (small crossOffset) and avoid overlapping existing chapters.
+			const NODE_CROSS_SIZE = 100; // approximate height of a chapter card + gap
 
 			let anchorCommitSha: string | null;
 			let axisOffset: number;
@@ -143,18 +144,23 @@ export const chapterFork = {
 				axisOffset = input.axisOffset ?? 0;
 				crossOffset = input.crossOffset ?? 0;
 			} else {
-				// Default: anchor to the fork commit, offset cross-axis by sibling count
+				// Default: anchor to the fork commit
 				anchorCommitSha = commitSha;
 				axisOffset = 0;
 
-				// Count existing children to offset and avoid overlap
-				const existingSiblings = await db
-					.select({ id: chapters.id })
+				// Find all chapters already anchored to this commit to avoid overlap
+				const existing = await db
+					.select({ crossOffset: chapters.crossOffset })
 					.from(chapters)
-					.where(eq(chapters.parentChapterId, parentChapterId));
-				const siblingIndex = existingSiblings.length; // 0-based: this will be the Nth child
+					.where(eq(chapters.anchorCommitSha, commitSha));
+				const occupied = new Set(
+					existing.map((r) => Math.round((r.crossOffset ?? 0) / NODE_CROSS_SIZE)),
+				);
 
-				crossOffset = siblingIndex * CROSS_SPACING;
+				// Find the first free slot starting from 0 (closest to ruler)
+				let slot = 0;
+				while (occupied.has(slot)) slot++;
+				crossOffset = slot * NODE_CROSS_SIZE;
 			}
 
 			// Create DB record

@@ -56,11 +56,28 @@ export const reviewService = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		// Compute position (anchor to same commit as source, offset cross-axis)
-		const CROSS_OFFSET = 380;
-		const anchorCommitSha = input.anchorCommitSha ?? source.anchorCommitSha ?? sourceHeadSha;
+		// Compute position (anchor to same commit as source, auto-avoid existing chapters)
+		const NODE_CROSS_SIZE = 100;
+		const resolvedAnchor = input.anchorCommitSha ?? source.anchorCommitSha ?? sourceHeadSha;
+		const anchorCommitSha = resolvedAnchor;
 		const axisOffset = input.axisOffset ?? source.axisOffset ?? 0;
-		const crossOffset = input.crossOffset ?? (source.crossOffset ?? 0) + CROSS_OFFSET;
+
+		let crossOffset: number;
+		if (input.crossOffset != null) {
+			crossOffset = input.crossOffset;
+		} else {
+			// Find first free slot at this anchor commit
+			const existing = await db
+				.select({ crossOffset: chapters.crossOffset })
+				.from(chapters)
+				.where(eq(chapters.anchorCommitSha, resolvedAnchor));
+			const occupied = new Set(
+				existing.map((r) => Math.round((r.crossOffset ?? 0) / NODE_CROSS_SIZE)),
+			);
+			let slot = 0;
+			while (occupied.has(slot)) slot++;
+			crossOffset = slot * NODE_CROSS_SIZE;
+		}
 
 		const rollback: Array<() => Promise<void>> = [];
 
