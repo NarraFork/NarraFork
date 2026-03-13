@@ -64,6 +64,7 @@ import {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
+import type { LoadToolNotFound, LoadToolResult } from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
 	getAffectedFiles,
@@ -71,7 +72,7 @@ import {
 	rebuildFileStatesExcluding,
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
-import { narratorService } from "../services/narrator-service";
+import { handleLoadToolCommand, narratorService } from "../services/narrator-service";
 import {
 	clearBufferedMessages,
 	closeNarrator,
@@ -389,6 +390,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	let finalMessage = message;
 	let commandText: string | null = null;
 	const cmdResult = await resolveCommand(message, id, userId);
+	if (cmdResult.resolved && ("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)) {
+		const result = await handleLoadToolCommand(id, cmdResult as LoadToolResult | LoadToolNotFound);
+		return c.json(result, 200);
+	}
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 		finalMessage = cmdResult.expandedPrompt;
 		commandText = cmdResult.rawCommand;

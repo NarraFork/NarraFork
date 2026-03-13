@@ -186,7 +186,8 @@ class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
-				this.lastMessageIds.delete(nId);
+				// Keep lastMessageId so that re-subscribe (page navigation back)
+				// can still trigger server-side catch-up.
 				removedIds.push(nId);
 			}
 		}

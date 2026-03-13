@@ -65,6 +65,12 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
 			permissionSuggestions: block.permissionSuggestions ?? tc?.permissionSuggestions,
 			startedAt,
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields injected by mergeFieldsByIndex
+			_metadata: block._metadata ?? (tc as any)?._metadata,
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields injected by mergeFieldsByIndex
+			_longRunning: block._longRunning ?? (tc as any)?._longRunning,
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields injected by mergeFieldsByIndex
+			_streamingOutput: block._streamingOutput ?? (tc as any)?._streamingOutput,
 		});
 	}
 	return results;

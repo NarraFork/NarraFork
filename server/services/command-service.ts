@@ -35,13 +35,23 @@ interface CommandNotResolved {
 	resolved: false;
 }
 
-interface LoadToolResult {
+export interface LoadToolResult {
 	resolved: true;
 	loadTool: string;
 	rawCommand: string;
 }
 
-export type ResolveResult = CommandResolveResult | CommandNotResolved | LoadToolResult;
+export interface LoadToolNotFound {
+	resolved: true;
+	loadToolNotFound: string;
+	rawCommand: string;
+}
+
+export type ResolveResult =
+	| CommandResolveResult
+	| CommandNotResolved
+	| LoadToolResult
+	| LoadToolNotFound;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
 function parseCommandInput(prompt: string): { name: string; input: string } | null {
@@ -200,7 +210,7 @@ export async function resolveCommand(
 		if (toolRoutine?.tool) {
 			return { resolved: true, loadTool: toolRoutine.tool.toolName, rawCommand: prompt };
 		}
-		return { resolved: false };
+		return { resolved: true, loadToolNotFound: toolId, rawCommand: prompt };
 	}
 
 	const commands = await getAvailableCommands(narratorId, userId);

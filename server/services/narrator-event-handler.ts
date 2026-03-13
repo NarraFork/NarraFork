@@ -114,6 +114,8 @@ export interface ToolChunkSnapshot {
 	input?: unknown;
 	/** Timestamp from tool_started */
 	streamStartedAt?: number;
+	/** Latest streaming output from bash tool */
+	streamingOutput?: string;
 }
 
 export interface StreamingSnapshot {
@@ -662,11 +664,18 @@ export async function processEvent(
 		}
 
 		case "tool_output": {
+			// Store latest output in snapshot for reconnecting clients
+			const snap = getOrCreateSnapshot(broadcastTargetId);
+			const chunk = snap.toolChunks.get(event.toolUseId);
+			if (chunk) {
+				chunk.streamingOutput = event.output;
+			}
 			dualBroadcast(ctx, {
 				type: "tool_output",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
 				output: event.output,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
 		}

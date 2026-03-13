@@ -21,6 +21,7 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconCode,
+	IconDownload,
 	IconFile,
 	IconGitFork,
 	IconListCheck,
@@ -30,6 +31,7 @@ import {
 	IconPlayerStop,
 	IconRobot,
 	IconSearch,
+	IconShare,
 	IconTerminal2,
 	IconTrash,
 	IconWorldSearch,
@@ -76,6 +78,8 @@ export interface ToolCallData {
 	_metadata?: Record<string, unknown>;
 	/** Set by watchdog when process has been running ≥60s — shows terminate button */
 	_longRunning?: boolean;
+	/** Real-time streaming output from bash tool (updated via WS tool_output events) */
+	_streamingOutput?: string;
 }
 
 export interface PendingPermission {
@@ -136,6 +140,7 @@ const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
+const SHARE_TOOLS = new Set(["ShareFile"]);
 
 export type ToolCategory =
 	| "file"
@@ -147,6 +152,7 @@ export type ToolCategory =
 	| "ask"
 	| "plan"
 	| "terminal"
+	| "share"
 	| "generic";
 
 export function isEditTool(name: string): boolean {
@@ -163,6 +169,7 @@ export function getCategory(name: string): ToolCategory {
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
+	if (SHARE_TOOLS.has(name)) return "share";
 	return "generic";
 }
 
@@ -186,6 +193,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 			return IconMap;
 		case "terminal":
 			return IconTerminal2;
+		case "share":
+			return IconShare;
 		default:
 			return IconCode;
 	}
@@ -211,6 +220,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "grape";
 		case "terminal":
 			return "yellow";
+		case "share":
+			return "green";
 		default:
 			return "gray";
 	}
@@ -247,6 +258,7 @@ function escapeRegExp(s: string): string {
 /**
  * Try to extract a top-level string property from a possibly-truncated JSON object.
  * For truncated objects, attempts a regex match on the preview string.
+ * Supports both complete and truncated (unclosed) string values in the preview.
  */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function extractField(val: any, ...keys: string[]): string {
@@ -259,6 +271,7 @@ function extractField(val: any, ...keys: string[]): string {
 	}
 	// Try to extract from the JSON preview string via regex
 	for (const k of keys) {
+		// First try: complete string value (with closing quote)
 		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
 		const m = val.preview.match(re);
 		if (m) {
@@ -266,6 +279,17 @@ function extractField(val: any, ...keys: string[]): string {
 				return JSON.parse(`"${m[1]}"`);
 			} catch {
 				return m[1];
+			}
+		}
+		// Second try: truncated string value (no closing quote — preview was cut mid-value)
+		const reTrunc = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
+		const mt = val.preview.match(reTrunc);
+		if (mt) {
+			try {
+				// Attempt to parse; may fail if cut mid-escape — fall back to raw
+				return JSON.parse(`"${mt[1]}"`);
+			} catch {
+				return mt[1];
 			}
 		}
 	}
@@ -413,6 +437,11 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 				return short ? `Write ${short}…` : "Write";
 			}
 			return action || "Terminal";
+		}
+		case "share": {
+			const fp = getFilePath(input);
+			if (!fp) return "Share";
+			return basename(fp);
 		}
 		default:
 			return toolName;
@@ -568,9 +597,45 @@ const termStyle = {
 	color: "var(--mantine-color-gray-3)",
 } as const;
 
-/** Small indicator shown when tool call content is truncated (loading full data) */
+/**
+ * Context carrying the truncation-fetch state from LazyDetailRenderer.
+ * When the full data is being fetched, detail renderers can show a loading indicator
+ * instead of the misleading "expand to load" text.
+ */
+const TruncationFetchCtx = createContext<{
+	isLoading: boolean;
+	isError: boolean;
+	refetch: () => void;
+}>({ isLoading: false, isError: false, refetch: () => {} });
+
+/** Small indicator shown when tool call content is truncated */
 function TruncatedBadge({ fullLength }: { fullLength?: number }) {
 	const { t } = useTranslation("narrator");
+	const { isLoading, isError, refetch } = useContext(TruncationFetchCtx);
+
+	if (isLoading) {
+		return (
+			<Group gap={4} mt={2}>
+				<IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />
+				<Text size="xs" c="dimmed" fs="italic">
+					{t("truncatedLoading", {
+						size: fullLength ? `${Math.round(fullLength / 1024)}KB` : "",
+					})}
+				</Text>
+			</Group>
+		);
+	}
+
+	if (isError) {
+		return (
+			<UnstyledButton onClick={() => refetch()} mt={2}>
+				<Text size="xs" c="red" fs="italic" td="underline">
+					{t("truncatedError")}
+				</Text>
+			</UnstyledButton>
+		);
+	}
+
 	return (
 		<Text size="xs" c="dimmed" fs="italic" mt={2}>
 			{t("truncatedPreview", {
@@ -743,6 +808,8 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const cmd = extractField(toolCall.inputJson, "command");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const isRunning = toolCall.status === "running" && !toolCall.outputJson;
+	const streamingOutput = toolCall._streamingOutput;
 
 	return (
 		<Box mt="xs">
@@ -752,6 +819,18 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					style={{ ...termStyle, maxHeight: 60 }}
 					title="Command"
 				/>
+			)}
+			{isRunning && streamingOutput && (
+				<>
+					<Text size="xs" fw={500} mt={4} mb={2}>
+						{t("output")}
+					</Text>
+					<ContentViewer
+						content={streamingOutput}
+						style={termStyle}
+						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Shell"}
+					/>
+				</>
 			)}
 			{toolCall.outputJson && (
 				<>
@@ -957,6 +1036,94 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{toolCall.errorMessage}
 				</Text>
 			)}
+		</Box>
+	);
+}
+
+function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
+	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
+
+	const filename = (meta?.filename as string) ?? "file";
+	const sizeFormatted = (meta?.sizeFormatted as string) ?? "";
+	const downloadUrl = meta?.downloadUrl as string | undefined;
+	const expiresAt = meta?.expiresAt as string | undefined;
+	const expiryHours = meta?.expiryHours as number | undefined;
+	const isDirectory = meta?.isDirectory as boolean | undefined;
+	const compressed = meta?.compressed as boolean | undefined;
+
+	const expiresLabel = useMemo(() => {
+		if (!expiresAt) return null;
+		try {
+			return new Date(expiresAt).toLocaleString();
+		} catch {
+			return expiresAt;
+		}
+	}, [expiresAt]);
+
+	// Fallback to generic if no structured metadata
+	if (!downloadUrl) {
+		return <GenericDetail toolCall={toolCall} />;
+	}
+
+	return (
+		<Box mt="xs">
+			<Paper
+				p="sm"
+				radius="md"
+				withBorder
+				style={{
+					borderColor: "var(--mantine-color-green-light)",
+					backgroundColor: "var(--mantine-color-green-light)",
+				}}
+			>
+				<Group gap="sm" wrap="nowrap" align="flex-start">
+					<ThemeIcon size={36} radius="md" variant="light" color="green">
+						<IconShare size={20} />
+					</ThemeIcon>
+					<Box style={{ flex: 1, minWidth: 0 }}>
+						<Text size="sm" fw={600} truncate="end">
+							{filename}
+						</Text>
+						<Group gap="xs" mt={2}>
+							{sizeFormatted && (
+								<Badge size="xs" variant="light" color="gray">
+									{sizeFormatted}
+								</Badge>
+							)}
+							{isDirectory && (
+								<Badge size="xs" variant="light" color="blue">
+									{t("shareFile.directory")}
+								</Badge>
+							)}
+							{compressed && (
+								<Badge size="xs" variant="light" color="violet">
+									{t("shareFile.compressed")}
+								</Badge>
+							)}
+							{expiresLabel && (
+								<Tooltip label={`Expires: ${expiresLabel}`} withArrow>
+									<Badge size="xs" variant="light" color="yellow">
+										{expiryHours}h
+									</Badge>
+								</Tooltip>
+							)}
+						</Group>
+					</Box>
+					<Button
+						component="a"
+						href={downloadUrl}
+						target="_blank"
+						rel="noopener noreferrer"
+						size="compact-sm"
+						variant="light"
+						color="green"
+						leftSection={<IconDownload size={14} />}
+					>
+						{t("shareFile.download")}
+					</Button>
+				</Group>
+			</Paper>
 		</Box>
 	);
 }
@@ -1245,6 +1412,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <PlanDetail toolCall={toolCall} />;
 		case "terminal":
 			return <TerminalDetail toolCall={toolCall} />;
+		case "share":
+			return <ShareFileDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}
@@ -1431,11 +1600,12 @@ function LazyDetailRenderer({
 	opened: boolean;
 }) {
 	const needsFetch = hasTruncatedData(toolCall) && opened && !!narratorId;
-	const { data: fullTc } = useToolCallDetail(
-		narratorId ?? "",
-		toolCall.toolUseId ?? "",
-		needsFetch,
-	);
+	const {
+		data: fullTc,
+		isLoading,
+		isError,
+		refetch,
+	} = useToolCallDetail(narratorId ?? "", toolCall.toolUseId ?? "", needsFetch);
 
 	const resolvedToolCall = useMemo(() => {
 		if (!fullTc) return toolCall;
@@ -1446,7 +1616,16 @@ function LazyDetailRenderer({
 		};
 	}, [toolCall, fullTc]);
 
-	return <DetailRenderer toolCall={resolvedToolCall} />;
+	const fetchCtx = useMemo(
+		() => ({ isLoading: needsFetch && isLoading, isError, refetch }),
+		[needsFetch, isLoading, isError, refetch],
+	);
+
+	return (
+		<TruncationFetchCtx.Provider value={fetchCtx}>
+			<DetailRenderer toolCall={resolvedToolCall} />
+		</TruncationFetchCtx.Provider>
+	);
 }
 
 // --- Swipe / context-menu constants ---
@@ -1497,6 +1676,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 	useEffect(() => {
 		if (pendingPermission || toolCall.status === "pending") setOpened(true);
 	}, [pendingPermission, toolCall.status]);
+
+	// Auto-expand bash card when streaming output arrives
+	useEffect(() => {
+		if (cat === "bash" && toolCall._streamingOutput) setOpened(true);
+	}, [cat, toolCall._streamingOutput]);
 
 	// Auto-expand todo/plan cards once streaming finishes
 	useEffect(() => {

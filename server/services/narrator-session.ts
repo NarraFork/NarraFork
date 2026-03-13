@@ -3837,16 +3837,20 @@ export async function recoverOnStartup(): Promise<void> {
 
 /**
  * Enable an optional tool for a narrator session.
- * Returns true if the tool was newly enabled, false if already enabled or unknown.
+ * Returns "loaded" if newly enabled, "already_loaded" if already present,
+ * "no_session" if the narrator has no active session, or "unknown_tool" if invalid.
  */
-export function loadOptionalTool(narratorId: string, toolName: string): boolean {
+export function loadOptionalTool(
+	narratorId: string,
+	toolName: string,
+): "loaded" | "already_loaded" | "no_session" | "unknown_tool" {
 	const active = activeNarrators.get(narratorId);
-	if (!active) return false;
-	if (!OPTIONAL_TOOLS.has(toolName)) return false;
-	if (active._enabledOptionalTools.has(toolName)) return false;
+	if (!active) return "no_session";
+	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
+	if (active._enabledOptionalTools.has(toolName)) return "already_loaded";
 	active._enabledOptionalTools.add(toolName);
 	logger.info("Optional tool loaded", { narratorId, toolName });
-	return true;
+	return "loaded";
 }
 
 /** Get the set of enabled optional tool names for a narrator session. */

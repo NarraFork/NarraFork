@@ -19,6 +19,7 @@ import { logger } from "../lib/logger";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { LoadToolNotFound, LoadToolResult } from "./command-service";
 import { revertPatchesForMessages, revertPatchForToolUse } from "./snapshot-revert";
 
 /**
@@ -294,6 +295,31 @@ interface CreateSubagentInput {
 	permissionMode?: string;
 	model?: string;
 	systemPrompt?: string;
+}
+
+/**
+ * Shared handler for `/load <tool>` commands.
+ * Called from both the HTTP route and the WebSocket buffer_message handler.
+ */
+export async function handleLoadToolCommand(
+	narratorId: string,
+	cmdResult: LoadToolResult | LoadToolNotFound,
+): Promise<{ toolName: string; loaded: boolean; alreadyLoaded: boolean }> {
+	if ("loadToolNotFound" in cmdResult) {
+		const toolId = cmdResult.loadToolNotFound;
+		const infoText = `⚠️ Unknown tool: ${toolId}. Available: terminal, share_file`;
+		await narratorService.persistInfoMessage(narratorId, infoText);
+		return { toolName: toolId, loaded: false, alreadyLoaded: false };
+	}
+	const { loadOptionalTool } = await import("./narrator-session");
+	const toolName = cmdResult.loadTool;
+	const result = loadOptionalTool(narratorId, toolName);
+	const alreadyLoaded = result === "already_loaded";
+	const infoText = alreadyLoaded
+		? `🔧 Tool already loaded: ${toolName}`
+		: `🔧 Tool loaded: ${toolName}`;
+	await narratorService.persistInfoMessage(narratorId, infoText);
+	return { toolName, loaded: true, alreadyLoaded };
 }
 
 export const narratorService = {
@@ -1937,6 +1963,42 @@ export const narratorService = {
 			.returning();
 
 		await appendMessageRef(narratorId, id);
+		return msg;
+	},
+
+	/**
+	 * Persist a lightweight info system message (role="system", type="info").
+	 * Excluded from model history — purely a UI notification in the chat timeline.
+	 * Returns the created message row and broadcasts it via WebSocket.
+	 */
+	async persistInfoMessage(narratorId: string, text: string) {
+		const id = generateId();
+		const now = new Date().toISOString();
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "info", message: text }],
+				contentText: `[Info] ${text}`,
+				createdAt: now,
+			})
+			.returning();
+		await appendMessageRef(narratorId, id);
+		broadcastToNarrator(narratorId, {
+			type: "message",
+			narratorId,
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "system",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				children: [],
+			},
+		});
 		return msg;
 	},
 

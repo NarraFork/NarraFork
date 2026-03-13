@@ -8,7 +8,7 @@ import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_TIMEOUT_MS = 600_000;
+const MAX_TIMEOUT_MS = 86_400_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 

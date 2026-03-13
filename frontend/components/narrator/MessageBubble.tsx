@@ -1024,6 +1024,17 @@ export const MessageBubble = memo(function MessageBubble({
 				/>
 			);
 		}
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const infoBlock = blocks.find((b: any) => b.type === "info");
+		if (infoBlock) {
+			return (
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+					<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+						{infoBlock.message}
+					</Text>
+				</Paper>
+			);
+		}
 		return null;
 	}
 
@@ -1348,6 +1359,7 @@ export const MessageBubble = memo(function MessageBubble({
 							startedAt: tc?.startedAt,
 							// _longRunning: 由 WS tool_long_running 事件通过 mergeFieldsByIndex 设置
 							_longRunning: tc?._longRunning,
+							_streamingOutput: tc?._streamingOutput,
 						};
 						const perm = resolvePerm?.(toolCallData) ?? null;
 						return (

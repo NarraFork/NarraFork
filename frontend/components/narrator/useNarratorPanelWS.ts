@@ -851,6 +851,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
+			onToolOutput: (toolUseId: string, output: string, _parentToolUseId?: string) => {
+				// 实时更新 bash 工具的流式输出到已持久化的 tool call 上
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ _streamingOutput: output },
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onToolStarted: (
 				toolUseId: string,
 				toolName: string,
@@ -1031,8 +1043,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					clearStreamingState();
 				}
 				if (isTerminal) {
-					// Cancel any pending RAF tool chunk flush.
-					cancelPendingToolChunks(false);
+					// Cancel any pending RAF tool chunk flush and notify so the memo
+					// recomputes — otherwise stale streaming tool blocks linger on screen.
+					cancelPendingToolChunks(true);
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1330,6 +1343,83 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// Keep refs in sync
 	sendPermissionDecisionRef.current = sendPermissionDecision;
 	sendBufferMessageRef.current = sendBufferMessage;
+
+	// --- Sync on page navigation (mount with existing cache) ---
+	// When the user navigates away and back, the global WS stays connected but
+	// the component unmounts/remounts.  staleTime=Infinity means React Query
+	// won't refetch, and the WS catch-up may not fire (lastMessageId was
+	// cleared on unsubscribe).  Fix: on mount, if we already have cached data
+	// (i.e. returning to the page), fetch the latest page and merge it.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: mount-only effect — intentionally runs once
+	useEffect(() => {
+		const cached = qc.getQueryData(messagesQueryKey) as MessagesQueryData | undefined;
+		if (!cached?.pages?.length) return; // first load — nothing to sync
+		if (firstPageHasMoreAfter) return; // around-mode (deep link) — skip
+
+		let cancelled = false;
+
+		// Fetch latest page and merge into cache
+		api
+			.getNarratorMessages(narratorId, { limit: 20 })
+			.then((latestPage) => {
+				if (cancelled) return;
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+					const existingMap = new Map(firstPage.messages.map((m: NarratorMsg) => [m.id, m]));
+
+					// Update existing messages with fresh data (children, tool status, etc.)
+					const updatedMessages = firstPage.messages.map((existing: NarratorMsg) => {
+						// Preserve synthetic messages
+						if (existing.id === STREAMING_CHUNKS_MSG_ID) return existing;
+						const fresh = latestPage.messages.find((m: NarratorMsg) => m.id === existing.id);
+						if (!fresh) return existing;
+						return { ...fresh, children: fresh.children ?? existing.children ?? [] };
+					});
+
+					// Append genuinely new messages
+					const newMsgs = latestPage.messages
+						.filter((m: NarratorMsg) => m.id && !existingMap.has(m.id))
+						.map((m: NarratorMsg) => ({ ...m, children: m.children ?? [] }));
+
+					firstPage.messages =
+						newMsgs.length > 0 ? [...updatedMessages, ...newMsgs] : updatedMessages;
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
+			})
+			.catch(() => {});
+
+		// Also sync permissions and buffered messages
+		api
+			.getPendingPermissions(narratorId)
+			.then((perms) => {
+				if (cancelled || perms.length === 0) return;
+				setPendingPermsMap((prev) => {
+					const next = new Map(prev);
+					for (const p of perms) {
+						if (p.toolUseId) next.set(p.toolUseId, p);
+					}
+					return next;
+				});
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+					applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+				);
+			})
+			.catch(() => {});
+
+		api
+			.getBufferedMessages(narratorId)
+			.then((msgs) => {
+				if (!cancelled) setQueuedMessages(msgs ?? []);
+			})
+			.catch(() => {});
+
+		return () => {
+			cancelled = true;
+		};
+	}, []);
 
 	// --- Load pending permissions on mount/reconnect ---
 	const prevConnectedRef = useRef(false);

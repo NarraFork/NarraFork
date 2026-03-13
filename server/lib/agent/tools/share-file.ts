@@ -142,6 +142,18 @@ export const shareFileTool: ToolDefinition = {
 					`Size: ${formatSize(finalStat.size)}\n` +
 					`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)`,
 				title: `Shared: ${finalName}`,
+				metadata: {
+					shareId: record.id,
+					downloadUrl,
+					filename: finalName,
+					originalName,
+					size: finalStat.size,
+					sizeFormatted: formatSize(finalStat.size),
+					expiresAt: record.expiresAt.toISOString(),
+					expiryHours,
+					isDirectory: isDir,
+					compressed: isDir || !!compress,
+				},
 			};
 		} catch (err) {
 			return {

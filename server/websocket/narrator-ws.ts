@@ -7,10 +7,11 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
+import type { LoadToolNotFound, LoadToolResult } from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
 import type { GitStatusSummary } from "../services/git-service";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
-import { narratorService } from "../services/narrator-service";
+import { handleLoadToolCommand, narratorService } from "../services/narrator-service";
 import {
 	clearBufferedMessages,
 	getBufferedMessages,
@@ -43,7 +44,13 @@ export type NarratorServerMessage =
 	| { type: "permission_request"; narratorId: string; request: unknown }
 	| { type: "status_change"; narratorId: string; status: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
-	| { type: "tool_output"; narratorId: string; toolUseId: string; output: string }
+	| {
+			type: "tool_output";
+			narratorId: string;
+			toolUseId: string;
+			output: string;
+			parentToolUseId?: string;
+	  }
 	// 看门狗检测到 bash/shell 进程运行 ≥60s 时推送，前端据此显示终止按钮
 	| { type: "tool_long_running"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
@@ -730,6 +737,16 @@ export const handleNarratorWS = {
 				if (userId) {
 					try {
 						const cmdResult = await resolveCommand(bufferText, msg.narratorId, userId);
+						if (
+							cmdResult.resolved &&
+							("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)
+						) {
+							await handleLoadToolCommand(
+								msg.narratorId,
+								cmdResult as LoadToolResult | LoadToolNotFound,
+							);
+							return;
+						}
 						if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 							commandText = msg.text;
 							bufferText = cmdResult.expandedPrompt;
