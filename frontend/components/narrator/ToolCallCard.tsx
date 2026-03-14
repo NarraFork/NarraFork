@@ -7,6 +7,7 @@ import {
 	Group,
 	List,
 	Menu,
+	Modal,
 	Paper,
 	Stack,
 	Text,
@@ -22,6 +23,7 @@ import {
 	IconChevronRight,
 	IconCode,
 	IconDownload,
+	IconEye,
 	IconFile,
 	IconGitFork,
 	IconListCheck,
@@ -41,6 +43,7 @@ import { createContext, memo, useContext, useEffect, useMemo, useRef, useState }
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { getToken } from "../../lib/api";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { ContentViewer } from "./ContentViewer";
@@ -642,6 +645,179 @@ function TruncatedBadge({ fullLength }: { fullLength?: number }) {
 				size: fullLength ? `${Math.round(fullLength / 1024)}KB` : "",
 			})}
 		</Text>
+	);
+}
+
+// --- File preview types ---
+
+const IMAGE_EXTS = new Set([
+	".jpg",
+	".jpeg",
+	".png",
+	".gif",
+	".webp",
+	".svg",
+	".avif",
+	".bmp",
+	".ico",
+]);
+const PDF_EXTS = new Set([".pdf"]);
+
+function getFilePreviewType(filePath: string): "image" | "pdf" | "text" {
+	const dot = filePath.lastIndexOf(".");
+	if (dot === -1) return "text";
+	const ext = filePath.slice(dot).toLowerCase();
+	if (IMAGE_EXTS.has(ext)) return "image";
+	if (PDF_EXTS.has(ext)) return "pdf";
+	return "text";
+}
+
+function FilePreviewModal({
+	filePath,
+	opened,
+	onClose,
+}: {
+	filePath: string;
+	opened: boolean;
+	onClose: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const previewType = getFilePreviewType(filePath);
+	const [error, setError] = useState(false);
+	const [loading, setLoading] = useState(false);
+	const [textContent, setTextContent] = useState<string | null>(null);
+	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+	const lang = getShikiLang(filePath);
+	const fileName = filePath.split("/").pop() || filePath;
+
+	// Reset state when modal opens with a new file
+	useEffect(() => {
+		if (opened) {
+			setError(false);
+			setTextContent(null);
+			setBlobUrl(null);
+		}
+	}, [opened]);
+
+	// Cleanup blob URL on unmount
+	useEffect(() => {
+		return () => {
+			if (blobUrl) URL.revokeObjectURL(blobUrl);
+		};
+	}, [blobUrl]);
+
+	// Fetch file content when modal opens
+	useEffect(() => {
+		if (!opened) return;
+		let cancelled = false;
+		setLoading(true);
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const url = `/api/fs/preview?path=${encodeURIComponent(filePath)}`;
+
+		if (previewType === "text") {
+			fetch(url, { headers })
+				.then((r) => {
+					if (!r.ok) throw new Error(r.statusText);
+					return r.text();
+				})
+				.then((text) => {
+					if (!cancelled) setTextContent(text);
+				})
+				.catch(() => {
+					if (!cancelled) setError(true);
+				})
+				.finally(() => {
+					if (!cancelled) setLoading(false);
+				});
+		} else {
+			// Image or PDF: fetch as blob and create object URL
+			fetch(url, { headers })
+				.then((r) => {
+					if (!r.ok) throw new Error(r.statusText);
+					return r.blob();
+				})
+				.then((blob) => {
+					if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+				})
+				.catch(() => {
+					if (!cancelled) setError(true);
+				})
+				.finally(() => {
+					if (!cancelled) setLoading(false);
+				});
+		}
+		return () => {
+			cancelled = true;
+		};
+	}, [opened, previewType, filePath]);
+
+	return (
+		<Modal
+			opened={opened}
+			onClose={onClose}
+			title={fileName}
+			size="xl"
+			styles={{
+				body: { padding: 0 },
+				header: { paddingBottom: 4 },
+			}}
+		>
+			{loading && (
+				<Group gap={4} p="md">
+					<IconLoader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+					<Text size="sm" c="dimmed">
+						{t("filePreview_loading")}
+					</Text>
+				</Group>
+			)}
+			{error && (
+				<Box p="md">
+					<Text c="red" size="sm">
+						{t("filePreview_loadError")}
+					</Text>
+				</Box>
+			)}
+			{!error && !loading && previewType === "image" && blobUrl && (
+				<Box p="xs" style={{ textAlign: "center" }}>
+					<img
+						src={blobUrl}
+						alt={fileName}
+						onError={() => setError(true)}
+						style={{
+							maxWidth: "100%",
+							maxHeight: "80vh",
+							objectFit: "contain",
+							borderRadius: "var(--mantine-radius-sm)",
+						}}
+					/>
+				</Box>
+			)}
+			{!error && !loading && previewType === "pdf" && blobUrl && (
+				<iframe
+					src={blobUrl}
+					title={fileName}
+					onError={() => setError(true)}
+					sandbox="allow-same-origin allow-scripts"
+					style={{
+						width: "100%",
+						height: "80vh",
+						border: "none",
+					}}
+				/>
+			)}
+			{!error && !loading && previewType === "text" && textContent != null && (
+				<Box p="xs">
+					<ContentViewer
+						content={textContent}
+						style={{ fontSize: 12, maxHeight: "75vh", overflow: "auto" }}
+						title={fileName}
+						language={lang}
+					/>
+				</Box>
+			)}
+		</Modal>
 	);
 }
 
@@ -1861,10 +2037,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const handleToggle = isStreaming ? undefined : () => setOpened((o) => !o);
 
+	// --- File preview modal state ---
+	const readFilePath = toolCall.toolName === "Read" ? getFilePath(toolCall.inputJson) : "";
+	const [previewOpened, setPreviewOpened] = useState(false);
+
 	// --- Message-level context menu actions (branch / fork / compact / delete) ---
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const hasActions = !!(
+		readFilePath ||
 		msgCtx.onForkFromMessage ||
 		msgCtx.onCompactBeforeMessage ||
 		(msgCtx.onDeleteBlock && blockIndex != null)
@@ -1875,6 +2056,21 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const menuItemsNode = hasActions ? (
 		<>
+			{readFilePath && (
+				<Menu.Item
+					leftSection={<IconEye size={14} />}
+					onClick={() => {
+						setPreviewOpened(true);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_viewFile")}
+				</Menu.Item>
+			)}
+			{readFilePath &&
+				(msgCtx.onForkFromMessage ||
+					msgCtx.onCompactBeforeMessage ||
+					(msgCtx.onDeleteBlock && blockIndex != null)) && <Menu.Divider />}
 			{msgCtx.onForkFromMessage && (
 				<Menu.Item
 					leftSection={<IconGitFork size={14} />}
@@ -1992,6 +2188,14 @@ export const ToolCallCard = memo(function ToolCallCard({
 		</Menu>
 	);
 
+	const previewModal = readFilePath ? (
+		<FilePreviewModal
+			filePath={readFilePath}
+			opened={previewOpened}
+			onClose={() => setPreviewOpened(false)}
+		/>
+	) : null;
+
 	// Inside a run: no Paper wrapper, just content + divider
 	if (inRun) {
 		return (
@@ -2010,6 +2214,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				</Box>
 				{swipeMenu}
 				{ctxMenu}
+				{previewModal}
 			</>
 		);
 	}
@@ -2033,6 +2238,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			</Box>
 			{swipeMenu}
 			{ctxMenu}
+			{previewModal}
 		</>
 	);
 });

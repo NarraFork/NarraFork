@@ -126,6 +126,7 @@
 	"contextMenu_delete": "Delete message",
 	"contextMenu_regenerate": "Regenerate from here",
 	"contextMenu_edit": "Edit message",
+	"contextMenu_viewFile": "View this file",
 	"regenerateFailed": "Regenerate failed",
 	"editFailed": "Edit failed",
 	"editCancel": "Cancel",
@@ -210,5 +211,7 @@
 	"shareFile.zip": "zip",
 	"shareFile.fileCount": "{{count}} files",
 	"shareFile.preview": "preview",
-	"shareFile.previewFailed": "Preview failed to load"
+	"shareFile.previewFailed": "Preview failed to load",
+	"filePreview_loadError": "Failed to load file",
+	"filePreview_loading": "Loading…"
 }

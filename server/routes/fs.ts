@@ -1,7 +1,7 @@
 import { execSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, extname, join, resolve, sep } from "node:path";
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
@@ -173,6 +173,84 @@ fsRoutes.post("/reveal", async (c) => {
 	child.unref();
 
 	return c.json({ ok: true });
+});
+
+// ── MIME type mapping for file preview ───────────────────────────────────────
+
+const PREVIEW_MIME: Record<string, string> = {
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png": "image/png",
+	".gif": "image/gif",
+	".webp": "image/webp",
+	".svg": "image/svg+xml",
+	".avif": "image/avif",
+	".bmp": "image/bmp",
+	".ico": "image/x-icon",
+	".pdf": "application/pdf",
+};
+
+const MAX_PREVIEW_BYTES = 20 * 1024 * 1024; // 20 MB (images / PDFs)
+const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024; // 1 MB (text files — larger payloads choke syntax highlighting)
+
+/**
+ * GET /api/fs/preview?path=...
+ *
+ * Serve a file for inline preview. Supports images, PDFs, and text files.
+ * Returns the file with appropriate Content-Type for browser rendering.
+ */
+fsRoutes.get("/preview", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const absPath = resolve(rawPath);
+	if (!existsSync(absPath)) {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(absPath);
+	} catch {
+		throw new ValidationError(`Cannot access: ${absPath}`);
+	}
+
+	if (!stat.isFile()) {
+		throw new ValidationError(`Not a file: ${absPath}`);
+	}
+
+	const ext = extname(absPath).toLowerCase();
+	const mime = PREVIEW_MIME[ext];
+
+	if (stat.size > (mime ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
+		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	if (mime) {
+		// Binary preview (image / PDF)
+		const file = Bun.file(absPath);
+		return new Response(file, {
+			headers: {
+				"Content-Type": mime,
+				"Content-Disposition": "inline",
+				"Content-Length": String(stat.size),
+				"Cache-Control": "private, max-age=60",
+			},
+		});
+	}
+
+	// Text file fallback
+	const file = Bun.file(absPath);
+	const text = await file.text();
+	return new Response(text, {
+		headers: {
+			"Content-Type": "text/plain; charset=utf-8",
+			"Content-Disposition": "inline",
+			"Cache-Control": "private, max-age=60",
+		},
+	});
 });
 
 /** List immediate subdirectories of a path. */
