@@ -40,7 +40,6 @@ export function ProjectSettingsModal({
 				? t("proxyDomainInvalid")
 				: null;
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 	const cs =
 		typeof chapterSettings === "string"
 			? (() => {
@@ -68,7 +67,6 @@ export function ProjectSettingsModal({
 	useEffect(() => {
 		if (opened) {
 			setDomain(proxyDomain ?? "");
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 			const fresh =
 				typeof chapterSettings === "string"
 					? (() => {

@@ -3430,8 +3430,9 @@ export async function editAndRegenerate(
 	}
 
 	// Update the message content
-	const now = new Date().toISOString();
-	const newContentJson = [{ type: "text", text: newContent }];
+	const newContentJson: Array<Record<string, string | undefined>> = [
+		{ type: "text", text: newContent },
+	];
 
 	// Preserve existing images in contentJson
 	const existingImages = extractImageRefs(targetMsg.contentJson);
@@ -3441,7 +3442,7 @@ export async function editAndRegenerate(
 			imageId: img.imageId,
 			filename: img.filename,
 			mediaType: img.mediaType,
-		} as { type: string; text?: string; imageId?: string; filename?: string; mediaType?: string });
+		});
 	}
 
 	await db
@@ -3449,7 +3450,6 @@ export async function editAndRegenerate(
 		.set({
 			contentText: newContent,
 			contentJson: newContentJson,
-			updatedAt: now,
 		})
 		.where(eq(narratorMessages.id, messageId));
 

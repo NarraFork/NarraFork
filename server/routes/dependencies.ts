@@ -13,7 +13,7 @@ dependencyRoutes.get("/", (c) => {
 /** POST /:name/install — install a specific dependency (admin only) */
 dependencyRoutes.post("/:name/install", requireAdmin, async (c) => {
 	const name = c.req.param("name");
-	if (!["git", "rg", "dtach"].includes(name)) {
+	if (!name || !["git", "rg", "dtach"].includes(name)) {
 		throw new ValidationError(`Invalid dependency name: ${name}`);
 	}
 	const result = await dependencyService.install(name);
