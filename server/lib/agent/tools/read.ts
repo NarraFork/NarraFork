@@ -1,10 +1,22 @@
-import { resolve } from "node:path";
+import { extname, resolve } from "node:path";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText } from "./encoding";
 
 /** Maximum characters returned by force_full (≈100 KB of text). */
 const FORCE_FULL_MAX_CHARS = 100_000;
+
+/** Image extensions → format string for the API (Anthropic media_type = `image/${format}`). */
+const IMAGE_EXTENSIONS: Record<string, string> = {
+	".png": "png",
+	".jpg": "jpeg",
+	".jpeg": "jpeg",
+	".gif": "gif",
+	".webp": "webp",
+};
+
+/** Max raw image size we'll base64-encode (~5 MB, safe for all providers). */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export const readTool: ToolDefinition = {
 	name: "Read",
@@ -97,6 +109,36 @@ export const readTool: ToolDefinition = {
 		}
 
 		const resolvedPath = resolve(ctx.cwd, file_path);
+
+		// ── Image file handling ──
+		const ext = extname(resolvedPath).toLowerCase();
+		const imageFormat = IMAGE_EXTENSIONS[ext];
+		if (imageFormat) {
+			try {
+				const file = Bun.file(resolvedPath);
+				const size = file.size;
+				if (size > MAX_IMAGE_BYTES) {
+					return {
+						output: `Image file too large (${(size / 1024 / 1024).toFixed(1)} MB). Maximum supported size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`,
+						isError: true,
+					};
+				}
+				const buffer = await file.arrayBuffer();
+				const base64 = Buffer.from(buffer).toString("base64");
+				return {
+					output: `[Image: ${file_path} (${(size / 1024).toFixed(1)} KB, ${imageFormat})]`,
+					title: file_path,
+					images: [{ format: imageFormat, base64 }],
+				};
+			} catch (err) {
+				return {
+					output: `Error reading image ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		// ── Text file handling (existing logic) ──
 		try {
 			const { text } = await readFileText(resolvedPath);
 			const lines = text.split("\n");

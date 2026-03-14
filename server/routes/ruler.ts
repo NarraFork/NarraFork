@@ -172,148 +172,48 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	});
 });
 
-// GET /:id/ruler/sub — Sub-ruler data for a specific chapter's branch
-rulerRoutes.get("/:id/ruler/sub", async (c) => {
-	const projectId = c.req.param("id");
-	const chapterId = c.req.query("chapterId");
-	const limitParam = c.req.query("limit");
-	const limit = limitParam ? Number.parseInt(limitParam, 10) : 200;
-
-	if (!chapterId) return c.json({ commits: [], segments: [], activeChapters: [] });
-
-	const chapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-	});
-	if (!chapter) throw new NotFoundError("Chapter", chapterId);
-
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
-	if (!project?.gitPath) return c.json({ commits: [], segments: [], activeChapters: [] });
-
-	// Get commits on this chapter's branch
-	// Use worktreePath if available, otherwise gitPath with branch option
-	let commits: Array<{
-		sha: string;
-		shortSha: string;
-		message: string;
-		author: string;
-		date: string;
-	}>;
-	if (chapter.worktreePath) {
-		commits = await gitService.getLog(chapter.worktreePath, { limit });
-	} else if (chapter.branch) {
-		commits = await gitService.getLog(project.gitPath, { limit, branch: chapter.branch });
-	} else {
-		return c.json({ commits: [], segments: [], activeChapters: [] });
-	}
-
-	// If we have a startCommitSha, trim commits to only those after the fork point
-	if (chapter.startCommitSha) {
-		const forkIdx = commits.findIndex((co) => co.sha === chapter.startCommitSha);
-		if (forkIdx >= 0) {
-			commits = commits.slice(0, forkIdx + 1);
-		}
-	}
-
-	// Find child chapters that forked from this chapter
-	const childChapters = await db.query.chapters.findMany({
-		where: and(eq(chapters.projectId, projectId), eq(chapters.parentChapterId, chapterId)),
-		columns: {
-			id: true,
-			title: true,
-			status: true,
-			branch: true,
-			role: true,
-			startCommitSha: true,
-			mergeCommitSha: true,
-		},
-	});
-
-	// Build segments from child chapters
-	const commitShaSet = new Set(commits.map((co) => co.sha));
-	const chaptersByStartSha = new Map<string, typeof childChapters>();
-	for (const ch of childChapters) {
-		if (ch.startCommitSha && commitShaSet.has(ch.startCommitSha)) {
-			const list = chaptersByStartSha.get(ch.startCommitSha) ?? [];
-			list.push(ch);
-			chaptersByStartSha.set(ch.startCommitSha, list);
-		}
-	}
-
-	const segments: Array<{
-		fromSha: string;
-		toSha: string;
-		fromIndex: number;
-		toIndex: number;
-		activeChapterCount: number;
-		totalChapterCount: number;
-		activeChapterIds: string[];
-		isExpandable: boolean;
-	}> = [];
-
-	for (let i = 0; i < commits.length; i++) {
-		const sha = commits[i].sha;
-		const chaptersAtSha = chaptersByStartSha.get(sha);
-		if (!chaptersAtSha || chaptersAtSha.length === 0) continue;
-
-		const toIndex = i > 0 ? i - 1 : i;
-		const toSha = commits[toIndex]?.sha ?? sha;
-		const activeCount = chaptersAtSha.filter((ch) => ch.status === "active").length;
-		const activeIds = chaptersAtSha.filter((ch) => ch.status === "active").map((ch) => ch.id);
-
-		segments.push({
-			fromSha: sha,
-			toSha,
-			fromIndex: i,
-			toIndex,
-			activeChapterCount: activeCount,
-			totalChapterCount: chaptersAtSha.length,
-			activeChapterIds: activeIds,
-			isExpandable: chaptersAtSha.length > 0,
-		});
-	}
-
-	// Active child chapters summary
-	const activeChapterIds = childChapters.filter((ch) => ch.status === "active").map((ch) => ch.id);
-	let narratorMap = new Map<string, { id: string; status: string }>();
-	if (activeChapterIds.length > 0) {
-		const chapterNarrators = await db.query.narrators.findMany({
-			where: and(inArray(narrators.chapterId, activeChapterIds), eq(narrators.type, "primary")),
-			columns: { id: true, chapterId: true, status: true },
-		});
-		narratorMap = new Map(
-			chapterNarrators
-				.filter((n) => n.chapterId)
-				.map((n) => [n.chapterId!, { id: n.id, status: n.status }]),
-		);
-	}
-
-	const activeChapters = childChapters
-		.filter((ch) => ch.status === "active")
-		.map((ch) => {
-			const narrator = narratorMap.get(ch.id);
-			return {
-				id: ch.id,
-				title: ch.title,
-				branch: ch.branch,
-				role: ch.role,
-				startCommitSha: ch.startCommitSha,
-				narratorId: narrator?.id ?? null,
-				narratorStatus: narrator?.status ?? null,
-			};
-		});
-
-	return c.json({ commits, segments, activeChapters });
-});
-
 // GET /:id/ruler/segment — Load segment detail (chapters within a commit range)
 rulerRoutes.get("/:id/ruler/segment", async (c) => {
 	const projectId = c.req.param("id");
 	const fromSha = c.req.query("from");
 	const _toSha = c.req.query("to");
+	const detail = (c.req.query("detail") ?? "full") as "summary" | "full";
 
 	if (!fromSha) return c.json({ chapters: [], edges: [] });
+
+	if (detail === "summary") {
+		// Lightweight: only id, title, status, role + narrator status
+		const projectChapters = await db.query.chapters.findMany({
+			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
+			columns: { id: true, title: true, status: true, role: true, startCommitSha: true },
+		});
+		const segmentChapters = projectChapters.filter((ch) => ch.startCommitSha === fromSha);
+		const chapterIds = segmentChapters.map((ch) => ch.id);
+
+		let narratorMap = new Map<string, string>();
+		if (chapterIds.length > 0) {
+			const chapterNarrators = await db.query.narrators.findMany({
+				where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.type, "primary")),
+				columns: { chapterId: true, status: true },
+			});
+			narratorMap = new Map(
+				chapterNarrators.filter((n) => n.chapterId).map((n) => [n.chapterId!, n.status]),
+			);
+		}
+
+		return c.json({
+			chapters: segmentChapters.map((ch) => ({
+				id: ch.id,
+				title: ch.title,
+				status: ch.status,
+				role: ch.role,
+				narratorStatus: narratorMap.get(ch.id) ?? null,
+			})),
+			edges: [],
+		});
+	}
+
+	// detail === "full" — existing behavior
 
 	// Get chapters whose startCommitSha matches the segment range
 	const projectChapters = await db.query.chapters.findMany({

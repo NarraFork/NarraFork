@@ -2,7 +2,6 @@ import {
 	ActionIcon,
 	Badge,
 	Group,
-	NativeSelect,
 	NumberInput,
 	Paper,
 	Stack,
@@ -10,10 +9,9 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconEye, IconEyeOff, IconPlus, IconTrash } from "@tabler/icons-react";
-import { useCallback, useState } from "react";
+import { IconEye, IconEyeOff, IconTrash } from "@tabler/icons-react";
+import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { modelValue } from "../../lib/constants";
 
 interface CustomModelsSectionProps {
 	customModels: Array<{ value: string; label: string; provider?: string }>;
@@ -25,6 +23,10 @@ interface CustomModelsSectionProps {
 	prefixOptions: Array<{ value: string; label: string }>;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	/** When true, only show orphan models (no add form) */
+	orphanOnly?: boolean;
+	/** Pre-filtered orphan models to display */
+	orphanModels?: Array<{ value: string; label: string; provider?: string }>;
 }
 
 export function CustomModelsSection({
@@ -32,28 +34,13 @@ export function CustomModelsSection({
 	onCustomModelsChange,
 	hiddenModels,
 	onToggleHidden,
-	prefixOptions,
 	modelContextWindows,
 	onContextWindowChange,
+	orphanModels,
 }: CustomModelsSectionProps) {
 	const { t } = useTranslation("settings");
-	const [newModelValue, setNewModelValue] = useState("");
-	const [newModelLabel, setNewModelLabel] = useState("");
-	const [newModelProvider, setNewModelProvider] = useState("openai");
 
-	const handleAddModel = useCallback(() => {
-		const v = newModelValue.trim();
-		const l = newModelLabel.trim();
-		if (!v || !l) return;
-		const fullValue = modelValue(newModelProvider, v);
-		if (customModels.some((m) => m.value === fullValue)) return;
-		onCustomModelsChange([
-			...customModels,
-			{ value: fullValue, label: l, provider: newModelProvider },
-		]);
-		setNewModelValue("");
-		setNewModelLabel("");
-	}, [newModelValue, newModelLabel, newModelProvider, customModels, onCustomModelsChange]);
+	const modelsToShow = orphanModels ?? customModels;
 
 	const handleRemoveModel = useCallback(
 		(value: string) => {
@@ -66,31 +53,19 @@ export function CustomModelsSection({
 		<Paper withBorder p="md">
 			<Stack>
 				<div>
-					<Title order={4}>{t("customModelsSection", { defaultValue: "Custom Models" })}</Title>
+					<Title order={4}>{t("orphanCustomModelsSection")}</Title>
 					<Text size="xs" c="dimmed">
-						{t("customModelsDesc")}
+						{t("orphanCustomModelsSectionDesc")}
 					</Text>
 				</div>
-				{customModels.map((m) => {
+				{modelsToShow.map((m) => {
 					const isHidden = hiddenModels.includes(m.value);
 					return (
 						<Group key={m.value} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
 							<TextInput value={m.value} disabled style={{ flex: 1 }} />
 							<TextInput value={m.label} disabled style={{ flex: 1 }} />
-							<Badge
-								size="sm"
-								variant="light"
-								color={
-										? "violet"
-										: m.provider === "codex"
-											? "indigo"
-											: m.provider === "anthropic"
-												? "pink"
-												: "teal"
-								}
-								w={70}
-							>
-								{m.provider ?? "openai"}
+							<Badge size="sm" variant="light" color="gray" w={70}>
+								{m.provider ?? "?"}
 							</Badge>
 							<NumberInput
 								placeholder={t("contextWindowPlaceholder")}
@@ -115,34 +90,6 @@ export function CustomModelsSection({
 						</Group>
 					);
 				})}
-				<Group gap="xs">
-					<TextInput
-						placeholder={t("modelValuePlaceholder")}
-						value={newModelValue}
-						onChange={(e) => setNewModelValue(e.currentTarget.value)}
-						style={{ flex: 1 }}
-					/>
-					<TextInput
-						placeholder={t("modelLabelPlaceholder")}
-						value={newModelLabel}
-						onChange={(e) => setNewModelLabel(e.currentTarget.value)}
-						style={{ flex: 1 }}
-					/>
-					<NativeSelect
-						size="xs"
-						data={prefixOptions}
-						value={newModelProvider}
-						onChange={(e) => setNewModelProvider(e.currentTarget.value)}
-						w={100}
-					/>
-					<ActionIcon
-						variant="light"
-						onClick={handleAddModel}
-						disabled={!newModelValue.trim() || !newModelLabel.trim()}
-					>
-						<IconPlus size={14} />
-					</ActionIcon>
-				</Group>
 			</Stack>
 		</Paper>
 	);

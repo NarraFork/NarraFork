@@ -1250,11 +1250,23 @@ export function NarratorPanel({
 	// merge the streaming tool chunks into the preceding run (no gap / shared border).
 	const lastMessageIsToolRun = !!lastMessage && hasToolUse(lastMessage);
 
+	const narratorIsIdle =
+		narrator?.status === "idle" ||
+		narrator?.status === "done" ||
+		narrator?.status === "error" ||
+		narrator?.status === "interrupted";
+
 	const canRetryLastUserMessage =
 		!!lastMessage &&
 		lastMessage.role === "user" &&
 		!String(lastMessage.id).startsWith("optimistic-") &&
-		(narrator?.status === "idle" || narrator?.status === "done" || narrator?.status === "error");
+		narratorIsIdle;
+
+	const canContinueNarrator =
+		!!lastMessage &&
+		lastMessage.role === "assistant" &&
+		!String(lastMessage.id).startsWith("optimistic-") &&
+		narratorIsIdle;
 
 	// Find the last user message ID for edit confirmation logic
 	const lastUserMessageId = useMemo(() => {
@@ -1720,6 +1732,44 @@ export function NarratorPanel({
 					message: toolName,
 					color: result.alreadyLoaded ? "yellow" : "green",
 				});
+			} else if (result?.buffered) {
+				// Message was buffered — remove optimistic message,
+				// WS buffer_set broadcast will sync the queue state.
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+					firstPage.messages = firstPage.messages.filter((m: NarratorMsg) => m.id !== optimisticId);
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
+				scrollToBottom(true);
+			} else if (result?.id) {
+				// Normal message — replace optimistic message with the real server message
+				// so we don't depend solely on WS onUserMessage for dedup.
+				const serverMsg: NarratorMsg = {
+					...result,
+					children: result.children ?? [],
+					toolCalls: result.toolCalls ?? [],
+				};
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+					const idx = firstPage.messages.findIndex((m: NarratorMsg) => m.id === optimisticId);
+					if (idx !== -1) {
+						// Optimistic message still present — replace it
+						const updated = [...firstPage.messages];
+						revokeContentBlockPreviewUrls(updated[idx].contentJson);
+						updated[idx] = serverMsg;
+						firstPage.messages = updated;
+					} else if (!firstPage.messages.some((m: NarratorMsg) => m.id === serverMsg.id)) {
+						// Optimistic was already replaced by WS, but server msg not yet in cache
+						firstPage.messages = [...firstPage.messages, serverMsg];
+					}
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
 			}
 		} catch (err) {
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
@@ -1784,6 +1834,22 @@ export function NarratorPanel({
 			await api.retryLastMessage(narratorId);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : "Failed to retry";
+			notifications.show({ title: "Error", message, color: "red" });
+		}
+	};
+
+	const handleContinue = async () => {
+		if (!canContinueNarrator) return;
+		try {
+			if (lastMessage && hasToolUse(lastMessage)) {
+				await api.continueNarrator(narratorId);
+			} else {
+				// Use a fixed English string so the AI receives a consistent
+				// instruction regardless of the user's UI language.
+				await submitMessage("Continue");
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : "Failed to continue";
 			notifications.show({ title: "Error", message, color: "red" });
 		}
 	};
@@ -3019,6 +3085,8 @@ export function NarratorPanel({
 									!hasInput &&
 									attachedImages.length === 0 &&
 									canRetryLastUserMessage;
+								const showContinue =
+									!showInterrupt && !hasInput && attachedImages.length === 0 && canContinueNarrator;
 								if (showInterrupt) {
 									return (
 										<Button
@@ -3061,6 +3129,13 @@ export function NarratorPanel({
 									return (
 										<Button key="retry" onClick={handleRetry}>
 											{t("retry")}
+										</Button>
+									);
+								}
+								if (showContinue) {
+									return (
+										<Button key="continue" onClick={handleContinue}>
+											{t("continue")}
 										</Button>
 									);
 								}

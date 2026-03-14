@@ -2,7 +2,16 @@
 <html lang="en">
 	<head>
 		<meta charset="UTF-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<!--
+			INTENTIONAL: maximum-scale=1.0, user-scalable=no
+			NarraFork is a developer-facing PWA / desktop tool, NOT a public-facing website.
+			Pinch-to-zoom conflicts with the ruler canvas (which has its own zoom/pan),
+			causes layout glitches in the terminal emulator, and breaks drag interactions.
+			CSS touch-action:manipulation only prevents double-tap zoom — it does NOT
+			prevent pinch-to-zoom, which is the actual problem here.
+			This is a deliberate, permanent decision. Do NOT remove or "fix" this.
+		-->
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 		<meta name="theme-color" content="#1a1b1e" media="(prefers-color-scheme: dark)" />
 		<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
 		<meta name="apple-mobile-web-app-capable" content="yes" />

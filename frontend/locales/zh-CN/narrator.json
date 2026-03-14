@@ -108,6 +108,7 @@
 	"clearAllQueued": "清空所有排队",
 	"queue": "排队",
 	"retry": "重试",
+	"continue": "继续",
 	"bgAgentWarning": "后台 agent 与 NarraFork 配合不佳，可能导致权限问题。",
 	"bgAgentRetry": "改为创建前台 agent",
 	"bgAgentRetryPrompt": "上一个 Task 使用了 `run_in_background: true`，导致权限问题。\n请用同步（前台）Task 重试相同任务，不要设置 `run_in_background`。",
@@ -207,5 +208,7 @@
 	"shareFile.directory": "目录",
 	"shareFile.compressed": "已压缩",
 	"shareFile.zip": "zip",
-	"shareFile.fileCount": "{{count}} 个文件"
+	"shareFile.fileCount": "{{count}} 个文件",
+	"shareFile.preview": "预览",
+	"shareFile.previewFailed": "预览加载失败"
 }

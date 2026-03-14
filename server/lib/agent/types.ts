@@ -53,6 +53,8 @@ export interface ToolResult {
 	truncated?: boolean;
 	/** When true the error is unrecoverable — the agent loop should stop immediately without further tool calls. */
 	fatal?: boolean;
+	/** Base64-encoded images to include in the tool result (for multimodal providers). */
+	images?: Array<{ format: string; base64: string }>;
 }
 
 export interface ToolDefinition {

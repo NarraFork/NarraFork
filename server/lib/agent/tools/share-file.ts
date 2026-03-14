@@ -144,11 +144,26 @@ export const shareFileTool: ToolDefinition = {
 					"Ignored when path is an array (always creates .zip). " +
 					"Default: false for files.",
 			),
+		preview: z
+			.boolean()
+			.optional()
+			.describe(
+				"Whether to enable inline preview in the frontend card. " +
+					"When true, the shared file will be rendered directly in the chat " +
+					"(supports images, videos, PDFs, and sanitized HTML). " +
+					"Ignored for compressed archives and multi-file shares. " +
+					"Default: false.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { path: inputPath, compress } = args as {
+		const {
+			path: inputPath,
+			compress,
+			preview,
+		} = args as {
 			path: string | string[];
 			compress?: boolean;
+			preview?: boolean;
 		};
 
 		const isMulti = Array.isArray(inputPath);
@@ -159,7 +174,7 @@ export const shareFileTool: ToolDefinition = {
 		}
 
 		// ── Single path mode (original behaviour) ──────────────────────────
-		return handleSinglePath(inputPath, compress, ctx);
+		return handleSinglePath(inputPath, compress, preview, ctx);
 	},
 };
 
@@ -264,11 +279,38 @@ async function handleMultiFile(
 	}
 }
 
+// ── Previewable file extensions ──────────────────────────────────────────────
+
+const PREVIEW_IMAGE_EXTS = new Set([
+	".jpg",
+	".jpeg",
+	".png",
+	".gif",
+	".webp",
+	".svg",
+	".avif",
+	".bmp",
+	".ico",
+]);
+const PREVIEW_VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".ogg"]);
+const PREVIEW_PDF_EXTS = new Set([".pdf"]);
+const PREVIEW_HTML_EXTS = new Set([".html", ".htm"]);
+
+function getPreviewType(filename: string): "image" | "video" | "pdf" | "html" | null {
+	const ext = filename.toLowerCase().replace(/^.*(\.[^.]+)$/, "$1");
+	if (PREVIEW_IMAGE_EXTS.has(ext)) return "image";
+	if (PREVIEW_VIDEO_EXTS.has(ext)) return "video";
+	if (PREVIEW_PDF_EXTS.has(ext)) return "pdf";
+	if (PREVIEW_HTML_EXTS.has(ext)) return "html";
+	return null;
+}
+
 // ── Single-path handler (original logic) ─────────────────────────────────────
 
 async function handleSinglePath(
 	inputPath: string,
 	compress: boolean | undefined,
+	preview: boolean | undefined,
 	ctx: { cwd: string; narratorId: string },
 ): Promise<ToolResult> {
 	const fullPath = resolve(ctx.cwd, inputPath);
@@ -351,13 +393,19 @@ async function handleSinglePath(
 
 		const downloadUrl = `/api/shares/${record.id}`;
 
+		// Determine preview capability: only for raw (uncompressed) single files
+		const canPreview = !isDir && !compress && !!preview;
+		const previewType = canPreview ? getPreviewType(finalName) : null;
+		const previewUrl = previewType ? `/api/shares/${record.id}/preview` : null;
+
 		return {
 			output:
 				`File shared successfully.\n\n` +
 				`Download link: ${downloadUrl}\n` +
 				`Filename: ${finalName}\n` +
 				`Size: ${formatSize(finalStat.size)}\n` +
-				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)`,
+				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)` +
+				(previewUrl ? `\nPreview: enabled (${previewType})` : ""),
 			title: `Shared: ${finalName}`,
 			metadata: {
 				shareId: record.id,
@@ -371,6 +419,7 @@ async function handleSinglePath(
 				isDirectory: isDir,
 				compressed: isDir || !!compress,
 				format,
+				...(previewUrl && { preview: true, previewType, previewUrl }),
 			},
 		};
 	} catch (err) {

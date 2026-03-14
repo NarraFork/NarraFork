@@ -210,5 +210,11 @@
 	"updateDownloadComplete": "Update downloaded successfully!",
 	"updateApplyInstructions": "Run the following command to apply the update:",
 	"updateReadyToApply": "Update is ready. Click the button below to restart and apply.",
-	"updateApplyNow": "Restart & Apply Update"
+	"updateApplyNow": "Restart & Apply Update",
+
+	"gitNotInstalled": "Git is not installed",
+	"gitNotInstalledDesc": "NarraFork requires Git to work. Please install Git and restart the application.",
+	"gitDownload": "Download Git",
+	"gitInstallGuide": "After installation, restart NarraFork to continue.",
+	"gitRecheck": "I've installed Git, recheck"
 }

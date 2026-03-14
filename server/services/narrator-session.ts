@@ -3232,6 +3232,38 @@ export async function retryLastMessage(
 }
 
 /**
+ * Continue the agent loop without creating a new user message.
+ * Used when the last message is an assistant message with pending tool calls —
+ * buildHistory will detect the trailing tool_use blocks and produce
+ * trailingToolResults so the loop picks up where it left off.
+ *
+ * If the last message is NOT an assistant tool_use, the caller should send
+ * a regular user message instead (handled on the frontend side).
+ */
+export async function continueLastToolUse(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ ok: boolean }> {
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	await narratorService.updateStatus(narratorId, "thinking");
+
+	// Pass empty text — buildHistory will detect trailing tool_use blocks
+	// and produce trailingToolResults for the agent loop to continue.
+	runAgentLoop(active, "", undefined).catch(async (err) => {
+		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
+		await narratorService.updateStatus(narratorId, "error", String(err));
+		broadcastToNarrator(narratorId, {
+			type: "narrator_error",
+			narratorId,
+			error: String(err),
+		});
+	});
+
+	return { ok: true };
+}
+
+/**
  * Regenerate from a specific message.
  * - If the target is a user message: delete everything after it, re-run agent loop with its text.
  * - If the target is an assistant message: find the preceding user message,

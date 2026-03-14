@@ -844,3 +844,39 @@ function removeStreamingChildInMessages(
 	});
 	return { messages: updated, changed: anyChanged };
 }
+
+/**
+ * Evict oldest pages from the cache until total message count <= maxMessages.
+ * Returns the original cache if no eviction is needed.
+ * Sets hasMore=true on the new last page so older messages can be re-fetched.
+ */
+export function evictOldestPages(old: InfiniteCache, maxMessages: number): InfiniteCache {
+	if (!old?.pages?.length || old.pages.length <= 1) return old;
+
+	let total = 0;
+	let keepCount = 0;
+	for (const page of old.pages) {
+		total += page.messages?.length ?? 0;
+		keepCount++;
+		if (total >= maxMessages) break;
+	}
+
+	if (keepCount >= old.pages.length) return old;
+
+	const pages = old.pages.slice(0, keepCount);
+	// Mark the last kept page as having more older messages
+	const lastPage = { ...pages[keepCount - 1] };
+	lastPage.hasMore = true;
+	// Derive nextCursor from the oldest message in the last kept page
+	const oldestMsg = lastPage.messages?.[0];
+	if (oldestMsg) {
+		lastPage.nextCursor = oldestMsg.id;
+	}
+	pages[keepCount - 1] = lastPage;
+
+	return {
+		...old,
+		pages,
+		pageParams: (old.pageParams ?? []).slice(0, keepCount),
+	};
+}

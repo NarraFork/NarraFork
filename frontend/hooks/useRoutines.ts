@@ -41,3 +41,21 @@ export function useToggleProjectRoutine(projectId: string) {
 		},
 	});
 }
+
+export function useGlobalPrompt() {
+	return useQuery({
+		queryKey: ["global-prompt"],
+		queryFn: api.getGlobalPrompt,
+		staleTime: 30_000,
+	});
+}
+
+export function useUpdateGlobalPrompt() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (data: { content: string; filePath?: string }) => api.updateGlobalPrompt(data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["global-prompt"] });
+		},
+	});
+}

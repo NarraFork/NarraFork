@@ -28,6 +28,8 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import type { CustomModelEntry } from "./InlineCustomModels";
+import { InlineCustomModels } from "./InlineCustomModels";
 import type { AnthropicProviderState } from "./types";
 
 interface AnthropicProvidersSectionProps {
@@ -39,6 +41,8 @@ interface AnthropicProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	customModels: CustomModelEntry[];
+	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 }
 
 export function AnthropicProvidersSection({
@@ -50,6 +54,8 @@ export function AnthropicProvidersSection({
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	customModels,
+	onCustomModelsChange,
 }: AnthropicProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -296,6 +302,15 @@ export function AnthropicProvidersSection({
 												})}
 											</Stack>
 										)}
+										<InlineCustomModels
+											prefix={p.prefix || "anthropic"}
+											customModels={customModels}
+											onCustomModelsChange={onCustomModelsChange}
+											hiddenModels={hiddenModels}
+											onToggleHidden={onToggleHidden}
+											modelContextWindows={modelContextWindows}
+											onContextWindowChange={onContextWindowChange}
+										/>
 									</Stack>
 								</Collapse>
 							</Stack>

@@ -12,10 +12,12 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
+import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
 import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -300,10 +302,14 @@ interface CreateSubagentInput {
 /**
  * Shared handler for `/load <tool>` commands.
  * Called from both the HTTP route and the WebSocket buffer_message handler.
+ *
+ * When a tool is newly loaded (not already_loaded), persists an additional
+ * role="user" message so the model knows the tool was just made available.
  */
 export async function handleLoadToolCommand(
 	narratorId: string,
 	cmdResult: LoadToolResult | LoadToolNotFound,
+	locale: Locale = "en",
 ): Promise<{ toolName: string; loaded: boolean; alreadyLoaded: boolean }> {
 	if ("loadToolNotFound" in cmdResult) {
 		const toolId = cmdResult.loadToolNotFound;
@@ -319,6 +325,47 @@ export async function handleLoadToolCommand(
 		? `🔧 Tool already loaded: ${toolName}`
 		: `🔧 Tool loaded: ${toolName}`;
 	await narratorService.persistInfoMessage(narratorId, infoText);
+
+	// Persist a user-role message so the model is aware the tool was just loaded
+	if (!alreadyLoaded) {
+		const routine = getBuiltinToolRoutines().find((r) => r.tool?.toolName === toolName);
+		const toolDescription =
+			locale === "zh-CN"
+				? (routine?.tool?.descriptionZh ?? routine?.tool?.descriptionEn ?? toolName)
+				: (routine?.tool?.descriptionEn ?? toolName);
+		const text = getToolMessageWithParams("toolLoaded", locale, {
+			toolName,
+			toolDescription,
+		});
+		const id = generateId();
+		const now = new Date().toISOString();
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "user",
+				contentJson: [{ type: "tool_loaded", toolName, text }],
+				contentText: text,
+				createdAt: now,
+			})
+			.returning();
+		await appendMessageRef(narratorId, id);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "user",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				children: [],
+			},
+		});
+	}
+
 	return { toolName, loaded: true, alreadyLoaded };
 }
 

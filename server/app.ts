@@ -6,6 +6,7 @@ import { cors } from "hono/cors";
 import { db } from "./db";
 import { users } from "./db/schema";
 import { AppError } from "./lib/errors";
+import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
@@ -57,15 +58,19 @@ app.use(
 
 // Public routes (no auth required)
 app.route("/api/auth", authRoutes);
-app.get("/api/health", (c) =>
-	c.json({
+app.get("/api/health", (c) => {
+	// Re-check git when it was previously unavailable so the frontend
+	// "recheck" button works without a server restart.
+	const gitOk = gitAvailable || recheckGit();
+	return c.json({
 		status: "ok",
 		version: APP_VERSION,
 		commit: GIT_COMMIT,
 		platform:
 			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
-	}),
-);
+		gitAvailable: gitOk,
+	});
+});
 
 app.get("/api/auth/status", async (c) => {
 	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
@@ -80,6 +85,28 @@ app.route("/api/shares", shareRoutes);
 
 // All routes below require authentication
 app.use("/api/*", requireAuth);
+
+// When git is not installed, block routes that depend on git operations.
+// Configuration / provider / notification routes remain accessible so the
+// frontend can still render the "install git" dialog and settings pages.
+const GIT_FREE_PREFIXES = [
+	"/api/settings",
+	"/api/admin",
+	"/api/user-preferences",
+	"/api/notification",
+	"/api/update",
+	"/api/routines",
+	"/api/skills",
+	"/api/openai",
+	"/api/codex",
+	"/api/anthropic",
+];
+app.use("/api/*", async (c, next) => {
+	if (gitAvailable) return next();
+	const path = c.req.path;
+	if (GIT_FREE_PREFIXES.some((p) => path.startsWith(p))) return next();
+	return c.json({ error: "Git is not installed. Please install git and restart NarraFork." }, 503);
+});
 
 app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);

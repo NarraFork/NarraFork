@@ -668,6 +668,8 @@ export const api = {
 	},
 	retryLastMessage: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
+	continueNarrator: (narratorId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/continue`, { method: "POST" }),
 	regenerateFromMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/regenerate/${messageId}`, {
 			method: "POST",
@@ -1158,16 +1160,18 @@ export const api = {
 		const qs = params.toString();
 		return request<ApiEntity>(`/projects/${projectId}/ruler${qs ? `?${qs}` : ""}`);
 	},
-	getRulerSegment: (projectId: string, fromSha: string, toSha?: string) => {
+	getRulerSegment: (
+		projectId: string,
+		fromSha: string,
+		toSha?: string,
+		detail?: "summary" | "full",
+	) => {
 		const params = new URLSearchParams({ from: fromSha });
 		if (toSha) params.set("to", toSha);
+		if (detail) params.set("detail", detail);
 		return request<ApiEntity>(`/projects/${projectId}/ruler/segment?${params}`);
 	},
-	getSubRulerData: (projectId: string, chapterId: string, opts?: { limit?: number }) => {
-		const params = new URLSearchParams({ chapterId });
-		if (opts?.limit) params.set("limit", String(opts.limit));
-		return request<ApiEntity>(`/projects/${projectId}/ruler/sub?${params}`);
-	},
+
 	updateRulerPositions: (
 		projectId: string,
 		positions: Array<{
@@ -1768,6 +1772,7 @@ export const api = {
 			version: string;
 			commit: string;
 			platform: "windows" | "macos" | "linux";
+			gitAvailable: boolean;
 		}>("/health"),
 
 	// Dependencies
@@ -1863,6 +1868,17 @@ export const api = {
 		request<{ ok: boolean }>(`/routines/project/${projectId}/${id}/toggle`, {
 			method: "POST",
 			body: JSON.stringify({ action }),
+		}),
+	getGlobalPrompt: () =>
+		request<{
+			content: string | null;
+			filePath: string | null;
+			candidates: Array<{ path: string; exists: boolean }>;
+		}>("/routines/global-prompt"),
+	updateGlobalPrompt: (data: { content: string; filePath?: string }) =>
+		request<{ ok: boolean; filePath: string }>("/routines/global-prompt", {
+			method: "PUT",
+			body: JSON.stringify(data),
 		}),
 
 	// Update

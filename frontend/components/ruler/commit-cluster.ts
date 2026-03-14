@@ -1,6 +1,5 @@
 import type { RulerSegment } from "../../hooks/useRuler";
-import type { TickPosition } from "./elastic-layout";
-import { getCollapsedGap } from "./elastic-layout";
+import { COLLAPSED_GAP, type TickPosition } from "./elastic-layout";
 
 export interface CommitCluster {
 	startSha: string;
@@ -28,7 +27,7 @@ export function clusterCommits(
 	const minScreen = getClusterMinScreenSize(scale);
 	if (minScreen === 0) return [];
 
-	const gap = getCollapsedGap(scale);
+	const gap = COLLAPSED_GAP;
 	const clusters: CommitCluster[] = [];
 	let i = 0;
 

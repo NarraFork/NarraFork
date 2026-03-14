@@ -98,6 +98,32 @@ describe("truncateOutput", () => {
 		expect(result.content).toBe("hello world");
 	});
 
+	test("keeps partial first line when single line exceeds MAX_BYTES", () => {
+		// Simulate a minified file: one huge line
+		const hugeLine = "x".repeat(MAX_BYTES * 3);
+		const result = truncateOutput(hugeLine);
+
+		expect(result.truncated).toBe(true);
+		expect(result.outputPath).toBeDefined();
+		// The preview should contain some content, not be empty
+		const previewPart = result.content.split("\n\n...")[0];
+		expect(previewPart.length).toBeGreaterThan(0);
+		expect(previewPart).toContain("…[line truncated,");
+		expect(previewPart).toContain(`${hugeLine.length} chars total`);
+	});
+
+	test("keeps partial first line for multi-line file where first line exceeds MAX_BYTES", () => {
+		// e.g. a file with a very long first line followed by short lines
+		const longFirst = "y".repeat(MAX_BYTES * 2);
+		const text = `${longFirst}\nshort line 2\nshort line 3`;
+		const result = truncateOutput(text);
+
+		expect(result.truncated).toBe(true);
+		const previewPart = result.content.split("\n\n...")[0];
+		expect(previewPart.length).toBeGreaterThan(0);
+		expect(previewPart).toContain("…[line truncated,");
+	});
+
 	test("output path contains narrafork-tool-output directory", () => {
 		const lines = Array.from({ length: MAX_LINES + 10 }, (_, i) => `x${i}`);
 		const result = truncateOutput(lines.join("\n"));

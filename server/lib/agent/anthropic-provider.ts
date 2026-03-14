@@ -9,6 +9,9 @@ import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./type
 
 // === Claude Code protocol constants ===
 
+/** Maximum number of server-side web searches per API call. */
+const WEB_SEARCH_MAX_USES = 8;
+
 /**
  * Beta flags matching Claude Code CLI protocol exactly.
  * All flags are always included — no conditional logic.
@@ -113,7 +116,12 @@ type AnthropicContentPart =
 	| {
 			type: "tool_result";
 			tool_use_id: string;
-			content: string;
+			content:
+				| string
+				| Array<
+						| { type: "text"; text: string }
+						| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+				  >;
 			is_error?: boolean;
 			cache_control?: CacheControl;
 	  }
@@ -247,6 +255,17 @@ interface AnthropicStreamEvent {
 		input?: Record<string, unknown>;
 		thinking?: string;
 		signature?: string;
+		// server_tool_use / web_search_tool_result fields
+		tool_use_id?: string;
+		content?:
+			| Array<{
+					title: string;
+					url: string;
+					snippet?: string;
+					encrypted_content?: string;
+					page_age?: string;
+			  }>
+			| { type: string; error_code: string };
 	};
 	delta?: {
 		type?: string;
@@ -272,6 +291,15 @@ interface ToolAccumEntry {
 	name: string;
 	args: string;
 	emitted: boolean;
+}
+
+/** Accumulator for server-side tool calls (web_search). */
+interface ServerToolAccumEntry {
+	id: string;
+	name: string;
+	args: string;
+	/** Extracted query from accumulated JSON */
+	query?: string;
 }
 
 /**
@@ -426,7 +454,12 @@ export class AnthropicProvider implements ProviderAdapter {
 		const toolResultParts: AnthropicContentPart[] = [];
 		for (const tr of params.toolResults as Array<{
 			tool_use_id: string;
-			content: string;
+			content:
+				| string
+				| Array<
+						| { type: "text"; text: string }
+						| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+				  >;
 			is_error?: boolean;
 		}>) {
 			toolResultParts.push({
@@ -533,8 +566,17 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		body.system = systemBlocks;
+
+		// Inject Anthropic server-side web_search tool alongside function tools.
+		// The API executes searches server-side and returns results via
+		// server_tool_use / web_search_tool_result SSE events.
+		const serverTools: Record<string, unknown>[] = [
+			{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
+		];
 		if (cachedTools) {
-			body.tools = cachedTools;
+			body.tools = [...cachedTools, ...serverTools];
+		} else {
+			body.tools = serverTools;
 		}
 
 		// Add metadata if provided
@@ -600,7 +642,30 @@ export class AnthropicProvider implements ProviderAdapter {
 		yield* parseAnthropicSSEStream(response.body);
 	}
 
-	formatToolResult(toolUseId: string, output: string, isError: boolean): unknown {
+	formatToolResult(
+		toolUseId: string,
+		output: string,
+		isError: boolean,
+		images?: Array<{ format: string; base64: string }>,
+	): unknown {
+		if (images?.length) {
+			const content: Array<
+				| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+				| { type: "text"; text: string }
+			> = [];
+			for (const img of images) {
+				content.push({
+					type: "image",
+					source: {
+						type: "base64",
+						media_type: `image/${img.format}`,
+						data: img.base64,
+					},
+				});
+			}
+			content.push({ type: "text", text: output });
+			return { tool_use_id: toolUseId, content, is_error: isError || undefined };
+		}
 		return { tool_use_id: toolUseId, content: output, is_error: isError || undefined };
 	}
 
@@ -610,7 +675,12 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		for (const tr of toolResults as Array<{
 			tool_use_id: string;
-			content: string;
+			content:
+				| string
+				| Array<
+						| { type: "text"; text: string }
+						| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+				  >;
 			is_error?: boolean;
 		}>) {
 			parts.push({
@@ -796,6 +866,7 @@ async function* parseAnthropicSSEStream(
 	// Tool call accumulators keyed by content block index
 	const toolAccum = new Map<number, ToolAccumEntry>();
 	const thinkingAccum = new Map<number, ThinkingAccumEntry>();
+	const serverToolAccum = new Map<number, ServerToolAccumEntry>();
 
 	const reader = body.getReader();
 	try {
@@ -831,7 +902,7 @@ async function* parseAnthropicSSEStream(
 					continue;
 				}
 
-				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum);
+				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum, serverToolAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -844,7 +915,7 @@ async function* parseAnthropicSSEStream(
 			try {
 				const jsonStr = remaining.startsWith("data: ") ? remaining.slice(6) : remaining.slice(5);
 				const event = JSON.parse(jsonStr);
-				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum);
+				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum, serverToolAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -882,6 +953,7 @@ function parseAnthropicEvent(
 	event: AnthropicStreamEvent,
 	toolAccum: Map<number, ToolAccumEntry>,
 	thinkingAccum: Map<number, ThinkingAccumEntry>,
+	serverToolAccum: Map<number, ServerToolAccumEntry>,
 ): ParsedStreamEvent[] {
 	const type = event.type;
 	if (!type) return [];
@@ -930,6 +1002,35 @@ function parseAnthropicEvent(
 				},
 			];
 		}
+		// Server-side tool use (web_search) — track but don't emit as local tool call
+		if (block.type === "server_tool_use" && block.id && block.name) {
+			serverToolAccum.set(idx, { id: block.id, name: block.name, args: "" });
+			logger.debug("Anthropic server tool use started", {
+				index: idx,
+				id: block.id,
+				name: block.name,
+			});
+			return [{ webSearch: { id: block.id, status: "in_progress" } }];
+		}
+		// Web search result — emit completion event
+		if (block.type === "web_search_tool_result") {
+			const toolUseId = block.tool_use_id ?? "";
+			// Find the matching server tool entry to get the query
+			let query: string | undefined;
+			for (const [, acc] of serverToolAccum) {
+				if (acc.id === toolUseId) {
+					query = acc.query;
+					break;
+				}
+			}
+			// Check for error response
+			if (block.content && !Array.isArray(block.content)) {
+				const errContent = block.content as { type: string; error_code: string };
+				logger.warn("Anthropic web search error", { error_code: errContent.error_code });
+				return [{ webSearch: { id: toolUseId, status: "completed", query } }];
+			}
+			return [{ webSearch: { id: toolUseId, status: "completed", query } }];
+		}
 		// Thinking block start — initialize signature accumulator
 		if (block.type === "thinking") {
 			thinkingAccum.set(idx, { signature: "" });
@@ -963,6 +1064,24 @@ function parseAnthropicEvent(
 
 		// Tool use input delta
 		if (event.delta.type === "input_json_delta" && event.delta.partial_json != null) {
+			// Server tool accumulator — extract query for web search progress
+			const serverAcc = serverToolAccum.get(idx);
+			if (serverAcc) {
+				serverAcc.args += event.delta.partial_json;
+				try {
+					const match = serverAcc.args.match(/"query"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+					if (match?.[1]) {
+						serverAcc.query = JSON.parse(`"${match[1]}"`);
+						return [
+							{ webSearch: { id: serverAcc.id, status: "searching", query: serverAcc.query } },
+						];
+					}
+				} catch {
+					// ignore partial JSON parse errors
+				}
+				return [];
+			}
+
 			const acc = toolAccum.get(idx);
 			if (acc && !acc.emitted) {
 				acc.args += event.delta.partial_json;

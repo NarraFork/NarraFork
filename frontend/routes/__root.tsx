@@ -46,6 +46,7 @@ import {
 } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { GitMissingAlert } from "../components/GitMissingAlert";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
 import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
@@ -104,12 +105,18 @@ function RootLayout() {
 	const isLoginPage = location.pathname === "/login";
 	const isPublicPage = location.pathname === "/licenses";
 
-	if (isLoginPage) return <Outlet />;
-
-	// Public pages: show inside AppShell if logged in, bare otherwise
-	if (isPublicPage && !getToken()) return <Outlet />;
-
-	return <AuthenticatedLayout />;
+	return (
+		<>
+			<GitMissingAlert />
+			{isLoginPage ? (
+				<Outlet />
+			) : isPublicPage && !getToken() ? (
+				<Outlet />
+			) : (
+				<AuthenticatedLayout />
+			)}
+		</>
+	);
 }
 
 /** Format chars/sec as a human-readable rate string. */

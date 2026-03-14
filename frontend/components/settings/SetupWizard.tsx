@@ -4,6 +4,7 @@ import {
 	Button,
 	Group,
 	Modal,
+	SegmentedControl,
 	Select,
 	Stack,
 	Text,
@@ -16,12 +17,13 @@ import {
 	IconArrowLeft,
 	IconArrowRight,
 	IconCheck,
+	IconNetwork,
 	IconRocket,
 	IconWand,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
@@ -29,7 +31,7 @@ import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
-const TOTAL_STEPS = 5;
+const TOTAL_STEPS = 6;
 
 // Inject pulse keyframes once
 if (typeof document !== "undefined" && !document.getElementById("wizard-fab-style")) {
@@ -136,7 +138,8 @@ export function SetupWizard({
 						{step === 1 && <DepsStep />}
 						{step === 2 && <ProviderStep onMinimize={onMinimize} providerCount={providerCount} />}
 						{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
-						{step === 4 && <CompleteStep />}
+						{step === 4 && <NetworkStep />}
+						{step === 5 && <CompleteStep />}
 					</Box>
 
 					<Group justify="space-between">
@@ -243,7 +246,7 @@ function WizardFab({ minimized, onRestore }: { minimized: boolean; onRestore: ()
 	);
 }
 
-const STEP_KEYS = ["welcome", "deps", "provider", "basic", "complete"];
+const STEP_KEYS = ["welcome", "deps", "provider", "basic", "network", "complete"];
 
 function StepIndicator({ current, total }: { current: number; total: number }) {
 	const { t } = useTranslation("settings");
@@ -434,6 +437,82 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					{t("wizardModelsRequired")}
 				</Text>
 			)}
+		</Stack>
+	);
+}
+
+function NetworkStep() {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+
+	const currentHost = settings?.server?.host ?? "localhost";
+	const lanAddresses: string[] = (settings as { lanAddresses?: string[] })?.lanAddresses ?? [];
+	const firstLan = lanAddresses[0];
+
+	const resolveMode = useCallback(
+		(host: string) => {
+			if (host === "0.0.0.0") return "open";
+			if (firstLan && host === firstLan) return "lan";
+			return "local";
+		},
+		[firstLan],
+	);
+
+	const [mode, setMode] = useState<string>(resolveMode(currentHost));
+
+	const save = useMutation({
+		mutationFn: (host: string) => api.updateSettings({ server: { host } }),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+	});
+
+	// Sync mode from settings when they load
+	useEffect(() => {
+		setMode(resolveMode(currentHost));
+	}, [currentHost, resolveMode]);
+
+	const modeToHost = (value: string) => {
+		if (value === "open") return "0.0.0.0";
+		if (value === "lan" && firstLan) return firstLan;
+		return "localhost";
+	};
+
+	const handleChange = (value: string) => {
+		setMode(value);
+		save.mutate(modeToHost(value));
+	};
+
+	const segmentData = [
+		{ label: t("wizardNetworkLocal"), value: "local" },
+		...(firstLan ? [{ label: t("wizardNetworkLan", { ip: firstLan }), value: "lan" }] : []),
+		{ label: t("wizardNetworkOpen"), value: "open" },
+	];
+
+	const descKey =
+		mode === "open"
+			? "wizardNetworkOpenDesc"
+			: mode === "lan"
+				? "wizardNetworkLanDesc"
+				: "wizardNetworkLocalDesc";
+
+	return (
+		<Stack gap="md">
+			<Stack align="center" gap="xs" pt="sm">
+				<IconNetwork size={36} color="var(--mantine-color-indigo-6)" />
+			</Stack>
+			<Text size="sm" c="dimmed" ta="center">
+				{t("wizardNetworkDesc")}
+			</Text>
+			<SegmentedControl fullWidth value={mode} onChange={handleChange} data={segmentData} />
+			<Text size="xs" c="dimmed">
+				{t(descKey)}
+			</Text>
+			<Text size="xs" c="orange">
+				{t("wizardNetworkRestartHint")}
+			</Text>
 		</Stack>
 	);
 }

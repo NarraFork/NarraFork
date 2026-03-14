@@ -31,6 +31,18 @@ function classifyCodexError(
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
+/** Detect errors caused by a stale or invalid previous_response_id / stored item reference. */
+function isPreviousResponseIdError(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err ?? "");
+	const lower = msg.toLowerCase();
+	return (
+		(lower.includes("not found") && lower.includes("not persisted")) ||
+		(lower.includes("item") &&
+			lower.includes("not found") &&
+			(lower.includes("store") || lower.includes("404")))
+	);
+}
+
 /**
  * Codex provider that uses the centralized credential pool.
  * Wraps OpenAIProvider with dynamic credential selection from CodexManager.
@@ -225,6 +237,21 @@ export class CodexProvider implements ProviderAdapter {
 			} catch (err) {
 				lastError = err;
 				attempt++;
+
+				// Detect 404 errors caused by stale previous_response_id
+				// (e.g. "Item with id 'rs_...' not found. Items are not persisted when store is set to false.")
+				// Retry without previous_response_id so the full history is sent instead.
+				if (params.previousResponseId && !hasStreamedEvents && isPreviousResponseIdError(err)) {
+					logger.warn("Codex previous_response_id stale, retrying without it", {
+						previousResponseId: params.previousResponseId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					params.previousResponseId = undefined;
+					// Don't count this as a credential failure — retry with same credential
+					attempt--;
+					continue;
+				}
+
 				const { classified, hasMore } = this.reportCallError(ctx, err);
 				const shouldRetry =
 					classified.type === "quota_exhausted" &&
@@ -234,6 +261,8 @@ export class CodexProvider implements ProviderAdapter {
 				if (shouldRetry) {
 					this.context = null;
 					this.contextSessionKey = undefined;
+					// Clear previous_response_id — different credential can't access stored responses
+					params.previousResponseId = undefined;
 					logger.info("Codex quota failover: retrying with next credential", {
 						operation: "chat",
 						attempt,
@@ -250,7 +279,12 @@ export class CodexProvider implements ProviderAdapter {
 		throw new Error("Codex chat failed");
 	}
 
-	formatToolResult(toolUseId: string, output: string, isError: boolean): unknown {
+	formatToolResult(
+		toolUseId: string,
+		output: string,
+		isError: boolean,
+		images?: Array<{ format: string; base64: string }>,
+	): unknown {
 		const dummy = new OpenAIProvider({
 			id: "codex",
 			name: "Codex",
@@ -260,7 +294,7 @@ export class CodexProvider implements ProviderAdapter {
 			defaultModel: "gpt-5.3-codex",
 			apiMode: "codex",
 		});
-		return dummy.formatToolResult(toolUseId, output, isError);
+		return dummy.formatToolResult(toolUseId, output, isError, images);
 	}
 
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {

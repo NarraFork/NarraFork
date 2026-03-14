@@ -1040,6 +1040,19 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// User messages — wrap entire bubble in ContentViewer for context menu / swipe
 	if (isUser) {
+		// Tool-loaded notification — render like an info message, not a user bubble
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const toolLoadedBlock = blocks.find((b: any) => b.type === "tool_loaded");
+		if (toolLoadedBlock) {
+			return (
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+					<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+						{toolLoadedBlock.text}
+					</Text>
+				</Paper>
+			);
+		}
+
 		const fullText = blocks
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.filter((b: any) => b.type === "text" && b.text)

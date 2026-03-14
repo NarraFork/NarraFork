@@ -76,6 +76,7 @@ import { handleLoadToolCommand, narratorService } from "../services/narrator-ser
 import {
 	clearBufferedMessages,
 	closeNarrator,
+	continueLastToolUse,
 	editAndRegenerate,
 	getBufferedMessages,
 	interruptNarrator,
@@ -391,7 +392,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	let commandText: string | null = null;
 	const cmdResult = await resolveCommand(message, id, userId);
 	if (cmdResult.resolved && ("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)) {
-		const result = await handleLoadToolCommand(id, cmdResult as LoadToolResult | LoadToolNotFound);
+		const locale = await getUserLanguage(userId);
+		const result = await handleLoadToolCommand(
+			id,
+			cmdResult as LoadToolResult | LoadToolNotFound,
+			locale,
+		);
 		return c.json(result, 200);
 	}
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -474,6 +480,27 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await retryLastMessage(id, locale, replyInUserLanguage);
+	return c.json(result);
+});
+
+// Continue the agent loop — resume from trailing tool_use without a new user message
+narratorRoutes.post("/:id/continue", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+
+	if (narrator.status === "thinking" || narrator.status === "waiting") {
+		throw new ValidationError("Cannot continue while narrator is already running");
+	}
+
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	const result = await continueLastToolUse(id, locale, replyInUserLanguage);
 	return c.json(result);
 });
 

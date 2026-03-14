@@ -87,5 +87,16 @@
 	"mcpEnv": "环境变量",
 	"tabOptionalTools": "可选工具",
 	"optionalToolsDesc": "可选的 Agent 工具，可通过 /load 命令加载到叙述者会话中。在此启用后将默认可用。",
-	"noOptionalTools": "暂无可选工具。"
+	"noOptionalTools": "暂无可选工具。",
+	"tabGlobalPrompt": "全局提示词",
+	"globalPromptDesc": "注入到每个叙述者系统提示词中的全局指令文件。从 ~/.agents/AGENT.md（优先）或 ~/.claude/CLAUDE.md 加载。",
+	"globalPromptEmpty": "未找到全局提示词文件。保存后将自动创建。",
+	"globalPromptActiveFile": "当前文件",
+	"globalPromptCandidates": "候选路径",
+	"globalPromptExists": "存在",
+	"globalPromptNotFound": "不存在",
+	"globalPromptSave": "保存",
+	"globalPromptSaved": "已保存",
+	"globalPromptSaveTo": "保存到",
+	"globalPromptPlaceholder": "输入所有叙述者共享的全局指令..."
 }

@@ -47,14 +47,6 @@ export function useRulerData(projectId: string) {
 	});
 }
 
-export function useSubRulerData(projectId: string, chapterId: string | null) {
-	return useQuery({
-		queryKey: ["ruler", projectId, "sub", chapterId],
-		queryFn: () => api.getSubRulerData(projectId, chapterId!) as Promise<RulerData>,
-		enabled: !!projectId && !!chapterId,
-	});
-}
-
 export function useRulerInfinite(projectId: string) {
 	return useInfiniteQuery({
 		queryKey: ["ruler", projectId],

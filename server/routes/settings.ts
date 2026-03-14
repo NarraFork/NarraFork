@@ -1,3 +1,4 @@
+import { networkInterfaces } from "node:os";
 import { Hono } from "hono";
 import { z } from "zod";
 import { getCodexManager } from "../lib/codex-manager";
@@ -161,6 +162,23 @@ function maskApiKey(key?: string): string {
 	return `${"*".repeat(8)}${key.slice(-4)}`;
 }
 
+/** Get RFC 1918 private IPv4 addresses from network interfaces. */
+function getLanAddresses(): string[] {
+	const nets = networkInterfaces();
+	const result: string[] = [];
+	for (const ifaces of Object.values(nets)) {
+		for (const iface of ifaces ?? []) {
+			if (iface.internal || iface.family !== "IPv4") continue;
+			const a = iface.address;
+			// RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+			if (a.startsWith("10.") || a.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(a)) {
+				result.push(a);
+			}
+		}
+	}
+	return result;
+}
+
 settingsRoutes.get("/", (c) => {
 	const s = loadSettings();
 	const codexManager = getCodexManager();
@@ -185,6 +203,7 @@ settingsRoutes.get("/", (c) => {
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
+		lanAddresses: getLanAddresses(),
 	};
 	return c.json(result);
 });

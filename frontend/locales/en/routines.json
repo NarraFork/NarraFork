@@ -87,5 +87,16 @@
 	"mcpEnv": "Environment Variables",
 	"tabOptionalTools": "Optional Tools",
 	"optionalToolsDesc": "Optional agent tools that can be loaded into a narrator session via /load command. Enable them here to make them available by default.",
-	"noOptionalTools": "No optional tools available."
+	"noOptionalTools": "No optional tools available.",
+	"tabGlobalPrompt": "Global Prompt",
+	"globalPromptDesc": "Global instructions file injected into every narrator's system prompt. Loaded from ~/.agents/AGENT.md (preferred) or ~/.claude/CLAUDE.md.",
+	"globalPromptEmpty": "No global prompt file found. Save to create one.",
+	"globalPromptActiveFile": "Active file",
+	"globalPromptCandidates": "Candidate paths",
+	"globalPromptExists": "exists",
+	"globalPromptNotFound": "not found",
+	"globalPromptSave": "Save",
+	"globalPromptSaved": "Saved",
+	"globalPromptSaveTo": "Save to",
+	"globalPromptPlaceholder": "Enter global instructions for all narrators..."
 }

@@ -6,6 +6,7 @@ import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { api } from "../../lib/api";
 import {
+	evictOldestPages,
 	findMsgByToolUseIdInTree,
 	insertChildIntoCache,
 	type MessageIndex,
@@ -121,6 +122,9 @@ export interface UseNarratorPanelWSReturn {
 	viewers: ViewerInfo[];
 }
 
+/** Max messages to keep in cache while the user is at the bottom. */
+const MAX_LIVE_MESSAGES = 200;
+
 function applyPendingPermissionsToCache(
 	old: MessagesQueryData | undefined,
 	perms: PendingPermission[],
@@ -225,12 +229,29 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, []);
 
 	// Helper: cancel any pending tool chunk RAF and clear temporary streaming tool state.
-	const cancelPendingToolChunks = useCallback((notify = true) => {
-		pendingToolChunkRef.current.clear();
+	// Only clears top-level chunks by default — subagent pending chunks (those with
+	// parentToolUseId) are preserved so concurrent subagents don't lose their streaming
+	// state when the parent narrator's assistant message arrives or another subagent
+	// completes. Pass includeSubagent=true for terminal cleanup (status change, error).
+	const cancelPendingToolChunks = useCallback((notify = true, includeSubagent = false) => {
+		if (includeSubagent) {
+			pendingToolChunkRef.current.clear();
+		} else {
+			// Only remove top-level entries; keep subagent chunks intact.
+			// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
+			for (const [key, chunk] of pendingToolChunkRef.current) {
+				if (!chunk.parentToolUseId) {
+					pendingToolChunkRef.current.delete(key);
+				}
+			}
+		}
 		const hadTopLevelChunks = topLevelStreamingChunkRef.current.size > 0;
 		topLevelStreamingChunkRef.current.clear();
 		topLevelStreamingCreatedAtRef.current = null;
-		if (toolChunkRafRef.current) {
+		// Only cancel the RAF if no subagent chunks remain to be flushed.
+		// When subagent chunks survive, the next RAF tick will consume them
+		// normally (the RAF callback calls pending.clear() after processing).
+		if (toolChunkRafRef.current && pendingToolChunkRef.current.size === 0) {
 			cancelAnimationFrame(toolChunkRafRef.current);
 			toolChunkRafRef.current = 0;
 		}
@@ -654,80 +675,109 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (wsData.message?.role === "assistant") {
 						// New assistant message means any pending retry succeeded
 						setRetryInfo((prev) => (prev ? null : prev));
-						if (streamingRef.current) {
-							streamingRef.current = "";
+						// Only clear top-level streaming state for non-subagent messages.
+						// Subagent assistant messages should NOT reset the parent narrator's
+						// streaming text, tool chunks, or streaming version — the parent
+						// may still be actively streaming while subagents complete.
+						if (!newMsg.parentToolUseId) {
+							if (streamingRef.current) {
+								streamingRef.current = "";
+							}
+							if (streamingReasoningRef.current) {
+								streamingReasoningRef.current = "";
+							}
+							webSearchRef.current = null;
+							clearStreamingState();
+							// Clear pending RAF chunks — real message supersedes synthetic state.
+							// Notify (bump version) so topLevelStreamingChunks memo recomputes
+							// to null immediately, since onToolStarted/onToolCompleted no longer
+							// remove individual entries from the streaming ref.
+							cancelPendingToolChunks(true);
+							removeStreamingChunksMsg(qc, messagesQueryKey);
 						}
-						if (streamingReasoningRef.current) {
-							streamingReasoningRef.current = "";
-						}
-						webSearchRef.current = null;
-						clearStreamingState();
-						// Clear pending RAF chunks — real message supersedes synthetic state.
-						// Notify (bump version) so topLevelStreamingChunks memo recomputes
-						// to null immediately, since onToolStarted/onToolCompleted no longer
-						// remove individual entries from the streaming ref.
-						cancelPendingToolChunks(true);
-						removeStreamingChunksMsg(qc, messagesQueryKey);
 					}
 					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
+						// Atomic remove-synthetic + insert-real in a single setQueryData
+						// to avoid an intermediate render where the card disappears.
 						const ptuId = newMsg.parentToolUseId;
 						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 							if (!old?.pages?.length) return old;
-							return removeSubagentStreamingChunk(old, ptuId, toolUseIndexRef.current);
+							let result = removeSubagentStreamingChunk(old, ptuId, toolUseIndexRef.current);
+							result = insertChildIntoCache(
+								result,
+								newMsg,
+								toolUseIndexRef.current,
+							) as MessagesQueryData;
+							return result;
 						});
-					}
-					const isNewCompactMsg =
-						newMsg.role === "system" &&
-						Array.isArray(newMsg.contentJson) &&
-						newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
+					} else if (newMsg.parentToolUseId) {
+						// Non-assistant subagent message (e.g. user/system) — insert
+						// into the message tree rather than appending as top-level.
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+							if (!old?.pages?.length) return old;
+							return insertChildIntoCache(
+								old,
+								newMsg,
+								toolUseIndexRef.current,
+							) as MessagesQueryData;
+						});
+					} else {
+						const isNewCompactMsg =
+							newMsg.role === "system" &&
+							Array.isArray(newMsg.contentJson) &&
+							newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
 
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-						if (newMsg.parentToolUseId) {
-							return insertChildIntoCache(old, newMsg, toolUseIndexRef.current);
-						}
-						const pages = [...old.pages];
-						const firstPage = { ...pages[0] };
-						const existingIdx = firstPage.messages.findIndex(
-							(m: NarratorMsg) => m.id === newMsg.id,
-						);
-						if (existingIdx !== -1) {
-							const updated = [...firstPage.messages];
-							updated[existingIdx] = newMsg;
-							firstPage.messages = updated;
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+							if (!old?.pages?.length) return old;
+							const pages = [...old.pages];
+							const firstPage = { ...pages[0] };
+							const existingIdx = firstPage.messages.findIndex(
+								(m: NarratorMsg) => m.id === newMsg.id,
+							);
+							if (existingIdx !== -1) {
+								const updated = [...firstPage.messages];
+								updated[existingIdx] = newMsg;
+								firstPage.messages = updated;
+								pages[0] = firstPage;
+								return { ...old, pages };
+							}
+							if (isNewCompactMsg) return old;
+							if (!isAtBottomRef.current && newMsg.role === "assistant") {
+								setUnreadCount((c) => c + 1);
+							}
+							// Replace a matching optimistic message by content, or append.
+							// Optimistic messages are only created with role "user", so for
+							// assistant messages this simply appends without scanning.
+							const optimisticIdx =
+								newMsg.role === "user"
+									? firstPage.messages.findIndex(
+											(m: NarratorMsg) =>
+												String(m.id).startsWith("optimistic-") &&
+												m.role === "user" &&
+												m.contentText === newMsg.contentText,
+										)
+									: -1;
+							if (optimisticIdx !== -1) {
+								const updated = [...firstPage.messages];
+								const om = updated[optimisticIdx];
+								revokeContentBlockPreviewUrls(om.contentJson);
+								updated[optimisticIdx] = newMsg;
+								firstPage.messages = updated;
+							} else {
+								firstPage.messages = [...firstPage.messages, newMsg];
+							}
 							pages[0] = firstPage;
-							return { ...old, pages };
+							// Evict oldest pages in the same callback to avoid an
+							// intermediate render with the full (pre-evict) data.
+							let result: MessagesQueryData = { ...old, pages };
+							if (isAtBottomRef.current) {
+								result = evictOldestPages(result, MAX_LIVE_MESSAGES) as MessagesQueryData;
+							}
+							return result;
+						});
+						if (isNewCompactMsg) {
+							qc.invalidateQueries({ queryKey: messagesQueryKey });
 						}
-						if (isNewCompactMsg) return old;
-						if (!isAtBottomRef.current && newMsg.role === "assistant") {
-							setUnreadCount((c) => c + 1);
-						}
-						// Replace a matching optimistic message by content, or append.
-						// Optimistic messages are only created with role "user", so for
-						// assistant messages this simply appends without scanning.
-						const optimisticIdx =
-							newMsg.role === "user"
-								? firstPage.messages.findIndex(
-										(m: NarratorMsg) =>
-											String(m.id).startsWith("optimistic-") &&
-											m.role === "user" &&
-											m.contentText === newMsg.contentText,
-									)
-								: -1;
-						if (optimisticIdx !== -1) {
-							const updated = [...firstPage.messages];
-							const om = updated[optimisticIdx];
-							revokeContentBlockPreviewUrls(om.contentJson);
-							updated[optimisticIdx] = newMsg;
-							firstPage.messages = updated;
-						} else {
-							firstPage.messages = [...firstPage.messages, newMsg];
-						}
-						pages[0] = firstPage;
-						return { ...old, pages };
-					});
-					if (isNewCompactMsg) {
-						qc.invalidateQueries({ queryKey: messagesQueryKey });
 					}
 				} else {
 					qc.invalidateQueries({ queryKey: messagesQueryKey });
@@ -770,7 +820,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						firstPage.messages = [...firstPage.messages, newMsg];
 					}
 					pages[0] = firstPage;
-					return { ...old, pages };
+					// Evict oldest pages in the same callback to avoid double render
+					let result: MessagesQueryData = { ...old, pages };
+					if (isAtBottomRef.current) {
+						result = evictOldestPages(result, MAX_LIVE_MESSAGES) as MessagesQueryData;
+					}
+					return result;
 				});
 			},
 			onToolCompleted: (
@@ -1061,7 +1116,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (isTerminal) {
 					// Cancel any pending RAF tool chunk flush and notify so the memo
 					// recomputes — otherwise stale streaming tool blocks linger on screen.
-					cancelPendingToolChunks(true);
+					// Include subagent chunks since the entire session is done.
+					cancelPendingToolChunks(true, true);
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1126,14 +1182,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setIsCompacting(false);
 				setPruneBoundaryMessageId(null);
 				setPrunedPercent(null);
-				cancelPendingToolChunks();
+				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
 			onNarratorError: (error) => {
 				// Session error may leave synthetic streaming chunks in the cache.
-				cancelPendingToolChunks(false);
+				cancelPendingToolChunks(false, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				if (streamingRef.current) {
 					streamingRef.current = "";
@@ -1173,7 +1229,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onCatchUp: (orphanChildren, topLevel) => {
 				// Clean up any residual streaming chunks from before the disconnect
-				cancelPendingToolChunks();
+				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
@@ -1203,6 +1259,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							result = { ...result, pages };
 						}
 					}
+					// Evict oldest pages in the same callback to avoid double render
+					if (isAtBottomRef.current) {
+						result = evictOldestPages(result, MAX_LIVE_MESSAGES) as MessagesQueryData;
+					}
 					return result;
 				});
 				if (isAtBottomRef.current) {
@@ -1211,7 +1271,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onFullReload: () => {
 				// Clean up synthetic streaming state before full reload.
-				cancelPendingToolChunks(false);
+				cancelPendingToolChunks(false, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				if (streamingRef.current) {
 					streamingRef.current = "";

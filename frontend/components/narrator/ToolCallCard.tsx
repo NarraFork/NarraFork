@@ -832,9 +832,24 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 		<Box mt="xs">
 			{cmd && (
 				<ContentViewer
-					content={`$ ${cmd}`}
+					content={cmd}
 					style={{ ...termStyle, maxHeight: 60 }}
 					title="Command"
+					renderContent={(wordWrap) => (
+						<Code
+							block
+							style={{
+								...termStyle,
+								maxHeight: 60,
+								...(wordWrap
+									? { whiteSpace: "pre-wrap", wordBreak: "break-all", overflowX: "hidden" }
+									: { whiteSpace: "pre", overflowX: "auto" }),
+								maxWidth: "100%",
+							}}
+						>
+							{`$ ${cmd}`}
+						</Code>
+					)}
 				/>
 			)}
 			{isRunning && streamingOutput && (
@@ -1057,6 +1072,91 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function ShareFilePreview({
+	previewUrl,
+	previewType,
+	filename,
+}: {
+	previewUrl: string;
+	previewType: string;
+	filename: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const [error, setError] = useState(false);
+
+	if (error) {
+		return (
+			<Text size="xs" c="dimmed" mt="xs">
+				{t("shareFile.previewFailed")}
+			</Text>
+		);
+	}
+
+	if (previewType === "image") {
+		return (
+			<Box mt="xs">
+				<img
+					src={previewUrl}
+					alt={filename}
+					onError={() => setError(true)}
+					style={{
+						maxWidth: "100%",
+						maxHeight: 400,
+						borderRadius: "var(--mantine-radius-sm)",
+						objectFit: "contain",
+						display: "block",
+					}}
+				/>
+			</Box>
+		);
+	}
+
+	if (previewType === "video") {
+		return (
+			<Box mt="xs">
+				{/* biome-ignore lint/a11y/useMediaCaption: user-shared file, no captions available */}
+				<video
+					src={previewUrl}
+					controls
+					onError={() => setError(true)}
+					style={{
+						maxWidth: "100%",
+						maxHeight: 400,
+						borderRadius: "var(--mantine-radius-sm)",
+						display: "block",
+					}}
+				/>
+			</Box>
+		);
+	}
+
+	if (previewType === "pdf" || previewType === "html") {
+		return (
+			<Box mt="xs">
+				<iframe
+					src={previewUrl}
+					title={filename}
+					onError={() => setError(true)}
+					// HTML: allow-same-origin only (no allow-scripts) — sanitized HTML
+					// doesn't need JS execution, and omitting scripts prevents XSS.
+					// PDF: allow-same-origin + allow-scripts — the browser's built-in
+					// PDF viewer (pdf.js) requires script execution to render.
+					sandbox={previewType === "html" ? "allow-same-origin" : "allow-same-origin allow-scripts"}
+					style={{
+						width: "100%",
+						height: 400,
+						border: "1px solid var(--mantine-color-default-border)",
+						borderRadius: "var(--mantine-radius-sm)",
+						background: "var(--mantine-color-body)",
+					}}
+				/>
+			</Box>
+		);
+	}
+
+	return null;
+}
+
 function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
@@ -1070,6 +1170,9 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const compressed = meta?.compressed as boolean | undefined;
 	const format = meta?.format as string | undefined;
 	const fileCount = meta?.fileCount as number | undefined;
+	const preview = meta?.preview as boolean | undefined;
+	const previewType = meta?.previewType as string | undefined;
+	const previewUrl = meta?.previewUrl as string | undefined;
 
 	const expiresLabel = useMemo(() => {
 		if (!expiresAt) return null;
@@ -1131,6 +1234,11 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 									{t("shareFile.fileCount", { count: fileCount })}
 								</Badge>
 							)}
+							{preview && previewType && (
+								<Badge size="xs" variant="light" color="teal">
+									{t("shareFile.preview")}
+								</Badge>
+							)}
 							{expiresLabel && (
 								<Tooltip label={`Expires: ${expiresLabel}`} withArrow>
 									<Badge size="xs" variant="light" color="yellow">
@@ -1153,6 +1261,9 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						{t("shareFile.download")}
 					</Button>
 				</Group>
+				{preview && previewUrl && previewType && (
+					<ShareFilePreview previewUrl={previewUrl} previewType={previewType} filename={filename} />
+				)}
 			</Paper>
 		</Box>
 	);
@@ -1198,11 +1309,12 @@ const TODO_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }
 function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const latestToolUseId = useContext(LatestTodosToolUseIdCtx);
 	const isLatest = !!toolCall.toolUseId && toolCall.toolUseId === latestToolUseId;
-	const todos: { content?: string; status?: string }[] = isTruncated(toolCall.inputJson)
+	const raw = isTruncated(toolCall.inputJson)
 		? isTruncated(toolCall.outputJson)
 			? []
-			: (toolCall.outputJson?.todos ?? [])
-		: (toolCall.inputJson?.todos ?? toolCall.outputJson?.todos ?? []);
+			: toolCall.outputJson?.todos
+		: (toolCall.inputJson?.todos ?? toolCall.outputJson?.todos);
+	const todos: { content?: string; status?: string }[] = Array.isArray(raw) ? raw : [];
 
 	if (!todos.length) {
 		return <GenericDetail toolCall={toolCall} />;
@@ -1693,6 +1805,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		(!!pendingPermission ||
 			toolCall.status === "pending" ||
 			cat === "todo" ||
+			cat === "share" ||
 			(cat === "plan" && !isDeniedPlan) ||
 			(isEdit && !isFailedEdit) ||
 			(isFailed && !isEdit && !isDeniedPlan));
@@ -2048,12 +2161,12 @@ if (typeof document !== "undefined") {
   border-bottom-left-radius: 0 !important;
   border-bottom-right-radius: 0 !important;
   overflow: visible !important;
-  border-bottom: none !important;
+  border-bottom-color: transparent !important;
 }
 [data-tool-run]:has(+ [data-tool-run].merge-top) .mantine-Paper-root {
   border-bottom-left-radius: 0 !important;
   border-bottom-right-radius: 0 !important;
-  border-bottom: none !important;
+  border-bottom-color: transparent !important;
 }`;
 		document.head.appendChild(style);
 	}

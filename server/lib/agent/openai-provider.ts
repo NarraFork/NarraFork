@@ -380,18 +380,80 @@ export class OpenAIProvider implements ProviderAdapter {
 				}
 			}
 
-			const sanitizedInputMessages = inputMessages.filter((msg) => {
-				if (msg.role !== "assistant") return true;
-				// Responses API rejects assistant role messages with null/empty content and no tool calls.
-				const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-				if (hasToolCalls) return true;
-				if (typeof msg.content === "string") return msg.content.length > 0;
-				if (Array.isArray(msg.content)) return msg.content.length > 0;
-				return false;
-			});
-			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages);
+			// Codex with previous_response_id: send only incremental input (tool results + user message).
+			// The server already has the full conversation history from the stored response.
+			const useStoredState = this.apiMode === "codex" && !!params.previousResponseId;
 
-			body = { model, input: responsesInput, stream: true, store: false };
+			let responsesInput: OAIMessage[];
+			if (useStoredState) {
+				// Incremental mode: only new items since the last response.
+				// inputMessages at this point already excludes developer/system messages.
+				// We only need the tool results and user message appended in chat().
+				// These are the items added AFTER the history array (tool results + current user msg).
+				const incrementalMessages: OAIMessage[] = [];
+				// Tool results were appended to messages after history
+				for (const tr of params.toolResults as Array<{
+					type: string;
+					call_id: string;
+					output: string;
+				}>) {
+					// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
+					incrementalMessages.push(tr as any);
+				}
+				// Current user message (if any, already appended to messages)
+				if (params.content && params.content !== ".") {
+					if (params.images?.length) {
+						const parts: OAIContentPart[] = [{ type: "input_text", text: params.content }];
+						for (const img of params.images) {
+							parts.push({
+								type: "input_image",
+								image_url: `data:image/${img.format};base64,${img.base64}`,
+							});
+						}
+						incrementalMessages.push({
+							role: "user",
+							content: parts,
+						} as unknown as OAIMessage);
+					} else {
+						incrementalMessages.push({
+							role: "user",
+							content: [{ type: "input_text", text: params.content }],
+						} as unknown as OAIMessage);
+					}
+				} else if ((params.toolResults as unknown[]).length === 0) {
+					incrementalMessages.push({
+						role: "user",
+						content: [{ type: "input_text", text: params.content }],
+					} as unknown as OAIMessage);
+				}
+				responsesInput = incrementalMessages;
+			} else {
+				const sanitizedInputMessages = inputMessages.filter((msg) => {
+					if (msg.role !== "assistant") return true;
+					// Responses API rejects assistant role messages with null/empty content and no tool calls.
+					const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+					if (hasToolCalls) return true;
+					if (typeof msg.content === "string") return msg.content.length > 0;
+					if (Array.isArray(msg.content)) return msg.content.length > 0;
+					return false;
+				});
+				responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages);
+			}
+
+			// Codex uses store: true for server-side response persistence (enables
+			// previous_response_id chaining and avoids 404 errors for reasoning items).
+			// Non-Codex Responses API keeps store: false.
+			const storeResponse = this.apiMode === "codex";
+			body = { model, input: responsesInput, stream: true, store: storeResponse };
+
+			if (useStoredState) {
+				body.previous_response_id = params.previousResponseId;
+			}
+
+			// Codex: enable server-side auto-truncation to handle context window overflow.
+			if (this.apiMode === "codex") {
+				body.truncation = "auto";
+			}
 			if (instructions) {
 				body.instructions = instructions;
 			} else if (this.apiMode === "codex") {
@@ -428,6 +490,9 @@ export class OpenAIProvider implements ProviderAdapter {
 				inputMessageCount: responsesInput.length,
 				toolCount: tools.length,
 				reasoningEffort: params.reasoningEffort,
+				previousResponseId: params.previousResponseId ?? null,
+				store: storeResponse,
+				useStoredState,
 			});
 		} else {
 			// Completions: POST /chat/completions
@@ -503,7 +568,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 	}
 
-	formatToolResult(toolUseId: string, output: string, _isError: boolean): unknown {
+	formatToolResult(
+		toolUseId: string,
+		output: string,
+		_isError: boolean,
+		_images?: Array<{ format: string; base64: string }>,
+	): unknown {
 		logger.debug("OpenAI formatToolResult", {
 			apiMode: this.apiMode,
 			toolUseId,
@@ -997,6 +1067,13 @@ function parseResponsesAPIEvent(
 				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
 			},
 		});
+	}
+
+	// ── Response created: capture response ID for previous_response_id chaining ──
+	if (type === "response.created" && chunk.response?.id) {
+		logger.debug("Responses API response created", { responseId: chunk.response.id });
+		results.push({ responseId: chunk.response.id });
+		return results;
 	}
 
 	// ── Text streaming ──

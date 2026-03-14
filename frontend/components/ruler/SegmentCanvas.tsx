@@ -1,14 +1,20 @@
 import { Badge, Box, Card, Group, Loader, Text } from "@mantine/core";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { RulerSegment } from "../../hooks/useRuler";
 import { api } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
-import { getSubRulerRenderMode } from "./focus-stack";
-import { SubRuler } from "./SubRuler";
 import type { RulerOrientation } from "./types";
 import type { ZoomTierId } from "./zoom-tiers";
+
+type CardMode = "dot" | "compact" | "full";
+
+function getCardMode(zoomTier: ZoomTierId): CardMode {
+	if (zoomTier === "L0" || zoomTier === "L1") return "dot";
+	if (zoomTier === "L2") return "compact";
+	return "full";
+}
 
 /** Active segments refresh faster; historical ones can be stale longer. */
 function getSegmentStaleTime(segment: RulerSegment): number {
@@ -82,8 +88,6 @@ interface SegmentCanvasProps {
 	onFitToView?: (worldX: number, worldY: number, worldW: number, worldH: number) => void;
 	/** Current zoom tier — controls card interactivity and connector visibility */
 	zoomTier?: ZoomTierId;
-	/** Current focus depth for sub-ruler render mode calculation */
-	focusDepth?: number;
 	/** Performance degradation level (0=normal, 1=reduced, 2=minimal) */
 	degradeLevel?: number;
 }
@@ -94,6 +98,7 @@ const DEFAULT_PANEL_WIDTH = 420;
 const DEFAULT_PANEL_HEIGHT = 520;
 const MIN_PANEL_WIDTH = 300;
 const MIN_PANEL_HEIGHT = 200;
+const CARD_TOP_OFFSET = 30;
 /** Cards (collapsed) are rendered within 3× the cross-axis viewport */
 const CARD_CROSS_MULTIPLIER = 3;
 /** Expanded narrator panels are rendered within 1.5× the cross-axis viewport */
@@ -116,30 +121,27 @@ export const SegmentCanvas = memo(
 		tickPositions,
 		onFitToView,
 		zoomTier = "L2",
-		focusDepth = 0,
 		degradeLevel = 0,
 	}: SegmentCanvasProps) {
 		const queryClient = useQueryClient();
 		const isH = orientation === "horizontal";
+		const cardMode = getCardMode(zoomTier);
 		const { data, isLoading } = useQuery({
-			queryKey: ["rulerSegment", projectId, fromSha],
-			queryFn: () => api.getRulerSegment(projectId, fromSha, toSha) as Promise<SegmentData>,
+			queryKey: ["rulerSegment", projectId, fromSha, cardMode],
+			queryFn: () =>
+				api.getRulerSegment(
+					projectId,
+					fromSha,
+					toSha,
+					cardMode === "full" ? "full" : "summary",
+				) as Promise<SegmentData>,
 			staleTime: getSegmentStaleTime(_segment),
 			placeholderData: _segment.activeChapterCount === 0 ? keepPreviousData : undefined,
+			enabled: cardMode !== "dot",
 		});
 
-		const [expandedChapters, setExpandedChapters] = useState<Set<string>>(new Set());
 		const [openNarratorId, setOpenNarratorId] = useState<string | null>(null);
 		const prevOpenNarratorIdRef = useRef<string | null>(null);
-
-		const toggleChapterExpand = useCallback((chId: string) => {
-			setExpandedChapters((prev) => {
-				const next = new Set(prev);
-				if (next.has(chId)) next.delete(chId);
-				else next.add(chId);
-				return next;
-			});
-		}, []);
 
 		const chapters = data?.chapters ?? [];
 
@@ -185,7 +187,7 @@ export const SegmentCanvas = memo(
 						id: ch.id,
 						title: ch.title,
 						worldX: (isH ? mainPos : 0) + ch.layoutX,
-						worldY: (isH ? 0 : mainPos) + ch.layoutY + 30,
+						worldY: (isH ? 0 : mainPos) + ch.layoutY + CARD_TOP_OFFSET,
 						worldW: isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH,
 						worldH: isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT,
 						status: ch.status,
@@ -214,13 +216,133 @@ export const SegmentCanvas = memo(
 			const panelH = ch.panelHeight ?? DEFAULT_PANEL_HEIGHT;
 			// Card world position: mainPos offsets the segment, +30 is the card top offset
 			const worldX = (isH ? mainPos : 0) + ch.layoutX;
-			const worldY = (isH ? 0 : mainPos) + ch.layoutY + 30;
+			const worldY = (isH ? 0 : mainPos) + ch.layoutY + CARD_TOP_OFFSET;
 			onFitToView(worldX, worldY, panelW, panelH);
 		}, [openNarratorId, laid, mainPos, isH, onFitToView]);
 
 		// Segment spans the full visible viewport in the cross-axis direction
 		const segCrossStart = viewTop - 20;
 		const segCrossSize = viewHeight + 40;
+
+		// --- Dot mode: render status dots from segment summary (no backend request) ---
+		if (cardMode === "dot") {
+			const dotSize = 6;
+			const dotGap = 4;
+			const totalDots = _segment.totalChapterCount;
+			const activeDots = _segment.activeChapterCount;
+			return (
+				<Box
+					style={{
+						position: "absolute",
+						...(isH
+							? {
+									left: mainPos,
+									top: segCrossStart,
+									width: mainSize,
+									height: segCrossSize,
+								}
+							: {
+									top: mainPos,
+									left: segCrossStart,
+									height: mainSize,
+									width: segCrossSize,
+								}),
+						display: "flex",
+						alignItems: "center",
+						justifyContent: "center",
+						gap: dotGap,
+						flexDirection: isH ? "row" : "column",
+						pointerEvents: "none",
+					}}
+				>
+					{Array.from({ length: totalDots }, (_, idx) => {
+						const key = `dot-${idx}`;
+						return (
+							<Box
+								key={key}
+								style={{
+									width: dotSize,
+									height: dotSize,
+									borderRadius: "50%",
+									background:
+										idx < activeDots
+											? "var(--mantine-color-green-5)"
+											: "var(--mantine-color-dimmed)",
+								}}
+							/>
+						);
+					})}
+				</Box>
+			);
+		}
+
+		// --- Compact mode: simplified small cards ---
+		if (cardMode === "compact") {
+			return (
+				<Box
+					style={{
+						position: "absolute",
+						...(isH
+							? {
+									left: mainPos,
+									top: segCrossStart + 4,
+									width: mainSize,
+									height: segCrossSize - 8,
+								}
+							: {
+									top: mainPos,
+									left: segCrossStart + 4,
+									height: mainSize,
+									width: segCrossSize - 8,
+								}),
+						display: "flex",
+						flexWrap: "wrap",
+						gap: 4,
+						alignItems: "flex-start",
+						alignContent: "flex-start",
+						...(isH ? { flexDirection: "row" } : { flexDirection: "column" }),
+					}}
+				>
+					{(data?.chapters ?? []).map((ch: SegmentChapter) => (
+						<Box
+							key={ch.id}
+							style={{
+								display: "flex",
+								alignItems: "center",
+								gap: 4,
+								padding: "2px 6px",
+								borderRadius: 4,
+								background: "var(--mantine-color-default-hover)",
+								maxWidth: 120,
+								overflow: "hidden",
+							}}
+						>
+							<Box
+								style={{
+									width: 6,
+									height: 6,
+									borderRadius: "50%",
+									flexShrink: 0,
+									background:
+										ch.status === "active"
+											? "var(--mantine-color-green-5)"
+											: ch.status === "merged"
+												? "var(--mantine-color-blue-5)"
+												: ch.status === "dormant"
+													? "var(--mantine-color-yellow-5)"
+													: "var(--mantine-color-dimmed)",
+								}}
+							/>
+							<Text size="xs" truncate style={{ fontSize: 10, lineHeight: 1.2 }}>
+								{ch.title}
+							</Text>
+						</Box>
+					))}
+				</Box>
+			);
+		}
+
+		// --- Full mode: interactive cards with panels ---
 
 		const containerStyle: React.CSSProperties = {
 			position: "absolute",
@@ -274,7 +396,6 @@ export const SegmentCanvas = memo(
 					{laid.map((ch) => {
 						const isPanelOpen =
 							zoomTier !== "L2" && openNarratorId === ch.narratorId && !!ch.narratorId;
-						const isSubRulerOpen = expandedChapters.has(ch.id);
 						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
 						const cardHeight = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
 
@@ -283,7 +404,7 @@ export const SegmentCanvas = memo(
 						const bufferHalf = (viewHeight * multiplier - viewHeight) / 2;
 						const cullTop = viewTop - bufferHalf;
 						const cullBottom = viewTop + viewHeight + bufferHalf;
-						const cardTop = ch.layoutY + 30; // CARD_TOP_OFFSET
+						const cardTop = ch.layoutY + CARD_TOP_OFFSET;
 						const cardBottom = cardTop + cardHeight;
 						if (cardBottom < cullTop || cardTop > cullBottom) return null;
 
@@ -295,19 +416,14 @@ export const SegmentCanvas = memo(
 									y={ch.layoutY}
 									width={cardWidth}
 									height={cardHeight}
-									isExpanded={isSubRulerOpen}
 									isPanelOpen={isPanelOpen}
 									scale={scale}
 									onClick={() => {
-										if (zoomTier === "L2") {
-											toggleChapterExpand(ch.id);
-											return;
-										}
+										if (zoomTier === "L2") return;
 										if (ch.narratorId) {
 											setOpenNarratorId(openNarratorId === ch.narratorId ? null : ch.narratorId);
 										}
 									}}
-									onDoubleClick={() => toggleChapterExpand(ch.id)}
 									onContextMenu={(e) => {
 										e.preventDefault();
 										e.stopPropagation();
@@ -321,7 +437,7 @@ export const SegmentCanvas = memo(
 									onDragEnd={(newX, newY) => {
 										const clampedY = Math.max(0, newY);
 										queryClient.setQueryData<SegmentData>(
-											["rulerSegment", projectId, fromSha],
+											["rulerSegment", projectId, fromSha, cardMode],
 											(old) => {
 												if (!old) return old;
 												return {
@@ -345,7 +461,7 @@ export const SegmentCanvas = memo(
 										const newAxisOffset = ch.layoutX + dx;
 										const newCrossOffset = Math.max(0, ch.layoutY + dy);
 										queryClient.setQueryData<SegmentData>(
-											["rulerSegment", projectId, fromSha],
+											["rulerSegment", projectId, fromSha, cardMode],
 											(old) => {
 												if (!old) return old;
 												return {
@@ -376,26 +492,6 @@ export const SegmentCanvas = memo(
 										]);
 									}}
 								/>
-								{isSubRulerOpen && ch.status === "active" && (
-									<Box
-										style={{
-											position: "absolute",
-											left: ch.layoutX,
-											top: ch.layoutY + 30 + cardHeight + 4,
-											width: Math.min(cardWidth + 100, mainSize - ch.layoutX - 8),
-										}}
-									>
-										<SubRuler
-											projectId={projectId}
-											chapterId={ch.id}
-											chapterTitle={ch.title}
-											width={Math.min(cardWidth + 100, mainSize - ch.layoutX - 8)}
-											depth={0}
-											orientation={orientation}
-											renderMode={getSubRulerRenderMode(1, focusDepth)}
-										/>
-									</Box>
-								)}
 							</Box>
 						);
 					})}
@@ -420,7 +516,6 @@ export const SegmentCanvas = memo(
 		if (prev.viewTop !== next.viewTop) return false;
 		if (prev.viewHeight !== next.viewHeight) return false;
 		if (prev.zoomTier !== next.zoomTier) return false;
-		if (prev.focusDepth !== next.focusDepth) return false;
 		if (prev.degradeLevel !== next.degradeLevel) return false;
 		return true;
 	},
@@ -447,8 +542,6 @@ interface ConnectorLinesProps {
 	tickPositions?: Map<string, number>;
 	openNarratorId: string | null;
 }
-
-const CARD_TOP_OFFSET = 30; // ChapterCard uses top: currentY + 30
 
 function ConnectorLines({
 	chapters,
@@ -554,11 +647,9 @@ function ChapterCard({
 	y,
 	width: cardWidth,
 	height,
-	isExpanded,
 	isPanelOpen,
 	scale,
 	onClick,
-	onDoubleClick,
 	onContextMenu,
 	onDragEnd,
 	onResizeEnd,
@@ -568,11 +659,9 @@ function ChapterCard({
 	y: number;
 	width: number;
 	height: number;
-	isExpanded?: boolean;
 	isPanelOpen?: boolean;
 	scale: number;
 	onClick?: () => void;
-	onDoubleClick?: () => void;
 	onContextMenu: (e: React.MouseEvent) => void;
 	onDragEnd?: (newX: number, newY: number) => void;
 	onResizeEnd?: (newW: number, newH: number, dx: number, dy: number) => void;
@@ -679,13 +768,11 @@ function ChapterCard({
 
 	const borderColor = isPanelOpen
 		? "var(--mantine-color-indigo-3)"
-		: isExpanded
-			? "var(--mantine-color-indigo-4)"
-			: isReview
-				? "var(--mantine-color-yellow-6)"
-				: isActive
-					? "var(--mantine-color-indigo-6)"
-					: "light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-4))";
+		: isReview
+			? "var(--mantine-color-yellow-6)"
+			: isActive
+				? "var(--mantine-color-indigo-6)"
+				: "light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-4))";
 
 	const currentX = x + dragOffset.dx + resizeDelta.dx;
 	const currentY = y + dragOffset.dy + resizeDelta.dy;
@@ -739,13 +826,13 @@ function ChapterCard({
 		<Card
 			ref={cardRef}
 			shadow="sm"
-			padding="xs"
-			radius="md"
+			padding={6}
+			radius="sm"
 			withBorder
 			style={{
 				position: "absolute",
 				left: currentX,
-				top: currentY + 30,
+				top: currentY + CARD_TOP_OFFSET,
 				width: displayW,
 				height: displayH,
 				borderColor,
@@ -807,10 +894,6 @@ function ChapterCard({
 				}
 			}}
 			onContextMenu={onContextMenu}
-			onDoubleClick={(e) => {
-				e.stopPropagation();
-				onDoubleClick?.();
-			}}
 		>
 			{/* Resize handles — only when panel is open */}
 			{isPanelOpen &&
@@ -840,24 +923,24 @@ function ChapterCard({
 
 			{/* Header */}
 			<Box ref={headerRef} style={{ cursor: "pointer" }}>
-				<Text size="xs" fw={600} truncate>
+				<Text size="11px" fw={600} truncate>
 					{chapter.title}
 				</Text>
-				<Group gap={4} mt={4}>
+				<Group gap={3} mt={2}>
 					<Badge size="xs" variant="light" color={isActive ? "green" : "gray"}>
 						{chapter.status}
 					</Badge>
 					{chapter.narratorStatus && (
-						<Box style={{ display: "flex", alignItems: "center", gap: 3 }}>
+						<Box style={{ display: "flex", alignItems: "center", gap: 2 }}>
 							<Box
 								style={{
-									width: 5,
-									height: 5,
+									width: 4,
+									height: 4,
 									borderRadius: "50%",
 									background: `var(--mantine-color-${NARRATOR_STATUS_COLORS[chapter.narratorStatus] ?? "gray"}-5)`,
 								}}
 							/>
-							<Text size="9px" c="dimmed">
+							<Text size="8px" c="dimmed">
 								{chapter.narratorStatus}
 							</Text>
 						</Box>

@@ -36,6 +36,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import type { CustomModelEntry } from "./InlineCustomModels";
+import { InlineCustomModels } from "./InlineCustomModels";
 
 function relativeTime(iso: string | undefined): string {
 	if (!iso) return "-";
@@ -49,13 +51,25 @@ function relativeTime(iso: string | undefined): string {
 interface CodexSectionProps {
 	hiddenModels: string[];
 	onToggleHidden: (modelVal: string) => void;
+	customModels: CustomModelEntry[];
+	onCustomModelsChange: (models: CustomModelEntry[]) => void;
+	modelContextWindows: Record<string, number>;
+	onContextWindowChange: (modelVal: string, size: number | null) => void;
 }
 
-export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps) {
+export function CodexSection({
+	hiddenModels,
+	onToggleHidden,
+	customModels,
+	onCustomModelsChange,
+	modelContextWindows,
+	onContextWindowChange,
+}: CodexSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const [expanded, setExpanded] = useState(true);
+	const [availableExpanded, setAvailableExpanded] = useState(true);
 	const [unavailableExpanded, setUnavailableExpanded] = useState(false);
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
@@ -601,10 +615,21 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 							<Stack gap="xs">
 								{availableEntries.length > 0 && (
 									<Stack gap="xs">
-										<Group justify="space-between">
-											<Text size="sm" fw={500}>
-												{t("codexCredentialsAvailable")}
-											</Text>
+										<Group
+											justify="space-between"
+											style={{ cursor: "pointer" }}
+											onClick={() => setAvailableExpanded(!availableExpanded)}
+										>
+											<Group gap="xs">
+												{availableExpanded ? (
+													<IconChevronDown size={16} />
+												) : (
+													<IconChevronRight size={16} />
+												)}
+												<Text size="sm" fw={500}>
+													{t("codexCredentialsAvailable")}
+												</Text>
+											</Group>
 											<Group gap="xs">
 												{selectedIds.size > 0 && (
 													<Button
@@ -612,7 +637,10 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 														color="red"
 														variant="light"
 														leftSection={<IconTrash size={14} />}
-														onClick={handleBatchDelete}
+														onClick={(e) => {
+															e.stopPropagation();
+															handleBatchDelete();
+														}}
 														loading={batchDeleteMut.isPending}
 													>
 														{t("codexBatchDelete")} ({selectedIds.size})
@@ -623,26 +651,28 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 												</Badge>
 											</Group>
 										</Group>
-										<CredentialList
-											entries={availableEntries}
-											currentId={status?.currentId}
-											usageCache={usageCache}
-											editingId={editingId}
-											editForm={editForm}
-											onEdit={handleEdit}
-											onSaveEdit={handleSaveEdit}
-											onCancelEdit={() => setEditingId(null)}
-											onEditFormChange={setEditForm}
-											usageMut={usageMut}
-											enableMut={enableMut}
-											disableMut={disableMut}
-											resetMut={resetMut}
-											deleteMut={deleteMut}
-											selectedIds={selectedIds}
-											onToggleSelect={toggleSelect}
-											onToggleSelectAll={toggleSelectAll}
-											t={t}
-										/>
+										<Collapse in={availableExpanded}>
+											<CredentialList
+												entries={availableEntries}
+												currentId={status?.currentId}
+												usageCache={usageCache}
+												editingId={editingId}
+												editForm={editForm}
+												onEdit={handleEdit}
+												onSaveEdit={handleSaveEdit}
+												onCancelEdit={() => setEditingId(null)}
+												onEditFormChange={setEditForm}
+												usageMut={usageMut}
+												enableMut={enableMut}
+												disableMut={disableMut}
+												resetMut={resetMut}
+												deleteMut={deleteMut}
+												selectedIds={selectedIds}
+												onToggleSelect={toggleSelect}
+												onToggleSelectAll={toggleSelectAll}
+												t={t}
+											/>
+										</Collapse>
 									</Stack>
 								)}
 
@@ -721,6 +751,15 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 									);
 								})}
 							</Stack>
+							<InlineCustomModels
+								prefix="codex"
+								customModels={customModels}
+								onCustomModelsChange={onCustomModelsChange}
+								hiddenModels={hiddenModels}
+								onToggleHidden={onToggleHidden}
+								modelContextWindows={modelContextWindows}
+								onContextWindowChange={onContextWindowChange}
+							/>
 						</Stack>
 					</Stack>
 				</Collapse>

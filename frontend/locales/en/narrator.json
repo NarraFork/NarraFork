@@ -108,6 +108,7 @@
 	"clearAllQueued": "Clear all queued",
 	"queue": "Queue",
 	"retry": "Retry",
+	"continue": "Continue",
 	"bgAgentWarning": "Background agents don't work well with NarraFork and may have permission issues.",
 	"bgAgentRetry": "Retry as foreground agent",
 	"bgAgentRetryPrompt": "The previous Task was launched with `run_in_background: true`, which caused permission issues.\nPlease retry the same task using a synchronous (foreground) Task instead — do NOT set `run_in_background`.",
@@ -207,5 +208,7 @@
 	"shareFile.directory": "directory",
 	"shareFile.compressed": "compressed",
 	"shareFile.zip": "zip",
-	"shareFile.fileCount": "{{count}} files"
+	"shareFile.fileCount": "{{count}} files",
+	"shareFile.preview": "preview",
+	"shareFile.previewFailed": "Preview failed to load"
 }

@@ -28,7 +28,7 @@ import {
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import {
@@ -42,7 +42,12 @@ import {
 	useUpdateMcpServer,
 } from "../../hooks/useMcp";
 import { useProjects } from "../../hooks/useProjects";
-import { useRoutines, useToggleRoutine } from "../../hooks/useRoutines";
+import {
+	useGlobalPrompt,
+	useRoutines,
+	useToggleRoutine,
+	useUpdateGlobalPrompt,
+} from "../../hooks/useRoutines";
 import {
 	useCreateGlobalSkill,
 	useDeleteGlobalSkill,
@@ -101,6 +106,7 @@ function RoutinesPage() {
 					<Tabs.Tab value="optional-tools">{t("tabOptionalTools")}</Tabs.Tab>
 					<Tabs.Tab value="global-skills">{t("tabGlobalSkills")}</Tabs.Tab>
 					<Tabs.Tab value="project-skills">{t("tabProjectSkills")}</Tabs.Tab>
+					<Tabs.Tab value="global-prompt">{t("tabGlobalPrompt")}</Tabs.Tab>
 					<Tabs.Tab value="mcp-tools">{t("tabMcpTools")}</Tabs.Tab>
 				</Tabs.List>
 
@@ -115,6 +121,9 @@ function RoutinesPage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="project-skills">
 					<ProjectSkillsTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="global-prompt">
+					<GlobalPromptTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="mcp-tools">
 					<McpToolsTab />
@@ -437,6 +446,139 @@ function GlobalSkillsTab() {
 					</Stack>
 				)}
 			</Modal>
+		</Stack>
+	);
+}
+
+// === Tab: Global Prompt ===
+
+function GlobalPromptTab() {
+	const { t } = useTranslation("routines");
+	const { data, isLoading } = useGlobalPrompt();
+	const updateMutation = useUpdateGlobalPrompt();
+
+	const [content, setContent] = useState("");
+	const [dirty, setDirty] = useState(false);
+	const [saved, setSaved] = useState(false);
+
+	// Sync fetched content into local state (skip if user is actively editing)
+	useEffect(() => {
+		if (data?.content != null && !dirty) {
+			setContent(data.content);
+		}
+	}, [data?.content, dirty]);
+
+	const handleChange = useCallback((val: string) => {
+		setContent(val);
+		setDirty(true);
+		setSaved(false);
+	}, []);
+
+	const handleSave = useCallback(
+		(filePath?: string) => {
+			updateMutation.mutate(
+				{ content, filePath },
+				{
+					onSuccess: () => {
+						setDirty(false);
+						setSaved(true);
+					},
+				},
+			);
+		},
+		[content, updateMutation],
+	);
+
+	if (isLoading) {
+		return (
+			<Text size="sm" c="dimmed">
+				Loading...
+			</Text>
+		);
+	}
+
+	const activeFile = data?.filePath;
+	const candidates = data?.candidates ?? [];
+
+	return (
+		<Stack>
+			<Text size="sm" c="dimmed">
+				{t("globalPromptDesc")}
+			</Text>
+
+			{/* Candidate paths */}
+			<Stack gap={4}>
+				<Text size="xs" fw={600}>
+					{t("globalPromptCandidates")}
+				</Text>
+				{candidates.map((c) => (
+					<Group key={c.path} gap="xs">
+						<Badge
+							size="xs"
+							variant={c.exists ? "filled" : "outline"}
+							color={c.exists ? "green" : "gray"}
+						>
+							{c.exists ? t("globalPromptExists") : t("globalPromptNotFound")}
+						</Badge>
+						<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
+							{c.path}
+						</Text>
+						{c.path === activeFile && (
+							<Badge size="xs" variant="light" color="indigo">
+								{t("globalPromptActiveFile")}
+							</Badge>
+						)}
+					</Group>
+				))}
+			</Stack>
+
+			{!activeFile && !dirty && (
+				<Text size="sm" c="dimmed">
+					{t("globalPromptEmpty")}
+				</Text>
+			)}
+
+			<Textarea
+				placeholder={t("globalPromptPlaceholder")}
+				value={content}
+				onChange={(e) => handleChange(e.currentTarget.value)}
+				autosize
+				minRows={10}
+				maxRows={30}
+				styles={{ input: { fontFamily: "monospace", fontSize: 13 } }}
+			/>
+
+			<Group justify="flex-end" gap="xs">
+				{saved && (
+					<Text size="xs" c="green">
+						{t("globalPromptSaved")}
+					</Text>
+				)}
+				{/* If no file exists yet, let user pick which path to create */}
+				{!activeFile && candidates.length > 0 ? (
+					candidates.map((c) => (
+						<Button
+							key={c.path}
+							size="xs"
+							variant="light"
+							onClick={() => handleSave(c.path)}
+							loading={updateMutation.isPending}
+							disabled={!content.trim()}
+						>
+							{t("globalPromptSaveTo")} {c.path.split("/").pop()}
+						</Button>
+					))
+				) : (
+					<Button
+						size="xs"
+						onClick={() => handleSave()}
+						loading={updateMutation.isPending}
+						disabled={!dirty}
+					>
+						{t("globalPromptSave")}
+					</Button>
+				)}
+			</Group>
 		</Stack>
 	);
 }

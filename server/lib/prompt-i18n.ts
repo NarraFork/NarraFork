@@ -486,6 +486,12 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		en: "Your previous response appears to have been cut off. Please continue from where you left off.",
 		"zh-CN": "你上一条回复似乎被截断了，请从中断处继续。",
 	},
+	// Injected as a user message when an optional tool is loaded via /load
+	toolLoaded: {
+		en: '[The optional tool "{toolName}" has just been loaded into this session. {toolDescription}. You can now use this tool when appropriate.]',
+		"zh-CN":
+			'[可选工具 "{toolName}" 刚刚被加载到本次会话中。{toolDescription}。你现在可以在合适的时候使用这个工具。]',
+	},
 } satisfies Record<string, Record<Locale, string>>;
 
 export type ToolMessageKey = keyof typeof toolMessages;

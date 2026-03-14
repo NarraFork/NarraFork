@@ -5,6 +5,7 @@ import { containerInstances, narrators, terminals, userPreferences } from "../db
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import type { LoadToolNotFound, LoadToolResult } from "../services/command-service";
@@ -743,9 +744,11 @@ export const handleNarratorWS = {
 							cmdResult.resolved &&
 							("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)
 						) {
+							const locale = await getUserLanguage(userId);
 							await handleLoadToolCommand(
 								msg.narratorId,
 								cmdResult as LoadToolResult | LoadToolNotFound,
+								locale,
 							);
 							return;
 						}

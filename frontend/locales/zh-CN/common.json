@@ -210,5 +210,11 @@
 	"updateDownloadComplete": "更新下载成功！",
 	"updateApplyInstructions": "运行以下命令应用更新：",
 	"updateReadyToApply": "更新已就绪，点击下方按钮重启并应用。",
-	"updateApplyNow": "重启并应用更新"
+	"updateApplyNow": "重启并应用更新",
+
+	"gitNotInstalled": "未检测到 Git",
+	"gitNotInstalledDesc": "NarraFork 需要 Git 才能正常工作。请安装 Git 后重启应用。",
+	"gitDownload": "下载 Git",
+	"gitInstallGuide": "安装完成后，请重启 NarraFork 以继续使用。",
+	"gitRecheck": "已安装 Git，重新检测"
 }

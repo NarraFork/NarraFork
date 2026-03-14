@@ -28,6 +28,8 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import type { CustomModelEntry } from "./InlineCustomModels";
+import { InlineCustomModels } from "./InlineCustomModels";
 import type { OpenAIProviderState } from "./types";
 
 interface OpenAIProvidersSectionProps {
@@ -39,6 +41,8 @@ interface OpenAIProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	customModels: CustomModelEntry[];
+	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 }
 
 export function OpenAIProvidersSection({
@@ -50,6 +54,8 @@ export function OpenAIProvidersSection({
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	customModels,
+	onCustomModelsChange,
 }: OpenAIProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -291,6 +297,15 @@ export function OpenAIProvidersSection({
 												})}
 											</Stack>
 										)}
+										<InlineCustomModels
+											prefix={p.prefix || "openai"}
+											customModels={customModels}
+											onCustomModelsChange={onCustomModelsChange}
+											hiddenModels={hiddenModels}
+											onToggleHidden={onToggleHidden}
+											modelContextWindows={modelContextWindows}
+											onContextWindowChange={onContextWindowChange}
+										/>
 									</Stack>
 								</Collapse>
 							</Stack>

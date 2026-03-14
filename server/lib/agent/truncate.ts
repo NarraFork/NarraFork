@@ -57,6 +57,23 @@ export function truncateOutput(
 	for (let i = 0; i < lines.length && i < maxLines; i++) {
 		const lineBytes = Buffer.byteLength(lines[i], "utf-8") + (i > 0 ? 1 : 0); // +1 for \n
 		if (bytes + lineBytes > maxBytes) {
+			// If we haven't kept any lines yet, the first line alone exceeds the byte
+			// limit (e.g. minified files). Truncate it at the character level so the
+			// LLM still sees *something* instead of an empty preview.
+			if (kept.length === 0) {
+				const line = lines[i];
+				// Binary-search-ish: walk chars until we approach maxBytes.
+				// Using simple slice is fine — overcount from multi-byte chars just
+				// means we keep slightly less, which is acceptable.
+				let cutLen = Math.min(line.length, maxBytes);
+				while (cutLen > 0 && Buffer.byteLength(line.slice(0, cutLen), "utf-8") > maxBytes) {
+					cutLen = Math.floor(cutLen * 0.9);
+				}
+				if (cutLen > 0) {
+					kept.push(`${line.slice(0, cutLen)}…[line truncated, ${line.length} chars total]`);
+					bytes = Buffer.byteLength(kept[0], "utf-8");
+				}
+			}
 			hitBytes = true;
 			break;
 		}
