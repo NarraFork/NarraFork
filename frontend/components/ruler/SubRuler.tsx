@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { type RulerData, useSubRulerData } from "../../hooks/useRuler";
 import { api } from "../../lib/api";
 import { computeElasticLayout } from "./elastic-layout";
+import type { SubRulerRenderMode } from "./focus-stack";
 import { TickContextMenu } from "./RulerContextMenus";
 import { SegmentCanvas } from "./SegmentCanvas";
 import type { RulerOrientation } from "./types";
@@ -20,6 +21,10 @@ interface SubRulerProps {
 	orientation?: RulerOrientation;
 	/** Callback when user wants to navigate up */
 	onBreadcrumbClick?: (depth: number) => void;
+	/** Render mode based on focus depth distance */
+	renderMode?: SubRulerRenderMode;
+	/** Request focus on this sub-ruler (used in indicator mode) */
+	onFocusRequest?: () => void;
 }
 
 const SUB_RULER_HEIGHT = 36;
@@ -32,6 +37,8 @@ export function SubRuler({
 	width,
 	depth,
 	orientation = "horizontal",
+	renderMode = "full",
+	onFocusRequest,
 }: SubRulerProps) {
 	const { t } = useTranslation("graph");
 	const queryClient = useQueryClient();
@@ -106,7 +113,28 @@ export function SubRuler({
 	}
 
 	// Opacity decreases with depth for visual hierarchy
-	const opacity = Math.max(0.4, 1 - depth * 0.15);
+	const opacity = renderMode === "full" ? 1 : renderMode === "compact" ? 0.85 : 0.6;
+	const trackHeight = renderMode === "compact" ? 20 : SUB_RULER_HEIGHT;
+
+	if (renderMode === "hidden") return null;
+
+	if (renderMode === "indicator") {
+		return (
+			<Box
+				onClick={onFocusRequest}
+				style={{
+					position: "absolute",
+					cursor: "pointer",
+					...(isH
+						? { left: 0, right: 0, height: 4, top: "50%", marginTop: -2 }
+						: { top: 0, bottom: 0, width: 4, left: "50%", marginLeft: -2 }),
+					background: "var(--mantine-color-indigo-8)",
+					borderRadius: 2,
+					opacity: 0.6,
+				}}
+			/>
+		);
+	}
 
 	return (
 		<Box style={{ opacity, marginTop: 8 }}>
@@ -125,8 +153,8 @@ export function SubRuler({
 				style={{
 					position: "relative",
 					...(isH
-						? { height: SUB_RULER_HEIGHT }
-						: { width: SUB_RULER_HEIGHT, minHeight: layout.totalWidth || 60 }),
+						? { height: trackHeight }
+						: { width: trackHeight, minHeight: layout.totalWidth || 60 }),
 					background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-7))",
 					...(isH
 						? {

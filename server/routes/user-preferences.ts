@@ -744,7 +744,18 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 			// corrupted, reset
 		}
 
-		viewports[projectId] = { x: viewport.x, y: viewport.y, zoom: viewport.zoom };
+		const existingVp = viewports[projectId];
+		viewports[projectId] = {
+			// Preserve existing ruler fields when classic mode saves (only x/y/zoom)
+			...existingVp,
+			x: viewport.x,
+			y: viewport.y,
+			zoom: viewport.zoom,
+			...(viewport.rulerOrientation && { rulerOrientation: viewport.rulerOrientation }),
+			...(viewport.rulerEdge && { rulerEdge: viewport.rulerEdge }),
+			...(viewport.rulerMainPan != null && { rulerMainPan: viewport.rulerMainPan }),
+			...(viewport.rulerCrossPan != null && { rulerCrossPan: viewport.rulerCrossPan }),
+		};
 
 		sqlite.run(
 			`INSERT INTO user_preferences (id, user_id, graph_viewports, created_at, updated_at)

@@ -1,12 +1,20 @@
 import { Badge, Box, Card, Group, Loader, Text } from "@mantine/core";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RulerSegment } from "../../hooks/useRuler";
 import { api } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
+import { getSubRulerRenderMode } from "./focus-stack";
 import { SubRuler } from "./SubRuler";
 import type { RulerOrientation } from "./types";
+import type { ZoomTierId } from "./zoom-tiers";
+
+/** Active segments refresh faster; historical ones can be stale longer. */
+function getSegmentStaleTime(segment: RulerSegment): number {
+	if (segment.activeChapterCount > 0) return 15_000; // 15s for active
+	return 5 * 60 * 1000; // 5min for historical
+}
 
 interface SegmentChapter {
 	id: string;
@@ -72,6 +80,12 @@ interface SegmentCanvasProps {
 	tickPositions?: Map<string, number>;
 	/** Request the parent to fit a world-space rect into the viewport */
 	onFitToView?: (worldX: number, worldY: number, worldW: number, worldH: number) => void;
+	/** Current zoom tier — controls card interactivity and connector visibility */
+	zoomTier?: ZoomTierId;
+	/** Current focus depth for sub-ruler render mode calculation */
+	focusDepth?: number;
+	/** Performance degradation level (0=normal, 1=reduced, 2=minimal) */
+	degradeLevel?: number;
 }
 
 const NODE_WIDTH = 220;
@@ -101,13 +115,17 @@ export const SegmentCanvas = memo(
 		onChapterContextMenu,
 		tickPositions,
 		onFitToView,
+		zoomTier = "L2",
+		focusDepth = 0,
+		degradeLevel = 0,
 	}: SegmentCanvasProps) {
 		const queryClient = useQueryClient();
 		const isH = orientation === "horizontal";
 		const { data, isLoading } = useQuery({
 			queryKey: ["rulerSegment", projectId, fromSha],
 			queryFn: () => api.getRulerSegment(projectId, fromSha, toSha) as Promise<SegmentData>,
-			staleTime: 30_000,
+			staleTime: getSegmentStaleTime(_segment),
+			placeholderData: _segment.activeChapterCount === 0 ? keepPreviousData : undefined,
 		});
 
 		const [expandedChapters, setExpandedChapters] = useState<Set<string>>(new Set());
@@ -241,8 +259,8 @@ export const SegmentCanvas = memo(
 						</Box>
 					)}
 
-					{/* Connector lines: tick → chapter card */}
-					{!isLoading && laid.length > 0 && (
+					{/* Connector lines: tick → chapter card (hidden at L2, simplified at degrade≥1) */}
+					{!isLoading && laid.length > 0 && zoomTier !== "L2" && degradeLevel < 2 && (
 						<ConnectorLines
 							chapters={laid}
 							mainPos={mainPos}
@@ -254,7 +272,8 @@ export const SegmentCanvas = memo(
 					)}
 
 					{laid.map((ch) => {
-						const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
+						const isPanelOpen =
+							zoomTier !== "L2" && openNarratorId === ch.narratorId && !!ch.narratorId;
 						const isSubRulerOpen = expandedChapters.has(ch.id);
 						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
 						const cardHeight = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
@@ -280,6 +299,10 @@ export const SegmentCanvas = memo(
 									isPanelOpen={isPanelOpen}
 									scale={scale}
 									onClick={() => {
+										if (zoomTier === "L2") {
+											toggleChapterExpand(ch.id);
+											return;
+										}
 										if (ch.narratorId) {
 											setOpenNarratorId(openNarratorId === ch.narratorId ? null : ch.narratorId);
 										}
@@ -369,6 +392,7 @@ export const SegmentCanvas = memo(
 											width={Math.min(cardWidth + 100, mainSize - ch.layoutX - 8)}
 											depth={0}
 											orientation={orientation}
+											renderMode={getSubRulerRenderMode(1, focusDepth)}
 										/>
 									</Box>
 								)}
@@ -395,6 +419,9 @@ export const SegmentCanvas = memo(
 		if (prev.onFitToView !== next.onFitToView) return false;
 		if (prev.viewTop !== next.viewTop) return false;
 		if (prev.viewHeight !== next.viewHeight) return false;
+		if (prev.zoomTier !== next.zoomTier) return false;
+		if (prev.focusDepth !== next.focusDepth) return false;
+		if (prev.degradeLevel !== next.degradeLevel) return false;
 		return true;
 	},
 );

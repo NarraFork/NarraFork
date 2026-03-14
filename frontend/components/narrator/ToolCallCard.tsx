@@ -1068,6 +1068,8 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const expiryHours = meta?.expiryHours as number | undefined;
 	const isDirectory = meta?.isDirectory as boolean | undefined;
 	const compressed = meta?.compressed as boolean | undefined;
+	const format = meta?.format as string | undefined;
+	const fileCount = meta?.fileCount as number | undefined;
 
 	const expiresLabel = useMemo(() => {
 		if (!expiresAt) return null;
@@ -1113,9 +1115,20 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 									{t("shareFile.directory")}
 								</Badge>
 							)}
-							{compressed && (
+							{format === "zip" ? (
 								<Badge size="xs" variant="light" color="violet">
-									{t("shareFile.compressed")}
+									{t("shareFile.zip")}
+								</Badge>
+							) : (
+								compressed && (
+									<Badge size="xs" variant="light" color="violet">
+										{t("shareFile.compressed")}
+									</Badge>
+								)
+							)}
+							{fileCount != null && fileCount > 0 && (
+								<Badge size="xs" variant="light" color="cyan">
+									{t("shareFile.fileCount", { count: fileCount })}
 								</Badge>
 							)}
 							{expiresLabel && (

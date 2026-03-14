@@ -205,5 +205,7 @@
 	"toolAlreadyLoaded": "Tool already loaded",
 	"shareFile.download": "Download",
 	"shareFile.directory": "directory",
-	"shareFile.compressed": "compressed"
+	"shareFile.compressed": "compressed",
+	"shareFile.zip": "zip",
+	"shareFile.fileCount": "{{count}} files"
 }

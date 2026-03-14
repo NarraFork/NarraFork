@@ -226,7 +226,7 @@ export interface NarraForkSettings {
 	shares?: {
 		/** Default expiry time in hours for shared files (default: 24). */
 		defaultExpiryHours: number;
-		/** Maximum file/folder size in MB allowed for sharing (default: 500). */
+		/** Maximum file/folder size in MB allowed for sharing (default: 4096). */
 		maxFileSizeMb: number;
 	};
 }
@@ -286,7 +286,7 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	shares: {
 		defaultExpiryHours: 24,
-		maxFileSizeMb: 500,
+		maxFileSizeMb: 4096,
 	},
 };
 
@@ -768,6 +768,11 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"claude-3-opus": 200_000,
 	"claude-sonnet-4": 200_000,
 	"claude-opus-4": 200_000,
+	// Claude 4.6 models — 1M context (GA since 2026-03-11)
+	"claude-sonnet-4-6": 1_000_000,
+	"claude-opus-4-6": 1_000_000,
+	"claude-sonnet-4.6": 1_000_000,
+	"claude-opus-4.6": 1_000_000,
 	// Anthropic native API models
 	"claude-sonnet-4-20250514": 200_000,
 	"claude-opus-4-20250514": 200_000,
@@ -813,8 +818,13 @@ export function getModelContextWindow(model: string, provider: string): number |
 	}
 
 	// 3. Fuzzy match (handles -latest, -preview, date suffixes, etc.)
+	// Sort by pattern length descending so longer (more specific) patterns match first.
+	// e.g. "claude-sonnet-4-6" should match before "claude-sonnet-4".
 	const normalizedBare = bareModel.toLowerCase();
-	for (const [pattern, config] of Object.entries(BUILTIN_CONTEXT_WINDOWS)) {
+	const sortedEntries = Object.entries(BUILTIN_CONTEXT_WINDOWS).sort(
+		(a, b) => b[0].length - a[0].length,
+	);
+	for (const [pattern, config] of sortedEntries) {
 		if (normalizedBare.startsWith(pattern)) {
 			return typeof config === "number" ? config : config.contextLength;
 		}

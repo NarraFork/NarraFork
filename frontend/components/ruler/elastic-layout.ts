@@ -10,6 +10,7 @@
  */
 
 import type { RulerSegment } from "../../hooks/useRuler";
+import type { AnimatedSegment } from "./spring";
 
 export interface TickPosition {
 	/** Index in the commits array */
@@ -34,6 +35,43 @@ export interface ElasticLayout {
 const COLLAPSED_GAP = 80; // px between ticks in collapsed state
 const EXPANDED_MIN_GAP = 400; // minimum px for an expanded segment
 
+const CARD_SLOT = 236; // 220 card + 16 gap
+const PADDING = 40;
+
+/**
+ * Scale-aware collapsed gap.
+ * - L0 (scale < 0.25): ultra-compact → 20px
+ * - L1 (0.25 ≤ scale < 0.6): linear 40→80px
+ * - L2+ (scale ≥ 0.6): standard 80px
+ */
+export function getCollapsedGap(scale: number): number {
+	if (scale < 0.25) return 20;
+	if (scale < 0.6) return 40 + ((scale - 0.25) / 0.35) * 40;
+	return 80;
+}
+
+/**
+ * Compute the expanded segment size based on chapter count and panel state.
+ */
+export function computeExpandedSize(params: {
+	chapterCount: number;
+	hasOpenPanel: boolean;
+	openPanelWidth: number;
+}): number {
+	const { chapterCount, hasOpenPanel, openPanelWidth } = params;
+
+	if (hasOpenPanel) {
+		return Math.max(openPanelWidth + CARD_SLOT + PADDING, 500);
+	}
+
+	let cols: number;
+	if (chapterCount <= 3) cols = chapterCount;
+	else if (chapterCount <= 8) cols = 4;
+	else cols = 5;
+
+	return Math.max(400, cols * CARD_SLOT + PADDING);
+}
+
 /**
  * Compute tick positions with elastic spacing.
  *
@@ -41,12 +79,14 @@ const EXPANDED_MIN_GAP = 400; // minimum px for an expanded segment
  * @param segments - Segments from the ruler API
  * @param expandedSegments - Set of fromSha values that are currently expanded
  * @param expandedSizes - Optional map of fromSha → custom expanded size (px)
+ * @param scale - Current zoom scale (default 1), affects collapsed gap
  */
 export function computeElasticLayout(
 	commitShas: string[],
 	segments: RulerSegment[],
 	expandedSegments: Set<string>,
 	expandedSizes?: Map<string, number>,
+	scale?: number,
 ): ElasticLayout {
 	// Build segment lookup
 	const segmentBySha = new Map<string, RulerSegment>();
@@ -75,7 +115,50 @@ export function computeElasticLayout(
 			const customSize = expandedSizes?.get(sha);
 			x += customSize ?? EXPANDED_MIN_GAP;
 		} else {
-			x += COLLAPSED_GAP;
+			x += getCollapsedGap(scale ?? 1);
+		}
+	}
+
+	return { ticks, totalWidth: x };
+}
+
+/**
+ * Like `computeElasticLayout` but reads in-flight animated sizes for expanded
+ * segments, falling back to `computeExpandedSize` when no animation state exists.
+ */
+export function computeElasticLayoutAnimated(
+	commitShas: string[],
+	segments: RulerSegment[],
+	expandedSegments: Set<string>,
+	animatedSizes: Map<string, AnimatedSegment>,
+	scale?: number,
+): ElasticLayout {
+	const segmentBySha = new Map<string, RulerSegment>();
+	for (const seg of segments) {
+		segmentBySha.set(seg.fromSha, seg);
+	}
+
+	const ticks: TickPosition[] = [];
+	let x = 0;
+
+	for (let i = 0; i < commitShas.length; i++) {
+		const sha = commitShas[i];
+		const segment = segmentBySha.get(sha);
+		const isExpanded = segment ? expandedSegments.has(sha) : false;
+
+		ticks.push({ index: i, x, sha, segment, isExpanded });
+
+		if (isExpanded && segment) {
+			const animated = animatedSizes.get(sha);
+			x += animated
+				? animated.currentSize
+				: computeExpandedSize({
+						chapterCount: segment.totalChapterCount,
+						hasOpenPanel: false,
+						openPanelWidth: 0,
+					});
+		} else {
+			x += getCollapsedGap(scale ?? 1);
 		}
 	}
 

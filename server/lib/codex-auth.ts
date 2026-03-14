@@ -14,6 +14,7 @@
  * Reference: opencode project's plugin/codex.ts
  */
 
+import { createHash, randomBytes } from "node:crypto";
 import { logger } from "./logger";
 
 // === Constants ===
@@ -74,30 +75,17 @@ function pfetch(
 
 // === PKCE helpers ===
 
-async function generatePKCE(): Promise<PkceCodes> {
-	const verifier = generateRandomString(43);
-	const data = new TextEncoder().encode(verifier);
-	const hash = await crypto.subtle.digest("SHA-256", data);
-	const challenge = base64UrlEncode(hash);
+function generatePKCE(): PkceCodes {
+	// 96 random bytes → base64url (128 chars), matching Go's generateCodeVerifier
+	const verifier = randomBytes(96).toString("base64url");
+	// SHA-256 of the verifier string → base64url (43 chars)
+	const challenge = createHash("sha256").update(verifier).digest("base64url");
 	return { verifier, challenge };
 }
 
-function generateRandomString(length: number): string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-	const bytes = crypto.getRandomValues(new Uint8Array(length));
-	return Array.from(bytes)
-		.map((b) => chars[b % chars.length])
-		.join("");
-}
-
-function base64UrlEncode(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	const binary = String.fromCharCode(...bytes);
-	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
 function generateState(): string {
-	return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer as ArrayBuffer);
+	// 16 random bytes → hex (32 chars), matching Go's GenerateRandomState
+	return randomBytes(16).toString("hex");
 }
 
 // === JWT parsing ===
@@ -243,15 +231,17 @@ interface PendingOAuth {
 let oauthServer: ReturnType<typeof Bun.serve> | undefined;
 let pendingOAuth: PendingOAuth | undefined;
 
+const CALLBACK_PORT = 1455;
+
 async function startOAuthServer(): Promise<{ port: number; redirectUri: string }> {
 	if (oauthServer) {
-		const port = oauthServer.port ?? 0;
+		const port = oauthServer.port ?? CALLBACK_PORT;
 		return { port, redirectUri: `http://localhost:${port}/auth/callback` };
 	}
 
-	// Use port 0 to let the OS assign a free port
+	// Use fixed port 1455 to match Go's RedirectURI
 	oauthServer = Bun.serve({
-		port: 0,
+		port: CALLBACK_PORT,
 		fetch(req) {
 			const url = new URL(req.url);
 
@@ -334,20 +324,20 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 	tokenPromise: Promise<CodexTokens>;
 }> {
 	const { redirectUri } = await startOAuthServer();
-	const pkce = await generatePKCE();
+	const pkce = generatePKCE();
 	const state = generateState();
 
 	const params = new URLSearchParams({
-		response_type: "code",
 		client_id: CLIENT_ID,
+		response_type: "code",
 		redirect_uri: redirectUri,
-		scope: "openid profile email offline_access",
+		scope: "openid email profile offline_access",
+		state,
 		code_challenge: pkce.challenge,
 		code_challenge_method: "S256",
+		prompt: "login",
 		id_token_add_organizations: "true",
 		codex_cli_simplified_flow: "true",
-		state,
-		originator: "narrafork",
 	});
 	const authorizeUrl = `${ISSUER}/oauth/authorize?${params.toString()}`;
 

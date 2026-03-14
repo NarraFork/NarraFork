@@ -1,5 +1,5 @@
-import { existsSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { createWriteStream, existsSync, statSync } from "node:fs";
+import { basename, dirname, relative, resolve } from "node:path";
 import { z } from "zod/v4";
 import { generateShortId } from "../../id";
 import { settings } from "../../settings";
@@ -29,137 +29,354 @@ function formatSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+/** Compute the size of a path (file or directory). */
+function pathSize(fullPath: string): number {
+	const stat = statSync(fullPath);
+	return stat.isDirectory() ? dirSize(fullPath) : stat.size;
+}
+
+/** Check if the system `zip` command is available. Cached after first call. */
+let _zipAvailable: boolean | null = null;
+function isZipCliAvailable(): boolean {
+	if (_zipAvailable !== null) return _zipAvailable;
+	try {
+		const proc = Bun.spawnSync(["zip", "--version"], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		_zipAvailable = proc.exitCode === 0;
+	} catch {
+		_zipAvailable = false;
+	}
+	return _zipAvailable;
+}
+
+/**
+ * Find the longest common parent directory among a set of absolute paths.
+ */
+function commonParentDir(paths: string[]): string {
+	if (paths.length === 0) return "/";
+	if (paths.length === 1) return dirname(paths[0]);
+
+	const segments = paths.map((p) => p.split("/").filter(Boolean));
+	const minLen = Math.min(...segments.map((s) => s.length));
+	let common = "";
+	for (let i = 0; i < minLen; i++) {
+		const seg = segments[0][i];
+		if (segments.every((s) => s[i] === seg)) {
+			common += `/${seg}`;
+		} else {
+			break;
+		}
+	}
+	return common || "/";
+}
+
+/**
+ * Create a zip archive using the system `zip` CLI.
+ * Returns null on success, or an error string on failure.
+ */
+function zipViaCli(outputPath: string, basedir: string, relativePaths: string[]): string | null {
+	const proc = Bun.spawnSync(["zip", "-r", outputPath, ...relativePaths], {
+		cwd: basedir,
+		stderr: "pipe",
+	});
+	if (proc.exitCode !== 0) {
+		const stderr = proc.stderr.toString().trim();
+		return stderr || `zip exited with code ${proc.exitCode}`;
+	}
+	return null;
+}
+
+/**
+ * Create a zip archive using the `archiver` library (fallback for platforms
+ * where the `zip` CLI is not available, e.g. Windows).
+ */
+async function zipViaArchiver(
+	outputPath: string,
+	basedir: string,
+	relativePaths: string[],
+): Promise<string | null> {
+	const archiver = (await import("archiver")).default;
+	return new Promise((res) => {
+		const output = createWriteStream(outputPath);
+		const archive = archiver("zip", { zlib: { level: 6 } });
+
+		output.on("close", () => res(null));
+		archive.on("error", (err: Error) => res(err.message));
+		archive.pipe(output);
+
+		for (const rel of relativePaths) {
+			const abs = resolve(basedir, rel);
+			const stat = statSync(abs);
+			if (stat.isDirectory()) {
+				archive.directory(abs, rel);
+			} else {
+				archive.file(abs, { name: rel });
+			}
+		}
+
+		archive.finalize();
+	});
+}
+
 export const shareFileTool: ToolDefinition = {
 	name: "ShareFile",
 	description:
 		"Share a file or directory by generating a temporary download link. " +
 		"Directories are automatically compressed into a .tar.gz archive. " +
 		"Files can optionally be compressed with gzip. " +
+		"Multiple files/directories can be packaged into a single .zip archive by passing an array of paths. " +
 		"The link expires after a configurable period (default 24 hours) and is accessible to anyone with the URL.",
 	parameters: z.object({
 		path: z
-			.string()
-			.describe("Path to the file or directory to share. Can be relative to cwd or absolute."),
+			.union([z.string(), z.array(z.string())])
+			.describe(
+				"Path to the file or directory to share. Can be relative to cwd or absolute. " +
+					"Pass an array of paths to package multiple files/directories into a single .zip archive.",
+			),
 		compress: z
 			.boolean()
 			.optional()
 			.describe(
 				"Whether to gzip-compress the file before sharing. " +
 					"Directories are always compressed as .tar.gz regardless of this flag. " +
+					"Ignored when path is an array (always creates .zip). " +
 					"Default: false for files.",
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { path: inputPath, compress } = args as {
-			path: string;
+			path: string | string[];
 			compress?: boolean;
 		};
 
-		// Resolve path relative to cwd
-		const fullPath = resolve(ctx.cwd, inputPath);
+		const isMulti = Array.isArray(inputPath);
 
-		if (!existsSync(fullPath)) {
-			return { output: `Path not found: ${fullPath}`, isError: true };
+		// ── Multi-file mode: zip packaging ──────────────────────────────────
+		if (isMulti) {
+			return handleMultiFile(inputPath, ctx);
 		}
 
-		const stat = statSync(fullPath);
-		const isDir = stat.isDirectory();
-		const maxSize = getMaxShareSizeBytes();
-
-		// Check size limit
-		const sourceSize = isDir ? dirSize(fullPath) : stat.size;
-		if (sourceSize > maxSize) {
-			return {
-				output: `Source size (${formatSize(sourceSize)}) exceeds the maximum allowed share size (${formatSize(maxSize)}).`,
-				isError: true,
-			};
-		}
-
-		// Use a single ID for both the directory and the share record
-		const shareId = generateShortId();
-		const shareDir = getShareDir(shareId);
-		const originalName = basename(fullPath);
-
-		try {
-			let storagePath: string;
-			let finalName: string;
-
-			if (isDir) {
-				// Directory → always tar.gz
-				finalName = `${originalName}.tar.gz`;
-				storagePath = resolve(shareDir, finalName);
-				const proc = Bun.spawnSync(
-					["tar", "-czf", storagePath, "-C", resolve(fullPath, ".."), originalName],
-					{ stderr: "pipe" },
-				);
-				if (proc.exitCode !== 0) {
-					const stderr = proc.stderr.toString().trim();
-					return {
-						output: `Failed to create archive: ${stderr || `tar exited with code ${proc.exitCode}`}`,
-						isError: true,
-					};
-				}
-			} else if (compress) {
-				// File + compress → copy then gzip
-				finalName = `${originalName}.gz`;
-				const tempPath = resolve(shareDir, originalName);
-				await Bun.write(tempPath, Bun.file(fullPath));
-				const proc = Bun.spawnSync(["gzip", tempPath], { stderr: "pipe" });
-				if (proc.exitCode !== 0) {
-					const stderr = proc.stderr.toString().trim();
-					return {
-						output: `Failed to compress file: ${stderr || `gzip exited with code ${proc.exitCode}`}`,
-						isError: true,
-					};
-				}
-				storagePath = resolve(shareDir, finalName);
-			} else {
-				// File, no compression → direct copy
-				finalName = originalName;
-				storagePath = resolve(shareDir, finalName);
-				await Bun.write(storagePath, Bun.file(fullPath));
-			}
-
-			const finalStat = statSync(storagePath);
-			const expiryHours = settings.shares?.defaultExpiryHours ?? 24;
-
-			const record = createShare({
-				id: shareId,
-				originalName: finalName,
-				storagePath,
-				size: finalStat.size,
-				createdBy: ctx.narratorId,
-				expiryHours,
-			});
-
-			const downloadUrl = `/api/shares/${record.id}`;
-
-			return {
-				output:
-					`File shared successfully.\n\n` +
-					`Download link: ${downloadUrl}\n` +
-					`Filename: ${finalName}\n` +
-					`Size: ${formatSize(finalStat.size)}\n` +
-					`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)`,
-				title: `Shared: ${finalName}`,
-				metadata: {
-					shareId: record.id,
-					downloadUrl,
-					filename: finalName,
-					originalName,
-					size: finalStat.size,
-					sizeFormatted: formatSize(finalStat.size),
-					expiresAt: record.expiresAt.toISOString(),
-					expiryHours,
-					isDirectory: isDir,
-					compressed: isDir || !!compress,
-				},
-			};
-		} catch (err) {
-			return {
-				output: `Failed to share file: ${err instanceof Error ? err.message : String(err)}`,
-				isError: true,
-			};
-		}
+		// ── Single path mode (original behaviour) ──────────────────────────
+		return handleSinglePath(inputPath, compress, ctx);
 	},
 };
+
+// ── Multi-file zip handler ───────────────────────────────────────────────────
+
+async function handleMultiFile(
+	inputPaths: string[],
+	ctx: { cwd: string; narratorId: string },
+): Promise<ToolResult> {
+	if (inputPaths.length === 0) {
+		return { output: "No paths provided.", isError: true };
+	}
+
+	// Resolve all paths & validate existence
+	const resolved: string[] = [];
+	for (const p of inputPaths) {
+		const full = resolve(ctx.cwd, p);
+		if (!existsSync(full)) {
+			return { output: `Path not found: ${full}`, isError: true };
+		}
+		resolved.push(full);
+	}
+
+	// Compute total size
+	const maxSize = getMaxShareSizeBytes();
+	let totalSize = 0;
+	for (const full of resolved) {
+		totalSize += pathSize(full);
+	}
+	if (totalSize > maxSize) {
+		return {
+			output: `Total source size (${formatSize(totalSize)}) exceeds the maximum allowed share size (${formatSize(maxSize)}).`,
+			isError: true,
+		};
+	}
+
+	const shareId = generateShortId();
+	const shareDir = getShareDir(shareId);
+	const finalName = `share-${Date.now()}.zip`;
+	const storagePath = resolve(shareDir, finalName);
+
+	// Compute common parent & relative paths for zip structure
+	const basedir = commonParentDir(resolved);
+	const relativePaths = resolved.map((p) => relative(basedir, p));
+
+	try {
+		// Prefer system zip; fall back to archiver
+		let err: string | null;
+		if (isZipCliAvailable()) {
+			err = zipViaCli(storagePath, basedir, relativePaths);
+		} else {
+			err = await zipViaArchiver(storagePath, basedir, relativePaths);
+		}
+		if (err) {
+			return { output: `Failed to create zip archive: ${err}`, isError: true };
+		}
+
+		const finalStat = statSync(storagePath);
+		const expiryHours = settings.shares?.defaultExpiryHours ?? 24;
+
+		const record = createShare({
+			id: shareId,
+			originalName: finalName,
+			storagePath,
+			size: finalStat.size,
+			createdBy: ctx.narratorId,
+			expiryHours,
+		});
+
+		const downloadUrl = `/api/shares/${record.id}`;
+		const fileCount = inputPaths.length;
+
+		return {
+			output:
+				`Files shared successfully.\n\n` +
+				`Download link: ${downloadUrl}\n` +
+				`Filename: ${finalName}\n` +
+				`Files packaged: ${fileCount}\n` +
+				`Size: ${formatSize(finalStat.size)}\n` +
+				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)`,
+			title: `Shared: ${finalName} (${fileCount} files)`,
+			metadata: {
+				shareId: record.id,
+				downloadUrl,
+				filename: finalName,
+				originalName: finalName,
+				size: finalStat.size,
+				sizeFormatted: formatSize(finalStat.size),
+				expiresAt: record.expiresAt.toISOString(),
+				expiryHours,
+				isDirectory: false,
+				compressed: true,
+				format: "zip" as const,
+				fileCount,
+			},
+		};
+	} catch (err) {
+		return {
+			output: `Failed to share files: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+		};
+	}
+}
+
+// ── Single-path handler (original logic) ─────────────────────────────────────
+
+async function handleSinglePath(
+	inputPath: string,
+	compress: boolean | undefined,
+	ctx: { cwd: string; narratorId: string },
+): Promise<ToolResult> {
+	const fullPath = resolve(ctx.cwd, inputPath);
+
+	if (!existsSync(fullPath)) {
+		return { output: `Path not found: ${fullPath}`, isError: true };
+	}
+
+	const stat = statSync(fullPath);
+	const isDir = stat.isDirectory();
+	const maxSize = getMaxShareSizeBytes();
+
+	const sourceSize = isDir ? dirSize(fullPath) : stat.size;
+	if (sourceSize > maxSize) {
+		return {
+			output: `Source size (${formatSize(sourceSize)}) exceeds the maximum allowed share size (${formatSize(maxSize)}).`,
+			isError: true,
+		};
+	}
+
+	const shareId = generateShortId();
+	const shareDir = getShareDir(shareId);
+	const originalName = basename(fullPath);
+
+	try {
+		let storagePath: string;
+		let finalName: string;
+		let format: "tar.gz" | "gz" | "raw";
+
+		if (isDir) {
+			// Directory → always tar.gz
+			finalName = `${originalName}.tar.gz`;
+			storagePath = resolve(shareDir, finalName);
+			format = "tar.gz";
+			const proc = Bun.spawnSync(
+				["tar", "-czf", storagePath, "-C", resolve(fullPath, ".."), originalName],
+				{ stderr: "pipe" },
+			);
+			if (proc.exitCode !== 0) {
+				const stderr = proc.stderr.toString().trim();
+				return {
+					output: `Failed to create archive: ${stderr || `tar exited with code ${proc.exitCode}`}`,
+					isError: true,
+				};
+			}
+		} else if (compress) {
+			// File + compress → copy then gzip
+			finalName = `${originalName}.gz`;
+			format = "gz";
+			const tempPath = resolve(shareDir, originalName);
+			await Bun.write(tempPath, Bun.file(fullPath));
+			const proc = Bun.spawnSync(["gzip", tempPath], { stderr: "pipe" });
+			if (proc.exitCode !== 0) {
+				const stderr = proc.stderr.toString().trim();
+				return {
+					output: `Failed to compress file: ${stderr || `gzip exited with code ${proc.exitCode}`}`,
+					isError: true,
+				};
+			}
+			storagePath = resolve(shareDir, finalName);
+		} else {
+			// File, no compression → direct copy
+			finalName = originalName;
+			format = "raw";
+			storagePath = resolve(shareDir, finalName);
+			await Bun.write(storagePath, Bun.file(fullPath));
+		}
+
+		const finalStat = statSync(storagePath);
+		const expiryHours = settings.shares?.defaultExpiryHours ?? 24;
+
+		const record = createShare({
+			id: shareId,
+			originalName: finalName,
+			storagePath,
+			size: finalStat.size,
+			createdBy: ctx.narratorId,
+			expiryHours,
+		});
+
+		const downloadUrl = `/api/shares/${record.id}`;
+
+		return {
+			output:
+				`File shared successfully.\n\n` +
+				`Download link: ${downloadUrl}\n` +
+				`Filename: ${finalName}\n` +
+				`Size: ${formatSize(finalStat.size)}\n` +
+				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)`,
+			title: `Shared: ${finalName}`,
+			metadata: {
+				shareId: record.id,
+				downloadUrl,
+				filename: finalName,
+				originalName,
+				size: finalStat.size,
+				sizeFormatted: formatSize(finalStat.size),
+				expiresAt: record.expiresAt.toISOString(),
+				expiryHours,
+				isDirectory: isDir,
+				compressed: isDir || !!compress,
+				format,
+			},
+		};
+	} catch (err) {
+		return {
+			output: `Failed to share file: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+		};
+	}
+}

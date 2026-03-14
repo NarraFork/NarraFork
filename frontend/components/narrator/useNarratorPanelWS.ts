@@ -620,6 +620,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (ev?.type !== "content_block_delta" || !ev.delta?.text || ev.subagentToolUseId) {
 					return;
 				}
+				// Streaming content arriving means any pending retry has succeeded
+				setRetryInfo((prev) => (prev ? null : prev));
 				if (ev.delta.type === "text_delta") {
 					streamingRef.current += ev.delta.text;
 					flushStreamingVersion();
@@ -650,6 +652,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (wsData.message?.id && wsData.message?.createdAt) {
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
+						// New assistant message means any pending retry succeeded
+						setRetryInfo((prev) => (prev ? null : prev));
 						if (streamingRef.current) {
 							streamingRef.current = "";
 						}

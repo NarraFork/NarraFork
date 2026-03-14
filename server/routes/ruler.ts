@@ -21,8 +21,10 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	const projectId = c.req.param("id");
 	const limitParam = c.req.query("limit");
 	const skipParam = c.req.query("skip");
+	const cursor = c.req.query("cursor");
+	const direction = c.req.query("direction") as "older" | "newer" | undefined;
 	const limit = limitParam ? Number.parseInt(limitParam, 10) : 200;
-	const skip = skipParam ? Number.parseInt(skipParam, 10) : 0;
+	let skip = skipParam ? Number.parseInt(skipParam, 10) : 0;
 
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
@@ -32,7 +34,35 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 
 	// Get main branch commit log
 	const branch = project.defaultBranch ?? "main";
-	const commits = await gitService.getLog(project.gitPath, { limit, skip, branch });
+	const totalCommitCount = await gitService.getCommitCount(project.gitPath, branch);
+
+	// Cursor-based pagination: use git rev-list to find cursor's absolute position
+	if (cursor) {
+		try {
+			// Count commits between cursor and branch HEAD to get cursor's position
+			const countAfterCursor = await gitService.getCommitCount(
+				project.gitPath,
+				`${cursor}..${branch}`,
+			);
+			// In git log order (newest first), cursor is at index = countAfterCursor
+			const cursorIndex = countAfterCursor;
+			if (direction === "older") {
+				skip = cursorIndex + 1;
+			} else if (direction === "newer") {
+				skip = Math.max(0, cursorIndex - limit);
+			} else {
+				skip = cursorIndex;
+			}
+		} catch {
+			// If cursor SHA is invalid or not reachable, fall back to skip-based loading
+		}
+	}
+
+	const commits = await gitService.getLog(project.gitPath, {
+		limit,
+		skip,
+		branch,
+	});
 
 	// Build a SHA set for fast lookup
 	const commitShaSet = new Set(commits.map((co) => co.sha));
@@ -132,7 +162,14 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			};
 		});
 
-	return c.json({ commits, segments, activeChapters });
+	return c.json({
+		commits,
+		segments,
+		activeChapters,
+		totalCommitCount,
+		oldestLoadedIndex: skip,
+		newestLoadedIndex: skip + commits.length - 1,
+	});
 });
 
 // GET /:id/ruler/sub — Sub-ruler data for a specific chapter's branch

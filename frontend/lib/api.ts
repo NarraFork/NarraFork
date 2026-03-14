@@ -983,6 +983,8 @@ export const api = {
 			zoom: number;
 			rulerOrientation?: "horizontal" | "vertical";
 			rulerEdge?: "start" | "end";
+			rulerMainPan?: number;
+			rulerCrossPan?: number;
 		},
 	) =>
 		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
@@ -1139,10 +1141,20 @@ export const api = {
 		}),
 
 	// === ruler (new NarraFlow) ===
-	getRulerData: (projectId: string, opts?: { limit?: number; skip?: number }) => {
+	getRulerData: (
+		projectId: string,
+		opts?: {
+			limit?: number;
+			skip?: number;
+			cursor?: string;
+			direction?: "older" | "newer";
+		},
+	) => {
 		const params = new URLSearchParams();
 		if (opts?.limit) params.set("limit", String(opts.limit));
 		if (opts?.skip) params.set("skip", String(opts.skip));
+		if (opts?.cursor) params.append("cursor", opts.cursor);
+		if (opts?.direction) params.append("direction", opts.direction);
 		const qs = params.toString();
 		return request<ApiEntity>(`/projects/${projectId}/ruler${qs ? `?${qs}` : ""}`);
 	},

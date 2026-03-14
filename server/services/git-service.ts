@@ -1049,6 +1049,12 @@ export const gitService = {
 			});
 	},
 
+	async getCommitCount(worktreePath: string, branch?: string): Promise<number> {
+		const args = ["rev-list", "--count", branch ?? "HEAD"];
+		const result = await exec(args, worktreePath, true);
+		return Number.parseInt(result.stdout.trim(), 10) || 0;
+	},
+
 	// === Reset ===
 
 	async resetSoft(worktreePath: string, target: string): Promise<void> {

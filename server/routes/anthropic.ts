@@ -130,7 +130,16 @@ async function fetchAnthropicModels(
 		Authorization: `Bearer ${config.apiKey}`,
 	};
 
-	const response = await fetch(`${baseUrl}/models`, { headers });
+	let response = await fetch(`${baseUrl}/models`, { headers });
+
+	// If failed and baseUrl doesn't already end with /v1, retry with /v1 appended
+	if (!response.ok && !/\/v1\/?$/i.test(baseUrl)) {
+		logger.debug("Anthropic models fetch failed, retrying with /v1 suffix", {
+			originalUrl: `${baseUrl}/models`,
+			status: response.status,
+		});
+		response = await fetch(`${baseUrl}/v1/models`, { headers });
+	}
 
 	if (!response.ok) {
 		const errText = await response.text().catch(() => "");

@@ -16,9 +16,6 @@ import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./type
 const ANTHROPIC_BETA_FLAGS =
 	"claude-code-20250219,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24";
 
-/** Additional beta flag for 1M context window support (used in model listing). */
-const CONTEXT_1M_BETA = "context-1m-2025-08-07";
-
 /** Base beta flag for non-chat requests (model listing, generate). */
 const ANTHROPIC_BASE_BETA = "claude-code-20250219";
 
@@ -133,12 +130,6 @@ interface AnthropicTool {
 	description: string;
 	input_schema: Record<string, unknown>;
 	cache_control?: { type: string };
-}
-
-/** Whether a model supports 1M context (sonnet or opus-4-6 variants). */
-function supports1mContext(model: string): boolean {
-	const lower = model.toLowerCase();
-	return lower.includes("sonnet") || lower.includes("opus-4-6") || lower.includes("opus-4.6");
 }
 
 // === Model capability detection ===
@@ -301,6 +292,8 @@ export class AnthropicProvider implements ProviderAdapter {
 	private proxy?: string;
 	/** Whether to reject unauthorized TLS certs (default true). */
 	private tlsRejectUnauthorized: boolean;
+	/** Cached base URL after successful /v1 fallback resolution. */
+	private resolvedBaseUrl?: string;
 
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
@@ -324,6 +317,52 @@ export class AnthropicProvider implements ProviderAdapter {
 			return fetch(input, { ...init, ...extra } as any);
 		}
 		return fetch(input, init);
+	}
+
+	/** Get the effective base URL, using cached resolution if available. */
+	private getBaseUrl(): string {
+		if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
+		return (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+	}
+
+	/** Whether a base URL already ends with /v1 (case-insensitive). */
+	private static hasV1Suffix(url: string): boolean {
+		return /\/v1\/?$/i.test(url);
+	}
+
+	/**
+	 * Fetch with automatic /v1 suffix fallback.
+	 * If the initial request fails and the base URL doesn't already end with /v1,
+	 * retries with /v1 appended. Caches the successful base URL for future calls.
+	 */
+	private async fetchWithV1Fallback(
+		path: string,
+		init: RequestInit,
+		useProxy = false,
+	): Promise<Response> {
+		const baseUrl = this.getBaseUrl();
+		const url = `${baseUrl}${path}`;
+		const doFetch = useProxy ? this.pfetch.bind(this) : fetch;
+		const response = await doFetch(url, init);
+
+		if (!response.ok && !AnthropicProvider.hasV1Suffix(baseUrl)) {
+			const retryBase = `${baseUrl}/v1`;
+			const retryUrl = `${retryBase}${path}`;
+			logger.debug("Anthropic request failed, retrying with /v1 suffix", {
+				originalUrl: url,
+				retryUrl,
+				status: response.status,
+			});
+			// Drain the failed response body to free the connection
+			await response.text().catch(() => {});
+			const retryResponse = await doFetch(retryUrl, init);
+			if (retryResponse.ok) {
+				this.resolvedBaseUrl = retryBase;
+			}
+			return retryResponse;
+		}
+
+		return response;
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
@@ -364,7 +403,6 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const apiKey = this.config.apiKey;
-		const baseUrl = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
 
 		if (!apiKey) {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
@@ -505,7 +543,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		// Build request URL with ?beta=true (matching Claude Code)
-		const reqUrl = `${baseUrl}/messages?beta=true`;
+		const reqPath = "/messages?beta=true";
 
 		// Build headers matching Claude Code CLI protocol exactly
 		const reqHeaders: Record<string, string> = {
@@ -530,7 +568,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		logger.debug("Anthropic chat request", {
 			model,
-			endpoint: reqUrl,
+			endpoint: `${this.getBaseUrl()}${reqPath}`,
 			toolCount: tools.length,
 			messageCount: messages.length,
 			hasSystem: !!systemPrompt,
@@ -539,12 +577,16 @@ export class AnthropicProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 		});
 
-		const response = await this.pfetch(reqUrl, {
-			method: "POST",
-			headers: reqHeaders,
-			body: JSON.stringify(body),
-			signal: params.signal,
-		});
+		const response = await this.fetchWithV1Fallback(
+			reqPath,
+			{
+				method: "POST",
+				headers: reqHeaders,
+				body: JSON.stringify(body),
+				signal: params.signal,
+			},
+			true,
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -637,17 +679,12 @@ export class AnthropicProvider implements ProviderAdapter {
 		systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const apiKey = this.config.apiKey;
-		const baseUrl = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
 
 		if (!apiKey) {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
 		}
 
 		const bareModel = parseModelId(model).model;
-		const betaFlags = supports1mContext(bareModel)
-			? `${ANTHROPIC_BASE_BETA},${CONTEXT_1M_BETA}`
-			: ANTHROPIC_BASE_BETA;
-
 		const body: {
 			model: string;
 			max_tokens: number;
@@ -662,13 +699,13 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.system = [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }];
 		}
 
-		const response = await fetch(`${baseUrl}/messages`, {
+		const response = await this.fetchWithV1Fallback("/messages", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${apiKey}`,
 				"anthropic-version": "2023-06-01",
-				"anthropic-beta": betaFlags,
+				"anthropic-beta": ANTHROPIC_BASE_BETA,
 				"user-agent": CLAUDE_CLI_USER_AGENT,
 			},
 			body: JSON.stringify(body),
@@ -705,7 +742,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		locale?: string,
 	): Promise<string> {
 		const apiKey = this.config.apiKey;
-		const baseUrl = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
 
 		if (!apiKey) {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
@@ -713,17 +749,13 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
-		const betaFlags = supports1mContext(bareModel)
-			? `${ANTHROPIC_BASE_BETA},${CONTEXT_1M_BETA}`
-			: ANTHROPIC_BASE_BETA;
-
-		const response = await fetch(`${baseUrl}/messages`, {
+		const response = await this.fetchWithV1Fallback("/messages", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${apiKey}`,
 				"anthropic-version": "2023-06-01",
-				"anthropic-beta": betaFlags,
+				"anthropic-beta": ANTHROPIC_BASE_BETA,
 				"user-agent": CLAUDE_CLI_USER_AGENT,
 			},
 			body: JSON.stringify({
