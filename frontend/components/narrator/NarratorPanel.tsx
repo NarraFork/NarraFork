@@ -614,7 +614,7 @@ function ReasoningEffortMenuItems({
 	return (
 		<>
 			<Menu.Label>{t("reasoningEffort")}</Menu.Label>
-			{(["", "low", "medium", "high", "xhigh"] as const).map((effort) => {
+			{(["", "none", "low", "medium", "high"] as const).map((effort) => {
 				const selected = (currentEffort ?? "") === effort || (!currentEffort && effort === "");
 				return (
 					<Menu.Item
@@ -721,6 +721,16 @@ export function NarratorPanel({
 		const providerPrefix = narrator?.model?.split(":")[0];
 		return !!providerPrefix && codexCapableProviders.has(providerPrefix);
 	}, [codexCapableProviders, narrator?.model]);
+
+	// Reasoning effort is supported by both Codex and Anthropic providers
+	const supportsReasoningEffort = useMemo(() => {
+		const providerPrefix = narrator?.model?.split(":")[0];
+		if (!providerPrefix) return false;
+		if (codexCapableProviders.has(providerPrefix)) return true;
+		// Check Anthropic providers
+		const anthropicProviders = settingsData?.anthropicProviders ?? [];
+		return anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
+	}, [codexCapableProviders, settingsData?.anthropicProviders, narrator?.model]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -986,6 +996,7 @@ export function NarratorPanel({
 		contextWindow,
 		pruneBoundaryMessageId,
 		prunedPercent,
+		retryInfo,
 		currentTodos,
 		todosToolUseId,
 		expandedToolUseId,
@@ -1006,7 +1017,24 @@ export function NarratorPanel({
 	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
 	const isPlanning = narrator?.permissionMode === "plan" && narrator?.status === "thinking";
-	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting);
+	const isRetrying = !!retryInfo;
+	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
+
+	// --- Retry countdown ---
+	const [retryCountdown, setRetryCountdown] = useState<number>(0);
+	useEffect(() => {
+		if (!retryInfo) {
+			setRetryCountdown(0);
+			return;
+		}
+		const tick = () => {
+			const remaining = Math.max(0, Math.ceil((retryInfo.retryAt - Date.now()) / 1000));
+			setRetryCountdown(remaining);
+		};
+		tick();
+		const id = setInterval(tick, 1000);
+		return () => clearInterval(id);
+	}, [retryInfo]);
 
 	const activeTodo = useMemo(() => {
 		if (!Array.isArray(currentTodos) || !currentTodos.length) return null;
@@ -1876,6 +1904,18 @@ export function NarratorPanel({
 				if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
 					e.preventDefault();
 					handleSend();
+				} else if (e.ctrlKey || e.metaKey) {
+					// Ctrl/Cmd+Enter: browsers don't insert a newline by default, do it manually
+					e.preventDefault();
+					const textarea = e.currentTarget as HTMLTextAreaElement;
+					const { selectionStart, selectionEnd } = textarea;
+					const before = input.slice(0, selectionStart);
+					const after = input.slice(selectionEnd);
+					const newValue = `${before}\n${after}`;
+					setInput(newValue);
+					requestAnimationFrame(() => {
+						textarea.selectionStart = textarea.selectionEnd = selectionStart + 1;
+					});
 				}
 			}
 			return;
@@ -2383,9 +2423,9 @@ export function NarratorPanel({
 				>
 					{showWorkIndicator ? (
 						<UnstyledButton
-							disabled={!activeTodo}
+							disabled={isRetrying || !activeTodo}
 							onClick={async () => {
-								if (!activeTodo || !todosToolUseId) return;
+								if (isRetrying || !activeTodo || !todosToolUseId) return;
 								// Search across all pages without flattening
 								let msg: NarratorMsg | null = null;
 								for (const page of messagesData?.pages ?? []) {
@@ -2423,24 +2463,48 @@ export function NarratorPanel({
 								<Loader
 									size={14}
 									color={
-										isCompacting ? "orange" : isWaiting ? "yellow" : isPlanning ? "green" : "blue"
+										isRetrying
+											? "yellow"
+											: isCompacting
+												? "orange"
+												: isWaiting
+													? "yellow"
+													: isPlanning
+														? "green"
+														: "blue"
 									}
 									style={{ flexShrink: 0 }}
 								/>
 								<Text
 									size="xs"
-									c={isCompacting ? "orange" : isWaiting ? "yellow" : isPlanning ? "green" : "blue"}
+									c={
+										isRetrying
+											? "yellow"
+											: isCompacting
+												? "orange"
+												: isWaiting
+													? "yellow"
+													: isPlanning
+														? "green"
+														: "blue"
+									}
 									truncate
 								>
-									{isCompacting
-										? t("compacting")
-										: activeTodo
-											? activeTodo.content || activeTodo.activeForm
-											: isWaiting
-												? t("status_waiting")
-												: isPlanning
-													? t("planning")
-													: t("thinking")}
+									{isRetrying
+										? t("retryingCountdown", {
+												count: retryInfo?.retryCount,
+												max: retryInfo?.maxRetries,
+												seconds: retryCountdown,
+											})
+										: isCompacting
+											? t("compacting")
+											: activeTodo
+												? activeTodo.content || activeTodo.activeForm
+												: isWaiting
+													? t("status_waiting")
+													: isPlanning
+														? t("planning")
+														: t("thinking")}
 								</Text>
 							</Group>
 						</UnstyledButton>
@@ -2661,18 +2725,18 @@ export function NarratorPanel({
 									</Menu.Dropdown>
 								</Menu>
 								<PathRulesPopover narratorId={narratorId} t={t} />
-								{/* Reasoning Effort (only for Codex-mode providers) */}
-								{supportsCodexControls && (
+								{/* Reasoning Effort (Codex + Anthropic providers) */}
+								{supportsReasoningEffort && (
 									<Menu position="top-end">
 										<Menu.Target>
 											<NativeSelect
 												size="xs"
 												data={[
 													{ value: "", label: t("reasoning_auto") },
+													{ value: "none", label: t("reasoning_none") },
 													{ value: "low", label: t("reasoning_low") },
 													{ value: "medium", label: t("reasoning_medium") },
 													{ value: "high", label: t("reasoning_high") },
-													{ value: "xhigh", label: t("reasoning_xhigh") },
 												]}
 												value={narrator.reasoningEffort ?? ""}
 												onChange={() => {}}
@@ -2790,14 +2854,14 @@ export function NarratorPanel({
 								</Menu.Dropdown>
 							</Menu>
 							<PathRulesPopover narratorId={narratorId} t={t} />
-							{/* Reasoning Effort (only for Codex-mode providers) - Mobile */}
-							{supportsCodexControls && (
+							{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
+							{supportsReasoningEffort && (
 								<Menu position="bottom-end" withinPortal>
 									<Menu.Target>
 										<ActionIcon variant="subtle" color="gray" size="sm">
 											<Text size="xs" fw={600}>
 												{(() => {
-													const effortMap = { low: "L", medium: "M", high: "H", xhigh: "X" };
+													const effortMap = { none: "O", low: "L", medium: "M", high: "H" };
 													return (
 														effortMap[narrator.reasoningEffort as keyof typeof effortMap] ?? "A"
 													);

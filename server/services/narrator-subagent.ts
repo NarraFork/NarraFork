@@ -72,13 +72,13 @@ const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", SHELL_TOOL_
 
 /** Tools excluded from general subagents (no nesting, no plan mode) */
 const GENERAL_EXCLUDED = new Set([
-	"Task",
+	"Agent",
 	"ContinueTask",
-	"CheckBackgroundTask",
-	"CancelBackgroundTask",
+	"TaskOutput",
+	"TaskStop",
 	"EnterPlanMode",
 	"ExitPlanMode",
-	"TodoWrite",
+	"TaskCreate",
 ]);
 
 /** Tool filter factories per subagent type */
@@ -331,7 +331,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
 			serviceTier: resolvedServiceTier,
 			metadata: isAnthropicProvider(resolvedProvider)
-				? { user_id: `narrafork_${narratorId}_session_${currentConversationId}` }
+				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,
 			toolFilter: TOOL_FILTERS[subagentType],
 			permissionHandler: (toolName, permInput, permToolUseId) =>
@@ -933,7 +933,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
 		return (
 			resultPrefix +
-			"Background task started. Use CheckBackgroundTask with this ID to check status or get results."
+			"Background task started. Use TaskOutput with this ID to check status or get results."
 		);
 	}
 

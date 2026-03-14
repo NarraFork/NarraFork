@@ -34,7 +34,7 @@ export async function warmSkillCache(skillRoot: string): Promise<void> {
 
 function buildDescription(config: AgentConfig): string {
 	const base =
-		"Load a project skill by name. Skills provide domain-specific instructions and knowledge for the current project. Use this tool when a task matches a skill's description.";
+		'Execute a skill within the main conversation\n\nWhen users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.\n\nWhen users reference a "slash command" or "/<something>" (e.g., "/commit", "/review-pr"), they are referring to a skill. Use this tool to invoke it.\n\nHow to invoke:\n- Use this tool with the skill name and optional arguments\n- Examples:\n  - `skill: "pdf"` - invoke the pdf skill\n  - `skill: "commit", args: "-m \'Fix bug\'"` - invoke with arguments\n  - `skill: "review-pr", args: "123"` - invoke with arguments\n  - `skill: "ms-office-suite:pdf"` - invoke using fully qualified name\n\nImportant:\n- Available skills are listed in system-reminder messages in the conversation\n- When a skill matches the user\'s request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task\n- NEVER mention a skill without actually calling this tool\n- Do not invoke a skill that is already running\n- Do not use this tool for built-in CLI commands (like /help, /clear, etc.)\n- If you see a <command-name> tag in the current conversation turn, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again';
 
 	const summaries = config.skillRoot ? skillSummaryCache.get(config.skillRoot) : undefined;
 
@@ -53,11 +53,35 @@ function buildDescription(config: AgentConfig): string {
 export const skillTool: ToolDefinition = {
 	name: "Skill",
 	description: buildDescription,
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			skill: {
+				description: 'The skill name. E.g., "commit", "review-pr", or "pdf"',
+				type: "string",
+			},
+			args: {
+				description: "Optional arguments for the skill",
+				type: "string",
+			},
+		},
+		required: ["skill"],
+		additionalProperties: false,
+	},
 	parameters: z.object({
-		name: z.string().describe("The name of the skill to load"),
+		name: z.string().optional().describe("The name of the skill to load"),
+		skill: z.string().optional().describe("The skill name (alias for name)"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { name } = args as { name: string };
+		const { name, skill } = args as { name?: string; skill?: string };
+		const skillName = skill ?? name;
+
+		if (!skillName) {
+			return {
+				output: "No skill name provided. Please specify a skill name.",
+				isError: true,
+			};
+		}
 
 		if (!ctx.skillRoot) {
 			return {
@@ -75,31 +99,31 @@ export const skillTool: ToolDefinition = {
 				skills.map((s) => ({ name: s.name, description: s.description })),
 			);
 
-			const skill = skills.find((s) => s.name === name);
+			const found = skills.find((s) => s.name === skillName);
 
-			if (!skill) {
+			if (!found) {
 				const available = skills.map((s) => s.name).join(", ");
 				return {
-					output: `Skill "${name}" not found. Available skills: ${available || "(none)"}`,
+					output: `Skill "${skillName}" not found. Available skills: ${available || "(none)"}`,
 					isError: true,
 				};
 			}
 
-			const skillDir = join(skill.location, "..");
-			const lines = [`<skill_content name="${escapeXml(skill.name)}">`];
-			lines.push(`# Skill: ${skill.name}`);
+			const skillDir = join(found.location, "..");
+			const lines = [`<skill_content name="${escapeXml(found.name)}">`];
+			lines.push(`# Skill: ${found.name}`);
 			lines.push("");
-			if (skill.content) {
-				lines.push(skill.content);
+			if (found.content) {
+				lines.push(found.content);
 				lines.push("");
 			}
 
 			lines.push(`Base directory for this skill: ${skillDir}`);
 
-			if (skill.files.length > 0) {
+			if (found.files.length > 0) {
 				lines.push("");
 				lines.push("<skill_files>");
-				for (const f of skill.files) {
+				for (const f of found.files) {
 					lines.push(`<file>${join(skillDir, f)}</file>`);
 				}
 				lines.push("</skill_files>");
@@ -107,10 +131,10 @@ export const skillTool: ToolDefinition = {
 
 			lines.push("</skill_content>");
 
-			return { output: lines.join("\n"), title: `Skill: ${skill.name}` };
+			return { output: lines.join("\n"), title: `Skill: ${found.name}` };
 		} catch (err) {
 			return {
-				output: `Failed to load skill "${name}": ${err instanceof Error ? err.message : String(err)}`,
+				output: `Failed to load skill "${skillName}": ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 			};
 		}

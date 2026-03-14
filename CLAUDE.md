@@ -7,9 +7,9 @@
 NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件开发被建模为分支故事网络，每个工作分支（章节/Chapter）拥有独立的 AI 叙述者（Claude Code 会话），运行在隔离的 git worktree 中，可选配 Podman 容器环境。面向小团队私有化部署，支持共享项目数据。
 
 **核心领域概念：**
-- **章节（Chapter）** — 工作单元 = git worktree + AI 会话，状态包括：active/dormant/merged/abandoned/frozen，角色（role）包括：trunk/branch/exploration
+- **章节（Chapter）** — 工作单元 = git worktree + AI 会话，状态包括：active/dormant/merged/abandoned/frozen，角色（role）包括：trunk/branch/exploration/review
 - **叙述者（Narrator）** — 绑定到章节（或独立运行）的 AI 会话，支持流式输出和权限控制，类型分为 primary（主叙述者）和 subagent（子代理）
-- **子代理（Subagent）** — 叙述者派生的子任务代理，分为 explore（只读探索）、plan（架构规划）、general（通用写入）三种类型
+- **子代理（Subagent）** — 叙述者派生的子任务代理，分为 explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）四种类型
 - **故事网络（Story Network）** — 所有章节 fork/merge/dependency/cherry_pick 关系构成的有向图，是项目的主界面
 - **探索组（Exploration Group）** — 将多个探索分支组织为一个实验组，用于技术方案对比
 - **章节边（Chapter Edge）** — 章节间的显式关系，类型包括：fork/merge/dependency/cherry_pick
@@ -59,7 +59,7 @@ server/
   index.ts          — Bun.serve() 入口：HTTP（Hono）+ WS 升级
   app.ts            — Hono 路由注册 + 全局错误处理
   db/
-    schema.ts       — Drizzle 表定义（projects、chapters、narrators 等 20+ 张表）
+    schema.ts       — Drizzle 表定义（projects、chapters、narrators 等 24 张表）
     relations.ts    — Drizzle 关系定义
     index.ts        — 数据库初始化（WAL 模式、外键、FTS5 虚拟表 + 触发器）
     connection.ts   — 数据库连接管理
@@ -76,39 +76,56 @@ server/
     logger.ts       — 日志系统
     constants.ts    — 常量定义
     platform.ts     — 平台检测（WSL、Windows、Linux）
+    platform-path.ts — 平台路径处理
     version.ts      — 版本信息
     slug.ts         — URL slug 生成
+    spawn.ts        — 子进程管理
     uploads.ts      — 文件上传处理
+    shares.ts       — 文件分享管理
     prompt-i18n.ts  — 提示词国际化
     builtin-routines.ts — 内置例程定义
     async-mutex.ts  — 异步互斥锁
     db-resilience.ts — 数据库恢复机制
-    agent/          — 自定义 AI Agent 框架（loop、多提供商、工具注册、15+ 内置工具）
+    blockmap.ts     — 块映射工具
+    stream-timeout.ts — 流超时处理
+    project-db.ts   — 项目数据库工具
+    codex-*.ts      — Codex 认证/管理/使用统计
+    agent/          — 自定义 AI Agent 框架（loop、多提供商、工具注册、19 个内置工具）
     mcp/            — MCP 集成（manager、tool-bridge、transports）
   terminal/         — 终端运行时（PTY 抽象层、buffer 管理、dtach 支持）
-  routes/           — Hono 路由组，挂载于 /api/*（27 个路由文件）
-  services/         — 业务逻辑（35 个服务：章节、叙述者、git、终端、容器、技能、例程等）
+  routes/           — Hono 路由组，挂载于 /api/*（31 个路由文件）
+  services/         — 业务逻辑（40 个服务：章节、叙述者、git、终端、容器、技能、例程、评审、快照等）
   websocket/        — Bun WebSocket 处理器（叙述者事件和终端 I/O）
   generated/        — 自动生成文件（构建信息、嵌入式迁移数据）
 ```
 
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
-- **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general 三种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
+- **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。
-- **章节角色（Role）**：trunk（主线，接收合并）、branch（工作分支，默认）、exploration（探索分支）。角色是视觉和语义标签，不限制操作能力。
-- **章节边（Chapter Edges）**：`chapter_edges` 表显式建模四种关系（fork/merge/dependency/cherry_pick），与 `parentChapterId`/`mergedIntoChapterId` 冗余字段同步维护。
+- **章节角色（Role）**：trunk（主线，接收合并）、branch（工作分支，默认）、exploration（探索分支）、review（代码评审）。角色是视觉和语义标签，不限制操作能力。
+- **章节边（Chapter Edges）**：`chapter_edges` 表显式建模五种关系（fork/merge/dependency/cherry_pick/review），与 `parentChapterId`/`mergedIntoChapterId` 冗余字段同步维护。
 - **依赖关系**：章节间可声明 dependency 边，系统检测上游变更并提供 rebase/merge 同步。
 - **探索组**：将多个 exploration 章节组织为实验组，支持决策（选定方案合并）和放弃。
 - **Git worktrees** 每个活跃章节在 `<project.gitPath>/.worktrees/` 下创建。休眠章节移除 worktree 但保留分支。每个项目对应一个 git 仓库，通过项目的 `gitPath` 配置。
 - **容器管理**通过 Podman compose 实现，端口从可配置池中分配（默认 10000–20000）。
 - **终端管理**通过平台特定的 PTY 实现（`server/terminal/`）：Unix 系统使用 `Bun.Terminal`，Windows 使用 `bun-pty`（Rust portable-pty）。两者实现统一的 `TerminalRuntime` 接口。可选支持 dtach 分离会话模式。终端生命周期与服务器进程绑定，重启后标记为已退出。
 - **批量合并**编排多章节合并，支持冲突检测、WebSocket 交互式决策和 AI 辅助冲突解决。
-- **故事网络图**是项目的主界面（`/projects/$projectId`），交互式 React Flow 画布，支持节点拖拽、右键菜单、侧边面板、边连接。
+- **故事网络图**是项目的主界面（`/projects/$projectId`），支持两种流程模式：classic（交互式 React Flow 画布，支持节点拖拽、右键菜单、侧边面板、边连接）和 ruler（线性时间轴视图）。
+- **评审系统**（`server/services/review-service.ts`）：章节级代码评审，支持 review 角色章节和 review 子代理。
+- **快照系统**（`server/services/file-snapshot-service.ts`、`snapshot.ts`、`snapshot-revert.ts`、`file-state-rebuild.ts`）：叙述者文件快照管理，支持快照创建、恢复和文件状态重建。
 - **技能系统**（`server/services/skill-service.ts`）：项目级技能库，为叙述者提供领域特定指令和知识。
 - **例程系统**（`server/services/routine-service.ts`）：内置和自定义的自动化例程。
 - **通知系统**（`server/services/notification-service.ts`）：通知管理和声音提醒。
+- **后台任务**：叙述者支持后台运行模式（`isBackground`/`backgroundStatus`/`backgroundResult` 字段），配合 check-background-task、cancel-background-task、continue-task 工具管理。
+- **叙述者服务拆分**：叙述者逻辑拆分为多个子服务 — narrator-service（核心 CRUD）、narrator-session（会话管理）、narrator-executor（执行器）、narrator-subagent（子代理管理）、narrator-context（上下文管理）、narrator-prompt（提示词生成）、narrator-title（标题生成）、narrator-recovery（恢复机制）、narrator-event-handler（事件处理）。
+- **项目数据库同步**（`server/services/project-db-sync.ts`）：项目数据库同步和导入功能。
+- **Worktree 监视器**（`server/services/worktree-watcher.ts`）：监视 worktree 文件变化。
+- **提交同步**（`server/services/commit-sync-service.ts`）：同步提交信息。
+- **合并摘要**（`server/services/merge-summary-service.ts`）：生成合并摘要。
+- **输出统计**（`server/services/output-stats.ts`）：叙述者输出统计。
+- **更新检查**（`server/services/update-service.ts`）：版本更新检查。
 
 **叙述者消息存储：** 消息通过三层结构管理：
 - `narrator_messages` — 存储所有消息（user/assistant/system），`contentJson` 保存完整的 SDK content blocks（text/tool_use/thinking），`parentToolUseId` 关联子 agent 消息树。
@@ -126,11 +143,11 @@ server/
 ```
 frontend/
   main.tsx            — i18n 初始化 + MantineProvider + QueryClient + RouterProvider
-  lib/                — 工具库（api、i18n、ws、notification、format、constants 等 11 个模块）
+  lib/                — 工具库（api、i18n、ws、ws-status、narrator-ws-manager、notification、notification-sound、format、constants、query-client、status-registry、hmr-guard、pwa、shiki-lang 等 14 个模块）
   locales/            — 翻译 JSON 文件：en/ 和 zh-CN/，每种语言 15 个命名空间
   routes/             — TanStack 基于文件的路由（自动代码分割）
-  hooks/              — React Query hooks + WebSocket hooks + UI 状态 hooks（37 个）
-  components/         — 按领域分组：chapter/、common/、container/、graph/、narrator/、nav/、project/、providers/、settings/、terminal/
+  hooks/              — React Query hooks + WebSocket hooks + UI 状态 hooks（41 个）
+  components/         — 按领域分组：chapter/、common/、container/、graph/、narrator/、nav/、project/、providers/、ruler/、settings/、terminal/
   styles/             — 全局样式（React Flow 控件、OLED 主题）
   types/              — TypeScript 类型声明
 ```
@@ -156,6 +173,12 @@ frontend/
 - `/api/notifications`、`/api/notification-sounds` — 通知管理
 - `/api/skills` — 技能管理
 - `/api/routines` — 例程管理
+- `/api/reviews` — 代码评审
+- `/api/ruler` — Ruler 流程模式
+- `/api/shares` — 文件分享
+- `/api/update` — 版本更新检查
+- `/api/project-db` — 项目数据库同步
+- `/api/git`、`/api/graph` — Git 操作和图数据
 
 **WebSocket：** `/ws/narrator?token=`（订阅/取消订阅模型），`/ws/terminal?terminalId=&token=`（stdin/stdout 管道）
 

@@ -119,24 +119,16 @@ async function fetchAnthropicModels(
 	config: AnthropicProviderConfig,
 ): Promise<AnthropicModelInfo[]> {
 	const baseUrl = (config.baseUrl || "https://api.anthropic.com/v1").replace(/\/+$/, "");
-	const isMax = !!config.maxMode;
 
-	// Build auth headers based on mode
+	if (!config.apiKey) {
+		throw new Error(`Anthropic API key not configured for provider "${config.name}"`);
+	}
+
+	// Always use Bearer auth (matching Claude Code CLI protocol)
 	const headers: Record<string, string> = {
 		"anthropic-version": "2023-06-01",
+		Authorization: `Bearer ${config.apiKey}`,
 	};
-
-	if (isMax) {
-		if (!config.apiKey) {
-			throw new Error(`API key not configured for MAX mode provider "${config.name}"`);
-		}
-		headers.authorization = `Bearer ${config.apiKey}`;
-	} else {
-		if (!config.apiKey) {
-			throw new Error(`Anthropic API key not configured for provider "${config.name}"`);
-		}
-		headers["x-api-key"] = config.apiKey;
-	}
 
 	const response = await fetch(`${baseUrl}/models`, { headers });
 

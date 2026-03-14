@@ -78,34 +78,41 @@ export function sendToTerminal(terminalId: string, message: TerminalServerMessag
 function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 	ws.data.subscribedTerminals.add(terminalId);
 
-	// Replay scrollback buffer so the client sees previous output
-	terminalService.getScrollback(terminalId).then((scrollback) => {
-		if (scrollback) {
-			try {
-				ws.send(
-					JSON.stringify({
-						type: "scrollback",
-						terminalId,
-						data: scrollback.data,
-						cols: scrollback.cols,
-						rows: scrollback.rows,
-					}),
-				);
-			} catch {
-				// connection may be dead
+	// If the terminal is a dtach session that's not currently attached,
+	// auto-reattach so new output flows through WebSocket.
+	terminalService
+		.ensureAttached(terminalId)
+		.then(() => {
+			// Replay scrollback buffer so the client sees previous output
+			return terminalService.getScrollback(terminalId);
+		})
+		.then((scrollback) => {
+			if (scrollback) {
+				try {
+					ws.send(
+						JSON.stringify({
+							type: "scrollback",
+							terminalId,
+							data: scrollback.data,
+							cols: scrollback.cols,
+							rows: scrollback.rows,
+						}),
+					);
+				} catch {
+					// connection may be dead
+				}
 			}
-		}
 
-		// Send current buffer state after scrollback
-		const bufferState = terminalService.getBufferState(terminalId);
-		if (bufferState) {
-			try {
-				ws.send(JSON.stringify({ type: "bufferState", terminalId, ...bufferState }));
-			} catch {
-				// noop
+			// Send current buffer state after scrollback
+			const bufferState = terminalService.getBufferState(terminalId);
+			if (bufferState) {
+				try {
+					ws.send(JSON.stringify({ type: "bufferState", terminalId, ...bufferState }));
+				} catch {
+					// noop
+				}
 			}
-		}
-	});
+		});
 }
 
 // === WebSocket handlers ===

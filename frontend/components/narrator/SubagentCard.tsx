@@ -92,6 +92,7 @@ export const SubagentCard = memo(
 			(toolCall.toolUseId && permCb?.bgRetryDismissedIds?.has(toolCall.toolUseId)) ?? false;
 		const showBgWarning = isBgWarning && !dismissed && !!onBgAgentRetry;
 		const isTerminal = /^(success|completed|denied|error|fail)$/.test(toolCall.status);
+		const isInitializing = toolCall.status === "initializing";
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
 		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
 		const prompt = input.prompt ?? "";
@@ -318,7 +319,7 @@ export const SubagentCard = memo(
 
 		const content = (
 			<MessageContextMenuCtx.Provider value={emptyCtx}>
-				<Box ref={cardRef}>
+				<Box ref={cardRef} className={isInitializing ? "tool-card-shimmer" : undefined}>
 					{/* Header: two-line collapsed view */}
 					<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
 						{/* Line 1: icon | type | model | calls | status | duration | chevron */}
@@ -487,7 +488,7 @@ export const SubagentCard = memo(
 														item.childMsg?.children,
 														item.tc.toolUseId,
 													);
-													const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Task";
+													const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Agent";
 													if (isSub) {
 														els.push(
 															<div
@@ -520,7 +521,7 @@ export const SubagentCard = memo(
 															nx.childMsg?.children,
 															nx.tc.toolUseId,
 														);
-														if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Task") break;
+														if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Agent") break;
 														run.push(nx);
 														j++;
 													}

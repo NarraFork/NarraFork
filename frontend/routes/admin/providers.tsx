@@ -95,7 +95,9 @@ function ProvidersPage() {
 				apiKey: p.apiKey ?? "",
 				baseUrl: p.baseUrl ?? "",
 				defaultModel: p.defaultModel ?? "",
-				maxMode: p.maxMode ?? false,
+				defaultReasoningEffort: p.defaultReasoningEffort ?? null,
+				proxy: p.proxy ?? "",
+				tlsRejectUnauthorized: p.tlsRejectUnauthorized ?? true,
 			}));
 			setAnthropicProviders(providers);
 			serverSnapshot.current.anthropicProviders = providers;

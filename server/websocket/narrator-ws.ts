@@ -240,7 +240,9 @@ export type NarratorServerMessage =
 				input?: unknown;
 				streamStartedAt?: number;
 			}>;
-	  };
+	  }
+	| { type: "model_changed"; narratorId: string; model: string }
+	| { type: "model_switched"; narratorId: string; model: string; provider: string };
 
 // Client → Server messages
 export type NarratorClientMessage =

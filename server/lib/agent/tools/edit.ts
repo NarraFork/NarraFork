@@ -371,21 +371,48 @@ function normalizeLineEndings(text: string): string {
 export const editTool: ToolDefinition = {
 	name: "Edit",
 	description:
-		"Edit a file by replacing an exact string match. old_string must be unique in the file unless replace_all is true. " +
-		"Uses cascading fuzzy matching (line-trimmed, block-anchor, whitespace-normalized, indentation-flexible, etc.) " +
-		"to tolerate minor whitespace/indentation differences from the LLM.",
+		"Performs exact string replacements in files.\n\n" +
+		"Usage:\n" +
+		"- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n" +
+		"- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.\n" +
+		"- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n" +
+		"- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n" +
+		"- The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.\n" +
+		"- Use `replace_all` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.",
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			file_path: {
+				description: "The absolute path to the file to modify",
+				type: "string",
+			},
+			old_string: {
+				description: "The text to replace",
+				type: "string",
+			},
+			new_string: {
+				description: "The text to replace it with (must be different from old_string)",
+				type: "string",
+			},
+			replace_all: {
+				description: "Replace all occurrences of old_string (default false)",
+				default: false,
+				type: "boolean",
+			},
+		},
+		required: ["file_path", "old_string", "new_string"],
+		additionalProperties: false,
+	},
 	parameters: z.object({
-		file_path: z.string().describe("Absolute or relative path to the file to edit"),
-		old_string: z
+		file_path: z.string().describe("The absolute path to the file to modify"),
+		old_string: z.string().describe("The text to replace"),
+		new_string: z
 			.string()
-			.describe(
-				"Exact string to find and replace. Must be unique in the file unless replace_all is true",
-			),
-		new_string: z.string().describe("Replacement string"),
+			.describe("The text to replace it with (must be different from old_string)"),
 		replace_all: z
 			.boolean()
 			.optional()
-			.describe("Replace all occurrences instead of requiring uniqueness"),
+			.describe("Replace all occurrences of old_string (default false)"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, old_string, new_string, replace_all } = args as {

@@ -117,7 +117,7 @@ terminalRoutes.get("/:id", async (c) => {
 });
 
 terminalRoutes.get("/:id/processes", async (c) => {
-	const processes = terminalService.getProcesses(c.req.param("id"));
+	const processes = await terminalService.getProcesses(c.req.param("id"));
 	return c.json(processes);
 });
 

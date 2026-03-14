@@ -18,7 +18,9 @@ export interface AnthropicProviderState {
 	apiKey: string;
 	baseUrl: string;
 	defaultModel: string;
-	maxMode: boolean;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	proxy?: string;
+	tlsRejectUnauthorized?: boolean;
 }
 
 	id: string;

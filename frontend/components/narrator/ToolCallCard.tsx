@@ -50,7 +50,7 @@ import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
- * Context carrying the toolUseId of the narrator's latest TodoWrite call.
+ * Context carrying the toolUseId of the narrator's latest TaskCreate call.
  * TodoDetail uses this to decide whether in_progress items should animate.
  */
 export const LatestTodosToolUseIdCtx = createContext<string | null>(null);
@@ -135,7 +135,7 @@ const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
-const TODO_TOOLS = new Set(["TodoWrite"]);
+const TODO_TOOLS = new Set(["TaskCreate"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
@@ -810,6 +810,23 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const isRunning = toolCall.status === "running" && !toolCall.outputJson;
 	const streamingOutput = toolCall._streamingOutput;
+
+	// Auto-scroll streaming output to bottom.
+	// The scrollable container is Mantine's <pre class="mantine-Code-root"> inside ContentViewer.
+	useEffect(() => {
+		if (!streamingOutput || !toolCall.toolUseId) return;
+		const raf = requestAnimationFrame(() => {
+			const card = document.getElementById(`tool-use-${toolCall.toolUseId}`);
+			if (!card) return;
+			// Find all Code-root <pre> elements; the last one is the streaming output
+			const pres = card.querySelectorAll<HTMLElement>("pre.mantine-Code-root");
+			const scrollable = pres.length > 1 ? pres[pres.length - 1] : pres[0];
+			if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
+				scrollable.scrollTop = scrollable.scrollHeight;
+			}
+		});
+		return () => cancelAnimationFrame(raf);
+	}, [streamingOutput, toolCall.toolUseId]);
 
 	return (
 		<Box mt="xs">

@@ -335,7 +335,7 @@ function resolveWhitelistDecision(
 ): "allow" | null {
 	if (whitelistDirs.length === 0) return null;
 
-	if (toolName === "Task") {
+	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		if (typeof workdir !== "string" || !workdir) return null;
 		const resolvedWorkdir = resolvePath(cwd, workdir);
@@ -441,7 +441,7 @@ function resolveBlacklistDecision(
 ): BlacklistDecisionResult | null {
 	if (blacklistDirs.length === 0) return null;
 
-	if (toolName === "Task") {
+	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		if (typeof workdir !== "string" || !workdir) return null;
 		const resolvedWorkdir = resolvePath(cwd, workdir);
@@ -480,12 +480,12 @@ function resolveBlacklistDecision(
 // individual tools go through their own permission checks. When Task specifies
 // a different workdir, it requires user approval (handled below).
 const ALWAYS_ALLOW_TOOLS = [
-	"TodoWrite",
+	"TaskCreate",
 	"EnterPlanMode",
 	"WebSearch",
 	"ContinueTask",
-	"CheckBackgroundTask",
-	"CancelBackgroundTask",
+	"TaskOutput",
+	"TaskStop",
 	"Skill",
 ];
 
@@ -743,11 +743,11 @@ export function resolvePermissionDecision(
 		};
 	}
 
-	// Task: auto-allow when using parent's cwd; ask when workdir differs.
+	// Agent: auto-allow when using parent's cwd; ask when workdir differs.
 	// bypassPermissions still bypasses this; dontAsk denies it.
 	// readOnly: explore/plan subagents within cwd subtree are allowed,
 	// outside cwd requires user approval, general subagents are always denied.
-	if (toolName === "Task") {
+	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		const resolvedWorkdir =
 			typeof workdir === "string" && workdir ? resolvePath(cwd, workdir) : null;
@@ -1290,8 +1290,8 @@ export async function handlePermission(
 		decisionReason = parts.join("; ");
 	}
 
-	// Build decisionReason for Task with custom workdir
-	if (toolName === "Task" && typeof input.workdir === "string" && input.workdir) {
+	// Build decisionReason for Agent with custom workdir
+	if (toolName === "Agent" && typeof input.workdir === "string" && input.workdir) {
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
@@ -1729,6 +1729,14 @@ async function createNarrator(
 	for (const routine of getBuiltinToolRoutines()) {
 		if (routine.tool && !disabledRoutines.has(routine.id)) {
 			active._enabledOptionalTools.add(routine.tool.toolName);
+		}
+	}
+	// Merge tools explicitly enabled on this narrator (via /load)
+	if (Array.isArray(narrator.enabledTools)) {
+		for (const toolName of narrator.enabledTools) {
+			if (OPTIONAL_TOOLS.has(toolName)) {
+				active._enabledOptionalTools.add(toolName);
+			}
 		}
 	}
 
@@ -2438,7 +2446,7 @@ async function runAgentLoop(
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				metadata: isAnthropicProvider(resolved.provider)
-					? { user_id: `narrafork_${narratorId}_session_${active.conversationId}` }
+					? { user_id: `user_${narratorId}_account__session_${active.conversationId}` }
 					: undefined,
 				// Exclude optional tools that haven't been loaded for this session
 				toolFilter: (tool) => {
@@ -3858,19 +3866,35 @@ export async function recoverOnStartup(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Enable an optional tool for a narrator session.
- * Returns "loaded" if newly enabled, "already_loaded" if already present,
- * "no_session" if the narrator has no active session, or "unknown_tool" if invalid.
+ * Enable an optional tool for a narrator.
+ * Persists to DB and updates the in-memory session if active.
  */
-export function loadOptionalTool(
+export async function loadOptionalTool(
 	narratorId: string,
 	toolName: string,
-): "loaded" | "already_loaded" | "no_session" | "unknown_tool" {
-	const active = activeNarrators.get(narratorId);
-	if (!active) return "no_session";
+): Promise<"loaded" | "already_loaded" | "unknown_tool"> {
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
-	if (active._enabledOptionalTools.has(toolName)) return "already_loaded";
-	active._enabledOptionalTools.add(toolName);
+
+	// Read current enabled tools from DB
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { enabledTools: true },
+	});
+	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
+	if (current.includes(toolName)) return "already_loaded";
+
+	// Persist
+	await db
+		.update(narrators)
+		.set({ enabledTools: [...current, toolName] })
+		.where(eq(narrators.id, narratorId));
+
+	// Also update in-memory session if active
+	const active = activeNarrators.get(narratorId);
+	if (active) {
+		active._enabledOptionalTools.add(toolName);
+	}
+
 	logger.info("Optional tool loaded", { narratorId, toolName });
 	return "loaded";
 }

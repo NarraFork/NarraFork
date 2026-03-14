@@ -91,11 +91,11 @@ adminRoutes.patch("/settings", async (c) => {
 
 adminRoutes.get("/terminals", async (c) => {
 	const terminals = await terminalService.listAll();
-	const orphanSockets = terminalService.listOrphanSockets();
+	const orphanSockets = await terminalService.listOrphanSockets();
 	const attachedSet = terminalService.getAttachedSet();
 	// Batch-fetch process info with a single ps snapshot
 	const runningIds = terminals.filter((t) => t.status === "running").map((t) => t.id);
-	const processMap = terminalService.getProcessesBatch(runningIds);
+	const processMap = await terminalService.getProcessesBatch(runningIds);
 	const annotated = terminals.map((t) => ({
 		...t,
 		attached: attachedSet.has(t.id),
@@ -132,7 +132,7 @@ adminRoutes.post("/terminals/kill-orphan", async (c) => {
 	if (!terminalId || typeof terminalId !== "string") {
 		throw new AppError("terminalId is required", 400, "VALIDATION_ERROR");
 	}
-	terminalService.killOrphanSocket(terminalId);
+	await terminalService.killOrphanSocket(terminalId);
 	return c.json({ ok: true });
 });
 

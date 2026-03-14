@@ -1,9 +1,10 @@
 /**
  * dtach service — manages detached terminal sessions that survive server restarts.
  * Falls back gracefully when dtach is not installed.
+ *
+ * All process queries use async Bun.spawn() to avoid blocking the main thread.
  */
 
-import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,6 +13,43 @@ import { logger } from "../lib/logger";
 import { DEV_NULL, IS_WINDOWS } from "../lib/platform";
 import type { TerminalRuntime } from "./runtime";
 import { spawnBunTerminal } from "./runtime-bun";
+
+// === Async command runner ===
+
+/**
+ * Run a command asynchronously via Bun.spawn and return stdout as string.
+ * Returns null on failure or timeout.
+ */
+async function runCommand(
+	cmd: string[],
+	opts?: { timeout?: number; env?: Record<string, string> },
+): Promise<string | null> {
+	try {
+		const proc = Bun.spawn(cmd, {
+			stdout: "pipe",
+			stderr: "ignore",
+			stdin: "ignore",
+			env: opts?.env,
+		});
+		const timeoutMs = opts?.timeout ?? 5000;
+		const result = await Promise.race([
+			proc.exited.then(async (code) => {
+				if (code !== 0) return null;
+				return new Response(proc.stdout).text();
+			}),
+			new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+		]);
+		// Kill if still running after timeout
+		try {
+			proc.kill();
+		} catch {
+			// already exited
+		}
+		return result;
+	} catch {
+		return null;
+	}
+}
 
 // === Process tree utilities ===
 
@@ -25,21 +63,12 @@ export interface ProcessInfo {
 	elapsed: string;
 }
 
-/**
- * Resolve the best command runner for process queries on Windows.
- *
- * Priority:
- *   1. Git Bash — has MSYS2 `ps` that understands Unix-style flags
- *   2. PowerShell (pwsh / powershell.exe)
- *   3. null — nothing available, process queries will return empty
- */
 type WinRunner = { type: "gitbash"; bash: string } | { type: "powershell"; pwsh: string } | null;
 let _cachedWinRunner: WinRunner | undefined;
 function getWinRunner(): WinRunner {
 	if (_cachedWinRunner !== undefined) return _cachedWinRunner;
 	const shell = detectShell();
 	if (shell.loginWrap) {
-		// loginWrap === true means Git Bash was detected
 		_cachedWinRunner = { type: "gitbash", bash: shell.path };
 	} else {
 		const pwsh = Bun.which("pwsh") ?? Bun.which("powershell.exe") ?? null;
@@ -48,80 +77,75 @@ function getWinRunner(): WinRunner {
 	return _cachedWinRunner;
 }
 
-/** Run a command via Git Bash and return stdout, or null on failure. */
-function runGitBash(bash: string, command: string, timeoutMs = 10000): string | null {
-	try {
-		return execSync(`"${bash}" --login -c '${command.replace(/'/g, "'\\''")}'`, {
-			encoding: "utf-8",
-			stdio: "pipe",
-			timeout: timeoutMs,
-			env: { ...process.env, MSYS2_PATH_TYPE: "inherit" },
-		});
-	} catch {
-		return null;
-	}
+async function runGitBash(
+	bash: string,
+	command: string,
+	timeoutMs = 10000,
+): Promise<string | null> {
+	return runCommand([bash, "--login", "-c", command], {
+		timeout: timeoutMs,
+		env: { ...process.env, MSYS2_PATH_TYPE: "inherit" },
+	});
 }
 
-/** Run a PowerShell command and return stdout, or null on failure. */
-function runPowerShell(pwsh: string, command: string, timeoutMs = 10000): string | null {
-	try {
-		return execSync(`"${pwsh}" -NoProfile -NonInteractive -Command "${command}"`, {
-			encoding: "utf-8",
-			stdio: "pipe",
-			timeout: timeoutMs,
-		});
-	} catch {
-		return null;
-	}
+async function runPowerShell(
+	pwsh: string,
+	command: string,
+	timeoutMs = 10000,
+): Promise<string | null> {
+	return runCommand([pwsh, "-NoProfile", "-NonInteractive", "-Command", command], {
+		timeout: timeoutMs,
+	});
 }
 
 /**
- * Snapshot of all system processes.
- * Unix: single `ps` call. Windows: Git Bash `ps` → PowerShell fallback.
- * Provides efficient tree traversal and info lookup without repeated execSync.
+ * Snapshot of all system processes (async construction).
+ * Use the static `create()` factory method.
  */
 export class ProcessSnapshot {
 	private infoByPid = new Map<number, ProcessInfo>();
 	private childrenByPid = new Map<number, number[]>();
 
-	constructor() {
+	private constructor() {}
+
+	static async create(): Promise<ProcessSnapshot> {
+		const snap = new ProcessSnapshot();
 		try {
 			if (IS_WINDOWS) {
-				this._buildFromWindows();
+				await snap._buildFromWindows();
 			} else {
-				this._buildFromUnix();
+				await snap._buildFromUnix();
 			}
 		} catch {
 			// ignore — snapshot will be empty
 		}
+		return snap;
 	}
 
-	private _buildFromUnix(): void {
-		const result = execSync("ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=", {
-			encoding: "utf-8",
-			stdio: "pipe",
-			timeout: 5000,
-		});
-		this._parseUnixPs(result);
+	private async _buildFromUnix(): Promise<void> {
+		const result = await runCommand(
+			["ps", "-ax", "-o", "pid=,ppid=,comm=,stat=,rss=,%cpu=,etime="],
+			{ timeout: 5000 },
+		);
+		if (result) this._parseUnixPs(result);
 	}
 
-	private _buildFromWindows(): void {
+	private async _buildFromWindows(): Promise<void> {
 		const runner = getWinRunner();
 		if (!runner) return;
 
 		if (runner.type === "gitbash") {
-			// MSYS2 ps supports -ax -o flags just like Unix
-			const result = runGitBash(runner.bash, "ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=");
+			const result = await runGitBash(
+				runner.bash,
+				"ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=",
+			);
 			if (result) {
 				this._parseUnixPs(result);
-				return;
 			}
-			// Git Bash ps failed — don't fallback, just return empty
 			return;
 		}
 
-		// PowerShell fallback
-		const result = runPowerShell(
+		const result = await runPowerShell(
 			runner.pwsh,
 			'Get-Process | ForEach-Object { "$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)" }',
 		);
@@ -198,9 +222,8 @@ export class ProcessSnapshot {
 
 /**
  * Find PIDs whose command line contains `searchArg`.
- * Unix: `pgrep -f`. Windows: Git Bash `pgrep` → PowerShell fallback.
  */
-export function findProcessesByArg(searchArg: string): number[] {
+export async function findProcessesByArg(searchArg: string): Promise<number[]> {
 	const pids: number[] = [];
 	try {
 		if (IS_WINDOWS) {
@@ -208,20 +231,18 @@ export function findProcessesByArg(searchArg: string): number[] {
 			if (!runner) return pids;
 
 			if (runner.type === "gitbash") {
-				const result = runGitBash(runner.bash, `pgrep -f "${searchArg}"`);
+				const result = await runGitBash(runner.bash, `pgrep -f "${searchArg}"`);
 				if (result) {
 					for (const line of result.trim().split(/\r?\n/)) {
 						const pid = Number.parseInt(line, 10);
 						if (!Number.isNaN(pid)) pids.push(pid);
 					}
-					return pids;
 				}
 				return pids;
 			}
 
-			// PowerShell fallback
 			const escaped = searchArg.replace(/'/g, "''").replace(/"/g, '\\"');
-			const result = runPowerShell(
+			const result = await runPowerShell(
 				runner.pwsh,
 				`Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${escaped}*' } | ForEach-Object { $_.ProcessId }`,
 			);
@@ -231,14 +252,12 @@ export function findProcessesByArg(searchArg: string): number[] {
 				if (!Number.isNaN(pid)) pids.push(pid);
 			}
 		} else {
-			const result = execSync(`pgrep -f "${searchArg}"`, {
-				encoding: "utf-8",
-				stdio: "pipe",
-				timeout: 5000,
-			});
-			for (const line of result.trim().split("\n")) {
-				const pid = Number.parseInt(line, 10);
-				if (!Number.isNaN(pid)) pids.push(pid);
+			const result = await runCommand(["pgrep", "-f", searchArg], { timeout: 5000 });
+			if (result) {
+				for (const line of result.trim().split("\n")) {
+					const pid = Number.parseInt(line, 10);
+					if (!Number.isNaN(pid)) pids.push(pid);
+				}
 			}
 		}
 	} catch {
@@ -249,9 +268,8 @@ export function findProcessesByArg(searchArg: string): number[] {
 
 /**
  * Get child PIDs recursively.
- * Unix: `ps`. Windows: Git Bash `ps` → PowerShell fallback.
  */
-export function getDescendantPids(pid: number): number[] {
+export async function getDescendantPids(pid: number): Promise<number[]> {
 	const descendants: number[] = [];
 	try {
 		const children = new Map<number, number[]>();
@@ -261,14 +279,13 @@ export function getDescendantPids(pid: number): number[] {
 			if (!runner) return descendants;
 
 			if (runner.type === "gitbash") {
-				const result = runGitBash(runner.bash, "ps -ax -o pid=,ppid=");
+				const result = await runGitBash(runner.bash, "ps -ax -o pid=,ppid=");
 				if (result) {
 					parseUnixPidPpid(result, children);
 				}
-				// If Git Bash ps failed, return empty
 				if (children.size === 0) return descendants;
 			} else {
-				const result = runPowerShell(
+				const result = await runPowerShell(
 					runner.pwsh,
 					'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)" }',
 				);
@@ -288,12 +305,10 @@ export function getDescendantPids(pid: number): number[] {
 				}
 			}
 		} else {
-			const result = execSync("ps -ax -o pid=,ppid=", {
-				encoding: "utf-8",
-				stdio: "pipe",
-				timeout: 5000,
-			});
-			parseUnixPidPpid(result, children);
+			const result = await runCommand(["ps", "-ax", "-o", "pid=,ppid="], { timeout: 5000 });
+			if (result) {
+				parseUnixPidPpid(result, children);
+			}
 		}
 
 		// BFS to collect all descendants
@@ -311,7 +326,6 @@ export function getDescendantPids(pid: number): number[] {
 	return descendants;
 }
 
-/** Parse Unix `ps -o pid=,ppid=` output into a parent→children map. */
 function parseUnixPidPpid(output: string, children: Map<number, number[]>): void {
 	for (const line of output.trim().split(/\r?\n/)) {
 		const parts = line.trim().split(/\s+/);
@@ -328,8 +342,8 @@ function parseUnixPidPpid(output: string, children: Map<number, number[]>): void
 	}
 }
 
-function killProcessTree(pid: number): void {
-	const descendants = getDescendantPids(pid);
+async function killProcessTree(pid: number): Promise<void> {
+	const descendants = await getDescendantPids(pid);
 	for (const childPid of descendants.reverse()) {
 		try {
 			process.kill(childPid, "SIGKILL");
@@ -357,17 +371,13 @@ export const dtachService = {
 		}
 	},
 
-	isAvailable(): boolean {
+	async isAvailable(): Promise<boolean> {
 		if (_available === null) {
 			if (IS_WINDOWS) {
 				_available = false;
 			} else {
-				try {
-					execSync("which dtach", { encoding: "utf-8", stdio: "pipe", timeout: 3000 });
-					_available = true;
-				} catch {
-					_available = false;
-				}
+				const result = await runCommand(["which", "dtach"], { timeout: 3000 });
+				_available = result !== null;
 			}
 			logger.info("dtach availability", { available: _available });
 		}
@@ -378,7 +388,6 @@ export const dtachService = {
 		return join(this.socketsDir, `terminal-${terminalId}.sock`);
 	},
 
-	/** Create a new detached session. Returns the dtach subprocess. */
 	async createSession(opts: {
 		terminalId: string;
 		cwd: string;
@@ -388,8 +397,6 @@ export const dtachService = {
 		const socketPath = this.getSocketPath(opts.terminalId);
 		const shell = detectShell().path;
 
-		// dtach -n: create new session without attaching
-		// -z: disable suspend (Ctrl+Z doesn't detach)
 		const proc = Bun.spawn(["dtach", "-n", socketPath, "-z", shell, "-li"], {
 			cwd: opts.cwd,
 			env: {
@@ -401,14 +408,12 @@ export const dtachService = {
 			stdio: ["ignore", "ignore", "ignore"],
 		});
 
-		// Wait for socket to appear (dtach creates it asynchronously)
 		await this.waitForSocket(socketPath, 3000);
 
 		logger.info("dtach session created", { terminalId: opts.terminalId, socketPath });
 		return { proc };
 	},
 
-	/** Attach to an existing dtach session via Bun.Terminal PTY */
 	attachSession(opts: {
 		terminalId: string;
 		cols: number;
@@ -427,8 +432,7 @@ export const dtachService = {
 		});
 	},
 
-	/** Check if a dtach socket is still alive */
-	isSocketAlive(terminalId: string): boolean {
+	async isSocketAlive(terminalId: string): Promise<boolean> {
 		const socketPath = this.getSocketPath(terminalId);
 		if (!existsSync(socketPath)) return false;
 		try {
@@ -437,19 +441,16 @@ export const dtachService = {
 		} catch {
 			return false;
 		}
-		// Verify dtach process is running
-		const pids = findProcessesByArg(socketPath);
+		const pids = await findProcessesByArg(socketPath);
 		return pids.length > 0;
 	},
 
-	/** Kill the dtach session and all child processes */
-	killSession(terminalId: string): void {
+	async killSession(terminalId: string): Promise<void> {
 		const socketPath = this.getSocketPath(terminalId);
-		const dtachPids = findProcessesByArg(socketPath);
+		const dtachPids = await findProcessesByArg(socketPath);
 		for (const pid of dtachPids) {
-			killProcessTree(pid);
+			await killProcessTree(pid);
 		}
-		// Clean up socket file
 		try {
 			if (existsSync(socketPath)) unlinkSync(socketPath);
 		} catch {
@@ -457,7 +458,6 @@ export const dtachService = {
 		}
 	},
 
-	/** Wait for a socket file to appear */
 	async waitForSocket(socketPath: string, timeoutMs: number): Promise<void> {
 		const start = Date.now();
 		const interval = 50;

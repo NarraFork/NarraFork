@@ -156,7 +156,7 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 		},
 	});
 	const defaultReasoningMut = useMutation({
-		mutationFn: (reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null) =>
+		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | null) =>
 			api.codexSetDefaultReasoningEffort(reasoningEffort),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
@@ -375,13 +375,13 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 				? tn("reasoning_medium")
 				: effectiveDefaultReasoningEffort === "high"
 					? tn("reasoning_high")
-					: effectiveDefaultReasoningEffort === "xhigh"
-						? tn("reasoning_xhigh")
+					: effectiveDefaultReasoningEffort === "none"
+						? tn("reasoning_none")
 						: tn("reasoning_auto");
 
 	const handleSaveDefaultReasoningEffort = () => {
 		const nextReasoningEffort =
-			(effectiveDefaultReasoningEffort as "low" | "medium" | "high" | "xhigh") || null;
+			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high") || null;
 		defaultReasoningMut.mutate(nextReasoningEffort, {
 			onSuccess: () => {
 				setDefaultReasoningEffort(nextReasoningEffort ?? "");
@@ -497,10 +497,10 @@ export function CodexSection({ hiddenModels, onToggleHidden }: CodexSectionProps
 									onChange={(v) => setDefaultReasoningEffort(v === "auto" ? "" : v)}
 									data={[
 										{ label: tn("reasoning_auto"), value: "auto" },
+										{ label: tn("reasoning_none"), value: "none" },
 										{ label: tn("reasoning_low"), value: "low" },
 										{ label: tn("reasoning_medium"), value: "medium" },
 										{ label: tn("reasoning_high"), value: "high" },
-										{ label: tn("reasoning_xhigh"), value: "xhigh" },
 									]}
 								/>
 								<Button

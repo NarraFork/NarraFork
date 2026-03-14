@@ -7,10 +7,34 @@ import { readFileText, writeFileText } from "./encoding";
 
 export const writeTool: ToolDefinition = {
 	name: "Write",
-	description: "Write content to a file. Creates parent directories if needed.",
+	description:
+		"Writes a file to the local filesystem.\n\n" +
+		"Usage:\n" +
+		"- This tool will overwrite the existing file if there is one at the provided path.\n" +
+		"- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n" +
+		"- Prefer the Edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n" +
+		"- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n" +
+		"- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.",
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			file_path: {
+				description: "The absolute path to the file to write (must be absolute, not relative)",
+				type: "string",
+			},
+			content: {
+				description: "The content to write to the file",
+				type: "string",
+			},
+		},
+		required: ["file_path", "content"],
+		additionalProperties: false,
+	},
 	parameters: z.object({
-		file_path: z.string().describe("Absolute or relative path to the file to write"),
-		content: z.string().describe("Full content to write to the file"),
+		file_path: z
+			.string()
+			.describe("The absolute path to the file to write (must be absolute, not relative)"),
+		content: z.string().describe("The content to write to the file"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, content } = args as { file_path: string; content: string };

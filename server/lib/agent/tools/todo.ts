@@ -32,8 +32,8 @@ function formatTodos(todos: TodoItem[]): string {
 		.join("\n");
 }
 
-export const todoWriteTool: ToolDefinition = {
-	name: "TodoWrite",
+export const taskCreateTool: ToolDefinition = {
+	name: "TaskCreate",
 	description:
 		"Write the complete todo list for this session, replacing any existing todos. " +
 		"Pass the full list of todo items each time — this is a full replacement, not an incremental update. " +

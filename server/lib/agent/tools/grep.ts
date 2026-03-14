@@ -3,11 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod/v4";
 import { logger } from "../../logger";
 import { IS_WINDOWS } from "../../platform";
-import { toForwardSlash } from "../../platform-path";
 import type { ToolDefinition, ToolResult } from "../types";
-
-const MAX_LINE_LENGTH = 2000;
-const MAX_MATCHES = 100;
 
 const RG_INSTALL_HINT = IS_WINDOWS
 	? "ripgrep (rg) is not installed. Install it with:\n\n  winget install BurntSushi.ripgrep.MSVC\n\nThen restart NarraFork."
@@ -88,30 +84,146 @@ if (!RG_PATH) {
 	);
 }
 
-const shellLabel = IS_WINDOWS ? "Shell" : "Bash";
+const DESCRIPTION = `A powerful search tool built on ripgrep
 
-const DESCRIPTION = `- Fast content search tool that works with any codebase size
-- Searches file contents using regular expressions
-- Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
-- Filter files by pattern with the include parameter (eg. "*.js", "*.{ts,tsx}")
-- Returns file paths and line numbers with at least one match sorted by modification time
-- Use this tool when you need to find files containing specific patterns
-- If you need to identify/count the number of matches within files, use the ${shellLabel} tool with \`rg\` (ripgrep) directly. Do NOT use \`grep\`.
-- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead`;
+  Usage:
+  - ALWAYS use Grep for search tasks. NEVER invoke \`grep\` or \`rg\` as a Bash command. The Grep tool has been optimized for correct permissions and access.
+  - Supports full regex syntax (e.g., "log.*Error", "function\\s+\\w+")
+  - Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
+  - Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
+  - Use Agent tool for open-ended searches requiring multiple rounds
+  - Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use \`interface\\{\\}\` to find \`interface{}\` in Go code)
+  - Multiline matching: By default patterns match within single lines only. For cross-line patterns like \`struct \\{[\\s\\S]*?field\`, use \`multiline: true\``;
 
 export const grepTool: ToolDefinition = {
 	name: "Grep",
 	description: DESCRIPTION,
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			pattern: {
+				description: "The regular expression pattern to search for in file contents",
+				type: "string",
+			},
+			path: {
+				description:
+					"File or directory to search in (rg PATH). Defaults to current working directory.",
+				type: "string",
+			},
+			glob: {
+				description: 'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob',
+				type: "string",
+			},
+			output_mode: {
+				description:
+					'Output mode: "content" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), "files_with_matches" shows file paths (supports head_limit), "count" shows match counts (supports head_limit). Defaults to "files_with_matches".',
+				type: "string",
+				enum: ["content", "files_with_matches", "count"],
+			},
+			"-B": {
+				description:
+					'Number of lines to show before each match (rg -B). Requires output_mode: "content", ignored otherwise.',
+				type: "number",
+			},
+			"-A": {
+				description:
+					'Number of lines to show after each match (rg -A). Requires output_mode: "content", ignored otherwise.',
+				type: "number",
+			},
+			"-C": {
+				description: "Alias for context.",
+				type: "number",
+			},
+			context: {
+				description:
+					'Number of lines to show before and after each match (rg -C). Requires output_mode: "content", ignored otherwise.',
+				type: "number",
+			},
+			"-n": {
+				description:
+					'Show line numbers in output (rg -n). Requires output_mode: "content", ignored otherwise. Defaults to true.',
+				type: "boolean",
+			},
+			"-i": {
+				description: "Case insensitive search (rg -i)",
+				type: "boolean",
+			},
+			type: {
+				description:
+					"File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.",
+				type: "string",
+			},
+			head_limit: {
+				description:
+					'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 0 (unlimited).',
+				type: "number",
+			},
+			offset: {
+				description:
+					'Skip first N lines/entries before applying head_limit, equivalent to "| tail -n +N | head -N". Works across all output modes. Defaults to 0.',
+				type: "number",
+			},
+			multiline: {
+				description:
+					"Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
+				type: "boolean",
+			},
+		},
+		required: ["pattern"],
+		additionalProperties: false,
+	},
 	parameters: z.object({
-		pattern: z.string().describe("The regex pattern to search for in file contents"),
+		pattern: z.string().describe("The regular expression pattern to search for in file contents"),
 		path: z
 			.string()
 			.optional()
-			.describe("The directory or file to search in. Defaults to the current working directory."),
-		include: z
+			.describe("File or directory to search in (rg PATH). Defaults to current working directory."),
+		glob: z
 			.string()
 			.optional()
-			.describe('File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")'),
+			.describe('Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob'),
+		output_mode: z
+			.enum(["content", "files_with_matches", "count"])
+			.optional()
+			.describe(
+				'Output mode: "content" shows matching lines, "files_with_matches" shows file paths (default), "count" shows match counts.',
+			),
+		"-B": z
+			.number()
+			.optional()
+			.describe("Number of lines to show before each match (rg -B). Content mode only."),
+		"-A": z
+			.number()
+			.optional()
+			.describe("Number of lines to show after each match (rg -A). Content mode only."),
+		"-C": z.number().optional().describe("Alias for context."),
+		context: z
+			.number()
+			.optional()
+			.describe("Number of lines to show before and after each match (rg -C). Content mode only."),
+		"-n": z
+			.boolean()
+			.optional()
+			.describe("Show line numbers in output (rg -n). Content mode only. Defaults to true."),
+		"-i": z.boolean().optional().describe("Case insensitive search (rg -i)"),
+		type: z
+			.string()
+			.optional()
+			.describe("File type to search (rg --type). Common types: js, py, rust, go, java, etc."),
+		head_limit: z
+			.number()
+			.optional()
+			.describe("Limit output to first N lines/entries. Defaults to 0 (unlimited)."),
+		offset: z
+			.number()
+			.optional()
+			.describe("Skip first N lines/entries before applying head_limit. Defaults to 0."),
+		multiline: z
+			.boolean()
+			.optional()
+			.describe(
+				"Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		if (!RG_PATH) {
@@ -121,11 +233,33 @@ export const grepTool: ToolDefinition = {
 		const {
 			pattern,
 			path: searchPathArg,
-			include,
+			glob: globPattern,
+			output_mode: outputMode = "files_with_matches",
+			"-B": beforeCtx,
+			"-A": afterCtx,
+			"-C": cAlias,
+			context: contextLines,
+			"-n": showLineNumbers = true,
+			"-i": caseInsensitive,
+			type: fileType,
+			head_limit: headLimit = 0,
+			offset = 0,
+			multiline,
 		} = args as {
 			pattern: string;
 			path?: string;
-			include?: string;
+			glob?: string;
+			output_mode?: "content" | "files_with_matches" | "count";
+			"-B"?: number;
+			"-A"?: number;
+			"-C"?: number;
+			context?: number;
+			"-n"?: boolean;
+			"-i"?: boolean;
+			type?: string;
+			head_limit?: number;
+			offset?: number;
+			multiline?: boolean;
 		};
 
 		if (!pattern) {
@@ -135,21 +269,51 @@ export const grepTool: ToolDefinition = {
 		let searchPath = searchPathArg ?? ctx.cwd;
 		searchPath = isAbsolute(searchPath) ? searchPath : resolve(ctx.cwd, searchPath);
 
-		const rgArgs = [
-			RG_PATH,
-			"-nH",
-			"--hidden",
-			"--no-messages",
-			"--field-match-separator=|",
-			"--regexp",
-			pattern,
-		];
+		// Build rg arguments
+		const rgArgs: string[] = [RG_PATH, "--hidden", "--no-messages"];
 
-		if (include) {
-			rgArgs.push("--glob", include);
+		// Output mode flags
+		if (outputMode === "files_with_matches") {
+			rgArgs.push("-l");
+		} else if (outputMode === "count") {
+			rgArgs.push("-c");
+		} else {
+			// content mode
+			if (showLineNumbers) {
+				rgArgs.push("-n");
+			}
+			// Context lines (only in content mode)
+			const effectiveC = cAlias ?? contextLines;
+			if (effectiveC != null) {
+				rgArgs.push("-C", String(effectiveC));
+			} else {
+				if (beforeCtx != null) rgArgs.push("-B", String(beforeCtx));
+				if (afterCtx != null) rgArgs.push("-A", String(afterCtx));
+			}
 		}
 
-		rgArgs.push(searchPath);
+		// Case insensitive
+		if (caseInsensitive) {
+			rgArgs.push("-i");
+		}
+
+		// Multiline
+		if (multiline) {
+			rgArgs.push("-U", "--multiline-dotall");
+		}
+
+		// File type filter
+		if (fileType) {
+			rgArgs.push("--type", fileType);
+		}
+
+		// Glob filter
+		if (globPattern) {
+			rgArgs.push("--glob", globPattern);
+		}
+
+		// Pattern and path
+		rgArgs.push("--regexp", pattern, searchPath);
 
 		try {
 			const proc = Bun.spawn(rgArgs, {
@@ -167,12 +331,11 @@ export const grepTool: ToolDefinition = {
 
 			// Exit codes: 0 = matches found, 1 = no matches, 2 = errors (but may still have matches)
 			if (exitCode === 2 && !stdout.trim()) {
-				// No output + exit code 2: could be invalid regex or all paths inaccessible
 				if (stderr.trim()) {
 					return { output: `ripgrep error: ${stderr.trim()}`, isError: true };
 				}
 				return {
-					output: "No files found",
+					output: "No matches found",
 					title: pattern,
 					metadata: { matches: 0, truncated: false },
 				};
@@ -180,7 +343,7 @@ export const grepTool: ToolDefinition = {
 
 			if (exitCode === 1) {
 				return {
-					output: "No files found",
+					output: "No matches found",
 					title: pattern,
 					metadata: { matches: 0, truncated: false },
 				};
@@ -192,91 +355,43 @@ export const grepTool: ToolDefinition = {
 
 			const hasErrors = exitCode === 2;
 
-			// Handle both Unix (\n) and Windows (\r\n) line endings
-			const lines = stdout.trim().split(/\r?\n/);
-			const matches: {
-				path: string;
-				modTime: number;
-				lineNum: number;
-				lineText: string;
-			}[] = [];
+			// Split output into lines
+			const rawLines = stdout.trimEnd().split(/\r?\n/);
 
-			for (const line of lines) {
-				if (!line) continue;
-
-				const [rawFilePath, lineNumStr, ...lineTextParts] = line.split("|");
-				if (!rawFilePath || !lineNumStr || lineTextParts.length === 0) continue;
-
-				const lineNum = parseInt(lineNumStr, 10);
-				const lineText = lineTextParts.join("|");
-
-				// Normalise backslashes so paths are consistent across platforms
-				const filePath = toForwardSlash(rawFilePath);
-
-				const file = Bun.file(filePath);
-				const stats = await file.stat().catch(() => null);
-				if (!stats) continue;
-
-				matches.push({
-					path: filePath,
-					modTime: stats.mtime.getTime(),
-					lineNum,
-					lineText,
-				});
+			// Apply offset and head_limit
+			let lines = rawLines;
+			if (offset > 0) {
+				lines = lines.slice(offset);
+			}
+			const truncated = headLimit > 0 && lines.length > headLimit;
+			if (headLimit > 0) {
+				lines = lines.slice(0, headLimit);
 			}
 
-			// Sort by modification time descending (most recently modified first)
-			matches.sort((a, b) => b.modTime - a.modTime);
-
-			const truncated = matches.length > MAX_MATCHES;
-			const finalMatches = truncated ? matches.slice(0, MAX_MATCHES) : matches;
-
-			if (finalMatches.length === 0) {
+			if (lines.length === 0 || (lines.length === 1 && !lines[0])) {
 				return {
-					output: "No files found",
+					output: "No matches found",
 					title: pattern,
 					metadata: { matches: 0, truncated: false },
 				};
 			}
 
-			const totalMatches = matches.length;
-			const outputLines = [
-				`Found ${totalMatches} matches${truncated ? ` (showing first ${MAX_MATCHES})` : ""}`,
-			];
-
-			let currentFile = "";
-			for (const match of finalMatches) {
-				if (currentFile !== match.path) {
-					if (currentFile !== "") {
-						outputLines.push("");
-					}
-					currentFile = match.path;
-					outputLines.push(`${match.path}:`);
-				}
-				const truncatedLineText =
-					match.lineText.length > MAX_LINE_LENGTH
-						? `${match.lineText.substring(0, MAX_LINE_LENGTH)}...`
-						: match.lineText;
-				outputLines.push(`  Line ${match.lineNum}: ${truncatedLineText}`);
-			}
-
+			const output = lines.join("\n");
+			const suffix: string[] = [];
 			if (truncated) {
-				outputLines.push("");
-				outputLines.push(
-					`(Results truncated: showing ${MAX_MATCHES} of ${totalMatches} matches (${totalMatches - MAX_MATCHES} hidden). Consider using a more specific path or pattern.)`,
+				suffix.push(
+					`\n(Results limited to ${headLimit} entries. ${rawLines.length - offset - headLimit} more available.)`,
 				);
 			}
-
 			if (hasErrors) {
-				outputLines.push("");
-				outputLines.push("(Some paths were inaccessible and skipped)");
+				suffix.push("\n(Some paths were inaccessible and skipped)");
 			}
 
 			return {
-				output: outputLines.join("\n"),
+				output: output + suffix.join(""),
 				title: pattern,
 				metadata: {
-					matches: totalMatches,
+					matches: rawLines.length,
 					truncated,
 				},
 			};

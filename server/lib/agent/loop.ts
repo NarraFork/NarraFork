@@ -240,7 +240,7 @@ function isRetryableError(err: unknown): boolean {
 const OUTPUT_THROTTLE_MS = 100;
 
 /** Tools that can safely run in parallel when multiple appear in the same turn. */
-const PARALLEL_TOOLS = new Set(["Task"]);
+const PARALLEL_TOOLS = new Set(["Agent"]);
 
 type ReasoningBlockEntry = { text: string; providerMetadata?: ReasoningProviderMetadata };
 
@@ -269,10 +269,10 @@ export async function* agentLoop(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
-	const resolvedProvider = resolveProviderAndModel(config.model);
-	const provider = resolvedProvider.adapter;
-	const effectiveModel = resolvedProvider.model;
-	const effectiveProvider = resolvedProvider.provider;
+	let resolvedProvider = resolveProviderAndModel(config.model);
+	let provider = resolvedProvider.adapter;
+	let effectiveModel = resolvedProvider.model;
+	let effectiveProvider = resolvedProvider.provider;
 	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
 	const locale = (config.locale as Locale) ?? "en";
 	let allTools: ResolvedToolDefinition[] = toolRegistry
@@ -308,7 +308,7 @@ export async function* agentLoop(
 		);
 	}
 
-	const tools = provider.formatTools(allTools);
+	let tools = provider.formatTools(allTools);
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 
@@ -341,6 +341,50 @@ export async function* agentLoop(
 					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 				}
 				pendingToolResults = replacement.pendingToolResults;
+			}
+		}
+
+		// Check for mid-loop model switch (only between turns, not on the first turn)
+		if (!isFirstTurn && config.getModelOverride) {
+			const newModel = config.getModelOverride();
+			if (newModel) {
+				try {
+					const newResolved = resolveProviderAndModel(newModel);
+					const providerChanged = newResolved.provider !== effectiveProvider;
+
+					effectiveModel = newResolved.model;
+					effectiveProvider = newResolved.provider;
+					config.model = newModel;
+					config.provider = newResolved.provider;
+
+					if (providerChanged) {
+						// Provider changed — rebuild tools and history for the new adapter
+						provider = newResolved.adapter;
+						tools = provider.formatTools(allTools);
+
+						// Force history rebuild via onBeforeTurn so messages are
+						// re-serialised in the new provider's format.
+						if (config.onBeforeTurn) {
+							const replacement = await config.onBeforeTurn(turnIndex);
+							if (replacement) {
+								history = replacement.history;
+								pendingToolResults = replacement.pendingToolResults;
+							}
+						}
+						if (config.systemPrompt) {
+							provider.injectSystemPrompt(
+								history,
+								config.systemPrompt,
+								effectiveModel,
+								config.locale,
+							);
+						}
+					}
+
+					yield { type: "model_switched", model: effectiveModel, provider: effectiveProvider };
+				} catch {
+					// resolveProviderAndModel failed — keep current model, skip switch
+				}
 			}
 		}
 
@@ -400,6 +444,7 @@ export async function* agentLoop(
 				stickySessionKey: config.narratorId,
 				reasoningEffort: config.reasoningEffort,
 				serviceTier: config.serviceTier,
+				metadata: config.metadata,
 				...(isFirstTurn && images?.length ? { images } : {}),
 			});
 
@@ -1418,7 +1463,10 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		};
 	} finally {
 		if (progressTimer) clearInterval(progressTimer);
-		if (pendingOutputTimer) clearTimeout(pendingOutputTimer);
+		if (pendingOutputTimer) {
+			clearTimeout(pendingOutputTimer);
+			pendingOutputTimer = undefined;
+		}
 	}
 }
 

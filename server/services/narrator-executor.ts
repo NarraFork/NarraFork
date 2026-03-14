@@ -112,7 +112,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	// end-of-session pattern where the model updates todos and stops.
 	// Also skip when already flagged by output_truncated (provider-confirmed truncation).
 	const skipInterruptionCheck =
-		lastToolNames.length > 0 && lastToolNames.every((n) => n === "TodoWrite");
+		lastToolNames.length > 0 && lastToolNames.every((n) => n === "TaskCreate");
 	if (
 		!interrupted &&
 		settings.agent.smartInterruptionCheck &&
@@ -141,6 +141,23 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
  * 1. No content at all → definitely interrupted.
  * 2. Has content → ask the summary model to judge (reply "pass" or "retry").
  */
+/**
+ * Heuristic pre-check: if the tail of the text ends in a way that is
+ * obviously complete, skip the expensive model call entirely.
+ */
+function looksCompleteByHeuristic(text: string): boolean {
+	const tail = text.trimEnd();
+	if (!tail) return false;
+
+	// Ends with sentence-ending punctuation (including CJK)
+	if (/[.!?。！？…)）】》」』\]"']$/.test(tail)) return true;
+
+	// Ends with a closed markdown code block
+	if (/```\s*$/.test(tail)) return true;
+
+	return false;
+}
+
 async function checkOutputInterruption(text: string, narratorId: string): Promise<boolean> {
 	if (!text.trim()) {
 		logger.info("Smart interruption check: empty output, marking as interrupted", {
@@ -149,27 +166,29 @@ async function checkOutputInterruption(text: string, narratorId: string): Promis
 		return true;
 	}
 
+	// Fast path: obviously complete endings don't need a model call
+	if (looksCompleteByHeuristic(text)) {
+		return false;
+	}
+
 	try {
 		const systemPrompt =
-			"You judge whether an AI coding assistant's final message was truncated mid-stream.\n" +
-			"You will receive the TAIL of the message. ONLY look at the very end — ignore anything earlier.\n\n" +
-			"TRUNCATED means the text literally stops mid-sentence, mid-word, mid-code-block (unclosed ```), " +
-			"or mid-list-item — as if the network cut out.\n\n" +
-			"NOT truncated (even if brief or abrupt):\n" +
-			"- Ends with a complete sentence, question, or summary section\n" +
-			"- Ends with a finished bullet list or numbered list\n" +
-			"- Ends with a closing remark like '总结', 'Summary', 'Done', etc.\n" +
-			"- The message is short but grammatically complete\n" +
-			"- All code blocks are closed\n\n" +
-			"Reply EXACTLY one word: pass (complete) or retry (truncated).";
+			"You judge whether an AI assistant's message was CUT OFF mid-stream (network/token limit).\n" +
+			"You receive only the last ~500 chars. Focus EXCLUSIVELY on the final line.\n\n" +
+			"Reply 'retry' ONLY if the text ends mid-word, mid-sentence without punctuation, " +
+			"or inside an unclosed ``` code block.\n" +
+			"Reply 'pass' for everything else — including short, abrupt, or incomplete-looking answers " +
+			"that still end on a grammatical boundary.\n\n" +
+			"One word only: pass or retry.";
 
-		const snippet = text.length > 2000 ? text.slice(-2000) : text;
+		const snippet = text.slice(-500);
 		const result = await agentGenerateWithMeta(snippet, settings.agent.summaryModel, systemPrompt);
 		const verdict = result.text.trim().toLowerCase();
 
 		if (verdict === "retry") {
 			logger.info("Smart interruption check: summary model flagged as interrupted", {
 				narratorId,
+				tail: text.slice(-100),
 			});
 			return true;
 		}

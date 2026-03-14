@@ -67,7 +67,7 @@ export function AnthropicProvidersSection({
 				apiKey: "",
 				baseUrl: "",
 				defaultModel: "",
-				maxMode: false,
+				proxy: "",
 			},
 		]);
 		setExpandedProviders((prev) => new Set(prev).add(id));
@@ -81,8 +81,17 @@ export function AnthropicProvidersSection({
 	);
 
 	const updateProvider = useCallback(
-		(id: string, field: keyof AnthropicProviderState, value: string | boolean) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
+		(id: string, field: keyof AnthropicProviderState, value: string | boolean | null) => {
+			onProvidersChange(
+				providers.map((p): AnthropicProviderState => {
+					if (p.id !== id) return p;
+					if (field === "defaultReasoningEffort") {
+						const effort = value as "none" | "low" | "medium" | "high" | null;
+						return { ...p, defaultReasoningEffort: effort || null };
+					}
+					return { ...p, [field]: value };
+				}),
+			);
 		},
 		[providers, onProvidersChange],
 	);
@@ -160,11 +169,6 @@ export function AnthropicProvidersSection({
 										<Text fw={500} size="sm">
 											{p.name || `Provider #${idx + 1}`}
 										</Text>
-										{p.maxMode && (
-											<Badge size="xs" variant="filled" color="violet">
-												MAX
-											</Badge>
-										)}
 										{providerModelCount > 0 && (
 											<Badge size="xs" variant="light">
 												{t("anthropicModelsCount", {
@@ -206,12 +210,6 @@ export function AnthropicProvidersSection({
 												)
 											}
 										/>
-										<Switch
-											label={t("anthropicMaxMode")}
-											description={t("anthropicMaxModeDesc")}
-											checked={p.maxMode}
-											onChange={(e) => updateProvider(p.id, "maxMode", e.currentTarget.checked)}
-										/>
 										<PasswordInput
 											label={t("anthropicApiKey")}
 											placeholder={t("anthropicApiKeyPlaceholder")}
@@ -224,6 +222,23 @@ export function AnthropicProvidersSection({
 											value={p.baseUrl}
 											onChange={(e) => updateProvider(p.id, "baseUrl", e.currentTarget.value)}
 										/>
+										<TextInput
+											label={t("anthropicProxy")}
+											placeholder={t("anthropicProxyPlaceholder")}
+											description={t("anthropicProxyDesc")}
+											value={p.proxy ?? ""}
+											onChange={(e) => updateProvider(p.id, "proxy", e.currentTarget.value)}
+										/>
+										{p.proxy && (
+											<Switch
+												label={t("anthropicTlsRejectUnauthorized")}
+												description={t("anthropicTlsRejectUnauthorizedDesc")}
+												checked={p.tlsRejectUnauthorized === false}
+												onChange={(e) =>
+													updateProvider(p.id, "tlsRejectUnauthorized", !e.currentTarget.checked)
+												}
+											/>
+										)}
 										<Group gap="xs">
 											<Button
 												size="xs"

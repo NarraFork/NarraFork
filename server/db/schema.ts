@@ -228,7 +228,7 @@ export const narrators = sqliteTable(
 		}).default("default"),
 		previousPermissionMode: text("previous_permission_mode"),
 		reasoningEffort: text("reasoning_effort", {
-			enum: ["low", "medium", "high", "xhigh"],
+			enum: ["none", "low", "medium", "high"],
 		}),
 		fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
 		relaxedPlan: integer("relaxed_plan", { mode: "boolean" }).notNull().default(false),
@@ -251,6 +251,8 @@ export const narrators = sqliteTable(
 		),
 		prunedPercent: integer("pruned_percent"),
 		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(true),
+		/** JSON array of optional tool names explicitly enabled for this narrator */
+		enabledTools: text("enabled_tools", { mode: "json" }).$type<string[]>(),
 		// Background task fields
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		backgroundStatus: text("background_status", {

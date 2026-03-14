@@ -838,7 +838,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	const id = c.req.param("id");
 	const { reasoningEffort } = await c.req.json();
-	const validEfforts = ["low", "medium", "high", "xhigh"];
+	const validEfforts = ["none", "low", "medium", "high"];
 	if (
 		reasoningEffort !== null &&
 		reasoningEffort !== undefined &&

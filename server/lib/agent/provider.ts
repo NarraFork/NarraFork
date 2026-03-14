@@ -92,10 +92,12 @@ export interface ChatParams {
 	stickySessionKey?: string;
 	/** Base64-encoded images to attach to the current user message */
 	images?: Array<{ format: string; base64: string }>;
-	/** Reasoning effort for Codex-mode providers (low, medium, high, xhigh) */
-	reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+	/** Reasoning effort level — maps to thinking config (Anthropic) or reasoning config (Codex) */
+	reasoningEffort?: "none" | "low" | "medium" | "high";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** Metadata to include in the request body (e.g. user_id for Anthropic) */
+	metadata?: { user_id: string };
 }
 
 // === The adapter interface ===

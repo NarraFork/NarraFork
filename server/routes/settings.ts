@@ -43,7 +43,9 @@ const anthropicProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
-	maxMode: z.boolean().optional(),
+	defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
+	proxy: z.string().optional(),
+	tlsRejectUnauthorized: z.boolean().optional(),
 });
 
 	id: z.string().min(1),
@@ -137,7 +139,7 @@ const updateSettingsSchema = z
 			.object({
 				proxy: z.string().optional(),
 				loadBalancingMode: z.enum(["priority", "balanced"]).optional(),
-				defaultReasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
+				defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
 			})
 			.partial()
 			.optional(),

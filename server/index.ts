@@ -453,6 +453,7 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 
 // Clean up leftover share directories from previous server runs
 import { cleanupStaleShares } from "./lib/shares";
+
 cleanupStaleShares();
 
 // Register project DB backup sync (event-driven dual-write)
@@ -480,10 +481,10 @@ if (existsSync(legacySnapshotsDir)) {
 }
 
 // Graceful shutdown
-const shutdown = () => {
+const shutdown = async () => {
 	stopHeartbeat();
 	stopContainerProxy();
-	terminalService.shutdownAll();
+	await terminalService.shutdownAll();
 	chapterCleanup.clearAllTimers();
 	worktreeWatcher.shutdown();
 	projectDbManager.closeAll();
@@ -503,7 +504,7 @@ let shuttingDown = false;
 const safeShutdown = () => {
 	if (shuttingDown) return;
 	shuttingDown = true;
-	shutdown();
+	shutdown().catch(() => process.exit(1));
 };
 process.on("SIGINT", safeShutdown);
 process.on("SIGTERM", safeShutdown);

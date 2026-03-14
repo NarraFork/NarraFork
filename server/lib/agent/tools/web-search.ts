@@ -23,9 +23,52 @@ import type { ToolDefinition, ToolResult } from "../types";
 export const webSearchTool: ToolDefinition = {
 	name: "WebSearch",
 	description:
-		"Search the web for current information. Returns relevant search results with titles, URLs, and snippets. " +
-		"Use this when you need up-to-date information that may not be in your training data, " +
-		"such as recent documentation, library versions, API references, or current events.",
+		"\n- Allows Claude to search the web and use the results to inform responses\n" +
+		"- Provides up-to-date information for current events and recent data\n" +
+		"- Returns search result information formatted as search result blocks, including links as markdown hyperlinks\n" +
+		"- Use this tool for accessing information beyond Claude's knowledge cutoff\n" +
+		"- Searches are performed automatically within a single API call\n" +
+		"\nCRITICAL REQUIREMENT - You MUST follow this:\n" +
+		'  - After answering the user\'s question, you MUST include a "Sources:" section at the end of your response\n' +
+		"  - In the Sources section, list all relevant URLs from the search results as markdown hyperlinks: [Title](URL)\n" +
+		"  - This is MANDATORY - never skip including sources in your response\n" +
+		"  - Example format:\n\n" +
+		"    [Your answer here]\n\n" +
+		"    Sources:\n" +
+		"    - [Source Title 1](https://example.com/1)\n" +
+		"    - [Source Title 2](https://example.com/2)\n" +
+		"\nUsage notes:\n" +
+		"  - Domain filtering is supported to include or block specific websites\n" +
+		"  - Web search is only available in the US\n" +
+		"\nIMPORTANT - Use the correct year in search queries:\n" +
+		"  - The current month is March 2026. You MUST use this year when searching for recent information, documentation, or current events.\n" +
+		'  - Example: If the user asks for "latest React docs", search for "React documentation" with the current year, NOT last year',
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			query: {
+				description: "The search query to use",
+				type: "string",
+				minLength: 2,
+			},
+			allowed_domains: {
+				description: "Only include search results from these domains",
+				type: "array",
+				items: {
+					type: "string",
+				},
+			},
+			blocked_domains: {
+				description: "Never include search results from these domains",
+				type: "array",
+				items: {
+					type: "string",
+				},
+			},
+		},
+		required: ["query"],
+		additionalProperties: false,
+	},
 	parameters: z.object({
 		query: z.string().describe("Search query string"),
 	}),

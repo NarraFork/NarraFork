@@ -196,9 +196,17 @@ export async function handleTransientError(opts: {
 		delayMs,
 	});
 
-	// Notify frontend
+	// Notify frontend (include retry metadata for statusbar display)
+	const warningPayload = {
+		type: "warning" as const,
+		narratorId,
+		message: error,
+		retryCount,
+		maxRetries,
+		delayMs,
+	};
 	eventBus.emit({ type: "narrator:warning", narratorId, message: error });
-	broadcastToNarrator(narratorId, { type: "warning", narratorId, message: error });
+	broadcastToNarrator(narratorId, warningPayload);
 
 	// Abort-aware backoff
 	await abortableSleep(delayMs, signal);

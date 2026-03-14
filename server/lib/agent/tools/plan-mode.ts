@@ -8,12 +8,72 @@ import type { ToolDefinition, ToolResult } from "../types";
 export const enterPlanModeTool: ToolDefinition = {
 	name: "EnterPlanMode",
 	description:
-		"Enter plan mode — ONLY use this when the task requires producing an implementation plan " +
-		"(e.g. the user explicitly asks for a plan, or a complex multi-step change needs an upfront design). " +
-		"Do NOT enter plan mode for code analysis, code review, bug investigation, answering questions, " +
-		"simple tasks, bug fixes, or straightforward changes — handle those directly in the current context. " +
-		"In plan mode, focus on reading relevant files and forming an actionable implementation plan " +
-		"without making any edits or running commands. Call ExitPlanMode with your plan when ready.",
+		"Use this tool proactively when you're about to start a non-trivial implementation task. Getting user sign-off on your approach before writing code prevents wasted effort and ensures alignment. This tool transitions you into plan mode where you can explore the codebase and design an implementation approach for user approval.\n\n" +
+		"## When to Use This Tool\n\n" +
+		"**Prefer using EnterPlanMode** for implementation tasks unless they're simple. Use it when ANY of these conditions apply:\n\n" +
+		"1. **New Feature Implementation**: Adding meaningful new functionality\n" +
+		'   - Example: "Add a logout button" - where should it go? What should happen on click?\n' +
+		'   - Example: "Add form validation" - what rules? What error messages?\n\n' +
+		"2. **Multiple Valid Approaches**: The task can be solved in several different ways\n" +
+		'   - Example: "Add caching to the API" - could use Redis, in-memory, file-based, etc.\n' +
+		'   - Example: "Improve performance" - many optimization strategies possible\n\n' +
+		"3. **Code Modifications**: Changes that affect existing behavior or structure\n" +
+		'   - Example: "Update the login flow" - what exactly should change?\n' +
+		'   - Example: "Refactor this component" - what\'s the target architecture?\n\n' +
+		"4. **Architectural Decisions**: The task requires choosing between patterns or technologies\n" +
+		'   - Example: "Add real-time updates" - WebSockets vs SSE vs polling\n' +
+		'   - Example: "Implement state management" - Redux vs Context vs custom solution\n\n' +
+		"5. **Multi-File Changes**: The task will likely touch more than 2-3 files\n" +
+		'   - Example: "Refactor the authentication system"\n' +
+		'   - Example: "Add a new API endpoint with tests"\n\n' +
+		"6. **Unclear Requirements**: You need to explore before understanding the full scope\n" +
+		'   - Example: "Make the app faster" - need to profile and identify bottlenecks\n' +
+		'   - Example: "Fix the bug in checkout" - need to investigate root cause\n\n' +
+		"7. **User Preferences Matter**: The implementation could reasonably go multiple ways\n" +
+		"   - If you would use AskUserQuestion to clarify the approach, use EnterPlanMode instead\n" +
+		"   - Plan mode lets you explore first, then present options with context\n\n" +
+		"## When NOT to Use This Tool\n\n" +
+		"Only skip EnterPlanMode for simple tasks:\n" +
+		"- Single-line or few-line fixes (typos, obvious bugs, small tweaks)\n" +
+		"- Adding a single function with clear requirements\n" +
+		"- Tasks where the user has given very specific, detailed instructions\n" +
+		"- Pure research/exploration tasks (use the Agent tool with explore agent instead)\n\n" +
+		"## What Happens in Plan Mode\n\n" +
+		"In plan mode, you'll:\n" +
+		"1. Thoroughly explore the codebase using Glob, Grep, and Read tools\n" +
+		"2. Understand existing patterns and architecture\n" +
+		"3. Design an implementation approach\n" +
+		"4. Present your plan to the user for approval\n" +
+		"5. Use AskUserQuestion if you need to clarify approaches\n" +
+		"6. Exit plan mode with ExitPlanMode when ready to implement\n\n" +
+		"## Examples\n\n" +
+		"### GOOD - Use EnterPlanMode:\n" +
+		'User: "Add user authentication to the app"\n' +
+		"- Requires architectural decisions (session vs JWT, where to store tokens, middleware structure)\n\n" +
+		'User: "Optimize the database queries"\n' +
+		"- Multiple approaches possible, need to profile first, significant impact\n\n" +
+		'User: "Implement dark mode"\n' +
+		"- Architectural decision on theme system, affects many components\n\n" +
+		'User: "Add a delete button to the user profile"\n' +
+		"- Seems simple but involves: where to place it, confirmation dialog, API call, error handling, state updates\n\n" +
+		'User: "Update the error handling in the API"\n' +
+		"- Affects multiple files, user should approve the approach\n\n" +
+		"### BAD - Don't use EnterPlanMode:\n" +
+		'User: "Fix the typo in the README"\n' +
+		"- Straightforward, no planning needed\n\n" +
+		'User: "Add a console.log to debug this function"\n' +
+		"- Simple, obvious implementation\n\n" +
+		'User: "What files handle routing?"\n' +
+		"- Research task, not implementation planning\n\n" +
+		"## Important Notes\n\n" +
+		"- This tool REQUIRES user approval - they must consent to entering plan mode\n" +
+		"- If unsure whether to use it, err on the side of planning - it's better to get alignment upfront than to redo work\n" +
+		"- Users appreciate being consulted before significant changes are made to their codebase",
+	rawJsonSchema: {
+		type: "object",
+		properties: {},
+		additionalProperties: false,
+	},
 	parameters: z.object({
 		confirm: z
 			.literal(true)
@@ -30,14 +90,51 @@ export const enterPlanModeTool: ToolDefinition = {
 export const exitPlanModeTool: ToolDefinition = {
 	name: "ExitPlanMode",
 	description:
-		"Exit plan mode and present your plan. " +
-		"You can provide the plan in TWO ways (mutually exclusive):\n" +
-		"1. **Inline**: Put the complete plan in the 'plan' parameter directly.\n" +
-		"2. **File-based**: For complex/long plans, first write the plan to the designated plan file " +
-		"using the Write tool (you may use multiple Write/Edit calls to build it incrementally), " +
-		"then pass the file path in the 'planFile' parameter.\n" +
-		"You MUST use exactly one of 'plan' or 'planFile'. " +
-		"Do NOT summarize or abbreviate. The plan must be complete and self-contained.",
+		"Use this tool when you are in plan mode and have finished writing your plan to the plan file and are ready for user approval.\n\n" +
+		"## How This Tool Works\n" +
+		"- You should have already written your plan to the plan file specified in the plan mode system message\n" +
+		"- This tool does NOT take the plan content as a parameter - it will read the plan from the file you wrote\n" +
+		"- This tool simply signals that you're done planning and ready for the user to review and approve\n" +
+		"- The user will see the contents of your plan file when they review it\n\n" +
+		"## When to Use This Tool\n" +
+		"IMPORTANT: Only use this tool when the task requires planning the implementation steps of a task that requires writing code. For research tasks where you're gathering information, searching files, reading files or in general trying to understand the codebase - do NOT use this tool.\n\n" +
+		"## Before Using This Tool\n" +
+		"Ensure your plan is complete and unambiguous:\n" +
+		"- If you have unresolved questions about requirements or approach, use AskUserQuestion first (in earlier phases)\n" +
+		"- Once your plan is finalized, use THIS tool to request approval\n\n" +
+		'**Important:** Do NOT use AskUserQuestion to ask "Is this plan okay?" or "Should I proceed?" - that\'s exactly what THIS tool does. ExitPlanMode inherently requests user approval of your plan.\n\n' +
+		"## Examples\n\n" +
+		'1. Initial task: "Search for and understand the implementation of vim mode in the codebase" - Do not use the exit plan mode tool because you are not planning the implementation steps of a task.\n' +
+		'2. Initial task: "Help me implement yank mode for vim" - Use the exit plan mode tool after you have finished planning the implementation steps of the task.\n' +
+		'3. Initial task: "Add a new feature to handle user authentication" - If unsure about auth method (OAuth, JWT, etc.), use AskUserQuestion first, then use exit plan mode tool after clarifying the approach.',
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			allowedPrompts: {
+				description:
+					"Prompt-based permissions needed to implement the plan. These describe categories of actions rather than specific commands.",
+				type: "array",
+				items: {
+					type: "object",
+					properties: {
+						tool: {
+							description: "The tool this prompt applies to",
+							type: "string",
+							enum: ["Bash"],
+						},
+						prompt: {
+							description:
+								'Semantic description of the action, e.g. "run tests", "install dependencies"',
+							type: "string",
+						},
+					},
+					required: ["tool", "prompt"],
+					additionalProperties: false,
+				},
+			},
+		},
+		additionalProperties: {},
+	},
 	parameters: z.object({
 		plan: z
 			.string()

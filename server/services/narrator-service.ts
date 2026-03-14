@@ -283,7 +283,7 @@ interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
-	reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
 }
@@ -313,7 +313,7 @@ export async function handleLoadToolCommand(
 	}
 	const { loadOptionalTool } = await import("./narrator-session");
 	const toolName = cmdResult.loadTool;
-	const result = loadOptionalTool(narratorId, toolName);
+	const result = await loadOptionalTool(narratorId, toolName);
 	const alreadyLoaded = result === "already_loaded";
 	const infoText = alreadyLoaded
 		? `🔧 Tool already loaded: ${toolName}`
@@ -1247,14 +1247,62 @@ export const narratorService = {
 	},
 
 	async getToolCallDetail(narratorId: string, toolUseId: string) {
+		// 1. Direct match — tool call belongs to this narrator
 		const tc = await db.query.narratorToolCalls.findFirst({
 			where: and(
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.toolUseId, toolUseId),
 			),
 		});
-		if (!tc) throw new NotFoundError("ToolCall", toolUseId);
-		return tc;
+		if (tc) return tc;
+
+		// 2. Fallback — look up by toolUseId alone, then verify the caller
+		//    narrator can see it. This covers:
+		//    - Forked narrators (shared message refs, tool call under original narrator)
+		//    - Subagent tool calls viewed inline in the parent narrator
+		//    - Combination of both (fork + subagent)
+		const candidate = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+		});
+		if (!candidate) throw new NotFoundError("ToolCall", toolUseId);
+
+		// Verify: the tool call's message (or an ancestor via parentToolUseId)
+		// must be reachable from this narrator's message refs.
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, candidate.messageId),
+			columns: { id: true, parentToolUseId: true },
+		});
+		if (msg) {
+			// Check if the message itself is in this narrator's refs
+			const directRef = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, msg.id),
+				),
+			});
+			if (directRef) return candidate;
+
+			// For subagent messages: the message has parentToolUseId pointing to
+			// a tool_use block in the parent narrator's message. Find that parent
+			// message and check if it's in our refs.
+			if (msg.parentToolUseId) {
+				const parentTc = await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.toolUseId, msg.parentToolUseId),
+					columns: { messageId: true },
+				});
+				if (parentTc) {
+					const parentRef = await db.query.narratorMessageRefs.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, parentTc.messageId),
+						),
+					});
+					if (parentRef) return candidate;
+				}
+			}
+		}
+
+		throw new NotFoundError("ToolCall", toolUseId);
 	},
 
 	/** Extract the full compact summary from a compact system message. */
@@ -2500,7 +2548,7 @@ export const narratorService = {
 
 	async updateReasoningEffort(
 		narratorId: string,
-		reasoningEffort: "low" | "medium" | "high" | "xhigh" | null,
+		reasoningEffort: "none" | "low" | "medium" | "high" | null,
 	) {
 		const now = new Date().toISOString();
 		await db

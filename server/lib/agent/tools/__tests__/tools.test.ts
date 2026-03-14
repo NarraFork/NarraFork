@@ -574,15 +574,18 @@ describe("Glob", () => {
 // ============================================================
 
 describe("Grep", () => {
-	test("returns structured output with file paths and line numbers", async () => {
+	test("files_with_matches mode returns file paths (default)", async () => {
 		const result = await grepTool.execute({ pattern: "const" }, makeCtx());
 		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("Found");
-		expect(result.output).toContain("matches");
-		// Should contain file paths with colon suffix (grouped format)
-		expect(result.output).toMatch(/\.ts:/);
-		// Should contain "Line N:" format
-		expect(result.output).toMatch(/Line \d+:/);
+		// Default mode is files_with_matches — returns file paths
+		expect(result.output).toContain(".ts");
+	});
+
+	test("content mode returns lines with line numbers", async () => {
+		const result = await grepTool.execute({ pattern: "const", output_mode: "content" }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		// rg -n outputs "path:linenum:content"
+		expect(result.output).toMatch(/:\d+:/);
 	});
 
 	test("returns title and metadata", async () => {
@@ -596,65 +599,72 @@ describe("Grep", () => {
 	test("no matches returns informative message", async () => {
 		const result = await grepTool.execute({ pattern: "zzz_nonexistent_zzz" }, makeCtx());
 		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("No files found");
+		expect(result.output).toContain("No matches found");
 		expect(result.metadata).toEqual({ matches: 0, truncated: false });
 	});
 
-	test("include filter restricts scope", async () => {
-		const result = await grepTool.execute({ pattern: "const", include: "*.ts" }, makeCtx());
+	test("glob filter restricts scope", async () => {
+		const result = await grepTool.execute({ pattern: "const", glob: "*.ts" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("a.ts");
 		expect(result.output).not.toContain("c.json");
 	});
 
-	test("include with multiple extensions via brace expansion", async () => {
-		const result = await grepTool.execute({ pattern: ".", include: "*.{ts,json}" }, makeCtx());
+	test("glob with multiple extensions via brace expansion", async () => {
+		const result = await grepTool.execute({ pattern: ".", glob: "*.{ts,json}" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain(".ts");
 		expect(result.output).toContain(".json");
 	});
 
 	test("relative path resolved against cwd", async () => {
-		const result = await grepTool.execute({ pattern: "line", path: "sample.txt" }, makeCtx());
+		const result = await grepTool.execute(
+			{ pattern: "line", path: "sample.txt", output_mode: "content" },
+			makeCtx(),
+		);
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("line one");
 	});
 
 	test("searches specific file", async () => {
-		const result = await grepTool.execute({ pattern: "line", path: SAMPLE_FILE }, makeCtx());
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("line one");
-		expect(result.output).toContain("Line 1:");
-	});
-
-	test("results are sorted by modification time", async () => {
-		// Touch a.ts to make it newer
-		writeFileSync(join(TEST_DIR, "a.ts"), "const a = 1;\n");
-		const result = await grepTool.execute({ pattern: "const", include: "*.ts" }, makeCtx());
-		expect(result.isError).toBeFalsy();
-		// a.ts was just written, should appear before b.ts
-		const aIdx = result.output.indexOf("a.ts:");
-		const bIdx = result.output.indexOf("b.ts:");
-		expect(aIdx).toBeLessThan(bIdx);
-	});
-
-	test("line text is truncated at MAX_LINE_LENGTH", async () => {
-		const longLine = "x".repeat(3000);
-		writeFileSync(join(TEST_DIR, "long.txt"), `${longLine}\n`);
 		const result = await grepTool.execute(
-			{ pattern: "x+", path: join(TEST_DIR, "long.txt") },
+			{ pattern: "line", path: SAMPLE_FILE, output_mode: "content" },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
-		// Should contain truncation indicator
-		expect(result.output).toContain("...");
-		// Should not contain the full 3000-char line
-		expect(result.output.length).toBeLessThan(3000);
+		expect(result.output).toContain("line one");
+		// rg -n outputs line numbers like "1:line one"
+		expect(result.output).toContain("1:");
+	});
+
+	test("glob filter finds matching files", async () => {
+		writeFileSync(join(TEST_DIR, "a.ts"), "const a = 1;\n");
+		const result = await grepTool.execute(
+			{ pattern: "const", glob: "*.ts", output_mode: "content" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("a.ts");
+		expect(result.output).toContain("b.ts");
+	});
+
+	test("long lines are included in output", async () => {
+		const longLine = "x".repeat(3000);
+		writeFileSync(join(TEST_DIR, "long.txt"), `${longLine}\n`);
+		const result = await grepTool.execute(
+			{ pattern: "x+", path: join(TEST_DIR, "long.txt"), output_mode: "content" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("x");
 	});
 
 	test("searches hidden files", async () => {
 		writeFileSync(join(TEST_DIR, ".hidden"), "secret_value\n");
-		const result = await grepTool.execute({ pattern: "secret_value", path: TEST_DIR }, makeCtx());
+		const result = await grepTool.execute(
+			{ pattern: "secret_value", path: TEST_DIR, output_mode: "content" },
+			makeCtx(),
+		);
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("secret_value");
 	});
@@ -688,10 +698,10 @@ describe("Grep injection safety", () => {
 		expect(existsSync(marker)).toBe(false);
 	});
 
-	test("include with shell metacharacters is not interpreted", async () => {
+	test("glob with shell metacharacters is not interpreted", async () => {
 		const marker = join(TEST_DIR, "pwned3");
 		const _result = await grepTool.execute(
-			{ pattern: "line", include: `$(touch ${marker})` },
+			{ pattern: "line", glob: `$(touch ${marker})` },
 			makeCtx(),
 		);
 		expect(existsSync(marker)).toBe(false);
@@ -715,23 +725,33 @@ describe("Grep schema validation", () => {
 		expect(result.success).toBe(false);
 	});
 
-	test("rejects unknown params (old params removed)", () => {
-		const _result = grepTool.parameters.safeParse({
+	test("accepts all CC params", () => {
+		const result = grepTool.parameters.safeParse({
 			pattern: "x",
 			output_mode: "content",
 			"-i": true,
+			"-B": 3,
+			"-A": 3,
+			"-n": true,
+			glob: "*.ts",
+			type: "ts",
+			head_limit: 10,
+			offset: 5,
+			multiline: true,
 		});
-		// Zod strict mode or extra keys — should still parse pattern but ignore extras
-		// The key point: these old params no longer exist in the schema
+		expect(result.success).toBe(true);
+	});
+
+	test("accepts minimal params", () => {
 		const parsed = grepTool.parameters.safeParse({ pattern: "x" });
 		expect(parsed.success).toBe(true);
 	});
 
-	test("accepts all valid params", () => {
+	test("accepts path and glob", () => {
 		const result = grepTool.parameters.safeParse({
 			pattern: "test",
 			path: "/tmp",
-			include: "*.ts",
+			glob: "*.ts",
 		});
 		expect(result.success).toBe(true);
 	});
@@ -943,8 +963,8 @@ describe("zodToJsonSchema", () => {
 		const props = json.properties as Record<string, any>;
 		expect(props.pattern.type).toBe("string");
 		expect(props.pattern.description).toBeDefined();
-		expect(props.include.type).toBe("string");
-		expect(props.include.description).toBeDefined();
+		expect(props.glob.type).toBe("string");
+		expect(props.glob.description).toBeDefined();
 	});
 
 	test("converts all tool schemas without error", () => {

@@ -38,18 +38,53 @@ function buildParameters() {
 			.boolean()
 			.optional()
 			.describe(
-				"If true, run the task in the background without blocking the parent narrator. Returns a task ID immediately that can be checked later with CheckBackgroundTask. The background task runs independently and its results can be retrieved when complete. Best for long-running exploration or analysis tasks that don't need to block the current conversation.",
+				"If true, run the task in the background without blocking the parent narrator. Returns a task ID immediately that can be checked later with TaskOutput. The background task runs independently and its results can be retrieved when complete. Best for long-running exploration or analysis tasks that don't need to block the current conversation.",
 			),
 	});
 }
 
-export const taskTool: ToolDefinition = {
-	name: "Task",
+export const agentTool: ToolDefinition = {
+	name: "Agent",
 	get description() {
 		return baseDescription;
 	},
 	get parameters() {
 		return buildParameters();
+	},
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			description: {
+				description: "A short (3-5 word) description of the task",
+				type: "string",
+			},
+			prompt: {
+				description: "The task for the agent to perform",
+				type: "string",
+			},
+			subagent_type: {
+				description: "The type of specialized agent to use for this task",
+				type: "string",
+			},
+			resume: {
+				description:
+					"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
+				type: "string",
+			},
+			run_in_background: {
+				description:
+					"Set to true to run this agent in the background. You will be notified when it completes.",
+				type: "boolean",
+			},
+			isolation: {
+				description:
+					'Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo.',
+				type: "string",
+				enum: ["worktree"],
+			},
+		},
+		required: ["description", "prompt"],
+		additionalProperties: false,
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const { prompt, subagent_type, model, workdir, background } = args as {

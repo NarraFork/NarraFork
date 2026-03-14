@@ -8,6 +8,22 @@ import type {
 	ToolCallRow,
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+
+/**
+ * Map legacy tool names to their current equivalents.
+ * Keeps historical sessions working after the CC-aligned rename.
+ */
+const LEGACY_TOOL_NAMES: Record<string, string> = {
+	Task: "Agent",
+	TodoWrite: "TaskCreate",
+	CheckBackgroundTask: "TaskOutput",
+	CancelBackgroundTask: "TaskStop",
+};
+
+function normalizeToolName(name: string): string {
+	return LEGACY_TOOL_NAMES[name] ?? name;
+}
+
 import type { ToolCallData } from "./ToolCallCard";
 
 export function isToolOnlyMessage(msg: NarratorMsg): boolean {
@@ -54,7 +70,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 		}
 		results.push({
 			id: block.tcId ?? tc?.id,
-			toolName: block.name ?? "",
+			toolName: normalizeToolName(block.name ?? ""),
 			toolUseId: block.id,
 			inputJson: block.inputJson ?? tc?.inputJson ?? block.input,
 			outputJson: block.outputJson ?? tc?.outputJson,
@@ -138,7 +154,7 @@ export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
 			const tc = tcs.find((t) => t.toolUseId === block.id);
 			if (!tc) continue;
 			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
-			const isSubagent = tc.toolName === "Task" || children.length > 0;
+			const isSubagent = tc.toolName === "Agent" || children.length > 0;
 			items.push({ kind: "tool", tc, msg, children, isSubagent, blockIndex: realIndex });
 		}
 	}

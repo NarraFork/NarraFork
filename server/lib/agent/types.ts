@@ -215,15 +215,15 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Glob",
 	"Grep",
 	"WebSearch",
-	"TodoWrite",
+	"TaskCreate",
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"Bash",
 	"Shell",
-	"Task",
+	"Agent",
 	"ContinueTask",
-	"CheckBackgroundTask",
-	"CancelBackgroundTask",
+	"TaskOutput",
+	"TaskStop",
 	"AskUserQuestion",
 	"Skill",
 ]);
@@ -247,8 +247,8 @@ export interface AgentConfig {
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
-	/** Reasoning effort — maps to thinking budget (Anthropic) or reasoning config (Codex) */
-	reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
+	reasoningEffort?: "none" | "low" | "medium" | "high";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */

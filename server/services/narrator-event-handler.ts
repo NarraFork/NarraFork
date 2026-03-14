@@ -536,7 +536,7 @@ export async function processEvent(
 
 			// Main narrator hooks: TodoWrite, EnterPlanMode
 			for (const tu of event.toolUses) {
-				if (tu.name === "TodoWrite" && tu.input?.todos && hooks?.onTodoWrite) {
+				if (tu.name === "TaskCreate" && tu.input?.todos && hooks?.onTodoWrite) {
 					await hooks.onTodoWrite(tu.input.todos as unknown[], tu.toolUseId);
 				}
 				if (tu.name === "EnterPlanMode" && hooks?.onEnterPlanMode) {
@@ -870,6 +870,16 @@ export async function processEvent(
 				status: event.status,
 				query: event.query,
 				queries: event.queries,
+			});
+			return null;
+		}
+
+		case "model_switched": {
+			dualBroadcast(ctx, {
+				type: "model_switched",
+				narratorId: broadcastTargetId,
+				model: event.model,
+				provider: event.provider,
 			});
 			return null;
 		}

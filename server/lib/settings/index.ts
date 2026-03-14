@@ -59,16 +59,14 @@ export interface AnthropicProviderConfig {
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/**
-	 * MAX mode — mimic Claude Code CLI protocol.
-	 * When enabled, apiKey is sent as Bearer token (instead of x-api-key),
-	 * with additional Claude Code specific headers, tool name prefixing, etc.
-	 */
-	maxMode?: boolean;
-	/**
 	 * Default reasoning effort for Anthropic models when narrator reasoningEffort is unset.
-	 * Maps to thinking budget (low/medium/high) or effort parameter (xhigh → max).
+	 * Maps to thinking config (adaptive/disabled) and effort parameter for supported models.
 	 */
-	defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh";
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high";
+	/** Optional HTTPS proxy URL for all requests to this provider. */
+	proxy?: string;
+	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
+	tlsRejectUnauthorized?: boolean;
 }
 
 	/** Unique short ID (8 chars). */
@@ -198,7 +196,7 @@ export interface NarraForkSettings {
 		/** Load balancing mode: "priority" (use highest priority) or "balanced" (round-robin). */
 		loadBalancingMode?: "priority" | "balanced";
 		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
-		defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh";
+		defaultReasoningEffort?: "none" | "low" | "medium" | "high";
 	};
 	/** Built-in routines configuration. */
 	routines: {
@@ -575,7 +573,7 @@ export function isAnthropicProvider(prefix?: string): boolean {
  */
 export function resolveDefaultReasoningEffort(
 	provider?: string,
-): "low" | "medium" | "high" | "xhigh" | undefined {
+): "none" | "low" | "medium" | "high" | undefined {
 	if (usesCodexApiMode(provider)) {
 		return settings.codex?.defaultReasoningEffort;
 	}

@@ -10,7 +10,8 @@
  * always operate on fully-processed state.
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -23,11 +24,14 @@ const DEFAULT_SCROLLBACK = 5000;
 
 const ESC = "\x1b";
 
+let _buffersDir: string | null = null;
 function getBuffersDir(): string {
+	if (_buffersDir) return _buffersDir;
 	const dir = resolve(homedir(), ".narrafork", "buffers");
 	if (!existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}
+	_buffersDir = dir;
 	return dir;
 }
 
@@ -156,7 +160,7 @@ export class BufferManager {
 	saveToDisk(): void {
 		// Fire-and-forget: flush then save. The periodic timer will retry if needed.
 		this.writeChain
-			.then(() => {
+			.then(async () => {
 				const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 				const serialized = this.serializeAddon.serialize({
 					scrollback: this.xterm.options.scrollback,
@@ -168,7 +172,7 @@ export class BufferManager {
 					rows: this.xterm.rows,
 					mouseMode: { ...this.mouseMode },
 				};
-				writeFileSync(filePath, JSON.stringify(fileData), "utf-8");
+				await Bun.write(filePath, JSON.stringify(fileData));
 				this.dirty = false;
 			})
 			.catch((err) => {
@@ -179,11 +183,12 @@ export class BufferManager {
 			});
 	}
 
-	loadFromDisk(): boolean {
+	async loadFromDisk(): Promise<boolean> {
 		const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 		try {
-			if (!existsSync(filePath)) return false;
-			const raw = readFileSync(filePath, "utf-8");
+			const file = Bun.file(filePath);
+			if (!(await file.exists())) return false;
+			const raw = await file.text();
 			const parsed = JSON.parse(raw);
 
 			if (parsed.version === 3 && typeof parsed.serialized === "string") {
@@ -232,20 +237,20 @@ export class BufferManager {
 		}
 	}
 
-	deleteFromDisk(): void {
+	async deleteFromDisk(): Promise<void> {
 		const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 		try {
-			if (existsSync(filePath)) unlinkSync(filePath);
+			await unlink(filePath);
 		} catch {
 			// ignore
 		}
 	}
 
 	/** Cleanup: stop flush timer, save final state, optionally delete */
-	dispose(deleteBuffer = false): void {
+	async dispose(deleteBuffer = false): Promise<void> {
 		this.stopPeriodicFlush();
 		if (deleteBuffer) {
-			this.deleteFromDisk();
+			await this.deleteFromDisk();
 		} else if (this.dirty) {
 			this.saveToDisk();
 		}
