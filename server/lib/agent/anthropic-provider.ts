@@ -10,31 +10,17 @@ import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./type
 // === Claude Code protocol constants ===
 
 /**
- * Beta features header matching Claude Code / opencode protocol.
- * - claude-code-20250219: Claude Code agent mode
- * - interleaved-thinking-2025-05-14: interleaved thinking/reasoning
- * - fine-grained-tool-streaming-2025-05-14: streaming tool use deltas
+ * Beta flags matching Claude Code CLI protocol exactly.
+ * All flags are always included — no conditional logic.
  */
 const ANTHROPIC_BETA_FLAGS =
-	"claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+	"claude-code-20250219,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24";
 
-/** Additional beta flag for 1M context window support (sonnet/opus models). */
+/** Additional beta flag for 1M context window support (used in model listing). */
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 
-/** OAuth beta flag required for Claude Pro/Max OAuth authentication. */
-const OAUTH_BETA = "oauth-2025-04-20";
-
-/** Beta flag for adaptive thinking (Opus 4.6 / Sonnet 4.6). */
-const ADAPTIVE_THINKING_BETA = "adaptive-thinking-2026-01-28";
-
-/** Beta flag for effort parameter support. */
-const EFFORT_BETA = "effort-2025-11-24";
-
-/** Beta flag for prompt caching scope. */
-const PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05";
-
-/** Beta flag for redacted thinking content. */
-const REDACT_THINKING_BETA = "redact-thinking-2026-02-12";
+/** Base beta flag for non-chat requests (model listing, generate). */
+const ANTHROPIC_BASE_BETA = "claude-code-20250219";
 
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
@@ -42,54 +28,54 @@ const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
 
-/** User-Agent string matching Claude Code. */
-const CLAUDE_CODE_USER_AGENT = "claude-code/2.1.71";
-
-/** User-Agent string for MAX mode (mimics Claude Code CLI). */
+/** User-Agent string matching Claude Code CLI. */
 const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.71 (external, cli)";
 
-/** Tool name prefix required by Claude Code endpoint (MAX mode). */
-const TOOL_PREFIX = "mcp_";
+/** Billing header injected as the first system block (matches Claude Code). */
+const BILLING_HEADER =
+	"x-anthropic-billing-header: cc_version=2.1.71.752; cc_entrypoint=cli; cch=9a771;";
+
+/** Identity block injected as the second system block (matches Claude Code). */
+const IDENTITY_BLOCK = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /**
  * Apply cache_control breakpoints to maximize Anthropic prompt caching.
  *
- * Anthropic caches everything up to (and including) the last block with
- * `cache_control`. We place breakpoints at:
- *   1. The system prompt block (rarely changes)
- *   2. The last tool definition (tool list rarely changes)
- *   3–4. The last 2 content blocks in the message history (stable prefix)
+ * System blocks already have cache_control set during construction (blocks 1 & 2).
+ * We place additional breakpoints at:
+ *   1. The last tool definition (tool list rarely changes)
+ *   2–3. The last 2 content blocks in the message history (stable prefix)
  *
- * This ensures the entire prefix (system + tools + all prior messages) is
- * cached across turns. New user/assistant messages are appended after the
- * cached prefix, so the cache stays valid.
+ * Total cache_control blocks: 2 (system) + 1 (tools) + up to 1 (messages) = 4 max.
+ * Anthropic allows a maximum of 4 blocks with cache_control.
  */
 function applyCacheBreakpoints(
-	systemBlocks: Array<Record<string, unknown>> | undefined,
 	messages: AnthropicMessage[],
 	tools: Array<Record<string, unknown>> | undefined,
 ): void {
-	// Breakpoint 1: system prompt (last block)
-	if (systemBlocks && systemBlocks.length > 0) {
-		Object.assign(systemBlocks[systemBlocks.length - 1], CACHE_CONTROL);
+	// First, strip any existing cache_control from all message content blocks.
+	for (const msg of messages) {
+		if (Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block && typeof block === "object" && "cache_control" in block) {
+					delete (block as Record<string, unknown>).cache_control;
+				}
+			}
+		}
 	}
 
-	// Breakpoint 2: last tool definition
+	// Breakpoint 1: last tool definition
 	if (tools && tools.length > 0) {
 		Object.assign(tools[tools.length - 1], CACHE_CONTROL);
 	}
 
-	// Breakpoints 3–4: last 2 content blocks in message history.
-	// Walk backwards through messages to find the last N blocks that can
-	// carry cache_control. We skip the very last message (the current user
-	// turn) since it changes every request — caching it would be pointless.
-	const TARGET_MSG_BREAKPOINTS = 2;
+	// Breakpoint 2: last content block in message history (skip the current user turn).
+	// We only place 1 message breakpoint (not 2) to stay within the 4-block limit
+	// since system already uses 2 cache_control blocks.
 	let placed = 0;
-	// Start from the second-to-last message (the last message is the new user turn)
-	for (let i = messages.length - 2; i >= 0 && placed < TARGET_MSG_BREAKPOINTS; i--) {
+	for (let i = messages.length - 2; i >= 0 && placed < 1; i--) {
 		const content = messages[i].content;
 		if (Array.isArray(content) && content.length > 0) {
-			// Find the last block that is NOT thinking/redacted_thinking
 			let targetIdx = -1;
 			for (let j = content.length - 1; j >= 0; j--) {
 				const blockType = (content[j] as { type?: string }).type;
@@ -103,66 +89,10 @@ function applyCacheBreakpoints(
 				placed++;
 			}
 		} else if (typeof content === "string") {
-			// Convert to array format so we can attach cache_control
 			messages[i].content = [{ type: "text", text: content, ...CACHE_CONTROL }];
 			placed++;
 		}
 	}
-}
-
-// === MAX mode helpers ===
-
-/**
- * Build request headers for MAX mode (mimics Claude Code CLI).
- * Uses Bearer token auth instead of x-api-key.
- */
-function buildMaxHeaders(apiKey: string, baseBetaFlags: string): Record<string, string> {
-	const betaParts = new Set([
-		OAUTH_BETA,
-		"interleaved-thinking-2025-05-14",
-		...baseBetaFlags
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean),
-	]);
-
-	return {
-		"Content-Type": "application/json",
-		authorization: `Bearer ${apiKey}`,
-		"anthropic-version": "2023-06-01",
-		"anthropic-beta": [...betaParts].join(","),
-		"user-agent": CLAUDE_CLI_USER_AGENT,
-	};
-}
-
-/**
- * Build request URL for MAX mode — appends ?beta=true.
- */
-function buildMaxUrl(baseUrl: string): string {
-	const url = new URL(`${baseUrl}/messages`);
-	url.searchParams.set("beta", "true");
-	return url.toString();
-}
-
-/**
- * Add mcp_ prefix to tool_use block names in messages (MAX mode).
- */
-function prefixMessageToolNames(messages: AnthropicMessage[]): void {
-	for (const msg of messages) {
-		if (!Array.isArray(msg.content)) continue;
-		for (const part of msg.content) {
-			if (part.type === "tool_use") {
-				part.name = `${TOOL_PREFIX}${part.name}`;
-			}
-		}
-	}
-}
-
-/**
- * Strip mcp_ prefix from tool names in SSE stream text.
- */
-function stripToolPrefix(text: string): string {
-	return text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
 }
 
 // === Anthropic message types ===
@@ -261,61 +191,44 @@ function getTokenLimits(model: string): { default: number; upperLimit: number } 
 /**
  * Map reasoning effort to Anthropic thinking configuration.
  *
- * For models supporting adaptive thinking (Opus 4.6, Sonnet 4.6):
- *   - Uses `{ type: "adaptive" }` which lets the model decide thinking depth
+ * Matching Claude Code behavior (v2.1.71):
+ *   - All supported models use `{ type: "adaptive" }` by default
+ *   - `reasoningEffort === "none"` → `{ type: "disabled" }` (thinking off)
+ *   - Any other value (or undefined) → `{ type: "adaptive" }`
  *
- * For older models with thinking support:
- *   - Uses `{ type: "enabled", budget_tokens: N }` with effort-based budgets
- *
- * Effort mapping (budget_tokens for non-adaptive models):
- *   - "low"    → 4096
- *   - "medium" → 10240
- *   - "high"   → 32000 (default)
- *   - "xhigh"  → upperLimit - 1 (63999)
+ * The old `{ type: "enabled", budget_tokens: N }` is deprecated by Anthropic
+ * in favor of adaptive thinking for all models.
  */
 function buildThinkingConfig(
 	model: string,
 	reasoningEffort: string | undefined,
-	maxTokens: number,
-): { type: "enabled"; budget_tokens: number } | { type: "adaptive" } | undefined {
+): { type: "adaptive" } | { type: "disabled" } | undefined {
 	if (!supportsThinking(model)) return undefined;
 
-	// Adaptive thinking for newer models
-	if (supportsAdaptiveThinking(model)) {
-		return { type: "adaptive" };
+	// "none" explicitly disables thinking
+	if (reasoningEffort === "none") {
+		return { type: "disabled" };
 	}
 
-	// Budget-based thinking for older models
-	const limits = getTokenLimits(model);
-	const budgetMap: Record<string, number> = {
-		low: 4096,
-		medium: 10240,
-		high: 32000,
-		xhigh: limits.upperLimit - 1,
-	};
-
-	const budget = budgetMap[reasoningEffort ?? "high"] ?? 32000;
-	// Budget must be >= 1 and < max_tokens
-	const clampedBudget = Math.max(1, Math.min(budget, maxTokens - 1));
-
-	return { type: "enabled", budget_tokens: clampedBudget };
+	// All supported models use adaptive thinking (matching Claude Code)
+	return { type: "adaptive" };
 }
 
 /**
  * Map reasoning effort to Anthropic effort parameter value.
  * Only for models that support the effort API (Opus 4.6, Sonnet 4.6).
  *
- * Mapping: low → low, medium → medium, high → high, xhigh → max
+ * Mapping: low → low, medium → medium, high → high
+ * "none" is not mapped (thinking is disabled, effort is irrelevant).
  */
 function mapEffortParam(
 	reasoningEffort: string | undefined,
-): "low" | "medium" | "high" | "max" | undefined {
-	if (!reasoningEffort) return undefined;
-	const map: Record<string, "low" | "medium" | "high" | "max"> = {
+): "low" | "medium" | "high" | undefined {
+	if (!reasoningEffort || reasoningEffort === "none") return undefined;
+	const map: Record<string, "low" | "medium" | "high"> = {
 		low: "low",
 		medium: "medium",
 		high: "high",
-		xhigh: "max",
 	};
 	return map[reasoningEffort];
 }
@@ -352,7 +265,12 @@ interface AnthropicStreamEvent {
 		thinking?: string;
 		signature?: string;
 	};
-	usage?: { input_tokens?: number; output_tokens?: number };
+	usage?: {
+		input_tokens?: number;
+		output_tokens?: number;
+		cache_read_input_tokens?: number;
+		cache_creation_input_tokens?: number;
+	};
 	error?: { type?: string; message?: string };
 }
 
@@ -379,18 +297,44 @@ interface ToolAccumEntry {
  */
 export class AnthropicProvider implements ProviderAdapter {
 	private config: AnthropicProviderConfig;
+	/** Optional proxy URL for all requests. */
+	private proxy?: string;
+	/** Whether to reject unauthorized TLS certs (default true). */
+	private tlsRejectUnauthorized: boolean;
 
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
+		this.proxy = config.proxy;
+		this.tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
+	}
+
+	/**
+	 * Proxy-aware fetch with optional TLS verification bypass.
+	 */
+	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		const extra: Record<string, unknown> = {};
+		if (this.proxy) {
+			extra.proxy = this.proxy;
+		}
+		if (!this.tlsRejectUnauthorized) {
+			extra.tls = { rejectUnauthorized: false };
+		}
+		if (Object.keys(extra).length > 0) {
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific extensions on RequestInit
+			return fetch(input, { ...init, ...extra } as any);
+		}
+		return fetch(input, init);
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
-		// cache_control is applied later in chat() via the global counter
 		return tools.map(
 			(tool): AnthropicTool => ({
 				name: tool.name,
 				description: tool.description,
-				input_schema: resolveToolJsonSchema(tool),
+				input_schema: {
+					$schema: "https://json-schema.org/draft/2020-12/schema",
+					...resolveToolJsonSchema(tool),
+				},
 			}),
 		);
 	}
@@ -503,32 +447,29 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		// Determine max_tokens based on model capabilities
 		const tokenLimits = getTokenLimits(model);
-		const maxTokens = tokenLimits.upperLimit;
+		const maxTokens = tokenLimits.default;
 
 		// Build thinking configuration
-		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort, maxTokens);
-		const thinkingEnabled = !!thinkingConfig;
+		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort);
+		const thinkingEnabled = !!thinkingConfig && thinkingConfig.type !== "disabled";
 
-		// Build system as array of text blocks
-		const systemBlocks = systemPrompt ? [{ type: "text" as const, text: systemPrompt }] : undefined;
+		// Build system as 3-block structure matching Claude Code:
+		// Block 0: billing header (no cache_control)
+		// Block 1: identity declaration (with cache_control)
+		// Block 2: full instructions (with cache_control)
+		const systemBlocks: Array<Record<string, unknown>> = [
+			{ type: "text", text: BILLING_HEADER },
+			{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
+		];
+		if (systemPrompt) {
+			systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
+		}
 
 		// Build tool definitions (without cache_control yet)
 		const cachedTools = tools.length > 0 ? tools.map((t) => ({ ...t })) : undefined;
 
-		const isMax = !!this.config.maxMode;
-
-		// MAX mode: prefix tool names with mcp_ and prefix tool_use in messages
-		if (isMax && cachedTools) {
-			for (const t of cachedTools) {
-				t.name = `${TOOL_PREFIX}${t.name}`;
-			}
-		}
-		if (isMax) {
-			prefixMessageToolNames(messages);
-		}
-
 		// Apply cache_control breakpoints at optimal positions for prefix caching
-		applyCacheBreakpoints(systemBlocks, messages, cachedTools);
+		applyCacheBreakpoints(messages, cachedTools);
 
 		const body: Record<string, unknown> = {
 			model,
@@ -547,18 +488,13 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.temperature = 1;
 		}
 
-		// Effort parameter for supported models
-		if (supportsEffort(model) && params.reasoningEffort) {
+		// Effort parameter: send for supported models when thinking is enabled (matching CC behavior)
+		if (supportsEffort(model) && thinkingEnabled) {
 			const effort = mapEffortParam(params.reasoningEffort);
-			if (effort) {
-				// output_config is the container for effort in the API
-				body.output_config = { effort };
-			}
+			body.output_config = { effort: effort ?? "medium" };
 		}
 
-		if (systemBlocks) {
-			body.system = systemBlocks;
-		}
+		body.system = systemBlocks;
 		if (cachedTools) {
 			body.tools = cachedTools;
 		}
@@ -568,37 +504,29 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.metadata = params.metadata;
 		}
 
-		// Build headers matching Claude Code protocol
-		const betaParts: string[] = [ANTHROPIC_BETA_FLAGS];
-		if (supports1mContext(model)) {
-			betaParts.push(CONTEXT_1M_BETA);
-		}
-		if (thinkingConfig?.type === "adaptive") {
-			betaParts.push(ADAPTIVE_THINKING_BETA);
-		}
-		if (supportsEffort(model) && params.reasoningEffort) {
-			betaParts.push(EFFORT_BETA);
-		}
-		betaParts.push(PROMPT_CACHING_SCOPE_BETA);
-		betaParts.push(REDACT_THINKING_BETA);
-		const betaFlags = betaParts.join(",");
+		// Build request URL with ?beta=true (matching Claude Code)
+		const reqUrl = `${baseUrl}/messages?beta=true`;
 
-		let reqUrl: string;
-		let reqHeaders: Record<string, string>;
-
-		if (isMax) {
-			reqUrl = buildMaxUrl(baseUrl);
-			reqHeaders = buildMaxHeaders(apiKey, betaFlags);
-		} else {
-			reqUrl = `${baseUrl}/messages`;
-			reqHeaders = {
-				"Content-Type": "application/json",
-				"x-api-key": apiKey,
-				"anthropic-version": "2023-06-01",
-				"anthropic-beta": betaFlags,
-				"user-agent": CLAUDE_CODE_USER_AGENT,
-			};
-		}
+		// Build headers matching Claude Code CLI protocol exactly
+		const reqHeaders: Record<string, string> = {
+			Accept: "application/json",
+			Authorization: `Bearer ${apiKey}`,
+			"Content-Type": "application/json",
+			"anthropic-version": "2023-06-01",
+			"anthropic-beta": ANTHROPIC_BETA_FLAGS,
+			"anthropic-dangerous-direct-browser-access": "true",
+			"user-agent": CLAUDE_CLI_USER_AGENT,
+			"x-app": "cli",
+			// X-Stainless headers matching Claude Code SDK
+			"X-Stainless-Arch": "x64",
+			"X-Stainless-Lang": "js",
+			"X-Stainless-OS": "Linux",
+			"X-Stainless-Package-Version": "0.74.0",
+			"X-Stainless-Retry-Count": "0",
+			"X-Stainless-Runtime": "node",
+			"X-Stainless-Runtime-Version": "v24.3.0",
+			"X-Stainless-Timeout": "600",
+		};
 
 		logger.debug("Anthropic chat request", {
 			model,
@@ -606,13 +534,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			toolCount: tools.length,
 			messageCount: messages.length,
 			hasSystem: !!systemPrompt,
-			maxMode: isMax,
 			maxTokens,
 			thinkingType: thinkingConfig?.type,
 			reasoningEffort: params.reasoningEffort,
 		});
 
-		const response = await fetch(reqUrl, {
+		const response = await this.pfetch(reqUrl, {
 			method: "POST",
 			headers: reqHeaders,
 			body: JSON.stringify(body),
@@ -628,7 +555,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw new Error("Anthropic API returned no body");
 		}
 
-		yield* parseAnthropicSSEStream(response.body, isMax);
+		yield* parseAnthropicSSEStream(response.body);
 	}
 
 	formatToolResult(toolUseId: string, output: string, isError: boolean): unknown {
@@ -718,8 +645,8 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const bareModel = parseModelId(model).model;
 		const betaFlags = supports1mContext(bareModel)
-			? `${ANTHROPIC_BETA_FLAGS},${CONTEXT_1M_BETA}`
-			: ANTHROPIC_BETA_FLAGS;
+			? `${ANTHROPIC_BASE_BETA},${CONTEXT_1M_BETA}`
+			: ANTHROPIC_BASE_BETA;
 
 		const body: {
 			model: string;
@@ -739,10 +666,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				"x-api-key": apiKey,
+				Authorization: `Bearer ${apiKey}`,
 				"anthropic-version": "2023-06-01",
 				"anthropic-beta": betaFlags,
-				"user-agent": CLAUDE_CODE_USER_AGENT,
+				"user-agent": CLAUDE_CLI_USER_AGENT,
 			},
 			body: JSON.stringify(body),
 		});
@@ -787,17 +714,17 @@ export class AnthropicProvider implements ProviderAdapter {
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
 		const betaFlags = supports1mContext(bareModel)
-			? `${ANTHROPIC_BETA_FLAGS},${CONTEXT_1M_BETA}`
-			: ANTHROPIC_BETA_FLAGS;
+			? `${ANTHROPIC_BASE_BETA},${CONTEXT_1M_BETA}`
+			: ANTHROPIC_BASE_BETA;
 
 		const response = await fetch(`${baseUrl}/messages`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				"x-api-key": apiKey,
+				Authorization: `Bearer ${apiKey}`,
 				"anthropic-version": "2023-06-01",
 				"anthropic-beta": betaFlags,
-				"user-agent": CLAUDE_CODE_USER_AGENT,
+				"user-agent": CLAUDE_CLI_USER_AGENT,
 			},
 			body: JSON.stringify({
 				model: bareModel,
@@ -829,7 +756,6 @@ export class AnthropicProvider implements ProviderAdapter {
 
 async function* parseAnthropicSSEStream(
 	body: ReadableStream<Uint8Array>,
-	stripMcpPrefix = false,
 ): AsyncGenerator<ParsedStreamEvent> {
 	const decoder = new TextDecoder();
 	let buffer = "";
@@ -846,18 +772,14 @@ async function* parseAnthropicSSEStream(
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
 
-			// MAX mode: strip mcp_ prefix from tool names in the raw stream
-			if (stripMcpPrefix) {
-				buffer = stripToolPrefix(buffer);
-			}
-
 			const lines = buffer.split("\n");
 			buffer = lines.pop() ?? "";
 
 			for (const line of lines) {
 				const trimmed = line.trim();
 				if (!trimmed || trimmed.startsWith("event:")) continue;
-				if (!trimmed.startsWith("data: ")) continue;
+				// Support both "data: {...}" (standard SSE) and "data:{...}" (no space)
+				if (!trimmed.startsWith("data:")) continue;
 
 				if (lineCount < 5) {
 					logger.debug("Anthropic SSE line", {
@@ -867,9 +789,12 @@ async function* parseAnthropicSSEStream(
 				}
 				lineCount++;
 
+				// Extract JSON payload: skip "data: " or "data:"
+				const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed.slice(5);
+
 				let event: AnthropicStreamEvent;
 				try {
-					event = JSON.parse(trimmed.slice(6));
+					event = JSON.parse(jsonStr);
 				} catch {
 					continue;
 				}
@@ -882,9 +807,11 @@ async function* parseAnthropicSSEStream(
 		}
 
 		// Process remaining buffer
-		if (buffer.trim()?.startsWith("data: ")) {
+		const remaining = buffer.trim();
+		if (remaining.startsWith("data:")) {
 			try {
-				const event = JSON.parse(buffer.trim().slice(6));
+				const jsonStr = remaining.startsWith("data: ") ? remaining.slice(6) : remaining.slice(5);
+				const event = JSON.parse(jsonStr);
 				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum);
 				for (const evt of events) {
 					yield evt;
@@ -934,13 +861,14 @@ function parseAnthropicEvent(
 			results.push({ messageId: event.message.id });
 		}
 		if (event.message.usage?.input_tokens != null) {
+			const cacheRead = event.message.usage.cache_read_input_tokens ?? 0;
+			const cacheCreation = event.message.usage.cache_creation_input_tokens ?? 0;
 			results.push({
 				usage: {
-					promptTokens: event.message.usage.input_tokens,
+					// Total input tokens occupying the context window (uncached + cached)
+					promptTokens: event.message.usage.input_tokens + cacheRead + cacheCreation,
 					completionTokens: event.message.usage.output_tokens,
-					cachedInputTokens:
-						(event.message.usage.cache_read_input_tokens ?? 0) +
-						(event.message.usage.cache_creation_input_tokens ?? 0),
+					cachedInputTokens: cacheRead + cacheCreation,
 				},
 			});
 		}
@@ -988,8 +916,8 @@ function parseAnthropicEvent(
 		}
 
 		// Thinking delta (extended thinking)
-		if (event.delta.type === "thinking_delta" && event.delta.text) {
-			return [{ reasoning: event.delta.text }];
+		if (event.delta.type === "thinking_delta" && event.delta.thinking) {
+			return [{ reasoning: event.delta.thinking }];
 		}
 
 		// Signature delta — accumulate for thinking block verification
@@ -1068,10 +996,14 @@ function parseAnthropicEvent(
 
 		// Usage update
 		if (event.usage?.output_tokens != null) {
+			const cacheRead = event.usage.cache_read_input_tokens ?? 0;
+			const cacheCreation = event.usage.cache_creation_input_tokens ?? 0;
 			results.push({
 				usage: {
-					promptTokens: event.usage.input_tokens ?? 0,
+					// Total input tokens occupying the context window (uncached + cached)
+					promptTokens: (event.usage.input_tokens ?? 0) + cacheRead + cacheCreation,
 					completionTokens: event.usage.output_tokens,
+					cachedInputTokens: cacheRead + cacheCreation,
 				},
 			});
 		}
