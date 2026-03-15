@@ -54,7 +54,7 @@ interface Camera {
 	panY: number;
 	scale: number;
 	orientation: string;
-	edge: string;
+	edge: "start" | "end";
 }
 
 export interface CardHitRect {
@@ -406,10 +406,18 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			wc.scale.set(1);
 		}
 
-		// Update ruler container — no camera transform
+		// --- Edge-aware ruler offset ---
+		// When edge === "end", the ruler track is at the bottom (H) or right (V).
+		// Shift the PixiJS ruler container to match the CSS ruler track position.
+		const crossViewport = isH ? d.containerHeight : d.containerWidth;
+		const rulerOffset = cam.edge === "end" ? crossViewport - trackH : 0;
+		// crossBase: where chapter nodes start on the cross axis (screen pixels)
+		const crossBase = cam.edge === "end" ? 0 : trackH;
+
+		// Update ruler container — position at ruler offset
 		const rc = rulerContainerRef.current;
 		if (rc) {
-			rc.position.set(0, 0);
+			rc.position.set(isH ? 0 : rulerOffset, isH ? rulerOffset : 0);
 			rc.scale.set(1, 1);
 		}
 
@@ -442,7 +450,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 		// --- Draw ruler track background (full viewport width) ---
 		const trackScreenWidth = isH ? d.containerWidth : d.containerHeight;
-		drawRulerTrackBg(trackBgGfx, theme, trackScreenWidth, trackH);
+		drawRulerTrackBg(trackBgGfx, theme, trackScreenWidth, trackH, isH, cam.edge);
 
 		// --- Viewport culling (screen-space) ---
 		const cullBuffer = mainViewport * 0.5;
@@ -474,6 +482,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					trackH,
 					cl.count,
 					cl.activeCount > 0,
+					isH,
 				);
 			}
 
@@ -489,7 +498,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					if (forkMergeShas.has(tick.sha)) {
 						const screenX = toScreen(tick.x);
 						const ls = getLocalScale(tick.x);
-						drawTick(tickGfx, theme, screenX, trackH, true, ls);
+						drawTick(tickGfx, theme, screenX, trackH, true, ls, isH);
 					}
 				}
 			}
@@ -504,7 +513,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				// Always show segment ticks; skip others based on stride
 				if (!tick.segment && tickStride > 1 && tick.index % tickStride !== 0) continue;
 				const ls = getLocalScale(tick.x);
-				drawTick(tickGfx, theme, screenX, trackH, !!tick.segment, ls);
+				drawTick(tickGfx, theme, screenX, trackH, !!tick.segment, ls, isH);
 			}
 		}
 
@@ -533,34 +542,63 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// so it only changes on zoom, not on pan. Each label is then squeezed along
 			// the main axis by the fisheye ratio to fit the actual screen gap.
 			const centerGap = COLLAPSED_GAP * cam.scale;
-			const labelStride = centerGap < 60 ? Math.ceil(60 / centerGap) : 1;
-			const centerAvailW = Math.max(0, centerGap - 8);
 
-			// Available vertical space for commit message (below SHA line)
-			const msgTopOffset = isExpanded ? 18 : 16;
-			const availableHeight = trackH - msgTopOffset - 4; // 4px bottom padding
-			// Approximate line height for message text
+			// --- Horizontal vs Vertical layout parameters ---
+			// Horizontal: text flows along X (main axis), width = tick gap, height = trackH
+			// Vertical: text flows horizontally within the track width, height = tick gap
+			const labelAvailMain = Math.max(0, centerGap - 8);
+			const labelAvailCross = trackH - 8; // 4px padding each side
+
+			const labelStride = isH
+				? centerGap < 60
+					? Math.ceil(60 / centerGap)
+					: 1
+				: centerGap < 24
+					? Math.ceil(24 / centerGap)
+					: 1;
+
+			// SHA label offset on cross axis (H) / main axis (V)
+			const shaOffset = 4;
+			// Message offset: in H mode, below SHA on cross axis;
+			// in V mode, below SHA on main axis (same X column, next line down)
+			const shaCrossSize = isH ? 0 : fontSize + 2;
+			const msgCrossOffset = isH ? (isExpanded ? 18 : 16) : shaOffset;
+
+			// Available space for commit message (H: cross-axis below SHA; V: main-axis gap minus SHA)
+			const msgAvailH = trackH - msgCrossOffset - 4;
+			const msgAvailV = Math.max(0, centerGap - shaCrossSize - 8);
 			const msgLineH = 13;
-			const maxLines = Math.max(1, Math.floor(availableHeight / msgLineH));
+			const maxMsgLines = isH
+				? Math.max(1, Math.floor(msgAvailH / msgLineH))
+				: Math.max(1, Math.floor(msgAvailV / msgLineH));
 
-			// Pre-compute message style based on center width (stable across pan)
-			const showMsg = (showMessages || isExpanded) && availableHeight > msgLineH * 0.5;
+			// Message text wrapping width
+			// H: wrap within tick gap (main axis); V: wrap within track width (cross axis)
+			const msgWrapWidth = isH ? labelAvailMain : labelAvailCross;
+
+			// Pre-compute message style
+			const showMsg = isH
+				? (showMessages || isExpanded) && msgAvailH > msgLineH * 0.5
+				: msgAvailV > msgLineH * 0.8;
 			if (showMsg) {
-				const msgKey = `${theme.dimmed}:${Math.round(centerAvailW)}:${maxLines}`;
+				const msgKey = `${theme.dimmed}:${Math.round(msgWrapWidth)}:${maxMsgLines}:${isH}`;
 				if (sc.msgKey !== msgKey || !sc.msgStyle) {
 					sc.msgStyle = new TextStyle({
 						fontSize: 10,
 						fill: theme.dimmed,
 						fontFamily: "sans-serif",
 						wordWrap: true,
-						wordWrapWidth: Math.max(40, centerAvailW),
+						wordWrapWidth: Math.max(40, msgWrapWidth),
 						breakWords: true,
 					});
 					sc.msgKey = msgKey;
 				}
 			}
-			const charsPerLine = Math.max(4, Math.floor(centerAvailW / 6));
-			const maxChars = charsPerLine * maxLines;
+
+			// Truncation limits
+			const mainCharsPerLine = Math.max(4, Math.floor(labelAvailMain / 6));
+			const crossCharsPerLine = Math.max(4, Math.floor(labelAvailCross / 6));
+			const maxChars = isH ? mainCharsPerLine * maxMsgLines : crossCharsPerLine * maxMsgLines;
 
 			for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
 				const tick = allTicks[ti];
@@ -572,29 +610,35 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				const nextScreenX = nextTick ? toScreen(nextTick.x) : screenX + centerGap;
 				const squeeze = centerGap > 0 ? Math.min(1, (nextScreenX - screenX) / centerGap) : 1;
 
-				// SHA label — layout at center width, squeeze along main axis
+				// SHA label
 				const label = tickPool.acquire(labelStyle);
-				label.text = tick.sha.slice(0, 7);
+				label.rotation = 0;
 				if (isH) {
+					label.text = tick.sha.slice(0, 7);
 					label.scale.set(squeeze, 1);
-					label.position.set(screenX + 4, 4);
+					label.position.set(screenX + 4, shaOffset);
 				} else {
+					// Vertical: horizontal text, truncate to fit track width
+					const shaChars = Math.max(4, Math.floor(labelAvailCross / (fontSize * 0.6)));
+					label.text = tick.sha.slice(0, Math.min(7, shaChars));
 					label.scale.set(1, squeeze);
-					label.position.set(4, screenX + 4);
+					label.position.set(shaOffset, screenX + 4);
 				}
 
-				// Commit message — layout at center width, squeeze along main axis
+				// Commit message
 				if (showMsg) {
 					const msg = d.commitMessages.get(tick.sha);
 					if (msg && sc.msgStyle) {
 						const msgLabel = tickPool.acquire(sc.msgStyle);
 						msgLabel.text = msg.length > maxChars ? `${msg.slice(0, maxChars)}…` : msg;
+						msgLabel.rotation = 0;
 						if (isH) {
 							msgLabel.scale.set(squeeze, 1);
-							msgLabel.position.set(screenX + 4, msgTopOffset);
+							msgLabel.position.set(screenX + 4, msgCrossOffset);
 						} else {
+							// V: message below SHA in the same column, squeezed along Y
 							msgLabel.scale.set(1, squeeze);
-							msgLabel.position.set(msgTopOffset, screenX + 4);
+							msgLabel.position.set(msgCrossOffset, screenX + shaCrossSize + 4);
 						}
 					}
 				}
@@ -614,12 +658,14 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					activeCount: cl.activeCount,
 				};
 			});
-			drawHeatmap(heatGfx, theme, screenClusters, trackH);
+			drawHeatmap(heatGfx, theme, screenClusters, trackH, isH);
 		}
 
 		// --- Draw chapter nodes + connectors (unified dot→pill→card) ---
 		// Cross axis remains linear — only main axis has fisheye.
-		const rulerEdgeCrossScreen = trackH;
+		// rulerEdgeCrossScreen: the cross-axis screen position of the ruler edge
+		// where connectors originate. Depends on edge placement.
+		const rulerEdgeCrossScreen = cam.edge === "end" ? crossViewport - trackH : trackH;
 		const chapterPool = chapterLabelPoolRef.current; // for dot/pill text
 		const cardPool = cardPoolRef.current; // for card-phase containers
 
@@ -672,7 +718,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const elemScreenW = morph.width;
 
 			const elemScreenCross =
-				trackH + (ch.layoutY + CARD_TOP_OFFSET) * cam.scale + crossPan + centerOffsetY * centerFade;
+				crossBase +
+				(ch.layoutY + CARD_TOP_OFFSET) * cam.scale +
+				crossPan +
+				centerOffsetY * centerFade;
 			const elemScreenCenterCross = elemScreenCross + morph.height / 2;
 
 			const hasPanel = d.openPanelChapterIds?.has(ch.id);

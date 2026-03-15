@@ -30,12 +30,17 @@ export function drawTick(
 	height: number,
 	isActive: boolean,
 	scale: number,
+	isH = true,
 ): void {
 	const s = Math.max(0.1, scale);
 	const w = Math.min(4, 2 / s);
 	const h = isActive ? Math.min(20, Math.max(14, 20 / s)) : 14;
 	const color = isActive ? theme.tickActive : theme.tickDefault;
-	g.rect(x - w / 2, height - h, w, h).fill({ color, alpha: isActive ? 0.8 : 0.4 });
+	if (isH) {
+		g.rect(x - w / 2, height - h, w, h).fill({ color, alpha: isActive ? 0.8 : 0.4 });
+	} else {
+		g.rect(height - h, x - w / 2, h, w).fill({ color, alpha: isActive ? 0.8 : 0.4 });
+	}
 }
 
 export function drawClusterBlock(
@@ -46,11 +51,16 @@ export function drawClusterBlock(
 	trackHeight: number,
 	count: number,
 	hasActive: boolean,
+	isH = true,
 ): void {
 	const h = Math.min(14, 4 + count * 0.5);
 	const color = hasActive ? theme.accent : theme.tickDefault;
 	const alpha = hasActive ? 0.5 : 0.25;
-	g.roundRect(x, trackHeight - h - 2, Math.max(width, 3), h, 2).fill({ color, alpha });
+	if (isH) {
+		g.roundRect(x, trackHeight - h - 2, Math.max(width, 3), h, 2).fill({ color, alpha });
+	} else {
+		g.roundRect(trackHeight - h - 2, x, h, Math.max(width, 3), 2).fill({ color, alpha });
+	}
 }
 
 // --- Heatmap ---
@@ -60,14 +70,22 @@ export function drawHeatmap(
 	theme: PixiTheme,
 	segments: Array<{ worldPos: number; worldSize: number; activeCount: number }>,
 	trackHeight: number,
+	isH = true,
 ): void {
 	for (const seg of segments) {
 		if (seg.activeCount <= 0) continue;
 		const intensity = Math.min(1, seg.activeCount / 5);
-		g.rect(seg.worldPos - seg.worldSize / 2, 0, seg.worldSize, trackHeight).fill({
-			color: theme.accent,
-			alpha: intensity * 0.15,
-		});
+		if (isH) {
+			g.rect(seg.worldPos - seg.worldSize / 2, 0, seg.worldSize, trackHeight).fill({
+				color: theme.accent,
+				alpha: intensity * 0.15,
+			});
+		} else {
+			g.rect(0, seg.worldPos - seg.worldSize / 2, trackHeight, seg.worldSize).fill({
+				color: theme.accent,
+				alpha: intensity * 0.15,
+			});
+		}
 	}
 }
 
@@ -210,9 +228,19 @@ export function drawRulerTrackBg(
 	theme: PixiTheme,
 	width: number,
 	height: number,
+	isH = true,
+	edge: "start" | "end" = "start",
 ): void {
-	g.rect(0, 0, width, height).fill({ color: theme.trackBg, alpha: 1 });
-	g.rect(0, height - 2, width, 2).fill({ color: theme.accentBorder, alpha: 1 });
+	// Border sits on the side facing the chapter area:
+	// edge="start" → border at far end (height-2); edge="end" → border at near end (0).
+	const borderAtFar = edge === "start";
+	if (isH) {
+		g.rect(0, 0, width, height).fill({ color: theme.trackBg, alpha: 1 });
+		g.rect(0, borderAtFar ? height - 2 : 0, width, 2).fill({ color: theme.accentBorder, alpha: 1 });
+	} else {
+		g.rect(0, 0, height, width).fill({ color: theme.trackBg, alpha: 1 });
+		g.rect(borderAtFar ? height - 2 : 0, 0, 2, width).fill({ color: theme.accentBorder, alpha: 1 });
+	}
 }
 
 // --- Segment background ---
