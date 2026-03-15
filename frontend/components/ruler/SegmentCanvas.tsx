@@ -6,15 +6,7 @@ import { api } from "../../lib/api";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import type { RulerOrientation } from "./types";
-import type { ZoomTierId } from "./zoom-tiers";
-
-type CardMode = "dot" | "compact" | "full";
-
-function getCardMode(zoomTier: ZoomTierId): CardMode {
-	if (zoomTier === "L0" || zoomTier === "L1") return "dot";
-	if (zoomTier === "L2") return "compact";
-	return "full";
-}
+import { getCardModeForChapter, getMorphFactor, getMorphStyle } from "./zoom-tiers";
 
 /** Active segments refresh faster; historical ones can be stale longer. */
 function getSegmentStaleTime(segment: RulerSegment): number {
@@ -82,14 +74,25 @@ interface SegmentCanvasProps {
 	cardRegistry?: React.MutableRefObject<Map<string, CardWorldInfo[]>>;
 	/** Callback to open chapter context menu at screen coordinates (lifted out of transform) */
 	onChapterContextMenu?: (state: ChapterContextMenuState) => void;
-	/** Map of commit SHA → main-axis world position, for drawing connector lines */
-	tickPositions?: Map<string, number>;
 	/** Request the parent to fit a world-space rect into the viewport */
 	onFitToView?: (worldX: number, worldY: number, worldW: number, worldH: number) => void;
-	/** Current zoom tier — controls card interactivity and connector visibility */
-	zoomTier?: ZoomTierId;
-	/** Performance degradation level (0=normal, 1=reduced, 2=minimal) */
-	degradeLevel?: number;
+	/** World-space X of the zoom center (for morph proximity) */
+	zoomCenterWorldX?: number;
+	/** World-space width of the viewport (for morph proximity) */
+	viewportWorldWidth?: number;
+	/** Callback when chapters are loaded for a segment */
+	onChaptersLoaded?: (
+		fromSha: string,
+		chapters: Array<{
+			id: string;
+			status: string;
+			title: string;
+			startCommitSha: string | null;
+			mergeCommitSha?: string | null;
+			layoutX: number;
+			layoutY: number;
+		}>,
+	) => void;
 }
 
 const NODE_WIDTH = 220;
@@ -118,26 +121,35 @@ export const SegmentCanvas = memo(
 		viewHeight = 800,
 		cardRegistry,
 		onChapterContextMenu,
-		tickPositions,
 		onFitToView,
-		zoomTier = "L2",
-		degradeLevel = 0,
+		zoomCenterWorldX = 0,
+		viewportWorldWidth = 1200,
+		onChaptersLoaded,
 	}: SegmentCanvasProps) {
 		const queryClient = useQueryClient();
 		const isH = orientation === "horizontal";
-		const cardMode = getCardMode(zoomTier);
+
+		// Determine data detail level based on segment center's card mode
+		const segCenterWorld = mainPos + mainSize / 2;
+		const segCardMode = getCardModeForChapter(
+			scale,
+			segCenterWorld,
+			zoomCenterWorldX,
+			viewportWorldWidth,
+		);
+		const needsFull = segCardMode === "full";
+
 		const { data, isLoading } = useQuery({
-			queryKey: ["rulerSegment", projectId, fromSha, cardMode],
+			queryKey: ["rulerSegment", projectId, fromSha, needsFull ? "full" : "summary"],
 			queryFn: () =>
 				api.getRulerSegment(
 					projectId,
 					fromSha,
 					toSha,
-					cardMode === "full" ? "full" : "summary",
+					needsFull ? "full" : "summary",
 				) as Promise<SegmentData>,
 			staleTime: getSegmentStaleTime(_segment),
 			placeholderData: _segment.activeChapterCount === 0 ? keepPreviousData : undefined,
-			enabled: cardMode !== "dot",
 		});
 
 		const [openNarratorId, setOpenNarratorId] = useState<string | null>(null);
@@ -183,13 +195,15 @@ export const SegmentCanvas = memo(
 			() =>
 				laid.map((ch) => {
 					const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
+					const rawW = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
+					const rawH = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
 					return {
 						id: ch.id,
 						title: ch.title,
 						worldX: (isH ? mainPos : 0) + ch.layoutX,
 						worldY: (isH ? 0 : mainPos) + ch.layoutY + CARD_TOP_OFFSET,
-						worldW: isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH,
-						worldH: isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT,
+						worldW: rawW,
+						worldH: rawH,
 						status: ch.status,
 					};
 				}),
@@ -204,6 +218,34 @@ export const SegmentCanvas = memo(
 				};
 			}
 		}, [cardInfos, cardRegistry, fromSha]);
+
+		// Report chapter data to parent for PixiJS rendering
+		useEffect(() => {
+			if (onChaptersLoaded && laid.length > 0) {
+				onChaptersLoaded(
+					fromSha,
+					laid.map((ch) => ({
+						id: ch.id,
+						status: ch.status,
+						title: ch.title,
+						startCommitSha: ch.startCommitSha,
+						mergeCommitSha: ch.mergeCommitSha,
+						layoutX: ch.layoutX,
+						layoutY: ch.layoutY,
+					})),
+				);
+			}
+		}, [laid, fromSha, onChaptersLoaded]);
+
+		// Clear PixiJS data only on full unmount.
+		// Intentionally omits onChaptersLoaded from deps — parent must provide a stable
+		// (useCallback) reference so this cleanup fires only on unmount, not on re-render.
+		// biome-ignore lint/correctness/useExhaustiveDependencies: unmount-only cleanup; parent guarantees stable callback ref
+		useEffect(() => {
+			return () => {
+				onChaptersLoaded?.(fromSha, []);
+			};
+		}, [fromSha]);
 
 		// When a narrator panel opens, request the parent to fit the expanded card into view
 		useEffect(() => {
@@ -224,129 +266,39 @@ export const SegmentCanvas = memo(
 		const segCrossStart = viewTop - 20;
 		const segCrossSize = viewHeight + 40;
 
-		// --- Dot mode: render status dots from segment summary (no backend request) ---
-		if (cardMode === "dot") {
-			const dotSize = 6;
-			const dotGap = 4;
-			const totalDots = _segment.totalChapterCount;
-			const activeDots = _segment.activeChapterCount;
-			return (
-				<Box
-					style={{
-						position: "absolute",
-						...(isH
-							? {
-									left: mainPos,
-									top: segCrossStart,
-									width: mainSize,
-									height: segCrossSize,
-								}
-							: {
-									top: mainPos,
-									left: segCrossStart,
-									height: mainSize,
-									width: segCrossSize,
-								}),
-						display: "flex",
-						alignItems: "center",
-						justifyContent: "center",
-						gap: dotGap,
-						flexDirection: isH ? "row" : "column",
-						pointerEvents: "none",
-					}}
-				>
-					{Array.from({ length: totalDots }, (_, idx) => {
-						const key = `dot-${idx}`;
-						return (
-							<Box
-								key={key}
-								style={{
-									width: dotSize,
-									height: dotSize,
-									borderRadius: "50%",
-									background:
-										idx < activeDots
-											? "var(--mantine-color-green-5)"
-											: "var(--mantine-color-dimmed)",
-								}}
-							/>
-						);
-					})}
-				</Box>
-			);
-		}
+		// Compute per-chapter morph — only render ChapterCard when showCardBody=true
+		// PixiJS handles dot/pill/connector rendering
+		const chapterMorphs = useMemo(
+			() =>
+				laid.map((ch) => {
+					const worldX = (isH ? mainPos : 0) + ch.layoutX + NODE_WIDTH / 2;
+					const t = getMorphFactor(scale, worldX, zoomCenterWorldX, viewportWorldWidth);
+					const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
+					return { ch, t, morph };
+				}),
+			[laid, isH, mainPos, scale, zoomCenterWorldX, viewportWorldWidth],
+		);
 
-		// --- Compact mode: simplified small cards ---
-		if (cardMode === "compact") {
+		// If no chapter needs card body, render minimal container
+		const anyShowCard = chapterMorphs.some((m) => m.morph.showCardBody);
+		if (!anyShowCard && !isLoading) {
+			// Transparent container — PixiJS draws everything
 			return (
 				<Box
 					style={{
 						position: "absolute",
+						pointerEvents: "none",
 						...(isH
-							? {
-									left: mainPos,
-									top: segCrossStart + 4,
-									width: mainSize,
-									height: segCrossSize - 8,
-								}
-							: {
-									top: mainPos,
-									left: segCrossStart + 4,
-									height: mainSize,
-									width: segCrossSize - 8,
-								}),
-						display: "flex",
-						flexWrap: "wrap",
-						gap: 4,
-						alignItems: "flex-start",
-						alignContent: "flex-start",
-						...(isH ? { flexDirection: "row" } : { flexDirection: "column" }),
+							? { left: mainPos, top: segCrossStart, width: mainSize, height: segCrossSize }
+							: { top: mainPos, left: segCrossStart, height: mainSize, width: segCrossSize }),
 					}}
-				>
-					{(data?.chapters ?? []).map((ch: SegmentChapter) => (
-						<Box
-							key={ch.id}
-							style={{
-								display: "flex",
-								alignItems: "center",
-								gap: 4,
-								padding: "2px 6px",
-								borderRadius: 4,
-								background: "var(--mantine-color-default-hover)",
-								maxWidth: 120,
-								overflow: "hidden",
-							}}
-						>
-							<Box
-								style={{
-									width: 6,
-									height: 6,
-									borderRadius: "50%",
-									flexShrink: 0,
-									background:
-										ch.status === "active"
-											? "var(--mantine-color-green-5)"
-											: ch.status === "merged"
-												? "var(--mantine-color-blue-5)"
-												: ch.status === "dormant"
-													? "var(--mantine-color-yellow-5)"
-													: "var(--mantine-color-dimmed)",
-								}}
-							/>
-							<Text size="xs" truncate style={{ fontSize: 10, lineHeight: 1.2 }}>
-								{ch.title}
-							</Text>
-						</Box>
-					))}
-				</Box>
+				/>
 			);
 		}
 
 		// --- Full mode: interactive cards with panels ---
-
 		const containerStyle: React.CSSProperties = {
 			position: "absolute",
-			background: "rgba(67, 56, 202, 0.04)",
 			pointerEvents: "none",
 		};
 		if (isH) {
@@ -367,7 +319,6 @@ export const SegmentCanvas = memo(
 
 		return (
 			<Box style={containerStyle}>
-				{/* Content layer with pointer events restored */}
 				<Box
 					style={{
 						position: "relative",
@@ -381,45 +332,44 @@ export const SegmentCanvas = memo(
 						</Box>
 					)}
 
-					{/* Connector lines: tick → chapter card (hidden at L2, simplified at degrade≥1) */}
-					{!isLoading && laid.length > 0 && zoomTier !== "L2" && degradeLevel < 2 && (
-						<ConnectorLines
-							chapters={laid}
-							mainPos={mainPos}
-							isH={isH}
-							scale={scale}
-							tickPositions={tickPositions}
-							openNarratorId={openNarratorId}
-						/>
-					)}
+					{chapterMorphs.map(({ ch, morph }) => {
+						// Only render ChapterCard when morph says showCardBody
+						if (!morph.showCardBody) return null;
 
-					{laid.map((ch) => {
-						const isPanelOpen =
-							zoomTier !== "L2" && openNarratorId === ch.narratorId && !!ch.narratorId;
-						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
-						const cardHeight = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
+						const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
+						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : morph.width;
+						const cardHeight = isPanelOpen
+							? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT)
+							: morph.height;
 
-						// Cross-axis visibility culling: panels use 1.5× viewport, cards use 3×
+						// Cross-axis visibility culling
+						const visualH = cardHeight;
 						const multiplier = isPanelOpen ? PANEL_CROSS_MULTIPLIER : CARD_CROSS_MULTIPLIER;
 						const bufferHalf = (viewHeight * multiplier - viewHeight) / 2;
 						const cullTop = viewTop - bufferHalf;
 						const cullBottom = viewTop + viewHeight + bufferHalf;
 						const cardTop = ch.layoutY + CARD_TOP_OFFSET;
-						const cardBottom = cardTop + cardHeight;
+						const cardBottom = cardTop + visualH;
 						if (cardBottom < cullTop || cardTop > cullBottom) return null;
+
+						// Center-fade: smooth transition from centered (morph) to top-left (card)
+						const centerFade = morph.showCardBody
+							? Math.max(0, 1 - (morph.width - 160) / (NODE_WIDTH - 160))
+							: 1;
+						const centerOffsetX = ((NODE_WIDTH - morph.width) / 2) * centerFade;
+						const centerOffsetY = ((NODE_HEIGHT - morph.height) / 2) * centerFade;
 
 						return (
 							<Box key={ch.id}>
 								<ChapterCard
 									chapter={ch}
-									x={ch.layoutX}
-									y={ch.layoutY}
+									x={ch.layoutX + centerOffsetX}
+									y={ch.layoutY + centerOffsetY}
 									width={cardWidth}
 									height={cardHeight}
 									isPanelOpen={isPanelOpen}
 									scale={scale}
 									onClick={() => {
-										if (zoomTier === "L2") return;
 										if (ch.narratorId) {
 											setOpenNarratorId(openNarratorId === ch.narratorId ? null : ch.narratorId);
 										}
@@ -436,18 +386,16 @@ export const SegmentCanvas = memo(
 									}}
 									onDragEnd={(newX, newY) => {
 										const clampedY = Math.max(0, newY);
-										queryClient.setQueryData<SegmentData>(
-											["rulerSegment", projectId, fromSha, cardMode],
-											(old) => {
-												if (!old) return old;
-												return {
-													...old,
-													chapters: old.chapters.map((c) =>
-														c.id === ch.id ? { ...c, axisOffset: newX, crossOffset: clampedY } : c,
-													),
-												};
-											},
-										);
+										const qk = ["rulerSegment", projectId, fromSha, needsFull ? "full" : "summary"];
+										queryClient.setQueryData<SegmentData>(qk, (old) => {
+											if (!old) return old;
+											return {
+												...old,
+												chapters: old.chapters.map((c) =>
+													c.id === ch.id ? { ...c, axisOffset: newX, crossOffset: clampedY } : c,
+												),
+											};
+										});
 										api.updateRulerPositions(projectId, [
 											{
 												chapterId: ch.id,
@@ -460,26 +408,24 @@ export const SegmentCanvas = memo(
 									onResizeEnd={(newW, newH, dx, dy) => {
 										const newAxisOffset = ch.layoutX + dx;
 										const newCrossOffset = Math.max(0, ch.layoutY + dy);
-										queryClient.setQueryData<SegmentData>(
-											["rulerSegment", projectId, fromSha, cardMode],
-											(old) => {
-												if (!old) return old;
-												return {
-													...old,
-													chapters: old.chapters.map((c) =>
-														c.id === ch.id
-															? {
-																	...c,
-																	panelWidth: newW,
-																	panelHeight: newH,
-																	axisOffset: newAxisOffset,
-																	crossOffset: newCrossOffset,
-																}
-															: c,
-													),
-												};
-											},
-										);
+										const qk = ["rulerSegment", projectId, fromSha, needsFull ? "full" : "summary"];
+										queryClient.setQueryData<SegmentData>(qk, (old) => {
+											if (!old) return old;
+											return {
+												...old,
+												chapters: old.chapters.map((c) =>
+													c.id === ch.id
+														? {
+																...c,
+																panelWidth: newW,
+																panelHeight: newH,
+																axisOffset: newAxisOffset,
+																crossOffset: newCrossOffset,
+															}
+														: c,
+												),
+											};
+										});
 										api.updateRulerPositions(projectId, [
 											{
 												chapterId: ch.id,
@@ -511,135 +457,16 @@ export const SegmentCanvas = memo(
 		if (prev.orientation !== next.orientation) return false;
 		if (prev.cardRegistry !== next.cardRegistry) return false;
 		if (prev.onChapterContextMenu !== next.onChapterContextMenu) return false;
-		if (prev.tickPositions !== next.tickPositions) return false;
 		if (prev.onFitToView !== next.onFitToView) return false;
 		if (prev.viewTop !== next.viewTop) return false;
 		if (prev.viewHeight !== next.viewHeight) return false;
-		if (prev.zoomTier !== next.zoomTier) return false;
-		if (prev.degradeLevel !== next.degradeLevel) return false;
+		if (prev.scale !== next.scale) return false;
+		if (prev.zoomCenterWorldX !== next.zoomCenterWorldX) return false;
+		if (prev.viewportWorldWidth !== next.viewportWorldWidth) return false;
+		if (prev.onChaptersLoaded !== next.onChaptersLoaded) return false;
 		return true;
 	},
 );
-
-// --- Connector lines from ruler ticks to chapter cards ---
-
-interface ConnectorLinesProps {
-	chapters: Array<{
-		id: string;
-		status: string;
-		startCommitSha: string | null;
-		mergeCommitSha?: string | null;
-		anchorCommitSha: string | null;
-		layoutX: number;
-		layoutY: number;
-		panelWidth: number | null;
-		panelHeight: number | null;
-		narratorId: string | null;
-	}>;
-	mainPos: number;
-	isH: boolean;
-	scale: number;
-	tickPositions?: Map<string, number>;
-	openNarratorId: string | null;
-}
-
-function ConnectorLines({
-	chapters,
-	mainPos,
-	isH,
-	scale,
-	tickPositions,
-	openNarratorId,
-}: ConnectorLinesProps) {
-	if (!tickPositions || chapters.length === 0) return null;
-
-	const lines: React.ReactNode[] = [];
-
-	for (const ch of chapters) {
-		const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
-		const cardW = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
-		const cardH = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
-		const isMerged = ch.status === "merged";
-		const strokeColor = isMerged ? "rgba(99, 102, 241, 0.25)" : "rgba(99, 102, 241, 0.45)";
-
-		// --- Fork line: startCommitSha tick → card leading edge ---
-		const forkSha = ch.startCommitSha;
-		if (forkSha) {
-			const forkTickMain = tickPositions.get(forkSha);
-			if (forkTickMain != null) {
-				const tm = forkTickMain - mainPos;
-				const cardCross = isH
-					? ch.layoutY + CARD_TOP_OFFSET + cardH / 2
-					: ch.layoutX + CARD_TOP_OFFSET + cardW / 2;
-				const cardMain = isH ? ch.layoutX : ch.layoutY;
-
-				// Quadratic bezier: control point at the L-corner (tm, cardCross)
-				// gives a smooth curve from ruler straight down to card straight in.
-				const forkPath = isH
-					? `M ${tm} 0 Q ${tm} ${cardCross}, ${cardMain} ${cardCross}`
-					: `M 0 ${tm} Q ${cardCross} ${tm}, ${cardCross} ${cardMain}`;
-
-				lines.push(
-					<path
-						key={`fork-${ch.id}`}
-						d={forkPath}
-						fill="none"
-						stroke={strokeColor}
-						strokeWidth={1.5 / scale}
-						strokeDasharray={isMerged ? `${4 / scale} ${3 / scale}` : undefined}
-					/>,
-				);
-			}
-		}
-
-		// --- Merge line: card trailing edge → mergeCommitSha tick ---
-		if (isMerged && ch.mergeCommitSha) {
-			const mergeTickMain = tickPositions.get(ch.mergeCommitSha);
-			if (mergeTickMain != null) {
-				const mm = mergeTickMain - mainPos;
-				const cardCross = isH
-					? ch.layoutY + CARD_TOP_OFFSET + cardH / 2
-					: ch.layoutX + CARD_TOP_OFFSET + cardW / 2;
-				const cardTrailMain = isH ? ch.layoutX + cardW : ch.layoutY + cardH;
-
-				const mergePath = isH
-					? `M ${cardTrailMain} ${cardCross} Q ${mm} ${cardCross}, ${mm} 0`
-					: `M ${cardCross} ${cardTrailMain} Q ${cardCross} ${mm}, 0 ${mm}`;
-
-				lines.push(
-					<path
-						key={`merge-${ch.id}`}
-						d={mergePath}
-						fill="none"
-						stroke="rgba(99, 102, 241, 0.25)"
-						strokeWidth={1.5 / scale}
-						strokeDasharray={`${4 / scale} ${3 / scale}`}
-					/>,
-				);
-			}
-		}
-	}
-
-	if (lines.length === 0) return null;
-
-	return (
-		<svg
-			role="img"
-			aria-label="Chapter connector lines"
-			style={{
-				position: "absolute",
-				top: 0,
-				left: 0,
-				width: "100%",
-				height: "100%",
-				overflow: "visible",
-				pointerEvents: "none",
-			}}
-		>
-			{lines}
-		</svg>
-	);
-}
 
 function ChapterCard({
 	chapter,
@@ -776,8 +603,8 @@ function ChapterCard({
 
 	const currentX = x + dragOffset.dx + resizeDelta.dx;
 	const currentY = y + dragOffset.dy + resizeDelta.dy;
-	const displayW = isPanelOpen ? Math.max(MIN_PANEL_WIDTH, cardWidth + resizeDelta.dw) : NODE_WIDTH;
-	const displayH = isPanelOpen ? Math.max(MIN_PANEL_HEIGHT, height + resizeDelta.dh) : NODE_HEIGHT;
+	const displayW = isPanelOpen ? Math.max(MIN_PANEL_WIDTH, cardWidth + resizeDelta.dw) : cardWidth;
+	const displayH = isPanelOpen ? Math.max(MIN_PANEL_HEIGHT, height + resizeDelta.dh) : height;
 
 	const startResize = (e: React.PointerEvent, corner: string) => {
 		e.preventDefault();

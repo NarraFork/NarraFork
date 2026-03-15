@@ -42,6 +42,7 @@ import {
 	IconLockOpen,
 	IconPaperclip,
 	IconPencil,
+	IconPhoto,
 	IconShield,
 	IconSparkles,
 	IconTerminal,
@@ -2430,6 +2431,14 @@ export function NarratorPanel({
 											{index === 0 ? `${t("bufferedMessage")}: ` : ""}
 											{msg.text}
 										</Text>
+										{msg.imageCount > 0 && (
+											<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+												<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
+												<Text size="xs" c="blue">
+													{msg.imageCount}
+												</Text>
+											</Group>
+										)}
 										<ActionIcon
 											size="xs"
 											variant="subtle"

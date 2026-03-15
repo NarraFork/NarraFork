@@ -1,5 +1,5 @@
-import { Box, Text } from "@mantine/core";
-import { IconEyeCheck, IconGitBranch, IconGitMerge } from "@tabler/icons-react";
+import { Box, CopyButton, Text, Tooltip } from "@mantine/core";
+import { IconCopy, IconEyeCheck, IconGitBranch, IconGitMerge } from "@tabler/icons-react";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -31,7 +31,8 @@ interface TickContextMenuProps {
 	y: number;
 	commitSha: string;
 	commitMessage: string;
-	hasSegment: boolean;
+	commitAuthor: string;
+	commitDate: string;
 	onClose: () => void;
 	onFork: (commitSha: string) => void;
 }
@@ -41,11 +42,14 @@ export function TickContextMenu({
 	y,
 	commitSha,
 	commitMessage,
+	commitAuthor,
+	commitDate,
 	onClose,
 	onFork,
 }: TickContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const { ref, pos } = useMenuPosition(x, y);
+	const hasMultiLine = commitMessage.includes("\n") || commitMessage.length > 60;
 	return (
 		<Box
 			ref={ref}
@@ -58,16 +62,45 @@ export function TickContextMenu({
 				border: "1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 				borderRadius: 8,
 				padding: 4,
-				minWidth: 180,
+				minWidth: 220,
+				maxWidth: 360,
 				boxShadow: "0 4px 12px light-dark(rgba(0,0,0,0.1), rgba(0,0,0,0.3))",
 			}}
 			onClick={(e) => e.stopPropagation()}
 		>
 			{/* Commit info header */}
 			<Box px={8} py={4}>
-				<Text size="xs" c="dimmed" truncate style={{ maxWidth: 200 }}>
-					{commitSha.slice(0, 8)} — {commitMessage}
-				</Text>
+				<Box style={{ display: "flex", alignItems: "center", gap: 4 }}>
+					<Text size="xs" ff="monospace" c="indigo" fw={600}>
+						{commitSha.slice(0, 8)}
+					</Text>
+					<CopyButton value={commitSha}>
+						{({ copied, copy }) => (
+							<Tooltip label={copied ? t("ruler.copied") : t("ruler.copySha")} withArrow>
+								<Box style={{ cursor: "pointer", display: "flex", opacity: 0.6 }} onClick={copy}>
+									<IconCopy size={12} />
+								</Box>
+							</Tooltip>
+						)}
+					</CopyButton>
+				</Box>
+				{commitAuthor && (
+					<Text size="10px" c="dimmed" mt={2}>
+						{commitAuthor}
+						{commitDate ? ` · ${formatRelativeDate(commitDate, t)}` : ""}
+					</Text>
+				)}
+				<Box
+					mt={4}
+					style={{
+						maxHeight: hasMultiLine ? 120 : undefined,
+						overflowY: hasMultiLine ? "auto" : undefined,
+					}}
+				>
+					<Text size="xs" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+						{commitMessage}
+					</Text>
+				</Box>
 			</Box>
 
 			<Box
@@ -195,6 +228,27 @@ export function ChapterContextMenu({
 			)}
 		</Box>
 	);
+}
+
+function formatRelativeDate(
+	dateStr: string,
+	t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+	try {
+		const d = new Date(dateStr);
+		const now = Date.now();
+		const diffMs = now - d.getTime();
+		const diffMin = Math.floor(diffMs / 60_000);
+		if (diffMin < 1) return t("ruler.justNow");
+		if (diffMin < 60) return t("ruler.minutesAgo", { count: diffMin });
+		const diffH = Math.floor(diffMin / 60);
+		if (diffH < 24) return t("ruler.hoursAgo", { count: diffH });
+		const diffD = Math.floor(diffH / 24);
+		if (diffD < 30) return t("ruler.daysAgo", { count: diffD });
+		return d.toLocaleDateString();
+	} catch {
+		return dateStr;
+	}
 }
 
 function MenuItem({

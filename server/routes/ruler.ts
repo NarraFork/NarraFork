@@ -182,10 +182,19 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 	if (!fromSha) return c.json({ chapters: [], edges: [] });
 
 	if (detail === "summary") {
-		// Lightweight: only id, title, status, role + narrator status
+		// Lightweight: id, title, status, role, narrator status + layout position
 		const projectChapters = await db.query.chapters.findMany({
 			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
-			columns: { id: true, title: true, status: true, role: true, startCommitSha: true },
+			columns: {
+				id: true,
+				title: true,
+				status: true,
+				role: true,
+				startCommitSha: true,
+				anchorCommitSha: true,
+				axisOffset: true,
+				crossOffset: true,
+			},
 		});
 		const segmentChapters = projectChapters.filter((ch) => ch.startCommitSha === fromSha);
 		const chapterIds = segmentChapters.map((ch) => ch.id);
@@ -208,6 +217,9 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 				status: ch.status,
 				role: ch.role,
 				narratorStatus: narratorMap.get(ch.id) ?? null,
+				anchorCommitSha: ch.anchorCommitSha ?? ch.startCommitSha ?? null,
+				axisOffset: ch.axisOffset ?? 0,
+				crossOffset: ch.crossOffset ?? 0,
 			})),
 			edges: [],
 		});

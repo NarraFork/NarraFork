@@ -9,5 +9,8 @@ export type RulerOrientation = "horizontal" | "vertical";
  */
 export type RulerEdge = "start" | "end";
 
-/** The ruler track thickness in px (same for both orientations). */
-export const RULER_THICKNESS = 48;
+/** Default (minimum) ruler track thickness in px. */
+export const DEFAULT_RULER_THICKNESS = 48;
+
+/** Maximum ruler track thickness when dragged open. */
+export const MAX_RULER_THICKNESS = 200;

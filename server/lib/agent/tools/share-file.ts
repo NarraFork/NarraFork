@@ -37,14 +37,15 @@ function pathSize(fullPath: string): number {
 
 /** Check if the system `zip` command is available. Cached after first call. */
 let _zipAvailable: boolean | null = null;
-function isZipCliAvailable(): boolean {
+async function isZipCliAvailable(): Promise<boolean> {
 	if (_zipAvailable !== null) return _zipAvailable;
 	try {
-		const proc = Bun.spawnSync(["zip", "--version"], {
+		const proc = Bun.spawn(["zip", "--version"], {
 			stdout: "ignore",
 			stderr: "ignore",
 		});
-		_zipAvailable = proc.exitCode === 0;
+		const exitCode = await proc.exited;
+		_zipAvailable = exitCode === 0;
 	} catch {
 		_zipAvailable = false;
 	}
@@ -76,14 +77,20 @@ function commonParentDir(paths: string[]): string {
  * Create a zip archive using the system `zip` CLI.
  * Returns null on success, or an error string on failure.
  */
-function zipViaCli(outputPath: string, basedir: string, relativePaths: string[]): string | null {
-	const proc = Bun.spawnSync(["zip", "-r", outputPath, ...relativePaths], {
+async function zipViaCli(
+	outputPath: string,
+	basedir: string,
+	relativePaths: string[],
+): Promise<string | null> {
+	const proc = Bun.spawn(["zip", "-r", outputPath, ...relativePaths], {
 		cwd: basedir,
+		stdout: "ignore",
 		stderr: "pipe",
 	});
-	if (proc.exitCode !== 0) {
-		const stderr = proc.stderr.toString().trim();
-		return stderr || `zip exited with code ${proc.exitCode}`;
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) {
+		const stderr = await new Response(proc.stderr).text();
+		return stderr.trim() || `zip exited with code ${exitCode}`;
 	}
 	return null;
 }
@@ -223,8 +230,8 @@ async function handleMultiFile(
 	try {
 		// Prefer system zip; fall back to archiver
 		let err: string | null;
-		if (isZipCliAvailable()) {
-			err = zipViaCli(storagePath, basedir, relativePaths);
+		if (await isZipCliAvailable()) {
+			err = await zipViaCli(storagePath, basedir, relativePaths);
 		} else {
 			err = await zipViaArchiver(storagePath, basedir, relativePaths);
 		}
@@ -345,14 +352,15 @@ async function handleSinglePath(
 			finalName = `${originalName}.tar.gz`;
 			storagePath = resolve(shareDir, finalName);
 			format = "tar.gz";
-			const proc = Bun.spawnSync(
+			const proc = Bun.spawn(
 				["tar", "-czf", storagePath, "-C", resolve(fullPath, ".."), originalName],
-				{ stderr: "pipe" },
+				{ stdout: "ignore", stderr: "pipe" },
 			);
-			if (proc.exitCode !== 0) {
-				const stderr = proc.stderr.toString().trim();
+			const exitCode = await proc.exited;
+			if (exitCode !== 0) {
+				const stderr = await new Response(proc.stderr).text();
 				return {
-					output: `Failed to create archive: ${stderr || `tar exited with code ${proc.exitCode}`}`,
+					output: `Failed to create archive: ${stderr.trim() || `tar exited with code ${exitCode}`}`,
 					isError: true,
 				};
 			}
@@ -362,11 +370,15 @@ async function handleSinglePath(
 			format = "gz";
 			const tempPath = resolve(shareDir, originalName);
 			await Bun.write(tempPath, Bun.file(fullPath));
-			const proc = Bun.spawnSync(["gzip", tempPath], { stderr: "pipe" });
-			if (proc.exitCode !== 0) {
-				const stderr = proc.stderr.toString().trim();
+			const proc = Bun.spawn(["gzip", tempPath], {
+				stdout: "ignore",
+				stderr: "pipe",
+			});
+			const exitCode = await proc.exited;
+			if (exitCode !== 0) {
+				const stderr = await new Response(proc.stderr).text();
 				return {
-					output: `Failed to compress file: ${stderr || `gzip exited with code ${proc.exitCode}`}`,
+					output: `Failed to compress file: ${stderr.trim() || `gzip exited with code ${exitCode}`}`,
 					isError: true,
 				};
 			}

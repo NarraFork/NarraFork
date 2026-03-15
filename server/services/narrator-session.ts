@@ -3771,9 +3771,14 @@ export function getBufferedMessages(narratorId: string): BufferedMessage[] {
 
 /** Project a buffer queue to the minimal shape needed for WS broadcast / REST responses. */
 export function toBufferSummary(
-	msgs: readonly Pick<BufferedMessage, "id" | "text" | "bufferedAt">[],
-): Array<{ id: string; text: string; bufferedAt: string }> {
-	return msgs.map((m) => ({ id: m.id, text: m.text, bufferedAt: m.bufferedAt }));
+	msgs: readonly Pick<BufferedMessage, "id" | "text" | "bufferedAt" | "images">[],
+): Array<{ id: string; text: string; bufferedAt: string; imageCount: number }> {
+	return msgs.map((m) => ({
+		id: m.id,
+		text: m.text,
+		bufferedAt: m.bufferedAt,
+		imageCount: m.images?.length ?? 0,
+	}));
 }
 
 // === Startup recovery ===

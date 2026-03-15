@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PendingPermission } from "../components/narrator/ToolCallCard";
-import type { TreeMessage } from "../lib/api";
+import type { BufferMessageSummary, TreeMessage } from "../lib/api";
 import {
 	type ListenerHandle,
 	narratorWSManager,
@@ -51,11 +51,8 @@ interface NarratorWSCallbacks {
 		todos: { id?: string; content?: string; status?: string }[],
 		toolUseId?: string,
 	) => void;
-	onBufferSet?: (messages: Array<{ id: string; text: string; bufferedAt: string }>) => void;
-	onBufferConsumed?: (
-		messageId: string,
-		remaining: Array<{ id: string; text: string; bufferedAt: string }>,
-	) => void;
+	onBufferSet?: (messages: BufferMessageSummary[]) => void;
+	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
@@ -263,22 +260,12 @@ export function useNarratorWS(
 						callbacksRef.current.onTitleUpdated?.(data.title as string);
 						break;
 					case "buffer_set":
-						callbacksRef.current.onBufferSet?.(
-							data.messages as Array<{
-								id: string;
-								text: string;
-								bufferedAt: string;
-							}>,
-						);
+						callbacksRef.current.onBufferSet?.(data.messages as BufferMessageSummary[]);
 						break;
 					case "buffer_consumed":
 						callbacksRef.current.onBufferConsumed?.(
 							data.messageId as string,
-							data.remaining as Array<{
-								id: string;
-								text: string;
-								bufferedAt: string;
-							}>,
+							data.remaining as BufferMessageSummary[],
 						);
 						break;
 					case "buffer_cleared":

@@ -52,7 +52,10 @@ shareRoutes.get("/:shareId", async (c) => {
 	// ASCII-safe fallback: replace non-ASCII chars with underscores
 	const asciiFallback = base.replace(/[^\x20-\x7E]/g, "_");
 
-	return new Response(file, {
+	// Use stream() instead of Bun.file() directly as Response body,
+	// so that our explicit Content-Length header is preserved
+	// (Bun.file() as body may trigger chunked transfer encoding).
+	return new Response(file.stream(), {
 		headers: {
 			"Content-Type": file.type || "application/octet-stream",
 			"Content-Disposition": `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`,

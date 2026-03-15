@@ -84,6 +84,12 @@
 		"horizontal": "Horizontal ruler",
 		"vertical": "Vertical ruler",
 		"edgeStart": "Ruler at start",
-		"edgeEnd": "Ruler at end"
+		"edgeEnd": "Ruler at end",
+		"copySha": "Copy SHA",
+		"copied": "Copied!",
+		"justNow": "just now",
+		"minutesAgo": "{{count}}m ago",
+		"hoursAgo": "{{count}}h ago",
+		"daysAgo": "{{count}}d ago"
 	}
 }

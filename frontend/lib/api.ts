@@ -141,6 +141,13 @@ export interface BlacklistCmd {
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 
+export interface BufferMessageSummary {
+	id: string;
+	text: string;
+	bufferedAt: string;
+	imageCount: number;
+}
+
 export interface TreeMessage {
 	id: string;
 	narratorId: string;
@@ -497,8 +504,7 @@ export const api = {
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
-	getBufferedMessages: (id: string) =>
-		request<Array<{ id: string; text: string; bufferedAt: string }>>(`/narrators/${id}/buffer`),
+	getBufferedMessages: (id: string) => request<BufferMessageSummary[]>(`/narrators/${id}/buffer`),
 	updateBufferedMessage: (narratorId: string, messageId: string, text: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
 			method: "PATCH",

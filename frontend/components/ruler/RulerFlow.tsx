@@ -1,4 +1,4 @@
-import { ActionIcon, Badge, Box, Center, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Center, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
 import {
 	IconArrowsHorizontal,
 	IconArrowsVertical,
@@ -7,17 +7,28 @@ import {
 	IconLayoutSidebarRightCollapse,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import { type CommitCluster, clusterCommits, computeHeatmap } from "./commit-cluster";
-import { COLLAPSED_GAP, computeElasticLayout, type TickPosition } from "./elastic-layout";
+import { clusterCommits } from "./commit-cluster";
+import {
+	COLLAPSED_GAP,
+	computeElasticLayout,
+	findTickAtX,
+	type TickPosition,
+} from "./elastic-layout";
 import { OffscreenBubbles } from "./OffscreenBubbles";
+import { type PixiChapterInfo, type RulerPixiHandle, RulerPixiLayer } from "./pixi/RulerPixiLayer";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
 import { type ChapterContextMenuState, SegmentCanvas } from "./SegmentCanvas";
-import { RULER_THICKNESS, type RulerEdge, type RulerOrientation } from "./types";
+import {
+	DEFAULT_RULER_THICKNESS,
+	MAX_RULER_THICKNESS,
+	type RulerEdge,
+	type RulerOrientation,
+} from "./types";
 import { getZoomTierInfo, type ZoomTierId } from "./zoom-tiers";
 
 interface RulerFlowProps {
@@ -25,9 +36,6 @@ interface RulerFlowProps {
 	focusChapterId?: string | null;
 }
 
-const TICK_WIDTH = 2;
-/** Multiplier of viewport size used as off-screen buffer for commit ticks on the ruler */
-const TICK_VIEWPORT_MULTIPLIER = 5;
 /** Multiplier of viewport size used as off-screen buffer for expanded segment canvases */
 const SEGMENT_VIEWPORT_MULTIPLIER = 3;
 
@@ -48,8 +56,8 @@ interface ClampBounds {
 
 /** Compute the hard min/max for each axis. */
 function getMainBounds(opts: ClampBounds, scale: number) {
-	const max = opts.mainViewportSize; // viewport right edge touches x=0
-	const min = -opts.maxContentMain * scale; // viewport left edge touches last content
+	const max = opts.mainViewportSize * 0.75; // allow at most 3/4 viewport empty space at start
+	const min = -opts.maxContentMain * scale + opts.mainViewportSize * 0.25; // keep at least 1/4 viewport showing content at end
 	return { min, max };
 }
 
@@ -76,41 +84,6 @@ function clampCamera(cam: Camera, opts?: ClampBounds): Camera {
 		if (opts.maxContentMain > 0) {
 			const mb = getMainBounds(opts, cam.scale);
 			mainPan = Math.max(mb.min, Math.min(mb.max, mainPan));
-		}
-	}
-
-	if (isH) {
-		const changed = mainPan !== cam.panX || crossPan !== cam.panY;
-		return changed ? { ...cam, panX: mainPan, panY: crossPan } : cam;
-	}
-	const changed = mainPan !== cam.panY || crossPan !== cam.panX;
-	return changed ? { ...cam, panX: crossPan, panY: mainPan } : cam;
-}
-
-/**
- * Soft clamp — allows overscroll with rubber-band resistance.
- * The further past the boundary, the harder it is to drag.
- */
-const RUBBER_BAND_FACTOR = 0.3;
-
-function rubberBand(value: number, min: number, max: number): number {
-	if (value > max) return max + (value - max) * RUBBER_BAND_FACTOR;
-	if (value < min) return min + (value - min) * RUBBER_BAND_FACTOR;
-	return value;
-}
-
-function softClampCamera(cam: Camera, opts?: ClampBounds): Camera {
-	const isH = cam.orientation === "horizontal";
-	let mainPan = isH ? cam.panX : cam.panY;
-	let crossPan = isH ? cam.panY : cam.panX;
-
-	if (opts) {
-		const cb = getCrossBounds(opts, cam.scale);
-		crossPan = rubberBand(crossPan, cb.min, cb.max);
-
-		if (opts.maxContentMain > 0) {
-			const mb = getMainBounds(opts, cam.scale);
-			mainPan = rubberBand(mainPan, mb.min, mb.max);
 		}
 	}
 
@@ -172,6 +145,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const cameraRef = useRef<Camera>(savedCamera);
 	const [camera, setCamera] = useState<Camera>(savedCamera);
+	const [rulerThickness, setRulerThickness] = useState(DEFAULT_RULER_THICKNESS);
+	const rulerDragRef = useRef<{ startY: number; startThickness: number } | null>(null);
+	const rulerDragCleanupRef = useRef<(() => void) | null>(null);
 	const cameraInitializedRef = useRef(false);
 	const [needsInitialPosition, setNeedsInitialPosition] = useState(false);
 	const rafIdRef = useRef(0);
@@ -198,6 +174,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		const cam = cameraRef.current;
 		const isH = cam.orientation === "horizontal";
 		const { panX: px, panY: py, scale: s } = cam;
+
+		// PixiJS layer — fast-path camera update
+		pixiRef.current?.updateCamera(cam);
 
 		// Tick strip — translate + scale; update counter-scale CSS variable for ticks
 		const strip = tickStripRef.current;
@@ -244,30 +223,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		rafIdRef.current = requestAnimationFrame(() => {
 			rafIdRef.current = 0;
 			applyTransformToDOM();
-
-			// Track frame timing for performance monitoring
-			const pm = perfMonitorRef.current;
-			const now = performance.now();
-			if (pm.lastFrame > 0) {
-				pm.frameTimes.push(now - pm.lastFrame);
-				if (pm.frameTimes.length > 60) pm.frameTimes.shift();
-				// Check P95 every 60 frames
-				if (pm.frameTimes.length === 60) {
-					const sorted = [...pm.frameTimes].sort((a, b) => a - b);
-					const p95 = sorted[Math.floor(sorted.length * 0.95)];
-					const newLevel =
-						p95 > 32
-							? Math.min(2, pm.degradeLevel + 1)
-							: p95 < 18 && pm.degradeLevel > 0
-								? pm.degradeLevel - 1
-								: pm.degradeLevel;
-					if (newLevel !== pm.degradeLevel) {
-						pm.degradeLevel = newLevel;
-						setDegradeLevel(newLevel);
-					}
-				}
-			}
-			pm.lastFrame = now;
 		});
 	}, [applyTransformToDOM]);
 
@@ -310,20 +265,46 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		};
 	}, [camera, projectId, queryClient]);
 
-	// --- Performance monitoring + adaptive degradation ---
-	const perfMonitorRef = useRef({ frameTimes: [] as number[], degradeLevel: 0, lastFrame: 0 });
-	const [degradeLevel, setDegradeLevel] = useState(0);
-
 	const containerRef = useRef<HTMLDivElement>(null);
+	const pixiRef = useRef<RulerPixiHandle>(null);
 	const wheelCleanupRef = useRef<(() => void) | null>(null);
+	const resizeObserverRef = useRef<ResizeObserver | null>(null);
+	const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
 	const isPanningRef = useRef(false);
 	const panStartRef = useRef({ x: 0, y: 0, camX: 0, camY: 0 });
+	// --- Inertia state for drag panning ---
+	const panSamplesRef = useRef<Array<{ x: number; y: number; t: number }>>([]);
+	const inertiaRafRef = useRef(0);
+	const pinchRef = useRef<{
+		active: boolean;
+		startDist: number;
+		startScale: number;
+		startPanX: number;
+		startPanY: number;
+		lastCenterX: number;
+		lastCenterY: number;
+		frameCount: number;
+	}>({
+		active: false,
+		startDist: 0,
+		startScale: 1,
+		startPanX: 0,
+		startPanY: 0,
+		lastCenterX: 0,
+		lastCenterY: 0,
+		frameCount: 0,
+	});
 	const segmentsRef = useRef<RulerSegment[]>([]);
 	const layoutRef = useRef<{ ticks: TickPosition[]; totalWidth: number }>({
 		ticks: [],
 		totalWidth: 0,
 	});
 	const commitShasRef = useRef<string[]>([]);
+
+	// Zoom center: world-space main-axis position of the last zoom gesture.
+	// Falls back to viewport center when no zoom is active.
+	const zoomCenterWorldRef = useRef<number | null>(null);
+	const zoomCenterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	// --- Offscreen card tracking (ref-based, no re-render) ---
 	const cardRegistryRef = useRef<
@@ -357,8 +338,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		}
 		const el = containerRef.current;
 		const crossVp = isH
-			? (el?.clientHeight ?? 800) - RULER_THICKNESS
-			: (el?.clientWidth ?? 1200) - RULER_THICKNESS;
+			? (el?.clientHeight ?? 800) - rulerThickness
+			: (el?.clientWidth ?? 1200) - rulerThickness;
 		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
 		const maxMain = totalMainRef.current;
 		const hasContent = maxCross > 0 || maxMain > 0;
@@ -370,13 +351,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					mainViewportSize: mainVp,
 				}
 			: undefined;
-	}, []);
+	}, [rulerThickness]);
 
 	/** Hard clamp — snap to bounds. For navigation, animation targets, etc. */
 	const hardClamp = useCallback((cam: Camera) => clampCamera(cam, getBounds()), [getBounds]);
-
-	/** Soft clamp — rubber-band resistance during active interaction. */
-	const softClamp = useCallback((cam: Camera) => softClampCamera(cam, getBounds()), [getBounds]);
 
 	/** Animate back to hard-clamped position after overscroll. */
 	const bounceRafRef = useRef(0);
@@ -411,6 +389,23 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// --- Smooth scroll state for main-axis wheel scrolling ---
 	const smoothScrollRef = useRef({
 		targetMainPan: 0,
+		animating: false,
+		rafId: 0,
+		/** Frame counter — used to throttle React state commits during animation */
+		frameCount: 0,
+	});
+
+	// Smooth zoom state: accumulates target scale and lerps toward it each frame
+	const smoothZoomRef = useRef({
+		targetScale: 1,
+		/** World-space main-axis position of the zoom anchor */
+		anchorWorldMain: 0,
+		/** Screen-space main-axis position of the zoom anchor */
+		anchorScreenMain: 0,
+		/** World-space cross-axis position of the zoom anchor */
+		anchorWorldCross: 0,
+		/** Screen-space cross-axis position of the zoom anchor */
+		anchorScreenCross: 0,
 		animating: false,
 		rafId: 0,
 	});
@@ -461,13 +456,84 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		}
 	}, [projectId, queryClient]);
 
+	/** Animate inertia after drag release. Decays velocity each frame until below threshold.
+	 *  When the camera crosses clamp bounds, friction ramps up sharply so the view
+	 *  overshoots only slightly before bouncing back. */
+	const animateInertia = useCallback(
+		(vx: number, vy: number) => {
+			cancelAnimationFrame(inertiaRafRef.current);
+			const FRICTION = 0.95;
+			const OVERSCROLL_FRICTION = 0.6;
+			const MIN_VELOCITY = 0.5;
+			let velX = vx;
+			let velY = vy;
+			let frameCount = 0;
+
+			const step = () => {
+				const cam = cameraRef.current;
+				const bounds = getBounds();
+				const isH = cam.orientation === "horizontal";
+
+				// Determine per-axis friction: heavy damping when past clamp bounds
+				let frictionX = FRICTION;
+				let frictionY = FRICTION;
+				if (bounds) {
+					const mainPan = isH ? cam.panX : cam.panY;
+					const crossPan = isH ? cam.panY : cam.panX;
+					const mb = bounds.maxContentMain > 0 ? getMainBounds(bounds, cam.scale) : null;
+					const cb = getCrossBounds(bounds, cam.scale);
+
+					const mainOver = mb ? mainPan < mb.min || mainPan > mb.max : false;
+					const crossOver = crossPan < cb.min || crossPan > cb.max;
+
+					if (isH) {
+						if (mainOver) frictionX = OVERSCROLL_FRICTION;
+						if (crossOver) frictionY = OVERSCROLL_FRICTION;
+					} else {
+						if (mainOver) frictionY = OVERSCROLL_FRICTION;
+						if (crossOver) frictionX = OVERSCROLL_FRICTION;
+					}
+				}
+
+				velX *= frictionX;
+				velY *= frictionY;
+
+				if (Math.abs(velX) < MIN_VELOCITY && Math.abs(velY) < MIN_VELOCITY) {
+					// Settle — commit and bounce back to bounds
+					setCamera({ ...cameraRef.current });
+					syncSmoothTarget();
+					animateBounce();
+					updatePrefetch();
+					return;
+				}
+
+				cameraRef.current = {
+					...cam,
+					panX: cam.panX + velX,
+					panY: cam.panY + velY,
+				};
+				scheduleLightRender();
+
+				frameCount++;
+				if (frameCount % 4 === 0) {
+					setCamera({ ...cameraRef.current });
+				}
+
+				inertiaRafRef.current = requestAnimationFrame(step);
+			};
+			inertiaRafRef.current = requestAnimationFrame(step);
+		},
+		[scheduleLightRender, animateBounce, syncSmoothTarget, updatePrefetch, getBounds],
+	);
+
 	// --- Context menu ---
 	const [tickMenu, setTickMenu] = useState<{
 		x: number;
 		y: number;
 		sha: string;
 		message: string;
-		hasSegment: boolean;
+		author: string;
+		date: string;
 	} | null>(null);
 
 	const [chapterMenu, setChapterMenu] = useState<ChapterContextMenuState | null>(null);
@@ -509,6 +575,22 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return () => window.removeEventListener("keydown", onKey);
 	}, [resetCamera]);
 
+	// Cleanup timers and event listeners on unmount
+	useEffect(() => {
+		return () => {
+			rulerDragCleanupRef.current?.();
+			cancelAnimationFrame(inertiaRafRef.current);
+			cancelAnimationFrame(smoothScrollRef.current.rafId);
+			cancelAnimationFrame(smoothZoomRef.current.rafId);
+			cancelAnimationFrame(bounceRafRef.current);
+			cancelAnimationFrame(animFrameRef.current);
+			smoothScrollRef.current.animating = false;
+			smoothZoomRef.current.animating = false;
+			if (zoomCenterTimerRef.current) clearTimeout(zoomCenterTimerRef.current);
+			resizeObserverRef.current?.disconnect();
+		};
+	}, []);
+
 	const animFrameRef = useRef(0);
 	const navigateToWorld = useCallback(
 		(worldX: number, worldY: number) => {
@@ -520,8 +602,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const isH = cam.orientation === "horizontal";
 			// worldX/worldY are always in CSS coordinate space (X=horizontal, Y=vertical)
 			// Canvas area excludes the ruler track
-			const canvasW = isH ? vw : vw - RULER_THICKNESS;
-			const canvasH = isH ? vh - RULER_THICKNESS : vh;
+			const canvasW = isH ? vw : vw - rulerThickness;
+			const canvasH = isH ? vh - rulerThickness : vh;
 			const target: Camera = hardClamp({
 				...cam,
 				panX: canvasW / 2 - worldX * s,
@@ -557,7 +639,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			cancelAnimationFrame(animFrameRef.current);
 			animFrameRef.current = requestAnimationFrame(step);
 		},
-		[hardClamp, syncSmoothTarget, scheduleLightRender],
+		[hardClamp, syncSmoothTarget, scheduleLightRender, rulerThickness],
 	);
 
 	/**
@@ -572,8 +654,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const vh = el?.clientHeight ?? 800;
 			const cam = cameraRef.current;
 			const isH = cam.orientation === "horizontal";
-			const canvasW = isH ? vw : vw - RULER_THICKNESS;
-			const canvasH = isH ? vh - RULER_THICKNESS : vh;
+			const canvasW = isH ? vw : vw - rulerThickness;
+			const canvasH = isH ? vh - rulerThickness : vh;
 
 			const PADDING = 40;
 			const neededW = (worldW + PADDING * 2) * cam.scale;
@@ -625,7 +707,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			cancelAnimationFrame(animFrameRef.current);
 			animFrameRef.current = requestAnimationFrame(step);
 		},
-		[hardClamp, syncSmoothTarget, scheduleLightRender],
+		[hardClamp, syncSmoothTarget, scheduleLightRender, rulerThickness],
 	);
 
 	const handleForkFromCommit = useCallback(
@@ -711,17 +793,73 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		[projectId, queryClient, chapterMenu],
 	);
 
+	// --- Tick context menu via hit-testing ---
+	const handleTickContextMenu = useCallback((e: React.MouseEvent) => {
+		const el = containerRef.current;
+		if (!el) return;
+		const rect = el.getBoundingClientRect();
+		const cam = cameraRef.current;
+		const isH = cam.orientation === "horizontal";
+		const mouseMain = isH ? e.clientX - rect.left : e.clientY - rect.top;
+		const mainPan = isH ? cam.panX : cam.panY;
+		const worldMain = (mouseMain - mainPan) / cam.scale;
+
+		const ticks = layoutRef.current.ticks;
+		if (ticks.length === 0) return;
+
+		const idx = findTickAtX(ticks, worldMain);
+		if (idx < 0) return;
+		const tick = ticks[idx];
+		const dist = Math.abs(tick.x - worldMain);
+		if (dist > COLLAPSED_GAP / 2) return;
+
+		e.preventDefault();
+		const commit = commitByShaRef.current.get(tick.sha);
+		setTickMenu({
+			x: e.clientX,
+			y: e.clientY,
+			sha: tick.sha,
+			message: commit?.message ?? "",
+			author: commit?.author ?? "",
+			date: commit?.date ?? "",
+		});
+	}, []);
+
 	// --- Input handlers ---
 	const wheelBounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const containerCallbackRef = useCallback(
 		(el: HTMLDivElement | null) => {
 			wheelCleanupRef.current?.();
 			wheelCleanupRef.current = null;
+			// Disconnect previous ResizeObserver
+			resizeObserverRef.current?.disconnect();
+			resizeObserverRef.current = null;
 			containerRef.current = el;
-			if (!el) return;
+			if (!el) {
+				setContainerSize({ width: 0, height: 0 });
+				return;
+			}
+
+			// Seed initial size synchronously so the first render has correct dimensions
+			setContainerSize({ width: el.clientWidth, height: el.clientHeight });
+
+			// Watch for layout changes (window resize, sidebar toggle, etc.)
+			const ro = new ResizeObserver((entries) => {
+				const entry = entries[0];
+				if (!entry) return;
+				const { width, height } = entry.contentRect;
+				setContainerSize((prev) =>
+					prev.width === Math.round(width) && prev.height === Math.round(height)
+						? prev
+						: { width: Math.round(width), height: Math.round(height) },
+				);
+			});
+			ro.observe(el);
+			resizeObserverRef.current = ro;
 
 			const onWheel = (e: WheelEvent) => {
 				cancelAnimationFrame(bounceRafRef.current);
+				cancelAnimationFrame(inertiaRafRef.current);
 				const cam = cameraRef.current;
 				const isH = cam.orientation === "horizontal";
 				const oldPanX = cam.panX;
@@ -734,18 +872,22 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					const mouseY = e.clientY - rect.top;
 					const canvasMouseMain = isH ? mouseX : mouseY;
 					const canvasMouseCross = isH
-						? mouseY - (cam.edge === "start" ? RULER_THICKNESS : 0)
-						: mouseX - (cam.edge === "start" ? RULER_THICKNESS : 0);
-					const newScale = Math.max(0.1, Math.min(5, cam.scale * factor));
+						? mouseY - (cam.edge === "start" ? rulerThickness : 0)
+						: mouseX - (cam.edge === "start" ? rulerThickness : 0);
+
+					const sz = smoothZoomRef.current;
+					// If not currently animating, seed target from current camera
+					if (!sz.animating) {
+						sz.targetScale = cam.scale;
+					}
+					sz.targetScale = Math.max(0.1, Math.min(5, sz.targetScale * factor));
+
+					// Compute world-space anchor from current (not target) camera
 					const mainPan = isH ? cam.panX : cam.panY;
 					const crossPan = isH ? cam.panY : cam.panX;
+					sz.anchorWorldMain = (canvasMouseMain - mainPan) / cam.scale;
+					sz.anchorScreenMain = canvasMouseMain;
 
-					// Classic zoom: tick.x is scale-independent, so standard
-					// world-coordinate anchoring works without any conversion.
-					const worldMain = (canvasMouseMain - mainPan) / cam.scale;
-					const newMainPan = canvasMouseMain - worldMain * newScale;
-
-					// Cross-axis zoom anchor
 					let worldMouseCross = (canvasMouseCross - crossPan) / cam.scale;
 					let maxCardCross = 0;
 					for (const cards of cardRegistryRef.current.values()) {
@@ -757,16 +899,65 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					if (maxCardCross > 0) {
 						worldMouseCross = Math.min(worldMouseCross, maxCardCross);
 					}
-					const newCrossPan = canvasMouseCross - worldMouseCross * newScale;
+					sz.anchorWorldCross = worldMouseCross;
+					sz.anchorScreenCross = canvasMouseCross;
 
-					cameraRef.current = softClamp({
-						...cam,
-						panX: isH ? newMainPan : newCrossPan,
-						panY: isH ? newCrossPan : newMainPan,
-						scale: newScale,
-					});
-					scheduleLightRender();
-					syncSmoothTarget();
+					// Record zoom center for distance-aware LOD
+					zoomCenterWorldRef.current = sz.anchorWorldMain;
+					if (zoomCenterTimerRef.current) clearTimeout(zoomCenterTimerRef.current);
+					zoomCenterTimerRef.current = setTimeout(() => {
+						zoomCenterWorldRef.current = null;
+					}, 800);
+
+					// Start smooth zoom animation loop if not already running
+					if (!sz.animating) {
+						sz.animating = true;
+						const zoomStep = () => {
+							const cur = cameraRef.current;
+							const curIsH = cur.orientation === "horizontal";
+							const diff = sz.targetScale - cur.scale;
+							const LERP = 0.18;
+
+							if (Math.abs(diff) < 0.001) {
+								// Close enough — snap to target
+								const newMainPan = sz.anchorScreenMain - sz.anchorWorldMain * sz.targetScale;
+								const newCrossPan = sz.anchorScreenCross - sz.anchorWorldCross * sz.targetScale;
+								cameraRef.current = hardClamp({
+									...cur,
+									panX: curIsH ? newMainPan : newCrossPan,
+									panY: curIsH ? newCrossPan : newMainPan,
+									scale: sz.targetScale,
+								});
+								scheduleLightRender();
+								setCamera({ ...cameraRef.current });
+								sz.animating = false;
+
+								// Bounce check after settle
+								if (wheelBounceTimerRef.current) clearTimeout(wheelBounceTimerRef.current);
+								wheelBounceTimerRef.current = setTimeout(() => {
+									wheelBounceTimerRef.current = null;
+									animateBounce();
+									updatePrefetch();
+								}, 120);
+								return;
+							}
+
+							const newScale = cur.scale + diff * LERP;
+							const newMainPan = sz.anchorScreenMain - sz.anchorWorldMain * newScale;
+							const newCrossPan = sz.anchorScreenCross - sz.anchorWorldCross * newScale;
+							cameraRef.current = hardClamp({
+								...cur,
+								panX: curIsH ? newMainPan : newCrossPan,
+								panY: curIsH ? newCrossPan : newMainPan,
+								scale: newScale,
+							});
+							scheduleLightRender();
+							// Commit to React state every frame so morph/LOD updates in real time
+							setCamera({ ...cameraRef.current });
+							sz.rafId = requestAnimationFrame(zoomStep);
+						};
+						sz.rafId = requestAnimationFrame(zoomStep);
+					}
 				} else {
 					e.preventDefault();
 					// Map deltaY (primary wheel axis) to main-axis scrolling with smooth animation.
@@ -783,7 +974,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 					// Apply cross-axis immediately (no smoothing needed for minor trackpad input)
 					if (crossDelta !== 0) {
-						const crossCam = softClamp({
+						const crossCam = hardClamp({
 							...cameraRef.current,
 							...(isH
 								? { panY: cameraRef.current.panY - crossDelta }
@@ -795,16 +986,17 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					// Start smooth animation loop if not already running
 					if (!ss.animating) {
 						ss.animating = true;
+						ss.frameCount = 0;
 						const smoothStep = () => {
 							const cur = cameraRef.current;
 							const curMain = cur.orientation === "horizontal" ? cur.panX : cur.panY;
 							const diff = ss.targetMainPan - curMain;
 
 							// Lerp factor — higher = snappier, lower = smoother
-							const LERP = 0.18;
+							const LERP = 0.25;
 							if (Math.abs(diff) < 0.5) {
 								// Close enough — snap and stop
-								const finalCam = softClamp({
+								const finalCam = hardClamp({
 									...cur,
 									...(cur.orientation === "horizontal"
 										? { panX: ss.targetMainPan }
@@ -812,14 +1004,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								});
 								cameraRef.current = finalCam;
 								scheduleLightRender();
+								setCamera({ ...cameraRef.current });
 								ss.animating = false;
 
 								// Trigger bounce check
 								if (wheelBounceTimerRef.current) clearTimeout(wheelBounceTimerRef.current);
 								wheelBounceTimerRef.current = setTimeout(() => {
 									wheelBounceTimerRef.current = null;
-									// Commit camera to React state after scroll settles
-									setCamera({ ...cameraRef.current });
 									animateBounce();
 									updatePrefetch();
 								}, 120);
@@ -827,12 +1018,18 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							}
 
 							const newMain = curMain + diff * LERP;
-							const newCam = softClamp({
+							const newCam = hardClamp({
 								...cur,
 								...(cur.orientation === "horizontal" ? { panX: newMain } : { panY: newMain }),
 							});
 							cameraRef.current = newCam;
 							scheduleLightRender();
+							// Commit to React state every 4 frames so SegmentCanvas
+							// visibility culling updates progressively instead of all at once.
+							ss.frameCount++;
+							if (ss.frameCount % 4 === 0) {
+								setCamera({ ...cameraRef.current });
+							}
 							ss.rafId = requestAnimationFrame(smoothStep);
 						};
 						ss.rafId = requestAnimationFrame(smoothStep);
@@ -845,32 +1042,135 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					panStartRef.current.camX += newCam.panX - oldPanX;
 					panStartRef.current.camY += newCam.panY - oldPanY;
 				}
-
-				// Bounce back after wheel activity stops (for zoom case; smooth scroll handles its own)
-				if (e.ctrlKey || e.metaKey) {
-					if (wheelBounceTimerRef.current) clearTimeout(wheelBounceTimerRef.current);
-					wheelBounceTimerRef.current = setTimeout(() => {
-						wheelBounceTimerRef.current = null;
-						// Commit camera to React state after zoom interaction settles
-						setCamera({ ...cameraRef.current });
-						animateBounce();
-						updatePrefetch();
-					}, 120);
-				}
 			};
 
 			el.addEventListener("wheel", onWheel, { passive: false });
+
+			// --- Touch pinch-to-zoom ---
+			const getTouchDist = (t: TouchList) => {
+				const dx = t[1].clientX - t[0].clientX;
+				const dy = t[1].clientY - t[0].clientY;
+				return Math.sqrt(dx * dx + dy * dy);
+			};
+			const getTouchCenter = (t: TouchList, rect: DOMRect) => ({
+				x: (t[0].clientX + t[1].clientX) / 2 - rect.left,
+				y: (t[0].clientY + t[1].clientY) / 2 - rect.top,
+			});
+
+			const onTouchStart = (e: TouchEvent) => {
+				if (e.touches.length !== 2) return;
+				e.preventDefault();
+				const p = pinchRef.current;
+				const rect = el.getBoundingClientRect();
+				const center = getTouchCenter(e.touches, rect);
+				p.active = true;
+				p.startDist = getTouchDist(e.touches);
+				p.startScale = cameraRef.current.scale;
+				p.startPanX = cameraRef.current.panX;
+				p.startPanY = cameraRef.current.panY;
+				p.lastCenterX = center.x;
+				p.lastCenterY = center.y;
+				p.frameCount = 0;
+				// Cancel any ongoing animations
+				cancelAnimationFrame(bounceRafRef.current);
+				cancelAnimationFrame(smoothZoomRef.current.rafId);
+				cancelAnimationFrame(inertiaRafRef.current);
+				smoothZoomRef.current.animating = false;
+			};
+
+			const onTouchMove = (e: TouchEvent) => {
+				const p = pinchRef.current;
+				if (!p.active || e.touches.length !== 2) return;
+				e.preventDefault();
+
+				const rect = el.getBoundingClientRect();
+				const newDist = getTouchDist(e.touches);
+				const center = getTouchCenter(e.touches, rect);
+				const cam = cameraRef.current;
+				const isH = cam.orientation === "horizontal";
+
+				// Scale
+				const newScale = Math.max(0.1, Math.min(5, p.startScale * (newDist / p.startDist)));
+
+				// Anchor zoom at pinch center
+				const canvasMouseMain = isH ? center.x : center.y;
+				const canvasMouseCross = isH
+					? center.y - (cam.edge === "start" ? rulerThickness : 0)
+					: center.x - (cam.edge === "start" ? rulerThickness : 0);
+				const mainPan = isH ? p.startPanX : p.startPanY;
+				const crossPan = isH ? p.startPanY : p.startPanX;
+				const startCenter = isH
+					? {
+							main: p.lastCenterX,
+							cross: p.lastCenterY - (cam.edge === "start" ? rulerThickness : 0),
+						}
+					: {
+							main: p.lastCenterY,
+							cross: p.lastCenterX - (cam.edge === "start" ? rulerThickness : 0),
+						};
+
+				const worldMain = (startCenter.main - mainPan) / p.startScale;
+				const worldCross = (startCenter.cross - crossPan) / p.startScale;
+				const newMainPan = canvasMouseMain - worldMain * newScale;
+				const newCrossPan = canvasMouseCross - worldCross * newScale;
+
+				cameraRef.current = hardClamp({
+					...cam,
+					panX: isH ? newMainPan : newCrossPan,
+					panY: isH ? newCrossPan : newMainPan,
+					scale: newScale,
+				});
+				scheduleLightRender();
+
+				p.frameCount++;
+				if (p.frameCount % 4 === 0) {
+					setCamera({ ...cameraRef.current });
+				}
+			};
+
+			const onTouchEnd = (e: TouchEvent) => {
+				const p = pinchRef.current;
+				if (!p.active) return;
+				if (e.touches.length < 2) {
+					p.active = false;
+					setCamera({ ...cameraRef.current });
+					syncSmoothTarget();
+					animateBounce();
+					updatePrefetch();
+				}
+			};
+
+			el.addEventListener("touchstart", onTouchStart, { passive: false });
+			el.addEventListener("touchmove", onTouchMove, { passive: false });
+			el.addEventListener("touchend", onTouchEnd);
+			el.addEventListener("touchcancel", onTouchEnd);
+
 			wheelCleanupRef.current = () => {
 				el.removeEventListener("wheel", onWheel);
+				el.removeEventListener("touchstart", onTouchStart);
+				el.removeEventListener("touchmove", onTouchMove);
+				el.removeEventListener("touchend", onTouchEnd);
+				el.removeEventListener("touchcancel", onTouchEnd);
 				cancelAnimationFrame(smoothScrollRef.current.rafId);
 				smoothScrollRef.current.animating = false;
+				cancelAnimationFrame(smoothZoomRef.current.rafId);
+				smoothZoomRef.current.animating = false;
+				cancelAnimationFrame(inertiaRafRef.current);
 			};
 		},
-		[scheduleLightRender, softClamp, animateBounce, syncSmoothTarget, updatePrefetch],
+		[
+			scheduleLightRender,
+			hardClamp,
+			animateBounce,
+			syncSmoothTarget,
+			updatePrefetch,
+			rulerThickness,
+		],
 	);
 	const handlePointerDown = useCallback((e: React.PointerEvent) => {
 		if (e.button === 1 || (e.button === 0 && e.currentTarget === e.target)) {
 			cancelAnimationFrame(bounceRafRef.current);
+			cancelAnimationFrame(inertiaRafRef.current);
 			isPanningRef.current = true;
 			panStartRef.current = {
 				x: e.clientX,
@@ -878,6 +1178,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				camX: cameraRef.current.panX,
 				camY: cameraRef.current.panY,
 			};
+			panSamplesRef.current = [{ x: e.clientX, y: e.clientY, t: performance.now() }];
 			(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 			e.preventDefault();
 		}
@@ -885,27 +1186,60 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePointerMove = useCallback(
 		(e: React.PointerEvent) => {
-			if (!isPanningRef.current) return;
-			cameraRef.current = softClamp({
+			if (!isPanningRef.current || pinchRef.current.active) return;
+			cameraRef.current = hardClamp({
 				...cameraRef.current,
 				panX: panStartRef.current.camX + (e.clientX - panStartRef.current.x),
 				panY: panStartRef.current.camY + (e.clientY - panStartRef.current.y),
 			});
 			scheduleLightRender();
+
+			// Record sample for inertia velocity calculation (keep last 5)
+			const samples = panSamplesRef.current;
+			samples.push({ x: e.clientX, y: e.clientY, t: performance.now() });
+			if (samples.length > 5) samples.shift();
 		},
-		[scheduleLightRender, softClamp],
+		[scheduleLightRender, hardClamp],
 	);
 
 	const handlePointerUp = useCallback(() => {
 		if (isPanningRef.current) {
 			isPanningRef.current = false;
-			// Commit final camera to React state
+
+			// Compute velocity from recent samples (within last 80ms)
+			const samples = panSamplesRef.current;
+			const now = performance.now();
+			const cutoff = now - 80;
+			const recent = samples.filter((s) => s.t >= cutoff);
+
+			if (recent.length >= 2) {
+				const first = recent[0];
+				const last = recent[recent.length - 1];
+				const dt = last.t - first.t;
+				if (dt > 0) {
+					// Convert px/ms to px/frame (~16.67ms)
+					const FRAME_MS = 16.67;
+					const vx = ((last.x - first.x) / dt) * FRAME_MS;
+					const vy = ((last.y - first.y) / dt) * FRAME_MS;
+					const speed = Math.sqrt(vx * vx + vy * vy);
+
+					if (speed > 2) {
+						// Commit current position, then start inertia
+						setCamera({ ...cameraRef.current });
+						syncSmoothTarget();
+						animateInertia(vx, vy);
+						return;
+					}
+				}
+			}
+
+			// No significant velocity — commit and bounce immediately
 			setCamera({ ...cameraRef.current });
 			syncSmoothTarget();
 			animateBounce();
 			updatePrefetch();
 		}
-	}, [animateBounce, syncSmoothTarget, updatePrefetch]);
+	}, [animateBounce, animateInertia, syncSmoothTarget, updatePrefetch]);
 
 	const toggleOrientation = useCallback(() => {
 		const cam = cameraRef.current;
@@ -955,6 +1289,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	segmentsRef.current = segments;
 	layoutRef.current = layout;
 	commitShasRef.current = commitShas;
+
+	// SHA → full commit (for context menu)
+	const commitByShaRef = useRef(new Map<string, (typeof commits)[number]>());
+	commitByShaRef.current = useMemo(() => {
+		const m = new Map<string, (typeof commits)[number]>();
+		for (const c of commits) m.set(c.sha, c);
+		return m;
+	}, [commits]);
 
 	// Keep totalMainRef in sync for clamp calculations
 	totalMainRef.current = layout.totalWidth;
@@ -1016,8 +1358,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// --- Derived values ---
 	const { panX, panY, scale, orientation, edge } = camera;
 	const isHorizontal = orientation === "horizontal";
-	const containerWidth = containerRef.current?.clientWidth ?? 1200;
-	const containerHeight = containerRef.current?.clientHeight ?? 800;
+	const containerWidth = containerSize.width || (containerRef.current?.clientWidth ?? 1200);
+	const containerHeight = containerSize.height || (containerRef.current?.clientHeight ?? 800);
 
 	// --- Zoom Tier ---
 	const tierInfo = useMemo(() => getZoomTierInfo(scale), [scale]);
@@ -1026,31 +1368,24 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// The "main axis" viewport size (along the ruler) and "cross axis" size
 	const mainViewport = isHorizontal ? containerWidth : containerHeight;
 	const crossViewport = isHorizontal
-		? containerHeight - RULER_THICKNESS
-		: containerWidth - RULER_THICKNESS;
+		? containerHeight - rulerThickness
+		: containerWidth - rulerThickness;
 	// Pan along the main axis
 	const mainPan = isHorizontal ? panX : panY;
 	const crossPan = isHorizontal ? panY : panX;
 
-	// Pre-compute visible ticks to avoid per-tick work in render.
-	// Commit ticks use a generous 5× viewport buffer so the ruler never pops in during scroll.
+	// Pre-compute visible segment ticks to avoid per-tick work in render.
 	// Expanded segments (cards / panels) use a 3× viewport buffer.
-	const { visibleTicks, segmentTicks } = useMemo(() => {
+	const segmentTicks = useMemo(() => {
 		const worldViewportMain = mainViewport / scale;
 		const worldViewStart = -mainPan / scale;
-
-		const tickBuffer = (worldViewportMain * TICK_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
-		const tickStart = worldViewStart - tickBuffer;
-		const tickEnd = worldViewStart + worldViewportMain + tickBuffer;
 
 		const segBuffer = (worldViewportMain * SEGMENT_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
 		const segStart = worldViewStart - segBuffer;
 		const segEnd = worldViewStart + worldViewportMain + segBuffer;
 
-		const visible: typeof layout.ticks = [];
 		const segs: typeof layout.ticks = [];
 		for (const tick of layout.ticks) {
-			if (tick.x >= tickStart && tick.x <= tickEnd) visible.push(tick);
 			if (tick.segment) {
 				// Cull segments by main-axis visibility (3× viewport)
 				const nextTick = layout.ticks[tick.index + 1];
@@ -1060,7 +1395,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}
 			}
 		}
-		return { visibleTicks: visible, segmentTicks: segs };
+		return segs;
 	}, [layout.ticks, mainPan, scale, mainViewport]);
 
 	// --- Commit clusters for L0/L1 ---
@@ -1074,23 +1409,86 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		() => clusterCommits(layout.ticks, segmentBySha, scale),
 		[layout.ticks, segmentBySha, scale],
 	);
-	const usesClusters = zoomTier === "L0" || zoomTier === "L1";
-
-	// --- Heatmap for L0 ---
-	const heatmapGradient = useMemo(() => {
-		if (zoomTier !== "L0" || clusters.length === 0 || degradeLevel >= 2) return undefined;
-		const segs = computeHeatmap(clusters, layout.totalWidth, mainViewport);
-		if (segs.length === 0) return undefined;
-		const stops = segs.map((s) => {
-			const pct = ((s.startX + s.endX) / 2 / layout.totalWidth) * 100;
-			const alpha = s.intensity * 0.5;
-			return `rgba(99, 102, 241, ${alpha.toFixed(2)}) ${pct.toFixed(1)}%`;
-		});
-		return `linear-gradient(to right, ${stops.join(", ")})`;
-	}, [zoomTier, clusters, layout.totalWidth, mainViewport, degradeLevel]);
-
 	const worldViewTop = -crossPan / scale;
 	const worldViewHeight = crossViewport / scale;
+	const worldViewportMain = mainViewport / scale;
+
+	// Zoom center for distance-aware LOD: use cursor position during zoom,
+	// otherwise fall back to viewport center.
+	const zoomCenterWorldX = zoomCenterWorldRef.current ?? -mainPan / scale + worldViewportMain / 2;
+
+	// Chapter data for PixiJS — populated by SegmentCanvas callbacks
+	const pixiChaptersMapRef = useRef<
+		Map<
+			string,
+			Array<{
+				id: string;
+				status: string;
+				title: string;
+				startCommitSha: string | null;
+				mergeCommitSha?: string | null;
+				layoutX: number;
+				layoutY: number;
+			}>
+		>
+	>(new Map());
+	const [pixiChaptersTick, setPixiChaptersTick] = useState(0);
+
+	const handleChaptersLoaded = useCallback(
+		(
+			fromSha: string,
+			chapters: Array<{
+				id: string;
+				status: string;
+				title: string;
+				startCommitSha: string | null;
+				mergeCommitSha?: string | null;
+				layoutX: number;
+				layoutY: number;
+			}>,
+		) => {
+			if (chapters.length === 0) {
+				pixiChaptersMapRef.current.delete(fromSha);
+			} else {
+				pixiChaptersMapRef.current.set(fromSha, chapters);
+			}
+			setPixiChaptersTick((t) => t + 1);
+		},
+		[],
+	);
+
+	// Commit SHA → first line of message (for PixiJS tick labels)
+	const commitMessages = useMemo(() => {
+		const map = new Map<string, string>();
+		for (const c of commits) {
+			const firstLine = c.message.split("\n")[0];
+			if (firstLine) map.set(c.sha, firstLine);
+		}
+		return map;
+	}, [commits]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: pixiChaptersTick triggers recompute
+	const pixiChapters = useMemo<PixiChapterInfo[]>(() => {
+		const result: PixiChapterInfo[] = [];
+		for (const tick of segmentTicks) {
+			if (!tick.segment) continue;
+			const chapters = pixiChaptersMapRef.current.get(tick.sha);
+			if (!chapters) continue;
+			for (const ch of chapters) {
+				result.push({
+					id: ch.id,
+					status: ch.status,
+					title: ch.title,
+					startCommitSha: ch.startCommitSha,
+					mergeCommitSha: ch.mergeCommitSha,
+					layoutX: ch.layoutX,
+					layoutY: ch.layoutY,
+					segMainPos: tick.x,
+				});
+			}
+		}
+		return result;
+	}, [segmentTicks, pixiChaptersTick]);
 
 	if (isLoading) {
 		return (
@@ -1110,7 +1508,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// --- Ruler track positioning ---
 	const rulerTrackStyle: React.CSSProperties = {
 		position: "absolute",
-		background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
 		zIndex: 10,
 		overflow: "hidden",
 	};
@@ -1118,18 +1515,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		Object.assign(rulerTrackStyle, {
 			left: 0,
 			right: 0,
-			height: RULER_THICKNESS,
-			borderBottom: edge === "start" ? "2px solid var(--mantine-color-indigo-7)" : undefined,
-			borderTop: edge === "end" ? "2px solid var(--mantine-color-indigo-7)" : undefined,
+			height: rulerThickness,
 			...(edge === "start" ? { top: 0 } : { bottom: 0 }),
 		});
 	} else {
 		Object.assign(rulerTrackStyle, {
 			top: 0,
 			bottom: 0,
-			width: RULER_THICKNESS,
-			borderRight: edge === "start" ? "2px solid var(--mantine-color-indigo-7)" : undefined,
-			borderLeft: edge === "end" ? "2px solid var(--mantine-color-indigo-7)" : undefined,
+			width: rulerThickness,
 			...(edge === "start" ? { left: 0 } : { right: 0 }),
 		});
 	}
@@ -1145,16 +1538,16 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			left: 0,
 			right: 0,
 			...(edge === "start"
-				? { top: RULER_THICKNESS, bottom: 0 }
-				: { top: 0, bottom: RULER_THICKNESS }),
+				? { top: rulerThickness, bottom: 0 }
+				: { top: 0, bottom: rulerThickness }),
 		});
 	} else {
 		Object.assign(canvasStyle, {
 			top: 0,
 			bottom: 0,
 			...(edge === "start"
-				? { left: RULER_THICKNESS, right: 0 }
-				: { left: 0, right: RULER_THICKNESS }),
+				? { left: rulerThickness, right: 0 }
+				: { left: 0, right: rulerThickness }),
 		});
 	}
 
@@ -1200,7 +1593,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			}}
 		>
 			{/* Ruler track */}
-			<Box style={rulerTrackStyle}>
+			<Box style={rulerTrackStyle} onContextMenu={handleTickContextMenu}>
 				<Text
 					size="xs"
 					c="dimmed"
@@ -1214,47 +1607,83 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				>
 					{t("ruler.commitCount", { count: commits.length })}
 				</Text>
-				<Box ref={tickStripRef} style={tickStripStyle}>
-					{heatmapGradient && (
-						<Box
-							style={{
-								position: "absolute",
-								inset: 0,
-								background: heatmapGradient,
-								borderRadius: 2,
-								pointerEvents: "none",
-							}}
-						/>
-					)}
-					{usesClusters
-						? clusters.map((cluster) => (
-								<RulerClusterTick
-									key={`cl-${cluster.startSha}`}
-									cluster={cluster}
-									orientation={orientation}
-									zoomTier={zoomTier}
-								/>
-							))
-						: visibleTicks.map((tick) => (
-								<RulerTick
-									key={tick.sha}
-									tick={tick}
-									commit={commits[tick.index]}
-									showLabel
-									orientation={orientation}
-									onContextMenu={(cx, cy) =>
-										setTickMenu({
-											x: cx,
-											y: cy,
-											sha: tick.sha,
-											message: commits[tick.index]?.message ?? "",
-											hasSegment: !!tick.segment,
-										})
-									}
-								/>
-							))}
-				</Box>
+				<Box ref={tickStripRef} style={tickStripStyle} />
 			</Box>
+
+			{/* Drag handle to resize ruler track */}
+			<Box
+				style={{
+					position: "absolute",
+					zIndex: 15,
+					...(isHorizontal
+						? {
+								left: 0,
+								right: 0,
+								height: 6,
+								cursor: "row-resize",
+								...(edge === "start"
+									? { top: rulerThickness - 3 }
+									: { bottom: rulerThickness - 3 }),
+							}
+						: {
+								top: 0,
+								bottom: 0,
+								width: 6,
+								cursor: "col-resize",
+								...(edge === "start"
+									? { left: rulerThickness - 3 }
+									: { right: rulerThickness - 3 }),
+							}),
+				}}
+				onMouseDown={(e: React.MouseEvent) => {
+					e.preventDefault();
+					const startPos = isHorizontal ? e.clientY : e.clientX;
+					rulerDragRef.current = { startY: startPos, startThickness: rulerThickness };
+
+					const onMove = (ev: MouseEvent) => {
+						if (!rulerDragRef.current) return;
+						const currentPos = isHorizontal ? ev.clientY : ev.clientX;
+						const delta =
+							edge === "start"
+								? currentPos - rulerDragRef.current.startY
+								: rulerDragRef.current.startY - currentPos;
+						const newThickness = Math.max(
+							DEFAULT_RULER_THICKNESS,
+							Math.min(MAX_RULER_THICKNESS, rulerDragRef.current.startThickness + delta),
+						);
+						setRulerThickness(newThickness);
+					};
+					const onUp = () => {
+						rulerDragRef.current = null;
+						rulerDragCleanupRef.current = null;
+						document.removeEventListener("mousemove", onMove);
+						document.removeEventListener("mouseup", onUp);
+					};
+					document.addEventListener("mousemove", onMove);
+					document.addEventListener("mouseup", onUp);
+					rulerDragCleanupRef.current = onUp;
+				}}
+			/>
+
+			{/* PixiJS rendering layer — ticks, clusters, heatmap, connectors, dot/pill morphs */}
+			<RulerPixiLayer
+				containerWidth={containerWidth}
+				containerHeight={containerHeight}
+				orientation={orientation}
+				pixiRef={pixiRef}
+				camera={camera}
+				layout={layout}
+				segments={segments}
+				chapters={pixiChapters}
+				zoomTier={zoomTier}
+				clusters={clusters}
+				scale={scale}
+				zoomCenterWorldX={zoomCenterWorldX}
+				viewportWorldWidth={worldViewportMain}
+				tickPositions={tickPositions}
+				rulerThickness={rulerThickness}
+				commitMessages={commitMessages}
+			/>
 
 			{/* 2D Canvas */}
 			<Box
@@ -1262,6 +1691,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				onPointerDown={handlePointerDown}
 				onPointerMove={handlePointerMove}
 				onPointerUp={handlePointerUp}
+				onContextMenu={handleTickContextMenu}
 				onDoubleClick={(e) => {
 					if (e.target === e.currentTarget) resetCamera();
 				}}
@@ -1279,7 +1709,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						transform: worldTransform,
 					}}
 				>
-					{!usesClusters &&
+					{zoomTier !== "L0" &&
 						segmentTicks.map((tick) => {
 							const seg = tick.segment;
 							if (!seg) return null;
@@ -1300,10 +1730,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 									viewHeight={worldViewHeight}
 									cardRegistry={cardRegistryRef}
 									onChapterContextMenu={setChapterMenu}
-									tickPositions={tickPositions}
 									onFitToView={fitRectToView}
-									zoomTier={zoomTier}
-									degradeLevel={degradeLevel}
+									zoomCenterWorldX={zoomCenterWorldX}
+									viewportWorldWidth={worldViewportMain}
+									onChaptersLoaded={handleChaptersLoaded}
 								/>
 							);
 						})}
@@ -1336,13 +1766,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					};
 					if (isHorizontal) {
 						Object.assign(headerStyle, {
-							top: (edge === "start" ? RULER_THICKNESS : 0) + 2,
+							top: (edge === "start" ? rulerThickness : 0) + 2,
 							left: screenMain,
 							width: segScreenSize,
 						});
 					} else {
 						Object.assign(headerStyle, {
-							left: (edge === "start" ? RULER_THICKNESS : 0) + 2,
+							left: (edge === "start" ? rulerThickness : 0) + 2,
 							top: screenMain,
 							height: segScreenSize,
 						});
@@ -1357,16 +1787,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							wrap={isHorizontal ? "nowrap" : "wrap"}
 							data-world-main={tick.x}
 							data-world-size={segWorldSize}
-						>
-							<Badge size="xs" variant="light" color="indigo">
-								{t("ruler.chapterCount", { count: seg.totalChapterCount })}
-							</Badge>
-							{seg.activeChapterCount > 0 && (
-								<Badge size="xs" variant="filled" color="indigo">
-									{t("ruler.activeCount", { count: seg.activeChapterCount })}
-								</Badge>
-							)}
-						</Group>
+						></Group>
 					);
 				})}
 			</Box>
@@ -1378,7 +1799,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				scale={scale}
 				viewportWidth={containerWidth}
 				viewportHeight={containerRef.current?.clientHeight ?? 800}
-				rulerThickness={RULER_THICKNESS}
+				rulerThickness={rulerThickness}
 				orientation={orientation}
 				edge={edge}
 				onNavigate={navigateToWorld}
@@ -1413,7 +1834,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					y={tickMenu.y}
 					commitSha={tickMenu.sha}
 					commitMessage={tickMenu.message}
-					hasSegment={tickMenu.hasSegment}
+					commitAuthor={tickMenu.author}
+					commitDate={tickMenu.date}
 					onClose={() => setTickMenu(null)}
 					onFork={handleForkFromCommit}
 				/>
@@ -1437,173 +1859,3 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		</Box>
 	);
 }
-
-// --- Memoized tick component to avoid re-rendering all ticks on camera change ---
-interface RulerTickProps {
-	tick: TickPosition;
-	commit: { shortSha: string; message: string } | undefined;
-	showLabel: boolean;
-	orientation: RulerOrientation;
-	onContextMenu: (x: number, y: number) => void;
-}
-
-const RulerTick = memo(function RulerTick({
-	tick,
-	commit,
-	showLabel,
-	orientation,
-	onContextMenu,
-}: RulerTickProps) {
-	const segment = tick.segment;
-	const hasActive = segment && segment.activeChapterCount > 0;
-	const isExpandable = segment?.isExpandable;
-	const isH = orientation === "horizontal";
-	// Position at world coordinate; the parent strip's CSS transform handles scaling.
-	// Counter-scale via CSS variable (updated by applyTransformToDOM) keeps content readable.
-	const pos = tick.x;
-
-	return (
-		<Box
-			style={{
-				position: "absolute",
-				...(isH ? { left: pos, top: 0, height: "100%" } : { top: pos, left: 0, width: "100%" }),
-				display: "flex",
-				flexDirection: isH ? "column" : "row",
-				alignItems: isH ? "flex-start" : "flex-start",
-				cursor: isExpandable ? "pointer" : "default",
-				transform: isH
-					? "scaleX(var(--ruler-counter-scale, 1))"
-					: "scaleY(var(--ruler-counter-scale, 1))",
-				transformOrigin: "0 0",
-			}}
-			onContextMenu={(e) => {
-				e.preventDefault();
-				onContextMenu(e.clientX, e.clientY);
-			}}
-		>
-			<Box
-				style={{
-					...(isH
-						? { width: TICK_WIDTH, height: hasActive ? 20 : 14, marginTop: 4 }
-						: { height: TICK_WIDTH, width: hasActive ? 20 : 14, marginLeft: 4 }),
-					background: hasActive
-						? "var(--mantine-color-indigo-5)"
-						: "light-dark(var(--mantine-color-gray-5), var(--mantine-color-dark-1))",
-					borderRadius: 1,
-					flexShrink: 0,
-				}}
-			/>
-			{showLabel && (
-				<Text
-					size="9px"
-					c={hasActive ? "indigo.4" : "dimmed"}
-					style={{
-						whiteSpace: "nowrap",
-						overflow: "hidden",
-						textOverflow: "ellipsis",
-						maxWidth: isH ? 76 : undefined,
-						maxHeight: isH ? undefined : 76,
-						textAlign: isH ? "left" : "center",
-						lineHeight: 1.2,
-						...(isH
-							? { marginTop: 2, marginLeft: -TICK_WIDTH / 2 }
-							: {
-									marginLeft: 2,
-									marginTop: -TICK_WIDTH / 2,
-									writingMode: "vertical-rl",
-									transform: "rotate(180deg)",
-								}),
-					}}
-				>
-					{commit?.shortSha}
-				</Text>
-			)}
-			{isExpandable && (
-				<Box
-					style={{
-						width: 10,
-						height: 10,
-						borderRadius: "50%",
-						background: "var(--mantine-color-indigo-4)",
-						...(isH
-							? { marginTop: 2, marginLeft: -10 / 2 + TICK_WIDTH / 2 }
-							: { marginLeft: 2, marginTop: -10 / 2 + TICK_WIDTH / 2 }),
-						border: "2px solid var(--mantine-color-indigo-3)",
-						transition: "all 150ms ease",
-					}}
-				/>
-			)}
-		</Box>
-	);
-});
-
-/** Aggregated commit cluster tick for L0/L1 zoom levels. */
-const RulerClusterTick = memo(function RulerClusterTick({
-	cluster,
-	orientation,
-	zoomTier,
-}: {
-	cluster: CommitCluster;
-	orientation: RulerOrientation;
-	zoomTier: ZoomTierId;
-}) {
-	const isH = orientation === "horizontal";
-	const barHeight = Math.min(14, 4 + cluster.count * 0.5);
-	const hasActive = cluster.activeCount > 0;
-	const bg = hasActive
-		? "var(--mantine-color-indigo-6)"
-		: "light-dark(var(--mantine-color-gray-5), var(--mantine-color-dark-3))";
-
-	return (
-		<Box
-			style={{
-				position: "absolute",
-				...(isH
-					? {
-							left: cluster.worldPos - cluster.worldSize / 2,
-							top: RULER_THICKNESS / 2 - barHeight / 2,
-							width: Math.max(4, cluster.worldSize),
-							height: barHeight,
-						}
-					: {
-							top: cluster.worldPos - cluster.worldSize / 2,
-							left: RULER_THICKNESS / 2 - barHeight / 2,
-							height: Math.max(4, cluster.worldSize),
-							width: barHeight,
-						}),
-				background: bg,
-				borderRadius: 2,
-				opacity: hasActive ? 1 : 0.7,
-			}}
-		>
-			{zoomTier === "L1" && cluster.count > 1 && (
-				<Text
-					size="8px"
-					c="dimmed"
-					style={{
-						position: "absolute",
-						...(isH ? { top: -12, left: 0 } : { left: -12, top: 0 }),
-						lineHeight: 1,
-						whiteSpace: "nowrap",
-					}}
-				>
-					{cluster.count}
-				</Text>
-			)}
-			{cluster.hasSegments && hasActive && (
-				<Box
-					style={{
-						position: "absolute",
-						width: 5,
-						height: 5,
-						borderRadius: "50%",
-						background: "var(--mantine-color-indigo-4)",
-						...(isH
-							? { top: -8, left: "50%", marginLeft: -2.5 }
-							: { left: -8, top: "50%", marginTop: -2.5 }),
-					}}
-				/>
-			)}
-		</Box>
-	);
-});

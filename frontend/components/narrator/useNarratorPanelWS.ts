@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
-import { api } from "../../lib/api";
+import { api, type BufferMessageSummary } from "../../lib/api";
 import {
 	evictOldestPages,
 	findMsgByToolUseIdInTree,
@@ -94,10 +94,8 @@ export interface UseNarratorPanelWSReturn {
 	pendingPermission: PendingPermission | null;
 	renderPermCb: PermissionCallbacks;
 	// State
-	queuedMessages: Array<{ id: string; text: string; bufferedAt: string }>;
-	setQueuedMessages: React.Dispatch<
-		React.SetStateAction<Array<{ id: string; text: string; bufferedAt: string }>>
-	>;
+	queuedMessages: BufferMessageSummary[];
+	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
 	isCompacting: boolean;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
@@ -270,9 +268,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, [pendingPermsMap]);
 
 	// --- Misc state ---
-	const [queuedMessages, setQueuedMessages] = useState<
-		Array<{ id: string; text: string; bufferedAt: string }>
-	>([]);
+	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
 	const [isCompacting, setIsCompacting] = useState(false);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);

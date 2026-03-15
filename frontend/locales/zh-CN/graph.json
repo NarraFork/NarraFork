@@ -84,6 +84,12 @@
 		"horizontal": "水平尺子",
 		"vertical": "垂直尺子",
 		"edgeStart": "尺子在起始侧",
-		"edgeEnd": "尺子在末尾侧"
+		"edgeEnd": "尺子在末尾侧",
+		"copySha": "复制 SHA",
+		"copied": "已复制！",
+		"justNow": "刚刚",
+		"minutesAgo": "{{count}} 分钟前",
+		"hoursAgo": "{{count}} 小时前",
+		"daysAgo": "{{count}} 天前"
 	}
 }
