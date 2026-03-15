@@ -47,36 +47,13 @@ export function getTransitionOpacity(progress: number, fadeInAt = 0.7, fadeOutAt
 }
 
 // ---------------------------------------------------------------------------
-// Distance-aware LOD: each chapter's LOD depends on scale + distance from zoom center
+// Distance-aware LOD: each chapter's LOD depends on the fisheye local scale
 // ---------------------------------------------------------------------------
 
 export type CardMode = "hidden" | "dot" | "compact" | "full";
 
-/**
- * Distance boost: chapters near the zoom center get a higher effective scale.
- * boost = 1.0 at maxDist, 1.5 at distance 0.
- */
-function distanceBoost(
-	chapterWorldX: number,
-	zoomCenterWorldX: number,
-	viewportWorldWidth: number,
-): number {
-	const dist = Math.abs(chapterWorldX - zoomCenterWorldX);
-	const maxDist = viewportWorldWidth * 1.5;
-	if (maxDist <= 0 || dist >= maxDist) return 1.0;
-	const t = 1 - dist / maxDist;
-	return 1.0 + t * 0.5;
-}
-
-/** Per-chapter card mode based on effective scale (global scale × distance boost). */
-export function getCardModeForChapter(
-	globalScale: number,
-	chapterMainWorldPos: number,
-	zoomCenterWorldX: number,
-	viewportWorldWidth: number,
-): CardMode {
-	const boost = distanceBoost(chapterMainWorldPos, zoomCenterWorldX, viewportWorldWidth);
-	const effectiveScale = globalScale * boost;
+/** Per-chapter card mode based on the fisheye local scale at its position. */
+export function getCardModeForChapter(effectiveScale: number): CardMode {
 	const tier = getZoomTierInfo(effectiveScale).tier.id;
 	if (tier === "L0") return "hidden";
 	if (tier === "L1") return "dot";
@@ -90,7 +67,7 @@ export function getCardModeForChapter(
 
 /** Scale thresholds for the continuous morph.
  *  Aligned with zoom tiers so each phase is visible:
- *  - L0 (< 0.25): SegmentCanvas not rendered → morph invisible
+ *  - L0 (< 0.25): morph invisible
  *  - L1 (0.25–0.6): dot phase (growing circle)
  *  - L2 (0.6–1.2): pill phase (circle → capsule with title)
  *  - L3+ (> 1.2): card phase (pill → full card)
@@ -101,33 +78,38 @@ const MORPH_PILL = 0.9; // pill fully formed (mid-L2)
 const MORPH_CARD = 1.2; // card fully formed (L3 boundary)
 
 /**
- * Map effectiveScale to a continuous morph factor `t` in [0, 1].
+ * Map an effective scale (fisheye localScale) to a continuous morph factor `t` in [0, 1].
  *  0.0       → invisible
  *  0.0–0.3   → dot (growing circle)
  *  0.3–0.7   → pill (circle → capsule with title)
  *  0.7–1.0   → card (pill → full card)
  */
-export function getMorphFactor(
-	globalScale: number,
-	chapterMainWorldPos: number,
-	zoomCenterWorldX: number,
-	viewportWorldWidth: number,
-): number {
-	const boost = distanceBoost(chapterMainWorldPos, zoomCenterWorldX, viewportWorldWidth);
-	const s = globalScale * boost;
-	if (s <= MORPH_INVISIBLE) return 0;
-	if (s >= MORPH_CARD) return 1;
+export function getMorphFactor(effectiveScale: number): number {
+	if (effectiveScale <= MORPH_INVISIBLE) return 0;
+	if (effectiveScale >= MORPH_CARD) return 1;
 	// Piecewise linear mapping:
 	// [MORPH_INVISIBLE, MORPH_DOT]  → [0, 0.3]
 	// [MORPH_DOT, MORPH_PILL]       → [0.3, 0.7]
 	// [MORPH_PILL, MORPH_CARD]      → [0.7, 1.0]
-	if (s < MORPH_DOT) {
-		return 0.3 * ((s - MORPH_INVISIBLE) / (MORPH_DOT - MORPH_INVISIBLE));
+	if (effectiveScale < MORPH_DOT) {
+		return 0.3 * ((effectiveScale - MORPH_INVISIBLE) / (MORPH_DOT - MORPH_INVISIBLE));
 	}
-	if (s < MORPH_PILL) {
-		return 0.3 + 0.4 * ((s - MORPH_DOT) / (MORPH_PILL - MORPH_DOT));
+	if (effectiveScale < MORPH_PILL) {
+		return 0.3 + 0.4 * ((effectiveScale - MORPH_DOT) / (MORPH_PILL - MORPH_DOT));
 	}
-	return 0.7 + 0.3 * ((s - MORPH_PILL) / (MORPH_CARD - MORPH_PILL));
+	return 0.7 + 0.3 * ((effectiveScale - MORPH_PILL) / (MORPH_CARD - MORPH_PILL));
+}
+
+/**
+ * Compute the center-fade factor for a chapter at morph factor `t`.
+ * Used by both React (SegmentCanvas) and PixiJS (RulerPixiLayer) to ensure
+ * consistent positioning during the dot→pill→card transition.
+ *
+ * Returns 1 in dot/pill phase (element is centered), fades to 0 in card phase
+ * (element snaps to top-left layout position).
+ */
+export function getCenterFade(t: number): number {
+	return t < 0.7 ? 1 : Math.max(0, 1 - (t - 0.7) / 0.3);
 }
 
 /** Interpolated visual properties for a chapter element at morph factor `t`. */
@@ -139,75 +121,175 @@ export interface MorphStyle {
 	titleOpacity: number;
 	/** Font size for the title (0 when hidden) */
 	titleFontSize: number;
-	/** Whether to show the full card body (status badges, narrator info, etc.) */
-	showCardBody: boolean;
+	/** Blend factor from pill to card appearance (0 = pure pill, 1 = full card).
+	 *  Continuous value for cross-fade — replaces the old boolean showCardBody. */
+	cardBlend: number;
 	/** Overall element opacity */
 	opacity: number;
 }
 
+// ---------------------------------------------------------------------------
+// Keyframe-driven morph interpolation
+// ---------------------------------------------------------------------------
+
+/**
+ * A single keyframe in the morph timeline.
+ * `width` and `height` use a sentinel value of -1 to mean "use fullWidth/fullHeight".
+ * All other fields are absolute values.
+ *
+ * Keyframes must be sorted by ascending `t`.
+ */
+interface MorphKeyframe {
+	t: number;
+	width: number;
+	height: number;
+	borderRadius: number;
+	titleOpacity: number;
+	titleFontSize: number;
+	cardBlend: number;
+	opacity: number;
+}
+
+/**
+ * Morph keyframe table — the single source of truth for the dot→pill→card transition.
+ *
+ * Edit this table to tune the morph curve. Each row is a snapshot at a given `t`:
+ *   t=0.00  invisible
+ *   t=0.01  dot appears (tiny circle, half-transparent)
+ *   t=0.30  dot fully formed (10px circle, opaque)
+ *   t=0.38  pill begins (title starts fading in)
+ *   t=0.70  pill fully formed (160×24 capsule, title visible)
+ *   t=1.00  full card (fullWidth × fullHeight)
+ *
+ * Width/height = -1 means "resolve to fullWidth/fullHeight at runtime".
+ */
+export const MORPH_KEYFRAMES: readonly MorphKeyframe[] = [
+	//  t      w     h    br   titleOp  fontSize  cardBlend  opacity
+	{
+		t: 0.0,
+		width: 0,
+		height: 0,
+		borderRadius: 4,
+		titleOpacity: 0,
+		titleFontSize: 0,
+		cardBlend: 0,
+		opacity: 0,
+	},
+	{
+		t: 0.01,
+		width: 4,
+		height: 4,
+		borderRadius: 2,
+		titleOpacity: 0,
+		titleFontSize: 0,
+		cardBlend: 0,
+		opacity: 0.5,
+	},
+	{
+		t: 0.3,
+		width: 10,
+		height: 10,
+		borderRadius: 5,
+		titleOpacity: 0,
+		titleFontSize: 9,
+		cardBlend: 0,
+		opacity: 1,
+	},
+	{
+		t: 0.38,
+		width: 40,
+		height: 14,
+		borderRadius: 5,
+		titleOpacity: 0,
+		titleFontSize: 9,
+		cardBlend: 0,
+		opacity: 1,
+	},
+	{
+		t: 0.7,
+		width: 160,
+		height: 24,
+		borderRadius: 4,
+		titleOpacity: 1,
+		titleFontSize: 10,
+		cardBlend: 0,
+		opacity: 1,
+	},
+	{
+		t: 1.0,
+		width: -1,
+		height: -1,
+		borderRadius: 4,
+		titleOpacity: 1,
+		titleFontSize: 14,
+		cardBlend: 1,
+		opacity: 1,
+	},
+] as const;
+
+/** Resolve a keyframe dimension value: -1 → fullSize, otherwise clamp to fullSize. */
+function resolveDim(v: number, fullSize: number): number {
+	return v === -1 ? fullSize : Math.min(v, fullSize);
+}
+
+/**
+ * Linearly interpolate between two keyframes at progress `p` ∈ [0, 1].
+ * Width/height sentinels (-1) are resolved against fullWidth/fullHeight before lerp.
+ */
+function lerpKf(a: MorphKeyframe, b: MorphKeyframe, p: number, fw: number, fh: number): MorphStyle {
+	const aw = resolveDim(a.width, fw);
+	const bw = resolveDim(b.width, fw);
+	const ah = resolveDim(a.height, fh);
+	const bh = resolveDim(b.height, fh);
+	const w = aw + p * (bw - aw);
+	const h = ah + p * (bh - ah);
+	return {
+		width: w,
+		height: h,
+		borderRadius: a.borderRadius + p * (b.borderRadius - a.borderRadius),
+		titleOpacity: a.titleOpacity + p * (b.titleOpacity - a.titleOpacity),
+		titleFontSize: a.titleFontSize + p * (b.titleFontSize - a.titleFontSize),
+		cardBlend: a.cardBlend + p * (b.cardBlend - a.cardBlend),
+		opacity: a.opacity + p * (b.opacity - a.opacity),
+	};
+}
+
+// Pre-computed zero style — returned for t <= 0 without allocation.
+const ZERO_STYLE: MorphStyle = {
+	width: 0,
+	height: 0,
+	borderRadius: 4,
+	titleOpacity: 0,
+	titleFontSize: 0,
+	cardBlend: 0,
+	opacity: 0,
+};
+
 /**
  * Compute interpolated visual properties from morph factor `t`.
  * All values change continuously — no discrete jumps.
+ *
+ * Driven by `MORPH_KEYFRAMES`: finds the surrounding pair and lerps between them.
  */
 export function getMorphStyle(t: number, fullWidth: number, fullHeight: number): MorphStyle {
-	if (t <= 0) {
-		return {
-			width: 0,
-			height: 0,
-			borderRadius: 4,
-			titleOpacity: 0,
-			titleFontSize: 0,
-			showCardBody: false,
-			opacity: 0,
-		};
+	if (t <= 0) return ZERO_STYLE;
+
+	const kf = MORPH_KEYFRAMES;
+	// Clamp to table range
+	const ct = Math.min(t, kf[kf.length - 1].t);
+
+	// Find the surrounding keyframe pair (linear scan — table is small)
+	for (let i = 0; i < kf.length - 1; i++) {
+		if (ct <= kf[i + 1].t) {
+			const a = kf[i];
+			const b = kf[i + 1];
+			const span = b.t - a.t;
+			const p = span === 0 ? 1 : (ct - a.t) / span;
+			return lerpKf(a, b, p, fullWidth, fullHeight);
+		}
 	}
 
-	// --- Dot phase: t ∈ (0, 0.3] ---
-	// Circle grows from 4px to 10px
-	if (t <= 0.3) {
-		const p = t / 0.3; // 0→1 within dot phase
-		const size = 4 + p * 6; // 4→10
-		return {
-			width: size,
-			height: size,
-			borderRadius: size / 2,
-			titleOpacity: 0,
-			titleFontSize: 0,
-			showCardBody: false,
-			opacity: 0.5 + p * 0.5, // 0.5→1.0
-		};
-	}
-
-	// --- Pill phase: t ∈ (0.3, 0.7] ---
-	// Width: 10 → fullWidth, Height: 10 → 24, borderRadius: 5 → 4
-	// Title fades in
-	if (t <= 0.7) {
-		const p = (t - 0.3) / 0.4; // 0→1 within pill phase
-		const w = 10 + p * (Math.min(fullWidth, 160) - 10);
-		const h = 10 + p * 14; // 10→24
-		return {
-			width: w,
-			height: h,
-			borderRadius: 5 - p * 1, // 5→4
-			titleOpacity: Math.max(0, (p - 0.2) / 0.8), // starts at p=0.2, full at p=1
-			titleFontSize: 9 + p * 1, // 9→10
-			showCardBody: false,
-			opacity: 1,
-		};
-	}
-
-	// --- Card phase: t ∈ (0.7, 1.0] ---
-	// Width: pill-max → fullWidth, Height: 24 → fullHeight
-	// Card body fades in
-	const p = (t - 0.7) / 0.3; // 0→1 within card phase
-	const pillMaxW = Math.min(fullWidth, 160);
-	return {
-		width: pillMaxW + p * (fullWidth - pillMaxW),
-		height: 24 + p * (fullHeight - 24),
-		borderRadius: 4,
-		titleOpacity: 1,
-		titleFontSize: 10 + p * 4, // 10→14
-		showCardBody: p > 0.3,
-		opacity: 1,
-	};
+	// t >= last keyframe — return final state
+	const last = kf[kf.length - 1];
+	return lerpKf(last, last, 0, fullWidth, fullHeight);
 }

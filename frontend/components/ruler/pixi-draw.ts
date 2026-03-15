@@ -2,7 +2,7 @@
  * Pure drawing helpers for the PixiJS ruler layer.
  * All functions receive a PixiTheme for theme-aware rendering.
  */
-import type { Graphics } from "pixi.js";
+import { Container, Graphics, Text, type TextStyle } from "pixi.js";
 import type { PixiTheme } from "./pixi/pixi-theme";
 import { themeStatusColor } from "./pixi/pixi-theme";
 import type { MorphStyle } from "./zoom-tiers";
@@ -31,8 +31,9 @@ export function drawTick(
 	isActive: boolean,
 	scale: number,
 ): void {
-	const w = 2 / scale;
-	const h = isActive ? Math.max(14, 20 / scale) : 14;
+	const s = Math.max(0.1, scale);
+	const w = Math.min(4, 2 / s);
+	const h = isActive ? Math.min(20, Math.max(14, 20 / s)) : 14;
 	const color = isActive ? theme.tickActive : theme.tickDefault;
 	g.rect(x - w / 2, height - h, w, h).fill({ color, alpha: isActive ? 0.8 : 0.4 });
 }
@@ -70,66 +71,112 @@ export function drawHeatmap(
 	}
 }
 
-// --- Morph elements (dot / pill) ---
+// --- Unified chapter node drawing (dot → pill → card) ---
 
-export function drawMorph(
+/**
+ * Draw a chapter node as a single continuous shape.
+ * The `morph.cardBlend` value controls how much "card-ness" is visible:
+ *   0 = pure dot/pill, 1 = full card with border + shadow.
+ *
+ * This replaces the old dual-path drawMorph + drawCard crossfade.
+ */
+export function drawChapterNode(
 	g: Graphics,
 	theme: PixiTheme,
 	morph: MorphStyle,
-	centerX: number,
-	centerY: number,
+	x: number,
+	y: number,
+	w: number,
+	h: number,
 	status: string,
-	scale: number,
+	role: string,
 ): void {
-	if (morph.opacity <= 0 || morph.width <= 0) return;
+	if (morph.opacity <= 0 || w <= 0 || h <= 0) return;
 
-	const color = themeStatusColor(theme, status);
+	const statusColor = themeStatusColor(theme, status);
+	const cb = morph.cardBlend;
+	const br = morph.borderRadius;
+	const alpha = morph.opacity;
 
-	// Size blending: dot = screen-space (counter-scaled), card = world-space, pill = blend
-	// titleOpacity: 0 at dot→pill boundary, 1 at pill→card boundary — perfect blend factor
-	const isDot = morph.borderRadius >= morph.width / 2 && morph.width === morph.height;
-	const screenToWorld = morph.titleOpacity; // 0 = screen-space, 1 = world-space
-	const counterScale = isDot ? 1 / scale : 1 + (1 / scale - 1) * (1 - screenToWorld);
-	const w = morph.width * counterScale;
-	const h = morph.height * counterScale;
-	const br = morph.borderRadius * counterScale;
-
-	const left = centerX - w / 2;
-	const top = centerY - h / 2;
+	const isDot = br >= w / 2 && Math.abs(w - h) < 0.5;
 
 	if (isDot) {
-		g.circle(centerX, centerY, w / 2).fill({ color, alpha: morph.opacity });
-	} else {
-		// Rounded rect (pill phase)
-		// Small pill: status color background → large pill: theme pillBg
-		const bgBlend = morph.titleOpacity; // 0 = pure status color, 1 = pillBg
-		const bgColor =
-			bgBlend < 0.01
-				? color
-				: bgBlend > 0.99
-					? theme.pillBg
-					: lerpColor(color, theme.pillBg, bgBlend);
-		const bgAlpha = morph.opacity * (0.85 + 0.15 * (1 - bgBlend)); // small pill more opaque
+		// Pure circle — early return
+		g.circle(x + w / 2, y + h / 2, w / 2).fill({ color: statusColor, alpha });
+		return;
+	}
 
-		g.roundRect(left, top, w, h, br).fill({
-			color: bgColor,
-			alpha: bgAlpha,
-		});
-		// Subtle border
-		g.roundRect(left, top, w, h, br).stroke({
+	// Background: blend from statusColor (pill) → cardBg (card)
+	const bgColor =
+		cb < 0.01 ? statusColor : cb > 0.99 ? theme.cardBg : lerpColor(statusColor, theme.cardBg, cb);
+	// Small pill is slightly more opaque; card is 0.95
+	const bgAlpha = alpha * (0.85 + 0.1 * cb);
+
+	g.roundRect(x, y, w, h, br).fill({ color: bgColor, alpha: bgAlpha });
+
+	// Border: blends from subtle pill border → card border
+	const isActive = status === "active";
+	const isReview = role === "review";
+	const pillBorderAlpha = alpha * 0.5 * (1 - cb);
+	const cardBorderAlpha = alpha * 0.7 * cb;
+
+	// Pill border (fades out as card appears)
+	if (pillBorderAlpha > 0.01) {
+		g.roundRect(x, y, w, h, br).stroke({
 			width: 1,
 			color: theme.pillBorder,
-			alpha: morph.opacity * 0.5,
+			alpha: pillBorderAlpha,
 		});
-		// Status dot inside pill
-		if (morph.titleOpacity > 0) {
-			const dotR = 3 * counterScale;
-			g.circle(left + dotR * 3, centerY, dotR).fill({ color, alpha: morph.opacity });
+	}
+
+	// Card border (fades in)
+	if (cardBorderAlpha > 0.01) {
+		const borderColor = isReview
+			? theme.cardReviewBorder
+			: isActive
+				? theme.cardActiveBorder
+				: theme.cardBorder;
+		const borderWidth = isReview || isActive ? 1.5 : 1;
+
+		if (isReview) {
+			// Dashed border approximation
+			const dashLen = 6;
+			const gapLen = 4;
+			const perimeter = 2 * (w + h);
+			let d = 0;
+			while (d < perimeter) {
+				const end = Math.min(d + dashLen, perimeter);
+				const [x1, y1] = perimeterPoint(x, y, w, h, br, d);
+				const [x2, y2] = perimeterPoint(x, y, w, h, br, end);
+				g.moveTo(x1, y1)
+					.lineTo(x2, y2)
+					.stroke({ width: borderWidth, color: borderColor, alpha: cardBorderAlpha });
+				d = end + gapLen;
+			}
+		} else {
+			g.roundRect(x, y, w, h, br).stroke({
+				width: borderWidth,
+				color: borderColor,
+				alpha: cardBorderAlpha,
+			});
 		}
 	}
-}
 
-// --- Connector lines ---
+	// Status dot inside pill (visible when title shows but card hasn't fully taken over)
+	if (morph.titleOpacity > 0 && cb < 0.95) {
+		const dotR = 3;
+		const dotAlpha = alpha * morph.titleOpacity * (1 - cb);
+		g.circle(x + dotR * 3, y + h / 2, dotR).fill({ color: statusColor, alpha: dotAlpha });
+	}
+
+	// Shadow (fades in with card)
+	if (cb > 0.1) {
+		g.roundRect(x + 1, y + 1, w, h, br).fill({
+			color: 0x000000,
+			alpha: alpha * (cb - 0.1) * 0.09,
+		});
+	}
+}
 
 export function drawConnector(
 	g: Graphics,
@@ -179,4 +226,127 @@ export function drawSegmentBg(
 	h: number,
 ): void {
 	g.rect(x, y, w, h).fill({ color: theme.accent, alpha: 0.04 });
+}
+
+/** Get a point along the perimeter of a rect (simplified, ignores rounded corners). */
+function perimeterPoint(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	_br: number,
+	d: number,
+): [number, number] {
+	const p = 2 * (w + h);
+	d = d % p;
+	if (d < w) return [x + d, y];
+	d -= w;
+	if (d < h) return [x + w, y + d];
+	d -= h;
+	if (d < w) return [x + w - d, y + h];
+	d -= w;
+	return [x, y + h - d];
+}
+
+// ---------------------------------------------------------------------------
+// TextPool — reusable PixiJS Text object pool with cursor-based management
+// ---------------------------------------------------------------------------
+
+/**
+ * Manages a pool of PixiJS Text objects attached to a Container.
+ * Call `acquire(style)` to get a Text object (reused or newly created),
+ * then call `flush()` at the end of each frame to hide unused texts.
+ *
+ * Replaces the manual `getPooledText` + `hidePooledTexts` + index tracking pattern.
+ */
+export class TextPool {
+	private pool: Text[] = [];
+	private cursor = 0;
+
+	constructor(private container: Container) {}
+
+	/** Get the next available Text object, creating one if the pool is exhausted. */
+	acquire(style: TextStyle): Text {
+		if (this.cursor < this.pool.length) {
+			const t = this.pool[this.cursor];
+			t.visible = true;
+			if (t.style !== style) t.style = style;
+			this.cursor++;
+			return t;
+		}
+		const t = new Text({ text: "", style });
+		this.pool.push(t);
+		this.container.addChild(t);
+		this.cursor++;
+		return t;
+	}
+
+	/** Hide all texts from cursor onwards and reset cursor for the next frame. */
+	flush(): void {
+		for (let i = this.cursor; i < this.pool.length; i++) {
+			this.pool[i].visible = false;
+		}
+		this.cursor = 0;
+	}
+
+	/** Current number of acquired texts this frame. */
+	get count(): number {
+		return this.cursor;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CardContainerPool — per-chapter Container pool for card-phase nodes
+// ---------------------------------------------------------------------------
+
+/** A pooled card container: owns a Graphics + a TextPool for self-contained z-order. */
+export interface CardSlot {
+	container: Container;
+	gfx: Graphics;
+	labels: TextPool;
+}
+
+/**
+ * Manages a pool of Container objects for card-phase chapter nodes.
+ * Each slot contains its own Graphics + TextPool, ensuring correct z-order
+ * (a card's text is always above its own background, never above another card).
+ *
+ * Dot/pill nodes continue using the shared morphGfx + chapterLabelPool.
+ * Only card-phase nodes (cardBlend > 0) acquire a slot from this pool.
+ */
+export class CardContainerPool {
+	private pool: CardSlot[] = [];
+	private cursor = 0;
+
+	constructor(private parent: Container) {}
+
+	/** Get the next available card slot, creating one if the pool is exhausted. */
+	acquire(): CardSlot {
+		if (this.cursor < this.pool.length) {
+			const slot = this.pool[this.cursor];
+			slot.container.visible = true;
+			slot.gfx.clear();
+			this.cursor++;
+			return slot;
+		}
+		const container = new Container();
+		const gfx = new Graphics();
+		const labelContainer = new Container();
+		container.addChild(gfx);
+		container.addChild(labelContainer);
+		this.parent.addChild(container);
+		const slot: CardSlot = { container, gfx, labels: new TextPool(labelContainer) };
+		this.pool.push(slot);
+		this.cursor++;
+		return slot;
+	}
+
+	/** Hide all unused slots and flush their label pools. Reset cursor for next frame. */
+	flush(): void {
+		for (let i = this.cursor; i < this.pool.length; i++) {
+			this.pool[i].container.visible = false;
+			this.pool[i].labels.flush();
+		}
+		this.cursor = 0;
+	}
 }

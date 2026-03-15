@@ -1,4 +1,4 @@
-import { Badge, Box, useMantineColorScheme } from "@mantine/core";
+import { Badge, Box, useComputedColorScheme } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
@@ -101,16 +101,12 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const { t } = useTranslation("terminal");
 		const { data: prefs } = useUserPreferences();
 		const [oledMode] = useLocalPref("narrafork_oled");
-		const { colorScheme } = useMantineColorScheme();
+		const computedScheme = useComputedColorScheme("dark");
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const terminalThemeKey = (prefs as any)?.terminalTheme ?? "auto";
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const terminalFontSize = (prefs as any)?.terminalFontSize ?? 14;
-		const resolvedTheme = getTerminalTheme(
-			terminalThemeKey,
-			colorScheme === "auto" ? "dark" : colorScheme,
-			oledMode,
-		);
+		const resolvedTheme = getTerminalTheme(terminalThemeKey, computedScheme, oledMode);
 		const themeBg = resolvedTheme.background ?? TERM_BG;
 		const [xtermSelection, setXtermSelection] = useState<string>("");
 		const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);

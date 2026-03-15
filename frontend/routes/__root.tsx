@@ -56,6 +56,7 @@ import { useLocalPref } from "../hooks/useLocalPref";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabs } from "../hooks/useRecentTabs";
 import { useUserPreferences } from "../hooks/useUserPreferences";
+import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, clearToken, getToken } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
@@ -71,6 +72,7 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
 	const router = useRouter();
 	const { t } = useTranslation("common");
+	const isDev = import.meta.env.DEV;
 
 	return (
 		<Center h="100vh">
@@ -81,6 +83,23 @@ function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
 				<Text c="dimmed" mb="xl">
 					{error.message || t("unexpectedError")}
 				</Text>
+				{isDev && error.stack && (
+					<Box
+						mb="xl"
+						p="sm"
+						ta="left"
+						style={{
+							background: "var(--mantine-color-dark-7)",
+							borderRadius: "var(--mantine-radius-sm)",
+							overflow: "auto",
+							maxHeight: 400,
+						}}
+					>
+						<Text size="xs" ff="monospace" style={{ whiteSpace: "pre-wrap" }}>
+							{error.stack}
+						</Text>
+					</Box>
+				)}
 				<Group justify="center">
 					<Button
 						variant="default"
@@ -144,6 +163,8 @@ function AuthenticatedLayout() {
 	const { data: prefs } = useUserPreferences();
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
+	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
+	useWakeLock(wakeLockEnabled);
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { width: navWidth, onDragStart: onNavDragStart } = useResizableNav();

@@ -1842,13 +1842,7 @@ export function NarratorPanel({
 	const handleContinue = async () => {
 		if (!canContinueNarrator) return;
 		try {
-			if (lastMessage && hasToolUse(lastMessage)) {
-				await api.continueNarrator(narratorId);
-			} else {
-				// Use a fixed English string so the AI receives a consistent
-				// instruction regardless of the user's UI language.
-				await submitMessage("Continue");
-			}
+			await api.continueNarrator(narratorId);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : "Failed to continue";
 			notifications.show({ title: "Error", message, color: "red" });

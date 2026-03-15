@@ -17,7 +17,7 @@ import {
 	TextInput,
 	Tooltip,
 	UnstyledButton,
-	useMantineColorScheme,
+	useComputedColorScheme,
 } from "@mantine/core";
 import { IconGripVertical, IconPlus, IconX } from "@tabler/icons-react";
 import { useCallback, useRef, useState } from "react";
@@ -56,7 +56,7 @@ function SortableTab({
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tab.id,
 	});
-	const { colorScheme } = useMantineColorScheme();
+	const computedScheme = useComputedColorScheme("dark");
 	const { t } = useTranslation("terminal");
 	const [editing, setEditing] = useState(false);
 	const [editName, setEditName] = useState(tab.name);
@@ -117,7 +117,7 @@ function SortableTab({
 								? "2px solid var(--mantine-color-indigo-6)"
 								: "2px solid transparent",
 							backgroundColor: isActive
-								? colorScheme === "dark"
+								? computedScheme === "dark"
 									? "var(--mantine-color-dark-6)"
 									: "var(--mantine-color-gray-1)"
 								: "transparent",

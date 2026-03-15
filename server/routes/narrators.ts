@@ -76,7 +76,7 @@ import { handleLoadToolCommand, narratorService } from "../services/narrator-ser
 import {
 	clearBufferedMessages,
 	closeNarrator,
-	continueLastToolUse,
+	continueNarrator,
 	editAndRegenerate,
 	getBufferedMessages,
 	interruptNarrator,
@@ -500,7 +500,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await continueLastToolUse(id, locale, replyInUserLanguage);
+	const result = await continueNarrator(id, locale, replyInUserLanguage);
 	return c.json(result);
 });
 

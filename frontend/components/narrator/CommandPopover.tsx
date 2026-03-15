@@ -5,7 +5,7 @@ import {
 	Paper,
 	Text,
 	UnstyledButton,
-	useMantineColorScheme,
+	useComputedColorScheme,
 } from "@mantine/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -75,8 +75,8 @@ export function CommandPopover({
 	onClose,
 }: CommandPopoverProps) {
 	const { t } = useTranslation("narrator");
-	const { colorScheme } = useMantineColorScheme();
-	const isDark = colorScheme === "dark";
+	const computedScheme = useComputedColorScheme("dark");
+	const isDark = computedScheme === "dark";
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const listRef = useRef<HTMLDivElement>(null);
 

@@ -28,6 +28,8 @@ export interface RulerActiveChapter {
 	startCommitSha: string | null;
 	narratorId: string | null;
 	narratorStatus: string | null;
+	axisOffset: number;
+	crossOffset: number;
 }
 
 export interface RulerData {

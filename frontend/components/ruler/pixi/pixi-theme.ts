@@ -18,6 +18,15 @@ export interface PixiTheme {
 	statusDormant: number;
 	statusFrozen: number;
 	statusAbandoned: number;
+	cardBg: number;
+	cardBorder: number;
+	cardActiveBorder: number;
+	cardText: number;
+	cardReviewBorder: number;
+	narratorRunning: number;
+	narratorDone: number;
+	narratorError: number;
+	narratorWaiting: number;
 }
 
 /** Parse a CSS color string (rgb, hex, etc.) into a 0xRRGGBB number. */
@@ -88,6 +97,24 @@ export function resolvePixiTheme(): PixiTheme {
 		statusDormant: varToHex("--mantine-color-yellow-5", 0xeab308),
 		statusFrozen: varToHex("--mantine-color-cyan-5", 0x06b6d4),
 		statusAbandoned: varToHex("--mantine-color-gray-5", 0x9ca3af),
+		cardBg: varToHex(
+			scheme === "dark" ? "--mantine-color-dark-6" : "--mantine-color-white",
+			scheme === "dark" ? 0x25262b : 0xffffff,
+		),
+		cardBorder: varToHex(
+			scheme === "dark" ? "--mantine-color-dark-4" : "--mantine-color-gray-4",
+			scheme === "dark" ? 0x495057 : 0xced4da,
+		),
+		cardActiveBorder: varToHex("--mantine-color-indigo-6", 0x4f46e5),
+		cardText: varToHex(
+			scheme === "dark" ? "--mantine-color-dark-0" : "--mantine-color-dark-9",
+			scheme === "dark" ? 0xc1c2c5 : 0x212529,
+		),
+		cardReviewBorder: varToHex("--mantine-color-yellow-6", 0xca8a04),
+		narratorRunning: varToHex("--mantine-color-blue-5", 0x3b82f6),
+		narratorDone: varToHex("--mantine-color-green-5", 0x22c55e),
+		narratorError: varToHex("--mantine-color-red-5", 0xef4444),
+		narratorWaiting: varToHex("--mantine-color-yellow-5", 0xeab308),
 	};
 
 	cached = { scheme, theme };

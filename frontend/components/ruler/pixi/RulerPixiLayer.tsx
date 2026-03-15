@@ -1,35 +1,45 @@
 /**
  * PixiJS rendering layer for the ruler.
  * Handles all high-frequency visual elements: ticks, clusters, heatmap,
- * connector lines, and dot/pill morph elements.
- * React DOM is only used for interactive ChapterCards above this layer.
+ * connector lines, and chapter node morph elements (dot → pill → card).
+ * React DOM is only used for interactive NarratorPanel overlays above this layer.
  */
-import { Application, Container, Graphics, Text, TextStyle } from "pixi.js";
+import { Application, Container, Graphics, TextStyle } from "pixi.js";
 import { memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RulerSegment } from "../../../hooks/useRuler";
 import type { CommitCluster } from "../commit-cluster";
-import { COLLAPSED_GAP, type ElasticLayout } from "../elastic-layout";
+import { COLLAPSED_GAP, type ElasticLayout, findTickAtX } from "../elastic-layout";
+import { localScale, screenToWorld, viewCenterFromPan, worldToScreen } from "../fisheye";
 import {
+	CardContainerPool,
+	drawChapterNode,
 	drawClusterBlock,
 	drawConnector,
 	drawHeatmap,
-	drawMorph,
 	drawRulerTrackBg,
-	drawSegmentBg,
 	drawTick,
+	TextPool,
 } from "../pixi-draw";
 import type { RulerOrientation } from "../types";
-import { getMorphFactor, getMorphStyle, type ZoomTierId } from "../zoom-tiers";
-import { invalidatePixiThemeCache, resolvePixiTheme } from "./pixi-theme";
+import { getCenterFade, getMorphFactor, getMorphStyle, type ZoomTierId } from "../zoom-tiers";
+import type { PixiTheme } from "./pixi-theme";
+import { invalidatePixiThemeCache, resolvePixiTheme, themeStatusColor } from "./pixi-theme";
 
-// Re-export for parent
-export type { RulerPixiHandle };
+// Reusable buffers to avoid per-frame allocations in redraw.
+// Module-level is safe because only one RulerPixiLayer instance exists at a time
+// and redraw() is synchronous.
+const mergedBuf: PixiChapterInfo[] = [];
+const alwaysIdsBuf = new Set<string>();
 
-/** Chapter info needed for morph + connector drawing */
+/** Chapter info needed for morph + connector + card drawing */
 export interface PixiChapterInfo {
 	id: string;
 	status: string;
 	title: string;
+	branch: string;
+	role: string;
+	narratorId: string | null;
+	narratorStatus: string | null;
 	startCommitSha: string | null;
 	mergeCommitSha?: string | null;
 	/** World-space layout position within the segment */
@@ -47,11 +57,27 @@ interface Camera {
 	edge: string;
 }
 
-interface RulerPixiHandle {
+export interface CardHitRect {
+	id: string;
+	narratorId: string | null;
+	fromSha: string;
+	screenX: number;
+	screenY: number;
+	width: number;
+	height: number;
+	layoutX: number;
+	layoutY: number;
+}
+
+export interface RulerPixiHandle {
 	/** Fast-path: update camera transform without React re-render */
 	updateCamera(cam: Camera): void;
 	/** Trigger a full re-render of the PixiJS scene */
 	render(): void;
+	/** Update chapter positions imperatively (e.g. during drag) without React state */
+	updateChapters(chapters: PixiChapterInfo[]): void;
+	/** Get current card hit rects for interaction hit-testing */
+	getCardHitRects(): CardHitRect[];
 }
 
 interface RulerPixiLayerProps {
@@ -68,19 +94,44 @@ interface RulerPixiLayerProps {
 	chapters: PixiChapterInfo[];
 	zoomTier: ZoomTierId;
 	clusters: CommitCluster[];
-	scale: number;
-	zoomCenterWorldX: number;
-	viewportWorldWidth: number;
 	tickPositions: Map<string, number>;
 	/** Dynamic ruler track thickness (changes when user drags the border) */
 	rulerThickness: number;
 	/** Commit SHA → first line of commit message */
 	commitMessages: Map<string, string>;
+	/** Active chapters that should always render as dots even at L0 */
+	alwaysVisibleChapters: PixiChapterInfo[];
+	/** Set of chapter IDs that have their narrator panel open (rendered by React) */
+	openPanelChapterIds?: Set<string>;
+	// --- Interaction callbacks ---
+	onChapterClick?: (chapterId: string, narratorId: string | null) => void;
+	onChapterContextMenu?: (chapterId: string, screenX: number, screenY: number) => void;
+	onChapterDragEnd?: (
+		chapterId: string,
+		fromSha: string,
+		newAxisOffset: number,
+		newCrossOffset: number,
+	) => void;
 }
 
 const NODE_WIDTH = 220;
 const NODE_HEIGHT = 72;
 const CARD_TOP_OFFSET = 30;
+
+function narratorStatusColor(theme: PixiTheme, status: string): number {
+	switch (status) {
+		case "running":
+			return theme.narratorRunning;
+		case "done":
+			return theme.narratorDone;
+		case "error":
+			return theme.narratorError;
+		case "waiting":
+			return theme.narratorWaiting;
+		default:
+			return theme.dimmed;
+	}
+}
 
 export const RulerPixiLayer = memo(function RulerPixiLayer({
 	containerWidth,
@@ -93,12 +144,14 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	chapters,
 	zoomTier,
 	clusters,
-	scale,
-	zoomCenterWorldX,
-	viewportWorldWidth,
 	tickPositions,
 	rulerThickness,
 	commitMessages,
+	alwaysVisibleChapters,
+	openPanelChapterIds,
+	onChapterClick: _onChapterClick,
+	onChapterContextMenu: _onChapterContextMenu,
+	onChapterDragEnd: _onChapterDragEnd,
 }: RulerPixiLayerProps) {
 	const containerDivRef = useRef<HTMLDivElement>(null);
 	const appRef = useRef<Application | null>(null);
@@ -110,16 +163,15 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	const tickGfxRef = useRef<Graphics | null>(null);
 	const morphGfxRef = useRef<Graphics | null>(null);
 	const connectorGfxRef = useRef<Graphics | null>(null);
-	const segBgGfxRef = useRef<Graphics | null>(null);
 	const heatmapGfxRef = useRef<Graphics | null>(null);
 	const trackBgGfxRef = useRef<Graphics | null>(null);
 	const rulerMaskGfxRef = useRef<Graphics | null>(null);
 
-	// Text object pools (reused each frame to avoid GC)
-	const tickLabelPoolRef = useRef<Text[]>([]);
-	const tickLabelContainerRef = useRef<Container | null>(null);
-	const pillLabelPoolRef = useRef<Text[]>([]);
-	const pillLabelContainerRef = useRef<Container | null>(null);
+	// TextPool instances (created during PixiJS init, reused each frame)
+	const tickLabelPoolRef = useRef<TextPool | null>(null);
+	const chapterLabelPoolRef = useRef<TextPool | null>(null);
+	// Card-phase chapters get their own Container for correct z-order
+	const cardPoolRef = useRef<CardContainerPool | null>(null);
 
 	// Cached TextStyle objects — reused across frames, only rebuilt when parameters change
 	const cachedStylesRef = useRef<{
@@ -127,27 +179,44 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		labelKey: string;
 		msgStyle: TextStyle | null;
 		msgKey: string;
-		pillStyle: TextStyle | null;
-		pillKey: string;
+		chapterTitleKey: string;
+		chapterTitleStyle: TextStyle | null;
+		cardBadgeKey: string;
+		cardBadgeStyle: TextStyle | null;
 	}>({
 		labelStyle: null,
 		labelKey: "",
 		msgStyle: null,
 		msgKey: "",
-		pillStyle: null,
-		pillKey: "",
+		chapterTitleKey: "",
+		chapterTitleStyle: null,
+		cardBadgeKey: "",
+		cardBadgeStyle: null,
 	});
 
+	// Latest camera ref — tracks the most recent camera state including fast-path
+	// updates (zoom/pan animations) that bypass React state. Used by updateChapters()
+	// so drag-time redraws use the correct camera instead of stale React state.
+	const latestCameraRef = useRef<Camera>(camera);
+
 	// Latest data refs (avoid stale closures in imperative handle)
+	// chaptersOverrideRef: set imperatively during drag, cleared only when the
+	// chapters prop actually changes (meaning React delivered fresh layout data).
+	// Previously this was cleared unconditionally on every render, which caused
+	// the override to be wiped when an unrelated prop (camera, scale, …) changed
+	// mid-drag, making connectors flash back to stale positions.
+	const chaptersOverrideRef = useRef<PixiChapterInfo[] | null>(null);
+	const prevChaptersRef = useRef(chapters);
+	if (prevChaptersRef.current !== chapters) {
+		prevChaptersRef.current = chapters;
+		chaptersOverrideRef.current = null;
+	}
 	const dataRef = useRef({
 		layout,
 		segments,
 		chapters,
 		zoomTier,
 		clusters,
-		scale,
-		zoomCenterWorldX,
-		viewportWorldWidth,
 		tickPositions,
 		orientation,
 		containerWidth,
@@ -155,6 +224,8 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		camera,
 		rulerThickness,
 		commitMessages,
+		alwaysVisibleChapters,
+		openPanelChapterIds,
 	});
 	dataRef.current = {
 		layout,
@@ -162,9 +233,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		chapters,
 		zoomTier,
 		clusters,
-		scale,
-		zoomCenterWorldX,
-		viewportWorldWidth,
 		tickPositions,
 		orientation,
 		containerWidth,
@@ -172,7 +240,12 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		camera,
 		rulerThickness,
 		commitMessages,
+		alwaysVisibleChapters,
+		openPanelChapterIds,
 	};
+
+	// Hit-test rectangles for card interaction (rebuilt each redraw)
+	const cardHitRectsRef = useRef<CardHitRect[]>([]);
 
 	// --- Initialize PixiJS Application ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: init once
@@ -199,13 +272,20 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			if (destroyed) return; // Component unmounted before init finished — skip setup
 			appRef.current = app;
 
+			// Use latest dimensions from dataRef (init closure may have stale values)
+			const latestW = dataRef.current.containerWidth;
+			const latestH = dataRef.current.containerHeight;
+			if (latestW !== containerWidth || latestH !== containerHeight) {
+				app.renderer.resize(latestW, latestH);
+			}
+
 			// Mount PixiJS-created canvas into our container div
 			const pixiCanvas = app.canvas as HTMLCanvasElement;
 			pixiCanvas.style.position = "absolute";
 			pixiCanvas.style.top = "0";
 			pixiCanvas.style.left = "0";
-			pixiCanvas.style.width = `${containerWidth}px`;
-			pixiCanvas.style.height = `${containerHeight}px`;
+			pixiCanvas.style.width = `${latestW}px`;
+			pixiCanvas.style.height = `${latestH}px`;
 			pixiCanvas.style.pointerEvents = "none";
 			container.appendChild(pixiCanvas);
 
@@ -219,13 +299,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			rulerContainerRef.current = rulerContainer;
 
 			// Create reusable Graphics objects
-			const segBgGfx = new Graphics();
 			const connectorGfx = new Graphics();
 			const morphGfx = new Graphics();
 			const heatmapGfx = new Graphics();
 			const tickGfx = new Graphics();
 
-			worldContainer.addChild(segBgGfx);
 			worldContainer.addChild(connectorGfx);
 			worldContainer.addChild(morphGfx);
 
@@ -239,21 +317,25 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			rulerContainer.addChild(rulerMaskGfx);
 			rulerContainer.mask = rulerMaskGfx;
 
-			// Text label containers
+			// Text pools — one for ruler tick labels, one for dot/pill chapter labels
 			const tickLabelContainer = new Container();
-			const pillLabelContainer = new Container();
+			const chapterLabelContainer = new Container();
 			rulerContainer.addChild(tickLabelContainer);
-			worldContainer.addChild(pillLabelContainer);
+			worldContainer.addChild(chapterLabelContainer);
+
+			tickLabelPoolRef.current = new TextPool(tickLabelContainer);
+			chapterLabelPoolRef.current = new TextPool(chapterLabelContainer);
+
+			// Card-phase chapters get per-node Containers (appended after chapterLabelContainer)
+			// so they render above dot/pill elements with correct internal z-order.
+			cardPoolRef.current = new CardContainerPool(worldContainer);
 
 			trackBgGfxRef.current = trackBgGfx;
 			rulerMaskGfxRef.current = rulerMaskGfx;
-			tickLabelContainerRef.current = tickLabelContainer;
-			pillLabelContainerRef.current = pillLabelContainer;
 
 			tickGfxRef.current = tickGfx;
 			morphGfxRef.current = morphGfx;
 			connectorGfxRef.current = connectorGfx;
-			segBgGfxRef.current = segBgGfx;
 			heatmapGfxRef.current = heatmapGfx;
 
 			// Signal ready and trigger initial draw
@@ -280,6 +362,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	}, []); // Only once
 
 	// --- Resize ---
+	// Include pixiReady so this runs after async PixiJS init completes,
+	// ensuring the renderer picks up the correct viewport dimensions.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: pixiReady triggers resize after async init
 	useEffect(() => {
 		const app = appRef.current;
 		if (!app?.renderer) return;
@@ -289,394 +374,496 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			pixiCanvas.style.width = `${containerWidth}px`;
 			pixiCanvas.style.height = `${containerHeight}px`;
 		}
-	}, [containerWidth, containerHeight]);
-
-	// --- Text pool helper ---
-	const getPooledText = useCallback(
-		(pool: Text[], container: Container, index: number, style: TextStyle): Text => {
-			if (index < pool.length) {
-				const t = pool[index];
-				t.visible = true;
-				t.style = style;
-				return t;
-			}
-			const t = new Text({ text: "", style });
-			pool.push(t);
-			container.addChild(t);
-			return t;
-		},
-		[],
-	);
-
-	const hidePooledTexts = useCallback((pool: Text[], fromIndex: number) => {
-		for (let i = fromIndex; i < pool.length; i++) {
-			pool[i].visible = false;
-		}
-	}, []);
+	}, [containerWidth, containerHeight, pixiReady]);
 
 	// --- Full redraw function ---
-	const redraw = useCallback(
-		(cam: Camera) => {
-			const app = appRef.current;
-			if (!app) return;
+	const redraw = useCallback((cam: Camera) => {
+		const app = appRef.current;
+		if (!app) return;
 
-			const d = dataRef.current;
-			const isH = cam.orientation === "horizontal";
-			const trackH = d.rulerThickness;
+		const d = dataRef.current;
+		const isH = cam.orientation === "horizontal";
+		const trackH = d.rulerThickness;
 
-			// Update world container transform
-			const wc = worldContainerRef.current;
-			if (wc) {
-				if (isH) {
-					wc.position.set(cam.panX, cam.panY + trackH);
-					wc.scale.set(cam.scale);
-				} else {
-					wc.position.set(cam.panX + trackH, cam.panY);
-					wc.scale.set(cam.scale);
-				}
+		// --- Fisheye parameters ---
+		const mainViewport = isH ? d.containerWidth : d.containerHeight;
+		const mainPan = isH ? cam.panX : cam.panY;
+		const crossPan = isH ? cam.panY : cam.panX;
+		const viewCenter = viewCenterFromPan(mainPan, mainViewport, cam.scale);
+
+		// Helper: world main-axis → screen main-axis pixel
+		const toScreen = (worldMain: number) =>
+			worldToScreen(worldMain, viewCenter, mainViewport, cam.scale);
+
+		// Helper: get local scale at a world position
+		const getLocalScale = (worldMain: number) =>
+			localScale(worldMain, viewCenter, mainViewport, cam.scale);
+
+		// Update world container — no camera transform, everything is screen-space
+		const wc = worldContainerRef.current;
+		if (wc) {
+			wc.position.set(0, 0);
+			wc.scale.set(1);
+		}
+
+		// Update ruler container — no camera transform
+		const rc = rulerContainerRef.current;
+		if (rc) {
+			rc.position.set(0, 0);
+			rc.scale.set(1, 1);
+		}
+
+		// --- Clear all graphics ---
+		tickGfxRef.current?.clear();
+		morphGfxRef.current?.clear();
+		connectorGfxRef.current?.clear();
+		heatmapGfxRef.current?.clear();
+		trackBgGfxRef.current?.clear();
+		rulerMaskGfxRef.current?.clear();
+
+		const tickGfx = tickGfxRef.current;
+		const morphGfx = morphGfxRef.current;
+		const connGfx = connectorGfxRef.current;
+		const heatGfx = heatmapGfxRef.current;
+		const trackBgGfx = trackBgGfxRef.current;
+		const rulerMaskGfx = rulerMaskGfxRef.current;
+		if (!tickGfx || !morphGfx || !connGfx || !heatGfx || !trackBgGfx) return;
+
+		// --- Update ruler mask to clip contents within the track area ---
+		// Everything is now in screen space, so the mask is simply the track rect.
+		if (rulerMaskGfx) {
+			const maskW = isH ? d.containerWidth : trackH;
+			const maskH = isH ? trackH : d.containerHeight;
+			rulerMaskGfx.rect(0, 0, maskW, maskH).fill({ color: 0xffffff });
+		}
+
+		// --- Resolve theme ---
+		const theme = resolvePixiTheme();
+
+		// --- Draw ruler track background (full viewport width) ---
+		const trackScreenWidth = isH ? d.containerWidth : d.containerHeight;
+		drawRulerTrackBg(trackBgGfx, theme, trackScreenWidth, trackH);
+
+		// --- Viewport culling (screen-space) ---
+		const cullBuffer = mainViewport * 0.5;
+		const cullStart = -cullBuffer;
+		const cullEnd = mainViewport + cullBuffer;
+
+		// Pre-compute visible tick range via binary search to avoid iterating all ticks.
+		// screenToWorld maps screen edges back to world coords; findTickAtX does binary search.
+		const worldCullStart = screenToWorld(cullStart, viewCenter, mainViewport, cam.scale);
+		const worldCullEnd = screenToWorld(cullEnd, viewCenter, mainViewport, cam.scale);
+		const allTicks = d.layout.ticks;
+		const visStartIdx = Math.max(0, findTickAtX(allTicks, worldCullStart) - 1);
+		const visEndIdx = Math.min(allTicks.length - 1, findTickAtX(allTicks, worldCullEnd) + 1);
+
+		// --- Draw ticks / clusters ---
+		const usesClusters = d.zoomTier === "L0" || d.zoomTier === "L1";
+
+		if (usesClusters && d.clusters.length > 0) {
+			for (const cl of d.clusters) {
+				const clScreen = toScreen(cl.worldPos);
+				const clLS = getLocalScale(cl.worldPos);
+				const clScreenSize = cl.worldSize * clLS;
+				if (clScreen + clScreenSize < cullStart || clScreen - clScreenSize > cullEnd) continue;
+				drawClusterBlock(
+					tickGfx,
+					theme,
+					clScreen - clScreenSize / 2,
+					clScreenSize,
+					trackH,
+					cl.count,
+					cl.activeCount > 0,
+				);
 			}
 
-			// Update ruler container position
-			const rc = rulerContainerRef.current;
-			if (rc) {
-				if (isH) {
-					rc.position.set(cam.panX, 0);
-					rc.scale.set(cam.scale, 1);
-				} else {
-					rc.position.set(0, cam.panY);
-					rc.scale.set(1, cam.scale);
-				}
+			// Draw individual ticks for fork/merge commits even in cluster mode
+			const forkMergeShas = new Set<string>();
+			for (const ch of d.chapters) {
+				if (ch.startCommitSha) forkMergeShas.add(ch.startCommitSha);
+				if (ch.mergeCommitSha) forkMergeShas.add(ch.mergeCommitSha);
 			}
-
-			// --- Clear all graphics ---
-			tickGfxRef.current?.clear();
-			morphGfxRef.current?.clear();
-			connectorGfxRef.current?.clear();
-			segBgGfxRef.current?.clear();
-			heatmapGfxRef.current?.clear();
-			trackBgGfxRef.current?.clear();
-			rulerMaskGfxRef.current?.clear();
-
-			const tickGfx = tickGfxRef.current;
-			const morphGfx = morphGfxRef.current;
-			const connGfx = connectorGfxRef.current;
-			const segBgGfx = segBgGfxRef.current;
-			const heatGfx = heatmapGfxRef.current;
-			const trackBgGfx = trackBgGfxRef.current;
-			const rulerMaskGfx = rulerMaskGfxRef.current;
-			if (!tickGfx || !morphGfx || !connGfx || !segBgGfx || !heatGfx || !trackBgGfx) return;
-
-			// --- Update ruler mask to clip contents within the track area ---
-			// The mask is in rulerContainer's local space.
-			// rulerContainer is positioned at (panX, 0) with scale (scale, 1) for horizontal,
-			// so we need a rect that covers the visible viewport in local coords.
-			if (rulerMaskGfx) {
-				const maskW = isH ? d.containerWidth / cam.scale : trackH;
-				const maskH = isH ? trackH : d.containerHeight / cam.scale;
-				const maskX = isH ? -cam.panX / cam.scale : 0;
-				const maskY = isH ? 0 : -cam.panY / cam.scale;
-				rulerMaskGfx.rect(maskX, maskY, maskW, maskH).fill({ color: 0xffffff });
-			}
-
-			// --- Resolve theme ---
-			const theme = resolvePixiTheme();
-
-			// --- Draw ruler track background ---
-			const trackWorldWidth = d.layout.totalWidth + 200;
-			drawRulerTrackBg(trackBgGfx, theme, trackWorldWidth, trackH);
-
-			// --- Viewport culling ---
-			const mainPan = isH ? cam.panX : cam.panY;
-			const mainViewport = isH ? d.containerWidth : d.containerHeight;
-			const worldViewStart = -mainPan / cam.scale;
-			const worldViewEnd = worldViewStart + mainViewport / cam.scale;
-			const buffer = (worldViewEnd - worldViewStart) * 0.5;
-			const cullStart = worldViewStart - buffer;
-			const cullEnd = worldViewEnd + buffer;
-
-			// --- Draw ticks / clusters ---
-			const usesClusters = d.zoomTier === "L0" || d.zoomTier === "L1";
-
-			if (usesClusters && d.clusters.length > 0) {
-				for (const cl of d.clusters) {
-					if (cl.worldPos + cl.worldSize < cullStart || cl.worldPos - cl.worldSize > cullEnd)
-						continue;
-					drawClusterBlock(
-						tickGfx,
-						theme,
-						cl.worldPos - cl.worldSize / 2,
-						cl.worldSize,
-						trackH,
-						cl.count,
-						cl.activeCount > 0,
-					);
-				}
-			} else {
-				// Compute tick stride: skip ticks when they'd be < 8px apart on screen
-				const screenGap = COLLAPSED_GAP * cam.scale;
-				const tickStride = screenGap < 8 ? Math.ceil(8 / screenGap) : 1;
-
-				for (const tick of d.layout.ticks) {
-					if (tick.x < cullStart || tick.x > cullEnd) continue;
-					// Always show segment ticks; skip others based on stride
-					if (!tick.segment && tickStride > 1 && tick.index % tickStride !== 0) continue;
-					drawTick(tickGfx, theme, tick.x, trackH, !!tick.segment, cam.scale);
-				}
-			}
-
-			// --- Draw tick labels (L2+ only) ---
-			const tickLabelContainer = tickLabelContainerRef.current;
-			const tickLabelPool = tickLabelPoolRef.current;
-			if (tickLabelContainer && !usesClusters) {
-				const showMessages = d.zoomTier === "L4" || d.zoomTier === "L3";
-				const isExpanded = trackH > 60;
-				const fontSize = isExpanded ? 11 : 10;
-
-				// Label style: no wordWrap — we truncate manually per tick
-				const labelKey = `${fontSize}:${theme.dimmed}`;
-				const sc = cachedStylesRef.current;
-				if (sc.labelKey !== labelKey || !sc.labelStyle) {
-					sc.labelStyle = new TextStyle({
-						fontSize,
-						fill: theme.dimmed,
-						fontFamily: "monospace",
-					});
-					sc.labelKey = labelKey;
-				}
-				const labelStyle = sc.labelStyle;
-
-				const counterScaleX = 1 / cam.scale;
-				const labelScreenGap = COLLAPSED_GAP * cam.scale;
-				const labelStride = labelScreenGap < 60 ? Math.ceil(60 / labelScreenGap) : 1;
-
-				// Available vertical space for commit message (below SHA line)
-				const msgTopOffset = isExpanded ? 18 : 16;
-				const availableHeight = trackH - msgTopOffset - 4; // 4px bottom padding
-				// Approximate line height for message text
-				const msgLineH = 13;
-				const maxLines = Math.max(1, Math.floor(availableHeight / msgLineH));
-
-				let labelIdx = 0;
-				const ticks = d.layout.ticks;
-				for (let ti = 0; ti < ticks.length; ti++) {
-					const tick = ticks[ti];
-					if (tick.x < cullStart || tick.x > cullEnd) continue;
-					if (!tick.segment && labelStride > 1 && tick.index % labelStride !== 0) continue;
-
-					// Compute available width: distance to next visible tick (in world space)
-					const nextTick = ticks[ti + 1];
-					const tickGap = nextTick ? nextTick.x - tick.x : COLLAPSED_GAP;
-					// Padding so text doesn't touch the next tick
-					const availableWorldW = Math.max(0, tickGap - 8 / cam.scale);
-
-					// SHA label
-					const label = getPooledText(tickLabelPool, tickLabelContainer, labelIdx, labelStyle);
-					label.text = tick.sha.slice(0, 7);
-					label.scale.set(counterScaleX, 1);
-					if (isH) {
-						label.position.set(tick.x + 4 / cam.scale, 4);
-					} else {
-						label.position.set(4, tick.x + 4 / cam.scale);
+			if (forkMergeShas.size > 0) {
+				for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
+					const tick = allTicks[ti];
+					if (forkMergeShas.has(tick.sha)) {
+						const screenX = toScreen(tick.x);
+						const ls = getLocalScale(tick.x);
+						drawTick(tickGfx, theme, screenX, trackH, true, ls);
 					}
-					labelIdx++;
+				}
+			}
+		} else {
+			// Compute tick stride: skip ticks when they'd be < 8px apart on screen
+			const screenGap = COLLAPSED_GAP * cam.scale;
+			const tickStride = screenGap < 8 ? Math.ceil(8 / screenGap) : 1;
 
-					// Commit message (when zoomed in enough or ruler expanded)
-					if ((showMessages || isExpanded) && availableHeight > msgLineH * 0.5) {
-						const msg = d.commitMessages.get(tick.sha);
-						if (msg) {
-							// Word-wrap width = available world width (counter-scaled to screen px)
-							const wrapPx = availableWorldW * cam.scale;
-							const msgKey = `${theme.dimmed}:${Math.round(wrapPx)}:${maxLines}`;
-							if (sc.msgKey !== msgKey || !sc.msgStyle) {
-								sc.msgStyle = new TextStyle({
-									fontSize: 10,
+			for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
+				const tick = allTicks[ti];
+				const screenX = toScreen(tick.x);
+				// Always show segment ticks; skip others based on stride
+				if (!tick.segment && tickStride > 1 && tick.index % tickStride !== 0) continue;
+				const ls = getLocalScale(tick.x);
+				drawTick(tickGfx, theme, screenX, trackH, !!tick.segment, ls);
+			}
+		}
+
+		// --- Draw tick labels (L2+ only) ---
+		const tickPool = tickLabelPoolRef.current;
+		if (tickPool && !usesClusters) {
+			const showMessages = d.zoomTier === "L4" || d.zoomTier === "L3";
+			const isExpanded = trackH > 60;
+			const fontSize = isExpanded ? 11 : 10;
+
+			// Label style: no wordWrap — we truncate manually per tick
+			const labelKey = `${fontSize}:${theme.dimmed}`;
+			const sc = cachedStylesRef.current;
+			if (sc.labelKey !== labelKey || !sc.labelStyle) {
+				sc.labelStyle = new TextStyle({
+					fontSize,
+					fill: theme.dimmed,
+					fontFamily: "monospace",
+				});
+				sc.labelKey = labelKey;
+			}
+			const labelStyle = sc.labelStyle;
+
+			// Center gap: the tick spacing at viewport center (no fisheye compression).
+			// Text layout (word-wrap, truncation) is computed against this fixed width
+			// so it only changes on zoom, not on pan. Each label is then squeezed along
+			// the main axis by the fisheye ratio to fit the actual screen gap.
+			const centerGap = COLLAPSED_GAP * cam.scale;
+			const labelStride = centerGap < 60 ? Math.ceil(60 / centerGap) : 1;
+			const centerAvailW = Math.max(0, centerGap - 8);
+
+			// Available vertical space for commit message (below SHA line)
+			const msgTopOffset = isExpanded ? 18 : 16;
+			const availableHeight = trackH - msgTopOffset - 4; // 4px bottom padding
+			// Approximate line height for message text
+			const msgLineH = 13;
+			const maxLines = Math.max(1, Math.floor(availableHeight / msgLineH));
+
+			// Pre-compute message style based on center width (stable across pan)
+			const showMsg = (showMessages || isExpanded) && availableHeight > msgLineH * 0.5;
+			if (showMsg) {
+				const msgKey = `${theme.dimmed}:${Math.round(centerAvailW)}:${maxLines}`;
+				if (sc.msgKey !== msgKey || !sc.msgStyle) {
+					sc.msgStyle = new TextStyle({
+						fontSize: 10,
+						fill: theme.dimmed,
+						fontFamily: "sans-serif",
+						wordWrap: true,
+						wordWrapWidth: Math.max(40, centerAvailW),
+						breakWords: true,
+					});
+					sc.msgKey = msgKey;
+				}
+			}
+			const charsPerLine = Math.max(4, Math.floor(centerAvailW / 6));
+			const maxChars = charsPerLine * maxLines;
+
+			for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
+				const tick = allTicks[ti];
+				if (!tick.segment && labelStride > 1 && tick.index % labelStride !== 0) continue;
+				const screenX = toScreen(tick.x);
+
+				// Fisheye squeeze ratio: actual screen gap / center gap
+				const nextTick = allTicks[ti + 1];
+				const nextScreenX = nextTick ? toScreen(nextTick.x) : screenX + centerGap;
+				const squeeze = centerGap > 0 ? Math.min(1, (nextScreenX - screenX) / centerGap) : 1;
+
+				// SHA label — layout at center width, squeeze along main axis
+				const label = tickPool.acquire(labelStyle);
+				label.text = tick.sha.slice(0, 7);
+				if (isH) {
+					label.scale.set(squeeze, 1);
+					label.position.set(screenX + 4, 4);
+				} else {
+					label.scale.set(1, squeeze);
+					label.position.set(4, screenX + 4);
+				}
+
+				// Commit message — layout at center width, squeeze along main axis
+				if (showMsg) {
+					const msg = d.commitMessages.get(tick.sha);
+					if (msg && sc.msgStyle) {
+						const msgLabel = tickPool.acquire(sc.msgStyle);
+						msgLabel.text = msg.length > maxChars ? `${msg.slice(0, maxChars)}…` : msg;
+						if (isH) {
+							msgLabel.scale.set(squeeze, 1);
+							msgLabel.position.set(screenX + 4, msgTopOffset);
+						} else {
+							msgLabel.scale.set(1, squeeze);
+							msgLabel.position.set(msgTopOffset, screenX + 4);
+						}
+					}
+				}
+			}
+		}
+		tickPool?.flush();
+
+		// --- Draw heatmap (L0 only) ---
+		if (d.zoomTier === "L0" && d.clusters.length > 0) {
+			// Map cluster positions to screen space for heatmap
+			const screenClusters = d.clusters.map((cl) => {
+				const sPos = toScreen(cl.worldPos);
+				const ls = getLocalScale(cl.worldPos);
+				return {
+					worldPos: sPos,
+					worldSize: cl.worldSize * ls,
+					activeCount: cl.activeCount,
+				};
+			});
+			drawHeatmap(heatGfx, theme, screenClusters, trackH);
+		}
+
+		// --- Draw chapter nodes + connectors (unified dot→pill→card) ---
+		// Cross axis remains linear — only main axis has fisheye.
+		const rulerEdgeCrossScreen = trackH;
+		const chapterPool = chapterLabelPoolRef.current; // for dot/pill text
+		const cardPool = cardPoolRef.current; // for card-phase containers
+
+		const cardHitRects = cardHitRectsRef.current;
+		cardHitRects.length = 0;
+
+		// Use imperative override if available (e.g. during card drag)
+		const chaptersToRender = chaptersOverrideRef.current ?? d.chapters;
+
+		// Merge always-visible active chapters (for L0 where SegmentCanvas is not rendered)
+		// Reuse a single array to avoid per-frame allocations
+		const always = d.alwaysVisibleChapters;
+		let merged: typeof chaptersToRender;
+		if (always.length === 0) {
+			merged = chaptersToRender;
+		} else {
+			mergedBuf.length = 0;
+			const alwaysIds = alwaysIdsBuf;
+			alwaysIds.clear();
+			for (const c of always) alwaysIds.add(c.id);
+			for (const c of chaptersToRender) {
+				if (!alwaysIds.has(c.id)) mergedBuf.push(c);
+			}
+			for (const c of always) mergedBuf.push(c);
+			merged = mergedBuf;
+		}
+
+		for (const ch of merged) {
+			const chWorldMain = ch.segMainPos + ch.layoutX + NODE_WIDTH / 2;
+			const ls = getLocalScale(chWorldMain);
+			let t = getMorphFactor(ls);
+			// Active chapters always show at least as a dot
+			if (t <= 0 && ch.status === "active") t = 0.15;
+			if (t <= 0) continue;
+			// Guard against stale/incomplete chapter data after cleanup
+			if (!ch.title || !ch.status) continue;
+
+			const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
+			const centerFade = getCenterFade(t);
+			const centerOffsetX = (NODE_WIDTH - morph.width) / 2;
+			const centerOffsetY = (NODE_HEIGHT - morph.height) / 2;
+
+			// --- Unified position: always compute left-edge world coord ---
+			// This ensures pill and card use the exact same anchor through
+			// the fisheye transform, eliminating the position jump.
+			const elemWorldMain = ch.segMainPos + ch.layoutX + centerOffsetX * centerFade;
+			const elemScreenLeft = toScreen(elemWorldMain);
+			const elemScreenRight = toScreen(elemWorldMain + morph.width);
+			const elemScreenW = elemScreenRight - elemScreenLeft;
+
+			const elemScreenCross =
+				trackH + (ch.layoutY + CARD_TOP_OFFSET) * cam.scale + crossPan + centerOffsetY * centerFade;
+			const elemScreenCenterCross = elemScreenCross + morph.height / 2;
+
+			const hasPanel = d.openPanelChapterIds?.has(ch.id);
+
+			// --- Draw unified chapter node (single path: dot → pill → card) ---
+			const screenW = isH ? elemScreenW : morph.height;
+			const screenH = isH ? morph.height : elemScreenW;
+			const nodeLeft = isH ? elemScreenLeft : elemScreenCross;
+			const nodeTop = isH ? elemScreenCross : elemScreenLeft;
+
+			if (!hasPanel) {
+				const screenMorph = { ...morph, width: screenW, height: screenH };
+				const isCard = morph.cardBlend > 0;
+
+				// Card-phase: use per-chapter Container for correct z-order
+				// Dot/pill-phase: use shared morphGfx (cheaper, no z-order issue)
+				const drawGfx = isCard && cardPool ? cardPool.acquire() : null;
+				const targetGfx = drawGfx ? drawGfx.gfx : morphGfx;
+
+				drawChapterNode(
+					targetGfx,
+					theme,
+					screenMorph,
+					nodeLeft,
+					nodeTop,
+					screenW,
+					screenH,
+					ch.status,
+					ch.role,
+				);
+
+				// Store hit rect for interaction when card-like
+				if (isCard) {
+					cardHitRects.push({
+						id: ch.id,
+						narratorId: ch.narratorId,
+						fromSha: ch.startCommitSha ?? "",
+						screenX: nodeLeft,
+						screenY: nodeTop,
+						width: screenW,
+						height: screenH,
+						layoutX: ch.layoutX,
+						layoutY: ch.layoutY,
+					});
+				}
+
+				// --- Chapter title text (unified for pill + card phases) ---
+				if (morph.titleOpacity > 0 && screenW > 30) {
+					const cb = morph.cardBlend;
+					const titleFontSize = morph.titleFontSize;
+					// Blend fill color: dimmed (pill) → cardText (card)
+					const titleFill = cb > 0.5 ? theme.cardText : theme.dimmed;
+					const titleWeight = cb > 0.5 ? "600" : "normal";
+					const titleKey = `${Math.round(titleFontSize * 2) / 2}:${titleFill}:${titleWeight}`;
+					const sc = cachedStylesRef.current;
+					if (sc.chapterTitleKey !== titleKey || !sc.chapterTitleStyle) {
+						sc.chapterTitleStyle = new TextStyle({
+							fontSize: Math.round(titleFontSize * 2) / 2,
+							fill: titleFill,
+							fontFamily: "sans-serif",
+							fontWeight: titleWeight,
+						});
+						sc.chapterTitleKey = titleKey;
+					}
+
+					const mainSize = isH ? screenW : screenH;
+					const maxChars = Math.max(2, Math.floor((mainSize - 22) / (titleFontSize * 0.55)));
+					const title = ch.title.length > maxChars ? `${ch.title.slice(0, maxChars)}…` : ch.title;
+
+					// Use card slot's own TextPool when in card phase, shared pool otherwise
+					const labelPool = drawGfx ? drawGfx.labels : chapterPool;
+					if (labelPool) {
+						const titleLabel = labelPool.acquire(sc.chapterTitleStyle);
+						titleLabel.text = title;
+						titleLabel.alpha = morph.opacity * morph.titleOpacity;
+						titleLabel.scale.set(1);
+						titleLabel.position.set(nodeLeft + 8, nodeTop + 6);
+
+						// Card detail labels — only when card is tall enough
+						if (cb > 0 && screenH > 36) {
+							const badgeFontSize = 9;
+							const badgeKey = `badge:${badgeFontSize}:${theme.dimmed}`;
+							if (sc.cardBadgeKey !== badgeKey || !sc.cardBadgeStyle) {
+								sc.cardBadgeStyle = new TextStyle({
+									fontSize: badgeFontSize,
 									fill: theme.dimmed,
 									fontFamily: "sans-serif",
-									wordWrap: true,
-									wordWrapWidth: Math.max(40, wrapPx),
 								});
-								sc.msgKey = msgKey;
+								sc.cardBadgeKey = badgeKey;
 							}
-							const msgLabel = getPooledText(
-								tickLabelPool,
-								tickLabelContainer,
-								labelIdx,
-								sc.msgStyle,
-							);
-							// Truncate to fit available lines
-							const charsPerLine = Math.max(4, Math.floor(wrapPx / 6));
-							const maxChars = charsPerLine * maxLines;
-							msgLabel.text = msg.length > maxChars ? `${msg.slice(0, maxChars)}…` : msg;
-							msgLabel.scale.set(counterScaleX, 1);
-							if (isH) {
-								msgLabel.position.set(tick.x + 4 / cam.scale, msgTopOffset);
-							} else {
-								msgLabel.position.set(msgTopOffset, tick.x + 4 / cam.scale);
+							const detailAlpha = Math.min(1, (screenH - 36) / 20) * cb;
+
+							// Status dot + label
+							const statusColor = themeStatusColor(theme, ch.status);
+							const dotY = nodeTop + 24;
+							targetGfx
+								.circle(nodeLeft + 12, dotY + 4, 3)
+								.fill({ color: statusColor, alpha: morph.opacity * detailAlpha });
+
+							const statusLabel = labelPool.acquire(sc.cardBadgeStyle);
+							statusLabel.text = ch.status;
+							statusLabel.alpha = morph.opacity * 0.8 * detailAlpha;
+							statusLabel.scale.set(1);
+							statusLabel.position.set(nodeLeft + 18, dotY);
+
+							// Narrator status (if any)
+							if (ch.narratorStatus) {
+								const nsColor = narratorStatusColor(theme, ch.narratorStatus);
+								const nsX = nodeLeft + 18 + (ch.status?.length ?? 0) * 5.5 + 10;
+								targetGfx
+									.circle(nsX, dotY + 4, 2.5)
+									.fill({ color: nsColor, alpha: morph.opacity * detailAlpha });
+								const nsLabel = labelPool.acquire(sc.cardBadgeStyle);
+								nsLabel.text = ch.narratorStatus;
+								nsLabel.alpha = morph.opacity * 0.6 * detailAlpha;
+								nsLabel.scale.set(1);
+								nsLabel.position.set(nsX + 6, dotY);
 							}
-							labelIdx++;
+
+							// Branch name — only when card is tall enough
+							if (screenH > 52) {
+								const branchAlpha = Math.min(1, (screenH - 52) / 16) * cb;
+								const branchLabel = labelPool.acquire(sc.cardBadgeStyle);
+								const maxBranchChars = Math.max(
+									4,
+									Math.floor((screenW - 16) / (badgeFontSize * 0.55)),
+								);
+								branchLabel.text =
+									(ch.branch?.length ?? 0) > maxBranchChars
+										? `${ch.branch.slice(0, maxBranchChars)}…`
+										: (ch.branch ?? "");
+								branchLabel.alpha = morph.opacity * 0.5 * branchAlpha;
+								branchLabel.scale.set(1);
+								branchLabel.position.set(nodeLeft + 8, nodeTop + 40);
+							}
 						}
-					}
-				}
-				hidePooledTexts(tickLabelPool, labelIdx);
-			} else if (tickLabelContainer) {
-				hidePooledTexts(tickLabelPool, 0);
-			}
 
-			// --- Draw heatmap (L0 only) ---
-			if (d.zoomTier === "L0" && d.clusters.length > 0) {
-				drawHeatmap(heatGfx, theme, d.clusters, trackH);
-			}
-
-			// --- Draw segment backgrounds ---
-			for (const tick of d.layout.ticks) {
-				if (!tick.segment) continue;
-				if (tick.x > cullEnd) break;
-				const nextTick = d.layout.ticks[tick.index + 1];
-				const segW = nextTick ? nextTick.x - tick.x : 400;
-				if (tick.x + segW < cullStart) continue;
-
-				const crossSize = (isH ? d.containerHeight : d.containerWidth) / cam.scale;
-				drawSegmentBg(segBgGfx, theme, tick.x, 0, segW, crossSize);
-			}
-
-			// --- Draw morph elements + connectors ---
-			const pillLabelContainer = pillLabelContainerRef.current;
-			const pillLabelPool = pillLabelPoolRef.current;
-			let pillLabelIdx = 0;
-
-			for (const ch of d.chapters) {
-				const worldX = ch.segMainPos + ch.layoutX + NODE_WIDTH / 2;
-				const t = getMorphFactor(cam.scale, worldX, d.zoomCenterWorldX, d.viewportWorldWidth);
-				if (t <= 0) continue;
-
-				const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
-
-				// Don't draw morph if showCardBody — React DOM handles that
-				if (!morph.showCardBody) {
-					const centerFade = t < 0.7 ? 1 : Math.max(0, 1 - (t - 0.7) / 0.3);
-					const centerOffsetX = (NODE_WIDTH - morph.width) / 2;
-					const centerOffsetY = (NODE_HEIGHT - morph.height) / 2;
-					const cx =
-						ch.segMainPos +
-						ch.layoutX +
-						NODE_WIDTH / 2 +
-						centerOffsetX * centerFade -
-						centerOffsetX;
-					const cy =
-						ch.layoutY +
-						CARD_TOP_OFFSET +
-						NODE_HEIGHT / 2 +
-						centerOffsetY * centerFade -
-						centerOffsetY;
-
-					drawMorph(morphGfx, theme, morph, cx, cy, ch.status, cam.scale);
-
-					// Pill title text (only when titleOpacity > 0 and pill is wide enough)
-					const screenToWorld = morph.titleOpacity;
-					const counterScale = 1 + (1 / cam.scale - 1) * (1 - screenToWorld);
-					const pillW = morph.width * counterScale;
-					const pillH = morph.height * counterScale;
-
-					if (morph.titleOpacity > 0 && pillW * cam.scale > 30 && pillLabelContainer) {
-						const pillFontSize = Math.round(morph.titleFontSize * 2) / 2; // snap to 0.5px
-						const pillKey = `${pillFontSize}:${theme.dimmed}`;
-						const sc = cachedStylesRef.current;
-						if (sc.pillKey !== pillKey || !sc.pillStyle) {
-							sc.pillStyle = new TextStyle({
-								fontSize: pillFontSize,
-								fill: theme.dimmed,
-								fontFamily: "sans-serif",
-							});
-							sc.pillKey = pillKey;
-						}
-						const label = getPooledText(
-							pillLabelPool,
-							pillLabelContainer,
-							pillLabelIdx,
-							sc.pillStyle,
-						);
-						const maxChars = Math.max(
-							2,
-							Math.floor((pillW * cam.scale - 22) / (morph.titleFontSize * 0.55)),
-						);
-						const title = ch.title.length > maxChars ? `${ch.title.slice(0, maxChars)}…` : ch.title;
-						label.text = title;
-						label.alpha = morph.opacity * morph.titleOpacity;
-						label.scale.set(counterScale);
-						const left = cx - pillW / 2;
-						const top = cy - pillH / 2;
-						label.position.set(
-							left + 18 * counterScale,
-							top + (pillH - morph.titleFontSize * counterScale) / 2,
-						);
-						pillLabelIdx++;
-					}
-				}
-
-				// Connector lines (all morph stages)
-				const lineOpacity = t * (ch.status === "merged" ? 0.25 : 0.45);
-				if (ch.startCommitSha && lineOpacity > 0.01) {
-					const forkTickMain = d.tickPositions.get(ch.startCommitSha);
-					if (forkTickMain != null) {
-						const centerFade = t < 0.7 ? 1 : Math.max(0, 1 - (t - 0.7) / 0.3);
-						const centerOffsetX = (NODE_WIDTH - morph.width) / 2;
-						const centerOffsetY = (NODE_HEIGHT - morph.height) / 2;
-						const elemLeft = ch.segMainPos + ch.layoutX + centerOffsetX * centerFade;
-						const elemTop = ch.layoutY + CARD_TOP_OFFSET + centerOffsetY * centerFade;
-						const elemCenterCross = isH ? elemTop + morph.height / 2 : elemLeft + morph.width / 2;
-						const elemLeadMain = isH ? elemLeft : elemTop;
-
-						drawConnector(
-							connGfx,
-							theme,
-							forkTickMain,
-							elemLeadMain,
-							elemCenterCross,
-							-trackH / cam.scale,
-							isH,
-							cam.scale,
-							lineOpacity,
-						);
-					}
-				}
-
-				// Merge connector
-				if (ch.status === "merged" && ch.mergeCommitSha) {
-					const mergeTickMain = d.tickPositions.get(ch.mergeCommitSha);
-					if (mergeTickMain != null) {
-						const centerFade = t < 0.7 ? 1 : Math.max(0, 1 - (t - 0.7) / 0.3);
-						const centerOffsetX = (NODE_WIDTH - morph.width) / 2;
-						const centerOffsetY = (NODE_HEIGHT - morph.height) / 2;
-						const elemLeft = ch.segMainPos + ch.layoutX + centerOffsetX * centerFade;
-						const elemTop = ch.layoutY + CARD_TOP_OFFSET + centerOffsetY * centerFade;
-						const elemCenterCross = isH ? elemTop + morph.height / 2 : elemLeft + morph.width / 2;
-						const elemTrailMain = isH ? elemLeft + morph.width : elemTop + morph.height;
-
-						drawConnector(
-							connGfx,
-							theme,
-							mergeTickMain,
-							elemTrailMain,
-							elemCenterCross,
-							-trackH / cam.scale,
-							isH,
-							cam.scale,
-							t * 0.25,
-						);
+						// Flush card slot's labels immediately (each slot is self-contained)
+						if (drawGfx) labelPool.flush();
 					}
 				}
 			}
 
-			// Hide unused pill labels
-			if (pillLabelContainer) {
-				hidePooledTexts(pillLabelPool, pillLabelIdx);
+			// --- Connector lines (all morph stages, unified position) ---
+			const lineOpacity = t * (ch.status === "merged" ? 0.25 : 0.45);
+			if (ch.startCommitSha && lineOpacity > 0.01) {
+				const forkTickMain = d.tickPositions.get(ch.startCommitSha);
+				if (forkTickMain != null) {
+					const forkScreenMain = toScreen(forkTickMain);
+
+					drawConnector(
+						connGfx,
+						theme,
+						forkScreenMain,
+						elemScreenLeft,
+						elemScreenCenterCross,
+						rulerEdgeCrossScreen,
+						isH,
+						1, // screen space — fixed stroke width
+						lineOpacity,
+					);
+				}
 			}
 
-			// Render
-			app.render();
-		},
-		[getPooledText, hidePooledTexts],
-	);
+			// Merge connector
+			if (ch.status === "merged" && ch.mergeCommitSha) {
+				const mergeTickMain = d.tickPositions.get(ch.mergeCommitSha);
+				if (mergeTickMain != null) {
+					const mergeScreenMain = toScreen(mergeTickMain);
+
+					drawConnector(
+						connGfx,
+						theme,
+						mergeScreenMain,
+						elemScreenRight,
+						elemScreenCenterCross,
+						rulerEdgeCrossScreen,
+						isH,
+						1, // screen space — fixed stroke width
+						t * 0.25,
+					);
+				}
+			}
+		}
+
+		// Flush unused chapter labels and card containers
+		chapterPool?.flush();
+		cardPool?.flush();
+
+		// Render
+		app.render();
+	}, []);
 
 	// --- Watch for Mantine theme changes ---
 	useEffect(() => {
@@ -696,10 +883,18 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		pixiRef,
 		() => ({
 			updateCamera(cam: Camera) {
+				latestCameraRef.current = cam;
 				redraw(cam);
 			},
 			render() {
 				appRef.current?.render();
+			},
+			updateChapters(chs: PixiChapterInfo[]) {
+				chaptersOverrideRef.current = chs;
+				redraw(latestCameraRef.current);
+			},
+			getCardHitRects() {
+				return cardHitRectsRef.current;
 			},
 		}),
 		[redraw],
@@ -708,6 +903,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	// Full redraw when data changes (React re-render path)
 	// biome-ignore lint/correctness/useExhaustiveDependencies: data read from refs
 	useEffect(() => {
+		latestCameraRef.current = camera;
 		redraw(camera);
 	}, [
 		pixiReady,
@@ -717,13 +913,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		chapters,
 		zoomTier,
 		clusters,
-		scale,
-		zoomCenterWorldX,
-		viewportWorldWidth,
 		tickPositions,
 		orientation,
 		rulerThickness,
 		commitMessages,
+		alwaysVisibleChapters,
 		redraw,
 	]);
 

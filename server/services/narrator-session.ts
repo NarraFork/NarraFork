@@ -3232,19 +3232,34 @@ export async function retryLastMessage(
 }
 
 /**
- * Continue the agent loop without creating a new user message.
- * Used when the last message is an assistant message with pending tool calls —
- * buildHistory will detect the trailing tool_use blocks and produce
- * trailingToolResults so the loop picks up where it left off.
+ * Continue the agent loop.
  *
- * If the last message is NOT an assistant tool_use, the caller should send
- * a regular user message instead (handled on the frontend side).
+ * If the last assistant message contains pending tool_use blocks, resumes
+ * the loop directly (buildHistory produces trailingToolResults).
+ *
+ * Otherwise (e.g. the assistant's text reply was truncated), sends a
+ * locale-aware "please continue" user message via feedMessage so the
+ * model receives a properly localised prompt.
  */
-export async function continueLastToolUse(
+export async function continueNarrator(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ ok: boolean }> {
+	// Check whether the last assistant message has trailing tool_use blocks.
+	const msgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const lastAssistant = msgs.findLast((m) => m.role === "assistant");
+	const blocks = Array.isArray(lastAssistant?.contentJson) ? lastAssistant!.contentJson : [];
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const hasTrailingToolUse = blocks.some((b: any) => b.type === "tool_use");
+
+	if (!hasTrailingToolUse) {
+		// No pending tool calls — send a localised "continue" user message instead.
+		const continueText = getToolMessage("interruptionContinue", locale);
+		await feedMessage(narratorId, continueText, undefined, locale, replyInUserLanguage);
+		return { ok: true };
+	}
+
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "thinking");
 

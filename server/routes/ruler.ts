@@ -78,6 +78,8 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			role: true,
 			startCommitSha: true,
 			mergeCommitSha: true,
+			axisOffset: true,
+			crossOffset: true,
 		},
 	});
 
@@ -159,6 +161,8 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 				startCommitSha: ch.startCommitSha,
 				narratorId: narrator?.id ?? null,
 				narratorStatus: narrator?.status ?? null,
+				axisOffset: ch.axisOffset ?? 0,
+				crossOffset: ch.crossOffset ?? 0,
 			};
 		});
 

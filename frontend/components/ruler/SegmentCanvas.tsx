@@ -1,12 +1,12 @@
-import { Badge, Box, Card, Group, Loader, Text } from "@mantine/core";
+import { Box, Card, Text } from "@mantine/core";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { RulerSegment } from "../../hooks/useRuler";
 import { api } from "../../lib/api";
-import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
+import { localScale } from "./fisheye";
 import type { RulerOrientation } from "./types";
-import { getCardModeForChapter, getMorphFactor, getMorphStyle } from "./zoom-tiers";
+import { getCardModeForChapter } from "./zoom-tiers";
 
 /** Active segments refresh faster; historical ones can be stale longer. */
 function getSegmentStaleTime(segment: RulerSegment): number {
@@ -45,6 +45,7 @@ export interface CardWorldInfo {
 	worldW: number;
 	worldH: number;
 	status: string;
+	narratorStatus: string | null;
 }
 
 export interface ChapterContextMenuState {
@@ -78,8 +79,14 @@ interface SegmentCanvasProps {
 	onFitToView?: (worldX: number, worldY: number, worldW: number, worldH: number) => void;
 	/** World-space X of the zoom center (for morph proximity) */
 	zoomCenterWorldX?: number;
-	/** World-space width of the viewport (for morph proximity) */
-	viewportWorldWidth?: number;
+	/** Screen-space size of the viewport along the main axis (for fisheye) */
+	viewportSize?: number;
+	/** Screen-space main-axis position of this segment (fisheye-mapped) */
+	screenMainPos?: number;
+	/** Screen-space main-axis size of this segment (fisheye-mapped) */
+	screenMainSize?: number;
+	/** Screen-space cross-axis offset (crossPan + rulerThickness) */
+	screenCrossOffset?: number;
 	/** Callback when chapters are loaded for a segment */
 	onChaptersLoaded?: (
 		fromSha: string,
@@ -87,6 +94,27 @@ interface SegmentCanvasProps {
 			id: string;
 			status: string;
 			title: string;
+			branch: string;
+			role: string;
+			narratorId: string | null;
+			narratorStatus: string | null;
+			startCommitSha: string | null;
+			mergeCommitSha?: string | null;
+			layoutX: number;
+			layoutY: number;
+		}>,
+	) => void;
+	/** Lightweight callback during card drag — updates PixiJS without React re-render */
+	onChapterDragMove?: (
+		fromSha: string,
+		chapters: Array<{
+			id: string;
+			status: string;
+			title: string;
+			branch: string;
+			role: string;
+			narratorId: string | null;
+			narratorStatus: string | null;
 			startCommitSha: string | null;
 			mergeCommitSha?: string | null;
 			layoutX: number;
@@ -102,10 +130,6 @@ const DEFAULT_PANEL_HEIGHT = 520;
 const MIN_PANEL_WIDTH = 300;
 const MIN_PANEL_HEIGHT = 200;
 const CARD_TOP_OFFSET = 30;
-/** Cards (collapsed) are rendered within 3× the cross-axis viewport */
-const CARD_CROSS_MULTIPLIER = 3;
-/** Expanded narrator panels are rendered within 1.5× the cross-axis viewport */
-const PANEL_CROSS_MULTIPLIER = 1.5;
 
 export const SegmentCanvas = memo(
 	function SegmentCanvas({
@@ -117,26 +141,21 @@ export const SegmentCanvas = memo(
 		segment: _segment,
 		scale = 1,
 		orientation = "horizontal",
-		viewTop = 0,
-		viewHeight = 800,
-		cardRegistry,
-		onChapterContextMenu,
 		onFitToView,
 		zoomCenterWorldX = 0,
-		viewportWorldWidth = 1200,
+		viewportSize = 1200,
+		screenMainPos,
+		screenCrossOffset = 0,
 		onChaptersLoaded,
+		onChapterDragMove: _onChapterDragMove,
 	}: SegmentCanvasProps) {
 		const queryClient = useQueryClient();
 		const isH = orientation === "horizontal";
 
 		// Determine data detail level based on segment center's card mode
 		const segCenterWorld = mainPos + mainSize / 2;
-		const segCardMode = getCardModeForChapter(
-			scale,
-			segCenterWorld,
-			zoomCenterWorldX,
-			viewportWorldWidth,
-		);
+		const segEffectiveScale = localScale(segCenterWorld, zoomCenterWorldX, viewportSize, scale);
+		const segCardMode = getCardModeForChapter(segEffectiveScale);
 		const needsFull = segCardMode === "full";
 
 		const { data, isLoading } = useQuery({
@@ -152,8 +171,8 @@ export const SegmentCanvas = memo(
 			placeholderData: _segment.activeChapterCount === 0 ? keepPreviousData : undefined,
 		});
 
-		const [openNarratorId, setOpenNarratorId] = useState<string | null>(null);
-		const prevOpenNarratorIdRef = useRef<string | null>(null);
+		const [openNarratorIds, setOpenNarratorIds] = useState<Set<string>>(new Set());
+		const prevOpenNarratorIdsRef = useRef<Set<string>>(new Set());
 
 		const chapters = data?.chapters ?? [];
 
@@ -190,35 +209,6 @@ export const SegmentCanvas = memo(
 			});
 		}, [chapters, mainSize, isH]);
 
-		// Write card world positions to shared registry (no re-render)
-		const cardInfos = useMemo(
-			() =>
-				laid.map((ch) => {
-					const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
-					const rawW = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : NODE_WIDTH;
-					const rawH = isPanelOpen ? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT) : NODE_HEIGHT;
-					return {
-						id: ch.id,
-						title: ch.title,
-						worldX: (isH ? mainPos : 0) + ch.layoutX,
-						worldY: (isH ? 0 : mainPos) + ch.layoutY + CARD_TOP_OFFSET,
-						worldW: rawW,
-						worldH: rawH,
-						status: ch.status,
-					};
-				}),
-			[laid, mainPos, isH, openNarratorId],
-		);
-
-		useEffect(() => {
-			if (cardRegistry) {
-				cardRegistry.current.set(fromSha, cardInfos);
-				return () => {
-					cardRegistry.current.delete(fromSha);
-				};
-			}
-		}, [cardInfos, cardRegistry, fromSha]);
-
 		// Report chapter data to parent for PixiJS rendering
 		useEffect(() => {
 			if (onChaptersLoaded && laid.length > 0) {
@@ -228,6 +218,10 @@ export const SegmentCanvas = memo(
 						id: ch.id,
 						status: ch.status,
 						title: ch.title,
+						branch: ch.branch,
+						role: ch.role,
+						narratorId: ch.narratorId,
+						narratorStatus: ch.narratorStatus,
 						startCommitSha: ch.startCommitSha,
 						mergeCommitSha: ch.mergeCommitSha,
 						layoutX: ch.layoutX,
@@ -249,200 +243,99 @@ export const SegmentCanvas = memo(
 
 		// When a narrator panel opens, request the parent to fit the expanded card into view
 		useEffect(() => {
-			const prev = prevOpenNarratorIdRef.current;
-			prevOpenNarratorIdRef.current = openNarratorId;
-			if (!openNarratorId || openNarratorId === prev || !onFitToView) return;
-			const ch = laid.find((c) => c.narratorId === openNarratorId);
-			if (!ch) return;
-			const panelW = ch.panelWidth ?? DEFAULT_PANEL_WIDTH;
-			const panelH = ch.panelHeight ?? DEFAULT_PANEL_HEIGHT;
-			// Card world position: mainPos offsets the segment, +30 is the card top offset
-			const worldX = (isH ? mainPos : 0) + ch.layoutX;
-			const worldY = (isH ? 0 : mainPos) + ch.layoutY + CARD_TOP_OFFSET;
-			onFitToView(worldX, worldY, panelW, panelH);
-		}, [openNarratorId, laid, mainPos, isH, onFitToView]);
+			const prev = prevOpenNarratorIdsRef.current;
+			prevOpenNarratorIdsRef.current = openNarratorIds;
+			if (!onFitToView) return;
+			// Find newly added narrator IDs
+			for (const id of openNarratorIds) {
+				if (!prev.has(id)) {
+					const ch = laid.find((c) => c.narratorId === id);
+					if (!ch) continue;
+					const panelW = ch.panelWidth ?? DEFAULT_PANEL_WIDTH;
+					const panelH = ch.panelHeight ?? DEFAULT_PANEL_HEIGHT;
+					const worldX = (isH ? mainPos : 0) + ch.layoutX;
+					const worldY = (isH ? 0 : mainPos) + ch.layoutY + CARD_TOP_OFFSET;
+					onFitToView(worldX, worldY, panelW, panelH);
+					break; // fit the first newly opened one
+				}
+			}
+		}, [openNarratorIds, laid, mainPos, isH, onFitToView]);
 
-		// Segment spans the full visible viewport in the cross-axis direction
-		const segCrossStart = viewTop - 20;
-		const segCrossSize = viewHeight + 40;
+		// PixiJS handles all card/morph rendering.
+		// React only renders open narrator panels.
+		const hasOpenPanel = laid.some((ch) => ch.narratorId && openNarratorIds.has(ch.narratorId));
 
-		// Compute per-chapter morph — only render ChapterCard when showCardBody=true
-		// PixiJS handles dot/pill/connector rendering
-		const chapterMorphs = useMemo(
-			() =>
-				laid.map((ch) => {
-					const worldX = (isH ? mainPos : 0) + ch.layoutX + NODE_WIDTH / 2;
-					const t = getMorphFactor(scale, worldX, zoomCenterWorldX, viewportWorldWidth);
-					const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
-					return { ch, t, morph };
-				}),
-			[laid, isH, mainPos, scale, zoomCenterWorldX, viewportWorldWidth],
-		);
-
-		// If no chapter needs card body, render minimal container
-		const anyShowCard = chapterMorphs.some((m) => m.morph.showCardBody);
-		if (!anyShowCard && !isLoading) {
-			// Transparent container — PixiJS draws everything
-			return (
-				<Box
-					style={{
-						position: "absolute",
-						pointerEvents: "none",
-						...(isH
-							? { left: mainPos, top: segCrossStart, width: mainSize, height: segCrossSize }
-							: { top: mainPos, left: segCrossStart, height: mainSize, width: segCrossSize }),
-					}}
-				/>
-			);
-		}
-
-		// --- Full mode: interactive cards with panels ---
-		const containerStyle: React.CSSProperties = {
-			position: "absolute",
-			pointerEvents: "none",
-		};
-		if (isH) {
-			Object.assign(containerStyle, {
-				left: mainPos,
-				top: segCrossStart,
-				width: mainSize,
-				height: segCrossSize,
-			});
-		} else {
-			Object.assign(containerStyle, {
-				top: mainPos,
-				left: segCrossStart,
-				height: mainSize,
-				width: segCrossSize,
-			});
+		if (!hasOpenPanel && !isLoading) {
+			// Nothing to render in React — PixiJS handles everything
+			return null;
 		}
 
 		return (
-			<Box style={containerStyle}>
-				<Box
-					style={{
-						position: "relative",
-						...(isH ? { top: -segCrossStart } : { left: -segCrossStart }),
-						pointerEvents: "auto",
-					}}
-				>
-					{isLoading && (
-						<Box style={{ display: "flex", justifyContent: "center", paddingTop: 40 }}>
-							<Loader size="sm" />
-						</Box>
-					)}
+			<>
+				{laid.map((ch) => {
+					if (!ch.narratorId || !openNarratorIds.has(ch.narratorId)) return null;
 
-					{chapterMorphs.map(({ ch, morph }) => {
-						// Only render ChapterCard when morph says showCardBody
-						if (!morph.showCardBody) return null;
+					const panelW = ch.panelWidth ?? DEFAULT_PANEL_WIDTH;
+					const panelH = ch.panelHeight ?? DEFAULT_PANEL_HEIGHT;
 
-						const isPanelOpen = openNarratorId === ch.narratorId && !!ch.narratorId;
-						const cardWidth = isPanelOpen ? (ch.panelWidth ?? DEFAULT_PANEL_WIDTH) : morph.width;
-						const cardHeight = isPanelOpen
-							? (ch.panelHeight ?? DEFAULT_PANEL_HEIGHT)
-							: morph.height;
+					// Position panel in screen coordinates
+					const panelScreenX = screenMainPos != null ? screenMainPos + ch.layoutX : ch.layoutX;
+					const panelScreenY = (ch.layoutY + CARD_TOP_OFFSET) * scale + screenCrossOffset;
 
-						// Cross-axis visibility culling
-						const visualH = cardHeight;
-						const multiplier = isPanelOpen ? PANEL_CROSS_MULTIPLIER : CARD_CROSS_MULTIPLIER;
-						const bufferHalf = (viewHeight * multiplier - viewHeight) / 2;
-						const cullTop = viewTop - bufferHalf;
-						const cullBottom = viewTop + viewHeight + bufferHalf;
-						const cardTop = ch.layoutY + CARD_TOP_OFFSET;
-						const cardBottom = cardTop + visualH;
-						if (cardBottom < cullTop || cardTop > cullBottom) return null;
-
-						// Center-fade: smooth transition from centered (morph) to top-left (card)
-						const centerFade = morph.showCardBody
-							? Math.max(0, 1 - (morph.width - 160) / (NODE_WIDTH - 160))
-							: 1;
-						const centerOffsetX = ((NODE_WIDTH - morph.width) / 2) * centerFade;
-						const centerOffsetY = ((NODE_HEIGHT - morph.height) / 2) * centerFade;
-
-						return (
-							<Box key={ch.id}>
-								<ChapterCard
-									chapter={ch}
-									x={ch.layoutX + centerOffsetX}
-									y={ch.layoutY + centerOffsetY}
-									width={cardWidth}
-									height={cardHeight}
-									isPanelOpen={isPanelOpen}
-									scale={scale}
-									onClick={() => {
-										if (ch.narratorId) {
-											setOpenNarratorId(openNarratorId === ch.narratorId ? null : ch.narratorId);
-										}
-									}}
-									onContextMenu={(e) => {
-										e.preventDefault();
-										e.stopPropagation();
-										onChapterContextMenu?.({
-											x: e.clientX,
-											y: e.clientY,
-											chapter: ch,
-											fromSha,
-										});
-									}}
-									onDragEnd={(newX, newY) => {
-										const clampedY = Math.max(0, newY);
-										const qk = ["rulerSegment", projectId, fromSha, needsFull ? "full" : "summary"];
-										queryClient.setQueryData<SegmentData>(qk, (old) => {
-											if (!old) return old;
-											return {
-												...old,
-												chapters: old.chapters.map((c) =>
-													c.id === ch.id ? { ...c, axisOffset: newX, crossOffset: clampedY } : c,
-												),
-											};
-										});
-										api.updateRulerPositions(projectId, [
-											{
-												chapterId: ch.id,
-												anchorCommitSha: ch.anchorCommitSha ?? fromSha,
-												axisOffset: newX,
-												crossOffset: clampedY,
-											},
-										]);
-									}}
-									onResizeEnd={(newW, newH, dx, dy) => {
-										const newAxisOffset = ch.layoutX + dx;
-										const newCrossOffset = Math.max(0, ch.layoutY + dy);
-										const qk = ["rulerSegment", projectId, fromSha, needsFull ? "full" : "summary"];
-										queryClient.setQueryData<SegmentData>(qk, (old) => {
-											if (!old) return old;
-											return {
-												...old,
-												chapters: old.chapters.map((c) =>
-													c.id === ch.id
-														? {
-																...c,
-																panelWidth: newW,
-																panelHeight: newH,
-																axisOffset: newAxisOffset,
-																crossOffset: newCrossOffset,
-															}
-														: c,
-												),
-											};
-										});
-										api.updateRulerPositions(projectId, [
-											{
-												chapterId: ch.id,
-												anchorCommitSha: ch.anchorCommitSha ?? fromSha,
-												axisOffset: newAxisOffset,
-												crossOffset: newCrossOffset,
-												width: newW,
-												height: newH,
-											},
-										]);
-									}}
-								/>
-							</Box>
-						);
-					})}
-				</Box>
-			</Box>
+					return (
+						<NarratorPanelOverlay
+							key={ch.id}
+							chapter={ch}
+							narratorId={ch.narratorId}
+							screenX={panelScreenX}
+							screenY={panelScreenY}
+							width={panelW}
+							height={panelH}
+							scale={scale}
+							onClose={() => {
+								setOpenNarratorIds((prev) => {
+									const next = new Set(prev);
+									// biome-ignore lint/style/noNonNullAssertion: checked above
+									next.delete(ch.narratorId!);
+									return next;
+								});
+							}}
+							onResizeEnd={(newW, newH, dx, dy) => {
+								const newAxisOffset = ch.layoutX + dx;
+								const newCrossOffset = Math.max(0, ch.layoutY + dy);
+								const qk = ["rulerSegment", projectId, fromSha, needsFull ? "full" : "summary"];
+								queryClient.setQueryData<SegmentData>(qk, (old) => {
+									if (!old) return old;
+									return {
+										...old,
+										chapters: old.chapters.map((c) =>
+											c.id === ch.id
+												? {
+														...c,
+														axisOffset: newAxisOffset,
+														crossOffset: newCrossOffset,
+														panelWidth: newW,
+														panelHeight: newH,
+													}
+												: c,
+										),
+									};
+								});
+								api.updateRulerPositions(projectId, [
+									{
+										chapterId: ch.id,
+										anchorCommitSha: ch.anchorCommitSha ?? fromSha,
+										axisOffset: newAxisOffset,
+										crossOffset: newCrossOffset,
+										width: newW,
+										height: newH,
+									},
+								]);
+							}}
+						/>
+					);
+				})}
+			</>
 		);
 	},
 	(prev, next) => {
@@ -455,99 +348,63 @@ export const SegmentCanvas = memo(
 		if (prev.mainSize !== next.mainSize) return false;
 		if (prev.segment !== next.segment) return false;
 		if (prev.orientation !== next.orientation) return false;
-		if (prev.cardRegistry !== next.cardRegistry) return false;
-		if (prev.onChapterContextMenu !== next.onChapterContextMenu) return false;
 		if (prev.onFitToView !== next.onFitToView) return false;
-		if (prev.viewTop !== next.viewTop) return false;
-		if (prev.viewHeight !== next.viewHeight) return false;
 		if (prev.scale !== next.scale) return false;
 		if (prev.zoomCenterWorldX !== next.zoomCenterWorldX) return false;
-		if (prev.viewportWorldWidth !== next.viewportWorldWidth) return false;
+		if (prev.viewportSize !== next.viewportSize) return false;
+		if (prev.screenMainPos !== next.screenMainPos) return false;
+		if (prev.screenCrossOffset !== next.screenCrossOffset) return false;
 		if (prev.onChaptersLoaded !== next.onChaptersLoaded) return false;
+		if (prev.onChapterDragMove !== next.onChapterDragMove) return false;
 		return true;
 	},
 );
 
-function ChapterCard({
+/** Floating narrator panel overlay — rendered when user clicks a card in PixiJS */
+function NarratorPanelOverlay({
 	chapter,
-	x,
-	y,
-	width: cardWidth,
-	height,
-	isPanelOpen,
+	narratorId,
+	screenX,
+	screenY,
+	width: panelW,
+	height: panelH,
 	scale,
-	onClick,
-	onContextMenu,
-	onDragEnd,
+	onClose,
 	onResizeEnd,
 }: {
-	chapter: SegmentChapter & { layoutX: number; layoutY: number };
-	x: number;
-	y: number;
+	chapter: { id: string; title: string };
+	narratorId: string;
+	screenX: number;
+	screenY: number;
 	width: number;
 	height: number;
-	isPanelOpen?: boolean;
 	scale: number;
-	onClick?: () => void;
-	onContextMenu: (e: React.MouseEvent) => void;
-	onDragEnd?: (newX: number, newY: number) => void;
-	onResizeEnd?: (newW: number, newH: number, dx: number, dy: number) => void;
+	onClose: () => void;
+	onResizeEnd: (newW: number, newH: number, dx: number, dy: number) => void;
 }) {
-	const isActive = chapter.status === "active";
-	const isReview = chapter.role === "review";
-	const panelWheelRef = useRef<HTMLDivElement>(null);
-	const isDraggingRef = useRef(false);
-	const dragStartRef = useRef({ x: 0, y: 0, origX: 0, origY: 0 });
-	const pointerDownTargetRef = useRef<EventTarget | null>(null);
-	const headerRef = useRef<HTMLDivElement>(null);
-	const cardRef = useRef<HTMLDivElement>(null);
-	const [dragOffset, setDragOffset] = useState({ dx: 0, dy: 0 });
-
-	// Reset drag offset when props position changes (after optimistic update lands)
-	const prevPos = useRef({ x, y });
-	if (prevPos.current.x !== x || prevPos.current.y !== y) {
-		prevPos.current = { x, y };
-		if (dragOffset.dx !== 0 || dragOffset.dy !== 0) {
-			setDragOffset({ dx: 0, dy: 0 });
-		}
-	}
-
-	// Resize state
 	const isResizingRef = useRef(false);
 	const resizeStartRef = useRef({ x: 0, y: 0, origW: 0, origH: 0, corner: "" });
 	const [resizeDelta, setResizeDelta] = useState({ dw: 0, dh: 0, dx: 0, dy: 0 });
 	const resizeDeltaRef = useRef(resizeDelta);
 	resizeDeltaRef.current = resizeDelta;
-
-	// Reset resize delta when props size changes (after optimistic update lands)
-	const prevSize = useRef({ w: cardWidth, h: height });
-	if (prevSize.current.w !== cardWidth || prevSize.current.h !== height) {
-		prevSize.current = { w: cardWidth, h: height };
-		if (resizeDelta.dw !== 0 || resizeDelta.dh !== 0) {
-			setResizeDelta({ dw: 0, dh: 0, dx: 0, dy: 0 });
-		}
-	}
+	const panelWheelRef = useRef<HTMLDivElement>(null);
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
 
-	// Prevent wheel events inside the narrator panel from bubbling to the canvas
-	// and block browser Ctrl+wheel zoom
+	// Prevent wheel events inside the panel from bubbling
 	useEffect(() => {
 		const el = panelWheelRef.current;
 		if (!el) return;
 		const handler = (e: WheelEvent) => {
 			e.stopPropagation();
-			if (e.ctrlKey || e.metaKey) {
-				e.preventDefault();
-			}
+			if (e.ctrlKey || e.metaKey) e.preventDefault();
 		};
 		el.addEventListener("wheel", handler, { passive: false });
 		return () => el.removeEventListener("wheel", handler);
 	});
 
-	// Global pointer handlers for resize (must track outside the handle element)
+	// Global pointer handlers for resize
 	useEffect(() => {
-		if (!isPanelOpen) return;
 		const handleMove = (e: PointerEvent) => {
 			if (!isResizingRef.current) return;
 			const rawDx = (e.clientX - resizeStartRef.current.x) / scale;
@@ -567,12 +424,10 @@ function ChapterCard({
 				dh = -rawDy;
 				dy = rawDy;
 			}
-			// Clamp: don't let size go below minimum
 			const clampedW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + dw);
 			const clampedH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + dh);
 			const actualDw = clampedW - resizeStartRef.current.origW;
 			const actualDh = clampedH - resizeStartRef.current.origH;
-			// Adjust position offset based on clamped size change
 			if (corner.includes("l")) dx = -actualDw;
 			if (corner.includes("t")) dy = -actualDh;
 			setResizeDelta({ dw: actualDw, dh: actualDh, dx, dy });
@@ -583,7 +438,7 @@ function ChapterCard({
 			const d = resizeDeltaRef.current;
 			const newW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + d.dw);
 			const newH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + d.dh);
-			onResizeEnd?.(newW, newH, d.dx, d.dy);
+			onResizeEnd(newW, newH, d.dx, d.dy);
 		};
 		window.addEventListener("pointermove", handleMove);
 		window.addEventListener("pointerup", handleUp);
@@ -591,226 +446,114 @@ function ChapterCard({
 			window.removeEventListener("pointermove", handleMove);
 			window.removeEventListener("pointerup", handleUp);
 		};
-	}, [isPanelOpen, scale, onResizeEnd]);
+	}, [scale, onResizeEnd]);
 
-	const borderColor = isPanelOpen
-		? "var(--mantine-color-indigo-3)"
-		: isReview
-			? "var(--mantine-color-yellow-6)"
-			: isActive
-				? "var(--mantine-color-indigo-6)"
-				: "light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-4))";
-
-	const currentX = x + dragOffset.dx + resizeDelta.dx;
-	const currentY = y + dragOffset.dy + resizeDelta.dy;
-	const displayW = isPanelOpen ? Math.max(MIN_PANEL_WIDTH, cardWidth + resizeDelta.dw) : cardWidth;
-	const displayH = isPanelOpen ? Math.max(MIN_PANEL_HEIGHT, height + resizeDelta.dh) : height;
+	const displayW = Math.max(MIN_PANEL_WIDTH, panelW + resizeDelta.dw);
+	const displayH = Math.max(MIN_PANEL_HEIGHT, panelH + resizeDelta.dh);
 
 	const startResize = (e: React.PointerEvent, corner: string) => {
 		e.preventDefault();
 		e.stopPropagation();
 		isResizingRef.current = true;
-		resizeStartRef.current = {
-			x: e.clientX,
-			y: e.clientY,
-			origW: cardWidth,
-			origH: height,
-			corner,
-		};
-	};
-
-	const handleStyle = (corner: string): React.CSSProperties => {
-		const isBr = corner === "br";
-		const size = isBr ? 20 : 14;
-		const base: React.CSSProperties = {
-			position: "absolute",
-			width: size,
-			height: size,
-			zIndex: 10,
-		};
-		if (corner === "tl") {
-			base.top = -2;
-			base.left = -2;
-			base.cursor = "nwse-resize";
-		} else if (corner === "tr") {
-			base.top = -2;
-			base.right = -2;
-			base.cursor = "nesw-resize";
-		} else if (corner === "bl") {
-			base.bottom = -2;
-			base.left = -2;
-			base.cursor = "nesw-resize";
-		} else {
-			base.bottom = 0;
-			base.right = 0;
-			base.cursor = "nwse-resize";
-			base.overflow = "hidden";
-		}
-		return base;
+		resizeStartRef.current = { x: e.clientX, y: e.clientY, origW: panelW, origH: panelH, corner };
 	};
 
 	return (
 		<Card
-			ref={cardRef}
 			shadow="sm"
 			padding={6}
 			radius="sm"
 			withBorder
 			style={{
 				position: "absolute",
-				left: currentX,
-				top: currentY + CARD_TOP_OFFSET,
+				left: screenX + resizeDelta.dx,
+				top: screenY + resizeDelta.dy,
 				width: displayW,
 				height: displayH,
-				borderColor,
-				borderWidth: isPanelOpen ? 2 : isReview ? 2 : 1,
-				borderStyle: isReview ? "dashed" : "solid",
-				opacity: isActive ? 1 : 0.6,
-				cursor: isDraggingRef.current ? "grabbing" : isPanelOpen ? "default" : "grab",
+				borderColor: "var(--mantine-color-indigo-3)",
+				borderWidth: 2,
+				borderStyle: "solid",
 				display: "flex",
 				flexDirection: "column",
 				overflow: "hidden",
-				transition:
-					isDraggingRef.current || isResizingRef.current
-						? "none"
-						: "width 200ms ease, height 200ms ease",
+				transition: isResizingRef.current ? "none" : "width 200ms ease, height 200ms ease",
 				userSelect: "none",
+				zIndex: 10,
+				pointerEvents: "auto",
 			}}
-			onPointerDown={(e) => {
-				// Only start drag from header area or when panel is closed (compact card)
-				if (e.button !== 0) return;
-				pointerDownTargetRef.current = e.target;
-				const headerEl = headerRef.current;
-				const isFromHeader = headerEl && e.target instanceof Node && headerEl.contains(e.target);
-				if (!isPanelOpen || isFromHeader) {
-					isDraggingRef.current = true;
-					dragStartRef.current = {
-						x: e.clientX,
-						y: e.clientY,
-						origX: currentX,
-						origY: currentY,
-					};
-					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-				}
-				e.stopPropagation();
-			}}
-			onPointerMove={(e) => {
-				if (!isDraggingRef.current) return;
-				const dx = (e.clientX - dragStartRef.current.x) / scale;
-				const dy = (e.clientY - dragStartRef.current.y) / scale;
-				setDragOffset({ dx, dy });
-			}}
-			onPointerUp={(e) => {
-				if (!isDraggingRef.current) return;
-				isDraggingRef.current = false;
-				const dx = (e.clientX - dragStartRef.current.x) / scale;
-				const dy = (e.clientY - dragStartRef.current.y) / scale;
-				const wasDrag = Math.abs(dx) > 3 || Math.abs(dy) > 3;
-				if (wasDrag) {
-					const newX = dragStartRef.current.origX + dx;
-					const newY = dragStartRef.current.origY + dy;
-					onDragEnd?.(newX, newY);
-				} else {
-					setDragOffset({ dx: 0, dy: 0 });
-					// Only toggle panel when clicking the header area, not the panel content
-					const headerEl = headerRef.current;
-					const downTarget = pointerDownTargetRef.current;
-					if (headerEl && downTarget instanceof Node && headerEl.contains(downTarget)) {
-						onClick?.();
-					}
-				}
-			}}
-			onContextMenu={onContextMenu}
 		>
-			{/* Resize handles — only when panel is open */}
-			{isPanelOpen &&
-				(["tl", "tr", "bl", "br"] as const).map((corner) => (
-					<Box
-						key={corner}
-						style={handleStyle(corner)}
-						onPointerDown={(e) => startResize(e, corner)}
-					>
-						{corner === "br" && (
-							<Box
-								style={{
-									position: "absolute",
-									bottom: 0,
-									right: 0,
-									width: 0,
-									height: 0,
-									borderStyle: "solid",
-									borderWidth: "0 0 12px 12px",
-									borderColor: "transparent transparent var(--mantine-color-indigo-5) transparent",
-									opacity: 0.6,
-								}}
-							/>
-						)}
-					</Box>
-				))}
-
-			{/* Header */}
-			<Box ref={headerRef} style={{ cursor: "pointer" }}>
-				<Text size="11px" fw={600} truncate>
-					{chapter.title}
-				</Text>
-				<Group gap={3} mt={2}>
-					<Badge size="xs" variant="light" color={isActive ? "green" : "gray"}>
-						{chapter.status}
-					</Badge>
-					{chapter.narratorStatus && (
-						<Box style={{ display: "flex", alignItems: "center", gap: 2 }}>
-							<Box
-								style={{
-									width: 4,
-									height: 4,
-									borderRadius: "50%",
-									background: `var(--mantine-color-${NARRATOR_STATUS_COLORS[chapter.narratorStatus] ?? "gray"}-5)`,
-								}}
-							/>
-							<Text size="8px" c="dimmed">
-								{chapter.narratorStatus}
-							</Text>
-						</Box>
-					)}
-				</Group>
-				{!isPanelOpen && (
-					<Text size="9px" c="dimmed" mt={2} truncate>
-						{chapter.branch}
-					</Text>
-				)}
-			</Box>
-
-			{/* Narrator panel */}
-			{isPanelOpen && chapter.narratorId && (
+			{/* Resize handles */}
+			{(["tl", "tr", "bl", "br"] as const).map((corner) => (
 				<Box
-					ref={panelWheelRef}
-					onClick={(e) => e.stopPropagation()}
-					onDoubleClick={(e) => e.stopPropagation()}
+					key={corner}
 					style={{
-						flex: 1,
-						minHeight: 0,
-						overflow: "hidden",
-						borderTop:
-							"1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
-						marginTop: 6,
-						position: "relative",
+						position: "absolute",
+						width: corner === "br" ? 20 : 14,
+						height: corner === "br" ? 20 : 14,
+						zIndex: 10,
+						...(corner === "tl" ? { top: -2, left: -2, cursor: "nwse-resize" } : {}),
+						...(corner === "tr" ? { top: -2, right: -2, cursor: "nesw-resize" } : {}),
+						...(corner === "bl" ? { bottom: -2, left: -2, cursor: "nesw-resize" } : {}),
+						...(corner === "br"
+							? { bottom: 0, right: 0, cursor: "nwse-resize", overflow: "hidden" }
+							: {}),
 					}}
+					onPointerDown={(e) => startResize(e, corner)}
 				>
-					<Box style={{ height: "100%", visibility: isCurrentlyResizing ? "hidden" : "visible" }}>
-						<StableNarratorPanel narratorId={chapter.narratorId} />
-					</Box>
-					{isCurrentlyResizing && (
+					{corner === "br" && (
 						<Box
 							style={{
 								position: "absolute",
-								inset: 0,
-								backgroundColor: "var(--mantine-color-body)",
-								opacity: 0.7,
+								bottom: 0,
+								right: 0,
+								width: 0,
+								height: 0,
+								borderStyle: "solid",
+								borderWidth: "0 0 12px 12px",
+								borderColor: "transparent transparent var(--mantine-color-indigo-5) transparent",
+								opacity: 0.6,
 							}}
 						/>
 					)}
 				</Box>
-			)}
+			))}
+
+			{/* Header */}
+			<Box style={{ cursor: "pointer" }} onClick={onClose}>
+				<Text size="11px" fw={600} truncate>
+					{chapter.title}
+				</Text>
+			</Box>
+
+			{/* Narrator panel */}
+			<Box
+				ref={panelWheelRef}
+				onClick={(e) => e.stopPropagation()}
+				onDoubleClick={(e) => e.stopPropagation()}
+				style={{
+					flex: 1,
+					minHeight: 0,
+					overflow: "hidden",
+					borderTop:
+						"1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
+					marginTop: 6,
+					position: "relative",
+				}}
+			>
+				<Box style={{ height: "100%", visibility: isCurrentlyResizing ? "hidden" : "visible" }}>
+					<StableNarratorPanel narratorId={narratorId} />
+				</Box>
+				{isCurrentlyResizing && (
+					<Box
+						style={{
+							position: "absolute",
+							inset: 0,
+							backgroundColor: "var(--mantine-color-body)",
+							opacity: 0.7,
+						}}
+					/>
+				)}
+			</Box>
 		</Card>
 	);
 }

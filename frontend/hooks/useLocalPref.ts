@@ -6,7 +6,7 @@ import { useCallback, useSyncExternalStore } from "react";
  * within the same tab via a manual notify mechanism.
  */
 
-type Key = "narrafork_fullscreen" | "narrafork_oled";
+type Key = "narrafork_fullscreen" | "narrafork_oled" | "narrafork_wakelock";
 
 const listeners = new Set<() => void>();
 

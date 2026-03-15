@@ -9,6 +9,7 @@ interface OffscreenCard {
 	worldX: number;
 	worldY: number;
 	status: string;
+	narratorStatus: string | null;
 }
 
 interface OffscreenBubblesProps {
@@ -38,6 +39,8 @@ interface MergedBubble {
 	/** Average world position of all cards in this group */
 	avgWorldX: number;
 	avgWorldY: number;
+	/** Dominant narrator status for coloring (most severe in group) */
+	narratorStatus: string;
 }
 
 const BUBBLE_MARGIN = 8;
@@ -45,6 +48,24 @@ const BUBBLE_SIZE = 28;
 const TOP_BADGE_HEIGHT = 32;
 /** Bubbles within this screen-pixel distance get merged */
 const MERGE_DISTANCE = 40;
+
+/** Only show offscreen bubbles for cards whose narrator needs attention */
+const BUBBLE_NARRATOR_STATUSES = new Set(["done", "error", "waiting"]);
+
+const BUBBLE_STATUS_COLORS: Record<string, { bg: string; border: string }> = {
+	done: {
+		bg: "var(--mantine-color-green-7)",
+		border: "var(--mantine-color-green-4)",
+	},
+	error: {
+		bg: "var(--mantine-color-red-7)",
+		border: "var(--mantine-color-red-4)",
+	},
+	waiting: {
+		bg: "var(--mantine-color-yellow-7)",
+		border: "var(--mantine-color-yellow-4)",
+	},
+};
 
 export const OffscreenBubbles = memo(function OffscreenBubbles({
 	cards,
@@ -74,6 +95,7 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 		}
 
 		// Step 1: compute raw bubble for each offscreen card
+		// Only track cards whose narrator status needs attention
 		const raw: Array<{
 			id: string;
 			title: string;
@@ -82,9 +104,13 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 			direction: Direction;
 			worldX: number;
 			worldY: number;
+			narratorStatus: string;
 		}> = [];
 
 		for (const card of cards) {
+			const ns = card.narratorStatus;
+			if (!ns || !BUBBLE_NARRATOR_STATUSES.has(ns)) continue;
+
 			const sx = card.worldX * scale + panX;
 			const sy = card.worldY * scale + panY;
 
@@ -137,6 +163,7 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 				direction,
 				worldX: card.worldX,
 				worldY: card.worldY,
+				narratorStatus: ns,
 			});
 		}
 
@@ -165,6 +192,15 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 			const avgWX = group.reduce((s, b) => s + b.worldX, 0) / group.length;
 			const avgWY = group.reduce((s, b) => s + b.worldY, 0) / group.length;
 
+			// Pick the most severe narrator status in the group: error > waiting > done
+			const statusPriority: Record<string, number> = { error: 2, waiting: 1, done: 0 };
+			let dominant = group[0].narratorStatus;
+			for (const b of group) {
+				if ((statusPriority[b.narratorStatus] ?? -1) > (statusPriority[dominant] ?? -1)) {
+					dominant = b.narratorStatus;
+				}
+			}
+
 			merged.push({
 				key: group[0].id,
 				count: group.length,
@@ -174,6 +210,7 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 				direction: group[0].direction,
 				avgWorldX: avgWX,
 				avgWorldY: avgWY,
+				narratorStatus: dominant,
 			});
 		}
 
@@ -184,33 +221,36 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 
 	return (
 		<>
-			{bubbles.map((b) => (
-				<Box
-					key={b.key}
-					style={{
-						position: "absolute",
-						left: b.screenX,
-						top: b.screenY,
-						width: BUBBLE_SIZE,
-						height: BUBBLE_SIZE,
-						borderRadius: "50%",
-						background: "var(--mantine-color-indigo-7)",
-						border: "2px solid var(--mantine-color-indigo-4)",
-						display: "flex",
-						alignItems: "center",
-						justifyContent: "center",
-						zIndex: 15,
-						cursor: "pointer",
-						boxShadow: "0 2px 8px light-dark(rgba(0,0,0,0.15), rgba(0,0,0,0.4))",
-					}}
-					title={b.titles.join("\n")}
-					onClick={() => onNavigate?.(b.avgWorldX, b.avgWorldY)}
-				>
-					<Text size="9px" c="white" fw={700}>
-						{b.count > 1 ? b.count : directionArrow(b.direction)}
-					</Text>
-				</Box>
-			))}
+			{bubbles.map((b) => {
+				const colors = BUBBLE_STATUS_COLORS[b.narratorStatus];
+				return (
+					<Box
+						key={b.key}
+						style={{
+							position: "absolute",
+							left: b.screenX,
+							top: b.screenY,
+							width: BUBBLE_SIZE,
+							height: BUBBLE_SIZE,
+							borderRadius: "50%",
+							background: colors?.bg ?? "var(--mantine-color-indigo-7)",
+							border: `2px solid ${colors?.border ?? "var(--mantine-color-indigo-4)"}`,
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "center",
+							zIndex: 15,
+							cursor: "pointer",
+							boxShadow: "0 2px 8px light-dark(rgba(0,0,0,0.15), rgba(0,0,0,0.4))",
+						}}
+						title={b.titles.join("\n")}
+						onClick={() => onNavigate?.(b.avgWorldX, b.avgWorldY)}
+					>
+						<Text size="9px" c="white" fw={700}>
+							{b.count > 1 ? b.count : directionArrow(b.direction)}
+						</Text>
+					</Box>
+				);
+			})}
 		</>
 	);
 });

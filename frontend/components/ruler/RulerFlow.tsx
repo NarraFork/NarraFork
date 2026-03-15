@@ -19,6 +19,7 @@ import {
 	findTickAtX,
 	type TickPosition,
 } from "./elastic-layout";
+import { screenToWorld, solvePanForAnchor, viewCenterFromPan, worldToScreen } from "./fisheye";
 import { OffscreenBubbles } from "./OffscreenBubbles";
 import { type PixiChapterInfo, type RulerPixiHandle, RulerPixiLayer } from "./pixi/RulerPixiLayer";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
@@ -47,6 +48,10 @@ interface Camera {
 	edge: RulerEdge;
 }
 
+const NODE_WIDTH = 220;
+const NODE_HEIGHT = 72;
+const NODE_GAP = 16;
+
 interface ClampBounds {
 	maxContentCross: number;
 	crossViewportSize: number;
@@ -61,6 +66,20 @@ function getMainBounds(opts: ClampBounds, scale: number) {
 	return { min, max };
 }
 
+/** Rubber-band: the further past the boundary, the more resistance. */
+function rubberBand(value: number, min: number, max: number, viewport: number): number {
+	const range = viewport * 0.5;
+	if (value > max) {
+		const over = value - max;
+		return max + range * (1 - 1 / (over / range + 1));
+	}
+	if (value < min) {
+		const over = min - value;
+		return min - range * (1 - 1 / (over / range + 1));
+	}
+	return value;
+}
+
 function getCrossBounds(opts: ClampBounds, scale: number) {
 	const PADDING = 200;
 	const max = 0;
@@ -72,7 +91,7 @@ function getCrossBounds(opts: ClampBounds, scale: number) {
 }
 
 /** Hard clamp — snaps to bounds. Used for navigation targets and bounce destinations. */
-function clampCamera(cam: Camera, opts?: ClampBounds): Camera {
+function clampCamera(cam: Camera, opts?: ClampBounds, soft?: boolean): Camera {
 	const isH = cam.orientation === "horizontal";
 	let mainPan = isH ? cam.panX : cam.panY;
 	let crossPan = isH ? cam.panY : cam.panX;
@@ -83,7 +102,11 @@ function clampCamera(cam: Camera, opts?: ClampBounds): Camera {
 
 		if (opts.maxContentMain > 0) {
 			const mb = getMainBounds(opts, cam.scale);
-			mainPan = Math.max(mb.min, Math.min(mb.max, mainPan));
+			if (soft) {
+				mainPan = rubberBand(mainPan, mb.min, mb.max, opts.mainViewportSize);
+			} else {
+				mainPan = Math.max(mb.min, Math.min(mb.max, mainPan));
+			}
 		}
 	}
 
@@ -172,38 +195,32 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// Only pan/scale changes use this path; layout changes still go through setCamera.
 	const applyTransformToDOM = useCallback(() => {
 		const cam = cameraRef.current;
-		const isH = cam.orientation === "horizontal";
-		const { panX: px, panY: py, scale: s } = cam;
 
-		// PixiJS layer — fast-path camera update
+		// PixiJS layer — fast-path camera update (handles all fisheye rendering)
 		pixiRef.current?.updateCamera(cam);
 
-		// Tick strip — translate + scale; update counter-scale CSS variable for ticks
+		// Tick strip — update counter-scale CSS variable
 		const strip = tickStripRef.current;
 		if (strip) {
-			strip.style.transform = isH
-				? `translateX(${px}px) scaleX(${s})`
-				: `translateY(${py}px) scaleY(${s})`;
-			strip.style.setProperty("--ruler-counter-scale", String(1 / s));
+			strip.style.setProperty("--ruler-counter-scale", String(1 / cam.scale));
 		}
 
-		// World layer (2D canvas)
-		const world = worldLayerRef.current;
-		if (world) {
-			world.style.transform = `translate(${px}px, ${py}px) scale(${s})`;
-		}
-
-		// Segment headers — each child is positioned by screen-space main coordinate
+		// Segment headers — position using fisheye
 		const hdr = headerLayerRef.current;
 		if (hdr) {
-			const mainPan = isH ? px : py;
+			const isH = cam.orientation === "horizontal";
+			const el = containerRef.current;
+			const mainViewport = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+			const mainPan = isH ? cam.panX : cam.panY;
+			const viewCenter = viewCenterFromPan(mainPan, mainViewport, cam.scale);
 			for (let i = 0; i < hdr.children.length; i++) {
 				const child = hdr.children[i] as HTMLElement;
 				const worldMain = Number(child.dataset.worldMain);
 				const worldSize = Number(child.dataset.worldSize);
 				if (Number.isNaN(worldMain)) continue;
-				const screenMain = worldMain * s + mainPan;
-				const screenSize = worldSize * s;
+				const screenMain = worldToScreen(worldMain, viewCenter, mainViewport, cam.scale);
+				const screenEnd = worldToScreen(worldMain + worldSize, viewCenter, mainViewport, cam.scale);
+				const screenSize = screenEnd - screenMain;
 				if (isH) {
 					child.style.left = `${screenMain}px`;
 					child.style.width = `${screenSize}px`;
@@ -267,6 +284,36 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const containerRef = useRef<HTMLDivElement>(null);
 	const pixiRef = useRef<RulerPixiHandle>(null);
+	const cardDragRef = useRef<{
+		active: boolean;
+		chapterId: string;
+		fromSha: string;
+		startScreenX: number;
+		startScreenY: number;
+		startLayoutX: number;
+		startLayoutY: number;
+		pointerId: number;
+	} | null>(null);
+	// Chapter data for PixiJS — populated by SegmentCanvas callbacks
+	const pixiChaptersMapRef = useRef<
+		Map<
+			string,
+			Array<{
+				id: string;
+				status: string;
+				title: string;
+				branch: string;
+				role: string;
+				narratorId: string | null;
+				narratorStatus: string | null;
+				startCommitSha: string | null;
+				mergeCommitSha?: string | null;
+				layoutX: number;
+				layoutY: number;
+			}>
+		>
+	>(new Map());
+	const [pixiChaptersTick, setPixiChaptersTick] = useState(0);
 	const wheelCleanupRef = useRef<(() => void) | null>(null);
 	const resizeObserverRef = useRef<ResizeObserver | null>(null);
 	const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
@@ -318,6 +365,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				worldW: number;
 				worldH: number;
 				status: string;
+				narratorStatus: string | null;
 			}>
 		>
 	>(new Map());
@@ -355,6 +403,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	/** Hard clamp — snap to bounds. For navigation, animation targets, etc. */
 	const hardClamp = useCallback((cam: Camera) => clampCamera(cam, getBounds()), [getBounds]);
+	const softClamp = useCallback((cam: Camera) => clampCamera(cam, getBounds(), true), [getBounds]);
 
 	/** Animate back to hard-clamped position after overscroll. */
 	const bounceRafRef = useRef(0);
@@ -408,6 +457,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		anchorScreenCross: 0,
 		animating: false,
 		rafId: 0,
+		frameCount: 0,
 	});
 
 	// Keep target in sync when camera changes from other sources (drag, navigate, etc.)
@@ -457,8 +507,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	}, [projectId, queryClient]);
 
 	/** Animate inertia after drag release. Decays velocity each frame until below threshold.
-	 *  When the camera crosses clamp bounds, friction ramps up sharply so the view
-	 *  overshoots only slightly before bouncing back. */
+	 *  Main axis: heavy damping when past clamp bounds (allows slight overscroll then bounce).
+	 *  Cross axis: hard clamp — velocity zeroed and position snapped, no overscroll allowed. */
 	const animateInertia = useCallback(
 		(vx: number, vy: number) => {
 			cancelAnimationFrame(inertiaRafRef.current);
@@ -474,29 +524,38 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				const bounds = getBounds();
 				const isH = cam.orientation === "horizontal";
 
-				// Determine per-axis friction: heavy damping when past clamp bounds
-				let frictionX = FRICTION;
-				let frictionY = FRICTION;
+				// Per-axis friction: heavy damping on main axis when past bounds
+				let frictionMain = FRICTION;
 				if (bounds) {
 					const mainPan = isH ? cam.panX : cam.panY;
-					const crossPan = isH ? cam.panY : cam.panX;
 					const mb = bounds.maxContentMain > 0 ? getMainBounds(bounds, cam.scale) : null;
+					if (mb && (mainPan < mb.min || mainPan > mb.max)) {
+						frictionMain = OVERSCROLL_FRICTION;
+					}
+
+					// Cross axis: kill velocity and clamp position immediately
+					const crossPan = isH ? cam.panY : cam.panX;
 					const cb = getCrossBounds(bounds, cam.scale);
-
-					const mainOver = mb ? mainPan < mb.min || mainPan > mb.max : false;
-					const crossOver = crossPan < cb.min || crossPan > cb.max;
-
+					const clampedCross = Math.max(cb.min, Math.min(cb.max, crossPan));
 					if (isH) {
-						if (mainOver) frictionX = OVERSCROLL_FRICTION;
-						if (crossOver) frictionY = OVERSCROLL_FRICTION;
+						velY = 0;
+						if (clampedCross !== cam.panY) {
+							cameraRef.current = { ...cam, panY: clampedCross };
+						}
 					} else {
-						if (mainOver) frictionY = OVERSCROLL_FRICTION;
-						if (crossOver) frictionX = OVERSCROLL_FRICTION;
+						velX = 0;
+						if (clampedCross !== cam.panX) {
+							cameraRef.current = { ...cam, panX: clampedCross };
+						}
 					}
 				}
 
-				velX *= frictionX;
-				velY *= frictionY;
+				// Apply friction
+				if (isH) {
+					velX *= frictionMain;
+				} else {
+					velY *= frictionMain;
+				}
 
 				if (Math.abs(velX) < MIN_VELOCITY && Math.abs(velY) < MIN_VELOCITY) {
 					// Settle — commit and bounce back to bounds
@@ -507,10 +566,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					return;
 				}
 
+				const cur = cameraRef.current;
 				cameraRef.current = {
-					...cam,
-					panX: cam.panX + velX,
-					panY: cam.panY + velY,
+					...cur,
+					panX: cur.panX + velX,
+					panY: cur.panY + velY,
 				};
 				scheduleLightRender();
 
@@ -802,7 +862,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		const isH = cam.orientation === "horizontal";
 		const mouseMain = isH ? e.clientX - rect.left : e.clientY - rect.top;
 		const mainPan = isH ? cam.panX : cam.panY;
-		const worldMain = (mouseMain - mainPan) / cam.scale;
+		const mvp = isH ? el.clientWidth : el.clientHeight;
+		const vc = viewCenterFromPan(mainPan, mvp, cam.scale);
+		const worldMain = screenToWorld(mouseMain, vc, mvp, cam.scale);
 
 		const ticks = layoutRef.current.ticks;
 		if (ticks.length === 0) return;
@@ -885,7 +947,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					// Compute world-space anchor from current (not target) camera
 					const mainPan = isH ? cam.panX : cam.panY;
 					const crossPan = isH ? cam.panY : cam.panX;
-					sz.anchorWorldMain = (canvasMouseMain - mainPan) / cam.scale;
+					const mvp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+					const vc = viewCenterFromPan(mainPan, mvp, cam.scale);
+					sz.anchorWorldMain = screenToWorld(canvasMouseMain, vc, mvp, cam.scale);
 					sz.anchorScreenMain = canvasMouseMain;
 
 					let worldMouseCross = (canvasMouseCross - crossPan) / cam.scale;
@@ -912,15 +976,22 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					// Start smooth zoom animation loop if not already running
 					if (!sz.animating) {
 						sz.animating = true;
+						sz.frameCount = 0;
 						const zoomStep = () => {
 							const cur = cameraRef.current;
 							const curIsH = cur.orientation === "horizontal";
 							const diff = sz.targetScale - cur.scale;
 							const LERP = 0.18;
+							const mvp = curIsH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
 
 							if (Math.abs(diff) < 0.001) {
 								// Close enough — snap to target
-								const newMainPan = sz.anchorScreenMain - sz.anchorWorldMain * sz.targetScale;
+								const newMainPan = solvePanForAnchor(
+									sz.anchorWorldMain,
+									sz.anchorScreenMain,
+									mvp,
+									sz.targetScale,
+								);
 								const newCrossPan = sz.anchorScreenCross - sz.anchorWorldCross * sz.targetScale;
 								cameraRef.current = hardClamp({
 									...cur,
@@ -943,7 +1014,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							}
 
 							const newScale = cur.scale + diff * LERP;
-							const newMainPan = sz.anchorScreenMain - sz.anchorWorldMain * newScale;
+							const newMainPan = solvePanForAnchor(
+								sz.anchorWorldMain,
+								sz.anchorScreenMain,
+								mvp,
+								newScale,
+							);
 							const newCrossPan = sz.anchorScreenCross - sz.anchorWorldCross * newScale;
 							cameraRef.current = hardClamp({
 								...cur,
@@ -952,8 +1028,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								scale: newScale,
 							});
 							scheduleLightRender();
-							// Commit to React state every frame so morph/LOD updates in real time
-							setCamera({ ...cameraRef.current });
+							// Commit to React state periodically (not every frame) to reduce GC pressure
+							// PixiJS handles morph/LOD in real time via updateCamera
+							sz.frameCount = (sz.frameCount ?? 0) + 1;
+							if (sz.frameCount % 6 === 0) {
+								setCamera({ ...cameraRef.current });
+							}
 							sz.rafId = requestAnimationFrame(zoomStep);
 						};
 						sz.rafId = requestAnimationFrame(zoomStep);
@@ -1109,12 +1189,18 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							cross: p.lastCenterX - (cam.edge === "start" ? rulerThickness : 0),
 						};
 
-				const worldMain = (startCenter.main - mainPan) / p.startScale;
+				const pinchMvp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+				const worldMain = screenToWorld(
+					startCenter.main,
+					viewCenterFromPan(mainPan, pinchMvp, p.startScale),
+					pinchMvp,
+					p.startScale,
+				);
 				const worldCross = (startCenter.cross - crossPan) / p.startScale;
-				const newMainPan = canvasMouseMain - worldMain * newScale;
+				const newMainPan = solvePanForAnchor(worldMain, canvasMouseMain, pinchMvp, newScale);
 				const newCrossPan = canvasMouseCross - worldCross * newScale;
 
-				cameraRef.current = hardClamp({
+				cameraRef.current = softClamp({
 					...cam,
 					panX: isH ? newMainPan : newCrossPan,
 					panY: isH ? newCrossPan : newMainPan,
@@ -1161,13 +1247,264 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		[
 			scheduleLightRender,
 			hardClamp,
+			softClamp,
 			animateBounce,
 			syncSmoothTarget,
 			updatePrefetch,
 			rulerThickness,
 		],
 	);
+
+	// --- Layout computation ---
+	const rulerData = (data as RulerData) ?? { commits: [], segments: [], activeChapters: [] };
+
+	const toggleOrientation = useCallback(() => {
+		const cam = cameraRef.current;
+		const newOri = cam.orientation === "horizontal" ? "vertical" : "horizontal";
+		const isH = newOri === "horizontal";
+		const el = containerRef.current;
+		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+		const tw = totalMainRef.current;
+		const mp = -(tw * 1) + mainVp - 40;
+		const next = hardClamp({
+			...cam,
+			orientation: newOri,
+			...(isH ? { panX: mp, panY: 0 } : { panX: 0, panY: mp }),
+		});
+		cameraRef.current = next;
+		setCamera({ ...next });
+	}, [hardClamp]);
+
+	const toggleEdge = useCallback(() => {
+		const cam = cameraRef.current;
+		const next = hardClamp({ ...cam, edge: cam.edge === "start" ? "end" : "start" });
+		cameraRef.current = next;
+		setCamera({ ...next });
+	}, [hardClamp]);
+
+	const rawCommits = rulerData.commits ?? [];
+	const commits = useMemo(() => [...rawCommits].reverse(), [rawCommits]);
+	const segments = useMemo(() => {
+		const len = rawCommits.length;
+		if (len === 0) return rulerData.segments ?? [];
+		return (rulerData.segments ?? []).map((seg) => ({
+			...seg,
+			fromIndex: len - 1 - seg.fromIndex,
+			toIndex: len - 1 - seg.toIndex,
+		}));
+	}, [rawCommits, rulerData.segments]);
+
+	const commitShas = useMemo(() => commits.map((c) => c.sha), [commits]);
+	const layout = useMemo(() => computeElasticLayout(commitShas, segments), [commitShas, segments]);
+
+	segmentsRef.current = segments;
+	layoutRef.current = layout;
+	commitShasRef.current = commitShas;
+
+	const commitByShaRef = useRef(new Map<string, (typeof commits)[number]>());
+	commitByShaRef.current = useMemo(() => {
+		const m = new Map<string, (typeof commits)[number]>();
+		for (const c of commits) m.set(c.sha, c);
+		return m;
+	}, [commits]);
+
+	totalMainRef.current = layout.totalWidth;
+
+	useEffect(() => {
+		const timer = setInterval(() => {
+			const cam = cameraRef.current;
+			const isH = cam.orientation === "horizontal";
+			const mPan = isH ? cam.panX : cam.panY;
+			const el = containerRef.current;
+			const mViewport = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+			const worldStart = -mPan / cam.scale;
+			const worldEnd = worldStart + mViewport / cam.scale;
+			const bufferSize = (worldEnd - worldStart) * 3;
+			const queries = queryClient.getQueriesData({ queryKey: ["rulerSegment", projectId] });
+			for (const [key] of queries) {
+				const fromSha = key[2] as string;
+				const tick = layout.ticks.find((t) => t.sha === fromSha);
+				if (!tick) continue;
+				if (tick.x < worldStart - bufferSize || tick.x > worldEnd + bufferSize) {
+					queryClient.removeQueries({ queryKey: key });
+				}
+			}
+		}, 60_000);
+		return () => clearInterval(timer);
+	}, [projectId, queryClient, layout.ticks]);
+
+	useEffect(() => {
+		if (!needsInitialPosition || commits.length === 0) return;
+		setNeedsInitialPosition(false);
+		const cam = cameraRef.current;
+		const isH = cam.orientation === "horizontal";
+		const el = containerRef.current;
+		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+		const mainPan = -(layout.totalWidth * cam.scale) + mainVp - 40;
+		const clamped = clampCamera(
+			{ ...cam, ...(isH ? { panX: mainPan, panY: 0 } : { panX: 0, panY: mainPan }) },
+			getBounds(),
+		);
+		cameraRef.current = clamped;
+		setCamera({ ...clamped });
+	}, [needsInitialPosition, commits.length, layout.totalWidth, getBounds]);
+
+	const tickPositions = useMemo(() => {
+		const map = new Map<string, number>();
+		for (const tick of layout.ticks) {
+			map.set(tick.sha, tick.x);
+		}
+		return map;
+	}, [layout.ticks]);
+
+	const { panX, panY, scale, orientation, edge } = camera;
+	const isHorizontal = orientation === "horizontal";
+	const containerWidth = containerSize.width || (containerRef.current?.clientWidth ?? 1200);
+	const containerHeight = containerSize.height || (containerRef.current?.clientHeight ?? 800);
+
+	const tierInfo = useMemo(() => getZoomTierInfo(scale), [scale]);
+	const zoomTier: ZoomTierId = tierInfo.tier.id;
+
+	const mainViewport = isHorizontal ? containerWidth : containerHeight;
+	const crossViewport = isHorizontal
+		? containerHeight - rulerThickness
+		: containerWidth - rulerThickness;
+	const mainPan = isHorizontal ? panX : panY;
+	const crossPan = isHorizontal ? panY : panX;
+
+	const worldViewportMain = mainViewport / scale;
+
+	const segmentTicks = useMemo(() => {
+		const worldViewStart = -mainPan / scale;
+		const segBuffer = (worldViewportMain * SEGMENT_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
+		const segStart = worldViewStart - segBuffer;
+		const segEnd = worldViewStart + worldViewportMain + segBuffer;
+		const segs: typeof layout.ticks = [];
+		for (const tick of layout.ticks) {
+			if (tick.segment) {
+				const nextTick = layout.ticks[tick.index + 1];
+				const segEndX = nextTick ? nextTick.x : tick.x + 400;
+				if (segEndX >= segStart && tick.x <= segEnd) {
+					segs.push(tick);
+				}
+			}
+		}
+		return segs;
+	}, [layout.ticks, mainPan, scale, worldViewportMain]);
+
+	const segmentBySha = useMemo(() => {
+		const map = new Map<string, RulerSegment>();
+		for (const seg of segments) map.set(seg.fromSha, seg);
+		return map;
+	}, [segments]);
+
+	const clusters = useMemo(
+		() => clusterCommits(layout.ticks, segmentBySha, scale),
+		[layout.ticks, segmentBySha, scale],
+	);
+	const worldViewTop = -crossPan / scale;
+	const worldViewHeight = crossViewport / scale;
+
+	const fisheyeCenter = viewCenterFromPan(mainPan, mainViewport, scale);
+
+	// Shared state for open narrator panels (lifted from SegmentCanvas for PixiJS interaction)
+	const [openPanelChapterIds, setOpenPanelChapterIds] = useState<Set<string>>(new Set());
+
+	const handlePixiChapterClick = useCallback((chapterId: string, _narratorId: string | null) => {
+		setOpenPanelChapterIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(chapterId)) {
+				next.delete(chapterId);
+			} else {
+				next.add(chapterId);
+			}
+			return next;
+		});
+	}, []);
+
+	const handlePixiChapterContextMenu = useCallback(
+		(chapterId: string, screenX: number, screenY: number) => {
+			for (const [_sha, chs] of pixiChaptersMapRef.current) {
+				const ch = chs.find((c) => c.id === chapterId);
+				if (ch) {
+					setChapterMenu({
+						x: screenX,
+						y: screenY,
+						chapter: ch as never,
+						fromSha: ch.startCommitSha ?? "",
+					});
+					break;
+				}
+			}
+		},
+		[],
+	);
+
+	const handlePixiChapterDragEnd = useCallback(
+		(chapterId: string, fromSha: string, newAxisOffset: number, newCrossOffset: number) => {
+			const clampedCross = Math.max(0, newCrossOffset);
+			const qk = ["rulerSegment", projectId, fromSha, "full"];
+			queryClient.setQueryData(qk, (old: unknown) => {
+				if (!old || typeof old !== "object") return old;
+				const data = old as {
+					chapters: Array<{ id: string; axisOffset: number; crossOffset: number }>;
+				};
+				return {
+					...data,
+					chapters: data.chapters.map((c) =>
+						c.id === chapterId ? { ...c, axisOffset: newAxisOffset, crossOffset: clampedCross } : c,
+					),
+				};
+			});
+			api.updateRulerPositions(projectId, [
+				{
+					chapterId,
+					anchorCommitSha: fromSha,
+					axisOffset: newAxisOffset,
+					crossOffset: clampedCross,
+				},
+			]);
+		},
+		[projectId, queryClient],
+	);
+
+	// Refs for card interaction callbacks — used in handlePointerUp via refs
+	// to avoid circular dependency in useCallback deps
+	const pixiClickRef = useRef(handlePixiChapterClick);
+	pixiClickRef.current = handlePixiChapterClick;
+	const pixiDragEndRef = useRef(handlePixiChapterDragEnd);
+	pixiDragEndRef.current = handlePixiChapterDragEnd;
+
 	const handlePointerDown = useCallback((e: React.PointerEvent) => {
+		// Check card hit first (left click only)
+		if (e.button === 0) {
+			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
+			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+			const sx = e.clientX - rect.left;
+			const sy = e.clientY - rect.top;
+			for (const hr of hitRects) {
+				if (
+					sx >= hr.screenX &&
+					sx <= hr.screenX + hr.width &&
+					sy >= hr.screenY &&
+					sy <= hr.screenY + hr.height
+				) {
+					cardDragRef.current = {
+						active: false,
+						chapterId: hr.id,
+						fromSha: hr.fromSha,
+						startScreenX: e.clientX,
+						startScreenY: e.clientY,
+						startLayoutX: hr.layoutX,
+						startLayoutY: hr.layoutY,
+						pointerId: e.pointerId,
+					};
+					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+					e.preventDefault();
+					return;
+				}
+			}
+		}
 		if (e.button === 1 || (e.button === 0 && e.currentTarget === e.target)) {
 			cancelAnimationFrame(bounceRafRef.current);
 			cancelAnimationFrame(inertiaRafRef.current);
@@ -1186,8 +1523,18 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePointerMove = useCallback(
 		(e: React.PointerEvent) => {
+			// Card drag
+			const cd = cardDragRef.current;
+			if (cd) {
+				const dx = e.clientX - cd.startScreenX;
+				const dy = e.clientY - cd.startScreenY;
+				if (!cd.active && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+					cd.active = true;
+				}
+				return;
+			}
 			if (!isPanningRef.current || pinchRef.current.active) return;
-			cameraRef.current = hardClamp({
+			cameraRef.current = softClamp({
 				...cameraRef.current,
 				panX: panStartRef.current.camX + (e.clientX - panStartRef.current.x),
 				panY: panStartRef.current.camY + (e.clientY - panStartRef.current.y),
@@ -1199,36 +1546,55 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			samples.push({ x: e.clientX, y: e.clientY, t: performance.now() });
 			if (samples.length > 5) samples.shift();
 		},
-		[scheduleLightRender, hardClamp],
+		[scheduleLightRender, softClamp],
 	);
 
-	const handlePointerUp = useCallback(() => {
-		if (isPanningRef.current) {
-			isPanningRef.current = false;
+	const handlePointerUp = useCallback(
+		(e: React.PointerEvent) => {
+			// Card drag/click end
+			const cd = cardDragRef.current;
+			if (cd) {
+				cardDragRef.current = null;
+				if (!cd.active) {
+					pixiClickRef.current(cd.chapterId, null);
+				} else {
+					const cam = cameraRef.current;
+					const dx = (e.clientX - cd.startScreenX) / cam.scale;
+					const dy = (e.clientY - cd.startScreenY) / cam.scale;
+					pixiDragEndRef.current(
+						cd.chapterId,
+						cd.fromSha,
+						cd.startLayoutX + dx,
+						cd.startLayoutY + dy,
+					);
+				}
+				return;
+			}
+			if (isPanningRef.current) {
+				isPanningRef.current = false;
 
-			// Compute velocity from recent samples (within last 80ms)
-			const samples = panSamplesRef.current;
-			const now = performance.now();
-			const cutoff = now - 80;
-			const recent = samples.filter((s) => s.t >= cutoff);
+				// Compute velocity from recent samples (within last 80ms)
+				const samples = panSamplesRef.current;
+				const now = performance.now();
+				const cutoff = now - 80;
+				const recent = samples.filter((s) => s.t >= cutoff);
 
-			if (recent.length >= 2) {
-				const first = recent[0];
-				const last = recent[recent.length - 1];
-				const dt = last.t - first.t;
-				if (dt > 0) {
-					// Convert px/ms to px/frame (~16.67ms)
-					const FRAME_MS = 16.67;
-					const vx = ((last.x - first.x) / dt) * FRAME_MS;
-					const vy = ((last.y - first.y) / dt) * FRAME_MS;
-					const speed = Math.sqrt(vx * vx + vy * vy);
-
-					if (speed > 2) {
-						// Commit current position, then start inertia
-						setCamera({ ...cameraRef.current });
-						syncSmoothTarget();
-						animateInertia(vx, vy);
-						return;
+				if (recent.length >= 2) {
+					const first = recent[0];
+					const last = recent[recent.length - 1];
+					const dt = last.t - first.t;
+					if (dt > 0) {
+						// Convert px/ms → px/frame (~16.67ms at 60fps)
+						const FRAME_MS = 16.67;
+						const vx = ((last.x - first.x) / dt) * FRAME_MS;
+						const vy = ((last.y - first.y) / dt) * FRAME_MS;
+						const speed = Math.sqrt(vx * vx + vy * vy);
+						if (speed > 2) {
+							setCamera({ ...cameraRef.current });
+							syncSmoothTarget();
+							animateInertia(vx, vy);
+							return;
+						}
 					}
 				}
 			}
@@ -1238,201 +1604,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			syncSmoothTarget();
 			animateBounce();
 			updatePrefetch();
-		}
-	}, [animateBounce, animateInertia, syncSmoothTarget, updatePrefetch]);
-
-	const toggleOrientation = useCallback(() => {
-		const cam = cameraRef.current;
-		const newOri = cam.orientation === "horizontal" ? "vertical" : "horizontal";
-		const isH = newOri === "horizontal";
-		const el = containerRef.current;
-		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
-		const tw = totalMainRef.current;
-		const mainPan = -(tw * 1) + mainVp - 40;
-		const next = hardClamp({
-			...cam,
-			orientation: newOri,
-			...(isH ? { panX: mainPan, panY: 0 } : { panX: 0, panY: mainPan }),
-		});
-		cameraRef.current = next;
-		setCamera({ ...next });
-	}, [hardClamp]);
-
-	const toggleEdge = useCallback(() => {
-		const cam = cameraRef.current;
-		const next = hardClamp({ ...cam, edge: cam.edge === "start" ? "end" : "start" });
-		cameraRef.current = next;
-		setCamera({ ...next });
-	}, [hardClamp]);
-
-	// --- Layout computation ---
-	const rulerData = (data as RulerData) ?? { commits: [], segments: [], activeChapters: [] };
-	// Reverse commits so oldest is at x=0 (left) and newest at x=max (right)
-	const rawCommits = rulerData.commits ?? [];
-	const commits = useMemo(() => [...rawCommits].reverse(), [rawCommits]);
-	// Remap segment fromIndex to match the reversed commit order
-	const segments = useMemo(() => {
-		const len = rawCommits.length;
-		if (len === 0) return rulerData.segments ?? [];
-		return (rulerData.segments ?? []).map((seg) => ({
-			...seg,
-			fromIndex: len - 1 - seg.fromIndex,
-			toIndex: len - 1 - seg.toIndex,
-		}));
-	}, [rawCommits, rulerData.segments]);
-
-	const commitShas = useMemo(() => commits.map((c) => c.sha), [commits]);
-
-	const layout = useMemo(() => computeElasticLayout(commitShas, segments), [commitShas, segments]);
-
-	// Keep ref in sync so layout reads latest segments
-	segmentsRef.current = segments;
-	layoutRef.current = layout;
-	commitShasRef.current = commitShas;
-
-	// SHA → full commit (for context menu)
-	const commitByShaRef = useRef(new Map<string, (typeof commits)[number]>());
-	commitByShaRef.current = useMemo(() => {
-		const m = new Map<string, (typeof commits)[number]>();
-		for (const c of commits) m.set(c.sha, c);
-		return m;
-	}, [commits]);
-
-	// Keep totalMainRef in sync for clamp calculations
-	totalMainRef.current = layout.totalWidth;
-
-	// --- Memory reclamation: evict stale segment caches ---
-	useEffect(() => {
-		const timer = setInterval(() => {
-			const cam = cameraRef.current;
-			const isH = cam.orientation === "horizontal";
-			const mPan = isH ? cam.panX : cam.panY;
-			const el = containerRef.current;
-			const mViewport = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
-			const worldStart = -mPan / cam.scale;
-			const worldEnd = worldStart + mViewport / cam.scale;
-			const bufferSize = (worldEnd - worldStart) * 3;
-
-			const queries = queryClient.getQueriesData({ queryKey: ["rulerSegment", projectId] });
-			for (const [key] of queries) {
-				const fromSha = key[2] as string;
-				const tick = layout.ticks.find((t) => t.sha === fromSha);
-				if (!tick) continue;
-				if (tick.x < worldStart - bufferSize || tick.x > worldEnd + bufferSize) {
-					queryClient.removeQueries({ queryKey: key });
-				}
-			}
-		}, 60_000);
-		return () => clearInterval(timer);
-	}, [projectId, queryClient, layout.ticks]);
-
-	// On first load without a saved ruler viewport, position camera at the latest commit (right end).
-	// After reversing, newest commit is at x=totalWidth, so we pan to show the right edge.
-	// needsInitialPosition is a state so this effect re-runs when prefs finish loading.
-	useEffect(() => {
-		if (!needsInitialPosition || commits.length === 0) return;
-		setNeedsInitialPosition(false);
-		const cam = cameraRef.current;
-		const isH = cam.orientation === "horizontal";
-		const el = containerRef.current;
-		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
-		// Position so the right edge of the viewport aligns with the last tick + some padding
-		const mainPan = -(layout.totalWidth * cam.scale) + mainVp - 40;
-		const clamped = clampCamera(
-			{ ...cam, ...(isH ? { panX: mainPan, panY: 0 } : { panX: 0, panY: mainPan }) },
-			getBounds(),
-		);
-		cameraRef.current = clamped;
-		setCamera({ ...clamped });
-	}, [needsInitialPosition, commits.length, layout.totalWidth, getBounds]);
-
-	// Build sha → main-axis world position map for connector lines
-	const tickPositions = useMemo(() => {
-		const map = new Map<string, number>();
-		for (const tick of layout.ticks) {
-			map.set(tick.sha, tick.x);
-		}
-		return map;
-	}, [layout.ticks]);
-
-	// --- Derived values ---
-	const { panX, panY, scale, orientation, edge } = camera;
-	const isHorizontal = orientation === "horizontal";
-	const containerWidth = containerSize.width || (containerRef.current?.clientWidth ?? 1200);
-	const containerHeight = containerSize.height || (containerRef.current?.clientHeight ?? 800);
-
-	// --- Zoom Tier ---
-	const tierInfo = useMemo(() => getZoomTierInfo(scale), [scale]);
-	const zoomTier: ZoomTierId = tierInfo.tier.id;
-
-	// The "main axis" viewport size (along the ruler) and "cross axis" size
-	const mainViewport = isHorizontal ? containerWidth : containerHeight;
-	const crossViewport = isHorizontal
-		? containerHeight - rulerThickness
-		: containerWidth - rulerThickness;
-	// Pan along the main axis
-	const mainPan = isHorizontal ? panX : panY;
-	const crossPan = isHorizontal ? panY : panX;
-
-	// Pre-compute visible segment ticks to avoid per-tick work in render.
-	// Expanded segments (cards / panels) use a 3× viewport buffer.
-	const segmentTicks = useMemo(() => {
-		const worldViewportMain = mainViewport / scale;
-		const worldViewStart = -mainPan / scale;
-
-		const segBuffer = (worldViewportMain * SEGMENT_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
-		const segStart = worldViewStart - segBuffer;
-		const segEnd = worldViewStart + worldViewportMain + segBuffer;
-
-		const segs: typeof layout.ticks = [];
-		for (const tick of layout.ticks) {
-			if (tick.segment) {
-				// Cull segments by main-axis visibility (3× viewport)
-				const nextTick = layout.ticks[tick.index + 1];
-				const segEndX = nextTick ? nextTick.x : tick.x + 400;
-				if (segEndX >= segStart && tick.x <= segEnd) {
-					segs.push(tick);
-				}
-			}
-		}
-		return segs;
-	}, [layout.ticks, mainPan, scale, mainViewport]);
-
-	// --- Commit clusters for L0/L1 ---
-	const segmentBySha = useMemo(() => {
-		const map = new Map<string, RulerSegment>();
-		for (const seg of segments) map.set(seg.fromSha, seg);
-		return map;
-	}, [segments]);
-
-	const clusters = useMemo(
-		() => clusterCommits(layout.ticks, segmentBySha, scale),
-		[layout.ticks, segmentBySha, scale],
+		},
+		[animateBounce, animateInertia, syncSmoothTarget, updatePrefetch],
 	);
-	const worldViewTop = -crossPan / scale;
-	const worldViewHeight = crossViewport / scale;
-	const worldViewportMain = mainViewport / scale;
-
-	// Zoom center for distance-aware LOD: use cursor position during zoom,
-	// otherwise fall back to viewport center.
-	const zoomCenterWorldX = zoomCenterWorldRef.current ?? -mainPan / scale + worldViewportMain / 2;
-
-	// Chapter data for PixiJS — populated by SegmentCanvas callbacks
-	const pixiChaptersMapRef = useRef<
-		Map<
-			string,
-			Array<{
-				id: string;
-				status: string;
-				title: string;
-				startCommitSha: string | null;
-				mergeCommitSha?: string | null;
-				layoutX: number;
-				layoutY: number;
-			}>
-		>
-	>(new Map());
-	const [pixiChaptersTick, setPixiChaptersTick] = useState(0);
 
 	const handleChaptersLoaded = useCallback(
 		(
@@ -1441,6 +1615,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				id: string;
 				status: string;
 				title: string;
+				branch: string;
+				role: string;
+				narratorId: string | null;
+				narratorStatus: string | null;
 				startCommitSha: string | null;
 				mergeCommitSha?: string | null;
 				layoutX: number;
@@ -1453,6 +1631,58 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				pixiChaptersMapRef.current.set(fromSha, chapters);
 			}
 			setPixiChaptersTick((t) => t + 1);
+		},
+		[],
+	);
+
+	/** Lightweight drag-move handler: updates ref + triggers PixiJS redraw without React state. */
+	const handleChapterDragMove = useCallback(
+		(
+			fromSha: string,
+			chapters: Array<{
+				id: string;
+				status: string;
+				title: string;
+				branch: string;
+				role: string;
+				narratorId: string | null;
+				narratorStatus: string | null;
+				startCommitSha: string | null;
+				mergeCommitSha?: string | null;
+				layoutX: number;
+				layoutY: number;
+			}>,
+		) => {
+			if (chapters.length === 0) {
+				pixiChaptersMapRef.current.delete(fromSha);
+			} else {
+				pixiChaptersMapRef.current.set(fromSha, chapters);
+			}
+			// Rebuild full PixiChapterInfo[] from the map and push to PixiJS imperatively
+			const ticks = layoutRef.current.ticks;
+			const result: PixiChapterInfo[] = [];
+			for (const tick of ticks) {
+				if (!tick.segment) continue;
+				const chs = pixiChaptersMapRef.current.get(tick.sha);
+				if (!chs) continue;
+				for (const ch of chs) {
+					result.push({
+						id: ch.id,
+						status: ch.status,
+						title: ch.title,
+						branch: ch.branch,
+						role: ch.role,
+						narratorId: ch.narratorId,
+						narratorStatus: ch.narratorStatus,
+						startCommitSha: ch.startCommitSha,
+						mergeCommitSha: ch.mergeCommitSha,
+						layoutX: ch.layoutX,
+						layoutY: ch.layoutY,
+						segMainPos: tick.x,
+					});
+				}
+			}
+			pixiRef.current?.updateChapters(result);
 		},
 		[],
 	);
@@ -1479,6 +1709,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					id: ch.id,
 					status: ch.status,
 					title: ch.title,
+					branch: ch.branch,
+					role: ch.role,
+					narratorId: ch.narratorId,
+					narratorStatus: ch.narratorStatus,
 					startCommitSha: ch.startCommitSha,
 					mergeCommitSha: ch.mergeCommitSha,
 					layoutX: ch.layoutX,
@@ -1489,6 +1723,45 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		}
 		return result;
 	}, [segmentTicks, pixiChaptersTick]);
+
+	// Always-visible active chapters for L0 dot rendering.
+	// Uses activeChapters from the main ruler query (no segment fetch needed).
+	const alwaysVisibleChapters = useMemo<PixiChapterInfo[]>(() => {
+		const activeChapters = rulerData.activeChapters ?? [];
+		if (activeChapters.length === 0) return [];
+		const result: PixiChapterInfo[] = [];
+		// Group active chapters by startCommitSha to compute per-group layout offsets
+		const byStartSha = new Map<string, typeof activeChapters>();
+		for (const ch of activeChapters) {
+			if (!ch.startCommitSha) continue;
+			const list = byStartSha.get(ch.startCommitSha) ?? [];
+			list.push(ch);
+			byStartSha.set(ch.startCommitSha, list);
+		}
+		for (const [sha, chs] of byStartSha) {
+			const segMainPos = tickPositions.get(sha);
+			if (segMainPos == null) continue;
+			for (let i = 0; i < chs.length; i++) {
+				const ch = chs[i];
+				// Use persisted offsets when available, fall back to grid layout
+				const hasOffset = ch.axisOffset !== 0 || ch.crossOffset !== 0;
+				result.push({
+					id: ch.id,
+					status: "active",
+					title: ch.title,
+					branch: ch.branch ?? "",
+					role: ch.role ?? "branch",
+					narratorId: ch.narratorId ?? null,
+					narratorStatus: ch.narratorStatus ?? null,
+					startCommitSha: ch.startCommitSha,
+					layoutX: hasOffset ? ch.axisOffset : 20 + (i % 3) * (NODE_WIDTH + NODE_GAP),
+					layoutY: hasOffset ? ch.crossOffset : 20 + Math.floor(i / 3) * (NODE_HEIGHT + NODE_GAP),
+					segMainPos,
+				});
+			}
+		}
+		return result;
+	}, [rulerData.activeChapters, tickPositions]);
 
 	if (isLoading) {
 		return (
@@ -1577,9 +1850,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	}
 
 	// --- World transform for the 2D canvas ---
-	const worldTransform = isHorizontal
-		? `translate(${panX}px, ${panY}px) scale(${scale})`
-		: `translate(${panX}px, ${panY}px) scale(${scale})`;
+	// No CSS transform — all positioning is done per-element via fisheye (main-axis)
+	// and explicit screen-space calculation (cross-axis).
+	const worldTransform = "none";
 
 	return (
 		<Box
@@ -1615,32 +1888,34 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				style={{
 					position: "absolute",
 					zIndex: 15,
+					touchAction: "none",
 					...(isHorizontal
 						? {
 								left: 0,
 								right: 0,
-								height: 6,
+								height: 16,
 								cursor: "row-resize",
 								...(edge === "start"
-									? { top: rulerThickness - 3 }
-									: { bottom: rulerThickness - 3 }),
+									? { top: rulerThickness - 8 }
+									: { bottom: rulerThickness - 8 }),
 							}
 						: {
 								top: 0,
 								bottom: 0,
-								width: 6,
+								width: 16,
 								cursor: "col-resize",
 								...(edge === "start"
-									? { left: rulerThickness - 3 }
-									: { right: rulerThickness - 3 }),
+									? { left: rulerThickness - 8 }
+									: { right: rulerThickness - 8 }),
 							}),
 				}}
-				onMouseDown={(e: React.MouseEvent) => {
+				onPointerDown={(e: React.PointerEvent) => {
 					e.preventDefault();
+					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 					const startPos = isHorizontal ? e.clientY : e.clientX;
 					rulerDragRef.current = { startY: startPos, startThickness: rulerThickness };
 
-					const onMove = (ev: MouseEvent) => {
+					const onMove = (ev: PointerEvent) => {
 						if (!rulerDragRef.current) return;
 						const currentPos = isHorizontal ? ev.clientY : ev.clientX;
 						const delta =
@@ -1656,11 +1931,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					const onUp = () => {
 						rulerDragRef.current = null;
 						rulerDragCleanupRef.current = null;
-						document.removeEventListener("mousemove", onMove);
-						document.removeEventListener("mouseup", onUp);
+						document.removeEventListener("pointermove", onMove);
+						document.removeEventListener("pointerup", onUp);
+						document.removeEventListener("pointercancel", onUp);
 					};
-					document.addEventListener("mousemove", onMove);
-					document.addEventListener("mouseup", onUp);
+					document.addEventListener("pointermove", onMove);
+					document.addEventListener("pointerup", onUp);
+					document.addEventListener("pointercancel", onUp);
 					rulerDragCleanupRef.current = onUp;
 				}}
 			/>
@@ -1677,12 +1954,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				chapters={pixiChapters}
 				zoomTier={zoomTier}
 				clusters={clusters}
-				scale={scale}
-				zoomCenterWorldX={zoomCenterWorldX}
-				viewportWorldWidth={worldViewportMain}
 				tickPositions={tickPositions}
 				rulerThickness={rulerThickness}
 				commitMessages={commitMessages}
+				alwaysVisibleChapters={alwaysVisibleChapters}
+				openPanelChapterIds={openPanelChapterIds}
+				onChapterClick={handlePixiChapterClick}
+				onChapterContextMenu={handlePixiChapterContextMenu}
+				onChapterDragEnd={handlePixiChapterDragEnd}
 			/>
 
 			{/* 2D Canvas */}
@@ -1714,7 +1993,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							const seg = tick.segment;
 							if (!seg) return null;
 							const nextTick = layout.ticks[tick.index + 1];
-							const segSize = nextTick ? nextTick.x - tick.x : 400;
+							const segSize = nextTick ? nextTick.x - tick.x : COLLAPSED_GAP;
+							const smp = worldToScreen(tick.x, fisheyeCenter, mainViewport, scale);
+							const sme = worldToScreen(tick.x + segSize, fisheyeCenter, mainViewport, scale);
 							return (
 								<SegmentCanvas
 									key={`seg-${tick.sha}`}
@@ -1731,9 +2012,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 									cardRegistry={cardRegistryRef}
 									onChapterContextMenu={setChapterMenu}
 									onFitToView={fitRectToView}
-									zoomCenterWorldX={zoomCenterWorldX}
-									viewportWorldWidth={worldViewportMain}
+									zoomCenterWorldX={fisheyeCenter}
+									viewportSize={mainViewport}
+									screenMainPos={smp}
+									screenMainSize={sme - smp}
+									screenCrossOffset={crossPan}
 									onChaptersLoaded={handleChaptersLoaded}
+									onChapterDragMove={handleChapterDragMove}
 								/>
 							);
 						})}
@@ -1756,10 +2041,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				{segmentTicks.map((tick) => {
 					const seg = tick.segment;
 					if (!seg) return null;
-					const screenMain = tick.x * scale + mainPan;
+					const screenMain = worldToScreen(tick.x, fisheyeCenter, mainViewport, scale);
 					const nextTick = layout.ticks[tick.index + 1];
-					const segWorldSize = nextTick ? nextTick.x - tick.x : 400;
-					const segScreenSize = segWorldSize * scale;
+					const segWorldEnd = nextTick ? nextTick.x : tick.x + COLLAPSED_GAP;
+					const screenEnd = worldToScreen(segWorldEnd, fisheyeCenter, mainViewport, scale);
+					const segScreenSize = screenEnd - screenMain;
 					const headerStyle: React.CSSProperties = {
 						position: "absolute",
 						pointerEvents: "none",
@@ -1786,7 +2072,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							style={headerStyle}
 							wrap={isHorizontal ? "nowrap" : "wrap"}
 							data-world-main={tick.x}
-							data-world-size={segWorldSize}
+							data-world-size={segWorldEnd - tick.x}
 						></Group>
 					);
 				})}

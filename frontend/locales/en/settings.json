@@ -197,6 +197,8 @@
 	"displaySection": "Display",
 	"ignoreSafeArea": "Fullscreen Mode",
 	"ignoreSafeAreaDesc": "Hide the system status bar and use the entire screen. Turn off to show the status bar.",
+	"wakeLock": "Keep Screen Awake",
+	"wakeLockDesc": "Prevent the screen from dimming or locking while NarraFork is open",
 	"pwaSection": "App Update",
 	"pwaForceUpdate": "Refresh Cache",
 	"pwaForceUpdateDesc": "Refresh PWA cache and reload the page. Note: This does not check for backend server updates, only refreshes the frontend cache.",

@@ -18,6 +18,8 @@ export interface AppearanceSectionProps {
 	setOledMode: (v: boolean) => void;
 	isFullscreen: boolean;
 	setIsFullscreen: (v: boolean) => void;
+	wakeLock: boolean;
+	setWakeLock: (v: boolean) => void;
 }
 
 export function AppearanceSection({
@@ -27,6 +29,8 @@ export function AppearanceSection({
 	setOledMode,
 	isFullscreen,
 	setIsFullscreen,
+	wakeLock,
+	setWakeLock,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -61,6 +65,12 @@ export function AppearanceSection({
 						document.exitFullscreen?.().catch(() => {});
 					}
 				}}
+			/>
+			<Switch
+				label={t("wakeLock")}
+				description={t("wakeLockDesc")}
+				checked={wakeLock}
+				onChange={(e) => setWakeLock(e.currentTarget.checked)}
 			/>
 
 			{/* Word Wrap */}

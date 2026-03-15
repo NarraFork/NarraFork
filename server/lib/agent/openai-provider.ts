@@ -451,7 +451,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 
 			// Codex: enable server-side auto-truncation to handle context window overflow.
-			if (this.apiMode === "codex") {
+			// Only send when using the official Codex endpoint — third-party proxies
+			// or custom baseUrls may not support this parameter (HTTP 400).
+			if (this.apiMode === "codex" && !this.config.baseUrl) {
 				body.truncation = "auto";
 			}
 			if (instructions) {

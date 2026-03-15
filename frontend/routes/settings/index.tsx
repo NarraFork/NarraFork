@@ -146,6 +146,9 @@ function SettingsPage() {
 	// OLED mode (local-only)
 	const [oledMode, setOledMode] = useLocalPref("narrafork_oled");
 
+	// Wake lock (local-only)
+	const [wakeLock, setWakeLock] = useLocalPref("narrafork_wakelock");
+
 	// PWA cache refresh
 	const [pwaUpdating, setPwaUpdating] = useState(false);
 
@@ -618,6 +621,8 @@ function SettingsPage() {
 							setOledMode={setOledMode}
 							isFullscreen={isFullscreen}
 							setIsFullscreen={setIsFullscreen}
+							wakeLock={wakeLock}
+							setWakeLock={setWakeLock}
 						/>
 					</Accordion.Panel>
 				</Accordion.Item>

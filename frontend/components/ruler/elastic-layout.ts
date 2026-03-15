@@ -28,34 +28,10 @@ export interface ElasticLayout {
 /** Fixed gap between ticks in collapsed state (world-space pixels) */
 export const COLLAPSED_GAP = 80;
 
-const CARD_SLOT = 236; // 220 card + 16 gap
-const PADDING = 40;
-
 /**
- * Compute the expanded segment size based on chapter count and panel state.
- */
-function computeExpandedSize(params: {
-	chapterCount: number;
-	hasOpenPanel: boolean;
-	openPanelWidth: number;
-}): number {
-	const { chapterCount, hasOpenPanel, openPanelWidth } = params;
-
-	if (hasOpenPanel) {
-		return Math.max(openPanelWidth + CARD_SLOT + PADDING, 500);
-	}
-
-	let cols: number;
-	if (chapterCount <= 3) cols = chapterCount;
-	else if (chapterCount <= 8) cols = 4;
-	else cols = 5;
-
-	return Math.max(400, cols * CARD_SLOT + PADDING);
-}
-
-/**
- * Compute tick positions with elastic spacing.
- * All segments are always expanded — there is no collapsed/expanded toggle.
+ * Compute tick positions with uniform spacing.
+ * All ticks use the same gap — segment ticks no longer get expanded canvas areas.
+ * The fisheye transform handles visual expansion at the viewport center.
  * tick.x is scale-independent.
  */
 export function computeElasticLayout(
@@ -75,16 +51,7 @@ export function computeElasticLayout(
 		const segment = segmentBySha.get(sha);
 
 		ticks.push({ index: i, x, sha, segment });
-
-		if (segment) {
-			x += computeExpandedSize({
-				chapterCount: segment.totalChapterCount,
-				hasOpenPanel: false,
-				openPanelWidth: 0,
-			});
-		} else {
-			x += COLLAPSED_GAP;
-		}
+		x += COLLAPSED_GAP;
 	}
 
 	return { ticks, totalWidth: x };
