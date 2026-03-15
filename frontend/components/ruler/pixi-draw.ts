@@ -31,15 +31,20 @@ export function drawTick(
 	isActive: boolean,
 	scale: number,
 	isH = true,
+	edge: "start" | "end" = "start",
 ): void {
 	const s = Math.max(0.1, scale);
 	const w = Math.min(4, 2 / s);
 	const h = isActive ? Math.min(20, Math.max(14, 20 / s)) : 14;
 	const color = isActive ? theme.tickActive : theme.tickDefault;
+	const alpha = isActive ? 0.8 : 0.4;
+	// edge="start": ticks grow inward from the far end (height-h)
+	// edge="end":   ticks grow inward from the near end (0)
+	const crossPos = edge === "start" ? height - h : 0;
 	if (isH) {
-		g.rect(x - w / 2, height - h, w, h).fill({ color, alpha: isActive ? 0.8 : 0.4 });
+		g.rect(x - w / 2, crossPos, w, h).fill({ color, alpha });
 	} else {
-		g.rect(height - h, x - w / 2, h, w).fill({ color, alpha: isActive ? 0.8 : 0.4 });
+		g.rect(crossPos, x - w / 2, h, w).fill({ color, alpha });
 	}
 }
 
@@ -52,14 +57,17 @@ export function drawClusterBlock(
 	count: number,
 	hasActive: boolean,
 	isH = true,
+	edge: "start" | "end" = "start",
 ): void {
 	const h = Math.min(14, 4 + count * 0.5);
 	const color = hasActive ? theme.accent : theme.tickDefault;
 	const alpha = hasActive ? 0.5 : 0.25;
+	// edge="start": clusters anchor at far end; edge="end": anchor at near end
+	const crossPos = edge === "start" ? trackHeight - h - 2 : 2;
 	if (isH) {
-		g.roundRect(x, trackHeight - h - 2, Math.max(width, 3), h, 2).fill({ color, alpha });
+		g.roundRect(x, crossPos, Math.max(width, 3), h, 2).fill({ color, alpha });
 	} else {
-		g.roundRect(trackHeight - h - 2, x, h, Math.max(width, 3), 2).fill({ color, alpha });
+		g.roundRect(crossPos, x, h, Math.max(width, 3), 2).fill({ color, alpha });
 	}
 }
 

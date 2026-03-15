@@ -483,6 +483,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					cl.count,
 					cl.activeCount > 0,
 					isH,
+					cam.edge,
 				);
 			}
 
@@ -498,7 +499,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					if (forkMergeShas.has(tick.sha)) {
 						const screenX = toScreen(tick.x);
 						const ls = getLocalScale(tick.x);
-						drawTick(tickGfx, theme, screenX, trackH, true, ls, isH);
+						drawTick(tickGfx, theme, screenX, trackH, true, ls, isH, cam.edge);
 					}
 				}
 			}
@@ -513,7 +514,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				// Always show segment ticks; skip others based on stride
 				if (!tick.segment && tickStride > 1 && tick.index % tickStride !== 0) continue;
 				const ls = getLocalScale(tick.x);
-				drawTick(tickGfx, theme, screenX, trackH, !!tick.segment, ls, isH);
+				drawTick(tickGfx, theme, screenX, trackH, !!tick.segment, ls, isH, cam.edge);
 			}
 		}
 
@@ -557,15 +558,25 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					? Math.ceil(24 / centerGap)
 					: 1;
 
-			// SHA label offset on cross axis (H) / main axis (V)
-			const shaOffset = 4;
-			// Message offset: in H mode, below SHA on cross axis;
-			// in V mode, below SHA on main axis (same X column, next line down)
+			// Label cross-axis positioning depends on edge:
+			// edge="start": labels at y≈4 (near screen edge), ticks at y≈trackH (near canvas)
+			// edge="end":   labels at y≈trackH-fontSize-4 (near screen edge), ticks at y≈0 (near canvas)
+			const edgeEnd = cam.edge === "end";
+			const shaOffset = edgeEnd ? trackH - fontSize - 4 : 4;
+			// Message offset on cross axis (H mode) or same column offset (V mode)
 			const shaCrossSize = isH ? 0 : fontSize + 2;
-			const msgCrossOffset = isH ? (isExpanded ? 18 : 16) : shaOffset;
+			const msgCrossOffset = isH
+				? edgeEnd
+					? shaOffset - (isExpanded ? 14 : 12) // above SHA toward screen edge
+					: isExpanded
+						? 18
+						: 16 // below SHA toward canvas
+				: shaOffset;
 
-			// Available space for commit message (H: cross-axis below SHA; V: main-axis gap minus SHA)
-			const msgAvailH = trackH - msgCrossOffset - 4;
+			// Available space for commit message (H: cross-axis; V: main-axis gap minus SHA)
+			const msgAvailH = edgeEnd
+				? msgCrossOffset - 4 // space from msgCrossOffset up to track edge
+				: trackH - msgCrossOffset - 4; // space from msgCrossOffset down to track edge
 			const msgAvailV = Math.max(0, centerGap - shaCrossSize - 8);
 			const msgLineH = 13;
 			const maxMsgLines = isH
