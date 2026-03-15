@@ -667,8 +667,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// the fisheye transform, eliminating the position jump.
 			const elemWorldMain = ch.segMainPos + ch.layoutX + centerOffsetX * centerFade;
 			const elemScreenLeft = toScreen(elemWorldMain);
-			const elemScreenRight = toScreen(elemWorldMain + morph.width);
-			const elemScreenW = elemScreenRight - elemScreenLeft;
+			// Use morph.width directly as screen pixels — it is already a screen-space
+			// value (like morph.height on the cross axis). Fisheye only affects position.
+			const elemScreenW = morph.width;
 
 			const elemScreenCross =
 				trackH + (ch.layoutY + CARD_TOP_OFFSET) * cam.scale + crossPan + centerOffsetY * centerFade;
@@ -846,7 +847,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 						connGfx,
 						theme,
 						mergeScreenMain,
-						elemScreenRight,
+						elemScreenLeft + elemScreenW,
 						elemScreenCenterCross,
 						rulerEdgeCrossScreen,
 						isH,

@@ -872,8 +872,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		const idx = findTickAtX(ticks, worldMain);
 		if (idx < 0) return;
 		const tick = ticks[idx];
-		const dist = Math.abs(tick.x - worldMain);
-		if (dist > COLLAPSED_GAP / 2) return;
+		// Check the click falls within this tick's cell (from tick.x to next tick)
+		const nextTick = ticks[idx + 1];
+		const cellEnd = nextTick ? nextTick.x : tick.x + COLLAPSED_GAP;
+		if (worldMain < tick.x - 2 || worldMain > cellEnd) return;
 
 		e.preventDefault();
 		const commit = commitByShaRef.current.get(tick.sha);
@@ -1970,7 +1972,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				onPointerDown={handlePointerDown}
 				onPointerMove={handlePointerMove}
 				onPointerUp={handlePointerUp}
-				onContextMenu={handleTickContextMenu}
 				onDoubleClick={(e) => {
 					if (e.target === e.currentTarget) resetCamera();
 				}}
