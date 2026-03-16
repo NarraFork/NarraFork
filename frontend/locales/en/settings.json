@@ -148,6 +148,8 @@
 	"defaultRelaxedPlanDesc": "When enabled, new narrators will have relaxed plan mode on by default. In relaxed plan mode, tools remain available during planning instead of being disabled.",
 	"smartInterruptionCheck": "Smart Output Interruption Check",
 	"smartInterruptionCheckDesc": "Automatically detect when model output is cut off and send a continue message. Empty responses are retried immediately; non-empty responses are checked by the summary model.",
+	"maxTransientRetries": "Max Retries for Recoverable Errors",
+	"maxTransientRetriesDesc": "Maximum retry attempts for transient API errors (rate limits, server errors). Set to -1 for infinite retries.",
 	"globalWhitelistDirs": "Global Whitelist Directories",
 	"globalWhitelistDirsDesc": "Directories auto-allowed for all narrators. Project and narrator level can add more.",
 	"globalBlacklistDirs": "Global Blacklist Directories",

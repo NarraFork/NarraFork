@@ -148,6 +148,8 @@
 	"defaultRelaxedPlanDesc": "启用后，新叙述者默认开启宽松规划模式。宽松规划模式下，规划时工具仍然可用，不会被禁用。",
 	"smartInterruptionCheck": "智能检查输出中断",
 	"smartInterruptionCheckDesc": "自动检测模型输出是否被截断，并发送继续消息。空回复会立即重试；非空回复由摘要模型判断是否中断。",
+	"maxTransientRetries": "可恢复错误最大重试次数",
+	"maxTransientRetriesDesc": "遇到临时性 API 错误（限流、服务器错误）时的最大重试次数。设为 -1 表示无限重试。",
 	"globalWhitelistDirs": "全局白名单目录",
 	"globalWhitelistDirsDesc": "对所有叙述者自动放行的目录。项目和叙述者级别可追加更多。",
 	"globalBlacklistDirs": "全局黑名单目录",

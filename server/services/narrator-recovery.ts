@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
+import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { COMPACT_CONTEXT_USAGE_PCT, runCustomCompact } from "./narrator-session";
@@ -17,8 +18,12 @@ import { COMPACT_CONTEXT_USAGE_PCT, runCustomCompact } from "./narrator-session"
 // ── Constants ────────────────────────────────────────────────────────────────
 
 export const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
-export const MAX_TRANSIENT_RETRIES = 10;
 export const TRANSIENT_RETRY_BASE_MS = 5_000;
+
+/** Read the user-configured max transient retries from settings. */
+export function getMaxTransientRetries(): number {
+	return settings.agent.maxTransientRetries;
+}
 
 // ── Context overflow recovery ────────────────────────────────────────────────
 
@@ -179,7 +184,7 @@ export async function handleTransientError(opts: {
 }): Promise<{ shouldRetry: boolean; delayMs: number }> {
 	const { narratorId, error, retryCount, maxRetries, signal } = opts;
 
-	if (retryCount > maxRetries) {
+	if (maxRetries !== -1 && retryCount > maxRetries) {
 		logger.error("Transient error exceeded max retries", {
 			narratorId,
 			error,

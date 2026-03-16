@@ -2563,12 +2563,12 @@ export function NarratorPanel({
 										? retryCountdown > 0
 											? t("retryingCountdown", {
 													count: retryInfo?.retryCount,
-													max: retryInfo?.maxRetries,
+													max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
 													seconds: retryCountdown,
 												})
 											: t("retryingNow", {
 													count: retryInfo?.retryCount,
-													max: retryInfo?.maxRetries,
+													max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
 												})
 										: isCompacting
 											? t("compacting")

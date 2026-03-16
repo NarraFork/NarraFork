@@ -134,6 +134,8 @@ export interface NarraForkSettings {
 		defaultRelaxedPlan: boolean;
 		/** Smart output interruption check — auto-detect and retry interrupted model output. */
 		smartInterruptionCheck: boolean;
+		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
+		maxTransientRetries: number;
 		/** Global whitelist directories — merged with project and narrator level. */
 		whitelistDirs?: Array<{
 			path: string;
@@ -248,6 +250,7 @@ const DEFAULTS: NarraForkSettings = {
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
+		maxTransientRetries: 10,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,

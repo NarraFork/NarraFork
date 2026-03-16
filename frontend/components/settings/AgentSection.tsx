@@ -30,6 +30,8 @@ export interface AgentSectionProps {
 	setDefaultRelaxedPlan: (v: boolean) => void;
 	smartInterruptionCheck: boolean;
 	setSmartInterruptionCheck: (v: boolean) => void;
+	maxTransientRetries: number;
+	setMaxTransientRetries: (v: number) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -138,6 +140,14 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("smartInterruptionCheckDesc")}
 				checked={props.smartInterruptionCheck}
 				onChange={(e) => props.setSmartInterruptionCheck(e.currentTarget.checked)}
+			/>
+			<NumberInput
+				label={t("maxTransientRetries")}
+				description={t("maxTransientRetriesDesc")}
+				value={props.maxTransientRetries}
+				onChange={(v) => props.setMaxTransientRetries(typeof v === "number" ? v : 10)}
+				min={-1}
+				max={100}
 			/>
 			{/* Session */}
 			<Title order={5} mt="sm">

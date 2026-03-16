@@ -22,10 +22,10 @@ import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
+	getMaxTransientRetries,
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
-	MAX_TRANSIENT_RETRIES,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
 import {
@@ -436,11 +436,13 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				);
 				history = rebuilt.history;
 				trailingToolResults = rebuilt.trailingToolResults;
+				transientRetries = 0;
 				continue;
 			}
 			if (overflow.action === "retry_compacted") {
 				needsRestart = true;
 				currentConversationId = overflow.newConversationId;
+				transientRetries = 0;
 				// Continue to the restart-after-compact flow below
 			} else {
 				hasError = true;
@@ -457,11 +459,16 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				narratorId,
 				error: result.retryableError,
 				retryCount: transientRetries,
-				maxRetries: MAX_TRANSIENT_RETRIES,
+				maxRetries: getMaxTransientRetries(),
 				signal,
 			});
 			if (shouldRetry) {
 				continue;
+			}
+			// If aborted during backoff sleep, don't mark as error — the
+			// caller will handle the abort status.
+			if (signal.aborted) {
+				break;
 			}
 			hasError = true;
 			finalText = `Error: ${result.retryableError}`;

@@ -993,6 +993,7 @@ export const api = {
 			rulerEdge?: "start" | "end";
 			rulerMainPan?: number;
 			rulerCrossPan?: number;
+			rulerThickness?: number;
 		},
 	) =>
 		request<{ ok: boolean }>("/user-preferences/graph-viewports", {

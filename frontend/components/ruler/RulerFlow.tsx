@@ -138,6 +138,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const queryClient = useQueryClient();
 	// --- Camera state: ref is source of truth, state drives render via rAF ---
 	const hasRulerViewportRef = useRef(false);
+	const savedRulerThicknessRef = useRef(DEFAULT_RULER_THICKNESS);
 	const savedCamera = useMemo<Camera>(() => {
 		try {
 			const raw = (prefs as Record<string, unknown> | undefined)?.graphViewports;
@@ -151,6 +152,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					rulerEdge?: RulerEdge;
 					rulerMainPan?: number;
 					rulerCrossPan?: number;
+					rulerThickness?: number;
 				}
 			> = {};
 			if (typeof raw === "string") viewports = JSON.parse(raw);
@@ -160,6 +162,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			// Classic mode viewports share the same key but have incompatible coordinates.
 			if (v?.rulerMainPan != null) {
 				hasRulerViewportRef.current = true;
+				if (
+					v.rulerThickness != null &&
+					v.rulerThickness >= DEFAULT_RULER_THICKNESS &&
+					v.rulerThickness <= MAX_RULER_THICKNESS
+				) {
+					savedRulerThicknessRef.current = v.rulerThickness;
+				}
 				const ori = v.rulerOrientation ?? "horizontal";
 				const isH = ori === "horizontal";
 				const mainPan = v.rulerMainPan;
@@ -181,7 +190,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const cameraRef = useRef<Camera>(savedCamera);
 	const [camera, setCamera] = useState<Camera>(savedCamera);
-	const [rulerThickness, setRulerThickness] = useState(DEFAULT_RULER_THICKNESS);
+	const [rulerThickness, setRulerThickness] = useState(savedRulerThicknessRef.current);
 	const rulerDragRef = useRef<{ startY: number; startThickness: number } | null>(null);
 	const rulerDragCleanupRef = useRef<(() => void) | null>(null);
 	const cameraInitializedRef = useRef(false);
@@ -197,6 +206,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		}
 		cameraRef.current = savedCamera;
 		setCamera(savedCamera);
+		setRulerThickness(savedRulerThicknessRef.current);
 	}, [savedCamera, prefs]);
 
 	// DOM refs for direct transform updates (bypass React re-render during pan/zoom)
@@ -290,6 +300,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				rulerEdge: camera.edge,
 				rulerMainPan: mainPan,
 				rulerCrossPan: crossPan,
+				rulerThickness,
 			};
 			api.saveGraphViewport(projectId, viewportData);
 			// Optimistically update the cached prefs so re-entering ruler restores this position
@@ -310,7 +321,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return () => {
 			if (cameraSaveTimerRef.current) clearTimeout(cameraSaveTimerRef.current);
 		};
-	}, [camera, projectId, queryClient]);
+	}, [camera, rulerThickness, projectId, queryClient]);
 
 	const containerRef = useRef<HTMLDivElement>(null);
 	const pixiRef = useRef<RulerPixiHandle>(null);
@@ -1094,6 +1105,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					}
 					ss.targetMainPan -= delta;
 
+					// Clamp target so it can't accumulate far past the boundary.
+					// Allow a small overshoot (half viewport) for elastic feel,
+					// but prevent the infinite accumulation that causes the view
+					// to get stuck at the edge.
+					const scrollBounds = getBounds();
+					if (scrollBounds && scrollBounds.maxContentMain > 0) {
+						const mb = getMainBounds(scrollBounds, cam.scale);
+						const overshoot = scrollBounds.mainViewportSize * 0.3;
+						ss.targetMainPan = Math.max(
+							mb.min - overshoot,
+							Math.min(mb.max + overshoot, ss.targetMainPan),
+						);
+					}
+
 					// Apply cross-axis immediately (no smoothing needed for minor trackpad input)
 					if (crossDelta !== 0) {
 						const crossCam = hardClamp({
@@ -1111,7 +1136,23 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						ss.frameCount = 0;
 						const smoothStep = () => {
 							const cur = cameraRef.current;
-							const curMain = cur.orientation === "horizontal" ? cur.panX : cur.panY;
+							const curIsH = cur.orientation === "horizontal";
+							const curMain = curIsH ? cur.panX : cur.panY;
+
+							// Pull targetMainPan back toward bounds each frame.
+							// This is the second line of defense (the first is the
+							// clamp in onWheel).  Use a strong factor so the target
+							// converges quickly when the user stops scrolling.
+							const bounds = getBounds();
+							if (bounds && bounds.maxContentMain > 0) {
+								const mb = getMainBounds(bounds, cur.scale);
+								if (ss.targetMainPan < mb.min) {
+									ss.targetMainPan += (mb.min - ss.targetMainPan) * 0.35;
+								} else if (ss.targetMainPan > mb.max) {
+									ss.targetMainPan += (mb.max - ss.targetMainPan) * 0.35;
+								}
+							}
+
 							const diff = ss.targetMainPan - curMain;
 
 							// Lerp factor — higher = snappier, lower = smoother
@@ -1120,9 +1161,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								// Close enough — snap and stop
 								const finalCam = hardClamp({
 									...cur,
-									...(cur.orientation === "horizontal"
-										? { panX: ss.targetMainPan }
-										: { panY: ss.targetMainPan }),
+									...(curIsH ? { panX: ss.targetMainPan } : { panY: ss.targetMainPan }),
 								});
 								cameraRef.current = finalCam;
 								scheduleLightRender();
@@ -1142,9 +1181,30 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							const newMain = curMain + diff * LERP;
 							const newCam = hardClamp({
 								...cur,
-								...(cur.orientation === "horizontal" ? { panX: newMain } : { panY: newMain }),
+								...(curIsH ? { panX: newMain } : { panY: newMain }),
 							});
 							cameraRef.current = newCam;
+
+							// Detect when hardClamp pins the camera (no actual movement).
+							// This means target is past the boundary — snap target to the
+							// clamped position so the animation converges immediately
+							// instead of spinning with a large diff that never shrinks.
+							const clampedMain = curIsH ? newCam.panX : newCam.panY;
+							if (Math.abs(clampedMain - curMain) < 0.1 && Math.abs(diff) > 1) {
+								ss.targetMainPan = clampedMain;
+								scheduleLightRender();
+								setCamera({ ...cameraRef.current });
+								ss.animating = false;
+
+								if (wheelBounceTimerRef.current) clearTimeout(wheelBounceTimerRef.current);
+								wheelBounceTimerRef.current = setTimeout(() => {
+									wheelBounceTimerRef.current = null;
+									animateBounce();
+									updatePrefetch();
+								}, 120);
+								return;
+							}
+
 							scheduleLightRender();
 							// Commit to React state every 4 frames so SegmentCanvas
 							// visibility culling updates progressively instead of all at once.
@@ -1294,6 +1354,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			syncSmoothTarget,
 			updatePrefetch,
 			rulerThickness,
+			getBounds,
 		],
 	);
 
