@@ -1,4 +1,4 @@
-import { agentGenerateWithHistory } from "../lib/agent";
+import { summaryGenerateWithHistory } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
@@ -67,10 +67,9 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 	});
 
 	const TITLE_TIMEOUT_MS = 30_000;
-	const titlePromise = agentGenerateWithHistory(
+	const titlePromise = summaryGenerateWithHistory(
 		titlePrompt.replace(/<conversation>\s*$/, "").trim(),
 		`<conversation>\n${conversationText}\n</conversation>`,
-		settings.agent.summaryModel,
 		locale,
 	);
 
@@ -119,10 +118,9 @@ export async function generateQuickTitle(
 		});
 
 		const TITLE_TIMEOUT_MS = 30_000;
-		const titlePromise = agentGenerateWithHistory(
+		const titlePromise = summaryGenerateWithHistory(
 			titlePrompt.replace(/<user_message>\s*$/, "").trim(),
 			`<user_message>\n${truncated}\n</user_message>`,
-			settings.agent.summaryModel,
 			locale,
 		);
 

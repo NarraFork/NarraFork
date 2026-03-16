@@ -1,4 +1,4 @@
-import { type AgentConfig, agentGenerateWithMeta, agentLoop } from "../lib/agent";
+import { type AgentConfig, agentLoop, summaryGenerate } from "../lib/agent";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -182,7 +182,7 @@ async function checkOutputInterruption(text: string, narratorId: string): Promis
 			"One word only: pass or retry.";
 
 		const snippet = text.slice(-500);
-		const result = await agentGenerateWithMeta(snippet, settings.agent.summaryModel, systemPrompt);
+		const result = await summaryGenerate(snippet, systemPrompt);
 		const verdict = result.text.trim().toLowerCase();
 
 		if (verdict === "retry") {

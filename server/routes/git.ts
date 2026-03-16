@@ -208,8 +208,7 @@ gitRoutes.post("/:chapterId/git/ai-commit-message", async (c) => {
 	}
 
 	// Lazy import to avoid circular dependency
-	const { agentGenerateWithHistory } = await import("../lib/agent");
-	const { settings } = await import("../lib/settings");
+	const { summaryGenerateWithHistory } = await import("../lib/agent");
 
 	const systemPrompt = `You are a git commit message generator. Given a git diff, generate a concise commit message following the Conventional Commits format.
 Rules:
@@ -221,10 +220,9 @@ Rules:
 - Reply with ONLY the commit message, nothing else`;
 
 	const AI_TIMEOUT_MS = 30_000;
-	const generatePromise = agentGenerateWithHistory(
+	const generatePromise = summaryGenerateWithHistory(
 		systemPrompt,
 		`<diff>\n${diff}\n</diff>`,
-		settings.agent.summaryModel,
 		"en",
 	);
 

@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
-import { agentGenerateWithMeta } from "../lib/agent";
+import { summaryGenerate } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
@@ -215,9 +215,8 @@ function translateReasoningBlock(
 
 	(async () => {
 		try {
-			const result = await agentGenerateWithMeta(
+			const result = await summaryGenerate(
 				reasoningText,
-				settings.agent.summaryModel,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
 			);
 			const translated = result.text?.trim();

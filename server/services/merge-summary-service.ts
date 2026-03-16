@@ -8,7 +8,7 @@ import {
 	projects,
 	users,
 } from "../db/schema";
-import { agentGenerateWithMeta } from "../lib/agent";
+import { summaryGenerate } from "../lib/agent";
 import { logger } from "../lib/logger";
 import { getMergeSummaryLabel, getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -224,11 +224,7 @@ export const mergeSummaryService = {
 			const systemPrompt = getPrompt("mergeSummary", locale);
 
 			// Call the summary model (Haiku)
-			const result = await agentGenerateWithMeta(
-				userText,
-				settings.agent.summaryModel,
-				systemPrompt,
-			);
+			const result = await summaryGenerate(userText, systemPrompt);
 
 			const summary = result.text?.trim();
 			if (!summary) {

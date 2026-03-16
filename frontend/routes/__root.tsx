@@ -49,6 +49,7 @@ import { useTranslation } from "react-i18next";
 import { GitMissingAlert } from "../components/GitMissingAlert";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
+import { SummaryModelPickerModal } from "../components/settings/SummaryModelPickerModal";
 import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
@@ -629,6 +630,8 @@ function AuthenticatedLayout() {
 					setWizardOpen(true);
 				}}
 			/>
+
+			<SummaryModelPickerModal />
 		</AppShell>
 	);
 }

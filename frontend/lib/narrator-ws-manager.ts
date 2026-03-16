@@ -392,6 +392,15 @@ class NarratorWSManager {
 					this._resetPingTimeout();
 					return;
 				}
+				// Global events that aren't narrator-scoped — dispatch as DOM events
+				if (data.type === "summary_model_unavailable") {
+					window.dispatchEvent(
+						new CustomEvent("narrafork:summary-model-unavailable", {
+							detail: { model: data.model },
+						}),
+					);
+					return;
+				}
 				this._dispatch(data);
 			} catch {
 				if (import.meta.env.DEV) {

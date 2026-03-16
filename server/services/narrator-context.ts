@@ -1,4 +1,4 @@
-import { agentGenerateWithMeta } from "../lib/agent";
+import { summaryGenerate } from "../lib/agent";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { getModelContextWindow, parseModelId, settings } from "../lib/settings";
@@ -151,11 +151,7 @@ export const narratorContext = {
 		try {
 			const summarySuffix = getPrompt("compactSuffix", locale);
 			const summaryUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${summarySuffix}`;
-			const result = await agentGenerateWithMeta(
-				summaryUserText,
-				settings.agent.summaryModel,
-				summaryPrompt,
-			);
+			const result = await summaryGenerate(summaryUserText, summaryPrompt);
 
 			return result.text || "Failed to generate summary.";
 		} catch (err) {
@@ -334,11 +330,7 @@ export const narratorContext = {
 		let lastError: unknown;
 		for (let attempt = 1; attempt <= COMPACT_MAX_RETRIES; attempt++) {
 			try {
-				const result = await agentGenerateWithMeta(
-					compactUserText,
-					settings.agent.summaryModel,
-					compactSystemPrompt,
-				);
+				const result = await summaryGenerate(compactUserText, compactSystemPrompt);
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");
 				}

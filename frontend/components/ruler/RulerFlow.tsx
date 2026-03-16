@@ -1025,8 +1025,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							const diff = sz.targetScale - cur.scale;
 							const LERP = 0.18;
 							const mvp = curIsH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
-							const prevPanX = cur.panX;
-							const prevPanY = cur.panY;
 
 							if (Math.abs(diff) < 0.001) {
 								// Close enough — snap to target
@@ -1043,11 +1041,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 									panY: curIsH ? newCrossPan : newMainPan,
 									scale: sz.targetScale,
 								});
-								// Rebase drag origin so concurrent panning stays consistent
-								if (isPanningRef.current) {
-									panStartRef.current.camX += cameraRef.current.panX - prevPanX;
-									panStartRef.current.camY += cameraRef.current.panY - prevPanY;
-								}
 								scheduleLightRender();
 								setCamera({ ...cameraRef.current });
 								sz.animating = false;
@@ -1076,11 +1069,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								panY: curIsH ? newCrossPan : newMainPan,
 								scale: newScale,
 							});
-							// Rebase drag origin so concurrent panning stays consistent
-							if (isPanningRef.current) {
-								panStartRef.current.camX += cameraRef.current.panX - prevPanX;
-								panStartRef.current.camY += cameraRef.current.panY - prevPanY;
-							}
 							scheduleLightRender();
 							// Commit to React state periodically (not every frame) to reduce GC pressure
 							// PixiJS handles morph/LOD in real time via updateCamera
@@ -1123,8 +1111,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						ss.frameCount = 0;
 						const smoothStep = () => {
 							const cur = cameraRef.current;
-							const prevPanX = cur.panX;
-							const prevPanY = cur.panY;
 							const curMain = cur.orientation === "horizontal" ? cur.panX : cur.panY;
 							const diff = ss.targetMainPan - curMain;
 
@@ -1139,11 +1125,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 										: { panY: ss.targetMainPan }),
 								});
 								cameraRef.current = finalCam;
-								// Rebase drag origin so concurrent panning stays consistent
-								if (isPanningRef.current) {
-									panStartRef.current.camX += cameraRef.current.panX - prevPanX;
-									panStartRef.current.camY += cameraRef.current.panY - prevPanY;
-								}
 								scheduleLightRender();
 								setCamera({ ...cameraRef.current });
 								ss.animating = false;
@@ -1164,11 +1145,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								...(cur.orientation === "horizontal" ? { panX: newMain } : { panY: newMain }),
 							});
 							cameraRef.current = newCam;
-							// Rebase drag origin so concurrent panning stays consistent
-							if (isPanningRef.current) {
-								panStartRef.current.camX += cameraRef.current.panX - prevPanX;
-								panStartRef.current.camY += cameraRef.current.panY - prevPanY;
-							}
 							scheduleLightRender();
 							// Commit to React state every 4 frames so SegmentCanvas
 							// visibility culling updates progressively instead of all at once.
@@ -1650,6 +1626,17 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		if (e.button === 1 || (e.button === 0 && e.currentTarget === e.target)) {
 			cancelAnimationFrame(bounceRafRef.current);
 			cancelAnimationFrame(inertiaRafRef.current);
+			// Stop any in-progress smooth zoom/scroll so drag takes over immediately
+			const sz = smoothZoomRef.current;
+			if (sz.animating) {
+				cancelAnimationFrame(sz.rafId);
+				sz.animating = false;
+			}
+			const ss = smoothScrollRef.current;
+			if (ss.animating) {
+				cancelAnimationFrame(ss.rafId);
+				ss.animating = false;
+			}
 			isPanningRef.current = true;
 			panStartRef.current = {
 				x: e.clientX,

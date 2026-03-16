@@ -1,6 +1,7 @@
 import { networkInterfaces } from "node:os";
 import { Hono } from "hono";
 import { z } from "zod";
+import { resolveProviderAndModel } from "../lib/agent/provider";
 import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
 import {
@@ -179,6 +180,21 @@ function getLanAddresses(): string[] {
 	return result;
 }
 
+/**
+ * Check whether the configured summary model's provider is available.
+ * Uses a lightweight check (no actual API call) — just verifies the provider
+ * can be resolved and instantiated.
+ */
+function checkSummaryModelAvailable(summaryModel: string): boolean {
+	if (!summaryModel) return false;
+	try {
+		resolveProviderAndModel(summaryModel);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 settingsRoutes.get("/", (c) => {
 	const s = loadSettings();
 	const codexManager = getCodexManager();
@@ -204,6 +220,7 @@ settingsRoutes.get("/", (c) => {
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
 		lanAddresses: getLanAddresses(),
+		summaryModelAvailable: checkSummaryModelAvailable(s.agent.summaryModel),
 	};
 	return c.json(result);
 });
