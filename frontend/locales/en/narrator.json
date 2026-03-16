@@ -50,6 +50,7 @@
 	"narratorError": "Narrator Error",
 	"narratorRetrying": "Temporarily Unavailable — Retrying",
 	"retryingCountdown": "Retry {{count}}/{{max}} — {{seconds}}s",
+	"retryingNow": "Retry {{count}}/{{max}} — retrying…",
 	"attachImage": "Attach image",
 	"removeImage": "Remove",
 	"imageTooLarge": "Image must be under 10MB",

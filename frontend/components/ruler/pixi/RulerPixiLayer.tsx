@@ -75,7 +75,7 @@ export interface RulerPixiHandle {
 	/** Trigger a full re-render of the PixiJS scene */
 	render(): void;
 	/** Update chapter positions imperatively (e.g. during drag) without React state */
-	updateChapters(chapters: PixiChapterInfo[]): void;
+	updateChapters(chapters: PixiChapterInfo[] | null): void;
 	/** Get current card hit rects for interaction hit-testing */
 	getCardHitRects(): CardHitRect[];
 }
@@ -116,7 +116,7 @@ interface RulerPixiLayerProps {
 
 const NODE_WIDTH = 220;
 const NODE_HEIGHT = 72;
-const CARD_TOP_OFFSET = 30;
+const CARD_TOP_OFFSET = 2;
 
 function narratorStatusColor(theme: PixiTheme, status: string): number {
 	switch (status) {
@@ -694,20 +694,33 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			merged = chaptersToRender;
 		} else {
 			mergedBuf.length = 0;
-			const alwaysIds = alwaysIdsBuf;
-			alwaysIds.clear();
-			for (const c of always) alwaysIds.add(c.id);
+			// Collect IDs from chaptersToRender (which may be override data during drag)
+			const renderedIds = alwaysIdsBuf;
+			renderedIds.clear();
 			for (const c of chaptersToRender) {
-				if (!alwaysIds.has(c.id)) mergedBuf.push(c);
+				mergedBuf.push(c);
+				renderedIds.add(c.id);
 			}
-			for (const c of always) mergedBuf.push(c);
+			// Append always-visible chapters that aren't already in chaptersToRender
+			for (const c of always) {
+				if (!renderedIds.has(c.id)) mergedBuf.push(c);
+			}
 			merged = mergedBuf;
 		}
 
 		for (const ch of merged) {
 			const chWorldMain = ch.segMainPos + ch.layoutX + NODE_WIDTH / 2;
 			const ls = getLocalScale(chWorldMain);
-			let t = getMorphFactor(ls);
+
+			// Morph factor is the minimum of two independent factors:
+			// 1) Global zoom level — what morph phase the camera scale alone warrants
+			// 2) Fisheye edge fade — how much the chapter is compressed at the edge
+			// This keeps cards visible as long as the zoom is deep enough AND the
+			// chapter hasn't been pushed too far into the fisheye periphery.
+			const tZoom = getMorphFactor(cam.scale);
+			const tEdge = getMorphFactor(ls);
+			let t = Math.min(tZoom, tEdge);
+
 			// Active chapters always show at least as a dot
 			if (t <= 0 && ch.status === "active") t = 0.15;
 			if (t <= 0) continue;
@@ -724,9 +737,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// the fisheye transform, eliminating the position jump.
 			const elemWorldMain = ch.segMainPos + ch.layoutX + centerOffsetX * centerFade;
 			const elemScreenLeft = toScreen(elemWorldMain);
-			// Use morph.width directly as screen pixels — it is already a screen-space
-			// value (like morph.height on the cross axis). Fisheye only affects position.
-			const elemScreenW = morph.width;
+			// Main-axis size of the element in screen pixels (used for connector endpoints).
+			// In horizontal mode the card's CSS width runs along the main axis;
+			// in vertical mode the card's CSS height runs along the main axis.
+			const elemMainSize = isH ? morph.width : morph.height;
 
 			const elemScreenCross =
 				crossBase +
@@ -738,10 +752,28 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const hasPanel = d.openPanelChapterIds?.has(ch.id);
 
 			// --- Draw unified chapter node (single path: dot → pill → card) ---
-			const screenW = isH ? elemScreenW : morph.height;
-			const screenH = isH ? morph.height : elemScreenW;
+			// Card visual dimensions stay the same regardless of orientation —
+			// only the position axes swap. morph.width is always the card's
+			// CSS width and morph.height is always the CSS height.
+			const screenW = morph.width;
+			const screenH = morph.height;
 			const nodeLeft = isH ? elemScreenLeft : elemScreenCross;
 			const nodeTop = isH ? elemScreenCross : elemScreenLeft;
+
+			// Always track hit rects for card-like chapters (panels need them for positioning)
+			if (morph.cardBlend > 0) {
+				cardHitRects.push({
+					id: ch.id,
+					narratorId: ch.narratorId,
+					fromSha: ch.startCommitSha ?? "",
+					screenX: nodeLeft,
+					screenY: nodeTop,
+					width: screenW,
+					height: screenH,
+					layoutX: ch.layoutX,
+					layoutY: ch.layoutY,
+				});
+			}
 
 			if (!hasPanel) {
 				const screenMorph = { ...morph, width: screenW, height: screenH };
@@ -764,21 +796,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					ch.role,
 				);
 
-				// Store hit rect for interaction when card-like
-				if (isCard) {
-					cardHitRects.push({
-						id: ch.id,
-						narratorId: ch.narratorId,
-						fromSha: ch.startCommitSha ?? "",
-						screenX: nodeLeft,
-						screenY: nodeTop,
-						width: screenW,
-						height: screenH,
-						layoutX: ch.layoutX,
-						layoutY: ch.layoutY,
-					});
-				}
-
 				// --- Chapter title text (unified for pill + card phases) ---
 				if (morph.titleOpacity > 0 && screenW > 30) {
 					const cb = morph.cardBlend;
@@ -798,8 +815,8 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 						sc.chapterTitleKey = titleKey;
 					}
 
-					const mainSize = isH ? screenW : screenH;
-					const maxChars = Math.max(2, Math.floor((mainSize - 22) / (titleFontSize * 0.55)));
+					// Title text is always horizontal — truncate based on CSS width
+					const maxChars = Math.max(2, Math.floor((screenW - 22) / (titleFontSize * 0.55)));
 					const title = ch.title.length > maxChars ? `${ch.title.slice(0, maxChars)}…` : ch.title;
 
 					// Use card slot's own TextPool when in card phase, shared pool otherwise
@@ -878,23 +895,25 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 			// --- Connector lines (all morph stages, unified position) ---
 			const lineOpacity = t * (ch.status === "merged" ? 0.25 : 0.45);
-			if (ch.startCommitSha && lineOpacity > 0.01) {
-				const forkTickMain = d.tickPositions.get(ch.startCommitSha);
-				if (forkTickMain != null) {
-					const forkScreenMain = toScreen(forkTickMain);
+			if (lineOpacity > 0.01) {
+				// Prefer exact tick position; fall back to segment origin when the
+				// chapter's startCommitSha is not a segment boundary tick or is null.
+				const forkTickMain = ch.startCommitSha
+					? (d.tickPositions.get(ch.startCommitSha) ?? ch.segMainPos)
+					: ch.segMainPos;
+				const forkScreenMain = toScreen(forkTickMain);
 
-					drawConnector(
-						connGfx,
-						theme,
-						forkScreenMain,
-						elemScreenLeft,
-						elemScreenCenterCross,
-						rulerEdgeCrossScreen,
-						isH,
-						1, // screen space — fixed stroke width
-						lineOpacity,
-					);
-				}
+				drawConnector(
+					connGfx,
+					theme,
+					forkScreenMain,
+					elemScreenLeft,
+					elemScreenCenterCross,
+					rulerEdgeCrossScreen,
+					isH,
+					1, // screen space — fixed stroke width
+					lineOpacity,
+				);
 			}
 
 			// Merge connector
@@ -907,7 +926,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 						connGfx,
 						theme,
 						mergeScreenMain,
-						elemScreenLeft + elemScreenW,
+						elemScreenLeft + elemMainSize,
 						elemScreenCenterCross,
 						rulerEdgeCrossScreen,
 						isH,
@@ -950,7 +969,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			render() {
 				appRef.current?.render();
 			},
-			updateChapters(chs: PixiChapterInfo[]) {
+			updateChapters(chs: PixiChapterInfo[] | null) {
 				chaptersOverrideRef.current = chs;
 				redraw(latestCameraRef.current);
 			},
@@ -979,6 +998,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		rulerThickness,
 		commitMessages,
 		alwaysVisibleChapters,
+		openPanelChapterIds,
 		redraw,
 	]);
 

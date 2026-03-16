@@ -50,6 +50,7 @@
 	"narratorError": "叙述者错误",
 	"narratorRetrying": "服务暂时不可用 — 正在重试",
 	"retryingCountdown": "重试 {{count}}/{{max}} — {{seconds}}秒后重试",
+	"retryingNow": "重试 {{count}}/{{max}} — 正在重试…",
 	"attachImage": "附加图片",
 	"removeImage": "移除",
 	"imageTooLarge": "图片不能超过 10MB",

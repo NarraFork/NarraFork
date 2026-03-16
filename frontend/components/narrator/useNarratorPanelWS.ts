@@ -936,6 +936,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				input?: Record<string, unknown>,
 				parentToolUseId?: string,
 			) => {
+				// Tool execution starting means any pending retry has succeeded.
+				// Functional update avoids unnecessary re-render when already null.
+				setRetryInfo((prev) => (prev ? null : prev));
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
 

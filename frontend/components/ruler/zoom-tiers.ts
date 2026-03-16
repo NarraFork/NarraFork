@@ -75,7 +75,8 @@ export function getCardModeForChapter(effectiveScale: number): CardMode {
 const MORPH_INVISIBLE = 0.25; // below: hidden (matches L0 boundary)
 const MORPH_DOT = 0.45; // dot fully formed (mid-L1)
 const MORPH_PILL = 0.9; // pill fully formed (mid-L2)
-const MORPH_CARD = 1.2; // card fully formed (L3 boundary)
+/** Scale at which card is fully formed (L3 boundary). Exported for card-persistence logic. */
+export const MORPH_CARD = 1.2;
 
 /**
  * Map an effective scale (fisheye localScale) to a continuous morph factor `t` in [0, 1].
@@ -206,13 +207,23 @@ export const MORPH_KEYFRAMES: readonly MorphKeyframe[] = [
 		opacity: 1,
 	},
 	{
+		t: 0.5,
+		width: 100,
+		height: 20,
+		borderRadius: 4,
+		titleOpacity: 0.5,
+		titleFontSize: 10,
+		cardBlend: 1,
+		opacity: 1,
+	},
+	{
 		t: 0.7,
 		width: 160,
 		height: 24,
 		borderRadius: 4,
 		titleOpacity: 1,
 		titleFontSize: 10,
-		cardBlend: 0,
+		cardBlend: 1,
 		opacity: 1,
 	},
 	{

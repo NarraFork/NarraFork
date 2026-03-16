@@ -1,4 +1,4 @@
-import { ActionIcon, Box, Center, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Card, Center, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
 import {
 	IconArrowsHorizontal,
 	IconArrowsVertical,
@@ -7,11 +7,12 @@ import {
 	IconLayoutSidebarRightCollapse,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { NarratorPanel } from "../narrator/NarratorPanel";
 import { clusterCommits } from "./commit-cluster";
 import {
 	COLLAPSED_GAP,
@@ -23,7 +24,7 @@ import { screenToWorld, solvePanForAnchor, viewCenterFromPan, worldToScreen } fr
 import { OffscreenBubbles } from "./OffscreenBubbles";
 import { type PixiChapterInfo, type RulerPixiHandle, RulerPixiLayer } from "./pixi/RulerPixiLayer";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
-import { type ChapterContextMenuState, SegmentCanvas } from "./SegmentCanvas";
+import { SegmentCanvas } from "./SegmentCanvas";
 import {
 	DEFAULT_RULER_THICKNESS,
 	MAX_RULER_THICKNESS,
@@ -51,6 +52,18 @@ interface Camera {
 const NODE_WIDTH = 220;
 const NODE_HEIGHT = 72;
 const NODE_GAP = 16;
+
+const DEFAULT_PANEL_WIDTH = 420;
+const DEFAULT_PANEL_HEIGHT = 520;
+const MIN_PANEL_WIDTH = 300;
+const MIN_PANEL_HEIGHT = 200;
+
+interface ChapterContextMenuState {
+	x: number;
+	y: number;
+	chapter: { id: string; title: string; status: string; role: string };
+	fromSha: string;
+}
 
 interface ClampBounds {
 	maxContentCross: number;
@@ -230,6 +243,23 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}
 			}
 		}
+
+		// Narrator panels — reposition using latest hitRects from PixiJS
+		const panelEls = panelElsRef.current;
+		if (panelEls.size > 0) {
+			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
+			const cEl = containerRef.current;
+			const cRect = cEl?.getBoundingClientRect();
+			const ox = cRect?.left ?? 0;
+			const oy = cRect?.top ?? 0;
+			for (const [chId, div] of panelEls) {
+				const hr = hitRects.find((r) => r.id === chId);
+				if (hr) {
+					div.style.left = `${ox + hr.screenX}px`;
+					div.style.top = `${oy + hr.screenY}px`;
+				}
+			}
+		}
 	}, []);
 
 	// Lightweight render: only updates DOM transforms, no React re-render.
@@ -293,6 +323,16 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		startLayoutX: number;
 		startLayoutY: number;
 		pointerId: number;
+	} | null>(null);
+	/** Long-press timer for touch card drag activation */
+	const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	/** Pending card hit info while waiting for long-press on touch */
+	const longPressPendingRef = useRef<{
+		hr: { id: string; fromSha: string; layoutX: number; layoutY: number };
+		clientX: number;
+		clientY: number;
+		pointerId: number;
+		target: HTMLElement;
 	} | null>(null);
 	// Chapter data for PixiJS — populated by SegmentCanvas callbacks
 	const pixiChaptersMapRef = useRef<
@@ -985,6 +1025,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							const diff = sz.targetScale - cur.scale;
 							const LERP = 0.18;
 							const mvp = curIsH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+							const prevPanX = cur.panX;
+							const prevPanY = cur.panY;
 
 							if (Math.abs(diff) < 0.001) {
 								// Close enough — snap to target
@@ -1001,6 +1043,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 									panY: curIsH ? newCrossPan : newMainPan,
 									scale: sz.targetScale,
 								});
+								// Rebase drag origin so concurrent panning stays consistent
+								if (isPanningRef.current) {
+									panStartRef.current.camX += cameraRef.current.panX - prevPanX;
+									panStartRef.current.camY += cameraRef.current.panY - prevPanY;
+								}
 								scheduleLightRender();
 								setCamera({ ...cameraRef.current });
 								sz.animating = false;
@@ -1029,6 +1076,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								panY: curIsH ? newCrossPan : newMainPan,
 								scale: newScale,
 							});
+							// Rebase drag origin so concurrent panning stays consistent
+							if (isPanningRef.current) {
+								panStartRef.current.camX += cameraRef.current.panX - prevPanX;
+								panStartRef.current.camY += cameraRef.current.panY - prevPanY;
+							}
 							scheduleLightRender();
 							// Commit to React state periodically (not every frame) to reduce GC pressure
 							// PixiJS handles morph/LOD in real time via updateCamera
@@ -1071,6 +1123,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						ss.frameCount = 0;
 						const smoothStep = () => {
 							const cur = cameraRef.current;
+							const prevPanX = cur.panX;
+							const prevPanY = cur.panY;
 							const curMain = cur.orientation === "horizontal" ? cur.panX : cur.panY;
 							const diff = ss.targetMainPan - curMain;
 
@@ -1085,6 +1139,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 										: { panY: ss.targetMainPan }),
 								});
 								cameraRef.current = finalCam;
+								// Rebase drag origin so concurrent panning stays consistent
+								if (isPanningRef.current) {
+									panStartRef.current.camX += cameraRef.current.panX - prevPanX;
+									panStartRef.current.camY += cameraRef.current.panY - prevPanY;
+								}
 								scheduleLightRender();
 								setCamera({ ...cameraRef.current });
 								ss.animating = false;
@@ -1105,6 +1164,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								...(cur.orientation === "horizontal" ? { panX: newMain } : { panY: newMain }),
 							});
 							cameraRef.current = newCam;
+							// Rebase drag origin so concurrent panning stays consistent
+							if (isPanningRef.current) {
+								panStartRef.current.camX += cameraRef.current.panX - prevPanX;
+								panStartRef.current.camY += cameraRef.current.panY - prevPanY;
+							}
 							scheduleLightRender();
 							// Commit to React state every 4 frames so SegmentCanvas
 							// visibility culling updates progressively instead of all at once.
@@ -1411,6 +1475,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	// Shared state for open narrator panels (lifted from SegmentCanvas for PixiJS interaction)
 	const [openPanelChapterIds, setOpenPanelChapterIds] = useState<Set<string>>(new Set());
+	const panelElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+	const [panelSizes, setPanelSizes] = useState<Map<string, { w: number; h: number }>>(new Map());
 
 	const handlePixiChapterClick = useCallback((chapterId: string, _narratorId: string | null) => {
 		setOpenPanelChapterIds((prev) => {
@@ -1440,6 +1506,30 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			}
 		},
 		[],
+	);
+
+	const handleCanvasContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
+			const containerEl = containerRef.current;
+			if (!containerEl || hitRects.length === 0) return;
+			const rect = containerEl.getBoundingClientRect();
+			const cx = e.clientX - rect.left;
+			const cy = e.clientY - rect.top;
+			for (const hr of hitRects) {
+				if (
+					cx >= hr.screenX &&
+					cx <= hr.screenX + hr.width &&
+					cy >= hr.screenY &&
+					cy <= hr.screenY + hr.height
+				) {
+					e.preventDefault();
+					handlePixiChapterContextMenu(hr.id, e.clientX, e.clientY);
+					return;
+				}
+			}
+		},
+		[handlePixiChapterContextMenu],
 	);
 
 	const handlePixiChapterDragEnd = useCallback(
@@ -1476,12 +1566,22 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	pixiClickRef.current = handlePixiChapterClick;
 	const pixiDragEndRef = useRef(handlePixiChapterDragEnd);
 	pixiDragEndRef.current = handlePixiChapterDragEnd;
+	// biome-ignore lint/style/noNonNullAssertion: initialized before first use (after handleChapterDragMove definition)
+	const chapterDragMoveRef = useRef<typeof handleChapterDragMove>(null!);
 
 	const handlePointerDown = useCallback((e: React.PointerEvent) => {
-		// Check card hit first (left click only)
+		// Cancel any pending long-press
+		if (longPressTimerRef.current) {
+			clearTimeout(longPressTimerRef.current);
+			longPressTimerRef.current = null;
+			longPressPendingRef.current = null;
+		}
+
+		// Check card hit first (left click / primary touch only)
 		if (e.button === 0) {
 			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
-			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+			const rect = containerRef.current?.getBoundingClientRect();
+			if (!rect) return;
 			const sx = e.clientX - rect.left;
 			const sy = e.clientY - rect.top;
 			for (const hr of hitRects) {
@@ -1491,6 +1591,46 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					sy >= hr.screenY &&
 					sy <= hr.screenY + hr.height
 				) {
+					const isTouch = e.pointerType === "touch";
+					if (isTouch) {
+						// Touch: start long-press timer, don't block pan yet
+						longPressPendingRef.current = {
+							hr: {
+								id: hr.id,
+								fromSha: hr.fromSha,
+								layoutX: hr.layoutX,
+								layoutY: hr.layoutY,
+							},
+							clientX: e.clientX,
+							clientY: e.clientY,
+							pointerId: e.pointerId,
+							target: e.currentTarget as HTMLElement,
+						};
+						longPressTimerRef.current = setTimeout(() => {
+							longPressTimerRef.current = null;
+							const p = longPressPendingRef.current;
+							if (!p) return;
+							longPressPendingRef.current = null;
+							// Activate card drag
+							cardDragRef.current = {
+								active: true,
+								chapterId: p.hr.id,
+								fromSha: p.hr.fromSha,
+								startScreenX: p.clientX,
+								startScreenY: p.clientY,
+								startLayoutX: p.hr.layoutX,
+								startLayoutY: p.hr.layoutY,
+								pointerId: p.pointerId,
+							};
+							// Cancel any ongoing pan
+							isPanningRef.current = false;
+							p.target.setPointerCapture(p.pointerId);
+							navigator.vibrate?.(50);
+						}, 400);
+						// Don't return — let pan logic below start normally
+						break;
+					}
+					// Mouse: immediate drag
 					cardDragRef.current = {
 						active: false,
 						chapterId: hr.id,
@@ -1525,6 +1665,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePointerMove = useCallback(
 		(e: React.PointerEvent) => {
+			// Cancel long-press if finger moved too far
+			const lp = longPressPendingRef.current;
+			if (lp) {
+				const lpDx = e.clientX - lp.clientX;
+				const lpDy = e.clientY - lp.clientY;
+				if (Math.abs(lpDx) > 10 || Math.abs(lpDy) > 10) {
+					if (longPressTimerRef.current) {
+						clearTimeout(longPressTimerRef.current);
+						longPressTimerRef.current = null;
+					}
+					longPressPendingRef.current = null;
+				}
+			}
+
 			// Card drag
 			const cd = cardDragRef.current;
 			if (cd) {
@@ -1532,6 +1686,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				const dy = e.clientY - cd.startScreenY;
 				if (!cd.active && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
 					cd.active = true;
+				}
+				if (cd.active) {
+					// Real-time visual update: compute new layout position and push to PixiJS
+					const cam = cameraRef.current;
+					const newLayoutX = cd.startLayoutX + dx / cam.scale;
+					const newLayoutY = cd.startLayoutY + dy / cam.scale;
+					const chs = pixiChaptersMapRef.current.get(cd.fromSha);
+					if (chs) {
+						const updated = chs.map((c) =>
+							c.id === cd.chapterId ? { ...c, layoutX: newLayoutX, layoutY: newLayoutY } : c,
+						);
+						pixiChaptersMapRef.current.set(cd.fromSha, updated);
+						chapterDragMoveRef.current(cd.fromSha, updated);
+					}
 				}
 				return;
 			}
@@ -1553,6 +1721,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePointerUp = useCallback(
 		(e: React.PointerEvent) => {
+			// Clean up long-press
+			if (longPressTimerRef.current) {
+				clearTimeout(longPressTimerRef.current);
+				longPressTimerRef.current = null;
+			}
+			const wasPendingLongPress = longPressPendingRef.current !== null;
+			longPressPendingRef.current = null;
+
 			// Card drag/click end
 			const cd = cardDragRef.current;
 			if (cd) {
@@ -1570,6 +1746,30 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						cd.startLayoutY + dy,
 					);
 				}
+				return;
+			}
+
+			// Touch tap on card (long-press didn't fire): treat as click
+			if (wasPendingLongPress) {
+				const hitRects = pixiRef.current?.getCardHitRects() ?? [];
+				const rect = containerRef.current?.getBoundingClientRect();
+				if (rect && hitRects.length > 0) {
+					const sx = e.clientX - rect.left;
+					const sy = e.clientY - rect.top;
+					for (const hr of hitRects) {
+						if (
+							sx >= hr.screenX &&
+							sx <= hr.screenX + hr.width &&
+							sy >= hr.screenY &&
+							sy <= hr.screenY + hr.height
+						) {
+							pixiClickRef.current(hr.id, hr.narratorId);
+							break;
+						}
+					}
+				}
+				isPanningRef.current = false;
+				setCamera({ ...cameraRef.current });
 				return;
 			}
 			if (isPanningRef.current) {
@@ -1688,6 +1888,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		},
 		[],
 	);
+	chapterDragMoveRef.current = handleChapterDragMove;
 
 	// Commit SHA → first line of message (for PixiJS tick labels)
 	const commitMessages = useMemo(() => {
@@ -1972,9 +2173,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				onPointerDown={handlePointerDown}
 				onPointerMove={handlePointerMove}
 				onPointerUp={handlePointerUp}
-				onDoubleClick={(e) => {
-					if (e.target === e.currentTarget) resetCamera();
-				}}
+				onContextMenu={handleCanvasContextMenu}
 			>
 				<Box
 					ref={worldLayerRef}
@@ -2011,7 +2210,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 									viewTop={worldViewTop}
 									viewHeight={worldViewHeight}
 									cardRegistry={cardRegistryRef}
-									onChapterContextMenu={setChapterMenu}
 									onFitToView={fitRectToView}
 									zoomCenterWorldX={fisheyeCenter}
 									viewportSize={mainViewport}
@@ -2143,6 +2341,286 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					onAbandon={handleChapterAbandon}
 				/>
 			)}
+
+			{/* Narrator panels for open chapters */}
+			{Array.from(openPanelChapterIds).map((chId) => {
+				let chData: { id: string; title: string; narratorId: string | null } | null = null;
+				for (const [_sha, chs] of pixiChaptersMapRef.current) {
+					const found = chs.find((c) => c.id === chId);
+					if (found) {
+						chData = found;
+						break;
+					}
+				}
+				if (!chData?.narratorId) return null;
+
+				const hitRects = pixiRef.current?.getCardHitRects() ?? [];
+				const hr = hitRects.find((r) => r.id === chId);
+				if (!hr) return null;
+
+				const containerEl = containerRef.current;
+				const cRect = containerEl?.getBoundingClientRect();
+				const screenX = (cRect?.left ?? 0) + hr.screenX;
+				const screenY = (cRect?.top ?? 0) + hr.screenY;
+
+				return (
+					<NarratorPanelOverlay
+						key={chId}
+						chapter={chData}
+						narratorId={chData.narratorId}
+						screenX={screenX}
+						screenY={screenY}
+						width={panelSizes.get(chId)?.w ?? DEFAULT_PANEL_WIDTH}
+						height={panelSizes.get(chId)?.h ?? DEFAULT_PANEL_HEIGHT}
+						scale={scale}
+						onClose={() => {
+							setOpenPanelChapterIds((prev) => {
+								const next = new Set(prev);
+								next.delete(chId);
+								return next;
+							});
+						}}
+						onResizeEnd={(newW, newH) => {
+							setPanelSizes((prev) => {
+								const next = new Map(prev);
+								next.set(chId, { w: newW, h: newH });
+								return next;
+							});
+							const anchorSha = hr.fromSha;
+							api.updateRulerPositions(projectId, [
+								{
+									chapterId: chId,
+									anchorCommitSha: anchorSha,
+									axisOffset: 0,
+									crossOffset: 0,
+									width: newW,
+									height: newH,
+								},
+							]);
+						}}
+						panelRef={(el) => {
+							if (el) {
+								panelElsRef.current.set(chId, el);
+							} else {
+								panelElsRef.current.delete(chId);
+							}
+						}}
+					/>
+				);
+			})}
 		</Box>
 	);
 }
+
+/** Floating narrator panel overlay — rendered when user clicks a card in PixiJS */
+function NarratorPanelOverlay({
+	chapter,
+	narratorId,
+	screenX,
+	screenY,
+	width: panelW,
+	height: panelH,
+	scale,
+	onClose,
+	onResizeEnd,
+	panelRef,
+}: {
+	chapter: { id: string; title: string };
+	narratorId: string;
+	screenX: number;
+	screenY: number;
+	width: number;
+	height: number;
+	scale: number;
+	onClose: () => void;
+	onResizeEnd: (newW: number, newH: number) => void;
+	panelRef?: (el: HTMLDivElement | null) => void;
+}) {
+	const isResizingRef = useRef(false);
+	const resizeStartRef = useRef({ x: 0, y: 0, origW: 0, origH: 0, corner: "" });
+	const [resizeDelta, setResizeDelta] = useState({ dw: 0, dh: 0, dx: 0, dy: 0 });
+	const resizeDeltaRef = useRef(resizeDelta);
+	resizeDeltaRef.current = resizeDelta;
+	const panelWheelRef = useRef<HTMLDivElement>(null);
+
+	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
+
+	// Prevent wheel events inside the panel from bubbling
+	useEffect(() => {
+		const el = panelWheelRef.current;
+		if (!el) return;
+		const handler = (e: WheelEvent) => {
+			e.stopPropagation();
+			if (e.ctrlKey || e.metaKey) e.preventDefault();
+		};
+		el.addEventListener("wheel", handler, { passive: false });
+		return () => el.removeEventListener("wheel", handler);
+	});
+
+	// Global pointer handlers for resize
+	useEffect(() => {
+		const handleMove = (e: PointerEvent) => {
+			if (!isResizingRef.current) return;
+			const rawDx = (e.clientX - resizeStartRef.current.x) / scale;
+			const rawDy = (e.clientY - resizeStartRef.current.y) / scale;
+			const corner = resizeStartRef.current.corner;
+			let dw = 0;
+			let dh = 0;
+			let dx = 0;
+			let dy = 0;
+			if (corner.includes("r")) dw = rawDx;
+			if (corner.includes("l")) {
+				dw = -rawDx;
+				dx = rawDx;
+			}
+			if (corner.includes("b")) dh = rawDy;
+			if (corner.includes("t")) {
+				dh = -rawDy;
+				dy = rawDy;
+			}
+			const clampedW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + dw);
+			const clampedH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + dh);
+			const actualDw = clampedW - resizeStartRef.current.origW;
+			const actualDh = clampedH - resizeStartRef.current.origH;
+			if (corner.includes("l")) dx = -actualDw;
+			if (corner.includes("t")) dy = -actualDh;
+			setResizeDelta({ dw: actualDw, dh: actualDh, dx, dy });
+		};
+		const handleUp = () => {
+			if (!isResizingRef.current) return;
+			isResizingRef.current = false;
+			const d = resizeDeltaRef.current;
+			const newW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + d.dw);
+			const newH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + d.dh);
+			onResizeEnd(newW, newH);
+			setResizeDelta({ dw: 0, dh: 0, dx: 0, dy: 0 });
+		};
+		window.addEventListener("pointermove", handleMove);
+		window.addEventListener("pointerup", handleUp);
+		return () => {
+			window.removeEventListener("pointermove", handleMove);
+			window.removeEventListener("pointerup", handleUp);
+		};
+	}, [scale, onResizeEnd]);
+
+	const displayW = Math.max(MIN_PANEL_WIDTH, panelW + resizeDelta.dw);
+	const displayH = Math.max(MIN_PANEL_HEIGHT, panelH + resizeDelta.dh);
+
+	const startResize = (e: React.PointerEvent, corner: string) => {
+		e.preventDefault();
+		e.stopPropagation();
+		isResizingRef.current = true;
+		resizeStartRef.current = { x: e.clientX, y: e.clientY, origW: panelW, origH: panelH, corner };
+	};
+
+	return (
+		<Card
+			ref={panelRef}
+			shadow="sm"
+			padding={6}
+			radius="sm"
+			withBorder
+			style={{
+				position: "fixed",
+				left: screenX + resizeDelta.dx,
+				top: screenY + resizeDelta.dy,
+				width: displayW,
+				height: displayH,
+				borderColor: "var(--mantine-color-indigo-3)",
+				borderWidth: 2,
+				borderStyle: "solid",
+				display: "flex",
+				flexDirection: "column",
+				overflow: "hidden",
+				transition: isResizingRef.current ? "none" : "width 200ms ease, height 200ms ease",
+				userSelect: "none",
+				zIndex: 10,
+				pointerEvents: "auto",
+			}}
+			onPointerDown={(e) => e.stopPropagation()}
+			onPointerUp={(e) => e.stopPropagation()}
+		>
+			{/* Resize handles */}
+			{(["tl", "tr", "bl", "br"] as const).map((corner) => (
+				<Box
+					key={corner}
+					style={{
+						position: "absolute",
+						width: corner === "br" ? 20 : 14,
+						height: corner === "br" ? 20 : 14,
+						zIndex: 10,
+						...(corner === "tl" ? { top: -2, left: -2, cursor: "nwse-resize" } : {}),
+						...(corner === "tr" ? { top: -2, right: -2, cursor: "nesw-resize" } : {}),
+						...(corner === "bl" ? { bottom: -2, left: -2, cursor: "nesw-resize" } : {}),
+						...(corner === "br"
+							? { bottom: 0, right: 0, cursor: "nwse-resize", overflow: "hidden" }
+							: {}),
+					}}
+					onPointerDown={(e) => startResize(e, corner)}
+				>
+					{corner === "br" && (
+						<Box
+							style={{
+								position: "absolute",
+								bottom: 0,
+								right: 0,
+								width: 0,
+								height: 0,
+								borderStyle: "solid",
+								borderWidth: "0 0 12px 12px",
+								borderColor: "transparent transparent var(--mantine-color-indigo-5) transparent",
+								opacity: 0.6,
+							}}
+						/>
+					)}
+				</Box>
+			))}
+
+			{/* Header */}
+			<Box style={{ cursor: "pointer" }} onClick={onClose}>
+				<Text size="11px" fw={600} truncate>
+					{chapter.title}
+				</Text>
+			</Box>
+
+			{/* Narrator panel */}
+			<Box
+				ref={panelWheelRef}
+				onClick={(e) => e.stopPropagation()}
+				onDoubleClick={(e) => e.stopPropagation()}
+				style={{
+					flex: 1,
+					minHeight: 0,
+					overflow: "hidden",
+					borderTop:
+						"1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
+					marginTop: 6,
+					position: "relative",
+				}}
+			>
+				<Box style={{ height: "100%", visibility: isCurrentlyResizing ? "hidden" : "visible" }}>
+					<StableNarratorPanel narratorId={narratorId} />
+				</Box>
+				{isCurrentlyResizing && (
+					<Box
+						style={{
+							position: "absolute",
+							inset: 0,
+							backgroundColor: "var(--mantine-color-body)",
+							opacity: 0.7,
+						}}
+					/>
+				)}
+			</Box>
+		</Card>
+	);
+}
+
+/** Memoized wrapper — prevents NarratorPanel from re-rendering during resize drags */
+const StableNarratorPanel = memo(function StableNarratorPanel({
+	narratorId,
+}: {
+	narratorId: string;
+}) {
+	return <NarratorPanel narratorId={narratorId} compact />;
+});
