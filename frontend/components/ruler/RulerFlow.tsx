@@ -357,6 +357,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		>
 	>(new Map());
 	const [pixiChaptersTick, setPixiChaptersTick] = useState(0);
+	const pixiChaptersTickRafRef = useRef(0);
 	const wheelCleanupRef = useRef<(() => void) | null>(null);
 	const resizeObserverRef = useRef<ResizeObserver | null>(null);
 	const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
@@ -687,6 +688,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			cancelAnimationFrame(smoothZoomRef.current.rafId);
 			cancelAnimationFrame(bounceRafRef.current);
 			cancelAnimationFrame(animFrameRef.current);
+			cancelAnimationFrame(pixiChaptersTickRafRef.current);
 			smoothScrollRef.current.animating = false;
 			smoothZoomRef.current.animating = false;
 			if (zoomCenterTimerRef.current) clearTimeout(zoomCenterTimerRef.current);
@@ -1469,6 +1471,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const worldViewportMain = mainViewport / scale;
 
+	const segmentTicksRef = useRef<typeof layout.ticks>([]);
 	const segmentTicks = useMemo(() => {
 		const worldViewStart = -mainPan / scale;
 		const segBuffer = (worldViewportMain * SEGMENT_VIEWPORT_MULTIPLIER - worldViewportMain) / 2;
@@ -1484,6 +1487,16 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}
 			}
 		}
+		// Stabilize reference: if the SHA set and segment refs haven't changed,
+		// return the previous array to avoid triggering downstream pixiChapters recomputation.
+		const prev = segmentTicksRef.current;
+		if (
+			prev.length === segs.length &&
+			prev.every((t, i) => t.sha === segs[i].sha && t.segment === segs[i].segment)
+		) {
+			return prev;
+		}
+		segmentTicksRef.current = segs;
 		return segs;
 	}, [layout.ticks, mainPan, scale, worldViewportMain]);
 
@@ -1493,9 +1506,19 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return map;
 	}, [segments]);
 
+	// Quantize scale for cluster computation to reduce recalculation frequency.
+	// clusterCommits uses scale for a discrete minScreenSize threshold (3 tiers)
+	// and a continuous screen-distance check. Quantization introduces ≤2px error
+	// in the distance check, which is negligible against the 20/40px thresholds.
+	const clusterScale = useMemo(() => {
+		if (scale >= 0.6) return 1; // L2+: clusterCommits returns []
+		if (scale >= 0.25) return Math.round(scale * 20) / 20; // 0.05 step
+		return Math.round(scale * 50) / 50; // 0.02 step
+	}, [scale]);
+
 	const clusters = useMemo(
-		() => clusterCommits(layout.ticks, segmentBySha, scale),
-		[layout.ticks, segmentBySha, scale],
+		() => clusterCommits(layout.ticks, segmentBySha, clusterScale),
+		[layout.ticks, segmentBySha, clusterScale],
 	);
 	const worldViewTop = -crossPan / scale;
 	const worldViewHeight = crossViewport / scale;
@@ -1899,7 +1922,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			} else {
 				pixiChaptersMapRef.current.set(fromSha, chapters);
 			}
-			setPixiChaptersTick((t) => t + 1);
+			// Batch multiple SegmentCanvas loads within the same frame into one React update
+			if (!pixiChaptersTickRafRef.current) {
+				pixiChaptersTickRafRef.current = requestAnimationFrame(() => {
+					pixiChaptersTickRafRef.current = 0;
+					setPixiChaptersTick((t) => t + 1);
+				});
+			}
 		},
 		[],
 	);

@@ -234,28 +234,37 @@ function renderTokens(tokens: ThemedToken[]) {
 	));
 }
 
-const lineNoStyle = {
+const lineNoGutterStyle = {
 	display: "inline-block",
-	minWidth: "3ch",
-	textAlign: "right" as const,
 	userSelect: "none" as const,
 	flexShrink: 0,
 	opacity: 0.4,
 	fontSize: "inherit",
 	fontFamily: "inherit",
-	paddingRight: "0.5ch",
 } as const;
+
+/** Build the fixed-width gutter string: " oldNo newNo±" with padStart alignment */
+function formatGutter(
+	oldNo: number | undefined,
+	newNo: number | undefined,
+	prefix: string,
+	w: number,
+): string {
+	const old = oldNo != null ? String(oldNo).padStart(w) : " ".repeat(w);
+	const nw = newNo != null ? String(newNo).padStart(w) : " ".repeat(w);
+	return `${old} ${nw}${prefix}`;
+}
 
 const DiffLineRow = memo(function DiffLineRow({
 	line,
 	tokens,
 	diffStyles,
-	showLineNumbers,
+	lineNoWidth,
 }: {
 	line: DiffLine;
 	tokens?: ThemedToken[];
 	diffStyles: ReturnType<typeof getDiffStyles>;
-	showLineNumbers?: boolean;
+	lineNoWidth?: number;
 }) {
 	const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
 	const lineStyle =
@@ -273,13 +282,13 @@ const DiffLineRow = memo(function DiffLineRow({
 
 	return (
 		<div style={lineStyle}>
-			{showLineNumbers && (
-				<>
-					<span style={lineNoStyle}>{line.oldLineNo ?? ""}</span>
-					<span style={lineNoStyle}>{line.newLineNo ?? ""}</span>
-				</>
+			{lineNoWidth != null ? (
+				<span style={{ ...lineNoGutterStyle, color: gutterColor }}>
+					{formatGutter(line.oldLineNo, line.newLineNo, prefix, lineNoWidth)}
+				</span>
+			) : (
+				<span style={{ ...gutterStyle, color: gutterColor }}>{prefix}</span>
 			)}
-			<span style={{ ...gutterStyle, color: gutterColor }}>{prefix}</span>
 			{line.wordChanges ? (
 				line.wordChanges.map((wc, j) => {
 					if (wc.removed) {
@@ -330,7 +339,15 @@ export const DiffView = memo(function DiffView({
 	const diffStyles = getDiffStyles(isDark);
 	const lines = useMemo(() => computeDiff(oldStr, newStr, startLine), [oldStr, newStr, startLine]);
 	const tokenMap = useTokenMap(lines, language, theme);
-	const showLineNumbers = startLine != null;
+	const lineNoWidth = useMemo(() => {
+		if (startLine == null) return undefined;
+		let maxNo = 1;
+		for (const l of lines) {
+			if (l.oldLineNo != null && l.oldLineNo > maxNo) maxNo = l.oldLineNo;
+			if (l.newLineNo != null && l.newLineNo > maxNo) maxNo = l.newLineNo;
+		}
+		return Math.max(3, String(maxNo).length);
+	}, [startLine, lines]);
 
 	if (lines.length === 0) return null;
 
@@ -367,7 +384,7 @@ export const DiffView = memo(function DiffView({
 						line={line}
 						tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
 						diffStyles={diffStyles}
-						showLineNumbers={showLineNumbers}
+						lineNoWidth={lineNoWidth}
 					/>
 				);
 			})}

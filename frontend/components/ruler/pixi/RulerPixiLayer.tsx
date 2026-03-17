@@ -708,6 +708,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			merged = mergedBuf;
 		}
 
+		// Pre-compute zoom morph factor — cam.scale is loop-invariant
+		const tZoom = getMorphFactor(cam.scale);
+
 		for (const ch of merged) {
 			const chWorldMain = ch.segMainPos + ch.layoutX + NODE_WIDTH / 2;
 			const ls = getLocalScale(chWorldMain);
@@ -717,7 +720,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// 2) Fisheye edge fade — how much the chapter is compressed at the edge
 			// This keeps cards visible as long as the zoom is deep enough AND the
 			// chapter hasn't been pushed too far into the fisheye periphery.
-			const tZoom = getMorphFactor(cam.scale);
 			const tEdge = getMorphFactor(ls);
 			let t = Math.min(tZoom, tEdge);
 
@@ -980,10 +982,18 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		[redraw],
 	);
 
-	// Full redraw when data changes (React re-render path)
-	// biome-ignore lint/correctness/useExhaustiveDependencies: data read from refs
+	// Full redraw when data changes (React re-render path).
+	// Skip redraw when only camera changed — the updateCamera fast-path already handled it.
+	const prevDataDepsRef = useRef("");
 	useEffect(() => {
 		latestCameraRef.current = camera;
+		// Build a fingerprint of all non-camera dependencies
+		const dataFingerprint = `${pixiReady}|${layout.totalWidth}|${segments.length}|${chapters.length}|${zoomTier}|${clusters.length}|${tickPositions.size}|${orientation}|${rulerThickness}|${commitMessages.size}|${alwaysVisibleChapters.length}|${openPanelChapterIds?.size ?? 0}`;
+		if (dataFingerprint === prevDataDepsRef.current) {
+			// Only camera changed — updateCamera fast-path already drew this frame
+			return;
+		}
+		prevDataDepsRef.current = dataFingerprint;
 		redraw(camera);
 	}, [
 		pixiReady,
