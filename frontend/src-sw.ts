@@ -13,11 +13,16 @@ declare let self: ServiceWorkerGlobalScope;
 precacheAndRoute(self.__WB_MANIFEST);
 cleanupOutdatedCaches();
 
-// SPA: serve index.html for all navigation requests
-registerRoute(new NavigationRoute(createHandlerBoundToURL("index.html")));
-
-// API requests always go to network
+// API and WebSocket requests always go to network
 registerRoute(/^https?:\/\/.*\/api\//, new NetworkOnly(), "GET");
+registerRoute(/^https?:\/\/.*\/api\//, new NetworkOnly(), "POST");
+
+// SPA: serve index.html for navigation requests, but NOT for /api/ or /ws/ paths
+registerRoute(
+	new NavigationRoute(createHandlerBoundToURL("index.html"), {
+		denylist: [/^\/api\//, /^\/ws\//],
+	}),
+);
 
 // ── Version check on activate ──────────────────────────────────────────────
 const APP_VERSION = __APP_VERSION__;

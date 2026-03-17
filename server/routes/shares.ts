@@ -52,14 +52,14 @@ shareRoutes.get("/:shareId", async (c) => {
 	// ASCII-safe fallback: replace non-ASCII chars with underscores
 	const asciiFallback = base.replace(/[^\x20-\x7E]/g, "_");
 
-	// Use stream() instead of Bun.file() directly as Response body,
-	// so that our explicit Content-Length header is preserved
-	// (Bun.file() as body may trigger chunked transfer encoding).
-	return new Response(file.stream(), {
+	// Use BunFile directly as Response body — Bun natively handles it with
+	// correct Content-Length, enabling browsers to show download progress.
+	// (ReadableStream from file.stream() triggers chunked transfer encoding,
+	// which strips Content-Length and breaks progress reporting.)
+	return new Response(file, {
 		headers: {
 			"Content-Type": file.type || "application/octet-stream",
 			"Content-Disposition": `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`,
-			"Content-Length": String(record.size),
 			"Cache-Control": "no-cache",
 		},
 	});
@@ -163,7 +163,6 @@ shareRoutes.get("/:shareId/preview", async (c) => {
 		headers: {
 			"Content-Type": contentType,
 			"Content-Disposition": "inline",
-			"Content-Length": String(record.size),
 			"Cache-Control": "private, max-age=3600",
 		},
 	});
