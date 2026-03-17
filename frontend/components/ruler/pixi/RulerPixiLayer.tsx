@@ -722,7 +722,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		const cardScale = getCardScale(cam.scale);
 
 		for (const ch of merged) {
-			const chWorldMain = ch.segMainPos + ch.layoutX + NODE_WIDTH / 2;
+			const chWorldMain = ch.segMainPos + ch.layoutX;
 			const ls = getLocalScale(chWorldMain);
 
 			// Morph factor is the minimum of two independent factors:

@@ -10,6 +10,7 @@ import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
+import { recallTool } from "./recall";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
 import { agentTool } from "./task";
@@ -28,6 +29,7 @@ import { writeTool } from "./write";
 export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["Recall", recallTool],
 ]);
 
 /** Register all core tools into the singleton registry */

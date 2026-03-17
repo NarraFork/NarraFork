@@ -107,7 +107,7 @@ import {
 	renderToolRun,
 	StreamingBubble,
 } from "./MessageRenderer";
-import { findMsgByToolUseIdInTree } from "./message-tree-utils";
+import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { hasToolUse, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
@@ -1060,6 +1060,7 @@ export function NarratorPanel({
 	const titleInputRef = useRef<HTMLInputElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	const sendingRef = useRef(false);
 
 	// Force react-textarea-autosize to recalculate after viewport width
 	// changes (e.g. DevTools mobile↔desktop toggle). The library recalculates
@@ -1327,14 +1328,13 @@ export function NarratorPanel({
 	const mountTrimmedRef = useRef(false);
 	if (!mountTrimmedRef.current) {
 		mountTrimmedRef.current = true;
-		const MAX_PAGES_ON_SWITCH = 3;
+		const MAX_MOUNT_MESSAGES = 60;
 		const cached = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
-		if (cached?.pages && cached.pages.length > MAX_PAGES_ON_SWITCH) {
-			qc.setQueryData(messagesQueryKey, {
-				...cached,
-				pages: cached.pages.slice(0, MAX_PAGES_ON_SWITCH),
-				pageParams: cached.pageParams.slice(0, MAX_PAGES_ON_SWITCH),
-			});
+		if (cached?.pages && cached.pages.length > 1) {
+			const trimmed = evictOldestPages(cached, MAX_MOUNT_MESSAGES);
+			if (trimmed !== cached) {
+				qc.setQueryData(messagesQueryKey, trimmed);
+			}
 		}
 	}
 	const skipProgressive = !!highlightMessageId;
@@ -1353,19 +1353,7 @@ export function NarratorPanel({
 			const MAX_CACHED_MESSAGES = 200;
 			qc.setQueryData(keyToTrim, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length || old.pages.length <= 1) return old;
-				let total = 0;
-				let keepCount = 0;
-				for (const page of old.pages) {
-					total += page.messages?.length ?? 0;
-					keepCount++;
-					if (total >= MAX_CACHED_MESSAGES) break;
-				}
-				if (keepCount >= old.pages.length) return old;
-				return {
-					...old,
-					pages: old.pages.slice(0, keepCount),
-					pageParams: old.pageParams.slice(0, keepCount),
-				};
+				return evictOldestPages(old, MAX_CACHED_MESSAGES) as MessagesQueryData;
 			});
 		};
 	}, [messagesQueryKey, qc]);
@@ -1794,39 +1782,44 @@ export function NarratorPanel({
 
 	const handleSend = async () => {
 		const msg = input.trim();
-		if (!msg) return;
-		inputHistory.push(msg);
-		if (isActive) {
-			// Send via HTTP POST so images are uploaded via multipart/form-data
+		if (!msg || sendingRef.current) return;
+		sendingRef.current = true;
+		try {
+			inputHistory.push(msg);
+			if (isActive) {
+				// Send via HTTP POST so images are uploaded via multipart/form-data
+				const images = [...attachedImages];
+				setInput("");
+				setAttachedImages([]);
+				try {
+					const result = await api.sendNarratorMessage(
+						narratorId,
+						msg,
+						images.length > 0 ? images : undefined,
+					);
+					if (result?.buffered) {
+						// Don't optimistically insert — the WS buffer_set broadcast
+						// from the server will sync the authoritative queue state.
+						scrollToBottom(true);
+					}
+				} catch {
+					// Fallback to WebSocket text-only buffer (images not supported over WS)
+					if (images.length > 0) {
+						setAttachedImages(images);
+					}
+					sendBufferMessage(narratorId, msg);
+					// Optimistic: WS buffer_set will sync the real state
+					scrollToBottom(true);
+				}
+				return;
+			}
 			const images = [...attachedImages];
 			setInput("");
 			setAttachedImages([]);
-			try {
-				const result = await api.sendNarratorMessage(
-					narratorId,
-					msg,
-					images.length > 0 ? images : undefined,
-				);
-				if (result?.buffered) {
-					// Don't optimistically insert — the WS buffer_set broadcast
-					// from the server will sync the authoritative queue state.
-					scrollToBottom(true);
-				}
-			} catch {
-				// Fallback to WebSocket text-only buffer (images not supported over WS)
-				if (images.length > 0) {
-					setAttachedImages(images);
-				}
-				sendBufferMessage(narratorId, msg);
-				// Optimistic: WS buffer_set will sync the real state
-				scrollToBottom(true);
-			}
-			return;
+			await submitMessage(msg, images);
+		} finally {
+			sendingRef.current = false;
 		}
-		const images = [...attachedImages];
-		setInput("");
-		setAttachedImages([]);
-		await submitMessage(msg, images);
 	};
 
 	const handleRetry = async () => {

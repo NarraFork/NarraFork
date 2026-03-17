@@ -1724,10 +1724,15 @@ async function createNarrator(
 		_enabledOptionalTools: new Set(),
 	};
 
-	// Auto-load optional tools whose routines are globally enabled (not in disabledRoutines)
+	// Auto-load optional tools whose routines are globally enabled
 	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
+	const enabledRoutines = new Set(settings.routines?.enabledRoutines ?? []);
 	for (const routine of getBuiltinToolRoutines()) {
-		if (routine.tool && !disabledRoutines.has(routine.id)) {
+		if (!routine.tool) continue;
+		const on = routine.defaultEnabled
+			? !disabledRoutines.has(routine.id)
+			: enabledRoutines.has(routine.id);
+		if (on) {
 			active._enabledOptionalTools.add(routine.tool.toolName);
 		}
 	}

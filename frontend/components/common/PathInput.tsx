@@ -167,31 +167,33 @@ export function PathInput(props: PathInputProps) {
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") {
+			// When dropdown is open, try to fill the first option on Enter
+			if (combobox.dropdownOpened) {
+				const idx = combobox.getSelectedOptionIndex();
+				if (idx === -1 && options.length > 0) {
+					// No highlighted option — select the first candidate
+					e.preventDefault();
+					handleOptionSubmit(options[0].path);
+					return;
+				}
+				if (idx !== -1) {
+					// Let Combobox handle the highlighted option selection
+					return;
+				}
+			}
+
 			if (isControlled) {
 				// Controlled mode: just close dropdown on Enter
 				combobox.closeDropdown();
 				return;
 			}
 			// Uncontrolled mode: confirm and clear
-			if (combobox.dropdownOpened) {
-				const idx = combobox.getSelectedOptionIndex();
-				if (idx === -1) {
-					e.preventDefault();
-					combobox.closeDropdown();
-					const v = value.trim();
-					if (v) {
-						props.onConfirm(v);
-						setValue("");
-					}
-				}
-				// else let Combobox handle the option selection
-			} else {
-				e.preventDefault();
-				const v = value.trim();
-				if (v) {
-					props.onConfirm(v);
-					setValue("");
-				}
+			e.preventDefault();
+			combobox.closeDropdown();
+			const v = value.trim();
+			if (v) {
+				props.onConfirm(v);
+				setValue("");
 			}
 		}
 	};

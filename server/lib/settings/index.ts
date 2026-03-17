@@ -204,6 +204,8 @@ export interface NarraForkSettings {
 	routines: {
 		/** Globally disabled routine IDs (blacklist — all enabled by default). */
 		disabledRoutines: string[];
+		/** Explicitly enabled routine IDs (for routines with defaultEnabled: false). */
+		enabledRoutines: string[];
 	};
 	/** Multiple OpenAI-compatible API providers. */
 	openaiProviders?: OpenAIProviderConfig[];
@@ -276,6 +278,7 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	routines: {
 		disabledRoutines: [],
+		enabledRoutines: [],
 	},
 	codex: {
 		defaultReasoningEffort: "high",

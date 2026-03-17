@@ -67,7 +67,15 @@ export interface RoutineStatus {
 
 /** Check if a routine is globally enabled (not in the disabled list). */
 function isGloballyEnabled(routineId: string): boolean {
+	const routine = getBuiltinRoutine(routineId);
 	const disabled = settings.routines?.disabledRoutines ?? [];
+	// Routines default to off (defaultEnabled omitted or false).
+	// They require explicit opt-in via the enabledRoutines whitelist.
+	// Routines with defaultEnabled: true use the legacy blacklist approach.
+	if (!routine?.defaultEnabled) {
+		const enabled = settings.routines?.enabledRoutines ?? [];
+		return enabled.includes(routineId);
+	}
 	return !disabled.includes(routineId);
 }
 
@@ -125,11 +133,20 @@ export async function enableRoutineGlobal(routineId: string, userId: string): Pr
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
 
-	// Remove from disabled list in settings
+	// Remove from disabled list, add to enabled list in settings
 	const disabled = settings.routines?.disabledRoutines ?? [];
+	const enabled = settings.routines?.enabledRoutines ?? [];
 	const newDisabled = disabled.filter((id) => id !== routineId);
+	const newEnabled = enabled.includes(routineId) ? enabled : [...enabled, routineId];
 	const { saveSettings } = await import("../lib/settings");
-	saveSettings({ ...settings, routines: { ...settings.routines, disabledRoutines: newDisabled } });
+	saveSettings({
+		...settings,
+		routines: {
+			...settings.routines,
+			disabledRoutines: newDisabled,
+			enabledRoutines: newEnabled,
+		},
+	});
 
 	// Materialize (tool type needs no materialization — just the settings flag)
 	if (routine.type === "command" && routine.command) {
@@ -146,13 +163,25 @@ export async function disableRoutineGlobal(routineId: string, userId: string): P
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
 
-	// Add to disabled list in settings
+	// Add to disabled list, remove from enabled list in settings
 	const disabled = settings.routines?.disabledRoutines ?? [];
+	const enabled = settings.routines?.enabledRoutines ?? [];
+	const newEnabled = enabled.filter((id) => id !== routineId);
 	if (!disabled.includes(routineId)) {
 		const { saveSettings } = await import("../lib/settings");
 		saveSettings({
 			...settings,
-			routines: { ...settings.routines, disabledRoutines: [...disabled, routineId] },
+			routines: {
+				...settings.routines,
+				disabledRoutines: [...disabled, routineId],
+				enabledRoutines: newEnabled,
+			},
+		});
+	} else if (newEnabled.length !== enabled.length) {
+		const { saveSettings } = await import("../lib/settings");
+		saveSettings({
+			...settings,
+			routines: { ...settings.routines, enabledRoutines: newEnabled },
 		});
 	}
 
