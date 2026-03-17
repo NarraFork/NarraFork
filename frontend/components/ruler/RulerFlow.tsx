@@ -334,16 +334,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		startLayoutX: number;
 		startLayoutY: number;
 		pointerId: number;
-	} | null>(null);
-	/** Long-press timer for touch card drag activation */
-	const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	/** Pending card hit info while waiting for long-press on touch */
-	const longPressPendingRef = useRef<{
-		hr: { id: string; fromSha: string; layoutX: number; layoutY: number };
-		clientX: number;
-		clientY: number;
-		pointerId: number;
-		target: HTMLElement;
+		/** Set when drag was prepared by contextmenu (touch long-press) — suppress click on release */
+		fromContextMenu?: boolean;
 	} | null>(null);
 	// Chapter data for PixiJS — populated by SegmentCanvas callbacks
 	const pixiChaptersMapRef = useRef<
@@ -1545,8 +1537,56 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		[],
 	);
 
+	/** Suppress contextmenu events triggered by touch long-press card drag */
+	const suppressContextMenuRef = useRef(false);
+	/** Touch hit on a card — stored until contextmenu (long-press) promotes it to drag */
+	const touchCardHitRef = useRef<{
+		id: string;
+		fromSha: string;
+		layoutX: number;
+		layoutY: number;
+		clientX: number;
+		clientY: number;
+		pointerId: number;
+	} | null>(null);
+
 	const handleCanvasContextMenu = useCallback(
 		(e: React.MouseEvent) => {
+			// Suppress browser contextmenu when touch long-press card drag is active
+			if (suppressContextMenuRef.current) {
+				e.preventDefault();
+				return;
+			}
+			// Touch long-press on a card: open context menu AND prepare card drag.
+			// If the finger moves past the dead zone, the menu closes and drag activates.
+			// If the finger lifts, the menu stays open.
+			const tch = touchCardHitRef.current;
+			if (tch) {
+				e.preventDefault();
+				touchCardHitRef.current = null;
+				// Open chapter context menu
+				handlePixiChapterContextMenu(tch.id, e.clientX, e.clientY);
+				// Prepare card drag (inactive — will activate on move past dead zone)
+				cardDragRef.current = {
+					active: false,
+					chapterId: tch.id,
+					fromSha: tch.fromSha,
+					startScreenX: tch.clientX,
+					startScreenY: tch.clientY,
+					startLayoutX: tch.layoutX,
+					startLayoutY: tch.layoutY,
+					pointerId: tch.pointerId,
+					fromContextMenu: true,
+				};
+				// Cancel ongoing pan
+				isPanningRef.current = false;
+				// Ensure pointer capture so drag events aren't lost if finger leaves canvas
+				try {
+					containerRef.current?.setPointerCapture(tch.pointerId);
+				} catch {}
+				navigator.vibrate?.(50);
+				return;
+			}
 			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
 			const containerEl = containerRef.current;
 			if (!containerEl || hitRects.length === 0) return;
@@ -1607,13 +1647,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const chapterDragMoveRef = useRef<typeof handleChapterDragMove>(null!);
 
 	const handlePointerDown = useCallback((e: React.PointerEvent) => {
-		// Cancel any pending long-press
-		if (longPressTimerRef.current) {
-			clearTimeout(longPressTimerRef.current);
-			longPressTimerRef.current = null;
-			longPressPendingRef.current = null;
-		}
-
 		// Check card hit first (left click / primary touch only)
 		if (e.button === 0) {
 			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
@@ -1628,46 +1661,21 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					sy >= hr.screenY &&
 					sy <= hr.screenY + hr.height
 				) {
-					const isTouch = e.pointerType === "touch";
-					if (isTouch) {
-						// Touch: start long-press timer, don't block pan yet
-						longPressPendingRef.current = {
-							hr: {
-								id: hr.id,
-								fromSha: hr.fromSha,
-								layoutX: hr.layoutX,
-								layoutY: hr.layoutY,
-							},
+					if (e.pointerType === "touch") {
+						// Touch: record hit, let pan start normally below.
+						// contextmenu (long-press) will promote to card drag.
+						touchCardHitRef.current = {
+							id: hr.id,
+							fromSha: hr.fromSha,
+							layoutX: hr.layoutX,
+							layoutY: hr.layoutY,
 							clientX: e.clientX,
 							clientY: e.clientY,
 							pointerId: e.pointerId,
-							target: e.currentTarget as HTMLElement,
 						};
-						longPressTimerRef.current = setTimeout(() => {
-							longPressTimerRef.current = null;
-							const p = longPressPendingRef.current;
-							if (!p) return;
-							longPressPendingRef.current = null;
-							// Activate card drag
-							cardDragRef.current = {
-								active: true,
-								chapterId: p.hr.id,
-								fromSha: p.hr.fromSha,
-								startScreenX: p.clientX,
-								startScreenY: p.clientY,
-								startLayoutX: p.hr.layoutX,
-								startLayoutY: p.hr.layoutY,
-								pointerId: p.pointerId,
-							};
-							// Cancel any ongoing pan
-							isPanningRef.current = false;
-							p.target.setPointerCapture(p.pointerId);
-							navigator.vibrate?.(50);
-						}, 400);
-						// Don't return — let pan logic below start normally
 						break;
 					}
-					// Mouse: immediate drag
+					// Mouse: immediate drag (inactive until dead zone exceeded)
 					cardDragRef.current = {
 						active: false,
 						chapterId: hr.id,
@@ -1713,17 +1721,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePointerMove = useCallback(
 		(e: React.PointerEvent) => {
-			// Cancel long-press if finger moved too far
-			const lp = longPressPendingRef.current;
-			if (lp) {
-				const lpDx = e.clientX - lp.clientX;
-				const lpDy = e.clientY - lp.clientY;
-				if (Math.abs(lpDx) > 10 || Math.abs(lpDy) > 10) {
-					if (longPressTimerRef.current) {
-						clearTimeout(longPressTimerRef.current);
-						longPressTimerRef.current = null;
-					}
-					longPressPendingRef.current = null;
+			// Cancel touch card hit if finger moved too far (user is panning, not long-pressing)
+			const tch = touchCardHitRef.current;
+			if (tch) {
+				const tdx = e.clientX - tch.clientX;
+				const tdy = e.clientY - tch.clientY;
+				if (Math.abs(tdx) > 10 || Math.abs(tdy) > 10) {
+					touchCardHitRef.current = null;
 				}
 			}
 
@@ -1734,12 +1738,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				const dy = e.clientY - cd.startScreenY;
 				if (!cd.active && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
 					cd.active = true;
+					// Suppress browser contextmenu while dragging
+					suppressContextMenuRef.current = true;
+					// Close any open context menu
+					setChapterMenu(null);
+					setTickMenu(null);
 				}
 				if (cd.active) {
 					// Real-time visual update: compute new layout position and push to PixiJS
 					const cam = cameraRef.current;
-					const newLayoutX = cd.startLayoutX + dx / cam.scale;
-					const newLayoutY = cd.startLayoutY + dy / cam.scale;
+					const isH = cam.orientation === "horizontal";
+					// In horizontal mode: screen X → layoutX (main), screen Y → layoutY (cross)
+					// In vertical mode: screen Y → layoutX (main), screen X → layoutY (cross)
+					const newLayoutX = cd.startLayoutX + (isH ? dx : dy) / cam.scale;
+					const newLayoutY = cd.startLayoutY + (isH ? dy : dx) / cam.scale;
 					const chs = pixiChaptersMapRef.current.get(cd.fromSha);
 					if (chs) {
 						const updated = chs.map((c) =>
@@ -1769,57 +1781,64 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePointerUp = useCallback(
 		(e: React.PointerEvent) => {
-			// Clean up long-press
-			if (longPressTimerRef.current) {
-				clearTimeout(longPressTimerRef.current);
-				longPressTimerRef.current = null;
+			// Reset contextmenu suppression after a short delay so the
+			// browser's contextmenu event (which fires after pointerup) is still caught
+			if (suppressContextMenuRef.current) {
+				setTimeout(() => {
+					suppressContextMenuRef.current = false;
+				}, 100);
 			}
-			const wasPendingLongPress = longPressPendingRef.current !== null;
-			longPressPendingRef.current = null;
+
+			// Touch tap on card (long-press didn't fire): treat as click
+			const tch = touchCardHitRef.current;
+			if (tch) {
+				touchCardHitRef.current = null;
+				if (!cardDragRef.current) {
+					pixiClickRef.current(tch.id, null);
+					// Swallow the synthetic click that the browser fires after pointerup
+					// so it doesn't land on the panel that just appeared under the finger.
+					document.addEventListener(
+						"click",
+						(ev) => {
+							ev.stopPropagation();
+							ev.preventDefault();
+						},
+						{ capture: true, once: true },
+					);
+					isPanningRef.current = false;
+					setCamera({ ...cameraRef.current });
+					return;
+				}
+			}
 
 			// Card drag/click end
 			const cd = cardDragRef.current;
 			if (cd) {
 				cardDragRef.current = null;
 				if (!cd.active) {
-					pixiClickRef.current(cd.chapterId, null);
+					// Don't fire click when releasing after a context-menu long-press —
+					// the menu is already open, clicking would navigate away.
+					if (!cd.fromContextMenu) {
+						pixiClickRef.current(cd.chapterId, null);
+					}
 				} else {
 					const cam = cameraRef.current;
-					const dx = (e.clientX - cd.startScreenX) / cam.scale;
-					const dy = (e.clientY - cd.startScreenY) / cam.scale;
+					const isH = cam.orientation === "horizontal";
+					const screenDx = e.clientX - cd.startScreenX;
+					const screenDy = e.clientY - cd.startScreenY;
+					// Match the axis mapping from handlePointerMove
+					const dMain = (isH ? screenDx : screenDy) / cam.scale;
+					const dCross = (isH ? screenDy : screenDx) / cam.scale;
 					pixiDragEndRef.current(
 						cd.chapterId,
 						cd.fromSha,
-						cd.startLayoutX + dx,
-						cd.startLayoutY + dy,
+						cd.startLayoutX + dMain,
+						cd.startLayoutY + dCross,
 					);
 				}
 				return;
 			}
 
-			// Touch tap on card (long-press didn't fire): treat as click
-			if (wasPendingLongPress) {
-				const hitRects = pixiRef.current?.getCardHitRects() ?? [];
-				const rect = containerRef.current?.getBoundingClientRect();
-				if (rect && hitRects.length > 0) {
-					const sx = e.clientX - rect.left;
-					const sy = e.clientY - rect.top;
-					for (const hr of hitRects) {
-						if (
-							sx >= hr.screenX &&
-							sx <= hr.screenX + hr.width &&
-							sy >= hr.screenY &&
-							sy <= hr.screenY + hr.height
-						) {
-							pixiClickRef.current(hr.id, hr.narratorId);
-							break;
-						}
-					}
-				}
-				isPanningRef.current = false;
-				setCamera({ ...cameraRef.current });
-				return;
-			}
 			if (isPanningRef.current) {
 				isPanningRef.current = false;
 

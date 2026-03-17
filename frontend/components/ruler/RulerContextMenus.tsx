@@ -65,6 +65,7 @@ export function TickContextMenu({
 				minWidth: 220,
 				maxWidth: 360,
 				boxShadow: "0 4px 12px light-dark(rgba(0,0,0,0.1), rgba(0,0,0,0.3))",
+				userSelect: "none",
 			}}
 			onClick={(e) => e.stopPropagation()}
 		>
@@ -169,6 +170,7 @@ export function ChapterContextMenu({
 				padding: 4,
 				minWidth: 180,
 				boxShadow: "0 4px 12px light-dark(rgba(0,0,0,0.1), rgba(0,0,0,0.3))",
+				userSelect: "none",
 			}}
 			onClick={(e) => e.stopPropagation()}
 		>
