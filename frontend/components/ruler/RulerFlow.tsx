@@ -31,7 +31,7 @@ import {
 	type RulerEdge,
 	type RulerOrientation,
 } from "./types";
-import { getZoomTierInfo, type ZoomTierId } from "./zoom-tiers";
+import { getCardScale, getZoomTierInfo, SCALE_MAX, SCALE_MIN, type ZoomTierId } from "./zoom-tiers";
 
 interface RulerFlowProps {
 	projectId: string;
@@ -989,7 +989,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					if (!sz.animating) {
 						sz.targetScale = cam.scale;
 					}
-					sz.targetScale = Math.max(0.1, Math.min(5, sz.targetScale * factor));
+					sz.targetScale = Math.max(SCALE_MIN, Math.min(SCALE_MAX, sz.targetScale * factor));
 
 					// Compute world-space anchor from current (not target) camera
 					const mainPan = isH ? cam.panX : cam.panY;
@@ -1266,7 +1266,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				const isH = cam.orientation === "horizontal";
 
 				// Scale
-				const newScale = Math.max(0.1, Math.min(5, p.startScale * (newDist / p.startDist)));
+				const newScale = Math.max(
+					SCALE_MIN,
+					Math.min(SCALE_MAX, p.startScale * (newDist / p.startDist)),
+				);
 
 				// Anchor zoom at pinch center
 				const canvasMouseMain = isH ? center.x : center.y;
@@ -2541,6 +2544,9 @@ function NarratorPanelOverlay({
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
 
+	// Panel scales with camera zoom — shared formula from zoom-tiers
+	const panelScale = getCardScale(scale);
+
 	// Prevent wheel events inside the panel from bubbling
 	useEffect(() => {
 		const el = panelWheelRef.current;
@@ -2557,8 +2563,8 @@ function NarratorPanelOverlay({
 	useEffect(() => {
 		const handleMove = (e: PointerEvent) => {
 			if (!isResizingRef.current) return;
-			const rawDx = (e.clientX - resizeStartRef.current.x) / scale;
-			const rawDy = (e.clientY - resizeStartRef.current.y) / scale;
+			const rawDx = (e.clientX - resizeStartRef.current.x) / (scale * panelScale);
+			const rawDy = (e.clientY - resizeStartRef.current.y) / (scale * panelScale);
 			const corner = resizeStartRef.current.corner;
 			let dw = 0;
 			let dh = 0;
@@ -2597,7 +2603,7 @@ function NarratorPanelOverlay({
 			window.removeEventListener("pointermove", handleMove);
 			window.removeEventListener("pointerup", handleUp);
 		};
-	}, [scale, onResizeEnd]);
+	}, [scale, onResizeEnd, panelScale]);
 
 	const displayW = Math.max(MIN_PANEL_WIDTH, panelW + resizeDelta.dw);
 	const displayH = Math.max(MIN_PANEL_HEIGHT, panelH + resizeDelta.dh);
@@ -2632,6 +2638,8 @@ function NarratorPanelOverlay({
 				userSelect: "none",
 				zIndex: 10,
 				pointerEvents: "auto",
+				transform: `scale(${panelScale})`,
+				transformOrigin: "top left",
 			}}
 			onPointerDown={(e) => e.stopPropagation()}
 			onPointerUp={(e) => e.stopPropagation()}

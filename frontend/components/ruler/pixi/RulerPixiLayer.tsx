@@ -21,7 +21,14 @@ import {
 	TextPool,
 } from "../pixi-draw";
 import type { RulerOrientation } from "../types";
-import { getCenterFade, getMorphFactor, getMorphStyle, type ZoomTierId } from "../zoom-tiers";
+import {
+	DOT_FINAL_SIZE,
+	getCardScale,
+	getMorphFactor,
+	getMorphStyle,
+	MORPH_T_DOT,
+	type ZoomTierId,
+} from "../zoom-tiers";
 import type { PixiTheme } from "./pixi-theme";
 import { invalidatePixiThemeCache, resolvePixiTheme, themeStatusColor } from "./pixi-theme";
 
@@ -711,6 +718,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		// Pre-compute zoom morph factor — cam.scale is loop-invariant
 		const tZoom = getMorphFactor(cam.scale);
 
+		// Card scale factor (clamped) — shared with NarratorPanelOverlay in RulerFlow.
+		const cardScale = getCardScale(cam.scale);
+
 		for (const ch of merged) {
 			const chWorldMain = ch.segMainPos + ch.layoutX + NODE_WIDTH / 2;
 			const ls = getLocalScale(chWorldMain);
@@ -730,26 +740,22 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			if (!ch.title || !ch.status) continue;
 
 			const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
-			const centerFade = getCenterFade(t);
-			const centerOffsetX = (NODE_WIDTH - morph.width) / 2;
-			const centerOffsetY = (NODE_HEIGHT - morph.height) / 2;
 
-			// --- Unified position: always compute left-edge world coord ---
-			// This ensures pill and card use the exact same anchor through
-			// the fisheye transform, eliminating the position jump.
-			const elemWorldMain = ch.segMainPos + ch.layoutX + centerOffsetX * centerFade;
+			// Apply cardScale to pill/card phases, keep dots at fixed size.
+			const isDot = t <= MORPH_T_DOT;
+			const scaledW = isDot ? morph.width : Math.max(DOT_FINAL_SIZE, morph.width * cardScale);
+			const scaledH = isDot ? morph.height : Math.max(DOT_FINAL_SIZE, morph.height * cardScale);
+
+			// Fixed anchor — start edge of the layout slot for all morph phases.
+			// Dot/pill/card all grow from this point toward the end of the main axis,
+			// keeping the connector endpoint stable throughout the morph transition.
+			const elemWorldMain = ch.segMainPos + ch.layoutX;
 			const elemScreenLeft = toScreen(elemWorldMain);
 			// Main-axis size of the element in screen pixels (used for connector endpoints).
-			// In horizontal mode the card's CSS width runs along the main axis;
-			// in vertical mode the card's CSS height runs along the main axis.
-			const elemMainSize = isH ? morph.width : morph.height;
+			const elemMainSize = isH ? scaledW : scaledH;
 
-			const elemScreenCross =
-				crossBase +
-				(ch.layoutY + CARD_TOP_OFFSET) * cam.scale +
-				crossPan +
-				centerOffsetY * centerFade;
-			const elemScreenCenterCross = elemScreenCross + morph.height / 2;
+			const elemScreenCross = crossBase + (ch.layoutY + CARD_TOP_OFFSET) * cam.scale + crossPan;
+			const elemScreenCenterCross = elemScreenCross + scaledH / 2;
 
 			const hasPanel = d.openPanelChapterIds?.has(ch.id);
 
@@ -757,8 +763,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// Card visual dimensions stay the same regardless of orientation —
 			// only the position axes swap. morph.width is always the card's
 			// CSS width and morph.height is always the CSS height.
-			const screenW = morph.width;
-			const screenH = morph.height;
+			// Anchor is the start edge — scaling only extends toward the end.
+			const screenW = scaledW;
+			const screenH = scaledH;
 			const nodeLeft = isH ? elemScreenLeft : elemScreenCross;
 			const nodeTop = isH ? elemScreenCross : elemScreenLeft;
 
@@ -818,7 +825,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					}
 
 					// Title text is always horizontal — truncate based on CSS width
-					const maxChars = Math.max(2, Math.floor((screenW - 22) / (titleFontSize * 0.55)));
+					const maxChars = Math.max(
+						2,
+						Math.floor((screenW - 22 * cardScale) / (titleFontSize * 0.55)),
+					);
 					const title = ch.title.length > maxChars ? `${ch.title.slice(0, maxChars)}…` : ch.title;
 
 					// Use card slot's own TextPool when in card phase, shared pool otherwise
@@ -828,11 +838,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 						titleLabel.text = title;
 						titleLabel.alpha = morph.opacity * morph.titleOpacity;
 						titleLabel.scale.set(1);
-						titleLabel.position.set(nodeLeft + 8, nodeTop + 6);
+						titleLabel.position.set(nodeLeft + 8 * cardScale, nodeTop + 6 * cardScale);
 
 						// Card detail labels — only when card is tall enough
-						if (cb > 0 && screenH > 36) {
-							const badgeFontSize = 9;
+						if (cb > 0 && screenH > 36 * cardScale) {
+							const badgeFontSize = 9 * cardScale;
 							const badgeKey = `badge:${badgeFontSize}:${theme.dimmed}`;
 							if (sc.cardBadgeKey !== badgeKey || !sc.cardBadgeStyle) {
 								sc.cardBadgeStyle = new TextStyle({
@@ -842,42 +852,47 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 								});
 								sc.cardBadgeKey = badgeKey;
 							}
-							const detailAlpha = Math.min(1, (screenH - 36) / 20) * cb;
+							const detailAlpha = Math.min(1, (screenH - 36 * cardScale) / (20 * cardScale)) * cb;
 
 							// Status dot + label
 							const statusColor = themeStatusColor(theme, ch.status);
-							const dotY = nodeTop + 24;
+							const dotY = nodeTop + 24 * cardScale;
+							const dotR = 3 * cardScale;
 							targetGfx
-								.circle(nodeLeft + 12, dotY + 4, 3)
+								.circle(nodeLeft + 12 * cardScale, dotY + 4 * cardScale, dotR)
 								.fill({ color: statusColor, alpha: morph.opacity * detailAlpha });
 
 							const statusLabel = labelPool.acquire(sc.cardBadgeStyle);
 							statusLabel.text = ch.status;
 							statusLabel.alpha = morph.opacity * 0.8 * detailAlpha;
 							statusLabel.scale.set(1);
-							statusLabel.position.set(nodeLeft + 18, dotY);
+							statusLabel.position.set(nodeLeft + 18 * cardScale, dotY);
 
 							// Narrator status (if any)
 							if (ch.narratorStatus) {
 								const nsColor = narratorStatusColor(theme, ch.narratorStatus);
-								const nsX = nodeLeft + 18 + (ch.status?.length ?? 0) * 5.5 + 10;
+								const nsX =
+									nodeLeft +
+									18 * cardScale +
+									(ch.status?.length ?? 0) * 5.5 * cardScale +
+									10 * cardScale;
 								targetGfx
-									.circle(nsX, dotY + 4, 2.5)
+									.circle(nsX, dotY + 4 * cardScale, 2.5 * cardScale)
 									.fill({ color: nsColor, alpha: morph.opacity * detailAlpha });
 								const nsLabel = labelPool.acquire(sc.cardBadgeStyle);
 								nsLabel.text = ch.narratorStatus;
 								nsLabel.alpha = morph.opacity * 0.6 * detailAlpha;
 								nsLabel.scale.set(1);
-								nsLabel.position.set(nsX + 6, dotY);
+								nsLabel.position.set(nsX + 6 * cardScale, dotY);
 							}
 
 							// Branch name — only when card is tall enough
-							if (screenH > 52) {
-								const branchAlpha = Math.min(1, (screenH - 52) / 16) * cb;
+							if (screenH > 52 * cardScale) {
+								const branchAlpha = Math.min(1, (screenH - 52 * cardScale) / (16 * cardScale)) * cb;
 								const branchLabel = labelPool.acquire(sc.cardBadgeStyle);
 								const maxBranchChars = Math.max(
 									4,
-									Math.floor((screenW - 16) / (badgeFontSize * 0.55)),
+									Math.floor((screenW - 16 * cardScale) / (badgeFontSize * 0.55)),
 								);
 								branchLabel.text =
 									(ch.branch?.length ?? 0) > maxBranchChars
@@ -885,7 +900,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 										: (ch.branch ?? "");
 								branchLabel.alpha = morph.opacity * 0.5 * branchAlpha;
 								branchLabel.scale.set(1);
-								branchLabel.position.set(nodeLeft + 8, nodeTop + 40);
+								branchLabel.position.set(nodeLeft + 8 * cardScale, nodeTop + 40 * cardScale);
 							}
 						}
 

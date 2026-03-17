@@ -78,6 +78,40 @@ const MORPH_PILL = 0.9; // pill fully formed (mid-L2)
 /** Scale at which card is fully formed (L3 boundary). Exported for card-persistence logic. */
 export const MORPH_CARD = 1.2;
 
+// ---------------------------------------------------------------------------
+// Camera scale bounds & card-scale helper
+// ---------------------------------------------------------------------------
+
+/** Minimum camera scale (used by wheel & pinch clamp). */
+export const SCALE_MIN = 0.1;
+/** Maximum camera scale (used by wheel & pinch clamp). */
+export const SCALE_MAX = 5;
+
+/** Minimum card-scale factor at SCALE_MIN. */
+const CARD_SCALE_MIN = 0.5;
+
+/**
+ * Dot final size in pixels — derived from MORPH_KEYFRAMES t=0.3.
+ * Used as the lower bound when applying cardScale to pill/card phases
+ * so that scaled elements never shrink below the dot size.
+ */
+export const DOT_FINAL_SIZE = 10; // sync: MORPH_KEYFRAMES[2].width/height
+
+/**
+ * Compute a continuous card-scale factor from camera scale.
+ * Linearly maps [SCALE_MIN, SCALE_MAX] → [0.5, 1.0] (clamped).
+ * Applied to pill/card phases only — dots stay at fixed pixel size.
+ */
+export function getCardScale(scale: number): number {
+	return Math.max(
+		CARD_SCALE_MIN,
+		Math.min(
+			1,
+			CARD_SCALE_MIN + (1 - CARD_SCALE_MIN) * ((scale - SCALE_MIN) / (SCALE_MAX - SCALE_MIN)),
+		),
+	);
+}
+
 /**
  * Map an effective scale (fisheye localScale) to a continuous morph factor `t` in [0, 1].
  *  0.0       → invisible
@@ -101,17 +135,8 @@ export function getMorphFactor(effectiveScale: number): number {
 	return 0.7 + 0.3 * ((effectiveScale - MORPH_PILL) / (MORPH_CARD - MORPH_PILL));
 }
 
-/**
- * Compute the center-fade factor for a chapter at morph factor `t`.
- * Used by both React (SegmentCanvas) and PixiJS (RulerPixiLayer) to ensure
- * consistent positioning during the dot→pill→card transition.
- *
- * Returns 1 in dot/pill phase (element is centered), fades to 0 in card phase
- * (element snaps to top-left layout position).
- */
-export function getCenterFade(t: number): number {
-	return t < 0.7 ? 1 : Math.max(0, 1 - (t - 0.7) / 0.3);
-}
+/** Morph factor threshold: dot phase ends at t=0.3. */
+export const MORPH_T_DOT = 0.3;
 
 /** Interpolated visual properties for a chapter element at morph factor `t`. */
 export interface MorphStyle {
