@@ -23,3 +23,38 @@
 .rootNoWrap p {
 	margin-block: 0.25em;
 }
+
+.codeBlock {
+	position: relative;
+	margin-top: 0.35em;
+	margin-bottom: 0;
+}
+
+.codeLang {
+	position: absolute;
+	top: 4px;
+	left: 8px;
+	font-size: 10px;
+	line-height: 1;
+	color: var(--mantine-color-dimmed);
+	z-index: 1;
+	pointer-events: none;
+	user-select: none;
+}
+
+.codeCopy {
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	z-index: 1;
+	opacity: 0;
+	transition: opacity 150ms ease;
+}
+
+.codeBlock:hover .codeCopy {
+	opacity: 1;
+}
+
+.codeBlockWithLang pre {
+	padding-top: calc(var(--mantine-spacing-xs) + 14px);
+}

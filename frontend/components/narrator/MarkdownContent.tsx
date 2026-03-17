@@ -3,10 +3,11 @@ import { memo, type ReactNode, useMemo } from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
 
 /** Recursively extract plain text from React children */
-function extractText(node: ReactNode): string {
+export function extractText(node: ReactNode): string {
 	if (node == null || typeof node === "boolean") return "";
 	if (typeof node === "string" || typeof node === "number") return String(node);
 	if (Array.isArray(node)) return node.map(extractText).join("");
@@ -94,23 +95,28 @@ const mdComponents: Components = {
 		);
 	},
 	code({ children, className }) {
+		const lang = className?.replace("language-", "");
 		const isBlock = className?.startsWith("language-");
 		if (isBlock) {
 			const text = extractText(children);
 			const isDiagram = DIAGRAM_PATTERN.test(text);
-			return (
-				<Code
-					block
-					fz="xs"
-					style={{
-						maxWidth: "100%",
-						overflowX: "auto",
-						...(isDiagram && { whiteSpace: "pre", wordBreak: "normal" }),
-					}}
-				>
-					{children}
-				</Code>
-			);
+			if (isDiagram) {
+				return (
+					<Code
+						block
+						fz="xs"
+						style={{
+							maxWidth: "100%",
+							overflowX: "auto",
+							whiteSpace: "pre",
+							wordBreak: "normal",
+						}}
+					>
+						{children}
+					</Code>
+				);
+			}
+			return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
 		}
 		return <Code fz="xs">{children}</Code>;
 	},
@@ -118,6 +124,7 @@ const mdComponents: Components = {
 		// For fenced code blocks without a language tag, react-markdown renders
 		// <pre><code>…</code></pre> where the inner <code> has no className.
 		// Detect diagram content and force no-wrap on those blocks.
+		// Otherwise wrap in MarkdownCodeBlock for copy button + consistent styling.
 		const text = extractText(children);
 		const isDiagram = DIAGRAM_PATTERN.test(text);
 		if (isDiagram) {
@@ -136,7 +143,15 @@ const mdComponents: Components = {
 				</Code>
 			);
 		}
-		return <>{children}</>;
+		// If the inner <code> already rendered a MarkdownCodeBlock (has language),
+		// just pass through. Otherwise wrap bare code in MarkdownCodeBlock.
+		const child = Array.isArray(children) ? children[0] : children;
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown children structure
+		const childType = child && typeof child === "object" && (child as any).type;
+		if (childType === MarkdownCodeBlock) {
+			return <>{children}</>;
+		}
+		return <MarkdownCodeBlock language="text">{text}</MarkdownCodeBlock>;
 	},
 	hr() {
 		return <Divider my={4} />;
