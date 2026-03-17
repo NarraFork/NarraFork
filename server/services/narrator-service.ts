@@ -445,7 +445,18 @@ export const narratorService = {
 
 		const now = new Date().toISOString();
 		const id = generateId();
-		const resolvedPermMode = (input.permissionMode ?? parent.permissionMode ?? "default") as
+
+		// Resolve effective permission mode for the subagent.
+		// When the parent is in plan mode, subagents should NOT inherit "plan" —
+		// plan mode semantics (Write/Edit restricted to plan file) are meaningless
+		// for subagents. Instead, resolve to the effective mode:
+		// - relaxedPlan → inherit previousPermissionMode (the mode before entering plan)
+		// - strict plan → readOnly
+		let basePermMode = input.permissionMode ?? parent.permissionMode ?? "default";
+		if (basePermMode === "plan") {
+			basePermMode = parent.relaxedPlan ? (parent.previousPermissionMode ?? "default") : "readOnly";
+		}
+		const resolvedPermMode = basePermMode as
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
@@ -512,7 +523,16 @@ export const narratorService = {
 		}
 		const now = new Date().toISOString();
 		const id = generateId();
-		const resolvedPermMode = (input.permissionMode ?? "default") as
+
+		// Subagents should never have "plan" permission mode — resolve it
+		// the same way as createSubagent (see comment there).
+		let basePermMode = input.permissionMode ?? "default";
+		if (basePermMode === "plan") {
+			basePermMode = original.relaxedPlan
+				? (original.previousPermissionMode ?? "default")
+				: "readOnly";
+		}
+		const resolvedPermMode = basePermMode as
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
