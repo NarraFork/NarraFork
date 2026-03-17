@@ -26,6 +26,7 @@ import {
 	IconEye,
 	IconFile,
 	IconGitFork,
+	IconHistory,
 	IconListCheck,
 	IconLoader2,
 	IconMap,
@@ -144,6 +145,7 @@ const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
+const RECALL_TOOLS = new Set(["Recall"]);
 
 export type ToolCategory =
 	| "file"
@@ -156,6 +158,7 @@ export type ToolCategory =
 	| "plan"
 	| "terminal"
 	| "share"
+	| "recall"
 	| "generic";
 
 export function isEditTool(name: string): boolean {
@@ -173,6 +176,7 @@ export function getCategory(name: string): ToolCategory {
 	if (PLAN_TOOLS.has(name)) return "plan";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
+	if (RECALL_TOOLS.has(name)) return "recall";
 	return "generic";
 }
 
@@ -198,6 +202,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 			return IconTerminal2;
 		case "share":
 			return IconShare;
+		case "recall":
+			return IconHistory;
 		default:
 			return IconCode;
 	}
@@ -225,6 +231,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "yellow";
 		case "share":
 			return "green";
+		case "recall":
+			return "cyan";
 		default:
 			return "gray";
 	}
@@ -445,6 +453,21 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const fp = getFilePath(input);
 			if (!fp) return "Share";
 			return basename(fp);
+		}
+		case "recall": {
+			const action = extractField(input, "action");
+			if (action === "search") {
+				// query can be string or string[] — extractField only handles string
+				const raw = isTruncated(input) ? undefined : input?.query;
+				const q = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.join(", ") : "";
+				if (q) return q.length > 60 ? `${q.slice(0, 57)}...` : q;
+				return "Search";
+			}
+			if (action === "read_conversation") {
+				const nid = extractField(input, "narrator_id");
+				return nid ? `Read ${nid.slice(0, 8)}…` : "Read conversation";
+			}
+			return "Recall";
 		}
 		default:
 			return toolName;
@@ -1445,6 +1468,173 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+interface RecallResult {
+	id: string;
+	narratorId: string;
+	narratorTitle: string | null;
+	chapterId: string | null;
+	role: string;
+	createdAt: string;
+	snippet: string;
+}
+
+function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
+	const action = meta?.action as string | undefined;
+
+	if (!meta || (action !== "search" && action !== "read_conversation")) {
+		return <GenericDetail toolCall={toolCall} />;
+	}
+
+	if (action === "search") {
+		// For batch queries, results are merged from all sub-queries
+		const allResults = (Array.isArray(meta.results) ? meta.results : []) as Array<RecallResult>;
+		const queries = Array.isArray(meta.queries) ? meta.queries : meta.query ? [meta.query] : [];
+
+		if (allResults.length === 0) {
+			return (
+				<Box mt="xs">
+					<Text size="xs" c="dimmed">
+						No results found
+						{queries.length > 0 && ` for ${queries.map((q: string) => `"${q}"`).join(", ")}`}.
+					</Text>
+				</Box>
+			);
+		}
+
+		return (
+			<Box mt="xs">
+				{queries.length > 0 && (
+					<Group gap={4} mb={6} wrap="wrap">
+						{queries.map((q: string, i: number) => (
+							// biome-ignore lint/suspicious/noArrayIndexKey: static badge list, no reordering
+							<Badge key={`${i}:${q}`} size="xs" variant="light" color="cyan">
+								{q}
+							</Badge>
+						))}
+					</Group>
+				)}
+				<Stack gap={4}>
+					{allResults.map((r: RecallResult) => (
+						<Paper
+							key={r.id}
+							p={6}
+							radius="sm"
+							style={{
+								backgroundColor: "var(--mantine-color-dark-7)",
+								border: "1px solid var(--mantine-color-dark-5)",
+							}}
+						>
+							<Group gap={6} mb={2} wrap="nowrap">
+								<Badge
+									size="xs"
+									variant="light"
+									color={r.role === "user" ? "blue" : r.role === "assistant" ? "green" : "gray"}
+								>
+									{r.role}
+								</Badge>
+								{r.narratorTitle && (
+									<Text size="xs" fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
+										{r.narratorTitle}
+									</Text>
+								)}
+								<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+									{formatRecallTime(r.createdAt)}
+								</Text>
+							</Group>
+							<Text size="xs" c="dimmed" lineClamp={2} style={{ whiteSpace: "pre-wrap" }}>
+								{r.snippet.replace(/>>>/g, "").replace(/<<</g, "").trim()}
+							</Text>
+							<Group gap={4} mt={2}>
+								<Code style={{ fontSize: 10 }}>{r.id.slice(0, 8)}</Code>
+								{r.chapterId && (
+									<Text size="xs" c="dimmed">
+										ch:{r.chapterId.slice(0, 8)}
+									</Text>
+								)}
+							</Group>
+						</Paper>
+					))}
+				</Stack>
+			</Box>
+		);
+	}
+
+	// action === "read_conversation"
+	const messages = Array.isArray(meta.messages) ? meta.messages : [];
+	const narratorTitle = meta.narratorTitle as string | undefined;
+	const model = meta.model as string | undefined;
+
+	return (
+		<Box mt="xs">
+			<Group gap={6} mb={6}>
+				{narratorTitle && (
+					<Text size="xs" fw={600}>
+						{narratorTitle}
+					</Text>
+				)}
+				{model && (
+					<Badge size="xs" variant="outline" color="gray">
+						{model}
+					</Badge>
+				)}
+			</Group>
+			<Stack gap={2}>
+				{messages.map(
+					(msg: { id: string; seq: number; role: string; text: string; createdAt: string }) => (
+						<Box
+							key={msg.id}
+							p={6}
+							style={{
+								backgroundColor:
+									msg.role === "user" ? "var(--mantine-color-indigo-light)" : undefined,
+								borderRadius: "var(--mantine-radius-sm)",
+							}}
+						>
+							<Group gap={6} mb={2}>
+								<Badge
+									size="xs"
+									variant="light"
+									color={msg.role === "user" ? "blue" : msg.role === "assistant" ? "green" : "gray"}
+								>
+									{msg.role}
+								</Badge>
+								<Text size="xs" c="dimmed">
+									seq {msg.seq}
+								</Text>
+								<Text size="xs" c="dimmed" style={{ marginLeft: "auto" }}>
+									{formatRecallTime(msg.createdAt)}
+								</Text>
+							</Group>
+							<Text
+								size="xs"
+								lineClamp={4}
+								style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+							>
+								{msg.text || "—"}
+							</Text>
+						</Box>
+					),
+				)}
+			</Stack>
+		</Box>
+	);
+}
+
+function formatRecallTime(iso: string): string {
+	try {
+		const d = new Date(iso);
+		return d.toLocaleString(undefined, {
+			month: "short",
+			day: "numeric",
+			hour: "2-digit",
+			minute: "2-digit",
+		});
+	} catch {
+		return iso;
+	}
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -1732,6 +1922,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <TerminalDetail toolCall={toolCall} />;
 		case "share":
 			return <ShareFileDetail toolCall={toolCall} />;
+		case "recall":
+			return <RecallDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}
@@ -1982,6 +2174,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			toolCall.status === "pending" ||
 			cat === "todo" ||
 			cat === "share" ||
+			cat === "recall" ||
 			(cat === "plan" && !isDeniedPlan) ||
 			(isEdit && !isFailedEdit) ||
 			(isFailed && !isEdit && !isDeniedPlan));

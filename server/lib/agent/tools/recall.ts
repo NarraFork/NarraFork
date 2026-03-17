@@ -10,6 +10,7 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 const MAX_SEARCH_LIMIT = 50;
 const DEFAULT_SEARCH_LIMIT = 20;
+const MAX_BATCH_QUERIES = 10;
 const MAX_READ_LIMIT = 50;
 const DEFAULT_READ_LIMIT = 20;
 const SNIPPET_CHARS = 300;
@@ -21,14 +22,21 @@ export const recallTool: ToolDefinition = {
 		"Use this to recall previous discussions, find relevant context from other sessions, " +
 		"or explore what was discussed in any chapter.\n\n" +
 		"Two actions are available:\n" +
-		'- "search": Full-text search across all narrator messages. Returns matching snippets with metadata.\n' +
+		'- "search": Full-text search across all narrator messages. Returns matching snippets with metadata. ' +
+		"Pass an array of strings to `query` to run multiple searches in one call.\n" +
 		'- "read_conversation": Read messages from a specific narrator session. ' +
 		"Optionally center around a specific message ID (e.g. from a search result).",
 	parameters: z.object({
 		action: z
 			.enum(["search", "read_conversation"])
 			.describe('The action to perform: "search" or "read_conversation"'),
-		query: z.string().optional().describe('Search query string (required for action "search")'),
+		query: z
+			.union([z.string(), z.array(z.string())])
+			.optional()
+			.describe(
+				'Search query (required for action "search"). ' +
+					"Pass an array to run multiple searches in one call.",
+			),
 		narrator_id: z
 			.string()
 			.optional()
@@ -51,18 +59,85 @@ export const recallTool: ToolDefinition = {
 	async execute(args): Promise<ToolResult> {
 		const { action, query, narrator_id, message_id, limit } = args as {
 			action: "search" | "read_conversation";
-			query?: string;
+			query?: string | string[];
 			narrator_id?: string;
 			message_id?: string;
 			limit?: number;
 		};
 
 		if (action === "search") {
-			return handleSearch(query, limit);
+			const queries = Array.isArray(query) ? query : [query];
+			if (queries.length === 1) {
+				return handleSearch(queries[0], limit);
+			}
+			if (queries.length > MAX_BATCH_QUERIES) {
+				return {
+					output: `Too many queries (${queries.length}). Maximum is ${MAX_BATCH_QUERIES}.`,
+					isError: true,
+				};
+			}
+			// Batch: run each query independently and merge results
+			const sections: string[] = [];
+			const allResults: SearchResultItem[] = [];
+			const queryList: string[] = [];
+			let errorCount = 0;
+			for (const q of queries) {
+				const result = handleSearch(q, limit);
+				if (result.isError) errorCount++;
+				sections.push(result.output);
+				// Collect structured results from each sub-search
+				const meta = result.metadata as SearchMetadata | undefined;
+				if (meta?.results) allResults.push(...meta.results);
+				if (q) queryList.push(q);
+			}
+			return {
+				output: sections.join("\n\n---\n\n"),
+				isError: errorCount === queries.length,
+				title: `Recall: ${queries.length} queries`,
+				metadata: {
+					action: "search",
+					queries: queryList,
+					results: allResults,
+				} satisfies BatchSearchMetadata,
+			};
 		}
 		return handleReadConversation(narrator_id, message_id, limit);
 	},
 };
+
+// ---------------------------------------------------------------------------
+// Types for structured metadata
+// ---------------------------------------------------------------------------
+
+interface SearchResultItem {
+	id: string;
+	narratorId: string;
+	narratorTitle: string | null;
+	chapterId: string | null;
+	role: string;
+	createdAt: string;
+	snippet: string;
+}
+
+interface SearchMetadata {
+	action: "search";
+	query: string;
+	results: SearchResultItem[];
+}
+
+interface BatchSearchMetadata {
+	action: "search";
+	queries: string[];
+	results: SearchResultItem[];
+}
+
+interface ConversationMessage {
+	id: string;
+	seq: number;
+	role: string;
+	text: string;
+	createdAt: string;
+}
 
 // ---------------------------------------------------------------------------
 // search
@@ -116,22 +191,39 @@ function handleSearch(query: string | undefined, limit: number | undefined): Too
 	}
 
 	if (rows.length === 0) {
-		return { output: `No results found for "${query}".` };
+		return {
+			output: `No results found for "${query}".`,
+			metadata: { action: "search", query, results: [] } satisfies SearchMetadata,
+		};
 	}
 
+	const results: SearchResultItem[] = rows.map((row) => ({
+		id: row.id,
+		narratorId: row.narrator_id,
+		narratorTitle: row.narrator_title ?? null,
+		chapterId: row.chapter_id ?? null,
+		role: row.role,
+		createdAt: row.created_at,
+		snippet: (row.snippet ?? "").replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
+	}));
+
 	const lines: string[] = [`Found ${rows.length} result(s) for "${query}":\n`];
-	for (const row of rows) {
+	for (const r of results) {
 		lines.push(
-			`- [${row.role}] message ${row.id}` +
-				`  narrator=${row.narrator_id}` +
-				(row.narrator_title ? ` ("${row.narrator_title}")` : "") +
-				(row.chapter_id ? `  chapter=${row.chapter_id}` : "") +
-				`  at ${row.created_at}` +
-				`\n  ${(row.snippet ?? "").replace(/\n/g, " ").slice(0, SNIPPET_CHARS)}`,
+			`- [${r.role}] message ${r.id}` +
+				`  narrator=${r.narratorId}` +
+				(r.narratorTitle ? ` ("${r.narratorTitle}")` : "") +
+				(r.chapterId ? `  chapter=${r.chapterId}` : "") +
+				`  at ${r.createdAt}` +
+				`\n  ${r.snippet}`,
 		);
 	}
 
-	return { output: lines.join("\n"), title: `Recall: ${query}` };
+	return {
+		output: lines.join("\n"),
+		title: `Recall: ${query}`,
+		metadata: { action: "search", query, results } satisfies SearchMetadata,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +300,14 @@ function handleReadConversation(
 		return { output: `No messages found for narrator "${narratorId}".` };
 	}
 
+	const messages: ConversationMessage[] = rows.map((row) => ({
+		id: row.id,
+		seq: row.seq,
+		role: row.role,
+		text: (row.content_text ?? "").slice(0, 500),
+		createdAt: row.created_at,
+	}));
+
 	const header =
 		`Narrator: ${narrator.title ?? narratorId}` +
 		(narrator.chapter_id ? ` (chapter ${narrator.chapter_id})` : "") +
@@ -215,13 +315,21 @@ function handleReadConversation(
 		`\nShowing ${rows.length} message(s):\n`;
 
 	const lines: string[] = [header];
-	for (const row of rows) {
-		const text = (row.content_text ?? "").slice(0, 500).replace(/\n/g, "\n  ");
-		lines.push(`[seq=${row.seq}] ${row.role} (${row.id}) at ${row.created_at}:\n  ${text}\n`);
+	for (const msg of messages) {
+		const text = msg.text.replace(/\n/g, "\n  ");
+		lines.push(`[seq=${msg.seq}] ${msg.role} (${msg.id}) at ${msg.createdAt}:\n  ${text}\n`);
 	}
 
 	return {
 		output: lines.join("\n"),
 		title: `Conversation: ${narrator.title ?? narratorId}`,
+		metadata: {
+			action: "read_conversation",
+			narratorId,
+			narratorTitle: narrator.title,
+			chapterId: narrator.chapter_id,
+			model: narrator.model,
+			messages,
+		},
 	};
 }
