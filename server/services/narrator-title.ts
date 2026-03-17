@@ -1,3 +1,6 @@
+import { and, eq } from "drizzle-orm";
+import { db } from "../db";
+import { chapters, narrators } from "../db/schema";
 import { summaryGenerateWithHistory } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -15,6 +18,10 @@ export async function persistTitle(narratorId: string, title: string): Promise<b
 		await narratorService.updateTitle(narratorId, title);
 		broadcastToNarrator(narratorId, { type: "title_updated", narratorId, title });
 		eventBus.emit({ type: "narrator:title_updated", narratorId, title });
+
+		// Sync to chapter.title for chapter-bound narrators
+		await syncTitleToChapter(narratorId, title);
+
 		return true;
 	} catch (err) {
 		logger.error("Failed to persist title after retries", {
@@ -23,6 +30,79 @@ export async function persistTitle(narratorId: string, title: string): Promise<b
 			error: String(err),
 		});
 		return false;
+	}
+}
+
+/**
+ * Sync narrator title to the bound chapter's title.
+ * Only applies to chapter-bound primary narrators.
+ */
+async function syncTitleToChapter(narratorId: string, title: string): Promise<void> {
+	try {
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true, type: true },
+		});
+		if (!narrator?.chapterId || narrator.type !== "primary") return;
+
+		// Skip if chapter title is already identical
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { title: true },
+		});
+		if (chapter?.title === title) return;
+
+		const now = new Date().toISOString();
+		await db
+			.update(chapters)
+			.set({ title, updatedAt: now })
+			.where(eq(chapters.id, narrator.chapterId));
+	} catch (err) {
+		logger.warn("Failed to sync title to chapter (non-fatal)", {
+			narratorId,
+			title,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * Sync chapter title to the bound primary narrator's title.
+ * Called when chapter.title is updated directly.
+ */
+export async function syncTitleToNarrator(chapterId: string, title: string): Promise<void> {
+	try {
+		const primaryNarrator = await db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+			columns: { id: true, title: true },
+		});
+		if (!primaryNarrator) return;
+		if (primaryNarrator.title === title) return; // already in sync
+
+		// Directly update DB instead of going through narratorService.updateTitle /
+		// persistTitle to avoid a circular sync loop (persistTitle → syncTitleToChapter
+		// → back here).  The broadcast + eventBus emit below mirror what persistTitle does.
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ title, updatedAt: now })
+			.where(eq(narrators.id, primaryNarrator.id));
+		broadcastToNarrator(primaryNarrator.id, {
+			type: "title_updated",
+			narratorId: primaryNarrator.id,
+			title,
+		});
+		eventBus.emit({
+			type: "narrator:title_updated",
+			narratorId: primaryNarrator.id,
+			title,
+		});
+	} catch (err) {
+		logger.warn("Failed to sync title to narrator (non-fatal)", {
+			chapterId,
+			title,
+			error: String(err),
+		});
 	}
 }
 

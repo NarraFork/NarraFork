@@ -288,6 +288,7 @@ interface CreateNarratorInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
+	title?: string;
 }
 
 interface CreateSubagentInput {
@@ -426,6 +427,7 @@ export const narratorService = {
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
+				title: input.title ?? null,
 				createdAt: now,
 				updatedAt: now,
 			})

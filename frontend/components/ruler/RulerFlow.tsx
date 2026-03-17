@@ -7,7 +7,7 @@ import {
 	IconLayoutSidebarRightCollapse,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -262,11 +262,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const cRect = cEl?.getBoundingClientRect();
 			const ox = cRect?.left ?? 0;
 			const oy = cRect?.top ?? 0;
+			const ps = getCardScale(cam.scale);
 			for (const [chId, div] of panelEls) {
 				const hr = hitRects.find((r) => r.id === chId);
 				if (hr) {
 					div.style.left = `${ox + hr.screenX}px`;
 					div.style.top = `${oy + hr.screenY}px`;
+					div.style.transform = `scale(${ps})`;
 				}
 			}
 		}
@@ -282,6 +284,15 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			applyTransformToDOM();
 		});
 	}, [applyTransformToDOM]);
+
+	// After every React render, immediately sync DOM transforms with the latest
+	// cameraRef before the browser paints. This prevents a 1-frame flicker when
+	// setCamera (called every N frames during smooth zoom) commits a stale camera
+	// snapshot to React state — the inline styles from that render would briefly
+	// show the old position/scale until the next rAF corrects them.
+	// useLayoutEffect fires synchronously after DOM mutation but before paint,
+	// so the correction is invisible to the user.
+	useLayoutEffect(applyTransformToDOM);
 
 	// Debounced save to server
 	const cameraSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2540,6 +2551,8 @@ function NarratorPanelOverlay({
 	const [resizeDelta, setResizeDelta] = useState({ dw: 0, dh: 0, dx: 0, dy: 0 });
 	const resizeDeltaRef = useRef(resizeDelta);
 	resizeDeltaRef.current = resizeDelta;
+	const onResizeEndRef = useRef(onResizeEnd);
+	onResizeEndRef.current = onResizeEnd;
 	const panelWheelRef = useRef<HTMLDivElement>(null);
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
@@ -2559,51 +2572,21 @@ function NarratorPanelOverlay({
 		return () => el.removeEventListener("wheel", handler);
 	});
 
-	// Global pointer handlers for resize
+	// Stable resize handlers via refs — bound/unbound in startResize
+	const handleMoveRef = useRef<((e: PointerEvent) => void) | null>(null);
+	const handleUpRef = useRef<((e: PointerEvent) => void) | null>(null);
+
+	// Cleanup on unmount
 	useEffect(() => {
-		const handleMove = (e: PointerEvent) => {
-			if (!isResizingRef.current) return;
-			const rawDx = (e.clientX - resizeStartRef.current.x) / (scale * panelScale);
-			const rawDy = (e.clientY - resizeStartRef.current.y) / (scale * panelScale);
-			const corner = resizeStartRef.current.corner;
-			let dw = 0;
-			let dh = 0;
-			let dx = 0;
-			let dy = 0;
-			if (corner.includes("r")) dw = rawDx;
-			if (corner.includes("l")) {
-				dw = -rawDx;
-				dx = rawDx;
-			}
-			if (corner.includes("b")) dh = rawDy;
-			if (corner.includes("t")) {
-				dh = -rawDy;
-				dy = rawDy;
-			}
-			const clampedW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + dw);
-			const clampedH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + dh);
-			const actualDw = clampedW - resizeStartRef.current.origW;
-			const actualDh = clampedH - resizeStartRef.current.origH;
-			if (corner.includes("l")) dx = -actualDw;
-			if (corner.includes("t")) dy = -actualDh;
-			setResizeDelta({ dw: actualDw, dh: actualDh, dx, dy });
-		};
-		const handleUp = () => {
-			if (!isResizingRef.current) return;
-			isResizingRef.current = false;
-			const d = resizeDeltaRef.current;
-			const newW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + d.dw);
-			const newH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + d.dh);
-			onResizeEnd(newW, newH);
-			setResizeDelta({ dw: 0, dh: 0, dx: 0, dy: 0 });
-		};
-		window.addEventListener("pointermove", handleMove);
-		window.addEventListener("pointerup", handleUp);
 		return () => {
-			window.removeEventListener("pointermove", handleMove);
-			window.removeEventListener("pointerup", handleUp);
+			if (handleMoveRef.current)
+				document.removeEventListener("pointermove", handleMoveRef.current, true);
+			if (handleUpRef.current) {
+				document.removeEventListener("pointerup", handleUpRef.current, true);
+				document.removeEventListener("pointercancel", handleUpRef.current, true);
+			}
 		};
-	}, [scale, onResizeEnd, panelScale]);
+	}, []);
 
 	const displayW = Math.max(MIN_PANEL_WIDTH, panelW + resizeDelta.dw);
 	const displayH = Math.max(MIN_PANEL_HEIGHT, panelH + resizeDelta.dh);
@@ -2613,6 +2596,54 @@ function NarratorPanelOverlay({
 		e.stopPropagation();
 		isResizingRef.current = true;
 		resizeStartRef.current = { x: e.clientX, y: e.clientY, origW: panelW, origH: panelH, corner };
+
+		const ps = panelScale;
+		const handleMove = (ev: PointerEvent) => {
+			if (!isResizingRef.current) return;
+			const rawDx = (ev.clientX - resizeStartRef.current.x) / ps;
+			const rawDy = (ev.clientY - resizeStartRef.current.y) / ps;
+			const c = resizeStartRef.current.corner;
+			let dw = 0;
+			let dh = 0;
+			let dx = 0;
+			let dy = 0;
+			if (c.includes("r")) dw = rawDx;
+			if (c.includes("l")) {
+				dw = -rawDx;
+				dx = rawDx;
+			}
+			if (c.includes("b")) dh = rawDy;
+			if (c.includes("t")) {
+				dh = -rawDy;
+				dy = rawDy;
+			}
+			const clampedW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + dw);
+			const clampedH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + dh);
+			const actualDw = clampedW - resizeStartRef.current.origW;
+			const actualDh = clampedH - resizeStartRef.current.origH;
+			if (c.includes("l")) dx = -actualDw;
+			if (c.includes("t")) dy = -actualDh;
+			setResizeDelta({ dw: actualDw, dh: actualDh, dx, dy });
+		};
+		const handleUp = () => {
+			isResizingRef.current = false;
+			const d = resizeDeltaRef.current;
+			const newW = Math.max(MIN_PANEL_WIDTH, resizeStartRef.current.origW + d.dw);
+			const newH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + d.dh);
+			onResizeEndRef.current(newW, newH);
+			setResizeDelta({ dw: 0, dh: 0, dx: 0, dy: 0 });
+			document.removeEventListener("pointermove", handleMove, true);
+			document.removeEventListener("pointerup", handleUp, true);
+			document.removeEventListener("pointercancel", handleUp, true);
+			handleMoveRef.current = null;
+			handleUpRef.current = null;
+		};
+		handleMoveRef.current = handleMove;
+		handleUpRef.current = handleUp;
+		// Capture phase — runs before any stopPropagation in bubbling
+		document.addEventListener("pointermove", handleMove, true);
+		document.addEventListener("pointerup", handleUp, true);
+		document.addEventListener("pointercancel", handleUp, true);
 	};
 
 	return (

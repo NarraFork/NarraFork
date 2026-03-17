@@ -572,11 +572,6 @@ function NarratorsPage() {
 											<Text fw={500} truncate>
 												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 											</Text>
-											{chapter && (
-												<Badge size="xs" variant="outline" color="indigo">
-													{chapter.title}
-												</Badge>
-											)}
 										</Group>
 										<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 											{viewers.length > 0 && (
@@ -608,6 +603,9 @@ function NarratorsPage() {
 													size="sm"
 													color="orange"
 													variant="subtle"
+													onPointerDown={(e: React.PointerEvent) => {
+														e.stopPropagation();
+													}}
 													onClick={(e: React.MouseEvent) => {
 														e.stopPropagation();
 														setConfirmArchiveId(narrator.id);
@@ -719,16 +717,6 @@ function NarratorsPage() {
 											</Badge>
 										)}
 									</Group>
-									{chapter && (
-										<Badge
-											size="xs"
-											variant="outline"
-											color="indigo"
-											style={{ alignSelf: "flex-start" }}
-										>
-											{chapter.title}
-										</Badge>
-									)}
 									{(chapter?.projectName || narrator.cwd) && (
 										<Text size="xs" c="dimmed" truncate>
 											{[
@@ -779,6 +767,9 @@ function NarratorsPage() {
 												size="sm"
 												color="orange"
 												variant="subtle"
+												onPointerDown={(e: React.PointerEvent) => {
+													e.stopPropagation();
+												}}
 												onClick={(e: React.MouseEvent) => {
 													e.stopPropagation();
 													setConfirmArchiveId(narrator.id);

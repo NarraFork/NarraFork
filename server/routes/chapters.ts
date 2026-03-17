@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { supportsContainers } from "../lib/platform";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -35,6 +36,7 @@ import {
 	resolveComposeFile,
 } from "../services/container-service";
 import { gitService } from "../services/git-service";
+import { syncTitleToNarrator } from "../services/narrator-title";
 import { reviewService } from "../services/review-service";
 
 export const chapterRoutes = new Hono();
@@ -77,6 +79,14 @@ chapterRoutes.patch("/:id", async (c) => {
 	const parsed = updateChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const chapter = await chapterService.update(id, parsed.data);
+
+	// Sync title to primary narrator if title was updated
+	if (parsed.data.title !== undefined) {
+		syncTitleToNarrator(id, parsed.data.title).catch((err) => {
+			logger.warn("syncTitleToNarrator failed", { chapterId: id, error: String(err) });
+		});
+	}
+
 	return c.json(chapter);
 });
 

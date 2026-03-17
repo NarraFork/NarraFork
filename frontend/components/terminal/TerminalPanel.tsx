@@ -143,6 +143,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			end: { col: number; row: number };
 		} | null>(null);
 		const selHandleDragRef = useRef<"start" | "end" | null>(null);
+		// Flag set synchronously when a handle is touched, so the native
+		// touchstart listener on the container can skip the long-press timer.
+		const handleTouchedRef = useRef(false);
 		// Track virtual keyboard height on mobile
 		useEffect(() => {
 			if (!isMobile) {
@@ -445,6 +448,12 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 			function onLongPressStart(e: TouchEvent) {
 				if (e.touches.length !== 1 || pinchingRef.current) return;
+				// A selection handle was just touched — skip long-press detection
+				// so we don't interfere with handle dragging.
+				if (handleTouchedRef.current) {
+					handleTouchedRef.current = false;
+					return;
+				}
 				// If selection handles are active and user taps elsewhere, dismiss them
 				const touch = e.touches[0];
 				longPressTouchRef.current = { x: touch.clientX, y: touch.clientY };
@@ -470,10 +479,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					const touch = e.touches[0];
 					const cell = touchToCell(touch.clientX, touch.clientY);
 					if (!cell) return;
-					let nextHandles: {
-						start: { col: number; row: number };
-						end: { col: number; row: number };
-					} | null = null;
+					// Compute new handles synchronously so we can apply the
+					// xterm selection immediately (setState is batched/async).
 					setSelHandles((prev) => {
 						if (!prev) return prev;
 						const next = { ...prev };
@@ -482,13 +489,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 						} else {
 							next.end = cell;
 						}
-						nextHandles = next;
+						applyHandleSelection(next.start, next.end);
 						return next;
 					});
-					if (nextHandles as typeof selHandles) {
-						const h = nextHandles as unknown as NonNullable<typeof selHandles>;
-						applyHandleSelection(h.start, h.end);
-					}
 					return;
 				}
 				if (!longPressTouchRef.current || !longPressTimerRef.current) return;
@@ -503,11 +506,22 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			}
 
 			function onLongPressEnd() {
+				// If we were dragging a selection handle, just finish the drag
+				// without clearing the selection or handles.
+				if (selHandleDragRef.current) {
+					selHandleDragRef.current = null;
+					if (longPressTimerRef.current) {
+						clearTimeout(longPressTimerRef.current);
+						longPressTimerRef.current = null;
+					}
+					longPressTouchRef.current = null;
+					return;
+				}
 				if (longPressTimerRef.current) {
 					// Timer still running = short tap, dismiss handles if active
 					clearTimeout(longPressTimerRef.current);
 					longPressTimerRef.current = null;
-					if (longPressTouchRef.current && !selHandleDragRef.current) {
+					if (longPressTouchRef.current) {
 						// Short tap: dismiss selection handles
 						setSelHandles(null);
 						setSelectionAnchor(null);
@@ -516,7 +530,6 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					}
 				}
 				longPressTouchRef.current = null;
-				selHandleDragRef.current = null;
 			}
 
 			container.addEventListener("touchstart", onLongPressStart, { passive: true });
@@ -583,6 +596,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		}, []);
 
 		const startHandleDrag = useCallback((which: "start" | "end") => {
+			handleTouchedRef.current = true;
 			selHandleDragRef.current = which;
 		}, []);
 

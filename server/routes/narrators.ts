@@ -94,7 +94,7 @@ import {
 	updateNarratorModel,
 	updateNarratorPermissionMode,
 } from "../services/narrator-session";
-import { generateTitle } from "../services/narrator-title";
+import { generateTitle, persistTitle } from "../services/narrator-title";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
 import {
 	broadcastToNarrator,
@@ -921,7 +921,7 @@ narratorRoutes.patch("/:id/title", async (c) => {
 	const parsed = updateNarratorTitleSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	await narratorService.getById(id);
-	await narratorService.updateTitle(id, parsed.data.title);
+	await persistTitle(id, parsed.data.title);
 	return c.json({ ok: true, title: parsed.data.title });
 });
 
@@ -932,7 +932,7 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const title = await generateTitle(id, locale);
-	await narratorService.updateTitle(id, title);
+	await persistTitle(id, title);
 	return c.json({ title });
 });
 

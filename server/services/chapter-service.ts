@@ -109,6 +109,7 @@ export const chapterService = {
 					chapterId: id,
 					type: "primary",
 					model: settings.agent.defaultModel,
+					title: input.title,
 				});
 			} catch (err) {
 				logger.warn("Failed to auto-create primary narrator for root chapter", {
@@ -192,6 +193,7 @@ export const chapterService = {
 						chapterId: id,
 						type: "primary",
 						model: settings.agent.defaultModel,
+						title: input.title,
 					});
 				} catch (err) {
 					logger.warn("Failed to auto-create primary narrator", {
