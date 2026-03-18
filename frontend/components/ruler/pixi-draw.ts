@@ -34,7 +34,8 @@ export function drawTick(
 	edge: "start" | "end" = "start",
 ): void {
 	const s = Math.max(0.1, scale);
-	const w = Math.min(4, 2 / s);
+	// Wider ticks (3/s vs old 2/s) to stay visible after decimation increases spacing
+	const w = Math.min(6, 3 / s);
 	const h = isActive ? Math.min(20, Math.max(14, 20 / s)) : 14;
 	const color = isActive ? theme.tickActive : theme.tickDefault;
 	const alpha = isActive ? 0.8 : 0.4;
@@ -48,50 +49,56 @@ export function drawTick(
 	}
 }
 
-export function drawClusterBlock(
+// --- Density bar (replaces cluster blocks + heatmap) ---
+
+/** Screen-space density data for a single retained tick. */
+export interface DensityBarEntry {
+	screenX: number;
+	screenGapToNext: number;
+	skippedCount: number;
+}
+
+/**
+ * Draw a thin density bar along the ruler track edge.
+ * Intensity = number of skipped (decimated) commits between retained ticks.
+ * Replaces the old cluster block + heatmap rendering.
+ */
+export function drawDensityBar(
 	g: Graphics,
 	theme: PixiTheme,
-	x: number,
-	width: number,
+	entries: DensityBarEntry[],
 	trackHeight: number,
-	count: number,
-	hasActive: boolean,
 	isH = true,
 	edge: "start" | "end" = "start",
 ): void {
-	const h = Math.min(14, 4 + count * 0.5);
-	const color = hasActive ? theme.accent : theme.tickDefault;
-	const alpha = hasActive ? 0.5 : 0.25;
-	// edge="start": clusters anchor at far end; edge="end": anchor at near end
-	const crossPos = edge === "start" ? trackHeight - h - 2 : 2;
-	if (isH) {
-		g.roundRect(x, crossPos, Math.max(width, 3), h, 2).fill({ color, alpha });
-	} else {
-		g.roundRect(crossPos, x, h, Math.max(width, 3), 2).fill({ color, alpha });
-	}
-}
+	if (entries.length < 2) return;
 
-// --- Heatmap ---
+	const barH = 3;
+	// edge="start": bar at far end (near chapter area); edge="end": bar at near end
+	const crossPos = edge === "start" ? trackHeight - barH - 1 : 1;
 
-export function drawHeatmap(
-	g: Graphics,
-	theme: PixiTheme,
-	segments: Array<{ worldPos: number; worldSize: number; activeCount: number }>,
-	trackHeight: number,
-	isH = true,
-): void {
-	for (const seg of segments) {
-		if (seg.activeCount <= 0) continue;
-		const intensity = Math.min(1, seg.activeCount / 5);
+	for (let i = 0; i < entries.length - 1; i++) {
+		const e = entries[i];
+		if (e.skippedCount <= 0) continue;
+
+		// Density: skipped commits per screen pixel
+		const density = e.screenGapToNext > 0 ? e.skippedCount / e.screenGapToNext : 0;
+		// Map density to alpha: 0 → 0.05, high → 0.4
+		const alpha = Math.min(0.4, 0.05 + density * 8);
+		if (alpha < 0.06) continue;
+
+		const segW = e.screenGapToNext;
+		if (segW <= 0) continue;
+
 		if (isH) {
-			g.rect(seg.worldPos - seg.worldSize / 2, 0, seg.worldSize, trackHeight).fill({
+			g.rect(e.screenX, crossPos, segW, barH).fill({
 				color: theme.accent,
-				alpha: intensity * 0.15,
+				alpha,
 			});
 		} else {
-			g.rect(0, seg.worldPos - seg.worldSize / 2, trackHeight, seg.worldSize).fill({
+			g.rect(crossPos, e.screenX, barH, segW).fill({
 				color: theme.accent,
-				alpha: intensity * 0.15,
+				alpha,
 			});
 		}
 	}

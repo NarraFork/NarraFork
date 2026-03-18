@@ -1,25 +1,24 @@
 /**
  * PixiJS rendering layer for the ruler.
- * Handles all high-frequency visual elements: ticks, clusters, heatmap,
+ * Handles all high-frequency visual elements: ticks, density bar,
  * connector lines, and chapter node morph elements (dot → pill → card).
  * React DOM is only used for interactive NarratorPanel overlays above this layer.
  */
 import { Application, Container, Graphics, TextStyle } from "pixi.js";
 import { memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RulerSegment } from "../../../hooks/useRuler";
-import type { CommitCluster } from "../commit-cluster";
-import { COLLAPSED_GAP, type ElasticLayout, findTickAtX } from "../elastic-layout";
+import { type ElasticLayout, findTickAtX } from "../elastic-layout";
 import { localScale, screenToWorld, viewCenterFromPan, worldToScreen } from "../fisheye";
 import {
 	CardContainerPool,
 	drawChapterNode,
-	drawClusterBlock,
 	drawConnector,
-	drawHeatmap,
+	drawDensityBar,
 	drawRulerTrackBg,
 	drawTick,
 	TextPool,
 } from "../pixi-draw";
+import { decimateTicks, slotWidth } from "../tick-decimation";
 import type { RulerOrientation } from "../types";
 import {
 	DOT_FINAL_SIZE,
@@ -107,7 +106,6 @@ interface RulerPixiLayerProps {
 	segments: RulerSegment[];
 	chapters: PixiChapterInfo[];
 	zoomTier: ZoomTierId;
-	clusters: CommitCluster[];
 	tickPositions: Map<string, number>;
 	/** Dynamic ruler track thickness (changes when user drags the border) */
 	rulerThickness: number;
@@ -159,7 +157,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	segments,
 	chapters,
 	zoomTier,
-	clusters,
 	tickPositions,
 	rulerThickness,
 	commitMessages,
@@ -233,7 +230,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		segments,
 		chapters,
 		zoomTier,
-		clusters,
 		tickPositions,
 		orientation,
 		containerWidth,
@@ -249,7 +245,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		segments,
 		chapters,
 		zoomTier,
-		clusters,
 		tickPositions,
 		orientation,
 		containerWidth,
@@ -485,70 +480,51 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		const cullStart = -cullBuffer;
 		const cullEnd = mainViewport + cullBuffer;
 
-		// Pre-compute visible tick range via binary search to avoid iterating all ticks.
-		// screenToWorld maps screen edges back to world coords; findTickAtX does binary search.
+		const allTicks = d.layout.ticks;
+
+		// Pre-compute visible tick range via binary search.
 		const worldCullStart = screenToWorld(cullStart, viewCenter, mainViewport, cam.scale);
 		const worldCullEnd = screenToWorld(cullEnd, viewCenter, mainViewport, cam.scale);
-		const allTicks = d.layout.ticks;
 		const visStartIdx = Math.max(0, findTickAtX(allTicks, worldCullStart) - 1);
 		const visEndIdx = Math.min(allTicks.length - 1, findTickAtX(allTicks, worldCullEnd) + 1);
 
-		// --- Draw ticks / clusters ---
-		const usesClusters = d.zoomTier === "L0" || d.zoomTier === "L1";
-
-		if (usesClusters && d.clusters.length > 0) {
-			for (const cl of d.clusters) {
-				const clScreen = toScreen(cl.worldPos);
-				const clLS = getLocalScale(cl.worldPos);
-				const clScreenSize = cl.worldSize * clLS;
-				if (clScreen + clScreenSize < cullStart || clScreen - clScreenSize > cullEnd) continue;
-				drawClusterBlock(
-					tickGfx,
-					theme,
-					clScreen - clScreenSize / 2,
-					clScreenSize,
-					trackH,
-					cl.count,
-					cl.activeCount > 0,
-					isH,
-					cam.edge,
-				);
-			}
-
-			// Draw individual ticks for fork/merge commits even in cluster mode
-			const forkMergeShas = new Set<string>();
-			for (const ch of d.chapters) {
-				if (ch.startCommitSha) forkMergeShas.add(ch.startCommitSha);
-				if (ch.mergeCommitSha) forkMergeShas.add(ch.mergeCommitSha);
-			}
-			if (forkMergeShas.size > 0) {
-				for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
-					const tick = allTicks[ti];
-					if (forkMergeShas.has(tick.sha)) {
-						const screenX = toScreen(tick.x);
-						const ls = getLocalScale(tick.x);
-						drawTick(tickGfx, theme, screenX, trackH, true, ls, isH, cam.edge);
-					}
-				}
-			}
-		} else {
-			// Compute tick stride: skip ticks when they'd be < 8px apart on screen
-			const screenGap = COLLAPSED_GAP * cam.scale;
-			const tickStride = screenGap < 8 ? Math.ceil(8 / screenGap) : 1;
-
-			for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
-				const tick = allTicks[ti];
-				const screenX = toScreen(tick.x);
-				// Always show segment ticks; skip others based on stride
-				if (!tick.segment && tickStride > 1 && tick.index % tickStride !== 0) continue;
-				const ls = getLocalScale(tick.x);
-				drawTick(tickGfx, theme, screenX, trackH, !!tick.segment, ls, isH, cam.edge);
-			}
+		// --- Collect fork/merge SHAs for priority retention ---
+		const forkMergeShas = new Set<string>();
+		const chaptersToScan = chaptersOverrideRef.current ?? d.chapters;
+		for (const ch of chaptersToScan) {
+			if (ch.startCommitSha) forkMergeShas.add(ch.startCommitSha);
+			if (ch.mergeCommitSha) forkMergeShas.add(ch.mergeCommitSha);
+		}
+		for (const ch of d.alwaysVisibleChapters) {
+			if (ch.startCommitSha) forkMergeShas.add(ch.startCommitSha);
+			if (ch.mergeCommitSha) forkMergeShas.add(ch.mergeCommitSha);
 		}
 
-		// --- Draw tick labels (L2+ only) ---
+		// --- Decimate ticks based on global scale (pan-stable) ---
+		const decimated = decimateTicks(allTicks, forkMergeShas, cam.scale, visStartIdx, visEndIdx);
+
+		// --- Draw ticks ---
+		for (const dt of decimated) {
+			const screenX = toScreen(dt.x);
+			drawTick(tickGfx, theme, screenX, trackH, dt.priority !== "normal", cam.scale, isH, cam.edge);
+		}
+
+		// --- Draw density bar (replaces heatmap + cluster blocks) ---
+		// Build screen-space data for the density bar from decimated ticks.
+		const densityData = decimated.map((dt, i) => {
+			const screenX = toScreen(dt.x);
+			const nextDt = decimated[i + 1];
+			const nextScreenX = nextDt ? toScreen(nextDt.x) : screenX;
+			return { screenX, screenGapToNext: nextScreenX - screenX, skippedCount: dt.skippedCount };
+		});
+		drawDensityBar(heatGfx, theme, densityData, trackH, isH, cam.edge);
+
+		// --- Draw tick labels ---
+		// Slot width = stride * COLLAPSED_GAP * scale, always ≥ MIN_TICK_WIDTH.
+		// Zooming in makes slots wider (more text visible); zooming out increases
+		// stride (fewer ticks) but each retained tick keeps at least MIN_TICK_WIDTH.
 		const tickPool = tickLabelPoolRef.current;
-		if (tickPool && !usesClusters) {
+		if (tickPool && decimated.length > 0) {
 			const showMessages = d.zoomTier === "L4" || d.zoomTier === "L3";
 			const isExpanded = trackH > 60;
 			const fontSize = isExpanded ? 11 : 10;
@@ -566,59 +542,43 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			}
 			const labelStyle = sc.labelStyle;
 
-			// Center gap: the tick spacing at viewport center (no fisheye compression).
-			// Text layout (word-wrap, truncation) is computed against this fixed width
-			// so it only changes on zoom, not on pan. Each label is then squeezed along
-			// the main axis by the fisheye ratio to fit the actual screen gap.
-			const centerGap = COLLAPSED_GAP * cam.scale;
-
-			// --- Horizontal vs Vertical layout parameters ---
-			// Horizontal: text flows along X (main axis), width = tick gap, height = trackH
-			// Vertical: text flows horizontally within the track width, height = tick gap
-			const labelAvailMain = Math.max(0, centerGap - 8);
 			const labelAvailCross = trackH - 8; // 4px padding each side
 
-			const labelStride = isH
-				? centerGap < 60
-					? Math.ceil(60 / centerGap)
-					: 1
-				: centerGap < 24
-					? Math.ceil(24 / centerGap)
-					: 1;
-
 			// Label cross-axis positioning depends on edge:
-			// edge="start": labels at y≈4 (near screen edge), ticks at y≈trackH (near canvas)
-			// edge="end":   labels at y≈trackH-fontSize-4 (near screen edge), ticks at y≈0 (near canvas)
 			const edgeEnd = cam.edge === "end";
 			const shaOffset = edgeEnd ? trackH - fontSize - 4 : 4;
-			// Message offset on cross axis (H mode) or same column offset (V mode)
 			const shaCrossSize = isH ? 0 : fontSize + 2;
 			const msgCrossOffset = isH
 				? edgeEnd
-					? shaOffset - (isExpanded ? 14 : 12) // above SHA toward screen edge
+					? shaOffset - (isExpanded ? 14 : 12)
 					: isExpanded
 						? 18
-						: 16 // below SHA toward canvas
+						: 16
 				: shaOffset;
 
-			// Available space for commit message (H: cross-axis; V: main-axis gap minus SHA)
-			const msgAvailH = edgeEnd
-				? msgCrossOffset - 4 // space from msgCrossOffset up to track edge
-				: trackH - msgCrossOffset - 4; // space from msgCrossOffset down to track edge
-			const msgAvailV = Math.max(0, centerGap - shaCrossSize - 8);
+			// Available space for commit message (cross-axis)
+			const msgAvailH = edgeEnd ? msgCrossOffset - 4 : trackH - msgCrossOffset - 4;
 			const msgLineH = 13;
+
+			// Label width grows with zoom. slotWidth = stride * COLLAPSED_GAP * scale.
+			const slot = slotWidth(cam.scale);
+			const labelWidth = slot - 8; // 8px padding
+
+			// --- Pre-compute message layout (constant across all ticks in this frame) ---
+			const msgAvailMain = labelWidth;
+			const msgAvailVert = Math.max(0, slot - shaCrossSize - 8);
+			const showMsg = isH
+				? (showMessages || isExpanded) && msgAvailH > msgLineH * 0.5 && msgAvailMain > 40
+				: msgAvailVert > msgLineH * 0.8;
+
+			const msgWrapWidth = isH ? msgAvailMain : labelAvailCross;
 			const maxMsgLines = isH
 				? Math.max(1, Math.floor(msgAvailH / msgLineH))
-				: Math.max(1, Math.floor(msgAvailV / msgLineH));
+				: Math.max(1, Math.floor(msgAvailVert / msgLineH));
+			const mainCharsPerLine = Math.max(4, Math.floor(msgAvailMain / 6));
+			const crossCharsPerLine = Math.max(4, Math.floor(labelAvailCross / 6));
+			const maxChars = isH ? mainCharsPerLine * maxMsgLines : crossCharsPerLine * maxMsgLines;
 
-			// Message text wrapping width
-			// H: wrap within tick gap (main axis); V: wrap within track width (cross axis)
-			const msgWrapWidth = isH ? labelAvailMain : labelAvailCross;
-
-			// Pre-compute message style
-			const showMsg = isH
-				? (showMessages || isExpanded) && msgAvailH > msgLineH * 0.5
-				: msgAvailV > msgLineH * 0.8;
 			if (showMsg) {
 				const msgKey = `${theme.dimmed}:${Math.round(msgWrapWidth)}:${maxMsgLines}:${isH}`;
 				if (sc.msgKey !== msgKey || !sc.msgStyle) {
@@ -634,39 +594,38 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				}
 			}
 
-			// Truncation limits
-			const mainCharsPerLine = Math.max(4, Math.floor(labelAvailMain / 6));
-			const crossCharsPerLine = Math.max(4, Math.floor(labelAvailCross / 6));
-			const maxChars = isH ? mainCharsPerLine * maxMsgLines : crossCharsPerLine * maxMsgLines;
+			// SHA truncation length (constant for all ticks at this zoom level)
+			const shaCharsH = Math.max(4, Math.min(7, Math.floor(labelWidth / (fontSize * 0.6))));
 
-			for (let ti = visStartIdx; ti <= visEndIdx; ti++) {
-				const tick = allTicks[ti];
-				if (!tick.segment && labelStride > 1 && tick.index % labelStride !== 0) continue;
-				const screenX = toScreen(tick.x);
+			for (let di = 0; di < decimated.length; di++) {
+				const dt = decimated[di];
+				const screenX = toScreen(dt.x);
 
-				// Fisheye squeeze ratio: actual screen gap / center gap
-				const nextTick = allTicks[ti + 1];
-				const nextScreenX = nextTick ? toScreen(nextTick.x) : screenX + centerGap;
-				const squeeze = centerGap > 0 ? Math.min(1, (nextScreenX - screenX) / centerGap) : 1;
+				// Fisheye squeeze: ratio of actual screen gap to the expected slot width.
+				// At viewport center actualGap ≈ slot, squeeze ≈ 1.
+				// At edges fisheye compresses actualGap < slot, squeeze < 1.
+				const nextDt = decimated[di + 1];
+				const nextScreenX = nextDt ? toScreen(nextDt.x) : screenX + slot;
+				const actualGap = nextScreenX - screenX;
+				const squeeze = slot > 0 ? Math.min(1, actualGap / slot) : 1;
 
 				// SHA label
 				const label = tickPool.acquire(labelStyle);
 				label.rotation = 0;
 				if (isH) {
-					label.text = tick.sha.slice(0, 7);
+					label.text = dt.sha.slice(0, shaCharsH);
 					label.scale.set(squeeze, 1);
 					label.position.set(screenX + 4, shaOffset);
 				} else {
-					// Vertical: horizontal text, truncate to fit track width
-					const shaChars = Math.max(4, Math.floor(labelAvailCross / (fontSize * 0.6)));
-					label.text = tick.sha.slice(0, Math.min(7, shaChars));
+					const shaCharsV = Math.max(4, Math.floor(labelAvailCross / (fontSize * 0.6)));
+					label.text = dt.sha.slice(0, Math.min(7, shaCharsV));
 					label.scale.set(1, squeeze);
 					label.position.set(shaOffset, screenX + 4);
 				}
 
 				// Commit message
 				if (showMsg) {
-					const msg = d.commitMessages.get(tick.sha);
+					const msg = d.commitMessages.get(dt.sha);
 					if (msg && sc.msgStyle) {
 						const msgLabel = tickPool.acquire(sc.msgStyle);
 						msgLabel.text = msg.length > maxChars ? `${msg.slice(0, maxChars)}…` : msg;
@@ -675,7 +634,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 							msgLabel.scale.set(squeeze, 1);
 							msgLabel.position.set(screenX + 4, msgCrossOffset);
 						} else {
-							// V: message below SHA in the same column, squeezed along Y
 							msgLabel.scale.set(1, squeeze);
 							msgLabel.position.set(msgCrossOffset, screenX + shaCrossSize + 4);
 						}
@@ -684,21 +642,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			}
 		}
 		tickPool?.flush();
-
-		// --- Draw heatmap (L0 only) ---
-		if (d.zoomTier === "L0" && d.clusters.length > 0) {
-			// Map cluster positions to screen space for heatmap
-			const screenClusters = d.clusters.map((cl) => {
-				const sPos = toScreen(cl.worldPos);
-				const ls = getLocalScale(cl.worldPos);
-				return {
-					worldPos: sPos,
-					worldSize: cl.worldSize * ls,
-					activeCount: cl.activeCount,
-				};
-			});
-			drawHeatmap(heatGfx, theme, screenClusters, trackH, isH);
-		}
 
 		// --- Draw chapter nodes + connectors (unified dot→pill→card) ---
 		// Cross axis remains linear — only main axis has fisheye.
@@ -1131,7 +1074,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	useEffect(() => {
 		latestCameraRef.current = camera;
 		// Build a fingerprint of all non-camera dependencies
-		const dataFingerprint = `${pixiReady}|${layout.totalWidth}|${segments.length}|${chapters.length}|${zoomTier}|${clusters.length}|${tickPositions.size}|${orientation}|${rulerThickness}|${commitMessages.size}|${alwaysVisibleChapters.length}|${openPanelChapterIds?.size ?? 0}`;
+		const dataFingerprint = `${pixiReady}|${layout.totalWidth}|${segments.length}|${chapters.length}|${zoomTier}|${tickPositions.size}|${orientation}|${rulerThickness}|${commitMessages.size}|${alwaysVisibleChapters.length}|${openPanelChapterIds?.size ?? 0}`;
 		if (dataFingerprint === prevDataDepsRef.current) {
 			// Only camera changed — updateCamera fast-path already drew this frame
 			return;
@@ -1145,7 +1088,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		segments,
 		chapters,
 		zoomTier,
-		clusters,
 		tickPositions,
 		orientation,
 		rulerThickness,
