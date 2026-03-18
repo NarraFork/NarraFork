@@ -92,12 +92,20 @@ export function CodexSection({
 	const [importResult, setImportResult] = useState<string | null>(null);
 	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 	const deviceAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+	const browserAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+	const browserAuthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-	// Cleanup device-auth polling interval on unmount
+	// Cleanup polling intervals/timeouts on unmount
 	useEffect(() => {
 		return () => {
 			if (deviceAuthIntervalRef.current) {
 				clearInterval(deviceAuthIntervalRef.current);
+			}
+			if (browserAuthIntervalRef.current) {
+				clearInterval(browserAuthIntervalRef.current);
+			}
+			if (browserAuthTimeoutRef.current) {
+				clearTimeout(browserAuthTimeoutRef.current);
 			}
 		};
 	}, []);
@@ -261,26 +269,35 @@ export function CodexSection({
 			const result = await api.codexBrowserAuth();
 			window.open(result.authorizeUrl, "_blank");
 
-			// Set timeout to auto-cancel after 60 seconds
-			const timeout = setTimeout(() => {
-				if (browserAuthPending) {
-					handleCancelBrowserAuth();
-					notifications.show({
-						message: "Browser authorization timed out",
-						color: "orange",
-					});
+			const cleanupBrowserAuth = () => {
+				if (browserAuthIntervalRef.current) {
+					clearInterval(browserAuthIntervalRef.current);
+					browserAuthIntervalRef.current = null;
 				}
+				if (browserAuthTimeoutRef.current) {
+					clearTimeout(browserAuthTimeoutRef.current);
+					browserAuthTimeoutRef.current = null;
+				}
+			};
+
+			// Set timeout to auto-cancel after 60 seconds
+			browserAuthTimeoutRef.current = setTimeout(() => {
+				cleanupBrowserAuth();
+				handleCancelBrowserAuth();
+				notifications.show({
+					message: "Browser authorization timed out",
+					color: "orange",
+				});
 			}, 60_000);
 
 			// Monitor for new credentials
-			const checkInterval = setInterval(() => {
+			browserAuthIntervalRef.current = setInterval(() => {
 				qc.invalidateQueries({ queryKey: ["codex", "status"] });
 				const currentEntries =
 					qc.getQueryData<{ entries: unknown[] }>(["codex", "status"])?.entries ?? [];
 
 				if (currentEntries.length > initialCount) {
-					clearInterval(checkInterval);
-					clearTimeout(timeout);
+					cleanupBrowserAuth();
 					setBrowserAuthPending(false);
 					setBrowserAuthLoading(false);
 					notifications.show({
@@ -289,12 +306,6 @@ export function CodexSection({
 					});
 				}
 			}, 3_000);
-
-			// Clean up on unmount
-			return () => {
-				clearInterval(checkInterval);
-				clearTimeout(timeout);
-			};
 		} catch (err) {
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);

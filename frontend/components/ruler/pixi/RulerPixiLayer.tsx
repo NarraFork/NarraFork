@@ -117,6 +117,8 @@ interface RulerPixiLayerProps {
 	alwaysVisibleChapters: PixiChapterInfo[];
 	/** Set of chapter IDs that have their narrator panel open (rendered by React) */
 	openPanelChapterIds?: Set<string>;
+	/** Called when panel blend animation updates — allows parent to sync DOM panels */
+	onPanelBlendUpdate?: () => void;
 	// --- Interaction callbacks ---
 	onChapterClick?: (chapterId: string, narratorId: string | null) => void;
 	onChapterContextMenu?: (chapterId: string, screenX: number, screenY: number) => void;
@@ -163,6 +165,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	commitMessages,
 	alwaysVisibleChapters,
 	openPanelChapterIds,
+	onPanelBlendUpdate,
 	onChapterClick: _onChapterClick,
 	onChapterContextMenu: _onChapterContextMenu,
 	onChapterDragEnd: _onChapterDragEnd,
@@ -258,8 +261,18 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		openPanelChapterIds,
 	};
 
+	// Callback ref — avoids stale closure in redraw's rAF callback
+	const onPanelBlendUpdateRef = useRef(onPanelBlendUpdate);
+	onPanelBlendUpdateRef.current = onPanelBlendUpdate;
+
 	// Hit-test rectangles for card interaction (rebuilt each redraw)
 	const cardHitRectsRef = useRef<CardHitRect[]>([]);
+
+	// --- Panel open/close blend animation ---
+	// Per-chapter blend factor: 0 = card size, 1 = panel size.
+	// Lerps each frame toward the target (1 if panel open, 0 if closed).
+	const panelBlendMapRef = useRef<Map<string, number>>(new Map());
+	const panelAnimRafRef = useRef(0);
 
 	// --- Initialize PixiJS Application ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: init once
@@ -359,6 +372,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 		return () => {
 			destroyed = true;
+			cancelAnimationFrame(panelAnimRafRef.current);
 			// Only destroy if init completed and app was fully set up
 			if (appRef.current) {
 				// Workaround for PixiJS v8 ResizePlugin bug: destroy() calls
@@ -728,6 +742,25 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		// Card scale factor (clamped) — shared with NarratorPanelOverlay in RulerFlow.
 		const cardScale = getCardScale(cam.scale);
 
+		// --- Panel blend animation: advance per-chapter blend toward target ---
+		const blendMap = panelBlendMapRef.current;
+		let needsAnimFrame = false;
+		const BLEND_LERP = 0.15;
+		const BLEND_SNAP = 0.01;
+
+		// Advance blend for chapters that are closing (no longer in openPanelChapterIds)
+		for (const [chId, val] of blendMap) {
+			if (!d.openPanelChapterIds?.has(chId)) {
+				const next = val - val * BLEND_LERP;
+				if (next < BLEND_SNAP) {
+					blendMap.delete(chId);
+				} else {
+					blendMap.set(chId, next);
+					needsAnimFrame = true;
+				}
+			}
+		}
+
 		for (const ch of merged) {
 			const chWorldMain = ch.segMainPos + ch.layoutX;
 			// For chapters with an open panel, compute localScale at both the
@@ -737,7 +770,20 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// the fisheye periphery.
 			let ls: number;
 			const hasPanel = d.openPanelChapterIds?.has(ch.id);
-			if (hasPanel && ch.panelWidth) {
+
+			// Advance blend for this chapter toward target
+			let panelBlend = blendMap.get(ch.id) ?? 0;
+			if (hasPanel) {
+				const target = 1;
+				panelBlend += (target - panelBlend) * BLEND_LERP;
+				if (Math.abs(target - panelBlend) < BLEND_SNAP) panelBlend = target;
+				else needsAnimFrame = true;
+				blendMap.set(ch.id, panelBlend);
+			}
+			// panelBlend > 0 means panel is either open or animating closed
+			const effectivePanel = panelBlend > 0;
+
+			if (effectivePanel && ch.panelWidth) {
 				const panelWorldSize = ch.panelWidth / cam.scale;
 				const lsNear = getLocalScale(chWorldMain);
 				const lsFar = getLocalScale(chWorldMain + panelWorldSize);
@@ -763,29 +809,41 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
 
 			// --- Panel morph schedule ---
-			// When a panel is open, skip the pill phase entirely: the panel
-			// shrinks continuously from its CSS size down to dot size, then
-			// disappears and the PixiJS dot takes over.
-			//   t > DOT (0.3)  → panel visible (shrinking), PixiJS skipped
-			//   t ≤ DOT        → panel gone, PixiJS draws the dot
-			const panelVisible = hasPanel && t > MORPH_T_DOT;
+			// When a panel is open (or animating), blend draw size from card/dot
+			// dimensions toward panel dimensions using panelBlend.
+			//   panelBlend > 0 && t > DOT → panel visible (blending), PixiJS skipped
+			//   panelBlend === 0 || t ≤ DOT → panel gone, PixiJS draws normally
+			const panelVisible = effectivePanel && t > MORPH_T_DOT;
 
-			// For chapters with an open panel, blend draw size from panel CSS
-			// dimensions down to dot size as t decreases toward MORPH_T_DOT.
+			// For chapters with panel blend > 0, compute two sets of dimensions:
+			// 1) hitW/hitH — for DOM panel positioning (uses target panel size immediately)
+			// 2) connW/connH — for connector line endpoints (smoothly blended)
 			let drawW = morph.width;
 			let drawH = morph.height;
+			let hitW = morph.width;
+			let hitH = morph.height;
 			if (panelVisible && ch.panelWidth && ch.panelHeight) {
-				// Map t from [DOT..1] → blend [0..1] (0 = dot size, 1 = panel size)
-				const blend = (t - MORPH_T_DOT) / (1 - MORPH_T_DOT);
+				// Map t from [DOT..1] → zoomBlend [0..1] (0 = dot size, 1 = panel size)
+				const zoomBlend = (t - MORPH_T_DOT) / (1 - MORPH_T_DOT);
 				const dotMorph = getMorphStyle(MORPH_T_DOT, NODE_WIDTH, NODE_HEIGHT);
-				drawW = dotMorph.width + blend * (ch.panelWidth - dotMorph.width);
-				drawH = dotMorph.height + blend * (ch.panelHeight - dotMorph.height);
+				// Target dimensions at full panel open
+				const targetW = dotMorph.width + zoomBlend * (ch.panelWidth - dotMorph.width);
+				const targetH = dotMorph.height + zoomBlend * (ch.panelHeight - dotMorph.height);
+				// Hit rect: use target size immediately so DOM panel renders at correct size
+				hitW = targetW;
+				hitH = targetH;
+				// Connector endpoints: blend smoothly from card to panel size
+				drawW = morph.width + panelBlend * (targetW - morph.width);
+				drawH = morph.height + panelBlend * (targetH - morph.height);
 			}
 
 			// Apply cardScale to pill/card phases, keep dots at fixed size.
 			const isDot = t <= MORPH_T_DOT;
 			const scaledW = isDot ? drawW : Math.max(DOT_FINAL_SIZE, drawW * cardScale);
 			const scaledH = isDot ? drawH : Math.max(DOT_FINAL_SIZE, drawH * cardScale);
+			// Hit rect dimensions (for DOM panel positioning)
+			const hitScaledW = isDot ? hitW : Math.max(DOT_FINAL_SIZE, hitW * cardScale);
+			const hitScaledH = isDot ? hitH : Math.max(DOT_FINAL_SIZE, hitH * cardScale);
 
 			// Fixed anchor — start edge of the layout slot for all morph phases.
 			// Dot/pill/card all grow from this point toward the end of the main axis,
@@ -808,17 +866,22 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const nodeLeft = isH ? elemScreenLeft : elemScreenCross;
 			const nodeTop = isH ? elemScreenCross : elemScreenLeft;
 
-			// Track hit rects for card-like chapters AND chapters with open panels.
+			// Track hit rects for card-like chapters AND chapters with open/animating panels.
 			// Panels need hit rects for positioning even when cardBlend has dropped to 0.
-			if (morph.cardBlend > 0 || hasPanel) {
+			// Use hitScaledW/H so DOM panel gets the correct target size immediately.
+			if (morph.cardBlend > 0 || effectivePanel) {
+				const hrW = effectivePanel ? hitScaledW : screenW;
+				const hrH = effectivePanel ? hitScaledH : screenH;
+				const hrLeft = isH ? elemScreenLeft : elemScreenCross;
+				const hrTop = isH ? elemScreenCross : elemScreenLeft;
 				cardHitRects.push({
 					id: ch.id,
 					narratorId: ch.narratorId,
 					fromSha: ch.startCommitSha ?? "",
-					screenX: nodeLeft,
-					screenY: nodeTop,
-					width: screenW,
-					height: screenH,
+					screenX: hrLeft,
+					screenY: hrTop,
+					width: hrW,
+					height: hrH,
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
 					localScale: ls,
@@ -826,12 +889,20 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				});
 			}
 
-			// Skip PixiJS draw while the panel is visible (t > DOT).
-			// Once t ≤ DOT the panel disappears and PixiJS draws the dot.
-			const skipDraw = panelVisible;
+			// Skip PixiJS draw while the panel is fully visible (blend ≈ 1 and t > DOT).
+			// During close animation (blend < 1), draw PixiJS with fading opacity.
+			// Once blend reaches 0 or t ≤ DOT, PixiJS draws normally.
+			const skipDraw = panelVisible && panelBlend >= 1;
 
 			if (!skipDraw) {
-				const screenMorph = { ...morph, width: screenW, height: screenH };
+				// During panel close animation, fade PixiJS node in as panel fades out
+				const animOpacity = panelVisible ? 1 - panelBlend : 1;
+				const screenMorph = {
+					...morph,
+					width: screenW,
+					height: screenH,
+					opacity: morph.opacity * animOpacity,
+				};
 				const isCard = morph.cardBlend > 0;
 
 				// Card-phase: use per-chapter Container for correct z-order
@@ -1006,6 +1077,17 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 		// Render
 		app.render();
+
+		// Schedule next frame if panel blend animation is in progress
+		if (needsAnimFrame) {
+			cancelAnimationFrame(panelAnimRafRef.current);
+			panelAnimRafRef.current = requestAnimationFrame(() => {
+				panelAnimRafRef.current = 0;
+				redraw(latestCameraRef.current);
+				// Notify parent to sync DOM panel positions with updated hit rects
+				onPanelBlendUpdateRef.current?.();
+			});
+		}
 	}, []);
 
 	// --- Watch for Mantine theme changes ---

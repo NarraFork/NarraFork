@@ -647,6 +647,7 @@ export function NarratorPanel({
 	onMinimize,
 	onBack,
 	isResizing,
+	onHeaderPointerDown,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -2006,7 +2007,21 @@ export function NarratorPanel({
 					justify="space-between"
 					py="xs"
 					px="md"
-					style={{ borderBottom: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
+					style={{
+						borderBottom: "1px solid var(--mantine-color-default-border)",
+						flexShrink: 0,
+						cursor: onHeaderPointerDown ? "grab" : undefined,
+					}}
+					onPointerDown={
+						onHeaderPointerDown
+							? (e: React.PointerEvent) => {
+									// Skip drag initiation when clicking interactive elements
+									const el = e.target as HTMLElement;
+									if (el.closest("button, a, input, select, textarea, [role='button']")) return;
+									onHeaderPointerDown(e);
+								}
+							: undefined
+					}
 				>
 					<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
 						{compact ? (

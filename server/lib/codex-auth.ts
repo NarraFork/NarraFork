@@ -32,6 +32,8 @@ export interface CodexTokens {
 	expiresAt: number;
 	/** ChatGPT account ID extracted from JWT claims. */
 	accountId?: string;
+	/** Email extracted from JWT claims. */
+	email?: string;
 }
 
 interface TokenResponse {
@@ -52,6 +54,7 @@ interface IdTokenClaims {
 	email?: string;
 	"https://api.openai.com/auth"?: {
 		chatgpt_account_id?: string;
+		chatgpt_plan_type?: string;
 	};
 }
 
@@ -100,28 +103,33 @@ function parseJwtClaims(token: string): IdTokenClaims | undefined {
 	}
 }
 
-function extractAccountId(tokens: TokenResponse): string | undefined {
+function extractIdTokenInfo(tokens: TokenResponse): {
+	accountId?: string;
+	email?: string;
+} {
+	const result: { accountId?: string; email?: string } = {};
 	if (tokens.id_token) {
 		const claims = parseJwtClaims(tokens.id_token);
 		if (claims) {
+			result.email = claims.email;
 			const id =
 				claims.chatgpt_account_id ||
 				claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
 				claims.organizations?.[0]?.id;
-			if (id) return id;
+			if (id) result.accountId = id;
 		}
 	}
-	if (tokens.access_token) {
+	if (!result.accountId && tokens.access_token) {
 		const claims = parseJwtClaims(tokens.access_token);
 		if (claims) {
-			return (
+			result.accountId =
 				claims.chatgpt_account_id ||
 				claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
-				claims.organizations?.[0]?.id
-			);
+				claims.organizations?.[0]?.id;
+			if (!result.email) result.email = claims.email;
 		}
 	}
-	return undefined;
+	return result;
 }
 
 // === Token exchange ===
@@ -194,12 +202,13 @@ export async function refreshCodexToken(
 			`Token refresh returned non-JSON payload: ${message}. body preview=${raw.slice(0, 500)}`,
 		);
 	}
-	const accountId = extractAccountId(tokens);
+	const info = extractIdTokenInfo(tokens);
 	return {
 		accessToken: tokens.access_token,
 		refreshToken: tokens.refresh_token,
 		expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-		accountId,
+		accountId: info.accountId,
+		email: info.email,
 	};
 }
 
@@ -360,12 +369,13 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 			resolve: (tokens) => {
 				clearTimeout(timeout);
 				stopOAuthServer();
-				const accountId = extractAccountId(tokens);
+				const info = extractIdTokenInfo(tokens);
 				resolve({
 					accessToken: tokens.access_token,
 					refreshToken: tokens.refresh_token,
 					expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-					accountId,
+					accountId: info.accountId,
+					email: info.email,
 				});
 			},
 			reject: (error) => {
@@ -518,12 +528,13 @@ export async function pollDeviceCodeFlow(
 						`body preview=${tokenRaw.slice(0, 500)}`,
 				);
 			}
-			const accountId = extractAccountId(tokens);
+			const info = extractIdTokenInfo(tokens);
 			return {
 				accessToken: tokens.access_token,
 				refreshToken: tokens.refresh_token,
 				expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-				accountId,
+				accountId: info.accountId,
+				email: info.email,
 			};
 		}
 

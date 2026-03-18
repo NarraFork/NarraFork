@@ -256,6 +256,7 @@ export class CodexManager {
 				refreshToken: refreshed.refreshToken,
 				expiresAt: refreshed.expiresAt,
 				accountId: refreshed.accountId,
+				email: refreshed.email,
 			});
 
 			this.saveCredentials();
@@ -281,6 +282,7 @@ export class CodexManager {
 				refreshToken: tokens.refreshToken,
 				expiresAt: tokens.expiresAt,
 				accountId: tokens.accountId ?? cred.accountId,
+				email: tokens.email ?? cred.email,
 			};
 		})().finally(() => {
 			this.refreshPromises.delete(id);
@@ -633,6 +635,7 @@ export class CodexManager {
 			refreshToken: refreshed.refreshToken,
 			expiresAt: refreshed.expiresAt,
 			accountId: refreshed.accountId,
+			email: refreshed.email,
 		});
 		this.saveCredentials();
 	}
@@ -680,6 +683,7 @@ export class CodexManager {
 				refreshToken: refreshed.refreshToken,
 				expiresAt: refreshed.expiresAt,
 				accountId: refreshed.accountId,
+				email: refreshed.email,
 			});
 			this.saveCredentials();
 		}
@@ -757,6 +761,7 @@ export class CodexManager {
 			existing.accessToken = tokens.accessToken;
 			existing.expiresAt = tokens.expiresAt;
 			if (tokens.accountId) existing.accountId = tokens.accountId;
+			if (tokens.email) existing.email = tokens.email;
 			if (existing.disabled && existing.disabledReason !== "manual") {
 				existing.disabled = false;
 				existing.disabledReason = undefined;
@@ -772,6 +777,7 @@ export class CodexManager {
 			accessToken: tokens.accessToken,
 			expiresAt: tokens.expiresAt,
 			accountId: tokens.accountId,
+			email: tokens.email,
 			priority: this.entries.length,
 			disabled: false,
 		};

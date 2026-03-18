@@ -65,6 +65,11 @@ const DEFAULT_PANEL_HEIGHT = 520;
 const MIN_PANEL_WIDTH = 300;
 const MIN_PANEL_HEIGHT = 200;
 
+/** Duration (ms) for the panel close animation — DOM unmount delay. */
+const PANEL_CLOSE_DURATION = 250;
+/** CSS transition duration string for panel opacity fade. */
+const PANEL_OPACITY_TRANSITION = "180ms ease";
+
 interface ChapterContextMenuState {
 	x: number;
 	y: number;
@@ -287,9 +292,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						div.style.transform = `scale(${panelScale})`;
 					}
 					// Panel visible at full opacity while t > DOT; hidden once t ≤ DOT.
-					const visible = hr.morphT > MORPH_T_DOT;
-					div.style.opacity = visible ? "1" : "0";
-					div.style.pointerEvents = visible ? "auto" : "none";
+					// Also respect the enter/exit animation opacity from React state.
+					const zoomVisible = hr.morphT > MORPH_T_DOT;
+					const animOp = Number(div.dataset.animOpacity);
+					const finalOpacity = zoomVisible ? (Number.isFinite(animOp) ? animOp : 1) : 0;
+					div.style.opacity = String(finalOpacity);
+					div.style.pointerEvents = zoomVisible && finalOpacity > 0 ? "auto" : "none";
 				}
 			}
 		}
@@ -1587,6 +1595,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	// Shared state for open narrator panels (lifted from SegmentCanvas for PixiJS interaction)
 	const [openPanelChapterIds, setOpenPanelChapterIds] = useState<Set<string>>(new Set());
+	// Panels in close animation — kept mounted until animation completes
+	const [closingPanelChapterIds, setClosingPanelChapterIds] = useState<Set<string>>(new Set());
 	const panelElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
 	const [panelSizes, setPanelSizes] = useState<Map<string, { w: number; h: number }>>(new Map());
 	/** Captures the starting layout position when a panel header drag begins */
@@ -1596,18 +1606,40 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	panelSizesRef.current = panelSizes;
 	const openPanelIdsRef = useRef<Set<string>>(new Set());
 	openPanelIdsRef.current = openPanelChapterIds;
+	const closingPanelIdsRef = useRef<Set<string>>(new Set());
+	closingPanelIdsRef.current = closingPanelChapterIds;
 
-	const handlePixiChapterClick = useCallback((chapterId: string, _narratorId: string | null) => {
-		setOpenPanelChapterIds((prev) => {
-			const next = new Set(prev);
-			if (next.has(chapterId)) {
-				next.delete(chapterId);
-			} else {
-				next.add(chapterId);
-			}
-			return next;
+	/** Start close animation for a panel: move to closing set, auto-remove after duration. */
+	const startPanelClose = useCallback((chId: string) => {
+		setClosingPanelChapterIds((cp) => {
+			const n = new Set(cp);
+			n.add(chId);
+			return n;
 		});
+		setTimeout(() => {
+			setClosingPanelChapterIds((cp) => {
+				const n = new Set(cp);
+				n.delete(chId);
+				return n;
+			});
+		}, PANEL_CLOSE_DURATION);
 	}, []);
+
+	const handlePixiChapterClick = useCallback(
+		(chapterId: string, _narratorId: string | null) => {
+			setOpenPanelChapterIds((prev) => {
+				const next = new Set(prev);
+				if (next.has(chapterId)) {
+					next.delete(chapterId);
+					startPanelClose(chapterId);
+				} else {
+					next.add(chapterId);
+				}
+				return next;
+			});
+		},
+		[startPanelClose],
+	);
 
 	const handlePixiChapterContextMenu = useCallback(
 		(chapterId: string, screenX: number, screenY: number) => {
@@ -2031,12 +2063,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const result: PixiChapterInfo[] = [];
 			const ps = panelSizesRef.current;
 			const openIds = openPanelIdsRef.current;
+			const closingIds = closingPanelIdsRef.current;
 			for (const tick of ticks) {
 				if (!tick.segment) continue;
 				const chs = pixiChaptersMapRef.current.get(tick.sha);
 				if (!chs) continue;
 				for (const ch of chs) {
-					const hasPanel = openIds.has(ch.id);
+					const hasPanel = openIds.has(ch.id) || closingIds.has(ch.id);
 					result.push({
 						id: ch.id,
 						status: ch.status,
@@ -2080,7 +2113,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			if (!chapters) continue;
 			for (const ch of chapters) {
 				const ps = panelSizes.get(ch.id);
-				const hasPanel = openPanelChapterIds.has(ch.id);
+				const hasPanel = openPanelChapterIds.has(ch.id) || closingPanelChapterIds.has(ch.id);
 				result.push({
 					id: ch.id,
 					status: ch.status,
@@ -2100,7 +2133,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			}
 		}
 		return result;
-	}, [segmentTicks, pixiChaptersTick, panelSizes, openPanelChapterIds]);
+	}, [segmentTicks, pixiChaptersTick, panelSizes, openPanelChapterIds, closingPanelChapterIds]);
 
 	// Always-visible active chapters for L0 dot rendering.
 	// Uses activeChapters from the main ruler query (no segment fetch needed).
@@ -2137,15 +2170,25 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					segMainPos,
 					panelWidth:
 						panelSizes.get(ch.id)?.w ??
-						(openPanelChapterIds.has(ch.id) ? DEFAULT_PANEL_WIDTH : undefined),
+						(openPanelChapterIds.has(ch.id) || closingPanelChapterIds.has(ch.id)
+							? DEFAULT_PANEL_WIDTH
+							: undefined),
 					panelHeight:
 						panelSizes.get(ch.id)?.h ??
-						(openPanelChapterIds.has(ch.id) ? DEFAULT_PANEL_HEIGHT : undefined),
+						(openPanelChapterIds.has(ch.id) || closingPanelChapterIds.has(ch.id)
+							? DEFAULT_PANEL_HEIGHT
+							: undefined),
 				});
 			}
 		}
 		return result;
-	}, [rulerData.activeChapters, tickPositions, panelSizes, openPanelChapterIds]);
+	}, [
+		rulerData.activeChapters,
+		tickPositions,
+		panelSizes,
+		openPanelChapterIds,
+		closingPanelChapterIds,
+	]);
 
 	if (isLoading) {
 		return (
@@ -2347,6 +2390,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				commitMessages={commitMessages}
 				alwaysVisibleChapters={alwaysVisibleChapters}
 				openPanelChapterIds={openPanelChapterIds}
+				onPanelBlendUpdate={applyTransformToDOM}
 				onChapterClick={handlePixiChapterClick}
 				onChapterContextMenu={handlePixiChapterContextMenu}
 				onChapterDragEnd={handlePixiChapterDragEnd}
@@ -2521,8 +2565,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				/>
 			)}
 
-			{/* Narrator panels for open chapters */}
-			{Array.from(openPanelChapterIds).map((chId) => {
+			{/* Narrator panels for open and closing (animating out) chapters */}
+			{Array.from(new Set([...openPanelChapterIds, ...closingPanelChapterIds])).map((chId) => {
+				const isClosing = closingPanelChapterIds.has(chId) && !openPanelChapterIds.has(chId);
 				let chData: { id: string; title: string; narratorId: string | null } | null = null;
 				for (const [_sha, chs] of pixiChaptersMapRef.current) {
 					const found = chs.find((c) => c.id === chId);
@@ -2545,7 +2590,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				return (
 					<NarratorPanelOverlay
 						key={chId}
-						chapter={chData}
 						narratorId={chData.narratorId}
 						screenX={screenX}
 						screenY={screenY}
@@ -2553,12 +2597,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						height={panelSizes.get(chId)?.h ?? DEFAULT_PANEL_HEIGHT}
 						scale={scale}
 						localScale={hr.localScale}
+						isClosing={isClosing}
 						onClose={() => {
 							setOpenPanelChapterIds((prev) => {
 								const next = new Set(prev);
 								next.delete(chId);
 								return next;
 							});
+							startPanelClose(chId);
 						}}
 						onResizeEnd={(newW, newH) => {
 							setPanelSizes((prev) => {
@@ -2641,7 +2687,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 /** Floating narrator panel overlay — rendered when user clicks a card in PixiJS */
 function NarratorPanelOverlay({
-	chapter,
 	narratorId,
 	screenX,
 	screenY,
@@ -2649,6 +2694,7 @@ function NarratorPanelOverlay({
 	height: panelH,
 	scale: _scale,
 	localScale: fisheyeLocalScale,
+	isClosing,
 	onClose,
 	onResizeEnd,
 	onDragMove,
@@ -2656,7 +2702,6 @@ function NarratorPanelOverlay({
 	canvasEl,
 	panelRef,
 }: {
-	chapter: { id: string; title: string };
 	narratorId: string;
 	screenX: number;
 	screenY: number;
@@ -2666,6 +2711,8 @@ function NarratorPanelOverlay({
 	scale: number;
 	/** Fisheye local scale at this chapter's position — used for visual panel scaling */
 	localScale: number;
+	/** Whether this panel is in its close animation */
+	isClosing?: boolean;
 	onClose: () => void;
 	onResizeEnd: (newW: number, newH: number) => void;
 	/** Called during header drag with screen-space deltas */
@@ -2687,7 +2734,17 @@ function NarratorPanelOverlay({
 	onDragMoveRef.current = onDragMove;
 	const onDragEndRef = useRef(onDragEnd);
 	onDragEndRef.current = onDragEnd;
+	const onCloseRef = useRef(onClose);
+	onCloseRef.current = onClose;
 	const panelWheelRef = useRef<HTMLDivElement>(null);
+
+	// Enter animation: start invisible, fade in after mount
+	const [mounted, setMounted] = useState(false);
+	useEffect(() => {
+		const raf = requestAnimationFrame(() => setMounted(true));
+		return () => cancelAnimationFrame(raf);
+	}, []);
+	const animOpacity = isClosing ? 0 : mounted ? 1 : 0;
 
 	// Header drag state
 	const isDraggingRef = useRef(false);
@@ -2821,6 +2878,10 @@ function NarratorPanelOverlay({
 				const dx = ev.clientX - dragStartRef.current.x;
 				const dy = ev.clientY - dragStartRef.current.y;
 				onDragEndRef.current(dx, dy);
+			} else if (ev.type === "pointerup") {
+				// Click without drag — close the panel.
+				// Only on pointerup; pointercancel (browser gesture takeover) should not close.
+				onCloseRef.current();
 			}
 			document.removeEventListener("pointermove", handleMove, true);
 			document.removeEventListener("pointerup", handleUp, true);
@@ -2848,6 +2909,7 @@ function NarratorPanelOverlay({
 			data-panel-w={displayW}
 			data-panel-h={displayH}
 			data-resizing={isCurrentlyResizing ? "1" : undefined}
+			data-anim-opacity={animOpacity}
 			style={{
 				position: "fixed",
 				left: screenX + resizeDelta.dx,
@@ -2860,10 +2922,13 @@ function NarratorPanelOverlay({
 				display: "flex",
 				flexDirection: "column",
 				overflow: "hidden",
-				transition: isResizingRef.current ? "none" : "width 200ms ease, height 200ms ease",
+				opacity: animOpacity,
+				transition: isResizingRef.current
+					? "none"
+					: `width 200ms ease, height 200ms ease, opacity ${PANEL_OPACITY_TRANSITION}`,
 				userSelect: "none",
 				zIndex: 10,
-				pointerEvents: "auto",
+				pointerEvents: isClosing ? "none" : "auto",
 				transform: `scale(${panelScale})`,
 				transformOrigin: "top left",
 			}}
@@ -2906,22 +2971,7 @@ function NarratorPanelOverlay({
 				</Box>
 			))}
 
-			{/* Header — drag handle; click (without drag) closes the panel */}
-			<Box
-				style={{ cursor: "grab" }}
-				onPointerDown={startDrag}
-				onClick={(e) => {
-					e.stopPropagation();
-					// Only close if the pointer didn't move past the dead zone
-					if (!dragDidMoveRef.current) onClose();
-				}}
-			>
-				<Text size="11px" fw={600} truncate>
-					{chapter.title}
-				</Text>
-			</Box>
-
-			{/* Narrator panel */}
+			{/* Narrator panel — header handles drag and close via NarratorPanel props */}
 			<Box
 				onClick={(e) => e.stopPropagation()}
 				onDoubleClick={(e) => e.stopPropagation()}
@@ -2929,14 +2979,15 @@ function NarratorPanelOverlay({
 					flex: 1,
 					minHeight: 0,
 					overflow: "hidden",
-					borderTop:
-						"1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
-					marginTop: 6,
 					position: "relative",
 				}}
 			>
 				<Box style={{ height: "100%", visibility: isCurrentlyResizing ? "hidden" : "visible" }}>
-					<StableNarratorPanel narratorId={narratorId} />
+					<StableNarratorPanel
+						narratorId={narratorId}
+						onMinimize={onClose}
+						onHeaderPointerDown={startDrag}
+					/>
 				</Box>
 				{isCurrentlyResizing && (
 					<Box
@@ -2956,8 +3007,19 @@ function NarratorPanelOverlay({
 /** Memoized wrapper — prevents NarratorPanel from re-rendering during resize drags */
 const StableNarratorPanel = memo(function StableNarratorPanel({
 	narratorId,
+	onMinimize,
+	onHeaderPointerDown,
 }: {
 	narratorId: string;
+	onMinimize?: () => void;
+	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 }) {
-	return <NarratorPanel narratorId={narratorId} compact />;
+	return (
+		<NarratorPanel
+			narratorId={narratorId}
+			compact
+			onMinimize={onMinimize}
+			onHeaderPointerDown={onHeaderPointerDown}
+		/>
+	);
 });

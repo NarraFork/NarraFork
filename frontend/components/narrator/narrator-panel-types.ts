@@ -137,6 +137,8 @@ export interface NarratorPanelProps {
 	onBack?: () => void;
 	/** When true, shows a skeleton overlay instead of messages (e.g. during node resize) */
 	isResizing?: boolean;
+	/** Called on pointerdown on the header bar — allows parent to initiate drag */
+	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
