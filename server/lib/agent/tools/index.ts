@@ -16,6 +16,7 @@ import { skillTool } from "./skill";
 import { agentTool } from "./task";
 import { terminalTool } from "./terminal";
 import { taskCreateTool } from "./todo";
+import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
 import { writeTool } from "./write";
 
@@ -41,6 +42,7 @@ export function registerCoreTools(): void {
 	toolRegistry.register(globTool);
 	toolRegistry.register(grepTool);
 	toolRegistry.register(webSearchTool);
+	toolRegistry.register(webFetchTool);
 	toolRegistry.register(taskCreateTool);
 	toolRegistry.register(enterPlanModeTool);
 	toolRegistry.register(exitPlanModeTool);

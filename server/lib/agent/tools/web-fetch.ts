@@ -1,0 +1,124 @@
+import { z } from "zod/v4";
+import { logger } from "../../logger";
+import type { ToolDefinition, ToolResult } from "../types";
+
+const MODES = ["readability", "screenshot", "dom", "smart"] as const;
+
+export const webFetchTool: ToolDefinition = {
+	name: "WebFetch",
+	description:
+		"Fetch and extract content from a web page URL. Use this after WebSearch to get detailed content from specific URLs.\n\n" +
+		"Modes:\n" +
+		'- "readability": Extract article text using Mozilla Readability. Best for articles, docs, blog posts. Works without a browser.\n' +
+		'- "screenshot": Capture a viewport screenshot as an image. Requires Chrome/Chromium browser.\n' +
+		'- "dom": Extract cleaned HTML DOM structure. Best for structured data, tables, lists. Works without a browser (no JS rendering).\n' +
+		'- "smart": Extract DOM then summarize with an AI model. Best for long pages where you only need key information. Works without a browser.\n\n' +
+		"Note: readability, dom, and smart modes fall back to HTTP fetch when Chrome is not available. " +
+		"This works well for static pages but won't render JavaScript-heavy SPAs.\n\n" +
+		"Parameters:\n" +
+		"- url (required): The URL to fetch\n" +
+		"- mode (required): One of readability, screenshot, dom, smart\n" +
+		"- selector (optional): CSS selector to extract specific elements (dom mode only)\n" +
+		"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)",
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			url: {
+				description: "The URL to fetch content from",
+				type: "string",
+			},
+			mode: {
+				description:
+					"Extraction mode: readability (article text), screenshot (page image), dom (cleaned HTML), smart (AI summary)",
+				type: "string",
+				enum: MODES,
+			},
+			selector: {
+				description: "CSS selector to extract specific elements (only used in dom mode)",
+				type: "string",
+			},
+			max_length: {
+				description:
+					"Maximum output length in characters (default: 20000, not applicable to screenshot mode)",
+				type: "number",
+			},
+		},
+		required: ["url", "mode"],
+		additionalProperties: false,
+	},
+	parameters: z.object({
+		url: z.string().describe("The URL to fetch"),
+		mode: z.enum(MODES).describe("Extraction mode"),
+		selector: z.string().optional().describe("CSS selector (dom mode)"),
+		max_length: z.number().optional().describe("Max output chars"),
+	}),
+	async execute(args): Promise<ToolResult> {
+		const { url, mode, selector, max_length } = args as {
+			url: string;
+			mode: (typeof MODES)[number];
+			selector?: string;
+			max_length?: number;
+		};
+
+		// Basic URL validation
+		try {
+			const parsed = new URL(url);
+			if (!parsed.protocol.startsWith("http")) {
+				return { output: "Only http:// and https:// URLs are supported.", isError: true };
+			}
+		} catch {
+			return { output: `Invalid URL: ${url}`, isError: true };
+		}
+
+		logger.info("WebFetch executing", { url, mode, selector });
+
+		try {
+			switch (mode) {
+				case "readability": {
+					const { fetchReadability } = await import("../../web-fetch/readability");
+					const result = await fetchReadability(url, max_length);
+					const header = result.title ? `# ${result.title}\n\n` : "";
+					const excerpt = result.excerpt ? `> ${result.excerpt}\n\n` : "";
+					return {
+						output: `${header}${excerpt}${result.content}`,
+						title: result.title || url,
+					};
+				}
+				case "screenshot": {
+					const { fetchScreenshot } = await import("../../web-fetch/screenshot");
+					const result = await fetchScreenshot(url);
+					return {
+						output: `Screenshot of ${url} (${result.width}x${result.height})`,
+						images: [{ format: "png", base64: result.base64 }],
+						title: url,
+					};
+				}
+				case "dom": {
+					const { fetchDom } = await import("../../web-fetch/dom");
+					const result = await fetchDom(url, selector, max_length);
+					return {
+						output: result,
+						title: selector ? `${url} [${selector}]` : url,
+					};
+				}
+				case "smart": {
+					const { fetchSmart } = await import("../../web-fetch/smart");
+					const result = await fetchSmart(url, max_length);
+					return {
+						output: result.summary,
+						title: result.title || url,
+					};
+				}
+				default:
+					return { output: `Unknown mode: ${mode}`, isError: true };
+			}
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			logger.warn("WebFetch failed", { url, mode, error: msg });
+			return {
+				output: `WebFetch failed: ${msg}`,
+				isError: true,
+			};
+		}
+	},
+};

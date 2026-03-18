@@ -38,6 +38,7 @@ import {
 	IconTerminal2,
 	IconTrash,
 	IconWorldSearch,
+	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
 import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
@@ -139,6 +140,7 @@ const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
+const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const TODO_TOOLS = new Set(["TaskCreate"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
@@ -152,6 +154,7 @@ export type ToolCategory =
 	| "bash"
 	| "search"
 	| "webSearch"
+	| "webFetch"
 	| "todo"
 	| "taskOutput"
 	| "ask"
@@ -170,6 +173,7 @@ export function getCategory(name: string): ToolCategory {
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (SEARCH_TOOLS.has(name)) return "search";
 	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
+	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
 	if (TODO_TOOLS.has(name)) return "todo";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (ASK_TOOLS.has(name)) return "ask";
@@ -190,6 +194,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 			return IconSearch;
 		case "webSearch":
 			return IconWorldSearch;
+		case "webFetch":
+			return IconWorldWww;
 		case "todo":
 			return IconListCheck;
 		case "taskOutput":
@@ -218,6 +224,8 @@ export function getCategoryColor(cat: ToolCategory) {
 		case "search":
 			return "cyan";
 		case "webSearch":
+			return "teal";
+		case "webFetch":
 			return "teal";
 		case "todo":
 			return "teal";
@@ -406,6 +414,13 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const q = extractField(input, "query");
 			if (!q) return "Web Search";
 			return q.length > 60 ? `${q.slice(0, 57)}...` : q;
+		}
+		case "webFetch": {
+			const fetchUrl = extractField(input, "url");
+			const fetchMode = extractField(input, "mode");
+			if (!fetchUrl) return fetchMode || "WebFetch";
+			const short = fetchUrl.length > 50 ? `${fetchUrl.slice(0, 47)}...` : fetchUrl;
+			return fetchMode ? `${fetchMode}: ${short}` : short;
 		}
 		case "todo":
 			return "Update todos";
@@ -1197,6 +1212,72 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("common");
+	const fetchUrl = extractField(toolCall.inputJson, "url");
+	const mode = extractField(toolCall.inputJson, "mode");
+	const selector = extractField(toolCall.inputJson, "selector");
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const raw = resolveDisplayText(toolCall.outputJson);
+
+	// For screenshot mode, check if there are images in the output metadata
+	const isScreenshot = mode === "screenshot";
+
+	return (
+		<Box mt="xs">
+			{fetchUrl && (
+				<Text
+					size="xs"
+					component="a"
+					href={fetchUrl}
+					target="_blank"
+					rel="noopener noreferrer"
+					c="teal"
+					ff="monospace"
+					style={{ textDecoration: "none" }}
+				>
+					{fetchUrl}
+				</Text>
+			)}
+			{mode && (
+				<Badge size="xs" variant="light" color="teal" mt={4}>
+					{mode}
+				</Badge>
+			)}
+			{selector && (
+				<Text size="xs" c="dimmed" mt={2}>
+					selector: <Code style={{ fontSize: 11 }}>{selector}</Code>
+				</Text>
+			)}
+			{!isScreenshot && raw && (
+				<>
+					<Text size="xs" fw={500} mt={4} mb={2}>
+						{t("output")}
+					</Text>
+					<ContentViewer
+						content={raw}
+						style={codeStyle}
+						title={fetchUrl || "WebFetch"}
+						markdown={mode === "smart" || mode === "readability"}
+						contentType={mode === "smart" || mode === "readability" ? "markdown" : undefined}
+					/>
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
+				</>
+			)}
+			{isScreenshot && raw && (
+				<Text size="xs" c="dimmed" mt={4}>
+					{raw}
+				</Text>
+			)}
+			{toolCall.errorMessage && !toolCall.outputJson && (
+				<Text size="xs" c="red" mt={4}>
+					{toolCall.errorMessage}
+				</Text>
+			)}
+		</Box>
+	);
+}
+
 function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const action = extractField(toolCall.inputJson, "action");
 	const terminalId = extractField(toolCall.inputJson, "terminal_id");
@@ -1910,6 +1991,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <SearchDetail toolCall={toolCall} />;
 		case "webSearch":
 			return <WebSearchDetail toolCall={toolCall} />;
+		case "webFetch":
+			return <WebFetchDetail toolCall={toolCall} />;
 		case "todo":
 			return <TodoDetail toolCall={toolCall} />;
 		case "taskOutput":

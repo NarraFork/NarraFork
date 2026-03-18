@@ -217,6 +217,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Glob",
 	"Grep",
 	"WebSearch",
+	"WebFetch",
 	"TaskCreate",
 	"EnterPlanMode",
 	"ExitPlanMode",
