@@ -39,8 +39,10 @@ export interface BashAnalysis {
 	isCatastrophic: boolean;
 	/** 灾难性命令的原因描述 */
 	catastrophicReason?: string;
-	/** Chapter 模式下检测到的 git 分支违规操作（切换分支、修改其他分支等） */
+	/** Chapter 模式下检测到的 git 分支违规操作（硬拒绝，不可绕过） */
 	gitBranchViolations: string[];
+	/** Chapter 模式下检测到的 git 分支警告操作（走权限申请，用户可批准） */
+	gitBranchWarnings: string[];
 	/** 是否包含写操作（如 biome --write）— 只在 acceptEdits 模式下允许 */
 	hasWriteOperation: boolean;
 }
@@ -1336,7 +1338,18 @@ const GIT_READONLY_SUBCOMMANDS = new Set([
 	"fsck",
 	"verify-pack",
 	"hash-object",
-	"symbolic-ref",
+	// symbolic-ref 已移至条件检测（写入可切换分支）
+	// plumbing 只读命令
+	"diff-tree",
+	"diff-files",
+	"diff-index",
+	"merge-base",
+	"show-ref",
+	"verify-commit",
+	"verify-tag",
+	"var",
+	"get-tar-commit-id",
+	"whatchanged",
 ]);
 
 /**
@@ -1367,24 +1380,26 @@ const GIT_CURRENT_BRANCH_SAFE = new Set([
 	"fetch",
 	"pull",
 	"submodule",
-	"stash", // push/pop/drop 有副作用，但不影响分支
+	// stash 已移至条件检测（stash branch 会创建新分支）
 	"config", // 可写入 .git/config，但不影响分支
 	"remote", // add/remove 修改远程配置，但不影响分支
 ]);
 
 /**
- * 检测 chapter 模式下的 git 分支违规操作。
- * 返回违规描述列表（空列表 = 无违规）。
+ * 检测 chapter 模式下的 git 分支违规和警告操作。
+ * 返回 violations（硬拒绝）和 warnings（走权限申请）。
  *
- * 在 chapter 模式下，agent 只能在当前分支上工作，禁止：
- * - 切换分支（checkout <branch>, switch, worktree add）
- * - 创建/删除分支（branch <name>, branch -d/-D）
- * - 推送到其他分支（push origin <src>:<dst>）
- * - 修改其他分支的历史（rebase <other-branch>, merge, reset 到其他分支）
- * - 强制推送（push --force）
+ * 在 chapter 模式下，agent 只能在当前分支上工作：
+ * - violations（硬拒绝）：切换分支、创建/删除分支、强制推送、合并、变基到其他分支、硬重置等
+ * - warnings（权限申请）：soft/mixed reset、force-with-lease push、stash branch 等
+ * - 放行：恢复操作（merge --abort）、标签操作、只读 plumbing 命令等
  */
-function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[] {
+function detectGitBranchViolations(commands: BashAnalysis["commands"]): {
+	violations: string[];
+	warnings: string[];
+} {
 	const violations: string[] = [];
+	const warnings: string[] = [];
 
 	for (const cmd of commands) {
 		const tokens = cmd.tokens;
@@ -1401,10 +1416,17 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 
 		// ── 逐个检测可能影响分支的命令 ──
 
-		// checkout: 只允许 checkout -- <file>（恢复文件），禁止切换分支
+		// checkout: 文件恢复操作放行，分支切换拦截
 		if (sub === "checkout") {
-			// checkout -- <file> 是恢复文件，不是切换分支（虽然有风险，但不违反分支限制）
+			// checkout -- <file> 是恢复文件
 			if (tokens.includes("--")) continue;
+			// --ours/--theirs/--conflict 是冲突解决（文件级操作）
+			if (tokens.some((t) => t === "--ours" || t === "--theirs" || t.startsWith("--conflict")))
+				continue;
+			// -p/--patch 是交互式 hunk 恢复
+			if (tokens.some((t) => t === "-p" || t === "--patch")) continue;
+			// --pathspec-from-file 是从文件读取路径列表恢复
+			if (tokens.some((t) => t.startsWith("--pathspec-from-file"))) continue;
 			// checkout -b <branch> 创建新分支
 			if (tokens.some((t) => t === "-b" || t === "-B"))
 				violations.push("git checkout -b (creates new branch)");
@@ -1480,11 +1502,14 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 			continue;
 		}
 
-		// push: 禁止 --force 和推送到非当前分支的 refspec
+		// push: 区分 --force（硬拒绝）和 --force-with-lease（警告）
 		if (sub === "push") {
 			const pushFlags = tokens.slice(2);
-			if (pushFlags.some((t) => t === "--force" || t === "-f" || t === "--force-with-lease"))
-				violations.push("git push --force (may overwrite other branches)");
+			const hasForce = pushFlags.some((t) => t === "--force" || t === "-f");
+			const hasForceWithLease = pushFlags.some((t) => t === "--force-with-lease");
+			if (hasForce) violations.push("git push --force (may overwrite other branches)");
+			else if (hasForceWithLease)
+				warnings.push("git push --force-with-lease (safe force push, but rewrites remote history)");
 			if (pushFlags.some((t) => t === "--delete" || t === "-d"))
 				violations.push("git push --delete (deletes remote branch)");
 			// push --all / --mirror 推送所有分支/引用
@@ -1501,27 +1526,106 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 			continue;
 		}
 
-		// merge: 禁止（会改变当前分支状态，且涉及其他分支）
+		// merge: --abort/--continue/--quit 是恢复操作，放行；其他拦截
 		if (sub === "merge") {
+			if (tokens.some((t) => t === "--abort" || t === "--continue" || t === "--quit")) continue;
 			violations.push("git merge (merges another branch into current)");
 			continue;
 		}
 
-		// rebase: 禁止（重写历史，可能涉及其他分支）
+		// rebase: --abort/--continue/--skip/--quit/--edit-todo/--show-current-patch 是恢复操作，放行
 		if (sub === "rebase") {
+			if (
+				tokens.some(
+					(t) =>
+						t === "--abort" ||
+						t === "--continue" ||
+						t === "--skip" ||
+						t === "--quit" ||
+						t === "--edit-todo" ||
+						t === "--show-current-patch",
+				)
+			)
+				continue;
 			violations.push("git rebase (rewrites branch history)");
 			continue;
 		}
 
-		// reset: `git reset [file]` / `git reset HEAD [file]` (unstage) 是安全的，
-		// 但 `git reset --hard/--soft/--mixed` 会改变分支状态
+		// reset: 区分硬拒绝（--hard/--merge/--keep）、警告（--soft/--mixed/隐式 mixed）和放行（unstage）
 		if (sub === "reset") {
 			const resetArgs = tokens.slice(2);
-			const dangerousResetFlags = ["--hard", "--soft", "--mixed", "--merge", "--keep"];
-			if (resetArgs.some((t) => dangerousResetFlags.includes(t))) {
-				violations.push("git reset --hard/--soft/--mixed (alters branch state)");
+			const hasHard = resetArgs.includes("--hard");
+			const hasMerge = resetArgs.includes("--merge");
+			const hasKeep = resetArgs.includes("--keep");
+			const hasSoft = resetArgs.includes("--soft");
+			const hasMixed = resetArgs.includes("--mixed");
+
+			if (hasHard || hasMerge || hasKeep) {
+				violations.push("git reset --hard/--merge/--keep (destructive branch state change)");
+				continue;
 			}
-			// 纯 `git reset` (unstage all) 或 `git reset -- file` (unstage file) 是安全的
+			if (hasSoft) {
+				warnings.push("git reset --soft (moves HEAD, keeps working tree and index)");
+				continue;
+			}
+			if (hasMixed) {
+				warnings.push("git reset --mixed (moves HEAD, resets index but keeps working tree)");
+				continue;
+			}
+			// 无显式 mode flag — 检查是否有 commit-ish 参数（隐式 --mixed）
+			// `git reset` (unstage all) 和 `git reset -- file` (unstage file) 是安全的
+			// `git reset HEAD file` (unstage file) 也是安全的
+			// 但 `git reset HEAD~N` (无文件路径) 等价于 `git reset --mixed HEAD~N`
+			if (resetArgs.includes("--")) continue; // -- 后面是文件路径，是 unstage
+			if (resetArgs.includes("-p") || resetArgs.includes("--patch")) continue; // 交互式 unstage
+			const nonFlagArgs = resetArgs.filter((t) => !t.startsWith("-"));
+			if (nonFlagArgs.length === 0) continue; // 纯 `git reset`，unstage all
+			// 有非 flag 参数 — 判断是 commit-ish 还是文件路径
+			// 启发式：如果参数看起来像 commit-ish（HEAD~N、hash、分支名等），视为隐式 --mixed
+			// 如果有多个非 flag 参数，第一个可能是 tree-ish，后面是文件路径（unstage）
+			if (nonFlagArgs.length >= 2) continue; // `git reset HEAD file.txt` — unstage
+			// 单个非 flag 参数 — 可能是 commit-ish 或文件路径
+			// 保守处理：如果看起来像 commit ref（HEAD、HEAD~N、hash 等），产生 warning
+			const arg = nonFlagArgs[0];
+			if (looksLikeCommitRef(arg)) {
+				warnings.push("git reset <commit> (implicit --mixed, moves HEAD and resets index)");
+			}
+			// 否则可能是文件路径（unstage），放行
+			continue;
+		}
+
+		// stash: stash branch 创建新分支（warning），其他子命令放行
+		if (sub === "stash") {
+			const stashSub = tokens[2];
+			if (stashSub === "branch") warnings.push("git stash branch (creates new branch from stash)");
+			// push/pop/drop/apply/list/show/clear/create/store/save 和无子命令 — 放行
+			continue;
+		}
+
+		// symbolic-ref: 读取放行，写入/删除拦截
+		if (sub === "symbolic-ref") {
+			if (tokens.some((t) => t === "-d" || t === "--delete")) {
+				violations.push("git symbolic-ref --delete (deletes symbolic ref)");
+				continue;
+			}
+			// 过滤掉 flag 参数，提取非 flag 参数（排除 -m 的值参数）
+			const symFlags = new Set(["-q", "--quiet", "--short", "--recurse", "--no-recurse"]);
+			const cleanArgs: string[] = [];
+			for (let i = 0; i < tokens.slice(2).length; i++) {
+				const t = tokens[i + 2];
+				if (t === "-m") {
+					i++; // skip next (reason message)
+					continue;
+				}
+				if (symFlags.has(t)) continue;
+				if (t.startsWith("-")) continue; // unknown flag, skip
+				cleanArgs.push(t);
+			}
+			// 一个参数 = 读取（如 `symbolic-ref HEAD`），两个参数 = 写入
+			if (cleanArgs.length >= 2) {
+				violations.push("git symbolic-ref <name> <ref> (changes branch pointer)");
+			}
+			// 读取模式 — 放行
 			continue;
 		}
 
@@ -1543,22 +1647,8 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 			continue;
 		}
 
-		// tag: 纯 `git tag` / `git tag -l` 列出标签是只读的，
-		// `git tag <name>` 创建标签 / `git tag -d` 删除标签需要拦截
-		if (sub === "tag") {
-			const tagFlags = tokens.slice(2);
-			// -l/--list 后面的参数是 pattern，不是 tag 名
-			const isListMode = tagFlags.some((t) => t === "-l" || t === "--list");
-			if (isListMode) continue;
-			// -n<num> / --contains / --sort 等也是只读查询
-			const tagArgs = tagFlags.filter((t) => !t.startsWith("-"));
-			if (
-				tagArgs.length > 0 ||
-				tagFlags.some((t) => t === "-d" || t === "--delete" || t === "-a" || t === "-s")
-			)
-				violations.push("git tag (creates/deletes tags)");
-			continue;
-		}
+		// tag: 标签操作不影响分支结构，全部放行
+		if (sub === "tag") continue;
 
 		// gc: 允许（维护操作，不影响分支）
 		if (sub === "gc") continue;
@@ -1567,7 +1657,22 @@ function detectGitBranchViolations(commands: BashAnalysis["commands"]): string[]
 		violations.push(`git ${sub} (unknown git subcommand in chapter mode)`);
 	}
 
-	return violations;
+	return { violations, warnings };
+}
+
+/**
+ * 启发式判断一个字符串是否看起来像 git commit 引用。
+ * 用于区分 `git reset <commit>` 和 `git reset <file>`。
+ */
+function looksLikeCommitRef(arg: string): boolean {
+	// HEAD, HEAD~N, HEAD^N, HEAD~N^M, @{N}, ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD
+	if (/^(HEAD|ORIG_HEAD|MERGE_HEAD|CHERRY_PICK_HEAD|FETCH_HEAD|@)([~^@{}\d]|$)/i.test(arg))
+		return true;
+	// 完整或缩写的 hex SHA（7-40 字符）
+	if (/^[0-9a-f]{7,40}$/i.test(arg)) return true;
+	// tag-like: v1.0, v1.0.0
+	if (/^v\d+\.\d+/i.test(arg)) return true;
+	return false;
 }
 
 /**
@@ -1830,7 +1935,9 @@ export async function analyzeBashCommand(
 	const catastrophicReason = detectCatastrophic(commands, command);
 
 	// Chapter 模式下的 git 分支违规检测
-	const gitBranchViolations = isChapter ? detectGitBranchViolations(commands) : [];
+	const gitBranchResult = isChapter
+		? detectGitBranchViolations(commands)
+		: { violations: [], warnings: [] };
 
 	return {
 		commands,
@@ -1842,12 +1949,11 @@ export async function analyzeBashCommand(
 		hasEnvInjection,
 		isCatastrophic: catastrophicReason !== null,
 		catastrophicReason: catastrophicReason ?? undefined,
-		gitBranchViolations,
+		gitBranchViolations: gitBranchResult.violations,
+		gitBranchWarnings: gitBranchResult.warnings,
 		hasWriteOperation,
 	};
 }
-
-// ── 导出供测试使用 ───────────────────────────────────────
 
 export {
 	SAFE_COMMANDS,
@@ -2215,7 +2321,9 @@ export function analyzePowerShellCommand(
 	}
 
 	// Chapter 模式下的 git 分支违规检测
-	const gitBranchViolations = isChapter ? detectGitBranchViolations(commands) : [];
+	const gitBranchResult = isChapter
+		? detectGitBranchViolations(commands)
+		: { violations: [], warnings: [] };
 
 	return {
 		commands,
@@ -2227,7 +2335,8 @@ export function analyzePowerShellCommand(
 		hasEnvInjection,
 		isCatastrophic: catastrophicReason !== undefined,
 		catastrophicReason,
-		gitBranchViolations,
+		gitBranchViolations: gitBranchResult.violations,
+		gitBranchWarnings: gitBranchResult.warnings,
 		hasWriteOperation,
 	};
 }

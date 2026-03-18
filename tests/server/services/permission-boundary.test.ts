@@ -20,6 +20,7 @@ function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		gitBranchWarnings: [],
 		hasWriteOperation: false,
 		...partial,
 	};

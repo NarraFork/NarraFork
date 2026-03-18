@@ -24,6 +24,7 @@ import {
 	DOT_FINAL_SIZE,
 	getMorphFactor,
 	getMorphStyle,
+	getPanelFadeOpacity,
 	MORPH_T_DOT,
 	type ZoomTierId,
 } from "../zoom-tiers";
@@ -783,9 +784,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// --- Panel morph schedule ---
 			// When a panel is open (or animating), blend draw size from card/dot
 			// dimensions toward panel dimensions using panelBlend.
-			//   panelBlend > 0 && t > DOT → panel visible (blending), PixiJS skipped
-			//   panelBlend === 0 || t ≤ DOT → panel gone, PixiJS draws normally
-			const panelVisible = effectivePanel && t > MORPH_T_DOT;
+			// panelFade is a continuous [0,1] value that smoothly transitions
+			// the panel visibility as t approaches MORPH_T_DOT, preventing the
+			// abrupt disappearance that occurred with the old binary threshold.
+			const panelFade = effectivePanel ? getPanelFadeOpacity(t) : 0;
+			const panelVisible = panelFade > 0;
 
 			// For chapters with panel blend > 0, compute two sets of dimensions:
 			// 1) hitW/hitH — for DOM panel positioning (uses target panel size immediately)
@@ -796,7 +799,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			let hitH = morph.height;
 			if (panelVisible && ch.panelWidth && ch.panelHeight) {
 				// Map t from [DOT..1] → zoomBlend [0..1] (0 = dot size, 1 = panel size)
-				const zoomBlend = (t - MORPH_T_DOT) / (1 - MORPH_T_DOT);
+				const zoomBlend = Math.max(0, (t - MORPH_T_DOT) / (1 - MORPH_T_DOT));
 				const dotMorph = getMorphStyle(MORPH_T_DOT, chapterWidth, NODE_HEIGHT);
 				// Target dimensions at full panel open
 				const targetW = dotMorph.width + zoomBlend * (ch.panelWidth - dotMorph.width);
@@ -862,14 +865,18 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				});
 			}
 
-			// Skip PixiJS draw while the panel is fully visible (blend ≈ 1 and t > DOT).
-			// During close animation (blend < 1), draw PixiJS with fading opacity.
-			// Once blend reaches 0 or t ≤ DOT, PixiJS draws normally.
-			const skipDraw = panelVisible && panelBlend >= 1;
+			// Skip PixiJS draw only when the panel is fully visible (blend ≈ 1 AND fade = 1).
+			// During the fade transition zone, both panel and PixiJS node are drawn
+			// with complementary opacities for a smooth cross-fade.
+			const skipDraw = panelVisible && panelBlend >= 1 && panelFade >= 1;
 
 			if (!skipDraw) {
-				// During panel close animation, fade PixiJS node in as panel fades out
-				const animOpacity = panelVisible ? 1 - panelBlend : 1;
+				// Cross-fade: PixiJS node fades in as panel fades out.
+				// panelBlend * panelFade gives the effective panel coverage:
+				//   panelFade=1, panelBlend=1 → panel fully covers, PixiJS hidden
+				//   panelFade=0.5             → panel half-faded, PixiJS half-visible
+				//   panelFade=0               → panel gone, PixiJS fully visible
+				const animOpacity = panelVisible ? 1 - panelBlend * panelFade : 1;
 				const screenMorph = {
 					...morph,
 					width: screenW,

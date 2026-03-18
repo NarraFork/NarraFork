@@ -619,6 +619,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		gitBranchWarnings: [],
 		hasWriteOperation: false,
 	};
 
@@ -631,6 +632,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		gitBranchWarnings: [],
 		hasWriteOperation: false,
 	};
 
@@ -645,6 +647,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		gitBranchWarnings: [],
 		hasWriteOperation: false,
 	};
 
@@ -663,6 +666,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: false,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		gitBranchWarnings: [],
 		hasWriteOperation: false,
 	};
 
@@ -675,6 +679,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		hasEnvInjection: true,
 		isCatastrophic: false,
 		gitBranchViolations: [],
+		gitBranchWarnings: [],
 		hasWriteOperation: false,
 	};
 
@@ -1036,12 +1041,23 @@ describe("Chapter mode - git branch restrictions", () => {
 			"git branch --contains HEAD",
 			"git branch --merged",
 			"git tag",
+			// plumbing 只读命令
+			"git diff-tree HEAD~1 HEAD",
+			"git diff-files",
+			"git diff-index HEAD",
+			"git merge-base main HEAD",
+			"git show-ref",
+			"git verify-commit HEAD",
+			"git verify-tag v1.0",
+			"git var GIT_AUTHOR_IDENT",
+			"git whatchanged -1",
 		];
 
 		for (const cmd of readonlyCmds) {
-			test(`${cmd} → no violations`, async () => {
+			test(`${cmd} → no violations, no warnings`, async () => {
 				const r = await chapterAnalyze(cmd);
 				expect(r.gitBranchViolations).toEqual([]);
+				expect(r.gitBranchWarnings).toEqual([]);
 			});
 		}
 	});
@@ -1062,8 +1078,13 @@ describe("Chapter mode - git branch restrictions", () => {
 			"git fetch origin",
 			"git pull origin main",
 			"git stash",
+			"git stash push -m 'wip'",
 			"git stash pop",
 			"git stash drop",
+			"git stash apply",
+			"git stash list",
+			"git stash show",
+			"git stash clear",
 			"git grep 'TODO'",
 			"git archive --format=tar HEAD",
 			"git format-patch HEAD~3",
@@ -1075,12 +1096,40 @@ describe("Chapter mode - git branch restrictions", () => {
 			"git submodule update --init",
 			"git bisect start",
 			"git notes add -m 'note'",
+			// tag 操作（不影响分支结构）
+			"git tag v1.0.0",
+			"git tag -a v1.0.0 -m 'release'",
+			"git tag -d v1.0.0",
+			"git tag -l",
+			"git tag -l 'v1.*'",
+			"git tag --list",
+			// symbolic-ref 读取
+			"git symbolic-ref HEAD",
+			"git symbolic-ref --short HEAD",
+			// merge/rebase 恢复操作
+			"git merge --abort",
+			"git merge --continue",
+			"git merge --quit",
+			"git rebase --abort",
+			"git rebase --continue",
+			"git rebase --skip",
+			"git rebase --quit",
+			"git rebase --edit-todo",
+			"git rebase --show-current-patch",
+			// checkout 文件恢复
+			"git checkout -- src/index.ts",
+			"git checkout --ours -- file.txt",
+			"git checkout --theirs file.txt",
+			"git checkout -p",
+			"git checkout --patch",
+			"git checkout --pathspec-from-file=files.txt",
 		];
 
 		for (const cmd of safeCmds) {
-			test(`${cmd} → no violations`, async () => {
+			test(`${cmd} → no violations, no warnings`, async () => {
 				const r = await chapterAnalyze(cmd);
 				expect(r.gitBranchViolations).toEqual([]);
+				expect(r.gitBranchWarnings).toEqual([]);
 			});
 		}
 	});
@@ -1186,9 +1235,11 @@ describe("Chapter mode - git branch restrictions", () => {
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 		});
 
-		test("git push --force-with-lease", async () => {
+		test("git push --force-with-lease → warning (not violation)", async () => {
 			const r = await chapterAnalyze("git push --force-with-lease");
-			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings.length).toBeGreaterThan(0);
+			expect(r.gitBranchWarnings[0]).toContain("force-with-lease");
 		});
 
 		test("git push --mirror", async () => {
@@ -1242,59 +1293,101 @@ describe("Chapter mode - git branch restrictions", () => {
 
 	// ── Merge/Rebase/Reset：chapter 模式下应拦截 ──
 
-	describe("merge/rebase/reset (denied in chapter mode)", () => {
-		test("git merge develop", async () => {
+	describe("merge/rebase/reset (denied or warned in chapter mode)", () => {
+		test("git merge develop → violation", async () => {
 			const r = await chapterAnalyze("git merge develop");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 			expect(r.gitBranchViolations[0]).toContain("merge");
 		});
 
-		test("git merge --no-ff feature", async () => {
+		test("git merge --no-ff feature → violation", async () => {
 			const r = await chapterAnalyze("git merge --no-ff feature");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 		});
 
-		test("git rebase main", async () => {
+		test("git rebase main → violation", async () => {
 			const r = await chapterAnalyze("git rebase main");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 			expect(r.gitBranchViolations[0]).toContain("rebase");
 		});
 
-		test("git rebase -i HEAD~3", async () => {
+		test("git rebase -i HEAD~3 → violation", async () => {
 			const r = await chapterAnalyze("git rebase -i HEAD~3");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 		});
 
-		test("git reset --hard HEAD~1", async () => {
+		test("git reset --hard HEAD~1 → violation", async () => {
 			const r = await chapterAnalyze("git reset --hard HEAD~1");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 			expect(r.gitBranchViolations[0]).toContain("reset");
 		});
 
-		test("git reset --soft HEAD~1", async () => {
-			const r = await chapterAnalyze("git reset --soft HEAD~1");
+		test("git reset --merge HEAD~1 → violation", async () => {
+			const r = await chapterAnalyze("git reset --merge HEAD~1");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 		});
 
-		test("git reset --mixed HEAD~1", async () => {
-			const r = await chapterAnalyze("git reset --mixed HEAD~1");
+		test("git reset --keep HEAD~1 → violation", async () => {
+			const r = await chapterAnalyze("git reset --keep HEAD~1");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		});
+
+		test("git reset --soft HEAD~1 → warning (not violation)", async () => {
+			const r = await chapterAnalyze("git reset --soft HEAD~1");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings.length).toBeGreaterThan(0);
+			expect(r.gitBranchWarnings[0]).toContain("--soft");
+		});
+
+		test("git reset --mixed HEAD~1 → warning (not violation)", async () => {
+			const r = await chapterAnalyze("git reset --mixed HEAD~1");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings.length).toBeGreaterThan(0);
+			expect(r.gitBranchWarnings[0]).toContain("--mixed");
+		});
+
+		test("git reset HEAD~3 (implicit --mixed) → warning", async () => {
+			const r = await chapterAnalyze("git reset HEAD~3");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings.length).toBeGreaterThan(0);
+			expect(r.gitBranchWarnings[0]).toContain("implicit --mixed");
+		});
+
+		test("git reset abc1234567 (commit hash, implicit --mixed) → warning", async () => {
+			const r = await chapterAnalyze("git reset abc1234567");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings.length).toBeGreaterThan(0);
 		});
 
 		// unstage 操作应该放行
 		test("git reset HEAD file.txt → allowed (unstage)", async () => {
 			const r = await chapterAnalyze("git reset HEAD file.txt");
 			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
 		});
 
 		test("git reset → allowed (unstage all)", async () => {
 			const r = await chapterAnalyze("git reset");
 			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
 		});
 
 		test("git reset -- file.txt → allowed (unstage file)", async () => {
 			const r = await chapterAnalyze("git reset -- file.txt");
 			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
+		});
+
+		test("git reset -p → allowed (interactive unstage)", async () => {
+			const r = await chapterAnalyze("git reset -p");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
+		});
+
+		test("git reset src/file.txt (non-commit-ref) → allowed (unstage)", async () => {
+			const r = await chapterAnalyze("git reset src/file.txt");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
 		});
 	});
 
@@ -1328,50 +1421,53 @@ describe("Chapter mode - git branch restrictions", () => {
 		});
 	});
 
-	// ── Tag 创建/删除：chapter 模式下应拦截 ──
+	// ── stash branch：chapter 模式下应警告 ──
 
-	describe("tag create/delete (denied in chapter mode)", () => {
-		test("git tag v1.0.0", async () => {
-			const r = await chapterAnalyze("git tag v1.0.0");
+	describe("stash branch (warned in chapter mode)", () => {
+		test("git stash branch new-branch → warning", async () => {
+			const r = await chapterAnalyze("git stash branch new-branch");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings.length).toBeGreaterThan(0);
+			expect(r.gitBranchWarnings[0]).toContain("stash branch");
+		});
+	});
+
+	// ── symbolic-ref 写入：chapter 模式下应拦截 ──
+
+	describe("symbolic-ref write (denied in chapter mode)", () => {
+		test("git symbolic-ref HEAD refs/heads/other → violation", async () => {
+			const r = await chapterAnalyze("git symbolic-ref HEAD refs/heads/other");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
-			expect(r.gitBranchViolations[0]).toContain("tag");
+			expect(r.gitBranchViolations[0]).toContain("symbolic-ref");
 		});
 
-		test("git tag -a v1.0.0 -m 'release'", async () => {
-			const r = await chapterAnalyze("git tag -a v1.0.0 -m 'release'");
+		test("git symbolic-ref --delete HEAD → violation", async () => {
+			const r = await chapterAnalyze("git symbolic-ref --delete HEAD");
+			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+			expect(r.gitBranchViolations[0]).toContain("symbolic-ref");
+		});
+
+		test("git symbolic-ref -d HEAD → violation", async () => {
+			const r = await chapterAnalyze("git symbolic-ref -d HEAD");
 			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
 		});
 
-		test("git tag -d v1.0.0", async () => {
-			const r = await chapterAnalyze("git tag -d v1.0.0");
-			expect(r.gitBranchViolations.length).toBeGreaterThan(0);
+		test("git symbolic-ref HEAD → allowed (read)", async () => {
+			const r = await chapterAnalyze("git symbolic-ref HEAD");
+			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
 		});
 
-		// 纯 git tag（列出标签）应放行
-		test("git tag → allowed (list tags)", async () => {
-			const r = await chapterAnalyze("git tag");
+		test("git symbolic-ref --short HEAD → allowed (read)", async () => {
+			const r = await chapterAnalyze("git symbolic-ref --short HEAD");
 			expect(r.gitBranchViolations).toEqual([]);
-		});
-
-		test("git tag -l → allowed (list tags)", async () => {
-			const r = await chapterAnalyze("git tag -l");
-			expect(r.gitBranchViolations).toEqual([]);
-		});
-
-		test("git tag -l 'v1.*' → allowed (list matching tags)", async () => {
-			const r = await chapterAnalyze("git tag -l 'v1.*'");
-			expect(r.gitBranchViolations).toEqual([]);
-		});
-
-		test("git tag --list → allowed", async () => {
-			const r = await chapterAnalyze("git tag --list");
-			expect(r.gitBranchViolations).toEqual([]);
+			expect(r.gitBranchWarnings).toEqual([]);
 		});
 	});
 
 	// ── 非 chapter 模式下不应有分支违规 ──
 
-	describe("non-chapter mode (no violations)", () => {
+	describe("non-chapter mode (no violations, no warnings)", () => {
 		const cmds = [
 			"git checkout main",
 			"git switch develop",
@@ -1387,6 +1483,7 @@ describe("Chapter mode - git branch restrictions", () => {
 			test(`${cmd} → no violations in normal mode`, async () => {
 				const r = await normalAnalyze(cmd);
 				expect(r.gitBranchViolations).toEqual([]);
+				expect(r.gitBranchWarnings).toEqual([]);
 			});
 		}
 	});
@@ -1457,6 +1554,59 @@ describe("Chapter mode - git branch restrictions", () => {
 				isChapter: true,
 			});
 			expect(decision).toBe("deny");
+		});
+
+		test("chapter mode + git push --force-with-lease → ask (warning)", async () => {
+			const analysis = await chapterAnalyze("git push --force-with-lease");
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git push --force-with-lease" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
+			expect(decision).toBe("ask");
+		});
+
+		test("chapter mode + git reset --soft → ask (warning)", async () => {
+			const analysis = await chapterAnalyze("git reset --soft HEAD~1");
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git reset --soft HEAD~1" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
+			expect(decision).toBe("ask");
+		});
+
+		test("chapter mode + git stash branch → ask (warning)", async () => {
+			const analysis = await chapterAnalyze("git stash branch new-branch");
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git stash branch new-branch" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
+			expect(decision).toBe("ask");
+		});
+
+		test("chapter mode + git merge --abort → ask (not deny)", async () => {
+			const analysis = await chapterAnalyze("git merge --abort");
+			const decision = resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git merge --abort" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: analysis,
+				isChapter: true,
+			});
+			// merge --abort is allowed (no violation), so it goes through normal permission flow
+			expect(decision).not.toBe("deny");
 		});
 
 		test("non-chapter mode + git checkout → ask (default mode asks for bash)", async () => {

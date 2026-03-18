@@ -572,6 +572,8 @@ export interface PermissionDecisionOpts {
 	previousPermissionMode?: string;
 	/** Mutable object to collect metadata about the decision (e.g. blacklist source). */
 	meta?: PermissionDecisionMeta;
+	/** Project git repository root path — used for structural path protection. */
+	projectGitPath?: string;
 }
 
 // ── Command pattern matching ──────────────────────────────
@@ -648,6 +650,117 @@ function isCommandWhitelistCovered(
 	});
 }
 
+// ── Protected path checks (hard-deny, no bypass) ─────────
+
+/** Write-operation tools that target a single file_path. */
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "MultiEdit"]);
+
+/** Destructive shell commands that delete files/directories. */
+const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
+
+/** Check if an absolute path points inside a `.git` directory (or is `.git` itself). */
+function isGitInternalPath(absPath: string): boolean {
+	const normalized = resolvePath(absPath);
+	// Matches: /foo/.git, /foo/.git/config, /foo/.git/objects/...
+	const segments = normalized.split("/");
+	return segments.includes(".git");
+}
+
+/**
+ * Check if an absolute path is a "structural" path that must not be destroyed:
+ * - The project directory itself (gitPath)
+ * - Any ancestor of the project directory
+ * - The `.worktrees` directory itself
+ *
+ * Returns a human-readable reason string, or null if not structural.
+ */
+function isStructuralPath(absPath: string, projectGitPath: string): string | null {
+	const normalizedTarget = resolvePath(absPath);
+	const normalizedProject = resolvePath(projectGitPath);
+
+	// Project directory itself
+	if (pathsEqual(normalizedTarget, normalizedProject)) {
+		return `project root directory: ${normalizedProject}`;
+	}
+	// Ancestor of project directory (projectGitPath is inside absPath)
+	if (
+		isInsidePath(normalizedTarget, normalizedProject) &&
+		!pathsEqual(normalizedTarget, normalizedProject)
+	) {
+		return `ancestor of project root: ${normalizedTarget}`;
+	}
+	// .worktrees directory itself
+	if (pathsEqual(normalizedTarget, `${normalizedProject}/.worktrees`)) {
+		return `worktrees directory: ${normalizedTarget}`;
+	}
+	return null;
+}
+
+/**
+ * Hard-deny check for protected paths. Runs before any permission mode logic.
+ *
+ * Two protection levels:
+ * 1. `.git` — full write protection (Write/Edit deny; Bash with write ops deny)
+ * 2. Structural paths (project dir, ancestors, .worktrees) — destructive-only protection
+ *    (only rm/rmdir/shred targeting these paths are denied)
+ *
+ * Returns a deny-reason string, or null if no protection triggered.
+ */
+function resolveProtectedPathDeny(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	projectGitPath: string | undefined,
+	bashAnalysis?: BashAnalysis,
+): string | null {
+	// ── Write/Edit tools: only .git protection ──
+	if (WRITE_TOOLS.has(toolName)) {
+		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		if (!filePath) return null;
+		const absPath = resolvePath(cwd, filePath);
+		if (isGitInternalPath(absPath)) {
+			return `Write to .git directory is forbidden: ${absPath}`;
+		}
+		// Structural paths are NOT blocked for Write/Edit (they're not destructive)
+		return null;
+	}
+
+	// ── Bash/Shell tool ──
+	if (toolName === SHELL_TOOL_NAME && bashAnalysis) {
+		// 1. .git full write protection: any write operation touching .git paths
+		if (bashAnalysis.hasWriteOperation) {
+			for (const p of bashAnalysis.filePaths) {
+				if (isGitInternalPath(p)) {
+					return `Shell write operation targeting .git directory is forbidden: ${p}`;
+				}
+			}
+		}
+
+		// 2. Structural path protection: only destructive commands
+		if (projectGitPath) {
+			for (const cmd of bashAnalysis.commands) {
+				const cmdName = cmd.tokens[0];
+				if (!DESTRUCTIVE_COMMANDS.has(cmdName)) continue;
+				// Extract non-flag arguments as potential path targets
+				for (const arg of cmd.tokens.slice(1)) {
+					if (arg.startsWith("-")) continue;
+					const absArg = resolvePath(cwd, arg);
+					// .git protection for destructive commands too
+					if (isGitInternalPath(absArg)) {
+						return `Destructive operation on .git directory is forbidden: ${cmdName} ${absArg}`;
+					}
+					const structural = isStructuralPath(absArg, projectGitPath);
+					if (structural) {
+						return `Destructive operation on ${structural} is forbidden: ${cmdName} ${absArg}`;
+					}
+				}
+			}
+		}
+	}
+
+	return null;
+}
+
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -666,6 +779,7 @@ export function resolvePermissionDecision(
 		relaxedPlan = false,
 		previousPermissionMode,
 		meta,
+		projectGitPath,
 	} = opts;
 	// Catastrophic commands are ALWAYS blocked — no override possible
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
@@ -673,6 +787,24 @@ export function resolvePermissionDecision(
 	// Chapter mode: git branch violations are hard-denied (no bypass)
 	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchViolations?.length)
 		return "deny";
+
+	// Chapter mode: git branch warnings require user approval (ask)
+	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchWarnings?.length)
+		return "ask";
+
+	// Protected path check — hard-deny, no bypass possible.
+	// .git: all write operations denied. Structural paths: destructive ops only.
+	const protectedPathReason = resolveProtectedPathDeny(
+		toolName,
+		input,
+		cwd,
+		projectGitPath,
+		bashAnalysis,
+	);
+	if (protectedPathReason) {
+		if (meta) meta.blacklistReason = protectedPathReason;
+		return "deny";
+	}
 
 	// Plan mode: Write/Edit to the designated plan file is always allowed.
 	if (permMode === "plan" && (toolName === "Write" || toolName === "Edit")) {
@@ -950,6 +1082,7 @@ export async function handlePermission(
 	let projectBl: BlacklistDir[] = [];
 	let projectCmdWl: CommandWhitelistEntry[] = [];
 	let projectCmdBl: CommandBlacklistEntry[] = [];
+	let resolvedProjectGitPath: string | undefined;
 	if (narrator?.chapterId) {
 		const chapter = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
@@ -958,8 +1091,9 @@ export async function handlePermission(
 		if (chapter?.projectId) {
 			const project = await db.query.projects.findFirst({
 				where: eq(projects.id, chapter.projectId),
-				columns: { chapterSettings: true },
+				columns: { chapterSettings: true, gitPath: true },
 			});
+			if (project?.gitPath) resolvedProjectGitPath = project.gitPath;
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 			const cs = project?.chapterSettings as any;
 			if (cs?.whitelistDirs) {
@@ -1090,6 +1224,7 @@ export async function handlePermission(
 		relaxedPlan: isRelaxedPlan,
 		previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
 		meta: permMeta,
+		projectGitPath: resolvedProjectGitPath,
 	});
 	logger.debug("Permission decision", {
 		narratorId,
@@ -1296,6 +1431,11 @@ export async function handlePermission(
 			parts.push("Environment variable injection detected");
 		}
 		decisionReason = parts.join("; ");
+	}
+	// Chapter mode git branch warnings — include in decisionReason for ask flow
+	if (isChapter && bashAnalysis?.gitBranchWarnings?.length) {
+		const warningMsg = `Chapter branch warnings: ${bashAnalysis.gitBranchWarnings.join("; ")}`;
+		decisionReason = decisionReason ? `${decisionReason}; ${warningMsg}` : warningMsg;
 	}
 
 	// Build decisionReason for Agent with custom workdir

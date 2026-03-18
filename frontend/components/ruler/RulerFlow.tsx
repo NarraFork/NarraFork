@@ -30,7 +30,13 @@ import {
 	type RulerEdge,
 	type RulerOrientation,
 } from "./types";
-import { getZoomTierInfo, MORPH_T_DOT, SCALE_MAX, SCALE_MIN, type ZoomTierId } from "./zoom-tiers";
+import {
+	getPanelFadeOpacity,
+	getZoomTierInfo,
+	SCALE_MAX,
+	SCALE_MIN,
+	type ZoomTierId,
+} from "./zoom-tiers";
 
 interface RulerFlowProps {
 	projectId: string;
@@ -283,13 +289,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						const panelScale = hr.width / panelCSSW;
 						div.style.transform = `scale(${panelScale})`;
 					}
-					// Panel visible at full opacity while t > DOT; hidden once t ≤ DOT.
-					// Also respect the enter/exit animation opacity from React state.
-					const zoomVisible = hr.morphT > MORPH_T_DOT;
+					// Smooth cross-fade: panel opacity transitions continuously as
+					// morphT approaches MORPH_T_DOT, instead of a binary cutoff.
+					const panelFadeOp = getPanelFadeOpacity(hr.morphT);
 					const animOp = Number(div.dataset.animOpacity);
-					const finalOpacity = zoomVisible ? (Number.isFinite(animOp) ? animOp : 1) : 0;
+					const finalOpacity = panelFadeOp * (Number.isFinite(animOp) ? animOp : 1);
 					div.style.opacity = String(finalOpacity);
-					div.style.pointerEvents = zoomVisible && finalOpacity > 0 ? "auto" : "none";
+					div.style.pointerEvents = finalOpacity > 0 ? "auto" : "none";
 				}
 			}
 		}

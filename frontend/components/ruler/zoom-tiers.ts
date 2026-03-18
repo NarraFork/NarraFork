@@ -120,6 +120,25 @@ export function getMorphFactor(effectiveScale: number): number {
 /** Morph factor threshold: dot phase ends at t=0.3. */
 export const MORPH_T_DOT = 0.3;
 
+/**
+ * Smooth fade margin above MORPH_T_DOT for panel → dot/pill cross-fade.
+ * Panel starts fading out at MORPH_T_DOT + PANEL_FADE_MARGIN and is fully
+ * hidden at MORPH_T_DOT. PixiJS node fades in symmetrically.
+ */
+const PANEL_FADE_MARGIN = 0.15;
+
+/**
+ * Returns a continuous opacity [0, 1] for the narrator panel based on morphT.
+ *   morphT >= MORPH_T_DOT + PANEL_FADE_MARGIN → 1 (fully visible)
+ *   morphT <= MORPH_T_DOT                     → 0 (fully hidden)
+ *   in between                                → linear interpolation
+ */
+export function getPanelFadeOpacity(morphT: number): number {
+	if (morphT >= MORPH_T_DOT + PANEL_FADE_MARGIN) return 1;
+	if (morphT <= MORPH_T_DOT) return 0;
+	return (morphT - MORPH_T_DOT) / PANEL_FADE_MARGIN;
+}
+
 /** Interpolated visual properties for a chapter element at morph factor `t`. */
 export interface MorphStyle {
 	width: number;

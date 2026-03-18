@@ -838,12 +838,14 @@ export function NarratorPanel({
 	// --- Command popover ---
 	const { data: commandsList } = useNarratorCommands(narratorId);
 	// Show command popover only when typing command name (no space yet),
-	// or when typing "/load <tool>" sub-completion
+	// or when typing "/load <tool>" sub-completion.
+	// Suppress when browsing input history so arrow keys keep navigating history.
 	const commandPopoverVisible =
 		input.startsWith("/") &&
 		!input.includes("\n") &&
 		(!input.includes(" ") || /^\/load\s\S*$/i.test(input)) &&
-		(commandsList?.length ?? 0) > 0;
+		(commandsList?.length ?? 0) > 0 &&
+		!inputHistory.isBrowsing;
 	// Matched command for param helper (after space is typed)
 	const matchedCommand = useMemo(() => {
 		if (!input.startsWith("/") || !commandsList?.length) return null;
@@ -2444,10 +2446,9 @@ export function NarratorPanel({
 										) : (
 											<Box w={16} h={16} style={{ flexShrink: 0 }} />
 										)}
-										<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-											{index === 0 ? `${t("bufferedMessage")}: ` : ""}
-											{msg.text}
-										</Text>
+									<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
+										{msg.text}
+									</Text>
 										{msg.imageCount > 0 && (
 											<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
 												<IconPhoto size={14} color="var(--mantine-color-blue-5)" />

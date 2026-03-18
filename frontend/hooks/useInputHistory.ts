@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 
 const MAX_HISTORY = 50;
 
@@ -10,6 +10,21 @@ const MAX_HISTORY = 50;
 export function useInputHistory(storageKey: string) {
 	const indexRef = useRef(-1);
 	const draftRef = useRef("");
+	// Track browsing version so useSyncExternalStore can react to index changes
+	const versionRef = useRef(0);
+	const subscribersRef = useRef(new Set<() => void>());
+	const subscribe = useCallback((cb: () => void) => {
+		subscribersRef.current.add(cb);
+		return () => {
+			subscribersRef.current.delete(cb);
+		};
+	}, []);
+	const getSnapshot = useCallback(() => versionRef.current, []);
+	useSyncExternalStore(subscribe, getSnapshot);
+	const notify = useCallback(() => {
+		versionRef.current++;
+		for (const cb of subscribersRef.current) cb();
+	}, []);
 
 	const getHistory = useCallback((): string[] => {
 		try {
@@ -36,13 +51,15 @@ export function useInputHistory(storageKey: string) {
 			// 去重：如果最近一条相同则不重复添加
 			if (history[0] === trimmed) {
 				indexRef.current = -1;
+				notify();
 				return;
 			}
 			const next = [trimmed, ...history].slice(0, MAX_HISTORY);
 			setHistory(next);
 			indexRef.current = -1;
+			notify();
 		},
-		[getHistory, setHistory],
+		[getHistory, setHistory, notify],
 	);
 
 	/**
@@ -63,6 +80,7 @@ export function useInputHistory(storageKey: string) {
 				const nextIndex = Math.min(indexRef.current + 1, history.length - 1);
 				if (nextIndex === indexRef.current && indexRef.current !== -1) return null;
 				indexRef.current = nextIndex;
+				notify();
 				return history[nextIndex];
 			}
 
@@ -70,19 +88,24 @@ export function useInputHistory(storageKey: string) {
 			if (indexRef.current <= -1) return null;
 			const nextIndex = indexRef.current - 1;
 			indexRef.current = nextIndex;
+			notify();
 			if (nextIndex === -1) {
 				// 回到草稿
 				return draftRef.current;
 			}
 			return history[nextIndex];
 		},
-		[getHistory],
+		[getHistory, notify],
 	);
 
 	/** 重置浏览位置（用户手动编辑输入框时调用） */
 	const reset = useCallback(() => {
 		indexRef.current = -1;
-	}, []);
+		notify();
+	}, [notify]);
 
-	return { push, navigate, reset };
+	/** 是否正在浏览历史（index !== -1） */
+	const isBrowsing = indexRef.current !== -1;
+
+	return { push, navigate, reset, isBrowsing };
 }
