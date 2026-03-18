@@ -1392,20 +1392,45 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const toggleOrientation = useCallback(() => {
 		const cam = cameraRef.current;
-		const newOri = cam.orientation === "horizontal" ? "vertical" : "horizontal";
-		const isH = newOri === "horizontal";
+		const oldIsH = cam.orientation === "horizontal";
+		const newOri = oldIsH ? "vertical" : "horizontal";
 		const el = containerRef.current;
-		const mainVp = isH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
-		const tw = totalMainRef.current;
-		const mp = -(tw * 1) + mainVp - 40;
+
+		// Compute the world-space center the user is currently looking at.
+		// Main axis uses fisheye's viewCenterFromPan; cross axis is linear.
+		const oldMainPan = oldIsH ? cam.panX : cam.panY;
+		const oldCrossPan = oldIsH ? cam.panY : cam.panX;
+		const oldMainVp = oldIsH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+		const oldCrossVp = oldIsH
+			? (el?.clientHeight ?? 800) - rulerThickness
+			: (el?.clientWidth ?? 1200) - rulerThickness;
+		const worldMainCenter = viewCenterFromPan(oldMainPan, oldMainVp, cam.scale);
+		const worldCrossCenter = (oldCrossVp / 2 - oldCrossPan) / cam.scale;
+
+		// In the new orientation the axes swap:
+		// old main axis → new cross axis, old cross axis → new main axis.
+		const newIsH = !oldIsH;
+		const newMainVp = newIsH ? (el?.clientWidth ?? 1200) : (el?.clientHeight ?? 800);
+		const newCrossVp = newIsH
+			? (el?.clientHeight ?? 800) - rulerThickness
+			: (el?.clientWidth ?? 1200) - rulerThickness;
+
+		// The main axis (commit timeline) stays the same world coordinate space,
+		// so we solve for the new main pan that keeps the same world center visible.
+		const newMainPan = solvePanForAnchor(worldMainCenter, newMainVp / 2, newMainVp, cam.scale);
+		// Cross axis is linear — place the old cross center at the new viewport center.
+		const newCrossPan = newCrossVp / 2 - worldCrossCenter * cam.scale;
+
 		const next = hardClamp({
 			...cam,
 			orientation: newOri,
-			...(isH ? { panX: mp, panY: 0 } : { panX: 0, panY: mp }),
+			...(newIsH
+				? { panX: newMainPan, panY: newCrossPan }
+				: { panX: newCrossPan, panY: newMainPan }),
 		});
 		cameraRef.current = next;
 		setCamera({ ...next });
-	}, [hardClamp]);
+	}, [hardClamp, rulerThickness]);
 
 	const toggleEdge = useCallback(() => {
 		const cam = cameraRef.current;
@@ -1564,6 +1589,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const [openPanelChapterIds, setOpenPanelChapterIds] = useState<Set<string>>(new Set());
 	const panelElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
 	const [panelSizes, setPanelSizes] = useState<Map<string, { w: number; h: number }>>(new Map());
+	/** Captures the starting layout position when a panel header drag begins */
+	const panelDragStartRef = useRef<Map<string, { layoutX: number; layoutY: number }>>(new Map());
+	/** Refs for panel state — used by handleChapterDragMove to include panel dimensions */
+	const panelSizesRef = useRef(panelSizes);
+	panelSizesRef.current = panelSizes;
+	const openPanelIdsRef = useRef<Set<string>>(new Set());
+	openPanelIdsRef.current = openPanelChapterIds;
 
 	const handlePixiChapterClick = useCallback((chapterId: string, _narratorId: string | null) => {
 		setOpenPanelChapterIds((prev) => {
@@ -1750,7 +1782,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}
 			}
 		}
-		if (e.button === 1 || (e.button === 0 && e.currentTarget === e.target)) {
+		// Allow pan from left-click on non-interactive areas (canvas, ruler track, etc.)
+		// Skip if the click landed on or inside a button/link/input.
+		const interactive = (e.target as HTMLElement).closest?.("button, a, input, select");
+		if (e.button === 1 || (e.button === 0 && !interactive)) {
 			cancelAnimationFrame(bounceRafRef.current);
 			cancelAnimationFrame(inertiaRafRef.current);
 			// Stop any in-progress smooth zoom/scroll so drag takes over immediately
@@ -1994,11 +2029,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			// Rebuild full PixiChapterInfo[] from the map and push to PixiJS imperatively
 			const ticks = layoutRef.current.ticks;
 			const result: PixiChapterInfo[] = [];
+			const ps = panelSizesRef.current;
+			const openIds = openPanelIdsRef.current;
 			for (const tick of ticks) {
 				if (!tick.segment) continue;
 				const chs = pixiChaptersMapRef.current.get(tick.sha);
 				if (!chs) continue;
 				for (const ch of chs) {
+					const hasPanel = openIds.has(ch.id);
 					result.push({
 						id: ch.id,
 						status: ch.status,
@@ -2012,6 +2050,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						layoutX: ch.layoutX,
 						layoutY: ch.layoutY,
 						segMainPos: tick.x,
+						panelWidth: ps.get(ch.id)?.w ?? (hasPanel ? DEFAULT_PANEL_WIDTH : undefined),
+						panelHeight: ps.get(ch.id)?.h ?? (hasPanel ? DEFAULT_PANEL_HEIGHT : undefined),
 					});
 				}
 			}
@@ -2208,6 +2248,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				position: "relative",
 				touchAction: "none",
 			}}
+			onPointerDown={handlePointerDown}
+			onPointerMove={handlePointerMove}
+			onPointerUp={handlePointerUp}
 		>
 			{/* Ruler track */}
 			<Box style={rulerTrackStyle} onContextMenu={handleTickContextMenu}>
@@ -2255,6 +2298,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}}
 				onPointerDown={(e: React.PointerEvent) => {
 					e.preventDefault();
+					e.stopPropagation();
 					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 					const startPos = isHorizontal ? e.clientY : e.clientX;
 					rulerDragRef.current = { startY: startPos, startThickness: rulerThickness };
@@ -2309,13 +2353,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			/>
 
 			{/* 2D Canvas */}
-			<Box
-				style={canvasStyle}
-				onPointerDown={handlePointerDown}
-				onPointerMove={handlePointerMove}
-				onPointerUp={handlePointerUp}
-				onContextMenu={handleCanvasContextMenu}
-			>
+			<Box style={canvasStyle} onContextMenu={handleCanvasContextMenu}>
 				<Box
 					ref={worldLayerRef}
 					style={{
@@ -2540,6 +2578,52 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								},
 							]);
 						}}
+						onDragMove={(screenDx, screenDy) => {
+							const cam = cameraRef.current;
+							const isH = cam.orientation === "horizontal";
+							const chs = pixiChaptersMapRef.current.get(hr.fromSha);
+							if (!chs) return;
+							const ch = chs.find((c) => c.id === chId);
+							if (!ch) return;
+							// Lazily capture the start layout on first move
+							if (!panelDragStartRef.current.has(chId)) {
+								panelDragStartRef.current.set(chId, {
+									layoutX: ch.layoutX,
+									layoutY: ch.layoutY,
+								});
+							}
+							const start = panelDragStartRef.current.get(chId);
+							if (!start) return;
+							const dMain = (isH ? screenDx : screenDy) / cam.scale;
+							const dCross = (isH ? screenDy : screenDx) / cam.scale;
+							const updated = chs.map((c) =>
+								c.id === chId
+									? {
+											...c,
+											layoutX: start.layoutX + dMain,
+											layoutY: start.layoutY + dCross,
+										}
+									: c,
+							);
+							pixiChaptersMapRef.current.set(hr.fromSha, updated);
+							chapterDragMoveRef.current(hr.fromSha, updated);
+							scheduleLightRender();
+						}}
+						onDragEnd={(screenDx, screenDy) => {
+							const cam = cameraRef.current;
+							const isH = cam.orientation === "horizontal";
+							const start = panelDragStartRef.current.get(chId);
+							panelDragStartRef.current.delete(chId);
+							if (!start) return;
+							const dMain = (isH ? screenDx : screenDy) / cam.scale;
+							const dCross = (isH ? screenDy : screenDx) / cam.scale;
+							pixiDragEndRef.current(
+								chId,
+								hr.fromSha,
+								start.layoutX + dMain,
+								start.layoutY + dCross,
+							);
+						}}
 						panelRef={(el) => {
 							if (el) {
 								panelElsRef.current.set(chId, el);
@@ -2547,6 +2631,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								panelElsRef.current.delete(chId);
 							}
 						}}
+						canvasEl={containerRef.current}
 					/>
 				);
 			})}
@@ -2566,6 +2651,9 @@ function NarratorPanelOverlay({
 	localScale: fisheyeLocalScale,
 	onClose,
 	onResizeEnd,
+	onDragMove,
+	onDragEnd,
+	canvasEl,
 	panelRef,
 }: {
 	chapter: { id: string; title: string };
@@ -2580,6 +2668,12 @@ function NarratorPanelOverlay({
 	localScale: number;
 	onClose: () => void;
 	onResizeEnd: (newW: number, newH: number) => void;
+	/** Called during header drag with screen-space deltas */
+	onDragMove: (screenDx: number, screenDy: number) => void;
+	/** Called when header drag ends with final screen-space deltas */
+	onDragEnd: (screenDx: number, screenDy: number) => void;
+	/** Canvas container element — Ctrl+wheel events are forwarded here for zoom */
+	canvasEl: HTMLDivElement | null;
 	panelRef?: (el: HTMLDivElement | null) => void;
 }) {
 	const isResizingRef = useRef(false);
@@ -2589,20 +2683,36 @@ function NarratorPanelOverlay({
 	resizeDeltaRef.current = resizeDelta;
 	const onResizeEndRef = useRef(onResizeEnd);
 	onResizeEndRef.current = onResizeEnd;
+	const onDragMoveRef = useRef(onDragMove);
+	onDragMoveRef.current = onDragMove;
+	const onDragEndRef = useRef(onDragEnd);
+	onDragEndRef.current = onDragEnd;
 	const panelWheelRef = useRef<HTMLDivElement>(null);
+
+	// Header drag state
+	const isDraggingRef = useRef(false);
+	const dragDidMoveRef = useRef(false);
+	const dragStartRef = useRef({ x: 0, y: 0 });
+	const dragMoveHandlerRef = useRef<((e: PointerEvent) => void) | null>(null);
+	const dragUpHandlerRef = useRef<((e: PointerEvent) => void) | null>(null);
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
 
 	// Panel scales with fisheye local scale — shrinks at viewport edges
 	const panelScale = getCardScale(fisheyeLocalScale);
 
-	// Prevent wheel events inside the panel from bubbling
+	// Prevent wheel events inside the panel from bubbling to the canvas,
+	// EXCEPT when Ctrl/Meta is held — forward those to the canvas for zoom.
 	useEffect(() => {
 		const el = panelWheelRef.current;
 		if (!el) return;
 		const handler = (e: WheelEvent) => {
+			if (e.ctrlKey || e.metaKey) {
+				e.preventDefault();
+				if (canvasEl) canvasEl.dispatchEvent(new WheelEvent("wheel", e));
+				return;
+			}
 			e.stopPropagation();
-			if (e.ctrlKey || e.metaKey) e.preventDefault();
 		};
 		el.addEventListener("wheel", handler, { passive: false });
 		return () => el.removeEventListener("wheel", handler);
@@ -2620,6 +2730,12 @@ function NarratorPanelOverlay({
 			if (handleUpRef.current) {
 				document.removeEventListener("pointerup", handleUpRef.current, true);
 				document.removeEventListener("pointercancel", handleUpRef.current, true);
+			}
+			if (dragMoveHandlerRef.current)
+				document.removeEventListener("pointermove", dragMoveHandlerRef.current, true);
+			if (dragUpHandlerRef.current) {
+				document.removeEventListener("pointerup", dragUpHandlerRef.current, true);
+				document.removeEventListener("pointercancel", dragUpHandlerRef.current, true);
 			}
 		};
 	}, []);
@@ -2682,9 +2798,49 @@ function NarratorPanelOverlay({
 		document.addEventListener("pointercancel", handleUp, true);
 	};
 
+	const startDrag = (e: React.PointerEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		isDraggingRef.current = true;
+		dragDidMoveRef.current = false;
+		dragStartRef.current = { x: e.clientX, y: e.clientY };
+
+		const handleMove = (ev: PointerEvent) => {
+			if (!isDraggingRef.current) return;
+			const dx = ev.clientX - dragStartRef.current.x;
+			const dy = ev.clientY - dragStartRef.current.y;
+			// Dead zone — don't start visual drag until pointer moves past 3px
+			if (!dragDidMoveRef.current && Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+			dragDidMoveRef.current = true;
+			onDragMoveRef.current(dx, dy);
+		};
+		const handleUp = (ev: PointerEvent) => {
+			if (!isDraggingRef.current) return;
+			isDraggingRef.current = false;
+			if (dragDidMoveRef.current) {
+				const dx = ev.clientX - dragStartRef.current.x;
+				const dy = ev.clientY - dragStartRef.current.y;
+				onDragEndRef.current(dx, dy);
+			}
+			document.removeEventListener("pointermove", handleMove, true);
+			document.removeEventListener("pointerup", handleUp, true);
+			document.removeEventListener("pointercancel", handleUp, true);
+			dragMoveHandlerRef.current = null;
+			dragUpHandlerRef.current = null;
+		};
+		dragMoveHandlerRef.current = handleMove;
+		dragUpHandlerRef.current = handleUp;
+		document.addEventListener("pointermove", handleMove, true);
+		document.addEventListener("pointerup", handleUp, true);
+		document.addEventListener("pointercancel", handleUp, true);
+	};
+
 	return (
 		<Card
-			ref={panelRef}
+			ref={(el: HTMLDivElement | null) => {
+				panelWheelRef.current = el;
+				panelRef?.(el);
+			}}
 			shadow="sm"
 			padding={6}
 			radius="sm"
@@ -2750,8 +2906,16 @@ function NarratorPanelOverlay({
 				</Box>
 			))}
 
-			{/* Header */}
-			<Box style={{ cursor: "pointer" }} onClick={onClose}>
+			{/* Header — drag handle; click (without drag) closes the panel */}
+			<Box
+				style={{ cursor: "grab" }}
+				onPointerDown={startDrag}
+				onClick={(e) => {
+					e.stopPropagation();
+					// Only close if the pointer didn't move past the dead zone
+					if (!dragDidMoveRef.current) onClose();
+				}}
+			>
 				<Text size="11px" fw={600} truncate>
 					{chapter.title}
 				</Text>
@@ -2759,7 +2923,6 @@ function NarratorPanelOverlay({
 
 			{/* Narrator panel */}
 			<Box
-				ref={panelWheelRef}
 				onClick={(e) => e.stopPropagation()}
 				onDoubleClick={(e) => e.stopPropagation()}
 				style={{
