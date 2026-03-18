@@ -18,6 +18,7 @@ interface SegmentChapter {
 	status: string;
 	branch: string;
 	role: string;
+	parentChapterId: string | null;
 	narratorId: string | null;
 	narratorStatus: string | null;
 	reviewStatus: string | null;
@@ -85,6 +86,7 @@ interface SegmentCanvasProps {
 			title: string;
 			branch: string;
 			role: string;
+			parentChapterId?: string | null;
 			narratorId: string | null;
 			narratorStatus: string | null;
 			startCommitSha: string | null;
@@ -102,6 +104,7 @@ interface SegmentCanvasProps {
 			title: string;
 			branch: string;
 			role: string;
+			parentChapterId?: string | null;
 			narratorId: string | null;
 			narratorStatus: string | null;
 			startCommitSha: string | null;
@@ -203,6 +206,7 @@ export const SegmentCanvas = memo(
 						title: ch.title,
 						branch: ch.branch,
 						role: ch.role,
+						parentChapterId: ch.parentChapterId,
 						narratorId: ch.narratorId,
 						narratorStatus: ch.narratorStatus,
 						startCommitSha: ch.startCommitSha,

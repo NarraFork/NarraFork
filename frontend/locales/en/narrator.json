@@ -34,6 +34,7 @@
 	"suggesting": "Thinking...",
 	"suggestFailed": "Failed to suggest answers",
 	"untitled": "Untitled",
+	"editTitle": "Edit title",
 	"generateTitle": "Generate title",
 	"scrollToBottom": "Scroll to bottom",
 	"scrollToBottomWithCount": "Scroll to bottom ({{count}} new messages)",

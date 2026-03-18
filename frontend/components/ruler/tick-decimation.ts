@@ -37,9 +37,9 @@ export const MIN_TICK_WIDTH = 60;
 /**
  * Compute the decimation stride from camera scale.
  * stride = ceil(MIN_TICK_WIDTH / (COLLAPSED_GAP * scale)), clamped to ≥ 1.
- * At scale=1 with COLLAPSED_GAP=80: stride=1 (every tick kept, slot=80px).
- * At scale=0.5: stride=2 (every other tick, slot=80px).
- * At scale=0.1: stride=8 (every 8th tick, slot=96px).
+ * At scale=1 with COLLAPSED_GAP=240: stride=1 (every tick kept, slot=240px).
+ * At scale=0.25: stride=1 (slot=60px, just at MIN_TICK_WIDTH).
+ * At scale=0.1: stride=3 (every 3rd tick, slot=72px).
  */
 export function computeStride(scale: number): number {
 	const screenGap = COLLAPSED_GAP * scale;

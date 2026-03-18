@@ -26,7 +26,7 @@ export interface ElasticLayout {
 }
 
 /** Fixed gap between ticks in collapsed state (world-space pixels) */
-export const COLLAPSED_GAP = 80;
+export const COLLAPSED_GAP = 240;
 
 /**
  * Compute tick positions with uniform spacing.

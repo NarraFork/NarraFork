@@ -30,14 +30,7 @@ import {
 	type RulerEdge,
 	type RulerOrientation,
 } from "./types";
-import {
-	getCardScale,
-	getZoomTierInfo,
-	MORPH_T_DOT,
-	SCALE_MAX,
-	SCALE_MIN,
-	type ZoomTierId,
-} from "./zoom-tiers";
+import { getZoomTierInfo, MORPH_T_DOT, SCALE_MAX, SCALE_MIN, type ZoomTierId } from "./zoom-tiers";
 
 interface RulerFlowProps {
 	projectId: string;
@@ -368,6 +361,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		active: boolean;
 		chapterId: string;
 		fromSha: string;
+		/** Actual key in pixiChaptersMapRef (may differ from fromSha for orphan chapters) */
+		mapKey: string;
 		startScreenX: number;
 		startScreenY: number;
 		startLayoutX: number;
@@ -386,6 +381,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				title: string;
 				branch: string;
 				role: string;
+				parentChapterId?: string | null;
 				narratorId: string | null;
 				narratorStatus: string | null;
 				startCommitSha: string | null;
@@ -395,6 +391,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			}>
 		>
 	>(new Map());
+
+	/** Resolve the actual pixiChaptersMapRef key for a chapter.
+	 *  Orphan chapters may be keyed under their parent's segment SHA. */
+	const resolvePixiMapKey = useCallback(
+		(chapterId: string, fallbackSha: string): string => {
+			if (pixiChaptersMapRef.current.has(fallbackSha)) return fallbackSha;
+			for (const [sha, entries] of pixiChaptersMapRef.current) {
+				if (entries.some((c) => c.id === chapterId)) return sha;
+			}
+			return fallbackSha;
+		},
+		[],
+	);
+
 	const [pixiChaptersTick, setPixiChaptersTick] = useState(0);
 	const pixiChaptersTickRafRef = useRef(0);
 	const wheelCleanupRef = useRef<(() => void) | null>(null);
@@ -681,15 +691,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const [chapterMenu, setChapterMenu] = useState<ChapterContextMenuState | null>(null);
 
-	useEffect(() => {
-		if (!tickMenu && !chapterMenu) return;
-		const handler = () => {
-			setTickMenu(null);
-			setChapterMenu(null);
-		};
-		window.addEventListener("click", handler);
-		return () => window.removeEventListener("click", handler);
-	}, [tickMenu, chapterMenu]);
+	const closeAllMenus = useCallback(() => {
+		setTickMenu(null);
+		setChapterMenu(null);
+	}, []);
 
 	// --- Actions ---
 	const resetCamera = useCallback(() => {
@@ -874,16 +879,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			try {
 				await api.forkChapter(chapterId, {});
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
-				if (chapterMenu) {
-					queryClient.invalidateQueries({
-						queryKey: ["rulerSegment", projectId, chapterMenu.fromSha],
-					});
-				}
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
 			} catch {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient, chapterMenu],
+		[projectId, queryClient],
 	);
 
 	const handleChapterMerge = useCallback(
@@ -891,16 +892,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			try {
 				await api.rulerMerge(projectId, { sourceChapterId: chapterId });
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
-				if (chapterMenu) {
-					queryClient.invalidateQueries({
-						queryKey: ["rulerSegment", projectId, chapterMenu.fromSha],
-					});
-				}
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
 			} catch {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient, chapterMenu],
+		[projectId, queryClient],
 	);
 
 	const handleChapterReview = useCallback(
@@ -908,16 +905,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			try {
 				await api.createReview(chapterId, {});
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
-				if (chapterMenu) {
-					queryClient.invalidateQueries({
-						queryKey: ["rulerSegment", projectId, chapterMenu.fromSha],
-					});
-				}
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
 			} catch {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient, chapterMenu],
+		[projectId, queryClient],
 	);
 
 	const handleChapterAbandon = useCallback(
@@ -925,16 +918,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			try {
 				await api.rulerAbandon(projectId, chapterId);
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
-				if (chapterMenu) {
-					queryClient.invalidateQueries({
-						queryKey: ["rulerSegment", projectId, chapterMenu.fromSha],
-					});
-				}
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
 			} catch {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient, chapterMenu],
+		[projectId, queryClient],
 	);
 
 	// --- Tick context menu via hit-testing ---
@@ -1622,14 +1611,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handlePixiChapterContextMenu = useCallback(
 		(chapterId: string, screenX: number, screenY: number) => {
-			for (const [_sha, chs] of pixiChaptersMapRef.current) {
+			for (const [sha, chs] of pixiChaptersMapRef.current) {
 				const ch = chs.find((c) => c.id === chapterId);
 				if (ch) {
 					setChapterMenu({
 						x: screenX,
 						y: screenY,
 						chapter: ch as never,
-						fromSha: ch.startCommitSha ?? "",
+						fromSha: sha,
 					});
 					break;
 				}
@@ -1644,6 +1633,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const touchCardHitRef = useRef<{
 		id: string;
 		fromSha: string;
+		mapKey: string;
 		layoutX: number;
 		layoutY: number;
 		clientX: number;
@@ -1672,6 +1662,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					active: false,
 					chapterId: tch.id,
 					fromSha: tch.fromSha,
+					mapKey: tch.mapKey,
 					startScreenX: tch.clientX,
 					startScreenY: tch.clientY,
 					startLayoutX: tch.layoutX,
@@ -1762,12 +1753,17 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					sy >= hr.screenY &&
 					sy <= hr.screenY + hr.height
 				) {
+					// Resolve actual pixiChaptersMapRef key (orphan chapters may be
+					// keyed under their parent's segment SHA, not their own startCommitSha)
+					const resolvedMapKey = resolvePixiMapKey(hr.id, hr.fromSha);
+
 					if (e.pointerType === "touch") {
 						// Touch: record hit, let pan start normally below.
 						// contextmenu (long-press) will promote to card drag.
 						touchCardHitRef.current = {
 							id: hr.id,
 							fromSha: hr.fromSha,
+							mapKey: resolvedMapKey,
 							layoutX: hr.layoutX,
 							layoutY: hr.layoutY,
 							clientX: e.clientX,
@@ -1781,6 +1777,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						active: false,
 						chapterId: hr.id,
 						fromSha: hr.fromSha,
+						mapKey: resolvedMapKey,
 						startScreenX: e.clientX,
 						startScreenY: e.clientY,
 						startLayoutX: hr.layoutX,
@@ -1856,13 +1853,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					// In vertical mode: screen Y → layoutX (main), screen X → layoutY (cross)
 					const newLayoutX = cd.startLayoutX + (isH ? dx : dy) / cam.scale;
 					const newLayoutY = cd.startLayoutY + (isH ? dy : dx) / cam.scale;
-					const chs = pixiChaptersMapRef.current.get(cd.fromSha);
+					const chs = pixiChaptersMapRef.current.get(cd.mapKey);
 					if (chs) {
 						const updated = chs.map((c) =>
 							c.id === cd.chapterId ? { ...c, layoutX: newLayoutX, layoutY: newLayoutY } : c,
 						);
-						pixiChaptersMapRef.current.set(cd.fromSha, updated);
-						chapterDragMoveRef.current(cd.fromSha, updated);
+						pixiChaptersMapRef.current.set(cd.mapKey, updated);
+						chapterDragMoveRef.current(cd.mapKey, updated);
 					}
 				}
 				return;
@@ -1935,7 +1932,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					const dCross = (isH ? screenDy : screenDx) / cam.scale;
 					pixiDragEndRef.current(
 						cd.chapterId,
-						cd.fromSha,
+						cd.mapKey,
 						cd.startLayoutX + dMain,
 						cd.startLayoutY + dCross,
 					);
@@ -1990,6 +1987,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				title: string;
 				branch: string;
 				role: string;
+				parentChapterId?: string | null;
 				narratorId: string | null;
 				narratorStatus: string | null;
 				startCommitSha: string | null;
@@ -2024,6 +2022,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				title: string;
 				branch: string;
 				role: string;
+				parentChapterId?: string | null;
 				narratorId: string | null;
 				narratorStatus: string | null;
 				startCommitSha: string | null;
@@ -2055,6 +2054,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						title: ch.title,
 						branch: ch.branch,
 						role: ch.role,
+						parentChapterId: ch.parentChapterId,
 						narratorId: ch.narratorId,
 						narratorStatus: ch.narratorStatus,
 						startCommitSha: ch.startCommitSha,
@@ -2099,6 +2099,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					title: ch.title,
 					branch: ch.branch,
 					role: ch.role,
+					parentChapterId: ch.parentChapterId,
 					narratorId: ch.narratorId,
 					narratorStatus: ch.narratorStatus,
 					startCommitSha: ch.startCommitSha,
@@ -2120,13 +2121,41 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		const activeChapters = rulerData.activeChapters ?? [];
 		if (activeChapters.length === 0) return [];
 		const result: PixiChapterInfo[] = [];
-		// Group active chapters by startCommitSha to compute per-group layout offsets
+
+		// Build lookup by id for parent-chain traversal
+		const chapterById = new Map<string, (typeof activeChapters)[number]>();
+		for (const ch of activeChapters) chapterById.set(ch.id, ch);
+
+		// Resolve effective startCommitSha: if the chapter's own startCommitSha
+		// is not on the main-branch tick list (e.g. forked from a sub-branch commit),
+		// walk up the parentChapterId chain to find an ancestor whose startCommitSha
+		// IS on the ruler, so the chapter can "attach" to its parent's anchor.
+		const resolveEffectiveSha = (ch: (typeof activeChapters)[number]): string | null => {
+			if (ch.startCommitSha && tickPositions.has(ch.startCommitSha)) {
+				return ch.startCommitSha;
+			}
+			const visited = new Set<string>();
+			let cur = ch;
+			while (cur.parentChapterId && !visited.has(cur.parentChapterId)) {
+				visited.add(cur.parentChapterId);
+				const parent = chapterById.get(cur.parentChapterId);
+				if (!parent) break;
+				if (parent.startCommitSha && tickPositions.has(parent.startCommitSha)) {
+					return parent.startCommitSha;
+				}
+				cur = parent;
+			}
+			return null;
+		};
+
+		// Group active chapters by effective startCommitSha
 		const byStartSha = new Map<string, typeof activeChapters>();
 		for (const ch of activeChapters) {
-			if (!ch.startCommitSha) continue;
-			const list = byStartSha.get(ch.startCommitSha) ?? [];
+			const sha = resolveEffectiveSha(ch);
+			if (!sha) continue;
+			const list = byStartSha.get(sha) ?? [];
 			list.push(ch);
-			byStartSha.set(ch.startCommitSha, list);
+			byStartSha.set(sha, list);
 		}
 		for (const [sha, chs] of byStartSha) {
 			const segMainPos = tickPositions.get(sha);
@@ -2144,6 +2173,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					narratorId: ch.narratorId ?? null,
 					narratorStatus: ch.narratorStatus ?? null,
 					startCommitSha: ch.startCommitSha,
+					parentChapterId: ch.parentChapterId,
 					layoutX: hasOffset ? ch.axisOffset : 20 + (i % 3) * (NODE_WIDTH + NODE_GAP),
 					layoutY: hasOffset ? ch.crossOffset : 20 + Math.floor(i / 3) * (NODE_HEIGHT + NODE_GAP),
 					segMainPos,
@@ -2514,6 +2544,26 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				</Tooltip>
 			</Group>
 
+			{(tickMenu || chapterMenu) && (
+				<Box
+					style={{
+						position: "fixed",
+						inset: 0,
+						zIndex: 999,
+					}}
+					onPointerDown={(e) => {
+						e.stopPropagation();
+						e.preventDefault();
+						closeAllMenus();
+					}}
+					onContextMenu={(e) => {
+						e.stopPropagation();
+						e.preventDefault();
+						closeAllMenus();
+					}}
+				/>
+			)}
+
 			{tickMenu && (
 				<TickContextMenu
 					x={tickMenu.x}
@@ -2554,11 +2604,19 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						break;
 					}
 				}
+				// Fallback: check alwaysVisibleChapters (orphan chapters not in any segment)
+				if (!chData) {
+					const found = alwaysVisibleChapters.find((c) => c.id === chId);
+					if (found) chData = found;
+				}
 				if (!chData?.narratorId) return null;
 
 				const hitRects = pixiRef.current?.getCardHitRects() ?? [];
 				const hr = hitRects.find((r) => r.id === chId);
 				if (!hr) return null;
+
+				// Resolve actual map key for orphan chapters
+				const panelMapKey = resolvePixiMapKey(chId, hr.fromSha);
 
 				const containerEl = containerRef.current;
 				const cRect = containerEl?.getBoundingClientRect();
@@ -2574,7 +2632,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						width={panelSizes.get(chId)?.w ?? DEFAULT_PANEL_WIDTH}
 						height={panelSizes.get(chId)?.h ?? DEFAULT_PANEL_HEIGHT}
 						scale={scale}
-						localScale={hr.localScale}
 						isClosing={isClosing}
 						onClose={() => {
 							setOpenPanelChapterIds((prev) => {
@@ -2605,7 +2662,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						onDragMove={(screenDx, screenDy) => {
 							const cam = cameraRef.current;
 							const isH = cam.orientation === "horizontal";
-							const chs = pixiChaptersMapRef.current.get(hr.fromSha);
+							const chs = pixiChaptersMapRef.current.get(panelMapKey);
 							if (!chs) return;
 							const ch = chs.find((c) => c.id === chId);
 							if (!ch) return;
@@ -2629,8 +2686,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 										}
 									: c,
 							);
-							pixiChaptersMapRef.current.set(hr.fromSha, updated);
-							chapterDragMoveRef.current(hr.fromSha, updated);
+							pixiChaptersMapRef.current.set(panelMapKey, updated);
+							chapterDragMoveRef.current(panelMapKey, updated);
 							scheduleLightRender();
 						}}
 						onDragEnd={(screenDx, screenDy) => {
@@ -2643,7 +2700,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							const dCross = (isH ? screenDy : screenDx) / cam.scale;
 							pixiDragEndRef.current(
 								chId,
-								hr.fromSha,
+								panelMapKey,
 								start.layoutX + dMain,
 								start.layoutY + dCross,
 							);
@@ -2656,6 +2713,32 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 							}
 						}}
 						canvasEl={containerRef.current}
+						onContextMenu={(e) => {
+							e.preventDefault();
+							let fullChData:
+								| {
+										id: string;
+										title: string;
+										status: string;
+										role: string;
+										startCommitSha: string | null;
+								  }
+								| undefined;
+							for (const [_sha, chs] of pixiChaptersMapRef.current) {
+								const found = chs.find((c) => c.id === chId);
+								if (found) {
+									fullChData = found;
+									break;
+								}
+							}
+							if (!fullChData) return;
+							setChapterMenu({
+								x: e.clientX,
+								y: e.clientY,
+								chapter: fullChData,
+								fromSha: fullChData.startCommitSha ?? "",
+							});
+						}}
 					/>
 				);
 			})}
@@ -2671,7 +2754,6 @@ function NarratorPanelOverlay({
 	width: panelW,
 	height: panelH,
 	scale: _scale,
-	localScale: fisheyeLocalScale,
 	isClosing,
 	onClose,
 	onResizeEnd,
@@ -2679,6 +2761,7 @@ function NarratorPanelOverlay({
 	onDragEnd,
 	canvasEl,
 	panelRef,
+	onContextMenu,
 }: {
 	narratorId: string;
 	screenX: number;
@@ -2687,8 +2770,6 @@ function NarratorPanelOverlay({
 	height: number;
 	/** Camera scale — used for resize screen-to-world math */
 	scale: number;
-	/** Fisheye local scale at this chapter's position — used for visual panel scaling */
-	localScale: number;
 	/** Whether this panel is in its close animation */
 	isClosing?: boolean;
 	onClose: () => void;
@@ -2700,6 +2781,7 @@ function NarratorPanelOverlay({
 	/** Canvas container element — Ctrl+wheel events are forwarded here for zoom */
 	canvasEl: HTMLDivElement | null;
 	panelRef?: (el: HTMLDivElement | null) => void;
+	onContextMenu?: (e: React.MouseEvent) => void;
 }) {
 	const isResizingRef = useRef(false);
 	const resizeStartRef = useRef({ x: 0, y: 0, origW: 0, origH: 0, corner: "" });
@@ -2733,8 +2815,8 @@ function NarratorPanelOverlay({
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
 
-	// Panel scales with fisheye local scale — shrinks at viewport edges
-	const panelScale = getCardScale(fisheyeLocalScale);
+	// Panel scales 1:1 with the camera — no damping
+	const panelScale = 1;
 
 	// Prevent wheel events inside the panel from bubbling to the canvas,
 	// EXCEPT when Ctrl/Meta is held — forward those to the canvas for zoom.
@@ -2834,6 +2916,8 @@ function NarratorPanelOverlay({
 	};
 
 	const startDrag = (e: React.PointerEvent) => {
+		// Only initiate drag on primary button (left click) — right-click should not start drag/close
+		if (e.button !== 0) return;
 		e.preventDefault();
 		e.stopPropagation();
 		isDraggingRef.current = true;
@@ -2899,7 +2983,7 @@ function NarratorPanelOverlay({
 				borderStyle: "solid",
 				display: "flex",
 				flexDirection: "column",
-				overflow: "hidden",
+				overflow: "visible",
 				opacity: animOpacity,
 				transition: isResizingRef.current
 					? "none"
@@ -2912,6 +2996,7 @@ function NarratorPanelOverlay({
 			}}
 			onPointerDown={(e) => e.stopPropagation()}
 			onPointerUp={(e) => e.stopPropagation()}
+			onContextMenu={onContextMenu}
 		>
 			{/* Resize handles */}
 			{(["tl", "tr", "bl", "br"] as const).map((corner) => (
@@ -2919,14 +3004,14 @@ function NarratorPanelOverlay({
 					key={corner}
 					style={{
 						position: "absolute",
-						width: corner === "br" ? 20 : 14,
-						height: corner === "br" ? 20 : 14,
+						width: corner === "br" ? 28 : 14,
+						height: corner === "br" ? 28 : 14,
 						zIndex: 10,
 						...(corner === "tl" ? { top: -2, left: -2, cursor: "nwse-resize" } : {}),
 						...(corner === "tr" ? { top: -2, right: -2, cursor: "nesw-resize" } : {}),
 						...(corner === "bl" ? { bottom: -2, left: -2, cursor: "nesw-resize" } : {}),
 						...(corner === "br"
-							? { bottom: 0, right: 0, cursor: "nwse-resize", overflow: "hidden" }
+							? { bottom: -8, right: -8, cursor: "nwse-resize", overflow: "hidden" }
 							: {}),
 					}}
 					onPointerDown={(e) => startResize(e, corner)}
@@ -2935,8 +3020,8 @@ function NarratorPanelOverlay({
 						<Box
 							style={{
 								position: "absolute",
-								bottom: 0,
-								right: 0,
+								bottom: 8,
+								right: 8,
 								width: 0,
 								height: 0,
 								borderStyle: "solid",

@@ -4,7 +4,7 @@
  * connector lines, and chapter node morph elements (dot → pill → card).
  * React DOM is only used for interactive NarratorPanel overlays above this layer.
  */
-import { Application, Container, Graphics, TextStyle } from "pixi.js";
+import { Application, CanvasTextMetrics, Container, Graphics, TextStyle } from "pixi.js";
 import { memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RulerSegment } from "../../../hooks/useRuler";
 import { type ElasticLayout, findTickAtX } from "../elastic-layout";
@@ -22,7 +22,6 @@ import { decimateTicks, slotWidth } from "../tick-decimation";
 import type { RulerOrientation } from "../types";
 import {
 	DOT_FINAL_SIZE,
-	getCardScale,
 	getMorphFactor,
 	getMorphStyle,
 	MORPH_T_DOT,
@@ -48,6 +47,8 @@ export interface PixiChapterInfo {
 	narratorStatus: string | null;
 	startCommitSha: string | null;
 	mergeCommitSha?: string | null;
+	/** Parent chapter ID — used to draw connector to parent instead of ruler for orphan chapters */
+	parentChapterId?: string | null;
 	/** World-space layout position within the segment */
 	layoutX: number;
 	layoutY: number;
@@ -130,6 +131,11 @@ interface RulerPixiLayerProps {
 
 const NODE_WIDTH = 220;
 const NODE_HEIGHT = 72;
+const NODE_MIN_WIDTH = 80;
+const NODE_TITLE_PADDING = 24; // horizontal padding inside card for title
+
+// Reusable TextStyle for title width measurement (font size updated before each use)
+const measureStyle = new TextStyle({ fontFamily: "sans-serif", fontWeight: "600", fontSize: 11 });
 const CARD_TOP_OFFSET = 2;
 
 function narratorStatusColor(theme: PixiTheme, status: string): number {
@@ -683,7 +689,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		const tZoom = getMorphFactor(cam.scale);
 
 		// Card scale factor (clamped) — shared with NarratorPanelOverlay in RulerFlow.
-		const cardScale = getCardScale(cam.scale);
+		// Card internal layout (padding, font sizes, badge positions) scales with
+		// cam.scale so content stays proportional to the card dimensions.
+		const cardScale = cam.scale;
 
 		// --- Panel blend animation: advance per-chapter blend toward target ---
 		const blendMap = panelBlendMapRef.current;
@@ -703,6 +711,19 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				}
 			}
 		}
+
+		// Map of chapter screen positions — used for parent-to-child connectors
+		const chapterScreenPos = new Map<
+			string,
+			{ mainLeft: number; mainSize: number; crossCenter: number }
+		>();
+		// Deferred connectors for orphan chapters (parent may not be positioned yet)
+		const deferredConnectors: Array<{
+			parentId: string;
+			elemScreenLeft: number;
+			elemScreenCenterCross: number;
+			opacity: number;
+		}> = [];
 
 		for (const ch of merged) {
 			const chWorldMain = ch.segMainPos + ch.layoutX;
@@ -749,7 +770,15 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// Guard against stale/incomplete chapter data after cleanup
 			if (!ch.title || !ch.status) continue;
 
-			const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
+			// Compute per-chapter card width based on measured title width.
+			// CanvasTextMetrics has built-in caching so repeated calls are cheap.
+			const measured = CanvasTextMetrics.measureText(ch.title ?? "", measureStyle);
+			const chapterWidth = Math.max(
+				NODE_MIN_WIDTH,
+				Math.min(NODE_WIDTH, measured.width + NODE_TITLE_PADDING),
+			);
+
+			const morph = getMorphStyle(t, chapterWidth, NODE_HEIGHT);
 
 			// --- Panel morph schedule ---
 			// When a panel is open (or animating), blend draw size from card/dot
@@ -768,7 +797,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			if (panelVisible && ch.panelWidth && ch.panelHeight) {
 				// Map t from [DOT..1] → zoomBlend [0..1] (0 = dot size, 1 = panel size)
 				const zoomBlend = (t - MORPH_T_DOT) / (1 - MORPH_T_DOT);
-				const dotMorph = getMorphStyle(MORPH_T_DOT, NODE_WIDTH, NODE_HEIGHT);
+				const dotMorph = getMorphStyle(MORPH_T_DOT, chapterWidth, NODE_HEIGHT);
 				// Target dimensions at full panel open
 				const targetW = dotMorph.width + zoomBlend * (ch.panelWidth - dotMorph.width);
 				const targetH = dotMorph.height + zoomBlend * (ch.panelHeight - dotMorph.height);
@@ -780,13 +809,14 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				drawH = morph.height + panelBlend * (targetH - morph.height);
 			}
 
-			// Apply cardScale to pill/card phases, keep dots at fixed size.
+			// Dot phase keeps fixed screen size; pill/card scale 1:1 with cam.scale
+			// so card dimensions and inter-card distances zoom at the same rate.
 			const isDot = t <= MORPH_T_DOT;
-			const scaledW = isDot ? drawW : Math.max(DOT_FINAL_SIZE, drawW * cardScale);
-			const scaledH = isDot ? drawH : Math.max(DOT_FINAL_SIZE, drawH * cardScale);
+			const scaledW = isDot ? drawW : Math.max(DOT_FINAL_SIZE, drawW * cam.scale);
+			const scaledH = isDot ? drawH : Math.max(DOT_FINAL_SIZE, drawH * cam.scale);
 			// Hit rect dimensions (for DOM panel positioning)
-			const hitScaledW = isDot ? hitW : Math.max(DOT_FINAL_SIZE, hitW * cardScale);
-			const hitScaledH = isDot ? hitH : Math.max(DOT_FINAL_SIZE, hitH * cardScale);
+			const hitScaledW = isDot ? hitW : Math.max(DOT_FINAL_SIZE, hitW * cam.scale);
+			const hitScaledH = isDot ? hitH : Math.max(DOT_FINAL_SIZE, hitH * cam.scale);
 
 			// Fixed anchor — start edge of the layout slot for all morph phases.
 			// Dot/pill/card all grow from this point toward the end of the main axis,
@@ -971,26 +1001,46 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			}
 
 			// --- Connector lines (all morph stages, unified position) ---
+			// Store screen position for parent-to-child connectors
+			chapterScreenPos.set(ch.id, {
+				mainLeft: elemScreenLeft,
+				mainSize: elemMainSize,
+				crossCenter: elemScreenCenterCross,
+			});
+
 			const lineOpacity = t * (ch.status === "merged" ? 0.25 : 0.45);
 			if (lineOpacity > 0.01) {
-				// Prefer exact tick position; fall back to segment origin when the
-				// chapter's startCommitSha is not a segment boundary tick or is null.
-				const forkTickMain = ch.startCommitSha
-					? (d.tickPositions.get(ch.startCommitSha) ?? ch.segMainPos)
-					: ch.segMainPos;
-				const forkScreenMain = toScreen(forkTickMain);
+				// Check if this chapter's startCommitSha is on the ruler backbone
+				const onBackbone = ch.startCommitSha ? d.tickPositions.has(ch.startCommitSha) : true;
 
-				drawConnector(
-					connGfx,
-					theme,
-					forkScreenMain,
-					elemScreenLeft,
-					elemScreenCenterCross,
-					rulerEdgeCrossScreen,
-					isH,
-					1, // screen space — fixed stroke width
-					lineOpacity,
-				);
+				if (!onBackbone && ch.parentChapterId) {
+					// Orphan chapter: defer connector to after the loop so parent
+					// position is guaranteed to be available
+					deferredConnectors.push({
+						parentId: ch.parentChapterId,
+						elemScreenLeft,
+						elemScreenCenterCross,
+						opacity: lineOpacity,
+					});
+				} else {
+					// Normal chapter: connect from ruler tick to chapter node
+					const forkTickMain = ch.startCommitSha
+						? (d.tickPositions.get(ch.startCommitSha) ?? ch.segMainPos)
+						: ch.segMainPos;
+					const forkScreenMain = toScreen(forkTickMain);
+
+					drawConnector(
+						connGfx,
+						theme,
+						forkScreenMain,
+						elemScreenLeft,
+						elemScreenCenterCross,
+						rulerEdgeCrossScreen,
+						isH,
+						1, // screen space — fixed stroke width
+						lineOpacity,
+					);
+				}
 			}
 
 			// Merge connector
@@ -1011,6 +1061,25 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 						t * 0.25,
 					);
 				}
+			}
+		}
+
+		// Draw deferred connectors for orphan chapters (parent → child)
+		for (const dc of deferredConnectors) {
+			const parentPos = chapterScreenPos.get(dc.parentId);
+			if (parentPos) {
+				// Connect from parent chapter's end edge to child chapter's start edge
+				drawConnector(
+					connGfx,
+					theme,
+					parentPos.mainLeft + parentPos.mainSize,
+					dc.elemScreenLeft,
+					dc.elemScreenCenterCross,
+					parentPos.crossCenter,
+					isH,
+					1,
+					dc.opacity,
+				);
 			}
 		}
 

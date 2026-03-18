@@ -51,40 +51,51 @@ export const agentTool: ToolDefinition = {
 	get parameters() {
 		return buildParameters();
 	},
-	rawJsonSchema: {
-		type: "object",
-		properties: {
-			description: {
-				description: "A short (3-5 word) description of the task",
-				type: "string",
+	get rawJsonSchema() {
+		return {
+			type: "object" as const,
+			properties: {
+				description: {
+					description: "A short (3-5 word) description of the task",
+					type: "string",
+				},
+				prompt: {
+					description: "The task for the agent to perform",
+					type: "string",
+				},
+				subagent_type: {
+					description: "The type of specialized agent to use for this task",
+					type: "string",
+				},
+				resume: {
+					description:
+						"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
+					type: "string",
+				},
+				run_in_background: {
+					description:
+						"Set to true to run this agent in the background. You will be notified when it completes.",
+					type: "boolean",
+				},
+				model: {
+					description: `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}`,
+					type: "string",
+				},
+				workdir: {
+					description:
+						"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
+					type: "string",
+				},
+				isolation: {
+					description:
+						'Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo.',
+					type: "string",
+					enum: ["worktree"],
+				},
 			},
-			prompt: {
-				description: "The task for the agent to perform",
-				type: "string",
-			},
-			subagent_type: {
-				description: "The type of specialized agent to use for this task",
-				type: "string",
-			},
-			resume: {
-				description:
-					"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
-				type: "string",
-			},
-			run_in_background: {
-				description:
-					"Set to true to run this agent in the background. You will be notified when it completes.",
-				type: "boolean",
-			},
-			isolation: {
-				description:
-					'Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo.',
-				type: "string",
-				enum: ["worktree"],
-			},
-		},
-		required: ["description", "prompt"],
-		additionalProperties: false,
+			required: ["description", "prompt"],
+			additionalProperties: false,
+		};
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const { prompt, subagent_type, model, workdir, background } = args as {

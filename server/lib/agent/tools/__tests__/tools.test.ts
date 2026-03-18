@@ -919,7 +919,8 @@ describe("Bash", () => {
 // ============================================================
 
 import { z } from "zod/v4";
-import { zodToJsonSchema } from "../../tool-registry";
+import { agentTool } from "../task";
+import { resolveToolJsonSchema, zodToJsonSchema } from "../../tool-registry";
 
 describe("zodToJsonSchema", () => {
 	test("converts simple object schema", () => {
@@ -973,6 +974,59 @@ describe("zodToJsonSchema", () => {
 			const json = zodToJsonSchema(tool.parameters);
 			expect(json.type).toBe("object");
 			expect(json.properties).toBeDefined();
+		}
+	});
+});
+
+// ============================================================
+// Agent tool — rawJsonSchema parity with Zod schema
+// ============================================================
+
+describe("Agent tool rawJsonSchema", () => {
+	test("rawJsonSchema includes model parameter", () => {
+		const schema = agentTool.rawJsonSchema!;
+		const props = schema.properties as Record<string, any>;
+		expect(props.model).toBeDefined();
+		expect(props.model.type).toBe("string");
+	});
+
+	test("rawJsonSchema includes workdir parameter", () => {
+		const schema = agentTool.rawJsonSchema!;
+		const props = schema.properties as Record<string, any>;
+		expect(props.workdir).toBeDefined();
+		expect(props.workdir.type).toBe("string");
+	});
+
+	test("model description includes available models list", () => {
+		const schema = agentTool.rawJsonSchema!;
+		const props = schema.properties as Record<string, any>;
+		expect(props.model.description).toContain("Available models:");
+	});
+
+	test("rawJsonSchema is dynamic (getter, not static)", () => {
+		// Accessing rawJsonSchema twice should return equal but not identical objects
+		const a = agentTool.rawJsonSchema;
+		const b = agentTool.rawJsonSchema;
+		expect(a).toEqual(b);
+		expect(a).not.toBe(b);
+	});
+
+	test("resolveToolJsonSchema uses rawJsonSchema over Zod", () => {
+		const resolved = resolveToolJsonSchema(agentTool);
+		const raw = agentTool.rawJsonSchema!;
+		expect(resolved).toEqual(raw);
+	});
+
+	test("rawJsonSchema covers all Zod parameter keys", () => {
+		const zodSchema = zodToJsonSchema(agentTool.parameters);
+		const zodKeys = Object.keys(zodSchema.properties as Record<string, unknown>);
+		const rawKeys = Object.keys(
+			(agentTool.rawJsonSchema!.properties as Record<string, unknown>) ?? {},
+		);
+		// Zod "background" maps to rawJsonSchema "run_in_background" (CC naming alignment)
+		const keyMap: Record<string, string> = { background: "run_in_background" };
+		for (const key of zodKeys) {
+			expect(rawKeys).toContain(keyMap[key] ?? key);
 		}
 	});
 });

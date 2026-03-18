@@ -25,6 +25,7 @@ export interface RulerActiveChapter {
 	title: string;
 	branch: string;
 	role: string;
+	parentChapterId: string | null;
 	startCommitSha: string | null;
 	narratorId: string | null;
 	narratorStatus: string | null;

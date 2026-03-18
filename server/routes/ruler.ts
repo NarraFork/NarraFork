@@ -14,6 +14,29 @@ import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { gitService } from "../services/git-service";
 
+/**
+ * Check if a chapter belongs to a segment (identified by `targetSha`) by walking
+ * up the parentChapterId chain. Returns true if the chapter's own startCommitSha
+ * matches, or if any ancestor's startCommitSha matches.
+ */
+function chapterBelongsToSegment(
+	ch: { startCommitSha: string | null; parentChapterId: string | null },
+	targetSha: string,
+	byId: Map<string, { startCommitSha: string | null; parentChapterId: string | null }>,
+): boolean {
+	if (ch.startCommitSha === targetSha) return true;
+	const visited = new Set<string>();
+	let cur = ch;
+	while (cur.parentChapterId && !visited.has(cur.parentChapterId)) {
+		visited.add(cur.parentChapterId);
+		const parent = byId.get(cur.parentChapterId);
+		if (!parent) break;
+		if (parent.startCommitSha === targetSha) return true;
+		cur = parent;
+	}
+	return false;
+}
+
 export const rulerRoutes = new Hono();
 
 // GET /:id/ruler — Main ruler data (commit backbone + segments + active chapters)
@@ -76,6 +99,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			status: true,
 			branch: true,
 			role: true,
+			parentChapterId: true,
 			startCommitSha: true,
 			mergeCommitSha: true,
 			axisOffset: true,
@@ -101,14 +125,35 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		);
 	}
 
+	// Resolve effective startCommitSha for chapters whose own startCommitSha
+	// is not on the main branch (e.g. forked from a sub-branch commit).
+	// Walk up the parentChapterId chain to find an ancestor on the backbone.
+	const chapterById = new Map(projectChapters.map((ch) => [ch.id, ch]));
+	function resolveEffectiveSha(ch: (typeof projectChapters)[number]): string | null {
+		if (ch.startCommitSha && commitShaSet.has(ch.startCommitSha)) return ch.startCommitSha;
+		const visited = new Set<string>();
+		let cur = ch;
+		while (cur.parentChapterId && !visited.has(cur.parentChapterId)) {
+			visited.add(cur.parentChapterId);
+			const parent = chapterById.get(cur.parentChapterId);
+			if (!parent) break;
+			if (parent.startCommitSha && commitShaSet.has(parent.startCommitSha)) {
+				return parent.startCommitSha;
+			}
+			cur = parent;
+		}
+		return null;
+	}
+
 	// Compute segments: find commit ranges that have chapters
-	// A chapter belongs to the segment containing its startCommitSha
+	// A chapter belongs to the segment containing its effective startCommitSha
 	const chaptersByStartSha = new Map<string, typeof projectChapters>();
 	for (const ch of projectChapters) {
-		if (ch.startCommitSha && commitShaSet.has(ch.startCommitSha)) {
-			const list = chaptersByStartSha.get(ch.startCommitSha) ?? [];
+		const sha = resolveEffectiveSha(ch);
+		if (sha) {
+			const list = chaptersByStartSha.get(sha) ?? [];
 			list.push(ch);
-			chaptersByStartSha.set(ch.startCommitSha, list);
+			chaptersByStartSha.set(sha, list);
 		}
 	}
 
@@ -158,6 +203,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 				title: ch.title,
 				branch: ch.branch,
 				role: ch.role,
+				parentChapterId: ch.parentChapterId ?? null,
 				startCommitSha: ch.startCommitSha,
 				narratorId: narrator?.id ?? null,
 				narratorStatus: narrator?.status ?? null,
@@ -194,13 +240,19 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 				title: true,
 				status: true,
 				role: true,
+				parentChapterId: true,
 				startCommitSha: true,
 				anchorCommitSha: true,
 				axisOffset: true,
 				crossOffset: true,
 			},
 		});
-		const segmentChapters = projectChapters.filter((ch) => ch.startCommitSha === fromSha);
+
+		// Resolve chapters to this segment via parent-chain fallback
+		const byId = new Map(projectChapters.map((ch) => [ch.id, ch]));
+		const segmentChapters = projectChapters.filter((ch) =>
+			chapterBelongsToSegment(ch, fromSha, byId),
+		);
 		const chapterIds = segmentChapters.map((ch) => ch.id);
 
 		let narratorMap = new Map<string, string>();
@@ -240,6 +292,7 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			status: true,
 			branch: true,
 			role: true,
+			parentChapterId: true,
 			startCommitSha: true,
 			mergeCommitSha: true,
 			headCommitSha: true,
@@ -254,8 +307,11 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 		},
 	});
 
-	// Filter to chapters in this segment (startCommitSha == fromSha)
-	const segmentChapters = projectChapters.filter((ch) => ch.startCommitSha === fromSha);
+	// Filter to chapters in this segment — includes parent-chain fallback
+	const fullById = new Map(projectChapters.map((ch) => [ch.id, ch]));
+	const segmentChapters = projectChapters.filter((ch) =>
+		chapterBelongsToSegment(ch, fromSha, fullById),
+	);
 	const chapterIds = segmentChapters.map((ch) => ch.id);
 
 	// Get narrator info
@@ -294,6 +350,7 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			status: ch.status,
 			branch: ch.branch,
 			role: ch.role,
+			parentChapterId: ch.parentChapterId ?? null,
 			startCommitSha: ch.startCommitSha,
 			mergeCommitSha: ch.mergeCommitSha,
 			headCommitSha: ch.headCommitSha,

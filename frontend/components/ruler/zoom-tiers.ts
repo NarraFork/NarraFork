@@ -12,11 +12,11 @@ export interface ZoomTier {
  *  L3 work:       individual ticks + full labels + expanded cards + connector lines
  *  L4 focus:      individual ticks + commit message + narrator panels inline */
 export const ZOOM_TIERS: readonly ZoomTier[] = [
-	{ id: "L0", minScale: 0, maxScale: 0.25 },
-	{ id: "L1", minScale: 0.25, maxScale: 0.6 },
-	{ id: "L2", minScale: 0.6, maxScale: 1.2 },
-	{ id: "L3", minScale: 1.2, maxScale: 2.0 },
-	{ id: "L4", minScale: 2.0, maxScale: Number.POSITIVE_INFINITY },
+	{ id: "L0", minScale: 0, maxScale: 0.15 },
+	{ id: "L1", minScale: 0.15, maxScale: 0.3 },
+	{ id: "L2", minScale: 0.3, maxScale: 0.55 },
+	{ id: "L3", minScale: 0.55, maxScale: 0.8 },
+	{ id: "L4", minScale: 0.8, maxScale: Number.POSITIVE_INFINITY },
 ] as const;
 
 /** Returns the current zoom tier and progress (0–1) within that tier. */
@@ -67,16 +67,16 @@ export function getCardModeForChapter(effectiveScale: number): CardMode {
 
 /** Scale thresholds for the continuous morph.
  *  Aligned with zoom tiers so each phase is visible:
- *  - L0 (< 0.25): morph invisible
- *  - L1 (0.25–0.6): dot phase (growing circle)
- *  - L2 (0.6–1.2): pill phase (circle → capsule with title)
- *  - L3+ (> 1.2): card phase (pill → full card)
+ *  - L0 (< 0.15): morph invisible
+ *  - L1 (0.15–0.3): dot phase (growing circle)
+ *  - L2 (0.3–0.55): pill phase (circle → capsule with title)
+ *  - L3+ (> 0.55): card phase (pill → full card)
  */
-const MORPH_INVISIBLE = 0.25; // below: hidden (matches L0 boundary)
-const MORPH_DOT = 0.45; // dot fully formed (mid-L1)
-const MORPH_PILL = 0.9; // pill fully formed (mid-L2)
+const MORPH_INVISIBLE = 0.15; // below: hidden (matches L0 boundary)
+const MORPH_DOT = 0.25; // dot fully formed (mid-L1)
+const MORPH_PILL = 0.45; // pill fully formed (mid-L2)
 /** Scale at which card is fully formed (L3 boundary). Exported for card-persistence logic. */
-export const MORPH_CARD = 1.2;
+export const MORPH_CARD = 0.55;
 
 // ---------------------------------------------------------------------------
 // Camera scale bounds & card-scale helper
@@ -85,10 +85,7 @@ export const MORPH_CARD = 1.2;
 /** Minimum camera scale (used by wheel & pinch clamp). */
 export const SCALE_MIN = 0.1;
 /** Maximum camera scale (used by wheel & pinch clamp). */
-export const SCALE_MAX = 5;
-
-/** Minimum card-scale factor at SCALE_MIN. */
-const CARD_SCALE_MIN = 0.5;
+export const SCALE_MAX = 1;
 
 /**
  * Dot final size in pixels — derived from MORPH_KEYFRAMES t=0.3.
@@ -96,21 +93,6 @@ const CARD_SCALE_MIN = 0.5;
  * so that scaled elements never shrink below the dot size.
  */
 export const DOT_FINAL_SIZE = 10; // sync: MORPH_KEYFRAMES[2].width/height
-
-/**
- * Compute a continuous card-scale factor from camera scale.
- * Linearly maps [SCALE_MIN, SCALE_MAX] → [0.5, 1.0] (clamped).
- * Applied to pill/card phases only — dots stay at fixed pixel size.
- */
-export function getCardScale(scale: number): number {
-	return Math.max(
-		CARD_SCALE_MIN,
-		Math.min(
-			1,
-			CARD_SCALE_MIN + (1 - CARD_SCALE_MIN) * ((scale - SCALE_MIN) / (SCALE_MAX - SCALE_MIN)),
-		),
-	);
-}
 
 /**
  * Map an effective scale (fisheye localScale) to a continuous morph factor `t` in [0, 1].
@@ -257,7 +239,7 @@ export const MORPH_KEYFRAMES: readonly MorphKeyframe[] = [
 		height: -1,
 		borderRadius: 4,
 		titleOpacity: 1,
-		titleFontSize: 14,
+		titleFontSize: 11,
 		cardBlend: 1,
 		opacity: 1,
 	},

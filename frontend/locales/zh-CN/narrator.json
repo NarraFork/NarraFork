@@ -34,6 +34,7 @@
 	"suggesting": "思考中...",
 	"suggestFailed": "建议答案失败",
 	"untitled": "未命名",
+	"editTitle": "编辑标题",
 	"generateTitle": "生成标题",
 	"scrollToBottom": "滚动到底部",
 	"scrollToBottomWithCount": "滚动到底部（{{count}} 条新消息）",

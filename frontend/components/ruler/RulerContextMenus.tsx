@@ -68,6 +68,7 @@ export function TickContextMenu({
 				userSelect: "none",
 			}}
 			onClick={(e) => e.stopPropagation()}
+			onPointerDown={(e) => e.stopPropagation()}
 		>
 			{/* Commit info header */}
 			<Box px={8} py={4}>
@@ -173,6 +174,7 @@ export function ChapterContextMenu({
 				userSelect: "none",
 			}}
 			onClick={(e) => e.stopPropagation()}
+			onPointerDown={(e) => e.stopPropagation()}
 		>
 			<Box px={8} py={4}>
 				<Text size="xs" fw={500} truncate style={{ maxWidth: 200 }}>
