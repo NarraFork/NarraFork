@@ -190,6 +190,13 @@ const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: s
 const pendingPlanCompact = hotSafe<Set<string>>("narrafork.pendingPlanCompact", () => new Set());
 
 // Buffered message queue — keyed by narratorId, supports multiple queued messages
+export interface BufferCreator {
+	id: string;
+	username: string;
+	avatarColor?: string | null;
+	avatarImageId?: string | null;
+}
+
 interface BufferedMessage {
 	id: string;
 	text: string;
@@ -197,6 +204,7 @@ interface BufferedMessage {
 	bufferedAt: string;
 	commandText?: string | null;
 	createdBy?: string | null;
+	creator?: BufferCreator | null;
 }
 const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 	"narrafork.bufferedMessages",
@@ -3746,6 +3754,7 @@ export function pushBufferedMessage(
 	images?: ImageRef[],
 	commandText?: string | null,
 	createdBy?: string | null,
+	creator?: BufferCreator | null,
 ): { ok: boolean; bufferedAt: string; id: string } {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
@@ -3753,7 +3762,7 @@ export function pushBufferedMessage(
 	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
 	const queue = bufferedMessages.get(narratorId) ?? [];
-	queue.push({ id, text, images, bufferedAt, commandText, createdBy });
+	queue.push({ id, text, images, bufferedAt, commandText, createdBy, creator });
 	bufferedMessages.set(narratorId, queue);
 	return { ok: true, bufferedAt, id };
 }
@@ -3798,13 +3807,20 @@ export function getBufferedMessages(narratorId: string): BufferedMessage[] {
 
 /** Project a buffer queue to the minimal shape needed for WS broadcast / REST responses. */
 export function toBufferSummary(
-	msgs: readonly Pick<BufferedMessage, "id" | "text" | "bufferedAt" | "images">[],
-): Array<{ id: string; text: string; bufferedAt: string; imageCount: number }> {
+	msgs: readonly Pick<BufferedMessage, "id" | "text" | "bufferedAt" | "images" | "creator">[],
+): Array<{
+	id: string;
+	text: string;
+	bufferedAt: string;
+	imageCount: number;
+	creator?: BufferCreator | null;
+}> {
 	return msgs.map((m) => ({
 		id: m.id,
 		text: m.text,
 		bufferedAt: m.bufferedAt,
 		imageCount: m.images?.length ?? 0,
+		creator: m.creator ?? null,
 	}));
 }
 

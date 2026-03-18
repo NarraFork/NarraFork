@@ -1,5 +1,5 @@
 import { Anchor, Blockquote, Code, Divider, List, Table, Text, Title } from "@mantine/core";
-import { memo, type ReactNode, useMemo } from "react";
+import { Component, memo, type ReactNode, useMemo } from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -207,7 +207,37 @@ function heading({ children, node }: any) {
 	);
 }
 
-const remarkPlugins = [remarkGfm];
+/**
+ * Detect whether the browser supports RegExp lookbehind assertions.
+ * `mdast-util-gfm-autolink-literal` (used by remark-gfm) relies on lookbehind
+ * which throws in Safari < 16.4 / older iOS WebKit.  When unsupported we skip
+ * remark-gfm entirely and fall back to plain react-markdown.
+ */
+const supportsLookbehind = (() => {
+	try {
+		// biome-ignore lint/complexity/useRegexLiterals: must use constructor so unsupported syntax is caught at runtime
+		new RegExp("(?<=a)b");
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
+const remarkPlugins = supportsLookbehind ? [remarkGfm] : [];
+
+/** Thin error boundary so a remark-gfm regex crash doesn't blank the chat. */
+class MarkdownErrorBoundary extends Component<
+	{ fallback: ReactNode; children: ReactNode },
+	{ hasError: boolean }
+> {
+	state = { hasError: false };
+	static getDerivedStateFromError() {
+		return { hasError: true };
+	}
+	render() {
+		return this.state.hasError ? this.props.fallback : this.props.children;
+	}
+}
 
 interface MarkdownContentProps {
 	text: string;
@@ -233,11 +263,22 @@ export const MarkdownContent = memo(function MarkdownContent({
 		);
 	}
 
+	const plainFallback = (
+		<Text
+			size="sm"
+			style={wordWrap ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre", overflowX: "auto" }}
+		>
+			{trimmed}
+		</Text>
+	);
+
 	return (
-		<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-			<Markdown remarkPlugins={remarkPlugins} components={mdComponents}>
-				{trimmed}
-			</Markdown>
-		</div>
+		<MarkdownErrorBoundary fallback={plainFallback}>
+			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+				<Markdown remarkPlugins={remarkPlugins} components={mdComponents}>
+					{trimmed}
+				</Markdown>
+			</div>
+		</MarkdownErrorBoundary>
 	);
 });

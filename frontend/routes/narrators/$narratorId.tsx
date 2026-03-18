@@ -142,26 +142,20 @@ function NarratorDetailPage() {
 
 	// Desktop terminal panel visibility — restore from localStorage if a running terminal exists
 	const [terminalOpen, setTerminalOpen] = useState(false);
-	const initializedRef = useRef(false);
+	const initializedForRef = useRef<string | null>(null);
 
 	useEffect(() => {
-		if (initializedRef.current) return;
+		if (initializedForRef.current === narratorId) return;
 		const saved = localStorage.getItem(terminalStorageKey(narratorId));
 		if (saved === "true" && hasRunningTerminal) {
 			setTerminalOpen(true);
-			initializedRef.current = true;
+			initializedForRef.current = narratorId;
 		} else if (existingTerminals !== undefined) {
-			// Data loaded but no saved state or no running terminal
-			initializedRef.current = true;
+			// Data loaded but no saved state or no running terminal — reset panel
+			setTerminalOpen(saved === "true" && hasRunningTerminal);
+			initializedForRef.current = narratorId;
 		}
 	}, [narratorId, hasRunningTerminal, existingTerminals]);
-
-	// Close terminal panel on unmount (navigating away)
-	useEffect(() => {
-		return () => {
-			localStorage.removeItem(terminalStorageKey(narratorId));
-		};
-	}, [narratorId]);
 
 	// Terminal width for desktop (as ratio of container)
 	const [terminalRatio, setTerminalRatio] = useState(DEFAULT_TERMINAL_RATIO);

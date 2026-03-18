@@ -33,6 +33,7 @@ import {
 	narratorWhitelistDirs,
 	projects,
 	terminals,
+	users,
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -76,6 +77,7 @@ import { handleLoadToolCommand, narratorService } from "../services/narrator-ser
 import {
 	clearBufferedMessages,
 	closeNarrator,
+	type BufferCreator,
 	continueNarrator,
 	editAndRegenerate,
 	getBufferedMessages,
@@ -425,12 +427,25 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		}
 
 		// Primary narrator: push onto buffer queue
+		const user = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+		});
+		const creator: BufferCreator | null = user
+			? {
+					id: user.id,
+					username: user.username,
+					avatarColor: user.avatarColor,
+					avatarImageId: user.avatarImageId,
+				}
+			: null;
 		const result = pushBufferedMessage(
 			id,
 			finalMessage,
 			images.length > 0 ? images : undefined,
 			commandText,
 			userId,
+			creator,
 		);
 		if (result.ok) {
 			const messages = toBufferSummary(getBufferedMessages(id));

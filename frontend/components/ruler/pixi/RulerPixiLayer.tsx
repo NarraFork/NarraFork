@@ -54,6 +54,9 @@ export interface PixiChapterInfo {
 	layoutY: number;
 	/** The segment's main-axis world position */
 	segMainPos: number;
+	/** Panel dimensions (set when narrator panel is open for this chapter) */
+	panelWidth?: number;
+	panelHeight?: number;
 }
 
 interface Camera {
@@ -74,6 +77,10 @@ export interface CardHitRect {
 	height: number;
 	layoutX: number;
 	layoutY: number;
+	/** Fisheye local scale at this chapter's main-axis position */
+	localScale: number;
+	/** Morph factor t ∈ [0, 1] — used by DOM panel to compute cardBlend for cross-fade */
+	morphT: number;
 }
 
 export interface RulerPixiHandle {
@@ -723,7 +730,21 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 		for (const ch of merged) {
 			const chWorldMain = ch.segMainPos + ch.layoutX;
-			const ls = getLocalScale(chWorldMain);
+			// For chapters with an open panel, compute localScale at both the
+			// near edge and far edge of the panel along the main axis, then
+			// pick the higher value (closer to viewport center). This prevents
+			// large panels from shrinking prematurely when only one edge enters
+			// the fisheye periphery.
+			let ls: number;
+			const hasPanel = d.openPanelChapterIds?.has(ch.id);
+			if (hasPanel && ch.panelWidth) {
+				const panelWorldSize = ch.panelWidth / cam.scale;
+				const lsNear = getLocalScale(chWorldMain);
+				const lsFar = getLocalScale(chWorldMain + panelWorldSize);
+				ls = Math.max(lsNear, lsFar);
+			} else {
+				ls = getLocalScale(chWorldMain);
+			}
 
 			// Morph factor is the minimum of two independent factors:
 			// 1) Global zoom level — what morph phase the camera scale alone warrants
@@ -741,10 +762,30 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 			const morph = getMorphStyle(t, NODE_WIDTH, NODE_HEIGHT);
 
+			// --- Panel morph schedule ---
+			// When a panel is open, skip the pill phase entirely: the panel
+			// shrinks continuously from its CSS size down to dot size, then
+			// disappears and the PixiJS dot takes over.
+			//   t > DOT (0.3)  → panel visible (shrinking), PixiJS skipped
+			//   t ≤ DOT        → panel gone, PixiJS draws the dot
+			const panelVisible = hasPanel && t > MORPH_T_DOT;
+
+			// For chapters with an open panel, blend draw size from panel CSS
+			// dimensions down to dot size as t decreases toward MORPH_T_DOT.
+			let drawW = morph.width;
+			let drawH = morph.height;
+			if (panelVisible && ch.panelWidth && ch.panelHeight) {
+				// Map t from [DOT..1] → blend [0..1] (0 = dot size, 1 = panel size)
+				const blend = (t - MORPH_T_DOT) / (1 - MORPH_T_DOT);
+				const dotMorph = getMorphStyle(MORPH_T_DOT, NODE_WIDTH, NODE_HEIGHT);
+				drawW = dotMorph.width + blend * (ch.panelWidth - dotMorph.width);
+				drawH = dotMorph.height + blend * (ch.panelHeight - dotMorph.height);
+			}
+
 			// Apply cardScale to pill/card phases, keep dots at fixed size.
 			const isDot = t <= MORPH_T_DOT;
-			const scaledW = isDot ? morph.width : Math.max(DOT_FINAL_SIZE, morph.width * cardScale);
-			const scaledH = isDot ? morph.height : Math.max(DOT_FINAL_SIZE, morph.height * cardScale);
+			const scaledW = isDot ? drawW : Math.max(DOT_FINAL_SIZE, drawW * cardScale);
+			const scaledH = isDot ? drawH : Math.max(DOT_FINAL_SIZE, drawH * cardScale);
 
 			// Fixed anchor — start edge of the layout slot for all morph phases.
 			// Dot/pill/card all grow from this point toward the end of the main axis,
@@ -757,8 +798,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const elemScreenCross = crossBase + (ch.layoutY + CARD_TOP_OFFSET) * cam.scale + crossPan;
 			const elemScreenCenterCross = elemScreenCross + scaledH / 2;
 
-			const hasPanel = d.openPanelChapterIds?.has(ch.id);
-
 			// --- Draw unified chapter node (single path: dot → pill → card) ---
 			// Card visual dimensions stay the same regardless of orientation —
 			// only the position axes swap. morph.width is always the card's
@@ -769,8 +808,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const nodeLeft = isH ? elemScreenLeft : elemScreenCross;
 			const nodeTop = isH ? elemScreenCross : elemScreenLeft;
 
-			// Always track hit rects for card-like chapters (panels need them for positioning)
-			if (morph.cardBlend > 0) {
+			// Track hit rects for card-like chapters AND chapters with open panels.
+			// Panels need hit rects for positioning even when cardBlend has dropped to 0.
+			if (morph.cardBlend > 0 || hasPanel) {
 				cardHitRects.push({
 					id: ch.id,
 					narratorId: ch.narratorId,
@@ -781,10 +821,16 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					height: screenH,
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
+					localScale: ls,
+					morphT: t,
 				});
 			}
 
-			if (!hasPanel) {
+			// Skip PixiJS draw while the panel is visible (t > DOT).
+			// Once t ≤ DOT the panel disappears and PixiJS draws the dot.
+			const skipDraw = panelVisible;
+
+			if (!skipDraw) {
 				const screenMorph = { ...morph, width: screenW, height: screenH };
 				const isCard = morph.cardBlend > 0;
 
@@ -806,9 +852,9 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				);
 
 				// --- Chapter title text (unified for pill + card phases) ---
-				if (morph.titleOpacity > 0 && screenW > 30) {
-					const cb = morph.cardBlend;
-					const titleFontSize = morph.titleFontSize;
+				if (screenMorph.titleOpacity > 0 && screenW > 30) {
+					const cb = screenMorph.cardBlend;
+					const titleFontSize = screenMorph.titleFontSize;
 					// Blend fill color: dimmed (pill) → cardText (card)
 					const titleFill = cb > 0.5 ? theme.cardText : theme.dimmed;
 					const titleWeight = cb > 0.5 ? "600" : "normal";
@@ -836,7 +882,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 					if (labelPool) {
 						const titleLabel = labelPool.acquire(sc.chapterTitleStyle);
 						titleLabel.text = title;
-						titleLabel.alpha = morph.opacity * morph.titleOpacity;
+						titleLabel.alpha = screenMorph.opacity * screenMorph.titleOpacity;
 						titleLabel.scale.set(1);
 						titleLabel.position.set(nodeLeft + 8 * cardScale, nodeTop + 6 * cardScale);
 
@@ -860,11 +906,11 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 							const dotR = 3 * cardScale;
 							targetGfx
 								.circle(nodeLeft + 12 * cardScale, dotY + 4 * cardScale, dotR)
-								.fill({ color: statusColor, alpha: morph.opacity * detailAlpha });
+								.fill({ color: statusColor, alpha: screenMorph.opacity * detailAlpha });
 
 							const statusLabel = labelPool.acquire(sc.cardBadgeStyle);
 							statusLabel.text = ch.status;
-							statusLabel.alpha = morph.opacity * 0.8 * detailAlpha;
+							statusLabel.alpha = screenMorph.opacity * 0.8 * detailAlpha;
 							statusLabel.scale.set(1);
 							statusLabel.position.set(nodeLeft + 18 * cardScale, dotY);
 
@@ -878,10 +924,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 									10 * cardScale;
 								targetGfx
 									.circle(nsX, dotY + 4 * cardScale, 2.5 * cardScale)
-									.fill({ color: nsColor, alpha: morph.opacity * detailAlpha });
+									.fill({ color: nsColor, alpha: screenMorph.opacity * detailAlpha });
 								const nsLabel = labelPool.acquire(sc.cardBadgeStyle);
 								nsLabel.text = ch.narratorStatus;
-								nsLabel.alpha = morph.opacity * 0.6 * detailAlpha;
+								nsLabel.alpha = screenMorph.opacity * 0.6 * detailAlpha;
 								nsLabel.scale.set(1);
 								nsLabel.position.set(nsX + 6 * cardScale, dotY);
 							}
@@ -898,7 +944,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 									(ch.branch?.length ?? 0) > maxBranchChars
 										? `${ch.branch.slice(0, maxBranchChars)}…`
 										: (ch.branch ?? "");
-								branchLabel.alpha = morph.opacity * 0.5 * branchAlpha;
+								branchLabel.alpha = screenMorph.opacity * 0.5 * branchAlpha;
 								branchLabel.scale.set(1);
 								branchLabel.position.set(nodeLeft + 8 * cardScale, nodeTop + 40 * cardScale);
 							}

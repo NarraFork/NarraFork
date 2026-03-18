@@ -141,11 +141,19 @@ export interface BlacklistCmd {
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 
+export interface BufferCreator {
+	id: string;
+	username: string;
+	avatarColor?: string | null;
+	avatarImageId?: string | null;
+}
+
 export interface BufferMessageSummary {
 	id: string;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;
+	creator?: BufferCreator | null;
 }
 
 export interface TreeMessage {

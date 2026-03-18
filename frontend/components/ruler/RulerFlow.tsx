@@ -31,7 +31,14 @@ import {
 	type RulerEdge,
 	type RulerOrientation,
 } from "./types";
-import { getCardScale, getZoomTierInfo, SCALE_MAX, SCALE_MIN, type ZoomTierId } from "./zoom-tiers";
+import {
+	getCardScale,
+	getZoomTierInfo,
+	MORPH_T_DOT,
+	SCALE_MAX,
+	SCALE_MIN,
+	type ZoomTierId,
+} from "./zoom-tiers";
 
 interface RulerFlowProps {
 	projectId: string;
@@ -262,13 +269,21 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const cRect = cEl?.getBoundingClientRect();
 			const ox = cRect?.left ?? 0;
 			const oy = cRect?.top ?? 0;
-			const ps = getCardScale(cam.scale);
 			for (const [chId, div] of panelEls) {
 				const hr = hitRects.find((r) => r.id === chId);
 				if (hr) {
 					div.style.left = `${ox + hr.screenX}px`;
 					div.style.top = `${oy + hr.screenY}px`;
-					div.style.transform = `scale(${ps})`;
+					// Panel scale = hitRect size / panel CSS size.
+					// The hitRect blends between panel and dot dimensions as t
+					// decreases, so the panel shrinks in lockstep.
+					const panelCSSW = Number(div.dataset.panelW) || 420;
+					const panelScale = hr.width / panelCSSW;
+					div.style.transform = `scale(${panelScale})`;
+					// Panel visible at full opacity while t > DOT; hidden once t ≤ DOT.
+					const visible = hr.morphT > MORPH_T_DOT;
+					div.style.opacity = visible ? "1" : "0";
+					div.style.pointerEvents = visible ? "auto" : "none";
 				}
 			}
 		}
@@ -2018,6 +2033,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const chapters = pixiChaptersMapRef.current.get(tick.sha);
 			if (!chapters) continue;
 			for (const ch of chapters) {
+				const ps = panelSizes.get(ch.id);
 				result.push({
 					id: ch.id,
 					status: ch.status,
@@ -2031,11 +2047,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
 					segMainPos: tick.x,
+					panelWidth: ps?.w,
+					panelHeight: ps?.h,
 				});
 			}
 		}
 		return result;
-	}, [segmentTicks, pixiChaptersTick]);
+	}, [segmentTicks, pixiChaptersTick, panelSizes]);
 
 	// Always-visible active chapters for L0 dot rendering.
 	// Uses activeChapters from the main ruler query (no segment fetch needed).
@@ -2070,11 +2088,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					layoutX: hasOffset ? ch.axisOffset : 20 + (i % 3) * (NODE_WIDTH + NODE_GAP),
 					layoutY: hasOffset ? ch.crossOffset : 20 + Math.floor(i / 3) * (NODE_HEIGHT + NODE_GAP),
 					segMainPos,
+					panelWidth: panelSizes.get(ch.id)?.w,
+					panelHeight: panelSizes.get(ch.id)?.h,
 				});
 			}
 		}
 		return result;
-	}, [rulerData.activeChapters, tickPositions]);
+	}, [rulerData.activeChapters, tickPositions, panelSizes]);
 
 	if (isLoading) {
 		return (
@@ -2483,6 +2503,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						width={panelSizes.get(chId)?.w ?? DEFAULT_PANEL_WIDTH}
 						height={panelSizes.get(chId)?.h ?? DEFAULT_PANEL_HEIGHT}
 						scale={scale}
+						localScale={hr.localScale}
 						onClose={() => {
 							setOpenPanelChapterIds((prev) => {
 								const next = new Set(prev);
@@ -2530,7 +2551,8 @@ function NarratorPanelOverlay({
 	screenY,
 	width: panelW,
 	height: panelH,
-	scale,
+	scale: _scale,
+	localScale: fisheyeLocalScale,
 	onClose,
 	onResizeEnd,
 	panelRef,
@@ -2541,7 +2563,10 @@ function NarratorPanelOverlay({
 	screenY: number;
 	width: number;
 	height: number;
+	/** Camera scale — used for resize screen-to-world math */
 	scale: number;
+	/** Fisheye local scale at this chapter's position — used for visual panel scaling */
+	localScale: number;
 	onClose: () => void;
 	onResizeEnd: (newW: number, newH: number) => void;
 	panelRef?: (el: HTMLDivElement | null) => void;
@@ -2557,8 +2582,8 @@ function NarratorPanelOverlay({
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
 
-	// Panel scales with camera zoom — shared formula from zoom-tiers
-	const panelScale = getCardScale(scale);
+	// Panel scales with fisheye local scale — shrinks at viewport edges
+	const panelScale = getCardScale(fisheyeLocalScale);
 
 	// Prevent wheel events inside the panel from bubbling
 	useEffect(() => {
@@ -2653,6 +2678,8 @@ function NarratorPanelOverlay({
 			padding={6}
 			radius="sm"
 			withBorder
+			data-panel-w={displayW}
+			data-panel-h={displayH}
 			style={{
 				position: "fixed",
 				left: screenX + resizeDelta.dx,

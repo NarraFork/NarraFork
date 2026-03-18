@@ -202,15 +202,19 @@ function useTokenMap(
 		codeToTokens(sourceText, {
 			lang: effectiveLang as BundledLanguage,
 			theme,
-		}).then((result) => {
-			if (cancelled) return;
-			const map: TokenMap = new Map();
-			for (let i = 0; i < result.tokens.length && i < lines.length; i++) {
-				// Key by index to handle duplicate lines correctly
-				map.set(String(i), result.tokens[i]);
-			}
-			setTokenMap(map);
-		});
+		})
+			.then((result) => {
+				if (cancelled) return;
+				const map: TokenMap = new Map();
+				for (let i = 0; i < result.tokens.length && i < lines.length; i++) {
+					// Key by index to handle duplicate lines correctly
+					map.set(String(i), result.tokens[i]);
+				}
+				setTokenMap(map);
+			})
+			.catch(() => {
+				if (!cancelled) setTokenMap(null);
+			});
 
 		return () => {
 			cancelled = true;

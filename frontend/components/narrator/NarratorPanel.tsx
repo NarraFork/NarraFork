@@ -2409,11 +2409,18 @@ export function NarratorPanel({
 										<Text size="xs" c="dimmed" w={16} ta="center">
 											{index + 1}
 										</Text>
-										<Loader
-											size={14}
-											color="blue"
-											style={{ visibility: index === 0 ? "visible" : "hidden" }}
-										/>
+										{msg.creator ? (
+											<UserAvatar
+												username={msg.creator.username}
+												avatarColor={msg.creator.avatarColor}
+												avatarImageId={msg.creator.avatarImageId}
+												userId={msg.creator.id}
+												size={16}
+												showTooltip={false}
+											/>
+										) : (
+											<Box w={16} h={16} style={{ flexShrink: 0 }} />
+										)}
 										<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
 											{index === 0 ? `${t("bufferedMessage")}: ` : ""}
 											{msg.text}
