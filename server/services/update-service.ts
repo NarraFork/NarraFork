@@ -8,12 +8,15 @@ import {
 	createWriteStream,
 	existsSync,
 	mkdirSync,
+	readFileSync,
 	renameSync,
 	unlinkSync,
+	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+	applyZstdPatch,
 	type Blockmap,
 	calculateDiff,
 	calculateDiffSize,
@@ -23,6 +26,7 @@ import {
 	generateBlockmap,
 	parseBlockmapBuffer,
 	writeBlockmapFile,
+	type ZstdPatchMeta,
 } from "../lib/blockmap";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
@@ -50,6 +54,8 @@ export interface UpdateCheckResult {
 	totalSize?: number;
 	diffBlocks?: number;
 	totalBlocks?: number;
+	/** Size of zstd dictionary patch if available (smaller than blockmap diff) */
+	zstdPatchSize?: number;
 }
 
 export interface UpdateProgress {
@@ -164,33 +170,56 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 		let totalSize: number | undefined;
 		let diffBlocks: number | undefined;
 		let totalBlocks: number | undefined;
+		let zstdPatchSize: number | undefined;
 
 		const execPath = getCurrentExecutablePath();
 		if (execPath) {
-			try {
-				// Download new blockmap
-				const blockmapUrl = `${serverUrl}/${channel}/${releaseInfo.path}.blockmap`;
-				const blockmapResponse = await fetch(blockmapUrl);
-				if (blockmapResponse.ok) {
-					const blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
-					const newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
+			// Run blockmap diff and zstd meta check in parallel
+			const blockmapPromise = (async () => {
+				try {
+					const blockmapUrl = `${serverUrl}/${channel}/${releaseInfo.path}.blockmap`;
+					const blockmapResponse = await fetch(blockmapUrl);
+					if (blockmapResponse.ok) {
+						const blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
+						const newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
 
-					// Generate local blockmap
-					const localResult = await generateBlockmap(execPath);
-					const localBlockmap = localResult.blockmap;
+						const localResult = await generateBlockmap(execPath);
+						const localBlockmap = localResult.blockmap;
 
-					// Calculate diff
-					const diff = calculateDiff(localBlockmap, newBlockmap);
-					downloadSize = calculateDiffSize(diff);
-					totalSize = calculateTotalSize(newBlockmap);
-					diffBlocks = diff.length;
-					totalBlocks = newBlockmap.files[0]?.checksums.length ?? 0;
+						const diff = calculateDiff(localBlockmap, newBlockmap);
+						downloadSize = calculateDiffSize(diff);
+						totalSize = calculateTotalSize(newBlockmap);
+						diffBlocks = diff.length;
+						totalBlocks = newBlockmap.files[0]?.checksums.length ?? 0;
+					}
+				} catch (err) {
+					logger.debug("Failed to calculate diff size", { error: String(err) });
+					totalSize = releaseInfo.files[0]?.size;
+					downloadSize = totalSize;
 				}
-			} catch (err) {
-				logger.debug("Failed to calculate diff size", { error: String(err) });
-				// Fall back to full download size
-				totalSize = releaseInfo.files[0]?.size;
-				downloadSize = totalSize;
+			})();
+
+			const zstdPromise = (async () => {
+				try {
+					const zstdMetaUrl = buildZstdPatchMetaUrl(serverUrl, channel, product, releaseInfo.path);
+					const metaResp = await fetch(zstdMetaUrl);
+					if (metaResp.ok) {
+						const meta = (await metaResp.json()) as ZstdPatchMeta;
+						// Only count if the patch is from our current version
+						if (meta.fromVersion === APP_VERSION) {
+							zstdPatchSize = meta.patchSize;
+						}
+					}
+				} catch {
+					// zstd patch not available, no problem
+				}
+			})();
+
+			await Promise.all([blockmapPromise, zstdPromise]);
+
+			// Use zstd patch size as the effective download size if smaller
+			if (zstdPatchSize && (!downloadSize || zstdPatchSize < downloadSize)) {
+				downloadSize = zstdPatchSize;
 			}
 		}
 
@@ -203,6 +232,7 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 			totalSize,
 			diffBlocks,
 			totalBlocks,
+			zstdPatchSize,
 		};
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
@@ -267,56 +297,101 @@ export async function downloadUpdate(
 		});
 
 		let useDelta = false;
+		let useZstdPatch = false;
 		let diff: DiffBlock[] = [];
 		let newBlockmap: Blockmap | null = null;
 		let localBlockmap: Blockmap | null = null;
+		let zstdPatchMeta: ZstdPatchMeta | null = null;
+		let zstdPatchBuf: Buffer | null = null;
 
 		// Try delta update if we have a local executable
 		if (execPath && existsSync(execPath)) {
+			// Strategy 1: zstd dictionary patch (smallest, ~4MB)
 			try {
-				// Download new blockmap
-				const blockmapUrl = `${downloadBaseUrl}/${releaseInfo.path}.blockmap`;
-				const blockmapResponse = await fetch(blockmapUrl);
+				const zstdMetaUrl = buildZstdPatchMetaUrl(serverUrl, channel, product, releaseInfo.path);
+				const metaResp = await fetch(zstdMetaUrl);
+				if (metaResp.ok) {
+					zstdPatchMeta = (await metaResp.json()) as ZstdPatchMeta;
 
-				// Fallback to legacy URL if new API fails
-				let blockmapBuffer: Buffer;
-				if (blockmapResponse.ok) {
-					blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
-				} else {
-					const legacyUrl = `${serverUrl}/${channel}/${releaseInfo.path}.blockmap`;
-					const legacyResponse = await fetch(legacyUrl);
-					if (!legacyResponse.ok) {
-						throw new Error("Blockmap not available");
+					// Only use if the patch is from our current version
+					if (zstdPatchMeta.fromVersion === APP_VERSION) {
+						const zstdPatchUrl = buildZstdPatchUrl(serverUrl, channel, product, releaseInfo.path);
+						const patchResp = await fetch(zstdPatchUrl);
+						if (patchResp.ok) {
+							zstdPatchBuf = Buffer.from(await patchResp.arrayBuffer());
+							useZstdPatch = true;
+							onProgress?.({
+								phase: "downloading",
+								bytesDownloaded: zstdPatchBuf.length,
+								totalBytes: zstdPatchBuf.length,
+								percent: 100,
+							});
+							logger.info("Using zstd dictionary patch", {
+								fromVersion: zstdPatchMeta.fromVersion,
+								toVersion: zstdPatchMeta.toVersion,
+								patchSize: zstdPatchBuf.length,
+								totalSize: zstdPatchMeta.newFileSize,
+								savings: `${Math.round((1 - zstdPatchBuf.length / zstdPatchMeta.newFileSize) * 100)}%`,
+							});
+						}
+					} else {
+						logger.debug("Zstd patch version mismatch", {
+							patchFrom: zstdPatchMeta.fromVersion,
+							current: APP_VERSION,
+						});
 					}
-					blockmapBuffer = Buffer.from(await legacyResponse.arrayBuffer());
-				}
-
-				newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
-
-				// Generate local blockmap
-				const localResult = await generateBlockmap(execPath);
-				localBlockmap = localResult.blockmap;
-
-				// Calculate diff
-				diff = calculateDiff(localBlockmap, newBlockmap);
-				const diffSize = calculateDiffSize(diff);
-				const totalSize = calculateTotalSize(newBlockmap);
-
-				// Use delta if it saves at least 20% of download
-				if (diffSize < totalSize * 0.8) {
-					useDelta = true;
-					logger.info("Using delta update", {
-						diffBlocks: diff.length,
-						totalBlocks: newBlockmap.files[0]?.checksums.length,
-						diffSize,
-						totalSize,
-						savings: `${Math.round((1 - diffSize / totalSize) * 100)}%`,
-					});
 				}
 			} catch (err) {
-				logger.debug("Delta update not available, falling back to full download", {
-					error: String(err),
-				});
+				logger.debug("Zstd patch not available", { error: String(err) });
+			}
+
+			// Strategy 2: blockmap delta (fallback, ~17MB)
+			if (!useZstdPatch) {
+				try {
+					// Download new blockmap
+					const blockmapUrl = `${downloadBaseUrl}/${releaseInfo.path}.blockmap`;
+					const blockmapResponse = await fetch(blockmapUrl);
+
+					// Fallback to legacy URL if new API fails
+					let blockmapBuffer: Buffer;
+					if (blockmapResponse.ok) {
+						blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
+					} else {
+						const legacyUrl = `${serverUrl}/${channel}/${releaseInfo.path}.blockmap`;
+						const legacyResponse = await fetch(legacyUrl);
+						if (!legacyResponse.ok) {
+							throw new Error("Blockmap not available");
+						}
+						blockmapBuffer = Buffer.from(await legacyResponse.arrayBuffer());
+					}
+
+					newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
+
+					// Generate local blockmap
+					const localResult = await generateBlockmap(execPath);
+					localBlockmap = localResult.blockmap;
+
+					// Calculate diff
+					diff = calculateDiff(localBlockmap, newBlockmap);
+					const diffSize = calculateDiffSize(diff);
+					const totalSize = calculateTotalSize(newBlockmap);
+
+					// Use delta if it saves at least 20% of download
+					if (diffSize < totalSize * 0.8) {
+						useDelta = true;
+						logger.info("Using blockmap delta update", {
+							diffBlocks: diff.length,
+							totalBlocks: newBlockmap.files[0]?.checksums.length,
+							diffSize,
+							totalSize,
+							savings: `${Math.round((1 - diffSize / totalSize) * 100)}%`,
+						});
+					}
+				} catch (err) {
+					logger.debug("Delta update not available, falling back to full download", {
+						error: String(err),
+					});
+				}
 			}
 		}
 
@@ -324,26 +399,64 @@ export async function downloadUpdate(
 		const fileDownloadUrl = `${downloadBaseUrl}/${releaseInfo.path}`;
 		const legacyFileUrl = `${serverUrl}/${channel}/${releaseInfo.path}`;
 
-		if (useDelta && newBlockmap && localBlockmap && diff.length > 0 && execPath) {
-			// Delta download
-			await downloadDelta(
-				execPath,
-				fileDownloadUrl,
-				tempPath,
-				localBlockmap,
-				newBlockmap,
-				diff,
-				onProgress,
-			);
-		} else {
-			// Full download - try new API first, fallback to legacy
-			await downloadFull(
-				fileDownloadUrl,
-				tempPath,
-				releaseInfo.files[0]?.size ?? 0,
-				onProgress,
-				legacyFileUrl,
-			);
+		if (useZstdPatch && zstdPatchBuf && zstdPatchMeta && execPath) {
+			// Zstd dictionary patch — read local binary, apply patch, write result
+			try {
+				const oldBuf = readFileSync(execPath);
+
+				onProgress?.({
+					phase: "applying",
+					bytesDownloaded: zstdPatchBuf.length,
+					totalBytes: zstdPatchMeta.newFileSize,
+					percent: 50,
+				});
+
+				// applyZstdPatch verifies SHA512 internally
+				const newBuf = applyZstdPatch(oldBuf, zstdPatchBuf, zstdPatchMeta);
+				writeFileSync(tempPath, newBuf);
+
+				onProgress?.({
+					phase: "applying",
+					bytesDownloaded: zstdPatchBuf.length,
+					totalBytes: zstdPatchMeta.newFileSize,
+					percent: 100,
+				});
+
+				logger.info("Zstd patch applied successfully", {
+					patchSize: zstdPatchBuf.length,
+					resultSize: newBuf.length,
+				});
+			} catch (err) {
+				logger.warn("Zstd patch failed, falling back to full download", {
+					error: String(err),
+				});
+				// Fall through to blockmap or full download
+				useZstdPatch = false;
+			}
+		}
+
+		if (!useZstdPatch) {
+			if (useDelta && newBlockmap && localBlockmap && diff.length > 0 && execPath) {
+				// Blockmap delta download
+				await downloadDelta(
+					execPath,
+					fileDownloadUrl,
+					tempPath,
+					localBlockmap,
+					newBlockmap,
+					diff,
+					onProgress,
+				);
+			} else {
+				// Full download - try new API first, fallback to legacy
+				await downloadFull(
+					fileDownloadUrl,
+					tempPath,
+					releaseInfo.files[0]?.size ?? 0,
+					onProgress,
+					legacyFileUrl,
+				);
+			}
 		}
 
 		// Verify SHA512
@@ -798,4 +911,38 @@ export async function applyUpdateAndRestart(): Promise<{ success: boolean; error
 	}
 
 	return { success: false, error: "Failed to request restart" };
+}
+
+// ============================================================================
+// Zstd patch URL helpers
+// ============================================================================
+
+/**
+ * Build URL for the zstd patch metadata JSON.
+ */
+function buildZstdPatchMetaUrl(
+	serverUrl: string,
+	channel: string,
+	product: string,
+	releasePath: string,
+): string {
+	if (serverUrl.includes("/api/v1/")) {
+		return `${serverUrl}/download/${channel}/${releasePath}.zstd-patch.meta.json`;
+	}
+	return `${serverUrl}/api/v1/${product}/download/${channel}/${releasePath}.zstd-patch.meta.json`;
+}
+
+/**
+ * Build URL for the zstd patch binary.
+ */
+function buildZstdPatchUrl(
+	serverUrl: string,
+	channel: string,
+	product: string,
+	releasePath: string,
+): string {
+	if (serverUrl.includes("/api/v1/")) {
+		return `${serverUrl}/download/${channel}/${releasePath}.zstd-patch`;
+	}
+	return `${serverUrl}/api/v1/${product}/download/${channel}/${releasePath}.zstd-patch`;
 }

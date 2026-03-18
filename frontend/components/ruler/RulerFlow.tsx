@@ -272,14 +272,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			for (const [chId, div] of panelEls) {
 				const hr = hitRects.find((r) => r.id === chId);
 				if (hr) {
-					div.style.left = `${ox + hr.screenX}px`;
-					div.style.top = `${oy + hr.screenY}px`;
-					// Panel scale = hitRect size / panel CSS size.
-					// The hitRect blends between panel and dot dimensions as t
-					// decreases, so the panel shrinks in lockstep.
-					const panelCSSW = Number(div.dataset.panelW) || 420;
-					const panelScale = hr.width / panelCSSW;
-					div.style.transform = `scale(${panelScale})`;
+					// Skip transform updates while the panel is being resized —
+					// the resize handler manages dimensions directly and the
+					// hitRect hasn't caught up with the in-progress size yet.
+					const isResizing = div.dataset.resizing === "1";
+					if (!isResizing) {
+						div.style.left = `${ox + hr.screenX}px`;
+						div.style.top = `${oy + hr.screenY}px`;
+						// Panel scale = hitRect size / panel CSS size.
+						// The hitRect blends between panel and dot dimensions as t
+						// decreases, so the panel shrinks in lockstep.
+						const panelCSSW = Number(div.dataset.panelW) || 420;
+						const panelScale = hr.width / panelCSSW;
+						div.style.transform = `scale(${panelScale})`;
+					}
 					// Panel visible at full opacity while t > DOT; hidden once t ≤ DOT.
 					const visible = hr.morphT > MORPH_T_DOT;
 					div.style.opacity = visible ? "1" : "0";
@@ -2034,6 +2040,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			if (!chapters) continue;
 			for (const ch of chapters) {
 				const ps = panelSizes.get(ch.id);
+				const hasPanel = openPanelChapterIds.has(ch.id);
 				result.push({
 					id: ch.id,
 					status: ch.status,
@@ -2047,13 +2054,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
 					segMainPos: tick.x,
-					panelWidth: ps?.w,
-					panelHeight: ps?.h,
+					panelWidth: ps?.w ?? (hasPanel ? DEFAULT_PANEL_WIDTH : undefined),
+					panelHeight: ps?.h ?? (hasPanel ? DEFAULT_PANEL_HEIGHT : undefined),
 				});
 			}
 		}
 		return result;
-	}, [segmentTicks, pixiChaptersTick, panelSizes]);
+	}, [segmentTicks, pixiChaptersTick, panelSizes, openPanelChapterIds]);
 
 	// Always-visible active chapters for L0 dot rendering.
 	// Uses activeChapters from the main ruler query (no segment fetch needed).
@@ -2088,13 +2095,17 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					layoutX: hasOffset ? ch.axisOffset : 20 + (i % 3) * (NODE_WIDTH + NODE_GAP),
 					layoutY: hasOffset ? ch.crossOffset : 20 + Math.floor(i / 3) * (NODE_HEIGHT + NODE_GAP),
 					segMainPos,
-					panelWidth: panelSizes.get(ch.id)?.w,
-					panelHeight: panelSizes.get(ch.id)?.h,
+					panelWidth:
+						panelSizes.get(ch.id)?.w ??
+						(openPanelChapterIds.has(ch.id) ? DEFAULT_PANEL_WIDTH : undefined),
+					panelHeight:
+						panelSizes.get(ch.id)?.h ??
+						(openPanelChapterIds.has(ch.id) ? DEFAULT_PANEL_HEIGHT : undefined),
 				});
 			}
 		}
 		return result;
-	}, [rulerData.activeChapters, tickPositions, panelSizes]);
+	}, [rulerData.activeChapters, tickPositions, panelSizes, openPanelChapterIds]);
 
 	if (isLoading) {
 		return (
@@ -2680,6 +2691,7 @@ function NarratorPanelOverlay({
 			withBorder
 			data-panel-w={displayW}
 			data-panel-h={displayH}
+			data-resizing={isCurrentlyResizing ? "1" : undefined}
 			style={{
 				position: "fixed",
 				left: screenX + resizeDelta.dx,

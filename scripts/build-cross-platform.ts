@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { join, relative } from "node:path";
 import { createGzip } from "node:zlib";
+import { generateZstdPatch, type ZstdPatchMeta } from "../server/lib/blockmap";
 
 const ROOT = join(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -389,6 +390,35 @@ for (const platform of selectedPlatforms) {
 		`✓ Blockmap: ${relative(ROOT, blockmapPath)} (${blockmapResult.blockmap.files[0].checksums.length} blocks)`,
 	);
 
+	// Step 8: Generate zstd dictionary patch against previous version
+	const prevBinary = findPreviousVersionBinary(platform.name, VERSION);
+	if (prevBinary) {
+		console.log(`→ Generating zstd patch from ${relative(ROOT, prevBinary.path)}...`);
+		try {
+			const oldBuf = readFileSync(prevBinary.path);
+			const newBuf = readFileSync(outfile);
+
+			const { patch, meta } = generateZstdPatch(oldBuf, newBuf, {
+				fromVersion: prevBinary.version,
+				toVersion: VERSION,
+			});
+
+			const patchPath = `${outfile}.zstd-patch`;
+			const metaPath = `${outfile}.zstd-patch.meta.json`;
+			writeFileSync(patchPath, patch);
+			writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
+			const savings = ((1 - patch.length / newBuf.length) * 100).toFixed(1);
+			console.log(
+				`✓ Zstd patch: ${relative(ROOT, patchPath)} (${(patch.length / 1024).toFixed(0)}KB, ${savings}% savings)`,
+			);
+		} catch (err) {
+			console.warn(`⚠ Zstd patch generation failed: ${err}`);
+		}
+	} else {
+		console.log("ℹ No previous version found for zstd patch generation");
+	}
+
 	// Write latest.yml for this platform
 	const latestYmlPath = join(DIST_DIR, getLatestYmlName(platform.target));
 	const latestYml = generateLatestYml({
@@ -419,4 +449,64 @@ if (needsCodesign.length > 0) {
 	for (const name of needsCodesign) {
 		console.log(`    xattr -cr dist/${name}`);
 	}
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Find the most recent previous version binary for the same platform in dist/.
+ * Returns null if no previous version exists.
+ */
+function findPreviousVersionBinary(
+	currentName: string,
+	currentVersion: string,
+): { path: string; version: string } | null {
+	// Extract platform suffix from name: "narrafork-0.0.17-linux-x64" → "linux-x64"
+	const versionedPrefix = `narrafork-${currentVersion}-`;
+	if (!currentName.startsWith(versionedPrefix)) return null;
+	const platformSuffix = currentName.slice(versionedPrefix.length);
+
+	// Scan dist/ for same-platform binaries with different versions
+	const candidates: { version: string; path: string }[] = [];
+	const pattern = new RegExp(
+		`^narrafork-(\\d+\\.\\d+\\.\\d+)-${platformSuffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+	);
+
+	for (const name of readdirSync(DIST_DIR)) {
+		const m = name.match(pattern);
+		if (m && m[1] !== currentVersion) {
+			candidates.push({ version: m[1], path: join(DIST_DIR, name) });
+		}
+	}
+
+	if (candidates.length === 0) return null;
+
+	// Sort by version descending, pick the latest one before current
+	candidates.sort((a, b) => {
+		const pa = a.version.split(".").map(Number);
+		const pb = b.version.split(".").map(Number);
+		for (let i = 0; i < 3; i++) {
+			if (pa[i] !== pb[i]) return pb[i] - pa[i]; // descending
+		}
+		return 0;
+	});
+
+	// Pick the highest version that is less than current
+	const currentParts = currentVersion.split(".").map(Number);
+	for (const c of candidates) {
+		const parts = c.version.split(".").map(Number);
+		let isLess = false;
+		for (let i = 0; i < 3; i++) {
+			if (parts[i] < currentParts[i]) {
+				isLess = true;
+				break;
+			}
+			if (parts[i] > currentParts[i]) break;
+		}
+		if (isLess) return c;
+	}
+
+	return null;
 }
