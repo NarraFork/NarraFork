@@ -139,6 +139,59 @@ export async function imageToBase64(filePath: string): Promise<ImageBase64Result
 	return { base64: buf.toString("base64"), detectedMediaType };
 }
 
+// === Text file uploads ===
+
+import { MAX_TEXT_FILE_SIZE, isTextFile } from "@shared/text-file-types";
+
+export interface TextFileRef {
+	fileId: string;
+	filename: string;
+	/** Relative path from UPLOADS_DIR (e.g. "<narratorId>/text/<fileId>.ts"). */
+	filePath: string;
+	size: number;
+}
+
+/** Resolve a TextFileRef.filePath (relative) to an absolute path. */
+export function resolveTextFilePath(relativePath: string): string {
+	const abs = resolve(UPLOADS_DIR, relativePath);
+	if (!abs.startsWith(UPLOADS_DIR)) {
+		throw new ValidationError("Invalid text file path");
+	}
+	return abs;
+}
+
+export async function saveUploadedTextFile(narratorId: string, file: File): Promise<TextFileRef> {
+	if (!isTextFile(file.name)) {
+		throw new ValidationError(
+			`Unsupported text file type: ${file.name}. Only common text and code files are allowed.`,
+		);
+	}
+	if (file.size > MAX_TEXT_FILE_SIZE) {
+		throw new ValidationError(
+			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 10MB`,
+		);
+	}
+
+	const fileId = generateShortId();
+	const ext = extname(file.name) || ".txt";
+	const dir = resolve(UPLOADS_DIR, narratorId, "text");
+	if (!dir.startsWith(UPLOADS_DIR)) {
+		throw new ValidationError("Invalid narrator ID");
+	}
+	mkdirSync(dir, { recursive: true });
+
+	const absPath = resolve(dir, `${fileId}${ext}`);
+	const buffer = await file.arrayBuffer();
+	await Bun.write(absPath, buffer);
+
+	// Store path relative to UPLOADS_DIR for portability
+	const relativePath = `${narratorId}/text/${fileId}${ext}`;
+
+	logger.info("Text file uploaded", { narratorId, fileId, filename: file.name, size: file.size });
+
+	return { fileId, filename: file.name, filePath: relativePath, size: file.size };
+}
+
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {
 	const dir = resolve(UPLOADS_DIR, narratorId);
 	if (existsSync(dir)) {

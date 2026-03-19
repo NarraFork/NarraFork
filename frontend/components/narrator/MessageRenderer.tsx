@@ -247,6 +247,7 @@ export function renderTreeMessages(
 		blocks.some((b: ContentBlock) => {
 			if (b.type === "text") return !!b.text?.trim();
 			if (b.type === "image") return true;
+			if (b.type === "text_file") return true;
 			if (b.type === "reasoning") return !!b.text?.trim();
 			if (b.type === "web_search") return true;
 			if (b.type === "thinking") {

@@ -186,6 +186,7 @@ export default defineConfig(({ mode }) => {
 		resolve: {
 			alias: {
 				"@frontend": resolve(__dirname),
+				"@shared": resolve(__dirname, "..", "shared"),
 			},
 		},
 	};

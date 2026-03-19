@@ -26,6 +26,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconArchive,
 	IconArrowDown,
@@ -37,6 +38,7 @@ import {
 	IconCodeOff,
 	IconEraser,
 	IconExternalLink,
+	IconFile,
 	IconFolderPlus,
 	IconLock,
 	IconLockOpen,
@@ -47,6 +49,7 @@ import {
 	IconSparkles,
 	IconTerminal,
 	IconTrash,
+	IconUpload,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -119,8 +122,10 @@ import type {
 } from "./narrator-panel-types";
 import {
 	ACCEPTED_TYPES,
+	isTextFile,
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
+	MAX_TEXT_FILE_SIZE,
 	PERM_MODE_ICONS,
 	PERM_MODES,
 	STREAMING_CHUNKS_MSG_ID,
@@ -921,6 +926,9 @@ export function NarratorPanel({
 		};
 	}, [appendInputRef]);
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
+	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
+	const [isDragging, setIsDragging] = useState(false);
+	const dragCounterRef = useRef(0);
 
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -1695,7 +1703,7 @@ export function NarratorPanel({
 	}, [highlightMessageId, totalMessageCount]);
 
 	// --- Send / retry message ---
-	const submitMessage = async (msg: string, images: File[] = []) => {
+	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
 		streamingRef.current = "";
 		streamingReasoningRef.current = "";
 
@@ -1709,6 +1717,11 @@ export function NarratorPanel({
 				filename: f.name,
 				mediaType: f.type,
 				previewUrl: URL.createObjectURL(f),
+			})),
+			...textFiles.map((f) => ({
+				type: "text_file",
+				filename: f.name,
+				size: f.size,
 			})),
 			{ type: "text", text: msg },
 		];
@@ -1744,6 +1757,7 @@ export function NarratorPanel({
 				narratorId,
 				msg,
 				images.length > 0 ? images : undefined,
+				textFiles.length > 0 ? textFiles : undefined,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -1828,15 +1842,18 @@ export function NarratorPanel({
 		try {
 			inputHistory.push(msg);
 			if (isActive) {
-				// Send via HTTP POST so images are uploaded via multipart/form-data
+				// Send via HTTP POST so images/textFiles are uploaded via multipart/form-data
 				const images = [...attachedImages];
+				const textFiles = [...attachedTextFiles];
 				setInput("");
 				setAttachedImages([]);
+				setAttachedTextFiles([]);
 				try {
 					const result = await api.sendNarratorMessage(
 						narratorId,
 						msg,
 						images.length > 0 ? images : undefined,
+						textFiles.length > 0 ? textFiles : undefined,
 					);
 					if (result?.buffered) {
 						// Don't optimistically insert — the WS buffer_set broadcast
@@ -1844,9 +1861,12 @@ export function NarratorPanel({
 						scrollToBottom(true);
 					}
 				} catch {
-					// Fallback to WebSocket text-only buffer (images not supported over WS)
+					// Fallback to WebSocket text-only buffer (images/textFiles not supported over WS)
 					if (images.length > 0) {
 						setAttachedImages(images);
+					}
+					if (textFiles.length > 0) {
+						setAttachedTextFiles(textFiles);
 					}
 					sendBufferMessage(narratorId, msg);
 					// Optimistic: WS buffer_set will sync the real state
@@ -1855,9 +1875,11 @@ export function NarratorPanel({
 				return;
 			}
 			const images = [...attachedImages];
+			const textFiles = [...attachedTextFiles];
 			setInput("");
 			setAttachedImages([]);
-			await submitMessage(msg, images);
+			setAttachedTextFiles([]);
+			await submitMessage(msg, images, textFiles);
 		} finally {
 			sendingRef.current = false;
 		}
@@ -1965,6 +1987,31 @@ export function NarratorPanel({
 		setAttachedImages((prev) => [...prev, ...processed]);
 	};
 
+	const addTextFiles = (files: File[]) => {
+		const valid = files.filter((f) => {
+			if (!isTextFile(f.name)) {
+				notifications.show({
+					title: t("unsupportedFileType"),
+					message: f.name,
+					color: "yellow",
+				});
+				return false;
+			}
+			if (f.size > MAX_TEXT_FILE_SIZE) {
+				notifications.show({
+					title: t("textFileTooLarge"),
+					message: `${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`,
+					color: "yellow",
+				});
+				return false;
+			}
+			return true;
+		});
+		if (valid.length > 0) {
+			setAttachedTextFiles((prev) => [...prev, ...valid]);
+		}
+	};
+
 	const handlePaste = (e: React.ClipboardEvent) => {
 		const items = e.clipboardData.items;
 		const imageFiles: File[] = [];
@@ -1977,6 +2024,59 @@ export function NarratorPanel({
 		if (imageFiles.length > 0) {
 			addImages(imageFiles);
 		}
+	};
+
+	const handleDragEnter = (e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		dragCounterRef.current++;
+		if (e.dataTransfer.types.includes("Files")) {
+			setIsDragging(true);
+		}
+	};
+
+	const handleDragLeave = (e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		dragCounterRef.current--;
+		if (dragCounterRef.current === 0) {
+			setIsDragging(false);
+		}
+	};
+
+	const handleDragOver = (e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+	};
+
+	const handleDrop = (e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		dragCounterRef.current = 0;
+		setIsDragging(false);
+		const files = Array.from(e.dataTransfer.files);
+		if (files.length === 0) return;
+		const imageFiles: File[] = [];
+		const textFileList: File[] = [];
+		const unsupported: string[] = [];
+		for (const f of files) {
+			if (ACCEPTED_TYPES.includes(f.type)) {
+				imageFiles.push(f);
+			} else if (isTextFile(f.name)) {
+				textFileList.push(f);
+			} else {
+				unsupported.push(f.name);
+			}
+		}
+		if (unsupported.length > 0) {
+			notifications.show({
+				title: t("unsupportedFileType"),
+				message: unsupported.join(", "),
+				color: "yellow",
+			});
+		}
+		if (imageFiles.length > 0) addImages(imageFiles);
+		if (textFileList.length > 0) addTextFiles(textFileList);
 	};
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -2041,7 +2141,39 @@ export function NarratorPanel({
 
 	return (
 		<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
-			<Stack h="100%" gap={0} style={{ overflow: "hidden" }}>
+			<Stack
+				h="100%"
+				gap={0}
+				style={{ overflow: "hidden", position: "relative" }}
+				onDragEnter={handleDragEnter}
+				onDragLeave={handleDragLeave}
+				onDragOver={handleDragOver}
+				onDrop={handleDrop}
+			>
+				{/* Drop overlay */}
+				{isDragging && (
+					<Box
+						style={{
+							position: "absolute",
+							inset: 0,
+							zIndex: 100,
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "center",
+							backgroundColor: "rgba(0, 0, 0, 0.5)",
+							border: "2px dashed var(--mantine-color-indigo-5)",
+							borderRadius: "var(--mantine-radius-md)",
+							pointerEvents: "none",
+						}}
+					>
+						<Stack align="center" gap="xs">
+							<IconUpload size={40} color="var(--mantine-color-indigo-4)" />
+							<Text size="lg" fw={500} c="white">
+								{t("dropFilesHere")}
+							</Text>
+						</Stack>
+					</Box>
+				)}
 				{/* Header */}
 				<Group
 					justify="space-between"
@@ -2404,6 +2536,47 @@ export function NarratorPanel({
 									title={t("removeImage")}
 								/>
 							</Box>
+						))}
+					</Group>
+				)}
+
+				{/* Text file previews */}
+				{attachedTextFiles.length > 0 && (
+					<Group
+						pt="xs"
+						px="md"
+						pb={0}
+						gap="xs"
+						wrap="wrap"
+						style={{
+							borderTop:
+								attachedImages.length > 0
+									? undefined
+									: "1px solid var(--mantine-color-default-border)",
+							flexShrink: 0,
+						}}
+					>
+						{attachedTextFiles.map((file, i) => (
+							<Badge
+								key={`${file.name}-${i}`}
+								variant="light"
+								color="gray"
+								size="lg"
+								leftSection={<IconFile size={14} />}
+								rightSection={
+									<CloseButton
+										size="xs"
+										variant="transparent"
+										onClick={() => setAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))}
+									/>
+								}
+								style={{ cursor: "default" }}
+							>
+								{file.name}{" "}
+								<Text span size="xs" c="dimmed">
+									({formatFileSize(file.size)})
+								</Text>
+							</Badge>
 						))}
 					</Group>
 				)}
@@ -3104,18 +3277,38 @@ export function NarratorPanel({
 						<input
 							ref={fileInputRef}
 							type="file"
-							accept="image/png,image/jpeg,image/gif,image/webp"
 							multiple
 							style={{ display: "none" }}
 							onChange={(e) => {
 								if (e.target.files) {
-									addImages(Array.from(e.target.files));
+									const files = Array.from(e.target.files);
+									const imageFiles: File[] = [];
+									const textFileList: File[] = [];
+									const unsupported: string[] = [];
+									for (const f of files) {
+										if (ACCEPTED_TYPES.includes(f.type)) {
+											imageFiles.push(f);
+										} else if (isTextFile(f.name)) {
+											textFileList.push(f);
+										} else {
+											unsupported.push(f.name);
+										}
+									}
+									if (unsupported.length > 0) {
+										notifications.show({
+											title: t("unsupportedFileType"),
+											message: unsupported.join(", "),
+											color: "yellow",
+										});
+									}
+									if (imageFiles.length > 0) addImages(imageFiles);
+									if (textFileList.length > 0) addTextFiles(textFileList);
 									e.target.value = "";
 								}
 							}}
 						/>
 						<Group gap="xs" align="end" wrap="nowrap">
-							<Tooltip label={t("attachImage")}>
+							<Tooltip label={t("attachFile")}>
 								<ActionIcon
 									variant="subtle"
 									color="gray"
@@ -3157,14 +3350,12 @@ export function NarratorPanel({
 							</Box>
 							{(() => {
 								const hasInput = !!input.trim();
-								const showInterrupt = isActive && !hasInput;
+								const hasAttachments = attachedImages.length > 0 || attachedTextFiles.length > 0;
+								const showInterrupt = isActive && !hasInput && !hasAttachments;
 								const showRetry =
-									!showInterrupt &&
-									!hasInput &&
-									attachedImages.length === 0 &&
-									canRetryLastUserMessage;
+									!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
 								const showContinue =
-									!showInterrupt && !hasInput && attachedImages.length === 0 && canContinueNarrator;
+									!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
 								if (showInterrupt) {
 									return (
 										<Button
@@ -3218,7 +3409,7 @@ export function NarratorPanel({
 									);
 								}
 								return (
-									<Button key="send" onClick={handleSend} disabled={!hasInput}>
+									<Button key="send" onClick={handleSend} disabled={!hasInput && !hasAttachments}>
 										{isActive
 											? queuedMessages.length > 0
 												? `${t("queue")} (${queuedMessages.length})`

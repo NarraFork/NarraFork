@@ -145,6 +145,10 @@ export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 export const MAX_IMAGE_LONG_EDGE = 1568;
 export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+export const MAX_TEXT_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+export { isTextFile } from "@shared/text-file-types";
+
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
 
 export const SUBAGENT_STREAMING_ID_PREFIX = "__streaming_subagent_";

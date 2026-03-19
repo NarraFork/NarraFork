@@ -18,12 +18,14 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
 	IconArrowsMinimize,
 	IconBrain,
 	IconChevronDown,
 	IconChevronRight,
+	IconFile,
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
@@ -141,6 +143,23 @@ function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) 
 				onClick={() => window.open(src, "_blank")}
 			/>
 		</Box>
+	);
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+function TextFileBlock({ block }: { block: any }) {
+	return (
+		<Group gap={6} py={2}>
+			<ThemeIcon size="sm" variant="light" color="gray">
+				<IconFile size={14} />
+			</ThemeIcon>
+			<Text size="sm" fw={500}>
+				{block.filename}
+			</Text>
+			<Text size="xs" c="dimmed">
+				({formatFileSize(block.size)})
+			</Text>
+		</Group>
 	);
 }
 
@@ -1246,6 +1265,9 @@ export const MessageBubble = memo(function MessageBubble({
 										if (block.type === "image") {
 											return <ImageBlock key={key} block={block} narratorId={narratorId} />;
 										}
+										if (block.type === "text_file") {
+											return <TextFileBlock key={key} block={block} />;
+										}
 										return null;
 									})}
 								</>
@@ -1280,6 +1302,9 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					if (block.type === "image") {
 						return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+					}
+					if (block.type === "text_file") {
+						return <TextFileBlock key={key} block={block} />;
 					}
 					if (block.type === "reasoning") {
 						const iconColor = getCategoryColor("plan");

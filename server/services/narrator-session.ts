@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { formatFileSize } from "@shared/text-file-types";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -37,8 +38,8 @@ import {
 	settings,
 	usesCodexApiMode,
 } from "../lib/settings";
-import type { ImageRef } from "../lib/uploads";
-import { getImagePath, imageToBase64 } from "../lib/uploads";
+import type { ImageRef, TextFileRef } from "../lib/uploads";
+import { getImagePath, imageToBase64, resolveTextFilePath } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
 
@@ -201,6 +202,7 @@ interface BufferedMessage {
 	id: string;
 	text: string;
 	images?: ImageRef[];
+	textFiles?: TextFileRef[];
 	bufferedAt: string;
 	commandText?: string | null;
 	createdBy?: string | null;
@@ -2960,6 +2962,13 @@ async function runAgentLoop(
 					const persistBlocks: Array<
 						| { type: "text"; text: string }
 						| { type: "image"; imageId: string; filename: string; mediaType: string }
+						| {
+								type: "text_file";
+								fileId: string;
+								filename: string;
+								size: number;
+								filePath: string;
+						  }
 					> = [];
 					if (buffered.images?.length) {
 						for (const img of buffered.images) {
@@ -2971,10 +2980,24 @@ async function runAgentLoop(
 							});
 						}
 					}
+					if (buffered.textFiles?.length) {
+						for (const tf of buffered.textFiles) {
+							persistBlocks.push({
+								type: "text_file",
+								fileId: tf.fileId,
+								filename: tf.filename,
+								size: tf.size,
+								filePath: tf.filePath,
+							});
+						}
+					}
+					const effectiveBufferedText =
+						buffered.text + buildAttachedFilesHint(buffered.textFiles ?? []);
+					// contentJson blocks store raw user text; contentText stores effectiveBufferedText (see feedMessage)
 					persistBlocks.push({ type: "text", text: buffered.text });
 					const userMsg = await narratorService.persistUserMessage(
 						narratorId,
-						buffered.text,
+						effectiveBufferedText,
 						persistBlocks,
 						buffered.commandText,
 						buffered.createdBy,
@@ -2982,7 +3005,7 @@ async function runAgentLoop(
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 					active.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "thinking");
-					currentText = buffered.text;
+					currentText = effectiveBufferedText;
 					currentImages = buffered.images;
 					continue;
 				}
@@ -3226,6 +3249,22 @@ async function runPlanCompact(narratorId: string, planText: string): Promise<voi
 
 // === Message feeding ===
 
+/** Build the attached_files hint appended to the user prompt when text files are present. */
+function buildAttachedFilesHint(textFiles: TextFileRef[]): string {
+	if (textFiles.length === 0) return "";
+	const lines = textFiles.map((f) => {
+		const absPath = resolveTextFilePath(f.filePath);
+		return `- ${absPath} (${f.filename}, ${formatFileSize(f.size)})`;
+	});
+	return (
+		"\n\n<attached_files>\n" +
+		"The user has attached the following files for your reference. " +
+		"Use the Read tool to access their contents when needed.\n" +
+		`${lines.join("\n")}\n` +
+		"</attached_files>"
+	);
+}
+
 /**
  * Persist a user message and kick off the agent loop in the background.
  * Returns the active narrator and persisted message for SSE subscription.
@@ -3238,12 +3277,14 @@ async function feedMessage(
 	replyInUserLanguage = false,
 	commandText?: string | null,
 	userId?: string | null,
+	textFiles?: TextFileRef[],
 ): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
 		| { type: "image"; imageId: string; filename: string; mediaType: string }
+		| { type: "text_file"; fileId: string; filename: string; size: number; filePath: string }
 	> = [];
 	if (images?.length) {
 		for (const img of images) {
@@ -3255,10 +3296,30 @@ async function feedMessage(
 			});
 		}
 	}
+	if (textFiles?.length) {
+		for (const tf of textFiles) {
+			persistBlocks.push({
+				type: "text_file",
+				fileId: tf.fileId,
+				filename: tf.filename,
+				size: tf.size,
+				filePath: tf.filePath,
+			});
+		}
+	}
+	// NOTE: persistBlocks stores the raw user text (without attached_files hint) so that
+	// contentJson reflects what the user actually typed. The effectivePrompt (with hint)
+	// is stored in contentText and sent to the AI. This intentional split means:
+	//   - contentJson (blocks) → frontend display, shows original user input
+	//   - contentText → FTS search index + AI prompt, includes file references
 	persistBlocks.push({ type: "text", text: prompt });
+
+	// Build the effective prompt with attached file hints
+	const effectivePrompt = prompt + buildAttachedFilesHint(textFiles ?? []);
+
 	const userMsg = await narratorService.persistUserMessage(
 		narratorId,
-		prompt,
+		effectivePrompt,
 		persistBlocks,
 		commandText,
 		userId,
@@ -3272,7 +3333,7 @@ async function feedMessage(
 	}
 
 	// Start agent loop in background
-	runAgentLoop(active, prompt, images).catch(async (err) => {
+	runAgentLoop(active, effectivePrompt, images).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
 		await narratorService.updateStatus(narratorId, "error", String(err));
 		broadcastToNarrator(narratorId, {
@@ -3301,6 +3362,7 @@ export async function sendMessage(
 	replyInUserLanguage = false,
 	commandText?: string | null,
 	userId?: string | null,
+	textFiles?: TextFileRef[],
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const { userMsg } = await feedMessage(
 		narratorId,
@@ -3310,6 +3372,7 @@ export async function sendMessage(
 		replyInUserLanguage,
 		commandText,
 		userId,
+		textFiles,
 	);
 	broadcastToNarrator(narratorId, {
 		type: "user_message",
@@ -3895,6 +3958,7 @@ export function pushBufferedMessage(
 	commandText?: string | null,
 	createdBy?: string | null,
 	creator?: BufferCreator | null,
+	textFiles?: TextFileRef[],
 ): { ok: boolean; bufferedAt: string; id: string } {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
@@ -3902,7 +3966,7 @@ export function pushBufferedMessage(
 	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
 	const queue = bufferedMessages.get(narratorId) ?? [];
-	queue.push({ id, text, images, bufferedAt, commandText, createdBy, creator });
+	queue.push({ id, text, images, textFiles, bufferedAt, commandText, createdBy, creator });
 	bufferedMessages.set(narratorId, queue);
 	return { ok: true, bufferedAt, id };
 }

@@ -649,16 +649,26 @@ export const api = {
 		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
 		request<{ summary: string }>(`/narrators/${narratorId}/compact/${messageId}`),
-	sendNarratorMessage: async (narratorId: string, message: string, images?: File[]) => {
+	sendNarratorMessage: async (
+		narratorId: string,
+		message: string,
+		images?: File[],
+		textFiles?: File[],
+	) => {
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
 
 		let body: BodyInit;
-		if (images?.length) {
+		if (images?.length || textFiles?.length) {
 			const formData = new FormData();
 			formData.append("message", message);
-			for (const img of images) formData.append("images", img);
+			if (images) {
+				for (const img of images) formData.append("images", img);
+			}
+			if (textFiles) {
+				for (const tf of textFiles) formData.append("textFiles", tf);
+			}
 			body = formData;
 		} else {
 			headers["Content-Type"] = "application/json";

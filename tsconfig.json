@@ -14,9 +14,10 @@
 		"types": ["bun-types", "vite-plugin-pwa/client"],
 		"paths": {
 			"@server/*": ["./server/*"],
-			"@frontend/*": ["./frontend/*"]
+			"@frontend/*": ["./frontend/*"],
+			"@shared/*": ["./shared/*"]
 		}
 	},
-	"include": ["server/**/*.ts", "frontend/**/*.ts", "frontend/**/*.tsx", "tests/**/*.ts"],
+	"include": ["server/**/*.ts", "frontend/**/*.ts", "frontend/**/*.tsx", "shared/**/*.ts", "tests/**/*.ts"],
 	"exclude": ["node_modules", "dist"]
 }

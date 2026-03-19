@@ -46,7 +46,12 @@ import {
 	getUserReplyInLanguage,
 	type Locale,
 } from "../lib/prompt-i18n";
-import { type ImageRef, saveUploadedImage } from "../lib/uploads";
+import {
+	type ImageRef,
+	saveUploadedImage,
+	saveUploadedTextFile,
+	type TextFileRef,
+} from "../lib/uploads";
 import {
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
@@ -104,7 +109,7 @@ import {
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
 
-/** Parse message request supporting both JSON and multipart/form-data (with images) */
+/** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
 export async function parseMessageRequest(
 	c: {
 		req: {
@@ -114,26 +119,34 @@ export async function parseMessageRequest(
 		};
 	},
 	narratorId: string,
-): Promise<{ message: string; images: ImageRef[] }> {
+): Promise<{ message: string; images: ImageRef[]; textFiles: TextFileRef[] }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
 		const message = formData.get("message") as string;
 		if (!message?.trim()) throw new ValidationError("message is required");
-		const files = formData.getAll("images") as File[];
-		if (files.length > 10) {
+		const imageFiles = formData.getAll("images") as File[];
+		if (imageFiles.length > 10) {
 			throw new ValidationError("Maximum 10 images per message");
 		}
 		const images: ImageRef[] = [];
-		for (const file of files) {
+		for (const file of imageFiles) {
 			images.push(await saveUploadedImage(narratorId, file));
 		}
-		return { message, images };
+		const textFileEntries = formData.getAll("textFiles") as File[];
+		if (textFileEntries.length > 10) {
+			throw new ValidationError("Maximum 10 text files per message");
+		}
+		const textFiles: TextFileRef[] = [];
+		for (const file of textFileEntries) {
+			textFiles.push(await saveUploadedTextFile(narratorId, file));
+		}
+		return { message, images, textFiles };
 	}
 	const body = await c.req.json();
 	const parsed = sendMessageSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return { message: parsed.data.message, images: [] };
+	return { message: parsed.data.message, images: [], textFiles: [] };
 }
 
 export const narratorRoutes = new Hono();
@@ -386,7 +399,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		await narratorService.updateStatus(id, "idle");
 	}
 
-	const { message, images } = await parseMessageRequest(c, id);
+	const { message, images, textFiles } = await parseMessageRequest(c, id);
 	const userId = c.get("user").sub;
 
 	// Resolve slash commands
@@ -446,6 +459,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			commandText,
 			userId,
 			creator,
+			textFiles.length > 0 ? textFiles : undefined,
 		);
 		if (result.ok) {
 			const messages = toBufferSummary(getBufferedMessages(id));
@@ -470,6 +484,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		replyInUserLanguage,
 		commandText,
 		userId,
+		textFiles,
 	);
 	return c.json(userMsg, 201);
 });
