@@ -96,6 +96,10 @@ export function truncateJson(val: any, maxLen: number): any {
  *  (their content IS the primary display payload, e.g. plan text). */
 const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 
+/** Tool names whose inputJson should not be truncated (prompt is the primary display),
+ *  but outputJson can still be truncated. */
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
+
 /** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
@@ -104,9 +108,10 @@ export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls: msg.toolCalls?.map((tc: any) => {
 			if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return tc;
+			const skipInput = SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName);
 			return {
 				...tc,
-				inputJson: truncateJson(tc.inputJson, maxLen),
+				inputJson: skipInput ? tc.inputJson : truncateJson(tc.inputJson, maxLen),
 				outputJson: truncateJson(tc.outputJson, maxLen),
 			};
 		}),

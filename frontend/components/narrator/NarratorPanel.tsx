@@ -26,7 +26,6 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconArchive,
 	IconArrowDown,
@@ -122,6 +121,7 @@ import type {
 } from "./narrator-panel-types";
 import {
 	ACCEPTED_TYPES,
+	formatFileSize,
 	isTextFile,
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
@@ -596,7 +596,7 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 	return (
 		<Popover
 			opened={opened}
-			onClose={close}
+			onChange={(o) => !o && close()}
 			position="top-end"
 			width={420}
 			shadow="md"
@@ -2546,7 +2546,7 @@ export function NarratorPanel({
 						pt="xs"
 						px="md"
 						pb={0}
-						gap="xs"
+						gap={6}
 						wrap="wrap"
 						style={{
 							borderTop:
@@ -2557,26 +2557,33 @@ export function NarratorPanel({
 						}}
 					>
 						{attachedTextFiles.map((file, i) => (
-							<Badge
+							<Group
 								key={`${file.name}-${i}`}
-								variant="light"
-								color="gray"
-								size="lg"
-								leftSection={<IconFile size={14} />}
-								rightSection={
-									<CloseButton
-										size="xs"
-										variant="transparent"
-										onClick={() => setAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))}
-									/>
-								}
-								style={{ cursor: "default" }}
+								gap={6}
+								px="xs"
+								py={4}
+								wrap="nowrap"
+								style={{
+									borderRadius: "var(--mantine-radius-sm)",
+									backgroundColor: "var(--mantine-color-dark-6)",
+									fontSize: "var(--mantine-font-size-xs)",
+								}}
 							>
-								{file.name}{" "}
-								<Text span size="xs" c="dimmed">
-									({formatFileSize(file.size)})
+								<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+								<Text size="xs" truncate style={{ maxWidth: 160 }}>
+									{file.name}
 								</Text>
-							</Badge>
+								<Text size="xs" c="dimmed">
+									{formatFileSize(file.size)}
+								</Text>
+								<CloseButton
+									size={16}
+									iconSize={12}
+									variant="transparent"
+									c="dimmed"
+									onClick={() => setAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))}
+								/>
+							</Group>
 						))}
 					</Group>
 				)}

@@ -1222,6 +1222,8 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	// For screenshot mode, check if there are images in the output metadata
 	const isScreenshot = mode === "screenshot";
+	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
+	const screenshotPreviewUrl = isScreenshot ? (meta?.previewUrl as string) : undefined;
 
 	return (
 		<Box mt="xs">
@@ -1264,7 +1266,27 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
-			{isScreenshot && raw && (
+			{isScreenshot && screenshotPreviewUrl && (
+				<Box mt="xs">
+					<img
+						src={screenshotPreviewUrl}
+						alt={fetchUrl || "screenshot"}
+						style={{
+							maxWidth: "100%",
+							maxHeight: 400,
+							borderRadius: "var(--mantine-radius-sm)",
+							objectFit: "contain",
+							display: "block",
+						}}
+					/>
+					{raw && (
+						<Text size="xs" c="dimmed" mt={4}>
+							{raw}
+						</Text>
+					)}
+				</Box>
+			)}
+			{isScreenshot && !screenshotPreviewUrl && raw && (
 				<Text size="xs" c="dimmed" mt={4}>
 					{raw}
 				</Text>

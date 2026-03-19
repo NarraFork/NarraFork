@@ -141,26 +141,22 @@ export async function imageToBase64(filePath: string): Promise<ImageBase64Result
 
 // === Text file uploads ===
 
-import { MAX_TEXT_FILE_SIZE, isTextFile } from "@shared/text-file-types";
+import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
+
+export { MAX_TEXT_FILE_SIZE };
 
 export interface TextFileRef {
-	fileId: string;
 	filename: string;
-	/** Relative path from UPLOADS_DIR (e.g. "<narratorId>/text/<fileId>.ts"). */
+	/** Absolute path where the file was saved (inside the worktree). */
 	filePath: string;
 	size: number;
 }
 
-/** Resolve a TextFileRef.filePath (relative) to an absolute path. */
-export function resolveTextFilePath(relativePath: string): string {
-	const abs = resolve(UPLOADS_DIR, relativePath);
-	if (!abs.startsWith(UPLOADS_DIR)) {
-		throw new ValidationError("Invalid text file path");
-	}
-	return abs;
-}
-
-export async function saveUploadedTextFile(narratorId: string, file: File): Promise<TextFileRef> {
+/**
+ * Validate a text file upload (type + size). Does NOT save the file.
+ * Saving happens later in feedMessage when the worktree cwd is known.
+ */
+export function validateTextFile(file: File): void {
 	if (!isTextFile(file.name)) {
 		throw new ValidationError(
 			`Unsupported text file type: ${file.name}. Only common text and code files are allowed.`,
@@ -171,25 +167,43 @@ export async function saveUploadedTextFile(narratorId: string, file: File): Prom
 			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 10MB`,
 		);
 	}
+}
 
-	const fileId = generateShortId();
-	const ext = extname(file.name) || ".txt";
-	const dir = resolve(UPLOADS_DIR, narratorId, "text");
-	if (!dir.startsWith(UPLOADS_DIR)) {
-		throw new ValidationError("Invalid narrator ID");
-	}
+/**
+ * Save a text file into the worktree's `.narrafork/attached/` directory
+ * using the original filename. Returns the absolute path.
+ */
+export async function saveTextFileToWorktree(cwd: string, file: File): Promise<TextFileRef> {
+	const dir = resolve(cwd, ".narrafork", "attached");
 	mkdirSync(dir, { recursive: true });
 
-	const absPath = resolve(dir, `${fileId}${ext}`);
+	// Use original filename, but sanitize path separators
+	const safeName = (file.name.split("/").pop() ?? file.name).replace(/[\\/:*?"<>|]/g, "_");
+	let filePath = resolve(dir, safeName);
+
+	// If file already exists, add a short suffix to avoid overwriting
+	if (existsSync(filePath)) {
+		const base = safeName.replace(/(\.[^.]+)$/, "");
+		const ext2 = extname(safeName) || "";
+		filePath = resolve(dir, `${base}_${generateShortId()}${ext2}`);
+	}
+
+	// Belt-and-suspenders: ensure we're still inside the target dir
+	if (!filePath.startsWith(dir)) {
+		throw new ValidationError("Invalid filename");
+	}
+
 	const buffer = await file.arrayBuffer();
-	await Bun.write(absPath, buffer);
+	await Bun.write(filePath, buffer);
 
-	// Store path relative to UPLOADS_DIR for portability
-	const relativePath = `${narratorId}/text/${fileId}${ext}`;
+	logger.info("Text file saved to worktree", {
+		cwd,
+		filename: file.name,
+		filePath,
+		size: file.size,
+	});
 
-	logger.info("Text file uploaded", { narratorId, fileId, filename: file.name, size: file.size });
-
-	return { fileId, filename: file.name, filePath: relativePath, size: file.size };
+	return { filename: file.name, filePath, size: file.size };
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {

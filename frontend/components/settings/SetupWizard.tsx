@@ -348,11 +348,7 @@ function ProviderStep({
 				<Button variant="light" onClick={handleGoToProviders}>
 					{t("wizardProviderGoToAdmin")}
 				</Button>
-				<Button
-					variant="gradient"
-					gradient={{ from: "grape", to: "orange", deg: 135 }}
-					onClick={handleGoToBetaTrial}
-				>
+				<Button variant="filled" color="indigo" onClick={handleGoToBetaTrial}>
 					{t("betaTrialButton")}
 				</Button>
 			</Group>

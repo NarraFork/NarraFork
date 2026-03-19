@@ -1,5 +1,9 @@
+import { writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { z } from "zod/v4";
+import { generateShortId } from "../../id";
 import { logger } from "../../logger";
+import { createShare, getShareDir } from "../../shares";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const MODES = ["readability", "screenshot", "dom", "smart"] as const;
@@ -87,9 +91,40 @@ export const webFetchTool: ToolDefinition = {
 				case "screenshot": {
 					const { fetchScreenshot } = await import("../../web-fetch/screenshot");
 					const result = await fetchScreenshot(url);
+
+					// Save screenshot as a temporary share for frontend preview
+					let metadata: Record<string, unknown> | undefined;
+					try {
+						const shareId = generateShortId();
+						const shareDir = getShareDir(shareId);
+						const filename = "screenshot.png";
+						const filePath = resolve(shareDir, filename);
+						const buffer = Buffer.from(result.base64, "base64");
+						writeFileSync(filePath, buffer);
+						createShare({
+							id: shareId,
+							originalName: filename,
+							storagePath: filePath,
+							size: buffer.length,
+							createdBy: "webfetch",
+							expiryHours: 1,
+						});
+						metadata = {
+							screenshotPreview: true,
+							previewUrl: `/api/shares/${shareId}/preview`,
+							width: result.width,
+							height: result.height,
+						};
+					} catch (e) {
+						logger.warn("Failed to create screenshot share for preview", {
+							error: e instanceof Error ? e.message : String(e),
+						});
+					}
+
 					return {
 						output: `Screenshot of ${url} (${result.width}x${result.height})`,
 						images: [{ format: "png", base64: result.base64 }],
+						metadata,
 						title: url,
 					};
 				}

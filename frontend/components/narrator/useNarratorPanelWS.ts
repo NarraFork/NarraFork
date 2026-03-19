@@ -798,12 +798,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// to avoid removing unrelated optimistic messages when sending rapidly.
 					// For slash commands, match by commandText since contentText differs
 					// (optimistic has raw command, server has expanded prompt).
+					// For text file attachments, server contentText includes <attached_files>
+					// hint appended to the original text, so also check startsWith.
 					const optimisticIdx = firstPage.messages.findIndex(
 						(m: NarratorMsg) =>
 							String(m.id).startsWith("optimistic-") &&
 							m.role === "user" &&
 							(m.contentText === newMsg.contentText ||
-								(m.commandText && newMsg.commandText && m.commandText === newMsg.commandText)),
+								(m.commandText && newMsg.commandText && m.commandText === newMsg.commandText) ||
+								(m.contentText &&
+									newMsg.contentText &&
+									newMsg.contentText.startsWith(m.contentText) &&
+									newMsg.contentText.includes("<attached_files>"))),
 					);
 					if (optimisticIdx !== -1) {
 						const updated = [...firstPage.messages];

@@ -166,30 +166,39 @@ export function PathInput(props: PathInputProps) {
 	);
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
+		// Tab = autocomplete first candidate (like shell tab-completion)
+		if (e.key === "Tab" && combobox.dropdownOpened && options.length > 0) {
+			e.preventDefault();
+			const idx = combobox.getSelectedOptionIndex();
+			if (idx !== -1) {
+				// Highlighted option — select it
+				combobox.selectOption(idx);
+			} else {
+				// No highlight — pick the first candidate
+				handleOptionSubmit(options[0].path);
+			}
+			return;
+		}
+
 		if (e.key === "Enter") {
-			// When dropdown is open, try to fill the first option on Enter
 			if (combobox.dropdownOpened) {
 				const idx = combobox.getSelectedOptionIndex();
-				if (idx === -1 && options.length > 0) {
-					// No highlighted option — select the first candidate
-					e.preventDefault();
-					handleOptionSubmit(options[0].path);
-					return;
-				}
 				if (idx !== -1) {
-					// Let Combobox handle the highlighted option selection
+					// User explicitly highlighted an option with arrow keys — let Combobox handle it
 					return;
 				}
+				// No highlighted option — close dropdown and confirm the current value
+				// (don't auto-select the first candidate, so the user can confirm the typed path)
 			}
+
+			e.preventDefault();
+			combobox.closeDropdown();
 
 			if (isControlled) {
 				// Controlled mode: just close dropdown on Enter
-				combobox.closeDropdown();
 				return;
 			}
 			// Uncontrolled mode: confirm and clear
-			e.preventDefault();
-			combobox.closeDropdown();
 			const v = value.trim();
 			if (v) {
 				props.onConfirm(v);

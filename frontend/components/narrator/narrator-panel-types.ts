@@ -147,7 +147,7 @@ export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/we
 
 export const MAX_TEXT_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
-export { isTextFile } from "@shared/text-file-types";
+export { formatFileSize, isTextFile } from "@shared/text-file-types";
 
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
 

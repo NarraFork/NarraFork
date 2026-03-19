@@ -39,7 +39,7 @@ import {
 	usesCodexApiMode,
 } from "../lib/settings";
 import type { ImageRef, TextFileRef } from "../lib/uploads";
-import { getImagePath, imageToBase64, resolveTextFilePath } from "../lib/uploads";
+import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
 
@@ -202,7 +202,7 @@ interface BufferedMessage {
 	id: string;
 	text: string;
 	images?: ImageRef[];
-	textFiles?: TextFileRef[];
+	textFiles?: File[];
 	bufferedAt: string;
 	commandText?: string | null;
 	createdBy?: string | null;
@@ -2959,12 +2959,18 @@ async function runAgentLoop(
 						messageId: buffered.id,
 						remaining,
 					});
+					// Save buffered text files to worktree
+					const savedBufferedTextFiles: TextFileRef[] = [];
+					if (buffered.textFiles?.length) {
+						for (const file of buffered.textFiles) {
+							savedBufferedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
+						}
+					}
 					const persistBlocks: Array<
 						| { type: "text"; text: string }
 						| { type: "image"; imageId: string; filename: string; mediaType: string }
 						| {
 								type: "text_file";
-								fileId: string;
 								filename: string;
 								size: number;
 								filePath: string;
@@ -2980,11 +2986,10 @@ async function runAgentLoop(
 							});
 						}
 					}
-					if (buffered.textFiles?.length) {
-						for (const tf of buffered.textFiles) {
+					if (savedBufferedTextFiles.length > 0) {
+						for (const tf of savedBufferedTextFiles) {
 							persistBlocks.push({
 								type: "text_file",
-								fileId: tf.fileId,
 								filename: tf.filename,
 								size: tf.size,
 								filePath: tf.filePath,
@@ -2992,7 +2997,7 @@ async function runAgentLoop(
 						}
 					}
 					const effectiveBufferedText =
-						buffered.text + buildAttachedFilesHint(buffered.textFiles ?? []);
+						buffered.text + buildAttachedFilesHint(savedBufferedTextFiles);
 					// contentJson blocks store raw user text; contentText stores effectiveBufferedText (see feedMessage)
 					persistBlocks.push({ type: "text", text: buffered.text });
 					const userMsg = await narratorService.persistUserMessage(
@@ -3253,8 +3258,7 @@ async function runPlanCompact(narratorId: string, planText: string): Promise<voi
 function buildAttachedFilesHint(textFiles: TextFileRef[]): string {
 	if (textFiles.length === 0) return "";
 	const lines = textFiles.map((f) => {
-		const absPath = resolveTextFilePath(f.filePath);
-		return `- ${absPath} (${f.filename}, ${formatFileSize(f.size)})`;
+		return `- ${f.filePath} (${f.filename}, ${formatFileSize(f.size)})`;
 	});
 	return (
 		"\n\n<attached_files>\n" +
@@ -3277,14 +3281,22 @@ async function feedMessage(
 	replyInUserLanguage = false,
 	commandText?: string | null,
 	userId?: string | null,
-	textFiles?: TextFileRef[],
+	rawTextFiles?: File[],
 ): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+
+	// Save text files to worktree (now that we have active.cwd)
+	const savedTextFiles: TextFileRef[] = [];
+	if (rawTextFiles?.length) {
+		for (const file of rawTextFiles) {
+			savedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
+		}
+	}
 
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
 		| { type: "image"; imageId: string; filename: string; mediaType: string }
-		| { type: "text_file"; fileId: string; filename: string; size: number; filePath: string }
+		| { type: "text_file"; filename: string; size: number; filePath: string }
 	> = [];
 	if (images?.length) {
 		for (const img of images) {
@@ -3296,11 +3308,10 @@ async function feedMessage(
 			});
 		}
 	}
-	if (textFiles?.length) {
-		for (const tf of textFiles) {
+	if (savedTextFiles.length > 0) {
+		for (const tf of savedTextFiles) {
 			persistBlocks.push({
 				type: "text_file",
-				fileId: tf.fileId,
 				filename: tf.filename,
 				size: tf.size,
 				filePath: tf.filePath,
@@ -3315,7 +3326,7 @@ async function feedMessage(
 	persistBlocks.push({ type: "text", text: prompt });
 
 	// Build the effective prompt with attached file hints
-	const effectivePrompt = prompt + buildAttachedFilesHint(textFiles ?? []);
+	const effectivePrompt = prompt + buildAttachedFilesHint(savedTextFiles);
 
 	const userMsg = await narratorService.persistUserMessage(
 		narratorId,
@@ -3362,7 +3373,7 @@ export async function sendMessage(
 	replyInUserLanguage = false,
 	commandText?: string | null,
 	userId?: string | null,
-	textFiles?: TextFileRef[],
+	textFiles?: File[],
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const { userMsg } = await feedMessage(
 		narratorId,
@@ -3958,7 +3969,7 @@ export function pushBufferedMessage(
 	commandText?: string | null,
 	createdBy?: string | null,
 	creator?: BufferCreator | null,
-	textFiles?: TextFileRef[],
+	textFiles?: File[],
 ): { ok: boolean; bufferedAt: string; id: string } {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };

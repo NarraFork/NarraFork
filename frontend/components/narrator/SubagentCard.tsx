@@ -432,7 +432,7 @@ export const SubagentCard = memo(
 								</Alert>
 							)}
 							{/* Prompt — shown first when expanded */}
-							{prompt && !promptShownInHeader && (
+							{prompt && (
 								<Box px="xs" pb={4}>
 									<UnstyledButton onClick={() => setShowPrompt((o) => !o)}>
 										<Group gap={4}>

@@ -46,12 +46,7 @@ import {
 	getUserReplyInLanguage,
 	type Locale,
 } from "../lib/prompt-i18n";
-import {
-	type ImageRef,
-	saveUploadedImage,
-	saveUploadedTextFile,
-	type TextFileRef,
-} from "../lib/uploads";
+import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploads";
 import {
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
@@ -119,7 +114,7 @@ export async function parseMessageRequest(
 		};
 	},
 	narratorId: string,
-): Promise<{ message: string; images: ImageRef[]; textFiles: TextFileRef[] }> {
+): Promise<{ message: string; images: ImageRef[]; textFiles: File[] }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
@@ -137,11 +132,10 @@ export async function parseMessageRequest(
 		if (textFileEntries.length > 10) {
 			throw new ValidationError("Maximum 10 text files per message");
 		}
-		const textFiles: TextFileRef[] = [];
 		for (const file of textFileEntries) {
-			textFiles.push(await saveUploadedTextFile(narratorId, file));
+			validateTextFile(file);
 		}
-		return { message, images, textFiles };
+		return { message, images, textFiles: textFileEntries };
 	}
 	const body = await c.req.json();
 	const parsed = sendMessageSchema.safeParse(body);
