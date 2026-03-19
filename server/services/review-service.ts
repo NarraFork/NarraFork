@@ -7,12 +7,12 @@ import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { buildReviewSystemPrompt } from "../lib/prompt-i18n";
+import { buildReviewSystemPrompt, getReviewStartMessage } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
-import { closeNarrator, updateNarratorChapterRole } from "./narrator-session";
+import { closeNarrator, sendMessage, updateNarratorChapterRole } from "./narrator-session";
 
 export interface CreateReviewInput {
 	title?: string;
@@ -168,6 +168,17 @@ export const reviewService = {
 				type: "review:created",
 				reviewChapterId: id,
 				sourceChapterId,
+			});
+
+			// Step 7: Auto-start the review by sending the initial message
+			const locale = input.locale ?? "en";
+			const startMsg = getReviewStartMessage(locale);
+			sendMessage(narrator.id, startMsg, undefined, locale).catch((err) => {
+				logger.error("Failed to auto-start review", {
+					reviewChapterId: id,
+					narratorId: narrator.id,
+					error: String(err),
+				});
 			});
 
 			return chapter;

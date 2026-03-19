@@ -689,15 +689,14 @@ export const handleNarratorWS = {
 					hasFeedback: !!msg.feedbackText,
 					hasAnswers: !!msg.answers,
 				});
-				resolvePermission(
-					msg.requestId,
-					msg.decision,
-					msg.message,
-					msg.answers,
-					msg.feedbackText,
-					msg.compactAfter,
-					msg.updatedPlan,
-				).catch((err) => {
+				resolvePermission(msg.requestId, msg.decision, {
+					denyMessage: msg.message,
+					answers: msg.answers,
+					feedbackText: msg.feedbackText,
+					compactAfter: msg.compactAfter,
+					updatedPlan: msg.updatedPlan,
+					userId: ws.data.userId,
+				}).catch((err) => {
 					logger.error("Failed to resolve permission", { error: String(err) });
 					try {
 						ws.send(

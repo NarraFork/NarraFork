@@ -173,13 +173,16 @@ class McpManager {
 			entry.reconnectTimer = undefined;
 		}
 
+		// Remove from map BEFORE closing transport so the onclose callback
+		// (which fires during transport.close()) won't schedule a reconnect.
+		const name = entry.config.name;
+		this.clients.delete(serverId);
+
 		try {
 			await entry.transport?.close?.();
 		} catch {
 			// ignore close errors
 		}
-		const name = entry.config.name;
-		this.clients.delete(serverId);
 		eventBus.emit({
 			type: "mcp:server_disconnected",
 			serverId,

@@ -242,15 +242,18 @@ let pendingOAuth: PendingOAuth | undefined;
 
 const CALLBACK_PORT = 1455;
 
-async function startOAuthServer(): Promise<{ port: number; redirectUri: string }> {
+async function ensureOAuthServer(): Promise<{ port: number; redirectUri: string }> {
 	if (oauthServer) {
 		const port = oauthServer.port ?? CALLBACK_PORT;
 		return { port, redirectUri: `http://localhost:${port}/auth/callback` };
 	}
 
-	// Use fixed port 1455 to match Go's RedirectURI
+	// Use fixed port 1455 to match Go's RedirectURI.
+	// The server is kept alive across multiple OAuth flows to avoid port-release
+	// race conditions when Bun.serve is stopped and immediately restarted.
 	oauthServer = Bun.serve({
 		port: CALLBACK_PORT,
+		reusePort: true,
 		fetch(req) {
 			const url = new URL(req.url);
 
@@ -280,7 +283,9 @@ async function startOAuthServer(): Promise<{ port: number; redirectUri: string }
 				}
 
 				if (!pendingOAuth || state !== pendingOAuth.state) {
-					const errorMsg = "Invalid state - potential CSRF attack";
+					const errorMsg = pendingOAuth
+						? "Invalid state - potential CSRF attack"
+						: "No pending OAuth flow (expired or already completed)";
 					pendingOAuth?.reject(new Error(errorMsg));
 					pendingOAuth = undefined;
 					return new Response(HTML_ERROR(errorMsg), {
@@ -300,7 +305,19 @@ async function startOAuthServer(): Promise<{ port: number; redirectUri: string }
 					current.proxy,
 				)
 					.then((tokens) => current.resolve(tokens))
-					.catch((err) => current.reject(err));
+					.catch((err) => {
+						// Enhance error message when proxy is not configured
+						if (!current.proxy && isNetworkError(err)) {
+							current.reject(
+								new Error(
+									`Token exchange failed (no proxy configured): ${err.message}. ` +
+										`If you are behind a firewall, configure the Codex proxy first.`,
+								),
+							);
+						} else {
+							current.reject(err);
+						}
+					});
 
 				return new Response(HTML_SUCCESS, {
 					headers: { "Content-Type": "text/html" },
@@ -312,29 +329,46 @@ async function startOAuthServer(): Promise<{ port: number; redirectUri: string }
 	});
 
 	const port = oauthServer.port ?? 0;
-	logger.info("Codex OAuth server started", { port });
+	logger.info("Codex OAuth callback server started (persistent)", { port });
 	return { port, redirectUri: `http://localhost:${port}/auth/callback` };
 }
 
-function stopOAuthServer() {
-	if (oauthServer) {
-		oauthServer.stop();
-		oauthServer = undefined;
-		logger.info("Codex OAuth server stopped");
-	}
+/** Heuristic: treat fetch/connection errors as network issues. */
+function isNetworkError(err: unknown): boolean {
+	if (!(err instanceof Error)) return false;
+	const msg = err.message.toLowerCase();
+	return (
+		msg.includes("fetch") ||
+		msg.includes("econnrefused") ||
+		msg.includes("enotfound") ||
+		msg.includes("etimedout") ||
+		msg.includes("econnreset") ||
+		msg.includes("unable to connect") ||
+		msg.includes("network") ||
+		msg.includes("dns")
+	);
 }
 
 /**
  * Start the browser-based OAuth flow.
  * Returns the authorization URL to open in the browser and a promise that resolves with tokens.
+ *
+ * The OAuth callback server is kept alive across flows — only the pending state is replaced.
+ * If a previous flow is still pending it is silently rejected before starting the new one.
  */
 export async function startBrowserOAuth(proxy?: string): Promise<{
 	authorizeUrl: string;
 	tokenPromise: Promise<CodexTokens>;
 }> {
-	const { redirectUri } = await startOAuthServer();
+	const { redirectUri } = await ensureOAuthServer();
 	const pkce = generatePKCE();
 	const state = generateState();
+
+	// Cancel any lingering previous flow
+	if (pendingOAuth) {
+		pendingOAuth.reject(new Error("Superseded by a new browser OAuth flow"));
+		pendingOAuth = undefined;
+	}
 
 	const params = new URLSearchParams({
 		client_id: CLIENT_ID,
@@ -353,9 +387,8 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 	const tokenPromise = new Promise<CodexTokens>((resolve, reject) => {
 		const timeout = setTimeout(
 			() => {
-				if (pendingOAuth) {
+				if (pendingOAuth?.state === state) {
 					pendingOAuth = undefined;
-					stopOAuthServer();
 					reject(new Error("OAuth callback timeout"));
 				}
 			},
@@ -368,7 +401,6 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 			proxy,
 			resolve: (tokens) => {
 				clearTimeout(timeout);
-				stopOAuthServer();
 				const info = extractIdTokenInfo(tokens);
 				resolve({
 					accessToken: tokens.access_token,
@@ -380,7 +412,6 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 			},
 			reject: (error) => {
 				clearTimeout(timeout);
-				stopOAuthServer();
 				reject(error);
 			},
 		};
@@ -551,11 +582,11 @@ export async function pollDeviceCodeFlow(
 
 /**
  * Cancel any pending browser OAuth flow.
+ * The callback server is intentionally kept alive for future flows.
  */
 export function cancelBrowserOAuth(): void {
 	if (pendingOAuth) {
 		pendingOAuth.reject(new Error("Login cancelled"));
 		pendingOAuth = undefined;
 	}
-	stopOAuthServer();
 }

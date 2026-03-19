@@ -135,8 +135,9 @@ const NODE_HEIGHT = 72;
 const NODE_MIN_WIDTH = 80;
 const NODE_TITLE_PADDING = 24; // horizontal padding inside card for title
 
-// Reusable TextStyle for title width measurement (font size updated before each use)
+// Reusable TextStyles for width measurement (font size updated before each use)
 const measureStyle = new TextStyle({ fontFamily: "sans-serif", fontWeight: "600", fontSize: 11 });
+const measureBadgeStyle = new TextStyle({ fontFamily: "sans-serif", fontSize: 9 });
 const CARD_TOP_OFFSET = 2;
 
 function narratorStatusColor(theme: PixiTheme, status: string): number {
@@ -771,12 +772,29 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			// Guard against stale/incomplete chapter data after cleanup
 			if (!ch.title || !ch.status) continue;
 
-			// Compute per-chapter card width based on measured title width.
+			// Compute per-chapter card width based on measured content widths.
 			// CanvasTextMetrics has built-in caching so repeated calls are cheap.
-			const measured = CanvasTextMetrics.measureText(ch.title ?? "", measureStyle);
+			const titleMeasured = CanvasTextMetrics.measureText(ch.title ?? "", measureStyle);
+			const titleNeeded = titleMeasured.width + NODE_TITLE_PADDING;
+			// Status row: dot(12+3+3) + status text + gap(10) + narrator dot(6+5) + narrator text
+			// Padding: 18px left (dot area) + text widths + gaps
+			const statusText = ch.status ?? "";
+			const narratorText = ch.narratorStatus ?? "";
+			const statusMeasured = CanvasTextMetrics.measureText(statusText, measureBadgeStyle);
+			let statusRowWidth = 18 + statusMeasured.width;
+			if (narratorText) {
+				const nsMeasured = CanvasTextMetrics.measureText(narratorText, measureBadgeStyle);
+				statusRowWidth += 10 + 6 + 5 + nsMeasured.width;
+			}
+			statusRowWidth += 8; // right padding
+			// Branch row: 8px left + branch text + 8px right
+			const branchText = ch.branch ?? "";
+			const branchNeeded = branchText
+				? CanvasTextMetrics.measureText(branchText, measureBadgeStyle).width + 16
+				: 0;
 			const chapterWidth = Math.max(
 				NODE_MIN_WIDTH,
-				Math.min(NODE_WIDTH, measured.width + NODE_TITLE_PADDING),
+				Math.min(NODE_WIDTH, Math.max(titleNeeded, statusRowWidth, branchNeeded)),
 			);
 
 			const morph = getMorphStyle(t, chapterWidth, NODE_HEIGHT);
@@ -905,7 +923,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				// --- Chapter title text (unified for pill + card phases) ---
 				if (screenMorph.titleOpacity > 0 && screenW > 30) {
 					const cb = screenMorph.cardBlend;
-					const titleFontSize = screenMorph.titleFontSize;
+					const titleFontSize = screenMorph.titleFontSize * cardScale;
 					// Blend fill color: dimmed (pill) → cardText (card)
 					const titleFill = cb > 0.5 ? theme.cardText : theme.dimmed;
 					const titleWeight = cb > 0.5 ? "600" : "normal";

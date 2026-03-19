@@ -6,6 +6,7 @@ Available agent types:
 - explore: Isolated read-only agent for codebase exploration. Tools: Read, Glob, Grep, WebSearch, Bash
 - plan: Software architect agent for designing implementation plans. Tools: Read, Glob, Grep, WebSearch, Bash
 - general: General-purpose agent with write access. Has access to all tools except Task.
+- Custom types: Users can define custom subagent types with specialized prompts and tool access. Use the custom type name as the subagent_type value. Custom types have their own system prompts and tool permissions configured by the user.
 
 When to use each type:
 

@@ -55,10 +55,15 @@ import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
- * Context carrying the toolUseId of the narrator's latest TaskCreate call.
- * TodoDetail uses this to decide whether in_progress items should animate.
+ * Context carrying the toolUseId of the narrator's latest TaskCreate call
+ * and whether the narrator is currently thinking.
+ * TodoDetail uses this to decide whether in_progress items should animate —
+ * spinning only makes sense while the narrator is actively working.
  */
-export const LatestTodosToolUseIdCtx = createContext<string | null>(null);
+export const LatestTodosToolUseIdCtx = createContext<{
+	toolUseId: string | null;
+	isThinking: boolean;
+}>({ toolUseId: null, isThinking: false });
 
 // --- Types ---
 
@@ -1776,7 +1781,7 @@ const TODO_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }
 };
 
 function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const latestToolUseId = useContext(LatestTodosToolUseIdCtx);
+	const { toolUseId: latestToolUseId, isThinking } = useContext(LatestTodosToolUseIdCtx);
 	const isLatest = !!toolCall.toolUseId && toolCall.toolUseId === latestToolUseId;
 	const raw = isTruncated(toolCall.inputJson)
 		? isTruncated(toolCall.outputJson)
@@ -1794,7 +1799,7 @@ function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 			<List spacing={4} size="xs" center>
 				{todos.map((todo, i) => {
 					const entry = TODO_STATUS_ICON[todo.status ?? "pending"] ?? TODO_STATUS_ICON.pending;
-					const spinning = isLatest && todo.status === "in_progress";
+					const spinning = isLatest && isThinking && todo.status === "in_progress";
 					const StatusIconComp = spinning ? IconLoader2 : entry.icon;
 					return (
 						<List.Item

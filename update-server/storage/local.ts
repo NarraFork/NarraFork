@@ -1,0 +1,155 @@
+/**
+ * Local filesystem storage backend.
+ */
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, join, relative } from "node:path";
+import type { StorageBackend } from "./types";
+
+export class LocalStorage implements StorageBackend {
+	constructor(private readonly baseDir: string) {
+		if (!existsSync(baseDir)) {
+			mkdirSync(baseDir, { recursive: true });
+		}
+	}
+
+	private resolve(path: string): string {
+		return join(this.baseDir, path);
+	}
+
+	async saveFile(path: string, data: Buffer | ReadableStream): Promise<void> {
+		const fullPath = this.resolve(path);
+		const dir = dirname(fullPath);
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+
+		if (Buffer.isBuffer(data)) {
+			writeFileSync(fullPath, data);
+		} else {
+			// ReadableStream → collect into Buffer
+			const chunks: Uint8Array[] = [];
+			const reader = (data as ReadableStream).getReader();
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const buf = Buffer.concat(chunks);
+			writeFileSync(fullPath, buf);
+		}
+	}
+
+	async getFile(path: string): Promise<Buffer | null> {
+		const fullPath = this.resolve(path);
+		if (!existsSync(fullPath)) return null;
+		try {
+			return readFileSync(fullPath);
+		} catch {
+			return null;
+		}
+	}
+
+	async getFileStream(path: string): Promise<ReadableStream | null> {
+		const fullPath = this.resolve(path);
+		if (!existsSync(fullPath)) return null;
+		try {
+			const file = Bun.file(fullPath);
+			return file.stream();
+		} catch {
+			return null;
+		}
+	}
+
+	async getFileSize(path: string): Promise<number | null> {
+		const fullPath = this.resolve(path);
+		if (!existsSync(fullPath)) return null;
+		try {
+			return statSync(fullPath).size;
+		} catch {
+			return null;
+		}
+	}
+
+	async deleteFile(path: string): Promise<void> {
+		const fullPath = this.resolve(path);
+		if (existsSync(fullPath)) {
+			try {
+				unlinkSync(fullPath);
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	async deleteDirectory(path: string): Promise<void> {
+		const fullPath = this.resolve(path);
+		if (existsSync(fullPath)) {
+			try {
+				rmSync(fullPath, { recursive: true, force: true });
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	async listFiles(prefix: string): Promise<string[]> {
+		const fullPath = this.resolve(prefix);
+		if (!existsSync(fullPath)) return [];
+
+		const results: string[] = [];
+		const walk = (dir: string) => {
+			try {
+				const entries = readdirSync(dir, { withFileTypes: true });
+				for (const entry of entries) {
+					const entryPath = join(dir, entry.name);
+					if (entry.isDirectory()) {
+						walk(entryPath);
+					} else {
+						results.push(relative(this.baseDir, entryPath));
+					}
+				}
+			} catch {
+				// ignore
+			}
+		};
+
+		try {
+			const stat = statSync(fullPath);
+			if (stat.isDirectory()) {
+				walk(fullPath);
+			} else {
+				results.push(relative(this.baseDir, fullPath));
+			}
+		} catch {
+			// ignore
+		}
+
+		return results;
+	}
+
+	async fileExists(path: string): Promise<boolean> {
+		return existsSync(this.resolve(path));
+	}
+
+	async getFileSlice(path: string, start: number, end: number): Promise<Buffer | null> {
+		const fullPath = this.resolve(path);
+		if (!existsSync(fullPath)) return null;
+		try {
+			const file = Bun.file(fullPath);
+			const slice = file.slice(start, end + 1);
+			const arrayBuf = await slice.arrayBuffer();
+			return Buffer.from(arrayBuf);
+		} catch {
+			return null;
+		}
+	}
+}

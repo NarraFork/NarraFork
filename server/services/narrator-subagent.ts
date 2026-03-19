@@ -18,6 +18,7 @@ import {
 } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
@@ -81,26 +82,77 @@ const GENERAL_EXCLUDED = new Set([
 	"TaskCreate",
 ]);
 
-/** Tool filter factories per subagent type */
-const TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
+/** Tool filter factories per built-in subagent type */
+const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
 	explore: (tool) => READONLY_TOOLS.has(tool.name),
 	plan: (tool) => READONLY_TOOLS.has(tool.name),
 	general: (tool) => !GENERAL_EXCLUDED.has(tool.name),
 };
+
+/**
+ * Resolve the tool filter for a subagent type.
+ * For built-in types, returns the static filter.
+ * For custom types, builds a filter based on the custom definition's toolAccess.
+ * Accepts an optional pre-loaded customDef to avoid redundant I/O.
+ */
+function resolveToolFilter(
+	subagentType: string,
+	customDef?: CustomSubagentDef | null,
+): ((tool: ToolDefinition) => boolean) | undefined {
+	const builtin = BUILTIN_TOOL_FILTERS[subagentType];
+	if (builtin) return builtin;
+
+	if (!customDef) return BUILTIN_TOOL_FILTERS.explore; // fallback: deny write access when definition is missing
+
+	switch (customDef.toolAccess) {
+		case "readOnly":
+			return BUILTIN_TOOL_FILTERS.explore;
+		case "general":
+			return BUILTIN_TOOL_FILTERS.general;
+		case "custom": {
+			const allowed = new Set(customDef.customTools);
+			return (tool) => allowed.has(tool.name);
+		}
+		default:
+			return BUILTIN_TOOL_FILTERS.explore;
+	}
+}
 
 // === Shared helpers ===
 
 /**
  * Build the effective system prompt for a subagent.
  * Optionally injects contextSummary (after compact).
+ * Accepts an optional pre-loaded customPrompt to avoid redundant I/O.
  */
 async function buildSubagentSystemPrompt(
 	subagentType: SubagentType,
 	cwd: string,
 	locale: Locale,
 	contextSummary?: string | null,
+	customPrompt?: string | null,
 ): Promise<string> {
-	const basePrompt = getSubagentPrompt(subagentType, locale);
+	// Try built-in prompt first
+	let basePrompt = getSubagentPrompt(subagentType, locale);
+
+	// If not a built-in type, use the pre-loaded custom prompt or load it
+	if (!basePrompt) {
+		if (customPrompt !== undefined) {
+			basePrompt = customPrompt;
+		} else {
+			const customDef = await customSubagentService.loadByName(subagentType);
+			basePrompt = customDef?.prompt ?? null;
+		}
+	}
+
+	// Fallback to a generic prompt if nothing found
+	if (!basePrompt) {
+		basePrompt =
+			locale === "zh-CN"
+				? "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。"
+				: "You are a subagent executing a delegated task. Complete the task and report your results concisely.";
+	}
+
 	const { prompt } = await buildEffectiveSystemPrompt({
 		basePrompt,
 		cwd,
@@ -227,7 +279,7 @@ interface SubagentExecOptions {
 	narratorId: string;
 	parentNarratorId: string;
 	toolUseId: string;
-	subagentType: "explore" | "plan" | "general";
+	subagentType: string;
 	prompt: string;
 	cwd: string;
 	model: string;
@@ -238,6 +290,8 @@ interface SubagentExecOptions {
 	/** Initial history (empty for new subagents, pre-loaded for continued) */
 	initialHistory: unknown[];
 	initialTrailingToolResults?: unknown[];
+	/** Pre-loaded custom subagent definition (avoids redundant I/O) */
+	customDef?: CustomSubagentDef | null;
 }
 
 /**
@@ -305,6 +359,9 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
 	let narratorFastMode = initialNarrator.fastMode ?? false;
 
+	// Resolve tool filter for this subagent type using pre-loaded customDef
+	const toolFilter = resolveToolFilter(subagentType, opts.customDef);
+
 	while (true) {
 		const eventContext = buildSubagentEventContext(
 			narratorId,
@@ -333,7 +390,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			metadata: isAnthropicProvider(resolvedProvider)
 				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,
-			toolFilter: TOOL_FILTERS[subagentType],
+			toolFilter,
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(
 					narratorId,
@@ -830,7 +887,7 @@ export function waitForBackgroundTask(
 export interface RunSubagentInput {
 	parentNarratorId: string;
 	toolUseId: string;
-	subagentType: "explore" | "plan" | "general";
+	subagentType: string;
 	prompt: string;
 	cwd: string;
 	signal: AbortSignal;
@@ -859,11 +916,26 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		background,
 	} = input;
 
-	const systemPrompt = await buildSubagentSystemPrompt(subagentType, cwd, locale as Locale);
+	// Load custom subagent definition once for non-builtin types
+	const isBuiltin =
+		subagentType === "explore" || subagentType === "plan" || subagentType === "general";
+	const customDef = isBuiltin ? null : await customSubagentService.loadByName(subagentType);
 
-	// Resolve model: explicit param > per-type setting > parent model > global default
-	const subagentPref =
-		subagentType !== "general" ? settings.agent.subagentModels?.[subagentType] : undefined;
+	const systemPrompt = await buildSubagentSystemPrompt(
+		subagentType,
+		cwd,
+		locale as Locale,
+		undefined,
+		customDef?.prompt,
+	);
+
+	// Resolve model: explicit param > per-type setting / custom default > parent model > global default
+	let subagentPref: string | undefined;
+	if (subagentType === "explore" || subagentType === "plan") {
+		subagentPref = settings.agent.subagentModels?.[subagentType] || undefined;
+	} else if (customDef) {
+		subagentPref = customDef.defaultModel || undefined;
+	}
 
 	// 1. Create subagent narrator
 	const subagent = await narratorService.createSubagent({
@@ -930,6 +1002,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			signal: bgAbort.signal,
 			systemPrompt,
 			initialHistory: [],
+			customDef,
 		}).catch((err) => {
 			logger.error("Background task unexpected error", {
 				subagentId,
@@ -973,6 +1046,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			signal: combinedSignal,
 			systemPrompt,
 			initialHistory: [],
+			customDef,
 		});
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
 		hasError = result.hasError || !!result.contextLengthExceeded;
@@ -1031,10 +1105,15 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 		throw new ValidationError(`Cannot continue subagent in status "${original.status}"`);
 	}
 
-	const subagentType = (original.subagentType ?? "general") as "explore" | "plan" | "general";
+	const subagentType = original.subagentType ?? "general";
 	const model = original.model ?? settings.agent.defaultModel;
 	const provider = resolveProvider(model);
 	const cwd = original.cwd ?? ".";
+
+	// Load custom subagent definition once for non-builtin types
+	const isBuiltinContinue =
+		subagentType === "explore" || subagentType === "plan" || subagentType === "general";
+	const customDef = isBuiltinContinue ? null : await customSubagentService.loadByName(subagentType);
 
 	// 2. Fork: create new subagent narrator and copy message refs from original
 	const forked = await narratorService.forkSubagent({
@@ -1082,6 +1161,7 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 			systemPrompt: original.systemPrompt ?? "",
 			initialHistory: history,
 			initialTrailingToolResults: trailingToolResults,
+			customDef,
 		});
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
 		hasError = result.hasError || !!result.contextLengthExceeded;

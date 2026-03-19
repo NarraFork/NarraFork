@@ -98,5 +98,22 @@
 	"globalPromptSave": "保存",
 	"globalPromptSaved": "已保存",
 	"globalPromptSaveTo": "保存到",
-	"globalPromptPlaceholder": "输入所有叙述者共享的全局指令..."
+	"globalPromptPlaceholder": "输入所有叙述者共享的全局指令...",
+	"tabCustomSubagents": "自定义子代理",
+	"customSubagentsDesc": "定义具有专用提示词和工具权限的自定义子代理类型。自定义类型可与内置类型（explore、plan、general）一起使用。",
+	"noCustomSubagents": "暂无自定义子代理。创建一个开始使用。",
+	"createSubagent": "创建子代理",
+	"editSubagent": "编辑",
+	"deleteSubagent": "删除",
+	"subagentName": "类型名称",
+	"subagentNamePlaceholder": "例如 security-reviewer",
+	"subagentDescription": "描述",
+	"subagentDescriptionPlaceholder": "简要描述该子代理的专长",
+	"subagentToolAccess": "工具权限",
+	"subagentCustomTools": "允许的工具",
+	"subagentDefaultModel": "默认模型",
+	"subagentDefaultModelPlaceholder": "留空则继承父叙述者的模型",
+	"subagentPrompt": "系统提示词",
+	"subagentPromptPlaceholder": "该子代理类型的指令...",
+	"deleteSubagentConfirm": "确定要删除自定义子代理「{{name}}」吗？"
 }

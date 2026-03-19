@@ -127,6 +127,7 @@ export function CodexSection({
 	const loadBalancingMode = status?.loadBalancingMode ?? "priority";
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
+	const lastBrowserAuthError = status?.lastBrowserAuthError;
 
 	useEffect(() => {
 		if (!status) return;
@@ -139,6 +140,28 @@ export function CodexSection({
 			setDefaultReasoningInitialized(true);
 		}
 	}, [status, globalProxyInitialized, defaultReasoningInitialized]);
+
+	// Auto-detect browser auth failure from server-side error
+	useEffect(() => {
+		if (browserAuthPending && lastBrowserAuthError) {
+			// Clean up polling
+			if (browserAuthIntervalRef.current) {
+				clearInterval(browserAuthIntervalRef.current);
+				browserAuthIntervalRef.current = null;
+			}
+			if (browserAuthTimeoutRef.current) {
+				clearTimeout(browserAuthTimeoutRef.current);
+				browserAuthTimeoutRef.current = null;
+			}
+			setBrowserAuthPending(false);
+			setBrowserAuthLoading(false);
+			notifications.show({
+				message: lastBrowserAuthError,
+				color: "red",
+				autoClose: 10_000,
+			});
+		}
+	}, [browserAuthPending, lastBrowserAuthError]);
 
 	// Mutations
 	const disableMut = useMutation({

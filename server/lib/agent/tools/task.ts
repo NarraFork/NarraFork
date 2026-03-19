@@ -20,8 +20,11 @@ function buildParameters() {
 		description: z.string().optional().describe("A short (3-5 word) description of the task"),
 		prompt: z.string().describe("The task for the agent to perform"),
 		subagent_type: z
-			.enum(["explore", "plan", "general"])
-			.describe("The type of specialized agent to use for this task"),
+			.string()
+			.min(1)
+			.describe(
+				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
+			),
 		model: z
 			.string()
 			.optional()
@@ -64,7 +67,8 @@ export const agentTool: ToolDefinition = {
 					type: "string",
 				},
 				subagent_type: {
-					description: "The type of specialized agent to use for this task",
+					description:
+						'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "general". Custom types are also supported.',
 					type: "string",
 				},
 				resume: {
@@ -101,7 +105,7 @@ export const agentTool: ToolDefinition = {
 		const { prompt, subagent_type, model, workdir, background } = args as {
 			prompt: string;
 			description?: string;
-			subagent_type: "explore" | "plan" | "general";
+			subagent_type: string;
 			model?: string;
 			workdir?: string;
 			background?: boolean;
@@ -122,7 +126,7 @@ export const agentTool: ToolDefinition = {
 			const result = await runSubagent({
 				parentNarratorId: ctx.narratorId,
 				toolUseId,
-				subagentType: subagent_type,
+				subagentType: subagent_type || "general",
 				prompt,
 				cwd: resolvedWorkdir,
 				signal: ctx.signal,

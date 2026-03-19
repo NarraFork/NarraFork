@@ -98,5 +98,22 @@
 	"globalPromptSave": "Save",
 	"globalPromptSaved": "Saved",
 	"globalPromptSaveTo": "Save to",
-	"globalPromptPlaceholder": "Enter global instructions for all narrators..."
+	"globalPromptPlaceholder": "Enter global instructions for all narrators...",
+	"tabCustomSubagents": "Custom Subagents",
+	"customSubagentsDesc": "Define custom subagent types with specialized prompts and tool permissions. Custom types can be used alongside built-in types (explore, plan, general).",
+	"noCustomSubagents": "No custom subagents defined. Create one to get started.",
+	"createSubagent": "Create Subagent",
+	"editSubagent": "Edit",
+	"deleteSubagent": "Delete",
+	"subagentName": "Type Name",
+	"subagentNamePlaceholder": "e.g. security-reviewer",
+	"subagentDescription": "Description",
+	"subagentDescriptionPlaceholder": "Brief description of what this subagent specializes in",
+	"subagentToolAccess": "Tool Access",
+	"subagentCustomTools": "Allowed Tools",
+	"subagentDefaultModel": "Default Model",
+	"subagentDefaultModelPlaceholder": "Leave empty to inherit from parent narrator",
+	"subagentPrompt": "System Prompt",
+	"subagentPromptPlaceholder": "Instructions for this subagent type...",
+	"deleteSubagentConfirm": "Are you sure you want to delete custom subagent \"{{name}}\"?"
 }

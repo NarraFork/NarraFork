@@ -344,7 +344,26 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 	const deleteCmdBl = useDeleteCmdBlacklist(narratorId);
 
 	const [opened, { toggle, close }] = useDisclosure(false);
+	const dropdownRef = useRef<HTMLDivElement>(null);
 	const badgeCount = wlDirs.length + blDirs.length + cmdWl.length + cmdBl.length;
+
+	// Custom click-outside handler that ignores clicks on portal children
+	// (Combobox dropdowns, Modals) which live outside the Popover DOM tree.
+	useEffect(() => {
+		if (!opened) return;
+		const handler = (e: MouseEvent) => {
+			const target = e.target as HTMLElement | null;
+			if (!target) return;
+			// Ignore clicks inside the popover dropdown itself
+			if (dropdownRef.current?.contains(target)) return;
+			// Ignore clicks inside any Mantine portal overlay (Modal, Combobox dropdown, etc.)
+			if (target.closest(".mantine-Modal-root, .mantine-Modal-overlay, .mantine-Combobox-dropdown"))
+				return;
+			close();
+		};
+		document.addEventListener("mousedown", handler);
+		return () => document.removeEventListener("mousedown", handler);
+	}, [opened, close]);
 
 	const trigger = (
 		<Tooltip label={t("path_rules")}>
@@ -596,14 +615,15 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 	return (
 		<Popover
 			opened={opened}
-			onChange={(o) => !o && close()}
+			onClose={close}
 			position="top-end"
 			width={420}
 			shadow="md"
 			withinPortal
+			closeOnClickOutside={false}
 		>
 			<Popover.Target>{trigger}</Popover.Target>
-			<Popover.Dropdown>{content}</Popover.Dropdown>
+			<Popover.Dropdown ref={dropdownRef}>{content}</Popover.Dropdown>
 		</Popover>
 	);
 }
@@ -1069,6 +1089,11 @@ export function NarratorPanel({
 	const isPlanning = narrator?.permissionMode === "plan" && narrator?.status === "thinking";
 	const isRetrying = !!retryInfo;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
+
+	const todosCtxValue = useMemo(
+		() => ({ toolUseId: todosToolUseId, isThinking: !!isWorking }),
+		[todosToolUseId, isWorking],
+	);
 
 	// --- Retry countdown ---
 	const [retryCountdown, setRetryCountdown] = useState<number>(0);
@@ -2433,7 +2458,7 @@ export function NarratorPanel({
 								: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
 						}}
 					>
-						<LatestTodosToolUseIdCtx.Provider value={todosToolUseId}>
+						<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
 							<Stack gap="sm" ref={contentRef}>
 								{visibleElements}
 								<StreamingBubble

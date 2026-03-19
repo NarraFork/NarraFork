@@ -141,6 +141,15 @@ export interface BlacklistCmd {
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 
+export interface CustomSubagentData {
+	name: string;
+	description: string;
+	toolAccess: string;
+	customTools: string[];
+	defaultModel: string;
+	prompt: string;
+}
+
 export interface BufferCreator {
 	id: string;
 	username: string;
@@ -1588,6 +1597,25 @@ export const api = {
 		request<{ ok: boolean }>(`/skills/global/${encodeURIComponent(name)}`, {
 			method: "DELETE",
 		}),
+
+	// Custom Subagents
+	listCustomSubagents: () => request<CustomSubagentData[]>("/custom-subagents"),
+	getCustomSubagent: (name: string) =>
+		request<CustomSubagentData>(`/custom-subagents/${encodeURIComponent(name)}`),
+	createCustomSubagent: (data: CustomSubagentData) =>
+		request<CustomSubagentData>("/custom-subagents", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateCustomSubagent: (currentName: string, data: CustomSubagentData) =>
+		request<CustomSubagentData>(`/custom-subagents/${encodeURIComponent(currentName)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deleteCustomSubagent: (name: string) =>
+		request<{ ok: boolean }>(`/custom-subagents/${encodeURIComponent(name)}`, {
+			method: "DELETE",
+		}),
 	openaiRefreshModels: () =>
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
 			"/openai/models/refresh",
@@ -1645,6 +1673,7 @@ export const api = {
 			stickySessionCount: number;
 			globalProxy?: string;
 			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+			lastBrowserAuthError?: string;
 			usageCache: Record<
 				string,
 				{

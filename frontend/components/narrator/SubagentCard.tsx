@@ -87,6 +87,8 @@ export const SubagentCard = memo(
 		const input = toolCall.inputJson ?? {};
 		const isBackground = !!input.background || !!input.run_in_background;
 		const agentType = input.subagent_type ?? "agent";
+		const isBuiltinType = ["explore", "plan", "general", "agent"].includes(agentType);
+		const agentBadgeColor = isBuiltinType ? "indigo" : "teal";
 		const isBgWarning = isBackground && !/^explore$/i.test(agentType);
 		const dismissed =
 			(toolCall.toolUseId && permCb?.bgRetryDismissedIds?.has(toolCall.toolUseId)) ?? false;
@@ -327,7 +329,7 @@ export const SubagentCard = memo(
 							<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
 								<IconRobot size={10} />
 							</ThemeIcon>
-							<Badge size="xs" variant="light" color="indigo">
+							<Badge size="xs" variant="light" color={agentBadgeColor}>
 								{agentType}
 							</Badge>
 							{isBackground && (

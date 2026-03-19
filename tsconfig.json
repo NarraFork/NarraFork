@@ -18,6 +18,6 @@
 			"@shared/*": ["./shared/*"]
 		}
 	},
-	"include": ["server/**/*.ts", "frontend/**/*.ts", "frontend/**/*.tsx", "shared/**/*.ts", "tests/**/*.ts"],
+	"include": ["server/**/*.ts", "frontend/**/*.ts", "frontend/**/*.tsx", "shared/**/*.ts", "tests/**/*.ts", "update-server/**/*.ts"],
 	"exclude": ["node_modules", "dist"]
 }

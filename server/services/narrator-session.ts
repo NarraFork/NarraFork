@@ -190,6 +190,12 @@ const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: s
 // Tracks narrators that should run plan compact after ExitPlanMode completes — keyed by narratorId
 const pendingPlanCompact = hotSafe<Set<string>>("narrafork.pendingPlanCompact", () => new Set());
 
+// Tracks the userId of the user who approved the plan — keyed by narratorId
+const pendingPlanApprover = hotSafe<Map<string, string>>(
+	"narrafork.pendingPlanApprover",
+	() => new Map(),
+);
+
 // Buffered message queue — keyed by narratorId, supports multiple queued messages
 export interface BufferCreator {
 	id: string;
@@ -352,7 +358,7 @@ function resolveWhitelistDecision(
 		if (pathsEqual(resolvedWorkdir, cwd)) return null;
 		const access = whitelistAccessForPath(cwd, resolvedWorkdir, whitelistDirs);
 		if (!access) return null;
-		const isGeneral = input.subagent_type === "general";
+		const isGeneral = input.subagent_type !== "explore" && input.subagent_type !== "plan";
 		if (!isGeneral) return "allow";
 		return access === "full" ? "allow" : null;
 	}
@@ -458,11 +464,11 @@ function resolveBlacklistDecision(
 		if (pathsEqual(resolvedWorkdir, cwd)) return null;
 		const match = blacklistMatchForPath(cwd, resolvedWorkdir, blacklistDirs);
 		if (!match) return null;
-		// denyAll blocks everything; denyWrite blocks general subagents (which have write access)
+		// denyAll blocks everything; denyWrite blocks subagents with write access (non-explore/plan)
 		if (match.denyLevel === "denyAll") {
 			return { decision: "deny", reason: formatBlacklistReason(match, resolvedWorkdir) };
 		}
-		if (input.subagent_type === "general") {
+		if (input.subagent_type !== "explore" && input.subagent_type !== "plan") {
 			return { decision: "deny", reason: formatBlacklistReason(match, resolvedWorkdir) };
 		}
 		return null;
@@ -898,8 +904,8 @@ export function resolvePermissionDecision(
 		const isDifferentDir = resolvedWorkdir !== null && !pathsEqual(resolvedWorkdir, normalizedCwd);
 
 		if (effectiveMode === "readOnly") {
-			// general subagents have write access — always deny in readOnly
-			if (input.subagent_type === "general") return "deny";
+			// Non-explore/plan subagents may have write access — always deny in readOnly
+			if (input.subagent_type !== "explore" && input.subagent_type !== "plan") return "deny";
 			// explore/plan: workdir outside cwd needs user approval
 			if (isOutsideCwd) return "ask";
 			return "allow";
@@ -1538,16 +1544,22 @@ export async function handlePermission(
 	});
 }
 
+export interface ResolvePermissionOpts {
+	denyMessage?: string;
+	answers?: Record<string, string>;
+	feedbackText?: string;
+	compactAfter?: boolean;
+	updatedPlan?: string;
+	userId?: string;
+}
+
 /** Called from WebSocket when user makes a permission decision */
 export async function resolvePermission(
 	requestId: string,
 	decision: "allow" | "deny",
-	denyMessage?: string,
-	answers?: Record<string, string>,
-	feedbackText?: string,
-	compactAfter?: boolean,
-	updatedPlan?: string,
+	opts: ResolvePermissionOpts = {},
 ): Promise<void> {
+	const { denyMessage, answers, feedbackText, compactAfter, updatedPlan, userId } = opts;
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
 		logger.warn("Permission resolution for unknown request", {
@@ -1644,6 +1656,12 @@ export async function resolvePermission(
 		// Mark for plan compact if requested (ExitPlanMode + reset context)
 		if (compactAfter) {
 			pendingPlanCompact.add(pending.narratorId);
+		}
+
+		// Track the approver userId for ExitPlanMode so the continuation message
+		// can display the approver's avatar and username.
+		if (pending.toolName === "ExitPlanMode" && userId) {
+			pendingPlanApprover.set(pending.narratorId, userId);
 		}
 
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
@@ -2812,9 +2830,17 @@ async function runAgentLoop(
 				const promptText = fb ? fb.feedbackText : continuePrompt;
 				if (fb) pendingFeedback.delete(narratorId);
 
-				const userMsg = await narratorService.persistUserMessage(narratorId, promptText, [
-					{ type: "text", text: promptText },
-				]);
+				// Retrieve the approver userId so the message shows their avatar
+				const approverId = pendingPlanApprover.get(narratorId);
+				if (approverId) pendingPlanApprover.delete(narratorId);
+
+				const userMsg = await narratorService.persistUserMessage(
+					narratorId,
+					promptText,
+					[{ type: "text", text: promptText }],
+					undefined,
+					approverId,
+				);
 				broadcastToNarrator(narratorId, {
 					type: "user_message",
 					narratorId,

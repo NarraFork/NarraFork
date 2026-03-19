@@ -1015,7 +1015,8 @@ narratorRoutes.get("/:id/permissions", async (c) => {
 // Approve permission
 narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const requestId = c.req.param("requestId");
-	await resolvePermission(requestId, "allow");
+	const userId = c.get("user").sub;
+	await resolvePermission(requestId, "allow", { userId });
 	return c.json({ ok: true });
 });
 
@@ -1024,7 +1025,9 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const requestId = c.req.param("requestId");
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
-	await resolvePermission(requestId, "deny", parsed.success ? parsed.data.message : undefined);
+	await resolvePermission(requestId, "deny", {
+		denyMessage: parsed.success ? parsed.data.message : undefined,
+	});
 	return c.json({ ok: true });
 });
 

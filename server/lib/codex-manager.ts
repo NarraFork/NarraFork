@@ -77,6 +77,8 @@ export interface ManagerSnapshot {
 	available: number;
 	stickySessionCount: number;
 	usageCache: Record<string, CodexUsageResult>;
+	/** Last browser OAuth error message (cleared on success). */
+	lastBrowserAuthError?: string;
 }
 
 export interface CallContext {
@@ -139,6 +141,8 @@ export class CodexManager {
 	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
 	private sessionAffinity = new Map<string, SessionAffinityEntry>();
 	private readonly beforeExitHandler: () => void;
+	/** Exposed via snapshot so the frontend can show browser-auth errors. */
+	private _lastBrowserAuthError?: string;
 
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
@@ -449,6 +453,7 @@ export class CodexManager {
 			available,
 			stickySessionCount: this.sessionAffinity.size,
 			usageCache: usageCacheObj,
+			lastBrowserAuthError: this._lastBrowserAuthError,
 		};
 	}
 
@@ -551,14 +556,19 @@ export class CodexManager {
 		const proxy = settings.codex?.proxy;
 		const { authorizeUrl, tokenPromise } = await startBrowserOAuth(proxy);
 
+		// Clear previous error when a new flow starts
+		this._lastBrowserAuthError = undefined;
+
 		// Handle the result in background
 		tokenPromise
 			.then((tokens) => {
+				this._lastBrowserAuthError = undefined;
 				this.addCredentialFromTokens(tokens);
 				logger.info("Codex browser auth completed", { accountId: tokens.accountId });
 			})
 			.catch((err) => {
-				logger.warn("Codex browser auth failed", { error: err.message });
+				this._lastBrowserAuthError = err instanceof Error ? err.message : String(err);
+				logger.warn("Codex browser auth failed", { error: this._lastBrowserAuthError });
 			});
 
 		return { authorizeUrl };

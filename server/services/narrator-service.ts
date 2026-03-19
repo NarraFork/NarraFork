@@ -298,7 +298,7 @@ interface CreateNarratorInput {
 
 interface CreateSubagentInput {
 	parentNarratorId: string;
-	subagentType: "explore" | "plan" | "general";
+	subagentType: string;
 	cwd: string;
 	permissionMode?: string;
 	model?: string;
@@ -516,7 +516,7 @@ export const narratorService = {
 	async forkSubagent(input: {
 		originalSubagentId: string;
 		parentNarratorId: string;
-		subagentType: "explore" | "plan" | "general";
+		subagentType: string;
 		cwd: string;
 		systemPrompt?: string;
 		model?: string;

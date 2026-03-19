@@ -213,7 +213,7 @@ export const narrators = sqliteTable(
 		type: text("type", { enum: ["primary", "subagent"] })
 			.notNull()
 			.default("primary"),
-		subagentType: text("subagent_type", { enum: ["explore", "plan", "general", "review"] }),
+		subagentType: text("subagent_type"),
 		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()

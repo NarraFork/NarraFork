@@ -32,6 +32,13 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import {
+	type CustomSubagentDef,
+	useCreateCustomSubagent,
+	useCustomSubagents,
+	useDeleteCustomSubagent,
+	useUpdateCustomSubagent,
+} from "../../hooks/useCustomSubagents";
+import {
 	useConnectMcpServer,
 	useCreateMcpServer,
 	useDeleteMcpServer,
@@ -106,6 +113,7 @@ function RoutinesPage() {
 					<Tabs.Tab value="optional-tools">{t("tabOptionalTools")}</Tabs.Tab>
 					<Tabs.Tab value="global-skills">{t("tabGlobalSkills")}</Tabs.Tab>
 					<Tabs.Tab value="project-skills">{t("tabProjectSkills")}</Tabs.Tab>
+					<Tabs.Tab value="custom-subagents">{t("tabCustomSubagents")}</Tabs.Tab>
 					<Tabs.Tab value="global-prompt">{t("tabGlobalPrompt")}</Tabs.Tab>
 					<Tabs.Tab value="mcp-tools">{t("tabMcpTools")}</Tabs.Tab>
 				</Tabs.List>
@@ -121,6 +129,9 @@ function RoutinesPage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="project-skills">
 					<ProjectSkillsTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="custom-subagents">
+					<CustomSubagentsTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="global-prompt">
 					<GlobalPromptTab />
@@ -579,6 +590,300 @@ function GlobalPromptTab() {
 					</Button>
 				)}
 			</Group>
+		</Stack>
+	);
+}
+
+// === Tab: Custom Subagents ===
+
+const TOOL_ACCESS_OPTIONS = [
+	{ value: "readOnly", label: "Read-only" },
+	{ value: "general", label: "General (write access)" },
+	{ value: "custom", label: "Custom tool list" },
+];
+
+const AVAILABLE_TOOLS = [
+	"Read",
+	"Glob",
+	"Grep",
+	"WebSearch",
+	"Bash",
+	"Write",
+	"Edit",
+	"AskUserQuestion",
+	"Skill",
+	"ShareFile",
+	"Terminal",
+	"TaskCreate",
+];
+
+interface SubagentDraft {
+	name: string;
+	description: string;
+	toolAccess: string;
+	customTools: string[];
+	defaultModel: string;
+	prompt: string;
+}
+
+const emptyDraft: SubagentDraft = {
+	name: "",
+	description: "",
+	toolAccess: "readOnly",
+	customTools: [],
+	defaultModel: "",
+	prompt: "",
+};
+
+function CustomSubagentsTab() {
+	const { t } = useTranslation("routines");
+	const { data: subagents, isLoading } = useCustomSubagents();
+	const createMutation = useCreateCustomSubagent();
+	const updateMutation = useUpdateCustomSubagent();
+	const deleteMutation = useDeleteCustomSubagent();
+
+	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
+	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
+
+	const [editingName, setEditingName] = useState<string | null>(null);
+	const [draft, setDraft] = useState<SubagentDraft>(emptyDraft);
+	const [deleteTarget, setDeleteTarget] = useState("");
+
+	const handleCreate = useCallback(() => {
+		setEditingName(null);
+		setDraft(emptyDraft);
+		openEdit();
+	}, [openEdit]);
+
+	const handleEdit = useCallback(
+		(sa: CustomSubagentDef) => {
+			setEditingName(sa.name);
+			setDraft({
+				name: sa.name,
+				description: sa.description,
+				toolAccess: sa.toolAccess,
+				customTools: sa.customTools,
+				defaultModel: sa.defaultModel,
+				prompt: sa.prompt,
+			});
+			openEdit();
+		},
+		[openEdit],
+	);
+
+	const handleSave = useCallback(() => {
+		const data = {
+			name: draft.name.trim(),
+			description: draft.description.trim(),
+			toolAccess: draft.toolAccess,
+			customTools: draft.customTools,
+			defaultModel: draft.defaultModel.trim(),
+			prompt: draft.prompt.trim(),
+		};
+		if (!data.name) return;
+
+		if (editingName) {
+			updateMutation.mutate(
+				{ currentName: editingName, ...data },
+				{ onSuccess: () => closeEdit() },
+			);
+		} else {
+			createMutation.mutate(data, { onSuccess: () => closeEdit() });
+		}
+	}, [draft, editingName, createMutation, updateMutation, closeEdit]);
+
+	const handleDelete = useCallback(
+		(name: string) => {
+			setDeleteTarget(name);
+			openDelete();
+		},
+		[openDelete],
+	);
+
+	const confirmDelete = useCallback(() => {
+		deleteMutation.mutate(deleteTarget, { onSuccess: () => closeDelete() });
+	}, [deleteTarget, deleteMutation, closeDelete]);
+
+	const toolAccessLabel = (ta: string) =>
+		TOOL_ACCESS_OPTIONS.find((o) => o.value === ta)?.label ?? ta;
+
+	return (
+		<Stack>
+			<Group justify="space-between">
+				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
+					{t("customSubagentsDesc")}
+				</Text>
+				<Button
+					size="xs"
+					variant="light"
+					leftSection={<IconPlus size={14} />}
+					onClick={handleCreate}
+				>
+					{t("createSubagent")}
+				</Button>
+			</Group>
+
+			{isLoading && (
+				<Text size="sm" c="dimmed">
+					Loading...
+				</Text>
+			)}
+
+			{!isLoading && (!subagents || subagents.length === 0) && (
+				<Text size="sm" c="dimmed">
+					{t("noCustomSubagents")}
+				</Text>
+			)}
+
+			{subagents?.map((sa) => (
+				<Paper key={sa.name} withBorder p="sm">
+					<Group justify="space-between" wrap="nowrap">
+						<div style={{ flex: 1, minWidth: 0 }}>
+							<Group gap="xs">
+								<Text size="sm" fw={600}>
+									{sa.name}
+								</Text>
+								<Badge size="xs" variant="light" color="teal">
+									{toolAccessLabel(sa.toolAccess)}
+								</Badge>
+							</Group>
+							<Text size="xs" c="dimmed" truncate="end">
+								{sa.description || sa.prompt.slice(0, 80)}
+							</Text>
+						</div>
+						<Group gap={4}>
+							<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(sa)}>
+								{t("editSubagent")}
+							</Button>
+							<ActionIcon
+								variant="subtle"
+								color="red"
+								size="sm"
+								onClick={() => handleDelete(sa.name)}
+							>
+								<IconTrash size={14} />
+							</ActionIcon>
+						</Group>
+					</Group>
+				</Paper>
+			))}
+
+			{/* Create / Edit Modal */}
+			<Modal
+				opened={editOpened}
+				onClose={closeEdit}
+				title={editingName ? t("editSubagent") : t("createSubagent")}
+				size="lg"
+			>
+				<Stack>
+					<TextInput
+						label={t("subagentName")}
+						placeholder={t("subagentNamePlaceholder")}
+						value={draft.name}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, name: val }));
+						}}
+					/>
+					<TextInput
+						label={t("subagentDescription")}
+						placeholder={t("subagentDescriptionPlaceholder")}
+						value={draft.description}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, description: val }));
+						}}
+					/>
+					<Select
+						label={t("subagentToolAccess")}
+						data={TOOL_ACCESS_OPTIONS}
+						value={draft.toolAccess}
+						onChange={(v) => setDraft((d) => ({ ...d, toolAccess: v ?? "readOnly" }))}
+					/>
+					{draft.toolAccess === "custom" && (
+						<div>
+							<Text size="sm" fw={500} mb={4}>
+								{t("subagentCustomTools")}
+							</Text>
+							<Group gap="xs">
+								{AVAILABLE_TOOLS.map((tool) => (
+									<Badge
+										key={tool}
+										size="sm"
+										variant={draft.customTools.includes(tool) ? "filled" : "outline"}
+										color={draft.customTools.includes(tool) ? "indigo" : "gray"}
+										style={{ cursor: "pointer" }}
+										onClick={() =>
+											setDraft((d) => ({
+												...d,
+												customTools: d.customTools.includes(tool)
+													? d.customTools.filter((t) => t !== tool)
+													: [...d.customTools, tool],
+											}))
+										}
+									>
+										{tool}
+									</Badge>
+								))}
+							</Group>
+						</div>
+					)}
+					<TextInput
+						label={t("subagentDefaultModel")}
+						placeholder={t("subagentDefaultModelPlaceholder")}
+						value={draft.defaultModel}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, defaultModel: val }));
+						}}
+					/>
+					<Textarea
+						label={t("subagentPrompt")}
+						placeholder={t("subagentPromptPlaceholder")}
+						value={draft.prompt}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, prompt: val }));
+						}}
+						autosize
+						minRows={8}
+						maxRows={20}
+					/>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeEdit}>
+							{t("cancel")}
+						</Button>
+						<Button
+							onClick={handleSave}
+							disabled={!draft.name.trim()}
+							loading={createMutation.isPending || updateMutation.isPending}
+						>
+							{t("save")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+
+			{/* Delete Confirm Modal */}
+			<Modal
+				opened={deleteOpened}
+				onClose={closeDelete}
+				title={t("deleteConfirmTitle")}
+				size="sm"
+				centered
+			>
+				<Stack>
+					<Text size="sm">{t("deleteSubagentConfirm", { name: deleteTarget })}</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeDelete}>
+							{t("cancel")}
+						</Button>
+						<Button color="red" onClick={confirmDelete} loading={deleteMutation.isPending}>
+							{t("deleteSubagent")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
 		</Stack>
 	);
 }

@@ -11,7 +11,8 @@ export type PromptKey =
 	| "compactSuffix"
 	| "conflictResolution"
 	| "mergeSummary";
-export type SubagentType = "explore" | "plan" | "general";
+export type BuiltinSubagentType = "explore" | "plan" | "general";
+export type SubagentType = string;
 
 /** Platform-aware shell label used in prompts shown to the AI model. */
 const SH = IS_WINDOWS ? "Shell" : "Bash";
@@ -160,7 +161,7 @@ export function getPrompt(key: PromptKey, locale: Locale = "en"): string {
 
 // --- Subagent system prompts ---
 
-const subagentPrompts: Record<SubagentType, Record<Locale, string>> = {
+const subagentPrompts: Record<BuiltinSubagentType, Record<Locale, string>> = {
 	explore: {
 		en: `You are a codebase exploration specialist. Your purpose is to search, filter, and distill information from codebases so the caller gets only what they need — not everything you read.
 
@@ -251,10 +252,13 @@ Provide a concrete, actionable implementation plan.`,
 
 /**
  * Get a localized subagent system prompt by type and locale.
+ * Returns null for custom (non-builtin) subagent types.
  * Falls back to English if the locale is not found.
  */
-export function getSubagentPrompt(type: SubagentType, locale: Locale = "en"): string {
-	return subagentPrompts[type][locale] ?? subagentPrompts[type].en;
+export function getSubagentPrompt(type: SubagentType, locale: Locale = "en"): string | null {
+	const entry = subagentPrompts[type as BuiltinSubagentType];
+	if (!entry) return null;
+	return entry[locale] ?? entry.en;
 }
 
 // --- Review narrator prompts ---
@@ -293,6 +297,15 @@ When you have completed your review, output your conclusion directly. Your concl
 - 关键发现（按严重程度排列）
 - 具体的改进建议，包含文件路径和行号`,
 };
+
+const reviewStartMessages: Record<Locale, string> = {
+	en: "Please begin your code review now.",
+	"zh-CN": "请开始你的代码审查。",
+};
+
+export function getReviewStartMessage(locale: Locale = "en"): string {
+	return reviewStartMessages[locale] ?? reviewStartMessages.en;
+}
 
 /**
  * Build the full system prompt for a review narrator.
