@@ -228,7 +228,7 @@ export const narrators = sqliteTable(
 		}).default("default"),
 		previousPermissionMode: text("previous_permission_mode"),
 		reasoningEffort: text("reasoning_effort", {
-			enum: ["none", "low", "medium", "high"],
+			enum: ["none", "low", "medium", "high", "xhigh"],
 		}),
 		fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
 		relaxedPlan: integer("relaxed_plan", { mode: "boolean" }).notNull().default(false),

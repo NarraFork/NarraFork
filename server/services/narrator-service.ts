@@ -285,7 +285,7 @@ interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
-	reasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
 	title?: string;
@@ -2617,7 +2617,7 @@ export const narratorService = {
 
 	async updateReasoningEffort(
 		narratorId: string,
-		reasoningEffort: "none" | "low" | "medium" | "high" | null,
+		reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null,
 	) {
 		const now = new Date().toISOString();
 		await db

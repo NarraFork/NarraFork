@@ -125,6 +125,7 @@
 	"reasoning_low": "Low",
 	"reasoning_medium": "Medium",
 	"reasoning_high": "High",
+	"reasoning_xhigh": "X-High",
 	"reasoning_none": "Off",
 	"chaptersSection": "Chapters",
 	"maxActiveWorktrees": "Max Active Worktrees",

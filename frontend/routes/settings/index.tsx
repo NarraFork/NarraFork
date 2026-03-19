@@ -439,7 +439,7 @@ function SettingsPage() {
 				editor: { type: editor },
 				codex: {
 					defaultReasoningEffort:
-						(codexDefaultReasoningEffort as "none" | "low" | "medium" | "high") || null,
+						(codexDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") || null,
 				},
 			},
 			{

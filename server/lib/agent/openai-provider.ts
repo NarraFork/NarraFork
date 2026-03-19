@@ -33,6 +33,37 @@ function defaultBaseUrl(mode: OpenAIApiMode): string {
 	return "https://api.openai.com/v1";
 }
 
+const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
+	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
+	// "none" is omitted — it disables reasoning entirely and is handled via
+	// early-return in normalizeCodexReasoningEffort before this table is consulted.
+	// The frontend counterpart (NarratorPanel CODEX_REASONING_OPTIONS_BY_MODEL)
+	// includes "none" because it drives UI dropdown options.
+	"gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
+	"gpt-5.2-codex": ["low", "medium", "high", "xhigh"],
+	"gpt-5.1-codex-max": ["low", "medium", "high", "xhigh"],
+	"gpt-5.1-codex": ["low", "medium", "high"],
+	"gpt-5.1-codex-mini": ["medium", "high"],
+	"gpt-5.2": ["low", "medium", "high", "xhigh"],
+	"gpt-5.4": ["low", "medium", "high", "xhigh"],
+};
+
+function normalizeCodexReasoningEffort(
+	model: string,
+	reasoningEffort: string | undefined,
+): string | undefined {
+	if (!reasoningEffort) return undefined;
+	if (reasoningEffort === "none") return reasoningEffort;
+	const bareModel = parseModelId(model).model;
+	const supported = CODEX_MODEL_REASONING_LEVELS[bareModel];
+	if (!supported || supported.includes(reasoningEffort)) return reasoningEffort;
+	if (reasoningEffort === "xhigh" && supported.includes("high")) return "high";
+	if (reasoningEffort === "low" && supported.includes("medium")) return "medium";
+	// Fallback: requested level not supported and no degradation rule matched.
+	// Clamp to the lowest supported level to avoid sending an unsupported value.
+	return supported[0] ?? reasoningEffort;
+}
+
 // === OpenAI identity prompt ===
 // OpenAI models need an explicit identity and tool-use instruction in the system prompt.
 // OpenAI models benefit from system-level guidance to actively use their tools.
@@ -380,75 +411,23 @@ export class OpenAIProvider implements ProviderAdapter {
 				}
 			}
 
-			// Codex with previous_response_id: send only incremental input (tool results + user message).
-			// The server already has the full conversation history from the stored response.
-			const useStoredState = this.apiMode === "codex" && !!params.previousResponseId;
+			const sanitizedInputMessages = inputMessages.filter((msg) => {
+				if (msg.role !== "assistant") return true;
+				// Responses API rejects assistant role messages with null/empty content and no tool calls.
+				const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+				if (hasToolCalls) return true;
+				if (typeof msg.content === "string") return msg.content.length > 0;
+				if (Array.isArray(msg.content)) return msg.content.length > 0;
+				return false;
+			});
+			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages);
 
-			let responsesInput: OAIMessage[];
-			if (useStoredState) {
-				// Incremental mode: only new items since the last response.
-				// inputMessages at this point already excludes developer/system messages.
-				// We only need the tool results and user message appended in chat().
-				// These are the items added AFTER the history array (tool results + current user msg).
-				const incrementalMessages: OAIMessage[] = [];
-				// Tool results were appended to messages after history
-				for (const tr of params.toolResults as Array<{
-					type: string;
-					call_id: string;
-					output: string;
-				}>) {
-					// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-					incrementalMessages.push(tr as any);
-				}
-				// Current user message (if any, already appended to messages)
-				if (params.content && params.content !== ".") {
-					if (params.images?.length) {
-						const parts: OAIContentPart[] = [{ type: "input_text", text: params.content }];
-						for (const img of params.images) {
-							parts.push({
-								type: "input_image",
-								image_url: `data:image/${img.format};base64,${img.base64}`,
-							});
-						}
-						incrementalMessages.push({
-							role: "user",
-							content: parts,
-						} as unknown as OAIMessage);
-					} else {
-						incrementalMessages.push({
-							role: "user",
-							content: [{ type: "input_text", text: params.content }],
-						} as unknown as OAIMessage);
-					}
-				} else if ((params.toolResults as unknown[]).length === 0) {
-					incrementalMessages.push({
-						role: "user",
-						content: [{ type: "input_text", text: params.content }],
-					} as unknown as OAIMessage);
-				}
-				responsesInput = incrementalMessages;
-			} else {
-				const sanitizedInputMessages = inputMessages.filter((msg) => {
-					if (msg.role !== "assistant") return true;
-					// Responses API rejects assistant role messages with null/empty content and no tool calls.
-					const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-					if (hasToolCalls) return true;
-					if (typeof msg.content === "string") return msg.content.length > 0;
-					if (Array.isArray(msg.content)) return msg.content.length > 0;
-					return false;
-				});
-				responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages);
-			}
-
-			// Codex uses store: true for server-side response persistence (enables
-			// previous_response_id chaining and avoids 404 errors for reasoning items).
-			// Non-Codex Responses API keeps store: false.
-			const storeResponse = this.apiMode === "codex";
-			body = { model, input: responsesInput, stream: true, store: storeResponse };
-
-			if (useStoredState) {
-				body.previous_response_id = params.previousResponseId;
-			}
+			// Codex CLI sets store based on endpoint: false for standard OpenAI/ChatGPT
+			// endpoints, true only for Azure OpenAI. Since we use the ChatGPT backend
+			// (chatgpt.com/backend-api/codex), store must be false.
+			// With store: false the server does not persist responses, so
+			// previous_response_id is unsupported — always send full history.
+			body = { model, input: responsesInput, stream: true, store: false };
 
 			// Codex: enable server-side auto-truncation to handle context window overflow.
 			// Only send when using the official Codex endpoint — third-party proxies
@@ -472,9 +451,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 
 			// Add reasoning configuration for Codex provider requests.
-			if (params.reasoningEffort && this.apiMode === "codex") {
+			const normalizedCodexReasoningEffort =
+				this.apiMode === "codex"
+					? normalizeCodexReasoningEffort(model, params.reasoningEffort)
+					: params.reasoningEffort;
+			if (normalizedCodexReasoningEffort && this.apiMode === "codex") {
 				body.reasoning = {
-					effort: params.reasoningEffort,
+					effort: normalizedCodexReasoningEffort,
 					summary: "auto",
 				};
 				body.include = ["reasoning.encrypted_content"];
@@ -491,10 +474,8 @@ export class OpenAIProvider implements ProviderAdapter {
 				instructionsLength: instructions.length,
 				inputMessageCount: responsesInput.length,
 				toolCount: tools.length,
-				reasoningEffort: params.reasoningEffort,
-				previousResponseId: params.previousResponseId ?? null,
-				store: storeResponse,
-				useStoredState,
+				reasoningEffort: normalizedCodexReasoningEffort,
+				originalReasoningEffort: params.reasoningEffort,
 			});
 		} else {
 			// Completions: POST /chat/completions

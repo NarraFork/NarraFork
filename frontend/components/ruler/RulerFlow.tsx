@@ -65,8 +65,6 @@ const MIN_PANEL_HEIGHT = 200;
 
 /** Duration (ms) for the panel close animation — DOM unmount delay. */
 const PANEL_CLOSE_DURATION = 250;
-/** CSS transition duration string for panel opacity fade. */
-const PANEL_OPACITY_TRANSITION = "180ms ease";
 
 interface ChapterContextMenuState {
 	x: number;
@@ -275,27 +273,24 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			for (const [chId, div] of panelEls) {
 				const hr = hitRects.find((r) => r.id === chId);
 				if (hr) {
-					// Skip transform updates while the panel is being resized —
-					// the resize handler manages dimensions directly and the
-					// hitRect hasn't caught up with the in-progress size yet.
+					const panelFadeOp = getPanelFadeOpacity(hr.morphT);
+					const animOp = Number(div.dataset.animOpacity);
+					const finalOpacity = panelFadeOp * (Number.isFinite(animOp) ? animOp : 1);
 					const isResizing = div.dataset.resizing === "1";
 					if (!isResizing) {
 						div.style.left = `${ox + hr.screenX}px`;
 						div.style.top = `${oy + hr.screenY}px`;
-						// Panel scale = hitRect size / panel CSS size.
-						// The hitRect blends between panel and dot dimensions as t
-						// decreases, so the panel shrinks in lockstep.
 						const panelCSSW = Number(div.dataset.panelW) || 420;
 						const panelScale = hr.width / panelCSSW;
 						div.style.transform = `scale(${panelScale})`;
 					}
-					// Smooth cross-fade: panel opacity transitions continuously as
-					// morphT approaches MORPH_T_DOT, instead of a binary cutoff.
-					const panelFadeOp = getPanelFadeOpacity(hr.morphT);
-					const animOp = Number(div.dataset.animOpacity);
-					const finalOpacity = panelFadeOp * (Number.isFinite(animOp) ? animOp : 1);
 					div.style.opacity = String(finalOpacity);
 					div.style.pointerEvents = finalOpacity > 0 ? "auto" : "none";
+				} else {
+					// No hitRect — chapter is outside the rendered range or
+					// redraw hasn't run yet. Hide the panel to avoid a flash.
+					div.style.opacity = "0";
+					div.style.pointerEvents = "none";
 				}
 			}
 		}
@@ -2005,7 +2000,29 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			if (chapters.length === 0) {
 				pixiChaptersMapRef.current.delete(fromSha);
 			} else {
-				pixiChaptersMapRef.current.set(fromSha, chapters);
+				// Merge with existing data: summary-level responses omit fields
+				// like narratorId, branch, etc.  Preserve those from the previous
+				// full-detail load so open panels don't lose their narrator reference.
+				const prev = pixiChaptersMapRef.current.get(fromSha);
+				if (prev) {
+					const prevById = new Map(prev.map((c) => [c.id, c]));
+					const merged = chapters.map((ch) => {
+						const old = prevById.get(ch.id);
+						if (!old) return ch;
+						return {
+							...old,
+							...ch,
+							narratorId: ch.narratorId ?? old.narratorId,
+							narratorStatus: ch.narratorStatus ?? old.narratorStatus,
+							branch: ch.branch || old.branch,
+							startCommitSha: ch.startCommitSha ?? old.startCommitSha,
+							mergeCommitSha: ch.mergeCommitSha ?? old.mergeCommitSha,
+						};
+					});
+					pixiChaptersMapRef.current.set(fromSha, merged);
+				} else {
+					pixiChaptersMapRef.current.set(fromSha, chapters);
+				}
 			}
 			// Batch multiple SegmentCanvas loads within the same frame into one React update
 			if (!pixiChaptersTickRafRef.current) {
@@ -2118,6 +2135,46 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				});
 			}
 		}
+
+		// Ensure chapters with open/closing panels are always included even if
+		// their segment was culled by the viewport buffer.  Without this, panning
+		// a chapter to the fisheye edge and releasing the mouse triggers a React
+		// re-render that recalculates segmentTicks — the segment may fall outside
+		// the 3× viewport buffer, dropping the chapter from pixiChapters and
+		// causing the panel to vanish.
+		const includedIds = new Set(result.map((c) => c.id));
+		const panelIds = new Set([...openPanelChapterIds, ...closingPanelChapterIds]);
+		for (const chId of panelIds) {
+			if (includedIds.has(chId)) continue;
+			// Search all segments for this chapter
+			for (const [sha, chs] of pixiChaptersMapRef.current) {
+				const ch = chs.find((c) => c.id === chId);
+				if (!ch) continue;
+				// Find the tick position for this segment
+				const tick = layout.ticks.find((t) => t.sha === sha);
+				if (!tick) break;
+				const ps = panelSizes.get(ch.id);
+				result.push({
+					id: ch.id,
+					status: ch.status,
+					title: ch.title,
+					branch: ch.branch,
+					role: ch.role,
+					parentChapterId: ch.parentChapterId,
+					narratorId: ch.narratorId,
+					narratorStatus: ch.narratorStatus,
+					startCommitSha: ch.startCommitSha,
+					mergeCommitSha: ch.mergeCommitSha,
+					layoutX: ch.layoutX,
+					layoutY: ch.layoutY,
+					segMainPos: tick.x,
+					panelWidth: ps?.w ?? DEFAULT_PANEL_WIDTH,
+					panelHeight: ps?.h ?? DEFAULT_PANEL_HEIGHT,
+				});
+				break;
+			}
+		}
+
 		return result;
 	}, [segmentTicks, pixiChaptersTick, panelSizes, openPanelChapterIds, closingPanelChapterIds]);
 
@@ -2619,15 +2676,16 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 				const hitRects = pixiRef.current?.getCardHitRects() ?? [];
 				const hr = hitRects.find((r) => r.id === chId);
-				if (!hr) return null;
+				// Don't unmount the panel when hitRect is temporarily missing
+				if (!hr && !openPanelChapterIds.has(chId)) return null;
 
 				// Resolve actual map key for orphan chapters
-				const panelMapKey = resolvePixiMapKey(chId, hr.fromSha);
+				const panelMapKey = hr ? resolvePixiMapKey(chId, hr.fromSha) : "";
 
 				const containerEl = containerRef.current;
 				const cRect = containerEl?.getBoundingClientRect();
-				const screenX = (cRect?.left ?? 0) + hr.screenX;
-				const screenY = (cRect?.top ?? 0) + hr.screenY;
+				const screenX = hr ? (cRect?.left ?? 0) + hr.screenX : -9999;
+				const screenY = hr ? (cRect?.top ?? 0) + hr.screenY : -9999;
 
 				return (
 					<NarratorPanelOverlay
@@ -2653,7 +2711,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 								next.set(chId, { w: newW, h: newH });
 								return next;
 							});
-							const anchorSha = hr.fromSha;
+							const anchorSha = hr?.fromSha;
+							if (!anchorSha) return;
 							api.updateRulerPositions(projectId, [
 								{
 									chapterId: chId,
@@ -2990,14 +3049,13 @@ function NarratorPanelOverlay({
 				display: "flex",
 				flexDirection: "column",
 				overflow: "visible",
-				opacity: animOpacity,
-				transition: isResizingRef.current
-					? "none"
-					: `width 200ms ease, height 200ms ease, opacity ${PANEL_OPACITY_TRANSITION}`,
+				// opacity and transform are controlled exclusively by
+				// applyTransformToDOM (via useLayoutEffect) to avoid React
+				// inline-style resets fighting the per-frame DOM updates.
+				transition: isResizingRef.current ? "none" : "width 200ms ease, height 200ms ease",
 				userSelect: "none",
 				zIndex: 10,
 				pointerEvents: isClosing ? "none" : "auto",
-				transform: `scale(${panelScale})`,
 				transformOrigin: "top left",
 			}}
 			onPointerDown={(e) => e.stopPropagation()}

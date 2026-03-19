@@ -251,7 +251,7 @@ export interface AgentConfig {
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
-	reasoningEffort?: "none" | "low" | "medium" | "high";
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */

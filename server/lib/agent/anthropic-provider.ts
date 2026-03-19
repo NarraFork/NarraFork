@@ -217,8 +217,9 @@ function buildThinkingConfig(
  * Map reasoning effort to Anthropic effort parameter value.
  * Only for models that support the effort API (Opus 4.6, Sonnet 4.6).
  *
- * Mapping: low → low, medium → medium, high → high
+ * Mapping: low → low, medium → medium, high → high, xhigh → high
  * "none" is not mapped (thinking is disabled, effort is irrelevant).
+ * Anthropic does not expose an xhigh tier, so we clamp to high.
  */
 function mapEffortParam(
 	reasoningEffort: string | undefined,
@@ -228,6 +229,7 @@ function mapEffortParam(
 		low: "low",
 		medium: "medium",
 		high: "high",
+		xhigh: "high",
 	};
 	return map[reasoningEffort];
 }

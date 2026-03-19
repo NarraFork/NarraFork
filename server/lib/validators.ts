@@ -136,7 +136,7 @@ export const createNarratorSchema = z.object({
 		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"])
 		.optional(),
 	cwd: z.string().min(1).max(4096).optional(),
-	reasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
+	reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).nullable().optional(),
 	fastMode: z.boolean().optional(),
 	relaxedPlan: z.boolean().optional(),
 });

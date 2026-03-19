@@ -178,7 +178,7 @@ export function CodexSection({
 		},
 	});
 	const defaultReasoningMut = useMutation({
-		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | null) =>
+		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null) =>
 			api.codexSetDefaultReasoningEffort(reasoningEffort),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
@@ -400,13 +400,15 @@ export function CodexSection({
 				? tn("reasoning_medium")
 				: effectiveDefaultReasoningEffort === "high"
 					? tn("reasoning_high")
-					: effectiveDefaultReasoningEffort === "none"
-						? tn("reasoning_none")
-						: tn("reasoning_auto");
+					: effectiveDefaultReasoningEffort === "xhigh"
+						? tn("reasoning_xhigh")
+						: effectiveDefaultReasoningEffort === "none"
+							? tn("reasoning_none")
+							: tn("reasoning_auto");
 
 	const handleSaveDefaultReasoningEffort = () => {
 		const nextReasoningEffort =
-			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high") || null;
+			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") || null;
 		defaultReasoningMut.mutate(nextReasoningEffort, {
 			onSuccess: () => {
 				setDefaultReasoningEffort(nextReasoningEffort ?? "");
@@ -526,6 +528,7 @@ export function CodexSection({
 										{ label: tn("reasoning_low"), value: "low" },
 										{ label: tn("reasoning_medium"), value: "medium" },
 										{ label: tn("reasoning_high"), value: "high" },
+										{ label: tn("reasoning_xhigh"), value: "xhigh" },
 									]}
 								/>
 								<Button

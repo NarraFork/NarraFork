@@ -198,7 +198,7 @@ export interface NarraForkSettings {
 		/** Load balancing mode: "priority" (use highest priority) or "balanced" (round-robin). */
 		loadBalancingMode?: "priority" | "balanced";
 		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
-		defaultReasoningEffort?: "none" | "low" | "medium" | "high";
+		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 	};
 	/** Built-in routines configuration. */
 	routines: {
@@ -281,7 +281,8 @@ const DEFAULTS: NarraForkSettings = {
 		enabledRoutines: [],
 	},
 	codex: {
-		defaultReasoningEffort: "high",
+		// codex-reversed 显示官方默认 reasoning level 为 medium，避免默认 high 过快消耗额度。
+		defaultReasoningEffort: "medium",
 	},
 	update: {
 		serverUrl: "",
@@ -579,7 +580,7 @@ export function isAnthropicProvider(prefix?: string): boolean {
  */
 export function resolveDefaultReasoningEffort(
 	provider?: string,
-): "none" | "low" | "medium" | "high" | undefined {
+): "none" | "low" | "medium" | "high" | "xhigh" | undefined {
 	if (usesCodexApiMode(provider)) {
 		return settings.codex?.defaultReasoningEffort;
 	}
@@ -757,15 +758,16 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"o1-mini": 128_000,
 	"o3-mini": 200_000,
 	// Codex models (ChatGPT Pro/Plus)
-	// NOTE: Requests may fail around ~270k in practice; keep a conservative headroom.
+	// Context windows here mirror the official model catalog exposed by codex-reversed.
 	"gpt-5-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex-max": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex-mini": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.2-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.2": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.4": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.3-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	// codex-reversed 内置 model catalog 显示这些模型的 context_window 为 272000。
+	"gpt-5.1-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.1-codex-max": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.1-codex-mini": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.2-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.2": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.4": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.3-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	// Common third-party models (via OpenAI-compatible APIs)
 	"deepseek-chat": 64_000,
 	"deepseek-reasoner": 64_000,

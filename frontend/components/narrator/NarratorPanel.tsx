@@ -603,19 +603,49 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 	);
 }
 
+type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh";
+
+const DEFAULT_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
+	"none",
+	"low",
+	"medium",
+	"high",
+];
+
+const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
+	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
+	// Includes "none" for UI display (disables reasoning). The backend counterpart
+	// (openai-provider CODEX_MODEL_REASONING_LEVELS) omits "none" because it is
+	// handled separately before the table lookup.
+	"gpt-5.3-codex": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.2-codex": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.1-codex-max": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.1-codex": ["none", "low", "medium", "high"],
+	"gpt-5.1-codex-mini": ["none", "medium", "high"],
+	"gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
+};
+
+function getCodexReasoningEffortOptions(model?: string): readonly ReasoningEffortValue[] {
+	const bareModel = model?.split(":").slice(1).join(":") ?? "";
+	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_REASONING_EFFORT_OPTIONS;
+}
+
 function ReasoningEffortMenuItems({
 	currentEffort,
+	options,
 	onSelect,
 	t,
 }: {
 	currentEffort: string | null | undefined;
+	options: readonly ReasoningEffortValue[];
 	onSelect: (effort: string | null) => void;
 	t: (key: string) => string;
 }) {
 	return (
 		<>
 			<Menu.Label>{t("reasoningEffort")}</Menu.Label>
-			{(["", "none", "low", "medium", "high"] as const).map((effort) => {
+			{(["", ...options] as const).map((effort) => {
 				const selected = (currentEffort ?? "") === effort || (!currentEffort && effort === "");
 				return (
 					<Menu.Item
@@ -733,6 +763,14 @@ export function NarratorPanel({
 		const anthropicProviders = settingsData?.anthropicProviders ?? [];
 		return anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
 	}, [codexCapableProviders, settingsData?.anthropicProviders, narrator?.model]);
+	const reasoningEffortOptions = useMemo(() => {
+		if (!narrator?.model) return DEFAULT_REASONING_EFFORT_OPTIONS;
+		const providerPrefix = narrator.model.split(":")[0];
+		if (providerPrefix && codexCapableProviders.has(providerPrefix)) {
+			return getCodexReasoningEffortOptions(narrator.model);
+		}
+		return DEFAULT_REASONING_EFFORT_OPTIONS;
+	}, [codexCapableProviders, narrator?.model]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -2446,9 +2484,9 @@ export function NarratorPanel({
 										) : (
 											<Box w={16} h={16} style={{ flexShrink: 0 }} />
 										)}
-									<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-										{msg.text}
-									</Text>
+										<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
+											{msg.text}
+										</Text>
 										{msg.imageCount > 0 && (
 											<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
 												<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
@@ -2831,10 +2869,10 @@ export function NarratorPanel({
 												size="xs"
 												data={[
 													{ value: "", label: t("reasoning_auto") },
-													{ value: "none", label: t("reasoning_none") },
-													{ value: "low", label: t("reasoning_low") },
-													{ value: "medium", label: t("reasoning_medium") },
-													{ value: "high", label: t("reasoning_high") },
+													...reasoningEffortOptions.map((effort) => ({
+														value: effort,
+														label: t(`reasoning_${effort}`),
+													})),
 												]}
 												value={narrator.reasoningEffort ?? ""}
 												onChange={() => {}}
@@ -2845,6 +2883,7 @@ export function NarratorPanel({
 										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 											<ReasoningEffortMenuItems
 												currentEffort={narrator.reasoningEffort}
+												options={reasoningEffortOptions}
 												onSelect={(e) =>
 													reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
 												}
@@ -2959,7 +2998,13 @@ export function NarratorPanel({
 										<ActionIcon variant="subtle" color="gray" size="sm">
 											<Text size="xs" fw={600}>
 												{(() => {
-													const effortMap = { none: "O", low: "L", medium: "M", high: "H" };
+													const effortMap = {
+														none: "O",
+														low: "L",
+														medium: "M",
+														high: "H",
+														xhigh: "X",
+													};
 													return (
 														effortMap[narrator.reasoningEffort as keyof typeof effortMap] ?? "A"
 													);
@@ -2970,6 +3015,7 @@ export function NarratorPanel({
 									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 										<ReasoningEffortMenuItems
 											currentEffort={narrator.reasoningEffort}
+											options={reasoningEffortOptions}
 											onSelect={(e) =>
 												reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
 											}

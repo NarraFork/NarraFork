@@ -84,6 +84,7 @@ export function ModelsSection({
 					{ value: "low", label: tn("reasoning_low") },
 					{ value: "medium", label: tn("reasoning_medium") },
 					{ value: "high", label: tn("reasoning_high") },
+					{ value: "xhigh", label: tn("reasoning_xhigh") },
 				]}
 				value={codexDefaultReasoningEffort || "auto"}
 				onChange={(v) => setCodexDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}

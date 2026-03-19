@@ -312,15 +312,18 @@ codexRoutes.get("/default-reasoning-effort", (c) => {
  */
 codexRoutes.post("/default-reasoning-effort", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as {
-		reasoningEffort?: "none" | "low" | "medium" | "high" | null;
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	};
-	const validEfforts = ["none", "low", "medium", "high"] as const;
+	const validEfforts = ["none", "low", "medium", "high", "xhigh"] as const;
 	if (
 		body.reasoningEffort !== null &&
 		body.reasoningEffort !== undefined &&
 		!validEfforts.includes(body.reasoningEffort)
 	) {
-		return c.json({ error: "Invalid reasoningEffort. Must be none|low|medium|high or null" }, 400);
+		return c.json(
+			{ error: "Invalid reasoningEffort. Must be none|low|medium|high|xhigh or null" },
+			400,
+		);
 	}
 
 	const settings = loadSettings();

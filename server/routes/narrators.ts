@@ -75,9 +75,9 @@ import {
 } from "../services/file-state-rebuild";
 import { handleLoadToolCommand, narratorService } from "../services/narrator-service";
 import {
+	type BufferCreator,
 	clearBufferedMessages,
 	closeNarrator,
-	type BufferCreator,
 	continueNarrator,
 	editAndRegenerate,
 	getBufferedMessages,
@@ -880,7 +880,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	const id = c.req.param("id");
 	const { reasoningEffort } = await c.req.json();
-	const validEfforts = ["none", "low", "medium", "high"];
+	const validEfforts = ["none", "low", "medium", "high", "xhigh"];
 	if (
 		reasoningEffort !== null &&
 		reasoningEffort !== undefined &&

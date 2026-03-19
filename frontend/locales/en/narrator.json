@@ -96,6 +96,7 @@
 	"reasoning_low": "Low",
 	"reasoning_medium": "Medium",
 	"reasoning_high": "High",
+	"reasoning_xhigh": "X-High",
 	"reasoning_none": "Off",
 	"fast_mode": "Fast Mode",
 	"fast_mode_tooltip": "Enable priority processing tier for faster inference (service_tier: priority)",
