@@ -18,6 +18,7 @@ import {
 } from "../lib/validators";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
+import { getClineEnabledModelsGrouped } from "./cline";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
 const modelOptionSchema = z.object({
@@ -56,6 +57,16 @@ const anthropicProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
+});
+
+const clineProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	baseUrl: z.string(),
+	accessToken: z.string().optional(),
+	defaultModel: z.string(),
+	defaultContextWindow: z.number().int().min(1).optional(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
@@ -138,6 +149,7 @@ const updateSettingsSchema = z
 			.optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
+		clineProviders: z.array(clineProviderSchema).optional(),
 		codex: z
 			.object({
 				proxy: z.string().optional(),
@@ -218,9 +230,14 @@ settingsRoutes.get("/", (c) => {
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
+		clineProviders: (s.clineProviders ?? []).map((p) => ({
+			...p,
+			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
+		})),
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
+		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
 		lanAddresses: getLanAddresses(),
@@ -273,10 +290,26 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real access tokens for Cline providers
+	if (validated.clineProviders) {
+		const currentProviders = current.clineProviders ?? [];
+		for (const p of validated.clineProviders) {
+			if (p.accessToken?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.accessToken = existing?.accessToken ?? "";
+			}
+		}
+	}
+
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
+		if (
+			key === "openaiProviders" ||
+			key === "anthropicProviders" ||
+			key === "clineProviders"
+		) {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
@@ -320,6 +353,10 @@ settingsRoutes.patch("/", async (c) => {
 		})),
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		clineProviders: (merged.clineProviders ?? []).map((p) => ({
+			...p,
+			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
 	};
 	return c.json(result);

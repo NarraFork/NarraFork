@@ -1,7 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api } from "../lib/api";
-import { groupModelsByProvider, type ModelOption, mergeModels, modelValue } from "../lib/constants";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	groupModelsByProvider,
+	type ModelOption,
+	mergeModels,
+	modelValue,
+} from "../lib/constants";
 
 export interface ProviderModels {
 	prefix: string;
@@ -140,6 +146,37 @@ export function useAllModels() {
 			}
 		}
 
+		// --- Cline models (per-provider, OpenRouter-based) ---
+		const clineModelsGrouped: Array<{
+			providerId: string;
+			providerName: string;
+			models: Array<{ id: string; name?: string }>;
+		}> = settingsData?.clineModelsGrouped ?? [];
+
+		const serverClineProviders: Array<{ id: string; prefix?: string; name?: string }> =
+			settingsData?.clineProviders ?? [];
+
+		const fetchedClineModels: ModelOption[] = [];
+		const clineByProvider: ProviderModels[] = [];
+
+		for (const group of clineModelsGrouped) {
+			const cfg = serverClineProviders.find((p) => p.id === group.providerId);
+			const prefix = cfg?.prefix ?? "cline";
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const opt: ModelOption = {
+					value: `${prefix}:${m.id}`,
+					label: m.name || m.id,
+					provider: prefix,
+				};
+				models.push(opt);
+				fetchedClineModels.push(opt);
+			}
+			clineByProvider.push({ prefix, name, models });
+		}
+
 		// --- Custom models ---
 		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? []).map(
 			(m: { value: string; label: string; provider?: string }) => ({
@@ -163,25 +200,49 @@ export function useAllModels() {
 		const allModels = mergeModels(
 			fetchedOpenaiModels,
 			fetchedAnthropicModels,
+			fetchedClineModels,
 			codexModels,
 			customModels,
 		);
 		const visibleModels = allModels.filter((m) => !hidden.has(m.value));
-		const groupedModels = groupModelsByProvider(visibleModels, providerLabels);
+
+		// --- "Follow default" option ---
+		const defaultModelOption = visibleModels.find((m) => m.value === defaultModelValue);
+		const defaultModelLabel = defaultModelOption?.label ?? defaultModelValue;
+		const followDefaultOption: ModelOption = {
+			value: FOLLOW_DEFAULT_MODEL,
+			label: defaultModelLabel,
+			provider: "__default__",
+		};
+
+		// Prepend follow-default to visible models for grouped select
+		const visibleWithDefault = [followDefaultOption, ...visibleModels];
+		const groupedModels = groupModelsByProvider(visibleWithDefault, {
+			...providerLabels,
+			__default__: "Default",
+		});
 
 		return {
 			/** All models (including hidden). */
 			allModels,
 			/** Models after hiddenModels filter. */
 			visibleModels,
-			/** Grouped for Mantine Select. */
+			/** Models with "follow default" prepended, after hiddenModels filter. */
+			visibleWithDefault,
+			/** Grouped for Mantine Select (includes "follow default"). */
 			groupedModels,
+			/** The "follow default" ModelOption. */
+			followDefaultOption,
+			/** The current default model value from settings. */
+			defaultModelValue,
 			/** Codex models only. */
 			codexModels,
 			/** OpenAI models grouped by provider. */
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */
 			anthropicByProvider,
+			/** Cline models grouped by provider. */
+			clineByProvider,
 			/** Custom models. */
 			customModels,
 			/** Hidden model values set. */

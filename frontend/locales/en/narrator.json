@@ -64,6 +64,7 @@
 	"archiveNarrator": "Archive",
 	"permissionMode": "Permission Mode",
 	"modelTooltip": "Model for next message",
+	"followDefault": "Follow default ({{model}})",
 	"perm_default": "Default",
 	"perm_acceptEdits": "Accept Edits",
 	"perm_bypassPermissions": "Bypass All",

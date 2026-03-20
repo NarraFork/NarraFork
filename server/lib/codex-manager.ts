@@ -38,6 +38,8 @@ export interface CodexCredential {
 	expiresAt?: number;
 	accountId?: string;
 	email?: string;
+	/** JWT subject claim — unique per user, used for deduplication. */
+	sub?: string;
 	priority: number;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
@@ -261,6 +263,7 @@ export class CodexManager {
 				expiresAt: refreshed.expiresAt,
 				accountId: refreshed.accountId,
 				email: refreshed.email,
+				sub: refreshed.sub,
 			});
 
 			this.saveCredentials();
@@ -287,6 +290,7 @@ export class CodexManager {
 				expiresAt: tokens.expiresAt,
 				accountId: tokens.accountId ?? cred.accountId,
 				email: tokens.email ?? cred.email,
+				sub: tokens.sub ?? cred.sub,
 			};
 		})().finally(() => {
 			this.refreshPromises.delete(id);
@@ -646,6 +650,7 @@ export class CodexManager {
 			expiresAt: refreshed.expiresAt,
 			accountId: refreshed.accountId,
 			email: refreshed.email,
+			sub: refreshed.sub,
 		});
 		this.saveCredentials();
 	}
@@ -694,6 +699,7 @@ export class CodexManager {
 				expiresAt: refreshed.expiresAt,
 				accountId: refreshed.accountId,
 				email: refreshed.email,
+				sub: refreshed.sub,
 			});
 			this.saveCredentials();
 		}
@@ -757,13 +763,27 @@ export class CodexManager {
 	// ==================== Credential Management ====================
 
 	private addCredentialFromTokens(tokens: CodexTokens): CodexCredential {
-		// Check for duplicates based on accountId or refreshToken hash
+		// Check for duplicates: refreshToken hash > sub > (accountId + email)
 		const refreshTokenHash = sha256Hex(tokens.refreshToken);
-		const existing = this.entries.find(
-			(e) =>
-				(e.accountId && e.accountId === tokens.accountId) ||
-				sha256Hex(e.refreshToken) === refreshTokenHash,
-		);
+		const existing = this.entries.find((e) => {
+			// Most precise: same refresh token
+			if (sha256Hex(e.refreshToken) === refreshTokenHash) return true;
+			// JWT subject is unique per user
+			if (e.sub && tokens.sub && e.sub === tokens.sub) return true;
+			// accountId alone is unreliable (org-level IDs can collide);
+			// require both accountId AND email to match.
+			if (
+				e.accountId &&
+				tokens.accountId &&
+				e.accountId === tokens.accountId &&
+				e.email &&
+				tokens.email &&
+				e.email === tokens.email
+			) {
+				return true;
+			}
+			return false;
+		});
 
 		if (existing) {
 			// Update existing credential
@@ -772,6 +792,7 @@ export class CodexManager {
 			existing.expiresAt = tokens.expiresAt;
 			if (tokens.accountId) existing.accountId = tokens.accountId;
 			if (tokens.email) existing.email = tokens.email;
+			if (tokens.sub) existing.sub = tokens.sub;
 			if (existing.disabled && existing.disabledReason !== "manual") {
 				existing.disabled = false;
 				existing.disabledReason = undefined;
@@ -788,6 +809,7 @@ export class CodexManager {
 			expiresAt: tokens.expiresAt,
 			accountId: tokens.accountId,
 			email: tokens.email,
+			sub: tokens.sub,
 			priority: this.entries.length,
 			disabled: false,
 		};

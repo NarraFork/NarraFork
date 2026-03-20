@@ -13,7 +13,9 @@ import { IconArchiveOff } from "@tabler/icons-react";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { useAllModels } from "../../hooks/useModels";
 import { useNarratorsPaginated, useUnarchiveNarrator } from "../../hooks/useNarrator";
+import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 
 export const Route = createFileRoute("/narrators/archived")({
 	component: ArchivedNarratorsPage,
@@ -34,6 +36,7 @@ function ArchivedNarratorsPage() {
 	const unarchiveNarrator = useUnarchiveNarrator();
 	const { t } = useTranslation("narrators");
 	const { i18n } = useTranslation();
+	const { defaultModelValue } = useAllModels();
 
 	const sentinelRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
@@ -76,7 +79,10 @@ function ArchivedNarratorsPage() {
 										</Text>
 										<Text size="sm" c="dimmed">
 											{t("narratorMeta", {
-												model: narrator.model,
+												model:
+													narrator.model === FOLLOW_DEFAULT_MODEL
+														? t("followDefault", { model: defaultModelValue })
+														: narrator.model,
 												count: narrator.messageCount ?? 0,
 											})}
 										</Text>

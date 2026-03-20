@@ -79,6 +79,25 @@ export interface AnthropicProviderConfig {
 	defaultModel: string;
 }
 
+export interface ClineProviderConfig {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** User-defined display name, e.g. "Cline", "Cline Production". */
+	name: string;
+	/** Provider prefix used in model IDs, e.g. "cline". */
+	prefix: string;
+	/** Cline API base URL, e.g. "https://openrouter.ai/api/v1". */
+	baseUrl: string;
+	/** OAuth access token (workos: prefix will be added automatically). */
+	accessToken?: string;
+	/** Default model (bare name without prefix). */
+	defaultModel: string;
+	/** Default context window size (tokens) for models in this provider. */
+	defaultContextWindow?: number;
+	/** User-selected models from the OpenRouter pool. Only these are available for use. */
+	enabledModels?: string[];
+}
+
 export interface McpServerConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -211,6 +230,8 @@ export interface NarraForkSettings {
 	openaiProviders?: OpenAIProviderConfig[];
 	/** Anthropic native API providers. */
 	anthropicProviders?: AnthropicProviderConfig[];
+	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */
+	clineProviders?: ClineProviderConfig[];
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
 	/** Delta update configuration. */
@@ -501,9 +522,11 @@ export function getBuiltinCodexModels(): string[] {
 let openaiModelChecker: ((model: string) => boolean) | null = null;
 let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
+let clineModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
+let clineModelLister: (() => string[]) | null = null;
 
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
@@ -541,6 +564,30 @@ export function registerCodexModelLister(lister: () => string[]): void {
 
 }
 
+export function registerClineModelChecker(checker: (model: string) => boolean): void {
+	clineModelChecker = checker;
+}
+
+export function registerClineModelLister(lister: () => string[]): void {
+	clineModelLister = lister;
+}
+
+/**
+ * Sentinel value stored in `narrators.model` to indicate "follow the default model from settings".
+ * When the user changes `settings.agent.defaultModel`, narrators with this value automatically
+ * pick up the new default on their next session start.
+ */
+export const FOLLOW_DEFAULT_MODEL = "__default__";
+
+/**
+ * Resolve the effective model string.  If the stored value is null, undefined,
+ * or the `__default__` sentinel, fall back to `settings.agent.defaultModel`.
+ */
+export function resolveEffectiveModel(model: string | null | undefined): string {
+	if (!model || model === FOLLOW_DEFAULT_MODEL) return settings.agent.defaultModel;
+	return model;
+}
+
 /**
  * Get all available model values (provider:id format), excluding hidden models.
  */
@@ -549,6 +596,7 @@ export function getVisibleModels(): string[] {
 	const openai = openaiModelLister?.() ?? [];
 	const anthropic = anthropicModelLister?.() ?? [];
 	const codex = codexModelLister?.() ?? [];
+	const cline = clineModelLister?.() ?? [];
 	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
 	const seen = new Set<string>();
 	const result: string[] = [];
@@ -656,6 +704,26 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 	return config.prefix;
 }
 
+/**
+ * Get the Cline provider config by its prefix.
+ * If prefix is undefined, returns the first provider.
+ */
+export function getClineProviderConfig(prefix?: string): ClineProviderConfig | undefined {
+	const providers = settings.clineProviders ?? [];
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+/** Get the provider prefix for a given Cline provider config. */
+export function clineProviderPrefix(config: ClineProviderConfig): string {
+	return config.prefix;
+}
+
+export function hasConfiguredClineProvider(): boolean {
+	const providers = settings.clineProviders ?? [];
+	return providers.some((p) => !!p.accessToken);
+}
+
 function hasConfiguredOpenaiProvider(): boolean {
 	const providers = settings.openaiProviders ?? [];
 	return providers.some((p) => !!p.apiKey);
@@ -700,6 +768,11 @@ function getConfiguredProviderCandidates(): string[] {
 		}
 	}
 	}
+	if (hasConfiguredClineProvider()) {
+		for (const p of settings.clineProviders ?? []) {
+			if (p.accessToken) available.add(p.prefix || "cline");
+		}
+	}
 	const result: string[] = [];
 
 	const preferredOpenai = (settings.openaiProviders ?? []).find((p) => p.apiKey)?.prefix;
@@ -739,6 +812,7 @@ export function resolveProvider(model?: string): string {
 		if (openaiModelChecker?.(bare)) return "openai";
 		if (anthropicModelChecker?.(bare)) return "anthropic";
 		if (codexModelChecker?.(bare)) return "codex";
+		if (clineModelChecker?.(bare)) return "cline";
 	}
 
 	const configured = getConfiguredProviderCandidates();

@@ -34,6 +34,8 @@ export interface CodexTokens {
 	accountId?: string;
 	/** Email extracted from JWT claims. */
 	email?: string;
+	/** JWT subject claim — unique per user, used for deduplication. */
+	sub?: string;
 }
 
 interface TokenResponse {
@@ -49,6 +51,7 @@ interface PkceCodes {
 }
 
 interface IdTokenClaims {
+	sub?: string;
 	chatgpt_account_id?: string;
 	organizations?: Array<{ id: string }>;
 	email?: string;
@@ -106,12 +109,16 @@ function parseJwtClaims(token: string): IdTokenClaims | undefined {
 function extractIdTokenInfo(tokens: TokenResponse): {
 	accountId?: string;
 	email?: string;
+	sub?: string;
 } {
-	const result: { accountId?: string; email?: string } = {};
+	const result: { accountId?: string; email?: string; sub?: string } = {};
 	if (tokens.id_token) {
 		const claims = parseJwtClaims(tokens.id_token);
 		if (claims) {
 			result.email = claims.email;
+			if (claims.sub) result.sub = claims.sub;
+			// Prefer user-level account IDs; fall back to organizations[0].id
+			// only when no user-level ID is available (needed for usage API).
 			const id =
 				claims.chatgpt_account_id ||
 				claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
@@ -127,6 +134,7 @@ function extractIdTokenInfo(tokens: TokenResponse): {
 				claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
 				claims.organizations?.[0]?.id;
 			if (!result.email) result.email = claims.email;
+			if (!result.sub && claims.sub) result.sub = claims.sub;
 		}
 	}
 	return result;
@@ -209,6 +217,7 @@ export async function refreshCodexToken(
 		expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
 		accountId: info.accountId,
 		email: info.email,
+		sub: info.sub,
 	};
 }
 
@@ -408,6 +417,7 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 					expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
 					accountId: info.accountId,
 					email: info.email,
+					sub: info.sub,
 				});
 			},
 			reject: (error) => {
@@ -566,6 +576,7 @@ export async function pollDeviceCodeFlow(
 				expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
 				accountId: info.accountId,
 				email: info.email,
+				sub: info.sub,
 			};
 		}
 

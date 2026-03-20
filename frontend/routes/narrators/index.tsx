@@ -54,7 +54,7 @@ import { usePlatform } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 
-import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { formatRelativeTime } from "../../lib/format";
 
 interface NarratorSearchParams {
@@ -170,7 +170,7 @@ function NarratorsPage() {
 		}
 	}, [search.create, guardedOpen, setSearch]);
 
-	const { groupedModels, settingsData } = useAllModels();
+	const { groupedModels, defaultModelValue } = useAllModels();
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const narratorIds = useMemo(() => narrators.map((s: any) => s.id), [narrators]);
@@ -267,7 +267,7 @@ function NarratorsPage() {
 		createNarrator.mutate(
 			{
 				...(cwd ? { cwd } : {}),
-				...(selectedModel ? { model: selectedModel } : {}),
+				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(startInPlanMode ? { permissionMode: "plan" as const } : {}),
 			},
 			{
@@ -619,7 +619,10 @@ function NarratorsPage() {
 									<Group gap="xs" wrap="nowrap">
 										<Text size="sm" c="dimmed" truncate>
 											{t("narratorMeta", {
-												model: narrator.model,
+												model:
+													narrator.model === FOLLOW_DEFAULT_MODEL
+														? t("followDefault", { model: defaultModelValue })
+														: narrator.model,
 												count: narrator.messageCount ?? 0,
 											})}
 										</Text>
@@ -692,7 +695,10 @@ function NarratorsPage() {
 									<Group gap="xs" wrap="nowrap">
 										<Text size="xs" c="dimmed" truncate>
 											{t("narratorMeta", {
-												model: narrator.model,
+												model:
+													narrator.model === FOLLOW_DEFAULT_MODEL
+														? t("followDefault", { model: defaultModelValue })
+														: narrator.model,
 												count: narrator.messageCount ?? 0,
 											})}
 										</Text>
@@ -865,10 +871,8 @@ function NarratorsPage() {
 						description={t("modelHint")}
 						data={groupedModels}
 						searchable
-						value={selectedModel || null}
+						value={selectedModel || FOLLOW_DEFAULT_MODEL}
 						onChange={(v) => setSelectedModel(v ?? "")}
-						placeholder={settingsData?.agent?.defaultModel ?? "claude-sonnet-4.5"}
-						clearable
 						maxDropdownHeight={320}
 						comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
 					/>

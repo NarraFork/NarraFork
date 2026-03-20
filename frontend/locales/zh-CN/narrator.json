@@ -64,6 +64,7 @@
 	"archiveNarrator": "归档",
 	"permissionMode": "权限模式",
 	"modelTooltip": "下次发言使用的模型",
+	"followDefault": "跟随默认 ({{model}})",
 	"perm_default": "逐项询问",
 	"perm_acceptEdits": "允许编辑",
 	"perm_bypassPermissions": "全部允许",

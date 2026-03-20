@@ -1821,6 +1821,71 @@ export const api = {
 		request<{ quotaBalance: number; quotaTotalGranted: number }>(
 		),
 
+	// Cline
+	clineStatus: () =>
+		request<{
+			authenticated: boolean;
+			email?: string;
+			displayName?: string;
+			expiresAt?: number;
+			providers: Array<{ id: string; name: string; prefix: string; hasToken: boolean }>;
+			totalModels: number;
+			pendingAuth: boolean;
+		}>("/cline/status"),
+	clineBrowserAuth: (apiBaseUrl?: string) =>
+		request<{ authorizeUrl: string }>("/cline/auth/browser", {
+			method: "POST",
+			body: JSON.stringify(apiBaseUrl ? { apiBaseUrl } : {}),
+		}),
+	clineCancelAuth: () => request<{ ok: boolean }>("/cline/auth/cancel", { method: "POST" }),
+	clineImportCallback: (callbackUrl: string) =>
+		request<{ ok: boolean; email?: string; displayName?: string }>("/cline/auth/callback", {
+			method: "POST",
+			body: JSON.stringify({ callbackUrl }),
+		}),
+	clineLogout: () => request<{ ok: boolean }>("/cline/auth/logout", { method: "POST" }),
+	clineRefreshModels: () =>
+		request<{
+			results: Array<{ providerId: string; name: string; count: number; error?: string }>;
+			models: Array<{ id: string; name?: string }>;
+			fromCache: boolean;
+		}>("/cline/models/refresh", { method: "POST" }),
+	clineRefreshProviderModels: (providerId: string) =>
+		request<{
+			models: Array<{ id: string; name?: string }>;
+			fromCache: boolean;
+		}>(`/cline/providers/${providerId}/models/refresh`, { method: "POST" }),
+	clineBalance: () => request<{ balance: number; userId: string }>("/cline/balance"),
+	clineRecommendedModels: () =>
+		request<{
+			recommended: Array<{ id: string; name: string; description?: string; tags: string[] }>;
+			free: Array<{ id: string; name: string; description?: string; tags: string[] }>;
+		}>("/cline/recommended-models"),
+	clineRefreshUserInfo: () =>
+		request<{
+			authenticated: boolean;
+			email?: string;
+			displayName?: string;
+			userId?: string;
+		}>("/cline/user-info/refresh", { method: "POST" }),
+	clinePoolSearch: (q: string, limit = 50) =>
+		request<{
+			models: Array<{
+				id: string;
+				name?: string;
+				contextLength?: number;
+				promptPrice?: string;
+				completionPrice?: string;
+			}>;
+			total: number;
+		}>(`/cline/pool/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+	clinePoolCount: () => request<{ count: number }>("/cline/pool/count"),
+	clineSetEnabledModels: (models: string[]) =>
+		request<{ ok: boolean; count: number }>("/cline/enabled-models", {
+			method: "POST",
+			body: JSON.stringify({ models }),
+		}),
+
 	// Health / platform
 	health: () =>
 		request<{

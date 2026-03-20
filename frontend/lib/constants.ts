@@ -15,6 +15,9 @@ export type ModelOption = {
 	rateMultiplier?: number;
 };
 
+/** Sentinel value stored in DB to mean "follow the default model from settings". */
+export const FOLLOW_DEFAULT_MODEL = "__default__";
+
 /**
  * Build a "provider:model" composite value.
  * This allows the same model ID to appear under different providers.

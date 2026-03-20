@@ -16,6 +16,7 @@ import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
+import { clineRoutes } from "./routes/cline";
 import { codexRoutes } from "./routes/codex";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dependencyRoutes } from "./routes/dependencies";
@@ -101,6 +102,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/custom-subagents",
 	"/api/openai",
 	"/api/codex",
+	"/api/cline",
 	"/api/anthropic",
 ];
 app.use("/api/*", async (c, next) => {
@@ -129,6 +131,7 @@ app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/cline", clineRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/skills", skillRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);

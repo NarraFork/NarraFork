@@ -18,7 +18,13 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
-import { resolveProvider, settings, usesCodexApiMode } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	resolveEffectiveModel,
+	resolveProvider,
+	settings,
+	usesCodexApiMode,
+} from "../lib/settings";
 import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { LoadToolNotFound, LoadToolResult } from "./command-service";
@@ -408,8 +414,9 @@ export const narratorService = {
 			| "plan"
 			| "dontAsk";
 
-		const resolvedModel = input.model ?? settings.agent.defaultModel;
-		const resolvedProvider = resolveProvider(resolvedModel);
+		const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
+		const actualModel = resolveEffectiveModel(storedModel);
+		const resolvedProvider = resolveProvider(actualModel);
 		const resolvedReasoningEffort =
 			input.reasoningEffort === undefined
 				? usesCodexApiMode(resolvedProvider)
@@ -423,7 +430,7 @@ export const narratorService = {
 				id,
 				chapterId: input.chapterId ?? null,
 				type,
-				model: resolvedModel,
+				model: storedModel,
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
@@ -470,7 +477,7 @@ export const narratorService = {
 			| "plan"
 			| "dontAsk";
 
-		const resolvedModel = input.model ?? parent.model ?? settings.agent.defaultModel;
+		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??
@@ -558,7 +565,7 @@ export const narratorService = {
 			.where(eq(narratorMessageRefs.narratorId, input.originalSubagentId))
 			.orderBy(narratorMessageRefs.seq);
 
-		const resolvedModel = input.model ?? settings.agent.defaultModel;
+		const resolvedModel = resolveEffectiveModel(input.model);
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			original.reasoningEffort ??
@@ -2996,8 +3003,11 @@ export const narratorService = {
 		}
 
 		// Create narrator + copy refs atomically
-		const resolvedModel = parent.model ?? "claude-sonnet-4.5";
-		const resolvedProvider = resolveProvider(resolvedModel);
+		// Preserve the parent's stored model value (including __default__ sentinel)
+		// so forked narrators continue to follow the default model setting.
+		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
+		const effectiveModel = resolveEffectiveModel(storedModel);
+		const resolvedProvider = resolveProvider(effectiveModel);
 		const resolvedReasoningEffort =
 			parent.reasoningEffort ??
 			(usesCodexApiMode(resolvedProvider)
@@ -3011,7 +3021,7 @@ export const narratorService = {
 					id,
 					chapterId: targetChapterId,
 					type: "primary",
-					model: resolvedModel,
+					model: storedModel,
 					systemPrompt,
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,

@@ -34,6 +34,7 @@ import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/pr
 import {
 	isAnthropicProvider,
 	resolveDefaultReasoningEffort,
+	resolveEffectiveModel,
 	resolveProvider,
 	settings,
 	usesCodexApiMode,
@@ -1880,7 +1881,7 @@ async function createNarrator(
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
 
-	const narratorModel = narrator.model ?? settings.agent.defaultModel;
+	const narratorModel = resolveEffectiveModel(narrator.model);
 
 	const active: ActiveNarrator = {
 		abortController,
@@ -4064,8 +4065,9 @@ export function isNarratorActive(narratorId: string): boolean {
 export function updateNarratorModel(narratorId: string, model: string): void {
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
-		active.model = model;
-		active.provider = resolveProvider(model);
+		const effectiveModel = resolveEffectiveModel(model);
+		active.model = effectiveModel;
+		active.provider = resolveProvider(effectiveModel);
 		broadcastToNarrator(narratorId, {
 			type: "model_changed",
 			narratorId,
