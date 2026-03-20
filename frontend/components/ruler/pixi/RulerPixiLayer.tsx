@@ -11,11 +11,14 @@ import { type ElasticLayout, findTickAtX } from "../elastic-layout";
 import { localScale, screenToWorld, viewCenterFromPan, worldToScreen } from "../fisheye";
 import {
 	CardContainerPool,
+	drawActivityBadge,
+	drawActivityTooltip,
 	drawChapterNode,
 	drawConnector,
 	drawDensityBar,
 	drawRulerTrackBg,
 	drawTick,
+	type PixiActivityInfo,
 	TextPool,
 } from "../pixi-draw";
 import { decimateTicks, slotWidth } from "../tick-decimation";
@@ -117,6 +120,8 @@ interface RulerPixiLayerProps {
 	alwaysVisibleChapters: PixiChapterInfo[];
 	/** Set of chapter IDs that have their narrator panel open (rendered by React) */
 	openPanelChapterIds?: Set<string>;
+	/** Activity info for collapsed chapters (badge + tooltip) */
+	activityMap?: Map<string, PixiActivityInfo>;
 	/** Called when panel blend animation updates — allows parent to sync DOM panels */
 	onPanelBlendUpdate?: () => void;
 	// --- Interaction callbacks ---
@@ -170,6 +175,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	commitMessages,
 	alwaysVisibleChapters,
 	openPanelChapterIds,
+	activityMap,
 	onPanelBlendUpdate,
 	onChapterClick: _onChapterClick,
 	onChapterContextMenu: _onChapterContextMenu,
@@ -205,6 +211,8 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		chapterTitleStyle: TextStyle | null;
 		cardBadgeKey: string;
 		cardBadgeStyle: TextStyle | null;
+		activityBadgeStyle: TextStyle | null;
+		activityTooltipStyle: TextStyle | null;
 	}>({
 		labelStyle: null,
 		labelKey: "",
@@ -214,6 +222,8 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		chapterTitleStyle: null,
 		cardBadgeKey: "",
 		cardBadgeStyle: null,
+		activityBadgeStyle: null,
+		activityTooltipStyle: null,
 	});
 
 	// Latest camera ref — tracks the most recent camera state including fast-path
@@ -247,6 +257,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		commitMessages,
 		alwaysVisibleChapters,
 		openPanelChapterIds,
+		activityMap,
 	});
 	dataRef.current = {
 		layout,
@@ -262,6 +273,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		commitMessages,
 		alwaysVisibleChapters,
 		openPanelChapterIds,
+		activityMap,
 	};
 
 	// Callback ref — avoids stale closure in redraw's rAF callback
@@ -1025,6 +1037,53 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 				}
 			}
 
+			// --- Activity badge + tooltip for collapsed chapters ---
+			if (!skipDraw && ch.status === "active" && !effectivePanel && chapterPool) {
+				const activity = d.activityMap?.get(ch.id);
+				if (activity && activity.count > 0) {
+					const sc = cachedStylesRef.current;
+					if (!sc.activityBadgeStyle) {
+						sc.activityBadgeStyle = new TextStyle({
+							fontSize: 9,
+							fill: 0xffffff,
+							fontFamily: "sans-serif",
+							fontWeight: "bold",
+						});
+					}
+					if (!sc.activityTooltipStyle) {
+						sc.activityTooltipStyle = new TextStyle({
+							fontSize: 11,
+							fill: 0xc1c2c5,
+							fontFamily: "sans-serif",
+						});
+					}
+					const badgeAnchor = drawActivityBadge(
+						morphGfx,
+						chapterPool,
+						sc.activityBadgeStyle,
+						activity,
+						nodeLeft,
+						nodeTop,
+						screenW,
+						screenH,
+						morph.opacity,
+					);
+					if (badgeAnchor) {
+						drawActivityTooltip(
+							morphGfx,
+							chapterPool,
+							sc.activityTooltipStyle,
+							activity,
+							nodeLeft + screenW / 2,
+							nodeTop,
+							screenW,
+							morph.opacity,
+							Date.now(),
+						);
+					}
+				}
+			}
+
 			// --- Connector lines (all morph stages, unified position) ---
 			// Store screen position for parent-to-child connectors
 			chapterScreenPos.set(ch.id, {
@@ -1168,7 +1227,14 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 	useEffect(() => {
 		latestCameraRef.current = camera;
 		// Build a fingerprint of all non-camera dependencies
-		const dataFingerprint = `${pixiReady}|${layout.totalWidth}|${segments.length}|${chapters.length}|${zoomTier}|${tickPositions.size}|${orientation}|${rulerThickness}|${commitMessages.size}|${alwaysVisibleChapters.length}|${openPanelChapterIds?.size ?? 0}`;
+		// Build activity fingerprint that changes when any activity entry updates
+		let activityFp = "0";
+		if (activityMap && activityMap.size > 0) {
+			const parts: string[] = [];
+			for (const [k, v] of activityMap) parts.push(`${k}:${v.count}:${v.timestamp}`);
+			activityFp = parts.join(",");
+		}
+		const dataFingerprint = `${pixiReady}|${layout.totalWidth}|${segments.length}|${chapters.length}|${zoomTier}|${tickPositions.size}|${orientation}|${rulerThickness}|${commitMessages.size}|${alwaysVisibleChapters.length}|${openPanelChapterIds?.size ?? 0}|${activityFp}`;
 		if (dataFingerprint === prevDataDepsRef.current) {
 			// Only camera changed — updateCamera fast-path already drew this frame
 			return;
@@ -1188,6 +1254,7 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		commitMessages,
 		alwaysVisibleChapters,
 		openPanelChapterIds,
+		activityMap,
 		redraw,
 	]);
 

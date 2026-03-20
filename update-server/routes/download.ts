@@ -181,6 +181,7 @@ async function serveFileWithRange(
 
 /**
  * Serve a file without Range support (for smaller files like blockmaps).
+ * Uses streaming to avoid loading entire file into memory.
  */
 async function serveFile(
 	c: import("hono").Context,
@@ -189,17 +190,22 @@ async function serveFile(
 	filename: string,
 	contentType = "application/octet-stream",
 ): Promise<Response> {
-	const data = await storage.getFile(path);
-	if (!data) {
+	const fileSize = await storage.getFileSize(path);
+	if (fileSize === null) {
 		return c.json({ error: "File not found" }, 404);
 	}
 
-	return new Response(new Uint8Array(data), {
+	const stream = await storage.getFileStream(path);
+	if (!stream) {
+		return c.json({ error: "File not found" }, 404);
+	}
+
+	return new Response(stream, {
 		status: 200,
 		headers: {
 			"Content-Type": contentType,
 			"Content-Disposition": `attachment; filename="${filename}"`,
-			"Content-Length": String(data.length),
+			"Content-Length": String(fileSize),
 		},
 	});
 }

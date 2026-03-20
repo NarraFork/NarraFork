@@ -10,6 +10,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
+import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { NarratorPanel } from "../narrator/NarratorPanel";
@@ -103,10 +104,10 @@ function rubberBand(value: number, min: number, max: number, viewport: number): 
 
 function getCrossBounds(opts: ClampBounds, scale: number) {
 	const PADDING = 200;
-	const max = 0;
+	const max = opts.crossViewportSize * 0.75;
 	const min =
 		opts.maxContentCross > 0
-			? Math.min(0, -(opts.maxContentCross + PADDING) * scale + opts.crossViewportSize)
+			? -(opts.maxContentCross + PADDING) * scale + opts.crossViewportSize * 0.25
 			: 0;
 	return { min, max };
 }
@@ -119,7 +120,11 @@ function clampCamera(cam: Camera, opts?: ClampBounds, soft?: boolean): Camera {
 
 	if (opts) {
 		const cb = getCrossBounds(opts, cam.scale);
-		crossPan = Math.max(cb.min, Math.min(cb.max, crossPan));
+		if (soft) {
+			crossPan = rubberBand(crossPan, cb.min, cb.max, opts.crossViewportSize);
+		} else {
+			crossPan = Math.max(cb.min, Math.min(cb.max, crossPan));
+		}
 
 		if (opts.maxContentMain > 0) {
 			const mb = getMainBounds(opts, cam.scale);
@@ -395,16 +400,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	/** Resolve the actual pixiChaptersMapRef key for a chapter.
 	 *  Orphan chapters may be keyed under their parent's segment SHA. */
-	const resolvePixiMapKey = useCallback(
-		(chapterId: string, fallbackSha: string): string => {
-			if (pixiChaptersMapRef.current.has(fallbackSha)) return fallbackSha;
-			for (const [sha, entries] of pixiChaptersMapRef.current) {
-				if (entries.some((c) => c.id === chapterId)) return sha;
-			}
-			return fallbackSha;
-		},
-		[],
-	);
+	const resolvePixiMapKey = useCallback((chapterId: string, fallbackSha: string): string => {
+		if (pixiChaptersMapRef.current.has(fallbackSha)) return fallbackSha;
+		for (const [sha, entries] of pixiChaptersMapRef.current) {
+			if (entries.some((c) => c.id === chapterId)) return sha;
+		}
+		return fallbackSha;
+	}, []);
 
 	const [pixiChaptersTick, setPixiChaptersTick] = useState(0);
 	const pixiChaptersTickRafRef = useRef(0);
@@ -601,8 +603,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	}, [projectId, queryClient]);
 
 	/** Animate inertia after drag release. Decays velocity each frame until below threshold.
-	 *  Main axis: heavy damping when past clamp bounds (allows slight overscroll then bounce).
-	 *  Cross axis: hard clamp — velocity zeroed and position snapped, no overscroll allowed. */
+	 *  Both axes use heavy damping when past clamp bounds (allows slight overscroll then bounce). */
 	const animateInertia = useCallback(
 		(vx: number, vy: number) => {
 			cancelAnimationFrame(inertiaRafRef.current);
@@ -618,8 +619,9 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				const bounds = getBounds();
 				const isH = cam.orientation === "horizontal";
 
-				// Per-axis friction: heavy damping on main axis when past bounds
+				// Per-axis friction: heavy damping when past bounds
 				let frictionMain = FRICTION;
+				let frictionCross = FRICTION;
 				if (bounds) {
 					const mainPan = isH ? cam.panX : cam.panY;
 					const mb = bounds.maxContentMain > 0 ? getMainBounds(bounds, cam.scale) : null;
@@ -627,28 +629,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						frictionMain = OVERSCROLL_FRICTION;
 					}
 
-					// Cross axis: kill velocity and clamp position immediately
 					const crossPan = isH ? cam.panY : cam.panX;
 					const cb = getCrossBounds(bounds, cam.scale);
-					const clampedCross = Math.max(cb.min, Math.min(cb.max, crossPan));
-					if (isH) {
-						velY = 0;
-						if (clampedCross !== cam.panY) {
-							cameraRef.current = { ...cam, panY: clampedCross };
-						}
-					} else {
-						velX = 0;
-						if (clampedCross !== cam.panX) {
-							cameraRef.current = { ...cam, panX: clampedCross };
-						}
+					if (crossPan < cb.min || crossPan > cb.max) {
+						frictionCross = OVERSCROLL_FRICTION;
 					}
 				}
 
 				// Apply friction
 				if (isH) {
 					velX *= frictionMain;
+					velY *= frictionCross;
 				} else {
 					velY *= frictionMain;
+					velX *= frictionCross;
 				}
 
 				if (Math.abs(velX) < MIN_VELOCITY && Math.abs(velY) < MIN_VELOCITY) {
@@ -1119,7 +1113,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					// Map deltaY (primary wheel axis) to main-axis scrolling with smooth animation.
 					// deltaX still maps to cross-axis for trackpad two-finger horizontal swipes.
 					const delta = e.deltaY + (isH ? e.deltaX : 0);
-					const crossDelta = isH ? 0 : e.deltaX;
+					const crossDelta = isH ? e.deltaX : 0;
 
 					const ss = smoothScrollRef.current;
 					// If not currently animating, seed target from current camera
@@ -2262,6 +2256,19 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		closingPanelChapterIds,
 	]);
 
+	// --- Activity tracking for collapsed chapters ---
+	const activityChapters = useMemo(() => {
+		const activeChapters = rulerData.activeChapters ?? [];
+		return activeChapters
+			.filter((ch): ch is typeof ch & { narratorId: string } => !!ch.narratorId)
+			.map((ch) => ({
+				chapterId: ch.id,
+				narratorId: ch.narratorId,
+			}));
+	}, [rulerData.activeChapters]);
+
+	const activityMap = useRulerChapterActivity(activityChapters, openPanelChapterIds);
+
 	if (isLoading) {
 		return (
 			<Center h="100%">
@@ -2461,6 +2468,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				commitMessages={commitMessages}
 				alwaysVisibleChapters={alwaysVisibleChapters}
 				openPanelChapterIds={openPanelChapterIds}
+				activityMap={activityMap}
 				onPanelBlendUpdate={applyTransformToDOM}
 				onChapterClick={handlePixiChapterClick}
 				onChapterContextMenu={handlePixiChapterContextMenu}

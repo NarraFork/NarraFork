@@ -79,7 +79,7 @@
 	"openaiResponsesApi": "使用 Responses API 格式",
 	"openaiResponsesApiDesc": "启用后使用 OpenAI Responses API 消息格式（适用于官方 API 及 Codex 兼容网关）。如果工具调用不工作，请尝试关闭此选项。",
 	"openaiApiMode": "API 模式",
-	"openaiApiModeDesc": "选择使用的 API 变体。Responses：原生 OpenAI Responses API。Completions：标准 Chat Completions。Codex：通过 /responses 端点访问的 Codex 网关。",
+	"openaiApiModeDesc": "GPT-4 及更老模型、国产模型选择 Completions。GPT-4o 及更新模型选择 Responses。从 Codex 反代出来的选择 Codex（支持思考强度）。",
 	"openaiApiModeResponses": "Responses",
 	"openaiApiModeCompletions": "Completions",
 	"openaiApiModeCodex": "Codex",

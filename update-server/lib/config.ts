@@ -21,6 +21,19 @@ let configPath = "";
 let currentConfig: ServerConfig = { ...DEFAULT_CONFIG };
 
 /**
+ * Pre-computed token lookup cache: hash → TokenRecord.
+ * Rebuilt whenever tokens are added/removed.
+ */
+let tokenHashMap = new Map<string, TokenRecord>();
+
+function rebuildTokenHashMap(): void {
+	tokenHashMap = new Map();
+	for (const record of currentConfig.tokens) {
+		tokenHashMap.set(record.tokenHash, record);
+	}
+}
+
+/**
  * Hash a token string using SHA-256.
  */
 async function hashToken(token: string): Promise<string> {
@@ -59,6 +72,7 @@ export async function initConfig(path: string): Promise<{ adminToken?: string }>
 		const raw = readFileSync(configPath, "utf-8");
 		const parsed = JSON.parse(raw) as Partial<ServerConfig>;
 		currentConfig = { ...DEFAULT_CONFIG, ...parsed };
+		rebuildTokenHashMap();
 		logger.info("Config loaded", { path: configPath });
 		return {};
 	}
@@ -76,6 +90,7 @@ export async function initConfig(path: string): Promise<{ adminToken?: string }>
 	};
 
 	currentConfig = { ...DEFAULT_CONFIG, tokens: [adminRecord] };
+	rebuildTokenHashMap();
 	saveConfig();
 
 	logger.info("Config created with admin token", { path: configPath });
@@ -113,6 +128,7 @@ export async function addToken(
 		createdAt: new Date().toISOString(),
 	};
 	currentConfig.tokens.push(record);
+	rebuildTokenHashMap();
 	saveConfig();
 	return { id: record.id, token: plain };
 }
@@ -124,6 +140,7 @@ export function removeToken(id: string): boolean {
 	const before = currentConfig.tokens.length;
 	currentConfig.tokens = currentConfig.tokens.filter((t) => t.id !== id);
 	if (currentConfig.tokens.length < before) {
+		rebuildTokenHashMap();
 		saveConfig();
 		return true;
 	}
@@ -131,13 +148,10 @@ export function removeToken(id: string): boolean {
 }
 
 /**
- * Find a token record by verifying the plain token against all stored hashes.
+ * Find a token record by verifying the plain token.
+ * Uses O(1) hash map lookup instead of iterating all tokens.
  */
 export async function findTokenByPlain(plain: string): Promise<TokenRecord | null> {
-	for (const record of currentConfig.tokens) {
-		if (await verifyToken(plain, record.tokenHash)) {
-			return record;
-		}
-	}
-	return null;
+	const hash = await hashToken(plain);
+	return tokenHashMap.get(hash) ?? null;
 }

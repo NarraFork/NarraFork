@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 
 /**
@@ -17,10 +18,15 @@ export function SummaryModelPickerModal() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const { groupedModels } = useAllModels();
+	const { data: prefs } = useUserPreferences();
 	const [opened, setOpened] = useState(false);
 	const [unavailableModel, setUnavailableModel] = useState("");
 	const [selected, setSelected] = useState<string | null>(null);
 	const dismissedRef = useRef(false);
+
+	// Suppress the modal while the setup wizard hasn't been completed yet —
+	// the wizard itself handles model selection.
+	const wizardIncomplete = prefs?.setupWizardCompleted === false;
 
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
@@ -33,16 +39,18 @@ export function SummaryModelPickerModal() {
 			settingsData &&
 			settingsData.summaryModelAvailable === false &&
 			settingsData.agent?.summaryModel &&
-			!dismissedRef.current
+			!dismissedRef.current &&
+			!wizardIncomplete
 		) {
 			setUnavailableModel(settingsData.agent.summaryModel);
 			setOpened(true);
 		}
-	}, [settingsData]);
+	}, [settingsData, wizardIncomplete]);
 
 	// Listen for WS-triggered DOM event
 	useEffect(() => {
 		const handler = (e: Event) => {
+			if (wizardIncomplete) return;
 			const model = (e as CustomEvent).detail?.model as string | undefined;
 			if (model) {
 				dismissedRef.current = false;
@@ -52,7 +60,7 @@ export function SummaryModelPickerModal() {
 		};
 		window.addEventListener("narrafork:summary-model-unavailable", handler);
 		return () => window.removeEventListener("narrafork:summary-model-unavailable", handler);
-	}, []);
+	}, [wizardIncomplete]);
 
 	const save = useMutation({
 		mutationFn: (summaryModel: string) => api.updateSettings({ agent: { summaryModel } }),

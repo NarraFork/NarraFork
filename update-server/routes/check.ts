@@ -6,9 +6,10 @@
  */
 import { Hono } from "hono";
 import { isValidChannel, isValidPlatform } from "../lib/platform";
-import { compareVersions, isNewerVersion } from "../lib/version";
+import { getLatestRelease } from "../lib/release-cache";
+import { isNewerVersion } from "../lib/version";
 import type { StorageBackend } from "../storage/types";
-import type { CheckUpdateResponse, ReleaseMeta, ZstdPatchMeta } from "../types";
+import type { CheckUpdateResponse, ZstdPatchMeta } from "../types";
 
 export function createCheckRoutes(storage: StorageBackend) {
 	const routes = new Hono();
@@ -27,8 +28,8 @@ export function createCheckRoutes(storage: StorageBackend) {
 			return c.json({ error: "Invalid channel parameter" }, 400);
 		}
 
-		// Find the latest version for this product/channel/platform
-		const latestMeta = await findLatestRelease(storage, product, channel, platform);
+		// O(1) cache lookup instead of filesystem scan
+		const latestMeta = await getLatestRelease(storage, product, channel, platform);
 
 		if (!latestMeta) {
 			const resp: CheckUpdateResponse = {
@@ -102,47 +103,4 @@ export function createCheckRoutes(storage: StorageBackend) {
 	});
 
 	return routes;
-}
-
-/**
- * Find the latest release for a product/channel/platform.
- * Scans all version directories and returns the newest one that has the requested platform.
- */
-async function findLatestRelease(
-	storage: StorageBackend,
-	product: string,
-	channel: string,
-	platform: string,
-): Promise<ReleaseMeta | null> {
-	const releasesPrefix = `products/${product}/releases`;
-	const files = await storage.listFiles(releasesPrefix);
-
-	// Extract unique version directories
-	const versions = new Set<string>();
-	for (const file of files) {
-		// file format: products/{product}/releases/{version}/...
-		const parts = file.split("/");
-		const relIdx = parts.indexOf("releases");
-		if (relIdx >= 0 && parts[relIdx + 1]) {
-			versions.add(parts[relIdx + 1]);
-		}
-	}
-
-	// Sort versions descending and find the latest matching one
-	const sorted = [...versions].sort((a, b) => compareVersions(b, a));
-
-	for (const version of sorted) {
-		const metaPath = `${releasesPrefix}/${version}/meta.json`;
-		const metaBuf = await storage.getFile(metaPath);
-		if (!metaBuf) continue;
-
-		try {
-			const meta = JSON.parse(metaBuf.toString("utf-8")) as ReleaseMeta;
-			if (meta.channel !== channel) continue;
-			if (!meta.platforms[platform]) continue;
-			return meta;
-		} catch {}
-	}
-
-	return null;
 }

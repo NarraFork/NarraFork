@@ -2,7 +2,7 @@
  * Pure drawing helpers for the PixiJS ruler layer.
  * All functions receive a PixiTheme for theme-aware rendering.
  */
-import { Container, Graphics, Text, type TextStyle } from "pixi.js";
+import { CanvasTextMetrics, Container, Graphics, Text, type TextStyle } from "pixi.js";
 import type { PixiTheme } from "./pixi/pixi-theme";
 import { themeStatusColor } from "./pixi/pixi-theme";
 import type { MorphStyle } from "./zoom-tiers";
@@ -336,6 +336,133 @@ export class TextPool {
 	get count(): number {
 		return this.cursor;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Activity badge + tooltip for collapsed chapters
+// ---------------------------------------------------------------------------
+
+/** Activity info passed from the hook to the PixiJS draw layer. */
+export interface PixiActivityInfo {
+	count: number;
+	lastText: string;
+	lastToolName: string | null;
+	timestamp: number;
+}
+
+/** Duration (ms) the tooltip stays fully visible after the last activity. */
+const TOOLTIP_VISIBLE_MS = 5000;
+/** Duration (ms) for the tooltip fade-out. */
+const TOOLTIP_FADE_MS = 1500;
+
+/**
+ * Draw a small red notification badge at the top-right corner of a chapter node.
+ * Returns the badge center position for tooltip anchoring.
+ */
+export function drawActivityBadge(
+	g: Graphics,
+	pool: TextPool,
+	badgeStyle: TextStyle,
+	activity: PixiActivityInfo,
+	nodeX: number,
+	nodeY: number,
+	nodeW: number,
+	_nodeH: number,
+	opacity: number,
+): { cx: number; cy: number } | null {
+	if (activity.count <= 0 || opacity <= 0.01) return null;
+
+	const countStr = activity.count > 99 ? "99+" : String(activity.count);
+	const r = countStr.length > 2 ? 10 : 7;
+	const cx = nodeX + nodeW - 2;
+	const cy = nodeY - 2;
+
+	// Red circle
+	g.circle(cx, cy, r).fill({ color: 0xe03131, alpha: opacity * 0.95 });
+
+	// Count text
+	const label = pool.acquire(badgeStyle);
+	label.text = countStr;
+	label.alpha = opacity;
+	label.scale.set(1);
+	// Center the text in the badge
+	const textW = countStr.length * 5.5;
+	label.position.set(cx - textW / 2, cy - 5);
+
+	return { cx, cy };
+}
+
+/**
+ * Draw a tooltip bubble above a chapter node showing the latest activity text.
+ * Fades out after TOOLTIP_VISIBLE_MS + TOOLTIP_FADE_MS from the last activity.
+ */
+export function drawActivityTooltip(
+	g: Graphics,
+	pool: TextPool,
+	style: TextStyle,
+	activity: PixiActivityInfo,
+	anchorX: number,
+	anchorY: number,
+	nodeW: number,
+	opacity: number,
+	now: number,
+): void {
+	const elapsed = now - activity.timestamp;
+	if (elapsed > TOOLTIP_VISIBLE_MS + TOOLTIP_FADE_MS) return;
+
+	let fadeAlpha = 1;
+	if (elapsed > TOOLTIP_VISIBLE_MS) {
+		fadeAlpha = 1 - (elapsed - TOOLTIP_VISIBLE_MS) / TOOLTIP_FADE_MS;
+	}
+	const alpha = opacity * fadeAlpha;
+	if (alpha <= 0.01) return;
+
+	const text = activity.lastToolName ? `🔧 ${activity.lastToolName}` : activity.lastText;
+	if (!text) return;
+
+	// Measure & truncate using CanvasTextMetrics (has built-in caching)
+	const maxW = Math.min(200, nodeW * 1.5);
+	let displayText = text;
+	let textW = CanvasTextMetrics.measureText(displayText, style).width;
+	if (textW > maxW) {
+		// Binary-search for the longest prefix that fits
+		let lo = 1;
+		let hi = displayText.length;
+		while (lo < hi) {
+			const mid = (lo + hi + 1) >> 1;
+			const w = CanvasTextMetrics.measureText(`${displayText.slice(0, mid)}…`, style).width;
+			if (w <= maxW) lo = mid;
+			else hi = mid - 1;
+		}
+		displayText = `${displayText.slice(0, lo)}…`;
+		textW = CanvasTextMetrics.measureText(displayText, style).width;
+	}
+	const padX = 8;
+	const padY = 5;
+	const bubbleW = textW + padX * 2;
+	const bubbleH = 20 + padY * 2;
+	const bubbleX = anchorX - bubbleW / 2;
+	const bubbleY = anchorY - bubbleH - 6;
+	const br = 6;
+
+	// Background
+	g.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, br).fill({
+		color: 0x1a1b1e,
+		alpha: alpha * 0.92,
+	});
+	// Border
+	g.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, br).stroke({
+		width: 1,
+		color: 0x373a40,
+		alpha: alpha * 0.6,
+	});
+
+	// Text
+	const label = pool.acquire(style);
+	label.text = displayText;
+	label.alpha = alpha;
+	label.scale.set(1);
+	label.position.set(bubbleX + padX, bubbleY + padY);
 }
 
 // ---------------------------------------------------------------------------

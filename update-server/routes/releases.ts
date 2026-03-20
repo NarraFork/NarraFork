@@ -11,15 +11,43 @@ import { Hono } from "hono";
 import { requireAuth } from "../lib/auth";
 import { logger } from "../lib/logger";
 import { isValidChannel, isValidPlatform } from "../lib/platform";
+import { getAllReleases, removeCachedRelease, setCachedRelease } from "../lib/release-cache";
 import type { StorageBackend } from "../storage/types";
 import type { PlatformFileInfo, ReleaseListItem, ReleaseMeta, ZstdPatchMeta } from "../types";
+
+/**
+ * Per-version write locks to prevent concurrent meta.json corruption.
+ * Key: "product/version"
+ */
+const metaLocks = new Map<string, Promise<void>>();
+
+async function withMetaLock<T>(product: string, version: string, fn: () => Promise<T>): Promise<T> {
+	const key = `${product}/${version}`;
+	// Wait for any existing lock on this version
+	while (metaLocks.has(key)) {
+		await metaLocks.get(key);
+	}
+	// Acquire lock
+	let releaseLock: (() => void) | undefined;
+	const lockPromise = new Promise<void>((resolve) => {
+		releaseLock = resolve;
+	});
+	metaLocks.set(key, lockPromise);
+
+	try {
+		return await fn();
+	} finally {
+		metaLocks.delete(key);
+		releaseLock?.();
+	}
+}
 
 export function createReleaseRoutes(storage: StorageBackend) {
 	const routes = new Hono();
 
 	// POST /api/v2/products/:product/releases
 	routes.post("/:product/releases", requireAuth("upload"), async (c) => {
-		const product = c.req.param("product");
+		const product = c.req.param("product") as string;
 
 		const formData = await c.req.formData();
 		const version = formData.get("version") as string | null;
@@ -79,8 +107,8 @@ export function createReleaseRoutes(storage: StorageBackend) {
 
 			hasZstdPatch = true;
 			try {
-				const meta = JSON.parse(metaBuffer.toString("utf-8")) as ZstdPatchMeta;
-				zstdPatchFromVersion = meta.fromVersion;
+				const patchMeta = JSON.parse(metaBuffer.toString("utf-8")) as ZstdPatchMeta;
+				zstdPatchFromVersion = patchMeta.fromVersion;
 			} catch {
 				// ignore
 			}
@@ -90,39 +118,44 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			});
 		}
 
-		// Update or create meta.json
-		const metaPath = `products/${product}/releases/${version}/meta.json`;
-		let meta: ReleaseMeta;
+		// Update meta.json under lock to prevent concurrent corruption
+		const meta = await withMetaLock(product, version, async () => {
+			const metaPath = `products/${product}/releases/${version}/meta.json`;
+			let m: ReleaseMeta;
 
-		const existingMeta = await storage.getFile(metaPath);
-		if (existingMeta) {
-			meta = JSON.parse(existingMeta.toString("utf-8")) as ReleaseMeta;
-		} else {
-			meta = {
-				version,
-				channel,
-				releaseDate: new Date().toISOString(),
-				releaseNotes: releaseNotes ?? undefined,
-				platforms: {},
+			const existingMeta = await storage.getFile(metaPath);
+			if (existingMeta) {
+				m = JSON.parse(existingMeta.toString("utf-8")) as ReleaseMeta;
+			} else {
+				m = {
+					version,
+					channel,
+					releaseDate: new Date().toISOString(),
+					releaseNotes: releaseNotes ?? undefined,
+					platforms: {},
+				};
+			}
+
+			if (releaseNotes) {
+				m.releaseNotes = releaseNotes;
+			}
+
+			const platformInfo: PlatformFileInfo = {
+				filename,
+				size: fileBuffer.length,
+				sha512,
+				hasBlockmap,
+				hasZstdPatch,
+				zstdPatchFromVersion,
 			};
-		}
 
-		// Update release notes if provided
-		if (releaseNotes) {
-			meta.releaseNotes = releaseNotes;
-		}
+			m.platforms[platform] = platformInfo;
+			await storage.saveFile(metaPath, Buffer.from(JSON.stringify(m, null, "\t")));
+			return m;
+		});
 
-		const platformInfo: PlatformFileInfo = {
-			filename,
-			size: fileBuffer.length,
-			sha512,
-			hasBlockmap,
-			hasZstdPatch,
-			zstdPatchFromVersion,
-		};
-
-		meta.platforms[platform] = platformInfo;
-		await storage.saveFile(metaPath, Buffer.from(JSON.stringify(meta, null, "\t")));
+		// Update in-memory cache
+		setCachedRelease(product, meta);
 
 		return c.json({
 			success: true,
@@ -138,47 +171,26 @@ export function createReleaseRoutes(storage: StorageBackend) {
 
 	// GET /api/v2/products/:product/releases
 	routes.get("/:product/releases", requireAuth("upload"), async (c) => {
-		const product = c.req.param("product");
-		const releasesPrefix = `products/${product}/releases`;
-		const files = await storage.listFiles(releasesPrefix);
+		const product = c.req.param("product") as string;
 
-		// Find all meta.json files
-		const metaFiles = files.filter((f) => f.endsWith("/meta.json"));
-		const releases: ReleaseListItem[] = [];
+		// Use cache instead of filesystem scan
+		const allReleases = await getAllReleases(storage, product);
 
-		for (const metaFile of metaFiles) {
-			const buf = await storage.getFile(metaFile);
-			if (!buf) continue;
-
-			try {
-				const meta = JSON.parse(buf.toString("utf-8")) as ReleaseMeta;
-				releases.push({
-					version: meta.version,
-					channel: meta.channel,
-					releaseDate: meta.releaseDate,
-					releaseNotes: meta.releaseNotes,
-					platforms: Object.keys(meta.platforms),
-				});
-			} catch {}
-		}
-
-		// Sort by version descending
-		releases.sort((a, b) => {
-			const partsA = a.version.split(".").map(Number);
-			const partsB = b.version.split(".").map(Number);
-			for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
-				const diff = (partsB[i] ?? 0) - (partsA[i] ?? 0);
-				if (diff !== 0) return diff;
-			}
-			return 0;
-		});
+		const releases: ReleaseListItem[] = allReleases.map((meta) => ({
+			version: meta.version,
+			channel: meta.channel,
+			releaseDate: meta.releaseDate,
+			releaseNotes: meta.releaseNotes,
+			platforms: Object.keys(meta.platforms),
+		}));
 
 		return c.json({ releases });
 	});
 
 	// DELETE /api/v2/products/:product/releases/:version
 	routes.delete("/:product/releases/:version", requireAuth("admin"), async (c) => {
-		const { product, version } = c.req.param();
+		const product = c.req.param("product") as string;
+		const version = c.req.param("version") as string;
 		const releasePath = `products/${product}/releases/${version}`;
 
 		const exists = await storage.fileExists(`${releasePath}/meta.json`);
@@ -187,8 +199,11 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		}
 
 		await storage.deleteDirectory(releasePath);
-		logger.info("Deleted release", { product, version });
 
+		// Remove from cache
+		removeCachedRelease(product, version);
+
+		logger.info("Deleted release", { product, version });
 		return c.json({ success: true, version });
 	});
 

@@ -79,7 +79,7 @@
 	"openaiResponsesApi": "Use Responses API format",
 	"openaiResponsesApiDesc": "Enable to use the OpenAI Responses API message format (for official API and Codex-compatible gateways). Try disabling if tool calling doesn't work.",
 	"openaiApiMode": "API Mode",
-	"openaiApiModeDesc": "Select the API variant to use. Responses: native OpenAI Responses API. Completions: standard Chat Completions. Codex: Codex gateway via the /responses endpoint.",
+	"openaiApiModeDesc": "Use Completions for GPT-4 and older models. Use Responses for GPT-4o and newer models. Use Codex for Codex reverse-proxy endpoints (supports thinking intensity).",
 	"openaiApiModeResponses": "Responses",
 	"openaiApiModeCompletions": "Completions",
 	"openaiApiModeCodex": "Codex",
