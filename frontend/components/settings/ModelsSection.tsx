@@ -1,7 +1,19 @@
-import type { ComboboxData } from "@mantine/core";
+import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import { Button, Select, Stack, Text } from "@mantine/core";
 import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+
+/** Prepend "group:" prefix to each item label so the selected value shows the provider. */
+function prefixLabels(data: ComboboxData): ComboboxData {
+	return (data as ComboboxItemGroup[]).map((g) => ({
+		group: g.group,
+		items: g.items.map((item) => {
+			const it = typeof item === "string" ? { value: item, label: item } : item;
+			return { ...it, label: `${g.group}:${it.label}` };
+		}),
+	}));
+}
 
 export interface ModelsSectionProps {
 	defaultModel: string;
@@ -34,18 +46,19 @@ export function ModelsSection({
 }: ModelsSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
 
 	return (
 		<Stack>
 			<Select
 				label={t("defaultModel")}
-				data={groupedModels}
+				data={prefixedModels}
 				searchable
 				value={defaultModel}
 			/>
 			<Select
 				label={t("summaryModel")}
-				data={groupedModels}
+				data={prefixedModels}
 				searchable
 				value={summaryModel}
 			/>
@@ -58,7 +71,7 @@ export function ModelsSection({
 				</Text>
 				<Select
 					label={t("subagentExploreModel")}
-					data={groupedModels}
+					data={prefixedModels}
 					searchable
 					clearable
 					placeholder={t("subagentModelInherit")}
@@ -67,7 +80,7 @@ export function ModelsSection({
 				/>
 				<Select
 					label={t("subagentPlanModel")}
-					data={groupedModels}
+					data={prefixedModels}
 					searchable
 					clearable
 					placeholder={t("subagentModelInherit")}

@@ -3,7 +3,7 @@
 
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { logger } from "../logger";
-import { loadSettings } from "../settings";
+import { settings } from "../settings";
 import { OpenAIProvider } from "./openai-provider";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -68,7 +68,6 @@ export class CodexProvider implements ProviderAdapter {
 
 	/** Create a temporary OpenAIProvider with the current credential. */
 	private createProvider(ctx: CallContext): OpenAIProvider {
-		const settings = loadSettings();
 		const proxy = settings.codex?.proxy;
 
 		return new OpenAIProvider(

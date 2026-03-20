@@ -579,6 +579,31 @@ function ToolHeader({
 		return toolCall.toolName;
 	}, [cat, toolCall.toolName, toolCall.inputJson]);
 
+	// For Bash tools, show a badge when a custom timeout is specified (default is 120000ms)
+	const customTimeout = useMemo(() => {
+		if (cat !== "bash") return null;
+		const ms = extractNumericField(toolCall.inputJson, "timeout");
+		if (ms == null || ms === 120_000) return null;
+		if (ms >= 60_000) {
+			const m = Math.round(ms / 60_000);
+			return `${m}m`;
+		}
+		return `${Math.round(ms / 1000)}s`;
+	}, [cat, toolCall.inputJson]);
+
+	// For Bash tools, prefer pure execution time (excludes streaming parse + permission wait)
+	const displayDurationMs = useMemo(() => {
+		if (toolCall.durationMs == null) return null;
+		if (cat === "bash") {
+			const exec =
+				typeof toolCall._metadata?.execDurationMs === "number"
+					? toolCall._metadata.execDurationMs
+					: undefined;
+			if (exec != null) return exec;
+		}
+		return toolCall.durationMs;
+	}, [cat, toolCall.durationMs, toolCall._metadata]);
+
 	const content = (
 		<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
 			<ThemeIcon size={16} variant="light" color={color} radius="sm">
@@ -602,9 +627,9 @@ function ToolHeader({
 							toolCall.status === "initializing") ? (
 							<ElapsedTimer startedAt={toolCall.startedAt} />
 						) : (
-							toolCall.durationMs != null && (
+							displayDurationMs != null && (
 								<Text size="xs" c="dimmed" ff="monospace">
-									{(toolCall.durationMs / 1000).toFixed(1)}s
+									{(displayDurationMs / 1000).toFixed(1)}s{customTimeout && `/${customTimeout}`}
 								</Text>
 							)
 						)}

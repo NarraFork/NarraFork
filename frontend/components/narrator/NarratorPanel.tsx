@@ -649,6 +649,7 @@ const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortV
 	"gpt-5.1-codex-mini": ["none", "medium", "high"],
 	"gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
 };
 
 function getCodexReasoningEffortOptions(model?: string): readonly ReasoningEffortValue[] {
@@ -3023,7 +3024,10 @@ export function NarratorPanel({
 									<Menu.Target>
 										<NativeSelect
 											size="xs"
-											data={allModels.map((m) => ({ value: m.value, label: m.label }))}
+											data={allModels.map((m) => ({
+												value: m.value,
+												label: m.provider ? `${m.provider}:${m.label}` : m.label,
+											}))}
 											value={narrator.model ?? ""}
 											onChange={() => {}}
 											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}

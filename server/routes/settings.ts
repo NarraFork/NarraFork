@@ -6,9 +6,9 @@ import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
 import {
 	getBuiltinCodexModels,
-	loadSettings,
 	type NarraForkSettings,
 	saveSettings,
+	settings,
 } from "../lib/settings";
 import {
 	blacklistDirEntrySchema,
@@ -200,7 +200,7 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 }
 
 settingsRoutes.get("/", (c) => {
-	const s = loadSettings();
+	const s = settings;
 	const codexManager = getCodexManager();
 	const codexSnapshot = codexManager.snapshot();
 	const result = {
@@ -234,7 +234,7 @@ settingsRoutes.patch("/", async (c) => {
 	const parsed = updateSettingsSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const current = loadSettings();
+	const current = settings;
 	const validated = parsed.data;
 	const oldProxyEnabled = current.containers.proxy.enabled;
 	const oldProxyPort = current.containers.proxy.port;

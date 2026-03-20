@@ -1137,7 +1137,10 @@ export async function* agentLoop(
 						durationMs,
 						brokenInputOverride,
 						updatedInput: brokenInputOverride,
-						metadata: result.metadata,
+						metadata:
+							durationMs !== result.durationMs
+								? { ...result.metadata, execDurationMs: result.durationMs }
+								: result.metadata,
 					};
 					toolIndex++;
 

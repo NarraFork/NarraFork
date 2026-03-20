@@ -69,7 +69,7 @@ function getSubagentBufferedMessagesMap() {
 // === Subagent type definitions ===
 
 /** Tools available to explore/plan subagents (read-only + Shell/Bash for shell inspection) */
-const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", SHELL_TOOL_NAME]);
+const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", SHELL_TOOL_NAME]);
 
 /** Tools excluded from general subagents (no nesting, no plan mode) */
 const GENERAL_EXCLUDED = new Set([

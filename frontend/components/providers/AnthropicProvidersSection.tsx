@@ -12,6 +12,7 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -38,6 +39,7 @@ interface AnthropicProvidersSectionProps {
 	providerModelsMap: Record<string, ModelOption[]>;
 	hiddenModels: string[];
 	onToggleHidden: (modelVal: string) => void;
+	onBatchToggleHidden: (modelValues: string[], hidden: boolean) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
@@ -51,6 +53,7 @@ export function AnthropicProvidersSection({
 	providerModelsMap,
 	hiddenModels,
 	onToggleHidden,
+	onBatchToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
@@ -266,42 +269,65 @@ export function AnthropicProvidersSection({
 												</Text>
 											)}
 										</Group>
-										{pModels.length > 0 && (
-											<Stack gap="xs" mt="xs">
-												{pModels.map((m) => {
-													const isHidden = hiddenModels.includes(m.value);
-													return (
-														<Group
-															key={m.value}
-															gap="xs"
-															style={isHidden ? { opacity: 0.5 } : undefined}
-														>
-															<TextInput value={m.value} disabled style={{ flex: 1 }} />
-															<TextInput value={m.label} disabled style={{ flex: 1 }} />
-															<NumberInput
-																placeholder={t("contextWindowPlaceholder")}
-																value={modelContextWindows[m.value] || ""}
-																onChange={(v) =>
-																	onContextWindowChange(m.value, typeof v === "number" ? v : null)
-																}
-																min={1}
-																step={1000}
-																suffix={` ${t("contextWindowSuffix")}`}
-																w={180}
-																size="xs"
-															/>
-															<ActionIcon
-																variant="subtle"
-																color={isHidden ? "gray" : "blue"}
-																onClick={() => onToggleHidden(m.value)}
-															>
-																{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-															</ActionIcon>
+										{pModels.length > 0 &&
+											(() => {
+												const allHidden = pModels.every((m) => hiddenModels.includes(m.value));
+												return (
+													<Stack gap="xs" mt="xs">
+														<Group gap="xs" justify="flex-end">
+															<Tooltip label={allHidden ? t("showAllModels") : t("hideAllModels")}>
+																<ActionIcon
+																	variant="subtle"
+																	color={allHidden ? "gray" : "blue"}
+																	onClick={() =>
+																		onBatchToggleHidden(
+																			pModels.map((m) => m.value),
+																			!allHidden,
+																		)
+																	}
+																>
+																	{allHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+																</ActionIcon>
+															</Tooltip>
 														</Group>
-													);
-												})}
-											</Stack>
-										)}
+														{pModels.map((m) => {
+															const isHidden = hiddenModels.includes(m.value);
+															return (
+																<Group
+																	key={m.value}
+																	gap="xs"
+																	style={isHidden ? { opacity: 0.5 } : undefined}
+																>
+																	<TextInput value={m.value} disabled style={{ flex: 1 }} />
+																	<TextInput value={m.label} disabled style={{ flex: 1 }} />
+																	<NumberInput
+																		placeholder={t("contextWindowPlaceholder")}
+																		value={modelContextWindows[m.value] || ""}
+																		onChange={(v) =>
+																			onContextWindowChange(
+																				m.value,
+																				typeof v === "number" ? v : null,
+																			)
+																		}
+																		min={1}
+																		step={1000}
+																		suffix={` ${t("contextWindowSuffix")}`}
+																		w={180}
+																		size="xs"
+																	/>
+																	<ActionIcon
+																		variant="subtle"
+																		color={isHidden ? "gray" : "blue"}
+																		onClick={() => onToggleHidden(m.value)}
+																	>
+																		{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+																	</ActionIcon>
+																</Group>
+															);
+														})}
+													</Stack>
+												);
+											})()}
 										<InlineCustomModels
 											prefix={p.prefix || "anthropic"}
 											customModels={customModels}

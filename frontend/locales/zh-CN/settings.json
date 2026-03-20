@@ -116,6 +116,8 @@
 	"anthropicRefreshModelsLoading": "获取中...",
 	"anthropicRefreshModelsError": "获取模型列表失败",
 	"anthropicModelsCount": "{{count}} 个模型可用",
+	"hideAllModels": "全部隐藏",
+	"showAllModels": "全部显示",
 	"anthropicAddProvider": "添加供应商",
 	"anthropicMaxMode": "MAX 模式",
 	"anthropicMaxModeDesc": "模拟 Claude Code CLI 协议。使用 Bearer Token 认证、mcp_ 工具前缀和 ?beta=true 端点。",

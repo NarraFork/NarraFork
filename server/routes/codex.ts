@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { getCodexManager, type LoadBalancingMode } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { loadSettings, saveSettings } from "../lib/settings";
+import { saveSettings, settings } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const codexRoutes = new Hono();
@@ -16,7 +16,6 @@ codexRoutes.use("*", requireAuth, requireAdmin);
  */
 codexRoutes.get("/status", (c) => {
 	const manager = getCodexManager();
-	const settings = loadSettings();
 	const mode = settings.codex?.loadBalancingMode;
 	if (mode === "priority" || mode === "balanced") {
 		manager.setLoadBalancingMode(mode);
@@ -271,7 +270,6 @@ codexRoutes.post("/load-balancing-mode", async (c) => {
 		return c.json({ error: "Invalid mode. Must be 'priority' or 'balanced'" }, 400);
 	}
 
-	const settings = loadSettings();
 	settings.codex = settings.codex || {};
 	settings.codex.loadBalancingMode = body.mode;
 	saveSettings(settings);
@@ -289,7 +287,6 @@ codexRoutes.post("/load-balancing-mode", async (c) => {
 codexRoutes.post("/global-proxy", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as { proxy?: string };
 
-	const settings = loadSettings();
 	settings.codex = settings.codex || {};
 	settings.codex.proxy = body.proxy || undefined;
 	saveSettings(settings);
@@ -302,7 +299,6 @@ codexRoutes.post("/global-proxy", async (c) => {
  * Get default reasoning effort for Codex models.
  */
 codexRoutes.get("/default-reasoning-effort", (c) => {
-	const settings = loadSettings();
 	return c.json({ reasoningEffort: settings.codex?.defaultReasoningEffort ?? null });
 });
 
@@ -326,7 +322,6 @@ codexRoutes.post("/default-reasoning-effort", async (c) => {
 		);
 	}
 
-	const settings = loadSettings();
 	settings.codex = settings.codex || {};
 	settings.codex.defaultReasoningEffort = body.reasoningEffort ?? undefined;
 	saveSettings(settings);

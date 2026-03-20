@@ -322,7 +322,36 @@ export function deepMerge<T extends Record<string, any>>(
 	return result;
 }
 
+/**
+ * Load settings from disk, with migrations.
+ * After initial load, returns the in-memory cache to avoid repeated disk I/O.
+ * Use `reloadSettings()` to force a re-read from disk.
+ */
 export function loadSettings(): NarraForkSettings {
+	// Return cached settings if already loaded (avoids EMFILE on Windows)
+	if (_cache.current) return _cache.current;
+	return loadSettingsFromDisk();
+}
+
+/**
+ * Force re-read settings from disk, bypassing the in-memory cache.
+ * Use this after external modifications to settings.json.
+ */
+export function reloadSettings(): NarraForkSettings {
+	const fresh = loadSettingsFromDisk();
+	if (_cache.current) {
+		for (const key of Object.keys(fresh) as Array<keyof NarraForkSettings>) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(_cache.current as any)[key] = fresh[key];
+		}
+	} else {
+		_cache.current = fresh;
+	}
+	// biome-ignore lint/style/noNonNullAssertion: guaranteed non-null after assignment above
+	return _cache.current!;
+}
+
+function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true });
 	if (!existsSync(settingsPath)) {
 		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2));
@@ -454,6 +483,7 @@ _cache.current = settings;
 ];
 const BUILTIN_CODEX_MODELS = [
 	"gpt-5.4",
+	"gpt-5.4-mini",
 	"gpt-5.3-codex",
 	"gpt-5.2-codex",
 	"gpt-5.2",
@@ -767,6 +797,7 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"gpt-5.2-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.2": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.4": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.4-mini": { contextLength: 400_000, maxCompletionTokens: 128_000 },
 	"gpt-5.3-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	// Common third-party models (via OpenAI-compatible APIs)
 	"deepseek-chat": 64_000,

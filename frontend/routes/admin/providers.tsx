@@ -296,6 +296,18 @@ function ProvidersPage() {
 		);
 	}, []);
 
+	const batchToggleHidden = useCallback((modelValues: string[], hidden: boolean) => {
+		setHiddenModels((prev) => {
+			if (hidden) {
+				const set = new Set(prev);
+				for (const v of modelValues) set.add(v);
+				return [...set];
+			}
+			const removeSet = new Set(modelValues);
+			return prev.filter((id) => !removeSet.has(id));
+		});
+	}, []);
+
 	const handleContextWindowChange = useCallback((modelVal: string, size: number | null) => {
 		setModelContextWindows((prev) => {
 			if (size == null) {
@@ -421,6 +433,7 @@ function ProvidersPage() {
 					providerModelsMap={providerModelsMap}
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
+					onBatchToggleHidden={batchToggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isOpenaiProviderDirty}
@@ -434,6 +447,7 @@ function ProvidersPage() {
 					providerModelsMap={anthropicModelsMap}
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
+					onBatchToggleHidden={batchToggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isAnthropicProviderDirty}

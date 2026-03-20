@@ -277,7 +277,7 @@ export class CodexManager {
 		if (existing) return existing;
 
 		const promise = (async () => {
-			const settings = await import("./settings").then((m) => m.loadSettings());
+			const { settings } = await import("./settings");
 			const proxy = settings.codex?.proxy;
 			const tokens = await refreshCodexToken(cred.refreshToken, proxy);
 			return {
@@ -552,7 +552,7 @@ export class CodexManager {
 	// ==================== OAuth Flows ====================
 
 	async startBrowserAuth(): Promise<{ authorizeUrl: string }> {
-		const settings = await import("./settings").then((m) => m.loadSettings());
+		const { settings } = await import("./settings");
 		const proxy = settings.codex?.proxy;
 		const { authorizeUrl, tokenPromise } = await startBrowserOAuth(proxy);
 
@@ -582,7 +582,7 @@ export class CodexManager {
 		// Cancel any existing flow
 		this.cancelDeviceAuth();
 
-		const settings = await import("./settings").then((m) => m.loadSettings());
+		const { settings } = await import("./settings");
 		const proxy = settings.codex?.proxy;
 		const { deviceAuthId, userCode, verificationUrl, interval } = await startDeviceCodeFlow(proxy);
 
@@ -702,7 +702,7 @@ export class CodexManager {
 			throw new Error("Account ID not available for this credential");
 		}
 
-		const settings = await import("./settings").then((m) => m.loadSettings());
+		const { settings } = await import("./settings");
 		const proxy = settings.codex?.proxy;
 
 		if (!entry.accessToken) {

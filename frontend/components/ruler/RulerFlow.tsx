@@ -104,7 +104,8 @@ function rubberBand(value: number, min: number, max: number, viewport: number): 
 
 function getCrossBounds(opts: ClampBounds, scale: number) {
 	const PADDING = 200;
-	const max = opts.crossViewportSize * 0.75;
+	// Cross-axis origin is the content top edge; disallow panning beyond it.
+	const max = 0;
 	const min =
 		opts.maxContentCross > 0
 			? -(opts.maxContentCross + PADDING) * scale + opts.crossViewportSize * 0.25
