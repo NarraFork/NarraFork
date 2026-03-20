@@ -98,8 +98,19 @@ const RETRYABLE_INVALID_STATE_REASONS = new Set([
 	"temporarily_unavailable",
 ]);
 
-function isRetryableInvalidStateReason(reason: string): boolean {
-	return RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase());
+function isRetryableInvalidStateReason(reason: string, message?: string): boolean {
+	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;
+	// Also check the message for retryable patterns (e.g. "Too many requests",
+	// "status 429") — providers may use non-standard reason codes like
+	// "stream_initialization_failed" while the message contains the real cause.
+	if (message) {
+		const m = message.toLowerCase();
+		if (NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
+		if (RETRYABLE_PATTERNS.some((p) => m.includes(p))) return true;
+		// Check for HTTP status codes embedded in the message
+		if (/\b(429|500|502|503|529)\b/.test(m)) return true;
+	}
+	return false;
 }
 
 function isContextOverflowReason(reason: string): boolean {
@@ -813,10 +824,42 @@ export async function* agentLoop(
 					const reason = String(parsed.invalidState.reason ?? "api_error");
 					const message = String(parsed.invalidState.message ?? "Unknown provider error");
 					if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
+						// Yield block_complete for accumulated content before early return
+						// so the caller can persist partial progress (mirrors catch path).
+						for (const entry of reasoningBlockMap.values()) {
+							if (entry.text || entry.providerMetadata) {
+								yield {
+									type: "block_complete",
+									block: {
+										type: "reasoning",
+										text: entry.text,
+										providerMetadata: entry.providerMetadata,
+									},
+								};
+							}
+						}
+						if (assistantText) {
+							yield { type: "block_complete", block: { type: "text", text: assistantText } };
+						}
 						yield { type: "context_length_exceeded", message };
 						return;
 					}
-					if (isRetryableInvalidStateReason(reason)) {
+					if (isRetryableInvalidStateReason(reason, message)) {
+						for (const entry of reasoningBlockMap.values()) {
+							if (entry.text || entry.providerMetadata) {
+								yield {
+									type: "block_complete",
+									block: {
+										type: "reasoning",
+										text: entry.text,
+										providerMetadata: entry.providerMetadata,
+									},
+								};
+							}
+						}
+						if (assistantText) {
+							yield { type: "block_complete", block: { type: "text", text: assistantText } };
+						}
 						yield { type: "retryable_error", message };
 						return;
 					}

@@ -498,8 +498,10 @@ export class ClineProvider implements ProviderAdapter {
 						return;
 					}
 
-					// Handle usage
-					if (chunk.usage && (!chunk.choices || chunk.choices.length === 0)) {
+					// Handle usage — Cline Gateway may embed usage in the last
+					// choices chunk (choices non-empty) or send it as a separate
+					// usage-only chunk (choices empty). Process usage regardless.
+					if (chunk.usage) {
 						const promptTokens = chunk.usage.prompt_tokens;
 						if (promptTokens != null) {
 							yield {
@@ -512,7 +514,8 @@ export class ClineProvider implements ProviderAdapter {
 								},
 							};
 						}
-						continue;
+						// If this is a usage-only chunk (no choices), skip further processing
+						if (!chunk.choices || chunk.choices.length === 0) continue;
 					}
 
 					const choice = chunk.choices?.[0];

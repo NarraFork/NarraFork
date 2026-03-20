@@ -2724,6 +2724,15 @@ async function runAgentLoop(
 
 			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 			if (result.contextLengthExceeded && active.alive) {
+				// Clean up partial message from the failed turn before any retry
+				// path — context overflow retries rebuild history from DB, so a
+				// stale partialMessageId would corrupt the next turn.
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				if (partialId) {
+					await cleanupPartialMessage(partialId, narratorId);
+				}
+
 				const overflow = await handleContextOverflow({
 					narratorId,
 					locale,
@@ -2769,6 +2778,14 @@ async function runAgentLoop(
 					signal: active.abortController.signal,
 				});
 				if (shouldRetry) {
+					// Clean up partial message from the failed turn so the retry
+					// starts fresh — otherwise the stale partialMessageId causes
+					// the next turn's block_complete events to append to the old message.
+					const partialId = active._partialMessageId;
+					active._partialMessageId = undefined;
+					if (partialId) {
+						await cleanupPartialMessage(partialId, narratorId);
+					}
 					continue;
 				}
 				// If aborted during backoff sleep, don't mark as error — the
@@ -3973,7 +3990,7 @@ export async function* startSession(
  * Clean up a partial (incomplete) assistant message and its related records.
  * Deletes children first to satisfy FK constraints.
  */
-async function cleanupPartialMessage(partialId: string, narratorId: string): Promise<void> {
+export async function cleanupPartialMessage(partialId: string, narratorId: string): Promise<void> {
 	try {
 		await db.transaction(async (tx) => {
 			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));

@@ -31,6 +31,7 @@ import {
 import { narratorService } from "./narrator-service";
 import {
 	buildContextManagementHooks,
+	cleanupPartialMessage,
 	handlePermission,
 	pruneToolCalls,
 	toBufferSummary,
@@ -474,6 +475,13 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				break;
 			}
 
+			// Clean up partial message from the failed turn before retry
+			const partialId = eventContext.getPartialMessageId();
+			if (partialId) {
+				await cleanupPartialMessage(partialId, narratorId);
+				eventContext.setPartialMessageId(undefined);
+			}
+
 			const overflow = await handleContextOverflow({
 				narratorId,
 				locale: locale as Locale,
@@ -520,6 +528,12 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				signal,
 			});
 			if (shouldRetry) {
+				// Clean up partial message from the failed turn before retry
+				const partialId = eventContext.getPartialMessageId();
+				if (partialId) {
+					await cleanupPartialMessage(partialId, narratorId);
+					eventContext.setPartialMessageId(undefined);
+				}
 				continue;
 			}
 			// If aborted during backoff sleep, don't mark as error — the

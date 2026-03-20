@@ -138,6 +138,34 @@ export function getClineCachedModels(): ClineModelInfo[] {
 	return result;
 }
 
+/**
+ * Fill context window sizes into settings for newly added models,
+ * using OpenRouter cached data. Fetches from API if cache is empty.
+ */
+async function fillContextWindows(
+	newModels: string[],
+	provider: ClineProviderConfig,
+): Promise<void> {
+	let cached = getClineCachedModels();
+	if (cached.length === 0) {
+		cached = await fetchOpenRouterModels(provider);
+		cachedModelsByProvider.set(provider.id, cached);
+		saveCachedModels();
+	}
+	const contextMap = new Map(cached.map((m) => [m.id, m.contextLength]));
+	let changed = false;
+	const windows = settings.agent.modelContextWindows ?? {};
+	settings.agent.modelContextWindows = windows;
+	for (const modelId of newModels) {
+		const ctx = contextMap.get(modelId);
+		if (ctx != null && !windows[`${provider.prefix}:${modelId}`]) {
+			windows[`${provider.prefix}:${modelId}`] = ctx;
+			changed = true;
+		}
+	}
+	if (changed) saveSettings(settings);
+}
+
 /** Get enabled models grouped by provider (only user-selected models). */
 export function getClineEnabledModelsGrouped(): Array<{
 	providerId: string;
@@ -545,8 +573,16 @@ clineRoutes.post("/enabled-models", async (c) => {
 	}
 
 	const provider = ensureDefaultProvider();
+	const oldSet = new Set(provider.enabledModels ?? []);
 	provider.enabledModels = body.models;
 	saveSettings(settings);
+
+	// Auto-fill context windows for newly added models
+	const newModels = body.models.filter((id) => !oldSet.has(id));
+	if (newModels.length > 0) {
+		await fillContextWindows(newModels, provider);
+	}
+
 	return c.json({ ok: true, count: body.models.length });
 });
 
