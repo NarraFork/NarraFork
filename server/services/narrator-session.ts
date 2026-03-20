@@ -196,6 +196,9 @@ const pendingPlanApprover = hotSafe<Map<string, string>>(
 	() => new Map(),
 );
 
+// Tracks the diff text when user edits the plan before approving — keyed by narratorId
+const pendingPlanDiff = hotSafe<Map<string, string>>("narrafork.pendingPlanDiff", () => new Map());
+
 // Buffered message queue — keyed by narratorId, supports multiple queued messages
 export interface BufferCreator {
 	id: string;
@@ -1664,6 +1667,17 @@ export async function resolvePermission(
 			pendingPlanApprover.set(pending.narratorId, userId);
 		}
 
+		// Track plan diff when user edited the plan before approving
+		if (updatedPlan !== undefined && pending.toolName === "ExitPlanMode") {
+			const originalPlan = typeof pending.input.plan === "string" ? pending.input.plan : "";
+			if (originalPlan && updatedPlan !== originalPlan) {
+				const diff = computeLineDiff(originalPlan, updatedPlan);
+				if (diff) {
+					pendingPlanDiff.set(pending.narratorId, diff);
+				}
+			}
+		}
+
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
 
 		// If the user attached feedback text, abort the agent loop so it stops
@@ -2825,10 +2839,25 @@ async function runAgentLoop(
 					locale,
 				);
 
-				// Check for chained feedback — use it instead of the default prompt
+				// If the user edited the plan, append the diff to the prompt
+				// (only for non-compact — compact already has the edited plan in system prompt)
+				const planDiff = pendingPlanDiff.get(narratorId);
+				if (planDiff) pendingPlanDiff.delete(narratorId);
+				const basePrompt =
+					!isCompact && planDiff
+						? getToolMessageWithParams("exitPlanModeApprovedWithDiff", locale, {
+								diff: planDiff,
+							})
+						: continuePrompt;
+
+				// Check for chained feedback — merge with diff if both exist
 				const fb = pendingFeedback.get(narratorId);
-				const promptText = fb ? fb.feedbackText : continuePrompt;
 				if (fb) pendingFeedback.delete(narratorId);
+				const promptText = fb
+					? basePrompt !== continuePrompt
+						? `${basePrompt}\n\n${fb.feedbackText}`
+						: fb.feedbackText
+					: basePrompt;
 
 				// Retrieve the approver userId so the message shows their avatar
 				const approverId = pendingPlanApprover.get(narratorId);
@@ -3258,6 +3287,94 @@ async function doRunCustomCompact(
 		});
 		throw err;
 	}
+}
+
+/**
+ * Compute a simple line-level unified diff between two strings.
+ * Returns a compact diff string showing only changed lines with context,
+ * or null if the texts are identical.
+ */
+function computeLineDiff(oldText: string, newText: string): string | null {
+	const oldLines = oldText.split("\n");
+	const newLines = newText.split("\n");
+	const CONTEXT = 2;
+
+	// Simple LCS-based diff using O(n*m) DP — fine for plan-sized texts
+	const m = oldLines.length;
+	const n = newLines.length;
+	const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+	for (let i = m - 1; i >= 0; i--) {
+		for (let j = n - 1; j >= 0; j--) {
+			if (oldLines[i] === newLines[j]) {
+				dp[i][j] = dp[i + 1][j + 1] + 1;
+			} else {
+				dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+			}
+		}
+	}
+
+	// Trace back to produce diff lines
+	const diffLines: Array<{ type: "keep" | "del" | "add"; text: string }> = [];
+	let i = 0;
+	let j = 0;
+	while (i < m || j < n) {
+		if (i < m && j < n && oldLines[i] === newLines[j]) {
+			diffLines.push({ type: "keep", text: oldLines[i] });
+			i++;
+			j++;
+		} else if (j < n && (i >= m || dp[i][j + 1] >= dp[i + 1][j])) {
+			diffLines.push({ type: "add", text: newLines[j] });
+			j++;
+		} else {
+			diffLines.push({ type: "del", text: oldLines[i] });
+			i++;
+		}
+	}
+
+	if (!diffLines.some((l) => l.type !== "keep")) return null;
+
+	// Collect change ranges (indices of non-keep lines)
+	const changeIndices: number[] = [];
+	for (let k = 0; k < diffLines.length; k++) {
+		if (diffLines[k].type !== "keep") changeIndices.push(k);
+	}
+
+	// Build hunks: group nearby changes with context lines
+	const hunks: string[] = [];
+	let hunkStart = Math.max(0, changeIndices[0] - CONTEXT);
+	let hunkEnd = Math.min(diffLines.length - 1, changeIndices[0] + CONTEXT);
+
+	for (let ci = 1; ci < changeIndices.length; ci++) {
+		const nextStart = Math.max(0, changeIndices[ci] - CONTEXT);
+		const nextEnd = Math.min(diffLines.length - 1, changeIndices[ci] + CONTEXT);
+		if (nextStart <= hunkEnd + 1) {
+			// Merge with current hunk
+			hunkEnd = nextEnd;
+		} else {
+			// Flush current hunk
+			const lines: string[] = [];
+			for (let h = hunkStart; h <= hunkEnd; h++) {
+				const d = diffLines[h];
+				if (d.type === "keep") lines.push(`  ${d.text}`);
+				else if (d.type === "del") lines.push(`- ${d.text}`);
+				else lines.push(`+ ${d.text}`);
+			}
+			hunks.push(lines.join("\n"));
+			hunkStart = nextStart;
+			hunkEnd = nextEnd;
+		}
+	}
+	// Flush last hunk
+	const lines: string[] = [];
+	for (let h = hunkStart; h <= hunkEnd; h++) {
+		const d = diffLines[h];
+		if (d.type === "keep") lines.push(`  ${d.text}`);
+		else if (d.type === "del") lines.push(`- ${d.text}`);
+		else lines.push(`+ ${d.text}`);
+	}
+	hunks.push(lines.join("\n"));
+
+	return hunks.join("\n...\n");
 }
 
 /**

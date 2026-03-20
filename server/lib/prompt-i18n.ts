@@ -400,6 +400,10 @@ const toolMessages = {
 		en: "The user approved your plan. You may now begin execution.",
 		"zh-CN": "用户批准了你的计划，可以开始执行。",
 	},
+	exitPlanModeApprovedWithDiff: {
+		en: "The user edited your plan before approving it. The following changes were made:\n\n{diff}\n\nPlease follow the edited plan.",
+		"zh-CN": "用户在批准前编辑了你的计划。以下是修改内容：\n\n{diff}\n\n请按照编辑后的计划执行。",
+	},
 	planCompactContinue: {
 		en: "The user approved your plan and the context has been reset. Your plan is now in the system prompt under Conversation Context. Please begin executing the plan.",
 		"zh-CN":
