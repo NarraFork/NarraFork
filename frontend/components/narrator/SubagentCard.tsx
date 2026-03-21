@@ -52,6 +52,56 @@ import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeig
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
 const stripSubagentId = (text: string) => text.replace(SUBAGENT_ID_RE, "").trim();
 
+/**
+ * Extract the _text value from a truncated JSON preview string.
+ * The preview may look like: `{"_text":"actual content here...` (cut mid-string).
+ * Falls back to the raw preview if _text is not found.
+ */
+function extractTextFromPreview(preview: string): string {
+	// Try complete _text value first
+	const complete = preview.match(/"_text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+	if (complete) {
+		try {
+			return JSON.parse(`"${complete[1]}"`);
+		} catch {
+			return complete[1];
+		}
+	}
+	// Try truncated _text value (no closing quote — preview was cut mid-value)
+	const truncated = preview.match(/"_text"\s*:\s*"((?:[^"\\]|\\.)*)/);
+	if (truncated) {
+		try {
+			return JSON.parse(`"${truncated[1]}"`);
+		} catch {
+			return truncated[1];
+		}
+	}
+	return preview;
+}
+
+/**
+ * Parse outputJson into a displayable raw string.
+ * Handles: plain string, truncated preview, content block array,
+ * structured { _text, _metadata }, and generic object fallback.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: outputJson is untyped
+function parseOutputJson(out: any): string {
+	if (!out) return "";
+	if (typeof out === "string") return out;
+	if (out._truncated && typeof out.preview === "string") {
+		return extractTextFromPreview(out.preview);
+	}
+	if (Array.isArray(out)) {
+		return out
+			.filter((b: ContentBlock) => b.text)
+			.map((b: ContentBlock) => b.text)
+			.join("\n");
+	}
+	if (typeof out._text === "string") return out._text;
+	if (typeof out === "object") return JSON.stringify(out, null, 2);
+	return "";
+}
+
 export interface SubagentCardProps {
 	toolCall: ToolCallData;
 	childMessages: NarratorMsg[];
@@ -162,32 +212,11 @@ export const SubagentCard = memo(
 			isTruncatedOutput && expanded,
 		);
 		const resultText = useMemo(() => {
-			const out = toolCall.outputJson;
-			if (!out) return "";
-			let raw = "";
-			if (typeof out === "string") raw = out;
-			// Handle truncated output from backend
-			else if (out._truncated && typeof out.preview === "string") raw = out.preview;
-			else if (Array.isArray(out)) {
-				raw = out
-					.filter((b: ContentBlock) => b.text)
-					.map((b: ContentBlock) => b.text)
-					.join("\n");
-			}
-			return stripSubagentId(raw);
+			return stripSubagentId(parseOutputJson(toolCall.outputJson));
 		}, [toolCall.outputJson]);
 		const fullResultText = useMemo(() => {
 			if (!fullTc?.outputJson) return undefined;
-			const out = fullTc.outputJson;
-			let raw = "";
-			if (typeof out === "string") raw = out;
-			else if (Array.isArray(out)) {
-				raw = out
-					.filter((b: ContentBlock) => b.text)
-					.map((b: ContentBlock) => b.text)
-					.join("\n");
-			}
-			const stripped = stripSubagentId(raw);
+			const stripped = stripSubagentId(parseOutputJson(fullTc.outputJson));
 			return stripped || undefined;
 		}, [fullTc?.outputJson]);
 

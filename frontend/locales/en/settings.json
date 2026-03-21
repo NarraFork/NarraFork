@@ -470,6 +470,7 @@
 	"wizardProviderRequired": "You must configure at least one AI provider before proceeding",
 	"wizardModelsRequired": "Both default model and summary model must be configured",
 	"wizardSummaryModelDesc": "Used for title generation, context compaction, and other background tasks",
+	"wizardSelectModel": "Select a model...",
 	"wizardNetworkDesc": "Choose whether NarraFork should only be accessible on this machine, or open to your local network.",
 	"wizardNetworkLocal": "This machine only",
 	"wizardNetworkLocalDesc": "Listen on localhost — only this computer can access NarraFork. More secure.",

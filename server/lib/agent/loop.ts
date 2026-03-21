@@ -772,8 +772,8 @@ export async function* agentLoop(
 					};
 				}
 				}
-				// Convert OpenAI usage to context_usage percentage
-				if (parsed.usage) {
+				// Convert OpenAI/Anthropic usage to context_usage percentage
+				if (parsed.usage && parsed.usage.promptTokens != null) {
 					const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (contextWindow) {
 						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;

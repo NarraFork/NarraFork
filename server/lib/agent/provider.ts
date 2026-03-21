@@ -58,7 +58,7 @@ export interface ParsedStreamEvent {
 	};
 	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
 	usage?: {
-		promptTokens: number;
+		promptTokens?: number;
 		completionTokens?: number;
 		/** Reasoning tokens (o1/o3 models) */
 		reasoningTokens?: number;

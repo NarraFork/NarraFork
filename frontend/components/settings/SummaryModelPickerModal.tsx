@@ -26,7 +26,9 @@ export function SummaryModelPickerModal() {
 
 	// Suppress the modal while the setup wizard hasn't been completed yet —
 	// the wizard itself handles model selection.
-	const wizardIncomplete = prefs?.setupWizardCompleted === false;
+	// Also suppress when prefs haven't loaded yet (undefined) to avoid a race
+	// where settings arrive before prefs and the modal flashes before the wizard.
+	const wizardIncomplete = !prefs || prefs.setupWizardCompleted === false;
 
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],

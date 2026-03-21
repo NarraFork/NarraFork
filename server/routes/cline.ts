@@ -351,6 +351,30 @@ async function fetchRecommendedModels(): Promise<ClineRecommendedModelsData> {
 	}
 }
 
+/**
+ * After first-time authentication, automatically fetch free models
+ * and add them to the provider's enabledModels so the user has
+ * something usable out of the box.
+ */
+async function autoAddFreeModels(provider: ClineProviderConfig): Promise<void> {
+	try {
+		const data = await fetchRecommendedModels();
+		const freeIds = data.free.map((m) => m.id);
+		if (freeIds.length === 0) return;
+
+		const existing = new Set(provider.enabledModels ?? []);
+		const toAdd = freeIds.filter((id) => !existing.has(id));
+		if (toAdd.length === 0) return;
+
+		provider.enabledModels = [...(provider.enabledModels ?? []), ...toAdd];
+		saveSettings(settings);
+		await fillContextWindows(toAdd, provider);
+		logger.info("Auto-added free models after Cline auth", { count: toAdd.length, models: toAdd });
+	} catch (err) {
+		logger.warn("Failed to auto-add free models after Cline auth", { error: String(err) });
+	}
+}
+
 // === Routes ===
 
 /**
@@ -386,12 +410,14 @@ clineRoutes.post("/auth/browser", async (c) => {
 
 		// Start waiting in background — the frontend will poll /status
 		waitForCompletion()
-			.then((creds) => {
+			.then(async (creds) => {
 				// Ensure provider exists and update access token
 				const provider = ensureDefaultProvider();
 				provider.accessToken = creds.accessToken;
 				saveSettings(settings);
 				logger.info("Cline OAuth completed", { email: creds.email });
+				// Auto-add free models on first auth
+				await autoAddFreeModels(provider);
 			})
 			.catch((err) => {
 				logger.error("Cline OAuth failed", { error: String(err) });
@@ -436,6 +462,9 @@ clineRoutes.post("/auth/callback", async (c) => {
 
 		// Cancel any pending browser auth since we got credentials directly
 		cancelBrowserAuth();
+
+		// Auto-add free models on first auth
+		await autoAddFreeModels(provider);
 
 		return c.json({
 			ok: true,

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { isInsidePath } from "../../platform-path";
-import { getToolMessage, type Locale } from "../../prompt-i18n";
+import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
 import type { ToolDefinition, ToolResult } from "../types";
 
 export const enterPlanModeTool: ToolDefinition = {
@@ -161,24 +161,28 @@ export const exitPlanModeTool: ToolDefinition = {
 		const locale = (ctx?.locale as Locale) ?? "en";
 		const ok = { output: getToolMessage("exitPlanModeOutput", locale) };
 
+		// Normalize: treat empty/whitespace-only strings as not provided
+		const hasPlan = typeof plan === "string" && plan.trim().length > 0;
+		const hasPlanFile = typeof planFile === "string" && planFile.trim().length > 0;
+
 		// Validate: exactly one of plan or planFile must be provided.
 		// Exception: if neither is provided but a plan file exists on disk, use it automatically.
-		if (plan && planFile) {
+		if (hasPlan && hasPlanFile) {
 			return {
-				output: "Error: Provide either 'plan' or 'planFile', not both.",
+				output: getToolMessage("exitPlanModeBothProvided", locale),
 				isError: true,
 			};
 		}
 
-		// If planFile is provided, validate it exists and is readable
-		if (planFile) {
-			const validation = validatePlanFile(cwd, planFile);
+		// If planFile is provided, validate it exists, is readable, and has content
+		if (hasPlanFile) {
+			const validation = validatePlanFile(cwd, planFile as string, locale);
 			if (validation.isError) return validation;
 			return ok;
 		}
 
 		// If inline plan is provided, return confirmation
-		if (plan) {
+		if (hasPlan) {
 			return ok;
 		}
 
@@ -187,35 +191,33 @@ export const exitPlanModeTool: ToolDefinition = {
 			const autoPath = `.narrafork/plan-${planFileId}.md`;
 			const absPath = resolve(cwd, autoPath);
 			if (existsSync(absPath)) {
-				const validation = validatePlanFile(cwd, autoPath);
+				const validation = validatePlanFile(cwd, autoPath, locale);
 				if (validation.isError) return validation;
 				return ok;
 			}
 		}
 
 		return {
-			output:
-				"Error: You must provide either 'plan' (inline text) or 'planFile' (path to plan file). " +
-				"Neither was provided and no plan file was found on disk.",
+			output: getToolMessage("exitPlanModeNeitherProvided", locale),
 			isError: true,
 		};
 	},
 };
 
-function validatePlanFile(cwd: string, planFile: string): ToolResult {
+function validatePlanFile(cwd: string, planFile: string, locale: Locale): ToolResult {
 	const absPath = resolve(cwd, planFile);
 
 	// Security: ensure the resolved path is under cwd
 	if (!isInsidePath(cwd, absPath)) {
 		return {
-			output: "Error: planFile must be within the working directory.",
+			output: getToolMessage("exitPlanModeFileOutsideCwd", locale),
 			isError: true,
 		};
 	}
 
 	if (!existsSync(absPath)) {
 		return {
-			output: `Error: Plan file not found: ${planFile}. Write the file first using the Write tool.`,
+			output: getToolMessageWithParams("exitPlanModeFileNotFound", locale, { planFile }),
 			isError: true,
 		};
 	}
@@ -224,14 +226,16 @@ function validatePlanFile(cwd: string, planFile: string): ToolResult {
 		const content = readFileSync(absPath, "utf-8");
 		if (!content.trim()) {
 			return {
-				output: "Error: Plan file is empty.",
+				output: getToolMessage("exitPlanModeFileEmpty", locale),
 				isError: true,
 			};
 		}
 		return { output: "" };
 	} catch (err) {
 		return {
-			output: `Error reading plan file: ${err instanceof Error ? err.message : String(err)}`,
+			output: getToolMessageWithParams("exitPlanModeFileReadError", locale, {
+				error: err instanceof Error ? err.message : String(err),
+			}),
 			isError: true,
 		};
 	}

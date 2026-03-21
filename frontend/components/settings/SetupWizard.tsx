@@ -89,6 +89,9 @@ export function SetupWizard({
 		(settings?.anthropicProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
 			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
 		)?.length ?? 0) +
+		(settings?.clineProviders?.filter(
+			(p: { baseUrl?: string; accessToken?: string }) => p.baseUrl && p.accessToken,
+		)?.length ?? 0) +
 		(settings?.codexAvailable ? 1 : 0);
 
 	// Track whether both models are set in BasicSettingsStep
@@ -366,10 +369,8 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 	const { groupedModels } = useAllModels();
 
 	const [projectDir, setProjectDir] = useState(settings?.paths?.defaultProjectDir ?? "");
-	const [defaultModel, setDefaultModel] = useState(
-	);
-	const [summaryModel, setSummaryModel] = useState(
-	);
+	const [defaultModel, setDefaultModel] = useState(settings?.agent?.defaultModel ?? "");
+	const [summaryModel, setSummaryModel] = useState(settings?.agent?.summaryModel ?? "");
 
 	const save = useMutation({
 		mutationFn: (data: Record<string, unknown>) => api.updateSettings(data),
@@ -401,6 +402,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={handleDirChange} />
 			<Select
 				label={t("defaultModel")}
+				placeholder={t("wizardSelectModel")}
 				data={groupedModels}
 				searchable
 				value={defaultModel}
@@ -416,6 +418,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 			<Select
 				label={t("summaryModel")}
 				description={t("wizardSummaryModelDesc")}
+				placeholder={t("wizardSelectModel")}
 				data={groupedModels}
 				searchable
 				value={summaryModel}

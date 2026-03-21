@@ -470,6 +470,7 @@
 	"wizardProviderRequired": "必须配置至少一个 AI 供应商才能继续",
 	"wizardModelsRequired": "默认模型和摘要模型都必须配置",
 	"wizardSummaryModelDesc": "用于标题生成、上下文压缩等后台任务",
+	"wizardSelectModel": "请选择模型...",
 	"wizardNetworkDesc": "选择 NarraFork 仅在本机可访问，还是开放给局域网内的其他设备。",
 	"wizardNetworkLocal": "仅本机",
 	"wizardNetworkLocalDesc": "监听 localhost — 只有本机可以访问，更安全。",

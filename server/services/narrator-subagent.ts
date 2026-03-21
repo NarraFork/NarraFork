@@ -534,6 +534,19 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					await cleanupPartialMessage(partialId, narratorId);
 					eventContext.setPartialMessageId(undefined);
 				}
+				// Rebuild history from DB so the retry includes any tool calls
+				// that were persisted before the API error occurred. Without this,
+				// the retry would use stale history and the model would repeat
+				// the same tool calls it already executed.
+				const rebuilt = await loadSubagentHistory(
+					narratorId,
+					model,
+					resolvedProvider,
+					pruneBoundaryId,
+				);
+				history = rebuilt.history;
+				trailingToolResults = rebuilt.trailingToolResults;
+				currentConversationId = randomUUID();
 				continue;
 			}
 			// If aborted during backoff sleep, don't mark as error — the

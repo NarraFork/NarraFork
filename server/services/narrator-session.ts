@@ -3131,6 +3131,36 @@ async function runAgentLoop(
 		active.abortController.abort();
 		active.events.emit("event", { type: "done", data: null });
 		active.events.removeAllListeners();
+
+		// --- Clean up per-narrator entries in global containers to prevent memory leaks ---
+		// These containers are module-level (hotSafe) and persist across narrator sessions.
+		// Without cleanup, entries accumulate on every interrupt/retry/error cycle.
+
+		// 1. pendingPermissions: key = toolCallId, value.narratorId identifies the owner
+		for (const [key, perm] of pendingPermissions) {
+			if (perm.narratorId === narratorId) {
+				try {
+					perm.cleanup();
+				} catch (e) {
+					logger.debug("Failed to cleanup pending permission", {
+						toolCallId: key,
+						error: String(e),
+					});
+				}
+				pendingPermissions.delete(key);
+			}
+		}
+
+		// 2-5. Containers keyed directly by narratorId
+		pendingFeedback.delete(narratorId);
+		pendingPlanCompact.delete(narratorId);
+		pendingPlanApprover.delete(narratorId);
+		pendingPlanDiff.delete(narratorId);
+		bufferedMessages.delete(narratorId);
+
+		// 6. Per-narrator git status Promise cache (Bash before-status snapshots)
+		active._bashBeforeStatus?.clear();
+
 		if (shouldUpdateTitle) {
 			generateAndSetTitle(narratorId, locale).catch(() => {});
 		}

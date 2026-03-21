@@ -1151,12 +1151,17 @@ function parseAnthropicEvent(
 		if (event.usage?.output_tokens != null) {
 			const cacheRead = event.usage.cache_read_input_tokens ?? 0;
 			const cacheCreation = event.usage.cache_creation_input_tokens ?? 0;
+			// message_delta typically only carries output_tokens — input_tokens is absent.
+			// Only include promptTokens when input_tokens is actually present to avoid
+			// overwriting the accurate value from message_start with 0.
+			const inputTokens = event.usage.input_tokens;
 			results.push({
 				usage: {
-					// Total input tokens occupying the context window (uncached + cached)
-					promptTokens: (event.usage.input_tokens ?? 0) + cacheRead + cacheCreation,
+					...(inputTokens != null && {
+						promptTokens: inputTokens + cacheRead + cacheCreation,
+						cachedInputTokens: cacheRead + cacheCreation,
+					}),
 					completionTokens: event.usage.output_tokens,
-					cachedInputTokens: cacheRead + cacheCreation,
 				},
 			});
 		}
