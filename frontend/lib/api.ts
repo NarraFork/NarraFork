@@ -1803,6 +1803,7 @@ export const api = {
 		request<{
 			added: number;
 			duplicates: number;
+			skipped: number;
 		}>("/codex/import", {
 			method: "POST",
 			body: JSON.stringify({ credentials }),

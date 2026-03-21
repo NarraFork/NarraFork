@@ -392,6 +392,21 @@ export async function processEvent(
 		case "block_complete": {
 			const { block } = event;
 
+			// Snapshot: clear accumulated streaming text/reasoning once the block
+			// is persisted — the completed block will be served via the partial
+			// message from the database, so the snapshot should only contain
+			// text that is still being streamed (i.e. not yet block_complete).
+			if (!ctx.parentToolUseId) {
+				const snap = streamingSnapshots.get(broadcastTargetId);
+				if (snap) {
+					if (block.type === "text") {
+						snap.streamingText = "";
+					} else if (block.type === "reasoning") {
+						snap.streamingReasoning = "";
+					}
+				}
+			}
+
 			// Ensure a partial message exists for incremental persistence
 			if (!ctx.getPartialMessageId()) {
 				const tokenUsage = ctx.getTokenUsage();

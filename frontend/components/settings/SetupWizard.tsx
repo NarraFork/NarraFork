@@ -465,7 +465,16 @@ function NetworkStep() {
 
 	const save = useMutation({
 		mutationFn: (host: string) => api.updateSettings({ server: { host } }),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+		onSuccess: (data) => {
+			qc.invalidateQueries({ queryKey: ["settings"] });
+			// Server is restarting at a new address — redirect after a short delay
+			const resp = data as { serverRestarting?: boolean; newUrl?: string };
+			if (resp.serverRestarting && resp.newUrl) {
+				setTimeout(() => {
+					window.location.href = resp.newUrl as string;
+				}, 1000);
+			}
+		},
 	});
 
 	// Sync mode from settings when they load

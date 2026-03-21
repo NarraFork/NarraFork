@@ -6,7 +6,9 @@ import { settings } from "@server/lib/settings";
 import iconv from "iconv-lite";
 import type { ToolContext } from "../../types";
 import { editTool } from "../edit";
+import { grepTool, isRgAvailable } from "../grep";
 import { readTool } from "../read";
+import { writeTool } from "../write";
 
 const TEST_DIR = join(tmpdir(), `narrafork-encoding-test-${Date.now()}`);
 
@@ -96,4 +98,51 @@ describe("Legacy encoding support", () => {
 		const content = await Bun.file(UTF8_FILE).text();
 		expect(content).toContain("再见世界");
 	});
+
+	test("write preserves GBK encoding when overwriting existing file", async () => {
+		settings.agent.legacyEncoding = true;
+		const result = await writeTool.execute(
+			{ file_path: GBK_FILE, content: "新的内容\n第二行\n" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+
+		// Verify the file is still GBK-encoded (not UTF-8)
+		const rawBuffer = Buffer.from(await Bun.file(GBK_FILE).arrayBuffer());
+		const decoded = iconv.decode(rawBuffer, "gbk");
+		expect(decoded).toContain("新的内容");
+		expect(decoded).toContain("第二行");
+	});
+
+	test("write uses UTF-8 for new files even with legacyEncoding on", async () => {
+		settings.agent.legacyEncoding = true;
+		const NEW_FILE = join(TEST_DIR, "new-file.txt");
+		const result = await writeTool.execute(
+			{ file_path: NEW_FILE, content: "全新文件\n" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+
+		// New files should be UTF-8
+		const content = await Bun.file(NEW_FILE).text();
+		expect(content).toContain("全新文件");
+	});
+
+	test.skipIf(!isRgAvailable)(
+		"grep finds content in GBK file when legacyEncoding is on",
+		async () => {
+			settings.agent.legacyEncoding = true;
+			// Use files_with_matches mode — rg should not skip the GBK file
+			const result = await grepTool.execute(
+				{
+					pattern: "GBK",
+					path: TEST_DIR,
+					output_mode: "files_with_matches",
+				},
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("gbk-test.txt");
+		},
+	);
 });

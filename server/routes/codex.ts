@@ -346,6 +346,17 @@ codexRoutes.post("/import", async (c) => {
 		return c.json({ error: "No credentials provided" }, 400);
 	}
 
+	// Validate that at least one credential has a refreshToken
+	const validCredentials = body.credentials.filter(
+		(c) => c.refreshToken && typeof c.refreshToken === "string",
+	);
+	if (validCredentials.length === 0) {
+		return c.json(
+			{ error: "No valid credentials: each credential must have a non-empty refreshToken" },
+			400,
+		);
+	}
+
 	const manager = getCodexManager();
 	const result = manager.importCredentials(body.credentials);
 	return c.json(result);

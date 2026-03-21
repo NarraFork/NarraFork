@@ -443,7 +443,7 @@ function SettingsPage() {
 				},
 			},
 			{
-				onSuccess: () => {
+				onSuccess: (data) => {
 					serverSnapshot.current = {
 						port,
 						host,
@@ -475,6 +475,13 @@ function SettingsPage() {
 						globalCommandWhitelist,
 						globalCommandBlacklist,
 					};
+					// Server is restarting at a new address — redirect after a short delay
+					const resp = data as { serverRestarting?: boolean; newUrl?: string };
+					if (resp.serverRestarting && resp.newUrl) {
+						setTimeout(() => {
+							window.location.href = resp.newUrl as string;
+						}, 1000);
+					}
 				},
 			},
 		);

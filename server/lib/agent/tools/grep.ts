@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod/v4";
 import { logger } from "../../logger";
 import { IS_WINDOWS } from "../../platform";
+import { settings } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const RG_INSTALL_HINT = IS_WINDOWS
@@ -272,6 +273,13 @@ export const grepTool: ToolDefinition = {
 		// Build rg arguments
 		const rgArgs: string[] = [RG_PATH, "--hidden", "--no-messages"];
 
+		// When legacy encoding is enabled, use --encoding none so rg doesn't skip
+		// non-UTF-8 files. This makes rg search raw bytes, allowing matches in
+		// files encoded as GBK, Shift_JIS, etc.
+		if (settings.agent.legacyEncoding) {
+			rgArgs.push("--encoding", "none");
+		}
+
 		// Output mode flags
 		if (outputMode === "files_with_matches") {
 			rgArgs.push("-l");
@@ -323,11 +331,35 @@ export const grepTool: ToolDefinition = {
 				signal: ctx.signal,
 			});
 
-			const [stdout, stderr] = await Promise.all([
-				new Response(proc.stdout).text(),
+			// When legacy encoding is enabled with --encoding none, rg outputs raw
+			// bytes. We read as a buffer first and attempt charset detection so that
+			// non-UTF-8 content (e.g. GBK grep results) is decoded correctly.
+			const [stdoutBuf, stderr] = await Promise.all([
+				new Response(proc.stdout).arrayBuffer(),
 				new Response(proc.stderr).text(),
 			]);
 			const exitCode = await proc.exited;
+
+			let stdout: string;
+			if (settings.agent.legacyEncoding) {
+				const buf = Buffer.from(stdoutBuf);
+				const chardet = await import("chardet");
+				const results = chardet.default.analyse(buf);
+				const best = results[0];
+				if (
+					best &&
+					best.confidence >= 70 &&
+					best.name.toLowerCase() !== "utf-8" &&
+					best.name.toLowerCase() !== "ascii"
+				) {
+					const iconv = await import("iconv-lite");
+					stdout = iconv.default.decode(buf, best.name);
+				} else {
+					stdout = new TextDecoder().decode(stdoutBuf);
+				}
+			} else {
+				stdout = new TextDecoder().decode(stdoutBuf);
+			}
 
 			// Exit codes: 0 = matches found, 1 = no matches, 2 = errors (but may still have matches)
 			if (exitCode === 2 && !stdout.trim()) {

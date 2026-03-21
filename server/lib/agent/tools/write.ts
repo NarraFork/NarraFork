@@ -40,12 +40,15 @@ export const writeTool: ToolDefinition = {
 		const { file_path, content } = args as { file_path: string; content: string };
 		const resolvedPath = resolve(ctx.cwd, file_path);
 		try {
-			// Record original content before writing (non-fatal)
+			// Detect existing file encoding before overwriting so we can preserve it
+			let existingEncoding = "utf-8";
 			await ensureFileSnapshot(ctx.narratorId, file_path, async () => {
 				try {
 					const file = Bun.file(resolvedPath);
 					if (await file.exists()) {
-						return (await readFileText(resolvedPath)).text;
+						const result = await readFileText(resolvedPath);
+						existingEncoding = result.encoding;
+						return result.text;
 					}
 				} catch {
 					// File doesn't exist or can't be read
@@ -54,7 +57,7 @@ export const writeTool: ToolDefinition = {
 			});
 
 			mkdirSync(dirname(resolvedPath), { recursive: true });
-			await writeFileText(resolvedPath, content);
+			await writeFileText(resolvedPath, content, existingEncoding);
 			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
 		} catch (err) {
 			return {

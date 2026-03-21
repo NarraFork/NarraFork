@@ -832,12 +832,17 @@ export class CodexManager {
 			displayName?: string;
 			priority?: number;
 		}>,
-	): { added: number; duplicates: number } {
+	): { added: number; duplicates: number; skipped: number } {
 		const existingHashes = new Set(this.entries.map((e) => sha256Hex(e.refreshToken)));
 		let added = 0;
 		let duplicates = 0;
+		let skipped = 0;
 
 		for (const c of creds) {
+			if (!c.refreshToken || typeof c.refreshToken !== "string") {
+				skipped++;
+				continue;
+			}
 			const hash = sha256Hex(c.refreshToken);
 			if (existingHashes.has(hash)) {
 				duplicates++;
@@ -865,7 +870,7 @@ export class CodexManager {
 			}
 		}
 
-		return { added, duplicates };
+		return { added, duplicates, skipped };
 	}
 
 	// ==================== Persistence ====================

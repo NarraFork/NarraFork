@@ -15,6 +15,7 @@ import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
+import { registerServerRestart } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -82,7 +83,7 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 
 const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
-const host = cliHost || process.env.HOST || settings.server.host;
+let currentHost = cliHost || process.env.HOST || settings.server.host;
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
 const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
@@ -234,7 +235,7 @@ const MAX_PORT_RETRIES = 10;
 function startServer(listenPort: number) {
 	return Bun.serve({
 		port: listenPort,
-		hostname: host,
+		hostname: currentHost,
 		idleTimeout: 255,
 		async fetch(req, server) {
 			const url = new URL(req.url);
@@ -333,10 +334,43 @@ if (portExplicit) {
 	}
 }
 
-logger.info(`NarraFork server running on http://${host}:${actualPort}`, {
+logger.info(`NarraFork server running on http://${currentHost}:${actualPort}`, {
 	isProd,
 	isCompiledBinary,
 	metaUrl: import.meta.url,
+});
+
+// Register server restart handler for hot-reloading host/port from settings
+registerServerRestart((newHost: string, newPort: number) => {
+	const oldHost = currentHost;
+	const oldPort = actualPort;
+	try {
+		_server.stop(true);
+		currentHost = newHost;
+		_server = startServer(newPort);
+		actualPort = newPort;
+		logger.info(
+			`Server restarted: http://${oldHost}:${oldPort} → http://${currentHost}:${actualPort}`,
+		);
+	} catch (err) {
+		// Rollback: try to restart on the old address
+		logger.error("Failed to restart server on new address, rolling back", {
+			newHost,
+			newPort,
+			error: String(err),
+		});
+		try {
+			currentHost = oldHost;
+			_server = startServer(oldPort);
+			actualPort = oldPort;
+			logger.info(`Server rolled back to http://${oldHost}:${oldPort}`);
+		} catch (rollbackErr) {
+			logger.error("Rollback also failed — server is down", {
+				error: String(rollbackErr),
+			});
+		}
+		throw err;
+	}
 });
 
 /** Open a URL in the user's default browser. */
@@ -398,7 +432,7 @@ async function openAsApp(url: string) {
 	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
-	const url = `http://${host === "0.0.0.0" ? "localhost" : host}:${actualPort}`;
+	const url = `http://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);

@@ -299,12 +299,15 @@ export class ClineProvider implements ProviderAdapter {
 		}
 		messages.push({ role: "user", content: text });
 
+		// Cline gateway may always return SSE even without stream:true,
+		// so we explicitly request streaming and collect the text from the SSE stream.
 		const response = await fetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify({
 				model: bareModel,
 				messages,
+				stream: true,
 			}),
 		});
 
@@ -313,14 +316,12 @@ export class ClineProvider implements ProviderAdapter {
 			throw new ApiError(response.status, `Cline API error ${response.status}: ${errText}`);
 		}
 
-		const raw = await response.text();
-		const json = JSON.parse(raw) as {
-			choices?: Array<{ message?: { content?: string } }>;
-			usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-		};
+		if (!response.body) {
+			throw new Error("Cline API returned no body");
+		}
 
 		return {
-			text: json.choices?.[0]?.message?.content ?? "",
+			text: await this.collectStreamText(response.body),
 			contextPercent: undefined,
 		};
 	}
@@ -337,6 +338,8 @@ export class ClineProvider implements ProviderAdapter {
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
 
+		// Cline gateway may always return SSE even without stream:true,
+		// so we explicitly request streaming and collect the text from the SSE stream.
 		const response = await fetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
@@ -346,6 +349,7 @@ export class ClineProvider implements ProviderAdapter {
 					{ role: "system", content: systemInstruction },
 					{ role: "user", content: `${reminder}\n\n${content}` },
 				],
+				stream: true,
 			}),
 		});
 
@@ -354,12 +358,11 @@ export class ClineProvider implements ProviderAdapter {
 			throw new ApiError(response.status, `Cline API error ${response.status}: ${errText}`);
 		}
 
-		const raw = await response.text();
-		const json = JSON.parse(raw) as {
-			choices?: Array<{ message?: { content?: string } }>;
-		};
+		if (!response.body) {
+			throw new Error("Cline API returned no body");
+		}
 
-		return json.choices?.[0]?.message?.content ?? "";
+		return this.collectStreamText(response.body);
 	}
 
 	// === Internal methods ===
@@ -453,6 +456,54 @@ export class ClineProvider implements ProviderAdapter {
 		}
 
 		return { history, trailingToolResults: pendingToolResults };
+	}
+
+	/**
+	 * Consume an SSE stream and return the concatenated text content.
+	 * Used by generateWithMeta / generateWithHistory where we only need the final text.
+	 */
+	private async collectStreamText(body: ReadableStream<Uint8Array>): Promise<string> {
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let text = "";
+
+		const reader = body.getReader();
+		try {
+			while (true) {
+				const { done, value } = await readWithTimeout(reader);
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+
+				const lines = buffer.split("\n");
+				buffer = lines.pop() ?? "";
+
+				for (const line of lines) {
+					const trimmed = line.trim();
+					if (!trimmed || trimmed === "data: [DONE]") continue;
+					if (!trimmed.startsWith("data: ")) continue;
+
+					let chunk: ClineStreamChunk;
+					try {
+						chunk = JSON.parse(trimmed.slice(6));
+					} catch {
+						continue;
+					}
+
+					if (chunk.error) {
+						throw new ApiError(500, `Cline API error: ${chunk.error.message || "Unknown error"}`);
+					}
+
+					const delta = chunk.choices?.[0]?.delta;
+					if (delta?.content) {
+						text += delta.content;
+					}
+				}
+			}
+		} finally {
+			reader.releaseLock();
+		}
+
+		return text;
 	}
 
 	private async *parseSSEStream(

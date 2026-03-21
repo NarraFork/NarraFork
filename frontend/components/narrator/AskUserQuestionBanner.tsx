@@ -1,8 +1,10 @@
 import { Alert, Badge, Button, Checkbox, Group, Radio, Stack, Text, Textarea } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+
+const DRAFT_KEY_PREFIX = "narrafork_ask_draft_";
 
 interface Question {
 	question: string;
@@ -35,9 +37,36 @@ export function AskUserQuestionBanner({
 	const { t } = useTranslation("narrator");
 	// Defensive: questions may come from untyped JSON — ensure it's always an array
 	const questions = Array.isArray(rawQuestions) ? rawQuestions : [];
-	const [selections, setSelections] = useState<Record<string, string>>({});
-	const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
+	const draftKey = `${DRAFT_KEY_PREFIX}${requestId}`;
+	const [selections, setSelections] = useState<Record<string, string>>(() => {
+		if (readOnly) return {};
+		try {
+			const raw = sessionStorage.getItem(draftKey);
+			if (raw) return JSON.parse(raw).selections ?? {};
+		} catch {}
+		return {};
+	});
+	const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
+		if (readOnly) return {};
+		try {
+			const raw = sessionStorage.getItem(draftKey);
+			if (raw) return JSON.parse(raw).customInputs ?? {};
+		} catch {}
+		return {};
+	});
 	const [suggesting, setSuggesting] = useState(false);
+
+	// Persist draft to sessionStorage
+	useEffect(() => {
+		if (readOnly) return;
+		const hasContent =
+			Object.values(selections).some((v) => v) || Object.values(customInputs).some((v) => v);
+		if (hasContent) {
+			sessionStorage.setItem(draftKey, JSON.stringify({ selections, customInputs }));
+		} else {
+			sessionStorage.removeItem(draftKey);
+		}
+	}, [readOnly, draftKey, selections, customInputs]);
 
 	// Custom input takes priority when non-empty
 	const getAnswer = (question: string) => {
@@ -66,6 +95,7 @@ export function AskUserQuestionBanner({
 		for (const q of questions) {
 			answers[q.question] = getAnswer(q.question);
 		}
+		sessionStorage.removeItem(draftKey);
 		onSubmit?.(requestId, answers);
 	};
 
@@ -214,7 +244,15 @@ export function AskUserQuestionBanner({
 						<Button size="xs" variant="light" loading={suggesting} onClick={handleSuggest}>
 							{suggesting ? t("suggesting") : t("suggestAnswer")}
 						</Button>
-						<Button size="xs" color="red" variant="light" onClick={() => onDeny?.(requestId)}>
+						<Button
+							size="xs"
+							color="red"
+							variant="light"
+							onClick={() => {
+								sessionStorage.removeItem(draftKey);
+								onDeny?.(requestId);
+							}}
+						>
 							{t("skipQuestion")}
 						</Button>
 					</Group>

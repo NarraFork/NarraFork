@@ -2089,9 +2089,48 @@ export function InlinePermission({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const [feedback, setFeedback] = useState("");
-	const [editing, setEditing] = useState(false);
-	const [editedPlan, setEditedPlan] = useState<string | null>(null);
+	const draftKey = `narrafork_perm_draft_${permission.id}`;
+	const [feedback, setFeedback] = useState(() => {
+		try {
+			const raw = sessionStorage.getItem(draftKey);
+			if (raw) return JSON.parse(raw).feedback ?? "";
+		} catch {}
+		return "";
+	});
+	const [editing, setEditing] = useState(() => {
+		try {
+			const raw = sessionStorage.getItem(draftKey);
+			if (raw) {
+				const parsed = JSON.parse(raw);
+				const pt =
+					permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
+						? permission.inputJson.plan
+						: null;
+				return parsed.editedPlan != null && parsed.editedPlan !== pt;
+			}
+		} catch {}
+		return false;
+	});
+	const [editedPlan, setEditedPlan] = useState<string | null>(() => {
+		try {
+			const raw = sessionStorage.getItem(draftKey);
+			if (raw) {
+				const parsed = JSON.parse(raw);
+				return parsed.editedPlan !== undefined ? parsed.editedPlan : null;
+			}
+		} catch {}
+		return null;
+	});
+
+	// Persist draft to sessionStorage
+	useEffect(() => {
+		const hasContent = feedback || editedPlan !== null;
+		if (hasContent) {
+			sessionStorage.setItem(draftKey, JSON.stringify({ feedback, editedPlan }));
+		} else {
+			sessionStorage.removeItem(draftKey);
+		}
+	}, [draftKey, feedback, editedPlan]);
 
 	// AskUserQuestion: render the full question form inline
 	if (permission.toolName === "AskUserQuestion" && Array.isArray(permission.inputJson?.questions)) {
@@ -2118,6 +2157,7 @@ export function InlinePermission({
 	const planEdited = editedPlan !== null && editedPlan !== planText;
 
 	const handleAllow = (compactAfter?: boolean) => {
+		sessionStorage.removeItem(draftKey);
 		onDecision?.(
 			permission.id,
 			"allow",
@@ -2220,7 +2260,10 @@ export function InlinePermission({
 					size="sm"
 					color="red"
 					variant="light"
-					onClick={() => onDecision?.(permission.id, "deny", feedback || undefined)}
+					onClick={() => {
+						sessionStorage.removeItem(draftKey);
+						onDecision?.(permission.id, "deny", feedback || undefined);
+					}}
 				>
 					{tc("deny")}
 				</Button>
