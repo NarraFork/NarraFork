@@ -27,7 +27,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
@@ -111,6 +111,7 @@ function RoutinesPage() {
 				<Tabs.List mb="md">
 					<Tabs.Tab value="commands">{t("tabCommands")}</Tabs.Tab>
 					<Tabs.Tab value="optional-tools">{t("tabOptionalTools")}</Tabs.Tab>
+					<Tabs.Tab value="tool-permissions">{t("tabToolPermissions")}</Tabs.Tab>
 					<Tabs.Tab value="global-skills">{t("tabGlobalSkills")}</Tabs.Tab>
 					<Tabs.Tab value="project-skills">{t("tabProjectSkills")}</Tabs.Tab>
 					<Tabs.Tab value="custom-subagents">{t("tabCustomSubagents")}</Tabs.Tab>
@@ -123,6 +124,9 @@ function RoutinesPage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="optional-tools">
 					<OptionalToolsTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="tool-permissions">
+					<ToolPermissionsTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="global-skills">
 					<GlobalSkillsTab />
@@ -213,6 +217,24 @@ function CommandsTab() {
 				commands={(userPrefs?.commands ?? []) as CommandDef[]}
 				onChange={(cmds) => updateUserPref.mutate({ commands: cmds })}
 			/>
+		</Stack>
+	);
+}
+
+// === Tab: Tool Permissions (link to detail page) ===
+
+function ToolPermissionsTab() {
+	const { t } = useTranslation("routines");
+	const navigate = useNavigate();
+
+	return (
+		<Stack>
+			<Text size="sm" c="dimmed">
+				{t("toolPermissionsDesc")}
+			</Text>
+			<Button variant="light" onClick={() => navigate({ to: "/routines/tool-permissions" })}>
+				{t("toolPermissionsManage")}
+			</Button>
 		</Stack>
 	);
 }

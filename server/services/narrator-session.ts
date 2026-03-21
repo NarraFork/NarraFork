@@ -586,6 +586,12 @@ export interface PermissionDecisionOpts {
 	meta?: PermissionDecisionMeta;
 	/** Project git repository root path — used for structural path protection. */
 	projectGitPath?: string;
+	/** WebFetch URL permission policy. */
+	webFetchPolicy?: {
+		allowAll?: boolean;
+		whitelist?: Array<{ pattern: string; enabled?: boolean }>;
+		blacklist?: Array<{ pattern: string; enabled?: boolean }>;
+	};
 }
 
 // ── Command pattern matching ──────────────────────────────
@@ -841,6 +847,41 @@ export function resolvePermissionDecision(
 			: permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
+
+	// WebFetch: URL-based permission policy.
+	// Default behaviour is "ask" (needs user approval).
+	// allowAll → auto-allow everything.
+	// blacklist match → deny (priority over whitelist).
+	// whitelist match → allow.
+	// No match → "ask" (or "deny" in readOnly/dontAsk modes).
+	if (toolName === "WebFetch") {
+		const url = typeof input.url === "string" ? input.url.toLowerCase() : "";
+		const policy = opts.webFetchPolicy;
+		if (policy) {
+			// Blacklist takes priority
+			const blEntries = (policy.blacklist ?? []).filter((e) => e.enabled !== false);
+			for (const entry of blEntries) {
+				if (entry.pattern && url.includes(entry.pattern.toLowerCase())) {
+					if (meta)
+						meta.blacklistReason = `WebFetch URL blocked by blacklist pattern: "${entry.pattern}"`;
+					return "deny";
+				}
+			}
+			// allowAll
+			if (policy.allowAll) return "allow";
+			// Whitelist
+			const wlEntries = (policy.whitelist ?? []).filter((e) => e.enabled !== false);
+			for (const entry of wlEntries) {
+				if (entry.pattern && url.includes(entry.pattern.toLowerCase())) {
+					return "allow";
+				}
+			}
+		}
+		// Fallback: respect permission mode
+		if (effectiveMode === "bypassPermissions") return "allow";
+		if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
+		return "ask";
+	}
 
 	// Command blacklist — deny if any sub-command matches (priority over all whitelists).
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis && commandBlacklist.length > 0) {
@@ -1237,6 +1278,7 @@ export async function handlePermission(
 		previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
 		meta: permMeta,
 		projectGitPath: resolvedProjectGitPath,
+		webFetchPolicy: settings.agent.webFetchPolicy,
 	});
 	logger.debug("Permission decision", {
 		narratorId,

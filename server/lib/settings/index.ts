@@ -178,6 +178,15 @@ export interface NarraForkSettings {
 			denyPrompt?: string;
 			enabled?: boolean;
 		}>;
+		/** WebFetch permission policy. */
+		webFetchPolicy?: {
+			/** When true, all URLs are auto-allowed without user approval. */
+			allowAll?: boolean;
+			/** URL keyword whitelist — matching URLs are auto-allowed. */
+			whitelist?: Array<{ pattern: string; enabled?: boolean }>;
+			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
+			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
+		};
 	};
 	chapters: {
 		maxActiveWorktrees: number;
