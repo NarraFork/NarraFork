@@ -153,6 +153,12 @@ const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
+const OVERSEER_TOOLS = new Set([
+	"ApprovePermission",
+	"DenyPermission",
+	"ListManagedNarrators",
+	"GetNarratorContext",
+]);
 
 export type ToolCategory =
 	| "file"
@@ -167,6 +173,7 @@ export type ToolCategory =
 	| "terminal"
 	| "share"
 	| "recall"
+	| "overseer"
 	| "generic";
 
 export function isEditTool(name: string): boolean {
@@ -186,6 +193,7 @@ export function getCategory(name: string): ToolCategory {
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
 	if (RECALL_TOOLS.has(name)) return "recall";
+	if (OVERSEER_TOOLS.has(name)) return "overseer";
 	return "generic";
 }
 
@@ -215,6 +223,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 			return IconShare;
 		case "recall":
 			return IconHistory;
+		case "overseer":
+			return IconEye;
 		default:
 			return IconCode;
 	}
@@ -246,6 +256,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "green";
 		case "recall":
 			return "cyan";
+		case "overseer":
+			return "indigo";
 		default:
 			return "gray";
 	}
@@ -471,6 +483,18 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 				return nid ? `Read ${nid.slice(0, 8)}…` : "Read conversation";
 			}
 			return "Recall";
+		}
+		case "overseer": {
+			const reqId = extractField(input, "requestId");
+			const short = reqId ? reqId.slice(0, 8) : "";
+			if (toolName === "ApprovePermission") return short ? `✓ Approve ${short}…` : "Approve";
+			if (toolName === "DenyPermission") return short ? `✗ Deny ${short}…` : "Deny";
+			if (toolName === "ListManagedNarrators") return "List managed narrators";
+			if (toolName === "GetNarratorContext") {
+				const nid = extractField(input, "narratorId");
+				return nid ? `Context: ${nid.slice(0, 8)}…` : "Get context";
+			}
+			return toolName;
 		}
 		default:
 			return toolName;
@@ -1751,6 +1775,80 @@ function formatRecallTime(iso: string): string {
 	}
 }
 
+// --- Overseer tool detail ---
+
+function OverseerDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const input = toolCall.inputJson as Record<string, unknown> | undefined;
+	const output =
+		typeof toolCall.outputJson === "string"
+			? toolCall.outputJson
+			: typeof (toolCall.outputJson as { output?: string })?.output === "string"
+				? (toolCall.outputJson as { output: string }).output
+				: resolveDisplayText(toolCall.outputJson);
+
+	if (toolCall.toolName === "ApprovePermission" || toolCall.toolName === "DenyPermission") {
+		const isApprove = toolCall.toolName === "ApprovePermission";
+		const reqId = (input?.requestId as string) ?? "";
+		const feedback = (input?.feedbackText as string) ?? (input?.denyMessage as string) ?? "";
+
+		return (
+			<Box mt="xs">
+				<Group gap="xs" mb="xs">
+					<Badge color={isApprove ? "green" : "red"} variant="filled" size="sm">
+						{isApprove ? "Approved" : "Denied"}
+					</Badge>
+					{reqId && <Code style={{ fontSize: 11 }}>{reqId}</Code>}
+				</Group>
+				{feedback && (
+					<Text size="xs" c="dimmed" mb="xs">
+						{feedback}
+					</Text>
+				)}
+				{output && (
+					<Code block style={{ fontSize: 11, maxHeight: 120, overflow: "auto" }}>
+						{output}
+					</Code>
+				)}
+			</Box>
+		);
+	}
+
+	if (toolCall.toolName === "GetNarratorContext") {
+		const nid = (input?.narratorId as string) ?? "";
+		return (
+			<Box mt="xs">
+				{nid && (
+					<Text size="xs" c="dimmed" mb="xs">
+						Narrator: <Code style={{ fontSize: 11 }}>{nid}</Code>
+					</Text>
+				)}
+				{output && (
+					<Code
+						block
+						style={{ fontSize: 11, maxHeight: 300, overflow: "auto", whiteSpace: "pre-wrap" }}
+					>
+						{output}
+					</Code>
+				)}
+			</Box>
+		);
+	}
+
+	// ListManagedNarrators and fallback
+	return (
+		<Box mt="xs">
+			{output && (
+				<Code
+					block
+					style={{ fontSize: 11, maxHeight: 300, overflow: "auto", whiteSpace: "pre-wrap" }}
+				>
+					{output}
+				</Code>
+			)}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -2042,6 +2140,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <ShareFileDetail toolCall={toolCall} />;
 		case "recall":
 			return <RecallDetail toolCall={toolCall} />;
+		case "overseer":
+			return <OverseerDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}

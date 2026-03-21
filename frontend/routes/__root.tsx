@@ -47,6 +47,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { GitMissingAlert } from "../components/GitMissingAlert";
+import { OverseerNavItem } from "../components/nav/OverseerNavItem";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
 import { SummaryModelPickerModal } from "../components/settings/SummaryModelPickerModal";
@@ -55,6 +56,7 @@ import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useOutputStats } from "../hooks/useOutputStats";
+import { useGlobalOverseer } from "../hooks/useOverseers";
 import { useRecentTabs } from "../hooks/useRecentTabs";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
@@ -170,6 +172,9 @@ function AuthenticatedLayout() {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { width: navWidth, onDragStart: onNavDragStart } = useResizableNav();
 	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
+	const { data: globalOverseer } = useGlobalOverseer();
+	const isOverseerPage =
+		!!globalOverseer?.narratorId && pathname === `/narrators/${globalOverseer.narratorId}`;
 
 	// --- Global narrator WebSocket connection ---
 	useEffect(() => {
@@ -307,7 +312,10 @@ function AuthenticatedLayout() {
 	const projectTabs = tabs.filter((t) => t.type === "project");
 	const narratorTabs = tabs.filter((t) => t.type !== "project");
 	const firstProjectTabActive = projectTabs.length > 0 && isTabActive(projectTabs[0], pathname);
-	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
+	const firstNarratorTabActive =
+		narratorTabs.length > 0 &&
+		isTabActive(narratorTabs[0], pathname) &&
+		narratorTabs[0].id !== globalOverseer?.narratorId;
 
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
@@ -438,6 +446,7 @@ function AuthenticatedLayout() {
 						leftSection={<IconDashboard size={16} />}
 						onClick={closeNavForLink}
 					/>
+					<OverseerNavItem onNavigate={closeNavForLink} />
 					<NavLink
 						component={Link}
 						to="/projects"
@@ -480,11 +489,13 @@ function AuthenticatedLayout() {
 				</Box>
 				<Box>
 					<NavLink
-						component={Link}
-						to="/narrators"
 						label={t("narrators")}
+						active={!isOverseerPage && pathname.startsWith("/narrators")}
 						leftSection={<IconMessageChatbot size={16} />}
-						onClick={closeNavForLink}
+						onClick={() => {
+							navigate({ to: "/narrators" });
+							closeNavForLink();
+						}}
 						styles={
 							firstNarratorTabActive
 								? {
@@ -539,7 +550,12 @@ function AuthenticatedLayout() {
 					/>
 				</Box>
 				<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-					<RecentTabList filter="narrator" onNavigate={closeNavForLink} firstTabConnected />
+					<RecentTabList
+						filter="narrator"
+						onNavigate={closeNavForLink}
+						firstTabConnected
+						excludeActiveNarratorId={globalOverseer?.narratorId}
+					/>
 				</Box>
 				<Box>
 					{user?.role === "admin" && (

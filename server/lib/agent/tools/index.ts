@@ -8,6 +8,12 @@ import { continueTaskTool } from "./continue-task";
 import { editTool } from "./edit";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
+import {
+	approvePermissionTool,
+	denyPermissionTool,
+	getNarratorContextTool,
+	listManagedNarratorsTool,
+} from "./overseer";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
@@ -33,6 +39,16 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Recall", recallTool],
 ]);
 
+/**
+ * Overseer-only tools — only injected for narrators bound to an overseer.
+ */
+export const OVERSEER_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
+	["ApprovePermission", approvePermissionTool],
+	["DenyPermission", denyPermissionTool],
+	["ListManagedNarrators", listManagedNarratorsTool],
+	["GetNarratorContext", getNarratorContextTool],
+]);
+
 /** Register all core tools into the singleton registry */
 export function registerCoreTools(): void {
 	toolRegistry.register(bashTool);
@@ -55,6 +71,11 @@ export function registerCoreTools(): void {
 
 	// Register optional tools (they use isAvailable to stay hidden by default)
 	for (const tool of OPTIONAL_TOOLS.values()) {
+		toolRegistry.register(tool);
+	}
+
+	// Register overseer tools (hidden by default, injected for overseer narrators)
+	for (const tool of OVERSEER_TOOLS.values()) {
 		toolRegistry.register(tool);
 	}
 }

@@ -286,4 +286,10 @@ export interface AgentConfig {
 	 * history/tools if the provider changed.
 	 */
 	getModelOverride?: () => string | null;
+	/**
+	 * Called after all tools in a turn complete. If returns true, the loop
+	 * exits gracefully without aborting running processes — used by feedback
+	 * injection to stop after the current tool finishes.
+	 */
+	shouldStop?: () => boolean;
 }

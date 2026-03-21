@@ -1246,6 +1246,156 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 	return paths;
 }
 
+// ── git 路径提取 ─────────────────────────────────────────
+
+/**
+ * git clone/init 等子命令中带值的 flag — 遇到时跳过下一个 token。
+ * 只列出 `--flag value` 形式（非 `--flag=value`）的常用选项。
+ */
+const GIT_CLONE_FLAGS_WITH_VALUE = new Set([
+	"-b",
+	"--branch",
+	"-o",
+	"--origin",
+	"--reference",
+	"--reference-if-able",
+	"--separate-git-dir",
+	"--depth",
+	"--shallow-since",
+	"--shallow-exclude",
+	"-j",
+	"--jobs",
+	"--filter",
+	"--bundle-uri",
+	"--template",
+	"--config",
+	"-c",
+]);
+
+/** git 写操作子命令 — 会在文件系统创建/修改内容 */
+const GIT_WRITE_SUBCOMMANDS = new Set(["clone", "init", "worktree"]);
+
+/**
+ * 从 git 命令中提取文件系统路径。
+ *
+ * git 的路径语义完全取决于子命令，不能用通用的 extractPathArgs 处理。
+ * 目前覆盖：
+ * - `git -C <dir>` — 工作目录切换
+ * - `git clone <url> [<directory>]` — 克隆目标目录
+ * - `git init [<directory>]` — 初始化目标目录
+ * - `git worktree add <path>` — worktree 路径
+ *
+ * @returns `{ paths, isWrite }` — 提取的路径列表和是否为写操作
+ */
+function extractGitPaths(tokens: string[], cwd: string): { paths: string[]; isWrite: boolean } {
+	const paths: string[] = [];
+	let isWrite = false;
+
+	// 先处理 git -C <dir>：跳过 git 本身的全局选项找到子命令
+	let subIdx = 1;
+	while (subIdx < tokens.length) {
+		const t = tokens[subIdx];
+		if (t === "-C" && subIdx + 1 < tokens.length) {
+			paths.push(resolvePath(cwd, tokens[subIdx + 1]));
+			subIdx += 2;
+			continue;
+		}
+		// 跳过其他全局 flag（--git-dir=, --work-tree= 等 = 形式自动跳过）
+		if (t.startsWith("-")) {
+			// --git-dir / --work-tree 等带值的全局 flag
+			if (
+				(t === "--git-dir" || t === "--work-tree" || t === "--namespace") &&
+				subIdx + 1 < tokens.length
+			) {
+				subIdx += 2;
+				continue;
+			}
+			subIdx++;
+			continue;
+		}
+		break; // 找到子命令
+	}
+
+	const sub = tokens[subIdx];
+	if (!sub) return { paths, isWrite };
+
+	if (GIT_WRITE_SUBCOMMANDS.has(sub)) {
+		isWrite = true;
+	}
+
+	if (sub === "clone") {
+		// git clone [options] <repository> [<directory>]
+		// 提取最后一个非 flag 参数作为目标目录（如果有两个非 flag 参数）
+		const nonFlagArgs: string[] = [];
+		let skipNext = false;
+		for (let i = subIdx + 1; i < tokens.length; i++) {
+			if (skipNext) {
+				// tree-sitter 可能丢失数字 token（如 --depth 1 中的 1），
+				// 如果下一个 token 仍是 flag，说明值被吃掉了，不应跳过
+				if (!tokens[i].startsWith("-")) {
+					skipNext = false;
+					continue;
+				}
+				skipNext = false;
+			}
+			const arg = tokens[i];
+			if (arg.startsWith("-")) {
+				if (GIT_CLONE_FLAGS_WITH_VALUE.has(arg)) skipNext = true;
+				continue;
+			}
+			nonFlagArgs.push(arg);
+		}
+		// nonFlagArgs[0] = repository URL/path, nonFlagArgs[1] = target directory
+		if (nonFlagArgs.length >= 2) {
+			paths.push(resolvePath(cwd, nonFlagArgs[1]));
+		}
+		// 如果 repository 是本地路径（不含 :// 且不以 git@ 开头），也提取
+		if (nonFlagArgs.length >= 1) {
+			const repo = nonFlagArgs[0];
+			if (!repo.includes("://") && !repo.startsWith("git@")) {
+				paths.push(resolvePath(cwd, repo));
+			}
+		}
+	} else if (sub === "init") {
+		// git init [<directory>]
+		const nonFlagArgs: string[] = [];
+		for (let i = subIdx + 1; i < tokens.length; i++) {
+			const arg = tokens[i];
+			if (arg.startsWith("-")) {
+				// --template / --separate-git-dir 带值
+				if (arg === "--template" || arg === "--separate-git-dir") {
+					i++;
+				}
+				continue;
+			}
+			nonFlagArgs.push(arg);
+		}
+		if (nonFlagArgs.length >= 1) {
+			paths.push(resolvePath(cwd, nonFlagArgs[0]));
+		}
+	} else if (sub === "worktree") {
+		const worktreeSub = tokens[subIdx + 1];
+		if (worktreeSub === "add" || worktreeSub === "move") {
+			// git worktree add <path> [<branch>] / git worktree move <worktree> <new-path>
+			const nonFlagArgs: string[] = [];
+			for (let i = subIdx + 2; i < tokens.length; i++) {
+				const arg = tokens[i];
+				if (arg.startsWith("-")) continue;
+				nonFlagArgs.push(arg);
+			}
+			if (nonFlagArgs.length >= 1) {
+				paths.push(resolvePath(cwd, nonFlagArgs[0]));
+			}
+			// worktree move 的第二个参数也是路径
+			if (worktreeSub === "move" && nonFlagArgs.length >= 2) {
+				paths.push(resolvePath(cwd, nonFlagArgs[1]));
+			}
+		}
+	}
+
+	return { paths, isWrite };
+}
+
 // ── 灾难性命令检测 ────────────────────────────────────────
 
 /** 系统关键路径 — 对这些路径的递归删除/覆盖是灾难性的 */
@@ -1878,6 +2028,12 @@ export async function analyzeBashCommand(
 			if (PATH_COMMANDS.has(cmdName)) {
 				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
 			}
+			// git 路径提取（clone/init/worktree 等子命令的目标路径）
+			if (cmdName === "git") {
+				const gitResult = extractGitPaths(tokens, cwd);
+				filePaths.push(...gitResult.paths);
+				if (gitResult.isWrite) hasWriteOperation = true;
+			}
 			continue;
 		}
 
@@ -1890,6 +2046,12 @@ export async function analyzeBashCommand(
 			// 路径提取
 			if (PATH_COMMANDS.has(cmdName)) {
 				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
+			}
+			// git 路径提取（安全子命令中也可能有 -C 等路径参数）
+			if (cmdName === "git") {
+				const gitResult = extractGitPaths(tokens, cwd);
+				filePaths.push(...gitResult.paths);
+				if (gitResult.isWrite) hasWriteOperation = true;
 			}
 			continue;
 		}

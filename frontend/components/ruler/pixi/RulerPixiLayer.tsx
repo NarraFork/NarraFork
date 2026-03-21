@@ -1096,8 +1096,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			if (lineOpacity > 0.01) {
 				// Check if this chapter's startCommitSha is on the ruler backbone
 				const onBackbone = ch.startCommitSha ? d.tickPositions.has(ch.startCommitSha) : true;
+				// Review chapters always connect to their parent chapter, not the ruler
+				const forceParentConnector = ch.role === "review";
 
-				if (!onBackbone && ch.parentChapterId) {
+				if ((forceParentConnector || !onBackbone) && ch.parentChapterId) {
 					// Orphan chapter: defer connector to after the loop so parent
 					// position is guaranteed to be available
 					deferredConnectors.push({

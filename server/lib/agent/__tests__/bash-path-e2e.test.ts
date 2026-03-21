@@ -134,3 +134,51 @@ describe("e2e: path extraction correctness", () => {
 		expect(a.filePaths).toContain("/etc/passwd");
 	});
 });
+
+describe("e2e: git clone/init to external directory → ask", () => {
+	test("git clone to external directory → ask (acceptEdits)", async () => {
+		expect(
+			await fullChain("git clone https://github.com/user/repo.git /tmp/my-clone", "acceptEdits"),
+		).toBe("ask");
+	});
+
+	test("git clone to external directory → ask (default)", async () => {
+		expect(await fullChain("git clone https://github.com/user/repo.git /tmp/my-clone")).toBe("ask");
+	});
+
+	test("git clone to project-internal directory → allow (acceptEdits)", async () => {
+		expect(
+			await fullChain("git clone https://github.com/user/repo.git ./vendor/repo", "acceptEdits"),
+		).toBe("allow");
+	});
+
+	test("git clone without target directory → allow (acceptEdits)", async () => {
+		expect(await fullChain("git clone https://github.com/user/repo.git", "acceptEdits")).toBe(
+			"allow",
+		);
+	});
+
+	test("git -C external dir → ask (acceptEdits)", async () => {
+		expect(await fullChain("git -C /opt/other-project status", "acceptEdits")).toBe("ask");
+	});
+
+	test("git init external directory → ask (acceptEdits)", async () => {
+		expect(await fullChain("git init /tmp/new-repo", "acceptEdits")).toBe("ask");
+	});
+
+	test("git init in cwd → allow (acceptEdits)", async () => {
+		expect(await fullChain("git init", "acceptEdits")).toBe("allow");
+	});
+
+	test("git worktree add external path → ask (acceptEdits)", async () => {
+		expect(await fullChain("git worktree add /tmp/wt feature", "acceptEdits")).toBe("ask");
+	});
+
+	test("git status (no external paths) → allow (acceptEdits)", async () => {
+		expect(await fullChain("git status", "acceptEdits")).toBe("allow");
+	});
+
+	test("git log (no external paths) → allow (acceptEdits)", async () => {
+		expect(await fullChain("git log --oneline", "acceptEdits")).toBe("allow");
+	});
+});

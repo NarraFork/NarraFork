@@ -210,6 +210,10 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				const maxTop = boxRect.bottom - menuHeight / 2;
 				menuTop = Math.max(minTop, Math.min(swipeY, maxTop));
 			}
+			// Clamp to viewport so the menu never overflows off-screen
+			// (the menu is rendered with translateY(-50%), so its edges are ±menuHeight/2 from top)
+			const half = menuHeight / 2;
+			menuTop = Math.max(half, Math.min(menuTop, window.innerHeight - half));
 			return { left: menuLeft, top: menuTop };
 		},
 		[swipeInitialRight, swipeOffset, swipeY],

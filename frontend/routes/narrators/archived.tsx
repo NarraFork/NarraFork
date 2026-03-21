@@ -4,17 +4,23 @@ import {
 	Card,
 	Group,
 	Loader,
+	Modal,
 	Stack,
 	Text,
 	Title,
 	Tooltip,
 } from "@mantine/core";
-import { IconArchiveOff } from "@tabler/icons-react";
+import { useDisclosure } from "@mantine/hooks";
+import { IconArchiveOff, IconTrash } from "@tabler/icons-react";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
-import { useNarratorsPaginated, useUnarchiveNarrator } from "../../hooks/useNarrator";
+import {
+	useDeleteNarrator,
+	useNarratorsPaginated,
+	useUnarchiveNarrator,
+} from "../../hooks/useNarrator";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 
 export const Route = createFileRoute("/narrators/archived")({
@@ -34,9 +40,33 @@ function ArchivedNarratorsPage() {
 		[paginatedData],
 	);
 	const unarchiveNarrator = useUnarchiveNarrator();
+	const deleteNarrator = useDeleteNarrator();
 	const { t } = useTranslation("narrators");
+	const { t: tc } = useTranslation("common");
 	const { i18n } = useTranslation();
 	const { defaultModelValue } = useAllModels();
+
+	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
+	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+
+	const handleDelete = useCallback(
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		(e: React.MouseEvent, narrator: any) => {
+			e.preventDefault();
+			e.stopPropagation();
+			setDeleteTarget({
+				id: narrator.id,
+				title: narrator.title || narrator.id.slice(0, 8),
+			});
+			openDelete();
+		},
+		[openDelete],
+	);
+
+	const confirmDelete = useCallback(() => {
+		if (!deleteTarget) return;
+		deleteNarrator.mutate(deleteTarget.id, { onSuccess: closeDelete });
+	}, [deleteTarget, deleteNarrator, closeDelete]);
 
 	const sentinelRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
@@ -111,6 +141,16 @@ function ArchivedNarratorsPage() {
 												<IconArchiveOff size={16} />
 											</ActionIcon>
 										</Tooltip>
+										<Tooltip label={t("deleteNarrator")}>
+											<ActionIcon
+												size="sm"
+												color="red"
+												variant="subtle"
+												onClick={(e) => handleDelete(e, narrator)}
+											>
+												<IconTrash size={16} />
+											</ActionIcon>
+										</Tooltip>
 									</Group>
 								</Group>
 							</Card>
@@ -127,6 +167,26 @@ function ArchivedNarratorsPage() {
 					)}
 				</Stack>
 			)}
+
+			<Modal
+				opened={deleteOpened}
+				onClose={closeDelete}
+				title={t("deleteNarratorConfirmTitle")}
+				size="sm"
+				centered
+			>
+				<Stack>
+					<Text size="sm">{t("deleteNarratorConfirm", { name: deleteTarget?.title })}</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeDelete}>
+							{tc("cancel")}
+						</Button>
+						<Button color="red" onClick={confirmDelete} loading={deleteNarrator.isPending}>
+							{t("deleteNarrator")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
 		</Stack>
 	);
 }

@@ -167,7 +167,25 @@ export type NarraForkEvent =
 	// MCP server lifecycle
 	| { type: "mcp:server_connected"; serverId: string; name: string; toolCount: number }
 	| { type: "mcp:server_disconnected"; serverId: string; name: string; reason?: string }
-	| { type: "mcp:server_error"; serverId: string; name: string; error: string };
+	| { type: "mcp:server_error"; serverId: string; name: string; error: string }
+	// Overseer lifecycle
+	| {
+			type: "overseer:event_routed";
+			overseerId: string;
+			narratorId: string;
+			eventType: string;
+	  }
+	| {
+			type: "overseer:decision_made";
+			overseerId: string;
+			narratorId: string;
+			requestId: string;
+			decision: "allow" | "deny";
+	  }
+	| { type: "overseer:created"; overseerId: string; scope: string; projectId?: string }
+	| { type: "overseer:deleted"; overseerId: string }
+	| { type: "overseer:enabled"; overseerId: string }
+	| { type: "overseer:disabled"; overseerId: string };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

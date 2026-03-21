@@ -213,6 +213,16 @@ export function useUnarchiveNarrator() {
 	});
 }
 
+export function useDeleteNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.deleteNarrator(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useInterruptNarrator() {
 	return useMutation({
 		mutationFn: (id: string) => api.interruptNarrator(id),

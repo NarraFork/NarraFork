@@ -29,6 +29,7 @@ import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
 import { openaiRoutes } from "./routes/openai";
+import { overseerRoutes } from "./routes/overseers";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
 import { reviewsRouter } from "./routes/reviews";
@@ -137,6 +138,7 @@ app.route("/api/skills", skillRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/reviews", reviewsRouter);
+app.route("/api/overseers", overseerRoutes);
 app.route("/api/update", updateRoutes);
 
 // Graph routes are nested under projects for RESTful consistency

@@ -1291,6 +1291,19 @@ export async function* agentLoop(
 			}
 		}
 
+		// Graceful stop requested (e.g. feedback injection) — exit without aborting processes.
+		// Unlike abort, this lets the current tool finish normally and preserves its result.
+		if (config.shouldStop?.()) {
+			provider.pushAssistantTurn(
+				history,
+				assistantText,
+				toolUses,
+				collectReasoningBlocks(reasoningBlockMap),
+			);
+			yield { type: "turn_complete", turnIndex };
+			return;
+		}
+
 		// Strip broken tool calls from the history sent to the model.
 		// The UI already has the full picture (tool_result events were yielded above),
 		// but the model should not see the broken tool_use + tool_result pair —

@@ -1043,6 +1043,17 @@ export function NarratorPanel({
 	// --- WebSocket + real-time state ---
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isSubagent = (fetchedNarrator as any)?.type === "subagent";
+
+		const prefix = narrator?.model?.split(":")[0];
+		if (!prefix) return null;
+		if (!cfg) return null;
+			| Record<string, { quotaBalance: number | null }>
+			| undefined;
+		return {
+			providerId: cfg.id,
+			quotaBalance: quotas?.[cfg.id]?.quotaBalance ?? null,
+		};
+
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,

@@ -1,5 +1,6 @@
 import { extname, resolve } from "node:path";
 import { z } from "zod/v4";
+import { imageToBase64 } from "../../uploads";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText } from "./encoding";
 
@@ -121,12 +122,20 @@ export const readTool: ToolDefinition = {
 						isError: true,
 					};
 				}
-				const buffer = await file.arrayBuffer();
-				const base64 = Buffer.from(buffer).toString("base64");
+				const { base64, detectedMediaType } = await imageToBase64(resolvedPath);
+				// Prefer the real format detected from file content magic bytes
+				const MIME_TO_FORMAT: Record<string, string> = {
+					"image/png": "png",
+					"image/jpeg": "jpeg",
+					"image/gif": "gif",
+					"image/webp": "webp",
+				};
+				const actualFormat =
+					(detectedMediaType && MIME_TO_FORMAT[detectedMediaType]) || imageFormat;
 				return {
-					output: `[Image: ${file_path} (${(size / 1024).toFixed(1)} KB, ${imageFormat})]`,
+					output: `[Image: ${file_path} (${(size / 1024).toFixed(1)} KB, ${actualFormat})]`,
 					title: file_path,
-					images: [{ format: imageFormat, base64 }],
+					images: [{ format: actualFormat, base64 }],
 				};
 			} catch (err) {
 				return {

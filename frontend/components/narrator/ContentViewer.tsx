@@ -7,6 +7,7 @@ import {
 	IconCopy,
 	IconDeviceMobileRotated,
 	IconEdit,
+	IconExternalLink,
 	IconGitFork,
 	IconMarkdown,
 	IconRefresh,
@@ -526,7 +527,19 @@ export const ContentViewer = memo(
 											msgCtx.onCompactBeforeMessage ||
 											msgCtx.onDeleteBlock ||
 											msgCtx.onRegenerateFromMessage ||
-											msgCtx.onEditMessage) && <Menu.Divider />}
+											msgCtx.onEditMessage ||
+											msgCtx.onJumpToSource) && <Menu.Divider />}
+										{msgCtx.onJumpToSource && (
+											<Menu.Item
+												leftSection={<IconExternalLink size={14} />}
+												onClick={() => {
+													msgCtx.onJumpToSource?.();
+													swipe.closeSwipe();
+												}}
+											>
+												{tNarrator("contextMenu_jumpToSource")}
+											</Menu.Item>
+										)}
 										{msgCtx.onEditMessage && (
 											<Menu.Item
 												leftSection={<IconEdit size={14} />}
@@ -727,7 +740,16 @@ export const ContentViewer = memo(
 							msgCtx.onCompactBeforeMessage ||
 							msgCtx.onDeleteBlock ||
 							msgCtx.onRegenerateFromMessage ||
-							msgCtx.onEditMessage) && <Menu.Divider />}
+							msgCtx.onEditMessage ||
+							msgCtx.onJumpToSource) && <Menu.Divider />}
+						{msgCtx.onJumpToSource && (
+							<Menu.Item
+								leftSection={<IconExternalLink size={14} />}
+								onClick={msgCtx.onJumpToSource}
+							>
+								{tNarrator("contextMenu_jumpToSource")}
+							</Menu.Item>
+						)}
 						{msgCtx.onEditMessage && (
 							<Menu.Item leftSection={<IconEdit size={14} />} onClick={msgCtx.onEditMessage}>
 								{tNarrator("contextMenu_edit")}

@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { mkdirSync, rmSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects } from "../db/schema";
@@ -88,6 +89,10 @@ export const reviewService = {
 
 			await gitService.createWorktree(gitPath, worktreePath, branchName);
 			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
+
+			// Step 1.5: Copy uncommitted/untracked changes from source worktree
+			// so the reviewer can see the full working state, not just committed code.
+			await this.copyDirtyFiles(sourceWorktree, worktreePath);
 
 			// Step 2: Create chapter record
 			const [chapter] = await db
@@ -197,24 +202,42 @@ export const reviewService = {
 
 	/**
 	 * Build diff context string for the review narrator's system prompt.
-	 * Shows the source chapter's changes relative to its base branch.
+	 * Shows the source chapter's changes relative to its base branch,
+	 * plus any uncommitted/untracked changes in the source worktree.
 	 */
 	async buildDiffContext(
 		gitPath: string,
 		source: typeof chapters.$inferSelect,
 		sourceHeadSha: string,
 	): Promise<string> {
+		const parts: string[] = [];
 		try {
 			const baseRef = source.startCommitSha ?? source.baseBranch;
-			const diff = await gitService.getDiffBetweenRefs(gitPath, baseRef, sourceHeadSha);
-			if (!diff.trim()) {
-				return "No code changes detected in the source chapter.";
+			const committedDiff = await gitService.getDiffBetweenRefs(gitPath, baseRef, sourceHeadSha);
+			if (committedDiff.trim()) {
+				parts.push(committedDiff);
 			}
-			return diff;
 		} catch (err) {
-			logger.warn("Failed to get diff for review context", { error: String(err) });
-			return "Unable to retrieve diff. Please use Read and Grep tools to examine the codebase.";
+			logger.warn("Failed to get committed diff for review context", { error: String(err) });
 		}
+
+		// Include uncommitted changes from the source worktree
+		const sourceWorktree = source.worktreePath ?? gitPath;
+		try {
+			const uncommittedDiff = await gitService.getFullDiff(sourceWorktree);
+			if (uncommittedDiff.trim()) {
+				parts.push("\n--- Uncommitted changes in source worktree ---\n", uncommittedDiff);
+			}
+		} catch (err) {
+			logger.warn("Failed to get uncommitted diff for review context", {
+				error: String(err),
+			});
+		}
+
+		if (parts.length === 0) {
+			return "No code changes detected in the source chapter.";
+		}
+		return parts.join("\n");
 	},
 
 	/**
@@ -519,5 +542,71 @@ export const reviewService = {
 		return await db.query.chapters.findFirst({
 			where: eq(chapters.id, reviewChapterId),
 		});
+	},
+
+	/**
+	 * Copy uncommitted/untracked files from source worktree to target worktree.
+	 * Uses `git status --porcelain` to enumerate dirty files, then copies them.
+	 * Deleted files are also removed in the target.
+	 */
+	async copyDirtyFiles(sourceWorktree: string, targetWorktree: string): Promise<void> {
+		try {
+			const status = await gitService.getStatus(sourceWorktree);
+			if (!status.trim()) return; // nothing dirty
+
+			// Parse porcelain output (line-based)
+			const lines = status.split("\n").filter(Boolean);
+			let copied = 0;
+			for (const line of lines) {
+				const x = line[0]; // index status
+				const y = line[1]; // worktree status
+				let filePath = line.slice(3).trim();
+				if (!filePath) continue;
+
+				// Handle renames: porcelain format is "R  old -> new"
+				const isRename = x === "R" || y === "R";
+				if (isRename && filePath.includes(" -> ")) {
+					const parts = filePath.split(" -> ");
+					// Copy the new file; the old path no longer exists in worktree
+					filePath = parts[1].trim();
+				}
+
+				// Deleted in worktree
+				if (y === "D" || (x === "D" && y === " ")) {
+					try {
+						rmSync(resolve(targetWorktree, filePath), { force: true });
+					} catch {}
+					continue;
+				}
+
+				// For all other statuses (modified, added, untracked, etc.), copy the file
+				try {
+					const srcPath = resolve(sourceWorktree, filePath);
+					const dstPath = resolve(targetWorktree, filePath);
+					const content = await Bun.file(srcPath).arrayBuffer();
+					mkdirSync(dirname(dstPath), { recursive: true });
+					await Bun.write(dstPath, content);
+					copied++;
+				} catch (err) {
+					// Skip files that can't be read (e.g. broken symlinks)
+					logger.debug("Failed to copy dirty file for review", {
+						filePath,
+						error: String(err),
+					});
+				}
+			}
+			if (copied > 0) {
+				logger.info("Copied dirty files to review worktree", {
+					sourceWorktree,
+					targetWorktree,
+					fileCount: copied,
+				});
+			}
+		} catch (err) {
+			// Non-fatal: review can still work with committed-only state
+			logger.warn("Failed to copy dirty files for review (non-fatal)", {
+				error: String(err),
+			});
+		}
 	},
 };

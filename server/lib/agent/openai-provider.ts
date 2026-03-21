@@ -430,10 +430,18 @@ export class OpenAIProvider implements ProviderAdapter {
 			// previous_response_id is unsupported — always send full history.
 			body = { model, input: responsesInput, stream: true, store: false };
 
+			// Codex: set prompt_cache_key to conversationId for server-side prompt caching.
+			// Codex CLI uses conversation_id as the cache key so the server can reuse
+			// cached prompt prefixes across turns within the same session.
+			if (this.apiMode === "codex") {
+				body.prompt_cache_key = params.conversationId;
+				body.parallel_tool_calls = true;
+			}
+
 			// Codex: enable server-side auto-truncation to handle context window overflow.
-			// Only send when using the official Codex endpoint — third-party proxies
-			// or custom baseUrls may not support this parameter (HTTP 400).
-			if (this.apiMode === "codex" && !this.config.baseUrl) {
+			// Send when the target is an official ChatGPT domain (works through proxies
+			// that point to official endpoints, but avoids sending to incompatible backends).
+			if (this.apiMode === "codex" && this.isOfficialChatGPTDomain()) {
 				body.truncation = "auto";
 			}
 			if (instructions) {
@@ -603,8 +611,11 @@ export class OpenAIProvider implements ProviderAdapter {
 				emitReasoningItems(reasoningBlocks, h, emittedIds);
 			}
 			if (text) {
+				// Use Responses API array format (output_text) for consistency with
+				// convertHistoryToResponsesApi — ensures identical format whether
+				// history is built from DB or pushed mid-loop, preserving cache prefix.
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				h.push({ role: "assistant", content: text } as any);
+				h.push({ role: "assistant", content: [{ type: "output_text", text }] } as any);
 			}
 			for (const tu of toolUses) {
 				logger.debug("OpenAI pushAssistantTurn function_call", {
@@ -1839,15 +1850,22 @@ function emitReasoningItems(
 
 	for (const [itemId, group] of grouped) {
 		emittedIds.add(itemId);
-		result.push({
+		// biome-ignore lint/suspicious/noExplicitAny: Responses API reasoning item shape
+		const item: Record<string, any> = {
 			type: "reasoning",
 			id: group.itemId,
 			encrypted_content: group.encryptedContent ?? null,
-			summary: group.summaryTexts.map((text) => ({
+		};
+		// Only include summary when there are actual summary texts.
+		// Codex CLI omits the field entirely when no summaries exist;
+		// sending an empty array may cause API validation issues.
+		if (group.summaryTexts.length > 0) {
+			item.summary = group.summaryTexts.map((text) => ({
 				type: "summary_text",
 				text,
-			})),
-		});
+			}));
+		}
+		result.push(item);
 	}
 }
 

@@ -496,6 +496,13 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Ensure global overseer exists (disabled by default on first creation)
+import { ensureGlobalOverseer } from "./services/overseer-service";
+
+ensureGlobalOverseer().catch((err) => {
+	logger.warn("Failed to ensure global overseer", { error: String(err) });
+});
+
 // Register project DB backup sync (event-driven dual-write)
 registerProjectDbSync();
 

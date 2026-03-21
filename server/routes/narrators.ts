@@ -977,6 +977,18 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Delete narrator (must be archived)
+narratorRoutes.delete("/:id", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator.status !== "archived") {
+		throw new ValidationError("Only archived narrators can be deleted");
+	}
+	if (isNarratorActive(id)) closeNarrator(id);
+	await narratorService.remove(id);
+	return c.json({ ok: true });
+});
+
 // Mark narrator as read (done → idle)
 // Error sessions are preserved because only status=done can transition.
 // Subagents are skipped — their done/error status must be preserved for ContinueTask.

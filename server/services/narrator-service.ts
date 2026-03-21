@@ -7,6 +7,7 @@ import {
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistDirs,
+	overseers,
 	terminals,
 	terminalTabs,
 	terminalViewState,
@@ -2867,6 +2868,15 @@ export const narratorService = {
 
 		// Delete in dependency order within a transaction
 		await db.transaction(async (tx) => {
+			// Clean up overseers (unique constraint, no cascade)
+			await tx.delete(overseers).where(eq(overseers.narratorId, narratorId));
+
+			// Nullify dangling overseer references in other narrators' tool calls
+			await tx
+				.update(narratorToolCalls)
+				.set({ permissionOverseerNarratorId: null })
+				.where(eq(narratorToolCalls.permissionOverseerNarratorId, narratorId));
+
 			// Clean up terminal-related records that reference this narrator
 			await tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId));
 			await tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId));

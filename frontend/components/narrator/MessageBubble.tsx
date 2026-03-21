@@ -1,7 +1,9 @@
 import {
+	Badge,
 	Box,
 	Button,
 	CloseButton,
+	Code,
 	Group,
 	Image,
 	Loader,
@@ -25,6 +27,7 @@ import {
 	IconBrain,
 	IconChevronDown,
 	IconChevronRight,
+	IconEye,
 	IconFile,
 	IconGitMerge,
 	IconLanguage,
@@ -32,6 +35,7 @@ import {
 	IconWorldSearch,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
@@ -40,7 +44,13 @@ import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
-import { getCategoryColor, type PendingPermission, ToolCallCard } from "./ToolCallCard";
+import {
+	getCategory,
+	getCategoryColor,
+	getCategoryIcon,
+	type PendingPermission,
+	ToolCallCard,
+} from "./ToolCallCard";
 
 interface MessageBubbleProps {
 	narratorId?: string;
@@ -201,13 +211,18 @@ function ErrorNotice({
 					size={16}
 					style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-red-7)" }}
 				/>
-				<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap", flex: 1 }}>
+				<Text
+					size="xs"
+					c="red.9"
+					style={{ whiteSpace: "pre-wrap", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}
+				>
 					{message}
 				</Text>
 				<CloseButton
 					size="xs"
 					variant="subtle"
 					c="red.7"
+					style={{ flexShrink: 0 }}
 					disabled={dismissing}
 					onClick={handleDismiss}
 				/>
@@ -862,6 +877,64 @@ function PlanCard({
 	);
 }
 
+// --- Overseer permission request block (rendered inside user messages) ---
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+function OverseerPermissionRequestBlock({ block }: { block: any }) {
+	const { t } = useTranslation("narrator");
+	const toolName = block.toolName as string;
+	const cat = getCategory(toolName);
+	const ToolIcon = getCategoryIcon(cat);
+	const color = getCategoryColor(cat);
+	const inputJson = block.inputJson as Record<string, unknown> | undefined;
+	const inputPreview = inputJson ? JSON.stringify(inputJson, null, 2).slice(0, 1500) : "";
+
+	return (
+		<Paper
+			p="sm"
+			radius="sm"
+			withBorder
+			style={{ borderColor: "var(--mantine-color-indigo-light)" }}
+		>
+			<Group gap="xs" mb="xs">
+				<ThemeIcon size="sm" variant="light" color="indigo" radius="xl">
+					<IconEye size={12} />
+				</ThemeIcon>
+				<Text size="xs" fw={600} c="indigo">
+					{t("overseer_permissionRequest")}
+				</Text>
+			</Group>
+			<Stack gap={6}>
+				<Group gap="xs">
+					<Text size="xs" c="dimmed" style={{ width: 60 }}>
+						{t("overseer_narrator")}
+					</Text>
+					<Text size="xs">{block.narratorTitle ?? block.narratorId}</Text>
+				</Group>
+				<Group gap="xs">
+					<Text size="xs" c="dimmed" style={{ width: 60 }}>
+						{t("overseer_tool")}
+					</Text>
+					<Badge size="xs" variant="light" color={color} leftSection={<ToolIcon size={10} />}>
+						{toolName}
+					</Badge>
+				</Group>
+				<Group gap="xs">
+					<Text size="xs" c="dimmed" style={{ width: 60 }}>
+						{t("overseer_request")}
+					</Text>
+					<Code style={{ fontSize: 10 }}>{block.requestId}</Code>
+				</Group>
+				{inputPreview && (
+					<Code block style={{ fontSize: 10, maxHeight: 200, overflow: "auto" }}>
+						{inputPreview}
+					</Code>
+				)}
+			</Stack>
+		</Paper>
+	);
+}
+
 export const MessageBubble = memo(function MessageBubble({
 	narratorId,
 	message,
@@ -938,7 +1011,26 @@ export const MessageBubble = memo(function MessageBubble({
 	);
 
 	// Build message-level context menu actions for ContentViewer to consume
+	const navigate = useNavigate();
+
+	// Detect overseer permission request blocks
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const overseerBlock = blocks.find((b: any) => b.type === "overseer_permission_request");
+	const isOverseerMessage = !!overseerBlock;
+
 	const ctxActions = useMemo<MessageContextMenuActions>(() => {
+		// Overseer messages: only show "jump to source narrator"
+		if (isOverseerMessage && overseerBlock?.narratorId) {
+			return {
+				onJumpToSource: () => {
+					navigate({
+						to: "/narrators/$narratorId",
+						params: { narratorId: overseerBlock.narratorId },
+					});
+				},
+			};
+		}
+
 		const actions: MessageContextMenuActions = {};
 		const msgId = message.id;
 		const msgUuid = message.messageUuid;
@@ -960,6 +1052,9 @@ export const MessageBubble = memo(function MessageBubble({
 		return actions;
 	}, [
 		isUser,
+		isOverseerMessage,
+		overseerBlock,
+		navigate,
 		message.id,
 		message.messageUuid,
 		onForkFromMessage,
@@ -1267,6 +1362,9 @@ export const MessageBubble = memo(function MessageBubble({
 										}
 										if (block.type === "text_file") {
 											return <TextFileBlock key={key} block={block} />;
+										}
+										if (block.type === "overseer_permission_request") {
+											return <OverseerPermissionRequestBlock key={key} block={block} />;
 										}
 										return null;
 									})}

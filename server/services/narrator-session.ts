@@ -15,13 +15,14 @@ import {
 	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
+	overseers,
 	projects,
 } from "../db/schema";
 import { buildHistory, type PermissionResult, resolveProviderAndModel } from "../lib/agent";
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { detectShell } from "../lib/agent/shell";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
-import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
+import { OPTIONAL_TOOLS, OVERSEER_TOOLS } from "../lib/agent/tools/index";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
@@ -137,6 +138,11 @@ interface ActiveNarrator {
 	_skillRoot?: string | null;
 	/** Optional tools enabled for this session (tool names, e.g. "Terminal") */
 	_enabledOptionalTools: Set<string>;
+	/** Whether this narrator is bound to an overseer */
+	_isOverseer: boolean;
+	/** Soft-stop flag: set when user approves a permission with feedbackText.
+	 *  The agent loop checks this via shouldStop() after tools complete. */
+	_feedbackSoftStop?: boolean;
 }
 
 // Use globalThis to survive Bun --hot reloads.  Module-level variables are
@@ -1521,6 +1527,13 @@ export async function handlePermission(
 		await narratorService.updateStatus(broadcastTargetId, "waiting");
 	}
 
+	// Route to overseer (async, non-blocking — overseer and user compete)
+	routePermissionToOverseer(narratorId, toolCallId, toolName, toolUseId, effectiveInput).catch(
+		(err) => {
+			logger.debug("Overseer routing skipped or failed", { narratorId, error: String(err) });
+		},
+	);
+
 	if (signal.aborted) {
 		broadcastToNarrator(wsTarget, {
 			type: "permission_resolved",
@@ -1604,7 +1617,7 @@ export async function resolvePermission(
 	requestId: string,
 	decision: "allow" | "deny",
 	opts: ResolvePermissionOpts = {},
-): Promise<void> {
+): Promise<boolean> {
 	const { denyMessage, answers, feedbackText, compactAfter, updatedPlan, userId } = opts;
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -1613,7 +1626,7 @@ export async function resolvePermission(
 			decision,
 			pendingKeys: [...pendingPermissions.keys()],
 		});
-		return;
+		return false;
 	}
 
 	logger.debug("Resolving permission", {
@@ -1723,16 +1736,17 @@ export async function resolvePermission(
 
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
 
-		// If the user attached feedback text, abort the agent loop so it stops
-		// after the current tool completes instead of continuing to the next turn.
+		// If the user attached feedback text, set a soft-stop flag so the agent
+		// loop exits gracefully after the current tool completes — without killing
+		// running processes (unlike abort which would terminate Bash mid-execution).
 		// The outer while-loop will pick up pendingFeedback and inject the user
 		// message before starting a fresh agent loop iteration.
-		// Exception: ExitPlanMode already aborts via onExitPlanMode — aborting
+		// Exception: ExitPlanMode already aborts via onExitPlanMode — soft-stopping
 		// here would race and prevent the tool_result from being processed.
 		if (feedbackText?.trim() && pending.toolName !== "ExitPlanMode") {
 			const active = activeNarrators.get(pending.narratorId);
 			if (active?.alive) {
-				active.abortController.abort();
+				active._feedbackSoftStop = true;
 			}
 		}
 	} else {
@@ -1751,6 +1765,7 @@ export async function resolvePermission(
 			pending.resolve({ behavior: "deny", message });
 		}
 	}
+	return true;
 }
 
 /**
@@ -1770,6 +1785,102 @@ export async function resolveAllPendingPermissions(narratorId: string): Promise<
 		await resolvePermission(requestId, "allow");
 	}
 	return toResolve.length;
+}
+
+// === Overseer permission routing ===
+
+/**
+ * Route a permission request to the responsible overseer (if any).
+ * This is fire-and-forget: the overseer and user compete to resolve the request.
+ * Whoever resolves first wins (pendingPermissions.resolve is idempotent).
+ */
+async function routePermissionToOverseer(
+	narratorId: string,
+	toolCallId: string,
+	toolName: string,
+	toolUseId: string,
+	input: Record<string, unknown>,
+): Promise<void> {
+	const { findResponsibleOverseer, getOverseerPolicy } = await import("./overseer-service");
+
+	const overseer = await findResponsibleOverseer(narratorId);
+	if (!overseer) return; // No overseer — user handles it
+
+	const policy = getOverseerPolicy(overseer);
+	if (!policy.handleEvents.permissionRequests) return; // Overseer doesn't handle permissions
+
+	// Build a descriptive message for the overseer
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { id: true, title: true, chapterId: true },
+	});
+
+	const narratorTitle = narrator?.title ?? "Untitled";
+	const inputSummary = JSON.stringify(input, null, 2).slice(0, 2000);
+
+	// Structured block for frontend rendering
+	const contentBlocks = [
+		{
+			type: "overseer_permission_request" as const,
+			requestId: toolCallId,
+			narratorId,
+			narratorTitle,
+			toolName,
+			toolUseId,
+			inputJson: input,
+		},
+	];
+
+	// Text version for the AI model
+	const textForModel =
+		`A Narrator under your jurisdiction needs a permission decision.\n\n` +
+		`Request ID: ${toolCallId}\n` +
+		`Narrator: ${narratorTitle} (id: ${narratorId})\n` +
+		`Tool: ${toolName}\n` +
+		`Tool Use ID: ${toolUseId}\n` +
+		`Input:\n\`\`\`json\n${inputSummary}\n\`\`\`\n\n` +
+		`Please review this request and use ApprovePermission or DenyPermission to make your decision.`;
+
+	eventBus.emit({
+		type: "overseer:event_routed",
+		overseerId: overseer.id,
+		narratorId,
+		eventType: "permission_request",
+	});
+
+	// Persist the structured message and trigger the agent loop
+	try {
+		const active = await ensureNarrator(overseer.narratorId, "en");
+
+		const userMsg = await narratorService.persistUserMessage(
+			overseer.narratorId,
+			textForModel,
+			contentBlocks,
+		);
+
+		broadcastToNarrator(overseer.narratorId, {
+			type: "user_message",
+			narratorId: overseer.narratorId,
+			message: userMsg,
+		});
+
+		await narratorService.updateStatus(overseer.narratorId, "thinking");
+
+		// Start agent loop in background
+		runAgentLoop(active, textForModel).catch(async (err) => {
+			logger.warn("Overseer agent loop failed", {
+				overseerId: overseer.id,
+				error: String(err),
+			});
+			await narratorService.updateStatus(overseer.narratorId, "error", String(err));
+		});
+	} catch (err) {
+		logger.warn("Failed to route permission to overseer", {
+			overseerId: overseer.id,
+			narratorId,
+			error: String(err),
+		});
+	}
 }
 
 // === Narrator lifecycle ===
@@ -1947,7 +2058,19 @@ async function createNarrator(
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
 		_enabledOptionalTools: new Set(),
+		_isOverseer: false,
 	};
+
+	// Check if this narrator is bound to an overseer
+	{
+		const overseerRecord = await db.query.overseers.findFirst({
+			where: eq(overseers.narratorId, narratorId),
+			columns: { id: true },
+		});
+		if (overseerRecord) {
+			active._isOverseer = true;
+		}
+	}
 
 	// Auto-load optional tools whose routines are globally enabled
 	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
@@ -2683,6 +2806,10 @@ async function runAgentLoop(
 					if (OPTIONAL_TOOLS.has(tool.name)) {
 						return active._enabledOptionalTools.has(tool.name);
 					}
+					// Overseer tools: only available if this narrator is an overseer
+					if (OVERSEER_TOOLS.has(tool.name)) {
+						return active._isOverseer;
+					}
 					return true;
 				},
 				permissionHandler: (toolName, input, toolUseId) =>
@@ -2705,6 +2832,13 @@ async function runAgentLoop(
 						return active.model;
 					}
 					return null;
+				},
+				shouldStop: () => {
+					if (active._feedbackSoftStop) {
+						active._feedbackSoftStop = false;
+						return true;
+					}
+					return false;
 				},
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.

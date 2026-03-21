@@ -6,6 +6,7 @@ export interface MessageContextMenuActions {
 	onDeleteBlock?: (blockIndex: number) => void;
 	onRegenerateFromMessage?: () => void;
 	onEditMessage?: () => void;
+	onJumpToSource?: () => void;
 }
 
 export const MessageContextMenuCtx = createContext<MessageContextMenuActions>({});

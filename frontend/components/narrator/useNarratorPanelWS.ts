@@ -275,6 +275,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
+	);
+	useEffect(() => {
+		}
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [unreadCount, setUnreadCount] = useState(0);
 
@@ -1165,6 +1168,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setPruneBoundaryMessageId(boundaryMessageId);
 				setPrunedPercent(prunedPct);
 			},
+				// Sync back to settings cache so provider info stays up-to-date
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic settings shape
+					qc.setQueryData(["settings"], (old: any) => {
+						return {
+							...old,
+									quotaBalance: balance,
+								},
+							},
+						};
+					});
+				}
 			},
 			onWebSearch: (id, status, query) => {
 				webSearchRef.current = { id, status, query };

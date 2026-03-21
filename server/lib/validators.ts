@@ -196,6 +196,34 @@ export const updateBlacklistCmdSchema = z.object({
 	enabled: z.boolean().optional(),
 });
 
+// === Overseers ===
+
+export const overseerPolicySchema = z.object({
+	handleEvents: z
+		.object({
+			permissionRequests: z.boolean().default(true),
+			loopDone: z.boolean().default(false),
+			errors: z.boolean().default(false),
+		})
+		.default({ permissionRequests: true, loopDone: false, errors: false }),
+	decisionTimeoutSec: z.number().int().min(10).max(600).default(120),
+});
+
+export const createOverseerSchema = z.object({
+	scope: z.enum(["global", "project"]),
+	projectId: z.string().min(1).optional(),
+	model: z.string().min(1).optional(),
+	systemPrompt: z.string().max(100_000).optional(),
+	policy: overseerPolicySchema.optional(),
+});
+
+export const updateOverseerSchema = z.object({
+	enabled: z.boolean().optional(),
+	policy: overseerPolicySchema.optional(),
+	model: z.string().min(1).optional(),
+	systemPrompt: z.string().max(100_000).optional(),
+});
+
 // === Buffered messages ===
 
 export const updateBufferedMessageSchema = z.object({

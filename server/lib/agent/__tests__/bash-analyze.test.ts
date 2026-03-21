@@ -110,11 +110,6 @@ describe("path extraction", () => {
 		expect(r.filePaths).toContain("/etc/config");
 	});
 
-	test("git status: no paths", async () => {
-		const r = await analyzeBashCommand("git status", CWD);
-		expect(r.filePaths).toHaveLength(0);
-	});
-
 	test("cd relative", async () => {
 		const r = await analyzeBashCommand("cd src/lib", CWD);
 		expect(r.filePaths).toContain(resolve(CWD, "src/lib"));
@@ -129,6 +124,71 @@ describe("path extraction", () => {
 		const r = await analyzeBashCommand("chmod +x script.sh", CWD);
 		expect(r.filePaths.some((p) => p.includes("+x"))).toBe(false);
 		expect(r.filePaths).toContain(resolve(CWD, "script.sh"));
+	});
+
+	test("git clone with target directory", async () => {
+		const r = await analyzeBashCommand(
+			"git clone https://github.com/user/repo.git /tmp/my-clone",
+			CWD,
+		);
+		expect(r.filePaths).toContain("/tmp/my-clone");
+		expect(r.hasWriteOperation).toBe(true);
+	});
+
+	test("git clone without target directory: no paths", async () => {
+		const r = await analyzeBashCommand("git clone https://github.com/user/repo.git", CWD);
+		expect(r.filePaths).toHaveLength(0);
+		expect(r.hasWriteOperation).toBe(true);
+	});
+
+	test("git clone with flags and target directory", async () => {
+		const r = await analyzeBashCommand(
+			"git clone --depth 1 -b main https://github.com/user/repo.git /home/other/dir",
+			CWD,
+		);
+		expect(r.filePaths).toContain("/home/other/dir");
+		expect(r.hasWriteOperation).toBe(true);
+	});
+
+	test("git clone local repo", async () => {
+		const r = await analyzeBashCommand("git clone /opt/repos/myrepo ./local-copy", CWD);
+		expect(r.filePaths).toContain("/opt/repos/myrepo");
+		expect(r.filePaths).toContain(resolve(CWD, "local-copy"));
+	});
+
+	test("git -C external dir", async () => {
+		const r = await analyzeBashCommand("git -C /opt/other-project status", CWD);
+		expect(r.filePaths).toContain("/opt/other-project");
+	});
+
+	test("git init with directory", async () => {
+		const r = await analyzeBashCommand("git init /tmp/new-repo", CWD);
+		expect(r.filePaths).toContain("/tmp/new-repo");
+		expect(r.hasWriteOperation).toBe(true);
+	});
+
+	test("git init without directory: no paths", async () => {
+		const r = await analyzeBashCommand("git init", CWD);
+		expect(r.filePaths).toHaveLength(0);
+		expect(r.hasWriteOperation).toBe(true);
+	});
+
+	test("git worktree add", async () => {
+		const r = await analyzeBashCommand("git worktree add /tmp/wt feature", CWD);
+		expect(r.filePaths).toContain("/tmp/wt");
+		expect(r.hasWriteOperation).toBe(true);
+	});
+
+	test("git status: no paths", async () => {
+		const r = await analyzeBashCommand("git status", CWD);
+		expect(r.filePaths).toHaveLength(0);
+		expect(r.hasWriteOperation).toBe(false);
+	});
+
+	test("git commit: no paths, no write", async () => {
+		const r = await analyzeBashCommand('git commit -m "fix bug"', CWD);
+		expect(r.filePaths).toHaveLength(0);
+		expect(r.hasWriteOperation).toBe(false);
 	});
 });
 

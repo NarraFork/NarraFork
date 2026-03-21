@@ -221,13 +221,20 @@ interface RecentTabListProps {
 	onNavigate?: () => void;
 	/** When true, the first tab (if active) removes its top border-radius */
 	firstTabConnected?: boolean;
+	/** Narrator ID to exclude from active highlighting (used for overseer) */
+	excludeActiveNarratorId?: string;
 }
 
 /**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
  * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
  */
-export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentTabListProps) {
+export function RecentTabList({
+	filter,
+	onNavigate,
+	firstTabConnected,
+	excludeActiveNarratorId,
+}: RecentTabListProps) {
 	const { tabs, removeTab, moveTab } = useRecentTabs();
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const navigate = useNavigate();
@@ -342,7 +349,10 @@ export function RecentTabList({ filter, onNavigate, firstTabConnected }: RecentT
 						<SortableTabItem
 							key={tabSortId(tab)}
 							tab={tab}
-							active={isTabActive(tab, pathname)}
+							active={
+								isTabActive(tab, pathname) &&
+								!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
+							}
 							onRemove={handleRemove}
 							onNavigate={onNavigate}
 							onContextMenu={handleContextMenu}
