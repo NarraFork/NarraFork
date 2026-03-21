@@ -70,5 +70,8 @@ export function pathsEqual(a: string, b: string): boolean {
 export function isInsidePath(parent: string, child: string): boolean {
 	const p = normalizePathForComparison(parent);
 	const c = normalizePathForComparison(child);
-	return c === p || c.startsWith(`${p}/`);
+	if (c === p) return true;
+	// Filesystem roots already end with "/" — avoid double-slash in prefix check
+	if (p === "/" || /^[a-zA-Z]:\/$/.test(p)) return c.startsWith(p);
+	return c.startsWith(`${p}/`);
 }

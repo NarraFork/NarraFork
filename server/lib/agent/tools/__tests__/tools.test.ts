@@ -66,7 +66,7 @@ describe("Read", () => {
 		// Line numbers should be present
 		expect(result.output).toMatch(/\d+│line one/);
 		// Metadata should include line counts
-		expect(result.metadata).toMatchObject({ forceFull: false });
+		expect(result.metadata).toMatchObject({ readAll: false });
 		expect(result.metadata?.totalLines).toBe(result.metadata?.readLines);
 	});
 
@@ -99,30 +99,30 @@ describe("Read", () => {
 		expect(result.isError).toBe(true);
 	});
 
-	test("force_full bypasses loop truncation for large files", async () => {
+	test("limit=-1 bypasses loop truncation for large files", async () => {
 		const target = join(TEST_DIR, "read-force-full.txt");
 		const content = "0123456789".repeat(7000); // 70KB
 		writeFileSync(target, content);
 
 		const result = await readTool.execute(
-			{ file_path: "read-force-full.txt", force_full: true },
+			{ file_path: "read-force-full.txt", limit: -1 },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
 		expect(result.truncated).toBe(true);
 		expect(result.output).toContain("0123456789");
 		expect(result.output).not.toContain("truncated");
-		expect(result.metadata?.forceFull).toBe(true);
+		expect(result.metadata?.readAll).toBe(true);
 	});
 
-	test("force_full caps output at ~100k chars", async () => {
+	test("limit=-1 caps output at ~100k chars", async () => {
 		const target = join(TEST_DIR, "read-force-full-large.txt");
 		// Create a file well over 100k chars (200k+ with line numbers)
 		const lines = Array.from({ length: 15000 }, (_, i) => `line ${i}: ${"x".repeat(20)}`);
 		writeFileSync(target, lines.join("\n"));
 
 		const result = await readTool.execute(
-			{ file_path: "read-force-full-large.txt", force_full: true },
+			{ file_path: "read-force-full-large.txt", limit: -1 },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
@@ -132,9 +132,9 @@ describe("Read", () => {
 		expect(result.output).toContain("Use offset/limit to read the rest");
 	});
 
-	test("returns error when mixing force_full with line paging", async () => {
+	test("returns error when mixing limit=-1 with offset", async () => {
 		const result = await readTool.execute(
-			{ file_path: "sample.txt", offset: 1, force_full: true },
+			{ file_path: "sample.txt", offset: 1, limit: -1 },
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
@@ -919,8 +919,8 @@ describe("Bash", () => {
 // ============================================================
 
 import { z } from "zod/v4";
-import { agentTool } from "../task";
 import { resolveToolJsonSchema, zodToJsonSchema } from "../../tool-registry";
+import { agentTool } from "../task";
 
 describe("zodToJsonSchema", () => {
 	test("converts simple object schema", () => {

@@ -124,11 +124,15 @@ async function fetchAnthropicModels(
 		throw new Error(`Anthropic API key not configured for provider "${config.name}"`);
 	}
 
-	// Always use Bearer auth (matching Claude Code CLI protocol)
+	// Official API uses Bearer auth (Claude Code CLI protocol), proxy uses x-api-key
 	const headers: Record<string, string> = {
 		"anthropic-version": "2023-06-01",
-		Authorization: `Bearer ${config.apiKey}`,
 	};
+	if (config.officialApi) {
+		headers.Authorization = `Bearer ${config.apiKey}`;
+	} else {
+		headers["x-api-key"] = config.apiKey;
+	}
 
 	let response = await fetch(`${baseUrl}/models`, { headers });
 

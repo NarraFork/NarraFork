@@ -50,6 +50,7 @@ const anthropicProviderSchema = z.object({
 	defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
 	proxy: z.string().optional(),
 	tlsRejectUnauthorized: z.boolean().optional(),
+	officialApi: z.boolean().optional(),
 });
 
 	id: z.string().min(1),

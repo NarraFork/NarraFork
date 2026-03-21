@@ -248,6 +248,12 @@ export function AnthropicProvidersSection({
 												}
 											/>
 										)}
+										<Switch
+											label={t("anthropicOfficialApi")}
+											description={t("anthropicOfficialApiDesc")}
+											checked={!!p.officialApi}
+											onChange={(e) => updateProvider(p.id, "officialApi", e.currentTarget.checked)}
+										/>
 										<Group gap="xs">
 											<Button
 												size="xs"

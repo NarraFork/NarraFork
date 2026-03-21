@@ -337,22 +337,6 @@ function extractNumericField(val: any, ...keys: string[]): number | undefined {
 	return undefined;
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function extractBoolField(val: any, ...keys: string[]): boolean {
-	if (!val) return false;
-	if (!isTruncated(val)) {
-		for (const k of keys) {
-			if (val[k] === true) return true;
-		}
-		return false;
-	}
-	for (const k of keys) {
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*true`);
-		if (val.preview?.match(re)) return true;
-	}
-	return false;
-}
-
 // --- Helper: extract a human-readable summary for the header ---
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -392,10 +376,9 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			if (toolName === "Read") {
 				const offset = extractNumericField(input, "offset");
 				const limit = extractNumericField(input, "limit");
-				const forceFull = extractBoolField(input, "force_full", "forceFull");
 				const totalLines =
 					typeof metadata?.totalLines === "number" ? metadata.totalLines : undefined;
-				if (forceFull) return `${base} (force_full)`;
+				if (limit === -1) return `${base} (read_all)`;
 				if (offset != null && limit != null) return `${base} (${offset}~${offset + limit - 1})`;
 				if (offset != null) return `${base} (${offset}~)`;
 				if (limit != null) return `${base} (1~${limit})`;

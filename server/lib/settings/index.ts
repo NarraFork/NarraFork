@@ -67,6 +67,14 @@ export interface AnthropicProviderConfig {
 	proxy?: string;
 	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
 	tlsRejectUnauthorized?: boolean;
+	/**
+	 * Whether this provider connects to the official Anthropic API (or an official relay).
+	 * When true, enables Claude Code protocol features: server-side web search,
+	 * beta flags, cache_control, billing header, Bearer auth, etc.
+	 * When false (default), uses standard Anthropic Messages API compatible with
+	 * third-party proxy/relay services.
+	 */
+	officialApi?: boolean;
 }
 
 	/** Unique short ID (8 chars). */

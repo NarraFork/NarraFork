@@ -1,5 +1,10 @@
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { getModelContextWindow, isAnthropicProvider, settings } from "../settings";
+import {
+	getAnthropicProviderConfig,
+	getModelContextWindow,
+	isAnthropicProvider,
+	settings,
+} from "../settings";
 import { StreamStaleError } from "../stream-timeout";
 import { resolveProviderAndModel } from "./provider";
 import { toolRegistry } from "./tool-registry";
@@ -288,7 +293,7 @@ export async function* agentLoop(
 	const locale = (config.locale as Locale) ?? "en";
 	let allTools: ResolvedToolDefinition[] = toolRegistry
 		.all()
-		.filter((t) => !t.isAvailable || t.isAvailable())
+		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
 		.map((t) => ({
 			...t,
 			description: typeof t.description === "function" ? t.description(config) : t.description,
@@ -299,9 +304,13 @@ export async function* agentLoop(
 		allTools = allTools.filter(config.toolFilter);
 	}
 
-	// Codex and Anthropic providers use native server-side web_search —
+	// Codex and official Anthropic providers use native server-side web_search —
 	// remove the WebSearch function tool to avoid duplicate search capabilities.
-	if (effectiveProvider === "codex" || isAnthropicProvider(effectiveProvider)) {
+	// Non-official (proxy) Anthropic providers keep the WebSearch function tool.
+	const isOfficialAnthropic =
+		isAnthropicProvider(effectiveProvider) &&
+		!!getAnthropicProviderConfig(effectiveProvider)?.officialApi;
+	if (effectiveProvider === "codex" || isOfficialAnthropic) {
 		allTools = allTools.filter((t) => t.name !== "WebSearch");
 	}
 

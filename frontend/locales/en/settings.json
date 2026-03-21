@@ -112,6 +112,8 @@
 	"anthropicProxyDesc": "Proxy for all requests to this provider. Leave empty for direct connection.",
 	"anthropicTlsRejectUnauthorized": "Skip TLS Verification",
 	"anthropicTlsRejectUnauthorizedDesc": "Disable certificate verification for MITM proxies or self-signed certs. Not recommended for production.",
+	"anthropicOfficialApi": "Official API",
+	"anthropicOfficialApiDesc": "Enable Claude Code protocol features (server-side web search, beta flags, prompt caching, Bearer auth). Turn this on only for the official Anthropic API or official relays. Leave off for third-party proxies.",
 	"anthropicRefreshModels": "Fetch Models",
 	"anthropicRefreshModelsLoading": "Fetching...",
 	"anthropicRefreshModelsError": "Failed to fetch models",

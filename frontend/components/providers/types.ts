@@ -21,6 +21,7 @@ export interface AnthropicProviderState {
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
 	proxy?: string;
 	tlsRejectUnauthorized?: boolean;
+	officialApi?: boolean;
 }
 
 	id: string;

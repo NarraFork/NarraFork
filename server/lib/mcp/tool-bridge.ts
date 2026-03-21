@@ -11,7 +11,10 @@ import { mcpManager } from "./manager";
  */
 function buildToolName(serverName: string, toolName: string): string {
 	const sanitized = serverName.replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase();
-	return `mcp__${sanitized}__${toolName}`;
+	// Ensure neither part is empty — fall back to "unknown" if sanitization yields nothing
+	const safeName = sanitized.replace(/^_+$/, "") || "unknown";
+	const safeTool = toolName || "unknown";
+	return `mcp__${safeName}__${safeTool}`;
 }
 
 /**
@@ -98,7 +101,7 @@ function cleanMcpSchema(inputSchema?: Tool["inputSchema"]): Record<string, unkno
 	}
 
 	const result: Record<string, unknown> = { type: "object" };
-	if (inputSchema.properties) {
+	if (inputSchema.properties && Object.keys(inputSchema.properties).length > 0) {
 		const props: Record<string, unknown> = {};
 		for (const [key, val] of Object.entries(inputSchema.properties)) {
 			if (typeof val === "object" && val !== null) {
@@ -113,6 +116,12 @@ function cleanMcpSchema(inputSchema?: Tool["inputSchema"]): Record<string, unkno
 		result.required = inputSchema.required;
 	}
 	result.additionalProperties = false;
+
+	// Ensure the schema has at least a `properties` field — some providers
+	if (!result.properties) {
+		result.properties = {};
+	}
+
 	return result;
 }
 

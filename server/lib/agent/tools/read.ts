@@ -3,8 +3,11 @@ import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText } from "./encoding";
 
-/** Maximum characters returned by force_full (≈100 KB of text). */
-const FORCE_FULL_MAX_CHARS = 100_000;
+/**
+ * When limit = -1 (read-all mode), cap output at ≈100 KB of text
+ * to avoid blowing up the context window.
+ */
+const READ_ALL_MAX_CHARS = 100_000;
 
 /** Image extensions → format string for the API (Anthropic media_type = `image/${format}`). */
 const IMAGE_EXTENSIONS: Record<string, string> = {
@@ -25,8 +28,9 @@ export const readTool: ToolDefinition = {
 		"Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\n" +
 		"Usage:\n" +
 		"- The file_path parameter must be an absolute path, not a relative path\n" +
-		"- By default, it reads up to 2000 lines starting from the beginning of the file\n" +
-		"- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n" +
+		"- By default, it reads the entire file from the beginning\n" +
+		"- You can optionally specify a line offset and limit (especially handy for long files)\n" +
+		"- Set limit to -1 to force reading the entire file, bypassing output truncation (up to ~100k chars)\n" +
 		"- Any lines longer than 2000 characters will be truncated\n" +
 		"- Results are returned using cat -n format, with line numbers starting at 1\n" +
 		"- This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.\n" +
@@ -50,7 +54,7 @@ export const readTool: ToolDefinition = {
 			},
 			limit: {
 				description:
-					"The number of lines to read. Only provide if the file is too large to read at once.",
+					"The number of lines to read. Set to -1 to read the entire file bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
 				type: "number",
 			},
 			pages: {
@@ -75,16 +79,10 @@ export const readTool: ToolDefinition = {
 		limit: z
 			.number()
 			.int()
-			.min(1)
+			.refine((v) => v === -1 || v >= 1, { message: "limit must be -1 or a positive integer" })
 			.optional()
 			.describe(
-				"The number of lines to read. Only provide if the file is too large to read at once.",
-			),
-		force_full: z
-			.boolean()
-			.optional()
-			.describe(
-				"If true, bypasses tool-output truncation and returns as much of the file as possible (up to ~100k chars). Cannot combine with offset/limit.",
+				"The number of lines to read. Set to -1 to read the entire file bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
 			),
 		pages: z
 			.string()
@@ -94,16 +92,16 @@ export const readTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { file_path, offset, limit, force_full } = args as {
+		const { file_path, offset, limit } = args as {
 			file_path: string;
 			offset?: number;
 			limit?: number;
-			force_full?: boolean;
 		};
 
-		if (force_full && (offset !== undefined || limit !== undefined)) {
+		const readAll = limit === -1;
+		if (readAll && offset !== undefined) {
 			return {
-				output: "Error: force_full cannot be combined with offset/limit",
+				output: "Error: limit=-1 (read-all) cannot be combined with offset",
 				isError: true,
 			};
 		}
@@ -138,22 +136,22 @@ export const readTool: ToolDefinition = {
 			}
 		}
 
-		// ── Text file handling (existing logic) ──
+		// ── Text file handling ──
 		try {
 			const { text } = await readFileText(resolvedPath);
 			const lines = text.split("\n");
-			const start = force_full ? 0 : Math.max(0, (offset ?? 1) - 1);
-			const end = force_full ? lines.length : limit ? start + limit : lines.length;
+			const start = Math.max(0, (offset ?? 1) - 1);
+			const end = readAll ? lines.length : limit ? start + limit : lines.length;
 			const slice = lines.slice(start, end);
 
 			let numbered = slice
 				.map((line, i) => `${String(start + i + 1).padStart(6)}│${line}`)
 				.join("\n");
 
-			// force_full caps output at ~100k chars to avoid blowing up context.
+			// read-all mode caps output at ~100k chars to avoid blowing up context.
 			let capped = false;
-			if (force_full && numbered.length > FORCE_FULL_MAX_CHARS) {
-				numbered = numbered.slice(0, FORCE_FULL_MAX_CHARS);
+			if (readAll && numbered.length > READ_ALL_MAX_CHARS) {
+				numbered = numbered.slice(0, READ_ALL_MAX_CHARS);
 				// Trim to last complete line to avoid a broken trailing line,
 				// but only if a newline exists in the last 200 chars — otherwise
 				// the file has very long / no-newline lines and hard-cutting is fine.
@@ -166,18 +164,18 @@ export const readTool: ToolDefinition = {
 			}
 
 			const suffix = capped
-				? `\n\n...output capped at ${FORCE_FULL_MAX_CHARS} chars. Use offset/limit to read the rest.`
+				? `\n\n...output capped at ${READ_ALL_MAX_CHARS} chars. Use offset/limit to read the rest.`
 				: "";
 
 			return {
 				output: (numbered || "(empty file)") + suffix,
 				title: file_path,
 				// Mark as pre-truncated to signal loop layer: do not apply global 50KB truncation.
-				truncated: !!force_full,
+				truncated: readAll,
 				metadata: {
 					totalLines: lines.length,
 					readLines: slice.length,
-					forceFull: !!force_full,
+					readAll,
 				},
 			};
 		} catch (err) {

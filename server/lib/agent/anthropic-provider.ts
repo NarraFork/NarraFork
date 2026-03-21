@@ -526,23 +526,32 @@ export class AnthropicProvider implements ProviderAdapter {
 		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort);
 		const thinkingEnabled = !!thinkingConfig && thinkingConfig.type !== "disabled";
 
-		// Build system as 3-block structure matching Claude Code:
-		// Block 0: billing header (no cache_control)
-		// Block 1: identity declaration (with cache_control)
-		// Block 2: full instructions (with cache_control)
-		const systemBlocks: Array<Record<string, unknown>> = [
-			{ type: "text", text: BILLING_HEADER },
-			{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
-		];
-		if (systemPrompt) {
-			systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
+		const isOfficial = !!this.config.officialApi;
+
+		// Build system blocks — official API uses Claude Code 3-block structure,
+		// proxy mode uses a simple text block.
+		const systemBlocks: Array<Record<string, unknown>> = [];
+		if (isOfficial) {
+			systemBlocks.push(
+				{ type: "text", text: BILLING_HEADER },
+				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
+			);
+			if (systemPrompt) {
+				systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
+			}
+		} else {
+			if (systemPrompt) {
+				systemBlocks.push({ type: "text", text: systemPrompt });
+			}
 		}
 
 		// Build tool definitions (without cache_control yet)
 		const cachedTools = tools.length > 0 ? tools.map((t) => ({ ...t })) : undefined;
 
-		// Apply cache_control breakpoints at optimal positions for prefix caching
-		applyCacheBreakpoints(messages, cachedTools);
+		// Apply cache_control breakpoints (official API only — proxies don't support it)
+		if (isOfficial) {
+			applyCacheBreakpoints(messages, cachedTools);
+		}
 
 		const body: Record<string, unknown> = {
 			model,
@@ -561,24 +570,24 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.temperature = 1;
 		}
 
-		// Effort parameter: send for supported models when thinking is enabled (matching CC behavior)
-		if (supportsEffort(model) && thinkingEnabled) {
+		// Effort parameter: official API only (proxies may not support output_config)
+		if (isOfficial && supportsEffort(model) && thinkingEnabled) {
 			const effort = mapEffortParam(params.reasoningEffort);
 			body.output_config = { effort: effort ?? "medium" };
 		}
 
 		body.system = systemBlocks;
 
-		// Inject Anthropic server-side web_search tool alongside function tools.
-		// The API executes searches server-side and returns results via
-		// server_tool_use / web_search_tool_result SSE events.
-		const serverTools: Record<string, unknown>[] = [
-			{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
-		];
-		if (cachedTools) {
-			body.tools = [...cachedTools, ...serverTools];
+		// Tools: official API injects server-side web_search; proxy mode uses function tools only.
+		if (isOfficial) {
+			const serverTools: Record<string, unknown>[] = [
+				{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
+			];
+			body.tools = cachedTools ? [...cachedTools, ...serverTools] : serverTools;
 		} else {
-			body.tools = serverTools;
+			if (cachedTools) {
+				body.tools = cachedTools;
+			}
 		}
 
 		// Add metadata if provided
@@ -586,29 +595,32 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.metadata = params.metadata;
 		}
 
-		// Build request URL with ?beta=true (matching Claude Code)
-		const reqPath = "/messages?beta=true";
+		// Request path: official API uses ?beta=true, proxy mode uses plain path.
+		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
-		// Build headers matching Claude Code CLI protocol exactly
+		// Headers: official API uses Claude Code CLI protocol, proxy mode uses standard headers.
 		const reqHeaders: Record<string, string> = {
 			Accept: "application/json",
-			Authorization: `Bearer ${apiKey}`,
 			"Content-Type": "application/json",
 			"anthropic-version": "2023-06-01",
-			"anthropic-beta": ANTHROPIC_BETA_FLAGS,
-			"anthropic-dangerous-direct-browser-access": "true",
-			"user-agent": CLAUDE_CLI_USER_AGENT,
-			"x-app": "cli",
-			// X-Stainless headers matching Claude Code SDK
-			"X-Stainless-Arch": "x64",
-			"X-Stainless-Lang": "js",
-			"X-Stainless-OS": "Linux",
-			"X-Stainless-Package-Version": "0.74.0",
-			"X-Stainless-Retry-Count": "0",
-			"X-Stainless-Runtime": "node",
-			"X-Stainless-Runtime-Version": "v24.3.0",
-			"X-Stainless-Timeout": "600",
 		};
+		if (isOfficial) {
+			reqHeaders.Authorization = `Bearer ${apiKey}`;
+			reqHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
+			reqHeaders["anthropic-dangerous-direct-browser-access"] = "true";
+			reqHeaders["user-agent"] = CLAUDE_CLI_USER_AGENT;
+			reqHeaders["x-app"] = "cli";
+			reqHeaders["X-Stainless-Arch"] = "x64";
+			reqHeaders["X-Stainless-Lang"] = "js";
+			reqHeaders["X-Stainless-OS"] = "Linux";
+			reqHeaders["X-Stainless-Package-Version"] = "0.74.0";
+			reqHeaders["X-Stainless-Retry-Count"] = "0";
+			reqHeaders["X-Stainless-Runtime"] = "node";
+			reqHeaders["X-Stainless-Runtime-Version"] = "v24.3.0";
+			reqHeaders["X-Stainless-Timeout"] = "600";
+		} else {
+			reqHeaders["x-api-key"] = apiKey;
+		}
 
 		logger.debug("Anthropic chat request", {
 			model,
@@ -757,6 +769,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		const bareModel = parseModelId(model).model;
+		const isOfficial = !!this.config.officialApi;
 		const body: {
 			model: string;
 			max_tokens: number;
@@ -768,18 +781,26 @@ export class AnthropicProvider implements ProviderAdapter {
 			messages: [{ role: "user", content: text }],
 		};
 		if (systemInstruction) {
-			body.system = [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }];
+			body.system = isOfficial
+				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
+				: [{ type: "text", text: systemInstruction }];
+		}
+
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+			"anthropic-version": "2023-06-01",
+		};
+		if (isOfficial) {
+			headers.Authorization = `Bearer ${apiKey}`;
+			headers["anthropic-beta"] = ANTHROPIC_BASE_BETA;
+			headers["user-agent"] = CLAUDE_CLI_USER_AGENT;
+		} else {
+			headers["x-api-key"] = apiKey;
 		}
 
 		const response = await this.fetchWithV1Fallback("/messages", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${apiKey}`,
-				"anthropic-version": "2023-06-01",
-				"anthropic-beta": ANTHROPIC_BASE_BETA,
-				"user-agent": CLAUDE_CLI_USER_AGENT,
-			},
+			headers,
 			body: JSON.stringify(body),
 		});
 
@@ -819,21 +840,31 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
 		}
 
+		const isOfficial = !!this.config.officialApi;
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
+
+		const genHeaders: Record<string, string> = {
+			"Content-Type": "application/json",
+			"anthropic-version": "2023-06-01",
+		};
+		if (isOfficial) {
+			genHeaders.Authorization = `Bearer ${apiKey}`;
+			genHeaders["anthropic-beta"] = ANTHROPIC_BASE_BETA;
+			genHeaders["user-agent"] = CLAUDE_CLI_USER_AGENT;
+		} else {
+			genHeaders["x-api-key"] = apiKey;
+		}
+
 		const response = await this.fetchWithV1Fallback("/messages", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${apiKey}`,
-				"anthropic-version": "2023-06-01",
-				"anthropic-beta": ANTHROPIC_BASE_BETA,
-				"user-agent": CLAUDE_CLI_USER_AGENT,
-			},
+			headers: genHeaders,
 			body: JSON.stringify({
 				model: bareModel,
 				max_tokens: 4096,
-				system: [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }],
+				system: isOfficial
+					? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
+					: [{ type: "text", text: systemInstruction }],
 				messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
 			}),
 		});

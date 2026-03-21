@@ -112,6 +112,8 @@
 	"anthropicProxyDesc": "此提供商所有请求的代理。留空则直连。",
 	"anthropicTlsRejectUnauthorized": "跳过 TLS 验证",
 	"anthropicTlsRejectUnauthorizedDesc": "禁用证书验证，用于 MITM 代理或自签名证书。不建议在生产环境使用。",
+	"anthropicOfficialApi": "官方 API",
+	"anthropicOfficialApiDesc": "启用 Claude Code 协议特性（服务端搜索、beta 标志、提示缓存、Bearer 认证）。仅在使用 Anthropic 官方 API 或官方中转时开启，第三方中转请关闭。",
 	"anthropicRefreshModels": "获取模型列表",
 	"anthropicRefreshModelsLoading": "获取中...",
 	"anthropicRefreshModelsError": "获取模型列表失败",
