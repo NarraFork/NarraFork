@@ -36,6 +36,9 @@ export interface RenderToolRunOptions {
 	containerStyle?: React.CSSProperties;
 	/** Extra className applied to the outer tool-run container. */
 	containerClassName?: string;
+	/** Additional messages whose tool items are appended after the main run's items.
+	 *  Used to visually merge streaming tool chunks into an existing tool run. */
+	appendMessages?: NarratorMsg[];
 }
 
 export function renderToolRun(
@@ -53,6 +56,7 @@ export function renderToolRun(
 		onDeleteBlock,
 		containerStyle,
 		containerClassName,
+		appendMessages,
 	} = opts;
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(
@@ -62,6 +66,9 @@ export function renderToolRun(
 			permCb.overseerReviewMap,
 		);
 	const items = flattenToolRun(run);
+	if (appendMessages?.length) {
+		items.push(...flattenToolRun(appendMessages));
+	}
 	if (items.length === 0) return null;
 
 	const taskCount = items.filter((it) => it.kind === "tool" && it.isSubagent).length;
@@ -211,7 +218,7 @@ export function renderToolRun(
 	);
 }
 
-function hasReasoningBlock(msg: NarratorMsg): boolean {
+export function hasReasoningBlock(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	return blocks.some((b: ContentBlock) => b.type === "reasoning" && !!b.text?.trim());

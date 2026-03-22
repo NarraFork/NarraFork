@@ -27,6 +27,7 @@ export interface RulerActiveChapter {
 	role: string;
 	parentChapterId: string | null;
 	startCommitSha: string | null;
+	mergeCommitSha?: string | null;
 	narratorId: string | null;
 	narratorStatus: string | null;
 	axisOffset: number;
@@ -37,6 +38,7 @@ export interface RulerData {
 	commits: RulerCommit[];
 	segments: RulerSegment[];
 	activeChapters: RulerActiveChapter[];
+	mergedChapters?: RulerActiveChapter[];
 	totalCommitCount?: number;
 	oldestLoadedIndex?: number;
 	newestLoadedIndex?: number;
@@ -93,10 +95,16 @@ export function flattenRulerPages(pages: RulerData[]): RulerData {
 	for (const page of pages) {
 		for (const ch of page.activeChapters) chapterMap.set(ch.id, ch);
 	}
+	// Deduplicate merged chapters by id
+	const mergedMap = new Map<string, RulerActiveChapter>();
+	for (const page of pages) {
+		for (const ch of page.mergedChapters ?? []) mergedMap.set(ch.id, ch);
+	}
 	return {
 		commits,
 		segments: [...segMap.values()],
 		activeChapters: [...chapterMap.values()],
+		mergedChapters: mergedMap.size > 0 ? [...mergedMap.values()] : undefined,
 		totalCommitCount: pages[0].totalCommitCount,
 		oldestLoadedIndex: Math.min(...pages.map((p) => p.oldestLoadedIndex ?? 0)),
 		newestLoadedIndex: Math.max(...pages.map((p) => p.newestLoadedIndex ?? 0)),

@@ -1859,6 +1859,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					),
 				};
 			});
+			// Also update the main ruler cache so alwaysVisibleChapters stays in sync
+			queryClient.setQueryData(["ruler", projectId], (old: unknown) => {
+				if (!old || typeof old !== "object") return old;
+				const rd = old as RulerData;
+				const updateOffset = (ch: { id: string; axisOffset: number; crossOffset: number }) =>
+					ch.id === chapterId
+						? { ...ch, axisOffset: newAxisOffset, crossOffset: clampedCross }
+						: ch;
+				return {
+					...rd,
+					activeChapters: rd.activeChapters.map(updateOffset),
+					mergedChapters: rd.mergedChapters?.map(updateOffset),
+				};
+			});
 			api.updateRulerPositions(projectId, [
 				{
 					chapterId,
@@ -2320,22 +2334,24 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return result;
 	}, [segmentTicks, pixiChaptersTick, panelSizes, openPanelChapterIds, closingPanelChapterIds]);
 
-	// Always-visible active chapters for L0 dot rendering.
-	// Uses activeChapters from the main ruler query (no segment fetch needed).
+	// Always-visible chapters for L0 dot rendering.
+	// Uses activeChapters + mergedChapters from the main ruler query (no segment fetch needed).
 	const alwaysVisibleChapters = useMemo<PixiChapterInfo[]>(() => {
 		const activeChapters = rulerData.activeChapters ?? [];
-		if (activeChapters.length === 0) return [];
+		const mergedChapters = rulerData.mergedChapters ?? [];
+		const allChapters = [...activeChapters, ...mergedChapters];
+		if (allChapters.length === 0) return [];
 		const result: PixiChapterInfo[] = [];
 
 		// Build lookup by id for parent-chain traversal
-		const chapterById = new Map<string, (typeof activeChapters)[number]>();
-		for (const ch of activeChapters) chapterById.set(ch.id, ch);
+		const chapterById = new Map<string, (typeof allChapters)[number]>();
+		for (const ch of allChapters) chapterById.set(ch.id, ch);
 
 		// Resolve effective startCommitSha: if the chapter's own startCommitSha
 		// is not on the main-branch tick list (e.g. forked from a sub-branch commit),
 		// walk up the parentChapterId chain to find an ancestor whose startCommitSha
 		// IS on the ruler, so the chapter can "attach" to its parent's anchor.
-		const resolveEffectiveSha = (ch: (typeof activeChapters)[number]): string | null => {
+		const resolveEffectiveSha = (ch: (typeof allChapters)[number]): string | null => {
 			if (ch.startCommitSha && tickPositions.has(ch.startCommitSha)) {
 				return ch.startCommitSha;
 			}
@@ -2353,9 +2369,10 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			return null;
 		};
 
-		// Group active chapters by effective startCommitSha
-		const byStartSha = new Map<string, typeof activeChapters>();
-		for (const ch of activeChapters) {
+		// Group all chapters by effective startCommitSha
+		const activeIdSet = new Set(activeChapters.map((ch) => ch.id));
+		const byStartSha = new Map<string, typeof allChapters>();
+		for (const ch of allChapters) {
 			const sha = resolveEffectiveSha(ch);
 			if (!sha) continue;
 			const list = byStartSha.get(sha) ?? [];
@@ -2367,17 +2384,19 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			if (segMainPos == null) continue;
 			for (let i = 0; i < chs.length; i++) {
 				const ch = chs[i];
+				const isMerged = !activeIdSet.has(ch.id);
 				// Use persisted offsets when available, fall back to grid layout
 				const hasOffset = ch.axisOffset !== 0 || ch.crossOffset !== 0;
 				result.push({
 					id: ch.id,
-					status: "active",
+					status: isMerged ? "merged" : "active",
 					title: ch.title,
 					branch: ch.branch ?? "",
 					role: ch.role ?? "branch",
 					narratorId: ch.narratorId ?? null,
 					narratorStatus: ch.narratorStatus ?? null,
 					startCommitSha: ch.startCommitSha,
+					mergeCommitSha: ch.mergeCommitSha,
 					parentChapterId: ch.parentChapterId,
 					layoutX: hasOffset ? ch.axisOffset : 20 + (i % 3) * (NODE_WIDTH + NODE_GAP),
 					layoutY: hasOffset ? ch.crossOffset : 20 + Math.floor(i / 3) * (NODE_HEIGHT + NODE_GAP),
@@ -2398,6 +2417,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return result;
 	}, [
 		rulerData.activeChapters,
+		rulerData.mergedChapters,
 		tickPositions,
 		panelSizes,
 		openPanelChapterIds,

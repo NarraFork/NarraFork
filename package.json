@@ -44,7 +44,6 @@
 		"sanitize-html": "^2.17.1",
 		"shiki": "^4.0.2",
 		"tree-sitter-bash": "0.25.0",
-		"virtua": "^0.48.8",
 		"web-tree-sitter": "0.25.10",
 		"zod": "^4.3.6"
 	},

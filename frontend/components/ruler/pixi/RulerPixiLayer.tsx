@@ -780,6 +780,8 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 			// Active chapters always show at least as a dot
 			if (t <= 0 && ch.status === "active") t = 0.15;
+			// Merged chapters also show as a smaller dot so they don't vanish on re-mount
+			if (t <= 0 && ch.status === "merged") t = 0.1;
 			if (t <= 0) continue;
 			// Guard against stale/incomplete chapter data after cleanup
 			if (!ch.title || !ch.status) continue;

@@ -858,8 +858,17 @@ export function resolvePermissionDecision(
 			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
 			if (pathsEqual(absPath, planFilePath)) return "allow";
 		}
-		// Strict plan: deny non-plan-file writes. Relaxed plan: delegate to inherited mode.
-		if (!relaxedPlan) return "deny";
+		// Strict plan: deny non-plan-file writes with explicit reason.
+		if (!relaxedPlan) {
+			if (meta) {
+				const planFile = planFileId ? `.narrafork/plan-${planFileId}.md` : "(unknown)";
+				meta.blacklistReason =
+					`Plan mode: Write/Edit is only allowed to the plan file "${planFile}". ` +
+					`Write your plan to that file, then call ExitPlanMode. ` +
+					`Only after the user approves your plan can you implement changes.`;
+			}
+			return "deny";
+		}
 	}
 
 	// For all other tools in plan mode:
@@ -1085,16 +1094,7 @@ export async function handlePermission(
 	const isPlanMode = permMode === "plan";
 	const isChapter = !!narrator?.chapterId;
 
-	// Plan mode: redirect Write/Edit file_path to the locked plan file
 	let effectiveInput = input;
-	if (isPlanMode && (toolName === "Write" || toolName === "Edit")) {
-		const active = activeNarrators.get(narratorId);
-		const planFileId = active?._planFileId;
-		if (planFileId) {
-			const planFileName = `.narrafork/plan-${planFileId}.md`;
-			effectiveInput = { ...input, file_path: planFileName };
-		}
-	}
 
 	// ExitPlanMode with planFile: pre-read file content for the permission UI.
 	// Replace planFile with the resolved plan content so the frontend can display it

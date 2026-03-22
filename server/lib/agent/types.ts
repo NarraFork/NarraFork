@@ -248,7 +248,7 @@ export interface AgentConfig {
 	planMode?: boolean;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
 	relaxedPlan?: boolean;
-	/** Plan file ID — set during plan mode for Write/Edit redirection and ExitPlanMode */
+	/** Plan file ID — set during plan mode for Write/Edit validation and ExitPlanMode */
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;

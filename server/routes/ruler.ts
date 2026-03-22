@@ -218,10 +218,29 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 			};
 		});
 
+	// Build merged chapters summary (so they are always visible without waiting
+	// for SegmentCanvas async loads — fixes disappearing merged chapters on re-mount)
+	const mergedChapters = projectChapters
+		.filter((ch) => ch.status === "merged")
+		.map((ch) => ({
+			id: ch.id,
+			title: ch.title,
+			branch: ch.branch,
+			role: ch.role,
+			parentChapterId: ch.parentChapterId ?? null,
+			startCommitSha: ch.startCommitSha,
+			mergeCommitSha: ch.mergeCommitSha,
+			narratorId: null as string | null,
+			narratorStatus: null as string | null,
+			axisOffset: ch.axisOffset ?? 0,
+			crossOffset: ch.crossOffset ?? 0,
+		}));
+
 	return c.json({
 		commits,
 		segments,
 		activeChapters,
+		mergedChapters,
 		totalCommitCount,
 		oldestLoadedIndex: skip,
 		newestLoadedIndex: skip + commits.length - 1,

@@ -776,7 +776,7 @@ CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase for project files
 
 STRICTLY FORBIDDEN: ANY project file edits, modifications, or system changes. Do NOT use Write, Edit, or any ${sh} command that modifies project files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation.
 
-**Exception**: You may ONLY write to the designated plan file: \`${planFile}\`. All Write/Edit calls in plan mode are automatically redirected to this file regardless of the path you specify.
+**Exception**: You may ONLY write to the designated plan file: \`${planFile}\`. Write/Edit calls targeting any other file will be REJECTED. You must explicitly use the correct plan file path.
 
 ## Your Responsibility
 
@@ -798,7 +798,7 @@ You have two ways to submit your plan (choose ONE):
 Call ExitPlanMode with the \`plan\` parameter containing your complete plan text.
 
 ### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)
-1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). All Write/Edit calls in plan mode are automatically redirected to this file — you don't need to worry about the file path.
+1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
 2. When done, call ExitPlanMode with \`planFile\` set to \`${planFile}\`.
 
 **IMPORTANT**: The plan (whether inline or in the file) must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.
@@ -814,7 +814,7 @@ Your turn should only end with either asking the user a question or calling Exit
 
 严格禁止：任何项目文件的编辑、修改或系统变更。不要使用 Write、Edit 或任何修改项目文件的 ${sh} 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。
 
-**例外**：你唯一可以写入的文件是指定的计划文件：\`${planFile}\`。计划模式下所有 Write/Edit 调用会自动重定向到此文件，无论你指定什么路径。
+**例外**：你唯一可以写入的文件是指定的计划文件：\`${planFile}\`。Write/Edit 调用如果目标不是此文件将被拒绝。你必须显式使用正确的计划文件路径。
 
 ## 你的职责
 
@@ -836,7 +836,7 @@ Your turn should only end with either asking the user a question or calling Exit
 调用 ExitPlanMode，在 \`plan\` 参数中填入完整的计划文本。
 
 ### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）
-1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。计划模式下所有 Write/Edit 调用会自动重定向到此文件 — 你无需关心文件路径。
+1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
 2. 完成后，调用 ExitPlanMode，将 \`planFile\` 设为 \`${planFile}\`。
 
 **重要**：计划（无论内联还是文件形式）必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。
