@@ -20,7 +20,7 @@ if (typeof document !== "undefined") {
 	if (!document.getElementById(id)) {
 		const style = document.createElement("style");
 		style.id = id;
-		style.textContent = `.broad-message-list-inner { padding: 0 var(--mantine-spacing-md); }`;
+		style.textContent = `.broad-message-list-inner { padding: var(--mantine-spacing-md) var(--mantine-spacing-md) 0; }`;
 		document.head.appendChild(style);
 	}
 }

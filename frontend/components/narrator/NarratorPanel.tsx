@@ -2030,6 +2030,34 @@ export function NarratorPanel({
 		});
 		mutationObserver.observe(vp, { childList: true, subtree: true });
 
+		// ResizeObserver on the content wrapper detects height changes that
+		// don't add/remove DOM nodes (e.g. text content updates, image loads,
+		// code block expansion). Without this, the MutationObserver alone
+		// misses cases where existing elements grow taller.
+		let contentResizeRafId = 0;
+		const contentObserver = new ResizeObserver(() => {
+			if (!initialScrollDoneRef.current || resizingRef.current) return;
+			cancelAnimationFrame(contentResizeRafId);
+			contentResizeRafId = requestAnimationFrame(() => {
+				if (resizingRef.current) {
+					if (isAtBottomRef.current && !highlightMessageId) {
+						programmaticScrollRef.current = true;
+						vp.scrollTop = vp.scrollHeight - vp.clientHeight;
+					}
+					return;
+				}
+				if (isAtBottomRef.current && !highlightMessageId) {
+					startFollowing();
+				}
+			});
+		});
+		// Observe the list wrapper (contentRef) — its height changes when
+		// any child element grows/shrinks without DOM node count changing.
+		const listWrapper = contentRef.current;
+		if (listWrapper) {
+			contentObserver.observe(listWrapper);
+		}
+
 		const vpObserver = new ResizeObserver(() => {
 			// Mark that a viewport resize is in progress so the mutation
 			// observer takes the synchronous-snap path, and onScroll
@@ -2050,8 +2078,10 @@ export function NarratorPanel({
 		return () => {
 			clearTimeout(vpResizeTimer);
 			cancelAnimationFrame(mutationRafId);
+			cancelAnimationFrame(contentResizeRafId);
 			resizingRef.current = false;
 			mutationObserver.disconnect();
+			contentObserver.disconnect();
 			vpObserver.disconnect();
 			stopFollowing();
 		};
