@@ -100,6 +100,9 @@
 		"mergeConflictResolvedDesc": "AI 解决了 {{count}} 个冲突文件并完成了合并。",
 		"mergeConflictFailed": "合并需要手动解决",
 		"mergeConflictFailedDesc": "AI 无法解决以下文件的冲突：{{files}}。已创建临时章节供手动解决。",
+		"mergeError": "合并失败",
+		"mergeDirtySource": "章节存在未提交的变更，请先提交或暂存。",
+		"mergeDirtyTrunk": "主线存在未提交的变更，请先提交或暂存。",
 		"rebaseOntoTrunk": "变基到主线",
 		"rebaseSuccess": "变基完成",
 		"rebaseSuccessDesc": "章节已变基到最新主线。",
@@ -110,6 +113,9 @@
 		"rebaseConflictFile": "文件",
 		"rebaseConflictCount": "冲突数",
 		"rebaseNarratorSent": "已发送给叙述者",
-		"rebaseNarratorSentDesc": "叙述者将解决变基冲突。"
+		"rebaseNarratorSentDesc": "叙述者将解决变基冲突。",
+		"rebaseError": "变基失败",
+		"rebaseDirtySource": "章节存在未提交的变更，请先提交或暂存。",
+		"rebaseDirtyTrunk": "主线存在未提交的变更，请先提交或暂存。"
 	}
 }

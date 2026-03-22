@@ -153,6 +153,19 @@ function clampCamera(cam: Camera, opts?: ClampBounds, soft?: boolean): Camera {
 	return changed ? { ...cam, panX: crossPan, panY: mainPan } : cam;
 }
 
+const DIRTY_ERROR_MAP: Record<string, string> = {
+	MERGE_DIRTY_TRUNK: "ruler.mergeDirtyTrunk",
+	MERGE_DIRTY_SOURCE: "ruler.mergeDirtySource",
+	REBASE_DIRTY_TRUNK: "ruler.rebaseDirtyTrunk",
+	REBASE_DIRTY_SOURCE: "ruler.rebaseDirtySource",
+};
+
+/** Map a structured dirty-worktree ApiError to an i18n key, or null for unknown errors. */
+function dirtyErrorKey(err: ApiError): string | null {
+	const code = (err.data?.error as string) ?? err.message;
+	return DIRTY_ERROR_MAP[code] ?? null;
+}
+
 export function RulerFlow({ projectId }: RulerFlowProps) {
 	const { t } = useTranslation("graph");
 	const { data, isLoading, error } = useRulerData(projectId);
@@ -928,11 +941,23 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					queryClient.invalidateQueries({
 						queryKey: ["rulerSegment", projectId],
 					});
-				}
-				/* other errors handled by global handler */
+			} else if (err instanceof ApiError) {
+				const msgKey = dirtyErrorKey(err);
+				notifications.show({
+					title: t("ruler.mergeError"),
+					message: msgKey ? t(msgKey) : err.message,
+					color: "red",
+				});
+			} else {
+				notifications.show({
+					title: t("ruler.mergeError"),
+					message: err instanceof Error ? err.message : String(err),
+					color: "red",
+				});
 			}
-		},
-		[projectId, queryClient, t],
+		}
+	},
+	[projectId, queryClient, t],
 	);
 
 	const handleChapterRebase = useCallback(
@@ -958,9 +983,22 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						conflictFiles: result.conflictFiles,
 					});
 				}
-			} catch {
-				/* global handler */
+		} catch (err) {
+			if (err instanceof ApiError) {
+				const msgKey = dirtyErrorKey(err);
+				notifications.show({
+					title: t("ruler.rebaseError"),
+					message: msgKey ? t(msgKey) : err.message,
+					color: "red",
+				});
+			} else {
+				notifications.show({
+					title: t("ruler.rebaseError"),
+					message: err instanceof Error ? err.message : String(err),
+					color: "red",
+				});
 			}
+		}
 		},
 		[projectId, queryClient, t, data],
 	);

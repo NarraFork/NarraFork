@@ -2485,6 +2485,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isFailed = toolCall.status === "fail";
 	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
 	const isDeniedPlan = isFailed && toolCall.toolName === "ExitPlanMode";
+	// When data is truncated (loaded from history), default to collapsed to avoid
+	// triggering expensive detail-fetch API calls. The card will expand if the user
+	// clicks it or if it was just streamed in (streaming cards go through
+	// _streamingChars → completed, so they never hit this path on first render).
+	const isTruncated = hasTruncatedData(toolCall);
 	const defaultOpen =
 		!isStreaming &&
 		(!!pendingPermission ||
@@ -2493,8 +2498,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 			cat === "share" ||
 			cat === "recall" ||
 			(cat === "plan" && !isDeniedPlan) ||
-			(isEdit && !isFailedEdit) ||
-			(isFailed && !isEdit && !isDeniedPlan));
+			(isEdit && !isFailedEdit && !isTruncated) ||
+			(isFailed && !isEdit && !isDeniedPlan && !isTruncated));
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Clamp plan card height to 85% of the nearest scroll container.
@@ -2511,10 +2516,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 		if (cat === "bash" && toolCall._streamingOutput) setOpened(true);
 	}, [cat, toolCall._streamingOutput]);
 
-	// Auto-expand todo/plan cards once streaming finishes
+	// Auto-expand todo/plan cards once streaming finishes (skip truncated history data)
 	useEffect(() => {
-		if (!isStreaming && (cat === "todo" || cat === "plan")) setOpened(true);
-	}, [isStreaming, cat]);
+		if (!isStreaming && !isTruncated && (cat === "todo" || cat === "plan")) setOpened(true);
+	}, [isStreaming, isTruncated, cat]);
 
 	// Force expand from outside (e.g. navigating to this card)
 	useEffect(() => {

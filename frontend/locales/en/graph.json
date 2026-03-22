@@ -100,6 +100,9 @@
 		"mergeConflictResolvedDesc": "AI resolved {{count}} conflicting file(s) and completed the merge.",
 		"mergeConflictFailed": "Merge needs manual resolution",
 		"mergeConflictFailedDesc": "AI could not resolve conflicts in: {{files}}. A temporary chapter has been created for manual resolution.",
+		"mergeError": "Merge failed",
+		"mergeDirtySource": "Chapter has uncommitted changes. Please commit or stash them first.",
+		"mergeDirtyTrunk": "Trunk has uncommitted changes. Please commit or stash them first.",
 		"rebaseOntoTrunk": "Rebase onto trunk",
 		"rebaseSuccess": "Rebase completed",
 		"rebaseSuccessDesc": "Chapter rebased onto latest trunk.",
@@ -110,6 +113,9 @@
 		"rebaseConflictFile": "File",
 		"rebaseConflictCount": "Conflicts",
 		"rebaseNarratorSent": "Sent to narrator",
-		"rebaseNarratorSentDesc": "The narrator will resolve rebase conflicts."
+		"rebaseNarratorSentDesc": "The narrator will resolve rebase conflicts.",
+		"rebaseError": "Rebase failed",
+		"rebaseDirtySource": "Chapter has uncommitted changes. Please commit or stash them first.",
+		"rebaseDirtyTrunk": "Trunk has uncommitted changes. Please commit or stash them first."
 	}
 }

@@ -456,9 +456,7 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 	// Dirty check: ensure trunk worktree is clean
 	const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
 	if (trunkStatus.trim()) {
-		throw new ValidationError(
-			"Target chapter (trunk) has uncommitted or untracked changes. Please commit or stash them first.",
-		);
+		return c.json({ error: "MERGE_DIRTY_TRUNK", code: "VALIDATION_ERROR" }, 400);
 	}
 
 	// Dirty check: ensure source worktree is clean
@@ -469,9 +467,7 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 	if (source.worktreePath) {
 		const sourceStatus = await gitService.getStatus(source.worktreePath);
 		if (sourceStatus.trim()) {
-			throw new ValidationError(
-				"Source chapter has uncommitted or untracked changes. Please commit or stash them first.",
-			);
+			return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
 		}
 	}
 
@@ -597,9 +593,15 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 	// Dirty check
 	const status = await gitService.getStatus(chapter.worktreePath);
 	if (status.trim()) {
-		throw new ValidationError(
-			"Chapter has uncommitted or untracked changes. Please commit or stash them first.",
-		);
+		return c.json({ error: "REBASE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
+	}
+
+	// Also check trunk worktree is clean
+	if (rootChapter.worktreePath) {
+		const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
+		if (trunkStatus.trim()) {
+			return c.json({ error: "REBASE_DIRTY_TRUNK", code: "VALIDATION_ERROR" }, 400);
+		}
 	}
 
 	// Execute rebase
