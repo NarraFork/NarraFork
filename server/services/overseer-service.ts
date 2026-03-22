@@ -4,11 +4,18 @@ import { chapters, narrators, overseers, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
+import {
+	buildOverseerSystemPrompt,
+	getOverseerTitle,
+	type Locale,
+	type OverseerScope as OverseerScopeI18n,
+} from "../lib/prompt-i18n";
 import { resolveEffectiveModel, settings } from "../lib/settings";
 
 // === Types ===
 
-export type OverseerScope = "global" | "project";
+export type OverseerScope = OverseerScopeI18n;
 
 export interface OverseerPolicy {
 	handleEvents: {
@@ -30,28 +37,6 @@ const DEFAULT_POLICY: OverseerPolicy = {
 
 export type Overseer = typeof overseers.$inferSelect;
 
-function buildOverseerSystemPrompt(scope: OverseerScope, projectName?: string): string {
-	const scopeDesc =
-		scope === "global"
-			? "You are a Global Overseer — you supervise all Narrators across all projects."
-			: `You are a Project Overseer for "${projectName ?? "Unknown"}" — you supervise all Narrators within this project.`;
-
-	return `You are an Overseer — a supervisory AI that monitors and manages other Narrators within your jurisdiction.
-
-${scopeDesc}
-
-When you receive a permission request from a managed Narrator, analyze:
-1. What tool is being called and with what parameters
-2. Whether the operation is safe and appropriate given the Narrator's task context
-3. Any potential risks (destructive file operations, dangerous commands, etc.)
-
-Then use ApprovePermission or DenyPermission to make your decision promptly.
-If you're unsure about safety, prefer to deny with a clear explanation.
-
-You can also use ListManagedNarrators to see all Narrators under your jurisdiction,
-and GetNarratorContext to read a Narrator's recent conversation for more context.`;
-}
-
 // === CRUD ===
 
 export async function createOverseer(input: {
@@ -60,6 +45,7 @@ export async function createOverseer(input: {
 	model?: string;
 	systemPrompt?: string;
 	policy?: Partial<OverseerPolicy>;
+	locale?: Locale;
 }): Promise<Overseer> {
 	// Validate scope constraints
 	if (input.scope === "project") {
@@ -105,13 +91,15 @@ export async function createOverseer(input: {
 		projectName = project?.name;
 	}
 
-	const defaultPrompt = buildOverseerSystemPrompt(input.scope, projectName);
+	const defaultPrompt = buildOverseerSystemPrompt(input.scope, input.locale ?? "en", projectName);
+
+	const locale = input.locale ?? "en";
 
 	// Create the narrator (standalone, no chapter)
 	await db.insert(narrators).values({
 		id: narratorId,
 		type: "primary",
-		title: input.scope === "global" ? "Global Overseer" : `Overseer: ${projectName ?? "Project"}`,
+		title: getOverseerTitle(input.scope, locale, projectName),
 		model: effectiveModel,
 		systemPrompt: input.systemPrompt ?? defaultPrompt,
 		permissionMode: "bypassPermissions",
@@ -439,3 +427,66 @@ export async function getOverseerDecisions(overseerId: string, limit = 50) {
 		},
 	});
 }
+
+// === Auto-replace overseer when its narrator is archived ===
+
+/**
+ * When an overseer's narrator is archived, delete the overseer record and
+ * create a fresh replacement that inherits scope, projectId and policy.
+ * This mirrors the replacement logic already present in `deleteOverseer`
+ * for the global scope, but generalises it to project-scoped overseers too.
+ */
+eventBus.on("narrator:status_changed", async (event) => {
+	if (event.status !== "archived") return;
+
+	const overseer = await db.query.overseers.findFirst({
+		where: eq(overseers.narratorId, event.narratorId),
+	});
+	if (!overseer) return;
+
+	logger.info("Overseer narrator archived, creating replacement", {
+		overseerId: overseer.id,
+		scope: overseer.scope,
+		projectId: overseer.projectId,
+	});
+
+	const savedPolicy = overseer.policyJson as OverseerPolicy | null;
+	const savedScope = overseer.scope as OverseerScope;
+	const savedProjectId = overseer.projectId;
+	const wasEnabled = overseer.enabled;
+
+	// Read the old narrator's model and systemPrompt so the replacement inherits them
+	const oldNarrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, event.narratorId),
+		columns: { model: true, systemPrompt: true },
+	});
+
+	const oldOverseerId = overseer.id;
+
+	// Remove the old overseer record (narrator is already archived)
+	await db.delete(overseers).where(eq(overseers.id, overseer.id));
+	eventBus.emit({ type: "overseer:deleted", overseerId: overseer.id });
+
+	// Create a fresh replacement, inheriting model and systemPrompt from the old narrator
+	const replacement = await createOverseer({
+		scope: savedScope,
+		projectId: savedProjectId ?? undefined,
+		policy: savedPolicy ?? undefined,
+		model: oldNarrator?.model ?? undefined,
+		systemPrompt: oldNarrator?.systemPrompt ?? undefined,
+	});
+
+	// Restore enabled state — createOverseer defaults global to disabled,
+	// project to enabled, so we explicitly sync the original value.
+	if (replacement.enabled !== wasEnabled) {
+		await updateOverseer(replacement.id, { enabled: wasEnabled });
+	}
+
+	eventBus.emit({
+		type: "overseer:replaced",
+		oldOverseerId,
+		newOverseerId: replacement.id,
+		scope: savedScope,
+		projectId: savedProjectId,
+	});
+});

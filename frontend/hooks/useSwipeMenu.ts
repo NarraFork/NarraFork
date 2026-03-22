@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getGlobalCloseSwipe, setGlobalCloseSwipe } from "../components/narrator/swipeState";
+import {
+	getGlobalCloseSwipe,
+	getGlobalOnSelectionRange,
+	getGlobalSwipeAnchor,
+	setGlobalCloseSwipe,
+	setGlobalSwipeAnchor,
+} from "../components/narrator/swipeState";
 
 const DEFAULT_THRESHOLD = 60;
 const DEFAULT_REVEAL_WIDTH = 180;
@@ -16,6 +22,12 @@ interface UseSwipeMenuOptions {
 	excludeSelectors?: string[];
 	/** Optional external ref for the swipe target element. If provided, the hook uses it instead of creating its own. */
 	externalBoxRef?: React.RefObject<HTMLDivElement | null>;
+	/**
+	 * Stable block ID for this swipeable element.
+	 * Used for multi-select: when a second swipe occurs while one is already
+	 * revealed, the system selects all blocks between the anchor and this block.
+	 */
+	blockId?: string;
 }
 
 export interface SwipeMenuState {
@@ -52,6 +64,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		swipeRevealWidth = DEFAULT_REVEAL_WIDTH,
 		excludeSelectors = ["[data-content-block]", ".mantine-Menu-dropdown"],
 		externalBoxRef,
+		blockId,
 	} = opts;
 
 	const internalBoxRef = useRef<HTMLDivElement>(null);
@@ -67,6 +80,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		startX: number;
 		startY: number;
 		dir: "h" | "v" | null;
+		/** True when another block's swipe was already open at touchstart. */
+		rangeCandidate: boolean;
 	} | null>(null);
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
@@ -78,16 +93,26 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		setSwipeOffset(0);
 		setSwipeRevealed(false);
 		setGlobalCloseSwipe(null);
+		// Clear anchor when the swipe that set it is closed
+		if (blockId && getGlobalSwipeAnchor() === blockId) {
+			setGlobalSwipeAnchor(null);
+		}
 		setTimeout(() => setSwipeClosing(false), DEFAULT_CLOSE_DURATION);
-	}, []);
+	}, [blockId]);
 
 	// --- Global coordination ---
 	useEffect(() => {
-		if (swipeRevealed) setGlobalCloseSwipe(closeSwipe);
+		if (swipeRevealed) {
+			setGlobalCloseSwipe(closeSwipe);
+			// Record this block as the anchor for potential multi-select
+			if (blockId) {
+				setGlobalSwipeAnchor(blockId);
+			}
+		}
 		return () => {
 			if (getGlobalCloseSwipe() === closeSwipe) setGlobalCloseSwipe(null);
 		};
-	}, [swipeRevealed, closeSwipe]);
+	}, [swipeRevealed, closeSwipe, blockId]);
 
 	// --- Touch handlers ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
@@ -100,34 +125,68 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 
 		const onTouchStart = (e: TouchEvent) => {
 			if (matchesExclude(e.target as HTMLElement)) return;
-			const cur = getGlobalCloseSwipe();
-			if (cur && cur !== closeSwipe) {
-				cur();
+
+			const curClose = getGlobalCloseSwipe();
+			const curAnchor = getGlobalSwipeAnchor();
+
+			// Another block's swipe is already open — this *might* be a range-select,
+			// but we don't know yet. Record the touch start and let onTouchMove
+			// determine whether it's a horizontal swipe or a vertical scroll.
+			if (curClose && curClose !== closeSwipe) {
+				if (blockId && curAnchor && curAnchor !== blockId) {
+					const touch = e.touches[0];
+					swipeRef.current = {
+						startX: touch.clientX,
+						startY: touch.clientY,
+						dir: null,
+						rangeCandidate: true,
+					};
+					setSwipeY(touch.clientY);
+					setSwipeInitialRight(node.getBoundingClientRect().right);
+					return;
+				}
+				// Same block or no blockId — just ignore (let user scroll)
 				swipeRef.current = null;
 				return;
 			}
+
 			if (swipeRevealed) {
-				closeSwipe();
+				// Tapping on the same block that's already revealed — do NOT close.
+				// The user can scroll or tap elsewhere freely.
 				swipeRef.current = null;
 				return;
 			}
+
 			const touch = e.touches[0];
-			swipeRef.current = { startX: touch.clientX, startY: touch.clientY, dir: null };
+			swipeRef.current = {
+				startX: touch.clientX,
+				startY: touch.clientY,
+				dir: null,
+				rangeCandidate: false,
+			};
 			setSwipeY(touch.clientY);
 			setSwipeInitialRight(node.getBoundingClientRect().right);
 		};
 
 		const onTouchMove = (e: TouchEvent) => {
 			const s = swipeRef.current;
-			if (!s || swipeRevealed) return;
+			if (!s) return;
+			// If this block's own swipe is already revealed, ignore moves
+			if (swipeRevealed && !s.rangeCandidate) return;
+
 			const touch = e.touches[0];
 			const dx = s.startX - touch.clientX;
 			const dy = Math.abs(touch.clientY - s.startY);
+
 			if (!s.dir) {
-				if (Math.abs(dx) > 10 || dy > 10) s.dir = Math.abs(dx) > dy ? "h" : "v";
+				if (Math.abs(dx) > 10 || dy > 10) {
+					s.dir = Math.abs(dx) > dy ? "h" : "v";
+				}
 				return;
 			}
 			if (s.dir === "v") return;
+
+			// Horizontal swipe detected — track offset
 			const offset = Math.max(0, Math.min(dx, swipeRevealWidth));
 			swipeOffsetRef.current = offset;
 			setSwipeOffset(offset);
@@ -137,7 +196,30 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			const s = swipeRef.current;
 			swipeRef.current = null;
 			if (!s || s.dir !== "h") return;
-			if (swipeOffsetRef.current >= swipeThreshold) {
+
+			const didSwipe = swipeOffsetRef.current >= swipeThreshold;
+
+			// Range-select: user completed a horizontal swipe on a different block
+			// while another block's swipe was already open.
+			if (s.rangeCandidate && didSwipe) {
+				const curAnchor = getGlobalSwipeAnchor();
+				const curClose = getGlobalCloseSwipe();
+				if (blockId && curAnchor && curAnchor !== blockId) {
+					const onRange = getGlobalOnSelectionRange();
+					if (onRange) {
+						onRange(curAnchor, blockId);
+					}
+					// Close the anchor's swipe menu
+					if (curClose) curClose();
+				}
+				// Reset our own offset (we don't reveal our own menu)
+				swipeOffsetRef.current = 0;
+				setSwipeOffset(0);
+				return;
+			}
+
+			// Normal swipe on this block
+			if (didSwipe) {
 				swipeOffsetRef.current = swipeRevealWidth;
 				setSwipeOffset(swipeRevealWidth);
 				setSwipeRevealed(true);
@@ -156,20 +238,22 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			node.removeEventListener("touchmove", onTouchMove);
 			node.removeEventListener("touchend", onTouchEnd);
 		};
-	}, [enabled, swipeRevealed, closeSwipe, swipeThreshold, swipeRevealWidth, excludeSelectors]);
+	}, [
+		enabled,
+		swipeRevealed,
+		closeSwipe,
+		swipeThreshold,
+		swipeRevealWidth,
+		excludeSelectors,
+		blockId,
+	]);
 
 	// --- Outside-touch close ---
-	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
-	useEffect(() => {
-		if (!swipeRevealed) return;
-		const onTouch = (e: TouchEvent) => {
-			const tgt = e.target as Node;
-			if (swipeBoxRef.current?.contains(tgt) || swipeMenuRef.current?.contains(tgt)) return;
-			closeSwipe();
-		};
-		document.addEventListener("touchstart", onTouch, { passive: true });
-		return () => document.removeEventListener("touchstart", onTouch);
-	}, [swipeRevealed, closeSwipe]);
+	// REMOVED: We no longer auto-close on outside touch. The swipe stays open
+	// so the user can scroll freely and swipe a second block for range selection.
+	// The swipe is closed only by:
+	// 1. Clicking a menu action item (explicit closeSwipe() calls in ContentViewer/ToolCallCard)
+	// 2. Exiting selection mode (via the floating toolbar)
 
 	// --- Context menu ---
 	const handleContextMenu = useCallback(
@@ -211,7 +295,6 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				menuTop = Math.max(minTop, Math.min(swipeY, maxTop));
 			}
 			// Clamp to viewport so the menu never overflows off-screen
-			// (the menu is rendered with translateY(-50%), so its edges are ±menuHeight/2 from top)
 			const half = menuHeight / 2;
 			menuTop = Math.max(half, Math.min(menuTop, window.innerHeight - half));
 			return { left: menuLeft, top: menuTop };

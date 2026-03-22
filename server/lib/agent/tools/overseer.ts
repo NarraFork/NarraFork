@@ -1,5 +1,6 @@
 import { z } from "zod/v4";
 import { logger } from "../../logger";
+import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
@@ -23,6 +24,7 @@ export const approvePermissionTool: ToolDefinition = {
 			requestId: string;
 			feedbackText?: string;
 		};
+		const locale = (ctx.locale ?? "en") as Locale;
 
 		try {
 			const { resolvePermission } = await import("../../../services/narrator-session");
@@ -36,7 +38,7 @@ export const approvePermissionTool: ToolDefinition = {
 			});
 			if (!overseer) {
 				return {
-					output: "Error: This narrator is not an overseer.",
+					output: getToolMessage("overseerNotAnOverseer", locale),
 					isError: true,
 				};
 			}
@@ -47,7 +49,9 @@ export const approvePermissionTool: ToolDefinition = {
 
 			if (!resolved) {
 				return {
-					output: `Permission request ${requestId} was already resolved (likely by the user).`,
+					output: getToolMessageWithParams("overseerPermissionAlreadyResolved", locale, {
+						requestId,
+					}),
 				};
 			}
 
@@ -70,7 +74,10 @@ export const approvePermissionTool: ToolDefinition = {
 			});
 
 			return {
-				output: `Permission request ${requestId} approved.${feedbackText ? ` Feedback: ${feedbackText}` : ""}`,
+				output: getToolMessageWithParams("overseerPermissionApproved", locale, {
+					requestId,
+					feedback: feedbackText ? ` Feedback: ${feedbackText}` : "",
+				}),
 			};
 		} catch (err) {
 			logger.error("ApprovePermission failed", {
@@ -105,6 +112,7 @@ export const denyPermissionTool: ToolDefinition = {
 			requestId: string;
 			denyMessage?: string;
 		};
+		const locale = (ctx.locale ?? "en") as Locale;
 
 		try {
 			const { resolvePermission } = await import("../../../services/narrator-session");
@@ -118,18 +126,20 @@ export const denyPermissionTool: ToolDefinition = {
 			});
 			if (!overseer) {
 				return {
-					output: "Error: This narrator is not an overseer.",
+					output: getToolMessage("overseerNotAnOverseer", locale),
 					isError: true,
 				};
 			}
 
 			const resolved = await resolvePermission(requestId, "deny", {
-				denyMessage: denyMessage ?? "Denied by Overseer",
+				denyMessage: denyMessage ?? getToolMessage("overseerDefaultDenyMessage", locale),
 			});
 
 			if (!resolved) {
 				return {
-					output: `Permission request ${requestId} was already resolved (likely by the user).`,
+					output: getToolMessageWithParams("overseerPermissionAlreadyResolved", locale, {
+						requestId,
+					}),
 				};
 			}
 
@@ -152,7 +162,10 @@ export const denyPermissionTool: ToolDefinition = {
 			});
 
 			return {
-				output: `Permission request ${requestId} denied.${denyMessage ? ` Reason: ${denyMessage}` : ""}`,
+				output: getToolMessageWithParams("overseerPermissionDenied", locale, {
+					requestId,
+					reason: denyMessage ? ` Reason: ${denyMessage}` : "",
+				}),
 			};
 		} catch (err) {
 			logger.error("DenyPermission failed", {
@@ -176,6 +189,7 @@ export const listManagedNarratorsTool: ToolDefinition = {
 		"List all Narrators under this Overseer's jurisdiction, including their current status.",
 	parameters: z.object({}),
 	async execute(_args, ctx): Promise<ToolResult> {
+		const locale = (ctx.locale ?? "en") as Locale;
 		try {
 			const { db } = await import("../../../db");
 			const { overseers } = await import("../../../db/schema");
@@ -187,7 +201,7 @@ export const listManagedNarratorsTool: ToolDefinition = {
 			});
 			if (!overseer) {
 				return {
-					output: "Error: This narrator is not an overseer.",
+					output: getToolMessage("overseerNotAnOverseer", locale),
 					isError: true,
 				};
 			}
@@ -195,15 +209,18 @@ export const listManagedNarratorsTool: ToolDefinition = {
 			const managed = await listManagedNarrators(overseer.id);
 
 			if (managed.length === 0) {
-				return { output: "No narrators currently under your jurisdiction." };
+				return { output: getToolMessage("overseerNoManagedNarrators", locale) };
 			}
 
 			const lines = managed.map(
 				(n) =>
 					`- ${n.title ?? "Untitled"} (id: ${n.id}, status: ${n.status}, chapter: ${n.chapterId ?? "standalone"})`,
 			);
+			const header = getToolMessageWithParams("overseerManagedNarratorsHeader", locale, {
+				count: managed.length,
+			});
 			return {
-				output: `Managed narrators (${managed.length}):\n${lines.join("\n")}`,
+				output: `${header}\n${lines.join("\n")}`,
 			};
 		} catch (err) {
 			return {
@@ -237,6 +254,7 @@ export const getNarratorContextTool: ToolDefinition = {
 			narratorId: string;
 			messageCount?: number;
 		};
+		const locale = (ctx.locale ?? "en") as Locale;
 
 		try {
 			const { db } = await import("../../../db");
@@ -249,7 +267,7 @@ export const getNarratorContextTool: ToolDefinition = {
 			});
 			if (!overseer) {
 				return {
-					output: "Error: This narrator is not an overseer.",
+					output: getToolMessage("overseerNotAnOverseer", locale),
 					isError: true,
 				};
 			}
@@ -271,7 +289,7 @@ export const getNarratorContextTool: ToolDefinition = {
 			});
 
 			if (refs.length === 0) {
-				return { output: "No messages found for this narrator." };
+				return { output: getToolMessage("overseerNoMessages", locale) };
 			}
 
 			// Reverse to chronological order
@@ -280,8 +298,12 @@ export const getNarratorContextTool: ToolDefinition = {
 				(m) => `[${m.role}] ${m.contentText?.slice(0, 500) ?? "(no text)"}`,
 			);
 
+			const header = getToolMessageWithParams("overseerRecentMessagesHeader", locale, {
+				narratorId,
+				count: messages.length,
+			});
 			return {
-				output: `Recent messages from narrator ${narratorId} (${messages.length}):\n\n${lines.join("\n\n")}`,
+				output: `${header}\n\n${lines.join("\n\n")}`,
 			};
 		} catch (err) {
 			return {

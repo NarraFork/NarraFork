@@ -56,6 +56,12 @@ interface NarratorWSCallbacks {
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
+	onOverseerReviewing?: (
+		requestId: string,
+		toolUseId: string,
+		status: "reviewing" | "queued" | "cleared",
+		overseerId?: string,
+	) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number, promptTokens?: number, contextWindow?: number) => void;
@@ -74,7 +80,7 @@ interface NarratorWSCallbacks {
 		query?: string,
 		queries?: string[],
 	) => void;
-	onNarratorError?: (error: string) => void;
+	onNarratorError?: (error: string, errorCode?: string) => void;
 	onNarratorWarning?: (info: {
 		message: string;
 		retryCount?: number;
@@ -279,6 +285,14 @@ export function useNarratorWS(
 					case "relaxed_plan_changed":
 						callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
 						break;
+					case "overseer_reviewing":
+						callbacksRef.current.onOverseerReviewing?.(
+							data.requestId as string,
+							data.toolUseId as string,
+							data.status as "reviewing" | "queued" | "cleared",
+							data.overseerId as string | undefined,
+						);
+						break;
 					case "compacting":
 						callbacksRef.current.onCompacting?.();
 						break;
@@ -331,7 +345,10 @@ export function useNarratorWS(
 						);
 						break;
 					case "narrator_error":
-						callbacksRef.current.onNarratorError?.(data.error as string);
+						callbacksRef.current.onNarratorError?.(
+							data.error as string,
+							data.errorCode as string | undefined,
+						);
 						break;
 					case "warning":
 						callbacksRef.current.onNarratorWarning?.({

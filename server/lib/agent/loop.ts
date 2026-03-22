@@ -160,7 +160,7 @@ function isContextWindowExceededError(err: unknown): boolean {
 	return false;
 }
 
-function isRetryableError(err: unknown): boolean {
+export function isRetryableError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;

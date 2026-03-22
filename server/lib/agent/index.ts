@@ -1,5 +1,6 @@
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
+import { isRetryableError } from "./loop";
 import { resolveProviderAndModel } from "./provider";
 import { registerCoreTools } from "./tools";
 import { initTruncateCleanup } from "./truncate";
@@ -84,6 +85,15 @@ export async function agentGenerateWithHistory(
 // When the summary model's provider is unavailable, they broadcast a
 // `summary_model_unavailable` event via WebSocket so the frontend can prompt
 // the user to pick a new model. A 30-second debounce prevents flooding.
+// Transient errors (rate limits, overloaded, network issues) are retried with
+// exponential backoff — same patterns as the main narrator agent loop.
+
+/** Max retries for transient errors in summary model calls. */
+const SUMMARY_MAX_TRANSIENT_RETRIES = 3;
+/** Base delay for exponential backoff (ms). */
+const SUMMARY_RETRY_BASE_MS = 3_000;
+/** Maximum backoff delay (ms). */
+const SUMMARY_RETRY_MAX_MS = 15_000;
 
 /** Timestamp of the last `summary_model_unavailable` broadcast. */
 let lastSummaryUnavailableBroadcast = 0;
@@ -121,29 +131,60 @@ async function broadcastSummaryUnavailable(): Promise<void> {
 }
 
 /**
+ * Retry wrapper for summary model calls.
+ * Retries transient errors with exponential backoff; immediately re-throws
+ * provider-unavailable errors after broadcasting a WS event.
+ */
+async function withSummaryRetry<T>(fn: () => Promise<T>): Promise<T> {
+	let lastErr: unknown;
+	for (let attempt = 0; attempt <= SUMMARY_MAX_TRANSIENT_RETRIES; attempt++) {
+		try {
+			return await fn();
+		} catch (err) {
+			lastErr = err;
+			if (isSummaryProviderError(err)) {
+				logger.warn("Summary model unavailable, broadcasting to clients", {
+					model: settings.agent.summaryModel,
+					error: String(err),
+				});
+				broadcastSummaryUnavailable();
+				throw err;
+			}
+			if (attempt < SUMMARY_MAX_TRANSIENT_RETRIES && isRetryableError(err)) {
+				const delayMs = Math.min(SUMMARY_RETRY_BASE_MS * 2 ** attempt, SUMMARY_RETRY_MAX_MS);
+				logger.warn("Summary model transient error, retrying", {
+					model: settings.agent.summaryModel,
+					attempt: attempt + 1,
+					maxRetries: SUMMARY_MAX_TRANSIENT_RETRIES,
+					delayMs,
+					error: String(err),
+				});
+				await new Promise((r) => setTimeout(r, delayMs));
+				continue;
+			}
+			throw err;
+		}
+	}
+	throw lastErr;
+}
+
+/**
  * Generate text using the summary model (with meta).
+ * Retries transient errors with exponential backoff.
  * On provider-unavailable errors, broadcasts a WS event and re-throws.
  */
 export async function summaryGenerate(
 	text: string,
 	systemInstruction?: string,
 ): Promise<{ text: string; contextPercent?: number }> {
-	try {
-		return await agentGenerateWithMeta(text, settings.agent.summaryModel, systemInstruction);
-	} catch (err) {
-		if (isSummaryProviderError(err)) {
-			logger.warn("Summary model unavailable, broadcasting to clients", {
-				model: settings.agent.summaryModel,
-				error: String(err),
-			});
-			broadcastSummaryUnavailable();
-		}
-		throw err;
-	}
+	return withSummaryRetry(() =>
+		agentGenerateWithMeta(text, settings.agent.summaryModel, systemInstruction),
+	);
 }
 
 /**
  * Generate text using the summary model (with history).
+ * Retries transient errors with exponential backoff.
  * On provider-unavailable errors, broadcasts a WS event and re-throws.
  */
 export async function summaryGenerateWithHistory(
@@ -151,21 +192,7 @@ export async function summaryGenerateWithHistory(
 	content: string,
 	locale?: string,
 ): Promise<string> {
-	try {
-		return await agentGenerateWithHistory(
-			systemInstruction,
-			content,
-			settings.agent.summaryModel,
-			locale,
-		);
-	} catch (err) {
-		if (isSummaryProviderError(err)) {
-			logger.warn("Summary model unavailable, broadcasting to clients", {
-				model: settings.agent.summaryModel,
-				error: String(err),
-			});
-			broadcastSummaryUnavailable();
-		}
-		throw err;
-	}
+	return withSummaryRetry(() =>
+		agentGenerateWithHistory(systemInstruction, content, settings.agent.summaryModel, locale),
+	);
 }

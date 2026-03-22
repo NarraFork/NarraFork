@@ -438,12 +438,6 @@ export class OpenAIProvider implements ProviderAdapter {
 				body.parallel_tool_calls = true;
 			}
 
-			// Codex: enable server-side auto-truncation to handle context window overflow.
-			// Send when the target is an official ChatGPT domain (works through proxies
-			// that point to official endpoints, but avoids sending to incompatible backends).
-			if (this.apiMode === "codex" && this.isOfficialChatGPTDomain()) {
-				body.truncation = "auto";
-			}
 			if (instructions) {
 				body.instructions = instructions;
 			} else if (this.apiMode === "codex") {
@@ -1850,22 +1844,15 @@ function emitReasoningItems(
 
 	for (const [itemId, group] of grouped) {
 		emittedIds.add(itemId);
-		// biome-ignore lint/suspicious/noExplicitAny: Responses API reasoning item shape
-		const item: Record<string, any> = {
+		result.push({
 			type: "reasoning",
 			id: group.itemId,
 			encrypted_content: group.encryptedContent ?? null,
-		};
-		// Only include summary when there are actual summary texts.
-		// Codex CLI omits the field entirely when no summaries exist;
-		// sending an empty array may cause API validation issues.
-		if (group.summaryTexts.length > 0) {
-			item.summary = group.summaryTexts.map((text) => ({
+			summary: group.summaryTexts.map((text) => ({
 				type: "summary_text",
 				text,
-			}));
-		}
-		result.push(item);
+			})),
+		});
 	}
 }
 

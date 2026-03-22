@@ -13,6 +13,7 @@ import {
 	startDeviceCodeFlow,
 } from "./codex-auth";
 import { type CodexUsageResult, fetchCodexUsage } from "./codex-usage";
+import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 
@@ -73,14 +74,25 @@ export interface CredentialSnapshot {
 
 export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
+	availableEntries: CredentialSnapshot[];
+	unavailableEntries: CredentialSnapshot[];
+	availableTotal: number;
+	unavailableTotal: number;
 	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
 	available: number;
 	stickySessionCount: number;
 	usageCache: Record<string, CodexUsageResult>;
+	usageQueue?: UsageQueueSnapshot;
 	/** Last browser OAuth error message (cleared on success). */
 	lastBrowserAuthError?: string;
+}
+
+export interface SnapshotOptions {
+	availablePage?: number;
+	unavailablePage?: number;
+	pageSize?: number;
 }
 
 export interface CallContext {
@@ -424,39 +436,66 @@ export class CodexManager {
 
 	// ==================== Admin API ====================
 
-	snapshot(): ManagerSnapshot {
+	snapshot(opts?: SnapshotOptions): ManagerSnapshot {
 		this.pruneSessionAffinity();
-		const available = this.entries.filter((e) => !e.disabled).length;
+
+		const mapEntry = (e: CodexCredential): CredentialSnapshot => {
+			const stats = this.stats.get(e.id);
+			return {
+				id: e.id,
+				displayName: e.displayName,
+				accountId: e.accountId,
+				email: e.email,
+				priority: e.priority,
+				disabled: e.disabled,
+				disabledReason: e.disabledReason,
+				successCount: stats?.successCount ?? 0,
+				failureCount: stats?.failureCount ?? 0,
+				lastUsedAt: stats?.lastUsedAt,
+				expiresAt: e.expiresAt,
+				quotaResetsAt: e.quotaResetsAt,
+				usage: e.usage,
+			};
+		};
+
+		const allAvailable = this.entries.filter((e) => !e.disabled);
+		const allUnavailable = this.entries.filter((e) => e.disabled);
+
+		const pageSize = opts?.pageSize ?? 0; // 0 = no pagination
+		const isPaged = pageSize > 0;
+
+		const slicePage = (arr: CodexCredential[], page?: number): CodexCredential[] => {
+			if (!isPaged || !page || page < 1) return arr;
+			const start = (page - 1) * pageSize;
+			return arr.slice(start, start + pageSize);
+		};
+
+		const pagedAvailable = slicePage(allAvailable, opts?.availablePage);
+		const pagedUnavailable = slicePage(allUnavailable, opts?.unavailablePage);
+
+		const availableSnapshots = pagedAvailable.map(mapEntry);
+		const unavailableSnapshots = pagedUnavailable.map(mapEntry);
+		const allPagedEntries = [...availableSnapshots, ...unavailableSnapshots];
+
+		// Only include usage for paged entries to reduce payload
 		const usageCacheObj: Record<string, CodexUsageResult> = {};
-		for (const e of this.entries) {
-			if (e.usage) usageCacheObj[e.id] = e.usage;
+		for (const snap of allPagedEntries) {
+			if (snap.usage) usageCacheObj[snap.id] = snap.usage;
 		}
+
 		return {
-			entries: this.entries.map((e) => {
-				const stats = this.stats.get(e.id);
-				const usage = e.usage;
-				return {
-					id: e.id,
-					displayName: e.displayName,
-					accountId: e.accountId,
-					email: e.email,
-					priority: e.priority,
-					disabled: e.disabled,
-					disabledReason: e.disabledReason,
-					successCount: stats?.successCount ?? 0,
-					failureCount: stats?.failureCount ?? 0,
-					lastUsedAt: stats?.lastUsedAt,
-					expiresAt: e.expiresAt,
-					quotaResetsAt: e.quotaResetsAt,
-					usage,
-				};
-			}),
+			entries: allPagedEntries,
+			availableEntries: availableSnapshots,
+			unavailableEntries: unavailableSnapshots,
+			availableTotal: allAvailable.length,
+			unavailableTotal: allUnavailable.length,
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
 			total: this.entries.length,
-			available,
+			available: allAvailable.length,
 			stickySessionCount: this.sessionAffinity.size,
 			usageCache: usageCacheObj,
+			usageQueue: codexUsageQueue.getSnapshot(),
 			lastBrowserAuthError: this._lastBrowserAuthError,
 		};
 	}
@@ -751,15 +790,6 @@ export class CodexManager {
 		await this.refreshUsageDeduplicated(id);
 	}
 
-	private scheduleInitialUsageFetch(id: string): void {
-		void this.refreshUsageDeduplicated(id).catch((err) => {
-			logger.warn("Failed to fetch initial Codex usage for credential", {
-				credentialId: id,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		});
-	}
-
 	// ==================== Credential Management ====================
 
 	private addCredentialFromTokens(tokens: CodexTokens): CodexCredential {
@@ -822,7 +852,7 @@ export class CodexManager {
 		}
 
 		this.saveCredentials();
-		this.scheduleInitialUsageFetch(cred.id);
+		codexUsageQueue.enqueue(cred.id);
 		return cred;
 	}
 
@@ -865,9 +895,9 @@ export class CodexManager {
 
 		if (added > 0) {
 			this.saveCredentials();
-			for (const e of this.entries) {
-				if (!e.usage) this.scheduleInitialUsageFetch(e.id);
-			}
+			// Enqueue usage fetch for newly added credentials via serial queue
+			const newIds = this.entries.filter((e) => !e.usage).map((e) => e.id);
+			codexUsageQueue.enqueueMany(newIds);
 		}
 
 		return { added, duplicates, skipped };
@@ -977,6 +1007,9 @@ let _instance: CodexManager | undefined;
 export function getCodexManager(): CodexManager {
 	if (!_instance) {
 		_instance = new CodexManager();
+		// Register the usage queue executor so it can fetch usage serially
+		const mgr = _instance;
+		codexUsageQueue.setExecutor((credentialId) => mgr.getUsage(credentialId));
 	}
 	return _instance;
 }

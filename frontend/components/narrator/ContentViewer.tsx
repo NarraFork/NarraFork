@@ -35,6 +35,7 @@ import { DiffView } from "./DiffView";
 import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -189,6 +190,9 @@ export const ContentViewer = memo(
 		const modalBodyRef = useRef<HTMLDivElement>(null);
 		const instanceId = useRef(nextInstanceId++);
 		const isMobile = contentViewerEnv.isMobile;
+		const blockIdStr = `cv-${instanceId.current}`;
+		const selection = useMessageSelection();
+		const isSelected = selection.selectionMode && selection.selectedBlockIds.has(blockIdStr);
 
 		const handle = useMemo<ContentViewerHandle>(
 			() => ({
@@ -291,6 +295,7 @@ export const ContentViewer = memo(
 			enabled: true,
 			externalBoxRef: boxRef,
 			excludeSelectors: [".mantine-Menu-dropdown"],
+			blockId: blockIdStr,
 		});
 
 		// Desktop: right-click opens context menu (override hook's handler to gate on !isMobile)
@@ -415,6 +420,10 @@ export const ContentViewer = memo(
 
 		const SWIPE_REVEAL_WIDTH = 180;
 
+		// Selected blocks get a visual offset to match the anchor's swipe
+		const selectionOffset = isSelected && !swipe.swipeRevealed ? SWIPE_REVEAL_WIDTH : 0;
+		const effectiveOffset = swipe.swipeOffset > 0 ? swipe.swipeOffset : selectionOffset;
+
 		return (
 			<>
 				<Box
@@ -422,11 +431,15 @@ export const ContentViewer = memo(
 					pos="relative"
 					data-content-block
 					data-cv-id={instanceId.current}
+					{...{ [BLOCK_ID_ATTR]: blockIdStr }}
 					style={{
 						maxWidth: "100%",
 						minWidth: 0,
-						transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+						transform: effectiveOffset > 0 ? `translateX(-${effectiveOffset}px)` : undefined,
 						transition: swipe.swipeTransition,
+						outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+						outlineOffset: isSelected ? -2 : undefined,
+						borderRadius: isSelected ? 4 : undefined,
 					}}
 					onMouseEnter={isMobile ? undefined : () => setHovered(true)}
 					onMouseLeave={isMobile ? undefined : () => setHovered(false)}

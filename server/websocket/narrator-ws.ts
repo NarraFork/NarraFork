@@ -88,6 +88,14 @@ export type NarratorServerMessage =
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
+	| {
+			type: "overseer_reviewing";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			status: "reviewing" | "queued" | "cleared";
+			overseerId?: string;
+	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| { type: "compact_done"; narratorId: string }
@@ -117,7 +125,7 @@ export type NarratorServerMessage =
 	| { type: "messages_deleted"; narratorId: string; deletedMessageIds: string[] }
 	| { type: "message_updated"; narratorId: string; message: unknown }
 	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
-	| { type: "narrator_error"; narratorId: string; error: string }
+	| { type: "narrator_error"; narratorId: string; error: string; errorCode?: string }
 	| {
 			type: "web_search";
 			narratorId: string;
@@ -532,6 +540,20 @@ eventBus.on("container:log", (event) => {
 
 eventBus.on("container:error", (event) => {
 	broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
+});
+
+// === Overseer replaced ===
+// When an overseer's narrator is archived and a replacement is created,
+// broadcast to all clients so they can refresh their overseer state.
+
+eventBus.on("overseer:replaced", (event) => {
+	broadcastToAll({
+		type: "overseer:replaced",
+		oldOverseerId: event.oldOverseerId,
+		newOverseerId: event.newOverseerId,
+		scope: event.scope,
+		projectId: event.projectId,
+	});
 });
 
 // === Recent tabs title sync ===

@@ -27,9 +27,9 @@ function parseArgs(
 
 	for (let i = 0; i < params.length; i++) {
 		if (i === params.length - 1) {
-			args[params[i].name] = tokens.slice(i).join(" ");
+			args[params[i].name] = tokens.slice(i).join(" ") || (params[i].defaultValue ?? "");
 		} else {
-			args[params[i].name] = tokens[i] ?? "";
+			args[params[i].name] = tokens[i] ?? params[i].defaultValue ?? "";
 		}
 	}
 

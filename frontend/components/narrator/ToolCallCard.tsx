@@ -21,6 +21,7 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
+	IconClock,
 	IconCode,
 	IconDownload,
 	IconEye,
@@ -52,6 +53,7 @@ import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
@@ -101,6 +103,7 @@ export interface PendingPermission {
 	decisionReason?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	suggestions?: any[];
+	overseerStatus?: "reviewing" | "queued";
 }
 
 interface ToolCallCardProps {
@@ -2291,6 +2294,23 @@ export function InlinePermission({
 					{permission.decisionReason}
 				</Text>
 			)}
+			{permission.overseerStatus && (
+				<Badge
+					size="xs"
+					variant="light"
+					color={permission.overseerStatus === "reviewing" ? "blue" : "gray"}
+					leftSection={
+						permission.overseerStatus === "reviewing" ? (
+							<IconEye size={10} />
+						) : (
+							<IconClock size={10} />
+						)
+					}
+					mb={4}
+				>
+					{permission.overseerStatus === "reviewing" ? t("overseerReviewing") : t("overseerQueued")}
+				</Badge>
+			)}
 			<Textarea
 				size="xs"
 				placeholder={t("feedbackPlaceholder")}
@@ -2506,7 +2526,14 @@ export const ToolCallCard = memo(function ToolCallCard({
 	);
 
 	// --- Swipe & context-menu state ---
-	const swipe = useSwipeMenu({ enabled: hasActions });
+	const tcBlockId = toolCall.toolUseId ? `tc-${toolCall.toolUseId}` : undefined;
+	const swipe = useSwipeMenu({ enabled: hasActions, blockId: tcBlockId });
+	const selection = useMessageSelection();
+	const isTcSelected = !!(
+		tcBlockId &&
+		selection.selectionMode &&
+		selection.selectedBlockIds.has(tcBlockId)
+	);
 
 	const menuItemsNode = hasActions ? (
 		<>
@@ -2650,6 +2677,20 @@ export const ToolCallCard = memo(function ToolCallCard({
 		/>
 	) : null;
 
+	// Shared selection-aware style computation for both inRun and standalone layouts
+	const buildSelectionStyle = (): React.CSSProperties => {
+		const selOffset = isTcSelected && !swipe.swipeRevealed ? 180 : 0;
+		const effTransform =
+			swipe.swipeOffset > 0 ? undefined : selOffset > 0 ? `translateX(-${selOffset}px)` : undefined;
+		return {
+			...swipe.swipeStyle,
+			...(effTransform ? { transform: effTransform } : {}),
+			...(isTcSelected
+				? { outline: "2px solid var(--mantine-color-indigo-6)", outlineOffset: -2, borderRadius: 4 }
+				: {}),
+		};
+	};
+
 	// Inside a run: no Paper wrapper, just content + divider
 	if (inRun) {
 		return (
@@ -2657,7 +2698,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<Box
 					ref={swipe.swipeBoxRef}
 					onContextMenu={swipe.handleContextMenu}
-					style={swipe.swipeStyle}
+					style={buildSelectionStyle()}
+					{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
 				>
 					<Box ref={isPlan ? cardRef : undefined}>
 						<Box p="xs" className={isStreaming ? "tool-card-shimmer" : undefined}>
@@ -2675,7 +2717,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	return (
 		<>
-			<Box ref={swipe.swipeBoxRef} onContextMenu={swipe.handleContextMenu} style={swipe.swipeStyle}>
+			<Box
+				ref={swipe.swipeBoxRef}
+				onContextMenu={swipe.handleContextMenu}
+				style={buildSelectionStyle()}
+				{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
+			>
 				<Paper
 					ref={isPlan ? cardRef : undefined}
 					withBorder={!inRun}

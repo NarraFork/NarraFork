@@ -2667,6 +2667,7 @@ export const narratorService = {
 		narratorId: string,
 		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
 		errorMessage?: string,
+		errorCode?: string,
 	) {
 		const now = new Date().toISOString();
 		// Keep error message only when status is explicitly "error".
@@ -2693,6 +2694,7 @@ export const narratorService = {
 				type: "narrator_error",
 				narratorId,
 				error: normalizedErrorMessage ?? "Unknown error",
+				errorCode,
 			});
 
 			// Persist a system-level error message visible in the UI but excluded

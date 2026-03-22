@@ -178,7 +178,7 @@ function parseCommandArgs(input: string, params: CommandParam[]): Record<string,
 	for (let i = 0; i < params.length; i++) {
 		if (i === params.length - 1) {
 			// Last param gets all remaining text
-			result[params[i].name] = tokens.slice(i).join(" ");
+			result[params[i].name] = tokens.slice(i).join(" ") || (params[i].defaultValue ?? "");
 		} else if (i < tokens.length) {
 			result[params[i].name] = tokens[i];
 		} else {

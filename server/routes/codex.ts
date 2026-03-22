@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { getCodexManager, type LoadBalancingMode } from "../lib/codex-manager";
+import { codexUsageQueue } from "../lib/codex-usage-queue";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { saveSettings, settings } from "../lib/settings";
@@ -20,7 +21,12 @@ codexRoutes.get("/status", (c) => {
 	if (mode === "priority" || mode === "balanced") {
 		manager.setLoadBalancingMode(mode);
 	}
-	const snapshot = manager.snapshot();
+
+	const availablePage = Number(c.req.query("availablePage")) || undefined;
+	const unavailablePage = Number(c.req.query("unavailablePage")) || undefined;
+	const pageSize = Number(c.req.query("pageSize")) || undefined;
+
+	const snapshot = manager.snapshot({ availablePage, unavailablePage, pageSize });
 
 	return c.json({
 		...snapshot,
@@ -360,4 +366,13 @@ codexRoutes.post("/import", async (c) => {
 	const manager = getCodexManager();
 	const result = manager.importCredentials(body.credentials);
 	return c.json(result);
+});
+
+/**
+ * POST /api/codex/usage-queue/clear
+ * Clear completed/failed items from the usage fetch queue.
+ */
+codexRoutes.post("/usage-queue/clear", (c) => {
+	codexUsageQueue.clearCompleted();
+	return c.json({ ok: true });
 });

@@ -242,6 +242,7 @@ export const SubagentCard = memo(
 			toolCall,
 			permCb?.pendingPermission,
 			permCb?.pendingPermsMap,
+			permCb?.overseerReviewMap,
 		);
 
 		// Find the child tool call that has a pending permission (if any)
@@ -571,6 +572,7 @@ export const SubagentCard = memo(
 																		r.tc,
 																		permCb?.pendingPermission,
 																		permCb?.pendingPermsMap,
+																		permCb?.overseerReviewMap,
 																	);
 																	return (
 																		<div
@@ -601,6 +603,7 @@ export const SubagentCard = memo(
 															r.tc,
 															permCb?.pendingPermission,
 															permCb?.pendingPermsMap,
+															permCb?.overseerReviewMap,
 														);
 														els.push(
 															<div

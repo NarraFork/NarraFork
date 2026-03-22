@@ -57,7 +57,12 @@ export function renderToolRun(
 		containerClassName,
 	} = opts;
 	const matchPermission = (tc: ToolCallData) =>
-		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
+		resolvePendingPerm(
+			tc,
+			permCb.pendingPermission,
+			permCb.pendingPermsMap,
+			permCb.overseerReviewMap,
+		);
 	const items = flattenToolRun(run);
 	if (items.length === 0) return null;
 
@@ -286,7 +291,12 @@ export function renderTreeMessages(
 				message={targetMsg}
 				onForkFromMessage={onForkFromMessage}
 				resolvePerm={(tc) =>
-					resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap)
+					resolvePendingPerm(
+						tc,
+						permCb.pendingPermission,
+						permCb.pendingPermsMap,
+						permCb.overseerReviewMap,
+					)
 				}
 				onPermissionDecision={permCb.onPermissionDecision}
 				onQuestionSubmit={permCb.onQuestionSubmit}
@@ -383,7 +393,12 @@ export function renderTreeMessages(
 								}}
 								onForkFromMessage={onForkFromMessage}
 								resolvePerm={(tc) =>
-									resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap)
+									resolvePendingPerm(
+										tc,
+										permCb.pendingPermission,
+										permCb.pendingPermsMap,
+										permCb.overseerReviewMap,
+									)
 								}
 								onPermissionDecision={permCb.onPermissionDecision}
 								onQuestionSubmit={permCb.onQuestionSubmit}

@@ -7,6 +7,7 @@ import {
 	Group,
 	Modal,
 	NumberInput,
+	Pagination,
 	Paper,
 	Progress,
 	SegmentedControl,
@@ -68,7 +69,7 @@ export function CodexSection({
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
-	const [expanded, setExpanded] = useState(true);
+	const [expanded, setExpanded] = useState(false);
 	const [availableExpanded, setAvailableExpanded] = useState(true);
 	const [unavailableExpanded, setUnavailableExpanded] = useState(false);
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
@@ -91,6 +92,9 @@ export function CodexSection({
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
 	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+	const [availablePage, setAvailablePage] = useState(1);
+	const [unavailablePage, setUnavailablePage] = useState(1);
+	const PAGE_SIZE = 20;
 	const deviceAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -115,15 +119,21 @@ export function CodexSection({
 		queryFn: api.getSettings,
 	});
 	const { data: status } = useQuery({
-		queryKey: ["codex", "status"],
-		queryFn: api.codexStatus,
-		refetchInterval: browserAuthPending ? 3_000 : 30_000, // Poll faster during auth
+		queryKey: ["codex", "status", { availablePage, unavailablePage, pageSize: PAGE_SIZE }],
+		queryFn: () => api.codexStatus({ availablePage, unavailablePage, pageSize: PAGE_SIZE }),
+		refetchInterval: (query) => {
+			if (browserAuthPending) return 3_000;
+			if (query.state.data?.usageQueue?.isRunning) return 3_000;
+			return 30_000;
+		},
 	});
 
 	const codexModelIds: string[] = settingsData?.codexModels ?? [];
 	const entries = status?.entries ?? [];
-	const availableEntries = entries.filter((entry) => !entry.disabled);
-	const unavailableEntries = entries.filter((entry) => entry.disabled);
+	const availableEntries = status?.availableEntries ?? [];
+	const unavailableEntries = status?.unavailableEntries ?? [];
+	const availableTotal = status?.availableTotal ?? 0;
+	const unavailableTotal = status?.unavailableTotal ?? 0;
 	const loadBalancingMode = status?.loadBalancingMode ?? "priority";
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
@@ -253,6 +263,10 @@ export function CodexSection({
 			});
 		},
 	});
+	const usageQueueClearMut = useMutation({
+		mutationFn: () => api.codexUsageQueueClear(),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
+	});
 
 	const toggleSelect = (id: string) => {
 		setSelectedIds((prev) => {
@@ -284,7 +298,7 @@ export function CodexSection({
 	};
 
 	const handleBrowserAuth = async () => {
-		const initialCount = entries.length;
+		const initialTotal = status?.total ?? 0;
 		setBrowserAuthLoading(true);
 		setBrowserAuthPending(true);
 
@@ -316,10 +330,13 @@ export function CodexSection({
 			// Monitor for new credentials
 			browserAuthIntervalRef.current = setInterval(() => {
 				qc.invalidateQueries({ queryKey: ["codex", "status"] });
-				const currentEntries =
-					qc.getQueryData<{ entries: unknown[] }>(["codex", "status"])?.entries ?? [];
+				// Check total from any cached codex status query
+				const queries = qc.getQueriesData<{ total?: number }>({
+					queryKey: ["codex", "status"],
+				});
+				const currentTotal = queries[0]?.[1]?.total ?? 0;
 
-				if (currentEntries.length > initialCount) {
+				if (currentTotal > initialTotal) {
 					cleanupBrowserAuth();
 					setBrowserAuthPending(false);
 					setBrowserAuthLoading(false);
@@ -647,10 +664,61 @@ export function CodexSection({
 							</Group>
 						</Stack>
 
+						{/* Usage fetch queue progress */}
+						{status?.usageQueue && status.usageQueue.items.length > 0 && (
+							<Paper withBorder p="sm">
+								<Stack gap="xs">
+									<Group justify="space-between">
+										<Text size="sm" fw={500}>
+											{t("codexUsageQueueTitle")}
+										</Text>
+										<Button
+											size="compact-xs"
+											variant="subtle"
+											onClick={() => usageQueueClearMut.mutate()}
+											loading={usageQueueClearMut.isPending}
+										>
+											{t("codexUsageQueueClear")}
+										</Button>
+									</Group>
+									{(() => {
+										const items = status?.usageQueue?.items ?? [];
+										const total = items.length;
+										const done = items.filter((i) => i.status === "done").length;
+										const failed = items.filter((i) => i.status === "failed").length;
+										const pending = items.filter(
+											(i) => i.status === "pending" || i.status === "processing",
+										).length;
+										const pct = total > 0 ? ((done + failed) / total) * 100 : 0;
+										return (
+											<>
+												<Progress
+													value={pct}
+													size="sm"
+													color={failed > 0 ? "orange" : "indigo"}
+													animated={status?.usageQueue?.isRunning ?? false}
+												/>
+												<Text size="xs" c="dimmed">
+													{pending > 0
+														? t("codexUsageQueueProgress", {
+																done,
+																total,
+																pending,
+																failed,
+															})
+														: t("codexUsageQueueDone")}
+												</Text>
+											</>
+										);
+									})()}
+								</Stack>
+							</Paper>
+						)}
+
 						{/* Credentials list (responsive: cards on mobile, table on desktop) */}
-						{entries.length > 0 && (
+						{(status?.total ?? 0) > 0 && (
 							<Stack gap="xs">
-								{availableEntries.length > 0 && (
+								{availableTotal > 0 && (
 									<Stack gap="xs">
 										<Group
 											justify="space-between"
@@ -684,13 +752,17 @@ export function CodexSection({
 													</Button>
 												)}
 												<Badge size="sm" color="green">
-													{availableEntries.length}
+													{availableTotal}
 												</Badge>
 											</Group>
 										</Group>
 										<Collapse in={availableExpanded}>
 											<CredentialList
 												entries={availableEntries}
+												totalEntries={availableTotal}
+												page={availablePage}
+												pageSize={PAGE_SIZE}
+												onPageChange={setAvailablePage}
 												currentId={status?.currentId}
 												usageCache={usageCache}
 												editingId={editingId}
@@ -713,7 +785,7 @@ export function CodexSection({
 									</Stack>
 								)}
 
-								{unavailableEntries.length > 0 && (
+								{unavailableTotal > 0 && (
 									<Stack gap="xs">
 										<Group
 											justify="space-between"
@@ -731,12 +803,16 @@ export function CodexSection({
 												</Text>
 											</Group>
 											<Badge size="sm" color="red">
-												{unavailableEntries.length}
+												{unavailableTotal}
 											</Badge>
 										</Group>
 										<Collapse in={unavailableExpanded}>
 											<CredentialList
 												entries={unavailableEntries}
+												totalEntries={unavailableTotal}
+												page={unavailablePage}
+												pageSize={PAGE_SIZE}
+												onPageChange={setUnavailablePage}
 												currentId={status?.currentId}
 												usageCache={usageCache}
 												editingId={editingId}
@@ -849,6 +925,10 @@ function CredentialList(props: {
 		lastUsedAt?: string;
 		expiresAt?: number;
 	}>;
+	totalEntries: number;
+	page: number;
+	pageSize: number;
+	onPageChange: (page: number) => void;
 	currentId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic usage cache structure
 	usageCache: Record<string, any>;
@@ -877,6 +957,10 @@ function CredentialList(props: {
 }) {
 	const {
 		entries,
+		totalEntries,
+		page,
+		pageSize,
+		onPageChange,
 		currentId,
 		usageCache,
 		editingId,
@@ -896,6 +980,8 @@ function CredentialList(props: {
 		t,
 	} = props;
 	const isMobile = useMediaQuery("(max-width: 768px)");
+	const { t: tSettings } = useTranslation("settings");
+	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
 
 	if (isMobile) {
 		return <CredentialCards {...props} />;
@@ -906,186 +992,202 @@ function CredentialList(props: {
 	const someSelected = entryIds.some((id) => selectedIds.has(id)) && !allSelected;
 
 	return (
-		<Table>
-			<Table.Thead>
-				<Table.Tr>
-					<Table.Th w={40}>
-						<Checkbox
-							size="xs"
-							checked={allSelected}
-							indeterminate={someSelected}
-							onChange={() => onToggleSelectAll(entryIds)}
-							aria-label={t("codexSelectAll")}
-						/>
-					</Table.Th>
-					<Table.Th>{t("codexColName")}</Table.Th>
-					<Table.Th>{t("codexColAccount")}</Table.Th>
-					<Table.Th>{t("codexColPriority")}</Table.Th>
-					<Table.Th>{t("codexColStatus")}</Table.Th>
-					<Table.Th>{t("codexColStats")}</Table.Th>
-					<Table.Th>{t("codexColUsage")}</Table.Th>
-					<Table.Th>{t("codexColLastUsed")}</Table.Th>
-					<Table.Th>{t("codexColActions")}</Table.Th>
-				</Table.Tr>
-			</Table.Thead>
-			<Table.Tbody>
-				{entries.map((entry) => {
-					const isEditing = editingId === entry.id;
-					const usage = usageCache[entry.id];
-					const isCurrent = entry.id === currentId;
-					return (
-						<Table.Tr key={entry.id}>
-							<Table.Td>
-								<Checkbox
-									size="xs"
-									checked={selectedIds.has(entry.id)}
-									onChange={() => onToggleSelect(entry.id)}
-								/>
-							</Table.Td>
-							<Table.Td>
-								{isEditing ? (
-									<TextInput
+		<Stack gap="xs">
+			<Table>
+				<Table.Thead>
+					<Table.Tr>
+						<Table.Th w={40}>
+							<Checkbox
+								size="xs"
+								checked={allSelected}
+								indeterminate={someSelected}
+								onChange={() => onToggleSelectAll(entryIds)}
+								aria-label={t("codexSelectAll")}
+							/>
+						</Table.Th>
+						<Table.Th>{t("codexColName")}</Table.Th>
+						<Table.Th>{t("codexColAccount")}</Table.Th>
+						<Table.Th>{t("codexColPriority")}</Table.Th>
+						<Table.Th>{t("codexColStatus")}</Table.Th>
+						<Table.Th>{t("codexColStats")}</Table.Th>
+						<Table.Th>{t("codexColUsage")}</Table.Th>
+						<Table.Th>{t("codexColLastUsed")}</Table.Th>
+						<Table.Th>{t("codexColActions")}</Table.Th>
+					</Table.Tr>
+				</Table.Thead>
+				<Table.Tbody>
+					{entries.map((entry) => {
+						const isEditing = editingId === entry.id;
+						const usage = usageCache[entry.id];
+						const isCurrent = entry.id === currentId;
+						return (
+							<Table.Tr key={entry.id}>
+								<Table.Td>
+									<Checkbox
 										size="xs"
-										value={editForm.displayName}
-										onChange={(e) => onEditFormChange({ ...editForm, displayName: e.target.value })}
-										placeholder={entry.accountId ?? entry.id}
+										checked={selectedIds.has(entry.id)}
+										onChange={() => onToggleSelect(entry.id)}
 									/>
-								) : (
-									<Text size="sm" fw={isCurrent ? 700 : 400}>
-										{entry.displayName || entry.accountId || entry.id.slice(0, 8)}
-									</Text>
-								)}
-							</Table.Td>
-							<Table.Td>
-								<Text size="xs" c="dimmed">
-									{entry.accountId?.slice(0, 12) ?? "-"}
-								</Text>
-							</Table.Td>
-							<Table.Td>
-								{isEditing ? (
-									<NumberInput
-										size="xs"
-										value={editForm.priority}
-										onChange={(v) => onEditFormChange({ ...editForm, priority: Number(v) })}
-										min={0}
-										max={100}
-										w={80}
-									/>
-								) : (
-									<Text size="sm">{entry.priority}</Text>
-								)}
-							</Table.Td>
-							<Table.Td>
-								{entry.disabled ? (
-									<Badge size="sm" color="red">
-										{entry.disabledReason || "Disabled"}
-									</Badge>
-								) : (
-									<Badge size="sm" color="green">
-										Active
-									</Badge>
-								)}
-							</Table.Td>
-							<Table.Td>
-								<Text size="xs">
-									✓ {entry.successCount} / ✗ {entry.failureCount}
-								</Text>
-							</Table.Td>
-							<Table.Td>
-								<UsageDisplay usage={usage} />
-							</Table.Td>
-							<Table.Td>
-								<Text size="xs" c="dimmed">
-									{relativeTime(entry.lastUsedAt)}
-								</Text>
-							</Table.Td>
-							<Table.Td>
-								<Group gap="xs">
+								</Table.Td>
+								<Table.Td>
 									{isEditing ? (
-										<>
-											<Tooltip label={t("codexSave")}>
-												<ActionIcon size="sm" color="green" onClick={onSaveEdit}>
-													<IconCheck size={16} />
-												</ActionIcon>
-											</Tooltip>
-											<Tooltip label={t("codexCancel")}>
-												<ActionIcon size="sm" color="gray" onClick={onCancelEdit}>
-													<IconX size={16} />
-												</ActionIcon>
-											</Tooltip>
-										</>
+										<TextInput
+											size="xs"
+											value={editForm.displayName}
+											onChange={(e) =>
+												onEditFormChange({ ...editForm, displayName: e.target.value })
+											}
+											placeholder={entry.accountId ?? entry.id}
+										/>
 									) : (
-										<>
-											<Tooltip label={t("codexEdit")}>
-												<ActionIcon size="sm" onClick={() => onEdit(entry)}>
-													<IconPencil size={16} />
-												</ActionIcon>
-											</Tooltip>
-
-											<Tooltip label={t("codexQueryUsage")}>
-												<ActionIcon
-													size="sm"
-													color="blue"
-													onClick={() => usageMut.mutate(entry.id)}
-													loading={usageMut.isPending}
-												>
-													<IconRefresh size={16} />
-												</ActionIcon>
-											</Tooltip>
-											{entry.disabled ? (
-												<Tooltip label={t("codexEnable")}>
-													<ActionIcon
-														size="sm"
-														color="green"
-														onClick={() => enableMut.mutate(entry.id)}
-													>
+										<Text size="sm" fw={isCurrent ? 700 : 400}>
+											{entry.displayName || entry.accountId || entry.id.slice(0, 8)}
+										</Text>
+									)}
+								</Table.Td>
+								<Table.Td>
+									<Text size="xs" c="dimmed">
+										{entry.accountId?.slice(0, 12) ?? "-"}
+									</Text>
+								</Table.Td>
+								<Table.Td>
+									{isEditing ? (
+										<NumberInput
+											size="xs"
+											value={editForm.priority}
+											onChange={(v) => onEditFormChange({ ...editForm, priority: Number(v) })}
+											min={0}
+											max={100}
+											w={80}
+										/>
+									) : (
+										<Text size="sm">{entry.priority}</Text>
+									)}
+								</Table.Td>
+								<Table.Td>
+									{entry.disabled ? (
+										<Badge size="sm" color="red">
+											{entry.disabledReason || "Disabled"}
+										</Badge>
+									) : (
+										<Badge size="sm" color="green">
+											Active
+										</Badge>
+									)}
+								</Table.Td>
+								<Table.Td>
+									<Text size="xs">
+										✓ {entry.successCount} / ✗ {entry.failureCount}
+									</Text>
+								</Table.Td>
+								<Table.Td>
+									<UsageDisplay usage={usage} />
+								</Table.Td>
+								<Table.Td>
+									<Text size="xs" c="dimmed">
+										{relativeTime(entry.lastUsedAt)}
+									</Text>
+								</Table.Td>
+								<Table.Td>
+									<Group gap="xs">
+										{isEditing ? (
+											<>
+												<Tooltip label={t("codexSave")}>
+													<ActionIcon size="sm" color="green" onClick={onSaveEdit}>
 														<IconCheck size={16} />
 													</ActionIcon>
 												</Tooltip>
-											) : (
-												<Tooltip label={t("codexDisable")}>
-													<ActionIcon
-														size="sm"
-														color="orange"
-														onClick={() => disableMut.mutate(entry.id)}
-													>
+												<Tooltip label={t("codexCancel")}>
+													<ActionIcon size="sm" color="gray" onClick={onCancelEdit}>
 														<IconX size={16} />
 													</ActionIcon>
 												</Tooltip>
-											)}
-											{entry.failureCount > 0 && (
-												<Tooltip label={t("codexReset")}>
+											</>
+										) : (
+											<>
+												<Tooltip label={t("codexEdit")}>
+													<ActionIcon size="sm" onClick={() => onEdit(entry)}>
+														<IconPencil size={16} />
+													</ActionIcon>
+												</Tooltip>
+
+												<Tooltip label={t("codexQueryUsage")}>
 													<ActionIcon
 														size="sm"
 														color="blue"
-														onClick={() => resetMut.mutate(entry.id)}
+														onClick={() => usageMut.mutate(entry.id)}
+														loading={usageMut.isPending}
 													>
-														<IconDeviceFloppy size={16} />
+														<IconRefresh size={16} />
 													</ActionIcon>
 												</Tooltip>
-											)}
-											<Tooltip label={t("codexDelete")}>
-												<ActionIcon
-													size="sm"
-													color="red"
-													onClick={() => {
-														if (confirm(t("codexDeleteConfirm"))) {
-															deleteMut.mutate(entry.id);
-														}
-													}}
-												>
-													<IconTrash size={16} />
-												</ActionIcon>
-											</Tooltip>
-										</>
-									)}
-								</Group>
-							</Table.Td>
-						</Table.Tr>
-					);
-				})}
-			</Table.Tbody>
-		</Table>
+												{entry.disabled ? (
+													<Tooltip label={t("codexEnable")}>
+														<ActionIcon
+															size="sm"
+															color="green"
+															onClick={() => enableMut.mutate(entry.id)}
+														>
+															<IconCheck size={16} />
+														</ActionIcon>
+													</Tooltip>
+												) : (
+													<Tooltip label={t("codexDisable")}>
+														<ActionIcon
+															size="sm"
+															color="orange"
+															onClick={() => disableMut.mutate(entry.id)}
+														>
+															<IconX size={16} />
+														</ActionIcon>
+													</Tooltip>
+												)}
+												{entry.failureCount > 0 && (
+													<Tooltip label={t("codexReset")}>
+														<ActionIcon
+															size="sm"
+															color="blue"
+															onClick={() => resetMut.mutate(entry.id)}
+														>
+															<IconDeviceFloppy size={16} />
+														</ActionIcon>
+													</Tooltip>
+												)}
+												<Tooltip label={t("codexDelete")}>
+													<ActionIcon
+														size="sm"
+														color="red"
+														onClick={() => {
+															if (confirm(t("codexDeleteConfirm"))) {
+																deleteMut.mutate(entry.id);
+															}
+														}}
+													>
+														<IconTrash size={16} />
+													</ActionIcon>
+												</Tooltip>
+											</>
+										)}
+									</Group>
+								</Table.Td>
+							</Table.Tr>
+						);
+					})}
+				</Table.Tbody>
+			</Table>
+			{totalPages > 1 && (
+				<Group justify="center">
+					<Pagination size="sm" total={totalPages} value={page} onChange={onPageChange} />
+					<Text size="xs" c="dimmed">
+						{tSettings("codexPageInfo", {
+							current: page,
+							total: totalPages,
+							count: totalEntries,
+						})}
+					</Text>
+				</Group>
+			)}
+		</Stack>
 	);
 }
 
@@ -1103,6 +1205,10 @@ function CredentialCards(props: {
 		lastUsedAt?: string;
 		expiresAt?: number;
 	}>;
+	totalEntries: number;
+	page: number;
+	pageSize: number;
+	onPageChange: (page: number) => void;
 	currentId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic usage cache structure
 	usageCache: Record<string, any>;
@@ -1130,6 +1236,10 @@ function CredentialCards(props: {
 }) {
 	const {
 		entries,
+		totalEntries,
+		page,
+		pageSize,
+		onPageChange,
 		currentId,
 		usageCache,
 		editingId,
@@ -1147,6 +1257,9 @@ function CredentialCards(props: {
 		onToggleSelect,
 		t,
 	} = props;
+
+	const { t: tSettings } = useTranslation("settings");
+	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
 
 	return (
 		<Stack gap="xs">
@@ -1346,6 +1459,18 @@ function CredentialCards(props: {
 					</Paper>
 				);
 			})}
+			{totalPages > 1 && (
+				<Group justify="center">
+					<Pagination size="sm" total={totalPages} value={page} onChange={onPageChange} />
+					<Text size="xs" c="dimmed">
+						{tSettings("codexPageInfo", {
+							current: page,
+							total: totalPages,
+							count: totalEntries,
+						})}
+					</Text>
+				</Group>
+			)}
 		</Stack>
 	);
 }

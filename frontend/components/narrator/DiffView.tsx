@@ -380,23 +380,25 @@ export const DiffView = memo(function DiffView({
 
 	return (
 		<Box style={style}>
-			{lines.map((line, i) => {
-				const key = `${line.type}-${i}`;
-				return (
-					<DiffLineRow
-						key={key}
-						line={line}
-						tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
-						diffStyles={diffStyles}
-						lineNoWidth={lineNoWidth}
-					/>
-				);
-			})}
-			{truncated && (
-				<div style={{ textAlign: "center", opacity: 0.6, paddingTop: 4 }}>
-					... diff truncated at {MAX_DIFF_LINES} lines ...
-				</div>
-			)}
+			<div style={wordWrap ? undefined : { minWidth: "fit-content" }}>
+				{lines.map((line, i) => {
+					const key = `${line.type}-${i}`;
+					return (
+						<DiffLineRow
+							key={key}
+							line={line}
+							tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
+							diffStyles={diffStyles}
+							lineNoWidth={lineNoWidth}
+						/>
+					);
+				})}
+				{truncated && (
+					<div style={{ textAlign: "center", opacity: 0.6, paddingTop: 4 }}>
+						... diff truncated at {MAX_DIFF_LINES} lines ...
+					</div>
+				)}
+			</div>
 		</Box>
 	);
 });

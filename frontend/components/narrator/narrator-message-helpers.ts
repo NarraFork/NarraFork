@@ -97,21 +97,23 @@ export function resolvePendingPerm(
 	tc: ToolCallData,
 	wsPerm: PendingPermission | null | undefined,
 	wsPermsMap?: Map<string, PendingPermission>,
+	overseerReviewMap?: Map<string, "reviewing" | "queued">,
 ): PendingPermission | null {
 	// Prefer WS-sourced permissions — they carry the full (untruncated) inputJson.
 	// The message-list API truncates large inputJson, so building from tc.inputJson
 	// would lose data (e.g. ExitPlanMode plan text).
+	let perm: PendingPermission | null = null;
 	if (wsPermsMap && tc.toolUseId) {
 		const fromMap = wsPermsMap.get(tc.toolUseId);
-		if (fromMap) return fromMap;
+		if (fromMap) perm = fromMap;
 	}
-	if (wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
-		return wsPerm;
+	if (!perm && wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
+		perm = wsPerm;
 	}
 	// Fallback: build from the tool call record itself (status-driven path,
 	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
-	if (tc.status === "pending" && tc.toolUseId) {
-		return {
+	if (!perm && tc.status === "pending" && tc.toolUseId) {
+		perm = {
 			id: tc.id ?? tc.toolUseId,
 			toolName: tc.toolName,
 			toolUseId: tc.toolUseId,
@@ -120,7 +122,11 @@ export function resolvePendingPerm(
 			suggestions: tc.permissionSuggestions ?? undefined,
 		};
 	}
-	return null;
+	// Attach overseer review status if available
+	if (perm && tc.toolUseId && overseerReviewMap?.has(tc.toolUseId)) {
+		return { ...perm, overseerStatus: overseerReviewMap.get(tc.toolUseId) };
+	}
+	return perm;
 }
 
 export function filterChildrenByToolUse(

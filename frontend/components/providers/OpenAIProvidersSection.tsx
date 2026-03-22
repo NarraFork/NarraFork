@@ -62,6 +62,7 @@ export function OpenAIProvidersSection({
 }: OpenAIProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const [sectionExpanded, setSectionExpanded] = useState(false);
 	const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 
@@ -133,211 +134,236 @@ export function OpenAIProvidersSection({
 	return (
 		<Paper withBorder p="md">
 			<Stack>
-				<Group justify="space-between">
-					<div>
-						<Title order={4}>{t("openaiProvidersSection")}</Title>
-						<Text size="xs" c="dimmed">
-							{t("openaiProvidersSectionDesc")}
-						</Text>
-					</div>
+				<Group
+					justify="space-between"
+					style={{ cursor: "pointer" }}
+					onClick={() => setSectionExpanded((v) => !v)}
+				>
+					<Group gap="xs">
+						{sectionExpanded ? <IconChevronDown size={20} /> : <IconChevronRight size={20} />}
+						<div>
+							<Title order={4}>{t("openaiProvidersSection")}</Title>
+							<Text size="xs" c="dimmed">
+								{t("openaiProvidersSectionDesc")}
+							</Text>
+						</div>
+					</Group>
 					<Button
 						size="xs"
 						variant="light"
 						leftSection={<IconPlus size={14} />}
-						onClick={handleAddProvider}
+						onClick={(e) => {
+							e.stopPropagation();
+							setSectionExpanded(true);
+							handleAddProvider();
+						}}
 					>
 						{t("openaiAddProvider")}
 					</Button>
 				</Group>
-				{providers.map((p, idx) => {
-					const isExpanded = expandedProviders.has(p.id);
-					const pModels = providerModelsMap[p.id] ?? [];
-					const providerModelCount = pModels.length;
-					return (
-						<Paper key={p.id} withBorder p="sm">
-							<Stack gap="xs">
-								<Group
-									justify="space-between"
-									style={{ cursor: "pointer" }}
-									onClick={() => toggleProviderExpanded(p.id)}
-								>
-									<Group gap="xs">
-										{isExpanded ? <IconChevronDown size={16} /> : <IconChevronRight size={16} />}
-										<Text fw={500} size="sm">
-											{p.name || `Provider #${idx + 1}`}
-										</Text>
-										{providerModelCount > 0 && (
-											<Badge size="xs" variant="light">
-												{t("openaiModelsCount", { count: providerModelCount })}
-											</Badge>
-										)}
-									</Group>
-									<ActionIcon
-										color="red"
-										variant="subtle"
-										size="sm"
-										onClick={(e) => {
-											e.stopPropagation();
-											handleRemoveProvider(p.id);
-										}}
-									>
-										<IconTrash size={14} />
-									</ActionIcon>
-								</Group>
-								<Collapse in={isExpanded}>
-									<Stack gap="xs" mt="xs">
-										<TextInput
-											label={t("openaiProviderName")}
-											placeholder={t("openaiProviderNamePlaceholder")}
-											value={p.name}
-											onChange={(e) => updateProvider(p.id, "name", e.currentTarget.value)}
-										/>
-										<TextInput
-											label={t("openaiProviderPrefix")}
-											description={t("openaiProviderPrefixDesc")}
-											placeholder={t("openaiProviderPrefixPlaceholder")}
-											value={p.prefix}
-											onChange={(e) =>
-												updateProvider(
-													p.id,
-													"prefix",
-													e.currentTarget.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""),
-												)
-											}
-										/>
-										<PasswordInput
-											label={t("openaiApiKey")}
-											placeholder={t("openaiApiKeyPlaceholder")}
-											value={p.apiKey}
-											onChange={(e) => updateProvider(p.id, "apiKey", e.currentTarget.value)}
-										/>
-										<TextInput
-											label={t("openaiBaseUrl")}
-											placeholder={t("openaiBaseUrlPlaceholder")}
-											value={p.baseUrl}
-											onChange={(e) => updateProvider(p.id, "baseUrl", e.currentTarget.value)}
-										/>
-										<Stack gap={4}>
-											<Text size="sm" fw={500}>
-												{t("openaiApiMode")}
-											</Text>
-											<Text size="xs" c="dimmed">
-												{t("openaiApiModeDesc")}
-											</Text>
-											<SegmentedControl
-												value={p.apiMode}
-												onChange={(v) => updateProvider(p.id, "apiMode", v)}
-												data={[
-													{ label: t("openaiApiModeResponses"), value: "responses" },
-													{ label: t("openaiApiModeCompletions"), value: "completions" },
-													{ label: t("openaiApiModeCodex"), value: "codex" },
-												]}
-											/>
-										</Stack>
-										{p.apiMode === "codex" && (
-											<TextInput
-												label={t("openaiCodexAccountId")}
-												description={t("openaiCodexAccountIdDesc")}
-												placeholder={t("openaiCodexAccountIdPlaceholder")}
-												value={p.codexAccountId}
-												onChange={(e) =>
-													updateProvider(p.id, "codexAccountId", e.currentTarget.value)
-												}
-											/>
-										)}
-										<Group gap="xs">
-											<Button
-												size="xs"
-												variant="light"
-												leftSection={<IconRefresh size={14} />}
-												loading={refreshingProvider === p.id}
-												disabled={!p.apiKey}
-												onClick={() => handleRefreshProviderModels(p.id)}
-											>
-												{refreshingProvider === p.id
-													? t("openaiRefreshModelsLoading")
-													: t("openaiRefreshModels")}
-											</Button>
-											{providerModelCount > 0 && (
-												<Text size="xs" c="dimmed">
-													{t("openaiModelsCount", { count: providerModelCount })}
+				<Collapse in={sectionExpanded}>
+					<Stack>
+						{providers.map((p, idx) => {
+							const isExpanded = expandedProviders.has(p.id);
+							const pModels = providerModelsMap[p.id] ?? [];
+							const providerModelCount = pModels.length;
+							return (
+								<Paper key={p.id} withBorder p="sm">
+									<Stack gap="xs">
+										<Group
+											justify="space-between"
+											style={{ cursor: "pointer" }}
+											onClick={() => toggleProviderExpanded(p.id)}
+										>
+											<Group gap="xs">
+												{isExpanded ? (
+													<IconChevronDown size={16} />
+												) : (
+													<IconChevronRight size={16} />
+												)}
+												<Text fw={500} size="sm">
+													{p.name || `Provider #${idx + 1}`}
 												</Text>
-											)}
+												{providerModelCount > 0 && (
+													<Badge size="xs" variant="light">
+														{t("openaiModelsCount", { count: providerModelCount })}
+													</Badge>
+												)}
+											</Group>
+											<ActionIcon
+												color="red"
+												variant="subtle"
+												size="sm"
+												onClick={(e) => {
+													e.stopPropagation();
+													handleRemoveProvider(p.id);
+												}}
+											>
+												<IconTrash size={14} />
+											</ActionIcon>
 										</Group>
-										{pModels.length > 0 &&
-											(() => {
-												const allHidden = pModels.every((m) => hiddenModels.includes(m.value));
-												return (
-													<Stack gap="xs" mt="xs">
-														<Group gap="xs" justify="flex-end">
-															<Tooltip label={allHidden ? t("showAllModels") : t("hideAllModels")}>
-																<ActionIcon
-																	variant="subtle"
-																	color={allHidden ? "gray" : "blue"}
-																	onClick={() =>
-																		onBatchToggleHidden(
-																			pModels.map((m) => m.value),
-																			!allHidden,
-																		)
-																	}
-																>
-																	{allHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-																</ActionIcon>
-															</Tooltip>
-														</Group>
-														{pModels.map((m) => {
-															const isHidden = hiddenModels.includes(m.value);
-															return (
-																<Group
-																	key={m.value}
-																	gap="xs"
-																	style={isHidden ? { opacity: 0.5 } : undefined}
-																>
-																	<TextInput value={m.value} disabled style={{ flex: 1 }} />
-																	<TextInput value={m.label} disabled style={{ flex: 1 }} />
-																	<NumberInput
-																		placeholder={t("contextWindowPlaceholder")}
-																		value={modelContextWindows[m.value] || ""}
-																		onChange={(v) =>
-																			onContextWindowChange(
-																				m.value,
-																				typeof v === "number" ? v : null,
-																			)
-																		}
-																		min={1}
-																		step={1000}
-																		suffix={` ${t("contextWindowSuffix")}`}
-																		w={180}
-																		size="xs"
-																	/>
-																	<ActionIcon
-																		variant="subtle"
-																		color={isHidden ? "gray" : "blue"}
-																		onClick={() => onToggleHidden(m.value)}
+										<Collapse in={isExpanded}>
+											<Stack gap="xs" mt="xs">
+												<TextInput
+													label={t("openaiProviderName")}
+													placeholder={t("openaiProviderNamePlaceholder")}
+													value={p.name}
+													onChange={(e) => updateProvider(p.id, "name", e.currentTarget.value)}
+												/>
+												<TextInput
+													label={t("openaiProviderPrefix")}
+													description={t("openaiProviderPrefixDesc")}
+													placeholder={t("openaiProviderPrefixPlaceholder")}
+													value={p.prefix}
+													onChange={(e) =>
+														updateProvider(
+															p.id,
+															"prefix",
+															e.currentTarget.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""),
+														)
+													}
+												/>
+												<PasswordInput
+													label={t("openaiApiKey")}
+													placeholder={t("openaiApiKeyPlaceholder")}
+													value={p.apiKey}
+													onChange={(e) => updateProvider(p.id, "apiKey", e.currentTarget.value)}
+												/>
+												<TextInput
+													label={t("openaiBaseUrl")}
+													placeholder={t("openaiBaseUrlPlaceholder")}
+													value={p.baseUrl}
+													onChange={(e) => updateProvider(p.id, "baseUrl", e.currentTarget.value)}
+												/>
+												<Stack gap={4}>
+													<Text size="sm" fw={500}>
+														{t("openaiApiMode")}
+													</Text>
+													<Text size="xs" c="dimmed">
+														{t("openaiApiModeDesc")}
+													</Text>
+													<SegmentedControl
+														value={p.apiMode}
+														onChange={(v) => updateProvider(p.id, "apiMode", v)}
+														data={[
+															{ label: t("openaiApiModeResponses"), value: "responses" },
+															{ label: t("openaiApiModeCompletions"), value: "completions" },
+															{ label: t("openaiApiModeCodex"), value: "codex" },
+														]}
+													/>
+												</Stack>
+												{p.apiMode === "codex" && (
+													<TextInput
+														label={t("openaiCodexAccountId")}
+														description={t("openaiCodexAccountIdDesc")}
+														placeholder={t("openaiCodexAccountIdPlaceholder")}
+														value={p.codexAccountId}
+														onChange={(e) =>
+															updateProvider(p.id, "codexAccountId", e.currentTarget.value)
+														}
+													/>
+												)}
+												<Group gap="xs">
+													<Button
+														size="xs"
+														variant="light"
+														leftSection={<IconRefresh size={14} />}
+														loading={refreshingProvider === p.id}
+														disabled={!p.apiKey}
+														onClick={() => handleRefreshProviderModels(p.id)}
+													>
+														{refreshingProvider === p.id
+															? t("openaiRefreshModelsLoading")
+															: t("openaiRefreshModels")}
+													</Button>
+													{providerModelCount > 0 && (
+														<Text size="xs" c="dimmed">
+															{t("openaiModelsCount", { count: providerModelCount })}
+														</Text>
+													)}
+												</Group>
+												{pModels.length > 0 &&
+													(() => {
+														const allHidden = pModels.every((m) => hiddenModels.includes(m.value));
+														return (
+															<Stack gap="xs" mt="xs">
+																<Group gap="xs" justify="flex-end">
+																	<Tooltip
+																		label={allHidden ? t("showAllModels") : t("hideAllModels")}
 																	>
-																		{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-																	</ActionIcon>
+																		<ActionIcon
+																			variant="subtle"
+																			color={allHidden ? "gray" : "blue"}
+																			onClick={() =>
+																				onBatchToggleHidden(
+																					pModels.map((m) => m.value),
+																					!allHidden,
+																				)
+																			}
+																		>
+																			{allHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+																		</ActionIcon>
+																	</Tooltip>
 																</Group>
-															);
-														})}
-													</Stack>
-												);
-											})()}
-										<InlineCustomModels
-											prefix={p.prefix || "openai"}
-											customModels={customModels}
-											onCustomModelsChange={onCustomModelsChange}
-											hiddenModels={hiddenModels}
-											onToggleHidden={onToggleHidden}
-											modelContextWindows={modelContextWindows}
-											onContextWindowChange={onContextWindowChange}
-										/>
+																{pModels.map((m) => {
+																	const isHidden = hiddenModels.includes(m.value);
+																	return (
+																		<Group
+																			key={m.value}
+																			gap="xs"
+																			style={isHidden ? { opacity: 0.5 } : undefined}
+																		>
+																			<TextInput value={m.value} disabled style={{ flex: 1 }} />
+																			<TextInput value={m.label} disabled style={{ flex: 1 }} />
+																			<NumberInput
+																				placeholder={t("contextWindowPlaceholder")}
+																				value={modelContextWindows[m.value] || ""}
+																				onChange={(v) =>
+																					onContextWindowChange(
+																						m.value,
+																						typeof v === "number" ? v : null,
+																					)
+																				}
+																				min={1}
+																				step={1000}
+																				suffix={` ${t("contextWindowSuffix")}`}
+																				w={180}
+																				size="xs"
+																			/>
+																			<ActionIcon
+																				variant="subtle"
+																				color={isHidden ? "gray" : "blue"}
+																				onClick={() => onToggleHidden(m.value)}
+																			>
+																				{isHidden ? (
+																					<IconEyeOff size={16} />
+																				) : (
+																					<IconEye size={16} />
+																				)}
+																			</ActionIcon>
+																		</Group>
+																	);
+																})}
+															</Stack>
+														);
+													})()}
+												<InlineCustomModels
+													prefix={p.prefix || "openai"}
+													customModels={customModels}
+													onCustomModelsChange={onCustomModelsChange}
+													hiddenModels={hiddenModels}
+													onToggleHidden={onToggleHidden}
+													modelContextWindows={modelContextWindows}
+													onContextWindowChange={onContextWindowChange}
+												/>
+											</Stack>
+										</Collapse>
 									</Stack>
-								</Collapse>
-							</Stack>
-						</Paper>
-					);
-				})}
+								</Paper>
+							);
+						})}
+					</Stack>
+				</Collapse>
 			</Stack>
 		</Paper>
 	);

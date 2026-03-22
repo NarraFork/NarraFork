@@ -70,6 +70,7 @@ export interface PendingPermission {
 	inputJson: unknown;
 	decisionReason?: string;
 	suggestions?: unknown[];
+	overseerStatus?: "reviewing" | "queued";
 }
 
 export interface PermissionCallbacks {
@@ -86,6 +87,7 @@ export interface PermissionCallbacks {
 	onQuestionDeny: (requestId: string) => void;
 	onBgAgentRetry?: (toolUseId: string) => void;
 	bgRetryDismissedIds: Set<string>;
+	overseerReviewMap: Map<string, "reviewing" | "queued">;
 }
 
 export type FlatToolItem =

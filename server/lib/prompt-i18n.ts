@@ -324,6 +324,90 @@ ${diffContext}
 \`\`\``;
 }
 
+// --- Overseer narrator prompts ---
+
+export type OverseerScope = "global" | "project";
+
+const overseerScopeDescs: Record<
+	OverseerScope,
+	Record<Locale, (projectName?: string) => string>
+> = {
+	global: {
+		en: () => "You are a Global Overseer — you supervise all Narrators across all projects.",
+		"zh-CN": () => "你是全局监察者 — 你监管所有项目中的所有叙述者。",
+	},
+	project: {
+		en: (projectName) =>
+			`You are a Project Overseer for "${projectName ?? "Unknown"}" — you supervise all Narrators within this project.`,
+		"zh-CN": (projectName) =>
+			`你是项目「${projectName ?? "未知"}」的监察者 — 你监管该项目内的所有叙述者。`,
+	},
+};
+
+const overseerBasePrompts: Record<Locale, (scopeDesc: string) => string> = {
+	en: (scopeDesc) =>
+		`You are an Overseer — a supervisory AI that monitors and manages other Narrators within your jurisdiction.
+
+${scopeDesc}
+
+When you receive a permission request from a managed Narrator, analyze:
+1. What tool is being called and with what parameters
+2. Whether the operation is safe and appropriate given the Narrator's task context
+3. Any potential risks (destructive file operations, dangerous commands, etc.)
+
+Then use ApprovePermission or DenyPermission to make your decision promptly.
+If you're unsure about safety, prefer to deny with a clear explanation.
+
+You can also use ListManagedNarrators to see all Narrators under your jurisdiction,
+and GetNarratorContext to read a Narrator's recent conversation for more context.`,
+	"zh-CN": (scopeDesc) =>
+		`你是一个监察者 — 一个监督和管理你管辖范围内其他叙述者的 AI。
+
+${scopeDesc}
+
+当你收到被管理叙述者的权限请求时，请分析：
+1. 正在调用什么工具，使用了什么参数
+2. 该操作在叙述者的任务上下文中是否安全和适当
+3. 任何潜在风险（破坏性文件操作、危险命令等）
+
+然后使用 ApprovePermission 或 DenyPermission 及时做出决定。
+如果你对安全性不确定，倾向于拒绝并给出清晰的解释。
+
+你还可以使用 ListManagedNarrators 查看你管辖范围内的所有叙述者，
+以及使用 GetNarratorContext 阅读叙述者的近期对话以获取更多上下文。`,
+};
+
+/**
+ * Build the full system prompt for an overseer narrator.
+ */
+export function buildOverseerSystemPrompt(
+	scope: OverseerScope,
+	locale: Locale = "en",
+	projectName?: string,
+): string {
+	const scopeDescFn = overseerScopeDescs[scope][locale] ?? overseerScopeDescs[scope].en;
+	const scopeDesc = scopeDescFn(projectName);
+	const baseFn = overseerBasePrompts[locale] ?? overseerBasePrompts.en;
+	return baseFn(scopeDesc);
+}
+
+const overseerTitles: Record<OverseerScope, Record<Locale, string>> = {
+	global: { en: "Global Overseer", "zh-CN": "全局监察者" },
+	project: { en: "Overseer: {projectName}", "zh-CN": "监察者：{projectName}" },
+};
+
+/**
+ * Get a localized overseer title.
+ */
+export function getOverseerTitle(
+	scope: OverseerScope,
+	locale: Locale = "en",
+	projectName?: string,
+): string {
+	const template = overseerTitles[scope][locale] ?? overseerTitles[scope].en;
+	return template.replace("{projectName}", projectName ?? "Project");
+}
+
 /**
  * Get the language preference for a user from the database.
  * Returns "en" as default if no preference is set.
@@ -534,6 +618,48 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		en: '[The optional tool "{toolName}" has just been loaded into this session. {toolDescription}. You can now use this tool when appropriate.]',
 		"zh-CN":
 			'[可选工具 "{toolName}" 刚刚被加载到本次会话中。{toolDescription}。你现在可以在合适的时候使用这个工具。]',
+	},
+	// --- Overseer tool messages ---
+	overseerPermissionRequestText: {
+		en: "A Narrator under your jurisdiction needs a permission decision.\n\nRequest ID: {requestId}\nNarrator: {narratorTitle} (id: {narratorId})\nTool: {toolName}\nTool Use ID: {toolUseId}\nInput:\n```json\n{inputSummary}\n```\n\nPlease review this request and use ApprovePermission or DenyPermission to make your decision.",
+		"zh-CN":
+			"你管辖范围内的一个叙述者需要权限决策。\n\nRequest ID: {requestId}\n叙述者: {narratorTitle} (id: {narratorId})\n工具: {toolName}\nTool Use ID: {toolUseId}\n输入:\n```json\n{inputSummary}\n```\n\n请审查此请求，并使用 ApprovePermission 或 DenyPermission 做出决定。",
+	},
+	overseerNotAnOverseer: {
+		en: "Error: This narrator is not an overseer.",
+		"zh-CN": "错误：此叙述者不是监察者。",
+	},
+	overseerPermissionApproved: {
+		en: "Permission request {requestId} approved.{feedback}",
+		"zh-CN": "权限请求 {requestId} 已批准。{feedback}",
+	},
+	overseerPermissionDenied: {
+		en: "Permission request {requestId} denied.{reason}",
+		"zh-CN": "权限请求 {requestId} 已拒绝。{reason}",
+	},
+	overseerPermissionAlreadyResolved: {
+		en: "Permission request {requestId} was already resolved (likely by the user).",
+		"zh-CN": "权限请求 {requestId} 已被解决（可能由用户处理）。",
+	},
+	overseerDefaultDenyMessage: {
+		en: "Denied by Overseer",
+		"zh-CN": "被监察者拒绝",
+	},
+	overseerNoManagedNarrators: {
+		en: "No narrators currently under your jurisdiction.",
+		"zh-CN": "当前你的管辖范围内没有叙述者。",
+	},
+	overseerManagedNarratorsHeader: {
+		en: "Managed narrators ({count}):",
+		"zh-CN": "被管理的叙述者（{count}）：",
+	},
+	overseerNoMessages: {
+		en: "No messages found for this narrator.",
+		"zh-CN": "未找到该叙述者的消息。",
+	},
+	overseerRecentMessagesHeader: {
+		en: "Recent messages from narrator {narratorId} ({count}):",
+		"zh-CN": "叙述者 {narratorId} 的近期消息（{count}）：",
 	},
 } satisfies Record<string, Record<Locale, string>>;
 

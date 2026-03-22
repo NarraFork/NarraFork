@@ -49,6 +49,46 @@ async function request<T>(
 	return response.json();
 }
 
+// --- Codex shared types ---
+
+interface CodexUsageWindow {
+	used_percent: number;
+	remaining_percent: number;
+	reset_at: number;
+	reset_after_seconds: number;
+	window_type: "5h" | "weekly" | "unknown";
+}
+
+interface CodexUsageData {
+	plan_type: string;
+	primary_window?: CodexUsageWindow;
+	secondary_window?: CodexUsageWindow;
+	code_review?: {
+		used_percent: number;
+		remaining_percent: number;
+		reset_at: number;
+		reset_after_seconds: number;
+	};
+	queriedAt: string;
+}
+
+interface CodexCredentialEntry {
+	id: string;
+	displayName?: string;
+	accountId?: string;
+	email?: string;
+	priority: number;
+	disabled: boolean;
+	disabledReason?: string;
+	successCount: number;
+	failureCount: number;
+	lastUsedAt?: string;
+	expiresAt?: number;
+	usage?: CodexUsageData;
+}
+
+// --- Content block types ---
+
 export interface BaseContentBlock {
 	type: string;
 	text?: string;
@@ -493,8 +533,7 @@ export const api = {
 		request<ApiEntity>(`/narrators/${id}/archive`, { method: "PATCH" }),
 	unarchiveNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/unarchive`, { method: "PATCH" }),
-	deleteNarrator: (id: string) =>
-		request<ApiEntity>(`/narrators/${id}`, { method: "DELETE" }),
+	deleteNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`, { method: "DELETE" }),
 	markNarratorRead: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
 	getNarratorMessages: (
@@ -1629,45 +1668,22 @@ export const api = {
 			{ method: "POST" },
 		),
 	// Codex credential pool management
-	codexStatus: () =>
-		request<{
-			entries: Array<{
-				id: string;
-				displayName?: string;
-				accountId?: string;
-				email?: string;
-				priority: number;
-				disabled: boolean;
-				disabledReason?: string;
-				successCount: number;
-				failureCount: number;
-				lastUsedAt?: string;
-				expiresAt?: number;
-				usage?: {
-					plan_type: string;
-					primary_window?: {
-						used_percent: number;
-						remaining_percent: number;
-						reset_at: number;
-						reset_after_seconds: number;
-						window_type: "5h" | "weekly" | "unknown";
-					};
-					secondary_window?: {
-						used_percent: number;
-						remaining_percent: number;
-						reset_at: number;
-						reset_after_seconds: number;
-						window_type: "5h" | "weekly" | "unknown";
-					};
-					code_review?: {
-						used_percent: number;
-						remaining_percent: number;
-						reset_at: number;
-						reset_after_seconds: number;
-					};
-					queriedAt: string;
-				};
-			}>;
+	codexStatus: (params?: {
+		availablePage?: number;
+		unavailablePage?: number;
+		pageSize?: number;
+	}) => {
+		const qs = new URLSearchParams();
+		if (params?.availablePage) qs.set("availablePage", String(params.availablePage));
+		if (params?.unavailablePage) qs.set("unavailablePage", String(params.unavailablePage));
+		if (params?.pageSize) qs.set("pageSize", String(params.pageSize));
+		const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+		return request<{
+			entries: CodexCredentialEntry[];
+			availableEntries: CodexCredentialEntry[];
+			unavailableEntries: CodexCredentialEntry[];
+			availableTotal: number;
+			unavailableTotal: number;
 			currentId: string;
 			loadBalancingMode: "priority" | "balanced";
 			total: number;
@@ -1676,34 +1692,21 @@ export const api = {
 			globalProxy?: string;
 			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 			lastBrowserAuthError?: string;
-			usageCache: Record<
-				string,
-				{
-					plan_type: string;
-					primary_window?: {
-						used_percent: number;
-						remaining_percent: number;
-						reset_at: number;
-						reset_after_seconds: number;
-						window_type: "5h" | "weekly" | "unknown";
-					};
-					secondary_window?: {
-						used_percent: number;
-						remaining_percent: number;
-						reset_at: number;
-						reset_after_seconds: number;
-						window_type: "5h" | "weekly" | "unknown";
-					};
-					code_review?: {
-						used_percent: number;
-						remaining_percent: number;
-						reset_at: number;
-						reset_after_seconds: number;
-					};
-					queriedAt: string;
-				}
-			>;
-		}>("/codex/status"),
+			usageCache: Record<string, CodexUsageData>;
+			usageQueue?: {
+				items: Array<{
+					id: string;
+					credentialId: string;
+					status: "pending" | "processing" | "done" | "failed";
+					error?: string;
+					addedAt: number;
+					startedAt?: number;
+					finishedAt?: number;
+				}>;
+				isRunning: boolean;
+			};
+		}>(`/codex/status${suffix}`);
+	},
 	codexBrowserAuth: () =>
 		request<{ authorizeUrl: string }>("/codex/auth/browser", {
 			method: "POST",
@@ -1810,6 +1813,8 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ credentials }),
 		}),
+	codexUsageQueueClear: () =>
+		request<{ ok: boolean }>("/codex/usage-queue/clear", { method: "POST" }),
 	// Anthropic models
 	anthropicRefreshProviderModels: (providerId: string) =>
 		request<{

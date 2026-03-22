@@ -143,6 +143,8 @@ interface ActiveNarrator {
 	/** Soft-stop flag: set when user approves a permission with feedbackText.
 	 *  The agent loop checks this via shouldStop() after tools complete. */
 	_feedbackSoftStop?: boolean;
+	/** Whether the agent loop is currently running for this narrator. */
+	_loopRunning?: boolean;
 }
 
 // Use globalThis to survive Bun --hot reloads.  Module-level variables are
@@ -205,6 +207,24 @@ const pendingPlanApprover = hotSafe<Map<string, string>>(
 
 // Tracks the diff text when user edits the plan before approving — keyed by narratorId
 const pendingPlanDiff = hotSafe<Map<string, string>>("narrafork.pendingPlanDiff", () => new Map());
+
+// Overseer permission request queue — keyed by overseer narratorId.
+// When the overseer's agent loop is already running, new permission requests
+// are queued here instead of spawning a concurrent loop.
+interface OverseerQueuedMessage {
+	requestId: string;
+	narratorId: string;
+	toolName: string;
+	toolUseId: string;
+	input: Record<string, unknown>;
+	textForModel: string;
+	contentBlocks: unknown[];
+	broadcastTargetId: string;
+}
+const pendingOverseerMessages = hotSafe<Map<string, OverseerQueuedMessage[]>>(
+	"narrafork.pendingOverseerMessages",
+	() => new Map(),
+);
 
 // Buffered message queue — keyed by narratorId, supports multiple queued messages
 export interface BufferCreator {
@@ -1528,11 +1548,16 @@ export async function handlePermission(
 	}
 
 	// Route to overseer (async, non-blocking — overseer and user compete)
-	routePermissionToOverseer(narratorId, toolCallId, toolName, toolUseId, effectiveInput).catch(
-		(err) => {
-			logger.debug("Overseer routing skipped or failed", { narratorId, error: String(err) });
-		},
-	);
+	routePermissionToOverseer(
+		narratorId,
+		toolCallId,
+		toolName,
+		toolUseId,
+		effectiveInput,
+		wsTarget,
+	).catch((err) => {
+		logger.debug("Overseer routing skipped or failed", { narratorId, error: String(err) });
+	});
 
 	if (signal.aborted) {
 		broadcastToNarrator(wsTarget, {
@@ -1638,6 +1663,20 @@ export async function resolvePermission(
 
 	// Clean up timeout + abort listener to prevent stale handlers from firing
 	pending.cleanup();
+
+	// Remove this request from any overseer queue (user resolved before overseer got to it)
+	for (const [overseerNarratorId, queue] of pendingOverseerMessages) {
+		const idx = queue.findIndex((m) => m.requestId === requestId);
+		if (idx !== -1) {
+			queue.splice(idx, 1);
+			if (queue.length === 0) pendingOverseerMessages.delete(overseerNarratorId);
+			logger.debug("Removed resolved permission from overseer queue", {
+				requestId,
+				overseerNarratorId,
+			});
+			break;
+		}
+	}
 
 	// Build updatedInput early so we can include it in the broadcast
 	let updatedInput: Record<string, unknown> | undefined;
@@ -1800,6 +1839,7 @@ async function routePermissionToOverseer(
 	toolName: string,
 	toolUseId: string,
 	input: Record<string, unknown>,
+	broadcastTargetId: string,
 ): Promise<void> {
 	const { findResponsibleOverseer, getOverseerPolicy } = await import("./overseer-service");
 
@@ -1831,15 +1871,31 @@ async function routePermissionToOverseer(
 		},
 	];
 
+	// Resolve locale for the overseer's prompt
+	const { getUserLanguage } = await import("../lib/prompt-i18n");
+	let overseerLocale: import("../lib/prompt-i18n").Locale = "en";
+	try {
+		const { users } = await import("../db/schema");
+		const admin = await db.query.users.findFirst({
+			where: eq(users.role, "admin"),
+			columns: { id: true },
+		});
+		if (admin) {
+			overseerLocale = await getUserLanguage(admin.id);
+		}
+	} catch {
+		// fallback to "en"
+	}
+
 	// Text version for the AI model
-	const textForModel =
-		`A Narrator under your jurisdiction needs a permission decision.\n\n` +
-		`Request ID: ${toolCallId}\n` +
-		`Narrator: ${narratorTitle} (id: ${narratorId})\n` +
-		`Tool: ${toolName}\n` +
-		`Tool Use ID: ${toolUseId}\n` +
-		`Input:\n\`\`\`json\n${inputSummary}\n\`\`\`\n\n` +
-		`Please review this request and use ApprovePermission or DenyPermission to make your decision.`;
+	const textForModel = getToolMessageWithParams("overseerPermissionRequestText", overseerLocale, {
+		requestId: toolCallId,
+		narratorTitle,
+		narratorId,
+		toolName,
+		toolUseId,
+		inputSummary,
+	});
 
 	eventBus.emit({
 		type: "overseer:event_routed",
@@ -1848,9 +1904,44 @@ async function routePermissionToOverseer(
 		eventType: "permission_request",
 	});
 
-	// Persist the structured message and trigger the agent loop
+	// Check if the overseer's agent loop is already running
+	const existingActive = activeNarrators.get(overseer.narratorId);
+	if (existingActive?.alive && existingActive._loopRunning) {
+		// Queue the message — the overseer's loop will pick it up when the current turn ends
+		const queue = pendingOverseerMessages.get(overseer.narratorId) ?? [];
+		queue.push({
+			requestId: toolCallId,
+			narratorId,
+			toolName,
+			toolUseId,
+			input,
+			textForModel,
+			contentBlocks,
+			broadcastTargetId,
+		});
+		pendingOverseerMessages.set(overseer.narratorId, queue);
+
+		// Notify the source narrator's UI that this request is queued for overseer
+		broadcastToNarrator(broadcastTargetId, {
+			type: "overseer_reviewing",
+			narratorId: broadcastTargetId,
+			requestId: toolCallId,
+			toolUseId,
+			status: "queued",
+			overseerId: overseer.id,
+		});
+
+		logger.debug("Overseer busy, queued permission request", {
+			overseerId: overseer.id,
+			requestId: toolCallId,
+			queueLength: queue.length,
+		});
+		return;
+	}
+
+	// Overseer is idle — persist and start the loop directly
 	try {
-		const active = await ensureNarrator(overseer.narratorId, "en");
+		const active = await ensureNarrator(overseer.narratorId, overseerLocale);
 
 		const userMsg = await narratorService.persistUserMessage(
 			overseer.narratorId,
@@ -1865,6 +1956,16 @@ async function routePermissionToOverseer(
 		});
 
 		await narratorService.updateStatus(overseer.narratorId, "thinking");
+
+		// Notify the source narrator's UI that the overseer is actively reviewing
+		broadcastToNarrator(broadcastTargetId, {
+			type: "overseer_reviewing",
+			narratorId: broadcastTargetId,
+			requestId: toolCallId,
+			toolUseId,
+			status: "reviewing",
+			overseerId: overseer.id,
+		});
 
 		// Start agent loop in background
 		runAgentLoop(active, textForModel).catch(async (err) => {
@@ -2369,6 +2470,7 @@ async function runAgentLoop(
 	images?: ImageRef[],
 ): Promise<void> {
 	const { narratorId, locale } = active;
+	active._loopRunning = true;
 	let shouldUpdateTitle = false;
 	let currentText = text;
 	let currentImages = images;
@@ -2934,7 +3036,12 @@ async function runAgentLoop(
 
 				// All attempts failed
 				logger.error("Context length exceeded after max retries", { narratorId });
-				await narratorService.updateStatus(narratorId, "error", "Context too long, compact failed");
+				await narratorService.updateStatus(
+					narratorId,
+					"error",
+					"Context too long, compact failed",
+					"context_too_long_compact_failed",
+				);
 				active.events.emit("event", {
 					type: "error",
 					data: { message: "Context too long, compact failed" },
@@ -3270,6 +3377,50 @@ async function runAgentLoop(
 				});
 			}
 
+			// Check for queued overseer permission requests before transitioning to done.
+			// This only applies to overseer narrators — regular narrators have no entries.
+			if (!loopHadError) {
+				const overseerQueue = pendingOverseerMessages.get(narratorId);
+				let nextValid: OverseerQueuedMessage | undefined;
+				while (overseerQueue && overseerQueue.length > 0) {
+					const candidate = overseerQueue.shift()!;
+					if (overseerQueue.length === 0) pendingOverseerMessages.delete(narratorId);
+					if (pendingPermissions.has(candidate.requestId)) {
+						nextValid = candidate;
+						break;
+					}
+					// Permission was already resolved — skip to next
+					logger.debug("Overseer queue: skipping already-resolved request", {
+						narratorId,
+						requestId: candidate.requestId,
+					});
+				}
+				if (nextValid) {
+					const userMsg = await narratorService.persistUserMessage(
+						narratorId,
+						nextValid.textForModel,
+						nextValid.contentBlocks,
+					);
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: userMsg,
+					});
+					// Notify the source narrator that the overseer is now actively reviewing
+					broadcastToNarrator(nextValid.broadcastTargetId, {
+						type: "overseer_reviewing",
+						narratorId: nextValid.broadcastTargetId,
+						requestId: nextValid.requestId,
+						toolUseId: nextValid.toolUseId,
+						status: "reviewing",
+					});
+					await narratorService.updateStatus(narratorId, "thinking");
+					currentText = nextValid.textForModel;
+					currentImages = undefined;
+					continue;
+				}
+			}
+
 			// No buffered messages — now transition to "done" (triggers notifications)
 			if (!loopHadError) {
 				// Atomically transition thinking/waiting → done.
@@ -3288,6 +3439,7 @@ async function runAgentLoop(
 		loopHadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
+		active._loopRunning = false;
 		active.alive = false;
 		if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 		// Stop file watcher for this narrator
@@ -3333,6 +3485,27 @@ async function runAgentLoop(
 		pendingPlanApprover.delete(narratorId);
 		pendingPlanDiff.delete(narratorId);
 		bufferedMessages.delete(narratorId);
+
+		// Drain any remaining overseer queue items — notify source narrators
+		// that the overseer is no longer reviewing so the UI clears the
+		// "queued for overseer" badge.
+		const remainingOverseerQueue = pendingOverseerMessages.get(narratorId);
+		if (remainingOverseerQueue && remainingOverseerQueue.length > 0) {
+			for (const queued of remainingOverseerQueue) {
+				broadcastToNarrator(queued.broadcastTargetId, {
+					type: "overseer_reviewing",
+					narratorId: queued.broadcastTargetId,
+					requestId: queued.requestId,
+					toolUseId: queued.toolUseId,
+					status: "cleared",
+				});
+			}
+			logger.debug("Overseer loop ended with queued items, cleared UI state", {
+				narratorId,
+				droppedCount: remainingOverseerQueue.length,
+			});
+		}
+		pendingOverseerMessages.delete(narratorId);
 
 		// 6. Per-narrator git status Promise cache (Bash before-status snapshots)
 		active._bashBeforeStatus?.clear();

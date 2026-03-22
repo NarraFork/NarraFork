@@ -91,6 +91,7 @@ import {
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
+import { useGlobalOverseer } from "../../hooks/useOverseers";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type TreeMessage } from "../../lib/api";
@@ -112,6 +113,11 @@ import {
 	renderToolRun,
 	StreamingBubble,
 } from "./MessageRenderer";
+import {
+	MessageSelectionCtx,
+	type MessageSelectionState,
+	resolveBlockRange,
+} from "./MessageSelectionCtx";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { hasToolUse, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
@@ -133,6 +139,7 @@ import {
 	PERM_MODES,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
+import { getGlobalCloseSwipe, setGlobalOnSelectionRange, setGlobalSwipeAnchor } from "./swipeState";
 import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
 import { useProgressiveMessageCount } from "./useProgressiveMessageCount";
@@ -771,7 +778,15 @@ export function NarratorPanel({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: tt } = useTranslation("terminal");
+	const { t: tn } = useTranslation("nav");
 	const qc = useQueryClient();
+
+	// Overseer title: if this narrator is the global overseer's narrator, show i18n title + #id
+	const { data: globalOverseer } = useGlobalOverseer();
+	const isOverseerNarrator = !!globalOverseer && globalOverseer.narratorId === narratorId;
+	const displayTitle = isOverseerNarrator
+		? `${tn("overseer")} #${narratorId}`
+		: narrator?.title || t("untitled");
 	const codexCapableProviders = useMemo(() => {
 		const providers = new Set<string>();
 		if (settingsData?.codexAvailable) providers.add("codex");
@@ -1450,6 +1465,53 @@ export function NarratorPanel({
 			});
 		};
 	}, [messagesQueryKey, qc]);
+
+	// --- Multi-select state ---
+	const [selectionMode, setSelectionMode] = useState(false);
+	const [selectedBlockIds, setSelectedBlockIds] = useState<Set<string>>(new Set());
+	const [anchorBlockId, setAnchorBlockId] = useState<string | null>(null);
+
+	const exitSelection = useCallback(() => {
+		setSelectionMode(false);
+		setSelectedBlockIds(new Set());
+		setAnchorBlockId(null);
+		setGlobalSwipeAnchor(null);
+		// Close any open swipe
+		const closeFn = getGlobalCloseSwipe();
+		if (closeFn) closeFn();
+	}, []);
+
+	// Register the global range-selection callback so useSwipeMenu instances
+	// can trigger multi-select without prop drilling.
+	useEffect(() => {
+		const handler = (anchor: string, target: string) => {
+			const container = contentRef.current;
+			if (!container) return;
+			const range = resolveBlockRange(container, anchor, target);
+			if (!range) return;
+			setSelectionMode(true);
+			setSelectedBlockIds(range);
+			setAnchorBlockId(anchor);
+		};
+		setGlobalOnSelectionRange(handler);
+		return () => setGlobalOnSelectionRange(null);
+	}, []);
+
+	// Clear selection when narrator changes
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is intentionally a dependency to reset selection on narrator switch
+	useEffect(() => {
+		exitSelection();
+	}, [narratorId, exitSelection]);
+
+	const selectionCtxValue = useMemo<MessageSelectionState>(
+		() => ({
+			selectionMode,
+			selectedBlockIds,
+			anchorBlockId,
+			exitSelection,
+		}),
+		[selectionMode, selectedBlockIds, anchorBlockId, exitSelection],
+	);
 
 	// --- Visible elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
@@ -2272,7 +2334,7 @@ export function NarratorPanel({
 							</ActionIcon>
 						)}
 						<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
-							{editingTitle ? (
+							{editingTitle && !isOverseerNarrator ? (
 								<TextInput
 									ref={titleInputRef}
 									value={titleValue}
@@ -2286,36 +2348,40 @@ export function NarratorPanel({
 								<Text
 									size="sm"
 									fw={500}
-									onDoubleClick={startEditingTitle}
+									onDoubleClick={isOverseerNarrator ? undefined : startEditingTitle}
 									style={{
-										cursor: "pointer",
+										cursor: isOverseerNarrator ? "default" : "pointer",
 										overflow: "hidden",
 										textOverflow: "ellipsis",
 										whiteSpace: "nowrap",
 										maxWidth: 500,
 									}}
-									title={narrator.title || t("untitled")}
+									title={displayTitle}
 								>
-									{narrator.title || t("untitled")}
+									{displayTitle}
 								</Text>
 							)}
-							<ActionIcon
-								size="xs"
-								variant="subtle"
-								onClick={startEditingTitle}
-								title={t("editTitle")}
-							>
-								<IconPencil size={12} />
-							</ActionIcon>
-							<ActionIcon
-								size="xs"
-								variant="subtle"
-								onClick={handleGenerateTitle}
-								loading={generatingTitle}
-								title={t("generateTitle")}
-							>
-								<IconSparkles size={12} />
-							</ActionIcon>
+							{!isOverseerNarrator && (
+								<>
+									<ActionIcon
+										size="xs"
+										variant="subtle"
+										onClick={startEditingTitle}
+										title={t("editTitle")}
+									>
+										<IconPencil size={12} />
+									</ActionIcon>
+									<ActionIcon
+										size="xs"
+										variant="subtle"
+										onClick={handleGenerateTitle}
+										loading={generatingTitle}
+										title={t("generateTitle")}
+									>
+										<IconSparkles size={12} />
+									</ActionIcon>
+								</>
+							)}
 						</Group>
 						{disconnected && (
 							<Badge
@@ -2477,23 +2543,47 @@ export function NarratorPanel({
 								: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
 						}}
 					>
-						<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-							<Stack gap="sm" ref={contentRef}>
-								{visibleElements}
-								<StreamingBubble
-									narratorId={narratorId}
-									streamingRef={streamingRef}
-									streamingReasoningRef={streamingReasoningRef}
-									webSearchRef={webSearchRef}
-									version={streamingVersion}
-								/>
-								{topLevelStreamingChunks &&
-									renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb, {
-										containerClassName: mergeStreaming ? "merge-top" : undefined,
-									})}
-							</Stack>
-						</LatestTodosToolUseIdCtx.Provider>
+						<MessageSelectionCtx.Provider value={selectionCtxValue}>
+							<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+								<Stack gap="sm" ref={contentRef}>
+									{visibleElements}
+									<StreamingBubble
+										narratorId={narratorId}
+										streamingRef={streamingRef}
+										streamingReasoningRef={streamingReasoningRef}
+										webSearchRef={webSearchRef}
+										version={streamingVersion}
+									/>
+									{topLevelStreamingChunks &&
+										renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb, {
+											containerClassName: mergeStreaming ? "merge-top" : undefined,
+										})}
+								</Stack>
+							</LatestTodosToolUseIdCtx.Provider>
+						</MessageSelectionCtx.Provider>
 					</ScrollArea>
+
+					{/* Multi-select floating toolbar */}
+					{selectionMode && (
+						<Group
+							px="md"
+							py={6}
+							justify="space-between"
+							wrap="nowrap"
+							style={{
+								borderTop: "1px solid var(--mantine-color-default-border)",
+								backgroundColor: "var(--mantine-color-indigo-light)",
+								flexShrink: 0,
+							}}
+						>
+							<Text size="sm" fw={500}>
+								{t("selectedBlocks", { count: selectedBlockIds.size })}
+							</Text>
+							<Button size="compact-xs" variant="subtle" color="gray" onClick={exitSelection}>
+								{tc("cancel")}
+							</Button>
+						</Group>
+					)}
 
 					{onSendToTerminal && (
 						<SelectionPopover

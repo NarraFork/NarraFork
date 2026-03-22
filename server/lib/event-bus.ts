@@ -185,7 +185,14 @@ export type NarraForkEvent =
 	| { type: "overseer:created"; overseerId: string; scope: string; projectId?: string }
 	| { type: "overseer:deleted"; overseerId: string }
 	| { type: "overseer:enabled"; overseerId: string }
-	| { type: "overseer:disabled"; overseerId: string };
+	| { type: "overseer:disabled"; overseerId: string }
+	| {
+			type: "overseer:replaced";
+			oldOverseerId: string;
+			newOverseerId: string;
+			scope: string;
+			projectId?: string | null;
+	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

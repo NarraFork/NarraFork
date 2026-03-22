@@ -1,7 +1,22 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { api } from "../lib/api";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 export function useGlobalOverseer() {
+	const qc = useQueryClient();
+
+	// Listen for overseer:replaced WS events to refresh data immediately
+	useEffect(() => {
+		const handle = narratorWSManager.addListener(
+			{ narratorIds: "*", types: ["overseer:replaced"] },
+			() => {
+				qc.invalidateQueries({ queryKey: ["overseers", "global"] });
+			},
+		);
+		return () => narratorWSManager.removeListener(handle);
+	}, [qc]);
+
 	return useQuery({
 		queryKey: ["overseers", "global"],
 		queryFn: async () => {
