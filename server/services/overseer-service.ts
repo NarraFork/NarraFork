@@ -338,7 +338,7 @@ function isOverseerUsable(
 	if (overseer.narratorId === sourceNarratorId) return false;
 
 	// Narrator must be in a usable state
-	const usableStatuses = new Set(["idle", "thinking", "waiting"]);
+	const usableStatuses = new Set(["idle", "thinking", "waiting", "done"]);
 	if (!usableStatuses.has(overseer.narrator.status)) return false;
 
 	return true;

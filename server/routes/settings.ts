@@ -9,6 +9,7 @@ import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	getBuiltinCodexModels,
 	type NarraForkSettings,
+	purgeStaleAgentModelRefs,
 	saveSettings,
 	settings,
 } from "../lib/settings";
@@ -257,6 +258,33 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			fn(ids);
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
+	}
+
+	// Collect prefixes of removed providers — needed to purge agent-level fields
+	// (summaryModel, hiddenModels, modelContextWindows) that reference stale models.
+	const removedPrefixes = new Set<string>();
+	for (const { ids } of purges) {
+		if (!ids.length) continue;
+		const idSet = new Set(ids);
+		for (const prov of [
+			prev.openaiProviders,
+			prev.anthropicProviders,
+			prev.clineProviders,
+		]) {
+			for (const p of prov ?? []) {
+				if (idSet.has(p.id)) removedPrefixes.add(p.prefix ?? "");
+			}
+		}
+	}
+	// Don't purge empty-prefix entries (would match everything)
+	removedPrefixes.delete("");
+	if (removedPrefixes.size === 0) return;
+
+	if (purgeStaleAgentModelRefs(next, (prefix) => removedPrefixes.has(prefix))) {
+		saveSettings(next);
+		logger.info("Purged stale agent references to removed providers", {
+			prefixes: [...removedPrefixes],
+		});
 	}
 }
 

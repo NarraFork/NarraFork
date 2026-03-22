@@ -1,7 +1,6 @@
 import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
 import { IconBrain } from "@tabler/icons-react";
 import { memo } from "react";
-import { useTranslation } from "react-i18next";
 import { ContentViewer } from "./ContentViewer";
 import { MessageBubble, ReasoningSummary } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
@@ -14,7 +13,6 @@ import {
 import type {
 	ContentBlock,
 	FlatToolItem,
-	MessagesPage,
 	NarratorMsg,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
@@ -565,88 +563,26 @@ export function renderTreeMessages(
 }
 
 // ---------------------------------------------------------------------------
-// MemoizedPageElements — per-page memoized rendering
+// renderTreeMessagesWithKeys — same as renderTreeMessages but also returns
+// stable string keys for each element (needed for virtualization).
 // ---------------------------------------------------------------------------
 
-interface PageElementsProps {
-	page: MessagesPage;
-	narratorId: string;
-	onForkFromMessage: ((uuid: string) => void) | undefined;
-	highlightedId: string | null;
-	permCb: PermissionCallbacks;
-	expandedToolUseId?: string | null;
-	editExpandOverride?: boolean | null;
-	showTokenUsage?: boolean;
-	/** When set, only render the last N messages of this page (for progressive rendering). */
-	maxMessages?: number;
-	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
-	onCompactBeforeMessage?: (messageId: string) => void;
-	onRegenerateFromMessage?: (messageId: string) => void;
-	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
-	pruneBoundaryMessageId?: string | null;
-	lastUserMessageId?: string;
-	hasChapter?: boolean;
+export function renderTreeMessagesWithKeys(...args: Parameters<typeof renderTreeMessages>): {
+	elements: React.ReactNode[];
+	keys: string[];
+} {
+	const { elements } = renderTreeMessages(...args);
+	const keys: string[] = [];
+	for (const el of elements) {
+		// Extract the React key from each element
+		if (el != null && typeof el === "object" && "key" in (el as React.ReactElement)) {
+			keys.push(String((el as React.ReactElement).key ?? keys.length));
+		} else {
+			keys.push(String(keys.length));
+		}
+	}
+	return { elements, keys };
 }
-
-export const MemoizedPageElements = memo(
-	function PageElements({
-		page,
-		narratorId,
-		onForkFromMessage,
-		highlightedId,
-		permCb,
-		expandedToolUseId,
-		editExpandOverride,
-		showTokenUsage,
-		maxMessages,
-		onDeleteBlock,
-		onCompactBeforeMessage,
-		onRegenerateFromMessage,
-		onEditAndRegenerate,
-		pruneBoundaryMessageId,
-		lastUserMessageId,
-		hasChapter,
-	}: PageElementsProps) {
-		const rawMsgs = Array.isArray(page.messages) ? page.messages : [];
-		const msgs =
-			maxMessages != null && maxMessages < rawMsgs.length
-				? rawMsgs.slice(rawMsgs.length - maxMessages)
-				: rawMsgs;
-		const { t } = useTranslation("narrator");
-		const { elements } = renderTreeMessages(
-			msgs,
-			narratorId,
-			onForkFromMessage,
-			highlightedId,
-			permCb,
-			expandedToolUseId,
-			editExpandOverride,
-			showTokenUsage,
-			pruneBoundaryMessageId,
-			t("pruneBoundaryLabel"),
-			onCompactBeforeMessage,
-			onDeleteBlock,
-			onRegenerateFromMessage,
-			onEditAndRegenerate,
-			lastUserMessageId,
-			hasChapter,
-		);
-		return <>{elements}</>;
-	},
-	(prev, next) =>
-		prev.page === next.page &&
-		prev.narratorId === next.narratorId &&
-		prev.onForkFromMessage === next.onForkFromMessage &&
-		prev.permCb.pendingPermsMap === next.permCb.pendingPermsMap &&
-		prev.permCb.bgRetryDismissedIds === next.permCb.bgRetryDismissedIds &&
-		prev.expandedToolUseId === next.expandedToolUseId &&
-		prev.editExpandOverride === next.editExpandOverride &&
-		prev.showTokenUsage === next.showTokenUsage &&
-		prev.maxMessages === next.maxMessages &&
-		prev.lastUserMessageId === next.lastUserMessageId &&
-		prev.hasChapter === next.hasChapter &&
-		prev.pruneBoundaryMessageId === next.pruneBoundaryMessageId,
-);
 
 // ---------------------------------------------------------------------------
 // RenderProgress — thin progress bar for progressive rendering / fetch

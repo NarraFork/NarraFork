@@ -108,9 +108,9 @@ import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
-	MemoizedPageElements,
 	RenderProgress,
 	renderToolRun,
+	renderTreeMessagesWithKeys,
 	StreamingBubble,
 } from "./MessageRenderer";
 import {
@@ -142,7 +142,8 @@ import {
 import { getGlobalCloseSwipe, setGlobalOnSelectionRange, setGlobalSwipeAnchor } from "./swipeState";
 import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
-import { useProgressiveMessageCount } from "./useProgressiveMessageCount";
+import type { VirtualMessageListHandle } from "./VirtualMessageList";
+import { VirtualMessageList } from "./VirtualMessageList";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
@@ -1415,11 +1416,12 @@ export function NarratorPanel({
 	// Standalone: use handleStandaloneFork (direct narrator fork)
 	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleStandaloneFork;
 
-	// --- Progressive rendering ---
+	// --- Virtualization setup ---
 	const highlightScrolledRef = useRef(false);
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
+	const virtualListRef = useRef<VirtualMessageListHandle>(null);
 
 	const prevNarratorIdRef = useRef(narratorId);
 	if (prevNarratorIdRef.current !== narratorId) {
@@ -1445,14 +1447,9 @@ export function NarratorPanel({
 			}
 		}
 	}
-	const skipProgressive = !!highlightMessageId;
-	const { visibleCount, done: renderDone } = useProgressiveMessageCount(
-		totalMessageCount,
-		20,
-		skipProgressive,
-		narratorId,
-		viewportRef,
-	);
+
+	// With virtualization there is no progressive rendering phase — always done.
+	const renderDone = true;
 
 	// Trim message cache on unmount / narrator switch
 	useEffect(() => {
@@ -1513,71 +1510,78 @@ export function NarratorPanel({
 		[selectionMode, selectedBlockIds, anchorBlockId, exitSelection],
 	);
 
-	// --- Visible elements ---
+	// --- Flat elements for virtualization ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-	const visibleElements = useMemo(() => {
-		if (isResizing) return [];
-		if (!messagesData?.pages || visibleCount === 0) return [];
+	// Page-level cache: keyed by page reference → { elements, keys }.
+	// When a page object reference doesn't change, we reuse the cached result.
+	const pageCacheRef = useRef(
+		new WeakMap<object, { elements: React.ReactNode[]; keys: string[] }>(),
+	);
+	const pruneDividerLabel = t("pruneBoundaryLabel");
+
+	const { flatElements, flatKeys } = useMemo(() => {
+		if (isResizing || !messagesData?.pages) return { flatElements: [], flatKeys: [] };
 		const pages = messagesData.pages;
 		const reversed = [...pages].reverse();
-		if (visibleCount >= totalMessageCount) {
-			return reversed.map((page, i) => (
-				<MemoizedPageElements
-					key={`page-${pages.length - 1 - i}`}
-					page={page}
-					narratorId={narratorId}
-					onForkFromMessage={forkHandler}
-					highlightedId={highlightedId}
-					permCb={renderPermCb}
-					expandedToolUseId={expandedToolUseId}
-					editExpandOverride={editExpandOverride}
-					showTokenUsage={showTokenUsage}
-					onDeleteBlock={handleDeleteBlock}
-					onCompactBeforeMessage={handleCompactBefore}
-					onRegenerateFromMessage={handleRegenerate}
-					onEditAndRegenerate={handleEditAndRegenerate}
-					pruneBoundaryMessageId={pruneBoundaryMessageId}
-					lastUserMessageId={lastUserMessageId}
-					hasChapter={hasChapter}
-				/>
-			));
-		}
-		const result: React.ReactNode[] = [];
-		let remaining = visibleCount;
-		for (let i = reversed.length - 1; i >= 0 && remaining > 0; i--) {
+		const cache = pageCacheRef.current;
+		const allElements: React.ReactNode[] = [];
+		const allKeys: string[] = [];
+
+		// Build a cache key object per page that includes all render-affecting props.
+		// We use the page reference as the primary cache key, but invalidate when
+		// other props change by storing a secondary key alongside.
+		const permsKey = `${renderPermCb.pendingPermsMap.size}:${[...renderPermCb.pendingPermsMap.keys()].join(",")}`;
+		const bgDismissedKey = `${renderPermCb.bgRetryDismissedIds.size}:${[...renderPermCb.bgRetryDismissedIds].join(",")}`;
+		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}|${bgDismissedKey}`;
+
+		for (let i = 0; i < reversed.length; i++) {
 			const page = reversed[i];
-			if (!page?.messages) continue;
-			const pageLen = page.messages.length;
-			const maxMsg = Math.min(remaining, pageLen);
-			result.unshift(
-				<MemoizedPageElements
-					key={`page-${pages.length - 1 - i}`}
-					page={page}
-					narratorId={narratorId}
-					onForkFromMessage={forkHandler}
-					highlightedId={highlightedId}
-					permCb={renderPermCb}
-					expandedToolUseId={expandedToolUseId}
-					editExpandOverride={editExpandOverride}
-					showTokenUsage={showTokenUsage}
-					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
-					onDeleteBlock={handleDeleteBlock}
-					onCompactBeforeMessage={handleCompactBefore}
-					onRegenerateFromMessage={handleRegenerate}
-					onEditAndRegenerate={handleEditAndRegenerate}
-					pruneBoundaryMessageId={pruneBoundaryMessageId}
-					lastUserMessageId={lastUserMessageId}
-					hasChapter={hasChapter}
-				/>,
+			if (!page?.messages?.length) continue;
+
+			// Check cache
+			const cached = cache.get(page);
+			if (cached && (cached as { _secondaryKey?: string })._secondaryKey === secondaryKey) {
+				for (let j = 0; j < cached.elements.length; j++) {
+					allElements.push(cached.elements[j]);
+					allKeys.push(`p${i}-${cached.keys[j]}`);
+				}
+				continue;
+			}
+
+			// Compute elements for this page
+			const result = renderTreeMessagesWithKeys(
+				page.messages,
+				narratorId,
+				forkHandler,
+				highlightedId,
+				renderPermCb,
+				expandedToolUseId,
+				editExpandOverride,
+				showTokenUsage,
+				pruneBoundaryMessageId,
+				pruneDividerLabel,
+				handleCompactBefore,
+				handleDeleteBlock,
+				handleRegenerate,
+				handleEditAndRegenerate,
+				lastUserMessageId,
+				hasChapter,
 			);
-			remaining -= maxMsg;
+
+			// Store in cache
+			const entry = { ...result, _secondaryKey: secondaryKey };
+			cache.set(page, entry);
+
+			for (let j = 0; j < result.elements.length; j++) {
+				allElements.push(result.elements[j]);
+				allKeys.push(`p${i}-${result.keys[j]}`);
+			}
 		}
-		return result;
+
+		return { flatElements: allElements, flatKeys: allKeys };
 	}, [
 		isResizing,
 		messagesData,
-		totalMessageCount,
-		visibleCount,
 		narratorId,
 		forkHandler,
 		renderPermCb,
@@ -1590,6 +1594,7 @@ export function NarratorPanel({
 		handleRegenerate,
 		handleEditAndRegenerate,
 		pruneBoundaryMessageId,
+		pruneDividerLabel,
 		lastUserMessageId,
 		hasChapter,
 	]);
@@ -1611,8 +1616,7 @@ export function NarratorPanel({
 	const handleLoadOlderRef = useRef(handleLoadOlder);
 	handleLoadOlderRef.current = handleLoadOlder;
 	useEffect(() => {
-		if (!autoLoadEnabled || !hasNextPage || !initialScrollDone || !renderDone || isFetchingNextPage)
-			return;
+		if (!autoLoadEnabled || !hasNextPage || !initialScrollDone || isFetchingNextPage) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
 		const check = () => {
@@ -1624,7 +1628,7 @@ export function NarratorPanel({
 		check();
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
-	}, [autoLoadEnabled, hasNextPage, initialScrollDone, renderDone, isFetchingNextPage]);
+	}, [autoLoadEnabled, hasNextPage, initialScrollDone, isFetchingNextPage]);
 
 	// --- Scroll state: user-input driven ---
 	const lastTouchYRef = useRef(0);
@@ -1727,7 +1731,7 @@ export function NarratorPanel({
 			initialScrollDoneRef.current = true;
 			setInitialScrollDone(true);
 		}
-	}, [totalMessageCount, renderDone, scrollToBottom, highlightMessageId]);
+	}, [totalMessageCount, scrollToBottom, highlightMessageId]);
 
 	// --- Auto-scroll via ResizeObserver ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: initialScrollDone is a trigger dep, not read inside
@@ -1796,17 +1800,32 @@ export function NarratorPanel({
 	// --- Scroll to highlighted message ---
 	useEffect(() => {
 		if (!highlightMessageId || totalMessageCount === 0 || highlightScrolledRef.current) return;
+		// With virtualization, the target element may not be in the DOM yet.
+		// First try direct DOM lookup (element is in viewport).
 		const el = document.getElementById(`msg-${highlightMessageId}`);
-		if (!el) return;
-		highlightScrolledRef.current = true;
-		requestAnimationFrame(() => {
-			el.scrollIntoView({ behavior: "smooth", block: "center" });
+		if (el) {
+			highlightScrolledRef.current = true;
+			requestAnimationFrame(() => {
+				el.scrollIntoView({ behavior: "smooth", block: "center" });
+				setTimeout(() => {
+					setHighlightedId(highlightMessageId);
+					setTimeout(() => setHighlightedId(null), 1600);
+				}, 400);
+			});
+			return;
+		}
+		// Element not in DOM — find its index in flatKeys and scroll virtualizer to it.
+		const keyIdx = flatKeys.findIndex((k) => k.includes(highlightMessageId));
+		if (keyIdx !== -1 && virtualListRef.current) {
+			highlightScrolledRef.current = true;
+			virtualListRef.current.scrollToIndex(keyIdx, { align: "center" });
+			// After virtualizer scrolls and renders the element, highlight it.
 			setTimeout(() => {
 				setHighlightedId(highlightMessageId);
 				setTimeout(() => setHighlightedId(null), 1600);
-			}, 400);
-		});
-	}, [highlightMessageId, totalMessageCount]);
+			}, 300);
+		}
+	}, [highlightMessageId, totalMessageCount, flatKeys]);
 
 	// --- Send / retry message ---
 	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
@@ -2460,20 +2479,13 @@ export function NarratorPanel({
 
 				{/* Messages */}
 				<Box pos="relative" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-					{(isFetchingNextPage || !renderDone) && (
+					{isFetchingNextPage && (
 						<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
-							<RenderProgress
-								indeterminate={isFetchingNextPage}
-								value={
-									!isFetchingNextPage && totalMessageCount > 0
-										? visibleCount / totalMessageCount
-										: undefined
-								}
-							/>
+							<RenderProgress indeterminate />
 						</Box>
 					)}
-					{/* Skeleton overlay during progressive rendering or node resize to prevent jitter */}
-					{(!renderDone || isResizing) && (
+					{/* Skeleton overlay during node resize to prevent jitter */}
+					{isResizing && (
 						<Box
 							pos="absolute"
 							top={0}
@@ -2530,35 +2542,39 @@ export function NarratorPanel({
 						h="100%"
 						type="always"
 						viewportRef={viewportCallbackRef}
-						py="sm"
 						px="md"
 						scrollbars="y"
 						styles={{
 							viewport: {
 								overscrollBehavior: "contain",
-								overflowAnchor: renderDone ? "auto" : "none",
 							},
-							scrollbar: renderDone
-								? undefined
-								: { pointerEvents: "none", opacity: 0, transition: "opacity 150ms ease" },
 						}}
 					>
 						<MessageSelectionCtx.Provider value={selectionCtxValue}>
 							<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-								<Stack gap="sm" ref={contentRef}>
-									{visibleElements}
-									<StreamingBubble
-										narratorId={narratorId}
-										streamingRef={streamingRef}
-										streamingReasoningRef={streamingReasoningRef}
-										webSearchRef={webSearchRef}
-										version={streamingVersion}
-									/>
-									{topLevelStreamingChunks &&
-										renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb, {
-											containerClassName: mergeStreaming ? "merge-top" : undefined,
-										})}
-								</Stack>
+								<VirtualMessageList
+									ref={virtualListRef}
+									elements={flatElements}
+									elementKeys={flatKeys}
+									scrollElementRef={viewportRef}
+									contentRef={contentRef}
+									paddingY={12}
+									trailing={
+										<>
+											<StreamingBubble
+												narratorId={narratorId}
+												streamingRef={streamingRef}
+												streamingReasoningRef={streamingReasoningRef}
+												webSearchRef={webSearchRef}
+												version={streamingVersion}
+											/>
+											{topLevelStreamingChunks &&
+												renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb, {
+													containerClassName: mergeStreaming ? "merge-top" : undefined,
+												})}
+										</>
+									}
+								/>
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>
 					</ScrollArea>

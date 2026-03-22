@@ -1,7 +1,7 @@
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import { Button, Select, Stack, Text } from "@mantine/core";
 import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
 /** Prepend "group:" prefix to each item label so the selected value shows the provider. */
@@ -47,6 +47,42 @@ export function ModelsSection({
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
+
+	// Collect all valid model values from the grouped data.
+	const validValues = useMemo(() => {
+		const set = new Set<string>();
+		for (const g of groupedModels as ComboboxItemGroup[]) {
+			for (const item of g.items) {
+				const v = typeof item === "string" ? item : item.value;
+				set.add(v);
+			}
+		}
+		return set;
+	}, [groupedModels]);
+
+	// When a selected model no longer exists in the available list (e.g. its
+	// provider was deleted), Mantine Select shows the placeholder but never
+	// fires onChange — so the stale value silently persists.  Reset it here.
+	useEffect(() => {
+		if (validValues.size === 0) return; // models not loaded yet
+		if (subagentExploreModel && !validValues.has(subagentExploreModel)) {
+			setSubagentExploreModel("");
+		}
+		if (subagentPlanModel && !validValues.has(subagentPlanModel)) {
+			setSubagentPlanModel("");
+		}
+		if (summaryModel && !validValues.has(summaryModel)) {
+			setSummaryModel("");
+		}
+	}, [
+		validValues,
+		subagentExploreModel,
+		setSubagentExploreModel,
+		subagentPlanModel,
+		setSubagentPlanModel,
+		summaryModel,
+		setSummaryModel,
+	]);
 
 	return (
 		<Stack>

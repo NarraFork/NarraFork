@@ -4028,8 +4028,8 @@ export async function continueNarrator(
 	const hasTrailingToolUse = blocks.some((b: any) => b.type === "tool_use");
 
 	if (!hasTrailingToolUse) {
-		// No pending tool calls — send a localised "continue" user message instead.
-		const continueText = getToolMessage("interruptionContinue", locale);
+		// No pending tool calls — send a simple "continue" user message.
+		const continueText = getToolMessage("userContinue", locale);
 		await feedMessage(narratorId, continueText, undefined, locale, replyInUserLanguage);
 		return { ok: true };
 	}

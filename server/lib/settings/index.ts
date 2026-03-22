@@ -482,6 +482,25 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		}
 	}
 
+	// Clean up agent fields that reference models from providers no longer in settings.
+	const activePrefixes = new Set<string>();
+	for (const prov of merged.openaiProviders ?? []) {
+		if (prov.prefix) activePrefixes.add(prov.prefix);
+	}
+	for (const prov of merged.anthropicProviders ?? []) {
+		if (prov.prefix) activePrefixes.add(prov.prefix);
+	}
+		if (prov.prefix) activePrefixes.add(prov.prefix);
+	}
+	for (const prov of merged.clineProviders ?? []) {
+		if (prov.prefix) activePrefixes.add(prov.prefix);
+	}
+	// Also allow built-in providers that have no provider config
+
+	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
+		needsSave = true;
+	}
+
 	if (needsSave) saveSettings(merged);
 
 	return merged;
@@ -490,6 +509,51 @@ function loadSettingsFromDisk(): NarraForkSettings {
 /** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
 function generateMigrationId(): string {
 	return randomBytes(6).toString("base64url").slice(0, 8);
+}
+
+/**
+ * Purge stale model references from agent settings.
+ * `isPrefixStale` receives the prefix portion of a model value (before ":") and
+ * returns true if that prefix should be considered stale.
+ * Mutates `settings.agent` in place. Returns true if any field was changed.
+ */
+export function purgeStaleAgentModelRefs(
+	settings: NarraForkSettings,
+	isPrefixStale: (prefix: string) => boolean,
+): boolean {
+	const isStale = (val: string | undefined): boolean => {
+		if (!val) return false;
+		const prefix = val.split(":")[0];
+		return !!prefix && isPrefixStale(prefix);
+	};
+
+	let dirty = false;
+	if (isStale(settings.agent.summaryModel)) {
+		settings.agent.summaryModel = "";
+		dirty = true;
+	}
+	for (const key of ["explore", "plan"] as const) {
+		if (isStale(settings.agent.subagentModels[key])) {
+			settings.agent.subagentModels[key] = "";
+			dirty = true;
+		}
+	}
+	const origHidden = settings.agent.hiddenModels ?? [];
+	const cleanedHidden = origHidden.filter((m) => !isStale(m));
+	if (cleanedHidden.length !== origHidden.length) {
+		settings.agent.hiddenModels = cleanedHidden;
+		dirty = true;
+	}
+	const origWindows = settings.agent.modelContextWindows ?? {};
+	const cleanedWindows: Record<string, number> = {};
+	for (const [k, v] of Object.entries(origWindows)) {
+		if (!isStale(k)) cleanedWindows[k] = v;
+	}
+	if (Object.keys(cleanedWindows).length !== Object.keys(origWindows).length) {
+		settings.agent.modelContextWindows = cleanedWindows;
+		dirty = true;
+	}
+	return dirty;
 }
 
 /** Internal mutable holder — `settings` re-exports its properties via the proxy-like sync in saveSettings. */

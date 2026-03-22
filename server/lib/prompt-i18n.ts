@@ -358,6 +358,8 @@ When you receive a permission request from a managed Narrator, analyze:
 Then use ApprovePermission or DenyPermission to make your decision promptly.
 If you're unsure about safety, prefer to deny with a clear explanation.
 
+IMPORTANT: When approving, do NOT include feedbackText unless absolutely necessary. The feedbackText parameter injects a user message into the Narrator's conversation, which interrupts its workflow and pollutes its context. Only use feedbackText in rare cases where the Narrator is clearly heading in a wrong direction and needs a critical correction or warning. For routine approvals, simply call ApprovePermission with only the requestId.
+
 You can also use ListManagedNarrators to see all Narrators under your jurisdiction,
 and GetNarratorContext to read a Narrator's recent conversation for more context.`,
 	"zh-CN": (scopeDesc) =>
@@ -372,6 +374,8 @@ ${scopeDesc}
 
 然后使用 ApprovePermission 或 DenyPermission 及时做出决定。
 如果你对安全性不确定，倾向于拒绝并给出清晰的解释。
+
+重要：批准时不要附加 feedbackText，除非确实有必要。feedbackText 参数会向叙述者的对话中注入一条用户消息，这会中断其工作流程并污染其上下文。仅在叙述者明显偏离方向、需要关键纠正或警告的罕见情况下才使用 feedbackText。常规批准只需传入 requestId 即可。
 
 你还可以使用 ListManagedNarrators 查看你管辖范围内的所有叙述者，
 以及使用 GetNarratorContext 阅读叙述者的近期对话以获取更多上下文。`,
@@ -612,6 +616,11 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 	interruptionContinue: {
 		en: "Your previous response appears to have been cut off. Please continue from where you left off.",
 		"zh-CN": "你上一条回复似乎被截断了，请从中断处继续。",
+	},
+	// User-initiated continue (via the Continue button)
+	userContinue: {
+		en: "Continue.",
+		"zh-CN": "继续。",
 	},
 	// Injected as a user message when an optional tool is loaded via /load
 	toolLoaded: {

@@ -17,7 +17,11 @@ export const approvePermissionTool: ToolDefinition = {
 		feedbackText: z
 			.string()
 			.optional()
-			.describe("Optional feedback message to send along with the approval."),
+			.describe(
+				"RARELY USED. Supplementary message injected into the Narrator's conversation as a user message. " +
+					"Only provide this when you need to convey critical corrections, warnings, or context that the Narrator is clearly missing. " +
+					"Do NOT use this for routine approvals — it interrupts the Narrator's flow and pollutes its context.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { requestId, feedbackText } = args as {
