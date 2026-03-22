@@ -14,6 +14,7 @@ const MAX_BATCH_QUERIES = 10;
 const MAX_READ_LIMIT = 50;
 const DEFAULT_READ_LIMIT = 20;
 const SNIPPET_CHARS = 300;
+const MAX_TOOL_CALL_OUTPUT = 4000;
 
 export const recallTool: ToolDefinition = {
 	name: "Recall",
@@ -21,15 +22,18 @@ export const recallTool: ToolDefinition = {
 		"Search and browse all narrator conversations in NarraFork. " +
 		"Use this to recall previous discussions, find relevant context from other sessions, " +
 		"or explore what was discussed in any chapter.\n\n" +
-		"Two actions are available:\n" +
+		"Three actions are available:\n" +
 		'- "search": Full-text search across all narrator messages. Returns matching snippets with metadata. ' +
 		"Pass an array of strings to `query` to run multiple searches in one call.\n" +
 		'- "read_conversation": Read messages from a specific narrator session. ' +
-		"Optionally center around a specific message ID (e.g. from a search result).",
+		"Each assistant message includes a summary of its tool calls (tool name + key params). " +
+		"Optionally center around a specific message ID (e.g. from a search result).\n" +
+		'- "read_tool_call": Read the full input/output of a specific tool call by its toolUseId ' +
+		"(obtained from read_conversation results).",
 	parameters: z.object({
 		action: z
-			.enum(["search", "read_conversation"])
-			.describe('The action to perform: "search" or "read_conversation"'),
+			.enum(["search", "read_conversation", "read_tool_call"])
+			.describe('The action to perform: "search", "read_conversation", or "read_tool_call"'),
 		query: z
 			.union([z.string(), z.array(z.string())])
 			.optional()
@@ -48,6 +52,10 @@ export const recallTool: ToolDefinition = {
 				"Optional message ID to center the read around. " +
 					"If omitted, returns the most recent messages.",
 			),
+		tool_call_id: z
+			.string()
+			.optional()
+			.describe('The toolUseId of the tool call to read (required for action "read_tool_call")'),
 		limit: z
 			.number()
 			.optional()
@@ -57,11 +65,12 @@ export const recallTool: ToolDefinition = {
 	}),
 
 	async execute(args): Promise<ToolResult> {
-		const { action, query, narrator_id, message_id, limit } = args as {
-			action: "search" | "read_conversation";
+		const { action, query, narrator_id, message_id, tool_call_id, limit } = args as {
+			action: "search" | "read_conversation" | "read_tool_call";
 			query?: string | string[];
 			narrator_id?: string;
 			message_id?: string;
+			tool_call_id?: string;
 			limit?: number;
 		};
 
@@ -101,6 +110,9 @@ export const recallTool: ToolDefinition = {
 				} satisfies BatchSearchMetadata,
 			};
 		}
+		if (action === "read_tool_call") {
+			return handleReadToolCall(tool_call_id);
+		}
 		return handleReadConversation(narrator_id, message_id, limit);
 	},
 };
@@ -131,12 +143,93 @@ interface BatchSearchMetadata {
 	results: SearchResultItem[];
 }
 
+interface ConversationToolCall {
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	summary: string;
+}
+
 interface ConversationMessage {
 	id: string;
 	seq: number;
 	role: string;
 	text: string;
 	createdAt: string;
+	toolCalls?: ConversationToolCall[];
+}
+
+// ---------------------------------------------------------------------------
+// Tool call summary — lightweight server-side equivalent of frontend getSummary
+// ---------------------------------------------------------------------------
+
+function basename(p: string): string {
+	const parts = p.split("/");
+	return parts[parts.length - 1] || p;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+function extractStr(obj: any, ...keys: string[]): string {
+	if (!obj || typeof obj !== "object") return "";
+	for (const k of keys) {
+		if (typeof obj[k] === "string") return obj[k];
+	}
+	return "";
+}
+
+const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit", "Glob"]);
+const BASH_TOOLS = new Set(["Bash", "Shell"]);
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+function getToolCallSummary(toolName: string, inputJson: any): string {
+	if (!inputJson || typeof inputJson !== "object") return toolName;
+
+	if (FILE_TOOLS.has(toolName)) {
+		const fp = extractStr(inputJson, "file_path", "filePath", "path", "pattern");
+		return fp ? basename(fp) : toolName;
+	}
+	if (BASH_TOOLS.has(toolName)) {
+		const cmd = extractStr(inputJson, "command");
+		if (!cmd) return toolName;
+		return cmd.length > 80 ? `${cmd.slice(0, 77)}...` : cmd;
+	}
+	if (toolName === "Grep") {
+		const pat = extractStr(inputJson, "pattern");
+		return pat ? (pat.length > 60 ? `${pat.slice(0, 57)}...` : pat) : toolName;
+	}
+	if (toolName === "WebSearch") {
+		const q = extractStr(inputJson, "query");
+		return q ? (q.length > 60 ? `${q.slice(0, 57)}...` : q) : "Web Search";
+	}
+	if (toolName === "WebFetch") {
+		const url = extractStr(inputJson, "url");
+		const mode = extractStr(inputJson, "mode");
+		if (!url) return mode || "WebFetch";
+		const short = url.length > 50 ? `${url.slice(0, 47)}...` : url;
+		return mode ? `${mode}: ${short}` : short;
+	}
+	if (toolName === "Agent" || toolName === "ContinueTask") {
+		return extractStr(inputJson, "description", "prompt").slice(0, 60) || toolName;
+	}
+	if (toolName === "Terminal") {
+		const action = extractStr(inputJson, "action");
+		return action || "Terminal";
+	}
+	if (toolName === "ShareFile") {
+		const fp = extractStr(inputJson, "path");
+		return fp ? basename(fp) : "Share";
+	}
+	if (toolName === "AskUserQuestion") {
+		const qs = inputJson.questions;
+		if (Array.isArray(qs) && qs.length > 0) {
+			return extractStr(qs[0], "header") || "Question";
+		}
+		return "Question";
+	}
+	if (toolName === "TaskCreate") return "Update todos";
+	if (toolName === "EnterPlanMode") return "Enter plan mode";
+	if (toolName === "ExitPlanMode") return "Plan ready";
+	return toolName;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,13 +393,55 @@ function handleReadConversation(
 		return { output: `No messages found for narrator "${narratorId}".` };
 	}
 
-	const messages: ConversationMessage[] = rows.map((row) => ({
-		id: row.id,
-		seq: row.seq,
-		role: row.role,
-		text: (row.content_text ?? "").slice(0, 500),
-		createdAt: row.created_at,
-	}));
+	// Batch-load tool calls for all message IDs
+	const messageIds = rows.map((r) => r.id as string);
+	const tcRows = sqlite
+		.prepare(
+			`SELECT tool_use_id, tool_name, status, input_json, message_id
+			 FROM narrator_tool_calls
+			 WHERE message_id IN (${messageIds.map(() => "?").join(",")})
+			 ORDER BY created_at ASC`,
+		)
+		.all(...messageIds) as Array<{
+		tool_use_id: string;
+		tool_name: string;
+		status: string;
+		input_json: string | null;
+		message_id: string;
+	}>;
+
+	// Group tool calls by message ID
+	const tcByMessage = new Map<string, ConversationToolCall[]>();
+	for (const tc of tcRows) {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+		let parsed: any = null;
+		try {
+			parsed = tc.input_json ? JSON.parse(tc.input_json) : null;
+		} catch {
+			// ignore parse errors
+		}
+		const entry: ConversationToolCall = {
+			toolUseId: tc.tool_use_id,
+			toolName: tc.tool_name,
+			status: tc.status,
+			summary: getToolCallSummary(tc.tool_name, parsed),
+		};
+		const list = tcByMessage.get(tc.message_id);
+		if (list) list.push(entry);
+		else tcByMessage.set(tc.message_id, [entry]);
+	}
+
+	const messages: ConversationMessage[] = rows.map((row) => {
+		const tcs = tcByMessage.get(row.id);
+		return {
+			id: row.id,
+			seq: row.seq,
+			role: row.role,
+			text: (row.content_text ?? "").slice(0, 500),
+			createdAt: row.created_at,
+			...(tcs && tcs.length > 0 ? { toolCalls: tcs } : {}),
+		};
+	});
 
 	const header =
 		`Narrator: ${narrator.title ?? narratorId}` +
@@ -317,7 +452,13 @@ function handleReadConversation(
 	const lines: string[] = [header];
 	for (const msg of messages) {
 		const text = msg.text.replace(/\n/g, "\n  ");
-		lines.push(`[seq=${msg.seq}] ${msg.role} (${msg.id}) at ${msg.createdAt}:\n  ${text}\n`);
+		lines.push(`[seq=${msg.seq}] ${msg.role} (${msg.id}) at ${msg.createdAt}:\n  ${text}`);
+		if (msg.toolCalls && msg.toolCalls.length > 0) {
+			for (const tc of msg.toolCalls) {
+				lines.push(`    [${tc.status}] ${tc.toolName}: ${tc.summary}  (toolUseId=${tc.toolUseId})`);
+			}
+		}
+		lines.push("");
 	}
 
 	return {
@@ -330,6 +471,120 @@ function handleReadConversation(
 			chapterId: narrator.chapter_id,
 			model: narrator.model,
 			messages,
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// read_tool_call
+// ---------------------------------------------------------------------------
+
+function handleReadToolCall(toolCallId: string | undefined): ToolResult {
+	if (!toolCallId) {
+		return {
+			output: 'Parameter "tool_call_id" is required for action "read_tool_call".',
+			isError: true,
+		};
+	}
+
+	const tc = sqlite
+		.prepare(
+			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
+			        tc.duration_ms, tc.error_message, tc.created_at,
+			        tc.narrator_id, n.title AS narrator_title
+			 FROM narrator_tool_calls tc
+			 JOIN narrators n ON n.id = tc.narrator_id
+			 WHERE tc.tool_use_id = ?`,
+		)
+		.get(toolCallId) as
+		| {
+				tool_use_id: string;
+				tool_name: string;
+				status: string;
+				input_json: string | null;
+				output_json: string | null;
+				duration_ms: number | null;
+				error_message: string | null;
+				created_at: string;
+				narrator_id: string;
+				narrator_title: string | null;
+		  }
+		| undefined;
+
+	if (!tc) {
+		return { output: `Tool call "${toolCallId}" not found.`, isError: true };
+	}
+
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+	let inputParsed: any = null;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+	let outputParsed: any = null;
+	try {
+		inputParsed = tc.input_json ? JSON.parse(tc.input_json) : null;
+	} catch {
+		// keep raw
+	}
+	try {
+		outputParsed = tc.output_json ? JSON.parse(tc.output_json) : null;
+	} catch {
+		// keep raw
+	}
+
+	const summary = getToolCallSummary(tc.tool_name, inputParsed);
+
+	const lines: string[] = [
+		`Tool: ${tc.tool_name} — ${summary}`,
+		`Status: ${tc.status}${tc.duration_ms != null ? ` (${tc.duration_ms}ms)` : ""}`,
+		`Narrator: ${tc.narrator_title ?? tc.narrator_id}`,
+		`Created: ${tc.created_at}`,
+	];
+
+	if (tc.error_message) {
+		lines.push(`\nError: ${tc.error_message}`);
+	}
+
+	// Input
+	lines.push("\n--- Input ---");
+	const inputStr = inputParsed ? JSON.stringify(inputParsed, null, 2) : (tc.input_json ?? "(none)");
+	lines.push(
+		inputStr.length > MAX_TOOL_CALL_OUTPUT
+			? `${inputStr.slice(0, MAX_TOOL_CALL_OUTPUT)}\n... (truncated, ${inputStr.length} chars total)`
+			: inputStr,
+	);
+
+	// Output
+	lines.push("\n--- Output ---");
+	if (outputParsed) {
+		// outputJson may have _text (common for bash/read results)
+		const textContent = typeof outputParsed._text === "string" ? outputParsed._text : null;
+		const outputStr = textContent ?? JSON.stringify(outputParsed, null, 2);
+		lines.push(
+			outputStr.length > MAX_TOOL_CALL_OUTPUT
+				? `${outputStr.slice(0, MAX_TOOL_CALL_OUTPUT)}\n... (truncated, ${outputStr.length} chars total)`
+				: outputStr,
+		);
+	} else {
+		const raw = tc.output_json ?? "(none)";
+		lines.push(
+			raw.length > MAX_TOOL_CALL_OUTPUT
+				? `${raw.slice(0, MAX_TOOL_CALL_OUTPUT)}\n... (truncated, ${raw.length} chars total)`
+				: raw,
+		);
+	}
+
+	return {
+		output: lines.join("\n"),
+		title: `${tc.tool_name}: ${summary}`,
+		metadata: {
+			action: "read_tool_call",
+			toolUseId: tc.tool_use_id,
+			toolName: tc.tool_name,
+			status: tc.status,
+			durationMs: tc.duration_ms,
+			narratorId: tc.narrator_id,
+			narratorTitle: tc.narrator_title,
+			input: inputParsed,
+			output: outputParsed,
 		},
 	};
 }
