@@ -3,9 +3,15 @@ import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
+import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
+import {
+	createBranch,
+	createLeafWith,
+	type SplitDirection,
+} from "../../components/narrator/split-tree";
 import { NarratorTerminal } from "../../components/terminal/NarratorTerminal";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
@@ -13,6 +19,11 @@ import { usePageUnload } from "../../hooks/usePageUnload";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
 import { api } from "../../lib/api";
+import {
+	type NarratorDragState,
+	onNarratorDragEnd,
+	onNarratorDragMove,
+} from "../../lib/narrator-drag";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
@@ -20,6 +31,14 @@ export const Route = createFileRoute("/narrators/$narratorId")({
 
 const MIN_PANEL_WIDTH = 200;
 const DEFAULT_TERMINAL_RATIO = 0.4;
+
+/** Drop zone overlay styles for drag-to-split — static, no need to recreate per render. */
+const DROP_OVERLAY_STYLES: Record<string, React.CSSProperties> = {
+	left: { left: 0, top: 0, width: "50%", height: "100%" },
+	right: { right: 0, top: 0, width: "50%", height: "100%" },
+	top: { left: 0, top: 0, width: "100%", height: "50%" },
+	bottom: { left: 0, bottom: 0, width: "100%", height: "50%" },
+};
 
 function terminalStorageKey(narratorId: string) {
 	return `narrafork_terminal_open_${narratorId}`;
@@ -301,6 +320,104 @@ function NarratorDetailPage() {
 		}
 	}, [narratorId, isMobile, closeDrawer, runningCount]);
 
+	// ── Drag-to-split: drop zone for creating workspace ──
+	type DropSide = "left" | "right" | "top" | "bottom" | null;
+	const [dropSide, setDropSide] = useState<DropSide>(null);
+	const dropSideRef = useRef<DropSide>(null);
+	const pageBoxRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const computeSide = (rect: DOMRect, x: number, y: number): DropSide => {
+			const relX = (x - rect.left) / rect.width;
+			const relY = (y - rect.top) / rect.height;
+			// Edge threshold: 30% from each edge
+			if (relX < 0.3) return "left";
+			if (relX > 0.7) return "right";
+			if (relY < 0.3) return "top";
+			if (relY > 0.7) return "bottom";
+			return "right"; // default to right split
+		};
+
+		const unsubMove = onNarratorDragMove((state: NarratorDragState) => {
+			// Don't allow dropping the same narrator
+			if (state.narratorId === narratorId) {
+				if (dropSideRef.current) {
+					dropSideRef.current = null;
+					setDropSide(null);
+				}
+				return;
+			}
+			const el = pageBoxRef.current;
+			if (!el) return;
+			const rect = el.getBoundingClientRect();
+			const inside =
+				state.x >= rect.left &&
+				state.x <= rect.right &&
+				state.y >= rect.top &&
+				state.y <= rect.bottom;
+			if (inside) {
+				const side = computeSide(rect, state.x, state.y);
+				dropSideRef.current = side;
+				setDropSide(side);
+			} else if (dropSideRef.current) {
+				dropSideRef.current = null;
+				setDropSide(null);
+			}
+		});
+
+		const unsubEnd = onNarratorDragEnd((final: NarratorDragState | null) => {
+			const side = dropSideRef.current;
+			dropSideRef.current = null;
+			setDropSide(null);
+			if (!final || !side || final.narratorId === narratorId) return;
+
+			// Create workspace with two panels
+			const direction: SplitDirection =
+				side === "left" || side === "right" ? "horizontal" : "vertical";
+			const currentLeaf = createLeafWith(narratorId);
+			const droppedLeaf = createLeafWith(final.narratorId);
+			const children =
+				side === "left" || side === "top" ? [droppedLeaf, currentLeaf] : [currentLeaf, droppedLeaf];
+			const tree = createBranch(direction, children);
+
+			api
+				.createWorkspace({ tree: JSON.stringify(tree) })
+				.then((ws) => {
+					addRecentTab({
+						type: "workspace",
+						id: ws.id,
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+						title: (ws as any).title || "Workspace",
+					});
+					// Mark both narrator tabs as belonging to this workspace
+					addRecentTab({
+						type: "narrator",
+						id: narratorId,
+						title: "",
+						workspaceId: ws.id,
+						updateOnly: true,
+					});
+					addRecentTab({
+						type: "narrator",
+						id: final.narratorId,
+						title: "",
+						workspaceId: ws.id,
+						updateOnly: true,
+					});
+					navigate({
+						to: "/narrators/workspace/$workspaceId",
+						params: { workspaceId: ws.id },
+					});
+				})
+				.catch(() => {});
+		});
+
+		return () => {
+			unsubMove();
+			unsubEnd();
+		};
+	}, [narratorId, navigate]);
+
 	// Desktop drag handle for resizing (mouse + touch)
 	const dragCleanupRef = useRef<(() => void) | null>(null);
 	const onDragStart = useCallback((e: React.MouseEvent | React.TouchEvent) => {
@@ -344,6 +461,12 @@ function NarratorDetailPage() {
 		return () => {
 			dragCleanupRef.current?.();
 		};
+	}, []);
+
+	// Merged ref for both terminal resize and drop zone detection
+	const mergedRef = useCallback((el: HTMLDivElement | null) => {
+		(containerRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+		pageBoxRef.current = el;
 	}, []);
 
 	// Mobile layout
@@ -416,9 +539,10 @@ function NarratorDetailPage() {
 	}
 
 	// Desktop layout: side by side
+
 	return (
 		<Box
-			ref={containerRef}
+			ref={mergedRef}
 			h="calc(100dvh - 60px)"
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
@@ -474,6 +598,22 @@ function NarratorDetailPage() {
 						/>
 					</Box>
 				</>
+			)}
+
+			{/* Drop zone overlay for drag-to-split */}
+			{dropSide && (
+				<Box
+					style={{
+						position: "absolute",
+						...DROP_OVERLAY_STYLES[dropSide],
+						backgroundColor: "var(--mantine-color-indigo-9)",
+						opacity: 0.2,
+						borderRadius: 4,
+						pointerEvents: "none",
+						transition: "all 100ms ease",
+						zIndex: 100,
+					}}
+				/>
 			)}
 		</Box>
 	);

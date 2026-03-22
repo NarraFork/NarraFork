@@ -2,6 +2,8 @@ import {
 	closestCenter,
 	DndContext,
 	type DragEndEvent,
+	type DragMoveEvent,
+	type DragStartEvent,
 	KeyboardSensor,
 	MouseSensor,
 	TouchSensor,
@@ -25,6 +27,7 @@ import {
 import {
 	IconArrowUp,
 	IconBox,
+	IconColumns,
 	IconFolder,
 	IconGitBranch,
 	IconMessageCircle,
@@ -34,15 +37,25 @@ import {
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
-import { type RecentTab, type RecentTabViewer, useRecentTabs } from "../../hooks/useRecentTabs";
+import {
+	addRecentTab,
+	type RecentTab,
+	type RecentTabViewer,
+	useRecentTabs,
+} from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import { startNarratorDrag } from "../../lib/narrator-drag";
+import {
+	endNarratorDrag,
+	moveNarratorDrag,
+	startNarratorDrag,
+	startNarratorDragManual,
+} from "../../lib/narrator-drag";
 import { triggerNotification } from "../../lib/notification";
 import { UserAvatar } from "../UserAvatar";
 
@@ -255,29 +268,90 @@ export function RecentTabList({
 		[tabs, filter],
 	);
 
+	// Split into top-level tabs and workspace children
+	const { topLevel, childrenByWorkspace } = useMemo(() => {
+		const top: RecentTab[] = [];
+		const byWs = new Map<string, RecentTab[]>();
+		for (const tab of filtered) {
+			if (tab.workspaceId) {
+				const arr = byWs.get(tab.workspaceId);
+				if (arr) arr.push(tab);
+				else byWs.set(tab.workspaceId, [tab]);
+			} else {
+				top.push(tab);
+			}
+		}
+		return { topLevel: top, childrenByWorkspace: byWs };
+	}, [filtered]);
+
 	const sensors = useSensors(
 		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
 		useSensor(KeyboardSensor),
 	);
 
+	// Bridge @dnd-kit drag into global narrator drag so workspace panels can receive drops
+	const handleDragStart = useCallback(
+		(event: DragStartEvent) => {
+			const tab = topLevel.find((t) => tabSortId(t) === event.active.id);
+			if (!tab) return;
+			const nId = tab.type === "narrator" ? tab.id : tab.type === "chapter" ? tab.narratorId : null;
+			if (!nId) return;
+			const me = event.activatorEvent as MouseEvent | TouchEvent;
+			const x = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
+			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
+			startNarratorDragManual(nId, tab.title, x, y);
+		},
+		[topLevel],
+	);
+
+	const handleDragMove = useCallback((event: DragMoveEvent) => {
+		const me = event.activatorEvent as MouseEvent | TouchEvent;
+		const baseX = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
+		const baseY = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
+		moveNarratorDrag(baseX + event.delta.x, baseY + event.delta.y);
+	}, []);
+
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
 			justDragged = true;
+			// End global narrator drag first — workspace drop handlers run synchronously
+			endNarratorDrag();
+
 			const { active, over } = event;
 			if (!over || active.id === over.id) return;
-			const oldIndex = filtered.findIndex((t) => tabSortId(t) === active.id);
-			const newIndex = filtered.findIndex((t) => tabSortId(t) === over.id);
+			const oldIndex = topLevel.findIndex((t) => tabSortId(t) === active.id);
+			const newIndex = topLevel.findIndex((t) => tabSortId(t) === over.id);
 			if (oldIndex === -1 || newIndex === -1) return;
 
 			// Compute the global index in the full tabs array based on the target tab's actual position.
-			const targetTab = filtered[newIndex];
+			const targetTab = topLevel[newIndex];
 			const globalIndex = tabs.findIndex((t) => tabSortId(t) === tabSortId(targetTab));
 			if (globalIndex === -1) return;
 
 			moveTab(active.id as string, { toIndex: globalIndex });
 		},
-		[filtered, tabs, moveTab],
+		[topLevel, tabs, moveTab],
+	);
+
+	/** Release all child tabs from a workspace and delete the workspace entity. */
+	const releaseWorkspace = useCallback(
+		(wsId: string) => {
+			const children = childrenByWorkspace.get(wsId);
+			if (children) {
+				for (const child of children) {
+					addRecentTab({
+						type: child.type,
+						id: child.id,
+						title: child.title,
+						workspaceId: null,
+						updateOnly: true,
+					});
+				}
+			}
+			api.deleteWorkspace(wsId).catch(() => {});
+		},
+		[childrenByWorkspace],
 	);
 
 	/** Remove a tab and navigate to dashboard if it was the active page. */
@@ -287,9 +361,10 @@ export function RecentTabList({
 			if (tab && isTabActive(tab, pathname)) {
 				navigate({ to: "/" });
 			}
+			if (type === "workspace") releaseWorkspace(id);
 			removeTab(type, id);
 		},
-		[removeTab, tabs, pathname, navigate],
+		[removeTab, tabs, pathname, navigate, releaseWorkspace],
 	);
 
 	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
@@ -311,9 +386,10 @@ export function RecentTabList({
 		if (isTabActive(tab, pathname)) {
 			navigate({ to: "/" });
 		}
+		if (tab.type === "workspace") releaseWorkspace(tab.id);
 		removeTab(tab.type, tab.id);
 		setCtxMenu(null);
-	}, [ctxMenu, removeTab, pathname, navigate]);
+	}, [ctxMenu, removeTab, pathname, navigate, releaseWorkspace]);
 
 	const platform = usePlatform();
 
@@ -338,27 +414,55 @@ export function RecentTabList({
 		}
 	}, [ctxMenu]);
 
-	if (filtered.length === 0) return null;
+	const handleDragCancel = useCallback(() => {
+		endNarratorDrag();
+	}, []);
 
-	const sortIds = filtered.map(tabSortId);
+	if (topLevel.length === 0) return null;
+
+	const sortIds = topLevel.map(tabSortId);
 
 	return (
 		<Box style={{ overflow: "hidden" }}>
-			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+			<DndContext
+				sensors={sensors}
+				collisionDetection={closestCenter}
+				onDragStart={handleDragStart}
+				onDragMove={handleDragMove}
+				onDragEnd={handleDragEnd}
+				onDragCancel={handleDragCancel}
+			>
 				<SortableContext items={sortIds} strategy={verticalListSortingStrategy}>
-					{filtered.map((tab, i) => (
-						<SortableTabItem
-							key={tabSortId(tab)}
-							tab={tab}
-							active={
-								isTabActive(tab, pathname) &&
-								!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
-							}
-							onRemove={handleRemove}
-							onNavigate={onNavigate}
-							onContextMenu={handleContextMenu}
-							connectTop={firstTabConnected && i === 0}
-						/>
+					{topLevel.map((tab, i) => (
+						<React.Fragment key={tabSortId(tab)}>
+							<SortableTabItem
+								tab={tab}
+								active={
+									isTabActive(tab, pathname) &&
+									!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
+								}
+								onRemove={handleRemove}
+								onNavigate={onNavigate}
+								onContextMenu={handleContextMenu}
+								connectTop={firstTabConnected && i === 0}
+							/>
+							{/* Render workspace children indented below */}
+							{tab.type === "workspace" &&
+								childrenByWorkspace
+									.get(tab.id)
+									?.map((child) => (
+										<WorkspaceChildTab
+											key={tabSortId(child)}
+											tab={child}
+											active={
+												isTabActive(child, pathname) &&
+												!(excludeActiveNarratorId && child.id === excludeActiveNarratorId)
+											}
+											onNavigate={onNavigate}
+											onContextMenu={handleContextMenu}
+										/>
+									))}
+						</React.Fragment>
 					))}
 				</SortableContext>
 			</DndContext>
@@ -372,7 +476,7 @@ export function RecentTabList({
 					onReveal={handleReveal}
 					canReveal={platform !== "linux" && ctxMenu.tab.type !== "project"}
 					isFirst={
-						filtered.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
+						topLevel.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
 					}
 					t={t}
 				/>
@@ -388,7 +492,73 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "chapter") {
 		return tab.narratorId ? pathname === `/narrators/${tab.narratorId}` : false;
 	}
+	if (tab.type === "workspace") {
+		return pathname === `/narrators/workspace/${tab.id}`;
+	}
 	return pathname === `/narrators/${tab.id}`;
+}
+
+/** Non-sortable child tab rendered indented under a workspace tab. */
+function WorkspaceChildTab({
+	tab,
+	active,
+	onNavigate,
+	onContextMenu,
+}: {
+	tab: RecentTab;
+	active: boolean;
+	onNavigate?: () => void;
+	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
+}) {
+	const navigate = useNavigate();
+	const to =
+		tab.type === "chapter" && tab.narratorId
+			? `/narrators/${tab.narratorId}`
+			: `/narrators/${tab.id}`;
+	const iconColor = tab.status
+		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		: undefined;
+	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+
+	return (
+		<Box pl="lg">
+			<NavLink
+				active={active}
+				label={
+					<Text
+						size="xs"
+						truncate="end"
+						style={{ overflow: "hidden", textOverflow: "ellipsis", textAlign: "left" }}
+					>
+						{tab.title}
+					</Text>
+				}
+				leftSection={
+					tab.type === "chapter" ? (
+						<IconGitBranch
+							size={14}
+							color={iconColor}
+							fill={filledStatus ? "currentColor" : "none"}
+						/>
+					) : filledStatus ? (
+						<IconMessageCircleFilled size={14} color={iconColor} />
+					) : (
+						<IconMessageCircle size={14} color={iconColor} />
+					)
+				}
+				onClick={() => {
+					onNavigate?.();
+					navigate({ to });
+				}}
+				onContextMenu={(e) => onContextMenu(e, tab)}
+				py={2}
+				styles={{
+					root: { borderRadius: 4, minHeight: 28 },
+					label: { overflow: "hidden" },
+				}}
+			/>
+		</Box>
+	);
 }
 
 interface SortableTabItemProps {
@@ -416,7 +586,9 @@ function SortableTabItem({
 			? `/projects/${tab.id}`
 			: tab.type === "chapter" && tab.narratorId
 				? `/narrators/${tab.narratorId}`
-				: `/narrators/${tab.id}`;
+				: tab.type === "workspace"
+					? `/narrators/workspace/${tab.id}`
+					: `/narrators/${tab.id}`;
 	const iconColor = tab.status
 		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
 		: undefined;
@@ -589,6 +761,8 @@ function SortableTabItem({
 						>
 							{tab.type === "project" ? (
 								<IconFolder size={16} />
+							) : tab.type === "workspace" ? (
+								<IconColumns size={16} />
 							) : tab.type === "chapter" ? (
 								<IconGitBranch
 									size={16}

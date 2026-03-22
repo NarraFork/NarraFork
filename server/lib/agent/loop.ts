@@ -6,6 +6,7 @@ import {
 	settings,
 } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
+import { estimateTokens } from "./estimate-tokens";
 import { resolveProviderAndModel } from "./provider";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
@@ -451,6 +452,8 @@ export async function* agentLoop(
 			string,
 			{ query?: string; queries?: string[]; emitted: boolean }
 		>();
+		// Track whether the provider reported usage data during this turn
+		let receivedUsage = false;
 
 		try {
 			const stream = provider.chat({
@@ -793,6 +796,7 @@ export async function* agentLoop(
 					}
 				}
 				if (parsed.contextUsagePercentage != null) {
+					receivedUsage = true;
 					yield { type: "context_usage", percentage: parsed.contextUsagePercentage };
 				}
 				if (parsed.metering) {
@@ -807,6 +811,7 @@ export async function* agentLoop(
 				}
 				// Convert OpenAI/Anthropic usage to context_usage percentage
 				if (parsed.usage && parsed.usage.promptTokens != null) {
+					receivedUsage = true;
 					const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (contextWindow) {
 						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
@@ -956,6 +961,29 @@ export async function* agentLoop(
 			}
 			yield { type: "error", message: msg };
 			return;
+		}
+
+		// ── Fallback: estimate context usage when the provider reported nothing ──
+		if (!receivedUsage) {
+			const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+			if (contextWindow) {
+				// Estimate prompt tokens from history + system prompt + current turn content
+				const historyText = JSON.stringify(history);
+				const systemText = config.systemPrompt ?? "";
+				const estimatedPromptTokens =
+					estimateTokens(historyText) +
+					estimateTokens(systemText) +
+					estimateTokens(content) +
+					estimateTokens(assistantText);
+				const percentage = Math.min((estimatedPromptTokens / contextWindow) * 100, 100);
+				yield {
+					type: "context_usage",
+					percentage,
+					promptTokens: estimatedPromptTokens,
+					contextWindow,
+					isEstimated: true,
+				};
+			}
 		}
 
 		// Detect orphaned tool uses — tool calls whose streaming input was cut off
@@ -1432,6 +1460,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	const start = Date.now();
 
 	const effectiveInput = permission.updatedInput ?? tu.input;
+	const permissionNotice = permission.behavior === "allow" ? permission.notice : undefined;
 
 	// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
 	if ("_raw" in effectiveInput) {
@@ -1542,10 +1571,12 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 
 	try {
 		const result = await tool.execute(effectiveInput, ctx);
+		// Append permission notice (e.g. plan-mode file redirect) to non-error output
+		const appendNotice = permissionNotice && !result.isError ? `\n\n${permissionNotice}` : "";
 		// If the tool already truncated its output, pass through as-is.
 		if (result.truncated) {
 			return {
-				output: result.output,
+				output: result.output + appendNotice,
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
@@ -1555,7 +1586,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		}
 		const truncated = truncateOutput(result.output);
 		return {
-			output: truncated.content,
+			output: truncated.content + appendNotice,
 			isError: result.isError,
 			fatal: result.fatal,
 			durationMs: Date.now() - start,

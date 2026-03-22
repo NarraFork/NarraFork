@@ -506,9 +506,10 @@ export const updateUserPreferencesSchema = z.object({
 });
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "project"]),
+	type: z.enum(["chapter", "narrator", "project", "workspace"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
+	workspaceId: z.string().min(1).max(50).nullish(),
 	title: z.string().max(200),
 	subtitle: z.string().max(200).optional(),
 	status: z.string().max(50).optional(),
@@ -521,7 +522,7 @@ export const upsertRecentTabSchema = recentTabSchema.extend({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "session", "project"]),
+	type: z.enum(["chapter", "narrator", "session", "project", "workspace"]),
 	id: z.string().min(1).max(50),
 });
 
@@ -815,4 +816,16 @@ export const gitDiffQuerySchema = z.object({
 
 export const importProjectSchema = z.object({
 	gitPath: z.string().min(1),
+});
+
+// === Workspaces ===
+
+export const createWorkspaceSchema = z.object({
+	title: z.string().max(200).optional(),
+	tree: z.string().min(2).max(50000), // JSON string of SplitNode
+});
+
+export const updateWorkspaceSchema = z.object({
+	title: z.string().max(200).optional(),
+	tree: z.string().min(2).max(50000).optional(),
 });

@@ -261,7 +261,12 @@ export type NarratorEvent =
 	| { type: "interrupted"; data: { message: string } }
 	| {
 			type: "context_usage";
-			data: { percentage: number; promptTokens?: number; contextWindow?: number };
+			data: {
+				percentage: number;
+				promptTokens?: number;
+				contextWindow?: number;
+				isEstimated?: boolean;
+			};
 	  }
 	| { type: "done"; data: null };
 
@@ -1135,6 +1140,30 @@ export async function handlePermission(
 
 	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
 
+	// Plan mode: redirect Write/Edit targeting common plan file names (plan.md, PLAN.md)
+	// to the designated plan file, instead of rejecting outright.
+	// The model sometimes forgets the exact plan file path — this saves a wasted tool call.
+	let planRedirectNotice: string | undefined;
+	if (isPlanMode && !isRelaxedPlan && planFileId && (toolName === "Write" || toolName === "Edit")) {
+		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
+		if (filePath) {
+			const absPath = resolvePath(cwd, filePath);
+			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
+			if (!pathsEqual(absPath, planFilePath)) {
+				// Check if the filename looks like a generic plan file
+				const fileName = filePath.split("/").pop()?.toLowerCase() ?? "";
+				if (fileName === "plan.md") {
+					const correctRelPath = `.narrafork/plan-${planFileId}.md`;
+					effectiveInput = { ...effectiveInput, file_path: correctRelPath };
+					planRedirectNotice = getToolMessageWithParams("planModeFileRedirected", locale, {
+						originalPath: filePath,
+						planFile: correctRelPath,
+					});
+				}
+			}
+		}
+	}
+
 	// Load enabled whitelist/blacklist directories for this narrator.
 	// Subagents inherit their parent narrator's directories.
 	// Three-layer merge: global settings → project chapterSettings → narrator DB rows.
@@ -1363,7 +1392,11 @@ export async function handlePermission(
 					eq(narratorToolCalls.toolUseId, toolUseId),
 				),
 			);
-		return { behavior: "allow", updatedInput: effectiveInput };
+		return {
+			behavior: "allow",
+			updatedInput: effectiveInput,
+			...(planRedirectNotice ? { notice: planRedirectNotice } : {}),
+		};
 	}
 	if (decision === "deny") {
 		// Blacklist-triggered deny — use the specific reason from the blacklist check

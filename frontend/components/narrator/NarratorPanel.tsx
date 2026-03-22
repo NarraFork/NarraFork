@@ -13,7 +13,6 @@ import {
 	Modal,
 	NativeSelect,
 	Popover,
-	ScrollArea,
 	SegmentedControl,
 	Skeleton,
 	Stack,
@@ -39,8 +38,6 @@ import {
 	IconExternalLink,
 	IconFile,
 	IconFolderPlus,
-	IconLayoutColumns,
-	IconLayoutRows,
 	IconLock,
 	IconLockOpen,
 	IconPaperclip,
@@ -105,6 +102,7 @@ import {
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { UserAvatar } from "../UserAvatar";
+import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -149,8 +147,6 @@ import {
 import { getGlobalCloseSwipe, setGlobalOnSelectionRange, setGlobalSwipeAnchor } from "./swipeState";
 import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
-import type { VirtualMessageListHandle } from "./VirtualMessageList";
-import { VirtualMessageList } from "./VirtualMessageList";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
@@ -769,8 +765,6 @@ export function NarratorPanel({
 	isResizing,
 	onHeaderPointerDown,
 	onClose,
-	onSplitHorizontal,
-	onSplitVertical,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -1030,7 +1024,6 @@ export function NarratorPanel({
 	const dragCounterRef = useRef(0);
 
 	// --- Scroll state ---
-	// In column-reverse: scrollTop=0 means at bottom (newest messages visible).
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	// Whether older messages are currently being prepended. When true, the
@@ -1041,24 +1034,79 @@ export function NarratorPanel({
 	isAtBottomRef.current = isAtBottom;
 
 	// --- Scroll helpers ---
-	// In column-reverse, scrollTop=0 is the bottom. "scrollToBottom" simply
-	// sets scrollTop to 0. No RAF follow loop or programmatic-scroll suppression
-	// is needed — the browser natively anchors to the bottom.
-	const scrollToBottom = useCallback((_instant?: boolean, _vpRetries = 3) => {
-		const vp = viewportRef.current;
-		if (!vp) {
-			if (_vpRetries > 0) {
-				requestAnimationFrame(() => scrollToBottom(_instant, _vpRetries - 1));
+	const followRafRef = useRef(0);
+	const followingRef = useRef(false);
+	// Suppress detachFromBottom for programmatic scrollTop changes.
+	// - `programmaticScrollRef` is a one-shot flag for individual scrollTop writes
+	//   (e.g. scrollToBottom instant, startFollowing final snap).
+	// - `resizingRef` is a sustained flag that stays true for the entire duration
+	//   of a viewport resize (set by vpObserver, cleared after a 150ms debounce).
+	//   During a resize, multiple scroll events fire from multiple programmatic
+	//   scrollTop writes; a one-shot flag can't cover them all, so we need this
+	//   sustained flag to prevent the oscillation loop.
+	const programmaticScrollRef = useRef(false);
+	const resizingRef = useRef(false);
+
+	const lastFollowScrollTop = useRef(0);
+
+	const startFollowing = useCallback(() => {
+		if (followingRef.current) return;
+		const step = () => {
+			const vp = viewportRef.current;
+			if (!vp) {
+				followingRef.current = false;
+				return;
 			}
-			return;
-		}
-		vp.scrollTop = 0;
-		if (!isAtBottomRef.current) {
-			isAtBottomRef.current = true;
-			setIsAtBottom(true);
-		}
-		setUnreadCountRef.current?.(0);
+			// If scrollTop decreased since last frame, user scrolled up — stop following
+			if (vp.scrollTop < lastFollowScrollTop.current) {
+				followingRef.current = false;
+				return;
+			}
+			const target = vp.scrollHeight - vp.clientHeight;
+			const gap = target - vp.scrollTop;
+			if (gap < 1.5) {
+				programmaticScrollRef.current = true;
+				vp.scrollTop = target;
+				followingRef.current = false;
+				if (!isAtBottomRef.current) {
+					isAtBottomRef.current = true;
+					setIsAtBottom(true);
+					setUnreadCountRef.current?.(0);
+				}
+				return;
+			}
+			vp.scrollTop += Math.max(gap * 0.25, 1.5);
+			lastFollowScrollTop.current = vp.scrollTop;
+			followRafRef.current = requestAnimationFrame(step);
+		};
+		followingRef.current = true;
+		lastFollowScrollTop.current = viewportRef.current?.scrollTop ?? 0;
+		followRafRef.current = requestAnimationFrame(step);
 	}, []);
+
+	const stopFollowing = useCallback(() => {
+		followingRef.current = false;
+		cancelAnimationFrame(followRafRef.current);
+	}, []);
+
+	const scrollToBottom = useCallback(
+		(instant?: boolean) => {
+			const vp = viewportRef.current;
+			if (!vp) return;
+			if (!isAtBottomRef.current) {
+				isAtBottomRef.current = true;
+				setIsAtBottom(true);
+			}
+			setUnreadCountRef.current?.(0);
+			if (instant) {
+				programmaticScrollRef.current = true;
+				vp.scrollTop = vp.scrollHeight;
+			} else {
+				startFollowing();
+			}
+		},
+		[startFollowing],
+	);
 
 	// --- WebSocket + real-time state ---
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1103,6 +1151,7 @@ export function NarratorPanel({
 		contextPercent,
 		promptTokens,
 		contextWindow,
+		isEstimated,
 		pruneBoundaryMessageId,
 		prunedPercent,
 		retryInfo,
@@ -1423,7 +1472,7 @@ export function NarratorPanel({
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
-	const virtualListRef = useRef<VirtualMessageListHandle>(null);
+	const virtualListRef = useRef<BroadMessageListHandle>(null);
 
 	const clearHighlightTimers = useCallback(() => {
 		if (highlightStartTimerRef.current != null) {
@@ -1700,11 +1749,13 @@ export function NarratorPanel({
 			targets.push([]);
 		}
 
-		// Streaming tool chunks — merge visually with the preceding tool run when possible
+		// Streaming tool chunks — merge visually with the preceding tool run when possible,
+		// but only if there is no streaming text content in between (StreamingBubble).
+		// When the model emits text before tool calls, the streaming tool should appear
+		// below the text bubble, not get merged into an earlier tool run.
 		if (topLevelStreamingChunks) {
-			if (lastToolRunMsgs && lastToolRunMsgs.length > 0) {
-				// Find the last tool-run element in the list (it may not be the very
-				// last entry if a StreamingBubble was appended after it).
+			if (!hasStreamingContent && lastToolRunMsgs && lastToolRunMsgs.length > 0) {
+				// No streaming text — safe to merge into the preceding tool run
 				let toolRunIdx = -1;
 				for (let ti = els.length - 1; ti >= 0; ti--) {
 					if (keys[ti]?.includes("tool-run-")) {
@@ -1713,20 +1764,15 @@ export function NarratorPanel({
 					}
 				}
 				if (toolRunIdx >= 0) {
-					// Re-render the last tool run with the streaming chunks appended,
-					// so all items share a single bordered container with correct
-					// inRun / isLast / divider logic.
 					const prevTargets = targets[toolRunIdx] ?? [];
 					const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
 						appendMessages: [topLevelStreamingChunks],
 					});
 					if (mergedEl) {
 						els[toolRunIdx] = mergedEl;
-						// Keep the original key to avoid React unmount/remount flicker
 						targets[toolRunIdx] = prevTargets;
 					}
 				} else {
-					// Fallback: no tool-run found, render standalone
 					const toolEl = renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb);
 					if (toolEl) {
 						els.push(toolEl);
@@ -1735,6 +1781,7 @@ export function NarratorPanel({
 					}
 				}
 			} else {
+				// Has streaming text content or no preceding tool run — render standalone
 				const toolEl = renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb);
 				if (toolEl) {
 					els.push(toolEl);
@@ -1804,11 +1851,9 @@ export function NarratorPanel({
 		const vp = viewportRef.current;
 		if (!vp) return;
 		const check = () => {
-			// In column-reverse: high scrollTop = near visual top (older messages).
+			// Normal scroll direction: scrollTop near 0 = near visual top (older messages).
 			// Trigger load-older when within 2x viewport height from the top.
-			const maxScroll = vp.scrollHeight - vp.clientHeight;
-			const distFromTop = maxScroll - vp.scrollTop;
-			if (distFromTop < vp.clientHeight * 2 && vp.scrollHeight > vp.clientHeight) {
+			if (vp.scrollTop < vp.clientHeight * 2 && vp.scrollHeight > vp.clientHeight) {
 				handleLoadOlderRef.current();
 			}
 		};
@@ -1825,9 +1870,10 @@ export function NarratorPanel({
 		const vp = viewportRef.current;
 		if (!vp) return;
 		const check = () => {
-			// In column-reverse: scrollTop near 0 = at visual bottom (newest messages).
-			// Trigger load-newer when scrollTop is very small.
-			if (vp.scrollTop <= 24) {
+			// Normal scroll direction: scrollTop near max = at visual bottom (newest messages).
+			// Trigger load-newer when near the bottom.
+			const distFromBottom = vp.scrollHeight - vp.scrollTop - vp.clientHeight;
+			if (distFromBottom <= 24) {
 				handleLoadNewerRef.current();
 			}
 		};
@@ -1844,9 +1890,8 @@ export function NarratorPanel({
 		(viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
 		if (!node) return;
 
-		// In column-reverse: scrollTop=0 means at bottom (newest messages).
 		const checkAtBottom = () => {
-			const atBottom = node.scrollTop < 30;
+			const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 30;
 			if (atBottom && !isAtBottomRef.current) {
 				isAtBottomRef.current = true;
 				setIsAtBottom(true);
@@ -1860,14 +1905,7 @@ export function NarratorPanel({
 			}
 		};
 
-		// In column-reverse, scrolling "up" (toward older messages) increases scrollTop.
-		// deltaY > 0 (wheel down in normal mode) actually scrolls toward older = detach.
-		// deltaY < 0 (wheel up in normal mode) scrolls toward newer = toward bottom.
-		// But with column-reverse, the browser inverts wheel direction automatically,
-		// so deltaY < 0 means user scrolled up visually = away from bottom.
 		const onWheel = (e: WheelEvent) => {
-			// In column-reverse, scrollTop increases when scrolling up (away from bottom).
-			// deltaY < 0 means user scrolled up = scrollTop increases = detach from bottom.
 			if (e.deltaY < 0) detachFromBottom();
 		};
 		const onTouchStart = (e: TouchEvent) => {
@@ -1878,20 +1916,33 @@ export function NarratorPanel({
 			const cur = e.touches[0].clientY;
 			const delta = lastTouchYRef.current - cur;
 			lastTouchYRef.current = cur;
-			// delta < 0 means finger moved down = scrolling up visually = detach
 			if (delta < 0) detachFromBottom();
 		};
 
 		let lastScrollTop = node.scrollTop;
 		const onScroll = () => {
 			const cur = node.scrollTop;
-			// In column-reverse, scrollTop increasing means scrolling away from bottom.
-			if (cur > lastScrollTop && cur > 30) {
+			// During a viewport resize, suppress all detach checks — multiple
+			// programmatic scrollTop writes fire multiple scroll events and a
+			// one-shot flag can't cover them all.
+			if (resizingRef.current) {
+				lastScrollTop = cur;
+				return;
+			}
+			// One-shot suppression for individual programmatic scrollTop writes
+			// outside of a resize (e.g. scrollToBottom instant).
+			if (programmaticScrollRef.current) {
+				programmaticScrollRef.current = false;
+				lastScrollTop = cur;
+				return;
+			}
+			if (!followingRef.current && cur < lastScrollTop) {
 				detachFromBottom();
 			}
 			lastScrollTop = cur;
 		};
 		const onScrollEnd = () => {
+			if (followingRef.current || resizingRef.current) return;
 			checkAtBottom();
 		};
 
@@ -1910,46 +1961,101 @@ export function NarratorPanel({
 	}, []);
 
 	// --- Initial scroll ---
-	// In column-reverse, the browser starts at scrollTop=0 (bottom) automatically.
-	// We just need to mark initialScrollDone once messages are rendered.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: renderDone is a state trigger — effect must re-run when it flips to true
 	useEffect(() => {
-		if (initialScrollDoneRef.current || totalMessageCount === 0 || !renderDone) {
-			return;
+		if (
+			!initialScrollDoneRef.current &&
+			totalMessageCount > 0 &&
+			renderDone &&
+			!highlightMessageId &&
+			isAtBottomRef.current
+		) {
+			initialScrollDoneRef.current = true;
+			setInitialScrollDone(true);
+			scrollToBottom(true);
 		}
-		initialScrollDoneRef.current = true;
-		setInitialScrollDone(true);
-		// column-reverse starts at bottom natively — no scrollToBottom needed.
-		// But if there's a highlight target, don't interfere.
-	}, [totalMessageCount]);
+		if (
+			!initialScrollDoneRef.current &&
+			totalMessageCount > 0 &&
+			renderDone &&
+			!isAtBottomRef.current
+		) {
+			initialScrollDoneRef.current = true;
+			setInitialScrollDone(true);
+		}
+	}, [totalMessageCount, renderDone, scrollToBottom, highlightMessageId]);
 
-	// --- Auto-scroll via ResizeObserver ---
-	// In column-reverse, the browser natively keeps scrollTop=0 (bottom) when
-	// content grows, as long as the user hasn't scrolled away. We only need a
-	// lightweight observer to detect at-bottom state changes.
+	// --- Auto-scroll via MutationObserver + ResizeObserver ---
+	// MutationObserver detects DOM changes (new messages added) in the scroll
+	// container and triggers the follow loop. ResizeObserver on the viewport
+	// handles viewport resize (e.g. DevTools toggle).
 	// biome-ignore lint/correctness/useExhaustiveDependencies: initialScrollDone is a trigger dep, not read inside
 	useEffect(() => {
-		const content = contentRef.current;
-		if (!content) return;
-
 		const vp = viewportRef.current;
+		if (!vp) return;
 
-		const contentObserver = new ResizeObserver(() => {
+		// Track whether the *viewport* itself is being resized (e.g. DevTools
+		// mobile↔desktop toggle). During a viewport resize both observers fire
+		// in rapid succession; using the RAF-based follow loop in that situation
+		// causes continuous scrollTop writes that force layout thrashing, block
+		// the main thread, and can trigger React's "Maximum update depth" error.
+		let vpResizeTimer = 0;
+
+		// Use MutationObserver to detect content changes (new messages, streaming
+		// content growth, etc.) instead of ResizeObserver on contentRef. This is
+		// more reliable because broad-infinite-list manages its own DOM structure
+		// and contentRef may not be set synchronously.
+		let mutationRafId = 0;
+		const mutationObserver = new MutationObserver(() => {
 			if (!initialScrollDoneRef.current) return;
-			if (!vp) return;
-			// In column-reverse, check if we're still at bottom (scrollTop near 0)
-			if (!isAtBottomRef.current && !highlightMessageId) {
-				if (vp.scrollTop < 30) {
-					isAtBottomRef.current = true;
-					setIsAtBottom(true);
+			// Debounce via rAF to batch rapid DOM mutations (e.g. streaming)
+			cancelAnimationFrame(mutationRafId);
+			mutationRafId = requestAnimationFrame(() => {
+				if (resizingRef.current) {
+					if (isAtBottomRef.current && !highlightMessageId) {
+						programmaticScrollRef.current = true;
+						vp.scrollTop = vp.scrollHeight - vp.clientHeight;
+					}
+					return;
 				}
+				if (isAtBottomRef.current && !highlightMessageId) {
+					startFollowing();
+				} else if (!isAtBottomRef.current && !highlightMessageId) {
+					if (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 30) {
+						isAtBottomRef.current = true;
+						setIsAtBottom(true);
+					}
+				}
+			});
+		});
+		mutationObserver.observe(vp, { childList: true, subtree: true });
+
+		const vpObserver = new ResizeObserver(() => {
+			// Mark that a viewport resize is in progress so the mutation
+			// observer takes the synchronous-snap path, and onScroll
+			// suppresses all detach checks for the duration.
+			resizingRef.current = true;
+			clearTimeout(vpResizeTimer);
+			vpResizeTimer = window.setTimeout(() => {
+				resizingRef.current = false;
+			}, 150);
+
+			if (isAtBottomRef.current && !highlightMessageId) {
+				programmaticScrollRef.current = true;
+				vp.scrollTop = vp.scrollHeight - vp.clientHeight;
 			}
 		});
-		contentObserver.observe(content);
+		vpObserver.observe(vp);
 
 		return () => {
-			contentObserver.disconnect();
+			clearTimeout(vpResizeTimer);
+			cancelAnimationFrame(mutationRafId);
+			resizingRef.current = false;
+			mutationObserver.disconnect();
+			vpObserver.disconnect();
+			stopFollowing();
 		};
-	}, [highlightMessageId, initialScrollDone]);
+	}, [highlightMessageId, initialScrollDone, startFollowing, stopFollowing]);
 
 	const scrollToVirtualTarget = useCallback(
 		({
@@ -2623,20 +2729,6 @@ export function NarratorPanel({
 								<IconArchive size={16} />
 							</ActionIcon>
 						</Tooltip>
-						{onSplitHorizontal && (
-							<Tooltip label={t("splitRight")}>
-								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onSplitHorizontal}>
-									<IconLayoutColumns size={16} />
-								</ActionIcon>
-							</Tooltip>
-						)}
-						{onSplitVertical && (
-							<Tooltip label={t("splitDown")}>
-								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onSplitVertical}>
-									<IconLayoutRows size={16} />
-								</ActionIcon>
-							</Tooltip>
-						)}
 						{onClose && (
 							<Tooltip label={t("closePanel")}>
 								<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
@@ -2667,7 +2759,9 @@ export function NarratorPanel({
 									}
 									archiveMutation.mutate(narratorId);
 									closeArchiveConfirm();
-									if (onMinimize) {
+									if (onClose) {
+										onClose();
+									} else if (onMinimize) {
 										onMinimize();
 									} else {
 										navigate({ to: "/narrators" });
@@ -2741,34 +2835,20 @@ export function NarratorPanel({
 							</Stack>
 						</Box>
 					)}
-					<ScrollArea
-						h="100%"
-						type="always"
-						viewportRef={viewportCallbackRef}
-						px="md"
-						scrollbars="y"
-						styles={{
-							viewport: {
-								overscrollBehavior: "contain",
-								// column-reverse: browser natively starts at bottom
-								display: "flex",
-								flexDirection: "column-reverse",
-							},
-						}}
-					>
+					<Box h="100%" style={{ position: "relative" }}>
 						<MessageSelectionCtx.Provider value={selectionCtxValue}>
 							<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-								<VirtualMessageList
+								<BroadMessageList
 									ref={virtualListRef}
 									elements={finalElements}
 									elementKeys={finalKeys}
-									scrollRef={viewportRef}
+									scrollRef={viewportCallbackRef}
 									contentRef={contentRef}
 									shift={shifting}
 								/>
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>
-					</ScrollArea>
+					</Box>
 
 					{/* Multi-select floating toolbar */}
 					{selectionMode && (
@@ -3271,6 +3351,9 @@ export function NarratorPanel({
 										)}
 										<Menu.Label>
 											{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
+											{isEstimated && (
+												<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
+											)}
 										</Menu.Label>
 										{promptTokens != null && (
 											<Menu.Label>
@@ -3282,6 +3365,9 @@ export function NarratorPanel({
 													: t("contextUsageTokens", {
 															tokens: promptTokens.toLocaleString(),
 														})}
+												{isEstimated && (
+													<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
+												)}
 											</Menu.Label>
 										)}
 										<Menu.Divider />

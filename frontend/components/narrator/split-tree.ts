@@ -30,6 +30,26 @@ export function createLeaf(narratorId: string | null = null): SplitLeaf {
 	return { type: "leaf", id: genId(), narratorId };
 }
 
+/** Shorthand: create a leaf with a specific narratorId. */
+export function createLeafWith(narratorId: string): SplitLeaf {
+	return { type: "leaf", id: genId(), narratorId };
+}
+
+/** Create a branch with two children. */
+export function createBranch(
+	direction: SplitDirection,
+	children: SplitNode[],
+	sizes?: number[],
+): SplitBranch {
+	return {
+		type: "branch",
+		id: genId(),
+		direction,
+		children,
+		sizes: sizes ?? children.map(() => 100 / children.length),
+	};
+}
+
 // ── Tree operations (immutable) ──
 
 /**
@@ -59,10 +79,11 @@ function splitLeafImpl(
 		const children = position === "after" ? [kept, empty] : [empty, kept];
 		return { type: "branch", id: genId(), direction, children, sizes: [50, 50] };
 	}
-	// Branch: recurse into children
+	// Branch: recurse into children, then flatten same-direction nesting
 	const newChildren = node.children.map((c) => splitLeafImpl(c, leafId, direction, position));
 	const changed = newChildren.some((c, i) => c !== node.children[i]);
-	return changed ? { ...node, children: newChildren } : node;
+	if (!changed) return node;
+	return flattenBranch({ ...node, children: newChildren });
 }
 
 /** Split a leaf and assign a narratorId to the newly created leaf. */
@@ -94,7 +115,8 @@ function splitAndAssignImpl(
 		splitAndAssignImpl(c, leafId, direction, position, narratorId),
 	);
 	const changed = newChildren.some((c, i) => c !== node.children[i]);
-	return changed ? { ...node, children: newChildren } : node;
+	if (!changed) return node;
+	return flattenBranch({ ...node, children: newChildren });
 }
 
 /** Remove a leaf from the tree. If its parent branch has only one child left, collapse it. */
@@ -158,7 +180,46 @@ export function countLeaves(tree: SplitNode): number {
 	return tree.children.reduce((sum, c) => sum + countLeaves(c), 0);
 }
 
+/** Recursively flatten same-direction nesting throughout the tree. */
+export function normalizeTree(node: SplitNode): SplitNode {
+	if (node.type === "leaf") return node;
+	const normalized = {
+		...node,
+		children: node.children.map(normalizeTree),
+	};
+	return flattenBranch(normalized);
+}
+
 // ── Helpers (targeted map to avoid generic mapNode pitfalls) ──
+
+/**
+ * Flatten same-direction child branches into the parent.
+ * e.g. branch(H)[A, branch(H)[B, C]] → branch(H)[A, B, C]
+ * The inlined child's sizes are scaled proportionally to the slot it occupied.
+ */
+function flattenBranch(branch: SplitBranch): SplitBranch {
+	const flatChildren: SplitNode[] = [];
+	const flatSizes: number[] = [];
+	let needsFlatten = false;
+
+	for (let i = 0; i < branch.children.length; i++) {
+		const child = branch.children[i];
+		if (child.type === "branch" && child.direction === branch.direction) {
+			needsFlatten = true;
+			const parentSlotPct = branch.sizes[i];
+			for (let j = 0; j < child.children.length; j++) {
+				flatChildren.push(child.children[j]);
+				flatSizes.push((child.sizes[j] / 100) * parentSlotPct);
+			}
+		} else {
+			flatChildren.push(child);
+			flatSizes.push(branch.sizes[i]);
+		}
+	}
+
+	if (!needsFlatten) return branch;
+	return { ...branch, children: flatChildren, sizes: flatSizes };
+}
 
 /** Map a specific leaf by id. Only touches leaves, never changes node types. */
 function mapLeaf(node: SplitNode, leafId: string, fn: (leaf: SplitLeaf) => SplitLeaf): SplitNode {

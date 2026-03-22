@@ -101,6 +101,7 @@ export interface UseNarratorPanelWSReturn {
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
 	promptTokens: number | null;
 	contextWindow: number | null;
+	isEstimated: boolean;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
 	// Retry
@@ -280,6 +281,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
+	const [isEstimated, setIsEstimated] = useState(false);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 	);
@@ -329,11 +331,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			const cp = m.contextPercent;
 			if (cp != null) {
 				setContextPercent(cp as number);
-				// Restore promptTokens / contextWindow from turnUsageJson
-				const tu = m.turnUsageJson as Record<string, number> | null | undefined;
+				// Restore promptTokens / contextWindow / isEstimated from turnUsageJson
+				const tu = m.turnUsageJson as Record<string, unknown> | null | undefined;
 				if (tu) {
-					if (tu.input_tokens != null) setPromptTokens(tu.input_tokens);
-					if (tu.context_window != null) setContextWindow(tu.context_window);
+					if (tu.input_tokens != null) setPromptTokens(tu.input_tokens as number);
+					if (tu.context_window != null) setContextWindow(tu.context_window as number);
+					setIsEstimated(!!tu.is_estimated);
 				} else if (m.tokensIn != null) {
 					setPromptTokens(m.tokensIn as number);
 				}
@@ -1204,10 +1207,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, relaxedPlan } : old,
 				);
 			},
-			onContextUsage: (percentage, promptTokens, contextWindow) => {
+			onContextUsage: (percentage, promptTokens, contextWindow, isEst) => {
 				setContextPercent(percentage);
 				setPromptTokens(promptTokens ?? null);
 				setContextWindow(contextWindow ?? null);
+				setIsEstimated(!!isEst);
 			},
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				setPruneBoundaryMessageId(boundaryMessageId);
@@ -1705,6 +1709,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setContextPercent,
 		promptTokens,
 		contextWindow,
+		isEstimated,
 		pruneBoundaryMessageId,
 		prunedPercent,
 		retryInfo,

@@ -21,7 +21,6 @@ import { useDisclosure } from "@mantine/hooks";
 import {
 	IconArchive,
 	IconBox,
-	IconColumns,
 	IconEye,
 	IconFilter,
 	IconFolder,
@@ -388,11 +387,6 @@ function NarratorsPage() {
 							) : (
 								<IconSortAscending size={16} />
 							)}
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("workspaceView")}>
-						<ActionIcon variant="subtle" size="sm" component={Link} to="/narrators/workspace">
-							<IconColumns size={16} />
 						</ActionIcon>
 					</Tooltip>
 					<Button variant="subtle" component={Link} to="/narrators/archived">

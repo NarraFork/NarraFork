@@ -421,7 +421,17 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 		// Upsert: merge into existing or prepend
 		const idx = tabs.findIndex((t) => t.type === tab.type && t.id === tab.id);
 		if (idx >= 0) {
-			tabs[idx] = { ...tabs[idx], ...tab };
+			if (updateOnly) {
+				// Only merge non-empty fields to avoid overwriting with placeholder values
+				const patch: Record<string, unknown> = {};
+				for (const [k, v] of Object.entries(tab)) {
+					if (k === "type" || k === "id") continue;
+					if (v !== "" && v !== undefined) patch[k] = v;
+				}
+				tabs[idx] = { ...tabs[idx], ...patch };
+			} else {
+				tabs[idx] = { ...tabs[idx], ...tab };
+			}
 		} else if (updateOnly) {
 			sqlite.run("COMMIT");
 			return c.json(tabs);

@@ -1,6 +1,5 @@
-import { Box, Text } from "@mantine/core";
+import { Box } from "@mantine/core";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
 import {
 	type NarratorDragState,
 	onNarratorDragEnd,
@@ -44,7 +43,6 @@ export interface SplitPanelCallbacks {
 	) => void;
 	onReplace: (leafId: string, narratorId: string) => void;
 	onClose: (leafId: string) => void;
-	onSplit: (leafId: string, direction: SplitDirection) => void;
 	canClose: boolean;
 }
 
@@ -52,7 +50,6 @@ export const SplitPanelCtx = createContext<SplitPanelCallbacks>({
 	onSplitAndAssign: () => {},
 	onReplace: () => {},
 	onClose: () => {},
-	onSplit: () => {},
 	canClose: false,
 });
 
@@ -74,14 +71,10 @@ export function SplitPanelContainer({
 // ── Leaf: NarratorPanel with drop overlay ──
 
 function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
-	const { onSplitAndAssign, onReplace, onClose, onSplit, canClose } = useContext(SplitPanelCtx);
-	const { t } = useTranslation("narrators");
+	const { onSplitAndAssign, onReplace, onClose, canClose } = useContext(SplitPanelCtx);
 	const [dropZone, setDropZone] = useState<DropZone>(null);
 	const boxRef = useRef<HTMLDivElement>(null);
 	const dropZoneRef = useRef<DropZone>(null);
-
-	// Keep ref in sync for use in event callbacks
-	dropZoneRef.current = dropZone;
 
 	useEffect(() => {
 		const unsubMove = onNarratorDragMove((state: NarratorDragState) => {
@@ -94,14 +87,18 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 				state.y >= rect.top &&
 				state.y <= rect.bottom;
 			if (inside) {
-				setDropZone(computeDropZone(rect, state.x, state.y));
+				const zone = computeDropZone(rect, state.x, state.y);
+				dropZoneRef.current = zone;
+				setDropZone(zone);
 			} else if (dropZoneRef.current) {
+				dropZoneRef.current = null;
 				setDropZone(null);
 			}
 		});
 
 		const unsubEnd = onNarratorDragEnd((final: NarratorDragState | null) => {
 			const zone = dropZoneRef.current;
+			dropZoneRef.current = null;
 			setDropZone(null);
 			if (!final || !zone) return;
 
@@ -138,30 +135,13 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 			h="100%"
 			style={{ position: "relative", overflow: "hidden", borderRadius: 4 }}
 		>
-			{leaf.narratorId ? (
+			{leaf.narratorId && (
 				<NarratorPanel
 					key={leaf.narratorId}
 					narratorId={leaf.narratorId}
 					compact
 					onClose={canClose ? () => onClose(leaf.id) : undefined}
-					onSplitHorizontal={() => onSplit(leaf.id, "horizontal")}
-					onSplitVertical={() => onSplit(leaf.id, "vertical")}
 				/>
-			) : (
-				<Box
-					h="100%"
-					style={{
-						display: "flex",
-						alignItems: "center",
-						justifyContent: "center",
-						backgroundColor: "var(--mantine-color-dark-7)",
-						border: "1px solid var(--mantine-color-dark-5)",
-					}}
-				>
-					<Text size="sm" c="dimmed">
-						{t("dropNarratorHere")}
-					</Text>
-				</Box>
 			)}
 
 			{/* Drop zone overlay */}
@@ -193,16 +173,125 @@ function BranchPanel({
 }) {
 	const isHorizontal = branch.direction === "horizontal";
 	const containerRef = useRef<HTMLDivElement>(null);
+	const overlayRef = useRef<HTMLDivElement>(null);
+
+	const handleResizeStart = useCallback(
+		/** Called on pointerdown — compute handle offset within container and show overlay */
+		(_handleIdx: number, pointerPos: number) => {
+			const container = containerRef.current;
+			const overlay = overlayRef.current;
+			if (!container || !overlay) return null;
+			const rect = container.getBoundingClientRect();
+			const totalPx = isHorizontal ? rect.width : rect.height;
+			const containerStart = isHorizontal ? rect.left : rect.top;
+			const handleOffset = pointerPos - containerStart;
+
+			// Show overlay line at current position
+			overlay.style.display = "block";
+			if (isHorizontal) {
+				overlay.style.left = `${handleOffset}px`;
+				overlay.style.top = "0";
+				overlay.style.width = "2px";
+				overlay.style.height = "100%";
+			} else {
+				overlay.style.top = `${handleOffset}px`;
+				overlay.style.left = "0";
+				overlay.style.height = "2px";
+				overlay.style.width = "100%";
+			}
+
+			return {
+				totalPx,
+				containerStart,
+				startPointer: pointerPos,
+				startOffset: handleOffset,
+				startSizes: [...branch.sizes],
+			};
+		},
+		[branch.sizes, isHorizontal],
+	);
+
+	/** Called on pointermove — move overlay line (pure DOM, no React state) */
+	const handleResizeMove = useCallback(
+		(
+			currentPos: number,
+			ctx: {
+				totalPx: number;
+				containerStart: number;
+				startPointer: number;
+				startOffset: number;
+				startSizes: number[];
+			},
+			handleIdx: number,
+		) => {
+			const overlay = overlayRef.current;
+			if (!overlay) return;
+			const delta = currentPos - ctx.startPointer;
+			const prevPct = ctx.startSizes[handleIdx - 1];
+			const currPct = ctx.startSizes[handleIdx];
+			const deltaPct = (delta / ctx.totalPx) * 100;
+			// Clamp so neither side goes below MIN_SIZE_PCT
+			const clampedDelta = Math.max(
+				MIN_SIZE_PCT - prevPct,
+				Math.min(currPct - MIN_SIZE_PCT, deltaPct),
+			);
+			const clampedPx = (clampedDelta / 100) * ctx.totalPx;
+			const newOffset = ctx.startOffset + clampedPx;
+			if (isHorizontal) {
+				overlay.style.left = `${newOffset}px`;
+			} else {
+				overlay.style.top = `${newOffset}px`;
+			}
+		},
+		[isHorizontal],
+	);
+
+	/** Called on pointerup — hide overlay, commit final sizes */
+	const handleResizeEnd = useCallback(
+		(
+			currentPos: number,
+			ctx: {
+				totalPx: number;
+				containerStart: number;
+				startPointer: number;
+				startOffset: number;
+				startSizes: number[];
+			},
+			handleIdx: number,
+		) => {
+			const overlay = overlayRef.current;
+			if (overlay) overlay.style.display = "none";
+
+			const delta = currentPos - ctx.startPointer;
+			const deltaPct = (delta / ctx.totalPx) * 100;
+			const prevPct = ctx.startSizes[handleIdx - 1];
+			const currPct = ctx.startSizes[handleIdx];
+			const clampedDelta = Math.max(
+				MIN_SIZE_PCT - prevPct,
+				Math.min(currPct - MIN_SIZE_PCT, deltaPct),
+			);
+			if (Math.abs(clampedDelta) < 0.01) return;
+
+			const newSizes = [...ctx.startSizes];
+			newSizes[handleIdx - 1] = prevPct + clampedDelta;
+			newSizes[handleIdx] = currPct - clampedDelta;
+			onUpdateSizes(branch.id, newSizes);
+		},
+		[branch.id, onUpdateSizes],
+	);
 
 	return (
 		<Box
 			ref={containerRef}
 			h="100%"
+			w="100%"
 			style={{
 				display: "flex",
 				flexDirection: isHorizontal ? "row" : "column",
 				minWidth: 0,
 				minHeight: 0,
+				overflow: "hidden",
+				position: "relative",
 			}}
 		>
 			{branch.children.map((child, idx) => (
@@ -212,12 +301,34 @@ function BranchPanel({
 					idx={idx}
 					branch={branch}
 					isHorizontal={isHorizontal}
-					containerRef={containerRef}
 					onUpdateSizes={onUpdateSizes}
+					onResizeStart={handleResizeStart}
+					onResizeMove={handleResizeMove}
+					onResizeEnd={handleResizeEnd}
 				/>
 			))}
+			{/* Drag preview overlay line — positioned via pure DOM */}
+			<div
+				ref={overlayRef}
+				style={{
+					display: "none",
+					position: "absolute",
+					backgroundColor: "var(--mantine-color-indigo-6)",
+					borderRadius: 1,
+					zIndex: 10,
+					pointerEvents: "none",
+				}}
+			/>
 		</Box>
 	);
+}
+
+interface ResizeCtx {
+	totalPx: number;
+	containerStart: number;
+	startPointer: number;
+	startOffset: number;
+	startSizes: number[];
 }
 
 function ChildWithHandle({
@@ -225,47 +336,63 @@ function ChildWithHandle({
 	idx,
 	branch,
 	isHorizontal,
-	containerRef,
 	onUpdateSizes,
+	onResizeStart,
+	onResizeMove,
+	onResizeEnd,
 }: {
 	child: SplitNode;
 	idx: number;
 	branch: SplitBranch;
 	isHorizontal: boolean;
-	containerRef: React.RefObject<HTMLDivElement | null>;
 	onUpdateSizes: (branchId: string, sizes: number[]) => void;
+	onResizeStart: (handleIdx: number, pointerPos: number) => ResizeCtx | null;
+	onResizeMove: (currentPos: number, ctx: ResizeCtx, handleIdx: number) => void;
+	onResizeEnd: (currentPos: number, ctx: ResizeCtx, handleIdx: number) => void;
 }) {
-	const sizeProp = isHorizontal
-		? { width: `${branch.sizes[idx]}%` }
-		: { height: `${branch.sizes[idx]}%` };
+	// Use flex-grow ratio instead of fixed percentage width/height.
+	// This lets the flex container naturally account for resize handle widths.
+	const flexProp = { flex: `${branch.sizes[idx]} 1 0%` };
 
-	const handleDrag = useCallback(
-		(delta: number) => {
-			if (!containerRef.current) return;
-			const rect = containerRef.current.getBoundingClientRect();
-			const totalPx = isHorizontal ? rect.width : rect.height;
-			const deltaPct = (delta / totalPx) * 100;
+	const onResizeStartRef = useRef(onResizeStart);
+	onResizeStartRef.current = onResizeStart;
+	const onResizeMoveRef = useRef(onResizeMove);
+	onResizeMoveRef.current = onResizeMove;
+	const onResizeEndRef = useRef(onResizeEnd);
+	onResizeEndRef.current = onResizeEnd;
 
-			const newSizes = [...branch.sizes];
-			const prevIdx = idx - 1;
-			const newPrev = newSizes[prevIdx] + deltaPct;
-			const newCurr = newSizes[idx] - deltaPct;
+	const handlePointerDown = useCallback(
+		(e: React.PointerEvent) => {
+			e.preventDefault();
+			const pos = isHorizontal ? e.clientX : e.clientY;
+			const ctx = onResizeStartRef.current(idx, pos);
+			if (!ctx) return;
 
-			if (newPrev < MIN_SIZE_PCT || newCurr < MIN_SIZE_PCT) return;
-			newSizes[prevIdx] = newPrev;
-			newSizes[idx] = newCurr;
-			onUpdateSizes(branch.id, newSizes);
+			document.body.style.cursor = isHorizontal ? "col-resize" : "row-resize";
+			document.body.style.userSelect = "none";
+
+			const onMove = (ev: PointerEvent) => {
+				onResizeMoveRef.current(isHorizontal ? ev.clientX : ev.clientY, ctx, idx);
+			};
+			const onUp = (ev: PointerEvent) => {
+				document.removeEventListener("pointermove", onMove);
+				document.removeEventListener("pointerup", onUp);
+				document.body.style.cursor = "";
+				document.body.style.userSelect = "";
+				onResizeEndRef.current(isHorizontal ? ev.clientX : ev.clientY, ctx, idx);
+			};
+			document.addEventListener("pointermove", onMove);
+			document.addEventListener("pointerup", onUp);
 		},
-		[branch.id, branch.sizes, idx, isHorizontal, containerRef, onUpdateSizes],
+		[idx, isHorizontal],
 	);
 
 	return (
 		<>
-			{idx > 0 && <ResizeHandle direction={branch.direction} onDrag={handleDrag} />}
+			{idx > 0 && <ResizeHandle direction={branch.direction} onPointerDown={handlePointerDown} />}
 			<Box
 				style={{
-					...sizeProp,
-					flexShrink: 0,
+					...flexProp,
 					minWidth: 0,
 					minHeight: 0,
 					overflow: "hidden",
@@ -277,49 +404,16 @@ function ChildWithHandle({
 	);
 }
 
-// ── Resize handle ──
+// ── Resize handle (visual only, drag logic lives in parent) ──
 
 function ResizeHandle({
 	direction,
-	onDrag,
+	onPointerDown,
 }: {
 	direction: SplitDirection;
-	onDrag: (deltaPx: number) => void;
+	onPointerDown: (e: React.PointerEvent) => void;
 }) {
 	const isHorizontal = direction === "horizontal";
-	const lastPos = useRef(0);
-	const cleanupRef = useRef<(() => void) | null>(null);
-
-	const onPointerDown = useCallback(
-		(e: React.PointerEvent) => {
-			e.preventDefault();
-			lastPos.current = isHorizontal ? e.clientX : e.clientY;
-
-			const onMove = (ev: PointerEvent) => {
-				const current = isHorizontal ? ev.clientX : ev.clientY;
-				const delta = current - lastPos.current;
-				if (delta !== 0) {
-					onDrag(delta);
-					lastPos.current = current;
-				}
-			};
-
-			const onUp = () => {
-				document.removeEventListener("pointermove", onMove);
-				document.removeEventListener("pointerup", onUp);
-				document.body.style.cursor = "";
-				document.body.style.userSelect = "";
-				cleanupRef.current = null;
-			};
-
-			document.body.style.cursor = isHorizontal ? "col-resize" : "row-resize";
-			document.body.style.userSelect = "none";
-			document.addEventListener("pointermove", onMove);
-			document.addEventListener("pointerup", onUp);
-			cleanupRef.current = onUp;
-		},
-		[isHorizontal, onDrag],
-	);
 
 	return (
 		<Box
@@ -331,6 +425,9 @@ function ResizeHandle({
 				backgroundColor: "transparent",
 				transition: "background-color 150ms ease",
 				position: "relative",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
 			}}
 			onMouseEnter={(e) => {
 				(e.currentTarget as HTMLElement).style.backgroundColor = "var(--mantine-color-indigo-9)";
@@ -338,6 +435,17 @@ function ResizeHandle({
 			onMouseLeave={(e) => {
 				(e.currentTarget as HTMLElement).style.backgroundColor = "transparent";
 			}}
-		/>
+		>
+			{/* Always-visible thin line indicator */}
+			<Box
+				style={{
+					position: "absolute",
+					[isHorizontal ? "width" : "height"]: 1,
+					[isHorizontal ? "height" : "width"]: "100%",
+					backgroundColor: "var(--mantine-color-dark-4)",
+					pointerEvents: "none",
+				}}
+			/>
+		</Box>
 	);
 }

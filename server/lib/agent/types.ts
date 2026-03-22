@@ -75,7 +75,12 @@ export type ResolvedToolDefinition = ToolDefinition & { description: string };
 // === Permission ===
 
 export type PermissionResult =
-	| { behavior: "allow"; updatedInput?: Record<string, unknown> }
+	| {
+			behavior: "allow";
+			updatedInput?: Record<string, unknown>;
+			/** Optional notice appended to the tool output (e.g. plan-mode file redirect). */
+			notice?: string;
+	  }
 	| {
 			behavior: "deny";
 			message?: string;
@@ -150,6 +155,7 @@ export type AgentEvent =
 			reasoningTokens?: number;
 			cachedInputTokens?: number;
 			contextWindow?: number;
+			isEstimated?: boolean;
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "invalid_state"; reason: string; message: string }

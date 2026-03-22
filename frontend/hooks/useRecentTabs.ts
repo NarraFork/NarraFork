@@ -13,10 +13,12 @@ export interface RecentTabViewer {
 }
 
 export interface RecentTab {
-	type: "chapter" | "narrator" | "project";
+	type: "chapter" | "narrator" | "project" | "workspace";
 	id: string;
 	/** Primary narrator ID — used for WS subscriptions */
 	narratorId?: string;
+	/** If this tab belongs to a workspace, the workspace ID */
+	workspaceId?: string | null;
 	title: string;
 	subtitle?: string;
 	status?: string;
@@ -174,9 +176,12 @@ function evictTabCache(qc: ReturnType<typeof useQueryClient>, tab: RecentTab) {
 
 // === Standalone helper for use in effects (fire-and-forget) ===
 
-export function addRecentTab(tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number }) {
-	const entry: RecentTab = { ...tab, lastVisitedAt: tab.lastVisitedAt ?? Date.now() };
-	api.upsertRecentTab(entry).catch((err) => {
+export function addRecentTab(
+	tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number; updateOnly?: boolean },
+) {
+	const { updateOnly, ...rest } = tab;
+	const entry = { ...rest, lastVisitedAt: rest.lastVisitedAt ?? Date.now() };
+	api.upsertRecentTab({ ...entry, updateOnly }).catch((err) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);
 	});
 }

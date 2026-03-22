@@ -43,6 +43,7 @@ import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import { userPreferencesRoutes } from "./routes/user-preferences";
+import { workspaceRoutes } from "./routes/workspaces";
 
 const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
 const hasFrontendBuild = existsSync(
@@ -140,6 +141,7 @@ app.route("/api/routines", routineRoutes);
 app.route("/api/reviews", reviewsRouter);
 app.route("/api/overseers", overseerRoutes);
 app.route("/api/update", updateRoutes);
+app.route("/api/workspaces", workspaceRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);

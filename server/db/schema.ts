@@ -724,3 +724,19 @@ export const narratorBlacklistCmds = sqliteTable(
 		uniqueIndex("idx_blacklist_cmds_narrator_pattern").on(table.narratorId, table.pattern),
 	],
 );
+
+// === workspaces ===
+export const workspaces = sqliteTable(
+	"workspaces",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		title: text("title").notNull(),
+		tree: text("tree").notNull(), // JSON: SplitNode
+		createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+		updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+	},
+	(table) => [index("idx_workspaces_user").on(table.userId)],
+);

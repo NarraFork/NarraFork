@@ -33,6 +33,7 @@ export interface TokenUsageSnapshot {
 	reasoningTokens?: number;
 	cachedInputTokens?: number;
 	contextWindow?: number;
+	isEstimated?: boolean;
 }
 
 export interface EventHandlerContext {
@@ -436,6 +437,7 @@ export async function processEvent(
 								...(tokenUsage.contextWindow != null && {
 									context_window: tokenUsage.contextWindow,
 								}),
+								...(tokenUsage.isEstimated && { is_estimated: true }),
 							}
 						: undefined,
 				});
@@ -497,6 +499,7 @@ export async function processEvent(
 						...(tokenUsage.contextWindow != null && {
 							context_window: tokenUsage.contextWindow,
 						}),
+						...(tokenUsage.isEstimated && { is_estimated: true }),
 					}
 				: undefined;
 			let savedId: string;
@@ -780,6 +783,7 @@ export async function processEvent(
 				...(event.reasoningTokens != null && { reasoningTokens: event.reasoningTokens }),
 				...(event.cachedInputTokens != null && { cachedInputTokens: event.cachedInputTokens }),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
+				...(event.isEstimated && { isEstimated: true }),
 			});
 
 			const isSubagent = !!ctx.parentToolUseId;
@@ -789,6 +793,7 @@ export async function processEvent(
 				percentage: event.percentage,
 				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
+				...(event.isEstimated && { isEstimated: true }),
 				...(isSubagent && { isSubagent: true }),
 			});
 			ctx.sseEmitter?.emit("event", {
@@ -797,6 +802,7 @@ export async function processEvent(
 					percentage: event.percentage,
 					...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 					...(event.contextWindow != null && { contextWindow: event.contextWindow }),
+					...(event.isEstimated && { isEstimated: true }),
 				},
 			});
 

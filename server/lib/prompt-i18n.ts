@@ -637,6 +637,11 @@ const toolMessages = {
 		"zh-CN":
 			"[计划模式] 此工具在计划模式下已禁用。请专注于阅读和分析代码，然后调用 ExitPlanMode 提交你的计划。",
 	},
+	planModeFileRedirected: {
+		en: '[Plan Mode] Note: Your write target was redirected from "{originalPath}" to the designated plan file "{planFile}". In plan mode, please use the exact plan file path directly.',
+		"zh-CN":
+			'[计划模式] 注意：你的写入目标已从 "{originalPath}" 重定向到指定的计划文件 "{planFile}"。在计划模式下，请直接使用正确的计划文件路径。',
+	},
 	// TodoWrite output
 	todoWriteOutput: {
 		en: "Updated todos: {total} total ({completed} completed, {inProgress} in progress, {pending} pending)",

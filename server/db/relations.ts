@@ -24,6 +24,7 @@ import {
 	userFavoriteDirectories,
 	userPreferences,
 	users,
+	workspaces,
 } from "./schema";
 
 export const projectsRelations = relations(projects, ({ many }) => ({
@@ -195,6 +196,7 @@ export const portAllocationsRelations = relations(portAllocations, ({ one }) => 
 
 export const usersRelations = relations(users, ({ many, one }) => ({
 	favoriteDirectories: many(userFavoriteDirectories),
+	workspaces: many(workspaces),
 	preferences: one(userPreferences, {
 		fields: [users.id],
 		references: [userPreferences.userId],
@@ -273,5 +275,12 @@ export const overseersRelations = relations(overseers, ({ one }) => ({
 	project: one(projects, {
 		fields: [overseers.projectId],
 		references: [projects.id],
+	}),
+}));
+
+export const workspacesRelations = relations(workspaces, ({ one }) => ({
+	user: one(users, {
+		fields: [workspaces.userId],
+		references: [users.id],
 	}),
 }));

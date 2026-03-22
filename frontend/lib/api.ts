@@ -1030,19 +1030,21 @@ export const api = {
 
 	// Recent Tabs
 	upsertRecentTab: (tab: {
-		type: "chapter" | "narrator" | "project";
+		type: "chapter" | "narrator" | "project" | "workspace";
 		id: string;
 		narratorId?: string;
+		workspaceId?: string | null;
 		title: string;
 		subtitle?: string;
 		status?: string;
 		lastVisitedAt: number;
+		updateOnly?: boolean;
 	}) =>
 		request<ApiEntity[]>("/user-preferences/recent-tabs", {
 			method: "PUT",
 			body: JSON.stringify(tab),
 		}),
-	removeRecentTab: (type: "chapter" | "narrator" | "project", id: string) =>
+	removeRecentTab: (type: "chapter" | "narrator" | "project" | "workspace", id: string) =>
 		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),
@@ -2080,6 +2082,16 @@ export const api = {
 		}),
 	deleteOverseer: (id: string) =>
 		request<{ ok: boolean }>(`/overseers/${id}`, { method: "DELETE" }),
+
+	// ── Workspaces ──
+	listWorkspaces: () => request<ApiEntity[]>("/workspaces"),
+	getWorkspace: (id: string) => request<ApiEntity>(`/workspaces/${id}`),
+	createWorkspace: (data: { title?: string; tree: string }) =>
+		request<ApiEntity>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
+	updateWorkspace: (id: string, data: { title?: string; tree?: string }) =>
+		request<ApiEntity>(`/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	deleteWorkspace: (id: string) =>
+		request<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
 };
 
 	text: string,

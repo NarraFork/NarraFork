@@ -144,10 +144,6 @@ export interface NarratorPanelProps {
 	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 	/** Close this panel (used in workspace multi-panel mode) */
 	onClose?: () => void;
-	/** Split this panel horizontally — add a new panel to the right */
-	onSplitHorizontal?: () => void;
-	/** Split this panel vertically — add a new panel below */
-	onSplitVertical?: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
