@@ -519,6 +519,10 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 				const nid = extractField(input, "narrator_id");
 				return nid ? `Read ${nid.slice(0, 8)}…` : "Read conversation";
 			}
+			if (action === "read_tool_call") {
+				const tcId = extractField(input, "tool_call_id");
+				return tcId ? `Tool call ${tcId.slice(0, 8)}…` : "Read tool call";
+			}
 			return "Recall";
 		}
 		case "overseer": {
