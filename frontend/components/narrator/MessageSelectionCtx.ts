@@ -15,6 +15,8 @@ export interface MessageSelectionState {
 	anchorBlockId: string | null;
 	/** Exit multi-select mode and clear selection. */
 	exitSelection: () => void;
+	/** Remove a single block from the selection. Exits selection mode if empty. */
+	deselectBlock: (blockId: string) => void;
 }
 
 const DEFAULT_STATE: MessageSelectionState = {
@@ -22,6 +24,7 @@ const DEFAULT_STATE: MessageSelectionState = {
 	selectedBlockIds: new Set(),
 	anchorBlockId: null,
 	exitSelection: () => {},
+	deselectBlock: () => {},
 };
 
 export const MessageSelectionCtx = createContext<MessageSelectionState>(DEFAULT_STATE);

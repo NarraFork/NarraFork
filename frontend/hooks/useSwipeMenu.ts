@@ -28,6 +28,8 @@ interface UseSwipeMenuOptions {
 	 * revealed, the system selects all blocks between the anchor and this block.
 	 */
 	blockId?: string;
+	/** Called when a right-swipe gesture completes (e.g. to deselect a selected block). */
+	onSwipeRight?: () => void;
 }
 
 export interface SwipeMenuState {
@@ -65,6 +67,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		excludeSelectors = ["[data-content-block]", ".mantine-Menu-dropdown"],
 		externalBoxRef,
 		blockId,
+		onSwipeRight,
 	} = opts;
 
 	const internalBoxRef = useRef<HTMLDivElement>(null);
@@ -82,6 +85,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		dir: "h" | "v" | null;
 		/** True when another block's swipe was already open at touchstart. */
 		rangeCandidate: boolean;
+		/** Raw dx (startX - clientX) at last touchmove. Positive = left, negative = right. */
+		lastDx: number;
 	} | null>(null);
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
@@ -140,6 +145,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 						startY: touch.clientY,
 						dir: null,
 						rangeCandidate: true,
+						lastDx: 0,
 					};
 					setSwipeY(touch.clientY);
 					setSwipeInitialRight(node.getBoundingClientRect().right);
@@ -151,9 +157,15 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			}
 
 			if (swipeRevealed) {
-				// Tapping on the same block that's already revealed — do NOT close.
-				// The user can scroll or tap elsewhere freely.
-				swipeRef.current = null;
+				// Already revealed — allow right-swipe to close the menu.
+				const touch = e.touches[0];
+				swipeRef.current = {
+					startX: touch.clientX,
+					startY: touch.clientY,
+					dir: null,
+					rangeCandidate: false,
+					lastDx: 0,
+				};
 				return;
 			}
 
@@ -163,6 +175,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				startY: touch.clientY,
 				dir: null,
 				rangeCandidate: false,
+				lastDx: 0,
 			};
 			setSwipeY(touch.clientY);
 			setSwipeInitialRight(node.getBoundingClientRect().right);
@@ -171,8 +184,6 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		const onTouchMove = (e: TouchEvent) => {
 			const s = swipeRef.current;
 			if (!s) return;
-			// If this block's own swipe is already revealed, ignore moves
-			if (swipeRevealed && !s.rangeCandidate) return;
 
 			const touch = e.touches[0];
 			const dx = s.startX - touch.clientX;
@@ -186,7 +197,18 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			}
 			if (s.dir === "v") return;
 
-			// Horizontal swipe detected — track offset
+			s.lastDx = dx;
+
+			if (swipeRevealed && !s.rangeCandidate) {
+				// Already open — right-swipe (dx < 0) to close
+				// Map dx from [0 .. -swipeRevealWidth] to offset [swipeRevealWidth .. 0]
+				const offset = Math.max(0, Math.min(swipeRevealWidth + dx, swipeRevealWidth));
+				swipeOffsetRef.current = offset;
+				setSwipeOffset(offset);
+				return;
+			}
+
+			// Horizontal swipe detected — track offset (left-swipe only, dx > 0)
 			const offset = Math.max(0, Math.min(dx, swipeRevealWidth));
 			swipeOffsetRef.current = offset;
 			setSwipeOffset(offset);
@@ -213,6 +235,27 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 					if (curClose) curClose();
 				}
 				// Reset our own offset (we don't reveal our own menu)
+				swipeOffsetRef.current = 0;
+				setSwipeOffset(0);
+				return;
+			}
+
+			// Right-swipe to close: was revealed, now offset dropped below threshold
+			if (swipeRevealed && !didSwipe) {
+				closeSwipe();
+				return;
+			}
+
+			// Right-swipe but not enough — snap back to fully open
+			if (swipeRevealed && didSwipe) {
+				swipeOffsetRef.current = swipeRevealWidth;
+				setSwipeOffset(swipeRevealWidth);
+				return;
+			}
+
+			// Right-swipe callback (e.g. deselect a selected block)
+			if (!swipeRevealed && onSwipeRight && s.lastDx < -swipeThreshold) {
+				onSwipeRight();
 				swipeOffsetRef.current = 0;
 				setSwipeOffset(0);
 				return;
@@ -246,6 +289,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		swipeRevealWidth,
 		excludeSelectors,
 		blockId,
+		onSwipeRight,
 	]);
 
 	// --- Outside-touch close ---

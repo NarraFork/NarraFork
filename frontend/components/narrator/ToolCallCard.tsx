@@ -44,7 +44,16 @@ import {
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
-import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+	createContext,
+	memo,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
@@ -2572,13 +2581,20 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	// --- Swipe & context-menu state ---
 	const tcBlockId = toolCall.toolUseId ? `tc-${toolCall.toolUseId}` : undefined;
-	const swipe = useSwipeMenu({ enabled: hasActions, blockId: tcBlockId });
 	const selection = useMessageSelection();
 	const isTcSelected = !!(
 		tcBlockId &&
 		selection.selectionMode &&
 		selection.selectedBlockIds.has(tcBlockId)
 	);
+	const handleDeselectTc = useCallback(() => {
+		if (tcBlockId) selection.deselectBlock(tcBlockId);
+	}, [selection.deselectBlock, tcBlockId]);
+	const swipe = useSwipeMenu({
+		enabled: hasActions,
+		blockId: tcBlockId,
+		onSwipeRight: isTcSelected ? handleDeselectTc : undefined,
+	});
 
 	const menuItemsNode = hasActions ? (
 		<>

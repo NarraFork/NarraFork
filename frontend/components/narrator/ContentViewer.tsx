@@ -291,11 +291,16 @@ export const ContentViewer = memo(
 		// Context menu state (desktop: Mantine Menu, mobile: swipe reveal)
 		// ContentViewer uses its own boxRef for both swipe and other purposes (viewport detection).
 		// excludeSelectors is empty because ContentViewer IS the content block.
+		const handleDeselectBlock = useCallback(() => {
+			selection.deselectBlock(blockIdStr);
+		}, [selection.deselectBlock, blockIdStr]);
+
 		const swipe = useSwipeMenu({
 			enabled: true,
 			externalBoxRef: boxRef,
 			excludeSelectors: [".mantine-Menu-dropdown"],
 			blockId: blockIdStr,
+			onSwipeRight: isSelected ? handleDeselectBlock : undefined,
 		});
 
 		// Desktop: right-click opens context menu (override hook's handler to gate on !isMobile)

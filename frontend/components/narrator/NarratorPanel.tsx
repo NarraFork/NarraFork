@@ -1564,6 +1564,19 @@ export function NarratorPanel({
 		if (closeFn) closeFn();
 	}, []);
 
+	const deselectBlock = useCallback((blockId: string) => {
+		setSelectedBlockIds((prev) => {
+			const next = new Set(prev);
+			next.delete(blockId);
+			if (next.size === 0) {
+				setSelectionMode(false);
+				setAnchorBlockId(null);
+				setGlobalSwipeAnchor(null);
+			}
+			return next;
+		});
+	}, []);
+
 	// Register the global range-selection callback so useSwipeMenu instances
 	// can trigger multi-select without prop drilling.
 	useEffect(() => {
@@ -1592,8 +1605,9 @@ export function NarratorPanel({
 			selectedBlockIds,
 			anchorBlockId,
 			exitSelection,
+			deselectBlock,
 		}),
-		[selectionMode, selectedBlockIds, anchorBlockId, exitSelection],
+		[selectionMode, selectedBlockIds, anchorBlockId, exitSelection, deselectBlock],
 	);
 
 	// --- Flat elements for virtualization ---
