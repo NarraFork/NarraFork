@@ -89,6 +89,7 @@ interface SegmentCanvasProps {
 			parentChapterId?: string | null;
 			narratorId: string | null;
 			narratorStatus: string | null;
+			reviewStatus?: string | null;
 			startCommitSha: string | null;
 			mergeCommitSha?: string | null;
 			layoutX: number;
@@ -209,6 +210,7 @@ export const SegmentCanvas = memo(
 						parentChapterId: ch.parentChapterId,
 						narratorId: ch.narratorId,
 						narratorStatus: ch.narratorStatus,
+						reviewStatus: ch.reviewStatus,
 						startCommitSha: ch.startCommitSha,
 						mergeCommitSha: ch.mergeCommitSha,
 						layoutX: ch.layoutX,

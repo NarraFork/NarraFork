@@ -17,6 +17,19 @@ export function useGlobalOverseer() {
 		return () => narratorWSManager.removeListener(handle);
 	}, [qc]);
 
+	// Listen for overseer:status_changed WS events to refresh the nav item in real-time.
+	// This event is broadcast to ALL clients (not just subscribers) when the global
+	// overseer's narrator status changes (thinking/waiting/idle/etc.).
+	useEffect(() => {
+		const handle = narratorWSManager.addListener(
+			{ narratorIds: "*", types: ["overseer:status_changed"] },
+			(data) => {
+				qc.invalidateQueries({ queryKey: ["overseers", "global"] });
+			},
+		);
+		return () => narratorWSManager.removeListener(handle);
+	}, [qc]);
+
 	return useQuery({
 		queryKey: ["overseers", "global"],
 		queryFn: async () => {

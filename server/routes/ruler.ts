@@ -3,16 +3,22 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import {
 	forkChapterSchema,
 	rulerAbandonSchema,
 	rulerMergeSchema,
+	rulerRebaseResolveSchema,
+	rulerRebaseSchema,
 	updateRulerPositionsSchema,
 } from "../lib/validators";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
+import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
+import { narratorService } from "../services/narrator-service";
+import { sendMessage } from "../services/narrator-session";
 
 /**
  * Check if a chapter belongs to a segment (identified by `targetSha`) by walking
@@ -443,23 +449,43 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
 	});
 	if (!rootChapter) throw new NotFoundError("Root chapter for project", projectId);
+	if (!rootChapter.worktreePath) {
+		throw new ValidationError("Root chapter has no worktree");
+	}
+
+	// Dirty check: ensure trunk worktree is clean
+	const trunkStatus = await gitService.getStatus(rootChapter.worktreePath);
+	if (trunkStatus.trim()) {
+		throw new ValidationError(
+			"Target chapter (trunk) has uncommitted or untracked changes. Please commit or stash them first.",
+		);
+	}
+
+	// Dirty check: ensure source worktree is clean
+	const source = await db.query.chapters.findFirst({
+		where: and(eq(chapters.id, sourceChapterId), eq(chapters.projectId, projectId)),
+	});
+	if (!source) throw new NotFoundError("Chapter", sourceChapterId);
+	if (source.worktreePath) {
+		const sourceStatus = await gitService.getStatus(source.worktreePath);
+		if (sourceStatus.trim()) {
+			throw new ValidationError(
+				"Source chapter has uncommitted or untracked changes. Please commit or stash them first.",
+			);
+		}
+	}
+
+	const mergeStrategy = strategy ?? "merge";
 
 	// Execute merge
 	const result = await chapterMerge.merge(sourceChapterId, {
 		targetChapterId: rootChapter.id,
-		strategy: strategy ?? "merge",
+		strategy: mergeStrategy,
 		message,
 	});
 
-	if (!result.success) {
-		return c.json(result, 409);
-	}
-
-	// Ruler mode: also delete the git branch after merge (freeze completely)
-	const source = await db.query.chapters.findFirst({
-		where: eq(chapters.id, sourceChapterId),
-	});
-	if (source) {
+	if (result.success) {
+		// Ruler mode: delete the source git branch after merge
 		const project = await db.query.projects.findFirst({
 			where: eq(projects.id, projectId),
 		});
@@ -467,12 +493,58 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 			try {
 				await gitService.deleteBranch(project.gitPath, source.branch);
 			} catch {
-				// Branch may already be deleted or not exist
+				// Branch may already be deleted
 			}
 		}
+		return c.json(result);
 	}
 
-	return c.json(result);
+	// Conflict detected — attempt AI resolution via temporary chapter
+	if (result.conflictFiles?.length) {
+		const userId = c.get("user").sub;
+		const locale = await getUserLanguage(userId);
+
+		const aiResult = await chapterMerge.rulerAiResolve(sourceChapterId, rootChapter.id, {
+			strategy: mergeStrategy,
+			message,
+			locale,
+			userId,
+		});
+
+		if (aiResult.resolved) {
+			// AI resolved — delete source branch (Ruler-specific)
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+			});
+			if (project?.gitPath && source.branch) {
+				try {
+					await gitService.deleteBranch(project.gitPath, source.branch);
+				} catch {
+					// Branch may already be deleted
+				}
+			}
+			return c.json({
+				...aiResult.mergeResult,
+				aiResolved: true,
+				resolvedConflictFiles: result.conflictFiles,
+			});
+		}
+
+		// AI failed — return 409 with temp chapter info
+		return c.json(
+			{
+				success: false,
+				conflictFiles: result.conflictFiles,
+				aiAttempted: true,
+				aiError: aiResult.error,
+				tempChapterId: aiResult.tempChapterId,
+				remainingFiles: aiResult.remainingFiles,
+			},
+			409,
+		);
+	}
+
+	return c.json(result, 409);
 });
 
 // POST /:id/ruler/abandon — Abandon a chapter (delete worktree + branch)
@@ -492,4 +564,120 @@ rulerRoutes.post("/:id/ruler/abandon", async (c) => {
 	await chapterService.remove(chapterId);
 
 	return c.json({ success: true });
+});
+
+// POST /:id/ruler/rebase — Rebase a chapter onto trunk
+rulerRoutes.post("/:id/ruler/rebase", async (c) => {
+	const projectId = c.req.param("id");
+	const parsed = rulerRebaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { chapterId } = parsed.data;
+
+	// Find root chapter (trunk)
+	const rootChapter = await db.query.chapters.findFirst({
+		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
+	});
+	if (!rootChapter) throw new NotFoundError("Root chapter for project", projectId);
+
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, projectId),
+	});
+	if (!project?.gitPath) throw new ValidationError("Project has no git path");
+
+	const trunkBranch = project.defaultBranch ?? "main";
+
+	// Verify source chapter
+	const chapter = await db.query.chapters.findFirst({
+		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+	});
+	if (!chapter) throw new NotFoundError("Chapter", chapterId);
+	if (chapter.status !== "active") throw new ValidationError("Can only rebase active chapters");
+	if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+
+	// Dirty check
+	const status = await gitService.getStatus(chapter.worktreePath);
+	if (status.trim()) {
+		throw new ValidationError(
+			"Chapter has uncommitted or untracked changes. Please commit or stash them first.",
+		);
+	}
+
+	// Execute rebase
+	const result = await gitService.rebase(chapter.worktreePath, trunkBranch);
+
+	if (result.success) {
+		// Update chapter SHAs
+		const trunkHead = await gitService.getHeadCommit(project.gitPath);
+		await db
+			.update(chapters)
+			.set({
+				startCommitSha: trunkHead,
+				headCommitSha: result.commitSha,
+			})
+			.where(eq(chapters.id, chapterId));
+
+		// Sync commits
+		await commitSyncService.syncChapterCommits(chapterId).catch(() => {});
+
+		return c.json({ success: true, commitSha: result.commitSha });
+	}
+
+	// Conflict — return file list, worktree stays in rebase state
+	return c.json({
+		success: false,
+		conflictFiles: result.conflictFiles,
+	});
+});
+
+// POST /:id/ruler/rebase-resolve — Resolve rebase conflict (abort or let narrator handle)
+rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
+	const projectId = c.req.param("id");
+	const parsed = rulerRebaseResolveSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { chapterId, action } = parsed.data;
+
+	const chapter = await db.query.chapters.findFirst({
+		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+	});
+	if (!chapter) throw new NotFoundError("Chapter", chapterId);
+	if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+
+	if (action === "abort") {
+		await gitService.rebaseAbort(chapter.worktreePath);
+		return c.json({ success: true });
+	}
+
+	// action === "continue" — send conflict resolution message to narrator
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, projectId),
+	});
+	const trunkBranch = project?.defaultBranch ?? "main";
+
+	// Get or create primary narrator for this chapter
+	let narrator = await db.query.narrators.findFirst({
+		where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+	});
+	if (!narrator) {
+		narrator = await narratorService.create({
+			chapterId,
+			permissionMode: "default",
+		});
+	}
+
+	// Build rebase conflict prompt
+	const conflictFiles = await gitService.getConflictFilesWithLines(chapter.worktreePath);
+	const fileList = conflictFiles
+		.map((f) => `  - ${f.file} (${f.conflictLines} conflict(s))`)
+		.join("\n");
+
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+
+	const prompt = getPrompt("rebaseConflictResolution", locale as Locale)
+		.replace("{ontoBranch}", trunkBranch)
+		.replace("{fileList}", fileList);
+
+	await sendMessage(narrator.id, prompt, undefined, locale as Locale);
+
+	return c.json({ success: true, narratorId: narrator.id });
 });

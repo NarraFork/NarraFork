@@ -175,6 +175,16 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		update: z
+			.object({
+				serverUrl: z.string().url().optional(),
+				product: z.string().min(1).optional(),
+				channel: z.enum(["stable", "beta"]).optional(),
+				checkIntervalMinutes: z.number().int().min(0).optional(),
+				autoDownload: z.boolean().optional(),
+			})
+			.partial()
+			.optional(),
 	})
 	.strict();
 

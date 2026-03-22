@@ -4,7 +4,9 @@ import {
 	NumberInput,
 	SegmentedControl,
 	Stack,
+	Switch,
 	Text,
+	TextInput,
 	Title,
 } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
@@ -25,6 +27,13 @@ export interface ServerSystemSectionProps {
 	setOpenBrowser: (v: string) => void;
 	pwaUpdating: boolean;
 	handlePwaUpdate: () => void;
+	// Update server
+	updateServerUrl: string;
+	setUpdateServerUrl: (v: string) => void;
+	updateChannel: "stable" | "beta";
+	setUpdateChannel: (v: "stable" | "beta") => void;
+	updateAutoDownload: boolean;
+	setUpdateAutoDownload: (v: boolean) => void;
 }
 
 export function ServerSystemSection({
@@ -38,6 +47,12 @@ export function ServerSystemSection({
 	setOpenBrowser,
 	pwaUpdating,
 	handlePwaUpdate,
+	updateServerUrl,
+	setUpdateServerUrl,
+	updateChannel,
+	setUpdateChannel,
+	updateAutoDownload,
+	setUpdateAutoDownload,
 }: ServerSystemSectionProps) {
 	const { t } = useTranslation("settings");
 
@@ -77,6 +92,37 @@ export function ServerSystemSection({
 					]}
 				/>
 			</div>
+
+			{/* Update Server */}
+			<Title order={5} mt="sm">
+				{t("updateServerSubSection") ?? "Update Server"}
+			</Title>
+			<TextInput
+				label={t("updateServerUrl") ?? "Update Server URL"}
+				description={t("updateServerUrlDesc") ?? "URL of the update server (e.g., https://updates.example.com)"}
+				placeholder="https://updates.example.com"
+				value={updateServerUrl}
+				onChange={(e) => setUpdateServerUrl(e.currentTarget.value)}
+			/>
+			<div>
+				<Text size="sm" fw={500} mb={4}>
+					{t("updateChannel") ?? "Update Channel"}
+				</Text>
+				<SegmentedControl
+					value={updateChannel}
+					onChange={(v) => setUpdateChannel(v as "stable" | "beta")}
+					data={[
+						{ label: t("updateChannelStable") ?? "Stable", value: "stable" },
+						{ label: t("updateChannelBeta") ?? "Beta", value: "beta" },
+					]}
+				/>
+			</div>
+			<Switch
+				label={t("updateAutoDownload") ?? "Auto-download updates"}
+				description={t("updateAutoDownloadDesc") ?? "Automatically download updates when available"}
+				checked={updateAutoDownload}
+				onChange={(e) => setUpdateAutoDownload(e.currentTarget.checked)}
+			/>
 
 			{/* System Dependencies */}
 			<Title order={5} mt="sm">

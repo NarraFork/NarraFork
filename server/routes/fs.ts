@@ -63,7 +63,7 @@ fsRoutes.get("/browse", (c) => {
  * Uses platform-specific APIs to resolve actual paths:
  * - Linux: XDG user-dirs ($XDG_DESKTOP_DIR etc., falls back to ~/Desktop)
  * - macOS: ~/Desktop, ~/Documents, ~/Downloads (standard on macOS)
- * - Windows: Known Folder GUIDs via PowerShell, falls back to USERPROFILE subfolders
+ * - Windows: PowerShell [Environment]::GetFolderPath (no USERPROFILE concatenation fallback)
  *
  * Only includes paths that actually exist on the system.
  */
@@ -365,7 +365,7 @@ const _winFolderCache: Record<string, string | null> = {};
  * Strategy:
  * 1. Try Environment.GetFolderPath with the correct SpecialFolder enum name
  * 2. For Downloads (no enum), use Shell.Application COM object with GUID
- * 3. Fall back to USERPROFILE\Downloads etc.
+ * 3. Return null if all methods fail (no USERPROFILE concatenation fallback)
  */
 function resolveWindowsKnownFolder(key: string, home: string): string | null {
 	if (key in _winFolderCache) return _winFolderCache[key];
@@ -405,15 +405,10 @@ function resolveWindowsKnownFolder(key: string, home: string): string | null {
 		}
 	}
 
-	// Method 3: Fallback to English name under home
-	const englishNames: Record<string, string> = {
-		desktop: "Desktop",
-		documents: "Documents",
-		downloads: "Downloads",
-	};
-	const fallback = join(home, englishNames[key] || key);
-	_winFolderCache[key] = existsSync(fallback) ? fallback : null;
-	return _winFolderCache[key];
+	// Method 3: No fallback - return null if PowerShell methods fail
+	// Desktop should always use [Environment]::GetFolderPath, not USERPROFILE concatenation
+	_winFolderCache[key] = null;
+	return null;
 }
 
 /**
@@ -422,7 +417,7 @@ function resolveWindowsKnownFolder(key: string, home: string): string | null {
  *
  * - Linux: XDG user-dirs.dirs → env vars → fallback ~/Desktop etc.
  * - macOS: ~/Desktop, ~/Documents, ~/Downloads (always English on macOS)
- * - Windows: Environment.GetFolderPath via PowerShell → fallback USERPROFILE subfolders
+ * - Windows: Environment.GetFolderPath via PowerShell only (no fallback)
  */
 function resolveUserDir(key: "desktop" | "documents" | "downloads", home: string): string | null {
 	const xdgMap: Record<string, string> = {

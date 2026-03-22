@@ -108,6 +108,7 @@ export interface ToolChunkSnapshot {
 	parentToolUseId?: string;
 	extractedFilePath?: string;
 	contentCharsReceived?: number;
+	extractedFields?: Record<string, string>;
 	/** Whether tool_started has fired (tool is executing) */
 	started?: boolean;
 	/** Input payload from tool_started */
@@ -371,6 +372,7 @@ export async function processEvent(
 					...(event.contentCharsReceived != null && {
 						contentCharsReceived: event.contentCharsReceived,
 					}),
+					...(event.extractedFields && { extractedFields: event.extractedFields }),
 					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 				});
 			}
@@ -384,6 +386,7 @@ export async function processEvent(
 				...(event.contentCharsReceived != null && {
 					contentCharsReceived: event.contentCharsReceived,
 				}),
+				...(event.extractedFields && { extractedFields: event.extractedFields }),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;

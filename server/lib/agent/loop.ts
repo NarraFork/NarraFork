@@ -442,6 +442,7 @@ export async function* agentLoop(
 				totalChars: number;
 				startedAt: number;
 				extractedFilePath?: string;
+				extractedFields?: Record<string, string>;
 				lastYieldedAt: number;
 			}
 		>();
@@ -586,12 +587,29 @@ export async function* agentLoop(
 									}
 								}
 
+								// For Agent tool, extract description/subagent_type/model from early chunks
+								let fieldsJustExtracted = false;
+								if (acc.name === "Agent" || acc.name === "Task") {
+									const raw = acc.inputChunks.join("");
+									const wantedKeys = ["description", "subagent_type", "model"] as const;
+									for (const key of wantedKeys) {
+										if (acc.extractedFields?.[key]) continue;
+										const re = new RegExp(`"${key}"\\s*:\\s*"([^"]*?)"`);
+										const m = raw.match(re);
+										if (m) {
+											if (!acc.extractedFields) acc.extractedFields = {};
+											acc.extractedFields[key] = m[1];
+											fieldsJustExtracted = true;
+										}
+									}
+								}
+
 								// Throttle: yield at most once per 50ms per tool to reduce WS pressure.
-								// Bypass throttle when file_path is first extracted so the frontend
-								// can display the path immediately instead of waiting for the next
+								// Bypass throttle when file_path or fields are first extracted so the
+								// frontend can display them immediately instead of waiting for the next
 								// content chunk.
 								const now = Date.now();
-								if (filePathJustExtracted || now - acc.lastYieldedAt >= 50) {
+								if (filePathJustExtracted || fieldsJustExtracted || now - acc.lastYieldedAt >= 50) {
 									acc.lastYieldedAt = now;
 
 									// Calculate content chars (total minus file_path JSON overhead)
@@ -613,6 +631,9 @@ export async function* agentLoop(
 										...(acc.extractedFilePath && {
 											contentCharsReceived: contentChars,
 										}),
+										...(acc.extractedFields && {
+											extractedFields: acc.extractedFields,
+										}),
 									};
 								}
 							}
@@ -633,6 +654,9 @@ export async function* agentLoop(
 									}),
 									...(acc.extractedFilePath && {
 										contentCharsReceived: contentChars,
+									}),
+									...(acc.extractedFields && {
+										extractedFields: acc.extractedFields,
 									}),
 								};
 

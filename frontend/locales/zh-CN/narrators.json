@@ -50,5 +50,10 @@
 	"filterHasRunningContainers": "有运行中容器",
 	"filterHasViewers": "有人在查看",
 	"filterMenuTitle": "筛选条件",
-	"containers": "{{running}}/{{total}} 个容器"
+	"containers": "{{running}}/{{total}} 个容器",
+	"workspaceView": "工作区视图",
+	"listView": "列表视图",
+	"splitRight": "向右分割",
+	"splitDown": "向下分割",
+	"dropNarratorHere": "拖放叙述者到此处"
 }

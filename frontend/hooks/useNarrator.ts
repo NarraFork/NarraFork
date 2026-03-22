@@ -112,11 +112,18 @@ export function useNarrator(id: string) {
 	});
 }
 
+type MessagePageParam =
+	| {
+			cursor: string;
+			direction: "older" | "newer";
+	  }
+	| undefined;
+
 export function useNarratorMessages(narratorId: string, around?: NarratorMessagesAroundOptions) {
 	const normalizedAround = normalizeAroundOptions(around);
 	return useInfiniteQuery({
 		queryKey: getNarratorMessagesQueryKey(narratorId, normalizedAround),
-		queryFn: ({ pageParam }) => {
+		queryFn: ({ pageParam }: { pageParam: MessagePageParam }) => {
 			// First page: use the bounded around-window when deep-linking to a message,
 			// otherwise fetch the latest page.
 			if (!pageParam && normalizedAround) {
@@ -124,11 +131,19 @@ export function useNarratorMessages(narratorId: string, around?: NarratorMessage
 			}
 			return api.getNarratorMessages(narratorId, {
 				limit: pageParam ? 50 : 20,
-				cursor: pageParam,
+				cursor: pageParam?.cursor,
+				direction: pageParam?.direction,
 			});
 		},
-		initialPageParam: undefined as string | undefined,
-		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
+		initialPageParam: undefined as MessagePageParam,
+		getNextPageParam: (lastPage) =>
+			lastPage.hasMore && lastPage.nextCursor
+				? { cursor: lastPage.nextCursor, direction: "older" as const }
+				: undefined,
+		getPreviousPageParam: (firstPage) =>
+			firstPage.hasMoreAfter && firstPage.prevCursor
+				? { cursor: firstPage.prevCursor, direction: "newer" as const }
+				: undefined,
 		enabled: !!narratorId,
 		// Messages are kept up-to-date via WebSocket (setQueryData), so background
 		// refetch on remount is unnecessary. A high staleTime prevents TanStack Query

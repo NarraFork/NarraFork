@@ -7,9 +7,11 @@ export function getAvatarUrl(userId: string, avatarImageId: string): string {
 
 export class ApiError extends Error {
 	status: number;
-	constructor(message: string, status: number) {
+	data?: Record<string, unknown>;
+	constructor(message: string, status: number, data?: Record<string, unknown>) {
 		super(message);
 		this.status = status;
+		this.data = data;
 	}
 }
 
@@ -44,7 +46,7 @@ async function request<T>(
 	}
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ error: response.statusText }));
-		throw new ApiError(error.error ?? "Request failed", response.status);
+		throw new ApiError(error.error ?? "Request failed", response.status, error);
 	}
 	return response.json();
 }
@@ -258,6 +260,7 @@ export interface PaginatedMessages {
 	hasMore: boolean;
 	nextCursor: string | null;
 	hasMoreAfter?: boolean;
+	prevCursor?: string | null;
 	pruneBoundaryMessageId?: string | null;
 	prunedPercent?: number | null;
 }
@@ -541,6 +544,7 @@ export const api = {
 		opts?: {
 			limit?: number;
 			cursor?: string;
+			direction?: "older" | "newer";
 			around?: MessagesAroundOptions;
 		},
 	) => {
@@ -552,6 +556,7 @@ export const api = {
 		} else {
 			if (opts?.limit) params.set("limit", String(opts.limit));
 			if (opts?.cursor) params.set("cursor", opts.cursor);
+			if (opts?.direction === "newer") params.set("direction", "newer");
 		}
 		const qs = params.toString();
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
@@ -1288,6 +1293,23 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ chapterId }),
 		}),
+	rulerRebase: (projectId: string, chapterId: string) =>
+		request<{
+			success: boolean;
+			commitSha?: string;
+			conflictFiles?: Array<{ file: string; conflictLines: number }>;
+		}>(`/projects/${projectId}/ruler/rebase`, {
+			method: "POST",
+			body: JSON.stringify({ chapterId }),
+		}),
+	rulerRebaseResolve: (
+		projectId: string,
+		data: { chapterId: string; action: "abort" | "continue" },
+	) =>
+		request<{ success: boolean; narratorId?: string }>(
+			`/projects/${projectId}/ruler/rebase-resolve`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
 
 	// === chapter commits ===
 	getChapterCommits: (id: string, params?: { limit?: number; since?: string }) => {

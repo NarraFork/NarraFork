@@ -39,6 +39,8 @@ import {
 	IconExternalLink,
 	IconFile,
 	IconFolderPlus,
+	IconLayoutColumns,
+	IconLayoutRows,
 	IconLock,
 	IconLockOpen,
 	IconPaperclip,
@@ -120,7 +122,7 @@ import {
 } from "./MessageSelectionCtx";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import { hasToolUse, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
+import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesQueryData,
@@ -719,6 +721,9 @@ export function NarratorPanel({
 	onBack,
 	isResizing,
 	onHeaderPointerDown,
+	onClose,
+	onSplitHorizontal,
+	onSplitVertical,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -747,6 +752,9 @@ export function NarratorPanel({
 		hasNextPage,
 		fetchNextPage,
 		isFetchingNextPage,
+		hasPreviousPage,
+		fetchPreviousPage,
+		isFetchingPreviousPage,
 	} = useNarratorMessages(narratorId, aroundOptions);
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
@@ -977,6 +985,9 @@ export function NarratorPanel({
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
+	// Whether older messages are currently being prepended. When true, virtua's
+	// shift prop maintains scroll position from the end (scroll anchoring).
+	const [shifting, setShifting] = useState(false);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
@@ -994,6 +1005,12 @@ export function NarratorPanel({
 	//   sustained flag to prevent the oscillation loop.
 	const programmaticScrollRef = useRef(false);
 	const resizingRef = useRef(false);
+	// Sustained flag: true while the content ResizeObserver is actively snapping
+	// scrollTop to the bottom. Unlike the one-shot `programmaticScrollRef`, this
+	// stays true across rapid consecutive ResizeObserver callbacks so that
+	// `onScroll` suppresses all detach checks for the entire burst.
+	const contentSnappingRef = useRef(false);
+	const contentSnappingTimer = useRef(0);
 
 	const lastFollowScrollTop = useRef(0);
 
@@ -1038,18 +1055,46 @@ export function NarratorPanel({
 	}, []);
 
 	const scrollToBottom = useCallback(
-		(instant?: boolean) => {
+		(instant?: boolean, _vpRetries = 3) => {
 			const vp = viewportRef.current;
-			if (!vp) return;
+			if (!vp) {
+				// Viewport may not be mounted yet (e.g. right after narrator
+				// switch where key={narratorId} causes a full remount). Retry
+				// a few frames to wait for the ScrollArea callback ref to fire.
+				if (_vpRetries > 0) {
+					requestAnimationFrame(() => scrollToBottom(instant, _vpRetries - 1));
+				}
+				return;
+			}
 			if (!isAtBottomRef.current) {
 				isAtBottomRef.current = true;
 				setIsAtBottom(true);
 			}
 			setUnreadCountRef.current?.(0);
 			if (instant) {
-				programmaticScrollRef.current = true;
-				vp.scrollTop = vp.scrollHeight;
+				// Instant jump via virtua's scrollToIndex — used for initial
+				// load, narrator switch, and "scroll to bottom" button clicks.
+				const handle = virtualListRef.current;
+				if (handle) {
+					// virtua's viewportSize is 0 until its ResizeObserver fires
+					// the first measurement. If we call scrollToIndex before
+					// that, it computes a wrong offset and does nothing useful.
+					// Poll briefly until the viewport is measured.
+					const doScroll = (retries = 5) => {
+						programmaticScrollRef.current = true;
+						handle.scrollToIndex(Number.MAX_SAFE_INTEGER, { align: "end" });
+						if (handle.viewportSize === 0 && retries > 0) {
+							requestAnimationFrame(() => doScroll(retries - 1));
+						}
+					};
+					doScroll();
+				} else {
+					programmaticScrollRef.current = true;
+					vp.scrollTop = vp.scrollHeight;
+				}
 			} else {
+				// Smooth lerp follow — used during streaming / new messages
+				// so the scroll feels fluid rather than jumpy.
 				startFollowing();
 			}
 		},
@@ -1357,10 +1402,6 @@ export function NarratorPanel({
 		return null;
 	}, [hydrated, messagesData]);
 
-	// Whether the last visible message ends with a tool run — used to visually
-	// merge the streaming tool chunks into the preceding run (no gap / shared border).
-	const lastMessageIsToolRun = !!lastMessage && hasToolUse(lastMessage);
-
 	const narratorIsIdle =
 		narrator?.status === "idle" ||
 		narrator?.status === "done" ||
@@ -1418,10 +1459,38 @@ export function NarratorPanel({
 
 	// --- Virtualization setup ---
 	const highlightScrolledRef = useRef(false);
+	const highlightStartTimerRef = useRef<number | null>(null);
+	const highlightClearTimerRef = useRef<number | null>(null);
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
 	const virtualListRef = useRef<VirtualMessageListHandle>(null);
+
+	const clearHighlightTimers = useCallback(() => {
+		if (highlightStartTimerRef.current != null) {
+			window.clearTimeout(highlightStartTimerRef.current);
+			highlightStartTimerRef.current = null;
+		}
+		if (highlightClearTimerRef.current != null) {
+			window.clearTimeout(highlightClearTimerRef.current);
+			highlightClearTimerRef.current = null;
+		}
+	}, []);
+
+	const scheduleHighlight = useCallback(
+		(messageId: string, delayMs: number) => {
+			clearHighlightTimers();
+			highlightStartTimerRef.current = window.setTimeout(() => {
+				setHighlightedId(messageId);
+				highlightClearTimerRef.current = window.setTimeout(() => {
+					setHighlightedId((current) => (current === messageId ? null : current));
+					highlightClearTimerRef.current = null;
+				}, 1600);
+				highlightStartTimerRef.current = null;
+			}, delayMs);
+		},
+		[clearHighlightTimers],
+	);
 
 	const prevNarratorIdRef = useRef(narratorId);
 	if (prevNarratorIdRef.current !== narratorId) {
@@ -1431,6 +1500,15 @@ export function NarratorPanel({
 			setInitialScrollDone(false);
 		}
 	}
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/highlightMessageId are used to reset one-shot highlight state when the active target changes
+	useEffect(() => {
+		highlightScrolledRef.current = false;
+		clearHighlightTimers();
+		setHighlightedId(null);
+	}, [narratorId, highlightMessageId, clearHighlightTimers]);
+
+	useEffect(() => clearHighlightTimers, [clearHighlightTimers]);
 
 	// Pre-render trim: on mount (key={narratorId} causes full remount on switch),
 	// if the incoming narrator already has too many cached pages from a previous
@@ -1515,17 +1593,23 @@ export function NarratorPanel({
 	// Page-level cache: keyed by page reference → { elements, keys }.
 	// When a page object reference doesn't change, we reuse the cached result.
 	const pageCacheRef = useRef(
-		new WeakMap<object, { elements: React.ReactNode[]; keys: string[] }>(),
+		new WeakMap<object, { elements: React.ReactNode[]; keys: string[]; targets: string[][] }>(),
 	);
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
-	const { flatElements, flatKeys } = useMemo(() => {
-		if (isResizing || !messagesData?.pages) return { flatElements: [], flatKeys: [] };
+	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
+		if (isResizing || !messagesData?.pages) {
+			return { flatElements: [], flatKeys: [], flatTargets: [] };
+		}
 		const pages = messagesData.pages;
-		const reversed = [...pages].reverse();
+		const pageParams = messagesData.pageParams ?? [];
+		const reversed = pages
+			.map((page, originalIndex) => ({ page, originalIndex, pageParam: pageParams[originalIndex] }))
+			.reverse();
 		const cache = pageCacheRef.current;
 		const allElements: React.ReactNode[] = [];
 		const allKeys: string[] = [];
+		const allTargets: string[][] = [];
 
 		// Build a cache key object per page that includes all render-affecting props.
 		// We use the page reference as the primary cache key, but invalidate when
@@ -1534,16 +1618,30 @@ export function NarratorPanel({
 		const bgDismissedKey = `${renderPermCb.bgRetryDismissedIds.size}:${[...renderPermCb.bgRetryDismissedIds].join(",")}`;
 		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}|${bgDismissedKey}`;
 
-		for (let i = 0; i < reversed.length; i++) {
-			const page = reversed[i];
+		for (const { page, originalIndex, pageParam } of reversed) {
 			if (!page?.messages?.length) continue;
+			const pageCursor =
+				typeof pageParam === "object" && pageParam && "cursor" in pageParam
+					? String(pageParam.cursor)
+					: typeof pageParam === "string"
+						? pageParam
+						: undefined;
+			const pageDirection =
+				typeof pageParam === "object" && pageParam && "direction" in pageParam
+					? String(pageParam.direction)
+					: "older";
+			const pageKey =
+				pageParam == null
+					? `initial:${narratorId}:${highlightMessageId ?? "latest"}`
+					: `${pageDirection}:${pageCursor ?? originalIndex}`;
 
 			// Check cache
 			const cached = cache.get(page);
 			if (cached && (cached as { _secondaryKey?: string })._secondaryKey === secondaryKey) {
 				for (let j = 0; j < cached.elements.length; j++) {
 					allElements.push(cached.elements[j]);
-					allKeys.push(`p${i}-${cached.keys[j]}`);
+					allKeys.push(`${pageKey}-${cached.keys[j]}`);
+					allTargets.push(cached.targets[j] ?? []);
 				}
 				continue;
 			}
@@ -1574,11 +1672,12 @@ export function NarratorPanel({
 
 			for (let j = 0; j < result.elements.length; j++) {
 				allElements.push(result.elements[j]);
-				allKeys.push(`p${i}-${result.keys[j]}`);
+				allKeys.push(`${pageKey}-${result.keys[j]}`);
+				allTargets.push(result.targets[j] ?? []);
 			}
 		}
 
-		return { flatElements: allElements, flatKeys: allKeys };
+		return { flatElements: allElements, flatKeys: allKeys, flatTargets: allTargets };
 	}, [
 		isResizing,
 		messagesData,
@@ -1588,6 +1687,7 @@ export function NarratorPanel({
 		expandedToolUseId,
 		editExpandOverride,
 		highlightedId,
+		highlightMessageId,
 		showTokenUsage,
 		handleDeleteBlock,
 		handleCompactBefore,
@@ -1599,19 +1699,96 @@ export function NarratorPanel({
 		hasChapter,
 	]);
 
-	// Whether streaming tool chunks should visually merge into the preceding tool run.
-	// Only merge when there is no streaming text/reasoning between them.
-	const mergeStreaming =
-		!!topLevelStreamingChunks &&
-		lastMessageIsToolRun &&
-		!streamingRef.current &&
-		!streamingReasoningRef.current;
+	// Append streaming content (StreamingBubble + streaming tool chunks) to the
+	// virtualised element list so they participate in normal virtual scrolling
+	// instead of being rendered in a separate trailing slot.
+	const { finalElements, finalKeys, finalTargets } = useMemo(() => {
+		const els = [...flatElements];
+		const keys = [...flatKeys];
+		const targets = [...flatTargets];
 
-	// --- Load older ---
-	const handleLoadOlder = useCallback(() => {
+		// StreamingBubble — only append when there is streaming text/reasoning/web-search
+		// We read refs here; streamingVersion change triggers the memo recalculation.
+		void streamingVersion;
+		const hasStreamingContent =
+			!!streamingRef.current || !!streamingReasoningRef.current || !!webSearchRef.current;
+		if (hasStreamingContent) {
+			els.push(
+				<StreamingBubble
+					narratorId={narratorId}
+					streamingRef={streamingRef}
+					streamingReasoningRef={streamingReasoningRef}
+					webSearchRef={webSearchRef}
+					version={streamingVersion}
+				/>,
+			);
+			keys.push("__streaming_bubble__");
+			targets.push([]);
+		}
+
+		// Streaming tool chunks
+		if (topLevelStreamingChunks) {
+			const toolEl = renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb);
+			if (toolEl) {
+				els.push(toolEl);
+				keys.push("__streaming_tool_chunks__");
+				targets.push([]);
+			}
+		}
+
+		return { finalElements: els, finalKeys: keys, finalTargets: targets };
+	}, [
+		flatElements,
+		flatKeys,
+		flatTargets,
+		streamingVersion,
+		topLevelStreamingChunks,
+		narratorId,
+		renderPermCb,
+		streamingRef,
+		streamingReasoningRef,
+		webSearchRef,
+	]);
+
+	const targetIndexMap = useMemo(() => {
+		const indexMap = new Map<string, number>();
+		for (let i = 0; i < finalTargets.length; i++) {
+			for (const targetId of finalTargets[i] ?? []) {
+				if (targetId && !indexMap.has(targetId)) {
+					indexMap.set(targetId, i);
+				}
+			}
+		}
+		return indexMap;
+	}, [finalTargets]);
+
+	// --- Load older / newer ---
+	const handleLoadOlder = useCallback(async () => {
 		if (isFetchingNextPage) return;
-		fetchNextPage();
+		// Enable virtua's shift mode so scroll position is maintained from the
+		// end while older messages are prepended.
+		setShifting(true);
+		await fetchNextPage();
+		// Clear shift after one frame — virtua has already consumed shift=true
+		// during the render that followed the data update.
+		requestAnimationFrame(() => {
+			setShifting(false);
+		});
 	}, [fetchNextPage, isFetchingNextPage]);
+
+	const handleLoadNewer = useCallback(async () => {
+		if (isFetchingPreviousPage) return;
+		await fetchPreviousPage();
+	}, [fetchPreviousPage, isFetchingPreviousPage]);
+
+	const revealLatestMessages = useCallback(async () => {
+		for (let attempt = 0; attempt < 20; attempt++) {
+			const firstPage = qc.getQueryData<MessagesQueryData>(messagesQueryKey)?.pages?.[0];
+			if (!firstPage?.hasMoreAfter || !firstPage.prevCursor) break;
+			await fetchPreviousPage();
+		}
+		scrollToBottom(true);
+	}, [fetchPreviousPage, messagesQueryKey, qc, scrollToBottom]);
 
 	const handleLoadOlderRef = useRef(handleLoadOlder);
 	handleLoadOlderRef.current = handleLoadOlder;
@@ -1629,6 +1806,23 @@ export function NarratorPanel({
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
 	}, [autoLoadEnabled, hasNextPage, initialScrollDone, isFetchingNextPage]);
+
+	const handleLoadNewerRef = useRef(handleLoadNewer);
+	handleLoadNewerRef.current = handleLoadNewer;
+	useEffect(() => {
+		if (!autoLoadEnabled || !hasPreviousPage || !initialScrollDone || isFetchingPreviousPage)
+			return;
+		const vp = viewportRef.current;
+		if (!vp) return;
+		const check = () => {
+			const remaining = vp.scrollHeight - vp.scrollTop - vp.clientHeight;
+			if (remaining <= 24) {
+				handleLoadNewerRef.current();
+			}
+		};
+		vp.addEventListener("scroll", check, { passive: true });
+		return () => vp.removeEventListener("scroll", check);
+	}, [autoLoadEnabled, hasPreviousPage, initialScrollDone, isFetchingPreviousPage]);
 
 	// --- Scroll state: user-input driven ---
 	const lastTouchYRef = useRef(0);
@@ -1674,24 +1868,31 @@ export function NarratorPanel({
 			// During a viewport resize, suppress all detach checks — multiple
 			// programmatic scrollTop writes fire multiple scroll events and a
 			// one-shot flag can't cover them all.
-			if (resizingRef.current) {
+			if (resizingRef.current || contentSnappingRef.current) {
 				lastScrollTop = cur;
 				return;
 			}
 			// One-shot suppression for individual programmatic scrollTop writes
-			// outside of a resize (e.g. scrollToBottom instant).
+			// outside of a resize (e.g. scrollToBottom).
 			if (programmaticScrollRef.current) {
 				programmaticScrollRef.current = false;
 				lastScrollTop = cur;
 				return;
 			}
+			// Only detach if scrollTop moved upward AND we're meaningfully
+			// away from the bottom. Without the distance check, virtua's
+			// internal scroll reconciliation (which may nudge scrollTop by
+			// a fraction of a pixel) would falsely trigger a detach.
 			if (!followingRef.current && cur < lastScrollTop) {
-				detachFromBottom();
+				const distFromBottom = node.scrollHeight - cur - node.clientHeight;
+				if (distFromBottom > 30) {
+					detachFromBottom();
+				}
 			}
 			lastScrollTop = cur;
 		};
 		const onScrollEnd = () => {
-			if (followingRef.current || resizingRef.current) return;
+			if (followingRef.current || resizingRef.current || contentSnappingRef.current) return;
 			checkAtBottom();
 		};
 
@@ -1711,25 +1912,13 @@ export function NarratorPanel({
 
 	// --- Initial scroll ---
 	useEffect(() => {
-		if (
-			!initialScrollDoneRef.current &&
-			totalMessageCount > 0 &&
-			renderDone &&
-			!highlightMessageId &&
-			isAtBottomRef.current
-		) {
-			initialScrollDoneRef.current = true;
-			setInitialScrollDone(true);
-			scrollToBottom(true);
+		if (initialScrollDoneRef.current || totalMessageCount === 0 || !renderDone) {
+			return;
 		}
-		if (
-			!initialScrollDoneRef.current &&
-			totalMessageCount > 0 &&
-			renderDone &&
-			!isAtBottomRef.current
-		) {
-			initialScrollDoneRef.current = true;
-			setInitialScrollDone(true);
+		initialScrollDoneRef.current = true;
+		setInitialScrollDone(true);
+		if (!highlightMessageId && isAtBottomRef.current) {
+			scrollToBottom(true);
 		}
 	}, [totalMessageCount, scrollToBottom, highlightMessageId]);
 
@@ -1760,9 +1949,23 @@ export function NarratorPanel({
 				}
 				return;
 			}
-			if (isAtBottomRef.current && !highlightMessageId) {
-				startFollowing();
+			// When the user is at the bottom, keep them pinned there as content
+			// grows (new messages, streaming text, tool output, etc.). We use a
+			// direct scrollTop write instead of scrollToIndex to avoid the
+			// scrollToIndex → virtua re-measure → ResizeObserver feedback loop.
+			if (isAtBottomRef.current && !highlightMessageId && vp) {
+				// Use a sustained flag so that rapid consecutive ResizeObserver
+				// callbacks (virtua re-measuring multiple items) don't cause
+				// onScroll to falsely detach from bottom between writes.
+				contentSnappingRef.current = true;
+				clearTimeout(contentSnappingTimer.current);
+				contentSnappingTimer.current = window.setTimeout(() => {
+					contentSnappingRef.current = false;
+				}, 150);
+				vp.scrollTop = vp.scrollHeight - vp.clientHeight;
 			} else if (!isAtBottomRef.current && !highlightMessageId) {
+				// Detect when the user has scrolled close to the bottom without
+				// us noticing (e.g. content shrank).
 				if (vp && vp.scrollHeight - vp.scrollTop - vp.clientHeight < 30) {
 					isAtBottomRef.current = true;
 					setIsAtBottom(true);
@@ -1790,42 +1993,72 @@ export function NarratorPanel({
 
 		return () => {
 			clearTimeout(vpResizeTimer);
+			clearTimeout(contentSnappingTimer.current);
 			resizingRef.current = false;
+			contentSnappingRef.current = false;
 			contentObserver.disconnect();
 			vpObserver.disconnect();
 			stopFollowing();
 		};
 	}, [highlightMessageId, startFollowing, stopFollowing, initialScrollDone]);
 
+	const scrollToVirtualTarget = useCallback(
+		({
+			domIds,
+			targetIds,
+			highlightId,
+		}: {
+			domIds: string[];
+			targetIds: string[];
+			highlightId?: string;
+		}) => {
+			for (const domId of domIds) {
+				const el = document.getElementById(domId);
+				if (el) {
+					requestAnimationFrame(() => {
+						el.scrollIntoView({ behavior: "smooth", block: "center" });
+						if (highlightId) {
+							scheduleHighlight(highlightId, 400);
+						}
+					});
+					return true;
+				}
+			}
+			const targetIndex = targetIds
+				.map((targetId) => targetIndexMap.get(targetId))
+				.find((index): index is number => index != null);
+			if (targetIndex != null && virtualListRef.current) {
+				virtualListRef.current.scrollToIndex(targetIndex, { align: "center" });
+				if (domIds.length > 0) {
+					window.setTimeout(() => {
+						for (const domId of domIds) {
+							const el = document.getElementById(domId);
+							if (el) {
+								el.scrollIntoView({ block: "center" });
+								break;
+							}
+						}
+					}, 80);
+				}
+				if (highlightId) {
+					scheduleHighlight(highlightId, 300);
+				}
+				return true;
+			}
+			return false;
+		},
+		[scheduleHighlight, targetIndexMap],
+	);
+
 	// --- Scroll to highlighted message ---
 	useEffect(() => {
 		if (!highlightMessageId || totalMessageCount === 0 || highlightScrolledRef.current) return;
-		// With virtualization, the target element may not be in the DOM yet.
-		// First try direct DOM lookup (element is in viewport).
-		const el = document.getElementById(`msg-${highlightMessageId}`);
-		if (el) {
-			highlightScrolledRef.current = true;
-			requestAnimationFrame(() => {
-				el.scrollIntoView({ behavior: "smooth", block: "center" });
-				setTimeout(() => {
-					setHighlightedId(highlightMessageId);
-					setTimeout(() => setHighlightedId(null), 1600);
-				}, 400);
-			});
-			return;
-		}
-		// Element not in DOM — find its index in flatKeys and scroll virtualizer to it.
-		const keyIdx = flatKeys.findIndex((k) => k.includes(highlightMessageId));
-		if (keyIdx !== -1 && virtualListRef.current) {
-			highlightScrolledRef.current = true;
-			virtualListRef.current.scrollToIndex(keyIdx, { align: "center" });
-			// After virtualizer scrolls and renders the element, highlight it.
-			setTimeout(() => {
-				setHighlightedId(highlightMessageId);
-				setTimeout(() => setHighlightedId(null), 1600);
-			}, 300);
-		}
-	}, [highlightMessageId, totalMessageCount, flatKeys]);
+		highlightScrolledRef.current = scrollToVirtualTarget({
+			domIds: [`msg-${highlightMessageId}`],
+			targetIds: [highlightMessageId],
+			highlightId: highlightMessageId,
+		});
+	}, [highlightMessageId, totalMessageCount, scrollToVirtualTarget]);
 
 	// --- Send / retry message ---
 	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
@@ -2441,6 +2674,27 @@ export function NarratorPanel({
 								<IconArchive size={16} />
 							</ActionIcon>
 						</Tooltip>
+						{onSplitHorizontal && (
+							<Tooltip label={t("splitRight")}>
+								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onSplitHorizontal}>
+									<IconLayoutColumns size={16} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+						{onSplitVertical && (
+							<Tooltip label={t("splitDown")}>
+								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onSplitVertical}>
+									<IconLayoutRows size={16} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+						{onClose && (
+							<Tooltip label={t("closePanel")}>
+								<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
+									<IconX size={16} />
+								</ActionIcon>
+							</Tooltip>
+						)}
 					</Group>
 				</Group>
 
@@ -2544,9 +2798,19 @@ export function NarratorPanel({
 						viewportRef={viewportCallbackRef}
 						px="md"
 						scrollbars="y"
+						style={
+							// Hide content until the initial scroll-to-bottom completes.
+							// Without this, the user briefly sees the oldest messages at
+							// the top before the viewport jumps to the bottom. visibility:
+							// hidden keeps layout intact so virtua can still measure items.
+							!initialScrollDone && totalMessageCount > 0 ? { visibility: "hidden" } : undefined
+						}
 						styles={{
 							viewport: {
 								overscrollBehavior: "contain",
+								// Opt out of browser's native scroll anchoring — it conflicts
+								// with virtua's own scroll position management.
+								overflowAnchor: "none",
 							},
 						}}
 					>
@@ -2554,26 +2818,11 @@ export function NarratorPanel({
 							<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
 								<VirtualMessageList
 									ref={virtualListRef}
-									elements={flatElements}
-									elementKeys={flatKeys}
-									scrollElementRef={viewportRef}
+									elements={finalElements}
+									elementKeys={finalKeys}
+									scrollRef={viewportRef}
 									contentRef={contentRef}
-									paddingY={12}
-									trailing={
-										<>
-											<StreamingBubble
-												narratorId={narratorId}
-												streamingRef={streamingRef}
-												streamingReasoningRef={streamingReasoningRef}
-												webSearchRef={webSearchRef}
-												version={streamingVersion}
-											/>
-											{topLevelStreamingChunks &&
-												renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb, {
-													containerClassName: mergeStreaming ? "merge-top" : undefined,
-												})}
-										</>
-									}
+									shift={shifting}
 								/>
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>
@@ -2616,10 +2865,10 @@ export function NarratorPanel({
 							bottom: 12,
 							right: 24,
 							zIndex: 10,
-							transform: isAtBottom ? "translateY(80px)" : "translateY(0)",
-							opacity: isAtBottom ? 0 : 1,
+							transform: !isAtBottom || hasPreviousPage ? "translateY(0)" : "translateY(80px)",
+							opacity: !isAtBottom || hasPreviousPage ? 1 : 0,
 							transition: "transform 200ms ease, opacity 200ms ease",
-							pointerEvents: isAtBottom ? "none" : "auto",
+							pointerEvents: !isAtBottom || hasPreviousPage ? "auto" : "none",
 						}}
 					>
 						{unreadCount > 0 && (
@@ -2643,7 +2892,7 @@ export function NarratorPanel({
 							color="gray"
 							radius="xl"
 							size="lg"
-							onClick={() => scrollToBottom()}
+							onClick={() => (hasPreviousPage ? revealLatestMessages() : scrollToBottom(true))}
 							title={
 								unreadCount > 0
 									? t("scrollToBottomWithCount", { count: unreadCount })
@@ -2665,7 +2914,11 @@ export function NarratorPanel({
 						style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 					>
 						{attachedImages.map((file, i) => (
-							<Box key={`${file.name}-${i}`} pos="relative" style={{ display: "inline-block" }}>
+							<Box
+								key={`${file.name}-${file.size}-${file.lastModified}-${file.type}`}
+								pos="relative"
+								style={{ display: "inline-block" }}
+							>
 								<Image
 									src={imagePreviewUrls[i]}
 									alt={file.name}
@@ -2708,7 +2961,7 @@ export function NarratorPanel({
 					>
 						{attachedTextFiles.map((file, i) => (
 							<Group
-								key={`${file.name}-${i}`}
+								key={`${file.name}-${file.size}-${file.lastModified}-${file.type}`}
 								gap={6}
 								px="xs"
 								py={4}
@@ -2907,16 +3160,11 @@ export function NarratorPanel({
 								}
 								if (!msg) return;
 								setExpandedToolUseId(todosToolUseId);
-								const el =
-									document.getElementById(`tool-use-${todosToolUseId}`) ??
-									document.getElementById(`msg-${msg.id}`);
-								if (el) {
-									el.scrollIntoView({ behavior: "smooth", block: "center" });
-									setTimeout(() => {
-										setHighlightedId(msg.id);
-										setTimeout(() => setHighlightedId(null), 1600);
-									}, 400);
-								}
+								scrollToVirtualTarget({
+									domIds: [`tool-use-${todosToolUseId}`, `msg-${msg.id}`],
+									targetIds: [todosToolUseId, msg.id],
+									highlightId: msg.id,
+								});
 							}}
 							style={{ minWidth: 0, flex: 1 }}
 						>

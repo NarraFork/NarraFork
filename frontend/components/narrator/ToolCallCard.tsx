@@ -26,11 +26,13 @@ import {
 	IconDownload,
 	IconEye,
 	IconFile,
+	IconFileText,
 	IconGitFork,
 	IconHistory,
 	IconListCheck,
 	IconLoader2,
 	IconMap,
+	IconPencil,
 	IconPlayerPlay,
 	IconPlayerStop,
 	IconRobot,
@@ -143,6 +145,7 @@ export const TOOL_CARD_BG = "color-mix(in srgb, var(--mantine-color-body) 50%, t
 import { TOOL_CALL_STATUS_COLORS as STATUS_COLORS } from "@frontend/lib/status-registry";
 export { STATUS_COLORS };
 
+const READ_TOOLS = new Set(["Read"]);
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit"]);
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
@@ -151,6 +154,7 @@ const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const TODO_TOOLS = new Set(["TaskCreate"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
+const AGENT_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
@@ -164,6 +168,7 @@ const OVERSEER_TOOLS = new Set([
 ]);
 
 export type ToolCategory =
+	| "read"
 	| "file"
 	| "bash"
 	| "search"
@@ -171,6 +176,7 @@ export type ToolCategory =
 	| "webFetch"
 	| "todo"
 	| "taskOutput"
+	| "agent"
 	| "ask"
 	| "plan"
 	| "terminal"
@@ -184,6 +190,7 @@ export function isEditTool(name: string): boolean {
 }
 
 export function getCategory(name: string): ToolCategory {
+	if (READ_TOOLS.has(name)) return "read";
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (SEARCH_TOOLS.has(name)) return "search";
@@ -191,6 +198,7 @@ export function getCategory(name: string): ToolCategory {
 	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
 	if (TODO_TOOLS.has(name)) return "todo";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
+	if (AGENT_TOOLS.has(name)) return "agent";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
@@ -200,10 +208,12 @@ export function getCategory(name: string): ToolCategory {
 	return "generic";
 }
 
-export function getCategoryIcon(cat: ToolCategory) {
+export function getCategoryIcon(cat: ToolCategory, toolName?: string) {
 	switch (cat) {
+		case "read":
+			return IconEye;
 		case "file":
-			return IconFile;
+			return IconPencil;
 		case "bash":
 			return IconTerminal2;
 		case "search":
@@ -216,6 +226,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 			return IconListCheck;
 		case "taskOutput":
 			return IconRobot;
+		case "agent":
+			return IconGitFork;
 		case "ask":
 			return IconPlayerPlay;
 		case "plan":
@@ -235,6 +247,8 @@ export function getCategoryIcon(cat: ToolCategory) {
 
 export function getCategoryColor(cat: ToolCategory) {
 	switch (cat) {
+		case "read":
+			return "lime";
 		case "file":
 			return "violet";
 		case "bash":
@@ -249,6 +263,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "teal";
 		case "taskOutput":
 			return "indigo";
+		case "agent":
+			return "pink";
 		case "ask":
 			return "blue";
 		case "plan":
@@ -371,6 +387,14 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		const chars = input._streamingChars as number;
 		const filePath = input._streamingFilePath as string | undefined;
 		const contentChars = input._streamingContentChars as number | undefined;
+		const fields = input._streamingFields as Record<string, string> | undefined;
+		// Agent tool: show subagent_type + description while prompt is still streaming
+		if (fields && (toolName === "Agent" || toolName === "Task" || toolName === "ContinueTask")) {
+			const parts: string[] = [];
+			if (fields.subagent_type) parts.push(fields.subagent_type);
+			if (fields.description) parts.push(fields.description);
+			if (parts.length > 0) return parts.join(": ");
+		}
 		if (filePath) {
 			const base = basename(filePath);
 			const displayChars = contentChars ?? chars;
@@ -384,24 +408,25 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 	}
 	const cat = getCategory(toolName);
 	switch (cat) {
-		case "file": {
+		case "read": {
 			const fp = getFilePath(input);
 			if (!fp) return "";
 			const base = basename(fp);
-			if (toolName === "Read") {
-				const offset = extractNumericField(input, "offset");
-				const limit = extractNumericField(input, "limit");
-				const totalLines =
-					typeof metadata?.totalLines === "number" ? metadata.totalLines : undefined;
-				if (limit === -1) return `${base} (read_all)`;
-				if (offset != null && limit != null) return `${base} (${offset}~${offset + limit - 1})`;
-				if (offset != null) return `${base} (${offset}~)`;
-				if (limit != null) return `${base} (1~${limit})`;
-				// No paging params — file was short enough to read in full
-				if (totalLines != null) return `${base} (${totalLines}L)`;
-				return base;
-			}
+			const offset = extractNumericField(input, "offset");
+			const limit = extractNumericField(input, "limit");
+			const totalLines = typeof metadata?.totalLines === "number" ? metadata.totalLines : undefined;
+			if (limit === -1) return `${base} (read_all)`;
+			if (offset != null && limit != null) return `${base} (${offset}~${offset + limit - 1})`;
+			if (offset != null) return `${base} (${offset}~)`;
+			if (limit != null) return `${base} (1~${limit})`;
+			// No paging params — file was short enough to read in full
+			if (totalLines != null) return `${base} (${totalLines}L)`;
 			return base;
+		}
+		case "file": {
+			const fp = getFilePath(input);
+			if (!fp) return "";
+			return basename(fp);
 		}
 		case "bash": {
 			const cmd = extractField(input, "command");
@@ -431,6 +456,15 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const taskId = extractField(input, "task_id");
 			if (toolName === "TaskStop") return taskId ? `Stop ${taskId}` : "Stop task";
 			return taskId ? `Check ${taskId}` : "Check task output";
+		}
+		case "agent": {
+			const agentType = extractField(input, "subagent_type");
+			const desc = extractField(input, "description");
+			const parts: string[] = [];
+			if (agentType) parts.push(agentType);
+			if (desc) parts.push(desc);
+			if (parts.length > 0) return parts.join(": ");
+			return toolName;
 		}
 		case "ask": {
 			const questions = isTruncated(input) ? undefined : input?.questions;
@@ -2133,6 +2167,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <TodoDetail toolCall={toolCall} />;
 		case "taskOutput":
 			return <TaskOutputDetail toolCall={toolCall} />;
+		case "agent":
+			return <GenericDetail toolCall={toolCall} />;
 		case "ask":
 			return <AskDetail toolCall={toolCall} />;
 		case "plan":
@@ -2852,28 +2888,6 @@ if (typeof document !== "undefined") {
   );
   animation: tool-shimmer 2s ease-in-out infinite;
   pointer-events: none;
-}
-/* Streaming tool-chunk merge: top half */
-[data-tool-run].merge-top {
-  margin-top: calc(-1 * var(--mantine-spacing-sm) - 1px);
-  border-top-left-radius: 0 !important;
-  border-top-right-radius: 0 !important;
-}
-[data-tool-run].merge-top > * .mantine-Paper-root:first-of-type {
-  border-top-left-radius: 0 !important;
-  border-top-right-radius: 0 !important;
-}
-/* Streaming tool-chunk merge: bottom half — tool run immediately before .merge-top */
-[data-tool-run]:has(+ [data-tool-run].merge-top) {
-  border-bottom-left-radius: 0 !important;
-  border-bottom-right-radius: 0 !important;
-  overflow: visible !important;
-  border-bottom-color: transparent !important;
-}
-[data-tool-run]:has(+ [data-tool-run].merge-top) .mantine-Paper-root {
-  border-bottom-left-radius: 0 !important;
-  border-bottom-right-radius: 0 !important;
-  border-bottom-color: transparent !important;
 }`;
 		document.head.appendChild(style);
 	}

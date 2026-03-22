@@ -1,7 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
+import { containerInstances, narrators, overseers, terminals, userPreferences } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -151,6 +151,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
+			extractedFields?: Record<string, string>;
 	  }
 	| {
 			type: "subagent_started";
@@ -245,6 +246,7 @@ export type NarratorServerMessage =
 				parentToolUseId?: string;
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
+				extractedFields?: Record<string, string>;
 				started?: boolean;
 				input?: unknown;
 				streamStartedAt?: number;
@@ -553,6 +555,24 @@ eventBus.on("overseer:replaced", (event) => {
 		newOverseerId: event.newOverseerId,
 		scope: event.scope,
 		projectId: event.projectId,
+	});
+});
+
+// === Overseer narrator status sync ===
+// When an overseer's narrator status changes (thinking/waiting/idle/etc.),
+// broadcast to ALL clients so the nav item updates in real-time without
+// requiring the nav to have an active subscription to the overseer narrator.
+
+eventBus.on("narrator:status_changed", async (event) => {
+	const overseer = await db.query.overseers.findFirst({
+		where: eq(overseers.narratorId, event.narratorId),
+	});
+	if (!overseer) return;
+	broadcastToAll({
+		type: "overseer:status_changed",
+		overseerId: overseer.id,
+		narratorId: event.narratorId,
+		status: event.status,
 	});
 });
 

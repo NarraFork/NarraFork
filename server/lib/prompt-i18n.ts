@@ -10,6 +10,8 @@ export type PromptKey =
 	| "compact"
 	| "compactSuffix"
 	| "conflictResolution"
+	| "conflictResolutionEnhanced"
+	| "rebaseConflictResolution"
 	| "mergeSummary";
 export type BuiltinSubagentType = "explore" | "plan" | "general";
 export type SubagentType = string;
@@ -130,6 +132,76 @@ Do NOT run git add or git commit — just resolve the conflicts in the files.`,
 3. 确保解决后的代码可以编译且逻辑正确
 
 不要运行 git add 或 git commit —— 只需解决文件中的冲突。`,
+	},
+	conflictResolutionEnhanced: {
+		en: `A git merge from branch "{sourceBranch}" into "{targetBranch}" has produced conflicts.
+
+Source branch change summary (commit messages):
+{commitMessages}
+
+Change statistics:
+{diffStat}
+
+Conflicting files:
+{fileList}
+
+Please resolve all merge conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
+1. Read the file to understand both sides of the conflict
+2. Use the commit messages and change statistics above to understand the intent of each side
+3. Edit the file to produce the correct merged result, removing all conflict markers
+4. Make sure the resolved code compiles and makes sense
+
+Do NOT run git add or git commit — just resolve the conflicts in the files.`,
+		"zh-CN": `从分支 "{sourceBranch}" 合并到 "{targetBranch}" 时产生了冲突。
+
+源分支的变更摘要（commit messages）：
+{commitMessages}
+
+变更统计：
+{diffStat}
+
+冲突文件：
+{fileList}
+
+请解决这些文件中的所有合并冲突。冲突标记（<<<<<<< HEAD、=======、>>>>>>>）已存在于工作目录中。对于每个文件：
+1. 读取文件以理解冲突双方的内容
+2. 结合上方的 commit messages 和变更统计，理解双方的变更意图
+3. 编辑文件以生成正确的合并结果，移除所有冲突标记
+4. 确保解决后的代码可以编译且逻辑正确
+
+不要运行 git add 或 git commit —— 只需解决文件中的冲突。`,
+	},
+	rebaseConflictResolution: {
+		en: `A git rebase onto "{ontoBranch}" has produced conflicts in the following files:
+
+{fileList}
+
+Please resolve all rebase conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
+1. Read the file to understand both sides of the conflict
+2. Edit the file to produce the correct result, removing all conflict markers
+3. Make sure the resolved code compiles and makes sense
+
+After resolving ALL conflicts in the current step, run:
+  git add -A && git -c core.editor=true rebase --continue
+
+If rebase --continue produces new conflicts (from a subsequent commit), repeat the process: resolve the new conflicts, then run git add -A && git -c core.editor=true rebase --continue again. Keep going until the rebase is fully complete.
+
+Do NOT run git rebase --abort.`,
+		"zh-CN": `在变基到 "{ontoBranch}" 时，以下文件产生了冲突：
+
+{fileList}
+
+请解决这些文件中的所有变基冲突。冲突标记（<<<<<<< HEAD、=======、>>>>>>>）已存在于工作目录中。对于每个文件：
+1. 读取文件以理解冲突双方的内容
+2. 编辑文件以生成正确的结果，移除所有冲突标记
+3. 确保解决后的代码可以编译且逻辑正确
+
+解决完当前步骤的所有冲突后，运行：
+  git add -A && git -c core.editor=true rebase --continue
+
+如果 rebase --continue 产生了新的冲突（来自后续的 commit），请重复此过程：解决新冲突，然后再次运行 git add -A && git -c core.editor=true rebase --continue。持续进行直到变基完全完成。
+
+不要运行 git rebase --abort。`,
 	},
 	mergeSummary: {
 		en: `You are a merge summary generator. Given the commit history of a branch that was just merged, produce a concise summary describing what the branch accomplished. This summary will be injected into the parent branch's narrator context so it can be aware of the merged work.

@@ -34,6 +34,7 @@ interface NarratorWSCallbacks {
 		parentToolUseId?: string,
 		extractedFilePath?: string,
 		contentCharsReceived?: number,
+		extractedFields?: Record<string, string>,
 	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
@@ -229,6 +230,7 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 							data.extractedFilePath as string | undefined,
 							data.contentCharsReceived as number | undefined,
+							data.extractedFields as Record<string, string> | undefined,
 						);
 						break;
 					case "tool_completed":

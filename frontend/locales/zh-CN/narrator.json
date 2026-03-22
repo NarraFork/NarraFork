@@ -230,5 +230,8 @@
 	"shareFile.preview": "预览",
 	"shareFile.previewFailed": "预览加载失败",
 	"filePreview_loadError": "加载文件失败",
-	"filePreview_loading": "加载中…"
+	"filePreview_loading": "加载中…",
+	"splitRight": "向右分割",
+	"splitDown": "向下分割",
+	"closePanel": "关闭面板"
 }

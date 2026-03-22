@@ -129,6 +129,8 @@ export type AgentEvent =
 			extractedFilePath?: string;
 			/** For Write/Edit tools: content chars received (excluding file_path field) */
 			contentCharsReceived?: number;
+			/** Generic extracted fields from streaming JSON (e.g. Agent tool's description/subagent_type) */
+			extractedFields?: Record<string, string>;
 	  }
 	| {
 			/** A single content block has been fully streamed and is ready for persistence / execution. */

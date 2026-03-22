@@ -217,6 +217,166 @@ function hasReasoningBlock(msg: NarratorMsg): boolean {
 	return blocks.some((b: ContentBlock) => b.type === "reasoning" && !!b.text?.trim());
 }
 
+function hasVisibleBlocks(blocks: ContentBlock[]) {
+	return blocks.some((b: ContentBlock) => {
+		if (b.type === "text") return !!b.text?.trim();
+		if (b.type === "image") return true;
+		if (b.type === "text_file") return true;
+		if (b.type === "reasoning") return !!b.text?.trim();
+		if (b.type === "web_search") return true;
+		if (b.type === "thinking") {
+			const thinking = (b as { thinking?: string }).thinking;
+			return typeof thinking === "string" ? thinking.trim().length > 0 : true;
+		}
+		return false;
+	});
+}
+
+function collectRunTargetIds(
+	run: NarratorMsg[],
+	excludedMessageIds: ReadonlySet<string> = new Set<string>(),
+): string[] {
+	const ids = new Set<string>();
+	const visit = (msg: NarratorMsg) => {
+		if (msg.id && !excludedMessageIds.has(msg.id)) {
+			ids.add(msg.id);
+		}
+		for (const tc of (msg.toolCalls as Array<{ toolUseId?: string | null }> | undefined) ?? []) {
+			if (tc.toolUseId) ids.add(tc.toolUseId);
+		}
+		for (const block of Array.isArray(msg.contentJson) ? msg.contentJson : []) {
+			if (block.type === "tool_use" && typeof block.id === "string" && block.id.length > 0) {
+				ids.add(block.id);
+			}
+		}
+		for (const child of msg.children ?? []) {
+			visit(child);
+		}
+	};
+	for (const msg of run) {
+		visit(msg);
+	}
+	return [...ids];
+}
+
+function collectRenderedTargetIds(
+	messages: NarratorMsg[],
+	pruneBoundaryMessageId?: string | null,
+): string[][] {
+	const targets: string[][] = [];
+	let i = 0;
+
+	while (i < messages.length) {
+		const msg = messages[i];
+
+		if (msg._noMerge && msg.id === STREAMING_CHUNKS_MSG_ID) {
+			i++;
+			continue;
+		}
+
+		const hasTool = hasToolUse(msg);
+		const hasReasoning = hasReasoningBlock(msg);
+		const toolOnly = isToolOnlyMessage(msg);
+		const shouldRenderToolRun = hasTool || (hasReasoning && toolOnly);
+
+		if (shouldRenderToolRun) {
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			let renderedLeading = false;
+			if (!toolOnly) {
+				const reasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
+				const otherEntries: { block: ContentBlock; origIdx: number }[] = [];
+				blocks.forEach((b: ContentBlock, idx: number) => {
+					if (b.type === "reasoning" && !!b.text?.trim()) {
+						reasoningEntries.push({ block: b, origIdx: idx });
+					} else if (b.type !== "tool_use") {
+						otherEntries.push({ block: b, origIdx: idx });
+					}
+				});
+				const leadingBlocks = [...reasoningEntries, ...otherEntries].map((entry) => entry.block);
+				if (hasVisibleBlocks(leadingBlocks)) {
+					renderedLeading = true;
+					targets.push(msg.id ? [msg.id] : []);
+				}
+			}
+
+			const run: NarratorMsg[] = [msg];
+			let trailingContentMsg: NarratorMsg | null = null;
+			let j = i + 1;
+			while (
+				j < messages.length &&
+				(hasToolUse(messages[j]) || hasReasoningBlock(messages[j])) &&
+				isToolOnlyMessage(messages[j]) &&
+				!messages[j]._noMerge
+			) {
+				run.push(messages[j]);
+				j++;
+			}
+
+			if (j < messages.length) {
+				const tailMsg = messages[j];
+				const tailHasTool = hasToolUse(tailMsg);
+				const tailHasReasoning = hasReasoningBlock(tailMsg);
+				const tailToolOnly = isToolOnlyMessage(tailMsg);
+				if (!tailHasTool && tailHasReasoning && !tailToolOnly && !tailMsg._noMerge) {
+					const tailBlocks = Array.isArray(tailMsg.contentJson) ? tailMsg.contentJson : [];
+					const tailReasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
+					const tailContentEntries: { block: ContentBlock; origIdx: number }[] = [];
+					tailBlocks.forEach((b: ContentBlock, idx: number) => {
+						if (b.type === "reasoning" && !!b.text?.trim()) {
+							tailReasoningEntries.push({ block: b, origIdx: idx });
+						} else if (b.type !== "tool_use") {
+							tailContentEntries.push({ block: b, origIdx: idx });
+						}
+					});
+					if (tailReasoningEntries.length > 0) {
+						run.push(tailMsg);
+					}
+					const tailContentBlocks = tailContentEntries.map((entry) => entry.block);
+					if (hasVisibleBlocks(tailContentBlocks)) {
+						trailingContentMsg = tailMsg;
+					}
+					j++;
+				}
+			}
+
+			const excludedTargetIds = new Set<string>();
+			if (renderedLeading && msg.id) {
+				excludedTargetIds.add(msg.id);
+			}
+			if (trailingContentMsg?.id) {
+				excludedTargetIds.add(trailingContentMsg.id);
+			}
+			targets.push(collectRunTargetIds(run, excludedTargetIds));
+
+			if (
+				pruneBoundaryMessageId &&
+				run.some((item) => item.id === pruneBoundaryMessageId) &&
+				!(trailingContentMsg && trailingContentMsg.id === pruneBoundaryMessageId)
+			) {
+				targets.push([]);
+			}
+
+			if (trailingContentMsg) {
+				targets.push(trailingContentMsg.id ? [trailingContentMsg.id] : []);
+				if (pruneBoundaryMessageId && trailingContentMsg.id === pruneBoundaryMessageId) {
+					targets.push([]);
+				}
+			}
+
+			i = j;
+			continue;
+		}
+
+		targets.push(msg.id ? [msg.id] : []);
+		if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
+			targets.push([]);
+		}
+		i++;
+	}
+
+	return targets;
+}
+
 // ---------------------------------------------------------------------------
 // renderTreeMessages — renders a flat message list, grouping tool runs
 // ---------------------------------------------------------------------------
@@ -245,20 +405,6 @@ export function renderTreeMessages(
 	// merge forward with subsequent tool-bearing messages.
 	const elements: React.ReactNode[] = [];
 	let i = 0;
-
-	const hasVisibleBlocks = (blocks: ContentBlock[]) =>
-		blocks.some((b: ContentBlock) => {
-			if (b.type === "text") return !!b.text?.trim();
-			if (b.type === "image") return true;
-			if (b.type === "text_file") return true;
-			if (b.type === "reasoning") return !!b.text?.trim();
-			if (b.type === "web_search") return true;
-			if (b.type === "thinking") {
-				const thinking = (b as { thinking?: string }).thinking;
-				return typeof thinking === "string" ? thinking.trim().length > 0 : true;
-			}
-			return false;
-		});
 
 	const renderRegularMessage = (
 		targetMsg: NarratorMsg,
@@ -570,6 +716,7 @@ export function renderTreeMessages(
 export function renderTreeMessagesWithKeys(...args: Parameters<typeof renderTreeMessages>): {
 	elements: React.ReactNode[];
 	keys: string[];
+	targets: string[][];
 } {
 	const { elements } = renderTreeMessages(...args);
 	const keys: string[] = [];
@@ -581,7 +728,13 @@ export function renderTreeMessagesWithKeys(...args: Parameters<typeof renderTree
 			keys.push(String(keys.length));
 		}
 	}
-	return { elements, keys };
+	const [messages, , , , , , , , pruneBoundaryMessageId] = args;
+	const targets = collectRenderedTargetIds(messages, pruneBoundaryMessageId);
+	return {
+		elements,
+		keys,
+		targets: targets.length === elements.length ? targets : elements.map(() => []),
+	};
 }
 
 // ---------------------------------------------------------------------------

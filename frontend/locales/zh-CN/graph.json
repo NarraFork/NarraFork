@@ -25,7 +25,12 @@
 		"revealInExplorer": "在资源管理器中打开",
 		"deleteConfirmTitle": "删除章节",
 		"deleteConfirmMessage": "确定要删除章节「{{title}}」吗？这将移除工作树和分支，对话将保留为只读。",
-		"cancel": "取消"
+		"cancel": "取消",
+		"reviewActions": {
+			"sendToSource": "发回源节点",
+			"promoteToChapter": "转正为章节",
+			"dismiss": "关闭审查"
+		}
 	},
 	"controls": {
 		"selectMode": "选择模式",
@@ -90,6 +95,21 @@
 		"justNow": "刚刚",
 		"minutesAgo": "{{count}} 分钟前",
 		"hoursAgo": "{{count}} 小时前",
-		"daysAgo": "{{count}} 天前"
+		"daysAgo": "{{count}} 天前",
+		"mergeConflictResolved": "冲突已自动解决",
+		"mergeConflictResolvedDesc": "AI 解决了 {{count}} 个冲突文件并完成了合并。",
+		"mergeConflictFailed": "合并需要手动解决",
+		"mergeConflictFailedDesc": "AI 无法解决以下文件的冲突：{{files}}。已创建临时章节供手动解决。",
+		"rebaseOntoTrunk": "变基到主线",
+		"rebaseSuccess": "变基完成",
+		"rebaseSuccessDesc": "章节已变基到最新主线。",
+		"rebaseConflict": "变基冲突",
+		"rebaseConflictDesc": "以下文件存在冲突：",
+		"rebaseAbort": "取消变基",
+		"rebaseLetNarratorResolve": "让叙述者解决",
+		"rebaseConflictFile": "文件",
+		"rebaseConflictCount": "冲突数",
+		"rebaseNarratorSent": "已发送给叙述者",
+		"rebaseNarratorSentDesc": "叙述者将解决变基冲突。"
 	}
 }

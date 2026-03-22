@@ -25,7 +25,12 @@
 		"revealInExplorer": "Reveal in File Manager",
 		"deleteConfirmTitle": "Delete Chapter",
 		"deleteConfirmMessage": "Are you sure you want to delete chapter \"{{title}}\"? The worktree and branch will be removed. Conversations will be preserved as read-only.",
-		"cancel": "Cancel"
+		"cancel": "Cancel",
+		"reviewActions": {
+			"sendToSource": "Send to Source",
+			"promoteToChapter": "Promote to Chapter",
+			"dismiss": "Dismiss Review"
+		}
 	},
 	"controls": {
 		"selectMode": "Select mode",
@@ -90,6 +95,21 @@
 		"justNow": "just now",
 		"minutesAgo": "{{count}}m ago",
 		"hoursAgo": "{{count}}h ago",
-		"daysAgo": "{{count}}d ago"
+		"daysAgo": "{{count}}d ago",
+		"mergeConflictResolved": "Conflicts auto-resolved",
+		"mergeConflictResolvedDesc": "AI resolved {{count}} conflicting file(s) and completed the merge.",
+		"mergeConflictFailed": "Merge needs manual resolution",
+		"mergeConflictFailedDesc": "AI could not resolve conflicts in: {{files}}. A temporary chapter has been created for manual resolution.",
+		"rebaseOntoTrunk": "Rebase onto trunk",
+		"rebaseSuccess": "Rebase completed",
+		"rebaseSuccessDesc": "Chapter rebased onto latest trunk.",
+		"rebaseConflict": "Rebase conflicts",
+		"rebaseConflictDesc": "The following files have conflicts:",
+		"rebaseAbort": "Cancel rebase",
+		"rebaseLetNarratorResolve": "Let narrator resolve",
+		"rebaseConflictFile": "File",
+		"rebaseConflictCount": "Conflicts",
+		"rebaseNarratorSent": "Sent to narrator",
+		"rebaseNarratorSentDesc": "The narrator will resolve rebase conflicts."
 	}
 }

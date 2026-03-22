@@ -5,6 +5,7 @@ import { chapters, narrators, projects } from "../db/schema";
 import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -43,6 +44,15 @@ export interface AiResolveResult {
 	resolved: boolean;
 	mergeResult?: MergeResult;
 	error?: string;
+}
+
+export interface RulerAiResolveResult {
+	resolved: boolean;
+	mergeResult?: MergeResult;
+	/** Temporary chapter ID — preserved on failure for user interaction */
+	tempChapterId?: string;
+	error?: string;
+	remainingFiles?: string[];
 }
 
 async function getProjectGitPath(projectId: string): Promise<string> {
@@ -308,6 +318,7 @@ export const chapterMerge = {
 				source.branch,
 				target.branch,
 				locale,
+				mergeContext,
 			);
 			logger.info("Starting AI conflict resolution", {
 				sourceId: sourceChapterId,
@@ -639,6 +650,256 @@ export const chapterMerge = {
 
 		return { ok: true };
 	},
+
+	/**
+	 * Ruler-mode AI conflict resolution: fork a temporary chapter from trunk,
+	 * merge the source branch into it, let AI resolve conflicts, then merge
+	 * the result back into trunk.
+	 *
+	 * On success: cleans up the temporary chapter.
+	 * On failure: preserves the temporary chapter for user interaction.
+	 */
+	async rulerAiResolve(
+		sourceChapterId: string,
+		targetChapterId: string,
+		options: {
+			strategy?: "merge" | "squash";
+			message?: string;
+			locale?: Locale;
+			userId?: string;
+		},
+	): Promise<RulerAiResolveResult> {
+		const { chapterFork } = await import("./chapter-fork");
+		const { chapterService } = await import("./chapter-service");
+		const { narratorService } = await import("./narrator-service");
+
+		const source = await db.query.chapters.findFirst({
+			where: eq(chapters.id, sourceChapterId),
+		});
+		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
+		const target = await db.query.chapters.findFirst({
+			where: eq(chapters.id, targetChapterId),
+		});
+		if (!target) throw new NotFoundError("Chapter", targetChapterId);
+		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+
+		const gitPath = await getProjectGitPath(source.projectId);
+		const strategy = options.strategy ?? "merge";
+		const message = options.message ?? `Merge ${source.branch} into ${target.branch}`;
+		const locale = options.locale ?? "en";
+
+		// Collect merge context before any merge operation
+		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
+			(err) => {
+				logger.warn("Failed to collect pre-merge context for ruler AI resolve (non-fatal)", {
+					sourceChapterId,
+					error: String(err),
+				});
+				return { commits: [] as string[], diffStat: "" };
+			},
+		);
+
+		// Record target HEAD before merge for reliable unmerge
+		const preMergeTargetSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
+
+		// Step 1: Fork a temporary chapter from trunk
+		const tempTitle = `merge-resolve-${generateShortId(6)}`;
+		let tempChapter: { id: string; worktreePath: string | null; branch: string };
+		try {
+			tempChapter = await chapterFork.fork(targetChapterId, {
+				title: tempTitle,
+				inheritMode: "fresh",
+			});
+		} catch (err) {
+			logger.error("Failed to fork temporary chapter for ruler AI resolve", {
+				sourceChapterId,
+				targetChapterId,
+				error: String(err),
+			});
+			return { resolved: false, error: `Failed to create temporary chapter: ${String(err)}` };
+		}
+
+		if (!tempChapter.worktreePath) {
+			return { resolved: false, error: "Temporary chapter has no worktree" };
+		}
+
+		const tempWorktree = tempChapter.worktreePath;
+
+		try {
+			// Step 2: Merge source branch into temp worktree (no commit)
+			const mergeResult = await gitService.mergeNoCommit(tempWorktree, source.branch, strategy);
+
+			if (!mergeResult.hasConflicts) {
+				// No conflicts (race condition) — commit and merge back to trunk
+				const commitSha = await gitService.autoCommit(tempWorktree, message);
+				return await this.finalizeTempMerge(
+					sourceChapterId,
+					targetChapterId,
+					tempChapter,
+					strategy,
+					message,
+					commitSha ?? undefined,
+					options.userId,
+					mergeContext,
+					preMergeTargetSha,
+					gitPath,
+					chapterService,
+				);
+			}
+
+			const conflictFiles = mergeResult.conflictFiles;
+
+			// Step 3: Create narrator on temp chapter and start AI resolution
+			const narrator = await narratorService.create({
+				chapterId: tempChapter.id,
+				permissionMode: "default",
+			});
+
+			const prompt = buildConflictResolutionPrompt(
+				conflictFiles,
+				source.branch,
+				target.branch,
+				locale,
+				mergeContext,
+			);
+
+			logger.info("Starting ruler AI conflict resolution", {
+				sourceId: sourceChapterId,
+				targetId: targetChapterId,
+				tempChapterId: tempChapter.id,
+				conflictFiles,
+				narratorId: narrator.id,
+			});
+
+			try {
+				for await (const _event of startSession(narrator.id, prompt)) {
+					// drain the session — the narrator resolves conflicts in the temp worktree
+				}
+			} catch (err) {
+				logger.error("Ruler AI conflict resolution session failed", {
+					error: String(err),
+				});
+				// Preserve temp chapter for user interaction
+				return {
+					resolved: false,
+					tempChapterId: tempChapter.id,
+					error: `AI session failed: ${String(err)}`,
+					remainingFiles: conflictFiles,
+				};
+			}
+
+			// Step 4: Check remaining conflicts
+			const remainingConflicts = await gitService.getConflictFiles(tempWorktree);
+			if (remainingConflicts.length > 0) {
+				// AI didn't resolve everything — preserve temp chapter
+				return {
+					resolved: false,
+					tempChapterId: tempChapter.id,
+					error: `AI could not resolve all conflicts. Remaining: ${remainingConflicts.join(", ")}`,
+					remainingFiles: remainingConflicts,
+				};
+			}
+
+			// All conflicts resolved — commit
+			const commitSha = await gitService.autoCommit(tempWorktree, message);
+
+			// Step 5: Merge temp branch back into trunk
+			return await this.finalizeTempMerge(
+				sourceChapterId,
+				targetChapterId,
+				tempChapter,
+				strategy,
+				message,
+				commitSha ?? undefined,
+				options.userId,
+				mergeContext,
+				preMergeTargetSha,
+				gitPath,
+				chapterService,
+			);
+		} catch (err) {
+			logger.error("Ruler AI resolve unexpected error", {
+				sourceChapterId,
+				targetChapterId,
+				tempChapterId: tempChapter.id,
+				error: String(err),
+			});
+			// Preserve temp chapter on unexpected errors
+			return {
+				resolved: false,
+				tempChapterId: tempChapter.id,
+				error: String(err),
+			};
+		}
+	},
+
+	/**
+	 * Finalize a ruler AI resolve: merge the temp branch into trunk,
+	 * mark the source as merged, and clean up the temp chapter.
+	 */
+	async finalizeTempMerge(
+		sourceChapterId: string,
+		targetChapterId: string,
+		tempChapter: { id: string; worktreePath: string | null; branch: string },
+		strategy: string,
+		message: string,
+		_commitSha: string | undefined,
+		userId: string | undefined,
+		mergeContext: { commits: string[]; diffStat: string },
+		preMergeTargetSha: string,
+		gitPath: string,
+		chapterService: { remove: (id: string) => Promise<unknown> },
+	): Promise<RulerAiResolveResult> {
+		const target = await db.query.chapters.findFirst({
+			where: eq(chapters.id, targetChapterId),
+		});
+		if (!target?.worktreePath) {
+			return { resolved: false, error: "Target chapter lost worktree during resolve" };
+		}
+
+		// Merge temp branch into trunk (should be clean merge or fast-forward)
+		const trunkMerge = await gitService.merge(
+			target.worktreePath,
+			tempChapter.branch,
+			"merge",
+			message,
+		);
+
+		if (!trunkMerge.success) {
+			return {
+				resolved: false,
+				tempChapterId: tempChapter.id,
+				error: "Failed to merge resolved result back into trunk",
+			};
+		}
+
+		// Mark source chapter as merged
+		await this.markMerged(
+			sourceChapterId,
+			targetChapterId,
+			strategy,
+			trunkMerge.commitSha,
+			userId,
+			mergeContext,
+			preMergeTargetSha,
+		);
+
+		// Clean up temp chapter
+		try {
+			await chapterService.remove(tempChapter.id);
+			await gitService.deleteBranch(gitPath, tempChapter.branch).catch(() => {});
+		} catch (err) {
+			logger.warn("Failed to clean up temporary chapter after ruler AI resolve", {
+				tempChapterId: tempChapter.id,
+				error: String(err),
+			});
+		}
+
+		return {
+			resolved: true,
+			mergeResult: { success: true, commitSha: trunkMerge.commitSha },
+		};
+	},
 };
 
 function buildConflictResolutionPrompt(
@@ -646,8 +907,20 @@ function buildConflictResolutionPrompt(
 	sourceBranch: string,
 	targetBranch: string,
 	locale: Locale = "en",
+	mergeContext?: { commits: string[]; diffStat: string },
 ): string {
 	const fileList = conflictFiles.map((f) => `  - ${f}`).join("\n");
+
+	// Use enhanced prompt when merge context is available
+	if (mergeContext && (mergeContext.commits.length > 0 || mergeContext.diffStat)) {
+		return getPrompt("conflictResolutionEnhanced", locale)
+			.replace("{sourceBranch}", sourceBranch)
+			.replace("{targetBranch}", targetBranch)
+			.replace("{commitMessages}", mergeContext.commits.join("\n") || "(none)")
+			.replace("{diffStat}", mergeContext.diffStat || "(none)")
+			.replace("{fileList}", fileList);
+	}
+
 	return getPrompt("conflictResolution", locale)
 		.replace("{sourceBranch}", sourceBranch)
 		.replace("{targetBranch}", targetBranch)

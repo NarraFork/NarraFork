@@ -12,6 +12,7 @@ interface NodeContextMenuProps {
 		role: string;
 		isRoot?: boolean;
 		worktreePath?: string | null;
+		reviewStatus?: string | null;
 	};
 	onClose: () => void;
 	onFork: (nodeId: string) => void;
@@ -22,6 +23,9 @@ interface NodeContextMenuProps {
 	onUnmerge: (nodeId: string) => void;
 	onDelete: (nodeId: string) => void;
 	onReveal: (nodeId: string) => void;
+	onConvertToSubagent: (nodeId: string) => void;
+	onPromoteReview: (nodeId: string) => void;
+	onDismissReview: (nodeId: string) => void;
 }
 
 export function NodeContextMenu({
@@ -38,6 +42,9 @@ export function NodeContextMenu({
 	onUnmerge,
 	onDelete,
 	onReveal,
+	onConvertToSubagent,
+	onPromoteReview,
+	onDismissReview,
 }: NodeContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const isRoot = !!nodeData.isRoot;
@@ -97,6 +104,50 @@ export function NodeContextMenu({
 								{t("contextMenu.review")}
 							</Text>
 						</UnstyledButton>
+					)}
+					{nodeData.status === "active" && nodeData.role === "review" && (
+						<>
+							<Divider my={4} />
+							<UnstyledButton
+								px="xs"
+								py={4}
+								onClick={() => onConvertToSubagent(nodeId)}
+								disabled={nodeData.reviewStatus !== "concluded"}
+								style={{
+									borderRadius: 4,
+									opacity: nodeData.reviewStatus !== "concluded" ? 0.4 : 1,
+								}}
+							>
+								<Text size="sm">{t("contextMenu.reviewActions.sendToSource")}</Text>
+							</UnstyledButton>
+							<UnstyledButton
+								px="xs"
+								py={4}
+								onClick={() => onPromoteReview(nodeId)}
+								disabled={
+									nodeData.reviewStatus !== "concluded" && nodeData.reviewStatus !== "reviewing"
+								}
+								style={{
+									borderRadius: 4,
+									opacity:
+										nodeData.reviewStatus !== "concluded" && nodeData.reviewStatus !== "reviewing"
+											? 0.4
+											: 1,
+								}}
+							>
+								<Text size="sm">{t("contextMenu.reviewActions.promoteToChapter")}</Text>
+							</UnstyledButton>
+							<UnstyledButton
+								px="xs"
+								py={4}
+								onClick={() => onDismissReview(nodeId)}
+								style={{ borderRadius: 4 }}
+							>
+								<Text size="sm" c="red">
+									{t("contextMenu.reviewActions.dismiss")}
+								</Text>
+							</UnstyledButton>
+						</>
 					)}
 					{!isRoot && (
 						<>

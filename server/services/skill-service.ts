@@ -1,4 +1,4 @@
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import matter from "gray-matter";
@@ -36,6 +36,30 @@ async function getMtimeMs(filePath: string): Promise<number | null> {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Resolve a Dirent entry that may be a symlink and check whether it points to
+ * a directory or a regular file.  For non-symlink entries the check is free
+ * (no extra syscall).
+ */
+async function resolveEntryType(
+	parentDir: string,
+	entry: import("node:fs").Dirent,
+): Promise<"dir" | "file" | null> {
+	if (entry.isDirectory()) return "dir";
+	if (entry.isFile()) return "file";
+	if (entry.isSymbolicLink()) {
+		try {
+			const real = await realpath(join(parentDir, entry.name));
+			const s = await stat(real);
+			if (s.isDirectory()) return "dir";
+			if (s.isFile()) return "file";
+		} catch {
+			// broken symlink — skip
+		}
+	}
+	return null;
 }
 
 /**
@@ -81,7 +105,7 @@ async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 		try {
 			const entries = await readdir(dir, { withFileTypes: true });
 			for (const entry of entries) {
-				if (!entry.isDirectory()) continue;
+				if ((await resolveEntryType(dir, entry)) !== "dir") continue;
 				const skillDir = join(dir, entry.name);
 				const skillFile = join(skillDir, "SKILL.md");
 				const skill = await loadSkillCached(skillFile, skillDir);
@@ -126,9 +150,10 @@ async function collectSkillFiles(skillDir: string, depth = 0): Promise<string[]>
 		const entries = await readdir(skillDir, { withFileTypes: true });
 		for (const entry of entries) {
 			const fullPath = join(skillDir, entry.name);
-			if (entry.isFile() && entry.name !== "SKILL.md") {
+			const kind = await resolveEntryType(skillDir, entry);
+			if (kind === "file" && entry.name !== "SKILL.md") {
 				files.push(relative(skillDir, fullPath));
-			} else if (entry.isDirectory() && depth < 2) {
+			} else if (kind === "dir" && depth < 2) {
 				const sub = await collectSkillFiles(fullPath, depth + 1);
 				files.push(...sub.map((f) => join(entry.name, f)));
 			}

@@ -50,5 +50,10 @@
 	"filterHasRunningContainers": "Running Containers",
 	"filterHasViewers": "Being Viewed",
 	"filterMenuTitle": "Filter by",
-	"containers": "{{running}}/{{total}} containers"
+	"containers": "{{running}}/{{total}} containers",
+	"workspaceView": "Workspace view",
+	"listView": "List view",
+	"splitRight": "Split right",
+	"splitDown": "Split down",
+	"dropNarratorHere": "Drop a narrator here"
 }

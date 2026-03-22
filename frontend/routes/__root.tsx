@@ -51,6 +51,7 @@ import { OverseerNavItem } from "../components/nav/OverseerNavItem";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
 import { SummaryModelPickerModal } from "../components/settings/SummaryModelPickerModal";
+import { UpdateAvailableBanner } from "../components/UpdateAvailableBanner";
 import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
@@ -330,6 +331,7 @@ function AuthenticatedLayout() {
 		>
 			<WSConnectionAlert />
 			<VersionUpdateBanner />
+			<UpdateAvailableBanner />
 			<AppShell.Header>
 				<Group h="100%" px="md" justify="space-between" wrap="nowrap">
 					<Group wrap="nowrap">

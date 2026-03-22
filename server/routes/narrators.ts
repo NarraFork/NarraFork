@@ -655,7 +655,8 @@ narratorRoutes.get("/:id/messages", async (c) => {
 	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
 	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
 	const cursor = c.req.query("cursor") || undefined;
-	const result = await narratorService.getMessagesCursor(id, limit, cursor);
+	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
+	const result = await narratorService.getMessagesCursor(id, limit, cursor, direction);
 	const narrator = await narratorService.getById(id);
 	return c.json({
 		...result,

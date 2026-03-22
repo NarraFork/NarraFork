@@ -505,6 +505,7 @@ export function upsertSubagentStreamingChunk(
 	index?: MessageIndex,
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
+	extractedFields?: Record<string, string>,
 ): InfiniteCache {
 	const syntheticId = subagentStreamingId(parentToolUseId);
 
@@ -525,6 +526,7 @@ export function upsertSubagentStreamingChunk(
 				inputCharsTotal,
 				extractedFilePath,
 				contentCharsReceived,
+				extractedFields,
 			);
 			if (changed) {
 				page.messages = messages;
@@ -548,6 +550,7 @@ export function upsertSubagentStreamingChunk(
 			inputCharsTotal,
 			extractedFilePath,
 			contentCharsReceived,
+			extractedFields,
 		);
 		if (changed) anyChanged = true;
 		return changed ? { ...page, messages } : page;
@@ -567,6 +570,7 @@ function upsertStreamingChildAtPath(
 	inputCharsTotal: number,
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
+	extractedFields?: Record<string, string>,
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (path.length === 0) return { messages, changed: false };
 	const [idx, ...rest] = path;
@@ -587,6 +591,7 @@ function upsertStreamingChildAtPath(
 				inputCharsTotal,
 				extractedFilePath,
 				contentCharsReceived,
+				extractedFields,
 			),
 			changed: true,
 		};
@@ -604,6 +609,7 @@ function upsertStreamingChildAtPath(
 		inputCharsTotal,
 		extractedFilePath,
 		contentCharsReceived,
+		extractedFields,
 	);
 	if (!childResult.changed) return { messages, changed: false };
 	const updated = [...messages];
@@ -623,6 +629,7 @@ function upsertStreamingChildOnMsg(
 	inputCharsTotal: number,
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
+	extractedFields?: Record<string, string>,
 ): TreeMessage[] {
 	const msg = messages[msgIdx];
 	const children = [...(msg.children || [])];
@@ -632,6 +639,7 @@ function upsertStreamingChildOnMsg(
 	const streamingInput: Record<string, unknown> = { _streamingChars: inputCharsTotal };
 	if (extractedFilePath) streamingInput._streamingFilePath = extractedFilePath;
 	if (contentCharsReceived != null) streamingInput._streamingContentChars = contentCharsReceived;
+	if (extractedFields) streamingInput._streamingFields = extractedFields;
 
 	const { blocks, toolCalls } = upsertStreamingToolBlock(
 		existing ? [...existing.contentJson] : [],
@@ -673,6 +681,7 @@ function upsertStreamingChildInMessages(
 	inputCharsTotal: number,
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
+	extractedFields?: Record<string, string>,
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
@@ -691,6 +700,7 @@ function upsertStreamingChildInMessages(
 			if (extractedFilePath) streamingInput._streamingFilePath = extractedFilePath;
 			if (contentCharsReceived != null)
 				streamingInput._streamingContentChars = contentCharsReceived;
+			if (extractedFields) streamingInput._streamingFields = extractedFields;
 
 			const { blocks, toolCalls } = upsertStreamingToolBlock(
 				existing ? [...existing.contentJson] : [],
@@ -732,6 +742,7 @@ function upsertStreamingChildInMessages(
 				inputCharsTotal,
 				extractedFilePath,
 				contentCharsReceived,
+				extractedFields,
 			);
 			if (childResult.changed) {
 				anyChanged = true;
@@ -864,13 +875,29 @@ export function evictOldestPages(old: InfiniteCache, maxMessages: number): Infin
 	if (keepCount >= old.pages.length) return old;
 
 	const pages = old.pages.slice(0, keepCount);
-	// Mark the last kept page as having more older messages
+	// Mark the last kept page as having more older messages and restore the
+	// cursor that originally fetched the first dropped page. The backend expects
+	// a seq cursor here, not a message ID.
 	const lastPage = { ...pages[keepCount - 1] };
 	lastPage.hasMore = true;
-	// Derive nextCursor from the oldest message in the last kept page
-	const oldestMsg = lastPage.messages?.[0];
-	if (oldestMsg) {
-		lastPage.nextCursor = oldestMsg.id;
+	const firstDroppedPage = old.pages[keepCount];
+	const droppedPageParam = old.pageParams?.[keepCount] as
+		| string
+		| { cursor?: string; direction?: "older" | "newer" }
+		| undefined;
+	const restoredOlderCursor =
+		typeof droppedPageParam === "string"
+			? droppedPageParam
+			: droppedPageParam?.direction === "older"
+				? droppedPageParam.cursor
+				: undefined;
+	if (typeof restoredOlderCursor === "string" && restoredOlderCursor.length > 0) {
+		lastPage.nextCursor = restoredOlderCursor;
+	} else if (
+		typeof firstDroppedPage?.nextCursor === "string" &&
+		firstDroppedPage.nextCursor.length > 0
+	) {
+		lastPage.nextCursor = firstDroppedPage.nextCursor;
 	}
 	pages[keepCount - 1] = lastPage;
 

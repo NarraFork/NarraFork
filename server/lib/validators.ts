@@ -313,6 +313,15 @@ export const rulerAbandonSchema = z.object({
 	chapterId: z.string().min(1),
 });
 
+export const rulerRebaseSchema = z.object({
+	chapterId: z.string().min(1),
+});
+
+export const rulerRebaseResolveSchema = z.object({
+	chapterId: z.string().min(1),
+	action: z.enum(["abort", "continue"]),
+});
+
 export const updateRulerPositionsSchema = z.object({
 	positions: z.array(
 		z.object({

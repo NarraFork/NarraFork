@@ -230,5 +230,8 @@
 	"shareFile.preview": "preview",
 	"shareFile.previewFailed": "Preview failed to load",
 	"filePreview_loadError": "Failed to load file",
-	"filePreview_loading": "Loading…"
+	"filePreview_loading": "Loading…",
+	"splitRight": "Split right",
+	"splitDown": "Split down",
+	"closePanel": "Close panel"
 }

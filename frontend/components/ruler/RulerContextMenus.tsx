@@ -1,5 +1,14 @@
 import { Box, CopyButton, Text, Tooltip } from "@mantine/core";
-import { IconCopy, IconEyeCheck, IconGitBranch, IconGitMerge } from "@tabler/icons-react";
+import {
+	IconCopy,
+	IconEyeCheck,
+	IconGitBranch,
+	IconGitMerge,
+	IconGitPullRequest,
+	IconMessageForward,
+	IconPrompt,
+	IconX,
+} from "@tabler/icons-react";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -132,11 +141,16 @@ interface ChapterContextMenuProps {
 	chapterTitle: string;
 	chapterStatus: string;
 	chapterRole: string;
+	reviewStatus?: string | null;
 	onClose: () => void;
 	onFork: (chapterId: string) => void;
 	onMerge: (chapterId: string) => void;
+	onRebase: (chapterId: string) => void;
 	onReview: (chapterId: string) => void;
 	onAbandon: (chapterId: string) => void;
+	onConvertToSubagent: (chapterId: string) => void;
+	onPromoteReview: (chapterId: string) => void;
+	onDismissReview: (chapterId: string) => void;
 }
 
 export function ChapterContextMenu({
@@ -146,11 +160,16 @@ export function ChapterContextMenu({
 	chapterTitle,
 	chapterStatus,
 	chapterRole,
+	reviewStatus,
 	onClose,
 	onFork,
 	onMerge,
+	onRebase,
 	onReview,
 	onAbandon,
+	onConvertToSubagent,
+	onPromoteReview,
+	onDismissReview,
 }: ChapterContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const { ref, pos } = useMenuPosition(x, y);
@@ -209,6 +228,14 @@ export function ChapterContextMenu({
 						}}
 					/>
 					<MenuItem
+						icon={<IconGitPullRequest size={14} />}
+						label={t("ruler.rebaseOntoTrunk")}
+						onClick={() => {
+							onRebase(chapterId);
+							onClose();
+						}}
+					/>
+					<MenuItem
 						icon={<IconEyeCheck size={14} />}
 						label={t("contextMenu.review")}
 						onClick={() => {
@@ -219,7 +246,39 @@ export function ChapterContextMenu({
 				</>
 			)}
 
-			{isActive && (
+			{isActive && isReview && (
+				<>
+					<MenuItem
+						icon={<IconMessageForward size={14} />}
+						label={t("contextMenu.reviewActions.sendToSource")}
+						disabled={reviewStatus !== "concluded"}
+						onClick={() => {
+							onConvertToSubagent(chapterId);
+							onClose();
+						}}
+					/>
+					<MenuItem
+						icon={<IconPrompt size={14} />}
+						label={t("contextMenu.reviewActions.promoteToChapter")}
+						disabled={reviewStatus !== "concluded" && reviewStatus !== "reviewing"}
+						onClick={() => {
+							onPromoteReview(chapterId);
+							onClose();
+						}}
+					/>
+					<MenuItem
+						icon={<IconX size={14} />}
+						label={t("contextMenu.reviewActions.dismiss")}
+						color="red"
+						onClick={() => {
+							onDismissReview(chapterId);
+							onClose();
+						}}
+					/>
+				</>
+			)}
+
+			{isActive && !isReview && (
 				<MenuItem
 					icon={<Text size="xs">✕</Text>}
 					label={t("ruler.abandon")}
@@ -259,11 +318,13 @@ function MenuItem({
 	icon,
 	label,
 	color,
+	disabled,
 	onClick,
 }: {
 	icon: React.ReactNode;
 	label: string;
 	color?: string;
+	disabled?: boolean;
 	onClick: () => void;
 }) {
 	return (
@@ -274,11 +335,13 @@ function MenuItem({
 				gap: 8,
 				padding: "6px 8px",
 				borderRadius: 4,
-				cursor: "pointer",
+				cursor: disabled ? "default" : "pointer",
 				color: color ? `var(--mantine-color-${color}-5)` : undefined,
+				opacity: disabled ? 0.4 : 1,
+				pointerEvents: disabled ? "none" : undefined,
 			}}
-			className="ruler-menu-item"
-			onClick={onClick}
+			className={disabled ? undefined : "ruler-menu-item"}
+			onClick={disabled ? undefined : onClick}
 		>
 			{icon}
 			<Text size="xs">{label}</Text>

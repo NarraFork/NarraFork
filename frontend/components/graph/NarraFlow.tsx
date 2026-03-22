@@ -72,6 +72,7 @@ interface ContextMenuState {
 		role: string;
 		isRoot?: boolean;
 		worktreePath?: string | null;
+		reviewStatus?: string | null;
 	};
 }
 
@@ -890,6 +891,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				role: d.role ?? "branch",
 				isRoot: d.isRoot ?? false,
 				worktreePath: d.worktreePath ?? null,
+				reviewStatus: d.reviewStatus ?? null,
 			},
 		});
 	}, []);
@@ -1341,6 +1343,57 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[queryClient],
 	);
 
+	const handleConvertToSubagent = useCallback(
+		async (nodeId: string) => {
+			setContextMenu(null);
+			try {
+				await api.convertReviewToSubagent(nodeId);
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["graph"] });
+			} catch (err) {
+				notifications.show({
+					message: err instanceof Error ? err.message : "Failed to convert to subagent",
+					color: "red",
+				});
+			}
+		},
+		[queryClient],
+	);
+
+	const handlePromoteReview = useCallback(
+		async (nodeId: string) => {
+			setContextMenu(null);
+			try {
+				await api.promoteReview(nodeId);
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["graph"] });
+			} catch (err) {
+				notifications.show({
+					message: err instanceof Error ? err.message : "Failed to promote review",
+					color: "red",
+				});
+			}
+		},
+		[queryClient],
+	);
+
+	const handleDismissReview = useCallback(
+		async (nodeId: string) => {
+			setContextMenu(null);
+			try {
+				await api.dismissReview(nodeId);
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["graph"] });
+			} catch (err) {
+				notifications.show({
+					message: err instanceof Error ? err.message : "Failed to dismiss review",
+					color: "red",
+				});
+			}
+		},
+		[queryClient],
+	);
+
 	const handleMergeNew = useCallback(
 		(nodeIds: string[]) => {
 			if (nodeIds.length < 2) return;
@@ -1581,6 +1634,9 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						onUnmerge={handleUnmerge}
 						onDelete={handleDelete}
 						onReveal={handleReveal}
+						onConvertToSubagent={handleConvertToSubagent}
+						onPromoteReview={handlePromoteReview}
+						onDismissReview={handleDismissReview}
 					/>
 				)}
 			</Box>

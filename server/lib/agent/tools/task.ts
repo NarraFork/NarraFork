@@ -18,7 +18,6 @@ function getAvailableModelsList(): string {
 function buildParameters() {
 	return z.object({
 		description: z.string().optional().describe("A short (3-5 word) description of the task"),
-		prompt: z.string().describe("The task for the agent to perform"),
 		subagent_type: z
 			.string()
 			.min(1)
@@ -43,6 +42,7 @@ function buildParameters() {
 			.describe(
 				"If true, run the task in the background without blocking the parent narrator. Returns a task ID immediately that can be checked later with TaskOutput. The background task runs independently and its results can be retrieved when complete. Best for long-running exploration or analysis tasks that don't need to block the current conversation.",
 			),
+		prompt: z.string().describe("The task for the agent to perform"),
 	});
 }
 
@@ -60,10 +60,6 @@ export const agentTool: ToolDefinition = {
 			properties: {
 				description: {
 					description: "A short (3-5 word) description of the task",
-					type: "string",
-				},
-				prompt: {
-					description: "The task for the agent to perform",
 					type: "string",
 				},
 				subagent_type: {
@@ -95,6 +91,10 @@ export const agentTool: ToolDefinition = {
 						'Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo.',
 					type: "string",
 					enum: ["worktree"],
+				},
+				prompt: {
+					description: "The task for the agent to perform",
+					type: "string",
 				},
 			},
 			required: ["description", "prompt"],

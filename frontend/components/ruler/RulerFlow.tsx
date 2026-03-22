@@ -1,4 +1,5 @@
 import { ActionIcon, Box, Card, Center, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import {
 	IconArrowsHorizontal,
 	IconArrowsVertical,
@@ -12,7 +13,7 @@ import { useTranslation } from "react-i18next";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api } from "../../lib/api";
+import { ApiError, api } from "../../lib/api";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import {
 	COLLAPSED_GAP,
@@ -23,6 +24,7 @@ import {
 import { screenToWorld, solvePanForAnchor, viewCenterFromPan, worldToScreen } from "./fisheye";
 import { OffscreenBubbles } from "./OffscreenBubbles";
 import { type PixiChapterInfo, type RulerPixiHandle, RulerPixiLayer } from "./pixi/RulerPixiLayer";
+import { RebaseConflictDialog } from "./RebaseConflictDialog";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
 import { SegmentCanvas } from "./SegmentCanvas";
 import {
@@ -70,7 +72,13 @@ const PANEL_CLOSE_DURATION = 250;
 interface ChapterContextMenuState {
 	x: number;
 	y: number;
-	chapter: { id: string; title: string; status: string; role: string };
+	chapter: {
+		id: string;
+		title: string;
+		status: string;
+		role: string;
+		reviewStatus?: string | null;
+	};
 	fromSha: string;
 }
 
@@ -391,6 +399,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				parentChapterId?: string | null;
 				narratorId: string | null;
 				narratorStatus: string | null;
+				reviewStatus?: string | null;
 				startCommitSha: string | null;
 				mergeCommitSha?: string | null;
 				layoutX: number;
@@ -687,6 +696,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const [chapterMenu, setChapterMenu] = useState<ChapterContextMenuState | null>(null);
 
+	const [rebaseConflict, setRebaseConflict] = useState<{
+		chapterId: string;
+		chapterTitle: string;
+		conflictFiles: Array<{ file: string; conflictLines: number }>;
+	} | null>(null);
+
 	const closeAllMenus = useCallback(() => {
 		setTickMenu(null);
 		setChapterMenu(null);
@@ -886,14 +901,68 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const handleChapterMerge = useCallback(
 		async (chapterId: string) => {
 			try {
-				await api.rulerMerge(projectId, { sourceChapterId: chapterId });
+				const result = await api.rulerMerge(projectId, { sourceChapterId: chapterId });
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
 				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+
+				if (result.aiResolved) {
+					notifications.show({
+						title: t("ruler.mergeConflictResolved"),
+						message: t("ruler.mergeConflictResolvedDesc", {
+							count: (result.resolvedConflictFiles as string[])?.length ?? 0,
+						}),
+						color: "teal",
+					});
+				}
+			} catch (err) {
+				if (err instanceof ApiError && err.data?.aiAttempted) {
+					notifications.show({
+						title: t("ruler.mergeConflictFailed"),
+						message: t("ruler.mergeConflictFailedDesc", {
+							files: (err.data.remainingFiles as string[])?.join(", ") ?? "",
+						}),
+						color: "orange",
+						autoClose: false,
+					});
+					queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+					queryClient.invalidateQueries({
+						queryKey: ["rulerSegment", projectId],
+					});
+				}
+				/* other errors handled by global handler */
+			}
+		},
+		[projectId, queryClient, t],
+	);
+
+	const handleChapterRebase = useCallback(
+		async (chapterId: string) => {
+			// Find chapter title for the dialog
+			const rd = data as RulerData | undefined;
+			const chapter = rd?.activeChapters?.find((ch) => ch.id === chapterId);
+			const title = chapter?.title ?? chapterId;
+			try {
+				const result = await api.rulerRebase(projectId, chapterId);
+				if (result.success) {
+					queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+					notifications.show({
+						title: t("ruler.rebaseSuccess"),
+						message: t("ruler.rebaseSuccessDesc"),
+						color: "teal",
+					});
+				} else if (result.conflictFiles?.length) {
+					setRebaseConflict({
+						chapterId,
+						chapterTitle: title,
+						conflictFiles: result.conflictFiles,
+					});
+				}
 			} catch {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient],
+		[projectId, queryClient, t, data],
 	);
 
 	const handleChapterReview = useCallback(
@@ -913,6 +982,45 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		async (chapterId: string) => {
 			try {
 				await api.rulerAbandon(projectId, chapterId);
+				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+			} catch {
+				/* global handler */
+			}
+		},
+		[projectId, queryClient],
+	);
+
+	const handleReviewConvertToSubagent = useCallback(
+		async (chapterId: string) => {
+			try {
+				await api.convertReviewToSubagent(chapterId);
+				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+			} catch {
+				/* global handler */
+			}
+		},
+		[projectId, queryClient],
+	);
+
+	const handleReviewPromote = useCallback(
+		async (chapterId: string) => {
+			try {
+				await api.promoteReview(chapterId);
+				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+			} catch {
+				/* global handler */
+			}
+		},
+		[projectId, queryClient],
+	);
+
+	const handleReviewDismiss = useCallback(
+		async (chapterId: string) => {
+			try {
+				await api.dismissReview(chapterId);
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
 				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
 			} catch {
@@ -1986,6 +2094,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				parentChapterId?: string | null;
 				narratorId: string | null;
 				narratorStatus: string | null;
+				reviewStatus?: string | null;
 				startCommitSha: string | null;
 				mergeCommitSha?: string | null;
 				layoutX: number;
@@ -2657,13 +2766,38 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					chapterTitle={chapterMenu.chapter.title}
 					chapterStatus={chapterMenu.chapter.status}
 					chapterRole={chapterMenu.chapter.role}
+					reviewStatus={chapterMenu.chapter.reviewStatus}
 					onClose={() => setChapterMenu(null)}
 					onFork={handleChapterFork}
 					onMerge={handleChapterMerge}
+					onRebase={handleChapterRebase}
 					onReview={handleChapterReview}
 					onAbandon={handleChapterAbandon}
+					onConvertToSubagent={handleReviewConvertToSubagent}
+					onPromoteReview={handleReviewPromote}
+					onDismissReview={handleReviewDismiss}
 				/>
 			)}
+
+			<RebaseConflictDialog
+				opened={rebaseConflict !== null}
+				onClose={() => setRebaseConflict(null)}
+				projectId={projectId}
+				chapterId={rebaseConflict?.chapterId ?? ""}
+				chapterTitle={rebaseConflict?.chapterTitle ?? ""}
+				conflictFiles={rebaseConflict?.conflictFiles ?? []}
+				onResolved={() => {
+					queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+				}}
+				onNarratorOpened={(chId) => {
+					setOpenPanelChapterIds((prev) => {
+						const next = new Set(prev);
+						next.add(chId);
+						return next;
+					});
+				}}
+			/>
 
 			{/* Narrator panels for open and closing (animating out) chapters */}
 			{Array.from(new Set([...openPanelChapterIds, ...closingPanelChapterIds])).map((chId) => {
@@ -3062,7 +3196,6 @@ function NarratorPanelOverlay({
 				// applyTransformToDOM (via useLayoutEffect) to avoid React
 				// inline-style resets fighting the per-frame DOM updates.
 				transition: isResizingRef.current ? "none" : "width 200ms ease, height 200ms ease",
-				userSelect: "none",
 				zIndex: 10,
 				pointerEvents: isClosing ? "none" : "auto",
 				transformOrigin: "top left",

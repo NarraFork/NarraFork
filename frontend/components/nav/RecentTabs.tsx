@@ -42,6 +42,7 @@ import { type RecentTab, type RecentTabViewer, useRecentTabs } from "../../hooks
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { startNarratorDrag } from "../../lib/narrator-drag";
 import { triggerNotification } from "../../lib/notification";
 import { UserAvatar } from "../UserAvatar";
 
@@ -526,6 +527,22 @@ function SortableTabItem({
 			? { transform: `translateX(${swipeX}px)`, transition: "none" }
 			: {};
 
+	// Cross-component drag — pointerdown on icon starts a global narrator drag.
+	// We use onPointerDown + stopPropagation so @dnd-kit's PointerSensor
+	// on the outer div doesn't capture it (pointer events fire before mouse events).
+	const dragNarratorId =
+		tab.type === "narrator" ? tab.id : tab.type === "chapter" ? tab.narratorId : null;
+
+	const handleIconPointerDown = useCallback(
+		(e: React.PointerEvent) => {
+			if (e.button !== 0 || !dragNarratorId) return;
+			e.stopPropagation();
+			e.preventDefault();
+			startNarratorDrag(dragNarratorId, tab.title, e.clientX, e.clientY);
+		},
+		[dragNarratorId, tab.title],
+	);
+
 	return (
 		<div
 			ref={setNodeRef}
@@ -566,19 +583,24 @@ function SortableTabItem({
 						</>
 					}
 					leftSection={
-						tab.type === "project" ? (
-							<IconFolder size={16} />
-						) : tab.type === "chapter" ? (
-							<IconGitBranch
-								size={16}
-								color={iconColor}
-								fill={filledStatus ? "currentColor" : "none"}
-							/>
-						) : filledStatus ? (
-							<IconMessageCircleFilled size={16} color={iconColor} />
-						) : (
-							<IconMessageCircle size={16} color={iconColor} />
-						)
+						<span
+							onPointerDown={handleIconPointerDown}
+							style={{ cursor: dragNarratorId ? "grab" : undefined }}
+						>
+							{tab.type === "project" ? (
+								<IconFolder size={16} />
+							) : tab.type === "chapter" ? (
+								<IconGitBranch
+									size={16}
+									color={iconColor}
+									fill={filledStatus ? "currentColor" : "none"}
+								/>
+							) : filledStatus ? (
+								<IconMessageCircleFilled size={16} color={iconColor} />
+							) : (
+								<IconMessageCircle size={16} color={iconColor} />
+							)}
+						</span>
 					}
 					styles={{
 						root: {

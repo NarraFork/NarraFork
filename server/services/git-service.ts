@@ -461,6 +461,76 @@ export const gitService = {
 		await exec(["merge", "--abort"], worktreePath);
 	},
 
+	/** Rebase current branch onto another branch. On conflict the worktree is left
+	 *  in the middle of a rebase so the caller can decide to abort or resolve. */
+	async rebase(
+		worktreePath: string,
+		ontoBranch: string,
+	): Promise<{
+		success: boolean;
+		commitSha?: string;
+		conflictFiles?: Array<{ file: string; conflictLines: number }>;
+	}> {
+		const result = await exec(["rebase", ontoBranch], worktreePath);
+		if (result.exitCode !== 0) {
+			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
+				return {
+					success: false,
+					conflictFiles: await this.getConflictFilesWithLines(worktreePath),
+				};
+			}
+			throw new GitError(`Rebase failed: ${result.stderr}`);
+		}
+		const sha = await this.getHeadCommit(worktreePath);
+		return { success: true, commitSha: sha };
+	},
+
+	async rebaseAbort(worktreePath: string): Promise<void> {
+		await exec(["rebase", "--abort"], worktreePath);
+	},
+
+	async rebaseContinue(worktreePath: string): Promise<{
+		success: boolean;
+		commitSha?: string;
+		conflictFiles?: Array<{ file: string; conflictLines: number }>;
+	}> {
+		// Stage all resolved files then continue
+		await exec(["add", "-A"], worktreePath);
+		const result = await exec(["-c", "core.editor=true", "rebase", "--continue"], worktreePath);
+		if (result.exitCode !== 0) {
+			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
+				return {
+					success: false,
+					conflictFiles: await this.getConflictFilesWithLines(worktreePath),
+				};
+			}
+			throw new GitError(`Rebase continue failed: ${result.stderr}`);
+		}
+		const sha = await this.getHeadCommit(worktreePath);
+		return { success: true, commitSha: sha };
+	},
+
+	/** Get conflict files with the number of conflict markers in each file */
+	async getConflictFilesWithLines(
+		worktreePath: string,
+	): Promise<Array<{ file: string; conflictLines: number }>> {
+		const files = await this.getConflictFiles(worktreePath);
+		const result: Array<{ file: string; conflictLines: number }> = [];
+		for (const file of files) {
+			try {
+			const grepResult = await safeSpawn({
+				cmd: ["grep", "-c", "^<<<<<<<", file],
+				cwd: worktreePath,
+			});
+				const count = Number.parseInt(grepResult.stdout.trim(), 10) || 0;
+				result.push({ file, conflictLines: count });
+			} catch {
+				result.push({ file, conflictLines: 0 });
+			}
+		}
+		return result;
+	},
+
 	/** Perform merge without committing — leaves conflicts in worktree for resolution */
 	async mergeNoCommit(
 		worktreePath: string,

@@ -21,6 +21,7 @@ import { useDisclosure } from "@mantine/hooks";
 import {
 	IconArchive,
 	IconBox,
+	IconColumns,
 	IconEye,
 	IconFilter,
 	IconFolder,
@@ -53,7 +54,6 @@ import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
-
 import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { formatRelativeTime } from "../../lib/format";
 
@@ -388,6 +388,11 @@ function NarratorsPage() {
 							) : (
 								<IconSortAscending size={16} />
 							)}
+						</ActionIcon>
+					</Tooltip>
+					<Tooltip label={t("workspaceView")}>
+						<ActionIcon variant="subtle" size="sm" component={Link} to="/narrators/workspace">
+							<IconColumns size={16} />
 						</ActionIcon>
 					</Tooltip>
 					<Button variant="subtle" component={Link} to="/narrators/archived">

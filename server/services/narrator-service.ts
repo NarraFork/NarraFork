@@ -927,21 +927,30 @@ export const narratorService = {
 		return narrator?.type === "subagent";
 	},
 
-	async getMessagesCursor(narratorId: string, limit = 50, cursor?: string) {
+	async getMessagesCursor(
+		narratorId: string,
+		limit = 50,
+		cursor?: string,
+		direction: "older" | "newer" = "older",
+	) {
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 
-		// Build cursor condition on seq
+		// Build cursor condition on seq.
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const cursorConditions: any[] = [eq(narratorMessageRefs.narratorId, narratorId)];
 		if (cursor) {
 			const cursorSeq = Number.parseInt(cursor, 10);
 			if (!Number.isNaN(cursorSeq)) {
-				cursorConditions.push(lt(narratorMessageRefs.seq, cursorSeq));
+				cursorConditions.push(
+					direction === "newer"
+						? gt(narratorMessageRefs.seq, cursorSeq)
+						: lt(narratorMessageRefs.seq, cursorSeq),
+				);
 			}
 		}
 
-		// Query messages via junction table, ordered by seq DESC.
-		// For subagent narrators, include all messages (they all have parentToolUseId).
+		// Query messages via junction table. Older paging walks backward from the
+		// current oldest row; newer paging walks forward from the current newest row.
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -952,15 +961,25 @@ export const narratorService = {
 			.where(
 				and(...cursorConditions, ...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)])),
 			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.orderBy(
+				direction === "newer" ? narratorMessageRefs.seq : sql`${narratorMessageRefs.seq} DESC`,
+			)
 			.limit(limit + 1);
 
-		const hasMore = refRows.length > limit;
-		const pageRows = hasMore ? refRows.slice(0, limit) : refRows;
-		pageRows.reverse(); // chronological order
+		const hasMoreInDirection = refRows.length > limit;
+		const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
+		if (direction === "older") {
+			pageRows.reverse();
+		}
 
 		if (pageRows.length === 0) {
-			return { messages: [], hasMore, nextCursor: null, hasMoreAfter: false };
+			return {
+				messages: [],
+				hasMore: false,
+				nextCursor: null,
+				hasMoreAfter: false,
+				prevCursor: null,
+			};
 		}
 
 		const messageIds = pageRows.map((r) => r.messageId);
@@ -969,7 +988,7 @@ export const narratorService = {
 			with: { toolCalls: true, creator: true },
 		});
 
-		// Sort by seq order from refs (not createdAt)
+		// Sort by seq order from refs (not createdAt).
 		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 
@@ -983,7 +1002,7 @@ export const narratorService = {
 		}
 
 		// Fetch child messages (don't filter by narratorId — forked narrators
-		// share messages whose narratorId points to the original creator)
+		// share messages whose narratorId points to the original creator).
 		const parentToolUseIds = collectToolUseIds(topMessages);
 		const childMessages =
 			parentToolUseIds.length > 0
@@ -1005,9 +1024,13 @@ export const narratorService = {
 
 		return {
 			messages: tree,
-			hasMore,
-			nextCursor: hasMore ? String(pageRows[0].seq) : null,
-			hasMoreAfter: false,
+			hasMore: direction === "older" ? hasMoreInDirection : false,
+			nextCursor: direction === "older" && hasMoreInDirection ? String(pageRows[0].seq) : null,
+			hasMoreAfter: direction === "newer" ? hasMoreInDirection : false,
+			prevCursor:
+				direction === "newer" && hasMoreInDirection
+					? String(pageRows[pageRows.length - 1].seq)
+					: null,
 		};
 	},
 
@@ -1325,6 +1348,9 @@ export const narratorService = {
 			hasMore,
 			nextCursor: hasMore ? String(olderRows[0]?.seq ?? anchorRef.seq) : null,
 			hasMoreAfter,
+			prevCursor: hasMoreAfter
+				? String(newerRows[newerRows.length - 1]?.seq ?? anchorRef.seq)
+				: null,
 		};
 	},
 
