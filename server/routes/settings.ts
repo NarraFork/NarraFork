@@ -4,6 +4,7 @@ import { z } from "zod";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	getBuiltinCodexModels,
@@ -18,9 +19,13 @@ import {
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
-import { getAnthropicCachedModelsGrouped } from "./anthropic";
-import { getClineEnabledModelsGrouped } from "./cline";
-import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
+import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
+import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
+import {
+	getOpenaiCachedModels,
+	getOpenaiCachedModelsGrouped,
+	purgeOpenaiProviderCache,
+} from "./openai";
 
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
@@ -213,6 +218,48 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
+/** Return IDs present in `oldList` but absent from `newList`. */
+function getRemovedProviderIds(
+	oldList: { id: string }[] | undefined,
+	newList: { id: string }[] | undefined,
+): string[] {
+	const newIds = new Set((newList ?? []).map((p) => p.id));
+	return (oldList ?? []).filter((p) => !newIds.has(p.id)).map((p) => p.id);
+}
+
+/**
+ * After settings are saved, detect providers that were removed and purge their
+ * in-memory + on-disk model caches so no stale data lingers.
+ */
+function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSettings): void {
+	const purges: Array<{ type: string; ids: string[]; fn: (ids: string[]) => void }> = [
+		{
+			type: "openai",
+			ids: getRemovedProviderIds(prev.openaiProviders, next.openaiProviders),
+			fn: purgeOpenaiProviderCache,
+		},
+		{
+			type: "anthropic",
+			ids: getRemovedProviderIds(prev.anthropicProviders, next.anthropicProviders),
+			fn: purgeAnthropicProviderCache,
+		},
+		{
+		},
+		{
+			type: "cline",
+			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
+			fn: purgeClineProviderCache,
+		},
+	];
+
+	for (const { type, ids, fn } of purges) {
+		if (ids.length) {
+			fn(ids);
+			logger.info("Purged provider model cache", { type, removedIds: ids });
+		}
+	}
+}
+
 settingsRoutes.get("/", (c) => {
 	const s = settings;
 	const codexManager = getCodexManager();
@@ -342,6 +389,9 @@ settingsRoutes.patch("/", async (c) => {
 	}
 
 	saveSettings(merged);
+
+	// Purge model caches for removed providers
+	purgeRemovedProviderCaches(current, merged);
 
 	// Detect host/port changes and schedule a server restart
 	const newHost = merged.server.host;

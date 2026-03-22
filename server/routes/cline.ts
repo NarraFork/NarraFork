@@ -118,6 +118,15 @@ function saveCachedModels(): void {
 loadCachedModels();
 ensureDefaultProvider();
 
+/** Remove cached models for providers that no longer exist in settings. */
+export function purgeClineProviderCache(removedIds: string[]): void {
+	let changed = false;
+	for (const id of removedIds) {
+		if (cachedModelsByProvider.delete(id)) changed = true;
+	}
+	if (changed) saveCachedModels();
+}
+
 /** Get cached models for a specific provider. */
 export function getClineCachedModelsByProvider(providerId: string): ClineModelInfo[] {
 	return cachedModelsByProvider.get(providerId) ?? [];

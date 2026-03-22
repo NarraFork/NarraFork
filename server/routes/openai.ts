@@ -234,6 +234,15 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIMo
 	throw new Error(`Failed to fetch models from all candidate URLs: ${errors.join("; ")}`);
 }
 
+/** Remove cached models for providers that no longer exist in settings. */
+export function purgeOpenaiProviderCache(removedIds: string[]): void {
+	let changed = false;
+	for (const id of removedIds) {
+		if (cachedModelsByProvider.delete(id)) changed = true;
+	}
+	if (changed) saveAllCachedModels();
+}
+
 // Legacy endpoints (backward compat)
 openaiRoutes.get("/models", (c) => {
 	return c.json({ models: getOpenaiCachedModels(), fromCache: true });

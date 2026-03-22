@@ -162,6 +162,15 @@ async function fetchAnthropicModels(
 	return unique;
 }
 
+/** Remove cached models for providers that no longer exist in settings. */
+export function purgeAnthropicProviderCache(removedIds: string[]): void {
+	let changed = false;
+	for (const id of removedIds) {
+		if (cachedModelsByProvider.delete(id)) changed = true;
+	}
+	if (changed) saveAllCachedModels();
+}
+
 // Routes
 anthropicRoutes.get("/models", (c) => {
 	return c.json({ models: getAnthropicCachedModels(), fromCache: true });
