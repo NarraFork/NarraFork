@@ -529,20 +529,30 @@ export function ClineSection({
 								const prefixed = `${firstPrefix}:${m.id}`;
 								const isHidden = hiddenModels.includes(prefixed);
 								return (
-									<Group key={m.id} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
+									<Group
+										key={m.id}
+										gap="xs"
+										wrap="wrap"
+										style={isHidden ? { opacity: 0.5 } : undefined}
+									>
 										<Text
 											size="xs"
 											style={{
 												fontFamily: "monospace",
 												flex: 1,
-												minWidth: 0,
+												minWidth: 120,
 											}}
 											truncate
 										>
 											{prefixed}
 										</Text>
 										{m.name && m.name !== m.id && (
-											<Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 0 }} truncate>
+											<Text
+												size="xs"
+												c="dimmed"
+												style={{ flex: 1, minWidth: 80 }}
+												truncate
+											>
 												{m.name}
 											</Text>
 										)}

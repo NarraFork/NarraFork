@@ -4,6 +4,7 @@ import {
 	type NarratorDragState,
 	onNarratorDragEnd,
 	onNarratorDragMove,
+	startNarratorDrag,
 } from "../../lib/narrator-drag";
 import { NarratorPanel } from "./NarratorPanel";
 import type { SplitBranch, SplitDirection, SplitLeaf, SplitNode } from "./split-tree";
@@ -43,6 +44,15 @@ export interface SplitPanelCallbacks {
 	) => void;
 	onReplace: (leafId: string, narratorId: string) => void;
 	onClose: (leafId: string) => void;
+	/** Swap the narrators of two leaf panels. */
+	onSwap: (leafIdA: string, leafIdB: string) => void;
+	/** Move an existing panel (remove from source leaf, split-assign at target). */
+	onMoveToSplit: (
+		sourceLeafId: string,
+		targetLeafId: string,
+		direction: SplitDirection,
+		position: "before" | "after",
+	) => void;
 	canClose: boolean;
 }
 
@@ -50,6 +60,8 @@ export const SplitPanelCtx = createContext<SplitPanelCallbacks>({
 	onSplitAndAssign: () => {},
 	onReplace: () => {},
 	onClose: () => {},
+	onSwap: () => {},
+	onMoveToSplit: () => {},
 	canClose: false,
 });
 
@@ -71,10 +83,13 @@ export function SplitPanelContainer({
 // ── Leaf: NarratorPanel with drop overlay ──
 
 function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
-	const { onSplitAndAssign, onReplace, onClose, canClose } = useContext(SplitPanelCtx);
+	const { onSplitAndAssign, onReplace, onClose, onSwap, onMoveToSplit, canClose } =
+		useContext(SplitPanelCtx);
 	const [dropZone, setDropZone] = useState<DropZone>(null);
 	const boxRef = useRef<HTMLDivElement>(null);
 	const dropZoneRef = useRef<DropZone>(null);
+	/** Track the source leaf id when the drag originates from within the tree. */
+	const dragSourceLeafRef = useRef<string | null>(null);
 
 	useEffect(() => {
 		const unsubMove = onNarratorDragMove((state: NarratorDragState) => {
@@ -87,8 +102,17 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 				state.y >= rect.top &&
 				state.y <= rect.bottom;
 			if (inside) {
+				// Don't show drop zone when dragging over the source panel itself
+				if (state.sourceLeafId === leaf.id) {
+					if (dropZoneRef.current) {
+						dropZoneRef.current = null;
+						setDropZone(null);
+					}
+					return;
+				}
 				const zone = computeDropZone(rect, state.x, state.y);
 				dropZoneRef.current = zone;
+				dragSourceLeafRef.current = state.sourceLeafId ?? null;
 				setDropZone(zone);
 			} else if (dropZoneRef.current) {
 				dropZoneRef.current = null;
@@ -98,7 +122,9 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 
 		const unsubEnd = onNarratorDragEnd((final: NarratorDragState | null) => {
 			const zone = dropZoneRef.current;
+			const sourceLeafId = dragSourceLeafRef.current;
 			dropZoneRef.current = null;
+			dragSourceLeafRef.current = null;
 			setDropZone(null);
 			if (!final || !zone) return;
 
@@ -113,13 +139,28 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 				final.y <= rect.bottom;
 			if (!inside) return;
 
+			// Don't drop on self
+			if (final.sourceLeafId === leaf.id) return;
+
 			if (zone === "center") {
-				onReplace(leaf.id, final.narratorId);
+				if (sourceLeafId) {
+					// Drag from within tree → swap
+					onSwap(sourceLeafId, leaf.id);
+				} else {
+					// Drag from sidebar → replace
+					onReplace(leaf.id, final.narratorId);
+				}
 			} else {
 				const direction: SplitDirection =
 					zone === "left" || zone === "right" ? "horizontal" : "vertical";
 				const position: "before" | "after" = zone === "left" || zone === "top" ? "before" : "after";
-				onSplitAndAssign(leaf.id, direction, position, final.narratorId);
+				if (sourceLeafId) {
+					// Drag from within tree → move (remove source, split at target)
+					onMoveToSplit(sourceLeafId, leaf.id, direction, position);
+				} else {
+					// Drag from sidebar → split and assign
+					onSplitAndAssign(leaf.id, direction, position, final.narratorId);
+				}
 			}
 		});
 
@@ -127,7 +168,15 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 			unsubMove();
 			unsubEnd();
 		};
-	}, [leaf.id, onSplitAndAssign, onReplace]);
+	}, [leaf.id, onSplitAndAssign, onReplace, onSwap, onMoveToSplit]);
+
+	const handleHeaderPointerDown = useCallback(
+		(e: React.PointerEvent) => {
+			if (!leaf.narratorId) return;
+			startNarratorDrag(leaf.narratorId, "", e.clientX, e.clientY, leaf.id);
+		},
+		[leaf.narratorId, leaf.id],
+	);
 
 	return (
 		<Box
@@ -141,6 +190,7 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 					narratorId={leaf.narratorId}
 					compact
 					onClose={canClose ? () => onClose(leaf.id) : undefined}
+					onHeaderPointerDown={handleHeaderPointerDown}
 				/>
 			)}
 

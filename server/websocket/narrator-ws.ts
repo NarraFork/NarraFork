@@ -453,14 +453,6 @@ function debouncedTerminalCount(narratorId: string | null) {
 	);
 }
 
-eventBus.on("terminal:created", (event) => {
-	debouncedTerminalCount(event.narratorId);
-});
-
-eventBus.on("terminal:exited", (event) => {
-	debouncedTerminalCount(event.narratorId);
-});
-
 // === Container status change listener ===
 // When a container starts/stops/pauses/resumes, compute the aggregate status for the chapter
 // and broadcast to subscribers of the chapter's narrator. Debounced per-chapter.
@@ -512,118 +504,138 @@ function debouncedContainerStatus(chapterId: string) {
 	);
 }
 
-eventBus.on("container:started", (event) => {
-	debouncedContainerStatus(event.chapterId);
-	broadcastToAll({ type: "container:started", chapterId: event.chapterId });
-});
+// === Event bus listeners ===
+// Guard against duplicate registration during Bun --hot reloads.
+// The eventBus singleton survives reloads (via hotSafe in event-bus.ts),
+// but this module re-executes, so without a guard each reload appends
+// duplicate handlers — causing N× DB queries and WS broadcasts.
 
-eventBus.on("container:stopped", (event) => {
-	debouncedContainerStatus(event.chapterId);
-	broadcastToAll({ type: "container:stopped", chapterId: event.chapterId });
-});
+const _listenersRegistered = Symbol.for("narrafork.narratorWs.listenersRegistered");
+// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
+if (!(globalThis as any)[_listenersRegistered]) {
+	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
+	(globalThis as any)[_listenersRegistered] = true;
 
-eventBus.on("container:paused", (event) => {
-	debouncedContainerStatus(event.chapterId);
-	broadcastToAll({ type: "container:paused", chapterId: event.chapterId });
-});
-
-eventBus.on("container:resumed", (event) => {
-	debouncedContainerStatus(event.chapterId);
-	broadcastToAll({ type: "container:resumed", chapterId: event.chapterId });
-});
-
-eventBus.on("container:starting", (event) => {
-	broadcastToAll({ type: "container:starting", chapterId: event.chapterId });
-});
-
-eventBus.on("container:log", (event) => {
-	broadcastToAll({ type: "container:log", chapterId: event.chapterId, line: event.line });
-});
-
-eventBus.on("container:error", (event) => {
-	broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
-});
-
-// === Overseer replaced ===
-// When an overseer's narrator is archived and a replacement is created,
-// broadcast to all clients so they can refresh their overseer state.
-
-eventBus.on("overseer:replaced", (event) => {
-	broadcastToAll({
-		type: "overseer:replaced",
-		oldOverseerId: event.oldOverseerId,
-		newOverseerId: event.newOverseerId,
-		scope: event.scope,
-		projectId: event.projectId,
+	eventBus.on("terminal:created", (event) => {
+		debouncedTerminalCount(event.narratorId);
 	});
-});
 
-// === Overseer narrator status sync ===
-// When an overseer's narrator status changes (thinking/waiting/idle/etc.),
-// broadcast to ALL clients so the nav item updates in real-time without
-// requiring the nav to have an active subscription to the overseer narrator.
-
-eventBus.on("narrator:status_changed", async (event) => {
-	const overseer = await db.query.overseers.findFirst({
-		where: eq(overseers.narratorId, event.narratorId),
+	eventBus.on("terminal:exited", (event) => {
+		debouncedTerminalCount(event.narratorId);
 	});
-	if (!overseer) return;
-	broadcastToAll({
-		type: "overseer:status_changed",
-		overseerId: overseer.id,
-		narratorId: event.narratorId,
-		status: event.status,
+
+	eventBus.on("container:started", (event) => {
+		debouncedContainerStatus(event.chapterId);
+		broadcastToAll({ type: "container:started", chapterId: event.chapterId });
 	});
-});
 
-// === Recent tabs title sync ===
-// When a narrator title changes, update the stored title in every user's recent_tabs
-// and broadcast a fresh snapshot so the sidebar reflects the new title immediately.
+	eventBus.on("container:stopped", (event) => {
+		debouncedContainerStatus(event.chapterId);
+		broadcastToAll({ type: "container:stopped", chapterId: event.chapterId });
+	});
 
-eventBus.on("narrator:title_updated", async (event) => {
-	try {
-		const { broadcastTabsSnapshot } = await import("../routes/user-preferences");
-		const rows = db
-			.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
-			.from(userPreferences)
-			.all();
+	eventBus.on("container:paused", (event) => {
+		debouncedContainerStatus(event.chapterId);
+		broadcastToAll({ type: "container:paused", chapterId: event.chapterId });
+	});
 
-		for (const row of rows) {
-			let tabs: Record<string, unknown>[];
-			try {
-				tabs = JSON.parse(row.recentTabs);
-			} catch {
-				continue;
-			}
-			if (!Array.isArray(tabs)) continue;
+	eventBus.on("container:resumed", (event) => {
+		debouncedContainerStatus(event.chapterId);
+		broadcastToAll({ type: "container:resumed", chapterId: event.chapterId });
+	});
 
-			let changed = false;
-			for (const tab of tabs) {
-				const isMatch =
-					(tab.type === "narrator" && tab.id === event.narratorId) ||
-					(tab.type === "chapter" && tab.narratorId === event.narratorId);
-				if (isMatch && tab.title !== event.title) {
-					tab.title = event.title;
-					changed = true;
-				}
-			}
-			if (!changed) continue;
+	eventBus.on("container:starting", (event) => {
+		broadcastToAll({ type: "container:starting", chapterId: event.chapterId });
+	});
 
-			const now = new Date().toISOString();
-			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-				JSON.stringify(tabs),
-				now,
-				row.userId,
-			]);
-			broadcastTabsSnapshot(row.userId, tabs);
-		}
-	} catch (err) {
-		logger.error("Failed to sync recent tabs after title update", {
-			narratorId: event.narratorId,
-			error: String(err),
+	eventBus.on("container:log", (event) => {
+		broadcastToAll({ type: "container:log", chapterId: event.chapterId, line: event.line });
+	});
+
+	eventBus.on("container:error", (event) => {
+		broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
+	});
+
+	// === Overseer replaced ===
+	// When an overseer's narrator is archived and a replacement is created,
+	// broadcast to all clients so they can refresh their overseer state.
+
+	eventBus.on("overseer:replaced", (event) => {
+		broadcastToAll({
+			type: "overseer:replaced",
+			oldOverseerId: event.oldOverseerId,
+			newOverseerId: event.newOverseerId,
+			scope: event.scope,
+			projectId: event.projectId,
 		});
-	}
-});
+	});
+
+	// === Overseer narrator status sync ===
+	// When an overseer's narrator status changes (thinking/waiting/idle/etc.),
+	// broadcast to ALL clients so the nav item updates in real-time without
+	// requiring the nav to have an active subscription to the overseer narrator.
+
+	eventBus.on("narrator:status_changed", async (event) => {
+		const overseer = await db.query.overseers.findFirst({
+			where: eq(overseers.narratorId, event.narratorId),
+		});
+		if (!overseer) return;
+		broadcastToAll({
+			type: "overseer:status_changed",
+			overseerId: overseer.id,
+			narratorId: event.narratorId,
+			status: event.status,
+		});
+	});
+
+	// === Recent tabs title sync ===
+	// When a narrator title changes, update the stored title in every user's recent_tabs
+	// and broadcast a fresh snapshot so the sidebar reflects the new title immediately.
+
+	eventBus.on("narrator:title_updated", async (event) => {
+		try {
+			const { broadcastTabsSnapshot } = await import("../routes/user-preferences");
+			const rows = db
+				.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
+				.from(userPreferences)
+				.all();
+
+			for (const row of rows) {
+				let tabs: Record<string, unknown>[];
+				try {
+					tabs = JSON.parse(row.recentTabs);
+				} catch {
+					continue;
+				}
+				if (!Array.isArray(tabs)) continue;
+
+				let changed = false;
+				for (const tab of tabs) {
+					const isMatch =
+						(tab.type === "narrator" && tab.id === event.narratorId) ||
+						(tab.type === "chapter" && tab.narratorId === event.narratorId);
+					if (isMatch && tab.title !== event.title) {
+						tab.title = event.title;
+						changed = true;
+					}
+				}
+				if (!changed) continue;
+
+				const now = new Date().toISOString();
+				sqlite.run(
+					`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`,
+					[JSON.stringify(tabs), now, row.userId],
+				);
+				broadcastTabsSnapshot(row.userId, tabs);
+			}
+		} catch (err) {
+			logger.error("Failed to sync recent tabs after title update", {
+				narratorId: event.narratorId,
+				error: String(err),
+			});
+		}
+	});
+} // end of hot-reload guard
 
 // === WebSocket handlers ===
 

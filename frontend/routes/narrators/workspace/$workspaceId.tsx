@@ -13,11 +13,13 @@ import {
 	countLeaves,
 	createLeaf,
 	getAllNarratorIds,
+	moveLeaf,
 	removeLeaf,
 	type SplitDirection,
 	type SplitNode,
 	setNarrator,
 	splitAndAssign,
+	swapLeaves,
 	updateSizes,
 } from "../../../components/narrator/split-tree";
 import { addRecentTab } from "../../../hooks/useRecentTabs";
@@ -234,6 +236,25 @@ function WorkspacePage() {
 		[updateTree],
 	);
 
+	const handleSwap = useCallback(
+		(leafIdA: string, leafIdB: string) => {
+			updateTree((prev) => swapLeaves(prev, leafIdA, leafIdB));
+		},
+		[updateTree],
+	);
+
+	const handleMoveToSplit = useCallback(
+		(
+			sourceLeafId: string,
+			targetLeafId: string,
+			direction: SplitDirection,
+			position: "before" | "after",
+		) => {
+			updateTree((prev) => moveLeaf(prev, sourceLeafId, targetLeafId, direction, position));
+		},
+		[updateTree],
+	);
+
 	if (isLoading || !tree) {
 		return (
 			<Box
@@ -254,6 +275,8 @@ function WorkspacePage() {
 		onSplitAndAssign: handleSplitAndAssign,
 		onReplace: handleReplace,
 		onClose: handleClose,
+		onSwap: handleSwap,
+		onMoveToSplit: handleMoveToSplit,
 		canClose,
 	};
 

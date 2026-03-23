@@ -850,9 +850,24 @@ export function CodexSection({
 									const modelVal = `codex:${modelId}`;
 									const isHidden = hiddenModels.includes(modelVal);
 									return (
-										<Group key={modelId} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
-											<TextInput value={modelVal} disabled style={{ flex: 1 }} size="xs" />
-											<TextInput value={modelId} disabled style={{ flex: 1 }} size="xs" />
+										<Group
+											key={modelId}
+											gap="xs"
+											wrap="wrap"
+											style={isHidden ? { opacity: 0.5 } : undefined}
+										>
+											<TextInput
+												value={modelVal}
+												disabled
+												style={{ flex: 1, minWidth: 120 }}
+												size="xs"
+											/>
+											<TextInput
+												value={modelId}
+												disabled
+												style={{ flex: 1, minWidth: 120 }}
+												size="xs"
+											/>
 											<ActionIcon
 												variant="subtle"
 												color={isHidden ? "gray" : "blue"}

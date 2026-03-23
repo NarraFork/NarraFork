@@ -13,6 +13,8 @@ export interface NarratorDragState {
 	title: string;
 	x: number;
 	y: number;
+	/** When drag originates from a workspace leaf panel, this is the leaf id. */
+	sourceLeafId?: string;
 }
 
 type MoveListener = (state: NarratorDragState) => void;
@@ -30,8 +32,14 @@ export function getNarratorDrag(): NarratorDragState | null {
 
 // ── Entry point 1: icon pointerdown (registers document listeners) ──
 
-export function startNarratorDrag(narratorId: string, title: string, x: number, y: number) {
-	_current = { narratorId, title, x, y };
+export function startNarratorDrag(
+	narratorId: string,
+	title: string,
+	x: number,
+	y: number,
+	sourceLeafId?: string,
+) {
+	_current = { narratorId, title, x, y, sourceLeafId };
 	_ownsPointer = true;
 	document.addEventListener("pointermove", onDocPointerMove, true);
 	document.addEventListener("pointerup", onDocPointerUp, true);

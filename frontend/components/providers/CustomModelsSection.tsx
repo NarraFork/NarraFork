@@ -61,9 +61,14 @@ export function CustomModelsSection({
 				{modelsToShow.map((m) => {
 					const isHidden = hiddenModels.includes(m.value);
 					return (
-						<Group key={m.value} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
-							<TextInput value={m.value} disabled style={{ flex: 1 }} />
-							<TextInput value={m.label} disabled style={{ flex: 1 }} />
+						<Group
+							key={m.value}
+							gap="xs"
+							wrap="wrap"
+							style={isHidden ? { opacity: 0.5 } : undefined}
+						>
+							<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
+							<TextInput value={m.label} disabled style={{ flex: 1, minWidth: 120 }} />
 							<Badge size="sm" variant="light" color="gray" w={70}>
 								{m.provider ?? "?"}
 							</Badge>

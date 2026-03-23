@@ -3583,15 +3583,19 @@ export async function runCustomCompact(
 		return;
 	}
 
-	// Wrap compact with timeout to ensure lock is always released
+	// Wrap compact with timeout to ensure lock is always released.
+	// Save the timer ID so we can clearTimeout after the race settles —
+	// without this, the 5-minute timer holds its closure in memory even
+	// when compact finishes in seconds.
+	let compactTimer: ReturnType<typeof setTimeout>;
 	const compactPromise = Promise.race([
 		doRunCustomCompact(narratorId, locale, beforeMessageId),
-		new Promise<void>((_, reject) =>
-			setTimeout(
+		new Promise<void>((_, reject) => {
+			compactTimer = setTimeout(
 				() => reject(new Error("Compact operation timed out after 5 minutes")),
 				COMPACT_TIMEOUT_MS,
-			),
-		),
+			);
+		}),
 	]);
 	compactLocks.set(narratorId, compactPromise);
 	try {
@@ -3603,6 +3607,8 @@ export async function runCustomCompact(
 		});
 		throw err;
 	} finally {
+		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
+		clearTimeout(compactTimer!);
 		compactLocks.delete(narratorId);
 	}
 }

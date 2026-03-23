@@ -83,9 +83,9 @@ export function InlineCustomModels({
 			{myModels.map((m) => {
 				const isHidden = hiddenModels.includes(m.value);
 				return (
-					<Group key={m.value} gap="xs" style={isHidden ? { opacity: 0.5 } : undefined}>
-						<TextInput value={m.value} disabled style={{ flex: 1 }} />
-						<TextInput value={m.label} disabled style={{ flex: 1 }} />
+					<Group key={m.value} gap="xs" wrap="wrap" style={isHidden ? { opacity: 0.5 } : undefined}>
+						<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
+						<TextInput value={m.label} disabled style={{ flex: 1, minWidth: 120 }} />
 						<NumberInput
 							placeholder={t("contextWindowPlaceholder")}
 							value={modelContextWindows[m.value] || ""}
@@ -109,19 +109,19 @@ export function InlineCustomModels({
 					</Group>
 				);
 			})}
-			<Group gap="xs">
+			<Group gap="xs" wrap="wrap">
 				<TextInput
 					placeholder={t("modelValuePlaceholder")}
 					value={newModelValue}
 					onChange={(e) => setNewModelValue(e.currentTarget.value)}
-					style={{ flex: 1 }}
+					style={{ flex: 1, minWidth: 120 }}
 					size="xs"
 				/>
 				<TextInput
 					placeholder={t("modelLabelPlaceholder")}
 					value={newModelLabel}
 					onChange={(e) => setNewModelLabel(e.currentTarget.value)}
-					style={{ flex: 1 }}
+					style={{ flex: 1, minWidth: 120 }}
 					size="xs"
 				/>
 				<ActionIcon

@@ -244,6 +244,69 @@ function mapBranch(
 	return changed ? { ...updated, children: newChildren } : updated;
 }
 
+/**
+ * Move a leaf from one position to another in a single atomic operation.
+ * The source leaf is removed and its narratorId is placed in a new leaf
+ * adjacent to the target leaf (split in the given direction/position).
+ *
+ * This is safer than removeLeaf + splitAndAssign because it handles the case
+ * where removing the source leaf collapses a branch that contains the target.
+ */
+export function moveLeaf(
+	tree: SplitNode,
+	sourceLeafId: string,
+	targetLeafId: string,
+	direction: SplitDirection,
+	position: "before" | "after",
+): SplitNode {
+	if (sourceLeafId === targetLeafId) return tree;
+
+	// 1. Find the source narrator
+	let sourceNarratorId: string | null = null;
+	walkLeaves(tree, (leaf) => {
+		if (leaf.id === sourceLeafId) sourceNarratorId = leaf.narratorId;
+	});
+	if (!sourceNarratorId) return tree;
+
+	// 2. Clear the source leaf's narrator (set to null) so we can track it
+	let result: SplitNode = mapLeaf(tree, sourceLeafId, (l) => ({ ...l, narratorId: null }));
+
+	// 3. Split the target leaf and assign the source narrator to the new leaf
+	result = splitAndAssign(result, targetLeafId, direction, position, sourceNarratorId);
+
+	// 4. Remove the now-empty source leaf
+	const cleaned = removeLeaf(result, sourceLeafId);
+	return cleaned ?? result;
+}
+
+/** Swap the narratorIds of two leaves identified by their leaf ids. */
+export function swapLeaves(tree: SplitNode, leafIdA: string, leafIdB: string): SplitNode {
+	if (leafIdA === leafIdB) return tree;
+	// Collect current narratorIds
+	let narA: string | null | undefined;
+	let narB: string | null | undefined;
+	walkLeaves(tree, (leaf) => {
+		if (leaf.id === leafIdA) narA = leaf.narratorId;
+		if (leaf.id === leafIdB) narB = leaf.narratorId;
+	});
+	if (narA === undefined || narB === undefined) return tree;
+	// Apply swap via two mapLeaf passes (undefined already filtered above)
+	const swapA = narA as string | null;
+	const swapB = narB as string | null;
+	let result = mapLeaf(tree, leafIdA, (l) => ({ ...l, narratorId: swapB }));
+	result = mapLeaf(result, leafIdB, (l) => ({ ...l, narratorId: swapA }));
+	return result;
+}
+
+/** Find the leaf id that holds a given narratorId. */
+export function findLeafByNarrator(tree: SplitNode, narratorId: string): string | null {
+	let found: string | null = null;
+	walkLeaves(tree, (leaf) => {
+		if (leaf.narratorId === narratorId) found = leaf.id;
+	});
+	return found;
+}
+
 function walkLeaves(node: SplitNode, fn: (leaf: SplitLeaf) => void): void {
 	if (node.type === "leaf") {
 		fn(node);

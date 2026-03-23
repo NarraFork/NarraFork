@@ -56,11 +56,24 @@ export class BufferManager {
 	private flushTimer: ReturnType<typeof setInterval> | null = null;
 
 	/**
-	 * Chain of pending xterm.write() calls. Each append() chains onto this
-	 * promise so that getContents()/resize()/saveToDisk() can await full
-	 * processing before reading state.
+	 * Chain of pending xterm.write() calls. The drain loop consumes
+	 * pendingWrites in batches so that getContents()/resize()/saveToDisk()
+	 * can await full processing before reading state.
+	 *
+	 * IMPORTANT: Previous implementation chained a new Promise per append()
+	 * call, creating an ever-growing Promise chain that held references to
+	 * every data string until the chain resolved. Under high-frequency
+	 * terminal output (npm install, make, etc.) this caused GB-level memory
+	 * leaks. The current batch-drain approach keeps at most one pending
+	 * Promise + one pending string array regardless of throughput.
 	 */
 	private writeChain: Promise<void> = Promise.resolve();
+
+	/** Buffered data waiting to be written to xterm in the next drain cycle. */
+	private pendingWrites: string[] = [];
+
+	/** Whether a drain loop is currently scheduled/running. */
+	private draining = false;
 
 	/**
 	 * Mouse tracking mode state — still tracked manually because the
@@ -103,10 +116,26 @@ export class BufferManager {
 
 	append(data: string): void {
 		this.trackMouseMode(data);
-		this.writeChain = this.writeChain.then(
-			() => new Promise<void>((resolve) => this.xterm.write(data, resolve)),
-		);
+		this.pendingWrites.push(data);
 		this.dirty = true;
+		if (!this.draining) this.drain();
+	}
+
+	/**
+	 * Drain all pendingWrites into xterm in batches.
+	 * Joins accumulated strings into a single write() call per iteration,
+	 * keeping the Promise chain O(1) instead of O(n) per append().
+	 */
+	private drain(): void {
+		this.draining = true;
+		this.writeChain = this.writeChain.then(async () => {
+			while (this.pendingWrites.length > 0) {
+				const batch = this.pendingWrites.join("");
+				this.pendingWrites.length = 0;
+				await new Promise<void>((resolve) => this.xterm.write(batch, resolve));
+			}
+			this.draining = false;
+		});
 	}
 
 	/** Wait for all pending writes to be processed by the headless xterm */
