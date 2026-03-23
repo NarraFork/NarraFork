@@ -859,13 +859,9 @@ function SortableWorkspaceChildTab({
 	const sortStyle: React.CSSProperties = {
 		transform: CSS.Transform.toString(transform),
 		transition,
-		// isDragging: keep layout space so dnd-kit can compute drop positions;
-		// dimmed (workspace children following header drag): collapse to hide.
-		...(dimmed
-			? { opacity: 0, height: 0, overflow: "hidden", margin: 0, padding: 0 }
-			: isDragging
-				? { opacity: 0 }
-				: { opacity: 1 }),
+		// Both isDragging and dimmed (workspace children following header drag)
+		// keep layout space so dnd-kit can compute correct drop positions.
+		opacity: isDragging || dimmed ? 0 : 1,
 	};
 
 	return (
