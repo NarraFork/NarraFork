@@ -15,6 +15,12 @@ function prefixLabels(data: ComboboxData): ComboboxData {
 	}));
 }
 
+export interface SubagentAllowedModels {
+	explore: string[];
+	plan: string[];
+	general: string[];
+}
+
 export interface ModelsSectionProps {
 	defaultModel: string;
 	setDefaultModel: (v: string) => void;
@@ -26,8 +32,8 @@ export interface ModelsSectionProps {
 	setSubagentPlanModel: (v: string) => void;
 	codexDefaultReasoningEffort: string;
 	setCodexDefaultReasoningEffort: (v: string) => void;
-	subagentAllowedModels: string[];
-	setSubagentAllowedModels: (v: string[]) => void;
+	subagentAllowedModels: SubagentAllowedModels;
+	setSubagentAllowedModels: (v: SubagentAllowedModels) => void;
 	groupedModels: ComboboxData;
 	navigate: (opts: ToOptions & NavigateOptions) => void;
 }
@@ -127,15 +133,40 @@ export function ModelsSection({
 					value={subagentPlanModel || null}
 					onChange={(v) => setSubagentPlanModel(v ?? "")}
 				/>
+			</Stack>
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("subagentAllowedModels")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("subagentAllowedModelsDesc")}
+				</Text>
 				<MultiSelect
-					label={t("subagentAllowedModels")}
-					description={t("subagentAllowedModelsDesc")}
+					label={t("subagentAllowedModelsExplore")}
 					data={prefixedModels}
 					searchable
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
-					value={subagentAllowedModels}
-					onChange={setSubagentAllowedModels}
+					value={subagentAllowedModels.explore}
+					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, explore: v })}
+				/>
+				<MultiSelect
+					label={t("subagentAllowedModelsPlan")}
+					data={prefixedModels}
+					searchable
+					clearable
+					placeholder={t("subagentAllowedModelsPlaceholder")}
+					value={subagentAllowedModels.plan}
+					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, plan: v })}
+				/>
+				<MultiSelect
+					label={t("subagentAllowedModelsGeneral")}
+					data={prefixedModels}
+					searchable
+					clearable
+					placeholder={t("subagentAllowedModelsPlaceholder")}
+					value={subagentAllowedModels.general}
+					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, general: v })}
 				/>
 			</Stack>
 			<Select

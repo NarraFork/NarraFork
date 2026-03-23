@@ -10,7 +10,8 @@ type Key =
 	| "narrafork_fullscreen"
 	| "narrafork_oled"
 	| "narrafork_wakelock"
-	| "narrafork_advanced_anim";
+	| "narrafork_advanced_anim"
+	| "narrafork_expand_reasoning";
 
 const listeners = new Set<() => void>();
 

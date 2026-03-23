@@ -1,10 +1,10 @@
 /*
- * Advanced blur-in animation
- * Applied when [data-advanced-anim] or .blur-anim-active is present.
- * New DOM elements play the animation on mount; existing ones are unaffected
- * because CSS animations only trigger once per element lifecycle.
+ * Advanced animation effects (enabled via user preference).
+ * - Streaming text: inline-element blur-in reveal (StreamingBubble)
+ * - Streaming tool chunks: blur-in entrance for new tool cards
  */
 
+/* Shared blur-in keyframe */
 @keyframes nf-blur-in {
 	from {
 		filter: blur(8px);
@@ -16,25 +16,23 @@
 	}
 }
 
-/* Message list item-level entrance */
-.blur-anim-item {
-	animation: nf-blur-in 350ms ease-out both;
+/* Inline-element reveal for streaming text */
+@keyframes nf-inline-in {
+	from {
+		opacity: 0;
+		filter: blur(4px);
+	}
+	to {
+		opacity: 1;
+		filter: blur(0);
+	}
 }
 
-/* Streaming text: block-level elements inside MarkdownContent */
-.blur-anim-active p,
-.blur-anim-active h1,
-.blur-anim-active h2,
-.blur-anim-active h3,
-.blur-anim-active h4,
-.blur-anim-active h5,
-.blur-anim-active h6,
-.blur-anim-active pre,
-.blur-anim-active ul,
-.blur-anim-active ol,
-.blur-anim-active blockquote,
-.blur-anim-active table,
-.blur-anim-active hr,
-.blur-anim-active [data-tool-run] {
-	animation: nf-blur-in 350ms ease-out both;
+.nf-inline-in {
+	animation: nf-inline-in 350ms ease-out both;
+}
+
+/* Streaming tool card entrance — applied to individual tool items */
+.nf-tool-blur-in {
+	animation: nf-blur-in 400ms ease-out both;
 }

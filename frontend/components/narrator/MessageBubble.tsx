@@ -594,7 +594,8 @@ export function ReasoningSummary({
 	useLayoutEffect(() => {
 		if (hasTrailingContent && !autoExpandedRef.current) {
 			autoExpandedRef.current = true;
-			setExpanded(true);
+			const shouldExpand = localStorage.getItem("narrafork_expand_reasoning") === "true";
+			setExpanded(shouldExpand);
 		}
 	}, [hasTrailingContent]);
 

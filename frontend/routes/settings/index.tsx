@@ -21,7 +21,7 @@ import { AboutSection } from "../../components/settings/AboutSection";
 import { AgentSection } from "../../components/settings/AgentSection";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
 import { ChaptersContainersSection } from "../../components/settings/ChaptersContainersSection";
-import { ModelsSection } from "../../components/settings/ModelsSection";
+import { ModelsSection, type SubagentAllowedModels } from "../../components/settings/ModelsSection";
 import { NotificationSection } from "../../components/settings/NotificationSection";
 import { ProfileSection } from "../../components/settings/ProfileSection";
 import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
@@ -152,6 +152,9 @@ function SettingsPage() {
 	// Advanced animation (local-only)
 	const [advancedAnim, setAdvancedAnim] = useLocalPref("narrafork_advanced_anim");
 
+	// Expand reasoning cards by default (local-only)
+	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
+
 	// PWA cache refresh
 	const [pwaUpdating, setPwaUpdating] = useState(false);
 
@@ -181,7 +184,11 @@ function SettingsPage() {
 	const [maxTurns, setMaxTurns] = useState(200);
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
-	const [subagentAllowedModels, setSubagentAllowedModels] = useState<string[]>([]);
+	const [subagentAllowedModels, setSubagentAllowedModels] = useState<SubagentAllowedModels>({
+		explore: [],
+		plan: [],
+		general: [],
+	});
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [translateReasoning, setTranslateReasoning] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
@@ -233,7 +240,7 @@ function SettingsPage() {
 		maxTurns: 200,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
-		subagentAllowedModels: [] as string[],
+		subagentAllowedModels: { explore: [], plan: [], general: [] } as SubagentAllowedModels,
 		maxWorktrees: 10,
 		maxContainers: 5,
 		sizeWarning: 500,
@@ -289,7 +296,11 @@ function SettingsPage() {
 				maxTurns: settings.agent?.maxTurns ?? 200,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
-				subagentAllowedModels: settings.agent?.subagentAllowedModels ?? [],
+				subagentAllowedModels: {
+					explore: settings.agent?.subagentAllowedModels?.explore ?? [],
+					plan: settings.agent?.subagentAllowedModels?.plan ?? [],
+					general: settings.agent?.subagentAllowedModels?.general ?? [],
+				},
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -729,6 +740,8 @@ function SettingsPage() {
 							setWakeLock={setWakeLock}
 							advancedAnim={advancedAnim}
 							setAdvancedAnim={setAdvancedAnim}
+							expandReasoning={expandReasoning}
+							setExpandReasoning={setExpandReasoning}
 						/>
 					</Accordion.Panel>
 				</Accordion.Item>

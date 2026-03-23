@@ -1,7 +1,8 @@
 import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
 import { IconBrain } from "@tabler/icons-react";
-import { memo } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { ContentViewer } from "./ContentViewer";
+import { MD_PATTERN } from "./MarkdownContent";
 import { MessageBubble, ReasoningSummary } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
@@ -17,6 +18,7 @@ import type {
 	PermissionCallbacks,
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+import { StreamingRevealContext } from "./StreamingRevealContext";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { getCategoryColor, TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
@@ -39,6 +41,10 @@ export interface RenderToolRunOptions {
 	/** Additional messages whose tool items are appended after the main run's items.
 	 *  Used to visually merge streaming tool chunks into an existing tool run. */
 	appendMessages?: NarratorMsg[];
+	/** Apply blur-in entrance animation to appended tool items only (streaming tool chunks).
+	 *  When true, only items originating from `appendMessages` get the animation;
+	 *  items from the main `run` array are left untouched. */
+	animateAppended?: boolean;
 }
 
 export function renderToolRun(
@@ -57,6 +63,7 @@ export function renderToolRun(
 		containerStyle,
 		containerClassName,
 		appendMessages,
+		animateAppended,
 	} = opts;
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(
@@ -66,6 +73,8 @@ export function renderToolRun(
 			permCb.overseerReviewMap,
 		);
 	const items = flattenToolRun(run);
+	// Track where appended items start so animation is scoped to new items only.
+	const appendStartIdx = items.length;
 	if (appendMessages?.length) {
 		items.push(...flattenToolRun(appendMessages));
 	}
@@ -86,6 +95,7 @@ export function renderToolRun(
 						borderRadius: "var(--mantine-radius-sm)",
 					}
 				: undefined;
+		const shouldAnimate = animateAppended && idx >= appendStartIdx;
 
 		// Build context menu actions for this item's parent message
 		const ctxActions: MessageContextMenuActions = {};
@@ -113,7 +123,11 @@ export function renderToolRun(
 			);
 			return (
 				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-					<div id={`msg-${item.msg.id}`} style={hlStyle}>
+					<div
+						id={`msg-${item.msg.id}`}
+						style={hlStyle}
+						className={shouldAnimate ? "nf-tool-blur-in" : undefined}
+					>
 						<ContentViewer
 							content={item.reasoningText}
 							markdown
@@ -144,6 +158,7 @@ export function renderToolRun(
 					<div
 						id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
 						style={hlStyle}
+						className={shouldAnimate ? "nf-tool-blur-in" : undefined}
 					>
 						<SubagentCard
 							toolCall={item.tc}
@@ -166,6 +181,7 @@ export function renderToolRun(
 				<div
 					id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
 					style={hlStyle}
+					className={shouldAnimate ? "nf-tool-blur-in" : undefined}
 				>
 					<ToolCallCard
 						toolCall={item.tc}
@@ -786,21 +802,21 @@ export const StreamingBubble = memo(
 		streamingRef,
 		streamingReasoningRef,
 		includeReasoning,
-		advancedAnim,
 		webSearchRef,
 		version,
+		advancedAnim,
 	}: {
 		narratorId: string;
 		streamingRef: React.RefObject<string>;
 		streamingReasoningRef?: React.RefObject<string>;
 		includeReasoning?: boolean;
-		advancedAnim?: boolean;
 		webSearchRef?: React.RefObject<{
 			id: string;
 			status: "in_progress" | "searching" | "completed";
 			query?: string;
 		} | null>;
 		version: number;
+		advancedAnim?: boolean;
 	}) {
 		// Read ref directly during render — version change triggers re-render
 		// which picks up the latest accumulated text without an extra useEffect cycle.
@@ -808,6 +824,34 @@ export const StreamingBubble = memo(
 		const text = streamingRef.current;
 		const reasoning = includeReasoning ? streamingReasoningRef?.current : undefined;
 		const webSearch = webSearchRef?.current;
+
+		// Track previous text length for inline-element blur-in animation.
+		// prevTextLenRef holds the length from the *previous* render so we can
+		// compute how many characters are new in this frame.
+		const prevTextLenRef = useRef(0);
+		const textLen = text?.length ?? 0;
+		const newCharCount = advancedAnim ? Math.max(0, textLen - prevTextLenRef.current) : 0;
+
+		// Detect plain-text → markdown transition.
+		// When isMd flips from false to true, existing text should not animate.
+		const isMd = text ? MD_PATTERN.test(text.trim()) : false;
+		const prevWasMdRef = useRef(false);
+		const justBecameMd = isMd && !prevWasMdRef.current && prevTextLenRef.current > 0;
+
+		// Single effect to update tracking refs after commit.
+		// Handles both normal streaming updates and the reset when streaming ends.
+		useEffect(() => {
+			if (!text) {
+				prevTextLenRef.current = 0;
+				prevWasMdRef.current = false;
+			} else {
+				prevTextLenRef.current = textLen;
+				prevWasMdRef.current = isMd;
+			}
+		});
+
+		const revealCtx = useMemo(() => ({ newCharCount, justBecameMd }), [newCharCount, justBecameMd]);
+
 		if (!text && !reasoning && !webSearch) return null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic block shapes
 		const blocks: any[] = [];
@@ -821,6 +865,7 @@ export const StreamingBubble = memo(
 		}
 		if (reasoning) blocks.push({ type: "reasoning", text: reasoning });
 		if (text) blocks.push({ type: "text", text });
+
 		const bubble = (
 			<MessageBubble
 				narratorId={narratorId}
@@ -830,11 +875,19 @@ export const StreamingBubble = memo(
 				}}
 			/>
 		);
-		return advancedAnim ? <div className="blur-anim-active">{bubble}</div> : bubble;
+
+		if (advancedAnim && (newCharCount > 0 || justBecameMd)) {
+			return (
+				<StreamingRevealContext.Provider value={revealCtx}>
+					{bubble}
+				</StreamingRevealContext.Provider>
+			);
+		}
+		return bubble;
 	},
 	(prev, next) =>
 		prev.version === next.version &&
 		prev.includeReasoning === next.includeReasoning &&
-		prev.advancedAnim === next.advancedAnim &&
-		prev.narratorId === next.narratorId,
+		prev.narratorId === next.narratorId &&
+		prev.advancedAnim === next.advancedAnim,
 );

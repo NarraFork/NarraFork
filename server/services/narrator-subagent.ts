@@ -972,10 +972,16 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		subagentPref = customDef.defaultModel || undefined;
 	}
 
-	// Apply subagent allowed-model pool restriction.
+	// Apply per-type subagent allowed-model pool restriction.
 	// When the pool is non-empty, only models in the pool may be used.
 	// Walk the priority chain and pick the first allowed candidate.
-	const allowedPool = settings.agent.subagentAllowedModels ?? [];
+	// Note: "review" and custom subagent types fall back to the "general" pool
+	// since they don't have dedicated pool configurations.
+	const poolKey =
+		subagentType === "explore" || subagentType === "plan" || subagentType === "general"
+			? subagentType
+			: "general";
+	const allowedPool = settings.agent.subagentAllowedModels?.[poolKey] ?? [];
 	let resolvedModelInput: string | undefined;
 	if (allowedPool.length > 0) {
 		const poolSet = new Set(allowedPool);

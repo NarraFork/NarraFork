@@ -162,8 +162,12 @@ export interface NarraForkSettings {
 			explore: string;
 			plan: string;
 		};
-		/** Allowed model pool for subagents. Empty array = no restriction. */
-		subagentAllowedModels: string[];
+		/** Per-type allowed model pools for subagents. Empty array = no restriction. */
+		subagentAllowedModels: {
+			explore: string[];
+			plan: string[];
+			general: string[];
+		};
 		legacyEncoding: boolean;
 		/**
 		 * Per-model context window overrides (tokens).
@@ -301,7 +305,11 @@ const DEFAULTS: NarraForkSettings = {
 			explore: "",
 			plan: "",
 		},
-		subagentAllowedModels: [],
+		subagentAllowedModels: {
+			explore: [],
+			plan: [],
+			general: [],
+		},
 		legacyEncoding: false,
 		modelContextWindows: {},
 		translateReasoning: false,
@@ -476,6 +484,19 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// Clean up legacy openai field from settings.json
 	if (mergedAny.openai !== undefined) {
 		delete mergedAny.openai;
+		needsSave = true;
+	}
+
+	// Migrate subagentAllowedModels from flat string[] to per-type object.
+	// Old format: string[] — applied uniformly to all subagent types.
+	// New format: { explore: string[], plan: string[], general: string[] }
+	const rawPool = raw.agent?.subagentAllowedModels;
+	if (Array.isArray(rawPool)) {
+		merged.agent.subagentAllowedModels = {
+			explore: [...rawPool],
+			plan: [...rawPool],
+			general: [...rawPool],
+		};
 		needsSave = true;
 	}
 

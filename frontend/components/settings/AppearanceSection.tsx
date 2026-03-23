@@ -22,6 +22,8 @@ export interface AppearanceSectionProps {
 	setWakeLock: (v: boolean) => void;
 	advancedAnim: boolean;
 	setAdvancedAnim: (v: boolean) => void;
+	expandReasoning: boolean;
+	setExpandReasoning: (v: boolean) => void;
 }
 
 export function AppearanceSection({
@@ -35,6 +37,8 @@ export function AppearanceSection({
 	setWakeLock,
 	advancedAnim,
 	setAdvancedAnim,
+	expandReasoning,
+	setExpandReasoning,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -81,6 +85,12 @@ export function AppearanceSection({
 				description={t("advancedAnimationDesc")}
 				checked={advancedAnim}
 				onChange={(e) => setAdvancedAnim(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("expandReasoning")}
+				description={t("expandReasoningDesc")}
+				checked={expandReasoning}
+				onChange={(e) => setExpandReasoning(e.currentTarget.checked)}
 			/>
 
 			{/* Word Wrap */}

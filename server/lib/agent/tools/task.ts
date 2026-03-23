@@ -6,23 +6,28 @@ import type { ToolDefinition, ToolResult } from "../types";
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
 
-/** Build the model list shown to the AI, respecting the subagent allowed-model pool. */
+/** Build a dynamic model list string from all visible models. */
 function getAvailableModelsList(): string {
-	const pool = settings.agent.subagentAllowedModels ?? [];
-	const models = pool.length > 0 ? pool : getVisibleModels();
+	const models = getVisibleModels();
 	if (models.length > 0) {
 		return models.join(", ");
 	}
 	return "(no models configured yet)";
 }
 
-/** When a pool restriction is active, append a note to the model parameter description. */
+/** When per-type pool restrictions are active, append a note to the model parameter description. */
 function getSubagentPoolNote(): string {
-	const pool = settings.agent.subagentAllowedModels ?? [];
-	if (pool.length > 0) {
-		return "\n\nNote: Subagent model selection is restricted to the models listed above. Models outside this pool will be ignored.";
+	const pools = settings.agent.subagentAllowedModels;
+	if (!pools) return "";
+	const parts: string[] = [];
+	for (const type of ["explore", "plan", "general"] as const) {
+		const pool = pools[type];
+		if (pool && pool.length > 0) {
+			parts.push(`${type}: ${pool.join(", ")}`);
+		}
 	}
-	return "";
+	if (parts.length === 0) return "";
+	return `\n\nNote: Subagent model selection is restricted per type. Allowed models — ${parts.join("; ")}. Models outside the pool for a given type will be ignored.`;
 }
 
 function buildParameters() {
