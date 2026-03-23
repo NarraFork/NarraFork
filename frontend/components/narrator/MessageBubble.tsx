@@ -40,6 +40,8 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
+import { BlurInOnAppear } from "./BlurInOnAppear";
+import { getReasoningBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
@@ -1409,6 +1411,11 @@ export const MessageBubble = memo(function MessageBubble({
 						const iconColor = getCategoryColor("plan");
 						const reasoningText = typeof block.text === "string" ? block.text : "";
 						if (!reasoningText.trim()) return null;
+						const reasoningAnimationId = getReasoningBlurAnimationId({
+							messageId: message.id,
+							blockIndex: realIndex,
+							createdAt: message.createdAt,
+						});
 						return (
 							<ContentViewer
 								key={key}
@@ -1417,14 +1424,19 @@ export const MessageBubble = memo(function MessageBubble({
 								contentType="markdown"
 								blockIndex={realIndex}
 							>
-								<Paper withBorder radius="sm" p="xs">
-									<Group gap={6} wrap="nowrap" align="flex-start">
-										<ThemeIcon size={18} variant="light" color={iconColor} radius="sm" mt={1}>
-											<IconBrain size={12} />
-										</ThemeIcon>
-										<ReasoningSummary text={reasoningText} translatedText={block.translatedText} />
-									</Group>
-								</Paper>
+								<BlurInOnAppear animationId={reasoningAnimationId}>
+									<Paper withBorder radius="sm" p="xs">
+										<Group gap={6} wrap="nowrap" align="flex-start">
+											<ThemeIcon size={18} variant="light" color={iconColor} radius="sm" mt={1}>
+												<IconBrain size={12} />
+											</ThemeIcon>
+											<ReasoningSummary
+												text={reasoningText}
+												translatedText={block.translatedText}
+											/>
+										</Group>
+									</Paper>
+								</BlurInOnAppear>
 							</ContentViewer>
 						);
 					}

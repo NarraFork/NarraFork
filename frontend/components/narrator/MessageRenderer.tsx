@@ -1,6 +1,12 @@
 import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
 import { IconBrain } from "@tabler/icons-react";
 import { memo } from "react";
+import { BlurInOnAppear } from "./BlurInOnAppear";
+import {
+	getReasoningBlurAnimationId,
+	getToolCallBlurAnimationId,
+	getUserMessageBlurAnimationId,
+} from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
 import { MessageBubble, ReasoningSummary } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
@@ -41,6 +47,11 @@ export interface RenderToolRunOptions {
 	appendMessages?: NarratorMsg[];
 }
 
+export type RenderedTreeElementMeta =
+	| { kind: "regular" }
+	| { kind: "decorative" }
+	| { kind: "tool-run"; run: NarratorMsg[] };
+
 export function renderToolRun(
 	run: NarratorMsg[],
 	narratorId: string,
@@ -73,6 +84,8 @@ export function renderToolRun(
 
 	const taskCount = items.filter((it) => it.kind === "tool" && it.isSubagent).length;
 	const soleSubagent = taskCount === 1;
+	const wrapWithBlur = (animationId: string | null, node: React.ReactNode) =>
+		animationId ? <BlurInOnAppear animationId={animationId}>{node}</BlurInOnAppear> : node;
 
 	const renderItem = (item: FlatToolItem, idx: number, total: number) => {
 		const key =
@@ -103,6 +116,12 @@ export function renderToolRun(
 
 		if (item.kind === "reasoning") {
 			const iconColor = getCategoryColor("plan");
+			const reasoningAnimationId = getReasoningBlurAnimationId({
+				messageId: item.msg.id,
+				blockIndex: item.blockIndex,
+				createdAt: item.msg.createdAt,
+				fallbackKey: idx,
+			});
 			const header = (
 				<Group gap={5} wrap="nowrap" align="flex-start">
 					<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
@@ -113,74 +132,88 @@ export function renderToolRun(
 			);
 			return (
 				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-					<div id={`msg-${item.msg.id}`} style={hlStyle}>
-						<ContentViewer
-							content={item.reasoningText}
-							markdown
-							contentType="markdown"
-							blockIndex={item.blockIndex}
-						>
-							{total >= 2 ? (
-								<>
-									<Box p="xs">{header}</Box>
-									{idx !== total - 1 && (
-										<Divider color="var(--mantine-color-default-border)" size={1} />
-									)}
-								</>
-							) : (
-								<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
-									{header}
-								</Paper>
-							)}
-						</ContentViewer>
-					</div>
+					{wrapWithBlur(
+						reasoningAnimationId,
+						<div id={`msg-${item.msg.id}`} style={hlStyle}>
+							<ContentViewer
+								content={item.reasoningText}
+								markdown
+								contentType="markdown"
+								blockIndex={item.blockIndex}
+							>
+								{total >= 2 ? (
+									<>
+										<Box p="xs">{header}</Box>
+										{idx !== total - 1 && (
+											<Divider color="var(--mantine-color-default-border)" size={1} />
+										)}
+									</>
+								) : (
+									<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
+										{header}
+									</Paper>
+								)}
+							</ContentViewer>
+						</div>,
+					)}
 				</MessageContextMenuCtx.Provider>
 			);
 		}
 
+		const toolAnimationId = getToolCallBlurAnimationId({
+			toolUseId: item.tc.toolUseId,
+			messageId: item.msg.id,
+			fallbackKey: item.blockIndex ?? idx,
+		});
 		if (item.isSubagent) {
 			return (
 				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-					<div
-						id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-						style={hlStyle}
-					>
-						<SubagentCard
-							toolCall={item.tc}
-							childMessages={item.children ?? []}
-							narratorId={narratorId}
-							inRun={total >= 2}
-							isLast={idx === total - 1}
-							isSoleInRun={soleSubagent}
-							permCb={permCb}
-							editExpandOverride={editExpandOverride}
-							onBgAgentRetry={permCb?.onBgAgentRetry}
-							blockIndex={item.blockIndex}
-						/>
-					</div>
+					{wrapWithBlur(
+						toolAnimationId,
+						<div
+							id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
+							style={hlStyle}
+						>
+							<SubagentCard
+								toolCall={item.tc}
+								childMessages={item.children ?? []}
+								narratorId={narratorId}
+								inRun={total >= 2}
+								isLast={idx === total - 1}
+								isSoleInRun={soleSubagent}
+								permCb={permCb}
+								editExpandOverride={editExpandOverride}
+								onBgAgentRetry={permCb?.onBgAgentRetry}
+								blockIndex={item.blockIndex}
+							/>
+						</div>,
+					)}
 				</MessageContextMenuCtx.Provider>
 			);
 		}
 		return (
 			<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-				<div
-					id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-					style={hlStyle}
-				>
-					<ToolCallCard
-						toolCall={item.tc}
-						narratorId={narratorId}
-						inRun={total >= 2}
-						isLast={idx === total - 1}
-						pendingPermission={matchPermission(item.tc)}
-						onPermissionDecision={permCb.onPermissionDecision}
-						onQuestionSubmit={permCb.onQuestionSubmit}
-						onQuestionDeny={permCb.onQuestionDeny}
-						forceExpand={expandedToolUseId === item.tc.toolUseId}
-						editExpandOverride={editExpandOverride}
-						blockIndex={item.blockIndex}
-					/>
-				</div>
+				{wrapWithBlur(
+					toolAnimationId,
+					<div
+						id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
+						style={hlStyle}
+					>
+						<ToolCallCard
+							toolCall={item.tc}
+							narratorId={narratorId}
+							inRun={total >= 2}
+							isLast={idx === total - 1}
+							pendingPermission={matchPermission(item.tc)}
+							onPermissionDecision={permCb.onPermissionDecision}
+							onQuestionSubmit={permCb.onQuestionSubmit}
+							onQuestionDeny={permCb.onQuestionDeny}
+							forceExpand={expandedToolUseId === item.tc.toolUseId}
+							editExpandOverride={editExpandOverride}
+							blockIndex={item.blockIndex}
+						/>
+					</div>,
+				)}
 			</MessageContextMenuCtx.Provider>
 		);
 	};
@@ -403,12 +436,13 @@ export function renderTreeMessages(
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
 	lastUserMessageId?: string,
 	hasChapter?: boolean,
-): { elements: React.ReactNode[] } {
+): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[] } {
 	// Messages are already tree-structured from the backend (children nested).
 	// Group consecutive assistant messages with tool_use blocks into visual "runs".
 	// A message with text + tool_use renders its text first, then its tool calls
 	// merge forward with subsequent tool-bearing messages.
 	const elements: React.ReactNode[] = [];
+	const meta: RenderedTreeElementMeta[] = [];
 	let i = 0;
 
 	const renderRegularMessage = (
@@ -416,73 +450,84 @@ export function renderTreeMessages(
 		key: string,
 		domId = `msg-${targetMsg.id}`,
 		highlight = true,
-	) => (
-		<Box
-			key={key}
-			id={domId}
-			style={{
-				borderRadius: "var(--mantine-radius-md)",
-				animation:
-					highlight && highlightedId === targetMsg.id ? "highlight-blink 1.5s ease" : undefined,
-			}}
-		>
-			{showTokenUsage &&
-				targetMsg.role === "assistant" &&
-				(targetMsg.tokensIn != null || targetMsg.meterUsage != null) && (
-					<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-						{targetMsg.tokensIn != null
-							? `↑ ${(targetMsg.tokensIn as number).toLocaleString()}`
-							: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
-					</Text>
-				)}
-			<MessageBubble
-				narratorId={narratorId}
-				message={targetMsg}
-				onForkFromMessage={onForkFromMessage}
-				resolvePerm={(tc) =>
-					resolvePendingPerm(
-						tc,
-						permCb.pendingPermission,
-						permCb.pendingPermsMap,
-						permCb.overseerReviewMap,
-					)
-				}
-				onPermissionDecision={permCb.onPermissionDecision}
-				onQuestionSubmit={permCb.onQuestionSubmit}
-				onQuestionDeny={permCb.onQuestionDeny}
-				onCompactBeforeMessage={onCompactBeforeMessage}
-				onDeleteBlock={onDeleteBlock}
-				onRegenerateFromMessage={onRegenerateFromMessage}
-				onEditAndRegenerate={onEditAndRegenerate}
-				isLastUserMessage={targetMsg.id === lastUserMessageId}
-				hasChapter={hasChapter}
-			/>
-			{showTokenUsage &&
-				(targetMsg.turnUsageJson != null ||
-					(targetMsg.meterUsage != null && targetMsg.tokensIn == null)) && (
-					<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
-						{targetMsg.turnUsageJson != null ? (
-							<>
-								Σ{" "}
-								{(
-									(targetMsg.turnUsageJson as Record<string, number>).input_tokens ?? 0
-								).toLocaleString()}{" "}
-								in ·{" "}
-								{(
-									(targetMsg.turnUsageJson as Record<string, number>).output_tokens ?? 0
-								).toLocaleString()}{" "}
-								out
-								{targetMsg.costUsd != null &&
-									(targetMsg.costUsd as number) > 0 &&
-									` · $${(targetMsg.costUsd as number).toFixed(4)}`}
-							</>
-						) : (
-							`${(targetMsg.meterUsage as number).toFixed(2)} credits`
-						)}
-					</Text>
-				)}
-		</Box>
-	);
+	) => {
+		const content = (
+			<Box
+				key={key}
+				id={domId}
+				style={{
+					borderRadius: "var(--mantine-radius-md)",
+					animation:
+						highlight && highlightedId === targetMsg.id ? "highlight-blink 1.5s ease" : undefined,
+				}}
+			>
+				{showTokenUsage &&
+					targetMsg.role === "assistant" &&
+					(targetMsg.tokensIn != null || targetMsg.meterUsage != null) && (
+						<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
+							{targetMsg.tokensIn != null
+								? `↑ ${(targetMsg.tokensIn as number).toLocaleString()}`
+								: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
+						</Text>
+					)}
+				<MessageBubble
+					narratorId={narratorId}
+					message={targetMsg}
+					onForkFromMessage={onForkFromMessage}
+					resolvePerm={(tc) =>
+						resolvePendingPerm(
+							tc,
+							permCb.pendingPermission,
+							permCb.pendingPermsMap,
+							permCb.overseerReviewMap,
+						)
+					}
+					onPermissionDecision={permCb.onPermissionDecision}
+					onQuestionSubmit={permCb.onQuestionSubmit}
+					onQuestionDeny={permCb.onQuestionDeny}
+					onCompactBeforeMessage={onCompactBeforeMessage}
+					onDeleteBlock={onDeleteBlock}
+					onRegenerateFromMessage={onRegenerateFromMessage}
+					onEditAndRegenerate={onEditAndRegenerate}
+					isLastUserMessage={targetMsg.id === lastUserMessageId}
+					hasChapter={hasChapter}
+				/>
+				{showTokenUsage &&
+					(targetMsg.turnUsageJson != null ||
+						(targetMsg.meterUsage != null && targetMsg.tokensIn == null)) && (
+						<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
+							{targetMsg.turnUsageJson != null ? (
+								<>
+									Σ{" "}
+									{(
+										(targetMsg.turnUsageJson as Record<string, number>).input_tokens ?? 0
+									).toLocaleString()}{" "}
+									in ·{" "}
+									{(
+										(targetMsg.turnUsageJson as Record<string, number>).output_tokens ?? 0
+									).toLocaleString()}{" "}
+									out
+									{targetMsg.costUsd != null &&
+										(targetMsg.costUsd as number) > 0 &&
+										` · $${(targetMsg.costUsd as number).toFixed(4)}`}
+								</>
+							) : (
+								`${(targetMsg.meterUsage as number).toFixed(2)} credits`
+							)}
+						</Text>
+					)}
+			</Box>
+		);
+		const userAnimationId =
+			targetMsg.role === "user" ? getUserMessageBlurAnimationId(targetMsg.id) : null;
+		return userAnimationId ? (
+			<BlurInOnAppear key={key} animationId={userAnimationId}>
+				{content}
+			</BlurInOnAppear>
+		) : (
+			content
+		);
+	};
 
 	while (i < messages.length) {
 		const msg = messages[i];
@@ -561,6 +606,7 @@ export function renderTreeMessages(
 							/>
 						</Box>,
 					);
+					meta.push({ kind: "regular" });
 				}
 			}
 
@@ -643,7 +689,10 @@ export function renderTreeMessages(
 				onDeleteBlock,
 			});
 
-			if (el) elements.push(el);
+			if (el) {
+				elements.push(el);
+				meta.push({ kind: "tool-run", run });
+			}
 
 			// Insert prune divider if any message in this run is the boundary, unless
 			// the boundary is the attached tail message and we're about to render its content.
@@ -662,6 +711,7 @@ export function renderTreeMessages(
 						styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
 					/>,
 				);
+				meta.push({ kind: "decorative" });
 			}
 
 			if (trailingContentMsg) {
@@ -673,6 +723,7 @@ export function renderTreeMessages(
 						false,
 					),
 				);
+				meta.push({ kind: "regular" });
 				if (pruneBoundaryMessageId && trailingContentMsg.id === pruneBoundaryMessageId) {
 					elements.push(
 						<Divider
@@ -684,6 +735,7 @@ export function renderTreeMessages(
 							styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
 						/>,
 					);
+					meta.push({ kind: "decorative" });
 				}
 			}
 
@@ -692,6 +744,7 @@ export function renderTreeMessages(
 		}
 
 		elements.push(renderRegularMessage(msg, msg.id));
+		meta.push({ kind: "regular" });
 
 		// Insert prune divider after the boundary message
 		if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
@@ -705,12 +758,13 @@ export function renderTreeMessages(
 					styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
 				/>,
 			);
+			meta.push({ kind: "decorative" });
 		}
 
 		i++;
 	}
 
-	return { elements };
+	return { elements, meta };
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +776,9 @@ export function renderTreeMessagesWithKeys(...args: Parameters<typeof renderTree
 	elements: React.ReactNode[];
 	keys: string[];
 	targets: string[][];
+	meta: RenderedTreeElementMeta[];
 } {
-	const { elements } = renderTreeMessages(...args);
+	const { elements, meta } = renderTreeMessages(...args);
 	const keys: string[] = [];
 	for (const el of elements) {
 		// Extract the React key from each element
@@ -739,6 +794,7 @@ export function renderTreeMessagesWithKeys(...args: Parameters<typeof renderTree
 		elements,
 		keys,
 		targets: targets.length === elements.length ? targets : elements.map(() => []),
+		meta: meta.length === elements.length ? meta : elements.map(() => ({ kind: "regular" })),
 	};
 }
 

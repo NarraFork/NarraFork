@@ -26,6 +26,8 @@ export interface AgentSectionProps {
 	setLegacyEncoding: (v: boolean) => void;
 	translateReasoning: boolean;
 	setTranslateReasoning: (v: boolean) => void;
+	expandReasoning: boolean;
+	setExpandReasoning: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
 	smartInterruptionCheck: boolean;
@@ -128,6 +130,12 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("translateReasoningDesc")}
 				checked={props.translateReasoning}
 				onChange={(e) => props.setTranslateReasoning(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("expandReasoning")}
+				description={t("expandReasoningDesc")}
+				checked={props.expandReasoning}
+				onChange={(e) => props.setExpandReasoning(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("defaultRelaxedPlan")}

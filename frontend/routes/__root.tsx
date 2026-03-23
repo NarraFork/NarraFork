@@ -167,6 +167,7 @@ function AuthenticatedLayout() {
 	const { data: prefs } = useUserPreferences();
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
+	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
 	const computedScheme = useComputedColorScheme("dark");
@@ -256,6 +257,16 @@ function AuthenticatedLayout() {
 			html.removeAttribute("data-oled");
 		}
 	}, [oledMode]);
+
+	// Sync advanced animation data attribute on <html>
+	useEffect(() => {
+		const html = document.documentElement;
+		if (advancedAnim) {
+			html.setAttribute("data-advanced-anim", "true");
+		} else {
+			html.removeAttribute("data-advanced-anim");
+		}
+	}, [advancedAnim]);
 
 	// Sync theme-color meta tag with actual background color
 	useEffect(() => {

@@ -57,6 +57,7 @@ import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -102,12 +103,15 @@ import {
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { UserAvatar } from "../UserAvatar";
+import { BlurInOnAppearProvider } from "./BlurInOnAppear";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
+import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
+	type RenderedTreeElementMeta,
 	RenderProgress,
 	renderToolRun,
 	renderTreeMessagesWithKeys,
@@ -790,6 +794,13 @@ export function NarratorPanel({
 	const displayTitle = isOverseerNarrator
 		? `${tn("overseer")} #${narratorId}`
 		: narrator?.title || t("untitled");
+	// Resolve the effective model: when following default, use the actual default model value
+	const resolvedModel = useMemo(() => {
+		const m = narrator?.model;
+		if (!m || m === FOLLOW_DEFAULT_MODEL) return defaultModelValue;
+		return m;
+	}, [narrator?.model, defaultModelValue]);
+
 	const codexCapableProviders = useMemo(() => {
 		const providers = new Set<string>();
 		if (settingsData?.codexAvailable) providers.add("codex");
@@ -801,27 +812,27 @@ export function NarratorPanel({
 		return providers;
 	}, [settingsData]);
 	const supportsCodexControls = useMemo(() => {
-		const providerPrefix = narrator?.model?.split(":")[0];
+		const providerPrefix = resolvedModel?.split(":")[0];
 		return !!providerPrefix && codexCapableProviders.has(providerPrefix);
-	}, [codexCapableProviders, narrator?.model]);
+	}, [codexCapableProviders, resolvedModel]);
 
 	// Reasoning effort is supported by both Codex and Anthropic providers
 	const supportsReasoningEffort = useMemo(() => {
-		const providerPrefix = narrator?.model?.split(":")[0];
+		const providerPrefix = resolvedModel?.split(":")[0];
 		if (!providerPrefix) return false;
 		if (codexCapableProviders.has(providerPrefix)) return true;
 		// Check Anthropic providers
 		const anthropicProviders = settingsData?.anthropicProviders ?? [];
 		return anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
-	}, [codexCapableProviders, settingsData?.anthropicProviders, narrator?.model]);
+	}, [codexCapableProviders, settingsData?.anthropicProviders, resolvedModel]);
 	const reasoningEffortOptions = useMemo(() => {
-		if (!narrator?.model) return DEFAULT_REASONING_EFFORT_OPTIONS;
-		const providerPrefix = narrator.model.split(":")[0];
+		if (!resolvedModel) return DEFAULT_REASONING_EFFORT_OPTIONS;
+		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && codexCapableProviders.has(providerPrefix)) {
-			return getCodexReasoningEffortOptions(narrator.model);
+			return getCodexReasoningEffortOptions(resolvedModel);
 		}
 		return DEFAULT_REASONING_EFFORT_OPTIONS;
-	}, [codexCapableProviders, narrator?.model]);
+	}, [codexCapableProviders, resolvedModel]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1453,6 +1464,8 @@ export function NarratorPanel({
 		[clearHighlightTimers],
 	);
 
+	const stableToolRunKeyByTargetIdRef = useRef<Map<string, string>>(new Map());
+	const nextStableToolRunKeyRef = useRef(1);
 	const prevNarratorIdRef = useRef(narratorId);
 	if (prevNarratorIdRef.current !== narratorId) {
 		prevNarratorIdRef.current = narratorId;
@@ -1460,6 +1473,8 @@ export function NarratorPanel({
 			initialScrollDoneRef.current = false;
 			setInitialScrollDone(false);
 		}
+		stableToolRunKeyByTargetIdRef.current.clear();
+		nextStableToolRunKeyRef.current = 1;
 	}
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/highlightMessageId are used to reset one-shot highlight state when the active target changes
@@ -1470,6 +1485,31 @@ export function NarratorPanel({
 	}, [narratorId, highlightMessageId, clearHighlightTimers]);
 
 	useEffect(() => clearHighlightTimers, [clearHighlightTimers]);
+
+	const getStableRenderElementKey = useCallback(
+		(rawKey: string, targetIds: string[], pageKey?: string) => {
+			if (!rawKey.includes("tool-run-")) {
+				return pageKey ? `${pageKey}-${rawKey}` : rawKey;
+			}
+			if (targetIds.length === 0) {
+				return pageKey ? `${pageKey}-${rawKey}` : rawKey;
+			}
+
+			let stableKey: string | undefined;
+			for (const targetId of targetIds) {
+				stableKey = stableToolRunKeyByTargetIdRef.current.get(targetId);
+				if (stableKey) break;
+			}
+			if (!stableKey) {
+				stableKey = `tool-run-stable-${nextStableToolRunKeyRef.current++}`;
+			}
+			for (const targetId of targetIds) {
+				stableToolRunKeyByTargetIdRef.current.set(targetId, stableKey);
+			}
+			return stableKey;
+		},
+		[],
+	);
 
 	// Pre-render trim: on mount (key={narratorId} causes full remount on switch),
 	// if the incoming narrator already has too many cached pages from a previous
@@ -1565,19 +1605,41 @@ export function NarratorPanel({
 
 	// --- Flat elements for virtualization ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-	// Page-level cache: keyed by page reference → { elements, keys }.
+	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
+	const suppressBlurIn =
+		!advancedAnim || isResizing || !initialScrollDone || shifting || isFetchingPreviousPage;
+	const blurInSeedIds = useMemo(() => {
+		if (!advancedAnim || !suppressBlurIn || !messagesData?.pages?.length) return [];
+		const ids = new Set<string>();
+		for (const page of messagesData.pages) {
+			for (const animationId of collectBlurInAnimationIdsFromMessages(page.messages)) {
+				ids.add(animationId);
+			}
+		}
+		return [...ids];
+	}, [advancedAnim, suppressBlurIn, messagesData]);
+	// Page-level cache: keyed by page reference → rendered elements/keys/targets/meta.
 	// When a page object reference doesn't change, we reuse the cached result.
 	const pageCacheRef = useRef(
-		new WeakMap<object, { elements: React.ReactNode[]; keys: string[]; targets: string[][] }>(),
+		new WeakMap<
+			object,
+			{
+				elements: React.ReactNode[];
+				keys: string[];
+				targets: string[][];
+				meta: RenderedTreeElementMeta[];
+			}
+		>(),
 	);
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
-	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
+	const { flatElements, flatKeys, flatTargets, flatMeta } = useMemo(() => {
 		if (isResizing || !messagesData?.pages) {
 			return {
 				flatElements: [],
 				flatKeys: [],
 				flatTargets: [],
+				flatMeta: [],
 			};
 		}
 		const pages = messagesData.pages;
@@ -1589,6 +1651,7 @@ export function NarratorPanel({
 		const allElements: React.ReactNode[] = [];
 		const allKeys: string[] = [];
 		const allTargets: string[][] = [];
+		const allMeta: RenderedTreeElementMeta[] = [];
 
 		// Build a cache key object per page that includes all render-affecting props.
 		// We use the page reference as the primary cache key, but invalidate when
@@ -1618,9 +1681,11 @@ export function NarratorPanel({
 			const cached = cache.get(page);
 			if (cached && (cached as { _secondaryKey?: string })._secondaryKey === secondaryKey) {
 				for (let j = 0; j < cached.elements.length; j++) {
+					const targetIds = cached.targets[j] ?? [];
 					allElements.push(cached.elements[j]);
-					allKeys.push(`${pageKey}-${cached.keys[j]}`);
-					allTargets.push(cached.targets[j] ?? []);
+					allKeys.push(getStableRenderElementKey(cached.keys[j], targetIds, pageKey));
+					allTargets.push(targetIds);
+					allMeta.push(cached.meta[j] ?? { kind: "regular" });
 				}
 				continue;
 			}
@@ -1650,9 +1715,11 @@ export function NarratorPanel({
 			cache.set(page, entry);
 
 			for (let j = 0; j < result.elements.length; j++) {
+				const targetIds = result.targets[j] ?? [];
 				allElements.push(result.elements[j]);
-				allKeys.push(`${pageKey}-${result.keys[j]}`);
-				allTargets.push(result.targets[j] ?? []);
+				allKeys.push(getStableRenderElementKey(result.keys[j], targetIds, pageKey));
+				allTargets.push(targetIds);
+				allMeta.push(result.meta[j] ?? { kind: "regular" });
 			}
 		}
 
@@ -1660,6 +1727,7 @@ export function NarratorPanel({
 			flatElements: allElements,
 			flatKeys: allKeys,
 			flatTargets: allTargets,
+			flatMeta: allMeta,
 		};
 	}, [
 		isResizing,
@@ -1672,6 +1740,7 @@ export function NarratorPanel({
 		highlightedId,
 		highlightMessageId,
 		showTokenUsage,
+		getStableRenderElementKey,
 		handleDeleteBlock,
 		handleCompactBefore,
 		handleRegenerate,
@@ -1682,6 +1751,17 @@ export function NarratorPanel({
 		hasChapter,
 	]);
 
+	const standaloneStreamingReasoningCreatedAtRef = useRef<string | null>(null);
+	const hasStandaloneStreamingReasoning =
+		!streamingRef.current && !!streamingReasoningRef.current && !topLevelStreamingChunks;
+	if (hasStandaloneStreamingReasoning) {
+		if (!standaloneStreamingReasoningCreatedAtRef.current) {
+			standaloneStreamingReasoningCreatedAtRef.current = new Date().toISOString();
+		}
+	} else {
+		standaloneStreamingReasoningCreatedAtRef.current = null;
+	}
+
 	// Append streaming content (StreamingBubble + streaming tool chunks) to the
 	// virtualised element list so they participate in normal virtual scrolling
 	// instead of being rendered in a separate trailing slot.
@@ -1689,19 +1769,64 @@ export function NarratorPanel({
 		const els = [...flatElements];
 		const keys = [...flatKeys];
 		const targets = [...flatTargets];
+		const metas = [...flatMeta];
 
 		// Model output order is always: reasoning → text/web_search → tool_use.
-		// When there is a preceding tool-run, reasoning should always merge upward
-		// into it. Only render reasoning inside the StreamingBubble when there is
-		// no prior tool-run to absorb it.
+		// Standalone streaming reasoning stays isolated so a new turn cannot
+		// temporarily render inside the previous persisted tool run. Streaming tool
+		// chunks may merge upward only when they clearly target the same run.
 		void streamingVersion;
 		const hasStreamingText = !!streamingRef.current || !!webSearchRef.current;
 		const hasStreamingReasoning = !!streamingReasoningRef.current;
 		const hasStreamingToolChunks = !!topLevelStreamingChunks;
 
+		const trailingToolRunIndex =
+			metas.length > 0 && metas[metas.length - 1]?.kind === "tool-run" ? metas.length - 1 : -1;
 		const reasoningInBubble = hasStreamingReasoning && hasStreamingText;
 		const renderStandaloneReasoningRun =
 			hasStreamingReasoning && !reasoningInBubble && !hasStreamingToolChunks;
+		const streamingToolTargetIds = (() => {
+			if (!topLevelStreamingChunks) return [] as string[];
+			const ids = new Set<string>();
+			for (const tc of topLevelStreamingChunks.toolCalls ?? []) {
+				if (tc.toolUseId) ids.add(tc.toolUseId);
+			}
+			for (const block of Array.isArray(topLevelStreamingChunks.contentJson)
+				? topLevelStreamingChunks.contentJson
+				: []) {
+				if (block.type === "tool_use" && typeof block.id === "string" && block.id.length > 0) {
+					ids.add(block.id);
+				}
+			}
+			return [...ids];
+		})();
+		const mergeIntoTrailingToolRun = (appendMessages: NarratorMsg[], extraTargetIds: string[]) => {
+			if (hasStreamingText || trailingToolRunIndex === -1 || appendMessages.length === 0)
+				return false;
+			if (extraTargetIds.length === 0) return false;
+			const trailingMeta = metas[trailingToolRunIndex];
+			if (!trailingMeta || trailingMeta.kind !== "tool-run") return false;
+			const trailingTargetIds = new Set(targets[trailingToolRunIndex] ?? []);
+			const sharesCurrentTurnTarget = extraTargetIds.some((targetId) =>
+				trailingTargetIds.has(targetId),
+			);
+			if (!sharesCurrentTurnTarget) return false;
+			const mergedEl = renderToolRun(trailingMeta.run, narratorId, renderPermCb, {
+				expandedToolUseId,
+				highlightedId,
+				editExpandOverride,
+				onForkFromMessage: forkHandler,
+				onCompactBeforeMessage: handleCompactBefore,
+				onDeleteBlock: handleDeleteBlock,
+				appendMessages,
+			});
+			if (!mergedEl) return false;
+			els[trailingToolRunIndex] = mergedEl;
+			targets[trailingToolRunIndex] = [
+				...new Set([...(targets[trailingToolRunIndex] ?? []), ...extraTargetIds]),
+			];
+			return true;
+		};
 
 		if (hasStreamingText) {
 			els.push(
@@ -1719,8 +1844,8 @@ export function NarratorPanel({
 		}
 
 		// Render streaming reasoning as its own transient run until the same turn
-		// emits text or tool chunks. This avoids leaking reasoning into the
-		// previous turn's tool run when the current turn starts with reasoning.
+		// emits text or tool chunks. Do not merge it into the previous persisted
+		// tool run, otherwise a new turn can temporarily appear under the wrong run.
 		if (renderStandaloneReasoningRun) {
 			const reasoningMsg = {
 				id: STREAMING_CHUNKS_MSG_ID,
@@ -1730,20 +1855,25 @@ export function NarratorPanel({
 				contentJson: [{ type: "reasoning", text: streamingReasoningRef.current }],
 				contentText: null,
 				toolCalls: [],
-				createdAt: new Date().toISOString(),
+				createdAt: standaloneStreamingReasoningCreatedAtRef.current ?? new Date().toISOString(),
 				children: [],
 			};
+			const reasoningTargetIds = standaloneStreamingReasoningCreatedAtRef.current
+				? [`reasoning-stream:${standaloneStreamingReasoningCreatedAtRef.current}`]
+				: [];
 			const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb);
 			if (toolEl) {
 				els.push(toolEl);
-				keys.push("__streaming_tool_chunks__");
-				targets.push([]);
+				keys.push(
+					getStableRenderElementKey("tool-run-__streaming_reasoning__", reasoningTargetIds),
+				);
+				targets.push(reasoningTargetIds);
 			}
 		}
 
-		// Streaming tool chunks always belong to the current turn. Keep them in a
-		// standalone synthetic run and prepend the current turn's reasoning when no
-		// streaming text bubble is rendering it already.
+		// Streaming tool chunks always belong to the current turn. If the latest
+		// rendered item is already a tool-run, append them into that run; otherwise
+		// keep them as a standalone synthetic run.
 		if (topLevelStreamingChunks) {
 			let chunksToRender = topLevelStreamingChunks;
 			if (hasStreamingReasoning && !reasoningInBubble) {
@@ -1758,11 +1888,15 @@ export function NarratorPanel({
 				};
 			}
 
-			const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
-			if (toolEl) {
-				els.push(toolEl);
-				keys.push("__streaming_tool_chunks__");
-				targets.push([]);
+			if (!mergeIntoTrailingToolRun([chunksToRender], streamingToolTargetIds)) {
+				const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
+				if (toolEl) {
+					els.push(toolEl);
+					keys.push(
+						getStableRenderElementKey("tool-run-__streaming_tool_chunks__", streamingToolTargetIds),
+					);
+					targets.push(streamingToolTargetIds);
+				}
 			}
 		}
 
@@ -1771,10 +1905,18 @@ export function NarratorPanel({
 		flatElements,
 		flatKeys,
 		flatTargets,
+		flatMeta,
 		streamingVersion,
 		topLevelStreamingChunks,
 		narratorId,
 		renderPermCb,
+		forkHandler,
+		highlightedId,
+		expandedToolUseId,
+		editExpandOverride,
+		handleCompactBefore,
+		handleDeleteBlock,
+		getStableRenderElementKey,
 		streamingRef,
 		streamingReasoningRef,
 		webSearchRef,
@@ -2842,14 +2984,31 @@ export function NarratorPanel({
 					<Box h="100%" style={{ position: "relative" }}>
 						<MessageSelectionCtx.Provider value={selectionCtxValue}>
 							<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-								<BroadMessageList
-									ref={virtualListRef}
-									elements={finalElements}
-									elementKeys={finalKeys}
-									scrollRef={viewportCallbackRef}
-									contentRef={contentRef}
-									shift={shifting}
-								/>
+								{advancedAnim ? (
+									<BlurInOnAppearProvider
+										scopeKey={narratorId}
+										suppress={suppressBlurIn}
+										seedIds={blurInSeedIds}
+									>
+										<BroadMessageList
+											ref={virtualListRef}
+											elements={finalElements}
+											elementKeys={finalKeys}
+											scrollRef={viewportCallbackRef}
+											contentRef={contentRef}
+											shift={shifting}
+										/>
+									</BlurInOnAppearProvider>
+								) : (
+									<BroadMessageList
+										ref={virtualListRef}
+										elements={finalElements}
+										elementKeys={finalKeys}
+										scrollRef={viewportCallbackRef}
+										contentRef={contentRef}
+										shift={shifting}
+									/>
+								)}
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>
 					</Box>

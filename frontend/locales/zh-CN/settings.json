@@ -269,7 +269,7 @@
 	"wakeLock": "屏幕常亮",
 	"wakeLockDesc": "NarraFork 打开时阻止屏幕变暗或锁定",
 	"advancedAnimation": "高级动画",
-	"advancedAnimationDesc": "预留给未来的叙述者动画效果；当前不会产生可见效果",
+	"advancedAnimationDesc": "为新出现的用户消息、工具调用卡片和推理卡片启用 blur-in 动画",
 	"expandReasoning": "默认展开推理内容",
 	"expandReasoningDesc": "自动展开叙述者消息中的推理/思考块，而不是默认折叠显示",
 	"pwaSection": "应用更新",
