@@ -265,6 +265,8 @@
 	"ignoreSafeAreaDesc": "隐藏系统状态栏，应用占满整个屏幕。关闭后显示状态栏。",
 	"wakeLock": "屏幕常亮",
 	"wakeLockDesc": "NarraFork 打开时阻止屏幕变暗或锁定",
+	"advancedAnimation": "高级动画",
+	"advancedAnimationDesc": "为叙述者对话中的新消息和流式文本启用模糊渐入动画效果",
 	"pwaSection": "应用更新",
 	"pwaForceUpdate": "刷新缓存",
 	"pwaForceUpdateDesc": "刷新 PWA 缓存并重新加载页面。注意：此操作不会检查后端服务器更新，仅用于刷新前端缓存。",

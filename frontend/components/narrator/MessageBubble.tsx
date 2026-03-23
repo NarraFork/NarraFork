@@ -1407,6 +1407,7 @@ export const MessageBubble = memo(function MessageBubble({
 					if (block.type === "reasoning") {
 						const iconColor = getCategoryColor("plan");
 						const reasoningText = typeof block.text === "string" ? block.text : "";
+						if (!reasoningText.trim()) return null;
 						return (
 							<ContentViewer
 								key={key}

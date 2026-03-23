@@ -4073,7 +4073,18 @@ export async function continueNarrator(
 	if (!hasTrailingToolUse) {
 		// No pending tool calls — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
-		await feedMessage(narratorId, continueText, undefined, locale, replyInUserLanguage);
+		const { userMsg } = await feedMessage(
+			narratorId,
+			continueText,
+			undefined,
+			locale,
+			replyInUserLanguage,
+		);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: userMsg,
+		});
 		return { ok: true };
 	}
 

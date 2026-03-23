@@ -149,6 +149,9 @@ function SettingsPage() {
 	// Wake lock (local-only)
 	const [wakeLock, setWakeLock] = useLocalPref("narrafork_wakelock");
 
+	// Advanced animation (local-only)
+	const [advancedAnim, setAdvancedAnim] = useLocalPref("narrafork_advanced_anim");
+
 	// PWA cache refresh
 	const [pwaUpdating, setPwaUpdating] = useState(false);
 
@@ -724,6 +727,8 @@ function SettingsPage() {
 							setIsFullscreen={setIsFullscreen}
 							wakeLock={wakeLock}
 							setWakeLock={setWakeLock}
+							advancedAnim={advancedAnim}
+							setAdvancedAnim={setAdvancedAnim}
 						/>
 					</Accordion.Panel>
 				</Accordion.Item>

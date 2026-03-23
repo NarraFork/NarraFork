@@ -57,6 +57,7 @@ import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -807,6 +808,7 @@ export function NarratorPanel({
 	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const { visibleWithDefault: allModels, defaultModelValue, settingsData } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
+	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
 	const contentViewerEnvironment = useMemo(
@@ -1744,30 +1746,14 @@ export function NarratorPanel({
 		const keys = [...flatKeys];
 		const targets = [...flatTargets];
 
-		// Model output order is always: reasoning → text → tool_use.
-		// Reasoning always renders in a tool-run container (brain-icon collapsible card).
-		// StreamingBubble is only for text / web-search content.
+		// Model output order is always: reasoning → text/web_search → tool_use.
+		// When there is a preceding tool-run, reasoning should always merge upward
+		// into it. Only render reasoning inside the StreamingBubble when there is
+		// no prior tool-run to absorb it.
 		void streamingVersion;
 		const hasStreamingText = !!streamingRef.current || !!webSearchRef.current;
 		const hasStreamingReasoning = !!streamingReasoningRef.current;
-		if (hasStreamingText) {
-			els.push(
-				<StreamingBubble
-					narratorId={narratorId}
-					streamingRef={streamingRef}
-					streamingReasoningRef={undefined}
-					webSearchRef={webSearchRef}
-					version={streamingVersion}
-				/>,
-			);
-			keys.push("__streaming_bubble__");
-			targets.push([]);
-		}
-
-		// Reasoning always merges upward into the preceding tool-run (it precedes
-		// text/tool in the model output, so visually it belongs with the previous
-		// tool-run container). Tool chunks merge downward only when there is no
-		// streaming text in between.
+		const hasStreamingToolChunks = !!topLevelStreamingChunks;
 
 		// Helper: find the last tool-run element index
 		const findLastToolRunIdx = () => {
@@ -1777,8 +1763,33 @@ export function NarratorPanel({
 			return -1;
 		};
 
-		// 1) Streaming reasoning — always try to merge upward into preceding tool-run
-		if (hasStreamingReasoning && !topLevelStreamingChunks) {
+		const lastToolRunIdx = findLastToolRunIdx();
+		const lastToolRunExists = lastToolRunIdx >= 0 && lastToolRunMsgs && lastToolRunMsgs.length > 0;
+		const reasoningInBubble = hasStreamingReasoning && hasStreamingText && !lastToolRunExists;
+		const mergeReasoningUpward = hasStreamingReasoning && !reasoningInBubble && lastToolRunExists;
+		const renderStandaloneReasoningRun =
+			hasStreamingReasoning && !reasoningInBubble && !hasStreamingToolChunks && !lastToolRunExists;
+
+		if (hasStreamingText) {
+			els.push(
+				<StreamingBubble
+					narratorId={narratorId}
+					streamingRef={streamingRef}
+					streamingReasoningRef={streamingReasoningRef}
+					includeReasoning={reasoningInBubble}
+					advancedAnim={advancedAnim}
+					webSearchRef={webSearchRef}
+					version={streamingVersion}
+				/>,
+			);
+			keys.push("__streaming_bubble__");
+			targets.push([]);
+		}
+
+		// 1) Streaming reasoning — always merge upward when there is a preceding
+		//    tool-run. Otherwise, when there are no tool chunks yet, render it as a
+		//    standalone tool-run container.
+		if (mergeReasoningUpward || renderStandaloneReasoningRun) {
 			const reasoningMsg = {
 				id: STREAMING_CHUNKS_MSG_ID,
 				narratorId,
@@ -1790,15 +1801,19 @@ export function NarratorPanel({
 				createdAt: new Date().toISOString(),
 				children: [],
 			};
-			const toolRunIdx = findLastToolRunIdx();
-			if (toolRunIdx >= 0 && lastToolRunMsgs && lastToolRunMsgs.length > 0) {
-				const prevTargets = targets[toolRunIdx] ?? [];
+			if (
+				mergeReasoningUpward &&
+				lastToolRunIdx >= 0 &&
+				lastToolRunMsgs &&
+				lastToolRunMsgs.length > 0
+			) {
+				const prevTargets = targets[lastToolRunIdx] ?? [];
 				const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
 					appendMessages: [reasoningMsg],
 				});
 				if (mergedEl) {
-					els[toolRunIdx] = mergedEl;
-					targets[toolRunIdx] = prevTargets;
+					els[lastToolRunIdx] = mergedEl;
+					targets[lastToolRunIdx] = prevTargets;
 				}
 			} else {
 				const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb);
@@ -1810,10 +1825,11 @@ export function NarratorPanel({
 			}
 		}
 
-		// 2) Streaming tool chunks (with optional reasoning prepended)
+		// 2) Streaming tool chunks (prepend reasoning only when it was not already
+		//    absorbed upward into a preceding tool-run)
 		if (topLevelStreamingChunks) {
 			let chunksToRender = topLevelStreamingChunks;
-			if (hasStreamingReasoning) {
+			if (hasStreamingReasoning && !reasoningInBubble && !mergeReasoningUpward) {
 				chunksToRender = {
 					...topLevelStreamingChunks,
 					contentJson: [
@@ -1869,6 +1885,7 @@ export function NarratorPanel({
 		streamingRef,
 		streamingReasoningRef,
 		webSearchRef,
+		advancedAnim,
 	]);
 
 	const targetIndexMap = useMemo(() => {
@@ -2940,6 +2957,7 @@ export function NarratorPanel({
 									scrollRef={viewportCallbackRef}
 									contentRef={contentRef}
 									shift={shifting}
+									advancedAnim={advancedAnim}
 								/>
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>

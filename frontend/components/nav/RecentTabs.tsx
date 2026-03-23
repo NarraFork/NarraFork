@@ -50,6 +50,7 @@ import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
 import {
 	addRecentTab,
+	RECENT_TABS_QUERY_KEY,
 	type RecentTab,
 	type RecentTabViewer,
 	useRecentTabs,
@@ -459,6 +460,21 @@ export function RecentTabList({
 			// Determine the range of indices of the target (over) group.
 			const [overStart, overEnd] = getWorkspaceGroupRange(newSortIdx);
 
+			// Helper: synchronously reorder query data BEFORE moveTab (whose onMutate
+			// is async due to cancelQueries).  dnd-kit's drop animation reads the DOM
+			// on the next frame, so the list must already reflect the new order.
+			const reorderSync = (key: string, toIndex: number) => {
+				qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (prev) => {
+					if (!prev) return prev;
+					const idx = prev.findIndex((t) => `${t.type}:${t.id}` === key);
+					if (idx === -1) return prev;
+					const next = [...prev];
+					const [moved] = next.splice(idx, 1);
+					next.splice(Math.min(toIndex, next.length), 0, moved);
+					return next;
+				});
+			};
+
 			// If the active item is a workspace header, move the whole group.
 			// If the active item is a workspace child, move only the child.
 			if (activeTab.type === "workspace") {
@@ -485,6 +501,8 @@ export function RecentTabList({
 					insertIdx = overGlobalIdx;
 				}
 
+				// Sync reorder so dnd-kit sees the new order immediately
+				reorderSync(tabSortId(activeTab), insertIdx);
 				// Move the header tab — children follow implicitly via backend ordering by workspaceId.
 				moveTab(tabSortId(activeTab), { toIndex: insertIdx });
 			} else {
@@ -493,10 +511,12 @@ export function RecentTabList({
 				if (!targetTab) return;
 				const globalIndex = tabs.findIndex((t) => tabSortId(t) === tabSortId(targetTab));
 				if (globalIndex === -1) return;
+				// Sync reorder so dnd-kit sees the new order immediately
+				reorderSync(active.id as string, globalIndex);
 				moveTab(active.id as string, { toIndex: globalIndex });
 			}
 		},
-		[sortItems, tabs, moveTab, getWorkspaceGroupRange],
+		[sortItems, tabs, moveTab, getWorkspaceGroupRange, qc],
 	);
 
 	/** Release all child tabs from a workspace and delete the workspace entity. */
@@ -656,6 +676,13 @@ export function RecentTabList({
 					{sortItems.map((tab, sortIdx) => {
 						const isHeader = !tab.workspaceId;
 						const isDraggingThis = tabSortId(tab) === draggingTabId;
+						// When a workspace header is being dragged, hide its children too
+						// (the overlay already renders them).
+						const isChildOfDraggingWs =
+							!isHeader &&
+							tab.workspaceId &&
+							draggingTab?.type === "workspace" &&
+							tab.workspaceId === draggingTab.id;
 
 						// Workspace children use a compact sortable component.
 						if (!isHeader) {
@@ -669,7 +696,7 @@ export function RecentTabList({
 									}
 									onNavigate={onNavigate}
 									onContextMenu={handleContextMenu}
-									dimmed={isDraggingThis}
+									dimmed={isDraggingThis || !!isChildOfDraggingWs}
 								/>
 							);
 						}
@@ -694,15 +721,19 @@ export function RecentTabList({
 						);
 					})}
 				</SortableContext>
-				{/* Floating overlay while dragging a workspace header — shows the whole group. */}
+				{/* Floating overlay while dragging — workspace shows the whole group, others show a single tab. */}
 				<DragOverlay>
-					{draggingTab && draggingTab.type === "workspace" ? (
-						<Box style={{ opacity: 0.9 }}>
-							<DragOverlayWorkspaceItem
-								tab={draggingTab}
-								wsChildren={childrenByWorkspace.get(draggingTab.id) ?? []}
-							/>
-						</Box>
+					{draggingTab ? (
+						draggingTab.type === "workspace" ? (
+							<Box style={{ opacity: 0.9 }}>
+								<DragOverlayWorkspaceItem
+									tab={draggingTab}
+									wsChildren={childrenByWorkspace.get(draggingTab.id) ?? []}
+								/>
+							</Box>
+						) : (
+							<DragOverlayTabItem tab={draggingTab} active={isTabActive(draggingTab, pathname)} />
+						)
 					) : null}
 				</DragOverlay>
 			</DndContext>
@@ -828,7 +859,13 @@ function SortableWorkspaceChildTab({
 	const sortStyle: React.CSSProperties = {
 		transform: CSS.Transform.toString(transform),
 		transition,
-		opacity: isDragging ? 0 : dimmed ? 0.3 : 1,
+		// isDragging: keep layout space so dnd-kit can compute drop positions;
+		// dimmed (workspace children following header drag): collapse to hide.
+		...(dimmed
+			? { opacity: 0, height: 0, overflow: "hidden", margin: 0, padding: 0 }
+			: isDragging
+				? { opacity: 0 }
+				: { opacity: 1 }),
 	};
 
 	return (
@@ -895,7 +932,10 @@ function DragOverlayWorkspaceItem({
 				label={<Text size="sm">{tab.title}</Text>}
 				leftSection={<IconColumns size={16} />}
 				styles={{
-					root: { cursor: "grabbing", background: "var(--mantine-color-dark-7)" },
+					root: {
+						cursor: "grabbing",
+						background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
+					},
 				}}
 			/>
 			{wsChildren.map((child) => (
@@ -906,6 +946,70 @@ function DragOverlayWorkspaceItem({
 					onContextMenu={() => {}}
 				/>
 			))}
+		</Box>
+	);
+}
+
+/** Rendered in DragOverlay while a non-workspace tab is being dragged. */
+function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
+	const { t } = useTranslation("common");
+	const iconColor = tab.status
+		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		: undefined;
+	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+
+	return (
+		<Box style={{ opacity: 0.9, boxShadow: "0 8px 24px rgba(0,0,0,0.4)", borderRadius: 8 }}>
+			<NavLink
+				active={active}
+				label={
+					<Text size="sm" truncate>
+						{tab.title}
+					</Text>
+				}
+				description={
+					<>
+						{tab.subtitle && (
+							<Text
+								size="xs"
+								c="dimmed"
+								truncate
+								style={{
+									direction: tab.type === "narrator" ? "rtl" : undefined,
+									textAlign: "left",
+								}}
+							>
+								{tab.subtitle}
+							</Text>
+						)}
+						{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
+					</>
+				}
+				leftSection={
+					tab.type === "project" ? (
+						<IconFolder size={16} />
+					) : tab.type === "chapter" ? (
+						<IconGitBranch
+							size={16}
+							color={iconColor}
+							fill={filledStatus ? "currentColor" : "none"}
+						/>
+					) : filledStatus ? (
+						<IconMessageCircleFilled size={16} color={iconColor} />
+					) : (
+						<IconMessageCircle size={16} color={iconColor} />
+					)
+				}
+				styles={{
+					root: {
+						cursor: "grabbing",
+						...(!active && {
+							background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
+						}),
+					},
+					label: { overflow: "hidden" },
+				}}
+			/>
 		</Box>
 	);
 }

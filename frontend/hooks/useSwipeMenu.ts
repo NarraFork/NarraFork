@@ -131,6 +131,11 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		const onTouchStart = (e: TouchEvent) => {
 			if (matchesExclude(e.target as HTMLElement)) return;
 
+			// Don't initiate swipe when text is selected — let the user interact
+			// with the native selection handles / copy menu instead.
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+
 			const curClose = getGlobalCloseSwipe();
 			const curAnchor = getGlobalSwipeAnchor();
 

@@ -20,6 +20,8 @@ export interface AppearanceSectionProps {
 	setIsFullscreen: (v: boolean) => void;
 	wakeLock: boolean;
 	setWakeLock: (v: boolean) => void;
+	advancedAnim: boolean;
+	setAdvancedAnim: (v: boolean) => void;
 }
 
 export function AppearanceSection({
@@ -31,6 +33,8 @@ export function AppearanceSection({
 	setIsFullscreen,
 	wakeLock,
 	setWakeLock,
+	advancedAnim,
+	setAdvancedAnim,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -71,6 +75,12 @@ export function AppearanceSection({
 				description={t("wakeLockDesc")}
 				checked={wakeLock}
 				onChange={(e) => setWakeLock(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("advancedAnimation")}
+				description={t("advancedAnimationDesc")}
+				checked={advancedAnim}
+				onChange={(e) => setAdvancedAnim(e.currentTarget.checked)}
 			/>
 
 			{/* Word Wrap */}

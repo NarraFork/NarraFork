@@ -1,0 +1,40 @@
+/*
+ * Advanced blur-in animation
+ * Applied when [data-advanced-anim] or .blur-anim-active is present.
+ * New DOM elements play the animation on mount; existing ones are unaffected
+ * because CSS animations only trigger once per element lifecycle.
+ */
+
+@keyframes nf-blur-in {
+	from {
+		filter: blur(8px);
+		opacity: 0;
+	}
+	to {
+		filter: blur(0);
+		opacity: 1;
+	}
+}
+
+/* Message list item-level entrance */
+.blur-anim-item {
+	animation: nf-blur-in 350ms ease-out both;
+}
+
+/* Streaming text: block-level elements inside MarkdownContent */
+.blur-anim-active p,
+.blur-anim-active h1,
+.blur-anim-active h2,
+.blur-anim-active h3,
+.blur-anim-active h4,
+.blur-anim-active h5,
+.blur-anim-active h6,
+.blur-anim-active pre,
+.blur-anim-active ul,
+.blur-anim-active ol,
+.blur-anim-active blockquote,
+.blur-anim-active table,
+.blur-anim-active hr,
+.blur-anim-active [data-tool-run] {
+	animation: nf-blur-in 350ms ease-out both;
+}

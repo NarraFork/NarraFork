@@ -785,12 +785,16 @@ export const StreamingBubble = memo(
 		narratorId,
 		streamingRef,
 		streamingReasoningRef,
+		includeReasoning,
+		advancedAnim,
 		webSearchRef,
 		version,
 	}: {
 		narratorId: string;
 		streamingRef: React.RefObject<string>;
 		streamingReasoningRef?: React.RefObject<string>;
+		includeReasoning?: boolean;
+		advancedAnim?: boolean;
 		webSearchRef?: React.RefObject<{
 			id: string;
 			status: "in_progress" | "searching" | "completed";
@@ -802,7 +806,7 @@ export const StreamingBubble = memo(
 		// which picks up the latest accumulated text without an extra useEffect cycle.
 		void version;
 		const text = streamingRef.current;
-		const reasoning = streamingReasoningRef?.current;
+		const reasoning = includeReasoning ? streamingReasoningRef?.current : undefined;
 		const webSearch = webSearchRef?.current;
 		if (!text && !reasoning && !webSearch) return null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic block shapes
@@ -817,7 +821,7 @@ export const StreamingBubble = memo(
 		}
 		if (reasoning) blocks.push({ type: "reasoning", text: reasoning });
 		if (text) blocks.push({ type: "text", text });
-		return (
+		const bubble = (
 			<MessageBubble
 				narratorId={narratorId}
 				message={{
@@ -826,6 +830,11 @@ export const StreamingBubble = memo(
 				}}
 			/>
 		);
+		return advancedAnim ? <div className="blur-anim-active">{bubble}</div> : bubble;
 	},
-	(prev, next) => prev.version === next.version,
+	(prev, next) =>
+		prev.version === next.version &&
+		prev.includeReasoning === next.includeReasoning &&
+		prev.advancedAnim === next.advancedAnim &&
+		prev.narratorId === next.narratorId,
 );
