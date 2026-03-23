@@ -341,9 +341,6 @@ export function RecentTabList({
 
 	// Drag state: the tab currently being dragged (for workspace, tracks the whole group)
 	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
-	// When dragging a workspace header, the total height of header + children
-	// so the header placeholder can maintain the full group height.
-	const [wsGroupHeight, setWsGroupHeight] = useState<number | null>(null);
 
 	const filtered = useMemo(
 		() =>
@@ -426,20 +423,6 @@ export function RecentTabList({
 			const tab = sortItems.find((t) => tabSortId(t) === event.active.id);
 			if (!tab) return;
 
-			// Measure workspace group height so the header placeholder can match
-			if (tab.type === "workspace") {
-				const children = childrenByWorkspace.get(tab.id) ?? [];
-				const ids = [tabSortId(tab), ...children.map(tabSortId)];
-				let total = 0;
-				for (const id of ids) {
-					const el = document.querySelector(`[data-tab-sort-id="${globalThis.CSS.escape(id)}"]`);
-					if (el) total += (el as HTMLElement).offsetHeight;
-				}
-				setWsGroupHeight(total > 0 ? total : null);
-			} else {
-				setWsGroupHeight(null);
-			}
-
 			const nId = tab.type === "narrator" ? tab.id : tab.type === "chapter" ? tab.narratorId : null;
 			if (!nId) return;
 			const me = event.activatorEvent as MouseEvent | TouchEvent;
@@ -447,7 +430,7 @@ export function RecentTabList({
 			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
 			startNarratorDragManual(nId, tab.title, x, y);
 		},
-		[sortItems, childrenByWorkspace],
+		[sortItems],
 	);
 
 	const handleDragMove = useCallback((event: DragMoveEvent) => {
@@ -461,7 +444,6 @@ export function RecentTabList({
 		(event: DragEndEvent) => {
 			justDragged = true;
 			setDraggingTabId(null);
-			setWsGroupHeight(null);
 			// End global narrator drag first — workspace drop handlers run synchronously
 			endNarratorDrag();
 
@@ -478,21 +460,6 @@ export function RecentTabList({
 
 			// Determine the range of indices of the target (over) group.
 			const [overStart, overEnd] = getWorkspaceGroupRange(newSortIdx);
-
-			// Helper: synchronously reorder query data BEFORE moveTab (whose onMutate
-			// is async due to cancelQueries).  dnd-kit's drop animation reads the DOM
-			// on the next frame, so the list must already reflect the new order.
-			const reorderSync = (key: string, toIndex: number) => {
-				qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (prev) => {
-					if (!prev) return prev;
-					const idx = prev.findIndex((t) => `${t.type}:${t.id}` === key);
-					if (idx === -1) return prev;
-					const next = [...prev];
-					const [moved] = next.splice(idx, 1);
-					next.splice(Math.min(toIndex, next.length), 0, moved);
-					return next;
-				});
-			};
 
 			// If the active item is a workspace header, move the whole group.
 			// If the active item is a workspace child, move only the child.
@@ -520,8 +487,6 @@ export function RecentTabList({
 					insertIdx = overGlobalIdx;
 				}
 
-				// Sync reorder so dnd-kit sees the new order immediately
-				reorderSync(tabSortId(activeTab), insertIdx);
 				// Move the header tab — children follow implicitly via backend ordering by workspaceId.
 				moveTab(tabSortId(activeTab), { toIndex: insertIdx });
 			} else {
@@ -530,12 +495,10 @@ export function RecentTabList({
 				if (!targetTab) return;
 				const globalIndex = tabs.findIndex((t) => tabSortId(t) === tabSortId(targetTab));
 				if (globalIndex === -1) return;
-				// Sync reorder so dnd-kit sees the new order immediately
-				reorderSync(active.id as string, globalIndex);
 				moveTab(active.id as string, { toIndex: globalIndex });
 			}
 		},
-		[sortItems, tabs, moveTab, getWorkspaceGroupRange, qc],
+		[sortItems, tabs, moveTab, getWorkspaceGroupRange],
 	);
 
 	/** Release all child tabs from a workspace and delete the workspace entity. */
@@ -623,7 +586,6 @@ export function RecentTabList({
 	const handleDragCancel = useCallback(() => {
 		endNarratorDrag();
 		setDraggingTabId(null);
-		setWsGroupHeight(null);
 	}, []);
 
 	const handleWsAddClick = useCallback(
@@ -735,10 +697,9 @@ export function RecentTabList({
 								connectTop={
 									firstTabConnected && sortIdx === topLevel.findIndex((t) => !t.workspaceId)
 								}
-								onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
-								dimmed={isDraggingThis}
-								wsGroupHeight={tab.type === "workspace" ? wsGroupHeight : null}
-							/>
+							onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
+							dimmed={isDraggingThis}
+						/>
 						);
 					})}
 				</SortableContext>
@@ -888,17 +849,12 @@ function SortableWorkspaceChildTab({
 
 	const sortStyle: React.CSSProperties = {
 		transform: CSS.Transform.toString(transform),
-		// Skip transition when recovering from dimmed (collapsed) state so
+		// Skip transition when recovering from dimmed state so
 		// workspace children snap back instantly after header drag ends.
 		transition: dimmed || skipTransition ? "none" : transition,
-		// isDragging (self): keep layout space, just hide visually.
-		// dimmed (workspace children following header drag): collapse so dnd-kit
-		// only sees the header in the sort list; the DragOverlay renders the group.
-		...(dimmed
-			? { opacity: 0, height: 0, overflow: "hidden", margin: 0, padding: 0 }
-			: isDragging
-				? { opacity: 0 }
-				: { opacity: 1 }),
+		// isDragging (self) or dimmed (workspace children following header drag):
+		// keep layout space so dnd-kit can measure rects, just hide visually.
+		opacity: dimmed || isDragging ? 0 : 1,
 	};
 
 	return (
@@ -1065,8 +1021,6 @@ interface SortableTabItemProps {
 	onWsAddClick?: (e: React.MouseEvent, wsId: string) => void;
 	/** When true, reduce opacity to indicate the item is being dragged */
 	dimmed?: boolean;
-	/** When dragging a workspace header, the total group height (header + children) */
-	wsGroupHeight?: number | null;
 }
 
 function SortableTabItem({
@@ -1078,7 +1032,6 @@ function SortableTabItem({
 	connectTop,
 	onWsAddClick,
 	dimmed,
-	wsGroupHeight,
 }: SortableTabItemProps) {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
@@ -1104,9 +1057,6 @@ function SortableTabItem({
 		transition,
 		opacity: isDragging ? 0 : dimmed ? 0.3 : 1,
 		zIndex: isDragging ? 10 : undefined,
-		// When dragging a workspace header, expand placeholder to match the full
-		// group height (header + children) so other items don't jump.
-		...(isDragging && wsGroupHeight ? { height: wsGroupHeight } : undefined),
 	};
 
 	// Click to navigate — blocked after drag via module-level flag

@@ -269,7 +269,7 @@
 	"wakeLock": "Keep Screen Awake",
 	"wakeLockDesc": "Prevent the screen from dimming or locking while NarraFork is open",
 	"advancedAnimation": "Advanced Animation",
-	"advancedAnimationDesc": "Enable blur-in animation for new messages and streaming text in narrator conversations",
+	"advancedAnimationDesc": "Reserved for future narrator animation effects; currently has no visible effect",
 	"expandReasoning": "Expand Reasoning by Default",
 	"expandReasoningDesc": "Automatically expand reasoning/thinking blocks in narrator messages instead of showing them collapsed",
 	"pwaSection": "App Update",

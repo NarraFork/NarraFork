@@ -1,38 +1,4 @@
 /*
- * Advanced animation effects (enabled via user preference).
- * - Streaming text: inline-element blur-in reveal (StreamingBubble)
- * - Streaming tool chunks: blur-in entrance for new tool cards
+ * Reserved for future narrator animation effects.
+ * The advanced animation setting is currently a no-op.
  */
-
-/* Shared blur-in keyframe */
-@keyframes nf-blur-in {
-	from {
-		filter: blur(8px);
-		opacity: 0;
-	}
-	to {
-		filter: blur(0);
-		opacity: 1;
-	}
-}
-
-/* Inline-element reveal for streaming text */
-@keyframes nf-inline-in {
-	from {
-		opacity: 0;
-		filter: blur(4px);
-	}
-	to {
-		opacity: 1;
-		filter: blur(0);
-	}
-}
-
-.nf-inline-in {
-	animation: nf-inline-in 350ms ease-out both;
-}
-
-/* Streaming tool card entrance — applied to individual tool items */
-.nf-tool-blur-in {
-	animation: nf-blur-in 400ms ease-out both;
-}

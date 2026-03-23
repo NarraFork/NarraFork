@@ -57,7 +57,6 @@ import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
-import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -109,7 +108,6 @@ import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
-	hasReasoningBlock,
 	RenderProgress,
 	renderToolRun,
 	renderTreeMessagesWithKeys,
@@ -122,11 +120,7 @@ import {
 } from "./MessageSelectionCtx";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import {
-	hasToolUse,
-	isToolOnlyMessage,
-	revokeContentBlockPreviewUrls,
-} from "./narrator-message-helpers";
+import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesQueryData,
@@ -709,48 +703,6 @@ function ReasoningEffortMenuItems({
 	);
 }
 
-/**
- * Extract the trailing tool-run messages from the newest page so the
- * streaming-merge logic can re-render a combined run via appendMessages.
- */
-function extractLastToolRunMsgs(
-	lastKey: string,
-	pages: MessagesQueryData["pages"],
-): NarratorMsg[] | null {
-	if (!lastKey.includes("tool-run-") || pages.length === 0) return null;
-	const newestPage = pages[0];
-	const msgs = newestPage?.messages;
-	if (!msgs?.length) return null;
-
-	// Walk backwards to collect the trailing tool-only messages
-	const run: NarratorMsg[] = [];
-	for (let k = msgs.length - 1; k >= 0; k--) {
-		const m = msgs[k];
-		if (m.id === STREAMING_CHUNKS_MSG_ID) continue;
-		if ((hasToolUse(m) || hasReasoningBlock(m)) && isToolOnlyMessage(m) && !m._noMerge) {
-			run.unshift(m);
-		} else if (hasToolUse(m)) {
-			// Mixed message (text + tool_use): include only its tool_use blocks
-			const blocks = Array.isArray(m.contentJson) ? m.contentJson : [];
-			const toolEntries: { block: ContentBlock; origIdx: number }[] = [];
-			blocks.forEach((b: ContentBlock, idx: number) => {
-				if (b.type === "tool_use") toolEntries.push({ block: b, origIdx: idx });
-			});
-			if (toolEntries.length > 0) {
-				run.unshift({
-					...m,
-					contentJson: toolEntries.map((e) => e.block),
-					_blockOriginalIndices: toolEntries.map((e) => e.origIdx),
-				});
-			}
-			break;
-		} else {
-			break;
-		}
-	}
-	return run.length > 0 ? run : null;
-}
-
 export function NarratorPanel({
 	narratorId,
 	narrator: narratorProp,
@@ -808,7 +760,6 @@ export function NarratorPanel({
 	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const { visibleWithDefault: allModels, defaultModelValue, settingsData } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
-	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
 	const contentViewerEnvironment = useMemo(
@@ -1621,13 +1572,12 @@ export function NarratorPanel({
 	);
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
-	const { flatElements, flatKeys, flatTargets, lastToolRunMsgs } = useMemo(() => {
+	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
 		if (isResizing || !messagesData?.pages) {
 			return {
 				flatElements: [],
 				flatKeys: [],
 				flatTargets: [],
-				lastToolRunMsgs: null as NarratorMsg[] | null,
 			};
 		}
 		const pages = messagesData.pages;
@@ -1706,16 +1656,10 @@ export function NarratorPanel({
 			}
 		}
 
-		// Extract the last tool run's messages from the newest page so the
-		// streaming-merge logic can re-render a combined run via appendMessages.
-		const lastKey = allKeys.length > 0 ? allKeys[allKeys.length - 1] : "";
-		const lastToolRunMsgs = extractLastToolRunMsgs(lastKey, pages);
-
 		return {
 			flatElements: allElements,
 			flatKeys: allKeys,
 			flatTargets: allTargets,
-			lastToolRunMsgs,
 		};
 	}, [
 		isResizing,
@@ -1755,20 +1699,9 @@ export function NarratorPanel({
 		const hasStreamingReasoning = !!streamingReasoningRef.current;
 		const hasStreamingToolChunks = !!topLevelStreamingChunks;
 
-		// Helper: find the last tool-run element index
-		const findLastToolRunIdx = () => {
-			for (let ti = els.length - 1; ti >= 0; ti--) {
-				if (keys[ti]?.includes("tool-run-")) return ti;
-			}
-			return -1;
-		};
-
-		const lastToolRunIdx = findLastToolRunIdx();
-		const lastToolRunExists = lastToolRunIdx >= 0 && lastToolRunMsgs && lastToolRunMsgs.length > 0;
-		const reasoningInBubble = hasStreamingReasoning && hasStreamingText && !lastToolRunExists;
-		const mergeReasoningUpward = hasStreamingReasoning && !reasoningInBubble && lastToolRunExists;
+		const reasoningInBubble = hasStreamingReasoning && hasStreamingText;
 		const renderStandaloneReasoningRun =
-			hasStreamingReasoning && !reasoningInBubble && !hasStreamingToolChunks && !lastToolRunExists;
+			hasStreamingReasoning && !reasoningInBubble && !hasStreamingToolChunks;
 
 		if (hasStreamingText) {
 			els.push(
@@ -1779,17 +1712,16 @@ export function NarratorPanel({
 					includeReasoning={reasoningInBubble}
 					webSearchRef={webSearchRef}
 					version={streamingVersion}
-					advancedAnim={advancedAnim}
 				/>,
 			);
 			keys.push("__streaming_bubble__");
 			targets.push([]);
 		}
 
-		// 1) Streaming reasoning — always merge upward when there is a preceding
-		//    tool-run. Otherwise, when there are no tool chunks yet, render it as a
-		//    standalone tool-run container.
-		if (mergeReasoningUpward || renderStandaloneReasoningRun) {
+		// Render streaming reasoning as its own transient run until the same turn
+		// emits text or tool chunks. This avoids leaking reasoning into the
+		// previous turn's tool run when the current turn starts with reasoning.
+		if (renderStandaloneReasoningRun) {
 			const reasoningMsg = {
 				id: STREAMING_CHUNKS_MSG_ID,
 				narratorId,
@@ -1801,38 +1733,20 @@ export function NarratorPanel({
 				createdAt: new Date().toISOString(),
 				children: [],
 			};
-			if (
-				mergeReasoningUpward &&
-				lastToolRunIdx >= 0 &&
-				lastToolRunMsgs &&
-				lastToolRunMsgs.length > 0
-			) {
-				const prevTargets = targets[lastToolRunIdx] ?? [];
-				const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
-					appendMessages: [reasoningMsg],
-					animateAppended: !!advancedAnim,
-				});
-				if (mergedEl) {
-					els[lastToolRunIdx] = mergedEl;
-					targets[lastToolRunIdx] = prevTargets;
-				}
-			} else {
-				const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb, {
-					animateAppended: !!advancedAnim,
-				});
-				if (toolEl) {
-					els.push(toolEl);
-					keys.push("__streaming_tool_chunks__");
-					targets.push([]);
-				}
+			const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb);
+			if (toolEl) {
+				els.push(toolEl);
+				keys.push("__streaming_tool_chunks__");
+				targets.push([]);
 			}
 		}
 
-		// 2) Streaming tool chunks (prepend reasoning only when it was not already
-		//    absorbed upward into a preceding tool-run)
+		// Streaming tool chunks always belong to the current turn. Keep them in a
+		// standalone synthetic run and prepend the current turn's reasoning when no
+		// streaming text bubble is rendering it already.
 		if (topLevelStreamingChunks) {
 			let chunksToRender = topLevelStreamingChunks;
-			if (hasStreamingReasoning && !reasoningInBubble && !mergeReasoningUpward) {
+			if (hasStreamingReasoning && !reasoningInBubble) {
 				chunksToRender = {
 					...topLevelStreamingChunks,
 					contentJson: [
@@ -1844,39 +1758,11 @@ export function NarratorPanel({
 				};
 			}
 
-			if (!hasStreamingText && lastToolRunMsgs && lastToolRunMsgs.length > 0) {
-				// No streaming text — safe to merge into the preceding tool run
-				const toolRunIdx = findLastToolRunIdx();
-				if (toolRunIdx >= 0) {
-					const prevTargets = targets[toolRunIdx] ?? [];
-					const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
-						appendMessages: [chunksToRender],
-						animateAppended: !!advancedAnim,
-					});
-					if (mergedEl) {
-						els[toolRunIdx] = mergedEl;
-						targets[toolRunIdx] = prevTargets;
-					}
-				} else {
-					const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb, {
-						animateAppended: !!advancedAnim,
-					});
-					if (toolEl) {
-						els.push(toolEl);
-						keys.push("__streaming_tool_chunks__");
-						targets.push([]);
-					}
-				}
-			} else {
-				// Has streaming text content or no preceding tool run — render standalone
-				const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb, {
-					animateAppended: !!advancedAnim,
-				});
-				if (toolEl) {
-					els.push(toolEl);
-					keys.push("__streaming_tool_chunks__");
-					targets.push([]);
-				}
+			const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
+			if (toolEl) {
+				els.push(toolEl);
+				keys.push("__streaming_tool_chunks__");
+				targets.push([]);
 			}
 		}
 
@@ -1885,7 +1771,6 @@ export function NarratorPanel({
 		flatElements,
 		flatKeys,
 		flatTargets,
-		lastToolRunMsgs,
 		streamingVersion,
 		topLevelStreamingChunks,
 		narratorId,
@@ -1893,7 +1778,6 @@ export function NarratorPanel({
 		streamingRef,
 		streamingReasoningRef,
 		webSearchRef,
-		advancedAnim,
 	]);
 
 	const targetIndexMap = useMemo(() => {
