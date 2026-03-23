@@ -44,7 +44,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type React from "react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
@@ -868,6 +868,15 @@ function SortableWorkspaceChildTab({
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tabSortId(tab),
 	});
+
+	// Track whether this child was dimmed (collapsed) in the previous render.
+	// When transitioning from dimmed→visible we skip the dnd-kit transition
+	// so the child snaps back instantly instead of sliding in.
+	const wasDimmedRef = useRef(false);
+	const skipTransition = !dimmed && wasDimmedRef.current;
+	useEffect(() => {
+		wasDimmedRef.current = !!dimmed;
+	});
 	const to =
 		tab.type === "chapter" && tab.narratorId
 			? `/narrators/${tab.narratorId}`
@@ -879,7 +888,9 @@ function SortableWorkspaceChildTab({
 
 	const sortStyle: React.CSSProperties = {
 		transform: CSS.Transform.toString(transform),
-		transition,
+		// Skip transition when recovering from dimmed (collapsed) state so
+		// workspace children snap back instantly after header drag ends.
+		transition: dimmed || skipTransition ? "none" : transition,
 		// isDragging (self): keep layout space, just hide visually.
 		// dimmed (workspace children following header drag): collapse so dnd-kit
 		// only sees the header in the sort list; the DragOverlay renders the group.
