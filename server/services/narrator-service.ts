@@ -307,6 +307,7 @@ interface CreateSubagentInput {
 	parentNarratorId: string;
 	subagentType: string;
 	cwd: string;
+	title?: string;
 	permissionMode?: string;
 	model?: string;
 	systemPrompt?: string;
@@ -493,6 +494,7 @@ export const narratorService = {
 				chapterId: parent.chapterId ?? null,
 				type: "subagent",
 				subagentType: input.subagentType,
+				title: input.title ?? null,
 				model: resolvedModel,
 				systemPrompt: input.systemPrompt ?? null,
 				permissionMode: resolvedPermMode,

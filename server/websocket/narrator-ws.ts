@@ -154,11 +154,12 @@ export type NarratorServerMessage =
 			extractedFields?: Record<string, string>;
 	  }
 	| {
-			type: "subagent_started";
-			narratorId: string;
-			subagentNarratorId: string;
-			toolUseId: string;
-			subagentType: string;
+		type: "subagent_started";
+		narratorId: string;
+		subagentNarratorId: string;
+		toolUseId: string;
+		subagentType: string;
+		model?: string;
 	  }
 	| {
 			type: "background_task_started";

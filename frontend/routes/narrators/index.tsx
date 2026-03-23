@@ -23,34 +23,23 @@ import {
 	IconBox,
 	IconEye,
 	IconFilter,
-	IconFolder,
 	IconPlayerPlay,
 	IconSortAscending,
 	IconSortDescending,
-	IconStar,
-	IconStarFilled,
 	IconTerminal2,
-	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { DirectoryPicker } from "../../components/common/DirectoryPicker";
+import {
+	CreateNarratorModal,
+	type CreateNarratorResult,
+} from "../../components/narrator/CreateNarratorModal";
 import { UserAvatar } from "../../components/UserAvatar";
-import {
-	useCreateFavoriteDirectory,
-	useDeleteFavoriteDirectory,
-	useFavoriteDirectories,
-} from "../../hooks/useFavoriteDirectories";
 import { useAllModels } from "../../hooks/useModels";
-import {
-	useArchiveNarrator,
-	useCreateNarrator,
-	useNarratorsPaginated,
-} from "../../hooks/useNarrator";
+import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrator";
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
-import { usePlatform } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
@@ -139,20 +128,12 @@ function NarratorsPage() {
 		() => paginatedData?.pages.flatMap((p) => p.items) ?? [],
 		[paginatedData],
 	);
-	const createNarrator = useCreateNarrator();
 	const archiveNarrator = useArchiveNarrator();
 	const [opened, { open, close }] = useDisclosure(false);
 	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
-	const [cwd, setCwd] = useState("");
-	const [selectedModel, setSelectedModel] = useState("");
-	const [startInPlanMode, setStartInPlanMode] = useState(false);
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
 	const [navigatingId, setNavigatingId] = useState<string | null>(null);
-	const platform = usePlatform();
-	const { data: favorites } = useFavoriteDirectories();
-	const addFavorite = useCreateFavoriteDirectory();
-	const removeFavorite = useDeleteFavoriteDirectory();
 	const qc = useQueryClient();
 	const requireSetup = useSetupWizardGuard();
 
@@ -169,7 +150,7 @@ function NarratorsPage() {
 		}
 	}, [search.create, guardedOpen, setSearch]);
 
-	const { groupedModels, defaultModelValue } = useAllModels();
+	const { defaultModelValue } = useAllModels();
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const narratorIds = useMemo(() => narrators.map((s: any) => s.id), [narrators]);
@@ -259,42 +240,19 @@ function NarratorsPage() {
 		[navigate, navigatingId],
 	);
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isFavorited = favorites?.some((f: any) => f.path === cwd);
-
-	const handleCreate = () => {
-		createNarrator.mutate(
-			{
-				...(cwd ? { cwd } : {}),
-				model: selectedModel || FOLLOW_DEFAULT_MODEL,
-				...(startInPlanMode ? { permissionMode: "plan" as const } : {}),
-			},
-			{
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				onSuccess: (data: any) => {
-					close();
-					setCwd("");
-					setSelectedModel("");
-					setStartInPlanMode(false);
-					addRecentTab({
-						type: "narrator",
-						id: data.id,
-						title: data.title || t("newNarrator"),
-						subtitle: data.cwd || cwd,
-						status: data.status || "idle",
-					});
-					navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
-				},
-			},
-		);
-	};
-
-	const handleClose = () => {
-		close();
-		setCwd("");
-		setSelectedModel("");
-		setStartInPlanMode(false);
-	};
+	const handleCreated = useCallback(
+		(data: CreateNarratorResult) => {
+			addRecentTab({
+				type: "narrator",
+				id: data.id,
+				title: data.title,
+				subtitle: data.cwd,
+				status: data.status,
+			});
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
+		},
+		[navigate],
+	);
 
 	return (
 		<Stack>
@@ -800,94 +758,7 @@ function NarratorsPage() {
 				</Stack>
 			)}
 
-			<Modal opened={opened} onClose={handleClose} title={t("newNarratorModal")}>
-				<Stack>
-					<Text size="sm" c="dimmed">
-						{t("newNarratorDescription")}
-					</Text>
-
-					<DirectoryPicker
-						label={t("workingDirectory")}
-						description={t("workingDirectoryHint")}
-						placeholder={
-							platform === "windows" ? "E:\\Code\\my-project" : "/home/user/projects/my-project"
-						}
-						leftSection={<IconFolder size={16} />}
-						value={cwd}
-						onChange={setCwd}
-						rightSectionExtra={
-							cwd ? (
-								isFavorited ? (
-									<IconStarFilled size={16} style={{ color: "var(--mantine-color-yellow-5)" }} />
-								) : (
-									<Tooltip label={t("addToFavorites")}>
-										<ActionIcon
-											variant="subtle"
-											size="sm"
-											onClick={() => addFavorite.mutate({ path: cwd })}
-										>
-											<IconStar size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)
-							) : null
-						}
-					/>
-
-					{favorites?.length ? (
-						<Stack gap="xs">
-							<Text size="xs" fw={500} c="dimmed">
-								{t("favoriteDirectories")}
-							</Text>
-							{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-							{favorites.map((fav: any) => (
-								<Group key={fav.id} gap="xs" wrap="nowrap">
-									<Button
-										variant={cwd === fav.path ? "light" : "subtle"}
-										size="xs"
-										style={{ flex: 1, justifyContent: "flex-start" }}
-										onClick={() => setCwd(fav.path)}
-									>
-										<Text size="xs" truncate>
-											{fav.label || fav.path}
-										</Text>
-									</Button>
-									<ActionIcon
-										variant="subtle"
-										color="red"
-										size="xs"
-										onClick={() => removeFavorite.mutate(fav.id)}
-									>
-										<IconX size={14} />
-									</ActionIcon>
-								</Group>
-							))}
-						</Stack>
-					) : null}
-
-					<Select
-						label={t("model")}
-						description={t("modelHint")}
-						data={groupedModels}
-						searchable
-						value={selectedModel || FOLLOW_DEFAULT_MODEL}
-						onChange={(v) => setSelectedModel(v ?? "")}
-						maxDropdownHeight={320}
-						comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
-					/>
-
-					<Checkbox
-						label={t("startInPlanMode")}
-						description={t("startInPlanModeHint")}
-						checked={startInPlanMode}
-						onChange={(e) => setStartInPlanMode(e.currentTarget.checked)}
-					/>
-
-					<Button onClick={handleCreate} loading={createNarrator.isPending}>
-						{t("createNarrator")}
-					</Button>
-				</Stack>
-			</Modal>
+			<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
 
 			<Modal
 				opened={!!confirmArchiveId}

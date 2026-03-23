@@ -31,7 +31,7 @@ import {
 import { narratorService } from "./narrator-service";
 import {
 	buildContextManagementHooks,
-	cleanupPartialMessage,
+	finalizeOrCleanupPartialMessage,
 	handlePermission,
 	pruneToolCalls,
 	toBufferSummary,
@@ -239,6 +239,7 @@ function broadcastSubagentStarted(
 	parentNarratorId: string,
 	toolUseId: string,
 	subagentType: string,
+	model?: string,
 ): void {
 	eventBus.emit({
 		type: "narrator:subagent_started",
@@ -253,6 +254,7 @@ function broadcastSubagentStarted(
 		subagentNarratorId: subagentId,
 		toolUseId,
 		subagentType,
+		...(model && { model }),
 	});
 }
 
@@ -475,10 +477,12 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				break;
 			}
 
-			// Clean up partial message from the failed turn before retry
+			// Finalize or clean up partial message from the failed turn before retry.
+			// If tools were already executed, the message is kept so the retry
+			// includes them in history.
 			const partialId = eventContext.getPartialMessageId();
 			if (partialId) {
-				await cleanupPartialMessage(partialId, narratorId);
+				await finalizeOrCleanupPartialMessage(partialId, narratorId);
 				eventContext.setPartialMessageId(undefined);
 			}
 
@@ -528,10 +532,12 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				signal,
 			});
 			if (shouldRetry) {
-				// Clean up partial message from the failed turn before retry
+				// Finalize or clean up partial message from the failed turn.
+				// If tools were already executed, the message is kept so the
+				// rebuilt history includes them.
 				const partialId = eventContext.getPartialMessageId();
 				if (partialId) {
-					await cleanupPartialMessage(partialId, narratorId);
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
 					eventContext.setPartialMessageId(undefined);
 				}
 				// Rebuild history from DB so the retry includes any tool calls
@@ -917,6 +923,7 @@ export interface RunSubagentInput {
 	subagentType: string;
 	prompt: string;
 	cwd: string;
+	title?: string;
 	signal: AbortSignal;
 	locale: string;
 	model?: string;
@@ -937,6 +944,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		subagentType,
 		prompt,
 		cwd,
+		title,
 		signal,
 		locale,
 		model: explicitModel,
@@ -964,13 +972,33 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		subagentPref = customDef.defaultModel || undefined;
 	}
 
+	// Apply subagent allowed-model pool restriction.
+	// When the pool is non-empty, only models in the pool may be used.
+	// Walk the priority chain and pick the first allowed candidate.
+	const allowedPool = settings.agent.subagentAllowedModels ?? [];
+	let resolvedModelInput: string | undefined;
+	if (allowedPool.length > 0) {
+		const poolSet = new Set(allowedPool);
+		const parent = await narratorService.getById(parentNarratorId);
+		const candidates = [
+			explicitModel,
+			subagentPref,
+			parent.model ?? undefined,
+			settings.agent.defaultModel,
+		].filter((m): m is string => !!m);
+		resolvedModelInput = candidates.find((m) => poolSet.has(m)) ?? settings.agent.defaultModel;
+	} else {
+		resolvedModelInput = explicitModel || subagentPref || undefined;
+	}
+
 	// 1. Create subagent narrator
 	const subagent = await narratorService.createSubagent({
 		parentNarratorId,
 		subagentType,
+		title,
 		cwd,
 		systemPrompt,
-		model: explicitModel || subagentPref || undefined,
+		model: resolvedModelInput,
 	});
 
 	const subagentId = subagent.id;
@@ -991,7 +1019,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			.where(eq(narrators.id, subagentId));
 
 		// Broadcast background task started
-		broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType);
+		broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 		eventBus.emit({
 			type: "narrator:background_task_started",
 			narratorId: parentNarratorId,
@@ -1047,7 +1075,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	// --- Foreground mode (existing behavior) ---
 
 	// 3. Broadcast subagent_started
-	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType);
+	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 
 	// Create an independent AbortController so the subagent can be interrupted
 	// from its own page without aborting the parent narrator.
@@ -1156,7 +1184,7 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	const forkedId = forked.id;
 
 	// 3. Broadcast subagent_started
-	broadcastSubagentStarted(forkedId, parentNarratorId, toolUseId, subagentType);
+	broadcastSubagentStarted(forkedId, parentNarratorId, toolUseId, subagentType, model);
 
 	// 4. Persist new user message under the forked subagent
 	await narratorService.persistSubagentUserMessage(forkedId, prompt, toolUseId);

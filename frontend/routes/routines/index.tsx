@@ -24,6 +24,7 @@ import {
 	IconPlug,
 	IconPlugOff,
 	IconPlus,
+	IconRefresh,
 	IconTrash,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
@@ -59,6 +60,7 @@ import {
 	useCreateGlobalSkill,
 	useDeleteGlobalSkill,
 	useGlobalSkills,
+	useGlobalSkillsRefresh,
 	useSkills,
 	useUpdateGlobalSkill,
 } from "../../hooks/useSkills";
@@ -253,6 +255,7 @@ function GlobalSkillsTab() {
 	const createMutation = useCreateGlobalSkill();
 	const updateMutation = useUpdateGlobalSkill();
 	const deleteMutation = useDeleteGlobalSkill();
+	const refreshMutation = useGlobalSkillsRefresh();
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
@@ -326,14 +329,25 @@ function GlobalSkillsTab() {
 				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
 					{t("globalSkillsDesc")}
 				</Text>
-				<Button
-					size="xs"
-					variant="light"
-					leftSection={<IconPlus size={14} />}
-					onClick={handleCreate}
-				>
-					{t("createSkill")}
-				</Button>
+				<Group gap="xs">
+					<ActionIcon
+						variant="subtle"
+						size="sm"
+						onClick={() => refreshMutation.mutate()}
+						loading={refreshMutation.isPending}
+						title={t("refreshSkills")}
+					>
+						<IconRefresh size={14} />
+					</ActionIcon>
+					<Button
+						size="xs"
+						variant="light"
+						leftSection={<IconPlus size={14} />}
+						onClick={handleCreate}
+					>
+						{t("createSkill")}
+					</Button>
+				</Group>
 			</Group>
 
 			{isLoading && (

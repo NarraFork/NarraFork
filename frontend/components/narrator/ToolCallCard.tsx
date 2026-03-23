@@ -103,6 +103,8 @@ export interface ToolCallData {
 	_longRunning?: boolean;
 	/** Real-time streaming output from bash tool (updated via WS tool_output events) */
 	_streamingOutput?: string;
+	/** Resolved model name for subagent tool calls (set via WS subagent_started event) */
+	_resolvedModel?: string;
 }
 
 export interface PendingPermission {
@@ -2371,10 +2373,12 @@ export function InlinePermission({
 				mb="xs"
 			/>
 			<Group gap="sm">
-				<Button size="sm" color="green" onClick={() => handleAllow()}>
-					{tc("allow")}
-				</Button>
-				{isExitPlan && (
+				{!editing && (
+					<Button size="sm" color="green" onClick={() => handleAllow()}>
+						{tc("allow")}
+					</Button>
+				)}
+				{!editing && isExitPlan && (
 					<Button size="sm" color="teal" variant="light" onClick={() => handleAllow(true)}>
 						{t("acceptAndResetContext")}
 					</Button>
@@ -2395,7 +2399,7 @@ export function InlinePermission({
 						{editing ? t("planEditDone") : t("planEdit")}
 					</Button>
 				)}
-				{planEdited && (
+				{(planEdited || editing) && (
 					<Button
 						size="sm"
 						color="gray"
@@ -2408,17 +2412,19 @@ export function InlinePermission({
 						{t("planEditReset")}
 					</Button>
 				)}
-				<Button
-					size="sm"
-					color="red"
-					variant="light"
-					onClick={() => {
-						sessionStorage.removeItem(draftKey);
-						onDecision?.(permission.id, "deny", feedback || undefined);
-					}}
-				>
-					{tc("deny")}
-				</Button>
+				{!editing && (
+					<Button
+						size="sm"
+						color="red"
+						variant="light"
+						onClick={() => {
+							sessionStorage.removeItem(draftKey);
+							onDecision?.(permission.id, "deny", feedback || undefined);
+						}}
+					>
+						{tc("deny")}
+					</Button>
+				)}
 			</Group>
 		</Box>
 	);

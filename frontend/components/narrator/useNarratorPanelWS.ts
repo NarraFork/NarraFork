@@ -1004,6 +1004,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return mergeFieldsByIndex(old, toolUseId, fields, toolUseIndexRef.current);
 				});
 			},
+			onSubagentStarted: (toolUseId: string, model?: string) => {
+				if (!model) return;
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ _resolvedModel: model },
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onToolUseChunk: (
 				toolUseId: string,
 				toolName: string,

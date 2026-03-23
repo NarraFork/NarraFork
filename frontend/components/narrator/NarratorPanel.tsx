@@ -1744,17 +1744,18 @@ export function NarratorPanel({
 		const keys = [...flatKeys];
 		const targets = [...flatTargets];
 
-		// StreamingBubble — only append when there is streaming text/reasoning/web-search
-		// We read refs here; streamingVersion change triggers the memo recalculation.
+		// Model output order is always: reasoning → text → tool_use.
+		// Reasoning always renders in a tool-run container (brain-icon collapsible card).
+		// StreamingBubble is only for text / web-search content.
 		void streamingVersion;
-		const hasStreamingContent =
-			!!streamingRef.current || !!streamingReasoningRef.current || !!webSearchRef.current;
-		if (hasStreamingContent) {
+		const hasStreamingText = !!streamingRef.current || !!webSearchRef.current;
+		const hasStreamingReasoning = !!streamingReasoningRef.current;
+		if (hasStreamingText) {
 			els.push(
 				<StreamingBubble
 					narratorId={narratorId}
 					streamingRef={streamingRef}
-					streamingReasoningRef={streamingReasoningRef}
+					streamingReasoningRef={undefined}
 					webSearchRef={webSearchRef}
 					version={streamingVersion}
 				/>,
@@ -1763,31 +1764,81 @@ export function NarratorPanel({
 			targets.push([]);
 		}
 
-		// Streaming tool chunks — merge visually with the preceding tool run when possible,
-		// but only if there is no streaming text content in between (StreamingBubble).
-		// When the model emits text before tool calls, the streaming tool should appear
-		// below the text bubble, not get merged into an earlier tool run.
-		if (topLevelStreamingChunks) {
-			if (!hasStreamingContent && lastToolRunMsgs && lastToolRunMsgs.length > 0) {
-				// No streaming text — safe to merge into the preceding tool run
-				let toolRunIdx = -1;
-				for (let ti = els.length - 1; ti >= 0; ti--) {
-					if (keys[ti]?.includes("tool-run-")) {
-						toolRunIdx = ti;
-						break;
-					}
+		// Reasoning always merges upward into the preceding tool-run (it precedes
+		// text/tool in the model output, so visually it belongs with the previous
+		// tool-run container). Tool chunks merge downward only when there is no
+		// streaming text in between.
+
+		// Helper: find the last tool-run element index
+		const findLastToolRunIdx = () => {
+			for (let ti = els.length - 1; ti >= 0; ti--) {
+				if (keys[ti]?.includes("tool-run-")) return ti;
+			}
+			return -1;
+		};
+
+		// 1) Streaming reasoning — always try to merge upward into preceding tool-run
+		if (hasStreamingReasoning && !topLevelStreamingChunks) {
+			const reasoningMsg = {
+				id: STREAMING_CHUNKS_MSG_ID,
+				narratorId,
+				parentToolUseId: null,
+				role: "assistant" as const,
+				contentJson: [{ type: "reasoning", text: streamingReasoningRef.current }],
+				contentText: null,
+				toolCalls: [],
+				createdAt: new Date().toISOString(),
+				children: [],
+			};
+			const toolRunIdx = findLastToolRunIdx();
+			if (toolRunIdx >= 0 && lastToolRunMsgs && lastToolRunMsgs.length > 0) {
+				const prevTargets = targets[toolRunIdx] ?? [];
+				const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
+					appendMessages: [reasoningMsg],
+				});
+				if (mergedEl) {
+					els[toolRunIdx] = mergedEl;
+					targets[toolRunIdx] = prevTargets;
 				}
+			} else {
+				const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb);
+				if (toolEl) {
+					els.push(toolEl);
+					keys.push("__streaming_tool_chunks__");
+					targets.push([]);
+				}
+			}
+		}
+
+		// 2) Streaming tool chunks (with optional reasoning prepended)
+		if (topLevelStreamingChunks) {
+			let chunksToRender = topLevelStreamingChunks;
+			if (hasStreamingReasoning) {
+				chunksToRender = {
+					...topLevelStreamingChunks,
+					contentJson: [
+						{ type: "reasoning", text: streamingReasoningRef.current },
+						...(Array.isArray(topLevelStreamingChunks.contentJson)
+							? topLevelStreamingChunks.contentJson
+							: []),
+					],
+				};
+			}
+
+			if (!hasStreamingText && lastToolRunMsgs && lastToolRunMsgs.length > 0) {
+				// No streaming text — safe to merge into the preceding tool run
+				const toolRunIdx = findLastToolRunIdx();
 				if (toolRunIdx >= 0) {
 					const prevTargets = targets[toolRunIdx] ?? [];
 					const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
-						appendMessages: [topLevelStreamingChunks],
+						appendMessages: [chunksToRender],
 					});
 					if (mergedEl) {
 						els[toolRunIdx] = mergedEl;
 						targets[toolRunIdx] = prevTargets;
 					}
 				} else {
-					const toolEl = renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb);
+					const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
 					if (toolEl) {
 						els.push(toolEl);
 						keys.push("__streaming_tool_chunks__");
@@ -1796,7 +1847,7 @@ export function NarratorPanel({
 				}
 			} else {
 				// Has streaming text content or no preceding tool run — render standalone
-				const toolEl = renderToolRun([topLevelStreamingChunks], narratorId, renderPermCb);
+				const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
 				if (toolEl) {
 					els.push(toolEl);
 					keys.push("__streaming_tool_chunks__");

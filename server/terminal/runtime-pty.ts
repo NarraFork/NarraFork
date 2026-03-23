@@ -41,6 +41,18 @@ export function spawnPortablePty(opts: TerminalSpawnOptions): TerminalRuntime {
 		},
 		kill() {
 			pty.kill();
+			// On Windows, pty.kill() only terminates the direct child (ConPTY host).
+			// Shell processes and their children (e.g. cmd.exe → node.exe) may survive.
+			// Use taskkill /T /F to recursively kill the entire process tree.
+			if (process.platform === "win32" && pty.pid) {
+				try {
+					Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pty.pid)], {
+						stdio: ["ignore", "ignore", "ignore"],
+					});
+				} catch {
+					/* best effort — process may already be gone */
+				}
+			}
 		},
 		get pid() {
 			return pty.pid;

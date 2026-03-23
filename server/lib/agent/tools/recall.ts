@@ -1,3 +1,4 @@
+import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
 import { sqlite } from "../../../db";
 import { buildFtsQuery, sanitizeQuery } from "../../../services/search-service";
@@ -15,6 +16,103 @@ const MAX_READ_LIMIT = 50;
 const DEFAULT_READ_LIMIT = 20;
 const SNIPPET_CHARS = 300;
 const MAX_TOOL_CALL_OUTPUT = 4000;
+
+// --- Cached prepared statements (lazy-initialized) ---
+// Avoids creating a new Statement object on every Recall tool invocation.
+
+let _searchFts: Statement | null = null;
+let _searchLike: Statement | null = null;
+let _getNarrator: Statement | null = null;
+let _getRefSeq: Statement | null = null;
+let _msgsAround: Statement | null = null;
+let _msgsLatest: Statement | null = null;
+let _getToolCall: Statement | null = null;
+
+function searchFtsStmt() {
+	if (!_searchFts) {
+		_searchFts = sqlite.prepare(
+			`SELECT m.id, m.narrator_id, m.role, m.created_at,
+			        n.title AS narrator_title, n.chapter_id,
+			        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
+			 FROM narrator_messages_fts
+			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+			 JOIN narrators n ON n.id = m.narrator_id
+			 WHERE narrator_messages_fts MATCH ?
+			 ORDER BY rank
+			 LIMIT ?`,
+		);
+	}
+	return _searchFts;
+}
+function searchLikeStmt() {
+	if (!_searchLike) {
+		_searchLike = sqlite.prepare(
+			`SELECT m.id, m.narrator_id, m.role, m.created_at,
+			        n.title AS narrator_title, n.chapter_id,
+			        substr(m.content_text, 1, ?) AS snippet
+			 FROM narrator_messages m
+			 JOIN narrators n ON n.id = m.narrator_id
+			 WHERE m.content_text LIKE ?
+			 ORDER BY m.created_at DESC
+			 LIMIT ?`,
+		);
+	}
+	return _searchLike;
+}
+function getNarratorStmt() {
+	if (!_getNarrator) {
+		_getNarrator = sqlite.prepare(
+			"SELECT id, title, chapter_id, model FROM narrators WHERE id = ?",
+		);
+	}
+	return _getNarrator;
+}
+function getRefSeqStmt() {
+	if (!_getRefSeq) {
+		_getRefSeq = sqlite.prepare(
+			"SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?",
+		);
+	}
+	return _getRefSeq;
+}
+function msgsAroundStmt() {
+	if (!_msgsAround) {
+		_msgsAround = sqlite.prepare(
+			`SELECT m.id, m.role, m.content_text, m.created_at, r.seq
+			 FROM narrator_message_refs r
+			 JOIN narrator_messages m ON m.id = r.message_id
+			 WHERE r.narrator_id = ? AND r.seq >= ? AND r.seq <= ?
+			 ORDER BY r.seq ASC`,
+		);
+	}
+	return _msgsAround;
+}
+function msgsLatestStmt() {
+	if (!_msgsLatest) {
+		_msgsLatest = sqlite.prepare(
+			`SELECT m.id, m.role, m.content_text, m.created_at, r.seq
+			 FROM narrator_message_refs r
+			 JOIN narrator_messages m ON m.id = r.message_id
+			 WHERE r.narrator_id = ?
+			 ORDER BY r.seq DESC
+			 LIMIT ?`,
+		);
+	}
+	return _msgsLatest;
+}
+function getToolCallStmt() {
+	if (!_getToolCall) {
+		_getToolCall = sqlite.prepare(
+			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
+			        tc.duration_ms, tc.error_message, tc.created_at,
+			        tc.narrator_id, n.title AS narrator_title
+			 FROM narrator_tool_calls tc
+			 JOIN narrators n ON n.id = tc.narrator_id
+			 WHERE tc.tool_use_id = ?`,
+		);
+	}
+	return _getToolCall;
+}
 
 export const recallTool: ToolDefinition = {
 	name: "Recall",
@@ -254,33 +352,10 @@ function handleSearch(query: string | undefined, limit: number | undefined): Too
 
 	if (useFts) {
 		const ftsExpr = buildFtsQuery(safeQuery);
-		rows = sqlite
-			.prepare(
-				`SELECT m.id, m.narrator_id, m.role, m.created_at,
-				        n.title AS narrator_title, n.chapter_id,
-				        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
-				 FROM narrator_messages_fts
-				 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE narrator_messages_fts MATCH ?
-				 ORDER BY rank
-				 LIMIT ?`,
-			)
-			.all(ftsExpr, cap);
+		rows = searchFtsStmt().all(ftsExpr, cap);
 	} else {
 		const like = `%${safeQuery}%`;
-		rows = sqlite
-			.prepare(
-				`SELECT m.id, m.narrator_id, m.role, m.created_at,
-				        n.title AS narrator_title, n.chapter_id,
-				        substr(m.content_text, 1, ?) AS snippet
-				 FROM narrator_messages m
-				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE m.content_text LIKE ?
-				 ORDER BY m.created_at DESC
-				 LIMIT ?`,
-			)
-			.all(SNIPPET_CHARS, like, cap);
+		rows = searchLikeStmt().all(SNIPPET_CHARS, like, cap);
 	}
 
 	if (rows.length === 0) {
@@ -338,9 +413,7 @@ function handleReadConversation(
 	const cap = Math.min(Math.max(limit ?? DEFAULT_READ_LIMIT, 1), MAX_READ_LIMIT);
 
 	// Verify narrator exists
-	const narrator = sqlite
-		.prepare("SELECT id, title, chapter_id, model FROM narrators WHERE id = ?")
-		.get(narratorId) as
+	const narrator = getNarratorStmt().get(narratorId) as
 		| { id: string; title: string | null; chapter_id: string | null; model: string | null }
 		| undefined;
 
@@ -353,9 +426,7 @@ function handleReadConversation(
 
 	if (messageId) {
 		// Find the seq of the target message in this narrator's refs
-		const ref = sqlite
-			.prepare("SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?")
-			.get(narratorId, messageId) as { seq: number } | undefined;
+		const ref = getRefSeqStmt().get(narratorId, messageId) as { seq: number } | undefined;
 
 		if (!ref) {
 			return {
@@ -365,27 +436,10 @@ function handleReadConversation(
 		}
 
 		const half = Math.floor(cap / 2);
-		rows = sqlite
-			.prepare(
-				`SELECT m.id, m.role, m.content_text, m.created_at, r.seq
-				 FROM narrator_message_refs r
-				 JOIN narrator_messages m ON m.id = r.message_id
-				 WHERE r.narrator_id = ? AND r.seq >= ? AND r.seq <= ?
-				 ORDER BY r.seq ASC`,
-			)
-			.all(narratorId, ref.seq - half, ref.seq + (cap - half));
+		rows = msgsAroundStmt().all(narratorId, ref.seq - half, ref.seq + (cap - half));
 	} else {
 		// Latest messages
-		rows = sqlite
-			.prepare(
-				`SELECT m.id, m.role, m.content_text, m.created_at, r.seq
-				 FROM narrator_message_refs r
-				 JOIN narrator_messages m ON m.id = r.message_id
-				 WHERE r.narrator_id = ?
-				 ORDER BY r.seq DESC
-				 LIMIT ?`,
-			)
-			.all(narratorId, cap);
+		rows = msgsLatestStmt().all(narratorId, cap);
 		rows.reverse();
 	}
 
@@ -487,16 +541,7 @@ function handleReadToolCall(toolCallId: string | undefined): ToolResult {
 		};
 	}
 
-	const tc = sqlite
-		.prepare(
-			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
-			        tc.duration_ms, tc.error_message, tc.created_at,
-			        tc.narrator_id, n.title AS narrator_title
-			 FROM narrator_tool_calls tc
-			 JOIN narrators n ON n.id = tc.narrator_id
-			 WHERE tc.tool_use_id = ?`,
-		)
-		.get(toolCallId) as
+	const tc = getToolCallStmt().get(toolCallId) as
 		| {
 				tool_use_id: string;
 				tool_name: string;

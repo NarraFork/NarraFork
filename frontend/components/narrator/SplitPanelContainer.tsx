@@ -82,12 +82,28 @@ export function SplitPanelContainer({
 
 // ── Leaf: NarratorPanel with drop overlay ──
 
+/** Threshold below which the panel uses compact (mobile-style) toolbar. */
+const COMPACT_WIDTH_THRESHOLD = 640;
+
 function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 	const { onSplitAndAssign, onReplace, onClose, onSwap, onMoveToSplit, canClose } =
 		useContext(SplitPanelCtx);
 	const [dropZone, setDropZone] = useState<DropZone>(null);
 	const boxRef = useRef<HTMLDivElement>(null);
 	const dropZoneRef = useRef<DropZone>(null);
+
+	// Track panel width to decide compact vs desktop toolbar
+	const [isCompact, setIsCompact] = useState(true);
+	useEffect(() => {
+		const el = boxRef.current;
+		if (!el) return;
+		const ro = new ResizeObserver((entries) => {
+			const width = entries[0]?.contentRect.width ?? 0;
+			setIsCompact(width < COMPACT_WIDTH_THRESHOLD);
+		});
+		ro.observe(el);
+		return () => ro.disconnect();
+	}, []);
 	/** Track the source leaf id when the drag originates from within the tree. */
 	const dragSourceLeafRef = useRef<string | null>(null);
 
@@ -188,7 +204,7 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 				<NarratorPanel
 					key={leaf.narratorId}
 					narratorId={leaf.narratorId}
-					compact
+					compact={isCompact}
 					onClose={canClose ? () => onClose(leaf.id) : undefined}
 					onHeaderPointerDown={handleHeaderPointerDown}
 				/>

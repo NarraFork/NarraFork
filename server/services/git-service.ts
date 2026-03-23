@@ -58,6 +58,10 @@ export interface GitStatusSummary {
 	totalFiles: number;
 	headSha: string;
 	branch: string;
+	/** Total lines added across all uncommitted changes (staged + unstaged + untracked). */
+	linesAdded: number;
+	/** Total lines removed across all uncommitted changes (staged + unstaged + untracked). */
+	linesRemoved: number;
 }
 
 function stripTrailingLineBreaks(text: string): string {
@@ -105,15 +109,59 @@ function countTextLines(content: string): number {
 	return content.endsWith("\n") ? lineCount - 1 : lineCount;
 }
 
+/** Max file size (bytes) to read for untracked line counting. Skip larger / binary files. */
+const MAX_UNTRACKED_FILE_SIZE = 1_000_000; // 1 MB
+/** Max number of untracked files to count lines for. */
+const MAX_UNTRACKED_LINE_COUNT_FILES = 200;
+/**
+ * Number of bytes to sample for binary detection.
+ * Matches VSCode's approach: read first 4100 bytes, scan for null byte.
+ * See: vscode/extensions/git/src/git.ts — detectObjectType()
+ */
+const BINARY_DETECT_BYTES = 4100;
+
+/**
+ * Detect whether a file is binary by reading its first bytes and scanning
+ * for null (0x00) bytes — the same heuristic used by VSCode and git itself.
+ * Returns true if the file appears to be binary.
+ */
+async function isBinaryFile(filePath: string, size: number): Promise<boolean> {
+	const bytesToRead = Math.min(size, BINARY_DETECT_BYTES);
+	try {
+		const file = Bun.file(filePath);
+		const slice = file.slice(0, bytesToRead);
+		const ab = await slice.arrayBuffer();
+		const view = new Uint8Array(ab);
+		for (let i = 0; i < view.length; i++) {
+			if (view[i] === 0) return true;
+		}
+		return false;
+	} catch {
+		return true; // If we can't read it, treat as binary
+	}
+}
+
 async function getUntrackedLineStatsMap(
 	worktreePath: string,
 	files: string[],
 ): Promise<Map<string, LineStats>> {
+	// Cap the number of files to avoid reading thousands of files into memory
+	const capped = files.slice(0, MAX_UNTRACKED_LINE_COUNT_FILES);
 	const entries = await Promise.all(
-		files.map(async (file) => {
+		capped.map(async (file) => {
 			try {
 				const filePath = join(worktreePath, file);
-				const content = await Bun.file(filePath).text();
+				const bunFile = Bun.file(filePath);
+				const size = bunFile.size;
+				// Skip files that are too large (likely binary or generated)
+				if (size > MAX_UNTRACKED_FILE_SIZE) {
+					return [file, { added: 0, removed: 0 }] as const;
+				}
+				// Binary detection: sample first bytes for null byte (VSCode approach)
+				if (size > 0 && (await isBinaryFile(filePath, size))) {
+					return [file, { added: 0, removed: 0 }] as const;
+				}
+				const content = await bunFile.text();
 				return [file, { added: countTextLines(content), removed: 0 }] as const;
 			} catch {
 				return [file, { added: 0, removed: 0 }] as const;
@@ -518,10 +566,10 @@ export const gitService = {
 		const result: Array<{ file: string; conflictLines: number }> = [];
 		for (const file of files) {
 			try {
-			const grepResult = await safeSpawn({
-				cmd: ["grep", "-c", "^<<<<<<<", file],
-				cwd: worktreePath,
-			});
+				const grepResult = await safeSpawn({
+					cmd: ["grep", "-c", "^<<<<<<<", file],
+					cwd: worktreePath,
+				});
 				const count = Number.parseInt(grepResult.stdout.trim(), 10) || 0;
 				result.push({ file, conflictLines: count });
 			} catch {
@@ -646,6 +694,18 @@ export const gitService = {
 			}
 		}
 
+		// Aggregate total line stats from the per-file maps we already computed
+		let totalLinesAdded = 0;
+		let totalLinesRemoved = 0;
+		for (const stats of stagedLineStats.values()) {
+			totalLinesAdded += stats.added;
+			totalLinesRemoved += stats.removed;
+		}
+		for (const stats of unstagedLineStats.values()) {
+			totalLinesAdded += stats.added;
+			totalLinesRemoved += stats.removed;
+		}
+
 		return {
 			hasChanges: entries.length > 0,
 			staged,
@@ -655,14 +715,23 @@ export const gitService = {
 			totalFiles: entries.length,
 			headSha: headResult.stdout,
 			branch: branchResult.stdout,
+			linesAdded: totalLinesAdded,
+			linesRemoved: totalLinesRemoved,
 		};
 	},
 
 	/** Get full diff of all uncommitted changes (staged + unstaged + untracked).
-	 *  Truncates at ~100KB to avoid blowing up AI token budgets. */
+	 *  Truncates at ~100KB to avoid blowing up AI token budgets.
+	 *  Binary files are excluded at the git level to prevent memory blowup. */
 	async getFullDiff(worktreePath: string, maxBytes = 100_000): Promise<string> {
-		// Diff of tracked files (staged + unstaged combined against HEAD)
-		const diffResult = await exec(["diff", "HEAD"], worktreePath);
+		// Diff of tracked files (staged + unstaged combined against HEAD).
+		// --no-binary: suppress binary file content in diff output.
+		// -D/--irreversible-delete: omit full content of deleted files.
+		const diffResult = await exec(
+			["diff", "HEAD", "--no-binary", "-D", "--no-color"],
+			worktreePath,
+			true,
+		);
 		const parts: string[] = [];
 		let totalLen = 0;
 
@@ -682,16 +751,30 @@ export const gitService = {
 			return parts.join("\n");
 		}
 
-		// List untracked files and show their content
+		// List untracked files and show their content (skip binary files)
 		const untrackedResult = await exec(
 			["ls-files", "--others", "--exclude-standard"],
 			worktreePath,
+			true,
 		);
 		const untrackedFiles = untrackedResult.stdout.split("\n").filter(Boolean);
-		for (const file of untrackedFiles) {
-			// --no-index always exits 1 when diff is found — silence the expected error log
-			const showResult = await exec(["diff", "--no-index", DEV_NULL, file], worktreePath, true);
+		// Cap the number of untracked files we diff to avoid spawning too many processes
+		const MAX_UNTRACKED_DIFFS = 50;
+		const filesToDiff = untrackedFiles.slice(0, MAX_UNTRACKED_DIFFS);
+		for (const file of filesToDiff) {
+			// --no-index always exits 1 when diff is found — silence the expected error log.
+			// --no-binary: skip binary file content.
+			const showResult = await exec(
+				["diff", "--no-index", "--no-binary", "--no-color", DEV_NULL, file],
+				worktreePath,
+				true,
+			);
 			if (showResult.stdout && !addPart(showResult.stdout)) break;
+		}
+		if (untrackedFiles.length > MAX_UNTRACKED_DIFFS) {
+			addPart(
+				`\n\n[... ${untrackedFiles.length - MAX_UNTRACKED_DIFFS} more untracked files omitted]`,
+			);
 		}
 
 		return parts.join("\n");
@@ -701,6 +784,7 @@ export const gitService = {
 	 * Get diff between two refs (commits, branches, tags).
 	 * Useful for review: shows all changes between a base and head.
 	 * Truncates at maxBytes to avoid blowing up token budgets.
+	 * Binary files are excluded to prevent memory blowup.
 	 */
 	async getDiffBetweenRefs(
 		repoPath: string,
@@ -708,7 +792,11 @@ export const gitService = {
 		headRef: string,
 		maxBytes = 100_000,
 	): Promise<string> {
-		const result = await exec(["diff", `${baseRef}..${headRef}`], repoPath, true);
+		const result = await exec(
+			["diff", "--no-binary", "--no-color", `${baseRef}..${headRef}`],
+			repoPath,
+			true,
+		);
 		if (!result.stdout) return "";
 		if (result.stdout.length > maxBytes) {
 			return `${result.stdout.slice(0, maxBytes)}\n\n[diff truncated — exceeded size limit]`;

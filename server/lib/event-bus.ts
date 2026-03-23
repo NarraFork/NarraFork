@@ -104,6 +104,7 @@ export type NarraForkEvent =
 			parentNarratorId: string;
 			toolUseId: string;
 			subagentType: string;
+			model?: string;
 	  }
 	| {
 			type: "narrator:subagent_completed";

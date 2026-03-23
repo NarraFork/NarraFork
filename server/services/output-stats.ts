@@ -33,6 +33,15 @@ export function recordOutputChunk(charCount: number): void {
 	if (charCount <= 0) return;
 	totalChars += charCount;
 	chunks.push({ chars: charCount, ts: Date.now() });
+	// Prevent unbounded growth when no subscribers are pruning via computeRate().
+	// At ~100 chunks/sec streaming, 10 000 entries ≈ 100 seconds of history — well
+	// beyond the 3-second window, so we only prune when clearly oversized.
+	if (chunks.length > 10_000) {
+		const cutoff = Date.now() - WINDOW_MS;
+		while (chunks.length > 0 && chunks[0].ts < cutoff) {
+			chunks.shift();
+		}
+	}
 }
 
 /** Prune entries older than the window and compute chars/sec. */

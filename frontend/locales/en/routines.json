@@ -14,6 +14,7 @@
 	"noProjectSelected": "Select a project to view its skills.",
 	"noGlobalSkills": "No global skills found. Create one to get started.",
 	"noMcpTools": "No MCP tools available.",
+	"refreshSkills": "Refresh",
 	"createSkill": "Create Skill",
 	"editSkill": "Edit Skill",
 	"deleteSkill": "Delete",

@@ -1,11 +1,14 @@
 import {
+	type CollisionDetection,
 	closestCenter,
 	DndContext,
 	type DragEndEvent,
 	type DragMoveEvent,
+	DragOverlay,
 	type DragStartEvent,
 	KeyboardSensor,
 	MouseSensor,
+	pointerWithin,
 	TouchSensor,
 	useSensor,
 	useSensors,
@@ -14,6 +17,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import { statusRegistry } from "@frontend/lib/status-registry";
 import {
+	ActionIcon,
 	Avatar,
 	Box,
 	Group,
@@ -24,6 +28,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import {
 	IconArrowUp,
 	IconBox,
@@ -32,12 +37,14 @@ import {
 	IconGitBranch,
 	IconMessageCircle,
 	IconMessageCircleFilled,
+	IconPlus,
 	IconTerminal2,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import type React from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
@@ -48,6 +55,7 @@ import {
 	useRecentTabs,
 } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
+import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import {
@@ -57,6 +65,8 @@ import {
 	startNarratorDragManual,
 } from "../../lib/narrator-drag";
 import { triggerNotification } from "../../lib/notification";
+import { CreateNarratorModal, type CreateNarratorResult } from "../narrator/CreateNarratorModal";
+import { addLeaf, type SplitNode } from "../narrator/split-tree";
 import { UserAvatar } from "../UserAvatar";
 
 const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
@@ -240,6 +250,69 @@ interface RecentTabListProps {
 }
 
 /**
+ * Custom collision detection that groups workspace children with their header.
+ * When the pointer is over any workspace child (or its workspace header),
+ * the entire workspace group is treated as a single drop target.
+ * This ensures dragging an external item over a workspace causes the whole
+ * group to shift together visually.
+ */
+function workspaceGroupCollisionDetection(
+	args: Parameters<CollisionDetection>[0],
+	sortItems: RecentTab[],
+	childrenByWorkspace: Map<string, RecentTab[]>,
+): ReturnType<CollisionDetection> {
+	// First, use pointerWithin to find which items the pointer is over.
+	const pointerCollisions = pointerWithin(args);
+
+	if (pointerCollisions.length === 0) {
+		// No items under pointer — fall back to closestCenter.
+		return closestCenter(args);
+	}
+
+	// Find the first item under the pointer.
+	const first = pointerCollisions[0];
+	if (!first) return pointerCollisions;
+
+	const tab = sortItems.find((t) => tabSortId(t) === first.id);
+	if (!tab) return pointerCollisions;
+
+	// Determine the group that this item belongs to.
+	// A workspace header or child belongs to the workspace group.
+	const groupIds: string[] = [];
+
+	if (tab.type === "workspace") {
+		// Pointer is over the workspace header — include header + all children.
+		groupIds.push(tabSortId(tab));
+		const children = childrenByWorkspace.get(tab.id) ?? [];
+		groupIds.push(...children.map((c) => tabSortId(c)));
+	} else if (tab.workspaceId) {
+		// Pointer is over a workspace child — include the workspace header + all children.
+		const wsHeader = sortItems.find((t) => t.type === "workspace" && t.id === tab.workspaceId);
+		if (wsHeader) groupIds.push(tabSortId(wsHeader));
+		const children = childrenByWorkspace.get(tab.workspaceId) ?? [];
+		groupIds.push(...children.map((c) => tabSortId(c)));
+	} else {
+		// Non-workspace item — no grouping needed.
+		groupIds.push(first.id as string);
+	}
+
+	// Filter pointer collisions to only include items in the same group.
+	// But always include the first collision (the actual drop target) and any
+	// siblings in the same workspace group.
+	const groupIdSet = new Set(groupIds);
+	const groupCollisions = pointerCollisions.filter((c) => groupIdSet.has(c.id as string));
+
+	// If we're dragging a workspace header, we want the group to be treated as one.
+	// Return the collision for the workspace header if it's in the group.
+	const wsHeaderCollision = groupCollisions.find((c) => {
+		const t = sortItems.find((s) => tabSortId(s) === c.id);
+		return t?.type === "workspace";
+	});
+
+	return wsHeaderCollision ? [wsHeaderCollision] : groupCollisions;
+}
+
+/**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
  * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
  */
@@ -252,13 +325,21 @@ export function RecentTabList({
 	const { tabs, removeTab, moveTab } = useRecentTabs();
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const navigate = useNavigate();
+	const qc = useQueryClient();
 	const { t } = useTranslation("nav");
+	const requireSetup = useSetupWizardGuard();
 
 	const [ctxMenu, setCtxMenu] = useState<{
 		x: number;
 		y: number;
 		tab: RecentTab;
 	} | null>(null);
+
+	// Workspace "add narrator" modal state
+	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
+
+	// Drag state: the tab currently being dragged (for workspace, tracks the whole group)
+	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
 
 	const filtered = useMemo(
 		() =>
@@ -284,6 +365,50 @@ export function RecentTabList({
 		return { topLevel: top, childrenByWorkspace: byWs };
 	}, [filtered]);
 
+	// Build a flat array of all items in visual order (topLevel + their workspace children).
+	// This ensures dnd-kit sees the true layout so that dragging external items over
+	// a workspace causes the whole group (header + children) to shift together.
+	const sortItems = useMemo(() => {
+		const items: RecentTab[] = [];
+		for (const tab of topLevel) {
+			items.push(tab);
+			if (tab.type === "workspace") {
+				const children = childrenByWorkspace.get(tab.id) ?? [];
+				items.push(...children);
+			}
+		}
+		return items;
+	}, [topLevel, childrenByWorkspace]);
+
+	// Helper: for a given sortIdx, return the indices of the whole workspace group
+	// that the item at that index belongs to (header + all children).
+	// Returns a range [startIdx, endIdx] (inclusive).
+	// Returns [idx, idx] for non-workspace items.
+	const getWorkspaceGroupRange = useCallback(
+		(idx: number): [start: number, end: number] => {
+			const tab = sortItems[idx];
+			if (!tab) return [idx, idx];
+			if (tab.type !== "workspace") return [idx, idx];
+			// Find the last index of this workspace's children
+			let end = idx;
+			for (let i = idx + 1; i < sortItems.length; i++) {
+				if (sortItems[i].workspaceId === tab.id) end = i;
+				else break;
+			}
+			return [idx, end];
+		},
+		[sortItems],
+	);
+
+	// Custom collision detection: when pointer is over a workspace child or header,
+	// treat the entire workspace group as a single target so dragging external items
+	// over a workspace causes the whole group to shift together.
+	const collisionDetection = useCallback(
+		(args: Parameters<CollisionDetection>[0]) =>
+			workspaceGroupCollisionDetection(args, sortItems, childrenByWorkspace),
+		[sortItems, childrenByWorkspace],
+	);
+
 	const sensors = useSensors(
 		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
@@ -293,7 +418,8 @@ export function RecentTabList({
 	// Bridge @dnd-kit drag into global narrator drag so workspace panels can receive drops
 	const handleDragStart = useCallback(
 		(event: DragStartEvent) => {
-			const tab = topLevel.find((t) => tabSortId(t) === event.active.id);
+			setDraggingTabId(event.active.id as string);
+			const tab = sortItems.find((t) => tabSortId(t) === event.active.id);
 			if (!tab) return;
 			const nId = tab.type === "narrator" ? tab.id : tab.type === "chapter" ? tab.narratorId : null;
 			if (!nId) return;
@@ -302,7 +428,7 @@ export function RecentTabList({
 			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
 			startNarratorDragManual(nId, tab.title, x, y);
 		},
-		[topLevel],
+		[sortItems],
 	);
 
 	const handleDragMove = useCallback((event: DragMoveEvent) => {
@@ -315,28 +441,69 @@ export function RecentTabList({
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
 			justDragged = true;
+			setDraggingTabId(null);
 			// End global narrator drag first — workspace drop handlers run synchronously
 			endNarratorDrag();
 
 			const { active, over } = event;
 			if (!over || active.id === over.id) return;
-			const oldIndex = topLevel.findIndex((t) => tabSortId(t) === active.id);
-			const newIndex = topLevel.findIndex((t) => tabSortId(t) === over.id);
-			if (oldIndex === -1 || newIndex === -1) return;
 
-			// Compute the global index in the full tabs array based on the target tab's actual position.
-			const targetTab = topLevel[newIndex];
-			const globalIndex = tabs.findIndex((t) => tabSortId(t) === tabSortId(targetTab));
-			if (globalIndex === -1) return;
+			// Find sort indices of active (dragged) and over (drop target) items.
+			const oldSortIdx = sortItems.findIndex((t) => tabSortId(t) === active.id);
+			const newSortIdx = sortItems.findIndex((t) => tabSortId(t) === over.id);
+			if (oldSortIdx === -1 || newSortIdx === -1) return;
 
-			moveTab(active.id as string, { toIndex: globalIndex });
+			const activeTab = sortItems[oldSortIdx];
+			if (!activeTab) return;
+
+			// Determine the range of indices of the target (over) group.
+			const [overStart, overEnd] = getWorkspaceGroupRange(newSortIdx);
+
+			// If the active item is a workspace header, move the whole group.
+			// If the active item is a workspace child, move only the child.
+			if (activeTab.type === "workspace") {
+				// Determine insertion point based on direction.
+				const overTab = sortItems[overStart];
+				if (!overTab) return;
+
+				if (overStart === oldSortIdx) return; // no-op
+
+				const overGlobalIdx = tabs.findIndex((t) => tabSortId(t) === tabSortId(overTab));
+				if (overGlobalIdx === -1) return;
+
+				let insertIdx: number;
+				if (oldSortIdx < newSortIdx) {
+					// Moving down: insert after the target group (the group occupies [overStart..overEnd]).
+					const afterOverTab = sortItems[overEnd];
+					if (!afterOverTab) return;
+					const afterOverGlobalIdx = tabs.findIndex(
+						(t) => tabSortId(t) === tabSortId(afterOverTab),
+					);
+					insertIdx = afterOverGlobalIdx + 1;
+				} else {
+					// Moving up: insert before the target group's header.
+					insertIdx = overGlobalIdx;
+				}
+
+				// Move the header tab — children follow implicitly via backend ordering by workspaceId.
+				moveTab(tabSortId(activeTab), { toIndex: insertIdx });
+			} else {
+				// Normal item (non-workspace) drag — move single item.
+				const targetTab = sortItems[overStart];
+				if (!targetTab) return;
+				const globalIndex = tabs.findIndex((t) => tabSortId(t) === tabSortId(targetTab));
+				if (globalIndex === -1) return;
+				moveTab(active.id as string, { toIndex: globalIndex });
+			}
 		},
-		[topLevel, tabs, moveTab],
+		[sortItems, tabs, moveTab, getWorkspaceGroupRange],
 	);
 
 	/** Release all child tabs from a workspace and delete the workspace entity. */
 	const releaseWorkspace = useCallback(
 		(wsId: string) => {
+			// Remove query cache first to prevent 404 errors on the workspace page
+			qc.removeQueries({ queryKey: ["workspace", wsId] });
 			const children = childrenByWorkspace.get(wsId);
 			if (children) {
 				for (const child of children) {
@@ -351,7 +518,7 @@ export function RecentTabList({
 			}
 			api.deleteWorkspace(wsId).catch(() => {});
 		},
-		[childrenByWorkspace],
+		[childrenByWorkspace, qc],
 	);
 
 	/** Remove a tab and navigate to dashboard if it was the active page. */
@@ -416,26 +583,100 @@ export function RecentTabList({
 
 	const handleDragCancel = useCallback(() => {
 		endNarratorDrag();
+		setDraggingTabId(null);
 	}, []);
+
+	const handleWsAddClick = useCallback(
+		(e: React.MouseEvent, wsId: string) => {
+			e.stopPropagation();
+			e.preventDefault();
+			if (!requireSetup()) return;
+			setWsCreateTarget(wsId);
+		},
+		[requireSetup],
+	);
+
+	const handleWsNarratorCreated = useCallback(
+		async (data: CreateNarratorResult) => {
+			if (!wsCreateTarget) return;
+			const wsId = wsCreateTarget;
+			setWsCreateTarget(null);
+			// Add to recent tabs with workspaceId
+			addRecentTab({
+				type: "narrator",
+				id: data.id,
+				title: data.title,
+				subtitle: data.cwd,
+				status: data.status,
+				workspaceId: wsId,
+			});
+			// Fetch current workspace tree, add the new leaf, persist
+			try {
+				const ws = (await api.getWorkspace(wsId)) as { tree?: string };
+				const tree: SplitNode = ws?.tree
+					? (JSON.parse(ws.tree) as SplitNode)
+					: { type: "leaf", id: "sp_1", narratorId: null };
+				const updated = addLeaf(tree, data.id);
+				await api.updateWorkspace(wsId, { tree: JSON.stringify(updated) });
+				qc.invalidateQueries({ queryKey: ["workspace", wsId] });
+			} catch (err) {
+				notifications.show({
+					color: "yellow",
+					title: t("workspaceTreeUpdateFailed") ?? "Workspace layout update failed",
+					message: err instanceof Error ? err.message : String(err),
+				});
+			}
+			// Navigate to the workspace
+			navigate({ to: `/narrators/workspace/${wsId}` });
+			onNavigate?.();
+		},
+		[wsCreateTarget, qc, navigate, onNavigate, t],
+	);
 
 	if (topLevel.length === 0) return null;
 
-	const sortIds = topLevel.map(tabSortId);
+	const sortIds = sortItems.map(tabSortId);
+
+	// The tab being dragged (may be a workspace header or a child).
+	const draggingTab = draggingTabId
+		? (sortItems.find((t) => tabSortId(t) === draggingTabId) ?? null)
+		: null;
 
 	return (
 		<Box style={{ overflow: "hidden" }}>
 			<DndContext
 				sensors={sensors}
-				collisionDetection={closestCenter}
+				collisionDetection={collisionDetection}
 				onDragStart={handleDragStart}
 				onDragMove={handleDragMove}
 				onDragEnd={handleDragEnd}
 				onDragCancel={handleDragCancel}
 			>
 				<SortableContext items={sortIds} strategy={verticalListSortingStrategy}>
-					{topLevel.map((tab, i) => (
-						<React.Fragment key={tabSortId(tab)}>
+					{sortItems.map((tab, sortIdx) => {
+						const isHeader = !tab.workspaceId;
+						const isDraggingThis = tabSortId(tab) === draggingTabId;
+
+						// Workspace children use a compact sortable component.
+						if (!isHeader) {
+							return (
+								<SortableWorkspaceChildTab
+									key={tabSortId(tab)}
+									tab={tab}
+									active={
+										isTabActive(tab, pathname) &&
+										!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
+									}
+									onNavigate={onNavigate}
+									onContextMenu={handleContextMenu}
+									dimmed={isDraggingThis}
+								/>
+							);
+						}
+
+						return (
 							<SortableTabItem
+								key={tabSortId(tab)}
 								tab={tab}
 								active={
 									isTabActive(tab, pathname) &&
@@ -444,27 +685,26 @@ export function RecentTabList({
 								onRemove={handleRemove}
 								onNavigate={onNavigate}
 								onContextMenu={handleContextMenu}
-								connectTop={firstTabConnected && i === 0}
+								connectTop={
+									firstTabConnected && sortIdx === topLevel.findIndex((t) => !t.workspaceId)
+								}
+								onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
+								dimmed={isDraggingThis}
 							/>
-							{/* Render workspace children indented below */}
-							{tab.type === "workspace" &&
-								childrenByWorkspace
-									.get(tab.id)
-									?.map((child) => (
-										<WorkspaceChildTab
-											key={tabSortId(child)}
-											tab={child}
-											active={
-												isTabActive(child, pathname) &&
-												!(excludeActiveNarratorId && child.id === excludeActiveNarratorId)
-											}
-											onNavigate={onNavigate}
-											onContextMenu={handleContextMenu}
-										/>
-									))}
-						</React.Fragment>
-					))}
+						);
+					})}
 				</SortableContext>
+				{/* Floating overlay while dragging a workspace header — shows the whole group. */}
+				<DragOverlay>
+					{draggingTab && draggingTab.type === "workspace" ? (
+						<Box style={{ opacity: 0.9 }}>
+							<DragOverlayWorkspaceItem
+								tab={draggingTab}
+								wsChildren={childrenByWorkspace.get(draggingTab.id) ?? []}
+							/>
+						</Box>
+					) : null}
+				</DragOverlay>
 			</DndContext>
 			{ctxMenu && (
 				<TabContextMenu
@@ -478,9 +718,15 @@ export function RecentTabList({
 					isFirst={
 						topLevel.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
 					}
+					isWorkspace={ctxMenu.tab.type === "workspace"}
 					t={t}
 				/>
 			)}
+			<CreateNarratorModal
+				opened={wsCreateTarget !== null}
+				onClose={() => setWsCreateTarget(null)}
+				onCreated={handleWsNarratorCreated}
+			/>
 		</Box>
 	);
 }
@@ -521,18 +767,75 @@ function WorkspaceChildTab({
 	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
 
 	return (
-		<Box pl="lg">
+		<NavLink
+			active={active}
+			label={<Text size="xs">{tab.title}</Text>}
+			leftSection={
+				tab.type === "chapter" ? (
+					<IconGitBranch
+						size={14}
+						color={iconColor}
+						fill={filledStatus ? "currentColor" : "none"}
+					/>
+				) : filledStatus ? (
+					<IconMessageCircleFilled size={14} color={iconColor} />
+				) : (
+					<IconMessageCircle size={14} color={iconColor} />
+				)
+			}
+			onClick={() => {
+				onNavigate?.();
+				navigate({ to });
+			}}
+			onContextMenu={(e) => onContextMenu(e, tab)}
+			py={2}
+			pl="lg"
+			styles={{
+				root: { borderRadius: 4, minHeight: 28 },
+				label: { overflow: "hidden" },
+			}}
+		/>
+	);
+}
+
+/** Compact sortable child tab for workspace children. */
+function SortableWorkspaceChildTab({
+	tab,
+	active,
+	onNavigate,
+	onContextMenu,
+	dimmed,
+}: {
+	tab: RecentTab;
+	active: boolean;
+	onNavigate?: () => void;
+	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
+	dimmed?: boolean;
+}) {
+	const navigate = useNavigate();
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: tabSortId(tab),
+	});
+	const to =
+		tab.type === "chapter" && tab.narratorId
+			? `/narrators/${tab.narratorId}`
+			: `/narrators/${tab.id}`;
+	const iconColor = tab.status
+		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		: undefined;
+	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+
+	const sortStyle: React.CSSProperties = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0 : dimmed ? 0.3 : 1,
+	};
+
+	return (
+		<div ref={setNodeRef} {...attributes} {...listeners} style={sortStyle}>
 			<NavLink
 				active={active}
-				label={
-					<Text
-						size="xs"
-						truncate="end"
-						style={{ overflow: "hidden", textOverflow: "ellipsis", textAlign: "left" }}
-					>
-						{tab.title}
-					</Text>
-				}
+				label={<Text size="xs">{tab.title}</Text>}
 				leftSection={
 					tab.type === "chapter" ? (
 						<IconGitBranch
@@ -552,11 +855,57 @@ function WorkspaceChildTab({
 				}}
 				onContextMenu={(e) => onContextMenu(e, tab)}
 				py={2}
+				pl="lg"
 				styles={{
 					root: { borderRadius: 4, minHeight: 28 },
 					label: { overflow: "hidden" },
 				}}
 			/>
+		</div>
+	);
+}
+
+/**
+ * Rendered in DragOverlay while a workspace is being dragged.
+ * Shows the workspace title + all its child tabs as a single floating preview.
+ */
+function DragOverlayWorkspaceItem({
+	tab,
+	wsChildren,
+}: {
+	tab: RecentTab;
+	wsChildren: RecentTab[];
+}) {
+	const { attributes, listeners, setNodeRef, transform, transition } = useSortable({
+		id: tabSortId(tab),
+	});
+
+	const sortStyle: React.CSSProperties = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+	};
+
+	return (
+		<Box style={{ ...sortStyle, boxShadow: "0 8px 24px rgba(0,0,0,0.4)", borderRadius: 8 }}>
+			<NavLink
+				ref={setNodeRef}
+				{...attributes}
+				{...listeners}
+				active={false}
+				label={<Text size="sm">{tab.title}</Text>}
+				leftSection={<IconColumns size={16} />}
+				styles={{
+					root: { cursor: "grabbing", background: "var(--mantine-color-dark-7)" },
+				}}
+			/>
+			{wsChildren.map((child) => (
+				<WorkspaceChildTab
+					key={tabSortId(child)}
+					tab={child}
+					active={false}
+					onContextMenu={() => {}}
+				/>
+			))}
 		</Box>
 	);
 }
@@ -569,6 +918,10 @@ interface SortableTabItemProps {
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	/** When true and active, remove top border-radius to connect with nav above */
 	connectTop?: boolean;
+	/** Workspace-only: click handler for the "add narrator" button */
+	onWsAddClick?: (e: React.MouseEvent, wsId: string) => void;
+	/** When true, reduce opacity to indicate the item is being dragged */
+	dimmed?: boolean;
 }
 
 function SortableTabItem({
@@ -578,6 +931,8 @@ function SortableTabItem({
 	onNavigate,
 	onContextMenu,
 	connectTop,
+	onWsAddClick,
+	dimmed,
 }: SortableTabItemProps) {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
@@ -601,7 +956,7 @@ function SortableTabItem({
 	const sortStyle: React.CSSProperties = {
 		transform: CSS.Transform.toString(transform),
 		transition,
-		opacity: isDragging ? 0.5 : 1,
+		opacity: isDragging ? 0 : dimmed ? 0.3 : 1,
 		zIndex: isDragging ? 10 : undefined,
 	};
 
@@ -776,6 +1131,20 @@ function SortableTabItem({
 							)}
 						</span>
 					}
+					rightSection={
+						onWsAddClick ? (
+							<Tooltip label={t("addToWorkspace")} position="right">
+								<ActionIcon
+									size="xs"
+									variant="subtle"
+									onClick={(e: React.MouseEvent) => onWsAddClick(e, tab.id)}
+									onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
+								>
+									<IconPlus size={14} />
+								</ActionIcon>
+							</Tooltip>
+						) : undefined
+					}
 					styles={{
 						root: {
 							cursor: "pointer",
@@ -907,6 +1276,7 @@ interface TabContextMenuProps {
 	onReveal: () => void;
 	canReveal: boolean;
 	isFirst: boolean;
+	isWorkspace: boolean;
 	t: (key: string) => string;
 }
 
@@ -919,6 +1289,7 @@ function TabContextMenu({
 	onReveal,
 	canReveal,
 	isFirst,
+	isWorkspace,
 	t,
 }: TabContextMenuProps) {
 	return (
@@ -958,7 +1329,7 @@ function TabContextMenu({
 					<UnstyledButton px="xs" py={4} onClick={onRemove} style={{ borderRadius: 4 }}>
 						<Group gap={8} wrap="nowrap">
 							<IconX size={14} />
-							<Text size="sm">{t("closeTab")}</Text>
+							<Text size="sm">{t(isWorkspace ? "dissolveWorkspace" : "closeTab")}</Text>
 						</Group>
 					</UnstyledButton>
 					{canReveal && (

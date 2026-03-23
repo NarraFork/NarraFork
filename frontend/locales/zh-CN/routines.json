@@ -14,6 +14,7 @@
 	"noProjectSelected": "选择一个项目以查看其技能。",
 	"noGlobalSkills": "暂无全局技能。创建一个开始使用。",
 	"noMcpTools": "暂无可用的 MCP 工具。",
+	"refreshSkills": "刷新",
 	"createSkill": "创建技能",
 	"editSkill": "编辑技能",
 	"deleteSkill": "删除",

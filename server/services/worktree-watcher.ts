@@ -162,13 +162,10 @@ export const worktreeWatcher = {
 
 	/** Internal: process a debounced file change event. */
 	async _processChange(worktreePath: string, entry: WatcherEntry): Promise<void> {
-		const { chapterId, narratorIds, locale } = entry;
+		const { chapterId, narratorIds } = entry;
 
-		const [statusSummary, lineStats, currentHead] = await Promise.all([
-			gitService.getStatusSummary(worktreePath),
-			gitService.getUncommittedLineStats(worktreePath),
-			gitService.getHeadCommit(worktreePath).catch(() => ""),
-		]);
+		const statusSummary = await gitService.getStatusSummary(worktreePath);
+		const currentHead = statusSummary.headSha;
 
 		// Strip files array from WS broadcast to keep payloads small
 		const { files: _files, ...statusWithoutFiles } = statusSummary;
@@ -181,8 +178,8 @@ export const worktreeWatcher = {
 				chapterId,
 				toolUseId: "",
 				status: statusWithoutFiles as typeof statusSummary,
-				linesAdded: lineStats.added,
-				linesRemoved: lineStats.removed,
+				linesAdded: statusSummary.linesAdded,
+				linesRemoved: statusSummary.linesRemoved,
 			});
 		}
 

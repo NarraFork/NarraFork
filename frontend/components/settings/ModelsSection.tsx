@@ -1,5 +1,5 @@
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
-import { Button, Select, Stack, Text } from "@mantine/core";
+import { Button, MultiSelect, Select, Stack, Text } from "@mantine/core";
 import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -26,6 +26,8 @@ export interface ModelsSectionProps {
 	setSubagentPlanModel: (v: string) => void;
 	codexDefaultReasoningEffort: string;
 	setCodexDefaultReasoningEffort: (v: string) => void;
+	subagentAllowedModels: string[];
+	setSubagentAllowedModels: (v: string[]) => void;
 	groupedModels: ComboboxData;
 	navigate: (opts: ToOptions & NavigateOptions) => void;
 }
@@ -41,6 +43,8 @@ export function ModelsSection({
 	setSubagentPlanModel,
 	codexDefaultReasoningEffort,
 	setCodexDefaultReasoningEffort,
+	subagentAllowedModels,
+	setSubagentAllowedModels,
 	groupedModels,
 	navigate,
 }: ModelsSectionProps) {
@@ -122,6 +126,16 @@ export function ModelsSection({
 					placeholder={t("subagentModelInherit")}
 					value={subagentPlanModel || null}
 					onChange={(v) => setSubagentPlanModel(v ?? "")}
+				/>
+				<MultiSelect
+					label={t("subagentAllowedModels")}
+					description={t("subagentAllowedModelsDesc")}
+					data={prefixedModels}
+					searchable
+					clearable
+					placeholder={t("subagentAllowedModelsPlaceholder")}
+					value={subagentAllowedModels}
+					onChange={setSubagentAllowedModels}
 				/>
 			</Stack>
 			<Select

@@ -128,11 +128,9 @@ export function renderToolRun(
 									)}
 								</>
 							) : (
-								<Box p="xs">
-									<Paper withBorder radius="sm" p="xs">
-										{header}
-									</Paper>
-								</Box>
+								<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
+									{header}
+								</Paper>
 							)}
 						</ContentViewer>
 					</div>

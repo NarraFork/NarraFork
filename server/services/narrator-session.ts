@@ -919,7 +919,9 @@ export function resolvePermissionDecision(
 		}
 		// Fallback: respect permission mode
 		if (effectiveMode === "bypassPermissions") return "allow";
-		if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
+		if (effectiveMode === "dontAsk") return "deny";
+		// readOnly: WebFetch is a read-only operation — ask instead of deny
+		if (effectiveMode === "readOnly") return "ask";
 		return "ask";
 	}
 
@@ -1150,9 +1152,9 @@ export async function handlePermission(
 			const absPath = resolvePath(cwd, filePath);
 			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
 			if (!pathsEqual(absPath, planFilePath)) {
-				// Check if the filename looks like a generic plan file
+				// Check if the filename looks like a plan file (plan.md, plan-xxx.md, PLAN.md, etc.)
 				const fileName = filePath.split("/").pop()?.toLowerCase() ?? "";
-				if (fileName === "plan.md") {
+				if (/^plan(?:[-_].+)?\.md$/.test(fileName)) {
 					const correctRelPath = `.narrafork/plan-${planFileId}.md`;
 					effectiveInput = { ...effectiveInput, file_path: correctRelPath };
 					planRedirectNotice = getToolMessageWithParams("planModeFileRedirected", locale, {
@@ -2741,9 +2743,8 @@ async function runAgentLoop(
 										baseBranch
 											? gitService.getCommitsAhead(worktreePath, baseBranch)
 											: Promise.resolve({ count: 0, baseBranch: "" }),
-										gitService.getUncommittedLineStats(worktreePath),
 									]).then(
-										([gitStatus, ahead, lines]) => {
+										([gitStatus, ahead]) => {
 											// Strip files array from WS broadcast to avoid
 											// sending huge payloads when many files are changed.
 											// The Git panel fetches the full list via API.
@@ -2756,8 +2757,8 @@ async function runAgentLoop(
 												status: statusWithoutFiles as typeof gitStatus,
 												commitsAhead: ahead.count,
 												baseBranch: ahead.baseBranch,
-												linesAdded: lines.added,
-												linesRemoved: lines.removed,
+												linesAdded: gitStatus.linesAdded,
+												linesRemoved: gitStatus.linesRemoved,
 											});
 										},
 										(err) => {
@@ -2892,7 +2893,9 @@ async function runAgentLoop(
 							cleanupTasks.push(narratorService.updateStatus(narratorId, "interrupted"));
 						}
 						if (partialId) {
-							cleanupTasks.push(cleanupPartialMessage(partialId, narratorId));
+							cleanupTasks.push(
+								finalizeOrCleanupPartialMessage(partialId, narratorId).then(() => {}),
+							);
 						}
 						await Promise.all(cleanupTasks).catch((err) => {
 							logger.warn("Post-interrupt cleanup failed", {
@@ -2903,7 +2906,7 @@ async function runAgentLoop(
 						return;
 					}
 					if (partialId) {
-						await cleanupPartialMessage(partialId, narratorId);
+						await finalizeOrCleanupPartialMessage(partialId, narratorId);
 					}
 					logger.error("Agent loop error", { narratorId, error: message });
 					await narratorService.updateStatus(narratorId, "error", message);
@@ -3035,13 +3038,13 @@ async function runAgentLoop(
 
 			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 			if (result.contextLengthExceeded && active.alive) {
-				// Clean up partial message from the failed turn before any retry
-				// path — context overflow retries rebuild history from DB, so a
-				// stale partialMessageId would corrupt the next turn.
+				// Finalize or clean up the partial message from the failed turn.
+				// If tools were already executed, the message is kept so the
+				// retry's rebuilt history includes them.
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
 				if (partialId) {
-					await cleanupPartialMessage(partialId, narratorId);
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
 				}
 
 				const overflow = await handleContextOverflow({
@@ -3094,13 +3097,14 @@ async function runAgentLoop(
 					signal: active.abortController.signal,
 				});
 				if (shouldRetry) {
-					// Clean up partial message from the failed turn so the retry
-					// starts fresh — otherwise the stale partialMessageId causes
-					// the next turn's block_complete events to append to the old message.
+					// Finalize or clean up the partial message from the failed turn.
+					// If tools were already executed (side effects occurred), the message
+					// is kept so buildHistory includes them and the model won't repeat them.
+					// Otherwise the partial is deleted so the retry starts fresh.
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
 					if (partialId) {
-						await cleanupPartialMessage(partialId, narratorId);
+						await finalizeOrCleanupPartialMessage(partialId, narratorId);
 					}
 					continue;
 				}
@@ -4421,6 +4425,108 @@ export async function cleanupPartialMessage(partialId: string, narratorId: strin
 			partialId,
 			error: String(err),
 		});
+	}
+}
+
+/**
+ * Finalize or clean up a partial message before retry.
+ *
+ * If the partial message has tool calls with real execution results
+ * (status is success, fail, or running), keep the message — those tools
+ * produced side effects that cannot be undone.  Unexecuted tool_calls
+ * (initializing / pending) are removed, and the message's contentJson is
+ * trimmed to match.  Running tool_calls are marked as fail (interrupted).
+ *
+ * If no tool call was actually executed, the entire partial message is
+ * deleted via {@link cleanupPartialMessage}.
+ *
+ * @returns `true` if the message was kept (finalized), `false` if deleted.
+ */
+export async function finalizeOrCleanupPartialMessage(
+	partialId: string,
+	narratorId: string,
+): Promise<boolean> {
+	try {
+		const toolCalls = await db.query.narratorToolCalls.findMany({
+			where: eq(narratorToolCalls.messageId, partialId),
+			columns: { id: true, toolUseId: true, status: true },
+		});
+
+		// Statuses that indicate the tool was actually executed (side effects occurred)
+		const executedStatuses = new Set(["success", "fail", "running"]);
+		const executed = toolCalls.filter((tc) => executedStatuses.has(tc.status));
+
+		if (executed.length === 0) {
+			// No tool was actually executed — safe to delete everything
+			await cleanupPartialMessage(partialId, narratorId);
+			return false;
+		}
+
+		// Some tools were executed — keep the message, clean up the rest
+		const unexecuted = toolCalls.filter((tc) => !executedStatuses.has(tc.status));
+		const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
+
+		await db.transaction(async (tx) => {
+			// Delete unexecuted tool_call records
+			if (unexecuted.length > 0) {
+				await tx.delete(narratorToolCalls).where(
+					inArray(
+						narratorToolCalls.id,
+						unexecuted.map((tc) => tc.id),
+					),
+				);
+			}
+
+			// Mark running tool_calls as fail (interrupted by retry)
+			const running = executed.filter((tc) => tc.status === "running");
+			if (running.length > 0) {
+				await tx
+					.update(narratorToolCalls)
+					.set({
+						status: "fail",
+						errorMessage: "Interrupted by API error during retry",
+					})
+					.where(
+						inArray(
+							narratorToolCalls.id,
+							running.map((tc) => tc.id),
+						),
+					);
+			}
+
+			// Remove unexecuted tool_use blocks from contentJson
+			if (unexecutedToolUseIds.size > 0) {
+				const msg = await tx.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, partialId),
+					columns: { contentJson: true },
+				});
+				if (msg && Array.isArray(msg.contentJson)) {
+					const filtered = (msg.contentJson as Array<Record<string, unknown>>).filter(
+						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
+					);
+					await tx
+						.update(narratorMessages)
+						.set({ contentJson: filtered })
+						.where(eq(narratorMessages.id, partialId));
+				}
+			}
+		});
+
+		logger.info("Finalized partial message with executed tool calls", {
+			narratorId,
+			partialId,
+			executedCount: executed.length,
+			removedCount: unexecuted.length,
+		});
+		return true;
+	} catch (err) {
+		logger.warn("Failed to finalize partial message, falling back to cleanup", {
+			narratorId,
+			partialId,
+			error: String(err),
+		});
+		await cleanupPartialMessage(partialId, narratorId);
+		return false;
 	}
 }
 

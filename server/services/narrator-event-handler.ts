@@ -126,7 +126,13 @@ export interface StreamingSnapshot {
 	toolChunks: Map<string, ToolChunkSnapshot>;
 }
 
-const streamingSnapshots = new Map<string, StreamingSnapshot>();
+const streamingSnapshots = (() => {
+	const sym = Symbol.for("narrafork.streamingSnapshots");
+	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
+	const g = globalThis as any;
+	if (!g[sym]) g[sym] = new Map<string, StreamingSnapshot>();
+	return g[sym] as Map<string, StreamingSnapshot>;
+})();
 
 function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 	let snap = streamingSnapshots.get(narratorId);
@@ -623,6 +629,11 @@ export async function processEvent(
 				if (event.brokenInputOverride) {
 					await narratorService.overwriteToolCallInput(event.toolUseId, event.brokenInputOverride);
 				}
+				// Permission-level input redirect (e.g. plan-mode file path):
+				// update the persisted inputJson to reflect the actual path used.
+				else if (event.updatedInput) {
+					await narratorService.overwriteToolCallInput(event.toolUseId, event.updatedInput);
+				}
 			} catch (err) {
 				logger.error("Failed to persist tool result", {
 					narratorId,
@@ -644,6 +655,8 @@ export async function processEvent(
 							event.toolUseId,
 							event.brokenInputOverride,
 						);
+					} else if (event.updatedInput) {
+						await narratorService.overwriteToolCallInput(event.toolUseId, event.updatedInput);
 					}
 				} catch (retryErr) {
 					logger.error("CRITICAL: tool_result persist failed after retry", {

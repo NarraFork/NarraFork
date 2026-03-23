@@ -4,7 +4,6 @@ import { chapterCommits, chapters, narratorMessages, projects } from "../db/sche
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
-import { gitService } from "./git-service";
 
 type CommitSource = "manual" | "auto" | "merge" | "cherry_pick" | "initial";
 
@@ -187,8 +186,9 @@ export const commitSyncService = {
 			await db.insert(chapterCommits).values(chunk).onConflictDoNothing();
 		}
 
-		// Update chapter head and count
-		const headSha = await gitService.getHeadCommit(cwd);
+		// Update chapter head and count — reuse the first commit from git log
+		// (which is the latest / HEAD) instead of spawning a separate git process.
+		const headSha = rawCommits[0].sha;
 		const totalCount = await db.$count(chapterCommits, eq(chapterCommits.chapterId, chapterId));
 		await db
 			.update(chapters)

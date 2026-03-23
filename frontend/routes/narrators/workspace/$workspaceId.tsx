@@ -22,12 +22,15 @@ import {
 	swapLeaves,
 	updateSizes,
 } from "../../../components/narrator/split-tree";
-import { addRecentTab } from "../../../hooks/useRecentTabs";
+import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
 import { api } from "../../../lib/api";
 
 export const Route = createFileRoute("/narrators/workspace/$workspaceId")({
-	component: WorkspacePage,
+	component: () => {
+		const { workspaceId } = Route.useParams();
+		return <WorkspacePage key={workspaceId} />;
+	},
 });
 
 function isValidNode(node: unknown, depth = 0): node is SplitNode {
@@ -78,6 +81,7 @@ function WorkspacePage() {
 		const trimmed = editTitle.trim();
 		if (trimmed && trimmed !== serverTitle) {
 			updateRef.current.mutate({ id: workspaceId, title: trimmed });
+			updateRecentTabLocal("workspace", workspaceId, { title: trimmed });
 		}
 	}, [editTitle, serverTitle, workspaceId]);
 

@@ -69,6 +69,9 @@
 	"subagentExploreModel": "Explore Subagent Model",
 	"subagentPlanModel": "Plan Subagent Model",
 	"subagentModelInherit": "(Inherit from parent)",
+	"subagentAllowedModels": "Subagent Allowed Models",
+	"subagentAllowedModelsDesc": "Restrict which models subagents can use. Leave empty to allow all models.",
+	"subagentAllowedModelsPlaceholder": "(No restriction)",
 	"modelValuePlaceholder": "Model ID",
 	"modelLabelPlaceholder": "Display name",
 	"modelProviderPlaceholder": "Provider",
@@ -517,5 +520,17 @@
 	"authorsLabel": "Authors",
 	"summaryModelUnavailableTitle": "Summary Model Unavailable",
 	"summaryModelUnavailableDesc": "The configured summary model \"{{model}}\" is not available. Features like title generation, context compaction, and reasoning translation require a working summary model. Please select a new one.",
-	"summaryModelUnavailableConfirm": "Save"
+	"summaryModelUnavailableConfirm": "Save",
+	"tlsEnabled": "Enable TLS/HTTPS",
+	"tlsEnabledDesc": "Serve over HTTPS using TLS certificates. Requires a valid certificate and private key file. Changes trigger a server restart.",
+	"tlsCertFile": "Certificate File",
+	"tlsCertFileDesc": "Path to the PEM-formatted TLS certificate file (e.g., fullchain.pem)",
+	"tlsKeyFile": "Private Key File",
+	"tlsKeyFileDesc": "Path to the PEM-formatted TLS private key file (e.g., privkey.pem)",
+	"tlsPassphrase": "Key Passphrase",
+	"tlsPassphraseDesc": "Passphrase for the private key (leave empty if not encrypted)",
+	"tlsPassphrasePlaceholder": "Optional",
+	"tlsPassphraseSecurityWarning": "This value is stored in plain text. Use file permissions to restrict access.",
+	"tlsCaFile": "CA Certificate File",
+	"tlsCaFileDesc": "Path to the CA certificate file (optional, overrides default trusted CAs)"
 }

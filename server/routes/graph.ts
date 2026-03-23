@@ -158,35 +158,41 @@ graphRoutes.get("/:id/graph", async (c) => {
 		},
 	});
 
-	// Refresh git info for active chapters with worktrees (lightweight, parallel)
+	// Refresh git info for active chapters with worktrees (lightweight, with concurrency limit)
 	const activeChapters = projectChapters.filter((ch) => ch.status === "active" && ch.worktreePath);
 	if (activeChapters.length > 0) {
-		const refreshResults = await Promise.allSettled(
-			activeChapters.map(async (ch) => {
-				const cwd = ch.worktreePath;
-				if (!cwd) return;
-				try {
-					const liveHead = await gitService.getHeadCommit(cwd);
-					if (liveHead && liveHead !== ch.headCommitSha) {
-						// HEAD changed — sync commits and update cache
-						const newCount = await commitSyncService.syncChapterCommits(ch.id);
-						if (newCount > 0 || liveHead !== ch.headCommitSha) {
-							// Re-read updated values from DB
-							const updated = await db.query.chapters.findFirst({
-								where: eq(chapters.id, ch.id),
-								columns: { commitCount: true, headCommitSha: true },
-							});
-							if (updated) {
-								ch.commitCount = updated.commitCount;
-								ch.headCommitSha = updated.headCommitSha;
+		const MAX_CONCURRENT = 3;
+		const refreshResults: PromiseSettledResult<void>[] = [];
+		for (let i = 0; i < activeChapters.length; i += MAX_CONCURRENT) {
+			const batch = activeChapters.slice(i, i + MAX_CONCURRENT);
+			const batchResults = await Promise.allSettled(
+				batch.map(async (ch) => {
+					const cwd = ch.worktreePath;
+					if (!cwd) return;
+					try {
+						const liveHead = await gitService.getHeadCommit(cwd);
+						if (liveHead && liveHead !== ch.headCommitSha) {
+							// HEAD changed — sync commits and update cache
+							const newCount = await commitSyncService.syncChapterCommits(ch.id);
+							if (newCount > 0 || liveHead !== ch.headCommitSha) {
+								// Re-read updated values from DB
+								const updated = await db.query.chapters.findFirst({
+									where: eq(chapters.id, ch.id),
+									columns: { commitCount: true, headCommitSha: true },
+								});
+								if (updated) {
+									ch.commitCount = updated.commitCount;
+									ch.headCommitSha = updated.headCommitSha;
+								}
 							}
 						}
+					} catch {
+						// Non-fatal — use cached values
 					}
-				} catch {
-					// Non-fatal — use cached values
-				}
-			}),
-		);
+				}),
+			);
+			refreshResults.push(...batchResults);
+		}
 		const failures = refreshResults.filter((r) => r.status === "rejected");
 		if (failures.length > 0) {
 			logger.debug("Some graph git refreshes failed", {

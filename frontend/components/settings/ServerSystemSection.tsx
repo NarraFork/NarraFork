@@ -1,4 +1,5 @@
 import {
+	Alert,
 	Autocomplete,
 	Button,
 	NumberInput,
@@ -9,7 +10,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
+import { IconAlertTriangle, IconRefresh } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
@@ -27,6 +28,17 @@ export interface ServerSystemSectionProps {
 	setOpenBrowser: (v: string) => void;
 	pwaUpdating: boolean;
 	handlePwaUpdate: () => void;
+	// TLS
+	tlsEnabled: boolean;
+	setTlsEnabled: (v: boolean) => void;
+	tlsCertFile: string;
+	setTlsCertFile: (v: string) => void;
+	tlsKeyFile: string;
+	setTlsKeyFile: (v: string) => void;
+	tlsPassphrase: string;
+	setTlsPassphrase: (v: string) => void;
+	tlsCaFile: string;
+	setTlsCaFile: (v: string) => void;
 	// Update server
 	updateServerUrl: string;
 	setUpdateServerUrl: (v: string) => void;
@@ -47,6 +59,16 @@ export function ServerSystemSection({
 	setOpenBrowser,
 	pwaUpdating,
 	handlePwaUpdate,
+	tlsEnabled,
+	setTlsEnabled,
+	tlsCertFile,
+	setTlsCertFile,
+	tlsKeyFile,
+	setTlsKeyFile,
+	tlsPassphrase,
+	setTlsPassphrase,
+	tlsCaFile,
+	setTlsCaFile,
 	updateServerUrl,
 	setUpdateServerUrl,
 	updateChannel,
@@ -93,13 +115,57 @@ export function ServerSystemSection({
 				/>
 			</div>
 
+			{/* TLS */}
+			<Switch
+				label={t("tlsEnabled")}
+				description={t("tlsEnabledDesc")}
+				checked={tlsEnabled}
+				onChange={(e) => setTlsEnabled(e.currentTarget.checked)}
+			/>
+			{tlsEnabled && (
+				<>
+					<PathInput
+						label={t("tlsCertFile")}
+						description={t("tlsCertFileDesc")}
+						value={tlsCertFile}
+						onChange={setTlsCertFile}
+					/>
+					<PathInput
+						label={t("tlsKeyFile")}
+						description={t("tlsKeyFileDesc")}
+						value={tlsKeyFile}
+						onChange={setTlsKeyFile}
+					/>
+					<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
+						{t("tlsPassphraseSecurityWarning") ??
+							"This value is stored in plain text in settings.json. Use file permissions to restrict access."}
+					</Alert>
+					<TextInput
+						label={t("tlsPassphrase")}
+						description={t("tlsPassphraseDesc")}
+						value={tlsPassphrase}
+						onChange={(e) => setTlsPassphrase(e.currentTarget.value)}
+						type="password"
+						placeholder={t("tlsPassphrasePlaceholder")}
+					/>
+					<PathInput
+						label={t("tlsCaFile")}
+						description={t("tlsCaFileDesc")}
+						value={tlsCaFile}
+						onChange={setTlsCaFile}
+					/>
+				</>
+			)}
+
 			{/* Update Server */}
 			<Title order={5} mt="sm">
 				{t("updateServerSubSection") ?? "Update Server"}
 			</Title>
 			<TextInput
 				label={t("updateServerUrl") ?? "Update Server URL"}
-				description={t("updateServerUrlDesc") ?? "URL of the update server (e.g., https://updates.example.com)"}
+				description={
+					t("updateServerUrlDesc") ?? "URL of the update server (e.g., https://updates.example.com)"
+				}
 				placeholder="https://updates.example.com"
 				value={updateServerUrl}
 				onChange={(e) => setUpdateServerUrl(e.currentTarget.value)}

@@ -314,3 +314,25 @@ function walkLeaves(node: SplitNode, fn: (leaf: SplitLeaf) => void): void {
 		for (const child of node.children) walkLeaves(child, fn);
 	}
 }
+
+/**
+ * Add a narrator to the tree.
+ * If an empty leaf exists, fill it; otherwise split the last leaf horizontally.
+ */
+export function addLeaf(tree: SplitNode, narratorId: string): SplitNode {
+	const empty = findFirstEmptyLeaf(tree);
+	if (empty) return setNarrator(tree, empty.id, narratorId);
+	// Find the last leaf and split it
+	const lastLeaf = findLastLeaf(tree);
+	if (!lastLeaf) return tree;
+	return splitAndAssign(tree, lastLeaf.id, "horizontal", "after", narratorId);
+}
+
+function findLastLeaf(node: SplitNode): SplitLeaf | null {
+	if (node.type === "leaf") return node;
+	for (let i = node.children.length - 1; i >= 0; i--) {
+		const found = findLastLeaf(node.children[i]);
+		if (found) return found;
+	}
+	return null;
+}

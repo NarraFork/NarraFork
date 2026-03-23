@@ -1,18 +1,28 @@
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
-import { getVisibleModels } from "../../settings";
+import { getVisibleModels, settings } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
 
-/** Build a dynamic model list string from all visible models. */
+/** Build the model list shown to the AI, respecting the subagent allowed-model pool. */
 function getAvailableModelsList(): string {
-	const models = getVisibleModels();
+	const pool = settings.agent.subagentAllowedModels ?? [];
+	const models = pool.length > 0 ? pool : getVisibleModels();
 	if (models.length > 0) {
 		return models.join(", ");
 	}
 	return "(no models configured yet)";
+}
+
+/** When a pool restriction is active, append a note to the model parameter description. */
+function getSubagentPoolNote(): string {
+	const pool = settings.agent.subagentAllowedModels ?? [];
+	if (pool.length > 0) {
+		return "\n\nNote: Subagent model selection is restricted to the models listed above. Models outside this pool will be ignored.";
+	}
+	return "";
 }
 
 function buildParameters() {
@@ -28,7 +38,7 @@ function buildParameters() {
 			.string()
 			.optional()
 			.describe(
-				`Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}`,
+				`Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}${getSubagentPoolNote()}`,
 			),
 		workdir: z
 			.string()
@@ -78,7 +88,7 @@ export const agentTool: ToolDefinition = {
 					type: "boolean",
 				},
 				model: {
-					description: `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}`,
+					description: `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}${getSubagentPoolNote()}`,
 					type: "string",
 				},
 				workdir: {
@@ -102,7 +112,7 @@ export const agentTool: ToolDefinition = {
 		};
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { prompt, subagent_type, model, workdir, background } = args as {
+		const { prompt, description, subagent_type, model, workdir, background } = args as {
 			prompt: string;
 			description?: string;
 			subagent_type: string;
@@ -128,6 +138,7 @@ export const agentTool: ToolDefinition = {
 				toolUseId,
 				subagentType: subagent_type || "general",
 				prompt,
+				title: description || undefined,
 				cwd: resolvedWorkdir,
 				signal: ctx.signal,
 				locale: ctx.locale,

@@ -11,7 +11,7 @@
  *   bun server/dev-all.ts --cold   # no hot-reload
  */
 
-import { type Subprocess, spawn } from "bun";
+import { type Subprocess, spawn, spawnSync } from "bun";
 
 const isWindows = process.platform === "win32";
 const isCold = process.argv.includes("--cold");
@@ -48,7 +48,20 @@ function killAll() {
 	for (const child of children) {
 		try {
 			if (child.exitCode === null) {
-				child.kill();
+				if (isWindows && child.pid) {
+					// On Windows, Subprocess.kill() only terminates the direct child.
+					// Use taskkill /T /F to recursively kill the entire process tree
+					// (e.g. bun → server/index.ts → shell → git, vite → esbuild, etc.)
+					try {
+						spawnSync(["taskkill", "/T", "/F", "/PID", String(child.pid)], {
+							stdio: ["ignore", "ignore", "ignore"],
+						});
+					} catch {
+						/* best effort */
+					}
+				} else {
+					child.kill();
+				}
 			}
 		} catch {
 			// already dead

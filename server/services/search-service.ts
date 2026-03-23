@@ -1,3 +1,4 @@
+import type { Statement } from "bun:sqlite";
 import { sqlite } from "../db";
 
 interface SearchResult {
@@ -28,20 +29,91 @@ export function buildFtsQuery(safeQuery: string): string {
 		.join(" ");
 }
 
-/** Run an FTS5 MATCH query or fall back to LIKE for short queries */
-function ftsQuery(
-	ftsSQL: string,
-	likeSQL: string,
-	useFts: boolean,
-	ftsArgs: (string | number)[],
-	likeArgs: (string | number)[],
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-): any[] {
-	return useFts
-		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(sqlite.prepare(ftsSQL).all(...ftsArgs) as any[])
-		: // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(sqlite.prepare(likeSQL).all(...likeArgs) as any[]);
+// --- Cached prepared statements (lazy-initialized) ---
+// Avoids creating a new Statement object on every search call.
+
+let _chaptersFts: Statement | null = null;
+let _chaptersLike: Statement | null = null;
+let _messagesFts: Statement | null = null;
+let _messagesLike: Statement | null = null;
+let _narratorsFts: Statement | null = null;
+let _narratorsLike: Statement | null = null;
+
+function chaptersFtsStmt() {
+	if (!_chaptersFts) {
+		_chaptersFts = sqlite.prepare(
+			`SELECT c.id, c.title, c.project_id,
+			  snippet(chapters_fts, 1, '', '', '...', 64) as snippet
+			 FROM chapters_fts
+			 JOIN chapters c ON c.rowid = chapters_fts.rowid
+			 WHERE chapters_fts MATCH ?
+			 ORDER BY rank LIMIT ?`,
+		);
+	}
+	return _chaptersFts;
+}
+function chaptersLikeStmt() {
+	if (!_chaptersLike) {
+		_chaptersLike = sqlite.prepare(
+			`SELECT id, title, project_id,
+			  substr(description, 1, 128) as snippet
+			 FROM chapters
+			 WHERE title LIKE ? OR description LIKE ?
+			 LIMIT ?`,
+		);
+	}
+	return _chaptersLike;
+}
+function messagesFtsStmt() {
+	if (!_messagesFts) {
+		_messagesFts = sqlite.prepare(
+			`SELECT m.id, m.narrator_id, m.content_text, n.chapter_id,
+			  snippet(narrator_messages_fts, 0, '', '', '...', 64) as snippet
+			 FROM narrator_messages_fts
+			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+			 JOIN narrators n ON n.id = m.narrator_id
+			 WHERE narrator_messages_fts MATCH ?
+			 ORDER BY rank LIMIT ?`,
+		);
+	}
+	return _messagesFts;
+}
+function messagesLikeStmt() {
+	if (!_messagesLike) {
+		_messagesLike = sqlite.prepare(
+			`SELECT m.id, m.narrator_id, m.content_text, n.chapter_id,
+			  substr(m.content_text, 1, 200) as snippet
+			 FROM narrator_messages m
+			 JOIN narrators n ON n.id = m.narrator_id
+			 WHERE m.content_text LIKE ?
+			 LIMIT ?`,
+		);
+	}
+	return _messagesLike;
+}
+function narratorsFtsStmt() {
+	if (!_narratorsFts) {
+		_narratorsFts = sqlite.prepare(
+			`SELECT n.id, n.title, n.chapter_id,
+			  snippet(narrators_fts, 0, '', '', '...', 64) as snippet
+			 FROM narrators_fts
+			 JOIN narrators n ON n.rowid = narrators_fts.rowid
+			 WHERE narrators_fts MATCH ?
+			 ORDER BY rank LIMIT ?`,
+		);
+	}
+	return _narratorsFts;
+}
+function narratorsLikeStmt() {
+	if (!_narratorsLike) {
+		_narratorsLike = sqlite.prepare(
+			`SELECT id, title, chapter_id
+			 FROM narrators
+			 WHERE title LIKE ?
+			 LIMIT ?`,
+		);
+	}
+	return _narratorsLike;
 }
 
 export const searchService = {
@@ -59,22 +131,10 @@ export const searchService = {
 		const like = `%${safeQuery}%`;
 
 		if (entities.includes("chapters")) {
-			const rows = ftsQuery(
-				`SELECT c.id, c.title, c.project_id,
-				  snippet(chapters_fts, 1, '', '', '...', 64) as snippet
-				 FROM chapters_fts
-				 JOIN chapters c ON c.rowid = chapters_fts.rowid
-				 WHERE chapters_fts MATCH ?
-				 ORDER BY rank LIMIT ?`,
-				`SELECT id, title, project_id,
-				  substr(description, 1, 128) as snippet
-				 FROM chapters
-				 WHERE title LIKE ? OR description LIKE ?
-				 LIMIT ?`,
-				useFts,
-				[quoted, limit],
-				[like, like, limit],
-			);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const rows: any[] = useFts
+				? chaptersFtsStmt().all(quoted, limit)
+				: chaptersLikeStmt().all(like, like, limit);
 			for (const row of rows) {
 				results.push({
 					type: "chapter",
@@ -86,24 +146,10 @@ export const searchService = {
 		}
 
 		if (entities.includes("messages")) {
-			const rows = ftsQuery(
-				`SELECT m.id, m.narrator_id, m.content_text, n.chapter_id,
-				  snippet(narrator_messages_fts, 0, '', '', '...', 64) as snippet
-				 FROM narrator_messages_fts
-				 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE narrator_messages_fts MATCH ?
-				 ORDER BY rank LIMIT ?`,
-				`SELECT m.id, m.narrator_id, m.content_text, n.chapter_id,
-				  substr(m.content_text, 1, 200) as snippet
-				 FROM narrator_messages m
-				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE m.content_text LIKE ?
-				 LIMIT ?`,
-				useFts,
-				[quoted, limit],
-				[like, limit],
-			);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const rows: any[] = useFts
+				? messagesFtsStmt().all(quoted, limit)
+				: messagesLikeStmt().all(like, limit);
 			for (const row of rows) {
 				results.push({
 					type: "message",
@@ -116,21 +162,10 @@ export const searchService = {
 		}
 
 		if (entities.includes("narrators")) {
-			const rows = ftsQuery(
-				`SELECT n.id, n.title, n.chapter_id,
-				  snippet(narrators_fts, 0, '', '', '...', 64) as snippet
-				 FROM narrators_fts
-				 JOIN narrators n ON n.rowid = narrators_fts.rowid
-				 WHERE narrators_fts MATCH ?
-				 ORDER BY rank LIMIT ?`,
-				`SELECT id, title, chapter_id
-				 FROM narrators
-				 WHERE title LIKE ?
-				 LIMIT ?`,
-				useFts,
-				[quoted, limit],
-				[like, limit],
-			);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const rows: any[] = useFts
+				? narratorsFtsStmt().all(quoted, limit)
+				: narratorsLikeStmt().all(like, limit);
 			for (const row of rows) {
 				results.push({
 					type: "narrator",

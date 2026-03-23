@@ -129,12 +129,26 @@ export interface McpServerConfig {
 	enabled: boolean;
 }
 
+export interface TlsConfig {
+	enabled: boolean;
+	/** Path to PEM-formatted TLS certificate file. */
+	certFile: string;
+	/** Path to PEM-formatted TLS private key file. */
+	keyFile: string;
+	/** Passphrase for the private key (if encrypted). */
+	passphrase?: string;
+	/** Path to CA certificate file (overrides default trusted CAs). */
+	caFile?: string;
+}
+
 export interface NarraForkSettings {
 	server: {
 		port: number;
 		host: string;
 		/** Browser launch behaviour on server start: "off" | "browser" | "app" */
 		openBrowser: "off" | "browser" | "app";
+		/** Optional TLS configuration for HTTPS. */
+		tls?: TlsConfig;
 	};
 	paths: { defaultProjectDir: string };
 	agent: {
@@ -148,6 +162,8 @@ export interface NarraForkSettings {
 			explore: string;
 			plan: string;
 		};
+		/** Allowed model pool for subagents. Empty array = no restriction. */
+		subagentAllowedModels: string[];
 		legacyEncoding: boolean;
 		/**
 		 * Per-model context window overrides (tokens).
@@ -285,6 +301,7 @@ const DEFAULTS: NarraForkSettings = {
 			explore: "",
 			plan: "",
 		},
+		subagentAllowedModels: [],
 		legacyEncoding: false,
 		modelContextWindows: {},
 		translateReasoning: false,

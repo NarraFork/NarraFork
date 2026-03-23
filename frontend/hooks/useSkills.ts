@@ -71,3 +71,15 @@ export function useDeleteGlobalSkill() {
 		},
 	});
 }
+
+export function useGlobalSkillsRefresh() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async () => {
+			await api.listGlobalSkills();
+		},
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["global-skills"] });
+		},
+	});
+}

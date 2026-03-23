@@ -232,11 +232,28 @@ if (isProd) {
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
 
+/** Return the URL protocol based on current TLS config. */
+function getProtocol(): "https" | "http" {
+	return settings.server.tls?.enabled ? "https" : "http";
+}
+
 function startServer(listenPort: number) {
+	const tlsCfg = settings.server.tls;
+	const tls =
+		tlsCfg?.enabled && tlsCfg.certFile && tlsCfg.keyFile
+			? {
+					cert: Bun.file(tlsCfg.certFile),
+					key: Bun.file(tlsCfg.keyFile),
+					...(tlsCfg.passphrase && { passphrase: tlsCfg.passphrase }),
+					...(tlsCfg.caFile && { ca: Bun.file(tlsCfg.caFile) }),
+				}
+			: undefined;
+
 	return Bun.serve({
 		port: listenPort,
 		hostname: currentHost,
 		idleTimeout: 255,
+		tls,
 		async fetch(req, server) {
 			const url = new URL(req.url);
 
@@ -334,7 +351,7 @@ if (portExplicit) {
 	}
 }
 
-logger.info(`NarraFork server running on http://${currentHost}:${actualPort}`, {
+logger.info(`NarraFork server running on ${getProtocol()}://${currentHost}:${actualPort}`, {
 	isProd,
 	isCompiledBinary,
 	metaUrl: import.meta.url,
@@ -350,7 +367,7 @@ registerServerRestart((newHost: string, newPort: number) => {
 		_server = startServer(newPort);
 		actualPort = newPort;
 		logger.info(
-			`Server restarted: http://${oldHost}:${oldPort} → http://${currentHost}:${actualPort}`,
+			`Server restarted: ${getProtocol()}://${oldHost}:${oldPort} → ${getProtocol()}://${currentHost}:${actualPort}`,
 		);
 	} catch (err) {
 		// Rollback: try to restart on the old address
@@ -363,7 +380,7 @@ registerServerRestart((newHost: string, newPort: number) => {
 			currentHost = oldHost;
 			_server = startServer(oldPort);
 			actualPort = oldPort;
-			logger.info(`Server rolled back to http://${oldHost}:${oldPort}`);
+			logger.info(`Server rolled back to ${getProtocol()}://${oldHost}:${oldPort}`);
 		} catch (rollbackErr) {
 			logger.error("Rollback also failed — server is down", {
 				error: String(rollbackErr),
@@ -432,7 +449,8 @@ async function openAsApp(url: string) {
 	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
-	const url = `http://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	const proto = getProtocol();
+	const url = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
@@ -555,12 +573,30 @@ const safeShutdown = () => {
 };
 process.on("SIGINT", safeShutdown);
 process.on("SIGTERM", safeShutdown);
+// SIGHUP fires on some Windows terminal emulators when the console window is closed.
+process.on("SIGHUP", safeShutdown);
 // On Windows, closing the console window may not deliver SIGINT/SIGTERM.
 // "exit" fires when the event loop drains or process.exit() is called elsewhere.
+// NOTE: "exit" handlers MUST be synchronous — async work is ignored.
 process.on("exit", () => {
 	try {
 		_server?.stop(true);
 	} catch {
 		// best effort
+	}
+	// On Windows, child processes (terminals, agent shells, MCP servers) may
+	// outlive the parent even after _server.stop().  taskkill /T /F on our own
+	// PID recursively kills the entire process tree, ensuring no orphan holds
+	// the port or leaks resources.  This is a synchronous last-resort cleanup
+	// that runs even when SIGINT/SIGTERM were never delivered (e.g. console
+	// window closed via the X button).
+	if (IS_WINDOWS) {
+		try {
+			Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(process.pid)], {
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+		} catch {
+			// best effort — we're exiting anyway
+		}
 	}
 });

@@ -745,7 +745,7 @@ export async function* agentLoop(
 										isError: sr.isError ?? false,
 										durationMs: sr.durationMs,
 										brokenInputOverride: brokenOverride,
-										updatedInput: brokenOverride,
+										updatedInput: brokenOverride ?? sr.updatedInput,
 										metadata: sr.metadata,
 									};
 									if (sr.fatal) {
@@ -1240,7 +1240,7 @@ export async function* agentLoop(
 						isError: result.isError ?? false,
 						durationMs,
 						brokenInputOverride,
-						updatedInput: brokenInputOverride,
+						updatedInput: brokenInputOverride ?? result.updatedInput,
 						metadata:
 							durationMs !== result.durationMs
 								? { ...result.metadata, execDurationMs: result.durationMs }
@@ -1323,7 +1323,7 @@ export async function* agentLoop(
 							isError: result.isError ?? false,
 							durationMs: result.durationMs,
 							brokenInputOverride,
-							updatedInput: brokenInputOverride,
+							updatedInput: brokenInputOverride ?? result.updatedInput,
 							metadata: result.metadata,
 						};
 					}
@@ -1423,6 +1423,9 @@ interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** When the permission handler redirected the input (e.g. plan-mode file path),
+	 *  this holds the effective input that was actually executed. */
+	updatedInput?: Record<string, unknown>;
 }
 
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
@@ -1461,6 +1464,11 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 
 	const effectiveInput = permission.updatedInput ?? tu.input;
 	const permissionNotice = permission.behavior === "allow" ? permission.notice : undefined;
+	// Track whether the permission handler redirected the input (e.g. plan-mode file path)
+	const redirectedInput =
+		permission.updatedInput && permission.updatedInput !== tu.input
+			? permission.updatedInput
+			: undefined;
 
 	// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
 	if ("_raw" in effectiveInput) {
@@ -1582,6 +1590,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 				durationMs: Date.now() - start,
 				metadata: result.metadata,
 				images: result.images,
+				updatedInput: redirectedInput,
 			};
 		}
 		const truncated = truncateOutput(result.output);
@@ -1592,12 +1601,14 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			durationMs: Date.now() - start,
 			metadata: result.metadata,
 			images: result.images,
+			updatedInput: redirectedInput,
 		};
 	} catch (err) {
 		return {
 			output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
 			isError: true,
 			durationMs: Date.now() - start,
+			updatedInput: redirectedInput,
 		};
 	} finally {
 		if (progressTimer) clearInterval(progressTimer);

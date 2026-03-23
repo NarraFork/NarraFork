@@ -41,15 +41,8 @@ function validateFilePaths(files: string[]): void {
 
 gitRoutes.get("/:chapterId/git/status", async (c) => {
 	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const [summary, lineStats] = await Promise.all([
-		gitService.getStatusSummary(worktreePath),
-		gitService.getUncommittedLineStats(worktreePath),
-	]);
-	return c.json({
-		...summary,
-		linesAdded: lineStats.added,
-		linesRemoved: lineStats.removed,
-	});
+	const summary = await gitService.getStatusSummary(worktreePath);
+	return c.json(summary);
 });
 
 // --- Stage ---

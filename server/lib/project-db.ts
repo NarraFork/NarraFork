@@ -228,6 +228,9 @@ interface CachedConnection {
 class ProjectDbManager {
 	private cache = new Map<string, CachedConnection>();
 	private maxConnections = 8;
+	/** Idle timeout: close connections unused for 30 minutes. */
+	private idleTimeoutMs = 30 * 60 * 1000;
+	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 	/**
 	 * Get or create a project database connection.
@@ -262,6 +265,7 @@ class ProjectDbManager {
 		}
 
 		this.evictIfNeeded();
+		this.ensureCleanupTimer();
 
 		const conn = initProjectDb(gitPath);
 		this.cache.set(projectId, { conn, gitPath, lastUsed: Date.now() });
@@ -280,6 +284,7 @@ class ProjectDbManager {
 			cached.conn.close();
 			this.cache.delete(projectId);
 		}
+		if (this.cache.size === 0) this.stopCleanupTimer();
 	}
 
 	/** Close all connections (process exit). */
@@ -293,6 +298,7 @@ class ProjectDbManager {
 			}
 		}
 		this.cache.clear();
+		this.stopCleanupTimer();
 	}
 
 	/** Evict least-recently-used connections if over limit. */
@@ -307,6 +313,37 @@ class ProjectDbManager {
 			}
 		}
 		if (oldestId) this.close(oldestId);
+	}
+
+	/** Start periodic cleanup timer (every 10 minutes). */
+	private ensureCleanupTimer(): void {
+		if (this.cleanupTimer) return;
+		this.cleanupTimer = setInterval(() => this.evictIdle(), 10 * 60 * 1000);
+		// Don't prevent process exit
+		if (
+			this.cleanupTimer &&
+			typeof this.cleanupTimer === "object" &&
+			"unref" in this.cleanupTimer
+		) {
+			this.cleanupTimer.unref();
+		}
+	}
+
+	private stopCleanupTimer(): void {
+		if (this.cleanupTimer) {
+			clearInterval(this.cleanupTimer);
+			this.cleanupTimer = null;
+		}
+	}
+
+	/** Close connections that have been idle longer than idleTimeoutMs. */
+	private evictIdle(): void {
+		const cutoff = Date.now() - this.idleTimeoutMs;
+		const toEvict: string[] = [];
+		for (const [id, cached] of this.cache) {
+			if (cached.lastUsed < cutoff) toEvict.push(id);
+		}
+		for (const id of toEvict) this.close(id);
 	}
 }
 

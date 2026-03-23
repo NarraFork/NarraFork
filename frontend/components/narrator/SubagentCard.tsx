@@ -159,7 +159,7 @@ export const SubagentCard = memo(
 			"Subagent";
 		const [showPrompt, setShowPrompt] = useState(false);
 		const [showCalls, setShowCalls] = useState(soleAndRunning);
-		const resolvedModel = childMessages[0]?.subagentModel ?? input.model;
+		const resolvedModel = childMessages[0]?.subagentModel ?? toolCall._resolvedModel ?? input.model;
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 
 		// Clamp card height to 70% of the nearest scroll container (chat viewport).

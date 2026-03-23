@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -85,6 +86,15 @@ const updateSettingsSchema = z
 				port: z.number().int().min(1).max(65535),
 				host: z.string().min(1).max(255),
 				openBrowser: z.enum(["off", "browser", "app"]),
+				tls: z
+					.object({
+						enabled: z.boolean(),
+						certFile: z.string(),
+						keyFile: z.string(),
+						passphrase: z.string().optional(),
+						caFile: z.string().optional(),
+					})
+					.optional(),
 			})
 			.partial()
 			.optional(),
@@ -304,6 +314,13 @@ settingsRoutes.get("/", (c) => {
 	const codexSnapshot = codexManager.snapshot();
 	const result = {
 		...s,
+		// Mask TLS passphrase
+		server: {
+			...s.server,
+			tls: s.server.tls
+				? { ...s.server.tls, passphrase: s.server.tls.passphrase ? "********" : undefined }
+				: undefined,
+		},
 		auth: { ...s.auth, jwtSecret: undefined },
 		// Multi-provider — mask all keys
 		openaiProviders: (s.openaiProviders ?? []).map((p) => ({
@@ -344,10 +361,34 @@ settingsRoutes.patch("/", async (c) => {
 	const oldProxyPort = current.containers.proxy.port;
 	const oldHost = current.server.host;
 	const oldPort = current.server.port;
+	const oldTls = current.server.tls;
 
 	// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
 	if (validated.codex?.defaultReasoningEffort === null) {
 		validated.codex.defaultReasoningEffort = undefined;
+	}
+
+	// Preserve TLS passphrase if masked or empty (don't overwrite with placeholder)
+	if (validated.server?.tls) {
+		if (!validated.server.tls.passphrase || validated.server.tls.passphrase === "********") {
+			validated.server.tls.passphrase = oldTls?.passphrase;
+		}
+	}
+
+	// Validate TLS cert/key files exist when enabling TLS
+	if (validated.server?.tls?.enabled) {
+		const { certFile, keyFile } = validated.server.tls;
+		if (!certFile || !existsSync(certFile)) {
+			throw new ValidationError(`TLS certificate file not found: ${certFile || "(empty)"}`);
+		}
+		if (!keyFile || !existsSync(keyFile)) {
+			throw new ValidationError(`TLS private key file not found: ${keyFile || "(empty)"}`);
+		}
+		if (validated.server.tls.caFile && !existsSync(validated.server.tls.caFile)) {
+			throw new ValidationError(
+				`TLS CA certificate file not found: ${validated.server.tls.caFile}`,
+			);
+		}
 	}
 
 	// Preserve real API keys for multi-provider
@@ -431,18 +472,33 @@ settingsRoutes.patch("/", async (c) => {
 	// Purge model caches for removed providers
 	purgeRemovedProviderCaches(current, merged);
 
-	// Detect host/port changes and schedule a server restart
+	// Detect host/port/TLS changes and schedule a server restart
 	const newHost = merged.server.host;
 	const newPort = merged.server.port;
+	const newTls = merged.server.tls;
 	const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
+	const tlsChanged = JSON.stringify(oldTls) !== JSON.stringify(newTls);
+	const needsRestart = serverAddressChanged || tlsChanged;
 
-	if (serverAddressChanged) {
+	if (needsRestart) {
 		scheduleServerRestart(newHost, newPort);
 	}
+
+	const newProtocol = newTls?.enabled ? "https" : "http";
 
 	// Mask sensitive fields before returning (same logic as GET)
 	const result = {
 		...merged,
+		// Mask TLS passphrase
+		server: {
+			...merged.server,
+			tls: merged.server.tls
+				? {
+						...merged.server.tls,
+						passphrase: merged.server.tls.passphrase ? "********" : undefined,
+					}
+				: undefined,
+		},
 		auth: { ...merged.auth, jwtSecret: undefined },
 		openaiProviders: (merged.openaiProviders ?? []).map((p) => ({
 			...p,
@@ -460,9 +516,9 @@ settingsRoutes.patch("/", async (c) => {
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
 		// Signal to the frontend that the server is restarting at a new address
-		...(serverAddressChanged && {
+		...(needsRestart && {
 			serverRestarting: true,
-			newUrl: `http://${newHost === "0.0.0.0" ? "localhost" : newHost}:${newPort}`,
+			newUrl: `${newProtocol}://${newHost === "0.0.0.0" ? "localhost" : newHost}:${newPort}`,
 		}),
 	};
 	return c.json(result);
