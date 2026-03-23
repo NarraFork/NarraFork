@@ -859,9 +859,14 @@ function SortableWorkspaceChildTab({
 	const sortStyle: React.CSSProperties = {
 		transform: CSS.Transform.toString(transform),
 		transition,
-		// Both isDragging and dimmed (workspace children following header drag)
-		// keep layout space so dnd-kit can compute correct drop positions.
-		opacity: isDragging || dimmed ? 0 : 1,
+		// isDragging (self): keep layout space, just hide visually.
+		// dimmed (workspace children following header drag): collapse so dnd-kit
+		// only sees the header in the sort list; the DragOverlay renders the group.
+		...(dimmed
+			? { opacity: 0, height: 0, overflow: "hidden", margin: 0, padding: 0 }
+			: isDragging
+				? { opacity: 0 }
+				: { opacity: 1 }),
 	};
 
 	return (
