@@ -341,6 +341,9 @@ export function RecentTabList({
 
 	// Drag state: the tab currently being dragged (for workspace, tracks the whole group)
 	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+	// When dragging a workspace header, the total height of header + children
+	// so the header placeholder can maintain the full group height.
+	const [wsGroupHeight, setWsGroupHeight] = useState<number | null>(null);
 
 	const filtered = useMemo(
 		() =>
@@ -422,6 +425,21 @@ export function RecentTabList({
 			setDraggingTabId(event.active.id as string);
 			const tab = sortItems.find((t) => tabSortId(t) === event.active.id);
 			if (!tab) return;
+
+			// Measure workspace group height so the header placeholder can match
+			if (tab.type === "workspace") {
+				const children = childrenByWorkspace.get(tab.id) ?? [];
+				const ids = [tabSortId(tab), ...children.map(tabSortId)];
+				let total = 0;
+				for (const id of ids) {
+					const el = document.querySelector(`[data-tab-sort-id="${globalThis.CSS.escape(id)}"]`);
+					if (el) total += (el as HTMLElement).offsetHeight;
+				}
+				setWsGroupHeight(total > 0 ? total : null);
+			} else {
+				setWsGroupHeight(null);
+			}
+
 			const nId = tab.type === "narrator" ? tab.id : tab.type === "chapter" ? tab.narratorId : null;
 			if (!nId) return;
 			const me = event.activatorEvent as MouseEvent | TouchEvent;
@@ -429,7 +447,7 @@ export function RecentTabList({
 			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
 			startNarratorDragManual(nId, tab.title, x, y);
 		},
-		[sortItems],
+		[sortItems, childrenByWorkspace],
 	);
 
 	const handleDragMove = useCallback((event: DragMoveEvent) => {
@@ -443,6 +461,7 @@ export function RecentTabList({
 		(event: DragEndEvent) => {
 			justDragged = true;
 			setDraggingTabId(null);
+			setWsGroupHeight(null);
 			// End global narrator drag first — workspace drop handlers run synchronously
 			endNarratorDrag();
 
@@ -604,6 +623,7 @@ export function RecentTabList({
 	const handleDragCancel = useCallback(() => {
 		endNarratorDrag();
 		setDraggingTabId(null);
+		setWsGroupHeight(null);
 	}, []);
 
 	const handleWsAddClick = useCallback(
@@ -717,6 +737,7 @@ export function RecentTabList({
 								}
 								onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
 								dimmed={isDraggingThis}
+								wsGroupHeight={tab.type === "workspace" ? wsGroupHeight : null}
 							/>
 						);
 					})}
@@ -870,7 +891,13 @@ function SortableWorkspaceChildTab({
 	};
 
 	return (
-		<div ref={setNodeRef} {...attributes} {...listeners} style={sortStyle}>
+		<div
+			ref={setNodeRef}
+			{...attributes}
+			{...listeners}
+			style={sortStyle}
+			data-tab-sort-id={tabSortId(tab)}
+		>
 			<NavLink
 				active={active}
 				label={<Text size="xs">{tab.title}</Text>}
@@ -1027,6 +1054,8 @@ interface SortableTabItemProps {
 	onWsAddClick?: (e: React.MouseEvent, wsId: string) => void;
 	/** When true, reduce opacity to indicate the item is being dragged */
 	dimmed?: boolean;
+	/** When dragging a workspace header, the total group height (header + children) */
+	wsGroupHeight?: number | null;
 }
 
 function SortableTabItem({
@@ -1038,6 +1067,7 @@ function SortableTabItem({
 	connectTop,
 	onWsAddClick,
 	dimmed,
+	wsGroupHeight,
 }: SortableTabItemProps) {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
@@ -1063,6 +1093,9 @@ function SortableTabItem({
 		transition,
 		opacity: isDragging ? 0 : dimmed ? 0.3 : 1,
 		zIndex: isDragging ? 10 : undefined,
+		// When dragging a workspace header, expand placeholder to match the full
+		// group height (header + children) so other items don't jump.
+		...(isDragging && wsGroupHeight ? { height: wsGroupHeight } : undefined),
 	};
 
 	// Click to navigate — blocked after drag via module-level flag
@@ -1181,6 +1214,7 @@ function SortableTabItem({
 			{...attributes}
 			{...listeners}
 			style={{ ...sortStyle, overflow: "hidden", touchAction: "pan-y" }}
+			data-tab-sort-id={tabSortId(tab)}
 		>
 			<div style={swipeStyle}>
 				<NavLink
