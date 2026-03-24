@@ -113,15 +113,14 @@ import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
 	type RenderedTreeElementMeta,
 	RenderProgress,
-	renderToolRun,
 	renderTreeMessagesWithKeys,
-	StreamingBubble,
 } from "./MessageRenderer";
 import {
 	MessageSelectionCtx,
 	type MessageSelectionState,
 	resolveBlockRange,
 } from "./MessageSelectionCtx";
+import { buildStreamingMsg } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
@@ -719,9 +718,11 @@ export function NarratorPanel({
 	compact,
 	onMinimize,
 	onBack,
+	onViewSubagentSession,
 	isResizing,
 	onHeaderPointerDown,
 	onClose,
+	onOpenTerminalPanel,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -1619,6 +1620,35 @@ export function NarratorPanel({
 		return [...ids];
 	}, [advancedAnim, suppressBlurIn, messagesData]);
 	// Page-level cache: keyed by page reference → rendered elements/keys/targets/meta.
+	// Build a synthetic streaming message from the current streaming state.
+	// All streaming content (reasoning, text, web_search, tool chunks) is combined
+	// into a single message so segmentMessages can apply canonical ordering and
+	// merge tool-runs correctly.
+	const streamingReasoningCreatedAtRef = useRef<string | null>(null);
+	const hasStreamingContent =
+		!!streamingRef.current ||
+		!!streamingReasoningRef.current ||
+		!!topLevelStreamingChunks ||
+		!!webSearchRef.current;
+	if (hasStreamingContent) {
+		if (!streamingReasoningCreatedAtRef.current) {
+			streamingReasoningCreatedAtRef.current = new Date().toISOString();
+		}
+	} else {
+		streamingReasoningCreatedAtRef.current = null;
+	}
+
+	// Force re-read of streaming refs by depending on streamingVersion
+	void streamingVersion;
+	const streamingMsg = buildStreamingMsg({
+		reasoningText: streamingReasoningRef.current || undefined,
+		streamingText: streamingRef.current || undefined,
+		webSearch: webSearchRef.current,
+		toolChunksMsg: topLevelStreamingChunks,
+		narratorId,
+		reasoningCreatedAt: streamingReasoningCreatedAtRef.current ?? undefined,
+	});
+
 	// When a page object reference doesn't change, we reuse the cached result.
 	const pageCacheRef = useRef(
 		new WeakMap<
@@ -1633,13 +1663,12 @@ export function NarratorPanel({
 	);
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
-	const { flatElements, flatKeys, flatTargets, flatMeta } = useMemo(() => {
+	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
 		if (isResizing || !messagesData?.pages) {
 			return {
 				flatElements: [],
 				flatKeys: [],
 				flatTargets: [],
-				flatMeta: [],
 			};
 		}
 		const pages = messagesData.pages;
@@ -1651,7 +1680,6 @@ export function NarratorPanel({
 		const allElements: React.ReactNode[] = [];
 		const allKeys: string[] = [];
 		const allTargets: string[][] = [];
-		const allMeta: RenderedTreeElementMeta[] = [];
 
 		// Build a cache key object per page that includes all render-affecting props.
 		// We use the page reference as the primary cache key, but invalidate when
@@ -1660,7 +1688,8 @@ export function NarratorPanel({
 		const bgDismissedKey = `${renderPermCb.bgRetryDismissedIds.size}:${[...renderPermCb.bgRetryDismissedIds].join(",")}`;
 		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}|${bgDismissedKey}`;
 
-		for (const { page, originalIndex, pageParam } of reversed) {
+		for (let ri = 0; ri < reversed.length; ri++) {
+			const { page, originalIndex, pageParam } = reversed[ri];
 			if (!page?.messages?.length) continue;
 			const pageCursor =
 				typeof pageParam === "object" && pageParam && "cursor" in pageParam
@@ -1677,15 +1706,23 @@ export function NarratorPanel({
 					? `initial:${narratorId}:${highlightMessageId ?? "latest"}`
 					: `${pageDirection}:${pageCursor ?? originalIndex}`;
 
-			// Check cache
+			// The last page in the reversed array (= first/newest page) receives
+			// the streaming message so it participates in normal segmentation.
+			const isNewestPage = ri === reversed.length - 1;
+			const pageStreamingMsg = isNewestPage ? streamingMsg : null;
+
+			// Check cache — skip cache when streaming is active on this page
 			const cached = cache.get(page);
-			if (cached && (cached as { _secondaryKey?: string })._secondaryKey === secondaryKey) {
+			if (
+				!pageStreamingMsg &&
+				cached &&
+				(cached as { _secondaryKey?: string })._secondaryKey === secondaryKey
+			) {
 				for (let j = 0; j < cached.elements.length; j++) {
 					const targetIds = cached.targets[j] ?? [];
 					allElements.push(cached.elements[j]);
 					allKeys.push(getStableRenderElementKey(cached.keys[j], targetIds, pageKey));
 					allTargets.push(targetIds);
-					allMeta.push(cached.meta[j] ?? { kind: "regular" });
 				}
 				continue;
 			}
@@ -1708,18 +1745,21 @@ export function NarratorPanel({
 				handleEditAndRegenerate,
 				lastUserMessageId,
 				hasChapter,
+				onViewSubagentSession,
+				pageStreamingMsg,
 			);
 
-			// Store in cache
-			const entry = { ...result, _secondaryKey: secondaryKey };
-			cache.set(page, entry);
+			// Only cache when there's no streaming message (streaming changes every frame)
+			if (!pageStreamingMsg) {
+				const entry = { ...result, _secondaryKey: secondaryKey };
+				cache.set(page, entry);
+			}
 
 			for (let j = 0; j < result.elements.length; j++) {
 				const targetIds = result.targets[j] ?? [];
 				allElements.push(result.elements[j]);
 				allKeys.push(getStableRenderElementKey(result.keys[j], targetIds, pageKey));
 				allTargets.push(targetIds);
-				allMeta.push(result.meta[j] ?? { kind: "regular" });
 			}
 		}
 
@@ -1727,7 +1767,6 @@ export function NarratorPanel({
 			flatElements: allElements,
 			flatKeys: allKeys,
 			flatTargets: allTargets,
-			flatMeta: allMeta,
 		};
 	}, [
 		isResizing,
@@ -1749,178 +1788,15 @@ export function NarratorPanel({
 		pruneDividerLabel,
 		lastUserMessageId,
 		hasChapter,
+		onViewSubagentSession,
+		streamingMsg,
 	]);
 
-	const standaloneStreamingReasoningCreatedAtRef = useRef<string | null>(null);
-	const hasStandaloneStreamingReasoning =
-		!streamingRef.current && !!streamingReasoningRef.current && !topLevelStreamingChunks;
-	if (hasStandaloneStreamingReasoning) {
-		if (!standaloneStreamingReasoningCreatedAtRef.current) {
-			standaloneStreamingReasoningCreatedAtRef.current = new Date().toISOString();
-		}
-	} else {
-		standaloneStreamingReasoningCreatedAtRef.current = null;
-	}
-
-	// Append streaming content (StreamingBubble + streaming tool chunks) to the
-	// virtualised element list so they participate in normal virtual scrolling
-	// instead of being rendered in a separate trailing slot.
-	const { finalElements, finalKeys, finalTargets } = useMemo(() => {
-		const els = [...flatElements];
-		const keys = [...flatKeys];
-		const targets = [...flatTargets];
-		const metas = [...flatMeta];
-
-		// Model output order is always: reasoning → text/web_search → tool_use.
-		// Standalone streaming reasoning stays isolated so a new turn cannot
-		// temporarily render inside the previous persisted tool run. Streaming tool
-		// chunks may merge upward only when they clearly target the same run.
-		void streamingVersion;
-		const hasStreamingText = !!streamingRef.current || !!webSearchRef.current;
-		const hasStreamingReasoning = !!streamingReasoningRef.current;
-		const hasStreamingToolChunks = !!topLevelStreamingChunks;
-
-		const trailingToolRunIndex =
-			metas.length > 0 && metas[metas.length - 1]?.kind === "tool-run" ? metas.length - 1 : -1;
-		const reasoningInBubble = hasStreamingReasoning && hasStreamingText;
-		const renderStandaloneReasoningRun =
-			hasStreamingReasoning && !reasoningInBubble && !hasStreamingToolChunks;
-		const streamingToolTargetIds = (() => {
-			if (!topLevelStreamingChunks) return [] as string[];
-			const ids = new Set<string>();
-			for (const tc of topLevelStreamingChunks.toolCalls ?? []) {
-				if (tc.toolUseId) ids.add(tc.toolUseId);
-			}
-			for (const block of Array.isArray(topLevelStreamingChunks.contentJson)
-				? topLevelStreamingChunks.contentJson
-				: []) {
-				if (block.type === "tool_use" && typeof block.id === "string" && block.id.length > 0) {
-					ids.add(block.id);
-				}
-			}
-			return [...ids];
-		})();
-		const mergeIntoTrailingToolRun = (appendMessages: NarratorMsg[], extraTargetIds: string[]) => {
-			if (hasStreamingText || trailingToolRunIndex === -1 || appendMessages.length === 0)
-				return false;
-			if (extraTargetIds.length === 0) return false;
-			const trailingMeta = metas[trailingToolRunIndex];
-			if (!trailingMeta || trailingMeta.kind !== "tool-run") return false;
-			const trailingTargetIds = new Set(targets[trailingToolRunIndex] ?? []);
-			const sharesCurrentTurnTarget = extraTargetIds.some((targetId) =>
-				trailingTargetIds.has(targetId),
-			);
-			if (!sharesCurrentTurnTarget) return false;
-			const mergedEl = renderToolRun(trailingMeta.run, narratorId, renderPermCb, {
-				expandedToolUseId,
-				highlightedId,
-				editExpandOverride,
-				onForkFromMessage: forkHandler,
-				onCompactBeforeMessage: handleCompactBefore,
-				onDeleteBlock: handleDeleteBlock,
-				appendMessages,
-			});
-			if (!mergedEl) return false;
-			els[trailingToolRunIndex] = mergedEl;
-			targets[trailingToolRunIndex] = [
-				...new Set([...(targets[trailingToolRunIndex] ?? []), ...extraTargetIds]),
-			];
-			return true;
-		};
-
-		if (hasStreamingText) {
-			els.push(
-				<StreamingBubble
-					narratorId={narratorId}
-					streamingRef={streamingRef}
-					streamingReasoningRef={streamingReasoningRef}
-					includeReasoning={reasoningInBubble}
-					webSearchRef={webSearchRef}
-					version={streamingVersion}
-				/>,
-			);
-			keys.push("__streaming_bubble__");
-			targets.push([]);
-		}
-
-		// Render streaming reasoning as its own transient run until the same turn
-		// emits text or tool chunks. Do not merge it into the previous persisted
-		// tool run, otherwise a new turn can temporarily appear under the wrong run.
-		if (renderStandaloneReasoningRun) {
-			const reasoningMsg = {
-				id: STREAMING_CHUNKS_MSG_ID,
-				narratorId,
-				parentToolUseId: null,
-				role: "assistant" as const,
-				contentJson: [{ type: "reasoning", text: streamingReasoningRef.current }],
-				contentText: null,
-				toolCalls: [],
-				createdAt: standaloneStreamingReasoningCreatedAtRef.current ?? new Date().toISOString(),
-				children: [],
-			};
-			const reasoningTargetIds = standaloneStreamingReasoningCreatedAtRef.current
-				? [`reasoning-stream:${standaloneStreamingReasoningCreatedAtRef.current}`]
-				: [];
-			const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb);
-			if (toolEl) {
-				els.push(toolEl);
-				keys.push(
-					getStableRenderElementKey("tool-run-__streaming_reasoning__", reasoningTargetIds),
-				);
-				targets.push(reasoningTargetIds);
-			}
-		}
-
-		// Streaming tool chunks always belong to the current turn. If the latest
-		// rendered item is already a tool-run, append them into that run; otherwise
-		// keep them as a standalone synthetic run.
-		if (topLevelStreamingChunks) {
-			let chunksToRender = topLevelStreamingChunks;
-			if (hasStreamingReasoning && !reasoningInBubble) {
-				chunksToRender = {
-					...topLevelStreamingChunks,
-					contentJson: [
-						{ type: "reasoning", text: streamingReasoningRef.current },
-						...(Array.isArray(topLevelStreamingChunks.contentJson)
-							? topLevelStreamingChunks.contentJson
-							: []),
-					],
-				};
-			}
-
-			if (!mergeIntoTrailingToolRun([chunksToRender], streamingToolTargetIds)) {
-				const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
-				if (toolEl) {
-					els.push(toolEl);
-					keys.push(
-						getStableRenderElementKey("tool-run-__streaming_tool_chunks__", streamingToolTargetIds),
-					);
-					targets.push(streamingToolTargetIds);
-				}
-			}
-		}
-
-		return { finalElements: els, finalKeys: keys, finalTargets: targets };
-	}, [
-		flatElements,
-		flatKeys,
-		flatTargets,
-		flatMeta,
-		streamingVersion,
-		topLevelStreamingChunks,
-		narratorId,
-		renderPermCb,
-		forkHandler,
-		highlightedId,
-		expandedToolUseId,
-		editExpandOverride,
-		handleCompactBefore,
-		handleDeleteBlock,
-		getStableRenderElementKey,
-		streamingRef,
-		streamingReasoningRef,
-		webSearchRef,
-	]);
+	// All streaming content is now handled by segmentMessages via streamingMsg.
+	// No separate finalElements pass needed — flatElements is the final output.
+	const finalElements = flatElements;
+	const finalKeys = flatKeys;
+	const finalTargets = flatTargets;
 
 	const targetIndexMap = useMemo(() => {
 		const indexMap = new Map<string, number>();
@@ -2755,7 +2631,17 @@ export function NarratorPanel({
 					}
 				>
 					<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
-						{compact ? (
+						{onMinimize ? (
+							<Tooltip label={t("backToGraph")} position="right">
+								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
+									<IconArrowsMinimize size={16} />
+								</ActionIcon>
+							</Tooltip>
+						) : onBack ? (
+							<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+								<IconArrowLeft size={16} />
+							</ActionIcon>
+						) : compact ? (
 							<ActionIcon
 								size="sm"
 								variant="subtle"
@@ -2770,18 +2656,12 @@ export function NarratorPanel({
 							>
 								<IconExternalLink size={16} />
 							</ActionIcon>
-						) : onMinimize ? (
-							<Tooltip label={t("backToGraph")} position="right">
-								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
-									<IconArrowsMinimize size={16} />
-								</ActionIcon>
-							</Tooltip>
 						) : (
 							<ActionIcon
 								size="sm"
 								variant="subtle"
 								color="gray"
-								onClick={onBack ?? (() => navigate({ to: ".." }))}
+								onClick={() => navigate({ to: ".." })}
 							>
 								<IconArrowLeft size={16} />
 							</ActionIcon>
@@ -3705,8 +3585,16 @@ export function NarratorPanel({
 										</ActionIcon>
 									</Tooltip>
 								)}
-								{onToggleTerminal && (
-									<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
+								{(onToggleTerminal || onOpenTerminalPanel) && (
+									<Tooltip
+										label={
+											onOpenTerminalPanel
+												? tt("openTerminal")
+												: terminalOpen
+													? tt("closeTerminal")
+													: tt("openTerminal")
+										}
+									>
 										<Indicator
 											label={activeTerminalCount}
 											size={14}
@@ -3718,7 +3606,7 @@ export function NarratorPanel({
 												variant="subtle"
 												color={terminalOpen ? "blue" : "gray"}
 												size="sm"
-												onClick={onToggleTerminal}
+												onClick={onOpenTerminalPanel ?? onToggleTerminal}
 											>
 												<IconTerminal size={16} />
 											</ActionIcon>
@@ -3838,8 +3726,16 @@ export function NarratorPanel({
 									</ActionIcon>
 								</Tooltip>
 							)}
-							{onToggleTerminal && (
-								<Tooltip label={terminalOpen ? tt("closeTerminal") : tt("openTerminal")}>
+							{(onToggleTerminal || onOpenTerminalPanel) && (
+								<Tooltip
+									label={
+										onOpenTerminalPanel
+											? tt("openTerminal")
+											: terminalOpen
+												? tt("closeTerminal")
+												: tt("openTerminal")
+									}
+								>
 									<Indicator
 										label={activeTerminalCount}
 										size={14}
@@ -3851,7 +3747,7 @@ export function NarratorPanel({
 											variant="subtle"
 											color={terminalOpen ? "blue" : "gray"}
 											size="sm"
-											onClick={onToggleTerminal}
+											onClick={onOpenTerminalPanel ?? onToggleTerminal}
 										>
 											<IconTerminal size={16} />
 										</ActionIcon>

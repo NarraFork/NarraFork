@@ -236,8 +236,6 @@ export interface TreeMessage {
 	} | null;
 	createdAt: string;
 	children: TreeMessage[];
-	/** Synthetic flag: when true, tool run grouping should not merge this message with the preceding run. */
-	_noMerge?: boolean;
 	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
 	_blockOriginalIndices?: number[];
 }

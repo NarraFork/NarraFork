@@ -1,7 +1,13 @@
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
-import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
+import {
+	containerInstances,
+	narrators,
+	terminals,
+	userPreferences,
+	workspaces,
+} from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -580,9 +586,11 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 			filtered = tabs.filter((t) => t.type !== "project" || isKept(t));
 		} else {
 			// inactive_narrators: keep projects + active narrator/chapter tabs
-			// Need live status from DB for accurate filtering
+			// Workspace-aware: if ANY child in a workspace is active, keep the
+			// entire workspace (header + all children). If ALL children are idle,
+			// remove the workspace + children and dissolve the workspace DB record.
 			const narratorIds = tabs
-				.filter((t) => t.type !== "project")
+				.filter((t) => t.type !== "project" && t.type !== "workspace")
 				.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
 				.filter(Boolean);
 
@@ -595,13 +603,64 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 				for (const r of rows) statusMap.set(r.id, r.status);
 			}
 
+			// Group children by workspaceId
+			const childrenByWs = new Map<string, Record<string, unknown>[]>();
+			for (const t of tabs) {
+				const wsId = t.workspaceId as string | undefined;
+				if (wsId) {
+					const arr = childrenByWs.get(wsId);
+					if (arr) arr.push(t);
+					else childrenByWs.set(wsId, [t]);
+				}
+			}
+
+			// Determine which workspaces have at least one active child
+			const activeWorkspaces = new Set<string>();
+			const allWorkspaceIds = new Set<string>();
+			for (const t of tabs) {
+				if (t.type === "workspace") allWorkspaceIds.add(t.id as string);
+			}
+			for (const wsId of allWorkspaceIds) {
+				const children = childrenByWs.get(wsId) ?? [];
+				const hasActive = children.some((child) => {
+					const nId =
+						child.type === "narrator" ? (child.id as string) : (child.narratorId as string);
+					const status = nId ? statusMap.get(nId) : undefined;
+					return status != null && ACTIVE_STATUSES.has(status);
+				});
+				if (hasActive) activeWorkspaces.add(wsId);
+			}
+
+			// Workspaces to dissolve (all children idle)
+			const dissolveWsIds: string[] = [];
+			for (const wsId of allWorkspaceIds) {
+				if (!activeWorkspaces.has(wsId) && !isKept({ type: "workspace", id: wsId })) {
+					dissolveWsIds.push(wsId);
+				}
+			}
+
 			filtered = tabs.filter((t) => {
 				if (isKept(t)) return true;
 				if (t.type === "project") return true;
+				// Workspace header
+				if (t.type === "workspace") {
+					return activeWorkspaces.has(t.id as string);
+				}
+				// Workspace child — follow workspace decision
+				const wsId = t.workspaceId as string | undefined;
+				if (wsId) {
+					return activeWorkspaces.has(wsId);
+				}
+				// Non-workspace tab — keep if active
 				const nId = t.type === "narrator" ? (t.id as string) : (t.narratorId as string);
 				const status = nId ? statusMap.get(nId) : undefined;
 				return status != null && ACTIVE_STATUSES.has(status);
 			});
+
+			// Dissolve workspace DB records for fully-idle workspaces
+			for (const wsId of dissolveWsIds) {
+				await db.delete(workspaces).where(eq(workspaces.id, wsId));
+			}
 		}
 
 		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { QueryClient } from "@tanstack/react-query";
+import { extractToolRunItems } from "../../frontend/components/narrator/message-segments";
 import {
-	flattenToolRun,
 	hasToolUse,
 	isToolOnlyMessage,
 	removeStreamingChunksMsg,
@@ -52,12 +52,13 @@ describe("narrator-message-helpers legacy behavior", () => {
 		expect(calls[0].durationMs).toBe(42);
 	});
 
-	test("flattenToolRun 保持 reasoning/tool 顺序并识别 subagent", () => {
+	test("extractToolRunItems 保持 reasoning/tool 顺序并识别 subagent", () => {
 		const { run, taskToolUseId, bashToolUseId, childFromTask } = createLegacyToolRunFixture();
-		const flat = flattenToolRun(run);
+		// extractToolRunItems works per-message; flatten both messages
+		const flat = run.flatMap((msg) => extractToolRunItems(msg));
 
-		expect(flat.map((x) => x.kind)).toEqual(["reasoning", "tool", "tool"]);
-		expect(flat[0]).toMatchObject({ kind: "reasoning", reasoningText: "先规划再执行" });
+		expect(flat.map((x: { kind: string }) => x.kind)).toEqual(["reasoning", "tool", "tool"]);
+		expect(flat[0]).toMatchObject({ kind: "reasoning", text: "先规划再执行" });
 
 		expect(flat[1].kind).toBe("tool");
 		if (flat[1].kind === "tool") {

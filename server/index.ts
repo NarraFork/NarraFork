@@ -514,6 +514,17 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Clean up orphan workspace records not referenced in any user's recentTabs
+import { dissolveOrphanWorkspaces } from "./routes/workspaces";
+
+dissolveOrphanWorkspaces()
+	.then((count) => {
+		if (count > 0) logger.info(`Dissolved ${count} orphan workspace(s)`);
+	})
+	.catch((err) => {
+		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
+	});
+
 // Ensure global overseer exists (disabled by default on first creation)
 import { ensureGlobalOverseer } from "./services/overseer-service";
 

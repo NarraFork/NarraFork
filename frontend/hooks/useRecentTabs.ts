@@ -128,10 +128,41 @@ export function useRecentTabs() {
 				);
 			} else {
 				// inactive_narrators — keep projects + active tabs + kept tab
+				// Workspace-aware: keep entire workspace if any child is active
 				const ACTIVE = new Set(["thinking", "waiting", "done"]);
+
+				// Group children by workspaceId
+				const childrenByWs = new Map<string, RecentTab[]>();
+				for (const tab of prev) {
+					if (tab.workspaceId) {
+						const arr = childrenByWs.get(tab.workspaceId);
+						if (arr) arr.push(tab);
+						else childrenByWs.set(tab.workspaceId, [tab]);
+					}
+				}
+
+				// Determine which workspaces have at least one active child
+				const activeWorkspaces = new Set<string>();
+				for (const tab of prev) {
+					if (tab.type === "workspace") {
+						const children = childrenByWs.get(tab.id) ?? [];
+						if (children.some((c) => ACTIVE.has(c.status ?? ""))) {
+							activeWorkspaces.add(tab.id);
+						}
+					}
+				}
+
 				const kept: RecentTab[] = [];
 				for (const tab of prev) {
-					if (isKept(tab) || tab.type === "project" || ACTIVE.has(tab.status ?? "")) {
+					if (isKept(tab) || tab.type === "project") {
+						kept.push(tab);
+					} else if (tab.type === "workspace") {
+						if (activeWorkspaces.has(tab.id)) kept.push(tab);
+						else evictTabCache(qc, tab);
+					} else if (tab.workspaceId) {
+						if (activeWorkspaces.has(tab.workspaceId)) kept.push(tab);
+						else evictTabCache(qc, tab);
+					} else if (ACTIVE.has(tab.status ?? "")) {
 						kept.push(tab);
 					} else {
 						evictTabCache(qc, tab);

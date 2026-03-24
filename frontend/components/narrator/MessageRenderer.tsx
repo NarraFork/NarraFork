@@ -11,24 +11,19 @@ import { ContentViewer } from "./ContentViewer";
 import { MessageBubble, ReasoningSummary } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
-	flattenToolRun,
-	hasToolUse,
-	isToolOnlyMessage,
-	resolvePendingPerm,
-} from "./narrator-message-helpers";
-import type {
-	ContentBlock,
-	FlatToolItem,
-	NarratorMsg,
-	PermissionCallbacks,
-} from "./narrator-panel-types";
-import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+	collectSegmentTargetIds,
+	type RenderSegment,
+	segmentMessages,
+	type ToolRunItem,
+} from "./message-segments";
+import { resolvePendingPerm } from "./narrator-message-helpers";
+import type { NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { getCategoryColor, TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 
 // ---------------------------------------------------------------------------
-// renderToolRun — renders a group of tool-bearing messages
+// renderToolRun — renders a tool-run segment from pre-computed ToolRunItems
 // ---------------------------------------------------------------------------
 
 export interface RenderToolRunOptions {
@@ -38,22 +33,21 @@ export interface RenderToolRunOptions {
 	onForkFromMessage?: (uuid: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
-	/** Extra styles applied to the outer tool-run container (used for visual merging). */
+	onViewSubagentSession?: (narratorId: string) => void;
+	/** Extra styles applied to the outer tool-run container. */
 	containerStyle?: React.CSSProperties;
 	/** Extra className applied to the outer tool-run container. */
 	containerClassName?: string;
-	/** Additional messages whose tool items are appended after the main run's items.
-	 *  Used to visually merge streaming tool chunks into an existing tool run. */
-	appendMessages?: NarratorMsg[];
 }
 
 export type RenderedTreeElementMeta =
 	| { kind: "regular" }
 	| { kind: "decorative" }
-	| { kind: "tool-run"; run: NarratorMsg[] };
+	| { kind: "tool-run"; sourceMessages: NarratorMsg[] };
 
 export function renderToolRun(
-	run: NarratorMsg[],
+	items: ToolRunItem[],
+	runKey: string,
 	narratorId: string,
 	permCb: PermissionCallbacks,
 	opts: RenderToolRunOptions = {},
@@ -65,10 +59,13 @@ export function renderToolRun(
 		onForkFromMessage,
 		onCompactBeforeMessage,
 		onDeleteBlock,
+		onViewSubagentSession,
 		containerStyle,
 		containerClassName,
-		appendMessages,
 	} = opts;
+
+	if (items.length === 0) return null;
+
 	const matchPermission = (tc: ToolCallData) =>
 		resolvePendingPerm(
 			tc,
@@ -76,22 +73,17 @@ export function renderToolRun(
 			permCb.pendingPermsMap,
 			permCb.overseerReviewMap,
 		);
-	const items = flattenToolRun(run);
-	if (appendMessages?.length) {
-		items.push(...flattenToolRun(appendMessages));
-	}
-	if (items.length === 0) return null;
 
 	const taskCount = items.filter((it) => it.kind === "tool" && it.isSubagent).length;
 	const soleSubagent = taskCount === 1;
 	const wrapWithBlur = (animationId: string | null, node: React.ReactNode) =>
 		animationId ? <BlurInOnAppear animationId={animationId}>{node}</BlurInOnAppear> : node;
 
-	const renderItem = (item: FlatToolItem, idx: number, total: number) => {
+	const renderItem = (item: ToolRunItem, idx: number, total: number) => {
 		const key =
 			item.kind === "tool"
 				? (item.tc.toolUseId ?? `${item.msg.id}-${idx}`)
-				: `reasoning-${item.msg.id}-${idx}`;
+				: `reasoning-${item.msg.id}-${item.blockIndex}`;
 		const hlStyle =
 			highlightedId === item.msg.id
 				? {
@@ -100,7 +92,6 @@ export function renderToolRun(
 					}
 				: undefined;
 
-		// Build context menu actions for this item's parent message
 		const ctxActions: MessageContextMenuActions = {};
 		const msgUuid = item.msg.messageUuid;
 		const msgId = item.msg.id;
@@ -127,7 +118,7 @@ export function renderToolRun(
 					<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
 						<IconBrain size={10} />
 					</ThemeIcon>
-					<ReasoningSummary text={item.reasoningText} translatedText={item.translatedText} />
+					<ReasoningSummary text={item.text} translatedText={item.translatedText} />
 				</Group>
 			);
 			return (
@@ -136,7 +127,7 @@ export function renderToolRun(
 						reasoningAnimationId,
 						<div id={`msg-${item.msg.id}`} style={hlStyle}>
 							<ContentViewer
-								content={item.reasoningText}
+								content={item.text}
 								markdown
 								contentType="markdown"
 								blockIndex={item.blockIndex}
@@ -184,6 +175,7 @@ export function renderToolRun(
 								permCb={permCb}
 								editExpandOverride={editExpandOverride}
 								onBgAgentRetry={permCb?.onBgAgentRetry}
+								onViewSubagentSession={onViewSubagentSession}
 								blockIndex={item.blockIndex}
 							/>
 						</div>,
@@ -221,7 +213,7 @@ export function renderToolRun(
 	if (items.length >= 2) {
 		return (
 			<Box
-				key={`tool-run-${run[0].id}`}
+				key={`tool-run-${runKey}`}
 				data-tool-run
 				className={containerClassName}
 				style={{
@@ -239,7 +231,7 @@ export function renderToolRun(
 
 	return (
 		<div
-			key={`tool-run-${run[0].id}`}
+			key={`tool-run-${runKey}`}
 			data-tool-run
 			className={containerClassName}
 			style={containerStyle}
@@ -249,174 +241,8 @@ export function renderToolRun(
 	);
 }
 
-export function hasReasoningBlock(msg: NarratorMsg): boolean {
-	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some((b: ContentBlock) => b.type === "reasoning" && !!b.text?.trim());
-}
-
-function hasVisibleBlocks(blocks: ContentBlock[]) {
-	return blocks.some((b: ContentBlock) => {
-		if (b.type === "text") return !!b.text?.trim();
-		if (b.type === "image") return true;
-		if (b.type === "text_file") return true;
-		if (b.type === "reasoning") return !!b.text?.trim();
-		if (b.type === "web_search") return true;
-		if (b.type === "thinking") {
-			const thinking = (b as { thinking?: string }).thinking;
-			return typeof thinking === "string" ? thinking.trim().length > 0 : true;
-		}
-		return false;
-	});
-}
-
-function collectRunTargetIds(
-	run: NarratorMsg[],
-	excludedMessageIds: ReadonlySet<string> = new Set<string>(),
-): string[] {
-	const ids = new Set<string>();
-	const visit = (msg: NarratorMsg) => {
-		if (msg.id && !excludedMessageIds.has(msg.id)) {
-			ids.add(msg.id);
-		}
-		for (const tc of (msg.toolCalls as Array<{ toolUseId?: string | null }> | undefined) ?? []) {
-			if (tc.toolUseId) ids.add(tc.toolUseId);
-		}
-		for (const block of Array.isArray(msg.contentJson) ? msg.contentJson : []) {
-			if (block.type === "tool_use" && typeof block.id === "string" && block.id.length > 0) {
-				ids.add(block.id);
-			}
-		}
-		for (const child of msg.children ?? []) {
-			visit(child);
-		}
-	};
-	for (const msg of run) {
-		visit(msg);
-	}
-	return [...ids];
-}
-
-function collectRenderedTargetIds(
-	messages: NarratorMsg[],
-	pruneBoundaryMessageId?: string | null,
-): string[][] {
-	const targets: string[][] = [];
-	let i = 0;
-
-	while (i < messages.length) {
-		const msg = messages[i];
-
-		if (msg._noMerge && msg.id === STREAMING_CHUNKS_MSG_ID) {
-			i++;
-			continue;
-		}
-
-		const hasTool = hasToolUse(msg);
-		const hasReasoning = hasReasoningBlock(msg);
-		const toolOnly = isToolOnlyMessage(msg);
-		const shouldRenderToolRun = hasTool || (hasReasoning && toolOnly);
-
-		if (shouldRenderToolRun) {
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			let renderedLeading = false;
-			if (!toolOnly) {
-				const reasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
-				const otherEntries: { block: ContentBlock; origIdx: number }[] = [];
-				blocks.forEach((b: ContentBlock, idx: number) => {
-					if (b.type === "reasoning" && !!b.text?.trim()) {
-						reasoningEntries.push({ block: b, origIdx: idx });
-					} else if (b.type !== "tool_use") {
-						otherEntries.push({ block: b, origIdx: idx });
-					}
-				});
-				const leadingBlocks = [...reasoningEntries, ...otherEntries].map((entry) => entry.block);
-				if (hasVisibleBlocks(leadingBlocks)) {
-					renderedLeading = true;
-					targets.push(msg.id ? [msg.id] : []);
-				}
-			}
-
-			const run: NarratorMsg[] = [msg];
-			let trailingContentMsg: NarratorMsg | null = null;
-			let j = i + 1;
-			while (
-				j < messages.length &&
-				(hasToolUse(messages[j]) || hasReasoningBlock(messages[j])) &&
-				isToolOnlyMessage(messages[j]) &&
-				!messages[j]._noMerge
-			) {
-				run.push(messages[j]);
-				j++;
-			}
-
-			if (j < messages.length) {
-				const tailMsg = messages[j];
-				const tailHasTool = hasToolUse(tailMsg);
-				const tailHasReasoning = hasReasoningBlock(tailMsg);
-				const tailToolOnly = isToolOnlyMessage(tailMsg);
-				if (!tailHasTool && tailHasReasoning && !tailToolOnly && !tailMsg._noMerge) {
-					const tailBlocks = Array.isArray(tailMsg.contentJson) ? tailMsg.contentJson : [];
-					const tailReasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
-					const tailContentEntries: { block: ContentBlock; origIdx: number }[] = [];
-					tailBlocks.forEach((b: ContentBlock, idx: number) => {
-						if (b.type === "reasoning" && !!b.text?.trim()) {
-							tailReasoningEntries.push({ block: b, origIdx: idx });
-						} else if (b.type !== "tool_use") {
-							tailContentEntries.push({ block: b, origIdx: idx });
-						}
-					});
-					if (tailReasoningEntries.length > 0) {
-						run.push(tailMsg);
-					}
-					const tailContentBlocks = tailContentEntries.map((entry) => entry.block);
-					if (hasVisibleBlocks(tailContentBlocks)) {
-						trailingContentMsg = tailMsg;
-					}
-					j++;
-				}
-			}
-
-			const excludedTargetIds = new Set<string>();
-			if (renderedLeading && msg.id) {
-				excludedTargetIds.add(msg.id);
-			}
-			if (trailingContentMsg?.id) {
-				excludedTargetIds.add(trailingContentMsg.id);
-			}
-			targets.push(collectRunTargetIds(run, excludedTargetIds));
-
-			if (
-				pruneBoundaryMessageId &&
-				run.some((item) => item.id === pruneBoundaryMessageId) &&
-				!(trailingContentMsg && trailingContentMsg.id === pruneBoundaryMessageId)
-			) {
-				targets.push([]);
-			}
-
-			if (trailingContentMsg) {
-				targets.push(trailingContentMsg.id ? [trailingContentMsg.id] : []);
-				if (pruneBoundaryMessageId && trailingContentMsg.id === pruneBoundaryMessageId) {
-					targets.push([]);
-				}
-			}
-
-			i = j;
-			continue;
-		}
-
-		targets.push(msg.id ? [msg.id] : []);
-		if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
-			targets.push([]);
-		}
-		i++;
-	}
-
-	return targets;
-}
-
 // ---------------------------------------------------------------------------
-// renderTreeMessages — renders a flat message list, grouping tool runs
+// renderTreeMessages — renders a flat message list using pre-computed segments
 // ---------------------------------------------------------------------------
 
 export function renderTreeMessages(
@@ -436,21 +262,36 @@ export function renderTreeMessages(
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
 	lastUserMessageId?: string,
 	hasChapter?: boolean,
-): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[] } {
-	// Messages are already tree-structured from the backend (children nested).
-	// Group consecutive assistant messages with tool_use blocks into visual "runs".
-	// A message with text + tool_use renders its text first, then its tool calls
-	// merge forward with subsequent tool-bearing messages.
+	onViewSubagentSession?: (narratorId: string) => void,
+	streamingMsg?: NarratorMsg | null,
+): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[]; segments: RenderSegment[] } {
+	const segments = segmentMessages(messages, {
+		pruneBoundaryMessageId,
+		pruneDividerLabel,
+		streamingMsg,
+	});
+
 	const elements: React.ReactNode[] = [];
 	const meta: RenderedTreeElementMeta[] = [];
-	let i = 0;
 
-	const renderRegularMessage = (
+	const renderMessageSegment = (
 		targetMsg: NarratorMsg,
 		key: string,
 		domId = `msg-${targetMsg.id}`,
 		highlight = true,
+		visibleBlockIndices?: number[],
 	) => {
+		// Build the message object — if visibleBlockIndices is set, filter contentJson
+		const displayMsg =
+			visibleBlockIndices != null
+				? {
+						...targetMsg,
+						contentJson: visibleBlockIndices.map((bi) => targetMsg.contentJson[bi]),
+						toolCalls: [],
+						_blockOriginalIndices: visibleBlockIndices,
+					}
+				: targetMsg;
+
 		const content = (
 			<Box
 				key={key}
@@ -472,7 +313,7 @@ export function renderTreeMessages(
 					)}
 				<MessageBubble
 					narratorId={narratorId}
-					message={targetMsg}
+					message={displayMsg}
 					onForkFromMessage={onForkFromMessage}
 					resolvePerm={(tc) =>
 						resolvePendingPerm(
@@ -529,242 +370,56 @@ export function renderTreeMessages(
 		);
 	};
 
-	while (i < messages.length) {
-		const msg = messages[i];
-
-		// Skip deferred streaming chunks — they are rendered after the StreamingBubble
-		if (msg._noMerge && msg.id === STREAMING_CHUNKS_MSG_ID) {
-			i++;
-			continue;
-		}
-
-		const hasTool = hasToolUse(msg);
-		const hasReasoning = hasReasoningBlock(msg);
-		const toolOnly = isToolOnlyMessage(msg);
-		const shouldRenderToolRun = hasTool || (hasReasoning && toolOnly);
-
-		if (shouldRenderToolRun) {
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			// For mixed messages, render reasoning + text/image first so the order becomes:
-			// reasoning → text/image → tool calls.
-			if (!toolOnly) {
-				const reasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
-				const otherEntries: { block: ContentBlock; origIdx: number }[] = [];
-				blocks.forEach((b: ContentBlock, idx: number) => {
-					if (b.type === "reasoning" && !!b.text?.trim()) {
-						reasoningEntries.push({ block: b, origIdx: idx });
-					} else if (b.type !== "tool_use") {
-						otherEntries.push({ block: b, origIdx: idx });
-					}
-				});
-				const leadingEntries = [...reasoningEntries, ...otherEntries];
-				const leadingBlocks = leadingEntries.map((e) => e.block);
-				const leadingOriginalIndices = leadingEntries.map((e) => e.origIdx);
-				if (hasVisibleBlocks(leadingBlocks)) {
-					elements.push(
-						<Box
-							key={`${msg.id}-leading`}
-							id={`msg-${msg.id}`}
-							style={{
-								borderRadius: "var(--mantine-radius-md)",
-								animation: highlightedId === msg.id ? "highlight-blink 1.5s ease" : undefined,
-							}}
-						>
-							{showTokenUsage && (msg.tokensIn != null || msg.meterUsage != null) && (
-								<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-									{msg.tokensIn != null
-										? `↑ ${(msg.tokensIn as number).toLocaleString()}`
-										: `${(msg.meterUsage as number).toFixed(2)} credits`}
-								</Text>
-							)}
-							<MessageBubble
-								narratorId={narratorId}
-								message={{
-									...msg,
-									contentJson: leadingBlocks,
-									toolCalls: [],
-									_blockOriginalIndices: leadingOriginalIndices,
-								}}
-								onForkFromMessage={onForkFromMessage}
-								resolvePerm={(tc) =>
-									resolvePendingPerm(
-										tc,
-										permCb.pendingPermission,
-										permCb.pendingPermsMap,
-										permCb.overseerReviewMap,
-									)
-								}
-								onPermissionDecision={permCb.onPermissionDecision}
-								onQuestionSubmit={permCb.onQuestionSubmit}
-								onQuestionDeny={permCb.onQuestionDeny}
-								onCompactBeforeMessage={onCompactBeforeMessage}
-								onDeleteBlock={onDeleteBlock}
-								onRegenerateFromMessage={onRegenerateFromMessage}
-								onEditAndRegenerate={onEditAndRegenerate}
-								isLastUserMessage={msg.id === lastUserMessageId}
-								hasChapter={hasChapter}
-							/>
-						</Box>,
-					);
-					meta.push({ kind: "regular" });
-				}
-			}
-
-			// Collect this message and subsequent tool-bearing messages into a run.
-			// Respect _noMerge flag on synthetic streaming messages — when the model
-			// emitted text before these tool chunks, they should render separately.
-			const runStartMsg: NarratorMsg =
-				!toolOnly && hasTool
-					? (() => {
-							const toolEntries: { block: ContentBlock; origIdx: number }[] = [];
-							blocks.forEach((b: ContentBlock, idx: number) => {
-								if (b.type === "tool_use") toolEntries.push({ block: b, origIdx: idx });
-							});
-							return {
-								...msg,
-								contentJson: toolEntries.map((e) => e.block),
-								_blockOriginalIndices: toolEntries.map((e) => e.origIdx),
-							};
-						})()
-					: msg;
-			const run: NarratorMsg[] = [runStartMsg];
-			let trailingContentMsg: NarratorMsg | null = null;
-			let j = i + 1;
-			while (
-				j < messages.length &&
-				(hasToolUse(messages[j]) || hasReasoningBlock(messages[j])) &&
-				isToolOnlyMessage(messages[j]) &&
-				!messages[j]._noMerge
-			) {
-				run.push(messages[j]);
-				j++;
-			}
-
-			// If the immediate next assistant message is reasoning + visible content (no tool_use),
-			// attach its reasoning into the current run, and render only its non-reasoning content
-			// as a normal message below. This keeps reasoning visually glued to the prior tool run.
-			if (j < messages.length) {
-				const tailMsg = messages[j];
-				const tailHasTool = hasToolUse(tailMsg);
-				const tailHasReasoning = hasReasoningBlock(tailMsg);
-				const tailToolOnly = isToolOnlyMessage(tailMsg);
-				if (!tailHasTool && tailHasReasoning && !tailToolOnly && !tailMsg._noMerge) {
-					const tailBlocks = Array.isArray(tailMsg.contentJson) ? tailMsg.contentJson : [];
-					const tailReasoningEntries: { block: ContentBlock; origIdx: number }[] = [];
-					const tailContentEntries: { block: ContentBlock; origIdx: number }[] = [];
-					tailBlocks.forEach((b: ContentBlock, idx: number) => {
-						if (b.type === "reasoning" && !!b.text?.trim()) {
-							tailReasoningEntries.push({ block: b, origIdx: idx });
-						} else if (b.type !== "tool_use") {
-							tailContentEntries.push({ block: b, origIdx: idx });
-						}
-					});
-					if (tailReasoningEntries.length > 0) {
-						run.push({
-							...tailMsg,
-							contentJson: tailReasoningEntries.map((e) => e.block),
-							toolCalls: [],
-							_blockOriginalIndices: tailReasoningEntries.map((e) => e.origIdx),
-						});
-					}
-					const tailContentBlocks = tailContentEntries.map((e) => e.block);
-					if (hasVisibleBlocks(tailContentBlocks)) {
-						trailingContentMsg = {
-							...tailMsg,
-							contentJson: tailContentBlocks,
-							toolCalls: [],
-							_blockOriginalIndices: tailContentEntries.map((e) => e.origIdx),
-						};
-					}
-					j++;
-				}
-			}
-
-			const el = renderToolRun(run, narratorId, permCb, {
-				expandedToolUseId,
-				highlightedId,
-				editExpandOverride,
-				onForkFromMessage,
-				onCompactBeforeMessage,
-				onDeleteBlock,
-			});
-
-			if (el) {
-				elements.push(el);
-				meta.push({ kind: "tool-run", run });
-			}
-
-			// Insert prune divider if any message in this run is the boundary, unless
-			// the boundary is the attached tail message and we're about to render its content.
-			if (
-				pruneBoundaryMessageId &&
-				run.some((m) => m.id === pruneBoundaryMessageId) &&
-				!(trailingContentMsg && trailingContentMsg.id === pruneBoundaryMessageId)
-			) {
-				elements.push(
-					<Divider
-						key="prune-boundary"
-						my="xs"
-						label={pruneDividerLabel}
-						labelPosition="center"
-						color="yellow.7"
-						styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
-					/>,
-				);
-				meta.push({ kind: "decorative" });
-			}
-
-			if (trailingContentMsg) {
-				elements.push(
-					renderRegularMessage(
-						trailingContentMsg,
-						`${trailingContentMsg.id}-tail-content`,
-						`msg-${trailingContentMsg.id}-content`,
-						false,
-					),
-				);
-				meta.push({ kind: "regular" });
-				if (pruneBoundaryMessageId && trailingContentMsg.id === pruneBoundaryMessageId) {
-					elements.push(
-						<Divider
-							key="prune-boundary"
-							my="xs"
-							label={pruneDividerLabel}
-							labelPosition="center"
-							color="yellow.7"
-							styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
-						/>,
-					);
-					meta.push({ kind: "decorative" });
-				}
-			}
-
-			i = j;
-			continue;
-		}
-
-		elements.push(renderRegularMessage(msg, msg.id));
-		meta.push({ kind: "regular" });
-
-		// Insert prune divider after the boundary message
-		if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
+	for (const seg of segments) {
+		if (seg.kind === "prune-divider") {
 			elements.push(
 				<Divider
 					key="prune-boundary"
 					my="xs"
-					label={pruneDividerLabel}
+					label={seg.label}
 					labelPosition="center"
 					color="yellow.7"
 					styles={{ label: { color: "var(--mantine-color-yellow-5)", fontSize: 11 } }}
 				/>,
 			);
 			meta.push({ kind: "decorative" });
+			continue;
 		}
 
-		i++;
+		if (seg.kind === "message") {
+			const key = seg.visibleBlockIndices ? `${seg.msg.id}-leading` : seg.msg.id;
+			const domId = seg.visibleBlockIndices ? `msg-${seg.msg.id}` : `msg-${seg.msg.id}`;
+			elements.push(
+				renderMessageSegment(
+					seg.msg,
+					key,
+					domId,
+					!seg.visibleBlockIndices,
+					seg.visibleBlockIndices,
+				),
+			);
+			meta.push({ kind: "regular" });
+			continue;
+		}
+
+		// seg.kind === "tool-run"
+		const runKey = seg.sourceMessages[0]?.id ?? "unknown";
+		const el = renderToolRun(seg.items, runKey, narratorId, permCb, {
+			expandedToolUseId,
+			highlightedId,
+			editExpandOverride,
+			onForkFromMessage,
+			onCompactBeforeMessage,
+			onDeleteBlock,
+			onViewSubagentSession,
+		});
+		if (el) {
+			elements.push(el);
+			meta.push({ kind: "tool-run", sourceMessages: seg.sourceMessages });
+		}
 	}
 
-	return { elements, meta };
+	return { elements, meta, segments };
 }
 
 // ---------------------------------------------------------------------------
@@ -778,18 +433,21 @@ export function renderTreeMessagesWithKeys(...args: Parameters<typeof renderTree
 	targets: string[][];
 	meta: RenderedTreeElementMeta[];
 } {
-	const { elements, meta } = renderTreeMessages(...args);
+	const { elements, meta, segments } = renderTreeMessages(...args);
 	const keys: string[] = [];
 	for (const el of elements) {
-		// Extract the React key from each element
 		if (el != null && typeof el === "object" && "key" in (el as React.ReactElement)) {
 			keys.push(String((el as React.ReactElement).key ?? keys.length));
 		} else {
 			keys.push(String(keys.length));
 		}
 	}
-	const [messages, , , , , , , , pruneBoundaryMessageId] = args;
-	const targets = collectRenderedTargetIds(messages, pruneBoundaryMessageId);
+
+	const targets: string[][] = [];
+	for (const seg of segments) {
+		targets.push(collectSegmentTargetIds(seg));
+	}
+
 	return {
 		elements,
 		keys,
@@ -856,8 +514,6 @@ export const StreamingBubble = memo(
 		} | null>;
 		version: number;
 	}) {
-		// Read ref directly during render — version change triggers re-render
-		// which picks up the latest accumulated text without an extra useEffect cycle.
 		void version;
 		const text = streamingRef.current;
 		const reasoning = includeReasoning ? streamingReasoningRef?.current : undefined;

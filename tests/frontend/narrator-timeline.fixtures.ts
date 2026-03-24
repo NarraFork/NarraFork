@@ -23,7 +23,6 @@ export function makeMessage(
 		subagentModel: partial.subagentModel ?? null,
 		createdAt: partial.createdAt ?? NOW,
 		children: partial.children ?? [],
-		_noMerge: partial._noMerge,
 	};
 }
 
@@ -99,7 +98,6 @@ export function createStreamingChunksFixture() {
 		toolCalls: [
 			{ toolUseId: "stream-1", toolName: "Write", status: "initializing", createdAt: NOW },
 		],
-		_noMerge: true,
 	});
 	const tail = makeMessage({
 		id: "m-tail",

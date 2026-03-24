@@ -1,7 +1,7 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { workspaces } from "../db/schema";
+import { userPreferences, workspaces } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { createWorkspaceSchema, updateWorkspaceSchema } from "../lib/validators";
@@ -89,3 +89,39 @@ workspaceRoutes.delete("/:id", async (c) => {
 
 	return c.json({ ok: true });
 });
+
+/**
+ * Delete workspace DB records that are not referenced in any user's recentTabs.
+ * Called on server startup to clean up orphans left by previous runs.
+ */
+export async function dissolveOrphanWorkspaces(): Promise<number> {
+	// Collect all workspace IDs from DB
+	const allWs = await db.select({ id: workspaces.id }).from(workspaces);
+	if (allWs.length === 0) return 0;
+
+	// Collect all workspace IDs referenced in any user's recentTabs
+	const allPrefs = await db
+		.select({ recentTabs: userPreferences.recentTabs })
+		.from(userPreferences);
+
+	const referencedWsIds = new Set<string>();
+	for (const row of allPrefs) {
+		let tabs: Record<string, unknown>[];
+		try {
+			tabs = JSON.parse(row.recentTabs);
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(tabs)) continue;
+		for (const t of tabs) {
+			if (t.type === "workspace") referencedWsIds.add(t.id as string);
+		}
+	}
+
+	// Delete orphans
+	const orphanIds = allWs.filter((ws) => !referencedWsIds.has(ws.id)).map((ws) => ws.id);
+	if (orphanIds.length > 0) {
+		await db.delete(workspaces).where(inArray(workspaces.id, orphanIds));
+	}
+	return orphanIds.length;
+}

@@ -1,96 +1,15 @@
 import type { QueryClient } from "@tanstack/react-query";
-import type {
-	ContentBlock,
-	FlatToolItem,
-	MessagesQueryData,
-	NarratorMsg,
-	PendingPermission,
-	ToolCallRow,
-} from "./narrator-panel-types";
+import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
-
-/**
- * Map legacy tool names to their current equivalents.
- * Keeps historical sessions working after the CC-aligned rename.
- */
-const LEGACY_TOOL_NAMES: Record<string, string> = {
-	Task: "Agent",
-	TodoWrite: "TaskCreate",
-	CheckBackgroundTask: "TaskOutput",
-	CancelBackgroundTask: "TaskStop",
-};
-
-function normalizeToolName(name: string): string {
-	return LEGACY_TOOL_NAMES[name] ?? name;
-}
-
 import type { ToolCallData } from "./ToolCallCard";
 
-export function isToolOnlyMessage(msg: NarratorMsg): boolean {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return (
-		msg.role === "assistant" &&
-		blocks.length > 0 &&
-		blocks.every(
-			(b: ContentBlock) =>
-				b.type === "tool_use" || b.type === "reasoning" || (b.type === "text" && !b.text?.trim()),
-		)
-	);
-}
-
-/** Check if an assistant message contains at least one tool_use block. */
-export function hasToolUse(msg: NarratorMsg): boolean {
-	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some((b: ContentBlock) => b.type === "tool_use");
-}
-
-/** Resolve ALL tool_use blocks from a message (one message may contain multiple tool calls).
- *  Reads enriched fields directly from contentJson blocks when available (set by
- *  the backend's enrichToolUseBlocks), falling back to the toolCalls array for
- *  messages that haven't been enriched (e.g. synthetic streaming chunks). */
-export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	const results: ToolCallData[] = [];
-	for (const block of blocks) {
-		if (block.type !== "tool_use") continue;
-		// Enriched blocks carry all fields directly; fall back to toolCalls lookup
-		const isEnriched = block.status !== undefined;
-		const tc = isEnriched
-			? null
-			: msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === (block.id ?? ""));
-		const status = block.status ?? tc?.status ?? "running";
-		// Derive startedAt for in-progress tools from persisted timestamps so the
-		// elapsed timer works correctly when re-entering a session.
-		let startedAt: number | undefined;
-		if (status === "running" || status === "pending" || status === "initializing") {
-			const ts =
-				block.permissionDecidedAt ?? tc?.permissionDecidedAt ?? block.tcCreatedAt ?? tc?.createdAt;
-			if (ts) startedAt = new Date(ts).getTime();
-		}
-		results.push({
-			id: block.tcId ?? tc?.id,
-			toolName: normalizeToolName(block.name ?? ""),
-			toolUseId: block.id,
-			inputJson: block.inputJson ?? tc?.inputJson ?? block.input,
-			outputJson: block.outputJson ?? tc?.outputJson,
-			status,
-			durationMs: block.durationMs ?? tc?.durationMs,
-			errorMessage: block.errorMessage ?? tc?.errorMessage,
-			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
-			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
-			permissionSuggestions: block.permissionSuggestions ?? tc?.permissionSuggestions,
-			startedAt,
-			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields injected by mergeFieldsByIndex
-			_metadata: block._metadata ?? (tc as any)?._metadata,
-			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields injected by mergeFieldsByIndex
-			_longRunning: block._longRunning ?? (tc as any)?._longRunning,
-			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields injected by mergeFieldsByIndex
-			_streamingOutput: block._streamingOutput ?? (tc as any)?._streamingOutput,
-		});
-	}
-	return results;
-}
+// Re-export functions that moved to message-segments.ts for backward compatibility
+export {
+	filterChildrenByToolUse,
+	hasToolUse,
+	isToolOnlyMessage,
+	resolveAllToolCallsFromMsg,
+} from "./message-segments";
 
 /** Resolve a PendingPermission from a tool call's data or WS state fallback. */
 export function resolvePendingPerm(
@@ -127,44 +46,6 @@ export function resolvePendingPerm(
 		return { ...perm, overseerStatus: overseerReviewMap.get(tc.toolUseId) };
 	}
 	return perm;
-}
-
-export function filterChildrenByToolUse(
-	children: NarratorMsg[],
-	toolUseId: string | undefined,
-): NarratorMsg[] {
-	if (!toolUseId) return [];
-	return children.filter((c) => c.parentToolUseId === toolUseId);
-}
-
-export function flattenToolRun(run: NarratorMsg[]): FlatToolItem[] {
-	const items: FlatToolItem[] = [];
-	for (const msg of run) {
-		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-		const origIndices = msg._blockOriginalIndices;
-		for (let bi = 0; bi < blocks.length; bi++) {
-			const block = blocks[bi];
-			const realIndex = origIndices?.[bi] ?? bi;
-			if (block.type === "reasoning" && typeof block.text === "string" && block.text.trim()) {
-				items.push({
-					kind: "reasoning",
-					msg,
-					reasoningText: block.text,
-					translatedText: block.translatedText,
-					blockIndex: realIndex,
-				});
-				continue;
-			}
-			if (block.type !== "tool_use") continue;
-			const tcs = resolveAllToolCallsFromMsg(msg);
-			const tc = tcs.find((t) => t.toolUseId === block.id);
-			if (!tc) continue;
-			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
-			const isSubagent = tc.toolName === "Agent" || children.length > 0;
-			items.push({ kind: "tool", tc, msg, children, isSubagent, blockIndex: realIndex });
-		}
-	}
-	return items;
 }
 
 export function revokeContentBlockPreviewUrls(
