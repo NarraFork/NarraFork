@@ -55,5 +55,6 @@
 	"listView": "List view",
 	"splitRight": "Split right",
 	"splitDown": "Split down",
-	"dropNarratorHere": "Drop a narrator here"
+	"dropNarratorHere": "Drop a narrator here",
+	"distributePanels": "Distribute panels evenly"
 }

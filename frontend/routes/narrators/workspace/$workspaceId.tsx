@@ -1,5 +1,5 @@
 import { ActionIcon, Box, Center, Group, Loader, Text, TextInput, Tooltip } from "@mantine/core";
-import { IconArrowLeft, IconCheck, IconPencil } from "@tabler/icons-react";
+import { IconArrowLeft, IconCheck, IconEqualDouble, IconPencil } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -12,14 +12,18 @@ import {
 import {
 	countLeaves,
 	createLeaf,
+	distributeSizes,
 	getAllNarratorIds,
 	moveLeaf,
 	removeLeaf,
 	type SplitDirection,
+	type SplitLeaf,
 	type SplitNode,
 	setNarrator,
 	splitAndAssign,
+	splitAndAssignTerminal,
 	swapLeaves,
+	type TerminalLeafConfig,
 	updateSizes,
 } from "../../../components/narrator/split-tree";
 import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
@@ -56,6 +60,11 @@ function parseTree(json: string): SplitNode {
 	return createLeaf();
 }
 
+function collectLeafIds(node: SplitNode): string[] {
+	if (node.type === "leaf") return [node.id];
+	return node.children.flatMap(collectLeafIds);
+}
+
 function WorkspacePage() {
 	const { workspaceId } = Route.useParams();
 	const navigate = useNavigate();
@@ -86,6 +95,9 @@ function WorkspacePage() {
 	}, [editTitle, serverTitle, workspaceId]);
 
 	const [tree, setTree] = useState<SplitNode | null>(null);
+	const [leafSubagentStacks, setLeafSubagentStacks] = useState<Record<string, string[]>>({});
+	const leafSubagentStacksRef = useRef<Record<string, string[]>>({});
+	leafSubagentStacksRef.current = leafSubagentStacks;
 	/** Track whether local edits have been made — skip overwriting with stale server data. */
 	const localEditRef = useRef(false);
 	/** Track the server updatedAt we last loaded from, to detect fresh refetches. */
@@ -107,6 +119,23 @@ function WorkspacePage() {
 			localEditRef.current = false;
 		}
 	}, [workspace, tree]);
+
+	useEffect(() => {
+		if (!tree) return;
+		const liveLeafIds = new Set(collectLeafIds(tree));
+		setLeafSubagentStacks((prev) => {
+			let changed = false;
+			const next: Record<string, string[]> = {};
+			for (const [leafId, stack] of Object.entries(prev)) {
+				if (liveLeafIds.has(leafId) && stack.length > 0) {
+					next[leafId] = stack;
+				} else {
+					changed = true;
+				}
+			}
+			return changed ? next : prev;
+		});
+	}, [tree]);
 
 	// Record recent tab
 	useEffect(() => {
@@ -184,14 +213,17 @@ function WorkspacePage() {
 	useEffect(() => {
 		return () => {
 			if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-			// Flush pending save
+			// Flush pending save — use api directly instead of mutation to avoid
+			// global error notifications when the workspace has already been deleted
+			// (e.g. user dissolved the workspace, which triggers unmount + delete).
 			if (treeRef.current) {
-				updateRef.current.mutate({
-					id: workspaceId,
-					tree: JSON.stringify(treeRef.current),
-				});
+				api.updateWorkspace(workspaceId, { tree: JSON.stringify(treeRef.current) }).catch(() => {});
 			}
-			for (const id of getAllNarratorIds(treeRef.current ?? createLeaf())) {
+			const narratorIds = new Set(getAllNarratorIds(treeRef.current ?? createLeaf()));
+			for (const stack of Object.values(leafSubagentStacksRef.current)) {
+				for (const id of stack) narratorIds.add(id);
+			}
+			for (const id of narratorIds) {
 				api.leaveNarrator(id).catch(() => {});
 			}
 		};
@@ -240,6 +272,10 @@ function WorkspacePage() {
 		[updateTree],
 	);
 
+	const handleDistribute = useCallback(() => {
+		updateTree((prev) => distributeSizes(prev));
+	}, [updateTree]);
+
 	const handleSwap = useCallback(
 		(leafIdA: string, leafIdB: string) => {
 			updateTree((prev) => swapLeaves(prev, leafIdA, leafIdB));
@@ -258,6 +294,50 @@ function WorkspacePage() {
 		},
 		[updateTree],
 	);
+
+	const handleSplitAndAssignTerminal = useCallback(
+		(
+			leafId: string,
+			direction: SplitDirection,
+			position: "before" | "after",
+			config: TerminalLeafConfig,
+		) => {
+			updateTree((prev) => splitAndAssignTerminal(prev, leafId, direction, position, config));
+		},
+		[updateTree],
+	);
+
+	const resolveNarratorView = useCallback(
+		(leaf: SplitLeaf) => {
+			const stack = leafSubagentStacks[leaf.id] ?? [];
+			return {
+				narratorId: stack[stack.length - 1] ?? leaf.narratorId,
+				isSubagentView: stack.length > 0,
+			};
+		},
+		[leafSubagentStacks],
+	);
+
+	const handleOpenSubagentInLeaf = useCallback((leafId: string, narratorId: string) => {
+		setLeafSubagentStacks((prev) => {
+			const current = prev[leafId] ?? [];
+			if (current[current.length - 1] === narratorId) return prev;
+			return { ...prev, [leafId]: [...current, narratorId] };
+		});
+	}, []);
+
+	const handleRestoreLeafNarrator = useCallback((leafId: string) => {
+		setLeafSubagentStacks((prev) => {
+			const current = prev[leafId] ?? [];
+			if (current.length === 0) return prev;
+			if (current.length === 1) {
+				const next = { ...prev };
+				delete next[leafId];
+				return next;
+			}
+			return { ...prev, [leafId]: current.slice(0, -1) };
+		});
+	}, []);
 
 	if (isLoading || !tree) {
 		return (
@@ -281,6 +361,10 @@ function WorkspacePage() {
 		onClose: handleClose,
 		onSwap: handleSwap,
 		onMoveToSplit: handleMoveToSplit,
+		onSplitAndAssignTerminal: handleSplitAndAssignTerminal,
+		resolveNarratorView,
+		onOpenSubagentInLeaf: handleOpenSubagentInLeaf,
+		onRestoreLeafNarrator: handleRestoreLeafNarrator,
 		canClose,
 	};
 
@@ -332,6 +416,12 @@ function WorkspacePage() {
 						<IconPencil size={14} color="var(--mantine-color-dimmed)" />
 					</Group>
 				)}
+				<Box style={{ flex: 1 }} />
+				<Tooltip label={t("distributePanels")}>
+					<ActionIcon size="sm" variant="subtle" onClick={handleDistribute}>
+						<IconEqualDouble size={16} />
+					</ActionIcon>
+				</Tooltip>
 			</Group>
 
 			<Box style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden" }}>

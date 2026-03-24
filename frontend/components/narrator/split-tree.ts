@@ -7,10 +7,25 @@ function genId(): string {
 
 export type SplitDirection = "horizontal" | "vertical";
 
+export type PanelType = "narrator" | "terminal";
+
+export interface TerminalLeafConfig {
+	/** Bind to a narrator's terminal list */
+	narratorId?: string;
+	/** Bind to a chapter's terminal list */
+	chapterId?: string;
+	/** Standalone terminal CWD (when neither narratorId nor chapterId) */
+	cwd?: string;
+}
+
 export interface SplitLeaf {
 	type: "leaf";
 	id: string;
+	/** Panel type — defaults to "narrator" for backward compat. */
+	panelType?: PanelType;
 	narratorId: string | null;
+	/** Config for terminal panels (only when panelType === "terminal"). */
+	terminalConfig?: TerminalLeafConfig | null;
 }
 
 export interface SplitBranch {
@@ -27,12 +42,28 @@ export type SplitNode = SplitLeaf | SplitBranch;
 // ── Constructors ──
 
 export function createLeaf(narratorId: string | null = null): SplitLeaf {
-	return { type: "leaf", id: genId(), narratorId };
+	return { type: "leaf", id: genId(), panelType: "narrator", narratorId };
 }
 
 /** Shorthand: create a leaf with a specific narratorId. */
 export function createLeafWith(narratorId: string): SplitLeaf {
-	return { type: "leaf", id: genId(), narratorId };
+	return { type: "leaf", id: genId(), panelType: "narrator", narratorId };
+}
+
+/** Create a terminal-type leaf. */
+export function createTerminalLeaf(config: TerminalLeafConfig): SplitLeaf {
+	return {
+		type: "leaf",
+		id: genId(),
+		panelType: "terminal",
+		narratorId: null,
+		terminalConfig: config,
+	};
+}
+
+/** Resolve panelType for a leaf, defaulting to "narrator" for backward compat. */
+export function leafPanelType(leaf: SplitLeaf): PanelType {
+	return leaf.panelType ?? "narrator";
 }
 
 /** Create a branch with two children. */
@@ -74,7 +105,7 @@ function splitLeafImpl(
 	if (node.type === "leaf") {
 		if (node.id !== leafId) return node;
 		// Create a fresh copy of the original leaf (new object, same data)
-		const kept: SplitLeaf = { type: "leaf", id: node.id, narratorId: node.narratorId };
+		const kept: SplitLeaf = { ...node };
 		const empty = createLeaf();
 		const children = position === "after" ? [kept, empty] : [empty, kept];
 		return { type: "branch", id: genId(), direction, children, sizes: [50, 50] };
@@ -106,13 +137,46 @@ function splitAndAssignImpl(
 ): SplitNode {
 	if (node.type === "leaf") {
 		if (node.id !== leafId) return node;
-		const kept: SplitLeaf = { type: "leaf", id: node.id, narratorId: node.narratorId };
+		const kept: SplitLeaf = { ...node };
 		const assigned = createLeaf(narratorId);
 		const children = position === "after" ? [kept, assigned] : [assigned, kept];
 		return { type: "branch", id: genId(), direction, children, sizes: [50, 50] };
 	}
 	const newChildren = node.children.map((c) =>
 		splitAndAssignImpl(c, leafId, direction, position, narratorId),
+	);
+	const changed = newChildren.some((c, i) => c !== node.children[i]);
+	if (!changed) return node;
+	return flattenBranch({ ...node, children: newChildren });
+}
+
+/** Split a leaf and assign a terminal config to the newly created leaf. */
+export function splitAndAssignTerminal(
+	tree: SplitNode,
+	leafId: string,
+	direction: SplitDirection,
+	position: "before" | "after",
+	config: TerminalLeafConfig,
+): SplitNode {
+	return splitAndAssignTerminalImpl(tree, leafId, direction, position, config);
+}
+
+function splitAndAssignTerminalImpl(
+	node: SplitNode,
+	leafId: string,
+	direction: SplitDirection,
+	position: "before" | "after",
+	config: TerminalLeafConfig,
+): SplitNode {
+	if (node.type === "leaf") {
+		if (node.id !== leafId) return node;
+		const kept: SplitLeaf = { ...node };
+		const terminal = createTerminalLeaf(config);
+		const children = position === "after" ? [kept, terminal] : [terminal, kept];
+		return { type: "branch", id: genId(), direction, children, sizes: [50, 50] };
+	}
+	const newChildren = node.children.map((c) =>
+		splitAndAssignTerminalImpl(c, leafId, direction, position, config),
 	);
 	const changed = newChildren.some((c, i) => c !== node.children[i]);
 	if (!changed) return node;
@@ -147,7 +211,26 @@ export function removeLeaf(tree: SplitNode, leafId: string): SplitNode | null {
 
 /** Set the narratorId of a specific leaf. */
 export function setNarrator(tree: SplitNode, leafId: string, narratorId: string | null): SplitNode {
-	return mapLeaf(tree, leafId, (leaf) => ({ ...leaf, narratorId }));
+	return mapLeaf(tree, leafId, (leaf) => ({
+		...leaf,
+		panelType: "narrator",
+		narratorId,
+		terminalConfig: undefined,
+	}));
+}
+
+/** Convert a leaf to a terminal panel. */
+export function setTerminalConfig(
+	tree: SplitNode,
+	leafId: string,
+	config: TerminalLeafConfig,
+): SplitNode {
+	return mapLeaf(tree, leafId, (leaf) => ({
+		...leaf,
+		panelType: "terminal",
+		narratorId: null,
+		terminalConfig: config,
+	}));
 }
 
 /** Update sizes of a specific branch. */
@@ -155,18 +238,33 @@ export function updateSizes(tree: SplitNode, branchId: string, sizes: number[]):
 	return mapBranch(tree, branchId, (branch) => ({ ...branch, sizes }));
 }
 
-/** Collect all non-null narratorIds from the tree. */
+/**
+ * Distribute all branch children sizes evenly.
+ * Applied recursively to every branch in the tree.
+ */
+export function distributeSizes(tree: SplitNode): SplitNode {
+	if (tree.type === "leaf") return tree;
+	const evenSizes = tree.children.map(() => 100 / tree.children.length);
+	const updated: SplitBranch = { ...tree, sizes: evenSizes };
+	return {
+		...updated,
+		children: updated.children.map((child) => distributeSizes(child)),
+	};
+}
+
+/** Collect all non-null narratorIds from narrator-type leaves. */
 export function getAllNarratorIds(tree: SplitNode): string[] {
 	const ids: string[] = [];
 	walkLeaves(tree, (leaf) => {
-		if (leaf.narratorId) ids.push(leaf.narratorId);
+		if (leafPanelType(leaf) === "narrator" && leaf.narratorId) ids.push(leaf.narratorId);
 	});
 	return ids;
 }
 
-/** Find the first empty leaf (narratorId === null). */
+/** Find the first empty narrator-type leaf (narratorId === null). */
 export function findFirstEmptyLeaf(tree: SplitNode): SplitLeaf | null {
-	if (tree.type === "leaf") return tree.narratorId === null ? tree : null;
+	if (tree.type === "leaf")
+		return leafPanelType(tree) === "narrator" && tree.narratorId === null ? tree : null;
 	for (const child of tree.children) {
 		const found = findFirstEmptyLeaf(child);
 		if (found) return found;
@@ -261,40 +359,66 @@ export function moveLeaf(
 ): SplitNode {
 	if (sourceLeafId === targetLeafId) return tree;
 
-	// 1. Find the source narrator
-	let sourceNarratorId: string | null = null;
+	// 1. Find the source leaf data
+	let found: SplitLeaf | null = null;
 	walkLeaves(tree, (leaf) => {
-		if (leaf.id === sourceLeafId) sourceNarratorId = leaf.narratorId;
+		if (leaf.id === sourceLeafId) found = { ...leaf };
 	});
-	if (!sourceNarratorId) return tree;
+	if (!found) return tree;
+	const sourceLeaf: SplitLeaf = found;
 
-	// 2. Clear the source leaf's narrator (set to null) so we can track it
-	let result: SplitNode = mapLeaf(tree, sourceLeafId, (l) => ({ ...l, narratorId: null }));
+	// For narrator leaves, require a narratorId to move
+	const srcType = leafPanelType(sourceLeaf);
+	if (srcType === "narrator" && !sourceLeaf.narratorId) return tree;
 
-	// 3. Split the target leaf and assign the source narrator to the new leaf
-	result = splitAndAssign(result, targetLeafId, direction, position, sourceNarratorId);
+	// 2. Clear the source leaf content
+	let result: SplitNode = mapLeaf(tree, sourceLeafId, (l) => ({
+		...l,
+		narratorId: null,
+		panelType: "narrator" as PanelType,
+		terminalConfig: undefined,
+	}));
+
+	// 3. Split the target leaf and place the source content
+	if (srcType === "terminal" && sourceLeaf.terminalConfig) {
+		result = splitAndAssignTerminal(
+			result,
+			targetLeafId,
+			direction,
+			position,
+			sourceLeaf.terminalConfig,
+		);
+	} else if (sourceLeaf.narratorId) {
+		result = splitAndAssign(result, targetLeafId, direction, position, sourceLeaf.narratorId);
+	}
 
 	// 4. Remove the now-empty source leaf
 	const cleaned = removeLeaf(result, sourceLeafId);
 	return cleaned ?? result;
 }
 
-/** Swap the narratorIds of two leaves identified by their leaf ids. */
+/** Swap the full content of two leaves identified by their leaf ids. */
 export function swapLeaves(tree: SplitNode, leafIdA: string, leafIdB: string): SplitNode {
 	if (leafIdA === leafIdB) return tree;
-	// Collect current narratorIds
-	let narA: string | null | undefined;
-	let narB: string | null | undefined;
+	let leafA: SplitLeaf | undefined;
+	let leafB: SplitLeaf | undefined;
 	walkLeaves(tree, (leaf) => {
-		if (leaf.id === leafIdA) narA = leaf.narratorId;
-		if (leaf.id === leafIdB) narB = leaf.narratorId;
+		if (leaf.id === leafIdA) leafA = leaf;
+		if (leaf.id === leafIdB) leafB = leaf;
 	});
-	if (narA === undefined || narB === undefined) return tree;
-	// Apply swap via two mapLeaf passes (undefined already filtered above)
-	const swapA = narA as string | null;
-	const swapB = narB as string | null;
-	let result = mapLeaf(tree, leafIdA, (l) => ({ ...l, narratorId: swapB }));
-	result = mapLeaf(result, leafIdB, (l) => ({ ...l, narratorId: swapA }));
+	if (!leafA || !leafB) return tree;
+	// Capture into const to satisfy closure narrowing
+	const dataA = leafA;
+	const dataB = leafB;
+	// Swap all content fields
+	let result = mapLeaf(tree, leafIdA, () => ({
+		...dataB,
+		id: leafIdA,
+	}));
+	result = mapLeaf(result, leafIdB, () => ({
+		...dataA,
+		id: leafIdB,
+	}));
 	return result;
 }
 
@@ -326,6 +450,18 @@ export function addLeaf(tree: SplitNode, narratorId: string): SplitNode {
 	const lastLeaf = findLastLeaf(tree);
 	if (!lastLeaf) return tree;
 	return splitAndAssign(tree, lastLeaf.id, "horizontal", "after", narratorId);
+}
+
+/** Find the last narrator-type leaf with a narratorId. */
+export function findLastNarratorLeaf(node: SplitNode): SplitLeaf | null {
+	if (node.type === "leaf") {
+		return leafPanelType(node) === "narrator" && node.narratorId ? node : null;
+	}
+	for (let i = node.children.length - 1; i >= 0; i--) {
+		const found = findLastNarratorLeaf(node.children[i]);
+		if (found) return found;
+	}
+	return null;
 }
 
 function findLastLeaf(node: SplitNode): SplitLeaf | null {

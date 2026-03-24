@@ -6,8 +6,16 @@ import {
 	onNarratorDragMove,
 	startNarratorDrag,
 } from "../../lib/narrator-drag";
+import { WorkspaceTerminalPanel } from "../terminal/WorkspaceTerminalPanel";
 import { NarratorPanel } from "./NarratorPanel";
-import type { SplitBranch, SplitDirection, SplitLeaf, SplitNode } from "./split-tree";
+import type {
+	SplitBranch,
+	SplitDirection,
+	SplitLeaf,
+	SplitNode,
+	TerminalLeafConfig,
+} from "./split-tree";
+import { leafPanelType } from "./split-tree";
 
 const MIN_SIZE_PCT = 15;
 
@@ -44,7 +52,7 @@ export interface SplitPanelCallbacks {
 	) => void;
 	onReplace: (leafId: string, narratorId: string) => void;
 	onClose: (leafId: string) => void;
-	/** Swap the narrators of two leaf panels. */
+	/** Swap the content of two leaf panels. */
 	onSwap: (leafIdA: string, leafIdB: string) => void;
 	/** Move an existing panel (remove from source leaf, split-assign at target). */
 	onMoveToSplit: (
@@ -53,6 +61,16 @@ export interface SplitPanelCallbacks {
 		direction: SplitDirection,
 		position: "before" | "after",
 	) => void;
+	/** Split a leaf and assign a terminal panel to the new leaf. */
+	onSplitAndAssignTerminal?: (
+		leafId: string,
+		direction: SplitDirection,
+		position: "before" | "after",
+		config: TerminalLeafConfig,
+	) => void;
+	resolveNarratorView: (leaf: SplitLeaf) => { narratorId: string | null; isSubagentView: boolean };
+	onOpenSubagentInLeaf: (leafId: string, narratorId: string) => void;
+	onRestoreLeafNarrator: (leafId: string) => void;
 	canClose: boolean;
 }
 
@@ -62,6 +80,9 @@ export const SplitPanelCtx = createContext<SplitPanelCallbacks>({
 	onClose: () => {},
 	onSwap: () => {},
 	onMoveToSplit: () => {},
+	resolveNarratorView: (leaf) => ({ narratorId: leaf.narratorId, isSubagentView: false }),
+	onOpenSubagentInLeaf: () => {},
+	onRestoreLeafNarrator: () => {},
 	canClose: false,
 });
 
@@ -86,11 +107,23 @@ export function SplitPanelContainer({
 const COMPACT_WIDTH_THRESHOLD = 640;
 
 function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
-	const { onSplitAndAssign, onReplace, onClose, onSwap, onMoveToSplit, canClose } =
-		useContext(SplitPanelCtx);
+	const {
+		onSplitAndAssign,
+		onReplace,
+		onClose,
+		onSwap,
+		onMoveToSplit,
+		onSplitAndAssignTerminal,
+		resolveNarratorView,
+		onOpenSubagentInLeaf,
+		onRestoreLeafNarrator,
+		canClose,
+	} = useContext(SplitPanelCtx);
 	const [dropZone, setDropZone] = useState<DropZone>(null);
 	const boxRef = useRef<HTMLDivElement>(null);
 	const dropZoneRef = useRef<DropZone>(null);
+	const panelType = leafPanelType(leaf);
+	const { narratorId: currentNarratorId, isSubagentView } = resolveNarratorView(leaf);
 
 	// Track panel width to decide compact vs desktop toolbar
 	const [isCompact, setIsCompact] = useState(true);
@@ -188,11 +221,22 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 
 	const handleHeaderPointerDown = useCallback(
 		(e: React.PointerEvent) => {
-			if (!leaf.narratorId) return;
-			startNarratorDrag(leaf.narratorId, "", e.clientX, e.clientY, leaf.id);
+			if (panelType === "narrator" && currentNarratorId) {
+				startNarratorDrag(currentNarratorId, "", e.clientX, e.clientY, leaf.id);
+			} else if (panelType === "terminal") {
+				// Use a placeholder narratorId — the sourceLeafId is what matters for tree-internal moves
+				startNarratorDrag("__terminal__", "Terminal", e.clientX, e.clientY, leaf.id);
+			}
 		},
-		[leaf.narratorId, leaf.id],
+		[panelType, currentNarratorId, leaf.id],
 	);
+
+	const handleOpenTerminalPanel = useCallback(() => {
+		if (!leaf.narratorId || !onSplitAndAssignTerminal) return;
+		onSplitAndAssignTerminal(leaf.id, "horizontal", "after", {
+			narratorId: leaf.narratorId,
+		});
+	}, [leaf.id, leaf.narratorId, onSplitAndAssignTerminal]);
 
 	return (
 		<Box
@@ -200,14 +244,51 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 			h="100%"
 			style={{ position: "relative", overflow: "hidden", borderRadius: 4 }}
 		>
-			{leaf.narratorId && (
-				<NarratorPanel
-					key={leaf.narratorId}
-					narratorId={leaf.narratorId}
-					compact={isCompact}
+			{panelType === "terminal" && leaf.terminalConfig ? (
+				<WorkspaceTerminalPanel
+					key={leaf.id}
+					config={leaf.terminalConfig}
+					leafId={leaf.id}
 					onClose={canClose ? () => onClose(leaf.id) : undefined}
 					onHeaderPointerDown={handleHeaderPointerDown}
 				/>
+			) : (
+				<>
+					{/* Base narrator — always mounted so it stays warm when a subagent overlays */}
+					{leaf.narratorId && (
+						<Box
+							style={{
+								position: "absolute",
+								inset: 0,
+								visibility: isSubagentView ? "hidden" : "visible",
+							}}
+						>
+							<NarratorPanel
+								key={leaf.narratorId}
+								narratorId={leaf.narratorId}
+								compact={isCompact}
+								onClose={canClose ? () => onClose(leaf.id) : undefined}
+								onHeaderPointerDown={handleHeaderPointerDown}
+								onOpenTerminalPanel={onSplitAndAssignTerminal ? handleOpenTerminalPanel : undefined}
+								onViewSubagentSession={(narratorId) => onOpenSubagentInLeaf(leaf.id, narratorId)}
+							/>
+						</Box>
+					)}
+					{/* Subagent overlay — stacked on top when active */}
+					{isSubagentView && currentNarratorId && (
+						<Box style={{ position: "absolute", inset: 0 }}>
+							<NarratorPanel
+								key={currentNarratorId}
+								narratorId={currentNarratorId}
+								compact={isCompact}
+								onBack={() => onRestoreLeafNarrator(leaf.id)}
+								onClose={canClose ? () => onClose(leaf.id) : undefined}
+								onHeaderPointerDown={handleHeaderPointerDown}
+								onViewSubagentSession={(narratorId) => onOpenSubagentInLeaf(leaf.id, narratorId)}
+							/>
+						</Box>
+					)}
+				</>
 			)}
 
 			{/* Drop zone overlay */}

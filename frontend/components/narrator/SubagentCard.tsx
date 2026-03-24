@@ -112,6 +112,7 @@ export interface SubagentCardProps {
 	permCb?: PermissionCallbacks;
 	editExpandOverride?: boolean | null;
 	onBgAgentRetry?: (toolUseId: string) => void;
+	onViewSubagentSession?: (narratorId: string) => void;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
 }
@@ -127,6 +128,7 @@ export const SubagentCard = memo(
 		permCb,
 		editExpandOverride,
 		onBgAgentRetry,
+		onViewSubagentSession,
 		blockIndex,
 	}: SubagentCardProps) {
 		const { t } = useTranslation("narrator");
@@ -296,11 +298,15 @@ export const SubagentCard = memo(
 
 		const handleViewSession = useCallback(() => {
 			if (subagentNarratorId) {
-				navigate({
-					to: "/narrators/$narratorId",
-					params: { narratorId: subagentNarratorId },
-					search: fromParam ? { from: fromParam } : undefined,
-				});
+				if (onViewSubagentSession) {
+					onViewSubagentSession(subagentNarratorId);
+				} else {
+					navigate({
+						to: "/narrators/$narratorId",
+						params: { narratorId: subagentNarratorId },
+						search: fromParam ? { from: fromParam } : undefined,
+					});
+				}
 				swipe.closeSwipe();
 			} else {
 				// Fallback: expand card inline if we can't resolve the subagent narrator
@@ -312,7 +318,7 @@ export const SubagentCard = memo(
 					if (el) el.scrollTop = el.scrollHeight;
 				}, 300);
 			}
-		}, [subagentNarratorId, swipe.closeSwipe, navigate, fromParam]);
+		}, [subagentNarratorId, onViewSubagentSession, swipe.closeSwipe, navigate, fromParam]);
 
 		const cardMenuItems = (
 			<>
@@ -538,6 +544,7 @@ export const SubagentCard = memo(
 																	permCb={permCb}
 																	editExpandOverride={editExpandOverride}
 																	onBgAgentRetry={permCb?.onBgAgentRetry}
+																	onViewSubagentSession={onViewSubagentSession}
 																/>
 															</div>,
 														);
@@ -760,6 +767,7 @@ export const SubagentCard = memo(
 		prev.isLast === next.isLast &&
 		prev.isSoleInRun === next.isSoleInRun &&
 		prev.editExpandOverride === next.editExpandOverride &&
+		prev.onViewSubagentSession === next.onViewSubagentSession &&
 		prev.permCb?.pendingPermsMap === next.permCb?.pendingPermsMap &&
 		prev.permCb?.bgRetryDismissedIds === next.permCb?.bgRetryDismissedIds,
 );

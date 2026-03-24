@@ -17,5 +17,6 @@
 	"layoutSplitV": "垂直分屏",
 	"layoutTriple": "三面板",
 	"layoutQuad": "四面板",
-	"disconnected": "连接断开"
+	"disconnected": "连接断开",
+	"terminalOf": "终端 · {{name}}"
 }

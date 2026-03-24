@@ -13,7 +13,6 @@ import type {
 	ToolUseContentBlock,
 	TreeMessage,
 } from "../../lib/api";
-import type { ToolCallData } from "./ToolCallCard";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {
@@ -91,23 +90,6 @@ export interface PermissionCallbacks {
 	overseerReviewMap: Map<string, "reviewing" | "queued">;
 }
 
-export type FlatToolItem =
-	| {
-			kind: "tool";
-			tc: ToolCallData;
-			msg: NarratorMsg;
-			children: NarratorMsg[];
-			isSubagent: boolean;
-			blockIndex: number;
-	  }
-	| {
-			kind: "reasoning";
-			msg: NarratorMsg;
-			reasoningText: string;
-			translatedText?: string;
-			blockIndex: number;
-	  };
-
 export interface NarratorPanelSnapshot {
 	id: string;
 	chapterId?: string | null;
@@ -138,12 +120,16 @@ export interface NarratorPanelProps {
 	onMinimize?: () => void;
 	/** Custom back navigation handler (e.g. subagent → parent narrator) */
 	onBack?: () => void;
+	/** Open a subagent session without leaving the current panel (e.g. inside a workspace leaf) */
+	onViewSubagentSession?: (narratorId: string) => void;
 	/** When true, shows a skeleton overlay instead of messages (e.g. during node resize) */
 	isResizing?: boolean;
 	/** Called on pointerdown on the header bar — allows parent to initiate drag */
 	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 	/** Close this panel (used in workspace multi-panel mode) */
 	onClose?: () => void;
+	/** Open a terminal panel next to this narrator (workspace mode) */
+	onOpenTerminalPanel?: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
@@ -156,22 +142,12 @@ export { formatFileSize, isTextFile } from "@shared/text-file-types";
 
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
 
-export const SUBAGENT_STREAMING_ID_PREFIX = "__streaming_subagent_";
-
 export function isToolUseBlock(block: ContentBlock): block is ToolUseBlock {
 	return block.type === "tool_use" && typeof block.id === "string";
 }
 
 export function isStreamingChunksMessage(msg: NarratorMsg | null | undefined): boolean {
 	return !!msg && msg.id === STREAMING_CHUNKS_MSG_ID;
-}
-
-export function isSubagentStreamingMessage(msg: NarratorMsg | null | undefined): boolean {
-	return !!msg && msg.id.startsWith(SUBAGENT_STREAMING_ID_PREFIX);
-}
-
-export function isNoMergeMessage(msg: NarratorMsg | null | undefined): boolean {
-	return !!msg?._noMerge;
 }
 
 export const PERM_MODES = [

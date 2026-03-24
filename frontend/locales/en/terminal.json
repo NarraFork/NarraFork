@@ -17,5 +17,6 @@
 	"layoutSplitV": "Split vertical",
 	"layoutTriple": "Triple",
 	"layoutQuad": "Quad",
-	"disconnected": "Disconnected"
+	"disconnected": "Disconnected",
+	"terminalOf": "Terminal · {{name}}"
 }
