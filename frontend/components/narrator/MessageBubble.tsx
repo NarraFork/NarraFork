@@ -1384,7 +1384,7 @@ export const MessageBubble = memo(function MessageBubble({
 	// (including those inside ToolCallCard) can access message-level actions
 	return (
 		<MessageContextMenuCtx.Provider value={ctxActions}>
-			<Stack gap={4}>
+			<Stack gap={4} style={{ minWidth: 0 }}>
 				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 				{blocks.map((block: any, i: number) => {
 					const key = block.id ?? `${block.type}-${i}`;
@@ -1407,9 +1407,14 @@ export const MessageBubble = memo(function MessageBubble({
 					if (block.type === "text_file") {
 						return <TextFileBlock key={key} block={block} />;
 					}
-					if (block.type === "reasoning") {
+					if (block.type === "reasoning" || block.type === "thinking") {
 						const iconColor = getCategoryColor("plan");
-						const reasoningText = typeof block.text === "string" ? block.text : "";
+						const reasoningText =
+							block.type === "reasoning"
+								? typeof block.text === "string"
+									? block.text
+									: ""
+								: ((block as { thinking?: string }).thinking ?? "");
 						if (!reasoningText.trim()) return null;
 						const reasoningAnimationId = getReasoningBlurAnimationId({
 							messageId: message.id,
@@ -1437,30 +1442,6 @@ export const MessageBubble = memo(function MessageBubble({
 										</Group>
 									</Paper>
 								</BlurInOnAppear>
-							</ContentViewer>
-						);
-					}
-					if (block.type === "thinking") {
-						return (
-							<ContentViewer
-								key={key}
-								content={block.thinking ?? ""}
-								markdown
-								contentType="markdown"
-								blockIndex={realIndex}
-							>
-								<Paper
-									p="xs"
-									radius="sm"
-									style={{ backgroundColor: "var(--mantine-color-yellow-light)" }}
-								>
-									<Text size="xs" c="dimmed" fw={500} mb={2}>
-										{t("thinking")}
-									</Text>
-									<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-										{block.thinking}
-									</Text>
-								</Paper>
 							</ContentViewer>
 						);
 					}

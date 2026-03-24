@@ -1666,16 +1666,21 @@ export function NarratorPanel({
 		streamingReasoningCreatedAtRef.current = null;
 	}
 
-	// Force re-read of streaming refs by depending on streamingVersion
-	void streamingVersion;
-	const streamingMsg = buildStreamingMsg({
-		reasoningText: streamingReasoningRef.current || undefined,
-		streamingText: streamingRef.current || undefined,
-		webSearch: webSearchRef.current,
-		toolChunksMsg: topLevelStreamingChunks,
-		narratorId,
-		reasoningCreatedAt: streamingReasoningCreatedAtRef.current ?? undefined,
-	});
+	// Build the streaming message inside useMemo so it only produces a new
+	// reference when the actual streaming content changes, not on every render.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refs are read intentionally — streamingVersion forces re-evaluation
+	const streamingMsg = useMemo(() => {
+		// streamingVersion forces re-read of refs (streamingRef, streamingReasoningRef, webSearchRef)
+		void streamingVersion;
+		return buildStreamingMsg({
+			reasoningText: streamingReasoningRef.current || undefined,
+			streamingText: streamingRef.current || undefined,
+			webSearch: webSearchRef.current,
+			toolChunksMsg: topLevelStreamingChunks,
+			narratorId,
+			reasoningCreatedAt: streamingReasoningCreatedAtRef.current ?? undefined,
+		});
+	}, [streamingVersion, topLevelStreamingChunks, narratorId]);
 
 	// When a page object reference doesn't change, we reuse the cached result.
 	const pageCacheRef = useRef(

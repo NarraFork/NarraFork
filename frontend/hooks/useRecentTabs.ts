@@ -31,6 +31,96 @@ export interface RecentTab {
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
 
+/** Target types accepted by the server API */
+export type RecentTabApiMoveTarget = { toIndex: number } | { position: "top" | "above_idle" };
+
+/** Extended target types for local optimistic moves (includes key-based anchoring) */
+export type RecentTabMoveTarget =
+	| RecentTabApiMoveTarget
+	| { afterKey: string }
+	| { beforeKey: string };
+
+/**
+ * Enforce workspace grouping: workspace header is immediately followed by its children.
+ * Operates in-place on the array.
+ */
+function regroupTabs(tabs: RecentTab[]): void {
+	const childrenByWs = new Map<string, RecentTab[]>();
+	for (const t of tabs) {
+		if (t.workspaceId) {
+			const arr = childrenByWs.get(t.workspaceId);
+			if (arr) arr.push(t);
+			else childrenByWs.set(t.workspaceId, [t]);
+		}
+	}
+	if (childrenByWs.size === 0) return;
+
+	// Remove all workspace children
+	let i = 0;
+	while (i < tabs.length) {
+		if (tabs[i].workspaceId) tabs.splice(i, 1);
+		else i++;
+	}
+
+	// Re-insert children after their workspace header
+	const headerIds = new Set<string>();
+	for (let j = 0; j < tabs.length; j++) {
+		if (tabs[j].type === "workspace") {
+			const wsId = tabs[j].id;
+			headerIds.add(wsId);
+			const children = childrenByWs.get(wsId);
+			if (children && children.length > 0) {
+				tabs.splice(j + 1, 0, ...children);
+				j += children.length;
+			}
+		}
+	}
+
+	// Orphan children — clear workspaceId and append
+	for (const [wsId, children] of childrenByWs) {
+		if (!headerIds.has(wsId)) {
+			for (const c of children) c.workspaceId = undefined;
+			tabs.push(...children);
+		}
+	}
+}
+
+export function applyRecentTabMove(
+	tabs: RecentTab[],
+	key: string,
+	target: RecentTabMoveTarget,
+): RecentTab[] {
+	const idx = tabs.findIndex((tab) => `${tab.type}:${tab.id}` === key);
+	if (idx === -1) return tabs;
+
+	const next = [...tabs];
+	const tab = next[idx];
+
+	let movedGroup: RecentTab[];
+	if (tab.type === "workspace") {
+		let end = idx + 1;
+		while (end < next.length && next[end].workspaceId === tab.id) end++;
+		movedGroup = next.splice(idx, end - idx);
+	} else {
+		movedGroup = next.splice(idx, 1);
+	}
+
+	if ("afterKey" in target) {
+		const afterIdx = next.findIndex((t) => `${t.type}:${t.id}` === target.afterKey);
+		next.splice(afterIdx === -1 ? next.length : afterIdx + 1, 0, ...movedGroup);
+	} else if ("beforeKey" in target) {
+		const beforeIdx = next.findIndex((t) => `${t.type}:${t.id}` === target.beforeKey);
+		next.splice(beforeIdx === -1 ? 0 : beforeIdx, 0, ...movedGroup);
+	} else if ("toIndex" in target) {
+		next.splice(Math.min(target.toIndex, next.length), 0, ...movedGroup);
+	} else {
+		next.unshift(...movedGroup);
+	}
+
+	regroupTabs(next);
+	return next;
+}
+
 // === Hook ===
 
 export function useRecentTabs() {
@@ -61,10 +151,16 @@ export function useRecentTabs() {
 					qc.removeQueries({ queryKey: ["narrators", tab.id] });
 				}
 			}
-			qc.setQueryData(
-				RECENT_TABS_QUERY_KEY,
-				prev.filter((t) => !(t.type === type && t.id === id)),
-			);
+			let next: RecentTab[];
+			if (type === "workspace") {
+				// Removing workspace header: release children (clear workspaceId) and remove header
+				next = prev
+					.filter((t) => !(t.type === type && t.id === id))
+					.map((t) => (t.workspaceId === id ? { ...t, workspaceId: undefined } : t));
+			} else {
+				next = prev.filter((t) => !(t.type === type && t.id === id));
+			}
+			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
 			return { prev };
 		},
 		onError: (_err, _vars, ctx) => {
@@ -75,23 +171,13 @@ export function useRecentTabs() {
 
 	// --- Move a tab (optimistic) ---
 	const moveMutation = useMutation({
-		mutationFn: (args: {
-			key: string;
-			target: { toIndex: number } | { position: "top" | "above_idle" };
-		}) => api.moveRecentTab(args.key, args.target),
+		mutationFn: (args: { key: string; target: RecentTabApiMoveTarget }) =>
+			api.moveRecentTab(args.key, args.target),
 		onMutate: async ({ key, target }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const idx = prev.findIndex((t) => `${t.type}:${t.id}` === key);
-			if (idx === -1) return { prev };
-			const next = [...prev];
-			const [moved] = next.splice(idx, 1);
-			if ("toIndex" in target) {
-				next.splice(Math.min(target.toIndex, next.length), 0, moved);
-			} else {
-				// top or above_idle — just put at top for optimistic (server will do exact placement)
-				next.unshift(moved);
-			}
+			const next = applyRecentTabMove(prev, key, target);
+			if (next === prev) return { prev };
 			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
 			return { prev };
 		},
@@ -184,8 +270,7 @@ export function useRecentTabs() {
 			[removeMutation],
 		),
 		moveTab: useCallback(
-			(key: string, target: { toIndex: number } | { position: "top" | "above_idle" }) =>
-				moveMutation.mutate({ key, target }),
+			(key: string, target: RecentTabApiMoveTarget) => moveMutation.mutate({ key, target }),
 			[moveMutation],
 		),
 		clearTabs: useCallback(

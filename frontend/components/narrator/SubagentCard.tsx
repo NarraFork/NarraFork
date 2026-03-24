@@ -25,6 +25,8 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { BlurInOnAppear } from "./BlurInOnAppear";
+import { getToolCallBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import {
@@ -528,25 +530,34 @@ export const SubagentCard = memo(
 													);
 													const isSub = (subCh && subCh.length > 0) || item.tc.toolName === "Agent";
 													if (isSub) {
+														const subAnimId = getToolCallBlurAnimationId({
+															toolUseId: item.toolUseId,
+															messageId: item.msgId,
+															fallbackKey: ci,
+														});
 														els.push(
-															<div
+															<BlurInOnAppear
 																key={item.toolUseId ?? item.tc.toolName}
-																id={
-																	item.toolUseId
-																		? `tool-use-${item.toolUseId}`
-																		: `msg-${item.msgId}`
-																}
+																animationId={subAnimId}
 															>
-																<SubagentCard
-																	toolCall={item.tc}
-																	childMessages={subCh ?? []}
-																	narratorId={narratorId}
-																	permCb={permCb}
-																	editExpandOverride={editExpandOverride}
-																	onBgAgentRetry={permCb?.onBgAgentRetry}
-																	onViewSubagentSession={onViewSubagentSession}
-																/>
-															</div>,
+																<div
+																	id={
+																		item.toolUseId
+																			? `tool-use-${item.toolUseId}`
+																			: `msg-${item.msgId}`
+																	}
+																>
+																	<SubagentCard
+																		toolCall={item.tc}
+																		childMessages={subCh ?? []}
+																		narratorId={narratorId}
+																		permCb={permCb}
+																		editExpandOverride={editExpandOverride}
+																		onBgAgentRetry={permCb?.onBgAgentRetry}
+																		onViewSubagentSession={onViewSubagentSession}
+																	/>
+																</div>
+															</BlurInOnAppear>,
 														);
 														ci++;
 														continue;
@@ -581,25 +592,34 @@ export const SubagentCard = memo(
 																		permCb?.pendingPermsMap,
 																		permCb?.overseerReviewMap,
 																	);
+																	const runAnimId = getToolCallBlurAnimationId({
+																		toolUseId: r.toolUseId,
+																		messageId: r.msgId,
+																		fallbackKey: ri,
+																	});
 																	return (
-																		<div
+																		<BlurInOnAppear
 																			key={r.toolUseId ?? r.tc.toolName}
-																			id={
-																				r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
-																			}
+																			animationId={runAnimId}
 																		>
-																			<ToolCallCard
-																				toolCall={r.tc}
-																				narratorId={narratorId}
-																				inRun
-																				isLast={ri === run.length - 1}
-																				pendingPermission={mp}
-																				onPermissionDecision={permCb?.onPermissionDecision}
-																				onQuestionSubmit={permCb?.onQuestionSubmit}
-																				onQuestionDeny={permCb?.onQuestionDeny}
-																				editExpandOverride={editExpandOverride}
-																			/>
-																		</div>
+																			<div
+																				id={
+																					r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
+																				}
+																			>
+																				<ToolCallCard
+																					toolCall={r.tc}
+																					narratorId={narratorId}
+																					inRun
+																					isLast={ri === run.length - 1}
+																					pendingPermission={mp}
+																					onPermissionDecision={permCb?.onPermissionDecision}
+																					onQuestionSubmit={permCb?.onQuestionSubmit}
+																					onQuestionDeny={permCb?.onQuestionDeny}
+																					editExpandOverride={editExpandOverride}
+																				/>
+																			</div>
+																		</BlurInOnAppear>
 																	);
 																})}
 															</Box>,
@@ -612,21 +632,30 @@ export const SubagentCard = memo(
 															permCb?.pendingPermsMap,
 															permCb?.overseerReviewMap,
 														);
+														const singleAnimId = getToolCallBlurAnimationId({
+															toolUseId: r.toolUseId,
+															messageId: r.msgId,
+															fallbackKey: ci,
+														});
 														els.push(
-															<div
+															<BlurInOnAppear
 																key={r.toolUseId ?? r.tc.toolName}
-																id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
+																animationId={singleAnimId}
 															>
-																<ToolCallCard
-																	toolCall={r.tc}
-																	narratorId={narratorId}
-																	pendingPermission={mp}
-																	onPermissionDecision={permCb?.onPermissionDecision}
-																	onQuestionSubmit={permCb?.onQuestionSubmit}
-																	onQuestionDeny={permCb?.onQuestionDeny}
-																	editExpandOverride={editExpandOverride}
-																/>
-															</div>,
+																<div
+																	id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
+																>
+																	<ToolCallCard
+																		toolCall={r.tc}
+																		narratorId={narratorId}
+																		pendingPermission={mp}
+																		onPermissionDecision={permCb?.onPermissionDecision}
+																		onQuestionSubmit={permCb?.onQuestionSubmit}
+																		onQuestionDeny={permCb?.onQuestionDeny}
+																		editExpandOverride={editExpandOverride}
+																	/>
+																</div>
+															</BlurInOnAppear>,
 														);
 													}
 													ci = j;

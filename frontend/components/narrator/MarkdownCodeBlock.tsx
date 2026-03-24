@@ -49,11 +49,7 @@ export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 				</CopyButton>
 			</div>
 
-			<HighlightedCode
-				code={code}
-				lang={language}
-				style={{ maxWidth: "100%", overflowX: "auto", border: "none" }}
-			/>
+			<HighlightedCode code={code} lang={language} style={{ maxWidth: "100%", border: "none" }} />
 		</div>
 	);
 });

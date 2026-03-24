@@ -195,6 +195,7 @@ export const BroadMessageList = forwardRef<BroadMessageListHandle, BroadMessageL
 			const inner = listRef.current?.scrollViewRef?.current;
 			if (inner) {
 				inner.style.overscrollBehavior = "contain";
+				inner.style.overflowX = "hidden";
 			}
 		});
 

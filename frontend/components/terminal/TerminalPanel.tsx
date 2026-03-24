@@ -1,5 +1,15 @@
-import { Badge, Box, useComputedColorScheme } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Box,
+	Group,
+	Paper,
+	Portal,
+	Text,
+	useComputedColorScheme,
+} from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { IconClipboard, IconKeyboard } from "@tabler/icons-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -146,6 +156,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		// Flag set synchronously when a handle is touched, so the native
 		// touchstart listener on the container can skip the long-press timer.
 		const handleTouchedRef = useRef(false);
+		// Ctrl+V paste popover state
+		const [pastePopover, setPastePopover] = useState<{ top: number; left: number } | null>(null);
+		const pastePopoverRef = useRef<HTMLDivElement>(null);
 		// Track virtual keyboard height on mobile
 		useEffect(() => {
 			if (!isMobile) {
@@ -291,6 +304,42 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				fitAddon.fit();
 				resize(term.cols, term.rows);
 			}
+
+			// Intercept Ctrl+C when text is selected: copy to clipboard instead of sending SIGINT
+			// Intercept Ctrl+V: show popover to choose between paste and sending raw Ctrl+V
+			term.attachCustomKeyEventHandler((e) => {
+				if (e.type !== "keydown" || e.shiftKey || e.altKey || e.metaKey) return true;
+				if (!e.ctrlKey) return true;
+
+				if (e.key === "c") {
+					const sel = term.getSelection();
+					if (sel) {
+						navigator.clipboard.writeText(sel).catch(() => {});
+						term.clearSelection();
+						return false;
+					}
+				}
+
+				if (e.key === "v") {
+					e.preventDefault();
+					// Position popover near the cursor in the terminal
+					const screenEl = term.element?.querySelector(".xterm-screen");
+					if (screenEl) {
+						const rect = screenEl.getBoundingClientRect();
+						const cellW = rect.width / term.cols;
+						const cellH = rect.height / term.rows;
+						const cursorX = term.buffer.active.cursorX;
+						const cursorY = term.buffer.active.cursorY;
+						setPastePopover({
+							top: rect.top + cursorY * cellH,
+							left: rect.left + cursorX * cellW,
+						});
+					}
+					return false;
+				}
+
+				return true;
+			});
 
 			term.onData((data) => {
 				// During term.write() (PTY output processing), xterm.js may
@@ -600,6 +649,41 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			selHandleDragRef.current = which;
 		}, []);
 
+		const handlePasteFromClipboard = useCallback(() => {
+			navigator.clipboard
+				.readText()
+				.then((text) => {
+					if (text) write(text);
+				})
+				.catch(() => {});
+			setPastePopover(null);
+			termRef.current?.focus();
+		}, [write]);
+
+		const handleSendCtrlV = useCallback(() => {
+			write("\x16");
+			setPastePopover(null);
+			termRef.current?.focus();
+		}, [write]);
+
+		// Dismiss paste popover on outside click
+		useEffect(() => {
+			if (!pastePopover) return;
+			const onMouseDown = (e: MouseEvent) => {
+				if (pastePopoverRef.current?.contains(e.target as Node)) return;
+				setPastePopover(null);
+			};
+			const onKeyDown = (e: KeyboardEvent) => {
+				if (e.key === "Escape") setPastePopover(null);
+			};
+			document.addEventListener("mousedown", onMouseDown);
+			document.addEventListener("keydown", onKeyDown);
+			return () => {
+				document.removeEventListener("mousedown", onMouseDown);
+				document.removeEventListener("keydown", onKeyDown);
+			};
+		}, [pastePopover]);
+
 		return (
 			<Box
 				h="100%"
@@ -662,6 +746,58 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 						</>
 					)}
 				</Box>
+				{pastePopover && (
+					<Portal>
+						<Paper
+							ref={pastePopoverRef}
+							shadow="md"
+							radius="md"
+							px={4}
+							py={4}
+							style={{
+								position: "fixed",
+								top: Math.max(4, pastePopover.top - 40),
+								left: Math.max(4, Math.min(window.innerWidth - 160, pastePopover.left)),
+								zIndex: 1000,
+							}}
+						>
+							<Group gap={4}>
+								<ActionIcon
+									variant="filled"
+									color="indigo"
+									size="sm"
+									radius="xl"
+									onClick={handlePasteFromClipboard}
+									title={t("pasteContent")}
+								>
+									<IconClipboard size={14} />
+								</ActionIcon>
+								<Text
+									size="xs"
+									c="dimmed"
+									style={{ cursor: "pointer" }}
+									onClick={handlePasteFromClipboard}
+								>
+									{t("pasteContent")}
+								</Text>
+								<Box w={4} />
+								<ActionIcon
+									variant="filled"
+									color="gray"
+									size="sm"
+									radius="xl"
+									onClick={handleSendCtrlV}
+									title={t("sendCtrlV")}
+								>
+									<IconKeyboard size={14} />
+								</ActionIcon>
+								<Text size="xs" c="dimmed" style={{ cursor: "pointer" }} onClick={handleSendCtrlV}>
+									{t("sendCtrlV")}
+								</Text>
+							</Group>
+						</Paper>
+					</Portal>
+				)}
 				{isMobile && <TerminalAuxKeys onKey={handleAuxKey} mods={mods} onToggleMod={toggleMod} />}
 			</Box>
 		);

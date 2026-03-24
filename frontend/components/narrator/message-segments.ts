@@ -73,36 +73,16 @@ export type RenderSegment =
 // Block classification helpers (pure, no side effects)
 // ---------------------------------------------------------------------------
 
-export function hasToolUse(msg: NarratorMsg): boolean {
-	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some((b: ContentBlock) => b.type === "tool_use");
+/** Extract reasoning text from a block (handles both reasoning and legacy thinking). */
+function getReasoningText(b: ContentBlock): string {
+	if (b.type === "reasoning") return b.text ?? "";
+	if (b.type === "thinking") return (b as { thinking?: string }).thinking ?? "";
+	return "";
 }
 
-export function hasReasoningBlock(msg: NarratorMsg): boolean {
-	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some(
-		(b: ContentBlock) =>
-			(b.type === "reasoning" && !!b.text?.trim()) ||
-			(b.type === "thinking" && !!(b as { thinking?: string }).thinking?.trim()),
-	);
-}
-
-/** True when every visible block is either tool_use, reasoning, or blank text. */
-export function isToolOnlyMessage(msg: NarratorMsg): boolean {
-	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return (
-		blocks.length > 0 &&
-		blocks.every(
-			(b: ContentBlock) =>
-				b.type === "tool_use" ||
-				b.type === "reasoning" ||
-				(b.type === "thinking" && !!(b as { thinking?: string }).thinking?.trim()) ||
-				(b.type === "text" && !b.text?.trim()),
-		)
-	);
+/** Check if a block is a reasoning/thinking block with content. */
+function isReasoningBlock(b: ContentBlock): boolean {
+	return !!getReasoningText(b).trim();
 }
 
 /** Check if a block is visible user-facing content (text, image, etc.) — NOT tool_use or reasoning. */
@@ -114,18 +94,29 @@ function isVisibleContentBlock(b: ContentBlock): boolean {
 	return false;
 }
 
-/** Check if a block is a reasoning/thinking block with content. */
-function isReasoningBlock(b: ContentBlock): boolean {
-	if (b.type === "reasoning") return !!b.text?.trim();
-	if (b.type === "thinking") return !!(b as { thinking?: string }).thinking?.trim();
-	return false;
+export function hasToolUse(msg: NarratorMsg): boolean {
+	if (msg.role !== "assistant") return false;
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return blocks.some((b: ContentBlock) => b.type === "tool_use");
 }
 
-/** Extract reasoning text from a block (handles both reasoning and legacy thinking). */
-function getReasoningText(b: ContentBlock): string {
-	if (b.type === "reasoning") return b.text ?? "";
-	if (b.type === "thinking") return (b as { thinking?: string }).thinking ?? "";
-	return "";
+export function hasReasoningBlock(msg: NarratorMsg): boolean {
+	if (msg.role !== "assistant") return false;
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return blocks.some((b: ContentBlock) => isReasoningBlock(b));
+}
+
+/** True when every visible block is either tool_use, reasoning, or blank text. */
+export function isToolOnlyMessage(msg: NarratorMsg): boolean {
+	if (msg.role !== "assistant") return false;
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return (
+		blocks.length > 0 &&
+		blocks.every(
+			(b: ContentBlock) =>
+				b.type === "tool_use" || isReasoningBlock(b) || (b.type === "text" && !b.text?.trim()),
+		)
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +516,7 @@ export function buildStreamingMsg(opts: {
 	}
 
 	return {
-		id: toolChunksMsg?.id ?? "__streaming__",
+		id: "__streaming__",
 		narratorId,
 		parentToolUseId: null,
 		role: "assistant",

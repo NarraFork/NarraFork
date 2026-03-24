@@ -18,5 +18,7 @@
 	"layoutTriple": "Triple",
 	"layoutQuad": "Quad",
 	"disconnected": "Disconnected",
-	"terminalOf": "Terminal · {{name}}"
+	"terminalOf": "Terminal · {{name}}",
+	"pasteContent": "Paste",
+	"sendCtrlV": "Send Ctrl+V"
 }

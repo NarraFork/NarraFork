@@ -2498,6 +2498,27 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isPlan = cat === "plan";
 	// Streaming tool chunks (still being generated) — not expandable
 	const isStreaming = toolCall.inputJson?._streamingChars != null;
+
+	// --- Green shimmer on running → success transition ---
+	// prevStatusRef starts as null so we can detect the *mount* case: when the
+	// streaming synthetic message is replaced by the real assistant message the
+	// outer container key changes, React mounts a fresh ToolCallCard whose
+	// initial status is already "success".  For non-truncated data this means
+	// the tool just finished, so we should still play the shimmer.
+	const isTruncated = hasTruncatedData(toolCall);
+	const prevStatusRef = useRef<string | null>(null);
+	const [doneShimmer, setDoneShimmer] = useState(false);
+	useEffect(() => {
+		const prev = prevStatusRef.current;
+		prevStatusRef.current = toolCall.status;
+		const wasRunning = prev === "running" || prev === "pending" || prev === "initializing";
+		const freshMount = prev === null && !isTruncated;
+		if (toolCall.status === "success" && (wasRunning || freshMount)) {
+			setDoneShimmer(true);
+			const timer = setTimeout(() => setDoneShimmer(false), 650);
+			return () => clearTimeout(timer);
+		}
+	}, [toolCall.status, isTruncated]);
 	// Auto-expand: permission pending, todo tools, or edit tools.
 	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
 	// Denied ExitPlanMode defaults to collapsed — plan content is folded inside PlanDetail.
@@ -2508,7 +2529,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// triggering expensive detail-fetch API calls. The card will expand if the user
 	// clicks it or if it was just streamed in (streaming cards go through
 	// _streamingChars → completed, so they never hit this path on first render).
-	const isTruncated = hasTruncatedData(toolCall);
 	const defaultOpen =
 		!isStreaming &&
 		(!!pendingPermission ||
@@ -2549,6 +2569,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 	useEffect(() => {
 		if (isEdit && editExpandOverride != null) setOpened(editExpandOverride);
 	}, [isEdit, editExpandOverride]);
+
+	const isRunning =
+		toolCall.status === "running" ||
+		toolCall.status === "pending" ||
+		toolCall.status === "initializing";
 
 	const borderColor = pendingPermission
 		? "var(--mantine-color-yellow-6)"
@@ -2661,6 +2686,14 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const planStyle =
 		isPlan && vpHeight ? { maxHeight: vpHeight, overflow: "hidden auto" as const } : undefined;
 
+	const shimmerClass = isStreaming
+		? "tool-card-shimmer"
+		: doneShimmer
+			? "tool-done-shimmer"
+			: isRunning
+				? "tool-running-shimmer"
+				: undefined;
+
 	const cardContent = (
 		<>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
@@ -2769,7 +2802,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
 				>
 					<Box ref={isPlan ? cardRef : undefined}>
-						<Box p="xs" className={isStreaming ? "tool-card-shimmer" : undefined}>
+						<Box p="xs" className={shimmerClass}>
 							{cardContent}
 						</Box>
 						{!isLast && <Divider color="var(--mantine-color-default-border)" size={1} />}
@@ -2795,7 +2828,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					withBorder={!inRun}
 					radius={inRun ? 0 : "sm"}
 					p="xs"
-					className={isStreaming ? "tool-card-shimmer" : undefined}
+					className={shimmerClass}
 					style={{
 						backgroundColor: TOOL_CARD_BG,
 						...(borderColor ? { borderColor } : {}),
@@ -2900,6 +2933,8 @@ if (typeof document !== "undefined") {
 		style.textContent = `
 @keyframes spin { to { transform: rotate(360deg) } }
 @keyframes tool-shimmer { to { transform: translateX(100%) } }
+@keyframes tool-running-shimmer { from { transform: translateX(-100%) } to { transform: translateX(100%) } }
+@keyframes tool-done-shimmer { from { transform: translateX(100%) } to { transform: translateX(-100%) } }
 .tool-card-shimmer {
   position: relative;
   overflow: hidden;
@@ -2919,6 +2954,50 @@ if (typeof document !== "undefined") {
   );
   animation: tool-shimmer 2s ease-in-out infinite;
   pointer-events: none;
+}
+.tool-running-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.tool-running-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(77,171,247,.06) 30%,
+    rgba(77,171,247,.13) 50%,
+    rgba(77,171,247,.06) 70%,
+    transparent 100%
+  );
+  animation: tool-running-shimmer 2s ease-in-out infinite;
+  pointer-events: none;
+}
+.tool-done-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.tool-done-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(64,192,87,.06) 30%,
+    rgba(64,192,87,.13) 50%,
+    rgba(64,192,87,.06) 70%,
+    transparent 100%
+  );
+  animation: tool-done-shimmer 600ms ease-out forwards;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tool-running-shimmer::after { animation: none; }
+  .tool-done-shimmer::after { animation: none; }
 }`;
 		document.head.appendChild(style);
 	}

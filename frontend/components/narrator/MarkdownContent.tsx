@@ -82,7 +82,13 @@ const mdComponents: Components = {
 	},
 	a({ href, children }) {
 		return (
-			<Anchor href={href} target="_blank" rel="noopener noreferrer" size="sm">
+			<Anchor
+				href={href}
+				target="_blank"
+				rel="noopener noreferrer"
+				size="sm"
+				style={{ overflowWrap: "anywhere" }}
+			>
 				{children}
 			</Anchor>
 		);
@@ -118,7 +124,11 @@ const mdComponents: Components = {
 			}
 			return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
 		}
-		return <Code fz="xs">{children}</Code>;
+		return (
+			<Code fz="xs" style={{ overflowWrap: "anywhere", wordBreak: "break-all" }}>
+				{children}
+			</Code>
+		);
 	},
 	pre({ children }) {
 		// For fenced code blocks without a language tag, react-markdown renders
@@ -258,7 +268,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 				size="sm"
 				style={wordWrap ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre", overflowX: "auto" }}
 			>
-				{text}
+				{trimmed}
 			</Text>
 		);
 	}
@@ -268,7 +278,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 			size="sm"
 			style={wordWrap ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre", overflowX: "auto" }}
 		>
-			{text}
+			{trimmed}
 		</Text>
 	);
 
@@ -276,7 +286,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 		<MarkdownErrorBoundary fallback={plainFallback}>
 			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
 				<Markdown remarkPlugins={remarkPlugins} components={mdComponents}>
-					{text}
+					{trimmed}
 				</Markdown>
 			</div>
 		</MarkdownErrorBoundary>

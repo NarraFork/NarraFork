@@ -118,7 +118,15 @@ export const HighlightedCode = memo(function HighlightedCode({
 	// Plain text or pending — use Mantine Code
 	if (!html) {
 		return (
-			<Code block style={style}>
+			<Code
+				block
+				style={{
+					...style,
+					whiteSpace: "pre-wrap",
+					wordBreak: "break-all",
+					overflowWrap: "anywhere",
+				}}
+			>
 				{code}
 			</Code>
 		);

@@ -1,5 +1,5 @@
 import type { BaseContentBlock } from "../../lib/api";
-import { type NarratorMsg, STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+import type { NarratorMsg } from "./narrator-panel-types";
 
 export function getUserMessageBlurAnimationId(messageId?: string | null) {
 	return messageId ? `user-msg:${messageId}` : null;
@@ -33,14 +33,11 @@ export function getReasoningBlurAnimationId({
 	fallbackKey?: string | number | null;
 }) {
 	const suffix = blockIndex ?? fallbackKey ?? 0;
-	if (messageId && messageId !== STREAMING_CHUNKS_MSG_ID) {
+	if (messageId) {
 		return `reasoning:${messageId}:${suffix}`;
 	}
 	if (createdAt) {
 		return `reasoning-stream:${createdAt}:${suffix}`;
-	}
-	if (messageId) {
-		return `reasoning:${messageId}:${suffix}`;
 	}
 	return null;
 }
@@ -84,7 +81,7 @@ export function collectBlurInAnimationIdsFromMessage(msg: NarratorMsg, acc = new
 	for (const [idx, block] of (
 		(msg.contentJson as BaseContentBlock[] | undefined) ?? []
 	).entries()) {
-		if (block.type === "reasoning") {
+		if (block.type === "reasoning" || block.type === "thinking") {
 			const animationId = getReasoningBlurAnimationId({
 				messageId: msg.id,
 				blockIndex: idx,

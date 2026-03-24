@@ -71,6 +71,58 @@ function migrateTabTypes(tabs: Record<string, unknown>[]): void {
 	}
 }
 
+/**
+ * Enforce workspace grouping invariant: workspace header is immediately followed
+ * by all its children (tabs with matching workspaceId), with no other tabs in between.
+ * Orphan children (workspaceId points to a missing header) get their workspaceId cleared.
+ * Operates in-place.
+ */
+function regroupWorkspaces(tabs: Record<string, unknown>[]): void {
+	// 1. Collect workspace children grouped by workspaceId, preserving relative order
+	const childrenByWs = new Map<string, Record<string, unknown>[]>();
+	for (const t of tabs) {
+		const wsId = t.workspaceId as string | undefined;
+		if (wsId) {
+			const arr = childrenByWs.get(wsId);
+			if (arr) arr.push(t);
+			else childrenByWs.set(wsId, [t]);
+		}
+	}
+	if (childrenByWs.size === 0) return;
+
+	// 2. Remove all workspace children from the array
+	let i = 0;
+	while (i < tabs.length) {
+		if (tabs[i].workspaceId) tabs.splice(i, 1);
+		else i++;
+	}
+
+	// 3. Re-insert children right after their workspace header
+	const headerIds = new Set<string>();
+	for (let j = 0; j < tabs.length; j++) {
+		if (tabs[j].type === "workspace") {
+			const wsId = tabs[j].id as string;
+			headerIds.add(wsId);
+			const children = childrenByWs.get(wsId);
+			if (children && children.length > 0) {
+				tabs.splice(j + 1, 0, ...children);
+				j += children.length;
+			}
+		}
+	}
+
+	// 4. Orphan children (header was removed) — clear workspaceId so they become top-level
+	for (const [wsId, children] of childrenByWs) {
+		if (!headerIds.has(wsId)) {
+			for (const c of children) {
+				delete c.workspaceId;
+			}
+			// Append orphans at the end
+			tabs.push(...children);
+		}
+	}
+}
+
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
 export async function enrichTabs(
 	tabs: Record<string, unknown>[],
@@ -442,9 +494,29 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 			sqlite.run("COMMIT");
 			return c.json(tabs);
 		} else {
-			tabs.unshift(tab);
+			// New tab: if it belongs to a workspace, insert after the workspace header's
+			// last child instead of prepending to the top.
+			const wsId = tab.workspaceId as string | undefined;
+			if (wsId) {
+				const headerIdx = tabs.findIndex((t) => t.type === "workspace" && t.id === wsId);
+				if (headerIdx >= 0) {
+					// Find the end of the workspace group
+					let insertIdx = headerIdx + 1;
+					while (insertIdx < tabs.length && tabs[insertIdx].workspaceId === wsId) {
+						insertIdx++;
+					}
+					tabs.splice(insertIdx, 0, tab);
+				} else {
+					// Header not found — clear workspaceId and prepend as top-level
+					delete (tab as Record<string, unknown>).workspaceId;
+					tabs.unshift(tab);
+				}
+			} else {
+				tabs.unshift(tab);
+			}
 		}
 		tabs = tabs.slice(0, MAX_RECENT_TABS);
+		regroupWorkspaces(tabs);
 
 		const tabsJson = JSON.stringify(tabs);
 
@@ -495,6 +567,17 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 			// corrupted
 		}
 		migrateTabTypes(tabs as Record<string, unknown>[]);
+
+		// When removing a workspace header, release all children (clear workspaceId)
+		// and delete the workspace DB record.
+		if (tabType === "workspace") {
+			for (const t of tabs as Record<string, unknown>[]) {
+				if (t.workspaceId === tabId) delete t.workspaceId;
+			}
+			db.delete(workspaces)
+				.where(eq(workspaces.id, tabId))
+				.catch(() => {});
+		}
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		filtered = tabs.filter((t: any) => !(t.type === tabType && t.id === tabId));
@@ -663,6 +746,8 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 			}
 		}
 
+		regroupWorkspaces(filtered);
+
 		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
 			JSON.stringify(filtered),
 			now,
@@ -716,14 +801,39 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 			sqlite.run("COMMIT");
 			result = tabs;
 		} else {
-			const [moved] = tabs.splice(idx, 1);
+			const tab = tabs[idx];
+
+			// Extract the item (or workspace group) from the array
+			let movedGroup: Record<string, unknown>[];
+			if (tab.type === "workspace") {
+				// Workspace header: extract header + all contiguous children
+				let end = idx + 1;
+				while (end < tabs.length && tabs[end].workspaceId === tab.id) end++;
+				movedGroup = tabs.splice(idx, end - idx);
+			} else {
+				movedGroup = tabs.splice(idx, 1);
+			}
 
 			if (position === "top") {
-				tabs.unshift(moved);
+				tabs.unshift(...movedGroup);
 			} else if (position === "above_idle") {
+				// If the moved tab is a workspace child, promote the whole workspace instead.
+				// The movedGroup is already extracted; find the workspace header and re-extract.
+				const wsId = movedGroup[0].workspaceId as string | undefined;
+				if (wsId && movedGroup.length === 1) {
+					// Put the child back first, then re-extract the whole workspace group
+					tabs.splice(idx, 0, ...movedGroup);
+					const headerIdx = tabs.findIndex((t) => t.type === "workspace" && t.id === wsId);
+					if (headerIdx >= 0) {
+						let end = headerIdx + 1;
+						while (end < tabs.length && tabs[end].workspaceId === wsId) end++;
+						movedGroup = tabs.splice(headerIdx, end - headerIdx);
+					}
+				}
+
 				// Need live status from DB
 				const narratorIds = tabs
-					.filter((t) => t.type !== "project")
+					.filter((t) => t.type !== "project" && t.type !== "workspace" && !t.workspaceId)
 					.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
 					.filter(Boolean);
 				const statusMap = new Map<string, string>();
@@ -735,10 +845,29 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 					for (const r of rows) statusMap.set(r.id, r.status);
 				}
 
-				// Find the first idle tab and insert just above it
+				// Find the first idle top-level tab (skip workspace children)
 				const IDLE_STATUSES = new Set(["idle"]);
 				let firstIdleIdx = -1;
 				for (let i = 0; i < tabs.length; i++) {
+					// Skip workspace children — they move with their header
+					if (tabs[i].workspaceId) continue;
+					// Skip workspace headers — check their children's status
+					if (tabs[i].type === "workspace") {
+						const wsChildren: Record<string, unknown>[] = [];
+						for (let k = i + 1; k < tabs.length && tabs[k].workspaceId === tabs[i].id; k++) {
+							wsChildren.push(tabs[k]);
+						}
+						const allIdle = wsChildren.every((c) => {
+							const nId = c.type === "narrator" ? (c.id as string) : (c.narratorId as string);
+							const st = nId ? statusMap.get(nId) : undefined;
+							return st != null && IDLE_STATUSES.has(st);
+						});
+						if (wsChildren.length > 0 && allIdle) {
+							firstIdleIdx = i;
+							break;
+						}
+						continue;
+					}
 					const nId =
 						tabs[i].type === "narrator" ? (tabs[i].id as string) : (tabs[i].narratorId as string);
 					const status = nId ? statusMap.get(nId) : undefined;
@@ -748,16 +877,18 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 					}
 				}
 				if (firstIdleIdx === -1) {
-					// No idle tabs — append at end
-					tabs.push(moved);
+					tabs.push(...movedGroup);
 				} else {
-					tabs.splice(firstIdleIdx, 0, moved);
+					tabs.splice(firstIdleIdx, 0, ...movedGroup);
 				}
 			} else if (toIndex != null) {
 				// toIndex — clamp to valid range
 				const target = Math.min(toIndex, tabs.length);
-				tabs.splice(target, 0, moved);
+				tabs.splice(target, 0, ...movedGroup);
 			}
+
+			// Ensure workspace grouping invariant after any move
+			regroupWorkspaces(tabs);
 
 			result = tabs;
 			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
