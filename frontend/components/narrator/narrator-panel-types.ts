@@ -103,6 +103,7 @@ export interface NarratorPanelSnapshot {
 	errorMessage?: string | null;
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
+	turnStartedAt?: string | null;
 }
 
 export interface NarratorPanelProps {

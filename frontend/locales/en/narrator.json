@@ -234,5 +234,6 @@
 	"filePreview_loading": "Loading…",
 	"splitRight": "Split right",
 	"splitDown": "Split down",
-	"closePanel": "Close panel"
+	"closePanel": "Close panel",
+	"lastTurnDuration": "last turn {{duration}}"
 }

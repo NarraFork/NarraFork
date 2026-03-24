@@ -1143,6 +1143,34 @@ export function NarratorPanel({
 	const isRetrying = !!retryInfo;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 
+	// --- Turn elapsed timer ---
+	const turnStartedAt = narrator?.turnStartedAt as string | null | undefined;
+	const narratorUpdatedAt = narrator?.updatedAt as string | null | undefined;
+	const [turnElapsed, setTurnElapsed] = useState<number | null>(null);
+	useEffect(() => {
+		if (!turnStartedAt) {
+			setTurnElapsed(null);
+			return;
+		}
+		const startMs = new Date(turnStartedAt).getTime();
+		if (showWorkIndicator) {
+			// Live ticking while working
+			const update = () => setTurnElapsed(Math.floor((Date.now() - startMs) / 1000));
+			update();
+			const id = setInterval(update, 1000);
+			return () => clearInterval(id);
+		}
+		// Terminal state: compute duration from turnStartedAt → updatedAt
+		const endMs = narratorUpdatedAt ? new Date(narratorUpdatedAt).getTime() : Date.now();
+		setTurnElapsed(Math.max(0, Math.floor((endMs - startMs) / 1000)));
+	}, [turnStartedAt, showWorkIndicator, narratorUpdatedAt]);
+	const turnElapsedText = useMemo(() => {
+		if (turnElapsed == null) return null;
+		const m = Math.floor(turnElapsed / 60);
+		const s = turnElapsed % 60;
+		return `${m}:${s.toString().padStart(2, "0")}`;
+	}, [turnElapsed]);
+
 	const todosCtxValue = useMemo(
 		() => ({ toolUseId: todosToolUseId, isThinking: !!isWorking }),
 		[todosToolUseId, isWorking],
@@ -3285,6 +3313,11 @@ export function NarratorPanel({
 														? t("planning")
 														: t("thinking")}
 								</Text>
+								{turnElapsedText && (
+									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+										{turnElapsedText}
+									</Text>
+								)}
 							</Group>
 						</UnstyledButton>
 					) : (
@@ -3303,6 +3336,11 @@ export function NarratorPanel({
 							<Text size="xs" c="dimmed">
 								{t(`status_${narrator.status}`)}
 							</Text>
+							{turnElapsedText && (
+								<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+									· {t("lastTurnDuration", { duration: turnElapsedText })}
+								</Text>
+							)}
 						</Group>
 					)}
 					{/* Model & Permission selectors */}

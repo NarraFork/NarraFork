@@ -3919,7 +3919,7 @@ async function feedMessage(
 		userId,
 	);
 
-	await narratorService.updateStatus(narratorId, "thinking");
+	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	const narrator = await narratorService.getById(narratorId);
 	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
@@ -4033,7 +4033,7 @@ export async function retryLastMessage(
 	const imageRefs = extractImageRefs(lastMsg.contentJson);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	await narratorService.updateStatus(narratorId, "thinking");
+	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
@@ -4089,7 +4089,7 @@ export async function continueNarrator(
 	}
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	await narratorService.updateStatus(narratorId, "thinking");
+	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	// Pass empty text — buildHistory will detect trailing tool_use blocks
 	// and produce trailingToolResults for the agent loop to continue.
@@ -4196,7 +4196,7 @@ export async function regenerateFromMessage(
 	const imageRefs = extractImageRefs(userMsg.contentJson);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	await narratorService.updateStatus(narratorId, "thinking");
+	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (regenerate)", { narratorId, error: String(err) });
@@ -4321,7 +4321,7 @@ export async function editAndRegenerate(
 	const imageRefs = existingImages;
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	await narratorService.updateStatus(narratorId, "thinking");
+	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch(
 		async (err) => {

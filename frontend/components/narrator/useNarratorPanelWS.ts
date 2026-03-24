@@ -1163,7 +1163,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 				}
 			},
-			onStatusChange: (status) => {
+			onStatusChange: (status, turnStartedAt) => {
 				setIsCompacting(false);
 				setRetryInfo(null);
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
@@ -1188,8 +1188,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					cancelPendingToolChunks(true, true);
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
+				// Merge turnStartedAt only when the server explicitly sends it (i.e. at turn start).
+				// Terminal-status broadcasts (idle/done/error) omit turnStartedAt on purpose so the
+				// cached value from the "thinking" broadcast is preserved — the UI uses it to display
+				// the elapsed duration of the last completed turn.
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, status } : old,
+					old ? { ...old, status, ...(turnStartedAt !== undefined && { turnStartedAt }) } : old,
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},

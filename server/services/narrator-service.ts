@@ -2696,14 +2696,26 @@ export const narratorService = {
 		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
 		errorMessage?: string,
 		errorCode?: string,
+		/** Set to true only at the real turn entry points (sendMessage, retry, continue, etc.)
+		 *  to avoid resetting the timer on loop-internal thinking transitions. */
+		setTurnStart?: boolean,
 	) {
 		const now = new Date().toISOString();
 		// Keep error message only when status is explicitly "error".
 		// Any non-error status transition clears stale error text.
 		const normalizedErrorMessage = status === "error" ? (errorMessage ?? null) : null;
+		// Record turn start time only when explicitly requested (turn entry points).
+		// Loop-internal thinking transitions (permission resume, buffered messages, etc.)
+		// must NOT reset this — the timer should reflect the entire turn duration.
+		const turnStartedAt = setTurnStart ? now : undefined;
 		await db
 			.update(narrators)
-			.set({ status, errorMessage: normalizedErrorMessage, updatedAt: now })
+			.set({
+				status,
+				errorMessage: normalizedErrorMessage,
+				updatedAt: now,
+				...(turnStartedAt !== undefined && { turnStartedAt }),
+			})
 			.where(eq(narrators.id, narratorId));
 
 		eventBus.emit(
@@ -2762,6 +2774,7 @@ export const narratorService = {
 			type: "status_change",
 			narratorId,
 			status,
+			turnStartedAt: turnStartedAt ?? undefined,
 		});
 	},
 

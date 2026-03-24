@@ -260,6 +260,8 @@ export const narrators = sqliteTable(
 		}),
 		backgroundResult: text("background_result"),
 		backgroundCompletedAt: text("background_completed_at"),
+		/** ISO timestamp when the current (or last) turn started */
+		turnStartedAt: text("turn_started_at"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},

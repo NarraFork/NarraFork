@@ -1,4 +1,5 @@
 import { ActionIcon, Box, Center, Group, Loader, Text, TextInput, Tooltip } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { IconArrowLeft, IconCheck, IconEqualDouble, IconPencil } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -117,6 +118,27 @@ function WorkspacePage() {
 			setTree(parseTree((workspace as any).tree));
 			loadedAtRef.current = serverUpdatedAt ?? null;
 			localEditRef.current = false;
+		} else if (isFreshRefetch && localEditRef.current && tree) {
+			// Even with local edits, accept server tree if it contains narrators
+			// that the local tree doesn't have (e.g. added via sidebar "+" button).
+			// Trade-off: this overwrites local layout edits (panel resizes, closes)
+			// when new narrators appear — acceptable since adding a narrator is a
+			// higher-priority structural change than in-flight layout tweaks.
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+			const serverTree = parseTree((workspace as any).tree);
+			const localIds = new Set(getAllNarratorIds(tree));
+			const serverIds = getAllNarratorIds(serverTree);
+			const hasNewNarrators = serverIds.some((id) => !localIds.has(id));
+			if (hasNewNarrators) {
+				setTree(serverTree);
+				loadedAtRef.current = serverUpdatedAt ?? null;
+				localEditRef.current = false;
+				// Cancel any pending debounced save to avoid overwriting the server tree
+				if (saveTimerRef.current) {
+					clearTimeout(saveTimerRef.current);
+					saveTimerRef.current = null;
+				}
+			}
 		}
 	}, [workspace, tree]);
 
@@ -339,6 +361,31 @@ function WorkspacePage() {
 		});
 	}, []);
 
+	// ── Mobile scale: shrink panels proportionally on narrow viewports ──
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const panelContainerRef = useRef<HTMLDivElement>(null);
+	const [mobileScale, setMobileScale] = useState(1);
+	const leafCount = tree ? countLeaves(tree) : 0;
+
+	useEffect(() => {
+		if (!isMobile || leafCount <= 1) {
+			setMobileScale(1);
+			return;
+		}
+		const el = panelContainerRef.current;
+		if (!el) return;
+		const MIN_LEAF_WIDTH_PX = 360;
+		const ro = new ResizeObserver((entries) => {
+			const containerWidth = entries[0]?.contentRect.width ?? 0;
+			if (containerWidth <= 0) return;
+			const neededWidth = leafCount * MIN_LEAF_WIDTH_PX;
+			const scale = Math.min(1, containerWidth / neededWidth);
+			setMobileScale(Math.max(0.5, scale));
+		});
+		ro.observe(el);
+		return () => ro.disconnect();
+	}, [isMobile, leafCount]);
+
 	if (isLoading || !tree) {
 		return (
 			<Box
@@ -353,7 +400,16 @@ function WorkspacePage() {
 		);
 	}
 
-	const canClose = countLeaves(tree) > 1;
+	const canClose = leafCount > 1;
+	const needsScale = isMobile && leafCount > 1 && mobileScale < 1;
+	const scaleStyle: React.CSSProperties = needsScale
+		? {
+				width: `${100 / mobileScale}%`,
+				height: `${100 / mobileScale}%`,
+				transform: `scale(${mobileScale})`,
+				transformOrigin: "top left",
+			}
+		: {};
 
 	const ctxValue: SplitPanelCallbacks = {
 		onSplitAndAssign: handleSplitAndAssign,
@@ -424,10 +480,15 @@ function WorkspacePage() {
 				</Tooltip>
 			</Group>
 
-			<Box style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden" }}>
-				<SplitPanelCtx.Provider value={ctxValue}>
-					<SplitPanelContainer node={tree} onUpdateSizes={handleUpdateSizes} />
-				</SplitPanelCtx.Provider>
+			<Box
+				ref={panelContainerRef}
+				style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden" }}
+			>
+				<Box style={{ width: "100%", height: "100%", ...scaleStyle }}>
+					<SplitPanelCtx.Provider value={ctxValue}>
+						<SplitPanelContainer node={tree} onUpdateSizes={handleUpdateSizes} />
+					</SplitPanelCtx.Provider>
+				</Box>
 			</Box>
 			<NarratorDragGhost />
 		</Box>

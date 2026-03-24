@@ -43,7 +43,7 @@ export type NarratorServerMessage =
 	| { type: "message"; narratorId: string; message: unknown }
 	| { type: "stream_event"; narratorId: string; event: unknown }
 	| { type: "permission_request"; narratorId: string; request: unknown }
-	| { type: "status_change"; narratorId: string; status: string }
+	| { type: "status_change"; narratorId: string; status: string; turnStartedAt?: string }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_output";
@@ -154,12 +154,12 @@ export type NarratorServerMessage =
 			extractedFields?: Record<string, string>;
 	  }
 	| {
-		type: "subagent_started";
-		narratorId: string;
-		subagentNarratorId: string;
-		toolUseId: string;
-		subagentType: string;
-		model?: string;
+			type: "subagent_started";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId: string;
+			subagentType: string;
+			model?: string;
 	  }
 	| {
 			type: "background_task_started";

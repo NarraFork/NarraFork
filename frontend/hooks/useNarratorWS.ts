@@ -19,7 +19,7 @@ interface NarratorWSCallbacks {
 		decision?: "allow" | "deny",
 		feedbackText?: string,
 	) => void;
-	onStatusChange?: (status: string) => void;
+	onStatusChange?: (status: string, turnStartedAt?: string) => void;
 	onToolStarted?: (
 		toolUseId: string,
 		toolName: string,
@@ -217,7 +217,10 @@ export function useNarratorWS(
 						);
 						break;
 					case "status_change":
-						callbacksRef.current.onStatusChange?.(data.status as string);
+						callbacksRef.current.onStatusChange?.(
+							data.status as string,
+							data.turnStartedAt as string | undefined,
+						);
 						break;
 					case "tool_started":
 						callbacksRef.current.onToolStarted?.(
