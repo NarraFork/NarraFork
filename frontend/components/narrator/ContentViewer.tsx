@@ -94,6 +94,8 @@ interface ContentViewerProps {
 	language?: string;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
+	/** Whether this content is currently being streamed (enables per-char animation) */
+	streaming?: boolean;
 }
 
 /** Sticky wrapper: zero-height, sticks to the top of the nearest scroll
@@ -172,6 +174,7 @@ export const ContentViewer = memo(
 			renderContent,
 			language,
 			blockIndex,
+			streaming,
 		},
 		ref,
 	) {
@@ -406,7 +409,7 @@ export const ContentViewer = memo(
 				</Code>
 			) : (
 				<Box px="xs" py={4} style={{ minWidth: 0, ...extraStyle }}>
-					<MarkdownContent text={text} wordWrap={wordWrap} />
+					<MarkdownContent text={text} wordWrap={wordWrap} streaming={streaming} />
 				</Box>
 			);
 

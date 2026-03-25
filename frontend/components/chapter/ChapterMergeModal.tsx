@@ -2,7 +2,7 @@ import { Alert, Button, Modal, Select, Stack, Text, TextInput } from "@mantine/c
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../lib/api";
+import { ApiError, api } from "../../lib/api";
 
 interface MergeCheckResult {
 	hasConflicts: boolean;
@@ -138,7 +138,14 @@ export function ChapterMergeModal({
 				{merge.isError && (
 					<Alert color="red" title={t("mergeFailed")}>
 						<Text size="sm">
-							{merge.error instanceof Error ? merge.error.message : tc("unknownError")}
+							{merge.error instanceof ApiError && merge.error.data?.error === "MERGE_DIRTY_SOURCE"
+								? t("mergeDirtySource")
+								: merge.error instanceof ApiError &&
+										merge.error.data?.error === "MERGE_DIRTY_TARGET"
+									? t("mergeDirtyTarget")
+									: merge.error instanceof Error
+										? merge.error.message
+										: tc("unknownError")}
 						</Text>
 					</Alert>
 				)}

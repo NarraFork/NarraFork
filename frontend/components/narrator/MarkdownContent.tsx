@@ -1,5 +1,5 @@
 import { Anchor, Blockquote, Code, Divider, List, Table, Text, Title } from "@mantine/core";
-import { Component, memo, type ReactNode, useMemo } from "react";
+import { Component, memo, type ReactNode, useLayoutEffect, useRef } from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -22,10 +22,6 @@ export const MD_PATTERN =
 /** Detect box-drawing / ASCII-art diagram characters that should never be word-wrapped */
 const DIAGRAM_PATTERN =
 	/[─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┘├┤┬┴┼╋╔╗╚╝╠╣╦╩╬║═╒╓╕╖╘╙╛╜╞╟╡╢╤╥╧╨╪╫]|[┌┐└┘├┤┬┴┼│─]|[╭╮╯╰]|[+\-|]{3,}.*[+\-|]{3,}/;
-
-function hasMarkdown(text: string): boolean {
-	return MD_PATTERN.test(text);
-}
 
 const HEADING_ORDER: Record<string, 1 | 2 | 3 | 4 | 5 | 6> = {
 	h1: 1,
@@ -249,29 +245,206 @@ class MarkdownErrorBoundary extends Component<
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Streaming per-character blur-in animation hook
+// ---------------------------------------------------------------------------
+
+const CHAR_IN_CLASS = "nf-char-in";
+
+/**
+ * Count total visible text characters inside a DOM subtree by walking all
+ * TEXT_NODE children. Skips nodes inside <code>/<pre> blocks.
+ */
+function countTextChars(root: HTMLElement): number {
+	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+		acceptNode(node) {
+			const parent = node.parentElement;
+			if (parent?.closest("pre, code")) return NodeFilter.FILTER_REJECT;
+			return NodeFilter.FILTER_ACCEPT;
+		},
+	});
+	let count = 0;
+	while (walker.nextNode()) {
+		count += (walker.currentNode as globalThis.Text).length;
+	}
+	return count;
+}
+
+/**
+ * Walk text nodes and wrap the last `newCount` characters in animated spans.
+ * Returns the number of characters actually wrapped (may be less if DOM is
+ * shorter than expected due to markdown re-parsing).
+ */
+function wrapNewChars(root: HTMLElement, newCount: number): number {
+	// Collect all eligible text nodes
+	const textNodes: globalThis.Text[] = [];
+	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+		acceptNode(node) {
+			const parent = node.parentElement;
+			if (parent?.closest("pre, code")) return NodeFilter.FILTER_REJECT;
+			return NodeFilter.FILTER_ACCEPT;
+		},
+	});
+	while (walker.nextNode()) {
+		textNodes.push(walker.currentNode as globalThis.Text);
+	}
+
+	// Total chars across all text nodes
+	let totalChars = 0;
+	for (const tn of textNodes) totalChars += tn.length;
+
+	// The boundary: chars before this index are "old", after are "new"
+	const boundary = totalChars - newCount;
+	if (boundary < 0) return totalChars; // everything is new
+
+	let charsSoFar = 0;
+	let wrapped = 0;
+
+	for (const textNode of textNodes) {
+		const nodeLen = textNode.length;
+		const nodeEnd = charsSoFar + nodeLen;
+
+		if (nodeEnd <= boundary) {
+			// Entirely old — skip
+			charsSoFar = nodeEnd;
+			continue;
+		}
+
+		// How many chars in this node are old vs new
+		const oldInNode = Math.max(0, boundary - charsSoFar);
+		const newText = textNode.textContent?.slice(oldInNode) ?? "";
+
+		if (!newText) {
+			charsSoFar = nodeEnd;
+			continue;
+		}
+
+		// Split: keep old part as-is, wrap new part in animated span
+		const parent = textNode.parentNode;
+		if (!parent) {
+			charsSoFar = nodeEnd;
+			continue;
+		}
+
+		if (oldInNode > 0) {
+			// Split the text node: [old part] | [new part]
+			const newNode = textNode.splitText(oldInNode);
+			const span = document.createElement("span");
+			span.className = CHAR_IN_CLASS;
+			parent.replaceChild(span, newNode);
+			span.appendChild(newNode);
+		} else {
+			// Entire node is new
+			const span = document.createElement("span");
+			span.className = CHAR_IN_CLASS;
+			parent.replaceChild(span, textNode);
+			span.appendChild(textNode);
+		}
+
+		wrapped += newText.length;
+		charsSoFar = nodeEnd;
+	}
+
+	return wrapped;
+}
+
+/**
+ * Remove all animated spans: unwrap their text content back into the parent.
+ */
+function cleanupAnimSpans(root: HTMLElement) {
+	const spans = root.querySelectorAll(`.${CHAR_IN_CLASS}`);
+	for (const span of spans) {
+		const parent = span.parentNode;
+		if (!parent) continue;
+		while (span.firstChild) {
+			parent.insertBefore(span.firstChild, span);
+		}
+		parent.removeChild(span);
+		parent.normalize(); // merge adjacent text nodes
+	}
+}
+
+/**
+ * Hook that applies per-character blur-in animation to newly streamed text.
+ *
+ * On each render where `streaming` is true, it compares the current DOM text
+ * length against the previously recorded length and wraps only the delta
+ * characters in `<span class="nf-char-in">`. When the animation finishes
+ * (or on the next tick), the spans are cleaned up to avoid DOM bloat.
+ */
+function useStreamingCharAnim(
+	containerRef: React.RefObject<HTMLElement | null>,
+	streaming: boolean | undefined,
+) {
+	const prevLenRef = useRef(0);
+	const cleanupTimerRef = useRef(0);
+
+	useLayoutEffect(() => {
+		const el = containerRef.current;
+		if (!el || !streaming) {
+			// Reset when streaming stops
+			if (!streaming) {
+				prevLenRef.current = 0;
+				if (el) cleanupAnimSpans(el);
+			}
+			return;
+		}
+
+		// Clean up any leftover spans from the previous tick before measuring
+		cleanupAnimSpans(el);
+
+		const currentLen = countTextChars(el);
+		const prevLen = prevLenRef.current;
+		const delta = currentLen - prevLen;
+
+		if (delta > 0) {
+			wrapNewChars(el, delta);
+
+			// Schedule cleanup after animation completes (180ms + small buffer)
+			if (cleanupTimerRef.current) cancelAnimationFrame(cleanupTimerRef.current);
+			cleanupTimerRef.current = requestAnimationFrame(() => {
+				// Use a timeout matching the animation duration
+				setTimeout(() => {
+					if (containerRef.current) cleanupAnimSpans(containerRef.current);
+					cleanupTimerRef.current = 0;
+				}, 200);
+			});
+		}
+
+		prevLenRef.current = currentLen;
+	});
+
+	// Cleanup on unmount
+	useLayoutEffect(() => {
+		return () => {
+			if (cleanupTimerRef.current) cancelAnimationFrame(cleanupTimerRef.current);
+			const el = containerRef.current;
+			if (el) cleanupAnimSpans(el);
+		};
+	}, [containerRef]);
+}
+
+// ---------------------------------------------------------------------------
+// MarkdownContent component
+// ---------------------------------------------------------------------------
+
 interface MarkdownContentProps {
 	text: string;
 	/** When false, disable word-wrap so long lines scroll horizontally. Defaults to true. */
 	wordWrap?: boolean;
+	/** Whether this content is currently being streamed (enables per-char animation) */
+	streaming?: boolean;
 }
 
 export const MarkdownContent = memo(function MarkdownContent({
 	text,
 	wordWrap = true,
+	streaming,
 }: MarkdownContentProps) {
 	const trimmed = text.trim();
-	const isMd = useMemo(() => hasMarkdown(trimmed), [trimmed]);
+	const containerRef = useRef<HTMLDivElement>(null);
 
-	if (!isMd) {
-		return (
-			<Text
-				size="sm"
-				style={wordWrap ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre", overflowX: "auto" }}
-			>
-				{trimmed}
-			</Text>
-		);
-	}
+	useStreamingCharAnim(containerRef, streaming);
 
 	const plainFallback = (
 		<Text
@@ -284,7 +457,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
 	return (
 		<MarkdownErrorBoundary fallback={plainFallback}>
-			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+			<div ref={containerRef} className={wordWrap ? classes.root : classes.rootNoWrap}>
 				<Markdown remarkPlugins={remarkPlugins} components={mdComponents}>
 					{trimmed}
 				</Markdown>

@@ -297,7 +297,12 @@ export function getCategoryColor(cat: ToolCategory) {
 
 /** Check whether a value is a truncated placeholder produced by the backend */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function isTruncated(val: any): val is { _truncated: true; preview: string; fullLength: number } {
+function isTruncated(val: any): val is {
+	_truncated: true;
+	preview: string;
+	fullLength: number;
+	_hints?: Record<string, unknown>;
+} {
 	return val?._truncated === true && typeof val?.preview === "string";
 }
 
@@ -323,7 +328,8 @@ function escapeRegExp(s: string): string {
 
 /**
  * Try to extract a top-level string property from a possibly-truncated JSON object.
- * For truncated objects, attempts a regex match on the preview string.
+ * For truncated objects with `_hints`, reads directly from the hints map first.
+ * For truncated objects without hints, attempts a regex match on the preview string.
  * Supports both complete and truncated (unclosed) string values in the preview.
  */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -334,6 +340,13 @@ function extractField(val: any, ...keys: string[]): string {
 			if (typeof val[k] === "string") return val[k];
 		}
 		return "";
+	}
+	// Fast path: read from pre-extracted hints
+	const hints = val._hints;
+	if (hints && typeof hints === "object") {
+		for (const k of keys) {
+			if (typeof hints[k] === "string") return hints[k];
+		}
 	}
 	// Try to extract from the JSON preview string via regex
 	for (const k of keys) {
@@ -370,6 +383,13 @@ function extractNumericField(val: any, ...keys: string[]): number | undefined {
 			if (typeof val[k] === "number") return val[k];
 		}
 		return undefined;
+	}
+	// Fast path: read from pre-extracted hints
+	const hints = val._hints;
+	if (hints && typeof hints === "object") {
+		for (const k of keys) {
+			if (typeof hints[k] === "number") return hints[k];
+		}
 	}
 	for (const k of keys) {
 		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*(\\d+)`);
@@ -491,6 +511,10 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 					return `${header} → ${label}`;
 				}
 				return header || "Question";
+			}
+			// Truncated input: try to read header from _hints
+			if (isTruncated(input) && typeof input._hints?._firstHeader === "string") {
+				return input._hints._firstHeader;
 			}
 			return "Question";
 		}
@@ -2690,7 +2714,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		? "tool-card-shimmer"
 		: doneShimmer
 			? "tool-done-shimmer"
-			: isRunning
+			: isRunning && !pendingPermission
 				? "tool-running-shimmer"
 				: undefined;
 

@@ -1,3 +1,4 @@
+import { lstat, readdir } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { z } from "zod/v4";
 import { imageToBase64 } from "../../uploads";
@@ -109,6 +110,17 @@ export const readTool: ToolDefinition = {
 
 		const resolvedPath = resolve(ctx.cwd, file_path);
 
+		// ── Directory handling: list contents instead of erroring ──
+		try {
+			const stat = await lstat(resolvedPath);
+			if (stat.isDirectory()) {
+				return await listDirectory(file_path, resolvedPath);
+			}
+		} catch {
+			// Path doesn't exist or can't be stat'd — fall through to normal read,
+			// which will produce the appropriate error message.
+		}
+
 		// ── Image file handling ──
 		const ext = extname(resolvedPath).toLowerCase();
 		const imageFormat = IMAGE_EXTENSIONS[ext];
@@ -195,3 +207,31 @@ export const readTool: ToolDefinition = {
 		}
 	},
 };
+
+// ── Directory listing helper ──
+
+const MAX_DIR_ENTRIES = 500;
+
+async function listDirectory(displayPath: string, resolvedPath: string): Promise<ToolResult> {
+	const entries = await readdir(resolvedPath, { withFileTypes: true });
+
+	// Sort: directories first, then files, alphabetical within each group
+	const sorted = entries.toSorted((a, b) => {
+		const aDir = a.isDirectory() ? 0 : 1;
+		const bDir = b.isDirectory() ? 0 : 1;
+		if (aDir !== bDir) return aDir - bDir;
+		return a.name.localeCompare(b.name);
+	});
+
+	const truncated = sorted.length > MAX_DIR_ENTRIES;
+	const visible = truncated ? sorted.slice(0, MAX_DIR_ENTRIES) : sorted;
+
+	const lines = visible.map((e) => `  ${e.name}${e.isDirectory() ? "/" : ""}`);
+	const header = `Directory listing for ${displayPath}\n`;
+	const footer = `\n(${entries.length} entries${truncated ? `, showing first ${MAX_DIR_ENTRIES}` : ""})`;
+
+	return {
+		output: header + lines.join("\n") + footer,
+		title: displayPath,
+	};
+}

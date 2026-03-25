@@ -107,6 +107,133 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
  *  but outputJson can still be truncated. */
 const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
 
+/**
+ * Extract short header-relevant fields from a tool's inputJson before truncation.
+ * These hints are attached to the truncated object so the frontend can display
+ * file names, line numbers, commands, etc. without relying on regex parsing.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function extractHeaderHints(toolName: string, input: any): Record<string, unknown> | undefined {
+	if (!input || typeof input !== "object") return undefined;
+	const h: Record<string, unknown> = {};
+	const str = (k: string) => (typeof input[k] === "string" ? input[k] : undefined);
+	const num = (k: string) => (typeof input[k] === "number" ? input[k] : undefined);
+
+	switch (toolName) {
+		case "Write":
+		case "Edit":
+		case "MultiEdit":
+		case "Read": {
+			const fp = str("file_path") ?? str("filePath") ?? str("path");
+			if (fp) h.file_path = fp;
+			const offset = num("offset");
+			if (offset != null) h.offset = offset;
+			const limit = num("limit");
+			if (limit != null) h.limit = limit;
+			break;
+		}
+		case "Bash": {
+			const cmd = str("command");
+			if (cmd) h.command = cmd.length > 100 ? cmd.slice(0, 100) : cmd;
+			const timeout = num("timeout");
+			if (timeout != null) h.timeout = timeout;
+			break;
+		}
+		case "Glob":
+		case "Grep": {
+			const pat = str("pattern") ?? str("glob");
+			if (pat) h.pattern = pat;
+			const p = str("path");
+			if (p) h.path = p;
+			const g = str("glob");
+			if (g) h.glob = g;
+			break;
+		}
+		case "WebSearch": {
+			const q = str("query");
+			if (q) h.query = q;
+			break;
+		}
+		case "WebFetch": {
+			const url = str("url");
+			if (url) h.url = url;
+			const mode = str("mode");
+			if (mode) h.mode = mode;
+			break;
+		}
+		case "Terminal": {
+			const action = str("action");
+			if (action) h.action = action;
+			const tid = str("terminal_id");
+			if (tid) h.terminal_id = tid;
+			const inp = str("input");
+			if (inp) h.input = inp.length > 60 ? inp.slice(0, 60) : inp;
+			break;
+		}
+		case "ShareFile": {
+			const fp = str("path");
+			if (fp) h.path = fp;
+			break;
+		}
+		case "AskUserQuestion": {
+			const qs = input.questions;
+			if (Array.isArray(qs) && qs.length > 0 && typeof qs[0]?.header === "string") {
+				h._firstHeader = qs[0].header;
+			}
+			break;
+		}
+		case "TaskOutput":
+		case "TaskStop": {
+			const tid = str("task_id");
+			if (tid) h.task_id = tid;
+			break;
+		}
+		case "Recall": {
+			const action = str("action");
+			if (action) h.action = action;
+			const q = str("query");
+			if (q) h.query = q;
+			const nid = str("narrator_id");
+			if (nid) h.narrator_id = nid;
+			const tcId = str("tool_call_id");
+			if (tcId) h.tool_call_id = tcId;
+			break;
+		}
+		case "ApprovePermission":
+		case "DenyPermission":
+		case "GetNarratorContext":
+		case "ListManagedNarrators": {
+			const rid = str("requestId");
+			if (rid) h.requestId = rid;
+			const nid = str("narratorId");
+			if (nid) h.narratorId = nid;
+			break;
+		}
+		default:
+			return undefined;
+	}
+	return Object.keys(h).length > 0 ? h : undefined;
+}
+
+/**
+ * Truncate inputJson with header hints attached.
+ * If the input exceeds maxLen, the truncated object includes a `_hints` field
+ * containing short header-relevant fields extracted before truncation.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function truncateInputWithHints(toolName: string, val: any, maxLen: number): any {
+	if (val === null || val === undefined) return val;
+	const str = typeof val === "string" ? val : JSON.stringify(val);
+	if (str.length <= maxLen) return val;
+	const hints = extractHeaderHints(toolName, val);
+	return {
+		_truncated: true,
+		preview: str.slice(0, maxLen),
+		fullLength: str.length,
+		...(hints && { _hints: hints }),
+	};
+}
+
 /** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
@@ -118,7 +245,9 @@ export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 			const skipInput = SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName);
 			return {
 				...tc,
-				inputJson: skipInput ? tc.inputJson : truncateJson(tc.inputJson, maxLen),
+				inputJson: skipInput
+					? tc.inputJson
+					: truncateInputWithHints(tc.toolName, tc.inputJson, maxLen),
 				outputJson: truncateJson(tc.outputJson, maxLen),
 			};
 		}),

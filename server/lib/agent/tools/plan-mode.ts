@@ -90,12 +90,11 @@ export const enterPlanModeTool: ToolDefinition = {
 export const exitPlanModeTool: ToolDefinition = {
 	name: "ExitPlanMode",
 	description:
-		"Use this tool when you are in plan mode and have finished writing your plan to the plan file and are ready for user approval.\n\n" +
+		"Use this tool when you are in plan mode and have finished designing your implementation plan and are ready for user approval.\n\n" +
 		"## How This Tool Works\n" +
-		"- You should have already written your plan to the plan file specified in the plan mode system message\n" +
-		"- This tool does NOT take the plan content as a parameter - it will read the plan from the file you wrote\n" +
-		"- This tool simply signals that you're done planning and ready for the user to review and approve\n" +
-		"- The user will see the contents of your plan file when they review it\n\n" +
+		"- You MUST pass the complete plan content in the `plan` parameter\n" +
+		"- The user will see the plan content you provide and decide whether to approve it\n" +
+		"- An empty or missing plan will be rejected — the plan parameter is required\n\n" +
 		"## When to Use This Tool\n" +
 		"IMPORTANT: Only use this tool when the task requires planning the implementation steps of a task that requires writing code. For research tasks where you're gathering information, searching files, reading files or in general trying to understand the codebase - do NOT use this tool.\n\n" +
 		"## Before Using This Tool\n" +
@@ -110,6 +109,13 @@ export const exitPlanModeTool: ToolDefinition = {
 	rawJsonSchema: {
 		type: "object",
 		properties: {
+			plan: {
+				description:
+					"The COMPLETE implementation plan in markdown format. " +
+					"Must contain the full plan with all steps, file changes, and reasoning. " +
+					"This content will be shown to the user for approval. Cannot be empty.",
+				type: "string",
+			},
 			allowedPrompts: {
 				description:
 					"Prompt-based permissions needed to implement the plan. These describe categories of actions rather than specific commands.",
@@ -133,16 +139,16 @@ export const exitPlanModeTool: ToolDefinition = {
 				},
 			},
 		},
+		required: ["plan"],
 		additionalProperties: {},
 	},
 	parameters: z.object({
 		plan: z
 			.string()
-			.optional()
 			.describe(
-				"The COMPLETE plan in markdown format (inline mode). " +
-					"Must contain the full implementation plan with all steps, details, and reasoning. " +
-					"Mutually exclusive with 'planFile'.",
+				"The COMPLETE implementation plan in markdown format. " +
+					"Must contain the full plan with all steps, file changes, and reasoning. " +
+					"This content will be shown to the user for approval. Cannot be empty.",
 			),
 		planFile: z
 			.string()

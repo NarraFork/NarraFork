@@ -55,6 +55,8 @@
 	"fastForwardDescription": "目标分支没有分叉提交，合并将以快进方式进行，不会产生合并提交。",
 	"conflictCheckFailed": "冲突检查失败",
 	"mergeFailed": "合并失败",
+	"mergeDirtySource": "源章节存在未提交的变更，请先提交或暂存。",
+	"mergeDirtyTarget": "目标章节存在未提交的变更，请先提交或暂存。",
 	"checkConflicts": "检查冲突",
 	"batchMergeTitle": "批量合并",
 	"batchMergeDescription": "将多个源章节合并到目标章节。合并时会创建临时分叉，所有源章节按顺序合并。",

@@ -2584,24 +2584,26 @@ export function NarratorPanel({
 			return;
 		}
 		// 上下箭头翻阅输入历史
+		// 需要处理 soft-wrap（长文本自动折行）的情况：
+		// 先让浏览器执行默认的光标移动，如果光标位置没变说明已在首/末视觉行，
+		// 此时才触发历史导航。
 		if (e.key === "ArrowUp" || e.key === "ArrowDown") {
 			const textarea = e.currentTarget as HTMLTextAreaElement;
-			const { selectionStart, value } = textarea;
-			if (e.key === "ArrowUp") {
-				// 光标在第一行时才触发
-				const textBeforeCursor = value.slice(0, selectionStart);
-				if (textBeforeCursor.includes("\n")) return;
-			} else {
-				// 光标在最后一行时才触发
-				const textAfterCursor = value.slice(selectionStart);
-				if (textAfterCursor.includes("\n")) return;
-			}
+			const posBefore = textarea.selectionStart;
 			const direction = e.key === "ArrowUp" ? "up" : "down";
-			const result = inputHistory.navigate(direction, input);
-			if (result !== null) {
-				e.preventDefault();
-				setInput(result);
-			}
+			// 让浏览器先处理默认行为，下一帧再检查光标是否移动
+			requestAnimationFrame(() => {
+				const posAfter = textarea.selectionStart;
+				if (posBefore !== posAfter) return; // 光标移动了，说明还在文本中间行
+				const result = inputHistory.navigate(direction, input);
+				if (result !== null) {
+					setInput(result);
+					// 将光标移到末尾
+					requestAnimationFrame(() => {
+						textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
+					});
+				}
+			});
 		}
 	};
 
@@ -3506,60 +3508,64 @@ export function NarratorPanel({
 						{/* Desktop selects */}
 						{!compact && (
 							<Group gap={6} wrap="nowrap" visibleFrom="sm">
-								<Menu position="top-end">
-									<Menu.Target>
-										<NativeSelect
-											size="xs"
-											data={allModels.map((m) => ({
-												value: m.value,
-												label:
-													m.value === FOLLOW_DEFAULT_MODEL
-														? t("followDefault", { model: defaultModelValue })
-														: m.provider
-															? `${m.provider}:${m.label}`
-															: m.label,
-											}))}
-											value={narrator.model ?? FOLLOW_DEFAULT_MODEL}
-											onChange={() => {}}
-											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-											style={{ pointerEvents: "auto" }}
-										/>
-									</Menu.Target>
-									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-										<ModelMenuItems
-											allModels={allModels}
-											currentModel={narrator.model}
-											totalCostUsd={narrator.totalCostUsd}
-											onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-										/>
-									</Menu.Dropdown>
-								</Menu>
-								<Menu position="top-end">
-									<Menu.Target>
-										<NativeSelect
-											size="xs"
-											leftSection={
-												PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-													<IconShield size={14} />
-												)
-											}
-											data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
-											value={narrator.permissionMode ?? "default"}
-											onChange={() => {}}
-											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-											style={{ pointerEvents: "auto" }}
-										/>
-									</Menu.Target>
-									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-										<PermModeMenuItems
-											currentMode={narrator.permissionMode ?? "default"}
-											onSelect={(m) =>
-												permModeMutation.mutate({ id: narratorId, permissionMode: m })
-											}
-											t={t}
-										/>
-									</Menu.Dropdown>
-								</Menu>
+								<Tooltip label={t("modelTooltip")}>
+									<Menu position="top-end">
+										<Menu.Target>
+											<NativeSelect
+												size="xs"
+												data={allModels.map((m) => ({
+													value: m.value,
+													label:
+														m.value === FOLLOW_DEFAULT_MODEL
+															? t("followDefault", { model: defaultModelValue })
+															: m.provider
+																? `${m.provider}:${m.label}`
+																: m.label,
+												}))}
+												value={narrator.model ?? FOLLOW_DEFAULT_MODEL}
+												onChange={() => {}}
+												onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+												style={{ pointerEvents: "auto" }}
+											/>
+										</Menu.Target>
+										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+											<ModelMenuItems
+												allModels={allModels}
+												currentModel={narrator.model}
+												totalCostUsd={narrator.totalCostUsd}
+												onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+											/>
+										</Menu.Dropdown>
+									</Menu>
+								</Tooltip>
+								<Tooltip label={t("permissionMode")}>
+									<Menu position="top-end">
+										<Menu.Target>
+											<NativeSelect
+												size="xs"
+												leftSection={
+													PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+														<IconShield size={14} />
+													)
+												}
+												data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
+												value={narrator.permissionMode ?? "default"}
+												onChange={() => {}}
+												onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+												style={{ pointerEvents: "auto" }}
+											/>
+										</Menu.Target>
+										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+											<PermModeMenuItems
+												currentMode={narrator.permissionMode ?? "default"}
+												onSelect={(m) =>
+													permModeMutation.mutate({ id: narratorId, permissionMode: m })
+												}
+												t={t}
+											/>
+										</Menu.Dropdown>
+									</Menu>
+								</Tooltip>
 								<PathRulesPopover narratorId={narratorId} t={t} />
 								{/* Reasoning Effort (Codex + Anthropic providers) */}
 								{supportsReasoningEffort && (
@@ -3660,45 +3666,52 @@ export function NarratorPanel({
 						)}
 						{/* Mobile: model & permission */}
 						<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
-							<Menu position="bottom-end" withinPortal>
-								<Menu.Target>
-									<ActionIcon variant="subtle" color="gray" size="sm">
-										<Text size="xs" fw={600}>
-											{(() => {
-												if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model) return "D";
-												const m = allModels.find((x) => x.value === narrator.model);
-												return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
-											})()}
-										</Text>
-									</ActionIcon>
-								</Menu.Target>
-								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-									<ModelMenuItems
-										allModels={allModels}
-										currentModel={narrator.model}
-										totalCostUsd={narrator.totalCostUsd}
-										onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-										label={t("modelTooltip")}
-									/>
-								</Menu.Dropdown>
-							</Menu>
-							<Menu position="bottom-end" withinPortal>
-								<Menu.Target>
-									<ActionIcon variant="subtle" color="gray" size="sm">
-										{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-											<IconShield size={16} />
-										)}
-									</ActionIcon>
-								</Menu.Target>
-								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-									<Menu.Label>{t("permissionMode")}</Menu.Label>
-									<PermModeMenuItems
-										currentMode={narrator.permissionMode ?? "default"}
-										onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
-										t={t}
-									/>
-								</Menu.Dropdown>
-							</Menu>
+							<Tooltip label={t("modelTooltip")}>
+								<Menu position="bottom-end" withinPortal>
+									<Menu.Target>
+										<ActionIcon variant="subtle" color="gray" size="sm">
+											<Text size="xs" fw={600}>
+												{(() => {
+													if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
+														return "D";
+													const m = allModels.find((x) => x.value === narrator.model);
+													return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
+												})()}
+											</Text>
+										</ActionIcon>
+									</Menu.Target>
+									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+										<ModelMenuItems
+											allModels={allModels}
+											currentModel={narrator.model}
+											totalCostUsd={narrator.totalCostUsd}
+											onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+											label={t("modelTooltip")}
+										/>
+									</Menu.Dropdown>
+								</Menu>
+							</Tooltip>
+							<Tooltip label={t("permissionMode")}>
+								<Menu position="bottom-end" withinPortal>
+									<Menu.Target>
+										<ActionIcon variant="subtle" color="gray" size="sm">
+											{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+												<IconShield size={16} />
+											)}
+										</ActionIcon>
+									</Menu.Target>
+									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+										<Menu.Label>{t("permissionMode")}</Menu.Label>
+										<PermModeMenuItems
+											currentMode={narrator.permissionMode ?? "default"}
+											onSelect={(m) =>
+												permModeMutation.mutate({ id: narratorId, permissionMode: m })
+											}
+											t={t}
+										/>
+									</Menu.Dropdown>
+								</Menu>
+							</Tooltip>
 							<PathRulesPopover narratorId={narratorId} t={t} />
 							{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 							{supportsReasoningEffort && (

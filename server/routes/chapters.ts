@@ -134,6 +134,26 @@ chapterRoutes.post("/:id/merge", async (c) => {
 	const id = c.req.param("id");
 	const parsed = mergeChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	// Dirty check: ensure source and target worktrees are clean
+	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, id) });
+	if (!source) throw new NotFoundError("Chapter", id);
+	if (source.worktreePath) {
+		const sourceStatus = await gitService.getStatus(source.worktreePath);
+		if (sourceStatus.trim()) {
+			return c.json({ error: "MERGE_DIRTY_SOURCE", code: "VALIDATION_ERROR" }, 400);
+		}
+	}
+	const target = await db.query.chapters.findFirst({
+		where: eq(chapters.id, parsed.data.targetChapterId),
+	});
+	if (target?.worktreePath) {
+		const targetStatus = await gitService.getStatus(target.worktreePath);
+		if (targetStatus.trim()) {
+			return c.json({ error: "MERGE_DIRTY_TARGET", code: "VALIDATION_ERROR" }, 400);
+		}
+	}
+
 	const userId = c.get("user").sub;
 	const result = await chapterMerge.merge(id, parsed.data, userId);
 	if (!result.success) {

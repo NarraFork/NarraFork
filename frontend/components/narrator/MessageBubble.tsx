@@ -1391,6 +1391,7 @@ export const MessageBubble = memo(function MessageBubble({
 					const realIndex = message._blockOriginalIndices?.[i] ?? i;
 					if (block.type === "text") {
 						if (!block.text?.trim()) return null;
+						const isStreaming = message.id === "__streaming__";
 						return (
 							<ContentViewer
 								key={key}
@@ -1398,6 +1399,7 @@ export const MessageBubble = memo(function MessageBubble({
 								markdown
 								contentType="markdown"
 								blockIndex={realIndex}
+								streaming={isStreaming}
 							/>
 						);
 					}

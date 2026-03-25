@@ -105,13 +105,12 @@ export const TEXT_FILE_EXTENSIONS = new Set([
 /** Max text file upload size in bytes (10 MB). */
 export const MAX_TEXT_FILE_SIZE = 10 * 1024 * 1024;
 
-/** Check whether a filename is an allowed text/code file. */
-export function isTextFile(filename: string): boolean {
-	const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-	if (TEXT_FILE_EXTENSIONS.has(ext)) return true;
-	// Also match extensionless dotfiles like "Makefile", "Dockerfile"
-	const base = filename.split("/").pop() ?? filename;
-	return TEXT_FILE_EXTENSIONS.has(base.toLowerCase());
+/**
+ * Check whether a filename is an allowed text/code file.
+ * Accepts any file — the extension allowlist is kept only for display hints.
+ */
+export function isTextFile(_filename: string): boolean {
+	return true;
 }
 
 /** Format a byte size into a human-readable string (B / KB / MB). */

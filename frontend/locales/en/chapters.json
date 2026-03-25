@@ -55,6 +55,8 @@
 	"fastForwardDescription": "Target branch has no divergent commits. Merge will fast-forward without creating a merge commit.",
 	"conflictCheckFailed": "Conflict check failed",
 	"mergeFailed": "Merge failed",
+	"mergeDirtySource": "Source chapter has uncommitted changes. Please commit or stash them first.",
+	"mergeDirtyTarget": "Target chapter has uncommitted changes. Please commit or stash them first.",
 	"checkConflicts": "Check Conflicts",
 	"batchMergeTitle": "Batch Merge",
 	"batchMergeDescription": "Merge multiple source chapters into a target chapter. A temporary fork is created for the merge; all sources are merged sequentially.",

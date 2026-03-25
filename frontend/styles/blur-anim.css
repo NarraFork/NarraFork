@@ -22,10 +22,35 @@
 	will-change: opacity, filter, transform;
 }
 
+/*
+ * Streaming per-character blur-in.
+ * Applied to <span> wrappers injected by the streaming animation hook.
+ * Short duration + light blur to avoid jank at ~60fps streaming ticks.
+ */
+@keyframes nf-char-in {
+	0% {
+		opacity: 0;
+		filter: blur(4px);
+	}
+	100% {
+		opacity: 1;
+		filter: blur(0);
+	}
+}
+
+.nf-char-in {
+	animation: nf-char-in 180ms ease-out both;
+	will-change: opacity, filter;
+}
+
 @media (prefers-reduced-motion: reduce) {
 	:root[data-advanced-anim="true"] .nf-blur-in-enter {
 		animation: none;
 		filter: none;
 		transform: none;
+	}
+	.nf-char-in {
+		animation: none;
+		filter: none;
 	}
 }
