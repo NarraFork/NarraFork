@@ -1127,6 +1127,27 @@ export async function handlePermission(
 		}
 	}
 
+	// ExitPlanMode: reject early if plan content is still empty after all resolution attempts.
+	// This prevents the user from seeing an empty plan approval dialog.
+	// Include the correct plan file path so the model knows where to write.
+	if (toolName === "ExitPlanMode") {
+		const planValue = effectiveInput.plan;
+		const hasPlanContent = typeof planValue === "string" && planValue.trim().length > 0;
+		if (!hasPlanContent) {
+			const activePfId = activeNarrators.get(narratorId)?._planFileId;
+			const planFilePath = activePfId
+				? `.narrafork/plan-${activePfId}.md`
+				: ".narrafork/plan-<id>.md";
+			return {
+				behavior: "deny",
+				message: getToolMessageWithParams("exitPlanModeEmptyPlan", locale, {
+					planFile: planFilePath,
+				}),
+				rawMessage: true,
+			};
+		}
+	}
+
 	// Shell command pre-analysis (tree-sitter AST for bash, regex for PowerShell)
 	let bashAnalysis: BashAnalysis | undefined;
 	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {

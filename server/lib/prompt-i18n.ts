@@ -631,6 +631,11 @@ const toolMessages = {
 		en: "Error reading plan file: {error}",
 		"zh-CN": "读取计划文件时出错：{error}",
 	},
+	exitPlanModeEmptyPlan: {
+		en: "Error: The plan content is empty. You must provide a non-empty plan in the 'plan' parameter for the user to review. If you wrote the plan to a file, use the designated plan file path: {planFile} — then call ExitPlanMode again with the plan content in the 'plan' parameter, or write to that file and pass it via 'planFile'.",
+		"zh-CN":
+			"错误：计划内容为空。你必须在 'plan' 参数中提供非空的计划内容供用户审阅。如果你已将计划写入文件，请使用指定的计划文件路径：{planFile} — 然后再次调用 ExitPlanMode，在 'plan' 参数中传入计划内容，或将计划写入该文件后通过 'planFile' 传入。",
+	},
 	// Plan mode disabled tool description (injected in loop.ts)
 	planModeToolDisabled: {
 		en: "[PLAN MODE] This tool is disabled during plan mode. Focus on reading and analyzing code, then call ExitPlanMode with your plan.",
