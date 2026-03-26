@@ -255,7 +255,10 @@ function tryReclaimPort(targetPort: number): void {
 		}
 		if (pids.size === 0) return;
 
-		// Check if the PID belongs to a bun process before killing
+		// Check if the PID belongs to a bun/narrafork process before killing.
+		// The process name could be bun.exe (dev mode) or narrafork.exe (compiled
+		// binary) or any other name the user chose for the compiled output.
+		const KNOWN_PROCESS_NAMES = ["bun", "narrafork"];
 		for (const pid of pids) {
 			try {
 				const info = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
@@ -263,9 +266,9 @@ function tryReclaimPort(targetPort: number): void {
 					stderr: "ignore",
 				});
 				const infoStr = new TextDecoder().decode(info.stdout).toLowerCase();
-				if (!infoStr.includes("bun")) continue;
+				if (!KNOWN_PROCESS_NAMES.some((name) => infoStr.includes(name))) continue;
 
-				logger.warn(`Killing stale bun process (PID ${pid}) holding port ${targetPort}`);
+				logger.warn(`Killing stale process (PID ${pid}) holding port ${targetPort}`);
 				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
 					stdio: ["ignore", "ignore", "ignore"],
 				});
