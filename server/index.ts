@@ -229,6 +229,57 @@ if (isProd) {
 	}
 }
 
+// ── Windows: kill stale bun processes holding our port ──────────────────────
+// Bun on Windows has known issues where the port isn't released after a crash
+// or unclean shutdown (see oven-sh/bun#12127, #18003, #26049).  Before we try
+// to bind, check if a leftover bun.exe is still holding the port and kill it.
+function tryReclaimPort(targetPort: number): void {
+	if (!IS_WINDOWS) return;
+	try {
+		// netstat -ano gives lines like:
+		//   TCP    0.0.0.0:7779           0.0.0.0:0              LISTENING       12345
+		//   TCP    [::]:7779              [::]:0                 LISTENING       12345
+		const result = Bun.spawnSync(["netstat", "-ano"], { stdout: "pipe", stderr: "ignore" });
+		if (result.exitCode !== 0) return;
+		const output = new TextDecoder().decode(result.stdout);
+		const pids = new Set<number>();
+		for (const line of output.split("\n")) {
+			// Match lines with our port in LISTENING state
+			if (!line.includes("LISTENING")) continue;
+			// Match both 0.0.0.0:PORT and [::]:PORT and 127.0.0.1:PORT
+			const portPattern = new RegExp(`:${targetPort}\\s`);
+			if (!portPattern.test(line)) continue;
+			const parts = line.trim().split(/\s+/);
+			const pid = Number.parseInt(parts[parts.length - 1], 10);
+			if (pid > 0 && pid !== process.pid) pids.add(pid);
+		}
+		if (pids.size === 0) return;
+
+		// Check if the PID belongs to a bun process before killing
+		for (const pid of pids) {
+			try {
+				const info = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+					stdout: "pipe",
+					stderr: "ignore",
+				});
+				const infoStr = new TextDecoder().decode(info.stdout).toLowerCase();
+				if (!infoStr.includes("bun")) continue;
+
+				logger.warn(`Killing stale bun process (PID ${pid}) holding port ${targetPort}`);
+				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
+					stdio: ["ignore", "ignore", "ignore"],
+				});
+				// Brief pause to let the OS release the socket
+				Bun.sleepSync(300);
+			} catch {
+				// best effort
+			}
+		}
+	} catch {
+		// netstat/tasklist not available — skip silently
+	}
+}
+
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
 
@@ -304,6 +355,9 @@ function startServer(listenPort: number) {
 
 let actualPort = port;
 let _server: ReturnType<typeof startServer>;
+
+// On Windows, try to reclaim the port from stale bun processes before binding.
+tryReclaimPort(port);
 
 if (portExplicit) {
 	// User explicitly specified a port — fail hard if it's busy
