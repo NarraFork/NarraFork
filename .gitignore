@@ -21,3 +21,4 @@ scripts/
 .release.local.json
 mitm-dump/
 *-dump.json
+package-lock.json

@@ -27,6 +27,7 @@
 		"chardet": "^2.1.1",
 		"diff": "^8.0.3",
 		"drizzle-orm": "^0.44.7",
+		"flowtoken": "^1.0.40",
 		"gray-matter": "^4.0.3",
 		"hono": "^4.12.7",
 		"i18next": "^25.8.18",

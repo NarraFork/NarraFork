@@ -2529,6 +2529,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// outer container key changes, React mounts a fresh ToolCallCard whose
 	// initial status is already "success".  For non-truncated data this means
 	// the tool just finished, so we should still play the shimmer.
+	//
+	// Guard against narrator-switch remounts: when the user switches narrators
+	// all cards remount with prev=null.  We distinguish "just finished in the
+	// live stream" from "loaded from history / real-message replacement" by
+	// checking startedAt — only the live WS path sets it (via onToolStarted →
+	// mergeFieldsByIndex).  History loads and real-message replacements go
+	// through message-segments which leaves startedAt undefined for completed
+	// tools.  When startedAt IS present we additionally verify the tool
+	// finished less than 2 s ago to cover edge cases.
 	const isTruncated = hasTruncatedData(toolCall);
 	const prevStatusRef = useRef<string | null>(null);
 	const [doneShimmer, setDoneShimmer] = useState(false);
@@ -2536,13 +2545,26 @@ export const ToolCallCard = memo(function ToolCallCard({
 		const prev = prevStatusRef.current;
 		prevStatusRef.current = toolCall.status;
 		const wasRunning = prev === "running" || prev === "pending" || prev === "initializing";
-		const freshMount = prev === null && !isTruncated;
+		let freshMount = prev === null && !isTruncated;
+		if (freshMount) {
+			if (toolCall.startedAt == null) {
+				// No startedAt → loaded from history or real-message replacement,
+				// the shimmer was already played on the streaming card (if any).
+				freshMount = false;
+			} else if (toolCall.durationMs != null) {
+				// Has timing info — only shimmer if finished within the last 2 s.
+				const finishedAt = toolCall.startedAt + toolCall.durationMs;
+				if (Date.now() - finishedAt > 2000) {
+					freshMount = false;
+				}
+			}
+		}
 		if (toolCall.status === "success" && (wasRunning || freshMount)) {
 			setDoneShimmer(true);
 			const timer = setTimeout(() => setDoneShimmer(false), 650);
 			return () => clearTimeout(timer);
 		}
-	}, [toolCall.status, isTruncated]);
+	}, [toolCall.status, toolCall.startedAt, toolCall.durationMs, isTruncated]);
 	// Auto-expand: permission pending, todo tools, or edit tools.
 	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
 	// Denied ExitPlanMode defaults to collapsed — plan content is folded inside PlanDetail.

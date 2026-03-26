@@ -1516,7 +1516,7 @@ export function NarratorPanel({
 	useEffect(() => clearHighlightTimers, [clearHighlightTimers]);
 
 	const getStableRenderElementKey = useCallback(
-		(rawKey: string, targetIds: string[], pageKey?: string) => {
+		(rawKey: string, targetIds: string[], pageKey?: string, usedKeys?: Set<string>) => {
 			if (!rawKey.includes("tool-run-")) {
 				return pageKey ? `${pageKey}-${rawKey}` : rawKey;
 			}
@@ -1528,6 +1528,12 @@ export function NarratorPanel({
 			for (const targetId of targetIds) {
 				stableKey = stableToolRunKeyByTargetIdRef.current.get(targetId);
 				if (stableKey) break;
+			}
+			// If the found key is already used in this render batch (e.g. same msg.id
+			// produced multiple tool-run segments split by content blocks), allocate
+			// a fresh key to avoid duplicate React keys.
+			if (stableKey && usedKeys?.has(stableKey)) {
+				stableKey = undefined;
 			}
 			if (!stableKey) {
 				stableKey = `tool-run-stable-${nextStableToolRunKeyRef.current++}`;
@@ -1713,6 +1719,7 @@ export function NarratorPanel({
 		const allElements: React.ReactNode[] = [];
 		const allKeys: string[] = [];
 		const allTargets: string[][] = [];
+		const usedKeys = new Set<string>();
 
 		// Build a cache key object per page that includes all render-affecting props.
 		// We use the page reference as the primary cache key, but invalidate when
@@ -1754,7 +1761,9 @@ export function NarratorPanel({
 				for (let j = 0; j < cached.elements.length; j++) {
 					const targetIds = cached.targets[j] ?? [];
 					allElements.push(cached.elements[j]);
-					allKeys.push(getStableRenderElementKey(cached.keys[j], targetIds, pageKey));
+					const key = getStableRenderElementKey(cached.keys[j], targetIds, pageKey, usedKeys);
+					usedKeys.add(key);
+					allKeys.push(key);
 					allTargets.push(targetIds);
 				}
 				continue;
@@ -1791,7 +1800,9 @@ export function NarratorPanel({
 			for (let j = 0; j < result.elements.length; j++) {
 				const targetIds = result.targets[j] ?? [];
 				allElements.push(result.elements[j]);
-				allKeys.push(getStableRenderElementKey(result.keys[j], targetIds, pageKey));
+				const key = getStableRenderElementKey(result.keys[j], targetIds, pageKey, usedKeys);
+				usedKeys.add(key);
+				allKeys.push(key);
 				allTargets.push(targetIds);
 			}
 		}
