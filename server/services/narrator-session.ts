@@ -2288,6 +2288,7 @@ function triggerMidTurnCompact(
 		.getCompactBoundaryMessage(narratorId)
 		.then((boundaryMessageId) => {
 			if (!boundaryMessageId) {
+				logger.debug("No compact boundary found, aborting mid-turn compact", { narratorId });
 				if (compactLocks.get(narratorId) === placeholder) {
 					compactLocks.delete(narratorId);
 				}
@@ -2299,6 +2300,11 @@ function triggerMidTurnCompact(
 			if (compactLocks.get(narratorId) === placeholder) {
 				compactLocks.delete(narratorId);
 			}
+			logger.info("Starting runCustomCompact", {
+				narratorId,
+				boundaryMessageId,
+				hasLock: compactLocks.has(narratorId),
+			});
 			runCustomCompact(narratorId, locale, boundaryMessageId)
 				.then(() => {
 					onCompactDone?.();
@@ -2406,6 +2412,12 @@ export interface ContextManagementOptions {
 	setPruneBoundary: (id: string | null) => void;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
 	onCompactDone?: () => void;
+	/** Check whether a compact just finished and the next turn needs a full rebuild */
+	isCompactDone?: () => boolean;
+	/** Clear the compact-done flag after the rebuild has been applied */
+	clearCompactDone?: () => void;
+	/** Rebuild the system prompt with the latest contextSummary from DB */
+	rebuildSystemPrompt?: () => Promise<string | null>;
 }
 
 /**
@@ -2427,6 +2439,9 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		getPruneBoundary,
 		setPruneBoundary,
 		onCompactDone,
+		isCompactDone,
+		clearCompactDone,
+		rebuildSystemPrompt,
 	} = opts;
 
 	const onContextUsage = (percentage: number) => {
@@ -2525,6 +2540,28 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const onBeforeTurn = async () => {
+		// Check if a compact just finished — if so, force a full rebuild
+		// (history + system prompt) so the next API call uses compacted data.
+		// This takes priority over the prune-boundary check below because compact
+		// already clears the prune boundary and returns a fresh message set.
+		const compactJustDone = isCompactDone?.() ?? false;
+		if (compactJustDone) {
+			clearCompactDone?.();
+			// After compact, pruneBoundary is cleared — sync local cache
+			setPruneBoundary(null);
+			const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+			const msgs = isSubagentNarrator
+				? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
+				: rawMsgs;
+			const result = await buildHistory(msgs, getModel(), getProvider(), narratorId);
+			const systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
+			return {
+				history: result.history,
+				pendingToolResults: result.trailingToolResults,
+				systemPrompt,
+			};
+		}
+
 		const row = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { pruneBoundaryMessageId: true },
@@ -2640,6 +2677,7 @@ async function runAgentLoop(
 			};
 
 			// Build shared context management hooks (prune + compact)
+			let compactDoneFlag = false;
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
@@ -2654,6 +2692,30 @@ async function runAgentLoop(
 					if (s?.alive) {
 						s.conversationId = randomUUID();
 					}
+					compactDoneFlag = true;
+				},
+				isCompactDone: () => compactDoneFlag,
+				clearCompactDone: () => {
+					compactDoneFlag = false;
+				},
+				rebuildSystemPrompt: async () => {
+					const freshNarrator = await narratorService.getById(narratorId);
+					const { prompt } = await buildSystemPrompt(
+						{
+							systemPrompt: freshNarrator.systemPrompt,
+							contextSummary: freshNarrator.contextSummary,
+							todosJson: freshNarrator.todosJson,
+						},
+						active.cwd,
+						locale,
+						active._replyInUserLanguage ?? false,
+						freshNarrator.permissionMode === "plan",
+						active._planFileId,
+					);
+					// NOTE: Do NOT set active.systemPrompt here — the returned value
+					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
+					// Setting active.systemPrompt would create a second source of truth.
+					return prompt;
 				},
 			});
 

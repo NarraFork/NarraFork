@@ -284,6 +284,7 @@ export interface AgentConfig {
 	onBeforeTurn?: (turnIndex: number) => Promise<{
 		history: unknown[];
 		pendingToolResults: unknown[];
+		systemPrompt?: string;
 	} | null>;
 	/**
 	 * Called after tool execution to check if external code (e.g. onExitPlanMode)

@@ -448,6 +448,10 @@ export const api = {
 
 	// Settings
 	getSettings: () => request<ApiEntity>("/settings"),
+	getContextThresholds: (model: string, provider: string) =>
+		request<{ pruneStart: number; compactStart: number }>(
+			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
+		),
 	updateSettings: (data: Record<string, unknown>) =>
 		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
 

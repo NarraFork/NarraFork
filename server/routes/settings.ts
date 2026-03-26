@@ -9,6 +9,7 @@ import { logger } from "../lib/logger";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	getBuiltinCodexModels,
+	getContextThresholds,
 	type NarraForkSettings,
 	purgeStaleAgentModelRefs,
 	saveSettings,
@@ -367,6 +368,13 @@ settingsRoutes.get("/", (c) => {
 		summaryModelAvailable: checkSummaryModelAvailable(s.agent.summaryModel),
 	};
 	return c.json(result);
+});
+
+settingsRoutes.get("/context-thresholds", (c) => {
+	const model = c.req.query("model") ?? "";
+	const provider = c.req.query("provider") ?? "";
+	const thresholds = getContextThresholds(model, provider);
+	return c.json(thresholds);
 });
 
 settingsRoutes.patch("/", async (c) => {
