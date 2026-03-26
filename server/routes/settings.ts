@@ -116,6 +116,13 @@ const updateSettingsSchema = z
 						plan: z.string(),
 					})
 					.partial(),
+				subagentAllowedModels: z
+					.object({
+						explore: z.array(z.string()),
+						plan: z.array(z.string()),
+						general: z.array(z.string()),
+					})
+					.partial(),
 				legacyEncoding: z.boolean(),
 				translateReasoning: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),

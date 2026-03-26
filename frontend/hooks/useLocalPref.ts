@@ -31,15 +31,20 @@ function notify() {
 	for (const cb of listeners) cb();
 }
 
+/** Keys whose default value is `true` (opt-out instead of opt-in). */
+const DEFAULT_TRUE: ReadonlySet<Key> = new Set(["narrafork_advanced_anim"]);
+
 function getSnapshot(key: Key): boolean {
-	return localStorage.getItem(key) === "true";
+	const raw = localStorage.getItem(key);
+	if (raw === null) return DEFAULT_TRUE.has(key);
+	return raw === "true";
 }
 
 export function useLocalPref(key: Key): [boolean, (v: boolean) => void] {
 	const value = useSyncExternalStore(
 		subscribe,
 		() => getSnapshot(key),
-		() => false,
+		() => DEFAULT_TRUE.has(key),
 	);
 	const setValue = useCallback(
 		(v: boolean) => {

@@ -142,6 +142,7 @@ import {
 	PERM_MODES,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
+import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
 import { getGlobalCloseSwipe, setGlobalOnSelectionRange, setGlobalSwipeAnchor } from "./swipeState";
 import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
@@ -1854,6 +1855,26 @@ export function NarratorPanel({
 		return indexMap;
 	}, [finalTargets]);
 
+	// --- User message markers for scrollbar minimap ---
+	const userMessageMarkers = useMemo(() => {
+		if (!messagesData?.pages) return [];
+		const markers: { index: number; id: string }[] = [];
+		for (const page of messagesData.pages) {
+			for (const msg of page.messages ?? []) {
+				if (msg.role === "user" && msg.id) {
+					const idx = targetIndexMap.get(msg.id);
+					if (idx != null) markers.push({ index: idx, id: msg.id });
+				}
+			}
+		}
+		markers.sort((a, b) => a.index - b.index);
+		return markers;
+	}, [messagesData, targetIndexMap]);
+
+	const handleMarkerJump = useCallback((elementIndex: number) => {
+		virtualListRef.current?.scrollToIndex(elementIndex, { align: "center" });
+	}, []);
+
 	// --- Load older / newer ---
 	const handleLoadOlder = useCallback(async () => {
 		if (isFetchingNextPage) return;
@@ -2937,6 +2958,12 @@ export function NarratorPanel({
 								)}
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>
+						<ScrollbarUserMarkers
+							markers={userMessageMarkers}
+							totalCount={finalElements.length}
+							onJump={handleMarkerJump}
+							scrollContainerRef={viewportRef}
+						/>
 					</Box>
 
 					{/* Multi-select floating toolbar */}
