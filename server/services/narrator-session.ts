@@ -2293,6 +2293,12 @@ function triggerMidTurnCompact(
 				}
 				return;
 			}
+			// Release the placeholder lock before calling runCustomCompact,
+			// which sets its own lock. Otherwise runCustomCompact sees the
+			// placeholder and thinks a compact is already in progress.
+			if (compactLocks.get(narratorId) === placeholder) {
+				compactLocks.delete(narratorId);
+			}
 			runCustomCompact(narratorId, locale, boundaryMessageId)
 				.then(() => {
 					onCompactDone?.();
