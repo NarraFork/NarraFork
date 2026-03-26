@@ -70,6 +70,8 @@ interface NarratorWSCallbacks {
 		promptTokens?: number,
 		contextWindow?: number,
 		isEstimated?: boolean,
+		pruneStart?: number,
+		compactStart?: number,
 	) => void;
 	onPruneBoundary?: (boundaryMessageId: string | null, prunedPercent: number | null) => void;
 	onGitStatus?: (data: {
@@ -318,6 +320,8 @@ export function useNarratorWS(
 								data.promptTokens as number | undefined,
 								data.contextWindow as number | undefined,
 								data.isEstimated as boolean | undefined,
+								data.pruneStart as number | undefined,
+								data.compactStart as number | undefined,
 							);
 						}
 						break;

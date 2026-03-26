@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
-import { terminals } from "../../../db/schema";
+import { narrators, terminals } from "../../../db/schema";
 import { terminalService } from "../../../services/terminal-service";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -27,6 +27,51 @@ function extractPlainText(serialized: string): string {
 	let end = lines.length;
 	while (end > 0 && lines[end - 1].trim() === "") end--;
 	return lines.slice(0, end).join("\n");
+}
+
+/**
+ * Verify that the given narrator is allowed to access the terminal.
+ * A narrator can access a terminal if:
+ *   1. The terminal's narratorId matches, OR
+ *   2. The terminal's chapterId matches the narrator's chapterId.
+ */
+async function assertTerminalAccess(
+	terminalId: string,
+	narratorId: string,
+	cachedChapterId?: string,
+): Promise<
+	| { allowed: true; terminal: { id: string; name: string | null; status: string | null } }
+	| { allowed: false; error: string }
+> {
+	const terminal = await db.query.terminals.findFirst({
+		where: eq(terminals.id, terminalId),
+		columns: { id: true, name: true, status: true, narratorId: true, chapterId: true },
+	});
+	if (!terminal) {
+		return { allowed: false, error: `Terminal not found: ${terminalId}` };
+	}
+
+	// Direct narrator ownership
+	if (terminal.narratorId === narratorId) {
+		return { allowed: true, terminal };
+	}
+
+	// Chapter-level access: terminal belongs to the same chapter as the narrator
+	if (terminal.chapterId) {
+		// Use cached chapterId from ToolContext when available to avoid a DB lookup
+		const narratorChapterId = cachedChapterId ?? (await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true },
+		}))?.chapterId;
+		if (narratorChapterId && narratorChapterId === terminal.chapterId) {
+			return { allowed: true, terminal };
+		}
+	}
+
+	return {
+		allowed: false,
+		error: `Access denied: terminal ${terminalId} does not belong to this narrator or its chapter.`,
+	};
 }
 
 export const terminalTool: ToolDefinition = {
@@ -78,7 +123,7 @@ export const terminalTool: ToolDefinition = {
 				if (!terminal_id) {
 					return { output: "terminal_id is required for 'read' action", isError: true };
 				}
-				return await readBuffer(terminal_id, last_n_lines);
+				return await readBuffer(terminal_id, ctx.narratorId, ctx.chapterId, last_n_lines);
 			}
 			case "write": {
 				if (!terminal_id) {
@@ -87,7 +132,7 @@ export const terminalTool: ToolDefinition = {
 				if (input === undefined || input === null) {
 					return { output: "input is required for 'write' action", isError: true };
 				}
-				return await writeInput(terminal_id, input);
+				return await writeInput(terminal_id, ctx.narratorId, ctx.chapterId, input);
 			}
 			default:
 				return { output: `Unknown action: ${action}`, isError: true };
@@ -140,15 +185,17 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 	};
 }
 
-async function readBuffer(terminalId: string, lastNLines?: number): Promise<ToolResult> {
-	// Verify terminal exists
-	const terminal = await db.query.terminals.findFirst({
-		where: eq(terminals.id, terminalId),
-		columns: { id: true, name: true, status: true },
-	});
-	if (!terminal) {
-		return { output: `Terminal not found: ${terminalId}`, isError: true };
+async function readBuffer(
+	terminalId: string,
+	narratorId: string,
+	cachedChapterId?: string,
+	lastNLines?: number,
+): Promise<ToolResult> {
+	const access = await assertTerminalAccess(terminalId, narratorId, cachedChapterId);
+	if (!access.allowed) {
+		return { output: access.error, isError: true };
 	}
+	const { terminal } = access;
 
 	const scrollback = await terminalService.getScrollback(terminalId);
 	if (!scrollback) {
@@ -210,15 +257,18 @@ function tailSlice(text: string, maxLines: number, maxChars: number): string {
 	return result;
 }
 
-async function writeInput(terminalId: string, input: string): Promise<ToolResult> {
-	// Verify terminal exists and is running
-	const terminal = await db.query.terminals.findFirst({
-		where: eq(terminals.id, terminalId),
-		columns: { id: true, name: true, status: true },
-	});
-	if (!terminal) {
-		return { output: `Terminal not found: ${terminalId}`, isError: true };
+async function writeInput(
+	terminalId: string,
+	narratorId: string,
+	cachedChapterId: string | undefined,
+	input: string,
+): Promise<ToolResult> {
+	const access = await assertTerminalAccess(terminalId, narratorId, cachedChapterId);
+	if (!access.allowed) {
+		return { output: access.error, isError: true };
 	}
+	const { terminal } = access;
+
 	if (terminal.status === "exited") {
 		return { output: "Terminal has exited. Cannot send input.", isError: true };
 	}

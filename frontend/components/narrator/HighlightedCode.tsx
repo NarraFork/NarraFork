@@ -123,8 +123,8 @@ export const HighlightedCode = memo(function HighlightedCode({
 				style={{
 					...style,
 					whiteSpace: "pre-wrap",
-					wordBreak: "break-all",
-					overflowWrap: "anywhere",
+					wordBreak: "break-word",
+					overflowWrap: "break-word",
 				}}
 			>
 				{code}

@@ -1,12 +1,13 @@
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { users } from "../db/schema";
+import { narrators, users } from "../db/schema";
 import { AppError, formatZodError } from "../lib/errors";
 import { saveSettings, settings } from "../lib/settings";
 import { adminUpdateSettingsSchema, adminUpdateUserSchema } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 import { terminalService } from "../services/terminal-service";
+import { worktreeWatcher } from "../services/worktree-watcher";
 
 export const adminRoutes = new Hono();
 
@@ -152,4 +153,61 @@ adminRoutes.post("/terminals/reattach-orphan", async (c) => {
 	}
 	const terminal = await terminalService.reattachOrphan(terminalId);
 	return c.json(terminal);
+});
+
+// === Diagnostics ===
+
+adminRoutes.get("/diagnostics", async (c) => {
+	const cpuUsage = process.cpuUsage();
+	const memUsage = process.memoryUsage();
+
+	// Active narrators (thinking/waiting status)
+	const activeNarratorRows = await db.query.narrators.findMany({
+		where: eq(narrators.status, "thinking"),
+		columns: { id: true, status: true, chapterId: true },
+	});
+	const waitingNarratorRows = await db.query.narrators.findMany({
+		where: eq(narrators.status, "waiting"),
+		columns: { id: true, status: true, chapterId: true },
+	});
+
+	// Worktree watchers
+	const watcherPaths = worktreeWatcher.getActivePaths();
+
+	// Terminals
+	const allTerminals = await terminalService.listAll();
+	const runningTerminals = allTerminals.filter((t) => t.status === "running");
+
+	// Event loop lag: measure how long a setTimeout(0) takes to fire
+	const loopLagMs = await new Promise<number>((resolve) => {
+		const start = performance.now();
+		setTimeout(() => resolve(Math.round((performance.now() - start) * 100) / 100), 0);
+	});
+
+	return c.json({
+		timestamp: new Date().toISOString(),
+		uptime: Math.round(process.uptime()),
+		eventLoopLagMs: loopLagMs,
+		cpu: {
+			userMs: Math.round(cpuUsage.user / 1000),
+			systemMs: Math.round(cpuUsage.system / 1000),
+		},
+		memory: {
+			rss: memUsage.rss,
+			heapUsed: memUsage.heapUsed,
+			heapTotal: memUsage.heapTotal,
+		},
+		narrators: {
+			thinking: activeNarratorRows.length,
+			waiting: waitingNarratorRows.length,
+		},
+		worktreeWatchers: {
+			count: worktreeWatcher.getActiveCount(),
+			paths: watcherPaths,
+		},
+		terminals: {
+			total: allTerminals.length,
+			running: runningTerminals.length,
+		},
+	});
 });

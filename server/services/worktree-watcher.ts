@@ -12,22 +12,90 @@ const DEBOUNCE_MS = 1500;
 
 /**
  * Patterns to ignore when receiving fs.watch events.
- * These fire constantly during git operations, builds, etc.
+ * These fire constantly during git operations, builds, package installs, etc.
+ * On Linux, fs.watch({ recursive: true }) uses inotify which still delivers
+ * events for these directories — the callback filters them, but the kernel
+ * overhead of dispatching thousands of events per second can saturate a CPU core.
+ * Keep this list comprehensive to minimize wasted event processing.
  */
 const IGNORE_PATTERNS = [
 	".git",
 	"node_modules",
 	".next",
 	"dist",
+	"build",
+	"out",
 	"__pycache__",
+	".cache",
+	".parcel-cache",
+	".turbo",
+	".nuxt",
+	".output",
+	".svelte-kit",
+	"target",
+	".venv",
+	"venv",
+	"vendor",
+	".gradle",
+	".idea",
+	".vscode",
 	".DS_Store",
 	"Thumbs.db",
+	"coverage",
+	".nyc_output",
+	".pytest_cache",
+	".mypy_cache",
+	".ruff_cache",
+	".tox",
+	"*.swp",
+	"*.swo",
 ];
+
+/** Patterns matched by exact filename (no path prefix check needed). */
+const IGNORE_EXACT = new Set([".DS_Store", "Thumbs.db"]);
+
+/** Patterns matched by extension (glob-like entries starting with *). */
+const IGNORE_EXTENSIONS: string[] = [];
+
+/** Patterns matched by directory prefix. */
+const IGNORE_DIRS: string[] = [];
+
+// Pre-partition patterns for faster matching
+for (const p of IGNORE_PATTERNS) {
+	if (p.startsWith("*.")) {
+		IGNORE_EXTENSIONS.push(p.slice(1)); // e.g. ".swp"
+	} else if (!IGNORE_EXACT.has(p)) {
+		IGNORE_DIRS.push(p);
+	}
+}
 
 function shouldIgnore(filename: string | null): boolean {
 	if (!filename) return true;
 	const fwd = toForwardSlash(filename);
-	return IGNORE_PATTERNS.some((p) => fwd === p || fwd.startsWith(`${p}/`));
+	if (IGNORE_EXACT.has(fwd)) return true;
+	for (const ext of IGNORE_EXTENSIONS) {
+		if (fwd.endsWith(ext)) return true;
+	}
+	for (const dir of IGNORE_DIRS) {
+		if (fwd === dir || fwd.startsWith(`${dir}/`)) return true;
+	}
+	return false;
+}
+
+/**
+ * Rate limiter: tracks event count in a sliding window.
+ * When the rate exceeds the threshold, events are suppressed until the window resets.
+ */
+const RATE_WINDOW_MS = 2000;
+const RATE_LIMIT = 200; // max events per window before suppression
+
+interface RateLimitState {
+	/** Timestamp of the current window start. */
+	windowStart: number;
+	/** Number of events in the current window. */
+	count: number;
+	/** Whether we've already logged a warning for this suppression burst. */
+	warned: boolean;
 }
 
 interface WatcherEntry {
@@ -40,10 +108,30 @@ interface WatcherEntry {
 	debounceTimer?: ReturnType<typeof setTimeout>;
 	/** Last known HEAD SHA — used to detect new commits. */
 	lastHeadSha?: string;
+	/** Rate limiter state for this watcher. */
+	rateLimit: RateLimitState;
 }
 
 export const worktreeWatcher = {
 	_entries: new Map<string, WatcherEntry>(),
+
+	/** Get the number of active watchers (for diagnostics). */
+	getActiveCount(): number {
+		return this._entries.size;
+	},
+
+	/** Get active watcher paths and their narrator counts (for diagnostics). */
+	getActivePaths(): Array<{ path: string; chapterId: string; narratorCount: number }> {
+		const result: Array<{ path: string; chapterId: string; narratorCount: number }> = [];
+		for (const [path, entry] of this._entries) {
+			result.push({
+				path,
+				chapterId: entry.chapterId,
+				narratorCount: entry.narratorIds.size,
+			});
+		}
+		return result;
+	},
 
 	/**
 	 * Start watching a worktree directory for file changes.
@@ -81,6 +169,7 @@ export const worktreeWatcher = {
 				chapterId,
 				narratorIds: new Set([narratorId]),
 				locale,
+				rateLimit: { windowStart: Date.now(), count: 0, warned: false },
 			};
 
 			this._entries.set(worktreePath, entry);
@@ -95,7 +184,12 @@ export const worktreeWatcher = {
 				})
 				.catch(() => {});
 
-			logger.info("Worktree watcher started", { worktreePath, chapterId, narratorId });
+			logger.info("Worktree watcher started", {
+				worktreePath,
+				chapterId,
+				narratorId,
+				activeWatchers: this._entries.size,
+			});
 		} catch (err) {
 			logger.warn("Failed to start worktree watcher", {
 				worktreePath,
@@ -115,7 +209,10 @@ export const worktreeWatcher = {
 		entry.narratorIds.delete(narratorId);
 		if (entry.narratorIds.size === 0) {
 			this._removeEntry(worktreePath);
-			logger.info("Worktree watcher stopped (no narrators left)", { worktreePath });
+			logger.info("Worktree watcher stopped (no narrators left)", {
+				worktreePath,
+				activeWatchers: this._entries.size,
+			});
 		} else {
 			logger.debug("Worktree watcher: narrator removed", {
 				worktreePath,
@@ -131,22 +228,53 @@ export const worktreeWatcher = {
 	unwatchAll(worktreePath: string): void {
 		if (this._entries.has(worktreePath)) {
 			this._removeEntry(worktreePath);
-			logger.info("Worktree watcher force-stopped", { worktreePath });
+			logger.info("Worktree watcher force-stopped", {
+				worktreePath,
+				activeWatchers: this._entries.size,
+			});
 		}
 	},
 
-	/** Shut down all watchers (server shutdown). */
+	/** Shut down all watchers (server shutdown or startup recovery). */
 	shutdown(): void {
+		const count = this._entries.size;
 		for (const [path] of this._entries) {
 			this._removeEntry(path);
 		}
-		logger.info("All worktree watchers shut down");
+		if (count > 0) {
+			logger.info("All worktree watchers shut down", { count });
+		}
 	},
 
-	/** Internal: debounced handler for file change events. */
+	/** Internal: debounced handler for file change events with rate limiting. */
 	_onFileChange(worktreePath: string): void {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
+
+		// Rate limiting: suppress excessive events to prevent CPU saturation.
+		// On Linux, fs.watch({ recursive: true }) can fire thousands of inotify
+		// events per second during builds/installs even for ignored directories,
+		// because the kernel delivers events before our JS callback can filter them.
+		const now = Date.now();
+		const rl = entry.rateLimit;
+		if (now - rl.windowStart > RATE_WINDOW_MS) {
+			// Reset window
+			rl.windowStart = now;
+			rl.count = 0;
+			rl.warned = false;
+		}
+		rl.count++;
+		if (rl.count > RATE_LIMIT) {
+			if (!rl.warned) {
+				rl.warned = true;
+				logger.warn("Worktree watcher rate limit exceeded, suppressing events", {
+					worktreePath,
+					eventsInWindow: rl.count,
+					windowMs: RATE_WINDOW_MS,
+				});
+			}
+			return;
+		}
 
 		if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
 		entry.debounceTimer = setTimeout(() => {

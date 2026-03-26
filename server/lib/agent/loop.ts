@@ -797,7 +797,20 @@ export async function* agentLoop(
 				}
 				if (parsed.contextUsagePercentage != null) {
 					receivedUsage = true;
-					yield { type: "context_usage", percentage: parsed.contextUsagePercentage };
+					// Estimate token count from conversation content (char-based heuristic)
+					const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
+					const estimatedPromptTokens =
+						estimateTokens(JSON.stringify(history)) +
+						estimateTokens(config.systemPrompt ?? "") +
+						estimateTokens(content) +
+						estimateTokens(assistantText);
+					yield {
+						type: "context_usage",
+						percentage: parsed.contextUsagePercentage,
+						promptTokens: estimatedPromptTokens,
+						contextWindow: ctxWin ?? undefined,
+						isEstimated: true,
+					};
 				}
 				if (parsed.metering) {
 					yield {
@@ -1529,6 +1542,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		cwd: config.cwd,
 		signal: config.signal,
 		locale: config.locale ?? "en",
+		chapterId: config.chapterId,
 		planFileId: config.planFileId,
 		skillRoot: config.skillRoot,
 		requestPermission: config.permissionHandler,

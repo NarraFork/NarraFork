@@ -107,6 +107,8 @@ export type NarratorServerMessage =
 			isSubagent?: boolean;
 			promptTokens?: number;
 			contextWindow?: number;
+			pruneStart?: number;
+			compactStart?: number;
 	  }
 	| {
 			type: "prune_boundary";

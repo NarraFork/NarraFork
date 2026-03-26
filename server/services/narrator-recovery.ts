@@ -10,10 +10,10 @@ import { randomUUID } from "node:crypto";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { settings } from "../lib/settings";
+import { getContextThresholds, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
-import { COMPACT_CONTEXT_USAGE_PCT, runCustomCompact } from "./narrator-session";
+import { runCustomCompact } from "./narrator-session";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -62,11 +62,12 @@ export async function handleContextOverflow(opts: {
 	narratorId: string;
 	locale: Locale;
 	provider: string;
+	model: string;
 	overflowRetries: number;
 	maxRetries: number;
 	onBroadcast?: (event: Record<string, unknown>) => void;
 }): Promise<OverflowResult> {
-	const { narratorId, locale, provider, onBroadcast } = opts;
+	const { narratorId, locale, provider, model, onBroadcast } = opts;
 	let { overflowRetries } = opts;
 
 	overflowRetries++;
@@ -87,9 +88,11 @@ export async function handleContextOverflow(opts: {
 	if (provider === "codex" && overflowRetries === 1) {
 		try {
 			const before = await narratorService.getById(narratorId);
+			const thresholds = getContextThresholds(model, provider);
 			const pruneResult = await narratorService.computeAndUpdatePruneBoundary(
 				narratorId,
-				COMPACT_CONTEXT_USAGE_PCT,
+				thresholds.compactStart,
+				thresholds,
 			);
 
 			if (pruneResult) {

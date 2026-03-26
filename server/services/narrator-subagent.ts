@@ -490,6 +490,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				narratorId,
 				locale: locale as Locale,
 				provider: resolvedProvider,
+				model,
 				overflowRetries,
 				maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
 			});

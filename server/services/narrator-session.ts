@@ -33,6 +33,7 @@ import { getHome } from "../lib/platform";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
+	getContextThresholds,
 	isAnthropicProvider,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
@@ -2262,11 +2263,8 @@ async function createNarrator(
 
 // === Agent loop execution ===
 
-/** Trigger compact when context usage exceeds this percentage (0–100). */
-export const COMPACT_CONTEXT_USAGE_PCT = 99;
-
 /**
- * Minimum prunedPercent required before compact is allowed at the COMPACT_CONTEXT_USAGE_PCT
+ * Minimum prunedPercent required before compact is allowed at the compactStart
  * threshold. If prunedPercent is below this value, the system continues pruning instead of
  * compacting — giving prune more room to reclaim context before resorting to the heavier
  * compact operation.
@@ -2426,11 +2424,17 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	} = opts;
 
 	const onContextUsage = (percentage: number) => {
-		// Dynamic pruning: 95–98%
-		if (percentage >= 95 && percentage < COMPACT_CONTEXT_USAGE_PCT && !pruneLocks.has(narratorId)) {
+		const thresholds = getContextThresholds(getModel(), getProvider());
+
+		// Dynamic pruning: pruneStart – (compactStart - 1)%
+		if (
+			percentage >= thresholds.pruneStart &&
+			percentage < thresholds.compactStart &&
+			!pruneLocks.has(narratorId)
+		) {
 			pruneLocks.add(narratorId);
 			narratorService
-				.computeAndUpdatePruneBoundary(narratorId, percentage)
+				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
 				.then((result) => {
 					broadcastToNarrator(narratorId, {
 						type: "prune_boundary",
@@ -2451,16 +2455,16 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 				});
 		}
 
-		// ≥ 99%: check prunedPercent before deciding compact vs continued prune.
+		// ≥ compactStart%: check prunedPercent before deciding compact vs continued prune.
 		// If prunedPercent < 80%, there's still room to prune further — skip compact.
 		if (
-			percentage >= COMPACT_CONTEXT_USAGE_PCT &&
+			percentage >= thresholds.compactStart &&
 			!pruneLocks.has(narratorId) &&
 			!compactLocks.has(narratorId)
 		) {
 			pruneLocks.add(narratorId);
 			narratorService
-				.computeAndUpdatePruneBoundary(narratorId, percentage)
+				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
 				.then((result) => {
 					broadcastToNarrator(narratorId, {
 						type: "prune_boundary",
@@ -2470,12 +2474,15 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 					});
 					const prunedPct = result?.prunedPercent ?? 0;
 					if (prunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
-						logger.info("Context ≥99% but prunedPercent below threshold, continuing prune", {
-							narratorId,
-							contextPct: percentage,
-							prunedPercent: prunedPct,
-							threshold: COMPACT_PRUNE_THRESHOLD_PCT,
-						});
+						logger.info(
+							"Context above compactStart but prunedPercent below threshold, continuing prune",
+							{
+								narratorId,
+								contextPct: percentage,
+								prunedPercent: prunedPct,
+								threshold: COMPACT_PRUNE_THRESHOLD_PCT,
+							},
+						);
 						return; // stay in prune mode — don't compact yet
 					}
 					// prunedPercent ≥ 80%: prune is exhausted, proceed to compact
@@ -2951,6 +2958,7 @@ async function runAgentLoop(
 				systemPrompt: active.systemPrompt ?? undefined,
 				locale,
 				signal: active.abortController.signal,
+				chapterId: active._chapterId,
 				planMode: freshNarrator.permissionMode === "plan",
 				relaxedPlan: !!freshNarrator.relaxedPlan,
 				planFileId: active._planFileId,
@@ -3072,6 +3080,7 @@ async function runAgentLoop(
 					narratorId,
 					locale,
 					provider: active.provider,
+					model: active.model,
 					overflowRetries: contextOverflowRetries,
 					maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
 					onBroadcast(event) {
@@ -3296,9 +3305,11 @@ async function runAgentLoop(
 			// This is a fallback — the mid-turn compact in the context_usage handler
 			// may have already started a background compact.
 			// Before compacting, check prunedPercent: if < 80%, continue pruning instead.
+			const { model: postModel, provider: postProvider } = resolveProviderAndModel(active.model);
+			const postTurnThresholds = getContextThresholds(postModel, postProvider);
 			if (
 				active._contextUsagePct != null &&
-				active._contextUsagePct >= COMPACT_CONTEXT_USAGE_PCT &&
+				active._contextUsagePct >= postTurnThresholds.compactStart &&
 				!compactLocks.has(narratorId)
 			) {
 				active._contextUsagePct = undefined;
@@ -3312,7 +3323,7 @@ async function runAgentLoop(
 
 				if (currentPrunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
 					logger.info(
-						"Context ≥99% post-turn but prunedPercent below threshold, skipping compact",
+						"Context above compactStart post-turn but prunedPercent below threshold, skipping compact",
 						{
 							narratorId,
 							prunedPercent: currentPrunedPct,
@@ -4780,6 +4791,11 @@ export async function recoverOnStartup(): Promise<void> {
 	}
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
 	(globalThis as any)[HOT_RELOAD_GUARD] = true;
+
+	// Clean up any residual worktree watchers from a previous server run.
+	// On restart (or hot reload), old fs.watch handles may leak if the previous
+	// process didn't shut down cleanly, causing phantom CPU usage from inotify.
+	worktreeWatcher.shutdown();
 
 	const now = new Date().toISOString();
 	const migrations = [

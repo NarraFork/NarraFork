@@ -146,7 +146,7 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 				return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
 			}
 			return (
-				<Code fz="xs" style={{ overflowWrap: "anywhere", wordBreak: "break-all" }}>
+				<Code fz="xs" style={{ wordBreak: "break-word", overflowWrap: "break-word" }}>
 					{children}
 				</Code>
 			);

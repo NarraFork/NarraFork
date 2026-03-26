@@ -10,6 +10,8 @@
 	"compactSummaryTitle": "压缩摘要",
 	"triggerCompact": "立即压缩",
 	"clearContext": "清空上下文",
+	"thresholdSettings": "阈值设置",
+	"activeThresholds": "裁剪 {{prune}}% · 压缩 {{compact}}%",
 	"deleteCompact": "撤回压缩",
 	"editCompact": "编辑",
 	"cancelEdit": "取消",

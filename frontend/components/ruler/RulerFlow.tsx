@@ -3081,8 +3081,11 @@ function NarratorPanelOverlay({
 
 	const isCurrentlyResizing = isResizingRef.current || resizeDelta.dw !== 0 || resizeDelta.dh !== 0;
 
-	// Panel scales 1:1 with the camera — no damping
-	const panelScale = 1;
+	// Panel is rendered via CSS transform: scale(cam.scale), so mouse deltas
+	// must be divided by the camera scale to convert screen-px → world-px.
+	const panelScale = _scale;
+	const panelScaleRef = useRef(panelScale);
+	panelScaleRef.current = panelScale;
 
 	// Prevent wheel events inside the panel from bubbling to the canvas,
 	// EXCEPT when Ctrl/Meta is held — forward those to the canvas for zoom.
@@ -3132,9 +3135,9 @@ function NarratorPanelOverlay({
 		isResizingRef.current = true;
 		resizeStartRef.current = { x: e.clientX, y: e.clientY, origW: panelW, origH: panelH, corner };
 
-		const ps = panelScale;
 		const handleMove = (ev: PointerEvent) => {
 			if (!isResizingRef.current) return;
+			const ps = panelScaleRef.current ?? 1;
 			const rawDx = (ev.clientX - resizeStartRef.current.x) / ps;
 			const rawDy = (ev.clientY - resizeStartRef.current.y) / ps;
 			const c = resizeStartRef.current.corner;
@@ -3156,8 +3159,10 @@ function NarratorPanelOverlay({
 			const clampedH = Math.max(MIN_PANEL_HEIGHT, resizeStartRef.current.origH + dh);
 			const actualDw = clampedW - resizeStartRef.current.origW;
 			const actualDh = clampedH - resizeStartRef.current.origH;
-			if (c.includes("l")) dx = -actualDw;
-			if (c.includes("t")) dy = -actualDh;
+			// dx/dy are screen-space offsets (added to fixed-position left/top),
+			// so multiply world-space deltas by the panel's CSS scale.
+			if (c.includes("l")) dx = -actualDw * ps;
+			if (c.includes("t")) dy = -actualDh * ps;
 			setResizeDelta({ dw: actualDw, dh: actualDh, dx, dy });
 		};
 		const handleUp = () => {

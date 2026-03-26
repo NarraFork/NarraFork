@@ -11,8 +11,8 @@
 		font-size: 11px;
 		line-height: 1.55;
 		white-space: pre-wrap;
-		word-break: break-all;
-		overflow-wrap: anywhere;
+		word-break: break-word;
+		overflow-wrap: break-word;
 		tab-size: 4;
 		/* Override shiki's inline background-color on <pre> */
 		background: transparent;

@@ -215,6 +215,16 @@ export interface NarraForkSettings {
 			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
 			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
 		};
+		/**
+		 * Context window management thresholds (percentage, 0–100).
+		 * Split by model context window size: standard (≤600k) vs large (>600k).
+		 * - pruneStart: begin progressive message pruning at this percentage
+		 * - compactStart: trigger context compaction at this percentage
+		 */
+		contextThresholds?: {
+			standard: { pruneStart: number; compactStart: number };
+			large: { pruneStart: number; compactStart: number };
+		};
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -1064,6 +1074,32 @@ export function getModelContextWindow(model: string, provider: string): number |
 
 	// 4. Unknown model — return default 128k (conservative estimate)
 	return 128_000;
+}
+
+/** Threshold above which a model is considered "large context". */
+export const LARGE_CONTEXT_BOUNDARY = 600_000;
+
+export const DEFAULT_CONTEXT_THRESHOLDS = {
+	standard: { pruneStart: 95, compactStart: 99 },
+	large: { pruneStart: 95, compactStart: 99 },
+};
+
+/**
+ * Get the prune/compact thresholds for a model based on its context window size.
+ * Models with context window > 600k use the "large" thresholds; others use "standard".
+ */
+export function getContextThresholds(
+	model: string,
+	provider: string,
+): { pruneStart: number; compactStart: number } {
+	const ctxWin = getModelContextWindow(model, provider) ?? 128_000;
+	const tier = ctxWin > LARGE_CONTEXT_BOUNDARY ? "large" : "standard";
+	const userThresholds = settings.agent.contextThresholds;
+	const cfg = userThresholds?.[tier] ?? DEFAULT_CONTEXT_THRESHOLDS[tier];
+	return {
+		pruneStart: cfg.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
+		compactStart: cfg.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
+	};
 }
 
 /**

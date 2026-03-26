@@ -43,6 +43,7 @@ import {
 	IconPaperclip,
 	IconPencil,
 	IconPhoto,
+	IconSettings,
 	IconShield,
 	IconSparkles,
 	IconTerminal,
@@ -1118,6 +1119,8 @@ export function NarratorPanel({
 		promptTokens,
 		contextWindow,
 		isEstimated,
+		activePruneStart,
+		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
 		retryInfo,
@@ -3472,14 +3475,33 @@ export function NarratorPanel({
 										</Box>
 									</Menu.Target>
 									<Menu.Dropdown>
+										{activePruneStart != null && activeCompactStart != null && (
+											<Menu.Label c="dimmed" fz={10}>
+												{t("activeThresholds", {
+													prune: activePruneStart,
+													compact: activeCompactStart,
+												})}
+											</Menu.Label>
+										)}
+										<Menu.Item
+											leftSection={<IconSettings size={14} />}
+											c="dimmed"
+											fz="xs"
+											onClick={() =>
+												navigate({
+													to: "/settings",
+													search: { section: "agent", scrollTo: "contextThresholds" },
+												})
+											}
+										>
+											{t("thresholdSettings")}
+										</Menu.Item>
+										<Menu.Divider />
 										{prunedPercent != null && (
 											<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
 										)}
 										<Menu.Label>
 											{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-											{isEstimated && (
-												<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
-											)}
 										</Menu.Label>
 										{promptTokens != null && (
 											<Menu.Label>

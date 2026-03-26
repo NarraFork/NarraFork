@@ -34,6 +34,14 @@ export interface AgentSectionProps {
 	setSmartInterruptionCheck: (v: boolean) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	contextThresholds: {
+		standard: { pruneStart: number; compactStart: number };
+		large: { pruneStart: number; compactStart: number };
+	};
+	setContextThresholds: (v: {
+		standard: { pruneStart: number; compactStart: number };
+		large: { pruneStart: number; compactStart: number };
+	}) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -157,6 +165,91 @@ export function AgentSection(props: AgentSectionProps) {
 				min={-1}
 				max={100}
 			/>
+			{/* Context Thresholds */}
+			<Title order={5} mt="sm" id="contextThresholds">
+				{t("contextThresholds")}
+			</Title>
+			<Text size="xs" c="dimmed">
+				{t("contextThresholdsDesc")}
+			</Text>
+			<Text size="sm" fw={500} mt={4}>
+				{t("contextThresholdsStandard")}
+			</Text>
+			<Group grow>
+				<NumberInput
+					label={t("pruneStart")}
+					description={t("pruneStartDesc")}
+					value={props.contextThresholds.standard.pruneStart}
+					onChange={(v) =>
+						props.setContextThresholds({
+							...props.contextThresholds,
+							standard: {
+								...props.contextThresholds.standard,
+								pruneStart: typeof v === "number" ? v : 95,
+							},
+						})
+					}
+					min={50}
+					max={100}
+					suffix="%"
+				/>
+				<NumberInput
+					label={t("compactStart")}
+					description={t("compactStartDesc")}
+					value={props.contextThresholds.standard.compactStart}
+					onChange={(v) =>
+						props.setContextThresholds({
+							...props.contextThresholds,
+							standard: {
+								...props.contextThresholds.standard,
+								compactStart: typeof v === "number" ? v : 99,
+							},
+						})
+					}
+					min={50}
+					max={100}
+					suffix="%"
+				/>
+			</Group>
+			<Text size="sm" fw={500} mt={4}>
+				{t("contextThresholdsLarge")}
+			</Text>
+			<Group grow>
+				<NumberInput
+					label={t("pruneStart")}
+					description={t("pruneStartDesc")}
+					value={props.contextThresholds.large.pruneStart}
+					onChange={(v) =>
+						props.setContextThresholds({
+							...props.contextThresholds,
+							large: {
+								...props.contextThresholds.large,
+								pruneStart: typeof v === "number" ? v : 95,
+							},
+						})
+					}
+					min={10}
+					max={100}
+					suffix="%"
+				/>
+				<NumberInput
+					label={t("compactStart")}
+					description={t("compactStartDesc")}
+					value={props.contextThresholds.large.compactStart}
+					onChange={(v) =>
+						props.setContextThresholds({
+							...props.contextThresholds,
+							large: {
+								...props.contextThresholds.large,
+								compactStart: typeof v === "number" ? v : 99,
+							},
+						})
+					}
+					min={10}
+					max={100}
+					suffix="%"
+				/>
+			</Group>
 			{/* Session */}
 			<Title order={5} mt="sm">
 				{t("sessionSubSection")}

@@ -49,9 +49,14 @@ const ALL_SECTIONS = [
 
 export const Route = createFileRoute("/settings/")({
 	component: SettingsPage,
+	validateSearch: (search: Record<string, unknown>) => ({
+		section: typeof search.section === "string" ? search.section : undefined,
+		scrollTo: typeof search.scrollTo === "string" ? search.scrollTo : undefined,
+	}),
 });
 
 function SettingsPage() {
+	const { section: urlSection, scrollTo: urlScrollTo } = Route.useSearch();
 	const { data: settings, isLoading } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -64,8 +69,12 @@ function SettingsPage() {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
 
-	// Accordion state — profile & about expanded by default
-	const [openSections, setOpenSections] = useState<string[]>(["profile", "about"]);
+	// Accordion state — profile & about expanded by default; URL section takes priority
+	const [openSections, setOpenSections] = useState<string[]>(() => {
+		const defaults = ["profile", "about"];
+		if (urlSection && !defaults.includes(urlSection)) defaults.push(urlSection);
+		return defaults;
+	});
 
 	// Version / health info
 	const { data: healthData } = useQuery({
@@ -194,6 +203,10 @@ function SettingsPage() {
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
 	const [smartInterruptionCheck, setSmartInterruptionCheck] = useState(true);
 	const [maxTransientRetries, setMaxTransientRetries] = useState(10);
+	const [contextThresholds, setContextThresholds] = useState({
+		standard: { pruneStart: 95, compactStart: 99 },
+		large: { pruneStart: 95, compactStart: 99 },
+	});
 	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
 	const [globalWhitelistDirs, setGlobalWhitelistDirs] = useState<
 		Array<{ path: string; accessLevel: string; enabled?: boolean }>
@@ -255,6 +268,10 @@ function SettingsPage() {
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
+		contextThresholds: {
+			standard: { pruneStart: 95, compactStart: 99 },
+			large: { pruneStart: 95, compactStart: 99 },
+		},
 		codexDefaultReasoningEffort: "high",
 		globalWhitelistDirs: [] as Array<{
 			path: string;
@@ -315,6 +332,10 @@ function SettingsPage() {
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
+				contextThresholds: settings.agent?.contextThresholds ?? {
+					standard: { pruneStart: 95, compactStart: 99 },
+					large: { pruneStart: 95, compactStart: 99 },
+				},
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
@@ -355,6 +376,7 @@ function SettingsPage() {
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
 			setSmartInterruptionCheck(snap.smartInterruptionCheck);
 			setMaxTransientRetries(snap.maxTransientRetries);
+			setContextThresholds(snap.contextThresholds);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
 			setGlobalWhitelistDirs(snap.globalWhitelistDirs);
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
@@ -401,6 +423,7 @@ function SettingsPage() {
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
 			smartInterruptionCheck !== s.smartInterruptionCheck ||
 			maxTransientRetries !== s.maxTransientRetries ||
+			JSON.stringify(contextThresholds) !== JSON.stringify(s.contextThresholds) ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort ||
 			JSON.stringify(globalWhitelistDirs) !== JSON.stringify(s.globalWhitelistDirs) ||
 			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
@@ -442,6 +465,7 @@ function SettingsPage() {
 		defaultRelaxedPlan,
 		smartInterruptionCheck,
 		maxTransientRetries,
+		contextThresholds,
 		codexDefaultReasoningEffort,
 		globalWhitelistDirs,
 		globalBlacklistDirs,
@@ -461,6 +485,16 @@ function SettingsPage() {
 		}
 		prevDirty.current = isDirty;
 	}, [isDirty]);
+
+	// Scroll to target element from URL search params (e.g. ?section=agent&scrollTo=contextThresholds)
+	useEffect(() => {
+		if (!urlScrollTo || !initialized) return;
+		const timer = setTimeout(() => {
+			const el = document.getElementById(urlScrollTo);
+			el?.scrollIntoView({ behavior: "smooth", block: "center" });
+		}, 300);
+		return () => clearTimeout(timer);
+	}, [urlScrollTo, initialized]);
 
 	// Models from central hook (must be before early returns)
 	const { groupedModels } = useAllModels();
@@ -498,6 +532,7 @@ function SettingsPage() {
 					defaultRelaxedPlan,
 					smartInterruptionCheck,
 					maxTransientRetries,
+					contextThresholds,
 					whitelistDirs: globalWhitelistDirs,
 					blacklistDirs: globalBlacklistDirs,
 					commandWhitelist: globalCommandWhitelist,
@@ -562,6 +597,7 @@ function SettingsPage() {
 						defaultRelaxedPlan,
 						smartInterruptionCheck,
 						maxTransientRetries,
+						contextThresholds,
 						codexDefaultReasoningEffort,
 						globalWhitelistDirs,
 						globalBlacklistDirs,
@@ -672,6 +708,8 @@ function SettingsPage() {
 							setSmartInterruptionCheck={setSmartInterruptionCheck}
 							maxTransientRetries={maxTransientRetries}
 							setMaxTransientRetries={setMaxTransientRetries}
+							contextThresholds={contextThresholds}
+							setContextThresholds={setContextThresholds}
 							globalWhitelistDirs={globalWhitelistDirs}
 							setGlobalWhitelistDirs={setGlobalWhitelistDirs}
 							globalBlacklistDirs={globalBlacklistDirs}

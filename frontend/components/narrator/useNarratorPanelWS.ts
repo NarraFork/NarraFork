@@ -102,6 +102,8 @@ export interface UseNarratorPanelWSReturn {
 	promptTokens: number | null;
 	contextWindow: number | null;
 	isEstimated: boolean;
+	activePruneStart: number | null;
+	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
 	// Retry
@@ -282,6 +284,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
 	const [isEstimated, setIsEstimated] = useState(false);
+	const [activePruneStart, setActivePruneStart] = useState<number | null>(null);
+	const [activeCompactStart, setActiveCompactStart] = useState<number | null>(null);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 	);
@@ -1223,11 +1227,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, relaxedPlan } : old,
 				);
 			},
-			onContextUsage: (percentage, promptTokens, contextWindow, isEst) => {
+			onContextUsage: (
+				percentage,
+				promptTokens,
+				contextWindow,
+				isEst,
+				pruneStart,
+				compactStart,
+			) => {
 				setContextPercent(percentage);
 				setPromptTokens(promptTokens ?? null);
 				setContextWindow(contextWindow ?? null);
 				setIsEstimated(!!isEst);
+				setActivePruneStart(pruneStart ?? null);
+				setActiveCompactStart(compactStart ?? null);
 			},
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				setPruneBoundaryMessageId(boundaryMessageId);
@@ -1726,6 +1739,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		promptTokens,
 		contextWindow,
 		isEstimated,
+		activePruneStart,
+		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
 		retryInfo,

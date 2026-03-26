@@ -10,6 +10,8 @@
 	"compactSummaryTitle": "Compact Summary",
 	"triggerCompact": "Compact now",
 	"clearContext": "Clear context",
+	"thresholdSettings": "Threshold settings",
+	"activeThresholds": "Prune {{prune}}% · Compact {{compact}}%",
 	"deleteCompact": "Undo compact",
 	"editCompact": "Edit",
 	"cancelEdit": "Cancel",

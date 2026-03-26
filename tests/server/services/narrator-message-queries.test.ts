@@ -185,7 +185,10 @@ describe("narratorService message query regressions", () => {
 			contentText: "sub asst 2",
 		});
 
-		const prune = await narratorService.computeAndUpdatePruneBoundary("n-sub", 99);
+		const prune = await narratorService.computeAndUpdatePruneBoundary("n-sub", 99, {
+			pruneStart: 95,
+			compactStart: 99,
+		});
 		expect(prune).not.toBeNull();
 		expect(prune?.boundaryMessageId).toBe("s-m0");
 		expect(prune?.prunedPercent).toBe(17);

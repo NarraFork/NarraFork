@@ -133,6 +133,18 @@ const updateSettingsSchema = z
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
 				commandBlacklist: z.array(commandBlacklistEntrySchema).max(50),
+				contextThresholds: z
+					.object({
+						standard: z.object({
+							pruneStart: z.number().min(50).max(100),
+							compactStart: z.number().min(50).max(100),
+						}),
+						large: z.object({
+							pruneStart: z.number().min(10).max(100),
+							compactStart: z.number().min(10).max(100),
+						}),
+					})
+					.optional(),
 			})
 			.partial()
 			.optional(),

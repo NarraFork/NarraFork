@@ -3333,9 +3333,10 @@ export const narratorService = {
 	async computeAndUpdatePruneBoundary(
 		narratorId: string,
 		contextPct: number,
+		thresholds: { pruneStart: number; compactStart: number },
 	): Promise<{ boundaryMessageId: string; prunedPercent: number } | null> {
-		const PRUNE_START = 95;
-		const PRUNE_END = 99;
+		const PRUNE_START = thresholds.pruneStart;
+		const PRUNE_END = thresholds.compactStart;
 
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),

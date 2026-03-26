@@ -7,7 +7,7 @@ import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { settings } from "../lib/settings";
+import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import {
 	enrichToolUseBlocks,
@@ -799,6 +799,12 @@ export async function processEvent(
 				...(event.isEstimated && { isEstimated: true }),
 			});
 
+			// Resolve active thresholds based on context window size
+			const ctxWin = event.contextWindow ?? 128_000;
+			const tier = ctxWin > LARGE_CONTEXT_BOUNDARY ? "large" : "standard";
+			const activeThresholds =
+				settings.agent.contextThresholds?.[tier] ?? DEFAULT_CONTEXT_THRESHOLDS[tier];
+
 			const isSubagent = !!ctx.parentToolUseId;
 			dualBroadcast(ctx, {
 				type: "context_usage",
@@ -808,6 +814,9 @@ export async function processEvent(
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
 				...(event.isEstimated && { isEstimated: true }),
 				...(isSubagent && { isSubagent: true }),
+				pruneStart: activeThresholds.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
+				compactStart:
+					activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "context_usage",
@@ -816,6 +825,9 @@ export async function processEvent(
 					...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 					...(event.contextWindow != null && { contextWindow: event.contextWindow }),
 					...(event.isEstimated && { isEstimated: true }),
+					pruneStart: activeThresholds.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
+					compactStart:
+						activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 				},
 			});
 

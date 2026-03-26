@@ -24,6 +24,8 @@ export interface ToolContext {
 	signal: AbortSignal;
 	/** Locale for i18n of tool outputs */
 	locale: string;
+	/** Chapter ID the narrator belongs to (cached to avoid repeated DB lookups) */
+	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
@@ -250,6 +252,8 @@ export interface AgentConfig {
 	systemPrompt?: string;
 	locale?: string;
 	signal: AbortSignal;
+	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
+	chapterId?: string;
 	maxTurns?: number;
 	planMode?: boolean;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
