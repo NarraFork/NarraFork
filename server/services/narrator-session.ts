@@ -2457,6 +2457,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 
 		// ≥ compactStart%: check prunedPercent before deciding compact vs continued prune.
 		// If prunedPercent < 80%, there's still room to prune further — skip compact.
+		// Exception: when pruning is disabled for this narrator, skip the prune gate
+		// and compact immediately (otherwise compact would never trigger).
 		if (
 			percentage >= thresholds.compactStart &&
 			!pruneLocks.has(narratorId) &&
@@ -2465,13 +2467,28 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			pruneLocks.add(narratorId);
 			narratorService
 				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
-				.then((result) => {
+				.then(async (result) => {
 					broadcastToNarrator(narratorId, {
 						type: "prune_boundary",
 						narratorId,
 						boundaryMessageId: result?.boundaryMessageId ?? null,
 						prunedPercent: result?.prunedPercent ?? null,
 					});
+
+					// If prune returned null (e.g. pruning disabled), check the DB flag
+					// to decide whether to skip the prune gate entirely.
+					if (result == null) {
+						const row = await db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { pruneEnabled: true },
+						});
+						if (row && !row.pruneEnabled) {
+							// Pruning disabled — go straight to compact
+							triggerMidTurnCompact(narratorId, locale, onCompactDone);
+							return;
+						}
+					}
+
 					const prunedPct = result?.prunedPercent ?? 0;
 					if (prunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
 						logger.info(
@@ -3314,14 +3331,16 @@ async function runAgentLoop(
 			) {
 				active._contextUsagePct = undefined;
 
-				// Check current prunedPercent — if below threshold, prune further instead of compacting
+				// Check current prunedPercent — if below threshold, prune further instead of compacting.
+				// Exception: when pruning is disabled, skip the prune gate and compact directly.
 				const narrator = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { prunedPercent: true },
+					columns: { prunedPercent: true, pruneEnabled: true },
 				});
 				const currentPrunedPct = narrator?.prunedPercent ?? 0;
+				const pruneDisabled = narrator != null && !narrator.pruneEnabled;
 
-				if (currentPrunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
+				if (!pruneDisabled && currentPrunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
 					logger.info(
 						"Context above compactStart post-turn but prunedPercent below threshold, skipping compact",
 						{
