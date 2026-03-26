@@ -34,74 +34,128 @@ const HEADING_ORDER: Record<string, 1 | 2 | 3 | 4 | 5 | 6> = {
 	h6: 6,
 };
 
-const mdComponents: Components = {
-	p({ children }) {
-		const text = extractText(children);
-		const isDiagram = DIAGRAM_PATTERN.test(text);
+// biome-ignore lint/suspicious/noExplicitAny: flowtoken animateText signature
+type AnimateTextFn = (children: any) => any;
+
+/**
+ * Build react-markdown component overrides using Mantine components.
+ * When `animateText` is provided (streaming mode), text children are wrapped
+ * with flowtoken's animation. Otherwise children render as-is.
+ */
+function createMdComponents(animateText?: AnimateTextFn): Components {
+	const at = animateText ?? ((c: ReactNode) => c);
+
+	// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+	function headingComponent({ children, node }: any) {
+		const tag = node?.tagName ?? "h3";
+		const order = HEADING_ORDER[tag] ?? 3;
 		return (
-			<Text
-				size="sm"
-				style={{
-					marginTop: "0.35em",
-					marginBottom: 0,
-					...(isDiagram && {
-						whiteSpace: "pre",
-						overflowX: "auto",
-						wordBreak: "normal",
-					}),
-				}}
-			>
-				{children}
-			</Text>
+			<Title order={order} mt="0.4em" mb={0}>
+				{at(children)}
+			</Title>
 		);
-	},
-	h1: heading,
-	h2: heading,
-	h3: heading,
-	h4: heading,
-	h5: heading,
-	h6: heading,
-	ul({ children }) {
-		return (
-			<List size="sm" type="unordered" style={{ marginTop: "0.35em", marginBottom: 0 }}>
-				{children}
-			</List>
-		);
-	},
-	ol({ children }) {
-		return (
-			<List size="sm" type="ordered" style={{ marginTop: "0.35em", marginBottom: 0 }}>
-				{children}
-			</List>
-		);
-	},
-	li({ children }) {
-		return <List.Item style={{ margin: 0 }}>{children}</List.Item>;
-	},
-	a({ href, children }) {
-		return (
-			<Anchor
-				href={href}
-				target="_blank"
-				rel="noopener noreferrer"
-				size="sm"
-				style={{ overflowWrap: "anywhere" }}
-			>
-				{children}
-			</Anchor>
-		);
-	},
-	blockquote({ children }) {
-		return (
-			<Blockquote p="xs" my={0}>
-				{children}
-			</Blockquote>
-		);
-	},
-	code({ children, className }) {
-		const lang = className?.replace("language-", "");
-		const isBlock = className?.startsWith("language-");
-		if (isBlock) {
+	}
+
+	return {
+		p({ children }) {
+			const text = extractText(children);
+			const isDiagram = DIAGRAM_PATTERN.test(text);
+			return (
+				<Text
+					size="sm"
+					style={{
+						marginTop: "0.35em",
+						marginBottom: 0,
+						...(isDiagram && {
+							whiteSpace: "pre",
+							overflowX: "auto",
+							wordBreak: "normal",
+						}),
+					}}
+				>
+					{isDiagram ? children : at(children)}
+				</Text>
+			);
+		},
+		h1: headingComponent,
+		h2: headingComponent,
+		h3: headingComponent,
+		h4: headingComponent,
+		h5: headingComponent,
+		h6: headingComponent,
+		ul({ children }) {
+			return (
+				<List size="sm" type="unordered" style={{ marginTop: "0.35em", marginBottom: 0 }}>
+					{children}
+				</List>
+			);
+		},
+		ol({ children }) {
+			return (
+				<List size="sm" type="ordered" style={{ marginTop: "0.35em", marginBottom: 0 }}>
+					{children}
+				</List>
+			);
+		},
+		li({ children }) {
+			return <List.Item style={{ margin: 0 }}>{at(children)}</List.Item>;
+		},
+		a({ href, children }) {
+			return (
+				<Anchor
+					href={href}
+					target="_blank"
+					rel="noopener noreferrer"
+					size="sm"
+					style={{ overflowWrap: "anywhere" }}
+				>
+					{at(children)}
+				</Anchor>
+			);
+		},
+		blockquote({ children }) {
+			return (
+				<Blockquote p="xs" my={0}>
+					{children}
+				</Blockquote>
+			);
+		},
+		// Code blocks: no text animation — code content should not be split/animated
+		code({ children, className }) {
+			const lang = className?.replace("language-", "");
+			const isBlock = className?.startsWith("language-");
+			if (isBlock) {
+				const text = extractText(children);
+				const isDiagram = DIAGRAM_PATTERN.test(text);
+				if (isDiagram) {
+					return (
+						<Code
+							block
+							fz="xs"
+							style={{
+								maxWidth: "100%",
+								overflowX: "auto",
+								whiteSpace: "pre",
+								wordBreak: "normal",
+							}}
+						>
+							{children}
+						</Code>
+					);
+				}
+				return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
+			}
+			return (
+				<Code fz="xs" style={{ overflowWrap: "anywhere", wordBreak: "break-all" }}>
+					{children}
+				</Code>
+			);
+		},
+		pre({ children }) {
+			// For fenced code blocks without a language tag, react-markdown renders
+			// <pre><code>...</code></pre> where the inner <code> has no className.
+			// Detect diagram content and force no-wrap on those blocks.
+			// Otherwise wrap in MarkdownCodeBlock for copy button + consistent styling.
 			const text = extractText(children);
 			const isDiagram = DIAGRAM_PATTERN.test(text);
 			if (isDiagram) {
@@ -116,104 +170,124 @@ const mdComponents: Components = {
 							wordBreak: "normal",
 						}}
 					>
-						{children}
+						{text}
 					</Code>
 				);
 			}
-			return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
-		}
-		return (
-			<Code fz="xs" style={{ overflowWrap: "anywhere", wordBreak: "break-all" }}>
-				{children}
-			</Code>
-		);
-	},
-	pre({ children }) {
-		// For fenced code blocks without a language tag, react-markdown renders
-		// <pre><code>...</code></pre> where the inner <code> has no className.
-		// Detect diagram content and force no-wrap on those blocks.
-		// Otherwise wrap in MarkdownCodeBlock for copy button + consistent styling.
-		const text = extractText(children);
-		const isDiagram = DIAGRAM_PATTERN.test(text);
-		if (isDiagram) {
+			// If the inner <code> already rendered a MarkdownCodeBlock (has language),
+			// just pass through. Otherwise wrap bare code in MarkdownCodeBlock.
+			const child = Array.isArray(children) ? children[0] : children;
+			// biome-ignore lint/suspicious/noExplicitAny: react-markdown children structure
+			const childType = child && typeof child === "object" && (child as any).type;
+			if (childType === MarkdownCodeBlock) {
+				return <>{children}</>;
+			}
+			return <MarkdownCodeBlock language="text">{text}</MarkdownCodeBlock>;
+		},
+		hr() {
+			return <Divider my={4} />;
+		},
+		table({ children }) {
 			return (
-				<Code
-					block
-					fz="xs"
-					style={{
-						maxWidth: "100%",
-						overflowX: "auto",
-						whiteSpace: "pre",
-						wordBreak: "normal",
-					}}
-				>
-					{text}
-				</Code>
+				<div style={{ maxWidth: "100%", overflowX: "auto" }}>
+					<Table fz="sm" striped highlightOnHover style={{ margin: 0 }}>
+						{children}
+					</Table>
+				</div>
 			);
-		}
-		// If the inner <code> already rendered a MarkdownCodeBlock (has language),
-		// just pass through. Otherwise wrap bare code in MarkdownCodeBlock.
-		const child = Array.isArray(children) ? children[0] : children;
-		// biome-ignore lint/suspicious/noExplicitAny: react-markdown children structure
-		const childType = child && typeof child === "object" && (child as any).type;
-		if (childType === MarkdownCodeBlock) {
-			return <>{children}</>;
-		}
-		return <MarkdownCodeBlock language="text">{text}</MarkdownCodeBlock>;
-	},
-	hr() {
-		return <Divider my={4} />;
-	},
-	table({ children }) {
-		return (
-			<div style={{ maxWidth: "100%", overflowX: "auto" }}>
-				<Table fz="sm" striped highlightOnHover style={{ margin: 0 }}>
-					{children}
-				</Table>
-			</div>
-		);
-	},
-	thead({ children }) {
-		return <Table.Thead>{children}</Table.Thead>;
-	},
-	tbody({ children }) {
-		return <Table.Tbody>{children}</Table.Tbody>;
-	},
-	tr({ children }) {
-		return <Table.Tr>{children}</Table.Tr>;
-	},
-	th({ children }) {
-		return <Table.Th>{children}</Table.Th>;
-	},
-	td({ children }) {
-		return <Table.Td>{children}</Table.Td>;
-	},
-	strong({ children }) {
-		return (
-			<Text span fw={700} size="sm">
-				{children}
-			</Text>
-		);
-	},
-	em({ children }) {
-		return (
-			<Text span fs="italic" size="sm">
-				{children}
-			</Text>
-		);
-	},
-};
-
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function heading({ children, node }: any) {
-	const tag = node?.tagName ?? "h3";
-	const order = HEADING_ORDER[tag] ?? 3;
-	return (
-		<Title order={order} mt="0.4em" mb={0}>
-			{children}
-		</Title>
-	);
+		},
+		thead({ children }) {
+			return <Table.Thead>{children}</Table.Thead>;
+		},
+		tbody({ children }) {
+			return <Table.Tbody>{children}</Table.Tbody>;
+		},
+		tr({ children }) {
+			return <Table.Tr>{children}</Table.Tr>;
+		},
+		th({ children }) {
+			return <Table.Th>{at(children)}</Table.Th>;
+		},
+		td({ children }) {
+			return <Table.Td>{at(children)}</Table.Td>;
+		},
+		strong({ children }) {
+			return (
+				<Text span fw={700} size="sm">
+					{at(children)}
+				</Text>
+			);
+		},
+		em({ children }) {
+			return (
+				<Text span fs="italic" size="sm">
+					{at(children)}
+				</Text>
+			);
+		},
+	};
 }
+
+/** Static components (no animation) — created once at module level */
+const staticComponents = createMdComponents();
+
+/**
+ * Build a flowtoken `customComponents` object from our Mantine component map.
+ * Each entry receives `{...react-markdown-props, animateText}` from flowtoken
+ * and delegates to the corresponding Mantine component.
+ */
+function buildFlowtokenCustomComponents(): Record<
+	string,
+	// biome-ignore lint/suspicious/noExplicitAny: flowtoken custom component signature
+	(props: any) => ReactNode
+> {
+	// Keys that flowtoken's AnimatedMarkdown defines internally and that we
+	// want to override with our Mantine versions.  We also add keys that
+	// flowtoken does NOT define (ul, ol, blockquote, pre, thead, tbody, th)
+	// so they get Mantine styling too.
+	const keys = [
+		"p",
+		"h1",
+		"h2",
+		"h3",
+		"h4",
+		"h5",
+		"h6",
+		"ul",
+		"ol",
+		"li",
+		"a",
+		"blockquote",
+		"code",
+		"pre",
+		"hr",
+		"table",
+		"thead",
+		"tbody",
+		"tr",
+		"th",
+		"td",
+		"strong",
+		"em",
+	] as const;
+
+	const result: Record<string, (props: Record<string, unknown>) => ReactNode> = {};
+	for (const key of keys) {
+		// flowtoken calls: customComponent({ ...react-markdown-props, animateText })
+		result[key] = (props: Record<string, unknown>) => {
+			const { animateText, node, ...rest } = props;
+			const components = createMdComponents(animateText as AnimateTextFn | undefined);
+			const Component = components[key];
+			if (!Component) return null;
+			// biome-ignore lint/suspicious/noExplicitAny: bridging flowtoken → react-markdown component types
+			return (Component as any)({ ...rest, node });
+		};
+	}
+	return result;
+}
+
+/** Flowtoken custom components — created once at module level */
+const flowtokenCustomComponents = buildFlowtokenCustomComponents();
 
 /**
  * Detect whether the browser supports RegExp lookbehind assertions.
@@ -255,7 +329,7 @@ interface MarkdownContentProps {
 	text: string;
 	/** When false, disable word-wrap so long lines scroll horizontally. Defaults to true. */
 	wordWrap?: boolean;
-	/** Whether this content is currently being streamed (enables per-char animation) */
+	/** Whether this content is currently being streamed (enables per-word animation) */
 	streaming?: boolean;
 }
 
@@ -281,7 +355,8 @@ export const MarkdownContent = memo(function MarkdownContent({
 		</Text>
 	);
 
-	// Streaming mode: use flowtoken's AnimatedMarkdown for per-word blur-in
+	// Streaming mode: AnimatedMarkdown with our Mantine customComponents for
+	// consistent styling + flowtoken's per-word blur-in animation
 	if (shouldAnimate) {
 		return (
 			<MarkdownErrorBoundary fallback={plainFallback}>
@@ -292,17 +367,18 @@ export const MarkdownContent = memo(function MarkdownContent({
 						animation="blurIn"
 						animationDuration="0.35s"
 						animationTimingFunction="ease-out"
+						customComponents={flowtokenCustomComponents}
 					/>
 				</div>
 			</MarkdownErrorBoundary>
 		);
 	}
 
-	// Static mode: use react-markdown with our custom Mantine components
+	// Static mode: react-markdown with the same Mantine components (no animation)
 	return (
 		<MarkdownErrorBoundary fallback={plainFallback}>
 			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-				<Markdown remarkPlugins={remarkPlugins} components={mdComponents}>
+				<Markdown remarkPlugins={remarkPlugins} components={staticComponents}>
 					{trimmed}
 				</Markdown>
 			</div>
