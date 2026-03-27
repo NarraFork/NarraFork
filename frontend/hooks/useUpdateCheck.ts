@@ -50,6 +50,8 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 		currentVersion: data?.currentVersion,
 		latestVersion: data?.latestVersion,
 		releaseInfo: data?.releaseInfo,
+		releaseNotes: data?.releaseInfo?.releaseNotes,
+		releaseDate: data?.releaseInfo?.releaseDate,
 		downloadSize: data?.downloadSize,
 		totalSize: data?.totalSize,
 		diffBlocks: data?.diffBlocks,
@@ -180,32 +182,23 @@ export function useUpdateCleanup() {
 	});
 }
 
-export function useUpdateVersion() {
-	return useQuery({
-		queryKey: ["update-version"],
-		queryFn: () => api.getUpdateVersion(),
-		staleTime: Number.POSITIVE_INFINITY,
-	});
-}
+export function useUpdateApply() {
+	const [isApplying, setIsApplying] = useState(false);
 
-export function useUpdateRestart() {
-	const [isRestarting, setIsRestarting] = useState(false);
-
-	const restart = useCallback(async () => {
-		setIsRestarting(true);
+	const apply = useCallback(async () => {
+		setIsApplying(true);
 		try {
-			const result = await api.restartForUpdate();
+			const result = await api.applyUpdate();
 			if (!result.success) {
-				setIsRestarting(false);
-				return result;
+				setIsApplying(false);
 			}
-			// Server will restart, page will reload automatically when connection is lost
+			// If successful, the server will restart — page will reconnect automatically
 			return result;
 		} catch (err) {
-			setIsRestarting(false);
+			setIsApplying(false);
 			return { success: false, error: String(err) };
 		}
 	}, []);
 
-	return { restart, isRestarting };
+	return { apply, isApplying };
 }

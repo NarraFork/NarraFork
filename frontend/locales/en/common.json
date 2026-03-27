@@ -199,9 +199,12 @@
 	"pathBarPlaceholder": "Enter path...",
 
 	"updateAvailable": "Update available: v{{version}}",
+	"updateViewDetails": "Details",
 	"updateSavings": "{{percent}}% smaller",
 	"updateDeltaInfo": "Delta update: {{diffBlocks}}/{{totalBlocks}} blocks changed ({{downloadSize}} of {{totalSize}})",
-	"updateDownloadTitle": "Download Update",
+	"updateDownloadTitle": "Update v{{version}}",
+	"updateReleaseNotes": "Release Notes",
+	"updateNoNotes": "No release notes available.",
 	"updatePhaseChecking": "Checking for updates...",
 	"updatePhaseDownloading": "Downloading update...",
 	"updatePhaseApplying": "Verifying update...",

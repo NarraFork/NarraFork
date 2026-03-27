@@ -10,7 +10,7 @@ import { logger } from "./logger";
 
 const DEFAULT_CONFIG: ServerConfig = {
 	port: 7780,
-	host: "0.0.0.0",
+	host: "localhost",
 	dataDir: "./data",
 	tokens: [],
 	storage: { type: "local" },

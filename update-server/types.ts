@@ -51,6 +51,8 @@ export interface PlatformFileInfo {
 	hasBlockmap: boolean;
 	hasZstdPatch: boolean;
 	zstdPatchFromVersion?: string;
+	/** Whether the full binary file is available for download. */
+	hasFullFile?: boolean;
 }
 
 /** Release metadata stored as meta.json per version */
@@ -75,6 +77,8 @@ export interface CheckUpdateResponse {
 		size: number;
 		sha512: string;
 	};
+	/** Whether the full binary is available for download (false = delta only). */
+	hasFullFile?: boolean;
 	blockmap?: {
 		url: string;
 	};

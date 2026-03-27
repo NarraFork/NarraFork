@@ -5,13 +5,13 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { APP_VERSION } from "../lib/version";
 import {
-	applyUpdateAndRestart,
+	applyUpdate,
 	checkForUpdate,
 	cleanupOldUpdates,
 	downloadUpdate,
 	getUpdateDirectory,
 	getUpdateInstructions,
-	isRunningUnderLauncher,
+	getUpdateStatus,
 	type UpdateProgress,
 } from "../services/update-service";
 
@@ -35,7 +35,6 @@ updateRoutes.get("/version", (c) => {
 		version: APP_VERSION,
 		platform: process.platform,
 		arch: process.arch,
-		canHotRestart: isRunningUnderLauncher(),
 	});
 });
 
@@ -101,28 +100,19 @@ updateRoutes.get("/directory", (c) => {
 });
 
 /**
- * POST /api/update/restart
- * Apply downloaded update and restart (launcher mode only).
+ * GET /api/update/status
+ * Check if an update is downloaded and ready to apply.
  */
-updateRoutes.post("/restart", async (c) => {
-	if (!isRunningUnderLauncher()) {
-		return c.json(
-			{
-				success: false,
-				error: "Hot restart only available when running under launcher. Please restart manually.",
-			},
-			400,
-		);
-	}
+updateRoutes.get("/status", (c) => {
+	return c.json(getUpdateStatus());
+});
 
-	const result = await applyUpdateAndRestart();
-
-	if (result.success) {
-		// Give time for response to be sent before restart
-		setTimeout(() => {
-			process.exit(0);
-		}, 100);
-	}
-
+/**
+ * POST /api/update/apply
+ * Replace the current binary with the downloaded update and restart.
+ * The new process will kill this one after it starts successfully.
+ */
+updateRoutes.post("/apply", (c) => {
+	const result = applyUpdate();
 	return c.json(result);
 });

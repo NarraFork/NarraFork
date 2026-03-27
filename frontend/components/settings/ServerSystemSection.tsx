@@ -2,6 +2,7 @@ import {
 	Alert,
 	Autocomplete,
 	Button,
+	Group,
 	NumberInput,
 	SegmentedControl,
 	Stack,
@@ -10,8 +11,10 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconAlertTriangle, IconRefresh } from "@tabler/icons-react";
+import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
@@ -77,6 +80,8 @@ export function ServerSystemSection({
 	setUpdateAutoDownload,
 }: ServerSystemSectionProps) {
 	const { t } = useTranslation("settings");
+	const [checking, setChecking] = useState(false);
+	const [checkResult, setCheckResult] = useState<string | null>(null);
 
 	return (
 		<Stack>
@@ -189,6 +194,36 @@ export function ServerSystemSection({
 				checked={updateAutoDownload}
 				onChange={(e) => setUpdateAutoDownload(e.currentTarget.checked)}
 			/>
+			<Group gap="sm">
+				<Button
+					leftSection={<IconSearch size={16} />}
+					variant="default"
+					loading={checking}
+					onClick={async () => {
+						setChecking(true);
+						setCheckResult(null);
+						try {
+							const result = await api.checkUpdate();
+							if (result.updateAvailable && result.latestVersion) {
+								setCheckResult(t("updateFoundVersion", { version: result.latestVersion }));
+							} else {
+								setCheckResult(t("noUpdateAvailable"));
+							}
+						} catch {
+							setCheckResult(t("updateCheckFailed"));
+						} finally {
+							setChecking(false);
+						}
+					}}
+				>
+					{checking ? t("checkingForUpdate") : t("checkForUpdate")}
+				</Button>
+				{checkResult && (
+					<Text size="sm" c="dimmed">
+						{checkResult}
+					</Text>
+				)}
+			</Group>
 
 			{/* System Dependencies */}
 			<Title order={5} mt="sm">

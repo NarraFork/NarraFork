@@ -358,7 +358,7 @@ const DEFAULTS: NarraForkSettings = {
 		defaultReasoningEffort: "medium",
 	},
 	update: {
-		serverUrl: "",
+		serverUrl: "https://narrafork-update.b.domexie.cn",
 		product: "narrafork",
 		channel: "stable",
 		checkIntervalMinutes: 60,

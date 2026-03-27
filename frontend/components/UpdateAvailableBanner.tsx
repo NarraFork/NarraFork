@@ -4,9 +4,11 @@ import {
 	Button,
 	Code,
 	CopyButton,
+	Divider,
 	Group,
 	Modal,
 	Progress,
+	ScrollArea,
 	Stack,
 	Text,
 	Tooltip,
@@ -16,17 +18,13 @@ import {
 	IconCheck,
 	IconCopy,
 	IconDownload,
+	IconInfoCircle,
 	IconRefresh,
 	IconRocket,
 	IconX,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
-import {
-	useUpdateCheck,
-	useUpdateDownload,
-	useUpdateRestart,
-	useUpdateVersion,
-} from "../hooks/useUpdateCheck";
+import { useUpdateApply, useUpdateCheck, useUpdateDownload } from "../hooks/useUpdateCheck";
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
@@ -41,6 +39,8 @@ export function UpdateAvailableBanner() {
 		updateAvailable,
 		latestVersion,
 		releaseInfo,
+		releaseNotes,
+		releaseDate,
 		downloadSize,
 		totalSize,
 		diffBlocks,
@@ -49,29 +49,20 @@ export function UpdateAvailableBanner() {
 	} = useUpdateCheck();
 
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
-	const { data: versionInfo } = useUpdateVersion();
-	const { restart, isRestarting } = useUpdateRestart();
+	const { apply, isApplying } = useUpdateApply();
 
 	if (!updateAvailable) return null;
 
-	const canHotRestart = versionInfo?.canHotRestart ?? false;
-
 	const handleDownload = () => {
 		if (releaseInfo) {
-			open();
 			download(releaseInfo);
 		}
 	};
 
-	const handleRestart = async () => {
-		// Clear PWA cache before restart to ensure fresh assets after update
+	const handleApply = async () => {
 		const { clearPwaCache } = await import("@frontend/lib/pwa");
 		await clearPwaCache();
-
-		const result = await restart();
-		if (!result.success) {
-			// Show error - the manual instructions will be displayed
-		}
+		await apply();
 	};
 
 	const handleClose = () => {
@@ -84,6 +75,8 @@ export function UpdateAvailableBanner() {
 
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
+
+	const canAutoRestart = result?.success && result.instructions && !result.instructions.manual;
 
 	return (
 		<>
@@ -125,11 +118,10 @@ export function UpdateAvailableBanner() {
 					<Button
 						size="xs"
 						variant="light"
-						leftSection={<IconDownload size={14} />}
-						onClick={handleDownload}
-						loading={isDownloading}
+						leftSection={<IconInfoCircle size={14} />}
+						onClick={open}
 					>
-						{t("download")}
+						{t("updateViewDetails")}
 					</Button>
 				</Group>
 			</Alert>
@@ -137,11 +129,61 @@ export function UpdateAvailableBanner() {
 			<Modal
 				opened={opened}
 				onClose={handleClose}
-				title={t("updateDownloadTitle")}
-				size="md"
+				title={t("updateDownloadTitle", { version: latestVersion })}
+				size="lg"
 				centered
 			>
 				<Stack gap="md">
+					{/* Release info */}
+					{releaseDate && (
+						<Text size="xs" c="dimmed">
+							{new Date(releaseDate).toLocaleDateString(undefined, {
+								year: "numeric",
+								month: "long",
+								day: "numeric",
+							})}
+						</Text>
+					)}
+
+					{/* Release notes */}
+					<div>
+						<Text size="sm" fw={500} mb={4}>
+							{t("updateReleaseNotes")}
+						</Text>
+						<ScrollArea.Autosize mah={300}>
+							{releaseNotes ? (
+								<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+									{releaseNotes}
+								</Text>
+							) : (
+								<Text size="sm" c="dimmed" fs="italic">
+									{t("updateNoNotes")}
+								</Text>
+							)}
+						</ScrollArea.Autosize>
+					</div>
+
+					{/* Download size info */}
+					{savingsPercent > 0 && !result?.success && (
+						<Text size="xs" c="dimmed">
+							{t("updateDeltaInfo", {
+								diffBlocks,
+								totalBlocks,
+								downloadSize: formatBytes(downloadSize ?? 0),
+								totalSize: formatBytes(totalSize ?? 0),
+							})}
+						</Text>
+					)}
+
+					<Divider />
+
+					{/* Download / progress / apply section */}
+					{!progress && !result && (
+						<Button fullWidth leftSection={<IconDownload size={16} />} onClick={handleDownload}>
+							{t("download")} ({formatBytes(downloadSize ?? totalSize ?? 0)})
+						</Button>
+					)}
+
 					{progress && (
 						<>
 							<Text size="sm" c="dimmed">
@@ -175,15 +217,15 @@ export function UpdateAvailableBanner() {
 								{t("updateDownloadComplete")}
 							</Alert>
 
-							{canHotRestart ? (
+							{canAutoRestart ? (
 								<>
 									<Text size="sm">{t("updateReadyToApply")}</Text>
 									<Button
 										fullWidth
 										color="indigo"
 										leftSection={<IconRefresh size={16} />}
-										onClick={handleRestart}
-										loading={isRestarting}
+										onClick={handleApply}
+										loading={isApplying}
 									>
 										{t("updateApplyNow")}
 									</Button>

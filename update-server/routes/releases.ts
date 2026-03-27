@@ -59,6 +59,11 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		const zstdPatchFile = formData.get("zstdPatch") as File | null;
 		const zstdPatchMetaFile = formData.get("zstdPatchMeta") as File | null;
 
+		// When no full file is provided, these fields describe the target binary
+		const metaFilename = formData.get("filename") as string | null;
+		const metaSize = formData.get("size") as string | null;
+		const metaSha512 = formData.get("sha512") as string | null;
+
 		// Validate required fields
 		if (!version) return c.json({ error: "Missing version" }, 400);
 		if (!channel || !isValidChannel(channel)) {
@@ -67,24 +72,53 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		if (!platform || !isValidPlatform(platform)) {
 			return c.json({ error: "Invalid or missing platform" }, 400);
 		}
-		if (!file) return c.json({ error: "Missing file" }, 400);
+
+		// Either full file or metadata fields are required
+		if (!file && (!metaFilename || !metaSize || !metaSha512)) {
+			return c.json({ error: "Provide either 'file' or 'filename'+'size'+'sha512' fields" }, 400);
+		}
 
 		const basePath = `products/${product}/releases/${version}/${platform}`;
-		const filename = file.name;
+		let filename: string;
+		let fileSize: number;
+		let sha512: string;
+		let hasFullFile = false;
 
-		// Read file into buffer and compute SHA512
-		const fileBuffer = Buffer.from(await file.arrayBuffer());
-		const sha512 = createHash("sha512").update(fileBuffer).digest("base64");
+		if (file) {
+			// Full file upload — compute sha512 from content
+			filename = file.name;
+			const fileBuffer = Buffer.from(await file.arrayBuffer());
+			fileSize = fileBuffer.length;
+			sha512 = createHash("sha512").update(fileBuffer).digest("base64");
+			hasFullFile = true;
 
-		// Save main binary
-		await storage.saveFile(`${basePath}/${filename}`, fileBuffer);
-		logger.info("Saved release file", {
-			product,
-			version,
-			platform,
-			filename,
-			size: fileBuffer.length,
-		});
+			await storage.saveFile(`${basePath}/${filename}`, fileBuffer);
+			logger.info("Saved release file", {
+				product,
+				version,
+				platform,
+				filename,
+				size: fileSize,
+			});
+		} else {
+			// Delta-only upload — use provided metadata
+			// Safe: validated non-null by the guard above
+			filename = metaFilename as string;
+			fileSize = Number.parseInt(metaSize as string, 10);
+			sha512 = metaSha512 as string;
+
+			if (Number.isNaN(fileSize) || fileSize <= 0) {
+				return c.json({ error: "Invalid size" }, 400);
+			}
+
+			logger.info("Delta-only release (no full file)", {
+				product,
+				version,
+				platform,
+				filename,
+				size: fileSize,
+			});
+		}
 
 		// Save blockmap if provided
 		let hasBlockmap = false;
@@ -142,11 +176,12 @@ export function createReleaseRoutes(storage: StorageBackend) {
 
 			const platformInfo: PlatformFileInfo = {
 				filename,
-				size: fileBuffer.length,
+				size: fileSize,
 				sha512,
 				hasBlockmap,
 				hasZstdPatch,
 				zstdPatchFromVersion,
+				hasFullFile,
 			};
 
 			m.platforms[platform] = platformInfo;
@@ -162,8 +197,9 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			version,
 			platform,
 			filename,
-			size: fileBuffer.length,
+			size: fileSize,
 			sha512: `${sha512.slice(0, 16)}...`,
+			hasFullFile,
 			hasBlockmap,
 			hasZstdPatch,
 		});

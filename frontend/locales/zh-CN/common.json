@@ -199,9 +199,12 @@
 	"pathBarPlaceholder": "输入路径...",
 
 	"updateAvailable": "有新版本可用: v{{version}}",
+	"updateViewDetails": "查看详情",
 	"updateSavings": "节省 {{percent}}%",
 	"updateDeltaInfo": "差异更新: {{diffBlocks}}/{{totalBlocks}} 个块变更 ({{downloadSize}} / {{totalSize}})",
-	"updateDownloadTitle": "下载更新",
+	"updateDownloadTitle": "更新 v{{version}}",
+	"updateReleaseNotes": "更新日志",
+	"updateNoNotes": "暂无更新日志。",
 	"updatePhaseChecking": "正在检查更新...",
 	"updatePhaseDownloading": "正在下载更新...",
 	"updatePhaseApplying": "正在验证更新...",

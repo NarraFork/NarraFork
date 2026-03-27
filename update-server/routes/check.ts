@@ -72,6 +72,7 @@ export function createCheckRoutes(storage: StorageBackend) {
 				size: platformInfo.size,
 				sha512: platformInfo.sha512,
 			},
+			hasFullFile: platformInfo.hasFullFile ?? true,
 			blockmap: platformInfo.hasBlockmap
 				? { url: `${baseUrl}/blockmap/${platformInfo.filename}` }
 				: undefined,

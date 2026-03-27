@@ -4,17 +4,21 @@
  */
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
+	copyFileSync,
 	createReadStream,
 	createWriteStream,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import {
 	applyZstdPatch,
 	type Blockmap,
@@ -49,6 +53,8 @@ export interface ReleaseInfo {
 		blockmapUrl?: string;
 		zstdPatchUrl?: string;
 		zstdPatchMetaUrl?: string;
+		/** Whether the server has the full binary for download. */
+		hasFullFile?: boolean;
 	};
 }
 
@@ -116,6 +122,8 @@ interface V2CheckResponse {
 		size: number;
 		sha512: string;
 	};
+	/** Whether the full binary is available for download (false = delta only). */
+	hasFullFile?: boolean;
 	blockmap?: {
 		url: string;
 	};
@@ -188,6 +196,7 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 				blockmapUrl: data.blockmap ? `${serverUrl}${data.blockmap.url}` : undefined,
 				zstdPatchUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.url}` : undefined,
 				zstdPatchMetaUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.metaUrl}` : undefined,
+				hasFullFile: data.hasFullFile ?? true,
 			},
 		};
 
@@ -420,8 +429,14 @@ export async function downloadUpdate(
 					diff,
 					onProgress,
 				);
-			} else {
+			} else if (releaseInfo._v2?.hasFullFile !== false) {
 				await downloadFull(fileDownloadUrl, tempPath, releaseInfo.files[0]?.size ?? 0, onProgress);
+			} else {
+				return {
+					success: false,
+					error:
+						"Delta update not available for this version. No full download provided by the update server.",
+				};
 			}
 		}
 
@@ -742,8 +757,10 @@ async function computeFileSha512(filePath: string): Promise<string> {
 }
 
 /**
- * Apply a downloaded update by replacing the current executable.
- * Returns instructions for the user since we can't replace a running binary.
+ * Returns update instructions.
+ * When running as a compiled binary, `manual` is false — the frontend can use
+ * the /api/update/apply endpoint for automatic restart.
+ * In dev mode, manual instructions are provided as a fallback.
  */
 export function getUpdateInstructions(updatePath: string): {
 	manual: boolean;
@@ -759,24 +776,21 @@ export function getUpdateInstructions(updatePath: string): {
 		};
 	}
 
-	const _execDir = dirname(execPath);
+	// Compiled binary — auto-restart is available via /api/update/apply
 	const execName = basename(execPath);
-	const _updateName = basename(updatePath);
 
 	if (process.platform === "win32") {
-		// Windows: provide PowerShell command
 		return {
-			manual: true,
+			manual: false,
 			command: `Stop-Process -Name "${execName.replace(".exe", "")}" -Force; Move-Item -Force "${updatePath}" "${execPath}"; Start-Process "${execPath}"`,
-			message: `Update downloaded. Run the following command in PowerShell to apply:\n\nStop-Process -Name "${execName.replace(".exe", "")}" -Force; Move-Item -Force "${updatePath}" "${execPath}"; Start-Process "${execPath}"`,
+			message: "Update ready. Click apply to restart automatically.",
 		};
 	}
 
-	// Unix: provide shell command
 	return {
-		manual: true,
+		manual: false,
 		command: `pkill -f "${execName}" && mv "${updatePath}" "${execPath}" && chmod +x "${execPath}" && "${execPath}"`,
-		message: `Update downloaded to ${updatePath}. Run the following command to apply:\n\npkill -f "${execName}" && mv "${updatePath}" "${execPath}" && chmod +x "${execPath}" && "${execPath}"`,
+		message: "Update ready. Click apply to restart automatically.",
 	};
 }
 
@@ -793,7 +807,6 @@ export function getUpdateDirectory(): string {
 export function cleanupOldUpdates(): void {
 	if (!existsSync(UPDATE_DIR)) return;
 
-	const { readdirSync, unlinkSync, statSync } = require("node:fs");
 	const files = readdirSync(UPDATE_DIR);
 	const now = Date.now();
 	const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -811,64 +824,119 @@ export function cleanupOldUpdates(): void {
 }
 
 /**
- * Check if running under launcher (supports hot restart)
+ * Find the downloaded update file in the updates directory.
  */
-export function isRunningUnderLauncher(): boolean {
-	return !!process.env.NARRAFORK_LAUNCHER_PID;
-}
-
-/**
- * Request launcher to restart with new version
- */
-export function requestRestart(): boolean {
-	if (!isRunningUnderLauncher()) {
-		logger.warn("Cannot request restart: not running under launcher");
-		return false;
-	}
-
-	try {
-		// Send IPC message to launcher
-		if (process.send) {
-			process.send({ type: "restart" });
-			logger.info("Restart request sent to launcher");
-			return true;
-		}
-	} catch (err) {
-		logger.error("Failed to send restart request", { error: String(err) });
-	}
-
-	return false;
-}
-
-/**
- * Apply update and restart (for launcher mode)
- */
-export async function applyUpdateAndRestart(): Promise<{ success: boolean; error?: string }> {
-	if (!isRunningUnderLauncher()) {
-		return {
-			success: false,
-			error: "Hot restart only available when running under launcher",
-		};
-	}
-
-	// Check if update is downloaded
-	if (!existsSync(UPDATE_DIR)) {
-		return { success: false, error: "No update downloaded" };
-	}
-
-	const files = require("node:fs").readdirSync(UPDATE_DIR) as string[];
-	const updateFile = files.find(
-		(f: string) => f.startsWith("narrafork-") && !f.endsWith(".blockmap") && !f.endsWith(".tmp"),
+function findUpdateFile(): string | null {
+	if (!existsSync(UPDATE_DIR)) return null;
+	const files = readdirSync(UPDATE_DIR);
+	return (
+		files.find(
+			(f) => f.startsWith("narrafork-") && !f.endsWith(".blockmap") && !f.endsWith(".tmp"),
+		) ?? null
 	);
+}
 
+/**
+ * Check if an update has been downloaded and is ready to apply.
+ */
+export function getUpdateStatus(): {
+	ready: boolean;
+	updateFile?: string;
+	canAutoRestart: boolean;
+} {
+	const execPath = getCurrentExecutablePath();
+	const updateFile = findUpdateFile();
+	return {
+		ready: !!updateFile,
+		updateFile: updateFile ?? undefined,
+		canAutoRestart: !!execPath,
+	};
+}
+
+/**
+ * Move a file, falling back to copy+delete when src and dst are on different filesystems.
+ */
+function moveFileSync(src: string, dst: string): void {
+	try {
+		renameSync(src, dst);
+	} catch (err: unknown) {
+		if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+			copyFileSync(src, dst);
+			unlinkSync(src);
+		} else {
+			throw err;
+		}
+	}
+}
+
+/**
+ * Apply a downloaded update: replace the current binary and spawn the new process.
+ *
+ * Flow:
+ * 1. Locate the downloaded update file
+ * 2. Replace the current executable (Unix: mv; Windows: rename .old then mv)
+ * 3. Spawn the new binary as a detached process with --replace-pid=<our PID>
+ * 4. The new process will kill us after it starts successfully
+ */
+export function applyUpdate(): { success: boolean; error?: string } {
+	const execPath = getCurrentExecutablePath();
+	if (!execPath) {
+		return { success: false, error: "Not running as compiled binary" };
+	}
+
+	const updateFile = findUpdateFile();
 	if (!updateFile) {
 		return { success: false, error: "No update file found" };
 	}
 
-	// Request restart - launcher will apply the update
-	if (requestRestart()) {
-		return { success: true };
+	const updatePath = join(UPDATE_DIR, updateFile);
+	const isWindows = process.platform === "win32";
+
+	try {
+		if (isWindows) {
+			// Windows: can't overwrite running exe, rename it first
+			const oldPath = `${execPath}.old`;
+			if (existsSync(oldPath)) {
+				try {
+					unlinkSync(oldPath);
+				} catch {}
+			}
+			moveFileSync(execPath, oldPath);
+			try {
+				moveFileSync(updatePath, execPath);
+			} catch (err) {
+				// Rollback: restore original exe
+				moveFileSync(oldPath, execPath);
+				throw err;
+			}
+		} else {
+			// Unix: can overwrite running binary (inode stays valid for current process)
+			moveFileSync(updatePath, execPath);
+			chmodSync(execPath, 0o755);
+		}
+	} catch (err) {
+		return { success: false, error: `Failed to replace binary: ${err}` };
 	}
 
-	return { success: false, error: "Failed to request restart" };
+	// Build args for the new process: inherit current args, add --replace-pid
+	const newArgs = process.argv.slice(1).filter((a) => !a.startsWith("--replace-pid="));
+	newArgs.push(`--replace-pid=${process.pid}`);
+
+	try {
+		const proc = Bun.spawn([execPath, ...newArgs], {
+			stdio: ["ignore", "ignore", "ignore"],
+			env: { ...process.env },
+		});
+		proc.unref();
+
+		logger.info("Spawned new process for update", {
+			newPid: proc.pid,
+			oldPid: process.pid,
+			execPath,
+		});
+	} catch (err) {
+		return { success: false, error: `Failed to spawn new process: ${err}` };
+	}
+
+	return { success: true };
 }

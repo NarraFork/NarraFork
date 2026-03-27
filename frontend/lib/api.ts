@@ -455,6 +455,12 @@ export const api = {
 	updateSettings: (data: Record<string, unknown>) =>
 		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
 
+	testModel: (model: string, prompt: string) =>
+		request<{ text: string }>("/settings/test-model", {
+			method: "POST",
+			body: JSON.stringify({ model, prompt }),
+		}),
+
 	// Narrators (both chapter-bound and standalone sessions)
 	listNarrators: (opts?: {
 		chapterId?: string;
@@ -1108,6 +1114,11 @@ export const api = {
 		request<ApiEntity[]>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",
 			body: JSON.stringify({ key, ...target }),
+		}),
+	pinRecentTab: (key: string, pinned: boolean) =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs/pin", {
+			method: "PATCH",
+			body: JSON.stringify({ key, pinned }),
 		}),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<ApiEntity[]>("/user-preferences/recent-tabs/clear", {
@@ -2110,13 +2121,13 @@ export const api = {
 			totalBlocks?: number;
 		}>("/update/check"),
 	getUpdateVersion: () =>
-		request<{ version: string; platform: string; arch: string; canHotRestart: boolean }>(
-			"/update/version",
-		),
+		request<{ version: string; platform: string; arch: string }>("/update/version"),
 	getUpdateDirectory: () => request<{ directory: string }>("/update/directory"),
 	cleanupUpdates: () => request<{ success: boolean }>("/update/cleanup", { method: "POST" }),
-	restartForUpdate: () =>
-		request<{ success: boolean; error?: string }>("/update/restart", { method: "POST" }),
+	getUpdateStatus: () =>
+		request<{ ready: boolean; updateFile?: string; canAutoRestart: boolean }>("/update/status"),
+	applyUpdate: () =>
+		request<{ success: boolean; error?: string }>("/update/apply", { method: "POST" }),
 
 	// Overseers
 	listOverseers: (params?: { scope?: string; projectId?: string }) => {
