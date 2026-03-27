@@ -38,6 +38,8 @@ import {
 	IconGitBranch,
 	IconMessageCircle,
 	IconMessageCircleFilled,
+	IconPin,
+	IconPinnedOff,
 	IconPlus,
 	IconTerminal2,
 	IconX,
@@ -321,7 +323,7 @@ export function RecentTabList({
 	firstTabConnected,
 	excludeActiveNarratorId,
 }: RecentTabListProps) {
-	const { tabs, removeTab, moveTab } = useRecentTabs();
+	const { tabs, removeTab, moveTab, pinTab } = useRecentTabs();
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const navigate = useNavigate();
 	const qc = useQueryClient();
@@ -604,6 +606,19 @@ export function RecentTabList({
 				return;
 			}
 
+			// Enforce pin boundary: pinned tabs stay in pinned zone, unpinned stay in unpinned zone
+			const pinnedBoundary = sortItems.findIndex((t) => !t.pinned);
+			if (pinnedBoundary !== -1) {
+				if (activeTab.pinned && newSortIdx >= pinnedBoundary) {
+					clearDragState();
+					return;
+				}
+				if (!activeTab.pinned && newSortIdx < pinnedBoundary) {
+					clearDragState();
+					return;
+				}
+			}
+
 			const [overStart, overEnd] = getWorkspaceGroupRange(newSortIdx);
 			const movingDown = oldSortIdx < newSortIdx;
 			const anchorTab = sortItems[movingDown ? overEnd : overStart];
@@ -680,6 +695,13 @@ export function RecentTabList({
 		moveTab(tabSortId(tab), { position: "top" });
 		setCtxMenu(null);
 	}, [ctxMenu, moveTab]);
+
+	const handlePin = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		pinTab(tabSortId(tab), !tab.pinned);
+		setCtxMenu(null);
+	}, [ctxMenu, pinTab]);
 
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
@@ -866,6 +888,8 @@ export function RecentTabList({
 					y={ctxMenu.y}
 					onClose={() => setCtxMenu(null)}
 					onMoveToTop={handleMoveToTop}
+					onPin={handlePin}
+					isPinned={!!ctxMenu.tab.pinned}
 					onRemove={handleCtxClose}
 					onReveal={handleReveal}
 					canReveal={platform !== "linux" && ctxMenu.tab.type !== "project"}
@@ -1330,9 +1354,12 @@ function SortableTabItem({
 					onTouchMove={handleTouchMove}
 					onTouchEnd={handleTouchEnd}
 					label={
-						<Text size="sm" truncate>
-							{tab.title}
-						</Text>
+						<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
+							{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
+							<Text size="sm" truncate>
+								{tab.title}
+							</Text>
+						</Group>
 					}
 					description={
 						<>
@@ -1515,6 +1542,8 @@ interface TabContextMenuProps {
 	y: number;
 	onClose: () => void;
 	onMoveToTop: () => void;
+	onPin: () => void;
+	isPinned: boolean;
 	onRemove: () => void;
 	onReveal: () => void;
 	canReveal: boolean;
@@ -1528,6 +1557,8 @@ function TabContextMenu({
 	y,
 	onClose,
 	onMoveToTop,
+	onPin,
+	isPinned,
 	onRemove,
 	onReveal,
 	canReveal,
@@ -1561,7 +1592,7 @@ function TabContextMenu({
 				}}
 			>
 				<Stack gap={2}>
-					{!isFirst && (
+					{!isFirst && !isPinned && (
 						<UnstyledButton px="xs" py={4} onClick={onMoveToTop} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">
 								<IconArrowUp size={14} />
@@ -1569,6 +1600,12 @@ function TabContextMenu({
 							</Group>
 						</UnstyledButton>
 					)}
+					<UnstyledButton px="xs" py={4} onClick={onPin} style={{ borderRadius: 4 }}>
+						<Group gap={8} wrap="nowrap">
+							{isPinned ? <IconPinnedOff size={14} /> : <IconPin size={14} />}
+							<Text size="sm">{t(isPinned ? "unpinTab" : "pinTab")}</Text>
+						</Group>
+					</UnstyledButton>
 					<UnstyledButton px="xs" py={4} onClick={onRemove} style={{ borderRadius: 4 }}>
 						<Group gap={8} wrap="nowrap">
 							<IconX size={14} />

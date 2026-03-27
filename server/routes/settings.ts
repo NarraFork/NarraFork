@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { Hono } from "hono";
 import { z } from "zod";
+import { agentGenerateWithMeta } from "../lib/agent";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
@@ -377,6 +378,38 @@ settingsRoutes.get("/context-thresholds", (c) => {
 	return c.json(thresholds);
 });
 
+// --- Test model endpoint ---
+
+const testModelSchema = z.object({
+	model: z.string().min(1),
+	prompt: z.string().min(1).max(10000),
+});
+
+settingsRoutes.post("/test-model", async (c) => {
+	const body = await c.req.json();
+	const parsed = testModelSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues.map((i) => i.message).join(", "));
+	}
+	const { model, prompt } = parsed.data;
+
+	// Validate that the provider/model can be resolved
+	try {
+		resolveProviderAndModel(model);
+	} catch (err) {
+		return c.json({ error: err instanceof Error ? err.message : "Unknown provider or model" }, 400);
+	}
+
+	try {
+		const result = await agentGenerateWithMeta(prompt, model);
+		return c.json({ text: result.text });
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logger.warn("Model test failed", { model, error: message });
+		return c.json({ error: message }, 502);
+	}
+});
+
 settingsRoutes.patch("/", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateSettingsSchema.safeParse(body);
@@ -384,6 +417,43 @@ settingsRoutes.patch("/", async (c) => {
 
 	const current = settings;
 	const validated = parsed.data;
+
+	// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
+	{
+		const allPrefixes: Array<{ prefix: string; source: string }> = [];
+		for (const p of validated.openaiProviders ?? current.openaiProviders ?? []) {
+			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `OpenAI "${p.name || p.id}"` });
+		}
+		for (const p of validated.anthropicProviders ?? current.anthropicProviders ?? []) {
+			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Anthropic "${p.name || p.id}"` });
+		}
+		}
+		for (const p of validated.clineProviders ?? current.clineProviders ?? []) {
+			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Cline "${p.name || p.id}"` });
+		}
+		// Check reserved prefix conflicts
+		for (const { prefix, source } of allPrefixes) {
+			if (RESERVED_PREFIXES.has(prefix)) {
+				throw new ValidationError(
+					`Provider prefix "${prefix}" is reserved (built-in provider). ` +
+						`Please choose a different prefix for ${source}.`,
+				);
+			}
+		}
+		// Check cross-provider duplicate prefixes
+		const seen = new Map<string, string>();
+		for (const { prefix, source } of allPrefixes) {
+			const existing = seen.get(prefix);
+			if (existing) {
+				throw new ValidationError(
+					`Duplicate provider prefix "${prefix}" found in ${existing} and ${source}. ` +
+						`Each provider must have a unique prefix.`,
+				);
+			}
+			seen.set(prefix, source);
+		}
+	}
+
 	const oldProxyEnabled = current.containers.proxy.enabled;
 	const oldProxyPort = current.containers.proxy.port;
 	const oldHost = current.server.host;

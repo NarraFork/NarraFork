@@ -56,5 +56,7 @@
 	"splitRight": "Split right",
 	"splitDown": "Split down",
 	"dropNarratorHere": "Drop a narrator here",
-	"distributePanels": "Distribute panels evenly"
+	"distributePanels": "Distribute panels evenly",
+	"createdAtLabel": "Created {{time}}",
+	"lastMessageAtLabel": "Last message {{time}}"
 }

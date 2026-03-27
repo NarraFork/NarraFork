@@ -20,6 +20,7 @@ import {
 	IconChevronRight,
 	IconEye,
 	IconEyeOff,
+	IconPlayerPlay,
 	IconPlus,
 	IconRefresh,
 	IconTrash,
@@ -45,6 +46,8 @@ interface AnthropicProvidersSectionProps {
 	isProviderDirty?: (providerId: string) => boolean;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
+	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
+	onTestModel?: (model: string) => void;
 }
 
 export function AnthropicProvidersSection({
@@ -59,6 +62,8 @@ export function AnthropicProvidersSection({
 	isProviderDirty,
 	customModels,
 	onCustomModelsChange,
+	getPrefixError,
+	onTestModel,
 }: AnthropicProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -229,6 +234,7 @@ export function AnthropicProvidersSection({
 													description={t("anthropicProviderPrefixDesc")}
 													placeholder={t("anthropicProviderPrefixPlaceholder")}
 													value={p.prefix}
+													error={getPrefixError?.(p.prefix, p.id)}
 													onChange={(e) =>
 														updateProvider(
 															p.id,
@@ -356,6 +362,15 @@ export function AnthropicProvidersSection({
 																				w={180}
 																				size="xs"
 																			/>
+																			<Tooltip label={t("modelTestBtn")}>
+																				<ActionIcon
+																					variant="subtle"
+																					color="teal"
+																					onClick={() => onTestModel?.(m.value)}
+																				>
+																					<IconPlayerPlay size={16} />
+																				</ActionIcon>
+																			</Tooltip>
 																			<ActionIcon
 																				variant="subtle"
 																				color={isHidden ? "gray" : "blue"}

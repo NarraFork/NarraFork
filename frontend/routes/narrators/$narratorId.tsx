@@ -6,7 +6,9 @@ import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { FileModificationsPanel } from "../../components/narrator/FileModificationsDrawer";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
+import type { FileModPanelExternalProps } from "../../components/narrator/narrator-panel-types";
 import {
 	createBranch,
 	createLeafWith,
@@ -181,6 +183,24 @@ function NarratorDetailPage() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const dragging = useRef(false);
 
+	// Desktop file modifications panel
+	const [fileModOpen, setFileModOpen] = useState(false);
+	const [fileModPanelProps, setFileModPanelProps] = useState<FileModPanelExternalProps | null>(
+		null,
+	);
+	// When file mod panel opens, we keep terminal visible (they share the right side)
+	// The right side shows whichever was opened last; for simplicity, they are mutually exclusive.
+	const handleToggleFileModPanel = useCallback(() => {
+		setFileModOpen((prev) => {
+			if (!prev) {
+				// Opening file mod panel — close terminal
+				setTerminalOpen(false);
+				localStorage.setItem(terminalStorageKey(narratorId), "false");
+			}
+			return !prev;
+		});
+	}, [narratorId]);
+
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {
 		if (!hasRunningTerminal) {
@@ -214,6 +234,8 @@ function NarratorDetailPage() {
 		if (willOpen && !hasRunningTerminal) {
 			createTerminal.mutate({ name: "Terminal 1" });
 		}
+		// Close file mod panel when opening terminal
+		if (willOpen) setFileModOpen(false);
 	}, [narratorId, terminalOpen, hasRunningTerminal, createTerminal]);
 
 	const { t: tc } = useTranslation("chapters");
@@ -563,6 +585,9 @@ function NarratorDetailPage() {
 					onToggleTerminal={isSubagent ? undefined : toggleTerminal}
 					onMinimize={showMinimize ? onMinimize : undefined}
 					onBack={isSubagent ? onBack : undefined}
+					fileModPanelOpen={isSubagent ? undefined : fileModOpen}
+					onToggleFileModPanel={isSubagent ? undefined : handleToggleFileModPanel}
+					onFileModPropsChange={isSubagent ? undefined : setFileModPanelProps}
 				/>
 			</Box>
 
@@ -595,6 +620,43 @@ function NarratorDetailPage() {
 							onSendToChat={handleSendToChat}
 							onWriteRef={handleWriteRef}
 							onExit={handleTerminalExit}
+						/>
+					</Box>
+				</>
+			)}
+
+			{!isSubagent && fileModOpen && !terminalOpen && (
+				<>
+					{/* Drag handle */}
+					<Box
+						onMouseDown={onDragStart}
+						onTouchStart={onDragStart}
+						style={{
+							position: "relative",
+							width: 6,
+							cursor: "col-resize",
+							flexShrink: 0,
+							borderRight: "1px solid var(--mantine-color-dark-4)",
+						}}
+					/>
+
+					{/* File modifications panel */}
+					<Box
+						style={{
+							width: `${terminalRatio * 100}%`,
+							minWidth: MIN_PANEL_WIDTH,
+							flexShrink: 0,
+							overflow: "hidden",
+						}}
+					>
+						<FileModificationsPanel
+							narratorId={narratorId}
+							onClose={() => setFileModOpen(false)}
+							pendingPermission={fileModPanelProps?.pendingPermission}
+							onPermissionDecision={fileModPanelProps?.onPermissionDecision}
+							deletePreviewMessageId={fileModPanelProps?.deletePreviewMessageId}
+							onConfirmDelete={fileModPanelProps?.onConfirmDelete}
+							onCancelDelete={fileModPanelProps?.onCancelDelete}
 						/>
 					</Box>
 				</>

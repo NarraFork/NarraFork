@@ -1,4 +1,4 @@
-import { NavLink, Switch, Text } from "@mantine/core";
+import { NavLink, Switch, Text, Tooltip } from "@mantine/core";
 import { IconEye } from "@tabler/icons-react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useCallback } from "react";
@@ -12,9 +12,10 @@ function mantineVar(color: string) {
 
 interface OverseerNavItemProps {
 	onNavigate?: () => void;
+	collapsed?: boolean;
 }
 
-export function OverseerNavItem({ onNavigate }: OverseerNavItemProps) {
+export function OverseerNavItem({ onNavigate, collapsed }: OverseerNavItemProps) {
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const { data: overseer } = useGlobalOverseer();
@@ -47,38 +48,44 @@ export function OverseerNavItem({ onNavigate }: OverseerNavItemProps) {
 	);
 
 	return (
-		<NavLink
-			active={isCurrentPage}
-			label={
-				<Text size="sm" truncate>
-					{t("overseer")}
-				</Text>
-			}
-			description={
-				isEnabled && narratorStatus && narratorStatus !== "idle" ? (
-					<Text size="xs" c={isActive ? statusColor : "dimmed"}>
-						{narratorStatus}
-					</Text>
-				) : undefined
-			}
-			leftSection={
-				<IconEye
-					size={16}
-					color={isActive && isEnabled ? statusColor : undefined}
-					style={{ opacity: isEnabled ? 1 : 0.4 }}
-				/>
-			}
-			onClick={handleClick}
-			rightSection={
-				<Switch
-					size="xs"
-					checked={isEnabled}
-					onChange={() => {}}
-					onClick={handleToggle}
-					disabled={!overseer || updateOverseer.isPending}
-				/>
-			}
-			styles={{ root: { cursor: overseer ? "pointer" : "default" } }}
-		/>
+		<Tooltip label={t("overseer")} position="right" disabled={!collapsed}>
+			<NavLink
+				active={isCurrentPage}
+				label={
+					collapsed ? undefined : (
+						<Text size="sm" truncate>
+							{t("overseer")}
+						</Text>
+					)
+				}
+				description={
+					collapsed ? undefined : isEnabled && narratorStatus && narratorStatus !== "idle" ? (
+						<Text size="xs" c={isActive ? statusColor : "dimmed"}>
+							{narratorStatus}
+						</Text>
+					) : undefined
+				}
+				leftSection={
+					<IconEye
+						size={16}
+						color={isActive && isEnabled ? statusColor : undefined}
+						style={{ opacity: isEnabled ? 1 : 0.4 }}
+					/>
+				}
+				onClick={handleClick}
+				rightSection={
+					collapsed ? undefined : (
+						<Switch
+							size="xs"
+							checked={isEnabled}
+							onChange={() => {}}
+							onClick={handleToggle}
+							disabled={!overseer || updateOverseer.isPending}
+						/>
+					)
+				}
+				styles={{ root: { cursor: overseer ? "pointer" : "default" } }}
+			/>
+		</Tooltip>
 	);
 }

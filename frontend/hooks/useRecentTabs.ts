@@ -23,6 +23,8 @@ export interface RecentTab {
 	subtitle?: string;
 	status?: string;
 	lastVisitedAt: number;
+	/** Whether this tab is pinned to the top */
+	pinned?: boolean;
 	// Runtime-enriched fields (not persisted to DB)
 	activeTerminalCount?: number;
 	viewers?: RecentTabViewer[];
@@ -186,6 +188,30 @@ export function useRecentTabs() {
 		},
 	});
 
+	// --- Pin/unpin a tab (optimistic) ---
+	const pinMutation = useMutation({
+		mutationFn: (args: { key: string; pinned: boolean }) => api.pinRecentTab(args.key, args.pinned),
+		onMutate: async ({ key, pinned }) => {
+			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
+			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			const idx = prev.findIndex((t) => `${t.type}:${t.id}` === key);
+			if (idx === -1) return { prev };
+			const next = [...prev];
+			const tab = { ...next[idx], pinned: pinned || undefined };
+			if (!pinned) delete tab.pinned;
+			next.splice(idx, 1);
+			// Insert at end of pinned section (or start of unpinned section)
+			let insertIdx = 0;
+			while (insertIdx < next.length && next[insertIdx].pinned) insertIdx++;
+			next.splice(insertIdx, 0, tab);
+			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
+			return { prev };
+		},
+		onError: (_err, _vars, ctx) => {
+			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		},
+	});
+
 	// --- Clear tabs by scope (optimistic) ---
 	const clearMutation = useMutation({
 		mutationFn: ({
@@ -272,6 +298,10 @@ export function useRecentTabs() {
 		moveTab: useCallback(
 			(key: string, target: RecentTabApiMoveTarget) => moveMutation.mutate({ key, target }),
 			[moveMutation],
+		),
+		pinTab: useCallback(
+			(key: string, pinned: boolean) => pinMutation.mutate({ key, pinned }),
+			[pinMutation],
 		),
 		clearTabs: useCallback(
 			(scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>

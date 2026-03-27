@@ -1,6 +1,5 @@
 import { useDeletePreview } from "@frontend/hooks/useNarrator";
 import {
-	Accordion,
 	Badge,
 	Box,
 	Button,
@@ -10,8 +9,10 @@ import {
 	ScrollArea,
 	Stack,
 	Text,
+	UnstyledButton,
 } from "@mantine/core";
-import { IconFile, IconTrash } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconFile, IconTrash } from "@tabler/icons-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DiffView } from "./DiffView";
 
@@ -28,6 +29,7 @@ export function FileDeletePreviewTab({
 }) {
 	const { t } = useTranslation("narrator");
 	const { data, isLoading } = useDeletePreview(narratorId, messageId, true);
+	const [expandedFile, setExpandedFile] = useState<string | null>(null);
 
 	if (isLoading) {
 		return (
@@ -58,6 +60,10 @@ export function FileDeletePreviewTab({
 		);
 	}
 
+	const toggleFile = (filePath: string) => {
+		setExpandedFile((prev) => (prev === filePath ? null : filePath));
+	};
+
 	return (
 		<Stack gap="xs" h="100%">
 			<Group px="sm" py={4} justify="space-between">
@@ -68,14 +74,35 @@ export function FileDeletePreviewTab({
 			</Group>
 
 			<ScrollArea.Autosize mah="calc(100vh - 260px)" style={{ flex: 1 }}>
-				<Accordion variant="separated" chevronPosition="left" mx="xs">
+				<Stack gap={2} mx="xs">
 					{affectedFiles.map((file) => {
 						const lang = file.filePath.split(".").pop() ?? "";
+						const isExpanded = expandedFile === file.filePath;
 						return (
-							<Accordion.Item key={file.filePath} value={file.filePath}>
-								<Accordion.Control>
+							<Box
+								key={file.filePath}
+								style={{
+									borderRadius: "var(--mantine-radius-sm)",
+									border: "1px solid var(--mantine-color-dark-4)",
+									overflow: "hidden",
+								}}
+							>
+								<UnstyledButton
+									onClick={() => toggleFile(file.filePath)}
+									w="100%"
+									py={6}
+									px="xs"
+									style={{
+										backgroundColor: isExpanded ? "var(--mantine-color-dark-5)" : undefined,
+									}}
+								>
 									<Group gap="xs" wrap="nowrap" justify="space-between">
 										<Group gap="xs" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
+											{isExpanded ? (
+												<IconChevronDown size={14} style={{ flexShrink: 0 }} />
+											) : (
+												<IconChevronRight size={14} style={{ flexShrink: 0 }} />
+											)}
 											{file.willBeDeleted ? (
 												<IconTrash size={14} style={{ flexShrink: 0 }} />
 											) : (
@@ -99,25 +126,28 @@ export function FileDeletePreviewTab({
 												: t("fileMod_willBeReverted")}
 										</Badge>
 									</Group>
-								</Accordion.Control>
-								<Accordion.Panel>
-									{file.willBeDeleted ? (
-										<Text size="xs" c="dimmed" py="xs">
-											{t("fileMod_willBeDeleted")}
-										</Text>
-									) : (
-										<DiffView
-											oldStr={file.currentContent ?? ""}
-											newStr={file.revertedContent ?? ""}
-											maxHeight={400}
-											language={lang}
-										/>
-									)}
-								</Accordion.Panel>
-							</Accordion.Item>
+								</UnstyledButton>
+
+								{isExpanded && (
+									<Box px="xs" pb="xs">
+										{file.willBeDeleted ? (
+											<Text size="xs" c="dimmed" py="xs">
+												{t("fileMod_willBeDeleted")}
+											</Text>
+										) : (
+											<DiffView
+												oldStr={file.currentContent ?? ""}
+												newStr={file.revertedContent ?? ""}
+												maxHeight={400}
+												language={lang}
+											/>
+										)}
+									</Box>
+								)}
+							</Box>
 						);
 					})}
-				</Accordion>
+				</Stack>
 			</ScrollArea.Autosize>
 
 			<Box px="sm" pb="sm">

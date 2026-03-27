@@ -727,6 +727,9 @@ export function NarratorPanel({
 	onHeaderPointerDown,
 	onClose,
 	onOpenTerminalPanel,
+	fileModPanelOpen,
+	onToggleFileModPanel,
+	onFileModPropsChange,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -1162,8 +1165,30 @@ export function NarratorPanel({
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
 
-	// File modifications drawer state
-	const [fileModDrawerOpened, setFileModDrawerOpened] = useState(false);
+	// File modifications drawer/panel state
+	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
+	// otherwise use internal state (mobile drawer / workspace fallback).
+	const [internalFileModOpen, setInternalFileModOpen] = useState(false);
+	const fileModDrawerOpened = onToggleFileModPanel
+		? (fileModPanelOpen ?? false)
+		: internalFileModOpen;
+	const fileModPanelOpenRef = useRef(fileModPanelOpen ?? false);
+	fileModPanelOpenRef.current = fileModPanelOpen ?? false;
+	const externalSetFileModOpened = useCallback(
+		(v: boolean | ((prev: boolean) => boolean)) => {
+			if (!onToggleFileModPanel) return;
+			if (typeof v === "function") {
+				const next = v(fileModPanelOpenRef.current);
+				if (next !== fileModPanelOpenRef.current) onToggleFileModPanel();
+			} else if (v !== fileModPanelOpenRef.current) {
+				onToggleFileModPanel();
+			}
+		},
+		[onToggleFileModPanel],
+	);
+	const setFileModDrawerOpened = onToggleFileModPanel
+		? externalSetFileModOpened
+		: setInternalFileModOpen;
 	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
 	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
 
@@ -1176,6 +1201,34 @@ export function NarratorPanel({
 		}
 		return null;
 	}, [renderPermCb.pendingPermsMap]);
+
+	// Expose file-mod panel props to parent for desktop sidebar rendering
+	useEffect(() => {
+		if (onFileModPropsChange) {
+			onFileModPropsChange({
+				narratorId,
+				pendingPermission: firstEditPermission,
+				onPermissionDecision: renderPermCb.onPermissionDecision,
+				deletePreviewMessageId,
+				onConfirmDelete: () => {
+					pendingDeleteCallback?.();
+					setDeletePreviewMessageId(null);
+					setPendingDeleteCallback(null);
+				},
+				onCancelDelete: () => {
+					setDeletePreviewMessageId(null);
+					setPendingDeleteCallback(null);
+				},
+			});
+		}
+	}, [
+		onFileModPropsChange,
+		narratorId,
+		firstEditPermission,
+		renderPermCb.onPermissionDecision,
+		deletePreviewMessageId,
+		pendingDeleteCallback,
+	]);
 
 	const isWorking = narrator?.status === "thinking";
 	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
@@ -1221,7 +1274,7 @@ export function NarratorPanel({
 		() => ({
 			openForApproval: () => setFileModDrawerOpened(true),
 		}),
-		[],
+		[setFileModDrawerOpened],
 	);
 
 	// --- Retry countdown ---
@@ -4095,27 +4148,30 @@ export function NarratorPanel({
 					</Box>
 				)}
 
-				<FileModificationsDrawer
-					narratorId={narratorId}
-					opened={fileModDrawerOpened}
-					onClose={() => {
-						setFileModDrawerOpened(false);
-						setDeletePreviewMessageId(null);
-						setPendingDeleteCallback(null);
-					}}
-					pendingPermission={firstEditPermission}
-					onPermissionDecision={renderPermCb.onPermissionDecision}
-					deletePreviewMessageId={deletePreviewMessageId}
-					onConfirmDelete={() => {
-						pendingDeleteCallback?.();
-						setDeletePreviewMessageId(null);
-						setPendingDeleteCallback(null);
-					}}
-					onCancelDelete={() => {
-						setDeletePreviewMessageId(null);
-						setPendingDeleteCallback(null);
-					}}
-				/>
+				{/* Only render Drawer when NOT in external sidebar mode (i.e. mobile / workspace) */}
+				{!onToggleFileModPanel && (
+					<FileModificationsDrawer
+						narratorId={narratorId}
+						opened={fileModDrawerOpened}
+						onClose={() => {
+							setFileModDrawerOpened(false);
+							setDeletePreviewMessageId(null);
+							setPendingDeleteCallback(null);
+						}}
+						pendingPermission={firstEditPermission}
+						onPermissionDecision={renderPermCb.onPermissionDecision}
+						deletePreviewMessageId={deletePreviewMessageId}
+						onConfirmDelete={() => {
+							pendingDeleteCallback?.();
+							setDeletePreviewMessageId(null);
+							setPendingDeleteCallback(null);
+						}}
+						onCancelDelete={() => {
+							setDeletePreviewMessageId(null);
+							setPendingDeleteCallback(null);
+						}}
+					/>
+				)}
 			</Stack>
 		</ContentViewerEnvironmentProvider>
 	);

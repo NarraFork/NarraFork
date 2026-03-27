@@ -7,6 +7,21 @@ import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
+ * Per-narrator per-terminal read cursor.
+ * Tracks the plain-text character length at the end of the last read/write
+ * so that subsequent reads without `last_n_lines` return only new output,
+ * preventing stale content from polluting the LLM context.
+ *
+ * Key: `${narratorId}:${terminalId}`, Value: character offset after last read.
+ * Pure in-memory — resets naturally when the server restarts.
+ */
+const readCursors = new Map<string, number>();
+
+function cursorKey(narratorId: string, terminalId: string): string {
+	return `${narratorId}:${terminalId}`;
+}
+
+/**
  * Strip ANSI escape sequences from terminal output to produce plain text
  * that is easier for the LLM to read.
  */
@@ -59,10 +74,14 @@ async function assertTerminalAccess(
 	// Chapter-level access: terminal belongs to the same chapter as the narrator
 	if (terminal.chapterId) {
 		// Use cached chapterId from ToolContext when available to avoid a DB lookup
-		const narratorChapterId = cachedChapterId ?? (await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { chapterId: true },
-		}))?.chapterId;
+		const narratorChapterId =
+			cachedChapterId ??
+			(
+				await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { chapterId: true },
+				})
+			)?.chapterId;
 		if (narratorChapterId && narratorChapterId === terminal.chapterId) {
 			return { allowed: true, terminal };
 		}
@@ -78,7 +97,9 @@ export const terminalTool: ToolDefinition = {
 	name: "Terminal",
 	description:
 		"Interact with a running interactive terminal (PTY). " +
-		"Use action 'read' to get the current terminal buffer content (what's visible on screen plus scrollback). " +
+		"Use action 'read' to get new terminal output since the last read (incremental). " +
+		"On the first read (or after a buffer reset), the full buffer is returned. " +
+		"Pass 'last_n_lines' to override incremental mode and always get the last N lines. " +
 		"Use action 'write' to send input to the terminal (keystrokes, commands, Ctrl-C, etc.). " +
 		"Use action 'list' to list available terminals for the current narrator. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
@@ -104,8 +125,8 @@ export const terminalTool: ToolDefinition = {
 			.min(1)
 			.optional()
 			.describe(
-				"For 'read' action: only return the last N lines of the buffer. " +
-					"Useful for checking recent output without reading the entire scrollback.",
+				"For 'read' action: only return the last N lines of the buffer (overrides incremental mode). " +
+					"When omitted, read returns only new output since the last read/write call.",
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
@@ -208,15 +229,34 @@ async function readBuffer(
 		};
 	}
 
-	let text = extractPlainText(scrollback.data);
+	const fullText = extractPlainText(scrollback.data);
+	let text: string;
 
 	if (lastNLines !== undefined) {
-		text = tailSlice(text, lastNLines, WRITE_TAIL_CHARS);
+		// Explicit last_n_lines — bypass incremental mode
+		text = tailSlice(fullText, lastNLines, WRITE_TAIL_CHARS);
+	} else {
+		// Incremental mode: return only content after the cursor
+		const key = cursorKey(narratorId, terminalId);
+		const cursor = readCursors.get(key);
+
+		if (cursor !== undefined && cursor <= fullText.length) {
+			// Have a valid cursor — extract only new content
+			text = fullText.slice(cursor);
+		} else {
+			// No cursor (first read) or buffer was reset (cursor > length) — return full
+			text = fullText;
+		}
+		// Cap incremental output to avoid flooding context
+		text = tailSlice(text, READ_INCREMENTAL_MAX_LINES, READ_INCREMENTAL_MAX_CHARS);
 	}
+
+	// Update cursor to current end regardless of mode
+	readCursors.set(cursorKey(narratorId, terminalId), fullText.length);
 
 	if (!text.trim()) {
 		return {
-			output: "(terminal buffer is empty)",
+			output: "(no new output since last read)",
 			title: terminal.name ?? terminalId,
 		};
 	}
@@ -239,6 +279,10 @@ const WRITE_SETTLE_QUIET_MS = 500;
 const WRITE_TAIL_LINES = 80;
 /** Max characters to return from the buffer tail after a write */
 const WRITE_TAIL_CHARS = 20_000;
+/** Max lines for incremental read (no last_n_lines) */
+const READ_INCREMENTAL_MAX_LINES = 200;
+/** Max characters for incremental read (no last_n_lines) */
+const READ_INCREMENTAL_MAX_CHARS = 40_000;
 
 /**
  * Take the last N lines from text, also capping total character count.
@@ -324,6 +368,10 @@ async function writeInput(
 	}
 
 	let text = extractPlainText(afterSnapshot.data);
+
+	// Update cursor so subsequent reads skip what we already returned
+	readCursors.set(cursorKey(narratorId, terminalId), text.length);
+
 	text = tailSlice(text, WRITE_TAIL_LINES, WRITE_TAIL_CHARS);
 
 	if (!text.trim()) {

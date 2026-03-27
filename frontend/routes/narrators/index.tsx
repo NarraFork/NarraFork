@@ -43,7 +43,7 @@ import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
-import { formatRelativeTime } from "../../lib/format";
+import { formatSmartTime } from "../../lib/format";
 
 interface NarratorSearchParams {
 	create?: boolean;
@@ -604,9 +604,9 @@ function NarratorsPage() {
 											</Badge>
 										)}
 										<Text size="xs" c="dimmed" style={{ marginLeft: "auto", whiteSpace: "nowrap" }}>
-											{formatRelativeTime(
-												sortBy === "updatedAt" ? narrator.updatedAt : narrator.createdAt,
-											)}
+											{t("createdAtLabel", { time: formatSmartTime(narrator.createdAt) })}
+											{narrator.lastMessageAt &&
+												` · ${t("lastMessageAtLabel", { time: formatSmartTime(narrator.lastMessageAt) })}`}
 										</Text>
 									</Group>
 									{(chapter?.projectName || narrator.cwd) && (
@@ -720,9 +720,9 @@ function NarratorsPage() {
 												</Tooltip>
 											)}
 											<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
-												{formatRelativeTime(
-													sortBy === "updatedAt" ? narrator.updatedAt : narrator.createdAt,
-												)}
+												{t("createdAtLabel", { time: formatSmartTime(narrator.createdAt) })}
+												{narrator.lastMessageAt &&
+													` · ${t("lastMessageAtLabel", { time: formatSmartTime(narrator.lastMessageAt) })}`}
 											</Text>
 										</Group>
 										<Tooltip label={t("archive")}>

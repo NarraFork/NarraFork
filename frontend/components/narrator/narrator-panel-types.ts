@@ -131,6 +131,26 @@ export interface NarratorPanelProps {
 	onClose?: () => void;
 	/** Open a terminal panel next to this narrator (workspace mode) */
 	onOpenTerminalPanel?: () => void;
+	/** Whether the file modifications panel is open (desktop sidebar mode) */
+	fileModPanelOpen?: boolean;
+	/** Toggle the file modifications panel (desktop sidebar mode) */
+	onToggleFileModPanel?: () => void;
+	/** Callback that NarratorPanel calls when file-mod panel props change, so the parent can render the sidebar */
+	onFileModPropsChange?: (props: FileModPanelExternalProps) => void;
+}
+
+/** Props that NarratorPanel exposes for the external file-mod sidebar panel */
+export interface FileModPanelExternalProps {
+	narratorId: string;
+	pendingPermission: PendingPermission | null;
+	onPermissionDecision: (
+		requestId: string,
+		decision: "allow" | "deny",
+		feedbackText?: string,
+	) => void;
+	deletePreviewMessageId: string | null;
+	onConfirmDelete: () => void;
+	onCancelDelete: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;

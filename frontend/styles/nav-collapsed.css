@@ -1,0 +1,17 @@
+/*
+ * Collapsed navbar: center NavLink icons when label is hidden.
+ * Applied via data-collapsed attribute on AppShell.Navbar.
+ */
+
+[data-collapsed] .mantine-NavLink-root {
+	justify-content: center;
+	padding-inline: 0;
+}
+
+[data-collapsed] .mantine-NavLink-section {
+	margin-inline-end: 0;
+}
+
+[data-collapsed] .mantine-NavLink-body {
+	display: none;
+}

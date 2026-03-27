@@ -514,6 +514,7 @@ export const recentTabSchema = z.object({
 	subtitle: z.string().max(200).optional(),
 	status: z.string().max(50).optional(),
 	lastVisitedAt: z.number(),
+	pinned: z.boolean().optional(),
 });
 
 export const upsertRecentTabSchema = recentTabSchema.extend({
@@ -533,6 +534,13 @@ export const moveRecentTabSchema = z.object({
 	toIndex: z.number().int().min(0).max(20).optional(),
 	/** Named position — mutually exclusive with toIndex */
 	position: z.enum(["top", "above_idle"]).optional(),
+});
+
+export const pinRecentTabSchema = z.object({
+	/** Tab key in "type:id" format */
+	key: z.string().min(1).max(100),
+	/** Whether to pin or unpin */
+	pinned: z.boolean(),
 });
 
 export const clearRecentTabsSchema = z.object({

@@ -7,6 +7,7 @@ import { AnthropicProvidersSection } from "../../components/providers/AnthropicP
 import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CustomModelsSection } from "../../components/providers/CustomModelsSection";
+import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
 import {
 	type AnthropicProviderState,
@@ -224,7 +225,39 @@ function ProvidersPage() {
 		},
 	);
 
+	// Prefix conflict detection — reserved prefixes and cross-provider duplicates
+	// Extract cline provider prefixes from settings (cline state is not locally managed)
+	const clineProviderPrefixes = useMemo(() => {
+		const cps = (settings?.clineProviders ?? []) as Array<{ id: string; prefix?: string }>;
+		return cps
+			.filter((p): p is { id: string; prefix: string } => !!p.prefix)
+			.map((p) => ({ id: p.id, prefix: p.prefix }));
+	}, [settings]);
+	const getPrefixError = useCallback(
+		(prefix: string, currentProviderId: string): string | undefined => {
+			if (!prefix) return undefined;
+			if (RESERVED_PREFIXES.has(prefix)) return t("prefixReserved", { prefix });
+			// Check duplicates across all provider types
+			const allProviders: Array<{ id: string; prefix: string }> = [
+				...openaiProviders,
+				...anthropicProviders,
+				...clineProviderPrefixes,
+			];
+			const dup = allProviders.find((p) => p.prefix === prefix && p.id !== currentProviderId);
+			if (dup) return t("prefixDuplicate", { prefix });
+			return undefined;
+		},
+		[
+			RESERVED_PREFIXES,
+			openaiProviders,
+			anthropicProviders,
+			clineProviderPrefixes,
+			t,
+		],
+	);
+
 	const [highlight, setHighlight] = useState(false);
+	const [testingModel, setTestingModel] = useState<string | null>(null);
 	useEffect(() => {
 		if (isDirty) {
 			setHighlight(true);
@@ -408,6 +441,8 @@ function ProvidersPage() {
 					onContextWindowChange={handleContextWindowChange}
 					customModels={customModels}
 					onCustomModelsChange={setCustomModels}
+					getPrefixError={getPrefixError}
+					onTestModel={setTestingModel}
 				/>
 
 					settings={settings}
@@ -417,6 +452,7 @@ function ProvidersPage() {
 					onCustomModelsChange={setCustomModels}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
+					onTestModel={setTestingModel}
 				/>
 
 				<CodexSection
@@ -426,6 +462,7 @@ function ProvidersPage() {
 					onCustomModelsChange={setCustomModels}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
+					onTestModel={setTestingModel}
 				/>
 
 				<ClineSection
@@ -436,6 +473,7 @@ function ProvidersPage() {
 					onCustomModelsChange={setCustomModels}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
+					onTestModel={setTestingModel}
 				/>
 
 				<OpenAIProvidersSection
@@ -450,6 +488,8 @@ function ProvidersPage() {
 					isProviderDirty={isOpenaiProviderDirty}
 					customModels={customModels}
 					onCustomModelsChange={setCustomModels}
+					getPrefixError={getPrefixError}
+					onTestModel={setTestingModel}
 				/>
 
 				<AnthropicProvidersSection
@@ -464,6 +504,8 @@ function ProvidersPage() {
 					isProviderDirty={isAnthropicProviderDirty}
 					customModels={customModels}
 					onCustomModelsChange={setCustomModels}
+					getPrefixError={getPrefixError}
+					onTestModel={setTestingModel}
 				/>
 
 				{/* Orphan custom models: models whose provider prefix doesn't match any configured provider */}
@@ -521,6 +563,11 @@ function ProvidersPage() {
 				100% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
 			}
 		`}</style>
+			<ModelTestDialog
+				opened={testingModel !== null}
+				onClose={() => setTestingModel(null)}
+				modelValue={testingModel ?? ""}
+			/>
 		</>
 	);
 }

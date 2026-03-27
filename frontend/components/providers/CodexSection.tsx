@@ -29,6 +29,7 @@ import {
 	IconEye,
 	IconEyeOff,
 	IconPencil,
+	IconPlayerPlay,
 	IconRefresh,
 	IconTrash,
 	IconX,
@@ -56,6 +57,7 @@ interface CodexSectionProps {
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onTestModel?: (model: string) => void;
 }
 
 export function CodexSection({
@@ -65,6 +67,7 @@ export function CodexSection({
 	onCustomModelsChange,
 	modelContextWindows,
 	onContextWindowChange,
+	onTestModel,
 }: CodexSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
@@ -868,6 +871,15 @@ export function CodexSection({
 												style={{ flex: 1, minWidth: 120 }}
 												size="xs"
 											/>
+											<Tooltip label={t("modelTestBtn")}>
+												<ActionIcon
+													variant="subtle"
+													color="teal"
+													onClick={() => onTestModel?.(modelVal)}
+												>
+													<IconPlayerPlay size={16} />
+												</ActionIcon>
+											</Tooltip>
 											<ActionIcon
 												variant="subtle"
 												color={isHidden ? "gray" : "blue"}

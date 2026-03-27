@@ -56,5 +56,7 @@
 	"splitRight": "向右分割",
 	"splitDown": "向下分割",
 	"dropNarratorHere": "拖放叙述者到此处",
-	"distributePanels": "均匀分配面板"
+	"distributePanels": "均匀分配面板",
+	"createdAtLabel": "创建于 {{time}}",
+	"lastMessageAtLabel": "最后消息 {{time}}"
 }

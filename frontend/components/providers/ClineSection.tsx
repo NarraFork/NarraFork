@@ -12,6 +12,7 @@ import {
 	Textarea,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -24,6 +25,7 @@ import {
 	IconLogin,
 	IconLogout,
 	IconMinus,
+	IconPlayerPlay,
 	IconPlus,
 	IconRefresh,
 	IconSearch,
@@ -45,6 +47,7 @@ interface ClineSectionProps {
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onTestModel?: (model: string) => void;
 }
 
 export function ClineSection({
@@ -55,6 +58,7 @@ export function ClineSection({
 	onCustomModelsChange,
 	modelContextWindows,
 	onContextWindowChange,
+	onTestModel,
 }: ClineSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -547,12 +551,7 @@ export function ClineSection({
 											{prefixed}
 										</Text>
 										{m.name && m.name !== m.id && (
-											<Text
-												size="xs"
-												c="dimmed"
-												style={{ flex: 1, minWidth: 80 }}
-												truncate
-											>
+											<Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 80 }} truncate>
 												{m.name}
 											</Text>
 										)}
@@ -568,6 +567,15 @@ export function ClineSection({
 											w={180}
 											size="xs"
 										/>
+										<Tooltip label={t("modelTestBtn")}>
+											<ActionIcon
+												variant="subtle"
+												color="teal"
+												onClick={() => onTestModel?.(prefixed)}
+											>
+												<IconPlayerPlay size={16} />
+											</ActionIcon>
+										</Tooltip>
 										<ActionIcon
 											variant="subtle"
 											color={isHidden ? "gray" : "blue"}

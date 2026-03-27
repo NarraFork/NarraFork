@@ -1,4 +1,5 @@
-import { Drawer, Tabs } from "@mantine/core";
+import { ActionIcon, Box, Drawer, Group, Tabs, Text } from "@mantine/core";
+import { IconFileCode, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FileApprovalTab } from "./FileApprovalTab";
@@ -8,9 +9,8 @@ import type { PendingPermission } from "./narrator-panel-types";
 
 const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
 
-export interface FileModificationsDrawerProps {
+export interface FileModificationsPanelProps {
 	narratorId: string;
-	opened: boolean;
 	onClose: () => void;
 	// Approval mode
 	pendingPermission?: PendingPermission | null;
@@ -25,20 +25,19 @@ export interface FileModificationsDrawerProps {
 	onCancelDelete?: () => void;
 }
 
-export function FileModificationsDrawer({
+/** Pure content panel — used as sidebar on desktop */
+export function FileModificationsPanel({
 	narratorId,
-	opened,
 	onClose,
 	pendingPermission,
 	onPermissionDecision,
 	deletePreviewMessageId,
 	onConfirmDelete,
 	onCancelDelete,
-}: FileModificationsDrawerProps) {
+}: FileModificationsPanelProps) {
 	const { t } = useTranslation("narrator");
 	const [activeTab, setActiveTab] = useState<string>("summary");
 
-	// Auto-switch tab based on context
 	const isEditPermission = pendingPermission && EDIT_TOOLS.has(pendingPermission.toolName);
 
 	useEffect(() => {
@@ -49,7 +48,6 @@ export function FileModificationsDrawer({
 		}
 	}, [deletePreviewMessageId, isEditPermission]);
 
-	// When delete preview completes or cancels, close drawer
 	const handleConfirmDelete = () => {
 		onConfirmDelete?.();
 		onClose();
@@ -60,28 +58,37 @@ export function FileModificationsDrawer({
 		onClose();
 	};
 
-	// When permission is decided via this panel, close approval tab
 	const handlePermissionDecision = (
 		requestId: string,
 		decision: "allow" | "deny",
 		feedbackText?: string,
 	) => {
 		onPermissionDecision?.(requestId, decision, feedbackText);
-		// Switch back to summary after decision
 		setActiveTab("summary");
 	};
 
 	return (
-		<Drawer
-			opened={opened}
-			onClose={onClose}
-			position="right"
-			size={600}
-			title={t("fileMod_title")}
-			styles={{
-				body: { height: "calc(100% - 60px)", padding: 0, display: "flex", flexDirection: "column" },
-			}}
-		>
+		<Box h="100%" style={{ display: "flex", flexDirection: "column" }}>
+			{/* Header */}
+			<Group
+				gap={6}
+				px="xs"
+				py={3}
+				style={{
+					flexShrink: 0,
+					borderBottom: "1px solid var(--mantine-color-dark-4)",
+				}}
+			>
+				<IconFileCode size={14} />
+				<Text size="xs" fw={500} style={{ flex: 1 }}>
+					{t("fileMod_title")}
+				</Text>
+				<ActionIcon size="xs" variant="subtle" color="gray" onClick={onClose}>
+					<IconX size={12} />
+				</ActionIcon>
+			</Group>
+
+			{/* Tabs content */}
 			<Tabs
 				value={activeTab}
 				onChange={(v) => setActiveTab(v ?? "summary")}
@@ -121,6 +128,39 @@ export function FileModificationsDrawer({
 					</Tabs.Panel>
 				)}
 			</Tabs>
+		</Box>
+	);
+}
+
+/** Drawer wrapper — used on mobile */
+export interface FileModificationsDrawerProps extends FileModificationsPanelProps {
+	opened: boolean;
+}
+
+export function FileModificationsDrawer({
+	opened,
+	onClose,
+	...rest
+}: FileModificationsDrawerProps) {
+	const { t } = useTranslation("narrator");
+
+	return (
+		<Drawer
+			opened={opened}
+			onClose={onClose}
+			position="right"
+			size={600}
+			title={t("fileMod_title")}
+			styles={{
+				body: {
+					height: "calc(100% - 60px)",
+					padding: 0,
+					display: "flex",
+					flexDirection: "column",
+				},
+			}}
+		>
+			<FileModificationsPanel onClose={onClose} {...rest} />
 		</Drawer>
 	);
 }

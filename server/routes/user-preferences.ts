@@ -14,6 +14,7 @@ import { generateId } from "../lib/id";
 import {
 	clearRecentTabsSchema,
 	moveRecentTabSchema,
+	pinRecentTabSchema,
 	removeRecentTabSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
@@ -845,10 +846,12 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 					for (const r of rows) statusMap.set(r.id, r.status);
 				}
 
-				// Find the first idle top-level tab (skip workspace children)
+				// Find the first idle top-level tab (skip workspace children and pinned tabs)
 				const IDLE_STATUSES = new Set(["idle"]);
 				let firstIdleIdx = -1;
 				for (let i = 0; i < tabs.length; i++) {
+					// Skip pinned tabs — they stay at the top
+					if (tabs[i].pinned) continue;
 					// Skip workspace children — they move with their header
 					if (tabs[i].workspaceId) continue;
 					// Skip workspace headers — check their children's status
@@ -891,6 +894,76 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 			regroupWorkspaces(tabs);
 
 			result = tabs;
+			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+				JSON.stringify(result),
+				now,
+				userId,
+			]);
+			sqlite.run("COMMIT");
+		}
+	} catch (err) {
+		sqlite.run("ROLLBACK");
+		throw err;
+	}
+
+	const enriched = await broadcastTabsSnapshot(userId, result);
+	return c.json(enriched);
+});
+
+/** Toggle pin/unpin on a recent tab */
+userPreferencesRoutes.patch("/recent-tabs/pin", async (c) => {
+	const userId = c.get("user").sub;
+	const body = await c.req.json();
+	const parsed = pinRecentTabSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { key, pinned } = parsed.data;
+	const now = new Date().toISOString();
+	let result: Record<string, unknown>[];
+
+	sqlite.run("BEGIN IMMEDIATE");
+	try {
+		const pref = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+		});
+		if (!pref) {
+			sqlite.run("COMMIT");
+			return c.json([]);
+		}
+
+		let tabs: Record<string, unknown>[] = [];
+		try {
+			tabs = JSON.parse(pref.recentTabs);
+		} catch {
+			sqlite.run("COMMIT");
+			return c.json([]);
+		}
+		migrateTabTypes(tabs);
+
+		const idx = tabs.findIndex((t) => `${t.type}:${t.id}` === key);
+		if (idx === -1) {
+			sqlite.run("COMMIT");
+			result = tabs;
+		} else {
+			if (pinned) {
+				tabs[idx].pinned = true;
+				// Move to end of pinned section (before first non-pinned tab)
+				const tab = tabs.splice(idx, 1)[0];
+				let insertIdx = 0;
+				while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
+				tabs.splice(insertIdx, 0, tab);
+			} else {
+				delete tabs[idx].pinned;
+				// Move to start of non-pinned section (after last pinned tab)
+				const tab = tabs.splice(idx, 1)[0];
+				let insertIdx = 0;
+				while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
+				tabs.splice(insertIdx, 0, tab);
+			}
+
+			regroupWorkspaces(tabs);
+			result = tabs;
+
 			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
 				JSON.stringify(result),
 				now,
