@@ -9,8 +9,6 @@
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import {
-	createReadStream,
-	createWriteStream,
 	existsSync,
 	mkdirSync,
 	readdirSync,
@@ -19,8 +17,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join, relative } from "node:path";
-import { createGzip } from "node:zlib";
-import { generateZstdPatch, type ZstdPatchMeta } from "../server/lib/blockmap";
+import { generateZstdPatch } from "../server/lib/zstd-patch";
 
 const ROOT = join(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -37,98 +34,6 @@ const GENERATED_MIGRATIONS_DATA_FILE = join(
 );
 const GENERATED_BUILD_INFO_FILE = join(ROOT, "server", "generated", "build-info.ts");
 const DIST_DIR = join(ROOT, "dist");
-
-// ============================================================================
-// Blockmap generation utilities (must be defined before use)
-// ============================================================================
-
-const BLOCK_SIZE = 64 * 1024; // 64KB blocks
-
-interface BlockmapFile {
-	name: string;
-	offset: number;
-	checksums: string[];
-	sizes: number[];
-}
-
-interface Blockmap {
-	version: "2";
-	files: BlockmapFile[];
-}
-
-interface BlockmapResult {
-	blockmap: Blockmap;
-	sha512: string;
-	fileSize: number;
-}
-
-async function generateBlockmapForFile(filePath: string): Promise<BlockmapResult> {
-	const fileSize = statSync(filePath).size;
-	const checksums: string[] = [];
-	const sizes: number[] = [];
-	const sha512Hash = createHash("sha512");
-
-	return new Promise((resolve, reject) => {
-		const stream = createReadStream(filePath, { highWaterMark: BLOCK_SIZE });
-		let currentBlock = Buffer.alloc(0);
-
-		stream.on("data", (chunk: Buffer) => {
-			sha512Hash.update(chunk);
-			currentBlock = Buffer.concat([currentBlock, chunk]);
-
-			while (currentBlock.length >= BLOCK_SIZE) {
-				const block = currentBlock.subarray(0, BLOCK_SIZE);
-				const hash = createHash("sha256").update(block).digest("base64");
-				checksums.push(hash);
-				sizes.push(BLOCK_SIZE);
-				currentBlock = currentBlock.subarray(BLOCK_SIZE);
-			}
-		});
-
-		stream.on("end", () => {
-			if (currentBlock.length > 0) {
-				const hash = createHash("sha256").update(currentBlock).digest("base64");
-				checksums.push(hash);
-				sizes.push(currentBlock.length);
-			}
-
-			const blockmap: Blockmap = {
-				version: "2",
-				files: [
-					{
-						name: filePath.split("/").pop() || filePath,
-						offset: 0,
-						checksums,
-						sizes,
-					},
-				],
-			};
-
-			resolve({
-				blockmap,
-				sha512: sha512Hash.digest("base64"),
-				fileSize,
-			});
-		});
-
-		stream.on("error", reject);
-	});
-}
-
-async function writeBlockmapToFile(blockmap: Blockmap, outputPath: string): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const json = JSON.stringify(blockmap);
-		const gzip = createGzip({ level: 9 });
-		const output = createWriteStream(outputPath);
-
-		output.on("finish", resolve);
-		output.on("error", reject);
-		gzip.on("error", reject);
-
-		gzip.pipe(output);
-		gzip.end(json);
-	});
-}
 
 function getLatestYmlName(target: string): string {
 	if (target.includes("darwin")) return "latest-mac.yml";
@@ -381,16 +286,11 @@ for (const platform of selectedPlatforms) {
 
 	console.log(`✓ Built: ${relative(ROOT, outfile)}`);
 
-	// Step 7: Generate blockmap and SHA512 for delta updates
-	console.log(`→ Generating blockmap for ${platform.name}...`);
-	const blockmapResult = await generateBlockmapForFile(outfile);
-	const blockmapPath = `${outfile}.blockmap`;
-	await writeBlockmapToFile(blockmapResult.blockmap, blockmapPath);
-	console.log(
-		`✓ Blockmap: ${relative(ROOT, blockmapPath)} (${blockmapResult.blockmap.files[0].checksums.length} blocks)`,
-	);
+	// Compute SHA-512 and file size for latest.yml
+	const fileSha512 = createHash("sha512").update(readFileSync(outfile)).digest("base64");
+	const fileSize = statSync(outfile).size;
 
-	// Step 8: Generate zstd dictionary patch against previous version
+	// Step 7: Generate zstd dictionary patch against previous version
 	const prevBinary = findPreviousVersionBinary(platform.name, VERSION);
 	if (prevBinary) {
 		console.log(`→ Generating zstd patch from ${relative(ROOT, prevBinary.path)}...`);
@@ -424,8 +324,8 @@ for (const platform of selectedPlatforms) {
 	const latestYml = generateLatestYml({
 		version: VERSION,
 		path: platform.name,
-		sha512: blockmapResult.sha512,
-		fileSize: blockmapResult.fileSize,
+		sha512: fileSha512,
+		fileSize: fileSize,
 	});
 	writeFileSync(latestYmlPath, latestYml);
 	console.log(`✓ Generated: ${relative(ROOT, latestYmlPath)}`);

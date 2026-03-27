@@ -1,13 +1,12 @@
 /**
  * Update service for delta updates.
- * Handles version checking, blockmap diffing, and update downloading.
+ * Handles version checking, zstd patch application, and update downloading.
  */
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	copyFileSync,
 	createReadStream,
-	createWriteStream,
 	existsSync,
 	mkdirSync,
 	readdirSync,
@@ -19,27 +18,101 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import {
-	applyZstdPatch,
-	type Blockmap,
-	calculateDiff,
-	calculateDiffSize,
-	calculateTotalSize,
-	type DiffBlock,
-	diffToRangeHeader,
-	generateBlockmap,
-	parseBlockmapBuffer,
-	writeBlockmapFile,
-	type ZstdPatchMeta,
-} from "../lib/blockmap";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { APP_VERSION } from "../lib/version";
+import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
+
+const NARRAFORK_DIR = join(homedir(), ".narrafork");
+const BIN_DIR = join(NARRAFORK_DIR, "bin");
+
+/**
+ * Find or download the zstd CLI binary.
+ * - Linux/macOS: check system PATH
+ * - Windows: check BIN_DIR for cached zstd.exe, download from update server if missing
+ * Returns the path to zstd binary, or null if unavailable.
+ */
+async function getZstdCliPath(): Promise<string | null> {
+	// Check system PATH first
+	try {
+		const result = Bun.spawnSync(["zstd", "--version"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (result.exitCode === 0) return "zstd";
+	} catch {
+		// zstd not in PATH
+	}
+
+	// Determine platform-specific binary name
+	let toolName: string;
+	let cachedName: string;
+	if (process.platform === "win32") {
+		toolName = "zstd-win64.exe";
+		cachedName = "zstd.exe";
+	} else if (process.platform === "linux" && process.arch === "arm64") {
+		toolName = "zstd-linux-arm64";
+		cachedName = "zstd";
+	} else if (process.platform === "linux") {
+		toolName = "zstd-linux-x64";
+		cachedName = "zstd";
+	} else if (process.platform === "darwin") {
+		// macOS: try installing via Homebrew
+		const brewResult = Bun.spawnSync(["brew", "install", "zstd"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (brewResult.exitCode === 0) {
+			const recheck = Bun.spawnSync(["zstd", "--version"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (recheck.exitCode === 0) {
+				logger.info("Installed zstd via Homebrew");
+				return "zstd";
+			}
+		}
+		return null;
+	} else {
+		// Unknown platform
+		return null;
+	}
+
+	// Check cached binary
+	const cached = join(BIN_DIR, cachedName);
+	if (existsSync(cached)) {
+		// Ensure executable
+		try {
+			chmodSync(cached, 0o755);
+		} catch {}
+		return cached;
+	}
+
+	// Download from update server
+	const serverUrl = getServerBaseUrl();
+	if (!serverUrl) return null;
+
+	try {
+		const resp = await fetch(`${serverUrl}/api/v2/tools/${toolName}`);
+		if (resp.ok) {
+			mkdirSync(BIN_DIR, { recursive: true });
+			const buf = Buffer.from(await resp.arrayBuffer());
+			writeFileSync(cached, buf);
+			chmodSync(cached, 0o755);
+			logger.info("Downloaded zstd CLI", { path: cached, size: buf.length });
+			return cached;
+		}
+	} catch (err) {
+		logger.debug("Failed to download zstd CLI", { error: String(err) });
+	}
+
+	return null;
+}
 
 export interface ReleaseInfo {
 	version: string;
 	releaseDate: string;
-	releaseNotes?: string;
+	releaseNotes?: string | Record<string, string>;
 	path: string;
 	sha512: string;
 	files: Array<{
@@ -49,13 +122,22 @@ export interface ReleaseInfo {
 	}>;
 	/** V2 API URLs — populated by checkForUpdate when using v2 server */
 	_v2?: {
-		downloadUrl: string;
-		blockmapUrl?: string;
 		zstdPatchUrl?: string;
 		zstdPatchMetaUrl?: string;
-		/** Whether the server has the full binary for download. */
-		hasFullFile?: boolean;
+		patchChain?: Array<{
+			fromVersion: string;
+			toVersion: string;
+			patchSize: number;
+			url: string;
+			metaUrl: string;
+		}>;
 	};
+	/** Release notes for each version in the update path */
+	releaseNotesPerVersion?: Array<{
+		version: string;
+		releaseDate: string;
+		releaseNotes?: string | Record<string, string>;
+	}>;
 }
 
 export interface UpdateCheckResult {
@@ -63,12 +145,21 @@ export interface UpdateCheckResult {
 	currentVersion: string;
 	latestVersion?: string;
 	releaseInfo?: ReleaseInfo;
+	/** Actual download size based on chosen strategy */
 	downloadSize?: number;
 	totalSize?: number;
-	diffBlocks?: number;
-	totalBlocks?: number;
-	/** Size of zstd dictionary patch if available (smaller than blockmap diff) */
+	/** Size of zstd dictionary patch if available */
 	zstdPatchSize?: number;
+	/** Which strategy will be used */
+	strategy?: "zstd";
+	/** Patch chain for multi-step updates when direct patch is unavailable */
+	patchChain?: Array<{
+		fromVersion: string;
+		toVersion: string;
+		patchSize: number;
+		url: string;
+		metaUrl: string;
+	}>;
 }
 
 export interface UpdateProgress {
@@ -103,7 +194,8 @@ function getPlatform(): string {
  */
 function getCurrentExecutablePath(): string | null {
 	// Check if running as compiled binary
-	if (import.meta.url.startsWith("file:///$bunfs/")) {
+	// Linux/macOS: $bunfs, Windows: ~BUN/%7EBUN
+	if (import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/")) {
 		return process.execPath;
 	}
 	return null;
@@ -115,17 +207,12 @@ interface V2CheckResponse {
 	currentVersion?: string;
 	version?: string;
 	releaseDate?: string;
-	releaseNotes?: string;
+	releaseNotes?: string | Record<string, string>;
 	platform?: string;
 	file?: {
 		filename: string;
 		size: number;
 		sha512: string;
-	};
-	/** Whether the full binary is available for download (false = delta only). */
-	hasFullFile?: boolean;
-	blockmap?: {
-		url: string;
 	};
 	zstdPatch?: {
 		fromVersion: string;
@@ -133,6 +220,18 @@ interface V2CheckResponse {
 		url: string;
 		metaUrl: string;
 	} | null;
+	patchChain?: Array<{
+		fromVersion: string;
+		toVersion: string;
+		patchSize: number;
+		url: string;
+		metaUrl: string;
+	}> | null;
+	releaseNotesPerVersion?: Array<{
+		version: string;
+		releaseDate: string;
+		releaseNotes?: string | Record<string, string>;
+	}>;
 }
 
 /**
@@ -190,59 +289,40 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 					sha512: data.file.sha512,
 				},
 			],
-			// Store v2-specific URLs for download phase
 			_v2: {
-				downloadUrl: `${serverUrl}/api/v2/products/${product}/releases/${data.version}/download/${data.file.filename}`,
-				blockmapUrl: data.blockmap ? `${serverUrl}${data.blockmap.url}` : undefined,
 				zstdPatchUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.url}` : undefined,
 				zstdPatchMetaUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.metaUrl}` : undefined,
-				hasFullFile: data.hasFullFile ?? true,
+				patchChain: data.patchChain?.map((step) => ({
+					...step,
+					url: `${serverUrl}${step.url}`,
+					metaUrl: `${serverUrl}${step.metaUrl}`,
+				})),
 			},
+			releaseNotesPerVersion: data.releaseNotesPerVersion,
 		};
 
-		// Calculate diff size if we have a local blockmap
 		let downloadSize: number | undefined;
-		let totalSize: number | undefined;
-		let diffBlocks: number | undefined;
-		let totalBlocks: number | undefined;
 		let zstdPatchSize: number | undefined;
+		let strategy: "zstd" | undefined;
+		let patchChain: UpdateCheckResult["patchChain"];
 
-		// Use zstd patch size from server response directly
-		if (data.zstdPatch) {
+		// Check zstd patch availability
+		if (data.zstdPatch && data.zstdPatch.fromVersion === APP_VERSION) {
 			zstdPatchSize = data.zstdPatch.patchSize;
+			strategy = "zstd";
 			downloadSize = zstdPatchSize;
+		} else if (data.patchChain && data.patchChain.length > 0) {
+			// No direct patch — use chain
+			patchChain = data.patchChain.map((step) => ({
+				...step,
+				url: `${serverUrl}${step.url}`,
+				metaUrl: `${serverUrl}${step.metaUrl}`,
+			}));
+			strategy = "zstd";
+			downloadSize = patchChain.reduce((sum, s) => sum + s.patchSize, 0);
 		}
 
-		const execPath = getCurrentExecutablePath();
-		if (execPath && releaseInfo._v2?.blockmapUrl) {
-			try {
-				const blockmapResponse = await fetch(releaseInfo._v2.blockmapUrl);
-				if (blockmapResponse.ok) {
-					const blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
-					const newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
-
-					const localResult = await generateBlockmap(execPath);
-					const localBlockmap = localResult.blockmap;
-
-					const diff = calculateDiff(localBlockmap, newBlockmap);
-					const blockDiffSize = calculateDiffSize(diff);
-					totalSize = calculateTotalSize(newBlockmap);
-					diffBlocks = diff.length;
-					totalBlocks = newBlockmap.files[0]?.checksums.length ?? 0;
-
-					// Use blockmap diff size if no zstd patch or blockmap is smaller
-					if (!downloadSize || blockDiffSize < downloadSize) {
-						downloadSize = blockDiffSize;
-					}
-				}
-			} catch (err) {
-				logger.debug("Failed to calculate diff size", { error: String(err) });
-				totalSize = data.file.size;
-				if (!downloadSize) downloadSize = totalSize;
-			}
-		}
-
-		if (!totalSize) totalSize = data.file.size;
+		const totalSize = data.file.size;
 		if (!downloadSize) downloadSize = totalSize;
 
 		return {
@@ -252,9 +332,9 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 			releaseInfo,
 			downloadSize,
 			totalSize,
-			diffBlocks,
-			totalBlocks,
 			zstdPatchSize,
+			strategy,
+			patchChain,
 		};
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
@@ -263,7 +343,7 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 }
 
 /**
- * Download and apply an update using delta updates when possible.
+ * Download and apply an update using zstd patches.
  */
 export async function downloadUpdate(
 	releaseInfo: ReleaseInfo,
@@ -276,17 +356,17 @@ export async function downloadUpdate(
 
 	const execPath = getCurrentExecutablePath();
 
-	// Use v2 URLs if available, otherwise build from server URL
-	const product = settings.update?.product ?? "narrafork";
-	const fileDownloadUrl =
-		releaseInfo._v2?.downloadUrl ??
-		`${serverUrl}/api/v2/products/${product}/releases/${releaseInfo.version}/download/${releaseInfo.path}`;
-
 	// Ensure update directory exists
 	mkdirSync(UPDATE_DIR, { recursive: true });
 
 	const updatePath = join(UPDATE_DIR, basename(releaseInfo.path));
 	const tempPath = `${updatePath}.tmp`;
+
+	logger.info("Starting update download", {
+		version: releaseInfo.version,
+		execPath,
+		hasV2: !!releaseInfo._v2,
+	});
 
 	try {
 		onProgress?.({
@@ -296,17 +376,10 @@ export async function downloadUpdate(
 			percent: 0,
 		});
 
-		let useDelta = false;
-		let useZstdPatch = false;
-		let diff: DiffBlock[] = [];
-		let newBlockmap: Blockmap | null = null;
-		let localBlockmap: Blockmap | null = null;
-		let zstdPatchMeta: ZstdPatchMeta | null = null;
-		let zstdPatchBuf: Buffer | null = null;
+		let applied = false;
 
-		// Try delta update if we have a local executable
+		// Strategy: direct zstd patch
 		if (execPath && existsSync(execPath)) {
-			// Strategy 1: zstd dictionary patch (smallest, ~4MB)
 			const zstdMetaUrl = releaseInfo._v2?.zstdPatchMetaUrl;
 			const zstdPatchUrl = releaseInfo._v2?.zstdPatchUrl;
 
@@ -314,130 +387,164 @@ export async function downloadUpdate(
 				try {
 					const metaResp = await fetch(zstdMetaUrl);
 					if (metaResp.ok) {
-						zstdPatchMeta = (await metaResp.json()) as ZstdPatchMeta;
+						const meta = (await metaResp.json()) as ZstdPatchMeta;
+						if (meta.fromVersion === APP_VERSION) {
+							onProgress?.({
+								phase: "downloading",
+								bytesDownloaded: 0,
+								totalBytes: meta.patchSize,
+								percent: 0,
+							});
 
-						if (zstdPatchMeta.fromVersion === APP_VERSION) {
 							const patchResp = await fetch(zstdPatchUrl);
 							if (patchResp.ok) {
-								zstdPatchBuf = Buffer.from(await patchResp.arrayBuffer());
-								useZstdPatch = true;
+								const patchBuf = Buffer.from(await patchResp.arrayBuffer());
 								onProgress?.({
 									phase: "downloading",
-									bytesDownloaded: zstdPatchBuf.length,
-									totalBytes: zstdPatchBuf.length,
+									bytesDownloaded: patchBuf.length,
+									totalBytes: patchBuf.length,
 									percent: 100,
 								});
-								logger.info("Using zstd dictionary patch", {
-									fromVersion: zstdPatchMeta.fromVersion,
-									toVersion: zstdPatchMeta.toVersion,
-									patchSize: zstdPatchBuf.length,
-									totalSize: zstdPatchMeta.newFileSize,
-									savings: `${Math.round((1 - zstdPatchBuf.length / zstdPatchMeta.newFileSize) * 100)}%`,
+
+								logger.info("Applying zstd patch", {
+									patchSize: patchBuf.length,
+									newFileSize: meta.newFileSize,
+									mode: meta.mode ?? "dictionary",
+								});
+
+								onProgress?.({
+									phase: "applying",
+									bytesDownloaded: patchBuf.length,
+									totalBytes: meta.newFileSize,
+									percent: 50,
+								});
+
+								// For patch-from mode, we need zstd CLI
+								let zstdCliPath: string | undefined;
+								if (meta.mode === "patch-from") {
+									const cli = await getZstdCliPath();
+									if (!cli) {
+										logger.warn("Zstd CLI not available for patch-from mode, skipping");
+										throw new Error("zstd CLI required for patch-from mode");
+									}
+									zstdCliPath = cli;
+								}
+
+								const oldBuf = readFileSync(execPath);
+								const newBuf = applyZstdPatch(oldBuf, patchBuf, meta, zstdCliPath);
+								writeFileSync(tempPath, newBuf);
+								applied = true;
+
+								onProgress?.({
+									phase: "applying",
+									bytesDownloaded: patchBuf.length,
+									totalBytes: meta.newFileSize,
+									percent: 100,
+								});
+
+								logger.info("Zstd patch applied successfully", {
+									patchSize: patchBuf.length,
+									resultSize: newBuf.length,
 								});
 							}
 						} else {
 							logger.debug("Zstd patch version mismatch", {
-								patchFrom: zstdPatchMeta.fromVersion,
+								patchFrom: meta.fromVersion,
 								current: APP_VERSION,
 							});
 						}
 					}
 				} catch (err) {
-					logger.debug("Zstd patch not available", { error: String(err) });
+					logger.warn("Zstd patch failed", { error: String(err) });
 				}
 			}
+		}
 
-			// Strategy 2: blockmap delta (fallback, ~17MB)
-			if (!useZstdPatch) {
-				const blockmapUrl = releaseInfo._v2?.blockmapUrl;
-				if (blockmapUrl) {
-					try {
-						const blockmapResponse = await fetch(blockmapUrl);
-						if (blockmapResponse.ok) {
-							const blockmapBuffer = Buffer.from(await blockmapResponse.arrayBuffer());
-							newBlockmap = await parseBlockmapBuffer(blockmapBuffer);
+		// Strategy: patch chain (multi-step)
+		if (!applied && execPath && existsSync(execPath)) {
+			const chain = releaseInfo._v2?.patchChain;
+			if (chain && chain.length > 0) {
+				try {
+					logger.info("Using patch chain", { steps: chain.length });
+					let currentBuf = readFileSync(execPath);
 
-							const localResult = await generateBlockmap(execPath);
-							localBlockmap = localResult.blockmap;
-
-							diff = calculateDiff(localBlockmap, newBlockmap);
-							const diffSize = calculateDiffSize(diff);
-							const totalSize = calculateTotalSize(newBlockmap);
-
-							if (diffSize < totalSize * 0.8) {
-								useDelta = true;
-								logger.info("Using blockmap delta update", {
-									diffBlocks: diff.length,
-									totalBlocks: newBlockmap.files[0]?.checksums.length,
-									diffSize,
-									totalSize,
-									savings: `${Math.round((1 - diffSize / totalSize) * 100)}%`,
-								});
-							}
-						}
-					} catch (err) {
-						logger.debug("Delta update not available, falling back to full download", {
-							error: String(err),
+					for (let i = 0; i < chain.length; i++) {
+						const step = chain[i];
+						onProgress?.({
+							phase: "downloading",
+							bytesDownloaded: 0,
+							totalBytes: step.patchSize,
+							percent: Math.round((i / chain.length) * 100),
 						});
+
+						const metaResp = await fetch(step.metaUrl);
+						if (!metaResp.ok) {
+							throw new Error(
+								`Failed to fetch patch meta for step ${i + 1}/${chain.length}: ${metaResp.status}`,
+							);
+						}
+						const meta = (await metaResp.json()) as ZstdPatchMeta;
+
+						const patchResp = await fetch(step.url);
+						if (!patchResp.ok) {
+							throw new Error(
+								`Failed to fetch patch for step ${i + 1}/${chain.length}: ${patchResp.status}`,
+							);
+						}
+						const patchBuf = Buffer.from(await patchResp.arrayBuffer());
+
+						logger.info("Applying patch chain step", {
+							step: `${i + 1}/${chain.length}`,
+							from: step.fromVersion,
+							to: step.toVersion,
+							patchSize: patchBuf.length,
+						});
+
+						onProgress?.({
+							phase: "applying",
+							bytesDownloaded: patchBuf.length,
+							totalBytes: meta.newFileSize,
+							percent: Math.round(((i + 0.5) / chain.length) * 100),
+						});
+
+						let zstdCliPath: string | undefined;
+						if (meta.mode === "patch-from") {
+							const cli = await getZstdCliPath();
+							if (!cli) {
+								throw new Error("zstd CLI required for patch-from mode");
+							}
+							zstdCliPath = cli;
+						}
+
+						currentBuf = Buffer.from(applyZstdPatch(currentBuf, patchBuf, meta, zstdCliPath));
 					}
+
+					writeFileSync(tempPath, currentBuf);
+					applied = true;
+
+					onProgress?.({
+						phase: "applying",
+						bytesDownloaded: currentBuf.length,
+						totalBytes: currentBuf.length,
+						percent: 100,
+					});
+
+					logger.info("Patch chain applied successfully", {
+						steps: chain.length,
+						resultSize: currentBuf.length,
+					});
+				} catch (err) {
+					logger.warn("Patch chain failed", { error: String(err) });
 				}
 			}
 		}
 
-		if (useZstdPatch && zstdPatchBuf && zstdPatchMeta && execPath) {
-			// Zstd dictionary patch — read local binary, apply patch, write result
-			try {
-				const oldBuf = readFileSync(execPath);
-
-				onProgress?.({
-					phase: "applying",
-					bytesDownloaded: zstdPatchBuf.length,
-					totalBytes: zstdPatchMeta.newFileSize,
-					percent: 50,
-				});
-
-				const newBuf = applyZstdPatch(oldBuf, zstdPatchBuf, zstdPatchMeta);
-				writeFileSync(tempPath, newBuf);
-
-				onProgress?.({
-					phase: "applying",
-					bytesDownloaded: zstdPatchBuf.length,
-					totalBytes: zstdPatchMeta.newFileSize,
-					percent: 100,
-				});
-
-				logger.info("Zstd patch applied successfully", {
-					patchSize: zstdPatchBuf.length,
-					resultSize: newBuf.length,
-				});
-			} catch (err) {
-				logger.warn("Zstd patch failed, falling back to full download", {
-					error: String(err),
-				});
-				useZstdPatch = false;
-			}
-		}
-
-		if (!useZstdPatch) {
-			if (useDelta && newBlockmap && localBlockmap && diff.length > 0 && execPath) {
-				await downloadDelta(
-					execPath,
-					fileDownloadUrl,
-					tempPath,
-					localBlockmap,
-					newBlockmap,
-					diff,
-					onProgress,
-				);
-			} else if (releaseInfo._v2?.hasFullFile !== false) {
-				await downloadFull(fileDownloadUrl, tempPath, releaseInfo.files[0]?.size ?? 0, onProgress);
-			} else {
-				return {
-					success: false,
-					error:
-						"Delta update not available for this version. No full download provided by the update server.",
-				};
-			}
+		if (!applied) {
+			return {
+				success: false,
+				error:
+					"No applicable update strategy: neither direct zstd patch nor patch chain available.",
+			};
 		}
 
 		// Verify SHA512
@@ -462,11 +569,6 @@ export async function downloadUpdate(
 			unlinkSync(updatePath);
 		}
 		renameSync(tempPath, updatePath);
-
-		// Save blockmap for future delta updates
-		if (newBlockmap) {
-			await writeBlockmapFile(newBlockmap, `${updatePath}.blockmap`);
-		}
 
 		onProgress?.({
 			phase: "complete",
@@ -498,251 +600,6 @@ export async function downloadUpdate(
 }
 
 /**
- * Download using delta (only changed blocks).
- */
-async function downloadDelta(
-	localPath: string,
-	remoteUrl: string,
-	outputPath: string,
-	localBlockmap: Blockmap,
-	newBlockmap: Blockmap,
-	diff: DiffBlock[],
-	onProgress?: (progress: UpdateProgress) => void,
-): Promise<void> {
-	const newFile = newBlockmap.files[0];
-	if (!newFile) throw new Error("Invalid blockmap");
-
-	const _totalSize = calculateTotalSize(newBlockmap);
-	const diffSize = calculateDiffSize(diff);
-	let bytesDownloaded = 0;
-
-	// Create output file
-	const output = createWriteStream(outputPath);
-
-	// Track which blocks we need to download
-	const diffSet = new Set(diff.map((d) => d.index));
-
-	// Download changed blocks using Range requests
-	// Group adjacent blocks to minimize requests
-	const rangeHeader = diffToRangeHeader(diff);
-
-	let downloadedBlocks: Map<number, Buffer>;
-	if (rangeHeader) {
-		const response = await fetch(remoteUrl, {
-			headers: { Range: rangeHeader },
-		});
-
-		if (response.status === 206) {
-			// Partial content - parse multipart response or single range
-			downloadedBlocks = await parseRangeResponse(response, diff);
-		} else if (response.ok) {
-			// Server doesn't support Range, download full file
-			const buffer = Buffer.from(await response.arrayBuffer());
-			downloadedBlocks = new Map();
-			let offset = 0;
-			for (let i = 0; i < newFile.sizes.length; i++) {
-				if (diffSet.has(i)) {
-					downloadedBlocks.set(i, buffer.subarray(offset, offset + newFile.sizes[i]));
-				}
-				offset += newFile.sizes[i];
-			}
-		} else {
-			throw new Error(`Download failed: ${response.status}`);
-		}
-	} else {
-		downloadedBlocks = new Map();
-	}
-
-	// Reconstruct file: copy unchanged blocks from local, use downloaded for changed
-	return new Promise((resolve, reject) => {
-		const localStream = createReadStream(localPath);
-		const localFile = localBlockmap.files[0];
-		if (!localFile) {
-			reject(new Error("Invalid local blockmap"));
-			return;
-		}
-
-		let blockIndex = 0;
-		let localBuffer = Buffer.alloc(0);
-		let _localOffset = 0;
-
-		const writeNextBlock = () => {
-			while (blockIndex < newFile.sizes.length) {
-				const _blockSize = newFile.sizes[blockIndex];
-
-				if (diffSet.has(blockIndex)) {
-					// Use downloaded block
-					const downloadedBlock = downloadedBlocks.get(blockIndex);
-					if (!downloadedBlock) {
-						reject(new Error(`Missing downloaded block ${blockIndex}`));
-						return;
-					}
-					output.write(downloadedBlock);
-					bytesDownloaded += downloadedBlock.length;
-				} else {
-					// Copy from local file
-					const localBlockSize = localFile.sizes[blockIndex] ?? 0;
-					if (localBuffer.length < localBlockSize) {
-						// Need more data from local file
-						return;
-					}
-					const localBlock = localBuffer.subarray(0, localBlockSize);
-					output.write(localBlock);
-					localBuffer = localBuffer.subarray(localBlockSize);
-					_localOffset += localBlockSize;
-				}
-
-				blockIndex++;
-
-				onProgress?.({
-					phase: "downloading",
-					bytesDownloaded,
-					totalBytes: diffSize,
-					percent: Math.round((bytesDownloaded / diffSize) * 100),
-				});
-			}
-
-			// All blocks written
-			output.end();
-		};
-
-		localStream.on("data", (chunk: Buffer) => {
-			localBuffer = Buffer.concat([localBuffer, chunk]);
-			writeNextBlock();
-		});
-
-		localStream.on("end", () => {
-			writeNextBlock();
-		});
-
-		localStream.on("error", reject);
-		output.on("finish", resolve);
-		output.on("error", reject);
-	});
-}
-
-/**
- * Parse HTTP Range response (single range or multipart).
- */
-async function parseRangeResponse(
-	response: Response,
-	diff: DiffBlock[],
-): Promise<Map<number, Buffer>> {
-	const result = new Map<number, Buffer>();
-	const contentType = response.headers.get("content-type") ?? "";
-
-	if (contentType.includes("multipart/byteranges")) {
-		// Multipart response - parse boundaries
-		const boundary = contentType.match(/boundary=([^\s;]+)/)?.[1];
-		if (!boundary) throw new Error("Missing boundary in multipart response");
-
-		const buffer = Buffer.from(await response.arrayBuffer());
-		const parts = parseMultipartBuffer(buffer, boundary);
-
-		// Match parts to diff blocks by offset
-		for (let i = 0; i < parts.length && i < diff.length; i++) {
-			result.set(diff[i].index, parts[i]);
-		}
-	} else {
-		// Single range response
-		const buffer = Buffer.from(await response.arrayBuffer());
-		if (diff.length === 1) {
-			result.set(diff[0].index, buffer);
-		} else {
-			// Multiple ranges requested but got single response - split by sizes
-			let offset = 0;
-			for (const block of diff) {
-				result.set(block.index, buffer.subarray(offset, offset + block.size));
-				offset += block.size;
-			}
-		}
-	}
-
-	return result;
-}
-
-/**
- * Parse multipart buffer into parts.
- */
-function parseMultipartBuffer(buffer: Buffer, boundary: string): Buffer[] {
-	const parts: Buffer[] = [];
-	const boundaryBuffer = Buffer.from(`--${boundary}`);
-	const endBoundary = Buffer.from(`--${boundary}--`);
-
-	let start = 0;
-	while (start < buffer.length) {
-		const boundaryStart = buffer.indexOf(boundaryBuffer, start);
-		if (boundaryStart === -1) break;
-
-		// Find end of headers (double CRLF)
-		const headersEnd = buffer.indexOf("\r\n\r\n", boundaryStart);
-		if (headersEnd === -1) break;
-
-		const contentStart = headersEnd + 4;
-
-		// Find next boundary
-		const nextBoundary = buffer.indexOf(boundaryBuffer, contentStart);
-		const contentEnd = nextBoundary === -1 ? buffer.length : nextBoundary - 2; // -2 for CRLF before boundary
-
-		if (contentEnd > contentStart) {
-			parts.push(buffer.subarray(contentStart, contentEnd));
-		}
-
-		start = nextBoundary === -1 ? buffer.length : nextBoundary;
-
-		// Check for end boundary
-		if (buffer.subarray(start, start + endBoundary.length).equals(endBoundary)) {
-			break;
-		}
-	}
-
-	return parts;
-}
-
-/**
- * Download full file (fallback when delta not available).
- */
-async function downloadFull(
-	url: string,
-	outputPath: string,
-	totalSize: number,
-	onProgress?: (progress: UpdateProgress) => void,
-): Promise<void> {
-	const response = await fetch(url);
-
-	if (!response.ok) {
-		throw new Error(`Download failed: ${response.status}`);
-	}
-
-	const output = createWriteStream(outputPath);
-	const reader = response.body?.getReader();
-	if (!reader) throw new Error("No response body");
-
-	let bytesDownloaded = 0;
-
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-
-		output.write(Buffer.from(value));
-		bytesDownloaded += value.length;
-
-		onProgress?.({
-			phase: "downloading",
-			bytesDownloaded,
-			totalBytes: totalSize,
-			percent: totalSize > 0 ? Math.round((bytesDownloaded / totalSize) * 100) : 0,
-		});
-	}
-
-	return new Promise((resolve, reject) => {
-		output.on("finish", resolve);
-		output.on("error", reject);
-		output.end();
-	});
-}
-
-/**
  * Compute SHA512 hash of a file.
  */
 async function computeFileSha512(filePath: string): Promise<string> {
@@ -765,6 +622,7 @@ async function computeFileSha512(filePath: string): Promise<string> {
 export function getUpdateInstructions(updatePath: string): {
 	manual: boolean;
 	command?: string;
+	newBinaryPath?: string;
 	message: string;
 } {
 	const execPath = getCurrentExecutablePath();
@@ -776,21 +634,24 @@ export function getUpdateInstructions(updatePath: string): {
 		};
 	}
 
-	// Compiled binary — auto-restart is available via /api/update/apply
-	const execName = basename(execPath);
+	const execDir = join(execPath, "..");
+	const updateFile = basename(updatePath);
+	const newExecPath = join(execDir, updateFile);
 
 	if (process.platform === "win32") {
 		return {
 			manual: false,
-			command: `Stop-Process -Name "${execName.replace(".exe", "")}" -Force; Move-Item -Force "${updatePath}" "${execPath}"; Start-Process "${execPath}"`,
-			message: "Update ready. Click apply to restart automatically.",
+			newBinaryPath: newExecPath,
+			command: `"${newExecPath}"`,
+			message: "Update ready. Click apply to stop the server, then run the new binary.",
 		};
 	}
 
 	return {
 		manual: false,
-		command: `pkill -f "${execName}" && mv "${updatePath}" "${execPath}" && chmod +x "${execPath}" && "${execPath}"`,
-		message: "Update ready. Click apply to restart automatically.",
+		newBinaryPath: newExecPath,
+		command: `"${newExecPath}"`,
+		message: "Update ready. Click apply to stop the server, then run the new binary.",
 	};
 }
 
@@ -829,11 +690,7 @@ export function cleanupOldUpdates(): void {
 function findUpdateFile(): string | null {
 	if (!existsSync(UPDATE_DIR)) return null;
 	const files = readdirSync(UPDATE_DIR);
-	return (
-		files.find(
-			(f) => f.startsWith("narrafork-") && !f.endsWith(".blockmap") && !f.endsWith(".tmp"),
-		) ?? null
-	);
+	return files.find((f) => f.startsWith("narrafork-") && !f.endsWith(".tmp")) ?? null;
 }
 
 /**
@@ -870,15 +727,20 @@ function moveFileSync(src: string, dst: string): void {
 }
 
 /**
- * Apply a downloaded update: replace the current binary and spawn the new process.
+ * Apply a downloaded update: place the new binary next to the current one and spawn it.
  *
  * Flow:
- * 1. Locate the downloaded update file
- * 2. Replace the current executable (Unix: mv; Windows: rename .old then mv)
+ * 1. Locate the downloaded update file (e.g. narrafork-0.1.1-linux-x64)
+ * 2. Move it to the same directory as the current executable, keeping the new filename
  * 3. Spawn the new binary as a detached process with --replace-pid=<our PID>
  * 4. The new process will kill us after it starts successfully
  */
-export function applyUpdate(): { success: boolean; error?: string } {
+/**
+ * Apply a downloaded update:
+ * 1. Move the update file to the same directory as the current executable
+ * 2. Exit the process so the user can start the new binary
+ */
+export function applyUpdate(): { success: boolean; error?: string; newBinaryPath?: string } {
 	const execPath = getCurrentExecutablePath();
 	if (!execPath) {
 		return { success: false, error: "Not running as compiled binary" };
@@ -890,53 +752,34 @@ export function applyUpdate(): { success: boolean; error?: string } {
 	}
 
 	const updatePath = join(UPDATE_DIR, updateFile);
+	const execDir = join(execPath, "..");
+	const newExecPath = join(execDir, updateFile);
 	const isWindows = process.platform === "win32";
 
 	try {
-		if (isWindows) {
-			// Windows: can't overwrite running exe, rename it first
-			const oldPath = `${execPath}.old`;
-			if (existsSync(oldPath)) {
-				try {
-					unlinkSync(oldPath);
-				} catch {}
-			}
-			moveFileSync(execPath, oldPath);
+		// Move update file to the same directory as current executable, with new filename
+		if (existsSync(newExecPath)) {
 			try {
-				moveFileSync(updatePath, execPath);
-			} catch (err) {
-				// Rollback: restore original exe
-				moveFileSync(oldPath, execPath);
-				throw err;
-			}
-		} else {
-			// Unix: can overwrite running binary (inode stays valid for current process)
-			moveFileSync(updatePath, execPath);
-			chmodSync(execPath, 0o755);
+				unlinkSync(newExecPath);
+			} catch {}
+		}
+		moveFileSync(updatePath, newExecPath);
+		if (!isWindows) {
+			chmodSync(newExecPath, 0o755);
 		}
 	} catch (err) {
-		return { success: false, error: `Failed to replace binary: ${err}` };
+		return { success: false, error: `Failed to place new binary: ${err}` };
 	}
 
-	// Build args for the new process: inherit current args, add --replace-pid
-	const newArgs = process.argv.slice(1).filter((a) => !a.startsWith("--replace-pid="));
-	newArgs.push(`--replace-pid=${process.pid}`);
+	logger.info("Update applied, shutting down", {
+		oldExecPath: execPath,
+		newExecPath,
+	});
 
-	try {
-		const proc = Bun.spawn([execPath, ...newArgs], {
-			stdio: ["ignore", "ignore", "ignore"],
-			env: { ...process.env },
-		});
-		proc.unref();
+	// Exit after a short delay to allow the response to be sent
+	setTimeout(() => {
+		process.exit(0);
+	}, 500);
 
-		logger.info("Spawned new process for update", {
-			newPid: proc.pid,
-			oldPid: process.pid,
-			execPath,
-		});
-	} catch (err) {
-		return { success: false, error: `Failed to spawn new process: ${err}` };
-	}
-
-	return { success: true };
+	return { success: true, newBinaryPath: newExecPath };
 }

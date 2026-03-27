@@ -15,11 +15,11 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
+	IconAlertTriangle,
 	IconCheck,
 	IconCopy,
 	IconDownload,
-	IconInfoCircle,
-	IconRefresh,
+	IconPower,
 	IconRocket,
 	IconX,
 } from "@tabler/icons-react";
@@ -32,24 +32,37 @@ function formatBytes(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function UpdateAvailableBanner() {
-	const { t } = useTranslation("common");
+/** Resolve localized release notes — supports plain string or { "en": "...", "zh-CN": "..." } */
+function resolveNotes(
+	notes: string | Record<string, string> | undefined,
+	lang: string,
+): string | undefined {
+	if (!notes) return undefined;
+	if (typeof notes === "string") return notes;
+	return notes[lang] ?? notes.en ?? Object.values(notes)[0];
+}
+
+/**
+ * Inline update indicator — shown next to the app title in the header.
+ * Clicking opens the update detail modal.
+ */
+export function UpdateIndicator() {
+	const { t, i18n } = useTranslation("common");
 	const [opened, { open, close }] = useDisclosure(false);
 	const {
 		updateAvailable,
 		latestVersion,
+		currentVersion,
 		releaseInfo,
 		releaseNotes,
+		releaseNotesPerVersion,
 		releaseDate,
 		downloadSize,
 		totalSize,
-		diffBlocks,
-		totalBlocks,
-		dismiss,
 	} = useUpdateCheck();
 
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
-	const { apply, isApplying } = useUpdateApply();
+	const { apply, isApplying, applyResult } = useUpdateApply();
 
 	if (!updateAvailable) return null;
 
@@ -76,55 +89,25 @@ export function UpdateAvailableBanner() {
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
 
-	const canAutoRestart = result?.success && result.instructions && !result.instructions.manual;
+	const canApply = result?.success && result.instructions && !result.instructions.manual;
+	const serverStopped = applyResult?.success;
+	const downloadError = result && !result.success ? result.error : null;
+	const applyError = applyResult && !applyResult.success ? applyResult.error : null;
 
 	return (
 		<>
-			<Alert
-				color="indigo"
-				variant="light"
-				withCloseButton
-				onClose={dismiss}
-				style={{
-					position: "fixed",
-					top: 8,
-					left: "50%",
-					transform: "translateX(-50%)",
-					zIndex: 1000,
-					maxWidth: 600,
-					width: "calc(100% - 32px)",
-					borderRadius: "var(--mantine-radius-sm)",
-				}}
-			>
-				<Group justify="space-between" wrap="nowrap" gap="md">
-					<Group gap="xs" wrap="nowrap">
-						<IconRocket size={18} />
-						<Text size="sm">{t("updateAvailable", { version: latestVersion })}</Text>
-						{savingsPercent > 0 && (
-							<Tooltip
-								label={t("updateDeltaInfo", {
-									diffBlocks,
-									totalBlocks,
-									downloadSize: formatBytes(downloadSize ?? 0),
-									totalSize: formatBytes(totalSize ?? 0),
-								})}
-							>
-								<Badge size="xs" variant="light" color="green">
-									{t("updateSavings", { percent: savingsPercent })}
-								</Badge>
-							</Tooltip>
-						)}
-					</Group>
-					<Button
-						size="xs"
-						variant="light"
-						leftSection={<IconInfoCircle size={14} />}
-						onClick={open}
-					>
-						{t("updateViewDetails")}
-					</Button>
-				</Group>
-			</Alert>
+			<Tooltip label={t("updateViewDetails")} position="bottom" withArrow>
+				<Badge
+					size="sm"
+					variant="light"
+					color="indigo"
+					leftSection={<IconRocket size={12} />}
+					style={{ cursor: "pointer" }}
+					onClick={open}
+				>
+					{t("updateBadge", { from: currentVersion, to: latestVersion })}
+				</Badge>
+			</Tooltip>
 
 			<Modal
 				opened={opened}
@@ -134,7 +117,6 @@ export function UpdateAvailableBanner() {
 				centered
 			>
 				<Stack gap="md">
-					{/* Release info */}
 					{releaseDate && (
 						<Text size="xs" c="dimmed">
 							{new Date(releaseDate).toLocaleDateString(undefined, {
@@ -151,24 +133,63 @@ export function UpdateAvailableBanner() {
 							{t("updateReleaseNotes")}
 						</Text>
 						<ScrollArea.Autosize mah={300}>
-							{releaseNotes ? (
-								<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-									{releaseNotes}
-								</Text>
+							{releaseNotesPerVersion && releaseNotesPerVersion.length > 1 ? (
+								<Stack gap="md">
+									{releaseNotesPerVersion.map(
+										(v: {
+											version: string;
+											releaseDate: string;
+											releaseNotes?: string | Record<string, string>;
+										}) => {
+											const notes = resolveNotes(v.releaseNotes, i18n.language);
+											return (
+												<div key={v.version}>
+													<Group gap="xs" mb={4}>
+														<Badge size="xs" variant="light">
+															v{v.version}
+														</Badge>
+														<Text size="xs" c="dimmed">
+															{new Date(v.releaseDate).toLocaleDateString(undefined, {
+																year: "numeric",
+																month: "short",
+																day: "numeric",
+															})}
+														</Text>
+													</Group>
+													{notes ? (
+														<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+															{notes}
+														</Text>
+													) : (
+														<Text size="sm" c="dimmed" fs="italic">
+															{t("updateNoNotes")}
+														</Text>
+													)}
+												</div>
+											);
+										},
+									)}
+								</Stack>
 							) : (
-								<Text size="sm" c="dimmed" fs="italic">
-									{t("updateNoNotes")}
-								</Text>
+								(() => {
+									const notes = resolveNotes(releaseNotes, i18n.language);
+									return notes ? (
+										<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+											{notes}
+										</Text>
+									) : (
+										<Text size="sm" c="dimmed" fs="italic">
+											{t("updateNoNotes")}
+										</Text>
+									);
+								})()
 							)}
 						</ScrollArea.Autosize>
 					</div>
 
-					{/* Download size info */}
 					{savingsPercent > 0 && !result?.success && (
 						<Text size="xs" c="dimmed">
-							{t("updateDeltaInfo", {
-								diffBlocks,
-								totalBlocks,
+							{t("updatePatchInfo", {
 								downloadSize: formatBytes(downloadSize ?? 0),
 								totalSize: formatBytes(totalSize ?? 0),
 							})}
@@ -177,14 +198,15 @@ export function UpdateAvailableBanner() {
 
 					<Divider />
 
-					{/* Download / progress / apply section */}
+					{/* Download button */}
 					{!progress && !result && (
 						<Button fullWidth leftSection={<IconDownload size={16} />} onClick={handleDownload}>
 							{t("download")} ({formatBytes(downloadSize ?? totalSize ?? 0)})
 						</Button>
 					)}
 
-					{progress && (
+					{/* Download progress */}
+					{progress && !result && (
 						<>
 							<Text size="sm" c="dimmed">
 								{progress.phase === "checking" && t("updatePhaseChecking")}
@@ -194,7 +216,7 @@ export function UpdateAvailableBanner() {
 								{progress.phase === "error" && t("updatePhaseError")}
 							</Text>
 
-							{progress.phase === "downloading" && (
+							{(progress.phase === "downloading" || progress.phase === "applying") && (
 								<>
 									<Progress value={progress.percent} size="lg" animated />
 									<Text size="xs" c="dimmed" ta="center">
@@ -202,60 +224,102 @@ export function UpdateAvailableBanner() {
 									</Text>
 								</>
 							)}
-
-							{progress.phase === "error" && (
-								<Alert color="red" variant="light">
-									{progress.error}
-								</Alert>
-							)}
 						</>
 					)}
 
-					{result?.success && result.instructions && (
+					{/* Download error */}
+					{downloadError && (
+						<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
+							<Text size="sm">{downloadError}</Text>
+						</Alert>
+					)}
+
+					{/* Download complete — apply section */}
+					{canApply && !serverStopped && (
 						<Stack gap="sm">
 							<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
 								{t("updateDownloadComplete")}
 							</Alert>
 
-							{canAutoRestart ? (
-								<>
-									<Text size="sm">{t("updateReadyToApply")}</Text>
-									<Button
-										fullWidth
-										color="indigo"
-										leftSection={<IconRefresh size={16} />}
-										onClick={handleApply}
-										loading={isApplying}
-									>
-										{t("updateApplyNow")}
-									</Button>
-								</>
-							) : (
-								<>
-									<Text size="sm">{t("updateApplyInstructions")}</Text>
+							<Text size="sm">{t("updateApplyDescription")}</Text>
+							<Button
+								fullWidth
+								color="red"
+								variant="light"
+								leftSection={<IconPower size={16} />}
+								onClick={handleApply}
+								loading={isApplying}
+							>
+								{t("updateStopAndApply")}
+							</Button>
+						</Stack>
+					)}
 
-									{result.instructions.command && (
-										<Group gap="xs" align="flex-start">
-											<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
-												{result.instructions.command}
-											</Code>
-											<CopyButton value={result.instructions.command}>
-												{({ copied, copy }) => (
-													<Tooltip label={copied ? t("copied") : t("copy")}>
-														<Button
-															size="xs"
-															variant="subtle"
-															color={copied ? "green" : "gray"}
-															onClick={copy}
-														>
-															{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-														</Button>
-													</Tooltip>
-												)}
-											</CopyButton>
-										</Group>
+					{/* Apply error */}
+					{applyError && (
+						<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
+							<Text size="sm">{applyError}</Text>
+						</Alert>
+					)}
+
+					{/* Server stopped — show new binary path */}
+					{serverStopped && applyResult.newBinaryPath && (
+						<Stack gap="sm">
+							<Alert color="yellow" variant="light" icon={<IconPower size={16} />}>
+								{t("updateServerStopped")}
+							</Alert>
+
+							<Text size="sm">{t("updateRunNewBinary")}</Text>
+
+							<Group gap="xs" align="flex-start">
+								<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+									{applyResult.newBinaryPath}
+								</Code>
+								<CopyButton value={applyResult.newBinaryPath}>
+									{({ copied, copy }) => (
+										<Tooltip label={copied ? t("copied") : t("copy")}>
+											<Button
+												size="xs"
+												variant="subtle"
+												color={copied ? "green" : "gray"}
+												onClick={copy}
+											>
+												{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+											</Button>
+										</Tooltip>
 									)}
-								</>
+								</CopyButton>
+							</Group>
+						</Stack>
+					)}
+
+					{/* Manual instructions (dev mode) */}
+					{result?.success && result.instructions?.manual && (
+						<Stack gap="sm">
+							<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
+								{t("updateDownloadComplete")}
+							</Alert>
+							<Text size="sm">{t("updateApplyInstructions")}</Text>
+							{result.instructions.command && (
+								<Group gap="xs" align="flex-start">
+									<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+										{result.instructions.command}
+									</Code>
+									<CopyButton value={result.instructions.command}>
+										{({ copied, copy }) => (
+											<Tooltip label={copied ? t("copied") : t("copy")}>
+												<Button
+													size="xs"
+													variant="subtle"
+													color={copied ? "green" : "gray"}
+													onClick={copy}
+												>
+													{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+												</Button>
+											</Tooltip>
+										)}
+									</CopyButton>
+								</Group>
 							)}
 						</Stack>
 					)}

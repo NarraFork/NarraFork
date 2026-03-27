@@ -2110,15 +2110,27 @@ export const api = {
 			releaseInfo?: {
 				version: string;
 				releaseDate: string;
-				releaseNotes?: string;
+				releaseNotes?: string | Record<string, string>;
 				path: string;
 				sha512: string;
 				files: Array<{ url: string; size: number; sha512: string }>;
+				releaseNotesPerVersion?: Array<{
+					version: string;
+					releaseDate: string;
+					releaseNotes?: string | Record<string, string>;
+				}>;
 			};
 			downloadSize?: number;
 			totalSize?: number;
-			diffBlocks?: number;
-			totalBlocks?: number;
+			zstdPatchSize?: number;
+			strategy?: "zstd";
+			patchChain?: Array<{
+				fromVersion: string;
+				toVersion: string;
+				patchSize: number;
+				url: string;
+				metaUrl: string;
+			}>;
 		}>("/update/check"),
 	getUpdateVersion: () =>
 		request<{ version: string; platform: string; arch: string }>("/update/version"),
@@ -2127,7 +2139,9 @@ export const api = {
 	getUpdateStatus: () =>
 		request<{ ready: boolean; updateFile?: string; canAutoRestart: boolean }>("/update/status"),
 	applyUpdate: () =>
-		request<{ success: boolean; error?: string }>("/update/apply", { method: "POST" }),
+		request<{ success: boolean; error?: string; newBinaryPath?: string }>("/update/apply", {
+			method: "POST",
+		}),
 
 	// Overseers
 	listOverseers: (params?: { scope?: string; projectId?: string }) => {

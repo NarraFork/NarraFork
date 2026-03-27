@@ -43,6 +43,21 @@ export function createApp(storage: StorageBackend): Hono {
 	app.route("/api/v2/products", createCheckRoutes(storage));
 	app.route("/api/v2/products", createDownloadRoutes(storage));
 
+	// Tools endpoint — serves helper binaries (e.g. zstd.exe for Windows)
+	app.get("/api/v2/tools/:filename", async (c) => {
+		const filename = c.req.param("filename");
+		const path = `tools/${filename}`;
+		const file = await storage.getFile(path);
+		if (!file) return c.json({ error: "Tool not found" }, 404);
+		return new Response(new Uint8Array(file), {
+			headers: {
+				"Content-Type": "application/octet-stream",
+				"Content-Disposition": `attachment; filename="${filename}"`,
+				"Content-Length": String(file.length),
+			},
+		});
+	});
+
 	// Authenticated endpoints
 	app.route("/api/v2/products", createReleaseRoutes(storage));
 	app.route("/api/v2/tokens", tokenRoutes);

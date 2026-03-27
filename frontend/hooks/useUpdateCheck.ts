@@ -13,6 +13,7 @@ export interface UpdateProgress {
 export interface UpdateInstructions {
 	manual: boolean;
 	command?: string;
+	newBinaryPath?: string;
 	message: string;
 }
 
@@ -51,11 +52,11 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 		latestVersion: data?.latestVersion,
 		releaseInfo: data?.releaseInfo,
 		releaseNotes: data?.releaseInfo?.releaseNotes,
+		releaseNotesPerVersion: data?.releaseInfo?.releaseNotesPerVersion,
 		releaseDate: data?.releaseInfo?.releaseDate,
 		downloadSize: data?.downloadSize,
 		totalSize: data?.totalSize,
-		diffBlocks: data?.diffBlocks,
-		totalBlocks: data?.totalBlocks,
+		strategy: data?.strategy,
 		dismiss,
 		refetch,
 	};
@@ -184,21 +185,30 @@ export function useUpdateCleanup() {
 
 export function useUpdateApply() {
 	const [isApplying, setIsApplying] = useState(false);
+	const [applyResult, setApplyResult] = useState<{
+		success: boolean;
+		error?: string;
+		newBinaryPath?: string;
+	} | null>(null);
 
 	const apply = useCallback(async () => {
 		setIsApplying(true);
+		setApplyResult(null);
 		try {
 			const result = await api.applyUpdate();
+			setApplyResult(result);
 			if (!result.success) {
 				setIsApplying(false);
 			}
-			// If successful, the server will restart — page will reconnect automatically
+			// If successful, the server will exit — isApplying stays true
 			return result;
 		} catch (err) {
+			const result = { success: false, error: String(err) };
+			setApplyResult(result);
 			setIsApplying(false);
-			return { success: false, error: String(err) };
+			return result;
 		}
 	}, []);
 
-	return { apply, isApplying };
+	return { apply, isApplying, applyResult };
 }

@@ -1,5 +1,5 @@
 /**
- * Download routes — serves release files, blockmaps, and zstd patches.
+ * Download routes — serves release files and zstd patches.
  * Public endpoints — no auth required.
  * Supports HTTP Range requests (RFC 7233).
  */
@@ -19,18 +19,6 @@ export function createDownloadRoutes(storage: StorageBackend) {
 
 		const path = `products/${product}/releases/${version}/${platform}/${filename}`;
 		return serveFileWithRange(c, storage, path, filename);
-	});
-
-	// GET /api/v2/products/:product/releases/:version/blockmap/:filename
-	routes.get("/:product/releases/:version/blockmap/:filename", async (c) => {
-		const { product, version, filename } = c.req.param();
-		const platform = detectPlatformFromFilename(filename);
-		if (!platform) {
-			return c.json({ error: "Cannot determine platform from filename" }, 400);
-		}
-
-		const path = `products/${product}/releases/${version}/${platform}/${filename}.blockmap`;
-		return serveFile(c, storage, path, `${filename}.blockmap`);
 	});
 
 	// GET /api/v2/products/:product/releases/:version/zstd-patch/:filename
@@ -180,7 +168,7 @@ async function serveFileWithRange(
 }
 
 /**
- * Serve a file without Range support (for smaller files like blockmaps).
+ * Serve a file without Range support (for smaller files like patch metadata).
  * Uses streaming to avoid loading entire file into memory.
  */
 async function serveFile(

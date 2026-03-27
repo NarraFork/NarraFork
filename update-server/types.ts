@@ -48,11 +48,8 @@ export interface PlatformFileInfo {
 	filename: string;
 	size: number;
 	sha512: string;
-	hasBlockmap: boolean;
 	hasZstdPatch: boolean;
 	zstdPatchFromVersion?: string;
-	/** Whether the full binary file is available for download. */
-	hasFullFile?: boolean;
 }
 
 /** Release metadata stored as meta.json per version */
@@ -60,7 +57,8 @@ export interface ReleaseMeta {
 	version: string;
 	channel: Channel;
 	releaseDate: string;
-	releaseNotes?: string;
+	/** Release notes — plain string or localized { "en": "...", "zh-CN": "..." } */
+	releaseNotes?: string | Record<string, string>;
 	platforms: Record<string, PlatformFileInfo>;
 }
 
@@ -70,17 +68,13 @@ export interface CheckUpdateResponse {
 	currentVersion?: string;
 	version?: string;
 	releaseDate?: string;
-	releaseNotes?: string;
+	/** Release notes for the latest version */
+	releaseNotes?: string | Record<string, string>;
 	platform?: string;
 	file?: {
 		filename: string;
 		size: number;
 		sha512: string;
-	};
-	/** Whether the full binary is available for download (false = delta only). */
-	hasFullFile?: boolean;
-	blockmap?: {
-		url: string;
 	};
 	zstdPatch?: {
 		fromVersion: string;
@@ -88,9 +82,22 @@ export interface CheckUpdateResponse {
 		url: string;
 		metaUrl: string;
 	} | null;
+	patchChain?: Array<{
+		fromVersion: string;
+		toVersion: string;
+		patchSize: number;
+		url: string;
+		metaUrl: string;
+	}>;
+	/** Release notes for each version in the update path */
+	releaseNotesPerVersion?: Array<{
+		version: string;
+		releaseDate: string;
+		releaseNotes?: string | Record<string, string>;
+	}>;
 }
 
-/** Zstd patch metadata (matches server/lib/blockmap.ts ZstdPatchMeta) */
+/** Zstd patch metadata */
 export interface ZstdPatchMeta {
 	fromVersion: string;
 	toVersion: string;
@@ -106,6 +113,6 @@ export interface ReleaseListItem {
 	version: string;
 	channel: Channel;
 	releaseDate: string;
-	releaseNotes?: string;
+	releaseNotes?: string | Record<string, string>;
 	platforms: string[];
 }

@@ -12,6 +12,7 @@ import {
 	getUpdateDirectory,
 	getUpdateInstructions,
 	getUpdateStatus,
+	type ReleaseInfo,
 	type UpdateProgress,
 } from "../services/update-service";
 
@@ -41,13 +42,24 @@ updateRoutes.get("/version", (c) => {
 /**
  * POST /api/update/download
  * Download an update. Streams progress via SSE.
+ * The frontend sends a minimal releaseInfo, but we re-fetch the full check
+ * to get _v2 URLs (zstd patch, patch chain).
  */
 updateRoutes.post("/download", async (c) => {
-	const body = await c.req.json();
-	const { releaseInfo } = body;
+	let clientReleaseInfo: ReleaseInfo | undefined;
+	try {
+		const body = await c.req.json();
+		clientReleaseInfo = body?.releaseInfo;
+	} catch {
+		// Empty body is OK — we'll re-check
+	}
+
+	// Re-check to get full releaseInfo with _v2 URLs
+	const checkResult = await checkForUpdate();
+	const releaseInfo = checkResult.releaseInfo ?? clientReleaseInfo;
 
 	if (!releaseInfo) {
-		return c.json({ error: "Missing releaseInfo" }, 400);
+		return c.json({ error: "No update available" }, 404);
 	}
 
 	return streamSSE(c, async (stream) => {
@@ -109,8 +121,8 @@ updateRoutes.get("/status", (c) => {
 
 /**
  * POST /api/update/apply
- * Replace the current binary with the downloaded update and restart.
- * The new process will kill this one after it starts successfully.
+ * Move the downloaded update next to the current binary and exit.
+ * The user needs to start the new binary manually.
  */
 updateRoutes.post("/apply", (c) => {
 	const result = applyUpdate();

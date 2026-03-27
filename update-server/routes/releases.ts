@@ -53,9 +53,21 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		const version = formData.get("version") as string | null;
 		const channel = formData.get("channel") as string | null;
 		const platform = formData.get("platform") as string | null;
-		const releaseNotes = formData.get("releaseNotes") as string | null;
+		const releaseNotesRaw = formData.get("releaseNotes") as string | null;
+		let releaseNotes: string | Record<string, string> | undefined;
+		if (releaseNotesRaw) {
+			try {
+				const parsed = JSON.parse(releaseNotesRaw);
+				if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+					releaseNotes = parsed as Record<string, string>;
+				} else {
+					releaseNotes = releaseNotesRaw;
+				}
+			} catch {
+				releaseNotes = releaseNotesRaw;
+			}
+		}
 		const file = formData.get("file") as File | null;
-		const blockmapFile = formData.get("blockmap") as File | null;
 		const zstdPatchFile = formData.get("zstdPatch") as File | null;
 		const zstdPatchMetaFile = formData.get("zstdPatchMeta") as File | null;
 
@@ -82,7 +94,6 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		let filename: string;
 		let fileSize: number;
 		let sha512: string;
-		let hasFullFile = false;
 
 		if (file) {
 			// Full file upload — compute sha512 from content
@@ -90,7 +101,6 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			const fileBuffer = Buffer.from(await file.arrayBuffer());
 			fileSize = fileBuffer.length;
 			sha512 = createHash("sha512").update(fileBuffer).digest("base64");
-			hasFullFile = true;
 
 			await storage.saveFile(`${basePath}/${filename}`, fileBuffer);
 			logger.info("Saved release file", {
@@ -118,15 +128,6 @@ export function createReleaseRoutes(storage: StorageBackend) {
 				filename,
 				size: fileSize,
 			});
-		}
-
-		// Save blockmap if provided
-		let hasBlockmap = false;
-		if (blockmapFile) {
-			const blockmapBuffer = Buffer.from(await blockmapFile.arrayBuffer());
-			await storage.saveFile(`${basePath}/${filename}.blockmap`, blockmapBuffer);
-			hasBlockmap = true;
-			logger.info("Saved blockmap", { filename: `${filename}.blockmap` });
 		}
 
 		// Save zstd patch if provided
@@ -178,10 +179,8 @@ export function createReleaseRoutes(storage: StorageBackend) {
 				filename,
 				size: fileSize,
 				sha512,
-				hasBlockmap,
 				hasZstdPatch,
 				zstdPatchFromVersion,
-				hasFullFile,
 			};
 
 			m.platforms[platform] = platformInfo;
@@ -199,8 +198,6 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			filename,
 			size: fileSize,
 			sha512: `${sha512.slice(0, 16)}...`,
-			hasFullFile,
-			hasBlockmap,
 			hasZstdPatch,
 		});
 	});
