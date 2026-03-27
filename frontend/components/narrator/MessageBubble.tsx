@@ -573,7 +573,17 @@ export function ReasoningSummary({
 	translatedText?: string;
 }) {
 	const { t } = useTranslation("narrator");
-	const [expanded, setExpanded] = useState(false);
+	// Compute initial expanded state eagerly — avoids a useLayoutEffect setState
+	// that would count toward React's nested-update limit.
+	const [expanded, setExpanded] = useState(() => {
+		const singleLine = text.trim().replace(/\s+/g, " ");
+		const bm = singleLine.match(/^\*\*(.+?)\*\*/);
+		const trailing = bm ? singleLine.slice(bm[0].length).trim() : "";
+		if (trailing.length > 0) {
+			return localStorage.getItem("narrafork_expand_reasoning") === "true";
+		}
+		return false;
+	});
 	const [isOverflow, setIsOverflow] = useState(false);
 	const [showTranslation, setShowTranslation] = useState(!!translatedText);
 	const prevTranslatedRef = useRef(translatedText);
@@ -592,12 +602,15 @@ export function ReasoningSummary({
 	const trailingText = boldMatch ? singleLineText.slice(boldMatch[0].length).trim() : "";
 	const hasTrailingContent = trailingText.length > 0;
 
+	// When trailing content appears after mount (e.g. streaming text grows),
+	// auto-expand if the user preference is set. Use a ref guard so this only
+	// fires once per component instance.
 	const autoExpandedRef = useRef(false);
-	useLayoutEffect(() => {
+	useEffect(() => {
 		if (hasTrailingContent && !autoExpandedRef.current) {
 			autoExpandedRef.current = true;
 			const shouldExpand = localStorage.getItem("narrafork_expand_reasoning") === "true";
-			setExpanded(shouldExpand);
+			if (shouldExpand) setExpanded(true);
 		}
 	}, [hasTrailingContent]);
 
@@ -610,10 +623,11 @@ export function ReasoningSummary({
 		const measure = () => {
 			const el = lineRef.current;
 			if (!el) {
-				setIsOverflow(false);
+				setIsOverflow((prev) => (prev ? false : prev));
 				return;
 			}
-			setIsOverflow(el.scrollWidth - el.clientWidth > 1);
+			const overflowing = el.scrollWidth - el.clientWidth > 1;
+			setIsOverflow((prev) => (prev === overflowing ? prev : overflowing));
 		};
 
 		const lineEl = lineRef.current;
@@ -647,11 +661,14 @@ export function ReasoningSummary({
 
 	const canExpand = isOverflow || hasTrailingContent;
 
-	useLayoutEffect(() => {
-		if (!canExpand && expanded) {
-			setExpanded(false);
-		}
-	}, [canExpand, expanded]);
+	// Collapse when canExpand becomes false — use render-time guard to avoid
+	// a useLayoutEffect setState that counts toward the nested-update limit.
+	if (!canExpand && expanded) {
+		// Safe: React allows a single setState during render when the value
+		// actually changes, and it will re-render synchronously without
+		// incrementing the nested-update counter the same way useLayoutEffect does.
+		setExpanded(false);
+	}
 
 	return (
 		<Box style={{ flex: 1, minWidth: 0 }}>

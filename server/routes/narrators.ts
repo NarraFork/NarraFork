@@ -68,7 +68,10 @@ import {
 import type { LoadToolNotFound, LoadToolResult } from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
+	applyToolCall,
 	getAffectedFiles,
+	groupByFile,
+	queryOrderedToolCalls,
 	rebuildFileState,
 	rebuildFileStatesExcluding,
 	rebuildFileStatesUpToSeq,
@@ -1137,11 +1140,11 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
 
 	const currentContent = await rebuildFileState(narratorId, snap.filePath);
-	const original = snap.originalContent ?? "(file did not exist)";
-	const current = currentContent ?? "(file deleted)";
 
 	return c.json({
-		diff: `--- a/${snap.filePath}\n+++ b/${snap.filePath}\n\nOriginal:\n${original}\n\nCurrent:\n${current}`,
+		filePath: snap.filePath,
+		original: snap.originalContent,
+		current: currentContent,
 	});
 });
 
@@ -1268,6 +1271,192 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 			500,
 		);
 	}
+});
+
+/** Get aggregated file modification summary for a narrator */
+narratorRoutes.get("/:id/file-modifications", async (c) => {
+	const narratorId = c.req.param("id");
+
+	const snapshots = await db.query.narratorFileSnapshots.findMany({
+		where: eq(narratorFileSnapshots.narratorId, narratorId),
+		orderBy: asc(narratorFileSnapshots.createdAt),
+	});
+	if (snapshots.length === 0) return c.json({ files: [] });
+
+	const allToolCalls = await queryOrderedToolCalls(narratorId);
+	const grouped = groupByFile(allToolCalls);
+
+	const files = snapshots.map((snap) => {
+		const ops = grouped.get(snap.filePath) ?? [];
+		return {
+			filePath: snap.filePath,
+			snapshotId: snap.id,
+			originalExists: snap.originalContent !== null,
+			editCount: ops.length,
+			lastModifiedAt: ops.length > 0 ? ops[ops.length - 1].createdAt : snap.createdAt,
+			operations: ops.map((op) => ({
+				toolUseId: op.toolUseId,
+				toolName: op.toolName,
+				messageId: op.messageId,
+				createdAt: op.createdAt,
+			})),
+		};
+	});
+
+	return c.json({ files });
+});
+
+/** Revert a single file to its original state (before narrator touched it) */
+narratorRoutes.post("/:id/revert-file", async (c) => {
+	const narratorId = c.req.param("id");
+	const body = await c.req.json<{ filePath: string }>();
+	if (!body.filePath) return c.json({ error: "filePath is required" }, 400);
+
+	if (isNarratorActive(narratorId)) {
+		return c.json({ error: "Cannot revert while narrator is running" }, 409);
+	}
+
+	const cwd = await resolveNarratorCwd(narratorId);
+	if (!cwd) return c.json({ error: "Narrator has no working directory" }, 400);
+
+	const snap = await db.query.narratorFileSnapshots.findFirst({
+		where: and(
+			eq(narratorFileSnapshots.narratorId, narratorId),
+			eq(narratorFileSnapshots.filePath, body.filePath),
+		),
+		columns: { originalContent: true },
+	});
+	if (!snap) return c.json({ error: "No snapshot found for this file" }, 404);
+
+	try {
+		if (isNarratorActive(narratorId)) {
+			return c.json({ error: "Narrator became active during revert" }, 409);
+		}
+
+		const absPath = resolve(cwd, body.filePath);
+		if (snap.originalContent === null) {
+			// File didn't exist before — delete it
+			const file = Bun.file(absPath);
+			if (await file.exists()) unlinkSync(absPath);
+		} else {
+			mkdirSync(dirname(absPath), { recursive: true });
+			await Bun.write(absPath, snap.originalContent);
+		}
+
+		return c.json({ success: true, originalExists: snap.originalContent !== null });
+	} catch (err) {
+		return c.json(
+			{ error: `Revert failed: ${err instanceof Error ? err.message : String(err)}` },
+			500,
+		);
+	}
+});
+
+/** Preview file changes that would be reverted if a message is deleted */
+narratorRoutes.get("/:id/delete-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.query("messageId");
+	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
+
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+		columns: { seq: true },
+	});
+	if (!targetRef) return c.json({ error: "Message not found" }, 404);
+
+	// Find all tool calls at or after the target message
+	const toolCallsToRevert = await db
+		.select({
+			toolUseId: narratorToolCalls.toolUseId,
+			toolName: narratorToolCalls.toolName,
+			inputJson: narratorToolCalls.inputJson,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				gte(narratorMessageRefs.seq, targetRef.seq),
+			),
+		);
+
+	const affectedFilePaths = getAffectedFiles(toolCallsToRevert);
+	if (affectedFilePaths.length === 0) {
+		return c.json({ affectedFiles: [], toolCallCount: 0 });
+	}
+
+	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
+
+	// Current state (all tool calls applied)
+	const currentStates = await rebuildFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
+	// State after revert (excluding deleted tool calls)
+	const revertedStates = await rebuildFileStatesExcluding(
+		narratorId,
+		affectedFilePaths,
+		excludeIds,
+	);
+
+	const affectedFiles = affectedFilePaths.map((filePath) => ({
+		filePath,
+		currentContent: currentStates.get(filePath) ?? null,
+		revertedContent: revertedStates.get(filePath) ?? null,
+		willBeDeleted: revertedStates.get(filePath) === null,
+	}));
+
+	return c.json({ affectedFiles, toolCallCount: toolCallsToRevert.length });
+});
+
+/** Preview file state for a pending Write/Edit permission request */
+narratorRoutes.get("/:id/permission-file-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const toolUseId = c.req.query("toolUseId");
+	if (!toolUseId) return c.json({ error: "toolUseId query param is required" }, 400);
+
+	const toolCall = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+		),
+		columns: { toolName: true, inputJson: true },
+	});
+	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
+
+	const input = toolCall.inputJson as Record<string, unknown> | null;
+	const filePath = (input?.file_path as string) ?? null;
+	if (!filePath) return c.json({ error: "Tool call has no file_path" }, 400);
+
+	// Rebuild current file state (before this tool call is applied)
+	const currentContent = await rebuildFileState(narratorId, filePath);
+
+	// Simulate applying this tool call to get preview
+	const fakeOrdered = {
+		toolUseId,
+		toolName: toolCall.toolName,
+		inputJson: toolCall.inputJson,
+		status: "success",
+		messageId: "",
+		seq: 0,
+		createdAt: "",
+	};
+	const previewContent = applyToolCall(currentContent, fakeOrdered);
+
+	return c.json({
+		filePath,
+		currentContent,
+		previewContent,
+		toolName: toolCall.toolName,
+		inputJson: toolCall.inputJson,
+	});
 });
 
 // === Background task routes ===

@@ -26,6 +26,7 @@ import {
 	IconDownload,
 	IconEye,
 	IconFile,
+	IconFileCode,
 	IconFileText,
 	IconGitFork,
 	IconHistory,
@@ -77,6 +78,11 @@ export const LatestTodosToolUseIdCtx = createContext<{
 	toolUseId: string | null;
 	isThinking: boolean;
 }>({ toolUseId: null, isThinking: false });
+
+/** Context for opening the file modifications drawer from within tool call cards */
+export const FileModDrawerCtx = createContext<{
+	openForApproval: () => void;
+}>({ openForApproval: () => {} });
 
 // --- Types ---
 
@@ -2225,6 +2231,24 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 	}
 }
 
+// --- "Review in panel" button for Write/Edit permissions ---
+
+function ReviewInPanelButton() {
+	const { t } = useTranslation("narrator");
+	const { openForApproval } = useContext(FileModDrawerCtx);
+	return (
+		<Button
+			size="sm"
+			color="indigo"
+			variant="subtle"
+			leftSection={<IconFileCode size={14} />}
+			onClick={openForApproval}
+		>
+			{t("fileMod_viewInPanel")}
+		</Button>
+	);
+}
+
 // --- Inline permission UI rendered inside the tool call card ---
 
 export function InlinePermission({
@@ -2449,6 +2473,7 @@ export function InlinePermission({
 						{tc("deny")}
 					</Button>
 				)}
+				{!editing && EDIT_TOOLS.has(permission.toolName) && <ReviewInPanelButton />}
 			</Group>
 		</Box>
 	);

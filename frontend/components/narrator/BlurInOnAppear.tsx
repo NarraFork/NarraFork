@@ -97,12 +97,14 @@ export function useBlurInOnAppear(animationId?: string | null) {
 	const [shouldAnimate, setShouldAnimate] = useState(false);
 
 	useLayoutEffect(() => {
-		setShouldAnimate(false);
-		if (!registry || !animationId) return;
-		const registration = registry.registerAppearance(animationId);
-		if (registration.animate) {
-			setShouldAnimate(true);
+		if (!registry || !animationId) {
+			// Only call setState when the value actually changes to avoid
+			// incrementing React's nested-update counter unnecessarily.
+			setShouldAnimate((prev) => (prev ? false : prev));
+			return;
 		}
+		const registration = registry.registerAppearance(animationId);
+		setShouldAnimate(registration.animate);
 		return registration.cleanup;
 	}, [registry, animationId]);
 

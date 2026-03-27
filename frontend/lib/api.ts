@@ -800,6 +800,60 @@ export const api = {
 			body: JSON.stringify({ summary }),
 		}),
 
+	// File modifications
+	getFileModifications: (narratorId: string) =>
+		request<{
+			files: Array<{
+				filePath: string;
+				snapshotId: string;
+				originalExists: boolean;
+				editCount: number;
+				lastModifiedAt: string;
+				operations: Array<{
+					toolUseId: string;
+					toolName: string;
+					messageId: string;
+					createdAt: string;
+				}>;
+			}>;
+		}>(`/narrators/${narratorId}/file-modifications`),
+	getFileDiff: (narratorId: string, snapshotId: string) =>
+		request<{ filePath: string; original: string | null; current: string | null }>(
+			`/narrators/${narratorId}/patches/${snapshotId}/diff`,
+		),
+	revertFile: (narratorId: string, filePath: string) =>
+		request<{ success: boolean; originalExists: boolean }>(`/narrators/${narratorId}/revert-file`, {
+			method: "POST",
+			body: JSON.stringify({ filePath }),
+		}),
+	revertAllFiles: (narratorId: string) =>
+		request<{ fileCount: number; files: string[] }>(`/narrators/${narratorId}/revert`, {
+			method: "POST",
+			body: JSON.stringify({ messageId: "__all__" }),
+		}),
+	unrevertAll: (narratorId: string) =>
+		request<{ success: boolean }>(`/narrators/${narratorId}/unrevert`, { method: "POST" }),
+	getDeletePreview: (narratorId: string, messageId: string) =>
+		request<{
+			affectedFiles: Array<{
+				filePath: string;
+				currentContent: string | null;
+				revertedContent: string | null;
+				willBeDeleted: boolean;
+			}>;
+			toolCallCount: number;
+		}>(`/narrators/${narratorId}/delete-preview?messageId=${encodeURIComponent(messageId)}`),
+	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
+		request<{
+			filePath: string;
+			currentContent: string | null;
+			previewContent: string | null;
+			toolName: string;
+			inputJson: Record<string, unknown>;
+		}>(
+			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
+		),
+
 	// Narrator Fork (standalone sessions only)
 	forkNarrator: (
 		narratorId: string,

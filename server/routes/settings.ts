@@ -494,10 +494,12 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
-	saveSettings(merged);
-
-	// Purge model caches for removed providers
+	// Purge model caches for removed providers BEFORE saving,
+	// because saveSettings() mutates `settings` in-place (via _cache.current),
+	// which would make `current` and `merged` identical and prevent detection.
 	purgeRemovedProviderCaches(current, merged);
+
+	saveSettings(merged);
 
 	// Detect host/port/TLS changes and schedule a server restart
 	const newHost = merged.server.host;

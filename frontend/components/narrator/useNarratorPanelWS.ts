@@ -440,7 +440,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				feedbackText?: string,
 				compactAfter?: boolean,
 				updatedPlan?: string,
-		  ) => void)
+		  ) => boolean)
 		| null
 	>(null);
 	const sendBufferMessageRef = useRef<((targetNarratorId: string, text: string) => boolean) | null>(
@@ -485,7 +485,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			compactAfter?: boolean,
 			updatedPlan?: string,
 		) => {
-			sendPermissionDecisionRef.current?.(
+			const wsSent = sendPermissionDecisionRef.current?.(
 				requestId,
 				decision,
 				undefined,
@@ -494,6 +494,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				compactAfter,
 				updatedPlan,
 			);
+			// Fallback to HTTP API when WS send fails (e.g. reconnecting)
+			if (!wsSent) {
+				if (decision === "allow") {
+					api.approvePermission(requestId).catch(() => {});
+				} else {
+					api.denyPermission(requestId, feedbackText).catch(() => {});
+				}
+			}
 			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
 			if (toolUseId) {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
@@ -663,14 +671,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (ev?.type !== "content_block_delta" || !ev.delta?.text || ev.subagentToolUseId) {
 					return;
 				}
-				// Streaming content arriving means any pending retry has succeeded
-				setRetryInfo((prev) => (prev ? null : prev));
 				if (ev.delta.type === "text_delta") {
+					// Streaming content arriving means any pending retry has succeeded.
+					// Only call setRetryInfo when there is actually a retry to clear —
+					// avoids a no-op setState on every delta that still increments
+					// React's nested-update counter inside useLayoutEffect chains.
+					if (retryInfo) setRetryInfo(null);
 					streamingRef.current += ev.delta.text;
 					flushStreamingVersion();
 					return;
 				}
 				if (ev.delta.type === "reasoning_delta") {
+					if (retryInfo) setRetryInfo(null);
 					streamingReasoningRef.current += ev.delta.text;
 					flushStreamingVersion();
 					return;
@@ -696,7 +708,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
 						// New assistant message means any pending retry succeeded
-						setRetryInfo((prev) => (prev ? null : prev));
+						if (retryInfo) setRetryInfo(null);
 						// Only clear top-level streaming state for non-subagent messages.
 						// Subagent assistant messages should NOT reset the parent narrator's
 						// streaming text, tool chunks, or streaming version — the parent
@@ -969,8 +981,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				parentToolUseId?: string,
 			) => {
 				// Tool execution starting means any pending retry has succeeded.
-				// Functional update avoids unnecessary re-render when already null.
-				setRetryInfo((prev) => (prev ? null : prev));
+				if (retryInfo) setRetryInfo(null);
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
 
@@ -1169,13 +1180,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status, turnStartedAt) => {
 				setIsCompacting(false);
-				setRetryInfo(null);
+				if (retryInfo) setRetryInfo(null);
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
 				// "interrupted" and "done" also mean the agent loop has stopped, so any
 				// residual streaming text / tool chunks must be flushed.
 				const isTerminal =
 					status === "idle" || status === "interrupted" || status === "done" || status === "error";
 				if (isTerminal) {
+					const hadStreaming =
+						!!streamingRef.current || !!streamingReasoningRef.current || !!webSearchRef.current;
 					if (streamingRef.current) {
 						streamingRef.current = "";
 					}
@@ -1183,7 +1196,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						streamingReasoningRef.current = "";
 					}
 					webSearchRef.current = null;
-					clearStreamingState();
+					// Only bump streamingVersion when there was actual streaming content
+					// to clear — avoids a redundant setState when onMessage already
+					// cleared everything, reducing the nested-update count.
+					if (hadStreaming) {
+						clearStreamingState();
+					}
 				}
 				if (isTerminal) {
 					// Cancel any pending RAF tool chunk flush and notify so the memo

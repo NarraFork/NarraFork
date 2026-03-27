@@ -47,6 +47,64 @@ export function useNarratorsPaginated(opts?: {
 	});
 }
 
+// --- File modifications ---
+
+export function useFileModifications(narratorId: string, enabled = true) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "file-modifications"],
+		queryFn: () => api.getFileModifications(narratorId),
+		enabled,
+	});
+}
+
+export function useFileDiff(narratorId: string, snapshotId: string, enabled = false) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "file-diff", snapshotId],
+		queryFn: () => api.getFileDiff(narratorId, snapshotId),
+		enabled: enabled && !!snapshotId,
+	});
+}
+
+export function useDeletePreview(narratorId: string, messageId: string | null, enabled = false) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "delete-preview", messageId],
+		queryFn: () => api.getDeletePreview(narratorId, messageId as string),
+		enabled: enabled && !!messageId,
+	});
+}
+
+export function usePermissionFilePreview(
+	narratorId: string,
+	toolUseId: string | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "permission-file-preview", toolUseId],
+		queryFn: () => api.getPermissionFilePreview(narratorId, toolUseId as string),
+		enabled: enabled && !!toolUseId,
+	});
+}
+
+export function useRevertFile(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (filePath: string) => api.revertFile(narratorId, filePath),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "file-modifications"] });
+		},
+	});
+}
+
+export function useUnrevertAll(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.unrevertAll(narratorId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "file-modifications"] });
+		},
+	});
+}
+
 // === Narrator Fork (standalone narrators only) ===
 
 export function useForkNarrator() {

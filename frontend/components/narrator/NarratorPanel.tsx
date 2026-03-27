@@ -37,6 +37,7 @@ import {
 	IconEraser,
 	IconExternalLink,
 	IconFile,
+	IconFileCode,
 	IconFolderPlus,
 	IconLock,
 	IconLockOpen,
@@ -111,6 +112,7 @@ import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider } from "./ContentViewer";
+import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import {
 	type RenderedTreeElementMeta,
 	RenderProgress,
@@ -145,7 +147,7 @@ import {
 } from "./narrator-panel-types";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
 import { getGlobalCloseSwipe, setGlobalOnSelectionRange, setGlobalSwipeAnchor } from "./swipeState";
-import { LatestTodosToolUseIdCtx } from "./ToolCallCard";
+import { FileModDrawerCtx, LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
@@ -1160,6 +1162,21 @@ export function NarratorPanel({
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
 
+	// File modifications drawer state
+	const [fileModDrawerOpened, setFileModDrawerOpened] = useState(false);
+	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
+	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
+
+	// Get the first pending Write/Edit permission for the drawer
+	const firstEditPermission = useMemo(() => {
+		for (const perm of renderPermCb.pendingPermsMap.values()) {
+			if (perm.toolName === "Write" || perm.toolName === "Edit" || perm.toolName === "MultiEdit") {
+				return perm;
+			}
+		}
+		return null;
+	}, [renderPermCb.pendingPermsMap]);
+
 	const isWorking = narrator?.status === "thinking";
 	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
@@ -1198,6 +1215,13 @@ export function NarratorPanel({
 	const todosCtxValue = useMemo(
 		() => ({ toolUseId: todosToolUseId, isThinking: !!isWorking }),
 		[todosToolUseId, isWorking],
+	);
+
+	const fileModDrawerCtxValue = useMemo(
+		() => ({
+			openForApproval: () => setFileModDrawerOpened(true),
+		}),
+		[],
 	);
 
 	// --- Retry countdown ---
@@ -2832,6 +2856,16 @@ export function NarratorPanel({
 								{editExpandOverride === false ? <IconCode size={16} /> : <IconCodeOff size={16} />}
 							</ActionIcon>
 						</Tooltip>
+						<Tooltip label={t("fileMod_title")}>
+							<ActionIcon
+								size="sm"
+								variant={fileModDrawerOpened ? "light" : "subtle"}
+								color={fileModDrawerOpened ? "indigo" : "gray"}
+								onClick={() => setFileModDrawerOpened((v) => !v)}
+							>
+								<IconFileCode size={16} />
+							</ActionIcon>
+						</Tooltip>
 						<Tooltip label={t("archiveNarrator")}>
 							<ActionIcon
 								size="sm"
@@ -2953,13 +2987,24 @@ export function NarratorPanel({
 					)}
 					<Box h="100%" style={{ position: "relative" }}>
 						<MessageSelectionCtx.Provider value={selectionCtxValue}>
-							<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-								{advancedAnim ? (
-									<BlurInOnAppearProvider
-										scopeKey={narratorId}
-										suppress={suppressBlurIn}
-										seedIds={blurInSeedIds}
-									>
+							<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
+								<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+									{advancedAnim ? (
+										<BlurInOnAppearProvider
+											scopeKey={narratorId}
+											suppress={suppressBlurIn}
+											seedIds={blurInSeedIds}
+										>
+											<BroadMessageList
+												ref={virtualListRef}
+												elements={finalElements}
+												elementKeys={finalKeys}
+												scrollRef={viewportCallbackRef}
+												contentRef={contentRef}
+												shift={shifting}
+											/>
+										</BlurInOnAppearProvider>
+									) : (
 										<BroadMessageList
 											ref={virtualListRef}
 											elements={finalElements}
@@ -2968,18 +3013,9 @@ export function NarratorPanel({
 											contentRef={contentRef}
 											shift={shifting}
 										/>
-									</BlurInOnAppearProvider>
-								) : (
-									<BroadMessageList
-										ref={virtualListRef}
-										elements={finalElements}
-										elementKeys={finalKeys}
-										scrollRef={viewportCallbackRef}
-										contentRef={contentRef}
-										shift={shifting}
-									/>
-								)}
-							</LatestTodosToolUseIdCtx.Provider>
+									)}
+								</LatestTodosToolUseIdCtx.Provider>
+							</FileModDrawerCtx.Provider>
 						</MessageSelectionCtx.Provider>
 						<ScrollbarUserMarkers
 							markers={userMessageMarkers}
@@ -4058,6 +4094,28 @@ export function NarratorPanel({
 						</Group>
 					</Box>
 				)}
+
+				<FileModificationsDrawer
+					narratorId={narratorId}
+					opened={fileModDrawerOpened}
+					onClose={() => {
+						setFileModDrawerOpened(false);
+						setDeletePreviewMessageId(null);
+						setPendingDeleteCallback(null);
+					}}
+					pendingPermission={firstEditPermission}
+					onPermissionDecision={renderPermCb.onPermissionDecision}
+					deletePreviewMessageId={deletePreviewMessageId}
+					onConfirmDelete={() => {
+						pendingDeleteCallback?.();
+						setDeletePreviewMessageId(null);
+						setPendingDeleteCallback(null);
+					}}
+					onCancelDelete={() => {
+						setDeletePreviewMessageId(null);
+						setPendingDeleteCallback(null);
+					}}
+				/>
 			</Stack>
 		</ContentViewerEnvironmentProvider>
 	);

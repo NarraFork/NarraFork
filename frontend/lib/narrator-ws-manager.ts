@@ -57,6 +57,12 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
 const CLIENT_PING_TIMEOUT_MS = 60_000;
 const WS_STATUS_ID = "narrator-global";
+/**
+ * How long the tab must be hidden before we force a reconnect on return.
+ * Matches the server heartbeat interval — if we missed at least one ping
+ * cycle, the connection state is unreliable.
+ */
+const VISIBILITY_RECONNECT_THRESHOLD_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Manager
@@ -108,11 +114,13 @@ class NarratorWSManager {
 	connect(): void {
 		if (this.ws) return; // already connected / connecting
 		this.cancelled = false;
+		this._listenVisibility();
 		this._doConnect();
 	}
 
 	disconnect(): void {
 		this.cancelled = true;
+		this._unlistenVisibility();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
 		removeWSStatus(WS_STATUS_ID);
@@ -349,6 +357,13 @@ class NarratorWSManager {
 		if (ws) {
 			safeCloseWs(ws);
 		}
+		// Notify listeners that we're disconnected so reconnect-aware effects
+		// (e.g. getPendingPermissions, invalidateQueries) fire when the new
+		// connection opens.  Without this, _connected stays true and the
+		// onopen _setConnected(true) is a no-op (no change → no notification).
+		if (this._connected) {
+			this._setConnected(false, false);
+		}
 		this.reconnectAttempts = 0;
 		this._doConnect();
 	}
@@ -496,6 +511,60 @@ class NarratorWSManager {
 		if (this.statsRefCount > 0) {
 			ws.send(JSON.stringify({ type: "subscribe_stats" }));
 		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Visibility change — recover from browser background throttling
+	// -----------------------------------------------------------------------
+
+	private _boundVisibilityHandler: (() => void) | null = null;
+	private _hiddenAt = 0;
+
+	private _listenVisibility(): void {
+		if (this._boundVisibilityHandler) return;
+		this._boundVisibilityHandler = () => this._handleVisibilityChange();
+		document.addEventListener("visibilitychange", this._boundVisibilityHandler);
+	}
+
+	private _unlistenVisibility(): void {
+		if (this._boundVisibilityHandler) {
+			document.removeEventListener("visibilitychange", this._boundVisibilityHandler);
+			this._boundVisibilityHandler = null;
+		}
+	}
+
+	/**
+	 * When the tab returns to the foreground after being hidden for a while,
+	 * browsers may have throttled timers and frozen the WS data flow.
+	 *
+	 * We track how long the tab was hidden.  If it exceeds the threshold
+	 * (one server heartbeat interval), we force a full reconnect so that
+	 * `_restoreSubscriptions` runs cleanly on a fresh connection — this
+	 * avoids duplicate streaming snapshots or catch-up races on a stale
+	 * connection that may have silently lost messages.
+	 *
+	 * Short tab switches (< threshold) are ignored to avoid disrupting
+	 * active streaming.
+	 */
+	private _handleVisibilityChange(): void {
+		if (this.cancelled) return;
+
+		if (document.visibilityState === "hidden") {
+			this._hiddenAt = Date.now();
+			return;
+		}
+
+		// visible
+		if (!this._hiddenAt) return;
+		const elapsed = Date.now() - this._hiddenAt;
+		this._hiddenAt = 0;
+
+		// Only act if the tab was hidden long enough for messages to be lost
+		if (elapsed < VISIBILITY_RECONNECT_THRESHOLD_MS) return;
+
+		// Force a clean reconnect — _restoreSubscriptions will run in onopen
+		// with correct lastMessageIds, triggering server-side catch-up.
+		this.reconnect();
 	}
 
 	private _sendSubscribe(narratorIds: string[], lastMessageId?: string): void {

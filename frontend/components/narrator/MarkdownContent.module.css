@@ -9,6 +9,45 @@
 	margin-top: 0;
 }
 
+/* Fix flowtoken animated token spans.
+   1. inline-block prevents mid-token wrapping → override to inline.
+   2. pre-wrap inside list items preserves stray \n between items as visible
+      blank lines during streaming → override to normal inside <li>. */
+.root span[style*="inline-block"] {
+	display: inline !important;
+}
+
+.root li span[style*="pre-wrap"] {
+	white-space: normal !important;
+}
+
+/* Mantine List uses list-style-position:inside + white-space:nowrap on <li>
+   so the marker and inline-flex wrapper stay on one line. But the wrapper has
+   no width cap, so long text overflows the container.
+   Fix: switch to outside positioning with normal wrap. The marker sits in the
+   padding area and content wraps naturally. */
+.root ul,
+.root ol,
+.rootNoWrap ul,
+.rootNoWrap ol {
+	list-style-position: outside;
+	padding-inline-start: 1.5em;
+}
+
+.root li,
+.rootNoWrap li {
+	white-space: normal;
+}
+
+/* Remove extra top-margin on nested lists inside list items */
+.root li ul,
+.root li ol,
+.rootNoWrap li ul,
+.rootNoWrap li ol {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
 .rootNoWrap {
 	min-width: 0;
 	max-width: 100%;

@@ -13,7 +13,7 @@ import { narratorFileSnapshots, narratorMessageRefs, narratorToolCalls } from ".
 import { replace } from "../lib/agent/tools/edit";
 
 // Tool call with ordering info
-interface OrderedToolCall {
+export interface OrderedToolCall {
 	toolUseId: string;
 	toolName: string;
 	inputJson: unknown;
@@ -27,14 +27,14 @@ interface OrderedToolCall {
  * Query all Write/Edit tool calls for a narrator, ordered by message seq then createdAt.
  * Optionally limited to tool calls whose message seq <= maxSeq.
  */
-async function queryOrderedToolCalls(
+export async function queryOrderedToolCalls(
 	narratorId: string,
 	maxSeq?: number,
 ): Promise<OrderedToolCall[]> {
 	const conditions = [
 		eq(narratorToolCalls.narratorId, narratorId),
 		eq(narratorToolCalls.status, "success"),
-		sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+		sql`${narratorToolCalls.toolName} IN ('Write', 'Edit', 'MultiEdit')`,
 	];
 	if (maxSeq !== undefined) {
 		conditions.push(lte(narratorMessageRefs.seq, maxSeq));
@@ -68,7 +68,10 @@ async function queryOrderedToolCalls(
  * Apply a single tool call operation to file content.
  * Returns the new content, or null if the operation doesn't affect this file.
  */
-function applyToolCall(currentContent: string | null, toolCall: OrderedToolCall): string | null {
+export function applyToolCall(
+	currentContent: string | null,
+	toolCall: OrderedToolCall,
+): string | null {
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	if (!input) return currentContent;
 
@@ -76,7 +79,7 @@ function applyToolCall(currentContent: string | null, toolCall: OrderedToolCall)
 		return (input.content as string) ?? currentContent;
 	}
 
-	if (toolCall.toolName === "Edit") {
+	if (toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit") {
 		const oldString = input.old_string as string | undefined;
 		const newString = input.new_string as string | undefined;
 		const replaceAll = input.replace_all as boolean | undefined;
@@ -111,7 +114,7 @@ function applyToolCall(currentContent: string | null, toolCall: OrderedToolCall)
 /**
  * Group tool calls by file path.
  */
-function groupByFile(toolCalls: OrderedToolCall[]): Map<string, OrderedToolCall[]> {
+export function groupByFile(toolCalls: OrderedToolCall[]): Map<string, OrderedToolCall[]> {
 	const groups = new Map<string, OrderedToolCall[]>();
 	for (const tc of toolCalls) {
 		const input = tc.inputJson as Record<string, unknown> | null;
@@ -271,7 +274,7 @@ export function getAffectedFiles(
 ): string[] {
 	const files = new Set<string>();
 	for (const tc of toolCalls) {
-		if (tc.toolName !== "Write" && tc.toolName !== "Edit") continue;
+		if (tc.toolName !== "Write" && tc.toolName !== "Edit" && tc.toolName !== "MultiEdit") continue;
 		const input = tc.inputJson as Record<string, unknown> | null;
 		if (!input?.file_path) continue;
 		files.add(input.file_path as string);
