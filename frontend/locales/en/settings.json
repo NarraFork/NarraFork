@@ -540,6 +540,8 @@
 	"versionCommit": "Commit",
 	"versionPlatform": "Platform",
 	"authorsLabel": "Authors",
+	"changelogLink": "View Changelog",
+	"changelogEmpty": "No changelog entries yet.",
 	"summaryModelUnavailableTitle": "Summary Model Unavailable",
 	"summaryModelUnavailableDesc": "The configured summary model \"{{model}}\" is not available. Features like title generation, context compaction, and reasoning translation require a working summary model. Please select a new one.",
 	"summaryModelUnavailableConfirm": "Save",

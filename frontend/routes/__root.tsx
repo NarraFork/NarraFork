@@ -126,7 +126,7 @@ function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
 function RootLayout() {
 	const location = useRouterState({ select: (s) => s.location });
 	const isLoginPage = location.pathname === "/login";
-	const isPublicPage = location.pathname === "/licenses";
+	const isPublicPage = location.pathname === "/licenses" || location.pathname === "/changelog";
 
 	return (
 		<>

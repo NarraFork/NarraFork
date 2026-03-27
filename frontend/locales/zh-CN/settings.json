@@ -540,6 +540,8 @@
 	"versionCommit": "提交",
 	"versionPlatform": "平台",
 	"authorsLabel": "作者",
+	"changelogLink": "查看更新日志",
+	"changelogEmpty": "暂无更新日志。",
 	"summaryModelUnavailableTitle": "摘要模型不可用",
 	"summaryModelUnavailableDesc": "当前配置的摘要模型「{{model}}」不可用。标题生成、上下文压缩、推理翻译等功能需要可用的摘要模型，请选择一个新的模型。",
 	"summaryModelUnavailableConfirm": "保存",

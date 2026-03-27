@@ -40,6 +40,24 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 - **⚠️ 禁止自行删除数据库文件（`~/.narrafork/narrafork.db*`）或 `drizzle/` 目录** — 数据库包含用户数据，删除不可逆。迁移失败时应先尝试修复（如关闭外键检查、调整迁移顺序等），必须由用户明确授权后才能执行删除操作
 - 如用户明确要求全新迁移：删除 `drizzle/` 目录和数据库文件（`~/.narrafork/narrafork.db*`），再运行 `bun run db:generate` + `bun run db:migrate`
 
+**Changelog 与发布工作流：**
+
+项目使用 `changelogs/` 目录持久化每个版本的双语更新日志，构建时嵌入二进制。
+
+1. **生成 Changelog：** 使用 `/generate-changelog` 技能（或手动创建），输出到 `changelogs/v{version}.json`：
+   ```json
+   {
+     "version": "0.2.0",
+     "date": "2026-04-01",
+     "en": "## New Features\n\n- ...",
+     "zh-CN": "## 新功能\n\n- ..."
+   }
+   ```
+2. **发布新版本：** `bun scripts/release.ts <version>` — 自动从 `changelogs/v{version}.json` 读取 changelog（也可 `--changelog=<file>` 手动指定），执行版本 bump → git tag → 跨平台编译 → 上传更新服务器。
+3. **构建嵌入：** `scripts/build-cross-platform.ts` 会扫描 `changelogs/*.json` 生成 `server/generated/embedded-changelog.ts`，编译二进制后无需文件系统即可读取。
+4. **运行时读取：** `server/lib/changelog.ts` 双模式 — 开发时读文件系统，编译二进制读嵌入数据。API 端点 `GET /api/changelog`（公开，无需认证）。
+5. **前端查看：** 设置页 About 区域有「查看更新日志」链接，跳转到 `/changelog` 页面（Timeline 组件，按版本倒序，根据语言切换内容）。
+
 ## 技术栈
 
 - **运行时：** Bun（≥ 1.2），所有脚本通过 `bun run`/`bunx` 执行

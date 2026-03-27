@@ -1,5 +1,6 @@
 import { Anchor, Group, Stack, Text } from "@mantine/core";
-import { IconBrandGithub } from "@tabler/icons-react";
+import { IconBrandGithub, IconHistory } from "@tabler/icons-react";
+import { Link } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 
 declare const __APP_VERSION__: string;
@@ -67,6 +68,12 @@ export function AboutSection({ healthData }: AboutSectionProps) {
 					</Anchor>
 				</Group>
 			</Group>
+			<Anchor component={Link} to="/changelog" size="sm">
+				<Group gap={4}>
+					<IconHistory size={14} />
+					{t("changelogLink")}
+				</Group>
+			</Anchor>
 		</Stack>
 	);
 }

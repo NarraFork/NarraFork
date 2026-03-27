@@ -14,6 +14,7 @@ import { requireAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
 import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
+import changelogRoutes from "./routes/changelog";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
 import { clineRoutes } from "./routes/cline";
@@ -86,6 +87,9 @@ app.get("/api/auth/status", async (c) => {
 
 // Public: share download links (no auth — the share ID itself is the secret)
 app.route("/api/shares", shareRoutes);
+
+// Public: changelog (no sensitive data)
+app.route("/api/changelog", changelogRoutes);
 
 // All routes below require authentication
 app.use("/api/*", requireAuth);
