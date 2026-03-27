@@ -32,10 +32,12 @@ function collectLicenses() {
 		"LICENSE.md",
 		"LICENSE.txt",
 		"license",
+		"license.md",
 		"LICENCE",
 		"LICENCE.md",
 		"License",
 		"LICENSE-MIT",
+		"LICENSE-APACHE",
 	];
 
 	for (const name of Object.keys(all)) {
@@ -44,9 +46,14 @@ function collectLicenses() {
 			if (!existsSync(depPkgPath)) continue;
 			const depPkg = JSON.parse(readFileSync(depPkgPath, "utf8"));
 			const repo = depPkg.repository?.url ?? depPkg.repository ?? depPkg.homepage ?? "";
-			const repoStr = (typeof repo === "string" ? repo : (repo.url ?? ""))
+			let repoStr = (typeof repo === "string" ? repo : (repo.url ?? ""))
 				.replace(/^git\+/, "")
+				.replace(/^git:\/\//, "https://")
 				.replace(/\.git$/, "");
+			// Convert GitHub shorthand "user/repo" to full URL
+			if (repoStr && !repoStr.includes("://")) {
+				repoStr = `https://github.com/${repoStr}`;
+			}
 
 			let licenseText = "";
 			const depDir = join(nodeModules, name);
