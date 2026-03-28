@@ -131,7 +131,7 @@ function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buf
 		writeFileSync(newPath, newBuf);
 
 		const result = Bun.spawnSync(
-			["zstd", `--patch-from=${oldPath}`, newPath, "-o", patchPath, `-${level}`, "--force"],
+			["zstd", `--patch-from=${oldPath}`, newPath, "-o", patchPath, `-${level}`, "--force", "--long=31"],
 			{ stdout: "pipe", stderr: "pipe" },
 		);
 
@@ -244,7 +244,7 @@ function applyZstdCliPatch(
 
 	try {
 		const result = Bun.spawnSync(
-			[zstdBin, "-d", `--patch-from=${oldPath}`, patchPath, "-o", outPath, "--force"],
+			[zstdBin, "-d", `--patch-from=${oldPath}`, patchPath, "-o", outPath, "--force", "--long=31"],
 			{ stdout: "pipe", stderr: "pipe" },
 		);
 
