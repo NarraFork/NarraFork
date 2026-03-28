@@ -1,27 +1,20 @@
 import { usePermissionFilePreview } from "@frontend/hooks/useNarrator";
-import {
-	Box,
-	Button,
-	Center,
-	Group,
-	Loader,
-	ScrollArea,
-	Stack,
-	Tabs,
-	Text,
-	Textarea,
-} from "@mantine/core";
+import { toRelativePath } from "@frontend/lib/format";
+import { Box, Button, Center, Group, Loader, Tabs, Text, Textarea } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 import type { PendingPermission } from "./narrator-panel-types";
 
 export function FileApprovalTab({
 	narratorId,
+	basePath,
 	permission,
 	onDecision,
 }: {
 	narratorId: string;
+	basePath: string | null;
 	permission: PendingPermission;
 	onDecision?: (requestId: string, decision: "allow" | "deny", feedbackText?: string) => void;
 }) {
@@ -70,6 +63,7 @@ export function FileApprovalTab({
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const inputJson = permission.inputJson as Record<string, any> | null;
 	const filePath = data?.filePath ?? (inputJson?.file_path as string) ?? "unknown";
+	const displayPath = toRelativePath(filePath, basePath);
 	const lang = filePath.split(".").pop() ?? "";
 	const currentContent = data?.currentContent ?? "";
 	const previewContent = data?.previewContent ?? "";
@@ -80,14 +74,32 @@ export function FileApprovalTab({
 	const newString = isEdit ? ((inputJson?.new_string as string) ?? "") : "";
 
 	return (
-		<Stack gap="xs" h="100%">
-			<Group px="sm" py={4}>
-				<Text size="xs" fw={500}>
-					{permission.toolName}: {filePath}
+		<Box
+			style={{
+				overflow: "hidden",
+				minWidth: 0,
+				width: "100%",
+				display: "flex",
+				flexDirection: "column",
+				flex: 1,
+			}}
+		>
+			<Group px="sm" py={4} wrap="nowrap" style={{ minWidth: 0, overflow: "hidden" }}>
+				<Text size="xs" fw={500} style={{ flexShrink: 0 }}>
+					{permission.toolName}:
 				</Text>
+				<TruncatedPath path={displayPath} fw={500} />
 			</Group>
 
-			<ScrollArea.Autosize mah="calc(100vh - 280px)" style={{ flex: 1 }}>
+			<Box
+				style={{
+					flex: 1,
+					maxHeight: "calc(100vh - 280px)",
+					overflowY: "auto",
+					overflowX: "hidden",
+					width: "100%",
+				}}
+			>
 				<Tabs defaultValue="diff" variant="outline" mx="xs">
 					<Tabs.List>
 						<Tabs.Tab value="diff">{t("fileMod_changeDiff")}</Tabs.Tab>
@@ -124,7 +136,7 @@ export function FileApprovalTab({
 						</Box>
 					</Tabs.Panel>
 				</Tabs>
-			</ScrollArea.Autosize>
+			</Box>
 
 			<Box px="sm" pb="sm">
 				{permission.decisionReason && (
@@ -151,6 +163,6 @@ export function FileApprovalTab({
 					</Button>
 				</Group>
 			</Box>
-		</Stack>
+		</Box>
 	);
 }

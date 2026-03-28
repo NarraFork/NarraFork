@@ -16,6 +16,20 @@ export function formatRelativeTime(dateStr: string): string {
 }
 
 /**
+ * Strip a base directory prefix from an absolute file path to produce a
+ * project-relative display path.  If the path doesn't start with `basePath`,
+ * it is returned unchanged.
+ *
+ * Example: toRelativePath("/home/u/proj/src/a.ts", "/home/u/proj") → "src/a.ts"
+ */
+export function toRelativePath(filePath: string, basePath: string | null | undefined): string {
+	if (!basePath) return filePath;
+	const base = basePath.endsWith("/") ? basePath : `${basePath}/`;
+	if (filePath.startsWith(base)) return filePath.slice(base.length);
+	return filePath;
+}
+
+/**
  * Format a date string as relative time when within 24h,
  * or as a concrete date+time (YYYY-MM-DD HH:mm) when older.
  */

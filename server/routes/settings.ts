@@ -147,6 +147,27 @@ const updateSettingsSchema = z
 						}),
 					})
 					.optional(),
+				webFetchPolicy: z
+					.object({
+						allowAll: z.boolean().optional(),
+						whitelist: z
+							.array(
+								z.object({
+									pattern: z.string(),
+									enabled: z.boolean().optional(),
+								}),
+							)
+							.optional(),
+						blacklist: z
+							.array(
+								z.object({
+									pattern: z.string(),
+									enabled: z.boolean().optional(),
+								}),
+							)
+							.optional(),
+					})
+					.optional(),
 			})
 			.partial()
 			.optional(),

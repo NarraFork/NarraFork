@@ -1,4 +1,5 @@
 import { useDeletePreview } from "@frontend/hooks/useNarrator";
+import { toRelativePath } from "@frontend/lib/format";
 import {
 	Badge,
 	Box,
@@ -6,7 +7,6 @@ import {
 	Center,
 	Group,
 	Loader,
-	ScrollArea,
 	Stack,
 	Text,
 	UnstyledButton,
@@ -14,15 +14,18 @@ import {
 import { IconChevronDown, IconChevronRight, IconFile, IconTrash } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 
 export function FileDeletePreviewTab({
 	narratorId,
+	basePath,
 	messageId,
 	onConfirm,
 	onCancel,
 }: {
 	narratorId: string;
+	basePath: string | null;
 	messageId: string;
 	onConfirm: () => void;
 	onCancel: () => void;
@@ -65,7 +68,16 @@ export function FileDeletePreviewTab({
 	};
 
 	return (
-		<Stack gap="xs" h="100%">
+		<Box
+			style={{
+				overflow: "hidden",
+				minWidth: 0,
+				width: "100%",
+				display: "flex",
+				flexDirection: "column",
+				flex: 1,
+			}}
+		>
 			<Group px="sm" py={4} justify="space-between">
 				<Text size="xs" c="dimmed">
 					{t("fileMod_affectedFiles", { count: affectedFiles.length })} (
@@ -73,11 +85,20 @@ export function FileDeletePreviewTab({
 				</Text>
 			</Group>
 
-			<ScrollArea.Autosize mah="calc(100vh - 260px)" style={{ flex: 1 }}>
+			<Box
+				style={{
+					flex: 1,
+					maxHeight: "calc(100vh - 260px)",
+					overflowY: "auto",
+					overflowX: "hidden",
+					width: "100%",
+				}}
+			>
 				<Stack gap={2} mx="xs">
 					{affectedFiles.map((file) => {
 						const lang = file.filePath.split(".").pop() ?? "";
 						const isExpanded = expandedFile === file.filePath;
+						const displayPath = toRelativePath(file.filePath, basePath);
 						return (
 							<Box
 								key={file.filePath}
@@ -96,8 +117,17 @@ export function FileDeletePreviewTab({
 										backgroundColor: isExpanded ? "var(--mantine-color-dark-5)" : undefined,
 									}}
 								>
-									<Group gap="xs" wrap="nowrap" justify="space-between">
-										<Group gap="xs" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
+									<Group
+										gap="xs"
+										wrap="nowrap"
+										justify="space-between"
+										style={{ overflow: "hidden", minWidth: 0 }}
+									>
+										<Group
+											gap="xs"
+											wrap="nowrap"
+											style={{ flex: 1, minWidth: 0, overflow: "hidden" }}
+										>
 											{isExpanded ? (
 												<IconChevronDown size={14} style={{ flexShrink: 0 }} />
 											) : (
@@ -108,17 +138,7 @@ export function FileDeletePreviewTab({
 											) : (
 												<IconFile size={14} style={{ flexShrink: 0 }} />
 											)}
-											<Text
-												size="xs"
-												ff="monospace"
-												style={{
-													overflow: "hidden",
-													textOverflow: "ellipsis",
-													whiteSpace: "nowrap",
-												}}
-											>
-												{file.filePath}
-											</Text>
+											<TruncatedPath path={displayPath} />
 										</Group>
 										<Badge size="xs" variant="light" color={file.willBeDeleted ? "red" : "orange"}>
 											{file.willBeDeleted
@@ -148,7 +168,7 @@ export function FileDeletePreviewTab({
 						);
 					})}
 				</Stack>
-			</ScrollArea.Autosize>
+			</Box>
 
 			<Box px="sm" pb="sm">
 				<Group gap="sm" justify="flex-end">
@@ -160,6 +180,6 @@ export function FileDeletePreviewTab({
 					</Button>
 				</Group>
 			</Box>
-		</Stack>
+		</Box>
 	);
 }

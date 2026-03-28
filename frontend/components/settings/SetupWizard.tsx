@@ -23,7 +23,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
@@ -366,11 +366,34 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
 	});
-	const { groupedModels } = useAllModels();
+	const { groupedModels, visibleModels } = useAllModels();
+
+	// Validate initial model values — clear if the model's provider isn't configured
+	const availableValues = useMemo(
+		() => new Set(visibleModels.map((m) => m.value)),
+		[visibleModels],
+	);
+	const validatedDefault =
+		settings?.agent?.defaultModel && availableValues.has(settings.agent.defaultModel)
+			? settings.agent.defaultModel
+			: "";
+	const validatedSummary =
+		settings?.agent?.summaryModel && availableValues.has(settings.agent.summaryModel)
+			? settings.agent.summaryModel
+			: "";
 
 	const [projectDir, setProjectDir] = useState(settings?.paths?.defaultProjectDir ?? "");
-	const [defaultModel, setDefaultModel] = useState(settings?.agent?.defaultModel ?? "");
-	const [summaryModel, setSummaryModel] = useState(settings?.agent?.summaryModel ?? "");
+	const [defaultModel, setDefaultModel] = useState(validatedDefault);
+	const [summaryModel, setSummaryModel] = useState(validatedSummary);
+
+	// Sync validated values when async data loads (useState only captures initial render)
+	const syncedRef = useRef(false);
+	useEffect(() => {
+		if (syncedRef.current || availableValues.size === 0 || !settings) return;
+		syncedRef.current = true;
+		setDefaultModel(validatedDefault);
+		setSummaryModel(validatedSummary);
+	}, [availableValues.size, validatedDefault, validatedSummary, settings]);
 
 	const save = useMutation({
 		mutationFn: (data: Record<string, unknown>) => api.updateSettings(data),

@@ -1,3 +1,4 @@
+import { useNarrator } from "@frontend/hooks/useNarrator";
 import { ActionIcon, Box, Drawer, Group, Tabs, Text } from "@mantine/core";
 import { IconFileCode, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
@@ -36,6 +37,8 @@ export function FileModificationsPanel({
 	onCancelDelete,
 }: FileModificationsPanelProps) {
 	const { t } = useTranslation("narrator");
+	const { data: narrator } = useNarrator(narratorId);
+	const basePath = narrator?.cwd ?? null;
 	const [activeTab, setActiveTab] = useState<string>("summary");
 
 	const isEditPermission = pendingPermission && EDIT_TOOLS.has(pendingPermission.toolName);
@@ -68,7 +71,7 @@ export function FileModificationsPanel({
 	};
 
 	return (
-		<Box h="100%" style={{ display: "flex", flexDirection: "column" }}>
+		<Box h="100%" style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
 			{/* Header */}
 			<Group
 				gap={6}
@@ -103,14 +106,15 @@ export function FileModificationsPanel({
 					)}
 				</Tabs.List>
 
-				<Tabs.Panel value="summary" style={{ flex: 1, minHeight: 0 }}>
-					<FileSummaryTab narratorId={narratorId} />
+				<Tabs.Panel value="summary" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+					<FileSummaryTab narratorId={narratorId} basePath={basePath} />
 				</Tabs.Panel>
 
 				{isEditPermission && (
-					<Tabs.Panel value="approval" style={{ flex: 1, minHeight: 0 }}>
+					<Tabs.Panel value="approval" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
 						<FileApprovalTab
 							narratorId={narratorId}
+							basePath={basePath}
 							permission={pendingPermission}
 							onDecision={handlePermissionDecision}
 						/>
@@ -118,9 +122,10 @@ export function FileModificationsPanel({
 				)}
 
 				{deletePreviewMessageId && (
-					<Tabs.Panel value="delete-preview" style={{ flex: 1, minHeight: 0 }}>
+					<Tabs.Panel value="delete-preview" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
 						<FileDeletePreviewTab
 							narratorId={narratorId}
+							basePath={basePath}
 							messageId={deletePreviewMessageId}
 							onConfirm={handleConfirmDelete}
 							onCancel={handleCancelDelete}

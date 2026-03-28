@@ -228,7 +228,6 @@ export function PathInput(props: PathInputProps) {
 					}}
 					onFocus={() => {
 						interactedRef.current = true;
-						if (hasDropdownContent) combobox.openDropdown();
 					}}
 					onBlur={() => combobox.closeDropdown()}
 					onKeyDown={handleKeyDown}

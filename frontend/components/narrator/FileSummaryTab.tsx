@@ -1,4 +1,5 @@
 import { useFileDiff, useFileModifications, useRevertFile } from "@frontend/hooks/useNarrator";
+import { toRelativePath } from "@frontend/lib/format";
 import {
 	Badge,
 	Box,
@@ -6,7 +7,6 @@ import {
 	Center,
 	Group,
 	Loader,
-	ScrollArea,
 	Stack,
 	Text,
 	Tooltip,
@@ -22,6 +22,7 @@ import {
 } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 
 function FileDiffContent({
@@ -61,7 +62,13 @@ function FileDiffContent({
 	return <DiffView oldStr={original} newStr={current} maxHeight={400} language={lang} />;
 }
 
-export function FileSummaryTab({ narratorId }: { narratorId: string }) {
+export function FileSummaryTab({
+	narratorId,
+	basePath,
+}: {
+	narratorId: string;
+	basePath: string | null;
+}) {
 	const { t } = useTranslation("narrator");
 	const { data, isLoading } = useFileModifications(narratorId);
 	const revertFile = useRevertFile(narratorId);
@@ -103,16 +110,24 @@ export function FileSummaryTab({ narratorId }: { narratorId: string }) {
 	};
 
 	return (
-		<Stack gap={0}>
+		<Box style={{ overflow: "hidden", minWidth: 0, width: "100%" }}>
 			<Group px="sm" py={6} justify="space-between">
 				<Text size="xs" c="dimmed">
 					{t("fileMod_fileCount", { count: files.length })}
 				</Text>
 			</Group>
-			<ScrollArea.Autosize mah="calc(100vh - 200px)">
+			<Box
+				style={{
+					maxHeight: "calc(100vh - 200px)",
+					overflowY: "auto",
+					overflowX: "hidden",
+					width: "100%",
+				}}
+			>
 				<Stack gap={2} mx="xs">
 					{files.map((file) => {
 						const isExpanded = expandedFile === file.filePath;
+						const displayPath = toRelativePath(file.filePath, basePath);
 						return (
 							<Box
 								key={file.filePath}
@@ -131,8 +146,17 @@ export function FileSummaryTab({ narratorId }: { narratorId: string }) {
 										backgroundColor: isExpanded ? "var(--mantine-color-dark-5)" : undefined,
 									}}
 								>
-									<Group gap="xs" wrap="nowrap" justify="space-between">
-										<Group gap="xs" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
+									<Group
+										gap="xs"
+										wrap="nowrap"
+										justify="space-between"
+										style={{ overflow: "hidden", minWidth: 0 }}
+									>
+										<Group
+											gap="xs"
+											wrap="nowrap"
+											style={{ flex: 1, minWidth: 0, overflow: "hidden" }}
+										>
 											{isExpanded ? (
 												<IconChevronDown size={14} style={{ flexShrink: 0 }} />
 											) : (
@@ -143,17 +167,7 @@ export function FileSummaryTab({ narratorId }: { narratorId: string }) {
 											) : (
 												<IconFilePlus size={14} style={{ flexShrink: 0 }} />
 											)}
-											<Text
-												size="xs"
-												ff="monospace"
-												style={{
-													overflow: "hidden",
-													textOverflow: "ellipsis",
-													whiteSpace: "nowrap",
-												}}
-											>
-												{file.filePath}
-											</Text>
+											<TruncatedPath path={displayPath} />
 										</Group>
 										<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 											<Badge
@@ -224,7 +238,7 @@ export function FileSummaryTab({ narratorId }: { narratorId: string }) {
 						);
 					})}
 				</Stack>
-			</ScrollArea.Autosize>
-		</Stack>
+			</Box>
+		</Box>
 	);
 }
