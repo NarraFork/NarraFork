@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.1.0-fix1",
+	"version": "0.1.1",
 	"private": true,
 	"dependencies": {
 		"@dagrejs/dagre": "^2.0.4",
