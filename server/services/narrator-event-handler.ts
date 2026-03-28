@@ -6,6 +6,7 @@ import { narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
@@ -126,13 +127,10 @@ export interface StreamingSnapshot {
 	toolChunks: Map<string, ToolChunkSnapshot>;
 }
 
-const streamingSnapshots = (() => {
-	const sym = Symbol.for("narrafork.streamingSnapshots");
-	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
-	const g = globalThis as any;
-	if (!g[sym]) g[sym] = new Map<string, StreamingSnapshot>();
-	return g[sym] as Map<string, StreamingSnapshot>;
-})();
+const streamingSnapshots = hotSafe<Map<string, StreamingSnapshot>>(
+	"narrafork.streamingSnapshots",
+	() => new Map(),
+);
 
 function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 	let snap = streamingSnapshots.get(narratorId);

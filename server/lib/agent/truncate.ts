@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hotSafe } from "../hot-safe";
 
 // === Limits ===
 
@@ -16,8 +17,6 @@ const RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /** Cleanup interval. */
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-
-let cleanupTimer: ReturnType<typeof setInterval> | undefined;
 
 // === Types ===
 
@@ -143,11 +142,16 @@ function cleanup(): void {
 
 /** Start the periodic cleanup timer. Safe to call multiple times. */
 export function initTruncateCleanup(): void {
-	if (cleanupTimer) return;
+	const existing = hotSafe<{ timer?: ReturnType<typeof setInterval> }>(
+		"narrafork.truncateCleanupTimer",
+		() => ({}),
+	);
+	if (existing.timer) return;
 	cleanup(); // run once immediately
-	cleanupTimer = setInterval(cleanup, CLEANUP_INTERVAL_MS);
+	const timer = setInterval(cleanup, CLEANUP_INTERVAL_MS);
 	// Don't block process exit.
-	if (cleanupTimer && typeof cleanupTimer === "object" && "unref" in cleanupTimer) {
-		cleanupTimer.unref();
+	if (timer && typeof timer === "object" && "unref" in timer) {
+		timer.unref();
 	}
+	existing.timer = timer;
 }

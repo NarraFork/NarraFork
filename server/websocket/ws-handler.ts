@@ -1,4 +1,5 @@
 import type { ServerWebSocket } from "bun";
+import { hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import {
 	getNarratorConnections,
@@ -57,70 +58,68 @@ const HEARTBEAT_TIMEOUT_MS = 90_000;
 
 const pingPayload = JSON.stringify({ type: "ping" });
 
-let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+const HEARTBEAT_KEY = "narrafork.heartbeatTimer";
 
 export function startHeartbeat() {
-	if (heartbeatTimer) return;
-	heartbeatTimer = setInterval(() => {
-		const now = Date.now();
-		const staleNarrator: Array<ServerWebSocket<WSData & { channel: "narrator" }>> = [];
-		const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
+	hotTimer(HEARTBEAT_KEY, () =>
+		setInterval(() => {
+			const now = Date.now();
+			const staleNarrator: Array<ServerWebSocket<WSData & { channel: "narrator" }>> = [];
+			const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
 
-		for (const ws of getNarratorConnections()) {
-			if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
-				staleNarrator.push(ws);
-				continue;
+			for (const ws of getNarratorConnections()) {
+				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+					staleNarrator.push(ws);
+					continue;
+				}
+				try {
+					ws.send(pingPayload);
+				} catch {
+					staleNarrator.push(ws);
+				}
 			}
-			try {
-				ws.send(pingPayload);
-			} catch {
-				staleNarrator.push(ws);
-			}
-		}
 
-		for (const ws of getTerminalConnections()) {
-			if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
-				staleTerminal.push(ws);
-				continue;
+			for (const ws of getTerminalConnections()) {
+				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+					staleTerminal.push(ws);
+					continue;
+				}
+				try {
+					ws.send(pingPayload);
+				} catch {
+					staleTerminal.push(ws);
+				}
 			}
-			try {
-				ws.send(pingPayload);
-			} catch {
-				staleTerminal.push(ws);
-			}
-		}
 
-		for (const ws of staleNarrator) {
-			// Delegate to the channel handler so presence / stats are cleaned up
-			handleNarratorWS.close(ws);
-			try {
-				ws.close(1000, "heartbeat timeout");
-			} catch {
-				// already dead
+			for (const ws of staleNarrator) {
+				// Delegate to the channel handler so presence / stats are cleaned up
+				handleNarratorWS.close(ws);
+				try {
+					ws.close(1000, "heartbeat timeout");
+				} catch {
+					// already dead
+				}
 			}
-		}
 
-		for (const ws of staleTerminal) {
-			logger.debug("Closing stale terminal WS (heartbeat timeout)", {
-				connectedAt: ws.data.connectedAt,
-				lastPongAt: ws.data.lastPongAt,
-			});
-			// Delegate to the channel handler so subscriptions are cleaned up
-			handleTerminalWS.close(ws);
-			try {
-				ws.close(1000, "heartbeat timeout");
-			} catch {
-				// already dead
+			for (const ws of staleTerminal) {
+				logger.debug("Closing stale terminal WS (heartbeat timeout)", {
+					connectedAt: ws.data.connectedAt,
+					lastPongAt: ws.data.lastPongAt,
+				});
+				// Delegate to the channel handler so subscriptions are cleaned up
+				handleTerminalWS.close(ws);
+				try {
+					ws.close(1000, "heartbeat timeout");
+				} catch {
+					// already dead
+				}
 			}
-		}
-	}, HEARTBEAT_INTERVAL_MS);
+		}, HEARTBEAT_INTERVAL_MS),
+	);
 }
 
 export function stopHeartbeat() {
-	if (heartbeatTimer) {
-		clearInterval(heartbeatTimer);
-		heartbeatTimer = undefined;
-	}
+	hotTimerClear(HEARTBEAT_KEY);
 }
 
 /**

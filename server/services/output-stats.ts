@@ -5,6 +5,7 @@
  * average (chars/sec). Broadcasts the rate to subscribed WS clients every second.
  */
 
+import { hotSafe } from "../lib/hot-safe";
 import { getNarratorConnections } from "../websocket/narrator-ws";
 
 // --- Sliding window ---
@@ -26,7 +27,13 @@ let totalChars = 0;
 /** Number of WS clients subscribed to stats */
 let subscriberCount = 0;
 
-let broadcastTimer: ReturnType<typeof setInterval> | null = null;
+// Timer key for hotTimer / hotTimerClear.
+const TIMER_KEY = "narrafork.outputStatsBroadcastTimer";
+
+// Survive Bun --hot reloads: reuse the existing timer reference holder.
+const _timerHolder = hotSafe<{ ref: ReturnType<typeof setInterval> | null }>(TIMER_KEY, () => ({
+	ref: null,
+}));
 
 /** Record an incoming AI output chunk. */
 export function recordOutputChunk(charCount: number): void {
@@ -79,14 +86,14 @@ function broadcastStats(): void {
 }
 
 function ensureTimer(): void {
-	if (broadcastTimer) return;
-	broadcastTimer = setInterval(broadcastStats, BROADCAST_INTERVAL_MS);
+	if (_timerHolder.ref) return;
+	_timerHolder.ref = setInterval(broadcastStats, BROADCAST_INTERVAL_MS);
 }
 
 function maybeStopTimer(): void {
-	if (subscriberCount > 0 || !broadcastTimer) return;
-	clearInterval(broadcastTimer);
-	broadcastTimer = null;
+	if (subscriberCount > 0 || !_timerHolder.ref) return;
+	clearInterval(_timerHolder.ref);
+	_timerHolder.ref = null;
 }
 
 /** Called when a WS client subscribes to output stats. */

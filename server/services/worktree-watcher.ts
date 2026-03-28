@@ -1,5 +1,6 @@
 import { type FSWatcher, watch } from "node:fs";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { toForwardSlash } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
@@ -113,7 +114,10 @@ interface WatcherEntry {
 }
 
 export const worktreeWatcher = {
-	_entries: new Map<string, WatcherEntry>(),
+	_entries: hotSafe<Map<string, WatcherEntry>>(
+		"narrafork.worktreeWatcher.entries",
+		() => new Map(),
+	),
 
 	/** Get the number of active watchers (for diagnostics). */
 	getActiveCount(): number {
@@ -238,7 +242,10 @@ export const worktreeWatcher = {
 	/** Shut down all watchers (server shutdown or startup recovery). */
 	shutdown(): void {
 		const count = this._entries.size;
-		for (const [path] of this._entries) {
+		// Snapshot keys first — _removeEntry mutates the Map, and deleting
+		// during for..of iteration can skip entries on some engines.
+		const paths = [...this._entries.keys()];
+		for (const path of paths) {
 			this._removeEntry(path);
 		}
 		if (count > 0) {

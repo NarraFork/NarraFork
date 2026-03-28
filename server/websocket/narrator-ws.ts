@@ -4,6 +4,7 @@ import { db, sqlite } from "../db";
 import { containerInstances, narrators, overseers, terminals, userPreferences } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
+import { hotOnce } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
@@ -513,12 +514,7 @@ function debouncedContainerStatus(chapterId: string) {
 // but this module re-executes, so without a guard each reload appends
 // duplicate handlers — causing N× DB queries and WS broadcasts.
 
-const _listenersRegistered = Symbol.for("narrafork.narratorWs.listenersRegistered");
-// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
-if (!(globalThis as any)[_listenersRegistered]) {
-	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
-	(globalThis as any)[_listenersRegistered] = true;
-
+if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	eventBus.on("terminal:created", (event) => {
 		debouncedTerminalCount(event.narratorId);
 	});

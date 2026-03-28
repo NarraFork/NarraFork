@@ -27,6 +27,7 @@ import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
@@ -45,7 +46,6 @@ import type { ImageRef, TextFileRef } from "../lib/uploads";
 import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
-
 import { narratorContext } from "./narrator-context";
 import {
 	clearStreamingSnapshot,
@@ -64,7 +64,6 @@ import {
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
-
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state ===
@@ -154,15 +153,6 @@ interface ActiveNarrator {
 // means the old loop's finally-block deletes from a *new* empty Map while the
 // new code creates a second ActiveNarrator for the same narrator — leading to
 // two concurrent loops and status clobbering.
-
-/** Retrieve (or lazily create) a globalThis-pinned collection that survives --hot reloads. */
-function hotSafe<T>(key: string, factory: () => T): T {
-	const sym = Symbol.for(key);
-	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
-	const g = globalThis as any;
-	if (!g[sym]) g[sym] = factory();
-	return g[sym];
-}
 
 const activeNarrators = hotSafe<Map<string, ActiveNarrator>>(
 	"narrafork.activeNarrators",
