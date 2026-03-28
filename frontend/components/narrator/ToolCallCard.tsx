@@ -16,6 +16,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowsMinimize,
 	IconCheck,
@@ -2698,6 +2699,24 @@ export const ToolCallCard = memo(function ToolCallCard({
 		onSwipeRight: isTcSelected ? handleDeselectTc : undefined,
 	});
 
+	// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
+	const isMobileTc = useMediaQuery("(max-width: 768px)") ?? false;
+	const handleTcBlockClick = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobileTc || !tcBlockId) return;
+			const isModKey = e.metaKey || e.ctrlKey;
+			const isShift = e.shiftKey;
+			if (!isModKey && !isShift) return;
+			e.preventDefault();
+			if (isShift) {
+				selection.rangeSelectTo(tcBlockId);
+			} else {
+				selection.toggleBlock(tcBlockId);
+			}
+		},
+		[isMobileTc, tcBlockId, selection.toggleBlock, selection.rangeSelectTo],
+	);
+
 	const menuItemsNode = hasActions ? (
 		<>
 			{readFilePath && (
@@ -2850,7 +2869,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	// Shared selection-aware style computation for both inRun and standalone layouts
 	const buildSelectionStyle = (): React.CSSProperties => {
-		const selOffset = isTcSelected && !swipe.swipeRevealed ? 180 : 0;
+		const selOffset = isMobileTc && isTcSelected && !swipe.swipeRevealed ? 180 : 0;
 		const effTransform =
 			swipe.swipeOffset > 0 ? undefined : selOffset > 0 ? `translateX(-${selOffset}px)` : undefined;
 		return {
@@ -2869,6 +2888,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<Box
 					ref={swipe.swipeBoxRef}
 					onContextMenu={swipe.handleContextMenu}
+					onClick={handleTcBlockClick}
 					style={buildSelectionStyle()}
 					{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
 				>
@@ -2891,6 +2911,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			<Box
 				ref={swipe.swipeBoxRef}
 				onContextMenu={swipe.handleContextMenu}
+				onClick={handleTcBlockClick}
 				style={buildSelectionStyle()}
 				{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
 			>

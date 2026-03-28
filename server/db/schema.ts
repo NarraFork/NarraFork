@@ -727,6 +727,52 @@ export const narratorBlacklistCmds = sqliteTable(
 	],
 );
 
+// === volume_snapshots ===
+export const volumeSnapshots = sqliteTable(
+	"volume_snapshots",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		description: text("description"),
+		sourceChapterId: text("source_chapter_id").references(() => chapters.id, {
+			onDelete: "set null",
+		}),
+		serviceName: text("service_name").notNull(),
+		containerPath: text("container_path").notNull(),
+		sizeBytes: integer("size_bytes"),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_volume_snapshots_project").on(table.projectId),
+		index("idx_volume_snapshots_source_chapter").on(table.sourceChapterId),
+	],
+);
+
+// === volume_snapshot_applications ===
+export const volumeSnapshotApplications = sqliteTable(
+	"volume_snapshot_applications",
+	{
+		id: text("id").primaryKey(),
+		snapshotId: text("snapshot_id")
+			.notNull()
+			.references(() => volumeSnapshots.id, { onDelete: "cascade" }),
+		chapterId: text("chapter_id")
+			.notNull()
+			.references(() => chapters.id, { onDelete: "cascade" }),
+		appliedAt: text("applied_at").notNull(),
+		appliedBy: text("applied_by").references(() => users.id, { onDelete: "set null" }),
+	},
+	(table) => [
+		index("idx_snapshot_applications_snapshot").on(table.snapshotId),
+		index("idx_snapshot_applications_chapter").on(table.chapterId),
+	],
+);
+
 // === workspaces ===
 export const workspaces = sqliteTable(
 	"workspaces",

@@ -5,6 +5,7 @@ import {
 	Button,
 	Code,
 	Collapse,
+	Divider,
 	Group,
 	Loader,
 	ScrollArea,
@@ -31,6 +32,7 @@ import {
 } from "../../hooks/useContainers";
 import { api } from "../../lib/api";
 import { CONTAINER_STATUS_COLORS } from "../../lib/constants";
+import { VolumeSnapshotPanel } from "./VolumeSnapshotPanel";
 
 interface ContainerPanelProps {
 	chapterId: string;
@@ -238,6 +240,19 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 					{t("config")}
 				</Button>
 			</Group>
+
+			{/* Volume Snapshots */}
+			{chapter?.projectId && (
+				<>
+					<Divider />
+					<VolumeSnapshotPanel
+						projectId={chapter.projectId}
+						chapterId={chapterId}
+						serviceNames={serviceNames}
+						hasRunningContainers={running.length > 0}
+					/>
+				</>
+			)}
 		</Stack>
 	);
 }

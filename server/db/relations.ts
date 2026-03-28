@@ -24,6 +24,8 @@ import {
 	userFavoriteDirectories,
 	userPreferences,
 	users,
+	volumeSnapshotApplications,
+	volumeSnapshots,
 	workspaces,
 } from "./schema";
 
@@ -32,6 +34,7 @@ export const projectsRelations = relations(projects, ({ many }) => ({
 	chapterEdges: many(chapterEdges),
 	explorationGroups: many(explorationGroups),
 	overseers: many(overseers),
+	volumeSnapshots: many(volumeSnapshots),
 }));
 
 export const chaptersRelations = relations(chapters, ({ one, many }) => ({
@@ -60,6 +63,7 @@ export const chaptersRelations = relations(chapters, ({ one, many }) => ({
 	containerInstances: many(containerInstances),
 	portAllocations: many(portAllocations),
 	commits: many(chapterCommits),
+	snapshotApplications: many(volumeSnapshotApplications),
 }));
 
 export const chapterEdgesRelations = relations(chapterEdges, ({ one }) => ({
@@ -277,6 +281,40 @@ export const overseersRelations = relations(overseers, ({ one }) => ({
 		references: [projects.id],
 	}),
 }));
+
+export const volumeSnapshotsRelations = relations(volumeSnapshots, ({ one, many }) => ({
+	project: one(projects, {
+		fields: [volumeSnapshots.projectId],
+		references: [projects.id],
+	}),
+	sourceChapter: one(chapters, {
+		fields: [volumeSnapshots.sourceChapterId],
+		references: [chapters.id],
+	}),
+	createdByUser: one(users, {
+		fields: [volumeSnapshots.createdBy],
+		references: [users.id],
+	}),
+	applications: many(volumeSnapshotApplications),
+}));
+
+export const volumeSnapshotApplicationsRelations = relations(
+	volumeSnapshotApplications,
+	({ one }) => ({
+		snapshot: one(volumeSnapshots, {
+			fields: [volumeSnapshotApplications.snapshotId],
+			references: [volumeSnapshots.id],
+		}),
+		chapter: one(chapters, {
+			fields: [volumeSnapshotApplications.chapterId],
+			references: [chapters.id],
+		}),
+		appliedByUser: one(users, {
+			fields: [volumeSnapshotApplications.appliedBy],
+			references: [users.id],
+		}),
+	}),
+);
 
 export const workspacesRelations = relations(workspaces, ({ one }) => ({
 	user: one(users, {

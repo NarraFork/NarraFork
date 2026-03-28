@@ -44,6 +44,7 @@ import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import { userPreferencesRoutes } from "./routes/user-preferences";
+import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
 
 const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
@@ -153,6 +154,9 @@ app.route("/api/projects", graphRoutes);
 app.route("/api/projects", rulerRoutes);
 // Project DB backup/import routes
 app.route("/api/projects", projectDbRoutes);
+// Volume snapshot routes (nested under projects for list/create, standalone for single-item ops)
+app.route("/api/projects", volumeSnapshotRoutes);
+app.route("/api/volume-snapshots", volumeSnapshotRoutes);
 
 app.onError((err, c) => {
 	if (err instanceof AppError) {

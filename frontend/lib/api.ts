@@ -1200,6 +1200,50 @@ export const api = {
 			body: JSON.stringify(opts ?? {}),
 		}),
 
+	// Volume Snapshots
+	listVolumeSnapshots: (
+		projectId: string,
+		filters?: { serviceName?: string; containerPath?: string },
+	) => {
+		const params = new URLSearchParams();
+		if (filters?.serviceName) params.set("serviceName", filters.serviceName);
+		if (filters?.containerPath) params.set("containerPath", filters.containerPath);
+		const qs = params.toString();
+		return request<ApiEntity[]>(`/projects/${projectId}/volume-snapshots${qs ? `?${qs}` : ""}`);
+	},
+	createVolumeSnapshot: (
+		projectId: string,
+		data: {
+			chapterId: string;
+			serviceName: string;
+			containerPath: string;
+			name: string;
+			description?: string;
+		},
+	) =>
+		request<ApiEntity>(`/projects/${projectId}/volume-snapshots`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	getVolumeSnapshot: (snapshotId: string) => request<ApiEntity>(`/volume-snapshots/${snapshotId}`),
+	updateVolumeSnapshot: (
+		snapshotId: string,
+		data: { name?: string; description?: string | null },
+	) =>
+		request<ApiEntity>(`/volume-snapshots/${snapshotId}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	deleteVolumeSnapshot: (snapshotId: string) =>
+		request<{ success: boolean }>(`/volume-snapshots/${snapshotId}`, { method: "DELETE" }),
+	applyVolumeSnapshot: (snapshotId: string, targetChapterId: string) =>
+		request<{ success: boolean }>(`/volume-snapshots/${snapshotId}/apply`, {
+			method: "POST",
+			body: JSON.stringify({ targetChapterId }),
+		}),
+	getSnapshotApplications: (snapshotId: string) =>
+		request<ApiEntity[]>(`/volume-snapshots/${snapshotId}/applications`),
+
 	// Chapter operations (fork/merge/cleanup)
 	forkChapter: (
 		id: string,

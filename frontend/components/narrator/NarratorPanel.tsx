@@ -1706,6 +1706,47 @@ export function NarratorPanel({
 		});
 	}, []);
 
+	// Desktop: Ctrl/Cmd+Click toggles a single block
+	const toggleBlock = useCallback((blockId: string) => {
+		setSelectedBlockIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(blockId)) {
+				next.delete(blockId);
+				if (next.size === 0) {
+					setSelectionMode(false);
+					setAnchorBlockId(null);
+					return next;
+				}
+			} else {
+				next.add(blockId);
+				setSelectionMode(true);
+				setAnchorBlockId(blockId);
+			}
+			return next;
+		});
+	}, []);
+
+	// Desktop: Shift+Click range-selects from anchor to target
+	const rangeSelectTo = useCallback(
+		(blockId: string) => {
+			const container = contentRef.current;
+			if (!container) return;
+			const anchor = anchorBlockId;
+			if (!anchor) {
+				// No anchor yet — treat as single toggle
+				setSelectionMode(true);
+				setSelectedBlockIds(new Set([blockId]));
+				setAnchorBlockId(blockId);
+				return;
+			}
+			const range = resolveBlockRange(container, anchor, blockId);
+			if (!range) return;
+			setSelectionMode(true);
+			setSelectedBlockIds(range);
+		},
+		[anchorBlockId],
+	);
+
 	// Register the global range-selection callback so useSwipeMenu instances
 	// can trigger multi-select without prop drilling.
 	useEffect(() => {
@@ -1728,6 +1769,19 @@ export function NarratorPanel({
 		exitSelection();
 	}, [narratorId, exitSelection]);
 
+	// Escape key exits multi-select mode
+	useEffect(() => {
+		if (!selectionMode) return;
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				e.preventDefault();
+				exitSelection();
+			}
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [selectionMode, exitSelection]);
+
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
 			selectionMode,
@@ -1735,8 +1789,18 @@ export function NarratorPanel({
 			anchorBlockId,
 			exitSelection,
 			deselectBlock,
+			toggleBlock,
+			rangeSelectTo,
 		}),
-		[selectionMode, selectedBlockIds, anchorBlockId, exitSelection, deselectBlock],
+		[
+			selectionMode,
+			selectedBlockIds,
+			anchorBlockId,
+			exitSelection,
+			deselectBlock,
+			toggleBlock,
+			rangeSelectTo,
+		],
 	);
 
 	// --- Flat elements for virtualization ---

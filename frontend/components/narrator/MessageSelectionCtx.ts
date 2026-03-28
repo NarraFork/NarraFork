@@ -17,6 +17,10 @@ export interface MessageSelectionState {
 	exitSelection: () => void;
 	/** Remove a single block from the selection. Exits selection mode if empty. */
 	deselectBlock: (blockId: string) => void;
+	/** Toggle a single block (Ctrl/Cmd+Click). Enters selection mode if not active. */
+	toggleBlock: (blockId: string) => void;
+	/** Range-select from anchor to target (Shift+Click). */
+	rangeSelectTo: (blockId: string) => void;
 }
 
 const DEFAULT_STATE: MessageSelectionState = {
@@ -25,6 +29,8 @@ const DEFAULT_STATE: MessageSelectionState = {
 	anchorBlockId: null,
 	exitSelection: () => {},
 	deselectBlock: () => {},
+	toggleBlock: () => {},
+	rangeSelectTo: () => {},
 };
 
 export const MessageSelectionCtx = createContext<MessageSelectionState>(DEFAULT_STATE);

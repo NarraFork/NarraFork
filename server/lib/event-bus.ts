@@ -193,7 +193,14 @@ export type NarraForkEvent =
 			newOverseerId: string;
 			scope: string;
 			projectId?: string | null;
-	  };
+	  }
+	// Volume snapshots
+	| { type: "volume-snapshot:creating"; projectId: string; chapterId: string }
+	| { type: "volume-snapshot:created"; projectId: string; snapshotId: string }
+	| { type: "volume-snapshot:applying"; snapshotId: string; targetChapterId: string }
+	| { type: "volume-snapshot:applied"; snapshotId: string; targetChapterId: string }
+	| { type: "volume-snapshot:deleted"; projectId: string; snapshotId: string }
+	| { type: "volume-snapshot:error"; projectId: string; error: string };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

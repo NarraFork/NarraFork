@@ -306,6 +306,19 @@ export const ContentViewer = memo(
 			onSwipeRight: isSelected ? handleDeselectBlock : undefined,
 		});
 
+		// Mobile: double-tap to fullscreen
+		const lastTapRef = useRef(0);
+		const handleDoubleTap = useCallback(() => {
+			if (!isMobile) return;
+			const now = Date.now();
+			if (now - lastTapRef.current < 300) {
+				open();
+				lastTapRef.current = 0;
+			} else {
+				lastTapRef.current = now;
+			}
+		}, [isMobile, open]);
+
 		// Desktop: right-click opens context menu (override hook's handler to gate on !isMobile)
 		const handleContextMenu = useCallback(
 			(e: React.MouseEvent) => {
@@ -320,6 +333,30 @@ export const ContentViewer = memo(
 				swipe.setCtxMenuOpened(true);
 			},
 			[isMobile, swipe.setCtxMenuPos, swipe.setCtxMenuOpened],
+		);
+
+		// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
+		// Mobile: double-tap to fullscreen (falls through to handleDoubleTap)
+		const handleBlockClick = useCallback(
+			(e: React.MouseEvent) => {
+				if (isMobile) {
+					handleDoubleTap();
+					return;
+				}
+				const isModKey = e.metaKey || e.ctrlKey;
+				const isShift = e.shiftKey;
+				if (!isModKey && !isShift) return;
+				// Don't interfere with text selection
+				const sel = window.getSelection();
+				if (sel && sel.toString().trim().length > 0) return;
+				e.preventDefault();
+				if (isShift) {
+					selection.rangeSelectTo(blockIdStr);
+				} else {
+					selection.toggleBlock(blockIdStr);
+				}
+			},
+			[isMobile, handleDoubleTap, blockIdStr, selection.toggleBlock, selection.rangeSelectTo],
 		);
 
 		const iconSize = isMobile ? 18 : 12;
@@ -413,23 +450,10 @@ export const ContentViewer = memo(
 				</Box>
 			);
 
-		// Mobile: double-tap to fullscreen
-		const lastTapRef = useRef(0);
-		const handleDoubleTap = useCallback(() => {
-			if (!isMobile) return;
-			const now = Date.now();
-			if (now - lastTapRef.current < 300) {
-				open();
-				lastTapRef.current = 0;
-			} else {
-				lastTapRef.current = now;
-			}
-		}, [isMobile, open]);
-
 		const SWIPE_REVEAL_WIDTH = 180;
 
-		// Selected blocks get a visual offset to match the anchor's swipe
-		const selectionOffset = isSelected && !swipe.swipeRevealed ? SWIPE_REVEAL_WIDTH : 0;
+		// Selected blocks get a visual offset to match the anchor's swipe (mobile only)
+		const selectionOffset = isMobile && isSelected && !swipe.swipeRevealed ? SWIPE_REVEAL_WIDTH : 0;
 		const effectiveOffset = swipe.swipeOffset > 0 ? swipe.swipeOffset : selectionOffset;
 
 		return (
@@ -452,7 +476,7 @@ export const ContentViewer = memo(
 					onMouseEnter={isMobile ? undefined : () => setHovered(true)}
 					onMouseLeave={isMobile ? undefined : () => setHovered(false)}
 					onContextMenu={handleContextMenu}
-					onClick={isMobile ? handleDoubleTap : undefined}
+					onClick={handleBlockClick}
 				>
 					{/* Sticky bar: desktop hover only */}
 					{!isMobile && (
