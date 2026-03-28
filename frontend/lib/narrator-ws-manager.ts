@@ -56,6 +56,11 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
 const CLIENT_PING_TIMEOUT_MS = 60_000;
+/**
+ * Stop reconnecting after this many consecutive failures.
+ * With exponential backoff capped at 30s this is roughly 25 minutes.
+ */
+const MAX_RECONNECT_ATTEMPTS = 50;
 const WS_STATUS_ID = "narrator-global";
 /**
  * How long the tab must be hidden before we force a reconnect on return.
@@ -424,10 +429,12 @@ class NarratorWSManager {
 			}
 		};
 
-		ws.onclose = () => {
+		ws.onclose = (ev) => {
 			if (this.cancelled || this.ws !== ws) return;
 			this.ws = null;
 			this._setConnected(false, false);
+			// 1001 = Going Away — server is shutting down, don't reconnect.
+			if (ev.code === 1001) return;
 			this._scheduleReconnect();
 		};
 
@@ -438,6 +445,14 @@ class NarratorWSManager {
 
 	private _scheduleReconnect(): void {
 		if (this.cancelled) return;
+		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+			// Give up — server is likely down for good.
+			if (!this._disconnected) {
+				this._disconnected = true;
+				this._syncGlobalStatus(false);
+			}
+			return;
+		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._disconnected = true;
 			this._syncGlobalStatus(false);

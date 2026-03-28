@@ -32,6 +32,11 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 /** After this many fast retries, we consider the connection "disconnected" (show UI). */
 const DISCONNECTED_THRESHOLD = 3;
+/**
+ * Stop reconnecting after this many consecutive failures.
+ * With exponential backoff capped at 30s this is roughly 25 minutes.
+ */
+const MAX_RECONNECT_ATTEMPTS = 50;
 
 class TerminalWSManager {
 	private ws: WebSocket | null = null;
@@ -84,10 +89,12 @@ class TerminalWSManager {
 			}
 		};
 
-		ws.onclose = () => {
+		ws.onclose = (ev) => {
 			this._connected = false;
 			this.notifyStatus();
 			this.syncGlobalStatus();
+			// 1001 = Going Away — server is shutting down, don't reconnect.
+			if (ev.code === 1001) return;
 			this.scheduleReconnect();
 		};
 
@@ -99,6 +106,15 @@ class TerminalWSManager {
 
 	private scheduleReconnect() {
 		if (this.disposed) return;
+		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+			// Give up — server is likely down for good.
+			if (!this._disconnected) {
+				this._disconnected = true;
+				this.notifyStatus();
+				this.syncGlobalStatus();
+			}
+			return;
+		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._disconnected = true;
 			this.notifyStatus();

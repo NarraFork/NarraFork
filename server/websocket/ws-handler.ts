@@ -123,6 +123,30 @@ export function stopHeartbeat() {
 	}
 }
 
+/**
+ * Explicitly close every active WebSocket connection with a 1001 "Going Away"
+ * close frame.  Called during server shutdown so that clients receive a proper
+ * TCP FIN and don't leave connections stuck in CLOSE_WAIT / FIN_WAIT_2
+ * (especially problematic on Windows where Bun's `server.stop(true)` alone
+ * may not send close frames to each peer).
+ */
+export function closeAllConnections() {
+	for (const ws of getNarratorConnections()) {
+		try {
+			ws.close(1001, "server shutting down");
+		} catch {
+			// already dead — ignore
+		}
+	}
+	for (const ws of getTerminalConnections()) {
+		try {
+			ws.close(1001, "server shutting down");
+		} catch {
+			// already dead — ignore
+		}
+	}
+}
+
 // === Bun WebSocket handlers ===
 
 export const wsHandlers = {

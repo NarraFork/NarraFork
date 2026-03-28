@@ -30,7 +30,13 @@ import "./services/notification-service"; // Register notification event listene
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { terminalService } from "./services/terminal-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
-import { resolveWSData, startHeartbeat, stopHeartbeat, wsHandlers } from "./websocket/ws-handler";
+import {
+	closeAllConnections,
+	resolveWSData,
+	startHeartbeat,
+	stopHeartbeat,
+	wsHandlers,
+} from "./websocket/ws-handler";
 
 // Set rootless podman env vars early so all child processes inherit them
 ensureRootlessEnv();
@@ -626,6 +632,9 @@ const shutdown = async () => {
 	// On Windows, process.exit() alone may not close the socket in time,
 	// leaving a zombie process holding the port.
 	try {
+		// Send close frames to all WS clients first — on Windows, server.stop()
+		// alone may not deliver them, leaving TCP connections in CLOSE_WAIT.
+		closeAllConnections();
 		_server?.stop(true);
 	} catch {
 		// best effort
