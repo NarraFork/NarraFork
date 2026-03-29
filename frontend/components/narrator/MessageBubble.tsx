@@ -568,9 +568,12 @@ function MergeSummaryCard({
 export function ReasoningSummary({
 	text,
 	translatedText,
+	isStreaming,
 }: {
 	text: string;
 	translatedText?: string;
+	/** When true, skip expensive overflow measurement to avoid nested-update cascades. */
+	isStreaming?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	// Compute initial expanded state eagerly — avoids a useLayoutEffect setState
@@ -614,7 +617,13 @@ export function ReasoningSummary({
 		}
 	}, [hasTrailingContent]);
 
+	// During streaming, skip the expensive useLayoutEffect + ResizeObserver
+	// overflow measurement entirely. Each reasoning_delta bumps streamingVersion
+	// (~60fps), and the measure → setIsOverflow → canExpand flip → setExpanded →
+	// LazyCollapse setState cascade easily exceeds React's nested-update limit.
+	// Instead, assume overflow is true while streaming (the text is growing anyway).
 	useLayoutEffect(() => {
+		if (isStreaming) return;
 		if (!headerText) {
 			setIsOverflow(false);
 			return;
@@ -657,9 +666,12 @@ export function ReasoningSummary({
 			resizeObserver?.disconnect();
 			fontSet?.removeEventListener?.("loadingdone", handleFontsDone);
 		};
-	}, [headerText]);
+	}, [headerText, isStreaming]);
 
-	const canExpand = isOverflow || hasTrailingContent;
+	// While streaming, assume overflow so the expand button is available.
+	// This avoids the measure → setState cascade entirely.
+	const effectiveOverflow = isStreaming ? true : isOverflow;
+	const canExpand = effectiveOverflow || hasTrailingContent;
 
 	// Collapse when canExpand becomes false — use render-time guard to avoid
 	// a useLayoutEffect setState that counts toward the nested-update limit.
@@ -1051,7 +1063,7 @@ export const MessageBubble = memo(function MessageBubble({
 			};
 		}
 
-		const actions: MessageContextMenuActions = {};
+		const actions: MessageContextMenuActions = { messageId: message.id };
 		const msgId = message.id;
 		const msgUuid = message.messageUuid;
 		if (msgUuid && onForkFromMessage && !isUser) {

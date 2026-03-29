@@ -3,6 +3,7 @@ import {
 	getGlobalCloseSwipe,
 	getGlobalOnSelectionRange,
 	getGlobalSwipeAnchor,
+	getGlobalToggleBlock,
 	setGlobalCloseSwipe,
 	setGlobalSwipeAnchor,
 } from "../components/narrator/swipeState";
@@ -28,6 +29,12 @@ interface UseSwipeMenuOptions {
 	 * revealed, the system selects all blocks between the anchor and this block.
 	 */
 	blockId?: string;
+	/**
+	 * Alternate block ID used as the swipe anchor when this element's menu is
+	 * revealed but `blockId` is not set (e.g. a nested ContentViewer using its
+	 * parent ToolCallCard's ID).
+	 */
+	anchorBlockId?: string;
 	/** Called when a right-swipe gesture completes (e.g. to deselect a selected block). */
 	onSwipeRight?: () => void;
 }
@@ -67,6 +74,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		excludeSelectors = ["[data-content-block]", ".mantine-Menu-dropdown"],
 		externalBoxRef,
 		blockId,
+		anchorBlockId,
 		onSwipeRight,
 	} = opts;
 
@@ -92,6 +100,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
 
 	// --- Close ---
+	const effectiveAnchor = blockId ?? anchorBlockId;
 	const closeSwipe = useCallback(() => {
 		setSwipeClosing(true);
 		swipeOffsetRef.current = 0;
@@ -99,25 +108,29 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		setSwipeRevealed(false);
 		setGlobalCloseSwipe(null);
 		// Clear anchor when the swipe that set it is closed
-		if (blockId && getGlobalSwipeAnchor() === blockId) {
+		if (effectiveAnchor && getGlobalSwipeAnchor() === effectiveAnchor) {
 			setGlobalSwipeAnchor(null);
 		}
 		setTimeout(() => setSwipeClosing(false), DEFAULT_CLOSE_DURATION);
-	}, [blockId]);
+	}, [effectiveAnchor]);
 
 	// --- Global coordination ---
 	useEffect(() => {
 		if (swipeRevealed) {
 			setGlobalCloseSwipe(closeSwipe);
-			// Record this block as the anchor for potential multi-select
-			if (blockId) {
-				setGlobalSwipeAnchor(blockId);
+			// Record this block (or parent's block) as the anchor for potential multi-select
+			if (effectiveAnchor) {
+				setGlobalSwipeAnchor(effectiveAnchor);
 			}
 		}
 		return () => {
 			if (getGlobalCloseSwipe() === closeSwipe) setGlobalCloseSwipe(null);
+			// On unmount while revealed, also clear the anchor to avoid stale state
+			if (effectiveAnchor && getGlobalSwipeAnchor() === effectiveAnchor) {
+				setGlobalSwipeAnchor(null);
+			}
 		};
-	}, [swipeRevealed, closeSwipe, blockId]);
+	}, [swipeRevealed, closeSwipe, effectiveAnchor]);
 
 	// --- Touch handlers ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
@@ -139,11 +152,16 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			const curClose = getGlobalCloseSwipe();
 			const curAnchor = getGlobalSwipeAnchor();
 
+			// The ID this element represents for multi-select purposes.
+			// Falls back to anchorBlockId for nested elements (e.g. ContentViewer
+			// inside ToolCallCard uses the card's ID).
+			const selfId = blockId ?? anchorBlockId;
+
 			// Another block's swipe is already open — this *might* be a range-select,
 			// but we don't know yet. Record the touch start and let onTouchMove
 			// determine whether it's a horizontal swipe or a vertical scroll.
 			if (curClose && curClose !== closeSwipe) {
-				if (blockId && curAnchor && curAnchor !== blockId) {
+				if (selfId && curAnchor && curAnchor !== selfId) {
 					const touch = e.touches[0];
 					swipeRef.current = {
 						startX: touch.clientX,
@@ -225,16 +243,17 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			if (!s || s.dir !== "h") return;
 
 			const didSwipe = swipeOffsetRef.current >= swipeThreshold;
+			const selfId = blockId ?? anchorBlockId;
 
 			// Range-select: user completed a horizontal swipe on a different block
 			// while another block's swipe was already open.
 			if (s.rangeCandidate && didSwipe) {
 				const curAnchor = getGlobalSwipeAnchor();
 				const curClose = getGlobalCloseSwipe();
-				if (blockId && curAnchor && curAnchor !== blockId) {
+				if (selfId && curAnchor && curAnchor !== selfId) {
 					const onRange = getGlobalOnSelectionRange();
 					if (onRange) {
-						onRange(curAnchor, blockId);
+						onRange(curAnchor, selfId);
 					}
 					// Close the anchor's swipe menu
 					if (curClose) curClose();
@@ -261,6 +280,16 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			// Right-swipe callback (e.g. deselect a selected block)
 			if (!swipeRevealed && onSwipeRight && s.lastDx < -swipeThreshold) {
 				onSwipeRight();
+				swipeOffsetRef.current = 0;
+				setSwipeOffset(0);
+				return;
+			}
+
+			// Multi-select mode active: left-swipe toggles this block into the selection
+			// instead of opening the swipe menu.
+			const toggleFn = getGlobalToggleBlock();
+			if (toggleFn && selfId && didSwipe && !swipeRevealed) {
+				toggleFn(selfId);
 				swipeOffsetRef.current = 0;
 				setSwipeOffset(0);
 				return;
@@ -294,6 +323,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		swipeRevealWidth,
 		excludeSelectors,
 		blockId,
+		anchorBlockId,
 		onSwipeRight,
 	]);
 
@@ -303,6 +333,60 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	// The swipe is closed only by:
 	// 1. Clicking a menu action item (explicit closeSwipe() calls in ContentViewer/ToolCallCard)
 	// 2. Exiting selection mode (via the floating toolbar)
+
+	// --- Reposition on scroll/resize while revealed; auto-close when off-screen ---
+	const [, forceUpdate] = useState(0);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
+	useEffect(() => {
+		if (!swipeRevealed) return;
+		// Find the nearest scrollable ancestor of the swipe target
+		let scrollParent: HTMLElement | null = swipeBoxRef.current?.parentElement ?? null;
+		while (scrollParent && scrollParent.scrollHeight <= scrollParent.clientHeight) {
+			scrollParent = scrollParent.parentElement;
+		}
+		let rafId = 0;
+		const tick = () => {
+			// Throttle to one update per animation frame
+			if (rafId) return;
+			rafId = requestAnimationFrame(() => {
+				rafId = 0;
+				const box = swipeBoxRef.current;
+				// DOM node removed (e.g. virtualised list recycled it) — dismiss
+				if (!box || !box.isConnected) {
+					closeSwipe();
+					return;
+				}
+				const rect = box.getBoundingClientRect();
+				// Determine visible bounds from scroll container
+				let visTop = 0;
+				let visBottom = window.innerHeight;
+				if (scrollParent?.isConnected) {
+					const cr = scrollParent.getBoundingClientRect();
+					visTop = cr.top;
+					visBottom = cr.bottom;
+				}
+				// Block has scrolled entirely out of the visible area — dismiss
+				if (rect.bottom < visTop || rect.top > visBottom) {
+					closeSwipe();
+					return;
+				}
+				forceUpdate((n) => n + 1);
+			});
+		};
+		scrollParent?.addEventListener("scroll", tick, { passive: true });
+		window.addEventListener("resize", tick, { passive: true });
+		// Detect DOM changes (virtualised list recycling nodes on new messages)
+		const mo = new MutationObserver(tick);
+		if (scrollParent) {
+			mo.observe(scrollParent, { childList: true, subtree: true });
+		}
+		return () => {
+			cancelAnimationFrame(rafId);
+			scrollParent?.removeEventListener("scroll", tick);
+			window.removeEventListener("resize", tick);
+			mo.disconnect();
+		};
+	}, [swipeRevealed, closeSwipe]);
 
 	// --- Context menu ---
 	const handleContextMenu = useCallback(
@@ -337,15 +421,36 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		(menuHeight = 120) => {
 			const menuLeft = swipeInitialRight - swipeOffset;
 			const boxRect = swipeBoxRef.current?.getBoundingClientRect();
-			let menuTop = swipeY;
-			if (boxRect && boxRect.height > menuHeight) {
-				const minTop = boxRect.top + menuHeight / 2;
-				const maxTop = boxRect.bottom - menuHeight / 2;
-				menuTop = Math.max(minTop, Math.min(swipeY, maxTop));
-			}
-			// Clamp to viewport so the menu never overflows off-screen
 			const half = menuHeight / 2;
-			menuTop = Math.max(half, Math.min(menuTop, window.innerHeight - half));
+
+			// Determine the visible area — use the scroll container if found, else viewport
+			let visibleTop = 0;
+			let visibleBottom = window.innerHeight;
+			let el: HTMLElement | null = swipeBoxRef.current?.parentElement ?? null;
+			while (el) {
+				if (el.scrollHeight > el.clientHeight && el.clientHeight > 0) {
+					const cr = el.getBoundingClientRect();
+					visibleTop = Math.max(visibleTop, cr.top);
+					visibleBottom = Math.min(visibleBottom, cr.bottom);
+					break;
+				}
+				el = el.parentElement;
+			}
+
+			// Prefer center of visible area, clamp to block bounds
+			const center = (visibleTop + visibleBottom) / 2;
+			let menuTop = center;
+			if (boxRect) {
+				const minTop = boxRect.top + half;
+				const maxTop = boxRect.bottom - half;
+				if (minTop <= maxTop) {
+					menuTop = Math.max(minTop, Math.min(center, maxTop));
+				} else {
+					menuTop = (boxRect.top + boxRect.bottom) / 2;
+				}
+			}
+			// Clamp to visible area
+			menuTop = Math.max(visibleTop + half, Math.min(menuTop, visibleBottom - half));
 			return { left: menuLeft, top: menuTop };
 		},
 		[swipeInitialRight, swipeOffset, swipeY],

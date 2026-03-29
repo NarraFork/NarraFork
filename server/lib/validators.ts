@@ -861,3 +861,20 @@ export const updateWorkspaceSchema = z.object({
 	title: z.string().max(200).optional(),
 	tree: z.string().min(2).max(50000).optional(),
 });
+
+export const batchDeleteBlocksSchema = z.object({
+	blocks: z
+		.array(
+			z.object({
+				messageId: z.string().min(1),
+				blockIndex: z.number().int().min(0),
+			}),
+		)
+		.min(1)
+		.max(200),
+});
+
+export const forkFromMessagesSchema = z.object({
+	messageIds: z.array(z.string().min(1)).min(1).max(500),
+	title: z.string().max(200).optional(),
+});

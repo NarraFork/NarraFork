@@ -2092,6 +2092,47 @@ export const narratorService = {
 	},
 
 	/**
+	 * Delete multiple content blocks across one or more messages in a single operation.
+	 * Blocks are processed in reverse blockIndex order per message to avoid index shifting.
+	 * Delegates to `deleteMessageBlock` for each block to reuse COW / cascade / revert logic.
+	 */
+	async deleteMessageBlocks(
+		narratorId: string,
+		blocks: Array<{ messageId: string; blockIndex: number }>,
+	) {
+		// Group by messageId and sort blockIndex descending within each group
+		const grouped = new Map<string, number[]>();
+		for (const b of blocks) {
+			const arr = grouped.get(b.messageId) ?? [];
+			arr.push(b.blockIndex);
+			grouped.set(b.messageId, arr);
+		}
+		for (const arr of grouped.values()) {
+			arr.sort((a, b) => b - a); // descending so earlier deletes don't shift later indices
+		}
+
+		const results: Array<{ messageId: string; blockIndex: number; messageDeleted: boolean }> = [];
+		const failed: Array<{ messageId: string; blockIndex: number; error: string }> = [];
+		for (const [messageId, indices] of grouped) {
+			for (const blockIndex of indices) {
+				try {
+					const r = await this.deleteMessageBlock(narratorId, messageId, blockIndex);
+					results.push({ messageId, blockIndex, messageDeleted: r.messageDeleted });
+					// If the whole message was deleted, skip remaining blocks for this message
+					if (r.messageDeleted) break;
+				} catch (err) {
+					failed.push({
+						messageId,
+						blockIndex,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		}
+		return { deleted: results.length, failed: failed.length, results };
+	},
+
+	/**
 	 * Remove a compacting/compact message by ID without touching narrator's contextSummary.
 	 * Used for rollback when compact generation fails mid-way.
 	 */
@@ -3086,6 +3127,89 @@ export const narratorService = {
 	},
 
 	// === Fork ===
+
+	/**
+	 * Create a new standalone narrator containing only the specified messages
+	 * (by message ID) from the parent narrator, preserving their original order.
+	 */
+	async forkFromMessages(
+		parentNarratorId: string,
+		messageIds: string[],
+		opts?: { title?: string },
+	) {
+		const parent = await this.getById(parentNarratorId);
+		if (parent.type === "subagent") {
+			throw new ValidationError("Cannot fork from a subagent narrator");
+		}
+
+		// Fetch the parent's refs for the requested messages, ordered by seq
+		const parentRefs = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				isCompact: narratorMessageRefs.isCompact,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, parentNarratorId),
+					inArray(narratorMessageRefs.messageId, messageIds),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+
+		if (parentRefs.length === 0) {
+			throw new ValidationError("None of the specified messages belong to this narrator");
+		}
+
+		const now = new Date().toISOString();
+		const id = generateId();
+		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
+		const resolvedPermMode = (parent.permissionMode ?? "default") as
+			| "default"
+			| "acceptEdits"
+			| "bypassPermissions"
+			| "dontAsk";
+
+		const newNarrator = await db.transaction(async (tx) => {
+			const [created] = await tx
+				.insert(narrators)
+				.values({
+					id,
+					chapterId: null, // always standalone
+					type: "primary",
+					model: storedModel,
+					systemPrompt: parent.systemPrompt,
+					permissionMode: resolvedPermMode,
+					reasoningEffort: parent.reasoningEffort ?? null,
+					fastMode: parent.fastMode ?? false,
+					relaxedPlan: parent.relaxedPlan ?? false,
+					parentNarratorId,
+					inheritMode: "full",
+					status: "idle",
+					title: opts?.title ?? null,
+					cwd: parent.cwd ?? null,
+					createdAt: now,
+					updatedAt: now,
+				})
+				.returning();
+
+			// Re-sequence refs starting from 1
+			await tx.insert(narratorMessageRefs).values(
+				parentRefs.map((row, i) => ({
+					id: generateId(),
+					narratorId: id,
+					messageId: row.messageId,
+					seq: i + 1,
+					isCompact: 0,
+				})),
+			);
+
+			return created;
+		});
+
+		return newNarrator;
+	},
 
 	async forkNarrator(
 		parentNarratorId: string,

@@ -807,6 +807,17 @@ export const api = {
 			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}`,
 			{ method: "DELETE" },
 		),
+	deleteMessageBlocks: (
+		narratorId: string,
+		blocks: Array<{ messageId: string; blockIndex: number }>,
+	) =>
+		request<{ ok: boolean; deleted: number; failed: number }>(
+			`/narrators/${narratorId}/messages/batch-blocks`,
+			{
+				method: "DELETE",
+				body: JSON.stringify({ blocks }),
+			},
+		),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
@@ -884,6 +895,11 @@ export const api = {
 		request<ApiEntity>(`/narrators/${narratorId}/fork`, {
 			method: "POST",
 			body: JSON.stringify({ forkMessageUuid, title, inheritMode }),
+		}),
+	forkFromMessages: (narratorId: string, messageIds: string[], title?: string) =>
+		request<ApiEntity>(`/narrators/${narratorId}/fork-messages`, {
+			method: "POST",
+			body: JSON.stringify({ messageIds, title }),
 		}),
 
 	// Terminals

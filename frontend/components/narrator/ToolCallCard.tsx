@@ -66,7 +66,7 @@ import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
-import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
+import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
@@ -2785,7 +2785,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				: undefined;
 
 	const cardContent = (
-		<>
+		<NestedBlockCtx.Provider value={tcBlockId ?? null}>
 			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
 			{!isStreaming && (
 				<>
@@ -2798,7 +2798,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					</LazyCollapse>
 				</>
 			)}
-		</>
+		</NestedBlockCtx.Provider>
 	);
 
 	const swipeMenu =
@@ -2891,6 +2891,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 					onClick={handleTcBlockClick}
 					style={buildSelectionStyle()}
 					{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
+					{...(msgCtx.messageId ? { "data-message-id": msgCtx.messageId } : {})}
+					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 				>
 					<Box ref={isPlan ? cardRef : undefined}>
 						<Box p="xs" className={shimmerClass}>
@@ -2914,6 +2916,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onClick={handleTcBlockClick}
 				style={buildSelectionStyle()}
 				{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
+				{...(msgCtx.messageId ? { "data-message-id": msgCtx.messageId } : {})}
+				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 			>
 				<Paper
 					ref={isPlan ? cardRef : undefined}

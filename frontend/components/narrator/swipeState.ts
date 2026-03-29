@@ -49,3 +49,21 @@ export function getGlobalOnSelectionRange() {
 export function setGlobalOnSelectionRange(fn: SelectionRangeCallback | null) {
 	globalOnSelectionRange = fn;
 }
+
+// ---------------------------------------------------------------------------
+// Toggle-block callback — lets useSwipeMenu add/remove a single block
+// from the selection when multi-select mode is already active.
+// ---------------------------------------------------------------------------
+
+type ToggleBlockCallback = (blockId: string) => void;
+
+let globalToggleBlock: ToggleBlockCallback | null = null;
+
+export function getGlobalToggleBlock() {
+	return globalToggleBlock;
+}
+
+/** Called once by the NarratorPanel provider to register its handler. */
+export function setGlobalToggleBlock(fn: ToggleBlockCallback | null) {
+	globalToggleBlock = fn;
+}

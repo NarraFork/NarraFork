@@ -692,6 +692,16 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	return c.json({ ok: true, ...result });
 });
 
+// Batch-delete multiple content blocks across messages
+narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
+	const narratorId = c.req.param("id");
+	const body = await c.req.json();
+	const { batchDeleteBlocksSchema } = await import("../lib/validators");
+	const { blocks } = batchDeleteBlocksSchema.parse(body);
+	const result = await narratorService.deleteMessageBlocks(narratorId, blocks);
+	return c.json({ ok: true, ...result });
+});
+
 // Delete a single content block from a message
 narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) => {
 	const narratorId = c.req.param("id");
@@ -1006,6 +1016,18 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 		await narratorService.compareAndSetStatus(id, "done", "idle");
 	}
 	return c.json({ ok: true });
+});
+
+// Fork: create a new standalone narrator containing only the specified messages
+narratorRoutes.post("/:id/fork-messages", async (c) => {
+	const id = c.req.param("id");
+	const body = await c.req.json();
+	const { forkFromMessagesSchema } = await import("../lib/validators");
+	const parsed = forkFromMessagesSchema.parse(body);
+	const newNarrator = await narratorService.forkFromMessages(id, parsed.messageIds, {
+		title: parsed.title,
+	});
+	return c.json(newNarrator, 201);
 });
 
 // Fork standalone narrator (chapter-bound narrators must fork via chapter fork)

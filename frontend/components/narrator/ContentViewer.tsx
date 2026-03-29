@@ -35,7 +35,7 @@ import { DiffView } from "./DiffView";
 import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
-import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
+import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -142,7 +142,7 @@ let nextInstanceId = 0;
 
 /** Global registry: instanceId → handle, so parent components can look up
  *  a ContentViewer by its data-cv-id DOM attribute without passing refs. */
-const handleRegistry = new Map<number, ContentViewerHandle>();
+export const handleRegistry = new Map<number, ContentViewerHandle>();
 
 /** Look up a ContentViewerHandle from a DOM event target.
  *  Walks up to the nearest `[data-cv-id]` element and returns the handle. */
@@ -193,9 +193,16 @@ export const ContentViewer = memo(
 		const modalBodyRef = useRef<HTMLDivElement>(null);
 		const instanceId = useRef(nextInstanceId++);
 		const isMobile = contentViewerEnv.isMobile;
-		const blockIdStr = `cv-${instanceId.current}`;
+		const nested = useContext(NestedBlockCtx);
+		const blockIdStr = nested ? undefined : `cv-${instanceId.current}`;
 		const selection = useMessageSelection();
-		const isSelected = selection.selectionMode && selection.selectedBlockIds.has(blockIdStr);
+		// The effective ID for multi-select: own ID, or parent ToolCallCard's ID when nested + selecting
+		const effectiveSelectionId = nested && selection.selectionMode ? nested : blockIdStr;
+		const isSelected = !!(
+			effectiveSelectionId &&
+			selection.selectionMode &&
+			selection.selectedBlockIds.has(effectiveSelectionId)
+		);
 
 		const handle = useMemo<ContentViewerHandle>(
 			() => ({
@@ -295,14 +302,17 @@ export const ContentViewer = memo(
 		// ContentViewer uses its own boxRef for both swipe and other purposes (viewport detection).
 		// excludeSelectors is empty because ContentViewer IS the content block.
 		const handleDeselectBlock = useCallback(() => {
-			selection.deselectBlock(blockIdStr);
-		}, [selection.deselectBlock, blockIdStr]);
+			if (effectiveSelectionId) selection.deselectBlock(effectiveSelectionId);
+		}, [selection.deselectBlock, effectiveSelectionId]);
 
 		const swipe = useSwipeMenu({
 			enabled: true,
 			externalBoxRef: boxRef,
 			excludeSelectors: [".mantine-Menu-dropdown"],
-			blockId: blockIdStr,
+			// In selection mode, nested ContentViewers act on behalf of the parent
+			// ToolCallCard — use the parent's blockId so toggle/anchor targets the card.
+			blockId: nested && selection.selectionMode ? nested : blockIdStr,
+			anchorBlockId: nested ?? undefined,
 			onSwipeRight: isSelected ? handleDeselectBlock : undefined,
 		});
 
@@ -343,6 +353,7 @@ export const ContentViewer = memo(
 					handleDoubleTap();
 					return;
 				}
+				if (nested || !blockIdStr) return;
 				const isModKey = e.metaKey || e.ctrlKey;
 				const isShift = e.shiftKey;
 				if (!isModKey && !isShift) return;
@@ -356,7 +367,14 @@ export const ContentViewer = memo(
 					selection.toggleBlock(blockIdStr);
 				}
 			},
-			[isMobile, handleDoubleTap, blockIdStr, selection.toggleBlock, selection.rangeSelectTo],
+			[
+				isMobile,
+				nested,
+				handleDoubleTap,
+				blockIdStr,
+				selection.toggleBlock,
+				selection.rangeSelectTo,
+			],
 		);
 
 		const iconSize = isMobile ? 18 : 12;
@@ -453,7 +471,10 @@ export const ContentViewer = memo(
 		const SWIPE_REVEAL_WIDTH = 180;
 
 		// Selected blocks get a visual offset to match the anchor's swipe (mobile only)
-		const selectionOffset = isMobile && isSelected && !swipe.swipeRevealed ? SWIPE_REVEAL_WIDTH : 0;
+		// Nested ContentViewers skip visual selection — the parent ToolCallCard handles it.
+		const showSelectedVisual = isSelected && !nested;
+		const selectionOffset =
+			isMobile && showSelectedVisual && !swipe.swipeRevealed ? SWIPE_REVEAL_WIDTH : 0;
 		const effectiveOffset = swipe.swipeOffset > 0 ? swipe.swipeOffset : selectionOffset;
 
 		return (
@@ -463,15 +484,17 @@ export const ContentViewer = memo(
 					pos="relative"
 					data-content-block
 					data-cv-id={instanceId.current}
-					{...{ [BLOCK_ID_ATTR]: blockIdStr }}
+					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+					{...(msgCtx.messageId && !nested ? { "data-message-id": msgCtx.messageId } : {})}
+					{...(blockIndex != null && !nested ? { "data-block-index": String(blockIndex) } : {})}
 					style={{
 						maxWidth: "100%",
 						minWidth: 0,
 						transform: effectiveOffset > 0 ? `translateX(-${effectiveOffset}px)` : undefined,
 						transition: swipe.swipeTransition,
-						outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
-						outlineOffset: isSelected ? -2 : undefined,
-						borderRadius: isSelected ? 4 : undefined,
+						outline: showSelectedVisual ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+						outlineOffset: showSelectedVisual ? -2 : undefined,
+						borderRadius: showSelectedVisual ? 4 : undefined,
 					}}
 					onMouseEnter={isMobile ? undefined : () => setHovered(true)}
 					onMouseLeave={isMobile ? undefined : () => setHovered(false)}

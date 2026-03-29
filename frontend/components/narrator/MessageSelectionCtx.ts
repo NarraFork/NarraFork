@@ -6,6 +6,13 @@ import { createContext, useContext } from "react";
  */
 export const BLOCK_ID_ATTR = "data-block-id";
 
+/**
+ * When set to a non-null string, nested ContentViewers should NOT register
+ * their own block ID for multi-select. The value is the parent ToolCallCard's
+ * blockId, used as the swipe anchor when the nested viewer's menu is revealed.
+ */
+export const NestedBlockCtx = createContext<string | null>(null);
+
 export interface MessageSelectionState {
 	/** Whether multi-select mode is active. */
 	selectionMode: boolean;
@@ -72,4 +79,71 @@ export function resolveBlockRange(
 		result.add(ids[i]);
 	}
 	return result;
+}
+
+// ---------------------------------------------------------------------------
+// DOM helpers for batch operations — extract metadata from selected blocks.
+// ---------------------------------------------------------------------------
+
+export interface BlockMeta {
+	blockId: string;
+	messageId: string;
+	blockIndex: number;
+}
+
+/**
+ * Walk the container's `[data-block-id]` elements in DOM order and return
+ * metadata for every block whose ID is in `selectedIds`.
+ * Only blocks that carry both `data-message-id` and `data-block-index` are included.
+ */
+export function resolveSelectedBlockMeta(
+	container: HTMLElement,
+	selectedIds: Set<string>,
+): BlockMeta[] {
+	const allBlocks = container.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`);
+	const result: BlockMeta[] = [];
+	for (const el of allBlocks) {
+		const blockId = el.getAttribute(BLOCK_ID_ATTR);
+		if (!blockId || !selectedIds.has(blockId)) continue;
+		const messageId = el.getAttribute("data-message-id");
+		const blockIndexStr = el.getAttribute("data-block-index");
+		if (!messageId || blockIndexStr == null) continue;
+		result.push({ blockId, messageId, blockIndex: Number(blockIndexStr) });
+	}
+	return result;
+}
+
+/**
+ * Collect the visible text content of all selected blocks in DOM order.
+ * For `cv-*` blocks, uses the `handleRegistry` via `data-cv-id` if available,
+ * otherwise falls back to `innerText`.
+ * For `tc-*` blocks, uses `innerText`.
+ */
+export function collectSelectedText(
+	container: HTMLElement,
+	selectedIds: Set<string>,
+	handleRegistry?: Map<number, { getContent?: () => string }>,
+): string {
+	const allBlocks = container.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`);
+	const parts: string[] = [];
+	for (const el of allBlocks) {
+		const blockId = el.getAttribute(BLOCK_ID_ATTR);
+		if (!blockId || !selectedIds.has(blockId)) continue;
+		let text: string | undefined;
+		// Try handleRegistry for ContentViewer blocks
+		if (blockId.startsWith("cv-") && handleRegistry) {
+			const cvId = el.getAttribute("data-cv-id");
+			if (cvId != null) {
+				const handle = handleRegistry.get(Number(cvId));
+				text = handle?.getContent?.();
+			}
+		}
+		if (!text) {
+			text = el.innerText;
+		}
+		if (text?.trim()) {
+			parts.push(text.trim());
+		}
+	}
+	return parts.join("\n\n");
 }

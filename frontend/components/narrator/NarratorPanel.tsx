@@ -34,11 +34,13 @@ import {
 	IconCheck,
 	IconCode,
 	IconCodeOff,
+	IconCopy,
 	IconEraser,
 	IconExternalLink,
 	IconFile,
 	IconFileCode,
 	IconFolderPlus,
+	IconGitFork,
 	IconLock,
 	IconLockOpen,
 	IconPaperclip,
@@ -111,7 +113,7 @@ import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
-import { ContentViewerEnvironmentProvider } from "./ContentViewer";
+import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import {
 	type RenderedTreeElementMeta,
@@ -119,9 +121,12 @@ import {
 	renderTreeMessagesWithKeys,
 } from "./MessageRenderer";
 import {
+	BLOCK_ID_ATTR,
+	collectSelectedText,
 	MessageSelectionCtx,
 	type MessageSelectionState,
 	resolveBlockRange,
+	resolveSelectedBlockMeta,
 } from "./MessageSelectionCtx";
 import { buildStreamingMsg } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
@@ -146,7 +151,12 @@ import {
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
-import { getGlobalCloseSwipe, setGlobalOnSelectionRange, setGlobalSwipeAnchor } from "./swipeState";
+import {
+	getGlobalCloseSwipe,
+	setGlobalOnSelectionRange,
+	setGlobalSwipeAnchor,
+	setGlobalToggleBlock,
+} from "./swipeState";
 import { FileModDrawerCtx, LatestTodosToolUseIdCtx } from "./ToolCallCard";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
 
@@ -1763,6 +1773,16 @@ export function NarratorPanel({
 		return () => setGlobalOnSelectionRange(null);
 	}, []);
 
+	// Register toggle callback so useSwipeMenu can add/remove blocks
+	// from the selection when multi-select mode is already active.
+	useEffect(() => {
+		if (selectionMode) {
+			setGlobalToggleBlock(toggleBlock);
+			return () => setGlobalToggleBlock(null);
+		}
+		setGlobalToggleBlock(null);
+	}, [selectionMode, toggleBlock]);
+
 	// Clear selection when narrator changes
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is intentionally a dependency to reset selection on narrator switch
 	useEffect(() => {
@@ -1781,6 +1801,152 @@ export function NarratorPanel({
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
 	}, [selectionMode, exitSelection]);
+
+	// --- Floating toolbar position — clamp to selected blocks' bounding box ---
+	const selectionToolbarRef = useRef<HTMLDivElement>(null);
+	const [selectionToolbarTop, setSelectionToolbarTop] = useState<number | null>(null);
+
+	useEffect(() => {
+		if (!selectionMode || selectedBlockIds.size === 0) {
+			setSelectionToolbarTop(null);
+			return;
+		}
+		const container = contentRef.current;
+		const scrollEl = viewportRef.current;
+		if (!container || !scrollEl) return;
+
+		const reposition = () => {
+			const els = container.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`);
+			let minTop = Number.POSITIVE_INFINITY;
+			let maxBottom = Number.NEGATIVE_INFINITY;
+			for (const el of els) {
+				const bid = el.getAttribute(BLOCK_ID_ATTR);
+				if (!bid || !selectedBlockIds.has(bid)) continue;
+				const r = el.getBoundingClientRect();
+				if (r.top < minTop) minTop = r.top;
+				if (r.bottom > maxBottom) maxBottom = r.bottom;
+			}
+			if (!Number.isFinite(minTop)) return;
+			const menuH = selectionToolbarRef.current?.offsetHeight ?? 160;
+			const half = menuH / 2;
+			const screenCenter = window.innerHeight / 2;
+			// Clamp: prefer screen center, but stay within selected blocks' bounds
+			let top = Math.max(minTop + half, Math.min(screenCenter, maxBottom - half));
+			// Also clamp to viewport
+			top = Math.max(half, Math.min(top, window.innerHeight - half));
+			setSelectionToolbarTop(top);
+		};
+
+		reposition();
+		scrollEl.addEventListener("scroll", reposition, { passive: true });
+		window.addEventListener("resize", reposition, { passive: true });
+		return () => {
+			scrollEl.removeEventListener("scroll", reposition);
+			window.removeEventListener("resize", reposition);
+		};
+	}, [selectionMode, selectedBlockIds]);
+
+	// --- Batch copy ---
+	const handleBatchCopy = useCallback(async () => {
+		const container = contentRef.current;
+		if (!container || selectedBlockIds.size === 0) return;
+		const text = collectSelectedText(container, selectedBlockIds, handleRegistry);
+		if (!text) return;
+		try {
+			await navigator.clipboard.writeText(text);
+			notifications.show({
+				message: t("batchCopySuccess", { count: selectedBlockIds.size }),
+				color: "teal",
+			});
+		} catch {
+			// Fallback: some browsers block clipboard in non-secure contexts
+		}
+		exitSelection();
+	}, [selectedBlockIds, exitSelection, t]);
+
+	// --- Batch delete ---
+	const handleBatchDelete = useCallback(async () => {
+		const container = contentRef.current;
+		if (!container || selectedBlockIds.size === 0) return;
+		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
+		if (metas.length === 0) return;
+		// Confirm
+		const ok = window.confirm(t("batchDeleteConfirm", { count: metas.length }));
+		if (!ok) return;
+		// Optimistic update: remove blocks from cache
+		const prevData = qc.getQueryData(messagesQueryKey);
+		if (prevData) {
+			// Build a set of messageId:blockIndex for quick lookup
+			const toDelete = new Set(metas.map((m) => `${m.messageId}:${m.blockIndex}`));
+			qc.setQueryData(messagesQueryKey, (old: typeof prevData) => {
+				if (!old || typeof old !== "object" || !("pages" in old)) return old;
+				return {
+					...old,
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic page structure
+					pages: (old as any).pages.map((page: any) => ({
+						...page,
+						messages: page.messages
+							// biome-ignore lint/suspicious/noExplicitAny: dynamic message structure
+							.map((msg: any) => {
+								if (!Array.isArray(msg.contentJson)) return msg;
+								const filtered = msg.contentJson.filter(
+									(_: unknown, i: number) => !toDelete.has(`${msg.id}:${i}`),
+								);
+								if (filtered.length === 0) return null; // whole message removed
+								if (filtered.length === msg.contentJson.length) return msg; // unchanged
+								return { ...msg, contentJson: filtered };
+							})
+							.filter(Boolean),
+					})),
+				};
+			});
+		}
+		exitSelection();
+		try {
+			const res = await api.deleteMessageBlocks(
+				narratorId,
+				metas.map((m) => ({ messageId: m.messageId, blockIndex: m.blockIndex })),
+			);
+			// Always re-fetch from server to ensure consistency (best-effort delete
+			// may have partially succeeded, so optimistic cache may be inaccurate)
+			qc.invalidateQueries({ queryKey: messagesQueryKey });
+			if (res.failed > 0) {
+				notifications.show({ message: t("batchDeleteFailed"), color: "orange" });
+			}
+		} catch {
+			// Network / unexpected error — re-fetch to reflect whatever actually happened
+			qc.invalidateQueries({ queryKey: messagesQueryKey });
+			notifications.show({ message: t("batchDeleteFailed"), color: "red" });
+		}
+	}, [selectedBlockIds, exitSelection, narratorId, messagesQueryKey, qc, t]);
+
+	// --- Batch fork ---
+	const handleBatchFork = useCallback(async () => {
+		const container = contentRef.current;
+		if (!container || selectedBlockIds.size === 0) return;
+		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
+		if (metas.length === 0) return;
+		// Deduplicate messageIds preserving DOM order
+		const seen = new Set<string>();
+		const messageIds: string[] = [];
+		for (const m of metas) {
+			if (!seen.has(m.messageId)) {
+				seen.add(m.messageId);
+				messageIds.push(m.messageId);
+			}
+		}
+		exitSelection();
+		try {
+			const newNarrator = await api.forkFromMessages(narratorId, messageIds);
+			notifications.show({
+				message: t("batchForkSuccess", { count: messageIds.length }),
+				color: "teal",
+			});
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
+		} catch {
+			notifications.show({ message: t("batchForkFailed"), color: "red" });
+		}
+	}, [selectedBlockIds, exitSelection, narratorId, navigate, t]);
 
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
@@ -3142,26 +3308,43 @@ export function NarratorPanel({
 						/>
 					</Box>
 
-					{/* Multi-select floating toolbar */}
+					{/* Multi-select floating toolbar — fixed center, similar to swipe menu style */}
 					{selectionMode && (
-						<Group
-							px="md"
-							py={6}
-							justify="space-between"
-							wrap="nowrap"
+						<Box
+							ref={selectionToolbarRef}
 							style={{
-								borderTop: "1px solid var(--mantine-color-default-border)",
-								backgroundColor: "var(--mantine-color-indigo-light)",
-								flexShrink: 0,
+								position: "fixed",
+								right: 16,
+								top: selectionToolbarTop ?? "50%",
+								transform: "translateY(-50%)",
+								zIndex: 1000,
+								pointerEvents: "auto",
+								transition: "top 80ms ease-out",
 							}}
 						>
-							<Text size="sm" fw={500}>
-								{t("selectedBlocks", { count: selectedBlockIds.size })}
-							</Text>
-							<Button size="compact-xs" variant="subtle" color="gray" onClick={exitSelection}>
-								{tc("cancel")}
-							</Button>
-						</Group>
+							<Menu opened withinPortal={false} position="bottom-start">
+								<Menu.Dropdown style={{ position: "relative", width: 180 }}>
+									<Menu.Label>{t("selectedBlocks", { count: selectedBlockIds.size })}</Menu.Label>
+									<Menu.Item leftSection={<IconCopy size={14} />} onClick={handleBatchCopy}>
+										{t("batchCopy")}
+									</Menu.Item>
+									<Menu.Item leftSection={<IconGitFork size={14} />} onClick={handleBatchFork}>
+										{t("batchFork")}
+									</Menu.Item>
+									<Menu.Item
+										color="red"
+										leftSection={<IconTrash size={14} />}
+										onClick={handleBatchDelete}
+									>
+										{t("batchDelete")}
+									</Menu.Item>
+									<Menu.Divider />
+									<Menu.Item leftSection={<IconX size={14} />} onClick={exitSelection}>
+										{tc("cancel")}
+									</Menu.Item>
+								</Menu.Dropdown>
+							</Menu>
+						</Box>
 					)}
 
 					{onSendToTerminal && (

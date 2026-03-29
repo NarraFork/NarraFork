@@ -107,6 +107,7 @@ export function renderToolRun(
 
 		if (item.kind === "reasoning") {
 			const iconColor = getCategoryColor("plan");
+			const isStreaming = item.msg.id === "__streaming__";
 			const reasoningAnimationId = getReasoningBlurAnimationId({
 				messageId: item.msg.id,
 				blockIndex: item.blockIndex,
@@ -118,7 +119,11 @@ export function renderToolRun(
 					<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
 						<IconBrain size={10} />
 					</ThemeIcon>
-					<ReasoningSummary text={item.text} translatedText={item.translatedText} />
+					<ReasoningSummary
+						text={item.text}
+						translatedText={item.translatedText}
+						isStreaming={isStreaming}
+					/>
 				</Group>
 			);
 			return (
