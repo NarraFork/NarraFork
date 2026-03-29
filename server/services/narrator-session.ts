@@ -1094,34 +1094,32 @@ export async function handlePermission(
 
 	let effectiveInput = input;
 
-	// ExitPlanMode with planFile: pre-read file content for the permission UI.
-	// Replace planFile with the resolved plan content so the frontend can display it
-	// and execute() receives a single `plan` parameter (not both plan + planFile).
-	if (toolName === "ExitPlanMode" && !input.plan) {
-		const active = activeNarrators.get(narratorId);
-		const planFileId = active?._planFileId;
-		if (planFileId) {
-			const planFileName = `.narrafork/plan-${planFileId}.md`;
-			const absPath = resolve(cwd, planFileName);
-			try {
-				if (existsSync(absPath)) {
-					const content = readFileSync(absPath, "utf-8");
-					if (content.trim()) {
-						// Drop planFile, inject plan content — execute() sees only `plan`
-						const { planFile: _, ...rest } = effectiveInput;
-						effectiveInput = { ...rest, plan: content };
+	// ExitPlanMode: auto-resolve plan content from the designated plan file,
+	// then reject early if plan is still empty after all resolution attempts.
+	if (toolName === "ExitPlanMode") {
+		// Step 1: When the model omits `plan` (or passes empty/reference text),
+		// read the plan file so the permission UI and execute() receive the actual content.
+		const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
+		if (!inlinePlan) {
+			const active = activeNarrators.get(narratorId);
+			const planFileId = active?._planFileId;
+			if (planFileId) {
+				const planFileName = `.narrafork/plan-${planFileId}.md`;
+				const absPath = resolve(cwd, planFileName);
+				try {
+					if (existsSync(absPath)) {
+						const content = readFileSync(absPath, "utf-8");
+						if (content.trim()) {
+							effectiveInput = { ...effectiveInput, plan: content };
+						}
 					}
+				} catch {
+					// Ignore read errors — the empty-plan check below will catch it
 				}
-			} catch {
-				// Ignore read errors — the tool execute will handle them
 			}
 		}
-	}
 
-	// ExitPlanMode: reject early if plan content is still empty after all resolution attempts.
-	// This prevents the user from seeing an empty plan approval dialog.
-	// Include the correct plan file path so the model knows where to write.
-	if (toolName === "ExitPlanMode") {
+		// Step 2: Reject if plan content is still empty — prevents empty approval dialog.
 		const planValue = effectiveInput.plan;
 		const hasPlanContent = typeof planValue === "string" && planValue.trim().length > 0;
 		if (!hasPlanContent) {

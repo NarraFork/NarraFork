@@ -606,35 +606,14 @@ const toolMessages = {
 			"[计划模式] 用户拒绝了你的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改你的计划，然后再次调用 ExitPlanMode 提交。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
 	// ExitPlanMode validation errors
-	exitPlanModeBothProvided: {
-		en: "Error: Provide either 'plan' or 'planFile', not both.",
-		"zh-CN": "错误：请提供 'plan' 或 'planFile' 其中之一，不能同时提供。",
-	},
-	exitPlanModeNeitherProvided: {
-		en: "Error: You must provide either 'plan' (inline text) or 'planFile' (path to plan file). Neither was provided and no plan file was found on disk.",
-		"zh-CN":
-			"错误：你必须提供 'plan'（内联文本）或 'planFile'（计划文件路径）其中之一。两者均未提供，且磁盘上未找到计划文件。",
-	},
-	exitPlanModeFileOutsideCwd: {
-		en: "Error: planFile must be within the working directory.",
-		"zh-CN": "错误：planFile 必须位于工作目录内。",
-	},
-	exitPlanModeFileNotFound: {
-		en: "Error: Plan file not found: {planFile}. Write the file first using the Write tool.",
-		"zh-CN": "错误：未找到计划文件：{planFile}。请先使用 Write 工具创建该文件。",
-	},
-	exitPlanModeFileEmpty: {
-		en: "Error: Plan file is empty. Write your plan to the file before calling ExitPlanMode.",
-		"zh-CN": "错误：计划文件为空。请在调用 ExitPlanMode 之前将计划写入文件。",
-	},
-	exitPlanModeFileReadError: {
-		en: "Error reading plan file: {error}",
-		"zh-CN": "读取计划文件时出错：{error}",
-	},
 	exitPlanModeEmptyPlan: {
-		en: "Error: The plan content is empty. You must provide a non-empty plan in the 'plan' parameter for the user to review. If you wrote the plan to a file, use the designated plan file path: {planFile} — then call ExitPlanMode again with the plan content in the 'plan' parameter, or write to that file and pass it via 'planFile'.",
+		en: "Error: The plan content is empty. Either provide a non-empty plan in the 'plan' parameter, or write your plan to the designated plan file ({planFile}) first — the system will read it automatically when you call ExitPlanMode without the 'plan' parameter.",
 		"zh-CN":
-			"错误：计划内容为空。你必须在 'plan' 参数中提供非空的计划内容供用户审阅。如果你已将计划写入文件，请使用指定的计划文件路径：{planFile} — 然后再次调用 ExitPlanMode，在 'plan' 参数中传入计划内容，或将计划写入该文件后通过 'planFile' 传入。",
+			"错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件（{planFile}）— 当你不传 'plan' 参数调用 ExitPlanMode 时，系统会自动读取该文件。",
+	},
+	exitPlanModeEmptyPlanFallback: {
+		en: "Error: The plan content is empty. Provide a non-empty plan in the 'plan' parameter or write it to the designated plan file first.",
+		"zh-CN": "错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
 	},
 	// Plan mode disabled tool description (injected in loop.ts)
 	planModeToolDisabled: {
@@ -809,7 +788,7 @@ Call ExitPlanMode with the \`plan\` parameter containing your complete plan text
 
 ### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
-2. When done, call ExitPlanMode with \`planFile\` set to \`${planFile}\`.
+2. When done, call ExitPlanMode WITHOUT the \`plan\` parameter. The system will automatically read \`${planFile}\` and present its content to the user.
 
 **IMPORTANT**: The plan (whether inline or in the file) must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.
 
@@ -847,7 +826,7 @@ Your turn should only end with either asking the user a question or calling Exit
 
 ### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
-2. 完成后，调用 ExitPlanMode，将 \`planFile\` 设为 \`${planFile}\`。
+2. 完成后，直接调用 ExitPlanMode，不需要传 \`plan\` 参数。系统会自动读取 \`${planFile}\` 的内容并展示给用户。
 
 **重要**：计划（无论内联还是文件形式）必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。
 

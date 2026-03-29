@@ -1,8 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { z } from "zod/v4";
-import { isInsidePath } from "../../platform-path";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
+import { getToolMessage, type Locale } from "../../prompt-i18n";
 import type { ToolDefinition, ToolResult } from "../types";
 
 export const enterPlanModeTool: ToolDefinition = {
@@ -91,10 +88,14 @@ export const exitPlanModeTool: ToolDefinition = {
 	name: "ExitPlanMode",
 	description:
 		"Use this tool when you are in plan mode and have finished designing your implementation plan and are ready for user approval.\n\n" +
-		"## How This Tool Works\n" +
-		"- You MUST pass the complete plan content in the `plan` parameter\n" +
-		"- The user will see the plan content you provide and decide whether to approve it\n" +
-		"- An empty or missing plan will be rejected — the plan parameter is required\n\n" +
+		"## How This Tool Works\n\n" +
+		"You have two ways to submit your plan:\n\n" +
+		"### Mode A: Inline plan (for short/medium plans)\n" +
+		"Pass the complete plan text in the `plan` parameter.\n\n" +
+		"### Mode B: File-based plan (for long/complex plans)\n" +
+		"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `plan` parameter. " +
+		"The system will automatically read the plan file content and present it to the user.\n" +
+		"Do NOT put a file reference like 'Plan written to xxx' in the `plan` parameter — just omit `plan` entirely and the system handles the rest.\n\n" +
 		"## When to Use This Tool\n" +
 		"IMPORTANT: Only use this tool when the task requires planning the implementation steps of a task that requires writing code. For research tasks where you're gathering information, searching files, reading files or in general trying to understand the codebase - do NOT use this tool.\n\n" +
 		"## Before Using This Tool\n" +
@@ -113,7 +114,9 @@ export const exitPlanModeTool: ToolDefinition = {
 				description:
 					"The COMPLETE implementation plan in markdown format. " +
 					"Must contain the full plan with all steps, file changes, and reasoning. " +
-					"This content will be shown to the user for approval. Cannot be empty.",
+					"This content will be shown to the user for approval. Cannot be empty. " +
+					"Omit this parameter if you already wrote the plan to the designated plan file — " +
+					"the system will read the file automatically.",
 				type: "string",
 			},
 			allowedPrompts: {
@@ -139,110 +142,33 @@ export const exitPlanModeTool: ToolDefinition = {
 				},
 			},
 		},
-		required: ["plan"],
 		additionalProperties: {},
 	},
 	parameters: z.object({
 		plan: z
 			.string()
+			.optional()
 			.describe(
 				"The COMPLETE implementation plan in markdown format. " +
 					"Must contain the full plan with all steps, file changes, and reasoning. " +
-					"This content will be shown to the user for approval. Cannot be empty.",
-			),
-		planFile: z
-			.string()
-			.optional()
-			.describe(
-				"Path to the plan file (relative to cwd), e.g. '.narrafork/plan-xxxx.md'. " +
-					"Use this for complex plans that are too long to fit in a single parameter. " +
-					"Write the file first using the Write tool, then pass the path here. " +
-					"Mutually exclusive with 'plan'.",
+					"This content will be shown to the user for approval. Cannot be empty. " +
+					"Omit this parameter if you already wrote the plan to the designated plan file — " +
+					"the system will read the file automatically.",
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { plan, planFile } = args as { plan?: string; planFile?: string };
-		const cwd = ctx?.cwd ?? process.cwd();
-		const planFileId = ctx?.planFileId;
+		// The session layer (narrator-session.ts handlePermission) resolves the plan
+		// content before this execute() is called — either from the inline `plan`
+		// parameter or by reading the designated plan file on disk.  By the time we
+		// get here, `plan` should already contain the resolved content.
 		const locale = (ctx?.locale as Locale) ?? "en";
-		const ok = { output: getToolMessage("exitPlanModeOutput", locale) };
-
-		// Normalize: treat empty/whitespace-only strings as not provided
-		const hasPlan = typeof plan === "string" && plan.trim().length > 0;
-		const hasPlanFile = typeof planFile === "string" && planFile.trim().length > 0;
-
-		// Validate: exactly one of plan or planFile must be provided.
-		// Exception: if neither is provided but a plan file exists on disk, use it automatically.
-		if (hasPlan && hasPlanFile) {
+		const { plan } = args as { plan?: string };
+		if (!plan?.trim()) {
 			return {
-				output: getToolMessage("exitPlanModeBothProvided", locale),
+				output: getToolMessage("exitPlanModeEmptyPlanFallback", locale),
 				isError: true,
 			};
 		}
-
-		// If planFile is provided, validate it exists, is readable, and has content
-		if (hasPlanFile) {
-			const validation = validatePlanFile(cwd, planFile as string, locale);
-			if (validation.isError) return validation;
-			return ok;
-		}
-
-		// If inline plan is provided, return confirmation
-		if (hasPlan) {
-			return ok;
-		}
-
-		// Neither provided — try to auto-detect the plan file from planFileId
-		if (planFileId) {
-			const autoPath = `.narrafork/plan-${planFileId}.md`;
-			const absPath = resolve(cwd, autoPath);
-			if (existsSync(absPath)) {
-				const validation = validatePlanFile(cwd, autoPath, locale);
-				if (validation.isError) return validation;
-				return ok;
-			}
-		}
-
-		return {
-			output: getToolMessage("exitPlanModeNeitherProvided", locale),
-			isError: true,
-		};
+		return { output: getToolMessage("exitPlanModeOutput", locale) };
 	},
 };
-
-function validatePlanFile(cwd: string, planFile: string, locale: Locale): ToolResult {
-	const absPath = resolve(cwd, planFile);
-
-	// Security: ensure the resolved path is under cwd
-	if (!isInsidePath(cwd, absPath)) {
-		return {
-			output: getToolMessage("exitPlanModeFileOutsideCwd", locale),
-			isError: true,
-		};
-	}
-
-	if (!existsSync(absPath)) {
-		return {
-			output: getToolMessageWithParams("exitPlanModeFileNotFound", locale, { planFile }),
-			isError: true,
-		};
-	}
-
-	try {
-		const content = readFileSync(absPath, "utf-8");
-		if (!content.trim()) {
-			return {
-				output: getToolMessage("exitPlanModeFileEmpty", locale),
-				isError: true,
-			};
-		}
-		return { output: "" };
-	} catch (err) {
-		return {
-			output: getToolMessageWithParams("exitPlanModeFileReadError", locale, {
-				error: err instanceof Error ? err.message : String(err),
-			}),
-			isError: true,
-		};
-	}
-}
