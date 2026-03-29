@@ -270,5 +270,7 @@
 	"fileMod_fullFilePreview": "Full file (after change)",
 	"fileMod_noChanges": "No changes",
 	"fileMod_toolCallCount": "{{count}} tool calls",
-	"fileMod_toolCallCount_one": "{{count}} tool call"
+	"fileMod_toolCallCount_one": "{{count}} tool call",
+	"fileMod_timelineCurrent": "Current",
+	"fileMod_timelineMessage": "Message #{{n}}"
 }

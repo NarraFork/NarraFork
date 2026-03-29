@@ -563,5 +563,12 @@
 	"modelTestRun": "Send Test",
 	"modelTestRunning": "Testing…",
 	"modelTestResult": "Model Output",
-	"modelTestBtn": "Test"
+	"modelTestBtn": "Test",
+	"webFetchProxy": "WebFetch Proxy",
+	"webFetchProxyDesc": "Proxy mode for WebFetch HTTP requests and browser page fetching.",
+	"webFetchProxyDirect": "Direct (no proxy)",
+	"webFetchProxySystem": "System proxy (auto-detect)",
+	"webFetchProxyCustom": "Custom proxy",
+	"webFetchProxyUrl": "Proxy URL",
+	"webFetchProxyUrlPlaceholder": "e.g. http://127.0.0.1:7890, socks5://proxy:1080"
 }

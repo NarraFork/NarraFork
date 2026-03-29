@@ -166,6 +166,15 @@ const updateSettingsSchema = z
 								}),
 							)
 							.optional(),
+						proxy: z
+							.object({
+								mode: z.enum(["direct", "system", "custom"]),
+								url: z
+									.string()
+									.regex(/^(https?|socks[45]?):\/\//)
+									.optional(),
+							})
+							.optional(),
 					})
 					.optional(),
 			})

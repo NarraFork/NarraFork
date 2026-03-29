@@ -6,6 +6,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../logger";
+import { getWebFetchProxy } from "./proxy";
 
 // Dynamic import to avoid hard dependency at module load time.
 type PuppeteerBrowser = import("puppeteer").Browser;
@@ -29,6 +30,16 @@ const LAUNCH_ARGS = [
 	"--disable-dev-shm-usage",
 	"--disable-extensions",
 ];
+
+/** Build launch args, appending --proxy-server when a proxy is configured. */
+function buildLaunchArgs(): string[] {
+	const args = [...LAUNCH_ARGS];
+	const proxy = getWebFetchProxy();
+	if (proxy) {
+		args.push(`--proxy-server=${proxy}`);
+	}
+	return args;
+}
 
 /**
  * Find a Chrome executable in the Puppeteer cache directory.
@@ -155,13 +166,15 @@ async function launchBrowser(): Promise<PuppeteerBrowser> {
 	// Search for Chrome first — avoids slow timeout when default Puppeteer can't find its version
 	const customChromePath = findChromePath();
 
+	const launchArgs = buildLaunchArgs();
+
 	if (customChromePath) {
 		// Found a Chrome binary — launch with explicit path
 		try {
 			const b = await puppeteer.default.launch({
 				headless: true,
 				executablePath: customChromePath,
-				args: LAUNCH_ARGS,
+				args: launchArgs,
 			});
 			logger.info("Puppeteer browser launched", {
 				pid: b.process()?.pid,
@@ -181,7 +194,7 @@ async function launchBrowser(): Promise<PuppeteerBrowser> {
 	// Default Puppeteer launch (uses its own bundled Chrome version detection)
 	const b = await puppeteer.default.launch({
 		headless: true,
-		args: LAUNCH_ARGS,
+		args: launchArgs,
 	});
 	logger.info("Puppeteer browser launched (default)", { pid: b.process()?.pid });
 	return b;

@@ -2,6 +2,7 @@
 // Uses native fetch() + linkedom for HTML parsing, no browser needed.
 
 import { logger } from "../logger";
+import { getWebFetchProxy } from "./proxy";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const USER_AGENT =
@@ -30,6 +31,7 @@ export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): 
 	const timer = setTimeout(() => controller.abort(), timeout);
 
 	try {
+		const proxy = getWebFetchProxy();
 		const res = await fetch(url, {
 			headers: {
 				"User-Agent": USER_AGENT,
@@ -37,6 +39,7 @@ export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): 
 			},
 			signal: controller.signal,
 			redirect: "follow",
+			...(proxy ? { proxy } : {}),
 		});
 
 		if (!res.ok) {

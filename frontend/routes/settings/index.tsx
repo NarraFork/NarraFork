@@ -220,6 +220,9 @@ function SettingsPage() {
 	const [globalCommandBlacklist, setGlobalCommandBlacklist] = useState<
 		Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>
 	>([]);
+	// WebFetch proxy
+	const [webFetchProxyMode, setWebFetchProxyMode] = useState("system");
+	const [webFetchProxyUrl, setWebFetchProxyUrl] = useState("");
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
 	const [maxContainers, setMaxContainers] = useState(5);
@@ -292,6 +295,8 @@ function SettingsPage() {
 			denyPrompt?: string;
 			enabled?: boolean;
 		}>,
+		webFetchProxyMode: "system",
+		webFetchProxyUrl: "",
 		updateServerUrl: "",
 		updateChannel: "stable" as "stable" | "beta",
 		updateAutoDownload: false,
@@ -341,6 +346,8 @@ function SettingsPage() {
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
 				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
 				globalCommandBlacklist: settings.agent?.commandBlacklist ?? [],
+				webFetchProxyMode: settings.agent?.webFetchPolicy?.proxy?.mode ?? "system",
+				webFetchProxyUrl: settings.agent?.webFetchPolicy?.proxy?.url ?? "",
 				updateServerUrl: settings.update?.serverUrl ?? "",
 				updateChannel: settings.update?.channel ?? "stable",
 				updateAutoDownload: settings.update?.autoDownload ?? false,
@@ -382,6 +389,8 @@ function SettingsPage() {
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
 			setGlobalCommandWhitelist(snap.globalCommandWhitelist);
 			setGlobalCommandBlacklist(snap.globalCommandBlacklist);
+			setWebFetchProxyMode(snap.webFetchProxyMode);
+			setWebFetchProxyUrl(snap.webFetchProxyUrl);
 			setUpdateServerUrl(settings.update?.serverUrl ?? "");
 			setUpdateChannel(settings.update?.channel ?? "stable");
 			setUpdateAutoDownload(settings.update?.autoDownload ?? false);
@@ -429,6 +438,8 @@ function SettingsPage() {
 			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
 			JSON.stringify(globalCommandWhitelist) !== JSON.stringify(s.globalCommandWhitelist) ||
 			JSON.stringify(globalCommandBlacklist) !== JSON.stringify(s.globalCommandBlacklist) ||
+			webFetchProxyMode !== s.webFetchProxyMode ||
+			webFetchProxyUrl !== s.webFetchProxyUrl ||
 			updateServerUrl !== (s.updateServerUrl ?? "") ||
 			updateChannel !== (s.updateChannel ?? "stable") ||
 			updateAutoDownload !== (s.updateAutoDownload ?? false)
@@ -471,6 +482,8 @@ function SettingsPage() {
 		globalBlacklistDirs,
 		globalCommandWhitelist,
 		globalCommandBlacklist,
+		webFetchProxyMode,
+		webFetchProxyUrl,
 		updateServerUrl,
 		updateChannel,
 		updateAutoDownload,
@@ -537,6 +550,14 @@ function SettingsPage() {
 					blacklistDirs: globalBlacklistDirs,
 					commandWhitelist: globalCommandWhitelist,
 					commandBlacklist: globalCommandBlacklist,
+					webFetchPolicy: {
+						proxy: {
+							mode: webFetchProxyMode as "direct" | "system" | "custom",
+							...(webFetchProxyMode === "custom" && webFetchProxyUrl
+								? { url: webFetchProxyUrl }
+								: {}),
+						},
+					},
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -603,6 +624,8 @@ function SettingsPage() {
 						globalBlacklistDirs,
 						globalCommandWhitelist,
 						globalCommandBlacklist,
+						webFetchProxyMode,
+						webFetchProxyUrl,
 						updateServerUrl,
 						updateChannel,
 						updateAutoDownload,
@@ -718,6 +741,10 @@ function SettingsPage() {
 							setGlobalCommandWhitelist={setGlobalCommandWhitelist}
 							globalCommandBlacklist={globalCommandBlacklist}
 							setGlobalCommandBlacklist={setGlobalCommandBlacklist}
+							webFetchProxyMode={webFetchProxyMode}
+							setWebFetchProxyMode={setWebFetchProxyMode}
+							webFetchProxyUrl={webFetchProxyUrl}
+							setWebFetchProxyUrl={setWebFetchProxyUrl}
 							userPrefs={userPrefs}
 							updateUserPref={updateUserPref}
 						/>

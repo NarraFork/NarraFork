@@ -814,7 +814,7 @@ export const api = {
 		}),
 
 	// File modifications
-	getFileModifications: (narratorId: string) =>
+	getFileModifications: (narratorId: string, upToMessageId?: string) =>
 		request<{
 			files: Array<{
 				filePath: string;
@@ -829,10 +829,17 @@ export const api = {
 					createdAt: string;
 				}>;
 			}>;
-		}>(`/narrators/${narratorId}/file-modifications`),
-	getFileDiff: (narratorId: string, snapshotId: string) =>
+			timeline: Array<{
+				messageId: string;
+				createdAt: string;
+				seq: number;
+			}>;
+		}>(
+			`/narrators/${narratorId}/file-modifications${upToMessageId ? `?upToMessageId=${upToMessageId}` : ""}`,
+		),
+	getFileDiff: (narratorId: string, snapshotId: string, upToMessageId?: string) =>
 		request<{ filePath: string; original: string | null; current: string | null }>(
-			`/narrators/${narratorId}/patches/${snapshotId}/diff`,
+			`/narrators/${narratorId}/patches/${snapshotId}/diff${upToMessageId ? `?upToMessageId=${upToMessageId}` : ""}`,
 		),
 	revertFile: (narratorId: string, filePath: string) =>
 		request<{ success: boolean; originalExists: boolean }>(`/narrators/${narratorId}/revert-file`, {

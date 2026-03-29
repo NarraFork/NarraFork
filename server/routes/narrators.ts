@@ -1130,6 +1130,7 @@ narratorRoutes.get("/:id/patches", async (c) => {
 narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	const narratorId = c.req.param("id");
 	const patchId = c.req.param("patchId");
+	const upToMessageId = c.req.query("upToMessageId");
 
 	const snap = await db.query.narratorFileSnapshots.findFirst({
 		where: and(
@@ -1139,7 +1140,25 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	});
 	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
 
-	const currentContent = await rebuildFileState(narratorId, snap.filePath);
+	let currentContent: string | null;
+	if (upToMessageId) {
+		// Find the seq for the target message
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, upToMessageId),
+			),
+			columns: { seq: true },
+		});
+		if (ref) {
+			const states = await rebuildFileStatesUpToSeq(narratorId, ref.seq);
+			currentContent = states.get(snap.filePath) ?? snap.originalContent;
+		} else {
+			return c.json({ error: "Message not found in this narrator" }, 404);
+		}
+	} else {
+		currentContent = await rebuildFileState(narratorId, snap.filePath);
+	}
 
 	return c.json({
 		filePath: snap.filePath,
@@ -1276,34 +1295,59 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 /** Get aggregated file modification summary for a narrator */
 narratorRoutes.get("/:id/file-modifications", async (c) => {
 	const narratorId = c.req.param("id");
+	const upToMessageId = c.req.query("upToMessageId");
 
 	const snapshots = await db.query.narratorFileSnapshots.findMany({
 		where: eq(narratorFileSnapshots.narratorId, narratorId),
 		orderBy: asc(narratorFileSnapshots.createdAt),
 	});
-	if (snapshots.length === 0) return c.json({ files: [] });
+	if (snapshots.length === 0) return c.json({ files: [], timeline: [] });
 
+	// Always query all tool calls first to build the timeline
 	const allToolCalls = await queryOrderedToolCalls(narratorId);
-	const grouped = groupByFile(allToolCalls);
 
-	const files = snapshots.map((snap) => {
-		const ops = grouped.get(snap.filePath) ?? [];
-		return {
-			filePath: snap.filePath,
-			snapshotId: snap.id,
-			originalExists: snap.originalContent !== null,
-			editCount: ops.length,
-			lastModifiedAt: ops.length > 0 ? ops[ops.length - 1].createdAt : snap.createdAt,
-			operations: ops.map((op) => ({
-				toolUseId: op.toolUseId,
-				toolName: op.toolName,
-				messageId: op.messageId,
-				createdAt: op.createdAt,
-			})),
-		};
-	});
+	// Build timeline: unique messageIds in order of first appearance
+	const seenMessages = new Set<string>();
+	const timeline: Array<{ messageId: string; createdAt: string; seq: number }> = [];
+	for (const tc of allToolCalls) {
+		if (!seenMessages.has(tc.messageId)) {
+			seenMessages.add(tc.messageId);
+			timeline.push({ messageId: tc.messageId, createdAt: tc.createdAt, seq: tc.seq });
+		}
+	}
 
-	return c.json({ files });
+	// If upToMessageId is specified, find its seq and filter tool calls
+	let filteredToolCalls = allToolCalls;
+	if (upToMessageId) {
+		const targetEntry = timeline.find((t) => t.messageId === upToMessageId);
+		if (targetEntry) {
+			filteredToolCalls = allToolCalls.filter((tc) => tc.seq <= targetEntry.seq);
+		}
+	}
+
+	const grouped = groupByFile(filteredToolCalls);
+
+	const files = snapshots
+		.map((snap) => {
+			const ops = grouped.get(snap.filePath) ?? [];
+			if (upToMessageId && ops.length === 0) return null; // hide files with no ops in filtered mode
+			return {
+				filePath: snap.filePath,
+				snapshotId: snap.id,
+				originalExists: snap.originalContent !== null,
+				editCount: ops.length,
+				lastModifiedAt: ops.length > 0 ? ops[ops.length - 1].createdAt : snap.createdAt,
+				operations: ops.map((op) => ({
+					toolUseId: op.toolUseId,
+					toolName: op.toolName,
+					messageId: op.messageId,
+					createdAt: op.createdAt,
+				})),
+			};
+		})
+		.filter(Boolean);
+
+	return c.json({ files, timeline });
 });
 
 /** Revert a single file to its original state (before narrator touched it) */

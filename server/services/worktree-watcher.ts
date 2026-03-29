@@ -1,8 +1,8 @@
-import { type FSWatcher, watch } from "node:fs";
+import { type FSWatcher, readdirSync, statSync, watch } from "node:fs";
+import { join } from "node:path";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
-import { toForwardSlash } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { commitSyncService } from "./commit-sync-service";
@@ -11,15 +11,18 @@ import { gitService } from "./git-service";
 /** Debounce interval for file change events (ms). */
 const DEBOUNCE_MS = 1500;
 
+// ── Directory-level ignore (prevents inotify registration entirely) ─────────
+
 /**
- * Patterns to ignore when receiving fs.watch events.
- * These fire constantly during git operations, builds, package installs, etc.
- * On Linux, fs.watch({ recursive: true }) uses inotify which still delivers
- * events for these directories — the callback filters them, but the kernel
- * overhead of dispatching thousands of events per second can saturate a CPU core.
- * Keep this list comprehensive to minimize wasted event processing.
+ * Directories to skip during tree walk.
+ *
+ * Unlike the old approach (recursive fs.watch + JS callback filter), these
+ * directories are never watched at all — no inotify watch is registered, so
+ * the kernel never delivers events for them. This is the key to avoiding CPU
+ * saturation on Linux where Bun ≤1.3 registers per-file inotify watches
+ * inside recursive fs.watch (see oven-sh/bun#28290).
  */
-const IGNORE_PATTERNS = [
+const SKIP_DIRS = new Set([
 	".git",
 	"node_modules",
 	".next",
@@ -40,78 +43,102 @@ const IGNORE_PATTERNS = [
 	".gradle",
 	".idea",
 	".vscode",
-	".DS_Store",
-	"Thumbs.db",
 	"coverage",
 	".nyc_output",
 	".pytest_cache",
 	".mypy_cache",
 	".ruff_cache",
 	".tox",
-	"*.swp",
-	"*.swo",
-];
+	".worktrees",
+]);
 
-/** Patterns matched by exact filename (no path prefix check needed). */
-const IGNORE_EXACT = new Set([".DS_Store", "Thumbs.db"]);
+// ── File-level ignore (callback filter for individual file events) ──────────
 
-/** Patterns matched by extension (glob-like entries starting with *). */
-const IGNORE_EXTENSIONS: string[] = [];
+const IGNORE_FILES = new Set([".DS_Store", "Thumbs.db"]);
+const IGNORE_EXTENSIONS = [".swp", ".swo"];
 
-/** Patterns matched by directory prefix. */
-const IGNORE_DIRS: string[] = [];
-
-// Pre-partition patterns for faster matching
-for (const p of IGNORE_PATTERNS) {
-	if (p.startsWith("*.")) {
-		IGNORE_EXTENSIONS.push(p.slice(1)); // e.g. ".swp"
-	} else if (!IGNORE_EXACT.has(p)) {
-		IGNORE_DIRS.push(p);
-	}
-}
-
-function shouldIgnore(filename: string | null): boolean {
+function shouldIgnoreFile(filename: string | null): boolean {
 	if (!filename) return true;
-	const fwd = toForwardSlash(filename);
-	if (IGNORE_EXACT.has(fwd)) return true;
+	if (IGNORE_FILES.has(filename)) return true;
 	for (const ext of IGNORE_EXTENSIONS) {
-		if (fwd.endsWith(ext)) return true;
-	}
-	for (const dir of IGNORE_DIRS) {
-		if (fwd === dir || fwd.startsWith(`${dir}/`)) return true;
+		if (filename.endsWith(ext)) return true;
 	}
 	return false;
 }
 
-/**
- * Rate limiter: tracks event count in a sliding window.
- * When the rate exceeds the threshold, events are suppressed until the window resets.
- */
+// ── Rate limiter ────────────────────────────────────────────────────────────
+
 const RATE_WINDOW_MS = 2000;
-const RATE_LIMIT = 200; // max events per window before suppression
+const RATE_LIMIT = 200;
 
 interface RateLimitState {
-	/** Timestamp of the current window start. */
 	windowStart: number;
-	/** Number of events in the current window. */
 	count: number;
-	/** Whether we've already logged a warning for this suppression burst. */
 	warned: boolean;
 }
 
+// ── Watcher entry ───────────────────────────────────────────────────────────
+
 interface WatcherEntry {
-	watcher: FSWatcher;
+	/** One non-recursive FSWatcher per watched directory. */
+	watchers: Map<string, FSWatcher>;
 	chapterId: string;
-	/** Narrator IDs currently interested in this worktree. */
 	narratorIds: Set<string>;
-	/** Locale for commit threshold messages (from the first narrator that registered). */
 	locale: Locale;
 	debounceTimer?: ReturnType<typeof setTimeout>;
-	/** Last known HEAD SHA — used to detect new commits. */
 	lastHeadSha?: string;
-	/** Rate limiter state for this watcher. */
 	rateLimit: RateLimitState;
 }
+
+// ── Tree walk + per-directory watch ─────────────────────────────────────────
+
+/**
+ * Recursively walk `rootPath`, registering a non-recursive `fs.watch()` on
+ * every directory whose name is not in {@link SKIP_DIRS}.
+ *
+ * Returns a `Map<absoluteDirPath, FSWatcher>`.
+ */
+function walkAndWatch(
+	rootPath: string,
+	onEvent: (dirPath: string, eventType: string, filename: string | null) => void,
+	onError: (dirPath: string, err: Error) => void,
+): Map<string, FSWatcher> {
+	const watchers = new Map<string, FSWatcher>();
+
+	function addWatch(dirPath: string): void {
+		if (watchers.has(dirPath)) return;
+		try {
+			const w = watch(dirPath, (eventType, filename) => {
+				onEvent(dirPath, eventType, filename);
+			});
+			w.on("error", (err) => onError(dirPath, err));
+			watchers.set(dirPath, w);
+		} catch {
+			// Directory may have been removed between readdir and watch
+		}
+	}
+
+	function walk(dirPath: string): void {
+		addWatch(dirPath);
+		let entries: import("node:fs").Dirent[];
+		try {
+			entries = readdirSync(dirPath, { withFileTypes: true }) as import("node:fs").Dirent[];
+		} catch {
+			return; // Permission denied or removed
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const name = String(entry.name);
+			if (SKIP_DIRS.has(name)) continue;
+			walk(join(dirPath, name));
+		}
+	}
+
+	walk(rootPath);
+	return watchers;
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
 
 export const worktreeWatcher = {
 	_entries: hotSafe<Map<string, WatcherEntry>>(
@@ -119,12 +146,10 @@ export const worktreeWatcher = {
 		() => new Map(),
 	),
 
-	/** Get the number of active watchers (for diagnostics). */
 	getActiveCount(): number {
 		return this._entries.size;
 	},
 
-	/** Get active watcher paths and their narrator counts (for diagnostics). */
 	getActivePaths(): Array<{ path: string; chapterId: string; narratorCount: number }> {
 		const result: Array<{ path: string; chapterId: string; narratorCount: number }> = [];
 		for (const [path, entry] of this._entries) {
@@ -140,6 +165,11 @@ export const worktreeWatcher = {
 	/**
 	 * Start watching a worktree directory for file changes.
 	 * Multiple narrators can share the same watcher (same chapter).
+	 *
+	 * Instead of a single recursive `fs.watch` (which on Linux/Bun registers
+	 * inotify watches on every file including `.git/objects`), we manually walk
+	 * the directory tree and create one non-recursive watcher per directory,
+	 * skipping {@link SKIP_DIRS} entirely so no inotify resources are wasted.
 	 */
 	watch(worktreePath: string, chapterId: string, narratorId: string, locale: Locale): void {
 		const existing = this._entries.get(worktreePath);
@@ -154,27 +184,63 @@ export const worktreeWatcher = {
 		}
 
 		try {
-			const fsWatcher = watch(worktreePath, { recursive: true }, (_eventType, filename) => {
-				if (shouldIgnore(filename)) return;
-				this._onFileChange(worktreePath);
-			});
-
-			fsWatcher.on("error", (err) => {
-				logger.warn("Worktree watcher error", {
-					worktreePath,
-					error: String(err),
-				});
-				// Clean up broken watcher
-				this._removeEntry(worktreePath);
-			});
-
 			const entry: WatcherEntry = {
-				watcher: fsWatcher,
+				watchers: new Map(),
 				chapterId,
 				narratorIds: new Set([narratorId]),
 				locale,
 				rateLimit: { windowStart: Date.now(), count: 0, warned: false },
 			};
+
+			const onEvent = (dirPath: string, eventType: string, filename: string | null) => {
+				if (shouldIgnoreFile(filename)) return;
+
+				// Detect newly created subdirectories and start watching them.
+				// On Linux, `rename` is emitted for both creation and deletion.
+				if (eventType === "rename" && filename) {
+					const fullPath = join(dirPath, filename);
+					if (!SKIP_DIRS.has(filename) && !entry.watchers.has(fullPath)) {
+						try {
+							const st = statSync(fullPath);
+							if (st.isDirectory()) {
+								// Recursively watch the new subtree
+								const newWatchers = walkAndWatch(fullPath, onEvent, onError);
+								for (const [p, w] of newWatchers) {
+									entry.watchers.set(p, w);
+								}
+							}
+						} catch {
+							// Path was deleted or inaccessible — ignore
+						}
+					}
+				}
+
+				this._onFileChange(worktreePath);
+			};
+
+			const onError = (dirPath: string, err: Error) => {
+				// A single sub-watcher errored (directory removed, etc.)
+				// Close just that watcher; the rest keep running.
+				const w = entry.watchers.get(dirPath);
+				if (w) {
+					try {
+						w.close();
+					} catch {}
+					entry.watchers.delete(dirPath);
+				}
+				logger.debug("Worktree sub-watcher error (removed)", {
+					dirPath,
+					error: String(err),
+				});
+				// If ALL watchers are gone, clean up the entry entirely
+				if (entry.watchers.size === 0) {
+					logger.warn("Worktree watcher: all sub-watchers lost", { worktreePath });
+					this._removeEntry(worktreePath);
+				}
+			};
+
+			const watchers = walkAndWatch(worktreePath, onEvent, onError);
+			entry.watchers = watchers;
 
 			this._entries.set(worktreePath, entry);
 
@@ -192,7 +258,8 @@ export const worktreeWatcher = {
 				worktreePath,
 				chapterId,
 				narratorId,
-				activeWatchers: this._entries.size,
+				dirWatchers: watchers.size,
+				activeEntries: this._entries.size,
 			});
 		} catch (err) {
 			logger.warn("Failed to start worktree watcher", {
@@ -215,7 +282,7 @@ export const worktreeWatcher = {
 			this._removeEntry(worktreePath);
 			logger.info("Worktree watcher stopped (no narrators left)", {
 				worktreePath,
-				activeWatchers: this._entries.size,
+				activeEntries: this._entries.size,
 			});
 		} else {
 			logger.debug("Worktree watcher: narrator removed", {
@@ -234,7 +301,7 @@ export const worktreeWatcher = {
 			this._removeEntry(worktreePath);
 			logger.info("Worktree watcher force-stopped", {
 				worktreePath,
-				activeWatchers: this._entries.size,
+				activeEntries: this._entries.size,
 			});
 		}
 	},
@@ -242,8 +309,6 @@ export const worktreeWatcher = {
 	/** Shut down all watchers (server shutdown or startup recovery). */
 	shutdown(): void {
 		const count = this._entries.size;
-		// Snapshot keys first — _removeEntry mutates the Map, and deleting
-		// during for..of iteration can skip entries on some engines.
 		const paths = [...this._entries.keys()];
 		for (const path of paths) {
 			this._removeEntry(path);
@@ -258,14 +323,9 @@ export const worktreeWatcher = {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
 
-		// Rate limiting: suppress excessive events to prevent CPU saturation.
-		// On Linux, fs.watch({ recursive: true }) can fire thousands of inotify
-		// events per second during builds/installs even for ignored directories,
-		// because the kernel delivers events before our JS callback can filter them.
 		const now = Date.now();
 		const rl = entry.rateLimit;
 		if (now - rl.windowStart > RATE_WINDOW_MS) {
-			// Reset window
 			rl.windowStart = now;
 			rl.count = 0;
 			rl.warned = false;
@@ -343,7 +403,6 @@ export const worktreeWatcher = {
 				});
 			}
 		} else if (currentHead && !entry.lastHeadSha) {
-			// First time we got a HEAD — just record it
 			entry.lastHeadSha = currentHead;
 		}
 
@@ -355,11 +414,12 @@ export const worktreeWatcher = {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
 		if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
-		try {
-			entry.watcher.close();
-		} catch {
-			// Watcher may already be closed
+		for (const w of entry.watchers.values()) {
+			try {
+				w.close();
+			} catch {}
 		}
+		entry.watchers.clear();
 		this._entries.delete(worktreePath);
 	},
 };

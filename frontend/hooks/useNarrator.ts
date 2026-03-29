@@ -49,18 +49,27 @@ export function useNarratorsPaginated(opts?: {
 
 // --- File modifications ---
 
-export function useFileModifications(narratorId: string, enabled = true) {
+export function useFileModifications(
+	narratorId: string,
+	enabled = true,
+	upToMessageId?: string | null,
+) {
 	return useQuery({
-		queryKey: ["narrators", narratorId, "file-modifications"],
-		queryFn: () => api.getFileModifications(narratorId),
+		queryKey: ["narrators", narratorId, "file-modifications", upToMessageId ?? "all"],
+		queryFn: () => api.getFileModifications(narratorId, upToMessageId ?? undefined),
 		enabled,
 	});
 }
 
-export function useFileDiff(narratorId: string, snapshotId: string, enabled = false) {
+export function useFileDiff(
+	narratorId: string,
+	snapshotId: string,
+	enabled = false,
+	upToMessageId?: string | null,
+) {
 	return useQuery({
-		queryKey: ["narrators", narratorId, "file-diff", snapshotId],
-		queryFn: () => api.getFileDiff(narratorId, snapshotId),
+		queryKey: ["narrators", narratorId, "file-diff", snapshotId, upToMessageId ?? "all"],
+		queryFn: () => api.getFileDiff(narratorId, snapshotId, upToMessageId ?? undefined),
 		enabled: enabled && !!snapshotId,
 	});
 }

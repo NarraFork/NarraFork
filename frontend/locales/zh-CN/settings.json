@@ -563,5 +563,12 @@
 	"modelTestRun": "发送测试",
 	"modelTestRunning": "测试中…",
 	"modelTestResult": "模型输出",
-	"modelTestBtn": "测试"
+	"modelTestBtn": "测试",
+	"webFetchProxy": "WebFetch 代理",
+	"webFetchProxyDesc": "WebFetch HTTP 请求和浏览器页面抓取的代理模式。",
+	"webFetchProxyDirect": "直连（不使用代理）",
+	"webFetchProxySystem": "系统代理（自动检测）",
+	"webFetchProxyCustom": "自定义代理",
+	"webFetchProxyUrl": "代理地址",
+	"webFetchProxyUrlPlaceholder": "例如 http://127.0.0.1:7890、socks5://proxy:1080"
 }

@@ -214,6 +214,18 @@ export interface NarraForkSettings {
 			whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
 			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
+			/** Proxy configuration for WebFetch HTTP requests and browser. */
+			proxy?: {
+				/**
+				 * Proxy mode:
+				 * - "direct": no proxy
+				 * - "system": auto-detect from HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars
+				 * - "custom": use the manually specified URL
+				 */
+				mode: "direct" | "system" | "custom";
+				/** Proxy URL, only used when mode is "custom". */
+				url?: string;
+			};
 		};
 		/**
 		 * Context window management thresholds (percentage, 0–100).
