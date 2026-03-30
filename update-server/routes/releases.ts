@@ -220,6 +220,58 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		return c.json({ releases });
 	});
 
+	// POST /api/v2/products/:product/releases/:version/promote
+	// Promote a release from beta to stable (or change channel).
+	routes.post("/:product/releases/:version/promote", requireAuth("upload"), async (c) => {
+		const product = c.req.param("product") as string;
+		const version = c.req.param("version") as string;
+
+		let targetChannel = "stable";
+		try {
+			const body = await c.req.json();
+			if (body?.channel && typeof body.channel === "string") {
+				targetChannel = body.channel;
+			}
+		} catch {
+			// no body or invalid JSON — default to stable
+		}
+
+		if (targetChannel !== "stable" && targetChannel !== "beta") {
+			return c.json({ error: "Invalid channel (must be 'stable' or 'beta')" }, 400);
+		}
+
+		const meta = await withMetaLock(product, version, async () => {
+			const metaPath = `products/${product}/releases/${version}/meta.json`;
+			const existingMeta = await storage.getFile(metaPath);
+			if (!existingMeta) return null;
+
+			const m = JSON.parse(existingMeta.toString("utf-8")) as ReleaseMeta;
+			const oldChannel = m.channel;
+			m.channel = targetChannel as "stable" | "beta";
+			await storage.saveFile(metaPath, Buffer.from(JSON.stringify(m, null, "\t")));
+
+			logger.info("Promoted release", {
+				product,
+				version,
+				from: oldChannel,
+				to: targetChannel,
+			});
+			return m;
+		});
+
+		if (!meta) {
+			return c.json({ error: "Release not found" }, 404);
+		}
+
+		setCachedRelease(product, meta);
+		return c.json({
+			success: true,
+			version,
+			channel: targetChannel,
+			platforms: Object.keys(meta.platforms),
+		});
+	});
+
 	// DELETE /api/v2/products/:product/releases/:version
 	routes.delete("/:product/releases/:version", requireAuth("admin"), async (c) => {
 		const product = c.req.param("product") as string;

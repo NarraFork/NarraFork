@@ -51,7 +51,7 @@ import { OverseerNavItem } from "../components/nav/OverseerNavItem";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
 import { SummaryModelPickerModal } from "../components/settings/SummaryModelPickerModal";
-import { UpdateIndicator } from "../components/UpdateAvailableBanner";
+import { UpdateBadge } from "../components/UpdateBadge";
 import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
@@ -365,7 +365,7 @@ function AuthenticatedLayout() {
 								{t("appName")}
 							</Title>
 						</Tooltip>
-						<UpdateIndicator />
+						<UpdateBadge />
 						{!searchOpen && (
 							<Title order={3} hiddenFrom="sm">
 								{t("appName")}

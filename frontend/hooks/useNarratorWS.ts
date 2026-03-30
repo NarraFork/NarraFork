@@ -352,6 +352,10 @@ export function useNarratorWS(
 						}
 						break;
 						break;
+							data.position as number,
+							data.queueDepth as number,
+						);
+						break;
 					case "web_search":
 						callbacksRef.current.onWebSearch?.(
 							data.id as string,

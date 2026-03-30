@@ -234,11 +234,14 @@ interface V2CheckResponse {
 	}>;
 }
 
+const DEFAULT_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
+
 /**
  * Build the base URL for the update server (strips trailing slash).
+ * Falls back to the default update server when the configured URL is empty.
  */
 function getServerBaseUrl(): string {
-	const url = settings.update?.serverUrl ?? "";
+	const url = settings.update?.serverUrl || DEFAULT_UPDATE_SERVER_URL;
 	return url.replace(/\/+$/, "");
 }
 

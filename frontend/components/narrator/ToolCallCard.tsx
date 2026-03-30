@@ -732,9 +732,19 @@ function ToolHeader({
 		</Group>
 	);
 
+	const handleClick = useCallback(
+		(e: React.MouseEvent) => {
+			// When Ctrl/Cmd or Shift is held, skip toggle — let the event bubble
+			// up to the outer selection handler so the card is only selected.
+			if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+			onToggle?.();
+		},
+		[onToggle],
+	);
+
 	return (
 		<UnstyledButton
-			onClick={onToggle}
+			onClick={handleClick}
 			w="100%"
 			style={{
 				...(onToggle ? {} : { cursor: "default", pointerEvents: "none" as const }),
@@ -2136,7 +2146,13 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 						{denyFeedback}
 					</Text>
 				)}
-				<UnstyledButton onClick={() => setPlanExpanded((o) => !o)} w="100%">
+				<UnstyledButton
+					onClick={(e: React.MouseEvent) => {
+						if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+						setPlanExpanded((o) => !o);
+					}}
+					w="100%"
+				>
 					<Group gap={4} mb={4}>
 						{planExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 						<Text size="xs" c="dimmed">
@@ -2982,7 +2998,13 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 
 	return (
 		<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
-			<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%">
+			<UnstyledButton
+				onClick={(e: React.MouseEvent) => {
+					if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+					setExpanded((o) => !o);
+				}}
+				w="100%"
+			>
 				<Group gap={5} wrap="nowrap">
 					<ThemeIcon size={16} variant="light" color={color} radius="sm">
 						<Icon size={10} />

@@ -11,11 +11,13 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
+import { UpdateModal, type UpdateModalData } from "../UpdateModal";
 import { DependencyStatus } from "./DependencyStatus";
 
 const HOST_PRESETS = ["localhost", "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
@@ -82,6 +84,9 @@ export function ServerSystemSection({
 	const { t } = useTranslation("settings");
 	const [checking, setChecking] = useState(false);
 	const [checkResult, setCheckResult] = useState<string | null>(null);
+	const [updateModalOpened, { open: openUpdateModal, close: closeUpdateModal }] =
+		useDisclosure(false);
+	const [updateData, setUpdateData] = useState<UpdateModalData>({});
 
 	return (
 		<Stack>
@@ -205,7 +210,17 @@ export function ServerSystemSection({
 						try {
 							const result = await api.checkUpdate();
 							if (result.updateAvailable && result.latestVersion) {
-								setCheckResult(t("updateFoundVersion", { version: result.latestVersion }));
+								setUpdateData({
+									latestVersion: result.latestVersion,
+									currentVersion: result.currentVersion,
+									releaseInfo: result.releaseInfo,
+									releaseNotes: result.releaseInfo?.releaseNotes,
+									releaseNotesPerVersion: result.releaseInfo?.releaseNotesPerVersion,
+									releaseDate: result.releaseInfo?.releaseDate,
+									downloadSize: result.downloadSize,
+									totalSize: result.totalSize,
+								});
+								openUpdateModal();
 							} else {
 								setCheckResult(t("noUpdateAvailable"));
 							}
@@ -224,6 +239,8 @@ export function ServerSystemSection({
 					</Text>
 				)}
 			</Group>
+
+			<UpdateModal opened={updateModalOpened} onClose={closeUpdateModal} data={updateData} />
 
 			{/* System Dependencies */}
 			<Title order={5} mt="sm">

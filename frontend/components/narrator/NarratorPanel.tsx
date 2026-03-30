@@ -2644,6 +2644,17 @@ export function NarratorPanel({
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
+				// Optimistically set narrator status to "thinking" so the UI shows
+				// the work indicator immediately.  This guards against the race where
+				// the WS subscribe message hasn't been processed by the server yet
+				// when the backend broadcasts the status_change event — without this,
+				// the frontend stays stuck on "idle" until the user navigates away
+				// and back.
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old && old.status !== "thinking"
+						? { ...old, status: "thinking", turnStartedAt: new Date().toISOString() }
+						: old,
+				);
 			}
 		} catch (err) {
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
@@ -2658,6 +2669,10 @@ export function NarratorPanel({
 				pages[0] = firstPage;
 				return { ...old, pages };
 			});
+			// Roll back the optimistic narrator status set above
+			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+				old?.status === "thinking" ? { ...old, status: "idle" } : old,
+			);
 			const message = err instanceof Error ? err.message : "Failed to send message";
 			notifications.show({ title: "Error", message, color: "red" });
 		} finally {
@@ -3740,6 +3755,9 @@ export function NarratorPanel({
 							<Text size="xs" c="dimmed">
 								{t(`status_${narrator.status}`)}
 							</Text>
+								<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
+								</Text>
+							)}
 							{turnElapsedText && (
 								<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 									· {t("lastTurnDuration", { duration: turnElapsedText })}

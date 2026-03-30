@@ -239,6 +239,11 @@ export type NarratorServerMessage =
 			quotaBalance: number | null;
 	  }
 	| {
+			narratorId: string;
+			position: number;
+			queueDepth: number;
+	  }
+	| {
 			type: "streaming_snapshot";
 			narratorId: string;
 			streamingText: string;

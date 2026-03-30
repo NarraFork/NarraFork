@@ -1094,28 +1094,35 @@ export async function handlePermission(
 
 	let effectiveInput = input;
 
-	// ExitPlanMode: auto-resolve plan content from the designated plan file,
-	// then reject early if plan is still empty after all resolution attempts.
+	// ExitPlanMode: resolve plan content from the designated plan file (preferred)
+	// or fall back to inline `plan` parameter, then reject if still empty.
 	if (toolName === "ExitPlanMode") {
-		// Step 1: When the model omits `plan` (or passes empty/reference text),
-		// read the plan file so the permission UI and execute() receive the actual content.
-		const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
-		if (!inlinePlan) {
-			const active = activeNarrators.get(narratorId);
-			const planFileId = active?._planFileId;
-			if (planFileId) {
-				const planFileName = `.narrafork/plan-${planFileId}.md`;
-				const absPath = resolve(cwd, planFileName);
-				try {
-					if (existsSync(absPath)) {
-						const content = readFileSync(absPath, "utf-8");
-						if (content.trim()) {
-							effectiveInput = { ...effectiveInput, plan: content };
-						}
+		// Step 1: Always prefer the plan file content over inline `plan` parameter.
+		// This ensures the user reviews the actual file the model wrote, not a
+		// potentially stale or duplicated inline copy.
+		const active = activeNarrators.get(narratorId);
+		const planFileId = active?._planFileId;
+		let resolvedFromFile = false;
+		if (planFileId) {
+			const planFileName = `.narrafork/plan-${planFileId}.md`;
+			const absPath = resolve(cwd, planFileName);
+			try {
+				if (existsSync(absPath)) {
+					const content = readFileSync(absPath, "utf-8");
+					if (content.trim()) {
+						effectiveInput = { ...effectiveInput, plan: content };
+						resolvedFromFile = true;
 					}
-				} catch {
-					// Ignore read errors — the empty-plan check below will catch it
 				}
+			} catch {
+				// Ignore read errors — fall through to inline plan or empty-plan check
+			}
+		}
+		// Fall back to inline `plan` parameter only when the file doesn't exist or is empty.
+		if (!resolvedFromFile) {
+			const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
+			if (inlinePlan) {
+				effectiveInput = { ...effectiveInput, plan: inlinePlan };
 			}
 		}
 

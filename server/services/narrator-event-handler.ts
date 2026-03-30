@@ -869,6 +869,14 @@ export async function processEvent(
 			return null;
 		}
 
+			dualBroadcast(ctx, {
+				narratorId: broadcastTargetId,
+				position: event.position,
+				queueDepth: event.queueDepth,
+			});
+			return null;
+		}
+
 		case "invalid_state": {
 			logger.warn("Agent invalid state event", {
 				narratorId,

@@ -825,6 +825,9 @@ export async function* agentLoop(
 					};
 				}
 				}
+					yield {
+					};
+				}
 				// Convert OpenAI/Anthropic usage to context_usage percentage
 				if (parsed.usage && parsed.usage.promptTokens != null) {
 					receivedUsage = true;

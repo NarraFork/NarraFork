@@ -606,7 +606,10 @@ settingsRoutes.patch("/", async (c) => {
 	const newPort = merged.server.port;
 	const newTls = merged.server.tls;
 	const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
-	const tlsChanged = JSON.stringify(oldTls) !== JSON.stringify(newTls);
+	// Compare TLS configs — treat undefined and {enabled:false} as equivalent (both mean "no TLS")
+	const oldTlsEffective = oldTls?.enabled ? oldTls : undefined;
+	const newTlsEffective = newTls?.enabled ? newTls : undefined;
+	const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
 	const needsRestart = serverAddressChanged || tlsChanged;
 
 	if (needsRestart) {

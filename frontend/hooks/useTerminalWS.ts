@@ -37,16 +37,29 @@ const DISCONNECTED_THRESHOLD = 3;
  * With exponential backoff capped at 30s this is roughly 25 minutes.
  */
 const MAX_RECONNECT_ATTEMPTS = 50;
+/** Close the connection if no server ping is received within this window. */
+const CLIENT_PING_TIMEOUT_MS = 60_000;
+/**
+ * How long the tab must be hidden before we force a reconnect on return.
+ * Matches the server heartbeat interval — if we missed at least one ping
+ * cycle, the connection state is unreliable.
+ */
+const VISIBILITY_RECONNECT_THRESHOLD_MS = 30_000;
 
 class TerminalWSManager {
 	private ws: WebSocket | null = null;
 	private listeners = new Map<string, Set<Listener>>();
 	private reconnectAttempts = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	private pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
 	private disposed = false;
 	private _connected = false;
 	private _disconnected = false;
 	private statusListeners = new Set<() => void>();
+
+	// --- Visibility change tracking ---
+	private _boundVisibilityHandler: (() => void) | null = null;
+	private _hiddenAt = 0;
 
 	get connected() {
 		return this._connected;
@@ -56,18 +69,34 @@ class TerminalWSManager {
 	}
 
 	connect() {
-		if (this.ws?.readyState === WebSocket.OPEN || this.disposed) return;
+		// Guard: prevent duplicate connections when already connected or connecting
+		if (this.ws || this.disposed) return;
+
+		this._listenVisibility();
+
 		const token = getToken();
-		const tokenQuery = token ? `token=${encodeURIComponent(token)}` : "";
+		if (!token) {
+			// No token yet — retry after a short delay instead of connecting
+			// with empty credentials (which would waste reconnect attempts).
+			this.reconnectTimer = setTimeout(() => this.connect(), 1000);
+			return;
+		}
+
+		const tokenQuery = `token=${encodeURIComponent(token)}`;
 		const ws = new WebSocket(buildWsUrl("/ws/terminal", tokenQuery));
 		this.ws = ws;
 
 		ws.onopen = () => {
+			if (this.disposed || this.ws !== ws) {
+				ws.close();
+				return;
+			}
 			this._connected = true;
 			this._disconnected = false;
 			this.reconnectAttempts = 0;
 			this.notifyStatus();
 			this.syncGlobalStatus();
+			this.resetPingTimeout();
 			// Re-subscribe all active terminals
 			const ids = [...this.listeners.keys()];
 			if (ids.length > 0) {
@@ -76,11 +105,13 @@ class TerminalWSManager {
 		};
 
 		ws.onmessage = (event) => {
+			if (this.disposed || this.ws !== ws) return;
 			try {
 				const msg = JSON.parse(event.data);
 				// Respond to server heartbeat ping
 				if (msg.type === "ping") {
 					ws.send(JSON.stringify({ type: "pong" }));
+					this.resetPingTimeout();
 					return;
 				}
 				this.handleMessage(msg);
@@ -90,6 +121,9 @@ class TerminalWSManager {
 		};
 
 		ws.onclose = (ev) => {
+			if (this.disposed || this.ws !== ws) return;
+			this.ws = null;
+			clearTimeout(this.pingTimeoutTimer);
 			this._connected = false;
 			this.notifyStatus();
 			this.syncGlobalStatus();
@@ -99,8 +133,7 @@ class TerminalWSManager {
 		};
 
 		ws.onerror = () => {
-			this._connected = false;
-			this.notifyStatus();
+			// onclose will fire after this — no need to schedule reconnect here
 		};
 	}
 
@@ -131,12 +164,73 @@ class TerminalWSManager {
 	/** Reset retry counter and reconnect immediately. */
 	resetReconnect() {
 		clearTimeout(this.reconnectTimer);
+		clearTimeout(this.pingTimeoutTimer);
 		this.reconnectAttempts = 0;
 		this._disconnected = false;
 		this.notifyStatus();
-		this.ws?.close();
+		const ws = this.ws;
 		this.ws = null;
+		if (ws) {
+			safeCloseWs(ws);
+		}
 		this.connect();
+	}
+
+	// -----------------------------------------------------------------------
+	// Ping timeout — detect half-open connections
+	// -----------------------------------------------------------------------
+
+	private resetPingTimeout(): void {
+		clearTimeout(this.pingTimeoutTimer);
+		this.pingTimeoutTimer = setTimeout(() => {
+			if (!this.disposed && this.ws?.readyState === WebSocket.OPEN) {
+				this.ws.close(4000, "ping timeout");
+			}
+		}, CLIENT_PING_TIMEOUT_MS);
+	}
+
+	// -----------------------------------------------------------------------
+	// Visibility change — recover from browser background throttling
+	// -----------------------------------------------------------------------
+
+	private _listenVisibility(): void {
+		if (this._boundVisibilityHandler) return;
+		this._boundVisibilityHandler = () => this._handleVisibilityChange();
+		document.addEventListener("visibilitychange", this._boundVisibilityHandler);
+	}
+
+	private _unlistenVisibility(): void {
+		if (this._boundVisibilityHandler) {
+			document.removeEventListener("visibilitychange", this._boundVisibilityHandler);
+			this._boundVisibilityHandler = null;
+		}
+	}
+
+	private _handleVisibilityChange(): void {
+		if (this.disposed) return;
+
+		if (document.visibilityState === "hidden") {
+			this._hiddenAt = Date.now();
+			return;
+		}
+
+		// visible
+		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
+		this._hiddenAt = 0;
+
+		// If reconnection was exhausted (ws is null, no pending timer), always
+		// try again when the tab becomes visible — this is the only automatic
+		// recovery path after MAX_RECONNECT_ATTEMPTS.
+		if (!this.ws && !this.reconnectTimer) {
+			this.resetReconnect();
+			return;
+		}
+
+		// Only act if the tab was hidden long enough for messages to be lost
+		if (elapsed < VISIBILITY_RECONNECT_THRESHOLD_MS) return;
+
+		// Force a clean reconnect
+		this.resetReconnect();
 	}
 
 	private syncGlobalStatus() {
@@ -229,7 +323,8 @@ class TerminalWSManager {
 	}
 
 	private ensureConnected() {
-		if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+		if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) {
+			this.ws = null;
 			this.connect();
 		}
 	}
@@ -250,11 +345,14 @@ class TerminalWSManager {
 
 	releaseConnection() {
 		clearTimeout(this.reconnectTimer);
+		clearTimeout(this.pingTimeoutTimer);
+		this._unlistenVisibility();
 		this.reconnectAttempts = 0;
 		this._connected = false;
 		this._disconnected = false;
-		safeCloseWs(this.ws);
+		const ws = this.ws;
 		this.ws = null;
+		safeCloseWs(ws);
 		removeWSStatus("terminal");
 	}
 

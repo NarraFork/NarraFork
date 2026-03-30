@@ -570,9 +570,16 @@ class NarratorWSManager {
 		}
 
 		// visible
-		if (!this._hiddenAt) return;
-		const elapsed = Date.now() - this._hiddenAt;
+		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
+
+		// If reconnection was exhausted (ws is null, no pending timer), always
+		// try again when the tab becomes visible — this is the only automatic
+		// recovery path after MAX_RECONNECT_ATTEMPTS.
+		if (!this.ws && !this.reconnectTimer) {
+			this.reconnect();
+			return;
+		}
 
 		// Only act if the tab was hidden long enough for messages to be lost
 		if (elapsed < VISIBILITY_RECONNECT_THRESHOLD_MS) return;

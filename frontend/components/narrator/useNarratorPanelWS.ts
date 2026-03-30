@@ -1276,6 +1276,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
+			},
 			onWebSearch: (id, status, query) => {
 				webSearchRef.current = { id, status, query };
 				flushStreamingVersion();

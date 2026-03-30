@@ -1,0 +1,349 @@
+import {
+	Alert,
+	Badge,
+	Button,
+	Code,
+	CopyButton,
+	Divider,
+	Group,
+	Modal,
+	Progress,
+	ScrollArea,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
+import {
+	IconAlertTriangle,
+	IconCheck,
+	IconCopy,
+	IconDownload,
+	IconPower,
+	IconX,
+} from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
+import { useUpdateApply, useUpdateDownload } from "../hooks/useUpdateCheck";
+
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Resolve localized release notes — supports plain string or { "en": "...", "zh-CN": "..." } */
+function resolveNotes(
+	notes: string | Record<string, string> | undefined,
+	lang: string,
+): string | undefined {
+	if (!notes) return undefined;
+	if (typeof notes === "string") return notes;
+	return notes[lang] ?? notes.en ?? Object.values(notes)[0];
+}
+
+export interface UpdateModalData {
+	latestVersion?: string;
+	currentVersion?: string;
+	releaseInfo?: {
+		version: string;
+		releaseDate: string;
+		releaseNotes?: string | Record<string, string>;
+		path: string;
+		sha512: string;
+		files: Array<{ url: string; size: number; sha512: string }>;
+		releaseNotesPerVersion?: Array<{
+			version: string;
+			releaseDate: string;
+			releaseNotes?: string | Record<string, string>;
+		}>;
+	};
+	releaseNotes?: string | Record<string, string>;
+	releaseNotesPerVersion?: Array<{
+		version: string;
+		releaseDate: string;
+		releaseNotes?: string | Record<string, string>;
+	}>;
+	releaseDate?: string;
+	downloadSize?: number;
+	totalSize?: number;
+}
+
+export interface UpdateModalProps {
+	opened: boolean;
+	onClose: () => void;
+	data: UpdateModalData;
+}
+
+export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
+	const { t, i18n } = useTranslation("common");
+	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
+	const { apply, isApplying, applyResult } = useUpdateApply();
+
+	const {
+		latestVersion,
+		releaseInfo,
+		releaseNotes,
+		releaseNotesPerVersion,
+		releaseDate,
+		downloadSize,
+		totalSize,
+	} = data;
+
+	const handleDownload = () => {
+		if (releaseInfo) {
+			download(releaseInfo);
+		}
+	};
+
+	const handleApply = async () => {
+		const { clearPwaCache } = await import("@frontend/lib/pwa");
+		await clearPwaCache();
+		await apply();
+	};
+
+	const handleClose = () => {
+		if (isDownloading) {
+			cancel();
+		}
+		reset();
+		onClose();
+	};
+
+	const savingsPercent =
+		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
+
+	const canApply = result?.success && result.instructions && !result.instructions.manual;
+	const serverStopped = applyResult?.success;
+	const downloadError = result && !result.success ? result.error : null;
+	const applyError = applyResult && !applyResult.success ? applyResult.error : null;
+
+	return (
+		<Modal
+			opened={opened}
+			onClose={handleClose}
+			title={t("updateDownloadTitle", { version: latestVersion })}
+			size="lg"
+			centered
+		>
+			<Stack gap="md">
+				{releaseDate && (
+					<Text size="xs" c="dimmed">
+						{new Date(releaseDate).toLocaleDateString(undefined, {
+							year: "numeric",
+							month: "long",
+							day: "numeric",
+						})}
+					</Text>
+				)}
+
+				{/* Release notes */}
+				<div>
+					<Text size="sm" fw={500} mb={4}>
+						{t("updateReleaseNotes")}
+					</Text>
+					<ScrollArea.Autosize mah={300}>
+						{releaseNotesPerVersion && releaseNotesPerVersion.length > 1 ? (
+							<Stack gap="md">
+								{releaseNotesPerVersion.map(
+									(v: {
+										version: string;
+										releaseDate: string;
+										releaseNotes?: string | Record<string, string>;
+									}) => {
+										const notes = resolveNotes(v.releaseNotes, i18n.language);
+										return (
+											<div key={v.version}>
+												<Group gap="xs" mb={4}>
+													<Badge size="xs" variant="light">
+														v{v.version}
+													</Badge>
+													<Text size="xs" c="dimmed">
+														{new Date(v.releaseDate).toLocaleDateString(undefined, {
+															year: "numeric",
+															month: "short",
+															day: "numeric",
+														})}
+													</Text>
+												</Group>
+												{notes ? (
+													<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+														{notes}
+													</Text>
+												) : (
+													<Text size="sm" c="dimmed" fs="italic">
+														{t("updateNoNotes")}
+													</Text>
+												)}
+											</div>
+										);
+									},
+								)}
+							</Stack>
+						) : (
+							(() => {
+								const notes = resolveNotes(releaseNotes, i18n.language);
+								return notes ? (
+									<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+										{notes}
+									</Text>
+								) : (
+									<Text size="sm" c="dimmed" fs="italic">
+										{t("updateNoNotes")}
+									</Text>
+								);
+							})()
+						)}
+					</ScrollArea.Autosize>
+				</div>
+
+				{savingsPercent > 0 && !result?.success && (
+					<Text size="xs" c="dimmed">
+						{t("updatePatchInfo", {
+							downloadSize: formatBytes(downloadSize ?? 0),
+							totalSize: formatBytes(totalSize ?? 0),
+						})}
+					</Text>
+				)}
+
+				<Divider />
+
+				{/* Download button */}
+				{!progress && !result && (
+					<Button fullWidth leftSection={<IconDownload size={16} />} onClick={handleDownload}>
+						{t("download")} ({formatBytes(downloadSize ?? totalSize ?? 0)})
+					</Button>
+				)}
+
+				{/* Download progress */}
+				{progress && !result && (
+					<>
+						<Text size="sm" c="dimmed">
+							{progress.phase === "checking" && t("updatePhaseChecking")}
+							{progress.phase === "downloading" && t("updatePhaseDownloading")}
+							{progress.phase === "applying" && t("updatePhaseApplying")}
+							{progress.phase === "complete" && t("updatePhaseComplete")}
+							{progress.phase === "error" && t("updatePhaseError")}
+						</Text>
+
+						{(progress.phase === "downloading" || progress.phase === "applying") && (
+							<>
+								<Progress value={progress.percent} size="lg" animated />
+								<Text size="xs" c="dimmed" ta="center">
+									{formatBytes(progress.bytesDownloaded)} / {formatBytes(progress.totalBytes)}
+								</Text>
+							</>
+						)}
+					</>
+				)}
+
+				{/* Download error */}
+				{downloadError && (
+					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
+						<Text size="sm">{downloadError}</Text>
+					</Alert>
+				)}
+
+				{/* Download complete — apply section */}
+				{canApply && !serverStopped && (
+					<Stack gap="sm">
+						<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
+							{t("updateDownloadComplete")}
+						</Alert>
+
+						<Text size="sm">{t("updateApplyDescription")}</Text>
+						<Button
+							fullWidth
+							color="red"
+							variant="light"
+							leftSection={<IconPower size={16} />}
+							onClick={handleApply}
+							loading={isApplying}
+						>
+							{t("updateStopAndApply")}
+						</Button>
+					</Stack>
+				)}
+
+				{/* Apply error */}
+				{applyError && (
+					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
+						<Text size="sm">{applyError}</Text>
+					</Alert>
+				)}
+
+				{/* Server stopped — show new binary path */}
+				{serverStopped && applyResult.newBinaryPath && (
+					<Stack gap="sm">
+						<Alert color="yellow" variant="light" icon={<IconPower size={16} />}>
+							{t("updateServerStopped")}
+						</Alert>
+
+						<Text size="sm">{t("updateRunNewBinary")}</Text>
+
+						<Group gap="xs" align="flex-start">
+							<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+								{applyResult.newBinaryPath}
+							</Code>
+							<CopyButton value={applyResult.newBinaryPath}>
+								{({ copied, copy }) => (
+									<Tooltip label={copied ? t("copied") : t("copy")}>
+										<Button
+											size="xs"
+											variant="subtle"
+											color={copied ? "green" : "gray"}
+											onClick={copy}
+										>
+											{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+										</Button>
+									</Tooltip>
+								)}
+							</CopyButton>
+						</Group>
+					</Stack>
+				)}
+
+				{/* Manual instructions (dev mode) */}
+				{result?.success && result.instructions?.manual && (
+					<Stack gap="sm">
+						<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
+							{t("updateDownloadComplete")}
+						</Alert>
+						<Text size="sm">{t("updateApplyInstructions")}</Text>
+						{result.instructions.command && (
+							<Group gap="xs" align="flex-start">
+								<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+									{result.instructions.command}
+								</Code>
+								<CopyButton value={result.instructions.command}>
+									{({ copied, copy }) => (
+										<Tooltip label={copied ? t("copied") : t("copy")}>
+											<Button
+												size="xs"
+												variant="subtle"
+												color={copied ? "green" : "gray"}
+												onClick={copy}
+											>
+												{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+											</Button>
+										</Tooltip>
+									)}
+								</CopyButton>
+							</Group>
+						)}
+					</Stack>
+				)}
+
+				<Group justify="flex-end" gap="sm">
+					{isDownloading ? (
+						<Button variant="subtle" color="red" onClick={cancel} leftSection={<IconX size={14} />}>
+							{t("cancel")}
+						</Button>
+					) : (
+						<Button variant="subtle" onClick={handleClose}>
+							{t("close")}
+						</Button>
+					)}
+				</Group>
+			</Stack>
+		</Modal>
+	);
+}

@@ -993,7 +993,14 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			parent.model ?? undefined,
 			settings.agent.defaultModel,
 		].filter((m): m is string => !!m);
-		resolvedModelInput = candidates.find((m) => poolSet.has(m)) ?? settings.agent.defaultModel;
+		resolvedModelInput = candidates.find((m) => poolSet.has(m));
+		if (!resolvedModelInput) {
+			throw new ValidationError(
+				`No candidate model is in the allowed pool for "${poolKey}" subagents. ` +
+					`Allowed models: ${allowedPool.join(", ")}. ` +
+					`Please specify one of these models explicitly.`,
+			);
+		}
 	} else {
 		resolvedModelInput = explicitModel || subagentPref || undefined;
 	}
