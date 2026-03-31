@@ -4,7 +4,6 @@ import {
 	useCallback,
 	useContext,
 	useEffect,
-	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -96,7 +95,12 @@ export function useBlurInOnAppear(animationId?: string | null) {
 	const registry = useContext(BlurInOnAppearContext);
 	const [shouldAnimate, setShouldAnimate] = useState(false);
 
-	useLayoutEffect(() => {
+	// Use useEffect instead of useLayoutEffect to avoid incrementing React 19's
+	// nested-update counter during the commit phase. Blur-in is a CSS-driven
+	// visual effect — applying the class one frame later is imperceptible and
+	// prevents "max update depth exceeded" when many BlurInAnimated instances
+	// mount in the same commit (e.g. streaming reasoning → finalized message).
+	useEffect(() => {
 		if (!registry || !animationId) {
 			// Only call setState when the value actually changes to avoid
 			// incrementing React's nested-update counter unnecessarily.

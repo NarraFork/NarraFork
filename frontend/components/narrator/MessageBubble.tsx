@@ -673,14 +673,12 @@ export function ReasoningSummary({
 	const effectiveOverflow = isStreaming ? true : isOverflow;
 	const canExpand = effectiveOverflow || hasTrailingContent;
 
-	// Collapse when canExpand becomes false — use render-time guard to avoid
-	// a useLayoutEffect setState that counts toward the nested-update limit.
-	if (!canExpand && expanded) {
-		// Safe: React allows a single setState during render when the value
-		// actually changes, and it will re-render synchronously without
-		// incrementing the nested-update counter the same way useLayoutEffect does.
-		setExpanded(false);
-	}
+	// Derive the effective expanded state instead of using render-time setState.
+	// In React 19, render-time setState increments the nested-update counter
+	// just like useLayoutEffect setState, so the old `if (!canExpand && expanded)
+	// setExpanded(false)` pattern contributed to "max update depth exceeded"
+	// when many BlurInAnimated instances mount in the same commit.
+	const effectiveExpanded = canExpand && expanded;
 
 	return (
 		<Box style={{ flex: 1, minWidth: 0 }}>
@@ -726,7 +724,7 @@ export function ReasoningSummary({
 								height: 16,
 							}}
 						>
-							{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+							{effectiveExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 						</Box>
 					</Group>
 				</UnstyledButton>
@@ -758,7 +756,7 @@ export function ReasoningSummary({
 				</Box>
 			)}
 			{canExpand && (
-				<LazyCollapse in={expanded}>
+				<LazyCollapse in={effectiveExpanded}>
 					<Box
 						mt={4}
 						style={{
