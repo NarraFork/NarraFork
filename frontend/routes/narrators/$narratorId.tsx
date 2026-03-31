@@ -7,6 +7,7 @@ import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FileModificationsPanel } from "../../components/narrator/FileModificationsDrawer";
+import { clearHighlightCache } from "../../components/narrator/HighlightedCode";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import type { FileModPanelExternalProps } from "../../components/narrator/narrator-panel-types";
 import {
@@ -128,6 +129,8 @@ function NarratorDetailPage() {
 	useEffect(() => {
 		return () => {
 			api.leaveNarrator(narratorId).catch(() => {});
+			// Free syntax highlight cache when leaving narrator pages to reduce memory
+			clearHighlightCache();
 		};
 	}, [narratorId]);
 

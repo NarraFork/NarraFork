@@ -63,6 +63,11 @@ const CLIENT_PING_TIMEOUT_MS = 60_000;
 const MAX_RECONNECT_ATTEMPTS = 50;
 const WS_STATUS_ID = "narrator-global";
 /**
+ * Maximum number of lastMessageId entries to keep.
+ * Prevents unbounded growth when the user browses many narrators over time.
+ */
+const MAX_LAST_MESSAGE_IDS = 100;
+/**
  * How long the tab must be hidden before we force a reconnect on return.
  * Matches the server heartbeat interval — if we missed at least one ping
  * cycle, the connection state is unreliable.
@@ -176,7 +181,13 @@ class NarratorWSManager {
 		}
 
 		if (opts?.lastMessageId && narratorIds.length === 1) {
+			this.lastMessageIds.delete(narratorIds[0]);
 			this.lastMessageIds.set(narratorIds[0], opts.lastMessageId);
+			while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
+				const oldest = this.lastMessageIds.keys().next().value;
+				if (oldest !== undefined) this.lastMessageIds.delete(oldest);
+				else break;
+			}
 		}
 
 		// Send subscribe for newly-added IDs
@@ -333,7 +344,15 @@ class NarratorWSManager {
 	// -----------------------------------------------------------------------
 
 	updateLastMessageId(narratorId: string, messageId: string): void {
+		// Move to end (most recently used) by re-inserting
+		this.lastMessageIds.delete(narratorId);
 		this.lastMessageIds.set(narratorId, messageId);
+		// Evict oldest entries if over limit
+		while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
+			const oldest = this.lastMessageIds.keys().next().value;
+			if (oldest !== undefined) this.lastMessageIds.delete(oldest);
+			else break;
+		}
 	}
 
 	// -----------------------------------------------------------------------

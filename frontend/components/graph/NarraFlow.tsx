@@ -572,18 +572,22 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const narratorIdsForWS = useMemo(() => [...narratorIdMap.keys()], [narratorIdMap]);
 
-	const [liveStatuses, setLiveStatuses] = useState<Map<string, string>>(new Map());
+	const liveStatusesRef = useRef(new Map<string, string>());
+	const [liveStatusesTick, setLiveStatusesTick] = useState(0);
+	// Derive a stable snapshot for consumers — only changes when tick changes
+	// biome-ignore lint/correctness/useExhaustiveDependencies: liveStatusesTick is intentionally used to trigger re-read of the mutable ref
+	const liveStatuses = useMemo(() => liveStatusesRef.current, [liveStatusesTick]);
 
 	const handleNarratorWSUpdate = useCallback(
 		(narratorId: string, event: { type: string; status?: string }) => {
 			if (event.type === "status" && event.status) {
 				const chapterId = narratorIdMap.get(narratorId);
 				if (chapterId) {
-					setLiveStatuses((prev) => {
-						const next = new Map(prev);
-						next.set(chapterId, event.status as string);
-						return next;
-					});
+					const prev = liveStatusesRef.current.get(chapterId);
+					if (prev !== event.status) {
+						liveStatusesRef.current.set(chapterId, event.status as string);
+						setLiveStatusesTick((t) => t + 1);
+					}
 				}
 			}
 		},
@@ -591,6 +595,19 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	);
 
 	useNarratorsListWS(narratorIdsForWS, handleNarratorWSUpdate);
+
+	// Clean up liveStatuses entries for chapters no longer in the graph
+	useEffect(() => {
+		const validChapterIds = new Set(narratorIdMap.values());
+		let changed = false;
+		for (const chId of liveStatusesRef.current.keys()) {
+			if (!validChapterIds.has(chId)) {
+				liveStatusesRef.current.delete(chId);
+				changed = true;
+			}
+		}
+		if (changed) setLiveStatusesTick((t) => t + 1);
+	}, [narratorIdMap]);
 
 	// Inject expand state and live narrator status into node data while preserving object
 	// identity for untouched nodes. This keeps heavy custom nodes out of the drag hot path.

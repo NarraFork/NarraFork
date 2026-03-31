@@ -1624,9 +1624,18 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					queryClient.removeQueries({ queryKey: key });
 				}
 			}
-		}, 60_000);
+		}, 30_000);
 		return () => clearInterval(timer);
 	}, [projectId, queryClient, layout.ticks]);
+
+	// Clean up all segment caches when unmounting the ruler view
+	const projectIdRef = useRef(projectId);
+	projectIdRef.current = projectId;
+	useEffect(() => {
+		return () => {
+			queryClient.removeQueries({ queryKey: ["rulerSegment", projectIdRef.current] });
+		};
+	}, [queryClient]);
 
 	useEffect(() => {
 		if (!needsInitialPosition || commits.length === 0) return;

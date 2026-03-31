@@ -7,7 +7,7 @@ export function useContainers(chapterId: string) {
 		queryKey: ["containers", chapterId],
 		queryFn: () => api.getContainers(chapterId),
 		enabled: !!chapterId,
-		refetchInterval: 10000, // Poll every 10s for status updates
+		refetchInterval: 60_000, // Fallback polling — primary updates via WS (useContainerEvents)
 	});
 }
 

@@ -13,6 +13,7 @@
 		"@mantine/notifications": "^7.17.8",
 		"@modelcontextprotocol/sdk": "^1.27.1",
 		"@mozilla/readability": "^0.6.0",
+		"@parcel/watcher": "^2.5.6",
 		"@tabler/icons-react": "^3.40.0",
 		"@tanstack/react-query": "^5.75.0",
 		"@tanstack/react-router": "^1.166.7",
@@ -96,5 +97,9 @@
 		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts",
 		"test": "bun test",
 		"test:watch": "bun test --watch"
-	}
+	},
+	"trustedDependencies": [
+		"@parcel/watcher",
+		"tree-sitter-bash"
+	]
 }

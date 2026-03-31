@@ -209,6 +209,9 @@ export function useRulerChapterActivity(
 				clearTimeout(flushTimerRef.current);
 				flushTimerRef.current = null;
 			}
+			// Free accumulated data on unmount
+			activityRef.current.clear();
+			streamBufRef.current.clear();
 		};
 	}, [chapters, scheduleFlush]);
 

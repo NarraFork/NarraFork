@@ -583,10 +583,19 @@ export function useNarratorsListWS(
 
 	// Subscription handle ref — persists across ID changes
 	const subHandleRef = useRef<SubscriptionHandle | null>(null);
+	const listenerHandleRef = useRef<ListenerHandle | null>(null);
+	const globalListenerHandleRef = useRef<ListenerHandle | null>(null);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds
 	useEffect(() => {
-		if (!narratorIds.length && !onGlobalEventRef.current) return;
+		if (!narratorIds.length && !onGlobalEventRef.current) {
+			// No narrators to watch — clean up any stale listener from a previous run
+			if (listenerHandleRef.current) {
+				narratorWSManager.removeListener(listenerHandleRef.current);
+				listenerHandleRef.current = null;
+			}
+			return;
+		}
 
 		// First mount or IDs changed — manage subscription
 		if (!subHandleRef.current) {
@@ -595,33 +604,49 @@ export function useNarratorsListWS(
 			narratorWSManager.updateSubscription(subHandleRef.current, narratorIds);
 		}
 
+		// Re-register listener with the current narrator IDs for precise filtering
+		if (listenerHandleRef.current) {
+			narratorWSManager.removeListener(listenerHandleRef.current);
+		}
+		listenerHandleRef.current = narratorWSManager.addListener(
+			{
+				narratorIds: narratorIds.length > 0 ? narratorIds : "*",
+				types: ["status_change", "title_updated", "permission_mode_changed", "presence_update"],
+			},
+			(data) => {
+				const nId = data.narratorId as string | undefined;
+				if (data.type === "status_change") {
+					if (nId) onUpdateRef.current(nId, { type: "status", status: data.status as string });
+				} else if (data.type === "title_updated") {
+					if (nId) onUpdateRef.current(nId, { type: "title", title: data.title as string });
+				} else if (data.type === "permission_mode_changed") {
+					if (nId)
+						onUpdateRef.current(nId, {
+							type: "permissionMode",
+							permissionMode: data.permissionMode as string,
+						});
+				} else if (data.type === "presence_update") {
+					if (nId)
+						onUpdateRef.current(nId, {
+							type: "presence",
+							viewers: data.viewers as NarratorListWSEvent["viewers"],
+						});
+				}
+			},
+		);
+
 		// We don't return cleanup here — that's handled by the mount-only effect below
 	}, [idsKey]);
 
-	// Mount-only: set up listener + connection tracking, cleanup on unmount
+	// Mount-only: global event listener + connection tracking, cleanup on unmount
 	useEffect(() => {
-		const listenerHandle = narratorWSManager.addListener({ narratorIds: "*" }, (data) => {
-			const nId = data.narratorId as string | undefined;
-			if (data.type === "status_change") {
-				if (nId) onUpdateRef.current(nId, { type: "status", status: data.status as string });
-			} else if (data.type === "title_updated") {
-				if (nId) onUpdateRef.current(nId, { type: "title", title: data.title as string });
-			} else if (data.type === "permission_mode_changed") {
-				if (nId)
-					onUpdateRef.current(nId, {
-						type: "permissionMode",
-						permissionMode: data.permissionMode as string,
-					});
-			} else if (data.type === "presence_update") {
-				if (nId)
-					onUpdateRef.current(nId, {
-						type: "presence",
-						viewers: data.viewers as NarratorListWSEvent["viewers"],
-					});
-			} else if ((data.type as string).startsWith("user:")) {
+		// Separate listener for global "user:*" events (not narrator-scoped)
+		globalListenerHandleRef.current = narratorWSManager.addListener(
+			{ typePrefixes: ["user:"] },
+			(data) => {
 				onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
-			}
-		});
+			},
+		);
 
 		const unsubConnection = narratorWSManager.onConnectionChange((conn) => {
 			setConnected(conn);
@@ -630,7 +655,14 @@ export function useNarratorsListWS(
 
 		return () => {
 			unsubConnection();
-			narratorWSManager.removeListener(listenerHandle);
+			if (listenerHandleRef.current) {
+				narratorWSManager.removeListener(listenerHandleRef.current);
+				listenerHandleRef.current = null;
+			}
+			if (globalListenerHandleRef.current) {
+				narratorWSManager.removeListener(globalListenerHandleRef.current);
+				globalListenerHandleRef.current = null;
+			}
 			if (subHandleRef.current) {
 				narratorWSManager.unsubscribe(subHandleRef.current);
 				subHandleRef.current = null;

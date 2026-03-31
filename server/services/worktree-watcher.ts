@@ -1,70 +1,32 @@
-import { type FSWatcher, readdirSync, statSync, watch } from "node:fs";
-import { join } from "node:path";
+/**
+ * Worktree file watcher service.
+ *
+ * Monitors worktree directories for file changes and broadcasts git status
+ * updates to subscribed narrators via WebSocket.
+ *
+ * Architecture (modelled after VS Code):
+ *   @parcel/watcher (1 native recursive subscription per worktree)
+ *     → event coalescing (75ms aggregate + merge)
+ *     → throttled emission (500/batch, 200ms rest)
+ *     → debounce (1.5s) + rate limit
+ *     → git status query + WS broadcast
+ *
+ * This replaces the previous approach of N × fs.watch() per worktree
+ * (one per subdirectory), which consumed O(directories) inotify watches.
+ * Now each worktree uses exactly 1 inotify watch via @parcel/watcher.
+ */
+
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
+import { ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 
 /** Debounce interval for file change events (ms). */
 const DEBOUNCE_MS = 1500;
-
-// ── Directory-level ignore (prevents inotify registration entirely) ─────────
-
-/**
- * Directories to skip during tree walk.
- *
- * Unlike the old approach (recursive fs.watch + JS callback filter), these
- * directories are never watched at all — no inotify watch is registered, so
- * the kernel never delivers events for them. This is the key to avoiding CPU
- * saturation on Linux where Bun ≤1.3 registers per-file inotify watches
- * inside recursive fs.watch (see oven-sh/bun#28290).
- */
-const SKIP_DIRS = new Set([
-	".git",
-	"node_modules",
-	".next",
-	"dist",
-	"build",
-	"out",
-	"__pycache__",
-	".cache",
-	".parcel-cache",
-	".turbo",
-	".nuxt",
-	".output",
-	".svelte-kit",
-	"target",
-	".venv",
-	"venv",
-	"vendor",
-	".gradle",
-	".idea",
-	".vscode",
-	"coverage",
-	".nyc_output",
-	".pytest_cache",
-	".mypy_cache",
-	".ruff_cache",
-	".tox",
-	".worktrees",
-]);
-
-// ── File-level ignore (callback filter for individual file events) ──────────
-
-const IGNORE_FILES = new Set([".DS_Store", "Thumbs.db"]);
-const IGNORE_EXTENSIONS = [".swp", ".swo"];
-
-function shouldIgnoreFile(filename: string | null): boolean {
-	if (!filename) return true;
-	if (IGNORE_FILES.has(filename)) return true;
-	for (const ext of IGNORE_EXTENSIONS) {
-		if (filename.endsWith(ext)) return true;
-	}
-	return false;
-}
 
 // ── Rate limiter ────────────────────────────────────────────────────────────
 
@@ -80,8 +42,6 @@ interface RateLimitState {
 // ── Watcher entry ───────────────────────────────────────────────────────────
 
 interface WatcherEntry {
-	/** One non-recursive FSWatcher per watched directory. */
-	watchers: Map<string, FSWatcher>;
 	chapterId: string;
 	narratorIds: Set<string>;
 	locale: Locale;
@@ -90,53 +50,21 @@ interface WatcherEntry {
 	rateLimit: RateLimitState;
 }
 
-// ── Tree walk + per-directory watch ─────────────────────────────────────────
+// ── Singleton ParcelRecursiveWatcher ────────────────────────────────────────
 
 /**
- * Recursively walk `rootPath`, registering a non-recursive `fs.watch()` on
- * every directory whose name is not in {@link SKIP_DIRS}.
- *
- * Returns a `Map<absoluteDirPath, FSWatcher>`.
+ * Single shared ParcelRecursiveWatcher instance, pinned to globalThis
+ * so it survives Bun hot reloads.
  */
-function walkAndWatch(
-	rootPath: string,
-	onEvent: (dirPath: string, eventType: string, filename: string | null) => void,
-	onError: (dirPath: string, err: Error) => void,
-): Map<string, FSWatcher> {
-	const watchers = new Map<string, FSWatcher>();
-
-	function addWatch(dirPath: string): void {
-		if (watchers.has(dirPath)) return;
-		try {
-			const w = watch(dirPath, (eventType, filename) => {
-				onEvent(dirPath, eventType, filename);
-			});
-			w.on("error", (err) => onError(dirPath, err));
-			watchers.set(dirPath, w);
-		} catch {
-			// Directory may have been removed between readdir and watch
-		}
-	}
-
-	function walk(dirPath: string): void {
-		addWatch(dirPath);
-		let entries: import("node:fs").Dirent[];
-		try {
-			entries = readdirSync(dirPath, { withFileTypes: true }) as import("node:fs").Dirent[];
-		} catch {
-			return; // Permission denied or removed
-		}
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			const name = String(entry.name);
-			if (SKIP_DIRS.has(name)) continue;
-			walk(join(dirPath, name));
-		}
-	}
-
-	walk(rootPath);
-	return watchers;
-}
+const parcelWatcher = hotSafe<ParcelRecursiveWatcher>(
+	"narrafork.worktreeWatcher.parcel",
+	() =>
+		new ParcelRecursiveWatcher((rootPath, _events) => {
+			// Events from parcel are already coalesced and throttled.
+			// We just need to trigger the debounced git-status flow.
+			worktreeWatcher._onFileChange(rootPath);
+		}),
+);
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -166,10 +94,8 @@ export const worktreeWatcher = {
 	 * Start watching a worktree directory for file changes.
 	 * Multiple narrators can share the same watcher (same chapter).
 	 *
-	 * Instead of a single recursive `fs.watch` (which on Linux/Bun registers
-	 * inotify watches on every file including `.git/objects`), we manually walk
-	 * the directory tree and create one non-recursive watcher per directory,
-	 * skipping {@link SKIP_DIRS} entirely so no inotify resources are wasted.
+	 * Uses @parcel/watcher for a single native recursive subscription per
+	 * worktree root, replacing the previous N × fs.watch() approach.
 	 */
 	watch(worktreePath: string, chapterId: string, narratorId: string, locale: Locale): void {
 		const existing = this._entries.get(worktreePath);
@@ -183,90 +109,39 @@ export const worktreeWatcher = {
 			return;
 		}
 
-		try {
-			const entry: WatcherEntry = {
-				watchers: new Map(),
-				chapterId,
-				narratorIds: new Set([narratorId]),
-				locale,
-				rateLimit: { windowStart: Date.now(), count: 0, warned: false },
-			};
+		const entry: WatcherEntry = {
+			chapterId,
+			narratorIds: new Set([narratorId]),
+			locale,
+			rateLimit: { windowStart: Date.now(), count: 0, warned: false },
+		};
 
-			const onEvent = (dirPath: string, eventType: string, filename: string | null) => {
-				if (shouldIgnoreFile(filename)) return;
+		this._entries.set(worktreePath, entry);
 
-				// Detect newly created subdirectories and start watching them.
-				// On Linux, `rename` is emitted for both creation and deletion.
-				if (eventType === "rename" && filename) {
-					const fullPath = join(dirPath, filename);
-					if (!SKIP_DIRS.has(filename) && !entry.watchers.has(fullPath)) {
-						try {
-							const st = statSync(fullPath);
-							if (st.isDirectory()) {
-								// Recursively watch the new subtree
-								const newWatchers = walkAndWatch(fullPath, onEvent, onError);
-								for (const [p, w] of newWatchers) {
-									entry.watchers.set(p, w);
-								}
-							}
-						} catch {
-							// Path was deleted or inaccessible — ignore
-						}
-					}
-				}
-
-				this._onFileChange(worktreePath);
-			};
-
-			const onError = (dirPath: string, err: Error) => {
-				// A single sub-watcher errored (directory removed, etc.)
-				// Close just that watcher; the rest keep running.
-				const w = entry.watchers.get(dirPath);
-				if (w) {
-					try {
-						w.close();
-					} catch {}
-					entry.watchers.delete(dirPath);
-				}
-				logger.debug("Worktree sub-watcher error (removed)", {
-					dirPath,
-					error: String(err),
-				});
-				// If ALL watchers are gone, clean up the entry entirely
-				if (entry.watchers.size === 0) {
-					logger.warn("Worktree watcher: all sub-watchers lost", { worktreePath });
-					this._removeEntry(worktreePath);
-				}
-			};
-
-			const watchers = walkAndWatch(worktreePath, onEvent, onError);
-			entry.watchers = watchers;
-
-			this._entries.set(worktreePath, entry);
-
-			// Capture initial HEAD SHA
-			gitService
-				.getHeadCommit(worktreePath)
-				.then((sha) => {
-					if (this._entries.has(worktreePath)) {
-						entry.lastHeadSha = sha;
-					}
-				})
-				.catch(() => {});
-
-			logger.info("Worktree watcher started", {
-				worktreePath,
-				chapterId,
-				narratorId,
-				dirWatchers: watchers.size,
-				activeEntries: this._entries.size,
-			});
-		} catch (err) {
+		// Start the parcel watcher (async, fire-and-forget)
+		parcelWatcher.watch(worktreePath).catch((err) => {
 			logger.warn("Failed to start worktree watcher", {
 				worktreePath,
 				error: String(err),
 			});
-		}
+		});
+
+		// Capture initial HEAD SHA
+		gitService
+			.getHeadCommit(worktreePath)
+			.then((sha) => {
+				if (this._entries.has(worktreePath)) {
+					entry.lastHeadSha = sha;
+				}
+			})
+			.catch(() => {});
+
+		logger.info("Worktree watcher started", {
+			worktreePath,
+			chapterId,
+			narratorId,
+			activeEntries: this._entries.size,
+		});
 	},
 
 	/**
@@ -313,6 +188,8 @@ export const worktreeWatcher = {
 		for (const path of paths) {
 			this._removeEntry(path);
 		}
+		// Also shut down the underlying parcel watcher
+		parcelWatcher.shutdown().catch(() => {});
 		if (count > 0) {
 			logger.info("All worktree watchers shut down", { count });
 		}
@@ -414,12 +291,9 @@ export const worktreeWatcher = {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
 		if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
-		for (const w of entry.watchers.values()) {
-			try {
-				w.close();
-			} catch {}
-		}
-		entry.watchers.clear();
 		this._entries.delete(worktreePath);
+
+		// Stop the underlying parcel watcher for this path
+		parcelWatcher.unwatch(worktreePath).catch(() => {});
 	},
 };

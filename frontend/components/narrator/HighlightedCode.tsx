@@ -20,7 +20,7 @@ type CacheEntry = {
 const htmlCache = new Map<string, CacheEntry>();
 let htmlCacheBytes = 0;
 const MAX_CACHE_ENTRIES = 64;
-const MAX_CACHE_BYTES = 2 * 1024 * 1024;
+const MAX_CACHE_BYTES = 1 * 1024 * 1024;
 const MAX_CACHEABLE_CODE_CHARS = 20_000;
 
 function cacheKey(theme: string, lang: string, code: string) {
@@ -60,6 +60,12 @@ function setCachedHtml(key: string, html: string) {
 	while (htmlCache.size > MAX_CACHE_ENTRIES || htmlCacheBytes > MAX_CACHE_BYTES) {
 		evictOldestCachedHtml();
 	}
+}
+
+/** Clear the entire highlight cache. Call when navigating away from narrator pages. */
+export function clearHighlightCache() {
+	htmlCache.clear();
+	htmlCacheBytes = 0;
 }
 
 /**
