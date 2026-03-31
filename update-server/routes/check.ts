@@ -96,13 +96,14 @@ export function createCheckRoutes(storage: StorageBackend) {
 				}
 			}
 
-			// Build patch chain: find intermediate versions between current and latest
+			// Build patch chain: find intermediate versions between current and latest.
+			// Allow cross-channel releases as intermediates — a version promoted from
+			// beta to stable should still be usable as a stepping stone in a beta chain.
 			if (!resp.zstdPatch) {
 				const allReleases = await getAllReleases(storage, product);
 				const candidates = allReleases
 					.filter(
 						(r) =>
-							r.channel === latestMeta.channel &&
 							r.platforms[platform] &&
 							compareVersions(r.version, currentVersion) > 0 &&
 							compareVersions(r.version, latestMeta.version) <= 0,
