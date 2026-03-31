@@ -116,6 +116,19 @@ if (!skipFrontend) {
 	console.log("✓ Frontend built");
 }
 
+// Step 1b: Download @parcel/watcher native binaries for all platforms
+{
+	console.log("→ Downloading @parcel/watcher native binaries...");
+	const dl = Bun.spawnSync(["bun", "scripts/download-parcel-watcher.ts"], {
+		cwd: ROOT,
+		stdio: ["inherit", "inherit", "inherit"],
+	});
+	if (dl.exitCode !== 0) {
+		console.error("❌ @parcel/watcher binary download failed");
+		process.exit(1);
+	}
+}
+
 // Step 2: Scan dist/frontend/ and collect all files
 function walkDir(dir: string): string[] {
 	const results: string[] = [];
