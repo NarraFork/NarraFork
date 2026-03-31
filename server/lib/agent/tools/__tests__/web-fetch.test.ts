@@ -279,6 +279,7 @@ describe("WebFetch — tool definition", () => {
 		expect(props.mode.enum).toEqual(["readability", "screenshot", "dom", "smart"]);
 		expect(props.selector).toBeDefined();
 		expect(props.max_length).toBeDefined();
+		expect(props.purpose).toBeDefined();
 	});
 
 	test("Zod schema validates correct input", () => {
@@ -313,6 +314,15 @@ describe("WebFetch — tool definition", () => {
 			mode: "dom",
 			selector: "h1",
 			max_length: 5000,
+		});
+		expect(result.success).toBe(true);
+	});
+
+	test("Zod schema accepts purpose field", () => {
+		const result = webFetchTool.parameters.safeParse({
+			url: "https://example.com",
+			mode: "smart",
+			purpose: "Find the API authentication method",
 		});
 		expect(result.success).toBe(true);
 	});

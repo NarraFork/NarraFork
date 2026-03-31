@@ -250,7 +250,51 @@ export function isRetryableError(err: unknown): boolean {
 		return true;
 	}
 
-	return msgCandidates.some((msg) => RETRYABLE_PATTERNS.some((p) => msg.includes(p)));
+	if (msgCandidates.some((msg) => RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
+		return true;
+	}
+
+	// Check user-defined custom retry rules from settings
+	return matchesCustomRetryRules(obj, msgCandidates);
+}
+
+/** Match error against user-defined custom retry rules (AND within rule, OR across rules). */
+function matchesCustomRetryRules(obj: Record<string, unknown>, msgCandidates: string[]): boolean {
+	const rules = settings.agent.customRetryRules;
+	if (!rules?.length) return false;
+
+	const statusCodes = new Set<number>();
+	for (const field of [obj, obj.error, obj.cause]) {
+		if (field && typeof field === "object") {
+			const f = field as Record<string, unknown>;
+			if (typeof f.status === "number") statusCodes.add(f.status);
+			if (typeof f.statusCode === "number") statusCodes.add(f.statusCode);
+		}
+	}
+
+	const allText = msgCandidates.join(" ");
+
+	for (const rule of rules) {
+		if (rule.enabled === false) continue;
+		let matched = true;
+		let hasCondition = false;
+
+		if (rule.domain) {
+			hasCondition = true;
+			if (!allText.includes(rule.domain.toLowerCase())) matched = false;
+		}
+		if (matched && rule.statusCode) {
+			hasCondition = true;
+			if (!statusCodes.has(rule.statusCode)) matched = false;
+		}
+		if (matched && rule.keyword) {
+			hasCondition = true;
+			if (!allText.includes(rule.keyword.toLowerCase())) matched = false;
+		}
+
+		if (hasCondition && matched) return true;
+	}
+	return false;
 }
 
 /** Minimum interval between tool_output events (ms). */

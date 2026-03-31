@@ -99,3 +99,10 @@
 .codeBlockWithLang pre {
 	padding-top: calc(var(--mantine-spacing-xs) + 14px);
 }
+
+/* KaTeX block-level formulas: horizontal scroll on overflow */
+.root .katex-display,
+.rootNoWrap .katex-display {
+	overflow-x: auto;
+	overflow-y: hidden;
+}

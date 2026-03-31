@@ -462,6 +462,12 @@ export const api = {
 	updateSettings: (data: Record<string, unknown>) =>
 		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
 
+	addRetryRule: (data: { domain?: string; statusCode?: number; keyword?: string; note?: string }) =>
+		request<{ id: string }>("/settings/retry-rules", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
 	testModel: (model: string, prompt: string) =>
 		request<{ text: string }>("/settings/test-model", {
 			method: "POST",

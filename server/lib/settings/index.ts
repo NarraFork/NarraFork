@@ -183,6 +183,19 @@ export interface NarraForkSettings {
 		smartInterruptionCheck: boolean;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
+		/** User-defined retryable error rules. Matched errors are treated as transient. */
+		customRetryRules?: Array<{
+			id: string;
+			/** Domain keyword to match in error message (case-insensitive). */
+			domain?: string;
+			/** HTTP status code to match. */
+			statusCode?: number;
+			/** Content keyword to match in error message (case-insensitive). */
+			keyword?: string;
+			enabled?: boolean;
+			/** User note for this rule. */
+			note?: string;
+		}>;
 		/** Global whitelist directories — merged with project and narrator level. */
 		whitelistDirs?: Array<{
 			path: string;

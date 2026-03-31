@@ -6,6 +6,7 @@ import { agentGenerateWithMeta } from "../lib/agent";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
+import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
@@ -130,6 +131,19 @@ const updateSettingsSchema = z
 				defaultRelaxedPlan: z.boolean(),
 				smartInterruptionCheck: z.boolean(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
+				customRetryRules: z
+					.array(
+						z.object({
+							id: z.string().min(1),
+							domain: z.string().optional(),
+							statusCode: z.number().int().min(100).max(599).optional(),
+							keyword: z.string().optional(),
+							enabled: z.boolean().optional(),
+							note: z.string().max(200).optional(),
+						}),
+					)
+					.max(100)
+					.optional(),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
@@ -654,4 +668,37 @@ settingsRoutes.patch("/", async (c) => {
 		}),
 	};
 	return c.json(result);
+});
+
+const addRetryRuleSchema = z
+	.object({
+		domain: z.string().min(1).optional(),
+		statusCode: z.number().int().min(100).max(599).optional(),
+		keyword: z.string().min(1).optional(),
+		note: z.string().max(200).optional(),
+	})
+	.refine((d) => d.domain || d.statusCode || d.keyword, {
+		message: "At least one of domain, statusCode, or keyword is required",
+	});
+
+settingsRoutes.post("/retry-rules", async (c) => {
+	const body = await c.req.json();
+	const parsed = addRetryRuleSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const rule = {
+		id: generateShortId(),
+		...parsed.data,
+		enabled: true,
+	};
+
+	const current = settings;
+	const rules = [...(current.agent.customRetryRules ?? []), rule];
+	const merged = {
+		...current,
+		agent: { ...current.agent, customRetryRules: rules },
+	};
+	saveSettings(merged);
+
+	return c.json(rule, 201);
 });

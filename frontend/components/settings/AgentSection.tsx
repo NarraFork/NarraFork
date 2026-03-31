@@ -1,13 +1,28 @@
-import { Group, NumberInput, Select, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Group,
+	NumberInput,
+	Paper,
+	Select,
+	Stack,
+	Switch,
+	Text,
+	TextInput,
+	Title,
+} from "@mantine/core";
 import {
 	IconEye,
 	IconHandStop,
 	IconNotebook,
 	IconPencilCheck,
+	IconPlus,
 	IconShield,
 	IconShieldOff,
+	IconTrash,
 } from "@tabler/icons-react";
 import type { UseMutationResult } from "@tanstack/react-query";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
@@ -34,6 +49,24 @@ export interface AgentSectionProps {
 	setSmartInterruptionCheck: (v: boolean) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	customRetryRules: Array<{
+		id: string;
+		domain?: string;
+		statusCode?: number;
+		keyword?: string;
+		enabled?: boolean;
+		note?: string;
+	}>;
+	setCustomRetryRules: (
+		v: Array<{
+			id: string;
+			domain?: string;
+			statusCode?: number;
+			keyword?: string;
+			enabled?: boolean;
+			note?: string;
+		}>,
+	) => void;
 	contextThresholds: {
 		standard: { pruneStart: number; compactStart: number };
 		large: { pruneStart: number; compactStart: number };
@@ -169,6 +202,14 @@ export function AgentSection(props: AgentSectionProps) {
 				min={-1}
 				max={100}
 			/>
+			{/* Custom Retry Rules */}
+			<Title order={5} mt="sm">
+				{t("customRetryRules")}
+			</Title>
+			<Text size="xs" c="dimmed">
+				{t("customRetryRulesDesc")}
+			</Text>
+			<RetryRuleEditor rules={props.customRetryRules} onChange={props.setCustomRetryRules} />
 			{/* WebFetch Proxy */}
 			<Title order={5} mt="sm">
 				{t("webFetchProxy")}
@@ -403,6 +444,150 @@ export function AgentSection(props: AgentSectionProps) {
 					denyPromptPlaceholder: t("cmdDenyPromptPlaceholder"),
 				}}
 			/>
+		</Stack>
+	);
+}
+
+type RetryRule = {
+	id: string;
+	domain?: string;
+	statusCode?: number;
+	keyword?: string;
+	enabled?: boolean;
+	note?: string;
+};
+
+function RetryRuleEditor({
+	rules,
+	onChange,
+}: {
+	rules: RetryRule[];
+	onChange: (v: RetryRule[]) => void;
+}) {
+	const { t } = useTranslation("settings");
+	const [domain, setDomain] = useState("");
+	const [statusCode, setStatusCode] = useState<number | string>("");
+	const [keyword, setKeyword] = useState("");
+	const [note, setNote] = useState("");
+
+	const handleAdd = () => {
+		const d = domain.trim() || undefined;
+		const k = keyword.trim() || undefined;
+		const sc = typeof statusCode === "number" ? statusCode : undefined;
+		if (!d && !sc && !k) return;
+		const id = Math.random().toString(36).slice(2, 10);
+		onChange([
+			...rules,
+			{ id, domain: d, statusCode: sc, keyword: k, note: note.trim() || undefined, enabled: true },
+		]);
+		setDomain("");
+		setStatusCode("");
+		setKeyword("");
+		setNote("");
+	};
+
+	const handleRemove = (id: string) => {
+		onChange(rules.filter((r) => r.id !== id));
+	};
+
+	const handleToggle = (id: string) => {
+		onChange(rules.map((r) => (r.id === id ? { ...r, enabled: !r.enabled } : r)));
+	};
+
+	return (
+		<Stack gap="xs">
+			{rules.length === 0 && (
+				<Text size="xs" c="dimmed" fs="italic">
+					{t("retryRuleEmpty")}
+				</Text>
+			)}
+			{rules.map((rule) => (
+				<Paper key={rule.id} p="xs" withBorder>
+					<Group gap="xs" wrap="nowrap" align="center">
+						<Switch
+							size="xs"
+							checked={rule.enabled !== false}
+							onChange={() => handleToggle(rule.id)}
+							style={{ flexShrink: 0 }}
+						/>
+						<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="wrap">
+							{rule.domain && (
+								<Badge size="xs" variant="light" color="blue">
+									{t("retryRuleDomain")}: {rule.domain}
+								</Badge>
+							)}
+							{rule.statusCode && (
+								<Badge size="xs" variant="light" color="orange">
+									{t("retryRuleStatusCode")}: {rule.statusCode}
+								</Badge>
+							)}
+							{rule.keyword && (
+								<Badge size="xs" variant="light" color="grape" style={{ maxWidth: 300 }}>
+									<Text size="xs" truncate="end">
+										{t("retryRuleKeyword")}: {rule.keyword}
+									</Text>
+								</Badge>
+							)}
+							{rule.note && (
+								<Text size="xs" c="dimmed" truncate="end" style={{ maxWidth: 200 }}>
+									{rule.note}
+								</Text>
+							)}
+						</Group>
+						<ActionIcon
+							size="xs"
+							variant="subtle"
+							color="red"
+							onClick={() => handleRemove(rule.id)}
+						>
+							<IconTrash size={14} />
+						</ActionIcon>
+					</Group>
+				</Paper>
+			))}
+			<Paper p="xs" withBorder>
+				<Stack gap="xs">
+					<Group grow>
+						<TextInput
+							size="xs"
+							placeholder={t("retryRuleDomainPlaceholder")}
+							value={domain}
+							onChange={(e) => setDomain(e.currentTarget.value)}
+						/>
+						<NumberInput
+							size="xs"
+							placeholder={t("retryRuleStatusCodePlaceholder")}
+							value={statusCode}
+							onChange={setStatusCode}
+							min={100}
+							max={599}
+							allowDecimal={false}
+						/>
+					</Group>
+					<Group grow>
+						<TextInput
+							size="xs"
+							placeholder={t("retryRuleKeywordPlaceholder")}
+							value={keyword}
+							onChange={(e) => setKeyword(e.currentTarget.value)}
+						/>
+						<TextInput
+							size="xs"
+							placeholder={t("retryRuleNotePlaceholder")}
+							value={note}
+							onChange={(e) => setNote(e.currentTarget.value)}
+						/>
+					</Group>
+					<ActionIcon
+						variant="light"
+						size="sm"
+						onClick={handleAdd}
+						disabled={!domain.trim() && !keyword.trim() && typeof statusCode !== "number"}
+					>
+						<IconPlus size={14} />
+					</ActionIcon>
+				</Stack>
+			</Paper>
 		</Stack>
 	);
 }

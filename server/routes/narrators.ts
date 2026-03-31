@@ -65,7 +65,11 @@ import {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
-import type { LoadToolNotFound, LoadToolResult } from "../services/command-service";
+import type {
+	LoadSkillResult,
+	LoadToolNotFound,
+	LoadToolResult,
+} from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
 	applyToolCall,
@@ -76,7 +80,11 @@ import {
 	rebuildFileStatesExcluding,
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
-import { handleLoadToolCommand, narratorService } from "../services/narrator-service";
+import {
+	handleLoadSkillCommand,
+	handleLoadToolCommand,
+	narratorService,
+} from "../services/narrator-service";
 import {
 	type BufferCreator,
 	clearBufferedMessages,
@@ -411,6 +419,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			locale,
 		);
 		return c.json(result, 200);
+	}
+	if (cmdResult.resolved && "loadSkill" in cmdResult) {
+		const skillResult = await handleLoadSkillCommand(id, cmdResult as LoadSkillResult);
+		if (!skillResult.found) {
+			return c.json({ skillName: skillResult.skillName, loaded: false }, 200);
+		}
+		// Inject skill content into the message, preserving user input after the skill name
+		const userInput = (cmdResult as LoadSkillResult).skillInput;
+		finalMessage = `<command-name>${skillResult.skillName}</command-name>\n${skillResult.content}${userInput ? `\n\n${userInput}` : ""}`;
+		commandText = cmdResult.rawCommand;
 	}
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 		finalMessage = cmdResult.expandedPrompt;
@@ -785,6 +803,16 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 		// Fallback: try interrupting a foreground subagent
 		const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
 		interrupted = interruptForegroundSubagent(id);
+	}
+	// Fallback: if no active loop found but DB status is still thinking/waiting,
+	// the narrator is a zombie (loop ended without updating status, e.g. after
+	// hot reload or unhandled error). Force-reset to interrupted.
+	if (!interrupted) {
+		const narrator = await narratorService.getById(id);
+		if (narrator.status === "thinking" || narrator.status === "waiting") {
+			await narratorService.updateStatus(id, "interrupted");
+			interrupted = true;
+		}
 	}
 	return c.json({ interrupted });
 });

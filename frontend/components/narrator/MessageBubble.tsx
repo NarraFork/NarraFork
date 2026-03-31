@@ -1,4 +1,5 @@
 import {
+	ActionIcon,
 	Badge,
 	Box,
 	Button,
@@ -8,6 +9,7 @@ import {
 	Image,
 	Loader,
 	Modal,
+	NumberInput,
 	Paper,
 	ScrollArea,
 	Skeleton,
@@ -15,7 +17,9 @@ import {
 	Stack,
 	Text,
 	Textarea,
+	TextInput,
 	ThemeIcon,
+	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
@@ -32,6 +36,7 @@ import {
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
+	IconRepeat,
 	IconWorldSearch,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -187,7 +192,16 @@ function ErrorNotice({
 	onDismiss?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const { t: ts } = useTranslation("settings");
+	const { t: tc } = useTranslation("common");
 	const [dismissing, setDismissing] = useState(false);
+	const [ruleModalOpened, { open: openRuleModal, close: closeRuleModal }] = useDisclosure(false);
+	const [ruleDomain, setRuleDomain] = useState("");
+	const [ruleStatusCode, setRuleStatusCode] = useState<number | string>("");
+	const [ruleKeyword, setRuleKeyword] = useState(message);
+	const [ruleNote, setRuleNote] = useState("");
+	const [ruleSubmitting, setRuleSubmitting] = useState(false);
+	const qc = useQueryClient();
 
 	const handleDismiss = async () => {
 		setDismissing(true);
@@ -206,30 +220,120 @@ function ErrorNotice({
 		}
 	};
 
+	const handleAddRule = async () => {
+		const code = typeof ruleStatusCode === "number" ? ruleStatusCode : undefined;
+		const domain = ruleDomain.trim() || undefined;
+		const keyword = ruleKeyword.trim() || undefined;
+		if (!domain && !code && !keyword) {
+			notifications.show({
+				message: ts("retryRuleAtLeastOne"),
+				color: "yellow",
+			});
+			return;
+		}
+		setRuleSubmitting(true);
+		try {
+			await api.addRetryRule({
+				domain,
+				statusCode: code,
+				keyword,
+				note: ruleNote.trim() || undefined,
+			});
+			qc.invalidateQueries({ queryKey: ["settings"] });
+			notifications.show({
+				message: t("markRetryableSuccess"),
+				color: "green",
+				autoClose: 5000,
+			});
+			closeRuleModal();
+		} catch (err) {
+			notifications.show({
+				title: t("narratorError"),
+				message: err instanceof Error ? err.message : tc("unknownError"),
+				color: "red",
+			});
+		} finally {
+			setRuleSubmitting(false);
+		}
+	};
+
 	return (
-		<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
-			<Group gap={6} wrap="nowrap" align="flex-start">
-				<IconAlertTriangle
-					size={16}
-					style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-red-7)" }}
-				/>
-				<Text
-					size="xs"
-					c="red.9"
-					style={{ whiteSpace: "pre-wrap", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}
-				>
-					{message}
-				</Text>
-				<CloseButton
-					size="xs"
-					variant="subtle"
-					c="red.7"
-					style={{ flexShrink: 0 }}
-					disabled={dismissing}
-					onClick={handleDismiss}
-				/>
-			</Group>
-		</Paper>
+		<>
+			<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+				<Group gap={6} wrap="nowrap" align="flex-start">
+					<IconAlertTriangle
+						size={16}
+						style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-red-7)" }}
+					/>
+					<Text
+						size="xs"
+						c="red.9"
+						style={{ whiteSpace: "pre-wrap", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}
+					>
+						{message}
+					</Text>
+					<Tooltip label={t("markRetryable")} withArrow>
+						<ActionIcon
+							size="xs"
+							variant="subtle"
+							color="red.7"
+							style={{ flexShrink: 0 }}
+							onClick={openRuleModal}
+						>
+							<IconRepeat size={14} />
+						</ActionIcon>
+					</Tooltip>
+					<CloseButton
+						size="xs"
+						variant="subtle"
+						c="red.7"
+						style={{ flexShrink: 0 }}
+						disabled={dismissing}
+						onClick={handleDismiss}
+					/>
+				</Group>
+			</Paper>
+
+			<Modal
+				opened={ruleModalOpened}
+				onClose={closeRuleModal}
+				title={t("markRetryableTitle")}
+				size="sm"
+			>
+				<Stack gap="sm">
+					<TextInput
+						label={ts("retryRuleDomain")}
+						placeholder={ts("retryRuleDomainPlaceholder")}
+						value={ruleDomain}
+						onChange={(e) => setRuleDomain(e.currentTarget.value)}
+					/>
+					<NumberInput
+						label={ts("retryRuleStatusCode")}
+						placeholder={ts("retryRuleStatusCodePlaceholder")}
+						value={ruleStatusCode}
+						onChange={setRuleStatusCode}
+						min={100}
+						max={599}
+						allowDecimal={false}
+					/>
+					<TextInput
+						label={ts("retryRuleKeyword")}
+						placeholder={ts("retryRuleKeywordPlaceholder")}
+						value={ruleKeyword}
+						onChange={(e) => setRuleKeyword(e.currentTarget.value)}
+					/>
+					<TextInput
+						label={ts("retryRuleNote")}
+						placeholder={ts("retryRuleNotePlaceholder")}
+						value={ruleNote}
+						onChange={(e) => setRuleNote(e.currentTarget.value)}
+					/>
+					<Button onClick={handleAddRule} loading={ruleSubmitting} fullWidth>
+						{ts("retryRuleAdd")}
+					</Button>
+				</Stack>
+			</Modal>
+		</>
 	);
 }
 

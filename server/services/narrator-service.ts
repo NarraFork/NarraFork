@@ -8,6 +8,7 @@ import {
 	narratorToolCalls,
 	narratorWhitelistDirs,
 	overseers,
+	projects,
 	terminals,
 	terminalTabs,
 	terminalViewState,
@@ -28,7 +29,7 @@ import {
 } from "../lib/settings";
 import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { LoadToolNotFound, LoadToolResult } from "./command-service";
+import type { LoadSkillResult, LoadToolNotFound, LoadToolResult } from "./command-service";
 import { revertPatchesForMessages, revertPatchForToolUse } from "./snapshot-revert";
 
 /**
@@ -510,6 +511,84 @@ export async function handleLoadToolCommand(
 	}
 
 	return { toolName, loaded: true, alreadyLoaded };
+}
+
+/**
+ * Handle `/skill <name>` slash command.
+ * Loads the skill content and returns it so the caller can inject it into the user message.
+ * Also persists an info message for the UI timeline.
+ */
+export async function handleLoadSkillCommand(
+	narratorId: string,
+	cmdResult: LoadSkillResult,
+): Promise<
+	{ found: true; skillName: string; content: string } | { found: false; skillName: string }
+> {
+	const { join } = await import("node:path");
+	const { loadAllSkills } = await import("./skill-service");
+
+	// Resolve project gitPath for this narrator
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
+	});
+	let gitPath: string | null = null;
+	if (narrator?.chapterId) {
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { projectId: true },
+		});
+		if (chapter) {
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { gitPath: true },
+			});
+			gitPath = project?.gitPath ?? null;
+		}
+	}
+
+	const skills = await loadAllSkills(gitPath);
+	const found = skills.find((s) => s.name === cmdResult.loadSkill);
+
+	if (!found) {
+		const available = skills.map((s) => s.name).join(", ");
+		const infoText = `⚠️ Skill "${cmdResult.loadSkill}" not found. Available: ${available || "(none)"}`;
+		await narratorService.persistInfoMessage(narratorId, infoText);
+		return { found: false, skillName: cmdResult.loadSkill };
+	}
+
+	// Build skill content (same format as skill.ts execute)
+	const skillDir = join(found.location, "..");
+	const lines = [`<skill_content name="${escapeXmlAttr(found.name)}">`];
+	lines.push(`# Skill: ${found.name}`);
+	lines.push("");
+	if (found.content) {
+		lines.push(found.content);
+		lines.push("");
+	}
+	lines.push(`Base directory for this skill: ${skillDir}`);
+	if (found.files.length > 0) {
+		lines.push("");
+		lines.push("<skill_files>");
+		for (const f of found.files) {
+			lines.push(`<file>${join(skillDir, f)}</file>`);
+		}
+		lines.push("</skill_files>");
+	}
+	lines.push("</skill_content>");
+
+	await narratorService.persistInfoMessage(narratorId, `🔧 Skill loaded: ${found.name}`);
+
+	return { found: true, skillName: found.name, content: lines.join("\n") };
+}
+
+/** Escape characters that would break XML attribute values. */
+function escapeXmlAttr(s: string): string {
+	return s
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
 }
 
 export const narratorService = {

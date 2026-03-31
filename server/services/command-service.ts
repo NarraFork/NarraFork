@@ -47,11 +47,19 @@ export interface LoadToolNotFound {
 	rawCommand: string;
 }
 
+export interface LoadSkillResult {
+	resolved: true;
+	loadSkill: string;
+	skillInput: string;
+	rawCommand: string;
+}
+
 export type ResolveResult =
 	| CommandResolveResult
 	| CommandNotResolved
 	| LoadToolResult
-	| LoadToolNotFound;
+	| LoadToolNotFound
+	| LoadSkillResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
 function parseCommandInput(prompt: string): { name: string; input: string } | null {
@@ -211,6 +219,16 @@ export async function resolveCommand(
 			return { resolved: true, loadTool: toolRoutine.tool.toolName, rawCommand: prompt };
 		}
 		return { resolved: true, loadToolNotFound: toolId, rawCommand: prompt };
+	}
+
+	// Handle /skill <name> [input] — directly inject skill content into the message
+	if (parsed.name.toLowerCase() === "skill") {
+		// Split: first token is skill name, rest is user input
+		const parts = parsed.input.split(/\s+/);
+		const skillName = parts[0]?.trim();
+		if (!skillName) return { resolved: false };
+		const skillInput = parts.slice(1).join(" ").trim();
+		return { resolved: true, loadSkill: skillName, skillInput, rawCommand: prompt };
 	}
 
 	const commands = await getAvailableCommands(narratorId, userId);

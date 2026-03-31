@@ -26,6 +26,7 @@ Rules:
 export async function fetchSmart(
 	url: string,
 	maxLength = DEFAULT_MAX_LENGTH,
+	purpose?: string,
 ): Promise<{ summary: string; title: string }> {
 	// Get cleaned DOM (use a larger limit since we'll summarize it down)
 	const dom = await fetchDom(url, undefined, MAX_DOM_FOR_SUMMARY);
@@ -39,7 +40,11 @@ export async function fetchSmart(
 
 	const prompt = `URL: ${url}\n\nPage HTML content:\n\n${dom}`;
 
-	const result = await summaryGenerate(prompt, SYSTEM_PROMPT);
+	const systemPrompt = purpose
+		? `${SYSTEM_PROMPT}\n\nThe user is looking for specific information: "${purpose}". Prioritize extracting content relevant to this goal.`
+		: SYSTEM_PROMPT;
+
+	const result = await summaryGenerate(prompt, systemPrompt);
 	let summary = result.text.trim();
 
 	if (summary.length > maxLength) {

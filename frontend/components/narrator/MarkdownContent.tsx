@@ -1,10 +1,13 @@
 import { Anchor, Blockquote, Code, Divider, List, Table, Text, Title } from "@mantine/core";
 import { AnimatedMarkdown } from "flowtoken";
 import "flowtoken/dist/styles.css";
+import "katex/dist/katex.min.css";
 import { Component, memo, type ReactNode } from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
 
@@ -305,7 +308,7 @@ const supportsLookbehind = (() => {
 	}
 })();
 
-const remarkPlugins = supportsLookbehind ? [remarkGfm] : [];
+const remarkPlugins = supportsLookbehind ? [remarkGfm, remarkMath] : [remarkMath];
 
 /** Thin error boundary so a remark-gfm regex crash doesn't blank the chat. */
 class MarkdownErrorBoundary extends Component<
@@ -378,7 +381,11 @@ export const MarkdownContent = memo(function MarkdownContent({
 	return (
 		<MarkdownErrorBoundary fallback={plainFallback}>
 			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-				<Markdown remarkPlugins={remarkPlugins} components={staticComponents}>
+				<Markdown
+					remarkPlugins={remarkPlugins}
+					rehypePlugins={[rehypeKatex]}
+					components={staticComponents}
+				>
 					{trimmed}
 				</Markdown>
 			</div>

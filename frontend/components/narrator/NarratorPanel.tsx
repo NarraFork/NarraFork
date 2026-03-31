@@ -998,8 +998,8 @@ export function NarratorPanel({
 	}, [input, commandsList]);
 	const handleCommandSelect = useCallback((cmd: CommandItem) => {
 		if (cmd.type === "skill") {
-			// Skill selected — insert a prompt that tells the AI to load this skill
-			setInput(`Please load the "${cmd.name}" skill and apply it to: `);
+			// Skill selected — use /skill command so backend injects content directly
+			setInput(`/skill ${cmd.name} `);
 		} else if (cmd.type === "tool" && !cmd.name.includes(" ")) {
 			// Parent /load entry — expand to show sub-items
 			setInput(`/${cmd.name} `);

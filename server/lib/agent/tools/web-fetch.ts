@@ -23,7 +23,8 @@ export const webFetchTool: ToolDefinition = {
 		"- url (required): The URL to fetch\n" +
 		"- mode (required): One of readability, screenshot, dom, smart\n" +
 		"- selector (optional): CSS selector to extract specific elements (dom mode only)\n" +
-		"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)",
+		"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)\n" +
+		"- purpose (optional): What information you are looking for (smart mode only). When provided, the AI summarizer will prioritize extracting content relevant to this goal instead of producing a generic summary.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -46,6 +47,11 @@ export const webFetchTool: ToolDefinition = {
 					"Maximum output length in characters (default: 20000, not applicable to screenshot mode)",
 				type: "number",
 			},
+			purpose: {
+				description:
+					"What information you are looking for (smart mode only). The AI summarizer will prioritize extracting content relevant to this goal.",
+				type: "string",
+			},
 		},
 		required: ["url", "mode"],
 		additionalProperties: false,
@@ -55,13 +61,15 @@ export const webFetchTool: ToolDefinition = {
 		mode: z.enum(MODES).describe("Extraction mode"),
 		selector: z.string().optional().describe("CSS selector (dom mode)"),
 		max_length: z.number().optional().describe("Max output chars"),
+		purpose: z.string().optional().describe("What to look for (smart mode)"),
 	}),
 	async execute(args): Promise<ToolResult> {
-		const { url, mode, selector, max_length } = args as {
+		const { url, mode, selector, max_length, purpose } = args as {
 			url: string;
 			mode: (typeof MODES)[number];
 			selector?: string;
 			max_length?: number;
+			purpose?: string;
 		};
 
 		// Basic URL validation
@@ -138,7 +146,7 @@ export const webFetchTool: ToolDefinition = {
 				}
 				case "smart": {
 					const { fetchSmart } = await import("../../web-fetch/smart");
-					const result = await fetchSmart(url, max_length);
+					const result = await fetchSmart(url, max_length, purpose);
 					return {
 						output: result.summary,
 						title: result.title || url,
