@@ -53,10 +53,18 @@ export function useFileModifications(
 	narratorId: string,
 	enabled = true,
 	upToMessageId?: string | null,
+	fromMessageId?: string | null,
 ) {
 	return useQuery({
-		queryKey: ["narrators", narratorId, "file-modifications", upToMessageId ?? "all"],
-		queryFn: () => api.getFileModifications(narratorId, upToMessageId ?? undefined),
+		queryKey: [
+			"narrators",
+			narratorId,
+			"file-modifications",
+			fromMessageId ?? "start",
+			upToMessageId ?? "all",
+		],
+		queryFn: () =>
+			api.getFileModifications(narratorId, upToMessageId ?? undefined, fromMessageId ?? undefined),
 		enabled,
 	});
 }
@@ -66,10 +74,24 @@ export function useFileDiff(
 	snapshotId: string,
 	enabled = false,
 	upToMessageId?: string | null,
+	fromMessageId?: string | null,
 ) {
 	return useQuery({
-		queryKey: ["narrators", narratorId, "file-diff", snapshotId, upToMessageId ?? "all"],
-		queryFn: () => api.getFileDiff(narratorId, snapshotId, upToMessageId ?? undefined),
+		queryKey: [
+			"narrators",
+			narratorId,
+			"file-diff",
+			snapshotId,
+			fromMessageId ?? "start",
+			upToMessageId ?? "all",
+		],
+		queryFn: () =>
+			api.getFileDiff(
+				narratorId,
+				snapshotId,
+				upToMessageId ?? undefined,
+				fromMessageId ?? undefined,
+			),
 		enabled: enabled && !!snapshotId,
 	});
 }

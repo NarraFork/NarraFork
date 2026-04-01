@@ -3697,10 +3697,12 @@ export async function runCustomCompact(
 ): Promise<void> {
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
-		logger.info("Compact already in progress, skipping duplicate", { narratorId });
+		logger.info("Compact already in progress, waiting for it to finish", { narratorId });
 		// Wait for the in-flight compact to settle (ignore its error — the original
-		// caller handles it). We just need to know it's done before returning.
+		// caller handles it), then broadcast compact_done so the frontend refreshes
+		// its state (fixes manual compact button appearing unresponsive).
 		await existing.catch(() => {});
+		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 		return;
 	}
 

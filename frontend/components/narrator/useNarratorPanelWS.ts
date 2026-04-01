@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { api, type BufferMessageSummary } from "../../lib/api";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	evictOldestPages,
 	findMsgByToolUseIdInTree,
@@ -349,6 +350,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		}
 		contextInitRef.current = true;
 	}, [messagesData]);
+
+	// --- Initialize messageVersion from initial data ---
+	const versionInitRef = useRef(false);
+	useEffect(() => {
+		if (versionInitRef.current || !messagesData?.pages?.length) return;
+		const firstPage = messagesData.pages[0] as Record<string, unknown> | undefined;
+		if (firstPage && typeof firstPage.messageVersion === "number") {
+			narratorWSManager.updateMessageVersion(narratorId, firstPage.messageVersion as number);
+			versionInitRef.current = true;
+		}
+	}, [messagesData, narratorId]);
 
 	// --- toolUseId index (for O(1) lookups in WS callbacks) ---
 	const hydrated = !!messagesData?.pages;

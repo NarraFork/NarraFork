@@ -7,6 +7,7 @@ import {
 	Center,
 	Group,
 	Loader,
+	NativeSelect,
 	Stack,
 	Text,
 	Tooltip,
@@ -17,11 +18,11 @@ import {
 	IconArrowBackUp,
 	IconChevronDown,
 	IconChevronRight,
-	IconCircleFilled,
 	IconFile,
 	IconFilePlus,
 } from "@tabler/icons-react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
+
 import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
@@ -31,14 +32,22 @@ function FileDiffContent({
 	snapshotId,
 	filePath,
 	upToMessageId,
+	fromMessageId,
 }: {
 	narratorId: string;
 	snapshotId: string;
 	filePath: string;
 	upToMessageId?: string | null;
+	fromMessageId?: string | null;
 }) {
 	const { t } = useTranslation("narrator");
-	const { data, isLoading } = useFileDiff(narratorId, snapshotId, true, upToMessageId);
+	const { data, isLoading } = useFileDiff(
+		narratorId,
+		snapshotId,
+		true,
+		upToMessageId,
+		fromMessageId,
+	);
 
 	if (isLoading) {
 		return (
@@ -65,109 +74,95 @@ function FileDiffContent({
 	return <DiffView oldStr={original} newStr={current} maxHeight={400} language={lang} />;
 }
 
-/** Horizontal scrollable timeline of edit messages */
-function EditTimeline({
+interface TimelineEntry {
+	messageId: string;
+	createdAt: string;
+	seq: number;
+	role: string;
+	hasEdits: boolean;
+}
+
+const formatTime = (iso: string) => {
+	const d = new Date(iso);
+	return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
+/** Two-select range boundary selector for file modifications */
+function RangeBoundarySelector({
 	timeline,
-	selectedId,
-	onSelect,
+	fromId,
+	toId,
+	onChange,
 }: {
-	timeline: Array<{ messageId: string; createdAt: string; seq: number }>;
-	selectedId: string | null; // null = latest
-	onSelect: (messageId: string | null) => void;
+	timeline: TimelineEntry[];
+	fromId: string | null; // null = beginning
+	toId: string | null; // null = current (latest)
+	onChange: (fromId: string | null, toId: string | null) => void;
 }) {
 	const { t } = useTranslation("narrator");
-	const scrollRef = useRef<HTMLDivElement>(null);
 
-	// Callback ref: scroll active node into view when it mounts
-	const activeNodeRef = useCallback((node: HTMLButtonElement | null) => {
-		if (node && scrollRef.current) {
-			node.scrollIntoView({ inline: "center", block: "nearest" });
+	// Build option lists with role labels
+	const roleLabel = useCallback(
+		(entry: TimelineEntry, idx: number) => {
+			const time = formatTime(entry.createdAt);
+			const prefix =
+				entry.role === "user"
+					? t("fileMod_roleUser")
+					: entry.role === "assistant"
+						? t("fileMod_roleAssistant")
+						: t("fileMod_roleSystem");
+			const editMark = entry.hasEdits ? " *" : "";
+			return `#${idx + 1} ${prefix} ${time}${editMark}`;
+		},
+		[t],
+	);
+
+	// "From" options: "All" + every message
+	const fromOptions = useMemo(() => {
+		const opts = [{ value: "", label: t("fileMod_rangeAll") }];
+		for (let i = 0; i < timeline.length; i++) {
+			opts.push({ value: timeline[i].messageId, label: roleLabel(timeline[i], i) });
 		}
-	}, []);
+		return opts;
+	}, [timeline, t, roleLabel]);
+	// "To" options: every message + "Current"
+	const toOptions = useMemo(() => {
+		const opts: Array<{ value: string; label: string }> = [];
+		for (let i = 0; i < timeline.length; i++) {
+			opts.push({ value: timeline[i].messageId, label: roleLabel(timeline[i], i) });
+		}
+		opts.push({ value: "", label: t("fileMod_rangeCurrent") });
+		return opts;
+	}, [timeline, t, roleLabel]);
 
 	if (timeline.length <= 1) return null;
 
-	const lastId = timeline[timeline.length - 1]?.messageId ?? null;
-	const effectiveId = selectedId ?? lastId;
-
-	const formatTime = (iso: string) => {
-		const d = new Date(iso);
-		return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-	};
-
 	return (
 		<Box
-			ref={scrollRef}
 			px="sm"
 			py={6}
 			style={{
-				overflowX: "auto",
-				overflowY: "hidden",
 				flexShrink: 0,
 				borderBottom: "1px solid var(--mantine-color-dark-4)",
 			}}
 		>
-			<Group gap={0} wrap="nowrap" style={{ minWidth: "max-content" }}>
-				{timeline.map((entry, idx) => {
-					const isActive = entry.messageId === effectiveId;
-					const isLast = idx === timeline.length - 1;
-					return (
-						<Group key={entry.messageId} gap={0} wrap="nowrap" align="center">
-							{idx > 0 && (
-								<Box
-									style={{
-										width: 20,
-										height: 2,
-										backgroundColor: "var(--mantine-color-dark-3)",
-										flexShrink: 0,
-									}}
-								/>
-							)}
-							<Tooltip
-								label={
-									isLast
-										? t("fileMod_timelineCurrent")
-										: t("fileMod_timelineMessage", { n: idx + 1 })
-								}
-							>
-								<UnstyledButton
-									ref={isActive ? activeNodeRef : undefined}
-									onClick={() => onSelect(isLast ? null : entry.messageId)}
-									style={{
-										display: "flex",
-										flexDirection: "column",
-										alignItems: "center",
-										gap: 2,
-										padding: "2px 6px",
-										borderRadius: "var(--mantine-radius-sm)",
-										backgroundColor: isActive ? "var(--mantine-color-indigo-light)" : undefined,
-										flexShrink: 0,
-									}}
-								>
-									<IconCircleFilled
-										size={isActive ? 10 : 7}
-										color={
-											isActive
-												? "var(--mantine-color-indigo-filled)"
-												: "var(--mantine-color-dark-3)"
-										}
-									/>
-									<Text
-										size="10px"
-										c={isActive ? "indigo" : "dimmed"}
-										fw={isActive ? 600 : 400}
-										style={{ lineHeight: 1.2 }}
-									>
-										{isLast ? t("fileMod_timelineCurrent") : `#${idx + 1}`}
-									</Text>
-									<Text size="9px" c="dimmed" style={{ lineHeight: 1 }}>
-										{formatTime(entry.createdAt)}
-									</Text>
-								</UnstyledButton>
-							</Tooltip>
-						</Group>
-					);
-				})}
+			<Group gap="xs" wrap="nowrap" align="flex-end">
+				<NativeSelect
+					size="xs"
+					label={t("fileMod_rangeFrom")}
+					data={fromOptions}
+					value={fromId ?? ""}
+					onChange={(e) => onChange(e.currentTarget.value || null, toId)}
+					style={{ flex: 1, minWidth: 0 }}
+				/>
+				<NativeSelect
+					size="xs"
+					label={t("fileMod_rangeTo")}
+					data={toOptions}
+					value={toId ?? ""}
+					onChange={(e) => onChange(fromId, e.currentTarget.value || null)}
+					style={{ flex: 1, minWidth: 0 }}
+				/>
 			</Group>
 		</Box>
 	);
@@ -181,29 +176,44 @@ export function FileSummaryTab({
 	basePath: string | null;
 }) {
 	const { t } = useTranslation("narrator");
-	const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
 
 	// Always fetch full data first to get timeline
 	const { data: fullData, isLoading: fullLoading } = useFileModifications(narratorId);
 	const timeline = useMemo(() => fullData?.timeline ?? [], [fullData]);
 
-	// Fetch filtered data when a non-latest message is selected
+	// Compute default "from": the last user message in the timeline
+	const defaultFromId = useMemo(() => {
+		for (let i = timeline.length - 1; i >= 0; i--) {
+			if (timeline[i].role === "user") return timeline[i].messageId;
+		}
+		return null; // no user message found → show all
+	}, [timeline]);
+
+	// Range state: undefined means "use default", null means "all/current"
+	const [fromIdOverride, setFromIdOverride] = useState<string | null | undefined>(undefined);
+	const [toId, setToId] = useState<string | null>(null);
+
+	const effectiveFromId = fromIdOverride === undefined ? defaultFromId : fromIdOverride;
+	const isRangeFiltered = effectiveFromId !== null || toId !== null;
+
+	// Fetch filtered data when range is active
 	const { data: filteredData, isLoading: filteredLoading } = useFileModifications(
 		narratorId,
-		!!selectedMessageId,
-		selectedMessageId,
+		isRangeFiltered,
+		toId,
+		effectiveFromId,
 	);
 
-	const data = selectedMessageId ? filteredData : fullData;
-	const isLoading = selectedMessageId ? filteredLoading : fullLoading;
+	const data = isRangeFiltered ? filteredData : fullData;
+	const isLoading = isRangeFiltered ? filteredLoading : fullLoading;
 
 	const revertFile = useRevertFile(narratorId);
 	const [confirmRevert, setConfirmRevert] = useState<string | null>(null);
 	const [expandedFile, setExpandedFile] = useState<string | null>(null);
 
-	// Reset expanded file when switching timeline point
-	const handleTimelineSelect = useCallback((messageId: string | null) => {
-		setSelectedMessageId(messageId);
+	const handleRangeChange = useCallback((newFrom: string | null, newTo: string | null) => {
+		setFromIdOverride(newFrom);
+		setToId(newTo);
 		setExpandedFile(null);
 		setConfirmRevert(null);
 	}, []);
@@ -243,7 +253,8 @@ export function FileSummaryTab({
 		setExpandedFile((prev) => (prev === filePath ? null : filePath));
 	};
 
-	const isViewingHistory = selectedMessageId !== null;
+	// Only show revert when viewing current state (toId is null)
+	const canRevert = toId === null;
 
 	return (
 		<Box
@@ -256,11 +267,12 @@ export function FileSummaryTab({
 				height: "100%",
 			}}
 		>
-			{/* Timeline */}
-			<EditTimeline
+			{/* Range boundary selector */}
+			<RangeBoundarySelector
 				timeline={timeline}
-				selectedId={selectedMessageId}
-				onSelect={handleTimelineSelect}
+				fromId={effectiveFromId}
+				toId={toId}
+				onChange={handleRangeChange}
 			/>
 
 			{/* File count header */}
@@ -358,9 +370,10 @@ export function FileSummaryTab({
 													narratorId={narratorId}
 													snapshotId={file.snapshotId}
 													filePath={file.filePath}
-													upToMessageId={selectedMessageId}
+													upToMessageId={toId}
+													fromMessageId={effectiveFromId}
 												/>
-												{!isViewingHistory && (
+												{canRevert && (
 													<Group justify="flex-end">
 														{confirmRevert === file.filePath ? (
 															<Group gap="xs">

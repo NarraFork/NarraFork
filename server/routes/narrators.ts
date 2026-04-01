@@ -684,6 +684,7 @@ narratorRoutes.get("/:id/messages", async (c) => {
 		...result,
 		pruneBoundaryMessageId: narrator.pruneBoundaryMessageId ?? null,
 		prunedPercent: narrator.prunedPercent ?? null,
+		messageVersion: narrator.messageVersion ?? 0,
 	});
 });
 
@@ -1186,6 +1187,7 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	const narratorId = c.req.param("id");
 	const patchId = c.req.param("patchId");
 	const upToMessageId = c.req.query("upToMessageId");
+	const fromMessageId = c.req.query("fromMessageId");
 
 	const snap = await db.query.narratorFileSnapshots.findFirst({
 		where: and(
@@ -1195,9 +1197,29 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	});
 	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
 
+	// Resolve "from" boundary: file state at fromMessageId (used as the diff base)
+	let originalContent: string | null;
+	if (fromMessageId) {
+		const fromRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, fromMessageId),
+			),
+			columns: { seq: true },
+		});
+		if (fromRef) {
+			const states = await rebuildFileStatesUpToSeq(narratorId, fromRef.seq);
+			originalContent = states.get(snap.filePath) ?? snap.originalContent;
+		} else {
+			return c.json({ error: "fromMessageId not found in this narrator" }, 404);
+		}
+	} else {
+		originalContent = snap.originalContent;
+	}
+
+	// Resolve "to" boundary: file state at upToMessageId (or current)
 	let currentContent: string | null;
 	if (upToMessageId) {
-		// Find the seq for the target message
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
 				eq(narratorMessageRefs.narratorId, narratorId),
@@ -1217,7 +1239,7 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 
 	return c.json({
 		filePath: snap.filePath,
-		original: snap.originalContent,
+		original: originalContent,
 		current: currentContent,
 	});
 });
@@ -1351,6 +1373,7 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 narratorRoutes.get("/:id/file-modifications", async (c) => {
 	const narratorId = c.req.param("id");
 	const upToMessageId = c.req.query("upToMessageId");
+	const fromMessageId = c.req.query("fromMessageId");
 
 	const snapshots = await db.query.narratorFileSnapshots.findMany({
 		where: eq(narratorFileSnapshots.narratorId, narratorId),
@@ -1361,31 +1384,67 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 	// Always query all tool calls first to build the timeline
 	const allToolCalls = await queryOrderedToolCalls(narratorId);
 
-	// Build timeline: unique messageIds in order of first appearance
-	const seenMessages = new Set<string>();
-	const timeline: Array<{ messageId: string; createdAt: string; seq: number }> = [];
-	for (const tc of allToolCalls) {
-		if (!seenMessages.has(tc.messageId)) {
-			seenMessages.add(tc.messageId);
-			timeline.push({ messageId: tc.messageId, createdAt: tc.createdAt, seq: tc.seq });
-		}
+	// Build timeline from all top-level messages (user + assistant + system)
+	// so the frontend can use any message as a range boundary.
+	const allRefs = await db
+		.select({
+			messageId: narratorMessageRefs.messageId,
+			seq: narratorMessageRefs.seq,
+			role: narratorMessages.role,
+			createdAt: narratorMessages.createdAt,
+		})
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+		.where(
+			and(eq(narratorMessageRefs.narratorId, narratorId), isNull(narratorMessages.parentToolUseId)),
+		)
+		.orderBy(asc(narratorMessageRefs.seq));
+
+	const timeline: Array<{
+		messageId: string;
+		createdAt: string;
+		seq: number;
+		role: string;
+		hasEdits: boolean;
+	}> = [];
+	// Pre-compute which messageIds have file edits
+	const editMessageIds = new Set(allToolCalls.map((tc) => tc.messageId));
+	for (const ref of allRefs) {
+		timeline.push({
+			messageId: ref.messageId,
+			createdAt: ref.createdAt,
+			seq: ref.seq,
+			role: ref.role,
+			hasEdits: editMessageIds.has(ref.messageId),
+		});
 	}
 
-	// If upToMessageId is specified, find its seq and filter tool calls
-	let filteredToolCalls = allToolCalls;
-	if (upToMessageId) {
-		const targetEntry = timeline.find((t) => t.messageId === upToMessageId);
-		if (targetEntry) {
-			filteredToolCalls = allToolCalls.filter((tc) => tc.seq <= targetEntry.seq);
-		}
+	// Resolve seq boundaries for range filtering
+	let fromSeq: number | undefined;
+	let toSeq: number | undefined;
+	if (fromMessageId) {
+		const entry = timeline.find((t) => t.messageId === fromMessageId);
+		if (entry) fromSeq = entry.seq;
 	}
+	if (upToMessageId) {
+		const entry = timeline.find((t) => t.messageId === upToMessageId);
+		if (entry) toSeq = entry.seq;
+	}
+
+	// Filter tool calls to the [fromSeq, toSeq] range
+	const isRangeFiltered = fromSeq !== undefined || toSeq !== undefined;
+	const filteredToolCalls = allToolCalls.filter((tc) => {
+		if (fromSeq !== undefined && tc.seq <= fromSeq) return false;
+		if (toSeq !== undefined && tc.seq > toSeq) return false;
+		return true;
+	});
 
 	const grouped = groupByFile(filteredToolCalls);
 
 	const files = snapshots
 		.map((snap) => {
 			const ops = grouped.get(snap.filePath) ?? [];
-			if (upToMessageId && ops.length === 0) return null; // hide files with no ops in filtered mode
+			if (isRangeFiltered && ops.length === 0) return null; // hide files with no ops in filtered mode
 			return {
 				filePath: snap.filePath,
 				snapshotId: snap.id,

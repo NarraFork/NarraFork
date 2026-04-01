@@ -101,6 +101,9 @@ class NarratorWSManager {
 	// --- Last message IDs for catch-up ---
 	private lastMessageIds = new Map<string, string>();
 
+	// --- Message version tracking for sync_check ---
+	private messageVersions = new Map<string, number>();
+
 	// --- Listeners ---
 	private nextId = 1;
 	private listeners = new Map<number, ListenerEntry>();
@@ -356,6 +359,49 @@ class NarratorWSManager {
 	}
 
 	// -----------------------------------------------------------------------
+	// Message version tracking (for sync_check)
+	// -----------------------------------------------------------------------
+
+	updateMessageVersion(narratorId: string, version: number): void {
+		this.messageVersions.set(narratorId, version);
+	}
+
+	/** Optimistically increment the local version by 1 (called on each received message). */
+	bumpMessageVersion(narratorId: string): void {
+		const current = this.messageVersions.get(narratorId) ?? 0;
+		this.messageVersions.set(narratorId, current + 1);
+	}
+
+	/**
+	 * Send a lightweight sync_check for a single narrator.
+	 * The server compares the version and replies with sync_ok (in sync),
+	 * catch_up (incremental), or full_reload (too far behind / deleted).
+	 */
+	checkSync(narratorId: string): void {
+		if (this.ws?.readyState !== WebSocket.OPEN) return;
+		const version = this.messageVersions.get(narratorId) ?? 0;
+		const lastMessageId = this.lastMessageIds.get(narratorId);
+		const msg: Record<string, unknown> = {
+			type: "sync_check",
+			narratorId,
+			version,
+		};
+		if (lastMessageId) msg.lastMessageId = lastMessageId;
+		this.ws.send(JSON.stringify(msg));
+	}
+
+	/**
+	 * Send sync_check for all currently subscribed narrators.
+	 * Called on window focus to detect any missed messages.
+	 */
+	checkAllSubscribedSync(): void {
+		if (this.ws?.readyState !== WebSocket.OPEN) return;
+		for (const narratorId of this.narratorRefCounts.keys()) {
+			this.checkSync(narratorId);
+		}
+	}
+
+	// -----------------------------------------------------------------------
 	// Connection state
 	// -----------------------------------------------------------------------
 
@@ -577,8 +623,9 @@ class NarratorWSManager {
 	 * avoids duplicate streaming snapshots or catch-up races on a stale
 	 * connection that may have silently lost messages.
 	 *
-	 * Short tab switches (< threshold) are ignored to avoid disrupting
-	 * active streaming.
+	 * Short tab switches (< threshold) trigger a lightweight sync_check
+	 * for all subscribed narrators — this detects missed messages without
+	 * the overhead of a full reconnect.
 	 */
 	private _handleVisibilityChange(): void {
 		if (this.cancelled) return;
@@ -600,12 +647,14 @@ class NarratorWSManager {
 			return;
 		}
 
-		// Only act if the tab was hidden long enough for messages to be lost
-		if (elapsed < VISIBILITY_RECONNECT_THRESHOLD_MS) return;
+		// Long hidden — force a clean reconnect
+		if (elapsed >= VISIBILITY_RECONNECT_THRESHOLD_MS) {
+			this.reconnect();
+			return;
+		}
 
-		// Force a clean reconnect — _restoreSubscriptions will run in onopen
-		// with correct lastMessageIds, triggering server-side catch-up.
-		this.reconnect();
+		// Short switch — send lightweight sync_check to detect missed messages
+		this.checkAllSubscribedSync();
 	}
 
 	private _sendSubscribe(narratorIds: string[], lastMessageId?: string): void {

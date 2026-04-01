@@ -633,6 +633,12 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	}),
 	z.object({ type: z.literal("subscribe_stats") }),
 	z.object({ type: z.literal("unsubscribe_stats") }),
+	z.object({
+		type: z.literal("sync_check"),
+		narratorId: z.string().min(1),
+		version: z.number().int().min(0),
+		lastMessageId: z.string().min(1).optional(),
+	}),
 ]);
 
 // Terminal client → server

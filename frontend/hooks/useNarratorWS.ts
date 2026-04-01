@@ -189,6 +189,7 @@ export function useNarratorWS(
 							const msgId = (data.message as TreeMessage).id;
 							lastMessageIdRef.current = msgId;
 							narratorWSManager.updateLastMessageId(subscribedId, msgId);
+							narratorWSManager.bumpMessageVersion(subscribedId);
 						}
 						break;
 					case "user_message":
@@ -199,6 +200,7 @@ export function useNarratorWS(
 							const msgId = (data.message as TreeMessage).id;
 							lastMessageIdRef.current = msgId;
 							narratorWSManager.updateLastMessageId(subscribedId, msgId);
+							narratorWSManager.bumpMessageVersion(subscribedId);
 						}
 						break;
 					case "stream_event":
@@ -393,14 +395,25 @@ export function useNarratorWS(
 							lastMessageIdRef.current = lastId;
 							narratorWSManager.updateLastMessageId(subscribedId, lastId);
 						}
+						// Track messageVersion from catch_up response
+						if (typeof data.messageVersion === "number") {
+							narratorWSManager.updateMessageVersion(subscribedId, data.messageVersion as number);
+						}
 						break;
 					}
 					case "full_reload":
 						callbacksRef.current.onFullReload?.();
 						break;
+					case "sync_ok":
+						// Server confirmed we're in sync — update tracked version
+						if (typeof data.version === "number") {
+							narratorWSManager.updateMessageVersion(subscribedId, data.version as number);
+						}
+						break;
 					case "messages_deleted":
 						if (data.deletedMessageIds) {
 							callbacksRef.current.onMessagesDeleted?.(data.deletedMessageIds as string[]);
+							narratorWSManager.bumpMessageVersion(subscribedId);
 						}
 						break;
 					case "message_updated":

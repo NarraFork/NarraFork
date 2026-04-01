@@ -286,6 +286,13 @@
 	"fileMod_toolCallCount_one": "{{count}} tool call",
 	"fileMod_timelineCurrent": "Current",
 	"fileMod_timelineMessage": "Message #{{n}}",
+	"fileMod_rangeFrom": "After",
+	"fileMod_rangeTo": "Up to",
+	"fileMod_rangeAll": "Beginning",
+	"fileMod_rangeCurrent": "Current",
+	"fileMod_roleUser": "User",
+	"fileMod_roleAssistant": "Assistant",
+	"fileMod_roleSystem": "System",
 	"toolSkillFiles": "Attached files",
 	"toolSkillLoaded": "Skill loaded"
 }

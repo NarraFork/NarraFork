@@ -262,6 +262,8 @@ export const narrators = sqliteTable(
 		backgroundCompletedAt: text("background_completed_at"),
 		/** ISO timestamp when the current (or last) turn started */
 		turnStartedAt: text("turn_started_at"),
+		/** Monotonically increasing counter bumped on every message add/delete/update */
+		messageVersion: integer("message_version").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},

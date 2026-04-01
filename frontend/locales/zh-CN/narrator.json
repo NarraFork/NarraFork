@@ -286,6 +286,13 @@
 	"fileMod_toolCallCount_one": "{{count}} 个工具调用",
 	"fileMod_timelineCurrent": "当前",
 	"fileMod_timelineMessage": "消息 #{{n}}",
+	"fileMod_rangeFrom": "基线",
+	"fileMod_rangeTo": "截止",
+	"fileMod_rangeAll": "起始",
+	"fileMod_rangeCurrent": "当前",
+	"fileMod_roleUser": "用户",
+	"fileMod_roleAssistant": "助手",
+	"fileMod_roleSystem": "系统",
 	"toolSkillFiles": "附带文件",
 	"toolSkillLoaded": "技能已加载"
 }

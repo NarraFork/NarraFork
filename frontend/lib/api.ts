@@ -858,8 +858,12 @@ export const api = {
 		}),
 
 	// File modifications
-	getFileModifications: (narratorId: string, upToMessageId?: string) =>
-		request<{
+	getFileModifications: (narratorId: string, upToMessageId?: string, fromMessageId?: string) => {
+		const params = new URLSearchParams();
+		if (upToMessageId) params.set("upToMessageId", upToMessageId);
+		if (fromMessageId) params.set("fromMessageId", fromMessageId);
+		const qs = params.toString();
+		return request<{
 			files: Array<{
 				filePath: string;
 				snapshotId: string;
@@ -877,14 +881,25 @@ export const api = {
 				messageId: string;
 				createdAt: string;
 				seq: number;
+				role: string;
+				hasEdits: boolean;
 			}>;
-		}>(
-			`/narrators/${narratorId}/file-modifications${upToMessageId ? `?upToMessageId=${upToMessageId}` : ""}`,
-		),
-	getFileDiff: (narratorId: string, snapshotId: string, upToMessageId?: string) =>
-		request<{ filePath: string; original: string | null; current: string | null }>(
-			`/narrators/${narratorId}/patches/${snapshotId}/diff${upToMessageId ? `?upToMessageId=${upToMessageId}` : ""}`,
-		),
+		}>(`/narrators/${narratorId}/file-modifications${qs ? `?${qs}` : ""}`);
+	},
+	getFileDiff: (
+		narratorId: string,
+		snapshotId: string,
+		upToMessageId?: string,
+		fromMessageId?: string,
+	) => {
+		const params = new URLSearchParams();
+		if (upToMessageId) params.set("upToMessageId", upToMessageId);
+		if (fromMessageId) params.set("fromMessageId", fromMessageId);
+		const qs = params.toString();
+		return request<{ filePath: string; original: string | null; current: string | null }>(
+			`/narrators/${narratorId}/patches/${snapshotId}/diff${qs ? `?${qs}` : ""}`,
+		);
+	},
 	revertFile: (narratorId: string, filePath: string) =>
 		request<{ success: boolean; originalExists: boolean }>(`/narrators/${narratorId}/revert-file`, {
 			method: "POST",

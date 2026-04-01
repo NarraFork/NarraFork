@@ -411,6 +411,13 @@ async function appendMessageRef(
 			isCompact,
 			prunedPercent: resolvedPrunedPercent,
 		});
+
+		// Bump messageVersion so clients can detect out-of-sync state cheaply
+		await tx
+			.update(narrators)
+			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+			.where(eq(narrators.id, narratorId));
+
 		return seq;
 	});
 }
@@ -1245,6 +1252,18 @@ export const narratorService = {
 	},
 
 	/**
+	 * Return the current messageVersion for a narrator.
+	 * Used by the sync_check WS flow — a single indexed SELECT, O(1).
+	 */
+	async getMessageVersion(narratorId: string): Promise<number> {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { messageVersion: true },
+		});
+		return row?.messageVersion ?? 0;
+	},
+
+	/**
 	 * Fetch messages added after a given message ID (for WS catch-up).
 	 * Returns:
 	 * - `topLevel`: new top-level messages (tree-structured, chronological)
@@ -1701,6 +1720,7 @@ export const narratorService = {
 					apiConversationId: null,
 					pruneBoundaryMessageId: null,
 					prunedPercent: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId));
@@ -1807,6 +1827,7 @@ export const narratorService = {
 					apiConversationId: null,
 					pruneBoundaryMessageId: null,
 					prunedPercent: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId));
@@ -1859,6 +1880,11 @@ export const narratorService = {
 			if (!otherRef) {
 				await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
 			}
+			// Bump messageVersion
+			await tx
+				.update(narrators)
+				.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+				.where(eq(narrators.id, narratorId));
 		});
 	},
 
@@ -1949,6 +1975,7 @@ export const narratorService = {
 					apiConversationId: null,
 					pruneBoundaryMessageId: null,
 					prunedPercent: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId));
@@ -2162,6 +2189,7 @@ export const narratorService = {
 					apiConversationId: null,
 					pruneBoundaryMessageId: null,
 					prunedPercent: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId));

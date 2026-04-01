@@ -337,7 +337,7 @@ export interface NarraForkSettings {
 }
 
 const DEFAULTS: NarraForkSettings = {
-	server: { port: 7778, host: "localhost", openBrowser: "app" },
+	server: { port: 7778, host: "localhost", openBrowser: "browser" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
 		defaultPermissionMode: "acceptEdits",

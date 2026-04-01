@@ -58,6 +58,18 @@ export function ModelsSection({
 	const { t: tn } = useTranslation("narrator");
 	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
 
+	// For the default model selector, exclude the "follow default" option to prevent self-reference.
+	const prefixedModelsNoDefault = useMemo(
+		() =>
+			prefixedModels.filter(
+				(g) =>
+					!(g as ComboboxItemGroup).items?.some?.(
+						(i) => (typeof i === "string" ? i : i.value) === "__default__",
+					),
+			),
+		[prefixedModels],
+	);
+
 	// Collect all valid model values from the grouped data.
 	const validValues = useMemo(() => {
 		const set = new Set<string>();
@@ -98,7 +110,7 @@ export function ModelsSection({
 		<Stack>
 			<Select
 				label={t("defaultModel")}
-				data={prefixedModels}
+				data={prefixedModelsNoDefault}
 				searchable
 				value={defaultModel}
 			/>

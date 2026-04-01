@@ -262,7 +262,8 @@ export type NarratorServerMessage =
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
-	| { type: "model_switched"; narratorId: string; model: string; provider: string };
+	| { type: "model_switched"; narratorId: string; model: string; provider: string }
+	| { type: "sync_ok"; narratorId: string; version: number };
 
 // Client → Server messages
 export type NarratorClientMessage =
@@ -290,7 +291,8 @@ export type NarratorClientMessage =
 	| { type: "presence_join"; narratorId: string }
 	| { type: "presence_leave"; narratorId: string }
 	| { type: "subscribe_stats" }
-	| { type: "unsubscribe_stats" };
+	| { type: "unsubscribe_stats" }
+	| { type: "sync_check"; narratorId: string; version: number; lastMessageId?: string };
 
 // === Connection registry ===
 
@@ -698,9 +700,11 @@ export const handleNarratorWS = {
 				// Catch-up: send messages the client missed while disconnected
 				if (msg.lastMessageId && msg.narratorIds.length === 1) {
 					const narratorId = msg.narratorIds[0];
-					narratorService
-						.getMessagesAfter(narratorId, msg.lastMessageId)
-						.then(({ topLevel, orphanChildren, hitLimit }) => {
+					Promise.all([
+						narratorService.getMessagesAfter(narratorId, msg.lastMessageId),
+						narratorService.getMessageVersion(narratorId),
+					])
+						.then(([{ topLevel, orphanChildren, hitLimit }, version]) => {
 							// Connection may have been removed while the async query ran
 							if (!connections.has(ws)) return;
 							// Too many missed messages or reference not found — tell client to reload
@@ -712,7 +716,21 @@ export const handleNarratorWS = {
 								}
 								return;
 							}
-							if (topLevel.length === 0 && orphanChildren.length === 0) return;
+							if (topLevel.length === 0 && orphanChildren.length === 0) {
+								// No new messages — send sync_ok with current version
+								try {
+									ws.send(
+										JSON.stringify({
+											type: "sync_ok",
+											narratorId,
+											version,
+										}),
+									);
+								} catch {
+									connections.delete(ws);
+								}
+								return;
+							}
 							try {
 								ws.send(
 									JSON.stringify({
@@ -720,6 +738,7 @@ export const handleNarratorWS = {
 										narratorId,
 										orphanChildren,
 										topLevel,
+										messageVersion: version,
 									}),
 								);
 							} catch {
@@ -928,6 +947,79 @@ export const handleNarratorWS = {
 					ws.data.subscribedStats = false;
 					removeStatsSubscriber();
 				}
+				break;
+			}
+			case "sync_check": {
+				const narratorId = msg.narratorId;
+				narratorService
+					.getMessageVersion(narratorId)
+					.then((serverVersion) => {
+						if (!connections.has(ws)) return;
+						if (serverVersion === msg.version) {
+							// In sync — cheap ack
+							try {
+								ws.send(
+									JSON.stringify({
+										type: "sync_ok",
+										narratorId,
+										version: serverVersion,
+									}),
+								);
+							} catch {
+								connections.delete(ws);
+							}
+							return;
+						}
+						// Out of sync — try catch-up if lastMessageId provided
+						if (msg.lastMessageId) {
+							narratorService
+								.getMessagesAfter(narratorId, msg.lastMessageId)
+								.then(({ topLevel, orphanChildren, hitLimit }) => {
+									if (!connections.has(ws)) return;
+									if (hitLimit) {
+										try {
+											ws.send(JSON.stringify({ type: "full_reload", narratorId }));
+										} catch {
+											connections.delete(ws);
+										}
+										return;
+									}
+									if (topLevel.length === 0 && orphanChildren.length === 0) {
+										// Version mismatch but no new messages — likely a delete/update
+										try {
+											ws.send(JSON.stringify({ type: "full_reload", narratorId }));
+										} catch {
+											connections.delete(ws);
+										}
+										return;
+									}
+									try {
+										ws.send(
+											JSON.stringify({
+												type: "catch_up",
+												narratorId,
+												orphanChildren,
+												topLevel,
+												messageVersion: serverVersion,
+											}),
+										);
+									} catch {
+										connections.delete(ws);
+									}
+								})
+								.catch((err: unknown) =>
+									logger.warn("sync_check catch-up failed", { error: String(err) }),
+								);
+						} else {
+							// No lastMessageId — full reload
+							try {
+								ws.send(JSON.stringify({ type: "full_reload", narratorId }));
+							} catch {
+								connections.delete(ws);
+							}
+						}
+					})
+					.catch((err: unknown) => logger.warn("sync_check failed", { error: String(err) }));
 				break;
 			}
 		}
