@@ -40,6 +40,7 @@ import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
+import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
@@ -101,6 +102,7 @@ app.use("/api/*", requireAuth);
 const GIT_FREE_PREFIXES = [
 	"/api/settings",
 	"/api/admin",
+	"/api/storage",
 	"/api/user-preferences",
 	"/api/notification",
 	"/api/update",
@@ -141,6 +143,7 @@ app.route("/api/codex", codexRoutes);
 app.route("/api/cline", clineRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/skills", skillRoutes);
+app.route("/api/storage", storageRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/reviews", reviewsRouter);

@@ -6,6 +6,7 @@ import {
 	IconChevronDown,
 	IconChevronUp,
 	IconCpu,
+	IconDatabase,
 	IconInfoCircle,
 	IconPalette,
 	IconServer,
@@ -25,6 +26,7 @@ import { ModelsSection, type SubagentAllowedModels } from "../../components/sett
 import { NotificationSection } from "../../components/settings/NotificationSection";
 import { ProfileSection } from "../../components/settings/ProfileSection";
 import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
+import { StorageSection } from "../../components/settings/StorageSection";
 import {
 	useCurrentUser,
 	useDeleteAvatar,
@@ -43,6 +45,7 @@ const ALL_SECTIONS = [
 	"chaptersContainers",
 	"notifications",
 	"appearance",
+	"storage",
 	"serverSystem",
 	"about",
 ];
@@ -834,6 +837,16 @@ function SettingsPage() {
 							advancedAnim={advancedAnim}
 							setAdvancedAnim={setAdvancedAnim}
 						/>
+					</Accordion.Panel>
+				</Accordion.Item>
+
+				{/* Storage */}
+				<Accordion.Item value="storage">
+					<Accordion.Control icon={<IconDatabase size={20} />}>
+						{t("storageSection")}
+					</Accordion.Control>
+					<Accordion.Panel>
+						<StorageSection />
 					</Accordion.Panel>
 				</Accordion.Item>
 

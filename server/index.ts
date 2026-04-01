@@ -637,6 +637,8 @@ const shutdown = async () => {
 	worktreeWatcher.shutdown();
 	projectDbManager.closeAll();
 	mcpManager.shutdown().catch(() => {});
+	// Close browser pool if it was started
+	import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()).catch(() => {});
 	// Explicitly stop the HTTP server so the port is released immediately.
 	// On Windows, process.exit() alone may not close the socket in time,
 	// leaving a zombie process holding the port.

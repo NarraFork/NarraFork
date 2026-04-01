@@ -64,7 +64,7 @@ projectRoutes.post("/", async (c) => {
 	gitPath = resolve(gitPath);
 
 	let remoteUrl: string | null = null;
-	let defaultBranch = body.defaultBranch ?? "main";
+	let defaultBranch = "main";
 	const mode = body.repoMode;
 
 	// For clone mode, use SSE to stream progress
@@ -90,7 +90,7 @@ projectRoutes.post("/", async (c) => {
 
 				const detectedBranch = await gitService.getCurrentBranch(gitPath);
 				remoteUrl = cloneUrl;
-				defaultBranch = cloneBranch ?? detectedBranch ?? "main";
+				defaultBranch = detectedBranch ?? "main";
 
 				const [project] = await db
 					.insert(projects)
@@ -160,10 +160,12 @@ projectRoutes.post("/", async (c) => {
 		if (!(await gitService.isGitRepo(gitPath))) {
 			throw new ValidationError(`Path is not a git repository: ${gitPath}`);
 		}
+		const detectedBranch = await gitService.getCurrentBranch(gitPath);
+		defaultBranch = detectedBranch ?? "main";
 	} else if (mode === "init") {
 		await gitService.initRepo(gitPath);
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
-		defaultBranch = body.defaultBranch ?? detectedBranch ?? "main";
+		defaultBranch = detectedBranch ?? "main";
 
 		// Commit .gitignore as part of initial repo setup so fork branches inherit it
 		ensureGitignoreEntry(gitPath);

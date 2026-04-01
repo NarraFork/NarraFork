@@ -1,6 +1,7 @@
-// Lightweight HTTP fetch — fallback when Puppeteer is not available.
+// Lightweight HTTP fetch — fallback when Playwright browser is not available.
 // Uses native fetch() + linkedom for HTML parsing, no browser needed.
 
+import type { Page } from "playwright-core";
 import { logger } from "../logger";
 import { getWebFetchProxy } from "./proxy";
 
@@ -15,6 +16,8 @@ const BROWSER_UNAVAILABLE_PATTERNS = [
 	"not installed",
 	"ENOENT",
 	"cannot open shared object",
+	"Executable doesn't exist",
+	"browserType.launch",
 ];
 
 /** Check if an error message indicates the browser is simply not available. */
@@ -24,7 +27,7 @@ function isBrowserUnavailableError(msg: string): boolean {
 
 /**
  * Fetch a URL via HTTP and return the raw HTML body.
- * Works without Puppeteer — suitable for static pages, APIs, raw files.
+ * Works without Playwright — suitable for static pages, APIs, raw files.
  */
 export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): Promise<string> {
 	const controller = new AbortController();
@@ -53,7 +56,7 @@ export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): 
 }
 
 /**
- * Try to get HTML via Puppeteer. If browser is unavailable, returns null
+ * Try to get HTML via Playwright. If browser is unavailable, returns null
  * so the caller can fall back to HTTP fetch.
  *
  * Does NOT cache failures — if the user installs Chrome mid-session,
@@ -63,7 +66,7 @@ export async function tryBrowserFetch(
 	url: string,
 	options?: {
 		blockMedia?: boolean;
-		waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
+		waitUntil?: "load" | "domcontentloaded" | "networkidle";
 	},
 ): Promise<string | null> {
 	try {
@@ -75,7 +78,10 @@ export async function tryBrowserFetch(
 		try {
 			return await page.content();
 		} finally {
-			await page.close().catch(() => {});
+			await page
+				.context()
+				.close()
+				.catch(() => {});
 		}
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -95,13 +101,13 @@ export async function tryBrowserFetch(
  */
 export async function tryBrowserPage(
 	url: string,
-	options?: { waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" },
-): Promise<import("puppeteer").Page | null> {
+	options?: { waitUntil?: "load" | "domcontentloaded" | "networkidle" },
+): Promise<Page | null> {
 	try {
 		const { fetchPage } = await import("./browser");
 		return await fetchPage(url, {
 			blockMedia: false,
-			waitUntil: options?.waitUntil ?? "networkidle2",
+			waitUntil: options?.waitUntil ?? "networkidle",
 		});
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);

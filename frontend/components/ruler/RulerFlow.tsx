@@ -3324,11 +3324,11 @@ function NarratorPanelOverlay({
 				}}
 			>
 				<Box style={{ height: "100%", visibility: isCurrentlyResizing ? "hidden" : "visible" }}>
-					<StableNarratorPanel
-						narratorId={narratorId}
-						onMinimize={onClose}
-						onHeaderPointerDown={startDrag}
-					/>
+				<StableNarratorPanel
+					narratorId={narratorId}
+					onClose={onClose}
+					onHeaderPointerDown={startDrag}
+				/>
 				</Box>
 				{isCurrentlyResizing && (
 					<Box
@@ -3348,18 +3348,18 @@ function NarratorPanelOverlay({
 /** Memoized wrapper — prevents NarratorPanel from re-rendering during resize drags */
 const StableNarratorPanel = memo(function StableNarratorPanel({
 	narratorId,
-	onMinimize,
+	onClose,
 	onHeaderPointerDown,
 }: {
 	narratorId: string;
-	onMinimize?: () => void;
+	onClose?: () => void;
 	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 }) {
 	return (
 		<NarratorPanel
 			narratorId={narratorId}
 			compact
-			onMinimize={onMinimize}
+			onClose={onClose}
 			onHeaderPointerDown={onHeaderPointerDown}
 		/>
 	);

@@ -8,6 +8,18 @@ export interface ChangelogEntry {
 	"zh-CN": string;
 }
 
+export interface StorageCategoryResult {
+	key: string;
+	sizeBytes: number;
+	details?: Record<string, unknown>;
+}
+
+export interface StorageScanResult {
+	categories: StorageCategoryResult[];
+	totalBytes: number;
+	scannedAt: number;
+}
+
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
 	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
 }
@@ -2256,6 +2268,17 @@ export const api = {
 
 	// Changelog
 	getChangelogs: () => request<ChangelogEntry[]>("/changelog"),
+
+	// ── Storage ──
+	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
+	cleanupStorage: (target: "uploads" | "shares" | "worktrees" | "containers") =>
+		request<{
+			ok: boolean;
+			removed?: number;
+			freedBytes?: number;
+			success?: boolean;
+			output?: string;
+		}>("/storage/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
 };
 
 	text: string,
@@ -2301,4 +2324,83 @@ export const api = {
 			}
 		}
 	}
+}
+
+/**
+ * Scan storage via SSE stream.
+ * Calls onProgress for status updates, onCategory for each scanned category,
+ * and resolves with the complete result.
+ */
+export function scanStorageStream(callbacks: {
+	onProgress?: (message: string) => void;
+	onCategory?: (data: StorageCategoryResult) => void;
+	signal?: AbortSignal;
+}): Promise<StorageScanResult> {
+	return new Promise((resolve, reject) => {
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+
+		fetch(`${BASE}/storage/scan`, { headers, signal: callbacks.signal })
+			.then((response) => {
+				if (!response.ok) {
+					reject(new ApiError("Scan failed", response.status));
+					return;
+				}
+				const reader = response.body?.getReader();
+				if (!reader) {
+					reject(new ApiError("No response body", 500));
+					return;
+				}
+
+				const decoder = new TextDecoder();
+				let buffer = "";
+
+				const pump = (): void => {
+					reader
+						.read()
+						.then(({ done, value }) => {
+							if (done) return;
+							buffer += decoder.decode(value, { stream: true });
+							const lines = buffer.split("\n");
+							buffer = lines.pop() ?? "";
+
+							let eventType = "";
+							for (const line of lines) {
+								if (line.startsWith("event:")) {
+									eventType = line.slice(6).trim();
+								} else if (line.startsWith("data:")) {
+									const jsonStr = line.slice(5).trim();
+									if (!jsonStr) continue;
+									try {
+										const parsed = JSON.parse(jsonStr);
+										if (eventType === "progress") {
+											callbacks.onProgress?.(parsed.message);
+										} else if (eventType === "category") {
+											callbacks.onCategory?.(parsed);
+										} else if (eventType === "complete") {
+											reader.cancel().catch(() => {});
+											resolve(parsed as StorageScanResult);
+											return;
+										} else if (eventType === "error") {
+											reader.cancel().catch(() => {});
+											reject(new ApiError(parsed.error ?? "Scan failed", 500));
+											return;
+										}
+									} catch {
+										// skip malformed JSON
+									}
+								} else if (line.trim() === "") {
+									// Empty line marks end of SSE event — reset for next event
+									eventType = "";
+								}
+							}
+							pump();
+						})
+						.catch(reject);
+				};
+				pump();
+			})
+			.catch(reject);
+	});
 }

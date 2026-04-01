@@ -2,6 +2,7 @@ import { toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
 import { bashTool } from "./bash";
+import { browserTool } from "./browser";
 import { taskStopTool } from "./cancel-background-task";
 import { taskOutputTool } from "./check-background-task";
 import { continueTaskTool } from "./continue-task";
@@ -37,6 +38,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
 	["Recall", recallTool],
+	["Browser", browserTool],
 ]);
 
 /**

@@ -24,7 +24,7 @@ async function canLaunchBrowser(): Promise<boolean> {
 	try {
 		const { getBrowser } = await import("../../../web-fetch/browser");
 		const b = await getBrowser();
-		_browserOk = b.connected;
+		_browserOk = b.isConnected();
 	} catch {
 		_browserOk = false;
 	}

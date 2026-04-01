@@ -59,7 +59,6 @@ export const createProjectSchema = z.object({
 	// Repository mode: "existing" (default), "init", "clone"
 	repoMode: z.enum(["existing", "init", "clone"]),
 	gitPath: z.string().min(1),
-	defaultBranch: gitBranchName.optional(),
 	// Clone-specific fields
 	cloneUrl: z.string().min(1).optional(),
 	cloneBranch: gitBranchName.optional(),

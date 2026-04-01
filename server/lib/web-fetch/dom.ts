@@ -1,5 +1,5 @@
 // DOM mode — extract and clean rendered HTML.
-// Try Puppeteer first, fall back to HTTP fetch + linkedom if browser unavailable.
+// Try Playwright first, fall back to HTTP fetch + linkedom if browser unavailable.
 
 import sanitizeHtml from "sanitize-html";
 import { httpFetchHtml, tryBrowserFetch } from "./http-fetch";
@@ -32,17 +32,22 @@ export async function fetchDom(
 	let html: string;
 
 	if (selector) {
-		// With selector: try browser $$eval first (live DOM), fall back to linkedom
+		// With selector: try browser first (live DOM), fall back to linkedom
 		const { tryBrowserPage } = await import("./http-fetch");
 		const page = await tryBrowserPage(url, { waitUntil: "domcontentloaded" });
 		if (page) {
 			try {
-				html = await page.$$eval(selector, (els) => els.map((el) => el.outerHTML).join("\n"));
+				html = await page
+					.locator(selector)
+					.evaluateAll((els) => els.map((el) => el.outerHTML).join("\n"));
 				if (!html) {
 					return `No elements found matching selector: ${selector}`;
 				}
 			} finally {
-				await page.close().catch(() => {});
+				await page
+					.context()
+					.close()
+					.catch(() => {});
 			}
 		} else {
 			const rawHtml = await httpFetchHtml(url);

@@ -4719,6 +4719,16 @@ export function closeNarrator(narratorId: string): void {
 			error: String(err),
 		});
 	});
+	// Clean up any browser sessions owned by this narrator
+	import("../lib/browser/session")
+		.then(({ cleanupNarrator }) => {
+			cleanupNarrator(narratorId).catch((err) => {
+				logger.warn("Failed to cleanup browser sessions", { narratorId, error: String(err) });
+			});
+		})
+		.catch((err) => {
+			logger.warn("Failed to load browser session module", { narratorId, error: String(err) });
+		});
 	logger.info("Narrator closed", { narratorId });
 }
 
