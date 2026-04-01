@@ -153,3 +153,37 @@ export function listSessions(
 		lastActivity: s.lastActivity,
 	}));
 }
+
+/** Get stats for all active browser sessions across all narrators. */
+export function getAllSessionStats(): {
+	totalSessions: number;
+	narrators: Array<{ narratorId: string; sessionCount: number }>;
+} {
+	let totalSessions = 0;
+	const narratorStats: Array<{ narratorId: string; sessionCount: number }> = [];
+	for (const [narratorId, map] of sessions) {
+		totalSessions += map.size;
+		narratorStats.push({ narratorId, sessionCount: map.size });
+	}
+	return { totalSessions, narrators: narratorStats };
+}
+
+/** Close all browser sessions across all narrators. */
+export async function closeAllSessions(): Promise<number> {
+	let closed = 0;
+	const promises: Promise<void>[] = [];
+	for (const [, map] of sessions) {
+		for (const session of map.values()) {
+			promises.push(session.context.close().catch(() => {}));
+			closed++;
+		}
+	}
+	await Promise.all(promises);
+	sessions.clear();
+	if (cleanupTimer) {
+		clearInterval(cleanupTimer);
+		cleanupTimer = null;
+	}
+	logger.info("All browser sessions closed", { count: closed });
+	return closed;
+}

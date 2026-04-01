@@ -9,6 +9,7 @@ import {
 	IconDatabase,
 	IconInfoCircle,
 	IconPalette,
+	IconPlayerPlay,
 	IconServer,
 	IconUser,
 } from "@tabler/icons-react";
@@ -25,6 +26,7 @@ import { ChaptersContainersSection } from "../../components/settings/ChaptersCon
 import { ModelsSection, type SubagentAllowedModels } from "../../components/settings/ModelsSection";
 import { NotificationSection } from "../../components/settings/NotificationSection";
 import { ProfileSection } from "../../components/settings/ProfileSection";
+import { RuntimeSection } from "../../components/settings/RuntimeSection";
 import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
 import { StorageSection } from "../../components/settings/StorageSection";
 import {
@@ -46,6 +48,7 @@ const ALL_SECTIONS = [
 	"notifications",
 	"appearance",
 	"storage",
+	"runtime",
 	"serverSystem",
 	"about",
 ];
@@ -847,6 +850,16 @@ function SettingsPage() {
 					</Accordion.Control>
 					<Accordion.Panel>
 						<StorageSection />
+					</Accordion.Panel>
+				</Accordion.Item>
+
+				{/* Runtime Resources */}
+				<Accordion.Item value="runtime">
+					<Accordion.Control icon={<IconPlayerPlay size={20} />}>
+						{t("runtimeSection")}
+					</Accordion.Control>
+					<Accordion.Panel>
+						<RuntimeSection />
 					</Accordion.Panel>
 				</Accordion.Item>
 

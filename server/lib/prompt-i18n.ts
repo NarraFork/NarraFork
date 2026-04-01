@@ -613,7 +613,8 @@ const toolMessages = {
 	},
 	exitPlanModeEmptyPlanFallback: {
 		en: "Error: The plan content is empty. Provide a non-empty plan in the 'plan' parameter or write it to the designated plan file first.",
-		"zh-CN": "错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
+		"zh-CN":
+			"错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
 	},
 	// Plan mode disabled tool description (injected in loop.ts)
 	planModeToolDisabled: {
@@ -730,6 +731,19 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 	overseerRecentMessagesHeader: {
 		en: "Recent messages from narrator {narratorId} ({count}):",
 		"zh-CN": "叙述者 {narratorId} 的近期消息（{count}）：",
+	},
+	forkNarratorSuccess: {
+		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n{chapterInfo}\nThe new narrator is now running independently with your message.",
+		"zh-CN":
+			"叙述者分叉成功。\n\n叙述者 ID：{narratorId}\n标题：{title}\n{chapterInfo}\n新叙述者正在独立运行你的消息。",
+	},
+	forkNarratorChapterInfo: {
+		en: "Chapter ID: {chapterId}\nChapter: {chapterTitle}\n",
+		"zh-CN": "章节 ID：{chapterId}\n章节：{chapterTitle}\n",
+	},
+	forkNarratorError: {
+		en: "Failed to fork narrator: {error}",
+		"zh-CN": "分叉叙述者失败：{error}",
 	},
 } satisfies Record<string, Record<Locale, string>>;
 

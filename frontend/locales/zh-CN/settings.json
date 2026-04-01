@@ -619,5 +619,40 @@
 	"storageScanProgress_scanning_containers": "正在扫描容器...",
 	"storageNarratorDirs": "{{count}} 个叙述者",
 	"storageShareCount": "{{count}} 个共享",
-	"storageWorktreeCount": "{{count}} 个工作树"
+	"storageWorktreeCount": "{{count}} 个工作树",
+
+	"runtimeSection": "运行资源",
+	"runtimeScan": "扫描",
+	"runtimeRescan": "重新扫描",
+	"runtimeScanning": "扫描中...",
+	"runtimeLastScanned": "上次扫描：{{time}}",
+	"runtimeNotScanned": "点击扫描以检查运行资源使用情况",
+
+	"runtimeTerminals": "终端",
+	"runtimeTerminalsDesc": "服务器管理的终端进程",
+	"runtimeTerminalsRunning": "{{count}} 个运行中",
+	"runtimeTerminalsExited": "{{count}} 个已退出",
+	"runtimeTerminalsOrphan": "{{count}} 个孤立",
+	"runtimeCleanupTerminals": "清理已退出终端和孤立 socket",
+	"runtimeCleanupTerminalsSuccess": "已清理 {{count}} 个终端",
+
+	"runtimeContainers": "容器",
+	"runtimeContainersDesc": "章节环境的 Podman 容器",
+	"runtimeContainersRunning": "{{count}} 个运行中",
+	"runtimeContainersStopped": "{{count}} 个已停止",
+	"runtimeContainersUnavailable": "Podman 不可用",
+	"runtimeCleanupContainers": "停止所有运行中的容器",
+	"runtimeCleanupContainersSuccess": "已停止 {{count}} 个容器",
+
+	"runtimeBrowsers": "浏览器",
+	"runtimeBrowsersDesc": "用于网页抓取的 Playwright 浏览器",
+	"runtimeBrowserProcess": "进程：{{status}}",
+	"runtimeBrowserProcessRunning": "运行中",
+	"runtimeBrowserProcessStopped": "已停止",
+	"runtimeBrowserSessions": "{{count}} 个活跃会话",
+	"runtimeCleanupBrowsers": "关闭所有会话和浏览器进程",
+	"runtimeCleanupBrowsersSuccess": "已关闭 {{count}} 个会话，浏览器已停止",
+
+	"runtimeCleanupConfirm": "确定要执行此操作吗？这将终止选中的资源。",
+	"runtimeNone": "无"
 }

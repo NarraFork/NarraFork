@@ -619,5 +619,40 @@
 	"storageScanProgress_scanning_containers": "Scanning containers...",
 	"storageNarratorDirs": "{{count}} narrator(s)",
 	"storageShareCount": "{{count}} share(s)",
-	"storageWorktreeCount": "{{count}} worktree(s)"
+	"storageWorktreeCount": "{{count}} worktree(s)",
+
+	"runtimeSection": "Runtime Resources",
+	"runtimeScan": "Scan",
+	"runtimeRescan": "Rescan",
+	"runtimeScanning": "Scanning...",
+	"runtimeLastScanned": "Last scanned: {{time}}",
+	"runtimeNotScanned": "Click Scan to check runtime resource usage",
+
+	"runtimeTerminals": "Terminals",
+	"runtimeTerminalsDesc": "Terminal processes managed by the server",
+	"runtimeTerminalsRunning": "{{count}} running",
+	"runtimeTerminalsExited": "{{count}} exited",
+	"runtimeTerminalsOrphan": "{{count}} orphan",
+	"runtimeCleanupTerminals": "Kill exited terminals and orphan sockets",
+	"runtimeCleanupTerminalsSuccess": "Cleaned up {{count}} terminal(s)",
+
+	"runtimeContainers": "Containers",
+	"runtimeContainersDesc": "Podman containers for chapter environments",
+	"runtimeContainersRunning": "{{count}} running",
+	"runtimeContainersStopped": "{{count}} stopped",
+	"runtimeContainersUnavailable": "Podman not available",
+	"runtimeCleanupContainers": "Stop all running containers",
+	"runtimeCleanupContainersSuccess": "Stopped {{count}} container(s)",
+
+	"runtimeBrowsers": "Browsers",
+	"runtimeBrowsersDesc": "Playwright browser for web page fetching",
+	"runtimeBrowserProcess": "Process: {{status}}",
+	"runtimeBrowserProcessRunning": "running",
+	"runtimeBrowserProcessStopped": "stopped",
+	"runtimeBrowserSessions": "{{count}} active session(s)",
+	"runtimeCleanupBrowsers": "Close all sessions and browser process",
+	"runtimeCleanupBrowsersSuccess": "Closed {{count}} session(s), browser stopped",
+
+	"runtimeCleanupConfirm": "Are you sure? This will terminate the selected resources.",
+	"runtimeNone": "None"
 }

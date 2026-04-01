@@ -301,6 +301,12 @@ export async function createContext(): Promise<BrowserContext> {
 	});
 }
 
+/** Check whether the singleton browser is running and connected. */
+export function getBrowserStatus(): { running: boolean; connected: boolean } {
+	if (!browser) return { running: false, connected: false };
+	return { running: true, connected: browser.isConnected() };
+}
+
 /** Gracefully close the browser (called on process exit). */
 export async function closeBrowser(): Promise<void> {
 	if (browser) {

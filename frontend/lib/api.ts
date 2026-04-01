@@ -20,6 +20,13 @@ export interface StorageScanResult {
 	scannedAt: number;
 }
 
+export interface RuntimeScanResult {
+	terminals: { running: number; exited: number; orphanSockets: number };
+	containers: { running: number; stopped: number; podmanAvailable: boolean };
+	browsers: { processRunning: boolean; connected: boolean; activeSessions: number };
+	scannedAt: number;
+}
+
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
 	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
 }
@@ -2279,6 +2286,18 @@ export const api = {
 			success?: boolean;
 			output?: string;
 		}>("/storage/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
+
+	// ── Runtime Resources ──
+	scanRuntime: () => request<RuntimeScanResult>("/runtime/scan"),
+	getCachedRuntime: () => request<{ cached: boolean; data?: RuntimeScanResult }>("/runtime/cached"),
+	cleanupRuntime: (target: "terminals" | "containers" | "browsers") =>
+		request<{
+			ok: boolean;
+			killed?: number;
+			stopped?: number;
+			closedSessions?: number;
+			browserClosed?: boolean;
+		}>("/runtime/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
 };
 
 	text: string,

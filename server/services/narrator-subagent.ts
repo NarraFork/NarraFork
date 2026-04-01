@@ -72,7 +72,7 @@ function getSubagentBufferedMessagesMap() {
 /** Tools available to explore/plan subagents (read-only + Shell/Bash for shell inspection) */
 const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", SHELL_TOOL_NAME]);
 
-/** Tools excluded from general subagents (no nesting, no plan mode) */
+/** Tools excluded from general subagents (no nesting, no plan mode, no forking) */
 const GENERAL_EXCLUDED = new Set([
 	"Agent",
 	"ContinueTask",
@@ -81,6 +81,7 @@ const GENERAL_EXCLUDED = new Set([
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"TaskCreate",
+	"ForkNarrator",
 ]);
 
 /** Tool filter factories per built-in subagent type */

@@ -3520,6 +3520,91 @@ export const narratorService = {
 		return newNarrator;
 	},
 
+	/**
+	 * Fork a standalone narrator from a tool call.
+	 * For chapter-bound narrators, use chapterFork.fork() instead (handled by the tool).
+	 * This handles standalone narrators only.
+	 */
+	async forkStandaloneFromTool(
+		parentNarratorId: string,
+		mode: "fresh" | "fork",
+		opts?: {
+			title?: string;
+			inheritMode?: "full" | "compressed";
+			model?: string;
+			locale?: string;
+		},
+	) {
+		const parent = await this.getById(parentNarratorId);
+
+		if (parent.type === "subagent") {
+			throw new ValidationError("Cannot fork from a subagent narrator");
+		}
+		if (parent.chapterId) {
+			throw new ValidationError(
+				"Chapter-bound narrators must fork via chapter fork (use chapterFork.fork)",
+			);
+		}
+
+		if (mode === "fresh") {
+			// Create a brand-new standalone narrator inheriting parent's config
+			const newNarrator = await this.create({
+				chapterId: null,
+				model: opts?.model ?? parent.model ?? undefined,
+				systemPrompt: parent.systemPrompt ?? undefined,
+				permissionMode: parent.permissionMode ?? undefined,
+				cwd: parent.cwd ?? undefined,
+				reasoningEffort: parent.reasoningEffort as
+					| "none"
+					| "low"
+					| "medium"
+					| "high"
+					| "xhigh"
+					| null
+					| undefined,
+				fastMode: parent.fastMode ?? undefined,
+				relaxedPlan: parent.relaxedPlan ?? undefined,
+				title: opts?.title ?? undefined,
+			});
+			eventBus.emit({
+				type: "narrator:forked",
+				narratorId: newNarrator.id,
+				parentNarratorId,
+			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "narrator_forked",
+				narratorId: newNarrator.id,
+				parentNarratorId,
+			});
+			return newNarrator;
+		}
+
+		// mode === "fork": find latest message UUID and delegate to forkNarrator
+		const latestRef = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+			})
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, parentNarratorId))
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+
+		const latestMsgUuid = latestRef.length
+			? ((
+					await db.query.narratorMessages.findFirst({
+						where: eq(narratorMessages.id, latestRef[0].messageId),
+						columns: { messageUuid: true },
+					})
+				)?.messageUuid ?? null)
+			: null;
+
+		return this.forkNarrator(parentNarratorId, latestMsgUuid, {
+			title: opts?.title,
+			inheritMode: opts?.inheritMode ?? "full",
+			locale: opts?.locale,
+		});
+	},
+
 	// === Dynamic pruning boundary ===
 
 	/**

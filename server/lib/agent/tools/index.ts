@@ -7,6 +7,7 @@ import { taskStopTool } from "./cancel-background-task";
 import { taskOutputTool } from "./check-background-task";
 import { continueTaskTool } from "./continue-task";
 import { editTool } from "./edit";
+import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import {
@@ -39,6 +40,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["ShareFile", shareFileTool],
 	["Recall", recallTool],
 	["Browser", browserTool],
+	["ForkNarrator", forkNarratorTool],
 ]);
 
 /**
