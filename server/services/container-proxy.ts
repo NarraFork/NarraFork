@@ -5,6 +5,7 @@ import { containerInstances, projects } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { safeSpawn } from "../lib/spawn";
 
 interface ProxyTarget {
 	containerIp: string;
@@ -35,7 +36,7 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 // Cache management
 // ---------------------------------------------------------------------------
 
-/** Load all active proxy targets from DB into cache. */
+/** Load all active proxy targets from DB into cache, reconciling with actual container state. */
 export async function refreshCache(): Promise<void> {
 	cache.clear();
 	registeredDomains.clear();
@@ -52,6 +53,8 @@ export async function refreshCache(): Promise<void> {
 	// Load running container instances with proxy info
 	const instances = await db
 		.select({
+			id: containerInstances.id,
+			containerId: containerInstances.containerId,
 			proxyLabel: containerInstances.proxyLabel,
 			containerIp: containerInstances.containerIp,
 			containerPort: containerInstances.containerPort,
@@ -63,13 +66,45 @@ export async function refreshCache(): Promise<void> {
 			and(
 				eq(containerInstances.status, "running"),
 				isNotNull(containerInstances.proxyLabel),
-				isNotNull(containerInstances.containerIp),
 				isNotNull(containerInstances.containerPort),
 			),
 		);
 
 	for (const inst of instances) {
-		if (inst.proxyLabel && inst.containerIp && inst.containerPort != null) {
+		if (!inst.proxyLabel || inst.containerPort == null) continue;
+
+		// Reconcile: verify container is actually running and refresh IP
+		if (inst.containerId) {
+			const live = await inspectContainerState(inst.containerId);
+			if (!live.running) {
+				// Container is gone or stopped — update DB and skip
+				logger.info("Reconcile: container no longer running, updating DB", {
+					containerId: inst.containerId,
+					chapterId: inst.chapterId,
+					serviceName: inst.serviceName,
+				});
+				await db
+					.update(containerInstances)
+					.set({ status: "stopped", updatedAt: new Date().toISOString() })
+					.where(eq(containerInstances.id, inst.id));
+				continue;
+			}
+			// Update IP if it changed
+			if (live.ip && live.ip !== inst.containerIp) {
+				logger.info("Reconcile: container IP changed, updating DB", {
+					containerId: inst.containerId,
+					oldIp: inst.containerIp,
+					newIp: live.ip,
+				});
+				await db
+					.update(containerInstances)
+					.set({ containerIp: live.ip, updatedAt: new Date().toISOString() })
+					.where(eq(containerInstances.id, inst.id));
+				inst.containerIp = live.ip;
+			}
+		}
+
+		if (inst.containerIp) {
 			cache.set(inst.proxyLabel.toLowerCase(), {
 				containerIp: inst.containerIp,
 				containerPort: inst.containerPort,
@@ -83,6 +118,84 @@ export async function refreshCache(): Promise<void> {
 		targets: cache.size,
 		domains: registeredDomains.size,
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Container state inspection (for reconciliation)
+// ---------------------------------------------------------------------------
+
+interface ContainerLiveState {
+	running: boolean;
+	ip: string | null;
+}
+
+/**
+ * Inspect a container's actual state via `podman inspect`.
+ * Returns running status and current bridge network IP.
+ */
+async function inspectContainerState(containerId: string): Promise<ContainerLiveState> {
+	try {
+		const result = await safeSpawn({
+			cmd: [
+				"podman",
+				"inspect",
+				"--format",
+				"{{.State.Running}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+				containerId,
+			],
+			timeout: 5_000,
+		});
+		if (result.exitCode !== 0) {
+			// Container doesn't exist anymore
+			return { running: false, ip: null };
+		}
+		const parts = result.stdout.trim().split("|");
+		const running = parts[0] === "true";
+		// Multiple networks produce space-separated IPs; take the first one.
+		const rawIp = parts[1]?.trim() || null;
+		const ip = rawIp?.split(/\s+/)[0] || null;
+		return { running, ip };
+	} catch {
+		return { running: false, ip: null };
+	}
+}
+
+/**
+ * Reconcile all DB container states with actual podman state.
+ * Intended to be called once at server startup.
+ */
+export async function reconcileContainerStates(): Promise<void> {
+	const running = await db
+		.select({
+			id: containerInstances.id,
+			containerId: containerInstances.containerId,
+			chapterId: containerInstances.chapterId,
+			serviceName: containerInstances.serviceName,
+		})
+		.from(containerInstances)
+		.where(eq(containerInstances.status, "running"));
+
+	if (running.length === 0) return;
+
+	let staleCount = 0;
+	for (const inst of running) {
+		if (!inst.containerId) continue;
+		const live = await inspectContainerState(inst.containerId);
+		if (!live.running) {
+			await db
+				.update(containerInstances)
+				.set({ status: "stopped", updatedAt: new Date().toISOString() })
+				.where(eq(containerInstances.id, inst.id));
+			staleCount++;
+		}
+	}
+
+	if (staleCount > 0) {
+		logger.info("Startup reconciliation: marked stale containers as stopped", {
+			total: running.length,
+			stale: staleCount,
+		});
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -238,11 +351,16 @@ const wsHandlers: Bun.WebSocketHandler<ProxyWSData> = {
 // Pasta backend detection
 // ---------------------------------------------------------------------------
 
+/** Cached result of isPastaBackend() — network backend doesn't change at runtime. */
+let _pastaBackendCache: boolean | null = null;
+
 /**
  * Check if the rootless Podman network backend supports direct host→container IP access.
  * Returns true for pasta/passt (Podman 5.0+), false for slirp4netns.
+ * Result is cached after first call.
  */
 export function isPastaBackend(): boolean {
+	if (_pastaBackendCache !== null) return _pastaBackendCache;
 	try {
 		const out = execSync("podman info --format '{{.Host.RootlessNetworkCmd}}'", {
 			encoding: "utf-8",
@@ -251,10 +369,11 @@ export function isPastaBackend(): boolean {
 		}).trim();
 		// Remove surrounding quotes if present
 		const cmd = out.replace(/^'|'$/g, "").toLowerCase();
-		return cmd === "pasta" || cmd === "passt";
+		_pastaBackendCache = cmd === "pasta" || cmd === "passt";
 	} catch {
-		return false;
+		_pastaBackendCache = false;
 	}
+	return _pastaBackendCache;
 }
 
 // ---------------------------------------------------------------------------

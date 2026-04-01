@@ -23,7 +23,11 @@ initWslFlag();
 
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
-import { startContainerProxy, stopContainerProxy } from "./services/container-proxy";
+import {
+	reconcileContainerStates,
+	startContainerProxy,
+	stopContainerProxy,
+} from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
@@ -600,6 +604,11 @@ registerProjectDbSync();
 
 	.catch((err) => {
 	});
+
+// Reconcile container states on startup (mark stale DB records as stopped)
+reconcileContainerStates().catch((err) => {
+	logger.warn("Container state reconciliation failed", { error: String(err) });
+});
 
 // Start container proxy if enabled
 if (settings.containers.proxy?.enabled) {

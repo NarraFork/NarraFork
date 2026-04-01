@@ -283,5 +283,7 @@
 	"fileMod_toolCallCount": "{{count}} 个工具调用",
 	"fileMod_toolCallCount_one": "{{count}} 个工具调用",
 	"fileMod_timelineCurrent": "当前",
-	"fileMod_timelineMessage": "消息 #{{n}}"
+	"fileMod_timelineMessage": "消息 #{{n}}",
+	"toolSkillFiles": "附带文件",
+	"toolSkillLoaded": "技能已加载"
 }

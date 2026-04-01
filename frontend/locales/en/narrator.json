@@ -283,5 +283,7 @@
 	"fileMod_toolCallCount": "{{count}} tool calls",
 	"fileMod_toolCallCount_one": "{{count}} tool call",
 	"fileMod_timelineCurrent": "Current",
-	"fileMod_timelineMessage": "Message #{{n}}"
+	"fileMod_timelineMessage": "Message #{{n}}",
+	"toolSkillFiles": "Attached files",
+	"toolSkillLoaded": "Skill loaded"
 }

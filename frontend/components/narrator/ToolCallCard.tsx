@@ -42,6 +42,7 @@ import {
 	IconShare,
 	IconTerminal2,
 	IconTrash,
+	IconWand,
 	IconWorldSearch,
 	IconWorldWww,
 	IconX,
@@ -178,6 +179,7 @@ const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
+const SKILL_TOOLS = new Set(["Skill"]);
 const OVERSEER_TOOLS = new Set([
 	"ApprovePermission",
 	"DenyPermission",
@@ -200,6 +202,7 @@ export type ToolCategory =
 	| "terminal"
 	| "share"
 	| "recall"
+	| "skill"
 	| "overseer"
 	| "generic";
 
@@ -222,6 +225,7 @@ export function getCategory(name: string): ToolCategory {
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
 	if (RECALL_TOOLS.has(name)) return "recall";
+	if (SKILL_TOOLS.has(name)) return "skill";
 	if (OVERSEER_TOOLS.has(name)) return "overseer";
 	return "generic";
 }
@@ -256,6 +260,8 @@ export function getCategoryIcon(cat: ToolCategory, toolName?: string) {
 			return IconShare;
 		case "recall":
 			return IconHistory;
+		case "skill":
+			return IconWand;
 		case "overseer":
 			return IconEye;
 		default:
@@ -293,6 +299,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "green";
 		case "recall":
 			return "cyan";
+		case "skill":
+			return "grape";
 		case "overseer":
 			return "indigo";
 		default:
@@ -547,6 +555,16 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const fp = getFilePath(input);
 			if (!fp) return "Share";
 			return basename(fp);
+		}
+		case "skill": {
+			const skillName = extractField(input, "skill", "name");
+			const skillArgs = extractField(input, "args");
+			if (!skillName) return "Skill";
+			if (skillArgs) {
+				const label = `${skillName}: ${skillArgs}`;
+				return label.length > 60 ? `${label.slice(0, 57)}...` : label;
+			}
+			return skillName;
 		}
 		case "recall": {
 			const action = extractField(input, "action");
@@ -1942,6 +1960,82 @@ function OverseerDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
+	const output = resolveDisplayText(toolCall.outputJson);
+
+	if (!output || toolCall.status === "fail") {
+		return <GenericDetail toolCall={toolCall} />;
+	}
+
+	// Extract skill name from <skill_content name="...">
+	const nameMatch = output.match(/<skill_content\s+name="([^"]+)">/);
+	const skillName = nameMatch?.[1] ?? extractField(toolCall.inputJson, "skill", "name");
+
+	// Extract file list from <skill_files>
+	const filesMatch = output.match(/<skill_files>([\s\S]*?)<\/skill_files>/);
+	const files: string[] = [];
+	if (filesMatch) {
+		for (const m of filesMatch[1].matchAll(/<file>([^<]+)<\/file>/g)) {
+			files.push(m[1]);
+		}
+	}
+
+	// Extract content between header and base directory / skill_files
+	let content = "";
+	const skillTagIdx = output.indexOf("<skill_content");
+	if (skillTagIdx !== -1) {
+		const contentStart = output.indexOf("\n\n", skillTagIdx);
+		const contentEnd = output.indexOf("\nBase directory for this skill:");
+		if (contentStart !== -1 && contentEnd !== -1 && contentEnd > contentStart) {
+			content = output.slice(contentStart + 2, contentEnd).trim();
+			// Remove the "# Skill: ..." header line if present
+			content = content.replace(/^#\s+Skill:\s+.+\n*/, "").trim();
+		}
+	}
+
+	// Fallback to GenericDetail when we couldn't extract anything useful
+	if (!skillName && !content && files.length === 0) {
+		return <GenericDetail toolCall={toolCall} />;
+	}
+
+	return (
+		<Box mt="xs">
+			{skillName && (
+				<Group gap={6} mb={6}>
+					<Badge size="xs" variant="light" color="grape">
+						{skillName}
+					</Badge>
+					<Text size="xs" c="dimmed">
+						{t("toolSkillLoaded")}
+					</Text>
+				</Group>
+			)}
+			{content && (
+				<ContentViewer
+					content={content}
+					style={{ ...codeStyle, maxHeight: 400 }}
+					title={`Skill: ${skillName || "content"}`}
+				/>
+			)}
+			{files.length > 0 && (
+				<Box mt={6}>
+					<Text size="xs" fw={500} mb={4}>
+						{t("toolSkillFiles")}
+					</Text>
+					<Group gap={4} wrap="wrap">
+						{files.map((f) => (
+							<Badge key={f} size="xs" variant="dot" color="gray">
+								{basename(f)}
+							</Badge>
+						))}
+					</Group>
+				</Box>
+			)}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -2239,6 +2333,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <TerminalDetail toolCall={toolCall} />;
 		case "share":
 			return <ShareFileDetail toolCall={toolCall} />;
+		case "skill":
+			return <SkillDetail toolCall={toolCall} />;
 		case "recall":
 			return <RecallDetail toolCall={toolCall} />;
 		case "overseer":

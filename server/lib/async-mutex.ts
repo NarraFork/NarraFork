@@ -52,3 +52,6 @@ export const chapterLock = new AsyncMutex();
 
 /** Per-worktree mutex — guards git operations (merge, cherry-pick, autoCommit). */
 export const worktreeLock = new AsyncMutex();
+
+/** Per-chapter mutex — guards container lifecycle operations (start, stop, pause, remove). */
+export const containerLock = new AsyncMutex();

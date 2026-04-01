@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, containerInstances, projects } from "../db/schema";
+import { containerLock } from "../lib/async-mutex";
 import { NotFoundError, PodmanNotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -12,7 +13,7 @@ import { logger } from "../lib/logger";
 import { isInsidePath } from "../lib/platform-path";
 import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
-import { buildProxyUrl, generateProxyLabel } from "./container-proxy";
+import { buildProxyUrl, generateProxyLabel, isPastaBackend } from "./container-proxy";
 import { type PortMapping, portAllocator } from "./port-allocator";
 
 export interface ContainerConfig {
@@ -345,12 +346,14 @@ async function exec(
 /**
  * Execute a podman command and stream stderr lines to a callback in real time.
  * Used for long-running operations like `compose up` that may build images.
+ * @param timeout Hard timeout in ms (default 10 minutes). Process is killed on expiry.
  */
 async function execStreaming(
 	args: string[],
 	cwd: string,
 	onLine: (line: string) => void,
 	env?: Record<string, string>,
+	timeout = 600_000,
 ): Promise<ExecResult> {
 	ensurePodman();
 	const proc = Bun.spawn(["podman", ...args], {
@@ -359,6 +362,17 @@ async function execStreaming(
 		stderr: "pipe",
 		env: { ...process.env, ...env },
 	});
+
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		logger.error("Container command timed out, killing process", {
+			cmd: ["podman", ...args].join(" "),
+			cwd,
+			timeoutMs: timeout,
+		});
+		proc.kill();
+	}, timeout);
 
 	// Stream stderr line by line
 	const stderrChunks: string[] = [];
@@ -401,10 +415,20 @@ async function execStreaming(
 		proc.exited,
 	]);
 
+	clearTimeout(timer);
+
 	const stderr = stderrChunks
 		.filter((l) => l.trim() !== "" && !isNoiseLine(l))
 		.join("\n")
 		.trim();
+
+	if (timedOut) {
+		return {
+			stdout: stdout.trim(),
+			stderr: `Command timed out after ${timeout / 1000}s. ${stderr}`.trim(),
+			exitCode: exitCode ?? 1,
+		};
+	}
 
 	if (exitCode !== 0) {
 		logger.error("Container command failed", {
@@ -734,51 +758,70 @@ export const containerService = {
 		const proxyEnabled = settings.containers.proxy?.enabled && !!project?.proxyDomain;
 		const proxyDomain = project?.proxyDomain ?? null;
 
-		// Allocate ports (skip in proxy mode)
-		let portMappings: PortMapping[] = [];
-		if (!proxyEnabled && config?.ports && config.ports.length > 0) {
-			portMappings = await portAllocator.allocate(chapterId, config.ports);
-		} else if (proxyEnabled) {
-			// Switching from legacy port mapping mode to proxy mode — ensure stale allocations are gone.
-			await portAllocator.release(chapterId);
+		// Block proxy mode if pasta/passt backend is not available
+		if (proxyEnabled && !isPastaBackend()) {
+			throw new ValidationError(
+				"Proxy mode requires Podman 5.0+ with pasta/passt network backend. " +
+					"Current rootless network backend does not support direct host→container IP access. " +
+					"Either upgrade Podman and install passt, or disable proxy mode in settings.",
+			);
 		}
 
-		const chapterShortId = chapterId.slice(0, 8);
-		const env = buildComposeEnv(
-			chapterId,
-			portMappings,
-			config,
-			proxyEnabled && proxyDomain
-				? {
-						domain: proxyDomain,
-						port: settings.containers.proxy.port,
-						chapterShortId,
-					}
-				: undefined,
-		);
+		// Run the entire start flow under a per-chapter lock to prevent concurrent starts
+		containerLock
+			.acquire(chapterId, async () => {
+				// Allocate ports (skip in proxy mode)
+				let portMappings: PortMapping[] = [];
+				if (!proxyEnabled && config?.ports && config.ports.length > 0) {
+					portMappings = await portAllocator.allocate(chapterId, config.ports);
+				} else if (proxyEnabled) {
+					// Switching from legacy port mapping mode to proxy mode — ensure stale allocations are gone.
+					await portAllocator.release(chapterId);
+				}
 
-		// Signal that we're starting (UI can show a spinner)
-		eventBus.emit({ type: "container:starting", chapterId });
-		logger.info("Starting chapter containers in background", {
-			chapterId,
-			composeFile,
-			proxyMode: proxyEnabled,
-		});
+				const chapterShortId = chapterId.slice(0, 8);
+				const env = buildComposeEnv(
+					chapterId,
+					portMappings,
+					config,
+					proxyEnabled && proxyDomain
+						? {
+								domain: proxyDomain,
+								port: settings.containers.proxy.port,
+								chapterShortId,
+							}
+						: undefined,
+				);
 
-		// Run compose up in the background — don't await
-		this._runComposeUp(
-			chapterId,
-			chapter.worktreePath,
-			composeFile,
-			portMappings,
-			env,
-			config,
-			proxyEnabled && proxyDomain
-				? { domain: proxyDomain, port: settings.containers.proxy.port, chapterShortId }
-				: undefined,
-		).catch(() => {
-			// Errors are already handled inside _runComposeUp via eventBus
-		});
+				// Signal that we're starting (UI can show a spinner)
+				eventBus.emit({ type: "container:starting", chapterId });
+				logger.info("Starting chapter containers", {
+					chapterId,
+					composeFile,
+					proxyMode: proxyEnabled,
+				});
+
+				await this._runComposeUp(
+					chapterId,
+					chapter.worktreePath ?? "",
+					composeFile,
+					portMappings,
+					env,
+					config,
+					proxyEnabled && proxyDomain
+						? { domain: proxyDomain, port: settings.containers.proxy.port, chapterShortId }
+						: undefined,
+				);
+			})
+			.catch((err) => {
+				// _runComposeUp reports its own errors via eventBus; catch pre-compose
+				// failures (e.g. port allocation) that would otherwise be silently swallowed.
+				if (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					logger.error("Container start failed before compose up", { chapterId, error: msg });
+					eventBus.emit({ type: "container:error", chapterId, error: msg });
+				}
+			});
 	},
 
 	/** @internal Background compose up with streaming logs. */
@@ -893,86 +936,99 @@ export const containerService = {
 
 	/** Pause all containers for a chapter (used during dormant). */
 	async pauseChapterContainers(chapterId: string): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-		if (!chapter) throw new NotFoundError("Chapter", chapterId);
+		await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 
-		const config = chapter.containerConfig as ContainerConfig | null;
-		const worktreePath = chapter.worktreePath;
-		if (!worktreePath) return;
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const worktreePath = chapter.worktreePath;
+			if (!worktreePath) return;
 
-		const composeFile = resolveComposeFile(worktreePath, config);
-		if (!composeFile) return;
+			const composeFile = resolveComposeFile(worktreePath, config);
+			if (!composeFile) return;
 
-		const result = await exec(["compose", "-f", composeFile, "pause"], worktreePath);
-		if (result.exitCode !== 0) {
-			logger.warn("Failed to pause containers", { chapterId, stderr: result.stderr });
-			return;
-		}
+			const result = await exec(["compose", "-f", composeFile, "pause"], worktreePath);
+			if (result.exitCode !== 0) {
+				logger.warn("Failed to pause containers", { chapterId, stderr: result.stderr });
+				return;
+			}
 
-		const now = new Date().toISOString();
-		await db
-			.update(containerInstances)
-			.set({ status: "paused", updatedAt: now })
-			.where(eq(containerInstances.chapterId, chapterId));
+			const now = new Date().toISOString();
+			await db
+				.update(containerInstances)
+				.set({ status: "paused", updatedAt: now })
+				.where(eq(containerInstances.chapterId, chapterId));
 
-		eventBus.emit({ type: "container:paused", chapterId });
-		logger.info("Chapter containers paused", { chapterId });
+			eventBus.emit({ type: "container:paused", chapterId });
+			logger.info("Chapter containers paused", { chapterId });
+		});
 	},
 
 	/** Unpause all containers for a chapter (used during wake). */
 	async unpauseChapterContainers(chapterId: string): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-		if (!chapter) throw new NotFoundError("Chapter", chapterId);
-		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+		const needsFreshStart = await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+			if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 
-		const config = chapter.containerConfig as ContainerConfig | null;
-		const composeFile = resolveComposeFile(chapter.worktreePath, config);
-		if (!composeFile) return;
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const composeFile = resolveComposeFile(chapter.worktreePath, config);
+			if (!composeFile) return false;
 
-		const result = await exec(["compose", "-f", composeFile, "unpause"], chapter.worktreePath);
-		if (result.exitCode !== 0) {
-			// Containers may have been removed — clean up stale records and do a fresh start
-			logger.warn("Unpause failed, attempting fresh start", { chapterId });
+			const result = await exec(["compose", "-f", composeFile, "unpause"], chapter.worktreePath);
+			if (result.exitCode !== 0) {
+				// Containers may have been removed — signal caller to do a fresh start
+				logger.warn("Unpause failed, will attempt fresh start", { chapterId });
+				return true;
+			}
+
+			const now = new Date().toISOString();
+			await db
+				.update(containerInstances)
+				.set({ status: "running", updatedAt: now })
+				.where(eq(containerInstances.chapterId, chapterId));
+
+			eventBus.emit({ type: "container:resumed", chapterId });
+			logger.info("Chapter containers unpaused", { chapterId });
+			return false;
+		});
+
+		// Fresh start outside the lock to avoid deadlock (remove + start each acquire their own lock)
+		if (needsFreshStart) {
 			await this.removeChapterContainers(chapterId);
 			await this.startChapterContainers(chapterId);
-			return;
 		}
-
-		const now = new Date().toISOString();
-		await db
-			.update(containerInstances)
-			.set({ status: "running", updatedAt: now })
-			.where(eq(containerInstances.chapterId, chapterId));
-
-		eventBus.emit({ type: "container:resumed", chapterId });
-		logger.info("Chapter containers unpaused", { chapterId });
 	},
 
 	/** Stop all containers for a chapter. */
 	async stopChapterContainers(chapterId: string): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-		if (!chapter) throw new NotFoundError("Chapter", chapterId);
+		await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 
-		const config = chapter.containerConfig as ContainerConfig | null;
-		const worktreePath = chapter.worktreePath;
-		if (!worktreePath) return;
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const worktreePath = chapter.worktreePath;
+			if (!worktreePath) return;
 
-		const composeFile = resolveComposeFile(worktreePath, config);
-		if (!composeFile) return;
+			const composeFile = resolveComposeFile(worktreePath, config);
+			if (!composeFile) return;
 
-		const result = await exec(["compose", "-f", composeFile, "stop"], worktreePath);
-		if (result.exitCode !== 0) {
-			logger.warn("Failed to stop containers", { chapterId, stderr: result.stderr });
-		}
+			const result = await exec(["compose", "-f", composeFile, "stop"], worktreePath);
+			if (result.exitCode !== 0) {
+				logger.warn("Failed to stop containers", { chapterId, stderr: result.stderr });
+			}
 
-		const now = new Date().toISOString();
-		await db
-			.update(containerInstances)
-			.set({ status: "stopped", updatedAt: now })
-			.where(eq(containerInstances.chapterId, chapterId));
+			const now = new Date().toISOString();
+			await db
+				.update(containerInstances)
+				.set({ status: "stopped", updatedAt: now })
+				.where(eq(containerInstances.chapterId, chapterId));
 
-		eventBus.emit({ type: "container:stopped", chapterId });
-		logger.info("Chapter containers stopped", { chapterId });
+			eventBus.emit({ type: "container:stopped", chapterId });
+			logger.info("Chapter containers stopped", { chapterId });
+		});
 	},
 
 	/**
@@ -983,45 +1039,52 @@ export const containerService = {
 		chapterId: string,
 		opts: { deleteVolumes?: boolean } = {},
 	): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-		if (!chapter) throw new NotFoundError("Chapter", chapterId);
+		await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 
-		const config = chapter.containerConfig as ContainerConfig | null;
-		const worktreePath = chapter.worktreePath;
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const worktreePath = chapter.worktreePath;
 
-		// Check if this chapter was using proxy mode (has proxyLabel records)
-		const existingInstances = await db.query.containerInstances.findMany({
-			where: eq(containerInstances.chapterId, chapterId),
-			columns: { proxyLabel: true },
-		});
-		const wasProxyMode = existingInstances.some((i) => !!i.proxyLabel);
+			// Check if this chapter was using proxy mode (has proxyLabel records)
+			const existingInstances = await db.query.containerInstances.findMany({
+				where: eq(containerInstances.chapterId, chapterId),
+				columns: { proxyLabel: true },
+			});
+			const wasProxyMode = existingInstances.some((i) => !!i.proxyLabel);
 
-		// Try to run compose down if worktree exists
-		if (worktreePath) {
-			const composeFile = resolveComposeFile(worktreePath, config);
-			if (composeFile) {
-				const args = ["compose", "-f", composeFile, "down"];
-				if (opts.deleteVolumes) args.push("-v");
+			// Try to run compose down if worktree exists
+			if (worktreePath) {
+				const composeFile = resolveComposeFile(worktreePath, config);
+				if (composeFile) {
+					const args = ["compose", "-f", composeFile, "down"];
+					if (opts.deleteVolumes) args.push("-v");
 
-				const result = await exec(args, worktreePath);
-				if (result.exitCode !== 0) {
-					logger.warn("Failed to remove containers via compose", {
-						chapterId,
-						stderr: result.stderr,
-					});
+					const result = await exec(args, worktreePath);
+					if (result.exitCode !== 0) {
+						logger.warn("Failed to remove containers via compose", {
+							chapterId,
+							stderr: result.stderr,
+						});
+					}
 				}
 			}
-		}
 
-		// Clean up DB records regardless
-		await db.delete(containerInstances).where(eq(containerInstances.chapterId, chapterId));
-		// Only release ports if not in proxy mode
-		if (!wasProxyMode) {
-			await portAllocator.release(chapterId);
-		}
+			// Clean up DB records regardless
+			await db.delete(containerInstances).where(eq(containerInstances.chapterId, chapterId));
+			// Only release ports if not in proxy mode
+			if (!wasProxyMode) {
+				await portAllocator.release(chapterId);
+			}
 
-		eventBus.emit({ type: "container:stopped", chapterId });
-		logger.info("Chapter containers removed", { chapterId, deleteVolumes: opts.deleteVolumes });
+			eventBus.emit({ type: "container:stopped", chapterId });
+			logger.info("Chapter containers removed", {
+				chapterId,
+				deleteVolumes: opts.deleteVolumes,
+			});
+		});
 	},
 
 	/** Get container logs for a chapter. */

@@ -16,8 +16,18 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
 
-/** Per-container mutex — guards snapshot create/apply for the same chapter+service. */
+/**
+ * Per-container mutex — guards snapshot create/apply/delete for the same chapter+service.
+ * Lock ordering: always acquire snapshotLock BEFORE snapshotDeleteLock to avoid deadlocks.
+ */
 const snapshotLock = new AsyncMutex();
+
+/**
+ * Per-snapshot mutex — guards delete vs apply race on the same snapshot file.
+ * Must only be acquired while already holding snapshotLock, or standalone in deleteSnapshot.
+ * Never acquire snapshotLock while holding snapshotDeleteLock.
+ */
+const snapshotDeleteLock = new AsyncMutex();
 
 const SNAPSHOTS_DIR = join(homedir(), ".narrafork", "snapshots");
 
@@ -80,6 +90,11 @@ export const volumeSnapshotService = {
 
 		const lockKey = `${chapterId}:${serviceName}`;
 		return snapshotLock.acquire(lockKey, async () => {
+			logger.info(
+				"Creating snapshot from a running container — data consistency is not guaranteed " +
+					"if the application is actively writing to the target path",
+				{ chapterId, serviceName, containerPath },
+			);
 			eventBus.emit({ type: "volume-snapshot:creating", projectId, chapterId });
 
 			const containerId = await resolveContainerId(chapterId, serviceName);
@@ -178,91 +193,105 @@ export const volumeSnapshotService = {
 
 		const lockKey = `${targetChapterId}:${snapshot.serviceName}`;
 		return snapshotLock.acquire(lockKey, async () => {
-			const archivePath = snapshotFilePath(snapshot.projectId, snapshotId);
-			if (!existsSync(archivePath)) {
-				throw new ValidationError("Snapshot archive file is missing");
-			}
+			// Guard against concurrent deletion of this snapshot
+			return snapshotDeleteLock.acquire(snapshotId, async () => {
+				const archivePath = snapshotFilePath(snapshot.projectId, snapshotId);
+				if (!existsSync(archivePath)) {
+					throw new ValidationError("Snapshot archive file is missing");
+				}
 
-			eventBus.emit({
-				type: "volume-snapshot:applying",
-				snapshotId,
-				targetChapterId,
+				logger.info(
+					"Applying snapshot to a running container — if the application is actively " +
+						"using the target path, data corruption may occur",
+					{
+						snapshotId,
+						targetChapterId,
+						serviceName: snapshot.serviceName,
+						containerPath: snapshot.containerPath,
+					},
+				);
+
+				eventBus.emit({
+					type: "volume-snapshot:applying",
+					snapshotId,
+					targetChapterId,
+				});
+
+				const containerId = await resolveContainerId(targetChapterId, snapshot.serviceName);
+
+				try {
+					// Step 0: Ensure target path exists inside the container
+					await safeSpawn({
+						cmd: ["podman", "exec", containerId, "mkdir", "-p", snapshot.containerPath],
+						timeout: 10_000,
+					});
+
+					// Step 1: Copy archive into container
+					const tmpArchive = `/tmp/_narrafork_snapshot_${snapshotId}.tar.gz`;
+					const cpResult = await safeSpawn({
+						cmd: ["podman", "cp", archivePath, `${containerId}:${tmpArchive}`],
+						timeout: 300_000,
+					});
+					if (cpResult.exitCode !== 0) {
+						throw new Error(`Failed to copy archive to container: ${cpResult.stderr}`);
+					}
+
+					// Step 2: Extract archive into the target path
+					const extractResult = await safeSpawn({
+						cmd: [
+							"podman",
+							"exec",
+							containerId,
+							"tar",
+							"xzf",
+							tmpArchive,
+							"-C",
+							snapshot.containerPath,
+						],
+						timeout: 300_000,
+					});
+					if (extractResult.exitCode !== 0) {
+						throw new Error(`Failed to extract archive in container: ${extractResult.stderr}`);
+					}
+
+					// Step 3: Clean up temp file
+					await safeSpawn({
+						cmd: ["podman", "exec", containerId, "rm", "-f", tmpArchive],
+						timeout: 10_000,
+					});
+
+					// Record application
+					const applicationId = generateId();
+					await db.insert(volumeSnapshotApplications).values({
+						id: applicationId,
+						snapshotId,
+						chapterId: targetChapterId,
+						appliedAt: new Date().toISOString(),
+						appliedBy: userId ?? null,
+					});
+
+					eventBus.emit({
+						type: "volume-snapshot:applied",
+						snapshotId,
+						targetChapterId,
+					});
+					logger.info("Volume snapshot applied", {
+						snapshotId,
+						targetChapterId,
+						serviceName: snapshot.serviceName,
+					});
+
+					return { success: true };
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					eventBus.emit({
+						type: "volume-snapshot:error",
+						projectId: snapshot.projectId,
+						error: msg,
+					});
+					throw err;
+				}
 			});
-
-			const containerId = await resolveContainerId(targetChapterId, snapshot.serviceName);
-
-			try {
-				// Step 0: Ensure target path exists inside the container
-				await safeSpawn({
-					cmd: ["podman", "exec", containerId, "mkdir", "-p", snapshot.containerPath],
-					timeout: 10_000,
-				});
-
-				// Step 1: Copy archive into container
-				const tmpArchive = `/tmp/_narrafork_snapshot_${snapshotId}.tar.gz`;
-				const cpResult = await safeSpawn({
-					cmd: ["podman", "cp", archivePath, `${containerId}:${tmpArchive}`],
-					timeout: 300_000,
-				});
-				if (cpResult.exitCode !== 0) {
-					throw new Error(`Failed to copy archive to container: ${cpResult.stderr}`);
-				}
-
-				// Step 2: Extract archive into the target path
-				const extractResult = await safeSpawn({
-					cmd: [
-						"podman",
-						"exec",
-						containerId,
-						"tar",
-						"xzf",
-						tmpArchive,
-						"-C",
-						snapshot.containerPath,
-					],
-					timeout: 300_000,
-				});
-				if (extractResult.exitCode !== 0) {
-					throw new Error(`Failed to extract archive in container: ${extractResult.stderr}`);
-				}
-
-				// Step 3: Clean up temp file
-				await safeSpawn({
-					cmd: ["podman", "exec", containerId, "rm", "-f", tmpArchive],
-					timeout: 10_000,
-				});
-
-				// Record application
-				const applicationId = generateId();
-				await db.insert(volumeSnapshotApplications).values({
-					id: applicationId,
-					snapshotId,
-					chapterId: targetChapterId,
-					appliedAt: new Date().toISOString(),
-					appliedBy: userId ?? null,
-				});
-
-				eventBus.emit({
-					type: "volume-snapshot:applied",
-					snapshotId,
-					targetChapterId,
-				});
-				logger.info("Volume snapshot applied", {
-					snapshotId,
-					targetChapterId,
-					serviceName: snapshot.serviceName,
-				});
-
-				return { success: true };
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				eventBus.emit({
-					type: "volume-snapshot:error",
-					projectId: snapshot.projectId,
-					error: msg,
-				});
-				throw err;
-			}
 		});
 	},
 
@@ -320,6 +349,7 @@ export const volumeSnapshotService = {
 
 	/**
 	 * Delete a snapshot (DB record + archive file).
+	 * Guarded by snapshotDeleteLock to prevent racing with applySnapshot.
 	 */
 	async deleteSnapshot(snapshotId: string) {
 		const snapshot = await db.query.volumeSnapshots.findFirst({
@@ -329,20 +359,22 @@ export const volumeSnapshotService = {
 			throw new NotFoundError("VolumeSnapshot", snapshotId);
 		}
 
-		// Delete archive file
-		const archivePath = snapshotFilePath(snapshot.projectId, snapshotId);
-		try {
-			if (existsSync(archivePath)) unlinkSync(archivePath);
-		} catch (err) {
-			logger.warn("Failed to delete snapshot archive file", {
-				snapshotId,
-				path: archivePath,
-				error: String(err),
-			});
-		}
+		await snapshotDeleteLock.acquire(snapshotId, async () => {
+			// Delete archive file
+			const archivePath = snapshotFilePath(snapshot.projectId, snapshotId);
+			try {
+				if (existsSync(archivePath)) unlinkSync(archivePath);
+			} catch (err) {
+				logger.warn("Failed to delete snapshot archive file", {
+					snapshotId,
+					path: archivePath,
+					error: String(err),
+				});
+			}
 
-		// Delete DB records (applications cascade)
-		await db.delete(volumeSnapshots).where(eq(volumeSnapshots.id, snapshotId));
+			// Delete DB records (applications cascade)
+			await db.delete(volumeSnapshots).where(eq(volumeSnapshots.id, snapshotId));
+		});
 
 		eventBus.emit({
 			type: "volume-snapshot:deleted",
