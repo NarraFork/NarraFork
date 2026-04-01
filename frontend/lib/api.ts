@@ -375,6 +375,7 @@ export const api = {
 	createProjectStream: (
 		data: Record<string, unknown>,
 		onProgress: (message: string) => void,
+		onCredentialRequired?: () => void,
 	): Promise<ApiEntity> => {
 		return new Promise((resolve, reject) => {
 			const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -438,6 +439,13 @@ export const api = {
 											} else if (eventType === "complete") {
 												reader.cancel().catch(() => {});
 												resolve(parsed);
+												return;
+											} else if (eventType === "credential_required") {
+												reader.cancel().catch(() => {});
+												if (onCredentialRequired) {
+													onCredentialRequired();
+												}
+												reject(new ApiError(parsed.error ?? "Authentication required", 401));
 												return;
 											} else if (eventType === "error") {
 												reader.cancel().catch(() => {});

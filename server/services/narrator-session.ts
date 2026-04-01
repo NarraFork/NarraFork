@@ -2303,7 +2303,6 @@ function triggerMidTurnCompact(
 			runCustomCompact(narratorId, locale, boundaryMessageId)
 				.then(() => {
 					onCompactDone?.();
-					broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 				})
 				.catch((err) => {
 					logger.error("Auto-compact failed (mid-turn)", {
@@ -3430,7 +3429,6 @@ async function runAgentLoop(
 								if (current?.alive) {
 									current.conversationId = randomUUID();
 								}
-								broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 							})
 							.catch((compactErr) => {
 								logger.error("Auto-compact failed", {
@@ -3669,6 +3667,11 @@ async function runAgentLoop(
 
 // === Custom compact (conversation rotation) ===
 
+/** Check whether a compact operation is already running for the given narrator. */
+export function isCompactInProgress(narratorId: string): boolean {
+	return compactLocks.has(narratorId);
+}
+
 /** Per-narrator lock to prevent concurrent compact operations. */
 export const compactLocks = hotSafe<Map<string, Promise<void>>>(
 	"narrafork.compactLocks",
@@ -3801,6 +3804,7 @@ async function doRunCustomCompact(
 		}
 
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
+		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Custom compact failed after retries", {

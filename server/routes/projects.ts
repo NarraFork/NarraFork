@@ -1,3 +1,4 @@
+import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
@@ -18,7 +19,7 @@ import {
 	terminalTabs,
 	terminalViewState,
 } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
@@ -74,19 +75,29 @@ projectRoutes.post("/", async (c) => {
 		}
 		const cloneUrl = body.cloneUrl;
 		const cloneBranch = body.cloneBranch;
+		const credentials =
+			body.cloneUsername && body.clonePassword
+				? { username: body.cloneUsername, password: body.clonePassword }
+				: undefined;
 
 		return streamSSE(c, async (stream) => {
 			let sseId = 0;
 			try {
-				await gitService.cloneRepoStreaming(cloneUrl, gitPath, cloneBranch, (line) => {
-					stream
-						.writeSSE({
-							id: String(sseId++),
-							event: "progress",
-							data: JSON.stringify({ message: line }),
-						})
-						.catch(() => {});
-				});
+				await gitService.cloneRepoStreaming(
+					cloneUrl,
+					gitPath,
+					cloneBranch,
+					(line) => {
+						stream
+							.writeSSE({
+								id: String(sseId++),
+								event: "progress",
+								data: JSON.stringify({ message: line }),
+							})
+							.catch(() => {});
+					},
+					credentials,
+				);
 
 				const detectedBranch = await gitService.getCurrentBranch(gitPath);
 				remoteUrl = cloneUrl;
@@ -144,14 +155,28 @@ projectRoutes.post("/", async (c) => {
 					data: JSON.stringify(project),
 				});
 			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				await stream
-					.writeSSE({
-						id: String(sseId++),
-						event: "error",
-						data: JSON.stringify({ error: message }),
-					})
-					.catch(() => {});
+				if (err instanceof GitAuthError) {
+					// Clean up partially-created clone directory
+					try {
+						if (existsSync(gitPath)) rmSync(gitPath, { recursive: true, force: true });
+					} catch {}
+					await stream
+						.writeSSE({
+							id: String(sseId++),
+							event: "credential_required",
+							data: JSON.stringify({ error: err.message }),
+						})
+						.catch(() => {});
+				} else {
+					const message = err instanceof Error ? err.message : String(err);
+					await stream
+						.writeSSE({
+							id: String(sseId++),
+							event: "error",
+							data: JSON.stringify({ error: message }),
+						})
+						.catch(() => {});
+				}
 			}
 		});
 	}

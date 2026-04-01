@@ -171,6 +171,8 @@
 	"deleteMessageFailedDesc": "Failed to delete message. Please try again.",
 	"compactFailed": "Compact failed",
 	"compactFailedDesc": "Failed to compact messages. Please try again.",
+	"compactInProgress": "Compact in progress",
+	"compactInProgressDesc": "A compact operation is already running. Please wait for it to finish.",
 	"viewSubagentSession": "View session",
 	"expandEdits": "Expand edits",
 	"collapseEdits": "Collapse edits",

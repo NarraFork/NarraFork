@@ -62,6 +62,8 @@ export const createProjectSchema = z.object({
 	// Clone-specific fields
 	cloneUrl: z.string().min(1).optional(),
 	cloneBranch: gitBranchName.optional(),
+	cloneUsername: z.string().max(200).optional(),
+	clonePassword: z.string().max(200).optional(),
 	flowMode: z.enum(["classic", "ruler"]).default("classic"),
 });
 

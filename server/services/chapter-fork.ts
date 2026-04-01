@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
@@ -7,6 +7,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { isInsidePath } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import { slugify } from "../lib/slug";
 import { safeSpawn } from "../lib/spawn";
@@ -108,17 +109,47 @@ export const chapterFork = {
 						input.forkAtMessageUuid,
 					);
 					if (fileStates.size > 0) {
-						for (const [filePath, content] of fileStates) {
+						// Parent cwd used to convert absolute paths to relative
+						const parentCwd = parent.worktreePath ?? gitPath;
+						let applied = 0;
+
+						for (const [rawFilePath, content] of fileStates) {
 							if (content === null) continue; // Skip files that didn't exist
-							const absPath = resolve(worktreePath, filePath);
-							mkdirSync(dirname(absPath), { recursive: true });
-							await Bun.write(absPath, content);
+
+							// Normalize first to collapse any ".." segments before
+							// path-containment checks (resolve handles this).
+							const filePath = resolve(rawFilePath);
+
+							// file_path in tool inputs is typically absolute (e.g.
+							// /home/user/project/.worktrees/branch/src/foo.ts).
+							// We must convert it to a path relative to the parent
+							// worktree, then resolve against the NEW worktree.
+							let targetPath: string;
+							if (isAbsolute(filePath)) {
+								if (!isInsidePath(parentCwd, filePath)) {
+									// File is outside the worktree (e.g. /tmp/...) — skip
+									continue;
+								}
+								targetPath = resolve(worktreePath, relative(parentCwd, filePath));
+							} else {
+								targetPath = resolve(worktreePath, filePath);
+							}
+
+							// Safety: ensure we never write outside the new worktree
+							if (!isInsidePath(worktreePath, targetPath)) continue;
+
+							mkdirSync(dirname(targetPath), { recursive: true });
+							await Bun.write(targetPath, content);
+							applied++;
 						}
-						logger.info("Applied file snapshots to forked worktree", {
-							parentChapterId,
-							childChapterId: id,
-							fileCount: fileStates.size,
-						});
+						if (applied > 0) {
+							logger.info("Applied file snapshots to forked worktree", {
+								parentChapterId,
+								childChapterId: id,
+								fileCount: applied,
+								skipped: fileStates.size - applied,
+							});
+						}
 					}
 				} catch (err) {
 					// Non-fatal: degrade to commit-only state rather than failing the fork

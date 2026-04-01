@@ -93,6 +93,7 @@
 	"openaiProviderPrefixPlaceholder": "例如 openai、deepseek、groq",
 	"prefixReserved": "\"{{prefix}}\" 是内置保留前缀",
 	"prefixDuplicate": "\"{{prefix}}\" 已被其他供应商使用",
+	"providerDisabled": "已禁用",
 	"openaiApiKey": "API Key",
 	"openaiApiKeyPlaceholder": "sk-...",
 	"openaiBaseUrl": "Base URL",

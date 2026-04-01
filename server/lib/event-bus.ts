@@ -11,7 +11,7 @@ export type NarraForkEvent =
 	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] } // TODO: not yet emitted
 	| { type: "chapter:dormant"; chapterId: string }
 	| { type: "chapter:woken"; chapterId: string }
-	| { type: "chapter:abandoned"; chapterId: string }
+	| { type: "chapter:abandoned"; chapterId: string; projectId: string }
 	| { type: "review:created"; reviewChapterId: string; sourceChapterId: string }
 	| { type: "review:concluded"; reviewChapterId: string; sourceChapterId: string }
 	| { type: "review:converted"; reviewChapterId: string; action: "subagent" | "promote" }

@@ -279,7 +279,7 @@ export const chapterCleanup = {
 					.set({ status: "abandoned", worktreePath: null, updatedAt: now })
 					.where(eq(chapters.id, chapterId));
 
-				eventBus.emit({ type: "chapter:abandoned", chapterId });
+				eventBus.emit({ type: "chapter:abandoned", chapterId, projectId: chapter.projectId });
 				report.cleaned.push(chapterId);
 			} catch (err) {
 				report.errors.push({ chapterId, error: String(err) });

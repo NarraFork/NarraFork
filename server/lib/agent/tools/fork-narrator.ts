@@ -102,9 +102,20 @@ export const forkNarratorTool: ToolDefinition = {
 				const { and, eq } = await import("drizzle-orm");
 
 				const chapterInherit = mode === "fresh" ? "fresh" : (inheritMode ?? "full");
+
+				// In "fork" mode, resolve the latest message UUID so that
+				// chapterFork can restore uncommitted file changes via
+				// file-state-rebuild, keeping worktree ↔ message history consistent.
+				let forkAtMessageUuid: string | undefined;
+				if (mode === "fork") {
+					forkAtMessageUuid =
+						(await narratorService.getLatestMessageUuid(ctx.narratorId)) ?? undefined;
+				}
+
 				const newChapter = await chapterFork.fork(parent.chapterId, {
 					title,
 					inheritMode: chapterInherit,
+					forkAtMessageUuid,
 					locale,
 				});
 

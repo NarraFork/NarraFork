@@ -8,6 +8,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	PasswordInput,
 	Progress,
 	SegmentedControl,
 	SimpleGrid,
@@ -44,6 +45,8 @@ function ProjectListPage() {
 	const [cloneUrl, setCloneUrl] = useState("");
 	const [cloneUrlError, setCloneUrlError] = useState("");
 	const [cloneBranch, setCloneBranch] = useState("");
+	const [cloneUsername, setCloneUsername] = useState("");
+	const [clonePassword, setClonePassword] = useState("");
 	const { t } = useTranslation("projects");
 	const { t: tc } = useTranslation("common");
 	const platform = usePlatform();
@@ -69,6 +72,8 @@ function ProjectListPage() {
 		setCloneUrl("");
 		setCloneUrlError("");
 		setCloneBranch("");
+		setCloneUsername("");
+		setClonePassword("");
 		createProjectStream.reset();
 		createProject.reset();
 	};
@@ -311,6 +316,37 @@ function ProjectListPage() {
 							</Code>
 						</Stack>
 					)}
+					{createProjectStream.needsAuth && !isCloning && (
+						<Alert icon={<IconAlertCircle size={16} />} title={t("authRequired")} color="yellow">
+							<Stack gap="xs" mt="xs">
+								<Text size="sm">{t("authRequiredMessage")}</Text>
+								<TextInput
+									label={t("authUsername")}
+									placeholder={t("authUsernamePlaceholder")}
+									value={cloneUsername}
+									onChange={(e) => setCloneUsername(e.currentTarget.value)}
+									size="sm"
+								/>
+								<PasswordInput
+									label={t("authPassword")}
+									placeholder={t("authPasswordPlaceholder")}
+									value={clonePassword}
+									onChange={(e) => setClonePassword(e.currentTarget.value)}
+									size="sm"
+								/>
+								<Button
+									size="xs"
+									mt="xs"
+									onClick={() => {
+										createProjectStream.retryWithCredentials(cloneUsername, clonePassword);
+									}}
+									disabled={!cloneUsername.trim()}
+								>
+									{t("authRetry")}
+								</Button>
+							</Stack>
+						</Alert>
+					)}
 					{isNotGitRepoError && (
 						<Alert icon={<IconAlertCircle size={16} />} title={t("notGitRepoTitle")} color="yellow">
 							<Text size="sm">{t("notGitRepoMessage", { path: repoPath.trim() })}</Text>
@@ -324,7 +360,7 @@ function ProjectListPage() {
 							</Button>
 						</Alert>
 					)}
-					{mutationError && !isNotGitRepoError && (
+					{mutationError && !isNotGitRepoError && !createProjectStream.needsAuth && (
 						<Alert icon={<IconAlertCircle size={16} />} color="red">
 							<Text size="sm">{mutationError.message}</Text>
 						</Alert>

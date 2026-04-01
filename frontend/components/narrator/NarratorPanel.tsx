@@ -98,7 +98,7 @@ import {
 import { useGlobalOverseer } from "../../hooks/useOverseers";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api, type TreeMessage } from "../../lib/api";
+import { ApiError, api, type TreeMessage } from "../../lib/api";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	type ModelOption,
@@ -922,18 +922,24 @@ export function NarratorPanel({
 		[qc, messagesQueryKey, narratorId, t],
 	);
 
-	const handleCompactBefore = useCallback(
-		(messageId: string) => {
-			api.triggerCompact(narratorId, messageId).catch(() => {
-				notifications.show({
-					title: t("compactFailed"),
-					message: t("compactFailedDesc"),
-					color: "red",
-					autoClose: 5000,
-				});
+	const handleCompactError = useCallback(
+		(err: unknown) => {
+			const isInProgress = err instanceof ApiError && err.status === 409;
+			notifications.show({
+				title: isInProgress ? t("compactInProgress") : t("compactFailed"),
+				message: isInProgress ? t("compactInProgressDesc") : t("compactFailedDesc"),
+				color: isInProgress ? "yellow" : "red",
+				autoClose: 5000,
 			});
 		},
-		[narratorId, t],
+		[t],
+	);
+
+	const handleCompactBefore = useCallback(
+		(messageId: string) => {
+			api.triggerCompact(narratorId, messageId).catch(handleCompactError);
+		},
+		[narratorId, handleCompactError],
 	);
 
 	const handleRegenerate = useCallback(
@@ -3918,7 +3924,7 @@ export function NarratorPanel({
 										<Menu.Item
 											leftSection={<IconArrowsMinimize size={14} />}
 											onClick={() => {
-												api.triggerCompact(narratorId).catch(() => {});
+												api.triggerCompact(narratorId).catch(handleCompactError);
 											}}
 										>
 											{t("triggerCompact")}

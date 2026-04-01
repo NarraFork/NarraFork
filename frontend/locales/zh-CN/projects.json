@@ -77,5 +77,12 @@
 	"projectCommandWhitelist": "命令白名单",
 	"projectCommandWhitelistDesc": "此项目中叙述者自动放行的命令。",
 	"projectCommandBlacklist": "命令黑名单",
-	"projectCommandBlacklistDesc": "此项目中叙述者自动拒绝的命令。"
+	"projectCommandBlacklistDesc": "此项目中叙述者自动拒绝的命令。",
+	"authRequired": "需要认证",
+	"authRequiredMessage": "该仓库需要认证，请输入凭据。",
+	"authUsername": "用户名",
+	"authUsernamePlaceholder": "用户名或邮箱",
+	"authPassword": "密码 / Token",
+	"authPasswordPlaceholder": "密码或个人访问令牌",
+	"authRetry": "使用凭据重试"
 }

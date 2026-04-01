@@ -183,7 +183,7 @@ export function getClineEnabledModelsGrouped(): Array<{
 }> {
 	const providers = settings.clineProviders ?? [];
 	return providers
-		.filter((p) => p.enabledModels && p.enabledModels.length > 0)
+		.filter((p) => !p.disabled && p.enabledModels && p.enabledModels.length > 0)
 		.map((p) => {
 			const poolModels = cachedModelsByProvider.get(p.id) ?? [];
 			// Match enabled IDs against pool for metadata, fall back to bare ID
@@ -203,7 +203,7 @@ export function getClineEnabledModelsGrouped(): Array<{
 registerClineModelChecker((model) => {
 	const providers = settings.clineProviders ?? [];
 	for (const p of providers) {
-		if (p.enabledModels?.includes(model)) return true;
+		if (!p.disabled && p.enabledModels?.includes(model)) return true;
 	}
 	return false;
 });
@@ -212,6 +212,7 @@ registerClineModelLister(() => {
 	const result: string[] = [];
 	const providers = settings.clineProviders ?? [];
 	for (const p of providers) {
+		if (p.disabled) continue;
 		const prefix = clineProviderPrefix(p);
 		for (const modelId of p.enabledModels ?? []) {
 			result.push(`${prefix}:${modelId}`);

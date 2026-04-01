@@ -9,6 +9,7 @@ import {
 	PasswordInput,
 	SegmentedControl,
 	Stack,
+	Switch,
 	Text,
 	TextInput,
 	Title,
@@ -112,6 +113,13 @@ export function OpenAIProvidersSection({
 		});
 	}, []);
 
+	const toggleProviderDisabled = useCallback(
+		(id: string) => {
+			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)));
+		},
+		[providers, onProvidersChange],
+	);
+
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
 			if (isProviderDirty?.(providerId)) {
@@ -173,7 +181,12 @@ export function OpenAIProvidersSection({
 							const pModels = providerModelsMap[p.id] ?? [];
 							const providerModelCount = pModels.length;
 							return (
-								<Paper key={p.id} withBorder p="sm">
+								<Paper
+									key={p.id}
+									withBorder
+									p="sm"
+									style={p.disabled ? { opacity: 0.6 } : undefined}
+								>
 									<Stack gap="xs">
 										<Group
 											justify="space-between"
@@ -189,23 +202,39 @@ export function OpenAIProvidersSection({
 												<Text fw={500} size="sm">
 													{p.name || `Provider #${idx + 1}`}
 												</Text>
-												{providerModelCount > 0 && (
+												{p.disabled && (
+													<Badge size="xs" variant="light" color="gray">
+														{t("providerDisabled")}
+													</Badge>
+												)}
+												{!p.disabled && providerModelCount > 0 && (
 													<Badge size="xs" variant="light">
 														{t("openaiModelsCount", { count: providerModelCount })}
 													</Badge>
 												)}
 											</Group>
-											<ActionIcon
-												color="red"
-												variant="subtle"
-												size="sm"
-												onClick={(e) => {
-													e.stopPropagation();
-													handleRemoveProvider(p.id);
-												}}
-											>
-												<IconTrash size={14} />
-											</ActionIcon>
+											<Group gap="xs">
+												<Switch
+													size="xs"
+													checked={!p.disabled}
+													onChange={(e) => {
+														e.stopPropagation();
+														toggleProviderDisabled(p.id);
+													}}
+													onClick={(e) => e.stopPropagation()}
+												/>
+												<ActionIcon
+													color="red"
+													variant="subtle"
+													size="sm"
+													onClick={(e) => {
+														e.stopPropagation();
+														handleRemoveProvider(p.id);
+													}}
+												>
+													<IconTrash size={14} />
+												</ActionIcon>
+											</Group>
 										</Group>
 										<Collapse in={isExpanded}>
 											<Stack gap="xs" mt="xs">

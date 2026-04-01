@@ -93,6 +93,7 @@ import {
 	editAndRegenerate,
 	getBufferedMessages,
 	interruptNarrator,
+	isCompactInProgress,
 	isNarratorActive,
 	pushBufferedMessage,
 	regenerateFromMessage,
@@ -766,9 +767,13 @@ narratorRoutes.post("/:id/compact", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const body = await c.req.json().catch(() => ({}));
 	const beforeMessageId = body.beforeMessageId ?? undefined;
+
+	if (isCompactInProgress(narratorId)) {
+		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
+	}
+
 	// Fire-and-forget — compact may take a while (AI summary generation).
-	// On failure, runCustomCompact keeps a failed compact marker, marks narrator error,
-	// and broadcasts a compact_failed event via WebSocket so the frontend can react.
+	// compact_done / compact_failed are broadcast from doRunCustomCompact itself.
 	runCustomCompact(narratorId, locale, beforeMessageId).catch((err) => {
 		logger.error("Manual compact failed", { narratorId, err: String(err) });
 	});

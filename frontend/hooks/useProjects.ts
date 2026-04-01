@@ -34,6 +34,8 @@ export function useCreateProjectStream() {
 	const [isPending, setIsPending] = useState(false);
 	const [cloneProgress, setCloneProgress] = useState("");
 	const [error, setError] = useState<Error | null>(null);
+	const [needsAuth, setNeedsAuth] = useState(false);
+	const lastDataRef = useRef<Record<string, unknown> | null>(null);
 	const callbackRef = useRef<{
 		onSuccess?: () => void;
 		onError?: (err: Error) => void;
@@ -45,14 +47,22 @@ export function useCreateProjectStream() {
 			opts?: { onSuccess?: () => void; onError?: (err: Error) => void },
 		) => {
 			callbackRef.current = opts ?? {};
+			lastDataRef.current = data;
 			setIsPending(true);
 			setCloneProgress("");
 			setError(null);
+			setNeedsAuth(false);
 
 			api
-				.createProjectStream(data, (message) => {
-					setCloneProgress(message);
-				})
+				.createProjectStream(
+					data,
+					(message) => {
+						setCloneProgress(message);
+					},
+					() => {
+						setNeedsAuth(true);
+					},
+				)
 				.then(() => {
 					setIsPending(false);
 					qc.invalidateQueries({ queryKey: ["projects"] });
@@ -67,12 +77,27 @@ export function useCreateProjectStream() {
 		[qc],
 	);
 
+	const retryWithCredentials = useCallback(
+		(username: string, password: string) => {
+			if (!lastDataRef.current) return;
+			const data = {
+				...lastDataRef.current,
+				cloneUsername: username,
+				clonePassword: password,
+			};
+			mutate(data, callbackRef.current);
+		},
+		[mutate],
+	);
+
 	const reset = useCallback(() => {
 		setCloneProgress("");
 		setError(null);
+		setNeedsAuth(false);
+		lastDataRef.current = null;
 	}, []);
 
-	return { mutate, isPending, cloneProgress, error, reset };
+	return { mutate, isPending, cloneProgress, error, needsAuth, retryWithCredentials, reset };
 }
 
 export function useUpdateProject() {

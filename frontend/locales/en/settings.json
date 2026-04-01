@@ -93,6 +93,7 @@
 	"openaiProviderPrefixPlaceholder": "e.g. openai, deepseek, groq",
 	"prefixReserved": "\"{{prefix}}\" is a reserved built-in prefix",
 	"prefixDuplicate": "\"{{prefix}}\" is already used by another provider",
+	"providerDisabled": "Disabled",
 	"openaiApiKey": "API Key",
 	"openaiApiKeyPlaceholder": "sk-...",
 	"openaiBaseUrl": "Base URL",

@@ -573,6 +573,65 @@ function cleanupOrphanMessages(pdb: Database): void {
 	`);
 }
 
+/**
+ * Delete a chapter and all its associated data from the project database.
+ * Handles two scenarios:
+ * - cleanup: chapter still exists in main DB (status → abandoned), just sync it
+ * - remove: chapter already deleted from main DB, purge from project DB
+ */
+async function deleteChapterFromProjectDb(chapterId: string, projectId: string): Promise<void> {
+	// If chapter still exists in main DB (cleanup scenario), just sync the updated status
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, chapterId),
+	});
+	if (row) {
+		await syncChapter(chapterId);
+		return;
+	}
+
+	// Chapter already deleted from main DB — purge from project DB
+	const pdb = await getProjectDb(projectId);
+	if (!pdb) return;
+
+	// Find narrators belonging to this chapter in project DB
+	const narratorRows = pdb
+		.prepare("SELECT id FROM narrators WHERE chapter_id = ?")
+		.all(chapterId) as { id: string }[];
+	const narratorIds = narratorRows.map((n) => n.id);
+
+	const tx = pdb.transaction(() => {
+		if (narratorIds.length > 0) {
+			// narratorIds are nanoid strings from a DB query — safe for IN-clause interpolation
+			const ph = narratorIds.map(() => "?").join(",");
+			pdb.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${ph})`, narratorIds);
+			pdb.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${ph})`, narratorIds);
+			pdb.run("DELETE FROM narrators WHERE chapter_id = ?", [chapterId]);
+		}
+
+		pdb.run("DELETE FROM chapter_commits WHERE chapter_id = ?", [chapterId]);
+		pdb.run("DELETE FROM chapter_edges WHERE source_id = ? OR target_id = ?", [
+			chapterId,
+			chapterId,
+		]);
+		// Delete sessions where this chapter is the target, or appears in the
+		// source_chapter_ids JSON array (those sessions are now invalid).
+		pdb.run("DELETE FROM merge_sessions WHERE target_chapter_id = ?", [chapterId]);
+		pdb.run(
+			`DELETE FROM merge_sessions WHERE EXISTS (
+				SELECT 1 FROM json_each(source_chapter_ids) WHERE value = ?
+			)`,
+			[chapterId],
+		);
+		pdb.run("DELETE FROM chapters WHERE id = ?", [chapterId]);
+	});
+	tx();
+
+	// Clean up orphan messages no longer referenced by any narrator
+	cleanupOrphanMessages(pdb);
+
+	logger.info("Deleted chapter from project DB", { chapterId, projectId });
+}
+
 // === Full sync ===
 
 /** Full sync: export all project data from main DB to project DB. */
@@ -696,9 +755,12 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 			if (pid2) await syncChapterEdgesForProject(pid2);
 			break;
 		}
+		case "chapter:abandoned": {
+			await deleteChapterFromProjectDb(event.chapterId, event.projectId);
+			break;
+		}
 		case "chapter:dormant":
 		case "chapter:woken":
-		case "chapter:abandoned":
 		case "chapter:frozen":
 		case "chapter:role_changed": {
 			await syncChapter(event.chapterId);

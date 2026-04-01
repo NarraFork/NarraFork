@@ -85,7 +85,7 @@ export function getAnthropicCachedModelsGrouped(): Array<{
 }> {
 	const providers = settings.anthropicProviders ?? [];
 	return providers
-		.filter((p) => cachedModelsByProvider.has(p.id))
+		.filter((p) => !p.disabled && cachedModelsByProvider.has(p.id))
 		.map((p) => ({
 			providerId: p.id,
 			providerName: p.name,
@@ -105,6 +105,7 @@ registerAnthropicModelLister(() => {
 	const result: string[] = [];
 	const providers = settings.anthropicProviders ?? [];
 	for (const p of providers) {
+		if (p.disabled) continue;
 		const prefix = anthropicProviderPrefix(p);
 		const models = cachedModelsByProvider.get(p.id) ?? [];
 		for (const m of models) {

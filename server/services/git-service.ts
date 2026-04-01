@@ -1,6 +1,7 @@
-import { cpSync, mkdirSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { GitError } from "../lib/errors";
+import { GitAuthError, GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
@@ -950,15 +951,40 @@ export const gitService = {
 		destPath: string,
 		branch: string | undefined,
 		onProgress: (line: string) => void,
+		credentials?: { username: string; password: string },
 	): Promise<void> {
+		// If credentials provided, use a temporary GIT_ASKPASS script so that
+		// the password never appears in process arguments or git's stderr output.
+		let askPassScript: string | undefined;
+		if (credentials) {
+			const id = Math.random().toString(36).slice(2, 10);
+			askPassScript = join(tmpdir(), `narrafork-askpass-${id}.sh`);
+			// Git calls GIT_ASKPASS with a single argument like "Username for '...': "
+			// or "Password for '...': ". We match on the prompt to return the right value.
+			const script = [
+				"#!/bin/sh",
+				`case "$1" in`,
+				`  *[Uu]sername*) echo '${credentials.username.replace(/'/g, "'\\''")}';;`,
+				`  *) echo '${credentials.password.replace(/'/g, "'\\''")}';;`,
+				"esac",
+			].join("\n");
+			writeFileSync(askPassScript, script, { mode: 0o700 });
+		}
+
 		const args = ["clone", "--progress"];
 		if (branch) args.push("--branch", branch);
 		args.push(url, destPath);
 
 		const proc = Bun.spawn(["git", ...args], {
 			cwd: ".",
+			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
+			env: {
+				...process.env,
+				GIT_TERMINAL_PROMPT: "0",
+				...(askPassScript ? { GIT_ASKPASS: askPassScript } : {}),
+			},
 		});
 
 		// Read stderr in streaming fashion — git progress uses \r for in-place updates
@@ -999,12 +1025,33 @@ export const gitService = {
 		// Drain stdout to avoid pipe deadlock
 		await new Response(proc.stdout).text();
 
+		// Clean up temporary askpass script before checking exit code
+		if (askPassScript) {
+			try {
+				rmSync(askPassScript, { force: true });
+			} catch {}
+		}
+
 		const exitCode = await proc.exited;
 		if (exitCode !== 0) {
 			const detail =
 				recentStderrLines.find((l) => l.startsWith("fatal:")) ||
 				recentStderrLines[recentStderrLines.length - 1] ||
 				"";
+
+			// Detect authentication failure
+			const allStderr = recentStderrLines.join("\n").toLowerCase();
+			if (
+				allStderr.includes("authentication failed") ||
+				allStderr.includes("could not read username") ||
+				allStderr.includes("terminal prompts disabled") ||
+				allStderr.includes("could not read password") ||
+				allStderr.includes("invalid credentials") ||
+				allStderr.includes("logon failed")
+			) {
+				throw new GitAuthError(detail || "Git authentication required");
+			}
+
 			const suffix = detail ? `: ${detail}` : "";
 			throw new GitError(`Failed to clone repo (exit code ${exitCode})${suffix}`);
 		}

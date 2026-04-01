@@ -449,8 +449,9 @@ export const chapterService = {
 				.set({ mergedIntoChapterId: null })
 				.where(eq(chapters.mergedIntoChapterId, id));
 
+			const removedProjectId = chapter.projectId;
 			await db.delete(chapters).where(eq(chapters.id, id));
-			eventBus.emit({ type: "chapter:abandoned", chapterId: id });
+			eventBus.emit({ type: "chapter:abandoned", chapterId: id, projectId: removedProjectId });
 
 			// Remove this chapter from every user's recent tabs so ghost entries don't linger
 			removeTabFromAllUsers("chapter", id).catch((err) => {

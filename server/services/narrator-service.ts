@@ -3521,6 +3521,27 @@ export const narratorService = {
 	},
 
 	/**
+	 * Get the messageUuid of the latest top-level message for a narrator.
+	 * Returns null if the narrator has no messages.
+	 */
+	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
+		const latestRef = await db
+			.select({ messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+
+		if (!latestRef.length) return null;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, latestRef[0].messageId),
+			columns: { messageUuid: true },
+		});
+		return msg?.messageUuid ?? null;
+	},
+
+	/**
 	 * Fork a standalone narrator from a tool call.
 	 * For chapter-bound narrators, use chapterFork.fork() instead (handled by the tool).
 	 * This handles standalone narrators only.
@@ -3580,23 +3601,7 @@ export const narratorService = {
 		}
 
 		// mode === "fork": find latest message UUID and delegate to forkNarrator
-		const latestRef = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-			})
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, parentNarratorId))
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
-
-		const latestMsgUuid = latestRef.length
-			? ((
-					await db.query.narratorMessages.findFirst({
-						where: eq(narratorMessages.id, latestRef[0].messageId),
-						columns: { messageUuid: true },
-					})
-				)?.messageUuid ?? null)
-			: null;
+		const latestMsgUuid = await this.getLatestMessageUuid(parentNarratorId);
 
 		return this.forkNarrator(parentNarratorId, latestMsgUuid, {
 			title: opts?.title,

@@ -9,6 +9,7 @@ export interface OpenAIProviderState {
 	defaultModel: string;
 	apiMode: "responses" | "completions" | "codex";
 	codexAccountId: string;
+	disabled?: boolean;
 }
 
 export interface AnthropicProviderState {
@@ -22,6 +23,7 @@ export interface AnthropicProviderState {
 	proxy?: string;
 	tlsRejectUnauthorized?: boolean;
 	officialApi?: boolean;
+	disabled?: boolean;
 }
 
 	id: string;
@@ -30,6 +32,7 @@ export interface AnthropicProviderState {
 	apiKey: string;
 	baseUrl: string;
 	defaultModel: string;
+	disabled?: boolean;
 }
 
 

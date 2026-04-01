@@ -38,6 +38,12 @@ export class GitError extends AppError {
 	}
 }
 
+export class GitAuthError extends AppError {
+	constructor(message: string = "Git authentication required") {
+		super(message, 401, "GIT_AUTH_REQUIRED");
+	}
+}
+
 /** Convert a Zod error into a human-readable single-line message. */
 export function formatZodError(error: {
 	issues: Array<{ path: PropertyKey[]; message: string }>;
