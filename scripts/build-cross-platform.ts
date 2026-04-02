@@ -314,6 +314,9 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"--target",
 			platform.target,
 			"--asset-naming=[dir]/[name].[ext]",
+			// Playwright bundles an electron loader that imports "electron" —
+			// mark it external so the bundler doesn't try to resolve it.
+			"--external=electron",
 			"--outfile",
 			outfile,
 		],
