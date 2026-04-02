@@ -91,6 +91,12 @@ class NarratorWSManager {
 	// narratorId → Set of subscription handle IDs
 	private narratorRefCounts = new Map<string, Set<number>>();
 
+	// --- Pending subscribes (queued while WS is not OPEN) ---
+	// Tracks narrator IDs whose subscribe message hasn't been sent yet.
+	// lastMessageId is already stored in this.lastMessageIds by subscribe(),
+	// so we only need to track the IDs themselves.
+	private pendingSubscribeIds = new Set<string>();
+
 	// --- Presence ref-counting ---
 	// narratorId → Set of handle IDs that requested presence
 	private presenceRefCounts = new Map<string, Set<number>>();
@@ -193,9 +199,15 @@ class NarratorWSManager {
 			}
 		}
 
-		// Send subscribe for newly-added IDs
-		if (newIds.length && this.ws?.readyState === WebSocket.OPEN) {
-			this._sendSubscribe(newIds, opts?.lastMessageId);
+		// Send subscribe for newly-added IDs, or queue them for when WS opens
+		if (newIds.length) {
+			if (this.ws?.readyState === WebSocket.OPEN) {
+				this._sendSubscribe(newIds, opts?.lastMessageId);
+			} else {
+				for (const nId of newIds) {
+					this.pendingSubscribeIds.add(nId);
+				}
+			}
 		}
 
 		return handle;
@@ -267,6 +279,10 @@ class NarratorWSManager {
 			}
 			if (actuallyAdded.length) {
 				this._sendSubscribe(actuallyAdded);
+			}
+		} else if (actuallyAdded.length) {
+			for (const nId of actuallyAdded) {
+				this.pendingSubscribeIds.add(nId);
 			}
 		}
 	}
@@ -570,6 +586,9 @@ class NarratorWSManager {
 	private _restoreSubscriptions(): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+		// Clear pending queue — everything in narratorRefCounts will be sent below
+		this.pendingSubscribeIds.clear();
 
 		// Subscribe narrators — send individually so each can carry its own lastMessageId
 		for (const [narratorId] of this.narratorRefCounts) {

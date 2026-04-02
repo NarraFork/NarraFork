@@ -753,6 +753,27 @@ export async function processEvent(
 			return null;
 		}
 
+		case "retrying": {
+			// In-loop transient retry — notify frontend via WS warning so the
+			// status bar can show retry progress.  No DB state changes needed.
+			logger.warn("Retrying transient API error in-loop", {
+				narratorId,
+				error: event.message,
+				attempt: event.attempt,
+				maxRetries: event.maxRetries,
+				delayMs: event.delayMs,
+			});
+			broadcastToNarrator(broadcastTargetId, {
+				type: "warning",
+				narratorId: broadcastTargetId,
+				message: event.message,
+				retryCount: event.attempt,
+				maxRetries: event.maxRetries,
+				delayMs: event.delayMs,
+			});
+			return null;
+		}
+
 		case "stream_reasoning": {
 			// Track AI reasoning output character rate
 			recordOutputChunk(event.text.length);

@@ -4,6 +4,7 @@ import {
 	getModelContextWindow,
 	isAnthropicProvider,
 	settings,
+	usesStatefulApi,
 } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
 import { estimateTokens } from "./estimate-tokens";
@@ -18,9 +19,55 @@ import type {
 	ResolvedToolDefinition,
 	ToolContext,
 } from "./types";
-import { PLAN_MODE_ALLOWED_TOOLS, type ReasoningProviderMetadata } from "./types";
+import {
+	PLAN_MODE_ALLOWED_TOOLS,
+	type ReasoningProviderMetadata,
+	TRANSIENT_RETRY_BASE_MS,
+} from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
+
+/** Abort-aware sleep that resolves early when the signal fires. */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const timer = setTimeout(resolve, ms);
+		signal.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				resolve();
+			},
+			{ once: true },
+		);
+	});
+}
+
+/** Yield block_complete events for accumulated reasoning blocks and assistant text.
+ *  Used in every early-return / error path to persist partial progress. */
+function* flushPartialContent(
+	reasoningBlockMap: Map<string, { text: string; providerMetadata?: ReasoningProviderMetadata }>,
+	assistantText: string,
+): Generator<AgentEvent> {
+	for (const entry of reasoningBlockMap.values()) {
+		if (entry.text || entry.providerMetadata) {
+			yield {
+				type: "block_complete",
+				block: {
+					type: "reasoning",
+					text: entry.text,
+					providerMetadata: entry.providerMetadata,
+				},
+			};
+		}
+	}
+	if (assistantText) {
+		yield { type: "block_complete", block: { type: "text", text: assistantText } };
+	}
+}
 
 /** Max size of output pushed via tool_output events (UI preview only). */
 const MAX_STREAM_OUTPUT_LENGTH = 30_000;
@@ -502,174 +549,237 @@ export async function* agentLoop(
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
 
-		try {
-			const stream = provider.chat({
-				conversationId: config.conversationId,
-				content,
-				model: effectiveModel,
-				cwd: config.cwd,
-				history,
-				tools,
-				toolResults: pendingToolResults,
-				signal: config.signal,
-				stickySessionKey: config.narratorId,
-				reasoningEffort: config.reasoningEffort,
-				serviceTier: config.serviceTier,
-				metadata: config.metadata,
-				...(isFirstTurn && images?.length ? { images } : {}),
-			});
+		// ── Transient-error retry loop ──
+		// we can safely retry the exact same provider.chat() call with identical
+		// history, content, and toolResults — no server-side state was mutated.
+		// Stateful providers (responses/codex) cannot retry here because the
+		// server already consumed the request.
+		const maxChatRetries = usesStatefulApi(effectiveProvider)
+			? 0
+			: (config.maxTransientRetries ?? 0);
+		let chatRetryCount = 0;
 
-			for await (const parsed of stream) {
-				if (parsed.text) {
-					assistantText += parsed.text;
-					yield { type: "stream_text", text: parsed.text };
-				}
-				if (parsed.toolUses) {
-					// ── Tool use dedup ──
-					// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
-					// `parsed.toolUseChunk` path. This commonly happens for tools with
-					// empty or very small parameters (e.g. EnterPlanMode). Without dedup,
-					// the tool would be executed twice and yield duplicate events.
-					//
-					// Strategy:
-					// 1. Skip any toolUse whose ID is already in `toolUses` (streaming
-					//    path completed it first).
-					// 2. Remove matching entries from `toolUseAccum` (streaming accumulator)
-					//    so the streaming stop handler doesn't re-process them.
-					// 3. Yield block_complete + tool_call + start eager execution here,
-					//    mirroring what the streaming stop path would have done.
-					for (const tu of parsed.toolUses) {
-						// Skip duplicates — the streaming path may have already
-						// completed this tool call via toolUseChunk stop.
-						if (toolUses.some((t) => t.toolUseId === tu.toolUseId)) continue;
+		for (;;) {
+			// Reset per-attempt accumulators so a retry starts with a clean slate.
+			// (On the first attempt these are already empty; on retries they may
+			// contain partial data from the failed stream.)
+			//
+			// NOTE: earlyExecMap.clear() drops references to in-flight tool Promises
+			// from a failed attempt.  Those Promises are .catch()-wrapped so they
+			// won't cause unhandled rejections, but any side-effects (e.g. Bash
+			// commands) may still complete in the background.  In practice, retries
+			// only trigger on transient API errors that occur before tool execution
+			// begins (the stream fails during the model's response, not after tool
+			// dispatch), so this is safe.
+			assistantText = "";
+			reasoningBlockMap.clear();
+			toolUses.length = 0;
+			messageId = undefined;
+			credentialId = undefined;
+			earlyExecMap.clear();
+			settledResults.clear();
+			yieldedToolResults.clear();
+			brokenToolUseIds.clear();
+			toolUseAccum.clear();
+			webSearchAccum.clear();
+			receivedUsage = false;
 
-						toolUses.push(tu);
+			try {
+				const stream = provider.chat({
+					conversationId: config.conversationId,
+					content,
+					model: effectiveModel,
+					cwd: config.cwd,
+					history,
+					tools,
+					toolResults: pendingToolResults,
+					signal: config.signal,
+					stickySessionKey: config.narratorId,
+					reasoningEffort: config.reasoningEffort,
+					serviceTier: config.serviceTier,
+					metadata: config.metadata,
+					...(isFirstTurn && images?.length ? { images } : {}),
+				});
 
-						// If this tool was also being streamed via toolUseChunk, remove it
-						// from the accumulator so it isn't flagged as orphaned.
-						// the same call — especially for tools with empty parameters.
-						const wasStreaming = toolUseAccum.has(tu.toolUseId);
-						if (wasStreaming) {
-							toolUseAccum.delete(tu.toolUseId);
-						}
-
-						// Yield block_complete so the tool call is persisted
-						// (the streaming path would have done this on stop, but
-						// non-streaming toolUses skip that path entirely).
-						yield {
-							type: "block_complete",
-							block: {
-								type: "tool_use",
-								toolUseId: tu.toolUseId,
-								name: tu.name,
-								input: tu.input,
-							} satisfies ContentBlock,
-						};
-
-						// Start eager execution (same as the streaming stop path)
-						if (!earlyExecMap.has(tu.toolUseId)) {
-							const execPromise = executeTool(tu, config).catch(
-								(err): ToolExecResult => ({
-									output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-									isError: true,
-									durationMs: 0,
-								}),
-							);
-							execPromise.then((r) => settledResults.set(tu.toolUseId, r));
-							earlyExecMap.set(tu.toolUseId, execPromise);
-						}
-
-						yield {
-							type: "tool_call",
-							toolUseId: tu.toolUseId,
-							toolName: tu.name,
-							input: tu.input,
-						};
+				for await (const parsed of stream) {
+					if (parsed.text) {
+						assistantText += parsed.text;
+						yield { type: "stream_text", text: parsed.text };
 					}
-				}
+					if (parsed.toolUses) {
+						// ── Tool use dedup ──
+						// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
+						// `parsed.toolUseChunk` path. This commonly happens for tools with
+						// empty or very small parameters (e.g. EnterPlanMode). Without dedup,
+						// the tool would be executed twice and yield duplicate events.
+						//
+						// Strategy:
+						// 1. Skip any toolUse whose ID is already in `toolUses` (streaming
+						//    path completed it first).
+						// 2. Remove matching entries from `toolUseAccum` (streaming accumulator)
+						//    so the streaming stop handler doesn't re-process them.
+						// 3. Yield block_complete + tool_call + start eager execution here,
+						//    mirroring what the streaming stop path would have done.
+						for (const tu of parsed.toolUses) {
+							// Skip duplicates — the streaming path may have already
+							// completed this tool call via toolUseChunk stop.
+							if (toolUses.some((t) => t.toolUseId === tu.toolUseId)) continue;
 
-				// Handle streaming tool use chunks
-				if (parsed.toolUseChunk) {
-					const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
-					if (id) {
-						if (!toolUseAccum.has(id) && name) {
-							// Don't create accumulator if this tool was already
-							// completed via non-streaming parsed.toolUses
-							if (toolUses.some((t) => t.toolUseId === id)) {
-								// Still yield the chunk so the frontend sees it
-								yield {
-									type: "tool_use_chunk",
-									toolUseId: id,
-									toolName: name,
-									inputCharsTotal: 0,
-								};
-							} else {
-								toolUseAccum.set(id, {
-									name,
-									inputChunks: [],
-									totalChars: 0,
-									startedAt: Date.now(),
-									lastYieldedAt: Date.now(),
-								});
-								// Yield immediately so the frontend knows the tool name early
-								yield {
-									type: "tool_use_chunk",
-									toolUseId: id,
-									toolName: name,
-									inputCharsTotal: 0,
-								};
+							toolUses.push(tu);
+
+							// If this tool was also being streamed via toolUseChunk, remove it
+							// from the accumulator so it isn't flagged as orphaned.
+							// the same call — especially for tools with empty parameters.
+							const wasStreaming = toolUseAccum.has(tu.toolUseId);
+							if (wasStreaming) {
+								toolUseAccum.delete(tu.toolUseId);
 							}
+
+							// Yield block_complete so the tool call is persisted
+							// (the streaming path would have done this on stop, but
+							// non-streaming toolUses skip that path entirely).
+							yield {
+								type: "block_complete",
+								block: {
+									type: "tool_use",
+									toolUseId: tu.toolUseId,
+									name: tu.name,
+									input: tu.input,
+								} satisfies ContentBlock,
+							};
+
+							// Start eager execution (same as the streaming stop path)
+							if (!earlyExecMap.has(tu.toolUseId)) {
+								const execPromise = executeTool(tu, config).catch(
+									(err): ToolExecResult => ({
+										output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+										isError: true,
+										durationMs: 0,
+									}),
+								);
+								execPromise.then((r) => settledResults.set(tu.toolUseId, r));
+								earlyExecMap.set(tu.toolUseId, execPromise);
+							}
+
+							yield {
+								type: "tool_call",
+								toolUseId: tu.toolUseId,
+								toolName: tu.name,
+								input: tu.input,
+							};
 						}
-						const acc = toolUseAccum.get(id);
-						if (acc) {
-							if (typeof input === "string") {
-								acc.inputChunks.push(input);
-								acc.totalChars += input.length;
+					}
 
-								// For Write/Edit tools, try to extract file_path from first chunk
-								let filePathJustExtracted = false;
-								if (!acc.extractedFilePath && (acc.name === "Write" || acc.name === "Edit")) {
-									const raw = acc.inputChunks.join("");
-									const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
-									if (filePathMatch) {
-										acc.extractedFilePath = filePathMatch[1];
-										filePathJustExtracted = true;
-									}
+					// Handle streaming tool use chunks
+					if (parsed.toolUseChunk) {
+						const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
+						if (id) {
+							if (!toolUseAccum.has(id) && name) {
+								// Don't create accumulator if this tool was already
+								// completed via non-streaming parsed.toolUses
+								if (toolUses.some((t) => t.toolUseId === id)) {
+									// Still yield the chunk so the frontend sees it
+									yield {
+										type: "tool_use_chunk",
+										toolUseId: id,
+										toolName: name,
+										inputCharsTotal: 0,
+									};
+								} else {
+									toolUseAccum.set(id, {
+										name,
+										inputChunks: [],
+										totalChars: 0,
+										startedAt: Date.now(),
+										lastYieldedAt: Date.now(),
+									});
+									// Yield immediately so the frontend knows the tool name early
+									yield {
+										type: "tool_use_chunk",
+										toolUseId: id,
+										toolName: name,
+										inputCharsTotal: 0,
+									};
 								}
+							}
+							const acc = toolUseAccum.get(id);
+							if (acc) {
+								if (typeof input === "string") {
+									acc.inputChunks.push(input);
+									acc.totalChars += input.length;
 
-								// For Agent tool, extract description/subagent_type/model from early chunks
-								let fieldsJustExtracted = false;
-								if (acc.name === "Agent" || acc.name === "Task") {
-									const raw = acc.inputChunks.join("");
-									const wantedKeys = ["description", "subagent_type", "model"] as const;
-									for (const key of wantedKeys) {
-										if (acc.extractedFields?.[key]) continue;
-										const re = new RegExp(`"${key}"\\s*:\\s*"([^"]*?)"`);
-										const m = raw.match(re);
-										if (m) {
-											if (!acc.extractedFields) acc.extractedFields = {};
-											acc.extractedFields[key] = m[1];
-											fieldsJustExtracted = true;
+									// For Write/Edit tools, try to extract file_path from first chunk
+									let filePathJustExtracted = false;
+									if (!acc.extractedFilePath && (acc.name === "Write" || acc.name === "Edit")) {
+										const raw = acc.inputChunks.join("");
+										const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
+										if (filePathMatch) {
+											acc.extractedFilePath = filePathMatch[1];
+											filePathJustExtracted = true;
 										}
 									}
+
+									// For Agent tool, extract description/subagent_type/model from early chunks
+									let fieldsJustExtracted = false;
+									if (acc.name === "Agent" || acc.name === "Task") {
+										const raw = acc.inputChunks.join("");
+										const wantedKeys = ["description", "subagent_type", "model"] as const;
+										for (const key of wantedKeys) {
+											if (acc.extractedFields?.[key]) continue;
+											const re = new RegExp(`"${key}"\\s*:\\s*"([^"]*?)"`);
+											const m = raw.match(re);
+											if (m) {
+												if (!acc.extractedFields) acc.extractedFields = {};
+												acc.extractedFields[key] = m[1];
+												fieldsJustExtracted = true;
+											}
+										}
+									}
+
+									// Throttle: yield at most once per 50ms per tool to reduce WS pressure.
+									// Bypass throttle when file_path or fields are first extracted so the
+									// frontend can display them immediately instead of waiting for the next
+									// content chunk.
+									const now = Date.now();
+									if (
+										filePathJustExtracted ||
+										fieldsJustExtracted ||
+										now - acc.lastYieldedAt >= 50
+									) {
+										acc.lastYieldedAt = now;
+
+										// Calculate content chars (total minus file_path JSON overhead)
+										let contentChars = acc.totalChars;
+										if (acc.extractedFilePath) {
+											// Rough estimate: subtract the file_path field size
+											const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
+											contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+										}
+
+										yield {
+											type: "tool_use_chunk",
+											toolUseId: id,
+											toolName: acc.name,
+											inputCharsTotal: acc.totalChars,
+											...(acc.extractedFilePath && {
+												extractedFilePath: acc.extractedFilePath,
+											}),
+											...(acc.extractedFilePath && {
+												contentCharsReceived: contentChars,
+											}),
+											...(acc.extractedFields && {
+												extractedFields: acc.extractedFields,
+											}),
+										};
+									}
 								}
-
-								// Throttle: yield at most once per 50ms per tool to reduce WS pressure.
-								// Bypass throttle when file_path or fields are first extracted so the
-								// frontend can display them immediately instead of waiting for the next
-								// content chunk.
-								const now = Date.now();
-								if (filePathJustExtracted || fieldsJustExtracted || now - acc.lastYieldedAt >= 50) {
-									acc.lastYieldedAt = now;
-
-									// Calculate content chars (total minus file_path JSON overhead)
+								if (stop) {
+									// Yield final chunk with latest totals before completing
 									let contentChars = acc.totalChars;
 									if (acc.extractedFilePath) {
-										// Rough estimate: subtract the file_path field size
 										const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
 										contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
 									}
-
 									yield {
 										type: "tool_use_chunk",
 										toolUseId: id,
@@ -685,346 +795,333 @@ export async function* agentLoop(
 											extractedFields: acc.extractedFields,
 										}),
 									};
-								}
-							}
-							if (stop) {
-								// Yield final chunk with latest totals before completing
-								let contentChars = acc.totalChars;
-								if (acc.extractedFilePath) {
-									const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-									contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-								}
-								yield {
-									type: "tool_use_chunk",
-									toolUseId: id,
-									toolName: acc.name,
-									inputCharsTotal: acc.totalChars,
-									...(acc.extractedFilePath && {
-										extractedFilePath: acc.extractedFilePath,
-									}),
-									...(acc.extractedFilePath && {
-										contentCharsReceived: contentChars,
-									}),
-									...(acc.extractedFields && {
-										extractedFields: acc.extractedFields,
-									}),
-								};
 
-								const raw = acc.inputChunks.join("");
-								let parsedInput: Record<string, unknown> = {};
-								if (raw) {
-									try {
-										parsedInput = JSON.parse(raw);
-									} catch {
-										parsedInput = { _raw: raw };
+									const raw = acc.inputChunks.join("");
+									let parsedInput: Record<string, unknown> = {};
+									if (raw) {
+										try {
+											parsedInput = JSON.parse(raw);
+										} catch {
+											parsedInput = { _raw: raw };
+										}
 									}
-								}
-								const tu: AgentToolUse = {
-									toolUseId: id,
-									name: acc.name,
-									input: parsedInput,
-									streamStartedAt: acc.startedAt,
-								};
-								// Skip if already added via non-streaming parsed.toolUses
-								const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
-								if (!alreadyAdded) {
-									toolUses.push(tu);
-								}
-								toolUseAccum.delete(id);
-
-								// If already handled via non-streaming parsed.toolUses,
-								// skip block_complete / execution / tool_call — they were
-								// already yielded in the parsed.toolUses handler above.
-								if (alreadyAdded) continue;
-
-								// Block is complete — yield for immediate persistence
-								yield {
-									type: "block_complete",
-									block: {
-										type: "tool_use",
+									const tu: AgentToolUse = {
 										toolUseId: id,
-										name: tu.name,
+										name: acc.name,
 										input: parsedInput,
 										streamStartedAt: acc.startedAt,
-									} satisfies ContentBlock,
-								};
-
-								// Start tool execution eagerly (don't await — collect later).
-								// Wrap with .catch() so a rejected permissionHandler doesn't
-								// create an unhandled rejection; the error surfaces as isError.
-								// The .then() populates settledResults synchronously so the
-								// streaming loop can drain completed results without awaiting.
-								const execPromise = executeTool(tu, config).catch(
-									(err): ToolExecResult => ({
-										output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-										isError: true,
-										durationMs: 0,
-									}),
-								);
-								execPromise.then((r) => settledResults.set(id, r));
-								earlyExecMap.set(id, execPromise);
-
-								// Notify frontend the tool has started
-								yield {
-									type: "tool_call",
-									toolUseId: id,
-									toolName: tu.name,
-									input: parsedInput,
-									streamStartedAt: acc.startedAt,
-								};
-
-								// Drain any tool results that settled during streaming.
-								// This lets fast tools (Read, Glob, etc.) report completion
-								// before the model finishes outputting subsequent tool calls.
-								for (const prevTu of toolUses) {
-									const sr = settledResults.get(prevTu.toolUseId);
-									if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
-									yieldedToolResults.add(prevTu.toolUseId);
-									if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
-									const brokenOverride = sr.broken
-										? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
-										: undefined;
-									yield {
-										type: "tool_result",
-										toolUseId: prevTu.toolUseId,
-										toolName: prevTu.name,
-										output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
-										isError: sr.isError ?? false,
-										durationMs: sr.durationMs,
-										brokenInputOverride: brokenOverride,
-										updatedInput: brokenOverride ?? sr.updatedInput,
-										metadata: sr.metadata,
 									};
-									if (sr.fatal) {
-										yield { type: "error", message: sr.output };
-										return;
+									// Skip if already added via non-streaming parsed.toolUses
+									const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
+									if (!alreadyAdded) {
+										toolUses.push(tu);
+									}
+									toolUseAccum.delete(id);
+
+									// If already handled via non-streaming parsed.toolUses,
+									// skip block_complete / execution / tool_call — they were
+									// already yielded in the parsed.toolUses handler above.
+									if (alreadyAdded) continue;
+
+									// Block is complete — yield for immediate persistence
+									yield {
+										type: "block_complete",
+										block: {
+											type: "tool_use",
+											toolUseId: id,
+											name: tu.name,
+											input: parsedInput,
+											streamStartedAt: acc.startedAt,
+										} satisfies ContentBlock,
+									};
+
+									// Start tool execution eagerly (don't await — collect later).
+									// Wrap with .catch() so a rejected permissionHandler doesn't
+									// create an unhandled rejection; the error surfaces as isError.
+									// The .then() populates settledResults synchronously so the
+									// streaming loop can drain completed results without awaiting.
+									const execPromise = executeTool(tu, config).catch(
+										(err): ToolExecResult => ({
+											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+											isError: true,
+											durationMs: 0,
+										}),
+									);
+									execPromise.then((r) => settledResults.set(id, r));
+									earlyExecMap.set(id, execPromise);
+
+									// Notify frontend the tool has started
+									yield {
+										type: "tool_call",
+										toolUseId: id,
+										toolName: tu.name,
+										input: parsedInput,
+										streamStartedAt: acc.startedAt,
+									};
+
+									// Drain any tool results that settled during streaming.
+									// This lets fast tools (Read, Glob, etc.) report completion
+									// before the model finishes outputting subsequent tool calls.
+									for (const prevTu of toolUses) {
+										const sr = settledResults.get(prevTu.toolUseId);
+										if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
+										yieldedToolResults.add(prevTu.toolUseId);
+										if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
+										const brokenOverride = sr.broken
+											? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
+											: undefined;
+										yield {
+											type: "tool_result",
+											toolUseId: prevTu.toolUseId,
+											toolName: prevTu.name,
+											output: sr.broken
+												? getToolMessage("brokenToolCallResult", locale)
+												: sr.output,
+											isError: sr.isError ?? false,
+											durationMs: sr.durationMs,
+											brokenInputOverride: brokenOverride,
+											updatedInput: brokenOverride ?? sr.updatedInput,
+											metadata: sr.metadata,
+										};
+										if (sr.fatal) {
+											yield { type: "error", message: sr.output };
+											return;
+										}
 									}
 								}
 							}
 						}
 					}
-				}
 
-				if (parsed.messageId) messageId = parsed.messageId;
-				if (parsed.credentialId) credentialId = parsed.credentialId;
+					if (parsed.messageId) messageId = parsed.messageId;
+					if (parsed.credentialId) credentialId = parsed.credentialId;
 
-				if (parsed.reasoning) {
-					const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
-					const existing = reasoningBlockMap.get(itemKey);
-					if (existing) {
-						existing.text += parsed.reasoning;
-						if (parsed.reasoningMetadata) {
-							existing.providerMetadata = parsed.reasoningMetadata;
+					if (parsed.reasoning) {
+						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
+						const existing = reasoningBlockMap.get(itemKey);
+						if (existing) {
+							existing.text += parsed.reasoning;
+							if (parsed.reasoningMetadata) {
+								existing.providerMetadata = parsed.reasoningMetadata;
+							}
+						} else {
+							reasoningBlockMap.set(itemKey, {
+								text: parsed.reasoning,
+								providerMetadata: parsed.reasoningMetadata,
+							});
 						}
-					} else {
-						reasoningBlockMap.set(itemKey, {
+						yield {
+							type: "stream_reasoning",
 							text: parsed.reasoning,
 							providerMetadata: parsed.reasoningMetadata,
-						});
+						};
+					} else if (parsed.reasoningMetadata) {
+						// Metadata-only event (e.g. final encrypted_content from output_item.done).
+						// Update the stored metadata without emitting a streaming event.
+						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
+						const existing = reasoningBlockMap.get(itemKey);
+						if (existing) {
+							existing.providerMetadata = parsed.reasoningMetadata;
+						} else {
+							// Metadata arrived before any text — create an empty-text entry
+							reasoningBlockMap.set(itemKey, {
+								text: "",
+								providerMetadata: parsed.reasoningMetadata,
+							});
+						}
 					}
-					yield {
-						type: "stream_reasoning",
-						text: parsed.reasoning,
-						providerMetadata: parsed.reasoningMetadata,
-					};
-				} else if (parsed.reasoningMetadata) {
-					// Metadata-only event (e.g. final encrypted_content from output_item.done).
-					// Update the stored metadata without emitting a streaming event.
-					const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
-					const existing = reasoningBlockMap.get(itemKey);
-					if (existing) {
-						existing.providerMetadata = parsed.reasoningMetadata;
-					} else {
-						// Metadata arrived before any text — create an empty-text entry
-						reasoningBlockMap.set(itemKey, {
-							text: "",
-							providerMetadata: parsed.reasoningMetadata,
-						});
-					}
-				}
-				if (parsed.contextUsagePercentage != null) {
-					receivedUsage = true;
-					// Estimate token count from conversation content (char-based heuristic)
-					const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
-					const estimatedPromptTokens =
-						estimateTokens(JSON.stringify(history)) +
-						estimateTokens(config.systemPrompt ?? "") +
-						estimateTokens(content) +
-						estimateTokens(assistantText);
-					yield {
-						type: "context_usage",
-						percentage: parsed.contextUsagePercentage,
-						promptTokens: estimatedPromptTokens,
-						contextWindow: ctxWin ?? undefined,
-						isEstimated: true,
-					};
-				}
-				if (parsed.metering) {
-					yield {
-						type: "metering",
-						unit: parsed.metering.unit,
-						unitPlural: parsed.metering.unitPlural,
-						usage: parsed.metering.usage,
-						credentialId,
-					};
-				}
-				}
-					yield {
-					};
-				}
-				// Convert OpenAI/Anthropic usage to context_usage percentage
-				if (parsed.usage && parsed.usage.promptTokens != null) {
-					receivedUsage = true;
-					const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
-					if (contextWindow) {
-						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
+					if (parsed.contextUsagePercentage != null) {
+						receivedUsage = true;
+						// Estimate token count from conversation content (char-based heuristic)
+						const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
+						const estimatedPromptTokens =
+							estimateTokens(JSON.stringify(history)) +
+							estimateTokens(config.systemPrompt ?? "") +
+							estimateTokens(content) +
+							estimateTokens(assistantText);
 						yield {
 							type: "context_usage",
-							percentage: Math.min(percentage, 100),
-							promptTokens: parsed.usage.promptTokens,
-							completionTokens: parsed.usage.completionTokens,
-							reasoningTokens: parsed.usage.reasoningTokens,
-							cachedInputTokens: parsed.usage.cachedInputTokens,
-							contextWindow,
+							percentage: parsed.contextUsagePercentage,
+							promptTokens: estimatedPromptTokens,
+							contextWindow: ctxWin ?? undefined,
+							isEstimated: true,
 						};
 					}
-				}
-				if (parsed.webSearch) {
-					const ws = parsed.webSearch;
-					if (!webSearchAccum.has(ws.id)) {
-						webSearchAccum.set(ws.id, { emitted: false });
-					}
-					// biome-ignore lint/style/noNonNullAssertion: just set above
-					const acc = webSearchAccum.get(ws.id)!;
-					// Update query info when available (from output_item.done)
-					if (ws.query) acc.query = ws.query;
-					if (ws.queries) acc.queries = ws.queries;
-					// Emit block_complete when search is done (use accumulated query data
-					// since query info may arrive in earlier events than the completed status)
-					if (ws.status === "completed" && (acc.query || acc.queries) && !acc.emitted) {
-						acc.emitted = true;
+					if (parsed.metering) {
 						yield {
-							type: "block_complete",
-							block: {
-								type: "web_search",
-								id: ws.id,
-								query: acc.query,
-								queries: acc.queries,
-							},
+							type: "metering",
+							unit: parsed.metering.unit,
+							unitPlural: parsed.metering.unitPlural,
+							usage: parsed.metering.usage,
+							credentialId,
 						};
 					}
-					yield {
-						type: "web_search",
-						id: ws.id,
-						status: ws.status,
-						query: ws.query,
-						queries: ws.queries,
-					};
-				}
-				if (parsed.invalidState) {
-					const reason = String(parsed.invalidState.reason ?? "api_error");
-					const message = String(parsed.invalidState.message ?? "Unknown provider error");
-					if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
-						// Yield block_complete for accumulated content before early return
-						// so the caller can persist partial progress (mirrors catch path).
-						for (const entry of reasoningBlockMap.values()) {
-							if (entry.text || entry.providerMetadata) {
-								yield {
-									type: "block_complete",
-									block: {
-										type: "reasoning",
-										text: entry.text,
-										providerMetadata: entry.providerMetadata,
-									},
-								};
-							}
-						}
-						if (assistantText) {
-							yield { type: "block_complete", block: { type: "text", text: assistantText } };
-						}
-						yield { type: "context_length_exceeded", message };
-						return;
 					}
-					if (isRetryableInvalidStateReason(reason, message)) {
-						for (const entry of reasoningBlockMap.values()) {
-							if (entry.text || entry.providerMetadata) {
-								yield {
-									type: "block_complete",
-									block: {
-										type: "reasoning",
-										text: entry.text,
-										providerMetadata: entry.providerMetadata,
-									},
-								};
-							}
-						}
-						if (assistantText) {
-							yield { type: "block_complete", block: { type: "text", text: assistantText } };
-						}
-						yield { type: "retryable_error", message };
-						return;
-					}
-					// Output truncated by max_tokens — not an error, let smart
-					// interruption check handle the auto-continue.
-					if (isOutputTruncationReason(reason)) {
-						yield { type: "output_truncated", message };
-						// Don't return — fall through to yield assistant_message
-						// so the truncated content is persisted normally.
-					} else {
 						yield {
-							type: "invalid_state",
-							reason,
-							message,
 						};
 					}
+					// Convert OpenAI/Anthropic usage to context_usage percentage
+					if (parsed.usage && parsed.usage.promptTokens != null) {
+						receivedUsage = true;
+						const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+						if (contextWindow) {
+							const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
+							yield {
+								type: "context_usage",
+								percentage: Math.min(percentage, 100),
+								promptTokens: parsed.usage.promptTokens,
+								completionTokens: parsed.usage.completionTokens,
+								reasoningTokens: parsed.usage.reasoningTokens,
+								cachedInputTokens: parsed.usage.cachedInputTokens,
+								contextWindow,
+							};
+						}
+					}
+					if (parsed.webSearch) {
+						const ws = parsed.webSearch;
+						if (!webSearchAccum.has(ws.id)) {
+							webSearchAccum.set(ws.id, { emitted: false });
+						}
+						// biome-ignore lint/style/noNonNullAssertion: just set above
+						const acc = webSearchAccum.get(ws.id)!;
+						// Update query info when available (from output_item.done)
+						if (ws.query) acc.query = ws.query;
+						if (ws.queries) acc.queries = ws.queries;
+						// Emit block_complete when search is done (use accumulated query data
+						// since query info may arrive in earlier events than the completed status)
+						if (ws.status === "completed" && (acc.query || acc.queries) && !acc.emitted) {
+							acc.emitted = true;
+							yield {
+								type: "block_complete",
+								block: {
+									type: "web_search",
+									id: ws.id,
+									query: acc.query,
+									queries: acc.queries,
+								},
+							};
+						}
+						yield {
+							type: "web_search",
+							id: ws.id,
+							status: ws.status,
+							query: ws.query,
+							queries: ws.queries,
+						};
+					}
+					if (parsed.invalidState) {
+						const reason = String(parsed.invalidState.reason ?? "api_error");
+						const message = String(parsed.invalidState.message ?? "Unknown provider error");
+						if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
+							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield { type: "context_length_exceeded", message };
+							return;
+						}
+						if (isRetryableInvalidStateReason(reason, message)) {
+							// In-loop retry: skip block_complete persistence and retry
+							// the same chat() call with identical parameters.
+							if (chatRetryCount < maxChatRetries && !config.signal.aborted) {
+								chatRetryCount++;
+								const delayMs = Math.min(
+									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+									20_000,
+								);
+								yield {
+									type: "retrying",
+									message,
+									attempt: chatRetryCount,
+									maxRetries: maxChatRetries,
+									delayMs,
+								};
+								await abortableSleep(delayMs, config.signal);
+								if (config.signal.aborted) {
+									yield { type: "error", message: "Aborted" };
+									return;
+								}
+								continue; // retry provider.chat()
+							}
+							// Exhausted retries — yield block_complete for partial content
+							// then signal retryable_error to the caller.
+							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield { type: "retryable_error", message };
+							return;
+						}
+						// Output truncated by max_tokens — not an error, let smart
+						// interruption check handle the auto-continue.
+						if (isOutputTruncationReason(reason)) {
+							yield { type: "output_truncated", message };
+							// Don't return — fall through to yield assistant_message
+							// so the truncated content is persisted normally.
+						} else {
+							yield {
+								type: "invalid_state",
+								reason,
+								message,
+							};
+						}
+					}
 				}
-			}
-		} catch (err) {
-			// Even on error, yield block_complete for accumulated content so it can be persisted
-			for (const entry of reasoningBlockMap.values()) {
-				if (entry.text || entry.providerMetadata) {
-					yield {
-						type: "block_complete",
-						block: {
-							type: "reasoning",
-							text: entry.text,
-							providerMetadata: entry.providerMetadata,
-						},
-					};
+			} catch (err) {
+				if (config.signal.aborted) {
+					// Even on abort, yield block_complete for accumulated content so it can be persisted
+					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield { type: "error", message: "Aborted" };
+					return;
 				}
-			}
-			if (assistantText) {
-				yield { type: "block_complete", block: { type: "text", text: assistantText } };
-			}
-			if (config.signal.aborted) {
-				yield { type: "error", message: "Aborted" };
+				const msg = err instanceof Error ? err.message : String(err);
+				if (
+					err &&
+					typeof err === "object" &&
+					"code" in err &&
+					(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
+				) {
+					// Persist partial content before signalling overflow
+					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield { type: "context_length_exceeded", message: msg };
+					return;
+				}
+				// Detect context overflow errors from OpenAI/Codex-compatible providers.
+				// Treat as context_length_exceeded so caller can prune/compact+retry.
+				if (isContextWindowExceededError(err)) {
+					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield { type: "context_length_exceeded", message: msg };
+					return;
+				}
+				// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
+				// throttling, 429/529 overloaded)
+				if (isRetryableError(err)) {
+					// In-loop retry for stateless providers
+					if (chatRetryCount < maxChatRetries && !config.signal.aborted) {
+						chatRetryCount++;
+						const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1), 20_000);
+						yield {
+							type: "retrying",
+							message: msg,
+							attempt: chatRetryCount,
+							maxRetries: maxChatRetries,
+							delayMs,
+						};
+						await abortableSleep(delayMs, config.signal);
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						continue; // retry provider.chat()
+					}
+					// Exhausted retries — persist partial content and signal caller
+					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield { type: "retryable_error", message: msg };
+					return;
+				}
+				// Non-retryable error — persist partial content and signal caller
+				yield* flushPartialContent(reasoningBlockMap, assistantText);
+				yield { type: "error", message: msg };
 				return;
 			}
-			const msg = err instanceof Error ? err.message : String(err);
-			if (
-				err &&
-				typeof err === "object" &&
-				"code" in err &&
-				(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
-			) {
-				yield { type: "context_length_exceeded", message: msg };
-				return;
-			}
-			// Detect context overflow errors from OpenAI/Codex-compatible providers.
-			// Treat as context_length_exceeded so caller can prune/compact+retry.
-			if (isContextWindowExceededError(err)) {
-				yield { type: "context_length_exceeded", message: msg };
-				return;
-			}
-			// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
-			// throttling, 429/529 overloaded)
-			if (isRetryableError(err)) {
-				yield { type: "retryable_error", message: msg };
-				return;
-			}
-			yield { type: "error", message: msg };
-			return;
-		}
+
+			// Chat call succeeded — break out of the retry loop
+			break;
+		} // end for (;;) retry loop
 
 		// ── Fallback: estimate context usage when the provider reported nothing ──
 		if (!receivedUsage) {
@@ -1058,21 +1155,7 @@ export async function* agentLoop(
 			toolUseAccum.clear();
 
 			// Yield accumulated content before truncation
-			for (const entry of reasoningBlockMap.values()) {
-				if (entry.text || entry.providerMetadata) {
-					yield {
-						type: "block_complete",
-						block: {
-							type: "reasoning",
-							text: entry.text,
-							providerMetadata: entry.providerMetadata,
-						},
-					};
-				}
-			}
-			if (assistantText) {
-				yield { type: "block_complete", block: { type: "text", text: assistantText } };
-			}
+			yield* flushPartialContent(reasoningBlockMap, assistantText);
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.
@@ -1135,21 +1218,7 @@ export async function* agentLoop(
 
 		if (!hasOrphanedToolUses) {
 			// Yield block_complete for accumulated content now that streaming is done
-			for (const entry of reasoningBlockMap.values()) {
-				if (entry.text || entry.providerMetadata) {
-					yield {
-						type: "block_complete",
-						block: {
-							type: "reasoning",
-							text: entry.text,
-							providerMetadata: entry.providerMetadata,
-						},
-					};
-				}
-			}
-			if (assistantText) {
-				yield { type: "block_complete", block: { type: "text", text: assistantText } };
-			}
+			yield* flushPartialContent(reasoningBlockMap, assistantText);
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.

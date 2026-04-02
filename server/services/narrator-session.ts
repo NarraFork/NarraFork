@@ -41,6 +41,7 @@ import {
 	resolveProvider,
 	settings,
 	usesCodexApiMode,
+	usesStatefulApi,
 } from "../lib/settings";
 import type { ImageRef, TextFileRef } from "../lib/uploads";
 import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
@@ -3044,6 +3045,7 @@ async function runAgentLoop(
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
+				maxTransientRetries: getMaxTransientRetries(),
 				metadata: isAnthropicProvider(resolved.provider)
 					? { user_id: `user_${narratorId}_account__session_${active.conversationId}` }
 					: undefined,
@@ -3196,7 +3198,27 @@ async function runAgentLoop(
 			}
 
 			// --- Transient API error: warn frontend and retry with backoff ---
+			// For stateless providers, the agentLoop already retried internally with
+			// identical history/content — reaching here means all in-loop retries
+			// were exhausted.  Only stateful providers (responses/codex) benefit from
+			// an outer retry that rebuilds history from DB.
 			if (result.retryableError && active.alive) {
+				if (!usesStatefulApi(resolved.provider)) {
+					// Stateless provider: in-loop retries exhausted — give up.
+					const partialId = active._partialMessageId;
+					active._partialMessageId = undefined;
+					if (partialId) {
+						await finalizeOrCleanupPartialMessage(partialId, narratorId);
+					}
+					await narratorService.updateStatus(narratorId, "error", result.retryableError);
+					active.events.emit("event", {
+						type: "error",
+						data: { message: result.retryableError },
+					});
+					loopHadError = true;
+					break;
+				}
+				// Stateful provider: outer retry with rebuilt history
 				transientRetries++;
 				const { shouldRetry } = await handleTransientError({
 					narratorId,

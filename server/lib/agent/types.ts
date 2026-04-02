@@ -147,6 +147,13 @@ export type AgentEvent =
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
 	| { type: "retryable_error"; message: string }
+	| {
+			type: "retrying";
+			message: string;
+			attempt: number;
+			maxRetries: number;
+			delayMs: number;
+	  }
 	| { type: "context_length_exceeded"; message: string }
 	| { type: "stream_reasoning"; text: string; providerMetadata?: ReasoningProviderMetadata }
 	| {
@@ -305,4 +312,16 @@ export interface AgentConfig {
 	 * injection to stop after the current tool finishes.
 	 */
 	shouldStop?: () => boolean;
+	/**
+	 * Maximum number of transient-error retries within a single provider.chat()
+	 * call.  When exceeded the loop yields `retryable_error` and returns.
+	 * Defaults to 0 (no in-loop retry — caller handles it).
+	 */
+	maxTransientRetries?: number;
 }
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/** Base delay for transient-error retries (ms). Used by both the agent loop
+ *  (in-loop retry) and the outer narrator session retry. */
+export const TRANSIENT_RETRY_BASE_MS = 5_000;

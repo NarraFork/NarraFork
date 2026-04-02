@@ -848,6 +848,22 @@ export function usesCodexApiMode(prefix?: string): boolean {
 	return getOpenaiProviderConfig(prefix)?.apiMode === "codex";
 }
 
+/**
+ * Whether a provider uses a stateful server-side conversation (Responses API).
+ * Stateful providers cannot safely retry the same API call because the server
+ * already consumed the previous request and advanced its internal state.
+ *
+ * `prefix === "codex"` is hard-coded because Codex uses a dedicated config path
+ * (not the openaiProviders array), so `getOpenaiProviderConfig("codex")` would
+ * return undefined.  All other stateful providers are detected via `apiMode`.
+ */
+export function usesStatefulApi(prefix?: string): boolean {
+	if (!prefix) return false;
+	if (prefix === "codex") return true;
+	const mode = getOpenaiProviderConfig(prefix)?.apiMode;
+	return mode === "codex" || mode === "responses";
+}
+
 /** Whether a provider is an Anthropic provider (supports thinking/effort controls). */
 export function isAnthropicProvider(prefix?: string): boolean {
 	if (!prefix) return false;

@@ -209,7 +209,14 @@ export type NarratorServerMessage =
 			topLevel: unknown[];
 	  }
 	| { type: "error"; message: string }
-	| { type: "warning"; narratorId: string; message: string }
+	| {
+			type: "warning";
+			narratorId: string;
+			message: string;
+			retryCount?: number;
+			maxRetries?: number;
+			delayMs?: number;
+	  }
 	| { type: "context_length_exceeded"; narratorId: string }
 	| { type: "full_reload"; narratorId: string }
 	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }

@@ -391,6 +391,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			signal,
 			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
 			serviceTier: resolvedServiceTier,
+			maxTransientRetries: getMaxTransientRetries(),
 			metadata: isAnthropicProvider(resolvedProvider)
 				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,
@@ -1023,6 +1024,10 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	// 2. Persist subagent's user message (linked to parent's tool_use)
 	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
 
+	// Broadcast subagent_started after persist so the frontend only sees it
+	// when the subagent record is fully consistent (narrator + user message).
+	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
+
 	if (background) {
 		// --- Background mode: fire-and-forget ---
 
@@ -1032,9 +1037,6 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running", updatedAt: now })
 			.where(eq(narrators.id, subagentId));
-
-		// Broadcast background task started
-		broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 		eventBus.emit({
 			type: "narrator:background_task_started",
 			narratorId: parentNarratorId,
@@ -1088,9 +1090,6 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	}
 
 	// --- Foreground mode (existing behavior) ---
-
-	// 3. Broadcast subagent_started
-	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 
 	// Create an independent AbortController so the subagent can be interrupted
 	// from its own page without aborting the parent narrator.

@@ -1,8 +1,7 @@
 /** Split-tree data structure for VS Code–style recursive panel splitting. */
 
-let _nextId = 1;
 function genId(): string {
-	return `sp_${_nextId++}`;
+	return `sp_${crypto.randomUUID().slice(0, 8)}`;
 }
 
 export type SplitDirection = "horizontal" | "vertical";

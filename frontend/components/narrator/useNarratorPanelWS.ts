@@ -293,6 +293,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	useEffect(() => {
 		}
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
+	const retryInfoRef = useRef<RetryInfo | null>(null);
+	const clearRetryIfActive = useCallback(() => {
+		if (retryInfoRef.current) {
+			retryInfoRef.current = null;
+			setRetryInfo(null);
+		}
+	}, []);
 	const [unreadCount, setUnreadCount] = useState(0);
 
 	// --- Viewers ---
@@ -688,13 +695,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// Only call setRetryInfo when there is actually a retry to clear —
 					// avoids a no-op setState on every delta that still increments
 					// React's nested-update counter inside useLayoutEffect chains.
-					if (retryInfo) setRetryInfo(null);
+					clearRetryIfActive();
 					streamingRef.current += ev.delta.text;
 					flushStreamingVersion();
 					return;
 				}
 				if (ev.delta.type === "reasoning_delta") {
-					if (retryInfo) setRetryInfo(null);
+					clearRetryIfActive();
 					streamingReasoningRef.current += ev.delta.text;
 					flushStreamingVersion();
 					return;
@@ -720,7 +727,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
 						// New assistant message means any pending retry succeeded
-						if (retryInfo) setRetryInfo(null);
+						clearRetryIfActive();
 						// Only clear top-level streaming state for non-subagent messages.
 						// Subagent assistant messages should NOT reset the parent narrator's
 						// streaming text, tool chunks, or streaming version — the parent
@@ -993,7 +1000,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				parentToolUseId?: string,
 			) => {
 				// Tool execution starting means any pending retry has succeeded.
-				if (retryInfo) setRetryInfo(null);
+				clearRetryIfActive();
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
 
@@ -1027,6 +1034,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					};
 					if (parentToolUseId && input) {
 						fields.inputJson = input;
+					}
+					// For Agent tools with an explicit model in input, eagerly set
+					// _resolvedModel so the badge renders immediately instead of
+					// waiting for the subagent_started WS event.
+					if (toolName === "Agent" && input?.model && typeof input.model === "string") {
+						fields._resolvedModel = input.model;
 					}
 					return mergeFieldsByIndex(old, toolUseId, fields, toolUseIndexRef.current);
 				});
@@ -1192,7 +1205,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status, turnStartedAt) => {
 				setIsCompacting(false);
-				if (retryInfo) setRetryInfo(null);
+				clearRetryIfActive();
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
 				// "interrupted" and "done" also mean the agent loop has stopped, so any
 				// residual streaming text / tool chunks must be flushed.
@@ -1341,12 +1354,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onNarratorWarning: (info) => {
 				if (info.retryCount != null && info.maxRetries != null && info.delayMs != null) {
-					setRetryInfo({
+					const ri = {
 						message: info.message,
 						retryCount: info.retryCount,
 						maxRetries: info.maxRetries,
 						retryAt: Date.now() + info.delayMs,
-					});
+					};
+					retryInfoRef.current = ri;
+					setRetryInfo(ri);
 				}
 				notifications.show({
 					title: t("narratorRetrying"),

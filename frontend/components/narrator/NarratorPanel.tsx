@@ -104,6 +104,7 @@ import {
 	type ModelOption,
 	NARRATOR_STATUS_COLORS,
 } from "../../lib/constants";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { UserAvatar } from "../UserAvatar";
@@ -2212,10 +2213,33 @@ export function NarratorPanel({
 	]);
 
 	// All streaming content is now handled by segmentMessages via streamingMsg.
-	// No separate finalElements pass needed — flatElements is the final output.
-	const finalElements = flatElements;
-	const finalKeys = flatKeys;
-	const finalTargets = flatTargets;
+	// Prepend a manual "load older" button when auto-load is disabled and more pages exist.
+	const showManualLoadOlder = !autoLoadEnabled && hasNextPage;
+	const loadOlderBtnRef = useRef<() => void>(undefined);
+	const finalElements = useMemo(() => {
+		if (!showManualLoadOlder) return flatElements;
+		const btn = (
+			<Box ta="center" py={4}>
+				<Button
+					size="compact-xs"
+					variant="light"
+					onClick={() => loadOlderBtnRef.current?.()}
+					loading={isFetchingNextPage}
+				>
+					{t("loadOlderMessages")}
+				</Button>
+			</Box>
+		);
+		return [btn, ...flatElements];
+	}, [showManualLoadOlder, flatElements, isFetchingNextPage, t]);
+	const finalKeys = useMemo(
+		() => (showManualLoadOlder ? ["__load-older-btn__", ...flatKeys] : flatKeys),
+		[showManualLoadOlder, flatKeys],
+	);
+	const finalTargets = useMemo(
+		() => (showManualLoadOlder ? [[], ...flatTargets] : flatTargets),
+		[showManualLoadOlder, flatTargets],
+	);
 
 	const targetIndexMap = useMemo(() => {
 		const indexMap = new Map<string, number>();
@@ -2260,6 +2284,7 @@ export function NarratorPanel({
 			setShifting(false);
 		});
 	}, [fetchNextPage, isFetchingNextPage]);
+	loadOlderBtnRef.current = handleLoadOlder;
 
 	const handleLoadNewer = useCallback(async () => {
 		if (isFetchingPreviousPage) return;
@@ -2699,6 +2724,10 @@ export function NarratorPanel({
 						? { ...old, status: "thinking", turnStartedAt: new Date().toISOString() }
 						: old,
 				);
+				// Safety net: trigger a sync_check shortly after sending so that
+				// even if the WS subscription was delayed, we catch up on any
+				// missed events from the server.
+				setTimeout(() => narratorWSManager.checkSync(narratorId), 500);
 			}
 		} catch (err) {
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
@@ -3273,6 +3302,7 @@ export function NarratorPanel({
 							<RenderProgress indeterminate />
 						</Box>
 					)}
+
 					{/* Skeleton overlay during node resize to prevent jitter */}
 					{isResizing && (
 						<Box

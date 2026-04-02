@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { TRANSIENT_RETRY_BASE_MS } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
@@ -18,7 +19,7 @@ import { runCustomCompact } from "./narrator-session";
 // ── Constants ────────────────────────────────────────────────────────────────
 
 export const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
-export const TRANSIENT_RETRY_BASE_MS = 5_000;
+export { TRANSIENT_RETRY_BASE_MS };
 
 /** Read the user-configured max transient retries from settings. */
 export function getMaxTransientRetries(): number {
