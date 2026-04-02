@@ -681,8 +681,12 @@ export const handleNarratorWS = {
 				// Send streaming snapshot: restore in-progress tool chunks + text
 				for (const id of msg.narratorIds) {
 					const snap = getStreamingSnapshot(id);
-					if (snap && (snap.streamingText || snap.streamingReasoning || snap.toolChunks.size > 0)) {
-						try {
+					if (!snap) continue;
+					const hasStreaming =
+						snap.streamingText || snap.streamingReasoning || snap.toolChunks.size > 0;
+					if (!hasStreaming && !hasQueue) continue;
+					try {
+						if (hasStreaming) {
 							ws.send(
 								JSON.stringify({
 									type: "streaming_snapshot",
@@ -692,9 +696,16 @@ export const handleNarratorWS = {
 									toolChunks: [...snap.toolChunks.values()],
 								}),
 							);
-						} catch {
-							connections.delete(ws);
 						}
+						if (hasQueue) {
+							ws.send(
+								JSON.stringify({
+									narratorId: id,
+								}),
+							);
+						}
+					} catch {
+						connections.delete(ws);
 					}
 				}
 				// Catch-up: send messages the client missed while disconnected

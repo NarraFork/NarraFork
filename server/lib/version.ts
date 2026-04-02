@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 
 let version = "0.0.0";
 let commitHash = "";
+let platform = "";
 
 // Dev mode: read from package.json + git directly
 const pkgPath = resolve(import.meta.dir, "../../package.json");
@@ -22,9 +23,14 @@ if (existsSync(pkgPath)) {
 } else {
 	// Compiled binary: no package.json, use generated build info
 	try {
-		const { buildVersion, buildCommit } = await import("@server/generated/build-info");
-		version = buildVersion;
-		commitHash = buildCommit;
+		const mod = (await import("@server/generated/build-info")) as {
+			buildVersion: string;
+			buildCommit: string;
+			buildPlatform?: string;
+		};
+		version = mod.buildVersion;
+		commitHash = mod.buildCommit;
+		platform = mod.buildPlatform ?? "";
 	} catch {
 		// no build info either
 	}
@@ -32,3 +38,5 @@ if (existsSync(pkgPath)) {
 
 export const APP_VERSION: string = version;
 export const GIT_COMMIT: string = commitHash;
+/** Build platform identifier, e.g. "win-x64-baseline", "linux-x64". Empty in dev mode. */
+export const BUILD_PLATFORM: string = platform;

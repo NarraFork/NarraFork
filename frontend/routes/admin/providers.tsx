@@ -533,6 +533,7 @@ function ProvidersPage() {
 							prefixOptions={[]}
 							modelContextWindows={modelContextWindows}
 							onContextWindowChange={handleContextWindowChange}
+							onTestModel={setTestingModel}
 							orphanOnly
 							orphanModels={orphanModels}
 						/>

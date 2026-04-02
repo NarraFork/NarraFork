@@ -1198,7 +1198,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// residual streaming text / tool chunks must be flushed.
 				const isTerminal =
 					status === "idle" || status === "interrupted" || status === "done" || status === "error";
+				// shortly after the thinking transition.
 				if (isTerminal) {
+
 					const hadStreaming =
 						!!streamingRef.current || !!streamingReasoningRef.current || !!webSearchRef.current;
 					if (streamingRef.current) {
@@ -1214,8 +1216,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (hadStreaming) {
 						clearStreamingState();
 					}
-				}
-				if (isTerminal) {
+
 					// Cancel any pending RAF tool chunk flush and notify so the memo
 					// recomputes — otherwise stale streaming tool blocks linger on screen.
 					// Include subagent chunks since the entire session is done.

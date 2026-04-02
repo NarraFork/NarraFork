@@ -134,6 +134,7 @@ import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
+	MessagesPage,
 	MessagesQueryData,
 	NarratorMsg,
 	NarratorPanelProps,
@@ -163,6 +164,49 @@ import { useNarratorPanelWS } from "./useNarratorPanelWS";
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
+
+type PageRenderCacheEntry = {
+	messageRefs: readonly NarratorMsg[];
+	secondaryKey: string;
+	elements: React.ReactNode[];
+	keys: string[];
+	targets: string[][];
+	meta: RenderedTreeElementMeta[];
+};
+
+function hasSamePageMessageRefs(
+	prevMessages: readonly NarratorMsg[],
+	nextMessages: readonly NarratorMsg[],
+) {
+	if (prevMessages.length !== nextMessages.length) return false;
+	for (let i = 0; i < prevMessages.length; i++) {
+		if (prevMessages[i] !== nextMessages[i]) return false;
+	}
+	return true;
+}
+
+function getPageRenderCacheKey(
+	page: MessagesPage,
+	pageParam: unknown,
+	narratorId: string,
+	highlightMessageId?: string,
+) {
+	const pageCursor =
+		typeof pageParam === "object" && pageParam && "cursor" in pageParam
+			? String(pageParam.cursor)
+			: typeof pageParam === "string"
+				? pageParam
+				: undefined;
+	const pageDirection =
+		typeof pageParam === "object" && pageParam && "direction" in pageParam
+			? String(pageParam.direction)
+			: "older";
+	const firstMessageId = page.messages[0]?.id ?? "none";
+	const lastMessageId = page.messages[page.messages.length - 1]?.id ?? "none";
+	return pageParam == null
+		? `initial:${narratorId}:${highlightMessageId ?? "latest"}:${firstMessageId}:${lastMessageId}`
+		: `${pageDirection}:${pageCursor ?? firstMessageId}:${lastMessageId}`;
+}
 
 function ModelMenuItems({
 	allModels,
@@ -1612,6 +1656,7 @@ export function NarratorPanel({
 
 	const stableToolRunKeyByTargetIdRef = useRef<Map<string, string>>(new Map());
 	const nextStableToolRunKeyRef = useRef(1);
+	const pageCacheRef = useRef(new Map<string, PageRenderCacheEntry>());
 	const prevNarratorIdRef = useRef(narratorId);
 	if (prevNarratorIdRef.current !== narratorId) {
 		prevNarratorIdRef.current = narratorId;
@@ -1621,6 +1666,7 @@ export function NarratorPanel({
 		}
 		stableToolRunKeyByTargetIdRef.current.clear();
 		nextStableToolRunKeyRef.current = 1;
+		pageCacheRef.current.clear();
 	}
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/highlightMessageId are used to reset one-shot highlight state when the active target changes
@@ -2025,18 +2071,10 @@ export function NarratorPanel({
 		});
 	}, [streamingVersion, topLevelStreamingChunks, narratorId]);
 
-	// When a page object reference doesn't change, we reuse the cached result.
-	const pageCacheRef = useRef(
-		new WeakMap<
-			object,
-			{
-				elements: React.ReactNode[];
-				keys: string[];
-				targets: string[][];
-				meta: RenderedTreeElementMeta[];
-			}
-		>(),
-	);
+	// Page-level render cache.
+	// Use a stable page key + message reference equality instead of WeakMap page
+	// object identity, because React Query frequently replaces page wrapper
+	// objects even when the message list for that page is unchanged.
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
 	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
@@ -2050,50 +2088,39 @@ export function NarratorPanel({
 		const pages = messagesData.pages;
 		const pageParams = messagesData.pageParams ?? [];
 		const reversed = pages
-			.map((page, originalIndex) => ({ page, originalIndex, pageParam: pageParams[originalIndex] }))
+			.map((page, originalIndex) => ({ page, pageParam: pageParams[originalIndex] }))
 			.reverse();
 		const cache = pageCacheRef.current;
+		const activePageKeys = new Set<string>();
 		const allElements: React.ReactNode[] = [];
 		const allKeys: string[] = [];
 		const allTargets: string[][] = [];
 		const usedKeys = new Set<string>();
 
-		// Build a cache key object per page that includes all render-affecting props.
-		// We use the page reference as the primary cache key, but invalidate when
-		// other props change by storing a secondary key alongside.
+		// Build a secondary cache key for render-affecting props outside the page
+		// message references themselves.
 		const permsKey = `${renderPermCb.pendingPermsMap.size}:${[...renderPermCb.pendingPermsMap.keys()].join(",")}`;
 		const bgDismissedKey = `${renderPermCb.bgRetryDismissedIds.size}:${[...renderPermCb.bgRetryDismissedIds].join(",")}`;
 		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}|${bgDismissedKey}`;
 
 		for (let ri = 0; ri < reversed.length; ri++) {
-			const { page, originalIndex, pageParam } = reversed[ri];
+			const { page, pageParam } = reversed[ri];
 			if (!page?.messages?.length) continue;
-			const pageCursor =
-				typeof pageParam === "object" && pageParam && "cursor" in pageParam
-					? String(pageParam.cursor)
-					: typeof pageParam === "string"
-						? pageParam
-						: undefined;
-			const pageDirection =
-				typeof pageParam === "object" && pageParam && "direction" in pageParam
-					? String(pageParam.direction)
-					: "older";
-			const pageKey =
-				pageParam == null
-					? `initial:${narratorId}:${highlightMessageId ?? "latest"}`
-					: `${pageDirection}:${pageCursor ?? originalIndex}`;
+			const pageKey = getPageRenderCacheKey(page, pageParam, narratorId, highlightMessageId);
+			activePageKeys.add(pageKey);
 
 			// The last page in the reversed array (= first/newest page) receives
 			// the streaming message so it participates in normal segmentation.
 			const isNewestPage = ri === reversed.length - 1;
 			const pageStreamingMsg = isNewestPage ? streamingMsg : null;
 
-			// Check cache — skip cache when streaming is active on this page
-			const cached = cache.get(page);
+			// Check cache — skip cache when streaming is active on this page.
+			const cached = cache.get(pageKey);
 			if (
 				!pageStreamingMsg &&
 				cached &&
-				(cached as { _secondaryKey?: string })._secondaryKey === secondaryKey
+				cached.secondaryKey === secondaryKey &&
+				hasSamePageMessageRefs(cached.messageRefs, page.messages)
 			) {
 				for (let j = 0; j < cached.elements.length; j++) {
 					const targetIds = cached.targets[j] ?? [];
@@ -2130,8 +2157,13 @@ export function NarratorPanel({
 
 			// Only cache when there's no streaming message (streaming changes every frame)
 			if (!pageStreamingMsg) {
-				const entry = { ...result, _secondaryKey: secondaryKey };
-				cache.set(page, entry);
+				cache.set(pageKey, {
+					...result,
+					messageRefs: page.messages,
+					secondaryKey,
+				});
+			} else {
+				cache.delete(pageKey);
 			}
 
 			for (let j = 0; j < result.elements.length; j++) {
@@ -2141,6 +2173,12 @@ export function NarratorPanel({
 				usedKeys.add(key);
 				allKeys.push(key);
 				allTargets.push(targetIds);
+			}
+		}
+
+		for (const cachedPageKey of cache.keys()) {
+			if (!activePageKeys.has(cachedPageKey)) {
+				cache.delete(cachedPageKey);
 			}
 		}
 
@@ -3738,6 +3776,9 @@ export function NarratorPanel({
 														? t("planning")
 														: t("thinking")}
 								</Text>
+									<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
+									</Text>
+								)}
 								{turnElapsedText && (
 									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 										{turnElapsedText}
@@ -3761,9 +3802,6 @@ export function NarratorPanel({
 							<Text size="xs" c="dimmed">
 								{t(`status_${narrator.status}`)}
 							</Text>
-								<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
-								</Text>
-							)}
 							{turnElapsedText && (
 								<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 									· {t("lastTurnDuration", { duration: turnElapsedText })}

@@ -669,7 +669,7 @@ function MergeSummaryCard({
 	);
 }
 
-export function ReasoningSummary({
+export const ReasoningSummary = memo(function ReasoningSummary({
 	text,
 	translatedText,
 	isStreaming,
@@ -891,7 +891,7 @@ export function ReasoningSummary({
 			)}
 		</Box>
 	);
-}
+});
 
 function PlanCard({
 	summary,

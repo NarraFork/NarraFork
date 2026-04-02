@@ -899,6 +899,7 @@ export function CodexSection({
 								onToggleHidden={onToggleHidden}
 								modelContextWindows={modelContextWindows}
 								onContextWindowChange={onContextWindowChange}
+								onTestModel={onTestModel}
 							/>
 						</Stack>
 					</Stack>

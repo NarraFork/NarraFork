@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import { APP_VERSION } from "../lib/version";
+import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
 
 const NARRAFORK_DIR = join(homedir(), ".narrafork");
@@ -174,8 +174,11 @@ const UPDATE_DIR = resolve(homedir(), ".narrafork", "updates");
 
 /**
  * Get the platform identifier for update server.
+ * In compiled binaries, uses the build-time injected constant (includes baseline suffix).
+ * Falls back to runtime detection in dev mode.
  */
 function getPlatform(): string {
+	if (BUILD_PLATFORM) return BUILD_PLATFORM;
 	const arch = process.arch === "arm64" ? "arm64" : "x64";
 	switch (process.platform) {
 		case "darwin":
@@ -659,13 +662,6 @@ export function getUpdateInstructions(updatePath: string): {
 }
 
 /**
- * Get the path where updates are downloaded.
- */
-export function getUpdateDirectory(): string {
-	return UPDATE_DIR;
-}
-
-/**
  * Clean up old update files.
  */
 export function cleanupOldUpdates(): void {
@@ -685,6 +681,13 @@ export function cleanupOldUpdates(): void {
 			}
 		} catch {}
 	}
+}
+
+/**
+ * Get the path where updates are downloaded.
+ */
+export function getUpdateDirectory(): string {
+	return UPDATE_DIR;
 }
 
 /**

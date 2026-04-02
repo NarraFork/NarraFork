@@ -869,6 +869,9 @@ export async function processEvent(
 			return null;
 		}
 
+			// Cache queue position in the streaming snapshot so late-joining
+			// subscribers see it immediately via streaming_snapshot.
+			const qSnap = getOrCreateSnapshot(narratorId);
 			dualBroadcast(ctx, {
 				narratorId: broadcastTargetId,
 				position: event.position,

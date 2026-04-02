@@ -1,6 +1,6 @@
 import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
 import { IconBrain } from "@tabler/icons-react";
-import { memo } from "react";
+import { memo, useMemo } from "react";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import {
 	getReasoningBlurAnimationId,
@@ -45,6 +45,119 @@ export type RenderedTreeElementMeta =
 	| { kind: "decorative" }
 	| { kind: "tool-run"; sourceMessages: NarratorMsg[] };
 
+type ReasoningToolRunItem = Extract<ToolRunItem, { kind: "reasoning" }>;
+
+const HIGHLIGHT_STYLE: React.CSSProperties = {
+	animation: "highlight-blink 1.5s ease",
+	borderRadius: "var(--mantine-radius-sm)",
+};
+
+const ToolRunReasoningItem = memo(
+	function ToolRunReasoningItem({
+		item,
+		idx,
+		total,
+		highlighted,
+		onForkFromMessage,
+		onCompactBeforeMessage,
+		onDeleteBlock,
+	}: {
+		item: ReasoningToolRunItem;
+		idx: number;
+		total: number;
+		highlighted: boolean;
+		onForkFromMessage?: (uuid: string) => void;
+		onCompactBeforeMessage?: (messageId: string) => void;
+		onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	}) {
+		const iconColor = getCategoryColor("plan");
+		const isStreaming = item.msg.id === "__streaming__";
+		const reasoningAnimationId = getReasoningBlurAnimationId({
+			messageId: item.msg.id,
+			blockIndex: item.blockIndex,
+			createdAt: item.msg.createdAt,
+			fallbackKey: idx,
+		});
+		const hlStyle = highlighted ? HIGHLIGHT_STYLE : undefined;
+		const ctxActions = useMemo<MessageContextMenuActions>(() => {
+			const next: MessageContextMenuActions = {};
+			const msgUuid = item.msg.messageUuid;
+			const msgId = item.msg.id;
+			if (msgUuid && onForkFromMessage) {
+				next.onForkFromMessage = () => onForkFromMessage(msgUuid);
+			}
+			if (msgId && onCompactBeforeMessage) {
+				next.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
+			}
+			if (msgId && onDeleteBlock) {
+				next.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
+			}
+			return next;
+		}, [
+			item.msg.id,
+			item.msg.messageUuid,
+			onCompactBeforeMessage,
+			onDeleteBlock,
+			onForkFromMessage,
+		]);
+		const header = (
+			<Group gap={5} wrap="nowrap" align="flex-start">
+				<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
+					<IconBrain size={10} />
+				</ThemeIcon>
+				<ReasoningSummary
+					text={item.text}
+					translatedText={item.translatedText}
+					isStreaming={isStreaming}
+				/>
+			</Group>
+		);
+		const content = (
+			<div id={`msg-${item.msg.id}`} style={hlStyle}>
+				<ContentViewer
+					content={item.text}
+					markdown
+					contentType="markdown"
+					blockIndex={item.blockIndex}
+				>
+					{total >= 2 ? (
+						<>
+							<Box p="xs">{header}</Box>
+							{idx !== total - 1 && (
+								<Divider color="var(--mantine-color-default-border)" size={1} />
+							)}
+						</>
+					) : (
+						<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
+							{header}
+						</Paper>
+					)}
+				</ContentViewer>
+			</div>
+		);
+		return (
+			<MessageContextMenuCtx.Provider value={ctxActions}>
+				{reasoningAnimationId ? (
+					<BlurInOnAppear animationId={reasoningAnimationId}>{content}</BlurInOnAppear>
+				) : (
+					content
+				)}
+			</MessageContextMenuCtx.Provider>
+		);
+	},
+	(prev, next) =>
+		prev.item.msg === next.item.msg &&
+		prev.item.blockIndex === next.item.blockIndex &&
+		prev.item.text === next.item.text &&
+		prev.item.translatedText === next.item.translatedText &&
+		prev.idx === next.idx &&
+		prev.total === next.total &&
+		prev.highlighted === next.highlighted &&
+		prev.onForkFromMessage === next.onForkFromMessage &&
+		prev.onCompactBeforeMessage === next.onCompactBeforeMessage &&
+		prev.onDeleteBlock === next.onDeleteBlock,
+);
+
 export function renderToolRun(
 	items: ToolRunItem[],
 	runKey: string,
@@ -84,13 +197,7 @@ export function renderToolRun(
 			item.kind === "tool"
 				? (item.tc.toolUseId ?? `${item.msg.id}-${idx}`)
 				: `reasoning-${item.msg.id}-${item.blockIndex}`;
-		const hlStyle =
-			highlightedId === item.msg.id
-				? {
-						animation: "highlight-blink 1.5s ease",
-						borderRadius: "var(--mantine-radius-sm)",
-					}
-				: undefined;
+		const hlStyle = highlightedId === item.msg.id ? HIGHLIGHT_STYLE : undefined;
 
 		const ctxActions: MessageContextMenuActions = {};
 		const msgUuid = item.msg.messageUuid;
@@ -106,53 +213,17 @@ export function renderToolRun(
 		}
 
 		if (item.kind === "reasoning") {
-			const iconColor = getCategoryColor("plan");
-			const isStreaming = item.msg.id === "__streaming__";
-			const reasoningAnimationId = getReasoningBlurAnimationId({
-				messageId: item.msg.id,
-				blockIndex: item.blockIndex,
-				createdAt: item.msg.createdAt,
-				fallbackKey: idx,
-			});
-			const header = (
-				<Group gap={5} wrap="nowrap" align="flex-start">
-					<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
-						<IconBrain size={10} />
-					</ThemeIcon>
-					<ReasoningSummary
-						text={item.text}
-						translatedText={item.translatedText}
-						isStreaming={isStreaming}
-					/>
-				</Group>
-			);
 			return (
-				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-					{wrapWithBlur(
-						reasoningAnimationId,
-						<div id={`msg-${item.msg.id}`} style={hlStyle}>
-							<ContentViewer
-								content={item.text}
-								markdown
-								contentType="markdown"
-								blockIndex={item.blockIndex}
-							>
-								{total >= 2 ? (
-									<>
-										<Box p="xs">{header}</Box>
-										{idx !== total - 1 && (
-											<Divider color="var(--mantine-color-default-border)" size={1} />
-										)}
-									</>
-								) : (
-									<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
-										{header}
-									</Paper>
-								)}
-							</ContentViewer>
-						</div>,
-					)}
-				</MessageContextMenuCtx.Provider>
+				<ToolRunReasoningItem
+					key={key}
+					item={item}
+					idx={idx}
+					total={total}
+					highlighted={highlightedId === item.msg.id}
+					onForkFromMessage={onForkFromMessage}
+					onCompactBeforeMessage={onCompactBeforeMessage}
+					onDeleteBlock={onDeleteBlock}
+				/>
 			);
 		}
 

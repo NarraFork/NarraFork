@@ -7,8 +7,9 @@ import {
 	Stack,
 	Text,
 	TextInput,
+	Tooltip,
 } from "@mantine/core";
-import { IconEye, IconEyeOff, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconEye, IconEyeOff, IconPlayerPlay, IconPlus, IconTrash } from "@tabler/icons-react";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { modelValue } from "../../lib/constants";
@@ -28,6 +29,7 @@ interface InlineCustomModelsProps {
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onTestModel?: (model: string) => void;
 }
 
 export function InlineCustomModels({
@@ -38,6 +40,7 @@ export function InlineCustomModels({
 	onToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
+	onTestModel,
 }: InlineCustomModelsProps) {
 	const { t } = useTranslation("settings");
 	const [newModelValue, setNewModelValue] = useState("");
@@ -103,6 +106,13 @@ export function InlineCustomModels({
 						>
 							{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
 						</ActionIcon>
+						{onTestModel && (
+							<Tooltip label={t("modelTestBtn")}>
+								<ActionIcon variant="subtle" color="teal" onClick={() => onTestModel(m.value)}>
+									<IconPlayerPlay size={16} />
+								</ActionIcon>
+							</Tooltip>
+						)}
 						<ActionIcon color="red" variant="subtle" onClick={() => handleRemove(m.value)}>
 							<IconTrash size={14} />
 						</ActionIcon>

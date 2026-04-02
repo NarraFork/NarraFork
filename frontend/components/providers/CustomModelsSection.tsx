@@ -8,8 +8,9 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
-import { IconEye, IconEyeOff, IconTrash } from "@tabler/icons-react";
+import { IconEye, IconEyeOff, IconPlayerPlay, IconTrash } from "@tabler/icons-react";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -23,6 +24,7 @@ interface CustomModelsSectionProps {
 	prefixOptions: Array<{ value: string; label: string }>;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onTestModel?: (model: string) => void;
 	/** When true, only show orphan models (no add form) */
 	orphanOnly?: boolean;
 	/** Pre-filtered orphan models to display */
@@ -36,6 +38,7 @@ export function CustomModelsSection({
 	onToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
+	onTestModel,
 	orphanModels,
 }: CustomModelsSectionProps) {
 	const { t } = useTranslation("settings");
@@ -89,6 +92,13 @@ export function CustomModelsSection({
 							>
 								{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
 							</ActionIcon>
+							{onTestModel && (
+								<Tooltip label={t("modelTestBtn")}>
+									<ActionIcon variant="subtle" color="teal" onClick={() => onTestModel(m.value)}>
+										<IconPlayerPlay size={16} />
+									</ActionIcon>
+								</Tooltip>
+							)}
 							<ActionIcon color="red" variant="subtle" onClick={() => handleRemoveModel(m.value)}>
 								<IconTrash size={14} />
 							</ActionIcon>

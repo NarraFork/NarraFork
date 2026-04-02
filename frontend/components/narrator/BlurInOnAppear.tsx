@@ -101,14 +101,11 @@ export function useBlurInOnAppear(animationId?: string | null) {
 	// prevents "max update depth exceeded" when many BlurInAnimated instances
 	// mount in the same commit (e.g. streaming reasoning → finalized message).
 	useEffect(() => {
-		if (!registry || !animationId) {
-			// Only call setState when the value actually changes to avoid
-			// incrementing React's nested-update counter unnecessarily.
-			setShouldAnimate((prev) => (prev ? false : prev));
-			return;
-		}
+		if (!registry || !animationId) return;
 		const registration = registry.registerAppearance(animationId);
-		setShouldAnimate(registration.animate);
+		setShouldAnimate((prev) =>
+			Object.is(prev, registration.animate) ? prev : registration.animate,
+		);
 		return registration.cleanup;
 	}, [registry, animationId]);
 
