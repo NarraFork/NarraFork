@@ -1,6 +1,7 @@
 import {
 	getAnthropicProviderConfig,
 	getClineProviderConfig,
+	getNugProviderConfig,
 	getOpenaiProviderConfig,
 	parseModelId,
 	resolveEffectiveModel,
@@ -10,6 +11,7 @@ import {
 import { AnthropicProvider } from "./anthropic-provider";
 import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
+import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { AgentToolUse } from "./types";
 
@@ -190,6 +192,11 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 
 	}
 
+	const nugConfig = getNugProviderConfig(provider);
+	if (nugConfig) {
+		return new NugProvider(nugConfig);
+	}
+
 	const openaiConfig = getOpenaiProviderConfig(provider);
 	if (openaiConfig) {
 		return new OpenAIProvider(openaiConfig);
@@ -225,6 +232,11 @@ function defaultModelForProvider(provider: string): string | null {
 		return `${provider}:${anthropic.defaultModel}`;
 	}
 
+	}
+
+	const nug = getNugProviderConfig(provider);
+	if (nug?.defaultModel) {
+		return `${provider}:${nug.defaultModel}`;
 	}
 
 	const cline = getClineProviderConfig(provider);

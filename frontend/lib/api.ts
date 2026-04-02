@@ -2042,6 +2042,62 @@ export const api = {
 		request<{ quotaBalance: number; quotaTotalGranted: number }>(
 		),
 
+	// NUG
+	nugLogin: (providerId: string, body: { username: string; password: string }) =>
+		request<{ apiKey: string }>(`/nug/providers/${providerId}/login`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	nugGetQuota: (providerId: string) =>
+		request<{ balance: number; totalGranted: number; username?: string; role?: string }>(
+			`/nug/providers/${providerId}/quota`,
+		),
+	nugGetChannelsHealth: (providerId: string) =>
+		request<{
+			channels: Array<{
+				channelType: string;
+				totalCredentials: number;
+				availableCredentials: number;
+				disabledCredentials: number;
+				availabilityRate: number;
+				currentConcurrency: number;
+				maxConcurrency: number;
+				queueDepth: number;
+			}>;
+		}>(`/nug/providers/${providerId}/channels/health`),
+	nugGetUsage: (providerId: string, range: string) =>
+		request<{
+			events: Array<{
+				id: string;
+				channelType: string;
+				model: string;
+				inputTokens: number;
+				outputTokens: number;
+				cacheCreationInputTokens: number;
+				cacheReadInputTokens: number;
+				quotaCost: number;
+				meterUsage: number;
+				status: string;
+				durationMs: number;
+				createdAt: string;
+			}>;
+		}>(`/nug/providers/${providerId}/usage?range=${range}`),
+	nugGetUsageSummary: (providerId: string, range: string) =>
+		request<{
+			requestCount: number;
+			totalMeterUsage: number;
+			totalQuotaCost: number;
+			totalInputTokens: number;
+			totalOutputTokens: number;
+			totalCacheWriteTokens: number;
+			totalCacheReadTokens: number;
+		}>(`/nug/providers/${providerId}/usage/summary?range=${range}`),
+	nugRefreshProviderModels: (providerId: string) =>
+		request<{
+			models: Array<{ id: string; owned_by?: string }>;
+			fromCache: boolean;
+		}>(`/nug/providers/${providerId}/models/refresh`, { method: "POST" }),
+
 	// Cline
 	clineStatus: () =>
 		request<{

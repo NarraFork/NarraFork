@@ -93,6 +93,26 @@ export interface AnthropicProviderConfig {
 	defaultModel: string;
 }
 
+export interface NUGProviderConfig {
+	/** Unique short ID (8 chars). */
+	id: string;
+	/** User-defined display name, e.g. "NUG Production". */
+	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
+	/** Provider prefix used in model IDs, e.g. "nug". */
+	prefix: string;
+	/** NUG API Key for authentication. */
+	apiKey: string;
+	/** NUG service base URL, e.g. "http://127.0.0.1:7790". */
+	baseUrl: string;
+	defaultModel: string;
+	/** NUG account username (auto-filled after login). */
+	nugUsername?: string;
+	/** NUG account user ID (auto-filled after login). */
+	nugUserId?: string;
+}
+
 export interface ClineProviderConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -310,6 +330,8 @@ export interface NarraForkSettings {
 	openaiProviders?: OpenAIProviderConfig[];
 	/** Anthropic native API providers. */
 	anthropicProviders?: AnthropicProviderConfig[];
+	/** NUG (Narrafork Unified Gateway) providers — unified AI gateway. */
+	nugProviders?: NUGProviderConfig[];
 	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */
 	clineProviders?: ClineProviderConfig[];
 	/** External MCP server configurations. */
@@ -684,10 +706,12 @@ export function getBuiltinCodexModels(): string[] {
 let openaiModelChecker: ((model: string) => boolean) | null = null;
 let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
+let nugModelChecker: ((model: string) => boolean) | null = null;
 let clineModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
+let nugModelLister: (() => string[]) | null = null;
 let clineModelLister: (() => string[]) | null = null;
 
 // Register codex model checker and lister immediately
@@ -726,6 +750,14 @@ export function registerCodexModelLister(lister: () => string[]): void {
 
 }
 
+export function registerNugModelChecker(checker: (model: string) => boolean): void {
+	nugModelChecker = checker;
+}
+
+export function registerNugModelLister(lister: () => string[]): void {
+	nugModelLister = lister;
+}
+
 export function registerClineModelChecker(checker: (model: string) => boolean): void {
 	clineModelChecker = checker;
 }
@@ -758,10 +790,19 @@ export function getVisibleModels(): string[] {
 	const openai = openaiModelLister?.() ?? [];
 	const anthropic = anthropicModelLister?.() ?? [];
 	const codex = codexModelLister?.() ?? [];
+	const nug = nugModelLister?.() ?? [];
 	const cline = clineModelLister?.() ?? [];
 	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
 	const seen = new Set<string>();
 	const result: string[] = [];
+	for (const v of [
+		...openai,
+		...anthropic,
+		...codex,
+		...nug,
+		...cline,
+		...custom,
+	]) {
 		if (!seen.has(v) && !hidden.has(v)) {
 			seen.add(v);
 			result.push(v);
@@ -867,6 +908,21 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 }
 
 /**
+ * Get the NUG provider config by its prefix.
+ * If prefix is undefined, returns the first provider.
+ */
+export function getNugProviderConfig(prefix?: string): NUGProviderConfig | undefined {
+	const providers = (settings.nugProviders ?? []).filter((p) => !p.disabled);
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+/** Get the provider prefix for a given NUG provider config. */
+export function nugProviderPrefix(config: NUGProviderConfig): string {
+	return config.prefix;
+}
+
+/**
  * Get the Cline provider config by its prefix.
  * If prefix is undefined, returns the first provider.
  */
@@ -912,6 +968,16 @@ function hasConfiguredCodexProvider(): boolean {
 
 }
 
+export function hasConfiguredNugProvider(): boolean {
+	const providers = settings.nugProviders ?? [];
+	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
+}
+
+/** Get the first configured NUG provider. */
+export function getFirstNugProvider(): NUGProviderConfig | undefined {
+	return (settings.nugProviders ?? []).find((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
+}
+
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
 	if (hasConfiguredOpenaiProvider()) {
@@ -927,6 +993,11 @@ function getConfiguredProviderCandidates(): string[] {
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
 	}
+		}
+	}
+	if (hasConfiguredNugProvider()) {
+		for (const p of settings.nugProviders ?? []) {
+			if (!p.disabled && p.apiKey && p.baseUrl) available.add(p.prefix || "nug");
 		}
 	}
 	}
@@ -974,6 +1045,7 @@ export function resolveProvider(model?: string): string {
 		if (openaiModelChecker?.(bare)) return "openai";
 		if (anthropicModelChecker?.(bare)) return "anthropic";
 		if (codexModelChecker?.(bare)) return "codex";
+		if (nugModelChecker?.(bare)) return "nug";
 		if (clineModelChecker?.(bare)) return "cline";
 	}
 
