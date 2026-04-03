@@ -2,7 +2,6 @@ import {
 	closestCenter,
 	DndContext,
 	type DragEndEvent,
-	DragOverlay,
 	type DragStartEvent,
 	PointerSensor,
 	useSensor,
@@ -44,6 +43,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
 	useCreateFavoriteDirectory,
@@ -222,6 +222,76 @@ function SortableFavoriteNav({
 				dragHandleProps={{ ...attributes, ...listeners }}
 			/>
 		</div>
+	);
+}
+
+function FavDragOverlay({
+	activeFav,
+	label,
+	isActive,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	activeFav: any;
+	label: string;
+	isActive: boolean;
+}) {
+	const [pos, setPos] = useState({ x: 0, y: 0 });
+	const offsetRef = useRef({ x: 0, y: 0 });
+	const rafRef = useRef(0);
+
+	const handlePointerMove = useCallback((e: PointerEvent) => {
+		if (rafRef.current) return;
+		rafRef.current = requestAnimationFrame(() => {
+			setPos({
+				x: e.clientX - offsetRef.current.x,
+				y: e.clientY - offsetRef.current.y,
+			});
+			rafRef.current = 0;
+		});
+	}, []);
+
+	const handlePointerUp = useCallback(() => {
+		if (rafRef.current) cancelAnimationFrame(rafRef.current);
+		document.removeEventListener("pointermove", handlePointerMove);
+		document.removeEventListener("pointerup", handlePointerUp);
+	}, [handlePointerMove]);
+
+	const ref = useCallback(
+		(node: HTMLDivElement | null) => {
+			if (node) {
+				const rect = node.getBoundingClientRect();
+				offsetRef.current = { x: rect.width / 2, y: rect.height / 2 };
+				document.addEventListener("pointermove", handlePointerMove);
+				document.addEventListener("pointerup", handlePointerUp);
+			}
+		},
+		[handlePointerMove, handlePointerUp],
+	);
+
+	return createPortal(
+		<div
+			ref={ref}
+			style={{
+				position: "fixed",
+				left: pos.x || -9999,
+				top: pos.y || -9999,
+				zIndex: 9999,
+				pointerEvents: "none",
+				backgroundColor: "var(--mantine-color-dark-6)",
+				boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+				opacity: pos.x ? 1 : 0,
+				width: "fit-content",
+			}}
+		>
+			<FavoriteNavContent
+				fav={activeFav}
+				label={label}
+				isActive={isActive}
+				onNavigate={() => {}}
+				onRemove={() => {}}
+			/>
+		</div>,
+		document.body,
 	);
 }
 
@@ -605,28 +675,17 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 									);
 								})}
 							</SortableContext>
-							<DragOverlay dropAnimation={null}>
-								{activeFav ? (
-									<div
-										style={{
-											backgroundColor: "var(--mantine-color-dark-6)",
-											boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
-										}}
-									>
-										<FavoriteNavContent
-											fav={activeFav}
-											label={
-												activeFav.label ||
-												activeFav.path.split(/[/\\]/).filter(Boolean).pop() ||
-												activeFav.path
-											}
-											isActive={data?.path === activeFav.path}
-											onNavigate={() => {}}
-											onRemove={() => {}}
-										/>
-									</div>
-								) : null}
-							</DragOverlay>
+							{activeFav && (
+								<FavDragOverlay
+									activeFav={activeFav}
+									label={
+										activeFav.label ||
+										activeFav.path.split(/[/\\]/).filter(Boolean).pop() ||
+										activeFav.path
+									}
+									isActive={data?.path === activeFav.path}
+								/>
+							)}
 						</DndContext>
 					</Stack>
 				</ScrollArea>

@@ -6,10 +6,8 @@ import {
 	IconChevronDown,
 	IconChevronUp,
 	IconCpu,
-	IconDatabase,
 	IconInfoCircle,
 	IconPalette,
-	IconPlayerPlay,
 	IconServer,
 	IconUser,
 } from "@tabler/icons-react";
@@ -26,9 +24,7 @@ import { ChaptersContainersSection } from "../../components/settings/ChaptersCon
 import { ModelsSection, type SubagentAllowedModels } from "../../components/settings/ModelsSection";
 import { NotificationSection } from "../../components/settings/NotificationSection";
 import { ProfileSection } from "../../components/settings/ProfileSection";
-import { RuntimeSection } from "../../components/settings/RuntimeSection";
 import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
-import { StorageSection } from "../../components/settings/StorageSection";
 import {
 	useCurrentUser,
 	useDeleteAvatar,
@@ -47,8 +43,6 @@ const ALL_SECTIONS = [
 	"chaptersContainers",
 	"notifications",
 	"appearance",
-	"storage",
-	"runtime",
 	"serverSystem",
 	"about",
 ];
@@ -840,26 +834,6 @@ function SettingsPage() {
 							advancedAnim={advancedAnim}
 							setAdvancedAnim={setAdvancedAnim}
 						/>
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Storage */}
-				<Accordion.Item value="storage">
-					<Accordion.Control icon={<IconDatabase size={20} />}>
-						{t("storageSection")}
-					</Accordion.Control>
-					<Accordion.Panel>
-						<StorageSection />
-					</Accordion.Panel>
-				</Accordion.Item>
-
-				{/* Runtime Resources */}
-				<Accordion.Item value="runtime">
-					<Accordion.Control icon={<IconPlayerPlay size={20} />}>
-						{t("runtimeSection")}
-					</Accordion.Control>
-					<Accordion.Panel>
-						<RuntimeSection />
 					</Accordion.Panel>
 				</Accordion.Item>
 

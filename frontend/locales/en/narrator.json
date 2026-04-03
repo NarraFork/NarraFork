@@ -3,6 +3,7 @@
 	"narrator": "Narrator",
 	"thinking": "Thinking",
 	"reasoning": "Reasoning",
+	"reasoningChars": "{{formatted}} chars",
 	"planning": "Planning",
 	"compacting": "Compacting...",
 	"checkingInterrupt": "Checking output...",

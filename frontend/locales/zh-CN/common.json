@@ -225,5 +225,25 @@
 	"gitNotInstalledDesc": "NarraFork 需要 Git 才能正常工作。请安装 Git 后重启应用。",
 	"gitDownload": "下载 Git",
 	"gitInstallGuide": "安装完成后，请重启 NarraFork 以继续使用。",
-	"gitRecheck": "已安装 Git，重新检测"
+	"gitRecheck": "已安装 Git，重新检测",
+
+	"adminDashboard": "管理面板",
+	"adminDashboardDesc": "系统概览与快捷管理入口",
+	"adminUsers": "用户",
+	"adminUsersDesc": "用户管理与注册设置",
+	"adminContainers": "容器",
+	"adminContainersDesc": "容器环境检查与状态",
+	"adminProviders": "供应商",
+	"adminProvidersDesc": "AI 模型供应商配置",
+	"adminTerminals": "终端",
+	"adminTerminalsShortDesc": "终端会话管理",
+	"adminUserCount": "{{count}} 个用户",
+	"adminProviderCount": "{{count}} 个供应商",
+	"adminTerminalCount": "{{count}} 个终端",
+	"adminQuickActions": "快捷操作",
+	"adminSystemModules": "系统模块",
+	"adminStorage": "储存空间",
+	"adminStorageDesc": "磁盘占用扫描与清理",
+	"adminRuntime": "运行资源",
+	"adminRuntimeDesc": "终端、容器、浏览器运行状态"
 }

@@ -2721,6 +2721,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			cat === "todo" ||
 			cat === "share" ||
 			cat === "recall" ||
+			(cat === "bash" && toolCall.outputJson != null) ||
 			(cat === "plan" && !isDeniedPlan) ||
 			(isEdit && !isFailedEdit && !isTruncated) ||
 			(isFailed && !isEdit && !isDeniedPlan && !isTruncated));
@@ -2735,9 +2736,21 @@ export const ToolCallCard = memo(function ToolCallCard({
 		if (pendingPermission || toolCall.status === "pending") setOpened(true);
 	}, [pendingPermission, toolCall.status]);
 
-	// Auto-expand bash card when streaming output arrives
+	// Auto-expand bash card when streaming output arrives.
+	// Uses a ref guard: only setOpened once per streaming-output lifecycle.
+	// Reset when _streamingOutput clears so next streaming session can re-expand.
+	// Intentionally no `opened` in deps — user can collapse during streaming without
+	// the effect fighting back.
+	const bashExpandedRef = useRef(false);
 	useEffect(() => {
-		if (cat === "bash" && toolCall._streamingOutput) setOpened(true);
+		if (cat === "bash" && toolCall._streamingOutput) {
+			if (!bashExpandedRef.current) {
+				bashExpandedRef.current = true;
+				setOpened(true);
+			}
+		} else {
+			bashExpandedRef.current = false;
+		}
 	}, [cat, toolCall._streamingOutput]);
 
 	// Auto-expand todo/plan cards once streaming finishes (skip truncated history data)

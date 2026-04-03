@@ -15,6 +15,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import {
+	IconArrowLeft,
 	IconPlugConnected,
 	IconPlugConnectedX,
 	IconRefresh,
@@ -23,7 +24,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TerminalPanel } from "../../components/terminal/TerminalPanel";
@@ -127,7 +128,12 @@ function AdminTerminalsPage() {
 	return (
 		<Stack>
 			<Group justify="space-between">
-				<Title order={2}>{t("adminTerminalsTitle")}</Title>
+				<Group>
+					<ActionIcon variant="subtle" component={Link} to="/admin">
+						<IconArrowLeft size={18} />
+					</ActionIcon>
+					<Title order={2}>{t("adminTerminalsTitle")}</Title>
+				</Group>
 				<Tooltip label={t("refresh")}>
 					<ActionIcon variant="subtle" onClick={() => refetch()}>
 						<IconRefresh size={18} />

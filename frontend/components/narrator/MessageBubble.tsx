@@ -5,6 +5,7 @@ import {
 	Button,
 	CloseButton,
 	Code,
+	Collapse,
 	Group,
 	Image,
 	Loader,
@@ -56,6 +57,13 @@ import {
 	type PendingPermission,
 	ToolCallCard,
 } from "./ToolCallCard";
+
+// Module-level map that persists reasoning expand/collapse state across
+// component remounts (e.g. when streaming __streaming__ → real message).
+// Key: `${narratorId}:${blockIndex}`, Value: expanded (true) or collapsed (false).
+// Only written when the user explicitly toggles — blocks without an entry
+// always follow the global preference (narrafork_expand_reasoning).
+const reasoningExpandState = new Map<string, boolean>();
 
 interface MessageBubbleProps {
 	narratorId?: string;
@@ -178,11 +186,39 @@ function TextFileBlock({ block }: { block: any }) {
 	);
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
-function ReasoningBlock({ block, streaming }: { block: any; streaming?: boolean }) {
+function ReasoningBlock({
+	block,
+	streaming,
+	narratorId,
+	blockIndex,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+	block: any;
+	streaming?: boolean;
+	narratorId?: string;
+	blockIndex?: number;
+}) {
 	const { t } = useTranslation("narrator");
 	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
-	const [opened, setOpened] = useState(expandReasoning);
+
+	// Build a stable persistence key from narratorId + blockIndex.
+	// This key survives component remounts (streaming → real message transition).
+	const persistKey =
+		narratorId != null && blockIndex != null ? `${narratorId}:${blockIndex}` : undefined;
+
+	// Initialize from persisted state (if user toggled before remount) or global pref.
+	const persistedState = persistKey != null ? reasoningExpandState.get(persistKey) : undefined;
+	const [opened, setOpened] = useState(
+		persistedState !== undefined ? persistedState : expandReasoning,
+	);
+
+	// Track whether this instance has ever been toggled by the user.
+	// On the very first render with opened=true, we bypass LazyCollapse
+	// and render Mantine's Collapse directly — this avoids the LazyCollapse
+	// effect cascade (setMounted → rAF → setReveal) that causes "Maximum
+	// update depth exceeded" when many ReasoningBlock instances mount
+	// simultaneously (e.g. loading a long conversation with expand=true).
+	const hasToggled = useRef(persistedState !== undefined);
 
 	const text: string = block.text || block.thinking || "";
 	const translatedText: string | undefined = block.translatedText;
@@ -200,9 +236,17 @@ function ReasoningBlock({ block, streaming }: { block: any; streaming?: boolean 
 	// During streaming with no content yet, show a minimal "thinking" indicator
 	if (streaming && !displayText) {
 		return (
-			<Group gap={4} py={2}>
-				<IconBrain size={14} style={{ color: "var(--mantine-color-grape-5)", opacity: 0.7 }} />
-				<Text size="xs" c="dimmed" fs="italic">
+			<Group gap={0} py={2} wrap="nowrap" align="center">
+				<Box style={{ display: "flex", alignItems: "center", width: 11, justifyContent: "center" }}>
+					<IconChevronRight
+						size={12}
+						style={{ color: "var(--mantine-color-dimmed)", opacity: 0.5 }}
+					/>
+				</Box>
+				<ThemeIcon size={16} variant="light" color="grape" radius="sm">
+					<IconBrain size={10} />
+				</ThemeIcon>
+				<Text size="xs" c="dimmed" fs="italic" ml={4}>
 					{t("thinking")}…
 				</Text>
 			</Group>
@@ -211,59 +255,93 @@ function ReasoningBlock({ block, streaming }: { block: any; streaming?: boolean 
 
 	if (!displayText) return null;
 
+	const handleToggle = () => {
+		hasToggled.current = true;
+		setOpened((v) => {
+			const next = !v;
+			// Persist to module-level map so the state survives component remounts
+			// (e.g. when streaming __streaming__ message is replaced by real message).
+			if (persistKey) reasoningExpandState.set(persistKey, next);
+			return next;
+		});
+	};
+
+	const content = (
+		<Box
+			pl="md"
+			py={4}
+			style={{
+				borderLeft: "2px solid var(--mantine-color-grape-9)",
+				opacity: 0.75,
+				fontSize: "var(--mantine-font-size-xs)",
+			}}
+		>
+			<MarkdownContent text={displayText} streaming={streaming} />
+			{translatedText && text && (
+				<Group
+					gap={4}
+					mt={4}
+					style={{ cursor: "pointer", display: "inline-flex" }}
+					onClick={(e) => {
+						e.stopPropagation();
+						setShowTranslation((v) => !v);
+					}}
+				>
+					<IconLanguage size={12} style={{ opacity: 0.5 }} />
+					<Text size="xs" c="dimmed">
+						{showTranslation ? t("showOriginal") : t("showTranslated")}
+					</Text>
+				</Group>
+			)}
+		</Box>
+	);
+
 	return (
 		<Box>
 			<Group
-				gap={4}
+				gap={0}
 				py={2}
+				wrap="nowrap"
+				align="center"
 				style={{ cursor: "pointer", userSelect: "none" }}
-				onClick={() => setOpened((v) => !v)}
+				onClick={handleToggle}
 			>
-				{opened ? (
-					<IconChevronDown size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
-				) : (
-					<IconChevronRight size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
-				)}
-				<IconBrain size={14} style={{ color: "var(--mantine-color-grape-5)", opacity: 0.7 }} />
-				<Text size="xs" c="dimmed">
-					{t("reasoning")}
-					{!opened && (
-						<Text span c="dimmed" size="xs" ml={4} style={{ opacity: 0.6 }}>
-							— {displayText.slice(0, 80)}
-							{displayText.length > 80 ? "…" : ""}
-						</Text>
-					)}
-				</Text>
-			</Group>
-			<LazyCollapse in={opened}>
-				<Box
-					pl="md"
-					py={4}
-					style={{
-						borderLeft: "2px solid var(--mantine-color-grape-9)",
-						opacity: 0.75,
-						fontSize: "var(--mantine-font-size-xs)",
-					}}
-				>
-					<MarkdownContent text={displayText} />
-					{translatedText && text && (
-						<Group
-							gap={4}
-							mt={4}
-							style={{ cursor: "pointer", display: "inline-flex" }}
-							onClick={(e) => {
-								e.stopPropagation();
-								setShowTranslation((v) => !v);
-							}}
-						>
-							<IconLanguage size={12} style={{ opacity: 0.5 }} />
-							<Text size="xs" c="dimmed">
-								{showTranslation ? t("showOriginal") : t("showTranslated")}
-							</Text>
-						</Group>
+				<Box style={{ display: "flex", alignItems: "center", width: 11, justifyContent: "center" }}>
+					{opened ? (
+						<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+					) : (
+						<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
 					)}
 				</Box>
-			</LazyCollapse>
+				<ThemeIcon size={16} variant="light" color="grape" radius="sm">
+					<IconBrain size={10} />
+				</ThemeIcon>
+				<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
+					{t("reasoning")}
+				</Text>
+				<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
+					{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+				</Text>
+				{!opened && (
+					<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
+						— {displayText.slice(0, 80)}
+						{displayText.length > 80 ? "…" : ""}
+					</Text>
+				)}
+			</Group>
+			{/*
+				Initial mount with opened=true: render Collapse directly to avoid
+				LazyCollapse's effect cascade (setMounted → rAF → setReveal) that
+				triggers "Maximum update depth exceeded" in Mantine's Transition
+				when many instances mount at once.
+				After first user toggle: switch to LazyCollapse for proper
+				expand/collapse animation with content unmount.
+			*/}
+			{!hasToggled.current && opened ? (
+				<Collapse in={opened}>{content}</Collapse>
+			) : (
+				<LazyCollapse in={opened}>{content}</LazyCollapse>
+			)}
 		</Box>
 	);
 }
@@ -1405,7 +1483,15 @@ export const MessageBubble = memo(function MessageBubble({
 						return <TextFileBlock key={key} block={block} />;
 					}
 					if (block.type === "reasoning" || block.type === "thinking") {
-						return <ReasoningBlock key={key} block={block} streaming={isStreaming} />;
+						return (
+							<ReasoningBlock
+								key={key}
+								block={block}
+								streaming={isStreaming}
+								narratorId={narratorId}
+								blockIndex={realIndex}
+							/>
+						);
 					}
 					if (block.type === "web_search") {
 						const query = block.query ?? (block.queries as string[] | undefined)?.join(", ");

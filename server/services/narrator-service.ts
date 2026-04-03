@@ -1815,6 +1815,17 @@ export const narratorService = {
 				}
 
 				// Delete tool calls, then messages
+				// Clear narrator FK references to messages about to be deleted
+				// (narrators.forkMessageId and pruneBoundaryMessageId have RESTRICT delete)
+				await tx
+					.update(narrators)
+					.set({ forkMessageId: null })
+					.where(inArray(narrators.forkMessageId, orphanIds));
+				await tx
+					.update(narrators)
+					.set({ pruneBoundaryMessageId: null })
+					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
+
 				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
 				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
 			}
@@ -1963,6 +1974,17 @@ export const narratorService = {
 						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
 					for (const c of childRows) orphanIds.push(c.id);
 				}
+
+				// Clear narrator FK references to messages about to be deleted
+				// (narrators.forkMessageId and pruneBoundaryMessageId have RESTRICT delete)
+				await tx
+					.update(narrators)
+					.set({ forkMessageId: null })
+					.where(inArray(narrators.forkMessageId, orphanIds));
+				await tx
+					.update(narrators)
+					.set({ pruneBoundaryMessageId: null })
+					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
 
 				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
 				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
@@ -3223,6 +3245,17 @@ export const narratorService = {
 			const orphanIds = orphanRows.map((r) => r.id);
 
 			if (orphanIds.length > 0) {
+				// Clear narrator FK references to messages about to be deleted
+				// (narrators.forkMessageId and pruneBoundaryMessageId have RESTRICT delete)
+				await tx
+					.update(narrators)
+					.set({ forkMessageId: null })
+					.where(inArray(narrators.forkMessageId, orphanIds));
+				await tx
+					.update(narrators)
+					.set({ pruneBoundaryMessageId: null })
+					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
+
 				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
 			}
 

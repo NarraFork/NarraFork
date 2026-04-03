@@ -1,6 +1,7 @@
-import { Affix, Button, Loader, Stack, Title, Transition } from "@mantine/core";
+import { ActionIcon, Affix, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
+import { IconArrowLeft } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
@@ -364,7 +365,12 @@ function ProvidersPage() {
 	return (
 		<>
 			<Stack pb={80}>
-				<Title order={2}>{t("providersTitle")}</Title>
+				<Group mb="xs">
+					<ActionIcon variant="subtle" component={Link} to="/admin">
+						<IconArrowLeft size={18} />
+					</ActionIcon>
+					<Title order={2}>{t("providersTitle")}</Title>
+				</Group>
 
 					hiddenModels={state.hiddenModels}
 					onToggleHidden={dispatchers.toggleHidden}

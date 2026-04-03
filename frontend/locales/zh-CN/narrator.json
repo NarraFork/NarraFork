@@ -3,6 +3,7 @@
 	"narrator": "叙述者",
 	"thinking": "思考中",
 	"reasoning": "推理",
+	"reasoningChars": "{{formatted}} 字符",
 	"planning": "计划中",
 	"compacting": "正在压缩...",
 	"checkingInterrupt": "检查输出完整性...",

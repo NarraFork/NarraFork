@@ -3,6 +3,7 @@ import {
 	DndContext,
 	type DragEndEvent,
 	PointerSensor,
+	TouchSensor,
 	useSensor,
 	useSensors,
 } from "@dnd-kit/core";
@@ -825,7 +826,16 @@ function SortableQueuedMessageItem({
 					<div
 						{...attributes}
 						{...listeners}
-						style={{ cursor: "grab", display: "flex", alignItems: "center", flexShrink: 0 }}
+						style={{
+							cursor: "grab",
+							display: "flex",
+							alignItems: "center",
+							flexShrink: 0,
+							touchAction: "none",
+							minWidth: 24,
+							minHeight: 24,
+							justifyContent: "center",
+						}}
 					>
 						<Text size="xs" c="dimmed" w={16} ta="center">
 							{index + 1}
@@ -860,7 +870,16 @@ function SortableQueuedMessageItem({
 					<div
 						{...attributes}
 						{...listeners}
-						style={{ cursor: "grab", display: "flex", alignItems: "center", flexShrink: 0 }}
+						style={{
+							cursor: "grab",
+							display: "flex",
+							alignItems: "center",
+							flexShrink: 0,
+							touchAction: "none",
+							minWidth: 24,
+							minHeight: 24,
+							justifyContent: "center",
+						}}
 					>
 						<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
 					</div>
@@ -3054,7 +3073,10 @@ export function NarratorPanel({
 		});
 	};
 
-	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+	const sensors = useSensors(
+		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+		useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 5 } }),
+	);
 
 	const handleDragEndQueued = useCallback(
 		(event: DragEndEvent) => {

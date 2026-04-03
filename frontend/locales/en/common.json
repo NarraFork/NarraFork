@@ -225,5 +225,25 @@
 	"gitNotInstalledDesc": "NarraFork requires Git to work. Please install Git and restart the application.",
 	"gitDownload": "Download Git",
 	"gitInstallGuide": "After installation, restart NarraFork to continue.",
-	"gitRecheck": "I've installed Git, recheck"
+	"gitRecheck": "I've installed Git, recheck",
+
+	"adminDashboard": "Admin Panel",
+	"adminDashboardDesc": "System overview and quick management",
+	"adminUsers": "Users",
+	"adminUsersDesc": "User management and registration settings",
+	"adminContainers": "Containers",
+	"adminContainersDesc": "Container environment checks and status",
+	"adminProviders": "Providers",
+	"adminProvidersDesc": "AI model provider configuration",
+	"adminTerminals": "Terminals",
+	"adminTerminalsShortDesc": "Terminal session management",
+	"adminUserCount": "{{count}} user(s)",
+	"adminProviderCount": "{{count}} provider(s)",
+	"adminTerminalCount": "{{count}} terminal(s)",
+	"adminQuickActions": "Quick Actions",
+	"adminSystemModules": "System Modules",
+	"adminStorage": "Storage",
+	"adminStorageDesc": "Disk usage scan and cleanup",
+	"adminRuntime": "Runtime",
+	"adminRuntimeDesc": "Terminal, container and browser status"
 }

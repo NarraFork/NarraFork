@@ -25,6 +25,7 @@ export function LazyCollapse({ in: opened, children }: LazyCollapseProps) {
 	const [mounted, setMounted] = useState(opened);
 	const [reveal, setReveal] = useState(opened);
 	const isFirstMount = useRef(true);
+	const mountedRef = useRef(opened);
 
 	useEffect(() => {
 		// On initial mount, mounted and reveal are already set correctly by
@@ -36,20 +37,45 @@ export function LazyCollapse({ in: opened, children }: LazyCollapseProps) {
 			return;
 		}
 
-		if (opened && !mounted) {
-			setMounted(true);
-		}
-		if (opened && mounted) {
+		// Use mountedRef to track mounted state WITHOUT including `mounted` in deps.
+		// When `opened` toggles true, the old code ran setMounted(true) then re-ran
+		// the effect (because `mounted` changed) to schedule setReveal(true) — two
+		// state updates from one prop change. With many LazyCollapse instances
+		// reacting simultaneously, the accumulated updates exceeded React 19's
+		// nested-update limit (50), producing "Maximum update depth exceeded".
+		// The `opened && reveal` guard prevents re-triggering when the effect
+		// re-runs only because `reveal` changed.
+
+		// Guard: if already open and revealed, nothing to do
+		if (opened && reveal) return;
+
+		let cleanup: (() => void) | undefined;
+
+		if (opened) {
+			if (!mountedRef.current) {
+				// First open: mount children, reveal on next frame
+				mountedRef.current = true;
+				setMounted(true);
+			}
+			// Reveal on next frame (Collapse starts from height 0 → full height)
 			const raf = requestAnimationFrame(() => setReveal(true));
-			return () => cancelAnimationFrame(raf);
-		}
-		if (!opened) {
+			cleanup = () => cancelAnimationFrame(raf);
+		} else {
 			setReveal(false);
+			// Unmount children after transition completes (~200ms)
+			const timeout = setTimeout(() => {
+				mountedRef.current = false;
+				setMounted(false);
+			}, 250);
+			cleanup = () => clearTimeout(timeout);
 		}
-	}, [opened, mounted]);
+
+		return cleanup;
+	}, [opened, reveal]);
 
 	const handleTransitionEnd = useCallback(() => {
 		if (!opened) {
+			mountedRef.current = false;
 			setMounted(false);
 		}
 	}, [opened]);
