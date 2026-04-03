@@ -417,12 +417,12 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
 	const getSwipeMenuPosition = useCallback(
 		(menuHeight = 120) => {
-			// Use live rect to avoid stale positions when DOM changes between
-			// touchstart and menu render (e.g. new messages, streaming growth).
-			// NOTE: getBoundingClientRect() already includes the visual effect
-			// of transform: translateX(-swipeOffset), so do NOT subtract offset again.
+			// Use the layout position (swipeInitialRight) captured at touchstart.
+			// Do NOT use getBoundingClientRect().right here — it includes the
+			// visual offset from transform: translateX(-swipeOffset), which would
+			// double-count the swipe and break the CSS transition on release.
+			const menuLeft = swipeInitialRight - swipeOffset;
 			const boxRect = swipeBoxRef.current?.getBoundingClientRect();
-			const menuLeft = boxRect?.right ?? swipeInitialRight - swipeOffset;
 			const half = menuHeight / 2;
 
 			// Determine the visible area — use the scroll container if found, else viewport
