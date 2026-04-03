@@ -21,27 +21,6 @@ export function getToolCallBlurAnimationId({
 	return fallbackKey != null ? `tool:ephemeral:${fallbackKey}` : null;
 }
 
-export function getReasoningBlurAnimationId({
-	messageId,
-	blockIndex,
-	createdAt,
-	fallbackKey,
-}: {
-	messageId?: string | null;
-	blockIndex?: number | null;
-	createdAt?: string | null;
-	fallbackKey?: string | number | null;
-}) {
-	const suffix = blockIndex ?? fallbackKey ?? 0;
-	if (messageId) {
-		return `reasoning:${messageId}:${suffix}`;
-	}
-	if (createdAt) {
-		return `reasoning-stream:${createdAt}:${suffix}`;
-	}
-	return null;
-}
-
 function collectToolCallIds(msg: NarratorMsg, acc: Set<string>) {
 	const blockIds = new Set<string>();
 	for (const [idx, block] of (
@@ -76,19 +55,6 @@ export function collectBlurInAnimationIdsFromMessage(msg: NarratorMsg, acc = new
 	if (msg.role === "user") {
 		const animationId = getUserMessageBlurAnimationId(msg.id);
 		if (animationId) acc.add(animationId);
-	}
-
-	for (const [idx, block] of (
-		(msg.contentJson as BaseContentBlock[] | undefined) ?? []
-	).entries()) {
-		if (block.type === "reasoning" || block.type === "thinking") {
-			const animationId = getReasoningBlurAnimationId({
-				messageId: msg.id,
-				blockIndex: idx,
-				createdAt: msg.createdAt,
-			});
-			if (animationId) acc.add(animationId);
-		}
 	}
 
 	collectToolCallIds(msg, acc);

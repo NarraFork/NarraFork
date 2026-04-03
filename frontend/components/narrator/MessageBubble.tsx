@@ -20,7 +20,6 @@ import {
 	TextInput,
 	ThemeIcon,
 	Tooltip,
-	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -41,12 +40,11 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { api, getToken } from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
-import { BlurInOnAppear } from "./BlurInOnAppear";
-import { getReasoningBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
@@ -177,6 +175,96 @@ function TextFileBlock({ block }: { block: any }) {
 				({formatFileSize(block.size)})
 			</Text>
 		</Group>
+	);
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+function ReasoningBlock({ block, streaming }: { block: any; streaming?: boolean }) {
+	const { t } = useTranslation("narrator");
+	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
+	const [opened, setOpened] = useState(expandReasoning);
+
+	const text: string = block.text || block.thinking || "";
+	const translatedText: string | undefined = block.translatedText;
+	const [showTranslation, setShowTranslation] = useState(!!translatedText);
+	const prevTranslatedRef = useRef(translatedText);
+	// Auto-switch to translation when it arrives via WS update
+	useEffect(() => {
+		if (translatedText && !prevTranslatedRef.current) {
+			setShowTranslation(true);
+		}
+		prevTranslatedRef.current = translatedText;
+	}, [translatedText]);
+	const displayText = showTranslation && translatedText ? translatedText : text;
+
+	// During streaming with no content yet, show a minimal "thinking" indicator
+	if (streaming && !displayText) {
+		return (
+			<Group gap={4} py={2}>
+				<IconBrain size={14} style={{ color: "var(--mantine-color-grape-5)", opacity: 0.7 }} />
+				<Text size="xs" c="dimmed" fs="italic">
+					{t("thinking")}…
+				</Text>
+			</Group>
+		);
+	}
+
+	if (!displayText) return null;
+
+	return (
+		<Box>
+			<Group
+				gap={4}
+				py={2}
+				style={{ cursor: "pointer", userSelect: "none" }}
+				onClick={() => setOpened((v) => !v)}
+			>
+				{opened ? (
+					<IconChevronDown size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
+				) : (
+					<IconChevronRight size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
+				)}
+				<IconBrain size={14} style={{ color: "var(--mantine-color-grape-5)", opacity: 0.7 }} />
+				<Text size="xs" c="dimmed">
+					{t("reasoning")}
+					{!opened && (
+						<Text span c="dimmed" size="xs" ml={4} style={{ opacity: 0.6 }}>
+							— {displayText.slice(0, 80)}
+							{displayText.length > 80 ? "…" : ""}
+						</Text>
+					)}
+				</Text>
+			</Group>
+			<LazyCollapse in={opened}>
+				<Box
+					pl="md"
+					py={4}
+					style={{
+						borderLeft: "2px solid var(--mantine-color-grape-9)",
+						opacity: 0.75,
+						fontSize: "var(--mantine-font-size-xs)",
+					}}
+				>
+					<MarkdownContent text={displayText} />
+					{translatedText && text && (
+						<Group
+							gap={4}
+							mt={4}
+							style={{ cursor: "pointer", display: "inline-flex" }}
+							onClick={(e) => {
+								e.stopPropagation();
+								setShowTranslation((v) => !v);
+							}}
+						>
+							<IconLanguage size={12} style={{ opacity: 0.5 }} />
+							<Text size="xs" c="dimmed">
+								{showTranslation ? t("showOriginal") : t("showTranslated")}
+							</Text>
+						</Group>
+					)}
+				</Box>
+			</LazyCollapse>
+		</Box>
 	);
 }
 
@@ -668,238 +756,6 @@ function MergeSummaryCard({
 		</>
 	);
 }
-
-export const ReasoningSummary = memo(function ReasoningSummary({
-	text,
-	translatedText,
-	isStreaming,
-}: {
-	text: string;
-	translatedText?: string;
-	/** When true, skip expensive overflow measurement to avoid nested-update cascades. */
-	isStreaming?: boolean;
-}) {
-	const { t } = useTranslation("narrator");
-	// Compute initial expanded state eagerly — avoids a useLayoutEffect setState
-	// that would count toward React's nested-update limit.
-	const [expanded, setExpanded] = useState(() => {
-		const singleLine = text.trim().replace(/\s+/g, " ");
-		const bm = singleLine.match(/^\*\*(.+?)\*\*/);
-		const trailing = bm ? singleLine.slice(bm[0].length).trim() : "";
-		if (trailing.length > 0) {
-			return localStorage.getItem("narrafork_expand_reasoning") === "true";
-		}
-		return false;
-	});
-	const [isOverflow, setIsOverflow] = useState(false);
-	const [showTranslation, setShowTranslation] = useState(!!translatedText);
-	const prevTranslatedRef = useRef(translatedText);
-	// Auto-switch to translation when it arrives via WS update
-	useEffect(() => {
-		if (translatedText && !prevTranslatedRef.current) {
-			setShowTranslation(true);
-		}
-		prevTranslatedRef.current = translatedText;
-	}, [translatedText]);
-	const lineRef = useRef<HTMLDivElement | null>(null);
-	const displayText = showTranslation && translatedText ? translatedText : text;
-	const singleLineText = displayText.trim().replace(/\s+/g, " ");
-	const boldMatch = singleLineText.match(/^\*\*(.+?)\*\*/);
-	const headerText = boldMatch ? boldMatch[1] : singleLineText.replace(/\*\*/g, "");
-	const trailingText = boldMatch ? singleLineText.slice(boldMatch[0].length).trim() : "";
-	const hasTrailingContent = trailingText.length > 0;
-
-	// When trailing content appears after mount (e.g. streaming text grows),
-	// auto-expand if the user preference is set. Use a ref guard so this only
-	// fires once per component instance.
-	const autoExpandedRef = useRef(false);
-	useEffect(() => {
-		if (hasTrailingContent && !autoExpandedRef.current) {
-			autoExpandedRef.current = true;
-			const shouldExpand = localStorage.getItem("narrafork_expand_reasoning") === "true";
-			if (shouldExpand) setExpanded(true);
-		}
-	}, [hasTrailingContent]);
-
-	// During streaming, skip the expensive useLayoutEffect + ResizeObserver
-	// overflow measurement entirely. Each reasoning_delta bumps streamingVersion
-	// (~60fps), and the measure → setIsOverflow → canExpand flip → setExpanded →
-	// LazyCollapse setState cascade easily exceeds React's nested-update limit.
-	// Instead, assume overflow is true while streaming (the text is growing anyway).
-	useLayoutEffect(() => {
-		if (isStreaming) return;
-		if (!headerText) {
-			setIsOverflow(false);
-			return;
-		}
-
-		const measure = () => {
-			const el = lineRef.current;
-			if (!el) {
-				setIsOverflow((prev) => (prev ? false : prev));
-				return;
-			}
-			const gap = el.scrollWidth - el.clientWidth;
-			// Hysteresis: once overflow is detected, require the gap to shrink
-			// below 0 before resetting.  This prevents the expand/collapse chevron
-			// from flickering when minor layout shifts (scrollbar appearance, sibling
-			// animations) cause the measurement to oscillate around the threshold.
-			const overflowing = gap > 3;
-			setIsOverflow((prev) => {
-				if (prev && gap > 0) return prev; // hold overflow while any gap remains
-				return prev === overflowing ? prev : overflowing;
-			});
-		};
-
-		const lineEl = lineRef.current;
-		const containerEl = lineEl?.parentElement ?? null;
-		let cancelled = false;
-		const measureIfActive = () => {
-			if (!cancelled) measure();
-		};
-		const rafId1 = requestAnimationFrame(measureIfActive);
-		const rafId2 = requestAnimationFrame(() => requestAnimationFrame(measureIfActive));
-
-		let resizeObserver: ResizeObserver | undefined;
-		if (typeof ResizeObserver !== "undefined") {
-			resizeObserver = new ResizeObserver(measure);
-			if (lineEl) resizeObserver.observe(lineEl);
-			if (containerEl && containerEl !== lineEl) resizeObserver.observe(containerEl);
-		}
-
-		const fontSet = document.fonts;
-		const handleFontsDone = () => measure();
-		fontSet?.addEventListener?.("loadingdone", handleFontsDone);
-
-		return () => {
-			cancelled = true;
-			cancelAnimationFrame(rafId1);
-			cancelAnimationFrame(rafId2);
-			resizeObserver?.disconnect();
-			fontSet?.removeEventListener?.("loadingdone", handleFontsDone);
-		};
-	}, [headerText, isStreaming]);
-
-	// While streaming, assume overflow so the expand button is available.
-	// This avoids the measure → setState cascade entirely.
-	const effectiveOverflow = isStreaming ? true : isOverflow;
-	const canExpand = effectiveOverflow || hasTrailingContent;
-
-	// Derive the effective expanded state instead of using render-time setState.
-	// In React 19, render-time setState increments the nested-update counter
-	// just like useLayoutEffect setState, so the old `if (!canExpand && expanded)
-	// setExpanded(false)` pattern contributed to "max update depth exceeded"
-	// when many BlurInAnimated instances mount in the same commit.
-	const effectiveExpanded = canExpand && expanded;
-
-	return (
-		<Box style={{ flex: 1, minWidth: 0 }}>
-			{canExpand ? (
-				<UnstyledButton
-					onClick={() => setExpanded((o) => !o)}
-					w="100%"
-					style={{ display: "block" }}
-				>
-					<Group gap={4} wrap="nowrap" align="center">
-						<Box
-							style={{
-								flex: 1,
-								minWidth: 0,
-								display: "flex",
-								alignItems: "center",
-								height: 18,
-							}}
-						>
-							<div
-								ref={lineRef}
-								style={{
-									width: "100%",
-									overflow: "hidden",
-									textOverflow: "ellipsis",
-									whiteSpace: "nowrap",
-									fontSize: "var(--mantine-font-size-xs)",
-									fontFamily: "var(--mantine-font-family-monospace)",
-									lineHeight: "18px",
-								}}
-								title={headerText}
-							>
-								{headerText}
-							</div>
-						</Box>
-						<Box
-							style={{
-								display: "inline-flex",
-								alignItems: "center",
-								justifyContent: "center",
-								flexShrink: 0,
-								width: 16,
-								height: 16,
-							}}
-						>
-							{effectiveExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-						</Box>
-					</Group>
-				</UnstyledButton>
-			) : (
-				<Box
-					style={{
-						flex: 1,
-						minWidth: 0,
-						display: "flex",
-						alignItems: "center",
-						height: 18,
-					}}
-				>
-					<div
-						ref={lineRef}
-						style={{
-							width: "100%",
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							fontSize: "var(--mantine-font-size-xs)",
-							fontFamily: "var(--mantine-font-family-monospace)",
-							lineHeight: "18px",
-						}}
-						title={headerText}
-					>
-						{headerText}
-					</div>
-				</Box>
-			)}
-			{canExpand && (
-				<LazyCollapse in={effectiveExpanded}>
-					<Box
-						mt={4}
-						style={{
-							lineHeight: 1.35,
-							whiteSpace: "pre-wrap",
-							wordBreak: "break-word",
-							overflowWrap: "anywhere",
-						}}
-					>
-						<MarkdownContent text={hasTrailingContent ? trailingText : displayText.trim()} />
-					</Box>
-					{translatedText && (
-						<UnstyledButton
-							onClick={(e) => {
-								e.stopPropagation();
-								setShowTranslation((v) => !v);
-							}}
-							mt={4}
-							style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
-						>
-							<IconLanguage size={12} style={{ opacity: 0.5 }} />
-							<Text size="xs" c="dimmed">
-								{showTranslation ? t("showOriginal") : t("showTranslated")}
-							</Text>
-						</UnstyledButton>
-					)}
-				</LazyCollapse>
-			)}
-		</Box>
-	);
-});
 
 function PlanCard({
 	summary,
@@ -1549,43 +1405,7 @@ export const MessageBubble = memo(function MessageBubble({
 						return <TextFileBlock key={key} block={block} />;
 					}
 					if (block.type === "reasoning" || block.type === "thinking") {
-						const iconColor = getCategoryColor("plan");
-						const reasoningText =
-							block.type === "reasoning"
-								? typeof block.text === "string"
-									? block.text
-									: ""
-								: ((block as { thinking?: string }).thinking ?? "");
-						if (!reasoningText.trim()) return null;
-						const reasoningAnimationId = getReasoningBlurAnimationId({
-							messageId: message.id,
-							blockIndex: realIndex,
-							createdAt: message.createdAt,
-						});
-						return (
-							<ContentViewer
-								key={key}
-								content={reasoningText}
-								markdown
-								contentType="markdown"
-								blockIndex={realIndex}
-							>
-								<BlurInOnAppear animationId={reasoningAnimationId}>
-									<Paper withBorder radius="sm" p="xs">
-										<Group gap={6} wrap="nowrap" align="flex-start">
-											<ThemeIcon size={18} variant="light" color={iconColor} radius="sm" mt={1}>
-												<IconBrain size={12} />
-											</ThemeIcon>
-											<ReasoningSummary
-												text={reasoningText}
-												translatedText={block.translatedText}
-												isStreaming={isStreaming}
-											/>
-										</Group>
-									</Paper>
-								</BlurInOnAppear>
-							</ContentViewer>
-						);
+						return <ReasoningBlock key={key} block={block} streaming={isStreaming} />;
 					}
 					if (block.type === "web_search") {
 						const query = block.query ?? (block.queries as string[] | undefined)?.join(", ");

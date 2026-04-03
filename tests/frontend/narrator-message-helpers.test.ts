@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { QueryClient } from "@tanstack/react-query";
-import { extractToolRunItems } from "../../frontend/components/narrator/message-segments";
 import {
 	hasToolUse,
 	isToolOnlyMessage,
@@ -8,7 +7,6 @@ import {
 	resolveAllToolCallsFromMsg,
 } from "../../frontend/components/narrator/narrator-message-helpers";
 import {
-	createLegacyToolRunFixture,
 	createStreamingChunksFixture,
 	makeMessage,
 } from "./narrator-timeline.fixtures";
@@ -50,29 +48,6 @@ describe("narrator-message-helpers legacy behavior", () => {
 		expect(calls[0].inputJson).toEqual({ file_path: "b.txt" });
 		expect(calls[0].errorMessage).toBe("boom");
 		expect(calls[0].durationMs).toBe(42);
-	});
-
-	test("extractToolRunItems 保持 reasoning/tool 顺序并识别 subagent", () => {
-		const { run, taskToolUseId, bashToolUseId, childFromTask } = createLegacyToolRunFixture();
-		// extractToolRunItems works per-message; flatten both messages
-		const flat = run.flatMap((msg) => extractToolRunItems(msg));
-
-		expect(flat.map((x: { kind: string }) => x.kind)).toEqual(["reasoning", "tool", "tool"]);
-		expect(flat[0]).toMatchObject({ kind: "reasoning", text: "先规划再执行" });
-
-		expect(flat[1].kind).toBe("tool");
-		if (flat[1].kind === "tool") {
-			expect(flat[1].tc.toolUseId).toBe(taskToolUseId);
-			expect(flat[1].isSubagent).toBe(true);
-			expect(flat[1].children).toEqual([childFromTask]);
-		}
-
-		expect(flat[2].kind).toBe("tool");
-		if (flat[2].kind === "tool") {
-			expect(flat[2].tc.toolUseId).toBe(bashToolUseId);
-			expect(flat[2].isSubagent).toBe(false);
-			expect(flat[2].children).toHaveLength(0);
-		}
 	});
 
 	test("isToolOnlyMessage / hasToolUse 兼容 legacy 判定", () => {

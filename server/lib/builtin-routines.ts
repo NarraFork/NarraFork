@@ -84,6 +84,26 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			descriptionZh: "搜索和浏览所有叙述者对话",
 		},
 	},
+	{
+		id: "browser",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "Browser",
+			descriptionEn: "Interactive browser — navigate, click, fill forms, take screenshots",
+			descriptionZh: "交互式浏览器 — 导航、点击、填写表单、截图",
+		},
+	},
+	{
+		id: "fork_narrator",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ForkNarrator",
+			descriptionEn: "Fork the current narrator session into a new chapter",
+			descriptionZh: "将当前叙述者会话分叉到新章节",
+		},
+	},
 ];
 
 // ---------------------------------------------------------------------------

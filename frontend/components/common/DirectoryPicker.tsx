@@ -1,4 +1,16 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	DragOverlay,
+	type DragStartEvent,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Button,
 	Divider,
@@ -22,6 +34,7 @@ import {
 	IconFolder,
 	IconFolderOpen,
 	IconFolderPlus,
+	IconGripVertical,
 	IconHome,
 	IconPencil,
 	IconRefresh,
@@ -36,6 +49,7 @@ import {
 	useCreateFavoriteDirectory,
 	useDeleteFavoriteDirectory,
 	useFavoriteDirectories,
+	useReorderFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
 import { api } from "../../lib/api";
 import { PathInput } from "./PathInput";
@@ -126,6 +140,91 @@ export function DirectoryPicker({
 	);
 }
 
+// ── Sortable Favorite Nav Item ────────────────────────────────────────────────
+
+interface FavoriteNavContentProps {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	fav: any;
+	label: string;
+	isActive: boolean;
+	onNavigate: () => void;
+	onRemove: () => void;
+	dragHandleProps?: React.HTMLAttributes<HTMLSpanElement>;
+}
+
+function FavoriteNavContent({
+	label,
+	isActive,
+	onNavigate,
+	onRemove,
+	fav,
+	dragHandleProps,
+}: FavoriteNavContentProps) {
+	return (
+		<NavLink
+			label={label}
+			leftSection={
+				<span style={{ display: "flex", cursor: "grab" }} {...dragHandleProps}>
+					<IconGripVertical size={12} color="var(--mantine-color-dimmed)" />
+				</span>
+			}
+			rightSection={
+				<ActionIcon
+					variant="subtle"
+					size="xs"
+					color="red"
+					onClick={(e) => {
+						e.stopPropagation();
+						onRemove();
+					}}
+				>
+					<IconTrash size={12} />
+				</ActionIcon>
+			}
+			active={isActive}
+			onClick={onNavigate}
+			py={4}
+			styles={{
+				label: { fontSize: 12 },
+				root: { borderRadius: 0 },
+				section: { marginRight: 4 },
+			}}
+			title={fav.path}
+		/>
+	);
+}
+
+function SortableFavoriteNav({
+	fav,
+	label,
+	isActive,
+	onNavigate,
+	onRemove,
+}: FavoriteNavContentProps) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: fav.id,
+	});
+
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		visibility: isDragging ? ("hidden" as const) : undefined,
+	};
+
+	return (
+		<div ref={setNodeRef} style={style}>
+			<FavoriteNavContent
+				fav={fav}
+				label={label}
+				isActive={isActive}
+				onNavigate={onNavigate}
+				onRemove={onRemove}
+				dragHandleProps={{ ...attributes, ...listeners }}
+			/>
+		</div>
+	);
+}
+
 // ── Directory Browser (modal content) ────────────────────────────────────────
 
 interface DirectoryBrowserProps {
@@ -159,6 +258,36 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const { data: favorites = [] } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
+	const reorderFavorites = useReorderFavoriteDirectories();
+
+	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+	const [activeFavId, setActiveFavId] = useState<string | null>(null);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const activeFav = activeFavId ? favorites.find((f: any) => f.id === activeFavId) : null;
+
+	const handleFavDragStart = useCallback((event: DragStartEvent) => {
+		setActiveFavId(event.active.id as string);
+	}, []);
+
+	const handleFavDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			setActiveFavId(null);
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const oldIndex = favorites.findIndex((f) => f.id === active.id);
+			const newIndex = favorites.findIndex((f) => f.id === over.id);
+			if (oldIndex === -1 || newIndex === -1) return;
+			const newOrder = [...favorites];
+			const [moved] = newOrder.splice(oldIndex, 1);
+			newOrder.splice(newIndex, 0, moved);
+			reorderFavorites.mutate(newOrder.map((f) => f.id));
+		},
+		[favorites, reorderFavorites],
+	);
+
+	const handleFavDragCancel = useCallback(() => {
+		setActiveFavId(null);
+	}, []);
 
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["fs-browse", currentPath, showHidden],
@@ -450,37 +579,55 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 								{t("noFavorites")}
 							</Text>
 						)}
-						{favorites.map((fav) => {
-							const label = fav.label || fav.path.split(/[/\\]/).filter(Boolean).pop() || fav.path;
-							return (
-								<NavLink
-									key={fav.id}
-									label={label}
-									leftSection={<IconStarFilled size={14} color="var(--mantine-color-yellow-5)" />}
-									active={data?.path === fav.path}
-									onClick={() => navigateTo(fav.path)}
-									rightSection={
-										<ActionIcon
-											variant="subtle"
-											size="xs"
-											color="red"
-											onClick={(e) => {
-												e.stopPropagation();
-												removeFavorite.mutate(fav.id);
-											}}
-										>
-											<IconTrash size={12} />
-										</ActionIcon>
-									}
-									py={4}
-									styles={{
-										label: { fontSize: 12 },
-										root: { borderRadius: 0 },
-									}}
-									title={fav.path}
-								/>
-							);
-						})}
+						<DndContext
+							sensors={sensors}
+							collisionDetection={closestCenter}
+							onDragStart={handleFavDragStart}
+							onDragEnd={handleFavDragEnd}
+							onDragCancel={handleFavDragCancel}
+						>
+							<SortableContext
+								items={favorites.map((f) => f.id)}
+								strategy={verticalListSortingStrategy}
+							>
+								{favorites.map((fav) => {
+									const label =
+										fav.label || fav.path.split(/[/\\]/).filter(Boolean).pop() || fav.path;
+									return (
+										<SortableFavoriteNav
+											key={fav.id}
+											fav={fav}
+											label={label}
+											isActive={data?.path === fav.path}
+											onNavigate={() => navigateTo(fav.path)}
+											onRemove={() => removeFavorite.mutate(fav.id)}
+										/>
+									);
+								})}
+							</SortableContext>
+							<DragOverlay dropAnimation={null}>
+								{activeFav ? (
+									<div
+										style={{
+											backgroundColor: "var(--mantine-color-dark-6)",
+											boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+										}}
+									>
+										<FavoriteNavContent
+											fav={activeFav}
+											label={
+												activeFav.label ||
+												activeFav.path.split(/[/\\]/).filter(Boolean).pop() ||
+												activeFav.path
+											}
+											isActive={data?.path === activeFav.path}
+											onNavigate={() => {}}
+											onRemove={() => {}}
+										/>
+									</div>
+								) : null}
+							</DragOverlay>
+						</DndContext>
 					</Stack>
 				</ScrollArea>
 

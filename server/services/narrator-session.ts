@@ -4863,6 +4863,22 @@ export function removeBufferedMessage(narratorId: string, messageId: string): bo
 	return true;
 }
 
+/** Reorder the queue by a list of message ids. */
+export function reorderBufferedMessages(narratorId: string, orderedIds: string[]): boolean {
+	const queue = bufferedMessages.get(narratorId);
+	if (!queue || queue.length === 0) return false;
+	if (orderedIds.length !== queue.length) return false;
+	const byId = new Map(queue.map((m) => [m.id, m]));
+	const reordered: BufferedMessage[] = [];
+	for (const id of orderedIds) {
+		const msg = byId.get(id);
+		if (!msg) return false;
+		reordered.push(msg);
+	}
+	bufferedMessages.set(narratorId, reordered);
+	return true;
+}
+
 /** Clear the entire queue. */
 export function clearBufferedMessages(narratorId: string): void {
 	bufferedMessages.delete(narratorId);

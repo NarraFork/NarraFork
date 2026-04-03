@@ -26,65 +26,6 @@ export function makeMessage(
 	};
 }
 
-export function createLegacyToolRunFixture() {
-	const taskToolUseId = "tool-task-1";
-	const bashToolUseId = "tool-bash-1";
-
-	const childFromTask = makeMessage({
-		id: "child-1",
-		narratorId: "n-sub",
-		parentToolUseId: taskToolUseId,
-		role: "assistant",
-		contentJson: [{ type: "text", text: "subagent response" }],
-	});
-
-	const first = makeMessage({
-		id: "m-tool-1",
-		role: "assistant",
-		contentJson: [
-			{ type: "reasoning", text: "先规划再执行" },
-			{ type: "tool_use", id: taskToolUseId, name: "Task", input: { prompt: "探索" } },
-		],
-		toolCalls: [
-			{
-				id: "tc-task-1",
-				toolUseId: taskToolUseId,
-				toolName: "Task",
-				status: "running",
-				inputJson: { prompt: "探索" },
-				createdAt: NOW,
-			},
-		],
-		children: [childFromTask],
-	});
-
-	const second = makeMessage({
-		id: "m-tool-2",
-		role: "assistant",
-		contentJson: [
-			{ type: "tool_use", id: bashToolUseId, name: "Bash", input: { command: "ls -la" } },
-		],
-		toolCalls: [
-			{
-				id: "tc-bash-1",
-				toolUseId: bashToolUseId,
-				toolName: "Bash",
-				status: "success",
-				inputJson: { command: "ls -la" },
-				outputJson: "ok",
-				createdAt: NOW,
-			},
-		],
-	});
-
-	return {
-		run: [first, second],
-		taskToolUseId,
-		bashToolUseId,
-		childFromTask,
-	};
-}
-
 export function createStreamingChunksFixture() {
 	const regular = makeMessage({
 		id: "m-regular",

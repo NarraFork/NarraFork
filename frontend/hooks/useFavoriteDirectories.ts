@@ -27,3 +27,29 @@ export function useDeleteFavoriteDirectory() {
 		},
 	});
 }
+
+export function useReorderFavoriteDirectories() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.reorderFavoriteDirectories,
+		onMutate: async (ids: string[]) => {
+			await qc.cancelQueries({ queryKey: ["favoriteDirectories"] });
+			const previous = qc.getQueryData(["favoriteDirectories"]);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			qc.setQueryData(["favoriteDirectories"], (old: any[]) => {
+				if (!old) return old;
+				const map = new Map(old.map((f) => [f.id, f]));
+				return ids.map((id) => map.get(id)).filter(Boolean);
+			});
+			return { previous };
+		},
+		onError: (_err, _ids, context) => {
+			if (context?.previous) {
+				qc.setQueryData(["favoriteDirectories"], context.previous);
+			}
+		},
+		onSettled: () => {
+			qc.invalidateQueries({ queryKey: ["favoriteDirectories"] });
+		},
+	});
+}

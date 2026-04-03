@@ -43,7 +43,7 @@ describe("segmentMessages", () => {
 		}
 	});
 
-	test("reasoning + tool → single tool-run with reasoning before tool", () => {
+	test("reasoning + tool → message segment (reasoning) then tool-run", () => {
 		const msg = makeMessage({
 			id: "a1",
 			role: "assistant",
@@ -56,14 +56,15 @@ describe("segmentMessages", () => {
 			],
 		});
 		const segs = segmentMessages([msg]);
-		expect(segs).toHaveLength(1);
-		expect(segs[0].kind).toBe("tool-run");
-		if (segs[0].kind === "tool-run") {
-			expect(segs[0].items.map((i) => i.kind)).toEqual(["reasoning", "tool"]);
+		expect(segs).toHaveLength(2);
+		expect(segs[0].kind).toBe("message");
+		expect(segs[1].kind).toBe("tool-run");
+		if (segs[1].kind === "tool-run") {
+			expect(segs[1].items.map((i) => i.kind)).toEqual(["tool"]);
 		}
 	});
 
-	test("mixed message (reasoning + text + tool) → preserves original block order", () => {
+	test("reasoning + text + tool → text message then tool-run", () => {
 		const msg = makeMessage({
 			id: "a1",
 			role: "assistant",
@@ -77,20 +78,9 @@ describe("segmentMessages", () => {
 			],
 		});
 		const segs = segmentMessages([msg]);
-		// Original order: reasoning, text, tool
-		// reasoning starts a run, text breaks it, tool starts a new run
-		expect(segs).toHaveLength(3);
-		expect(segs[0].kind).toBe("tool-run"); // reasoning
-		if (segs[0].kind === "tool-run") {
-			expect(segs[0].items).toHaveLength(1);
-			expect(segs[0].items[0].kind).toBe("reasoning");
-		}
-		expect(segs[1].kind).toBe("message"); // text
-		expect(segs[2].kind).toBe("tool-run"); // tool
-		if (segs[2].kind === "tool-run") {
-			expect(segs[2].items).toHaveLength(1);
-			expect(segs[2].items[0].kind).toBe("tool");
-		}
+		expect(segs).toHaveLength(2);
+		expect(segs[0].kind).toBe("message"); // text
+		expect(segs[1].kind).toBe("tool-run"); // tool
 	});
 
 	test("consecutive tool-only messages merge into one tool-run", () => {
@@ -144,7 +134,7 @@ describe("segmentMessages", () => {
 		}
 	});
 
-	test("streaming reasoning + tool merges correctly", () => {
+	test("streaming reasoning breaks tool-run, producing 3 segments", () => {
 		const committed = makeMessage({
 			id: "a1",
 			role: "assistant",
@@ -165,11 +155,11 @@ describe("segmentMessages", () => {
 			],
 		});
 		const segs = segmentMessages([committed], { streamingMsg: streaming });
-		expect(segs).toHaveLength(1);
-		expect(segs[0].kind).toBe("tool-run");
-		if (segs[0].kind === "tool-run") {
-			expect(segs[0].items.map((i) => i.kind)).toEqual(["tool", "reasoning", "tool"]);
-		}
+		// reasoning is visible content → breaks the tool-run into 3 segments
+		expect(segs).toHaveLength(3);
+		expect(segs[0].kind).toBe("tool-run"); // committed tool
+		expect(segs[1].kind).toBe("message"); // streaming reasoning
+		expect(segs[2].kind).toBe("tool-run"); // streaming tool
 	});
 
 	test("text between tools breaks the run", () => {
@@ -201,19 +191,16 @@ describe("segmentMessages", () => {
 		expect(segs[2].kind).toBe("tool-run");
 	});
 
-	test("standalone streaming reasoning → tool-run segment", () => {
+	test("standalone streaming reasoning → content-whole segment (fallback)", () => {
 		const streaming = makeMessage({
 			id: "__streaming__",
 			role: "assistant",
 			contentJson: [{ type: "reasoning", text: "thinking..." }],
 		});
 		const segs = segmentMessages([], { streamingMsg: streaming });
+		// Reasoning blocks are ignored, but the message still gets a fallback segment
 		expect(segs).toHaveLength(1);
-		expect(segs[0].kind).toBe("tool-run");
-		if (segs[0].kind === "tool-run") {
-			expect(segs[0].items).toHaveLength(1);
-			expect(segs[0].items[0].kind).toBe("reasoning");
-		}
+		expect(segs[0].kind).toBe("message");
 	});
 
 	test("prune divider is inserted", () => {
@@ -234,7 +221,7 @@ describe("segmentMessages", () => {
 		expect(segs.some((s) => s.kind === "prune-divider")).toBe(true);
 	});
 
-	test("streaming text + tool: text stays before tool (arrival order)", () => {
+	test("streaming text + tool: text stays before tool", () => {
 		const streaming = makeMessage({
 			id: "__streaming__",
 			role: "assistant",
@@ -248,10 +235,9 @@ describe("segmentMessages", () => {
 			],
 		});
 		const segs = segmentMessages([], { streamingMsg: streaming });
-		expect(segs).toHaveLength(3);
-		expect(segs[0].kind).toBe("tool-run"); // reasoning
-		expect(segs[1].kind).toBe("message"); // text
-		expect(segs[2].kind).toBe("tool-run"); // tool
+		expect(segs).toHaveLength(2);
+		expect(segs[0].kind).toBe("message"); // text
+		expect(segs[1].kind).toBe("tool-run"); // tool
 	});
 
 	test("streaming text only (no tool) → message segment", () => {
@@ -265,7 +251,7 @@ describe("segmentMessages", () => {
 		expect(segs[0].kind).toBe("message");
 	});
 
-	test("streaming reasoning + text → reasoning run then message", () => {
+	test("streaming reasoning + text → only message segment", () => {
 		const streaming = makeMessage({
 			id: "__streaming__",
 			role: "assistant",
@@ -275,8 +261,7 @@ describe("segmentMessages", () => {
 			],
 		});
 		const segs = segmentMessages([], { streamingMsg: streaming });
-		expect(segs).toHaveLength(2);
-		expect(segs[0].kind).toBe("tool-run"); // reasoning
-		expect(segs[1].kind).toBe("message"); // text
+		expect(segs).toHaveLength(1);
+		expect(segs[0].kind).toBe("message"); // text only, reasoning ignored
 	});
 });

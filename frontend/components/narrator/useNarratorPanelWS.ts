@@ -689,7 +689,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onStreamEvent: (wsData: Record<string, unknown>) => {
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const ev = wsData.event as Record<string, any> | undefined;
-				if (ev?.type !== "content_block_delta" || !ev.delta?.text || ev.subagentToolUseId) {
+				// Skip non-delta events and subagent events (handled separately)
+				if (ev?.type !== "content_block_delta" || ev.subagentToolUseId) {
+					return;
+				}
+				// Skip deltas without text content
+				if (!ev.delta?.text) {
 					return;
 				}
 				if (ev.delta.type === "text_delta") {

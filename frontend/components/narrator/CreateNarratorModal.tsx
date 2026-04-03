@@ -1,4 +1,16 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	DragOverlay,
+	type DragStartEvent,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Button,
 	Checkbox,
@@ -9,13 +21,14 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
-import { IconFolder, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
-import { useState } from "react";
+import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useCreateFavoriteDirectory,
 	useDeleteFavoriteDirectory,
 	useFavoriteDirectories,
+	useReorderFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
@@ -36,6 +49,88 @@ interface CreateNarratorModalProps {
 	onCreated?: (narrator: CreateNarratorResult) => void;
 }
 
+function FavoriteItemContent({
+	fav,
+	isActive,
+	onSelect,
+	onRemove,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	fav: any;
+	isActive: boolean;
+	onSelect: () => void;
+	onRemove: () => void;
+}) {
+	return (
+		<Group gap="xs" wrap="nowrap">
+			<span style={{ display: "flex", flexShrink: 0 }}>
+				<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
+			</span>
+			<Button
+				variant={isActive ? "light" : "subtle"}
+				size="xs"
+				style={{ flex: 1, justifyContent: "flex-start" }}
+				onClick={onSelect}
+			>
+				<Text size="xs" truncate>
+					{fav.label || fav.path}
+				</Text>
+			</Button>
+			<ActionIcon variant="subtle" color="red" size="xs" onClick={onRemove}>
+				<IconX size={14} />
+			</ActionIcon>
+		</Group>
+	);
+}
+
+function SortableFavoriteItem({
+	fav,
+	isActive,
+	onSelect,
+	onRemove,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	fav: any;
+	isActive: boolean;
+	onSelect: () => void;
+	onRemove: () => void;
+}) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: fav.id,
+	});
+
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		visibility: isDragging ? ("hidden" as const) : undefined,
+	};
+
+	return (
+		<Group ref={setNodeRef} style={style} gap="xs" wrap="nowrap">
+			<span
+				{...attributes}
+				{...listeners}
+				style={{ cursor: "grab", display: "flex", flexShrink: 0 }}
+			>
+				<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
+			</span>
+			<Button
+				variant={isActive ? "light" : "subtle"}
+				size="xs"
+				style={{ flex: 1, justifyContent: "flex-start" }}
+				onClick={onSelect}
+			>
+				<Text size="xs" truncate>
+					{fav.label || fav.path}
+				</Text>
+			</Button>
+			<ActionIcon variant="subtle" color="red" size="xs" onClick={onRemove}>
+				<IconX size={14} />
+			</ActionIcon>
+		</Group>
+	);
+}
+
 export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const platform = usePlatform();
@@ -44,13 +139,43 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
+	const reorderFavorites = useReorderFavoriteDirectories();
 
 	const [cwd, setCwd] = useState("");
 	const [selectedModel, setSelectedModel] = useState("");
 	const [startInPlanMode, setStartInPlanMode] = useState(false);
+	const [activeId, setActiveId] = useState<string | null>(null);
+
+	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isFavorited = favorites?.some((f: any) => f.path === cwd);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const activeFav = activeId ? favorites?.find((f: any) => f.id === activeId) : null;
+
+	const handleDragStart = useCallback((event: DragStartEvent) => {
+		setActiveId(event.active.id as string);
+	}, []);
+
+	const handleDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			setActiveId(null);
+			const { active, over } = event;
+			if (!over || active.id === over.id || !favorites) return;
+			const oldIndex = favorites.findIndex((f: any) => f.id === active.id);
+			const newIndex = favorites.findIndex((f: any) => f.id === over.id);
+			if (oldIndex === -1 || newIndex === -1) return;
+			const newOrder = [...favorites];
+			const [moved] = newOrder.splice(oldIndex, 1);
+			newOrder.splice(newIndex, 0, moved);
+			reorderFavorites.mutate(newOrder.map((f: any) => f.id));
+		},
+		[favorites, reorderFavorites],
+	);
+
+	const handleDragCancel = useCallback(() => {
+		setActiveId(null);
+	}, []);
 
 	const handleCreate = () => {
 		createNarrator.mutate(
@@ -121,29 +246,47 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 						<Text size="xs" fw={500} c="dimmed">
 							{t("favoriteDirectories")}
 						</Text>
-						{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-						{favorites.map((fav: any) => (
-							<Group key={fav.id} gap="xs" wrap="nowrap">
-								<Button
-									variant={cwd === fav.path ? "light" : "subtle"}
-									size="xs"
-									style={{ flex: 1, justifyContent: "flex-start" }}
-									onClick={() => setCwd(fav.path)}
-								>
-									<Text size="xs" truncate>
-										{fav.label || fav.path}
-									</Text>
-								</Button>
-								<ActionIcon
-									variant="subtle"
-									color="red"
-									size="xs"
-									onClick={() => removeFavorite.mutate(fav.id)}
-								>
-									<IconX size={14} />
-								</ActionIcon>
-							</Group>
-						))}
+						<DndContext
+							sensors={sensors}
+							collisionDetection={closestCenter}
+							onDragStart={handleDragStart}
+							onDragEnd={handleDragEnd}
+							onDragCancel={handleDragCancel}
+						>
+							<SortableContext
+								items={favorites.map((f: any) => f.id)}
+								strategy={verticalListSortingStrategy}
+							>
+								{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+								{favorites.map((fav: any) => (
+									<SortableFavoriteItem
+										key={fav.id}
+										fav={fav}
+										isActive={cwd === fav.path}
+										onSelect={() => setCwd(fav.path)}
+										onRemove={() => removeFavorite.mutate(fav.id)}
+									/>
+								))}
+							</SortableContext>
+							<DragOverlay dropAnimation={null}>
+								{activeFav ? (
+									<div
+										style={{
+											borderRadius: 4,
+											backgroundColor: "var(--mantine-color-dark-6)",
+											boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+										}}
+									>
+										<FavoriteItemContent
+											fav={activeFav}
+											isActive={cwd === activeFav.path}
+											onSelect={() => {}}
+											onRemove={() => {}}
+										/>
+									</div>
+								) : null}
+							</DragOverlay>
+						</DndContext>
 					</Stack>
 				) : null}
 

@@ -231,6 +231,10 @@ export const updateBufferedMessageSchema = z.object({
 	text: z.string().min(1).max(100_000),
 });
 
+export const reorderBufferSchema = z.object({
+	orderedIds: z.array(z.string().min(1)).min(1),
+});
+
 // === Terminals ===
 
 export const createTerminalSchema = z

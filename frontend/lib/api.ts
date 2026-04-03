@@ -627,6 +627,11 @@ export const api = {
 		}),
 	clearBufferedMessages: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer`, { method: "DELETE" }),
+	reorderBufferedMessages: (narratorId: string, orderedIds: string[]) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/reorder`, {
+			method: "PUT",
+			body: JSON.stringify({ orderedIds }),
+		}),
 	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
 	approvePermission: (requestId: string) =>
 		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),

@@ -1,4 +1,14 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Avatar,
 	Badge,
@@ -41,6 +51,7 @@ import {
 	IconFileCode,
 	IconFolderPlus,
 	IconGitFork,
+	IconGripVertical,
 	IconLock,
 	IconLockOpen,
 	IconPaperclip,
@@ -98,7 +109,7 @@ import {
 import { useGlobalOverseer } from "../../hooks/useOverseers";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { ApiError, api, type TreeMessage } from "../../lib/api";
+import { ApiError, api, type BufferMessageSummary, type TreeMessage } from "../../lib/api";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	type ModelOption,
@@ -762,6 +773,133 @@ function ReasoningEffortMenuItems({
 				);
 			})}
 		</>
+	);
+}
+
+function SortableQueuedMessageItem({
+	msg,
+	index,
+	isEditing,
+	editingText,
+	onEditTextChange,
+	onSaveEdit,
+	onCancelEdit,
+	onStartEdit,
+	onRemove,
+	cancelBufferLabel,
+	editLabel,
+}: {
+	msg: BufferMessageSummary;
+	index: number;
+	isEditing: boolean;
+	editingText: string;
+	onEditTextChange: (text: string) => void;
+	onSaveEdit: () => void;
+	onCancelEdit: () => void;
+	onStartEdit: (msg: { id: string; text: string }) => void;
+	onRemove: (id: string) => void;
+	cancelBufferLabel: string;
+	editLabel: string;
+}) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: msg.id,
+	});
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0.5 : 1,
+	};
+
+	return (
+		<Group
+			ref={setNodeRef}
+			style={style}
+			px="md"
+			py={4}
+			gap="xs"
+			wrap="nowrap"
+			bg="var(--mantine-color-blue-light)"
+		>
+			{isEditing ? (
+				<>
+					<div
+						{...attributes}
+						{...listeners}
+						style={{ cursor: "grab", display: "flex", alignItems: "center", flexShrink: 0 }}
+					>
+						<Text size="xs" c="dimmed" w={16} ta="center">
+							{index + 1}
+						</Text>
+					</div>
+					<Textarea
+						size="xs"
+						value={editingText}
+						onChange={(e) => onEditTextChange(e.currentTarget.value)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter" && !e.shiftKey) {
+								e.preventDefault();
+								onSaveEdit();
+							}
+							if (e.key === "Escape") onCancelEdit();
+						}}
+						autosize
+						minRows={1}
+						maxRows={4}
+						style={{ flex: 1 }}
+						autoFocus
+					/>
+					<ActionIcon size="xs" variant="subtle" color="green" onClick={onSaveEdit}>
+						<IconCheck size={12} />
+					</ActionIcon>
+					<ActionIcon size="xs" variant="subtle" color="gray" onClick={onCancelEdit}>
+						<IconX size={12} />
+					</ActionIcon>
+				</>
+			) : (
+				<>
+					<div
+						{...attributes}
+						{...listeners}
+						style={{ cursor: "grab", display: "flex", alignItems: "center", flexShrink: 0 }}
+					>
+						<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
+					</div>
+					{msg.creator ? (
+						<UserAvatar
+							username={msg.creator.username}
+							avatarColor={msg.creator.avatarColor}
+							avatarImageId={msg.creator.avatarImageId}
+							userId={msg.creator.id}
+							size={16}
+							showTooltip={false}
+						/>
+					) : (
+						<Box w={16} h={16} style={{ flexShrink: 0 }} />
+					)}
+					<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
+						{msg.text}
+					</Text>
+					{msg.imageCount > 0 && (
+						<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+							<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
+							<Text size="xs" c="blue">
+								{msg.imageCount}
+							</Text>
+						</Group>
+					)}
+					<ActionIcon
+						size="xs"
+						variant="subtle"
+						color="blue"
+						onClick={() => onStartEdit(msg)}
+						title={editLabel}
+					>
+						<IconPencil size={12} />
+					</ActionIcon>
+					<CloseButton size="xs" onClick={() => onRemove(msg.id)} title={cancelBufferLabel} />
+				</>
+			)}
+		</Group>
 	);
 }
 
@@ -2071,15 +2209,14 @@ export function NarratorPanel({
 	// reference when the actual streaming content changes, not on every render.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: refs are read intentionally — streamingVersion forces re-evaluation
 	const streamingMsg = useMemo(() => {
-		// streamingVersion forces re-read of refs (streamingRef, streamingReasoningRef, webSearchRef)
+		// streamingVersion forces re-read of refs (streamingRef, webSearchRef)
 		void streamingVersion;
 		return buildStreamingMsg({
-			reasoningText: streamingReasoningRef.current || undefined,
 			streamingText: streamingRef.current || undefined,
+			streamingReasoning: streamingReasoningRef.current || undefined,
 			webSearch: webSearchRef.current,
 			toolChunksMsg: topLevelStreamingChunks,
 			narratorId,
-			reasoningCreatedAt: streamingReasoningCreatedAtRef.current ?? undefined,
 		});
 	}, [streamingVersion, topLevelStreamingChunks, narratorId]);
 
@@ -2126,7 +2263,7 @@ export function NarratorPanel({
 			const isNewestPage = ri === reversed.length - 1;
 			const pageStreamingMsg = isNewestPage ? streamingMsg : null;
 
-			// Check cache — skip cache when streaming is active on this page.
+			// Check cache for non-streaming pages.
 			const cached = cache.get(pageKey);
 			if (
 				!pageStreamingMsg &&
@@ -2145,47 +2282,102 @@ export function NarratorPanel({
 				continue;
 			}
 
-			// Compute elements for this page
-			const result = renderTreeMessagesWithKeys(
-				page.messages,
-				narratorId,
-				forkHandler,
-				highlightedId,
-				renderPermCb,
-				expandedToolUseId,
-				editExpandOverride,
-				showTokenUsage,
-				pruneBoundaryMessageId,
-				pruneDividerLabel,
-				handleCompactBefore,
-				handleDeleteBlock,
-				handleRegenerate,
-				handleEditAndRegenerate,
-				lastUserMessageId,
-				hasChapter,
-				onViewSubagentSession,
-				pageStreamingMsg,
-				resolvePermForRender,
-			);
+			const renderPage = (sm: NarratorMsg | null) =>
+				renderTreeMessagesWithKeys(
+					page.messages,
+					narratorId,
+					forkHandler,
+					highlightedId,
+					renderPermCb,
+					expandedToolUseId,
+					editExpandOverride,
+					showTokenUsage,
+					pruneBoundaryMessageId,
+					pruneDividerLabel,
+					handleCompactBefore,
+					handleDeleteBlock,
+					handleRegenerate,
+					handleEditAndRegenerate,
+					lastUserMessageId,
+					hasChapter,
+					onViewSubagentSession,
+					sm,
+					resolvePermForRender,
+				);
 
-			// Only cache when there's no streaming message (streaming changes every frame)
-			if (!pageStreamingMsg) {
+			const collectResults = (
+				result: ReturnType<typeof renderTreeMessagesWithKeys>,
+				startIdx = 0,
+			) => {
+				for (let j = startIdx; j < result.elements.length; j++) {
+					const targetIds = result.targets[j] ?? [];
+					allElements.push(result.elements[j]);
+					const key = getStableRenderElementKey(result.keys[j], targetIds, pageKey, usedKeys);
+					usedKeys.add(key);
+					allKeys.push(key);
+					allTargets.push(targetIds);
+				}
+			};
+
+			if (pageStreamingMsg) {
+				// Streaming page: reuse cached non-streaming elements for all
+				// segments except the last one (which includes streaming content).
+				//
+				// segmentMessages only appends streamingMsg to the end of the message
+				// array — earlier segments are identical. Each segment maps to exactly
+				// one element, so reusing the first (N-1) cached elements is safe.
+				//
+				// If the cache is missing (first streaming frame, or messages changed),
+				// render the non-streaming version to populate it, then render with
+				// streaming. On subsequent frames, the cache is already warm so we
+				// skip the non-streaming render entirely.
+				let cachedNoStreaming = cache.get(pageKey);
+				if (
+					!cachedNoStreaming ||
+					!hasSamePageMessageRefs(cachedNoStreaming.messageRefs, page.messages) ||
+					cachedNoStreaming.secondaryKey !== secondaryKey
+				) {
+					const noStreamResult = renderPage(null);
+					cache.set(pageKey, {
+						...noStreamResult,
+						messageRefs: page.messages,
+						secondaryKey,
+					});
+					cachedNoStreaming = cache.get(pageKey);
+				}
+
+				if (cachedNoStreaming && cachedNoStreaming.elements.length > 0) {
+					// Reuse the first (N-1) cached elements — these correspond to
+					// segments unaffected by streamingMsg.
+					const reuseCount = Math.max(0, cachedNoStreaming.elements.length - 1);
+					collectResults(cachedNoStreaming, 0);
+					// Remove the last element we just collected — it will be replaced
+					// by the streaming version below.
+					if (reuseCount < cachedNoStreaming.elements.length) {
+						allElements.length -= 1;
+						allKeys.length -= 1;
+						allTargets.length -= 1;
+					}
+
+					// Render the full page WITH streamingMsg, but only take the
+					// new elements beyond the cached portion (the streaming segment).
+					const streamResult = renderPage(pageStreamingMsg);
+					collectResults(streamResult, reuseCount);
+				} else {
+					// Fallback: cache lookup failed, render everything from the streaming result.
+					collectResults(renderPage(pageStreamingMsg));
+				}
+			} else {
+				// Non-streaming page not in cache: compute and cache.
+				const result = renderPage(null);
+
 				cache.set(pageKey, {
 					...result,
 					messageRefs: page.messages,
 					secondaryKey,
 				});
-			} else {
-				cache.delete(pageKey);
-			}
 
-			for (let j = 0; j < result.elements.length; j++) {
-				const targetIds = result.targets[j] ?? [];
-				allElements.push(result.elements[j]);
-				const key = getStableRenderElementKey(result.keys[j], targetIds, pageKey, usedKeys);
-				usedKeys.add(key);
-				allKeys.push(key);
-				allTargets.push(targetIds);
+				collectResults(result);
 			}
 		}
 
@@ -2861,6 +3053,32 @@ export function NarratorPanel({
 			}
 		});
 	};
+
+	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+	const handleDragEndQueued = useCallback(
+		(event: DragEndEvent) => {
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const oldIndex = queuedMessages.findIndex((m) => m.id === active.id);
+			const newIndex = queuedMessages.findIndex((m) => m.id === over.id);
+			if (oldIndex === -1 || newIndex === -1) return;
+			const newOrder = [...queuedMessages];
+			const [moved] = newOrder.splice(oldIndex, 1);
+			newOrder.splice(newIndex, 0, moved);
+			const snapshot = queuedMessages;
+			setQueuedMessages(newOrder);
+			api
+				.reorderBufferedMessages(
+					narratorId,
+					newOrder.map((m) => m.id),
+				)
+				.catch(() => {
+					setQueuedMessages(snapshot);
+				});
+		},
+		[queuedMessages, narratorId, setQueuedMessages],
+	);
 
 	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
 	const [editingQueuedText, setEditingQueuedText] = useState("");
@@ -3602,99 +3820,33 @@ export function NarratorPanel({
 							flexShrink: 0,
 						}}
 					>
-						{queuedMessages.map((msg, index) => (
-							<Group
-								key={msg.id}
-								px="md"
-								py={4}
-								gap="xs"
-								style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
+						<DndContext
+							sensors={sensors}
+							collisionDetection={closestCenter}
+							onDragEnd={handleDragEndQueued}
+						>
+							<SortableContext
+								items={queuedMessages.map((m) => m.id)}
+								strategy={verticalListSortingStrategy}
 							>
-								{editingQueuedId === msg.id ? (
-									<>
-										<Text size="xs" c="dimmed" w={16} ta="center">
-											{index + 1}
-										</Text>
-										<Textarea
-											size="xs"
-											value={editingQueuedText}
-											onChange={(e) => setEditingQueuedText(e.currentTarget.value)}
-											onKeyDown={(e) => {
-												if (e.key === "Enter" && !e.shiftKey) {
-													e.preventDefault();
-													handleSaveEditQueued();
-												}
-												if (e.key === "Escape") handleCancelEditQueued();
-											}}
-											autosize
-											minRows={1}
-											maxRows={4}
-											style={{ flex: 1 }}
-											autoFocus
-										/>
-										<ActionIcon
-											size="xs"
-											variant="subtle"
-											color="green"
-											onClick={handleSaveEditQueued}
-										>
-											<IconCheck size={12} />
-										</ActionIcon>
-										<ActionIcon
-											size="xs"
-											variant="subtle"
-											color="gray"
-											onClick={handleCancelEditQueued}
-										>
-											<IconX size={12} />
-										</ActionIcon>
-									</>
-								) : (
-									<>
-										<Text size="xs" c="dimmed" w={16} ta="center">
-											{index + 1}
-										</Text>
-										{msg.creator ? (
-											<UserAvatar
-												username={msg.creator.username}
-												avatarColor={msg.creator.avatarColor}
-												avatarImageId={msg.creator.avatarImageId}
-												userId={msg.creator.id}
-												size={16}
-												showTooltip={false}
-											/>
-										) : (
-											<Box w={16} h={16} style={{ flexShrink: 0 }} />
-										)}
-										<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-											{msg.text}
-										</Text>
-										{msg.imageCount > 0 && (
-											<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-												<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
-												<Text size="xs" c="blue">
-													{msg.imageCount}
-												</Text>
-											</Group>
-										)}
-										<ActionIcon
-											size="xs"
-											variant="subtle"
-											color="blue"
-											onClick={() => handleStartEditQueued(msg)}
-											title={tc("edit")}
-										>
-											<IconPencil size={12} />
-										</ActionIcon>
-										<CloseButton
-											size="xs"
-											onClick={() => handleRemoveQueued(msg.id)}
-											title={t("cancelBuffer")}
-										/>
-									</>
-								)}
-							</Group>
-						))}
+								{queuedMessages.map((msg, index) => (
+									<SortableQueuedMessageItem
+										key={msg.id}
+										msg={msg}
+										index={index}
+										isEditing={editingQueuedId === msg.id}
+										editingText={editingQueuedText}
+										onEditTextChange={setEditingQueuedText}
+										onSaveEdit={handleSaveEditQueued}
+										onCancelEdit={handleCancelEditQueued}
+										onStartEdit={handleStartEditQueued}
+										onRemove={handleRemoveQueued}
+										cancelBufferLabel={t("cancelBuffer")}
+										editLabel={tc("edit")}
+									/>
+								))}
+							</SortableContext>
+						</DndContext>
 						{queuedMessages.length > 1 && (
 							<Group
 								px="md"

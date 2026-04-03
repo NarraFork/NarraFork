@@ -55,6 +55,7 @@ import {
 	createWhitelistDirSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,
+	reorderBufferSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
@@ -98,6 +99,7 @@ import {
 	pushBufferedMessage,
 	regenerateFromMessage,
 	removeBufferedMessage,
+	reorderBufferedMessages,
 	resolveAllPendingPermissions,
 	resolvePermission,
 	retryLastMessage,
@@ -645,6 +647,19 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const mid = c.req.param("mid");
 	const ok = removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
+	const messages = toBufferSummary(getBufferedMessages(id));
+	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages });
+	return c.json({ ok: true });
+});
+
+// Reorder queued buffered messages
+narratorRoutes.put("/:id/buffer/reorder", async (c) => {
+	const id = c.req.param("id");
+	const body = await c.req.json();
+	const parsed = reorderBufferSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const ok = reorderBufferedMessages(id, parsed.data.orderedIds);
+	if (!ok) throw new ValidationError("Invalid reorder: ids do not match the current queue");
 	const messages = toBufferSummary(getBufferedMessages(id));
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages });
 	return c.json({ ok: true });

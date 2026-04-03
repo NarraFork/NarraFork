@@ -1,14 +1,8 @@
-import { Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
-import { IconBrain } from "@tabler/icons-react";
-import { memo, useMemo } from "react";
+import { Box, Divider, Text } from "@mantine/core";
+import { memo } from "react";
 import { BlurInOnAppear } from "./BlurInOnAppear";
-import {
-	getReasoningBlurAnimationId,
-	getToolCallBlurAnimationId,
-	getUserMessageBlurAnimationId,
-} from "./blur-in-ids";
-import { ContentViewer } from "./ContentViewer";
-import { MessageBubble, ReasoningSummary } from "./MessageBubble";
+import { getToolCallBlurAnimationId, getUserMessageBlurAnimationId } from "./blur-in-ids";
+import { MessageBubble } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
 	collectSegmentTargetIds,
@@ -20,7 +14,7 @@ import { resolvePendingPerm } from "./narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
-import { getCategoryColor, TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
+import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a tool-run segment from pre-computed ToolRunItems
@@ -34,9 +28,7 @@ export interface RenderToolRunOptions {
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
-	/** Extra styles applied to the outer tool-run container. */
 	containerStyle?: React.CSSProperties;
-	/** Extra className applied to the outer tool-run container. */
 	containerClassName?: string;
 }
 
@@ -45,118 +37,10 @@ export type RenderedTreeElementMeta =
 	| { kind: "decorative" }
 	| { kind: "tool-run"; sourceMessages: NarratorMsg[] };
 
-type ReasoningToolRunItem = Extract<ToolRunItem, { kind: "reasoning" }>;
-
 const HIGHLIGHT_STYLE: React.CSSProperties = {
 	animation: "highlight-blink 1.5s ease",
 	borderRadius: "var(--mantine-radius-sm)",
 };
-
-const ToolRunReasoningItem = memo(
-	function ToolRunReasoningItem({
-		item,
-		idx,
-		total,
-		highlighted,
-		onForkFromMessage,
-		onCompactBeforeMessage,
-		onDeleteBlock,
-	}: {
-		item: ReasoningToolRunItem;
-		idx: number;
-		total: number;
-		highlighted: boolean;
-		onForkFromMessage?: (uuid: string) => void;
-		onCompactBeforeMessage?: (messageId: string) => void;
-		onDeleteBlock?: (messageId: string, blockIndex: number) => void;
-	}) {
-		const iconColor = getCategoryColor("plan");
-		const isStreaming = item.msg.id === "__streaming__";
-		const reasoningAnimationId = getReasoningBlurAnimationId({
-			messageId: item.msg.id,
-			blockIndex: item.blockIndex,
-			createdAt: item.msg.createdAt,
-			fallbackKey: idx,
-		});
-		const hlStyle = highlighted ? HIGHLIGHT_STYLE : undefined;
-		const ctxActions = useMemo<MessageContextMenuActions>(() => {
-			const next: MessageContextMenuActions = {};
-			const msgUuid = item.msg.messageUuid;
-			const msgId = item.msg.id;
-			if (msgUuid && onForkFromMessage) {
-				next.onForkFromMessage = () => onForkFromMessage(msgUuid);
-			}
-			if (msgId && onCompactBeforeMessage) {
-				next.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
-			}
-			if (msgId && onDeleteBlock) {
-				next.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
-			}
-			return next;
-		}, [
-			item.msg.id,
-			item.msg.messageUuid,
-			onCompactBeforeMessage,
-			onDeleteBlock,
-			onForkFromMessage,
-		]);
-		const header = (
-			<Group gap={5} wrap="nowrap" align="flex-start">
-				<ThemeIcon size={16} variant="light" color={iconColor} radius="sm" mt={1}>
-					<IconBrain size={10} />
-				</ThemeIcon>
-				<ReasoningSummary
-					text={item.text}
-					translatedText={item.translatedText}
-					isStreaming={isStreaming}
-				/>
-			</Group>
-		);
-		const content = (
-			<div id={`msg-${item.msg.id}`} style={hlStyle}>
-				<ContentViewer
-					content={item.text}
-					markdown
-					contentType="markdown"
-					blockIndex={item.blockIndex}
-				>
-					{total >= 2 ? (
-						<>
-							<Box p="xs">{header}</Box>
-							{idx !== total - 1 && (
-								<Divider color="var(--mantine-color-default-border)" size={1} />
-							)}
-						</>
-					) : (
-						<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
-							{header}
-						</Paper>
-					)}
-				</ContentViewer>
-			</div>
-		);
-		return (
-			<MessageContextMenuCtx.Provider value={ctxActions}>
-				{reasoningAnimationId ? (
-					<BlurInOnAppear animationId={reasoningAnimationId}>{content}</BlurInOnAppear>
-				) : (
-					content
-				)}
-			</MessageContextMenuCtx.Provider>
-		);
-	},
-	(prev, next) =>
-		prev.item.msg === next.item.msg &&
-		prev.item.blockIndex === next.item.blockIndex &&
-		prev.item.text === next.item.text &&
-		prev.item.translatedText === next.item.translatedText &&
-		prev.idx === next.idx &&
-		prev.total === next.total &&
-		prev.highlighted === next.highlighted &&
-		prev.onForkFromMessage === next.onForkFromMessage &&
-		prev.onCompactBeforeMessage === next.onCompactBeforeMessage &&
-		prev.onDeleteBlock === next.onDeleteBlock,
-);
 
 export function renderToolRun(
 	items: ToolRunItem[],
@@ -187,16 +71,13 @@ export function renderToolRun(
 			permCb.overseerReviewMap,
 		);
 
-	const taskCount = items.filter((it) => it.kind === "tool" && it.isSubagent).length;
+	const taskCount = items.filter((it) => it.isSubagent).length;
 	const soleSubagent = taskCount === 1;
 	const wrapWithBlur = (animationId: string | null, node: React.ReactNode) =>
 		animationId ? <BlurInOnAppear animationId={animationId}>{node}</BlurInOnAppear> : node;
 
 	const renderItem = (item: ToolRunItem, idx: number, total: number) => {
-		const key =
-			item.kind === "tool"
-				? (item.tc.toolUseId ?? `${item.msg.id}-${idx}`)
-				: `reasoning-${item.msg.id}-${item.blockIndex}`;
+		const key = item.tc.toolUseId ?? `${item.msg.id}-${idx}`;
 		const hlStyle = highlightedId === item.msg.id ? HIGHLIGHT_STYLE : undefined;
 
 		const ctxActions: MessageContextMenuActions = {};
@@ -210,21 +91,6 @@ export function renderToolRun(
 		}
 		if (msgId && onDeleteBlock) {
 			ctxActions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
-		}
-
-		if (item.kind === "reasoning") {
-			return (
-				<ToolRunReasoningItem
-					key={key}
-					item={item}
-					idx={idx}
-					total={total}
-					highlighted={highlightedId === item.msg.id}
-					onForkFromMessage={onForkFromMessage}
-					onCompactBeforeMessage={onCompactBeforeMessage}
-					onDeleteBlock={onDeleteBlock}
-				/>
-			);
 		}
 
 		const toolAnimationId = getToolCallBlurAnimationId({
@@ -286,34 +152,26 @@ export function renderToolRun(
 		);
 	};
 
-	if (items.length >= 2) {
-		return (
-			<Box
-				key={`tool-run-${runKey}`}
-				data-tool-run
-				className={containerClassName}
-				style={{
-					border: "1px solid var(--mantine-color-default-border)",
-					borderRadius: "var(--mantine-radius-sm)",
-					overflow: "hidden",
-					backgroundColor: TOOL_CARD_BG,
-					...containerStyle,
-				}}
-			>
-				{items.map((item, idx) => renderItem(item, idx, items.length))}
-			</Box>
-		);
-	}
-
+	const isMultiRun = items.length >= 2;
 	return (
-		<div
+		<Box
 			key={`tool-run-${runKey}`}
 			data-tool-run
 			className={containerClassName}
-			style={containerStyle}
+			style={{
+				...(isMultiRun
+					? {
+							border: "1px solid var(--mantine-color-default-border)",
+							borderRadius: "var(--mantine-radius-sm)",
+							overflow: "hidden",
+							backgroundColor: TOOL_CARD_BG,
+						}
+					: undefined),
+				...containerStyle,
+			}}
 		>
-			{renderItem(items[0], 0, 1)}
-		</div>
+			{items.map((item, idx) => renderItem(item, idx, items.length))}
+		</Box>
 	);
 }
 
@@ -358,7 +216,6 @@ export function renderTreeMessages(
 		highlight = true,
 		visibleBlockIndices?: number[],
 	) => {
-		// Build the message object — if visibleBlockIndices is set, filter contentJson
 		const displayMsg =
 			visibleBlockIndices != null
 				? {
@@ -467,7 +324,7 @@ export function renderTreeMessages(
 
 		if (seg.kind === "message") {
 			const key = seg.visibleBlockIndices ? `${seg.msg.id}-leading` : seg.msg.id;
-			const domId = seg.visibleBlockIndices ? `msg-${seg.msg.id}` : `msg-${seg.msg.id}`;
+			const domId = `msg-${seg.msg.id}`;
 			elements.push(
 				renderMessageSegment(
 					seg.msg,
@@ -481,7 +338,6 @@ export function renderTreeMessages(
 			continue;
 		}
 
-		// seg.kind === "tool-run"
 		const runKey = seg.sourceMessages[0]?.id ?? "unknown";
 		const el = renderToolRun(seg.items, runKey, narratorId, permCb, {
 			expandedToolUseId,
@@ -577,15 +433,11 @@ export const StreamingBubble = memo(
 	function StreamingBubble({
 		narratorId,
 		streamingRef,
-		streamingReasoningRef,
-		includeReasoning,
 		webSearchRef,
 		version,
 	}: {
 		narratorId: string;
 		streamingRef: React.RefObject<string>;
-		streamingReasoningRef?: React.RefObject<string>;
-		includeReasoning?: boolean;
 		webSearchRef?: React.RefObject<{
 			id: string;
 			status: "in_progress" | "searching" | "completed";
@@ -595,9 +447,8 @@ export const StreamingBubble = memo(
 	}) {
 		void version;
 		const text = streamingRef.current;
-		const reasoning = includeReasoning ? streamingReasoningRef?.current : undefined;
 		const webSearch = webSearchRef?.current;
-		if (!text && !reasoning && !webSearch) return null;
+		if (!text && !webSearch) return null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic block shapes
 		const blocks: any[] = [];
 		if (webSearch) {
@@ -608,7 +459,6 @@ export const StreamingBubble = memo(
 				query: webSearch.query,
 			});
 		}
-		if (reasoning) blocks.push({ type: "reasoning", text: reasoning });
 		if (text) blocks.push({ type: "text", text });
 		return (
 			<MessageBubble
@@ -620,8 +470,5 @@ export const StreamingBubble = memo(
 			/>
 		);
 	},
-	(prev, next) =>
-		prev.version === next.version &&
-		prev.includeReasoning === next.includeReasoning &&
-		prev.narratorId === next.narratorId,
+	(prev, next) => prev.version === next.version && prev.narratorId === next.narratorId,
 );
