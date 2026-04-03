@@ -14,30 +14,32 @@ interface LazyCollapseProps {
  * To preserve the expand animation, mounting and opening happen in two frames:
  * frame 1 — mount the Collapse with `in={false}` so it measures height 0,
  * frame 2 — flip to `in={true}` to trigger the CSS transition.
+ *
+ * On initial mount with `in={true}`, the two-step animation is skipped —
+ * the Collapse renders directly with `in={true}` so content is immediately
+ * visible. This avoids setState-in-useEffect on mount, which React 19's
+ * `set-state-in-effect` lint rule flags and which causes "Maximum update
+ * depth exceeded" when many LazyCollapse instances mount simultaneously.
  */
 export function LazyCollapse({ in: opened, children }: LazyCollapseProps) {
 	const [mounted, setMounted] = useState(opened);
 	const [reveal, setReveal] = useState(opened);
-	const didInitialize = useRef(false);
+	const isFirstMount = useRef(true);
 
-	// When opened goes true: mount first, reveal next frame
 	useEffect(() => {
-		// Skip effect on initial mount when opened=true: useState(opened) already
-		// set mounted=true and reveal=true, so no state changes are needed.
-		// Without this guard, requestAnimationFrame would schedule a redundant
-		// setReveal(true) for every instance. When many LazyCollapse mount at once
-		// (e.g. reasoning blocks), the accumulated raf callbacks can trigger React's
-		// nested-update counter (limit 50) during the commit phase.
-		if (!didInitialize.current) {
-			didInitialize.current = true;
-			if (opened && mounted) return;
+		// On initial mount, mounted and reveal are already set correctly by
+		// useState(opened). Skip all setState calls — this is the React-recommended
+		// "derive state from props" pattern. The Collapse renders directly at its
+		// final state (collapsed or expanded) without an intermediate render pass.
+		if (isFirstMount.current) {
+			isFirstMount.current = false;
+			return;
 		}
 
 		if (opened && !mounted) {
 			setMounted(true);
 		}
 		if (opened && mounted) {
-			// Delay reveal to next frame so Collapse starts from height 0
 			const raf = requestAnimationFrame(() => setReveal(true));
 			return () => cancelAnimationFrame(raf);
 		}
