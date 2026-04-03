@@ -122,7 +122,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 		!config.signal.aborted &&
 		!skipInterruptionCheck
 	) {
-		interrupted = await checkOutputInterruption(finalText, config.narratorId);
+		interrupted = await checkOutputInterruption(finalText, config.narratorId, config.signal);
 	}
 
 	return {
@@ -158,7 +158,11 @@ function looksCompleteByHeuristic(text: string): boolean {
 	return false;
 }
 
-async function checkOutputInterruption(text: string, narratorId: string): Promise<boolean> {
+async function checkOutputInterruption(
+	text: string,
+	narratorId: string,
+	signal: AbortSignal,
+): Promise<boolean> {
 	if (!text.trim()) {
 		logger.info("Smart interruption check: empty output, marking as interrupted", {
 			narratorId,
@@ -170,6 +174,12 @@ async function checkOutputInterruption(text: string, narratorId: string): Promis
 	if (looksCompleteByHeuristic(text)) {
 		return false;
 	}
+
+	// Abort check before expensive model call
+	if (signal.aborted) return false;
+
+	// Notify frontend that we're running the interruption check
+	broadcastToNarrator(narratorId, { type: "interrupt_checking", narratorId });
 
 	try {
 		const systemPrompt =
@@ -183,7 +193,16 @@ async function checkOutputInterruption(text: string, narratorId: string): Promis
 
 		const snippet = text.slice(-500);
 		const result = await summaryGenerate(snippet, systemPrompt);
+
+		// Check abort after the model call completes
+		if (signal.aborted) {
+			broadcastToNarrator(narratorId, { type: "interrupt_check_done", narratorId });
+			return false;
+		}
+
 		const verdict = result.text.trim().toLowerCase();
+
+		broadcastToNarrator(narratorId, { type: "interrupt_check_done", narratorId });
 
 		if (verdict === "retry") {
 			logger.info("Smart interruption check: summary model flagged as interrupted", {
@@ -195,6 +214,7 @@ async function checkOutputInterruption(text: string, narratorId: string): Promis
 
 		return false;
 	} catch (err) {
+		broadcastToNarrator(narratorId, { type: "interrupt_check_done", narratorId });
 		logger.error("Smart interruption check failed, skipping", {
 			narratorId,
 			error: String(err),

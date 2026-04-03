@@ -35,7 +35,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -51,7 +51,7 @@ function relativeTime(iso: string | undefined): string {
 }
 
 interface CodexSectionProps {
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
@@ -60,7 +60,7 @@ interface CodexSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
-export function CodexSection({
+export const CodexSection = React.memo(function CodexSection({
 	hiddenModels,
 	onToggleHidden,
 	customModels,
@@ -851,7 +851,7 @@ export function CodexSection({
 							<Stack gap="xs">
 								{codexModelIds.map((modelId) => {
 									const modelVal = `codex:${modelId}`;
-									const isHidden = hiddenModels.includes(modelVal);
+									const isHidden = hiddenModels.has(modelVal);
 									return (
 										<Group
 											key={modelId}
@@ -937,7 +937,7 @@ export function CodexSection({
 			</Modal>
 		</Paper>
 	);
-}
+});
 
 // Credential list wrapper (responsive)
 function CredentialList(props: {

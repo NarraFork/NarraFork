@@ -85,7 +85,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	const swipeOffsetRef = useRef(0);
 	const [swipeRevealed, setSwipeRevealed] = useState(false);
 	const [swipeClosing, setSwipeClosing] = useState(false);
-	const [swipeY, setSwipeY] = useState(0);
+
 	const [swipeInitialRight, setSwipeInitialRight] = useState(0);
 	const swipeRef = useRef<{
 		startX: number;
@@ -170,7 +170,6 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 						rangeCandidate: true,
 						lastDx: 0,
 					};
-					setSwipeY(touch.clientY);
 					setSwipeInitialRight(node.getBoundingClientRect().right);
 					return;
 				}
@@ -200,7 +199,6 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				rangeCandidate: false,
 				lastDx: 0,
 			};
-			setSwipeY(touch.clientY);
 			setSwipeInitialRight(node.getBoundingClientRect().right);
 		};
 
@@ -419,8 +417,12 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
 	const getSwipeMenuPosition = useCallback(
 		(menuHeight = 120) => {
-			const menuLeft = swipeInitialRight - swipeOffset;
+			// Use live rect to avoid stale positions when DOM changes between
+			// touchstart and menu render (e.g. new messages, streaming growth).
+			// NOTE: getBoundingClientRect() already includes the visual effect
+			// of transform: translateX(-swipeOffset), so do NOT subtract offset again.
 			const boxRect = swipeBoxRef.current?.getBoundingClientRect();
+			const menuLeft = boxRect?.right ?? swipeInitialRight - swipeOffset;
 			const half = menuHeight / 2;
 
 			// Determine the visible area — use the scroll container if found, else viewport
@@ -451,9 +453,10 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			}
 			// Clamp to visible area
 			menuTop = Math.max(visibleTop + half, Math.min(menuTop, visibleBottom - half));
+
 			return { left: menuLeft, top: menuTop };
 		},
-		[swipeInitialRight, swipeOffset, swipeY],
+		[swipeInitialRight, swipeOffset],
 	);
 
 	return {

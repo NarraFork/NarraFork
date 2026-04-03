@@ -26,7 +26,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
@@ -34,11 +34,15 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import type { AnthropicProviderState } from "./types";
 
+type ProvidersUpdater =
+	| AnthropicProviderState[]
+	| ((prev: AnthropicProviderState[]) => AnthropicProviderState[]);
+
 interface AnthropicProvidersSectionProps {
 	providers: AnthropicProviderState[];
-	onProvidersChange: (providers: AnthropicProviderState[]) => void;
+	onProvidersChange: (updater: ProvidersUpdater) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	onBatchToggleHidden: (modelValues: string[], hidden: boolean) => void;
 	modelContextWindows: Record<string, number>;
@@ -50,7 +54,7 @@ interface AnthropicProvidersSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
-export function AnthropicProvidersSection({
+export const AnthropicProvidersSection = React.memo(function AnthropicProvidersSection({
 	providers,
 	onProvidersChange,
 	providerModelsMap,
@@ -73,8 +77,8 @@ export function AnthropicProvidersSection({
 
 	const handleAddProvider = useCallback(() => {
 		const id = Math.random().toString(36).slice(2, 10);
-		onProvidersChange([
-			...providers,
+		onProvidersChange((prev) => [
+			...prev,
 			{
 				id,
 				name: "Anthropic",
@@ -86,19 +90,19 @@ export function AnthropicProvidersSection({
 			},
 		]);
 		setExpandedProviders((prev) => new Set(prev).add(id));
-	}, [providers, onProvidersChange]);
+	}, [onProvidersChange]);
 
 	const handleRemoveProvider = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.filter((p) => p.id !== id));
+			onProvidersChange((prev) => prev.filter((p) => p.id !== id));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const updateProvider = useCallback(
 		(id: string, field: keyof AnthropicProviderState, value: string | boolean | null) => {
-			onProvidersChange(
-				providers.map((p): AnthropicProviderState => {
+			onProvidersChange((prev) =>
+				prev.map((p): AnthropicProviderState => {
 					if (p.id !== id) return p;
 					if (field === "defaultReasoningEffort") {
 						const effort = value as "none" | "low" | "medium" | "high" | null;
@@ -108,7 +112,7 @@ export function AnthropicProvidersSection({
 				}),
 			);
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const toggleProviderExpanded = useCallback((id: string) => {
@@ -122,9 +126,11 @@ export function AnthropicProvidersSection({
 
 	const toggleProviderDisabled = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)));
+			onProvidersChange((prev) =>
+				prev.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)),
+			);
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const handleRefreshProviderModels = useCallback(
@@ -220,9 +226,7 @@ export function AnthropicProvidersSection({
 												)}
 												{!p.disabled && providerModelCount > 0 && (
 													<Badge size="xs" variant="light">
-														{t("anthropicModelsCount", {
-															count: providerModelCount,
-														})}
+														{t("anthropicModelsCount", { count: providerModelCount })}
 													</Badge>
 												)}
 											</Group>
@@ -327,15 +331,13 @@ export function AnthropicProvidersSection({
 													</Button>
 													{providerModelCount > 0 && (
 														<Text size="xs" c="dimmed">
-															{t("anthropicModelsCount", {
-																count: providerModelCount,
-															})}
+															{t("anthropicModelsCount", { count: providerModelCount })}
 														</Text>
 													)}
 												</Group>
 												{pModels.length > 0 &&
 													(() => {
-														const allHidden = pModels.every((m) => hiddenModels.includes(m.value));
+														const allHidden = pModels.every((m) => hiddenModels.has(m.value));
 														return (
 															<Stack gap="xs" mt="xs">
 																<Group gap="xs" justify="flex-end">
@@ -357,7 +359,7 @@ export function AnthropicProvidersSection({
 																	</Tooltip>
 																</Group>
 																{pModels.map((m) => {
-																	const isHidden = hiddenModels.includes(m.value);
+																	const isHidden = hiddenModels.has(m.value);
 																	return (
 																		<Group
 																			key={m.value}
@@ -437,4 +439,4 @@ export function AnthropicProvidersSection({
 			</Stack>
 		</Paper>
 	);
-}
+});

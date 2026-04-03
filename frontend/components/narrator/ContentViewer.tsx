@@ -29,6 +29,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { DiffView } from "./DiffView";
@@ -536,12 +537,12 @@ export const ContentViewer = memo(
 							)))}
 				</Box>
 
-				{/* Swipe-reveal action menu — fixed, hugging the content's right edge */}
+				{/* Swipe-reveal action menu — portal to body, position:fixed to bypass containing blocks */}
 				{(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
 					(() => {
 						const menuEl = swipe.swipeMenuRef.current;
 						const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight ?? 200);
-						return (
+						return createPortal(
 							<Box
 								ref={swipe.swipeMenuRef}
 								style={{
@@ -666,7 +667,8 @@ export const ContentViewer = memo(
 										)}
 									</Menu.Dropdown>
 								</Menu>
-							</Box>
+							</Box>,
+							document.body,
 						);
 					})()}
 

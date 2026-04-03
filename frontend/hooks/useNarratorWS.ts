@@ -95,6 +95,8 @@ interface NarratorWSCallbacks {
 		maxRetries?: number;
 		delayMs?: number;
 	}) => void;
+	onInterruptChecking?: () => void;
+	onInterruptCheckDone?: () => void;
 	onModelChanged?: (model: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
@@ -379,6 +381,12 @@ export function useNarratorWS(
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
 						});
+						break;
+					case "interrupt_checking":
+						callbacksRef.current.onInterruptChecking?.();
+						break;
+					case "interrupt_check_done":
+						callbacksRef.current.onInterruptCheckDone?.();
 						break;
 					case "model_changed":
 					case "model_switched":

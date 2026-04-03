@@ -5,6 +5,7 @@
 	"reasoning": "Reasoning",
 	"planning": "Planning",
 	"compacting": "Compacting...",
+	"checkingInterrupt": "Checking output...",
 	"viewingNow": "Viewing now",
 	"compacted": "Context compacted",
 	"compactSummaryTitle": "Compact Summary",

@@ -27,7 +27,7 @@ import {
 	IconRefresh,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -118,6 +118,7 @@ function RoutinesPage() {
 					<Tabs.Tab value="project-skills">{t("tabProjectSkills")}</Tabs.Tab>
 					<Tabs.Tab value="custom-subagents">{t("tabCustomSubagents")}</Tabs.Tab>
 					<Tabs.Tab value="global-prompt">{t("tabGlobalPrompt")}</Tabs.Tab>
+					<Tabs.Tab value="default-system-prompt">{t("tabDefaultSystemPrompt")}</Tabs.Tab>
 					<Tabs.Tab value="mcp-tools">{t("tabMcpTools")}</Tabs.Tab>
 				</Tabs.List>
 
@@ -141,6 +142,9 @@ function RoutinesPage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="global-prompt">
 					<GlobalPromptTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="default-system-prompt">
+					<DefaultSystemPromptTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="mcp-tools">
 					<McpToolsTab />
@@ -625,6 +629,94 @@ function GlobalPromptTab() {
 						{t("globalPromptSave")}
 					</Button>
 				)}
+			</Group>
+		</Stack>
+	);
+}
+
+// === Tab: Default System Prompt ===
+
+function DefaultSystemPromptTab() {
+	const { t } = useTranslation("routines");
+	const { data: settings, isLoading } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+	const qc = useQueryClient();
+	const updateMutation = useMutation({
+		mutationFn: api.updateSettings,
+		onSuccess: (data) => {
+			qc.setQueryData(["settings"], data);
+		},
+	});
+
+	const [content, setContent] = useState("");
+	const [dirty, setDirty] = useState(false);
+	const [saved, setSaved] = useState(false);
+
+	// Sync fetched content into local state
+	useEffect(() => {
+		const val = settings?.agent?.defaultSystemPrompt ?? "";
+		if (!dirty) {
+			setContent(val);
+		}
+	}, [settings?.agent?.defaultSystemPrompt, dirty]);
+
+	const handleChange = useCallback((val: string) => {
+		setContent(val);
+		setDirty(true);
+		setSaved(false);
+	}, []);
+
+	const handleSave = useCallback(() => {
+		updateMutation.mutate(
+			{
+				agent: {
+					defaultSystemPrompt: content || undefined,
+				},
+			},
+			{
+				onSuccess: () => {
+					setDirty(false);
+					setSaved(true);
+				},
+			},
+		);
+	}, [content, updateMutation]);
+
+	if (isLoading) {
+		return (
+			<Text size="sm" c="dimmed">
+				Loading...
+			</Text>
+		);
+	}
+
+	return (
+		<Stack>
+			<Text size="sm" c="dimmed">
+				{t("defaultSystemPromptDesc")}
+			</Text>
+
+			<Textarea
+				placeholder={t("defaultSystemPromptPlaceholder")}
+				value={content}
+				onChange={(e) => handleChange(e.currentTarget.value)}
+				autosize
+				minRows={10}
+				maxRows={30}
+				styles={{ input: { fontFamily: "monospace", fontSize: 13 } }}
+			/>
+
+			<Group justify="flex-end" gap="xs">
+				{saved && (
+					<Text size="xs" c="green">
+						{t("defaultSystemPromptSaved")}
+					</Text>
+				)}
+				<Button size="xs" onClick={handleSave} loading={updateMutation.isPending} disabled={!dirty}>
+					{t("defaultSystemPromptSave")}
+				</Button>
 			</Group>
 		</Stack>
 	);

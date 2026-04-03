@@ -57,6 +57,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
@@ -2919,7 +2920,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		(() => {
 			const menuEl = swipe.swipeMenuRef.current;
 			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
-			return (
+			return createPortal(
 				<Box
 					ref={swipe.swipeMenuRef}
 					style={{
@@ -2937,7 +2938,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 							{menuItemsNode}
 						</Menu.Dropdown>
 					</Menu>
-				</Box>
+				</Box>,
+				document.body,
 			);
 		})();
 

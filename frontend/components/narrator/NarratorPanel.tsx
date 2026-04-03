@@ -132,7 +132,7 @@ import {
 import { buildStreamingMsg } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
+import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesPage,
@@ -1201,6 +1201,7 @@ export function NarratorPanel({
 		queuedMessages,
 		setQueuedMessages,
 		isCompacting,
+		isCheckingInterrupt,
 		contextPercent,
 		promptTokens,
 		contextWindow,
@@ -1222,6 +1223,16 @@ export function NarratorPanel({
 	} = wsState;
 	setContextPercentRef.current = wsState.setContextPercent;
 	setUnreadCountRef.current = setUnreadCount;
+
+	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
+	// recreating on every permission state change, which would break memo on
+	// MessageBubble and cascade re-renders through all reasoning summaries.
+	const renderPermCbRef = useRef(renderPermCb);
+	renderPermCbRef.current = renderPermCb;
+	const resolvePermForRender = useCallback((tc: import("./ToolCallCard").ToolCallData) => {
+		const p = renderPermCbRef.current;
+		return resolvePendingPerm(tc, p.pendingPermission, p.pendingPermsMap, p.overseerReviewMap);
+	}, []);
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
@@ -2154,6 +2165,7 @@ export function NarratorPanel({
 				hasChapter,
 				onViewSubagentSession,
 				pageStreamingMsg,
+				resolvePermForRender,
 			);
 
 			// Only cache when there's no streaming message (streaming changes every frame)
@@ -2210,6 +2222,7 @@ export function NarratorPanel({
 		hasChapter,
 		onViewSubagentSession,
 		streamingMsg,
+		resolvePermForRender,
 	]);
 
 	// All streaming content is now handled by segmentMessages via streamingMsg.
@@ -3798,13 +3811,15 @@ export function NarratorPanel({
 												})
 										: isCompacting
 											? t("compacting")
-											: activeTodo
-												? activeTodo.content || activeTodo.activeForm
-												: isWaiting
-													? t("status_waiting")
-													: isPlanning
-														? t("planning")
-														: t("thinking")}
+											: isCheckingInterrupt
+												? t("checkingInterrupt")
+												: activeTodo
+													? activeTodo.content || activeTodo.activeForm
+													: isWaiting
+														? t("status_waiting")
+														: isPlanning
+															? t("planning")
+															: t("thinking")}
 								</Text>
 									<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 									</Text>

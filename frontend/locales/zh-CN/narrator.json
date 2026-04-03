@@ -5,6 +5,7 @@
 	"reasoning": "推理",
 	"planning": "计划中",
 	"compacting": "正在压缩...",
+	"checkingInterrupt": "检查输出完整性...",
 	"viewingNow": "正在查看",
 	"compacted": "上下文已压缩",
 	"compactSummaryTitle": "压缩摘要",

@@ -340,6 +340,7 @@ export function renderTreeMessages(
 	hasChapter?: boolean,
 	onViewSubagentSession?: (narratorId: string) => void,
 	streamingMsg?: NarratorMsg | null,
+	resolvePerm?: (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>,
 ): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[]; segments: RenderSegment[] } {
 	const segments = segmentMessages(messages, {
 		pruneBoundaryMessageId,
@@ -391,13 +392,15 @@ export function renderTreeMessages(
 					narratorId={narratorId}
 					message={displayMsg}
 					onForkFromMessage={onForkFromMessage}
-					resolvePerm={(tc) =>
-						resolvePendingPerm(
-							tc,
-							permCb.pendingPermission,
-							permCb.pendingPermsMap,
-							permCb.overseerReviewMap,
-						)
+					resolvePerm={
+						resolvePerm ??
+						((tc) =>
+							resolvePendingPerm(
+								tc,
+								permCb.pendingPermission,
+								permCb.pendingPermsMap,
+								permCb.overseerReviewMap,
+							))
 					}
 					onPermissionDecision={permCb.onPermissionDecision}
 					onQuestionSubmit={permCb.onQuestionSubmit}

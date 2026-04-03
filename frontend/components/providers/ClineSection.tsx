@@ -33,7 +33,7 @@ import {
 	IconStarFilled,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -41,7 +41,7 @@ import { InlineCustomModels } from "./InlineCustomModels";
 
 interface ClineSectionProps {
 	settings: Record<string, unknown> | undefined;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
@@ -50,7 +50,7 @@ interface ClineSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
-export function ClineSection({
+export const ClineSection = React.memo(function ClineSection({
 	settings: settingsData,
 	hiddenModels,
 	onToggleHidden,
@@ -531,7 +531,7 @@ export function ClineSection({
 							)}
 							{enabledModelsMeta.map((m) => {
 								const prefixed = `${firstPrefix}:${m.id}`;
-								const isHidden = hiddenModels.includes(prefixed);
+								const isHidden = hiddenModels.has(prefixed);
 								return (
 									<Group
 										key={m.id}
@@ -606,4 +606,4 @@ export function ClineSection({
 			</Stack>
 		</Paper>
 	);
-}
+});

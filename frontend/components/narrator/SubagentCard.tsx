@@ -22,6 +22,7 @@ import {
 } from "@tabler/icons-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
@@ -697,7 +698,7 @@ export const SubagentCard = memo(
 			(() => {
 				const menuEl = swipe.swipeMenuRef.current;
 				const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
-				return (
+				return createPortal(
 					<Box
 						ref={swipe.swipeMenuRef}
 						style={{
@@ -715,7 +716,8 @@ export const SubagentCard = memo(
 								{cardMenuItems}
 							</Menu.Dropdown>
 						</Menu>
-					</Box>
+					</Box>,
+					document.body,
 				);
 			})();
 

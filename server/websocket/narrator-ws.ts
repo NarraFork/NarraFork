@@ -218,6 +218,8 @@ export type NarratorServerMessage =
 			delayMs?: number;
 	  }
 	| { type: "context_length_exceeded"; narratorId: string }
+	| { type: "interrupt_checking"; narratorId: string }
+	| { type: "interrupt_check_done"; narratorId: string }
 	| { type: "full_reload"; narratorId: string }
 	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }
 	| {

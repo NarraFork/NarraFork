@@ -1513,6 +1513,7 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// Assistant messages — wrap in context provider so all ContentViewers
 	// (including those inside ToolCallCard) can access message-level actions
+	const isStreaming = message.id === "__streaming__";
 	return (
 		<MessageContextMenuCtx.Provider value={ctxActions}>
 			<Stack gap={4} style={{ minWidth: 0 }}>
@@ -1522,7 +1523,6 @@ export const MessageBubble = memo(function MessageBubble({
 					const realIndex = message._blockOriginalIndices?.[i] ?? i;
 					if (block.type === "text") {
 						if (!block.text?.trim()) return null;
-						const isStreaming = message.id === "__streaming__";
 						return (
 							<ContentViewer
 								key={key}
@@ -1571,6 +1571,7 @@ export const MessageBubble = memo(function MessageBubble({
 											<ReasoningSummary
 												text={reasoningText}
 												translatedText={block.translatedText}
+												isStreaming={isStreaming}
 											/>
 										</Group>
 									</Paper>

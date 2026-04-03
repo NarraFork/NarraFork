@@ -11,7 +11,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconEye, IconEyeOff, IconPlayerPlay, IconTrash } from "@tabler/icons-react";
-import { useCallback } from "react";
+import React, { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
 interface CustomModelsSectionProps {
@@ -19,7 +19,7 @@ interface CustomModelsSectionProps {
 	onCustomModelsChange: (
 		models: Array<{ value: string; label: string; provider?: string }>,
 	) => void;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	prefixOptions: Array<{ value: string; label: string }>;
 	modelContextWindows: Record<string, number>;
@@ -31,7 +31,7 @@ interface CustomModelsSectionProps {
 	orphanModels?: Array<{ value: string; label: string; provider?: string }>;
 }
 
-export function CustomModelsSection({
+export const CustomModelsSection = React.memo(function CustomModelsSection({
 	customModels,
 	onCustomModelsChange,
 	hiddenModels,
@@ -62,7 +62,7 @@ export function CustomModelsSection({
 					</Text>
 				</div>
 				{modelsToShow.map((m) => {
-					const isHidden = hiddenModels.includes(m.value);
+					const isHidden = hiddenModels.has(m.value);
 					return (
 						<Group
 							key={m.value}
@@ -108,4 +108,4 @@ export function CustomModelsSection({
 			</Stack>
 		</Paper>
 	);
-}
+});

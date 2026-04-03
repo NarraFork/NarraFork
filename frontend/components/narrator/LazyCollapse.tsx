@@ -1,5 +1,5 @@
 import { Collapse } from "@mantine/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface LazyCollapseProps {
 	in: boolean;
@@ -18,9 +18,21 @@ interface LazyCollapseProps {
 export function LazyCollapse({ in: opened, children }: LazyCollapseProps) {
 	const [mounted, setMounted] = useState(opened);
 	const [reveal, setReveal] = useState(opened);
+	const didInitialize = useRef(false);
 
 	// When opened goes true: mount first, reveal next frame
 	useEffect(() => {
+		// Skip effect on initial mount when opened=true: useState(opened) already
+		// set mounted=true and reveal=true, so no state changes are needed.
+		// Without this guard, requestAnimationFrame would schedule a redundant
+		// setReveal(true) for every instance. When many LazyCollapse mount at once
+		// (e.g. reasoning blocks), the accumulated raf callbacks can trigger React's
+		// nested-update counter (limit 50) during the commit phase.
+		if (!didInitialize.current) {
+			didInitialize.current = true;
+			if (opened && mounted) return;
+		}
+
 		if (opened && !mounted) {
 			setMounted(true);
 		}

@@ -10,7 +10,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconEye, IconEyeOff, IconPlayerPlay, IconPlus, IconTrash } from "@tabler/icons-react";
-import { useCallback, useState } from "react";
+import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { modelValue } from "../../lib/constants";
 
@@ -25,14 +25,14 @@ interface InlineCustomModelsProps {
 	/** All custom models (component filters by prefix internally) */
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 }
 
-export function InlineCustomModels({
+export const InlineCustomModels = React.memo(function InlineCustomModels({
 	prefix,
 	customModels,
 	onCustomModelsChange,
@@ -84,7 +84,7 @@ export function InlineCustomModels({
 				labelPosition="left"
 			/>
 			{myModels.map((m) => {
-				const isHidden = hiddenModels.includes(m.value);
+				const isHidden = hiddenModels.has(m.value);
 				return (
 					<Group key={m.value} gap="xs" wrap="wrap" style={isHidden ? { opacity: 0.5 } : undefined}>
 						<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
@@ -144,4 +144,4 @@ export function InlineCustomModels({
 			</Group>
 		</Stack>
 	);
-}
+});

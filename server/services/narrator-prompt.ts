@@ -27,6 +27,8 @@ export interface BuildPromptOptions {
 	planFileId?: string;
 	/** Whether to force language instruction even for English locale */
 	replyInUserLanguage?: boolean;
+	/** Global default system prompt (used when basePrompt is null) */
+	defaultSystemPrompt?: string | null;
 }
 
 export interface BuildPromptResult {
@@ -53,9 +55,11 @@ export async function buildEffectiveSystemPrompt(
 		planMode,
 		planFileId,
 		replyInUserLanguage,
+		defaultSystemPrompt,
 	} = options;
 
-	let prompt = basePrompt;
+	// Fall back to global default system prompt when basePrompt is null
+	let prompt = basePrompt ?? defaultSystemPrompt ?? null;
 	let usedCompactSummary = false;
 
 	// 1. Inject compact summary if available

@@ -27,7 +27,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
@@ -35,11 +35,15 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import type { OpenAIProviderState } from "./types";
 
+type ProvidersUpdater =
+	| OpenAIProviderState[]
+	| ((prev: OpenAIProviderState[]) => OpenAIProviderState[]);
+
 interface OpenAIProvidersSectionProps {
 	providers: OpenAIProviderState[];
-	onProvidersChange: (providers: OpenAIProviderState[]) => void;
+	onProvidersChange: (updater: ProvidersUpdater) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	onBatchToggleHidden: (modelValues: string[], hidden: boolean) => void;
 	modelContextWindows: Record<string, number>;
@@ -51,7 +55,7 @@ interface OpenAIProvidersSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
-export function OpenAIProvidersSection({
+export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection({
 	providers,
 	onProvidersChange,
 	providerModelsMap,
@@ -74,8 +78,8 @@ export function OpenAIProvidersSection({
 
 	const handleAddProvider = useCallback(() => {
 		const id = Math.random().toString(36).slice(2, 10);
-		onProvidersChange([
-			...providers,
+		onProvidersChange((prev) => [
+			...prev,
 			{
 				id,
 				name: "",
@@ -88,20 +92,20 @@ export function OpenAIProvidersSection({
 			},
 		]);
 		setExpandedProviders((prev) => new Set(prev).add(id));
-	}, [providers, onProvidersChange]);
+	}, [onProvidersChange]);
 
 	const handleRemoveProvider = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.filter((p) => p.id !== id));
+			onProvidersChange((prev) => prev.filter((p) => p.id !== id));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const updateProvider = useCallback(
 		(id: string, field: keyof OpenAIProviderState, value: string) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
+			onProvidersChange((prev) => prev.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const toggleProviderExpanded = useCallback((id: string) => {
@@ -115,9 +119,11 @@ export function OpenAIProvidersSection({
 
 	const toggleProviderDisabled = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)));
+			onProvidersChange((prev) =>
+				prev.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)),
+			);
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const handleRefreshProviderModels = useCallback(
@@ -319,7 +325,7 @@ export function OpenAIProvidersSection({
 												</Group>
 												{pModels.length > 0 &&
 													(() => {
-														const allHidden = pModels.every((m) => hiddenModels.includes(m.value));
+														const allHidden = pModels.every((m) => hiddenModels.has(m.value));
 														return (
 															<Stack gap="xs" mt="xs">
 																<Group gap="xs" justify="flex-end">
@@ -341,7 +347,7 @@ export function OpenAIProvidersSection({
 																	</Tooltip>
 																</Group>
 																{pModels.map((m) => {
-																	const isHidden = hiddenModels.includes(m.value);
+																	const isHidden = hiddenModels.has(m.value);
 																	return (
 																		<Group
 																			key={m.value}
@@ -421,4 +427,4 @@ export function OpenAIProvidersSection({
 			</Stack>
 		</Paper>
 	);
-}
+});

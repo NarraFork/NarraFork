@@ -2074,6 +2074,7 @@ async function buildSystemPrompt(
 	replyInUserLanguage: boolean,
 	planMode = false,
 	planFileId?: string,
+	defaultSystemPrompt?: string | null,
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
@@ -2084,6 +2085,7 @@ async function buildSystemPrompt(
 		planMode,
 		planFileId,
 		replyInUserLanguage,
+		defaultSystemPrompt,
 	});
 }
 
@@ -2157,6 +2159,7 @@ async function createNarrator(
 		replyInUserLanguage,
 		isPlanMode,
 		planFileId,
+		settings.agent.defaultSystemPrompt,
 	);
 
 	// Resolve skill root for the Skill tool (projectGitPath or git root from cwd)
@@ -2706,6 +2709,7 @@ async function runAgentLoop(
 						active._replyInUserLanguage ?? false,
 						freshNarrator.permissionMode === "plan",
 						active._planFileId,
+						settings.agent.defaultSystemPrompt,
 					);
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
