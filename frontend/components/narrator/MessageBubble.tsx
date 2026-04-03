@@ -739,8 +739,16 @@ export const ReasoningSummary = memo(function ReasoningSummary({
 				setIsOverflow((prev) => (prev ? false : prev));
 				return;
 			}
-			const overflowing = el.scrollWidth - el.clientWidth > 1;
-			setIsOverflow((prev) => (prev === overflowing ? prev : overflowing));
+			const gap = el.scrollWidth - el.clientWidth;
+			// Hysteresis: once overflow is detected, require the gap to shrink
+			// below 0 before resetting.  This prevents the expand/collapse chevron
+			// from flickering when minor layout shifts (scrollbar appearance, sibling
+			// animations) cause the measurement to oscillate around the threshold.
+			const overflowing = gap > 3;
+			setIsOverflow((prev) => {
+				if (prev && gap > 0) return prev; // hold overflow while any gap remains
+				return prev === overflowing ? prev : overflowing;
+			});
 		};
 
 		const lineEl = lineRef.current;

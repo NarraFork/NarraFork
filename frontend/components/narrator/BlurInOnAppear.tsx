@@ -40,11 +40,13 @@ export function BlurInOnAppearProvider({
 }) {
 	const seenRef = useRef<Set<string>>(new Set());
 	const pendingRef = useRef<Map<string, symbol>>(new Map());
+	const completedRef = useRef<Set<string>>(new Set());
 
 	useEffect(() => {
 		void scopeKey;
 		seenRef.current.clear();
 		pendingRef.current.clear();
+		completedRef.current.clear();
 	}, [scopeKey]);
 
 	useEffect(() => {
@@ -52,6 +54,7 @@ export function BlurInOnAppearProvider({
 		for (const animationId of seedIds) {
 			if (!animationId) continue;
 			seenRef.current.add(animationId);
+			completedRef.current.add(animationId);
 			pendingRef.current.delete(animationId);
 		}
 	}, [scopeKey, seedIds]);
@@ -59,7 +62,22 @@ export function BlurInOnAppearProvider({
 	const registerAppearance = useCallback(
 		(animationId: string): BlurInRegistration => {
 			if (!animationId) return NOOP_REGISTRATION;
+
+			// Items that already completed their animation should never
+			// re-animate, regardless of suppress toggles.  This prevents
+			// the chevron flicker caused by suppressBlurIn changes
+			// re-triggering CSS animations that momentarily affect layout.
+			if (completedRef.current.has(animationId)) return NOOP_REGISTRATION;
+
 			if (seenRef.current.has(animationId) || pendingRef.current.has(animationId)) {
+				return NOOP_REGISTRATION;
+			}
+
+			if (suppress) {
+				// Suppressing: register as seen so a future non-suppress
+				// call won't animate either, but don't start an animation.
+				seenRef.current.add(animationId);
+				completedRef.current.add(animationId);
 				return NOOP_REGISTRATION;
 			}
 
@@ -74,12 +92,15 @@ export function BlurInOnAppearProvider({
 			});
 
 			return {
-				animate: !suppress,
+				animate: true,
 				cleanup: () => {
 					cancelled = true;
 					if (pendingRef.current.get(animationId) === token) {
 						pendingRef.current.delete(animationId);
 					}
+					// Mark as completed on cleanup (unmount or re-render)
+					// so this animation ID never re-triggers.
+					completedRef.current.add(animationId);
 				},
 			};
 		},
