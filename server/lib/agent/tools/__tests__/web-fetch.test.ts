@@ -164,6 +164,12 @@ describe("WebFetch — parameter handling", () => {
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("Unknown mode");
 	});
+
+	test("defaults to readability mode when mode is omitted", async () => {
+		const result = await webFetchTool.execute({ url: "https://example.com" }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(result.output.length).toBeGreaterThan(0);
+	}, 30_000);
 });
 
 // ============================================================
@@ -271,7 +277,7 @@ describe("WebFetch — tool definition", () => {
 		const schema = webFetchTool.rawJsonSchema;
 		expect(schema).toBeDefined();
 		expect(schema?.type).toBe("object");
-		expect(schema?.required).toEqual(["url", "mode"]);
+		expect(schema?.required).toEqual(["url"]);
 		// biome-ignore lint/suspicious/noExplicitAny: test assertion
 		const props = schema?.properties as Record<string, any>;
 		expect(props.url).toBeDefined();
@@ -295,9 +301,12 @@ describe("WebFetch — tool definition", () => {
 		expect(result.success).toBe(false);
 	});
 
-	test("Zod schema rejects missing mode", () => {
+	test("Zod schema defaults mode to readability when missing", () => {
 		const result = webFetchTool.parameters.safeParse({ url: "https://example.com" });
-		expect(result.success).toBe(false);
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect((result.data as { mode: string }).mode).toBe("readability");
+		}
 	});
 
 	test("Zod schema rejects invalid mode", () => {

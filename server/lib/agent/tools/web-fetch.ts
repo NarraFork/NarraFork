@@ -21,7 +21,7 @@ export const webFetchTool: ToolDefinition = {
 		"This works well for static pages but won't render JavaScript-heavy SPAs.\n\n" +
 		"Parameters:\n" +
 		"- url (required): The URL to fetch\n" +
-		"- mode (required): One of readability, screenshot, dom, smart\n" +
+		"- mode (optional): One of readability, screenshot, dom, smart. Defaults to readability.\n" +
 		"- selector (optional): CSS selector to extract specific elements (dom mode only)\n" +
 		"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)\n" +
 		"- purpose (optional): What information you are looking for (smart mode only). When provided, the AI summarizer will prioritize extracting content relevant to this goal instead of producing a generic summary.",
@@ -53,20 +53,20 @@ export const webFetchTool: ToolDefinition = {
 				type: "string",
 			},
 		},
-		required: ["url", "mode"],
+		required: ["url"],
 		additionalProperties: false,
 	},
 	parameters: z.object({
 		url: z.string().describe("The URL to fetch"),
-		mode: z.enum(MODES).describe("Extraction mode"),
+		mode: z.enum(MODES).optional().default("readability").describe("Extraction mode"),
 		selector: z.string().optional().describe("CSS selector (dom mode)"),
 		max_length: z.number().optional().describe("Max output chars"),
 		purpose: z.string().optional().describe("What to look for (smart mode)"),
 	}),
 	async execute(args): Promise<ToolResult> {
-		const { url, mode, selector, max_length, purpose } = args as {
+		const { url, mode = "readability", selector, max_length, purpose } = args as {
 			url: string;
-			mode: (typeof MODES)[number];
+			mode?: (typeof MODES)[number];
 			selector?: string;
 			max_length?: number;
 			purpose?: string;
