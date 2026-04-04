@@ -1,0 +1,6 @@
+{
+  "version": "0.1.7",
+  "date": "2026-03-09",
+  "en": "## Bug Fixes\n\n- Fix streaming message block keys shifting during AI response, eliminating flickering ToolCallCards\n- Fix NarratorPanel double-render on every streaming frame, improving stream rendering performance\n- Fix CreateNarratorModal expanding infinitely when there are many favorites; now scrollable with max height\n- Guard against model-hallucinated WebSearch calls for Codex and official Anthropic providers that use native server-side search\n\n## Improvements\n\n- Stable React keys for streaming blocks (reasoning, text, tool_use) prevent unnecessary component remounting\n- Tool-use block reference caching across streaming frames reduces redundant re-renders\n- Agent and WebFetch tool descriptions now adapt for providers with native web search",
+  "zh-CN": "## 修复\n\n- 修复 AI 响应流式输出过程中 block key 漂移导致 ToolCallCard 闪烁的问题\n- 修复 NarratorPanel 每个流式帧重复渲染，提升流式渲染性能\n- 修复创建叙述者弹窗在收藏较多时无限扩展，现在限制最大高度并支持滚动\n- 防止 Codex 和官方 Anthropic 提供商的模型幻觉调用 WebSearch 工具（这些提供商使用原生服务端搜索）\n\n## 改进\n\n- 流式 block（reasoning、text、tool_use）使用稳定 React key，避免组件不必要地卸载重建\n- tool_use block 引用跨流式帧缓存，减少冗余重渲染\n- Agent 和 WebFetch 工具描述会根据是否使用原生搜索自动适配"
+}
