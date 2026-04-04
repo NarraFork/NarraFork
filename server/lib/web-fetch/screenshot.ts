@@ -1,5 +1,5 @@
 // Screenshot mode — capture page as PNG image.
-// Requires Playwright + Chrome. No HTTP fallback possible.
+// Requires Puppeteer + Chrome. No HTTP fallback possible.
 
 import { tryBrowserPage } from "./http-fetch";
 
@@ -11,27 +11,25 @@ export async function fetchScreenshot(
 	if (!page) {
 		throw new Error(
 			"Screenshot mode requires a browser (Chrome/Chromium). " +
-				"Install Chrome or run `bunx playwright install chromium`, then try again.",
+				"Install Chrome or run `bunx puppeteer browsers install chrome`, then try again.",
 		);
 	}
 
 	try {
-		const viewport = page.viewportSize();
+		const viewport = page.viewport();
 		const width = viewport?.width ?? 1280;
 		const height = viewport?.height ?? 900;
 
 		const buffer = await page.screenshot({
 			type: "png",
 			fullPage: false,
+			encoding: "binary",
 		});
 
-		const base64 = buffer.toString("base64");
+		const base64 = Buffer.from(buffer as Uint8Array).toString("base64");
 
 		return { base64, width, height };
 	} finally {
-		await page
-			.context()
-			.close()
-			.catch(() => {});
+		await page.close().catch(() => {});
 	}
 }

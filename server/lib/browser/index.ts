@@ -1,4 +1,4 @@
-// Browser module — Playwright-based browser pool, session management, and actions.
+// Browser module — browser pool, session management, and actions.
 
 export * as actions from "./actions";
 export type { FetchPageOptions } from "./pool";

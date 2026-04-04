@@ -1,11 +1,10 @@
-// Playwright browser pool — singleton, lazy-initialized.
-// Replaces the old Puppeteer-based browser.ts with Playwright equivalents.
-// Discovers Chrome via env var → Playwright cache → system paths.
+// Puppeteer browser pool — singleton, lazy-initialized.
+// Discovers Chrome via env var → Puppeteer cache → system paths.
 
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Browser, BrowserContext, Page } from "playwright-core";
+import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { logger } from "../logger";
 import { getWebFetchProxy } from "../web-fetch/proxy";
 
@@ -13,8 +12,9 @@ let browser: Browser | null = null;
 let launching: Promise<Browser> | null = null;
 
 const PAGE_TIMEOUT_MS = 30_000;
-const DEFAULT_VIEWPORT = { width: 1280, height: 900 };
-const USER_AGENT =
+const LAUNCH_TIMEOUT_MS = 30_000;
+export const DEFAULT_VIEWPORT = { width: 1280, height: 900 };
+export const USER_AGENT =
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /** Media resource types to block when we only need text content. */
@@ -42,14 +42,13 @@ function buildLaunchArgs(): string[] {
  * Find a Chrome/Chromium executable.
  *
  * Search order:
- * 1. PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH or PUPPETEER_EXECUTABLE_PATH env var
- * 2. Playwright cache: ~/.cache/ms-playwright/chromium-{version}/
- * 3. Puppeteer cache (legacy): ~/.cache/puppeteer/chrome/
- * 4. System Chrome (google-chrome, chromium, etc.)
+ * 1. PUPPETEER_EXECUTABLE_PATH env var
+ * 2. Puppeteer cache: ~/.cache/puppeteer/chrome/
+ * 3. System Chrome (google-chrome, chromium, etc.)
  */
 function findChromePath(): string | undefined {
 	// 1. Explicit env var
-	for (const envKey of ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "PUPPETEER_EXECUTABLE_PATH"]) {
+	for (const envKey of ["PUPPETEER_EXECUTABLE_PATH"]) {
 		const envPath = process.env[envKey];
 		if (envPath && existsSync(envPath)) {
 			logger.info("Using Chrome from env var", { key: envKey, path: envPath });
@@ -57,18 +56,13 @@ function findChromePath(): string | undefined {
 		}
 	}
 
-	// 2. Scan Playwright cache
-	const pwCacheDir = join(homedir(), ".cache", "ms-playwright");
-	const pwPath = scanPlaywrightCache(pwCacheDir);
-	if (pwPath) return pwPath;
-
-	// 3. Scan Puppeteer cache (legacy support)
+	// 2. Scan Puppeteer cache
 	const puppeteerCacheDir =
 		process.env.PUPPETEER_CACHE_DIR ?? join(homedir(), ".cache", "puppeteer");
 	const puppeteerPath = scanPuppeteerCache(puppeteerCacheDir);
 	if (puppeteerPath) return puppeteerPath;
 
-	// 4. System Chrome on common paths
+	// 3. System Chrome on common paths
 	const systemPaths = getSystemChromePaths();
 	for (const p of systemPaths) {
 		if (existsSync(p)) {
@@ -80,37 +74,7 @@ function findChromePath(): string | undefined {
 	return undefined;
 }
 
-/** Scan Playwright's cache directory for a Chromium executable. */
-function scanPlaywrightCache(cacheDir: string): string | undefined {
-	if (!existsSync(cacheDir)) return undefined;
-	try {
-		const entries = readdirSync(cacheDir)
-			.filter((e) => e.startsWith("chromium"))
-			.sort()
-			.reverse(); // newest first
-		for (const entry of entries) {
-			const candidates = [
-				// Linux
-				join(cacheDir, entry, "chrome-linux", "chrome"),
-				// macOS
-				join(cacheDir, entry, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
-				// Windows
-				join(cacheDir, entry, "chrome-win", "chrome.exe"),
-			];
-			for (const c of candidates) {
-				if (existsSync(c)) {
-					logger.info("Found Chromium in Playwright cache", { path: c });
-					return c;
-				}
-			}
-		}
-	} catch {
-		// Not readable
-	}
-	return undefined;
-}
-
-/** Scan Puppeteer's cache directory for a Chrome executable (legacy). */
+/** Scan Puppeteer's cache directory for a Chrome executable. */
 function scanPuppeteerCache(cacheDir: string): string | undefined {
 	const chromeDir = join(cacheDir, "chrome");
 	if (!existsSync(chromeDir)) return undefined;
@@ -177,7 +141,6 @@ function getSystemChromePaths(): string[] {
 				"/Applications/Chromium.app/Contents/MacOS/Chromium",
 			];
 		default:
-			// Linux
 			return [
 				"/usr/bin/google-chrome",
 				"/usr/bin/google-chrome-stable",
@@ -189,19 +152,21 @@ function getSystemChromePaths(): string[] {
 }
 
 async function launchBrowser(): Promise<Browser> {
-	const { chromium } = await import("playwright-core");
+	const puppeteer = await import("puppeteer-core");
 
 	const executablePath = findChromePath();
 	const launchArgs = buildLaunchArgs();
 
 	if (executablePath) {
 		try {
-			const b = await chromium.launch({
+			const b = await puppeteer.default.launch({
 				headless: true,
 				executablePath,
 				args: launchArgs,
+				timeout: LAUNCH_TIMEOUT_MS,
 			});
-			logger.info("Playwright browser launched", {
+			logger.info("Puppeteer browser launched", {
+				pid: b.process()?.pid,
 				chromePath: executablePath,
 			});
 			return b;
@@ -209,23 +174,24 @@ async function launchBrowser(): Promise<Browser> {
 			const msg = err instanceof Error ? err.message : String(err);
 			logger.warn("Chrome found but launch failed, trying default", {
 				chromePath: executablePath,
-				error: msg.slice(0, 200),
+				error: msg.slice(0, 500),
 			});
 			// Fall through to default launch
 		}
 	}
 
-	// Default launch (Playwright's own detection)
-	const b = await chromium.launch({
+	// Default Puppeteer launch (uses its own detection)
+	const b = await puppeteer.default.launch({
 		headless: true,
 		args: launchArgs,
+		timeout: LAUNCH_TIMEOUT_MS,
 	});
-	logger.info("Playwright browser launched (default)");
+	logger.info("Puppeteer browser launched (default)", { pid: b.process()?.pid });
 	return b;
 }
 
 export async function getBrowser(): Promise<Browser> {
-	if (browser?.isConnected()) return browser;
+	if (browser?.connected) return browser;
 	// Prevent concurrent launches
 	if (launching) return launching;
 	launching = launchBrowser()
@@ -247,33 +213,33 @@ export interface FetchPageOptions {
 	/** Navigation timeout in ms (default: 30000). */
 	timeout?: number;
 	/** Wait condition (default: "domcontentloaded"). */
-	waitUntil?: "load" | "domcontentloaded" | "networkidle";
+	waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 }
 
 /**
  * Open a new page, navigate to `url`, and return the page.
- * Caller is responsible for calling `page.context().close()`.
+ * Caller is responsible for calling `page.close()`.
  */
 export async function fetchPage(url: string, options?: FetchPageOptions): Promise<Page> {
 	const b = await getBrowser();
-	const context = await b.newContext({
-		viewport: DEFAULT_VIEWPORT,
-		userAgent: USER_AGENT,
-	});
-
-	const page = await context.newPage();
-	const timeout = options?.timeout ?? PAGE_TIMEOUT_MS;
-	page.setDefaultTimeout(timeout);
-	page.setDefaultNavigationTimeout(timeout);
+	const page = await b.newPage();
 
 	try {
+		await page.setViewport(DEFAULT_VIEWPORT);
+		await page.setUserAgent(USER_AGENT);
+
+		const timeout = options?.timeout ?? PAGE_TIMEOUT_MS;
+		page.setDefaultNavigationTimeout(timeout);
+		page.setDefaultTimeout(timeout);
+
 		if (options?.blockMedia) {
-			await page.route("**/*", (route) => {
-				const type = route.request().resourceType();
-				if (BLOCKED_RESOURCE_TYPES.has(type)) {
-					return route.abort();
+			await page.setRequestInterception(true);
+			page.on("request", (req) => {
+				if (BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
+					void req.abort();
+				} else {
+					void req.continue();
 				}
-				return route.continue();
 			});
 		}
 
@@ -284,27 +250,25 @@ export async function fetchPage(url: string, options?: FetchPageOptions): Promis
 
 		return page;
 	} catch (err) {
-		await context.close().catch(() => {});
+		await page.close().catch(() => {});
 		throw err;
 	}
 }
 
 /**
- * Create a new browser context with default settings.
+ * Create a new incognito browser context.
  * Used by BrowserSession for persistent multi-page sessions.
  */
 export async function createContext(): Promise<BrowserContext> {
 	const b = await getBrowser();
-	return b.newContext({
-		viewport: DEFAULT_VIEWPORT,
-		userAgent: USER_AGENT,
-	});
+	const ctx = await b.createBrowserContext();
+	return ctx;
 }
 
 /** Check whether the singleton browser is running and connected. */
 export function getBrowserStatus(): { running: boolean; connected: boolean } {
 	if (!browser) return { running: false, connected: false };
-	return { running: true, connected: browser.isConnected() };
+	return { running: true, connected: browser.connected };
 }
 
 /** Gracefully close the browser (called on process exit). */
@@ -314,7 +278,7 @@ export async function closeBrowser(): Promise<void> {
 		browser = null;
 		try {
 			await b.close();
-			logger.info("Playwright browser closed");
+			logger.info("Puppeteer browser closed");
 		} catch {
 			// Already closed or crashed — ignore
 		}

@@ -128,6 +128,14 @@ type AnthropicContentPart =
 	| { type: "thinking"; thinking: string; signature: string }
 	| { type: "redacted_thinking"; data: string };
 
+/** Ensure content parts have at least one text or tool_use block (some APIs reject thinking-only messages). */
+function ensureTextOrToolBlock(parts: AnthropicContentPart[]): void {
+	const hasTextOrTool = parts.some((p) => p.type === "text" || p.type === "tool_use");
+	if (!hasTextOrTool) {
+		parts.push({ type: "text", text: "" });
+	}
+}
+
 interface AnthropicMessage {
 	role: "user" | "assistant";
 	content: string | AnthropicContentPart[];
@@ -516,6 +524,27 @@ export class AnthropicProvider implements ProviderAdapter {
 		// Ensure messages alternate user/assistant
 		const messages = ensureAlternating(history);
 
+		// Final safety net: drop any assistant messages with empty/null content
+		// before sending to the API. This catches edge cases where messages with
+		// empty contentJson (e.g. interrupted streaming) slip through buildHistory.
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (m.role === "assistant") {
+				const c = m.content;
+				if (
+					c == null ||
+					(typeof c === "string" && c === "") ||
+					(Array.isArray(c) && c.length === 0)
+				) {
+					logger.warn("Dropping empty assistant message before API call", {
+						index: i,
+						contentType: typeof c,
+					});
+					messages.splice(i, 1);
+				}
+			}
+		}
+
 		const model = parseModelId(params.model).model;
 
 		// Determine max_tokens based on model capabilities
@@ -748,6 +777,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		if (parts.length > 0) {
+			ensureTextOrToolBlock(parts);
 			h.push({ role: "assistant", content: parts });
 		}
 	}
@@ -1339,6 +1369,7 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 			}
 
 			if (parts.length > 0) {
+				ensureTextOrToolBlock(parts);
 				history.push({ role: "assistant", content: parts });
 			}
 
@@ -1395,6 +1426,13 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	if (messages.length === 0) return messages;
 
+	/** Check if a message has usable content (non-empty string or non-empty array). */
+	function hasContent(m: AnthropicMessage): boolean {
+		if (typeof m.content === "string") return m.content.length > 0;
+		if (Array.isArray(m.content)) return m.content.length > 0;
+		return false; // null, undefined, etc.
+	}
+
 	const result: AnthropicMessage[] = [];
 	for (const msg of messages) {
 		// Normalize string content to array format
@@ -1403,6 +1441,15 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 			content:
 				typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content,
 		};
+
+		// Skip messages with no usable content — the API rejects them
+		// (e.g. "assistant must provide content or tool_calls").
+		// This can happen when contentJson was saved empty (interrupted streaming).
+		// Note: messages with tool_use blocks are safe — tool_use is part of the
+		// content array, so content.length > 0 when tool calls exist.
+		if (!hasContent(normalized)) {
+			continue;
+		}
 
 		const last = result[result.length - 1];
 		if (last && last.role === normalized.role) {
@@ -1415,12 +1462,15 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 		}
 	}
 
+	// Safety: drop any messages that became empty after merging
+	const filtered = result.filter(hasContent);
+
 	// Anthropic requires the first message to be from user
-	if (result.length > 0 && result[0].role === "assistant") {
-		result.unshift({ role: "user", content: [{ type: "text", text: "." }] });
+	if (filtered.length > 0 && filtered[0].role === "assistant") {
+		filtered.unshift({ role: "user", content: [{ type: "text", text: "." }] });
 	}
 
-	return result;
+	return filtered;
 }
 
 function toContentParts(content: string | AnthropicContentPart[]): AnthropicContentPart[] {

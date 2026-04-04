@@ -1,10 +1,10 @@
 // Browser session management for the Browser tool.
 // Each narrator can hold multiple named sessions with automatic TTL cleanup.
 
-import type { BrowserContext, Page } from "playwright-core";
+import type { BrowserContext, Page } from "puppeteer-core";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
-import { createContext } from "./pool";
+import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
 
 /** Default session TTL: 10 minutes of inactivity. */
 const SESSION_TTL_MS = 10 * 60 * 1000;
@@ -64,6 +64,11 @@ export function touchSession(session: BrowserSession): void {
 export async function createSession(narratorId: string, url: string): Promise<BrowserSession> {
 	const context = await createContext();
 	const page = await context.newPage();
+
+	// Puppeteer doesn't support viewport/userAgent at context level (unlike Playwright),
+	// so we set them per-page to match fetchPage() defaults.
+	await page.setViewport(DEFAULT_VIEWPORT);
+	await page.setUserAgent(USER_AGENT);
 
 	await page.goto(url, { waitUntil: "domcontentloaded" });
 

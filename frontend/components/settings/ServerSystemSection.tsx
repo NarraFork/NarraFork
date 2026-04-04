@@ -12,7 +12,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
+import { IconAlertTriangle, IconCertificate, IconRefresh, IconSearch } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
@@ -84,6 +84,8 @@ export function ServerSystemSection({
 	const { t } = useTranslation("settings");
 	const [checking, setChecking] = useState(false);
 	const [checkResult, setCheckResult] = useState<string | null>(null);
+	const [generating, setGenerating] = useState(false);
+	const [generateResult, setGenerateResult] = useState<string | null>(null);
 	const [updateModalOpened, { open: openUpdateModal, close: closeUpdateModal }] =
 		useDisclosure(false);
 	const [updateData, setUpdateData] = useState<UpdateModalData>({});
@@ -132,6 +134,40 @@ export function ServerSystemSection({
 				checked={tlsEnabled}
 				onChange={(e) => setTlsEnabled(e.currentTarget.checked)}
 			/>
+			<Group gap="sm" align="flex-start">
+				<Button
+					leftSection={<IconCertificate size={16} />}
+					variant="light"
+					color="green"
+					size="xs"
+					loading={generating}
+					onClick={async () => {
+						setGenerating(true);
+						setGenerateResult(null);
+						try {
+							const result = await api.generateTlsCert();
+							setTlsCertFile(result.certPath);
+							setTlsKeyFile(result.keyPath);
+							setTlsEnabled(true);
+							setGenerateResult(t("tlsGenerateSuccess"));
+						} catch {
+							setGenerateResult(t("tlsGenerateError"));
+						} finally {
+							setGenerating(false);
+						}
+					}}
+				>
+					{generating ? t("tlsGenerating") : t("tlsGenerateCert")}
+				</Button>
+				{generateResult && (
+					<Text size="sm" c="dimmed" style={{ flex: 1 }}>
+						{generateResult}
+					</Text>
+				)}
+			</Group>
+			<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
+				{t("tlsGenerateWarning")}
+			</Alert>
 			{tlsEnabled && (
 				<>
 					<PathInput

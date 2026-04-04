@@ -1,5 +1,5 @@
 // DOM mode — extract and clean rendered HTML.
-// Try Playwright first, fall back to HTTP fetch + linkedom if browser unavailable.
+// Try browser first, fall back to HTTP fetch + linkedom if browser unavailable.
 
 import sanitizeHtml from "sanitize-html";
 import { httpFetchHtml, tryBrowserFetch } from "./http-fetch";
@@ -37,17 +37,12 @@ export async function fetchDom(
 		const page = await tryBrowserPage(url, { waitUntil: "domcontentloaded" });
 		if (page) {
 			try {
-				html = await page
-					.locator(selector)
-					.evaluateAll((els) => els.map((el) => el.outerHTML).join("\n"));
+				html = await page.$$eval(selector, (els) => els.map((el) => el.outerHTML).join("\n"));
 				if (!html) {
 					return `No elements found matching selector: ${selector}`;
 				}
 			} finally {
-				await page
-					.context()
-					.close()
-					.catch(() => {});
+				await page.close().catch(() => {});
 			}
 		} else {
 			const rawHtml = await httpFetchHtml(url);

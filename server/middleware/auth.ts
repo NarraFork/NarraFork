@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { Context, Next } from "hono";
+import { errors } from "jose";
 import { db } from "../db";
 import { users } from "../db/schema";
 import { type JwtPayload, verifyToken } from "../lib/auth";
@@ -47,7 +48,10 @@ export async function requireAuth(c: Context, next: Next) {
 	let payload: JwtPayload;
 	try {
 		payload = await verifyToken(token);
-	} catch {
+	} catch (err) {
+		if (err instanceof errors.JWTExpired) {
+			throw new AppError("Token expired", 401, "TOKEN_EXPIRED");
+		}
 		throw new AppError("Invalid or expired token", 401, "UNAUTHORIZED");
 	}
 

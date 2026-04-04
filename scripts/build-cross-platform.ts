@@ -314,8 +314,7 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"--target",
 			platform.target,
 			"--asset-naming=[dir]/[name].[ext]",
-			// Playwright bundles an electron loader that imports "electron" —
-			// mark it external so the bundler doesn't try to resolve it.
+			// electron is referenced by puppeteer-core but never used in headless mode
 			"--external=electron",
 			"--outfile",
 			outfile,

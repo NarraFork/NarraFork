@@ -1,7 +1,7 @@
-// Lightweight HTTP fetch — fallback when Playwright browser is not available.
+// Lightweight HTTP fetch — fallback when browser is not available.
 // Uses native fetch() + linkedom for HTML parsing, no browser needed.
 
-import type { Page } from "playwright-core";
+import type { Page } from "puppeteer-core";
 import { logger } from "../logger";
 import { getWebFetchProxy } from "./proxy";
 
@@ -27,7 +27,7 @@ function isBrowserUnavailableError(msg: string): boolean {
 
 /**
  * Fetch a URL via HTTP and return the raw HTML body.
- * Works without Playwright — suitable for static pages, APIs, raw files.
+ * Works without a browser — suitable for static pages, APIs, raw files.
  */
 export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): Promise<string> {
 	const controller = new AbortController();
@@ -56,7 +56,7 @@ export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): 
 }
 
 /**
- * Try to get HTML via Playwright. If browser is unavailable, returns null
+ * Try to get HTML via browser. If browser is unavailable, returns null
  * so the caller can fall back to HTTP fetch.
  *
  * Does NOT cache failures — if the user installs Chrome mid-session,
@@ -66,7 +66,7 @@ export async function tryBrowserFetch(
 	url: string,
 	options?: {
 		blockMedia?: boolean;
-		waitUntil?: "load" | "domcontentloaded" | "networkidle";
+		waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 	},
 ): Promise<string | null> {
 	try {
@@ -78,10 +78,7 @@ export async function tryBrowserFetch(
 		try {
 			return await page.content();
 		} finally {
-			await page
-				.context()
-				.close()
-				.catch(() => {});
+			await page.close().catch(() => {});
 		}
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -101,13 +98,13 @@ export async function tryBrowserFetch(
  */
 export async function tryBrowserPage(
 	url: string,
-	options?: { waitUntil?: "load" | "domcontentloaded" | "networkidle" },
+	options?: { waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" },
 ): Promise<Page | null> {
 	try {
 		const { fetchPage } = await import("./browser");
 		return await fetchPage(url, {
 			blockMedia: false,
-			waitUntil: options?.waitUntil ?? "networkidle",
+			waitUntil: options?.waitUntil ?? "networkidle0",
 		});
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);

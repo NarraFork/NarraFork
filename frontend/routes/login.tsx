@@ -16,7 +16,20 @@ import { createFileRoute, Link, Navigate, useNavigate } from "@tanstack/react-ro
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAuthStatus, useLogin, useRegister } from "../hooks/useAuth";
-import { getToken } from "../lib/api";
+import { type ApiError, getToken } from "../lib/api";
+
+/** Map backend error codes to i18n keys in the "common" namespace. */
+function mapAuthErrorCode(e: ApiError): string | null {
+	const code = (e.data as Record<string, unknown> | undefined)?.code;
+	if (typeof code !== "string") return null;
+	const mapping: Record<string, string> = {
+		INVALID_CREDENTIALS: "invalidCredentials",
+		UNAUTHORIZED: "authRequired",
+		TOKEN_EXPIRED: "tokenExpired",
+		NOT_FOUND: "userNotFound",
+	};
+	return mapping[code] ?? null;
+}
 
 export const Route = createFileRoute("/login")({
 	component: LoginPage,
@@ -56,7 +69,8 @@ function LoginPage() {
 			navigate({ to: "/" });
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {
-			setError(e.message || t("unknownError"));
+			const i18nKey = mapAuthErrorCode(e);
+			setError(i18nKey ? t(i18nKey) : e.message || t("unknownError"));
 		}
 	};
 
@@ -82,7 +96,8 @@ function LoginPage() {
 			navigate({ to: "/" });
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {
-			setError(e.message || t("unknownError"));
+			const i18nKey = mapAuthErrorCode(e);
+			setError(i18nKey ? t(i18nKey) : e.message || t("unknownError"));
 		}
 	};
 

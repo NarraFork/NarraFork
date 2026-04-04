@@ -1,7 +1,7 @@
 // High-level browser actions for the Browser tool.
 // Each action operates on a BrowserSession and returns a ToolResult-compatible output.
 
-import type { Page } from "playwright-core";
+import type { KeyInput, Page } from "puppeteer-core";
 import { cleanHtml } from "../web-fetch/dom";
 import type { BrowserSession } from "./session";
 import { touchSession } from "./session";
@@ -49,12 +49,11 @@ export async function click(
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSession(session);
 	const { page } = session;
-	const timeout = opts?.timeout ?? DEFAULT_ACTION_TIMEOUT;
 
 	if (opts?.coordinate && !selector) {
 		await page.mouse.click(opts.coordinate.x, opts.coordinate.y);
 	} else {
-		await page.locator(selector).click({ timeout });
+		await page.click(selector, { delay: 50 });
 	}
 
 	return { snapshot: await snapshot(page) };
@@ -65,11 +64,17 @@ export async function fill(
 	session: BrowserSession,
 	selector: string,
 	value: string,
-	opts?: { timeout?: number },
+	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSession(session);
-	const timeout = opts?.timeout ?? DEFAULT_ACTION_TIMEOUT;
-	await session.page.locator(selector).fill(value, { timeout });
+	// Click to focus, Ctrl+A to select all (works for both inputs and textareas),
+	// then Backspace to clear, then type new value.
+	await session.page.click(selector);
+	await session.page.keyboard.down("Control");
+	await session.page.keyboard.press("a");
+	await session.page.keyboard.up("Control");
+	await session.page.keyboard.press("Backspace");
+	await session.page.type(selector, value, { delay: 20 });
 	return { snapshot: await snapshot(session.page) };
 }
 
@@ -78,11 +83,10 @@ export async function select(
 	session: BrowserSession,
 	selector: string,
 	value: string,
-	opts?: { timeout?: number },
+	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSession(session);
-	const timeout = opts?.timeout ?? DEFAULT_ACTION_TIMEOUT;
-	await session.page.locator(selector).selectOption(value, { timeout });
+	await session.page.select(selector, value);
 	return { snapshot: await snapshot(session.page) };
 }
 
@@ -93,20 +97,17 @@ export async function type(
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSession(session);
 	const { page } = session;
-	const timeout = opts.timeout ?? DEFAULT_ACTION_TIMEOUT;
 
 	if (opts.key) {
 		if (opts.selector) {
-			await page.locator(opts.selector).press(opts.key, { timeout });
+			await page.focus(opts.selector);
+			await page.keyboard.press(opts.key as KeyInput);
 		} else {
-			await page.keyboard.press(opts.key);
+			await page.keyboard.press(opts.key as KeyInput);
 		}
 	} else if (opts.value) {
 		if (opts.selector) {
-			await page.locator(opts.selector).pressSequentially(opts.value, {
-				timeout,
-				delay: 50,
-			});
+			await page.type(opts.selector, opts.value, { delay: 50 });
 		} else {
 			await page.keyboard.type(opts.value, { delay: 50 });
 		}
@@ -119,11 +120,10 @@ export async function type(
 export async function hover(
 	session: BrowserSession,
 	selector: string,
-	opts?: { timeout?: number },
+	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSession(session);
-	const timeout = opts?.timeout ?? DEFAULT_ACTION_TIMEOUT;
-	await session.page.locator(selector).hover({ timeout });
+	await session.page.hover(selector);
 	return { snapshot: await snapshot(session.page) };
 }
 
@@ -134,13 +134,14 @@ export async function screenshot(
 ): Promise<{ base64: string; width: number; height: number }> {
 	touchSession(session);
 	const { page } = session;
-	const viewport = page.viewportSize();
+	const viewport = page.viewport();
 	const buffer = await page.screenshot({
 		type: "png",
 		fullPage: opts?.fullPage ?? false,
+		encoding: "binary",
 	});
 	return {
-		base64: buffer.toString("base64"),
+		base64: Buffer.from(buffer as Uint8Array).toString("base64"),
 		width: viewport?.width ?? 1280,
 		height: viewport?.height ?? 900,
 	};
@@ -153,10 +154,9 @@ export async function getText(
 	opts?: { maxLength?: number; timeout?: number },
 ): Promise<{ text: string; snapshot: PageSnapshot }> {
 	touchSession(session);
-	const timeout = opts?.timeout ?? DEFAULT_ACTION_TIMEOUT;
 	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
 
-	let text = (await session.page.locator(selector).textContent({ timeout })) ?? "";
+	let text = (await session.page.$eval(selector, (el) => el.textContent).catch(() => null)) ?? "";
 	if (text.length > maxLength) {
 		text = `${text.slice(0, maxLength)}\n\n[Text truncated at ${maxLength} characters]`;
 	}
@@ -169,11 +169,12 @@ export async function getAttribute(
 	session: BrowserSession,
 	selector: string,
 	attribute: string,
-	opts?: { timeout?: number },
+	_opts?: { timeout?: number },
 ): Promise<{ value: string | null; snapshot: PageSnapshot }> {
 	touchSession(session);
-	const timeout = opts?.timeout ?? DEFAULT_ACTION_TIMEOUT;
-	const value = await session.page.locator(selector).getAttribute(attribute, { timeout });
+	const value = await session.page
+		.$eval(selector, (el, attr) => el.getAttribute(attr), attribute)
+		.catch(() => null);
 	return { value, snapshot: await snapshot(session.page) };
 }
 
@@ -201,16 +202,20 @@ export async function wait(
 	opts: { selector?: string; state?: "visible" | "hidden" | "attached"; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSession(session);
+	const { page } = session;
 	const timeout = opts.timeout ?? DEFAULT_ACTION_TIMEOUT;
 
 	if (opts.selector) {
-		await session.page.locator(opts.selector).waitFor({
-			state: opts.state ?? "visible",
-			timeout,
-		});
+		if (opts.state === "hidden") {
+			await page.waitForSelector(opts.selector, { hidden: true, timeout });
+		} else if (opts.state === "visible") {
+			await page.waitForSelector(opts.selector, { visible: true, timeout });
+		} else {
+			// "attached" (default) — just wait for element to exist in DOM
+			await page.waitForSelector(opts.selector, { timeout });
+		}
 	} else {
-		// Just wait for a fixed duration
-		await session.page.waitForTimeout(timeout);
+		await new Promise((r) => setTimeout(r, timeout));
 	}
 
 	return { snapshot: await snapshot(session.page) };
@@ -232,13 +237,12 @@ export async function scroll(
 	const deltaY = opts.direction === "up" ? -amount : amount;
 
 	if (opts.selector) {
-		const loc = page.locator(opts.selector);
-		await loc.evaluate((el, dy) => el.scrollBy(0, dy), deltaY);
+		await page.$eval(opts.selector, (el, dy) => el.scrollBy(0, dy), deltaY);
 	} else {
 		const x = opts.coordinate?.x ?? 640;
 		const y = opts.coordinate?.y ?? 450;
 		await page.mouse.move(x, y);
-		await page.mouse.wheel(0, deltaY);
+		await page.mouse.wheel({ deltaY });
 	}
 
 	return { snapshot: await snapshot(page) };
@@ -256,8 +260,8 @@ export async function getDom(
 	let html: string;
 	if (opts?.selector) {
 		const elements = await page
-			.locator(opts.selector)
-			.evaluateAll((els) => els.map((el) => el.outerHTML).join("\n"));
+			.$$eval(opts.selector, (els) => els.map((el) => el.outerHTML).join("\n"))
+			.catch(() => "");
 		html = elements || `No elements found matching selector: ${opts.selector}`;
 	} else {
 		html = await page.evaluate(() => document.body?.innerHTML ?? "");

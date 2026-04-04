@@ -68,7 +68,8 @@ async function request<T>(
 	const response = await fetch(`${BASE}${path}`, { ...options, headers });
 	if (response.status === 401) {
 		clearToken();
-		throw new ApiError("Unauthorized", 401);
+		const error = await response.json().catch(() => ({ error: "Unauthorized" }));
+		throw new ApiError(error.error ?? "Unauthorized", 401, error);
 	}
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ error: response.statusText }));
@@ -318,7 +319,8 @@ export const api = {
 		});
 		if (res.status === 401) {
 			clearToken();
-			throw new ApiError("Unauthorized", 401);
+			const err = await res.json().catch(() => ({ error: "Unauthorized" }));
+			throw new ApiError(err.error ?? "Unauthorized", 401, err);
 		}
 		if (!res.ok) {
 			const err = await res.json().catch(() => ({ error: "Upload failed" }));
@@ -488,6 +490,14 @@ export const api = {
 		),
 	updateSettings: (data: Record<string, unknown>) =>
 		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
+	generateTlsCert: () =>
+		request<{
+			certPath: string;
+			keyPath: string;
+			expiresAt: string;
+			newUrl: string;
+			serverRestarting: boolean;
+		}>("/settings/generate-tls", { method: "POST" }),
 
 	addRetryRule: (data: { domain?: string; statusCode?: number; keyword?: string; note?: string }) =>
 		request<{ id: string }>("/settings/retry-rules", {
@@ -790,7 +800,8 @@ export const api = {
 		});
 		if (res.status === 401) {
 			clearToken();
-			throw new Error("Unauthorized");
+			const error = await res.json().catch(() => ({ error: "Unauthorized" }));
+			throw new Error(error.error ?? "Unauthorized");
 		}
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({ error: res.statusText }));

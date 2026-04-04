@@ -714,6 +714,41 @@ settingsRoutes.patch("/", async (c) => {
 	return c.json(result);
 });
 
+// Generate a self-signed TLS certificate and enable HTTPS
+settingsRoutes.post("/generate-tls", async (c) => {
+	const { generateSelfSignedCert } = await import("../lib/tls");
+	const result = await generateSelfSignedCert();
+
+	// Update settings to enable TLS with generated cert paths
+	const current = settings;
+	const merged = {
+		...current,
+		server: {
+			...current.server,
+			tls: {
+				enabled: true,
+				certFile: result.certPath,
+				keyFile: result.keyPath,
+			},
+		},
+	};
+	saveSettings(merged);
+
+	// Schedule server restart to apply TLS
+	const host = merged.server.host;
+	const port = merged.server.port;
+	scheduleServerRestart(host, port);
+
+	const newUrl = `https://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
+	return c.json({
+		certPath: result.certPath,
+		keyPath: result.keyPath,
+		expiresAt: result.expiresAt,
+		newUrl,
+		serverRestarting: true,
+	});
+});
+
 const addRetryRuleSchema = z
 	.object({
 		domain: z.string().min(1).optional(),

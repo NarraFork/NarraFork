@@ -77,7 +77,7 @@ export const webFetchTool: ToolDefinition = {
 		max_length: z.number().optional().describe("Max output chars"),
 		purpose: z.string().optional().describe("What to look for (smart mode)"),
 	}),
-	async execute(args): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		const {
 			url,
 			mode = "readability",
@@ -104,78 +104,98 @@ export const webFetchTool: ToolDefinition = {
 
 		logger.info("WebFetch executing", { url, mode, selector });
 
-		try {
-			switch (mode) {
-				case "readability": {
-					const { fetchReadability } = await import("../../web-fetch/readability");
-					const result = await fetchReadability(url, max_length);
-					const header = result.title ? `# ${result.title}\n\n` : "";
-					const excerpt = result.excerpt ? `> ${result.excerpt}\n\n` : "";
-					return {
-						output: `${header}${excerpt}${result.content}`,
-						title: result.title || url,
-					};
-				}
-				case "screenshot": {
-					const { fetchScreenshot } = await import("../../web-fetch/screenshot");
-					const result = await fetchScreenshot(url);
-
-					// Save screenshot as a temporary share for frontend preview
-					let metadata: Record<string, unknown> | undefined;
-					try {
-						const shareId = generateShortId();
-						const shareDir = getShareDir(shareId);
-						const filename = "screenshot.png";
-						const filePath = resolve(shareDir, filename);
-						const buffer = Buffer.from(result.base64, "base64");
-						writeFileSync(filePath, buffer);
-						createShare({
-							id: shareId,
-							originalName: filename,
-							storagePath: filePath,
-							size: buffer.length,
-							createdBy: "webfetch",
-							expiryHours: 1,
-						});
-						metadata = {
-							screenshotPreview: true,
-							previewUrl: `/api/shares/${shareId}/preview`,
-							width: result.width,
-							height: result.height,
-						};
-					} catch (e) {
-						logger.warn("Failed to create screenshot share for preview", {
-							error: e instanceof Error ? e.message : String(e),
-						});
-					}
-
-					return {
-						output: `Screenshot of ${url} (${result.width}x${result.height})`,
-						images: [{ format: "png", base64: result.base64 }],
-						metadata,
-						title: url,
-					};
-				}
-				case "dom": {
-					const { fetchDom } = await import("../../web-fetch/dom");
-					const result = await fetchDom(url, selector, max_length);
-					return {
-						output: result,
-						title: selector ? `${url} [${selector}]` : url,
-					};
-				}
-				case "smart": {
-					const { fetchSmart } = await import("../../web-fetch/smart");
-					const result = await fetchSmart(url, max_length, purpose);
-					return {
-						output: result.summary,
-						title: result.title || url,
-					};
-				}
-				default:
-					return { output: `Unknown mode: ${mode}`, isError: true };
+		// Race the actual fetch against the abort signal so the narrator can be interrupted.
+		const abortPromise = new Promise<never>((_, reject) => {
+			if (ctx?.signal?.aborted) {
+				reject(new DOMException("Aborted", "AbortError"));
+				return;
 			}
+			ctx?.signal?.addEventListener(
+				"abort",
+				() => reject(new DOMException("Aborted", "AbortError")),
+				{ once: true },
+			);
+		});
+
+		try {
+			const doFetch = async (): Promise<ToolResult> => {
+				switch (mode) {
+					case "readability": {
+						const { fetchReadability } = await import("../../web-fetch/readability");
+						const result = await fetchReadability(url, max_length);
+						const header = result.title ? `# ${result.title}\n\n` : "";
+						const excerpt = result.excerpt ? `> ${result.excerpt}\n\n` : "";
+						return {
+							output: `${header}${excerpt}${result.content}`,
+							title: result.title || url,
+						};
+					}
+					case "screenshot": {
+						const { fetchScreenshot } = await import("../../web-fetch/screenshot");
+						const result = await fetchScreenshot(url);
+
+						// Save screenshot as a temporary share for frontend preview
+						let metadata: Record<string, unknown> | undefined;
+						try {
+							const shareId = generateShortId();
+							const shareDir = getShareDir(shareId);
+							const filename = "screenshot.png";
+							const filePath = resolve(shareDir, filename);
+							const buffer = Buffer.from(result.base64, "base64");
+							writeFileSync(filePath, buffer);
+							createShare({
+								id: shareId,
+								originalName: filename,
+								storagePath: filePath,
+								size: buffer.length,
+								createdBy: "webfetch",
+								expiryHours: 1,
+							});
+							metadata = {
+								screenshotPreview: true,
+								previewUrl: `/api/shares/${shareId}/preview`,
+								width: result.width,
+								height: result.height,
+							};
+						} catch (e) {
+							logger.warn("Failed to create screenshot share for preview", {
+								error: e instanceof Error ? e.message : String(e),
+							});
+						}
+
+						return {
+							output: `Screenshot of ${url} (${result.width}x${result.height})`,
+							images: [{ format: "png", base64: result.base64 }],
+							metadata,
+							title: url,
+						};
+					}
+					case "dom": {
+						const { fetchDom } = await import("../../web-fetch/dom");
+						const result = await fetchDom(url, selector, max_length);
+						return {
+							output: result,
+							title: selector ? `${url} [${selector}]` : url,
+						};
+					}
+					case "smart": {
+						const { fetchSmart } = await import("../../web-fetch/smart");
+						const result = await fetchSmart(url, max_length, purpose);
+						return {
+							output: result.summary,
+							title: result.title || url,
+						};
+					}
+					default:
+						return { output: `Unknown mode: ${mode}`, isError: true };
+				}
+			};
+
+			return await Promise.race([doFetch(), abortPromise]);
 		} catch (err) {
+			if (err instanceof DOMException && err.name === "AbortError") {
+				return { output: "WebFetch was aborted.", isError: true };
+			}
 			const msg = err instanceof Error ? err.message : String(err);
 			logger.warn("WebFetch failed", { url, mode, error: msg });
 			return {
