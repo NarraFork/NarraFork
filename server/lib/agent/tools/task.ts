@@ -1,7 +1,12 @@
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
-import { getVisibleModels, settings } from "../../settings";
-import type { ToolDefinition, ToolResult } from "../types";
+import {
+	getAnthropicProviderConfig,
+	getVisibleModels,
+	isAnthropicProvider,
+	settings,
+} from "../../settings";
+import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
@@ -61,9 +66,19 @@ function buildParameters() {
 	});
 }
 
+function usesNativeWebSearch(provider: string): boolean {
+	if (provider === "codex") return true;
+	if (isAnthropicProvider(provider) && !!getAnthropicProviderConfig(provider)?.officialApi)
+		return true;
+	return false;
+}
+
 export const agentTool: ToolDefinition = {
 	name: "Agent",
-	get description() {
+	description(config: AgentConfig) {
+		if (usesNativeWebSearch(config.provider)) {
+			return baseDescription.replaceAll("WebSearch", "web_search (native)");
+		}
 		return baseDescription;
 	},
 	get parameters() {

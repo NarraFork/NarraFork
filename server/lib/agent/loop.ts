@@ -1,3 +1,4 @@
+import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import {
 	getAnthropicProviderConfig,
@@ -1563,6 +1564,27 @@ interface ToolExecResult {
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
 	const tool = toolRegistry.get(tu.name);
 	const locale = (config.locale as Locale) ?? "en";
+
+	// Defense-in-depth: Codex and official Anthropic use native server-side web_search.
+	// The WebSearch function tool is filtered from the API request (line ~407), but the
+	// non-official codex endpoint may not validate tool names strictly — the model could
+	// still invoke "WebSearch" based on training data / tool descriptions. Block execution
+	const isOfficialAnthropic =
+		isAnthropicProvider(config.provider) &&
+		!!getAnthropicProviderConfig(config.provider)?.officialApi;
+	if (tu.name === "WebSearch" && (config.provider === "codex" || isOfficialAnthropic)) {
+		logger.warn("Blocked WebSearch function tool for native-search provider", {
+			provider: config.provider,
+			model: config.model,
+			narratorId: config.narratorId,
+		});
+		return {
+			output:
+				"This provider uses native server-side web search. The WebSearch function tool is not available.",
+			isError: true,
+			durationMs: 0,
+		};
+	}
 
 	if (!tool) {
 		return {

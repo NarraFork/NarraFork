@@ -3,28 +3,42 @@ import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
+import { getAnthropicProviderConfig, isAnthropicProvider } from "../../settings";
 import { createShare, getShareDir } from "../../shares";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 const MODES = ["readability", "screenshot", "dom", "smart"] as const;
 
+const WEB_FETCH_BODY =
+	"Modes:\n" +
+	'- "readability": Extract article text using Mozilla Readability. Best for articles, docs, blog posts. Works without a browser.\n' +
+	'- "screenshot": Capture a viewport screenshot as an image. Requires Chrome/Chromium browser.\n' +
+	'- "dom": Extract cleaned HTML DOM structure. Best for structured data, tables, lists. Works without a browser (no JS rendering).\n' +
+	'- "smart": Extract DOM then summarize with an AI model. Best for long pages where you only need key information. Works without a browser.\n\n' +
+	"Note: readability, dom, and smart modes fall back to HTTP fetch when Chrome is not available. " +
+	"This works well for static pages but won't render JavaScript-heavy SPAs.\n\n" +
+	"Parameters:\n" +
+	"- url (required): The URL to fetch\n" +
+	"- mode (optional): One of readability, screenshot, dom, smart. Defaults to readability.\n" +
+	"- selector (optional): CSS selector to extract specific elements (dom mode only)\n" +
+	"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)\n" +
+	"- purpose (optional): What information you are looking for (smart mode only). When provided, the AI summarizer will prioritize extracting content relevant to this goal instead of producing a generic summary.";
+
+function usesNativeWebSearch(provider: string): boolean {
+	if (provider === "codex") return true;
+	if (isAnthropicProvider(provider) && !!getAnthropicProviderConfig(provider)?.officialApi)
+		return true;
+	return false;
+}
+
 export const webFetchTool: ToolDefinition = {
 	name: "WebFetch",
-	description:
-		"Fetch and extract content from a web page URL. Use this after WebSearch to get detailed content from specific URLs.\n\n" +
-		"Modes:\n" +
-		'- "readability": Extract article text using Mozilla Readability. Best for articles, docs, blog posts. Works without a browser.\n' +
-		'- "screenshot": Capture a viewport screenshot as an image. Requires Chrome/Chromium browser.\n' +
-		'- "dom": Extract cleaned HTML DOM structure. Best for structured data, tables, lists. Works without a browser (no JS rendering).\n' +
-		'- "smart": Extract DOM then summarize with an AI model. Best for long pages where you only need key information. Works without a browser.\n\n' +
-		"Note: readability, dom, and smart modes fall back to HTTP fetch when Chrome is not available. " +
-		"This works well for static pages but won't render JavaScript-heavy SPAs.\n\n" +
-		"Parameters:\n" +
-		"- url (required): The URL to fetch\n" +
-		"- mode (optional): One of readability, screenshot, dom, smart. Defaults to readability.\n" +
-		"- selector (optional): CSS selector to extract specific elements (dom mode only)\n" +
-		"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)\n" +
-		"- purpose (optional): What information you are looking for (smart mode only). When provided, the AI summarizer will prioritize extracting content relevant to this goal instead of producing a generic summary.",
+	description(config: AgentConfig) {
+		const intro = usesNativeWebSearch(config.provider)
+			? "Fetch and extract content from a web page URL. Use this after the native web_search tool to get detailed content from specific URLs."
+			: "Fetch and extract content from a web page URL. Use this after WebSearch to get detailed content from specific URLs.";
+		return `${intro}\n\n${WEB_FETCH_BODY}`;
+	},
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -64,7 +78,13 @@ export const webFetchTool: ToolDefinition = {
 		purpose: z.string().optional().describe("What to look for (smart mode)"),
 	}),
 	async execute(args): Promise<ToolResult> {
-		const { url, mode = "readability", selector, max_length, purpose } = args as {
+		const {
+			url,
+			mode = "readability",
+			selector,
+			max_length,
+			purpose,
+		} = args as {
 			url: string;
 			mode?: (typeof MODES)[number];
 			selector?: string;

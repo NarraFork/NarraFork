@@ -6,6 +6,7 @@ import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { clearToolBlockCache } from "./message-segments";
 import {
 	evictOldestPages,
 	findMsgByToolUseIdInTree,
@@ -230,6 +231,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			cancelAnimationFrame(streamingRafRef.current);
 			streamingRafRef.current = 0;
 		}
+		clearToolBlockCache();
 		setStreamingVersion((v) => v + 1);
 	}, []);
 

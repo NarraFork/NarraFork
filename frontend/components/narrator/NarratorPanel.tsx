@@ -141,7 +141,7 @@ import {
 	resolveBlockRange,
 	resolveSelectedBlockMeta,
 } from "./MessageSelectionCtx";
-import { buildStreamingMsg } from "./message-segments";
+import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
@@ -2339,17 +2339,16 @@ export function NarratorPanel({
 			};
 
 			if (pageStreamingMsg) {
-				// Streaming page: reuse cached non-streaming elements for all
-				// segments except the last one (which includes streaming content).
+				// Streaming page: reuse as many cached non-streaming elements as
+				// possible.  segmentMessages appends streamingMsg to the message
+				// array, which can either (a) add new segments (when streaming
+				// content is text/reasoning that forms its own segment) or
+				// (b) merge into the last existing segment (when streaming
+				// tool_use blocks extend the existing tool-run).
 				//
-				// segmentMessages only appends streamingMsg to the end of the message
-				// array — earlier segments are identical. Each segment maps to exactly
-				// one element, so reusing the first (N-1) cached elements is safe.
-				//
-				// If the cache is missing (first streaming frame, or messages changed),
-				// render the non-streaming version to populate it, then render with
-				// streaming. On subsequent frames, the cache is already warm so we
-				// skip the non-streaming render entirely.
+				// Instead of rendering twice to compare element counts, we call
+				// segmentMessages (pure computation, no React element creation)
+				// to determine which case applies, then render only once.
 				let cachedNoStreaming = cache.get(pageKey);
 				if (
 					!cachedNoStreaming ||
@@ -2366,20 +2365,41 @@ export function NarratorPanel({
 				}
 
 				if (cachedNoStreaming && cachedNoStreaming.elements.length > 0) {
-					// Reuse the first (N-1) cached elements — these correspond to
-					// segments unaffected by streamingMsg.
-					const reuseCount = Math.max(0, cachedNoStreaming.elements.length - 1);
-					collectResults(cachedNoStreaming, 0);
-					// Remove the last element we just collected — it will be replaced
-					// by the streaming version below.
-					if (reuseCount < cachedNoStreaming.elements.length) {
-						allElements.length -= 1;
-						allKeys.length -= 1;
-						allTargets.length -= 1;
+					// Cheap segment count comparison (no React element creation).
+					const noStreamSegs = segmentMessages(page.messages).length;
+					const withStreamSegs = segmentMessages(page.messages, {
+						streamingMsg: pageStreamingMsg,
+					}).length;
+					const streamingAddsSegs = withStreamSegs > noStreamSegs;
+
+					const cachedLen = cachedNoStreaming.elements.length;
+
+					// When streamingMsg only adds new segments (e.g. pure
+					// text/reasoning after a tool-run), all cached elements are
+					// still valid — reuse them all and only render the new ones.
+					//
+					// When streamingMsg modifies the last segment (e.g. a
+					// streaming tool_use merges into the existing tool-run),
+					// reuse the first (N-1) cached elements and re-render the
+					// last one from the streaming result.
+					const reuseCount = streamingAddsSegs ? cachedLen : Math.max(0, cachedLen - 1);
+
+					// Collect cached elements up to reuseCount.
+					for (let j = 0; j < reuseCount; j++) {
+						const targetIds = cachedNoStreaming.targets[j] ?? [];
+						allElements.push(cachedNoStreaming.elements[j]);
+						const key = getStableRenderElementKey(
+							cachedNoStreaming.keys[j],
+							targetIds,
+							pageKey,
+							usedKeys,
+						);
+						usedKeys.add(key);
+						allKeys.push(key);
+						allTargets.push(targetIds);
 					}
 
-					// Render the full page WITH streamingMsg, but only take the
-					// new elements beyond the cached portion (the streaming segment).
+					// Single render with streamingMsg, collect from reuseCount onward.
 					const streamResult = renderPage(pageStreamingMsg);
 					collectResults(streamResult, reuseCount);
 				} else {

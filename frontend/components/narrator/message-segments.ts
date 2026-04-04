@@ -316,6 +316,43 @@ export function collectSegmentTargetIds(seg: RenderSegment): string[] {
 // Streaming message builder
 // ---------------------------------------------------------------------------
 
+// Module-level cache for tool-use block reference stability.
+// During streaming, buildStreamingMsg is called on every frame.
+// topLevelStreamingChunks creates new block objects each time (via
+// upsertStreamingToolBlock's [...prevBlocks] spread), even when the
+// underlying data hasn't changed.  By caching per toolUseId and
+// reusing the old reference when data is shallowly equal, we prevent
+// unnecessary re-renders of ToolCallCard components that would
+// otherwise receive new prop object references every frame.
+const toolBlockCache = new Map<string, ContentBlock>();
+
+function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
+	const id = block.id;
+	if (!id || block.type !== "tool_use") return block;
+
+	const cached = toolBlockCache.get(id);
+	if (cached && shallowBlockEqual(cached, block)) {
+		return cached;
+	}
+	toolBlockCache.set(id, block);
+	return block;
+}
+
+// Shallow comparison of tool_use blocks for reference stability.
+// Note: `input` uses reference equality (===). This is safe because
+// upsertStreamingToolBlock creates block.input as {} once on creation
+// and never mutates it — streaming input updates go to toolCalls[].inputJson
+// instead.  If this invariant is ever broken, upgrade to a shallow input
+// comparison (e.g. shallowEqual(a.input, b.input)).
+function shallowBlockEqual(a: ContentBlock, b: ContentBlock): boolean {
+	return a.type === b.type && a.id === b.id && a.name === b.name && a.input === b.input;
+}
+
+/** Clear the tool-use block reference cache (call when streaming ends). */
+export function clearToolBlockCache(): void {
+	toolBlockCache.clear();
+}
+
 export function buildStreamingMsg(opts: {
 	streamingText?: string;
 	streamingReasoning?: string;
@@ -335,7 +372,13 @@ export function buildStreamingMsg(opts: {
 	const blocks: ContentBlock[] = [];
 
 	if (hasReasoning) {
-		blocks.push({ type: "reasoning", text: streamingReasoning } as ContentBlock);
+		// Assign stable synthetic id so React key doesn't shift when new blocks
+		// are inserted before it during streaming.
+		blocks.push({
+			type: "reasoning",
+			id: "streaming:reasoning",
+			text: streamingReasoning,
+		} as ContentBlock);
 	}
 	if (hasWebSearch) {
 		blocks.push({
@@ -346,11 +389,15 @@ export function buildStreamingMsg(opts: {
 		} as ContentBlock);
 	}
 	if (hasText) {
-		blocks.push({ type: "text", text: streamingText } as ContentBlock);
+		// Assign stable synthetic id so React key doesn't shift when new blocks
+		// are inserted before it during streaming.
+		blocks.push({ type: "text", id: "streaming:text", text: streamingText } as ContentBlock);
 	}
 	if (toolChunksMsg) {
 		const chunkBlocks = Array.isArray(toolChunksMsg.contentJson) ? toolChunksMsg.contentJson : [];
-		blocks.push(...chunkBlocks);
+		for (const raw of chunkBlocks) {
+			blocks.push(stabilizeToolUseBlock(raw));
+		}
 	}
 
 	return {
@@ -364,4 +411,44 @@ export function buildStreamingMsg(opts: {
 		createdAt: toolChunksMsg?.createdAt ?? new Date().toISOString(),
 		children: [],
 	} as NarratorMsg;
+}
+
+/**
+ * Generate stable React keys for a list of content blocks.
+ *
+ * Blocks that already carry an `id` (tool_use, web_search from the API,
+ * streaming blocks with synthetic ids) use that id directly.
+ * For blocks without an id, the block *type* is used as the key since each
+ * type typically appears at most once per message.  When multiple blocks
+ * share the same type and both lack an id, a dedup counter is appended so
+ * every key remains unique.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+export function generateBlockKeys(blocks: any[]): string[] {
+	const typeCount: Record<string, number> = {};
+	return blocks.map((block) => {
+		if (block.id) return block.id as string;
+		const t = block.type as string;
+		// Known content types typically appear at most once per message,
+		// so the first occurrence uses the bare type name as the key
+		// (e.g. "text") for maximum stability during streaming.
+		// Subsequent occurrences append a dedup counter (e.g. "text-1").
+		if (
+			t === "text" ||
+			t === "reasoning" ||
+			t === "thinking" ||
+			t === "web_search" ||
+			t === "image" ||
+			t === "text_file"
+		) {
+			const count = typeCount[t] ?? 0;
+			typeCount[t] = count + 1;
+			return count === 0 ? t : `${t}-${count}`;
+		}
+		// Unknown types always include a counter (e.g. "custom-0") since
+		// we cannot assume they appear at most once per message.
+		const count = typeCount[t] ?? 0;
+		typeCount[t] = count + 1;
+		return `${t}-${count}`;
+	});
 }

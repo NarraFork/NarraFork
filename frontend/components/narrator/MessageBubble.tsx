@@ -50,6 +50,7 @@ import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
+import { generateBlockKeys } from "./message-segments";
 import {
 	getCategory,
 	getCategoryColor,
@@ -1028,6 +1029,7 @@ export const MessageBubble = memo(function MessageBubble({
 }: MessageBubbleProps) {
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const blockKeys = useMemo(() => generateBlockKeys(blocks), [blocks]);
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const _msgId = message.id;
@@ -1461,7 +1463,7 @@ export const MessageBubble = memo(function MessageBubble({
 			<Stack gap={4} style={{ minWidth: 0 }}>
 				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 				{blocks.map((block: any, i: number) => {
-					const key = block.id ?? `${block.type}-${i}`;
+					const key = blockKeys[i];
 					const realIndex = message._blockOriginalIndices?.[i] ?? i;
 					if (block.type === "text") {
 						if (!block.text?.trim()) return null;
