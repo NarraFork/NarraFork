@@ -262,8 +262,21 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 	};
 
 	return (
-		<Modal opened={opened} onClose={handleClose} title={t("newNarratorModal")}>
-			<Stack>
+		<Modal
+			opened={opened}
+			onClose={handleClose}
+			title={t("newNarratorModal")}
+			size="md"
+			styles={{
+				body: {
+					maxHeight: "90vh",
+					display: "flex",
+					flexDirection: "column",
+					overflow: "hidden",
+				},
+			}}
+		>
+			<Stack gap="md" style={{ flex: 1, minHeight: 0 }}>
 				<Text size="sm" c="dimmed">
 					{t("newNarratorDescription")}
 				</Text>
@@ -297,36 +310,38 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				/>
 
 				{favorites?.length ? (
-					<Stack gap="xs">
+					<Stack gap="xs" style={{ flex: 1, minHeight: 0 }}>
 						<Text size="xs" fw={500} c="dimmed">
 							{t("favoriteDirectories")}
 						</Text>
-						<DndContext
-							sensors={sensors}
-							collisionDetection={closestCenter}
-							onDragStart={handleDragStart}
-							onDragEnd={handleDragEnd}
-							onDragCancel={handleDragCancel}
-						>
-							<SortableContext
-								items={favorites.map((f: any) => f.id)}
-								strategy={verticalListSortingStrategy}
+						<div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+							<DndContext
+								sensors={sensors}
+								collisionDetection={closestCenter}
+								onDragStart={handleDragStart}
+								onDragEnd={handleDragEnd}
+								onDragCancel={handleDragCancel}
 							>
-								{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-								{favorites.map((fav: any) => (
-									<SortableFavoriteItem
-										key={fav.id}
-										fav={fav}
-										isActive={cwd === fav.path}
-										onSelect={() => setCwd(fav.path)}
-										onRemove={() => removeFavorite.mutate(fav.id)}
-									/>
-								))}
-							</SortableContext>
-							{activeFav && (
-								<DragOverlayPortal activeFav={activeFav} isActive={cwd === activeFav.path} />
-							)}
-						</DndContext>
+								<SortableContext
+									items={favorites.map((f: any) => f.id)}
+									strategy={verticalListSortingStrategy}
+								>
+									{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+									{favorites.map((fav: any) => (
+										<SortableFavoriteItem
+											key={fav.id}
+											fav={fav}
+											isActive={cwd === fav.path}
+											onSelect={() => setCwd(fav.path)}
+											onRemove={() => removeFavorite.mutate(fav.id)}
+										/>
+									))}
+								</SortableContext>
+								{activeFav && (
+									<DragOverlayPortal activeFav={activeFav} isActive={cwd === activeFav.path} />
+								)}
+							</DndContext>
+						</div>
 					</Stack>
 				) : null}
 
