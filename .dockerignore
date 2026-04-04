@@ -10,3 +10,4 @@ drizzle/meta
 *.log
 .vscode
 .idea
+.narrafork
