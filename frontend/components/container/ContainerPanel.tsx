@@ -60,7 +60,7 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 	});
 	const start = useStartContainers();
 	const stop = useStopContainers();
-	const { starting, logs: buildLogs } = useContainerEvents(chapterId);
+	const { starting, logs: buildLogs, error, clearError } = useContainerEvents(chapterId);
 	const [logsOpen, setLogsOpen] = useState(false);
 	const [logService, setLogService] = useState<string | null>(null);
 	const [logTail, setLogTail] = useState("100");
@@ -129,15 +129,17 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 				</Text>
 			) : null}
 
-			{/* Build/startup streaming logs */}
-			{starting && (
+			{/* Build/startup streaming logs (shown while starting or after error) */}
+			{(starting || (error && buildLogs.length > 0)) && (
 				<>
-					<Group gap={4}>
-						<Loader size={12} />
-						<Text size="xs" c="dimmed">
-							{t("starting")}
-						</Text>
-					</Group>
+					{starting && (
+						<Group gap={4}>
+							<Loader size={12} />
+							<Text size="xs" c="dimmed">
+								{t("starting")}
+							</Text>
+						</Group>
+					)}
 					{buildLogs.length > 0 && (
 						<ScrollArea.Autosize mah={120} type="auto">
 							<Code block style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
@@ -146,6 +148,21 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 						</ScrollArea.Autosize>
 					)}
 				</>
+			)}
+
+			{/* Error alert after failed startup */}
+			{error && (
+				<Alert
+					icon={<IconAlertTriangle size={14} />}
+					color="red"
+					variant="light"
+					withCloseButton
+					onClose={clearError}
+				>
+					<Text size="xs" ff="monospace" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+						{error}
+					</Text>
+				</Alert>
 			)}
 
 			{/* Runtime logs (collapsible) */}

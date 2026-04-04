@@ -14,6 +14,7 @@ export function useContainerEvents(chapterId: string) {
 	const qc = useQueryClient();
 	const [starting, setStarting] = useState(false);
 	const [logs, setLogs] = useState<string[]>([]);
+	const [error, setError] = useState<string | null>(null);
 
 	useEffect(() => {
 		if (!chapterId) return;
@@ -26,6 +27,7 @@ export function useContainerEvents(chapterId: string) {
 				case "container:starting":
 					setStarting(true);
 					setLogs([]);
+					setError(null);
 					break;
 				case "container:log":
 					setLogs((prev) => {
@@ -35,6 +37,7 @@ export function useContainerEvents(chapterId: string) {
 					break;
 				case "container:started":
 					setStarting(false);
+					setError(null);
 					qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 					break;
 				case "container:stopped":
@@ -44,10 +47,12 @@ export function useContainerEvents(chapterId: string) {
 					break;
 				case "container:error":
 					setStarting(false);
+					setError((data.error as string) || "Unknown error");
 					notifications.show({
 						color: "red",
 						title: "Container error",
 						message: (data.error as string) || "Unknown error",
+						autoClose: false,
 					});
 					break;
 			}
@@ -58,5 +63,5 @@ export function useContainerEvents(chapterId: string) {
 		};
 	}, [chapterId, qc]);
 
-	return { starting, logs };
+	return { starting, logs, error, clearError: () => setError(null) };
 }
