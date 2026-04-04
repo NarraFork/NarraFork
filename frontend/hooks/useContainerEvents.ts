@@ -5,6 +5,11 @@ import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const MAX_LOG_LINES = 200;
 
+export interface ContainerLogEntry {
+	line: string;
+	phase: "build" | "start";
+}
+
 /**
  * Subscribe to container lifecycle events (starting/log/started/error) via the
  * global NarratorWSManager.  Automatically invalidates container queries on
@@ -13,7 +18,8 @@ const MAX_LOG_LINES = 200;
 export function useContainerEvents(chapterId: string) {
 	const qc = useQueryClient();
 	const [starting, setStarting] = useState(false);
-	const [logs, setLogs] = useState<string[]>([]);
+	const [logs, setLogs] = useState<ContainerLogEntry[]>([]);
+	const [phase, setPhase] = useState<"build" | "start" | null>(null);
 	const [error, setError] = useState<string | null>(null);
 
 	useEffect(() => {
@@ -27,16 +33,24 @@ export function useContainerEvents(chapterId: string) {
 				case "container:starting":
 					setStarting(true);
 					setLogs([]);
+					setPhase(null);
 					setError(null);
 					break;
-				case "container:log":
+				case "container:log": {
+					const entryPhase = (data.phase as "build" | "start") ?? "build";
+					setPhase(entryPhase);
+					// Skip empty phase-transition markers
+					const line = data.line as string;
+					if (!line) break;
 					setLogs((prev) => {
-						const next = [...prev, data.line as string];
+						const next = [...prev, { line, phase: entryPhase }];
 						return next.length > MAX_LOG_LINES ? next.slice(-MAX_LOG_LINES) : next;
 					});
 					break;
+				}
 				case "container:started":
 					setStarting(false);
+					setPhase(null);
 					setError(null);
 					qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 					break;
@@ -63,5 +77,5 @@ export function useContainerEvents(chapterId: string) {
 		};
 	}, [chapterId, qc]);
 
-	return { starting, logs, error, clearError: () => setError(null) };
+	return { starting, logs, phase, error, clearError: () => setError(null) };
 }

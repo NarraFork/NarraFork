@@ -150,7 +150,7 @@ export type NarraForkEvent =
 	| { type: "container:paused"; chapterId: string }
 	| { type: "container:resumed"; chapterId: string }
 	| { type: "container:error"; chapterId: string; error: string }
-	| { type: "container:log"; chapterId: string; line: string }
+	| { type: "container:log"; chapterId: string; line: string; phase?: "build" | "start" }
 	| { type: "container:starting"; chapterId: string }
 	// Terminal lifecycle
 	| {

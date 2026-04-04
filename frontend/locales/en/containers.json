@@ -4,6 +4,8 @@
 	"stop": "Stop",
 	"remove": "Remove",
 	"starting": "Starting…",
+	"buildPhase": "Build",
+	"startPhase": "Start",
 	"noContainers": "No containers running",
 	"showLogs": "Logs",
 	"hideLogs": "Hide Logs",

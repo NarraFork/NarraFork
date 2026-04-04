@@ -4,6 +4,8 @@
 	"stop": "停止",
 	"remove": "移除",
 	"starting": "启动中…",
+	"buildPhase": "构建",
+	"startPhase": "启动",
 	"noContainers": "无运行中的容器",
 	"showLogs": "日志",
 	"hideLogs": "收起日志",

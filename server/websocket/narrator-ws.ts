@@ -564,7 +564,12 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	});
 
 	eventBus.on("container:log", (event) => {
-		broadcastToAll({ type: "container:log", chapterId: event.chapterId, line: event.line });
+		broadcastToAll({
+			type: "container:log",
+			chapterId: event.chapterId,
+			line: event.line,
+			phase: event.phase,
+		});
 	});
 
 	eventBus.on("container:error", (event) => {

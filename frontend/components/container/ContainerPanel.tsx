@@ -23,7 +23,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useContainerEvents } from "../../hooks/useContainerEvents";
+import { type ContainerLogEntry, useContainerEvents } from "../../hooks/useContainerEvents";
 import {
 	useContainerLogs,
 	useContainers,
@@ -60,7 +60,7 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 	});
 	const start = useStartContainers();
 	const stop = useStopContainers();
-	const { starting, logs: buildLogs, error, clearError } = useContainerEvents(chapterId);
+	const { starting, logs: buildLogs, phase, error, clearError } = useContainerEvents(chapterId);
 	const [logsOpen, setLogsOpen] = useState(false);
 	const [logService, setLogService] = useState<string | null>(null);
 	const [logTail, setLogTail] = useState("100");
@@ -135,15 +135,22 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 					{starting && (
 						<Group gap={4}>
 							<Loader size={12} />
-							<Text size="xs" c="dimmed">
-								{t("starting")}
-							</Text>
+							{phase && (
+								<Badge size="xs" variant="light" color={phase === "build" ? "yellow" : "blue"}>
+									{phase === "build" ? t("buildPhase") : t("startPhase")}
+								</Badge>
+							)}
+							{!phase && (
+								<Text size="xs" c="dimmed">
+									{t("starting")}
+								</Text>
+							)}
 						</Group>
 					)}
 					{buildLogs.length > 0 && (
 						<ScrollArea.Autosize mah={120} type="auto">
 							<Code block style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
-								{buildLogs.join("\n")}
+								{buildLogs.map((entry: ContainerLogEntry) => entry.line).join("\n")}
 							</Code>
 						</ScrollArea.Autosize>
 					)}

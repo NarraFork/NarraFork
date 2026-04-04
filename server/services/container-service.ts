@@ -306,6 +306,49 @@ function isNoiseLine(line: string): boolean {
 	return NOISE_PATTERNS.some((p) => line.includes(p));
 }
 
+/**
+ * Detect whether a compose log line belongs to the "build" or "start" phase.
+ * Lines matching container lifecycle patterns (Container/Network/Volume creating
+ * or started) indicate the start phase; everything before that is build.
+ */
+type ComposePhase = "build" | "start";
+
+// Patterns that indicate container lifecycle (start phase)
+const START_PATTERNS = [
+	/^Container\s+/,
+	/^Network\s+/,
+	/^Volume\s+/,
+	/^Attaching to/,
+	/^Gracefully stopping/,
+	/^Killing /,
+];
+
+// Patterns that indicate build output (build phase)
+const BUILD_PATTERNS = [
+	/^STEP\s+\d+\/\d+:/,
+	/^--> /,
+	/^CACHED/,
+	/^COMMIT/,
+	/^Successfully tagged /,
+	/^error building at step/i,
+	/^error: failed to solve/i,
+	/^\[internal\]/,
+	/^\[build\]/,
+	/^\s*RUN\s/,
+	/^\s*COPY\s/,
+	/^\s*FROM\s/,
+	/^\s*ADD\s/,
+	/^Building\s/,
+];
+
+function isStartLine(line: string): boolean {
+	return START_PATTERNS.some((p) => p.test(line));
+}
+
+function isBuildLine(line: string): boolean {
+	return BUILD_PATTERNS.some((p) => p.test(line));
+}
+
 /** Strip ANSI escape codes from a string. */
 function stripAnsi(s: string): string {
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escape sequences
@@ -858,11 +901,21 @@ export const containerService = {
 				composeArgs.push(...config.services);
 			}
 
+			let currentPhase: ComposePhase = "build";
 			const result = await execStreaming(
 				composeArgs,
 				worktreePath,
 				(line) => {
-					eventBus.emit({ type: "container:log", chapterId, line });
+					// Phase transition: once we see lifecycle lines, switch to "start"
+					if (currentPhase === "build" && isStartLine(line)) {
+						currentPhase = "start";
+						// Emit a phase transition marker
+						eventBus.emit({ type: "container:log", chapterId, line: "", phase: "start" });
+					}
+					const phase = currentPhase;
+					// Re-detect build lines even after switching to start (mixed output)
+					const effectivePhase = isBuildLine(line) ? "build" : phase;
+					eventBus.emit({ type: "container:log", chapterId, line, phase: effectivePhase });
 				},
 				env,
 			);
