@@ -49,6 +49,7 @@ const openaiProviderSchema = z.object({
 	responsesApi: z.boolean().optional(),
 	apiMode: z.enum(["responses", "completions", "codex"]).optional(),
 	codexAccountId: z.string().optional(),
+	disabled: z.boolean().optional(),
 });
 
 const anthropicProviderSchema = z.object({
@@ -62,6 +63,7 @@ const anthropicProviderSchema = z.object({
 	proxy: z.string().optional(),
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
+	disabled: z.boolean().optional(),
 });
 
 	id: z.string().min(1),
@@ -70,6 +72,7 @@ const anthropicProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
+	disabled: z.boolean().optional(),
 });
 
 const nugProviderSchema = z.object({
@@ -81,6 +84,7 @@ const nugProviderSchema = z.object({
 	defaultModel: z.string(),
 	nugUsername: z.string().optional(),
 	nugUserId: z.string().optional(),
+	disabled: z.boolean().optional(),
 });
 
 const clineProviderSchema = z.object({
@@ -91,6 +95,7 @@ const clineProviderSchema = z.object({
 	accessToken: z.string().optional(),
 	defaultModel: z.string(),
 	defaultContextWindow: z.number().int().min(1).optional(),
+	disabled: z.boolean().optional(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
