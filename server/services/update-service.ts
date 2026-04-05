@@ -383,6 +383,7 @@ export async function downloadUpdate(
 		});
 
 		let applied = false;
+		let zstdCliMissing = false;
 
 		// Strategy: direct zstd patch
 		if (execPath && existsSync(execPath)) {
@@ -431,6 +432,7 @@ export async function downloadUpdate(
 									const cli = await getZstdCliPath();
 									if (!cli) {
 										logger.warn("Zstd CLI not available for patch-from mode, skipping");
+										zstdCliMissing = true;
 										throw new Error("zstd CLI required for patch-from mode");
 									}
 									zstdCliPath = cli;
@@ -517,6 +519,7 @@ export async function downloadUpdate(
 						if (meta.mode === "patch-from") {
 							const cli = await getZstdCliPath();
 							if (!cli) {
+								zstdCliMissing = true;
 								throw new Error("zstd CLI required for patch-from mode");
 							}
 							zstdCliPath = cli;
@@ -546,6 +549,12 @@ export async function downloadUpdate(
 		}
 
 		if (!applied) {
+			if (zstdCliMissing) {
+				return {
+					success: false,
+					error: "ZSTD_CLI_MISSING",
+				};
+			}
 			return {
 				success: false,
 				error:

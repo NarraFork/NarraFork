@@ -16,6 +16,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { generateZstdPatch } from "../server/lib/zstd-patch";
 
@@ -289,6 +290,73 @@ if (!existsSync(DIST_DIR)) {
 	mkdirSync(DIST_DIR, { recursive: true });
 }
 
+/**
+ * Find rcodesign binary for cross-platform ad-hoc signing of macOS binaries.
+ * Search order: system PATH → ~/.narrafork/bin/rcodesign
+ */
+function findRcodesign(): string | null {
+	// Check system PATH
+	try {
+		const check = Bun.spawnSync(["rcodesign", "--version"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (check.exitCode === 0) return "rcodesign";
+	} catch {
+		// rcodesign not in PATH
+	}
+
+	// Check ~/.narrafork/bin/
+	const localPath = join(homedir(), ".narrafork", "bin", "rcodesign");
+	if (existsSync(localPath)) {
+		try {
+			const localCheck = Bun.spawnSync([localPath, "--version"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (localCheck.exitCode === 0) return localPath;
+		} catch {
+			// local binary exists but failed to execute
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Ad-hoc sign a macOS Mach-O binary.
+ * Tries rcodesign first (works on any OS), falls back to native codesign on macOS.
+ */
+function adHocSign(filePath: string): boolean {
+	const rcodesign = findRcodesign();
+	if (rcodesign) {
+		const result = Bun.spawnSync([rcodesign, "sign", filePath], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (result.exitCode === 0) {
+			console.log(`✓ Ad-hoc signed (rcodesign): ${relative(ROOT, filePath)}`);
+			return true;
+		}
+		const stderr = new TextDecoder().decode(result.stderr);
+		console.warn(`⚠ rcodesign failed: ${stderr.trim()}`);
+	}
+
+	// Fallback: native codesign on macOS
+	if (process.platform === "darwin") {
+		const result = Bun.spawnSync(["codesign", "--force", "--sign", "-", filePath], {
+			cwd: ROOT,
+			stdio: ["inherit", "inherit", "inherit"],
+		});
+		if (result.exitCode === 0) {
+			console.log(`✓ Ad-hoc signed (codesign): ${relative(ROOT, filePath)}`);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 for (const platform of selectedPlatforms) {
 	console.log(`\n→ Compiling for ${platform.target}...`);
 
@@ -331,24 +399,15 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 	}
 
 	// Ad-hoc codesign for macOS targets (required to bypass Gatekeeper "damaged" error)
+	// Uses rcodesign (cross-platform) with fallback to native codesign (macOS only).
+	// Signing MUST happen before SHA512 computation and patch generation so that
+	// delta patches are based on the signed binary (matching what users actually run).
 	if (platform.target.includes("darwin")) {
-		if (process.platform === "darwin") {
-			const sign = Bun.spawnSync(["codesign", "--force", "--sign", "-", outfile], {
-				cwd: ROOT,
-				stdio: ["inherit", "inherit", "inherit"],
-			});
-			if (sign.exitCode === 0) {
-				console.log(`✓ Ad-hoc signed: ${relative(ROOT, outfile)}`);
-			} else {
-				console.warn(
-					`⚠ codesign failed — users may need to run: codesign --force --sign - ${relative(ROOT, outfile)}`,
-				);
-			}
-		} else {
-			console.log(
-				`ℹ macOS binary built on ${process.platform} — users need to run before first launch:`,
+		const signed = adHocSign(outfile);
+		if (!signed) {
+			console.warn(
+				`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(ROOT, outfile)}`,
 			);
-			console.log(`    codesign --force --sign - ${relative(ROOT, outfile)}`);
 		}
 	}
 
@@ -401,22 +460,8 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 
 console.log("\n✅ All builds completed!");
 console.log("\nBuilt executables:");
-const needsCodesign: string[] = [];
 for (const platform of selectedPlatforms) {
 	console.log(`  - dist/${platform.name}`);
-	if (platform.target.includes("darwin") && process.platform !== "darwin") {
-		needsCodesign.push(platform.name);
-	}
-}
-if (needsCodesign.length > 0) {
-	console.log("\n⚠ macOS binaries were cross-compiled — run on macOS before first launch:");
-	for (const name of needsCodesign) {
-		console.log(`    codesign --force --sign - dist/${name}`);
-	}
-	console.log("  Or remove Gatekeeper quarantine attribute:");
-	for (const name of needsCodesign) {
-		console.log(`    xattr -cr dist/${name}`);
-	}
 }
 
 // ============================================================================

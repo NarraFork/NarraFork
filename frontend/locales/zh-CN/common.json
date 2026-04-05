@@ -226,6 +226,9 @@
 	"updateStopAndApply": "停止服务器并应用",
 	"updateServerStopped": "服务器正在关闭...",
 	"updateRunNewBinary": "启动新的二进制文件以完成更新：",
+	"updateZstdMissingTitle": "未找到 zstd 工具",
+	"updateZstdMissingDesc": "增量更新需要 zstd 命令行工具，但在当前系统上未找到。请安装 zstd 后重试。",
+	"updateZstdInstallCmd": "# macOS\nbrew install zstd\n\n# Debian / Ubuntu\nsudo apt install zstd\n\n# Fedora / RHEL\nsudo dnf install zstd",
 
 	"gitNotInstalled": "未检测到 Git",
 	"gitNotInstalledDesc": "NarraFork 需要 Git 才能正常工作。请安装 Git 后重启应用。",

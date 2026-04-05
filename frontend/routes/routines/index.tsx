@@ -1416,7 +1416,7 @@ function McpToolsTab() {
 										</Text>
 									)}
 									{server.tools.map((tool) => (
-										<Paper key={tool.name} p="xs" bg="var(--mantine-color-dark-7)">
+										<Paper key={tool.name} p="xs" withBorder>
 											<Text size="xs" fw={600}>
 												{tool.name}
 											</Text>

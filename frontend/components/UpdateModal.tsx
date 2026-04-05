@@ -113,7 +113,9 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 
 	const canApply = result?.success && result.instructions && !result.instructions.manual;
 	const serverStopped = applyResult?.success;
-	const downloadError = result && !result.success ? result.error : null;
+	const rawDownloadError = result && !result.success ? result.error : null;
+	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
+	const downloadError = isZstdMissing ? null : rawDownloadError;
 	const applyError = applyResult && !applyResult.success ? applyResult.error : null;
 
 	return (
@@ -239,6 +241,31 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				{downloadError && (
 					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
 						<Text size="sm">{downloadError}</Text>
+					</Alert>
+				)}
+
+				{/* Zstd CLI missing — actionable hint */}
+				{isZstdMissing && (
+					<Alert color="orange" variant="light" icon={<IconAlertTriangle size={16} />}>
+						<Text size="sm" fw={500} mb={4}>
+							{t("updateZstdMissingTitle")}
+						</Text>
+						<Text size="sm">{t("updateZstdMissingDesc")}</Text>
+						<Code block mt={8} style={{ fontSize: "0.75rem" }}>
+							{t("updateZstdInstallCmd")}
+						</Code>
+						<Button
+							variant="light"
+							color="orange"
+							size="xs"
+							mt={8}
+							onClick={() => {
+								reset();
+								if (releaseInfo) download(releaseInfo);
+							}}
+						>
+							{t("retry")}
+						</Button>
 					</Alert>
 				)}
 
