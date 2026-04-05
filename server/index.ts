@@ -32,6 +32,7 @@ import { ensureRootlessEnv } from "./services/container-service";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
 import { registerProjectDbSync } from "./services/project-db-sync";
+import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
 import {
@@ -601,6 +602,9 @@ ensureGlobalOverseer().catch((err) => {
 
 // Register project DB backup sync (event-driven dual-write)
 registerProjectDbSync();
+
+// Register review event handler (inject feedback into source narrator on conclude)
+initReviewEventHandler();
 
 	.catch((err) => {
 	});

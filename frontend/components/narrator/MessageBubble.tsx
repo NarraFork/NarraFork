@@ -34,6 +34,7 @@ import {
 	IconChevronRight,
 	IconCopy,
 	IconEye,
+	IconEyeCheck,
 	IconFile,
 	IconGitFork,
 	IconGitMerge,
@@ -1075,6 +1076,105 @@ function MergeSummaryCard({
 	);
 }
 
+const VERDICT_COLORS: Record<string, string> = {
+	approve: "green",
+	request_changes: "orange",
+	comment_only: "blue",
+};
+
+const VERDICT_ICONS: Record<string, string> = {
+	approve: "\u2705",
+	request_changes: "\u{1F527}",
+	comment_only: "\u{1F4AC}",
+};
+
+function ReviewFeedbackCard({
+	block,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	block: any;
+}) {
+	const { t } = useTranslation("narrator");
+	const [opened, { open, close }] = useDisclosure(false);
+	const verdict: string = block.verdict ?? "comment_only";
+	const findings: Array<{
+		severity: string;
+		file?: string;
+		line?: number;
+		message: string;
+	}> = Array.isArray(block.findings) ? block.findings : [];
+	const color = VERDICT_COLORS[verdict] ?? "gray";
+	const icon = VERDICT_ICONS[verdict] ?? "\u{1F4AC}";
+
+	return (
+		<>
+			<Paper
+				p="xs"
+				radius="sm"
+				style={{
+					backgroundColor: `var(--mantine-color-${color}-light)`,
+					cursor: findings.length > 0 ? "pointer" : undefined,
+				}}
+				onClick={findings.length > 0 ? open : undefined}
+			>
+				<Group gap={6} wrap="nowrap">
+					<IconEyeCheck
+						size={16}
+						style={{ flexShrink: 0, color: `var(--mantine-color-${color}-6)` }}
+					/>
+					<Text size="xs" c={color} lineClamp={1}>
+						{icon} {t("reviewFeedbackLabel")} — {t(`reviewVerdict_${verdict}`)}
+						{findings.length > 0 && ` (${findings.length})`}
+					</Text>
+				</Group>
+			</Paper>
+
+			{findings.length > 0 && (
+				<Modal
+					opened={opened}
+					onClose={close}
+					title={
+						<Group gap="xs">
+							<IconEyeCheck size={18} style={{ color: `var(--mantine-color-${color}-6)` }} />
+							<Text fw={600}>
+								{t("reviewFeedbackTitle")} — {t(`reviewVerdict_${verdict}`)}
+							</Text>
+						</Group>
+					}
+					size="lg"
+				>
+					<Stack gap="xs">
+						{findings.map((f) => (
+							<Paper
+								key={`${f.severity}-${f.file ?? ""}-${f.line ?? ""}-${f.message.slice(0, 40)}`}
+								p="xs"
+								radius="sm"
+								withBorder
+								style={{ borderColor: `var(--mantine-color-${color}-4)` }}
+							>
+								<Group gap={4} mb={4}>
+									<Badge size="xs" variant="light" color={color}>
+										{f.severity}
+									</Badge>
+									{f.file && (
+										<Code fz="xs">
+											{f.file}
+											{f.line ? `:${f.line}` : ""}
+										</Code>
+									)}
+								</Group>
+								<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+									{f.message}
+								</Text>
+							</Paper>
+						))}
+					</Stack>
+				</Modal>
+			)}
+		</>
+	);
+}
+
 function PlanCard({
 	summary,
 	narratorId,
@@ -1394,6 +1494,13 @@ export const MessageBubble = memo(function MessageBubble({
 				onDelete={invalidateMessages}
 			/>
 		);
+	}
+
+	// Review feedback cards — injected by review-event-handler when a review concludes
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const reviewFeedbackBlock = blocks.find((b: any) => b.type === "review_feedback");
+	if (reviewFeedbackBlock) {
+		return <ReviewFeedbackCard block={reviewFeedbackBlock} />;
 	}
 
 	// System messages (compact indicators / plan cards / error notices)

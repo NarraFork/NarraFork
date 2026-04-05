@@ -296,5 +296,10 @@
 	"fileMod_roleAssistant": "Assistant",
 	"fileMod_roleSystem": "System",
 	"toolSkillFiles": "Attached files",
-	"toolSkillLoaded": "Skill loaded"
+	"toolSkillLoaded": "Skill loaded",
+	"reviewFeedbackLabel": "Code Review",
+	"reviewFeedbackTitle": "Review Findings",
+	"reviewVerdict_approve": "Approved",
+	"reviewVerdict_request_changes": "Changes Requested",
+	"reviewVerdict_comment_only": "Comments Only"
 }

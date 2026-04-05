@@ -296,5 +296,10 @@
 	"fileMod_roleAssistant": "助手",
 	"fileMod_roleSystem": "系统",
 	"toolSkillFiles": "附带文件",
-	"toolSkillLoaded": "技能已加载"
+	"toolSkillLoaded": "技能已加载",
+	"reviewFeedbackLabel": "代码评审",
+	"reviewFeedbackTitle": "评审发现",
+	"reviewVerdict_approve": "已通过",
+	"reviewVerdict_request_changes": "需要修改",
+	"reviewVerdict_comment_only": "仅评论"
 }
