@@ -149,11 +149,12 @@ export const chapterMerge = {
 			},
 		);
 
-		// Record target HEAD before merge for reliable unmerge
-		const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
-
-		// Lock the target worktree to prevent concurrent git operations
+		// Lock the target worktree to prevent concurrent git operations.
+		// preMergeTargetSha is captured INSIDE the lock to eliminate the race
+		// window where another operation could modify the target between the
+		// SHA read and the actual merge.
 		return worktreeLock.acquire(targetWorktree, async () => {
+			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			let result: MergeResult;
 			if (strategy === "cherry-pick") {
 				const baseSha = await gitService.getMergeBase(gitPath, target.branch, source.branch);
@@ -194,16 +195,33 @@ export const chapterMerge = {
 							preMergeTargetSha,
 						);
 					} catch (retryErr) {
-						// DB is inconsistent but git merge succeeded — return success
-						// with a warning so the caller doesn't retry the git operation.
-						logger.error("Retry also failed, DB state may be inconsistent", {
+						// DB update failed twice — try to undo the git merge so we
+						// don't leave git and DB in an inconsistent state.
+						logger.error("Retry also failed, attempting git rollback", {
 							sourceChapterId,
 							error: String(retryErr),
 						});
-						return {
-							...result,
-							warning: `Git merge succeeded but database update failed: ${String(retryErr)}`,
-						};
+						try {
+							await gitService.resetHard(targetWorktree, preMergeTargetSha);
+							logger.info("Git rollback succeeded after DB failure", {
+								sourceChapterId,
+							});
+							return {
+								success: false,
+								warning: `Merge rolled back: database update failed after git merge. Please retry. (${String(retryErr)})`,
+							};
+						} catch (resetErr) {
+							// Both DB and git rollback failed — critical state
+							logger.error("CRITICAL: Both DB update and git rollback failed", {
+								sourceChapterId,
+								dbError: String(retryErr),
+								gitError: String(resetErr),
+							});
+							return {
+								...result,
+								warning: `CRITICAL: Git merge succeeded but database update failed, and git rollback also failed. Manual intervention required. DB error: ${String(retryErr)}`,
+							};
+						}
 					}
 				}
 			} else if (result.conflictFiles) {
@@ -258,10 +276,8 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
-		// Record target HEAD before merge for reliable unmerge
-		const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
-
-		// Collect commit messages and diff stat BEFORE the merge
+		// Collect commit messages and diff stat BEFORE the merge — this is a
+		// read-only operation so it's safe (and desirable) to run outside the lock.
 		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
 			(err) => {
 				logger.warn("Failed to collect pre-merge context for AI resolve (non-fatal)", {
@@ -272,8 +288,10 @@ export const chapterMerge = {
 			},
 		);
 
-		// Lock the target worktree for the entire AI resolution
+		// Lock the target worktree for the entire AI resolution.
+		// preMergeTargetSha is captured inside the lock (same rationale as merge()).
 		return worktreeLock.acquire(targetWorktree, async () => {
+			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			let conflictFiles: string[];
 
 			if (strategy === "cherry-pick") {
@@ -699,9 +717,6 @@ export const chapterMerge = {
 			},
 		);
 
-		// Record target HEAD before merge for reliable unmerge
-		const preMergeTargetSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
-
 		// Step 1: Fork a temporary chapter from trunk
 		const tempTitle = `merge-resolve-${generateShortId(6)}`;
 		let tempChapter: { id: string; worktreePath: string | null; branch: string };
@@ -741,7 +756,6 @@ export const chapterMerge = {
 					commitSha ?? undefined,
 					options.userId,
 					mergeContext,
-					preMergeTargetSha,
 					gitPath,
 					chapterService,
 				);
@@ -813,7 +827,6 @@ export const chapterMerge = {
 				commitSha ?? undefined,
 				options.userId,
 				mergeContext,
-				preMergeTargetSha,
 				gitPath,
 				chapterService,
 			);
@@ -846,7 +859,6 @@ export const chapterMerge = {
 		_commitSha: string | undefined,
 		userId: string | undefined,
 		mergeContext: { commits: string[]; diffStat: string },
-		preMergeTargetSha: string,
 		gitPath: string,
 		chapterService: { remove: (id: string) => Promise<unknown> },
 	): Promise<RulerAiResolveResult> {
@@ -856,6 +868,10 @@ export const chapterMerge = {
 		if (!target?.worktreePath) {
 			return { resolved: false, error: "Target chapter lost worktree during resolve" };
 		}
+
+		// Capture target HEAD right before the merge — this is the most
+		// accurate point for unmerge since AI resolution may have taken a while.
+		const preMergeTargetSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
 
 		// Merge temp branch into trunk (should be clean merge or fast-forward)
 		const trunkMerge = await gitService.merge(
