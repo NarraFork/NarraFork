@@ -55,6 +55,7 @@ export const chapterFork = {
 		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 		const gitPath = project.gitPath;
 
+		const warnings: string[] = [];
 		const inheritMode = input.inheritMode ?? "full";
 		const autoTitle = `${parent.title.slice(0, 180)}-fork-${generateShortId(6)}`;
 		const title = input.title || autoTitle;
@@ -158,6 +159,9 @@ export const chapterFork = {
 						childChapterId: id,
 						error: String(err),
 					});
+					warnings.push(
+						`File snapshot restore failed: ${String(err)}. The forked worktree may be missing uncommitted changes from the parent.`,
+					);
 				}
 			}
 
@@ -295,6 +299,9 @@ export const chapterFork = {
 						chapterId: id,
 						error: String(err),
 					});
+					warnings.push(
+						`Container startup failed: ${String(err)}. The container config is preserved — you can retry from the chapter detail page.`,
+					);
 					// Ensure ports are released (startChapterContainers releases on
 					// failure internally, but double-check to prevent leaks)
 					try {
@@ -302,12 +309,7 @@ export const chapterFork = {
 					} catch {
 						// ignore
 					}
-					// Clear containerConfig so dormant/wake won't try to manage
-					// containers that were never started
-					await db
-						.update(chapters)
-						.set({ containerConfig: null, updatedAt: now })
-						.where(eq(chapters.id, id));
+					// Keep containerConfig so the user can retry manually
 				}
 			}
 
@@ -344,7 +346,7 @@ export const chapterFork = {
 			});
 
 			eventBus.emit({ type: "chapter:forked", chapterId: id, parentId: parentChapterId });
-			return chapter;
+			return warnings.length > 0 ? { ...chapter, warnings } : chapter;
 		} catch (err) {
 			logger.error("Chapter fork failed, rolling back", { error: String(err) });
 			for (const fn of rollback.reverse()) {

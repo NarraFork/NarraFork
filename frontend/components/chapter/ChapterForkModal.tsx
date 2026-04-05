@@ -9,6 +9,7 @@ import {
 	Textarea,
 	TextInput,
 } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
@@ -75,6 +76,17 @@ export function ChapterForkModal({
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+			// Show warnings as toast notifications if any
+			if (data?.warnings && Array.isArray(data.warnings)) {
+				for (const warning of data.warnings) {
+					notifications.show({
+						color: "yellow",
+						title: t("forkWarning"),
+						message: String(warning),
+						autoClose: 10_000,
+					});
+				}
+			}
 			if (onForkSuccess && data?.id) {
 				handleClose();
 				onForkSuccess(data.id);

@@ -22,6 +22,7 @@
 	"inheritCompressed": "Compressed (summary)",
 	"inheritFull": "Full (complete history)",
 	"forkFailed": "Fork failed",
+	"forkWarning": "Fork warning",
 	"forkSuccess": "Fork Created",
 	"forkCreatedClick": "\"{{title}}\" created. Click to open.",
 	"forkNavigatePrompt": "Chapter \"{{title}}\" has been created. Go to its conversation?",
