@@ -200,34 +200,67 @@ export const reviewService = {
 	 * Build diff context string for the review narrator's system prompt.
 	 * Shows the source chapter's changes relative to its base branch,
 	 * plus any uncommitted/untracked changes in the source worktree.
+	 *
+	 * Diff output is capped at ~80k chars (~20k tokens) to avoid exceeding
+	 * the model's context window.  Committed changes take priority; uncommitted
+	 * changes fill the remaining budget.
 	 */
 	async buildDiffContext(
 		gitPath: string,
 		source: typeof chapters.$inferSelect,
 		sourceHeadSha: string,
 	): Promise<string> {
+		// ~20k tokens ≈ 80k chars — leave room for the rest of the system prompt
+		const MAX_DIFF_CHARS = 80_000;
+		const TRUNCATION_COMMITTED =
+			"\n\n[Diff truncated — committed changes exceed size limit. " +
+			"Use the Read and Grep tools to examine specific files in detail.]\n";
+		const TRUNCATION_UNCOMMITTED =
+			"\n\n[Uncommitted diff truncated. " +
+			"Use the Read and Grep tools to examine specific files in detail.]\n";
+
 		const parts: string[] = [];
+		let totalLen = 0;
+
+		// Committed diff (higher priority)
 		try {
 			const baseRef = source.startCommitSha ?? source.baseBranch;
 			const committedDiff = await gitService.getDiffBetweenRefs(gitPath, baseRef, sourceHeadSha);
 			if (committedDiff.trim()) {
-				parts.push(committedDiff);
+				if (committedDiff.length <= MAX_DIFF_CHARS) {
+					parts.push(committedDiff);
+					totalLen += committedDiff.length;
+				} else {
+					parts.push(truncateAtLine(committedDiff, MAX_DIFF_CHARS));
+					totalLen = MAX_DIFF_CHARS;
+					parts.push(TRUNCATION_COMMITTED);
+				}
 			}
 		} catch (err) {
 			logger.warn("Failed to get committed diff for review context", { error: String(err) });
 		}
 
-		// Include uncommitted changes from the source worktree
-		const sourceWorktree = source.worktreePath ?? gitPath;
-		try {
-			const uncommittedDiff = await gitService.getFullDiff(sourceWorktree);
-			if (uncommittedDiff.trim()) {
-				parts.push("\n--- Uncommitted changes in source worktree ---\n", uncommittedDiff);
+		// Uncommitted diff (lower priority, only if budget remains)
+		if (totalLen < MAX_DIFF_CHARS) {
+			const sourceWorktree = source.worktreePath ?? gitPath;
+			try {
+				const uncommittedDiff = await gitService.getFullDiff(sourceWorktree);
+				if (uncommittedDiff.trim()) {
+					const header = "\n--- Uncommitted changes in source worktree ---\n";
+					const remaining = MAX_DIFF_CHARS - totalLen;
+					if (uncommittedDiff.length + header.length <= remaining) {
+						parts.push(header, uncommittedDiff);
+					} else {
+						const budget = remaining - header.length;
+						parts.push(header, budget > 0 ? truncateAtLine(uncommittedDiff, budget) : "");
+						parts.push(TRUNCATION_UNCOMMITTED);
+					}
+				}
+			} catch (err) {
+				logger.warn("Failed to get uncommitted diff for review context", {
+					error: String(err),
+				});
 			}
-		} catch (err) {
-			logger.warn("Failed to get uncommitted diff for review context", {
-				error: String(err),
-			});
 		}
 
 		if (parts.length === 0) {
@@ -606,3 +639,10 @@ export const reviewService = {
 		}
 	},
 };
+
+/** Truncate a string at the last newline before `maxLen`, avoiding mid-line cuts. */
+function truncateAtLine(text: string, maxLen: number): string {
+	if (text.length <= maxLen) return text;
+	const lastNewline = text.lastIndexOf("\n", maxLen);
+	return lastNewline > 0 ? text.slice(0, lastNewline) : text.slice(0, maxLen);
+}
