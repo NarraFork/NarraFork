@@ -175,16 +175,12 @@ export const reviewService = {
 				sourceChapterId,
 			});
 
-			// Step 7: Auto-start the review by sending the initial message
+			// Step 7: Auto-start the review by sending the initial message.
+			// Awaited so that a failure triggers the outer catch → rollback.
+			// A review that can't start is useless — better to roll back cleanly.
 			const locale = input.locale ?? "en";
 			const startMsg = getReviewStartMessage(locale);
-			sendMessage(narrator.id, startMsg, undefined, locale).catch((err) => {
-				logger.error("Failed to auto-start review", {
-					reviewChapterId: id,
-					narratorId: narrator.id,
-					error: String(err),
-				});
-			});
+			await sendMessage(narrator.id, startMsg, undefined, locale);
 
 			return chapter;
 		} catch (err) {
