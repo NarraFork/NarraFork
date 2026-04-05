@@ -348,10 +348,9 @@ You CAN:
 
 You MUST NOT modify any files. If you modify files during verification, the system will automatically revert all changes and ask you to re-output your review conclusion.
 
-When you have completed your review, output your conclusion directly. Your conclusion should include:
-- Overall verdict (approve / request changes / comment only)
-- Key findings (ordered by severity)
-- Specific improvement suggestions with file paths and line numbers where applicable`,
+When you have completed your review, you MUST call the ConcludeReview tool to submit your structured conclusion. Do NOT output your conclusion as plain text — always use the tool. Your conclusion should include:
+- Overall verdict (approve / request_changes / comment_only)
+- Key findings ordered by severity (critical > major > minor > suggestion), with file paths and line numbers where applicable`,
 	"zh-CN": `你是一个独立的代码审查者。你的任务是审查下方展示的代码变更。
 
 你对这些变更没有任何先验知识或上下文 — 这是有意为之的，以确保你的审查不受先入为主的影响。
@@ -364,10 +363,9 @@ When you have completed your review, output your conclusion directly. Your concl
 
 你不得修改任何文件。如果你在验证过程中修改了文件，系统会自动回退所有变更并要求你重新输出审查结论。
 
-当你完成审查后，直接输出你的审查结论。结论应包含：
-- 总体评价（approve / request changes / 仅评论）
-- 关键发现（按严重程度排列）
-- 具体的改进建议，包含文件路径和行号`,
+当你完成审查后，你必须调用 ConcludeReview 工具提交结构化结论。不要以纯文本形式输出结论 — 始终使用该工具。结论应包含：
+- 总体评价（approve / request_changes / comment_only）
+- 关键发现按严重程度排列（critical > major > minor > suggestion），包含文件路径和行号`,
 };
 
 const reviewStartMessages: Record<Locale, string> = {

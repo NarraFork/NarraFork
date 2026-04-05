@@ -18,6 +18,7 @@ import {
 	overseers,
 	portAllocations,
 	projects,
+	reviewConclusions,
 	terminals,
 	terminalTabs,
 	terminalViewState,
@@ -64,6 +65,8 @@ export const chaptersRelations = relations(chapters, ({ one, many }) => ({
 	portAllocations: many(portAllocations),
 	commits: many(chapterCommits),
 	snapshotApplications: many(volumeSnapshotApplications),
+	reviewConclusionsAsReview: many(reviewConclusions, { relationName: "reviewChapter" }),
+	reviewConclusionsAsSource: many(reviewConclusions, { relationName: "sourceChapter" }),
 }));
 
 export const chapterEdgesRelations = relations(chapterEdges, ({ one }) => ({
@@ -320,5 +323,18 @@ export const workspacesRelations = relations(workspaces, ({ one }) => ({
 	user: one(users, {
 		fields: [workspaces.userId],
 		references: [users.id],
+	}),
+}));
+
+export const reviewConclusionsRelations = relations(reviewConclusions, ({ one }) => ({
+	reviewChapter: one(chapters, {
+		fields: [reviewConclusions.reviewChapterId],
+		references: [chapters.id],
+		relationName: "reviewChapter",
+	}),
+	sourceChapter: one(chapters, {
+		fields: [reviewConclusions.sourceChapterId],
+		references: [chapters.id],
+		relationName: "sourceChapter",
 	}),
 }));

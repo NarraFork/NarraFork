@@ -1,8 +1,8 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapterEdges, chapters, narrators, projects } from "../db/schema";
+import { chapterEdges, chapters, narrators, projects, reviewConclusions } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId, generateShortId } from "../lib/id";
@@ -332,6 +332,8 @@ export const reviewService = {
 
 	/**
 	 * Mark a review as concluded when the agent loop ends cleanly.
+	 * If a structured conclusion exists in review_conclusions (written by ConcludeReview tool),
+	 * the review is concluded with that data. Otherwise, it's concluded without structured data.
 	 */
 	async concludeReview(reviewChapterId: string) {
 		const chapter = await db.query.chapters.findFirst({
@@ -354,6 +356,28 @@ export const reviewService = {
 		});
 
 		logger.info("Review concluded", { reviewChapterId });
+	},
+
+	/**
+	 * Get the latest structured conclusion for a review chapter.
+	 * Returns null if no structured conclusion was submitted via ConcludeReview tool.
+	 */
+	async getConclusion(reviewChapterId: string) {
+		return db.query.reviewConclusions.findFirst({
+			where: eq(reviewConclusions.reviewChapterId, reviewChapterId),
+			orderBy: [desc(reviewConclusions.createdAt)],
+		});
+	},
+
+	/**
+	 * Get the latest structured conclusion for a source chapter (across all its reviews).
+	 * Returns the most recent conclusion from any review of this source chapter.
+	 */
+	async getLatestConclusionForSource(sourceChapterId: string) {
+		return db.query.reviewConclusions.findFirst({
+			where: eq(reviewConclusions.sourceChapterId, sourceChapterId),
+			orderBy: [desc(reviewConclusions.createdAt)],
+		});
 	},
 
 	/**

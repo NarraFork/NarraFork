@@ -22,7 +22,7 @@ import { buildHistory, type PermissionResult, resolveProviderAndModel } from "..
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { detectShell } from "../lib/agent/shell";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
-import { OPTIONAL_TOOLS, OVERSEER_TOOLS } from "../lib/agent/tools/index";
+import { OPTIONAL_TOOLS, OVERSEER_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
@@ -3061,6 +3061,10 @@ async function runAgentLoop(
 					// Overseer tools: only available if this narrator is an overseer
 					if (OVERSEER_TOOLS.has(tool.name)) {
 						return active._isOverseer;
+					}
+					// Review tools: only available for review chapter narrators
+					if (REVIEW_TOOLS.has(tool.name)) {
+						return active._chapterRole === "review";
 					}
 					return true;
 				},

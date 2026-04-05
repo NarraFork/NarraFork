@@ -5,6 +5,7 @@ import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { taskStopTool } from "./cancel-background-task";
 import { taskOutputTool } from "./check-background-task";
+import { concludeReviewTool } from "./conclude-review";
 import { continueTaskTool } from "./continue-task";
 import { editTool } from "./edit";
 import { forkNarratorTool } from "./fork-narrator";
@@ -55,6 +56,13 @@ export const OVERSEER_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["GetNarratorContext", getNarratorContextTool],
 ]);
 
+/**
+ * Review-only tools — only injected for narrators in review chapters.
+ */
+export const REVIEW_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
+	["ConcludeReview", concludeReviewTool],
+]);
+
 /** Register all core tools into the singleton registry */
 export function registerCoreTools(): void {
 	toolRegistry.register(bashTool);
@@ -82,6 +90,11 @@ export function registerCoreTools(): void {
 
 	// Register overseer tools (hidden by default, injected for overseer narrators)
 	for (const tool of OVERSEER_TOOLS.values()) {
+		toolRegistry.register(tool);
+	}
+
+	// Register review tools (hidden by default, injected for review narrators)
+	for (const tool of REVIEW_TOOLS.values()) {
 		toolRegistry.register(tool);
 	}
 }

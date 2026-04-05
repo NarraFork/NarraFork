@@ -323,6 +323,8 @@ export const narratorMessageRefs = sqliteTable(
 		isCompact: integer("is_compact").notNull().default(0),
 		/** Pruned percent at the time this message was sent (inherited on fork) */
 		prunedPercent: integer("pruned_percent"),
+		/** Points to the segment-compact summary message that hides this ref. */
+		segmentCompactId: text("segment_compact_id"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
@@ -772,6 +774,36 @@ export const volumeSnapshotApplications = sqliteTable(
 	(table) => [
 		index("idx_snapshot_applications_snapshot").on(table.snapshotId),
 		index("idx_snapshot_applications_chapter").on(table.chapterId),
+	],
+);
+
+// === review_conclusions ===
+export const reviewConclusions = sqliteTable(
+	"review_conclusions",
+	{
+		id: text("id").primaryKey(),
+		reviewChapterId: text("review_chapter_id")
+			.notNull()
+			.references(() => chapters.id, { onDelete: "cascade" }),
+		sourceChapterId: text("source_chapter_id")
+			.notNull()
+			.references(() => chapters.id, { onDelete: "cascade" }),
+		verdict: text("verdict", {
+			enum: ["approve", "request_changes", "comment_only"],
+		}).notNull(),
+		findingsJson: text("findings_json", { mode: "json" }).$type<
+			Array<{
+				severity: "critical" | "major" | "minor" | "suggestion";
+				file?: string;
+				line?: number;
+				message: string;
+			}>
+		>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_review_conclusions_review").on(table.reviewChapterId),
+		index("idx_review_conclusions_source").on(table.sourceChapterId),
 	],
 );
 

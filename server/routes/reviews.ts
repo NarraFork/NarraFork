@@ -8,6 +8,23 @@ export const reviewsRouter = new Hono();
 // (This is mounted on the chapters router, not here — see chapters.ts)
 // The routes below handle review-specific operations.
 
+// GET /api/reviews/:id/conclusion — Get the structured review conclusion
+reviewsRouter.get("/:id/conclusion", async (c) => {
+	const reviewChapterId = c.req.param("id");
+	const conclusion = await reviewService.getConclusion(reviewChapterId);
+	if (!conclusion) {
+		return c.json({ conclusion: null });
+	}
+	return c.json({ conclusion });
+});
+
+// GET /api/reviews/by-source/:sourceChapterId/conclusion — Get latest conclusion for a source chapter
+reviewsRouter.get("/by-source/:sourceChapterId/conclusion", async (c) => {
+	const sourceChapterId = c.req.param("sourceChapterId");
+	const conclusion = await reviewService.getLatestConclusionForSource(sourceChapterId);
+	return c.json({ conclusion: conclusion ?? null });
+});
+
 // POST /api/reviews/:id/convert-to-subagent
 reviewsRouter.post("/:id/convert-to-subagent", async (c) => {
 	const reviewChapterId = c.req.param("id");
