@@ -664,6 +664,8 @@
 	"storageCleanupConfirm": "Are you sure? This action cannot be undone.",
 	"storageCleanupSuccess": "Cleaned up {{count}} items, freed {{size}}",
 	"storageCleanupContainersSuccess": "Prune completed",
+	"storageScanFailed": "Storage scan failed",
+	"storageCleanupFailed": "Storage cleanup failed",
 	"storageNotScanned": "Click Scan to analyze storage usage",
 	"storageScanProgress_scanning_database": "Scanning database...",
 	"storageScanProgress_scanning_uploads": "Scanning uploads...",
@@ -707,5 +709,7 @@
 	"runtimeCleanupBrowsersSuccess": "Closed {{count}} session(s), browser stopped",
 
 	"runtimeCleanupConfirm": "Are you sure? This will terminate the selected resources.",
+	"runtimeScanFailed": "Runtime scan failed",
+	"runtimeCleanupFailed": "Runtime cleanup failed",
 	"runtimeNone": "None"
 }

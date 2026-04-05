@@ -119,6 +119,10 @@ export function StorageSection() {
 		} catch (err) {
 			if ((err as Error).name !== "AbortError") {
 				console.error("Storage scan failed:", err);
+				notifications.show({
+					color: "red",
+					message: t("storageScanFailed"),
+				});
 			}
 		} finally {
 			setScanning(false);
@@ -151,6 +155,10 @@ export function StorageSection() {
 			}
 		} catch (err) {
 			console.error("Cleanup failed:", err);
+			notifications.show({
+				color: "red",
+				message: t("storageCleanupFailed"),
+			});
 		} finally {
 			setCleaningTarget(null);
 		}

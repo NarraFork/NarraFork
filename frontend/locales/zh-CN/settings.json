@@ -664,6 +664,8 @@
 	"storageCleanupConfirm": "确定要执行此操作吗？此操作不可撤销。",
 	"storageCleanupSuccess": "已清理 {{count}} 项，释放 {{size}}",
 	"storageCleanupContainersSuccess": "清理完成",
+	"storageScanFailed": "存储扫描失败",
+	"storageCleanupFailed": "存储清理失败",
 	"storageNotScanned": "点击扫描以分析储存空间使用情况",
 	"storageScanProgress_scanning_database": "正在扫描数据库...",
 	"storageScanProgress_scanning_uploads": "正在扫描上传文件...",
@@ -707,5 +709,7 @@
 	"runtimeCleanupBrowsersSuccess": "已关闭 {{count}} 个会话，浏览器已停止",
 
 	"runtimeCleanupConfirm": "确定要执行此操作吗？这将终止选中的资源。",
+	"runtimeScanFailed": "运行时扫描失败",
+	"runtimeCleanupFailed": "运行时清理失败",
 	"runtimeNone": "无"
 }

@@ -45,6 +45,10 @@ export function RuntimeSection() {
 			setScanResult(result);
 		} catch (err) {
 			console.error("Runtime scan failed:", err);
+			notifications.show({
+				color: "red",
+				message: t("runtimeScanFailed"),
+			});
 		} finally {
 			setScanning(false);
 		}
@@ -79,6 +83,10 @@ export function RuntimeSection() {
 			}
 		} catch (err) {
 			console.error("Cleanup failed:", err);
+			notifications.show({
+				color: "red",
+				message: t("runtimeCleanupFailed"),
+			});
 		} finally {
 			setCleaningTarget(null);
 		}

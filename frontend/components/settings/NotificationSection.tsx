@@ -121,7 +121,7 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 
 	const saveWebhookField = (field: string, value: string) => {
 		if (value.startsWith("*")) return;
-		updateUserPref.mutate({ [field]: value });
+		updateUserPref.mutate({ [field]: value || "" });
 	};
 
 	return (

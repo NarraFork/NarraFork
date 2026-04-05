@@ -174,7 +174,13 @@ function AdminUsersPage() {
 													<ActionIcon
 														color="red"
 														variant="subtle"
-														onClick={() => deleteUser.mutate(u.id)}
+														onClick={() => {
+															if (
+																window.confirm(t("confirmDeleteUser", { username: u.username }))
+															) {
+																deleteUser.mutate(u.id);
+															}
+														}}
 														loading={deleteUser.isPending}
 													>
 														<IconTrash size={16} />

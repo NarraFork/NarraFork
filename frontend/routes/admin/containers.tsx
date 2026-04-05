@@ -10,6 +10,7 @@ import {
 	ThemeIcon,
 	Title,
 } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { IconArrowLeft, IconCheck, IconRefresh, IconX } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
@@ -42,6 +43,11 @@ function AdminContainersPage() {
 		try {
 			const fresh = await api.getContainerSetup(true);
 			qc.setQueryData(["containerSetup"], fresh);
+		} catch {
+			notifications.show({
+				color: "red",
+				message: t("containerRecheckFailed"),
+			});
 		} finally {
 			setRechecking(false);
 		}
