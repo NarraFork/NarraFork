@@ -3476,16 +3476,14 @@ async function runAgentLoop(
 
 			// Check for buffered messages BEFORE transitioning to "done" —
 			// this prevents spurious notifications when there are queued messages.
-			const queue = bufferedMessages.get(narratorId);
-			const buffered = queue?.[0];
-			if (buffered) {
-				queue?.shift();
-				if (queue?.length === 0) bufferedMessages.delete(narratorId);
-				const finalNarrator = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { status: true },
-				});
-				if (finalNarrator?.status !== "error") {
+			// When the loop had an error, skip consumption entirely so queued
+			// messages are preserved for the user to retry or dismiss.
+			if (!loopHadError) {
+				const queue = bufferedMessages.get(narratorId);
+				const buffered = queue?.[0];
+				if (buffered) {
+					queue?.shift();
+					if (queue?.length === 0) bufferedMessages.delete(narratorId);
 					// Broadcast which message was consumed + remaining queue snapshot
 					const remaining = toBufferSummary(getBufferedMessages(narratorId));
 					broadcastToNarrator(narratorId, {
@@ -3549,11 +3547,6 @@ async function runAgentLoop(
 					currentImages = buffered.images;
 					continue;
 				}
-				broadcastToNarrator(narratorId, {
-					type: "buffer_cleared",
-					narratorId,
-					reason: "narrator_error",
-				});
 			}
 
 			// Check for queued overseer permission requests before transitioning to done.
@@ -3663,7 +3656,21 @@ async function runAgentLoop(
 		pendingPlanCompact.delete(narratorId);
 		pendingPlanApprover.delete(narratorId);
 		pendingPlanDiff.delete(narratorId);
-		bufferedMessages.delete(narratorId);
+		// When the loop ended with an error, preserve buffered messages so the
+		// user can retry and the queue will resume automatically.  Notify the
+		// frontend so it keeps showing the queued messages.
+		if (loopHadError) {
+			const preserved = bufferedMessages.get(narratorId);
+			if (preserved?.length) {
+				broadcastToNarrator(narratorId, {
+					type: "buffer_preserved",
+					narratorId,
+					messages: toBufferSummary(preserved),
+				});
+			}
+		} else {
+			bufferedMessages.delete(narratorId);
+		}
 
 		// Drain any remaining overseer queue items — notify source narrators
 		// that the overseer is no longer reviewing so the UI clears the
@@ -3874,6 +3881,134 @@ async function doRunCustomCompact(
 			type: "compact_failed",
 			narratorId,
 			messageId: compactingMsg.id,
+		});
+		throw err;
+	}
+}
+
+// === Segment compact (compress a selected subset of messages) ===
+
+/**
+ * Run a segment compact: compress a user-selected set of messages into a
+ * single inline summary. Unlike full compact, this does NOT affect the
+ * narrator's contextSummary — the summary lives inline in the message stream.
+ */
+export async function runSegmentCompact(
+	narratorId: string,
+	locale: Locale,
+	messageIds: string[],
+): Promise<void> {
+	const existing = compactLocks.get(narratorId);
+	if (existing) {
+		await existing.catch(() => {});
+		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+		return;
+	}
+
+	let timer: ReturnType<typeof setTimeout>;
+	const promise = Promise.race([
+		doRunSegmentCompact(narratorId, locale, messageIds),
+		new Promise<void>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error("Segment compact timed out after 5 minutes")),
+				COMPACT_TIMEOUT_MS,
+			);
+		}),
+	]);
+	compactLocks.set(narratorId, promise);
+	try {
+		await promise;
+	} catch (err) {
+		logger.error("Segment compact failed or timed out", {
+			narratorId,
+			error: String(err),
+		});
+		throw err;
+	} finally {
+		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
+		clearTimeout(timer!);
+		compactLocks.delete(narratorId);
+	}
+}
+
+async function doRunSegmentCompact(
+	narratorId: string,
+	locale: Locale,
+	messageIds: string[],
+): Promise<void> {
+	logger.info("Starting segment compact", { narratorId, messageCount: messageIds.length });
+
+	// Insert a "compacting" marker and hide the target messages
+	const markerMsg = await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
+	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
+	broadcastToNarrator(narratorId, { type: "compacting", narratorId });
+
+	try {
+		// Fetch the messages to summarize (they are still in DB, just hidden from refs)
+		const messages = await narratorService.getMessagesForSegmentCompact(narratorId, messageIds);
+
+		if (messages.length === 0) {
+			// Nothing to compact — clean up
+			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
+			broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+			return;
+		}
+
+		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+			narratorId,
+			locale,
+			messages,
+			null,
+		);
+
+		const finalizedMsg = await narratorService.finalizeSegmentCompact(
+			markerMsg.id,
+			narratorId,
+			summary,
+			contextPercent,
+		);
+
+		if (finalizedMsg) {
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: finalizedMsg });
+		}
+
+		logger.info("Segment compact completed", {
+			narratorId,
+			messageCount: messageIds.length,
+			summaryLength: summary.length,
+		});
+		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+	} catch (err) {
+		const errorMsg = err instanceof Error ? err.message : String(err);
+		logger.error("Segment compact failed", {
+			narratorId,
+			messageId: markerMsg.id,
+			error: errorMsg,
+		});
+
+		const failedSummary = `${COMPACT_FAILURE_TEXT}\n${errorMsg}`;
+		const failedMsg = await narratorService
+			.finalizeSegmentCompact(markerMsg.id, narratorId, failedSummary, undefined, {
+				status: "failed",
+				error: errorMsg,
+			})
+			.catch((e) => {
+				logger.error("Failed to finalize failed segment compact marker", {
+					narratorId,
+					messageId: markerMsg.id,
+					error: String(e),
+				});
+				return null;
+			});
+
+		if (failedMsg) {
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
+		}
+
+		broadcastToNarrator(narratorId, {
+			type: "compact_failed",
+			narratorId,
+			messageId: markerMsg.id,
 		});
 		throw err;
 	}

@@ -2167,6 +2167,35 @@ export function NarratorPanel({
 		}
 	}, [selectedBlockIds, exitSelection, narratorId, navigate, t]);
 
+	// --- Segment compact ---
+	const handleSegmentCompact = useCallback(async () => {
+		const container = contentRef.current;
+		if (!container || selectedBlockIds.size === 0) return;
+		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
+		if (metas.length === 0) return;
+		// Deduplicate messageIds preserving DOM order
+		const seen = new Set<string>();
+		const messageIds: string[] = [];
+		for (const m of metas) {
+			if (!seen.has(m.messageId)) {
+				seen.add(m.messageId);
+				messageIds.push(m.messageId);
+			}
+		}
+		exitSelection();
+		try {
+			await api.triggerSegmentCompact(narratorId, messageIds);
+		} catch (err) {
+			const isInProgress = err instanceof ApiError && err.status === 409;
+			notifications.show({
+				title: isInProgress ? t("compactInProgress") : t("segmentCompactFailed"),
+				message: isInProgress ? t("compactInProgressDesc") : t("segmentCompactFailedDesc"),
+				color: isInProgress ? "yellow" : "red",
+				autoClose: 5000,
+			});
+		}
+	}, [selectedBlockIds, exitSelection, narratorId, t]);
+
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
 			selectionMode,
@@ -3684,6 +3713,12 @@ export function NarratorPanel({
 									</Menu.Item>
 									<Menu.Item leftSection={<IconGitFork size={14} />} onClick={handleBatchFork}>
 										{t("batchFork")}
+									</Menu.Item>
+									<Menu.Item
+										leftSection={<IconArrowsMinimize size={14} />}
+										onClick={handleSegmentCompact}
+									>
+										{t("segmentCompact")}
 									</Menu.Item>
 									<Menu.Item
 										color="red"

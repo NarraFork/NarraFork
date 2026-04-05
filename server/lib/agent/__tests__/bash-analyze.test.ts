@@ -1111,6 +1111,7 @@ describe("Chapter mode - git branch restrictions", () => {
 			"git verify-tag v1.0",
 			"git var GIT_AUTHOR_IDENT",
 			"git whatchanged -1",
+			"git check-ignore -v node_modules",
 		];
 
 		for (const cmd of readonlyCmds) {

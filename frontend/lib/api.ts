@@ -875,6 +875,24 @@ export const api = {
 			body: JSON.stringify({ summary }),
 		}),
 
+	// Segment compact
+	triggerSegmentCompact: (narratorId: string, messageIds: string[]) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact`, {
+			method: "POST",
+			body: JSON.stringify({ messageIds }),
+		}),
+	getSegmentCompactSummary: (narratorId: string, messageId: string) =>
+		request<{ summary: string }>(`/narrators/${narratorId}/segment-compact/${messageId}`),
+	deleteSegmentCompact: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {
+			method: "DELETE",
+		}),
+	updateSegmentCompactSummary: (narratorId: string, messageId: string, summary: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ summary }),
+		}),
+
 	// File modifications
 	getFileModifications: (narratorId: string, upToMessageId?: string, fromMessageId?: string) => {
 		const params = new URLSearchParams();

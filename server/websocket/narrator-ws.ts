@@ -87,6 +87,11 @@ export type NarratorServerMessage =
 			remaining: Array<{ id: string; text: string; bufferedAt: string }>;
 	  }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
+	| {
+			type: "buffer_preserved";
+			narratorId: string;
+			messages: Array<{ id: string; text: string; bufferedAt: string }>;
+	  }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
 	| {

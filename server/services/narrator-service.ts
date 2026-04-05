@@ -951,7 +951,7 @@ export const narratorService = {
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
-		// Fetch message IDs from narrator_message_refs
+		// Fetch message IDs from narrator_message_refs (exclude segment-compacted refs)
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -959,6 +959,7 @@ export const narratorService = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+					isNull(narratorMessageRefs.segmentCompactId),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
@@ -1009,7 +1010,7 @@ export const narratorService = {
 
 		const lowerBound = compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : sql`1=1`;
 
-		// Get message IDs in range (compactSeq, targetSeq)
+		// Get message IDs in range (compactSeq, targetSeq), exclude segment-compacted
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -1018,6 +1019,7 @@ export const narratorService = {
 					eq(narratorMessageRefs.narratorId, narratorId),
 					lowerBound,
 					lt(narratorMessageRefs.seq, targetRef.seq),
+					isNull(narratorMessageRefs.segmentCompactId),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
@@ -1193,6 +1195,7 @@ export const narratorService = {
 
 		// Query messages via junction table. Older paging walks backward from the
 		// current oldest row; newer paging walks forward from the current newest row.
+		// Exclude refs hidden by segment-compact.
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -1201,7 +1204,11 @@ export const narratorService = {
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(
-				and(...cursorConditions, ...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)])),
+				and(
+					...cursorConditions,
+					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
+					isNull(narratorMessageRefs.segmentCompactId),
+				),
 			)
 			.orderBy(
 				direction === "newer" ? narratorMessageRefs.seq : sql`${narratorMessageRefs.seq} DESC`,
@@ -1327,7 +1334,7 @@ export const narratorService = {
 			.where(and(...countConditions));
 		if (cnt > limit) return { topLevel: [], orphanChildren: [], hitLimit: true };
 
-		// Fetch ALL messages with seq > ref.seq.
+		// Fetch ALL messages with seq > ref.seq (exclude segment-compacted refs).
 		const refRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -1335,7 +1342,11 @@ export const narratorService = {
 			})
 			.from(narratorMessageRefs)
 			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), gt(narratorMessageRefs.seq, ref.seq)),
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gt(narratorMessageRefs.seq, ref.seq),
+					isNull(narratorMessageRefs.segmentCompactId),
+				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} ASC`)
 			.limit(10_000);
@@ -1525,6 +1536,7 @@ export const narratorService = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					lt(narratorMessageRefs.seq, anchorRef.seq),
+					isNull(narratorMessageRefs.segmentCompactId),
 					...(topLevelFilter ? [topLevelFilter] : []),
 				),
 			)
@@ -1544,6 +1556,7 @@ export const narratorService = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					gt(narratorMessageRefs.seq, anchorRef.seq),
+					isNull(narratorMessageRefs.segmentCompactId),
 					...(topLevelFilter ? [topLevelFilter] : []),
 				),
 			)
@@ -3803,5 +3816,319 @@ export const narratorService = {
 			.update(narrators)
 			.set({ pruneBoundaryMessageId: null, prunedPercent: null, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
+	},
+
+	// ── Segment compact ──────────────────────────────────────────────────────
+
+	/**
+	 * Create a segment-compact marker and hide the specified messages.
+	 * The marker is inserted at the seq of the earliest hidden message.
+	 * Returns the marker message (status="compacting").
+	 */
+	async persistSegmentCompactMarker(narratorId: string, messageIds: string[]) {
+		if (messageIds.length === 0) throw new ValidationError("No messages to compact");
+
+		const id = generateId();
+		const now = new Date().toISOString();
+
+		// Find refs for the specified messages, ordered by seq
+		const refs = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.messageId, messageIds),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+
+		if (refs.length === 0) throw new ValidationError("No matching messages found");
+
+		const insertSeq = refs[0].seq;
+
+		// Atomically: shift seqs, insert marker, mark refs as hidden
+		await db.transaction(async (tx) => {
+			// Shift all refs at or after insertSeq to make room
+			await tx
+				.update(narratorMessageRefs)
+				.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						gte(narratorMessageRefs.seq, insertSeq),
+					),
+				);
+
+			// Insert the marker message
+			// Use role="system" so it is excluded from API history sent to the AI
+			// (buildAnthropicHistory / buildOAIHistory only include user+assistant).
+			// The summary lives inline in the message stream for the UI only.
+			await tx.insert(narratorMessages).values({
+				id,
+				narratorId,
+				role: "system",
+				contentJson: [
+					{
+						type: "segment_compact",
+						status: "compacting",
+						messageCount: refs.length,
+					},
+				],
+				contentText: "[Segment compacting]",
+				createdAt: now,
+			});
+
+			// Insert ref for the marker at the insertion point
+			await tx.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId,
+				messageId: id,
+				seq: insertSeq,
+				isCompact: 0,
+			});
+
+			// Mark the target refs as hidden by this segment compact
+			const targetMessageIds = refs.map((r) => r.messageId);
+			await tx
+				.update(narratorMessageRefs)
+				.set({ segmentCompactId: id })
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						inArray(narratorMessageRefs.messageId, targetMessageIds),
+					),
+				);
+		});
+
+		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
+
+		return msg;
+	},
+
+	/**
+	 * Fetch the specified messages for generating a segment-compact summary.
+	 */
+	async getMessagesForSegmentCompact(narratorId: string, messageIds: string[]) {
+		const refs = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.messageId, messageIds),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+
+		if (refs.length === 0) return [];
+
+		const ids = refs.map((r) => r.messageId);
+		const messages = await db.query.narratorMessages.findMany({
+			where: inArray(narratorMessages.id, ids),
+			with: { toolCalls: true },
+		});
+
+		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
+		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		return messages;
+	},
+
+	/**
+	 * Finalize a segment-compact marker with the generated summary.
+	 */
+	async finalizeSegmentCompact(
+		messageId: string,
+		narratorId: string,
+		summary: string,
+		contextPercent?: number,
+		options?: { status?: "compacted" | "failed"; error?: string },
+	) {
+		const now = new Date().toISOString();
+		const status = options?.status ?? "compacted";
+
+		// Count hidden messages
+		const [countRow] = await db
+			.select({ cnt: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.segmentCompactId, messageId),
+				),
+			);
+		const messageCount = countRow?.cnt ?? 0;
+
+		const block: Record<string, unknown> = {
+			type: "segment_compact",
+			status,
+			summary,
+			messageCount,
+		};
+		if (status === "failed" && options?.error) {
+			block.error = options.error;
+		}
+
+		const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
+
+		return db.transaction(async (tx) => {
+			const [updated] = await tx
+				.update(narratorMessages)
+				.set({
+					contentJson: [block],
+					contentText: `${prefix} ${summary.slice(0, 200)}...`,
+					contextPercent: contextPercent ?? null,
+				})
+				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
+				.returning();
+
+			if (!updated) return null;
+
+			// If failed, unhide the messages so they remain visible
+			if (status === "failed") {
+				await tx
+					.update(narratorMessageRefs)
+					.set({ segmentCompactId: null })
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.segmentCompactId, messageId),
+						),
+					);
+			}
+
+			// Bump messageVersion so WS sync detects the change
+			await tx
+				.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					apiConversationId: null,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
+
+			return updated;
+		});
+	},
+
+	/**
+	 * Delete a segment-compact marker and restore hidden messages.
+	 */
+	async deleteSegmentCompact(narratorId: string, messageId: string) {
+		const msg = await db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+		});
+		if (!msg) throw new NotFoundError("Message", messageId);
+
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const scBlock = blocks.find((b: any) => b.type === "segment_compact");
+		if (!scBlock) throw new ValidationError("Message is not a segment compact message");
+
+		const now = new Date().toISOString();
+
+		await db.transaction(async (tx) => {
+			// Restore hidden refs
+			await tx
+				.update(narratorMessageRefs)
+				.set({ segmentCompactId: null })
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, messageId),
+					),
+				);
+
+			// Delete the marker ref and message
+			await tx
+				.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.messageId, messageId),
+						eq(narratorMessageRefs.narratorId, narratorId),
+					),
+				);
+			await tx
+				.delete(narratorMessages)
+				.where(
+					and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+				);
+
+			// Bump messageVersion and clear API conversation cache
+			await tx
+				.update(narrators)
+				.set({
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+	},
+
+	/**
+	 * Get the summary of a segment-compact message.
+	 */
+	async getSegmentCompactSummary(narratorId: string, messageId: string) {
+		const msg = await db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+		});
+		if (!msg) throw new NotFoundError("Message", messageId);
+
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const scBlock = blocks.find((b: any) => b.type === "segment_compact");
+		if (!scBlock) throw new ValidationError("Message is not a segment compact message");
+
+		return scBlock.summary ?? "";
+	},
+
+	/**
+	 * Update the summary of a segment-compact message.
+	 */
+	async updateSegmentCompactSummary(narratorId: string, messageId: string, summary: string) {
+		const msg = await db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+		});
+		if (!msg) throw new NotFoundError("Message", messageId);
+
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
+		const scBlock = blocks.find(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "segment_compact" && b.status === "compacted",
+		);
+		if (!scBlock) throw new ValidationError("Message is not a compacted segment compact message");
+
+		const newBlock = {
+			type: "segment_compact" as const,
+			status: "compacted" as const,
+			summary,
+			messageCount: scBlock.messageCount ?? 0,
+		};
+
+		const now = new Date().toISOString();
+		await db.transaction(async (tx) => {
+			await tx
+				.update(narratorMessages)
+				.set({
+					contentJson: [newBlock],
+					contentText: `[Segment Compact] ${summary.slice(0, 200)}...`,
+				})
+				.where(eq(narratorMessages.id, messageId));
+
+			await tx
+				.update(narrators)
+				.set({ apiConversationId: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+		});
 	},
 };

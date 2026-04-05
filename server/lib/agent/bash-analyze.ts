@@ -1500,6 +1500,7 @@ const GIT_READONLY_SUBCOMMANDS = new Set([
 	"var",
 	"get-tar-commit-id",
 	"whatchanged",
+	"check-ignore",
 ]);
 
 /**

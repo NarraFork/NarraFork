@@ -1265,6 +1265,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBufferCleared: () => {
 				setQueuedMessages([]);
 			},
+			onBufferPreserved: (messages) => {
+				// Keep queued messages visible — they were preserved after an error.
+				// Sync with the authoritative list from the server in case the
+				// frontend state drifted (e.g. optimistic removes that didn't land).
+				setQueuedMessages(messages);
+				notifications.show({
+					title: t("narratorError"),
+					message: t("bufferPreservedNotice"),
+					color: "yellow",
+					autoClose: 6000,
+				});
+			},
 			onPermissionModeChanged: (permissionMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, permissionMode } : old,

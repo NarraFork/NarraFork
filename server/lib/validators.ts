@@ -236,6 +236,16 @@ export const reorderBufferSchema = z.object({
 	orderedIds: z.array(z.string().min(1)).min(1),
 });
 
+// === Segment compact ===
+
+export const segmentCompactSchema = z.object({
+	messageIds: z.array(z.string().min(1)).min(1).max(500),
+});
+
+export const updateSegmentCompactSummarySchema = z.object({
+	summary: z.string().min(1).max(100_000),
+});
+
 // === Terminals ===
 
 export const createTerminalSchema = z

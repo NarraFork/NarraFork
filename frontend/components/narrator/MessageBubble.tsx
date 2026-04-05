@@ -898,6 +898,164 @@ function CompactIndicator({
 	);
 }
 
+function SegmentCompactIndicator({
+	isCompacting,
+	narratorId,
+	messageId,
+	messageCount,
+	onDelete,
+}: {
+	isCompacting: boolean;
+	narratorId?: string;
+	messageId?: string;
+	messageCount?: number;
+	onDelete?: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [opened, { open, close }] = useDisclosure(false);
+	const [deleting, setDeleting] = useState(false);
+	const [editing, setEditing] = useState(false);
+	const [editText, setEditText] = useState("");
+	const [saving, setSaving] = useState(false);
+
+	const canClick = !isCompacting && narratorId && messageId;
+
+	const { data, isLoading, error, refetch } = useQuery({
+		queryKey: ["segment-compact-summary", narratorId, messageId],
+		queryFn: () => api.getSegmentCompactSummary(narratorId ?? "", messageId ?? ""),
+		enabled: opened && !!narratorId && !!messageId,
+	});
+
+	const handleDelete = async () => {
+		if (!narratorId || !messageId) return;
+		setDeleting(true);
+		try {
+			await api.deleteSegmentCompact(narratorId, messageId);
+			close();
+			onDelete?.();
+		} catch {
+			notifications.show({
+				title: t("segmentCompactFailed"),
+				message: t("segmentCompactFailedDesc"),
+				color: "red",
+				autoClose: 5000,
+			});
+		} finally {
+			setDeleting(false);
+		}
+	};
+
+	const handleEdit = () => {
+		setEditText(data?.summary ?? "");
+		setEditing(true);
+	};
+
+	const handleSave = async () => {
+		if (!narratorId || !messageId) return;
+		setSaving(true);
+		try {
+			await api.updateSegmentCompactSummary(narratorId, messageId, editText);
+			setEditing(false);
+			refetch();
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	return (
+		<>
+			<Group
+				gap={6}
+				justify="center"
+				py={4}
+				style={canClick ? { cursor: "pointer" } : undefined}
+				onClick={canClick ? open : undefined}
+			>
+				{isCompacting ? (
+					<Loader size={14} color="teal" />
+				) : (
+					<IconArrowsMinimize size={14} style={{ color: "var(--mantine-color-teal-6)" }} />
+				)}
+				<Text size="xs" c="teal" td={canClick ? "underline" : undefined}>
+					{isCompacting
+						? t("segmentCompacting")
+						: t("segmentCompacted", { count: messageCount ?? 0 })}
+				</Text>
+			</Group>
+
+			<Modal
+				opened={opened}
+				onClose={() => {
+					close();
+					setEditing(false);
+				}}
+				title={
+					<Group gap="xs">
+						<IconArrowsMinimize size={18} style={{ color: "var(--mantine-color-teal-6)" }} />
+						<Text fw={600}>{t("segmentCompactSummaryTitle")}</Text>
+					</Group>
+				}
+				size="lg"
+			>
+				{isLoading && (
+					<Group justify="center" py="xl">
+						<Loader size="sm" />
+					</Group>
+				)}
+				{error && (
+					<Text c="red" size="sm">
+						{error instanceof Error ? error.message : String(error)}
+					</Text>
+				)}
+				{editing ? (
+					<Textarea
+						value={editText}
+						onChange={(e) => setEditText(e.currentTarget.value)}
+						autosize
+						minRows={8}
+						maxRows={20}
+					/>
+				) : (
+					data?.summary && (
+						<ScrollArea.Autosize mah="70vh">
+							<MarkdownContent text={data.summary} />
+						</ScrollArea.Autosize>
+					)
+				)}
+				{canClick && (
+					<Group justify="flex-end" mt="md">
+						{editing ? (
+							<>
+								<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
+									{t("cancelEdit")}
+								</Button>
+								<Button size="xs" loading={saving} onClick={handleSave}>
+									{t("saveEdit")}
+								</Button>
+							</>
+						) : (
+							<>
+								<Button
+									color="red"
+									variant="light"
+									size="xs"
+									loading={deleting}
+									onClick={handleDelete}
+								>
+									{t("deleteSegmentCompact")}
+								</Button>
+								<Button variant="light" size="xs" onClick={handleEdit}>
+									{t("editCompact")}
+								</Button>
+							</>
+						)}
+					</Group>
+				)}
+			</Modal>
+		</>
+	);
+}
+
 function MergeSummaryCard({
 	block,
 	creator,
@@ -1501,6 +1659,46 @@ export const MessageBubble = memo(function MessageBubble({
 	const reviewFeedbackBlock = blocks.find((b: any) => b.type === "review_feedback");
 	if (reviewFeedbackBlock) {
 		return <ReviewFeedbackCard block={reviewFeedbackBlock} />;
+	}
+
+	// Segment compact indicators (role="system" with segment_compact content block)
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const segmentCompactBlock = blocks.find((b: any) => b.type === "segment_compact");
+	if (segmentCompactBlock) {
+		const isSegCompacting = segmentCompactBlock.status === "compacting";
+		const isFailed = segmentCompactBlock.status === "failed";
+		if (isFailed) {
+			return (
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+					<Group gap={6} wrap="nowrap" align="flex-start">
+						<IconAlertTriangle
+							size={16}
+							style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
+						/>
+						<Stack gap={2}>
+							<Text size="xs" fw={600} c="red.8">
+								{t("segmentCompactFailed")}
+							</Text>
+							<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
+								{segmentCompactBlock.error ??
+									segmentCompactBlock.summary ??
+									t("segmentCompactFailedDesc")}
+							</Text>
+						</Stack>
+					</Group>
+				</Paper>
+			);
+		}
+		const canNavigate = !isSegCompacting && narratorId && message.id;
+		return (
+			<SegmentCompactIndicator
+				isCompacting={isSegCompacting}
+				narratorId={canNavigate ? narratorId : undefined}
+				messageId={canNavigate ? message.id : undefined}
+				messageCount={segmentCompactBlock.messageCount}
+				onDelete={canNavigate ? invalidateMessages : undefined}
+			/>
+		);
 	}
 
 	// System messages (compact indicators / plan cards / error notices)

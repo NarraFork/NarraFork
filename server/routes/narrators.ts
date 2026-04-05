@@ -56,6 +56,7 @@ import {
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	segmentCompactSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
@@ -63,6 +64,7 @@ import {
 	updateBufferedMessageSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
+	updateSegmentCompactSummarySchema,
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
@@ -104,6 +106,7 @@ import {
 	resolvePermission,
 	retryLastMessage,
 	runCustomCompact,
+	runSegmentCompact,
 	sendMessage,
 	toBufferSummary,
 	updateBufferedMessage,
@@ -815,6 +818,57 @@ narratorRoutes.post("/:id/plan", async (c) => {
 	if (!content || typeof content !== "string") throw new ValidationError("content is required");
 	const msg = await narratorService.persistPlanMessage(narratorId, content);
 	return c.json(msg);
+});
+
+// === Segment compact routes ===
+
+// Trigger segment compact for selected messages
+narratorRoutes.post("/:id/segment-compact", async (c) => {
+	const narratorId = c.req.param("id");
+	await narratorService.getById(narratorId);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const body = await c.req.json();
+	const parsed = segmentCompactSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { messageIds } = parsed.data;
+
+	if (isCompactInProgress(narratorId)) {
+		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
+	}
+
+	runSegmentCompact(narratorId, locale, messageIds).catch((err) => {
+		logger.error("Segment compact failed", { narratorId, err: String(err) });
+	});
+	return c.json({ ok: true });
+});
+
+// Get segment compact summary
+narratorRoutes.get("/:id/segment-compact/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const summary = await narratorService.getSegmentCompactSummary(narratorId, messageId);
+	return c.json({ summary });
+});
+
+// Delete segment compact (undo)
+narratorRoutes.delete("/:id/segment-compact/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.deleteSegmentCompact(narratorId, messageId);
+	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+	return c.json({ ok: true });
+});
+
+// Update segment compact summary
+narratorRoutes.patch("/:id/segment-compact/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const body = await c.req.json();
+	const parsed = updateSegmentCompactSummarySchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await narratorService.updateSegmentCompactSummary(narratorId, messageId, parsed.data.summary);
+	return c.json({ ok: true });
 });
 
 // Interrupt active session

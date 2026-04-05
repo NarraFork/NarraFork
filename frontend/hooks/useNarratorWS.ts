@@ -55,6 +55,7 @@ interface NarratorWSCallbacks {
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
+	onBufferPreserved?: (messages: BufferMessageSummary[]) => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onOverseerReviewing?: (
@@ -297,6 +298,11 @@ export function useNarratorWS(
 					case "buffer_cleared":
 						callbacksRef.current.onBufferCleared?.(
 							data.reason as "cancelled" | "sent" | "narrator_error",
+						);
+						break;
+					case "buffer_preserved":
+						callbacksRef.current.onBufferPreserved?.(
+							data.messages as BufferMessageSummary[],
 						);
 						break;
 					case "permission_mode_changed":
