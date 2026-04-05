@@ -335,8 +335,10 @@ export const api = {
 	// Admin
 	listUsers: () => request<ApiEntity[]>("/admin/users"),
 	deleteUser: (id: string) => request<ApiEntity>(`/admin/users/${id}`, { method: "DELETE" }),
-	updateUser: (id: string, data: { username?: string; password?: string }) =>
-		request<ApiEntity>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	updateUser: (
+		id: string,
+		data: { username?: string; password?: string; role?: "admin" | "user" },
+	) => request<ApiEntity>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	updateAdminSettings: (data: { registrationOpen: boolean }) =>
 		request<ApiEntity>("/admin/settings", { method: "PATCH", body: JSON.stringify(data) }),
 	listAdminTerminals: () =>

@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { count, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
@@ -29,15 +29,41 @@ adminRoutes.get("/users", async (c) => {
 
 adminRoutes.patch("/users/:id", async (c) => {
 	const id = c.req.param("id");
+	const caller = c.get("user");
 	const parsed = adminUpdateUserSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
 
-	const { username, password } = parsed.data;
-	if (!username && !password) {
-		throw new AppError("At least one of username or password is required", 400, "VALIDATION_ERROR");
+	const { username, password, role } = parsed.data;
+	if (!username && !password && !role) {
+		throw new AppError("At least one field is required", 400, "VALIDATION_ERROR");
+	}
+
+	if (role && id === caller.sub && role !== "admin") {
+		throw new AppError("Cannot demote yourself", 400, "SELF_DEMOTE");
+	}
+
+	// Prevent demoting the last administrator
+	if (role === "user" && id !== caller.sub) {
+		const target = await db.query.users.findFirst({
+			where: eq(users.id, id),
+			columns: { role: true },
+		});
+		if (target?.role === "admin") {
+			const [{ value: adminCount }] = await db
+				.select({ value: count() })
+				.from(users)
+				.where(eq(users.role, "admin"));
+			if (adminCount <= 1) {
+				throw new AppError("Cannot demote the last administrator", 400, "LAST_ADMIN");
+			}
+		}
 	}
 
 	const updates: Record<string, string> = {};
+
+	if (role) {
+		updates.role = role;
+	}
 
 	if (username) {
 		const existing = await db.query.users.findFirst({
@@ -71,6 +97,21 @@ adminRoutes.delete("/users/:id", async (c) => {
 
 	if (id === caller.sub) {
 		throw new AppError("Cannot delete your own account", 400, "SELF_DELETE");
+	}
+
+	// Prevent deleting the last administrator
+	const target = await db.query.users.findFirst({
+		where: eq(users.id, id),
+		columns: { role: true },
+	});
+	if (target?.role === "admin") {
+		const [{ value: adminCount }] = await db
+			.select({ value: count() })
+			.from(users)
+			.where(eq(users.role, "admin"));
+		if (adminCount <= 1) {
+			throw new AppError("Cannot delete the last administrator", 400, "LAST_ADMIN");
+		}
 	}
 
 	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();

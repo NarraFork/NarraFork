@@ -10,6 +10,7 @@ import { editTool } from "./edit";
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
+import { narraforkAdminTool } from "./narrafork-admin";
 import {
 	approvePermissionTool,
 	denyPermissionTool,
@@ -41,6 +42,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Recall", recallTool],
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
+	["NarraForkAdmin", narraforkAdminTool],
 ]);
 
 /**

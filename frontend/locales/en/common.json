@@ -43,6 +43,8 @@
 	"newPassword": "New Password",
 	"newPasswordPlaceholder": "Leave blank to keep unchanged",
 	"userUpdateSuccess": "User updated successfully",
+	"confirmPromoteAdmin": "Are you sure you want to promote {{username}} to administrator?",
+	"confirmDemoteAdmin": "Are you sure you want to demote {{username}} to regular user?",
 	"actions": "Actions",
 	"copy": "Copy",
 	"copied": "Copied",

@@ -438,6 +438,7 @@ export const adminUpdateUserSchema = z.object({
 		.regex(/^[a-zA-Z0-9_-]+$/, "Alphanumeric, hyphens, underscores only")
 		.optional(),
 	password: z.string().min(8).max(128).optional(),
+	role: z.enum(["admin", "user"]).optional(),
 });
 
 export const updateProfileSchema = z.object({

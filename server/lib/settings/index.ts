@@ -427,6 +427,342 @@ const DEFAULTS: NarraForkSettings = {
 	},
 };
 
+// ---------------------------------------------------------------------------
+// Per-field documentation (dot-path → description)
+// ---------------------------------------------------------------------------
+
+export interface FieldDoc {
+	desc: string;
+	type: string;
+	valid?: string;
+}
+
+/**
+ * Runtime documentation for every leaf setting, keyed by dot-path.
+ * Kept alongside DEFAULTS so changes stay in sync.
+ */
+export const SETTING_DOCS: Record<string, FieldDoc> = {
+	// ── server ──────────────────────────────────────────────────────────
+	"server.port": {
+		desc: "服务器监听端口。重启后生效。",
+		type: "number",
+	},
+	"server.host": {
+		desc: '服务器监听地址。"localhost" 仅本机访问，"0.0.0.0" 允许局域网访问。重启后生效。',
+		type: "string",
+	},
+	"server.openBrowser": {
+		desc: '服务器启动时是否自动打开浏览器。"off" 不打开，"browser" 打开浏览器标签，"app" 打开 PWA 窗口。',
+		type: "string",
+		valid: '"off" | "browser" | "app"',
+	},
+	"server.tls.enabled": {
+		desc: "是否启用 HTTPS。启用后需要配置 certFile 和 keyFile。",
+		type: "boolean",
+	},
+	"server.tls.certFile": {
+		desc: "PEM 格式 TLS 证书文件路径。",
+		type: "string",
+	},
+	"server.tls.keyFile": {
+		desc: "PEM 格式 TLS 私钥文件路径。",
+		type: "string",
+	},
+	"server.tls.passphrase": {
+		desc: "私钥密码（如果私钥已加密）。可选。",
+		type: "string",
+	},
+	"server.tls.caFile": {
+		desc: "CA 证书文件路径，覆盖系统默认信任的 CA。可选。",
+		type: "string",
+	},
+
+	// ── paths ───────────────────────────────────────────────────────────
+	"paths.defaultProjectDir": {
+		desc: "默认项目目录。新建项目时的默认父目录。",
+		type: "string",
+	},
+
+	// ── agent ───────────────────────────────────────────────────────────
+	"agent.defaultModel": {
+		type: "string",
+	},
+	"agent.defaultPermissionMode": {
+		desc: "新建叙述者的默认权限模式。控制工具调用是否需要用户批准。",
+		type: "string",
+		valid:
+			'"default"(每次询问) | "acceptEdits"(自动接受编辑) | "bypassPermissions"(跳过所有) | ' +
+			'"readOnly"(只读) | "plan"(规划模式) | "dontAsk"(不询问)',
+	},
+	"agent.summaryModel": {
+		desc: "用于生成摘要的模型。用于压缩上下文、翻译推理块等辅助任务。应选择速度快成本低的模型。",
+		type: "string",
+	},
+	"agent.customModels": {
+		desc: '自定义模型列表，添加到 UI 模型选择器。每项包含 value("provider:modelId")、label(显示名)、provider(可选)。',
+		type: "array",
+	},
+	"agent.hiddenModels": {
+		desc: "隐藏的模型列表。这些模型不会在 UI 模型选择器中显示，但仍可通过 API 使用。",
+		type: "string[]",
+	},
+	"agent.maxTurns": {
+		desc: "叙述者会话的最大轮次。达到后 agent loop 停止。范围 1-1000。在 80% 时会发送 wrap-up 提醒。",
+		type: "number",
+		valid: "1-1000, 默认 200",
+	},
+	"agent.subagentModels.explore": {
+		desc: "explore 子代理的默认模型。空字符串表示使用全局 defaultModel。",
+		type: "string",
+	},
+	"agent.subagentModels.plan": {
+		desc: "plan 子代理的默认模型。空字符串表示使用全局 defaultModel。",
+		type: "string",
+	},
+	"agent.subagentAllowedModels.explore": {
+		desc: "explore 子代理允许的模型池。空数组表示无限制，可使用任何模型。",
+		type: "string[]",
+	},
+	"agent.subagentAllowedModels.plan": {
+		desc: "plan 子代理允许的模型池。空数组表示无限制。",
+		type: "string[]",
+	},
+	"agent.subagentAllowedModels.general": {
+		desc: "general 子代理允许的模型池。空数组表示无限制。",
+		type: "string[]",
+	},
+	"agent.legacyEncoding": {
+		desc: "启用非 UTF-8 编码检测（GBK、Shift_JIS 等）。启用后文件读写使用 chardet 自动检测并保留原始编码。禁用时仅使用 UTF-8。",
+		type: "boolean",
+	},
+	"agent.modelContextWindows": {
+		desc: '按模型覆盖上下文窗口大小（tokens）。键为完整模型值 "provider:modelId"，值为 token 数。优先级最高。',
+		type: "Record<string, number>",
+	},
+	"agent.translateReasoning": {
+		desc: "启用后，每个 reasoning/thinking 块完成后自动通过 summaryModel 翻译成用户语言（非英文时）。",
+		type: "boolean",
+	},
+	"agent.defaultRelaxedPlan": {
+		desc: "新建叙述者的 relaxed plan 默认值。启用时 plan 模式下工具保持完全可用；禁用时 plan 模式限制为只读工具集合。",
+		type: "boolean",
+	},
+	"agent.smartInterruptionCheck": {
+		desc: "自动检测模型输出是否被截断/中断。通过启发式检查（末尾标点、代码块闭合）和 summaryModel 判断，决定是否自动重试生成。",
+		type: "boolean",
+	},
+	"agent.maxTransientRetries": {
+		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试。有状态提供商（Responses/Codex）不支持重试。",
+		type: "number",
+		valid: "-1 = 无限重试, 默认 10",
+	},
+	"agent.customRetryRules": {
+		desc: "用户自定义可重试错误规则。匹配到的错误视为 transient 进行重试。每项含 id、domain(域名关键字)、statusCode、keyword、enabled、note。",
+		type: "array",
+	},
+	"agent.whitelistDirs": {
+		desc: '全局白名单目录。每项含 path、accessLevel("readOnly"|"readWrite"|"full")、enabled。与项目和叙述者级别合并。',
+		type: "array",
+	},
+	"agent.blacklistDirs": {
+		desc: '全局黑名单目录。优先级高于白名单。每项含 path、denyLevel("denyWrite"|"denyAll")、enabled。',
+		type: "array",
+	},
+	"agent.commandWhitelist": {
+		desc: "全局命令白名单。匹配的命令自动允许执行，无需用户确认。每项含 pattern(Bash 命令模式)、enabled。",
+		type: "array",
+	},
+	"agent.commandBlacklist": {
+		desc: "全局命令黑名单。匹配的命令自动拒绝。每项含 pattern、denyPrompt(拒绝提示)、enabled。",
+		type: "array",
+	},
+	"agent.defaultSystemPrompt": {
+		desc: "默认系统提示词。所有叙述者在自身 systemPrompt 为空时使用此值作为基础提示。",
+		type: "string",
+	},
+	"agent.webFetchPolicy.allowAll": {
+		desc: "为 true 时所有 URL 自动允许抓取，无需用户批准。",
+		type: "boolean",
+	},
+	"agent.webFetchPolicy.whitelist": {
+		desc: "URL 关键词白名单。匹配的 URL 自动允许。每项含 pattern、enabled。",
+		type: "array",
+	},
+	"agent.webFetchPolicy.blacklist": {
+		desc: "URL 关键词黑名单。优先级高于白名单。匹配的 URL 自动拒绝。每项含 pattern、enabled。",
+		type: "array",
+	},
+	"agent.webFetchPolicy.proxy.mode": {
+		desc: 'WebFetch 代理模式。"direct" 直连，"system" 从环境变量自动检测，"custom" 使用自定义 URL。',
+		type: "string",
+		valid: '"direct" | "system" | "custom"',
+	},
+	"agent.webFetchPolicy.proxy.url": {
+		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。',
+		type: "string",
+	},
+	"agent.contextThresholds.standard.pruneStart": {
+		desc: "标准模型(≤600k tokens)开始渐进式消息剪枝的上下文使用百分比(0-100)。",
+		type: "number",
+	},
+	"agent.contextThresholds.standard.compactStart": {
+		desc: "标准模型触发上下文压缩的百分比(0-100)。达到此阈值时压缩旧消息。",
+		type: "number",
+	},
+	"agent.contextThresholds.large.pruneStart": {
+		desc: "大模型(>600k tokens)开始渐进式消息剪枝的百分比(0-100)。",
+		type: "number",
+	},
+	"agent.contextThresholds.large.compactStart": {
+		desc: "大模型触发上下文压缩的百分比(0-100)。",
+		type: "number",
+	},
+
+	// ── chapters ────────────────────────────────────────────────────────
+	"chapters.maxActiveWorktrees": {
+		desc: "最大活跃 worktree 数量。超出时自动将最不活跃的章节休眠。≤0 禁用自动休眠。",
+		type: "number",
+		valid: "≥1, 默认 10",
+	},
+	"chapters.maxActiveContainers": {
+		desc: "最大活跃容器数量。超出时新容器创建会被拒绝。",
+		type: "number",
+		valid: "≥0, 默认 5",
+	},
+	"chapters.worktreeSizeWarningMb": {
+		desc: "Worktree 大小警告阈值(MB)。超出时向用户发出警告。0 表示禁用警告。",
+		type: "number",
+		valid: "≥0, 默认 500",
+	},
+	"chapters.autoSaveOnDormant": {
+		desc: "章节休眠时是否自动 git commit 保存未提交的更改。",
+		type: "boolean",
+	},
+	"chapters.dormantAfterMinutes": {
+		desc: "章节不活跃多少分钟后自动休眠。0 表示禁用自动休眠（仅在超出 maxActiveWorktrees 时休眠）。",
+		type: "number",
+		valid: "≥0, 默认 0 (禁用)",
+	},
+
+	// ── containers ──────────────────────────────────────────────────────
+	"containers.portRangeStart": {
+		desc: "容器端口分配范围起始值。",
+		type: "number",
+	},
+	"containers.portRangeEnd": {
+		desc: "容器端口分配范围结束值。",
+		type: "number",
+	},
+	"containers.proxy.enabled": {
+		desc: "是否启用容器代理服务。代理将 Host 头匹配的请求路由到对应容器。",
+		type: "boolean",
+	},
+	"containers.proxy.port": {
+		desc: "容器代理服务监听端口。",
+		type: "number",
+	},
+
+	// ── editor ──────────────────────────────────────────────────────────
+	"editor.type": {
+		desc: '默认编辑器类型。用于"在编辑器中打开"功能。',
+		type: "string",
+		valid: '"vscode" | "cursor" | "windsurf" | "zed"',
+	},
+
+	// ── auth ────────────────────────────────────────────────────────────
+	"auth.registrationOpen": {
+		desc: "是否允许新用户注册。false 时禁用注册（首个注册的用户始终为管理员）。",
+		type: "boolean",
+	},
+
+	// ── routines ────────────────────────────────────────────────────────
+	"routines.disabledRoutines": {
+		desc: '全局禁用的例程 ID 黑名单。列表中的例程对所有项目禁用。例程 ID 如 "terminal"、"share_file"、"recall" 等。',
+		type: "string[]",
+	},
+	"routines.enabledRoutines": {
+		desc: "全局启用的例程 ID 白名单。用于显式启用默认关闭的例程（defaultEnabled: false 的例程）。",
+		type: "string[]",
+	},
+
+	// ── codex ───────────────────────────────────────────────────────────
+	"codex.proxy": {
+		desc: "所有 Codex 请求的 HTTPS 代理 URL。可选。",
+		type: "string",
+	},
+	"codex.loadBalancingMode": {
+		desc: '多凭证时的负载均衡策略。"priority" 使用最高优先级凭证，"balanced" 轮询。',
+		type: "string",
+		valid: '"priority" | "balanced"',
+	},
+	"codex.defaultReasoningEffort": {
+		desc: "Codex 模型默认推理努力级别。越高推理越深入但消耗更多 token。",
+		type: "string",
+		valid: '"none" | "low" | "medium" | "high" | "xhigh"',
+	},
+
+	// ── update ──────────────────────────────────────────────────────────
+	"update.serverUrl": {
+		desc: "更新服务器 URL。",
+		type: "string",
+	},
+	"update.product": {
+		desc: "产品 ID，用于多产品更新服务器区分。",
+		type: "string",
+	},
+	"update.channel": {
+		desc: '更新通道。"stable" 稳定版，"beta" 测试版。',
+		type: "string",
+		valid: '"stable" | "beta"',
+	},
+	"update.checkIntervalMinutes": {
+		desc: "自动检查更新的间隔（分钟）。0 表示禁用自动检查。",
+		type: "number",
+	},
+	"update.autoDownload": {
+		desc: "检测到新版本时是否自动下载。下载后仍需用户确认安装。",
+		type: "boolean",
+	},
+
+	// ── shares ──────────────────────────────────────────────────────────
+	"shares.defaultExpiryHours": {
+		desc: "共享文件的默认过期时间（小时）。过期后下载链接失效。",
+		type: "number",
+	},
+	"shares.maxFileSizeMb": {
+		desc: "允许共享的最大文件/文件夹大小（MB）。",
+		type: "number",
+	},
+};
+
+// Development-time completeness check: warn if SETTING_DOCS misses any DEFAULTS leaf
+if (process.env.NODE_ENV !== "production") {
+	function collectLeafPaths(obj: Record<string, unknown>, prefix = ""): string[] {
+		const paths: string[] = [];
+		for (const key of Object.keys(obj)) {
+			const path = prefix ? `${prefix}.${key}` : key;
+			const val = obj[key];
+			if (
+				val !== null &&
+				typeof val === "object" &&
+				!Array.isArray(val) &&
+				!(val instanceof Date)
+			) {
+				paths.push(...collectLeafPaths(val as Record<string, unknown>, path));
+			} else {
+				paths.push(path);
+			}
+		}
+		return paths;
+	}
+	const defaultLeaves = collectLeafPaths(DEFAULTS as unknown as Record<string, unknown>);
+	const docKeys = new Set(Object.keys(SETTING_DOCS));
+	const missing = defaultLeaves.filter((p) => !docKeys.has(p));
+	if (missing.length > 0) {
+		console.warn(`[settings] SETTING_DOCS missing entries for: ${missing.join(", ")}`);
+	}
+}
+
 export const narraforkDir = resolve(homedir(), ".narrafork");
 const settingsPath = resolve(narraforkDir, "settings.json");
 
@@ -681,6 +1017,11 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
+
+/** Returns a copy of the default settings (for reset / comparison). */
+export function getDefaults(): NarraForkSettings {
+	return structuredClone(DEFAULTS);
+}
 
 	"claude-haiku-4.5",
 	"claude-sonnet-4.5",

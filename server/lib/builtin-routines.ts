@@ -104,6 +104,16 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			descriptionZh: "将当前叙述者会话分叉到新章节",
 		},
 	},
+	{
+		id: "narrafork_admin",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "NarraForkAdmin",
+			descriptionEn: "Admin settings management — get and modify all NarraFork settings",
+			descriptionZh: "管理员设置管理 — 获取和修改所有 NarraFork 设置",
+		},
+	},
 ];
 
 // ---------------------------------------------------------------------------

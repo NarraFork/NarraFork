@@ -58,8 +58,13 @@ function AdminUsersPage() {
 	});
 
 	const updateUser = useMutation({
-		mutationFn: ({ id, data }: { id: string; data: { username?: string; password?: string } }) =>
-			api.updateUser(id, data),
+		mutationFn: ({
+			id,
+			data,
+		}: {
+			id: string;
+			data: { username?: string; password?: string; role?: "admin" | "user" };
+		}) => api.updateUser(id, data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["admin", "users"] });
 			setEditingUser(null);
@@ -136,7 +141,26 @@ function AdminUsersPage() {
 									<Table.Tr key={u.id}>
 										<Table.Td>{u.username}</Table.Td>
 										<Table.Td>
-											<Badge color={u.role === "admin" ? "indigo" : "gray"}>{u.role}</Badge>
+											{u.id === user?.id ? (
+												<Badge color="indigo">{u.role}</Badge>
+											) : (
+												<Badge
+													color={u.role === "admin" ? "indigo" : "gray"}
+													style={{ cursor: "pointer" }}
+													onClick={() => {
+														const newRole = u.role === "admin" ? "user" : "admin";
+														const msg =
+															newRole === "admin"
+																? t("confirmPromoteAdmin", { username: u.username })
+																: t("confirmDemoteAdmin", { username: u.username });
+														if (window.confirm(msg)) {
+															updateUser.mutate({ id: u.id, data: { role: newRole } });
+														}
+													}}
+												>
+													{u.role}
+												</Badge>
+											)}
 										</Table.Td>
 										<Table.Td>
 											<Text size="sm">{new Date(u.createdAt).toLocaleDateString()}</Text>

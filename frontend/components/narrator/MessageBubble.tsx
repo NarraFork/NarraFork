@@ -9,6 +9,7 @@ import {
 	Group,
 	Image,
 	Loader,
+	Menu,
 	Modal,
 	NumberInput,
 	Paper,
@@ -22,7 +23,7 @@ import {
 	ThemeIcon,
 	Tooltip,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { formatFileSize } from "@shared/text-file-types";
 import {
@@ -31,25 +32,35 @@ import {
 	IconBrain,
 	IconChevronDown,
 	IconChevronRight,
+	IconCopy,
 	IconEye,
 	IconFile,
+	IconGitFork,
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
 	IconRepeat,
+	IconTrash,
 	IconWorldSearch,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
+import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api, getToken } from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
-import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
+import {
+	type MessageContextMenuActions,
+	MessageContextMenuCtx,
+	useMessageContextMenu,
+} from "./MessageContextMenuCtx";
+import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
 import {
 	getCategory,
@@ -65,6 +76,8 @@ import {
 // Only written when the user explicitly toggles — blocks without an entry
 // always follow the global preference (narrafork_expand_reasoning).
 const reasoningExpandState = new Map<string, boolean>();
+
+let nextRbInstanceId = 0;
 
 interface MessageBubbleProps {
 	narratorId?: string;
@@ -192,14 +205,17 @@ function ReasoningBlock({
 	streaming,
 	narratorId,
 	blockIndex,
+	messageId,
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
 	block: any;
 	streaming?: boolean;
 	narratorId?: string;
 	blockIndex?: number;
+	messageId?: string;
 }) {
 	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
 
 	// Build a stable persistence key from narratorId + blockIndex.
@@ -234,10 +250,101 @@ function ReasoningBlock({
 	}, [translatedText]);
 	const displayText = showTranslation && translatedText ? translatedText : text;
 
+	// --- Block ID, selection, swipe & context menu state ---
+	const rbInstanceId = useRef(nextRbInstanceId++);
+	const blockIdStr = `rb-${rbInstanceId.current}`;
+	const rootRef = useRef<HTMLDivElement>(null);
+	const selection = useMessageSelection();
+	const msgCtx = useMessageContextMenu();
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+
+	const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
+
+	const handleDeselect = useCallback(() => {
+		selection.deselectBlock(blockIdStr);
+	}, [selection.deselectBlock, blockIdStr]);
+
+	const swipe = useSwipeMenu({
+		enabled: true,
+		externalBoxRef: rootRef,
+		excludeSelectors: [".mantine-Menu-dropdown"],
+		blockId: blockIdStr,
+		onSwipeRight: isSelected ? handleDeselect : undefined,
+	});
+
+	// Desktop: right-click opens context menu
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile) return;
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+			e.preventDefault();
+			e.stopPropagation();
+			const x = Math.min(e.clientX, window.innerWidth - 200);
+			const flipY = e.clientY > window.innerHeight - 300;
+			swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
+			swipe.setCtxMenuOpened(true);
+		},
+		[isMobile, swipe],
+	);
+
+	// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
+	const handleBlockClick = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile) return;
+			const isModKey = e.metaKey || e.ctrlKey;
+			const isShift = e.shiftKey;
+			if (!isModKey && !isShift) return;
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+			e.preventDefault();
+			if (isShift) {
+				selection.rangeSelectTo(blockIdStr);
+			} else {
+				selection.toggleBlock(blockIdStr);
+			}
+		},
+		[isMobile, blockIdStr, selection],
+	);
+
+	const handleToggle = () => {
+		hasToggled.current = true;
+		setOpened((v) => {
+			const next = !v;
+			// Persist to module-level map so the state survives component remounts
+			// (e.g. when streaming __streaming__ message is replaced by real message).
+			if (persistKey) reasoningExpandState.set(persistKey, next);
+			return next;
+		});
+	};
+
+	const copyText = useCallback(() => {
+		navigator.clipboard.writeText(text);
+	}, [text]);
+
 	// During streaming with no content yet, show a minimal "thinking" indicator
 	if (streaming && !displayText) {
 		return (
-			<Group gap={0} py={2} wrap="nowrap" align="center">
+			<Group
+				ref={rootRef}
+				gap={0}
+				py={2}
+				wrap="nowrap"
+				align="center"
+				data-content-block
+				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+				onContextMenu={handleContextMenu}
+				onClick={handleBlockClick}
+				style={{
+					outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+					outlineOffset: isSelected ? -2 : undefined,
+					borderRadius: isSelected ? 4 : undefined,
+					transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+					transition: swipe.swipeTransition,
+				}}
+			>
 				<Box style={{ display: "flex", alignItems: "center", width: 11, justifyContent: "center" }}>
 					<IconChevronRight
 						size={12}
@@ -255,17 +362,6 @@ function ReasoningBlock({
 	}
 
 	if (!displayText) return null;
-
-	const handleToggle = () => {
-		hasToggled.current = true;
-		setOpened((v) => {
-			const next = !v;
-			// Persist to module-level map so the state survives component remounts
-			// (e.g. when streaming __streaming__ message is replaced by real message).
-			if (persistKey) reasoningExpandState.set(persistKey, next);
-			return next;
-		});
-	};
 
 	const content = (
 		<Box
@@ -297,53 +393,196 @@ function ReasoningBlock({
 		</Box>
 	);
 
-	return (
-		<Box>
-			<Group
-				gap={0}
-				py={2}
-				wrap="nowrap"
-				align="center"
-				style={{ cursor: "pointer", userSelect: "none" }}
-				onClick={handleToggle}
+	const SWIPE_REVEAL_WIDTH = 180;
+
+	// Menu items shared between context menu (desktop) and swipe menu (mobile)
+	const hasMenuActions = !!(
+		msgCtx.onForkFromMessage ||
+		msgCtx.onCompactBeforeMessage ||
+		msgCtx.onDeleteBlock
+	);
+	const menuItemsNode = (
+		<>
+			<Menu.Item
+				leftSection={<IconCopy size={14} />}
+				onClick={() => {
+					copyText();
+					swipe.closeSwipe();
+				}}
 			>
-				<Box style={{ display: "flex", alignItems: "center", width: 11, justifyContent: "center" }}>
-					{opened ? (
-						<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-					) : (
-						<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-					)}
-				</Box>
-				<ThemeIcon size={16} variant="light" color="grape" radius="sm">
-					<IconBrain size={10} />
-				</ThemeIcon>
-				<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
-					{t("reasoning")}
-				</Text>
-				<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
-					{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
-				</Text>
-				{!opened && (
-					<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
-						— {displayText.slice(0, 80)}
-						{displayText.length > 80 ? "…" : ""}
-					</Text>
-				)}
-			</Group>
-			{/*
-				Initial mount with opened=true: render Collapse directly to avoid
-				LazyCollapse's effect cascade (setMounted → rAF → setReveal) that
-				triggers "Maximum update depth exceeded" in Mantine's Transition
-				when many instances mount at once.
-				After first user toggle: switch to LazyCollapse for proper
-				expand/collapse animation with content unmount.
-			*/}
-			{!hasToggled.current && opened ? (
-				<Collapse in={opened}>{content}</Collapse>
-			) : (
-				<LazyCollapse in={opened}>{content}</LazyCollapse>
+				{tc("copy")}
+			</Menu.Item>
+			{hasMenuActions && <Menu.Divider />}
+			{msgCtx.onForkFromMessage && (
+				<Menu.Item
+					leftSection={<IconGitFork size={14} />}
+					onClick={() => {
+						msgCtx.onForkFromMessage?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{t("contextMenu_fork")}
+				</Menu.Item>
 			)}
-		</Box>
+			{msgCtx.onCompactBeforeMessage && (
+				<Menu.Item
+					leftSection={<IconArrowsMinimize size={14} />}
+					onClick={() => {
+						msgCtx.onCompactBeforeMessage?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{t("contextMenu_compactBefore")}
+				</Menu.Item>
+			)}
+			{msgCtx.onDeleteBlock && blockIndex != null && (
+				<Menu.Item
+					color="red"
+					leftSection={<IconTrash size={14} />}
+					onClick={() => {
+						msgCtx.onDeleteBlock?.(blockIndex);
+						swipe.closeSwipe();
+					}}
+				>
+					{t("contextMenu_delete")}
+				</Menu.Item>
+			)}
+		</>
+	);
+
+	// Right-click context menu (desktop)
+	const ctxMenu = (
+		<Menu
+			opened={swipe.ctxMenuOpened}
+			onChange={swipe.setCtxMenuOpened}
+			position="bottom-start"
+			withinPortal
+			styles={{
+				dropdown: {
+					position: "fixed",
+					left: swipe.ctxMenuPos.x,
+					...(swipe.ctxMenuPos.flipY
+						? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+						: { top: swipe.ctxMenuPos.y }),
+				},
+			}}
+		>
+			<Menu.Target>
+				<div
+					style={{
+						position: "fixed",
+						left: swipe.ctxMenuPos.x,
+						top: swipe.ctxMenuPos.y,
+						pointerEvents: "none",
+					}}
+				/>
+			</Menu.Target>
+			<Menu.Dropdown>{menuItemsNode}</Menu.Dropdown>
+		</Menu>
+	);
+
+	// Swipe-reveal action menu (mobile, portal to body)
+	const swipeMenu =
+		(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+		(() => {
+			const menuEl = swipe.swipeMenuRef.current;
+			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
+			return createPortal(
+				<Box
+					ref={swipe.swipeMenuRef}
+					style={{
+						position: "fixed",
+						left: pos.left,
+						top: pos.top,
+						transform: "translateY(-50%)",
+						zIndex: 1000,
+						transition: swipe.swipeMenuTransition,
+						pointerEvents: swipe.swipeClosing ? "none" : "auto",
+					}}
+				>
+					<Menu opened withinPortal={false} position="bottom-start">
+						<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+							{menuItemsNode}
+						</Menu.Dropdown>
+					</Menu>
+				</Box>,
+				document.body,
+			);
+		})();
+
+	return (
+		<>
+			<Box
+				ref={rootRef}
+				data-content-block
+				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+				onContextMenu={handleContextMenu}
+				onClick={handleBlockClick}
+				style={{
+					outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+					outlineOffset: isSelected ? -2 : undefined,
+					borderRadius: isSelected ? 4 : undefined,
+					transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+					transition: swipe.swipeTransition,
+				}}
+			>
+				<Group
+					gap={0}
+					py={2}
+					wrap="nowrap"
+					align="center"
+					style={{ cursor: "pointer", userSelect: "none" }}
+					onClick={handleToggle}
+				>
+					<Box
+						style={{
+							display: "flex",
+							alignItems: "center",
+							width: 11,
+							justifyContent: "center",
+						}}
+					>
+						{opened ? (
+							<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+						) : (
+							<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+						)}
+					</Box>
+					<ThemeIcon size={16} variant="light" color="grape" radius="sm">
+						<IconBrain size={10} />
+					</ThemeIcon>
+					<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
+						{t("reasoning")}
+					</Text>
+					<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
+						{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+					</Text>
+					{!opened && (
+						<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
+							— {displayText.slice(0, 80)}
+							{displayText.length > 80 ? "…" : ""}
+						</Text>
+					)}
+				</Group>
+				{/*
+					Initial mount with opened=true: render Collapse directly to avoid
+					LazyCollapse's effect cascade (setMounted → rAF → setReveal) that
+					triggers "Maximum update depth exceeded" in Mantine's Transition
+					when many instances mount at once.
+					After first user toggle: switch to LazyCollapse for proper
+					expand/collapse animation with content unmount.
+				*/}
+				{!hasToggled.current && opened ? (
+					<Collapse in={opened}>{content}</Collapse>
+				) : (
+					<LazyCollapse in={opened}>{content}</LazyCollapse>
+				)}
+			</Box>
+			{swipeMenu}
+			{ctxMenu}
+		</>
 	);
 }
 
@@ -1492,6 +1731,7 @@ export const MessageBubble = memo(function MessageBubble({
 								streaming={isStreaming}
 								narratorId={narratorId}
 								blockIndex={realIndex}
+								messageId={message.id}
 							/>
 						);
 					}

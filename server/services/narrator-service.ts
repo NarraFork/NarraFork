@@ -461,15 +461,40 @@ export async function handleLoadToolCommand(
 	narratorId: string,
 	cmdResult: LoadToolResult | LoadToolNotFound,
 	locale: Locale = "en",
+	userId?: string,
 ): Promise<{ toolName: string; loaded: boolean; alreadyLoaded: boolean }> {
 	if ("loadToolNotFound" in cmdResult) {
 		const toolId = cmdResult.loadToolNotFound;
-		const infoText = `⚠️ Unknown tool: ${toolId}. Available: terminal, share_file`;
+		const infoText =
+			locale === "zh-CN"
+				? `⚠️ 未知工具：${toolId}。可用：terminal, share_file, narrafork_admin`
+				: `⚠️ Unknown tool: ${toolId}. Available: terminal, share_file, narrafork_admin`;
 		await narratorService.persistInfoMessage(narratorId, infoText);
 		return { toolName: toolId, loaded: false, alreadyLoaded: false };
 	}
-	const { loadOptionalTool } = await import("./narrator-session");
 	const toolName = cmdResult.loadTool;
+
+	// Admin-only tool check
+	if (toolName === "NarraForkAdmin") {
+		const adminOnlyMsg =
+			locale === "zh-CN"
+				? "⛔ 只有管理员才能加载此工具"
+				: "⛔ Only administrators can load this tool";
+		if (!userId) {
+			await narratorService.persistInfoMessage(narratorId, adminOnlyMsg);
+			return { toolName, loaded: false, alreadyLoaded: false };
+		}
+		const user = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		});
+		if (!user || user.role !== "admin") {
+			await narratorService.persistInfoMessage(narratorId, adminOnlyMsg);
+			return { toolName, loaded: false, alreadyLoaded: false };
+		}
+	}
+
+	const { loadOptionalTool } = await import("./narrator-session");
 	const result = await loadOptionalTool(narratorId, toolName);
 	const alreadyLoaded = result === "already_loaded";
 	const infoText = alreadyLoaded

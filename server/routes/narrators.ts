@@ -420,6 +420,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			id,
 			cmdResult as LoadToolResult | LoadToolNotFound,
 			locale,
+			userId,
 		);
 		return c.json(result, 200);
 	}

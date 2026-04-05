@@ -43,6 +43,8 @@
 	"newPassword": "新密码",
 	"newPasswordPlaceholder": "留空则不修改",
 	"userUpdateSuccess": "用户信息已更新",
+	"confirmPromoteAdmin": "确定要将 {{username}} 提升为管理员？",
+	"confirmDemoteAdmin": "确定要将 {{username}} 降级为普通用户？",
 	"actions": "操作",
 	"copy": "复制",
 	"copied": "已复制",
