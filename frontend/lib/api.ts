@@ -1395,6 +1395,20 @@ export const api = {
 		request<ApiEntity>(`/reviews/${reviewId}/promote`, { method: "POST" }),
 	dismissReview: (reviewId: string) =>
 		request<ApiEntity>(`/reviews/${reviewId}/dismiss`, { method: "POST" }),
+	getReviewConclusionForSource: (sourceChapterId: string) =>
+		request<{
+			conclusion: {
+				id: string;
+				verdict: "approve" | "request_changes" | "comment_only";
+				findingsJson: Array<{
+					severity: string;
+					file?: string;
+					line?: number;
+					message: string;
+				}> | null;
+				createdAt: string;
+			} | null;
+		}>(`/reviews/by-source/${sourceChapterId}/conclusion`),
 
 	// === chapter edges ===
 	listChapterEdges: (params: { projectId?: string; chapterId?: string; type?: string }) => {

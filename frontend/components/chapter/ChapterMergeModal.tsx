@@ -31,6 +31,26 @@ export function ChapterMergeModal({
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
 
+	// Query project settings to check if review is required before merge
+	const { data: project } = useQuery({
+		queryKey: ["project", projectId],
+		queryFn: () => api.getProject(projectId),
+		enabled: opened,
+	});
+
+	const cs = project?.chapterSettings as Record<string, unknown> | null;
+	const requireReview = !!cs?.requireReviewBeforeMerge;
+
+	// Query latest review conclusion for the source chapter
+	const { data: reviewData } = useQuery({
+		queryKey: ["reviewConclusion", "source", chapterId],
+		queryFn: () => api.getReviewConclusionForSource(chapterId),
+		enabled: opened && requireReview,
+	});
+
+	const reviewVerdict = reviewData?.conclusion?.verdict ?? null;
+	const reviewBlocked = requireReview && reviewVerdict !== "approve";
+
 	const resetState = () => {
 		setTargetId(null);
 		setStrategy("merge");
@@ -150,6 +170,23 @@ export function ChapterMergeModal({
 					</Alert>
 				)}
 
+				{reviewBlocked && (
+					<Alert
+						color={reviewVerdict === "request_changes" ? "red" : "orange"}
+						title={
+							reviewVerdict === "request_changes"
+								? t("mergeReviewRequestChanges")
+								: t("mergeReviewRequired")
+						}
+					>
+						<Text size="sm">
+							{reviewVerdict === "request_changes"
+								? t("mergeReviewRequestChangesDesc")
+								: t("mergeReviewRequiredDesc")}
+						</Text>
+					</Alert>
+				)}
+
 				<Button
 					variant="light"
 					onClick={handleCheck}
@@ -158,7 +195,11 @@ export function ChapterMergeModal({
 				>
 					{t("checkConflicts")}
 				</Button>
-				<Button onClick={() => merge.mutate()} loading={merge.isPending} disabled={!targetId}>
+				<Button
+					onClick={() => merge.mutate()}
+					loading={merge.isPending}
+					disabled={!targetId || reviewBlocked}
+				>
 					{t("merge")}
 				</Button>
 			</Stack>

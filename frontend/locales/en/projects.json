@@ -78,6 +78,8 @@
 	"projectCommandWhitelistDesc": "Commands auto-allowed for narrators in this project.",
 	"projectCommandBlacklist": "Command Blacklist",
 	"projectCommandBlacklistDesc": "Commands auto-denied for narrators in this project.",
+	"requireReviewBeforeMerge": "Require Review Before Merge",
+	"requireReviewBeforeMergeDesc": "When enabled, chapters must have an approved review before they can be merged.",
 	"authRequired": "Authentication Required",
 	"authRequiredMessage": "This repository requires authentication. Please enter your credentials.",
 	"authUsername": "Username",

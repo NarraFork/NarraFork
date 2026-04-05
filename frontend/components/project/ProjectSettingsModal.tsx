@@ -1,4 +1,4 @@
-import { Button, Modal, Stack, Text, TextInput, Title } from "@mantine/core";
+import { Button, Modal, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateProject } from "../../hooks/useProjects";
@@ -63,6 +63,7 @@ export function ProjectSettingsModal({
 	const [commandBlacklist, setCommandBlacklist] = useState<
 		Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>
 	>(cs.commandBlacklist ?? []);
+	const [requireReview, setRequireReview] = useState<boolean>(cs.requireReviewBeforeMerge ?? false);
 
 	useEffect(() => {
 		if (opened) {
@@ -81,6 +82,7 @@ export function ProjectSettingsModal({
 			setBlacklistDirs(fresh.blacklistDirs ?? []);
 			setCommandWhitelist(fresh.commandWhitelist ?? []);
 			setCommandBlacklist(fresh.commandBlacklist ?? []);
+			setRequireReview(fresh.requireReviewBeforeMerge ?? false);
 		}
 	}, [opened, proxyDomain, chapterSettings]);
 
@@ -96,6 +98,7 @@ export function ProjectSettingsModal({
 						blacklistDirs,
 						commandWhitelist,
 						commandBlacklist,
+						requireReviewBeforeMerge: requireReview,
 					},
 				},
 			},
@@ -194,6 +197,15 @@ export function ProjectSettingsModal({
 						placeholder: ts("cmdListPlaceholder"),
 						denyPromptPlaceholder: ts("cmdDenyPromptPlaceholder"),
 					}}
+				/>
+
+				<Title order={5} mt="sm">
+					{t("requireReviewBeforeMerge")}
+				</Title>
+				<Switch
+					label={t("requireReviewBeforeMergeDesc")}
+					checked={requireReview}
+					onChange={(e) => setRequireReview(e.currentTarget.checked)}
 				/>
 
 				<Button onClick={handleSave} loading={update.isPending} disabled={!!domainError}>

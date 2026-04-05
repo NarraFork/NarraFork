@@ -89,6 +89,7 @@ export const updateProjectSchema = z.object({
 			blacklistDirs: z.array(blacklistDirEntrySchema).max(50).optional(),
 			commandWhitelist: z.array(commandWhitelistEntrySchema).max(50).optional(),
 			commandBlacklist: z.array(commandBlacklistEntrySchema).max(50).optional(),
+			requireReviewBeforeMerge: z.boolean().optional(),
 		})
 		.optional(),
 });

@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { chapters, narrators, projects, reviewConclusions } from "../db/schema";
 import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -132,6 +132,26 @@ export const chapterMerge = {
 		const strategy = input.strategy ?? "merge";
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
+
+		// Review gate: if project requires review approval before merge
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, source.projectId),
+		});
+		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
+		if (chapterSettings?.requireReviewBeforeMerge) {
+			const latestConclusion = await db.query.reviewConclusions.findFirst({
+				where: eq(reviewConclusions.sourceChapterId, sourceChapterId),
+				orderBy: [desc(reviewConclusions.createdAt)],
+			});
+			if (!latestConclusion || latestConclusion.verdict !== "approve") {
+				throw new ValidationError(
+					"Review approval required before merge. " +
+						(latestConclusion
+							? `Latest review verdict: ${latestConclusion.verdict}`
+							: "No review found."),
+				);
+			}
+		}
 
 		// Check if fast-forward is possible (only for "merge" strategy)
 		const canFastForward =
