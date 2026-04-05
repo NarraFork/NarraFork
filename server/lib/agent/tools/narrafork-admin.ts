@@ -153,7 +153,6 @@ export const narraforkAdminTool: ToolDefinition = {
 		"get_setting (single key by dot-path), " +
 		"update_settings (partial merge, requires approval), " +
 		"reset_setting (revert to default, requires approval).",
-	isAvailable: () => false,
 	parameters: z.object({
 		action: z
 			.enum(["get_settings", "get_setting", "update_settings", "reset_setting"])

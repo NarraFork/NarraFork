@@ -3,6 +3,7 @@ import {
 	buildStreamingMsg,
 	clearToolBlockCache,
 	generateBlockKeys,
+	type StreamingBlock,
 } from "../../frontend/components/narrator/message-segments";
 
 // ---------------------------------------------------------------------------
@@ -13,7 +14,10 @@ describe("buildStreamingMsg — stable block IDs", () => {
 	const base = { narratorId: "n1" };
 
 	test("reasoning block gets stable id", () => {
-		const msg = buildStreamingMsg({ ...base, streamingReasoning: "thinking..." });
+		const msg = buildStreamingMsg({
+			...base,
+			streamingBlocks: [{ type: "reasoning", text: "thinking..." }],
+		});
 		expect(msg).not.toBeNull();
 		const reasoningBlock = msg?.contentJson.find((b: any) => b.type === "reasoning");
 		expect(reasoningBlock).toBeDefined();
@@ -21,7 +25,10 @@ describe("buildStreamingMsg — stable block IDs", () => {
 	});
 
 	test("text block gets stable id", () => {
-		const msg = buildStreamingMsg({ ...base, streamingText: "hello" });
+		const msg = buildStreamingMsg({
+			...base,
+			streamingBlocks: [{ type: "text", text: "hello" }],
+		});
 		expect(msg).not.toBeNull();
 		const textBlock = msg?.contentJson.find((b: any) => b.type === "text");
 		expect(textBlock).toBeDefined();
@@ -31,8 +38,10 @@ describe("buildStreamingMsg — stable block IDs", () => {
 	test("reasoning + text both get stable ids", () => {
 		const msg = buildStreamingMsg({
 			...base,
-			streamingReasoning: "thinking...",
-			streamingText: "hello",
+			streamingBlocks: [
+				{ type: "reasoning", text: "thinking..." },
+				{ type: "text", text: "hello" },
+			],
 		});
 		expect(msg).not.toBeNull();
 		const ids = msg?.contentJson.map((b: any) => b.id);
@@ -42,7 +51,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 	test("web_search block keeps its original id", () => {
 		const msg = buildStreamingMsg({
 			...base,
-			webSearch: { id: "ws-123", status: "searching", query: "test" },
+			streamingBlocks: [{ type: "web_search", id: "ws-123", status: "searching", query: "test" }],
 		});
 		expect(msg).not.toBeNull();
 		const wsBlock = msg?.contentJson.find((b: any) => b.type === "web_search");
@@ -85,9 +94,11 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		};
 		const msg = buildStreamingMsg({
 			...base,
-			streamingReasoning: "thinking...",
-			streamingText: "result",
-			webSearch: { id: "ws-1", status: "completed", query: "q" },
+			streamingBlocks: [
+				{ type: "reasoning", text: "thinking..." },
+				{ type: "web_search", id: "ws-1", status: "completed", query: "q" },
+				{ type: "text", text: "result" },
+			],
 			toolChunksMsg,
 		});
 		expect(msg).not.toBeNull();
@@ -97,22 +108,29 @@ describe("buildStreamingMsg — stable block IDs", () => {
 
 	test("ids are stable across incremental streaming updates", () => {
 		// Simulate the streaming sequence: reasoning → +text → +web_search → +tool
-		const step1 = buildStreamingMsg({ ...base, streamingReasoning: "t" });
+		const step1 = buildStreamingMsg({
+			...base,
+			streamingBlocks: [{ type: "reasoning", text: "t" }],
+		});
 		const reasoningId1 = step1?.contentJson[0].id;
 
 		const step2 = buildStreamingMsg({
 			...base,
-			streamingReasoning: "thinking...",
-			streamingText: "hel",
+			streamingBlocks: [
+				{ type: "reasoning", text: "thinking..." },
+				{ type: "text", text: "hel" },
+			],
 		});
 		const reasoningId2 = step2?.contentJson.find((b: any) => b.type === "reasoning")?.id;
 		const textId2 = step2?.contentJson.find((b: any) => b.type === "text")?.id;
 
 		const step3 = buildStreamingMsg({
 			...base,
-			streamingReasoning: "thinking...",
-			streamingText: "hello world",
-			webSearch: { id: "ws-1", status: "searching" },
+			streamingBlocks: [
+				{ type: "reasoning", text: "thinking..." },
+				{ type: "web_search", id: "ws-1", status: "searching" },
+				{ type: "text", text: "hello world" },
+			],
 		});
 		const reasoningId3 = step3?.contentJson.find((b: any) => b.type === "reasoning")?.id;
 		const textId3 = step3?.contentJson.find((b: any) => b.type === "text")?.id;
@@ -123,6 +141,40 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		expect(reasoningId3).toBe("streaming:reasoning");
 		expect(textId2).toBe("streaming:text");
 		expect(textId3).toBe("streaming:text");
+	});
+
+	test("temporal order is preserved: search between reasoning steps", () => {
+		// Simulate: reasoning → search → reasoning (the bug scenario)
+		const msg = buildStreamingMsg({
+			...base,
+			streamingBlocks: [
+				{ type: "reasoning", text: "initial thinking" },
+				{ type: "web_search", id: "ws-1", status: "completed", query: "first search" },
+				{ type: "text", text: "result" },
+			],
+		});
+		expect(msg).not.toBeNull();
+		const types = msg?.contentJson.map((b: any) => b.type);
+		expect(types).toEqual(["reasoning", "web_search", "text"]);
+	});
+
+	test("multiple web_search blocks preserve temporal order", () => {
+		const msg = buildStreamingMsg({
+			...base,
+			streamingBlocks: [
+				{ type: "reasoning", text: "thinking about X" },
+				{ type: "web_search", id: "ws-1", status: "completed", query: "search X" },
+				{ type: "web_search", id: "ws-2", status: "searching", query: "search Y" },
+				{ type: "text", text: "partial..." },
+			],
+		});
+		expect(msg).not.toBeNull();
+		const types = msg?.contentJson.map((b: any) => b.type);
+		expect(types).toEqual(["reasoning", "web_search", "web_search", "text"]);
+		const wsIds = msg?.contentJson
+			.filter((b: any) => b.type === "web_search")
+			.map((b: any) => b.id);
+		expect(wsIds).toEqual(["ws-1", "ws-2"]);
 	});
 });
 
@@ -298,12 +350,12 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 
 		const msg1 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingText: "first",
+			streamingBlocks: [{ type: "text", text: "first" }],
 			toolChunksMsg,
 		});
 		const msg2 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingText: "second",
+			streamingBlocks: [{ type: "text", text: "second" }],
 			toolChunksMsg,
 		});
 
@@ -363,17 +415,17 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 		// Simulate streaming: same tool chunks, changing text
 		const msg1 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingText: "h",
+			streamingBlocks: [{ type: "text", text: "h" }],
 			toolChunksMsg,
 		});
 		const msg2 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingText: "hello",
+			streamingBlocks: [{ type: "text", text: "hello" }],
 			toolChunksMsg,
 		});
 		const msg3 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingText: "hello world",
+			streamingBlocks: [{ type: "text", text: "hello world" }],
 			toolChunksMsg,
 		});
 

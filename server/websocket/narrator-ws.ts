@@ -255,8 +255,11 @@ export type NarratorServerMessage =
 	| {
 			type: "streaming_snapshot";
 			narratorId: string;
-			streamingText: string;
-			streamingReasoning: string;
+			streamingBlocks: Array<
+				| { type: "reasoning"; text: string }
+				| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+				| { type: "text"; text: string }
+			>;
 			toolChunks: Array<{
 				toolUseId: string;
 				toolName: string;
@@ -696,8 +699,7 @@ export const handleNarratorWS = {
 				for (const id of msg.narratorIds) {
 					const snap = getStreamingSnapshot(id);
 					if (!snap) continue;
-					const hasStreaming =
-						snap.streamingText || snap.streamingReasoning || snap.toolChunks.size > 0;
+					const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
 					if (!hasStreaming && !hasQueue) continue;
 					try {
 						if (hasStreaming) {
@@ -705,8 +707,7 @@ export const handleNarratorWS = {
 								JSON.stringify({
 									type: "streaming_snapshot",
 									narratorId: id,
-									streamingText: snap.streamingText,
-									streamingReasoning: snap.streamingReasoning,
+									streamingBlocks: snap.streamingBlocks,
 									toolChunks: [...snap.toolChunks.values()],
 								}),
 							);

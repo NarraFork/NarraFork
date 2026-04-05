@@ -121,9 +121,15 @@ export interface ToolChunkSnapshot {
 	streamingOutput?: string;
 }
 
+/** A streaming block tracked in temporal order (by event arrival). */
+export type SnapshotStreamingBlock =
+	| { type: "reasoning"; text: string }
+	| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+	| { type: "text"; text: string };
+
 export interface StreamingSnapshot {
-	streamingText: string;
-	streamingReasoning: string;
+	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
+	streamingBlocks: SnapshotStreamingBlock[];
 	toolChunks: Map<string, ToolChunkSnapshot>;
 }
 
@@ -135,7 +141,7 @@ const streamingSnapshots = hotSafe<Map<string, StreamingSnapshot>>(
 function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 	let snap = streamingSnapshots.get(narratorId);
 	if (!snap) {
-		snap = { streamingText: "", streamingReasoning: "", toolChunks: new Map() };
+		snap = { streamingBlocks: [], toolChunks: new Map() };
 		streamingSnapshots.set(narratorId, snap);
 	}
 	return snap;
@@ -293,8 +299,16 @@ export async function processEvent(
 			recordOutputChunk(event.text.length);
 
 			// Snapshot: accumulate streaming text (top-level only)
+			// Append to the last text block if it exists, otherwise create a new one.
+			// This allows text blocks to be interleaved with web_search blocks.
 			if (!ctx.parentToolUseId) {
-				getOrCreateSnapshot(broadcastTargetId).streamingText += event.text;
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const lastBlock = snap.streamingBlocks[snap.streamingBlocks.length - 1];
+				if (lastBlock?.type === "text") {
+					lastBlock.text += event.text;
+				} else {
+					snap.streamingBlocks.push({ type: "text", text: event.text });
+				}
 			}
 
 			const streamEvent: Record<string, unknown> = {
@@ -400,17 +414,23 @@ export async function processEvent(
 		case "block_complete": {
 			const { block } = event;
 
-			// Snapshot: clear accumulated streaming text/reasoning once the block
-			// is persisted — the completed block will be served via the partial
-			// message from the database, so the snapshot should only contain
-			// text that is still being streamed (i.e. not yet block_complete).
+			// Snapshot: remove the completed block from the ordered streaming blocks.
+			// The completed block will be served via the partial message from the
+			// database, so the snapshot should only contain blocks still being streamed.
 			if (!ctx.parentToolUseId) {
 				const snap = streamingSnapshots.get(broadcastTargetId);
 				if (snap) {
 					if (block.type === "text") {
-						snap.streamingText = "";
+						// Remove the last text block (the one being streamed)
+						for (let i = snap.streamingBlocks.length - 1; i >= 0; i--) {
+							if (snap.streamingBlocks[i].type === "text") {
+								snap.streamingBlocks.splice(i, 1);
+								break;
+							}
+						}
 					} else if (block.type === "reasoning") {
-						snap.streamingReasoning = "";
+						const idx = snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
+						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
 					}
 				}
 			}
@@ -779,8 +799,15 @@ export async function processEvent(
 			recordOutputChunk(event.text.length);
 
 			// Snapshot: accumulate streaming reasoning (top-level only)
+			// Reasoning is always a single block — find and update, or create new.
 			if (!ctx.parentToolUseId) {
-				getOrCreateSnapshot(broadcastTargetId).streamingReasoning += event.text;
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const existing = snap.streamingBlocks.find((b) => b.type === "reasoning");
+				if (existing) {
+					existing.text += event.text;
+				} else {
+					snap.streamingBlocks.push({ type: "reasoning", text: event.text });
+				}
 			}
 
 			const reasoningStreamEvent: Record<string, unknown> = {
@@ -941,6 +968,26 @@ export async function processEvent(
 		}
 
 		case "web_search": {
+			// Snapshot: track web_search in ordered blocks (top-level only)
+			if (!ctx.parentToolUseId) {
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const existing = snap.streamingBlocks.find(
+					(b) => b.type === "web_search" && b.id === event.id,
+				);
+				if (existing && existing.type === "web_search") {
+					existing.status = event.status;
+					if (event.query) existing.query = event.query;
+					if (event.queries) existing.queries = event.queries;
+				} else {
+					snap.streamingBlocks.push({
+						type: "web_search",
+						id: event.id,
+						status: event.status,
+						query: event.query,
+						queries: event.queries,
+					});
+				}
+			}
 			dualBroadcast(ctx, {
 				type: "web_search",
 				narratorId: broadcastTargetId,

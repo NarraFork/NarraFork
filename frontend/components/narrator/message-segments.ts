@@ -353,46 +353,56 @@ export function clearToolBlockCache(): void {
 	toolBlockCache.clear();
 }
 
+/** A streaming block tracked in temporal order (by event arrival). */
+export type StreamingBlock =
+	| { type: "reasoning"; text: string }
+	| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+	| { type: "text"; text: string };
+
 export function buildStreamingMsg(opts: {
-	streamingText?: string;
-	streamingReasoning?: string;
-	webSearch?: { id: string; status: string; query?: string } | null;
+	streamingBlocks?: StreamingBlock[] | null;
 	toolChunksMsg?: NarratorMsg | null;
 	narratorId: string;
 }): NarratorMsg | null {
-	const { streamingText, streamingReasoning, webSearch, toolChunksMsg, narratorId } = opts;
+	const { streamingBlocks, toolChunksMsg, narratorId } = opts;
 
-	const hasText = !!streamingText;
-	const hasReasoning = !!streamingReasoning;
-	const hasWebSearch = !!webSearch;
+	const hasStreamingBlocks = !!streamingBlocks && streamingBlocks.length > 0;
 	const hasToolChunks = !!toolChunksMsg;
 
-	if (!hasText && !hasReasoning && !hasWebSearch && !hasToolChunks) return null;
+	if (!hasStreamingBlocks && !hasToolChunks) return null;
 
 	const blocks: ContentBlock[] = [];
 
-	if (hasReasoning) {
-		// Assign stable synthetic id so React key doesn't shift when new blocks
-		// are inserted before it during streaming.
-		blocks.push({
-			type: "reasoning",
-			id: "streaming:reasoning",
-			text: streamingReasoning,
-		} as ContentBlock);
+	if (hasStreamingBlocks) {
+		for (const sb of streamingBlocks) {
+			if (sb.type === "reasoning") {
+				// Assign stable synthetic id so React key doesn't shift when new blocks
+				// are inserted before it during streaming.
+				blocks.push({
+					type: "reasoning",
+					id: "streaming:reasoning",
+					text: sb.text,
+				} as ContentBlock);
+			} else if (sb.type === "web_search") {
+				blocks.push({
+					type: "web_search",
+					id: sb.id,
+					status: sb.status,
+					query: sb.query,
+					queries: sb.queries,
+				} as ContentBlock);
+			} else if (sb.type === "text") {
+				// Assign stable synthetic id so React key doesn't shift when new blocks
+				// are inserted before it during streaming.
+				blocks.push({
+					type: "text",
+					id: "streaming:text",
+					text: sb.text,
+				} as ContentBlock);
+			}
+		}
 	}
-	if (hasWebSearch) {
-		blocks.push({
-			type: "web_search",
-			id: webSearch.id,
-			status: webSearch.status,
-			query: webSearch.query,
-		} as ContentBlock);
-	}
-	if (hasText) {
-		// Assign stable synthetic id so React key doesn't shift when new blocks
-		// are inserted before it during streaming.
-		blocks.push({ type: "text", id: "streaming:text", text: streamingText } as ContentBlock);
-	}
+
 	if (toolChunksMsg) {
 		const chunkBlocks = Array.isArray(toolChunksMsg.contentJson) ? toolChunksMsg.contentJson : [];
 		for (const raw of chunkBlocks) {

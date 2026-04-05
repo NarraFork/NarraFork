@@ -1,5 +1,4 @@
 import { Box, Divider, Text } from "@mantine/core";
-import { memo } from "react";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId, getUserMessageBlurAnimationId } from "./blur-in-ids";
 import { MessageBubble } from "./MessageBubble";
@@ -424,51 +423,3 @@ export function RenderProgress({
 		</div>
 	);
 }
-
-// ---------------------------------------------------------------------------
-// StreamingBubble — isolated component to avoid re-rendering the entire panel
-// ---------------------------------------------------------------------------
-
-export const StreamingBubble = memo(
-	function StreamingBubble({
-		narratorId,
-		streamingRef,
-		webSearchRef,
-		version,
-	}: {
-		narratorId: string;
-		streamingRef: React.RefObject<string>;
-		webSearchRef?: React.RefObject<{
-			id: string;
-			status: "in_progress" | "searching" | "completed";
-			query?: string;
-		} | null>;
-		version: number;
-	}) {
-		void version;
-		const text = streamingRef.current;
-		const webSearch = webSearchRef?.current;
-		if (!text && !webSearch) return null;
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic block shapes
-		const blocks: any[] = [];
-		if (webSearch) {
-			blocks.push({
-				type: "web_search",
-				id: webSearch.id,
-				status: webSearch.status,
-				query: webSearch.query,
-			});
-		}
-		if (text) blocks.push({ type: "text", text });
-		return (
-			<MessageBubble
-				narratorId={narratorId}
-				message={{
-					role: "assistant",
-					contentJson: blocks,
-				}}
-			/>
-		);
-	},
-	(prev, next) => prev.version === next.version && prev.narratorId === next.narratorId,
-);

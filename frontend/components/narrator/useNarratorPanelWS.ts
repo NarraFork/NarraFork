@@ -6,7 +6,7 @@ import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
-import { clearToolBlockCache } from "./message-segments";
+import { clearToolBlockCache, type StreamingBlock } from "./message-segments";
 import {
 	evictOldestPages,
 	findMsgByToolUseIdInTree,
@@ -82,15 +82,9 @@ export interface UseNarratorPanelWSReturn {
 		updatedPlan?: string,
 	) => void;
 	// Streaming
-	streamingRef: React.RefObject<string>;
-	streamingReasoningRef: React.RefObject<string>;
 	streamingVersion: number;
 	topLevelStreamingChunks: NarratorMsg | null;
-	webSearchRef: React.RefObject<{
-		id: string;
-		status: "in_progress" | "searching" | "completed";
-		query?: string;
-	} | null>;
+	streamingBlocksRef: React.RefObject<StreamingBlock[]>;
 	// Permissions
 	pendingPermsMap: Map<string, PendingPermission>;
 	pendingPermission: PendingPermission | null;
@@ -163,17 +157,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const interruptMutation = useInterruptNarrator();
 
 	// --- Streaming state ---
-	const streamingRef = useRef("");
-	const streamingReasoningRef = useRef("");
 	const [streamingVersion, setStreamingVersion] = useState(0);
 	const [topLevelChunksVersion, bumpTopLevelStreamingChunksVersion] = useState(0);
-	// Native web search status (Codex web_search tool) — stored as ref to avoid extra re-renders;
-	// streamingVersion bump handles the render trigger.
-	const webSearchRef = useRef<{
-		id: string;
-		status: "in_progress" | "searching" | "completed";
-		query?: string;
-	} | null>(null);
+
+	// Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text
+	// blocks as events arrive, so the UI renders them in the correct sequence instead of
+	// grouping all reasoning before all search.
+	const streamingBlocksRef = useRef<StreamingBlock[]>([]);
 
 	// RAF-based throttle: coalesce rapid streaming updates into one render per frame
 	const streamingRafRef = useRef(0);
@@ -705,13 +695,29 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// avoids a no-op setState on every delta that still increments
 					// React's nested-update counter inside useLayoutEffect chains.
 					clearRetryIfActive();
-					streamingRef.current += ev.delta.text;
+					// Maintain ordered blocks: append to the last text block or create new one.
+					// This allows text blocks to be interleaved with web_search blocks.
+					const blocks = streamingBlocksRef.current;
+					const lastBlock = blocks[blocks.length - 1];
+					if (lastBlock?.type === "text") {
+						lastBlock.text += ev.delta.text;
+					} else {
+						blocks.push({ type: "text", text: ev.delta.text });
+					}
 					flushStreamingVersion();
 					return;
 				}
 				if (ev.delta.type === "reasoning_delta") {
 					clearRetryIfActive();
-					streamingReasoningRef.current += ev.delta.text;
+					// Maintain ordered blocks: reasoning is always a single block —
+					// find and update, or create new.
+					const blocks = streamingBlocksRef.current;
+					const reasoningBlock = blocks.find((b) => b.type === "reasoning");
+					if (reasoningBlock) {
+						reasoningBlock.text += ev.delta.text;
+					} else {
+						blocks.push({ type: "reasoning", text: ev.delta.text });
+					}
 					flushStreamingVersion();
 					return;
 				}
@@ -742,13 +748,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						// streaming text, tool chunks, or streaming version — the parent
 						// may still be actively streaming while subagents complete.
 						if (!newMsg.parentToolUseId) {
-							if (streamingRef.current) {
-								streamingRef.current = "";
-							}
-							if (streamingReasoningRef.current) {
-								streamingReasoningRef.current = "";
-							}
-							webSearchRef.current = null;
+							streamingBlocksRef.current = [];
 							clearStreamingState();
 							// Clear pending RAF chunks — real message supersedes synthetic state.
 							// Notify (bump version) so topLevelStreamingChunks memo recomputes
@@ -1225,15 +1225,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// shortly after the thinking transition.
 				if (isTerminal) {
 
-					const hadStreaming =
-						!!streamingRef.current || !!streamingReasoningRef.current || !!webSearchRef.current;
-					if (streamingRef.current) {
-						streamingRef.current = "";
-					}
-					if (streamingReasoningRef.current) {
-						streamingReasoningRef.current = "";
-					}
-					webSearchRef.current = null;
+					const hadStreaming = streamingBlocksRef.current.length > 0;
+					streamingBlocksRef.current = [];
 					// Only bump streamingVersion when there was actual streaming content
 					// to clear — avoids a redundant setState when onMessage already
 					// cleared everything, reducing the nested-update count.
@@ -1314,8 +1307,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			},
-			onWebSearch: (id, status, query) => {
-				webSearchRef.current = { id, status, query };
+			onWebSearch: (id, status, query, queries) => {
+				// Maintain ordered blocks: update existing search or append new one
+				const blocks = streamingBlocksRef.current;
+				const existingIdx = blocks.findIndex((b) => b.type === "web_search" && b.id === id);
+				if (existingIdx !== -1) {
+					const existing = blocks[existingIdx];
+					if (existing.type === "web_search") {
+						existing.status = status;
+						if (query) existing.query = query;
+						if (queries) existing.queries = queries;
+					}
+				} else {
+					blocks.push({ type: "web_search", id, status, query, queries });
+				}
 				flushStreamingVersion();
 			},
 			onGitStatus: (data) => {
@@ -1350,13 +1355,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Session error may leave synthetic streaming chunks in the cache.
 				cancelPendingToolChunks(false, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
-				if (streamingRef.current) {
-					streamingRef.current = "";
-				}
-				if (streamingReasoningRef.current) {
-					streamingReasoningRef.current = "";
-				}
-				webSearchRef.current = null;
+				streamingBlocksRef.current = [];
 				clearStreamingState();
 				const errorI18nMap: Record<string, string> = {
 					context_too_long_compact_failed: "contextTooLongCompactFailed",
@@ -1438,13 +1437,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Clean up synthetic streaming state before full reload.
 				cancelPendingToolChunks(false, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
-				if (streamingRef.current) {
-					streamingRef.current = "";
-				}
-				if (streamingReasoningRef.current) {
-					streamingReasoningRef.current = "";
-				}
-				webSearchRef.current = null;
+				streamingBlocksRef.current = [];
 				clearStreamingState();
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 			},
@@ -1524,14 +1517,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setViewers(v);
 			},
 			onStreamingSnapshot: (snapshot) => {
-				// Restore streaming text
-				if (snapshot.streamingText) {
-					streamingRef.current = snapshot.streamingText;
-				}
-				if (snapshot.streamingReasoning) {
-					streamingReasoningRef.current = snapshot.streamingReasoning;
-				}
-				if (snapshot.streamingText || snapshot.streamingReasoning) {
+				// Restore ordered streaming blocks from server snapshot
+				if (snapshot.streamingBlocks.length > 0) {
+					streamingBlocksRef.current = [...snapshot.streamingBlocks];
 					flushStreamingVersion();
 				}
 
@@ -1787,11 +1775,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		sendBufferMessage,
 		cancelBuffer,
 		sendPermissionDecision,
-		streamingRef,
-		streamingReasoningRef,
 		streamingVersion,
 		topLevelStreamingChunks,
-		webSearchRef,
+		streamingBlocksRef,
 		pendingPermsMap,
 		pendingPermission,
 		renderPermCb,
