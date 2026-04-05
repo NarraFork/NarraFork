@@ -5,6 +5,7 @@ import {
 	getModelContextWindow,
 	isAnthropicProvider,
 	settings,
+	usesCodexApiMode,
 	usesStatefulApi,
 } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
@@ -403,7 +404,7 @@ export async function* agentLoop(
 	const isOfficialAnthropic =
 		isAnthropicProvider(effectiveProvider) &&
 		!!getAnthropicProviderConfig(effectiveProvider)?.officialApi;
-	if (effectiveProvider === "codex" || isOfficialAnthropic) {
+	if (usesCodexApiMode(effectiveProvider) || isOfficialAnthropic) {
 		allTools = allTools.filter((t) => t.name !== "WebSearch");
 	}
 
@@ -1572,7 +1573,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 	const isOfficialAnthropic =
 		isAnthropicProvider(config.provider) &&
 		!!getAnthropicProviderConfig(config.provider)?.officialApi;
-	if (tu.name === "WebSearch" && (config.provider === "codex" || isOfficialAnthropic)) {
+	if (tu.name === "WebSearch" && (usesCodexApiMode(config.provider) || isOfficialAnthropic)) {
 		logger.warn("Blocked WebSearch function tool for native-search provider", {
 			provider: config.provider,
 			model: config.model,
