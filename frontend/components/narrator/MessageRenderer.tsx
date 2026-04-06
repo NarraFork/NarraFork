@@ -79,7 +79,7 @@ export function renderToolRun(
 		const key = item.tc.toolUseId ?? `${item.msg.id}-${idx}`;
 		const hlStyle = highlightedId === item.msg.id ? HIGHLIGHT_STYLE : undefined;
 
-		const ctxActions: MessageContextMenuActions = {};
+		const ctxActions: MessageContextMenuActions = { messageId: item.msg.id };
 		const msgUuid = item.msg.messageUuid;
 		const msgId = item.msg.id;
 		if (msgUuid && onForkFromMessage) {

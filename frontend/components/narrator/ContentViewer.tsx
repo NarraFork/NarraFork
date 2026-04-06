@@ -14,6 +14,7 @@ import {
 	IconTextWrap,
 	IconTextWrapDisabled,
 	IconTrash,
+	IconX,
 } from "@tabler/icons-react";
 import {
 	type CSSProperties,
@@ -665,6 +666,10 @@ export const ContentViewer = memo(
 												{tNarrator("contextMenu_delete")}
 											</Menu.Item>
 										)}
+										<Menu.Divider />
+										<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
+											{t("cancel")}
+										</Menu.Item>
 									</Menu.Dropdown>
 								</Menu>
 							</Box>,

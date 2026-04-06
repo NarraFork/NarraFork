@@ -43,6 +43,7 @@ import {
 	IconRepeat,
 	IconTrash,
 	IconWorldSearch,
+	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -448,6 +449,10 @@ function ReasoningBlock({
 					{t("contextMenu_delete")}
 				</Menu.Item>
 			)}
+			<Menu.Divider />
+			<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
+				{tc("cancel")}
+			</Menu.Item>
 		</>
 	);
 
@@ -1661,48 +1666,49 @@ export const MessageBubble = memo(function MessageBubble({
 		return <ReviewFeedbackCard block={reviewFeedbackBlock} />;
 	}
 
-	// Segment compact indicators (role="system" with segment_compact content block)
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const segmentCompactBlock = blocks.find((b: any) => b.type === "segment_compact");
-	if (segmentCompactBlock) {
-		const isSegCompacting = segmentCompactBlock.status === "compacting";
-		const isFailed = segmentCompactBlock.status === "failed";
-		if (isFailed) {
+	// System messages (compact indicators / plan cards / segment compact / error notices)
+	if (message.role === "system") {
+		// Segment compact indicators
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const segmentCompactBlock = blocks.find((b: any) => b.type === "segment_compact");
+		if (segmentCompactBlock) {
+			const isSegCompacting = segmentCompactBlock.status === "compacting";
+			const isFailed = segmentCompactBlock.status === "failed";
+			if (isFailed) {
+				return (
+					<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+						<Group gap={6} wrap="nowrap" align="flex-start">
+							<IconAlertTriangle
+								size={16}
+								style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
+							/>
+							<Stack gap={2}>
+								<Text size="xs" fw={600} c="red.8">
+									{t("segmentCompactFailed")}
+								</Text>
+								<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
+									{segmentCompactBlock.error ??
+										segmentCompactBlock.summary ??
+										t("segmentCompactFailedDesc")}
+								</Text>
+							</Stack>
+						</Group>
+					</Paper>
+				);
+			}
+			const canNavigate = !isSegCompacting && narratorId && message.id;
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
-					<Group gap={6} wrap="nowrap" align="flex-start">
-						<IconAlertTriangle
-							size={16}
-							style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
-						/>
-						<Stack gap={2}>
-							<Text size="xs" fw={600} c="red.8">
-								{t("segmentCompactFailed")}
-							</Text>
-							<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
-								{segmentCompactBlock.error ??
-									segmentCompactBlock.summary ??
-									t("segmentCompactFailedDesc")}
-							</Text>
-						</Stack>
-					</Group>
-				</Paper>
+				<SegmentCompactIndicator
+					isCompacting={isSegCompacting}
+					narratorId={canNavigate ? narratorId : undefined}
+					messageId={canNavigate ? message.id : undefined}
+					messageCount={segmentCompactBlock.messageCount}
+					onDelete={canNavigate ? invalidateMessages : undefined}
+				/>
 			);
 		}
-		const canNavigate = !isSegCompacting && narratorId && message.id;
-		return (
-			<SegmentCompactIndicator
-				isCompacting={isSegCompacting}
-				narratorId={canNavigate ? narratorId : undefined}
-				messageId={canNavigate ? message.id : undefined}
-				messageCount={segmentCompactBlock.messageCount}
-				onDelete={canNavigate ? invalidateMessages : undefined}
-			/>
-		);
-	}
 
-	// System messages (compact indicators / plan cards / error notices)
-	if (message.role === "system") {
+		// Regular compact indicators / plan cards
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
 		if (compactBlock) {

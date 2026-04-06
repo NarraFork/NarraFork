@@ -114,6 +114,40 @@ export function resolveSelectedBlockMeta(
 }
 
 /**
+ * Extract deduplicated message IDs from selected blocks in DOM order.
+ * Unlike resolveSelectedBlockMeta, this does NOT require data-block-index,
+ * and walks up the DOM to find the nearest data-message-id ancestor when
+ * the block itself doesn't carry one (e.g. nested ContentViewer blocks).
+ */
+export function resolveSelectedMessageIds(
+	container: HTMLElement,
+	selectedIds: Set<string>,
+): string[] {
+	const allBlocks = container.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`);
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const el of allBlocks) {
+		const blockId = el.getAttribute(BLOCK_ID_ATTR);
+		if (!blockId || !selectedIds.has(blockId)) continue;
+		// Try the element itself, then walk up to find the nearest message ID
+		let messageId = el.getAttribute("data-message-id");
+		if (!messageId) {
+			let parent = el.parentElement;
+			while (parent && parent !== container) {
+				messageId = parent.getAttribute("data-message-id");
+				if (messageId) break;
+				parent = parent.parentElement;
+			}
+		}
+		if (messageId && !seen.has(messageId)) {
+			seen.add(messageId);
+			result.push(messageId);
+		}
+	}
+	return result;
+}
+
+/**
  * Collect the visible text content of all selected blocks in DOM order.
  * For `cv-*` blocks, uses the `handleRegistry` via `data-cv-id` if available,
  * otherwise falls back to `innerText`.

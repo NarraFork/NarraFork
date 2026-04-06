@@ -67,3 +67,36 @@ export function getGlobalToggleBlock() {
 export function setGlobalToggleBlock(fn: ToggleBlockCallback | null) {
 	globalToggleBlock = fn;
 }
+
+// ---------------------------------------------------------------------------
+// Swipe anchor info — extended metadata for the off-screen overlay.
+// When the swiped block scrolls out of view, the overlay uses this to show
+// a preview and allow scrolling back.
+// ---------------------------------------------------------------------------
+
+export interface SwipeAnchorInfo {
+	blockId: string;
+	/** Short preview text extracted from the swiped block. */
+	previewText: string;
+	/** Reference to the swiped DOM element for cloning into the overlay. */
+	element: HTMLElement;
+	/** Scroll the swiped block back into view. */
+	scrollBack: () => void;
+	/** Close the swipe (and anchor). */
+	close: () => void;
+	/** Direction the block scrolled off-screen: "top" or "bottom". */
+	offScreen: "top" | "bottom";
+}
+
+type SwipeAnchorInfoCallback = (info: SwipeAnchorInfo | null) => void;
+
+let globalOnSwipeAnchorInfo: SwipeAnchorInfoCallback | null = null;
+
+export function getGlobalOnSwipeAnchorInfo() {
+	return globalOnSwipeAnchorInfo;
+}
+
+/** Called once by NarratorPanel to register its handler for off-screen overlay. */
+export function setGlobalOnSwipeAnchorInfo(fn: SwipeAnchorInfoCallback | null) {
+	globalOnSwipeAnchorInfo = fn;
+}

@@ -1101,6 +1101,7 @@ export const narratorService = {
 					eq(narratorMessageRefs.narratorId, narratorId),
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					inArray(narratorMessages.role, ["user", "assistant"]),
+					isNull(narratorMessageRefs.segmentCompactId),
 					...(includeChildMessages ? [] : [isNull(narratorMessages.parentToolUseId)]),
 				),
 			)
@@ -1323,6 +1324,7 @@ export const narratorService = {
 		const countConditions = [
 			eq(narratorMessageRefs.narratorId, narratorId),
 			gt(narratorMessageRefs.seq, ref.seq),
+			isNull(narratorMessageRefs.segmentCompactId),
 		];
 		if (!isSubagent) {
 			countConditions.push(sql`${narratorMessages.parentToolUseId} IS NULL`);

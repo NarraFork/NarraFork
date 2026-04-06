@@ -1336,24 +1336,59 @@ export const containerService = {
 		}
 	},
 
-	/** @internal Get a container's bridge network IP via podman inspect. */
+	/** @internal Get a container's bridge network IP via podman inspect (with retry). */
 	async _getContainerIp(containerId: string): Promise<string | null> {
-		try {
-			const result = await exec(
-				[
-					"inspect",
-					"--format",
-					"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-					containerId,
-				],
-				"/",
-			);
-			const ip = result.stdout.trim();
-			return ip || null;
-		} catch (err) {
-			logger.warn("Failed to get container IP", { containerId, error: String(err) });
-			return null;
+		const MAX_RETRIES = 3;
+		const BASE_DELAY_MS = 1000;
+
+		for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+			try {
+				const result = await exec(
+					[
+						"inspect",
+						"--format",
+						"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+						containerId,
+					],
+					"/",
+				);
+				const ip = result.stdout.trim();
+				if (ip) return ip;
+
+				// Empty IP — network may not be ready yet
+				if (attempt < MAX_RETRIES) {
+					const delay = BASE_DELAY_MS * 2 ** attempt;
+					logger.debug("Container IP empty, retrying", {
+						containerId,
+						attempt: attempt + 1,
+						delayMs: delay,
+					});
+					await Bun.sleep(delay);
+				}
+			} catch (err) {
+				if (attempt < MAX_RETRIES) {
+					const delay = BASE_DELAY_MS * 2 ** attempt;
+					logger.debug("Container IP fetch failed, retrying", {
+						containerId,
+						attempt: attempt + 1,
+						delayMs: delay,
+						error: String(err),
+					});
+					await Bun.sleep(delay);
+				} else {
+					logger.warn("Failed to get container IP after retries", {
+						containerId,
+						attempts: MAX_RETRIES + 1,
+						error: String(err),
+					});
+				}
+			}
 		}
+		logger.warn("Container IP still empty after all retries", {
+			containerId,
+			attempts: MAX_RETRIES + 1,
+		});
+		return null;
 	},
 
 	/** @internal Get exposed container ports via podman inspect. */

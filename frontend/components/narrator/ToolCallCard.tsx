@@ -2801,6 +2801,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// --- Message-level context menu actions (branch / fork / compact / delete) ---
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 	const hasActions = !!(
 		readFilePath ||
 		msgCtx.onForkFromMessage ||
@@ -2894,6 +2895,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 					{tNarrator("contextMenu_delete")}
 				</Menu.Item>
 			)}
+			<Menu.Divider />
+			<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
+				{tc("cancel")}
+			</Menu.Item>
 		</>
 	) : null;
 

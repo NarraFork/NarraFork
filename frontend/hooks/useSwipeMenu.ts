@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	getGlobalCloseSwipe,
 	getGlobalOnSelectionRange,
+	getGlobalOnSwipeAnchorInfo,
 	getGlobalSwipeAnchor,
 	getGlobalToggleBlock,
 	setGlobalCloseSwipe,
@@ -95,6 +96,10 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		rangeCandidate: boolean;
 		/** Raw dx (startX - clientX) at last touchmove. Positive = left, negative = right. */
 		lastDx: number;
+		/** Horizontally scrollable ancestor found at touchstart (if any). */
+		hScrollEl: HTMLElement | null;
+		/** Once the hScrollEl has been scrolled to its right edge, stop deferring to native scroll. */
+		hScrollExhausted: boolean;
 	} | null>(null);
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
@@ -141,6 +146,23 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 
 		const matchesExclude = (el: HTMLElement) => excludeSelectors.some((sel) => el.closest?.(sel));
 
+		/** Walk from `el` up to (but not including) `boundary` and return the
+		 *  first element whose content overflows horizontally AND is actually
+		 *  scrollable (overflow-x: auto|scroll). Elements with overflow:hidden
+		 *  (e.g. truncated text) have scrollWidth > clientWidth but cannot be
+		 *  scrolled by the user, so they must be skipped. */
+		const findHScrollable = (el: HTMLElement | null, boundary: HTMLElement): HTMLElement | null => {
+			let cur = el;
+			while (cur && cur !== boundary) {
+				if (cur.scrollWidth > cur.clientWidth + 1) {
+					const ov = getComputedStyle(cur).overflowX;
+					if (ov === "auto" || ov === "scroll") return cur;
+				}
+				cur = cur.parentElement;
+			}
+			return null;
+		};
+
 		const onTouchStart = (e: TouchEvent) => {
 			if (matchesExclude(e.target as HTMLElement)) return;
 
@@ -160,6 +182,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			// Another block's swipe is already open — this *might* be a range-select,
 			// but we don't know yet. Record the touch start and let onTouchMove
 			// determine whether it's a horizontal swipe or a vertical scroll.
+			const hScroll = findHScrollable(e.target as HTMLElement, node);
+
 			if (curClose && curClose !== closeSwipe) {
 				if (selfId && curAnchor && curAnchor !== selfId) {
 					const touch = e.touches[0];
@@ -169,6 +193,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 						dir: null,
 						rangeCandidate: true,
 						lastDx: 0,
+						hScrollEl: hScroll,
+						hScrollExhausted: false,
 					};
 					setSwipeInitialRight(node.getBoundingClientRect().right);
 					return;
@@ -187,6 +213,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 					dir: null,
 					rangeCandidate: false,
 					lastDx: 0,
+					hScrollEl: null,
+					hScrollExhausted: false,
 				};
 				return;
 			}
@@ -198,6 +226,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				dir: null,
 				rangeCandidate: false,
 				lastDx: 0,
+				hScrollEl: hScroll,
+				hScrollExhausted: false,
 			};
 			setSwipeInitialRight(node.getBoundingClientRect().right);
 		};
@@ -217,6 +247,25 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				return;
 			}
 			if (s.dir === "v") return;
+
+			// If the touch originated inside a horizontally scrollable container
+			// and the user is swiping left (dx > 0), defer to native scroll until
+			// the container has been scrolled all the way to the right edge.
+			if (s.hScrollEl && !s.hScrollExhausted && dx > 0) {
+				const el = s.hScrollEl;
+				const atRightEdge = el.scrollLeft + el.clientWidth >= el.scrollWidth - 1;
+				if (!atRightEdge) {
+					// Still scrollable — abort this swipe gesture entirely so the
+					// browser handles the native horizontal scroll.
+					swipeRef.current = null;
+					return;
+				}
+				// Reached the right edge — from now on treat as a normal swipe.
+				// Reset startX to current position so the swipe offset starts from 0.
+				s.hScrollExhausted = true;
+				s.startX = touch.clientX;
+				return;
+			}
 
 			s.lastDx = dx;
 
@@ -325,18 +374,83 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		onSwipeRight,
 	]);
 
-	// --- Outside-touch close ---
-	// REMOVED: We no longer auto-close on outside touch. The swipe stays open
-	// so the user can scroll freely and swipe a second block for range selection.
-	// The swipe is closed only by:
-	// 1. Clicking a menu action item (explicit closeSwipe() calls in ContentViewer/ToolCallCard)
-	// 2. Exiting selection mode (via the floating toolbar)
-
-	// --- Reposition on scroll/resize while revealed; auto-close when off-screen ---
-	const [, forceUpdate] = useState(0);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
+	// --- Right-swipe on the portal menu to close (follow-finger) ---
+	// The swipe menu is rendered via createPortal to document.body, so touch
+	// events on it don't bubble to swipeBoxRef. We mirror the same follow-finger
+	// logic used on the message body: update swipeOffset in real-time during the
+	// gesture, then snap closed or back open on touchend.
 	useEffect(() => {
 		if (!swipeRevealed) return;
+		const menu = swipeMenuRef.current;
+		if (!menu) return;
+
+		let startX = 0;
+		let startY = 0;
+		let dir: "h" | "v" | null = null;
+		let active = false;
+
+		const onStart = (e: TouchEvent) => {
+			const t = e.touches[0];
+			startX = t.clientX;
+			startY = t.clientY;
+			dir = null;
+			active = true;
+		};
+		const onMove = (e: TouchEvent) => {
+			if (!active) return;
+			const t = e.touches[0];
+			const dx = startX - t.clientX; // positive = left, negative = right
+			const dy = Math.abs(t.clientY - startY);
+			if (!dir) {
+				if (Math.abs(dx) > 10 || dy > 10) {
+					dir = Math.abs(dx) > dy ? "h" : "v";
+				}
+				return;
+			}
+			if (dir !== "h") return;
+			// Follow-finger: map dx to offset exactly like the message body handler
+			const offset = Math.max(0, Math.min(swipeRevealWidth + dx, swipeRevealWidth));
+			swipeOffsetRef.current = offset;
+			setSwipeOffset(offset);
+		};
+		const onEnd = () => {
+			if (!active || dir !== "h") {
+				active = false;
+				return;
+			}
+			active = false;
+			if (swipeOffsetRef.current < swipeThreshold) {
+				closeSwipe();
+			} else {
+				// Not enough — snap back to fully open
+				swipeOffsetRef.current = swipeRevealWidth;
+				setSwipeOffset(swipeRevealWidth);
+			}
+		};
+
+		menu.addEventListener("touchstart", onStart, { passive: true });
+		menu.addEventListener("touchmove", onMove, { passive: true });
+		menu.addEventListener("touchend", onEnd, { passive: true });
+		return () => {
+			menu.removeEventListener("touchstart", onStart);
+			menu.removeEventListener("touchmove", onMove);
+			menu.removeEventListener("touchend", onEnd);
+		};
+	}, [swipeRevealed, closeSwipe, swipeThreshold, swipeRevealWidth]);
+
+	// --- Reposition on scroll/resize while revealed; notify overlay when off-screen ---
+	const [, forceUpdate] = useState(0);
+	const offScreenRef = useRef<"top" | "bottom" | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
+	useEffect(() => {
+		if (!swipeRevealed) {
+			// If we were off-screen and swipe got closed externally, clear overlay
+			if (offScreenRef.current) {
+				offScreenRef.current = null;
+				getGlobalOnSwipeAnchorInfo()?.(null);
+			}
+			return;
+		}
 		// Find the nearest scrollable ancestor of the swipe target
 		let scrollParent: HTMLElement | null = swipeBoxRef.current?.parentElement ?? null;
 		while (scrollParent && scrollParent.scrollHeight <= scrollParent.clientHeight) {
@@ -351,6 +465,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				const box = swipeBoxRef.current;
 				// DOM node removed (e.g. virtualised list recycled it) — dismiss
 				if (!box || !box.isConnected) {
+					offScreenRef.current = null;
+					getGlobalOnSwipeAnchorInfo()?.(null);
 					closeSwipe();
 					return;
 				}
@@ -363,10 +479,33 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 					visTop = cr.top;
 					visBottom = cr.bottom;
 				}
-				// Block has scrolled entirely out of the visible area — dismiss
+				// Block has scrolled entirely out of the visible area
 				if (rect.bottom < visTop || rect.top > visBottom) {
-					closeSwipe();
+					const dir = rect.bottom < visTop ? "top" : "bottom";
+					if (offScreenRef.current !== dir) {
+						offScreenRef.current = dir;
+						const bid = effectiveAnchor;
+						if (bid) {
+							// Extract preview text from the swiped block
+							const preview = (box.innerText ?? "").slice(0, 80).replace(/\n+/g, " ").trim() || bid;
+							getGlobalOnSwipeAnchorInfo()?.({
+								blockId: bid,
+								previewText: preview,
+								element: box,
+								scrollBack: () => {
+									box.scrollIntoView({ behavior: "smooth", block: "center" });
+								},
+								close: closeSwipe,
+								offScreen: dir,
+							});
+						}
+					}
 					return;
+				}
+				// Block is back in view — clear overlay if it was showing
+				if (offScreenRef.current) {
+					offScreenRef.current = null;
+					getGlobalOnSwipeAnchorInfo()?.(null);
 				}
 				forceUpdate((n) => n + 1);
 			});
@@ -383,8 +522,13 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			scrollParent?.removeEventListener("scroll", tick);
 			window.removeEventListener("resize", tick);
 			mo.disconnect();
+			// Clear overlay on cleanup
+			if (offScreenRef.current) {
+				offScreenRef.current = null;
+				getGlobalOnSwipeAnchorInfo()?.(null);
+			}
 		};
-	}, [swipeRevealed, closeSwipe]);
+	}, [swipeRevealed, closeSwipe, effectiveAnchor]);
 
 	// --- Context menu ---
 	const handleContextMenu = useCallback(

@@ -140,6 +140,7 @@ import {
 	type MessageSelectionState,
 	resolveBlockRange,
 	resolveSelectedBlockMeta,
+	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
@@ -165,9 +166,12 @@ import {
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
+import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
 	getGlobalCloseSwipe,
+	type SwipeAnchorInfo,
 	setGlobalOnSelectionRange,
+	setGlobalOnSwipeAnchorInfo,
 	setGlobalSwipeAnchor,
 	setGlobalToggleBlock,
 } from "./swipeState";
@@ -2002,6 +2006,14 @@ export function NarratorPanel({
 		setGlobalToggleBlock(null);
 	}, [selectionMode, toggleBlock]);
 
+	// --- Off-screen swipe anchor overlay state ---
+	const [swipeAnchorOverlay, setSwipeAnchorOverlay] = useState<SwipeAnchorInfo | null>(null);
+
+	useEffect(() => {
+		setGlobalOnSwipeAnchorInfo(setSwipeAnchorOverlay);
+		return () => setGlobalOnSwipeAnchorInfo(null);
+	}, []);
+
 	// Clear selection when narrator changes
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is intentionally a dependency to reset selection on narrator switch
 	useEffect(() => {
@@ -2171,17 +2183,8 @@ export function NarratorPanel({
 	const handleSegmentCompact = useCallback(async () => {
 		const container = contentRef.current;
 		if (!container || selectedBlockIds.size === 0) return;
-		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
-		if (metas.length === 0) return;
-		// Deduplicate messageIds preserving DOM order
-		const seen = new Set<string>();
-		const messageIds: string[] = [];
-		for (const m of metas) {
-			if (!seen.has(m.messageId)) {
-				seen.add(m.messageId);
-				messageIds.push(m.messageId);
-			}
-		}
+		const messageIds = resolveSelectedMessageIds(container, selectedBlockIds);
+		if (messageIds.length === 0) return;
 		exitSelection();
 		try {
 			await api.triggerSegmentCompact(narratorId, messageIds);
@@ -3690,6 +3693,9 @@ export function NarratorPanel({
 							scrollContainerRef={viewportRef}
 						/>
 					</Box>
+
+					{/* Off-screen swipe anchor overlay — cloned message preview */}
+					{swipeAnchorOverlay && <SwipeAnchorOverlay info={swipeAnchorOverlay} />}
 
 					{/* Multi-select floating toolbar — fixed center, similar to swipe menu style */}
 					{selectionMode && (
