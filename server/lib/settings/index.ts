@@ -207,6 +207,8 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
+		freshShellEnv: boolean;
 		/** Smart output interruption check — auto-detect and retry interrupted model output. */
 		smartInterruptionCheck: boolean;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
@@ -378,6 +380,7 @@ const DEFAULTS: NarraForkSettings = {
 			general: [],
 		},
 		legacyEncoding: false,
+		freshShellEnv: false,
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
@@ -533,6 +536,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.legacyEncoding": {
 		desc: "启用非 UTF-8 编码检测（GBK、Shift_JIS 等）。启用后文件读写使用 chardet 自动检测并保留原始编码。禁用时仅使用 UTF-8。",
+		type: "boolean",
+	},
+	"agent.freshShellEnv": {
+		desc: "启用后 Bash 工具通过 login shell 加载最新环境变量，而非继承服务器进程环境。适用于服务器启动后修改了 shell 配置的场景。",
 		type: "boolean",
 	},
 	"agent.modelContextWindows": {

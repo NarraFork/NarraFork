@@ -29,6 +29,7 @@ import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
+import { generateWordSlug } from "../lib/words";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
@@ -65,6 +66,7 @@ import {
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
+import { getConclusionFileId, resolveConclusionFilePath } from "./subagent-conclusion";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state ===
@@ -597,6 +599,8 @@ export interface PermissionDecisionOpts {
 	bashAnalysis?: BashAnalysis;
 	isChapter?: boolean;
 	planFileId?: string;
+	/** Conclusion file ID for explore/plan subagents — Write/Edit to this file is allowed in readOnly mode */
+	conclusionFileId?: string;
 	whitelistDirs?: WhitelistDir[];
 	blacklistDirs?: BlacklistDir[];
 	commandWhitelist?: CommandWhitelistEntry[];
@@ -813,6 +817,7 @@ export function resolvePermissionDecision(
 		bashAnalysis,
 		isChapter = false,
 		planFileId,
+		conclusionFileId,
 		whitelistDirs = [],
 		blacklistDirs = [],
 		commandWhitelist = [],
@@ -1022,6 +1027,15 @@ export function resolvePermissionDecision(
 			if (externalBashPaths.length > 0) return "deny";
 			return "allow";
 		}
+		// Conclusion file: explore/plan subagents may Write/Edit their designated conclusion file.
+		if (conclusionFileId && (toolName === "Write" || toolName === "Edit")) {
+			const filePath = typeof input.file_path === "string" ? input.file_path : "";
+			if (filePath) {
+				const absPath = resolvePath(cwd, filePath);
+				const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
+				if (pathsEqual(absPath, conclusionPath)) return "allow";
+			}
+		}
 		return "deny";
 	}
 
@@ -1184,6 +1198,27 @@ export async function handlePermission(
 		}
 	}
 
+	// Conclusion file redirect: explore/plan subagents have all Write/Edit
+	// redirected to their designated conclusion file.
+	let conclusionRedirectNotice: string | undefined;
+	const subagentConcFileId = getConclusionFileId(narratorId);
+	if (subagentConcFileId && (toolName === "Write" || toolName === "Edit")) {
+		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
+		const conclusionRelPath = `.narrafork/conclusion-${subagentConcFileId}.md`;
+		if (filePath) {
+			const absPath = resolvePath(cwd, filePath);
+			const conclusionAbsPath = resolveConclusionFilePath(cwd, subagentConcFileId);
+			if (!pathsEqual(absPath, conclusionAbsPath)) {
+				effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
+				conclusionRedirectNotice =
+					`File path redirected: "${filePath}" → "${conclusionRelPath}". ` +
+					`As an explore/plan subagent, all Write/Edit operations target the conclusion file.`;
+			}
+		} else {
+			effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
+		}
+	}
+
 	// Load enabled whitelist/blacklist directories for this narrator.
 	// Subagents inherit their parent narrator's directories.
 	// Three-layer merge: global settings → project chapterSettings → narrator DB rows.
@@ -1337,6 +1372,7 @@ export async function handlePermission(
 	];
 
 	const permMeta: PermissionDecisionMeta = {};
+	const conclusionFileId = getConclusionFileId(narratorId);
 	const decision = resolvePermissionDecision({
 		toolName,
 		input: effectiveInput,
@@ -1345,6 +1381,7 @@ export async function handlePermission(
 		bashAnalysis,
 		isChapter,
 		planFileId,
+		conclusionFileId,
 		whitelistDirs: mergedWhitelist,
 		blacklistDirs: mergedBlacklist,
 		commandWhitelist: mergedCmdWhitelist,
@@ -1415,7 +1452,11 @@ export async function handlePermission(
 		return {
 			behavior: "allow",
 			updatedInput: effectiveInput,
-			...(planRedirectNotice ? { notice: planRedirectNotice } : {}),
+			...(planRedirectNotice
+				? { notice: planRedirectNotice }
+				: conclusionRedirectNotice
+					? { notice: conclusionRedirectNotice }
+					: {}),
 		};
 	}
 	if (decision === "deny") {
@@ -2146,7 +2187,7 @@ async function createNarrator(
 	// A new ID is generated each time — any previously written plan file from a prior session
 	// becomes orphaned, but the model will use the new file path from the refreshed system prompt.
 	const isPlanMode = narrator.permissionMode === "plan";
-	const planFileId = isPlanMode ? generateShortId() : undefined;
+	const planFileId = isPlanMode ? generateWordSlug() : undefined;
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
@@ -2739,7 +2780,7 @@ async function runAgentLoop(
 					});
 				},
 				onEnterPlanMode: async () => {
-					active._planFileId = generateShortId();
+					active._planFileId = generateWordSlug();
 					// Save current permission mode and switch to plan
 					const current = await db.query.narrators.findFirst({
 						where: eq(narrators.id, narratorId),
@@ -3800,6 +3841,7 @@ async function doRunCustomCompact(
 	// Insert a "compacting" marker so the frontend shows a loading indicator
 	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
+	broadcastToNarrator(narratorId, { type: "compacting", narratorId });
 
 	// Pass the main session's prune boundary so generateCompactSummary can
 	// start with tool calls already stripped for messages the main loop pruned.
@@ -3843,7 +3885,11 @@ async function doRunCustomCompact(
 		}
 
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+		broadcastToNarrator(narratorId, {
+			type: "compact_done",
+			narratorId,
+			contextPercentAfter: contextPercent,
+		});
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Custom compact failed after retries", {
@@ -3901,7 +3947,7 @@ export async function runSegmentCompact(
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
 		await existing.catch(() => {});
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+		broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
 		return;
 	}
 
@@ -3939,8 +3985,14 @@ async function doRunSegmentCompact(
 	logger.info("Starting segment compact", { narratorId, messageCount: messageIds.length });
 
 	// Insert a "compacting" marker and hide the target messages
-	const markerMsg = await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
+	const { message: markerMsg, hiddenMessageIds } =
+		await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
+	broadcastToNarrator(narratorId, {
+		type: "segment_compact_hide",
+		narratorId,
+		hiddenMessageIds,
+	});
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId });
 
 	try {
@@ -3950,7 +4002,7 @@ async function doRunSegmentCompact(
 		if (messages.length === 0) {
 			// Nothing to compact — clean up
 			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
-			broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+			broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
 			return;
 		}
 
@@ -3977,7 +4029,11 @@ async function doRunSegmentCompact(
 			messageCount: messageIds.length,
 			summaryLength: summary.length,
 		});
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+		broadcastToNarrator(narratorId, {
+			type: "compact_done",
+			narratorId,
+			isSegment: true,
+		});
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Segment compact failed", {
@@ -4941,7 +4997,7 @@ export async function updateNarratorPermissionMode(
 	if (!active) return;
 	if (mode === "plan") {
 		if (!active._planFileId) {
-			active._planFileId = generateShortId();
+			active._planFileId = generateWordSlug();
 		}
 		// _previousPermissionMode is also persisted in DB by narratorService.updatePermissionMode,
 		// so onExitPlanMode will read it from DB if the in-memory value is missing.
@@ -4953,7 +5009,7 @@ export async function updateNarratorPermissionMode(
 
 // === Buffered message queue API ===
 
-/** Push a message onto the queue. Returns the generated message id. */
+/** Push a message onto the queue (or unshift to front when position is "front"). */
 export function pushBufferedMessage(
 	narratorId: string,
 	text: string,
@@ -4962,6 +5018,7 @@ export function pushBufferedMessage(
 	createdBy?: string | null,
 	creator?: BufferCreator | null,
 	textFiles?: File[],
+	position: "back" | "front" = "back",
 ): { ok: boolean; bufferedAt: string; id: string } {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
@@ -4969,7 +5026,12 @@ export function pushBufferedMessage(
 	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
 	const queue = bufferedMessages.get(narratorId) ?? [];
-	queue.push({ id, text, images, textFiles, bufferedAt, commandText, createdBy, creator });
+	const entry = { id, text, images, textFiles, bufferedAt, commandText, createdBy, creator };
+	if (position === "front") {
+		queue.unshift(entry);
+	} else {
+		queue.push(entry);
+	}
 	bufferedMessages.set(narratorId, queue);
 	return { ok: true, bufferedAt, id };
 }

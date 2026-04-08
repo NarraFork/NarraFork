@@ -3908,7 +3908,8 @@ export const narratorService = {
 
 		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
 
-		return msg;
+		const hiddenMessageIds = refs.map((r) => r.messageId);
+		return { message: msg, hiddenMessageIds };
 	},
 
 	/**
@@ -4017,6 +4018,38 @@ export const narratorService = {
 
 			return updated;
 		});
+	},
+
+	/**
+	 * Fetch messages hidden by a specific segment compact marker.
+	 * Returns full message objects ordered by their original seq.
+	 */
+	async getSegmentCompactHiddenMessages(narratorId: string, segmentCompactId: string) {
+		const refs = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.segmentCompactId, segmentCompactId),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+
+		if (refs.length === 0) return [];
+
+		const ids = refs.map((r) => r.messageId);
+		const messages = await db.query.narratorMessages.findMany({
+			where: inArray(narratorMessages.id, ids),
+			with: { toolCalls: true },
+		});
+
+		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
+		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		return messages;
 	},
 
 	/**

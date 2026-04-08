@@ -261,6 +261,8 @@
 	"proxyEnabledDesc": "通过统一反向代理使用子域名路由容器流量，而非暴露独立的主机端口。需要 Podman 5.0+ 且使用 pasta 网络后端。",
 	"proxyPort": "代理端口",
 	"proxyPortDesc": "反向代理服务器监听端口",
+	"freshShellEnv": "刷新 Shell 环境",
+	"freshShellEnvDesc": "每次执行 Bash 工具时通过 login shell 加载最新的环境变量。如果在服务器启动后修改了 shell 配置（如 .bashrc、.zshrc），启用此选项可获取最新环境。",
 	"legacyEncoding": "旧编码支持",
 	"legacyEncodingDesc": "自动检测并保留非 UTF-8 文件编码（如 GBK、Shift_JIS）。处理旧项目代码时启用此选项。",
 	"translateReasoning": "翻译思考内容",

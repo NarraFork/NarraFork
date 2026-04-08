@@ -261,6 +261,8 @@
 	"proxyEnabledDesc": "Route container traffic through a unified reverse proxy using subdomains instead of exposing individual host ports. Requires Podman 5.0+ with pasta network backend.",
 	"proxyPort": "Proxy Port",
 	"proxyPortDesc": "Port for the reverse proxy server",
+	"freshShellEnv": "Fresh Shell Environment",
+	"freshShellEnvDesc": "Source user shell profile on each Bash tool execution to get the latest environment variables. Enable this if you modify shell config (e.g. .bashrc, .zshrc) after starting the server.",
 	"legacyEncoding": "Legacy Encoding Support",
 	"legacyEncodingDesc": "Auto-detect and preserve non-UTF-8 file encodings (e.g. GBK, Shift_JIS). Enable this when working with legacy codebases.",
 	"translateReasoning": "Translate Reasoning Blocks",

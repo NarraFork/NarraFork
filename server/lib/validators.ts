@@ -145,6 +145,7 @@ export const createNarratorSchema = z.object({
 
 export const sendMessageSchema = z.object({
 	message: z.string().min(1),
+	priority: z.boolean().optional(),
 });
 
 export const permissionDecisionSchema = z.object({

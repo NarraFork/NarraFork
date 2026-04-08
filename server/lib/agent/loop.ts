@@ -12,6 +12,7 @@ import { StreamStaleError } from "../stream-timeout";
 import { estimateTokens } from "./estimate-tokens";
 import { resolveProviderAndModel } from "./provider";
 import { toolRegistry } from "./tool-registry";
+import { SHELL_TOOL_NAME } from "./tools/bash";
 import { truncateOutput } from "./truncate";
 import type {
 	AgentConfig,
@@ -350,7 +351,15 @@ function matchesCustomRetryRules(obj: Record<string, unknown>, msgCandidates: st
 const OUTPUT_THROTTLE_MS = 100;
 
 /** Tools that can safely run in parallel when multiple appear in the same turn. */
-const PARALLEL_TOOLS = new Set(["Agent"]);
+const PARALLEL_TOOLS = new Set([
+	"Agent",
+	"Read",
+	"Glob",
+	"Grep",
+	"WebSearch",
+	"WebFetch",
+	SHELL_TOOL_NAME,
+]);
 
 type ReasoningBlockEntry = { text: string; providerMetadata?: ReasoningProviderMetadata };
 
@@ -869,6 +878,7 @@ export async function* agentLoop(
 										if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
 										yieldedToolResults.add(prevTu.toolUseId);
 										if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
+										if (sr.updatedInput) prevTu.input = sr.updatedInput;
 										const brokenOverride = sr.broken
 											? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
 											: undefined;
@@ -1166,6 +1176,7 @@ export async function* agentLoop(
 				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
+				if (sr.updatedInput) tu.input = sr.updatedInput;
 				const brokenOverride = sr.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
@@ -1229,6 +1240,7 @@ export async function* agentLoop(
 				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
+				if (sr.updatedInput) tu.input = sr.updatedInput;
 				const brokenOverride = sr.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
@@ -1285,7 +1297,7 @@ export async function* agentLoop(
 				})
 			: "";
 
-		// Group tool calls into runs: consecutive Task calls form a parallel batch,
+		// Group tool calls into runs: consecutive parallel-safe tools form a batch,
 		// everything else executes serially (one tool per group).
 		const groups: AgentToolUse[][] = [];
 		for (const tu of toolUses) {
@@ -1314,6 +1326,10 @@ export async function* agentLoop(
 				const earlyPromise = earlyExecMap.get(tu.toolUseId);
 				const result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
 				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
+				// When the permission handler redirected the input (e.g. conclusion file),
+				// update the in-memory tool_use so pushAssistantTurn writes the correct
+				// input into history — otherwise the model sees the original (wrong) path.
+				if (result.updatedInput) tu.input = result.updatedInput;
 				const isLastTool = toolIndex === toolUses.length - 1;
 				const outputForModel =
 					isLastTool && shouldNudge ? result.output + nudgeText : result.output;
@@ -1428,6 +1444,7 @@ export async function* agentLoop(
 
 					const tu = group[i];
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
+					if (result.updatedInput) tu.input = result.updatedInput;
 					const isLastTool = toolIndex === toolUses.length - 1 && remaining.size === 0;
 					const outputForModel =
 						isLastTool && shouldNudge ? result.output + nudgeText : result.output;

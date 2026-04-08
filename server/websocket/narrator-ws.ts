@@ -2,6 +2,7 @@ import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { containerInstances, narrators, overseers, terminals, userPreferences } from "../db/schema";
+import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce } from "../lib/hot-safe";
@@ -104,8 +105,14 @@ export type NarratorServerMessage =
 	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
-	| { type: "compact_done"; narratorId: string }
+	| {
+			type: "compact_done";
+			narratorId: string;
+			contextPercentAfter?: number;
+			isSegment?: boolean;
+	  }
 	| { type: "compact_failed"; narratorId: string; messageId: string }
+	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
 			type: "context_usage";
 			narratorId: string;
@@ -241,6 +248,11 @@ export type NarratorServerMessage =
 			type: "terminal_count_changed";
 			narratorId: string;
 			activeTerminalCount: number;
+	  }
+	| {
+			type: "browser_session_count";
+			narratorId: string;
+			activeBrowserSessions: number;
 	  }
 	| {
 			type: "container_status_changed";
@@ -481,6 +493,31 @@ function debouncedTerminalCount(narratorId: string | null) {
 	);
 }
 
+// === Browser session count change listener ===
+
+const pendingBrowserBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
+
+function broadcastBrowserSessionCount(narratorId: string) {
+	const count = listBrowserSessions(narratorId).length;
+	broadcastToNarrator(narratorId, {
+		type: "browser_session_count",
+		narratorId,
+		activeBrowserSessions: count,
+	});
+}
+
+function debouncedBrowserSessionCount(narratorId: string) {
+	const existing = pendingBrowserBroadcasts.get(narratorId);
+	if (existing) clearTimeout(existing);
+	pendingBrowserBroadcasts.set(
+		narratorId,
+		setTimeout(() => {
+			pendingBrowserBroadcasts.delete(narratorId);
+			broadcastBrowserSessionCount(narratorId);
+		}, 100),
+	);
+}
+
 // === Container status change listener ===
 // When a container starts/stops/pauses/resumes, compute the aggregate status for the chapter
 // and broadcast to subscribers of the chapter's narrator. Debounced per-chapter.
@@ -545,6 +582,14 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 
 	eventBus.on("terminal:exited", (event) => {
 		debouncedTerminalCount(event.narratorId);
+	});
+
+	eventBus.on("browser:session_created", (event) => {
+		debouncedBrowserSessionCount(event.narratorId);
+	});
+
+	eventBus.on("browser:session_closed", (event) => {
+		debouncedBrowserSessionCount(event.narratorId);
 	});
 
 	eventBus.on("container:started", (event) => {

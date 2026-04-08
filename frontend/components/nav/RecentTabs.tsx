@@ -833,6 +833,7 @@ export function RecentTabList({
 										isTabActive(tab, pathname) &&
 										!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
 									}
+									onRemove={handleRemove}
 									onNavigate={onNavigate}
 									onContextMenu={handleContextMenu}
 									dimmed={isDraggingThis || !!isChildOfDraggingWs}
@@ -980,6 +981,7 @@ function WorkspaceChildTab({
 function SortableWorkspaceChildTab({
 	tab,
 	active,
+	onRemove,
 	onNavigate,
 	onContextMenu,
 	dimmed,
@@ -987,6 +989,7 @@ function SortableWorkspaceChildTab({
 }: {
 	tab: RecentTab;
 	active: boolean;
+	onRemove: (type: RecentTab["type"], id: string) => void;
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	/** When true, hide the child (opacity 0) — overlay is showing it */
@@ -1057,6 +1060,15 @@ function SortableWorkspaceChildTab({
 				onClick={() => {
 					onNavigate?.();
 					navigate({ to });
+				}}
+				onMouseDown={(e: React.MouseEvent) => {
+					if (e.button === 1) e.preventDefault();
+				}}
+				onAuxClick={(e: React.MouseEvent) => {
+					if (e.button === 1) {
+						e.preventDefault();
+						onRemove(tab.type, tab.id);
+					}
 				}}
 				onContextMenu={(e) => onContextMenu(e, tab)}
 				py={2}
@@ -1236,7 +1248,13 @@ function SortableTabItem({
 		onNavigate?.();
 	}, [navigate, to, onNavigate]);
 
-	// Middle-click to close
+	// Middle-click to close — preventDefault on mousedown to suppress autoscroll
+	// when the tab list overflows and has a scrollbar.
+	const handleMouseDown = useCallback((e: React.MouseEvent) => {
+		if (e.button === 1) {
+			e.preventDefault();
+		}
+	}, []);
 	const handleAuxClick = useCallback(
 		(e: React.MouseEvent) => {
 			if (e.button === 1) {
@@ -1348,6 +1366,7 @@ function SortableTabItem({
 				<NavLink
 					active={active}
 					onClick={handleClick}
+					onMouseDown={handleMouseDown}
 					onAuxClick={handleAuxClick}
 					onContextMenu={handleContextMenu}
 					onTouchStart={handleTouchStart}

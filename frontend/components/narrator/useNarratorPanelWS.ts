@@ -93,6 +93,7 @@ export interface UseNarratorPanelWSReturn {
 	queuedMessages: BufferMessageSummary[];
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
 	isCompacting: boolean;
+	setIsCompacting: React.Dispatch<React.SetStateAction<boolean>>;
 	isCheckingInterrupt: boolean;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
@@ -735,9 +736,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (compactBlock.status === "failed") {
 						setIsCompacting(false);
 					}
-				} else {
-					setIsCompacting(false);
 				}
+				// Note: do NOT setIsCompacting(false) for non-compact messages —
+				// that causes a race condition where subagent or other messages
+				// arriving during compact would incorrectly clear the loading state.
+				// isCompacting is cleared by the dedicated compact_done/compact_failed events.
 				if (wsData.message?.id && wsData.message?.createdAt) {
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
@@ -1319,6 +1322,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			},
+			onBrowserSessionCount: () => {
+				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
+			},
 			onWebSearch: (id, status, query, queries) => {
 				// Maintain ordered blocks: update existing search or append new one
 				const blocks = streamingBlocksRef.current;
@@ -1348,7 +1354,26 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onCompacting: () => {
 				setIsCompacting(true);
 			},
-			onCompactDone: () => {
+			onSegmentCompactHide: (hiddenMessageIds: string[]) => {
+				// Remove hidden messages from the cache immediately so the UI
+				// reflects the fold before the compact summary arrives.
+				if (hiddenMessageIds.length === 0) return;
+				const idSet = new Set(hiddenMessageIds);
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					let anyChanged = false;
+					const pages = old.pages.map((page: MessagesPage) => {
+						const filtered = page.messages.filter((m: NarratorMsg) => !idSet.has(m.id as string));
+						if (filtered.length !== page.messages.length) {
+							anyChanged = true;
+							return { ...page, messages: filtered };
+						}
+						return page;
+					});
+					return anyChanged ? { ...old, pages } : old;
+				});
+			},
+			onCompactDone: (contextPercentAfter?: number, isSegment?: boolean) => {
 				setIsCompacting(false);
 				setPruneBoundaryMessageId(null);
 				setPrunedPercent(null);
@@ -1356,6 +1381,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
+				if (contextPercentAfter != null) {
+					notifications.show({
+						title: t(isSegment ? "segmentCompactSuccess" : "compactSuccess"),
+						message: t("compactSuccessDesc", {
+							percent: Math.round(contextPercentAfter),
+						}),
+						color: "green",
+						autoClose: 3000,
+					});
+				}
 			},
 			onInterruptChecking: () => {
 				setIsCheckingInterrupt(true);
@@ -1796,6 +1831,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		queuedMessages,
 		setQueuedMessages,
 		isCompacting,
+		setIsCompacting,
 		isCheckingInterrupt,
 		contextPercent,
 		setContextPercent,

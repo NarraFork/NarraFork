@@ -65,7 +65,8 @@ interface NarratorWSCallbacks {
 		overseerId?: string,
 	) => void;
 	onCompacting?: () => void;
-	onCompactDone?: () => void;
+	onCompactDone?: (contextPercentAfter?: number, isSegment?: boolean) => void;
+	onSegmentCompactHide?: (hiddenMessageIds: string[]) => void;
 	onContextUsage?: (
 		percentage: number,
 		promptTokens?: number,
@@ -144,6 +145,7 @@ interface NarratorWSCallbacks {
 			streamingOutput?: string;
 		}>;
 	}) => void;
+	onBrowserSessionCount?: (count: number) => void;
 }
 
 export function useNarratorWS(
@@ -301,9 +303,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "buffer_preserved":
-						callbacksRef.current.onBufferPreserved?.(
-							data.messages as BufferMessageSummary[],
-						);
+						callbacksRef.current.onBufferPreserved?.(data.messages as BufferMessageSummary[]);
 						break;
 					case "permission_mode_changed":
 						callbacksRef.current.onPermissionModeChanged?.(data.permissionMode as string);
@@ -324,7 +324,15 @@ export function useNarratorWS(
 						break;
 					case "compact_done":
 					case "compact_failed":
-						callbacksRef.current.onCompactDone?.();
+						callbacksRef.current.onCompactDone?.(
+							data.contextPercentAfter as number | undefined,
+							data.isSegment as boolean | undefined,
+						);
+						break;
+					case "segment_compact_hide":
+						if (data.hiddenMessageIds) {
+							callbacksRef.current.onSegmentCompactHide?.(data.hiddenMessageIds as string[]);
+						}
 						break;
 					case "context_usage":
 						if (!data.isSubagent) {
@@ -515,6 +523,11 @@ export function useNarratorWS(
 								streamingOutput?: string;
 							}>,
 						});
+						break;
+					case "browser_session_count":
+						callbacksRef.current.onBrowserSessionCount?.(
+							(data.activeBrowserSessions as number) ?? 0,
+						);
 						break;
 				}
 			},

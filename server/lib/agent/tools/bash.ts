@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
 import { getHome, IS_WINDOWS } from "../../platform";
-import { detectShell, killTree } from "../shell";
+import { loadSettings } from "../../settings";
+import { buildMinimalEnv, detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 
@@ -100,20 +101,28 @@ export const bashTool: ToolDefinition = {
 		try {
 			const shellInfo = detectShell();
 			const isWin = process.platform === "win32";
+			const freshEnv = loadSettings().agent.freshShellEnv;
 
-			// Build env: spread process.env then apply overrides.
-			// On Windows, the PATH variable is typically named "Path" (title-case).
-			// When we spread process.env into a plain object the case-insensitive
-			// proxy is lost, so bash (which expects uppercase "PATH") won't see it.
-			// Fix: always set an uppercase PATH from the original process.env.PATH
-			// (the proxy handles case-insensitive lookup).
-			const env: Record<string, string | undefined> = {
-				...process.env,
-				HOME: getHome(),
-				...shellInfo.extraEnv,
-			};
-			if (isWin && !env.PATH && process.env.PATH) {
-				env.PATH = process.env.PATH;
+			// Build env: in fresh mode use a minimal set so login shell profile
+			// populates the rest; otherwise inherit the server process env.
+			let env: Record<string, string | undefined>;
+			if (freshEnv) {
+				env = buildMinimalEnv(shellInfo.extraEnv);
+			} else {
+				// Spread process.env then apply overrides.
+				// On Windows, the PATH variable is typically named "Path" (title-case).
+				// When we spread process.env into a plain object the case-insensitive
+				// proxy is lost, so bash (which expects uppercase "PATH") won't see it.
+				// Fix: always set an uppercase PATH from the original process.env.PATH
+				// (the proxy handles case-insensitive lookup).
+				env = {
+					...process.env,
+					HOME: getHome(),
+					...shellInfo.extraEnv,
+				};
+				if (isWin && !env.PATH && process.env.PATH) {
+					env.PATH = process.env.PATH;
+				}
 			}
 
 			// On Windows with Git Bash we must use login-shell mode so that
@@ -124,6 +133,9 @@ export const bashTool: ToolDefinition = {
 			// `detached` is only useful on Unix (creates a new process group for
 			// clean tree-kill via negative PID).  On Windows it creates a new
 			// console window and can break stdio pipes, so we skip it.
+			//
+			// When freshShellEnv is enabled on Unix, always use login-shell
+			// wrapping (`-l -c`) so the shell sources its profile files.
 			let spawnArgs: [string, string[], object];
 			if (shellInfo.loginWrap) {
 				spawnArgs = [
@@ -132,11 +144,22 @@ export const bashTool: ToolDefinition = {
 					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
 				];
 			} else if (shellInfo.type === "powershell") {
-				// PowerShell: use -NoProfile -Command for clean, predictable execution
+				// PowerShell: in fresh mode, allow $PROFILE to load;
+				// otherwise use -NoProfile for clean, predictable execution.
+				const psArgs = freshEnv
+					? ["-NonInteractive", "-Command", command]
+					: ["-NoProfile", "-NonInteractive", "-Command", command];
 				spawnArgs = [
 					shellInfo.path,
-					["-NoProfile", "-NonInteractive", "-Command", command],
+					psArgs,
 					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				];
+			} else if (freshEnv) {
+				// Unix fresh mode: wrap as login shell to source profile
+				spawnArgs = [
+					shellInfo.path,
+					["-l", "-c", command],
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
 				];
 			} else {
 				spawnArgs = [

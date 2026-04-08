@@ -181,6 +181,7 @@ const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
 const SKILL_TOOLS = new Set(["Skill"]);
+const BROWSER_TOOLS = new Set(["Browser"]);
 const OVERSEER_TOOLS = new Set([
 	"ApprovePermission",
 	"DenyPermission",
@@ -205,6 +206,7 @@ export type ToolCategory =
 	| "recall"
 	| "skill"
 	| "overseer"
+	| "browser"
 	| "generic";
 
 export function isEditTool(name: string): boolean {
@@ -228,6 +230,7 @@ export function getCategory(name: string): ToolCategory {
 	if (RECALL_TOOLS.has(name)) return "recall";
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (OVERSEER_TOOLS.has(name)) return "overseer";
+	if (BROWSER_TOOLS.has(name)) return "browser";
 	return "generic";
 }
 
@@ -265,6 +268,8 @@ export function getCategoryIcon(cat: ToolCategory, toolName?: string) {
 			return IconWand;
 		case "overseer":
 			return IconEye;
+		case "browser":
+			return IconWorldWww;
 		default:
 			return IconCode;
 	}
@@ -304,6 +309,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "grape";
 		case "overseer":
 			return "indigo";
+		case "browser":
+			return "teal";
 		default:
 			return "gray";
 	}
@@ -597,6 +604,59 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 				return nid ? `Context: ${nid.slice(0, 8)}…` : "Get context";
 			}
 			return toolName;
+		}
+		case "browser": {
+			const action = extractField(input, "action");
+			const bUrl = extractField(input, "url");
+			const bSelector = extractField(input, "selector");
+			const bSessionId = extractField(input, "session_id");
+			const shortSess = bSessionId ? bSessionId.slice(0, 6) : "";
+			switch (action) {
+				case "launch": {
+					if (bUrl) {
+						const s = bUrl.length > 50 ? `${bUrl.slice(0, 47)}...` : bUrl;
+						return `Launch: ${s}`;
+					}
+					return "Launch";
+				}
+				case "screenshot":
+					return shortSess ? `Screenshot [${shortSess}…]` : "Screenshot";
+				case "click": {
+					if (bSelector)
+						return `Click: ${bSelector.length > 40 ? `${bSelector.slice(0, 37)}...` : bSelector}`;
+					return "Click";
+				}
+				case "fill": {
+					if (bSelector)
+						return `Fill: ${bSelector.length > 40 ? `${bSelector.slice(0, 37)}...` : bSelector}`;
+					return "Fill";
+				}
+				case "navigate": {
+					if (bUrl) {
+						const s = bUrl.length > 45 ? `${bUrl.slice(0, 42)}...` : bUrl;
+						return `Navigate: ${s}`;
+					}
+					const dir = extractField(input, "direction");
+					if (dir) return `Navigate ${dir}`;
+					return "Navigate";
+				}
+				case "dom":
+					return bSelector
+						? `DOM: ${bSelector.length > 40 ? `${bSelector.slice(0, 37)}...` : bSelector}`
+						: "DOM";
+				case "get_text":
+					return bSelector
+						? `Text: ${bSelector.length > 40 ? `${bSelector.slice(0, 37)}...` : bSelector}`
+						: "Get text";
+				case "evaluate":
+					return "Evaluate JS";
+				case "close":
+					return shortSess ? `Close [${shortSess}…]` : "Close";
+				case "list_sessions":
+					return "List sessions";
+				default:
+					return action || "Browser";
+			}
 		}
 		default:
 			return toolName;
@@ -2037,6 +2097,99 @@ function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
+	const action = extractField(toolCall.inputJson, "action");
+	const url = extractField(toolCall.inputJson, "url");
+	const selector = extractField(toolCall.inputJson, "selector");
+	const sessionId = extractField(toolCall.inputJson, "session_id");
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
+	const previewUrl = meta?.previewUrl as string | undefined;
+	const isScreenshot = action === "screenshot";
+
+	return (
+		<Box mt="xs">
+			<Group gap={6} mb={4}>
+				{action && (
+					<Badge size="xs" variant="light" color="teal">
+						{action}
+					</Badge>
+				)}
+				{sessionId && (
+					<Tooltip label={sessionId} fz="xs">
+						<Badge size="xs" variant="outline" color="dimmed">
+							{sessionId.slice(0, 8)}
+						</Badge>
+					</Tooltip>
+				)}
+			</Group>
+			{url && (
+				<Text
+					size="xs"
+					component="a"
+					href={url}
+					target="_blank"
+					rel="noopener noreferrer"
+					c="teal"
+					ff="monospace"
+					style={{ textDecoration: "none" }}
+				>
+					{url}
+				</Text>
+			)}
+			{isScreenshot && previewUrl && (
+				<Box mt="xs">
+					<img
+						src={previewUrl}
+						alt={t("browser.screenshotAlt")}
+						style={{
+							maxWidth: "100%",
+							maxHeight: 400,
+							borderRadius: "var(--mantine-radius-sm)",
+							objectFit: "contain",
+							display: "block",
+						}}
+					/>
+					{typeof meta?.width === "number" && typeof meta?.height === "number" && (
+						<Text size="xs" c="dimmed" mt={2}>
+							{meta.width}×{meta.height}
+						</Text>
+					)}
+				</Box>
+			)}
+			{isScreenshot && !previewUrl && outputText && (
+				<Text size="xs" c="dimmed" mt={4}>
+					{outputText}
+				</Text>
+			)}
+			{action === "dom" && outputText && (
+				<>
+					<ContentViewer
+						content={outputText}
+						style={codeStyle}
+						title={selector || "DOM"}
+						language="html"
+					/>
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
+				</>
+			)}
+			{!isScreenshot && action !== "dom" && outputText && (
+				<>
+					<ContentViewer content={outputText} style={codeStyle} title={action || "Browser"} />
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
+				</>
+			)}
+			{toolCall.errorMessage && !toolCall.outputJson && (
+				<Text size="xs" c="red" mt={4}>
+					{toolCall.errorMessage}
+				</Text>
+			)}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -2340,6 +2493,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <RecallDetail toolCall={toolCall} />;
 		case "overseer":
 			return <OverseerDetail toolCall={toolCall} />;
+		case "browser":
+			return <BrowserDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}
@@ -2836,6 +2991,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			if (!isModKey && !isShift) return;
 			e.preventDefault();
 			if (isShift) {
+				window.getSelection()?.removeAllRanges();
 				selection.rangeSelectTo(tcBlockId);
 			} else {
 				selection.toggleBlock(tcBlockId);

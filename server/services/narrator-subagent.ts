@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
@@ -7,6 +8,7 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
+import { generateWordSlug } from "../lib/words";
 import { logger } from "../lib/logger";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
 import {
@@ -36,6 +38,11 @@ import {
 	pruneToolCalls,
 	toBufferSummary,
 } from "./narrator-session";
+import {
+	deleteConclusionFileId,
+	resolveConclusionFilePath,
+	setConclusionFileId,
+} from "./subagent-conclusion";
 
 // === In-memory state ===
 // Use `let` + lazy getter to avoid TDZ issues under Bun --hot reload,
@@ -69,8 +76,22 @@ function getSubagentBufferedMessagesMap() {
 
 // === Subagent type definitions ===
 
-/** Tools available to explore/plan subagents (read-only + Shell/Bash for shell inspection) */
-const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", SHELL_TOOL_NAME]);
+/** Tools available to explore/plan subagents (read-only + Shell/Bash + Write/Edit for conclusion file) */
+const READONLY_TOOLS = new Set([
+	"Read",
+	"Glob",
+	"Grep",
+	"WebSearch",
+	"WebFetch",
+	SHELL_TOOL_NAME,
+	"Write",
+	"Edit",
+]);
+
+/**
+ * Per-subagent conclusion file ID map is managed in subagent-conclusion.ts
+ * to avoid circular imports with narrator-session.ts.
+ */
 
 /** Tools excluded from general subagents (no nesting, no plan mode, no forking) */
 const GENERAL_EXCLUDED = new Set([
@@ -339,6 +360,14 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 	// Transient error retry state
 	let transientRetries = 0;
+
+	// Conclusion file for explore/plan subagents — Write/Edit are restricted to this file.
+	// The file content is read after the loop finishes and used as finalText.
+	const isReadOnlySubagent = subagentType === "explore" || subagentType === "plan";
+	const conclusionFileId = isReadOnlySubagent ? generateWordSlug() : undefined;
+	if (conclusionFileId) {
+		setConclusionFileId(narratorId, conclusionFileId);
+	}
 
 	// Build context management hooks (prune + compact) for all subagent types
 	const ctxMgmt = buildContextManagementHooks({
@@ -645,6 +674,25 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const rebuilt = await loadSubagentHistory(narratorId, model, resolvedProvider, null);
 		history = rebuilt.history;
 		trailingToolResults = rebuilt.trailingToolResults;
+	}
+
+	// Read conclusion file for explore/plan subagents.
+	// If the subagent wrote to the designated conclusion file, use its content as finalText.
+	if (conclusionFileId) {
+		deleteConclusionFileId(narratorId);
+		const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
+		try {
+			if (existsSync(conclusionPath)) {
+				const content = readFileSync(conclusionPath, "utf-8").trim();
+				if (content && !hasError) {
+					finalText = content;
+				}
+				// Clean up the temporary conclusion file
+				rmSync(conclusionPath, { force: true });
+			}
+		} catch {
+			// Ignore read/cleanup errors
+		}
 	}
 
 	return { finalText, hasError, contextLengthExceeded };

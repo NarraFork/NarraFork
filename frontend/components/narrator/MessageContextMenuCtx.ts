@@ -9,6 +9,8 @@ export interface MessageContextMenuActions {
 	onRegenerateFromMessage?: () => void;
 	onEditMessage?: () => void;
 	onJumpToSource?: () => void;
+	onRetryCompact?: () => void;
+	onDismissFailedCompact?: () => void;
 }
 
 export const MessageContextMenuCtx = createContext<MessageContextMenuActions>({});

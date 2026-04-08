@@ -297,10 +297,15 @@ function ReasoningBlock({
 			const isModKey = e.metaKey || e.ctrlKey;
 			const isShift = e.shiftKey;
 			if (!isModKey && !isShift) return;
-			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
+			// Don't interfere with text selection — but when block selection
+			// is already active, Shift+Click should always do range-select.
+			if (!selection.selectionMode) {
+				const sel = window.getSelection();
+				if (sel && sel.toString().trim().length > 0) return;
+			}
 			e.preventDefault();
 			if (isShift) {
+				window.getSelection()?.removeAllRanges();
 				selection.rangeSelectTo(blockIdStr);
 			} else {
 				selection.toggleBlock(blockIdStr);
@@ -922,6 +927,7 @@ function SegmentCompactIndicator({
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
+	const [expanded, setExpanded] = useState(false);
 
 	const canClick = !isCompacting && narratorId && messageId;
 
@@ -929,6 +935,16 @@ function SegmentCompactIndicator({
 		queryKey: ["segment-compact-summary", narratorId, messageId],
 		queryFn: () => api.getSegmentCompactSummary(narratorId ?? "", messageId ?? ""),
 		enabled: opened && !!narratorId && !!messageId,
+	});
+
+	const {
+		data: hiddenData,
+		isLoading: hiddenLoading,
+		error: hiddenError,
+	} = useQuery({
+		queryKey: ["segment-compact-messages", narratorId, messageId],
+		queryFn: () => api.getSegmentCompactMessages(narratorId ?? "", messageId ?? ""),
+		enabled: expanded && !!narratorId && !!messageId,
 	});
 
 	const handleDelete = async () => {
@@ -967,26 +983,114 @@ function SegmentCompactIndicator({
 		}
 	};
 
+	interface HiddenMessage {
+		id: string;
+		role: string;
+		contentJson: { type: string; text?: string }[];
+	}
+
+	const hiddenMessages = (hiddenData?.messages ?? []) as HiddenMessage[];
+
 	return (
 		<>
-			<Group
-				gap={6}
-				justify="center"
-				py={4}
-				style={canClick ? { cursor: "pointer" } : undefined}
-				onClick={canClick ? open : undefined}
-			>
+			<Group gap={6} justify="center" py={4}>
 				{isCompacting ? (
 					<Loader size={14} color="teal" />
 				) : (
 					<IconArrowsMinimize size={14} style={{ color: "var(--mantine-color-teal-6)" }} />
 				)}
-				<Text size="xs" c="teal" td={canClick ? "underline" : undefined}>
+				<Text
+					size="xs"
+					c="teal"
+					td={canClick ? "underline" : undefined}
+					style={canClick ? { cursor: "pointer" } : undefined}
+					onClick={canClick ? open : undefined}
+				>
 					{isCompacting
 						? t("segmentCompacting")
 						: t("segmentCompacted", { count: messageCount ?? 0 })}
 				</Text>
+				{canClick && (
+					<Text
+						size="xs"
+						c="dimmed"
+						style={{ cursor: "pointer" }}
+						onClick={() => setExpanded((v) => !v)}
+					>
+						{expanded ? (
+							<Group gap={2}>
+								<IconChevronDown size={12} />
+								{t("collapseHiddenMessages")}
+							</Group>
+						) : (
+							<Group gap={2}>
+								<IconChevronRight size={12} />
+								{t("expandHiddenMessages")}
+							</Group>
+						)}
+					</Text>
+				)}
 			</Group>
+
+			<Collapse in={expanded}>
+				<Paper
+					p="xs"
+					radius="sm"
+					withBorder
+					style={{
+						borderColor: "var(--mantine-color-teal-3)",
+						opacity: 0.75,
+						marginBottom: 4,
+					}}
+				>
+					{hiddenLoading && (
+						<Group justify="center" py="sm">
+							<Loader size="xs" />
+						</Group>
+					)}
+					{hiddenError && (
+						<Text c="red" size="xs">
+							{hiddenError instanceof Error ? hiddenError.message : String(hiddenError)}
+						</Text>
+					)}
+					{hiddenMessages.length > 0 && (
+						<Stack gap={6}>
+							{hiddenMessages.map((msg) => {
+							const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+							const textParts = blocks
+								.filter((b) => b.type === "text")
+								.map((b) => b.text ?? "")
+								.join("\n\n");
+								if (!textParts) return null;
+								return (
+									<Box
+										key={msg.id}
+										style={{
+											borderLeft: `2px solid var(--mantine-color-${msg.role === "user" ? "blue" : "gray"}-4)`,
+											paddingLeft: 8,
+										}}
+									>
+										<Text size="xs" c="dimmed" fw={600} mb={2}>
+											{msg.role === "user" ? "User" : "Assistant"}
+										</Text>
+										<Text
+											size="xs"
+											style={{
+												whiteSpace: "pre-wrap",
+												wordBreak: "break-word",
+												maxHeight: 200,
+												overflow: "auto",
+											}}
+										>
+											{textParts.length > 800 ? `${textParts.slice(0, 800)}…` : textParts}
+										</Text>
+									</Box>
+								);
+							})}
+						</Stack>
+					)}
+				</Paper>
+			</Collapse>
 
 			<Modal
 				opened={opened}
@@ -1682,7 +1786,7 @@ export const MessageBubble = memo(function MessageBubble({
 								size={16}
 								style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
 							/>
-							<Stack gap={2}>
+							<Stack gap={2} style={{ flex: 1 }}>
 								<Text size="xs" fw={600} c="red.8">
 									{t("segmentCompactFailed")}
 								</Text>
@@ -1692,6 +1796,22 @@ export const MessageBubble = memo(function MessageBubble({
 										t("segmentCompactFailedDesc")}
 								</Text>
 							</Stack>
+							{narratorId && message.id && (
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									color="dimmed"
+									style={{ flexShrink: 0 }}
+									onClick={() => {
+										api.deleteSegmentCompact(narratorId, message.id!).then(
+											() => invalidateMessages(),
+											() => {},
+										);
+									}}
+								>
+									{t("dismiss")}
+								</Button>
+							)}
 						</Group>
 					</Paper>
 				);
@@ -1732,7 +1852,7 @@ export const MessageBubble = memo(function MessageBubble({
 								size={16}
 								style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
 							/>
-							<Stack gap={2}>
+							<Stack gap={2} style={{ flex: 1 }}>
 								<Text size="xs" fw={600} c="red.8">
 									{t("compactFailed")}
 								</Text>
@@ -1740,6 +1860,35 @@ export const MessageBubble = memo(function MessageBubble({
 									{compactBlock.error ?? compactBlock.summary ?? t("compactFailedDesc")}
 								</Text>
 							</Stack>
+							<Group gap={4} style={{ flexShrink: 0 }}>
+								{narratorId && (
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="red"
+										onClick={() => {
+											api.triggerCompact(narratorId).catch(() => {});
+										}}
+									>
+										{t("retryCompact")}
+									</Button>
+								)}
+								{narratorId && message.id && (
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="dimmed"
+										onClick={() => {
+											api.deleteCompactMessage(narratorId, message.id!).then(
+												() => invalidateMessages(),
+												() => {},
+											);
+										}}
+									>
+										{t("dismiss")}
+									</Button>
+								)}
+							</Group>
 						</Group>
 					</Paper>
 				);

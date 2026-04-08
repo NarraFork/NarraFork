@@ -40,6 +40,7 @@ export function PathInputWithBrowse({ placeholder, onConfirm }: PathInputWithBro
 				onClose={close}
 				title={t("selectDirectory")}
 				size="lg"
+				zIndex={400}
 				styles={{ body: { padding: 0 } }}
 			>
 				<DirectoryBrowser onSelect={handleSelect} onCancel={close} />

@@ -774,6 +774,7 @@ export const api = {
 		message: string,
 		images?: File[],
 		textFiles?: File[],
+		priority?: boolean,
 	) => {
 		const headers: Record<string, string> = {};
 		const token = getToken();
@@ -789,10 +790,11 @@ export const api = {
 			if (textFiles) {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
+			if (priority) formData.append("priority", "true");
 			body = formData;
 		} else {
 			headers["Content-Type"] = "application/json";
-			body = JSON.stringify({ message });
+			body = JSON.stringify(priority ? { message, priority: true } : { message });
 		}
 
 		const res = await fetch(`${BASE}/narrators/${narratorId}/messages`, {
@@ -883,6 +885,10 @@ export const api = {
 		}),
 	getSegmentCompactSummary: (narratorId: string, messageId: string) =>
 		request<{ summary: string }>(`/narrators/${narratorId}/segment-compact/${messageId}`),
+	getSegmentCompactMessages: (narratorId: string, messageId: string) =>
+		request<{ messages: unknown[] }>(
+			`/narrators/${narratorId}/segment-compact/${messageId}/messages`,
+		),
 	deleteSegmentCompact: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {
 			method: "DELETE",
@@ -995,6 +1001,14 @@ export const api = {
 		const params = new URLSearchParams({ narratorId });
 		return request<ApiEntity[]>(`/terminals?${params}`);
 	},
+
+	// Browser sessions
+	listBrowserSessions: (narratorId: string) =>
+		request<{ id: string; url: string; lastActivity: number }[]>(
+			`/narrators/${narratorId}/browser-sessions`,
+		),
+	closeBrowserSession: (narratorId: string, sessionId: string) =>
+		request(`/narrators/${narratorId}/browser-sessions/${sessionId}`, { method: "DELETE" }),
 	createTerminal: (data: {
 		chapterId?: string;
 		narratorId?: string;

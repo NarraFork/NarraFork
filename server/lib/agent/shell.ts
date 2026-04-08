@@ -1,6 +1,6 @@
 import { type ChildProcess, execSync } from "node:child_process";
 import path from "node:path";
-import { isWslAllowed } from "../platform";
+import { getHome, IS_WINDOWS, isWslAllowed } from "../platform";
 
 const SIGKILL_DELAY_MS = 200;
 
@@ -316,6 +316,31 @@ function isWslBash(bashPath: string): boolean {
 export function isPowerShell(shellPath: string): boolean {
 	const lower = path.basename(shellPath).toLowerCase();
 	return lower === "pwsh" || lower === "pwsh.exe" || lower === "powershell.exe";
+}
+
+/**
+ * Build a minimal environment for "fresh shell env" mode.
+ *
+ * Only essential variables are kept so that the login shell's profile
+ * scripts populate the rest from scratch.  `PATH` is retained so the
+ * shell binary itself (and basic utilities) can be found during init.
+ */
+export function buildMinimalEnv(extraEnv: Record<string, string> = {}): Record<string, string> {
+	const env: Record<string, string> = {
+		HOME: getHome(),
+		TERM: process.env.TERM ?? "xterm-256color",
+		LANG: process.env.LANG ?? "en_US.UTF-8",
+		USER: process.env.USER ?? "",
+		...extraEnv,
+	};
+	// PATH is essential for the shell to find itself and basic utilities.
+	const pathVal = process.env.PATH;
+	if (pathVal) env.PATH = pathVal;
+	// On Windows, also preserve the title-case "Path" if present.
+	if (IS_WINDOWS && !env.PATH && process.env.Path) {
+		env.PATH = process.env.Path;
+	}
+	return env;
 }
 
 /**

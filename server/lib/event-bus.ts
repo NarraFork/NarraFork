@@ -152,6 +152,9 @@ export type NarraForkEvent =
 	| { type: "container:error"; chapterId: string; error: string }
 	| { type: "container:log"; chapterId: string; line: string; phase?: "build" | "start" }
 	| { type: "container:starting"; chapterId: string }
+	// Browser session lifecycle
+	| { type: "browser:session_created"; sessionId: string; narratorId: string; url: string }
+	| { type: "browser:session_closed"; sessionId: string; narratorId: string }
 	// Terminal lifecycle
 	| {
 			type: "terminal:created";

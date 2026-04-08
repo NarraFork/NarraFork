@@ -122,6 +122,7 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { UserAvatar } from "../UserAvatar";
 import { BlurInOnAppearProvider } from "./BlurInOnAppear";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
+import { BrowserSessionBar } from "./BrowserSessionBar";
 import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
@@ -1128,26 +1129,6 @@ export function NarratorPanel({
 		[qc, messagesQueryKey, narratorId, t],
 	);
 
-	const handleCompactError = useCallback(
-		(err: unknown) => {
-			const isInProgress = err instanceof ApiError && err.status === 409;
-			notifications.show({
-				title: isInProgress ? t("compactInProgress") : t("compactFailed"),
-				message: isInProgress ? t("compactInProgressDesc") : t("compactFailedDesc"),
-				color: isInProgress ? "yellow" : "red",
-				autoClose: 5000,
-			});
-		},
-		[t],
-	);
-
-	const handleCompactBefore = useCallback(
-		(messageId: string) => {
-			api.triggerCompact(narratorId, messageId).catch(handleCompactError);
-		},
-		[narratorId, handleCompactError],
-	);
-
 	const handleRegenerate = useCallback(
 		async (messageId: string) => {
 			try {
@@ -1382,6 +1363,30 @@ export function NarratorPanel({
 	} = wsState;
 	setContextPercentRef.current = wsState.setContextPercent;
 	setUnreadCountRef.current = setUnreadCount;
+
+	const handleCompactError = useCallback(
+		(err: unknown) => {
+			const isInProgress = err instanceof ApiError && err.status === 409;
+			notifications.show({
+				title: isInProgress ? t("compactInProgress") : t("compactFailed"),
+				message: isInProgress ? t("compactInProgressDesc") : t("compactFailedDesc"),
+				color: isInProgress ? "yellow" : "red",
+				autoClose: 5000,
+			});
+		},
+		[t],
+	);
+
+	const handleCompactBefore = useCallback(
+		(messageId: string) => {
+			wsState.setIsCompacting(true);
+			api.triggerCompact(narratorId, messageId).catch((err) => {
+				wsState.setIsCompacting(false);
+				handleCompactError(err);
+			});
+		},
+		[narratorId, handleCompactError, wsState.setIsCompacting],
+	);
 
 	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
 	// recreating on every permission state change, which would break memo on
@@ -1699,6 +1704,24 @@ export function NarratorPanel({
 	handleInterruptMouseUpRef.current = handleInterruptMouseUp;
 
 	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
+
+	// --- Long-press send button to cut in line (priority queue) ---
+	const [sendPriorityProgress, setSendPriorityProgress] = useState(0);
+	const sendPriorityTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+	const sendPriorityFiredRef = useRef(false);
+
+	const clearSendPriorityTimer = useCallback(() => {
+		if (sendPriorityTimerRef.current) {
+			clearInterval(sendPriorityTimerRef.current);
+			sendPriorityTimerRef.current = null;
+		}
+		setSendPriorityProgress(0);
+		sendPriorityFiredRef.current = false;
+	}, []);
+	const clearSendPriorityTimerRef = useRef(clearSendPriorityTimer);
+	clearSendPriorityTimerRef.current = clearSendPriorityTimer;
+
+	useEffect(() => clearSendPriorityTimer, [clearSendPriorityTimer]);
 
 	// --- Hydration & message counting ---
 	const [hydrated, setHydrated] = useState(false);
@@ -2185,10 +2208,13 @@ export function NarratorPanel({
 		if (!container || selectedBlockIds.size === 0) return;
 		const messageIds = resolveSelectedMessageIds(container, selectedBlockIds);
 		if (messageIds.length === 0) return;
+		if (!window.confirm(t("segmentCompactConfirm", { count: messageIds.length }))) return;
 		exitSelection();
 		try {
+			wsState.setIsCompacting(true);
 			await api.triggerSegmentCompact(narratorId, messageIds);
 		} catch (err) {
+			wsState.setIsCompacting(false);
 			const isInProgress = err instanceof ApiError && err.status === 409;
 			notifications.show({
 				title: isInProgress ? t("compactInProgress") : t("segmentCompactFailed"),
@@ -2197,7 +2223,7 @@ export function NarratorPanel({
 				autoClose: 5000,
 			});
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, t]);
+	}, [selectedBlockIds, exitSelection, narratorId, t, wsState]);
 
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
@@ -2800,6 +2826,17 @@ export function NarratorPanel({
 		});
 		vpObserver.observe(vp);
 
+		// Listen for subagent card auto-expand events (e.g. permission request
+		// causes a collapsed card to expand). The Collapse animation changes the
+		// content height gradually; by the time this event fires (~300ms after
+		// expand) the animation is done and we can reliably scroll to bottom.
+		const onSubagentExpand = () => {
+			if (isAtBottomRef.current && !highlightMessageId) {
+				startFollowing();
+			}
+		};
+		vp.addEventListener("subagent-auto-expand", onSubagentExpand);
+
 		return () => {
 			clearTimeout(vpResizeTimer);
 			cancelAnimationFrame(mutationRafId);
@@ -2808,6 +2845,7 @@ export function NarratorPanel({
 			mutationObserver.disconnect();
 			contentObserver.disconnect();
 			vpObserver.disconnect();
+			vp.removeEventListener("subagent-auto-expand", onSubagentExpand);
 			stopFollowing();
 		};
 	}, [highlightMessageId, initialScrollDone, startFollowing, stopFollowing]);
@@ -3021,6 +3059,32 @@ export function NarratorPanel({
 		}
 	};
 
+	/** Shared logic for sending a buffered message (normal or priority). */
+	const doSendBuffered = async (msg: string, priority?: boolean) => {
+		const images = [...attachedImages];
+		const textFiles = [...attachedTextFiles];
+		setInput("");
+		setAttachedImages([]);
+		setAttachedTextFiles([]);
+		try {
+			const result = await api.sendNarratorMessage(
+				narratorId,
+				msg,
+				images.length > 0 ? images : undefined,
+				textFiles.length > 0 ? textFiles : undefined,
+				priority,
+			);
+			if (result?.buffered) {
+				scrollToBottom(true);
+			}
+		} catch {
+			if (images.length > 0) setAttachedImages(images);
+			if (textFiles.length > 0) setAttachedTextFiles(textFiles);
+			sendBufferMessage(narratorId, msg);
+			scrollToBottom(true);
+		}
+	};
+
 	const handleSend = async () => {
 		const msg = input.trim();
 		if (!msg || sendingRef.current) return;
@@ -3028,36 +3092,7 @@ export function NarratorPanel({
 		try {
 			inputHistory.push(msg);
 			if (isActive) {
-				// Send via HTTP POST so images/textFiles are uploaded via multipart/form-data
-				const images = [...attachedImages];
-				const textFiles = [...attachedTextFiles];
-				setInput("");
-				setAttachedImages([]);
-				setAttachedTextFiles([]);
-				try {
-					const result = await api.sendNarratorMessage(
-						narratorId,
-						msg,
-						images.length > 0 ? images : undefined,
-						textFiles.length > 0 ? textFiles : undefined,
-					);
-					if (result?.buffered) {
-						// Don't optimistically insert — the WS buffer_set broadcast
-						// from the server will sync the authoritative queue state.
-						scrollToBottom(true);
-					}
-				} catch {
-					// Fallback to WebSocket text-only buffer (images/textFiles not supported over WS)
-					if (images.length > 0) {
-						setAttachedImages(images);
-					}
-					if (textFiles.length > 0) {
-						setAttachedTextFiles(textFiles);
-					}
-					sendBufferMessage(narratorId, msg);
-					// Optimistic: WS buffer_set will sync the real state
-					scrollToBottom(true);
-				}
+				await doSendBuffered(msg);
 				return;
 			}
 			const images = [...attachedImages];
@@ -3070,6 +3105,88 @@ export function NarratorPanel({
 			sendingRef.current = false;
 		}
 	};
+	const handleSendRef = useRef(handleSend);
+	handleSendRef.current = handleSend;
+
+	/** Send with priority=true (cut in line — insert at front of queue). */
+	const handleSendPriority = async () => {
+		const msg = input.trim();
+		if (!msg || sendingRef.current) return;
+		sendingRef.current = true;
+		try {
+			inputHistory.push(msg);
+			await doSendBuffered(msg, true);
+		} finally {
+			sendingRef.current = false;
+		}
+	};
+	const handleSendPriorityRef = useRef(handleSendPriority);
+	handleSendPriorityRef.current = handleSendPriority;
+
+	const startSendPriorityPress = useCallback((_e: React.MouseEvent) => {
+		sendPriorityFiredRef.current = false;
+		const start = Date.now();
+		const duration = 600;
+		sendPriorityTimerRef.current = setInterval(() => {
+			const elapsed = Date.now() - start;
+			const pct = Math.min(elapsed / duration, 1);
+			setSendPriorityProgress(pct);
+			if (pct >= 1 && !sendPriorityFiredRef.current) {
+				sendPriorityFiredRef.current = true;
+				if (sendPriorityTimerRef.current != null) clearInterval(sendPriorityTimerRef.current);
+				sendPriorityTimerRef.current = null;
+				handleSendPriorityRef.current();
+			}
+		}, 16);
+	}, []);
+
+	const handleSendPriorityMouseUp = useCallback(() => {
+		if (!sendPriorityFiredRef.current && sendPriorityTimerRef.current) {
+			// Short click — normal queue send
+			clearSendPriorityTimer();
+			handleSendRef.current();
+			return;
+		}
+		clearSendPriorityTimer();
+	}, [clearSendPriorityTimer]);
+	const handleSendPriorityMouseUpRef = useRef(handleSendPriorityMouseUp);
+	handleSendPriorityMouseUpRef.current = handleSendPriorityMouseUp;
+
+	const sendPriorityBtnCleanupRef = useRef<(() => void) | null>(null);
+	const sendPriorityBtnRef = useCallback((btn: HTMLButtonElement | null) => {
+		if (sendPriorityBtnCleanupRef.current) {
+			sendPriorityBtnCleanupRef.current();
+			sendPriorityBtnCleanupRef.current = null;
+		}
+		if (!btn) return;
+		const onTouchStart = (e: TouchEvent) => {
+			e.preventDefault();
+			sendPriorityFiredRef.current = false;
+			const start = Date.now();
+			const duration = 600;
+			sendPriorityTimerRef.current = setInterval(() => {
+				const elapsed = Date.now() - start;
+				const pct = Math.min(elapsed / duration, 1);
+				setSendPriorityProgress(pct);
+				if (pct >= 1 && !sendPriorityFiredRef.current) {
+					sendPriorityFiredRef.current = true;
+					if (sendPriorityTimerRef.current != null) clearInterval(sendPriorityTimerRef.current);
+					sendPriorityTimerRef.current = null;
+					handleSendPriorityRef.current();
+				}
+			}, 16);
+		};
+		const onTouchEnd = () => handleSendPriorityMouseUpRef.current();
+		const onTouchCancel = () => clearSendPriorityTimerRef.current();
+		btn.addEventListener("touchstart", onTouchStart, { passive: false });
+		btn.addEventListener("touchend", onTouchEnd);
+		btn.addEventListener("touchcancel", onTouchCancel);
+		sendPriorityBtnCleanupRef.current = () => {
+			btn.removeEventListener("touchstart", onTouchStart);
+			btn.removeEventListener("touchend", onTouchEnd);
+			btn.removeEventListener("touchcancel", onTouchCancel);
+		};
+	}, []);
 
 	const handleRetry = async () => {
 		if (!canRetryLastUserMessage) return;
@@ -3654,7 +3771,13 @@ export function NarratorPanel({
 							</Stack>
 						</Box>
 					)}
-					<Box h="100%" style={{ position: "relative" }}>
+					<Box
+						h="100%"
+						style={{
+							position: "relative",
+							userSelect: selectionMode ? "none" : undefined,
+						}}
+					>
 						<MessageSelectionCtx.Provider value={selectionCtxValue}>
 							<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
 								<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
@@ -3945,6 +4068,9 @@ export function NarratorPanel({
 				{/* Chapter bar */}
 				{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
 
+				{/* Browser sessions bar */}
+				<BrowserSessionBar narratorId={narratorId} />
+
 				{/* Status bar */}
 				<Group
 					px="md"
@@ -4037,7 +4163,9 @@ export function NarratorPanel({
 													max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
 												})
 										: isCompacting
-											? t("compacting")
+											? isWorking
+												? t("thinkingWithCompact")
+												: t("compacting")
 											: isCheckingInterrupt
 												? t("checkingInterrupt")
 												: activeTodo
@@ -4234,7 +4362,11 @@ export function NarratorPanel({
 										<Menu.Item
 											leftSection={<IconArrowsMinimize size={14} />}
 											onClick={() => {
-												api.triggerCompact(narratorId).catch(handleCompactError);
+												wsState.setIsCompacting(true);
+												api.triggerCompact(narratorId).catch((err) => {
+													wsState.setIsCompacting(false);
+													handleCompactError(err);
+												});
 											}}
 										>
 											{t("triggerCompact")}
@@ -4715,13 +4847,47 @@ export function NarratorPanel({
 										</Button>
 									);
 								}
-								return (
+								return isActive && queuedMessages.length > 0 ? (
+									<Tooltip label={t("queueHoldToCutInLine")} position="top">
+										<Button
+											key="send-priority"
+											ref={sendPriorityBtnRef}
+											disabled={!hasInput && !hasAttachments}
+											onMouseDown={(e) => {
+												if (!hasInput && !hasAttachments) return;
+												startSendPriorityPress(e);
+											}}
+											onMouseUp={handleSendPriorityMouseUp}
+											onMouseLeave={clearSendPriorityTimer}
+											onContextMenu={(e) => e.preventDefault()}
+											style={{
+												position: "relative",
+												overflow: "hidden",
+												userSelect: "none",
+												touchAction: "none",
+											}}
+										>
+											{sendPriorityProgress > 0 && sendPriorityProgress < 1 && (
+												<div
+													style={{
+														position: "absolute",
+														inset: 0,
+														background: "var(--mantine-color-indigo-filled)",
+														opacity: 0.25,
+														transformOrigin: "left",
+														transform: `scaleX(${sendPriorityProgress})`,
+														pointerEvents: "none",
+													}}
+												/>
+											)}
+											<span style={{ position: "relative" }}>
+												{`${t("queue")} (${queuedMessages.length})`}
+											</span>
+										</Button>
+									</Tooltip>
+								) : (
 									<Button key="send" onClick={handleSend} disabled={!hasInput && !hasAttachments}>
-										{isActive
-											? queuedMessages.length > 0
-												? `${t("queue")} (${queuedMessages.length})`
-												: t("queue")
-											: tc("send")}
+										{isActive ? t("queue") : tc("send")}
 									</Button>
 								);
 							})()}

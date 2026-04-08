@@ -2,6 +2,7 @@
 // Each narrator can hold multiple named sessions with automatic TTL cleanup.
 
 import type { BrowserContext, Page } from "puppeteer-core";
+import { eventBus } from "../event-bus";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
@@ -40,6 +41,7 @@ function ensureCleanupTimer(): void {
 					logger.info("Browser session expired", { narratorId, sessionId });
 					void session.context.close().catch(() => {});
 					map.delete(sessionId);
+					eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 				}
 			}
 			if (map.size === 0) sessions.delete(narratorId);
@@ -90,6 +92,7 @@ export async function createSession(narratorId: string, url: string): Promise<Br
 
 	ensureCleanupTimer();
 	logger.info("Browser session created", { narratorId, sessionId, url });
+	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
 	return session;
 }
 
@@ -125,6 +128,7 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 	if (map.size === 0) sessions.delete(narratorId);
 
 	logger.info("Browser session closed", { narratorId, sessionId });
+	eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 	return true;
 }
 
@@ -133,6 +137,7 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 	const map = sessions.get(narratorId);
 	if (!map) return;
 
+	const sessionIds = Array.from(map.keys());
 	const promises: Promise<void>[] = [];
 	for (const session of map.values()) {
 		promises.push(session.context.close().catch(() => {}));
@@ -140,6 +145,9 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 	await Promise.all(promises);
 
 	sessions.delete(narratorId);
+	for (const sessionId of sessionIds) {
+		eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
+	}
 	logger.info("All browser sessions cleaned up", {
 		narratorId,
 		count: promises.length,

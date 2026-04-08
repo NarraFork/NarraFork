@@ -359,11 +359,16 @@ export const ContentViewer = memo(
 				const isModKey = e.metaKey || e.ctrlKey;
 				const isShift = e.shiftKey;
 				if (!isModKey && !isShift) return;
-				// Don't interfere with text selection
-				const sel = window.getSelection();
-				if (sel && sel.toString().trim().length > 0) return;
+				// Don't interfere with text selection — but when block selection
+				// is already active, Shift+Click should always do range-select
+				// (browser may have produced a text selection via native shift-click).
+				if (!selection.selectionMode) {
+					const sel = window.getSelection();
+					if (sel && sel.toString().trim().length > 0) return;
+				}
 				e.preventDefault();
 				if (isShift) {
+					window.getSelection()?.removeAllRanges();
 					selection.rangeSelectTo(blockIdStr);
 				} else {
 					selection.toggleBlock(blockIdStr);
@@ -374,6 +379,7 @@ export const ContentViewer = memo(
 				nested,
 				handleDoubleTap,
 				blockIdStr,
+				selection.selectionMode,
 				selection.toggleBlock,
 				selection.rangeSelectTo,
 			],

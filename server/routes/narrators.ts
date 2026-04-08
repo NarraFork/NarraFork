@@ -36,6 +36,12 @@ import {
 	users,
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
+import { screenshot as browserScreenshot } from "../lib/browser/actions";
+import {
+	closeSession as closeBrowserSession,
+	getSession as getBrowserSession,
+	listSessions as listBrowserSessions,
+} from "../lib/browser/session";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -131,7 +137,7 @@ export async function parseMessageRequest(
 		};
 	},
 	narratorId: string,
-): Promise<{ message: string; images: ImageRef[]; textFiles: File[] }> {
+): Promise<{ message: string; images: ImageRef[]; textFiles: File[]; priority?: boolean }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
@@ -152,12 +158,18 @@ export async function parseMessageRequest(
 		for (const file of textFileEntries) {
 			validateTextFile(file);
 		}
-		return { message, images, textFiles: textFileEntries };
+		const priority = formData.get("priority") === "true";
+		return { message, images, textFiles: textFileEntries, priority: priority || undefined };
 	}
 	const body = await c.req.json();
 	const parsed = sendMessageSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return { message: parsed.data.message, images: [], textFiles: [] };
+	return {
+		message: parsed.data.message,
+		images: [],
+		textFiles: [],
+		priority: parsed.data.priority,
+	};
 }
 
 export const narratorRoutes = new Hono();
@@ -410,7 +422,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		await narratorService.updateStatus(id, "idle");
 	}
 
-	const { message, images, textFiles } = await parseMessageRequest(c, id);
+	const { message, images, textFiles, priority } = await parseMessageRequest(c, id);
 	const userId = c.get("user").sub;
 
 	// Resolve slash commands
@@ -461,7 +473,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 
-		// Primary narrator: push onto buffer queue
+		// Primary narrator: push onto buffer queue (or unshift if priority)
 		const user = await db.query.users.findFirst({
 			where: eq(users.id, userId),
 			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
@@ -482,6 +494,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			userId,
 			creator,
 			textFiles.length > 0 ? textFiles : undefined,
+			priority ? "front" : undefined,
 		);
 		if (result.ok) {
 			const messages = toBufferSummary(getBufferedMessages(id));
@@ -849,6 +862,14 @@ narratorRoutes.get("/:id/segment-compact/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const summary = await narratorService.getSegmentCompactSummary(narratorId, messageId);
 	return c.json({ summary });
+});
+
+// Get messages hidden by a segment compact
+narratorRoutes.get("/:id/segment-compact/:messageId/messages", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const messages = await narratorService.getSegmentCompactHiddenMessages(narratorId, messageId);
+	return c.json({ messages });
 });
 
 // Delete segment compact (undo)
@@ -1964,4 +1985,34 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
 	await db.delete(narratorBlacklistCmds).where(eq(narratorBlacklistCmds.id, entryId));
 	return c.json({ ok: true });
+});
+
+// ── Browser sessions ─────────────────────────────────────────────────────────
+
+narratorRoutes.get("/:id/browser-sessions", (c) => {
+	const narratorId = c.req.param("id");
+	return c.json(listBrowserSessions(narratorId));
+});
+
+narratorRoutes.delete("/:id/browser-sessions/:sessionId", async (c) => {
+	const narratorId = c.req.param("id");
+	const sessionId = c.req.param("sessionId");
+	const closed = await closeBrowserSession(narratorId, sessionId);
+	if (!closed) throw new NotFoundError("BrowserSession", sessionId);
+	return c.json({ ok: true });
+});
+
+narratorRoutes.get("/:id/browser-sessions/:sessionId/screenshot", async (c) => {
+	const narratorId = c.req.param("id");
+	const sessionId = c.req.param("sessionId");
+	const session = getBrowserSession(narratorId, sessionId);
+	if (!session) throw new NotFoundError("BrowserSession", sessionId);
+	const result = await browserScreenshot(session);
+	const buffer = Buffer.from(result.base64, "base64");
+	return new Response(buffer, {
+		headers: {
+			"Content-Type": "image/png",
+			"Cache-Control": "no-store",
+		},
+	});
 });

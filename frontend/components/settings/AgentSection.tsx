@@ -39,6 +39,8 @@ export interface AgentSectionProps {
 	setMaxTurns: (v: number) => void;
 	legacyEncoding: boolean;
 	setLegacyEncoding: (v: boolean) => void;
+	freshShellEnv: boolean;
+	setFreshShellEnv: (v: boolean) => void;
 	translateReasoning: boolean;
 	setTranslateReasoning: (v: boolean) => void;
 	expandReasoning: boolean;
@@ -169,6 +171,12 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("legacyEncodingDesc")}
 				checked={props.legacyEncoding}
 				onChange={(e) => props.setLegacyEncoding(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("freshShellEnv")}
+				description={t("freshShellEnvDesc")}
+				checked={props.freshShellEnv}
+				onChange={(e) => props.setFreshShellEnv(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("translateReasoning")}

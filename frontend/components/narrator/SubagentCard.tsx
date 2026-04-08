@@ -270,6 +270,11 @@ export const SubagentCard = memo(
 				const t = setTimeout(() => {
 					const el = scrollBoxRef.current;
 					if (el) el.scrollTop = el.scrollHeight;
+					// Notify the outer scroll container (NarratorPanel) that this card
+					// expanded due to a permission request so it should follow to bottom.
+					cardRef.current?.dispatchEvent(
+						new CustomEvent("subagent-auto-expand", { bubbles: true }),
+					);
 				}, 300);
 				return () => clearTimeout(t);
 			}
@@ -277,7 +282,16 @@ export const SubagentCard = memo(
 
 		// Auto-expand when the Task tool itself needs permission (e.g. custom workdir)
 		useEffect(() => {
-			if (selfPerm) setExpanded(true);
+			if (selfPerm) {
+				setExpanded(true);
+				// Notify outer scroll container after Collapse animation
+				const t = setTimeout(() => {
+					cardRef.current?.dispatchEvent(
+						new CustomEvent("subagent-auto-expand", { bubbles: true }),
+					);
+				}, 300);
+				return () => clearTimeout(t);
+			}
 		}, [selfPerm]);
 
 		// When subagent finishes: collapse tool calls list
@@ -326,6 +340,10 @@ export const SubagentCard = memo(
 			},
 			[isMobileSa, saBlockId, selection.toggleBlock, selection.rangeSelectTo],
 		);
+
+		// Whether the card should show a highlighted border when collapsed
+		// (pending permission inside that the user can't see)
+		const hasPendingPerm = !expanded && !!(selfPerm || permChild);
 
 		// Resolve the subagent's own narratorId from child messages
 		const subagentNarratorId = useMemo(() => {
@@ -824,7 +842,15 @@ export const SubagentCard = memo(
 						ref={swipe.swipeBoxRef}
 						onContextMenu={swipe.handleContextMenu}
 						onClick={handleSaBlockClick}
-						style={buildSelectionStyle()}
+						style={{
+							...buildSelectionStyle(),
+							...(hasPendingPerm
+								? {
+										outline: "1px solid var(--mantine-color-yellow-6)",
+										outlineOffset: -1,
+									}
+								: {}),
+						}}
 						{...(saBlockId ? { [BLOCK_ID_ATTR]: saBlockId } : {})}
 						{...(parentMsgCtx.messageId ? { "data-message-id": parentMsgCtx.messageId } : {})}
 						{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
@@ -853,7 +879,9 @@ export const SubagentCard = memo(
 						radius={inRun ? 0 : "sm"}
 						style={{
 							overflow: "hidden",
-							...(selfPerm ? { borderColor: "var(--mantine-color-yellow-6)" } : {}),
+							...(selfPerm || hasPendingPerm
+								? { borderColor: "var(--mantine-color-yellow-6)" }
+								: {}),
 						}}
 					>
 						{content}
