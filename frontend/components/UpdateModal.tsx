@@ -22,6 +22,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
+import { MarkdownContent } from "./narrator/MarkdownContent";
 import { useUpdateApply, useUpdateDownload } from "../hooks/useUpdateCheck";
 
 function formatBytes(bytes: number): string {
@@ -166,15 +167,13 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 														})}
 													</Text>
 												</Group>
-												{notes ? (
-													<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-														{notes}
-													</Text>
-												) : (
-													<Text size="sm" c="dimmed" fs="italic">
-														{t("updateNoNotes")}
-													</Text>
-												)}
+{notes ? (
+									<MarkdownContent text={notes} />
+								) : (
+									<Text size="sm" c="dimmed" fs="italic">
+										{t("updateNoNotes")}
+									</Text>
+								)}
 											</div>
 										);
 									},
@@ -184,9 +183,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							(() => {
 								const notes = resolveNotes(releaseNotes, i18n.language);
 								return notes ? (
-									<Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-										{notes}
-									</Text>
+									<MarkdownContent text={notes} />
 								) : (
 									<Text size="sm" c="dimmed" fs="italic">
 										{t("updateNoNotes")}
