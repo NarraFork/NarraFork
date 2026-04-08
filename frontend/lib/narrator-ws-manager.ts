@@ -174,7 +174,10 @@ class NarratorWSManager {
 	 * If `lastMessageId` is provided and there is exactly one narratorId, the
 	 * server will send catch-up messages since that point.
 	 */
-	subscribe(narratorIds: string[], opts?: { lastMessageId?: string }): SubscriptionHandle {
+	subscribe(
+		narratorIds: string[],
+		opts?: { lastMessageId?: string; fullSubscribe?: boolean },
+	): SubscriptionHandle {
 		const id = this.nextId++;
 		const handle: SubscriptionHandle = { _id: id, _narratorIds: [...narratorIds] };
 
@@ -199,12 +202,15 @@ class NarratorWSManager {
 			}
 		}
 
-		// Send subscribe for newly-added IDs, or queue them for when WS opens
-		if (newIds.length) {
+		// When fullSubscribe is true (panel-level), always send subscribe to the
+		// server even if the ID was already ref-counted by a list-level subscriber.
+		// This ensures the server sends back the streaming snapshot (including
+		const idsToSend = opts?.fullSubscribe ? narratorIds : newIds;
+		if (idsToSend.length) {
 			if (this.ws?.readyState === WebSocket.OPEN) {
-				this._sendSubscribe(newIds, opts?.lastMessageId);
+				this._sendSubscribe(idsToSend, opts?.lastMessageId);
 			} else {
-				for (const nId of newIds) {
+				for (const nId of idsToSend) {
 					this.pendingSubscribeIds.add(nId);
 				}
 			}

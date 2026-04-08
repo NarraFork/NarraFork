@@ -172,11 +172,13 @@ export function useNarratorWS(
 
 		const subscribedId = narratorId;
 
-		// Subscribe to this narrator
-		const subHandle: SubscriptionHandle = narratorWSManager.subscribe(
-			[subscribedId],
-			lastMessageIdRef.current ? { lastMessageId: lastMessageIdRef.current } : undefined,
-		);
+		// Subscribe to this narrator (fullSubscribe ensures the server always
+		// sends back the streaming snapshot even when a list-level subscriber
+		// already holds a ref-count for this narrator ID).
+		const subHandle: SubscriptionHandle = narratorWSManager.subscribe([subscribedId], {
+			lastMessageId: lastMessageIdRef.current || undefined,
+			fullSubscribe: true,
+		});
 
 		// Join presence
 		narratorWSManager.joinPresence(subscribedId, subHandle._id);

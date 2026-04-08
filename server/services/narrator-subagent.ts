@@ -13,6 +13,7 @@ import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt
 import {
 	isAnthropicProvider,
 	resolveDefaultReasoningEffort,
+	resolveEffectiveModel,
 	resolveProvider,
 	settings,
 	usesCodexApiMode,
@@ -1039,10 +1040,12 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	if (allowedPool.length > 0) {
 		const poolSet = new Set(allowedPool);
 		const parent = await narratorService.getById(parentNarratorId);
+		// Resolve __default__ sentinel to the actual default model so it can match the pool.
+		const parentModel = parent.model ? resolveEffectiveModel(parent.model) : undefined;
 		const candidates = [
 			explicitModel,
 			subagentPref,
-			parent.model ?? undefined,
+			parentModel,
 			settings.agent.defaultModel,
 		].filter((m): m is string => !!m);
 		resolvedModelInput = candidates.find((m) => poolSet.has(m));
