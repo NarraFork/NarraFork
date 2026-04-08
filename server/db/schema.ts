@@ -330,6 +330,7 @@ export const narratorMessageRefs = sqliteTable(
 		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
 		index("idx_narrator_refs_seq").on(table.narratorId, table.seq),
 		index("idx_narrator_refs_message").on(table.messageId),
+		index("idx_narrator_refs_segment_compact").on(table.segmentCompactId),
 	],
 );
 

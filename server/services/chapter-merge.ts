@@ -222,6 +222,12 @@ export const chapterMerge = {
 							error: String(retryErr),
 						});
 						try {
+							const currentHead = (await gitService.getHeadCommit(targetWorktree)).trim();
+							logger.info("Recording current HEAD before git rollback", {
+								sourceChapterId,
+								currentHead,
+								rollbackTarget: preMergeTargetSha,
+							});
 							await gitService.resetHard(targetWorktree, preMergeTargetSha);
 							logger.info("Git rollback succeeded after DB failure", {
 								sourceChapterId,
