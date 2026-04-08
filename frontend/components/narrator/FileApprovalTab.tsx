@@ -1,11 +1,12 @@
 import { usePermissionFilePreview } from "@frontend/hooks/useNarrator";
 import { toRelativePath } from "@frontend/lib/format";
 import { Box, Button, Center, Group, Loader, Tabs, Text, Textarea } from "@mantine/core";
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 import type { PendingPermission } from "./narrator-panel-types";
+import { PermEnterHintCtx } from "./ToolCallCard";
 
 export function FileApprovalTab({
 	narratorId,
@@ -20,6 +21,7 @@ export function FileApprovalTab({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { action: permAction, setHasFeedback } = useContext(PermEnterHintCtx);
 	const toolUseId = permission.toolUseId ?? null;
 	const { data, isLoading } = usePermissionFilePreview(narratorId, toolUseId, !!toolUseId);
 
@@ -41,6 +43,11 @@ export function FileApprovalTab({
 			sessionStorage.removeItem(draftKey);
 		}
 	}, [draftKey, feedback]);
+
+	// Notify parent when feedback presence changes so the Enter hint can auto-switch
+	useEffect(() => {
+		setHasFeedback(!!feedback);
+	}, [feedback, setHasFeedback]);
 
 	const handleAllow = () => {
 		sessionStorage.removeItem(draftKey);
@@ -155,11 +162,32 @@ export function FileApprovalTab({
 					mb="xs"
 				/>
 				<Group gap="sm">
-					<Button size="sm" color="green" onClick={handleAllow}>
+					<Button
+						size="sm"
+						color="green"
+						onClick={handleAllow}
+						className={permAction === "allow" ? "perm-btn-pulse" : undefined}
+					>
 						{tc("allow")}
+						{permAction === "allow" && (
+							<Text span size="xs" ml={4} c="green.2">
+								⏎
+							</Text>
+						)}
 					</Button>
-					<Button size="sm" color="red" variant="light" onClick={handleDeny}>
+					<Button
+						size="sm"
+						color="red"
+						variant="light"
+						onClick={handleDeny}
+						className={permAction === "deny" ? "perm-btn-pulse" : undefined}
+					>
 						{tc("deny")}
+						{permAction === "deny" && (
+							<Text span size="xs" ml={4} c="red.2">
+								⏎
+							</Text>
+						)}
 					</Button>
 				</Group>
 			</Box>

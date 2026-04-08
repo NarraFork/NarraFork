@@ -51,6 +51,8 @@ export interface AgentSectionProps {
 	setSmartInterruptionCheck: (v: boolean) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	retryBackoffCeilMs: number;
+	setRetryBackoffCeilMs: (v: number) => void;
 	customRetryRules: Array<{
 		id: string;
 		domain?: string;
@@ -209,6 +211,21 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(v) => props.setMaxTransientRetries(typeof v === "number" ? v : 10)}
 				min={-1}
 				max={100}
+			/>
+			<NumberInput
+				label={t("retryBackoffCeil")}
+				description={t("retryBackoffCeilDesc")}
+				value={props.retryBackoffCeilMs / 1000}
+				onChange={(v) =>
+					props.setRetryBackoffCeilMs(
+						typeof v === "number" ? Math.round(v * 1000) : 20000,
+					)
+				}
+				min={1}
+				max={300}
+				step={1}
+				decimalScale={0}
+				suffix="s"
 			/>
 			{/* Custom Retry Rules */}
 			<Title order={5} mt="sm">

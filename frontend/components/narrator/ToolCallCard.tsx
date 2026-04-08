@@ -87,6 +87,16 @@ export const FileModDrawerCtx = createContext<{
 	openForApproval: () => void;
 }>({ openForApproval: () => {} });
 
+/**
+ * Context that signals which permission action is currently focused via keyboard.
+ * null = no hint (input has text or no pending permission).
+ * "allow" / "deny" = the action that Enter will trigger, with visual pulse.
+ */
+export const PermEnterHintCtx = createContext<{
+	action: "allow" | "deny" | null;
+	setHasFeedback: (has: boolean) => void;
+}>({ action: null, setHasFeedback: () => {} });
+
 // --- Types ---
 
 export interface ToolCallData {
@@ -2543,6 +2553,7 @@ export function InlinePermission({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { action: permAction, setHasFeedback } = useContext(PermEnterHintCtx);
 	const draftKey = `narrafork_perm_draft_${permission.id}`;
 	const [feedback, setFeedback] = useState(() => {
 		try {
@@ -2585,6 +2596,11 @@ export function InlinePermission({
 			sessionStorage.removeItem(draftKey);
 		}
 	}, [draftKey, feedback, editedPlan]);
+
+	// Notify parent when feedback presence changes so the Enter hint can auto-switch
+	useEffect(() => {
+		setHasFeedback(!!feedback);
+	}, [feedback, setHasFeedback]);
 
 	// AskUserQuestion: render the full question form inline
 	if (permission.toolName === "AskUserQuestion" && Array.isArray(permission.inputJson?.questions)) {
@@ -2691,8 +2707,18 @@ export function InlinePermission({
 			/>
 			<Group gap="sm">
 				{!editing && (
-					<Button size="sm" color="green" onClick={() => handleAllow()}>
+					<Button
+						size="sm"
+						color="green"
+						onClick={() => handleAllow()}
+						className={permAction === "allow" ? "perm-btn-pulse" : undefined}
+					>
 						{tc("allow")}
+						{permAction === "allow" && (
+							<Text span size="xs" ml={4} c="green.2">
+								⏎
+							</Text>
+						)}
 					</Button>
 				)}
 				{!editing && isExitPlan && (
@@ -2738,8 +2764,14 @@ export function InlinePermission({
 							sessionStorage.removeItem(draftKey);
 							onDecision?.(permission.id, "deny", feedback || undefined);
 						}}
+						className={permAction === "deny" ? "perm-btn-pulse" : undefined}
 					>
 						{tc("deny")}
+						{permAction === "deny" && (
+							<Text span size="xs" ml={4} c="red.2">
+								⏎
+							</Text>
+						)}
 					</Button>
 				)}
 				{!editing && EDIT_TOOLS.has(permission.toolName) && <ReviewInPanelButton />}

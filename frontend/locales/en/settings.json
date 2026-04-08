@@ -273,6 +273,8 @@
 	"smartInterruptionCheckDesc": "Automatically detect when model output is cut off and send a continue message. Empty responses are retried immediately; non-empty responses are checked by the summary model.",
 	"maxTransientRetries": "Max Retries for Recoverable Errors",
 	"maxTransientRetriesDesc": "Maximum retry attempts for transient API errors (rate limits, server errors). Set to -1 for infinite retries.",
+	"retryBackoffCeil": "Retry Backoff Ceiling",
+	"retryBackoffCeilDesc": "Maximum wait time (seconds) for exponential backoff. Retry delay will not exceed this value.",
 	"customRetryRules": "Custom Retryable Error Rules",
 	"customRetryRulesDesc": "Define custom rules to treat specific API errors as retryable. Matching errors will be automatically retried instead of failing immediately.",
 	"retryRuleDomain": "Domain",

@@ -318,6 +318,11 @@ export interface AgentConfig {
 	 * Defaults to 0 (no in-loop retry — caller handles it).
 	 */
 	maxTransientRetries?: number;
+	/**
+	 * Maximum backoff delay (ms) for transient-error retries.
+	 * Exponential backoff is capped at this value.  Defaults to 20_000 (20s).
+	 */
+	retryBackoffCeilMs?: number;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

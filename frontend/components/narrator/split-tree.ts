@@ -6,7 +6,7 @@ function genId(): string {
 
 export type SplitDirection = "horizontal" | "vertical";
 
-export type PanelType = "narrator" | "terminal";
+export type PanelType = "narrator" | "terminal" | "webview";
 
 export interface TerminalLeafConfig {
 	/** Bind to a narrator's terminal list */
@@ -17,6 +17,13 @@ export interface TerminalLeafConfig {
 	cwd?: string;
 }
 
+export interface WebviewLeafConfig {
+	/** URL to load in the iframe. */
+	url: string;
+	/** Optional display title (falls back to URL). */
+	title?: string;
+}
+
 export interface SplitLeaf {
 	type: "leaf";
 	id: string;
@@ -25,6 +32,8 @@ export interface SplitLeaf {
 	narratorId: string | null;
 	/** Config for terminal panels (only when panelType === "terminal"). */
 	terminalConfig?: TerminalLeafConfig | null;
+	/** Config for webview panels (only when panelType === "webview"). */
+	webviewConfig?: WebviewLeafConfig | null;
 }
 
 export interface SplitBranch {
@@ -57,6 +66,17 @@ export function createTerminalLeaf(config: TerminalLeafConfig): SplitLeaf {
 		panelType: "terminal",
 		narratorId: null,
 		terminalConfig: config,
+	};
+}
+
+/** Create a webview-type leaf. */
+export function createWebviewLeaf(config: WebviewLeafConfig): SplitLeaf {
+	return {
+		type: "leaf",
+		id: genId(),
+		panelType: "webview",
+		narratorId: null,
+		webviewConfig: config,
 	};
 }
 
@@ -182,6 +202,39 @@ function splitAndAssignTerminalImpl(
 	return flattenBranch({ ...node, children: newChildren });
 }
 
+/** Split a leaf and assign a webview config to the newly created leaf. */
+export function splitAndAssignWebview(
+	tree: SplitNode,
+	leafId: string,
+	direction: SplitDirection,
+	position: "before" | "after",
+	config: WebviewLeafConfig,
+): SplitNode {
+	return splitAndAssignWebviewImpl(tree, leafId, direction, position, config);
+}
+
+function splitAndAssignWebviewImpl(
+	node: SplitNode,
+	leafId: string,
+	direction: SplitDirection,
+	position: "before" | "after",
+	config: WebviewLeafConfig,
+): SplitNode {
+	if (node.type === "leaf") {
+		if (node.id !== leafId) return node;
+		const kept: SplitLeaf = { ...node };
+		const webview = createWebviewLeaf(config);
+		const children = position === "after" ? [kept, webview] : [webview, kept];
+		return { type: "branch", id: genId(), direction, children, sizes: [50, 50] };
+	}
+	const newChildren = node.children.map((c) =>
+		splitAndAssignWebviewImpl(c, leafId, direction, position, config),
+	);
+	const changed = newChildren.some((c, i) => c !== node.children[i]);
+	if (!changed) return node;
+	return flattenBranch({ ...node, children: newChildren });
+}
+
 /** Remove a leaf from the tree. If its parent branch has only one child left, collapse it. */
 export function removeLeaf(tree: SplitNode, leafId: string): SplitNode | null {
 	if (tree.type === "leaf") {
@@ -215,6 +268,7 @@ export function setNarrator(tree: SplitNode, leafId: string, narratorId: string 
 		panelType: "narrator",
 		narratorId,
 		terminalConfig: undefined,
+		webviewConfig: undefined,
 	}));
 }
 
@@ -229,6 +283,20 @@ export function setTerminalConfig(
 		panelType: "terminal",
 		narratorId: null,
 		terminalConfig: config,
+	}));
+}
+
+/** Convert a leaf to a webview panel. */
+export function setWebviewConfig(
+	tree: SplitNode,
+	leafId: string,
+	config: WebviewLeafConfig,
+): SplitNode {
+	return mapLeaf(tree, leafId, (leaf) => ({
+		...leaf,
+		panelType: "webview",
+		narratorId: null,
+		webviewConfig: config,
 	}));
 }
 
@@ -376,6 +444,7 @@ export function moveLeaf(
 		narratorId: null,
 		panelType: "narrator" as PanelType,
 		terminalConfig: undefined,
+		webviewConfig: undefined,
 	}));
 
 	// 3. Split the target leaf and place the source content
@@ -386,6 +455,14 @@ export function moveLeaf(
 			direction,
 			position,
 			sourceLeaf.terminalConfig,
+		);
+	} else if (srcType === "webview" && sourceLeaf.webviewConfig) {
+		result = splitAndAssignWebview(
+			result,
+			targetLeafId,
+			direction,
+			position,
+			sourceLeaf.webviewConfig,
 		);
 	} else if (sourceLeaf.narratorId) {
 		result = splitAndAssign(result, targetLeafId, direction, position, sourceLeaf.narratorId);

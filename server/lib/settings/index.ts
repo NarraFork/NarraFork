@@ -213,6 +213,8 @@ export interface NarraForkSettings {
 		smartInterruptionCheck: boolean;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
+		/** Maximum backoff delay (ms) for transient-error retries. Default 20000 (20s). */
+		retryBackoffCeilMs: number;
 		/** User-defined retryable error rules. Matched errors are treated as transient. */
 		customRetryRules?: Array<{
 			id: string;
@@ -386,6 +388,7 @@ const DEFAULTS: NarraForkSettings = {
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
+		retryBackoffCeilMs: 20_000,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -562,6 +565,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试。有状态提供商（Responses/Codex）不支持重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
+	},
+	"agent.retryBackoffCeilMs": {
+		desc: "可恢复错误重试退避时间上限（毫秒）。指数退避不会超过此值。默认 20000（20 秒）。",
+		type: "number",
+		valid: "正整数，默认 20000",
 	},
 	"agent.customRetryRules": {
 		desc: "用户自定义可重试错误规则。匹配到的错误视为 transient 进行重试。每项含 id、domain(域名关键字)、statusCode、keyword、enabled、note。",

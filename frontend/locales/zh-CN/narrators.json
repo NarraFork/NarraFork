@@ -58,5 +58,11 @@
 	"dropNarratorHere": "拖放叙述者到此处",
 	"distributePanels": "均匀分配面板",
 	"createdAtLabel": "创建于 {{time}}",
-	"lastMessageAtLabel": "最后消息 {{time}}"
+	"lastMessageAtLabel": "最后消息 {{time}}",
+	"addWebview": "添加网页视图",
+	"closeWebview": "关闭网页视图",
+	"webviewPlaceholder": "网页视图",
+	"webviewUrlPlaceholder": "输入 URL...",
+	"webviewOpenExternal": "在浏览器中打开",
+	"webviewEmpty": "输入 URL 以加载页面"
 }

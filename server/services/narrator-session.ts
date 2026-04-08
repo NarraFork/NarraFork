@@ -29,7 +29,6 @@ import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
-import { generateWordSlug } from "../lib/words";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
@@ -46,6 +45,7 @@ import {
 } from "../lib/settings";
 import type { ImageRef, TextFileRef } from "../lib/uploads";
 import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
+import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { gitService } from "./git-service";
 import { narratorContext } from "./narrator-context";
@@ -59,6 +59,7 @@ import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
 	getMaxTransientRetries,
+	getRetryBackoffCeilMs,
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
@@ -3091,6 +3092,7 @@ async function runAgentLoop(
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
+				retryBackoffCeilMs: getRetryBackoffCeilMs(),
 				metadata: isAnthropicProvider(resolved.provider)
 					? { user_id: `user_${narratorId}_account__session_${active.conversationId}` }
 					: undefined,

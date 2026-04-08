@@ -8,7 +8,6 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
-import { generateWordSlug } from "../lib/words";
 import { logger } from "../lib/logger";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
 import {
@@ -19,6 +18,7 @@ import {
 	usesCodexApiMode,
 } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
+import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
@@ -26,6 +26,7 @@ import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
 	getMaxTransientRetries,
+	getRetryBackoffCeilMs,
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
@@ -421,6 +422,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
 			serviceTier: resolvedServiceTier,
 			maxTransientRetries: getMaxTransientRetries(),
+			retryBackoffCeilMs: getRetryBackoffCeilMs(),
 			metadata: isAnthropicProvider(resolvedProvider)
 				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,

@@ -568,6 +568,7 @@ export async function* agentLoop(
 		const maxChatRetries = usesStatefulApi(effectiveProvider)
 			? 0
 			: (config.maxTransientRetries ?? 0);
+		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 		let chatRetryCount = 0;
 
 		for (;;) {
@@ -1032,11 +1033,15 @@ export async function* agentLoop(
 						if (isRetryableInvalidStateReason(reason, message)) {
 							// In-loop retry: skip block_complete persistence and retry
 							// the same chat() call with identical parameters.
-							if (chatRetryCount < maxChatRetries && !config.signal.aborted) {
+							// -1 means infinite retries (consistent with handleTransientError)
+							if (
+								(maxChatRetries === -1 || chatRetryCount < maxChatRetries) &&
+								!config.signal.aborted
+							) {
 								chatRetryCount++;
 								const delayMs = Math.min(
 									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-									20_000,
+									backoffCeil,
 								);
 								yield {
 									type: "retrying",
@@ -1103,9 +1108,16 @@ export async function* agentLoop(
 				// throttling, 429/529 overloaded)
 				if (isRetryableError(err)) {
 					// In-loop retry for stateless providers
-					if (chatRetryCount < maxChatRetries && !config.signal.aborted) {
+					// -1 means infinite retries (consistent with handleTransientError)
+					if (
+						(maxChatRetries === -1 || chatRetryCount < maxChatRetries) &&
+						!config.signal.aborted
+					) {
 						chatRetryCount++;
-						const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1), 20_000);
+						const delayMs = Math.min(
+							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+							backoffCeil,
+						);
 						yield {
 							type: "retrying",
 							message: msg,
@@ -1134,6 +1146,10 @@ export async function* agentLoop(
 			// Chat call succeeded — break out of the retry loop
 			break;
 		} // end for (;;) retry loop
+
+		// Reset retry counter after a successful turn so the next turn's
+		// backoff starts from the base delay instead of the ceiling.
+		chatRetryCount = 0;
 
 		// ── Fallback: estimate context usage when the provider reported nothing ──
 		if (!receivedUsage) {

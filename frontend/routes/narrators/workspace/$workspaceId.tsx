@@ -21,11 +21,14 @@ import {
 	type SplitLeaf,
 	type SplitNode,
 	setNarrator,
+	setWebviewConfig,
 	splitAndAssign,
 	splitAndAssignTerminal,
+	splitAndAssignWebview,
 	swapLeaves,
 	type TerminalLeafConfig,
 	updateSizes,
+	type WebviewLeafConfig,
 } from "../../../components/narrator/split-tree";
 import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
@@ -329,6 +332,25 @@ function WorkspacePage() {
 		[updateTree],
 	);
 
+	const handleSplitAndAssignWebview = useCallback(
+		(
+			leafId: string,
+			direction: SplitDirection,
+			position: "before" | "after",
+			config: WebviewLeafConfig,
+		) => {
+			updateTree((prev) => splitAndAssignWebview(prev, leafId, direction, position, config));
+		},
+		[updateTree],
+	);
+
+	const handleUpdateWebviewConfig = useCallback(
+		(leafId: string, config: WebviewLeafConfig) => {
+			updateTree((prev) => setWebviewConfig(prev, leafId, config));
+		},
+		[updateTree],
+	);
+
 	const resolveNarratorView = useCallback(
 		(leaf: SplitLeaf) => {
 			const stack = leafSubagentStacks[leaf.id] ?? [];
@@ -418,6 +440,8 @@ function WorkspacePage() {
 		onSwap: handleSwap,
 		onMoveToSplit: handleMoveToSplit,
 		onSplitAndAssignTerminal: handleSplitAndAssignTerminal,
+		onSplitAndAssignWebview: handleSplitAndAssignWebview,
+		onUpdateWebviewConfig: handleUpdateWebviewConfig,
 		resolveNarratorView,
 		onOpenSubagentInLeaf: handleOpenSubagentInLeaf,
 		onRestoreLeafNarrator: handleRestoreLeafNarrator,

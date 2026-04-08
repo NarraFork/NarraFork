@@ -88,9 +88,48 @@ async function loadSkillCached(skillFile: string, skillDir: string): Promise<Ski
 	return skill;
 }
 
+/** Directories to skip when recursively scanning for skills. */
+const SKIP_DIRS = new Set(["node_modules", ".git"]);
+
+/** Maximum recursion depth when walking skill directories. */
+const MAX_WALK_DEPTH = 5;
+
 /**
- * Scan directories for SKILL.md files.
- * Searches: .narrafork/skills/<name>/SKILL.md, .claude/skills/<name>/SKILL.md, .agents/skills/<name>/SKILL.md
+ * Recursively walk a directory tree looking for sub-directories that contain a
+ * `SKILL.md` file.  When a `SKILL.md` is found the directory is treated as a
+ * skill root and we do **not** recurse deeper (nested dirs are companion files,
+ * not nested skills).
+ */
+async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): Promise<void> {
+	if (depth > MAX_WALK_DEPTH) return;
+	let entries: import("node:fs").Dirent[];
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return; // directory doesn't exist or not readable
+	}
+
+	for (const entry of entries) {
+		if ((await resolveEntryType(dir, entry)) !== "dir") continue;
+		if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
+
+		const childDir = join(dir, entry.name);
+		const skillFile = join(childDir, "SKILL.md");
+		const skill = await loadSkillCached(skillFile, childDir);
+		if (skill) {
+			skills.push(skill);
+			// Don't recurse into a skill directory — sub-dirs are companion files
+		} else {
+			// No SKILL.md here — keep looking deeper
+			await walkForSkills(childDir, skills, depth + 1);
+		}
+	}
+}
+
+/**
+ * Scan directories for SKILL.md files (recursively).
+ * Searches: .narrafork/skills/, .claude/skills/, .agents/skills/ under basePath,
+ * walking sub-directories up to {@link MAX_WALK_DEPTH} levels deep.
  */
 async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 	const skills: SkillInfo[] = [];
@@ -102,20 +141,7 @@ async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 	];
 
 	for (const dir of searchDirs) {
-		try {
-			const entries = await readdir(dir, { withFileTypes: true });
-			for (const entry of entries) {
-				if ((await resolveEntryType(dir, entry)) !== "dir") continue;
-				const skillDir = join(dir, entry.name);
-				const skillFile = join(skillDir, "SKILL.md");
-				const skill = await loadSkillCached(skillFile, skillDir);
-				if (skill) {
-					skills.push(skill);
-				}
-			}
-		} catch {
-			// Directory doesn't exist, skip
-		}
+		await walkForSkills(dir, skills, 0);
 	}
 
 	return skills;

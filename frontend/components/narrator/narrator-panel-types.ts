@@ -28,6 +28,13 @@ if (typeof document !== "undefined") {
 			0% { transform: translateX(-100%) }
 			100% { transform: translateX(433%) }
 		}
+		@keyframes perm-btn-pulse {
+			0%, 100% { box-shadow: 0 0 0 0 currentColor }
+			50% { box-shadow: 0 0 0 3px currentColor }
+		}
+		.perm-btn-pulse {
+			animation: perm-btn-pulse 1.5s ease-in-out infinite;
+		}
 		@media (max-width: 768px) {
 			.context-ring { width: 14px !important; height: 14px !important; display: flex !important; align-items: center; justify-content: center; }
 			.context-ring svg { width: 14px; height: 14px; display: block; }

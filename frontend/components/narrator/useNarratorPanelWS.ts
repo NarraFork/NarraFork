@@ -276,6 +276,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
 	const [isCompacting, setIsCompacting] = useState(false);
 	const [isCheckingInterrupt, setIsCheckingInterrupt] = useState(false);
+	const interruptCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	useEffect(() => {
+		return () => {
+			if (interruptCheckTimeoutRef.current) {
+				clearTimeout(interruptCheckTimeoutRef.current);
+				interruptCheckTimeoutRef.current = null;
+			}
+		};
+	}, []);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
@@ -1394,9 +1403,23 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onInterruptChecking: () => {
 				setIsCheckingInterrupt(true);
+				// Safety timeout: if the backend never sends interrupt_check_done
+				// (e.g. WS glitch, backend crash), clear the checking state after
+				// 20 s so the UI doesn't stay stuck forever.
+				if (interruptCheckTimeoutRef.current) {
+					clearTimeout(interruptCheckTimeoutRef.current);
+				}
+				interruptCheckTimeoutRef.current = setTimeout(() => {
+					setIsCheckingInterrupt(false);
+					interruptCheckTimeoutRef.current = null;
+				}, 20_000);
 			},
 			onInterruptCheckDone: () => {
 				setIsCheckingInterrupt(false);
+				if (interruptCheckTimeoutRef.current) {
+					clearTimeout(interruptCheckTimeoutRef.current);
+					interruptCheckTimeoutRef.current = null;
+				}
 			},
 			onNarratorError: (error, errorCode) => {
 				// Session error may leave synthetic streaming chunks in the cache.

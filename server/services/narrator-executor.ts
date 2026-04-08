@@ -192,15 +192,42 @@ async function checkOutputInterruption(
 			"One word only: pass or retry.";
 
 		const snippet = text.slice(-500);
-		const result = await summaryGenerate(snippet, systemPrompt);
 
-		// Check abort after the model call completes
-		if (signal.aborted) {
+		// Race summaryGenerate against a 15 s timeout *and* the abort signal.
+		// Without this, a hanging fetch inside the summary model call would
+		// permanently block the narrator in "thinking" state — the user could
+		// neither send messages nor interrupt.
+		const CHECK_TIMEOUT_MS = 15_000;
+
+		const summaryPromise = summaryGenerate(snippet, systemPrompt);
+		const cancelPromise = new Promise<null>((resolve) => {
+			const onAbort = () => resolve(null);
+			signal.addEventListener("abort", onAbort, { once: true });
+			const timer = setTimeout(() => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(null);
+			}, CHECK_TIMEOUT_MS);
+			if (typeof timer === "object" && "unref" in timer) timer.unref();
+		});
+
+		const raceResult = await Promise.race([summaryPromise, cancelPromise]);
+
+		if (raceResult === null) {
+			// Timed out or aborted — treat as "not interrupted" so the outer
+			// loop finishes normally (or handles abort on its own).
 			broadcastToNarrator(narratorId, { type: "interrupt_check_done", narratorId });
+			if (signal.aborted) {
+				logger.info("Smart interruption check: aborted by user", { narratorId });
+			} else {
+				logger.warn("Smart interruption check: timed out, skipping", {
+					narratorId,
+					timeoutMs: CHECK_TIMEOUT_MS,
+				});
+			}
 			return false;
 		}
 
-		const verdict = result.text.trim().toLowerCase();
+		const verdict = raceResult.text.trim().toLowerCase();
 
 		broadcastToNarrator(narratorId, { type: "interrupt_check_done", narratorId });
 

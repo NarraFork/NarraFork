@@ -14,8 +14,10 @@ import type {
 	SplitLeaf,
 	SplitNode,
 	TerminalLeafConfig,
+	WebviewLeafConfig,
 } from "./split-tree";
 import { leafPanelType } from "./split-tree";
+import { WebviewPanel } from "./WebviewPanel";
 
 const MIN_SIZE_PCT = 15;
 
@@ -68,6 +70,15 @@ export interface SplitPanelCallbacks {
 		position: "before" | "after",
 		config: TerminalLeafConfig,
 	) => void;
+	/** Split a leaf and assign a webview panel to the new leaf. */
+	onSplitAndAssignWebview?: (
+		leafId: string,
+		direction: SplitDirection,
+		position: "before" | "after",
+		config: WebviewLeafConfig,
+	) => void;
+	/** Update the webview config of an existing leaf. */
+	onUpdateWebviewConfig?: (leafId: string, config: WebviewLeafConfig) => void;
 	resolveNarratorView: (leaf: SplitLeaf) => { narratorId: string | null; isSubagentView: boolean };
 	onOpenSubagentInLeaf: (leafId: string, narratorId: string) => void;
 	onRestoreLeafNarrator: (leafId: string) => void;
@@ -114,6 +125,7 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 		onSwap,
 		onMoveToSplit,
 		onSplitAndAssignTerminal,
+		onUpdateWebviewConfig,
 		resolveNarratorView,
 		onOpenSubagentInLeaf,
 		onRestoreLeafNarrator,
@@ -226,6 +238,8 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 			} else if (panelType === "terminal") {
 				// Use a placeholder narratorId — the sourceLeafId is what matters for tree-internal moves
 				startNarratorDrag("__terminal__", "Terminal", e.clientX, e.clientY, leaf.id);
+			} else if (panelType === "webview") {
+				startNarratorDrag("__webview__", "Webview", e.clientX, e.clientY, leaf.id);
 			}
 		},
 		[panelType, currentNarratorId, leaf.id],
@@ -237,6 +251,13 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 			narratorId: leaf.narratorId,
 		});
 	}, [leaf.id, leaf.narratorId, onSplitAndAssignTerminal]);
+
+	const handleWebviewConfigChange = useCallback(
+		(config: WebviewLeafConfig) => {
+			onUpdateWebviewConfig?.(leaf.id, config);
+		},
+		[leaf.id, onUpdateWebviewConfig],
+	);
 
 	return (
 		<Box
@@ -251,6 +272,15 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 					leafId={leaf.id}
 					onClose={canClose ? () => onClose(leaf.id) : undefined}
 					onHeaderPointerDown={handleHeaderPointerDown}
+				/>
+			) : panelType === "webview" ? (
+				<WebviewPanel
+					key={leaf.id}
+					config={leaf.webviewConfig ?? { url: "" }}
+					leafId={leaf.id}
+					onClose={canClose ? () => onClose(leaf.id) : undefined}
+					onHeaderPointerDown={handleHeaderPointerDown}
+					onConfigChange={handleWebviewConfigChange}
 				/>
 			) : (
 				<>

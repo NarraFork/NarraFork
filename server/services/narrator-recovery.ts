@@ -26,6 +26,11 @@ export function getMaxTransientRetries(): number {
 	return settings.agent.maxTransientRetries;
 }
 
+/** Read the user-configured retry backoff ceiling (ms) from settings. */
+export function getRetryBackoffCeilMs(): number {
+	return settings.agent.retryBackoffCeilMs;
+}
+
 // ── Context overflow recovery ────────────────────────────────────────────────
 
 interface OverflowResultBase {
@@ -197,7 +202,10 @@ export async function handleTransientError(opts: {
 		return { shouldRetry: false, delayMs: 0 };
 	}
 
-	const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (retryCount - 1), 20_000);
+	const delayMs = Math.min(
+		TRANSIENT_RETRY_BASE_MS * 2 ** (retryCount - 1),
+		getRetryBackoffCeilMs(),
+	);
 	logger.warn("Transient API error, retrying", {
 		narratorId,
 		error,

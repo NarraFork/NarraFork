@@ -58,5 +58,11 @@
 	"dropNarratorHere": "Drop a narrator here",
 	"distributePanels": "Distribute panels evenly",
 	"createdAtLabel": "Created {{time}}",
-	"lastMessageAtLabel": "Last message {{time}}"
+	"lastMessageAtLabel": "Last message {{time}}",
+	"addWebview": "Add webview",
+	"closeWebview": "Close webview",
+	"webviewPlaceholder": "Webview",
+	"webviewUrlPlaceholder": "Enter URL...",
+	"webviewOpenExternal": "Open in browser",
+	"webviewEmpty": "Enter a URL to load a page"
 }
