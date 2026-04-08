@@ -22,6 +22,21 @@ function cursorKey(narratorId: string, terminalId: string): string {
 }
 
 /**
+ * Reset all read cursors for a given terminal.
+ * Called when a terminal is re-attached after server restart or dtach detach,
+ * so that the next read returns the full buffer instead of potentially stale
+ * incremental content.
+ */
+export function resetCursorForTerminal(terminalId: string): void {
+	const suffix = `:${terminalId}`;
+	for (const key of readCursors.keys()) {
+		if (key.endsWith(suffix)) {
+			readCursors.delete(key);
+		}
+	}
+}
+
+/**
  * Strip ANSI escape sequences from terminal output to produce plain text
  * that is easier for the LLM to read.
  */
@@ -100,6 +115,8 @@ export const terminalTool: ToolDefinition = {
 		"Use action 'read' to get new terminal output since the last read (incremental). " +
 		"On the first read (or after a buffer reset), the full buffer is returned. " +
 		"Pass 'last_n_lines' to override incremental mode and always get the last N lines. " +
+		"Pass 'wait_for' to block until a specific string appears in new output (useful for waiting on " +
+		"build completion, server ready messages, prompts, etc.; times out after 30s). " +
 		"Use action 'write' to send input to the terminal (keystrokes, commands, Ctrl-C, etc.). " +
 		"Use action 'list' to list available terminals for the current narrator. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
@@ -128,13 +145,22 @@ export const terminalTool: ToolDefinition = {
 				"For 'read' action: only return the last N lines of the buffer (overrides incremental mode). " +
 					"When omitted, read returns only new output since the last read/write call.",
 			),
+		wait_for: z
+			.string()
+			.optional()
+			.describe(
+				"For 'read' action: block until this string appears in new terminal output, or until timeout (30s). " +
+					"Useful for waiting on build completion, server ready messages, prompts, etc. " +
+					"Case-sensitive substring match. Can be combined with last_n_lines.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { action, terminal_id, input, last_n_lines } = args as {
+		const { action, terminal_id, input, last_n_lines, wait_for } = args as {
 			action: "read" | "write" | "list";
 			terminal_id?: string;
 			input?: string;
 			last_n_lines?: number;
+			wait_for?: string;
 		};
 
 		switch (action) {
@@ -144,7 +170,7 @@ export const terminalTool: ToolDefinition = {
 				if (!terminal_id) {
 					return { output: "terminal_id is required for 'read' action", isError: true };
 				}
-				return await readBuffer(terminal_id, ctx.narratorId, ctx.chapterId, last_n_lines);
+				return await readBuffer(terminal_id, ctx.narratorId, ctx.chapterId, last_n_lines, wait_for);
 			}
 			case "write": {
 				if (!terminal_id) {
@@ -211,6 +237,7 @@ async function readBuffer(
 	narratorId: string,
 	cachedChapterId?: string,
 	lastNLines?: number,
+	waitFor?: string,
 ): Promise<ToolResult> {
 	const access = await assertTerminalAccess(terminalId, narratorId, cachedChapterId);
 	if (!access.allowed) {
@@ -218,6 +245,34 @@ async function readBuffer(
 	}
 	const { terminal } = access;
 
+	// --- wait_for polling phase ---
+	let waitTimedOut = false;
+	if (waitFor) {
+		const key = cursorKey(narratorId, terminalId);
+		const initialSnap = await terminalService.getScrollback(terminalId);
+		const initialText = initialSnap ? extractPlainText(initialSnap.data) : "";
+		const waitStart = readCursors.get(key) ?? initialText.length;
+
+		const deadline = Date.now() + READ_WAIT_FOR_TIMEOUT_MS;
+		let found = false;
+
+		while (Date.now() < deadline) {
+			const snap = await terminalService.getScrollback(terminalId);
+			if (snap) {
+				const full = extractPlainText(snap.data);
+				const newContent = full.slice(waitStart);
+				if (newContent.includes(waitFor)) {
+					found = true;
+					break;
+				}
+			}
+			await new Promise((r) => setTimeout(r, READ_WAIT_FOR_POLL_MS));
+		}
+
+		if (!found) waitTimedOut = true;
+	}
+
+	// --- normal read flow ---
 	const scrollback = await terminalService.getScrollback(terminalId);
 	if (!scrollback) {
 		return {
@@ -247,6 +302,10 @@ async function readBuffer(
 			// No cursor (first read) or buffer was reset (cursor > length) — return full
 			text = fullText;
 		}
+
+		// Note: stale-cursor-after-reattach is handled by resetCursorForTerminal()
+		// called in terminal-service during re-attach / recovery, so no guard needed here.
+
 		// Cap incremental output to avoid flooding context
 		text = tailSlice(text, READ_INCREMENTAL_MAX_LINES, READ_INCREMENTAL_MAX_CHARS);
 	}
@@ -256,12 +315,18 @@ async function readBuffer(
 
 	if (!text.trim()) {
 		return {
-			output: "(no new output since last read)",
+			output: waitTimedOut
+				? `(wait_for timed out after ${READ_WAIT_FOR_TIMEOUT_MS / 1000}s — "${waitFor}" not found, no new output)`
+				: "(no new output since last read)",
 			title: terminal.name ?? terminalId,
 		};
 	}
 
-	const truncated = truncateOutput(text);
+	const header = waitTimedOut
+		? `(wait_for timed out after ${READ_WAIT_FOR_TIMEOUT_MS / 1000}s — "${waitFor}" not found)\n\n`
+		: "";
+
+	const truncated = truncateOutput(header + text);
 	return {
 		output: truncated.content,
 		truncated: truncated.truncated,
@@ -283,6 +348,10 @@ const WRITE_TAIL_CHARS = 20_000;
 const READ_INCREMENTAL_MAX_LINES = 200;
 /** Max characters for incremental read (no last_n_lines) */
 const READ_INCREMENTAL_MAX_CHARS = 40_000;
+/** How long to wait for `wait_for` pattern to appear (ms) */
+const READ_WAIT_FOR_TIMEOUT_MS = 30_000;
+/** Polling interval when waiting for `wait_for` pattern (ms) */
+const READ_WAIT_FOR_POLL_MS = 500;
 
 /**
  * Take the last N lines from text, also capping total character count.
@@ -367,16 +436,20 @@ async function writeInput(
 		};
 	}
 
-	let text = extractPlainText(afterSnapshot.data);
+	const fullText = extractPlainText(afterSnapshot.data);
+
+	// Extract only new output generated by this write command (exclude stale content).
+	// If beforeLen > fullText.length, buffer was truncated/reset — fall back to full output.
+	let text = beforeLen < fullText.length ? fullText.slice(beforeLen) : fullText;
 
 	// Update cursor so subsequent reads skip what we already returned
-	readCursors.set(cursorKey(narratorId, terminalId), text.length);
+	readCursors.set(cursorKey(narratorId, terminalId), fullText.length);
 
 	text = tailSlice(text, WRITE_TAIL_LINES, WRITE_TAIL_CHARS);
 
 	if (!text.trim()) {
 		return {
-			output: `Sent ${processed.length} byte(s) to terminal. (buffer is empty)`,
+			output: `Sent ${processed.length} byte(s) to terminal. (no new output)`,
 			title: terminal.name ?? terminalId,
 		};
 	}

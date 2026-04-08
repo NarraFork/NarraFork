@@ -58,6 +58,7 @@ import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useGlobalOverseer } from "../hooks/useOverseers";
+import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
 import { useRecentTabs } from "../hooks/useRecentTabs";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
@@ -170,6 +171,7 @@ function AuthenticatedLayout() {
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
+	useRecentTabKeyboardNav();
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const {

@@ -1514,43 +1514,63 @@ export function NarratorPanel({
 	);
 
 	// True when the main input is empty and there's a non-question pending permission.
-	// Used to show Enter-key hints on Allow/Deny buttons via PermEnterHintCtx.
+	// Used to show Enter-key hints on permission buttons via PermEnterHintCtx.
 	const permHintActive =
 		!input.trim() &&
 		!!renderPermCb.pendingPermission &&
 		renderPermCb.pendingPermission.toolName !== "AskUserQuestion";
 
-	// Which action (allow/deny) is currently focused for the Enter shortcut.
-	// Defaults to "allow"; auto-switches to "deny" when feedback is typed;
-	// left/right arrow keys toggle manually.
-	const [permActionOverride, setPermActionOverride] = useState<"allow" | "deny" | null>(null);
+	// Index-based keyboard navigation for permission buttons.
+	// focusIndex tracks which button is highlighted; left/right arrows shift it.
+	const [permFocusIndex, setPermFocusIndex] = useState<number | null>(null);
+	const [permButtonCount, setPermButtonCount] = useState(0);
 	const [permHasFeedback, setPermHasFeedback] = useState(false);
 
-	// Reset override when permission changes
+	// Reset when permission changes
 	const prevPermIdRef = useRef<string | null>(null);
 	const currentPermId = renderPermCb.pendingPermission?.id ?? null;
 	if (prevPermIdRef.current !== currentPermId) {
 		prevPermIdRef.current = currentPermId;
-		if (permActionOverride !== null) setPermActionOverride(null);
+		if (permFocusIndex !== null) setPermFocusIndex(null);
 		if (permHasFeedback) setPermHasFeedback(false);
 	}
 
-	// Callback from child components when feedback presence changes.
-	// Auto-switches the default action (unless user has manually overridden).
 	const handlePermFeedbackChange = useCallback((has: boolean) => {
 		setPermHasFeedback(has);
-		// Auto-switch only when user hasn't manually toggled
-		setPermActionOverride(null);
+		// When feedback changes, reset manual override so default kicks in
+		setPermFocusIndex(null);
 	}, []);
 
-	const permDefaultAction: "allow" | "deny" = permHasFeedback ? "deny" : "allow";
-	const permEnterHint: "allow" | "deny" | null = permHintActive
-		? (permActionOverride ?? permDefaultAction)
+	const handlePermSetButtonCount = useCallback((n: number) => {
+		setPermButtonCount(n);
+	}, []);
+
+	// Ref holding the onClick handlers for each permission button, registered by the child.
+	const permActionsRef = useRef<(() => void)[]>([]);
+	const handlePermRegisterActions = useCallback((actions: (() => void)[]) => {
+		permActionsRef.current = actions;
+	}, []);
+
+	// Effective focus index: when no manual override, default to 0 (first button = Allow)
+	// or last button (Deny) when feedback is present.
+	const effectiveFocusIndex = permHintActive
+		? (permFocusIndex ?? (permHasFeedback ? permButtonCount - 1 : 0))
 		: null;
 
 	const permEnterHintCtxValue = useMemo(
-		() => ({ action: permEnterHint, setHasFeedback: handlePermFeedbackChange }),
-		[permEnterHint, handlePermFeedbackChange],
+		() => ({
+			focusIndex: effectiveFocusIndex,
+			setFocusIndex: setPermFocusIndex,
+			setButtonCount: handlePermSetButtonCount,
+			setHasFeedback: handlePermFeedbackChange,
+			registerActions: handlePermRegisterActions,
+		}),
+		[
+			effectiveFocusIndex,
+			handlePermSetButtonCount,
+			handlePermFeedbackChange,
+			handlePermRegisterActions,
+		],
 	);
 
 	// --- Retry countdown ---
@@ -3463,39 +3483,13 @@ export function NarratorPanel({
 
 		const ctrlEnterMode = (userPrefs?.sendMode ?? "enter") === "ctrl+enter";
 
-		// Left/Right arrow keys toggle between allow/deny when permission hint is active
-		if (permEnterHint && (e.key === "ArrowLeft" || e.key === "ArrowRight") && !input.trim()) {
-			e.preventDefault();
-			setPermActionOverride(permEnterHint === "allow" ? "deny" : "allow");
-			return;
-		}
-
 		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-			// When input is empty and there's a pending permission (not AskUserQuestion),
-			// Enter executes the currently focused action (allow or deny).
-			const perm = renderPermCb.pendingPermission;
-			if (
-				perm &&
-				permEnterHint &&
-				!input.trim() &&
-				!e.shiftKey &&
-				!e.ctrlKey &&
-				!e.metaKey
-			) {
+			// Permission shortcut: when input is empty and a permission is pending,
+			// the global keydown handler (useEffect above) handles Enter.
+			// preventDefault here to stop the textarea from inserting a newline.
+			if (effectiveFocusIndex != null && !input.trim() && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
 				e.preventDefault();
-				let feedback = "";
-				try {
-					const raw = sessionStorage.getItem(`narrafork_perm_draft_${perm.id}`);
-					if (raw) feedback = JSON.parse(raw).feedback ?? "";
-				} catch {}
-				if (permEnterHint === "deny") {
-					sessionStorage.removeItem(`narrafork_perm_draft_${perm.id}`);
-					renderPermCb.onPermissionDecision(perm.id, "deny", feedback || undefined);
-				} else {
-					renderPermCb.onPermissionDecision(perm.id, "allow", feedback || undefined);
-				}
-				setPermActionOverride(null);
-				return;
+				return; // action handled by global handler
 			}
 
 			if (ctrlEnterMode) {
@@ -3548,6 +3542,54 @@ export function NarratorPanel({
 			});
 		}
 	};
+
+	// Global keyboard shortcuts for permission actions.
+	// The textarea's onKeyDown only fires when the textarea has focus, but the user
+	// may be looking at the permission UI without focusing the main input.
+	// This effect listens at the window level so Enter/ArrowLeft/ArrowRight work
+	// regardless of focus, as long as the permission hint is active.
+	useEffect(() => {
+		if (effectiveFocusIndex == null) return;
+		const handler = (e: KeyboardEvent) => {
+			// Don't intercept if user is typing in an input/textarea (other than the main one)
+			const target = e.target as HTMLElement | null;
+			if (
+				target &&
+				(target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+			) {
+				// Allow only if it's our main textarea AND it's empty
+				if (target !== textareaRef.current) return;
+				if (input.trim()) return;
+			}
+
+			if (
+				(e.key === "ArrowLeft" || e.key === "ArrowRight") &&
+				!e.shiftKey &&
+				!e.ctrlKey &&
+				!e.metaKey
+			) {
+				e.preventDefault();
+				const count = permButtonCount;
+				if (count <= 1) return;
+				setPermFocusIndex((prev) => {
+					const cur = prev ?? effectiveFocusIndex ?? 0;
+					if (e.key === "ArrowLeft") return cur <= 0 ? count - 1 : cur - 1;
+					return cur >= count - 1 ? 0 : cur + 1;
+				});
+				return;
+			}
+
+			if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
+				const action = permActionsRef.current[effectiveFocusIndex];
+				if (!action) return;
+				e.preventDefault();
+				action();
+				setPermFocusIndex(null);
+			}
+		};
+		window.addEventListener("keydown", handler);
+		return () => window.removeEventListener("keydown", handler);
+	}, [effectiveFocusIndex, permButtonCount, input]);
 
 	if (!narrator || messagesLoading) return <NarratorPanelSkeleton />;
 

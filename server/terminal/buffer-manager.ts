@@ -186,9 +186,13 @@ export class BufferManager {
 		this.dirty = true;
 	}
 
-	saveToDisk(): void {
-		// Fire-and-forget: flush then save. The periodic timer will retry if needed.
-		this.writeChain
+	/**
+	 * Save buffer to disk. Returns a promise that resolves with the number of
+	 * bytes written. Callers that need durability (e.g. shutdown) should await
+	 * the returned promise.
+	 */
+	saveToDisk(): Promise<number> {
+		const p = this.writeChain
 			.then(async () => {
 				const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 				const serialized = this.serializeAddon.serialize({
@@ -201,15 +205,20 @@ export class BufferManager {
 					rows: this.xterm.rows,
 					mouseMode: { ...this.mouseMode },
 				};
-				await Bun.write(filePath, JSON.stringify(fileData));
+				const written = await Bun.write(filePath, JSON.stringify(fileData));
 				this.dirty = false;
+				return written;
 			})
 			.catch((err) => {
 				logger.error("Failed to save buffer", {
 					terminalId: this.terminalId,
 					error: String(err),
 				});
+				return 0;
 			});
+		// Store the promise so that subsequent writeChain consumers wait for it.
+		this.writeChain = p.then(() => {});
+		return p;
 	}
 
 	async loadFromDisk(): Promise<boolean> {
@@ -281,7 +290,7 @@ export class BufferManager {
 		if (deleteBuffer) {
 			await this.deleteFromDisk();
 		} else if (this.dirty) {
-			this.saveToDisk();
+			await this.saveToDisk();
 		}
 		this.xterm.dispose();
 	}

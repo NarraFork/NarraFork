@@ -51,6 +51,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
+import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
 	applyRecentTabMove,
@@ -329,6 +330,7 @@ export function RecentTabList({
 	const qc = useQueryClient();
 	const { t } = useTranslation("nav");
 	const requireSetup = useSetupWizardGuard();
+	const pendingKey = usePendingTabKey();
 
 	const [ctxMenu, setCtxMenu] = useState<{
 		x: number;
@@ -825,13 +827,16 @@ export function RecentTabList({
 
 						// Workspace children use a compact sortable component.
 						if (!isHeader) {
+							const tabKey = `${tab.type}:${tab.id}`;
 							return (
 								<SortableWorkspaceChildTab
 									key={tabSortId(tab)}
 									tab={tab}
 									active={
-										isTabActive(tab, pathname) &&
-										!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
+										pendingKey
+											? pendingKey === tabKey
+											: isTabActive(tab, pathname) &&
+												!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
 									}
 									onRemove={handleRemove}
 									onNavigate={onNavigate}
@@ -842,13 +847,16 @@ export function RecentTabList({
 							);
 						}
 
+						const tabKey = `${tab.type}:${tab.id}`;
 						return (
 							<SortableTabItem
 								key={tabSortId(tab)}
 								tab={tab}
 								active={
-									isTabActive(tab, pathname) &&
-									!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
+									pendingKey
+										? pendingKey === tabKey
+										: isTabActive(tab, pathname) &&
+											!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
 								}
 								onRemove={handleRemove}
 								onNavigate={onNavigate}

@@ -1,7 +1,7 @@
 import { usePermissionFilePreview } from "@frontend/hooks/useNarrator";
 import { toRelativePath } from "@frontend/lib/format";
 import { Box, Button, Center, Group, Loader, Tabs, Text, Textarea } from "@mantine/core";
-import { useContext, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
@@ -21,7 +21,8 @@ export function FileApprovalTab({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { action: permAction, setHasFeedback } = useContext(PermEnterHintCtx);
+	const { focusIndex, setButtonCount, setHasFeedback, registerActions } =
+		useContext(PermEnterHintCtx);
 	const toolUseId = permission.toolUseId ?? null;
 	const { data, isLoading } = usePermissionFilePreview(narratorId, toolUseId, !!toolUseId);
 
@@ -49,15 +50,21 @@ export function FileApprovalTab({
 		setHasFeedback(!!feedback);
 	}, [feedback, setHasFeedback]);
 
-	const handleAllow = () => {
+	const handleAllow = useCallback(() => {
 		sessionStorage.removeItem(draftKey);
 		onDecision?.(permission.id, "allow", feedback || undefined);
-	};
+	}, [draftKey, onDecision, permission.id, feedback]);
 
-	const handleDeny = () => {
+	const handleDeny = useCallback(() => {
 		sessionStorage.removeItem(draftKey);
 		onDecision?.(permission.id, "deny", feedback || undefined);
-	};
+	}, [draftKey, onDecision, permission.id, feedback]);
+
+	// Report button count and register actions
+	useEffect(() => {
+		setButtonCount(2);
+		registerActions([handleAllow, handleDeny]);
+	}, [setButtonCount, registerActions, handleAllow, handleDeny]);
 
 	if (isLoading) {
 		return (
@@ -156,6 +163,12 @@ export function FileApprovalTab({
 					placeholder={t("feedbackPlaceholder")}
 					value={feedback}
 					onChange={(e) => setFeedback(e.currentTarget.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && feedback.trim()) {
+							e.preventDefault();
+							handleDeny();
+						}
+					}}
 					autosize
 					minRows={1}
 					maxRows={3}
@@ -166,11 +179,11 @@ export function FileApprovalTab({
 						size="sm"
 						color="green"
 						onClick={handleAllow}
-						className={permAction === "allow" ? "perm-btn-pulse" : undefined}
+						className={focusIndex === 0 ? "perm-btn-pulse" : undefined}
 					>
 						{tc("allow")}
-						{permAction === "allow" && (
-							<Text span size="xs" ml={4} c="green.2">
+						{focusIndex === 0 && (
+							<Text span size="xs" ml={4} opacity={0.7}>
 								⏎
 							</Text>
 						)}
@@ -180,11 +193,11 @@ export function FileApprovalTab({
 						color="red"
 						variant="light"
 						onClick={handleDeny}
-						className={permAction === "deny" ? "perm-btn-pulse" : undefined}
+						className={focusIndex === 1 ? "perm-btn-pulse" : undefined}
 					>
 						{tc("deny")}
-						{permAction === "deny" && (
-							<Text span size="xs" ml={4} c="red.2">
+						{focusIndex === 1 && (
+							<Text span size="xs" ml={4} opacity={0.7}>
 								⏎
 							</Text>
 						)}

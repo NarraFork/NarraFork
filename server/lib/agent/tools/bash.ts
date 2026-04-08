@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
-import { getHome, IS_WINDOWS } from "../../platform";
+import { getHome } from "../../platform";
 import { loadSettings } from "../../settings";
 import { buildMinimalEnv, detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
@@ -13,8 +13,8 @@ const MAX_TIMEOUT_MS = 86_400_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
-/** Platform-aware tool name: "Shell" on Windows, "Bash" elsewhere. */
-export const SHELL_TOOL_NAME = IS_WINDOWS ? "Shell" : "Bash";
+/** Tool name: "Bash" when using bash (including Git Bash on Windows), "Shell" for PowerShell/cmd. */
+export const SHELL_TOOL_NAME = detectShell().type === "bash" ? "Bash" : "Shell";
 
 export const bashTool: ToolDefinition = {
 	name: SHELL_TOOL_NAME,

@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, terminals } from "../db/schema";
 import { detectShell } from "../lib/agent/shell";
+import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -548,6 +549,9 @@ export const terminalService = {
 		// Ensure DB status is running
 		await db.update(terminals).set({ status: "running" }).where(eq(terminals.id, terminalId));
 
+		// Clear stale read cursors so next read returns full buffer
+		resetCursorForTerminal(terminalId);
+
 		monitorAttachProcess(terminalId, runtime);
 
 		logger.info("Terminal re-attached", { terminalId });
@@ -668,6 +672,9 @@ export const terminalService = {
 					useDtach: true,
 				});
 
+				// Clear stale read cursors so next read returns full buffer
+				resetCursorForTerminal(terminal.id);
+
 				monitorAttachProcess(terminal.id, runtime, terminal.narratorId, terminal.chapterId);
 
 				recovered++;
@@ -727,6 +734,9 @@ export const terminalService = {
 						buffer,
 						useDtach: true,
 					});
+
+					// Clear stale read cursors so next read returns full buffer
+					resetCursorForTerminal(terminalId);
 
 					monitorAttachProcess(terminalId, runtime, existing.narratorId, existing.chapterId);
 
@@ -888,7 +898,7 @@ export const terminalService = {
 							// dtach mode: save buffer and close the attach process,
 							// but do NOT kill the dtach session — it should survive restart.
 							// DB status stays "running" so recoverOnStartup can find it.
-							active.buffer.saveToDisk();
+							await active.buffer.saveToDisk();
 							active.buffer.stopPeriodicFlush();
 							active.runtime.close();
 						} else {

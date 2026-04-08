@@ -26,9 +26,7 @@ import {
 	IconCode,
 	IconDownload,
 	IconEye,
-	IconFile,
 	IconFileCode,
-	IconFileText,
 	IconGitFork,
 	IconHistory,
 	IconListCheck,
@@ -88,14 +86,26 @@ export const FileModDrawerCtx = createContext<{
 }>({ openForApproval: () => {} });
 
 /**
- * Context that signals which permission action is currently focused via keyboard.
- * null = no hint (input has text or no pending permission).
- * "allow" / "deny" = the action that Enter will trigger, with visual pulse.
+ * Context for keyboard-driven permission button navigation.
+ * `focusIndex` is the 0-based index of the currently focused button (null = inactive).
+ * `setFocusIndex` lets the parent shift focus via arrow keys.
+ * `setButtonCount` lets the child report how many navigable buttons it has.
+ * `setHasFeedback` lets the child report whether feedback text is present.
+ * `registerActions` lets the child register onClick handlers so the parent can invoke them.
  */
 export const PermEnterHintCtx = createContext<{
-	action: "allow" | "deny" | null;
+	focusIndex: number | null;
+	setFocusIndex: (i: number | null) => void;
+	setButtonCount: (n: number) => void;
 	setHasFeedback: (has: boolean) => void;
-}>({ action: null, setHasFeedback: () => {} });
+	registerActions: (actions: (() => void)[]) => void;
+}>({
+	focusIndex: null,
+	setFocusIndex: () => {},
+	setButtonCount: () => {},
+	setHasFeedback: () => {},
+	registerActions: () => {},
+});
 
 // --- Types ---
 
@@ -244,7 +254,7 @@ export function getCategory(name: string): ToolCategory {
 	return "generic";
 }
 
-export function getCategoryIcon(cat: ToolCategory, toolName?: string) {
+export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
 	switch (cat) {
 		case "read":
 			return IconEye;
@@ -499,8 +509,11 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		}
 		case "search": {
 			const pat = extractField(input, "pattern", "glob");
-			if (!pat) return toolName;
-			return pat.length > 60 ? `${pat.slice(0, 57)}...` : pat;
+			const searchPath = extractField(input, "path");
+			if (!pat && !searchPath) return toolName;
+			const pathLabel = searchPath ? ` in ${basename(searchPath) || searchPath}` : "";
+			const raw = `${pat || toolName}${pathLabel}`;
+			return raw.length > 60 ? `${raw.slice(0, 57)}...` : raw;
 		}
 		case "webSearch": {
 			const q = extractField(input, "query");
@@ -739,6 +752,12 @@ function ToolHeader({
 		() => getSummary(toolCall.toolName, toolCall.inputJson, toolCall._metadata),
 		[toolCall.toolName, toolCall.inputJson, toolCall._metadata],
 	);
+	const searchPathSuffix = useMemo(() => {
+		if (cat !== "search") return null;
+		const p = extractField(toolCall.inputJson, "path");
+		if (!p) return null;
+		return basename(p) || p;
+	}, [cat, toolCall.inputJson]);
 	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 	const { t } = useTranslation("narrator");
 
@@ -791,9 +810,30 @@ function ToolHeader({
 			<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
 				{displayName}
 			</Text>
-			<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
-				{summary}
-			</Text>
+			{searchPathSuffix ? (
+				<Box
+					component="span"
+					ff="monospace"
+					style={{
+						flex: 1,
+						minWidth: 0,
+						fontSize: 12,
+						overflow: "hidden",
+						textOverflow: "ellipsis",
+						whiteSpace: "nowrap",
+					}}
+					title={summary}
+				>
+					<span>{extractField(toolCall.inputJson, "pattern", "glob")}</span>
+					<span style={{ color: "var(--mantine-color-dimmed)", marginLeft: 4 }}>
+						in {searchPathSuffix}
+					</span>
+				</Box>
+			) : (
+				<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
+					{summary}
+				</Text>
+			)}
 			<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
 				<Tooltip label={startedAtLabel} disabled={!startedAtLabel} position="top" withArrow fz="xs">
 					<Group gap={4} wrap="nowrap" align="center">
@@ -2528,6 +2568,65 @@ function ReviewInPanelButton() {
 	);
 }
 
+// --- Permission button bar with keyboard navigation ---
+
+interface PermButton {
+	label: string;
+	color: string;
+	variant?: string;
+	onClick: () => void;
+}
+
+/**
+ * Renders a row of permission buttons with keyboard-driven focus highlight.
+ * Reports button count to the parent via setButtonCount so the global
+ * keydown handler knows the navigation range.
+ */
+function PermButtonBar({
+	buttons,
+	focusIndex,
+	setButtonCount,
+	registerActions,
+	suffix,
+}: {
+	buttons: PermButton[];
+	focusIndex: number | null;
+	setButtonCount: (n: number) => void;
+	registerActions: (actions: (() => void)[]) => void;
+	suffix?: React.ReactNode;
+}) {
+	useEffect(() => {
+		setButtonCount(buttons.length);
+		registerActions(buttons.map((b) => b.onClick));
+	}, [buttons, setButtonCount, registerActions]);
+
+	return (
+		<Group gap="sm">
+			{buttons.map((btn, i) => {
+				const focused = focusIndex === i;
+				return (
+					<Button
+						key={`${btn.label}-${btn.color}`}
+						size="sm"
+						color={btn.color}
+						variant={btn.variant as "light" | "subtle" | undefined}
+						onClick={btn.onClick}
+						className={focused ? "perm-btn-pulse" : undefined}
+					>
+						{btn.label}
+						{focused && (
+							<Text span size="xs" ml={4} opacity={0.7}>
+								⏎
+							</Text>
+						)}
+					</Button>
+				);
+			})}
+			{suffix}
+		</Group>
+	);
+}
+
 // --- Inline permission UI rendered inside the tool call card ---
 
 export function InlinePermission({
@@ -2553,7 +2652,8 @@ export function InlinePermission({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { action: permAction, setHasFeedback } = useContext(PermEnterHintCtx);
+	const { focusIndex, setButtonCount, setHasFeedback, registerActions } =
+		useContext(PermEnterHintCtx);
 	const draftKey = `narrafork_perm_draft_${permission.id}`;
 	const [feedback, setFeedback] = useState(() => {
 		try {
@@ -2700,82 +2800,77 @@ export function InlinePermission({
 				placeholder={t("feedbackPlaceholder")}
 				value={feedback}
 				onChange={(e) => setFeedback(e.currentTarget.value)}
+				onKeyDown={(e) => {
+					// Enter in feedback textarea → deny with feedback
+					if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && feedback.trim()) {
+						e.preventDefault();
+						sessionStorage.removeItem(draftKey);
+						onDecision?.(permission.id, "deny", feedback);
+					}
+				}}
 				autosize
 				minRows={1}
 				maxRows={3}
 				mb="xs"
 			/>
-			<Group gap="sm">
-				{!editing && (
-					<Button
-						size="sm"
-						color="green"
-						onClick={() => handleAllow()}
-						className={permAction === "allow" ? "perm-btn-pulse" : undefined}
-					>
-						{tc("allow")}
-						{permAction === "allow" && (
-							<Text span size="xs" ml={4} c="green.2">
-								⏎
-							</Text>
-						)}
-					</Button>
-				)}
-				{!editing && isExitPlan && (
-					<Button size="sm" color="teal" variant="light" onClick={() => handleAllow(true)}>
-						{t("acceptAndResetContext")}
-					</Button>
-				)}
-				{isExitPlan && planText && (
-					<Button
-						size="sm"
-						color="indigo"
-						variant="light"
-						onClick={() => {
-							if (editing) {
+			<PermButtonBar
+				focusIndex={focusIndex}
+				buttons={(() => {
+					const btns: PermButton[] = [];
+					if (!editing) {
+						btns.push({
+							label: tc("allow"),
+							color: "green",
+							onClick: () => handleAllow(),
+						});
+					}
+					if (!editing && isExitPlan) {
+						btns.push({
+							label: t("acceptAndResetContext"),
+							color: "teal",
+							variant: "light",
+							onClick: () => handleAllow(true),
+						});
+					}
+					if (isExitPlan && planText) {
+						btns.push({
+							label: editing ? t("planEditDone") : t("planEdit"),
+							color: "indigo",
+							variant: "light",
+							onClick: () => {
+								if (editing) setEditing(false);
+								else handleStartEdit();
+							},
+						});
+					}
+					if (planEdited || editing) {
+						btns.push({
+							label: t("planEditReset"),
+							color: "gray",
+							variant: "subtle",
+							onClick: () => {
+								setEditedPlan(null);
 								setEditing(false);
-							} else {
-								handleStartEdit();
-							}
-						}}
-					>
-						{editing ? t("planEditDone") : t("planEdit")}
-					</Button>
-				)}
-				{(planEdited || editing) && (
-					<Button
-						size="sm"
-						color="gray"
-						variant="subtle"
-						onClick={() => {
-							setEditedPlan(null);
-							setEditing(false);
-						}}
-					>
-						{t("planEditReset")}
-					</Button>
-				)}
-				{!editing && (
-					<Button
-						size="sm"
-						color="red"
-						variant="light"
-						onClick={() => {
-							sessionStorage.removeItem(draftKey);
-							onDecision?.(permission.id, "deny", feedback || undefined);
-						}}
-						className={permAction === "deny" ? "perm-btn-pulse" : undefined}
-					>
-						{tc("deny")}
-						{permAction === "deny" && (
-							<Text span size="xs" ml={4} c="red.2">
-								⏎
-							</Text>
-						)}
-					</Button>
-				)}
-				{!editing && EDIT_TOOLS.has(permission.toolName) && <ReviewInPanelButton />}
-			</Group>
+							},
+						});
+					}
+					if (!editing) {
+						btns.push({
+							label: tc("deny"),
+							color: "red",
+							variant: "light",
+							onClick: () => {
+								sessionStorage.removeItem(draftKey);
+								onDecision?.(permission.id, "deny", feedback || undefined);
+							},
+						});
+					}
+					return btns;
+				})()}
+				setButtonCount={setButtonCount}
+				registerActions={registerActions}
+				suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
+			/>
 		</Box>
 	);
 }
