@@ -95,7 +95,7 @@ describe("narrator CRUD", () => {
 		expect(result?.chapterId).toBe("ch1");
 		expect(result?.type).toBe("primary");
 		expect(result?.status).toBe("idle");
-		expect(result?.model).toBe("claude-sonnet");
+		expect(result?.model).toBe("claude-sonnet-4.5");
 	});
 
 	it("can create a standalone narrator (null chapterId)", async () => {

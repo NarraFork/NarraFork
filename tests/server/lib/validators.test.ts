@@ -9,17 +9,29 @@ import {
 
 describe("createProjectSchema", () => {
 	it("accepts valid input", () => {
-		const result = createProjectSchema.safeParse({ name: "My Project" });
+		const result = createProjectSchema.safeParse({
+			name: "My Project",
+			repoMode: "existing",
+			gitPath: "/tmp/my-project",
+		});
 		expect(result.success).toBe(true);
 	});
 
 	it("rejects empty name", () => {
-		const result = createProjectSchema.safeParse({ name: "" });
+		const result = createProjectSchema.safeParse({
+			name: "",
+			repoMode: "existing",
+			gitPath: "/tmp/my-project",
+		});
 		expect(result.success).toBe(false);
 	});
 
 	it("rejects name over 200 chars", () => {
-		const result = createProjectSchema.safeParse({ name: "x".repeat(201) });
+		const result = createProjectSchema.safeParse({
+			name: "x".repeat(201),
+			repoMode: "existing",
+			gitPath: "/tmp/my-project",
+		});
 		expect(result.success).toBe(false);
 	});
 });

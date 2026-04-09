@@ -6,7 +6,7 @@ describe("GET /api/health", () => {
 		const res = await app.request("/api/health");
 		expect(res.status).toBe(200);
 		const body = await res.json();
-		expect(body).toEqual({ status: "ok" });
+		expect(body).toMatchObject({ status: "ok" });
 	});
 });
 

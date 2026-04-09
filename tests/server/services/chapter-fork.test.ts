@@ -19,12 +19,12 @@ describe("slugify", () => {
 		expect(slugify("---hello---")).toBe("hello");
 	});
 
-	it("handles CJK by stripping them (non-ascii)", () => {
-		expect(slugify("测试 feature")).toBe("feature");
+	it("preserves CJK characters (Unicode support)", () => {
+		expect(slugify("测试 feature")).toBe("测试-feature");
 	});
 
-	it("handles empty string", () => {
-		expect(slugify("")).toBe("");
+	it("handles empty string with fallback", () => {
+		expect(slugify("")).toBe("chapter");
 	});
 });
 

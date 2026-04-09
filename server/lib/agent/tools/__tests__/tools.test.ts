@@ -931,6 +931,7 @@ describe("zodToJsonSchema", () => {
 		const json = zodToJsonSchema(schema);
 		expect(json).toEqual({
 			type: "object",
+			additionalProperties: false,
 			properties: {
 				name: { type: "string" },
 				age: { type: "number" },

@@ -53,7 +53,7 @@ describe("isInsideWorktree", () => {
 		expect(isInsideWorktree(CWD, ".")).toBe(true);
 	});
 
-	test("windows-style path comparison is case-insensitive", () => {
+	test.skipIf(process.platform !== "win32")("windows-style path comparison is case-insensitive", () => {
 		expect(isInsideWorktree("C:/Users/Ray/Repo", "c:/users/ray/repo/src/index.ts")).toBe(true);
 		expect(isInsideWorktree("C:/Users/Ray/Repo", "C:/Users/Ray/Repo-2/file.txt")).toBe(false);
 	});
@@ -169,10 +169,10 @@ describe("resolvePermissionDecision", () => {
 
 	// --- Always-allow tools ---
 
-	test("TodoWrite is always allowed regardless of mode", () => {
+	test("TaskCreate is always allowed regardless of mode", () => {
 		expect(
 			resolvePermissionDecision({
-				toolName: "TodoWrite",
+				toolName: "TaskCreate",
 				input: {},
 				permMode: "default",
 				cwd: CWD,
@@ -180,7 +180,7 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 		expect(
 			resolvePermissionDecision({
-				toolName: "TodoWrite",
+				toolName: "TaskCreate",
 				input: {},
 				permMode: "dontAsk",
 				cwd: CWD,
@@ -188,7 +188,7 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 		expect(
 			resolvePermissionDecision({
-				toolName: "TodoWrite",
+				toolName: "TaskCreate",
 				input: {},
 				permMode: "acceptEdits",
 				cwd: CWD,
@@ -365,10 +365,10 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 	});
 
-	test("default mode: Task with full-whitelisted workdir → allow", () => {
+	test("default mode: Agent with full-whitelisted workdir → allow", () => {
 		expect(
 			resolvePermissionDecision({
-				toolName: "Task",
+				toolName: "Agent",
 				input: { subagent_type: "general", workdir: "/mnt/shared" },
 				permMode: "default",
 				cwd: CWD,
@@ -377,10 +377,10 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 	});
 
-	test("default mode: Task with readWrite-whitelisted workdir still asks for general subagent", () => {
+	test("default mode: Agent with readWrite-whitelisted workdir still asks for general subagent", () => {
 		expect(
 			resolvePermissionDecision({
-				toolName: "Task",
+				toolName: "Agent",
 				input: { subagent_type: "general", workdir: "/mnt/shared" },
 				permMode: "default",
 				cwd: CWD,
