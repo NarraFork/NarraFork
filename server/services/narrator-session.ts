@@ -3939,7 +3939,8 @@ async function doRunCustomCompact(
 /**
  * Run a segment compact: compress a user-selected set of messages into a
  * single inline summary. Unlike full compact, this does NOT affect the
- * narrator's contextSummary — the summary lives inline in the message stream.
+ * narrator's contextSummary — the summary lives inline in the message stream
+ * as a role="user" message so buildHistory includes it in the AI's context.
  */
 export async function runSegmentCompact(
 	narratorId: string,

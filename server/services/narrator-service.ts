@@ -3866,13 +3866,13 @@ export const narratorService = {
 				);
 
 			// Insert the marker message
-			// Use role="system" so it is excluded from API history sent to the AI
-			// (buildAnthropicHistory / buildOAIHistory only include user+assistant).
-			// The summary lives inline in the message stream for the UI only.
+			// Use role="user" so buildHistory includes the summary in the AI's
+			// conversation context. The contentText carries the summary text which
+			// providers pick up as a normal user message.
 			await tx.insert(narratorMessages).values({
 				id,
 				narratorId,
-				role: "system",
+				role: "user",
 				contentJson: [
 					{
 						type: "segment_compact",
@@ -3985,7 +3985,7 @@ export const narratorService = {
 				.update(narratorMessages)
 				.set({
 					contentJson: [block],
-					contentText: `${prefix} ${summary.slice(0, 200)}...`,
+					contentText: `${prefix}\n${summary}`,
 					contextPercent: contextPercent ?? null,
 				})
 				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
@@ -4156,7 +4156,7 @@ export const narratorService = {
 				.update(narratorMessages)
 				.set({
 					contentJson: [newBlock],
-					contentText: `[Segment Compact] ${summary.slice(0, 200)}...`,
+					contentText: `[Segment Compact]\n${summary}`,
 				})
 				.where(eq(narratorMessages.id, messageId));
 

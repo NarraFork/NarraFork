@@ -1056,11 +1056,11 @@ function SegmentCompactIndicator({
 					{hiddenMessages.length > 0 && (
 						<Stack gap={6}>
 							{hiddenMessages.map((msg) => {
-							const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-							const textParts = blocks
-								.filter((b) => b.type === "text")
-								.map((b) => b.text ?? "")
-								.join("\n\n");
+								const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+								const textParts = blocks
+									.filter((b) => b.type === "text")
+									.map((b) => b.text ?? "")
+									.join("\n\n");
 								if (!textParts) return null;
 								return (
 									<Box
@@ -1770,64 +1770,64 @@ export const MessageBubble = memo(function MessageBubble({
 		return <ReviewFeedbackCard block={reviewFeedbackBlock} />;
 	}
 
-	// System messages (compact indicators / plan cards / segment compact / error notices)
-	if (message.role === "system") {
-		// Segment compact indicators
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const segmentCompactBlock = blocks.find((b: any) => b.type === "segment_compact");
-		if (segmentCompactBlock) {
-			const isSegCompacting = segmentCompactBlock.status === "compacting";
-			const isFailed = segmentCompactBlock.status === "failed";
-			if (isFailed) {
-				return (
-					<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
-						<Group gap={6} wrap="nowrap" align="flex-start">
-							<IconAlertTriangle
-								size={16}
-								style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
-							/>
-							<Stack gap={2} style={{ flex: 1 }}>
-								<Text size="xs" fw={600} c="red.8">
-									{t("segmentCompactFailed")}
-								</Text>
-								<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
-									{segmentCompactBlock.error ??
-										segmentCompactBlock.summary ??
-										t("segmentCompactFailedDesc")}
-								</Text>
-							</Stack>
-							{narratorId && message.id && (
-								<Button
-									size="compact-xs"
-									variant="subtle"
-									color="dimmed"
-									style={{ flexShrink: 0 }}
-									onClick={() => {
-										api.deleteSegmentCompact(narratorId, message.id!).then(
-											() => invalidateMessages(),
-											() => {},
-										);
-									}}
-								>
-									{t("dismiss")}
-								</Button>
-							)}
-						</Group>
-					</Paper>
-				);
-			}
-			const canNavigate = !isSegCompacting && narratorId && message.id;
+	// Segment compact indicators — rendered for both role="user" (new) and role="system" (legacy)
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const segmentCompactBlock = blocks.find((b: any) => b.type === "segment_compact");
+	if (segmentCompactBlock) {
+		const isSegCompacting = segmentCompactBlock.status === "compacting";
+		const isFailed = segmentCompactBlock.status === "failed";
+		if (isFailed) {
 			return (
-				<SegmentCompactIndicator
-					isCompacting={isSegCompacting}
-					narratorId={canNavigate ? narratorId : undefined}
-					messageId={canNavigate ? message.id : undefined}
-					messageCount={segmentCompactBlock.messageCount}
-					onDelete={canNavigate ? invalidateMessages : undefined}
-				/>
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
+					<Group gap={6} wrap="nowrap" align="flex-start">
+						<IconAlertTriangle
+							size={16}
+							style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
+						/>
+						<Stack gap={2} style={{ flex: 1 }}>
+							<Text size="xs" fw={600} c="red.8">
+								{t("segmentCompactFailed")}
+							</Text>
+							<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
+								{segmentCompactBlock.error ??
+									segmentCompactBlock.summary ??
+									t("segmentCompactFailedDesc")}
+							</Text>
+						</Stack>
+						{narratorId && message.id && (
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								color="dimmed"
+								style={{ flexShrink: 0 }}
+								onClick={() => {
+									api.deleteSegmentCompact(narratorId, message.id!).then(
+										() => invalidateMessages(),
+										() => {},
+									);
+								}}
+							>
+								{t("dismiss")}
+							</Button>
+						)}
+					</Group>
+				</Paper>
 			);
 		}
+		const canNavigate = !isSegCompacting && narratorId && message.id;
+		return (
+			<SegmentCompactIndicator
+				isCompacting={isSegCompacting}
+				narratorId={canNavigate ? narratorId : undefined}
+				messageId={canNavigate ? message.id : undefined}
+				messageCount={segmentCompactBlock.messageCount}
+				onDelete={canNavigate ? invalidateMessages : undefined}
+			/>
+		);
+	}
 
+	// System messages (compact indicators / plan cards / error notices)
+	if (message.role === "system") {
 		// Regular compact indicators / plan cards
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
