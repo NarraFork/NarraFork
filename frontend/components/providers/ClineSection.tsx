@@ -2,23 +2,18 @@ import {
 	ActionIcon,
 	Badge,
 	Button,
-	Collapse,
 	Group,
 	NumberInput,
-	Paper,
 	ScrollArea,
 	Stack,
 	Text,
 	Textarea,
 	TextInput,
-	Title,
 	Tooltip,
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
-	IconChevronDown,
-	IconChevronRight,
 	IconEye,
 	IconEyeOff,
 	IconLink,
@@ -62,7 +57,6 @@ export const ClineSection = React.memo(function ClineSection({
 }: ClineSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const [expanded, setExpanded] = useState(false);
 	const [refreshing, setRefreshing] = useState(false);
 	const [callbackUrl, setCallbackUrl] = useState("");
 	const [poolSearch, setPoolSearch] = useState("");
@@ -101,7 +95,7 @@ export const ClineSection = React.memo(function ClineSection({
 	const { data: poolData } = useQuery({
 		queryKey: ["cline", "pool", "search", debouncedSearch],
 		queryFn: () => api.clinePoolSearch(debouncedSearch, 100),
-		enabled: expanded && debouncedSearch.length >= 2,
+		enabled: debouncedSearch.length >= 2,
 		staleTime: 60_000,
 	});
 
@@ -109,7 +103,6 @@ export const ClineSection = React.memo(function ClineSection({
 	const { data: poolCountData } = useQuery({
 		queryKey: ["cline", "pool", "count"],
 		queryFn: api.clinePoolCount,
-		enabled: expanded,
 		staleTime: 60_000,
 	});
 
@@ -222,388 +215,332 @@ export const ClineSection = React.memo(function ClineSection({
 	const poolCount = poolCountData?.count ?? 0;
 
 	return (
-		<Paper withBorder p="md">
-			<Stack>
-				<Group
-					justify="space-between"
-					style={{ cursor: "pointer" }}
-					onClick={() => setExpanded((v) => !v)}
-				>
-					<Group gap="xs">
-						{expanded ? <IconChevronDown size={16} /> : <IconChevronRight size={16} />}
-						<div>
-							<Title order={4}>{t("clineSection")}</Title>
-							<Text size="xs" c="dimmed">
-								{t("clineSectionDesc")}
-							</Text>
-						</div>
-						{isAuthenticated && (
-							<Badge size="sm" variant="light" color="green">
-								{t("clineAuthenticated")}
-							</Badge>
+		<Stack gap="md">
+			{/* Auth status and actions */}
+			<Group gap="sm">
+				{isAuthenticated ? (
+					<>
+						<Text size="sm">{t("clineLoggedInAs", { email: clineStatus?.email ?? "" })}</Text>
+						{balanceData && (
+							<Group gap={4}>
+								<Badge size="sm" variant="light" color="teal">
+									{t("clineBalance", {
+										balance: (balanceData.balance / 1_000_000).toFixed(2),
+									})}
+								</Badge>
+								<ActionIcon
+									size="sm"
+									variant="subtle"
+									loading={balanceFetching}
+									onClick={() => refetchBalance()}
+								>
+									<IconRefresh size={14} />
+								</ActionIcon>
+							</Group>
 						)}
-						{!isAuthenticated && (
-							<Badge size="sm" variant="light" color="gray">
-								{t("clineNotAuthenticated")}
-							</Badge>
-						)}
-						{enabledModels.length > 0 && (
-							<Badge size="xs" variant="light">
-								{t("clineEnabledModelsCount", { count: enabledModels.length })}
-							</Badge>
-						)}
+						<Button
+							size="xs"
+							variant="light"
+							color="red"
+							leftSection={<IconLogout size={14} />}
+							onClick={() => logoutMutation.mutate()}
+							loading={logoutMutation.isPending}
+						>
+							{t("clineLogout")}
+						</Button>
+					</>
+				) : (
+					<Button
+						size="xs"
+						variant="light"
+						leftSection={<IconLogin size={14} />}
+						onClick={() => loginMutation.mutate()}
+						loading={loginMutation.isPending || isPending}
+					>
+						{isPending ? t("clineLoginLoading") : t("clineLogin")}
+					</Button>
+				)}
+			</Group>
+
+			{/* Paste callback URL (for remote deployments) */}
+			{!isAuthenticated && (
+				<Stack gap={4}>
+					<Text size="xs" c="dimmed">
+						{t("clineCallbackUrlDesc")}
+					</Text>
+					<Group gap="xs" align="flex-end">
+						<Textarea
+							placeholder={t("clineCallbackUrlPlaceholder")}
+							value={callbackUrl}
+							onChange={(e) => setCallbackUrl(e.currentTarget.value)}
+							style={{ flex: 1 }}
+							size="xs"
+							minRows={2}
+							maxRows={4}
+							autosize
+						/>
+						<Button
+							size="xs"
+							variant="light"
+							leftSection={<IconLink size={14} />}
+							onClick={() => importCallbackMutation.mutate(callbackUrl)}
+							loading={importCallbackMutation.isPending}
+							disabled={!callbackUrl.trim()}
+						>
+							{importCallbackMutation.isPending
+								? t("clineCallbackImporting")
+								: t("clineCallbackImport")}
+						</Button>
 					</Group>
-				</Group>
+				</Stack>
+			)}
 
-				<Collapse in={expanded}>
-					<Stack gap="md" mt="xs">
-						{/* Auth status and actions */}
-						<Group gap="sm">
-							{isAuthenticated ? (
-								<>
-									<Text size="sm">{t("clineLoggedInAs", { email: clineStatus?.email ?? "" })}</Text>
-									{balanceData && (
-										<Group gap={4}>
-											<Badge size="sm" variant="light" color="teal">
-												{t("clineBalance", {
-													balance: (balanceData.balance / 1_000_000).toFixed(2),
-												})}
-											</Badge>
-											<ActionIcon
-												size="sm"
-												variant="subtle"
-												loading={balanceFetching}
-												onClick={() => refetchBalance()}
-											>
-												<IconRefresh size={14} />
-											</ActionIcon>
-										</Group>
-									)}
-									<Button
-										size="xs"
-										variant="light"
-										color="red"
-										leftSection={<IconLogout size={14} />}
-										onClick={() => logoutMutation.mutate()}
-										loading={logoutMutation.isPending}
-									>
-										{t("clineLogout")}
-									</Button>
-								</>
-							) : (
-								<Button
-									size="xs"
-									variant="light"
-									leftSection={<IconLogin size={14} />}
-									onClick={() => loginMutation.mutate()}
-									loading={loginMutation.isPending || isPending}
-								>
-									{isPending ? t("clineLoginLoading") : t("clineLogin")}
-								</Button>
-							)}
-						</Group>
-
-						{/* Paste callback URL (for remote deployments) */}
-						{!isAuthenticated && (
-							<Stack gap={4}>
-								<Text size="xs" c="dimmed">
-									{t("clineCallbackUrlDesc")}
-								</Text>
-								<Group gap="xs" align="flex-end">
-									<Textarea
-										placeholder={t("clineCallbackUrlPlaceholder")}
-										value={callbackUrl}
-										onChange={(e) => setCallbackUrl(e.currentTarget.value)}
-										style={{ flex: 1 }}
-										size="xs"
-										minRows={2}
-										maxRows={4}
-										autosize
-									/>
-									<Button
-										size="xs"
-										variant="light"
-										leftSection={<IconLink size={14} />}
-										onClick={() => importCallbackMutation.mutate(callbackUrl)}
-										loading={importCallbackMutation.isPending}
-										disabled={!callbackUrl.trim()}
-									>
-										{importCallbackMutation.isPending
-											? t("clineCallbackImporting")
-											: t("clineCallbackImport")}
-									</Button>
-								</Group>
-							</Stack>
-						)}
-
-						{/* Recommended & Free models — with quick-add buttons */}
-						{recommendedData &&
-							(recommendedData.recommended.length > 0 || recommendedData.free.length > 0) && (
-								<Stack gap="xs">
-									{recommendedData.free.length > 0 && (
-										<>
-											<Group gap={4}>
-												<IconStarFilled size={14} color="var(--mantine-color-green-6)" />
-												<Text size="xs" fw={600}>
-													{t("clineFreeModels")}
-												</Text>
-											</Group>
-											{recommendedData.free.map((m) => (
-												<Group key={m.id} gap="xs" pl="md">
-													<Badge size="xs" color="green" variant="light">
-														FREE
-													</Badge>
-													<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
-														{m.id}
-													</Text>
-													{!enabledSet.has(m.id) ? (
-														<Button
-															size="compact-xs"
-															variant="subtle"
-															onClick={() => addModel(m.id)}
-														>
-															{t("clineAddRecommended")}
-														</Button>
-													) : (
-														<Badge size="xs" variant="light" color="blue">
-															{t("clineModelAdded")}
-														</Badge>
-													)}
-												</Group>
-											))}
-										</>
-									)}
-									{recommendedData.recommended.length > 0 && (
-										<>
-											<Group gap={4}>
-												<IconStar size={14} color="var(--mantine-color-yellow-6)" />
-												<Text size="xs" fw={600}>
-													{t("clineRecommendedModels")}
-												</Text>
-											</Group>
-											{recommendedData.recommended.map((m) => (
-												<Group key={m.id} gap="xs" pl="md">
-													{m.tags.map((tag) => (
-														<Badge key={tag} size="xs" variant="light">
-															{tag}
-														</Badge>
-													))}
-													<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
-														{m.id}
-													</Text>
-													{!enabledSet.has(m.id) ? (
-														<Button
-															size="compact-xs"
-															variant="subtle"
-															onClick={() => addModel(m.id)}
-														>
-															{t("clineAddRecommended")}
-														</Button>
-													) : (
-														<Badge size="xs" variant="light" color="blue">
-															{t("clineModelAdded")}
-														</Badge>
-													)}
-												</Group>
-											))}
-										</>
-									)}
-								</Stack>
-							)}
-
-						{/* Model pool: refresh + search */}
-						<Stack gap="xs">
-							<Group gap="xs">
-								<Text size="sm" fw={600}>
-									{t("clineModelPool")}
-								</Text>
-								<Button
-									size="compact-xs"
-									variant="light"
-									leftSection={<IconRefresh size={12} />}
-									loading={refreshing}
-									onClick={handleRefreshModels}
-								>
-									{refreshing ? t("clineRefreshModelsLoading") : t("clineRefreshModels")}
-								</Button>
-								{poolCount > 0 && (
-									<Text size="xs" c="dimmed">
-										{t("clineModelPoolCount", { count: poolCount })}
+			{/* Recommended & Free models — with quick-add buttons */}
+			{recommendedData &&
+				(recommendedData.recommended.length > 0 || recommendedData.free.length > 0) && (
+					<Stack gap="xs">
+						{recommendedData.free.length > 0 && (
+							<>
+								<Group gap={4}>
+									<IconStarFilled size={14} color="var(--mantine-color-green-6)" />
+									<Text size="xs" fw={600}>
+										{t("clineFreeModels")}
 									</Text>
-								)}
-							</Group>
-							<Text size="xs" c="dimmed">
-								{t("clineModelPoolDesc")}
-							</Text>
-							<TextInput
-								placeholder={t("clineModelPoolSearch")}
-								leftSection={<IconSearch size={14} />}
-								value={poolSearch}
-								onChange={(e) => setPoolSearch(e.currentTarget.value)}
-								size="xs"
-							/>
-							{poolSearch.length >= 2 && poolData && (
-								<ScrollArea.Autosize mah={240}>
-									<Stack gap={2}>
-										{poolData.models.length === 0 && (
-											<Text size="xs" c="dimmed" ta="center" py="xs">
-												{t("clineModelPoolNoResults")}
-											</Text>
+								</Group>
+								{recommendedData.free.map((m) => (
+									<Group key={m.id} gap="xs" pl="md">
+										<Badge size="xs" color="green" variant="light">
+											FREE
+										</Badge>
+										<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
+											{m.id}
+										</Text>
+										{!enabledSet.has(m.id) ? (
+											<Button size="compact-xs" variant="subtle" onClick={() => addModel(m.id)}>
+												{t("clineAddRecommended")}
+											</Button>
+										) : (
+											<Badge size="xs" variant="light" color="blue">
+												{t("clineModelAdded")}
+											</Badge>
 										)}
-										{poolData.models.map((m) => {
-											const isEnabled = enabledSet.has(m.id);
-											return (
-												<Group
-													key={m.id}
-													gap="xs"
-													py={2}
-													px="xs"
-													style={{
-														borderRadius: 4,
-														background: isEnabled ? "var(--mantine-color-dark-6)" : undefined,
-													}}
-												>
-													<Text
-														size="xs"
-														style={{
-															fontFamily: "monospace",
-															flex: 1,
-															minWidth: 0,
-														}}
-														truncate
-													>
-														{m.id}
-													</Text>
-													{m.name && m.name !== m.id && (
-														<Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 0 }} truncate>
-															{m.name}
-														</Text>
-													)}
-													{m.contextLength && (
-														<Text size="xs" c="dimmed">
-															{Math.round(m.contextLength / 1000)}k
-														</Text>
-													)}
-													<ActionIcon
-														size="xs"
-														variant={isEnabled ? "filled" : "light"}
-														color={isEnabled ? "red" : "blue"}
-														onClick={() => (isEnabled ? removeModel(m.id) : addModel(m.id))}
-													>
-														{isEnabled ? <IconMinus size={12} /> : <IconPlus size={12} />}
-													</ActionIcon>
-												</Group>
-											);
-										})}
-										{poolData.total > poolData.models.length && (
-											<Text size="xs" c="dimmed" ta="center" py="xs">
-												+{poolData.total - poolData.models.length} more
-											</Text>
+									</Group>
+								))}
+							</>
+						)}
+						{recommendedData.recommended.length > 0 && (
+							<>
+								<Group gap={4}>
+									<IconStar size={14} color="var(--mantine-color-yellow-6)" />
+									<Text size="xs" fw={600}>
+										{t("clineRecommendedModels")}
+									</Text>
+								</Group>
+								{recommendedData.recommended.map((m) => (
+									<Group key={m.id} gap="xs" pl="md">
+										{m.tags.map((tag) => (
+											<Badge key={tag} size="xs" variant="light">
+												{tag}
+											</Badge>
+										))}
+										<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
+											{m.id}
+										</Text>
+										{!enabledSet.has(m.id) ? (
+											<Button size="compact-xs" variant="subtle" onClick={() => addModel(m.id)}>
+												{t("clineAddRecommended")}
+											</Button>
+										) : (
+											<Badge size="xs" variant="light" color="blue">
+												{t("clineModelAdded")}
+											</Badge>
 										)}
-									</Stack>
-								</ScrollArea.Autosize>
-							)}
-							{poolSearch.length < 2 && poolCount === 0 && (
-								<Text size="xs" c="dimmed">
-									{t("clineModelPoolEmpty")}
-								</Text>
-							)}
-						</Stack>
+									</Group>
+								))}
+							</>
+						)}
+					</Stack>
+				)}
 
-						{/* Enabled models list */}
-						<Stack gap="xs">
-							<Group gap="xs">
-								<Text size="sm" fw={600}>
-									{t("clineEnabledModels")}
-								</Text>
-								{enabledModels.length > 0 && (
-									<Badge size="xs" variant="light">
-										{t("clineEnabledModelsCount", {
-											count: enabledModels.length,
-										})}
-									</Badge>
-								)}
-							</Group>
-							{enabledModelsMeta.length === 0 && (
-								<Text size="xs" c="dimmed">
-									{t("clineEnabledModelsEmpty")}
+			{/* Model pool: refresh + search */}
+			<Stack gap="xs">
+				<Group gap="xs">
+					<Text size="sm" fw={600}>
+						{t("clineModelPool")}
+					</Text>
+					<Button
+						size="compact-xs"
+						variant="light"
+						leftSection={<IconRefresh size={12} />}
+						loading={refreshing}
+						onClick={handleRefreshModels}
+					>
+						{refreshing ? t("clineRefreshModelsLoading") : t("clineRefreshModels")}
+					</Button>
+					{poolCount > 0 && (
+						<Text size="xs" c="dimmed">
+							{t("clineModelPoolCount", { count: poolCount })}
+						</Text>
+					)}
+				</Group>
+				<Text size="xs" c="dimmed">
+					{t("clineModelPoolDesc")}
+				</Text>
+				<TextInput
+					placeholder={t("clineModelPoolSearch")}
+					leftSection={<IconSearch size={14} />}
+					value={poolSearch}
+					onChange={(e) => setPoolSearch(e.currentTarget.value)}
+					size="xs"
+				/>
+				{poolSearch.length >= 2 && poolData && (
+					<ScrollArea.Autosize mah={240}>
+						<Stack gap={2}>
+							{poolData.models.length === 0 && (
+								<Text size="xs" c="dimmed" ta="center" py="xs">
+									{t("clineModelPoolNoResults")}
 								</Text>
 							)}
-							{enabledModelsMeta.map((m) => {
-								const prefixed = `${firstPrefix}:${m.id}`;
-								const isHidden = hiddenModels.has(prefixed);
+							{poolData.models.map((m) => {
+								const isEnabled = enabledSet.has(m.id);
 								return (
 									<Group
 										key={m.id}
 										gap="xs"
-										wrap="wrap"
-										style={isHidden ? { opacity: 0.5 } : undefined}
+										py={2}
+										px="xs"
+										style={{
+											borderRadius: 4,
+											background: isEnabled ? "var(--mantine-color-dark-6)" : undefined,
+										}}
 									>
 										<Text
 											size="xs"
 											style={{
 												fontFamily: "monospace",
 												flex: 1,
-												minWidth: 120,
+												minWidth: 0,
 											}}
 											truncate
 										>
-											{prefixed}
+											{m.id}
 										</Text>
 										{m.name && m.name !== m.id && (
-											<Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 80 }} truncate>
+											<Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 0 }} truncate>
 												{m.name}
 											</Text>
 										)}
-										<NumberInput
-											placeholder={t("contextWindowPlaceholder")}
-											value={modelContextWindows[prefixed] || ""}
-											onChange={(v) =>
-												onContextWindowChange(prefixed, typeof v === "number" ? v : null)
-											}
-											min={1}
-											step={1000}
-											suffix={` ${t("contextWindowSuffix")}`}
-											w={180}
-											size="xs"
-										/>
-										<Tooltip label={t("modelTestBtn")}>
-											<ActionIcon
-												variant="subtle"
-												color="teal"
-												onClick={() => onTestModel?.(prefixed)}
-											>
-												<IconPlayerPlay size={16} />
-											</ActionIcon>
-										</Tooltip>
+										{m.contextLength && (
+											<Text size="xs" c="dimmed">
+												{Math.round(m.contextLength / 1000)}k
+											</Text>
+										)}
 										<ActionIcon
-											variant="subtle"
-											color={isHidden ? "gray" : "blue"}
-											onClick={() => onToggleHidden(prefixed)}
+											size="xs"
+											variant={isEnabled ? "filled" : "light"}
+											color={isEnabled ? "red" : "blue"}
+											onClick={() => (isEnabled ? removeModel(m.id) : addModel(m.id))}
 										>
-											{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-										</ActionIcon>
-										<ActionIcon variant="subtle" color="red" onClick={() => removeModel(m.id)}>
-											<IconMinus size={16} />
+											{isEnabled ? <IconMinus size={12} /> : <IconPlus size={12} />}
 										</ActionIcon>
 									</Group>
 								);
 							})}
+							{poolData.total > poolData.models.length && (
+								<Text size="xs" c="dimmed" ta="center" py="xs">
+									+{poolData.total - poolData.models.length} more
+								</Text>
+							)}
 						</Stack>
-
-						<InlineCustomModels
-							prefix={firstPrefix}
-							customModels={customModels}
-							onCustomModelsChange={onCustomModelsChange}
-							hiddenModels={hiddenModels}
-							onToggleHidden={onToggleHidden}
-							modelContextWindows={modelContextWindows}
-							onContextWindowChange={onContextWindowChange}
-							onTestModel={onTestModel}
-						/>
-					</Stack>
-				</Collapse>
+					</ScrollArea.Autosize>
+				)}
+				{poolSearch.length < 2 && poolCount === 0 && (
+					<Text size="xs" c="dimmed">
+						{t("clineModelPoolEmpty")}
+					</Text>
+				)}
 			</Stack>
-		</Paper>
+
+			{/* Enabled models list */}
+			<Stack gap="xs">
+				<Group gap="xs">
+					<Text size="sm" fw={600}>
+						{t("clineEnabledModels")}
+					</Text>
+					{enabledModels.length > 0 && (
+						<Badge size="xs" variant="light">
+							{t("clineEnabledModelsCount", {
+								count: enabledModels.length,
+							})}
+						</Badge>
+					)}
+				</Group>
+				{enabledModelsMeta.length === 0 && (
+					<Text size="xs" c="dimmed">
+						{t("clineEnabledModelsEmpty")}
+					</Text>
+				)}
+				{enabledModelsMeta.map((m) => {
+					const prefixed = `${firstPrefix}:${m.id}`;
+					const isHidden = hiddenModels.has(prefixed);
+					return (
+						<Group key={m.id} gap="xs" wrap="wrap" style={isHidden ? { opacity: 0.5 } : undefined}>
+							<Text
+								size="xs"
+								style={{
+									fontFamily: "monospace",
+									flex: 1,
+									minWidth: 120,
+								}}
+								truncate
+							>
+								{prefixed}
+							</Text>
+							{m.name && m.name !== m.id && (
+								<Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 80 }} truncate>
+									{m.name}
+								</Text>
+							)}
+							<NumberInput
+								placeholder={t("contextWindowPlaceholder")}
+								value={modelContextWindows[prefixed] || ""}
+								onChange={(v) => onContextWindowChange(prefixed, typeof v === "number" ? v : null)}
+								min={1}
+								step={1000}
+								suffix={` ${t("contextWindowSuffix")}`}
+								w={180}
+								size="xs"
+							/>
+							<Tooltip label={t("modelTestBtn")}>
+								<ActionIcon variant="subtle" color="teal" onClick={() => onTestModel?.(prefixed)}>
+									<IconPlayerPlay size={16} />
+								</ActionIcon>
+							</Tooltip>
+							<ActionIcon
+								variant="subtle"
+								color={isHidden ? "gray" : "blue"}
+								onClick={() => onToggleHidden(prefixed)}
+							>
+								{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+							</ActionIcon>
+							<ActionIcon variant="subtle" color="red" onClick={() => removeModel(m.id)}>
+								<IconMinus size={16} />
+							</ActionIcon>
+						</Group>
+					);
+				})}
+			</Stack>
+
+			<InlineCustomModels
+				prefix={firstPrefix}
+				customModels={customModels}
+				onCustomModelsChange={onCustomModelsChange}
+				hiddenModels={hiddenModels}
+				onToggleHidden={onToggleHidden}
+				modelContextWindows={modelContextWindows}
+				onContextWindowChange={onContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		</Stack>
 	);
 });

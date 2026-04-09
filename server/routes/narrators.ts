@@ -54,6 +54,7 @@ import {
 } from "../lib/prompt-i18n";
 import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploads";
 import {
+	askInPassingSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -1165,6 +1166,40 @@ narratorRoutes.post("/:id/fork", async (c) => {
 		title: parsed.data.title,
 		inheritMode: parsed.data.inheritMode ?? "full",
 	});
+	return c.json(newNarrator, 201);
+});
+
+// Ask in passing: fork narrator from a message and immediately send a question
+narratorRoutes.post("/:id/ask-in-passing", async (c) => {
+	const id = c.req.param("id");
+	const userId = c.get("user").sub;
+	const body = await c.req.json();
+	const parsed = askInPassingSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { forkMessageUuid, forkMessageId, question } = parsed.data;
+	if (!forkMessageUuid && !forkMessageId) {
+		throw new ValidationError("Either forkMessageUuid or forkMessageId is required");
+	}
+
+	// Fork narrator from the specified message (standalone, full context)
+	// forkNarrator supports both messageUuid and direct messageId lookup
+	const newNarrator = await narratorService.forkNarrator(id, forkMessageUuid ?? null, {
+		inheritMode: "full",
+		forkMessageId,
+	});
+
+	// Override permission mode to "default" (auto-approve read-only, manual for others)
+	await db
+		.update(narrators)
+		.set({ permissionMode: "default" })
+		.where(eq(narrators.id, newNarrator.id));
+
+	// Send the user's question to the new narrator
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	await sendMessage(newNarrator.id, question, [], locale, replyInUserLanguage, userId);
+
 	return c.json(newNarrator, 201);
 });
 

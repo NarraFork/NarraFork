@@ -209,6 +209,8 @@ const updateSettingsSchema = z
 					})
 					.optional(),
 				defaultSystemPrompt: z.string().max(50000).optional(),
+				providerOrder: z.array(z.string()).max(50).optional(),
+				disabledProviders: z.array(z.string()).max(20).optional(),
 			})
 			.partial()
 			.optional(),

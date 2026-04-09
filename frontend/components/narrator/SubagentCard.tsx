@@ -18,6 +18,7 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconEye,
+	IconMessageQuestion,
 	IconRobot,
 	IconTrash,
 } from "@tabler/icons-react";
@@ -315,7 +316,11 @@ export const SubagentCard = memo(
 
 		// --- Swipe / context-menu for SubagentCard itself ---
 		const parentMsgCtx = useMessageContextMenu();
-		const hasCardActions = !!(parentMsgCtx.onDeleteBlock || parentMsgCtx.onCompactBeforeMessage);
+		const hasCardActions = !!(
+			parentMsgCtx.onDeleteBlock ||
+			parentMsgCtx.onCompactBeforeMessage ||
+			parentMsgCtx.onAskInPassing
+		);
 
 		const swipe = useSwipeMenu({
 			enabled: hasCardActions,
@@ -382,6 +387,17 @@ export const SubagentCard = memo(
 				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
 					{t("viewSubagentSession")}
 				</Menu.Item>
+				{parentMsgCtx.onAskInPassing && (
+					<Menu.Item
+						leftSection={<IconMessageQuestion size={14} />}
+						onClick={() => {
+							parentMsgCtx.onAskInPassing?.();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_askInPassing")}
+					</Menu.Item>
+				)}
 				{parentMsgCtx.onCompactBeforeMessage && (
 					<Menu.Item
 						leftSection={<IconArrowsMinimize size={14} />}

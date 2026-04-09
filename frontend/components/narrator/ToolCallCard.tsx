@@ -32,6 +32,7 @@ import {
 	IconListCheck,
 	IconLoader2,
 	IconMap,
+	IconMessageQuestion,
 	IconPencil,
 	IconPlayerPlay,
 	IconPlayerStop,
@@ -3087,6 +3088,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const hasActions = !!(
 		readFilePath ||
 		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
 		msgCtx.onCompactBeforeMessage ||
 		(msgCtx.onDeleteBlock && blockIndex != null)
 	);
@@ -3142,6 +3144,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			)}
 			{readFilePath &&
 				(msgCtx.onForkFromMessage ||
+					msgCtx.onAskInPassing ||
 					msgCtx.onCompactBeforeMessage ||
 					(msgCtx.onDeleteBlock && blockIndex != null)) && <Menu.Divider />}
 			{msgCtx.onForkFromMessage && (
@@ -3153,6 +3156,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 					}}
 				>
 					{tNarrator("contextMenu_fork")}
+				</Menu.Item>
+			)}
+			{msgCtx.onAskInPassing && (
+				<Menu.Item
+					leftSection={<IconMessageQuestion size={14} />}
+					onClick={() => {
+						msgCtx.onAskInPassing?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_askInPassing")}
 				</Menu.Item>
 			)}
 			{msgCtx.onCompactBeforeMessage && (

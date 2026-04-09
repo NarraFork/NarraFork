@@ -986,6 +986,14 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ forkMessageUuid, title, inheritMode }),
 		}),
+	askInPassing: (
+		narratorId: string,
+		opts: { forkMessageUuid?: string; forkMessageId?: string; question: string },
+	) =>
+		request<ApiEntity>(`/narrators/${narratorId}/ask-in-passing`, {
+			method: "POST",
+			body: JSON.stringify(opts),
+		}),
 	forkFromMessages: (narratorId: string, messageIds: string[], title?: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork-messages`, {
 			method: "POST",

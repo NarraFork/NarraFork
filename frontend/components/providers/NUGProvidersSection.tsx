@@ -2,7 +2,7 @@ import {
 	ActionIcon,
 	Badge,
 	Button,
-	Collapse,
+	Divider,
 	Group,
 	Modal,
 	NumberInput,
@@ -17,18 +17,14 @@ import {
 	Table,
 	Text,
 	TextInput,
-	Title,
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
-	IconChevronDown,
-	IconChevronRight,
 	IconEye,
 	IconEyeOff,
 	IconLogin,
 	IconPlayerPlay,
-	IconPlus,
 	IconRefresh,
 	IconTrash,
 	IconUser,
@@ -536,26 +532,8 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 }: NUGProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const [sectionExpanded, setSectionExpanded] = useState(false);
-	const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 	const [loginModalProvider, setLoginModalProvider] = useState<string | null>(null);
-
-	const handleAddProvider = useCallback(() => {
-		const id = Math.random().toString(36).slice(2, 10);
-		onProvidersChange((prev) => [
-			...prev,
-			{
-				id,
-				name: "NUG",
-				prefix: "nug",
-				apiKey: "",
-				baseUrl: "",
-				defaultModel: "",
-			},
-		]);
-		setExpandedProviders((prev) => new Set(prev).add(id));
-	}, [onProvidersChange]);
 
 	const handleRemoveProvider = useCallback(
 		(id: string) => {
@@ -570,15 +548,6 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 		},
 		[onProvidersChange],
 	);
-
-	const toggleProviderExpanded = useCallback((id: string) => {
-		setExpandedProviders((prev) => {
-			const next = new Set(prev);
-			if (next.has(id)) next.delete(id);
-			else next.add(id);
-			return next;
-		});
-	}, []);
 
 	const toggleProviderDisabled = useCallback(
 		(id: string) => {
@@ -629,264 +598,206 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 		: null;
 
 	return (
-		<Paper withBorder p="md">
-			<Stack>
-				<Group
-					justify="space-between"
-					style={{ cursor: "pointer" }}
-					onClick={() => setSectionExpanded((v) => !v)}
-				>
-					<Group gap="xs">
-						{sectionExpanded ? <IconChevronDown size={20} /> : <IconChevronRight size={20} />}
-						<div>
-							<Title order={4}>{t("nugProvidersSection")}</Title>
-							<Text size="xs" c="dimmed">
-								{t("nugProvidersSectionDesc")}
-							</Text>
-						</div>
-					</Group>
-				</Group>
-				<Collapse in={sectionExpanded}>
-					<Group justify="flex-end" mb="xs">
-						<Button
-							size="xs"
-							variant="light"
-							leftSection={<IconPlus size={14} />}
-							onClick={() => handleAddProvider()}
-						>
-							{t("nugAddProvider")}
-						</Button>
-					</Group>
-					<Stack>
-						{providers.map((p, idx) => {
-							const isExpanded = expandedProviders.has(p.id);
-							const pModels = providerModelsMap[p.id] ?? [];
-							const providerModelCount = pModels.length;
-							return (
-								<Paper
-									key={p.id}
-									withBorder
-									p="sm"
-									style={p.disabled ? { opacity: 0.6 } : undefined}
+		<Stack>
+			<Text size="xs" c="dimmed">
+				{t("nugProvidersSectionDesc")}
+			</Text>
+
+			{providers.map((p, idx) => {
+				const pModels = providerModelsMap[p.id] ?? [];
+				const providerModelCount = pModels.length;
+				return (
+					<React.Fragment key={p.id}>
+						{idx > 0 && <Divider />}
+						<Stack gap="xs" style={p.disabled ? { opacity: 0.6 } : undefined}>
+							{/* Provider header */}
+							<Group justify="space-between">
+								<Group gap="xs">
+									<Text fw={500} size="sm">
+										{p.name || `NUG #${idx + 1}`}
+									</Text>
+									{p.disabled && (
+										<Badge size="xs" variant="light" color="gray">
+											{t("providerDisabled")}
+										</Badge>
+									)}
+									{!p.disabled && providerModelCount > 0 && (
+										<Badge size="xs" variant="light">
+										</Badge>
+									)}
+									{p.nugUsername && (
+										<Badge size="xs" variant="light" color="teal">
+											{p.nugUsername}
+										</Badge>
+									)}
+								</Group>
+								<Group gap="xs">
+									<Switch
+										size="xs"
+										checked={!p.disabled}
+										onChange={() => toggleProviderDisabled(p.id)}
+									/>
+									<ActionIcon
+										color="red"
+										variant="subtle"
+										size="sm"
+										onClick={() => handleRemoveProvider(p.id)}
+									>
+										<IconTrash size={14} />
+									</ActionIcon>
+								</Group>
+							</Group>
+
+							{/* Connection settings */}
+							<TextInput
+								size="xs"
+								label={t("nugProviderName")}
+								placeholder="NUG"
+								value={p.name}
+								onChange={(e) => updateProvider(p.id, { name: e.currentTarget.value })}
+							/>
+							<TextInput
+								size="xs"
+								label={t("nugProviderPrefix")}
+								description={t("nugProviderPrefixDesc")}
+								placeholder="nug"
+								value={p.prefix}
+								error={getPrefixError?.(p.prefix, p.id)}
+								onChange={(e) =>
+									updateProvider(p.id, {
+										prefix: e.currentTarget.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""),
+									})
+								}
+							/>
+							<TextInput
+								size="xs"
+								label={t("nugBaseUrl")}
+								placeholder="http://localhost:7800"
+								value={p.baseUrl}
+								onChange={(e) => updateProvider(p.id, { baseUrl: e.currentTarget.value })}
+							/>
+							<Group gap="xs" align="flex-end">
+								<PasswordInput
+									size="xs"
+									label={t("nugApiKey")}
+									placeholder={t("nugApiKeyPlaceholder")}
+									value={p.apiKey}
+									onChange={(e) => updateProvider(p.id, { apiKey: e.currentTarget.value })}
+									style={{ flex: 1 }}
+								/>
+								<Tooltip label={t("nugLoginTooltip")}>
+									<Button
+										size="xs"
+										variant="light"
+										leftSection={<IconLogin size={14} />}
+										disabled={!p.baseUrl}
+										onClick={() => setLoginModalProvider(p.id)}
+									>
+										{t("nugLoginBtn")}
+									</Button>
+								</Tooltip>
+							</Group>
+
+							{/* Account info */}
+							{p.apiKey && p.baseUrl && (
+								<NUGAccountInfo providerId={p.id} nugUsername={p.nugUsername} />
+							)}
+
+							{/* Channel health */}
+							{p.apiKey && p.baseUrl && !p.disabled && <NUGChannelHealth providerId={p.id} />}
+
+							{/* Usage panel */}
+							{p.apiKey && p.baseUrl && !p.disabled && <NUGUsagePanel providerId={p.id} />}
+
+							{/* Models */}
+							<Group gap="xs">
+								<Button
+									size="xs"
+									variant="light"
+									leftSection={<IconRefresh size={14} />}
+									loading={refreshingProvider === p.id}
+									disabled={!p.apiKey || !p.baseUrl}
+									onClick={() => handleRefreshModels(p.id)}
 								>
-									<Stack gap="xs">
-										<Group
-											justify="space-between"
-											style={{ cursor: "pointer" }}
-											onClick={() => toggleProviderExpanded(p.id)}
-										>
-											<Group gap="xs">
-												{isExpanded ? (
-													<IconChevronDown size={16} />
-												) : (
-													<IconChevronRight size={16} />
-												)}
-												<Text fw={500} size="sm">
-													{p.name || `NUG #${idx + 1}`}
-												</Text>
-												{p.disabled && (
-													<Badge size="xs" variant="light" color="gray">
-														{t("providerDisabled")}
-													</Badge>
-												)}
-												{!p.disabled && providerModelCount > 0 && (
-													<Badge size="xs" variant="light">
-													</Badge>
-												)}
-												{p.nugUsername && (
-													<Badge size="xs" variant="light" color="teal">
-														{p.nugUsername}
-													</Badge>
-												)}
-											</Group>
-											<Group gap="xs">
-												<Switch
+									{refreshingProvider === p.id
+										? t("nugRefreshModelsLoading")
+										: t("nugRefreshModels")}
+								</Button>
+								{providerModelCount > 0 && (
+									<Text size="xs" c="dimmed">
+									</Text>
+								)}
+							</Group>
+							{pModels.length > 0 && (
+								<Stack gap="xs">
+									{pModels.map((m) => {
+										const isHidden = hiddenModels.has(m.value);
+										return (
+											<Group
+												key={m.value}
+												gap="xs"
+												wrap="wrap"
+												style={isHidden ? { opacity: 0.5 } : undefined}
+											>
+												<TextInput
 													size="xs"
-													checked={!p.disabled}
-													onChange={(e) => {
-														e.stopPropagation();
-														toggleProviderDisabled(p.id);
-													}}
-													onClick={(e) => e.stopPropagation()}
+													value={m.value}
+													disabled
+													style={{ flex: 1, minWidth: 120 }}
 												/>
+												<TextInput
+													size="xs"
+													value={m.label}
+													disabled
+													style={{ flex: 1, minWidth: 120 }}
+												/>
+												<NumberInput
+													size="xs"
+													placeholder={t("contextWindowPlaceholder")}
+													value={modelContextWindows[m.value] || ""}
+													onChange={(v) =>
+														onContextWindowChange(m.value, typeof v === "number" ? v : null)
+													}
+													min={1}
+													step={1000}
+													suffix={` ${t("contextWindowSuffix")}`}
+													w={180}
+												/>
+												<Tooltip label={t("modelTestBtn")}>
+													<ActionIcon
+														variant="subtle"
+														color="teal"
+														onClick={() => onTestModel?.(m.value)}
+													>
+														<IconPlayerPlay size={16} />
+													</ActionIcon>
+												</Tooltip>
 												<ActionIcon
-													color="red"
 													variant="subtle"
-													size="sm"
-													onClick={(e) => {
-														e.stopPropagation();
-														handleRemoveProvider(p.id);
-													}}
+													color={isHidden ? "gray" : "blue"}
+													onClick={() => onToggleHidden(m.value)}
 												>
-													<IconTrash size={14} />
+													{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
 												</ActionIcon>
 											</Group>
-										</Group>
-										<Collapse in={isExpanded}>
-											<Stack gap="xs" mt="xs">
-												{/* Connection settings */}
-												<TextInput
-													label={t("nugProviderName")}
-													placeholder="NUG"
-													value={p.name}
-													onChange={(e) => updateProvider(p.id, { name: e.currentTarget.value })}
-												/>
-												<TextInput
-													label={t("nugProviderPrefix")}
-													description={t("nugProviderPrefixDesc")}
-													placeholder="nug"
-													value={p.prefix}
-													error={getPrefixError?.(p.prefix, p.id)}
-													onChange={(e) =>
-														updateProvider(p.id, {
-															prefix: e.currentTarget.value
-																.toLowerCase()
-																.replace(/[^a-z0-9_-]/g, ""),
-														})
-													}
-												/>
-												<TextInput
-													label={t("nugBaseUrl")}
-													placeholder="http://localhost:7800"
-													value={p.baseUrl}
-													onChange={(e) => updateProvider(p.id, { baseUrl: e.currentTarget.value })}
-												/>
-												<Group gap="xs" align="flex-end">
-													<PasswordInput
-														label={t("nugApiKey")}
-														placeholder={t("nugApiKeyPlaceholder")}
-														value={p.apiKey}
-														onChange={(e) =>
-															updateProvider(p.id, { apiKey: e.currentTarget.value })
-														}
-														style={{ flex: 1 }}
-													/>
-													<Tooltip label={t("nugLoginTooltip")}>
-														<Button
-															size="sm"
-															variant="light"
-															leftSection={<IconLogin size={14} />}
-															disabled={!p.baseUrl}
-															onClick={(e) => {
-																e.stopPropagation();
-																setLoginModalProvider(p.id);
-															}}
-														>
-															{t("nugLoginBtn")}
-														</Button>
-													</Tooltip>
-												</Group>
-
-												{/* Account info */}
-												{p.apiKey && p.baseUrl && (
-													<NUGAccountInfo providerId={p.id} nugUsername={p.nugUsername} />
-												)}
-
-												{/* Channel health */}
-												{p.apiKey && p.baseUrl && !p.disabled && (
-													<NUGChannelHealth providerId={p.id} />
-												)}
-
-												{/* Usage panel */}
-												{p.apiKey && p.baseUrl && !p.disabled && (
-													<NUGUsagePanel providerId={p.id} />
-												)}
-
-												{/* Models */}
-												<Group gap="xs">
-													<Button
-														size="xs"
-														variant="light"
-														leftSection={<IconRefresh size={14} />}
-														loading={refreshingProvider === p.id}
-														disabled={!p.apiKey || !p.baseUrl}
-														onClick={() => handleRefreshModels(p.id)}
-													>
-														{refreshingProvider === p.id
-															? t("nugRefreshModelsLoading")
-															: t("nugRefreshModels")}
-													</Button>
-													{providerModelCount > 0 && (
-														<Text size="xs" c="dimmed">
-														</Text>
-													)}
-												</Group>
-												{pModels.length > 0 && (
-													<Stack gap="xs" mt="xs">
-														{pModels.map((m) => {
-															const isHidden = hiddenModels.has(m.value);
-															return (
-																<Group
-																	key={m.value}
-																	gap="xs"
-																	wrap="wrap"
-																	style={isHidden ? { opacity: 0.5 } : undefined}
-																>
-																	<TextInput
-																		value={m.value}
-																		disabled
-																		style={{ flex: 1, minWidth: 120 }}
-																	/>
-																	<TextInput
-																		value={m.label}
-																		disabled
-																		style={{ flex: 1, minWidth: 120 }}
-																	/>
-																	<NumberInput
-																		placeholder={t("contextWindowPlaceholder")}
-																		value={modelContextWindows[m.value] || ""}
-																		onChange={(v) =>
-																			onContextWindowChange(
-																				m.value,
-																				typeof v === "number" ? v : null,
-																			)
-																		}
-																		min={1}
-																		step={1000}
-																		suffix={` ${t("contextWindowSuffix")}`}
-																		w={180}
-																		size="xs"
-																	/>
-																	<Tooltip label={t("modelTestBtn")}>
-																		<ActionIcon
-																			variant="subtle"
-																			color="teal"
-																			onClick={() => onTestModel?.(m.value)}
-																		>
-																			<IconPlayerPlay size={16} />
-																		</ActionIcon>
-																	</Tooltip>
-																	<ActionIcon
-																		variant="subtle"
-																		color={isHidden ? "gray" : "blue"}
-																		onClick={() => onToggleHidden(m.value)}
-																	>
-																		{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-																	</ActionIcon>
-																</Group>
-															);
-														})}
-													</Stack>
-												)}
-												<InlineCustomModels
-													prefix={p.prefix || "nug"}
-													customModels={customModels}
-													onCustomModelsChange={onCustomModelsChange}
-													hiddenModels={hiddenModels}
-													onToggleHidden={onToggleHidden}
-													modelContextWindows={modelContextWindows}
-													onContextWindowChange={onContextWindowChange}
-													onTestModel={onTestModel}
-												/>
-											</Stack>
-										</Collapse>
-									</Stack>
-								</Paper>
-							);
-						})}
-					</Stack>
-				</Collapse>
-			</Stack>
+										);
+									})}
+								</Stack>
+							)}
+							<InlineCustomModels
+								prefix={p.prefix || "nug"}
+								customModels={customModels}
+								onCustomModelsChange={onCustomModelsChange}
+								hiddenModels={hiddenModels}
+								onToggleHidden={onToggleHidden}
+								modelContextWindows={modelContextWindows}
+								onContextWindowChange={onContextWindowChange}
+								onTestModel={onTestModel}
+							/>
+						</Stack>
+					</React.Fragment>
+				);
+			})}
 
 			{/* Login modal */}
 			{loginProvider && (
@@ -900,6 +811,6 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 					}
 				/>
 			)}
-		</Paper>
+		</Stack>
 	);
 });

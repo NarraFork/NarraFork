@@ -24,6 +24,12 @@ export interface ExecuteLoopResult {
 	retryableError?: string;
 	/** Set when smart interruption check detected the output was cut off. */
 	interrupted?: boolean;
+	/**
+	 * When true, the interrupted turn should be resumed by replaying the
+	 * trailing tool-result request packet instead of sending a textual
+	 * "continue" prompt.
+	 */
+	shouldReplayInterruptedToolResultTurn?: boolean;
 }
 
 /**
@@ -43,6 +49,9 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let retryableError: string | undefined;
 	let lastToolNames: string[] = [];
 	let interrupted = false;
+	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
+	let sawAssistantMessage = false;
+	let lastAssistantHadToolUses = false;
 
 	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
 		// When aborted, still process tool_result and error events so:
@@ -77,8 +86,10 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 		if (config.signal.aborted) break;
 
 		if (event.type === "assistant_message") {
+			sawAssistantMessage = true;
 			finalText = event.text || "";
 			lastToolNames = event.toolUses.map((tu) => tu.name);
+			lastAssistantHadToolUses = event.toolUses.length > 0;
 		}
 		if (event.type === "context_length_exceeded") {
 			contextLengthExceeded = true;
@@ -132,6 +143,8 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 		contextLengthExceeded,
 		retryableError,
 		interrupted,
+		shouldReplayInterruptedToolResultTurn:
+			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),
 	};
 }
 

@@ -3399,6 +3399,8 @@ export const narratorService = {
 			newChapterId?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
 			locale?: string;
+			/** Direct message ID lookup (for messages without messageUuid, e.g. user messages) */
+			forkMessageId?: string;
 		},
 	) {
 		const parent = await this.getById(parentNarratorId);
@@ -3455,17 +3457,24 @@ export const narratorService = {
 		}> = [];
 		let resolvedForkMessageId: string | null = null;
 
-		if (forkMessageUuid && inheritMode !== "fresh") {
-			// Resolve messageUuid → message ID → narrator ref
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.messageUuid, forkMessageUuid),
-			});
-			if (!msg) throw new ValidationError("Fork message not found");
+		const directMessageId = opts?.forkMessageId;
+		if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
+			// Resolve to message ID: either via messageUuid or direct messageId
+			let msgId: string;
+			if (forkMessageUuid) {
+				const msg = await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.messageUuid, forkMessageUuid),
+				});
+				if (!msg) throw new ValidationError("Fork message not found");
+				msgId = msg.id;
+			} else {
+				msgId = directMessageId!;
+			}
 
 			const forkRef = await db.query.narratorMessageRefs.findFirst({
 				where: and(
 					eq(narratorMessageRefs.narratorId, parentNarratorId),
-					eq(narratorMessageRefs.messageId, msg.id),
+					eq(narratorMessageRefs.messageId, msgId),
 				),
 			});
 			if (!forkRef) throw new ValidationError("Fork message not found in parent narrator's refs");

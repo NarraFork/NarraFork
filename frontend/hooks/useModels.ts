@@ -27,6 +27,8 @@ export function useAllModels() {
 
 	return useMemo(() => {
 		const hidden = new Set<string>(settingsData?.agent?.hiddenModels ?? []);
+		const providerOrder: string[] = settingsData?.agent?.providerOrder ?? [];
+		const disabledProviders = new Set<string>(settingsData?.agent?.disabledProviders ?? []);
 
 					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					.map((m: any) => {
@@ -197,13 +199,59 @@ export function useAllModels() {
 			: [];
 
 		// --- Merge & filter ---
-		const allModels = mergeModels(
-			fetchedOpenaiModels,
-			fetchedAnthropicModels,
-			fetchedClineModels,
-			codexModels,
-			customModels,
-		);
+		// Build per-provider model arrays, then sort by providerOrder
+		const providerModelArrays: { prefix: string; models: ModelOption[] }[] = [];
+		const addGroup = (prefix: string, models: ModelOption[]) => {
+			if (models.length === 0) return;
+			providerModelArrays.push({ prefix, models });
+		};
+
+			addGroup(
+				prefix,
+			);
+		}
+		// OpenAI models by prefix
+		const openaiPrefixes = new Set(fetchedOpenaiModels.map((m) => m.provider ?? "openai"));
+		for (const prefix of openaiPrefixes) {
+			addGroup(
+				prefix,
+				fetchedOpenaiModels.filter((m) => (m.provider ?? "openai") === prefix),
+			);
+		}
+		// Anthropic models by prefix
+		const anthropicPrefixes = new Set(fetchedAnthropicModels.map((m) => m.provider ?? "anthropic"));
+		for (const prefix of anthropicPrefixes) {
+			addGroup(
+				prefix,
+				fetchedAnthropicModels.filter((m) => (m.provider ?? "anthropic") === prefix),
+			);
+		}
+		// Cline models by prefix
+		const clinePrefixes = new Set(fetchedClineModels.map((m) => m.provider ?? "cline"));
+		for (const prefix of clinePrefixes) {
+			addGroup(
+				prefix,
+				fetchedClineModels.filter((m) => (m.provider ?? "cline") === prefix),
+			);
+		}
+		if (codexModels.length > 0) addGroup("codex", codexModels);
+		if (customModels.length > 0) addGroup("__custom__", customModels);
+
+		// Sort by providerOrder (providers not in the list go to the end)
+		if (providerOrder.length > 0) {
+			const orderMap = new Map(providerOrder.map((p, i) => [p, i]));
+			providerModelArrays.sort((a, b) => {
+				const ai = orderMap.get(a.prefix) ?? 9999;
+				const bi = orderMap.get(b.prefix) ?? 9999;
+				return ai - bi;
+			});
+		}
+
+		// Filter out disabled providers and merge
+		const enabledModelArrays = providerModelArrays
+			.filter((g) => !disabledProviders.has(g.prefix))
+			.map((g) => g.models);
+		const allModels = mergeModels(...enabledModelArrays);
 		const visibleModels = allModels.filter((m) => !hidden.has(m.value));
 
 		// --- "Follow default" option ---
@@ -223,7 +271,7 @@ export function useAllModels() {
 		});
 
 		return {
-			/** All models (including hidden). */
+			/** All models (including hidden) — disabled providers filtered out. */
 			allModels,
 			/** Models after hiddenModels filter. */
 			visibleModels,
@@ -251,6 +299,10 @@ export function useAllModels() {
 			providerLabels,
 			/** Raw settings data (for other fields). */
 			settingsData,
+			/** Per-provider model groups BEFORE disabled filtering (for overview). */
+			allProviderModels: providerModelArrays,
+			/** Set of disabled provider prefixes (for overview). */
+			disabledProviders,
 		};
 	}, [settingsData]);
 }

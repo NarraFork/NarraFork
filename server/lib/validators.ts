@@ -472,6 +472,12 @@ export const forkNarratorSchema = z.object({
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 });
 
+export const askInPassingSchema = z.object({
+	forkMessageUuid: z.string().min(1).optional(),
+	forkMessageId: z.string().min(1).optional(),
+	question: z.string().min(1).max(10000),
+});
+
 export const updateNarratorModelSchema = z.object({
 	model: z.union([
 		z.literal("__default__"),

@@ -4,6 +4,7 @@ export interface MessageContextMenuActions {
 	/** The message ID this context belongs to (used by multi-select to map blockId → messageId). */
 	messageId?: string;
 	onForkFromMessage?: () => void;
+	onAskInPassing?: () => void;
 	onCompactBeforeMessage?: () => void;
 	onDeleteBlock?: (blockIndex: number) => void;
 	onRegenerateFromMessage?: () => void;

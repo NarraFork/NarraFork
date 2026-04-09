@@ -2436,6 +2436,35 @@ function appendTodosContext(text: string, todosJson: unknown): string {
 	return `${text}\n\n<current_todos>\n${lines.join("\n")}\n</current_todos>`;
 }
 
+interface ContinuableTopLevelMessage {
+	role: string;
+	parentToolUseId?: string | null;
+	contentJson?: unknown;
+	toolCalls?: Array<{ toolUseId?: string | null; toolName?: string | null }>;
+}
+
+function getLastContinuableTopLevelMessage<T extends ContinuableTopLevelMessage>(
+	messages: T[],
+): T | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.parentToolUseId) continue;
+		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		return msg;
+	}
+	return undefined;
+}
+
+function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefined): boolean {
+	if (!msg || msg.role !== "assistant") return false;
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	if (blocks.some((block: { type?: string }) => block?.type === "tool_use")) return true;
+	return (
+		Array.isArray(msg.toolCalls) &&
+		msg.toolCalls.some((tc) => Boolean(tc?.toolUseId) && Boolean(tc?.toolName))
+	);
+}
+
 // === Shared context management hooks ===
 
 export interface ContextManagementOptions {
@@ -3184,8 +3213,12 @@ async function runAgentLoop(
 
 			// Run one agent loop pass
 
-			// Inject pending todos into the user message so the model always has context
-			const effectiveText = appendTodosContext(currentText, freshNarrator.todosJson);
+			// When replaying a pure tool-result turn, preserve the original packet shape:
+			// no synthetic user text, no auto-added todos wrapper.
+			const isPureToolResultReplay = !currentText.trim() && trailingToolResults.length > 0;
+			const effectiveText = isPureToolResultReplay
+				? ""
+				: appendTodosContext(currentText, freshNarrator.todosJson);
 
 			const result = await executeAgentLoop({
 				config,
@@ -3311,7 +3344,10 @@ async function runAgentLoop(
 				shouldUpdateTitle = true;
 			}
 
-			// Smart interruption check — auto-continue if output was truncated
+			// Smart interruption check — auto-continue if output was truncated.
+			// When the last completed assistant turn was a tool-call turn, we must
+			// replay the tool-result request packet instead of appending a textual
+			// "continue" user message.
 			if (result.interrupted && active.alive) {
 				interruptionRetries++;
 				if (interruptionRetries > MAX_INTERRUPTION_RETRIES) {
@@ -3319,6 +3355,14 @@ async function runAgentLoop(
 						narratorId,
 						retries: interruptionRetries,
 					});
+				} else if (result.shouldReplayInterruptedToolResultTurn) {
+					logger.info("Smart interruption check: replaying interrupted tool-result turn", {
+						narratorId,
+						retries: interruptionRetries,
+					});
+					currentText = "";
+					currentImages = undefined;
+					continue;
 				} else {
 					const continueText = getToolMessage("interruptionContinue", locale);
 					const userMsg = await narratorService.persistUserMessage(narratorId, continueText, [
@@ -4395,8 +4439,9 @@ export async function retryLastMessage(
 /**
  * Continue the agent loop.
  *
- * If the last assistant message contains pending tool_use blocks, resumes
- * the loop directly (buildHistory produces trailingToolResults).
+ * If the last top-level message is a tool-call assistant turn, resumes by
+ * reconstructing the tool-result upload packet (buildHistory produces
+ * trailingToolResults).
  *
  * Otherwise (e.g. the assistant's text reply was truncated), sends a
  * locale-aware "please continue" user message via feedMessage so the
@@ -4407,14 +4452,13 @@ export async function continueNarrator(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ ok: boolean }> {
-	// Check whether the last assistant message has trailing tool_use blocks.
+	// If the last top-level message is a tool-call assistant turn, replay the
+	// tool-result request packet instead of appending a textual "continue".
 	const msgs = await narratorService.getMessagesSinceLastCompact(narratorId);
-	const lastAssistant = msgs.findLast((m) => m.role === "assistant");
-	const blocks = Array.isArray(lastAssistant?.contentJson) ? lastAssistant!.contentJson : [];
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const hasTrailingToolUse = blocks.some((b: any) => b.type === "tool_use");
+	const lastTopLevelMessage = getLastContinuableTopLevelMessage(msgs);
+	const shouldReplayToolResults = shouldReplayToolResultPacket(lastTopLevelMessage);
 
-	if (!hasTrailingToolUse) {
+	if (!shouldReplayToolResults) {
 		// No pending tool calls — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
 		const { userMsg } = await feedMessage(
@@ -4435,8 +4479,8 @@ export async function continueNarrator(
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
-	// Pass empty text — buildHistory will detect trailing tool_use blocks
-	// and produce trailingToolResults for the agent loop to continue.
+	// Pass empty text — buildHistory will reconstruct the trailing tool-result
+	// packet so the provider sees the same follow-up turn again.
 	runAgentLoop(active, "", undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
 		await narratorService.updateStatus(narratorId, "error", String(err));

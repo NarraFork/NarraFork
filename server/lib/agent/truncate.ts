@@ -48,28 +48,25 @@ export function truncateOutput(
 		return { content: text, truncated: false };
 	}
 
-	// Take lines from the head until we hit either limit.
+	// Take lines from the tail (most recent output is usually most relevant).
 	const kept: string[] = [];
 	let bytes = 0;
 	let hitBytes = false;
 
-	for (let i = 0; i < lines.length && i < maxLines; i++) {
-		const lineBytes = Buffer.byteLength(lines[i], "utf-8") + (i > 0 ? 1 : 0); // +1 for \n
+	for (let i = lines.length - 1; i >= 0 && kept.length < maxLines; i--) {
+		const lineBytes = Buffer.byteLength(lines[i], "utf-8") + (kept.length > 0 ? 1 : 0); // +1 for \n
 		if (bytes + lineBytes > maxBytes) {
-			// If we haven't kept any lines yet, the first line alone exceeds the byte
+			// If we haven't kept any lines yet, the last line alone exceeds the byte
 			// limit (e.g. minified files). Truncate it at the character level so the
 			// LLM still sees *something* instead of an empty preview.
 			if (kept.length === 0) {
 				const line = lines[i];
-				// Binary-search-ish: walk chars until we approach maxBytes.
-				// Using simple slice is fine — overcount from multi-byte chars just
-				// means we keep slightly less, which is acceptable.
 				let cutLen = Math.min(line.length, maxBytes);
-				while (cutLen > 0 && Buffer.byteLength(line.slice(0, cutLen), "utf-8") > maxBytes) {
+				while (cutLen > 0 && Buffer.byteLength(line.slice(-cutLen), "utf-8") > maxBytes) {
 					cutLen = Math.floor(cutLen * 0.9);
 				}
 				if (cutLen > 0) {
-					kept.push(`${line.slice(0, cutLen)}…[line truncated, ${line.length} chars total]`);
+					kept.push(`[line truncated, ${line.length} chars total]…${line.slice(-cutLen)}`);
 					bytes = Buffer.byteLength(kept[0], "utf-8");
 				}
 			}
@@ -80,6 +77,9 @@ export function truncateOutput(
 		bytes += lineBytes;
 	}
 
+	// Reverse to restore original order (we collected from the tail).
+	kept.reverse();
+
 	// Persist full output to disk.
 	const outputPath = persistOutput(text);
 
@@ -88,12 +88,12 @@ export function truncateOutput(
 	const preview = kept.join("\n");
 
 	const hint =
-		`⚠️ OUTPUT TRUNCATED — only ${kept.length} of ${lines.length} lines shown. Full output saved to: ${outputPath}\n` +
+		`⚠️ OUTPUT TRUNCATED — only the last ${kept.length} of ${lines.length} lines shown (earlier output omitted). Full output saved to: ${outputPath}\n` +
 		"⚠️ You MUST use Read (path: the file above) to retrieve the full content before proceeding. " +
 		"Do NOT re-run the command or pipe to a file — the output is already saved. " +
 		"Use Read with offset/limit for paging, or limit=-1 to read the entire file (up to ~100k chars), or Grep to search it.";
 
-	const content = `${preview}\n\n...${omitted} ${unit} truncated...\n\n${hint}`;
+	const content = `...${omitted} ${unit} truncated...\n\n${preview}\n\n${hint}`;
 
 	return { content, truncated: true, outputPath };
 }

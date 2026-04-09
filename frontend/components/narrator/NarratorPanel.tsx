@@ -80,6 +80,7 @@ import {
 	DEFAULT_MESSAGES_AROUND_BEFORE,
 	getNarratorMessagesQueryKey,
 	useArchiveNarrator,
+	useAskInPassing,
 	useBlacklistDirs,
 	useCmdBlacklist,
 	useCmdWhitelist,
@@ -927,6 +928,67 @@ function SortableQueuedMessageItem({
 	);
 }
 
+// --- Ask in passing inline input ---
+function AskInPassingInlineInput({
+	inputRef,
+	loading,
+	onSubmit,
+	onCancel,
+}: {
+	inputRef: React.RefObject<HTMLInputElement | null>;
+	loading: boolean;
+	onSubmit: (question: string) => void;
+	onCancel: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [value, setValue] = useState("");
+	return (
+		<Box
+			px="md"
+			py="xs"
+			style={{
+				borderRadius: "var(--mantine-radius-md)",
+				border: "1px dashed var(--mantine-color-indigo-7)",
+				backgroundColor: "var(--mantine-color-dark-7)",
+			}}
+		>
+			<Group gap="xs" wrap="nowrap">
+				<TextInput
+					ref={inputRef}
+					flex={1}
+					size="sm"
+					placeholder={t("askInPassing_placeholder")}
+					value={value}
+					onChange={(e) => setValue(e.currentTarget.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" && !e.shiftKey && value.trim()) {
+							e.preventDefault();
+							onSubmit(value.trim());
+						}
+						if (e.key === "Escape") {
+							e.preventDefault();
+							onCancel();
+						}
+					}}
+					disabled={loading}
+				/>
+				<Button
+					size="sm"
+					variant="filled"
+					onClick={() => value.trim() && onSubmit(value.trim())}
+					loading={loading}
+					disabled={!value.trim()}
+				>
+					{t("askInPassing_confirm")}
+				</Button>
+				<Button size="sm" variant="subtle" onClick={onCancel} disabled={loading}>
+					{t("askInPassing_cancel")}
+				</Button>
+			</Group>
+		</Box>
+	);
+}
+
 export function NarratorPanel({
 	narratorId,
 	narrator: narratorProp,
@@ -958,6 +1020,14 @@ export function NarratorPanel({
 	const chapterStatus = (chapterData as any)?.status as string | undefined;
 	const isChapterMerged = chapterStatus === "merged";
 	const forkNarratorMutation = useForkNarrator();
+	const askInPassingMutation = useAskInPassing();
+
+	// "Ask in passing" inline input state
+	const [askInPassingTarget, setAskInPassingTarget] = useState<{
+		messageUuid: string | null;
+		messageId: string;
+	} | null>(null);
+
 	const aroundOptions = useMemo(
 		() =>
 			highlightMessageId
@@ -1873,6 +1943,11 @@ export function NarratorPanel({
 	// Standalone: use handleStandaloneFork (direct narrator fork)
 	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleStandaloneFork;
 
+	// --- Ask in passing handler ---
+	const handleAskInPassing = useCallback((messageUuid: string | null, messageId: string) => {
+		setAskInPassingTarget({ messageUuid, messageId });
+	}, []);
+
 	// --- Virtualization setup ---
 	const highlightScrolledRef = useRef(false);
 	const highlightStartTimerRef = useRef<number | null>(null);
@@ -2433,6 +2508,7 @@ export function NarratorPanel({
 					onViewSubagentSession,
 					sm,
 					resolvePermForRender,
+					handleAskInPassing,
 				);
 
 			const collectResults = (
@@ -2565,6 +2641,7 @@ export function NarratorPanel({
 		onViewSubagentSession,
 		streamingMsg,
 		resolvePermForRender,
+		handleAskInPassing,
 	]);
 
 	// All streaming content is now handled by segmentMessages via streamingMsg.
@@ -2596,17 +2673,90 @@ export function NarratorPanel({
 		[showManualLoadOlder, flatTargets],
 	);
 
+	// --- Ask in passing: inject inline input after the target message ---
+	const askInPassingInputRef = useRef<HTMLInputElement>(null);
+	const {
+		elements: elementsWithAskInput,
+		keys: keysWithAskInput,
+		targets: targetsWithAskInput,
+	} = useMemo(() => {
+		if (!askInPassingTarget) {
+			return { elements: finalElements, keys: finalKeys, targets: finalTargets };
+		}
+		const targetMsgId = askInPassingTarget.messageId;
+		// Find the index of the element that contains the target message
+		let insertIdx = -1;
+		for (let i = 0; i < finalTargets.length; i++) {
+			if (finalTargets[i]?.includes(targetMsgId)) {
+				insertIdx = i;
+				break;
+			}
+		}
+		if (insertIdx === -1) {
+			return { elements: finalElements, keys: finalKeys, targets: finalTargets };
+		}
+		const inputEl = (
+			<AskInPassingInlineInput
+				key="__ask-in-passing__"
+				inputRef={askInPassingInputRef}
+				loading={askInPassingMutation.isPending}
+				onSubmit={(question) => {
+					askInPassingMutation.mutate(
+						{
+							narratorId,
+							forkMessageUuid: askInPassingTarget.messageUuid || undefined,
+							forkMessageId: askInPassingTarget.messageId,
+							question,
+						},
+						{
+							onSuccess: (newNarrator: { id: string }) => {
+								setAskInPassingTarget(null);
+								navigate({
+									to: "/narrators/$narratorId",
+									params: { narratorId: newNarrator.id },
+								});
+							},
+						},
+					);
+				}}
+				onCancel={() => setAskInPassingTarget(null)}
+			/>
+		);
+		const newElements = [...finalElements];
+		newElements.splice(insertIdx + 1, 0, inputEl);
+		const newKeys = [...finalKeys];
+		newKeys.splice(insertIdx + 1, 0, "__ask-in-passing__");
+		const newTargets = [...finalTargets];
+		newTargets.splice(insertIdx + 1, 0, []);
+		return { elements: newElements, keys: newKeys, targets: newTargets };
+	}, [
+		askInPassingTarget,
+		askInPassingMutation,
+		finalElements,
+		finalKeys,
+		finalTargets,
+		narratorId,
+		navigate,
+	]);
+
+	// Auto-focus the ask-in-passing input when it appears
+	useEffect(() => {
+		if (askInPassingTarget && askInPassingInputRef.current) {
+			askInPassingInputRef.current.focus();
+		}
+	}, [askInPassingTarget]);
+
 	const targetIndexMap = useMemo(() => {
 		const indexMap = new Map<string, number>();
-		for (let i = 0; i < finalTargets.length; i++) {
-			for (const targetId of finalTargets[i] ?? []) {
+		for (let i = 0; i < targetsWithAskInput.length; i++) {
+			for (const targetId of targetsWithAskInput[i] ?? []) {
 				if (targetId && !indexMap.has(targetId)) {
 					indexMap.set(targetId, i);
 				}
 			}
 		}
 		return indexMap;
-	}, [finalTargets]);
+	}, [targetsWithAskInput]);
 
 	// --- User message markers for scrollbar minimap ---
 	const userMessageMarkers = useMemo(() => {
@@ -3914,8 +4064,8 @@ export function NarratorPanel({
 											>
 												<BroadMessageList
 													ref={virtualListRef}
-													elements={finalElements}
-													elementKeys={finalKeys}
+													elements={elementsWithAskInput}
+													elementKeys={keysWithAskInput}
 													scrollRef={viewportCallbackRef}
 													contentRef={contentRef}
 													shift={shifting}
@@ -3924,8 +4074,8 @@ export function NarratorPanel({
 										) : (
 											<BroadMessageList
 												ref={virtualListRef}
-												elements={finalElements}
-												elementKeys={finalKeys}
+												elements={elementsWithAskInput}
+												elementKeys={keysWithAskInput}
 												scrollRef={viewportCallbackRef}
 												contentRef={contentRef}
 												shift={shifting}
@@ -3936,7 +4086,7 @@ export function NarratorPanel({
 							</MessageSelectionCtx.Provider>
 							<ScrollbarUserMarkers
 								markers={userMessageMarkers}
-								totalCount={finalElements.length}
+								totalCount={elementsWithAskInput.length}
 								onJump={handleMarkerJump}
 								scrollContainerRef={viewportRef}
 							/>

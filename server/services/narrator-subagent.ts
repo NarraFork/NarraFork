@@ -1038,7 +1038,11 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	const allowedPool = settings.agent.subagentAllowedModels?.[poolKey] ?? [];
 	let resolvedModelInput: string | undefined;
 	if (allowedPool.length > 0) {
-		const poolSet = new Set(allowedPool);
+		// Resolve sentinel values in the pool (e.g. "__default__" or bare "default")
+		// to the actual default model so they can match real candidate model IDs.
+		const poolSet = new Set(
+			allowedPool.map((m) => resolveEffectiveModel(m === "default" ? null : m)),
+		);
 		const parent = await narratorService.getById(parentNarratorId);
 		// Resolve __default__ sentinel to the actual default model so it can match the pool.
 		const parentModel = parent.model ? resolveEffectiveModel(parent.model) : undefined;
@@ -1052,7 +1056,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		if (!resolvedModelInput) {
 			throw new ValidationError(
 				`No candidate model is in the allowed pool for "${poolKey}" subagents. ` +
-					`Allowed models: ${allowedPool.join(", ")}. ` +
+					`Allowed models: ${[...poolSet].join(", ")}. ` +
 					`Please specify one of these models explicitly.`,
 			);
 		}

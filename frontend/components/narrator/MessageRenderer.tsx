@@ -24,6 +24,7 @@ export interface RenderToolRunOptions {
 	highlightedId?: string | null;
 	editExpandOverride?: boolean | null;
 	onForkFromMessage?: (uuid: string) => void;
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
@@ -53,6 +54,7 @@ export function renderToolRun(
 		highlightedId,
 		editExpandOverride,
 		onForkFromMessage,
+		onAskInPassing,
 		onCompactBeforeMessage,
 		onDeleteBlock,
 		onViewSubagentSession,
@@ -84,6 +86,9 @@ export function renderToolRun(
 		const msgId = item.msg.id;
 		if (msgUuid && onForkFromMessage) {
 			ctxActions.onForkFromMessage = () => onForkFromMessage(msgUuid);
+		}
+		if (msgId && onAskInPassing) {
+			ctxActions.onAskInPassing = () => onAskInPassing(msgUuid ?? null, msgId);
 		}
 		if (msgId && onCompactBeforeMessage) {
 			ctxActions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
@@ -198,6 +203,7 @@ export function renderTreeMessages(
 	onViewSubagentSession?: (narratorId: string) => void,
 	streamingMsg?: NarratorMsg | null,
 	resolvePerm?: (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>,
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void,
 ): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[]; segments: RenderSegment[] } {
 	const segments = segmentMessages(messages, {
 		pruneBoundaryMessageId,
@@ -248,6 +254,7 @@ export function renderTreeMessages(
 					narratorId={narratorId}
 					message={displayMsg}
 					onForkFromMessage={onForkFromMessage}
+					onAskInPassing={onAskInPassing}
 					resolvePerm={
 						resolvePerm ??
 						((tc) =>
@@ -343,6 +350,7 @@ export function renderTreeMessages(
 			highlightedId,
 			editExpandOverride,
 			onForkFromMessage,
+			onAskInPassing,
 			onCompactBeforeMessage,
 			onDeleteBlock,
 			onViewSubagentSession,

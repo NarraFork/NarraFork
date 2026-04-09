@@ -1747,7 +1747,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		ctx.emitOutput = (output: string) => {
 			latestOutput =
 				output.length > MAX_STREAM_OUTPUT_LENGTH
-					? `${output.slice(0, MAX_STREAM_OUTPUT_LENGTH)}\n\n...`
+					? `...\n\n${output.slice(-MAX_STREAM_OUTPUT_LENGTH)}`
 					: output;
 
 			const elapsed = Date.now() - lastEmitTime;

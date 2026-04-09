@@ -10,6 +10,7 @@ import {
 	IconExternalLink,
 	IconGitFork,
 	IconMarkdown,
+	IconMessageQuestion,
 	IconRefresh,
 	IconTextWrap,
 	IconTextWrapDisabled,
@@ -600,6 +601,7 @@ export const ContentViewer = memo(
 											{t("copy")}
 										</Menu.Item>
 										{(msgCtx.onForkFromMessage ||
+											msgCtx.onAskInPassing ||
 											msgCtx.onCompactBeforeMessage ||
 											msgCtx.onDeleteBlock ||
 											msgCtx.onRegenerateFromMessage ||
@@ -647,6 +649,17 @@ export const ContentViewer = memo(
 												}}
 											>
 												{tNarrator("contextMenu_fork")}
+											</Menu.Item>
+										)}
+										{msgCtx.onAskInPassing && (
+											<Menu.Item
+												leftSection={<IconMessageQuestion size={14} />}
+												onClick={() => {
+													msgCtx.onAskInPassing?.();
+													swipe.closeSwipe();
+												}}
+											>
+												{tNarrator("contextMenu_askInPassing")}
 											</Menu.Item>
 										)}
 										{msgCtx.onCompactBeforeMessage && (
@@ -818,6 +831,7 @@ export const ContentViewer = memo(
 							{t("copy")}
 						</Menu.Item>
 						{(msgCtx.onForkFromMessage ||
+							msgCtx.onAskInPassing ||
 							msgCtx.onCompactBeforeMessage ||
 							msgCtx.onDeleteBlock ||
 							msgCtx.onRegenerateFromMessage ||
@@ -847,6 +861,14 @@ export const ContentViewer = memo(
 						{msgCtx.onForkFromMessage && (
 							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
 								{tNarrator("contextMenu_fork")}
+							</Menu.Item>
+						)}
+						{msgCtx.onAskInPassing && (
+							<Menu.Item
+								leftSection={<IconMessageQuestion size={14} />}
+								onClick={msgCtx.onAskInPassing}
+							>
+								{tNarrator("contextMenu_askInPassing")}
 							</Menu.Item>
 						)}
 						{msgCtx.onCompactBeforeMessage && (

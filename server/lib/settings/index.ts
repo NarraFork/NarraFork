@@ -253,6 +253,15 @@ export interface NarraForkSettings {
 		}>;
 		/** Default system prompt — used as base prompt for all narrators when their own systemPrompt is null. */
 		defaultSystemPrompt?: string;
+		/**
+		 * Ordered list of provider prefixes controlling display & merge order.
+		 * Providers not listed are appended at the end in their default order.
+		 */
+		providerOrder?: string[];
+		/**
+		 * Multi-instance providers use their own `disabled` field instead.
+		 */
+		disabledProviders?: string[];
 		/** WebFetch permission policy. */
 		webFetchPolicy?: {
 			/** When true, all URLs are auto-allowed without user approval. */

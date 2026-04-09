@@ -40,6 +40,7 @@ import {
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
+	IconMessageQuestion,
 	IconRepeat,
 	IconTrash,
 	IconWorldSearch,
@@ -104,6 +105,7 @@ interface MessageBubbleProps {
 		_blockOriginalIndices?: number[];
 	};
 	onForkFromMessage?: (messageUuid: string) => void;
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	resolvePerm?: (tc: any) => PendingPermission | null;
@@ -405,6 +407,7 @@ function ReasoningBlock({
 	// Menu items shared between context menu (desktop) and swipe menu (mobile)
 	const hasMenuActions = !!(
 		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
 		msgCtx.onCompactBeforeMessage ||
 		msgCtx.onDeleteBlock
 	);
@@ -429,6 +432,17 @@ function ReasoningBlock({
 					}}
 				>
 					{t("contextMenu_fork")}
+				</Menu.Item>
+			)}
+			{msgCtx.onAskInPassing && (
+				<Menu.Item
+					leftSection={<IconMessageQuestion size={14} />}
+					onClick={() => {
+						msgCtx.onAskInPassing?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{t("contextMenu_askInPassing")}
 				</Menu.Item>
 			)}
 			{msgCtx.onCompactBeforeMessage && (
@@ -1622,6 +1636,7 @@ export const MessageBubble = memo(function MessageBubble({
 	narratorId,
 	message,
 	onForkFromMessage,
+	onAskInPassing,
 	resolvePerm,
 	onPermissionDecision,
 	onQuestionSubmit,
@@ -1721,6 +1736,9 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgUuid && onForkFromMessage && !isUser) {
 			actions.onForkFromMessage = () => onForkFromMessage(msgUuid);
 		}
+		if (msgId && onAskInPassing) {
+			actions.onAskInPassing = () => onAskInPassing(msgUuid ?? null, msgId);
+		}
 		if (msgId && onCompactBeforeMessage) {
 			actions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
 		}
@@ -1742,6 +1760,7 @@ export const MessageBubble = memo(function MessageBubble({
 		message.id,
 		message.messageUuid,
 		onForkFromMessage,
+		onAskInPassing,
 		onCompactBeforeMessage,
 		onDeleteBlock,
 		onRegenerateFromMessage,

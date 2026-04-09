@@ -3,7 +3,6 @@ import {
 	Badge,
 	Button,
 	Checkbox,
-	Collapse,
 	Group,
 	Modal,
 	NumberInput,
@@ -16,20 +15,14 @@ import {
 	Text,
 	Textarea,
 	TextInput,
-	Title,
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
 	IconCheck,
-	IconChevronDown,
-	IconChevronRight,
 	IconDeviceFloppy,
-	IconEye,
-	IconEyeOff,
 	IconPencil,
-	IconPlayerPlay,
 	IconRefresh,
 	IconTrash,
 	IconX,
@@ -38,17 +31,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { relativeTime } from "../../lib/relative-time";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
-
-function relativeTime(iso: string | undefined): string {
-	if (!iso) return "-";
-	const diff = Date.now() - new Date(iso).getTime();
-	if (diff < 60_000) return "<1m ago";
-	if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
-	if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`;
-	return `${Math.floor(diff / 86400_000)}d ago`;
-}
+import { ModelList } from "./ModelList";
 
 interface CodexSectionProps {
 	hiddenModels: Set<string>;
@@ -72,9 +58,6 @@ export const CodexSection = React.memo(function CodexSection({
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
-	const [expanded, setExpanded] = useState(false);
-	const [availableExpanded, setAvailableExpanded] = useState(true);
-	const [unavailableExpanded, setUnavailableExpanded] = useState(false);
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
 	const [deviceAuthModal, setDeviceAuthModal] = useState(false);
@@ -493,417 +476,335 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	return (
-		<Paper p="md" withBorder>
-			<Stack gap="md">
-				<Group
-					justify="space-between"
-					style={{ cursor: "pointer" }}
-					onClick={() => setExpanded(!expanded)}
-				>
-					<Group gap="xs">
-						{expanded ? <IconChevronDown size={20} /> : <IconChevronRight size={20} />}
-						<Title order={4}>{t("codexTitle")}</Title>
-					</Group>
-					<Badge size="sm" color={status?.available ? "green" : "gray"}>
-						{status?.available ?? 0} / {status?.total ?? 0}
-					</Badge>
-				</Group>
+		<Stack gap="md">
+			<Group justify="space-between">
+				<Text size="sm" c="dimmed">
+					{t("codexDescription")}
+				</Text>
+				<Badge size="sm" color={status?.available ? "green" : "gray"}>
+					{status?.available ?? 0} / {status?.total ?? 0}
+				</Badge>
+			</Group>
 
-				<Collapse in={expanded}>
-					<Stack gap="md">
-						<Text size="sm" c="dimmed">
-							{t("codexDescription")}
+			{/* Global settings */}
+			<Stack gap="xs">
+				<Group justify="space-between">
+					<Stack gap={2}>
+						<Text size="sm" fw={500}>
+							{t("codexGlobalSettings")}
 						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexStickySessionsCount", { count: stickySessionCount })}
+						</Text>
+					</Stack>
+					<SegmentedControl
+						size="xs"
+						value={loadBalancingMode}
+						onChange={(v) => lbModeMut.mutate(v as "priority" | "balanced")}
+						data={[
+							{ label: t("codexModePriority"), value: "priority" },
+							{ label: t("codexModeBalanced"), value: "balanced" },
+						]}
+					/>
+				</Group>
+				<Group align="flex-end">
+					<TextInput
+						size="xs"
+						label={t("codexGlobalProxy")}
+						description={t("codexGlobalProxyDesc")}
+						placeholder={t("codexProxyPlaceholder")}
+						value={globalProxy}
+						onChange={(e) => setGlobalProxy(e.target.value)}
+						style={{ flex: 1 }}
+					/>
+					<Button size="xs" onClick={handleSaveGlobalProxy} loading={globalProxyMut.isPending}>
+						{t("codexSave")}
+					</Button>
+				</Group>
+				<Group align="flex-end">
+					<TextInput
+						size="xs"
+						label={t("codexDefaultReasoningEffort")}
+						description={t("codexDefaultReasoningEffortDesc")}
+						value={effectiveDefaultReasoningEffortLabel}
+						readOnly
+						style={{ flex: 1 }}
+					/>
+					<SegmentedControl
+						size="xs"
+						value={effectiveDefaultReasoningEffort || "auto"}
+						onChange={(v) => setDefaultReasoningEffort(v === "auto" ? "" : v)}
+						data={[
+							{ label: tn("reasoning_auto"), value: "auto" },
+							{ label: tn("reasoning_none"), value: "none" },
+							{ label: tn("reasoning_low"), value: "low" },
+							{ label: tn("reasoning_medium"), value: "medium" },
+							{ label: tn("reasoning_high"), value: "high" },
+							{ label: tn("reasoning_xhigh"), value: "xhigh" },
+						]}
+					/>
+					<Button
+						size="xs"
+						onClick={handleSaveDefaultReasoningEffort}
+						loading={defaultReasoningMut.isPending}
+					>
+						{t("codexSave")}
+					</Button>
+				</Group>
+			</Stack>
 
-						{/* Global settings */}
+			{/* Add credentials */}
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("codexAddCredentials")}
+				</Text>
+				{browserAuthPending ? (
+					<Paper withBorder p="sm" bg="blue.0">
+						<Stack gap="xs">
+							<Group gap="xs">
+								<Text size="sm" c="blue">
+									Waiting for browser authorization...
+								</Text>
+							</Group>
+							<Button size="xs" variant="light" color="orange" onClick={handleCancelBrowserAuth}>
+								Cancel
+							</Button>
+						</Stack>
+					</Paper>
+				) : (
+					<Group>
+						<Button size="xs" onClick={handleBrowserAuth} loading={browserAuthLoading}>
+							{t("codexAddBrowser")}
+						</Button>
+						<Button size="xs" variant="light" onClick={handleDeviceAuth}>
+							{t("codexAddDevice")}
+						</Button>
+					</Group>
+				)}
+			</Stack>
+
+			{/* Import credentials */}
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("codexImportTitle")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("codexImportDesc")}
+				</Text>
+				<Textarea
+					size="xs"
+					placeholder={t("codexImportPlaceholder")}
+					value={importJson}
+					onChange={(e) => setImportJson(e.target.value)}
+					minRows={4}
+					maxRows={8}
+				/>
+				{importError && (
+					<Text size="xs" c="red">
+						{importError}
+					</Text>
+				)}
+				{importResult && (
+					<Text size="xs" c="green">
+						{importResult}
+					</Text>
+				)}
+				<Group>
+					<Button
+						size="xs"
+						onClick={handleImport}
+						loading={importMut.isPending}
+						disabled={!importJson.trim()}
+					>
+						{t("codexImport")}
+					</Button>
+					<Button
+						size="xs"
+						variant="subtle"
+						onClick={() => {
+							setImportJson("");
+							setImportError(null);
+							setImportResult(null);
+						}}
+					>
+						{t("codexClear")}
+					</Button>
+				</Group>
+			</Stack>
+
+			{/* Usage fetch queue progress */}
+			{status?.usageQueue && status.usageQueue.items.length > 0 && (
+				<Paper withBorder p="sm">
+					<Stack gap="xs">
+						<Group justify="space-between">
+							<Text size="sm" fw={500}>
+								{t("codexUsageQueueTitle")}
+							</Text>
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								onClick={() => usageQueueClearMut.mutate()}
+								loading={usageQueueClearMut.isPending}
+							>
+								{t("codexUsageQueueClear")}
+							</Button>
+						</Group>
+						{(() => {
+							const items = status?.usageQueue?.items ?? [];
+							const total = items.length;
+							const done = items.filter((i) => i.status === "done").length;
+							const failed = items.filter((i) => i.status === "failed").length;
+							const pending = items.filter(
+								(i) => i.status === "pending" || i.status === "processing",
+							).length;
+							const pct = total > 0 ? ((done + failed) / total) * 100 : 0;
+							return (
+								<>
+									<Progress
+										value={pct}
+										size="sm"
+										color={failed > 0 ? "orange" : "indigo"}
+										animated={status?.usageQueue?.isRunning ?? false}
+									/>
+									<Text size="xs" c="dimmed">
+										{pending > 0
+											? t("codexUsageQueueProgress", {
+													done,
+													total,
+													pending,
+													failed,
+												})
+											: t("codexUsageQueueDone")}
+									</Text>
+								</>
+							);
+						})()}
+					</Stack>
+				</Paper>
+			)}
+
+			{/* Credentials list (responsive: cards on mobile, table on desktop) */}
+			{(status?.total ?? 0) > 0 && (
+				<Stack gap="xs">
+					{availableTotal > 0 && (
 						<Stack gap="xs">
 							<Group justify="space-between">
-								<Stack gap={2}>
-									<Text size="sm" fw={500}>
-										{t("codexGlobalSettings")}
-									</Text>
-									<Text size="xs" c="dimmed">
-										{t("codexStickySessionsCount", { count: stickySessionCount })}
-									</Text>
-								</Stack>
-								<SegmentedControl
-									size="xs"
-									value={loadBalancingMode}
-									onChange={(v) => lbModeMut.mutate(v as "priority" | "balanced")}
-									data={[
-										{ label: t("codexModePriority"), value: "priority" },
-										{ label: t("codexModeBalanced"), value: "balanced" },
-									]}
-								/>
-							</Group>
-							<Group align="flex-end">
-								<TextInput
-									label={t("codexGlobalProxy")}
-									description={t("codexGlobalProxyDesc")}
-									placeholder={t("codexProxyPlaceholder")}
-									value={globalProxy}
-									onChange={(e) => setGlobalProxy(e.target.value)}
-									style={{ flex: 1 }}
-								/>
-								<Button
-									size="sm"
-									onClick={handleSaveGlobalProxy}
-									loading={globalProxyMut.isPending}
-								>
-									{t("codexSave")}
-								</Button>
-							</Group>
-							<Group align="flex-end">
-								<TextInput
-									label={t("codexDefaultReasoningEffort")}
-									description={t("codexDefaultReasoningEffortDesc")}
-									value={effectiveDefaultReasoningEffortLabel}
-									readOnly
-									style={{ flex: 1 }}
-								/>
-								<SegmentedControl
-									size="xs"
-									value={effectiveDefaultReasoningEffort || "auto"}
-									onChange={(v) => setDefaultReasoningEffort(v === "auto" ? "" : v)}
-									data={[
-										{ label: tn("reasoning_auto"), value: "auto" },
-										{ label: tn("reasoning_none"), value: "none" },
-										{ label: tn("reasoning_low"), value: "low" },
-										{ label: tn("reasoning_medium"), value: "medium" },
-										{ label: tn("reasoning_high"), value: "high" },
-										{ label: tn("reasoning_xhigh"), value: "xhigh" },
-									]}
-								/>
-								<Button
-									size="sm"
-									onClick={handleSaveDefaultReasoningEffort}
-									loading={defaultReasoningMut.isPending}
-								>
-									{t("codexSave")}
-								</Button>
-							</Group>
-						</Stack>
-
-						{/* Add credentials */}
-						<Stack gap="xs">
-							<Text size="sm" fw={500}>
-								{t("codexAddCredentials")}
-							</Text>
-							{browserAuthPending ? (
-								<Paper withBorder p="sm" bg="blue.0">
-									<Stack gap="xs">
-										<Group gap="xs">
-											<Text size="sm" c="blue">
-												Waiting for browser authorization...
-											</Text>
-										</Group>
-										<Button
-											size="sm"
-											variant="light"
-											color="orange"
-											onClick={handleCancelBrowserAuth}
-										>
-											Cancel
-										</Button>
-									</Stack>
-								</Paper>
-							) : (
-								<Group>
-									<Button size="sm" onClick={handleBrowserAuth} loading={browserAuthLoading}>
-										{t("codexAddBrowser")}
-									</Button>
-									<Button size="sm" variant="light" onClick={handleDeviceAuth}>
-										{t("codexAddDevice")}
-									</Button>
-								</Group>
-							)}
-						</Stack>
-
-						{/* Import credentials */}
-						<Stack gap="xs">
-							<Text size="sm" fw={500}>
-								{t("codexImportTitle")}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("codexImportDesc")}
-							</Text>
-							<Textarea
-								placeholder={t("codexImportPlaceholder")}
-								value={importJson}
-								onChange={(e) => setImportJson(e.target.value)}
-								minRows={4}
-								maxRows={8}
-							/>
-							{importError && (
-								<Text size="xs" c="red">
-									{importError}
+								<Text size="sm" fw={500}>
+									{t("codexCredentialsAvailable")}
 								</Text>
-							)}
-							{importResult && (
-								<Text size="xs" c="green">
-									{importResult}
-								</Text>
-							)}
-							<Group>
-								<Button
-									size="sm"
-									onClick={handleImport}
-									loading={importMut.isPending}
-									disabled={!importJson.trim()}
-								>
-									{t("codexImport")}
-								</Button>
-								<Button
-									size="sm"
-									variant="subtle"
-									onClick={() => {
-										setImportJson("");
-										setImportError(null);
-										setImportResult(null);
-									}}
-								>
-									{t("codexClear")}
-								</Button>
-							</Group>
-						</Stack>
-
-						{/* Usage fetch queue progress */}
-						{status?.usageQueue && status.usageQueue.items.length > 0 && (
-							<Paper withBorder p="sm">
-								<Stack gap="xs">
-									<Group justify="space-between">
-										<Text size="sm" fw={500}>
-											{t("codexUsageQueueTitle")}
-										</Text>
+								<Group gap="xs">
+									{selectedIds.size > 0 && (
 										<Button
 											size="compact-xs"
-											variant="subtle"
-											onClick={() => usageQueueClearMut.mutate()}
-											loading={usageQueueClearMut.isPending}
+											color="red"
+											variant="light"
+											leftSection={<IconTrash size={14} />}
+											onClick={handleBatchDelete}
+											loading={batchDeleteMut.isPending}
 										>
-											{t("codexUsageQueueClear")}
+											{t("codexBatchDelete")} ({selectedIds.size})
 										</Button>
-									</Group>
-									{(() => {
-										const items = status?.usageQueue?.items ?? [];
-										const total = items.length;
-										const done = items.filter((i) => i.status === "done").length;
-										const failed = items.filter((i) => i.status === "failed").length;
-										const pending = items.filter(
-											(i) => i.status === "pending" || i.status === "processing",
-										).length;
-										const pct = total > 0 ? ((done + failed) / total) * 100 : 0;
-										return (
-											<>
-												<Progress
-													value={pct}
-													size="sm"
-													color={failed > 0 ? "orange" : "indigo"}
-													animated={status?.usageQueue?.isRunning ?? false}
-												/>
-												<Text size="xs" c="dimmed">
-													{pending > 0
-														? t("codexUsageQueueProgress", {
-																done,
-																total,
-																pending,
-																failed,
-															})
-														: t("codexUsageQueueDone")}
-												</Text>
-											</>
-										);
-									})()}
-								</Stack>
-							</Paper>
-						)}
-
-						{/* Credentials list (responsive: cards on mobile, table on desktop) */}
-						{(status?.total ?? 0) > 0 && (
-							<Stack gap="xs">
-								{availableTotal > 0 && (
-									<Stack gap="xs">
-										<Group
-											justify="space-between"
-											style={{ cursor: "pointer" }}
-											onClick={() => setAvailableExpanded(!availableExpanded)}
-										>
-											<Group gap="xs">
-												{availableExpanded ? (
-													<IconChevronDown size={16} />
-												) : (
-													<IconChevronRight size={16} />
-												)}
-												<Text size="sm" fw={500}>
-													{t("codexCredentialsAvailable")}
-												</Text>
-											</Group>
-											<Group gap="xs">
-												{selectedIds.size > 0 && (
-													<Button
-														size="compact-xs"
-														color="red"
-														variant="light"
-														leftSection={<IconTrash size={14} />}
-														onClick={(e) => {
-															e.stopPropagation();
-															handleBatchDelete();
-														}}
-														loading={batchDeleteMut.isPending}
-													>
-														{t("codexBatchDelete")} ({selectedIds.size})
-													</Button>
-												)}
-												<Badge size="sm" color="green">
-													{availableTotal}
-												</Badge>
-											</Group>
-										</Group>
-										<Collapse in={availableExpanded}>
-											<CredentialList
-												entries={availableEntries}
-												totalEntries={availableTotal}
-												page={availablePage}
-												pageSize={PAGE_SIZE}
-												onPageChange={setAvailablePage}
-												currentId={status?.currentId}
-												usageCache={usageCache}
-												editingId={editingId}
-												editForm={editForm}
-												onEdit={handleEdit}
-												onSaveEdit={handleSaveEdit}
-												onCancelEdit={() => setEditingId(null)}
-												onEditFormChange={setEditForm}
-												usageMut={usageMut}
-												enableMut={enableMut}
-												disableMut={disableMut}
-												resetMut={resetMut}
-												deleteMut={deleteMut}
-												selectedIds={selectedIds}
-												onToggleSelect={toggleSelect}
-												onToggleSelectAll={toggleSelectAll}
-												t={t}
-											/>
-										</Collapse>
-									</Stack>
-								)}
-
-								{unavailableTotal > 0 && (
-									<Stack gap="xs">
-										<Group
-											justify="space-between"
-											style={{ cursor: "pointer" }}
-											onClick={() => setUnavailableExpanded(!unavailableExpanded)}
-										>
-											<Group gap="xs">
-												{unavailableExpanded ? (
-													<IconChevronDown size={16} />
-												) : (
-													<IconChevronRight size={16} />
-												)}
-												<Text size="sm" fw={500}>
-													{t("codexCredentialsUnavailable")}
-												</Text>
-											</Group>
-											<Badge size="sm" color="red">
-												{unavailableTotal}
-											</Badge>
-										</Group>
-										<Collapse in={unavailableExpanded}>
-											<CredentialList
-												entries={unavailableEntries}
-												totalEntries={unavailableTotal}
-												page={unavailablePage}
-												pageSize={PAGE_SIZE}
-												onPageChange={setUnavailablePage}
-												currentId={status?.currentId}
-												usageCache={usageCache}
-												editingId={editingId}
-												editForm={editForm}
-												onEdit={handleEdit}
-												onSaveEdit={handleSaveEdit}
-												onCancelEdit={() => setEditingId(null)}
-												onEditFormChange={setEditForm}
-												usageMut={usageMut}
-												enableMut={enableMut}
-												disableMut={disableMut}
-												resetMut={resetMut}
-												deleteMut={deleteMut}
-												selectedIds={selectedIds}
-												onToggleSelect={toggleSelect}
-												onToggleSelectAll={toggleSelectAll}
-												t={t}
-											/>
-										</Collapse>
-									</Stack>
-								)}
-							</Stack>
-						)}
-
-						{/* Models section */}
-						<Stack gap="xs">
-							<Text size="sm" fw={500}>
-								{t("codexModels")}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("codexModelsDesc")}
-							</Text>
-							<Stack gap="xs">
-								{codexModelIds.map((modelId) => {
-									const modelVal = `codex:${modelId}`;
-									const isHidden = hiddenModels.has(modelVal);
-									return (
-										<Group
-											key={modelId}
-											gap="xs"
-											wrap="wrap"
-											style={isHidden ? { opacity: 0.5 } : undefined}
-										>
-											<TextInput
-												value={modelVal}
-												disabled
-												style={{ flex: 1, minWidth: 120 }}
-												size="xs"
-											/>
-											<TextInput
-												value={modelId}
-												disabled
-												style={{ flex: 1, minWidth: 120 }}
-												size="xs"
-											/>
-											<Tooltip label={t("modelTestBtn")}>
-												<ActionIcon
-													variant="subtle"
-													color="teal"
-													onClick={() => onTestModel?.(modelVal)}
-												>
-													<IconPlayerPlay size={16} />
-												</ActionIcon>
-											</Tooltip>
-											<ActionIcon
-												variant="subtle"
-												color={isHidden ? "gray" : "blue"}
-												onClick={() => onToggleHidden(modelVal)}
-											>
-												{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-											</ActionIcon>
-										</Group>
-									);
-								})}
-							</Stack>
-							<InlineCustomModels
-								prefix="codex"
-								customModels={customModels}
-								onCustomModelsChange={onCustomModelsChange}
-								hiddenModels={hiddenModels}
-								onToggleHidden={onToggleHidden}
-								modelContextWindows={modelContextWindows}
-								onContextWindowChange={onContextWindowChange}
-								onTestModel={onTestModel}
+									)}
+									<Badge size="sm" color="green">
+										{availableTotal}
+									</Badge>
+								</Group>
+							</Group>
+							<CredentialList
+								entries={availableEntries}
+								totalEntries={availableTotal}
+								page={availablePage}
+								pageSize={PAGE_SIZE}
+								onPageChange={setAvailablePage}
+								currentId={status?.currentId}
+								usageCache={usageCache}
+								editingId={editingId}
+								editForm={editForm}
+								onEdit={handleEdit}
+								onSaveEdit={handleSaveEdit}
+								onCancelEdit={() => setEditingId(null)}
+								onEditFormChange={setEditForm}
+								usageMut={usageMut}
+								enableMut={enableMut}
+								disableMut={disableMut}
+								resetMut={resetMut}
+								deleteMut={deleteMut}
+								selectedIds={selectedIds}
+								onToggleSelect={toggleSelect}
+								onToggleSelectAll={toggleSelectAll}
+								t={t}
 							/>
 						</Stack>
-					</Stack>
-				</Collapse>
+					)}
+
+					{unavailableTotal > 0 && (
+						<Stack gap="xs">
+							<Group justify="space-between">
+								<Text size="sm" fw={500}>
+									{t("codexCredentialsUnavailable")}
+								</Text>
+								<Badge size="sm" color="red">
+									{unavailableTotal}
+								</Badge>
+							</Group>
+							<CredentialList
+								entries={unavailableEntries}
+								totalEntries={unavailableTotal}
+								page={unavailablePage}
+								pageSize={PAGE_SIZE}
+								onPageChange={setUnavailablePage}
+								currentId={status?.currentId}
+								usageCache={usageCache}
+								editingId={editingId}
+								editForm={editForm}
+								onEdit={handleEdit}
+								onSaveEdit={handleSaveEdit}
+								onCancelEdit={() => setEditingId(null)}
+								onEditFormChange={setEditForm}
+								usageMut={usageMut}
+								enableMut={enableMut}
+								disableMut={disableMut}
+								resetMut={resetMut}
+								deleteMut={deleteMut}
+								selectedIds={selectedIds}
+								onToggleSelect={toggleSelect}
+								onToggleSelectAll={toggleSelectAll}
+								t={t}
+							/>
+						</Stack>
+					)}
+				</Stack>
+			)}
+
+			{/* Models section */}
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("codexModels")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("codexModelsDesc")}
+				</Text>
+				{codexModelIds.length > 0 && (
+					<ModelList
+						models={codexModelIds.map((id) => ({ value: `codex:${id}`, label: id }))}
+						hiddenModels={hiddenModels}
+						onToggleHidden={onToggleHidden}
+						modelContextWindows={modelContextWindows}
+						onContextWindowChange={onContextWindowChange}
+						onTestModel={onTestModel}
+						showContextWindow={false}
+					/>
+				)}
+				<InlineCustomModels
+					prefix="codex"
+					customModels={customModels}
+					onCustomModelsChange={onCustomModelsChange}
+					hiddenModels={hiddenModels}
+					onToggleHidden={onToggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={onContextWindowChange}
+					onTestModel={onTestModel}
+				/>
 			</Stack>
 
 			{/* Device auth modal */}
@@ -935,7 +836,7 @@ export const CodexSection = React.memo(function CodexSection({
 					</Text>
 				</Stack>
 			</Modal>
-		</Paper>
+		</Stack>
 	);
 });
 

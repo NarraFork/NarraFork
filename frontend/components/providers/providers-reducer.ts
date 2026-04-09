@@ -16,6 +16,8 @@ export interface ProvidersState {
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
 	modelContextWindows: Record<string, number>;
+	providerOrder: string[];
+	disabledProviders: Set<string>;
 	initialized: boolean;
 }
 
@@ -26,6 +28,8 @@ export interface SavedSnapshot {
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
 	modelContextWindows: Record<string, number>;
+	providerOrder: string[];
+	disabledProviders: string[];
 }
 
 // Functional updater types
@@ -40,7 +44,10 @@ export type ProvidersAction =
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
 	| { type: "SET_CUSTOM_MODELS"; models: CustomModelEntry[] }
 	| { type: "SET_CONTEXT_WINDOW"; modelVal: string; size: number | null }
-	| { type: "MARK_SAVED" };
+	| { type: "SET_PROVIDER_ORDER"; order: string[] }
+	| { type: "TOGGLE_PROVIDER_DISABLED"; prefix: string }
+	| { type: "MARK_SAVED" }
+	| { type: "RESTORE_FROM_SNAPSHOT"; snapshot: SavedSnapshot };
 
 // ── Helpers ────────────────────────────────────────────
 
@@ -57,6 +64,8 @@ export const initialProvidersState: ProvidersState = {
 	hiddenModels: new Set(),
 	customModels: [],
 	modelContextWindows: {},
+	providerOrder: [],
+	disabledProviders: new Set(),
 	initialized: false,
 };
 
@@ -141,6 +150,9 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 			const windows = (agent.modelContextWindows as Record<string, number>) ?? {};
 
+			const providerOrder: string[] = (agent.providerOrder as string[]) ?? [];
+			const disabledProviders = new Set<string>((agent.disabledProviders as string[]) ?? []);
+
 			return {
 				openaiProviders: openai,
 				anthropicProviders: anthropic,
@@ -148,6 +160,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				hiddenModels: new Set(hidden),
 				customModels: custom,
 				modelContextWindows: windows,
+				providerOrder,
+				disabledProviders,
 				initialized: true,
 			};
 		}
@@ -209,6 +223,31 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			};
 		}
 
+		case "SET_PROVIDER_ORDER":
+			return { ...state, providerOrder: action.order };
+
+		case "TOGGLE_PROVIDER_DISABLED": {
+			const next = new Set(state.disabledProviders);
+			if (next.has(action.prefix)) next.delete(action.prefix);
+			else next.add(action.prefix);
+			return { ...state, disabledProviders: next };
+		}
+
+		case "RESTORE_FROM_SNAPSHOT": {
+			const snap = action.snapshot;
+			return {
+				...state,
+				openaiProviders: snap.openaiProviders.map((p) => ({ ...p })),
+				anthropicProviders: snap.anthropicProviders.map((p) => ({ ...p })),
+				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
+				hiddenModels: new Set(snap.hiddenModels),
+				customModels: snap.customModels.map((m) => ({ ...m })),
+				modelContextWindows: { ...snap.modelContextWindows },
+				providerOrder: [...snap.providerOrder],
+				disabledProviders: new Set(snap.disabledProviders),
+			};
+		}
+
 		default:
 			return state;
 	}
@@ -230,6 +269,8 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (state.nugProviders.length !== savedSnapshot.nugProviders.length) return true;
 		if (state.hiddenModels.size !== savedSnapshot.hiddenModels.length) return true;
 		if (state.customModels.length !== savedSnapshot.customModels.length) return true;
+		if (state.providerOrder.length !== savedSnapshot.providerOrder.length) return true;
+		if (state.disabledProviders.size !== savedSnapshot.disabledProviders.length) return true;
 
 		// Deep comparison via JSON.stringify only when lengths match
 		if (JSON.stringify(state.openaiProviders) !== JSON.stringify(savedSnapshot.openaiProviders))
@@ -243,10 +284,17 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 			return true;
 		if (
 			JSON.stringify([...state.hiddenModels].sort()) !==
-			JSON.stringify(savedSnapshot.hiddenModels.sort())
+			JSON.stringify([...savedSnapshot.hiddenModels].sort())
 		)
 			return true;
 		if (JSON.stringify(state.customModels) !== JSON.stringify(savedSnapshot.customModels))
+			return true;
+		if (JSON.stringify(state.providerOrder) !== JSON.stringify(savedSnapshot.providerOrder))
+			return true;
+		if (
+			JSON.stringify([...state.disabledProviders].sort()) !==
+			JSON.stringify([...savedSnapshot.disabledProviders].sort())
+		)
 			return true;
 		if (
 			JSON.stringify(state.modelContextWindows) !==
@@ -267,6 +315,8 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
 		modelContextWindows: { ...state.modelContextWindows },
+		providerOrder: [...state.providerOrder],
+		disabledProviders: [...state.disabledProviders],
 	};
 }
 
@@ -318,6 +368,16 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
+	const setProviderOrder = useCallback(
+		(order: string[]) => dispatch({ type: "SET_PROVIDER_ORDER", order }),
+		[dispatch],
+	);
+
+	const toggleProviderDisabled = useCallback(
+		(prefix: string) => dispatch({ type: "TOGGLE_PROVIDER_DISABLED", prefix }),
+		[dispatch],
+	);
+
 	return useMemo(
 		() => ({
 			setOpenaiProviders,
@@ -327,6 +387,8 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			batchToggleHidden,
 			setCustomModels,
 			handleContextWindowChange,
+			setProviderOrder,
+			toggleProviderDisabled,
 		}),
 		[
 			setOpenaiProviders,
@@ -336,6 +398,8 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			batchToggleHidden,
 			setCustomModels,
 			handleContextWindowChange,
+			setProviderOrder,
+			toggleProviderDisabled,
 		],
 	);
 }
