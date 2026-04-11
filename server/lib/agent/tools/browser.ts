@@ -64,7 +64,9 @@ export const browserTool: ToolDefinition = {
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
 		"- timeout (optional): Timeout in ms for wait/element actions (default: 10000)\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
-		"- max_length (optional): Max output length for dom/get_text/evaluate (default: 20000)",
+		"- max_length (optional): Max output length for dom/get_text/evaluate (default: 20000)\n" +
+		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
+		"Useful for debugging, visual inspection, or interacting with pages that require a display.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -116,6 +118,12 @@ export const browserTool: ToolDefinition = {
 				description: "Max output length for dom/get_text/evaluate (default: 20000)",
 				type: "number",
 			},
+			headless: {
+				description:
+					"Set to false to launch a visible browser window with GUI (default: true). " +
+					"Only applies to the launch action.",
+				type: "boolean",
+			},
 		},
 		required: ["action"],
 		additionalProperties: false,
@@ -137,6 +145,10 @@ export const browserTool: ToolDefinition = {
 			.optional()
 			.describe("Coordinates for positional actions"),
 		max_length: z.number().optional().describe("Max output length"),
+		headless: z
+			.boolean()
+			.optional()
+			.describe("Launch visible browser GUI (default: true = headless)"),
 	}),
 
 	async execute(args, ctx): Promise<ToolResult> {
@@ -151,6 +163,7 @@ export const browserTool: ToolDefinition = {
 			timeout,
 			coordinate,
 			max_length,
+			headless,
 		} = args as {
 			action: Action;
 			url?: string;
@@ -162,6 +175,7 @@ export const browserTool: ToolDefinition = {
 			timeout?: number;
 			coordinate?: { x: number; y: number };
 			max_length?: number;
+			headless?: boolean;
 		};
 
 		logger.info("Browser tool executing", {
@@ -174,7 +188,7 @@ export const browserTool: ToolDefinition = {
 		try {
 			switch (action) {
 				case "launch":
-					return await handleLaunch(ctx.narratorId, url);
+					return await handleLaunch(ctx.narratorId, url, headless ?? true);
 				case "list_sessions":
 					return handleListSessions(ctx.narratorId);
 				case "close":
@@ -202,7 +216,11 @@ export const browserTool: ToolDefinition = {
 
 // ── Action handlers ──
 
-async function handleLaunch(narratorId: string, url?: string): Promise<ToolResult> {
+async function handleLaunch(
+	narratorId: string,
+	url?: string,
+	headless = true,
+): Promise<ToolResult> {
 	if (!url) {
 		return { output: "url is required for launch action", isError: true };
 	}
@@ -219,12 +237,12 @@ async function handleLaunch(narratorId: string, url?: string): Promise<ToolResul
 		return { output: `Invalid URL: ${url}`, isError: true };
 	}
 
-	const session = await createSession(narratorId, url);
+	const session = await createSession(narratorId, url, headless);
 	const title = await session.page.title();
 
 	return {
 		output:
-			`Browser session started.\n` +
+			`Browser session started (${headless ? "headless" : "headed/GUI"}).\n` +
 			`Session ID: ${session.id}\n` +
 			`URL: ${session.page.url()}\n` +
 			`Title: ${title}`,
@@ -238,7 +256,8 @@ function handleListSessions(narratorId: string): ToolResult {
 		return { output: "No active browser sessions." };
 	}
 	const lines = list.map(
-		(s) => `- ${s.id} | ${s.url} | last active: ${new Date(s.lastActivity).toISOString()}`,
+		(s) =>
+			`- ${s.id} | ${s.url} | ${s.headless ? "headless" : "headed"} | last active: ${new Date(s.lastActivity).toISOString()}`,
 	);
 	return {
 		output: `Active sessions (${list.length}):\n${lines.join("\n")}`,

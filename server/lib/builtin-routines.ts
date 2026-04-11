@@ -16,6 +16,10 @@ export interface BuiltinCommandDef {
 		required?: boolean;
 		defaultValue?: string;
 	}>;
+	modelOverride?: {
+		model: string;
+		mode: "temporary" | "permanent";
+	};
 }
 
 export interface BuiltinSkillDef {

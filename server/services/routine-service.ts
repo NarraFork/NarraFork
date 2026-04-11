@@ -360,6 +360,7 @@ function buildCommandFromRoutine(routine: BuiltinRoutine): Command {
 		prompt: cmd.prompt,
 		description: `${cmd.descriptionEn} ${routineTag(routine.id)}`,
 		params: cmd.params,
+		...(cmd.modelOverride ? { modelOverride: cmd.modelOverride } : {}),
 	};
 }
 

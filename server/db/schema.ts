@@ -222,6 +222,9 @@ export const narrators = sqliteTable(
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
 		contextSummary: text("context_summary"),
 		model: text("model").default("claude-sonnet-4.5"),
+		/** When set, the model should be restored to this value after the current turn completes.
+		 *  Used by temporary model override on slash commands. Cleared after restore. */
+		pendingModelRestore: text("pending_model_restore"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
 			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"],

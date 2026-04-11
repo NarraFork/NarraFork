@@ -8,8 +8,9 @@ import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { logger } from "../logger";
 import { getWebFetchProxy } from "../web-fetch/proxy";
 
-let browser: Browser | null = null;
-let launching: Promise<Browser> | null = null;
+/** Browser instances keyed by mode. */
+const browsers: Map<boolean, Browser> = new Map();
+const launching: Map<boolean, Promise<Browser>> = new Map();
 
 const PAGE_TIMEOUT_MS = 30_000;
 const LAUNCH_TIMEOUT_MS = 30_000;
@@ -23,14 +24,16 @@ const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font", "stylesheet"])
 const LAUNCH_ARGS = [
 	"--no-sandbox",
 	"--disable-setuid-sandbox",
-	"--disable-gpu",
 	"--disable-dev-shm-usage",
 	"--disable-extensions",
 ];
 
 /** Build launch args, appending --proxy-server when a proxy is configured. */
-function buildLaunchArgs(): string[] {
+function buildLaunchArgs(headless: boolean): string[] {
 	const args = [...LAUNCH_ARGS];
+	if (headless) {
+		args.push("--disable-gpu");
+	}
 	const proxy = getWebFetchProxy();
 	if (proxy) {
 		args.push(`--proxy-server=${proxy}`);
@@ -151,16 +154,30 @@ function getSystemChromePaths(): string[] {
 	}
 }
 
-async function launchBrowser(): Promise<Browser> {
+async function launchBrowser(headless: boolean): Promise<Browser> {
+	// Headed mode requires a display server (X11 or Wayland)
+	if (
+		!headless &&
+		process.platform !== "win32" &&
+		!process.env.DISPLAY &&
+		!process.env.WAYLAND_DISPLAY
+	) {
+		throw new Error(
+			"Cannot launch headed browser: no DISPLAY or WAYLAND_DISPLAY environment variable found. " +
+				"Headed mode requires a graphical environment (X11 or Wayland). " +
+				"Use headless mode on servers.",
+		);
+	}
+
 	const puppeteer = await import("puppeteer-core");
 
 	const executablePath = findChromePath();
-	const launchArgs = buildLaunchArgs();
+	const launchArgs = buildLaunchArgs(headless);
 
 	if (executablePath) {
 		try {
 			const b = await puppeteer.default.launch({
-				headless: true,
+				headless,
 				executablePath,
 				args: launchArgs,
 				timeout: LAUNCH_TIMEOUT_MS,
@@ -168,6 +185,7 @@ async function launchBrowser(): Promise<Browser> {
 			logger.info("Puppeteer browser launched", {
 				pid: b.process()?.pid,
 				chromePath: executablePath,
+				headless,
 			});
 			return b;
 		} catch (err) {
@@ -182,29 +200,38 @@ async function launchBrowser(): Promise<Browser> {
 
 	// Default Puppeteer launch (uses its own detection)
 	const b = await puppeteer.default.launch({
-		headless: true,
+		headless,
 		args: launchArgs,
 		timeout: LAUNCH_TIMEOUT_MS,
 	});
-	logger.info("Puppeteer browser launched (default)", { pid: b.process()?.pid });
+	logger.info("Puppeteer browser launched (default)", { pid: b.process()?.pid, headless });
 	return b;
 }
 
-export async function getBrowser(): Promise<Browser> {
-	if (browser?.connected) return browser;
-	// Prevent concurrent launches
-	if (launching) return launching;
-	launching = launchBrowser()
+/**
+ * Get or launch a browser instance.
+ * @param headless - true for headless mode (default), false for headed (GUI) mode.
+ */
+export async function getBrowser(headless = true): Promise<Browser> {
+	const existing = browsers.get(headless);
+	if (existing?.connected) return existing;
+
+	// Prevent concurrent launches for the same mode
+	const pending = launching.get(headless);
+	if (pending) return pending;
+
+	const promise = launchBrowser(headless)
 		.then((b) => {
-			browser = b;
-			launching = null;
+			browsers.set(headless, b);
+			launching.delete(headless);
 			return b;
 		})
 		.catch((err) => {
-			launching = null;
+			launching.delete(headless);
 			throw err;
 		});
-	return launching;
+	launching.set(headless, promise);
+	return promise;
 }
 
 export interface FetchPageOptions {
@@ -258,31 +285,41 @@ export async function fetchPage(url: string, options?: FetchPageOptions): Promis
 /**
  * Create a new incognito browser context.
  * Used by BrowserSession for persistent multi-page sessions.
+ * @param headless - true for headless mode (default), false for headed (GUI) mode.
  */
-export async function createContext(): Promise<BrowserContext> {
-	const b = await getBrowser();
+export async function createContext(headless = true): Promise<BrowserContext> {
+	const b = await getBrowser(headless);
 	const ctx = await b.createBrowserContext();
 	return ctx;
 }
 
-/** Check whether the singleton browser is running and connected. */
-export function getBrowserStatus(): { running: boolean; connected: boolean } {
-	if (!browser) return { running: false, connected: false };
-	return { running: true, connected: browser.connected };
+/** Check whether browsers are running and connected. */
+export function getBrowserStatus(): {
+	headless: { running: boolean; connected: boolean };
+	headed: { running: boolean; connected: boolean };
+} {
+	const h = browsers.get(true);
+	const d = browsers.get(false);
+	return {
+		headless: h ? { running: true, connected: h.connected } : { running: false, connected: false },
+		headed: d ? { running: true, connected: d.connected } : { running: false, connected: false },
+	};
 }
 
-/** Gracefully close the browser (called on process exit). */
+/** Gracefully close all browsers (called on process exit). */
 export async function closeBrowser(): Promise<void> {
-	if (browser) {
-		const b = browser;
-		browser = null;
-		try {
-			await b.close();
-			logger.info("Puppeteer browser closed");
-		} catch {
-			// Already closed or crashed — ignore
-		}
+	const promises: Promise<void>[] = [];
+	for (const [headless, b] of browsers) {
+		promises.push(
+			b
+				.close()
+				.then(() => logger.info("Puppeteer browser closed", { headless }))
+				.catch(() => {}),
+		);
 	}
+	browsers.clear();
+	launching.clear();
+	await Promise.all(promises);
 }
 
 // Auto-cleanup on process exit

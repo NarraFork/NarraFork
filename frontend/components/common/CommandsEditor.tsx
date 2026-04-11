@@ -4,7 +4,10 @@ import {
 	Button,
 	Group,
 	Paper,
+	SegmentedControl,
+	Select,
 	Stack,
+	Switch,
 	Text,
 	Textarea,
 	TextInput,
@@ -12,6 +15,7 @@ import {
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useAllModels } from "../../hooks/useModels";
 
 export interface CommandParamDef {
 	name: string;
@@ -20,11 +24,17 @@ export interface CommandParamDef {
 	defaultValue?: string;
 }
 
+export interface CommandModelOverrideDef {
+	model: string;
+	mode: "temporary" | "permanent";
+}
+
 export interface CommandDef {
 	name: string;
 	prompt: string;
 	description?: string;
 	params?: CommandParamDef[];
+	modelOverride?: CommandModelOverrideDef;
 }
 
 interface CommandsEditorProps {
@@ -36,6 +46,7 @@ interface CommandsEditorProps {
 
 export function CommandsEditor({ commands, onChange, ns = "settings" }: CommandsEditorProps) {
 	const { t } = useTranslation(ns);
+	const { groupedModels } = useAllModels();
 	const [editIndex, setEditIndex] = useState<number | null>(null);
 	const [draft, setDraft] = useState<CommandDef>({ name: "", prompt: "" });
 	const [error, setError] = useState("");
@@ -62,6 +73,9 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 		setDraft({
 			...commands[index],
 			params: commands[index].params?.map((p) => ({ ...p })),
+			modelOverride: commands[index].modelOverride
+				? { ...commands[index].modelOverride }
+				: undefined,
 		});
 		setError("");
 	};
@@ -91,6 +105,9 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 							...(p.defaultValue?.trim() ? { defaultValue: p.defaultValue.trim() } : {}),
 						})),
 					}
+				: {}),
+			...(draft.modelOverride?.model
+				? { modelOverride: { model: draft.modelOverride.model, mode: draft.modelOverride.mode } }
 				: {}),
 		};
 
@@ -152,6 +169,19 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 											</Badge>
 										))}
 									</Group>
+								)}
+								{cmd.modelOverride && (
+									<Badge
+										size="xs"
+										variant="light"
+										color={cmd.modelOverride.mode === "temporary" ? "teal" : "orange"}
+										mt={4}
+									>
+										{cmd.modelOverride.mode === "temporary"
+											? t("commandModelTemporary")
+											: t("commandModelPermanent")}
+										: {cmd.modelOverride.model}
+									</Badge>
 								)}
 							</div>
 							<Group gap={4}>
@@ -286,6 +316,69 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 								{t("commandAddParam")}
 							</Button>
 						</Stack>
+
+						{/* Model override */}
+						<Stack gap={4}>
+							<Switch
+								label={t("commandModelOverride")}
+								description={t("commandModelOverrideDesc")}
+								size="xs"
+								checked={!!draft.modelOverride}
+								onChange={(e) => {
+									const checked = e.currentTarget.checked;
+									setDraft((d) => ({
+										...d,
+										modelOverride: checked ? { model: "", mode: "temporary" as const } : undefined,
+									}));
+								}}
+							/>
+							{draft.modelOverride && (
+								<Stack gap={4} ml="md">
+									<Select
+										label={t("commandModelSelect")}
+										placeholder={t("commandModelSelectPlaceholder")}
+										data={groupedModels}
+										value={draft.modelOverride.model || null}
+										onChange={(val) => {
+											setDraft((d) => ({
+												...d,
+												modelOverride: d.modelOverride
+													? { ...d.modelOverride, model: val ?? "" }
+													: undefined,
+											}));
+										}}
+										searchable
+										size="xs"
+									/>
+									<SegmentedControl
+										size="xs"
+										data={[
+											{
+												value: "temporary",
+												label: t("commandModelTemporary"),
+											},
+											{
+												value: "permanent",
+												label: t("commandModelPermanent"),
+											},
+										]}
+										value={draft.modelOverride.mode}
+										onChange={(val) => {
+											setDraft((d) => ({
+												...d,
+												modelOverride: d.modelOverride
+													? {
+															...d.modelOverride,
+															mode: val as "temporary" | "permanent",
+														}
+													: undefined,
+											}));
+										}}
+									/>
+								</Stack>
+							)}
+						</Stack>
+
 						<Group gap="xs">
 							<Button
 								size="xs"

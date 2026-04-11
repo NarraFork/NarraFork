@@ -29,7 +29,10 @@ import {
 	stopContainerProxy,
 } from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
-import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
+import {
+	recoverOnStartup as recoverNarrators,
+	restorePendingModelOverrides,
+} from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { registerProjectDbSync } from "./services/project-db-sync";
@@ -571,6 +574,11 @@ mcpManager
 // Clean up stale narrator states from previous server run
 recoverNarrators().catch((err) => {
 	logger.error("Narrator state recovery failed", { error: String(err) });
+});
+
+// Restore models for narrators with pending temporary overrides (unclean shutdown recovery)
+restorePendingModelOverrides().catch((err) => {
+	logger.error("Pending model override restore failed", { error: String(err) });
 });
 
 // Mark interrupted merge sessions as error

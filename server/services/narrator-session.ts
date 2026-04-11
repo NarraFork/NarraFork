@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { formatFileSize } from "@shared/text-file-types";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
@@ -3700,6 +3700,37 @@ async function runAgentLoop(
 	} finally {
 		active._loopRunning = false;
 		active.alive = false;
+
+		// Restore model after temporary override (slash command with modelOverride.mode="temporary")
+		// Read from DB so this survives server restarts.
+		try {
+			const fresh = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { pendingModelRestore: true },
+			});
+			if (fresh?.pendingModelRestore) {
+				const restoreModel = fresh.pendingModelRestore;
+				await db
+					.update(narrators)
+					.set({
+						model: restoreModel,
+						pendingModelRestore: null,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, narratorId));
+				broadcastToNarrator(narratorId, {
+					type: "model_changed",
+					narratorId,
+					model: restoreModel,
+				});
+			}
+		} catch (err) {
+			logger.error("Failed to restore model after temporary override", {
+				narratorId,
+				error: String(err),
+			});
+		}
+
 		if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 		// Stop file watcher for this narrator
 		if (active._worktreePath) {
@@ -5022,6 +5053,50 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			type: "model_changed",
 			narratorId,
 			model,
+		});
+	}
+}
+
+/**
+ * Set a temporary model override for the current agent loop.
+ * Persists the original model to DB so it survives server restarts.
+ * After the loop finishes, the model will be restored automatically.
+ */
+export async function setTemporaryModelRestore(
+	narratorId: string,
+	originalModel: string,
+): Promise<void> {
+	const now = new Date().toISOString();
+	await db
+		.update(narrators)
+		.set({ pendingModelRestore: originalModel, updatedAt: now })
+		.where(eq(narrators.id, narratorId));
+}
+
+/**
+ * Restore models for all narrators that have a pending temporary model override.
+ * Called once at server startup to recover from unclean shutdowns.
+ */
+export async function restorePendingModelOverrides(): Promise<void> {
+	const pending = await db.query.narrators.findMany({
+		where: isNotNull(narrators.pendingModelRestore),
+		columns: { id: true, pendingModelRestore: true },
+	});
+	if (pending.length === 0) return;
+
+	const now = new Date().toISOString();
+	for (const n of pending) {
+		await db
+			.update(narrators)
+			.set({
+				model: n.pendingModelRestore,
+				pendingModelRestore: null,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, n.id));
+		logger.info("Restored model from pending temporary override on startup", {
+			narratorId: n.id,
+			restoreModel: n.pendingModelRestore,
 		});
 	}
 }

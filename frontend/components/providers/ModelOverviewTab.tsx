@@ -1,4 +1,14 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Badge,
 	Box,
@@ -11,7 +21,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { IconArrowDown, IconArrowUp, IconSettings } from "@tabler/icons-react";
+import { IconArrowDown, IconArrowUp, IconGripVertical, IconSettings } from "@tabler/icons-react";
 import React, { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ModelOption } from "../../lib/constants";
@@ -48,6 +58,7 @@ export const ModelOverviewTab = React.memo(function ModelOverviewTab({
 	selectedProvider,
 }: ModelOverviewTabProps) {
 	const { t } = useTranslation("settings");
+	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
 	const sortedGroups = useMemo(() => {
 		const orderMap = new Map(providerOrder.map((p, i) => [p, i]));
@@ -59,6 +70,22 @@ export const ModelOverviewTab = React.memo(function ModelOverviewTab({
 	}, [groups, providerOrder]);
 
 	const enabledGroups = useMemo(() => sortedGroups.filter((g) => !g.disabled), [sortedGroups]);
+
+	const handleDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const prefixes = sortedGroups.map((g) => g.prefix);
+			const oldIdx = prefixes.indexOf(active.id as string);
+			const newIdx = prefixes.indexOf(over.id as string);
+			if (oldIdx < 0 || newIdx < 0) return;
+			const next = [...prefixes];
+			next.splice(oldIdx, 1);
+			next.splice(newIdx, 0, active.id as string);
+			onProviderOrderChange(next);
+		},
+		[sortedGroups, onProviderOrderChange],
+	);
 
 	const moveProvider = useCallback(
 		(prefix: string, direction: -1 | 1) => {
@@ -78,29 +105,36 @@ export const ModelOverviewTab = React.memo(function ModelOverviewTab({
 		<Stack gap="md">
 			{/* ── Provider control rows ── */}
 			<Paper withBorder p="xs">
-				<Stack gap={0}>
-					{sortedGroups.map((group, idx) => (
-						<ProviderRow
-							key={group.prefix}
-							group={group}
-							hiddenModels={hiddenModels}
-							isFirst={idx === 0}
-							isLast={idx === sortedGroups.length - 1}
-							onMoveUp={() => moveProvider(group.prefix, -1)}
-							onMoveDown={() => moveProvider(group.prefix, 1)}
-							onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
-							onOpenDetail={() => onOpenProviderDetail(group.prefix)}
-							isSelected={selectedProvider === group.prefix}
-							showDivider={idx < sortedGroups.length - 1}
-							t={t}
-						/>
-					))}
-					{sortedGroups.length === 0 && (
-						<Text c="dimmed" ta="center" py="md" size="sm">
-							{t("overviewNoProviders")}
-						</Text>
-					)}
-				</Stack>
+				<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+					<SortableContext
+						items={sortedGroups.map((g) => g.prefix)}
+						strategy={verticalListSortingStrategy}
+					>
+						<Stack gap={0}>
+							{sortedGroups.map((group, idx) => (
+								<SortableProviderRow
+									key={group.prefix}
+									group={group}
+									hiddenModels={hiddenModels}
+									isFirst={idx === 0}
+									isLast={idx === sortedGroups.length - 1}
+									onMoveUp={() => moveProvider(group.prefix, -1)}
+									onMoveDown={() => moveProvider(group.prefix, 1)}
+									onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
+									onOpenDetail={() => onOpenProviderDetail(group.prefix)}
+									isSelected={selectedProvider === group.prefix}
+									showDivider={idx < sortedGroups.length - 1}
+									t={t}
+								/>
+							))}
+							{sortedGroups.length === 0 && (
+								<Text c="dimmed" ta="center" py="md" size="sm">
+									{t("overviewNoProviders")}
+								</Text>
+							)}
+						</Stack>
+					</SortableContext>
+				</DndContext>
 			</Paper>
 
 			{/* ── Final model list (grouped by provider) ── */}
@@ -125,9 +159,9 @@ export const ModelOverviewTab = React.memo(function ModelOverviewTab({
 	);
 });
 
-// ── Compact provider row (no model expansion) ──────────
+// ── Sortable provider row ──────────────────────────────
 
-interface ProviderRowProps {
+interface SortableProviderRowProps {
 	group: ProviderGroup;
 	hiddenModels: Set<string>;
 	isFirst: boolean;
@@ -141,7 +175,7 @@ interface ProviderRowProps {
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
-const ProviderRow = React.memo(function ProviderRow({
+const SortableProviderRow = React.memo(function SortableProviderRow({
 	group,
 	hiddenModels,
 	isFirst,
@@ -153,7 +187,17 @@ const ProviderRow = React.memo(function ProviderRow({
 	isSelected,
 	showDivider,
 	t,
-}: ProviderRowProps) {
+}: SortableProviderRowProps) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: group.prefix,
+	});
+
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0.5 : group.disabled ? 0.5 : 1,
+	};
+
 	const { visibleCount, hiddenCount } = useMemo(() => {
 		let v = 0;
 		let h = 0;
@@ -165,18 +209,29 @@ const ProviderRow = React.memo(function ProviderRow({
 	}, [group.models, hiddenModels]);
 
 	return (
-		<>
+		<div ref={setNodeRef} style={style}>
 			<Group
 				gap="xs"
 				wrap="nowrap"
 				py={6}
 				px={4}
 				style={{
-					opacity: group.disabled ? 0.5 : 1,
 					background: isSelected ? "var(--mantine-color-indigo-light)" : undefined,
 					borderRadius: 4,
 				}}
 			>
+				{/* Drag handle — no Tooltip to avoid flicker during drag */}
+				<ActionIcon
+					variant="subtle"
+					size="sm"
+					color="gray"
+					style={{ cursor: isDragging ? "grabbing" : "grab", touchAction: "none" }}
+					{...attributes}
+					{...listeners}
+				>
+					<IconGripVertical size={16} />
+				</ActionIcon>
+
 				{/* Name + badges */}
 				<UnstyledButton onClick={onOpenDetail} style={{ flex: 1, minWidth: 0 }}>
 					<Group gap={6} wrap="nowrap">
@@ -201,18 +256,14 @@ const ProviderRow = React.memo(function ProviderRow({
 					</Group>
 				</UnstyledButton>
 
-				{/* Sort */}
+				{/* Sort arrows */}
 				<Group gap={2} wrap="nowrap">
-					<Tooltip label={t("overviewMoveUp")}>
-						<ActionIcon variant="subtle" size="xs" disabled={isFirst} onClick={onMoveUp}>
-							<IconArrowUp size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("overviewMoveDown")}>
-						<ActionIcon variant="subtle" size="xs" disabled={isLast} onClick={onMoveDown}>
-							<IconArrowDown size={14} />
-						</ActionIcon>
-					</Tooltip>
+					<ActionIcon variant="subtle" size="xs" disabled={isFirst} onClick={onMoveUp}>
+						<IconArrowUp size={14} />
+					</ActionIcon>
+					<ActionIcon variant="subtle" size="xs" disabled={isLast} onClick={onMoveDown}>
+						<IconArrowDown size={14} />
+					</ActionIcon>
 				</Group>
 
 				{/* Enable/disable */}
@@ -228,7 +279,7 @@ const ProviderRow = React.memo(function ProviderRow({
 				</Tooltip>
 			</Group>
 			{showDivider && <Divider />}
-		</>
+		</div>
 	);
 });
 

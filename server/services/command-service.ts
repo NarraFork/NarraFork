@@ -3,7 +3,7 @@ import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { logger } from "../lib/logger";
-import type { Command, CommandParam } from "./chapter-service";
+import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
 import { loadAllSkills } from "./skill-service";
 
 /** Safely extract commands array from a chapterSettings value. */
@@ -22,6 +22,7 @@ export interface ResolvedCommand {
 	description?: string;
 	source: "user" | "project";
 	params?: CommandParam[];
+	modelOverride?: CommandModelOverride;
 }
 
 interface CommandResolveResult {

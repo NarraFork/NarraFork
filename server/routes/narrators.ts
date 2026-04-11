@@ -115,6 +115,7 @@ import {
 	runCustomCompact,
 	runSegmentCompact,
 	sendMessage,
+	setTemporaryModelRestore,
 	toBufferSummary,
 	updateBufferedMessage,
 	updateNarratorModel,
@@ -455,6 +456,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		commandText = cmdResult.rawCommand;
 	}
 
+	// Extract model override from resolved command (if any)
+	const modelOverride =
+		cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
+
 	// Running narrator: buffer the message for execution after the current turn
 	if (narrator.status === "thinking" || narrator.status === "waiting") {
 		if (narrator.type === "subagent") {
@@ -512,6 +517,18 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
+	// Apply model override from slash command before sending
+	if (modelOverride?.model) {
+		if (modelOverride.mode === "temporary") {
+			// Persist the original model so it can be restored after the turn
+			// (survives server restarts). Must be written before sendMessage to
+			// avoid a race with the agent loop's finally block.
+			await setTemporaryModelRestore(id, narrator.model ?? "__default__");
+		}
+		// Switch model in DB (sendMessage → ensureNarrator reads from DB)
+		await narratorService.updateModel(id, modelOverride.model);
+	}
+
 	const userMsg = await sendMessage(
 		id,
 		finalMessage,
@@ -522,6 +539,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		userId,
 		textFiles,
 	);
+
+	// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
+	if (modelOverride?.model) {
+		updateNarratorModel(id, modelOverride.model);
+	}
+
 	return c.json(userMsg, 201);
 });
 

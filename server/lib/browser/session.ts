@@ -21,6 +21,8 @@ export interface BrowserSession {
 	url: string;
 	/** Last activity timestamp (ms). */
 	lastActivity: number;
+	/** Whether this session uses headless (true) or headed/GUI (false) browser. */
+	headless: boolean;
 }
 
 /**
@@ -63,8 +65,12 @@ export function touchSession(session: BrowserSession): void {
 }
 
 /** Create a new browser session for a narrator. */
-export async function createSession(narratorId: string, url: string): Promise<BrowserSession> {
-	const context = await createContext();
+export async function createSession(
+	narratorId: string,
+	url: string,
+	headless = true,
+): Promise<BrowserSession> {
+	const context = await createContext(headless);
 	const page = await context.newPage();
 
 	// Puppeteer doesn't support viewport/userAgent at context level (unlike Playwright),
@@ -81,6 +87,7 @@ export async function createSession(narratorId: string, url: string): Promise<Br
 		page,
 		url,
 		lastActivity: Date.now(),
+		headless,
 	};
 
 	let map = sessions.get(narratorId);
@@ -91,7 +98,7 @@ export async function createSession(narratorId: string, url: string): Promise<Br
 	map.set(sessionId, session);
 
 	ensureCleanupTimer();
-	logger.info("Browser session created", { narratorId, sessionId, url });
+	logger.info("Browser session created", { narratorId, sessionId, url, headless });
 	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
 	return session;
 }
@@ -157,13 +164,14 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 /** List active sessions for a narrator. */
 export function listSessions(
 	narratorId: string,
-): Array<{ id: string; url: string; lastActivity: number }> {
+): Array<{ id: string; url: string; lastActivity: number; headless: boolean }> {
 	const map = sessions.get(narratorId);
 	if (!map) return [];
 	return Array.from(map.values()).map((s) => ({
 		id: s.id,
 		url: s.page.url(),
 		lastActivity: s.lastActivity,
+		headless: s.headless,
 	}));
 }
 

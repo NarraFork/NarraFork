@@ -25,8 +25,8 @@ const cachedModelsByProvider = new Map<string, NugModelInfo[]>();
 // === In-memory NUG quota cache (key = provider id) ===
 
 interface NugQuotaCache {
-	quotaBalance: number | null;
-	quotaTotalGranted: number | null;
+	balance: number | null;
+	totalGranted: number | null;
 	fetchedAt: number;
 }
 
@@ -42,7 +42,7 @@ function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugP
 /** Fetch quota from a single NUG provider. */
 async function fetchNugQuota(
 	config: NUGProviderConfig,
-): Promise<{ quotaBalance: number; quotaTotalGranted: number } | null> {
+): Promise<{ balance: number; totalGranted: number } | null> {
 	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
 	if (!baseUrl || !config.apiKey) return null;
 	try {
@@ -61,13 +61,13 @@ export async function fetchAllNugQuotas(): Promise<void> {
 			const data = await fetchNugQuota(p);
 			if (data) {
 				cachedQuotaByProvider.set(p.id, {
-					quotaBalance: data.quotaBalance,
-					quotaTotalGranted: data.quotaTotalGranted,
+					balance: data.balance,
+					totalGranted: data.totalGranted,
 					fetchedAt: Date.now(),
 				});
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
-					quotaBalance: data.quotaBalance,
+					balance: data.balance,
 				});
 			}
 		}),
@@ -81,8 +81,8 @@ export function updateNugQuotaByPrefix(prefix: string, quotaBalance: number | nu
 	if (!config) return;
 	const existing = cachedQuotaByProvider.get(config.id);
 	cachedQuotaByProvider.set(config.id, {
-		quotaBalance,
-		quotaTotalGranted: existing?.quotaTotalGranted ?? null,
+		balance: quotaBalance,
+		totalGranted: existing?.totalGranted ?? null,
 		fetchedAt: Date.now(),
 	});
 }
@@ -95,14 +95,13 @@ export function getNugCachedQuota(providerId: string): NugQuotaCache | undefined
 /** Get all cached quotas keyed by provider ID. */
 export function getAllNugCachedQuotas(): Record<
 	string,
-	{ quotaBalance: number | null; quotaTotalGranted: number | null }
+	{ balance: number | null; totalGranted: number | null }
 > {
-	const result: Record<string, { quotaBalance: number | null; quotaTotalGranted: number | null }> =
-		{};
+	const result: Record<string, { balance: number | null; totalGranted: number | null }> = {};
 	for (const [id, cache] of cachedQuotaByProvider) {
 		result[id] = {
-			quotaBalance: cache.quotaBalance,
-			quotaTotalGranted: cache.quotaTotalGranted,
+			balance: cache.balance,
+			totalGranted: cache.totalGranted,
 		};
 	}
 	return result;
@@ -219,7 +218,7 @@ async function fetchNugModels(config: NUGProviderConfig): Promise<NugModelInfo[]
 
 	const provider = new NugProvider(config);
 	const json = await provider.getModels();
-	const models = (json.data ?? []) as NugModelInfo[];
+	const models = (json.models ?? []) as NugModelInfo[];
 
 	const seen = new Set<string>();
 	const unique = models.filter((m) => {
@@ -306,8 +305,8 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 	try {
 		const data = await entry.provider.getQuota();
 		cachedQuotaByProvider.set(id, {
-			quotaBalance: data.quotaBalance,
-			quotaTotalGranted: data.quotaTotalGranted,
+			balance: data.balance,
+			totalGranted: data.totalGranted,
 			fetchedAt: Date.now(),
 		});
 		return c.json(data);
@@ -338,8 +337,28 @@ nugRoutes.get("/providers/:id/usage", async (c) => {
 nugRoutes.get("/providers/:id/usage/summary", async (c) => {
 	const entry = getNugProvider(c.req.param("id"));
 	if (!entry) return c.json({ error: `Provider "${c.req.param("id")}" not found` }, 404);
+	// Frontend sends `range` (today/7days/30days/all), NUG expects `period` (today/7days/month/all)
+	const range = c.req.query("range") ?? "month";
+	const periodMap: Record<string, string> = {
+		today: "today",
+		"7days": "7days",
+		"30days": "month",
+		month: "month",
+		all: "all",
+	};
+	const period = periodMap[range] ?? "month";
 	try {
-		const data = await entry.provider.getUsageSummary();
+		const raw = (await entry.provider.getUsageSummary(period)) as Record<string, unknown>;
+		// NUG returns snake_case fields with string numeric values; convert to camelCase numbers
+		const data = {
+			requestCount: Number(raw.request_count ?? raw.requestCount ?? 0),
+			totalMeterUsage: Number(raw.total_meter_usage ?? raw.totalMeterUsage ?? 0),
+			totalQuotaCost: Number(raw.total_quota_cost ?? raw.totalQuotaCost ?? 0),
+			totalInputTokens: Number(raw.total_input_tokens ?? raw.totalInputTokens ?? 0),
+			totalOutputTokens: Number(raw.total_output_tokens ?? raw.totalOutputTokens ?? 0),
+			totalCacheWriteTokens: Number(raw.total_cache_write_tokens ?? raw.totalCacheWriteTokens ?? 0),
+			totalCacheReadTokens: Number(raw.total_cache_read_tokens ?? raw.totalCacheReadTokens ?? 0),
+		};
 		return c.json(data);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -348,7 +367,7 @@ nugRoutes.get("/providers/:id/usage/summary", async (c) => {
 	}
 });
 
-/** Proxy NUG login — authenticate with NUG and get a session token. */
+/** Proxy NUG login — authenticate with NUG, then create an API key in one step. */
 nugRoutes.post("/providers/:id/login", async (c) => {
 	const id = c.req.param("id");
 	const providers = settings.nugProviders ?? [];
@@ -365,17 +384,43 @@ nugRoutes.post("/providers/:id/login", async (c) => {
 	}
 
 	try {
-		const response = await fetch(`${baseUrl}/api/auth/login`, {
+		// Step 1: Login to get session cookie
+		const loginResponse = await fetch(`${baseUrl}/api/auth/login`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ username, password }),
 		});
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
+		if (!loginResponse.ok) {
+			const errText = await loginResponse.text().catch(() => "");
 			return c.json({ error: `NUG login failed: ${errText}` }, 502);
 		}
-		const data = await response.json();
-		return c.json(data);
+
+		// Extract session cookie from Set-Cookie header
+		const setCookieHeader = loginResponse.headers.get("set-cookie") ?? "";
+		const sessionMatch = setCookieHeader.match(/nug_session=([^;]+)/);
+		const sessionToken = sessionMatch?.[1];
+		if (!sessionToken) {
+			return c.json({ error: "NUG login succeeded but no session cookie received" }, 502);
+		}
+
+		const loginData = (await loginResponse.json()) as { user?: Record<string, unknown> };
+
+		// Step 2: Create API key using the session cookie
+		const apiKeyResponse = await fetch(`${baseUrl}/api/api-keys`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Cookie: `nug_session=${sessionToken}`,
+			},
+			body: JSON.stringify({ name: `narrafork-${Date.now()}` }),
+		});
+		if (!apiKeyResponse.ok) {
+			const errText = await apiKeyResponse.text().catch(() => "");
+			return c.json({ error: `NUG API key creation failed: ${errText}` }, 502);
+		}
+
+		const apiKeyData = (await apiKeyResponse.json()) as { apiKey?: string };
+		return c.json({ apiKey: apiKeyData.apiKey, user: loginData.user });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("NUG login failed", { error: msg, provider: config.name });

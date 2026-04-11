@@ -23,6 +23,8 @@ export interface RuntimeContainerInfo {
 export interface RuntimeBrowserInfo {
 	processRunning: boolean;
 	connected: boolean;
+	headedRunning: boolean;
+	headedConnected: boolean;
 	activeSessions: number;
 }
 
@@ -83,8 +85,10 @@ function scanBrowsers(): RuntimeBrowserInfo {
 	const status = getBrowserStatus();
 	const sessionStats = getAllSessionStats();
 	return {
-		processRunning: status.running,
-		connected: status.connected,
+		processRunning: status.headless.running,
+		connected: status.headless.connected,
+		headedRunning: status.headed.running,
+		headedConnected: status.headed.connected,
 		activeSessions: sessionStats.totalSessions,
 	};
 }
