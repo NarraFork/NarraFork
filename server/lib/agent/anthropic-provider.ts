@@ -3,6 +3,7 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
 import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
+import { getHttpUserAgent } from "../user-agent";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -649,6 +650,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["X-Stainless-Timeout"] = "600";
 		} else {
 			reqHeaders["x-api-key"] = apiKey;
+			reqHeaders["user-agent"] = getHttpUserAgent();
 		}
 
 		logger.debug("Anthropic chat request", {
