@@ -55,6 +55,7 @@ import {
 import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploads";
 import {
 	askInPassingSchema,
+	askInPassingStartSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -1192,7 +1193,116 @@ narratorRoutes.post("/:id/fork", async (c) => {
 	return c.json(newNarrator, 201);
 });
 
-// Ask in passing: fork narrator from a message and immediately send a question
+// === Ask in passing ===
+
+type AskInPassingPendingBlock = {
+	type: "ask_in_passing";
+	status: "pending";
+	sourceMessageId?: string;
+	sourceMessageUuid?: string | null;
+};
+
+const ASK_IN_PASSING_CONTENT_PREFIX = "[Ask in passing]";
+
+function buildAskInPassingContentText(question?: string): string {
+	const trimmedQuestion = question?.trim();
+	return trimmedQuestion
+		? `${ASK_IN_PASSING_CONTENT_PREFIX} ${trimmedQuestion}`
+		: ASK_IN_PASSING_CONTENT_PREFIX;
+}
+
+function getAskInPassingPendingBlock(
+	message: { role: string; contentJson: unknown } | null | undefined,
+): AskInPassingPendingBlock | null {
+	if (!message || message.role !== "system" || !Array.isArray(message.contentJson)) {
+		return null;
+	}
+
+	for (const block of message.contentJson) {
+		if (!block || typeof block !== "object") continue;
+		const candidate = block as Record<string, unknown>;
+		if (candidate.type === "ask_in_passing" && candidate.status === "pending") {
+			return candidate as AskInPassingPendingBlock;
+		}
+	}
+
+	return null;
+}
+
+// Start: create a persistent pending message in the source narrator's chat
+narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
+	const id = c.req.param("id");
+	const userId = c.get("user").sub;
+	const body = await c.req.json();
+	const parsed = askInPassingStartSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { sourceMessageId, sourceMessageUuid } = parsed.data;
+
+	// Verify the source message belongs to this narrator
+	const ref = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, id),
+			eq(narratorMessageRefs.messageId, sourceMessageId),
+		),
+	});
+	if (!ref) throw new ValidationError("Source message not found in this narrator");
+
+	const now = new Date().toISOString();
+	const msgId = generateId();
+	const msg = await db.transaction(async (tx) => {
+		const [insertedMsg] = await tx
+			.insert(narratorMessages)
+			.values({
+				id: msgId,
+				narratorId: id,
+				role: "system",
+				contentJson: [
+					{
+						type: "ask_in_passing",
+						status: "pending",
+						sourceMessageId,
+						sourceMessageUuid: sourceMessageUuid ?? null,
+					},
+				],
+				contentText: buildAskInPassingContentText(),
+				createdBy: userId,
+				createdAt: now,
+			})
+			.returning();
+
+		const maxSeqResult = await tx
+			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, id));
+		const nextSeq = (maxSeqResult[0]?.maxSeq ?? -1) + 1;
+
+		await tx.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId: id,
+			messageId: msgId,
+			seq: nextSeq,
+		});
+
+		await tx
+			.update(narrators)
+			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+			.where(eq(narrators.id, id));
+
+		return insertedMsg;
+	});
+
+	// Broadcast so the UI updates in real-time
+	broadcastToNarrator(id, {
+		type: "message",
+		narratorId: id,
+		message: msg,
+	});
+
+	return c.json({ messageId: msgId }, 201);
+});
+
+// Resolve: fork + send question + update pending message to resolved
 narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const id = c.req.param("id");
 	const userId = c.get("user").sub;
@@ -1200,16 +1310,31 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const parsed = askInPassingSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const { forkMessageUuid, forkMessageId, question } = parsed.data;
-	if (!forkMessageUuid && !forkMessageId) {
-		throw new ValidationError("Either forkMessageUuid or forkMessageId is required");
+	const { question, pendingMessageId } = parsed.data;
+
+	// Verify the pending message exists, belongs to this narrator, and is still pending
+	const pendingMsg = await db.query.narratorMessages.findFirst({
+		where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
+	});
+	const pendingBlock = getAskInPassingPendingBlock(pendingMsg);
+	if (!pendingMsg || !pendingBlock) {
+		throw new ValidationError("Pending ask-in-passing message not found");
 	}
 
-	// Fork narrator from the specified message (standalone, full context)
-	// forkNarrator supports both messageUuid and direct messageId lookup
-	const newNarrator = await narratorService.forkNarrator(id, forkMessageUuid ?? null, {
+	const sourceMessageId = pendingBlock.sourceMessageId;
+	const sourceMessageUuid = pendingBlock.sourceMessageUuid ?? null;
+	if (!sourceMessageId && !sourceMessageUuid) {
+		throw new ValidationError("Pending ask-in-passing message is missing source reference");
+	}
+
+	// Auto-generate title from the question (truncate to 80 chars, take first line)
+	const title = question.replace(/\n.*/s, "").slice(0, 80);
+
+	// Fork narrator from the source recorded in the pending card (single source of truth)
+	const newNarrator = await narratorService.forkNarrator(id, sourceMessageUuid, {
 		inheritMode: "full",
-		forkMessageId,
+		forkMessageId: sourceMessageId,
+		title,
 	});
 
 	// Override permission mode to "default" (auto-approve read-only, manual for others)
@@ -1223,7 +1348,90 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 	await sendMessage(newNarrator.id, question, [], locale, replyInUserLanguage, userId);
 
+	// Update the pending message to resolved
+	const resolvedContentJson = [
+		{
+			type: "ask_in_passing",
+			status: "resolved",
+			sourceMessageId: sourceMessageId ?? null,
+			question,
+			targetNarratorId: newNarrator.id,
+			createdAt: new Date().toISOString(),
+		},
+	];
+	const resolvedContentText = buildAskInPassingContentText(question);
+	const updatedMsg = await db.transaction(async (tx) => {
+		await tx
+			.update(narratorMessages)
+			.set({ contentJson: resolvedContentJson, contentText: resolvedContentText })
+			.where(eq(narratorMessages.id, pendingMessageId));
+
+		await tx
+			.update(narrators)
+			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+			.where(eq(narrators.id, id));
+
+		return {
+			...pendingMsg,
+			contentJson: resolvedContentJson,
+			contentText: resolvedContentText,
+		};
+	});
+
+	// Broadcast the update
+	broadcastToNarrator(id, {
+		type: "message_updated",
+		narratorId: id,
+		message: updatedMsg,
+	});
+
 	return c.json(newNarrator, 201);
+});
+
+// Cancel: delete a pending message
+narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+
+	// Verify the message exists and is a pending ask-in-passing
+	const msg = await db.query.narratorMessages.findFirst({
+		where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+	});
+	if (!msg || !getAskInPassingPendingBlock(msg)) {
+		throw new ValidationError("Pending ask-in-passing message not found");
+	}
+
+	await db.transaction(async (tx) => {
+		await tx
+			.delete(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			);
+
+		const otherRef = await tx.query.narratorMessageRefs.findFirst({
+			where: eq(narratorMessageRefs.messageId, messageId),
+		});
+		if (!otherRef) {
+			await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+		}
+
+		await tx
+			.update(narrators)
+			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+			.where(eq(narrators.id, narratorId));
+	});
+
+	// Broadcast deletion
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+
+	return c.json({ ok: true });
 });
 
 // Get pending permissions

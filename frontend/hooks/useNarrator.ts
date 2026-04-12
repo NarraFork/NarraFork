@@ -158,23 +158,42 @@ export function useForkNarrator() {
 	});
 }
 
+export function useStartAskInPassing() {
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			sourceMessageId,
+			sourceMessageUuid,
+		}: {
+			narratorId: string;
+			sourceMessageId: string;
+			sourceMessageUuid?: string;
+		}) => api.startAskInPassing(narratorId, { sourceMessageId, sourceMessageUuid }),
+	});
+}
+
 export function useAskInPassing() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: ({
 			narratorId,
-			forkMessageUuid,
-			forkMessageId,
 			question,
+			pendingMessageId,
 		}: {
 			narratorId: string;
-			forkMessageUuid?: string;
-			forkMessageId?: string;
 			question: string;
-		}) => api.askInPassing(narratorId, { forkMessageUuid, forkMessageId, question }),
+			pendingMessageId: string;
+		}) => api.askInPassing(narratorId, { question, pendingMessageId }),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
+	});
+}
+
+export function useCancelAskInPassing() {
+	return useMutation({
+		mutationFn: ({ narratorId, messageId }: { narratorId: string; messageId: string }) =>
+			api.cancelAskInPassing(narratorId, messageId),
 	});
 }
 

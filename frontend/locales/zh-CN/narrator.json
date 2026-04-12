@@ -3,6 +3,7 @@
 	"narrator": "叙述者",
 	"thinking": "思考中",
 	"reasoning": "推理",
+	"reasoningEncryptedPlaceholder": "推理内容已加密",
 	"reasoningChars": "{{formatted}} 字符",
 	"planning": "计划中",
 	"compacting": "正在压缩...",
@@ -148,8 +149,10 @@
 	"contextMenu_viewFile": "查看该文件",
 	"contextMenu_askInPassing": "顺便提问",
 	"askInPassing_placeholder": "输入你的问题...",
+	"askInPassing_hint": "从此处创建分叉并发送新提问",
 	"askInPassing_confirm": "提问",
 	"askInPassing_cancel": "取消",
+	"askInPassing_resolvedLabel": "顺便提问",
 	"selectedBlocks": "已选中 {{count}} 个块",
 	"batchCopy": "复制",
 	"batchCopySuccess": "已复制 {{count}} 个块到剪贴板",
@@ -330,5 +333,7 @@
 	"reviewFeedbackTitle": "评审发现",
 	"reviewVerdict_approve": "已通过",
 	"reviewVerdict_request_changes": "需要修改",
-	"reviewVerdict_comment_only": "仅评论"
+	"reviewVerdict_comment_only": "仅评论",
+	"chromeNotInstalled": "未检测到 Chrome/Chromium 浏览器。请先安装 Chrome，或运行：bunx puppeteer browsers install chrome",
+	"chromeFlatpakUnsupported": "Flatpak 安装的 Chrome 无法直接使用。请通过 deb/rpm 等原生方式安装 Chrome，或运行：bunx puppeteer browsers install chrome"
 }

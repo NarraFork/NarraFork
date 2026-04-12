@@ -152,11 +152,13 @@ interface OAIMessage {
 	content?: string | OAIContentPart[] | null;
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
-	/** Reasoning blocks from the assistant message (used for Responses API replay). */
+	/** Reasoning blocks from the assistant message (used for Responses API replay/fallback). */
 	_reasoningBlocks?: Array<{
 		text: string;
 		providerMetadata?: import("./types").ReasoningProviderMetadata;
 	}>;
+	/** Plain-text reasoning summary fallback when Responses API reasoning items cannot be replayed. */
+	_reasoningTextFallback?: string;
 }
 
 interface OAIToolCall {
@@ -599,17 +601,20 @@ export class OpenAIProvider implements ProviderAdapter {
 	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
-			// Emit reasoning items before text/tool_calls for Responses API
-			if (reasoningBlocks?.length) {
-				const emittedIds = new Set<string>();
-				emitReasoningItems(reasoningBlocks, h, emittedIds);
-			}
-			if (text) {
+			const reasoningTextFallback = buildReasoningTextFallback(reasoningBlocks);
+			const assistantText = reasoningTextFallback
+				? text
+					? `${reasoningTextFallback}\n\n${text}`
+					: reasoningTextFallback
+				: text;
+			if (assistantText) {
 				// Use Responses API array format (output_text) for consistency with
 				// convertHistoryToResponsesApi — ensures identical format whether
 				// history is built from DB or pushed mid-loop, preserving cache prefix.
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				h.push({ role: "assistant", content: [{ type: "output_text", text }] } as any);
+				h.push({
+					role: "assistant",
+					content: [{ type: "output_text", text: assistantText }],
+				} as unknown as OAIMessage);
 			}
 			for (const tu of toolUses) {
 				logger.debug("OpenAI pushAssistantTurn function_call", {
@@ -1750,9 +1755,10 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			// Always set content explicitly to avoid sending {role:"assistant"} with no fields.
 			const assistantMsg: OAIMessage = { role: "assistant", content: hasText ? text : null };
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-			// Attach reasoning blocks for Responses API replay (stripped in buildHistory for Chat Completions)
+			// Attach reasoning blocks and plain-text fallback for Responses API history.
 			if (reasoningBlocks.length > 0) {
 				assistantMsg._reasoningBlocks = reasoningBlocks;
+				assistantMsg._reasoningTextFallback = buildReasoningTextFallback(reasoningBlocks);
 			}
 			history.push(assistantMsg);
 
@@ -1791,69 +1797,66 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 }
 
 /**
- * Emit Responses API reasoning items from stored reasoning blocks.
- * Groups blocks by itemId — multiple summary parts with the same itemId
- * are merged into a single reasoning item with multiple summary entries.
- * Blocks without provider metadata (e.g. from non-Codex providers) are skipped.
+ * Build a plain-text reasoning summary fallback for assistant history.
+ *
+ * With store: false, historical Responses API reasoning items (itemId / encrypted_content)
+ * cannot be replayed after they have been persisted to our DB. We therefore keep their
+ * summary text as ordinary assistant text context instead of attempting to replay them.
  */
-function emitReasoningItems(
+function buildReasoningTextFallback(
 	reasoningBlocks:
 		| Array<{
 				text: string;
 				providerMetadata?: import("./types").ReasoningProviderMetadata;
 		  }>
 		| undefined,
-	// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
-	result: any[],
-	emittedIds: Set<string>,
-): void {
-	if (!reasoningBlocks?.length) return;
+): string {
+	if (!reasoningBlocks?.length) return "";
 
-	// Group by itemId for deduplication
-	const grouped = new Map<
-		string,
-		{
-			itemId: string;
-			encryptedContent?: string | null;
-			summaryTexts: string[];
-		}
-	>();
-
+	const parts: string[] = [];
 	for (const block of reasoningBlocks) {
+		const text = block.text?.trim();
+		if (!text) continue;
 		const itemId = block.providerMetadata?.openai?.itemId;
-		if (!itemId) continue; // Skip blocks without provider metadata
-		if (emittedIds.has(itemId)) continue; // Already emitted in a previous message
-
-		let group = grouped.get(itemId);
-		if (!group) {
-			group = {
-				itemId,
-				encryptedContent: block.providerMetadata?.openai?.reasoningEncryptedContent,
-				summaryTexts: [],
-			};
-			grouped.set(itemId, group);
+		if (itemId) {
+			logger.debug("Using historical reasoning summary as text fallback", { itemId });
 		}
-		if (block.text) {
-			group.summaryTexts.push(block.text);
-		}
-		// Update encrypted content if this block has a newer value
-		if (block.providerMetadata?.openai?.reasoningEncryptedContent != null) {
-			group.encryptedContent = block.providerMetadata.openai.reasoningEncryptedContent;
-		}
+		parts.push(text);
 	}
 
-	for (const [itemId, group] of grouped) {
-		emittedIds.add(itemId);
-		result.push({
-			type: "reasoning",
-			id: group.itemId,
-			encrypted_content: group.encryptedContent ?? null,
-			summary: group.summaryTexts.map((text) => ({
-				type: "summary_text",
-				text,
-			})),
-		});
+	return parts.join("\n");
+}
+
+function mergeAssistantTextWithReasoningFallback(
+	content: OAIMessage["content"],
+	reasoningTextFallback: string | undefined,
+): OAIMessage["content"] {
+	const fallback = reasoningTextFallback?.trim();
+	if (!fallback) return content;
+
+	if (typeof content === "string") {
+		return content ? `${fallback}\n\n${content}` : fallback;
 	}
+
+	if (Array.isArray(content)) {
+		const outputText = content.find(
+			(part): part is Extract<OAIContentPart, { type: "output_text" }> =>
+				part.type === "output_text",
+		);
+		if (outputText) {
+			return content.map((part) =>
+				part === outputText
+					? {
+							...part,
+							text: part.text ? `${fallback}\n\n${part.text}` : fallback,
+						}
+					: part,
+			);
+		}
+		return [{ type: "output_text", text: fallback }, ...content];
+	}
+
+	return fallback;
 }
 
 // === Responses API history converter ===
@@ -1867,8 +1870,6 @@ function emitReasoningItems(
  */
 function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 	const result: OAIMessage[] = [];
-	// Track emitted reasoning item IDs to deduplicate (same itemId across multiple blocks)
-	const emittedReasoningIds = new Set<string>();
 	for (const msg of messages) {
 		// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
 		const m = msg as any;
@@ -1899,12 +1900,12 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 				output: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
 			} as unknown as OAIMessage);
 		} else if (m.role === "assistant" && m.tool_calls?.length) {
-			// Split assistant message with tool_calls into reasoning + text + separate function_call items
-			// Emit reasoning items first (before text/tool_calls)
-			emitReasoningItems(m._reasoningBlocks, result, emittedReasoningIds);
-			if (m.content) {
-				const content =
-					typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
+			// Split assistant message with tool_calls into assistant text + separate function_call items.
+			const content = mergeAssistantTextWithReasoningFallback(
+				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content,
+				m._reasoningTextFallback,
+			);
+			if (content) {
 				result.push({ role: "assistant", content } as unknown as OAIMessage);
 			}
 			for (const tc of m.tool_calls as OAIToolCall[]) {
@@ -1919,18 +1920,17 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 			// Assistant message without tool calls — convert content to array format.
 			// Skip null/empty content because Responses API rejects role messages
 			// whose content is null.
-			// Emit reasoning items first
-			emitReasoningItems(m._reasoningBlocks, result, emittedReasoningIds);
-			if (typeof m.content === "string") {
-				if (!m.content) continue;
+			const content = mergeAssistantTextWithReasoningFallback(m.content, m._reasoningTextFallback);
+			if (typeof content === "string") {
+				if (!content) continue;
 				result.push({
 					role: "assistant",
-					content: [{ type: "output_text", text: m.content }],
+					content: [{ type: "output_text", text: content }],
 				} as unknown as OAIMessage);
 				continue;
 			}
-			if (Array.isArray(m.content) && m.content.length > 0) {
-				result.push({ role: "assistant", content: m.content } as unknown as OAIMessage);
+			if (Array.isArray(content) && content.length > 0) {
+				result.push({ role: "assistant", content } as unknown as OAIMessage);
 			}
 		} else if (m.type === "function_call_output" || m.type === "function_call") {
 			// Already in Responses API format — pass through

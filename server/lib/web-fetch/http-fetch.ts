@@ -18,6 +18,8 @@ const BROWSER_UNAVAILABLE_PATTERNS = [
 	"cannot open shared object",
 	"Executable doesn't exist",
 	"browserType.launch",
+	"executablePath",
+	"channel must be specified",
 ];
 
 /** Check if an error message indicates the browser is simply not available. */

@@ -3,6 +3,7 @@
 	"narrator": "Narrator",
 	"thinking": "Thinking",
 	"reasoning": "Reasoning",
+	"reasoningEncryptedPlaceholder": "Reasoning content is encrypted",
 	"reasoningChars": "{{formatted}} chars",
 	"planning": "Planning",
 	"compacting": "Compacting...",
@@ -148,8 +149,10 @@
 	"contextMenu_viewFile": "View this file",
 	"contextMenu_askInPassing": "Ask in passing",
 	"askInPassing_placeholder": "Type your question...",
+	"askInPassing_hint": "Fork from here and send a new question",
 	"askInPassing_confirm": "Ask",
 	"askInPassing_cancel": "Cancel",
+	"askInPassing_resolvedLabel": "Asked in passing",
 	"selectedBlocks": "{{count}} block(s) selected",
 	"batchCopy": "Copy",
 	"batchCopySuccess": "Copied {{count}} block(s) to clipboard",
@@ -330,5 +333,7 @@
 	"reviewFeedbackTitle": "Review Findings",
 	"reviewVerdict_approve": "Approved",
 	"reviewVerdict_request_changes": "Changes Requested",
-	"reviewVerdict_comment_only": "Comments Only"
+	"reviewVerdict_comment_only": "Comments Only",
+	"chromeNotInstalled": "Chrome/Chromium is not installed. Please install Chrome, or run: bunx puppeteer browsers install chrome",
+	"chromeFlatpakUnsupported": "Flatpak-installed Chrome cannot be used directly. Please install Chrome natively (deb/rpm), or run: bunx puppeteer browsers install chrome"
 }

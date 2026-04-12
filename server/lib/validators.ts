@@ -473,9 +473,13 @@ export const forkNarratorSchema = z.object({
 });
 
 export const askInPassingSchema = z.object({
-	forkMessageUuid: z.string().min(1).optional(),
-	forkMessageId: z.string().min(1).optional(),
 	question: z.string().min(1).max(10000),
+	pendingMessageId: z.string().min(1),
+});
+
+export const askInPassingStartSchema = z.object({
+	sourceMessageId: z.string().min(1),
+	sourceMessageUuid: z.string().min(1).optional(),
 });
 
 export const updateNarratorModelSchema = z.object({

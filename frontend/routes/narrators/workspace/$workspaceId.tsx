@@ -170,6 +170,7 @@ function WorkspacePage() {
 			id: workspaceId,
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 			title: (workspace as any).title || "Workspace",
+			updateOnly: true,
 		});
 	}, [workspaceId, workspace]);
 

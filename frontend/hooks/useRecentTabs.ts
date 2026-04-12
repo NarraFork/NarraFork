@@ -87,6 +87,24 @@ function regroupTabs(tabs: RecentTab[]): void {
 	}
 }
 
+function getPinnedSectionEndIndex(tabs: RecentTab[]): number {
+	let idx = 0;
+	while (idx < tabs.length) {
+		const tab = tabs[idx];
+		if (!tab) break;
+		if (tab.workspaceId) {
+			idx++;
+			continue;
+		}
+		if (!tab.pinned) break;
+		idx++;
+		if (tab.type === "workspace") {
+			while (idx < tabs.length && tabs[idx]?.workspaceId === tab.id) idx++;
+		}
+	}
+	return idx;
+}
+
 export function applyRecentTabMove(
 	tabs: RecentTab[],
 	key: string,
@@ -201,9 +219,8 @@ export function useRecentTabs() {
 			if (!pinned) delete tab.pinned;
 			next.splice(idx, 1);
 			// Insert at end of pinned section (or start of unpinned section)
-			let insertIdx = 0;
-			while (insertIdx < next.length && next[insertIdx].pinned) insertIdx++;
-			next.splice(insertIdx, 0, tab);
+			next.splice(getPinnedSectionEndIndex(next), 0, tab);
+			regroupTabs(next);
 			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
 			return { prev };
 		},

@@ -124,6 +124,55 @@ function regroupWorkspaces(tabs: Record<string, unknown>[]): void {
 	}
 }
 
+/**
+ * Return the array index immediately after the pinned top-level section.
+ * Workspace children ride along with their header, so they do not break the pinned zone.
+ */
+function getPinnedSectionEndIndex(tabs: Record<string, unknown>[]): number {
+	let idx = 0;
+	while (idx < tabs.length) {
+		const tab = tabs[idx];
+		if (tab.workspaceId) {
+			idx++;
+			continue;
+		}
+		if (!tab.pinned) break;
+		idx++;
+		if (tab.type === "workspace") {
+			while (idx < tabs.length && tabs[idx].workspaceId === tab.id) idx++;
+		}
+	}
+	return idx;
+}
+
+/**
+ * Move an existing top-level tab (or workspace group) to the front of the unpinned section.
+ * Pinned tabs keep their manual order, and workspace children stay attached to their header.
+ */
+function promoteTopLevelTabRespectingPins(tabs: Record<string, unknown>[], idx: number): void {
+	const tab = tabs[idx];
+	if (!tab || tab.workspaceId || tab.pinned) return;
+
+	let movedGroup: Record<string, unknown>[];
+	if (tab.type === "workspace") {
+		let end = idx + 1;
+		while (end < tabs.length && tabs[end].workspaceId === tab.id) end++;
+		movedGroup = tabs.splice(idx, end - idx);
+	} else {
+		movedGroup = tabs.splice(idx, 1);
+	}
+
+	tabs.splice(getPinnedSectionEndIndex(tabs), 0, ...movedGroup);
+}
+
+/** Insert a new top-level tab at the front of the unpinned section. */
+function insertTopLevelTabRespectingPins(
+	tabs: Record<string, unknown>[],
+	tab: Record<string, unknown>,
+): void {
+	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
+}
+
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
 export async function enrichTabs(
 	tabs: Record<string, unknown>[],
@@ -477,7 +526,7 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 
 		migrateTabTypes(tabs);
 
-		// Upsert: merge into existing or prepend
+		// Upsert: merge into existing or insert into the recent order while preserving the pinned zone
 		const idx = tabs.findIndex((t) => t.type === tab.type && t.id === tab.id);
 		if (idx >= 0) {
 			if (updateOnly) {
@@ -490,6 +539,7 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 				tabs[idx] = { ...tabs[idx], ...patch };
 			} else {
 				tabs[idx] = { ...tabs[idx], ...tab };
+				promoteTopLevelTabRespectingPins(tabs as Record<string, unknown>[], idx);
 			}
 		} else if (updateOnly) {
 			sqlite.run("COMMIT");
@@ -508,12 +558,12 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 					}
 					tabs.splice(insertIdx, 0, tab);
 				} else {
-					// Header not found — clear workspaceId and prepend as top-level
+					// Header not found — clear workspaceId and insert as a top-level tab.
 					delete (tab as Record<string, unknown>).workspaceId;
-					tabs.unshift(tab);
+					insertTopLevelTabRespectingPins(tabs as Record<string, unknown>[], tab);
 				}
 			} else {
-				tabs.unshift(tab);
+				insertTopLevelTabRespectingPins(tabs as Record<string, unknown>[], tab);
 			}
 		}
 		tabs = tabs.slice(0, MAX_RECENT_TABS);

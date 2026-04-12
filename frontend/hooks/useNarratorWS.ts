@@ -446,6 +446,7 @@ export function useNarratorWS(
 					case "message_updated":
 						if (data.message) {
 							callbacksRef.current.onMessageUpdated?.(data.message as TreeMessage);
+							narratorWSManager.bumpMessageVersion(subscribedId);
 						}
 						break;
 					case "commits_updated":

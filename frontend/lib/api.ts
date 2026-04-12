@@ -986,13 +986,28 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ forkMessageUuid, title, inheritMode }),
 		}),
+	startAskInPassing: (
+		narratorId: string,
+		opts: { sourceMessageId: string; sourceMessageUuid?: string },
+	) =>
+		request<{ messageId: string }>(`/narrators/${narratorId}/ask-in-passing/start`, {
+			method: "POST",
+			body: JSON.stringify(opts),
+		}),
 	askInPassing: (
 		narratorId: string,
-		opts: { forkMessageUuid?: string; forkMessageId?: string; question: string },
+		opts: {
+			question: string;
+			pendingMessageId: string;
+		},
 	) =>
 		request<ApiEntity>(`/narrators/${narratorId}/ask-in-passing`, {
 			method: "POST",
 			body: JSON.stringify(opts),
+		}),
+	cancelAskInPassing: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/ask-in-passing/${messageId}`, {
+			method: "DELETE",
 		}),
 	forkFromMessages: (narratorId: string, messageIds: string[], title?: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork-messages`, {

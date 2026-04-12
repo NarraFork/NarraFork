@@ -99,6 +99,7 @@ export type AgentEvent =
 			text: string;
 			toolUses: AgentToolUse[];
 			messageId?: string;
+			stopReason?: string;
 	  }
 	| { type: "stream_text"; text: string }
 	| {

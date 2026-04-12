@@ -1175,8 +1175,8 @@ export async function handlePermission(
 
 	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
 
-	// Plan mode: redirect Write/Edit targeting common plan file names (plan.md, PLAN.md)
-	// to the designated plan file, instead of rejecting outright.
+	// Plan mode: redirect Write/Edit targeting any .md file to the designated plan file,
+	// instead of rejecting outright.
 	// The model sometimes forgets the exact plan file path — this saves a wasted tool call.
 	let planRedirectNotice: string | undefined;
 	if (isPlanMode && !isRelaxedPlan && planFileId && (toolName === "Write" || toolName === "Edit")) {
@@ -1185,9 +1185,9 @@ export async function handlePermission(
 			const absPath = resolvePath(cwd, filePath);
 			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
 			if (!pathsEqual(absPath, planFilePath)) {
-				// Check if the filename looks like a plan file (plan.md, plan-xxx.md, PLAN.md, etc.)
+				// Check if the filename ends with .md
 				const fileName = filePath.split("/").pop()?.toLowerCase() ?? "";
-				if (/^plan(?:[-_].+)?\.md$/.test(fileName)) {
+				if (fileName.endsWith(".md")) {
 					const correctRelPath = `.narrafork/plan-${planFileId}.md`;
 					effectiveInput = { ...effectiveInput, file_path: correctRelPath };
 					planRedirectNotice = getToolMessageWithParams("planModeFileRedirected", locale, {

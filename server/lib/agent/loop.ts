@@ -531,6 +531,7 @@ export async function* agentLoop(
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
+		let stopReason: string | undefined;
 		// Map of tool executions started during streaming (toolUseId → Promise)
 		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 		// Synchronously queryable map of settled early-exec results (populated via .then())
@@ -908,6 +909,7 @@ export async function* agentLoop(
 
 					if (parsed.messageId) messageId = parsed.messageId;
 					if (parsed.credentialId) credentialId = parsed.credentialId;
+					if (parsed.stopReason) stopReason = parsed.stopReason;
 
 					if (parsed.reasoning) {
 						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
@@ -1219,6 +1221,7 @@ export async function* agentLoop(
 				text: assistantText,
 				toolUses,
 				messageId,
+				stopReason,
 			};
 
 			if (toolUses.length === 0) {
@@ -1283,6 +1286,7 @@ export async function* agentLoop(
 				text: assistantText,
 				toolUses,
 				messageId,
+				stopReason,
 			};
 		}
 

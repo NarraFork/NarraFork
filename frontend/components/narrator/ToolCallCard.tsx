@@ -887,6 +887,27 @@ function ToolHeader({
 	);
 }
 
+/**
+ * Localize known tool error messages (e.g. Chrome not installed).
+ * Returns the localized string, or the original message if no match.
+ */
+function useLocalizedToolError(errorMessage: string | undefined): string | undefined {
+	const { t } = useTranslation("narrator");
+	if (!errorMessage) return undefined;
+	// Flatpak Chrome detected but can't be launched
+	if (errorMessage.includes("Flatpak")) {
+		return t("chromeFlatpakUnsupported");
+	}
+	// Chrome not found or launch failed
+	if (
+		errorMessage.includes("Chrome/Chromium") ||
+		errorMessage.includes("puppeteer browsers install chrome")
+	) {
+		return t("chromeNotInstalled");
+	}
+	return errorMessage;
+}
+
 // --- Detail renderers per category ---
 
 const codeStyle = { fontSize: 11, maxHeight: 200, overflow: "auto" } as const;
@@ -1480,6 +1501,9 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const raw = resolveDisplayText(toolCall.outputJson);
 
+	// Localize known error messages
+	const localizedError = useLocalizedToolError(toolCall.errorMessage);
+
 	// For screenshot mode, check if there are images in the output metadata
 	const isScreenshot = mode === "screenshot";
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
@@ -1551,9 +1575,9 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{raw}
 				</Text>
 			)}
-			{toolCall.errorMessage && !toolCall.outputJson && (
+			{localizedError && !toolCall.outputJson && (
 				<Text size="xs" c="red" mt={4}>
-					{toolCall.errorMessage}
+					{localizedError}
 				</Text>
 			)}
 		</Box>
@@ -2159,6 +2183,7 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 	const previewUrl = meta?.previewUrl as string | undefined;
 	const isScreenshot = action === "screenshot";
+	const localizedError = useLocalizedToolError(toolCall.errorMessage);
 
 	return (
 		<Box mt="xs">
@@ -2232,9 +2257,9 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
-			{toolCall.errorMessage && !toolCall.outputJson && (
+			{localizedError && !toolCall.outputJson && (
 				<Text size="xs" c="red" mt={4}>
-					{toolCall.errorMessage}
+					{localizedError}
 				</Text>
 			)}
 		</Box>

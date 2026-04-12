@@ -740,5 +740,21 @@
 	"runtimeCleanupConfirm": "Are you sure? This will terminate the selected resources.",
 	"runtimeScanFailed": "Runtime scan failed",
 	"runtimeCleanupFailed": "Runtime cleanup failed",
-	"runtimeNone": "None"
+	"runtimeNone": "None",
+
+	"providerStatusConnected": "Connected",
+	"providerStatusUnverified": "Unverified",
+	"providerStatusError": "Error",
+	"providerStatusDisabled": "Disabled",
+	"providerStatusPartial": "Partial",
+	"providerTypePlatform": "Platform",
+	"providerTypeCustom": "Custom",
+	"providerRefreshModels": "Refresh model list",
+	"providerSectionPlatform": "Platform Integrations",
+	"providerSectionCustom": "Custom Providers",
+	"providerStatsTotal": "Total providers",
+	"providerStatsEnabled": "Enabled",
+	"providerStatsModels": "Available models",
+	"providerConfigDesc": "Configure API credentials, model list, and advanced options.",
+	"overviewHiddenCount": "{{count}} hidden"
 }

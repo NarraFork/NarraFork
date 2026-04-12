@@ -740,5 +740,21 @@
 	"runtimeCleanupConfirm": "确定要执行此操作吗？这将终止选中的资源。",
 	"runtimeScanFailed": "运行时扫描失败",
 	"runtimeCleanupFailed": "运行时清理失败",
-	"runtimeNone": "无"
+	"runtimeNone": "无",
+
+	"providerStatusConnected": "已连接",
+	"providerStatusUnverified": "未验证",
+	"providerStatusError": "错误",
+	"providerStatusDisabled": "已禁用",
+	"providerStatusPartial": "部分可用",
+	"providerTypePlatform": "平台",
+	"providerTypeCustom": "自建",
+	"providerRefreshModels": "刷新模型列表",
+	"providerSectionPlatform": "平台集成",
+	"providerSectionCustom": "自建供应商",
+	"providerStatsTotal": "供应商总数",
+	"providerStatsEnabled": "已启用",
+	"providerStatsModels": "可用模型",
+	"providerConfigDesc": "配置供应商的 API 凭据、模型列表和高级选项。",
+	"overviewHiddenCount": "{{count}} 个已隐藏"
 }

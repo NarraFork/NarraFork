@@ -53,8 +53,10 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, getToken } from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
+import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
@@ -79,6 +81,18 @@ import {
 // Only written when the user explicitly toggles — blocks without an entry
 // always follow the global preference (narrafork_expand_reasoning).
 const reasoningExpandState = new Map<string, boolean>();
+
+function hasEncryptedReasoningMetadata(block: unknown): boolean {
+	if (!block || typeof block !== "object") return false;
+	const providerMetadata = (block as Record<string, unknown>).providerMetadata;
+	if (!providerMetadata || typeof providerMetadata !== "object") return false;
+
+	return Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
+		if (!metadata || typeof metadata !== "object") return false;
+		const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
+		return typeof encrypted === "string" && encrypted.length > 0;
+	});
+}
 
 let nextRbInstanceId = 0;
 
@@ -241,8 +255,11 @@ function ReasoningBlock({
 	// simultaneously (e.g. loading a long conversation with expand=true).
 	const hasToggled = useRef(persistedState !== undefined);
 
-	const text: string = block.text || block.thinking || "";
+	const rawText: string = block.text || block.thinking || "";
 	const translatedText: string | undefined = block.translatedText;
+	const hasEncryptedReasoning = hasEncryptedReasoningMetadata(block);
+	const encryptedPlaceholder = t("reasoningEncryptedPlaceholder");
+	const text = rawText || (hasEncryptedReasoning ? encryptedPlaceholder : "");
 	const [showTranslation, setShowTranslation] = useState(!!translatedText);
 	const prevTranslatedRef = useRef(translatedText);
 	// Auto-switch to translation when it arrives via WS update
@@ -328,8 +345,8 @@ function ReasoningBlock({
 	};
 
 	const copyText = useCallback(() => {
-		navigator.clipboard.writeText(text);
-	}, [text]);
+		navigator.clipboard.writeText(displayText);
+	}, [displayText]);
 
 	// During streaming with no content yet, show a minimal "thinking" indicator
 	if (streaming && !displayText) {
@@ -383,7 +400,7 @@ function ReasoningBlock({
 			}}
 		>
 			<MarkdownContent text={displayText} streaming={streaming} />
-			{translatedText && text && (
+			{translatedText && rawText && (
 				<Group
 					gap={4}
 					mt={4}
@@ -1655,6 +1672,9 @@ export const MessageBubble = memo(function MessageBubble({
 	const qc = useQueryClient();
 	const _msgId = message.id;
 
+	// User preferences for send mode
+	const { data: userPrefs } = useUserPreferences();
+
 	// Edit mode state for user messages
 	const [isEditing, setIsEditing] = useState(false);
 	const [editContent, setEditContent] = useState("");
@@ -1699,6 +1719,42 @@ export const MessageBubble = memo(function MessageBubble({
 			setShowConfirmModal(false);
 		},
 		[message.id, onEditAndRegenerate, editContent],
+	);
+
+	// Handle keyboard shortcuts in edit mode
+	const handleEditKeyDown = useCallback(
+		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+			if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+
+			const ctrlEnterMode = (userPrefs?.sendMode ?? "enter") === "ctrl+enter";
+
+			if (ctrlEnterMode) {
+				// Ctrl+Enter mode: Ctrl/Cmd+Enter submits, plain Enter inserts newline
+				if (e.ctrlKey || e.metaKey) {
+					e.preventDefault();
+					handleConfirmClick();
+				}
+			} else {
+				// Enter mode (default): Enter submits, Shift/Ctrl/Cmd+Enter inserts newline
+				if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+					e.preventDefault();
+					handleConfirmClick();
+				} else if (e.ctrlKey || e.metaKey) {
+					// Ctrl/Cmd+Enter: browsers don't insert a newline by default, do it manually
+					e.preventDefault();
+					const textarea = e.currentTarget;
+					const { selectionStart, selectionEnd } = textarea;
+					const before = editContent.slice(0, selectionStart);
+					const after = editContent.slice(selectionEnd);
+					const newValue = `${before}\n${after}`;
+					setEditContent(newValue);
+					requestAnimationFrame(() => {
+						textarea.selectionStart = textarea.selectionEnd = selectionStart + 1;
+					});
+				}
+			}
+		},
+		[userPrefs?.sendMode, editContent, handleConfirmClick],
 	);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
@@ -1787,6 +1843,17 @@ export const MessageBubble = memo(function MessageBubble({
 	const reviewFeedbackBlock = blocks.find((b: any) => b.type === "review_feedback");
 	if (reviewFeedbackBlock) {
 		return <ReviewFeedbackCard block={reviewFeedbackBlock} />;
+	}
+
+	// Ask-in-passing cards — pending (input box) or resolved (link to new narrator)
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const askInPassingBlock = blocks.find((b: any) => b.type === "ask_in_passing");
+	if (askInPassingBlock) {
+		if (askInPassingBlock.status === "pending") {
+			if (!message.id || !narratorId) return null;
+			return <AskInPassingPendingCard messageId={message.id} narratorId={narratorId} />;
+		}
+		return <AskInPassingResolvedCard block={askInPassingBlock} />;
 	}
 
 	// Segment compact indicators — rendered for both role="user" (new) and role="system" (legacy)
@@ -1999,6 +2066,7 @@ export const MessageBubble = memo(function MessageBubble({
 							<Textarea
 								value={editContent}
 								onChange={(e) => setEditContent(e.currentTarget.value)}
+								onKeyDown={handleEditKeyDown}
 								autosize
 								minRows={2}
 								maxRows={10}

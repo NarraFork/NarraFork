@@ -79,6 +79,8 @@ export interface ParsedStreamEvent {
 	responseId?: string;
 	/** Internal: set when Responses API format is detected from the gateway */
 	_responsesApi?: boolean;
+	/** Stop reason from message_delta (Anthropic) or finish_reason (OpenAI) */
+	stopReason?: string;
 }
 
 // === Chat parameters passed to provider.chat() ===

@@ -48,6 +48,7 @@ function buildLaunchArgs(headless: boolean): string[] {
  * 1. PUPPETEER_EXECUTABLE_PATH env var
  * 2. Puppeteer cache: ~/.cache/puppeteer/chrome/
  * 3. System Chrome (google-chrome, chromium, etc.)
+ * 4. Flatpak Chrome/Chromium installations
  */
 function findChromePath(): string | undefined {
 	// 1. Explicit env var
@@ -72,6 +73,12 @@ function findChromePath(): string | undefined {
 			logger.info("Found system Chrome", { path: p });
 			return p;
 		}
+	}
+
+	// 4. Flatpak Chrome/Chromium
+	if (process.platform === "linux") {
+		const flatpakPath = scanFlatpakChrome();
+		if (flatpakPath) return flatpakPath;
 	}
 
 	return undefined;
@@ -114,6 +121,32 @@ function scanPuppeteerCache(cacheDir: string): string | undefined {
 	} catch {
 		// Not readable
 	}
+	return undefined;
+}
+
+/** Scan Flatpak Chrome/Chromium installations. */
+function scanFlatpakChrome(): string | undefined {
+	const xdgDataHome = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
+
+	// Flatpak app IDs and their binary paths relative to <install-dir>/current/active/files/
+	const flatpakApps = [
+		{ id: "com.google.Chrome", binary: join("extra", "chrome") },
+		{ id: "org.chromium.Chromium", binary: join("extra", "chromium") },
+	];
+
+	// Installation roots: user-level first, then system-wide
+	const installRoots = [join(xdgDataHome, "flatpak", "app"), "/var/lib/flatpak/app"];
+
+	for (const root of installRoots) {
+		for (const app of flatpakApps) {
+			const candidate = join(root, app.id, "current", "active", "files", app.binary);
+			if (existsSync(candidate)) {
+				logger.info("Found Flatpak Chrome", { appId: app.id, path: candidate });
+				return candidate;
+			}
+		}
+	}
+
 	return undefined;
 }
 
@@ -190,22 +223,33 @@ async function launchBrowser(headless: boolean): Promise<Browser> {
 			return b;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			logger.warn("Chrome found but launch failed, trying default", {
+			logger.warn("Chrome found but launch failed", {
 				chromePath: executablePath,
 				error: msg.slice(0, 500),
 			});
-			// Fall through to default launch
+
+			// Flatpak Chrome can't be launched directly — give a specific hint
+			if (executablePath.includes("/flatpak/")) {
+				throw new Error(
+					"Chrome was found at a Flatpak path but cannot be launched directly. " +
+						"Please install Chrome natively (deb/rpm), or run: " +
+						"bunx puppeteer browsers install chrome",
+				);
+			}
+
+			throw new Error(
+				"Chrome was found but failed to launch. " +
+					"Please install Chrome or run: bunx puppeteer browsers install chrome",
+			);
 		}
 	}
 
-	// Default Puppeteer launch (uses its own detection)
-	const b = await puppeteer.default.launch({
-		headless,
-		args: launchArgs,
-		timeout: LAUNCH_TIMEOUT_MS,
-	});
-	logger.info("Puppeteer browser launched (default)", { pid: b.process()?.pid, headless });
-	return b;
+	// No Chrome found — throw a user-friendly error instead of letting
+	// puppeteer-core emit the cryptic "executablePath or channel must be specified" message.
+	throw new Error(
+		"Could not find Chrome/Chromium. " +
+			"Please install Chrome or run: bunx puppeteer browsers install chrome",
+	);
 }
 
 /**

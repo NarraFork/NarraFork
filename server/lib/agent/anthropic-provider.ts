@@ -931,6 +931,10 @@ async function* parseAnthropicSSEStream(
 	const thinkingAccum = new Map<number, ThinkingAccumEntry>();
 	const serverToolAccum = new Map<number, ServerToolAccumEntry>();
 
+	// Stream integrity tracking
+	let receivedMessageStart = false;
+	let receivedAnyContentBlock = false;
+
 	const reader = body.getReader();
 	try {
 		while (true) {
@@ -965,6 +969,10 @@ async function* parseAnthropicSSEStream(
 					continue;
 				}
 
+				// Track stream integrity
+				if (event.type === "message_start") receivedMessageStart = true;
+				if (event.type === "content_block_start") receivedAnyContentBlock = true;
+
 				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum, serverToolAccum);
 				for (const evt of events) {
 					yield evt;
@@ -978,6 +986,10 @@ async function* parseAnthropicSSEStream(
 			try {
 				const jsonStr = remaining.startsWith("data: ") ? remaining.slice(6) : remaining.slice(5);
 				const event = JSON.parse(jsonStr);
+
+				if (event.type === "message_start") receivedMessageStart = true;
+				if (event.type === "content_block_start") receivedAnyContentBlock = true;
+
 				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum, serverToolAccum);
 				for (const evt of events) {
 					yield evt;
@@ -985,6 +997,13 @@ async function* parseAnthropicSSEStream(
 			} catch {
 				// ignore
 			}
+		}
+
+		// Stream integrity checks
+		if (!receivedMessageStart) {
+			logger.warn("Anthropic SSE stream ended without message_start event");
+		} else if (!receivedAnyContentBlock) {
+			logger.warn("Anthropic SSE stream had message_start but no content blocks");
 		}
 
 		// Flush un-emitted tool calls
@@ -1107,20 +1126,20 @@ function parseAnthropicEvent(
 		const idx = event.index ?? 0;
 
 		// Text delta
-		if (event.delta.type === "text_delta" && event.delta.text) {
+		if (event.delta.type === "text_delta" && event.delta.text != null) {
 			return [{ text: event.delta.text }];
 		}
 
 		// Thinking delta (extended thinking)
-		if (event.delta.type === "thinking_delta" && event.delta.thinking) {
+		if (event.delta.type === "thinking_delta" && event.delta.thinking != null) {
 			return [{ reasoning: event.delta.thinking }];
 		}
 
-		// Signature delta — accumulate for thinking block verification
+		// Signature delta — assign (Anthropic sends one per thinking block)
 		if (event.delta.type === "signature_delta" && event.delta.signature) {
 			const acc = thinkingAccum.get(idx);
 			if (acc) {
-				acc.signature += event.delta.signature;
+				acc.signature = event.delta.signature;
 			}
 			return [];
 		}
@@ -1168,6 +1187,11 @@ function parseAnthropicEvent(
 				return results;
 			}
 		}
+		// Unknown delta type — log for diagnostics
+		logger.debug("Unknown Anthropic content_block_delta type", {
+			deltaType: event.delta.type,
+			index: idx,
+		});
 		return [];
 	}
 
@@ -1227,15 +1251,35 @@ function parseAnthropicEvent(
 			});
 		}
 
-		// Stop reason
+		// Stop reason — always propagate to loop layer
 		const stopReason = event.delta?.stop_reason;
-		if (stopReason === "max_tokens") {
-			results.push({
-				invalidState: {
-					reason: "max_tokens",
-					message: "Response truncated: model reached maximum token limit.",
-				},
-			});
+		if (stopReason) {
+			results.push({ stopReason });
+
+			// Critical stop reasons → invalidState for special handling
+			if (stopReason === "max_tokens") {
+				results.push({
+					invalidState: {
+						reason: "max_tokens",
+						message: "Response truncated: model reached maximum token limit.",
+					},
+				});
+			} else if (stopReason === "model_context_window_exceeded") {
+				results.push({
+					invalidState: {
+						reason: "model_context_window_exceeded",
+						message: "The model has reached its context window limit.",
+					},
+				});
+			} else if (stopReason === "refusal") {
+				results.push({
+					invalidState: {
+						reason: "refusal",
+						message:
+							"Claude is unable to respond to this request, which appears to violate the Usage Policy.",
+					},
+				});
+			}
 		}
 
 		return results;
