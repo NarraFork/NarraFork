@@ -47,6 +47,8 @@ export interface ParsedStreamEvent {
 	reasoning?: string;
 	/** Provider metadata for reasoning continuation (Codex encrypted content, item ID) */
 	reasoningMetadata?: import("./types").ReasoningProviderMetadata;
+	/** Provider-native ordering index for a reasoning block (e.g. OpenAI Responses output_index). */
+	reasoningOutputIndex?: number;
 	contextUsagePercentage?: number;
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
@@ -74,6 +76,10 @@ export interface ParsedStreamEvent {
 		/** Search query (available on completion) */
 		query?: string;
 		queries?: string[];
+		/** Provider-native ordering index for this search block. */
+		outputIndex?: number;
+		/** True when this event is the final output_item.done payload. */
+		final?: boolean;
 	};
 	/** Response ID from OpenAI Responses API (resp_...) for previous_response_id chaining */
 	responseId?: string;

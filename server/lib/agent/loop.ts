@@ -52,7 +52,7 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 /** Yield block_complete events for accumulated reasoning blocks and assistant text.
  *  Used in every early-return / error path to persist partial progress. */
 function* flushPartialContent(
-	reasoningBlockMap: Map<string, { text: string; providerMetadata?: ReasoningProviderMetadata }>,
+	reasoningBlockMap: Map<string, ReasoningBlockEntry>,
 	assistantText: string,
 ): Generator<AgentEvent> {
 	for (const entry of reasoningBlockMap.values()) {
@@ -63,6 +63,7 @@ function* flushPartialContent(
 					type: "reasoning",
 					text: entry.text,
 					providerMetadata: entry.providerMetadata,
+					outputIndex: entry.outputIndex,
 				},
 			};
 		}
@@ -361,7 +362,11 @@ const PARALLEL_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 ]);
 
-type ReasoningBlockEntry = { text: string; providerMetadata?: ReasoningProviderMetadata };
+type ReasoningBlockEntry = {
+	text: string;
+	providerMetadata?: ReasoningProviderMetadata;
+	outputIndex?: number;
+};
 
 /** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
 function collectReasoningBlocks(
@@ -524,10 +529,7 @@ export async function* agentLoop(
 		 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
 		 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
 		 */
-		const reasoningBlockMap = new Map<
-			string,
-			{ text: string; providerMetadata?: ReasoningProviderMetadata }
-		>();
+		const reasoningBlockMap = new Map<string, ReasoningBlockEntry>();
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
@@ -556,7 +558,7 @@ export async function* agentLoop(
 		// Accumulator for native web search calls (Codex web_search tool)
 		const webSearchAccum = new Map<
 			string,
-			{ query?: string; queries?: string[]; emitted: boolean }
+			{ query?: string; queries?: string[]; emitted: boolean; outputIndex?: number }
 		>();
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
@@ -919,16 +921,21 @@ export async function* agentLoop(
 							if (parsed.reasoningMetadata) {
 								existing.providerMetadata = parsed.reasoningMetadata;
 							}
+							if (parsed.reasoningOutputIndex != null) {
+								existing.outputIndex = parsed.reasoningOutputIndex;
+							}
 						} else {
 							reasoningBlockMap.set(itemKey, {
 								text: parsed.reasoning,
 								providerMetadata: parsed.reasoningMetadata,
+								outputIndex: parsed.reasoningOutputIndex,
 							});
 						}
 						yield {
 							type: "stream_reasoning",
 							text: parsed.reasoning,
 							providerMetadata: parsed.reasoningMetadata,
+							outputIndex: parsed.reasoningOutputIndex,
 						};
 					} else if (parsed.reasoningMetadata) {
 						// Metadata-only event (e.g. final encrypted_content from output_item.done).
@@ -937,11 +944,15 @@ export async function* agentLoop(
 						const existing = reasoningBlockMap.get(itemKey);
 						if (existing) {
 							existing.providerMetadata = parsed.reasoningMetadata;
+							if (parsed.reasoningOutputIndex != null) {
+								existing.outputIndex = parsed.reasoningOutputIndex;
+							}
 						} else {
 							// Metadata arrived before any text — create an empty-text entry
 							reasoningBlockMap.set(itemKey, {
 								text: "",
 								providerMetadata: parsed.reasoningMetadata,
+								outputIndex: parsed.reasoningOutputIndex,
 							});
 						}
 					}
@@ -995,16 +1006,17 @@ export async function* agentLoop(
 					if (parsed.webSearch) {
 						const ws = parsed.webSearch;
 						if (!webSearchAccum.has(ws.id)) {
-							webSearchAccum.set(ws.id, { emitted: false });
+							webSearchAccum.set(ws.id, { emitted: false, outputIndex: ws.outputIndex });
 						}
 						// biome-ignore lint/style/noNonNullAssertion: just set above
 						const acc = webSearchAccum.get(ws.id)!;
 						// Update query info when available (from output_item.done)
 						if (ws.query) acc.query = ws.query;
 						if (ws.queries) acc.queries = ws.queries;
-						// Emit block_complete when search is done (use accumulated query data
-						// since query info may arrive in earlier events than the completed status)
-						if (ws.status === "completed" && (acc.query || acc.queries) && !acc.emitted) {
+						if (ws.outputIndex != null) acc.outputIndex = ws.outputIndex;
+						// Emit block_complete only from the final output_item.done payload so
+						// the persisted block keeps the search query and stable output order.
+						if (ws.final && (acc.query || acc.queries) && !acc.emitted) {
 							acc.emitted = true;
 							yield {
 								type: "block_complete",
@@ -1013,6 +1025,7 @@ export async function* agentLoop(
 									id: ws.id,
 									query: acc.query,
 									queries: acc.queries,
+									outputIndex: acc.outputIndex,
 								},
 							};
 						}
@@ -1022,6 +1035,7 @@ export async function* agentLoop(
 							status: ws.status,
 							query: ws.query,
 							queries: ws.queries,
+							outputIndex: acc.outputIndex,
 						};
 					}
 					if (parsed.invalidState) {

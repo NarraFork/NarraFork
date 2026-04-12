@@ -159,6 +159,7 @@ export function useForkNarrator() {
 }
 
 export function useStartAskInPassing() {
+	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: ({
 			narratorId,
@@ -169,6 +170,9 @@ export function useStartAskInPassing() {
 			sourceMessageId: string;
 			sourceMessageUuid?: string;
 		}) => api.startAskInPassing(narratorId, { sourceMessageId, sourceMessageUuid }),
+		onSuccess: (_data, { narratorId }) => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
+		},
 	});
 }
 

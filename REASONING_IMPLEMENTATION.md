@@ -148,53 +148,101 @@ if (block.type === "reasoning") {
 | **历史回放** | 复用同一渲染器 | ✅ 相同（MessageBubble 统一处理） |
 | **上下文回注** | **会回注**，支持 interleaved 的模型提取到 providerOptions | ✅ 相同（当前会随 contentJson 一起回注） |
 
-## 上下文回注策略（与 opencode 一致）
+## 上下文回注策略（已修复）
 
-**opencode 的实现（已验证）：**
+**当前实现（v0.1.10+）：**
 
-根据对 opencode 源码的调研（`packages/opencode/src/provider/transform.ts` 第 136-158 行），reasoning 内容**会被包含在上下文中**，但处理方式取决于模型能力：
+Reasoning 内容**会被完整回注**到上下文中，包括 `encrypted_content` 字段，以支持 Codex 模型的 reasoning continuation 功能。
 
-1. **普通模型：** reasoning 作为 content block 的一部分直接发送
-2. **支持 interleaved reasoning 的模型：** reasoning 被提取到 `providerOptions.openaiCompatible.reasoning_content` 字段
+### 实现细节
 
-**关键代码逻辑（opencode）：**
+在 `server/lib/agent/openai-provider.ts` 的 `convertHistoryToResponsesApi` 函数中：
+
 ```typescript
-const reasoningParts = msg.content.filter((part: any) => part.type === "reasoning")
-const reasoningText = reasoningParts.map((part: any) => part.text).join("")
-const filteredContent = msg.content.filter((part: any) => part.type !== "reasoning")
+// 1. 输出 reasoning items（包含 encrypted_content）
+if (m._reasoningBlocks?.length) {
+    for (const rb of m._reasoningBlocks) {
+        const metadata = rb.providerMetadata?.openai;
+        if (metadata?.reasoningEncryptedContent) {
+            result.push({
+                type: "reasoning",
+                id: metadata.itemId,
+                summary: [{ type: "summary_text", text: rb.text }],
+                encrypted_content: metadata.reasoningEncryptedContent,  // 完整回传
+            } as unknown as OAIMessage);
+        }
+    }
+}
 
-if (reasoningText) {
-  return {
-    ...msg,
-    content: filteredContent,  // 移除 reasoning 块
-    providerOptions: {
-      openaiCompatible: {
-        reasoning_content: reasoningText,  // 提取到专用字段
-      },
-    },
-  }
+// 2. 输出 assistant text（不包含 reasoning fallback）
+const content = typeof m.content === "string" 
+    ? [{ type: "output_text", text: m.content }] 
+    : m.content;
+if (content) {
+    result.push({ role: "assistant", content } as unknown as OAIMessage);
 }
 ```
 
-**narrafork 当前行为：**
-- reasoning block 会随 `narrator_messages.contentJson` 一起被 `buildHistory` 读取并喂回模型
-- 这与 opencode 的"普通模型"路径一致
-- 对于支持 interleaved reasoning 的模型（如 Claude with extended thinking），可以考虑实现类似的提取逻辑
+### 发送到 API 的格式
 
-**为什么要回注 reasoning？**
-1. **上下文连贯性：** 模型可以看到自己之前的推理过程，有助于保持思维连贯
-2. **协议支持：** 支持 interleaved reasoning 的模型（如 Claude）设计上就是为了处理这种场景
-3. **成本权衡：** 虽然会占用上下文窗口，但对于需要深度推理的任务，这是必要的代价
+```json
+{
+  "model": "gpt-5.3-codex",
+  "input": [
+    {
+      "type": "reasoning",
+      "id": "rs_abc123",
+      "summary": [
+        { "type": "summary_text", "text": "Earlier reasoning summary" }
+      ],
+      "encrypted_content": "base64_encoded_encrypted_reasoning"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "output_text", "text": "Visible assistant reply" }
+      ]
+    }
+  ],
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "include": ["reasoning.encrypted_content"]
+}
+```
 
-**可选优化方向（非必需）：**
-1. **智能提取：** 为支持 interleaved reasoning 的模型实现 providerOptions 提取逻辑
-2. **配置化：** 添加 narrator 级别的 `includeReasoningInContext` 开关（默认开启）
-3. **摘要策略：** 对超长 reasoning 进行摘要后再回注
+### 为什么要回注 reasoning？
 
-**实现位置（如需优化）：**
-- `server/lib/agent/anthropic-provider.ts` 的 `buildHistory` 方法
-- `server/lib/agent/openai-provider.ts` 的 `buildHistory` 方法
-- 在构建 messages 数组时检测模型能力并决定是否提取 reasoning 块
+1. **上下文连贯性**：模型可以看到自己之前的推理过程，有助于保持思维连贯
+2. **协议支持**：Codex 模型设计上就是为了处理 reasoning continuation
+3. **性能优化**：`encrypted_content` 是压缩格式，比纯文本更节省 token
+4. **功能完整性**：这是 Codex reasoning 功能的核心特性
+
+### 与 opencode 的对比
+
+| 维度 | opencode | narrafork（已修复） |
+|------|----------|---------------------|
+| **回注策略** | 会回注，支持 interleaved reasoning | ✅ 相同（完整回注 encrypted_content） |
+| **Responses API 格式** | 使用 `type: "reasoning"` item | ✅ 相同 |
+| **Encrypted content** | 包含在 reasoning item 中 | ✅ 相同 |
+| **Fallback 处理** | 仅用于不支持的模型 | ✅ 相同（仅在必要时使用） |
+
+### 历史问题（已修复）
+
+**v0.1.9 及之前版本的问题**：
+
+- ❌ 只将 reasoning summary 作为文本 fallback 合并到 assistant content
+- ❌ 没有回传 `encrypted_content` 字段
+- ❌ 导致 reasoning continuation 功能完全失效
+
+**v0.1.10+ 修复**：
+
+- ✅ 完整回传 reasoning items（包括 `encrypted_content`）
+- ✅ Reasoning 和 assistant text 分开发送
+- ✅ 支持 Codex 的 reasoning continuation 功能
+
+详见 `REASONING_FIX.md` 文档。
 
 ## 测试清单
 

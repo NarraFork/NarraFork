@@ -353,10 +353,17 @@ export function clearToolBlockCache(): void {
 	toolBlockCache.clear();
 }
 
-/** A streaming block tracked in temporal order (by event arrival). */
+/** A streaming block tracked in temporal order (by event arrival / provider output order). */
 export type StreamingBlock =
-	| { type: "reasoning"; text: string }
-	| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+	| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+	| {
+			type: "web_search";
+			id: string;
+			status: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
+	  }
 	| { type: "text"; text: string };
 
 export function buildStreamingMsg(opts: {
@@ -374,13 +381,15 @@ export function buildStreamingMsg(opts: {
 	const blocks: ContentBlock[] = [];
 
 	if (hasStreamingBlocks) {
-		for (const sb of streamingBlocks) {
+		for (const [index, sb] of streamingBlocks.entries()) {
 			if (sb.type === "reasoning") {
-				// Assign stable synthetic id so React key doesn't shift when new blocks
-				// are inserted before it during streaming.
 				blocks.push({
 					type: "reasoning",
-					id: "streaming:reasoning",
+					id:
+						sb.id ??
+						(sb.outputIndex != null
+							? `streaming:reasoning:${sb.outputIndex}`
+							: `streaming:reasoning:${index}`),
 					text: sb.text,
 				} as ContentBlock);
 			} else if (sb.type === "web_search") {
@@ -392,11 +401,9 @@ export function buildStreamingMsg(opts: {
 					queries: sb.queries,
 				} as ContentBlock);
 			} else if (sb.type === "text") {
-				// Assign stable synthetic id so React key doesn't shift when new blocks
-				// are inserted before it during streaming.
 				blocks.push({
 					type: "text",
-					id: "streaming:text",
+					id: `streaming:text:${index}`,
 					text: sb.text,
 				} as ContentBlock);
 			}

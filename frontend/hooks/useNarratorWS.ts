@@ -89,6 +89,7 @@ interface NarratorWSCallbacks {
 		status: "in_progress" | "searching" | "completed",
 		query?: string,
 		queries?: string[],
+		outputIndex?: number,
 	) => void;
 	onNarratorError?: (error: string, errorCode?: string) => void;
 	onNarratorWarning?: (info: {
@@ -128,8 +129,15 @@ interface NarratorWSCallbacks {
 	) => void;
 	onStreamingSnapshot?: (snapshot: {
 		streamingBlocks: Array<
-			| { type: "reasoning"; text: string }
-			| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+			| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+			| {
+					type: "web_search";
+					id: string;
+					status: string;
+					query?: string;
+					queries?: string[];
+					outputIndex?: number;
+			  }
 			| { type: "text"; text: string }
 		>;
 		toolChunks: Array<{
@@ -385,6 +393,7 @@ export function useNarratorWS(
 							data.status as "in_progress" | "searching" | "completed",
 							data.query as string | undefined,
 							data.queries as string[] | undefined,
+							data.outputIndex as number | undefined,
 						);
 						break;
 					case "narrator_error":
@@ -503,13 +512,14 @@ export function useNarratorWS(
 					case "streaming_snapshot":
 						callbacksRef.current.onStreamingSnapshot?.({
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
-								| { type: "reasoning"; text: string }
+								| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 								| {
 										type: "web_search";
 										id: string;
 										status: string;
 										query?: string;
 										queries?: string[];
+										outputIndex?: number;
 								  }
 								| { type: "text"; text: string }
 							>,

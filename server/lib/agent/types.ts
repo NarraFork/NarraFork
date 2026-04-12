@@ -156,7 +156,12 @@ export type AgentEvent =
 			delayMs: number;
 	  }
 	| { type: "context_length_exceeded"; message: string }
-	| { type: "stream_reasoning"; text: string; providerMetadata?: ReasoningProviderMetadata }
+	| {
+			type: "stream_reasoning";
+			text: string;
+			providerMetadata?: ReasoningProviderMetadata;
+			outputIndex?: number;
+	  }
 	| {
 			type: "context_usage";
 			percentage: number;
@@ -176,6 +181,7 @@ export type AgentEvent =
 			status: "in_progress" | "searching" | "completed";
 			query?: string;
 			queries?: string[];
+			outputIndex?: number;
 	  }
 	| { type: "model_switched"; model: string; provider: string }
 	| { type: "done" };
@@ -210,6 +216,7 @@ export type ContentBlock =
 			text: string;
 			translatedText?: string;
 			providerMetadata?: ReasoningProviderMetadata;
+			outputIndex?: number;
 	  }
 	| {
 			type: "tool_use";
@@ -223,6 +230,7 @@ export type ContentBlock =
 			id: string;
 			query?: string;
 			queries?: string[];
+			outputIndex?: number;
 	  };
 
 // === Plan mode constants ===

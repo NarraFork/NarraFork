@@ -30,6 +30,7 @@ import type { ModelOption } from "../../lib/constants";
 export interface ProviderGroup {
 	prefix: string;
 	label: string;
+	badgeLabel?: string;
 	models: ModelOption[];
 	disabled: boolean;
 	isPlatform: boolean;

@@ -3,6 +3,7 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { OpenAIProviderConfig } from "../settings";
 import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
+import { getHttpUserAgent } from "../user-agent";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -824,6 +825,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
+			"User-Agent": getHttpUserAgent(),
 		};
 		if (this.apiMode === "codex") {
 			headers.originator = "narrafork";
@@ -1079,22 +1081,46 @@ function parseResponsesAPIEvent(
 	// ── Web search: output_item.added (type=web_search_call) ──
 	if (type === "response.output_item.added" && chunk.item?.type === "web_search_call") {
 		const id = chunk.item.id ?? "";
-		logger.debug("Responses API web search started", { id });
-		results.push({ webSearch: { id, status: "in_progress" } });
+		logger.debug("Responses API web search started", { id, outputIndex: chunk.output_index });
+		results.push({
+			webSearch: {
+				id,
+				status: "in_progress",
+				outputIndex: chunk.output_index,
+			},
+		});
 		return results;
 	}
 
 	// ── Web search: lifecycle events ──
 	if (type === "response.web_search_call.in_progress") {
-		results.push({ webSearch: { id: chunk.item_id ?? "", status: "in_progress" } });
+		results.push({
+			webSearch: {
+				id: chunk.item_id ?? "",
+				status: "in_progress",
+				outputIndex: chunk.output_index,
+			},
+		});
 		return results;
 	}
 	if (type === "response.web_search_call.searching") {
-		results.push({ webSearch: { id: chunk.item_id ?? "", status: "searching" } });
+		results.push({
+			webSearch: {
+				id: chunk.item_id ?? "",
+				status: "searching",
+				outputIndex: chunk.output_index,
+			},
+		});
 		return results;
 	}
 	if (type === "response.web_search_call.completed") {
-		results.push({ webSearch: { id: chunk.item_id ?? "", status: "completed" } });
+		results.push({
+			webSearch: {
+				id: chunk.item_id ?? "",
+				status: "completed",
+				outputIndex: chunk.output_index,
+			},
+		});
 		return results;
 	}
 
@@ -1107,6 +1133,8 @@ function parseResponsesAPIEvent(
 				status: "completed",
 				query: action?.query,
 				queries: action?.queries,
+				outputIndex: chunk.output_index,
+				final: true,
 			},
 		});
 		return results;
@@ -1149,6 +1177,7 @@ function parseResponsesAPIEvent(
 							reasoningEncryptedContent: finalEncrypted,
 						},
 					},
+					reasoningOutputIndex: idx,
 				});
 			}
 		}
@@ -1169,9 +1198,13 @@ function parseResponsesAPIEvent(
 						reasoningEncryptedContent: acc.encryptedContent,
 					},
 				},
+				reasoningOutputIndex: chunk.output_index,
 			});
 		} else {
-			results.push({ reasoning: chunk.delta });
+			results.push({
+				reasoning: chunk.delta,
+				reasoningOutputIndex: chunk.output_index,
+			});
 		}
 		return results;
 	}
@@ -1744,7 +1777,8 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 					})) ?? [];
 
 			const hasText = text.length > 0;
-			if (!hasText && toolCalls.length === 0) {
+			const hasReasoningBlocks = reasoningBlocks.length > 0;
+			if (!hasText && toolCalls.length === 0 && !hasReasoningBlocks) {
 				// Skip empty assistant stubs (can happen after interrupted streaming).
 				// Keeping them would become `content: null` in Responses API input and
 				// trigger validation errors.
@@ -1900,14 +1934,34 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 				output: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
 			} as unknown as OAIMessage);
 		} else if (m.role === "assistant" && m.tool_calls?.length) {
-			// Split assistant message with tool_calls into assistant text + separate function_call items.
-			const content = mergeAssistantTextWithReasoningFallback(
-				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content,
-				m._reasoningTextFallback,
-			);
+			// Split assistant message with tool_calls into:
+			// 1. reasoning items (if any, with encrypted_content)
+			// 2. assistant text
+			// 3. separate function_call items
+
+			// 1. Output reasoning items with encrypted_content for continuation
+			if (m._reasoningBlocks?.length) {
+				for (const rb of m._reasoningBlocks) {
+					const metadata = rb.providerMetadata?.openai;
+					if (metadata?.reasoningEncryptedContent) {
+						result.push({
+							type: "reasoning",
+							id: metadata.itemId,
+							summary: [{ type: "summary_text", text: rb.text }],
+							encrypted_content: metadata.reasoningEncryptedContent,
+						} as unknown as OAIMessage);
+					}
+				}
+			}
+
+			// 2. Output assistant text (without reasoning fallback, since we sent reasoning items above)
+			const content =
+				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
 			if (content) {
 				result.push({ role: "assistant", content } as unknown as OAIMessage);
 			}
+
+			// 3. Output function_call items
 			for (const tc of m.tool_calls as OAIToolCall[]) {
 				result.push({
 					type: "function_call",
@@ -1920,7 +1974,24 @@ function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 			// Assistant message without tool calls — convert content to array format.
 			// Skip null/empty content because Responses API rejects role messages
 			// whose content is null.
-			const content = mergeAssistantTextWithReasoningFallback(m.content, m._reasoningTextFallback);
+
+			// 1. Output reasoning items with encrypted_content for continuation
+			if (m._reasoningBlocks?.length) {
+				for (const rb of m._reasoningBlocks) {
+					const metadata = rb.providerMetadata?.openai;
+					if (metadata?.reasoningEncryptedContent) {
+						result.push({
+							type: "reasoning",
+							id: metadata.itemId,
+							summary: [{ type: "summary_text", text: rb.text }],
+							encrypted_content: metadata.reasoningEncryptedContent,
+						} as unknown as OAIMessage);
+					}
+				}
+			}
+
+			// 2. Output assistant text (without reasoning fallback, since we sent reasoning items above)
+			const content = m.content;
 			if (typeof content === "string") {
 				if (!content) continue;
 				result.push({

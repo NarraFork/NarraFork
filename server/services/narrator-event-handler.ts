@@ -121,10 +121,17 @@ export interface ToolChunkSnapshot {
 	streamingOutput?: string;
 }
 
-/** A streaming block tracked in temporal order (by event arrival). */
+/** A streaming block tracked in temporal order (by event arrival / provider output order). */
 export type SnapshotStreamingBlock =
-	| { type: "reasoning"; text: string }
-	| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+	| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+	| {
+			type: "web_search";
+			id: string;
+			status: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
+	  }
 	| { type: "text"; text: string };
 
 export interface StreamingSnapshot {
@@ -145,6 +152,24 @@ function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 		streamingSnapshots.set(narratorId, snap);
 	}
 	return snap;
+}
+
+function getSnapshotBlockOutputIndex(block: SnapshotStreamingBlock): number | undefined {
+	return "outputIndex" in block && typeof block.outputIndex === "number"
+		? block.outputIndex
+		: undefined;
+}
+
+function findOrderedSnapshotInsertIndex(
+	blocks: SnapshotStreamingBlock[],
+	outputIndex: number | undefined,
+): number {
+	if (outputIndex == null) return blocks.length;
+	for (let i = 0; i < blocks.length; i++) {
+		const currentOrder = getSnapshotBlockOutputIndex(blocks[i]);
+		if (currentOrder != null && currentOrder > outputIndex) return i;
+	}
+	return blocks.length;
 }
 
 /** Retrieve the current streaming snapshot for a narrator (if any). */
@@ -201,11 +226,69 @@ function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage)
 // === Reasoning translation ===
 
 const LOCALE_NAMES: Record<string, string> = {
+	en: "English",
 	"zh-CN": "简体中文",
-	zh: "简体中文",
+	zh: "中文",
+	es: "Español",
+	fr: "Français",
+	de: "Deutsch",
 	ja: "日本語",
 	ko: "한국어",
 };
+
+type PersistedReasoningBlock = {
+	type?: string;
+	text?: string;
+	outputIndex?: number;
+	providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
+};
+
+function getReasoningItemId(
+	metadata?: import("../lib/agent/types").ReasoningProviderMetadata,
+): string | undefined {
+	const itemId = metadata?.openai?.itemId;
+	return typeof itemId === "string" && itemId.length > 0 ? itemId : undefined;
+}
+
+function findReasoningBlockIndex(
+	blocks: unknown[],
+	locator: {
+		reasoningText: string;
+		providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
+		outputIndex?: number;
+	},
+): number {
+	const targetItemId = getReasoningItemId(locator.providerMetadata);
+	if (targetItemId) {
+		for (let i = blocks.length - 1; i >= 0; i--) {
+			const block = blocks[i] as PersistedReasoningBlock;
+			if (
+				block.type === "reasoning" &&
+				getReasoningItemId(block.providerMetadata) === targetItemId
+			) {
+				return i;
+			}
+		}
+	}
+
+	if (locator.outputIndex != null) {
+		for (let i = blocks.length - 1; i >= 0; i--) {
+			const block = blocks[i] as PersistedReasoningBlock;
+			if (block.type === "reasoning" && block.outputIndex === locator.outputIndex) {
+				return i;
+			}
+		}
+	}
+
+	for (let i = blocks.length - 1; i >= 0; i--) {
+		const block = blocks[i] as PersistedReasoningBlock;
+		if (block.type === "reasoning" && block.text === locator.reasoningText) {
+			return i;
+		}
+	}
+
+	return -1;
+}
 
 /**
  * Translate a reasoning block's text via the summary model, then patch the
@@ -218,6 +301,10 @@ function translateReasoningBlock(
 	broadcastTargetId: string,
 	reasoningText: string,
 	ctx: EventHandlerContext,
+	locator?: {
+		providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
+		outputIndex?: number;
+	},
 ): void {
 	const locale = ctx.locale || "en";
 	// Skip translation for English content when locale is English
@@ -234,23 +321,20 @@ function translateReasoningBlock(
 			const translated = result.text?.trim();
 			if (!translated) return;
 
-			// Find the reasoning block index in the message
+			// Find the exact reasoning block in the message.
+			// Prefer stable identifiers (OpenAI itemId, then outputIndex), and only
+			// fall back to text matching for older persisted messages.
 			const msg = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
 				columns: { contentJson: true },
 			});
 			if (!msg) return;
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			// Find the last reasoning block whose text matches (in case of multiple)
-			let targetIdx = -1;
-			for (let i = blocks.length - 1; i >= 0; i--) {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON content blocks
-				const b = blocks[i] as any;
-				if (b.type === "reasoning" && b.text === reasoningText) {
-					targetIdx = i;
-					break;
-				}
-			}
+			const targetIdx = findReasoningBlockIndex(blocks, {
+				reasoningText,
+				providerMetadata: locator?.providerMetadata,
+				outputIndex: locator?.outputIndex,
+			});
 			if (targetIdx === -1) return;
 
 			await narratorService.patchReasoningTranslation(messageId, targetIdx, translated);
@@ -480,10 +564,14 @@ export async function processEvent(
 					type: "reasoning",
 					text: block.text,
 					providerMetadata: block.providerMetadata,
+					outputIndex: block.outputIndex,
 				});
 				// Fire-and-forget reasoning translation
 				if (settings.agent.translateReasoning && block.text) {
-					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx);
+					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx, {
+						providerMetadata: block.providerMetadata,
+						outputIndex: block.outputIndex,
+					});
 				}
 			} else if (block.type === "tool_use") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
@@ -498,6 +586,7 @@ export async function processEvent(
 					id: block.id,
 					query: block.query,
 					queries: block.queries,
+					outputIndex: block.outputIndex,
 				});
 			}
 			return null;
@@ -798,21 +887,47 @@ export async function processEvent(
 			// Track AI reasoning output character rate
 			recordOutputChunk(event.text.length);
 
-			// Snapshot: accumulate streaming reasoning (top-level only)
-			// Reasoning is always a single block — find and update, or create new.
+			const reasoningId = event.providerMetadata?.openai?.itemId;
+			const reasoningOutputIndex = event.outputIndex;
+
+			// Snapshot: accumulate streaming reasoning blocks in provider order.
 			if (!ctx.parentToolUseId) {
 				const snap = getOrCreateSnapshot(broadcastTargetId);
-				const existing = snap.streamingBlocks.find((b) => b.type === "reasoning");
-				if (existing) {
-					existing.text += event.text;
+				const existingIdx = snap.streamingBlocks.findIndex((b) => {
+					if (b.type !== "reasoning") return false;
+					if (reasoningId) return b.id === reasoningId;
+					if (reasoningOutputIndex != null) return b.outputIndex === reasoningOutputIndex;
+					return !b.id && b.outputIndex == null;
+				});
+				if (existingIdx !== -1) {
+					const existing = snap.streamingBlocks[existingIdx];
+					if (existing.type === "reasoning") {
+						existing.text += event.text;
+						if (reasoningId) existing.id = reasoningId;
+						if (reasoningOutputIndex != null) existing.outputIndex = reasoningOutputIndex;
+					}
 				} else {
-					snap.streamingBlocks.push({ type: "reasoning", text: event.text });
+					snap.streamingBlocks.splice(
+						findOrderedSnapshotInsertIndex(snap.streamingBlocks, reasoningOutputIndex),
+						0,
+						{
+							type: "reasoning",
+							text: event.text,
+							...(reasoningId ? { id: reasoningId } : {}),
+							...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
+						},
+					);
 				}
 			}
 
 			const reasoningStreamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
-				delta: { type: "reasoning_delta", text: event.text },
+				delta: {
+					type: "reasoning_delta",
+					text: event.text,
+					...(reasoningId ? { id: reasoningId } : {}),
+					...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
+				},
 			};
 			// Subagent: attach linking info so frontend knows which tool_use this belongs to
 			if (ctx.parentToolUseId) {
@@ -828,7 +943,12 @@ export async function processEvent(
 				type: "stream_event",
 				data: {
 					type: "content_block_delta",
-					delta: { type: "reasoning_delta", text: event.text },
+					delta: {
+						type: "reasoning_delta",
+						text: event.text,
+						...(reasoningId ? { id: reasoningId } : {}),
+						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
+					},
 				},
 			});
 			return null;
@@ -968,24 +1088,34 @@ export async function processEvent(
 		}
 
 		case "web_search": {
-			// Snapshot: track web_search in ordered blocks (top-level only)
+			// Snapshot: track web_search in provider order (top-level only)
 			if (!ctx.parentToolUseId) {
 				const snap = getOrCreateSnapshot(broadcastTargetId);
-				const existing = snap.streamingBlocks.find(
+				const existingIdx = snap.streamingBlocks.findIndex(
 					(b) => b.type === "web_search" && b.id === event.id,
 				);
-				if (existing && existing.type === "web_search") {
-					existing.status = event.status;
-					if (event.query) existing.query = event.query;
-					if (event.queries) existing.queries = event.queries;
+
+				if (existingIdx !== -1) {
+					const existing = snap.streamingBlocks[existingIdx];
+					if (existing.type === "web_search") {
+						existing.status = event.status;
+						if (event.query) existing.query = event.query;
+						if (event.queries) existing.queries = event.queries;
+						if (event.outputIndex != null) existing.outputIndex = event.outputIndex;
+					}
 				} else {
-					snap.streamingBlocks.push({
-						type: "web_search",
-						id: event.id,
-						status: event.status,
-						query: event.query,
-						queries: event.queries,
-					});
+					snap.streamingBlocks.splice(
+						findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
+						0,
+						{
+							type: "web_search",
+							id: event.id,
+							status: event.status,
+							query: event.query,
+							queries: event.queries,
+							...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
+						},
+					);
 				}
 			}
 			dualBroadcast(ctx, {
@@ -995,6 +1125,7 @@ export async function processEvent(
 				status: event.status,
 				query: event.query,
 				queries: event.queries,
+				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 			});
 			return null;
 		}

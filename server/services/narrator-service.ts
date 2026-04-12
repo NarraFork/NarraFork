@@ -1923,11 +1923,21 @@ export const narratorService = {
 			if (!otherRef) {
 				await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
 			}
-			// Bump messageVersion
+			// Clear the narrator's errorMessage field when dismissing the error
 			await tx
 				.update(narrators)
-				.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+				.set({
+					errorMessage: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+				})
 				.where(eq(narrators.id, narratorId));
+		});
+
+		// Broadcast the dismissal to update frontend cache
+		broadcastToNarrator(narratorId, {
+			type: "status_change",
+			narratorId,
+			status: (await this.getById(narratorId)).status,
 		});
 	},
 
@@ -2807,9 +2817,16 @@ export const narratorService = {
 					type: "reasoning";
 					text: string;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+					outputIndex?: number;
 			  }
 			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-			| { type: "web_search"; id: string; query?: string; queries?: string[] },
+			| {
+					type: "web_search";
+					id: string;
+					query?: string;
+					queries?: string[];
+					outputIndex?: number;
+			  },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),
@@ -2817,23 +2834,42 @@ export const narratorService = {
 		});
 		if (!existing) return;
 
-		// Keep a stable canonical order for assistant blocks regardless of stream arrival order:
-		// reasoning → text/other non-tool blocks → tool_use.
-		// This avoids cases where streaming tool_use blocks are persisted before reasoning/text.
+		// Preserve provider block order when available (e.g. Codex reasoning/search interleaving).
 		type StoredAssistantBlock =
 			| { type: "text"; text: string }
 			| {
 					type: "reasoning";
 					text: string;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+					outputIndex?: number;
 			  }
 			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-			| { type: string; text?: unknown; [key: string]: unknown };
+			| {
+					type: "web_search";
+					id: string;
+					query?: string;
+					queries?: string[];
+					outputIndex?: number;
+			  }
+			| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
 		const current = (
 			Array.isArray(existing.contentJson) ? existing.contentJson : []
 		) as StoredAssistantBlock[];
 		let content: StoredAssistantBlock[];
-		if (block.type === "reasoning") {
+		if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+			const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
+				const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
+				return typeof outputIndex === "number" ? outputIndex : undefined;
+			};
+			const next = [...current, block as StoredAssistantBlock];
+			const indexed = next.map((entry, index) => ({ entry, index }));
+			indexed.sort((a, b) => {
+				const aOrder = getOutputIndex(a.entry) ?? Number.POSITIVE_INFINITY;
+				const bOrder = getOutputIndex(b.entry) ?? Number.POSITIVE_INFINITY;
+				return aOrder === bOrder ? a.index - b.index : aOrder - bOrder;
+			});
+			content = indexed.map(({ entry }) => entry);
+		} else if (block.type === "reasoning") {
 			const idx = current.findIndex((b) => b.type !== "reasoning");
 			content =
 				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];

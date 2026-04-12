@@ -1239,12 +1239,13 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 
 	const { sourceMessageId, sourceMessageUuid } = parsed.data;
 
-	// Verify the source message belongs to this narrator
+	// Verify the source message belongs to this narrator and capture its position.
 	const ref = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, id),
 			eq(narratorMessageRefs.messageId, sourceMessageId),
 		),
+		columns: { seq: true },
 	});
 	if (!ref) throw new ValidationError("Source message not found in this narrator");
 
@@ -1271,17 +1272,17 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 			})
 			.returning();
 
-		const maxSeqResult = await tx
-			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, id));
-		const nextSeq = (maxSeqResult[0]?.maxSeq ?? -1) + 1;
+		const insertSeq = ref.seq + 1;
+		await tx
+			.update(narratorMessageRefs)
+			.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
+			.where(and(eq(narratorMessageRefs.narratorId, id), gte(narratorMessageRefs.seq, insertSeq)));
 
 		await tx.insert(narratorMessageRefs).values({
 			id: generateId(),
 			narratorId: id,
 			messageId: msgId,
-			seq: nextSeq,
+			seq: insertSeq,
 		});
 
 		await tx

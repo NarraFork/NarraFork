@@ -393,6 +393,14 @@ function ProvidersPage() {
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
 
+		const getBadgeLabel = (prefix: string): string | undefined => {
+			const openaiProvider = state.openaiProviders.find((p) => p.prefix === prefix);
+			if (openaiProvider) return openaiProvider.apiMode ?? "responses";
+			if (state.anthropicProviders.some((p) => p.prefix === prefix)) return "anthropic";
+			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
+			return undefined;
+		};
+
 		const addModel = (prefix: string, m: ModelOption) => {
 			let arr = byPrefix.get(prefix);
 			if (!arr) {
@@ -409,6 +417,12 @@ function ProvidersPage() {
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
+
+		// Add custom models to their respective prefixes
+		for (const m of state.customModels) {
+			const prefix = m.value.split(":")[0];
+			if (prefix) addModel(prefix, m);
+		}
 
 		// Ensure platform providers always present
 		for (const p of platformPrefixes) ensureEmpty(p);
@@ -433,6 +447,7 @@ function ProvidersPage() {
 			return {
 				prefix,
 				label: providerLabels[prefix] ?? prefix,
+				badgeLabel: isPlatform ? undefined : getBadgeLabel(prefix),
 				models,
 				disabled,
 				isPlatform,
@@ -443,6 +458,7 @@ function ProvidersPage() {
 		openaiByProvider,
 		anthropicByProvider,
 		clineByProvider,
+		state.customModels,
 		providerLabels,
 		state.disabledProviders,
 		state.openaiProviders,
@@ -506,13 +522,22 @@ function ProvidersPage() {
 	return (
 		<>
 			<Box
-				pb={80}
 				style={{
 					height: isMobile ? undefined : "calc(100vh - 80px)",
+					display: "flex",
+					flexDirection: "column",
 					overflow: "hidden",
 				}}
 			>
-				<Stack gap="md" style={{ height: "100%", padding: "var(--mantine-spacing-md)" }}>
+				<Stack
+					gap="md"
+					style={{
+						flex: 1,
+						padding: "var(--mantine-spacing-md)",
+						minHeight: 0,
+						overflow: "hidden",
+					}}
+				>
 					<Group gap="xs">
 						{!selectedProvider && (
 							<Box component={Link} to="/admin" style={{ display: "flex", alignItems: "center" }}>
@@ -522,7 +547,9 @@ function ProvidersPage() {
 						<Title order={2}>{t("providersTitle")}</Title>
 					</Group>
 
-					<Box style={{ flex: 1, overflow: "auto" }}>{renderContent()}</Box>
+					<Box style={{ flex: 1, overflowY: "auto", overflowX: "hidden", minHeight: 0 }}>
+						{renderContent()}
+					</Box>
 				</Stack>
 			</Box>
 

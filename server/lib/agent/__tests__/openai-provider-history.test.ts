@@ -26,8 +26,8 @@ function makeAssistantMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 	};
 }
 
-describe("OpenAIProvider Responses history reasoning fallback", () => {
-	test("buildHistory keeps historical reasoning summary as assistant text fallback", async () => {
+describe("OpenAIProvider Responses history reasoning continuation", () => {
+	test("buildHistory includes reasoning items with encrypted_content for continuation", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
 			makeAssistantMessage({
@@ -49,15 +49,54 @@ describe("OpenAIProvider Responses history reasoning fallback", () => {
 		];
 
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
-		const assistant = (result.history as Array<{ role?: string; content?: unknown }>).find(
+		const historyJson = JSON.stringify(result.history);
+
+		// Should include reasoning item with encrypted_content
+		expect(historyJson).toContain('"type":"reasoning"');
+		expect(historyJson).toContain('"id":"rs_123"');
+		expect(historyJson).toContain('"encrypted_content":"enc_123"');
+		expect(historyJson).toContain("Earlier hidden reasoning summary");
+
+		// Should also include assistant text
+		expect(historyJson).toContain("Visible assistant reply");
+
+		// Verify structure: reasoning item should come before assistant message
+		const reasoningItem = (result.history as Array<{ type?: string }>).find(
+			(msg) => msg.type === "reasoning",
+		);
+		const assistantMsg = (result.history as Array<{ role?: string }>).find(
 			(msg) => msg.role === "assistant",
 		);
+		expect(reasoningItem).toBeDefined();
+		expect(assistantMsg).toBeDefined();
+	});
 
-		expect(assistant).toBeDefined();
-		expect(JSON.stringify(assistant)).toContain("Earlier hidden reasoning summary");
-		expect(JSON.stringify(assistant)).toContain("Visible assistant reply");
-		expect(JSON.stringify(result.history)).not.toContain('"type":"reasoning"');
-		expect(JSON.stringify(result.history)).not.toContain('"id":"rs_123"');
+	test("buildHistory handles assistant message with reasoning but no text", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "Pure reasoning turn",
+						providerMetadata: {
+							openai: {
+								itemId: "rs_456",
+								reasoningEncryptedContent: "enc_456",
+							},
+						},
+					},
+				],
+				contentText: null,
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+
+		// Should include reasoning item
+		expect(historyJson).toContain('"type":"reasoning"');
+		expect(historyJson).toContain('"encrypted_content":"enc_456"');
 	});
 
 	test("pushAssistantTurn prepends reasoning fallback for current responses history", () => {

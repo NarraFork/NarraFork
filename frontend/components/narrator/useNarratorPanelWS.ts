@@ -49,6 +49,24 @@ export interface RetryInfo {
 	retryAt: number;
 }
 
+function getStreamingBlockOutputIndex(block: StreamingBlock): number | undefined {
+	return "outputIndex" in block && typeof block.outputIndex === "number"
+		? block.outputIndex
+		: undefined;
+}
+
+function findStreamingInsertIndex(
+	blocks: StreamingBlock[],
+	outputIndex: number | undefined,
+): number {
+	if (outputIndex == null) return blocks.length;
+	for (let i = 0; i < blocks.length; i++) {
+		const currentOrder = getStreamingBlockOutputIndex(blocks[i]);
+		if (currentOrder != null && currentOrder > outputIndex) return i;
+	}
+	return blocks.length;
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
@@ -719,14 +737,31 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				if (ev.delta.type === "reasoning_delta") {
 					clearRetryIfActive();
-					// Maintain ordered blocks: reasoning is always a single block —
-					// find and update, or create new.
 					const blocks = streamingBlocksRef.current;
-					const reasoningBlock = blocks.find((b) => b.type === "reasoning");
-					if (reasoningBlock) {
-						reasoningBlock.text += ev.delta.text;
+					const reasoningId =
+						typeof ev.delta.id === "string" && ev.delta.id.length > 0 ? ev.delta.id : undefined;
+					const outputIndex =
+						typeof ev.delta.outputIndex === "number" ? ev.delta.outputIndex : undefined;
+					const existingIdx = blocks.findIndex((b) => {
+						if (b.type !== "reasoning") return false;
+						if (reasoningId) return b.id === reasoningId;
+						if (outputIndex != null) return b.outputIndex === outputIndex;
+						return !b.id && b.outputIndex == null;
+					});
+					if (existingIdx !== -1) {
+						const existing = blocks[existingIdx];
+						if (existing.type === "reasoning") {
+							existing.text += ev.delta.text;
+							if (reasoningId) existing.id = reasoningId;
+							if (outputIndex != null) existing.outputIndex = outputIndex;
+						}
 					} else {
-						blocks.push({ type: "reasoning", text: ev.delta.text });
+						blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
+							type: "reasoning",
+							text: ev.delta.text,
+							...(reasoningId ? { id: reasoningId } : {}),
+							...(outputIndex != null ? { outputIndex } : {}),
+						});
 					}
 					flushStreamingVersion();
 					return;
@@ -800,6 +835,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							newMsg.role === "system" &&
 							Array.isArray(newMsg.contentJson) &&
 							newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
+						const isNewAskInPassingMsg =
+							newMsg.role === "system" &&
+							Array.isArray(newMsg.contentJson) &&
+							newMsg.contentJson.some((b: ContentBlock) => b.type === "ask_in_passing");
+						const needsMiddleInsertReload = isNewCompactMsg || isNewAskInPassingMsg;
 
 						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 							if (!old?.pages?.length) return old;
@@ -815,7 +855,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								pages[0] = firstPage;
 								return { ...old, pages };
 							}
-							if (isNewCompactMsg) return old;
+							if (needsMiddleInsertReload) return old;
 							if (!isAtBottomRef.current && newMsg.role === "assistant") {
 								setUnreadCount((c) => c + 1);
 							}
@@ -849,7 +889,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							}
 							return result;
 						});
-						if (isNewCompactMsg) {
+						if (needsMiddleInsertReload) {
 							qc.invalidateQueries({ queryKey: messagesQueryKey });
 						}
 					}
@@ -1256,6 +1296,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Terminal-status broadcasts (idle/done/error) omit turnStartedAt on purpose so the
 				// cached value from the "thinking" broadcast is preserved — the UI uses it to display
 				// the elapsed duration of the last completed turn.
+				// Note: errorMessage is NOT cleared here — it persists until user manually dismisses it.
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, status, ...(turnStartedAt !== undefined && { turnStartedAt }) } : old,
 				);
@@ -1334,8 +1375,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBrowserSessionCount: () => {
 				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
 			},
-			onWebSearch: (id, status, query, queries) => {
-				// Maintain ordered blocks: update existing search or append new one
+			onWebSearch: (id, status, query, queries, outputIndex) => {
 				const blocks = streamingBlocksRef.current;
 				const existingIdx = blocks.findIndex((b) => b.type === "web_search" && b.id === id);
 				if (existingIdx !== -1) {
@@ -1344,9 +1384,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						existing.status = status;
 						if (query) existing.query = query;
 						if (queries) existing.queries = queries;
+						if (outputIndex != null) existing.outputIndex = outputIndex;
 					}
 				} else {
-					blocks.push({ type: "web_search", id, status, query, queries });
+					blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
+						type: "web_search",
+						id,
+						status,
+						query,
+						queries,
+						...(outputIndex != null ? { outputIndex } : {}),
+					});
 				}
 				flushStreamingVersion();
 			},
@@ -1427,6 +1475,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				streamingBlocksRef.current = [];
 				clearStreamingState();
+				// Update narrator cache with error message
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, status: "error", errorMessage: error } : old,
+				);
 				const errorI18nMap: Record<string, string> = {
 					context_too_long_compact_failed: "contextTooLongCompactFailed",
 				};

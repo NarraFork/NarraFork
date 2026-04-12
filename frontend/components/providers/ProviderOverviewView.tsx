@@ -47,20 +47,26 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	const renderProviderCard = (group: ProviderGroup) => {
 		const hiddenCount = group.models.filter((m) => hiddenModels.has(m.value)).length;
 		const status = getProviderStatus(group);
+		const visibleModelsList = group.models
+			.filter((m) => !hiddenModels.has(m.value))
+			.map((m) => m.label);
 
 		return (
-			<ProviderCard
-				key={group.prefix}
-				label={group.label}
-				type={group.isPlatform ? "platform" : "custom"}
-				status={status}
-				modelCount={group.models.length}
-				hiddenCount={hiddenCount}
-				disabled={group.disabled}
-				onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
-				onOpenConfig={() => onOpenProviderConfig(group.prefix)}
-				isSelected={selectedProvider === group.prefix}
-			/>
+			<Grid.Col key={group.prefix} span={{ base: 12, sm: 6, md: 4, lg: 3 }}>
+				<ProviderCard
+					label={group.label}
+					type={group.isPlatform ? "platform" : "custom"}
+					badgeLabel={group.badgeLabel}
+					status={status}
+					modelCount={group.models.length}
+					hiddenCount={hiddenCount}
+					visibleModels={visibleModelsList}
+					disabled={group.disabled}
+					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
+					onOpenConfig={() => onOpenProviderConfig(group.prefix)}
+					isSelected={selectedProvider === group.prefix}
+				/>
+			</Grid.Col>
 		);
 	};
 
@@ -117,33 +123,21 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 
 			{/* Platform providers */}
 			{platformGroups.length > 0 && (
-				<Box>
+				<Box style={{ overflow: "hidden" }}>
 					<Title order={4} mb="xs">
 						{t("providerSectionPlatform")}
 					</Title>
-					<Grid>
-						{platformGroups.map(renderProviderCard).map((card, i) => (
-							<Grid.Col key={platformGroups[i].prefix} span={{ base: 12, sm: 6, md: 4, lg: 3 }}>
-								{card}
-							</Grid.Col>
-						))}
-					</Grid>
+					<Grid>{platformGroups.map(renderProviderCard)}</Grid>
 				</Box>
 			)}
 
 			{/* Custom providers */}
 			{customGroups.length > 0 && (
-				<Box>
+				<Box style={{ overflow: "hidden" }}>
 					<Title order={4} mb="xs">
 						{t("providerSectionCustom")}
 					</Title>
-					<Grid>
-						{customGroups.map(renderProviderCard).map((card, i) => (
-							<Grid.Col key={customGroups[i].prefix} span={{ base: 12, sm: 6, md: 4, lg: 3 }}>
-								{card}
-							</Grid.Col>
-						))}
-					</Grid>
+					<Grid>{customGroups.map(renderProviderCard)}</Grid>
 				</Box>
 			)}
 

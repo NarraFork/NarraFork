@@ -750,13 +750,14 @@
 	"providerStatusDisabled": "已禁用",
 	"providerStatusPartial": "部分可用",
 	"providerTypePlatform": "平台",
-	"providerTypeCustom": "自建",
+	"providerTypeCustom": "API Key",
 	"providerRefreshModels": "刷新模型列表",
 	"providerSectionPlatform": "平台集成",
-	"providerSectionCustom": "自建供应商",
+	"providerSectionCustom": "API key 接入",
 	"providerStatsTotal": "供应商总数",
 	"providerStatsEnabled": "已启用",
 	"providerStatsModels": "可用模型",
 	"providerConfigDesc": "配置供应商的 API 凭据、模型列表和高级选项。",
-	"overviewHiddenCount": "{{count}} 个已隐藏"
+	"overviewHiddenCount": "{{count}} 个已隐藏",
+	"overviewMoreModels": "更多模型"
 }

@@ -273,8 +273,15 @@ export type NarratorServerMessage =
 			type: "streaming_snapshot";
 			narratorId: string;
 			streamingBlocks: Array<
-				| { type: "reasoning"; text: string }
-				| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+				| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+				| {
+						type: "web_search";
+						id: string;
+						status: string;
+						query?: string;
+						queries?: string[];
+						outputIndex?: number;
+				  }
 				| { type: "text"; text: string }
 			>;
 			toolChunks: Array<{
