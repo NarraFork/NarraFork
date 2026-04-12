@@ -1,9 +1,10 @@
+import { computeFingerprint } from "../fingerprint";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
 import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
-import { getHttpUserAgent } from "../user-agent";
+import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -29,12 +30,33 @@ const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
 
-/** User-Agent string matching Claude Code CLI. */
-const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.71 (external, cli)";
+/**
+ * Build billing header with dynamic fingerprint computation.
+ * Format: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch={hash};
+ *
+ * @param messages - Message history to compute fingerprint from
+ * @returns Billing header string
+ */
+function buildBillingHeader(messages: AnthropicMessage[]): string {
+	// Extract first user message text for fingerprint computation
+	let firstUserMessageText = "";
+	const firstUserMsg = messages.find((m) => m.role === "user");
+	if (firstUserMsg) {
+		const content = firstUserMsg.content;
+		if (typeof content === "string") {
+			firstUserMessageText = content;
+		} else if (Array.isArray(content)) {
+			const textBlock = content.find((block) => block.type === "text");
+			if (textBlock && "text" in textBlock) {
+				firstUserMessageText = textBlock.text as string;
+			}
+		}
+	}
 
-/** Billing header injected as the first system block (matches Claude Code). */
-const BILLING_HEADER =
-	"x-anthropic-billing-header: cc_version=2.1.71.752; cc_entrypoint=cli; cch=9a771;";
+	// Compute fingerprint using Claude CLI version (2.1.88)
+	const fingerprint = computeFingerprint(firstUserMessageText, "2.1.88");
+	return `x-anthropic-billing-header: cc_version=2.1.88.${fingerprint}; cc_entrypoint=cli; cch=9a771;`;
+}
 
 /** Identity block injected as the second system block (matches Claude Code). */
 const IDENTITY_BLOCK = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -563,7 +585,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const systemBlocks: Array<Record<string, unknown>> = [];
 		if (isOfficial) {
 			systemBlocks.push(
-				{ type: "text", text: BILLING_HEADER },
+				{ type: "text", text: buildBillingHeader(messages) },
 				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
 			);
 			if (systemPrompt) {
@@ -638,7 +660,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders.Authorization = `Bearer ${apiKey}`;
 			reqHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
 			reqHeaders["anthropic-dangerous-direct-browser-access"] = "true";
-			reqHeaders["user-agent"] = CLAUDE_CLI_USER_AGENT;
+			reqHeaders["user-agent"] = getHttpClaudeCliUserAgent();
 			reqHeaders["x-app"] = "cli";
 			reqHeaders["X-Stainless-Arch"] = "x64";
 			reqHeaders["X-Stainless-Lang"] = "js";
@@ -825,9 +847,10 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial) {
 			headers.Authorization = `Bearer ${apiKey}`;
 			headers["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			headers["user-agent"] = CLAUDE_CLI_USER_AGENT;
+			headers["user-agent"] = getHttpClaudeCliUserAgent();
 		} else {
 			headers["x-api-key"] = apiKey;
+			headers["user-agent"] = getHttpUserAgent();
 		}
 
 		const response = await this.fetchWithV1Fallback("/messages", {
@@ -883,9 +906,10 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial) {
 			genHeaders.Authorization = `Bearer ${apiKey}`;
 			genHeaders["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			genHeaders["user-agent"] = CLAUDE_CLI_USER_AGENT;
+			genHeaders["user-agent"] = getHttpClaudeCliUserAgent();
 		} else {
 			genHeaders["x-api-key"] = apiKey;
+			genHeaders["user-agent"] = getHttpUserAgent();
 		}
 
 		const response = await this.fetchWithV1Fallback("/messages", {

@@ -2,6 +2,9 @@ import os from "node:os";
 import { APP_VERSION } from "./version";
 
 const ORIGINATOR = "narrafork";
+// Claude CLI version from official Claude Code (un project)
+// This version is used for Anthropic API authentication
+const CLAUDE_CLI_VERSION = "2.1.88";
 
 /**
  * Get OS type string in Codex format.
@@ -103,6 +106,18 @@ export function getUserAgent(): string {
 }
 
 /**
+ * Build User-Agent string in Claude CLI format (for Anthropic API):
+ * claude-cli/{version} (external, cli)
+ *
+ * This format is required by Anthropic's official API for proper authentication.
+ * The "external" user type indicates this is a third-party client.
+ * Uses the official Claude CLI version number for compatibility.
+ */
+export function getClaudeCliUserAgent(): string {
+	return `claude-cli/${CLAUDE_CLI_VERSION} (external, cli)`;
+}
+
+/**
  * Sanitize User-Agent string to ensure it's a valid HTTP header value.
  * Replaces invalid characters with underscores.
  */
@@ -116,4 +131,11 @@ export function sanitizeUserAgent(userAgent: string): string {
  */
 export function getHttpUserAgent(): string {
 	return sanitizeUserAgent(getUserAgent());
+}
+
+/**
+ * Get sanitized Claude CLI User-Agent string for Anthropic API.
+ */
+export function getHttpClaudeCliUserAgent(): string {
+	return sanitizeUserAgent(getClaudeCliUserAgent());
 }
