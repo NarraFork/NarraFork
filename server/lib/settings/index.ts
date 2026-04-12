@@ -207,6 +207,11 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/**
+		 * Global default reasoning effort — lowest priority fallback.
+		 * Fallback chain: narrator.reasoningEffort → provider.defaultReasoningEffort → agent.defaultReasoningEffort.
+		 */
+		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
 		/** Smart output interruption check — auto-detect and retry interrupted model output. */
@@ -1241,20 +1246,24 @@ export function isAnthropicProvider(prefix?: string): boolean {
 }
 
 /**
- * Resolve the default reasoning effort for a provider.
- * Checks Codex settings first, then Anthropic provider config.
+ * Resolve the default reasoning effort for a provider (two-level fallback).
+ * 1. Provider-specific default (Codex or Anthropic provider config)
+ * 2. Global default (agent.defaultReasoningEffort)
  * Returns undefined if no default is configured.
  */
 export function resolveDefaultReasoningEffort(
 	provider?: string,
 ): "none" | "low" | "medium" | "high" | "xhigh" | undefined {
 	if (usesCodexApiMode(provider)) {
-		return settings.codex?.defaultReasoningEffort;
+		return settings.codex?.defaultReasoningEffort ?? settings.agent.defaultReasoningEffort;
 	}
 	if (isAnthropicProvider(provider)) {
-		return getAnthropicProviderConfig(provider)?.defaultReasoningEffort;
+		return (
+			getAnthropicProviderConfig(provider)?.defaultReasoningEffort ??
+			settings.agent.defaultReasoningEffort
+		);
 	}
-	return undefined;
+	return settings.agent.defaultReasoningEffort;
 }
 
 /**

@@ -22,10 +22,10 @@ import { logger } from "../lib/logger";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
+	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
-	usesCodexApiMode,
 } from "../lib/settings";
 import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -661,9 +661,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(actualModel);
 		const resolvedReasoningEffort =
 			input.reasoningEffort === undefined
-				? usesCodexApiMode(resolvedProvider)
-					? (settings.codex?.defaultReasoningEffort ?? null)
-					: null
+				? (resolveDefaultReasoningEffort(resolvedProvider) ?? null)
 				: input.reasoningEffort;
 
 		const [narrator] = await db
@@ -722,10 +720,7 @@ export const narratorService = {
 		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
-			parent.reasoningEffort ??
-			(usesCodexApiMode(resolvedProvider)
-				? (settings.codex?.defaultReasoningEffort ?? null)
-				: null);
+			parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
 
 		const [narrator] = await db
 			.insert(narrators)
@@ -811,10 +806,7 @@ export const narratorService = {
 		const resolvedModel = resolveEffectiveModel(input.model);
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
-			original.reasoningEffort ??
-			(usesCodexApiMode(resolvedProvider)
-				? (settings.codex?.defaultReasoningEffort ?? null)
-				: null);
+			original.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
 
 		const narrator = await db.transaction(async (tx) => {
 			const [created] = await tx
@@ -3504,10 +3496,7 @@ export const narratorService = {
 		const effectiveModel = resolveEffectiveModel(storedModel);
 		const resolvedProvider = resolveProvider(effectiveModel);
 		const resolvedReasoningEffort =
-			parent.reasoningEffort ??
-			(usesCodexApiMode(resolvedProvider)
-				? (settings.codex?.defaultReasoningEffort ?? null)
-				: null);
+			parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
 
 		const newNarrator = await db.transaction(async (tx) => {
 			const [created] = await tx

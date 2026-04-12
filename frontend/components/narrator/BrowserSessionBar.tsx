@@ -2,9 +2,9 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
-	Button,
 	Collapse,
 	Group,
+	Loader,
 	Text,
 	Tooltip,
 	UnstyledButton,
@@ -17,7 +17,7 @@ import {
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useBrowserSessions, useCloseBrowserSession } from "../../hooks/useBrowserSessions";
 import { getToken } from "../../lib/api";
@@ -45,9 +45,9 @@ export function BrowserSessionBar({ narratorId }: { narratorId: string }) {
 			>
 				<Group gap={6} wrap="nowrap" style={{ flex: 1 }}>
 					<IconWorldWww size={14} color="var(--mantine-color-teal-5)" />
-				<Text size="xs" fw={500} c="teal">
-					{t("browser.title")}
-				</Text>
+					<Text size="xs" fw={500} c="teal">
+						{t("browser.title")}
+					</Text>
 					<Badge size="xs" variant="light" color="teal" circle>
 						{sessions.length}
 					</Badge>
@@ -76,20 +76,60 @@ function SessionCard({
 	const closeMutation = useCloseBrowserSession();
 	const [showScreenshot, setShowScreenshot] = useState(false);
 	const [screenshotKey, setScreenshotKey] = useState(0);
-	const [imgError, setImgError] = useState(false);
+	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [error, setError] = useState(false);
+	const revokedRef = useRef<string | null>(null);
 
-	const token = getToken();
-	const screenshotUrl = `/api/narrators/${narratorId}/browser-sessions/${session.id}/screenshot?token=${token}&t=${screenshotKey}`;
+	const fetchScreenshot = useCallback(async () => {
+		const token = getToken();
+		if (!token) return;
+		setLoading(true);
+		setError(false);
+		try {
+			const res = await fetch(
+				`/api/narrators/${narratorId}/browser-sessions/${session.id}/screenshot`,
+				{ headers: { Authorization: `Bearer ${token}` } },
+			);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const blob = await res.blob();
+			const url = URL.createObjectURL(blob);
+			// Revoke previous blob URL to avoid memory leak
+			if (revokedRef.current) {
+				URL.revokeObjectURL(revokedRef.current);
+			}
+			revokedRef.current = url;
+			setBlobUrl(url);
+		} catch {
+			setError(true);
+		} finally {
+			setLoading(false);
+		}
+	}, [narratorId, session.id]);
+
+	// Fetch when screenshot is shown or refreshed
+	useEffect(() => {
+		if (showScreenshot && screenshotKey > 0) {
+			fetchScreenshot();
+		}
+	}, [showScreenshot, screenshotKey, fetchScreenshot]);
+
+	// Cleanup blob URL on unmount
+	useEffect(() => {
+		return () => {
+			if (revokedRef.current) {
+				URL.revokeObjectURL(revokedRef.current);
+			}
+		};
+	}, []);
 
 	const handleRefresh = useCallback(() => {
-		setImgError(false);
 		setScreenshotKey((k) => k + 1);
 	}, []);
 
 	const handleToggleScreenshot = useCallback(() => {
 		setShowScreenshot((v) => {
 			if (!v) {
-				setImgError(false);
 				setScreenshotKey((k) => k + 1);
 			}
 			return !v;
@@ -156,26 +196,27 @@ function SessionCard({
 			</Group>
 			<Collapse in={showScreenshot}>
 				<Box mt="xs">
-					{imgError ? (
+					{loading ? (
+						<Group gap={6} justify="center" py="xs">
+							<Loader size="xs" />
+							<Text size="xs" c="dimmed">
+								{t("browser.refreshScreenshot")}
+							</Text>
+						</Group>
+					) : error ? (
 						<Group gap={6}>
 							<Text size="xs" c="red">
 								{t("browser.screenshotFailed")}
 							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								leftSection={<IconRefresh size={12} />}
-								onClick={handleRefresh}
-							>
-								{t("browser.refreshScreenshot")}
-							</Button>
+							<ActionIcon variant="subtle" size="sm" color="gray" onClick={handleRefresh}>
+								<IconRefresh size={12} />
+							</ActionIcon>
 						</Group>
-					) : (
+					) : blobUrl ? (
 						<>
 							<img
-								src={screenshotUrl}
+								src={blobUrl}
 								alt={t("browser.screenshotAlt")}
-								onError={() => setImgError(true)}
 								style={{
 									maxWidth: "100%",
 									maxHeight: 300,
@@ -184,17 +225,11 @@ function SessionCard({
 									display: "block",
 								}}
 							/>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								mt={4}
-								leftSection={<IconRefresh size={12} />}
-								onClick={handleRefresh}
-							>
-								{t("browser.refreshScreenshot")}
-							</Button>
+							<ActionIcon variant="subtle" size="sm" color="gray" mt={4} onClick={handleRefresh}>
+								<IconRefresh size={12} />
+							</ActionIcon>
 						</>
-					)}
+					) : null}
 				</Box>
 			</Collapse>
 		</Box>

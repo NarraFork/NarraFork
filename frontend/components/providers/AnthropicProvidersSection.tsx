@@ -5,6 +5,7 @@ import {
 	Divider,
 	Group,
 	PasswordInput,
+	Select,
 	Stack,
 	Switch,
 	Text,
@@ -58,6 +59,7 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 	onTestModel,
 }: AnthropicProvidersSectionProps) {
 	const { t } = useTranslation("settings");
+	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 
@@ -221,6 +223,22 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 								size="xs"
 								checked={!!p.officialApi}
 								onChange={(e) => updateProvider(p.id, "officialApi", e.currentTarget.checked)}
+							/>
+							<Select
+								label={t("anthropicDefaultReasoningEffort")}
+								description={t("anthropicDefaultReasoningEffortDesc")}
+								size="xs"
+								data={[
+									{ value: "auto", label: tn("reasoning_auto") },
+									{ value: "none", label: tn("reasoning_none") },
+									{ value: "low", label: tn("reasoning_low") },
+									{ value: "medium", label: tn("reasoning_medium") },
+									{ value: "high", label: tn("reasoning_high") },
+								]}
+								value={p.defaultReasoningEffort || "auto"}
+								onChange={(v) =>
+									updateProvider(p.id, "defaultReasoningEffort", v === "auto" ? null : (v ?? null))
+								}
 							/>
 							<Group gap="xs">
 								<Button

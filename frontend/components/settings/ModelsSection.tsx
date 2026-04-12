@@ -32,6 +32,8 @@ export interface ModelsSectionProps {
 	setSubagentPlanModel: (v: string) => void;
 	codexDefaultReasoningEffort: string;
 	setCodexDefaultReasoningEffort: (v: string) => void;
+	agentDefaultReasoningEffort: string;
+	setAgentDefaultReasoningEffort: (v: string) => void;
 	subagentAllowedModels: SubagentAllowedModels;
 	setSubagentAllowedModels: (v: SubagentAllowedModels) => void;
 	groupedModels: ComboboxData;
@@ -49,6 +51,8 @@ export function ModelsSection({
 	setSubagentPlanModel,
 	codexDefaultReasoningEffort,
 	setCodexDefaultReasoningEffort,
+	agentDefaultReasoningEffort,
+	setAgentDefaultReasoningEffort,
 	subagentAllowedModels,
 	setSubagentAllowedModels,
 	groupedModels,
@@ -181,6 +185,20 @@ export function ModelsSection({
 					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, general: v })}
 				/>
 			</Stack>
+			<Select
+				label={t("agentDefaultReasoningEffort")}
+				description={t("agentDefaultReasoningEffortDesc")}
+				data={[
+					{ value: "auto", label: tn("reasoning_auto") },
+					{ value: "none", label: tn("reasoning_none") },
+					{ value: "low", label: tn("reasoning_low") },
+					{ value: "medium", label: tn("reasoning_medium") },
+					{ value: "high", label: tn("reasoning_high") },
+					{ value: "xhigh", label: tn("reasoning_xhigh") },
+				]}
+				value={agentDefaultReasoningEffort || "auto"}
+				onChange={(v) => setAgentDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
+			/>
 			<Select
 				label={t("codexDefaultReasoningEffort")}
 				description={t("codexDefaultReasoningEffortDesc")}

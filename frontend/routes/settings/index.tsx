@@ -220,6 +220,7 @@ function SettingsPage() {
 		large: { pruneStart: 95, compactStart: 99 },
 	});
 	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
+	const [agentDefaultReasoningEffort, setAgentDefaultReasoningEffort] = useState("");
 	const [globalWhitelistDirs, setGlobalWhitelistDirs] = useState<
 		Array<{ path: string; accessLevel: string; enabled?: boolean }>
 	>([]);
@@ -298,6 +299,7 @@ function SettingsPage() {
 			large: { pruneStart: 95, compactStart: 99 },
 		},
 		codexDefaultReasoningEffort: "high",
+		agentDefaultReasoningEffort: "",
 		globalWhitelistDirs: [] as Array<{
 			path: string;
 			accessLevel: string;
@@ -367,6 +369,7 @@ function SettingsPage() {
 					large: { pruneStart: 95, compactStart: 99 },
 				},
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
+				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
 				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
@@ -413,6 +416,7 @@ function SettingsPage() {
 			setCustomRetryRules(snap.customRetryRules);
 			setContextThresholds(snap.contextThresholds);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
+			setAgentDefaultReasoningEffort(snap.agentDefaultReasoningEffort);
 			setGlobalWhitelistDirs(snap.globalWhitelistDirs);
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
 			setGlobalCommandWhitelist(snap.globalCommandWhitelist);
@@ -465,6 +469,7 @@ function SettingsPage() {
 			JSON.stringify(customRetryRules) !== JSON.stringify(s.customRetryRules) ||
 			JSON.stringify(contextThresholds) !== JSON.stringify(s.contextThresholds) ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort ||
+			agentDefaultReasoningEffort !== s.agentDefaultReasoningEffort ||
 			JSON.stringify(globalWhitelistDirs) !== JSON.stringify(s.globalWhitelistDirs) ||
 			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
 			JSON.stringify(globalCommandWhitelist) !== JSON.stringify(s.globalCommandWhitelist) ||
@@ -511,6 +516,7 @@ function SettingsPage() {
 		customRetryRules,
 		contextThresholds,
 		codexDefaultReasoningEffort,
+		agentDefaultReasoningEffort,
 		globalWhitelistDirs,
 		globalBlacklistDirs,
 		globalCommandWhitelist,
@@ -520,6 +526,7 @@ function SettingsPage() {
 		updateServerUrl,
 		updateChannel,
 		updateAutoDownload,
+		retryBackoffCeilMs,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -577,6 +584,9 @@ function SettingsPage() {
 					freshShellEnv,
 					translateReasoning,
 					defaultRelaxedPlan,
+					defaultReasoningEffort:
+						(agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
+						undefined,
 					smartInterruptionCheck,
 					maxTransientRetries,
 					retryBackoffCeilMs,
@@ -659,6 +669,7 @@ function SettingsPage() {
 						customRetryRules,
 						contextThresholds,
 						codexDefaultReasoningEffort,
+						agentDefaultReasoningEffort,
 						globalWhitelistDirs,
 						globalBlacklistDirs,
 						globalCommandWhitelist,
@@ -743,6 +754,8 @@ function SettingsPage() {
 							setSubagentAllowedModels={setSubagentAllowedModels}
 							codexDefaultReasoningEffort={codexDefaultReasoningEffort}
 							setCodexDefaultReasoningEffort={setCodexDefaultReasoningEffort}
+							agentDefaultReasoningEffort={agentDefaultReasoningEffort}
+							setAgentDefaultReasoningEffort={setAgentDefaultReasoningEffort}
 							groupedModels={groupedModels}
 							navigate={navigate}
 						/>

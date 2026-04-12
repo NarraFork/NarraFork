@@ -146,6 +146,7 @@ const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				translateReasoning: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
+				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				smartInterruptionCheck: z.boolean(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				customRetryRules: z
