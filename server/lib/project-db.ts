@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const PROJECT_DB_DIR = ".narrafork";
 const PROJECT_DB_FILE = "project.db";
 
@@ -13,6 +13,29 @@ const PROJECT_DB_FILE = "project.db";
 export function getProjectDbPath(gitPath: string): string {
 	return resolve(gitPath, PROJECT_DB_DIR, PROJECT_DB_FILE);
 }
+
+// Project DB is a portable per-project backup. Keep machine-local runtime references
+// (for example credential_id) out of this schema unless import/export truly depends on them.
+const PROJECT_DB_SCHEMA_PATCHES: Array<{
+	table: string;
+	columns: Array<{ name: string; type: string }>;
+}> = [
+	{
+		table: "narrator_messages",
+		columns: [
+			{ name: "provider", type: "TEXT" },
+			{ name: "model", type: "TEXT" },
+			{ name: "output_tokens", type: "INTEGER" },
+			{ name: "cached_input_tokens", type: "INTEGER" },
+			{ name: "cache_creation_input_tokens", type: "INTEGER" },
+			{ name: "cache_creation_5m_tokens", type: "INTEGER" },
+			{ name: "cache_creation_1h_tokens", type: "INTEGER" },
+			{ name: "reasoning_tokens", type: "INTEGER" },
+			{ name: "ttft_ms", type: "INTEGER" },
+			{ name: "duration_ms", type: "INTEGER" },
+		],
+	},
+];
 
 const CREATE_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -142,6 +165,16 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	tokens_in INTEGER,
 	cost_usd REAL,
 	turn_usage_json TEXT,
+	provider TEXT,
+	model TEXT,
+	output_tokens INTEGER,
+	cached_input_tokens INTEGER,
+	cache_creation_input_tokens INTEGER,
+	cache_creation_5m_tokens INTEGER,
+	cache_creation_1h_tokens INTEGER,
+	reasoning_tokens INTEGER,
+	ttft_ms INTEGER,
+	duration_ms INTEGER,
 	context_percent REAL,
 	meter_usage REAL,
 	meter_unit TEXT,
@@ -205,6 +238,20 @@ CREATE TABLE IF NOT EXISTS merge_sessions (
 );
 `;
 
+function ensureProjectDbSchema(conn: Database): void {
+	for (const patch of PROJECT_DB_SCHEMA_PATCHES) {
+		const existing = new Set(
+			(conn.prepare(`PRAGMA table_info("${patch.table}")`).all() as Array<{ name: string }>).map(
+				(row) => row.name,
+			),
+		);
+		for (const column of patch.columns) {
+			if (existing.has(column.name)) continue;
+			conn.run(`ALTER TABLE "${patch.table}" ADD COLUMN "${column.name}" ${column.type}`);
+		}
+	}
+}
+
 /** Initialize a project database: create dir, open connection, create tables. */
 function initProjectDb(gitPath: string): Database {
 	const dir = resolve(gitPath, PROJECT_DB_DIR);
@@ -215,6 +262,7 @@ function initProjectDb(gitPath: string): Database {
 	conn.run("PRAGMA foreign_keys = OFF");
 	conn.run("PRAGMA busy_timeout = 3000");
 	conn.exec(CREATE_TABLES_SQL);
+	ensureProjectDbSchema(conn);
 	conn.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 	return conn;
 }

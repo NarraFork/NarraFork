@@ -14,6 +14,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 
 interface ChapterForkModalProps {
@@ -71,11 +72,29 @@ export function ChapterForkModal({
 				inheritMode,
 				forkAtMessageUuid,
 			}),
-		onSuccess: (data) => {
+		onSuccess: async (data) => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+
+			// Add the forked chapter to recent tabs immediately
+			if (data?.id) {
+				const narrators = await api.listNarrators({ chapterId: data.id });
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+				const primary = narrators?.find((n: any) => n.type === "primary");
+				if (primary?.id) {
+					addRecentTab({
+						type: "chapter",
+						id: data.id,
+						narratorId: primary.id,
+						title: data.title ?? title.trim(),
+						subtitle: data.title,
+						status: primary.status,
+					});
+				}
+			}
+
 			// Show warnings as toast notifications if any
 			if (data?.warnings && Array.isArray(data.warnings)) {
 				for (const warning of data.warnings) {

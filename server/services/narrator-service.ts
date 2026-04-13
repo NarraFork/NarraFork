@@ -2706,6 +2706,17 @@ export const narratorService = {
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
+			provider?: string;
+			credentialId?: string;
+			model?: string;
+			outputTokens?: number;
+			cachedInputTokens?: number;
+			cacheCreationInputTokens?: number;
+			cacheCreation5mTokens?: number;
+			cacheCreation1hTokens?: number;
+			reasoningTokens?: number;
+			ttftMs?: number;
+			durationMs?: number;
 		},
 	) {
 		const id = generateId();
@@ -2732,6 +2743,17 @@ export const narratorService = {
 				contentJson: content,
 				contentText: contentText || null,
 				tokensIn: usage?.input_tokens,
+				provider: sdkMessage.provider ?? null,
+				credentialId: sdkMessage.credentialId ?? null,
+				model: sdkMessage.model ?? null,
+				outputTokens: sdkMessage.outputTokens ?? null,
+				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+				reasoningTokens: sdkMessage.reasoningTokens ?? null,
+				ttftMs: sdkMessage.ttftMs ?? null,
+				durationMs: sdkMessage.durationMs ?? null,
 				contextPercent: sdkMessage.contextPercent ?? null,
 				meterUsage: sdkMessage.meterUsage ?? null,
 				meterUnit: sdkMessage.meterUnit ?? null,
@@ -2776,6 +2798,17 @@ export const narratorService = {
 			meterUnit?: string;
 			tokensIn?: number;
 			turnUsage?: Record<string, unknown>;
+			provider?: string;
+			credentialId?: string;
+			model?: string;
+			outputTokens?: number;
+			cachedInputTokens?: number;
+			cacheCreationInputTokens?: number;
+			cacheCreation5mTokens?: number;
+			cacheCreation1hTokens?: number;
+			reasoningTokens?: number;
+			ttftMs?: number;
+			durationMs?: number;
 		},
 	) {
 		const id = generateId();
@@ -2793,6 +2826,17 @@ export const narratorService = {
 				contentText: null,
 				tokensIn: sdkMessage.tokensIn ?? null,
 				turnUsageJson: sdkMessage.turnUsage ?? null,
+				provider: sdkMessage.provider ?? null,
+				credentialId: sdkMessage.credentialId ?? null,
+				model: sdkMessage.model ?? null,
+				outputTokens: sdkMessage.outputTokens ?? null,
+				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+				reasoningTokens: sdkMessage.reasoningTokens ?? null,
+				ttftMs: sdkMessage.ttftMs ?? null,
+				durationMs: sdkMessage.durationMs ?? null,
 				contextPercent: sdkMessage.contextPercent ?? null,
 				meterUsage: sdkMessage.meterUsage ?? null,
 				meterUnit: sdkMessage.meterUnit ?? null,

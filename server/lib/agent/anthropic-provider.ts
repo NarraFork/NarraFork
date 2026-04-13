@@ -278,6 +278,10 @@ interface AnthropicStreamEvent {
 			output_tokens?: number;
 			cache_read_input_tokens?: number;
 			cache_creation_input_tokens?: number;
+			cache_creation?: {
+				ephemeral_5m_input_tokens?: number;
+				ephemeral_1h_input_tokens?: number;
+			};
 		};
 	};
 	content_block?: {
@@ -313,6 +317,10 @@ interface AnthropicStreamEvent {
 		output_tokens?: number;
 		cache_read_input_tokens?: number;
 		cache_creation_input_tokens?: number;
+		cache_creation?: {
+			ephemeral_5m_input_tokens?: number;
+			ephemeral_1h_input_tokens?: number;
+		};
 	};
 	error?: { type?: string; message?: string };
 }
@@ -1075,12 +1083,19 @@ function parseAnthropicEvent(
 		if (event.message.usage?.input_tokens != null) {
 			const cacheRead = event.message.usage.cache_read_input_tokens ?? 0;
 			const cacheCreation = event.message.usage.cache_creation_input_tokens ?? 0;
+			const cacheCreation5m = event.message.usage.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+			const cacheCreation1h = event.message.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
 			results.push({
 				usage: {
-					// Total input tokens occupying the context window (uncached + cached)
+					// Total prompt footprint in context window (uncached + cache read + cache write)
 					promptTokens: event.message.usage.input_tokens + cacheRead + cacheCreation,
+					// Raw billed non-cache input tokens
+					inputTokens: event.message.usage.input_tokens,
 					completionTokens: event.message.usage.output_tokens,
-					cachedInputTokens: cacheRead + cacheCreation,
+					cachedInputTokens: cacheRead,
+					cacheCreationInputTokens: cacheCreation,
+					cacheCreation5mTokens: cacheCreation5m,
+					cacheCreation1hTokens: cacheCreation1h,
 				},
 			});
 		}
@@ -1262,15 +1277,21 @@ function parseAnthropicEvent(
 		if (event.usage?.output_tokens != null) {
 			const cacheRead = event.usage.cache_read_input_tokens ?? 0;
 			const cacheCreation = event.usage.cache_creation_input_tokens ?? 0;
+			const cacheCreation5m = event.usage.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+			const cacheCreation1h = event.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
 			// message_delta typically only carries output_tokens — input_tokens is absent.
-			// Only include promptTokens when input_tokens is actually present to avoid
-			// overwriting the accurate value from message_start with 0.
+			// Only include prompt/input/cache figures when input_tokens is actually present
+			// to avoid overwriting the accurate value from message_start with 0.
 			const inputTokens = event.usage.input_tokens;
 			results.push({
 				usage: {
 					...(inputTokens != null && {
 						promptTokens: inputTokens + cacheRead + cacheCreation,
-						cachedInputTokens: cacheRead + cacheCreation,
+						inputTokens,
+						cachedInputTokens: cacheRead,
+						cacheCreationInputTokens: cacheCreation,
+						cacheCreation5mTokens: cacheCreation5m,
+						cacheCreation1hTokens: cacheCreation1h,
 					}),
 					completionTokens: event.usage.output_tokens,
 				},

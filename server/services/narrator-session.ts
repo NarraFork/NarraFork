@@ -101,6 +101,10 @@ interface ActiveNarrator {
 	events: EventEmitter;
 	alive: boolean;
 	locale: Locale;
+	/** ISO timestamp of current turn start, copied from updateStatus(thinking, setTurnStart=true). */
+	_turnStartedAt?: string;
+	/** Time to first text/reasoning token in current turn. */
+	_ttftMs?: number;
 	_usedCompactSummary?: boolean;
 	/** Current context usage percentage — used for message metadata */
 	_contextUsagePct?: number;
@@ -2725,11 +2729,15 @@ async function runAgentLoop(
 				conversationId: active.conversationId,
 				locale: active.locale,
 				providerPrefix: resolved.provider,
+				provider: resolved.provider,
+				model: resolved.model,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
 				getMeterUnit: () => active._lastMeterUnit,
 				getPartialMessageId: () => active._partialMessageId,
 				getTokenUsage: () => active._lastTokenUsage,
+				getTurnStartedAt: () => active._turnStartedAt,
+				getTtftMs: () => active._ttftMs,
 				setPartialMessageId: (id) => {
 					active._partialMessageId = id;
 				},
@@ -2742,6 +2750,9 @@ async function runAgentLoop(
 				},
 				setTokenUsage: (usage) => {
 					active._lastTokenUsage = usage;
+				},
+				setTtftMs: (ttftMs) => {
+					active._ttftMs = ttftMs;
 				},
 			};
 
@@ -4338,6 +4349,9 @@ async function feedMessage(
 		userId,
 	);
 
+	active._lastTokenUsage = undefined;
+	active._ttftMs = undefined;
+	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	const narrator = await narratorService.getById(narratorId);
@@ -4508,6 +4522,9 @@ export async function continueNarrator(
 	}
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	active._lastTokenUsage = undefined;
+	active._ttftMs = undefined;
+	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	// Pass empty text — buildHistory will reconstruct the trailing tool-result
@@ -4615,6 +4632,9 @@ export async function regenerateFromMessage(
 	const imageRefs = extractImageRefs(userMsg.contentJson);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	active._lastTokenUsage = undefined;
+	active._ttftMs = undefined;
+	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
@@ -4740,6 +4760,9 @@ export async function editAndRegenerate(
 	const imageRefs = existingImages;
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	active._lastTokenUsage = undefined;
+	active._ttftMs = undefined;
+	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
 
 	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch(

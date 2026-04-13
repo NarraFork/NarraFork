@@ -314,9 +314,11 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	const msgStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_messages
 		(id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json,
-		 content_text, tokens_in, cost_usd, turn_usage_json, context_percent,
-		 meter_usage, meter_unit, commit_sha, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 content_text, tokens_in, cost_usd, turn_usage_json, provider, model,
+		 output_tokens, cached_input_tokens, cache_creation_input_tokens,
+		 cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens,
+		 ttft_ms, duration_ms, context_percent, meter_usage, meter_unit, commit_sha, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const refStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_message_refs
@@ -344,6 +346,16 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 				m.tokensIn,
 				m.costUsd,
 				jsonCol(m.turnUsageJson),
+				m.provider,
+				m.model,
+				m.outputTokens,
+				m.cachedInputTokens,
+				m.cacheCreationInputTokens,
+				m.cacheCreation5mTokens,
+				m.cacheCreation1hTokens,
+				m.reasoningTokens,
+				m.ttftMs,
+				m.durationMs,
 				m.contextPercent,
 				m.meterUsage,
 				m.meterUnit,
@@ -494,9 +506,11 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 	const msgStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_messages
 		(id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json,
-		 content_text, tokens_in, cost_usd, turn_usage_json, context_percent,
-		 meter_usage, meter_unit, commit_sha, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 content_text, tokens_in, cost_usd, turn_usage_json, provider, model,
+		 output_tokens, cached_input_tokens, cache_creation_input_tokens,
+		 cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens,
+		 ttft_ms, duration_ms, context_percent, meter_usage, meter_unit, commit_sha, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const refStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_message_refs
@@ -530,6 +544,16 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 				m.tokensIn,
 				m.costUsd,
 				jsonCol(m.turnUsageJson),
+				m.provider,
+				m.model,
+				m.outputTokens,
+				m.cachedInputTokens,
+				m.cacheCreationInputTokens,
+				m.cacheCreation5mTokens,
+				m.cacheCreation1hTokens,
+				m.reasoningTokens,
+				m.ttftMs,
+				m.durationMs,
 				m.contextPercent,
 				m.meterUsage,
 				m.meterUnit,

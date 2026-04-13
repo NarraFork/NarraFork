@@ -373,7 +373,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
-	// (summaryModel, hiddenModels, modelContextWindows) that reference stale models.
+	// (summaryModel, hiddenModels, modelContextWindows, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
 	for (const { ids } of purges) {
 		if (!ids.length) continue;

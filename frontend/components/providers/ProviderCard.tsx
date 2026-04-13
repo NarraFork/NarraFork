@@ -104,16 +104,20 @@ export const ProviderCard = React.memo(function ProviderCard({
 							</Badge>
 						</Group>
 					</UnstyledButton>
-					<Switch
-						size="xs"
-						checked={!disabled}
-						onChange={(event) => {
-							event.stopPropagation();
-							onToggleDisabled();
-						}}
-						onClick={(event) => event.stopPropagation()}
-						aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
-					/>
+				<Switch
+					size="xs"
+					checked={!disabled}
+					onChange={(event) => {
+						event.preventDefault();
+						event.stopPropagation();
+						onToggleDisabled();
+					}}
+					onClick={(event) => {
+						event.preventDefault();
+						event.stopPropagation();
+					}}
+					aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
+				/>
 				</Group>
 
 				{/* Model preview or status */}

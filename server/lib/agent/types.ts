@@ -99,6 +99,7 @@ export type AgentEvent =
 			text: string;
 			toolUses: AgentToolUse[];
 			messageId?: string;
+			credentialId?: string;
 			stopReason?: string;
 	  }
 	| { type: "stream_text"; text: string }
@@ -166,9 +167,13 @@ export type AgentEvent =
 			type: "context_usage";
 			percentage: number;
 			promptTokens?: number;
+			inputTokens?: number;
 			completionTokens?: number;
 			reasoningTokens?: number;
 			cachedInputTokens?: number;
+			cacheCreationInputTokens?: number;
+			cacheCreation5mTokens?: number;
+			cacheCreation1hTokens?: number;
 			contextWindow?: number;
 			isEstimated?: boolean;
 	  }

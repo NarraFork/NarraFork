@@ -102,7 +102,6 @@ function NarratorDetailPage() {
 				title: displayTitle,
 				subtitle: chapterTitle,
 				status: narratorStatus,
-				updateOnly: true,
 			});
 		} else {
 			addRecentTab({
@@ -111,7 +110,6 @@ function NarratorDetailPage() {
 				title: narratorTitle || "New conversation",
 				subtitle: narratorCwd,
 				status: narratorStatus,
-				updateOnly: true,
 			});
 		}
 	}, [
@@ -300,6 +298,19 @@ function NarratorDetailPage() {
 				const narrators = await api.listNarrators({ chapterId: data.id });
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 				const primary = narrators?.find((n: any) => n.type === "primary");
+
+				// Add the forked chapter to recent tabs immediately
+				if (primary?.id) {
+					addRecentTab({
+						type: "chapter",
+						id: data.id,
+						narratorId: primary.id,
+						title: data.title ?? "Fork",
+						subtitle: data.title,
+						status: primary.status,
+					});
+				}
+
 				notifications.show({
 					title: tc("forkSuccess"),
 					message: tc("forkCreatedClick", { title: data.title ?? "Fork" }),

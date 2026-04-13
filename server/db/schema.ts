@@ -292,6 +292,17 @@ export const narratorMessages = sqliteTable(
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
 		turnUsageJson: text("turn_usage_json", { mode: "json" }),
+		provider: text("provider"),
+		credentialId: text("credential_id"),
+		model: text("model"),
+		outputTokens: integer("output_tokens"),
+		cachedInputTokens: integer("cached_input_tokens"),
+		cacheCreationInputTokens: integer("cache_creation_input_tokens"),
+		cacheCreation5mTokens: integer("cache_creation_5m_tokens"),
+		cacheCreation1hTokens: integer("cache_creation_1h_tokens"),
+		reasoningTokens: integer("reasoning_tokens"),
+		ttftMs: integer("ttft_ms"),
+		durationMs: integer("duration_ms"),
 		contextPercent: real("context_percent"),
 		meterUsage: real("meter_usage"),
 		meterUnit: text("meter_unit"),
@@ -368,12 +379,28 @@ export const narratorToolCalls = sqliteTable(
 			() => narrators.id,
 		),
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
+		// Token usage fields
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		cacheReadTokens: integer("cache_read_tokens").notNull().default(0),
+		cacheCreation5mTokens: integer("cache_creation_5m_tokens").notNull().default(0),
+		cacheCreation1hTokens: integer("cache_creation_1h_tokens").notNull().default(0),
+		// Cost fields (in USD)
+		inputCost: real("input_cost").notNull().default(0),
+		outputCost: real("output_cost").notNull().default(0),
+		cacheCreationCost: real("cache_creation_cost").notNull().default(0),
+		cacheReadCost: real("cache_read_cost").notNull().default(0),
+		totalCost: real("total_cost").notNull().default(0),
+		// Provider and model info
+		model: text("model"), // claude-3-5-sonnet-20241022, gpt-4o, etc.
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
 		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
+		index("idx_toolcalls_created").on(table.narratorId, table.createdAt),
 	],
 );
 

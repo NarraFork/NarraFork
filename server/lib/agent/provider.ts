@@ -62,12 +62,19 @@ export interface ParsedStreamEvent {
 	};
 	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
 	usage?: {
+		/** Total prompt footprint occupying context window; may include cache read/write depending on provider. */
 		promptTokens?: number;
+		/** Raw uncached input tokens billed as normal input. */
+		inputTokens?: number;
 		completionTokens?: number;
 		/** Reasoning tokens (o1/o3 models) */
 		reasoningTokens?: number;
-		/** Cached input tokens (prompt caching) */
+		/** Cached input tokens (prompt caching read/hit) */
 		cachedInputTokens?: number;
+		/** Cache creation / write tokens */
+		cacheCreationInputTokens?: number;
+		cacheCreation5mTokens?: number;
+		cacheCreation1hTokens?: number;
 	};
 	/** Web search lifecycle event from Responses API (Codex native web_search tool) */
 	webSearch?: {

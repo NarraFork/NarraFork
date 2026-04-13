@@ -10,6 +10,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { addRecentTab } from "../../hooks/useRecentTabs";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -901,9 +902,26 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const handleChapterFork = useCallback(
 		async (chapterId: string) => {
 			try {
-				await api.forkChapter(chapterId, {});
+				const data = await api.forkChapter(chapterId, {});
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
 				queryClient.invalidateQueries({ queryKey: ["rulerSegment", projectId] });
+
+				// Add the forked chapter to recent tabs immediately
+				if (data?.id) {
+					const narrators = await api.listNarrators({ chapterId: data.id });
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+					const primary = narrators?.find((n: any) => n.type === "primary");
+					if (primary?.id) {
+						addRecentTab({
+							type: "chapter",
+							id: data.id,
+							narratorId: primary.id,
+							title: data.title ?? "Fork",
+							subtitle: data.title,
+							status: primary.status,
+						});
+					}
+				}
 			} catch {
 				/* global handler */
 			}
@@ -941,23 +959,23 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					queryClient.invalidateQueries({
 						queryKey: ["rulerSegment", projectId],
 					});
-			} else if (err instanceof ApiError) {
-				const msgKey = dirtyErrorKey(err);
-				notifications.show({
-					title: t("ruler.mergeError"),
-					message: msgKey ? t(msgKey) : err.message,
-					color: "red",
-				});
-			} else {
-				notifications.show({
-					title: t("ruler.mergeError"),
-					message: err instanceof Error ? err.message : String(err),
-					color: "red",
-				});
+				} else if (err instanceof ApiError) {
+					const msgKey = dirtyErrorKey(err);
+					notifications.show({
+						title: t("ruler.mergeError"),
+						message: msgKey ? t(msgKey) : err.message,
+						color: "red",
+					});
+				} else {
+					notifications.show({
+						title: t("ruler.mergeError"),
+						message: err instanceof Error ? err.message : String(err),
+						color: "red",
+					});
+				}
 			}
-		}
-	},
-	[projectId, queryClient, t],
+		},
+		[projectId, queryClient, t],
 	);
 
 	const handleChapterRebase = useCallback(
@@ -983,22 +1001,22 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 						conflictFiles: result.conflictFiles,
 					});
 				}
-		} catch (err) {
-			if (err instanceof ApiError) {
-				const msgKey = dirtyErrorKey(err);
-				notifications.show({
-					title: t("ruler.rebaseError"),
-					message: msgKey ? t(msgKey) : err.message,
-					color: "red",
-				});
-			} else {
-				notifications.show({
-					title: t("ruler.rebaseError"),
-					message: err instanceof Error ? err.message : String(err),
-					color: "red",
-				});
+			} catch (err) {
+				if (err instanceof ApiError) {
+					const msgKey = dirtyErrorKey(err);
+					notifications.show({
+						title: t("ruler.rebaseError"),
+						message: msgKey ? t(msgKey) : err.message,
+						color: "red",
+					});
+				} else {
+					notifications.show({
+						title: t("ruler.rebaseError"),
+						message: err instanceof Error ? err.message : String(err),
+						color: "red",
+					});
+				}
 			}
-		}
 		},
 		[projectId, queryClient, t, data],
 	);
@@ -1903,87 +1921,90 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// biome-ignore lint/style/noNonNullAssertion: initialized before first use (after handleChapterDragMove definition)
 	const chapterDragMoveRef = useRef<typeof handleChapterDragMove>(null!);
 
-	const handlePointerDown = useCallback((e: React.PointerEvent) => {
-		// Check card hit first (left click / primary touch only)
-		if (e.button === 0) {
-			const hitRects = pixiRef.current?.getCardHitRects() ?? [];
-			const rect = containerRef.current?.getBoundingClientRect();
-			if (!rect) return;
-			const sx = e.clientX - rect.left;
-			const sy = e.clientY - rect.top;
-			for (const hr of hitRects) {
-				if (
-					sx >= hr.screenX &&
-					sx <= hr.screenX + hr.width &&
-					sy >= hr.screenY &&
-					sy <= hr.screenY + hr.height
-				) {
-					// Resolve actual pixiChaptersMapRef key (orphan chapters may be
-					// keyed under their parent's segment SHA, not their own startCommitSha)
-					const resolvedMapKey = resolvePixiMapKey(hr.id, hr.fromSha);
+	const handlePointerDown = useCallback(
+		(e: React.PointerEvent) => {
+			// Check card hit first (left click / primary touch only)
+			if (e.button === 0) {
+				const hitRects = pixiRef.current?.getCardHitRects() ?? [];
+				const rect = containerRef.current?.getBoundingClientRect();
+				if (!rect) return;
+				const sx = e.clientX - rect.left;
+				const sy = e.clientY - rect.top;
+				for (const hr of hitRects) {
+					if (
+						sx >= hr.screenX &&
+						sx <= hr.screenX + hr.width &&
+						sy >= hr.screenY &&
+						sy <= hr.screenY + hr.height
+					) {
+						// Resolve actual pixiChaptersMapRef key (orphan chapters may be
+						// keyed under their parent's segment SHA, not their own startCommitSha)
+						const resolvedMapKey = resolvePixiMapKey(hr.id, hr.fromSha);
 
-					if (e.pointerType === "touch") {
-						// Touch: record hit, let pan start normally below.
-						// contextmenu (long-press) will promote to card drag.
-						touchCardHitRef.current = {
-							id: hr.id,
+						if (e.pointerType === "touch") {
+							// Touch: record hit, let pan start normally below.
+							// contextmenu (long-press) will promote to card drag.
+							touchCardHitRef.current = {
+								id: hr.id,
+								fromSha: hr.fromSha,
+								mapKey: resolvedMapKey,
+								layoutX: hr.layoutX,
+								layoutY: hr.layoutY,
+								clientX: e.clientX,
+								clientY: e.clientY,
+								pointerId: e.pointerId,
+							};
+							break;
+						}
+						// Mouse: immediate drag (inactive until dead zone exceeded)
+						cardDragRef.current = {
+							active: false,
+							chapterId: hr.id,
 							fromSha: hr.fromSha,
 							mapKey: resolvedMapKey,
-							layoutX: hr.layoutX,
-							layoutY: hr.layoutY,
-							clientX: e.clientX,
-							clientY: e.clientY,
+							startScreenX: e.clientX,
+							startScreenY: e.clientY,
+							startLayoutX: hr.layoutX,
+							startLayoutY: hr.layoutY,
 							pointerId: e.pointerId,
 						};
-						break;
+						(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+						e.preventDefault();
+						return;
 					}
-					// Mouse: immediate drag (inactive until dead zone exceeded)
-					cardDragRef.current = {
-						active: false,
-						chapterId: hr.id,
-						fromSha: hr.fromSha,
-						mapKey: resolvedMapKey,
-						startScreenX: e.clientX,
-						startScreenY: e.clientY,
-						startLayoutX: hr.layoutX,
-						startLayoutY: hr.layoutY,
-						pointerId: e.pointerId,
-					};
-					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-					e.preventDefault();
-					return;
 				}
 			}
-		}
-		// Allow pan from left-click on non-interactive areas (canvas, ruler track, etc.)
-		// Skip if the click landed on or inside a button/link/input.
-		const interactive = (e.target as HTMLElement).closest?.("button, a, input, select");
-		if (e.button === 1 || (e.button === 0 && !interactive)) {
-			cancelAnimationFrame(bounceRafRef.current);
-			cancelAnimationFrame(inertiaRafRef.current);
-			// Stop any in-progress smooth zoom/scroll so drag takes over immediately
-			const sz = smoothZoomRef.current;
-			if (sz.animating) {
-				cancelAnimationFrame(sz.rafId);
-				sz.animating = false;
+			// Allow pan from left-click on non-interactive areas (canvas, ruler track, etc.)
+			// Skip if the click landed on or inside a button/link/input.
+			const interactive = (e.target as HTMLElement).closest?.("button, a, input, select");
+			if (e.button === 1 || (e.button === 0 && !interactive)) {
+				cancelAnimationFrame(bounceRafRef.current);
+				cancelAnimationFrame(inertiaRafRef.current);
+				// Stop any in-progress smooth zoom/scroll so drag takes over immediately
+				const sz = smoothZoomRef.current;
+				if (sz.animating) {
+					cancelAnimationFrame(sz.rafId);
+					sz.animating = false;
+				}
+				const ss = smoothScrollRef.current;
+				if (ss.animating) {
+					cancelAnimationFrame(ss.rafId);
+					ss.animating = false;
+				}
+				isPanningRef.current = true;
+				panStartRef.current = {
+					x: e.clientX,
+					y: e.clientY,
+					camX: cameraRef.current.panX,
+					camY: cameraRef.current.panY,
+				};
+				panSamplesRef.current = [{ x: e.clientX, y: e.clientY, t: performance.now() }];
+				(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+				e.preventDefault();
 			}
-			const ss = smoothScrollRef.current;
-			if (ss.animating) {
-				cancelAnimationFrame(ss.rafId);
-				ss.animating = false;
-			}
-			isPanningRef.current = true;
-			panStartRef.current = {
-				x: e.clientX,
-				y: e.clientY,
-				camX: cameraRef.current.panX,
-				camY: cameraRef.current.panY,
-			};
-			panSamplesRef.current = [{ x: e.clientX, y: e.clientY, t: performance.now() }];
-			(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-			e.preventDefault();
-		}
-	}, []);
+		},
+		[resolvePixiMapKey],
+	);
 
 	const handlePointerMove = useCallback(
 		(e: React.PointerEvent) => {
@@ -3324,11 +3345,11 @@ function NarratorPanelOverlay({
 				}}
 			>
 				<Box style={{ height: "100%", visibility: isCurrentlyResizing ? "hidden" : "visible" }}>
-				<StableNarratorPanel
-					narratorId={narratorId}
-					onClose={onClose}
-					onHeaderPointerDown={startDrag}
-				/>
+					<StableNarratorPanel
+						narratorId={narratorId}
+						onClose={onClose}
+						onHeaderPointerDown={startDrag}
+					/>
 				</Box>
 				{isCurrentlyResizing && (
 					<Box

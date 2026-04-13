@@ -5,6 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import {
 	CHAPTER_ROLE_ICONS,
@@ -55,12 +56,27 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 				inheritMode: "full",
 				forkAtMessageUuid: messageUuid,
 			}),
-		onSuccess: (data) => {
+		onSuccess: async (data) => {
 			queryClient.invalidateQueries({ queryKey: ["chapters"] });
 			queryClient.invalidateQueries({ queryKey: ["graph"] });
 			queryClient.invalidateQueries({ queryKey: ["narrators"] });
 			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 			if (data?.id) {
+				// Add the forked chapter to recent tabs immediately
+				const narrators = await api.listNarrators({ chapterId: data.id });
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
+				const primary = narrators?.find((n: any) => n.type === "primary");
+				if (primary?.id) {
+					addRecentTab({
+						type: "chapter",
+						id: data.id,
+						narratorId: primary.id,
+						title: data.title ?? "Fork",
+						subtitle: data.title,
+						status: primary.status,
+					});
+				}
+
 				notifications.show({
 					title: tch("forkSuccess"),
 					message: tch("forkCreatedClick", { title: data.title ?? "Fork" }),

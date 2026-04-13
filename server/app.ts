@@ -46,6 +46,7 @@ import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
+import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
@@ -155,6 +156,7 @@ app.route("/api/routines", routineRoutes);
 app.route("/api/reviews", reviewsRouter);
 app.route("/api/overseers", overseerRoutes);
 app.route("/api/update", updateRoutes);
+app.route("/api/usage-history", usageHistoryRoutes);
 app.route("/api/workspaces", workspaceRoutes);
 
 // Graph routes are nested under projects for RESTful consistency

@@ -989,6 +989,7 @@ function generateMigrationId(): string {
  * `isPrefixStale` receives the prefix portion of a model value (before ":") and
  * returns true if that prefix should be considered stale.
  * Mutates `settings.agent` in place. Returns true if any field was changed.
+ * Cleans: summaryModel, subagentModels, hiddenModels, modelContextWindows, customModels.
  */
 export function purgeStaleAgentModelRefs(
 	settings: NarraForkSettings,
@@ -1024,6 +1025,12 @@ export function purgeStaleAgentModelRefs(
 	}
 	if (Object.keys(cleanedWindows).length !== Object.keys(origWindows).length) {
 		settings.agent.modelContextWindows = cleanedWindows;
+		dirty = true;
+	}
+	const origCustom = settings.agent.customModels ?? [];
+	const cleanedCustom = origCustom.filter((m) => !isStale(m.value));
+	if (cleanedCustom.length !== origCustom.length) {
+		settings.agent.customModels = cleanedCustom;
 		dirty = true;
 	}
 	return dirty;

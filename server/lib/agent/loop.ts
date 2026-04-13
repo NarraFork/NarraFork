@@ -996,9 +996,13 @@ export async function* agentLoop(
 								type: "context_usage",
 								percentage: Math.min(percentage, 100),
 								promptTokens: parsed.usage.promptTokens,
+								inputTokens: parsed.usage.inputTokens,
 								completionTokens: parsed.usage.completionTokens,
 								reasoningTokens: parsed.usage.reasoningTokens,
 								cachedInputTokens: parsed.usage.cachedInputTokens,
+								cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
+								cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
+								cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
 								contextWindow,
 							};
 						}
@@ -1235,6 +1239,7 @@ export async function* agentLoop(
 				text: assistantText,
 				toolUses,
 				messageId,
+				credentialId,
 				stopReason,
 			};
 
@@ -1300,6 +1305,7 @@ export async function* agentLoop(
 				text: assistantText,
 				toolUses,
 				messageId,
+				credentialId,
 				stopReason,
 			};
 		}
