@@ -2008,12 +2008,7 @@ export async function analyzeBashCommand(
 				}
 				dangerousPatterns.push(danger);
 			}
-			// 即使条件安全命令没有危险参数，如果不在 SAFE_COMMANDS 中也需要标记
-			else if (!SAFE_COMMANDS.has(cmdName)) {
-				if (!nonWhitelisted.includes(cmdName)) {
-					nonWhitelisted.push(cmdName);
-				}
-			}
+			// 条件安全命令通过检查后视为安全，不再标记为 nonWhitelisted
 			// 写操作标记
 			if (PATH_COMMANDS_WRITE.has(cmdName)) {
 				hasWriteOperation = true;

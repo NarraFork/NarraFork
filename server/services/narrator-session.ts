@@ -687,12 +687,15 @@ function isCommandWhitelistCovered(
 	bashAnalysis: BashAnalysis,
 	commandWhitelist: CommandWhitelistEntry[],
 ): boolean {
-	if (commandWhitelist.length === 0) return false;
 	if (bashAnalysis.allWhitelisted) return false; // already whitelisted, no need
 	if (bashAnalysis.dangerousPatterns.length > 0) return false;
 	if (bashAnalysis.hasEnvInjection) return false;
-	if (bashAnalysis.nonWhitelisted.length === 0) return false;
 
+	// 如果没有 nonWhitelisted 命令，说明所有命令都是内置安全的
+	if (bashAnalysis.nonWhitelisted.length === 0) return true;
+
+	// 检查用户白名单是否覆盖所有 nonWhitelisted 命令
+	if (commandWhitelist.length === 0) return false;
 	return bashAnalysis.nonWhitelisted.every((cmdName) => {
 		const cmd = bashAnalysis.commands.find((c) => c.tokens[0] === cmdName);
 		if (!cmd) return false;
