@@ -2,10 +2,11 @@ import { computeFingerprint } from "../fingerprint";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
-import { parseModelId } from "../settings";
+import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -683,6 +684,13 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["user-agent"] = getHttpUserAgent();
 		}
 
+		params.requestDump?.setRequest({
+			transport: "http",
+			url: `${this.getBaseUrl()}${reqPath}`,
+			headers: sanitizeHeaders(reqHeaders),
+			body,
+		});
+
 		logger.debug("Anthropic chat request", {
 			model,
 			endpoint: `${this.getBaseUrl()}${reqPath}`,
@@ -704,9 +712,23 @@ export class AnthropicProvider implements ProviderAdapter {
 			},
 			true,
 		);
+		const responseTextPromise = params.requestDump
+			? response
+					.clone()
+					.text()
+					.catch((error) => {
+						params.requestDump?.setResponseError(error);
+						return "";
+					})
+			: undefined;
+		params.requestDump?.setResponseMeta({
+			status: response.status,
+			headers: sanitizeHeaders(response.headers),
+		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
+			params.requestDump?.setResponseBodyText(errText);
 			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
 		}
 
@@ -715,6 +737,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		yield* parseAnthropicSSEStream(response.body);
+		if (responseTextPromise) {
+			const bodyText = await responseTextPromise;
+			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
+			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+		}
 	}
 
 	formatToolResult(
@@ -1347,8 +1374,10 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
 } {
+	// Filter model-visible messages: user, assistant, sys (system context)
+	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
 	const topLevel = dbMessages.filter(
-		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant"),
+		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
 
 	// Drop the last user message — it's sent as the current message
@@ -1482,8 +1511,8 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 					}
 				}
 			}
-		} else if (msg.role === "user") {
-			// Flush pending tool results before user message
+		} else if (msg.role === "user" || msg.role === "sys") {
+			// Flush pending tool results before the next model-visible context message
 			if (pendingToolResults.length > 0) {
 				history.push({
 					role: "user",
@@ -1497,7 +1526,11 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 				pendingToolResults = [];
 			}
 
-			const text = msg.contentText || "";
+			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const textParts = content
+				.filter((b: { type: string }) => b.type === "text")
+				.map((b: { text: string }) => b.text);
+			const text = textParts.join("\n") || msg.contentText || "";
 			if (text) {
 				history.push({ role: "user", content: text });
 			}

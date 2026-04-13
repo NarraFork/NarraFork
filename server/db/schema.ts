@@ -286,7 +286,7 @@ export const narratorMessages = sqliteTable(
 			.references(() => narrators.id),
 		messageUuid: text("sdk_message_uuid"),
 		parentToolUseId: text("parent_tool_use_id"),
-		role: text("role", { enum: ["user", "assistant", "system"] }).notNull(),
+		role: text("role", { enum: ["user", "assistant", "system", "sys", "disp"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),
 		contentText: text("content_text"),
 		tokensIn: integer("tokens_in"),
@@ -886,6 +886,8 @@ export const apiRequests = sqliteTable(
 		contextPercent: real("context_percent"),
 		meterUsage: real("meter_usage"),
 		meterUnit: text("meter_unit"),
+		// 原始请求/响应 dump（调试用）
+		rawDumpJson: text("raw_dump_json"),
 		// 时间戳
 		createdAt: text("created_at").notNull(),
 	},

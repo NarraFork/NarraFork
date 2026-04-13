@@ -214,6 +214,10 @@ export interface NarraForkSettings {
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
+		/** Persist raw request/response dumps for each provider call into usage history. */
+		requestDumpEnabled: boolean;
+		/** Maximum size (bytes) for raw dump body text. Default 1MB. Set to -1 for unlimited. */
+		requestDumpMaxSize: number;
 		/** Smart output interruption check — auto-detect and retry interrupted model output. */
 		smartInterruptionCheck: boolean;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
@@ -397,6 +401,8 @@ const DEFAULTS: NarraForkSettings = {
 		},
 		legacyEncoding: false,
 		freshShellEnv: false,
+		requestDumpEnabled: false,
+		requestDumpMaxSize: 1024 * 1024, // 1MB
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
@@ -558,6 +564,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.freshShellEnv": {
 		desc: "启用后 Bash 工具通过 login shell 加载最新环境变量，而非继承服务器进程环境。适用于服务器启动后修改了 shell 配置的场景。",
 		type: "boolean",
+	},
+	"agent.requestDumpEnabled": {
+		desc: "启用后为每次模型/API 请求持久化原始请求与响应 dump，可在管理员请求历史中查看完整原始数据。",
+		type: "boolean",
+	},
+	"agent.requestDumpMaxSize": {
+		desc: "Raw dump 响应体文本的最大字节数。默认 1MB (1048576)。设为 -1 表示不限制。超出部分会被截断并标记。",
+		type: "number",
 	},
 	"agent.modelContextWindows": {
 		desc: '按模型覆盖上下文窗口大小（tokens）。键为完整模型值 "provider:modelId"，值为 token 数。优先级最高。',

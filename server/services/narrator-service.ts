@@ -469,7 +469,7 @@ export async function handleLoadToolCommand(
 			locale === "zh-CN"
 				? `⚠️ 未知工具：${toolId}。可用：terminal, share_file, narrafork_admin`
 				: `⚠️ Unknown tool: ${toolId}. Available: terminal, share_file, narrafork_admin`;
-		await narratorService.persistInfoMessage(narratorId, infoText);
+		await narratorService.persistDisplayMessage(narratorId, infoText);
 		return { toolName: toolId, loaded: false, alreadyLoaded: false };
 	}
 	const toolName = cmdResult.loadTool;
@@ -481,7 +481,7 @@ export async function handleLoadToolCommand(
 				? "⛔ 只有管理员才能加载此工具"
 				: "⛔ Only administrators can load this tool";
 		if (!userId) {
-			await narratorService.persistInfoMessage(narratorId, adminOnlyMsg);
+			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
 			return { toolName, loaded: false, alreadyLoaded: false };
 		}
 		const user = await db.query.users.findFirst({
@@ -489,7 +489,7 @@ export async function handleLoadToolCommand(
 			columns: { role: true },
 		});
 		if (!user || user.role !== "admin") {
-			await narratorService.persistInfoMessage(narratorId, adminOnlyMsg);
+			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
 			return { toolName, loaded: false, alreadyLoaded: false };
 		}
 	}
@@ -500,7 +500,7 @@ export async function handleLoadToolCommand(
 	const infoText = alreadyLoaded
 		? `🔧 Tool already loaded: ${toolName}`
 		: `🔧 Tool loaded: ${toolName}`;
-	await narratorService.persistInfoMessage(narratorId, infoText);
+	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	// Persist a user-role message so the model is aware the tool was just loaded
 	if (!alreadyLoaded) {
@@ -585,7 +585,7 @@ export async function handleLoadSkillCommand(
 	if (!found) {
 		const available = skills.map((s) => s.name).join(", ");
 		const infoText = `⚠️ Skill "${cmdResult.loadSkill}" not found. Available: ${available || "(none)"}`;
-		await narratorService.persistInfoMessage(narratorId, infoText);
+		await narratorService.persistDisplayMessage(narratorId, infoText);
 		return { found: false, skillName: cmdResult.loadSkill };
 	}
 
@@ -609,7 +609,7 @@ export async function handleLoadSkillCommand(
 	}
 	lines.push("</skill_content>");
 
-	await narratorService.persistInfoMessage(narratorId, `🔧 Skill loaded: ${found.name}`);
+	await narratorService.persistDisplayMessage(narratorId, `🔧 Skill loaded: ${found.name}`);
 
 	return { found: true, skillName: found.name, content: lines.join("\n") };
 }
@@ -2431,8 +2431,7 @@ export const narratorService = {
 
 	/**
 	 * Persist a system-injected message into the narrator's chat history.
-	 * Uses role="user" so the SDK includes it in conversation history
-	 * (role="system" is filtered out by buildHistory).
+	 * Uses role="sys" so the model can see it in conversation history.
 	 * The `contentBlocks` carry structured metadata for the UI; a text block
 	 * is always prepended so the model can read the plain-text content.
 	 */
@@ -2453,7 +2452,7 @@ export const narratorService = {
 			.values({
 				id,
 				narratorId,
-				role: "user",
+				role: "sys",
 				contentJson: blocks,
 				contentText: text,
 				createdBy: createdBy ?? null,
@@ -2466,11 +2465,11 @@ export const narratorService = {
 	},
 
 	/**
-	 * Persist a lightweight info system message (role="system", type="info").
+	 * Persist a lightweight display message (role="disp", type="info").
 	 * Excluded from model history — purely a UI notification in the chat timeline.
 	 * Returns the created message row and broadcasts it via WebSocket.
 	 */
-	async persistInfoMessage(narratorId: string, text: string) {
+	async persistDisplayMessage(narratorId: string, text: string) {
 		const id = generateId();
 		const now = new Date().toISOString();
 		const [msg] = await db
@@ -2478,7 +2477,7 @@ export const narratorService = {
 			.values({
 				id,
 				narratorId,
-				role: "system",
+				role: "disp",
 				contentJson: [{ type: "info", message: text }],
 				contentText: `[Info] ${text}`,
 				createdAt: now,
@@ -2491,7 +2490,7 @@ export const narratorService = {
 			message: {
 				id: msg.id,
 				narratorId,
-				role: "system",
+				role: "disp",
 				contentJson: msg.contentJson,
 				contentText: msg.contentText,
 				createdAt: msg.createdAt,
@@ -3010,6 +3009,11 @@ export const narratorService = {
 	async updateTitle(narratorId: string, title: string) {
 		const now = new Date().toISOString();
 		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
+	},
+
+	async updateCwd(narratorId: string, cwd: string) {
+		const now = new Date().toISOString();
+		await db.update(narrators).set({ cwd, updatedAt: now }).where(eq(narrators.id, narratorId));
 	},
 
 	async updateModel(narratorId: string, model: string) {

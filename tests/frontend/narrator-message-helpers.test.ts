@@ -6,10 +6,7 @@ import {
 	removeStreamingChunksMsg,
 	resolveAllToolCallsFromMsg,
 } from "../../frontend/components/narrator/narrator-message-helpers";
-import {
-	createStreamingChunksFixture,
-	makeMessage,
-} from "./narrator-timeline.fixtures";
+import { createStreamingChunksFixture, makeMessage } from "./narrator-timeline.fixtures";
 
 describe("narrator-message-helpers legacy behavior", () => {
 	test("resolveAllToolCallsFromMsg 优先读取 enriched tool_use block 字段", () => {

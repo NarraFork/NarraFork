@@ -201,6 +201,7 @@ function SettingsPage() {
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [freshShellEnv, setFreshShellEnv] = useState(false);
 	const [translateReasoning, setTranslateReasoning] = useState(false);
+	const [requestDumpEnabled, setRequestDumpEnabled] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
 	const [smartInterruptionCheck, setSmartInterruptionCheck] = useState(true);
 	const [maxTransientRetries, setMaxTransientRetries] = useState(10);
@@ -282,6 +283,7 @@ function SettingsPage() {
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
+		requestDumpEnabled: false,
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
@@ -359,6 +361,7 @@ function SettingsPage() {
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
+				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
@@ -409,6 +412,7 @@ function SettingsPage() {
 			setLegacyEncoding(snap.legacyEncoding);
 			setFreshShellEnv(snap.freshShellEnv);
 			setTranslateReasoning(snap.translateReasoning);
+			setRequestDumpEnabled(snap.requestDumpEnabled);
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
 			setSmartInterruptionCheck(snap.smartInterruptionCheck);
 			setMaxTransientRetries(snap.maxTransientRetries);
@@ -462,6 +466,7 @@ function SettingsPage() {
 			legacyEncoding !== s.legacyEncoding ||
 			freshShellEnv !== s.freshShellEnv ||
 			translateReasoning !== s.translateReasoning ||
+			requestDumpEnabled !== s.requestDumpEnabled ||
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
 			smartInterruptionCheck !== s.smartInterruptionCheck ||
 			maxTransientRetries !== s.maxTransientRetries ||
@@ -510,7 +515,9 @@ function SettingsPage() {
 		legacyEncoding,
 		freshShellEnv,
 		translateReasoning,
+		requestDumpEnabled,
 		defaultRelaxedPlan,
+
 		smartInterruptionCheck,
 		maxTransientRetries,
 		customRetryRules,
@@ -583,6 +590,7 @@ function SettingsPage() {
 					legacyEncoding,
 					freshShellEnv,
 					translateReasoning,
+					requestDumpEnabled,
 					defaultRelaxedPlan,
 					defaultReasoningEffort:
 						(agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
@@ -662,6 +670,7 @@ function SettingsPage() {
 						legacyEncoding,
 						freshShellEnv,
 						translateReasoning,
+						requestDumpEnabled,
 						defaultRelaxedPlan,
 						smartInterruptionCheck,
 						maxTransientRetries,
@@ -777,6 +786,8 @@ function SettingsPage() {
 							setFreshShellEnv={setFreshShellEnv}
 							translateReasoning={translateReasoning}
 							setTranslateReasoning={setTranslateReasoning}
+							requestDumpEnabled={requestDumpEnabled}
+							setRequestDumpEnabled={setRequestDumpEnabled}
 							expandReasoning={expandReasoning}
 							setExpandReasoning={setExpandReasoning}
 							defaultRelaxedPlan={defaultRelaxedPlan}

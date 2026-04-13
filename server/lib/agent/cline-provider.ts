@@ -2,9 +2,10 @@ import { buildOpenRouterHeaders, getAccessToken } from "../cline-auth";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { ClineProviderConfig } from "../settings";
-import { parseModelId } from "../settings";
+import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -210,6 +211,12 @@ export class ClineProvider implements ProviderAdapter {
 		}
 
 		const headers = this.buildHeaders(apiKey);
+		params.requestDump?.setRequest({
+			transport: "http",
+			url: `${baseUrl}/chat/completions`,
+			headers: sanitizeHeaders(headers),
+			body,
+		});
 		logger.debug("Cline chat request", {
 			model,
 			baseUrl,
@@ -226,9 +233,23 @@ export class ClineProvider implements ProviderAdapter {
 			body: JSON.stringify(body),
 			signal: params.signal,
 		});
+		const responseTextPromise = params.requestDump
+			? response
+					.clone()
+					.text()
+					.catch((error) => {
+						params.requestDump?.setResponseError(error);
+						return "";
+					})
+			: undefined;
+		params.requestDump?.setResponseMeta({
+			status: response.status,
+			headers: sanitizeHeaders(response.headers),
+		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
+			params.requestDump?.setResponseBodyText(errText);
 			throw new ApiError(response.status, `Cline API error ${response.status}: ${errText}`);
 		}
 
@@ -237,6 +258,11 @@ export class ClineProvider implements ProviderAdapter {
 		}
 
 		yield* this.parseSSEStream(response.body);
+		if (responseTextPromise) {
+			const bodyText = await responseTextPromise;
+			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
+			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+		}
 	}
 
 	formatToolResult(
@@ -371,8 +397,11 @@ export class ClineProvider implements ProviderAdapter {
 		history: ClineMessage[];
 		trailingToolResults: ClineToolResult[];
 	} {
+		// Filter model-visible messages: user, assistant, sys (system context)
+		// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
 		const topLevel = dbMessages.filter(
-			(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant"),
+			(m) =>
+				!m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 		);
 
 		// Drop the last user message — it's sent as the current message
@@ -451,6 +480,20 @@ export class ClineProvider implements ProviderAdapter {
 				const text = msg.contentText || "";
 				if (text) {
 					history.push({ role: "user", content: text });
+				}
+			} else if (msg.role === "sys") {
+				for (const tr of pendingToolResults) {
+					history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
+				}
+				pendingToolResults = [];
+
+				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+				const textParts = content
+					.filter((b: { type: string }) => b.type === "text")
+					.map((b: { text: string }) => b.text);
+				const text = textParts.join("\n") || msg.contentText || "";
+				if (text) {
+					history.push({ role: "system", content: text });
 				}
 			}
 		}

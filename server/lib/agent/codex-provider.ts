@@ -217,7 +217,8 @@ export class CodexProvider implements ProviderAdapter {
 			try {
 				for await (const event of provider.chat(params)) {
 					hasStreamedEvents = true;
-					yield event;
+					// Inject credentialId into the event
+					yield { ...event, credentialId: ctx.id };
 				}
 				this.manager.reportSuccess(ctx.id);
 				return;
@@ -289,6 +290,13 @@ export class CodexProvider implements ProviderAdapter {
 		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
+		}>,
+		webSearches?: Array<{
+			id: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
 		}>,
 	): void {
 		const dummy = new OpenAIProvider({
@@ -300,7 +308,7 @@ export class CodexProvider implements ProviderAdapter {
 			defaultModel: "gpt-5.3-codex",
 			apiMode: "codex",
 		});
-		dummy.pushAssistantTurn(history, text, toolUses, reasoningBlocks);
+		dummy.pushAssistantTurn(history, text, toolUses, reasoningBlocks, webSearches);
 	}
 
 	async generate(text: string, model: string): Promise<string> {

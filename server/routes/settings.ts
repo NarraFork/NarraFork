@@ -145,6 +145,7 @@ const updateSettingsSchema = z
 					.partial(),
 				legacyEncoding: z.boolean(),
 				translateReasoning: z.boolean(),
+				requestDumpEnabled: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				smartInterruptionCheck: z.boolean(),

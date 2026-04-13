@@ -10,9 +10,10 @@
  *   const { db, sqlite } = getTestDb();
  *   afterEach(() => cleanDb(sqlite));
  */
+
+import { Database } from "bun:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import * as relations from "../server/db/relations";
 import * as schema from "../server/db/schema";

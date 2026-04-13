@@ -53,6 +53,7 @@ import {
 	IconFolderPlus,
 	IconGitFork,
 	IconGripVertical,
+	IconInfoCircle,
 	IconLock,
 	IconLockOpen,
 	IconPaperclip,
@@ -146,6 +147,7 @@ import {
 } from "./MessageSelectionCtx";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
+import { NarratorDetailsPanel } from "./NarratorDetailsPanel";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
@@ -1402,6 +1404,7 @@ export function NarratorPanel({
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
+	const [detailsOpened, { toggle: toggleDetails, close: closeDetails }] = useDisclosure(false);
 
 	// File modifications drawer/panel state
 	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
@@ -3803,6 +3806,16 @@ export function NarratorPanel({
 									<IconFileCode size={16} />
 								</ActionIcon>
 							</Tooltip>
+							<Tooltip label={t("details.title")}>
+								<ActionIcon
+									size="sm"
+									variant={detailsOpened ? "light" : "subtle"}
+									color={detailsOpened ? "indigo" : "gray"}
+									onClick={toggleDetails}
+								>
+									<IconInfoCircle size={16} />
+								</ActionIcon>
+							</Tooltip>
 							<Tooltip label={t("archiveNarrator")}>
 								<ActionIcon
 									size="sm"
@@ -3860,6 +3873,15 @@ export function NarratorPanel({
 							</Group>
 						</Stack>
 					</Modal>
+
+					<NarratorDetailsPanel
+						opened={detailsOpened}
+						onClose={closeDetails}
+						narratorId={narratorId}
+						narrator={narrator}
+						viewers={viewers}
+						defaultModelValue={defaultModelValue}
+					/>
 
 					{/* Messages */}
 					<Box pos="relative" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>

@@ -276,5 +276,12 @@
 	"usageHistoryTableTokens": "Tokens",
 	"usageHistoryTableTTFT": "TTFT",
 	"usageHistoryTableDuration": "耗时",
-	"usageHistoryTableCost": "成本"
+	"usageHistoryTableCost": "成本",
+	"usageHistoryTableActions": "操作",
+	"usageHistoryToggleShowId": "显示 ID",
+	"usageHistoryToggleShowName": "显示名称",
+	"usageHistoryViewRawDump": "查看原始数据",
+	"usageHistoryRawDumpTitle": "原始请求数据",
+	"usageHistoryRawDumpLoading": "正在加载原始请求数据...",
+	"usageHistoryRawDumpEmpty": "这条请求暂时没有可查看的原始 dump。"
 }

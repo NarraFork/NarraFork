@@ -53,10 +53,13 @@ describe("isInsideWorktree", () => {
 		expect(isInsideWorktree(CWD, ".")).toBe(true);
 	});
 
-	test.skipIf(process.platform !== "win32")("windows-style path comparison is case-insensitive", () => {
-		expect(isInsideWorktree("C:/Users/Ray/Repo", "c:/users/ray/repo/src/index.ts")).toBe(true);
-		expect(isInsideWorktree("C:/Users/Ray/Repo", "C:/Users/Ray/Repo-2/file.txt")).toBe(false);
-	});
+	test.skipIf(process.platform !== "win32")(
+		"windows-style path comparison is case-insensitive",
+		() => {
+			expect(isInsideWorktree("C:/Users/Ray/Repo", "c:/users/ray/repo/src/index.ts")).toBe(true);
+			expect(isInsideWorktree("C:/Users/Ray/Repo", "C:/Users/Ray/Repo-2/file.txt")).toBe(false);
+		},
+	);
 
 	test("absolute path outside worktree", () => {
 		expect(isInsideWorktree(CWD, "/etc/passwd")).toBe(false);

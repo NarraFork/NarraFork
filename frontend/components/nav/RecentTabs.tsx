@@ -7,7 +7,6 @@ import {
 	DragOverlay,
 	type DragStartEvent,
 	type DropAnimationFunctionArguments,
-	KeyboardSensor,
 	MouseSensor,
 	pointerWithin,
 	TouchSensor,
@@ -434,7 +433,6 @@ export function RecentTabList({
 	const sensors = useSensors(
 		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
-		useSensor(KeyboardSensor),
 	);
 
 	// Height of the workspace group (header + children) measured on drag start.

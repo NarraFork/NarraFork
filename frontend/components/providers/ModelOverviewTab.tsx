@@ -29,6 +29,8 @@ import type { ModelOption } from "../../lib/constants";
 /** A provider group in the overview. */
 export interface ProviderGroup {
 	prefix: string;
+	/** Provider ID for multi-instance providers (used for routing). Undefined for platform providers. */
+	providerId?: string;
 	label: string;
 	badgeLabel?: string;
 	models: ModelOption[];

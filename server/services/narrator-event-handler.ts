@@ -1339,6 +1339,7 @@ export async function processEvent(
 					contextPercent: event.contextPercent ?? null,
 					meterUsage: event.meterUsage ?? null,
 					meterUnit: event.meterUnit ?? null,
+					rawDumpJson: event.rawDump ? JSON.stringify(event.rawDump) : null,
 					createdAt: new Date().toISOString(),
 				});
 				if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];

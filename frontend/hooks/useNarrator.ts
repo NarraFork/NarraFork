@@ -625,6 +625,17 @@ export function useUpdateModel() {
 	});
 }
 
+export function useUpdateCwd() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, cwd }: { id: string; cwd: string }) => api.updateNarratorCwd(id, cwd),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+		},
+	});
+}
+
 export function useUpdatePruneEnabled() {
 	const qc = useQueryClient();
 	return useMutation({

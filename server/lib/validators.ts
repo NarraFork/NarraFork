@@ -464,6 +464,10 @@ export const updateNarratorTitleSchema = z.object({
 	title: z.string().min(1).max(200),
 });
 
+export const updateNarratorCwdSchema = z.object({
+	cwd: z.string().trim().min(1).max(4096),
+});
+
 // === Narrator Fork (standalone narrators only) ===
 
 export const forkNarratorSchema = z.object({

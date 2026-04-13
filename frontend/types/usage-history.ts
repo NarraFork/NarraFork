@@ -1,3 +1,21 @@
+export interface UsageHistoryRawDump {
+	provider?: string;
+	model?: string;
+	request?: {
+		transport?: string;
+		url?: string;
+		headers?: Record<string, string>;
+		body?: unknown;
+	};
+	response?: {
+		status?: number;
+		headers?: Record<string, string>;
+		bodyText?: string;
+		events?: unknown[];
+		error?: string;
+	};
+}
+
 export interface UsageHistoryRecord {
 	id: string;
 	narratorId: string;
@@ -23,6 +41,8 @@ export interface UsageHistoryRecord {
 	chapterTitle?: string | null;
 	chapterId?: string | null;
 	projectId?: string | null;
+	hasRawDump?: boolean;
+	rawDump?: UsageHistoryRawDump | null;
 }
 
 export interface UsageHistoryStats {

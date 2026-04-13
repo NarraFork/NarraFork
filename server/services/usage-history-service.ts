@@ -54,6 +54,8 @@ export interface UsageHistoryRecord {
 	chapterTitle?: string | null;
 	chapterId?: string | null;
 	projectId?: string | null;
+	hasRawDump?: boolean;
+	rawDump?: unknown | null;
 }
 
 export class UsageHistoryService {
@@ -81,6 +83,15 @@ export class UsageHistoryService {
 		}
 
 		return null;
+	}
+
+	private parseRawDump(rawDumpJson: string | null): unknown | null {
+		if (!rawDumpJson) return null;
+		try {
+			return JSON.parse(rawDumpJson);
+		} catch {
+			return { invalidJson: true, rawText: rawDumpJson };
+		}
 	}
 
 	async listUsageHistory(
@@ -120,6 +131,7 @@ export class UsageHistoryService {
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
+				rawDumpJson: apiRequests.rawDumpJson,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
 				chapterTitle: chapters.title,
@@ -145,6 +157,7 @@ export class UsageHistoryService {
 				cacheCreation5mTokens: r.cacheCreation5mTokens ?? 0,
 				cacheCreation1hTokens: r.cacheCreation1hTokens ?? 0,
 				reasoningTokens: r.reasoningTokens ?? 0,
+				hasRawDump: !!r.rawDumpJson,
 			})) as UsageHistoryRecord[],
 			total,
 		};
@@ -216,6 +229,7 @@ export class UsageHistoryService {
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
+				rawDumpJson: apiRequests.rawDumpJson,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
 				chapterTitle: chapters.title,
@@ -228,8 +242,9 @@ export class UsageHistoryService {
 			.where(eq(apiRequests.id, id));
 
 		if (!record) return null;
+		const { rawDumpJson, ...rest } = record;
 		return {
-			...record,
+			...rest,
 			credentialName: this.getCredentialName(record.provider, record.credentialId),
 			inputTokens: record.inputTokens ?? 0,
 			outputTokens: record.outputTokens ?? 0,
@@ -238,6 +253,8 @@ export class UsageHistoryService {
 			cacheCreation5mTokens: record.cacheCreation5mTokens ?? 0,
 			cacheCreation1hTokens: record.cacheCreation1hTokens ?? 0,
 			reasoningTokens: record.reasoningTokens ?? 0,
+			hasRawDump: !!rawDumpJson,
+			rawDump: this.parseRawDump(rawDumpJson),
 		};
 	}
 

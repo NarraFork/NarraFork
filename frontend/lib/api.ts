@@ -657,6 +657,11 @@ export const api = {
 			method: "PATCH",
 			body: JSON.stringify({ title }),
 		}),
+	updateNarratorCwd: (id: string, cwd: string) =>
+		request<{ ok: boolean; cwd: string; changed: boolean }>(`/narrators/${id}/cwd`, {
+			method: "PATCH",
+			body: JSON.stringify({ cwd }),
+		}),
 	generateNarratorTitle: (id: string) =>
 		request<{ title: string }>(`/narrators/${id}/generate-title`, { method: "POST" }),
 	suggestAnswers: (

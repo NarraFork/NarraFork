@@ -12,6 +12,16 @@ const provider = new OpenAIProvider({
 	apiMode: "responses",
 });
 
+const codexProvider = new OpenAIProvider({
+	id: "codex",
+	name: "Codex",
+	prefix: "codex",
+	apiKey: "test-key",
+	baseUrl: "https://chatgpt.com/backend-api/codex",
+	defaultModel: "gpt-5.3-codex",
+	apiMode: "codex",
+});
+
 function createDoneSseResponse(): Response {
 	return new Response("data: [DONE]\n\n", {
 		status: 200,
@@ -103,5 +113,87 @@ describe("OpenAIProvider chat request formatting", () => {
 		expect(contentTypes).toEqual(["input_text", "input_image"]);
 		expect(contentTypes.includes("text")).toBe(false);
 		expect(contentTypes.includes("image_url")).toBe(false);
+	});
+
+	it("codex mode keeps prompt_cache_key constant and reuses the full input prefix", async () => {
+		const originalFetch = globalThis.fetch;
+		const capturedBodies: Record<string, unknown>[] = [];
+		globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+			const [, init] = args;
+			if (init?.body) {
+				capturedBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+			}
+			return createDoneSseResponse();
+		}) as typeof fetch;
+
+		try {
+			const history: unknown[] = [];
+			codexProvider.injectSystemPrompt(history, "Stay cached", "codex:gpt-5.3-codex", "en");
+			const conversationId = "cache-conv-1";
+
+			const firstParams: ChatParams = {
+				conversationId,
+				content: "hello 1",
+				model: "codex:gpt-5.3-codex",
+				cwd: "/tmp",
+				history,
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			};
+			for await (const _event of codexProvider.chat(firstParams)) {
+				// Drain stream
+			}
+
+			codexProvider.pushUserTurn(history, "hello 1", "codex:gpt-5.3-codex", []);
+			codexProvider.pushAssistantTurn(
+				history,
+				"assistant 1",
+				[],
+				[
+					{
+						text: "reasoning 1",
+						providerMetadata: {
+							openai: {
+								itemId: "rs_cache_1",
+								reasoningEncryptedContent: "enc_cache_1",
+							},
+						},
+						outputIndex: 0,
+					},
+				],
+				[{ id: "ws_cache_1", query: "cache query", outputIndex: 1 }],
+			);
+
+			const secondParams: ChatParams = {
+				conversationId,
+				content: "hello 2",
+				model: "codex:gpt-5.3-codex",
+				cwd: "/tmp",
+				history,
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			};
+			for await (const _event of codexProvider.chat(secondParams)) {
+				// Drain stream
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(capturedBodies).toHaveLength(2);
+		const [body1, body2] = capturedBodies as Array<{
+			prompt_cache_key?: string;
+			input?: unknown[];
+			tools?: unknown[];
+		}>;
+		expect(body1.prompt_cache_key).toBe("cache-conv-1");
+		expect(body2.prompt_cache_key).toBe("cache-conv-1");
+		expect(body1.tools).toEqual(body2.tools);
+		expect(body2.input?.slice(0, body1.input?.length ?? 0)).toEqual(body1.input);
+		expect(JSON.stringify(body2.input)).toContain('"type":"web_search_call"');
+		expect(JSON.stringify(body2.input)).toContain('"id":"ws_cache_1"');
+		expect(JSON.stringify(body2.input)).toContain('"type":"reasoning"');
 	});
 });

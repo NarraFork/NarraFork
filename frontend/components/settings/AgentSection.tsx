@@ -43,6 +43,8 @@ export interface AgentSectionProps {
 	setFreshShellEnv: (v: boolean) => void;
 	translateReasoning: boolean;
 	setTranslateReasoning: (v: boolean) => void;
+	requestDumpEnabled: boolean;
+	setRequestDumpEnabled: (v: boolean) => void;
 	expandReasoning: boolean;
 	setExpandReasoning: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
@@ -187,6 +189,12 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(e) => props.setTranslateReasoning(e.currentTarget.checked)}
 			/>
 			<Switch
+				label={t("requestDumpEnabled")}
+				description={t("requestDumpEnabledDesc")}
+				checked={props.requestDumpEnabled}
+				onChange={(e) => props.setRequestDumpEnabled(e.currentTarget.checked)}
+			/>
+			<Switch
 				label={t("expandReasoning")}
 				description={t("expandReasoningDesc")}
 				checked={props.expandReasoning}
@@ -217,9 +225,7 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("retryBackoffCeilDesc")}
 				value={props.retryBackoffCeilMs / 1000}
 				onChange={(v) =>
-					props.setRetryBackoffCeilMs(
-						typeof v === "number" ? Math.round(v * 1000) : 20000,
-					)
+					props.setRetryBackoffCeilMs(typeof v === "number" ? Math.round(v * 1000) : 20000)
 				}
 				min={1}
 				max={300}

@@ -9,7 +9,6 @@ import {
 	Paper,
 	PasswordInput,
 	Progress,
-	RingProgress,
 	SegmentedControl,
 	SimpleGrid,
 	Stack,
@@ -331,7 +330,6 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 	const [range, setRange] = useState<TimeRange>("today");
 	const [summary, setSummary] = useState<UsageSummary | null>(null);
 	const [events, setEvents] = useState<UsageEvent[]>([]);
-	const [expandedRow, setExpandedRow] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 
 	const fetchUsage = useCallback(async () => {
@@ -402,6 +400,7 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 						<Table.Th>{t("nugColTime")}</Table.Th>
 						<Table.Th>{t("nugColChannel")}</Table.Th>
 						<Table.Th>{t("nugColModel")}</Table.Th>
+						<Table.Th>{t("nugColTokens")}</Table.Th>
 						<Table.Th ta="right">{t("nugColMeterUsage")}</Table.Th>
 						<Table.Th ta="right">{t("nugColQuotaCost")}</Table.Th>
 						<Table.Th ta="center">{t("nugColStatus")}</Table.Th>
@@ -409,42 +408,61 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 				</Table.Thead>
 				<Table.Tbody>
 					{events.map((ev) => {
+						const normalInput =
+							ev.inputTokens - ev.cacheCreationInputTokens - ev.cacheReadInputTokens;
 						const hasCache = ev.cacheCreationInputTokens > 0 || ev.cacheReadInputTokens > 0;
-						const isExpanded = expandedRow === ev.id;
 						return (
-							<React.Fragment key={ev.id}>
-								<Table.Tr
-									style={{ cursor: hasCache ? "pointer" : undefined }}
-									onClick={() => hasCache && setExpandedRow(isExpanded ? null : ev.id)}
-								>
-									<Table.Td>{new Date(ev.createdAt).toLocaleTimeString()}</Table.Td>
-									<Table.Td>
-										<Badge size="xs" color={CHANNEL_COLORS[ev.channelType] ?? "blue"}>
-											{ev.channelType}
-										</Badge>
-									</Table.Td>
-									<Table.Td>{ev.model}</Table.Td>
-									<Table.Td ta="right">{ev.meterUsage.toFixed(2)}</Table.Td>
-									<Table.Td ta="right">{ev.quotaCost.toFixed(4)}</Table.Td>
-									<Table.Td ta="center">
-										<Badge size="xs" color={ev.status === "completed" ? "green" : "red"}>
-											{ev.status}
-										</Badge>
-									</Table.Td>
-								</Table.Tr>
-								{isExpanded && (
-									<Table.Tr>
-										<Table.Td colSpan={6}>
-											<CacheDetail event={ev} />
-										</Table.Td>
-									</Table.Tr>
-								)}
-							</React.Fragment>
+							<Table.Tr key={ev.id}>
+								<Table.Td>{new Date(ev.createdAt).toLocaleTimeString()}</Table.Td>
+								<Table.Td>
+									<Badge size="xs" color={CHANNEL_COLORS[ev.channelType] ?? "blue"}>
+										{ev.channelType}
+									</Badge>
+								</Table.Td>
+								<Table.Td>{ev.model}</Table.Td>
+								<Table.Td>
+									<Stack gap={2}>
+										<Group gap={4} wrap="nowrap">
+											<Text size="xs" c="dimmed" style={{ minWidth: 16 }}>
+												In:
+											</Text>
+											<Text size="xs">{normalInput.toLocaleString()}</Text>
+											{hasCache && (
+												<>
+													{ev.cacheCreationInputTokens > 0 && (
+														<Text size="xs" c="orange">
+															+W:{ev.cacheCreationInputTokens.toLocaleString()}
+														</Text>
+													)}
+													{ev.cacheReadInputTokens > 0 && (
+														<Text size="xs" c="teal">
+															+R:{ev.cacheReadInputTokens.toLocaleString()}
+														</Text>
+													)}
+												</>
+											)}
+										</Group>
+										<Group gap={4} wrap="nowrap">
+											<Text size="xs" c="dimmed" style={{ minWidth: 16 }}>
+												Out:
+											</Text>
+											<Text size="xs">{ev.outputTokens.toLocaleString()}</Text>
+										</Group>
+									</Stack>
+								</Table.Td>
+								<Table.Td ta="right">{ev.meterUsage.toFixed(2)}</Table.Td>
+								<Table.Td ta="right">{ev.quotaCost.toFixed(4)}</Table.Td>
+								<Table.Td ta="center">
+									<Badge size="xs" color={ev.status === "completed" ? "green" : "red"}>
+										{ev.status}
+									</Badge>
+								</Table.Td>
+							</Table.Tr>
 						);
 					})}
 					{events.length === 0 && (
 						<Table.Tr>
-							<Table.Td colSpan={6} ta="center">
+							<Table.Td colSpan={7} ta="center">
 								<Text size="xs" c="dimmed">
 									{t("nugNoUsageData")}
 								</Text>
@@ -454,63 +472,6 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 				</Table.Tbody>
 			</Table>
 		</Paper>
-	);
-}
-
-function CacheDetail({ event }: { event: UsageEvent }) {
-	const { t } = useTranslation("settings");
-	const totalInput =
-		event.cacheCreationInputTokens +
-		event.cacheReadInputTokens +
-		(event.inputTokens - event.cacheCreationInputTokens - event.cacheReadInputTokens);
-	const hitRate = totalInput > 0 ? Math.round((event.cacheReadInputTokens / totalInput) * 100) : 0;
-
-	return (
-		<SimpleGrid cols={4} p="xs">
-			<div>
-				<Text size="xs" c="dimmed">
-					{t("nugCacheInputTokens")}
-				</Text>
-				<Text size="sm" fw={500}>
-					{event.inputTokens.toLocaleString()}
-				</Text>
-			</div>
-			<div>
-				<Text size="xs" c="dimmed">
-					{t("nugCacheOutputTokens")}
-				</Text>
-				<Text size="sm" fw={500}>
-					{event.outputTokens.toLocaleString()}
-				</Text>
-			</div>
-			<div>
-				<Text size="xs" c="dimmed">
-					{t("nugCacheWrite")}
-				</Text>
-				<Text size="sm" fw={500}>
-					{event.cacheCreationInputTokens.toLocaleString()} tokens
-				</Text>
-			</div>
-			<div>
-				<Text size="xs" c="dimmed">
-					{t("nugCacheRead")}
-				</Text>
-				<Text size="sm" fw={500}>
-					{event.cacheReadInputTokens.toLocaleString()} tokens
-				</Text>
-			</div>
-			<div>
-				<Text size="xs" c="dimmed">
-					{t("nugCacheHitRate")}
-				</Text>
-				<Group gap={4}>
-					<RingProgress size={28} thickness={4} sections={[{ value: hitRate, color: "teal" }]} />
-					<Text size="sm" fw={500}>
-						{hitRate}%
-					</Text>
-				</Group>
-			</div>
-		</SimpleGrid>
 	);
 }
 

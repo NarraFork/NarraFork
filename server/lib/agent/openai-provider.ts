@@ -1,10 +1,11 @@
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { OpenAIProviderConfig } from "../settings";
-import { parseModelId } from "../settings";
+import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getHttpUserAgent } from "../user-agent";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -173,6 +174,19 @@ interface OAITool {
 	function: { name: string; description: string; parameters: Record<string, unknown> };
 }
 
+type ResponsesReasoningBlock = {
+	text: string;
+	providerMetadata?: import("./types").ReasoningProviderMetadata;
+	outputIndex?: number;
+};
+
+type ResponsesWebSearchBlock = {
+	id: string;
+	query?: string;
+	queries?: string[];
+	outputIndex?: number;
+};
+
 // === SSE delta types ===
 
 interface OAIDelta {
@@ -292,18 +306,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		_model: string,
 		_narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		const result = buildOAIHistory(dbMessages);
 		if (this.responsesFormat) {
-			// Convert standard format to Responses API format upfront
-			return {
-				history: convertHistoryToResponsesApi(result.history),
-				trailingToolResults: result.trailingToolResults.map((tr) => ({
-					type: "function_call_output" as const,
-					call_id: tr.tool_call_id,
-					output: tr.content,
-				})),
-			};
+			return buildResponsesHistory(dbMessages);
 		}
+		const result = buildOAIHistory(dbMessages);
 		// Chat Completions path: strip _reasoningBlocks from assistant messages
 		// to avoid sending unknown fields to strict OpenAI-compatible backends.
 		for (const msg of result.history) {
@@ -495,6 +501,14 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (tools.length > 0) body.tools = tools;
 		}
 
+		const requestHeaders = this.buildHeaders(apiKey);
+		params.requestDump?.setRequest({
+			transport: "http",
+			url: endpoint,
+			headers: sanitizeHeaders(requestHeaders),
+			body,
+		});
+
 		logger.debug("OpenAI chat request", {
 			model,
 			apiMode: this.apiMode,
@@ -520,13 +534,27 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const response = await this.pfetch(endpoint, {
 			method: "POST",
-			headers: this.buildHeaders(apiKey),
+			headers: requestHeaders,
 			body: JSON.stringify(body),
 			signal: params.signal,
+		});
+		const responseTextPromise = params.requestDump
+			? response
+					.clone()
+					.text()
+					.catch((error) => {
+						params.requestDump?.setResponseError(error);
+						return "";
+					})
+			: undefined;
+		params.requestDump?.setResponseMeta({
+			status: response.status,
+			headers: sanitizeHeaders(response.headers),
 		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
+			params.requestDump?.setResponseBodyText(errText);
 			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
 		}
 
@@ -539,6 +567,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			yield* _parseResponsesAPIStream(response.body);
 		} else {
 			yield* this.parseSSEStreamWithDetection(response.body);
+		}
+
+		if (responseTextPromise) {
+			const bodyText = await responseTextPromise;
+			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
+			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
 		}
 	}
 
@@ -581,10 +615,13 @@ export class OpenAIProvider implements ProviderAdapter {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shape
 				h.push(tr as any);
 			}
-		} else {
-			for (const tr of toolResults as OAIToolResult[]) {
-				h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
+			if (content && content !== ".") {
+				h.push(buildResponsesUserMessage(content));
 			}
+			return;
+		}
+		for (const tr of toolResults as OAIToolResult[]) {
+			h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 		}
 		if (content && content !== ".") {
 			h.push({ role: "user", content });
@@ -598,37 +635,21 @@ export class OpenAIProvider implements ProviderAdapter {
 		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
+		}>,
+		webSearches?: Array<{
+			id: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
 		}>,
 	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
-			const reasoningTextFallback = buildReasoningTextFallback(reasoningBlocks);
-			const assistantText = reasoningTextFallback
-				? text
-					? `${reasoningTextFallback}\n\n${text}`
-					: reasoningTextFallback
-				: text;
-			if (assistantText) {
-				// Use Responses API array format (output_text) for consistency with
-				// convertHistoryToResponsesApi — ensures identical format whether
-				// history is built from DB or pushed mid-loop, preserving cache prefix.
-				h.push({
-					role: "assistant",
-					content: [{ type: "output_text", text: assistantText }],
-				} as unknown as OAIMessage);
-			}
-			for (const tu of toolUses) {
-				logger.debug("OpenAI pushAssistantTurn function_call", {
-					call_id: tu.toolUseId,
-					name: tu.name,
-				});
-				h.push({
-					type: "function_call",
-					call_id: tu.toolUseId,
-					name: tu.name,
-					arguments: JSON.stringify(tu.input),
-					// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				} as any);
+			const items = buildResponsesAssistantTurnItems(text, toolUses, reasoningBlocks, webSearches);
+			for (const item of items) {
+				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
+				h.push(item as any);
 			}
 		} else {
 			const msg: OAIMessage = { role: "assistant", content: text || null };
@@ -1702,12 +1723,223 @@ function findActiveReasoningAccum(
 
 // === History builder ===
 
+function buildResponsesUserMessage(content: string): OAIMessage {
+	return { role: "user", content: [{ type: "input_text", text: content }] } as OAIMessage;
+}
+
+function buildResponsesPreludeItems(
+	reasoningBlocks?: ResponsesReasoningBlock[],
+	webSearchBlocks?: ResponsesWebSearchBlock[],
+): { items: OAIMessage[]; fallbackText: string } {
+	const entries: Array<{ item: OAIMessage; outputIndex?: number; sourceIndex: number }> = [];
+	const fallbackParts: string[] = [];
+	let sourceIndex = 0;
+	for (const block of reasoningBlocks ?? []) {
+		const text = block.text?.trim() ?? "";
+		const metadata = block.providerMetadata?.openai;
+		if (metadata?.reasoningEncryptedContent) {
+			entries.push({
+				item: {
+					type: "reasoning",
+					id: metadata.itemId,
+					summary: text ? [{ type: "summary_text", text }] : [],
+					encrypted_content: metadata.reasoningEncryptedContent,
+				} as unknown as OAIMessage,
+				outputIndex: block.outputIndex,
+				sourceIndex: sourceIndex++,
+			});
+		} else if (text) {
+			fallbackParts.push(text);
+		}
+	}
+	for (const block of webSearchBlocks ?? []) {
+		if (!block.query && !block.queries?.length) continue;
+		entries.push({
+			item: {
+				type: "web_search_call",
+				id: block.id,
+				status: "completed",
+				action: {
+					type: "search",
+					...(block.query ? { query: block.query } : {}),
+					...(block.queries?.length ? { queries: block.queries } : {}),
+				},
+			} as unknown as OAIMessage,
+			outputIndex: block.outputIndex,
+			sourceIndex: sourceIndex++,
+		});
+	}
+	entries.sort((a, b) =>
+		compareOptionalOutputIndex(a.outputIndex, b.outputIndex, a.sourceIndex, b.sourceIndex),
+	);
+	return { items: entries.map((entry) => entry.item), fallbackText: fallbackParts.join("\n") };
+}
+
+function mergeAssistantText(text: string, reasoningFallbackText: string): string {
+	const trimmedText = text.trim();
+	const trimmedFallback = reasoningFallbackText.trim();
+	if (trimmedFallback && trimmedText) return `${trimmedFallback}\n\n${trimmedText}`;
+	return trimmedFallback || trimmedText;
+}
+
+function buildResponsesAssistantTurnItems(
+	text: string,
+	toolUses: AgentToolUse[],
+	reasoningBlocks?: ResponsesReasoningBlock[],
+	webSearches?: ResponsesWebSearchBlock[],
+): OAIMessage[] {
+	const items: OAIMessage[] = [];
+	const prelude = buildResponsesPreludeItems(reasoningBlocks, webSearches);
+	items.push(...prelude.items);
+	const assistantText = mergeAssistantText(text, prelude.fallbackText);
+	if (assistantText) {
+		items.push({
+			role: "assistant",
+			content: [{ type: "output_text", text: assistantText }],
+		} as unknown as OAIMessage);
+	}
+	for (const tu of toolUses) {
+		items.push({
+			type: "function_call",
+			call_id: tu.toolUseId,
+			name: tu.name,
+			arguments: JSON.stringify(tu.input),
+		} as unknown as OAIMessage);
+	}
+	return items;
+}
+
+function compareOptionalOutputIndex(
+	a: number | undefined,
+	b: number | undefined,
+	aSourceIndex: number,
+	bSourceIndex: number,
+): number {
+	if (a != null && b != null) return a - b || aSourceIndex - bSourceIndex;
+	if (a != null) return -1;
+	if (b != null) return 1;
+	return aSourceIndex - bSourceIndex;
+}
+
+function buildResponsesHistory(dbMessages: DbMessage[]): {
+	history: OAIMessage[];
+	trailingToolResults: OAIMessage[];
+} {
+	// Filter model-visible messages: user, assistant, sys (system context)
+	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
+	const topLevel = dbMessages.filter(
+		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
+	);
+
+	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
+		topLevel.pop();
+	}
+
+	const history: OAIMessage[] = [];
+	let pendingToolResults: OAIMessage[] = [];
+
+	for (const msg of topLevel) {
+		if (msg.role === "assistant") {
+			history.push(...pendingToolResults);
+			pendingToolResults = [];
+
+			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const textParts = content
+				.filter((b: { type: string }) => b.type === "text")
+				.map((b: { text: string }) => b.text);
+			const text = textParts.join("\n") || msg.contentText || "";
+			const reasoningBlocks = content
+				.filter((b: { type: string }) => b.type === "reasoning")
+				.map(
+					(b: {
+						text: string;
+						providerMetadata?: import("./types").ReasoningProviderMetadata;
+						outputIndex?: number;
+					}) => ({
+						text: b.text,
+						providerMetadata: b.providerMetadata,
+						outputIndex: b.outputIndex,
+					}),
+				);
+			const webSearchBlocks = content
+				.filter((b: { type: string }) => b.type === "web_search")
+				.map((b: { id: string; query?: string; queries?: string[]; outputIndex?: number }) => ({
+					id: b.id,
+					query: b.query,
+					queries: b.queries,
+					outputIndex: b.outputIndex,
+				}));
+			const completedToolUseIds = new Set(
+				msg.toolCalls
+					?.filter((tc) => tc.status === "success" || tc.status === "fail")
+					.map((tc) => tc.toolUseId) ?? [],
+			);
+			const toolUses =
+				msg.toolCalls
+					?.filter((tc) => tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId))
+					.map((tc) => ({
+						toolUseId: tc.toolUseId,
+						name: tc.toolName,
+						input: (tc.inputJson ?? {}) as Record<string, unknown>,
+					})) ?? [];
+			const assistantItems = buildResponsesAssistantTurnItems(
+				text,
+				toolUses,
+				reasoningBlocks,
+				webSearchBlocks,
+			);
+			if (assistantItems.length === 0) {
+				continue;
+			}
+			history.push(...assistantItems);
+
+			if (msg.toolCalls) {
+				for (const tc of msg.toolCalls) {
+					if (tc.status === "success" || tc.status === "fail") {
+						const outputText =
+							typeof tc.outputJson === "string"
+								? tc.outputJson
+								: tc.outputJson != null
+									? JSON.stringify(tc.outputJson)
+									: "";
+						pendingToolResults.push({
+							type: "function_call_output",
+							call_id: tc.toolUseId,
+							output: outputText,
+						} as unknown as OAIMessage);
+					}
+				}
+			}
+		} else if (msg.role === "user") {
+			history.push(...pendingToolResults);
+			pendingToolResults = [];
+			const text = msg.contentText || "";
+			if (text) history.push(buildResponsesUserMessage(text));
+		} else if (msg.role === "sys") {
+			history.push(...pendingToolResults);
+			pendingToolResults = [];
+			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const textParts = content
+				.filter((b: { type: string }) => b.type === "text")
+				.map((b: { text: string }) => b.text);
+			const text = textParts.join("\n") || msg.contentText || "";
+			if (text) {
+				history.push({ role: "developer", content: text } as unknown as OAIMessage);
+			}
+		}
+	}
+
+	return { history, trailingToolResults: pendingToolResults };
+}
+
 function buildOAIHistory(dbMessages: DbMessage[]): {
 	history: OAIMessage[];
 	trailingToolResults: OAIToolResult[];
 } {
+	// Filter model-visible messages: user, assistant, sys (system context)
+	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
 	const topLevel = dbMessages.filter(
-		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant"),
+		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
 
 	// Drop the last user message — it's sent as the current message
@@ -1826,6 +2058,20 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			if (text) {
 				history.push({ role: "user", content: text });
 			}
+		} else if (msg.role === "sys") {
+			for (const tr of pendingToolResults) {
+				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
+			}
+			pendingToolResults = [];
+
+			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const textParts = content
+				.filter((b: { type: string }) => b.type === "text")
+				.map((b: { text: string }) => b.text);
+			const text = textParts.join("\n") || msg.contentText || "";
+			if (text) {
+				history.push({ role: "system", content: text });
+			}
 		}
 	}
 
@@ -1833,11 +2079,8 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 }
 
 /**
- * Build a plain-text reasoning summary fallback for assistant history.
- *
- * With store: false, historical Responses API reasoning items (itemId / encrypted_content)
- * cannot be replayed after they have been persisted to our DB. We therefore keep their
- * summary text as ordinary assistant text context instead of attempting to replay them.
+ * Build a plain-text reasoning fallback for blocks that cannot be replayed as
+ * Responses API reasoning items (for example because encrypted_content is absent).
  */
 function buildReasoningTextFallback(
 	reasoningBlocks:
@@ -1853,46 +2096,19 @@ function buildReasoningTextFallback(
 	for (const block of reasoningBlocks) {
 		const text = block.text?.trim();
 		if (!text) continue;
-		const itemId = block.providerMetadata?.openai?.itemId;
-		if (itemId) {
-			logger.debug("Using historical reasoning summary as text fallback", { itemId });
+		const openaiMeta = block.providerMetadata?.openai;
+		if (openaiMeta?.reasoningEncryptedContent) {
+			continue;
+		}
+		if (openaiMeta?.itemId) {
+			logger.debug("Using non-replayable historical reasoning summary as text fallback", {
+				itemId: openaiMeta.itemId,
+			});
 		}
 		parts.push(text);
 	}
 
 	return parts.join("\n");
-}
-
-function mergeAssistantTextWithReasoningFallback(
-	content: OAIMessage["content"],
-	reasoningTextFallback: string | undefined,
-): OAIMessage["content"] {
-	const fallback = reasoningTextFallback?.trim();
-	if (!fallback) return content;
-
-	if (typeof content === "string") {
-		return content ? `${fallback}\n\n${content}` : fallback;
-	}
-
-	if (Array.isArray(content)) {
-		const outputText = content.find(
-			(part): part is Extract<OAIContentPart, { type: "output_text" }> =>
-				part.type === "output_text",
-		);
-		if (outputText) {
-			return content.map((part) =>
-				part === outputText
-					? {
-							...part,
-							text: part.text ? `${fallback}\n\n${part.text}` : fallback,
-						}
-					: part,
-			);
-		}
-		return [{ type: "output_text", text: fallback }, ...content];
-	}
-
-	return fallback;
 }
 
 // === Responses API history converter ===

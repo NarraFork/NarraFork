@@ -1912,8 +1912,8 @@ export const MessageBubble = memo(function MessageBubble({
 		);
 	}
 
-	// System messages (compact indicators / plan cards / error notices)
-	if (message.role === "system") {
+	// System / display messages (compact indicators / plan cards / error notices / info notices)
+	if (message.role === "system" || message.role === "disp") {
 		// Regular compact indicators / plan cards
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");

@@ -70,6 +70,7 @@ import {
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
 	updateBufferedMessageSchema,
+	updateNarratorCwdSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,
@@ -1111,6 +1112,52 @@ narratorRoutes.patch("/:id/title", async (c) => {
 	await narratorService.getById(id);
 	await persistTitle(id, parsed.data.title);
 	return c.json({ ok: true, title: parsed.data.title });
+});
+
+// Update narrator working directory
+narratorRoutes.patch("/:id/cwd", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateNarratorCwdSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const cwd = parsed.data.cwd.trim();
+	if (!isAbsolute(cwd)) {
+		throw new ValidationError("cwd must be an absolute path");
+	}
+
+	// Validate path exists and is accessible
+	try {
+		const { access, constants } = await import("node:fs/promises");
+		await access(cwd, constants.R_OK | constants.X_OK);
+	} catch (error) {
+		const message =
+			error instanceof Error
+				? error.message
+				: "Working directory does not exist or is not accessible";
+		throw new ValidationError(message);
+	}
+
+	const narrator = await narratorService.getById(id);
+	const previousCwd = narrator.cwd?.trim() || null;
+	if (previousCwd === cwd) {
+		return c.json({ ok: true, cwd, changed: false });
+	}
+
+	await narratorService.updateCwd(id, cwd);
+
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const reminder =
+		locale === "zh-CN"
+			? previousCwd
+				? `工作目录已更新：${previousCwd} → ${cwd}`
+				: `工作目录已设置为：${cwd}`
+			: previousCwd
+				? `Working directory updated: ${previousCwd} → ${cwd}`
+				: `Working directory set to: ${cwd}`;
+	await narratorService.persistDisplayMessage(id, reminder);
+
+	return c.json({ ok: true, cwd, changed: true });
 });
 
 // Regenerate narrator title via AI

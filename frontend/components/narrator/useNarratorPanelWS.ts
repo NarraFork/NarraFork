@@ -831,12 +831,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							) as MessagesQueryData;
 						});
 					} else {
+						const isDisplayOrSystemMsg = newMsg.role === "system" || newMsg.role === "disp";
 						const isNewCompactMsg =
-							newMsg.role === "system" &&
+							isDisplayOrSystemMsg &&
 							Array.isArray(newMsg.contentJson) &&
 							newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
 						const isNewAskInPassingMsg =
-							newMsg.role === "system" &&
+							isDisplayOrSystemMsg &&
 							Array.isArray(newMsg.contentJson) &&
 							newMsg.contentJson.some((b: ContentBlock) => b.type === "ask_in_passing");
 						const needsMiddleInsertReload = isNewCompactMsg || isNewAskInPassingMsg;

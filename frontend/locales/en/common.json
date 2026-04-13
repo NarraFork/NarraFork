@@ -276,5 +276,12 @@
 	"usageHistoryTableTokens": "Tokens",
 	"usageHistoryTableTTFT": "TTFT",
 	"usageHistoryTableDuration": "Duration",
-	"usageHistoryTableCost": "Cost"
+	"usageHistoryTableCost": "Cost",
+	"usageHistoryTableActions": "Actions",
+	"usageHistoryToggleShowId": "Show ID",
+	"usageHistoryToggleShowName": "Show name",
+	"usageHistoryViewRawDump": "View raw data",
+	"usageHistoryRawDumpTitle": "Raw request data",
+	"usageHistoryRawDumpLoading": "Loading raw request data...",
+	"usageHistoryRawDumpEmpty": "No raw dump is available for this request yet."
 }
