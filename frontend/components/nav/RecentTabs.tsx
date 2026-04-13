@@ -389,45 +389,46 @@ export function RecentTabList({
 	// Build a flat array of all items in visual order (topLevel + their workspace children).
 	// This ensures dnd-kit sees the true layout so that dragging external items over
 	// a workspace causes the whole group (header + children) to shift together.
-	const sortItems = useMemo(() => {
-		const items: RecentTab[] = [];
+	// Split into pinned and unpinned groups for separate DnD contexts.
+	const { pinnedItems, unpinnedItems } = useMemo(() => {
+		const pinned: RecentTab[] = [];
+		const unpinned: RecentTab[] = [];
 		for (const tab of topLevel) {
-			items.push(tab);
+			const target = tab.pinned ? pinned : unpinned;
+			target.push(tab);
 			if (tab.type === "workspace") {
 				const children = childrenByWorkspace.get(tab.id) ?? [];
-				items.push(...children);
+				target.push(...children);
 			}
 		}
-		return items;
+		return { pinnedItems: pinned, unpinnedItems: unpinned };
 	}, [topLevel, childrenByWorkspace]);
 
-	// Helper: for a given sortIdx, return the indices of the whole workspace group
+	// Helper: for a given sortIdx in a specific group, return the indices of the whole workspace group
 	// that the item at that index belongs to (header + all children).
 	// Returns a range [startIdx, endIdx] (inclusive).
 	// Returns [idx, idx] for non-workspace items.
 	const getWorkspaceGroupRange = useCallback(
-		(idx: number): [start: number, end: number] => {
-			const tab = sortItems[idx];
+		(items: RecentTab[], idx: number): [start: number, end: number] => {
+			const tab = items[idx];
 			if (!tab) return [idx, idx];
 			if (tab.type !== "workspace") return [idx, idx];
 			// Find the last index of this workspace's children
 			let end = idx;
-			for (let i = idx + 1; i < sortItems.length; i++) {
-				if (sortItems[i].workspaceId === tab.id) end = i;
+			for (let i = idx + 1; i < items.length; i++) {
+				if (items[i].workspaceId === tab.id) end = i;
 				else break;
 			}
 			return [idx, end];
 		},
-		[sortItems],
+		[],
 	);
 
-	// Custom collision detection: when pointer is over a workspace child or header,
-	// treat the entire workspace group as a single target so dragging external items
-	// over a workspace causes the whole group to shift together.
-	const collisionDetection = useCallback(
-		(args: Parameters<CollisionDetection>[0]) =>
-			workspaceGroupCollisionDetection(args, sortItems, childrenByWorkspace),
-		[sortItems, childrenByWorkspace],
+	// Custom collision detection factory for a specific group
+	const makeCollisionDetection = useCallback(
+		(items: RecentTab[]) => (args: Parameters<CollisionDetection>[0]) =>
+			workspaceGroupCollisionDetection(args, items, childrenByWorkspace),
+		[childrenByWorkspace],
 	);
 
 	const sensors = useSensors(
@@ -441,16 +442,21 @@ export function RecentTabList({
 	const [wsGroupHeight, setWsGroupHeight] = useState<number | null>(null);
 	// Workspace ID whose children should stay collapsed (cleared with wsGroupHeight).
 	const [collapsedWsId, setCollapsedWsId] = useState<string | null>(null);
+	// Track which group (pinned/unpinned) is currently being dragged
+	const [activeGroup, setActiveGroup] = useState<"pinned" | "unpinned" | null>(null);
 
 	// Bridge @dnd-kit drag into global narrator drag so workspace panels can receive drops
 	const handleDragStart = useCallback(
-		(event: DragStartEvent) => {
+		(group: "pinned" | "unpinned") => (event: DragStartEvent) => {
 			setOptimisticTabs(null);
 			const activeId = event.active.id as string;
 			setDraggingTabId(activeId);
+			setActiveGroup(group);
+
+			const items = group === "pinned" ? pinnedItems : unpinnedItems;
 
 			// Measure workspace group height before children collapse
-			const tab = sortItems.find((t) => tabSortId(t) === activeId);
+			const tab = items.find((t) => tabSortId(t) === activeId);
 			if (tab?.type === "workspace") {
 				setCollapsedWsId(tab.id);
 				const headerEl = document.querySelector(
@@ -462,7 +468,7 @@ export function RecentTabList({
 					while (sibling) {
 						const sibId = sibling.getAttribute("data-tab-sort-id");
 						if (!sibId) break;
-						const sibTab = sortItems.find((t) => tabSortId(t) === sibId);
+						const sibTab = items.find((t) => tabSortId(t) === sibId);
 						if (!sibTab || sibTab.workspaceId !== tab.id) break;
 						totalHeight += sibling.offsetHeight;
 						sibling = sibling.nextElementSibling as HTMLElement | null;
@@ -482,7 +488,7 @@ export function RecentTabList({
 			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
 			startNarratorDragManual(nId, tab.title, x, y);
 		},
-		[sortItems],
+		[pinnedItems, unpinnedItems],
 	);
 
 	const handleDragMove = useCallback((event: DragMoveEvent) => {
@@ -499,6 +505,7 @@ export function RecentTabList({
 		setDraggingTabId(null);
 		setWsGroupHeight(null);
 		setCollapsedWsId(null);
+		setActiveGroup(null);
 		requestAnimationFrame(() => setDropSnap(false));
 	}, []);
 
@@ -593,35 +600,29 @@ export function RecentTabList({
 				return;
 			}
 
-			const oldSortIdx = sortItems.findIndex((t) => tabSortId(t) === active.id);
-			const newSortIdx = sortItems.findIndex((t) => tabSortId(t) === over.id);
+			if (!activeGroup) {
+				clearDragState();
+				return;
+			}
+
+			const items = activeGroup === "pinned" ? pinnedItems : unpinnedItems;
+
+			const oldSortIdx = items.findIndex((t) => tabSortId(t) === active.id);
+			const newSortIdx = items.findIndex((t) => tabSortId(t) === over.id);
 			if (oldSortIdx === -1 || newSortIdx === -1) {
 				clearDragState();
 				return;
 			}
 
-			const activeTab = sortItems[oldSortIdx];
+			const activeTab = items[oldSortIdx];
 			if (!activeTab) {
 				clearDragState();
 				return;
 			}
 
-			// Enforce pin boundary: pinned tabs stay in pinned zone, unpinned stay in unpinned zone
-			const pinnedBoundary = sortItems.findIndex((t) => !t.pinned);
-			if (pinnedBoundary !== -1) {
-				if (activeTab.pinned && newSortIdx >= pinnedBoundary) {
-					clearDragState();
-					return;
-				}
-				if (!activeTab.pinned && newSortIdx < pinnedBoundary) {
-					clearDragState();
-					return;
-				}
-			}
-
-			const [overStart, overEnd] = getWorkspaceGroupRange(newSortIdx);
+			const [overStart, overEnd] = getWorkspaceGroupRange(items, newSortIdx);
 			const movingDown = oldSortIdx < newSortIdx;
-			const anchorTab = sortItems[movingDown ? overEnd : overStart];
+			const anchorTab = items[movingDown ? overEnd : overStart];
 			if (!anchorTab) {
 				clearDragState();
 				return;
@@ -645,7 +646,15 @@ export function RecentTabList({
 
 			moveTab(tabSortId(activeTab), { toIndex: serverIdx });
 		},
-		[sortItems, renderTabs, moveTab, getWorkspaceGroupRange, clearDragState],
+		[
+			pinnedItems,
+			unpinnedItems,
+			activeGroup,
+			renderTabs,
+			moveTab,
+			getWorkspaceGroupRange,
+			clearDragState,
+		],
 	);
 
 	/** Release all child tabs from a workspace and delete the workspace entity. */
@@ -792,27 +801,31 @@ export function RecentTabList({
 
 	if (topLevel.length === 0) return null;
 
-	const sortIds = sortItems.map(tabSortId);
-
 	// The tab being dragged (may be a workspace header or a child).
 	const draggingTab = draggingTabId
-		? (sortItems.find((t) => tabSortId(t) === draggingTabId) ?? null)
+		? (pinnedItems.find((t) => tabSortId(t) === draggingTabId) ??
+			unpinnedItems.find((t) => tabSortId(t) === draggingTabId) ??
+			null)
 		: null;
 
-	return (
-		<Box style={{ overflow: "hidden" }}>
+	// Helper to render a group of tabs
+	const renderTabGroup = (items: RecentTab[], group: "pinned" | "unpinned") => {
+		if (items.length === 0) return null;
+
+		const sortIds = items.map(tabSortId);
+		const collisionDetection = makeCollisionDetection(items);
+
+		return (
 			<DndContext
 				sensors={sensors}
 				collisionDetection={collisionDetection}
-				onDragStart={handleDragStart}
+				onDragStart={handleDragStart(group)}
 				onDragMove={handleDragMove}
 				onDragEnd={handleDragEnd}
 				onDragCancel={handleDragCancel}
 			>
-				{/* When dropSnap is true, kill all transitions so items snap into place */}
-				{dropSnap && <style>{"[data-tab-sort-id]{transition:none!important}"}</style>}
 				<SortableContext items={sortIds} strategy={verticalListSortingStrategy}>
-					{sortItems.map((tab, sortIdx) => {
+					{items.map((tab, sortIdx) => {
 						const isHeader = !tab.workspaceId;
 						const isDraggingThis = tabSortId(tab) === draggingTabId;
 						// When a workspace header is being dragged (or animating its drop),
@@ -846,6 +859,9 @@ export function RecentTabList({
 						}
 
 						const tabKey = `${tab.type}:${tab.id}`;
+						// Only connect top for the first unpinned tab
+						const shouldConnectTop = firstTabConnected && group === "unpinned" && sortIdx === 0;
+
 						return (
 							<SortableTabItem
 								key={tabSortId(tab)}
@@ -859,9 +875,7 @@ export function RecentTabList({
 								onRemove={handleRemove}
 								onNavigate={onNavigate}
 								onContextMenu={handleContextMenu}
-								connectTop={
-									firstTabConnected && sortIdx === topLevel.findIndex((t) => !t.workspaceId)
-								}
+								connectTop={shouldConnectTop}
 								onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
 								dimmed={isDraggingThis}
 								wsGroupHeight={
@@ -875,7 +889,7 @@ export function RecentTabList({
 				</SortableContext>
 				{/* Floating overlay while dragging — workspace shows the whole group, others show a single tab. */}
 				<DragOverlay dropAnimation={dropAnimation}>
-					{draggingTab ? (
+					{draggingTab && activeGroup === group ? (
 						draggingTab.type === "workspace" ? (
 							<Box style={{ opacity: 0.9 }}>
 								<DragOverlayWorkspaceItem
@@ -889,6 +903,20 @@ export function RecentTabList({
 					) : null}
 				</DragOverlay>
 			</DndContext>
+		);
+	};
+
+	return (
+		<Box style={{ overflow: "hidden" }}>
+			{/* When dropSnap is true, kill all transitions so items snap into place */}
+			{dropSnap && <style>{"[data-tab-sort-id]{transition:none!important}"}</style>}
+
+			{/* Render pinned tabs group */}
+			{renderTabGroup(pinnedItems, "pinned")}
+
+			{/* Render unpinned tabs group */}
+			{renderTabGroup(unpinnedItems, "unpinned")}
+
 			{ctxMenu && (
 				<TabContextMenu
 					x={ctxMenu.x}
