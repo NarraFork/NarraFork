@@ -533,7 +533,6 @@ export async function* agentLoop(
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
-		let stopReason: string | undefined;
 		// Map of tool executions started during streaming (toolUseId → Promise)
 		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 		// Synchronously queryable map of settled early-exec results (populated via .then())
@@ -562,6 +561,26 @@ export async function* agentLoop(
 		>();
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
+
+		// API request tracking variables (moved outside retry loop)
+		let requestId: string | undefined;
+		let requestStartTime: number | undefined;
+		let requestTtftMs: number | undefined;
+		let requestUsage:
+			| {
+					promptTokens?: number;
+					inputTokens?: number;
+					completionTokens?: number;
+					reasoningTokens?: number;
+					cachedInputTokens?: number;
+					cacheCreationInputTokens?: number;
+					cacheCreation5mTokens?: number;
+					cacheCreation1hTokens?: number;
+			  }
+			| undefined;
+		let requestContextPercent: number | undefined;
+		let requestMeterUsage: number | undefined;
+		let requestMeterUnit: string | undefined;
 
 		// ── Transient-error retry loop ──
 		// we can safely retry the exact same provider.chat() call with identical
@@ -599,6 +618,24 @@ export async function* agentLoop(
 			webSearchAccum.clear();
 			receivedUsage = false;
 
+			// Generate unique request ID for this API call (reset on each retry)
+			requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+			requestStartTime = Date.now();
+			requestTtftMs = undefined;
+			requestUsage = undefined;
+			requestContextPercent = undefined;
+			requestMeterUsage = undefined;
+			requestMeterUnit = undefined;
+
+			// Emit API request start event
+			yield {
+				type: "api_request_start",
+				requestId,
+				provider: effectiveProvider,
+				model: effectiveModel,
+				credentialId,
+			};
+
 			try {
 				const stream = provider.chat({
 					conversationId: config.conversationId,
@@ -617,6 +654,14 @@ export async function* agentLoop(
 				});
 
 				for await (const parsed of stream) {
+					// Record TTFT (time to first token) for this request
+					if (
+						requestTtftMs === undefined &&
+						(parsed.text || parsed.toolUseChunk || parsed.reasoning)
+					) {
+						requestTtftMs = Date.now() - requestStartTime;
+					}
+
 					if (parsed.text) {
 						assistantText += parsed.text;
 						yield { type: "stream_text", text: parsed.text };
@@ -911,7 +956,6 @@ export async function* agentLoop(
 
 					if (parsed.messageId) messageId = parsed.messageId;
 					if (parsed.credentialId) credentialId = parsed.credentialId;
-					if (parsed.stopReason) stopReason = parsed.stopReason;
 
 					if (parsed.reasoning) {
 						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
@@ -974,6 +1018,8 @@ export async function* agentLoop(
 						};
 					}
 					if (parsed.metering) {
+						requestMeterUsage = parsed.metering.usage;
+						requestMeterUnit = parsed.metering.unit;
 						yield {
 							type: "metering",
 							unit: parsed.metering.unit,
@@ -989,12 +1035,24 @@ export async function* agentLoop(
 					// Convert OpenAI/Anthropic usage to context_usage percentage
 					if (parsed.usage && parsed.usage.promptTokens != null) {
 						receivedUsage = true;
+						// Store usage for API request tracking
+						requestUsage = {
+							promptTokens: parsed.usage.promptTokens,
+							inputTokens: parsed.usage.inputTokens,
+							completionTokens: parsed.usage.completionTokens,
+							reasoningTokens: parsed.usage.reasoningTokens,
+							cachedInputTokens: parsed.usage.cachedInputTokens,
+							cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
+							cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
+							cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
+						};
 						const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
 						if (contextWindow) {
 							const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
+							requestContextPercent = Math.min(percentage, 100);
 							yield {
 								type: "context_usage",
-								percentage: Math.min(percentage, 100),
+								percentage: requestContextPercent,
 								promptTokens: parsed.usage.promptTokens,
 								inputTokens: parsed.usage.inputTokens,
 								completionTokens: parsed.usage.completionTokens,
@@ -1167,6 +1225,35 @@ export async function* agentLoop(
 			break;
 		} // end for (;;) retry loop
 
+		// ── Estimate token usage when provider doesn't report it ──
+		// For these cases, we estimate based on text length to provide usage statistics.
+		if (!requestUsage) {
+			const historyText = JSON.stringify(history);
+			const systemText = config.systemPrompt ?? "";
+			const estimatedInputTokens =
+				estimateTokens(historyText) + estimateTokens(systemText) + estimateTokens(content);
+			const estimatedOutputTokens = estimateTokens(assistantText);
+
+			requestUsage = {
+				inputTokens: estimatedInputTokens,
+				promptTokens: estimatedInputTokens,
+				completionTokens: estimatedOutputTokens,
+			};
+		}
+
+		// Emit API request end event
+		const requestDurationMs = Date.now() - requestStartTime;
+		yield {
+			type: "api_request_end",
+			requestId,
+			usage: requestUsage,
+			ttftMs: requestTtftMs,
+			durationMs: requestDurationMs,
+			contextPercent: requestContextPercent,
+			meterUsage: requestMeterUsage,
+			meterUnit: requestMeterUnit,
+		};
+
 		// Reset retry counter after a successful turn so the next turn's
 		// backoff starts from the base delay instead of the ceiling.
 		chatRetryCount = 0;
@@ -1240,7 +1327,6 @@ export async function* agentLoop(
 				toolUses,
 				messageId,
 				credentialId,
-				stopReason,
 			};
 
 			if (toolUses.length === 0) {
@@ -1306,7 +1392,6 @@ export async function* agentLoop(
 				toolUses,
 				messageId,
 				credentialId,
-				stopReason,
 			};
 		}
 

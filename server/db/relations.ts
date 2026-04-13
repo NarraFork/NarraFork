@@ -1,5 +1,6 @@
 import { relations } from "drizzle-orm";
 import {
+	apiRequests,
 	chapterCommits,
 	chapterEdges,
 	chapters,
@@ -336,5 +337,16 @@ export const reviewConclusionsRelations = relations(reviewConclusions, ({ one })
 		fields: [reviewConclusions.sourceChapterId],
 		references: [chapters.id],
 		relationName: "sourceChapter",
+	}),
+}));
+
+export const apiRequestsRelations = relations(apiRequests, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [apiRequests.narratorId],
+		references: [narrators.id],
+	}),
+	message: one(narratorMessages, {
+		fields: [apiRequests.messageId],
+		references: [narratorMessages.id],
 	}),
 }));

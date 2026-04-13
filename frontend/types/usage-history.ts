@@ -3,6 +3,7 @@ export interface UsageHistoryRecord {
 	narratorId: string;
 	provider: string | null;
 	credentialId: string | null;
+	credentialName: string | null;
 	model: string | null;
 	inputTokens: number;
 	outputTokens: number;

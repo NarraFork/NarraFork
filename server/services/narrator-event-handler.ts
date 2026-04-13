@@ -2,14 +2,19 @@ import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessages } from "../db/schema";
+import { apiRequests, narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
-import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
+import {
+	buildUsageDataFromSnapshot,
+	calculateCost,
+	updateMessageUsage,
+} from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import {
 	enrichToolUseBlocks,
@@ -82,6 +87,19 @@ export interface EventHandlerContext {
 	// --- Mutable tracking ---
 	/** Tracks cumulative inputCharsTotal per tool_use for delta computation */
 	toolUseCharsMap?: Map<string, number>;
+	/** Tracks API requests in progress (requestId → request info) */
+	apiRequestsMap?: Map<
+		string,
+		{
+			requestId: string;
+			provider: string;
+			model: string;
+			credentialId?: string;
+			startTime: number;
+		}
+	>;
+	/** API requests inserted during this turn and awaiting assistant-message binding */
+	pendingApiRequestIds?: string[];
 }
 
 /**
@@ -566,9 +584,8 @@ export async function processEvent(
 					cacheCreation1hTokens: tokenUsage?.cacheCreation1hTokens,
 					reasoningTokens: tokenUsage?.reasoningTokens,
 					ttftMs: ctx.getTtftMs?.(),
-					durationMs: ctx.getTurnStartedAt?.()
-						? Math.max(0, Date.now() - new Date(ctx.getTurnStartedAt?.() ?? 0).getTime())
-						: undefined,
+					// 不在 block_complete 时设置 durationMs，等到 assistant_message 时再设置
+					durationMs: undefined,
 					turnUsage: tokenUsage
 						? {
 								input_tokens: tokenUsage.inputTokens ?? tokenUsage.promptTokens,
@@ -790,6 +807,24 @@ export async function processEvent(
 			// Main narrator: clear compact summary after first response
 			if (hooks?.onClearCompactSummary) {
 				await hooks.onClearCompactSummary();
+			}
+
+			// Bind this assistant message to the exact API request row created in this turn.
+			const pendingApiRequestId = ctx.pendingApiRequestIds?.shift();
+			if (pendingApiRequestId) {
+				try {
+					await db
+						.update(apiRequests)
+						.set({ messageId: savedId })
+						.where(eq(apiRequests.id, pendingApiRequestId));
+				} catch (error) {
+					logger.warn("Failed to update API request messageId", {
+						narratorId,
+						savedId,
+						apiRequestId: pendingApiRequestId,
+						error,
+					});
+				}
 			}
 
 			const savedMsg = fullMessage ?? { id: savedId };
@@ -1227,7 +1262,7 @@ export async function processEvent(
 				type: "web_search",
 				narratorId: broadcastTargetId,
 				id: event.id,
-				status: event.status,
+				status: event.status as "in_progress" | "searching" | "completed",
 				query: event.query,
 				queries: event.queries,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -1242,6 +1277,83 @@ export async function processEvent(
 				model: event.model,
 				provider: event.provider,
 			});
+			return null;
+		}
+
+		case "api_request_start": {
+			// Store request start info in context for later use
+			if (!ctx.apiRequestsMap) ctx.apiRequestsMap = new Map();
+			ctx.apiRequestsMap.set(event.requestId, {
+				requestId: event.requestId,
+				provider: event.provider,
+				model: event.model,
+				credentialId: event.credentialId,
+				startTime: Date.now(),
+			});
+			return null;
+		}
+
+		case "api_request_end": {
+			// Create API request record in database
+			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
+			if (!requestInfo) {
+				logger.warn("API request end without start", { narratorId, requestId: event.requestId });
+				return null;
+			}
+
+			const usageData = event.usage
+				? {
+						inputTokens: event.usage.inputTokens ?? event.usage.promptTokens ?? 0,
+						outputTokens: event.usage.completionTokens ?? 0,
+						cachedInputTokens: event.usage.cachedInputTokens ?? 0,
+						cacheCreationInputTokens: event.usage.cacheCreationInputTokens ?? 0,
+						cacheCreation5mInputTokens: event.usage.cacheCreation5mTokens ?? 0,
+						cacheCreation1hInputTokens: event.usage.cacheCreation1hTokens ?? 0,
+						reasoningTokens: event.usage.reasoningTokens ?? 0,
+					}
+				: null;
+
+			const cost = usageData
+				? calculateCost(usageData, requestInfo.provider, requestInfo.model)
+				: null;
+			const apiRequestId = generateId();
+
+			try {
+				await db.insert(apiRequests).values({
+					id: apiRequestId,
+					narratorId,
+					messageId: null, // Will be updated later when message is created
+					provider: requestInfo.provider,
+					credentialId: requestInfo.credentialId ?? null,
+					model: requestInfo.model,
+					inputTokens: usageData?.inputTokens ?? 0,
+					outputTokens: usageData?.outputTokens ?? 0,
+					cachedInputTokens: usageData?.cachedInputTokens ?? 0,
+					cacheCreationInputTokens: usageData?.cacheCreationInputTokens ?? 0,
+					cacheCreation5mTokens: usageData?.cacheCreation5mInputTokens ?? 0,
+					cacheCreation1hTokens: usageData?.cacheCreation1hInputTokens ?? 0,
+					reasoningTokens: usageData?.reasoningTokens ?? 0,
+					ttftMs: event.ttftMs ?? null,
+					durationMs: event.durationMs ?? null,
+					costUsd: cost?.totalCost ?? null,
+					contextPercent: event.contextPercent ?? null,
+					meterUsage: event.meterUsage ?? null,
+					meterUnit: event.meterUnit ?? null,
+					createdAt: new Date().toISOString(),
+				});
+				if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];
+				ctx.pendingApiRequestIds.push(apiRequestId);
+			} catch (error) {
+				logger.error("Failed to create API request record", {
+					narratorId,
+					requestId: event.requestId,
+					apiRequestId,
+					error,
+				});
+			} finally {
+				// Clean up in-progress request info after persistence attempt.
+				ctx.apiRequestsMap?.delete(event.requestId);
+			}
 			return null;
 		}
 

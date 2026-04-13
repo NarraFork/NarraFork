@@ -1,6 +1,7 @@
 import type { UsageHistoryRecord } from "@frontend/types/usage-history";
 import { Badge, Group, Stack, Table, Text, Tooltip } from "@mantine/core";
 import { IconBrain, IconClock, IconInfoCircle } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
 
 interface UsageHistoryTableProps {
 	records: UsageHistoryRecord[];
@@ -71,26 +72,28 @@ function TokensCell({ record }: { record: UsageHistoryRecord }) {
 }
 
 export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) {
+	const { t } = useTranslation("common");
+
 	if (loading) {
-		return <Text c="dimmed">加载中...</Text>;
+		return <Text c="dimmed">{t("loading", "加载中...")}</Text>;
 	}
 	if (records.length === 0) {
-		return <Text c="dimmed">暂无请求历史</Text>;
+		return <Text c="dimmed">{t("noData", "暂无数据")}</Text>;
 	}
 
 	return (
 		<Table striped highlightOnHover withTableBorder withColumnBorders>
 			<Table.Thead>
 				<Table.Tr>
-					<Table.Th>时间</Table.Th>
-					<Table.Th>叙述者</Table.Th>
-					<Table.Th>提供商</Table.Th>
-					<Table.Th>凭证</Table.Th>
-					<Table.Th>模型</Table.Th>
-					<Table.Th>Tokens</Table.Th>
-					<Table.Th>TTFT</Table.Th>
-					<Table.Th>耗时</Table.Th>
-					<Table.Th>成本</Table.Th>
+					<Table.Th>{t("usageHistoryTableTime")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableNarrator")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableProvider")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableCredential")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableModel")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableTokens")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableTTFT")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableDuration")}</Table.Th>
+					<Table.Th>{t("usageHistoryTableCost")}</Table.Th>
 				</Table.Tr>
 			</Table.Thead>
 			<Table.Tbody>
@@ -115,8 +118,8 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 							</Badge>
 						</Table.Td>
 						<Table.Td>
-							<Text size="sm" ff="monospace">
-								{record.credentialId ?? "-"}
+							<Text size="sm" ff={record.credentialName ? undefined : "monospace"}>
+								{record.credentialName || record.credentialId || "-"}
 							</Text>
 						</Table.Td>
 						<Table.Td>
@@ -138,9 +141,16 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 							</Group>
 						</Table.Td>
 						<Table.Td>
-							<Text size="sm" fw={500} c={record.costUsd ? "green" : "dimmed"}>
-								{record.costUsd != null ? `$${record.costUsd.toFixed(6)}` : "-"}
-							</Text>
+								<Text size="sm" fw={500} c={record.meterUsage ? "blue" : "dimmed"}>
+									{record.meterUsage != null
+										? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
+										: "-"}
+								</Text>
+							) : (
+								<Text size="sm" fw={500} c={record.costUsd ? "green" : "dimmed"}>
+									{record.costUsd != null ? `$${record.costUsd.toFixed(6)}` : "-"}
+								</Text>
+							)}
 						</Table.Td>
 					</Table.Tr>
 				))}

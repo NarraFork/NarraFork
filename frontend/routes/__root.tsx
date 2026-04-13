@@ -27,7 +27,6 @@ import {
 	IconMessageChatbot,
 	IconMessageReport,
 	IconPlus,
-	IconReceipt2,
 	IconSearch,
 	IconSettings,
 	IconShieldCog,
@@ -627,15 +626,6 @@ function AuthenticatedLayout() {
 							to="/routines"
 							label={navCollapsed ? undefined : t("routines")}
 							leftSection={<IconWand size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-					<Tooltip label={t("usageHistory")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/usage-history"
-							label={navCollapsed ? undefined : t("usageHistory")}
-							leftSection={<IconReceipt2 size={16} />}
 							onClick={closeNavForLink}
 						/>
 					</Tooltip>

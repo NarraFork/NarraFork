@@ -15,6 +15,7 @@ import {
 	IconCloud,
 	IconDatabase,
 	IconPlayerPlay,
+	IconReceipt2,
 	IconTerminal2,
 	IconUsers,
 	IconWand,
@@ -134,6 +135,14 @@ function AdminPage() {
 					value={ts("runtimeSection")}
 					description={t("adminRuntimeDesc")}
 					to="/admin/runtime"
+				/>
+				<StatCard
+					icon={<IconReceipt2 size={22} />}
+					color="cyan"
+					label={t("adminUsageHistory")}
+					value={t("adminUsageHistoryValue")}
+					description={t("adminUsageHistoryDesc")}
+					to="/admin/usage-history"
 				/>
 			</SimpleGrid>
 

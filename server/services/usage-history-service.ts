@@ -1,5 +1,7 @@
 import { db } from "@server/db";
-import { chapters, narratorMessages, narrators } from "@server/db/schema";
+import { apiRequests, chapters, narrators } from "@server/db/schema";
+import { getCodexManager } from "@server/lib/codex-manager";
+import { settings } from "@server/lib/settings";
 import { and, desc, eq, gte, like, lte, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
@@ -32,6 +34,7 @@ export interface UsageHistoryRecord {
 	narratorId: string;
 	provider: string | null;
 	credentialId: string | null;
+	credentialName: string | null;
 	model: string | null;
 	inputTokens: number;
 	outputTokens: number;
@@ -54,6 +57,32 @@ export interface UsageHistoryRecord {
 }
 
 export class UsageHistoryService {
+	/**
+	 * Get credential display name from provider snapshots
+	 */
+	private getCredentialName(provider: string | null, credentialId: string | null): string | null {
+		if (!provider || !credentialId) return null;
+
+		try {
+				if (!snapshot) return null;
+				const cred = snapshot.entries.find((c) => c.id === credentialId);
+				return cred?.displayName || cred?.email || null;
+			}
+			if (provider === "codex") {
+				const manager = getCodexManager();
+				const snapshot = manager.snapshot();
+				const cred = snapshot.entries.find((c) => c.id === credentialId);
+				return cred?.displayName || cred?.email || null;
+			}
+			}
+			// Anthropic and OpenAI don't have credential management
+		} catch {
+			// Ignore errors from snapshot calls (e.g., plugin not loaded)
+		}
+
+		return null;
+	}
+
 	async listUsageHistory(
 		filters: UsageHistoryFilters,
 		page = 1,
@@ -64,8 +93,8 @@ export class UsageHistoryService {
 
 		const [countResult] = await db
 			.select({ count: sql<number>`count(*)` })
-			.from(narratorMessages)
-			.leftJoin(narrators, eq(narratorMessages.narratorId, narrators.id))
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.where(and(...conditions));
 
@@ -73,41 +102,42 @@ export class UsageHistoryService {
 
 		const records = await db
 			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				provider: narratorMessages.provider,
-				credentialId: narratorMessages.credentialId,
-				model: narratorMessages.model,
-				inputTokens: narratorMessages.tokensIn,
-				outputTokens: narratorMessages.outputTokens,
-				cachedInputTokens: narratorMessages.cachedInputTokens,
-				cacheCreationInputTokens: narratorMessages.cacheCreationInputTokens,
-				cacheCreation5mTokens: narratorMessages.cacheCreation5mTokens,
-				cacheCreation1hTokens: narratorMessages.cacheCreation1hTokens,
-				reasoningTokens: narratorMessages.reasoningTokens,
-				ttftMs: narratorMessages.ttftMs,
-				durationMs: narratorMessages.durationMs,
-				costUsd: narratorMessages.costUsd,
-				contextPercent: narratorMessages.contextPercent,
-				meterUsage: narratorMessages.meterUsage,
-				meterUnit: narratorMessages.meterUnit,
-				createdAt: narratorMessages.createdAt,
+				id: apiRequests.id,
+				narratorId: apiRequests.narratorId,
+				provider: apiRequests.provider,
+				credentialId: apiRequests.credentialId,
+				model: apiRequests.model,
+				inputTokens: apiRequests.inputTokens,
+				outputTokens: apiRequests.outputTokens,
+				cachedInputTokens: apiRequests.cachedInputTokens,
+				cacheCreationInputTokens: apiRequests.cacheCreationInputTokens,
+				cacheCreation5mTokens: apiRequests.cacheCreation5mTokens,
+				cacheCreation1hTokens: apiRequests.cacheCreation1hTokens,
+				reasoningTokens: apiRequests.reasoningTokens,
+				ttftMs: apiRequests.ttftMs,
+				durationMs: apiRequests.durationMs,
+				costUsd: apiRequests.costUsd,
+				contextPercent: apiRequests.contextPercent,
+				meterUsage: apiRequests.meterUsage,
+				meterUnit: apiRequests.meterUnit,
+				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
 				chapterTitle: chapters.title,
-				chapterId: chapters.id,
+				chapterId: narrators.chapterId,
 				projectId: chapters.projectId,
 			})
-			.from(narratorMessages)
-			.leftJoin(narrators, eq(narratorMessages.narratorId, narrators.id))
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.where(and(...conditions))
-			.orderBy(desc(narratorMessages.createdAt))
+			.orderBy(desc(apiRequests.createdAt))
 			.limit(pageSize)
 			.offset(offset);
 
 		return {
 			records: records.map((r) => ({
 				...r,
+				credentialName: this.getCredentialName(r.provider, r.credentialId),
 				inputTokens: r.inputTokens ?? 0,
 				outputTokens: r.outputTokens ?? 0,
 				cachedInputTokens: r.cachedInputTokens ?? 0,
@@ -126,19 +156,19 @@ export class UsageHistoryService {
 		const [stats] = await db
 			.select({
 				totalRequests: sql<number>`count(*)`,
-				totalInputTokens: sql<number>`coalesce(sum(${narratorMessages.tokensIn}), 0)`,
-				totalOutputTokens: sql<number>`coalesce(sum(${narratorMessages.outputTokens}), 0)`,
-				totalCacheCreationTokens: sql<number>`coalesce(sum(${narratorMessages.cacheCreationInputTokens}), 0)`,
-				totalCacheReadTokens: sql<number>`coalesce(sum(${narratorMessages.cachedInputTokens}), 0)`,
-				totalCacheCreation5mTokens: sql<number>`coalesce(sum(${narratorMessages.cacheCreation5mTokens}), 0)`,
-				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${narratorMessages.cacheCreation1hTokens}), 0)`,
-				totalReasoningTokens: sql<number>`coalesce(sum(${narratorMessages.reasoningTokens}), 0)`,
-				totalCost: sql<number>`coalesce(sum(${narratorMessages.costUsd}), 0)`,
-				averageDurationMs: sql<number>`coalesce(avg(${narratorMessages.durationMs}), 0)`,
-				averageTtftMs: sql<number>`coalesce(avg(${narratorMessages.ttftMs}), 0)`,
+				totalInputTokens: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
+				totalOutputTokens: sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`,
+				totalCacheCreationTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`,
+				totalCacheReadTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`,
+				totalCacheCreation5mTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation5mTokens}), 0)`,
+				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
+				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
+				totalCost: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`,
+				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
+				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
 			})
-			.from(narratorMessages)
-			.leftJoin(narrators, eq(narratorMessages.narratorId, narrators.id))
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.where(and(...conditions));
 
@@ -168,38 +198,39 @@ export class UsageHistoryService {
 	async getUsageRecord(id: string): Promise<UsageHistoryRecord | null> {
 		const [record] = await db
 			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				provider: narratorMessages.provider,
-				credentialId: narratorMessages.credentialId,
-				model: narratorMessages.model,
-				inputTokens: narratorMessages.tokensIn,
-				outputTokens: narratorMessages.outputTokens,
-				cachedInputTokens: narratorMessages.cachedInputTokens,
-				cacheCreationInputTokens: narratorMessages.cacheCreationInputTokens,
-				cacheCreation5mTokens: narratorMessages.cacheCreation5mTokens,
-				cacheCreation1hTokens: narratorMessages.cacheCreation1hTokens,
-				reasoningTokens: narratorMessages.reasoningTokens,
-				ttftMs: narratorMessages.ttftMs,
-				durationMs: narratorMessages.durationMs,
-				costUsd: narratorMessages.costUsd,
-				contextPercent: narratorMessages.contextPercent,
-				meterUsage: narratorMessages.meterUsage,
-				meterUnit: narratorMessages.meterUnit,
-				createdAt: narratorMessages.createdAt,
+				id: apiRequests.id,
+				narratorId: apiRequests.narratorId,
+				provider: apiRequests.provider,
+				credentialId: apiRequests.credentialId,
+				model: apiRequests.model,
+				inputTokens: apiRequests.inputTokens,
+				outputTokens: apiRequests.outputTokens,
+				cachedInputTokens: apiRequests.cachedInputTokens,
+				cacheCreationInputTokens: apiRequests.cacheCreationInputTokens,
+				cacheCreation5mTokens: apiRequests.cacheCreation5mTokens,
+				cacheCreation1hTokens: apiRequests.cacheCreation1hTokens,
+				reasoningTokens: apiRequests.reasoningTokens,
+				ttftMs: apiRequests.ttftMs,
+				durationMs: apiRequests.durationMs,
+				costUsd: apiRequests.costUsd,
+				contextPercent: apiRequests.contextPercent,
+				meterUsage: apiRequests.meterUsage,
+				meterUnit: apiRequests.meterUnit,
+				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
 				chapterTitle: chapters.title,
-				chapterId: chapters.id,
+				chapterId: narrators.chapterId,
 				projectId: chapters.projectId,
 			})
-			.from(narratorMessages)
-			.leftJoin(narrators, eq(narratorMessages.narratorId, narrators.id))
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
-			.where(eq(narratorMessages.id, id));
+			.where(eq(apiRequests.id, id));
 
 		if (!record) return null;
 		return {
 			...record,
+			credentialName: this.getCredentialName(record.provider, record.credentialId),
 			inputTokens: record.inputTokens ?? 0,
 			outputTokens: record.outputTokens ?? 0,
 			cachedInputTokens: record.cachedInputTokens ?? 0,
@@ -211,23 +242,15 @@ export class UsageHistoryService {
 	}
 
 	private buildWhereConditions(filters: UsageHistoryFilters) {
-		const conditions = [
-			eq(narratorMessages.role, "assistant"),
-			sql`(
-				coalesce(${narratorMessages.tokensIn}, 0) > 0 OR
-				coalesce(${narratorMessages.outputTokens}, 0) > 0 OR
-				coalesce(${narratorMessages.cachedInputTokens}, 0) > 0 OR
-				coalesce(${narratorMessages.cacheCreationInputTokens}, 0) > 0
-			)`,
-		];
+		const conditions = [];
 
-		if (filters.narratorId) conditions.push(eq(narratorMessages.narratorId, filters.narratorId));
+		if (filters.narratorId) conditions.push(eq(apiRequests.narratorId, filters.narratorId));
 		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId));
 		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId));
-		if (filters.provider) conditions.push(eq(narratorMessages.provider, filters.provider));
-		if (filters.model) conditions.push(like(narratorMessages.model, `%${filters.model}%`));
-		if (filters.startDate) conditions.push(gte(narratorMessages.createdAt, filters.startDate));
-		if (filters.endDate) conditions.push(lte(narratorMessages.createdAt, filters.endDate));
+		if (filters.provider) conditions.push(eq(apiRequests.provider, filters.provider));
+		if (filters.model) conditions.push(like(apiRequests.model, `%${filters.model}%`));
+		if (filters.startDate) conditions.push(gte(apiRequests.createdAt, filters.startDate));
+		if (filters.endDate) conditions.push(lte(apiRequests.createdAt, filters.endDate));
 
 		return conditions;
 	}

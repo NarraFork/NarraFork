@@ -100,7 +100,6 @@ export type AgentEvent =
 			toolUses: AgentToolUse[];
 			messageId?: string;
 			credentialId?: string;
-			stopReason?: string;
 	  }
 	| { type: "stream_text"; text: string }
 	| {
@@ -116,33 +115,25 @@ export type AgentEvent =
 			toolName: string;
 			output: string;
 			isError: boolean;
-			durationMs: number;
-			/** When set, the tool call input was broken (output truncated mid-stream).
-			 *  The event handler should overwrite the persisted inputJson with this value. */
+			durationMs?: number;
 			brokenInputOverride?: Record<string, unknown>;
-			/** Updated input to display in the UI (for broken calls, the sanitized version). */
 			updatedInput?: Record<string, unknown>;
-			/** Optional metadata from the tool (e.g. line numbers for Edit). */
 			metadata?: Record<string, unknown>;
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
-	// 由 bash 工具看门狗在进程运行 ≥60s 时触发，经 event-handler → WS 推送到前端显示终止按钮
+	// Watchdog notification: tool has been running for ≥60s
 	| { type: "tool_long_running"; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_use_chunk";
 			toolUseId: string;
 			toolName: string;
 			inputCharsTotal: number;
-			/** For Write/Edit tools: extracted file path from the JSON */
 			extractedFilePath?: string;
-			/** For Write/Edit tools: content chars received (excluding file_path field) */
 			contentCharsReceived?: number;
-			/** Generic extracted fields from streaming JSON (e.g. Agent tool's description/subagent_type) */
 			extractedFields?: Record<string, string>;
 	  }
 	| {
-			/** A single content block has been fully streamed and is ready for persistence / execution. */
 			type: "block_complete";
 			block: ContentBlock;
 	  }
@@ -183,12 +174,38 @@ export type AgentEvent =
 	| {
 			type: "web_search";
 			id: string;
-			status: "in_progress" | "searching" | "completed";
+			status: string;
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
 	  }
 	| { type: "model_switched"; model: string; provider: string }
+	| {
+			type: "api_request_start";
+			requestId: string;
+			provider: string;
+			model: string;
+			credentialId?: string;
+	  }
+	| {
+			type: "api_request_end";
+			requestId: string;
+			usage?: {
+				promptTokens?: number;
+				inputTokens?: number;
+				completionTokens?: number;
+				reasoningTokens?: number;
+				cachedInputTokens?: number;
+				cacheCreationInputTokens?: number;
+				cacheCreation5mTokens?: number;
+				cacheCreation1hTokens?: number;
+			};
+			ttftMs?: number;
+			durationMs?: number;
+			contextPercent?: number;
+			meterUsage?: number;
+			meterUnit?: string;
+	  }
 	| { type: "done" };
 
 export interface AgentToolUse {

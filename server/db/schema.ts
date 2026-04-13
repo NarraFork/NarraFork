@@ -853,3 +853,46 @@ export const workspaces = sqliteTable(
 	},
 	(table) => [index("idx_workspaces_user").on(table.userId)],
 );
+
+// === api_requests ===
+// 独立记录每次 API 请求的统计信息（与 narrator_messages 解耦）
+export const apiRequests = sqliteTable(
+	"api_requests",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		// 关联的 assistant message ID（一个请求可能产生一个 assistant message）
+		messageId: text("message_id").references(() => narratorMessages.id, { onDelete: "set null" }),
+		// 提供商和模型信息
+		provider: text("provider"),
+		credentialId: text("credential_id"),
+		model: text("model"),
+		// Token 使用统计
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationInputTokens: integer("cache_creation_input_tokens").notNull().default(0),
+		cacheCreation5mTokens: integer("cache_creation_5m_tokens").notNull().default(0),
+		cacheCreation1hTokens: integer("cache_creation_1h_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		// 性能指标
+		ttftMs: integer("ttft_ms"), // Time to first token
+		durationMs: integer("duration_ms"), // 总耗时
+		// 成本
+		costUsd: real("cost_usd"),
+		// 上下文使用率
+		contextPercent: real("context_percent"),
+		meterUsage: real("meter_usage"),
+		meterUnit: text("meter_unit"),
+		// 时间戳
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_api_requests_narrator").on(table.narratorId, table.createdAt),
+		index("idx_api_requests_message").on(table.messageId),
+		index("idx_api_requests_provider").on(table.provider, table.createdAt),
+		index("idx_api_requests_created").on(table.createdAt),
+	],
+);

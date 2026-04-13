@@ -7,12 +7,14 @@ import { IconFilter, IconRefresh } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
-export const Route = createFileRoute("/usage-history")({
+export const Route = createFileRoute("/admin/usage-history")({
 	component: UsageHistoryPage,
 });
 
 function UsageHistoryPage() {
+	const { t } = useTranslation("common");
 	const [page, setPage] = useState(1);
 	const pageSize = 50;
 	const [filters, setFilters] = useState<UsageHistoryFilters>({});
@@ -55,7 +57,7 @@ function UsageHistoryPage() {
 		<div style={{ padding: "2rem", maxWidth: 1400, margin: "0 auto" }}>
 			<Stack gap="xl">
 				<Group justify="space-between">
-					<Title order={2}>请求历史</Title>
+					<Title order={2}>{t("usageHistoryTitle")}</Title>
 					<Button
 						leftSection={<IconRefresh size={16} />}
 						variant="light"
@@ -64,7 +66,7 @@ function UsageHistoryPage() {
 							refetchStats();
 						}}
 					>
-						刷新
+						{t("usageHistoryRefresh")}
 					</Button>
 				</Group>
 
@@ -73,8 +75,8 @@ function UsageHistoryPage() {
 				<Stack gap="md">
 					<Group align="end">
 						<Select
-							label="提供商"
-							placeholder="全部"
+							label={t("usageHistoryProvider")}
+							placeholder={t("usageHistoryAllProviders")}
 							clearable
 							data={[
 								{ value: "anthropic", label: "Anthropic" },
@@ -87,8 +89,8 @@ function UsageHistoryPage() {
 							}
 						/>
 						<TextInput
-							label="模型"
-							placeholder="按模型筛选"
+							label={t("usageHistoryModel")}
+							placeholder={t("usageHistoryModelPlaceholder")}
 							value={tempFilters.model ?? ""}
 							onChange={(e) =>
 								setTempFilters((prev) => ({ ...prev, model: e.currentTarget.value || undefined }))
@@ -115,10 +117,10 @@ function UsageHistoryPage() {
 							}}
 						/>
 						<Button leftSection={<IconFilter size={16} />} onClick={applyFilters}>
-							应用筛选
+							{t("usageHistoryApplyFilters")}
 						</Button>
 						<Button variant="light" onClick={resetFilters}>
-							重置
+							{t("usageHistoryReset")}
 						</Button>
 					</Group>
 				</Stack>

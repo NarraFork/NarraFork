@@ -6,7 +6,6 @@
 	"settings": "设置",
 	"admin": "管理",
 	"routines": "套路",
-	"usageHistory": "请求历史",
 	"logout": "退出登录",
 	"logoutConfirmTitle": "确认退出",
 	"logoutConfirmMessage": "确定要退出登录吗？",

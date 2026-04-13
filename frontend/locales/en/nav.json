@@ -6,7 +6,6 @@
 	"settings": "Settings",
 	"admin": "Admin",
 	"routines": "Routines",
-	"usageHistory": "Usage History",
 	"logout": "Logout",
 	"logoutConfirmTitle": "Confirm Logout",
 	"logoutConfirmMessage": "Are you sure you want to log out?",

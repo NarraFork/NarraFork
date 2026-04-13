@@ -1,9 +1,11 @@
-import { requireAuth } from "@server/middleware/auth";
+import { requireAdmin, requireAuth } from "@server/middleware/auth";
 import { usageHistoryService } from "@server/services/usage-history-service";
 import { Hono } from "hono";
 import { z } from "zod";
 
 const usageHistoryRoutes = new Hono();
+
+usageHistoryRoutes.use("*", requireAuth, requireAdmin);
 
 // 查询参数 schema
 const listQuerySchema = z.object({
@@ -32,7 +34,7 @@ const statsQuerySchema = z.object({
  * GET /api/usage-history
  * 获取使用历史记录列表（分页）
  */
-usageHistoryRoutes.get("/", requireAuth, async (c) => {
+usageHistoryRoutes.get("/", async (c) => {
 	const query = listQuerySchema.parse(c.req.query());
 	const { page, pageSize, ...filters } = query;
 
@@ -51,7 +53,7 @@ usageHistoryRoutes.get("/", requireAuth, async (c) => {
  * GET /api/usage-history/stats
  * 获取使用统计
  */
-usageHistoryRoutes.get("/stats", requireAuth, async (c) => {
+usageHistoryRoutes.get("/stats", async (c) => {
 	const filters = statsQuerySchema.parse(c.req.query());
 	const stats = await usageHistoryService.getUsageStats(filters);
 	return c.json(stats);
@@ -61,7 +63,7 @@ usageHistoryRoutes.get("/stats", requireAuth, async (c) => {
  * GET /api/usage-history/:id
  * 获取单条使用记录详情
  */
-usageHistoryRoutes.get("/:id", requireAuth, async (c) => {
+usageHistoryRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 
 	if (!id) {
