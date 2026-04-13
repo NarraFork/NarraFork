@@ -1996,6 +1996,7 @@ export const api = {
 			stickySessionCount: number;
 			globalProxy?: string;
 			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+			useWebSocket?: boolean;
 			lastBrowserAuthError?: string;
 			usageCache: Record<string, CodexUsageData>;
 			usageQueue?: {
@@ -2103,6 +2104,11 @@ export const api = {
 				body: JSON.stringify({ reasoningEffort }),
 			},
 		),
+	codexSetUseWebSocket: (useWebSocket: boolean) =>
+		request<{ ok: boolean; useWebSocket: boolean }>("/codex/use-websocket", {
+			method: "POST",
+			body: JSON.stringify({ useWebSocket }),
+		}),
 	codexImportCredentials: (
 		credentials: Array<{
 			refreshToken: string;

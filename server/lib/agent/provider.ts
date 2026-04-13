@@ -208,7 +208,11 @@ export interface ProviderAdapter {
 
 function createProviderByName(provider: string): ProviderAdapter | null {
 	}
-	if (provider === "codex") return new CodexProvider();
+	if (provider === "codex") {
+		return new CodexProvider({
+			useWebSocket: settings.codex?.useWebSocket ?? false,
+		});
+	}
 
 	const anthropicConfig = getAnthropicProviderConfig(provider);
 	if (anthropicConfig) {

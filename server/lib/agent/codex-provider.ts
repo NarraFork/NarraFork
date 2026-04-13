@@ -1,10 +1,23 @@
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
 // Wraps OpenAIProvider with dynamic credential selection
+// Supports both HTTP (default) and Responses WebSocket modes
 
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { logger } from "../logger";
-import { settings } from "../settings";
-import { OpenAIProvider } from "./openai-provider";
+import { parseModelId, settings } from "../settings";
+import {
+	type CodexResponsesRequestBody,
+	CodexWebSocketFallbackError,
+	streamCodexResponsesWebSocket,
+} from "./codex-websocket";
+import {
+	CODEX_DEFAULT_INSTRUCTIONS,
+	convertHistoryToResponsesApi,
+	normalizeCodexReasoningEffort,
+	type OAIContentPart,
+	type OAIMessage,
+	OpenAIProvider,
+} from "./openai-provider";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
@@ -31,14 +44,25 @@ function classifyCodexError(
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
+export interface CodexProviderOptions {
+	/** Use WebSocket instead of HTTP for streaming (experimental) */
+	useWebSocket?: boolean;
+}
+
 /**
  * Codex provider that uses the centralized credential pool.
  * Wraps OpenAIProvider with dynamic credential selection from CodexManager.
+ * Supports both HTTP (default) and WebSocket modes.
  */
 export class CodexProvider implements ProviderAdapter {
 	private manager = getCodexManager();
 	private context: CallContext | null = null;
 	private contextSessionKey: string | undefined;
+	private useWebSocket: boolean;
+
+	constructor(options?: CodexProviderOptions) {
+		this.useWebSocket = options?.useWebSocket ?? false;
+	}
 
 	/** Get or acquire a valid credential context. */
 	private async getContext(sessionKey?: string): Promise<CallContext> {
@@ -204,6 +228,13 @@ export class CodexProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		// Use WebSocket mode if enabled
+		if (this.useWebSocket) {
+			yield* this.chatWebSocket(params);
+			return;
+		}
+
+		// Default HTTP mode
 		const maxAttempts = this.getMaxFailoverAttempts();
 		let attempt = 0;
 		let lastError: unknown;
@@ -249,6 +280,166 @@ export class CodexProvider implements ProviderAdapter {
 
 		if (lastError instanceof Error) throw lastError;
 		throw new Error("Codex chat failed");
+	}
+
+	/** WebSocket-based chat implementation */
+	private async *chatWebSocket(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		const maxAttempts = this.getMaxFailoverAttempts();
+		let attempt = 0;
+		let lastError: unknown;
+
+		while (attempt < maxAttempts) {
+			const ctx = await this.getContext(params.stickySessionKey);
+			this.refreshUsageOnUse(ctx.id);
+			const provider = this.createProvider(ctx);
+			let hasStreamedEvents = false;
+
+			try {
+				const request = this.buildResponsesWebSocketRequest(params);
+				params.requestDump?.setRequest({
+					transport: "websocket",
+					url: `${CODEX_BASE_URL.replace(/\/+$/, "")}/responses`,
+					headers: {
+						Authorization: "Bearer [REDACTED]",
+						originator: "narrafork",
+						OpenAI_Beta: "responses_websockets=2026-02-06",
+					},
+					body: { type: "response.create", ...request },
+				});
+
+				for await (const event of streamCodexResponsesWebSocket({
+					baseUrl: CODEX_BASE_URL,
+					apiKey: ctx.token,
+					accountId: ctx.credential.accountId,
+					proxy: settings.codex?.proxy,
+					sessionKey: params.stickySessionKey ?? params.conversationId,
+					credentialId: ctx.id,
+					model: params.model,
+					request,
+					signal: params.signal,
+				})) {
+					hasStreamedEvents = true;
+					yield { ...event, credentialId: ctx.id };
+				}
+				this.manager.reportSuccess(ctx.id);
+				return;
+			} catch (err) {
+				if (err instanceof CodexWebSocketFallbackError) {
+					logger.warn("Codex Responses WebSocket unavailable, falling back to HTTP", {
+						credentialId: ctx.id,
+						status: err.status,
+						error: err.message,
+					});
+					for await (const event of provider.chat(params)) {
+						hasStreamedEvents = true;
+						yield { ...event, credentialId: ctx.id };
+					}
+					this.manager.reportSuccess(ctx.id);
+					return;
+				}
+
+				lastError = err;
+				attempt++;
+
+				const { classified, hasMore } = this.reportCallError(ctx, err);
+				const shouldRetry =
+					classified.type === "quota_exhausted" &&
+					hasMore &&
+					!hasStreamedEvents &&
+					attempt < maxAttempts;
+				if (shouldRetry) {
+					this.context = null;
+					this.contextSessionKey = undefined;
+					logger.info("Codex Responses WebSocket quota failover: retrying with next credential", {
+						operation: "chat",
+						attempt,
+						maxAttempts,
+						previousCredentialId: ctx.id,
+					});
+					continue;
+				}
+				throw err;
+			}
+		}
+
+		if (lastError instanceof Error) throw lastError;
+		throw new Error("Codex Responses WebSocket chat failed");
+	}
+
+	private buildResponsesWebSocketRequest(params: ChatParams): CodexResponsesRequestBody {
+		const model = parseModelId(params.model).model;
+		const messages: OAIMessage[] = [...(params.history as OAIMessage[])];
+		for (const tr of params.toolResults as Array<{
+			type: string;
+			call_id: string;
+			output: string;
+		}>) {
+			messages.push(tr as unknown as OAIMessage);
+		}
+		if (params.content && params.content !== ".") {
+			if (params.images?.length) {
+				const parts: OAIContentPart[] = [{ type: "text", text: params.content }];
+				for (const img of params.images) {
+					parts.push({
+						type: "image_url",
+						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
+					});
+				}
+				messages.push({ role: "user", content: parts });
+			} else {
+				messages.push({ role: "user", content: params.content });
+			}
+		} else if (params.toolResults.length === 0) {
+			messages.push({ role: "user", content: params.content });
+		}
+
+		let instructions = "";
+		const inputMessages: OAIMessage[] = [];
+		for (const msg of messages) {
+			if (msg.role === "system") {
+				if (typeof msg.content === "string") {
+					instructions += (instructions ? "\n\n" : "") + msg.content;
+				}
+				continue;
+			}
+			inputMessages.push(msg);
+		}
+
+		const sanitizedInputMessages = inputMessages.filter((msg) => {
+			if (msg.role !== "assistant") return true;
+			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+			if (hasToolCalls) return true;
+			if (typeof msg.content === "string") return msg.content.length > 0;
+			if (Array.isArray(msg.content)) return msg.content.length > 0;
+			return false;
+		});
+
+		const request: CodexResponsesRequestBody = {
+			model,
+			input: convertHistoryToResponsesApi(sanitizedInputMessages),
+			stream: true,
+			store: false,
+			prompt_cache_key: params.conversationId,
+			parallel_tool_calls: true,
+		};
+		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
+		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
+		tools.push({ type: "web_search" });
+		request.tools = tools;
+
+		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
+		if (reasoningEffort) {
+			request.reasoning = {
+				effort: reasoningEffort,
+				summary: "auto",
+			};
+			request.include = ["reasoning.encrypted_content"];
+		}
+		if (params.serviceTier) {
+			request.service_tier = params.serviceTier;
+		}
+
+		return request;
 	}
 
 	formatToolResult(

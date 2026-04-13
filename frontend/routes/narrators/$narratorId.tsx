@@ -102,7 +102,6 @@ function NarratorDetailPage() {
 				title: displayTitle,
 				subtitle: chapterTitle,
 				status: narratorStatus,
-				updateOnly: true,
 			});
 		} else {
 			addRecentTab({
@@ -111,7 +110,6 @@ function NarratorDetailPage() {
 				title: narratorTitle || "New conversation",
 				subtitle: narratorCwd,
 				status: narratorStatus,
-				updateOnly: true,
 			});
 		}
 	}, [

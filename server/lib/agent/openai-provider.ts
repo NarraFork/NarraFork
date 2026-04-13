@@ -51,7 +51,7 @@ const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
 	"gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
 };
 
-function normalizeCodexReasoningEffort(
+export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
@@ -80,7 +80,7 @@ const OPENAI_IDENTITY: Record<string, string> = {
 // Codex models (gpt-5.x-codex) use a specialized prompt inspired by OpenCode's codex_header.txt.
 // This prompt emphasizes concise, action-oriented behavior with minimal formatting.
 
-const CODEX_DEFAULT_INSTRUCTIONS =
+export const CODEX_DEFAULT_INSTRUCTIONS =
 	"You are NarraFork Narrator. Follow the user's request and answer concisely.";
 
 const CODEX_IDENTITY: Record<string, string> = {
@@ -142,14 +142,14 @@ const CODEX_IDENTITY: Record<string, string> = {
 
 // === OpenAI message types ===
 
-type OAIContentPart =
+export type OAIContentPart =
 	| { type: "text"; text: string }
 	| { type: "image_url"; image_url: { url: string } }
 	| { type: "input_text"; text: string }
 	| { type: "input_image"; image_url: string }
 	| { type: "output_text"; text: string };
 
-interface OAIMessage {
+export interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content?: string | OAIContentPart[] | null;
 	tool_calls?: OAIToolCall[];
@@ -163,7 +163,7 @@ interface OAIMessage {
 	_reasoningTextFallback?: string;
 }
 
-interface OAIToolCall {
+export interface OAIToolCall {
 	id: string;
 	type: "function";
 	function: { name: string; arguments: string };
@@ -1025,7 +1025,7 @@ async function* _parseResponsesAPIStream(
 	}
 }
 
-interface ResponsesAPIChunk {
+export interface ResponsesAPIChunk {
 	type?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	item?: any;
@@ -1041,7 +1041,7 @@ interface ResponsesAPIChunk {
 }
 
 /** Accumulator for a single Responses API tool call, keyed by output_index. */
-interface ResponsesToolAccum {
+export interface ResponsesToolAccum {
 	callId: string;
 	name: string;
 	args: string;
@@ -1049,14 +1049,14 @@ interface ResponsesToolAccum {
 }
 
 /** Accumulator for a Responses API reasoning item, keyed by output_index. */
-interface ResponsesReasoningAccum {
+export interface ResponsesReasoningAccum {
 	/** The canonical item ID from the API (e.g. "rs_...") */
 	itemId: string;
 	/** Encrypted reasoning content for continuation */
 	encryptedContent?: string | null;
 }
 
-function parseResponsesAPIEvent(
+export function parseResponsesAPIEvent(
 	chunk: ResponsesAPIChunk,
 	toolAccum: Map<number, ResponsesToolAccum>,
 	reasoningAccum: Map<number, ResponsesReasoningAccum>,
@@ -2120,7 +2120,7 @@ function buildReasoningTextFallback(
  *   - { role: "tool" }    → { type: "function_call_output", call_id, output }
  *   - { role: "assistant", tool_calls } → separate { type: "function_call" } items + text
  */
-function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
+export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage[] {
 	const result: OAIMessage[] = [];
 	for (const msg of messages) {
 		// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes

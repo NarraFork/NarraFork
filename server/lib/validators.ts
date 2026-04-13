@@ -129,6 +129,8 @@ export const updateChapterSchema = z.object({
 
 // === Narrators ===
 
+const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh"]);
+
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
 	type: z.enum(["primary"]).optional(),
@@ -138,9 +140,17 @@ export const createNarratorSchema = z.object({
 		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"])
 		.optional(),
 	cwd: z.string().min(1).max(4096).optional(),
-	reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).nullable().optional(),
+	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	fastMode: z.boolean().optional(),
 	relaxedPlan: z.boolean().optional(),
+});
+
+export const codexDefaultReasoningEffortSchema = z.object({
+	reasoningEffort: reasoningEffortSchema.nullable().optional(),
+});
+
+export const codexUseWebSocketSchema = z.object({
+	useWebSocket: z.boolean().optional(),
 });
 
 export const sendMessageSchema = z.object({

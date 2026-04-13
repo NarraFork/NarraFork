@@ -4,6 +4,7 @@ import { codexUsageQueue } from "../lib/codex-usage-queue";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { saveSettings, settings } from "../lib/settings";
+import { codexDefaultReasoningEffortSchema, codexUseWebSocketSchema } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const codexRoutes = new Hono();
@@ -33,6 +34,7 @@ codexRoutes.get("/status", (c) => {
 		globalProxy: settings.codex?.proxy,
 		loadBalancingMode: mode ?? snapshot.loadBalancingMode,
 		defaultReasoningEffort: settings.codex?.defaultReasoningEffort,
+		useWebSocket: settings.codex?.useWebSocket ?? false,
 	});
 });
 
@@ -313,26 +315,35 @@ codexRoutes.get("/default-reasoning-effort", (c) => {
  * Set default reasoning effort for Codex models.
  */
 codexRoutes.post("/default-reasoning-effort", async (c) => {
-	const body = (await c.req.json().catch(() => ({}))) as {
-		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
-	};
-	const validEfforts = ["none", "low", "medium", "high", "xhigh"] as const;
-	if (
-		body.reasoningEffort !== null &&
-		body.reasoningEffort !== undefined &&
-		!validEfforts.includes(body.reasoningEffort)
-	) {
-		return c.json(
-			{ error: "Invalid reasoningEffort. Must be none|low|medium|high|xhigh or null" },
-			400,
-		);
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexDefaultReasoningEffortSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
 	}
 
 	settings.codex = settings.codex || {};
-	settings.codex.defaultReasoningEffort = body.reasoningEffort ?? undefined;
+	settings.codex.defaultReasoningEffort = parsed.data.reasoningEffort ?? undefined;
 	saveSettings(settings);
 
 	return c.json({ ok: true, reasoningEffort: settings.codex.defaultReasoningEffort ?? null });
+});
+
+/**
+ * POST /api/codex/use-websocket
+ * Set whether to use Responses WebSocket transport for Codex connections.
+ */
+codexRoutes.post("/use-websocket", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexUseWebSocketSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
+	}
+
+	settings.codex = settings.codex || {};
+	settings.codex.useWebSocket = parsed.data.useWebSocket ?? false;
+	saveSettings(settings);
+
+	return c.json({ ok: true, useWebSocket: settings.codex.useWebSocket ?? false });
 });
 
 /**

@@ -342,8 +342,17 @@ function evictTabCache(qc: ReturnType<typeof useQueryClient>, tab: RecentTab) {
 export function addRecentTab(
 	tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number; updateOnly?: boolean },
 ) {
-	const { updateOnly, ...rest } = tab;
+	const { updateOnly: explicitUpdateOnly, ...rest } = tab;
 	const entry = { ...rest, lastVisitedAt: rest.lastVisitedAt ?? Date.now() };
+
+	// Auto-detect: if updateOnly is not explicitly set, check if tab already exists
+	let updateOnly = explicitUpdateOnly;
+	if (updateOnly === undefined) {
+		const currentTabs = globalQC.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+		const exists = currentTabs.some((t) => t.type === entry.type && t.id === entry.id);
+		updateOnly = exists;
+	}
+
 	api.upsertRecentTab({ ...entry, updateOnly }).catch((err) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);
 	});

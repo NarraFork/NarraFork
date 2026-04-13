@@ -1,0 +1,628 @@
+import type { Agent as HttpAgent, IncomingMessage } from "node:http";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import type WebSocket from "ws";
+import { logger } from "../logger";
+import { getHttpUserAgent } from "../user-agent";
+import {
+	type OAIMessage,
+	parseResponsesAPIEvent,
+	type ResponsesAPIChunk,
+	type ResponsesReasoningAccum,
+	type ResponsesToolAccum,
+} from "./openai-provider";
+import type { ParsedStreamEvent } from "./provider";
+
+const RESPONSES_WS_BETA_HEADER = "responses_websockets=2026-02-06";
+const TURN_STATE_HEADER = "x-codex-turn-state";
+const TURN_METADATA_HEADER = "x-codex-turn-metadata";
+const SESSION_ID_HEADER = "session_id";
+const CLIENT_REQUEST_ID_HEADER = "x-client-request-id";
+const OPENAI_BETA_HEADER = "OpenAI-Beta";
+const CONNECTION_IDLE_TIMEOUT_MS = 60_000;
+const SESSION_IDLE_TTL_MS = 10 * 60_000;
+const SESSION_CLEANUP_INTERVAL_MS = 60_000;
+const MAX_SESSION_CACHE_SIZE = 100;
+
+type PendingFrame =
+	| { type: "message"; text: string }
+	| { type: "close"; code: number; reason: string }
+	| { type: "error"; error: Error };
+
+interface CodexWrappedErrorEvent {
+	type?: string;
+	status?: number;
+	status_code?: number;
+	error?: {
+		code?: string;
+		message?: string;
+		type?: string;
+		plan_type?: string;
+		resets_at?: number;
+	};
+	headers?: Record<string, unknown>;
+}
+
+export interface CodexResponsesRequestBody extends Record<string, unknown> {
+	model: string;
+	input: OAIMessage[];
+	stream: true;
+	instructions?: string;
+	previous_response_id?: string;
+}
+
+export interface CompletedResponseSnapshot {
+	responseId: string;
+	itemsAdded: unknown[];
+}
+
+interface CachedSession {
+	connection: ReusableWebSocketConnection | null;
+	disabled: boolean;
+	lastRequest: CodexResponsesRequestBody | null;
+	lastCompleted: CompletedResponseSnapshot | null;
+	turnState: string | null;
+	busy: boolean;
+	lastUsedAt: number;
+}
+
+export interface StreamCodexResponsesWebSocketOptions {
+	baseUrl: string;
+	apiKey: string;
+	accountId?: string;
+	proxy?: string;
+	sessionKey: string;
+	credentialId: string;
+	model: string;
+	request: CodexResponsesRequestBody;
+	signal: AbortSignal;
+	turnMetadata?: string;
+}
+
+export class CodexWebSocketFallbackError extends Error {
+	readonly status?: number;
+
+	constructor(message: string, status?: number) {
+		super(message);
+		this.name = "CodexWebSocketFallbackError";
+		this.status = status;
+	}
+}
+
+const sessionCache = new Map<string, CachedSession>();
+let sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+function cloneJson<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function itemSignature(value: unknown): string {
+	return JSON.stringify(value);
+}
+
+function isPrefixExtension(baseline: unknown[], input: unknown[]): boolean {
+	if (baseline.length > input.length) return false;
+	for (let i = 0; i < baseline.length; i++) {
+		if (itemSignature(baseline[i]) !== itemSignature(input[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function requestWithoutInput(
+	request: CodexResponsesRequestBody,
+): Omit<CodexResponsesRequestBody, "input"> & { input: [] } {
+	return {
+		...cloneJson(request),
+		input: [],
+	};
+}
+
+function buildSessionCacheKey(options: StreamCodexResponsesWebSocketOptions): string {
+	return [options.baseUrl, options.sessionKey, options.credentialId, options.model].join("::");
+}
+
+function touchSession(session: CachedSession): void {
+	session.lastUsedAt = Date.now();
+}
+
+function stopSessionCleanupTimerIfIdle(): void {
+	if (sessionCache.size === 0 && sessionCleanupTimer) {
+		clearInterval(sessionCleanupTimer);
+		sessionCleanupTimer = null;
+	}
+}
+
+function ensureSessionCleanupTimer(): void {
+	if (sessionCleanupTimer) return;
+	sessionCleanupTimer = setInterval(() => {
+		void evictIdleCodexResponsesWebSocketSessions().catch((error) => {
+			logger.warn("Failed to evict idle Codex Responses WebSocket sessions", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}, SESSION_CLEANUP_INTERVAL_MS);
+	if (
+		sessionCleanupTimer &&
+		typeof sessionCleanupTimer === "object" &&
+		"unref" in sessionCleanupTimer
+	) {
+		sessionCleanupTimer.unref();
+	}
+}
+
+export function isCodexResponsesWebSocketSessionExpired(
+	session: Pick<CachedSession, "busy" | "lastUsedAt">,
+	now = Date.now(),
+	idleTtlMs = SESSION_IDLE_TTL_MS,
+): boolean {
+	return !session.busy && now - session.lastUsedAt > idleTtlMs;
+}
+
+async function removeSession(cacheKey: string, session: CachedSession): Promise<void> {
+	sessionCache.delete(cacheKey);
+	await closeSessionConnection(session);
+	stopSessionCleanupTimerIfIdle();
+}
+
+export async function evictIdleCodexResponsesWebSocketSessions(now = Date.now()): Promise<number> {
+	const staleEntries = [...sessionCache.entries()].filter(([, session]) =>
+		isCodexResponsesWebSocketSessionExpired(session, now),
+	);
+	for (const [cacheKey, session] of staleEntries) {
+		await removeSession(cacheKey, session);
+	}
+	return staleEntries.length;
+}
+
+async function trimCodexResponsesWebSocketSessions(
+	limit = MAX_SESSION_CACHE_SIZE,
+): Promise<number> {
+	const overflow = sessionCache.size - limit;
+	if (overflow <= 0) return 0;
+	const evictionCandidates = [...sessionCache.entries()]
+		.filter(([, session]) => !session.busy)
+		.sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)
+		.slice(0, overflow);
+	for (const [cacheKey, session] of evictionCandidates) {
+		await removeSession(cacheKey, session);
+	}
+	return evictionCandidates.length;
+}
+
+export async function clearCodexResponsesWebSocketSessions(): Promise<void> {
+	for (const [cacheKey, session] of [...sessionCache.entries()]) {
+		await removeSession(cacheKey, session);
+	}
+}
+
+function getOrCreateSession(key: string): CachedSession {
+	let session = sessionCache.get(key);
+	if (!session) {
+		session = {
+			connection: null,
+			disabled: false,
+			lastRequest: null,
+			lastCompleted: null,
+			turnState: null,
+			busy: false,
+			lastUsedAt: Date.now(),
+		};
+		sessionCache.set(key, session);
+		ensureSessionCleanupTimer();
+		void trimCodexResponsesWebSocketSessions();
+	} else {
+		touchSession(session);
+	}
+	return session;
+}
+
+function shouldDisableWebSocketForStatus(status?: number): boolean {
+	return status === 404 || status === 405 || status === 426 || status === 501;
+}
+
+export function buildCodexResponsesWebSocketUrl(baseUrl: string): string {
+	const url = new URL(baseUrl);
+	if (!url.pathname.endsWith("/responses")) {
+		url.pathname = `${url.pathname.replace(/\/+$/, "")}/responses`;
+	}
+	if (url.protocol === "https:") url.protocol = "wss:";
+	else if (url.protocol === "http:") url.protocol = "ws:";
+	return url.toString();
+}
+
+function isOfficialChatGPTDomain(baseUrl: string): boolean {
+	try {
+		const host = new URL(baseUrl).hostname;
+		return host === "chatgpt.com" || host.endsWith(".chatgpt.com") || host.endsWith(".openai.com");
+	} catch {
+		return false;
+	}
+}
+
+function buildHandshakeHeaders(
+	options: StreamCodexResponsesWebSocketOptions,
+	session: CachedSession,
+): Record<string, string> {
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${options.apiKey}`,
+		"User-Agent": getHttpUserAgent(),
+		originator: "narrafork",
+		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
+		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,
+		[SESSION_ID_HEADER]: options.sessionKey,
+		[CLIENT_REQUEST_ID_HEADER]: options.sessionKey,
+	};
+	if (options.accountId && isOfficialChatGPTDomain(options.baseUrl)) {
+		headers["ChatGPT-Account-Id"] = options.accountId;
+	}
+	if (session.turnState) {
+		headers[TURN_STATE_HEADER] = session.turnState;
+	}
+	if (options.turnMetadata) {
+		headers[TURN_METADATA_HEADER] = options.turnMetadata;
+	}
+	return headers;
+}
+
+function parseWrappedError(text: string): CodexWrappedErrorEvent | null {
+	try {
+		const parsed = JSON.parse(text) as CodexWrappedErrorEvent;
+		return parsed.type === "error" ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+function formatWrappedError(error: CodexWrappedErrorEvent): Error {
+	const status = error.status ?? error.status_code;
+	const code = error.error?.code ?? error.error?.type;
+	const message = error.error?.message ?? "Codex WebSocket request failed";
+	const suffix = [status ? `status=${status}` : null, code ? `code=${code}` : null]
+		.filter(Boolean)
+		.join(", ");
+	return new Error(suffix ? `${message} (${suffix})` : message);
+}
+
+export function buildCodexResponsesWebSocketRequest(
+	request: CodexResponsesRequestBody,
+	lastRequest: CodexResponsesRequestBody | null,
+	lastCompleted: CompletedResponseSnapshot | null,
+): Record<string, unknown> {
+	const fullRequest = cloneJson(request);
+	if (!lastRequest || !lastCompleted?.responseId) {
+		return { type: "response.create", ...fullRequest };
+	}
+
+	const previousWithoutInput = requestWithoutInput(lastRequest);
+	const currentWithoutInput = requestWithoutInput(fullRequest);
+	if (itemSignature(previousWithoutInput) !== itemSignature(currentWithoutInput)) {
+		return { type: "response.create", ...fullRequest };
+	}
+
+	const baseline = [
+		...cloneJson(lastRequest.input),
+		...cloneJson(lastCompleted.itemsAdded),
+	] as unknown[];
+	const currentInput = cloneJson(fullRequest.input) as unknown[];
+	if (!isPrefixExtension(baseline, currentInput)) {
+		return { type: "response.create", ...fullRequest };
+	}
+
+	const deltaInput = currentInput.slice(baseline.length) as OAIMessage[];
+	return {
+		type: "response.create",
+		...fullRequest,
+		input: deltaInput,
+		previous_response_id: lastCompleted.responseId,
+	};
+}
+
+async function closeSessionConnection(session: CachedSession): Promise<void> {
+	if (session.connection) {
+		await session.connection.close();
+		session.connection = null;
+	}
+}
+
+async function resetSession(session: CachedSession, disable = false): Promise<void> {
+	await closeSessionConnection(session);
+	session.lastRequest = null;
+	session.lastCompleted = null;
+	session.turnState = null;
+	session.disabled = disable;
+}
+
+class ReusableWebSocketConnection {
+	private ws: WebSocket | null = null;
+	private queue: PendingFrame[] = [];
+	private waiters: Array<(frame: PendingFrame) => void> = [];
+	private open = false;
+
+	constructor(
+		private readonly url: string,
+		private readonly headers: Record<string, string>,
+		private readonly proxy?: string,
+		private readonly onUpgrade?: (response: IncomingMessage) => void,
+	) {}
+
+	async connect(): Promise<void> {
+		const { default: WebSocketImpl } = await import("ws");
+		await new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const wsOptions: { headers: Record<string, string>; agent?: boolean | HttpAgent } = {
+				headers: this.headers,
+			};
+			if (this.proxy) {
+				wsOptions.agent = new HttpsProxyAgent(this.proxy);
+			}
+			const ws = new WebSocketImpl(this.url, wsOptions);
+			this.ws = ws;
+
+			const finishReject = (error: Error) => {
+				if (settled) return;
+				settled = true;
+				reject(error);
+			};
+			const finishResolve = () => {
+				if (settled) return;
+				settled = true;
+				resolve();
+			};
+
+			ws.once("upgrade", (response) => {
+				this.onUpgrade?.(response);
+			});
+			ws.once("unexpected-response", (_request, response) => {
+				const status = response.statusCode;
+				const message = `Codex WebSocket upgrade failed with status ${status ?? "unknown"}`;
+				finishReject(
+					shouldDisableWebSocketForStatus(status)
+						? new CodexWebSocketFallbackError(message, status)
+						: new Error(message),
+				);
+			});
+			ws.once("open", () => {
+				this.open = true;
+				finishResolve();
+			});
+			ws.once("error", (error) => {
+				if (!settled) {
+					const match = error.message.match(/Unexpected server response:\s*(\d+)/);
+					const status = match?.[1] ? Number.parseInt(match[1], 10) : undefined;
+					finishReject(
+						shouldDisableWebSocketForStatus(status)
+							? new CodexWebSocketFallbackError(error.message, status)
+							: error,
+					);
+					return;
+				}
+				this.push({ type: "error", error });
+			});
+			ws.on("message", (data) => {
+				const text = typeof data === "string" ? data : data.toString();
+				this.push({ type: "message", text });
+			});
+			ws.on("close", (code, reason) => {
+				this.open = false;
+				this.push({ type: "close", code, reason: reason.toString() });
+			});
+		});
+	}
+
+	isOpen(): boolean {
+		return !!this.ws && this.open;
+	}
+
+	isClosed(): boolean {
+		return (
+			!this.ws || this.ws.readyState === this.ws.CLOSED || this.ws.readyState === this.ws.CLOSING
+		);
+	}
+
+	async send(text: string): Promise<void> {
+		if (!this.ws || !this.open) {
+			throw new Error("Codex WebSocket connection is not open");
+		}
+		await new Promise<void>((resolve, reject) => {
+			this.ws?.send(text, (error) => {
+				if (error) reject(error);
+				else resolve();
+			});
+		});
+	}
+
+	async nextFrame(timeoutMs: number, signal: AbortSignal): Promise<PendingFrame> {
+		if (this.queue.length > 0) {
+			return this.queue.shift() as PendingFrame;
+		}
+		return new Promise<PendingFrame>((resolve, reject) => {
+			const onAbort = () => {
+				cleanup();
+				reject(new Error("Codex WebSocket request aborted"));
+			};
+			const timer = setTimeout(() => {
+				cleanup();
+				reject(new Error("Codex WebSocket idle timeout waiting for response event"));
+			}, timeoutMs);
+			const resolver = (frame: PendingFrame) => {
+				cleanup();
+				resolve(frame);
+			};
+			const cleanup = () => {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", onAbort);
+				const index = this.waiters.indexOf(resolver);
+				if (index >= 0) this.waiters.splice(index, 1);
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			this.waiters.push(resolver);
+		});
+	}
+
+	async close(): Promise<void> {
+		if (!this.ws) return;
+		const ws = this.ws;
+		this.ws = null;
+		if (ws.readyState === ws.CLOSED) return;
+		await new Promise<void>((resolve) => {
+			const done = () => resolve();
+			ws.once("close", done);
+			try {
+				ws.close();
+			} catch {
+				resolve();
+			}
+			setTimeout(resolve, 1000);
+		});
+	}
+
+	private push(frame: PendingFrame): void {
+		const waiter = this.waiters.shift();
+		if (waiter) {
+			waiter(frame);
+			return;
+		}
+		this.queue.push(frame);
+	}
+}
+
+async function ensureConnection(
+	session: CachedSession,
+	options: StreamCodexResponsesWebSocketOptions,
+): Promise<ReusableWebSocketConnection> {
+	if (session.connection?.isOpen()) {
+		return session.connection;
+	}
+	await closeSessionConnection(session);
+	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
+	const connection = new ReusableWebSocketConnection(
+		url,
+		buildHandshakeHeaders(options, session),
+		options.proxy,
+		(response) => {
+			const turnState = response.headers[TURN_STATE_HEADER];
+			if (typeof turnState === "string" && turnState) {
+				session.turnState = turnState;
+			}
+		},
+	);
+	await connection.connect();
+	session.connection = connection;
+	logger.info("Codex Responses WebSocket connected", {
+		sessionKey: options.sessionKey,
+		credentialId: options.credentialId,
+		model: options.model,
+		url,
+	});
+	return connection;
+}
+
+export async function* streamCodexResponsesWebSocket(
+	options: StreamCodexResponsesWebSocketOptions,
+): AsyncGenerator<ParsedStreamEvent> {
+	const cacheKey = buildSessionCacheKey(options);
+	const session = getOrCreateSession(cacheKey);
+	if (session.disabled) {
+		throw new CodexWebSocketFallbackError("Codex Responses WebSocket is disabled for this session");
+	}
+	if (session.busy) {
+		throw new Error("Codex Responses WebSocket session is already in use");
+	}
+
+	touchSession(session);
+	session.busy = true;
+	const request = cloneJson(options.request);
+	let connection: ReusableWebSocketConnection | null = null;
+	let completed = false;
+	let responseId = "";
+	const itemsAdded: unknown[] = [];
+	const toolAccum = new Map<number, ResponsesToolAccum>();
+	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
+
+	try {
+		connection = await ensureConnection(session, options);
+		const websocketRequest = buildCodexResponsesWebSocketRequest(
+			request,
+			session.lastRequest,
+			session.lastCompleted,
+		);
+		await connection.send(JSON.stringify(websocketRequest));
+
+		while (true) {
+			const frame = await connection.nextFrame(CONNECTION_IDLE_TIMEOUT_MS, options.signal);
+			if (frame.type === "error") {
+				throw frame.error;
+			}
+			if (frame.type === "close") {
+				throw new Error(
+					`Codex WebSocket closed before response.completed (code: ${frame.code}, reason: ${frame.reason})`,
+				);
+			}
+
+			const wrappedError = parseWrappedError(frame.text);
+			if (wrappedError) {
+				const status = wrappedError.status ?? wrappedError.status_code;
+				const error = formatWrappedError(wrappedError);
+				if (shouldDisableWebSocketForStatus(status)) {
+					await resetSession(session, true);
+					throw new CodexWebSocketFallbackError(error.message, status);
+				}
+				throw error;
+			}
+
+			let chunk: ResponsesAPIChunk;
+			try {
+				chunk = JSON.parse(frame.text) as ResponsesAPIChunk;
+			} catch {
+				continue;
+			}
+
+			if (chunk.type === "response.created" && chunk.response?.id) {
+				responseId = String(chunk.response.id);
+			}
+			if (chunk.type === "response.output_item.done" && chunk.item) {
+				itemsAdded.push(cloneJson(chunk.item));
+			}
+
+			for (const event of parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum)) {
+				yield event;
+			}
+
+			if (chunk.type === "response.completed") {
+				completed = true;
+				session.lastRequest = cloneJson(request);
+				session.lastCompleted = { responseId, itemsAdded: cloneJson(itemsAdded) };
+				touchSession(session);
+				return;
+			}
+			if (chunk.type === "response.failed" || chunk.type === "response.incomplete") {
+				await resetSession(session, false);
+				return;
+			}
+		}
+	} catch (error) {
+		if (error instanceof CodexWebSocketFallbackError) {
+			throw error;
+		}
+		await resetSession(session, false);
+		throw error;
+	} finally {
+		session.busy = false;
+		touchSession(session);
+		if (!completed && connection?.isClosed()) {
+			session.connection = null;
+		}
+		const canDiscardSession =
+			!completed &&
+			!session.disabled &&
+			session.connection === null &&
+			session.lastRequest === null &&
+			session.lastCompleted === null &&
+			session.turnState === null;
+		if (canDiscardSession) {
+			sessionCache.delete(cacheKey);
+			stopSessionCleanupTimerIfIdle();
+		}
+	}
+}

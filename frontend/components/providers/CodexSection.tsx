@@ -11,6 +11,7 @@ import {
 	Progress,
 	SegmentedControl,
 	Stack,
+	Switch,
 	Table,
 	Text,
 	Textarea,
@@ -74,6 +75,8 @@ export const CodexSection = React.memo(function CodexSection({
 	const [globalProxyInitialized, setGlobalProxyInitialized] = useState(false);
 	const [defaultReasoningEffort, setDefaultReasoningEffort] = useState("");
 	const [defaultReasoningInitialized, setDefaultReasoningInitialized] = useState(false);
+	const [useWebSocket, setUseWebSocket] = useState(false);
+	const [useWebSocketInitialized, setUseWebSocketInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
@@ -135,7 +138,11 @@ export const CodexSection = React.memo(function CodexSection({
 			setDefaultReasoningEffort(status.defaultReasoningEffort ?? "");
 			setDefaultReasoningInitialized(true);
 		}
-	}, [status, globalProxyInitialized, defaultReasoningInitialized]);
+		if (!useWebSocketInitialized) {
+			setUseWebSocket(status.useWebSocket ?? false);
+			setUseWebSocketInitialized(true);
+		}
+	}, [status, globalProxyInitialized, defaultReasoningInitialized, useWebSocketInitialized]);
 
 	// Auto-detect browser auth failure from server-side error
 	useEffect(() => {
@@ -202,6 +209,13 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			notifications.show({ message: t("codexDefaultReasoningUpdated"), color: "green" });
+		},
+	});
+	const useWebSocketMut = useMutation({
+		mutationFn: (useWebSocket: boolean) => api.codexSetUseWebSocket(useWebSocket),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			notifications.show({ message: t("codexWebSocketUpdated"), color: "green" });
 		},
 	});
 	const importMut = useMutation({
@@ -547,6 +561,33 @@ export const CodexSection = React.memo(function CodexSection({
 						size="xs"
 						onClick={handleSaveDefaultReasoningEffort}
 						loading={defaultReasoningMut.isPending}
+					>
+						{t("codexSave")}
+					</Button>
+				</Group>
+				<Group align="flex-end">
+					<Stack gap={4} style={{ flex: 1 }}>
+						<Group gap="xs">
+							<Text size="xs" fw={500}>
+								{t("codexUseWebSocket")}
+							</Text>
+							<Badge size="xs" color="orange" variant="light">
+								{t("codexExperimental")}
+							</Badge>
+						</Group>
+						<Text size="xs" c="dimmed">
+							{t("codexUseWebSocketDesc")}
+						</Text>
+					</Stack>
+					<Switch
+						size="sm"
+						checked={useWebSocket}
+						onChange={(e) => setUseWebSocket(e.currentTarget.checked)}
+					/>
+					<Button
+						size="xs"
+						onClick={() => useWebSocketMut.mutate(useWebSocket)}
+						loading={useWebSocketMut.isPending}
 					>
 						{t("codexSave")}
 					</Button>

@@ -342,6 +342,8 @@ export interface NarraForkSettings {
 		loadBalancingMode?: "priority" | "balanced";
 		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+		/** Use WebSocket instead of HTTP for Codex connections (experimental). */
+		useWebSocket?: boolean;
 	};
 	/** Built-in routines configuration. */
 	routines: {
@@ -439,6 +441,7 @@ const DEFAULTS: NarraForkSettings = {
 	codex: {
 		// codex-reversed 显示官方默认 reasoning level 为 medium，避免默认 high 过快消耗额度。
 		defaultReasoningEffort: "medium",
+		useWebSocket: false,
 	},
 	update: {
 		serverUrl: "https://narrafork-update.b.domexie.cn",
@@ -742,6 +745,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "Codex 模型默认推理努力级别。越高推理越深入但消耗更多 token。",
 		type: "string",
 		valid: '"none" | "low" | "medium" | "high" | "xhigh"',
+	},
+	"codex.useWebSocket": {
+		desc: "使用 Responses WebSocket 而非 HTTP 连接到 Codex（实验性功能，失败时会自动回退 HTTP）。",
+		type: "boolean",
 	},
 
 	// ── update ──────────────────────────────────────────────────────────

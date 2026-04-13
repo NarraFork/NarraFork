@@ -66,7 +66,6 @@ function ProjectDetailPage() {
 				id: projectId,
 				title: project.name,
 				subtitle: project.description || undefined,
-				updateOnly: true,
 			});
 		}
 	}, [projectId, project]);
