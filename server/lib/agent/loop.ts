@@ -31,6 +31,36 @@ import {
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
+function dedupeToolUsesInPlace(
+	toolUses: AgentToolUse[],
+	provider: string,
+	model: string,
+): AgentToolUse[] {
+	if (toolUses.length < 2) return toolUses;
+	const seen = new Set<string>();
+	const deduped: AgentToolUse[] = [];
+	const duplicateIds: string[] = [];
+	for (const tu of toolUses) {
+		if (seen.has(tu.toolUseId)) {
+			duplicateIds.push(tu.toolUseId);
+			continue;
+		}
+		seen.add(tu.toolUseId);
+		deduped.push(tu);
+	}
+	if (duplicateIds.length > 0) {
+		logger.error("Deduplicated repeated tool calls in a single turn", {
+			provider,
+			model,
+			duplicateCount: duplicateIds.length,
+			toolUseIds: [...new Set(duplicateIds)].slice(0, 20),
+		});
+		toolUses.length = 0;
+		toolUses.push(...deduped);
+	}
+	return toolUses;
+}
+
 /** Abort-aware sleep that resolves early when the signal fires. */
 function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 	return new Promise<void>((resolve) => {
@@ -1253,6 +1283,10 @@ export async function* agentLoop(
 			break;
 		} // end for (;;) retry loop
 
+		// Final safety net: if a provider/parser accidentally surfaced the same toolUseId
+		// multiple times in one turn, collapse them before any drain/execution logic below.
+		dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
+
 		// ── Estimate token usage when provider doesn't report it ──
 		// For these cases, we estimate based on text length to provide usage statistics.
 		if (!requestUsage) {
@@ -1274,6 +1308,7 @@ export async function* agentLoop(
 		yield {
 			type: "api_request_end",
 			requestId,
+			credentialId,
 			usage: requestUsage,
 			ttftMs: requestTtftMs,
 			durationMs: requestDurationMs,

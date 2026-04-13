@@ -20,6 +20,99 @@ export interface StorageScanResult {
 	scannedAt: number;
 }
 
+export interface DatabaseCleanupCandidateSummary {
+	count: number;
+	approxBytes: number;
+	blockedCount: number;
+	oldestAt: string | null;
+	retentionDays?: number;
+}
+
+export interface DatabaseStorageBreakdown {
+	mainBytes: number;
+	walBytes: number;
+	shmBytes: number;
+	cleanupCandidates: {
+		archivedSessions: DatabaseCleanupCandidateSummary;
+		staleSessions: DatabaseCleanupCandidateSummary;
+		apiRequestDumps: DatabaseCleanupCandidateSummary;
+	};
+}
+
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";
+
+export type DatabaseCleanupBlockedReasonCode =
+	| "chapterBound"
+	| "runningTerminal"
+	| "backgroundRunning"
+	| "nonArchived"
+	| "nonStaleStatus"
+	| "recentActivity";
+
+export type DatabaseCleanupWarningCode = "deletesUsageHistory";
+
+export interface DatabaseCleanupPreviewCounts {
+	sessions: number;
+	narrators: number;
+	descendantNarrators: number;
+	messages: number;
+	toolCalls: number;
+	apiRequests: number;
+	dumpsCleared: number;
+}
+
+export interface DatabaseCleanupNarratorSample {
+	type: "narrator";
+	id: string;
+	title: string | null;
+	status: string;
+	lastActivityAt: string;
+	messageCount: number;
+	descendantNarratorCount: number;
+	approxBytes: number;
+}
+
+export interface DatabaseCleanupApiRequestSample {
+	type: "apiRequest";
+	id: string;
+	narratorId: string | null;
+	narratorTitle: string | null;
+	chapterTitle: string | null;
+	createdAt: string;
+	approxBytes: number;
+}
+
+export interface DatabaseCleanupBlockedItem {
+	narratorId: string;
+	title: string | null;
+	lastActivityAt: string;
+	reasonCode: DatabaseCleanupBlockedReasonCode;
+	blockingNarratorId: string;
+	blockingTitle: string | null;
+	blockingStatus: string;
+}
+
+export interface DatabaseCleanupPreviewResult {
+	target: DatabaseCleanupTarget;
+	olderThanDays?: number;
+	approxBytes: number;
+	oldestAt: string | null;
+	counts: DatabaseCleanupPreviewCounts;
+	blockedCount: number;
+	warningCodes: DatabaseCleanupWarningCode[];
+	samples: Array<DatabaseCleanupNarratorSample | DatabaseCleanupApiRequestSample>;
+	blocked: DatabaseCleanupBlockedItem[];
+}
+
+export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewResult {
+	ok: true;
+	beforeBytes: number;
+	afterBytes: number;
+	freedBytes: number;
+	vacuumRan: boolean;
+	changed: boolean;
+}
+
 export interface RuntimeScanResult {
 	terminals: { running: number; exited: number; orphanSockets: number };
 	containers: { running: number; stopped: number; podmanAvailable: boolean };
@@ -2463,6 +2556,20 @@ export const api = {
 			success?: boolean;
 			output?: string;
 		}>("/storage/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
+	previewDatabaseCleanup: (data: {
+		target: DatabaseCleanupTarget;
+		olderThanDays?: number;
+		sampleLimit?: number;
+	}) =>
+		request<DatabaseCleanupPreviewResult>("/storage/database/preview", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	cleanupDatabase: (data: { target: DatabaseCleanupTarget; olderThanDays?: number }) =>
+		request<DatabaseCleanupExecutionResult>("/storage/database/cleanup", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 
 	// ── Runtime Resources ──
 	scanRuntime: () => request<RuntimeScanResult>("/runtime/scan"),

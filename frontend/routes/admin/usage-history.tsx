@@ -2,7 +2,17 @@ import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHisto
 import { UsageStatsCards } from "@frontend/components/usage-history/UsageStatsCards";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import type { UsageHistoryFilters } from "@frontend/types/usage-history";
-import { Button, Group, Pagination, Select, Stack, TextInput, Title } from "@mantine/core";
+import {
+	Autocomplete,
+	Button,
+	Group,
+	Pagination,
+	SimpleGrid,
+	Stack,
+	TextInput,
+	Title,
+} from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { IconFilter, IconRefresh } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
@@ -15,6 +25,7 @@ export const Route = createFileRoute("/admin/usage-history")({
 
 function UsageHistoryPage() {
 	const { t } = useTranslation("common");
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const [page, setPage] = useState(1);
 	const pageSize = 50;
 	const [filters, setFilters] = useState<UsageHistoryFilters>({});
@@ -36,10 +47,16 @@ function UsageHistoryPage() {
 		queryFn: () => usageHistoryApi.getStats(filters),
 	});
 
+	const { data: providersData } = useQuery({
+		queryKey: ["usage-history", "providers"],
+		queryFn: () => usageHistoryApi.listProviders(),
+	});
+
 	const applyFilters = () => {
 		setFilters({
-			...tempFilters,
-			startDate: startDate ? new Date(startDate).toISOString() : undefined,
+			provider: tempFilters.provider?.trim() || undefined,
+			model: tempFilters.model?.trim() || undefined,
+			startDate: startDate ? new Date(`${startDate}T00:00:00.000Z`).toISOString() : undefined,
 			endDate: endDate ? new Date(`${endDate}T23:59:59.999Z`).toISOString() : undefined,
 		});
 		setPage(1);
@@ -54,41 +71,69 @@ function UsageHistoryPage() {
 	};
 
 	return (
-		<div style={{ padding: "2rem", maxWidth: 1400, margin: "0 auto" }}>
-			<Stack gap="xl">
-				<Group justify="space-between">
-					<Title order={2}>{t("usageHistoryTitle")}</Title>
-					<Button
-						leftSection={<IconRefresh size={16} />}
-						variant="light"
-						onClick={() => {
-							refetchList();
-							refetchStats();
-						}}
-					>
-						{t("usageHistoryRefresh")}
-					</Button>
-				</Group>
+		<div
+			style={{
+				padding: isMobile ? "0.75rem" : "2rem",
+				maxWidth: 1400,
+				margin: "0 auto",
+			}}
+		>
+			<Stack gap={isMobile ? "md" : "xl"}>
+				{isMobile ? (
+					<Stack gap="xs">
+						<Title order={3}>{t("usageHistoryTitle")}</Title>
+						<Button
+							size="sm"
+							leftSection={<IconRefresh size={14} />}
+							variant="light"
+							fullWidth
+							onClick={() => {
+								refetchList();
+								refetchStats();
+							}}
+						>
+							{t("usageHistoryRefresh")}
+						</Button>
+					</Stack>
+				) : (
+					<Group justify="space-between">
+						<Title order={2}>{t("usageHistoryTitle")}</Title>
+						<Button
+							leftSection={<IconRefresh size={16} />}
+							variant="light"
+							onClick={() => {
+								refetchList();
+								refetchStats();
+							}}
+						>
+							{t("usageHistoryRefresh")}
+						</Button>
+					</Group>
+				)}
 
 				{stats ? <UsageStatsCards stats={stats} /> : null}
 
-				<Stack gap="md">
-					<Group align="end">
-						<Select
+				<Stack gap={isMobile ? "xs" : "md"}>
+					<SimpleGrid
+						cols={{ base: 1, sm: 2, lg: 4 }}
+						spacing={isMobile ? "xs" : "md"}
+						verticalSpacing={isMobile ? "xs" : "md"}
+					>
+						<Autocomplete
+							size={isMobile ? "xs" : "sm"}
 							label={t("usageHistoryProvider")}
-							placeholder={t("usageHistoryAllProviders")}
-							clearable
-							data={[
-								{ value: "anthropic", label: "Anthropic" },
-								{ value: "openai", label: "OpenAI" },
-								{ value: "codex", label: "Codex" },
-							]}
-							value={tempFilters.provider ?? null}
+							placeholder={t("usageHistoryProviderPlaceholder")}
+							data={providersData?.providers ?? []}
+							value={tempFilters.provider ?? ""}
 							onChange={(value) =>
-								setTempFilters((prev) => ({ ...prev, provider: value || undefined }))
+								setTempFilters((prev) => ({
+									...prev,
+									provider: value || undefined,
+								}))
 							}
 						/>
 						<TextInput
+							size={isMobile ? "xs" : "sm"}
 							label={t("usageHistoryModel")}
 							placeholder={t("usageHistoryModelPlaceholder")}
 							value={tempFilters.model ?? ""}
@@ -96,30 +141,31 @@ function UsageHistoryPage() {
 								setTempFilters((prev) => ({ ...prev, model: e.currentTarget.value || undefined }))
 							}
 						/>
-						<input
+						<TextInput
+							size={isMobile ? "xs" : "sm"}
+							label={t("usageHistoryStartDate")}
 							type="date"
 							value={startDate}
 							onChange={(e) => setStartDate(e.currentTarget.value)}
-							style={{
-								padding: 8,
-								borderRadius: 8,
-								border: "1px solid var(--mantine-color-default-border)",
-							}}
 						/>
-						<input
+						<TextInput
+							size={isMobile ? "xs" : "sm"}
+							label={t("usageHistoryEndDate")}
 							type="date"
 							value={endDate}
 							onChange={(e) => setEndDate(e.currentTarget.value)}
-							style={{
-								padding: 8,
-								borderRadius: 8,
-								border: "1px solid var(--mantine-color-default-border)",
-							}}
 						/>
-						<Button leftSection={<IconFilter size={16} />} onClick={applyFilters}>
+					</SimpleGrid>
+
+					<Group grow={isMobile} wrap="wrap" gap={isMobile ? "xs" : "sm"}>
+						<Button
+							size={isMobile ? "xs" : "sm"}
+							leftSection={<IconFilter size={isMobile ? 14 : 16} />}
+							onClick={applyFilters}
+						>
 							{t("usageHistoryApplyFilters")}
 						</Button>
-						<Button variant="light" onClick={resetFilters}>
+						<Button size={isMobile ? "xs" : "sm"} variant="light" onClick={resetFilters}>
 							{t("usageHistoryReset")}
 						</Button>
 					</Group>
@@ -129,7 +175,14 @@ function UsageHistoryPage() {
 
 				{listData && listData.totalPages > 1 ? (
 					<Group justify="center">
-						<Pagination value={page} onChange={setPage} total={listData.totalPages} />
+						<Pagination
+							value={page}
+							onChange={setPage}
+							total={listData.totalPages}
+							siblings={isMobile ? 0 : 1}
+							boundaries={isMobile ? 0 : 1}
+							size={isMobile ? "sm" : "md"}
+						/>
 					</Group>
 				) : null}
 			</Stack>

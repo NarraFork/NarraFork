@@ -59,9 +59,21 @@ export class CodexProvider implements ProviderAdapter {
 	private context: CallContext | null = null;
 	private contextSessionKey: string | undefined;
 	private useWebSocket: boolean;
+	/** Cached dummy provider for synchronous operations (formatToolResult, pushUserTurn, etc.) */
+	private dummyProvider: OpenAIProvider;
 
 	constructor(options?: CodexProviderOptions) {
-		this.useWebSocket = options?.useWebSocket ?? false;
+		this.useWebSocket = options?.useWebSocket ?? true;
+		// Create dummy provider once and reuse it
+		this.dummyProvider = new OpenAIProvider({
+			id: "codex",
+			name: "Codex",
+			prefix: "codex",
+			apiKey: "",
+			baseUrl: CODEX_BASE_URL,
+			defaultModel: "gpt-5.3-codex",
+			apiMode: "codex",
+		});
 	}
 
 	/** Get or acquire a valid credential context. */
@@ -373,8 +385,22 @@ export class CodexProvider implements ProviderAdapter {
 			type: string;
 			call_id: string;
 			output: string;
+			_images?: Array<{ format: string; base64: string }>;
 		}>) {
-			messages.push(tr as unknown as OAIMessage);
+			messages.push({
+				type: "function_call_output",
+				call_id: tr.call_id,
+				output: tr.output,
+			} as unknown as OAIMessage);
+			if (tr._images?.length) {
+				messages.push({
+					role: "user",
+					content: tr._images.map((img) => ({
+						type: "input_image",
+						image_url: `data:image/${img.format};base64,${img.base64}`,
+					})),
+				} as unknown as OAIMessage);
+			}
 		}
 		if (params.content && params.content !== ".") {
 			if (params.images?.length) {
@@ -448,30 +474,11 @@ export class CodexProvider implements ProviderAdapter {
 		isError: boolean,
 		images?: Array<{ format: string; base64: string }>,
 	): unknown {
-		const dummy = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "",
-			baseUrl: CODEX_BASE_URL,
-			defaultModel: "gpt-5.3-codex",
-			apiMode: "codex",
-		});
-		return dummy.formatToolResult(toolUseId, output, isError, images);
+		return this.dummyProvider.formatToolResult(toolUseId, output, isError, images);
 	}
 
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
-		// Use a dummy provider for this synchronous operation
-		const dummy = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "",
-			baseUrl: CODEX_BASE_URL,
-			defaultModel: "gpt-5.3-codex",
-			apiMode: "codex",
-		});
-		dummy.pushUserTurn(history, content, model, toolResults);
+		this.dummyProvider.pushUserTurn(history, content, model, toolResults);
 	}
 
 	pushAssistantTurn(
@@ -490,16 +497,7 @@ export class CodexProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 	): void {
-		const dummy = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "",
-			baseUrl: CODEX_BASE_URL,
-			defaultModel: "gpt-5.3-codex",
-			apiMode: "codex",
-		});
-		dummy.pushAssistantTurn(history, text, toolUses, reasoningBlocks, webSearches);
+		this.dummyProvider.pushAssistantTurn(history, text, toolUses, reasoningBlocks, webSearches);
 	}
 
 	async generate(text: string, model: string): Promise<string> {

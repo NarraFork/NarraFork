@@ -1,6 +1,7 @@
 import type {
 	UsageHistoryFilters,
 	UsageHistoryListResponse,
+	UsageHistoryProvidersResponse,
 	UsageHistoryRecord,
 	UsageHistoryStats,
 } from "@frontend/types/usage-history";
@@ -55,6 +56,13 @@ export const usageHistoryApi = {
 		if (filters.endDate) params.append("endDate", filters.endDate);
 
 		return fetchJson(`/api/usage-history/stats?${params.toString()}`);
+	},
+
+	/**
+	 * 获取历史中出现过的 provider 列表
+	 */
+	async listProviders(): Promise<UsageHistoryProvidersResponse> {
+		return fetchJson("/api/usage-history/providers");
 	},
 
 	/**

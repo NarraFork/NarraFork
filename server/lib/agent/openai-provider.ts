@@ -3,6 +3,7 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { OpenAIProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
+import { getImagePath, imageToBase64 } from "../uploads";
 import { getHttpUserAgent } from "../user-agent";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
@@ -148,6 +149,18 @@ export type OAIContentPart =
 	| { type: "input_text"; text: string }
 	| { type: "input_image"; image_url: string }
 	| { type: "output_text"; text: string };
+
+interface ResponsesToolImage {
+	format: string;
+	base64: string;
+}
+
+interface ResponsesFunctionCallOutputMessage {
+	type: "function_call_output";
+	call_id: string;
+	output: string;
+	_images?: ResponsesToolImage[];
+}
 
 export interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
@@ -304,10 +317,10 @@ export class OpenAIProvider implements ProviderAdapter {
 	async buildHistory(
 		dbMessages: DbMessage[],
 		_model: string,
-		_narratorId?: string,
+		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
 		if (this.responsesFormat) {
-			return buildResponsesHistory(dbMessages);
+			return await buildResponsesHistory(dbMessages, narratorId);
 		}
 		const result = buildOAIHistory(dbMessages);
 		// Chat Completions path: strip _reasoningBlocks from assistant messages
@@ -354,18 +367,14 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		// Append tool results
 		if (this.responsesFormat) {
-			for (const tr of params.toolResults as Array<{
-				type: string;
-				call_id: string;
-				output: string;
-			}>) {
+			for (const tr of params.toolResults as ResponsesFunctionCallOutputMessage[]) {
 				logger.debug("OpenAI appending Responses API tool result", {
 					type: tr.type,
 					call_id: tr.call_id,
 					outputLength: tr.output?.length,
+					hasImages: Array.isArray(tr._images) && tr._images.length > 0,
 				});
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				messages.push(tr as any);
+				messages.push(...expandResponsesToolResultMessage(tr));
 			}
 		} else {
 			for (const tr of params.toolResults as OAIToolResult[]) {
@@ -595,15 +604,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		toolUseId: string,
 		output: string,
 		_isError: boolean,
-		_images?: Array<{ format: string; base64: string }>,
+		images?: Array<{ format: string; base64: string }>,
 	): unknown {
-		logger.debug("OpenAI formatToolResult", {
-			apiMode: this.apiMode,
-			toolUseId,
-			outputLength: output.length,
-		});
+		// Removed debug log to prevent log spam in high-frequency scenarios
 		if (this.responsesFormat) {
-			return { type: "function_call_output", call_id: toolUseId, output };
+			return buildResponsesToolResultMessage(toolUseId, output, images);
 		}
 		return { tool_call_id: toolUseId, content: output } satisfies OAIToolResult;
 	}
@@ -611,9 +616,8 @@ export class OpenAIProvider implements ProviderAdapter {
 	pushUserTurn(history: unknown[], content: string, _model: string, toolResults: unknown[]): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
-			for (const tr of toolResults as Array<{ type: string; call_id: string; output: string }>) {
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shape
-				h.push(tr as any);
+			for (const tr of toolResults as ResponsesFunctionCallOutputMessage[]) {
+				h.push(...expandResponsesToolResultMessage(tr));
 			}
 			if (content && content !== ".") {
 				h.push(buildResponsesUserMessage(content));
@@ -1238,6 +1242,23 @@ export function parseResponsesAPIEvent(
 		const callId = chunk.item.call_id;
 		const name = chunk.item.name;
 		if (idx != null && callId && name) {
+			const existing = toolAccum.get(idx);
+			if (existing) {
+				if (existing.callId === callId) {
+					logger.warn("Ignoring duplicate Responses API tool call start event", {
+						outputIndex: idx,
+						callId,
+						toolName: name,
+					});
+					return results;
+				}
+				logger.warn("Responses API output_index reused for different tool call", {
+					outputIndex: idx,
+					previousCallId: existing.callId,
+					callId,
+					toolName: name,
+				});
+			}
 			toolAccum.set(idx, { callId, name, args: "", emitted: false });
 			logger.debug("Responses API tool call started", { outputIndex: idx, callId, toolName: name });
 			results.push({
@@ -1727,6 +1748,101 @@ function buildResponsesUserMessage(content: string): OAIMessage {
 	return { role: "user", content: [{ type: "input_text", text: content }] } as OAIMessage;
 }
 
+function buildResponsesToolResultMessage(
+	toolUseId: string,
+	output: string,
+	images?: ResponsesToolImage[],
+): ResponsesFunctionCallOutputMessage {
+	return {
+		type: "function_call_output",
+		call_id: toolUseId,
+		output,
+		...(images?.length ? { _images: images } : {}),
+	};
+}
+
+function expandResponsesToolResultMessage(
+	message: ResponsesFunctionCallOutputMessage,
+): OAIMessage[] {
+	const items: OAIMessage[] = [
+		{
+			type: "function_call_output",
+			call_id: message.call_id,
+			output: message.output,
+		} as unknown as OAIMessage,
+	];
+	if (message._images?.length) {
+		items.push({
+			role: "user",
+			content: message._images.map((img) => ({
+				type: "input_image",
+				image_url: `data:image/${img.format};base64,${img.base64}`,
+			})),
+		} as unknown as OAIMessage);
+	}
+	return items;
+}
+
+async function buildResponsesUserMessageFromDbMessage(
+	msg: DbMessage,
+	narratorId?: string,
+): Promise<OAIMessage | null> {
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const content: OAIContentPart[] = [];
+	let sawTextBlock = false;
+	for (const block of blocks as Array<Record<string, unknown>>) {
+		if (block.type === "text" && typeof block.text === "string") {
+			sawTextBlock = true;
+			if (block.text.length > 0) {
+				content.push({ type: "input_text", text: block.text });
+			}
+			continue;
+		}
+		if (block.type === "image" && typeof block.imageId === "string" && narratorId) {
+			const filePath = getImagePath(narratorId, block.imageId);
+			if (!filePath) {
+				logger.warn("Responses history image missing on disk; skipping replay", {
+					narratorId,
+					messageId: msg.id,
+					imageId: block.imageId,
+				});
+				continue;
+			}
+			try {
+				const result = await imageToBase64(filePath);
+				const mimeToFormat: Record<string, string> = {
+					"image/png": "png",
+					"image/jpeg": "jpeg",
+					"image/gif": "gif",
+					"image/webp": "webp",
+				};
+				const effectiveMime =
+					result.detectedMediaType ??
+					(typeof block.mediaType === "string" ? block.mediaType : "image/png");
+				content.push({
+					type: "input_image",
+					image_url: `data:image/${mimeToFormat[effectiveMime] ?? "png"};base64,${result.base64}`,
+				});
+			} catch (error) {
+				logger.warn("Failed to rebuild Responses history image; skipping replay", {
+					narratorId,
+					messageId: msg.id,
+					imageId: block.imageId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+	if (content.length > 0) {
+		return { role: "user", content } as unknown as OAIMessage;
+	}
+	const fallbackText = msg.contentText || "";
+	if (fallbackText && !sawTextBlock) {
+		return buildResponsesUserMessage(fallbackText);
+	}
+	return null;
+}
+
 function buildResponsesPreludeItems(
 	reasoningBlocks?: ResponsesReasoningBlock[],
 	webSearchBlocks?: ResponsesWebSearchBlock[],
@@ -1821,10 +1937,13 @@ function compareOptionalOutputIndex(
 	return aSourceIndex - bSourceIndex;
 }
 
-function buildResponsesHistory(dbMessages: DbMessage[]): {
+async function buildResponsesHistory(
+	dbMessages: DbMessage[],
+	narratorId?: string,
+): Promise<{
 	history: OAIMessage[];
-	trailingToolResults: OAIMessage[];
-} {
+	trailingToolResults: ResponsesFunctionCallOutputMessage[];
+}> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
 	const topLevel = dbMessages.filter(
@@ -1836,11 +1955,11 @@ function buildResponsesHistory(dbMessages: DbMessage[]): {
 	}
 
 	const history: OAIMessage[] = [];
-	let pendingToolResults: OAIMessage[] = [];
+	let pendingToolResults: ResponsesFunctionCallOutputMessage[] = [];
 
 	for (const msg of topLevel) {
 		if (msg.role === "assistant") {
-			history.push(...pendingToolResults);
+			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -1902,21 +2021,17 @@ function buildResponsesHistory(dbMessages: DbMessage[]): {
 								: tc.outputJson != null
 									? JSON.stringify(tc.outputJson)
 									: "";
-						pendingToolResults.push({
-							type: "function_call_output",
-							call_id: tc.toolUseId,
-							output: outputText,
-						} as unknown as OAIMessage);
+						pendingToolResults.push(buildResponsesToolResultMessage(tc.toolUseId, outputText));
 					}
 				}
 			}
 		} else if (msg.role === "user") {
-			history.push(...pendingToolResults);
+			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
-			const text = msg.contentText || "";
-			if (text) history.push(buildResponsesUserMessage(text));
+			const userMessage = await buildResponsesUserMessageFromDbMessage(msg, narratorId);
+			if (userMessage) history.push(userMessage);
 		} else if (msg.role === "sys") {
-			history.push(...pendingToolResults);
+			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content

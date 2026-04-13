@@ -10,7 +10,7 @@ const settingsState: {
 	};
 } = {
 	codex: {
-		useWebSocket: false,
+		useWebSocket: undefined,
 		defaultReasoningEffort: undefined,
 	},
 };
@@ -86,12 +86,19 @@ app.onError((err, c) => {
 });
 
 beforeEach(() => {
-	settingsState.codex.useWebSocket = false;
+	settingsState.codex.useWebSocket = undefined;
 	settingsState.codex.defaultReasoningEffort = undefined;
 	saveSettingsCalls = 0;
 });
 
 describe("codex routes validation", () => {
+	it("defaults websocket mode to enabled when unset", async () => {
+		const res = await app.request("/status");
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toMatchObject({ useWebSocket: true });
+	});
+
 	it("accepts boolean websocket settings and persists them", async () => {
 		const res = await app.request("/use-websocket", {
 			method: "POST",
@@ -114,7 +121,7 @@ describe("codex routes validation", () => {
 
 		expect(res.status).toBe(400);
 		expect(await res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
-		expect(settingsState.codex.useWebSocket).toBe(false);
+		expect(settingsState.codex.useWebSocket).toBeUndefined();
 		expect(saveSettingsCalls).toBe(0);
 	});
 

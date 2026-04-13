@@ -1324,7 +1324,7 @@ export async function processEvent(
 					narratorId,
 					messageId: null, // Will be updated later when message is created
 					provider: requestInfo.provider,
-					credentialId: requestInfo.credentialId ?? null,
+					credentialId: event.credentialId ?? requestInfo.credentialId ?? null,
 					model: requestInfo.model,
 					inputTokens: usageData?.inputTokens ?? 0,
 					outputTokens: usageData?.outputTokens ?? 0,

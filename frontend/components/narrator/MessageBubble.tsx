@@ -595,18 +595,20 @@ function ReasoningBlock({
 					<ThemeIcon size={16} variant="light" color="grape" radius="sm">
 						<IconBrain size={10} />
 					</ThemeIcon>
-					<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
-						{t("reasoning")}
-					</Text>
+				<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
+					{t("reasoning")}
+				</Text>
+				{!hasEncryptedReasoning && (
 					<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
 						{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
 					</Text>
-					{!opened && (
-						<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
-							— {displayText.slice(0, 80)}
-							{displayText.length > 80 ? "…" : ""}
-						</Text>
-					)}
+				)}
+				{!opened && (
+					<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
+						— {displayText.slice(0, 80)}
+						{displayText.length > 80 ? "…" : ""}
+					</Text>
+				)}
 				</Group>
 				{/*
 					Initial mount with opened=true: render Collapse directly to avoid

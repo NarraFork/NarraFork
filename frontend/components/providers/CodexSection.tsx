@@ -75,7 +75,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const [globalProxyInitialized, setGlobalProxyInitialized] = useState(false);
 	const [defaultReasoningEffort, setDefaultReasoningEffort] = useState("");
 	const [defaultReasoningInitialized, setDefaultReasoningInitialized] = useState(false);
-	const [useWebSocket, setUseWebSocket] = useState(false);
+	const [useWebSocket, setUseWebSocket] = useState(true);
 	const [useWebSocketInitialized, setUseWebSocketInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
@@ -139,7 +139,7 @@ export const CodexSection = React.memo(function CodexSection({
 			setDefaultReasoningInitialized(true);
 		}
 		if (!useWebSocketInitialized) {
-			setUseWebSocket(status.useWebSocket ?? false);
+			setUseWebSocket(status.useWebSocket ?? true);
 			setUseWebSocketInitialized(true);
 		}
 	}, [status, globalProxyInitialized, defaultReasoningInitialized, useWebSocketInitialized]);

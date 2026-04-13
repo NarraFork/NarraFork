@@ -77,3 +77,7 @@ export interface UsageHistoryListResponse {
 	pageSize: number;
 	totalPages: number;
 }
+
+export interface UsageHistoryProvidersResponse {
+	providers: string[];
+}

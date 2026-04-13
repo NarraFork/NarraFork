@@ -66,15 +66,15 @@ export class UsageHistoryService {
 		if (!provider || !credentialId) return null;
 
 		try {
-				if (!snapshot) return null;
+				if (!snapshot) return credentialId;
 				const cred = snapshot.entries.find((c) => c.id === credentialId);
-				return cred?.displayName || cred?.email || null;
+				return cred?.displayName || cred?.email || credentialId;
 			}
 			if (provider === "codex") {
 				const manager = getCodexManager();
 				const snapshot = manager.snapshot();
 				const cred = snapshot.entries.find((c) => c.id === credentialId);
-				return cred?.displayName || cred?.email || null;
+				return cred?.displayName || cred?.email || cred?.accountId || credentialId;
 			}
 			}
 			// Anthropic and OpenAI don't have credential management
@@ -82,7 +82,7 @@ export class UsageHistoryService {
 			// Ignore errors from snapshot calls (e.g., plugin not loaded)
 		}
 
-		return null;
+		return credentialId;
 	}
 
 	private parseRawDump(rawDumpJson: string | null): unknown | null {
@@ -92,6 +92,17 @@ export class UsageHistoryService {
 		} catch {
 			return { invalidJson: true, rawText: rawDumpJson };
 		}
+	}
+
+	async listProviders(): Promise<string[]> {
+		const rows = await db
+			.select({ provider: apiRequests.provider })
+			.from(apiRequests)
+			.where(sql`${apiRequests.provider} is not null and trim(${apiRequests.provider}) <> ''`)
+			.groupBy(apiRequests.provider)
+			.orderBy(sql`lower(${apiRequests.provider}) asc`);
+
+		return rows.flatMap((row) => (row.provider ? [row.provider] : []));
 	}
 
 	async listUsageHistory(
@@ -260,12 +271,14 @@ export class UsageHistoryService {
 
 	private buildWhereConditions(filters: UsageHistoryFilters) {
 		const conditions = [];
+		const provider = filters.provider?.trim();
+		const model = filters.model?.trim();
 
 		if (filters.narratorId) conditions.push(eq(apiRequests.narratorId, filters.narratorId));
 		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId));
 		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId));
-		if (filters.provider) conditions.push(eq(apiRequests.provider, filters.provider));
-		if (filters.model) conditions.push(like(apiRequests.model, `%${filters.model}%`));
+		if (provider) conditions.push(eq(apiRequests.provider, provider));
+		if (model) conditions.push(like(apiRequests.model, `%${model}%`));
 		if (filters.startDate) conditions.push(gte(apiRequests.createdAt, filters.startDate));
 		if (filters.endDate) conditions.push(lte(apiRequests.createdAt, filters.endDate));
 

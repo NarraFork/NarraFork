@@ -34,7 +34,7 @@ codexRoutes.get("/status", (c) => {
 		globalProxy: settings.codex?.proxy,
 		loadBalancingMode: mode ?? snapshot.loadBalancingMode,
 		defaultReasoningEffort: settings.codex?.defaultReasoningEffort,
-		useWebSocket: settings.codex?.useWebSocket ?? false,
+		useWebSocket: settings.codex?.useWebSocket ?? true,
 	});
 });
 
@@ -340,10 +340,10 @@ codexRoutes.post("/use-websocket", async (c) => {
 	}
 
 	settings.codex = settings.codex || {};
-	settings.codex.useWebSocket = parsed.data.useWebSocket ?? false;
+	settings.codex.useWebSocket = parsed.data.useWebSocket ?? true;
 	saveSettings(settings);
 
-	return c.json({ ok: true, useWebSocket: settings.codex.useWebSocket ?? false });
+	return c.json({ ok: true, useWebSocket: settings.codex.useWebSocket ?? true });
 });
 
 /**

@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import type { OpenAIProviderConfig } from "../../settings";
 import { OpenAIProvider } from "../openai-provider";
 import type { DbMessage } from "../provider";
@@ -13,10 +16,44 @@ const TEST_PROVIDER: OpenAIProviderConfig = {
 	apiMode: "responses",
 };
 
+const TEST_UPLOAD_ROOT = resolve(homedir(), ".narrafork", "uploads");
+const SAMPLE_PNG_BASE64 =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+const CLEANUP_DIRS = new Set<string>();
+
+function registerTestImage(narratorId: string, imageId: string, ext = ".png"): string {
+	const dir = resolve(TEST_UPLOAD_ROOT, narratorId);
+	mkdirSync(dir, { recursive: true });
+	const filePath = resolve(dir, `${imageId}${ext}`);
+	writeFileSync(filePath, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
+	CLEANUP_DIRS.add(dir);
+	return filePath;
+}
+
+afterEach(() => {
+	for (const dir of CLEANUP_DIRS) {
+		rmSync(dir, { recursive: true, force: true });
+	}
+	CLEANUP_DIRS.clear();
+});
+
 function makeAssistantMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 	return {
 		id: "msg-1",
 		role: "assistant",
+		contentJson: [],
+		contentText: null,
+		parentToolUseId: null,
+		messageUuid: null,
+		toolCalls: [],
+		...overrides,
+	};
+}
+
+function makeUserMessage(overrides: Partial<DbMessage> = {}): DbMessage {
+	return {
+		id: "user-1",
+		role: "user",
 		contentJson: [],
 		contentText: null,
 		parentToolUseId: null,
@@ -219,5 +256,51 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 
 		expect(pushedHistory).toEqual(rebuilt.history);
 		expect(pushedTrailing).toEqual(rebuilt.trailingToolResults);
+	});
+
+	test("buildHistory replays persisted user images as input_image items", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		registerTestImage("narrator-history", "img_hist");
+		const dbMessages: DbMessage[] = [
+			makeUserMessage({
+				id: "user-image",
+				contentJson: [
+					{
+						type: "image",
+						imageId: "img_hist",
+						filename: "sample.png",
+						mediaType: "image/png",
+					},
+					{ type: "text", text: "Describe this screenshot" },
+				],
+				contentText: "Describe this screenshot",
+			}),
+			makeAssistantMessage({
+				id: "assistant-after",
+				contentJson: [{ type: "text", text: "done" }],
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5", "narrator-history");
+		const historyJson = JSON.stringify(result.history);
+		expect(historyJson).toContain('"type":"input_image"');
+		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
+		expect(historyJson).toContain("Describe this screenshot");
+	});
+
+	test("pushUserTurn preserves tool result images for the next responses turn", () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: unknown[] = [];
+		const toolResult = provider.formatToolResult("call_image", "Rendered screenshot", false, [
+			{ format: "png", base64: SAMPLE_PNG_BASE64 },
+		]);
+
+		provider.pushUserTurn(history, "", "openai:gpt-5", [toolResult]);
+
+		const historyJson = JSON.stringify(history);
+		expect(historyJson).toContain('"type":"function_call_output"');
+		expect(historyJson).toContain('"call_id":"call_image"');
+		expect(historyJson).toContain('"type":"input_image"');
+		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
 	});
 });

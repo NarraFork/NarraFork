@@ -50,6 +50,15 @@ usageHistoryRoutes.get("/", async (c) => {
 });
 
 /**
+ * GET /api/usage-history/providers
+ * 获取历史中出现过的 provider 列表
+ */
+usageHistoryRoutes.get("/providers", async (c) => {
+	const providers = await usageHistoryService.listProviders();
+	return c.json({ providers });
+});
+
+/**
  * GET /api/usage-history/stats
  * 获取使用统计
  */

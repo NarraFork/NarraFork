@@ -4,9 +4,9 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { getDbPath } from "../db/connection";
 import { chapters, narrators, projects } from "../db/schema";
 import { logger } from "../lib/logger";
+import { databaseCleanupService } from "./database-cleanup-service";
 import { gitService } from "./git-service";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -43,6 +43,10 @@ export function getCachedScanResult(): StorageScanResult | null {
 	return cachedResult;
 }
 
+export function invalidateStorageCache(): void {
+	cachedResult = null;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /** Recursively sum file sizes in a directory (async to avoid blocking the event loop). */
@@ -69,29 +73,14 @@ async function dirSize(dirPath: string): Promise<number> {
 	return total;
 }
 
-async function fileSizeOrZero(path: string): Promise<number> {
-	try {
-		return (await stat(path)).size;
-	} catch {
-		return 0;
-	}
-}
-
 // ── Scan functions (each returns one category) ─────────────────────────────
 
 async function scanDatabase(): Promise<StorageCategoryResult> {
-	const dbPath = getDbPath();
-	const mainSize = await fileSizeOrZero(dbPath);
-	const walSize = await fileSizeOrZero(`${dbPath}-wal`);
-	const shmSize = await fileSizeOrZero(`${dbPath}-shm`);
+	const breakdown = await databaseCleanupService.scanDatabaseBreakdown();
 	return {
 		key: "database",
-		sizeBytes: mainSize + walSize + shmSize,
-		details: {
-			mainBytes: mainSize,
-			walBytes: walSize,
-			shmBytes: shmSize,
-		},
+		sizeBytes: breakdown.mainBytes + breakdown.walBytes + breakdown.shmBytes,
+		details: breakdown as unknown as Record<string, unknown>,
 	};
 }
 
@@ -413,6 +402,7 @@ export async function pruneContainerImages(): Promise<{ success: boolean; output
 
 export const storageService = {
 	getCachedScanResult,
+	invalidateStorageCache,
 	scanStorage,
 	cleanupOrphanedUploads,
 	cleanupAllShares,

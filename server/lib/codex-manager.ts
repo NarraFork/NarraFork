@@ -823,6 +823,9 @@ export class CodexManager {
 			if (tokens.accountId) existing.accountId = tokens.accountId;
 			if (tokens.email) existing.email = tokens.email;
 			if (tokens.sub) existing.sub = tokens.sub;
+			if (!existing.displayName) {
+				existing.displayName = existing.email || existing.accountId || `Codex ${existing.id}`;
+			}
 			if (existing.disabled && existing.disabledReason !== "manual") {
 				existing.disabled = false;
 				existing.disabledReason = undefined;
@@ -832,8 +835,10 @@ export class CodexManager {
 		}
 
 		// Add new credential
+		const id = generateShortId();
 		const cred: CodexCredential = {
-			id: generateShortId(),
+			id,
+			displayName: tokens.email || tokens.accountId || `Codex ${id}`,
 			refreshToken: tokens.refreshToken,
 			accessToken: tokens.accessToken,
 			expiresAt: tokens.expiresAt,
