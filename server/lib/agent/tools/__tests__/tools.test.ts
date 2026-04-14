@@ -20,6 +20,7 @@ import {
 import { globTool } from "../glob";
 import { grepTool } from "../grep";
 import { readTool } from "../read";
+import { abortableSleep } from "../terminal";
 import { writeTool } from "../write";
 
 // === Test fixtures ===
@@ -911,6 +912,22 @@ describe("Bash", () => {
 		expect(result.isError).toBeFalsy();
 		const { dirname } = await import("node:path");
 		expect(result.output.trim()).toBe(dirname(TEST_DIR));
+	});
+});
+
+describe("Terminal", () => {
+	test("abortableSleep resolves false when aborted", async () => {
+		const ac = new AbortController();
+		setTimeout(() => ac.abort(), 50);
+		const startedAt = Date.now();
+		const completed = await abortableSleep(5_000, ac.signal);
+		expect(completed).toBe(false);
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
+	});
+
+	test("abortableSleep resolves true when timer completes", async () => {
+		const completed = await abortableSleep(20, new AbortController().signal);
+		expect(completed).toBe(true);
 	});
 });
 

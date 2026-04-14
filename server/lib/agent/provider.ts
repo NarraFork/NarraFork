@@ -22,6 +22,8 @@ import type { AgentToolUse } from "./types";
 
 export interface DbMessage {
 	id: string;
+	/** Original owner narrator for this persisted message row. */
+	narratorId?: string;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;

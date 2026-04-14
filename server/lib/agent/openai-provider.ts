@@ -1787,6 +1787,7 @@ async function buildResponsesUserMessageFromDbMessage(
 	msg: DbMessage,
 	narratorId?: string,
 ): Promise<OAIMessage | null> {
+	const ownerNarratorId = msg.narratorId ?? narratorId;
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	const content: OAIContentPart[] = [];
 	let sawTextBlock = false;
@@ -1798,11 +1799,13 @@ async function buildResponsesUserMessageFromDbMessage(
 			}
 			continue;
 		}
-		if (block.type === "image" && typeof block.imageId === "string" && narratorId) {
-			const filePath = getImagePath(narratorId, block.imageId);
+		if (block.type === "image" && typeof block.imageId === "string" && ownerNarratorId) {
+			const filePath = getImagePath(ownerNarratorId, block.imageId);
 			if (!filePath) {
 				logger.warn("Responses history image missing on disk; skipping replay", {
 					narratorId,
+					messageNarratorId: msg.narratorId ?? null,
+					effectiveNarratorId: ownerNarratorId,
 					messageId: msg.id,
 					imageId: block.imageId,
 				});
@@ -1826,6 +1829,8 @@ async function buildResponsesUserMessageFromDbMessage(
 			} catch (error) {
 				logger.warn("Failed to rebuild Responses history image; skipping replay", {
 					narratorId,
+					messageNarratorId: msg.narratorId ?? null,
+					effectiveNarratorId: ownerNarratorId,
 					messageId: msg.id,
 					imageId: block.imageId,
 					error: error instanceof Error ? error.message : String(error),

@@ -170,7 +170,14 @@ export const terminalTool: ToolDefinition = {
 				if (!terminal_id) {
 					return { output: "terminal_id is required for 'read' action", isError: true };
 				}
-				return await readBuffer(terminal_id, ctx.narratorId, ctx.chapterId, last_n_lines, wait_for);
+				return await readBuffer(
+					terminal_id,
+					ctx.narratorId,
+					ctx.chapterId,
+					ctx.signal,
+					last_n_lines,
+					wait_for,
+				);
 			}
 			case "write": {
 				if (!terminal_id) {
@@ -179,8 +186,9 @@ export const terminalTool: ToolDefinition = {
 				if (input === undefined || input === null) {
 					return { output: "input is required for 'write' action", isError: true };
 				}
-				return await writeInput(terminal_id, ctx.narratorId, ctx.chapterId, input);
+				return await writeInput(terminal_id, ctx.narratorId, ctx.chapterId, ctx.signal, input);
 			}
+
 			default:
 				return { output: `Unknown action: ${action}`, isError: true };
 		}
@@ -232,10 +240,44 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 	};
 }
 
+const TERMINAL_ABORTED_MESSAGE = "Terminal operation aborted by user.";
+
+function makeAbortedResult(title?: string | null): ToolResult {
+	return {
+		output: TERMINAL_ABORTED_MESSAGE,
+		isError: true,
+		title: title ?? undefined,
+	};
+}
+
+export async function abortableSleep(ms: number, signal: AbortSignal): Promise<boolean> {
+	if (signal.aborted) {
+		return false;
+	}
+
+	return await new Promise<boolean>((resolve) => {
+		const onAbort = () => {
+			cleanup();
+			resolve(false);
+		};
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve(true);
+		}, ms);
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (typeof timer === "object" && "unref" in timer) timer.unref();
+	});
+}
+
 async function readBuffer(
 	terminalId: string,
 	narratorId: string,
-	cachedChapterId?: string,
+	cachedChapterId: string | undefined,
+	signal: AbortSignal,
 	lastNLines?: number,
 	waitFor?: string,
 ): Promise<ToolResult> {
@@ -244,12 +286,18 @@ async function readBuffer(
 		return { output: access.error, isError: true };
 	}
 	const { terminal } = access;
+	if (signal.aborted) {
+		return makeAbortedResult(terminal.name ?? terminalId);
+	}
 
 	// --- wait_for polling phase ---
 	let waitTimedOut = false;
 	if (waitFor) {
 		const key = cursorKey(narratorId, terminalId);
 		const initialSnap = await terminalService.getScrollback(terminalId);
+		if (signal.aborted) {
+			return makeAbortedResult(terminal.name ?? terminalId);
+		}
 		const initialText = initialSnap ? extractPlainText(initialSnap.data) : "";
 		const waitStart = readCursors.get(key) ?? initialText.length;
 
@@ -257,7 +305,13 @@ async function readBuffer(
 		let found = false;
 
 		while (Date.now() < deadline) {
+			if (signal.aborted) {
+				return makeAbortedResult(terminal.name ?? terminalId);
+			}
 			const snap = await terminalService.getScrollback(terminalId);
+			if (signal.aborted) {
+				return makeAbortedResult(terminal.name ?? terminalId);
+			}
 			if (snap) {
 				const full = extractPlainText(snap.data);
 				const newContent = full.slice(waitStart);
@@ -266,13 +320,18 @@ async function readBuffer(
 					break;
 				}
 			}
-			await new Promise((r) => setTimeout(r, READ_WAIT_FOR_POLL_MS));
+			if (!(await abortableSleep(READ_WAIT_FOR_POLL_MS, signal))) {
+				return makeAbortedResult(terminal.name ?? terminalId);
+			}
 		}
 
 		if (!found) waitTimedOut = true;
 	}
 
 	// --- normal read flow ---
+	if (signal.aborted) {
+		return makeAbortedResult(terminal.name ?? terminalId);
+	}
 	const scrollback = await terminalService.getScrollback(terminalId);
 	if (!scrollback) {
 		return {
@@ -374,6 +433,7 @@ async function writeInput(
 	terminalId: string,
 	narratorId: string,
 	cachedChapterId: string | undefined,
+	signal: AbortSignal,
 	input: string,
 ): Promise<ToolResult> {
 	const access = await assertTerminalAccess(terminalId, narratorId, cachedChapterId);
@@ -382,6 +442,9 @@ async function writeInput(
 	}
 	const { terminal } = access;
 
+	if (signal.aborted) {
+		return makeAbortedResult(terminal.name ?? terminalId);
+	}
 	if (terminal.status === "exited") {
 		return { output: "Terminal has exited. Cannot send input.", isError: true };
 	}
@@ -399,6 +462,9 @@ async function writeInput(
 
 	// Snapshot buffer length before writing so we can detect new output
 	const beforeSnapshot = await terminalService.getScrollback(terminalId);
+	if (signal.aborted) {
+		return makeAbortedResult(terminal.name ?? terminalId);
+	}
 	const beforeLen = beforeSnapshot ? extractPlainText(beforeSnapshot.data).length : 0;
 
 	// Process escape sequences in the input string
@@ -412,8 +478,13 @@ async function writeInput(
 	let settled = false;
 
 	while (Date.now() < deadline) {
-		await new Promise((r) => setTimeout(r, WRITE_POLL_INTERVAL_MS));
+		if (!(await abortableSleep(WRITE_POLL_INTERVAL_MS, signal))) {
+			return makeAbortedResult(terminal.name ?? terminalId);
+		}
 		const snap = await terminalService.getScrollback(terminalId);
+		if (signal.aborted) {
+			return makeAbortedResult(terminal.name ?? terminalId);
+		}
 		const curLen = snap ? extractPlainText(snap.data).length : 0;
 
 		if (curLen !== lastLen) {
@@ -428,6 +499,9 @@ async function writeInput(
 	}
 
 	// Read the final buffer and return the tail
+	if (signal.aborted) {
+		return makeAbortedResult(terminal.name ?? terminalId);
+	}
 	const afterSnapshot = await terminalService.getScrollback(terminalId);
 	if (!afterSnapshot) {
 		return {

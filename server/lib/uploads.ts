@@ -1,12 +1,39 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { extname, resolve } from "node:path";
+import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 
-const UPLOADS_DIR = resolve(homedir(), ".narrafork", "uploads");
-const AVATARS_DIR = resolve(UPLOADS_DIR, "avatars");
+const DEFAULT_UPLOADS_DIR = resolve(homedir(), ".narrafork", "uploads");
+let uploadsDirTestOverride: string | null = null;
+
+function isWithinDir(root: string, target: string): boolean {
+	const rel = relative(root, target);
+	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+/** Tests only: override the uploads root for this process. */
+export function setUploadsDirForTests(dir?: string | null): void {
+	uploadsDirTestOverride = dir ? resolve(dir) : null;
+}
+
+export function getUploadsDir(): string {
+	return uploadsDirTestOverride ?? DEFAULT_UPLOADS_DIR;
+}
+
+function getAvatarsDir(): string {
+	return resolve(getUploadsDir(), "avatars");
+}
+
+export function contentJsonHasImageBlocks(contentJson: unknown): boolean {
+	if (!Array.isArray(contentJson)) return false;
+	return contentJson.some((block) => {
+		if (!block || typeof block !== "object") return false;
+		const candidate = block as { type?: unknown; imageId?: unknown };
+		return candidate.type === "image" && typeof candidate.imageId === "string";
+	});
+}
 
 const ALLOWED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
@@ -40,8 +67,9 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 
 	const imageId = generateShortId();
 	const ext = MIME_TO_EXT[file.type] ?? (extname(file.name) || ".bin");
-	const dir = resolve(UPLOADS_DIR, narratorId);
-	if (!dir.startsWith(UPLOADS_DIR)) {
+	const uploadsDir = getUploadsDir();
+	const dir = resolve(uploadsDir, narratorId);
+	if (!isWithinDir(uploadsDir, dir)) {
 		throw new ValidationError("Invalid narrator ID");
 	}
 	mkdirSync(dir, { recursive: true });
@@ -56,8 +84,9 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 }
 
 export function getImagePath(narratorId: string, imageId: string): string | null {
-	const dir = resolve(UPLOADS_DIR, narratorId);
-	if (!dir.startsWith(UPLOADS_DIR)) return null; // prevent path traversal
+	const uploadsDir = getUploadsDir();
+	const dir = resolve(uploadsDir, narratorId);
+	if (!isWithinDir(uploadsDir, dir)) return null; // prevent path traversal
 	if (!existsSync(dir)) return null;
 
 	const files = readdirSync(dir);
@@ -65,7 +94,7 @@ export function getImagePath(narratorId: string, imageId: string): string | null
 	if (!match) return null;
 
 	const filePath = resolve(dir, match);
-	if (!filePath.startsWith(dir)) return null; // belt-and-suspenders
+	if (!isWithinDir(dir, filePath)) return null; // belt-and-suspenders
 	return filePath;
 }
 
@@ -207,7 +236,9 @@ export async function saveTextFileToWorktree(cwd: string, file: File): Promise<T
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {
-	const dir = resolve(UPLOADS_DIR, narratorId);
+	const uploadsDir = getUploadsDir();
+	const dir = resolve(uploadsDir, narratorId);
+	if (!isWithinDir(uploadsDir, dir)) return;
 	if (existsSync(dir)) {
 		rmSync(dir, { recursive: true, force: true });
 		logger.info("Narrator uploads cleaned up", { narratorId });
@@ -230,8 +261,9 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 
 	const imageId = generateShortId();
 	const ext = MIME_TO_EXT[file.type] ?? ".bin";
-	const dir = resolve(AVATARS_DIR, userId);
-	if (!dir.startsWith(AVATARS_DIR)) {
+	const avatarsDir = getAvatarsDir();
+	const dir = resolve(avatarsDir, userId);
+	if (!isWithinDir(avatarsDir, dir)) {
 		throw new ValidationError("Invalid user ID");
 	}
 
@@ -250,8 +282,9 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 }
 
 export function getAvatarPath(userId: string, imageId: string): string | null {
-	const dir = resolve(AVATARS_DIR, userId);
-	if (!dir.startsWith(AVATARS_DIR)) return null;
+	const avatarsDir = getAvatarsDir();
+	const dir = resolve(avatarsDir, userId);
+	if (!isWithinDir(avatarsDir, dir)) return null;
 	if (!existsSync(dir)) return null;
 
 	const files = readdirSync(dir);
@@ -259,13 +292,14 @@ export function getAvatarPath(userId: string, imageId: string): string | null {
 	if (!match) return null;
 
 	const filePath = resolve(dir, match);
-	if (!filePath.startsWith(dir)) return null;
+	if (!isWithinDir(dir, filePath)) return null;
 	return filePath;
 }
 
 export function deleteAvatarImage(userId: string): void {
-	const dir = resolve(AVATARS_DIR, userId);
-	if (!dir.startsWith(AVATARS_DIR)) return;
+	const avatarsDir = getAvatarsDir();
+	const dir = resolve(avatarsDir, userId);
+	if (!isWithinDir(avatarsDir, dir)) return;
 	if (existsSync(dir)) {
 		rmSync(dir, { recursive: true, force: true });
 		logger.info("Avatar deleted", { userId });

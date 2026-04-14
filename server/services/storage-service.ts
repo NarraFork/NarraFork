@@ -4,8 +4,9 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { chapters, narratorMessages, narrators, projects } from "../db/schema";
 import { logger } from "../lib/logger";
+import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { databaseCleanupService } from "./database-cleanup-service";
 import { gitService } from "./git-service";
 
@@ -26,7 +27,6 @@ export interface StorageScanResult {
 // ── Paths ──────────────────────────────────────────────────────────────────
 
 const NARRAFORK_DIR = resolve(homedir(), ".narrafork");
-const UPLOADS_DIR = resolve(NARRAFORK_DIR, "uploads");
 const SHARES_DIR = resolve(NARRAFORK_DIR, "shares");
 
 // ── Cache ──────────────────────────────────────────────────────────────────
@@ -73,6 +73,18 @@ async function dirSize(dirPath: string): Promise<number> {
 	return total;
 }
 
+export function buildReferencedUploadOwnerIds(
+	existingNarratorIds: Iterable<string>,
+	messageRows: Array<{ narratorId: string | null; contentJson: unknown }>,
+): Set<string> {
+	const ownerIds = new Set(existingNarratorIds);
+	for (const row of messageRows) {
+		if (!row.narratorId || !contentJsonHasImageBlocks(row.contentJson)) continue;
+		ownerIds.add(row.narratorId);
+	}
+	return ownerIds;
+}
+
 // ── Scan functions (each returns one category) ─────────────────────────────
 
 async function scanDatabase(): Promise<StorageCategoryResult> {
@@ -85,15 +97,16 @@ async function scanDatabase(): Promise<StorageCategoryResult> {
 }
 
 async function scanUploads(): Promise<StorageCategoryResult> {
-	const totalSize = await dirSize(UPLOADS_DIR);
+	const uploadsDir = getUploadsDir();
+	const totalSize = await dirSize(uploadsDir);
 	let narratorCount = 0;
 	let avatarSize = 0;
 	try {
-		const entries = await readdir(UPLOADS_DIR, { withFileTypes: true });
+		const entries = await readdir(uploadsDir, { withFileTypes: true });
 		for (const entry of entries) {
 			if (!entry.isDirectory()) continue;
 			if (entry.name === "avatars") {
-				avatarSize = await dirSize(resolve(UPLOADS_DIR, "avatars"));
+				avatarSize = await dirSize(resolve(uploadsDir, "avatars"));
 			} else {
 				narratorCount++;
 			}
@@ -270,24 +283,28 @@ export async function* scanStorage(): AsyncGenerator<
 // ── Cleanup functions ──────────────────────────────────────────────────────
 
 export async function cleanupOrphanedUploads(): Promise<{ removed: number; freedBytes: number }> {
-	if (!existsSync(UPLOADS_DIR)) return { removed: 0, freedBytes: 0 };
+	const uploadsDir = getUploadsDir();
+	if (!existsSync(uploadsDir)) return { removed: 0, freedBytes: 0 };
 
-	const entries = await readdir(UPLOADS_DIR, { withFileTypes: true });
-	const narratorIds = new Set(
-		db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.all()
-			.map((n) => n.id),
-	);
+	const entries = await readdir(uploadsDir, { withFileTypes: true });
+	const narratorIds = db
+		.select({ id: narrators.id })
+		.from(narrators)
+		.all()
+		.map((n) => n.id);
+	const uploadMessageOwners = db
+		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
+		.from(narratorMessages)
+		.all();
+	const preservedOwnerIds = buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
 
 	let removed = 0;
 	let freedBytes = 0;
 
 	for (const entry of entries) {
 		if (!entry.isDirectory() || entry.name === "avatars") continue;
-		if (!narratorIds.has(entry.name)) {
-			const dirPath = resolve(UPLOADS_DIR, entry.name);
+		if (!preservedOwnerIds.has(entry.name)) {
+			const dirPath = resolve(uploadsDir, entry.name);
 			const size = await dirSize(dirPath);
 			await rm(dirPath, { recursive: true, force: true });
 			removed++;

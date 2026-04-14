@@ -100,6 +100,7 @@ interface MessageBubbleProps {
 	narratorId?: string;
 	message: {
 		id?: string;
+		narratorId?: string;
 		role: string;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		contentJson: any[];
@@ -143,11 +144,11 @@ interface MessageBubbleProps {
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) {
+function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: string }) {
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
 	useEffect(() => {
-		if (block.previewUrl || !narratorId || !block.imageId) return;
+		if (block.previewUrl || !imageNarratorId || !block.imageId) return;
 
 		const token = getToken();
 		const headers: Record<string, string> = {};
@@ -155,7 +156,7 @@ function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) 
 
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		fetch(`/api/uploads/${narratorId}/${block.imageId}`, { headers })
+		fetch(`/api/uploads/${imageNarratorId}/${block.imageId}`, { headers })
 			.then((res) => (res.ok ? res.blob() : null))
 			.then((blob) => {
 				if (blob && !cancelled) {
@@ -169,9 +170,10 @@ function ImageBlock({ block, narratorId }: { block: any; narratorId?: string }) 
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [narratorId, block.imageId, block.previewUrl]);
+	}, [imageNarratorId, block.imageId, block.previewUrl]);
 
 	const src = block.previewUrl ?? blobUrl;
+
 	if (!src) {
 		return <Skeleton h={200} w={300} radius="sm" />;
 	}
@@ -595,20 +597,20 @@ function ReasoningBlock({
 					<ThemeIcon size={16} variant="light" color="grape" radius="sm">
 						<IconBrain size={10} />
 					</ThemeIcon>
-				<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
-					{t("reasoning")}
-				</Text>
-				{!hasEncryptedReasoning && (
-					<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
-						{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+					<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
+						{t("reasoning")}
 					</Text>
-				)}
-				{!opened && (
-					<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
-						— {displayText.slice(0, 80)}
-						{displayText.length > 80 ? "…" : ""}
-					</Text>
-				)}
+					{!hasEncryptedReasoning && (
+						<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
+							{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+						</Text>
+					)}
+					{!opened && (
+						<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
+							— {displayText.slice(0, 80)}
+							{displayText.length > 80 ? "…" : ""}
+						</Text>
+					)}
 				</Group>
 				{/*
 					Initial mount with opened=true: render Collapse directly to avoid
@@ -1889,7 +1891,9 @@ export const MessageBubble = memo(function MessageBubble({
 								color="dimmed"
 								style={{ flexShrink: 0 }}
 								onClick={() => {
-									api.deleteSegmentCompact(narratorId, message.id!).then(
+									const messageId = message.id;
+									if (!messageId) return;
+									api.deleteSegmentCompact(narratorId, messageId).then(
 										() => invalidateMessages(),
 										() => {},
 									);
@@ -1967,7 +1971,9 @@ export const MessageBubble = memo(function MessageBubble({
 										variant="subtle"
 										color="dimmed"
 										onClick={() => {
-											api.deleteCompactMessage(narratorId, message.id!).then(
+											const messageId = message.id;
+											if (!messageId) return;
+											api.deleteCompactMessage(narratorId, messageId).then(
 												() => invalidateMessages(),
 												() => {},
 											);
@@ -2206,7 +2212,7 @@ export const MessageBubble = memo(function MessageBubble({
 													// biome-ignore lint/suspicious/noArrayIndexKey: filtered image blocks have no stable id
 													key={`cmd-img-${i}`}
 													block={block}
-													narratorId={narratorId}
+													imageNarratorId={message.narratorId ?? narratorId}
 												/>
 											),
 										)}
@@ -2224,7 +2230,13 @@ export const MessageBubble = memo(function MessageBubble({
 											);
 										}
 										if (block.type === "image") {
-											return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+											return (
+												<ImageBlock
+													key={key}
+													block={block}
+													imageNarratorId={message.narratorId ?? narratorId}
+												/>
+											);
 										}
 										if (block.type === "text_file") {
 											return <TextFileBlock key={key} block={block} />;
@@ -2267,7 +2279,13 @@ export const MessageBubble = memo(function MessageBubble({
 						);
 					}
 					if (block.type === "image") {
-						return <ImageBlock key={key} block={block} narratorId={narratorId} />;
+						return (
+							<ImageBlock
+								key={key}
+								block={block}
+								imageNarratorId={message.narratorId ?? narratorId}
+							/>
+						);
 					}
 					if (block.type === "text_file") {
 						return <TextFileBlock key={key} block={block} />;

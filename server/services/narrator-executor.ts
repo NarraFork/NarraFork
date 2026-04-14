@@ -1,4 +1,5 @@
 import { type AgentConfig, agentLoop, summaryGenerate } from "../lib/agent";
+import type { AgentEvent } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -24,12 +25,19 @@ export interface ExecuteLoopResult {
 	retryableError?: string;
 	/** Set when smart interruption check detected the output was cut off. */
 	interrupted?: boolean;
+	/** Set when the agent loop was aborted before the turn completed normally. */
+	aborted?: boolean;
 	/**
 	 * When true, the interrupted turn should be resumed by replaying the
 	 * trailing tool-result request packet instead of sending a textual
 	 * "continue" prompt.
 	 */
 	shouldReplayInterruptedToolResultTurn?: boolean;
+}
+
+interface ExecuteLoopSourceOptions {
+	eventSource: AsyncIterable<AgentEvent>;
+	processEventFn?: typeof processEvent;
 }
 
 /**
@@ -39,8 +47,14 @@ export interface ExecuteLoopResult {
  * The main narrator wraps this in a while-loop for chained messages;
  * subagents call it once.
  */
-export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<ExecuteLoopResult> {
+export async function executeAgentLoop(
+	options: ExecuteLoopOptions,
+	sourceOptions?: ExecuteLoopSourceOptions,
+): Promise<ExecuteLoopResult> {
 	const { config, userText, history, trailingToolResults, images, eventContext, hooks } = options;
+	const eventSource =
+		sourceOptions?.eventSource ?? agentLoop(config, userText, history, trailingToolResults, images);
+	const processEventFn = sourceOptions?.processEventFn ?? processEvent;
 
 	let finalText = "";
 	let hasError = false;
@@ -49,20 +63,24 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 	let retryableError: string | undefined;
 	let lastToolNames: string[] = [];
 	let interrupted = false;
+	let aborted = false;
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
 
-	for await (const event of agentLoop(config, userText, history, trailingToolResults, images)) {
-		// When aborted, still process tool_result and error events so:
+	for await (const event of eventSource) {
+		const drainingAfterAbort = config.signal.aborted;
+		// When aborted, still drain tool_result and error events so:
 		// - tool_result: status is persisted to the DB (running → success/fail)
 		// - error("Aborted"): onErrorCleanup is called to clean up orphaned tool calls
-		// Without this, tools that finished executing after the abort signal would
-		// stay "running" forever, and orphaned tool calls would never be cleaned up.
-		if (config.signal.aborted && event.type !== "tool_result" && event.type !== "error") break;
+		// If we stop after the first post-abort event, pending-permission aborts and
+		// long-running tools can leave the narrator stuck in thinking/waiting.
+		if (drainingAfterAbort && event.type !== "tool_result" && event.type !== "error") {
+			continue;
+		}
 
 		try {
-			const result = await processEvent(event, eventContext, hooks);
+			const result = await processEventFn(event, eventContext, hooks);
 			if (result?.titleUpdate !== undefined) {
 				shouldUpdateTitle = result.titleUpdate;
 			}
@@ -81,9 +99,6 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 				});
 			}
 		}
-
-		// After processing a tool_result or error under abort, stop consuming further events.
-		if (config.signal.aborted) break;
 
 		if (event.type === "assistant_message") {
 			sawAssistantMessage = true;
@@ -105,7 +120,9 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 			interrupted = true;
 		}
 		if (event.type === "error") {
-			if (event.message !== "Aborted") {
+			if (event.message === "Aborted") {
+				aborted = true;
+			} else {
 				finalText = `Error: ${event.message}`;
 				hasError = true;
 			}
@@ -116,6 +133,13 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 			hasError = true;
 			break;
 		}
+	}
+
+	// If the stream ended while the abort signal was set, surface that to the caller
+	// so narrator-session can force interrupted cleanup instead of incorrectly
+	// continuing into buffered-message / done handling.
+	if (config.signal.aborted) {
+		aborted = true;
 	}
 
 	// Smart interruption check: detect truncated output and flag for auto-continue.
@@ -143,6 +167,7 @@ export async function executeAgentLoop(options: ExecuteLoopOptions): Promise<Exe
 		contextLengthExceeded,
 		retryableError,
 		interrupted,
+		aborted,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),
 	};

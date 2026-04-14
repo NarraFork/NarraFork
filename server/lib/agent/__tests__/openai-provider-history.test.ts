@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { OpenAIProviderConfig } from "../../settings";
+import { setUploadsDirForTests } from "../../uploads";
 import { OpenAIProvider } from "../openai-provider";
 import type { DbMessage } from "../provider";
 
@@ -16,25 +17,29 @@ const TEST_PROVIDER: OpenAIProviderConfig = {
 	apiMode: "responses",
 };
 
-const TEST_UPLOAD_ROOT = resolve(homedir(), ".narrafork", "uploads");
 const SAMPLE_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
-const CLEANUP_DIRS = new Set<string>();
+let testUploadsRoot = "";
 
 function registerTestImage(narratorId: string, imageId: string, ext = ".png"): string {
-	const dir = resolve(TEST_UPLOAD_ROOT, narratorId);
+	const dir = resolve(testUploadsRoot, narratorId);
 	mkdirSync(dir, { recursive: true });
 	const filePath = resolve(dir, `${imageId}${ext}`);
 	writeFileSync(filePath, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
-	CLEANUP_DIRS.add(dir);
 	return filePath;
 }
 
+beforeEach(() => {
+	testUploadsRoot = mkdtempSync(join(tmpdir(), "narrafork-openai-history-"));
+	setUploadsDirForTests(testUploadsRoot);
+});
+
 afterEach(() => {
-	for (const dir of CLEANUP_DIRS) {
-		rmSync(dir, { recursive: true, force: true });
+	setUploadsDirForTests(null);
+	if (testUploadsRoot) {
+		rmSync(testUploadsRoot, { recursive: true, force: true });
+		testUploadsRoot = "";
 	}
-	CLEANUP_DIRS.clear();
 });
 
 function makeAssistantMessage(overrides: Partial<DbMessage> = {}): DbMessage {
@@ -258,12 +263,13 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(pushedTrailing).toEqual(rebuilt.trailingToolResults);
 	});
 
-	test("buildHistory replays persisted user images as input_image items", async () => {
+	test("buildHistory replays persisted user images from the message owner narrator", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		registerTestImage("narrator-history", "img_hist");
+		registerTestImage("source-narrator", "img_hist");
 		const dbMessages: DbMessage[] = [
 			makeUserMessage({
 				id: "user-image",
+				narratorId: "source-narrator",
 				contentJson: [
 					{
 						type: "image",
@@ -281,7 +287,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 			}),
 		];
 
-		const result = await provider.buildHistory(dbMessages, "openai:gpt-5", "narrator-history");
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5", "forked-narrator");
 		const historyJson = JSON.stringify(result.history);
 		expect(historyJson).toContain('"type":"input_image"');
 		expect(historyJson).toContain('"image_url":"data:image/png;base64,');

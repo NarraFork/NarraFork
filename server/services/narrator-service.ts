@@ -27,7 +27,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../lib/settings";
-import { deleteNarratorUploads, type ImageRef } from "../lib/uploads";
+import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { LoadSkillResult, LoadToolNotFound, LoadToolResult } from "./command-service";
 import { revertPatchesForMessages, revertPatchForToolUse } from "./snapshot-revert";
@@ -51,6 +51,14 @@ async function attachSubagentModels(childMessages: any[]): Promise<void> {
 		const model = modelMap.get(msg.narratorId);
 		if (model) msg.subagentModel = model;
 	}
+}
+
+async function narratorStillOwnsImageMessages(narratorId: string): Promise<boolean> {
+	const remainingOwnedMessages = await db
+		.select({ contentJson: narratorMessages.contentJson })
+		.from(narratorMessages)
+		.where(eq(narratorMessages.narratorId, narratorId));
+	return remainingOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
 
 /**
@@ -3377,7 +3385,14 @@ export const narratorService = {
 
 			await tx.delete(narrators).where(eq(narrators.id, narratorId));
 		});
-		await deleteNarratorUploads(narratorId);
+
+		if (await narratorStillOwnsImageMessages(narratorId)) {
+			logger.info("Preserving narrator uploads because shared image messages still exist", {
+				narratorId,
+			});
+		} else {
+			await deleteNarratorUploads(narratorId);
+		}
 
 		logger.info("Narrator removed", { narratorId });
 	},

@@ -151,6 +151,8 @@ interface ActiveNarrator {
 	/** Soft-stop flag: set when user approves a permission with feedbackText.
 	 *  The agent loop checks this via shouldStop() after tools complete. */
 	_feedbackSoftStop?: boolean;
+	/** Set once interrupted cleanup has run for the current agent-loop iteration. */
+	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */
 	_loopRunning?: boolean;
 }
@@ -2265,6 +2267,7 @@ async function createNarrator(
 		_skillRoot: skillRoot,
 		_enabledOptionalTools: new Set(),
 		_isOverseer: false,
+		_interruptCleanupDone: false,
 	};
 
 	// Check if this narrator is bound to an overseer
@@ -2307,6 +2310,49 @@ async function createNarrator(
 	}
 
 	return active;
+}
+
+async function finalizeInterruptedRun(
+	active: ActiveNarrator,
+	narratorId: string,
+	partialId?: string,
+): Promise<void> {
+	if (active._interruptCleanupDone) {
+		return;
+	}
+	active._interruptCleanupDone = true;
+
+	logger.info("Agent loop aborted (interrupted)", { narratorId });
+	active.events.emit("event", {
+		type: "interrupted",
+		data: { message: "Narrator interrupted" },
+	});
+
+	const cleanupTasks = [cleanupOrphanedToolCalls(narratorId, active.locale)];
+	const current = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { status: true },
+	});
+	if (current?.status !== "error") {
+		cleanupTasks.push(narratorService.updateStatus(narratorId, "interrupted"));
+	}
+	if (partialId) {
+		cleanupTasks.push(finalizeOrCleanupPartialMessage(partialId, narratorId).then(() => {}));
+	}
+	await Promise.all(cleanupTasks).catch((err) => {
+		logger.warn("Post-interrupt cleanup failed", {
+			narratorId,
+			error: String(err),
+		});
+	});
+}
+
+export function shouldFinalizeAbortBeforeRecovery(
+	aborted: boolean | undefined,
+	signalAborted: boolean,
+	planApprovedContinue?: "continue" | "compact",
+): boolean {
+	return (aborted || signalAborted) && planApprovedContinue == null;
 }
 
 // === Agent loop execution ===
@@ -3072,34 +3118,7 @@ async function runAgentLoop(
 							}
 							return;
 						}
-						logger.info("Agent loop aborted (interrupted)", { narratorId });
-						// Broadcast interrupted event FIRST for instant UI feedback,
-						// then await DB cleanup so orphaned tool calls are resolved
-						// before the caller checks narrator status.
-						active.events.emit("event", {
-							type: "interrupted",
-							data: { message: "Narrator interrupted" },
-						});
-						// Preserve terminal error state: if status is already error, do not overwrite it.
-						const cleanupTasks = [cleanupOrphanedToolCalls(narratorId, active.locale)];
-						const current = await db.query.narrators.findFirst({
-							where: eq(narrators.id, narratorId),
-							columns: { status: true },
-						});
-						if (current?.status !== "error") {
-							cleanupTasks.push(narratorService.updateStatus(narratorId, "interrupted"));
-						}
-						if (partialId) {
-							cleanupTasks.push(
-								finalizeOrCleanupPartialMessage(partialId, narratorId).then(() => {}),
-							);
-						}
-						await Promise.all(cleanupTasks).catch((err) => {
-							logger.warn("Post-interrupt cleanup failed", {
-								narratorId,
-								error: String(err),
-							});
-						});
+						await finalizeInterruptedRun(active, narratorId, partialId);
 						return;
 					}
 					if (partialId) {
@@ -3234,6 +3253,7 @@ async function runAgentLoop(
 				? ""
 				: appendTodosContext(currentText, freshNarrator.todosJson);
 
+			active._interruptCleanupDone = false;
 			const result = await executeAgentLoop({
 				config,
 				userText: effectiveText,
@@ -3243,6 +3263,19 @@ async function runAgentLoop(
 				eventContext,
 				hooks,
 			});
+
+			if (
+				shouldFinalizeAbortBeforeRecovery(
+					result.aborted,
+					active.abortController.signal.aborted,
+					active._planApprovedContinue,
+				)
+			) {
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				await finalizeInterruptedRun(active, narratorId, partialId);
+				break;
+			}
 
 			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 			if (result.contextLengthExceeded && active.alive) {
@@ -3460,11 +3493,15 @@ async function runAgentLoop(
 				continue;
 			}
 
-			// If the loop was interrupted (abort signal fired), reset the abort
-			// controller so that any chained buffered message or feedback below
-			// can start a fresh agent loop iteration without immediately aborting.
-			if (active.abortController.signal.aborted) {
-				active.abortController = new AbortController();
+			// User interrupt: stop the outer loop here. Without this guard, a post-abort
+			// tool_result can make executeAgentLoop return before narrator-session notices
+			// the interrupted state, causing pending-permission aborts to incorrectly
+			// continue into buffered-message / done handling.
+			if (result.aborted || active.abortController.signal.aborted) {
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				await finalizeInterruptedRun(active, narratorId, partialId);
+				break;
 			}
 
 			// Check for chained feedback BEFORE marking "done" — when the user
