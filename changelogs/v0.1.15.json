@@ -1,0 +1,6 @@
+{
+	"version": "0.1.15",
+	"date": "2026-04-15",
+	"en": "## New Features\n\n- Director workspace layout with adaptive primary/secondary panels, preview mode, and touch-friendly panel promotion\n- Codex WebSocket recovery with premature-disconnect detection, silent disconnect handling, and automatic fallback support\n- Priority narrator messages that interrupt the current run and jump to the front of the buffer, including foreground subagents\n\n## Improvements\n\n- OpenAI Responses and Codex history reconstruction now preserves message IDs and keeps tool blocks aligned during pruning\n- Narrator send failures now restore draft text and attachments instead of losing pending input\n- Added coverage for Codex reconnect decisions, silent disconnect execution, and Responses history synchronization\n\n## Bug Fixes\n\n- Fixed Codex WebSocket abort handling so interrupts also cancel connect/reconnect work and avoid leaving narrators stuck in thinking",
+	"zh-CN": "## 新功能\n\n- Director 工作区布局上线：主次面板自适应切换，支持预览模式和更友好的触摸激活\n- Codex WebSocket 恢复机制增强：支持过早断连检测、静默断开处理与自动回退\n- 优先级叙述者消息支持插队并中断当前会话，前台子代理也可立即接收\n\n## 改进\n\n- OpenAI Responses 与 Codex 历史重建现在会保留消息 ID，并在裁剪时同步工具块状态\n- 发送失败时会恢复草稿文本和附件，避免待发送内容丢失\n- 新增 Codex 重连决策、silent_disconnect 执行链路和 Responses 历史同步测试覆盖\n\n## 修复\n\n- 修复 Codex WebSocket 中断处理：用户 abort 时会同步取消建连/重连流程，避免叙述者长时间卡在 thinking 状态"
+}
