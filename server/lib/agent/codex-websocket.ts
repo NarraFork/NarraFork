@@ -399,6 +399,14 @@ async function resetSession(session: CachedSession, disable = false): Promise<vo
 	session.disabled = disable;
 }
 
+function createCodexWebSocketAbortError(): Error {
+	return new Error("Codex WebSocket request aborted");
+}
+
+function isCodexWebSocketAbortError(error: unknown): boolean {
+	return error instanceof Error && error.message === "Codex WebSocket request aborted";
+}
+
 class ReusableWebSocketConnection {
 	private ws: WebSocket | null = null;
 	private queue: PendingFrame[] = [];
@@ -412,8 +420,11 @@ class ReusableWebSocketConnection {
 		private readonly onUpgrade?: (response: IncomingMessage) => void,
 	) {}
 
-	async connect(): Promise<void> {
+	async connect(signal: AbortSignal): Promise<void> {
 		const { default: WebSocketImpl } = await import("ws");
+		if (signal.aborted) {
+			throw createCodexWebSocketAbortError();
+		}
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
 			const wsOptions: { headers: Record<string, string>; agent?: boolean | HttpAgent } = {
@@ -425,15 +436,36 @@ class ReusableWebSocketConnection {
 			const ws = new WebSocketImpl(this.url, wsOptions);
 			this.ws = ws;
 
+			const cleanup = () => {
+				signal.removeEventListener("abort", onAbort);
+			};
 			const finishReject = (error: Error) => {
 				if (settled) return;
 				settled = true;
+				cleanup();
+				this.open = false;
+				if (this.ws === ws) {
+					this.ws = null;
+				}
 				reject(error);
 			};
 			const finishResolve = () => {
 				if (settled) return;
 				settled = true;
+				cleanup();
 				resolve();
+			};
+			const onAbort = () => {
+				try {
+					ws.terminate();
+				} catch {
+					try {
+						ws.close();
+					} catch {
+						// ignore secondary close errors while aborting connection setup
+					}
+				}
+				finishReject(createCodexWebSocketAbortError());
 			};
 
 			ws.once("upgrade", (response) => {
@@ -473,6 +505,11 @@ class ReusableWebSocketConnection {
 				this.open = false;
 				this.push({ type: "close", code, reason: reason.toString() });
 			});
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) {
+				onAbort();
+				return;
+			}
 		});
 	}
 
@@ -557,10 +594,16 @@ async function ensureConnection(
 	session: CachedSession,
 	options: StreamCodexResponsesWebSocketOptions,
 ): Promise<ReusableWebSocketConnection> {
+	if (options.signal.aborted) {
+		throw createCodexWebSocketAbortError();
+	}
 	if (session.connection?.isOpen()) {
 		return session.connection;
 	}
 	await closeSessionConnection(session);
+	if (options.signal.aborted) {
+		throw createCodexWebSocketAbortError();
+	}
 	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
 	const connection = new ReusableWebSocketConnection(
 		url,
@@ -573,7 +616,11 @@ async function ensureConnection(
 			}
 		},
 	);
-	await connection.connect();
+	await connection.connect(options.signal);
+	if (options.signal.aborted) {
+		await connection.close();
+		throw createCodexWebSocketAbortError();
+	}
 	session.connection = connection;
 	logger.info("Codex Responses WebSocket connected", {
 		sessionKey: options.sessionKey,
@@ -605,6 +652,7 @@ export async function* streamCodexResponsesWebSocket(
 	const itemsAdded: unknown[] = [];
 	const toolAccum = new Map<number, ResponsesToolAccum>();
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
+	let requestDispatched = false;
 
 	try {
 		const websocketRequest = buildCodexResponsesWebSocketRequest(
@@ -617,9 +665,19 @@ export async function* streamCodexResponsesWebSocket(
 		let hasYieldedEvents = false;
 
 		connection = await ensureConnection(session, options);
+		if (options.signal.aborted) {
+			yield { silentDisconnect: true };
+			return;
+		}
 		await connection.send(requestText);
+		requestDispatched = true;
 
 		while (true) {
+			if (options.signal.aborted) {
+				yield { silentDisconnect: true };
+				return;
+			}
+
 			let frame: PendingFrame;
 			try {
 				frame = await connection.nextFrame(CONNECTION_IDLE_TIMEOUT_MS, options.signal);
@@ -628,6 +686,11 @@ export async function* streamCodexResponsesWebSocket(
 					throw error;
 				}
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
+				if (options.signal.aborted) {
+					await resetSession(session, false);
+					yield { silentDisconnect: true };
+					return;
+				}
 				const decision = decidePrematureCodexReconnect(
 					latestMessageCreatedAt,
 					hasYieldedEvents,
@@ -650,6 +713,11 @@ export async function* streamCodexResponsesWebSocket(
 					reconnectCount++;
 					touchSession(session);
 					connection = await ensureConnection(session, options);
+					if (options.signal.aborted) {
+						await resetSession(session, false);
+						yield { silentDisconnect: true };
+						return;
+					}
 					await connection.send(requestText);
 					continue;
 				}
@@ -668,6 +736,11 @@ export async function* streamCodexResponsesWebSocket(
 			}
 			if (frame.type === "close") {
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
+				if (options.signal.aborted) {
+					await resetSession(session, false);
+					yield { silentDisconnect: true };
+					return;
+				}
 				const decision = decidePrematureCodexReconnect(
 					latestMessageCreatedAt,
 					hasYieldedEvents,
@@ -692,6 +765,11 @@ export async function* streamCodexResponsesWebSocket(
 					reconnectCount++;
 					touchSession(session);
 					connection = await ensureConnection(session, options);
+					if (options.signal.aborted) {
+						await resetSession(session, false);
+						yield { silentDisconnect: true };
+						return;
+					}
 					await connection.send(requestText);
 					continue;
 				}
@@ -749,6 +827,9 @@ export async function* streamCodexResponsesWebSocket(
 			}
 		}
 	} catch (error) {
+		if (isCodexWebSocketAbortError(error) && !requestDispatched) {
+			throw error;
+		}
 		if (error instanceof CodexWebSocketFallbackError) {
 			throw error;
 		}

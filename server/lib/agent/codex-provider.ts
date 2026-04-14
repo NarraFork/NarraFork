@@ -266,6 +266,9 @@ export class CodexProvider implements ProviderAdapter {
 				this.manager.reportSuccess(ctx.id);
 				return;
 			} catch (err) {
+				if (params.signal.aborted) {
+					throw err;
+				}
 				lastError = err;
 				attempt++;
 
@@ -337,6 +340,9 @@ export class CodexProvider implements ProviderAdapter {
 				this.manager.reportSuccess(ctx.id);
 				return;
 			} catch (err) {
+				if (params.signal.aborted) {
+					throw err;
+				}
 				if (err instanceof CodexWebSocketFallbackError) {
 					logger.warn("Codex Responses WebSocket unavailable, falling back to HTTP", {
 						credentialId: ctx.id,
