@@ -22,6 +22,32 @@ async function* makeEventSource(events: AgentEvent[]): AsyncIterable<AgentEvent>
 }
 
 describe("executeAgentLoop abort draining", () => {
+	test("marks silent disconnect without running interruption recovery", async () => {
+		const ac = new AbortController();
+		const processed: string[] = [];
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([{ type: "silent_disconnect" }]),
+				processEventFn: async (event) => {
+					processed.push(event.type);
+					return null;
+				},
+			},
+		);
+
+		expect(processed).toEqual(["silent_disconnect"]);
+		expect(result.silentDisconnect).toBe(true);
+		expect(result.interrupted).toBe(false);
+		expect(result.hasError).toBe(false);
+	});
+
 	test("continues draining until Aborted error after tool_result", async () => {
 		const ac = new AbortController();
 		ac.abort();

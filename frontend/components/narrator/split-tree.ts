@@ -47,6 +47,34 @@ export interface SplitBranch {
 
 export type SplitNode = SplitLeaf | SplitBranch;
 
+export type WorkspacePresentationMode = "split" | "director";
+
+export interface WorkspacePresentation {
+	mode: WorkspacePresentationMode;
+	primaryLeafId: string | null;
+	directorPrimaryRatio: number;
+}
+
+export interface WorkspaceLayoutData {
+	tree: SplitNode;
+	presentation: WorkspacePresentation;
+}
+
+export const MIN_DIRECTOR_PRIMARY_RATIO = 0.55;
+export const MAX_DIRECTOR_PRIMARY_RATIO = 0.85;
+export const DEFAULT_DIRECTOR_PRIMARY_RATIO = 0.72;
+
+export function normalizeDirectorPrimaryRatio(ratio?: number | null): number {
+	if (typeof ratio !== "number" || Number.isNaN(ratio)) return DEFAULT_DIRECTOR_PRIMARY_RATIO;
+	return Math.min(Math.max(ratio, MIN_DIRECTOR_PRIMARY_RATIO), MAX_DIRECTOR_PRIMARY_RATIO);
+}
+
+export const DEFAULT_WORKSPACE_PRESENTATION: WorkspacePresentation = {
+	mode: "split",
+	primaryLeafId: null,
+	directorPrimaryRatio: DEFAULT_DIRECTOR_PRIMARY_RATIO,
+};
+
 // ── Constructors ──
 
 export function createLeaf(narratorId: string | null = null): SplitLeaf {
@@ -513,6 +541,89 @@ function walkLeaves(node: SplitNode, fn: (leaf: SplitLeaf) => void): void {
 	} else {
 		for (const child of node.children) walkLeaves(child, fn);
 	}
+}
+
+export function getAllLeaves(tree: SplitNode): SplitLeaf[] {
+	const leaves: SplitLeaf[] = [];
+	walkLeaves(tree, (leaf) => {
+		leaves.push(leaf);
+	});
+	return leaves;
+}
+
+function isValidSplitNode(node: unknown, depth = 0): node is SplitNode {
+	if (depth > 50) return false;
+	if (!node || typeof node !== "object") return false;
+	const value = node as Record<string, unknown>;
+	if (value.type === "leaf") return typeof value.id === "string";
+	if (value.type === "branch") {
+		return (
+			Array.isArray(value.children) &&
+			Array.isArray(value.sizes) &&
+			(value.children as unknown[]).every((child) => isValidSplitNode(child, depth + 1))
+		);
+	}
+	return false;
+}
+
+function parsePresentation(tree: SplitNode, presentation: unknown): WorkspacePresentation {
+	const raw =
+		presentation && typeof presentation === "object"
+			? (presentation as Record<string, unknown>)
+			: {};
+	const mode = raw.mode === "director" ? "director" : "split";
+	const leafIds = new Set(getAllLeaves(tree).map((leaf) => leaf.id));
+	const candidatePrimary =
+		typeof raw.primaryLeafId === "string" && leafIds.has(raw.primaryLeafId)
+			? raw.primaryLeafId
+			: null;
+	return {
+		mode,
+		primaryLeafId: candidatePrimary ?? getAllLeaves(tree)[0]?.id ?? null,
+		directorPrimaryRatio: normalizeDirectorPrimaryRatio(
+			typeof raw.directorPrimaryRatio === "number" ? raw.directorPrimaryRatio : null,
+		),
+	};
+}
+
+export function normalizeWorkspacePresentation(
+	tree: SplitNode,
+	presentation?: Partial<WorkspacePresentation> | null,
+): WorkspacePresentation {
+	return parsePresentation(tree, presentation);
+}
+
+export function parseWorkspaceLayout(treeJson: string): WorkspaceLayoutData {
+	try {
+		const parsed = JSON.parse(treeJson);
+		if (isValidSplitNode(parsed)) {
+			return {
+				tree: parsed,
+				presentation: normalizeWorkspacePresentation(parsed),
+			};
+		}
+		if (parsed && typeof parsed === "object") {
+			const value = parsed as Record<string, unknown>;
+			if (isValidSplitNode(value.tree)) {
+				return {
+					tree: value.tree,
+					presentation: parsePresentation(value.tree, value.presentation),
+				};
+			}
+		}
+	} catch {}
+	const fallbackTree = createLeaf();
+	return {
+		tree: fallbackTree,
+		presentation: normalizeWorkspacePresentation(fallbackTree),
+	};
+}
+
+export function serializeWorkspaceLayout(layout: WorkspaceLayoutData): string {
+	return JSON.stringify({
+		tree: layout.tree,
+		presentation: normalizeWorkspacePresentation(layout.tree, layout.presentation),
+	});
 }
 
 /**

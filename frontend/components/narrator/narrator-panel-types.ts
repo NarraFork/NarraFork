@@ -138,6 +138,10 @@ export interface NarratorPanelProps {
 	onClose?: () => void;
 	/** Open a terminal panel next to this narrator (workspace mode) */
 	onOpenTerminalPanel?: () => void;
+	/** Minimal chrome for workspace secondary preview panels */
+	workspacePreview?: boolean;
+	/** Skip auto-focusing the main input when a preview is promoted to primary */
+	suppressAutoFocusOnPromote?: boolean;
 	/** Whether the file modifications panel is open (desktop sidebar mode) */
 	fileModPanelOpen?: boolean;
 	/** Toggle the file modifications panel (desktop sidebar mode) */

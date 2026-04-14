@@ -70,7 +70,7 @@ import {
 } from "../../lib/narrator-drag";
 import { triggerNotification } from "../../lib/notification";
 import { CreateNarratorModal, type CreateNarratorResult } from "../narrator/CreateNarratorModal";
-import { addLeaf, type SplitNode } from "../narrator/split-tree";
+import { addLeaf, parseWorkspaceLayout, serializeWorkspaceLayout } from "../narrator/split-tree";
 import { UserAvatar } from "../UserAvatar";
 
 const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
@@ -779,11 +779,14 @@ export function RecentTabList({
 			// Fetch current workspace tree, add the new leaf, persist
 			try {
 				const ws = (await api.getWorkspace(wsId)) as { tree?: string };
-				const tree: SplitNode = ws?.tree
-					? (JSON.parse(ws.tree) as SplitNode)
-					: { type: "leaf", id: "sp_1", narratorId: null };
-				const updated = addLeaf(tree, data.id);
-				await api.updateWorkspace(wsId, { tree: JSON.stringify(updated) });
+				const layout = ws?.tree ? parseWorkspaceLayout(ws.tree) : parseWorkspaceLayout("");
+				const updated = addLeaf(layout.tree, data.id);
+				await api.updateWorkspace(wsId, {
+					tree: serializeWorkspaceLayout({
+						tree: updated,
+						presentation: layout.presentation,
+					}),
+				});
 				qc.invalidateQueries({ queryKey: ["workspace", wsId] });
 			} catch (err) {
 				notifications.show({

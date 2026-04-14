@@ -810,6 +810,13 @@ export class AnthropicProvider implements ProviderAdapter {
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
 		}>,
+		_webSearches?: Array<{
+			id: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
+		}>,
+		_messageId?: string,
 	): void {
 		const h = history as AnthropicMessage[];
 		const parts: AnthropicContentPart[] = [];

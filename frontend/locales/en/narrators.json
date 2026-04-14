@@ -57,6 +57,8 @@
 	"splitDown": "Split down",
 	"dropNarratorHere": "Drop a narrator here",
 	"distributePanels": "Distribute panels evenly",
+	"workspaceSplitMode": "Split mode",
+	"workspaceDirectorMode": "Director mode",
 	"createdAtLabel": "Created {{time}}",
 	"lastMessageAtLabel": "Last message {{time}}",
 	"addWebview": "Add webview",

@@ -5,7 +5,11 @@ import {
 	type CodexResponsesRequestBody,
 	type CompletedResponseSnapshot,
 	clearCodexResponsesWebSocketSessions,
+	decidePrematureCodexReconnect,
+	hasRecentNarratorMessage,
 	isCodexResponsesWebSocketSessionExpired,
+	isCodexWebSocketIdleTimeoutError,
+	shouldTreatCodexStreamEventAsYielded,
 } from "../codex-websocket";
 import type { OAIMessage } from "../openai-provider";
 
@@ -88,6 +92,71 @@ describe("Codex Responses WebSocket helpers", () => {
 		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
 		expect(envelope.previous_response_id).toBeUndefined();
 		expect(envelope.input).toEqual(nextRequest.input);
+	});
+
+	test("treats narrator activity within five minutes as recent", () => {
+		const now = Date.parse("2026-01-01T00:10:00.000Z");
+		expect(hasRecentNarratorMessage("2026-01-01T00:05:01.000Z", now)).toBe(true);
+		expect(hasRecentNarratorMessage("2026-01-01T00:05:00.000Z", now)).toBe(true);
+		expect(hasRecentNarratorMessage("2026-01-01T00:04:59.000Z", now)).toBe(false);
+		expect(hasRecentNarratorMessage(null, now)).toBe(false);
+		expect(hasRecentNarratorMessage("not-a-date", now)).toBe(false);
+	});
+
+	test("detects websocket idle timeout errors", () => {
+		expect(
+			isCodexWebSocketIdleTimeoutError(
+				new Error("Codex WebSocket idle timeout waiting for response event"),
+			),
+		).toBe(true);
+		expect(isCodexWebSocketIdleTimeoutError(new Error("other error"))).toBe(false);
+		expect(
+			isCodexWebSocketIdleTimeoutError("Codex WebSocket idle timeout waiting for response event"),
+		).toBe(false);
+	});
+
+	test("reconnect decision only retries before any events were yielded", () => {
+		const now = Date.parse("2026-01-01T00:10:00.000Z");
+		expect(decidePrematureCodexReconnect("2026-01-01T00:09:30.000Z", false, 0, now)).toEqual({
+			shouldReconnect: true,
+			shouldFallback: true,
+		});
+		expect(decidePrematureCodexReconnect("2026-01-01T00:09:30.000Z", true, 0, now)).toEqual({
+			shouldReconnect: false,
+			shouldFallback: false,
+		});
+		expect(decidePrematureCodexReconnect("2026-01-01T00:09:30.000Z", false, 1, now)).toEqual({
+			shouldReconnect: false,
+			shouldFallback: true,
+		});
+		expect(decidePrematureCodexReconnect(null, false, 0, now)).toEqual({
+			shouldReconnect: false,
+			shouldFallback: false,
+		});
+	});
+
+	test("only counts completed visible stream events as yielded output", () => {
+		expect(shouldTreatCodexStreamEventAsYielded({ responseId: "resp_1" })).toBe(false);
+		expect(shouldTreatCodexStreamEventAsYielded({ messageId: "msg_1" })).toBe(false);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({ webSearch: { id: "ws_1", status: "in_progress" } }),
+		).toBe(false);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
+				webSearch: { id: "ws_1", status: "completed", final: true, query: "weather" },
+			}),
+		).toBe(true);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
+				toolUseChunk: { toolUseId: "call_1", name: "Read", input: "{}" },
+			}),
+		).toBe(false);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
+				toolUseChunk: { toolUseId: "call_1", name: "Read", stop: true },
+			}),
+		).toBe(true);
+		expect(shouldTreatCodexStreamEventAsYielded({ text: "hello" })).toBe(true);
 	});
 
 	test("expires only idle sessions past the TTL", () => {

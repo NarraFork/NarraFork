@@ -1,25 +1,40 @@
 import { ActionIcon, Box, Center, Group, Loader, Text, TextInput, Tooltip } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { IconArrowLeft, IconCheck, IconEqualDouble, IconPencil } from "@tabler/icons-react";
+import {
+	IconArrowLeft,
+	IconCheck,
+	IconEqualDouble,
+	IconLayoutGrid,
+	IconLayoutSidebarRight,
+	IconPencil,
+} from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NarratorDragGhost } from "../../../components/narrator/NarratorDragGhost";
 import type { SplitPanelCallbacks } from "../../../components/narrator/SplitPanelContainer";
 import {
+	DirectorPanelLayout,
 	SplitPanelContainer,
 	SplitPanelCtx,
 } from "../../../components/narrator/SplitPanelContainer";
 import {
 	countLeaves,
 	createLeaf,
+	DEFAULT_DIRECTOR_PRIMARY_RATIO,
+	DEFAULT_WORKSPACE_PRESENTATION,
 	distributeSizes,
+	getAllLeaves,
 	getAllNarratorIds,
 	moveLeaf,
+	normalizeDirectorPrimaryRatio,
+	normalizeWorkspacePresentation,
+	parseWorkspaceLayout,
 	removeLeaf,
 	type SplitDirection,
 	type SplitLeaf,
 	type SplitNode,
+	serializeWorkspaceLayout,
 	setNarrator,
 	setWebviewConfig,
 	splitAndAssign,
@@ -29,6 +44,7 @@ import {
 	type TerminalLeafConfig,
 	updateSizes,
 	type WebviewLeafConfig,
+	type WorkspacePresentation,
 } from "../../../components/narrator/split-tree";
 import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
@@ -41,32 +57,16 @@ export const Route = createFileRoute("/narrators/workspace/$workspaceId")({
 	},
 });
 
-function isValidNode(node: unknown, depth = 0): node is SplitNode {
-	if (depth > 50) return false;
-	if (!node || typeof node !== "object") return false;
-	const n = node as Record<string, unknown>;
-	if (n.type === "leaf") return typeof n.id === "string";
-	if (n.type === "branch") {
-		return (
-			Array.isArray(n.children) &&
-			Array.isArray(n.sizes) &&
-			(n.children as unknown[]).every((c) => isValidNode(c, depth + 1))
-		);
-	}
-	return false;
-}
-
-function parseTree(json: string): SplitNode {
-	try {
-		const parsed = JSON.parse(json);
-		if (isValidNode(parsed)) return parsed;
-	} catch {}
-	return createLeaf();
-}
-
 function collectLeafIds(node: SplitNode): string[] {
 	if (node.type === "leaf") return [node.id];
 	return node.children.flatMap(collectLeafIds);
+}
+
+function ensurePresentationForTree(
+	tree: SplitNode,
+	presentation?: Partial<WorkspacePresentation> | null,
+): WorkspacePresentation {
+	return normalizeWorkspacePresentation(tree, presentation ?? DEFAULT_WORKSPACE_PRESENTATION);
 }
 
 function WorkspacePage() {
@@ -99,6 +99,15 @@ function WorkspacePage() {
 	}, [editTitle, serverTitle, workspaceId]);
 
 	const [tree, setTree] = useState<SplitNode | null>(null);
+	const [presentation, setPresentation] = useState<WorkspacePresentation>(
+		DEFAULT_WORKSPACE_PRESENTATION,
+	);
+	const [directorRatioDraft, setDirectorRatioDraft] = useState<number | null>(null);
+	const [directorActivationMethod, setDirectorActivationMethod] = useState<
+		"mouse" | "touch" | "keyboard" | null
+	>(null);
+	const presentationRef = useRef<WorkspacePresentation>(DEFAULT_WORKSPACE_PRESENTATION);
+	presentationRef.current = presentation;
 	const [leafSubagentStacks, setLeafSubagentStacks] = useState<Record<string, string[]>>({});
 	const leafSubagentStacksRef = useRef<Record<string, string[]>>({});
 	leafSubagentStacksRef.current = leafSubagentStacks;
@@ -115,10 +124,13 @@ function WorkspacePage() {
 		const serverUpdatedAt = (workspace as any).updatedAt as number | undefined;
 		const isFirstLoad = tree === null;
 		const isFreshRefetch = serverUpdatedAt != null && serverUpdatedAt !== loadedAtRef.current;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+		const parsedLayout = parseWorkspaceLayout((workspace as any).tree);
 
 		if (isFirstLoad || (isFreshRefetch && !localEditRef.current)) {
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-			setTree(parseTree((workspace as any).tree));
+			setTree(parsedLayout.tree);
+			setPresentation(parsedLayout.presentation);
+			setDirectorRatioDraft(null);
 			loadedAtRef.current = serverUpdatedAt ?? null;
 			localEditRef.current = false;
 		} else if (isFreshRefetch && localEditRef.current && tree) {
@@ -127,13 +139,14 @@ function WorkspacePage() {
 			// Trade-off: this overwrites local layout edits (panel resizes, closes)
 			// when new narrators appear — acceptable since adding a narrator is a
 			// higher-priority structural change than in-flight layout tweaks.
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-			const serverTree = parseTree((workspace as any).tree);
+			const serverTree = parsedLayout.tree;
 			const localIds = new Set(getAllNarratorIds(tree));
 			const serverIds = getAllNarratorIds(serverTree);
 			const hasNewNarrators = serverIds.some((id) => !localIds.has(id));
 			if (hasNewNarrators) {
 				setTree(serverTree);
+				setPresentation(parsedLayout.presentation);
+				setDirectorRatioDraft(null);
 				loadedAtRef.current = serverUpdatedAt ?? null;
 				localEditRef.current = false;
 				// Cancel any pending debounced save to avoid overwriting the server tree
@@ -207,16 +220,26 @@ function WorkspacePage() {
 		prevNarratorIdsRef.current = currentIds;
 	}, [tree, workspaceId]);
 
-	// Persist tree to server (debounced)
+	// Persist workspace layout to server (debounced)
 	const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const treeRef = useRef(tree);
 	treeRef.current = tree;
 
-	const saveTree = useCallback(
-		(newTree: SplitNode) => {
+	const saveWorkspaceLayout = useCallback(
+		(newTree: SplitNode, nextPresentation?: WorkspacePresentation) => {
 			if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+			const normalizedPresentation = ensurePresentationForTree(
+				newTree,
+				nextPresentation ?? presentationRef.current,
+			);
 			saveTimerRef.current = setTimeout(() => {
-				updateRef.current.mutate({ id: workspaceId, tree: JSON.stringify(newTree) });
+				updateRef.current.mutate({
+					id: workspaceId,
+					tree: serializeWorkspaceLayout({
+						tree: newTree,
+						presentation: normalizedPresentation,
+					}),
+				});
 			}, 500);
 		},
 		[workspaceId],
@@ -226,12 +249,14 @@ function WorkspacePage() {
 		(fn: (prev: SplitNode) => SplitNode) => {
 			setTree((prev) => {
 				const next = fn(prev ?? createLeaf());
+				const normalizedPresentation = ensurePresentationForTree(next, presentationRef.current);
+				setPresentation(normalizedPresentation);
 				localEditRef.current = true;
-				saveTree(next);
+				saveWorkspaceLayout(next, normalizedPresentation);
 				return next;
 			});
 		},
-		[saveTree],
+		[saveWorkspaceLayout],
 	);
 
 	// Leave all narrators on unmount
@@ -242,7 +267,14 @@ function WorkspacePage() {
 			// global error notifications when the workspace has already been deleted
 			// (e.g. user dissolved the workspace, which triggers unmount + delete).
 			if (treeRef.current) {
-				api.updateWorkspace(workspaceId, { tree: JSON.stringify(treeRef.current) }).catch(() => {});
+				api
+					.updateWorkspace(workspaceId, {
+						tree: serializeWorkspaceLayout({
+							tree: treeRef.current,
+							presentation: ensurePresentationForTree(treeRef.current, presentationRef.current),
+						}),
+					})
+					.catch(() => {});
 			}
 			const narratorIds = new Set(getAllNarratorIds(treeRef.current ?? createLeaf()));
 			for (const stack of Object.values(leafSubagentStacksRef.current)) {
@@ -351,6 +383,51 @@ function WorkspacePage() {
 		[updateTree],
 	);
 
+	const updatePresentationState = useCallback(
+		(fn: (prev: WorkspacePresentation) => WorkspacePresentation) => {
+			setPresentation((prev) => {
+				const baseTree = tree ?? createLeaf();
+				const next = ensurePresentationForTree(baseTree, fn(prev));
+				localEditRef.current = true;
+				saveWorkspaceLayout(baseTree, next);
+				return next;
+			});
+		},
+		[saveWorkspaceLayout, tree],
+	);
+
+	const handleSetPresentationMode = useCallback(
+		(mode: WorkspacePresentation["mode"]) => {
+			setDirectorRatioDraft(null);
+			updatePresentationState((prev) => ({ ...prev, mode }));
+		},
+		[updatePresentationState],
+	);
+
+	const handleActivateDirectorLeaf = useCallback(
+		(leafId: string, method: "mouse" | "touch" | "keyboard") => {
+			setDirectorActivationMethod(method);
+			updatePresentationState((prev) => ({ ...prev, primaryLeafId: leafId }));
+		},
+		[updatePresentationState],
+	);
+
+	const handlePreviewDirectorRatio = useCallback((ratio: number) => {
+		setDirectorRatioDraft(normalizeDirectorPrimaryRatio(ratio));
+	}, []);
+
+	const handleCommitDirectorRatio = useCallback(
+		(ratio: number) => {
+			const nextRatio = normalizeDirectorPrimaryRatio(ratio);
+			setDirectorRatioDraft(null);
+			updatePresentationState((prev) => {
+				if (prev.directorPrimaryRatio === nextRatio) return prev;
+				return { ...prev, directorPrimaryRatio: nextRatio };
+			});
+		},
+		[updatePresentationState],
+	);
+
 	const resolveNarratorView = useCallback(
 		(leaf: SplitLeaf) => {
 			const stack = leafSubagentStacks[leaf.id] ?? [];
@@ -390,7 +467,7 @@ function WorkspacePage() {
 	const leafCount = tree ? countLeaves(tree) : 0;
 
 	useEffect(() => {
-		if (!isMobile || leafCount <= 1) {
+		if (presentation.mode === "director" || !isMobile || leafCount <= 1) {
 			setMobileScale(1);
 			return;
 		}
@@ -406,7 +483,55 @@ function WorkspacePage() {
 		});
 		ro.observe(el);
 		return () => ro.disconnect();
-	}, [isMobile, leafCount]);
+	}, [isMobile, leafCount, presentation.mode]);
+
+	const safeTree = tree ?? createLeaf();
+	const canClose = countLeaves(safeTree) > 1;
+	const isDirectorMode = presentation.mode === "director";
+	const directorLeaves = getAllLeaves(safeTree);
+	const effectiveDirectorRatio = normalizeDirectorPrimaryRatio(
+		directorRatioDraft ?? presentation.directorPrimaryRatio ?? DEFAULT_DIRECTOR_PRIMARY_RATIO,
+	);
+	const needsScale = !isDirectorMode && isMobile && leafCount > 1 && mobileScale < 1;
+	const scaleStyle: React.CSSProperties = needsScale
+		? {
+				width: `${100 / mobileScale}%`,
+				height: `${100 / mobileScale}%`,
+				transform: `scale(${mobileScale})`,
+				transformOrigin: "top left",
+			}
+		: {};
+
+	const ctxValue = useMemo<SplitPanelCallbacks>(
+		() => ({
+			onSplitAndAssign: handleSplitAndAssign,
+			onReplace: handleReplace,
+			onClose: handleClose,
+			onSwap: handleSwap,
+			onMoveToSplit: handleMoveToSplit,
+			onSplitAndAssignTerminal: handleSplitAndAssignTerminal,
+			onSplitAndAssignWebview: handleSplitAndAssignWebview,
+			onUpdateWebviewConfig: handleUpdateWebviewConfig,
+			resolveNarratorView,
+			onOpenSubagentInLeaf: handleOpenSubagentInLeaf,
+			onRestoreLeafNarrator: handleRestoreLeafNarrator,
+			canClose,
+		}),
+		[
+			canClose,
+			handleClose,
+			handleMoveToSplit,
+			handleOpenSubagentInLeaf,
+			handleReplace,
+			handleRestoreLeafNarrator,
+			handleSplitAndAssign,
+			handleSplitAndAssignTerminal,
+			handleSplitAndAssignWebview,
+			handleSwap,
+			handleUpdateWebviewConfig,
+			resolveNarratorView,
+		],
+	);
 
 	if (isLoading || !tree) {
 		return (
@@ -421,32 +546,6 @@ function WorkspacePage() {
 			</Box>
 		);
 	}
-
-	const canClose = leafCount > 1;
-	const needsScale = isMobile && leafCount > 1 && mobileScale < 1;
-	const scaleStyle: React.CSSProperties = needsScale
-		? {
-				width: `${100 / mobileScale}%`,
-				height: `${100 / mobileScale}%`,
-				transform: `scale(${mobileScale})`,
-				transformOrigin: "top left",
-			}
-		: {};
-
-	const ctxValue: SplitPanelCallbacks = {
-		onSplitAndAssign: handleSplitAndAssign,
-		onReplace: handleReplace,
-		onClose: handleClose,
-		onSwap: handleSwap,
-		onMoveToSplit: handleMoveToSplit,
-		onSplitAndAssignTerminal: handleSplitAndAssignTerminal,
-		onSplitAndAssignWebview: handleSplitAndAssignWebview,
-		onUpdateWebviewConfig: handleUpdateWebviewConfig,
-		resolveNarratorView,
-		onOpenSubagentInLeaf: handleOpenSubagentInLeaf,
-		onRestoreLeafNarrator: handleRestoreLeafNarrator,
-		canClose,
-	};
 
 	return (
 		<Box
@@ -497,8 +596,33 @@ function WorkspacePage() {
 					</Group>
 				)}
 				<Box style={{ flex: 1 }} />
+				<Group gap={4}>
+					<Tooltip label={t("workspaceSplitMode")}>
+						<ActionIcon
+							size="sm"
+							variant={isDirectorMode ? "subtle" : "light"}
+							onClick={() => handleSetPresentationMode("split")}
+						>
+							<IconLayoutGrid size={16} />
+						</ActionIcon>
+					</Tooltip>
+					<Tooltip label={t("workspaceDirectorMode")}>
+						<ActionIcon
+							size="sm"
+							variant={isDirectorMode ? "light" : "subtle"}
+							onClick={() => handleSetPresentationMode("director")}
+						>
+							<IconLayoutSidebarRight size={16} />
+						</ActionIcon>
+					</Tooltip>
+				</Group>
 				<Tooltip label={t("distributePanels")}>
-					<ActionIcon size="sm" variant="subtle" onClick={handleDistribute}>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						onClick={handleDistribute}
+						disabled={isDirectorMode}
+					>
 						<IconEqualDouble size={16} />
 					</ActionIcon>
 				</Tooltip>
@@ -510,7 +634,19 @@ function WorkspacePage() {
 			>
 				<Box style={{ width: "100%", height: "100%", ...scaleStyle }}>
 					<SplitPanelCtx.Provider value={ctxValue}>
-						<SplitPanelContainer node={tree} onUpdateSizes={handleUpdateSizes} />
+						{isDirectorMode ? (
+							<DirectorPanelLayout
+								leaves={directorLeaves}
+								primaryLeafId={presentation.primaryLeafId}
+								primaryRatio={effectiveDirectorRatio}
+								lastActivationMethod={directorActivationMethod}
+								onActivateLeaf={handleActivateDirectorLeaf}
+								onPreviewRatioChange={handlePreviewDirectorRatio}
+								onCommitRatioChange={handleCommitDirectorRatio}
+							/>
+						) : (
+							<SplitPanelContainer node={tree} onUpdateSizes={handleUpdateSizes} />
+						)}
 					</SplitPanelCtx.Provider>
 				</Box>
 			</Box>

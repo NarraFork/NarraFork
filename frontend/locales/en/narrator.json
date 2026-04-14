@@ -23,6 +23,7 @@
 	"plan": "Plan",
 	"back": "Back",
 	"sendPlaceholder": "Send a message...",
+	"sendFailed": "Failed to send message",
 	"chapterMergedHint": "This chapter has been merged. Wake it up to continue editing.",
 	"interrupt": "Interrupt",
 	"interruptHoldHint": "Hold the button to interrupt",

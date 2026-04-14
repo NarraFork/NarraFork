@@ -947,6 +947,8 @@ export function NarratorPanel({
 	onHeaderPointerDown,
 	onClose,
 	onOpenTerminalPanel,
+	workspacePreview,
+	suppressAutoFocusOnPromote,
 	fileModPanelOpen,
 	onToggleFileModPanel,
 	onFileModPropsChange,
@@ -1023,6 +1025,7 @@ export function NarratorPanel({
 	const displayTitle = isOverseerNarrator
 		? `${tn("overseer")} #${narratorId}`
 		: narrator?.title || t("untitled");
+	const isWorkspacePreview = workspacePreview === true;
 	// Resolve the effective model: when following default, use the actual default model value
 	const resolvedModel = useMemo(() => {
 		const m = narrator?.model;
@@ -1306,6 +1309,21 @@ export function NarratorPanel({
 		},
 		[startFollowing],
 	);
+	const wasWorkspacePreviewRef = useRef(isWorkspacePreview);
+	useEffect(() => {
+		const wasWorkspacePreview = wasWorkspacePreviewRef.current;
+		if (wasWorkspacePreview && !isWorkspacePreview) {
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					scrollToBottom(true);
+					if (!suppressAutoFocusOnPromote) {
+						textareaRef.current?.focus();
+					}
+				});
+			});
+		}
+		wasWorkspacePreviewRef.current = isWorkspacePreview;
+	}, [isWorkspacePreview, scrollToBottom, suppressAutoFocusOnPromote]);
 
 	// --- WebSocket + real-time state ---
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1336,7 +1354,6 @@ export function NarratorPanel({
 	const {
 		disconnected,
 		reconnect,
-		sendBufferMessage,
 		cancelBuffer,
 		streamingVersion,
 		topLevelStreamingChunks,
@@ -2625,6 +2642,21 @@ export function NarratorPanel({
 		() => (showManualLoadOlder ? [[], ...flatTargets] : flatTargets),
 		[showManualLoadOlder, flatTargets],
 	);
+	const previewMessageCount = 5;
+	const renderedElements = useMemo(
+		() =>
+			isWorkspacePreview
+				? finalElements.slice(Math.max(0, finalElements.length - previewMessageCount))
+				: finalElements,
+		[finalElements, isWorkspacePreview],
+	);
+	const renderedKeys = useMemo(
+		() =>
+			isWorkspacePreview
+				? finalKeys.slice(Math.max(0, finalKeys.length - previewMessageCount))
+				: finalKeys,
+		[finalKeys, isWorkspacePreview],
+	);
 
 	const targetIndexMap = useMemo(() => {
 		const indexMap = new Map<string, number>();
@@ -3167,11 +3199,12 @@ export function NarratorPanel({
 			if (result?.buffered) {
 				scrollToBottom(true);
 			}
-		} catch {
+		} catch (err) {
+			// Restore input and attachments on error
+			setInput(msg);
 			if (images.length > 0) setAttachedImages(images);
 			if (textFiles.length > 0) setAttachedTextFiles(textFiles);
-			sendBufferMessage(narratorId, msg);
-			scrollToBottom(true);
+			throw err; // Re-throw to let caller handle
 		}
 	};
 
@@ -3191,6 +3224,12 @@ export function NarratorPanel({
 			setAttachedImages([]);
 			setAttachedTextFiles([]);
 			await submitMessage(msg, images, textFiles);
+		} catch (err) {
+			notifications.show({
+				title: t("sendFailed"),
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
 		} finally {
 			sendingRef.current = false;
 		}
@@ -3205,11 +3244,16 @@ export function NarratorPanel({
 		sendingRef.current = true;
 		try {
 			inputHistory.push(msg);
-			// 1. Insert message at front of queue
+			// Send with priority=true — backend will automatically interrupt and insert at front
 			await doSendBuffered(msg, true);
-			// 2. Interrupt the narrator — when the loop ends it will
-			//    consume the queue head (our priority message) automatically.
-			await interruptMutation.mutateAsync(narratorId);
+		} catch (err) {
+			// On error, restore input and attachments
+			setInput(msg);
+			notifications.show({
+				title: t("sendFailed"),
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
 		} finally {
 			sendingRef.current = false;
 		}
@@ -3623,6 +3667,147 @@ export function NarratorPanel({
 
 	if (!narrator || messagesLoading) return <NarratorPanelSkeleton />;
 
+	const hasContextData = contextPercent != null;
+	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
+	const contextIndicatorRadius = 9;
+	const contextIndicatorCirc = 2 * Math.PI * contextIndicatorRadius;
+	const contextIndicatorOffset = contextIndicatorCirc * (1 - contextIndicatorPercent / 100);
+	const contextIndicatorColor =
+		contextIndicatorPercent >= 99
+			? "var(--mantine-color-red-6)"
+			: contextIndicatorPercent >= 95
+				? "var(--mantine-color-yellow-6)"
+				: "var(--mantine-color-blue-6)";
+	const contextIndicatorLabel = hasContextData
+		? `Context: ${contextPercent.toFixed(1)}%`
+		: "Context";
+	const contextRingNode = (
+		<Box
+			style={{
+				position: "relative",
+				width: 24,
+				height: 24,
+				flexShrink: 0,
+				cursor: isWorkspacePreview ? "default" : "pointer",
+			}}
+			className="context-ring"
+		>
+			<svg width={24} height={24} viewBox="0 0 24 24" role="img" aria-label={contextIndicatorLabel}>
+				<title>{contextIndicatorLabel}</title>
+				<circle
+					cx={12}
+					cy={12}
+					r={contextIndicatorRadius}
+					fill="none"
+					stroke="light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))"
+					strokeWidth={2.5}
+				/>
+				{hasContextData && (
+					<circle
+						cx={12}
+						cy={12}
+						r={contextIndicatorRadius}
+						fill="none"
+						stroke={contextIndicatorColor}
+						strokeWidth={2.5}
+						strokeDasharray={contextIndicatorCirc}
+						strokeDashoffset={contextIndicatorOffset}
+						strokeLinecap="round"
+						transform="rotate(-90 12 12)"
+						style={{ transition: "stroke-dashoffset 0.3s ease" }}
+					/>
+				)}
+			</svg>
+		</Box>
+	);
+	const contextIndicator = isWorkspacePreview ? (
+		contextRingNode
+	) : (
+		<Menu position="top-start">
+			<Menu.Target>{contextRingNode}</Menu.Target>
+			<Menu.Dropdown>
+				<Menu.Label c="dimmed" fz={10}>
+					{t("activeThresholds", {
+						prune: activePruneStart ?? modelThresholds?.pruneStart,
+						compact: activeCompactStart ?? modelThresholds?.compactStart,
+					})}
+				</Menu.Label>
+				<Menu.Item
+					leftSection={<IconSettings size={14} />}
+					c="dimmed"
+					fz="xs"
+					onClick={() =>
+						navigate({
+							to: "/settings",
+							search: { section: "agent", scrollTo: "contextThresholds" },
+						})
+					}
+				>
+					{t("thresholdSettings")}
+				</Menu.Item>
+				<Menu.Divider />
+				{prunedPercent != null && (
+					<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
+				)}
+				{hasContextData && (
+					<Menu.Label>
+						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
+					</Menu.Label>
+				)}
+				{promptTokens != null && (
+					<Menu.Label>
+						{contextWindow != null
+							? t("contextUsageTokensWithWindow", {
+									tokens: promptTokens.toLocaleString(),
+									window: contextWindow.toLocaleString(),
+								})
+							: t("contextUsageTokens", {
+									tokens: promptTokens.toLocaleString(),
+								})}
+						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
+					</Menu.Label>
+				)}
+				<Menu.Divider />
+				<Tooltip label={t("pruneEnabledTooltip")} multiline w={260} withArrow position="top">
+					<Menu.Label>
+						<Switch
+							size="xs"
+							label={t("pruneEnabled")}
+							checked={narrator.pruneEnabled ?? true}
+							onChange={(e) => {
+								pruneEnabledMutation.mutate({
+									id: narratorId,
+									pruneEnabled: e.currentTarget.checked,
+								});
+							}}
+						/>
+					</Menu.Label>
+				</Tooltip>
+				<Menu.Divider />
+				<Menu.Item
+					leftSection={<IconArrowsMinimize size={14} />}
+					onClick={() => {
+						wsState.setIsCompacting(true);
+						api.triggerCompact(narratorId).catch((err) => {
+							wsState.setIsCompacting(false);
+							handleCompactError(err);
+						});
+					}}
+				>
+					{t("triggerCompact")}
+				</Menu.Item>
+				<Menu.Item
+					leftSection={<IconEraser size={14} />}
+					onClick={() => {
+						api.clearContext(narratorId).catch(() => {});
+					}}
+				>
+					{t("clearContext")}
+				</Menu.Item>
+			</Menu.Dropdown>
+		</Menu>
+	);
+
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
 			<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
@@ -3681,43 +3866,44 @@ export function NarratorPanel({
 						}
 					>
 						<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
-							{onMinimize ? (
-								<Tooltip label={t("backToGraph")} position="right">
-									<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
-										<IconArrowsMinimize size={16} />
+							{!isWorkspacePreview &&
+								(onMinimize ? (
+									<Tooltip label={t("backToGraph")} position="right">
+										<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
+											<IconArrowsMinimize size={16} />
+										</ActionIcon>
+									</Tooltip>
+								) : onBack ? (
+									<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+										<IconArrowLeft size={16} />
 									</ActionIcon>
-								</Tooltip>
-							) : onBack ? (
-								<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
-									<IconArrowLeft size={16} />
-								</ActionIcon>
-							) : compact ? (
-								<ActionIcon
-									size="sm"
-									variant="subtle"
-									color="gray"
-									onClick={() =>
-										navigate({
-											to: "/narrators/$narratorId",
-											params: { narratorId },
-											search: { from: "graph" },
-										})
-									}
-								>
-									<IconExternalLink size={16} />
-								</ActionIcon>
-							) : (
-								<ActionIcon
-									size="sm"
-									variant="subtle"
-									color="gray"
-									onClick={() => navigate({ to: ".." })}
-								>
-									<IconArrowLeft size={16} />
-								</ActionIcon>
-							)}
+								) : compact ? (
+									<ActionIcon
+										size="sm"
+										variant="subtle"
+										color="gray"
+										onClick={() =>
+											navigate({
+												to: "/narrators/$narratorId",
+												params: { narratorId },
+												search: { from: "graph" },
+											})
+										}
+									>
+										<IconExternalLink size={16} />
+									</ActionIcon>
+								) : (
+									<ActionIcon
+										size="sm"
+										variant="subtle"
+										color="gray"
+										onClick={() => navigate({ to: ".." })}
+									>
+										<IconArrowLeft size={16} />
+									</ActionIcon>
+								))}
 							<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
-								{editingTitle && !isOverseerNarrator ? (
+								{editingTitle && !isOverseerNarrator && !isWorkspacePreview ? (
 									<TextInput
 										ref={titleInputRef}
 										value={titleValue}
@@ -3731,9 +3917,11 @@ export function NarratorPanel({
 									<Text
 										size="sm"
 										fw={500}
-										onDoubleClick={isOverseerNarrator ? undefined : startEditingTitle}
+										onDoubleClick={
+											isOverseerNarrator || isWorkspacePreview ? undefined : startEditingTitle
+										}
 										style={{
-											cursor: isOverseerNarrator ? "default" : "pointer",
+											cursor: isOverseerNarrator || isWorkspacePreview ? "default" : "pointer",
 											overflow: "hidden",
 											textOverflow: "ellipsis",
 											whiteSpace: "nowrap",
@@ -3744,7 +3932,7 @@ export function NarratorPanel({
 										{displayTitle}
 									</Text>
 								)}
-								{!isOverseerNarrator && (
+								{!isOverseerNarrator && !isWorkspacePreview && (
 									<>
 										<ActionIcon
 											size="xs"
@@ -3766,7 +3954,7 @@ export function NarratorPanel({
 									</>
 								)}
 							</Group>
-							{disconnected && (
+							{disconnected && !isWorkspacePreview && (
 								<Badge
 									size="xs"
 									variant="dot"
@@ -3779,64 +3967,68 @@ export function NarratorPanel({
 								</Badge>
 							)}
 						</Group>
-						<Group gap="xs">
-							<Tooltip label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}>
-								<ActionIcon
-									size="sm"
-									variant="subtle"
-									color="gray"
-									onClick={() =>
-										setEditExpandOverride((prev) => (prev === true ? false : prev === false))
-									}
+						{!isWorkspacePreview && (
+							<Group gap="xs">
+								<Tooltip
+									label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}
 								>
-									{editExpandOverride === false ? (
-										<IconCode size={16} />
-									) : (
-										<IconCodeOff size={16} />
-									)}
-								</ActionIcon>
-							</Tooltip>
-							<Tooltip label={t("fileMod_title")}>
-								<ActionIcon
-									size="sm"
-									variant={fileModDrawerOpened ? "light" : "subtle"}
-									color={fileModDrawerOpened ? "indigo" : "gray"}
-									onClick={() => setFileModDrawerOpened((v) => !v)}
-								>
-									<IconFileCode size={16} />
-								</ActionIcon>
-							</Tooltip>
-							<Tooltip label={t("details.title")}>
-								<ActionIcon
-									size="sm"
-									variant={detailsOpened ? "light" : "subtle"}
-									color={detailsOpened ? "indigo" : "gray"}
-									onClick={toggleDetails}
-								>
-									<IconInfoCircle size={16} />
-								</ActionIcon>
-							</Tooltip>
-							<Tooltip label={t("archiveNarrator")}>
-								<ActionIcon
-									size="sm"
-									variant="subtle"
-									color="orange"
-									loading={archiveMutation.isPending}
-									onClick={() => {
-										openArchiveConfirm();
-									}}
-								>
-									<IconArchive size={16} />
-								</ActionIcon>
-							</Tooltip>
-							{onClose && (
-								<Tooltip label={t("closePanel")}>
-									<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
-										<IconX size={16} />
+									<ActionIcon
+										size="sm"
+										variant="subtle"
+										color="gray"
+										onClick={() =>
+											setEditExpandOverride((prev) => (prev === true ? false : prev === false))
+										}
+									>
+										{editExpandOverride === false ? (
+											<IconCode size={16} />
+										) : (
+											<IconCodeOff size={16} />
+										)}
 									</ActionIcon>
 								</Tooltip>
-							)}
-						</Group>
+								<Tooltip label={t("fileMod_title")}>
+									<ActionIcon
+										size="sm"
+										variant={fileModDrawerOpened ? "light" : "subtle"}
+										color={fileModDrawerOpened ? "indigo" : "gray"}
+										onClick={() => setFileModDrawerOpened((v) => !v)}
+									>
+										<IconFileCode size={16} />
+									</ActionIcon>
+								</Tooltip>
+								<Tooltip label={t("details.title")}>
+									<ActionIcon
+										size="sm"
+										variant={detailsOpened ? "light" : "subtle"}
+										color={detailsOpened ? "indigo" : "gray"}
+										onClick={toggleDetails}
+									>
+										<IconInfoCircle size={16} />
+									</ActionIcon>
+								</Tooltip>
+								<Tooltip label={t("archiveNarrator")}>
+									<ActionIcon
+										size="sm"
+										variant="subtle"
+										color="orange"
+										loading={archiveMutation.isPending}
+										onClick={() => {
+											openArchiveConfirm();
+										}}
+									>
+										<IconArchive size={16} />
+									</ActionIcon>
+								</Tooltip>
+								{onClose && (
+									<Tooltip label={t("closePanel")}>
+										<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
+											<IconX size={16} />
+										</ActionIcon>
+									</Tooltip>
+								)}
+							</Group>
+						)}
 					</Group>
 
 					<Modal
@@ -3955,7 +4147,32 @@ export function NarratorPanel({
 							<MessageSelectionCtx.Provider value={selectionCtxValue}>
 								<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
 									<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-										{advancedAnim ? (
+										{isWorkspacePreview ? (
+											<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
+												<Box
+													px="md"
+													pt="md"
+													style={{
+														position: "absolute",
+														left: 0,
+														right: 0,
+														bottom: 0,
+														display: "flex",
+														flexDirection: "column",
+														gap: 12,
+													}}
+												>
+													{renderedElements.map((element, index) => (
+														<Box
+															key={renderedKeys[index] ?? `preview-${index}`}
+															style={{ flex: "0 0 auto", minWidth: 0 }}
+														>
+															{element}
+														</Box>
+													))}
+												</Box>
+											</Box>
+										) : advancedAnim ? (
 											<BlurInOnAppearProvider
 												scopeKey={narratorId}
 												suppress={suppressBlurIn}
@@ -3963,8 +4180,8 @@ export function NarratorPanel({
 											>
 												<BroadMessageList
 													ref={virtualListRef}
-													elements={finalElements}
-													elementKeys={finalKeys}
+													elements={renderedElements}
+													elementKeys={renderedKeys}
 													scrollRef={viewportCallbackRef}
 													contentRef={contentRef}
 													shift={shifting}
@@ -3973,8 +4190,8 @@ export function NarratorPanel({
 										) : (
 											<BroadMessageList
 												ref={virtualListRef}
-												elements={finalElements}
-												elementKeys={finalKeys}
+												elements={renderedElements}
+												elementKeys={renderedKeys}
 												scrollRef={viewportCallbackRef}
 												contentRef={contentRef}
 												shift={shifting}
@@ -3983,12 +4200,14 @@ export function NarratorPanel({
 									</LatestTodosToolUseIdCtx.Provider>
 								</FileModDrawerCtx.Provider>
 							</MessageSelectionCtx.Provider>
-							<ScrollbarUserMarkers
-								markers={userMessageMarkers}
-								totalCount={finalElements.length}
-								onJump={handleMarkerJump}
-								scrollContainerRef={viewportRef}
-							/>
+							{!isWorkspacePreview && (
+								<ScrollbarUserMarkers
+									markers={userMessageMarkers}
+									totalCount={finalElements.length}
+									onJump={handleMarkerJump}
+									scrollContainerRef={viewportRef}
+								/>
+							)}
 						</Box>
 
 						{/* Off-screen swipe anchor overlay — cloned message preview */}
@@ -4048,49 +4267,51 @@ export function NarratorPanel({
 						)}
 
 						{/* Scroll to bottom button */}
-						<Box
-							style={{
-								position: "absolute",
-								bottom: 12,
-								right: 24,
-								zIndex: 10,
-								transform: !isAtBottom || hasPreviousPage ? "translateY(0)" : "translateY(80px)",
-								opacity: !isAtBottom || hasPreviousPage ? 1 : 0,
-								transition: "transform 200ms ease, opacity 200ms ease",
-								pointerEvents: !isAtBottom || hasPreviousPage ? "auto" : "none",
-							}}
-						>
-							{unreadCount > 0 && (
-								<Badge
-									size="sm"
-									circle
-									color="indigo"
-									style={{
-										position: "absolute",
-										top: -6,
-										right: -6,
-										zIndex: 1,
-										pointerEvents: "none",
-									}}
-								>
-									{unreadCount > 99 ? "99+" : unreadCount}
-								</Badge>
-							)}
-							<ActionIcon
-								variant="filled"
-								color="gray"
-								radius="xl"
-								size="lg"
-								onClick={() => (hasPreviousPage ? revealLatestMessages() : scrollToBottom(true))}
-								title={
-									unreadCount > 0
-										? t("scrollToBottomWithCount", { count: unreadCount })
-										: t("scrollToBottom")
-								}
+						{!isWorkspacePreview && (
+							<Box
+								style={{
+									position: "absolute",
+									bottom: 12,
+									right: 24,
+									zIndex: 10,
+									transform: !isAtBottom || hasPreviousPage ? "translateY(0)" : "translateY(80px)",
+									opacity: !isAtBottom || hasPreviousPage ? 1 : 0,
+									transition: "transform 200ms ease, opacity 200ms ease",
+									pointerEvents: !isAtBottom || hasPreviousPage ? "auto" : "none",
+								}}
 							>
-								<IconArrowDown size={18} />
-							</ActionIcon>
-						</Box>
+								{unreadCount > 0 && (
+									<Badge
+										size="sm"
+										circle
+										color="indigo"
+										style={{
+											position: "absolute",
+											top: -6,
+											right: -6,
+											zIndex: 1,
+											pointerEvents: "none",
+										}}
+									>
+										{unreadCount > 99 ? "99+" : unreadCount}
+									</Badge>
+								)}
+								<ActionIcon
+									variant="filled"
+									color="gray"
+									radius="xl"
+									size="lg"
+									onClick={() => (hasPreviousPage ? revealLatestMessages() : scrollToBottom(true))}
+									title={
+										unreadCount > 0
+											? t("scrollToBottomWithCount", { count: unreadCount })
+											: t("scrollToBottom")
+									}
+								>
+									<IconArrowDown size={18} />
+								</ActionIcon>
+							</Box>
+						)}
 					</Box>
 
 					{/* Image previews */}
@@ -4261,7 +4482,7 @@ export function NarratorPanel({
 							flexShrink: 0,
 						}}
 					>
-						{showWorkIndicator ? (
+						{showWorkIndicator && !isWorkspacePreview ? (
 							<UnstyledButton
 								disabled={isRetrying || !activeTodo}
 								onClick={async () => {
@@ -4365,7 +4586,7 @@ export function NarratorPanel({
 								</Group>
 							</UnstyledButton>
 						) : (
-							<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+							<Group gap={6} wrap="nowrap" style={{ flexShrink: 0, minWidth: 0 }}>
 								<Box
 									w={8}
 									h={8}
@@ -4377,511 +4598,383 @@ export function NarratorPanel({
 										flexShrink: 0,
 									}}
 								/>
-								<Text size="xs" c="dimmed">
+								<Text size="xs" c="dimmed" truncate>
 									{t(`status_${narrator.status}`)}
 								</Text>
-								{turnElapsedText && (
+								{turnElapsedText && !isWorkspacePreview && (
 									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 										· {t("lastTurnDuration", { duration: turnElapsedText })}
 									</Text>
 								)}
 							</Group>
 						)}
-						{/* Model & Permission selectors */}
-						<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
-							{/* Viewers */}
-							{viewers.length > 1 && (
-								<Tooltip label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}>
-									<Avatar.Group spacing="xs">
-										{viewers.slice(0, 3).map((v) => (
-											<UserAvatar
-												key={v.userId}
-												username={v.username}
-												avatarColor={v.avatarColor}
-												avatarImageId={v.avatarImageId}
-												userId={v.userId}
-												size={22}
-												showTooltip={false}
-											/>
-										))}
-										{viewers.length > 3 && (
-											<Avatar size={22} radius="xl">
-												+{viewers.length - 3}
-											</Avatar>
-										)}
-									</Avatar.Group>
-								</Tooltip>
-							)}
-							{/* Context usage indicator — always visible, empty ring when no data */}
-							{(() => {
-								const hasData = contextPercent != null;
-								const pct = hasData ? Math.min(contextPercent, 100) : 0;
-								const r = 9;
-								const circ = 2 * Math.PI * r;
-								const offset = circ * (1 - pct / 100);
-								const color =
-									pct >= 99
-										? "var(--mantine-color-red-6)"
-										: pct >= 95
-											? "var(--mantine-color-yellow-6)"
-											: "var(--mantine-color-blue-6)";
-								const label = hasData ? `Context: ${contextPercent.toFixed(1)}%` : "Context";
-								return (
-									<Menu position="top-start">
-										<Menu.Target>
-											<Box
-												style={{
-													position: "relative",
-													width: 24,
-													height: 24,
-													flexShrink: 0,
-													cursor: "pointer",
-												}}
-												className="context-ring"
-											>
-												<svg
-													width={24}
-													height={24}
-													viewBox="0 0 24 24"
-													role="img"
-													aria-label={label}
-												>
-													<title>{label}</title>
-													<circle
-														cx={12}
-														cy={12}
-														r={r}
-														fill="none"
-														stroke="light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))"
-														strokeWidth={2.5}
-													/>
-													{hasData && (
-														<circle
-															cx={12}
-															cy={12}
-															r={r}
-															fill="none"
-															stroke={color}
-															strokeWidth={2.5}
-															strokeDasharray={circ}
-															strokeDashoffset={offset}
-															strokeLinecap="round"
-															transform="rotate(-90 12 12)"
-															style={{ transition: "stroke-dashoffset 0.3s ease" }}
-														/>
-													)}
-												</svg>
-											</Box>
-										</Menu.Target>
-										<Menu.Dropdown>
-											{(() => {
-												const prune = activePruneStart ?? modelThresholds?.pruneStart;
-												const compact = activeCompactStart ?? modelThresholds?.compactStart;
-												return (
-													<Menu.Label c="dimmed" fz={10}>
-														{t("activeThresholds", { prune, compact })}
-													</Menu.Label>
-												);
-											})()}
-											<Menu.Item
-												leftSection={<IconSettings size={14} />}
-												c="dimmed"
-												fz="xs"
-												onClick={() =>
-													navigate({
-														to: "/settings",
-														search: { section: "agent", scrollTo: "contextThresholds" },
-													})
-												}
-											>
-												{t("thresholdSettings")}
-											</Menu.Item>
-											<Menu.Divider />
-											{prunedPercent != null && (
-												<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
-											)}
-											{hasData && (
-												<Menu.Label>
-													{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-												</Menu.Label>
-											)}
-											{promptTokens != null && (
-												<Menu.Label>
-													{contextWindow != null
-														? t("contextUsageTokensWithWindow", {
-																tokens: promptTokens.toLocaleString(),
-																window: contextWindow.toLocaleString(),
-															})
-														: t("contextUsageTokens", {
-																tokens: promptTokens.toLocaleString(),
-															})}
-													{isEstimated && (
-														<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
-													)}
-												</Menu.Label>
-											)}
-											<Menu.Divider />
-											<Tooltip
-												label={t("pruneEnabledTooltip")}
-												multiline
-												w={260}
-												withArrow
-												position="top"
-											>
-												<Menu.Label>
-													<Switch
-														size="xs"
-														label={t("pruneEnabled")}
-														checked={narrator.pruneEnabled ?? true}
-														onChange={(e) => {
-															pruneEnabledMutation.mutate({
-																id: narratorId,
-																pruneEnabled: e.currentTarget.checked,
-															});
-														}}
-													/>
-												</Menu.Label>
-											</Tooltip>
-											<Menu.Divider />
-											<Menu.Item
-												leftSection={<IconArrowsMinimize size={14} />}
-												onClick={() => {
-													wsState.setIsCompacting(true);
-													api.triggerCompact(narratorId).catch((err) => {
-														wsState.setIsCompacting(false);
-														handleCompactError(err);
-													});
-												}}
-											>
-												{t("triggerCompact")}
-											</Menu.Item>
-											<Menu.Item
-												leftSection={<IconEraser size={14} />}
-												onClick={() => {
-													api.clearContext(narratorId).catch(() => {});
-												}}
-											>
-												{t("clearContext")}
-											</Menu.Item>
-										</Menu.Dropdown>
-									</Menu>
-								);
-							})()}
-									<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
-									</Text>
-								</Tooltip>
-							)}
-							{/* Desktop selects */}
-							{!compact && (
-								<Group gap={6} wrap="nowrap" visibleFrom="sm">
-									<Tooltip label={t("modelTooltip")}>
-										<Menu position="top-end">
-											<Menu.Target>
-												<NativeSelect
-													size="xs"
-													data={allModels.map((m) => ({
-														value: m.value,
-														label:
-															m.value === FOLLOW_DEFAULT_MODEL
-																? t("followDefault", { model: defaultModelValue })
-																: m.provider
-																	? `${m.provider}:${m.label}`
-																	: m.label,
-													}))}
-													value={narrator.model ?? FOLLOW_DEFAULT_MODEL}
-													onChange={() => {}}
-													onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-													style={{ pointerEvents: "auto" }}
-												/>
-											</Menu.Target>
-											<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-												<ModelMenuItems
-													allModels={allModels}
-													currentModel={narrator.model}
-													totalCostUsd={narrator.totalCostUsd}
-													onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-												/>
-											</Menu.Dropdown>
-										</Menu>
-									</Tooltip>
-									<Tooltip label={t("permissionMode")}>
-										<Menu position="top-end">
-											<Menu.Target>
-												<NativeSelect
-													size="xs"
-													leftSection={
-														PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-															<IconShield size={14} />
-														)
-													}
-													data={PERM_MODE_DATA.map((d) => ({ value: d.value, label: t(d.label) }))}
-													value={narrator.permissionMode ?? "default"}
-													onChange={() => {}}
-													onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-													style={{ pointerEvents: "auto" }}
-												/>
-											</Menu.Target>
-											<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-												<PermModeMenuItems
-													currentMode={narrator.permissionMode ?? "default"}
-													onSelect={(m) =>
-														permModeMutation.mutate({ id: narratorId, permissionMode: m })
-													}
-													t={t}
-												/>
-											</Menu.Dropdown>
-										</Menu>
-									</Tooltip>
-									<PathRulesPopover narratorId={narratorId} t={t} />
-									{/* Reasoning Effort (Codex + Anthropic providers) */}
-									{supportsReasoningEffort && (
-										<Menu position="top-end">
-											<Menu.Target>
-												<NativeSelect
-													size="xs"
-													data={[
-														{ value: "", label: t("reasoning_auto") },
-														...reasoningEffortOptions.map((effort) => ({
-															value: effort,
-															label: t(`reasoning_${effort}`),
-														})),
-													]}
-													value={narrator.reasoningEffort ?? ""}
-													onChange={() => {}}
-													onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-													style={{ pointerEvents: "auto" }}
-												/>
-											</Menu.Target>
-											<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-												<ReasoningEffortMenuItems
-													currentEffort={narrator.reasoningEffort}
-													options={reasoningEffortOptions}
-													onSelect={(e) =>
-														reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
-													}
-													t={t}
-												/>
-											</Menu.Dropdown>
-										</Menu>
-									)}
-									{/* Fast Mode toggle (only for Codex-mode providers) */}
-									{supportsCodexControls && (
-										<Tooltip label={t("fast_mode_tooltip")}>
-											<ActionIcon
-												variant="subtle"
-												color={narrator.fastMode ? "yellow" : "gray"}
-												size="sm"
-												onClick={() =>
-													fastModeMutation.mutate({
-														id: narratorId,
-														fastMode: !narrator.fastMode,
-													})
-												}
-											>
-												<IconBolt size={16} />
-											</ActionIcon>
-										</Tooltip>
-									)}
-									{/* Relaxed Plan toggle (only visible in plan mode) */}
-									{narrator.permissionMode === "plan" && (
-										<Tooltip label={t("relaxed_plan_tooltip")}>
-											<ActionIcon
-												variant="subtle"
-												color={narrator.relaxedPlan ? "teal" : "gray"}
-												size="sm"
-												onClick={() =>
-													relaxedPlanMutation.mutate({
-														id: narratorId,
-														relaxedPlan: !narrator.relaxedPlan,
-													})
-												}
-											>
-												{narrator.relaxedPlan ? <IconLockOpen size={16} /> : <IconLock size={16} />}
-											</ActionIcon>
-										</Tooltip>
-									)}
-									{(onToggleTerminal || onOpenTerminalPanel) && (
+
+						{isWorkspacePreview ? (
+							<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+								{contextIndicator}
+							</Group>
+						) : (
+							<>
+								{/* Model & Permission selectors */}
+								<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
+									{/* Viewers */}
+									{viewers.length > 1 && (
 										<Tooltip
-											label={
-												onOpenTerminalPanel
-													? tt("openTerminal")
-													: terminalOpen
-														? tt("closeTerminal")
-														: tt("openTerminal")
-											}
+											label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
 										>
-											<Indicator
-												label={activeTerminalCount}
-												size={14}
-												disabled={activeTerminalCount === 0}
-												offset={2}
-												color="blue"
-											>
+											<Avatar.Group spacing="xs">
+												{viewers.slice(0, 3).map((v) => (
+													<UserAvatar
+														key={v.userId}
+														username={v.username}
+														avatarColor={v.avatarColor}
+														avatarImageId={v.avatarImageId}
+														userId={v.userId}
+														size={22}
+														showTooltip={false}
+													/>
+												))}
+												{viewers.length > 3 && (
+													<Avatar size={22} radius="xl">
+														+{viewers.length - 3}
+													</Avatar>
+												)}
+											</Avatar.Group>
+										</Tooltip>
+									)}
+									{contextIndicator}
+											<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
+											</Text>
+										</Tooltip>
+									)}
+									{/* Desktop selects */}
+									{!compact && (
+										<Group gap={6} wrap="nowrap" visibleFrom="sm">
+											<Tooltip label={t("modelTooltip")}>
+												<Menu position="top-end">
+													<Menu.Target>
+														<NativeSelect
+															size="xs"
+															data={allModels.map((m) => ({
+																value: m.value,
+																label:
+																	m.value === FOLLOW_DEFAULT_MODEL
+																		? t("followDefault", { model: defaultModelValue })
+																		: m.provider
+																			? `${m.provider}:${m.label}`
+																			: m.label,
+															}))}
+															value={narrator.model ?? FOLLOW_DEFAULT_MODEL}
+															onChange={() => {}}
+															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+															style={{ pointerEvents: "auto" }}
+														/>
+													</Menu.Target>
+													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+														<ModelMenuItems
+															allModels={allModels}
+															currentModel={narrator.model}
+															totalCostUsd={narrator.totalCostUsd}
+															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+														/>
+													</Menu.Dropdown>
+												</Menu>
+											</Tooltip>
+											<Tooltip label={t("permissionMode")}>
+												<Menu position="top-end">
+													<Menu.Target>
+														<NativeSelect
+															size="xs"
+															leftSection={
+																PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+																	<IconShield size={14} />
+																)
+															}
+															data={PERM_MODE_DATA.map((d) => ({
+																value: d.value,
+																label: t(d.label),
+															}))}
+															value={narrator.permissionMode ?? "default"}
+															onChange={() => {}}
+															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+															style={{ pointerEvents: "auto" }}
+														/>
+													</Menu.Target>
+													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+														<PermModeMenuItems
+															currentMode={narrator.permissionMode ?? "default"}
+															onSelect={(m) =>
+																permModeMutation.mutate({ id: narratorId, permissionMode: m })
+															}
+															t={t}
+														/>
+													</Menu.Dropdown>
+												</Menu>
+											</Tooltip>
+											<PathRulesPopover narratorId={narratorId} t={t} />
+											{/* Reasoning Effort (Codex + Anthropic providers) */}
+											{supportsReasoningEffort && (
+												<Menu position="top-end">
+													<Menu.Target>
+														<NativeSelect
+															size="xs"
+															data={[
+																{ value: "", label: t("reasoning_auto") },
+																...reasoningEffortOptions.map((effort) => ({
+																	value: effort,
+																	label: t(`reasoning_${effort}`),
+																})),
+															]}
+															value={narrator.reasoningEffort ?? ""}
+															onChange={() => {}}
+															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+															style={{ pointerEvents: "auto" }}
+														/>
+													</Menu.Target>
+													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+														<ReasoningEffortMenuItems
+															currentEffort={narrator.reasoningEffort}
+															options={reasoningEffortOptions}
+															onSelect={(e) =>
+																reasoningEffortMutation.mutate({
+																	id: narratorId,
+																	reasoningEffort: e,
+																})
+															}
+															t={t}
+														/>
+													</Menu.Dropdown>
+												</Menu>
+											)}
+											{/* Fast Mode toggle (only for Codex-mode providers) */}
+											{supportsCodexControls && (
+												<Tooltip label={t("fast_mode_tooltip")}>
+													<ActionIcon
+														variant="subtle"
+														color={narrator.fastMode ? "yellow" : "gray"}
+														size="sm"
+														onClick={() =>
+															fastModeMutation.mutate({
+																id: narratorId,
+																fastMode: !narrator.fastMode,
+															})
+														}
+													>
+														<IconBolt size={16} />
+													</ActionIcon>
+												</Tooltip>
+											)}
+											{/* Relaxed Plan toggle (only visible in plan mode) */}
+											{narrator.permissionMode === "plan" && (
+												<Tooltip label={t("relaxed_plan_tooltip")}>
+													<ActionIcon
+														variant="subtle"
+														color={narrator.relaxedPlan ? "teal" : "gray"}
+														size="sm"
+														onClick={() =>
+															relaxedPlanMutation.mutate({
+																id: narratorId,
+																relaxedPlan: !narrator.relaxedPlan,
+															})
+														}
+													>
+														{narrator.relaxedPlan ? (
+															<IconLockOpen size={16} />
+														) : (
+															<IconLock size={16} />
+														)}
+													</ActionIcon>
+												</Tooltip>
+											)}
+											{(onToggleTerminal || onOpenTerminalPanel) && (
+												<Tooltip
+													label={
+														onOpenTerminalPanel
+															? tt("openTerminal")
+															: terminalOpen
+																? tt("closeTerminal")
+																: tt("openTerminal")
+													}
+												>
+													<Indicator
+														label={activeTerminalCount}
+														size={14}
+														disabled={activeTerminalCount === 0}
+														offset={2}
+														color="blue"
+													>
+														<ActionIcon
+															variant="subtle"
+															color={terminalOpen ? "blue" : "gray"}
+															size="sm"
+															onClick={onOpenTerminalPanel ?? onToggleTerminal}
+														>
+															<IconTerminal size={16} />
+														</ActionIcon>
+													</Indicator>
+												</Tooltip>
+											)}
+										</Group>
+									)}
+									{/* Mobile: model & permission */}
+									<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
+										<Tooltip label={t("modelTooltip")}>
+											<Menu position="bottom-end" withinPortal>
+												<Menu.Target>
+													<ActionIcon variant="subtle" color="gray" size="sm">
+														<Text size="xs" fw={600}>
+															{(() => {
+																if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
+																	return "D";
+																const m = allModels.find((x) => x.value === narrator.model);
+																return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
+															})()}
+														</Text>
+													</ActionIcon>
+												</Menu.Target>
+												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+													<ModelMenuItems
+														allModels={allModels}
+														currentModel={narrator.model}
+														totalCostUsd={narrator.totalCostUsd}
+														onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+														label={t("modelTooltip")}
+													/>
+												</Menu.Dropdown>
+											</Menu>
+										</Tooltip>
+										<Tooltip label={t("permissionMode")}>
+											<Menu position="bottom-end" withinPortal>
+												<Menu.Target>
+													<ActionIcon variant="subtle" color="gray" size="sm">
+														{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+															<IconShield size={16} />
+														)}
+													</ActionIcon>
+												</Menu.Target>
+												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+													<Menu.Label>{t("permissionMode")}</Menu.Label>
+													<PermModeMenuItems
+														currentMode={narrator.permissionMode ?? "default"}
+														onSelect={(m) =>
+															permModeMutation.mutate({ id: narratorId, permissionMode: m })
+														}
+														t={t}
+													/>
+												</Menu.Dropdown>
+											</Menu>
+										</Tooltip>
+										<PathRulesPopover narratorId={narratorId} t={t} />
+										{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
+										{supportsReasoningEffort && (
+											<Menu position="bottom-end" withinPortal>
+												<Menu.Target>
+													<ActionIcon variant="subtle" color="gray" size="sm">
+														<Text size="xs" fw={600}>
+															{(() => {
+																const effortMap = {
+																	none: "O",
+																	low: "L",
+																	medium: "M",
+																	high: "H",
+																	xhigh: "X",
+																};
+																return (
+																	effortMap[narrator.reasoningEffort as keyof typeof effortMap] ??
+																	"A"
+																);
+															})()}
+														</Text>
+													</ActionIcon>
+												</Menu.Target>
+												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+													<ReasoningEffortMenuItems
+														currentEffort={narrator.reasoningEffort}
+														options={reasoningEffortOptions}
+														onSelect={(e) =>
+															reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+														}
+														t={t}
+													/>
+												</Menu.Dropdown>
+											</Menu>
+										)}
+										{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
+										{supportsCodexControls && (
+											<Tooltip label={t("fast_mode_tooltip")}>
 												<ActionIcon
 													variant="subtle"
-													color={terminalOpen ? "blue" : "gray"}
+													color={narrator.fastMode ? "yellow" : "gray"}
 													size="sm"
-													onClick={onOpenTerminalPanel ?? onToggleTerminal}
+													onClick={() =>
+														fastModeMutation.mutate({
+															id: narratorId,
+															fastMode: !narrator.fastMode,
+														})
+													}
 												>
-													<IconTerminal size={16} />
+													<IconBolt size={16} />
 												</ActionIcon>
-											</Indicator>
-										</Tooltip>
-									)}
-								</Group>
-							)}
-							{/* Mobile: model & permission */}
-							<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
-								<Tooltip label={t("modelTooltip")}>
-									<Menu position="bottom-end" withinPortal>
-										<Menu.Target>
-											<ActionIcon variant="subtle" color="gray" size="sm">
-												<Text size="xs" fw={600}>
-													{(() => {
-														if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
-															return "D";
-														const m = allModels.find((x) => x.value === narrator.model);
-														return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
-													})()}
-												</Text>
-											</ActionIcon>
-										</Menu.Target>
-										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-											<ModelMenuItems
-												allModels={allModels}
-												currentModel={narrator.model}
-												totalCostUsd={narrator.totalCostUsd}
-												onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-												label={t("modelTooltip")}
-											/>
-										</Menu.Dropdown>
-									</Menu>
-								</Tooltip>
-								<Tooltip label={t("permissionMode")}>
-									<Menu position="bottom-end" withinPortal>
-										<Menu.Target>
-											<ActionIcon variant="subtle" color="gray" size="sm">
-												{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-													<IconShield size={16} />
-												)}
-											</ActionIcon>
-										</Menu.Target>
-										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-											<Menu.Label>{t("permissionMode")}</Menu.Label>
-											<PermModeMenuItems
-												currentMode={narrator.permissionMode ?? "default"}
-												onSelect={(m) =>
-													permModeMutation.mutate({ id: narratorId, permissionMode: m })
+											</Tooltip>
+										)}
+										{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
+										{narrator.permissionMode === "plan" && (
+											<Tooltip label={t("relaxed_plan_tooltip")}>
+												<ActionIcon
+													variant="subtle"
+													color={narrator.relaxedPlan ? "teal" : "gray"}
+													size="sm"
+													onClick={() =>
+														relaxedPlanMutation.mutate({
+															id: narratorId,
+															relaxedPlan: !narrator.relaxedPlan,
+														})
+													}
+												>
+													{narrator.relaxedPlan ? (
+														<IconLockOpen size={16} />
+													) : (
+														<IconLock size={16} />
+													)}
+												</ActionIcon>
+											</Tooltip>
+										)}
+										{(onToggleTerminal || onOpenTerminalPanel) && (
+											<Tooltip
+												label={
+													onOpenTerminalPanel
+														? tt("openTerminal")
+														: terminalOpen
+															? tt("closeTerminal")
+															: tt("openTerminal")
 												}
-												t={t}
-											/>
-										</Menu.Dropdown>
-									</Menu>
-								</Tooltip>
-								<PathRulesPopover narratorId={narratorId} t={t} />
-								{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
-								{supportsReasoningEffort && (
-									<Menu position="bottom-end" withinPortal>
-										<Menu.Target>
-											<ActionIcon variant="subtle" color="gray" size="sm">
-												<Text size="xs" fw={600}>
-													{(() => {
-														const effortMap = {
-															none: "O",
-															low: "L",
-															medium: "M",
-															high: "H",
-															xhigh: "X",
-														};
-														return (
-															effortMap[narrator.reasoningEffort as keyof typeof effortMap] ?? "A"
-														);
-													})()}
-												</Text>
-											</ActionIcon>
-										</Menu.Target>
-										<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-											<ReasoningEffortMenuItems
-												currentEffort={narrator.reasoningEffort}
-												options={reasoningEffortOptions}
-												onSelect={(e) =>
-													reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
-												}
-												t={t}
-											/>
-										</Menu.Dropdown>
-									</Menu>
-								)}
-								{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-								{supportsCodexControls && (
-									<Tooltip label={t("fast_mode_tooltip")}>
-										<ActionIcon
-											variant="subtle"
-											color={narrator.fastMode ? "yellow" : "gray"}
-											size="sm"
-											onClick={() =>
-												fastModeMutation.mutate({
-													id: narratorId,
-													fastMode: !narrator.fastMode,
-												})
-											}
-										>
-											<IconBolt size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)}
-								{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
-								{narrator.permissionMode === "plan" && (
-									<Tooltip label={t("relaxed_plan_tooltip")}>
-										<ActionIcon
-											variant="subtle"
-											color={narrator.relaxedPlan ? "teal" : "gray"}
-											size="sm"
-											onClick={() =>
-												relaxedPlanMutation.mutate({
-													id: narratorId,
-													relaxedPlan: !narrator.relaxedPlan,
-												})
-											}
-										>
-											{narrator.relaxedPlan ? <IconLockOpen size={16} /> : <IconLock size={16} />}
-										</ActionIcon>
-									</Tooltip>
-								)}
-								{(onToggleTerminal || onOpenTerminalPanel) && (
-									<Tooltip
-										label={
-											onOpenTerminalPanel
-												? tt("openTerminal")
-												: terminalOpen
-													? tt("closeTerminal")
-													: tt("openTerminal")
-										}
-									>
-										<Indicator
-											label={activeTerminalCount}
-											size={14}
-											disabled={activeTerminalCount === 0}
-											offset={2}
-											color="blue"
-										>
-											<ActionIcon
-												variant="subtle"
-												color={terminalOpen ? "blue" : "gray"}
-												size="sm"
-												onClick={onOpenTerminalPanel ?? onToggleTerminal}
 											>
-												<IconTerminal size={16} />
-											</ActionIcon>
-										</Indicator>
-									</Tooltip>
-								)}
-							</Group>
-						</Group>
+												<Indicator
+													label={activeTerminalCount}
+													size={14}
+													disabled={activeTerminalCount === 0}
+													offset={2}
+													color="blue"
+												>
+													<ActionIcon
+														variant="subtle"
+														color={terminalOpen ? "blue" : "gray"}
+														size="sm"
+														onClick={onOpenTerminalPanel ?? onToggleTerminal}
+													>
+														<IconTerminal size={16} />
+													</ActionIcon>
+												</Indicator>
+											</Tooltip>
+										)}
+									</Group>
+								</Group>
+							</>
+						)}
 					</Group>
 
 					{/* Input */}
-					{isChapterMerged ? (
+					{isWorkspacePreview ? null : isChapterMerged ? (
 						<Box
 							px="md"
 							py="sm"

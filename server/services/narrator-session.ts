@@ -2444,27 +2444,51 @@ export function pruneToolCalls(
 	for (const msg of dbMessages) {
 		if (!pruneIds.has(msg.id)) continue;
 
-		if (msg.toolCalls?.length) {
-			const kept = msg.toolCalls.filter((tc) => PRUNE_PROTECTED_TOOLS.has(tc.toolName));
-			msg.toolCalls = kept.length > 0 ? kept : [];
-		}
+		const keptToolCalls = msg.toolCalls?.length
+			? msg.toolCalls.filter((tc) => PRUNE_PROTECTED_TOOLS.has(tc.toolName))
+			: [];
+		msg.toolCalls = keptToolCalls.length > 0 ? keptToolCalls : [];
 
-		// Strip reasoning providerMetadata (encrypted_content) from pruned messages.
-		// Old encrypted content cannot be used for continuation and wastes tokens.
-		// The reasoning summary text is preserved for context.
-		// Skip if the message still has protected tool calls — their reasoning item
-		// must be preserved to satisfy Responses API pairing requirements.
-		if (Array.isArray(msg.contentJson) && !msg.toolCalls?.length) {
+		let hasProtectedToolContext = keptToolCalls.length > 0;
+		if (Array.isArray(msg.contentJson)) {
 			let mutated = false;
-			const blocks = msg.contentJson as Array<{ type: string; providerMetadata?: unknown }>;
-			for (const block of blocks) {
-				if (block.type === "reasoning" && block.providerMetadata) {
-					block.providerMetadata = undefined;
-					mutated = true;
-				}
-			}
+			const keptToolUseIds = new Set(
+				keptToolCalls
+					.map((tc) => tc.toolUseId)
+					.filter((toolUseId): toolUseId is string => typeof toolUseId === "string"),
+			);
+			const blocks = msg.contentJson.filter((block) => {
+				if (!block || typeof block !== "object") return true;
+				const toolBlock = block as { type?: string; id?: string; name?: string };
+				if (toolBlock.type !== "tool_use") return true;
+				const keep =
+					(typeof toolBlock.id === "string" && keptToolUseIds.has(toolBlock.id)) ||
+					(typeof toolBlock.name === "string" && PRUNE_PROTECTED_TOOLS.has(toolBlock.name));
+				if (keep) hasProtectedToolContext = true;
+				if (!keep) mutated = true;
+				return keep;
+			});
 			if (mutated) {
-				msg.contentJson = [...blocks];
+				msg.contentJson = blocks;
+			}
+
+			// Strip reasoning providerMetadata (encrypted_content) from pruned messages.
+			// Old encrypted content cannot be used for continuation and wastes tokens.
+			// The reasoning summary text is preserved for context.
+			// Skip if the message still has protected tool calls — their reasoning item
+			// must be preserved to satisfy Responses API pairing requirements.
+			if (!hasProtectedToolContext) {
+				let reasoningMutated = false;
+				const prunedBlocks = msg.contentJson as Array<{ type: string; providerMetadata?: unknown }>;
+				for (const block of prunedBlocks) {
+					if (block.type === "reasoning" && block.providerMetadata) {
+						block.providerMetadata = undefined;
+						reasoningMutated = true;
+					}
+				}
+				if (reasoningMutated) {
+					msg.contentJson = [...prunedBlocks];
+				}
 			}
 		}
 	}
@@ -3389,6 +3413,14 @@ async function runAgentLoop(
 
 			if (result.shouldUpdateTitle) {
 				shouldUpdateTitle = true;
+			}
+
+			if (result.silentDisconnect) {
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				if (partialId) {
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
 			}
 
 			// Smart interruption check — auto-continue if output was truncated.

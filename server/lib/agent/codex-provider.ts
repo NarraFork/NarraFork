@@ -325,6 +325,7 @@ export class CodexProvider implements ProviderAdapter {
 					accountId: ctx.credential.accountId,
 					proxy: settings.codex?.proxy,
 					sessionKey: params.stickySessionKey ?? params.conversationId,
+					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,
 					model: params.model,
 					request,
@@ -496,8 +497,16 @@ export class CodexProvider implements ProviderAdapter {
 			queries?: string[];
 			outputIndex?: number;
 		}>,
+		messageId?: string,
 	): void {
-		this.dummyProvider.pushAssistantTurn(history, text, toolUses, reasoningBlocks, webSearches);
+		this.dummyProvider.pushAssistantTurn(
+			history,
+			text,
+			toolUses,
+			reasoningBlocks,
+			webSearches,
+			messageId,
+		);
 	}
 
 	async generate(text: string, model: string): Promise<string> {

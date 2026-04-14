@@ -465,10 +465,17 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// Running narrator: buffer the message for execution after the current turn
 	if (narrator.status === "thinking" || narrator.status === "waiting") {
 		if (narrator.type === "subagent") {
-			const { pushSubagentBufferedMessage, getSubagentBufferedMessages } = await import(
-				"../services/narrator-subagent"
+			const {
+				pushSubagentBufferedMessage,
+				getSubagentBufferedMessages,
+				interruptForegroundSubagent,
+			} = await import("../services/narrator-subagent");
+			const result = pushSubagentBufferedMessage(
+				id,
+				finalMessage,
+				undefined,
+				priority ? "front" : "back",
 			);
-			const result = pushSubagentBufferedMessage(id, finalMessage);
 			if (!result.ok) {
 				throw new ValidationError("Subagent is not running in foreground");
 			}
@@ -478,6 +485,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				narratorId: id,
 				messages,
 			});
+			if (priority) {
+				const interrupted = interruptForegroundSubagent(id);
+				if (!interrupted && (narrator.status === "thinking" || narrator.status === "waiting")) {
+					await narratorService.updateStatus(id, "interrupted");
+				}
+			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 
@@ -511,6 +524,20 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				narratorId: id,
 				messages,
 			});
+			// If priority=true, automatically interrupt the narrator
+			if (priority) {
+				let interrupted = interruptNarrator(id);
+				if (!interrupted) {
+					// Fallback: try interrupting a foreground subagent
+					const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
+					interrupted = interruptForegroundSubagent(id);
+				}
+				// Fallback: if no active loop found but DB status is still thinking/waiting,
+				// force-reset to interrupted
+				if (!interrupted && (narrator.status === "thinking" || narrator.status === "waiting")) {
+					await narratorService.updateStatus(id, "interrupted");
+				}
+			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 		// Narrator not active in memory — fall through to normal send

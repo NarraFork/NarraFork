@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pruneToolCalls } from "../../../services/narrator-session";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
-import { OpenAIProvider } from "../openai-provider";
+import { OpenAIProvider, parseResponsesAPIEvent } from "../openai-provider";
 import type { DbMessage } from "../provider";
 
 const TEST_PROVIDER: OpenAIProviderConfig = {
@@ -173,6 +174,36 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(history[2])).not.toContain("Live reasoning summary");
 	});
 
+	test("pushAssistantTurn preserves official assistant message id when provided", () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(history, "Visible reply", [], undefined, undefined, "msg_remote_1");
+
+		expect(history).toHaveLength(1);
+		expect(JSON.stringify(history[0])).toContain('"id":"msg_remote_1"');
+		expect(JSON.stringify(history[0])).toContain("Visible reply");
+	});
+
+	test("parseResponsesAPIEvent captures assistant message item ids from responses events", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					role: "assistant",
+					id: "msg_remote_2",
+					content: [{ type: "output_text", text: "done" }],
+				},
+			},
+			new Map(),
+			new Map(),
+		);
+
+		const parsed = events.find((event) => event.messageId);
+		expect(parsed?.messageId).toBe("msg_remote_2");
+	});
+
 	test("pushAssistantTurn keeps non-replayable reasoning as assistant text fallback", () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const history: unknown[] = [];
@@ -203,6 +234,28 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(result.history[0])).toContain('"query":"weather sf"');
 		expect(JSON.stringify(result.history[1])).toContain("Search result summary");
 		expect(JSON.stringify(result.history)).not.toContain("[Web search:");
+	});
+
+	test("buildHistory preserves stored assistant item ordering and official message id", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				messageUuid: "msg_remote_3",
+				contentJson: [
+					{ type: "text", text: "Lead in" },
+					{ type: "web_search", id: "ws_ordered", query: "weather sf", outputIndex: 1 },
+					{ type: "text", text: "Follow up" },
+				],
+				contentText: "Lead in\nFollow up",
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		expect(result.history).toHaveLength(3);
+		expect(JSON.stringify(result.history[0])).toContain('"id":"msg_remote_3"');
+		expect(JSON.stringify(result.history[0])).toContain("Lead in");
+		expect(JSON.stringify(result.history[1])).toContain('"type":"web_search_call"');
+		expect(JSON.stringify(result.history[2])).toContain("Follow up");
 	});
 
 	test("buildHistory matches pushAssistantTurn canonical responses layout", async () => {
@@ -308,5 +361,108 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain('"call_id":"call_image"');
 		expect(historyJson).toContain('"type":"input_image"');
 		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
+	});
+
+	test("pruneToolCalls removes pruned non-protected tool_use blocks from responses history", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				id: "assistant-pruned",
+				contentJson: [
+					{ type: "tool_use", id: "call_enter_plan", name: "EnterPlanMode", input: {} },
+					{ type: "text", text: "Planning mode entered." },
+				],
+				contentText: "Planning mode entered.",
+				toolCalls: [
+					{
+						toolUseId: "call_enter_plan",
+						toolName: "EnterPlanMode",
+						inputJson: {},
+						outputJson: "Entered plan mode",
+						status: "success",
+					},
+				],
+			}),
+			makeAssistantMessage({
+				id: "assistant-later",
+				contentJson: [{ type: "text", text: "Later assistant turn" }],
+				contentText: "Later assistant turn",
+			}),
+		];
+
+		pruneToolCalls(dbMessages, "assistant-pruned");
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+		expect(historyJson).not.toContain('"call_id":"call_enter_plan"');
+		expect(historyJson).not.toContain('"type":"function_call_output"');
+		expect(result.trailingToolResults).toEqual([]);
+	});
+
+	test("pruneToolCalls preserves protected tool pairs in responses history", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				id: "assistant-protected",
+				contentJson: [
+					{
+						type: "tool_use",
+						id: "call_exit_plan",
+						name: "ExitPlanMode",
+						input: { plan: "Do it" },
+					},
+					{ type: "text", text: "Plan submitted." },
+				],
+				contentText: "Plan submitted.",
+				toolCalls: [
+					{
+						toolUseId: "call_exit_plan",
+						toolName: "ExitPlanMode",
+						inputJson: { plan: "Do it" },
+						outputJson: "Plan presented for approval",
+						status: "success",
+					},
+				],
+			}),
+			makeAssistantMessage({
+				id: "assistant-after-protected",
+				contentJson: [{ type: "text", text: "Execution starts later" }],
+				contentText: "Execution starts later",
+			}),
+		];
+
+		pruneToolCalls(dbMessages, "assistant-protected");
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+		expect(historyJson).toContain('"type":"function_call"');
+		expect(historyJson).toContain('"call_id":"call_exit_plan"');
+		expect(historyJson).toContain('"type":"function_call_output"');
+		expect(historyJson).toContain("Plan presented for approval");
+		expect(result.trailingToolResults).toEqual([]);
+	});
+
+	test("buildHistory skips orphaned tool_use blocks without completed tool results", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				id: "assistant-orphaned",
+				contentJson: [
+					{ type: "tool_use", id: "call_orphaned", name: "Read", input: { file_path: "/tmp/a" } },
+					{ type: "text", text: "This tool call was pruned elsewhere." },
+				],
+				contentText: "This tool call was pruned elsewhere.",
+				toolCalls: [],
+			}),
+			makeAssistantMessage({
+				id: "assistant-after-orphaned",
+				contentJson: [{ type: "text", text: "Next assistant turn" }],
+				contentText: "Next assistant turn",
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+		expect(historyJson).not.toContain('"call_id":"call_orphaned"');
+		expect(historyJson).not.toContain('"type":"function_call"');
+		expect(result.trailingToolResults).toEqual([]);
 	});
 });

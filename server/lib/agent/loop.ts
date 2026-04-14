@@ -1012,7 +1012,12 @@ export async function* agentLoop(
 						}
 					}
 
+					if (parsed.silentDisconnect) {
+						yield { type: "silent_disconnect" };
+						return;
+					}
 					if (parsed.messageId) messageId = parsed.messageId;
+
 					if (parsed.credentialId) credentialId = parsed.credentialId;
 
 					if (parsed.reasoning) {
@@ -1693,6 +1698,7 @@ export async function* agentLoop(
 				toolUses,
 				collectReasoningBlocks(reasoningBlockMap),
 				collectCompletedWebSearches(webSearchAccum),
+				messageId,
 			);
 			yield { type: "turn_complete", turnIndex };
 			return;
@@ -1717,6 +1723,7 @@ export async function* agentLoop(
 				cleanToolUses,
 				collectReasoningBlocks(reasoningBlockMap),
 				collectCompletedWebSearches(webSearchAccum),
+				messageId,
 			);
 
 			// Inject a user-side reminder so the model knows what happened and
@@ -1735,6 +1742,7 @@ export async function* agentLoop(
 				toolUses,
 				collectReasoningBlocks(reasoningBlockMap),
 				collectCompletedWebSearches(webSearchAccum),
+				messageId,
 			);
 		}
 

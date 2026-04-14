@@ -647,10 +647,17 @@ export class OpenAIProvider implements ProviderAdapter {
 			queries?: string[];
 			outputIndex?: number;
 		}>,
+		messageId?: string,
 	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
-			const items = buildResponsesAssistantTurnItems(text, toolUses, reasoningBlocks, webSearches);
+			const items = buildResponsesAssistantTurnItems(
+				text,
+				toolUses,
+				reasoningBlocks,
+				webSearches,
+				messageId,
+			);
 			for (const item of items) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
 				h.push(item as any);
@@ -1101,6 +1108,20 @@ export function parseResponsesAPIEvent(
 	// ── Text streaming ──
 	if (type === "response.output_text.delta" && typeof chunk.delta === "string") {
 		results.push({ text: chunk.delta });
+		return results;
+	}
+
+	// ── Assistant message items ──
+	// Responses API surfaces assistant messages as output items with stable item ids.
+	// Capture the id so higher layers can persist and replay it as the official
+	// message item id instead of synthesizing a local UUID.
+	if (
+		(type === "response.output_item.added" || type === "response.output_item.done") &&
+		chunk.item?.type === "message" &&
+		chunk.item.role === "assistant" &&
+		chunk.item.id
+	) {
+		results.push({ messageId: chunk.item.id });
 		return results;
 	}
 
@@ -1883,7 +1904,9 @@ function buildResponsesPreludeItems(
 				action: {
 					type: "search",
 					...(block.query ? { query: block.query } : {}),
-					...(block.queries?.length ? { queries: block.queries } : {}),
+					...(Array.isArray(block.queries) && block.queries.length > 0
+						? { queries: block.queries }
+						: {}),
 				},
 			} as unknown as OAIMessage,
 			outputIndex: block.outputIndex,
@@ -1908,6 +1931,7 @@ function buildResponsesAssistantTurnItems(
 	toolUses: AgentToolUse[],
 	reasoningBlocks?: ResponsesReasoningBlock[],
 	webSearches?: ResponsesWebSearchBlock[],
+	messageId?: string,
 ): OAIMessage[] {
 	const items: OAIMessage[] = [];
 	const prelude = buildResponsesPreludeItems(reasoningBlocks, webSearches);
@@ -1915,6 +1939,7 @@ function buildResponsesAssistantTurnItems(
 	const assistantText = mergeAssistantText(text, prelude.fallbackText);
 	if (assistantText) {
 		items.push({
+			...(messageId ? { id: messageId } : {}),
 			role: "assistant",
 			content: [{ type: "output_text", text: assistantText }],
 		} as unknown as OAIMessage);
@@ -1925,6 +1950,143 @@ function buildResponsesAssistantTurnItems(
 			call_id: tu.toolUseId,
 			name: tu.name,
 			arguments: JSON.stringify(tu.input),
+		} as unknown as OAIMessage);
+	}
+	return items;
+}
+
+function buildResponsesAssistantMessageItem(text: string, messageId?: string): OAIMessage | null {
+	const trimmed = text.trim();
+	if (!trimmed) return null;
+	return {
+		...(messageId ? { id: messageId } : {}),
+		role: "assistant",
+		content: [{ type: "output_text", text: trimmed }],
+	} as unknown as OAIMessage;
+}
+
+function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessage[] {
+	type StoredAssistantBlock =
+		| { type: "text"; text?: string }
+		| {
+				type: "reasoning";
+				text?: string;
+				providerMetadata?: import("./types").ReasoningProviderMetadata;
+				outputIndex?: number;
+		  }
+		| {
+				type: "web_search";
+				id: string;
+				query?: string;
+				queries?: string[];
+				outputIndex?: number;
+		  }
+		| { type: "tool_use"; id: string; name?: string; input?: Record<string, unknown> }
+		| { type: string; [key: string]: unknown };
+
+	const blocks = (Array.isArray(msg.contentJson) ? msg.contentJson : []) as StoredAssistantBlock[];
+	const completedToolCalls = new Map(
+		(msg.toolCalls ?? [])
+			.filter((tc) => tc.status === "success" || tc.status === "fail")
+			.filter((tc) => tc.toolName && tc.toolUseId)
+			.map((tc) => [tc.toolUseId, tc]),
+	);
+	const items: OAIMessage[] = [];
+	const textBuffer: string[] = [];
+	const consumedToolUseIds = new Set<string>();
+	let messageIdAvailable = msg.messageUuid ?? undefined;
+
+	const flushTextBuffer = () => {
+		const text = textBuffer.join("\n");
+		textBuffer.length = 0;
+		const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
+		if (item) {
+			items.push(item);
+			messageIdAvailable = undefined;
+		}
+	};
+
+	for (const block of blocks) {
+		if (block.type === "text") {
+			if (typeof block.text === "string" && block.text.length > 0) {
+				textBuffer.push(block.text);
+			}
+			continue;
+		}
+
+		if (block.type === "reasoning") {
+			flushTextBuffer();
+			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
+			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
+			const metadata = reasoningBlock.providerMetadata?.openai;
+			if (metadata?.reasoningEncryptedContent) {
+				items.push({
+					type: "reasoning",
+					id: metadata.itemId,
+					summary: text ? [{ type: "summary_text", text }] : [],
+					encrypted_content: metadata.reasoningEncryptedContent,
+				} as unknown as OAIMessage);
+			} else if (text) {
+				const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
+				if (item) {
+					items.push(item);
+					messageIdAvailable = undefined;
+				}
+			}
+			continue;
+		}
+
+		if (block.type === "web_search") {
+			flushTextBuffer();
+			const webSearchBlock = block as Extract<StoredAssistantBlock, { type: "web_search" }>;
+			if (
+				!webSearchBlock.query &&
+				!(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
+			) {
+				continue;
+			}
+			items.push({
+				type: "web_search_call",
+				id: webSearchBlock.id,
+				status: "completed",
+				action: {
+					type: "search",
+					...(webSearchBlock.query ? { query: webSearchBlock.query } : {}),
+					...(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0
+						? { queries: webSearchBlock.queries }
+						: {}),
+				},
+			} as unknown as OAIMessage);
+			continue;
+		}
+
+		if (block.type === "tool_use") {
+			flushTextBuffer();
+			const toolUseBlock = block as Extract<StoredAssistantBlock, { type: "tool_use" }>;
+			const toolCall = completedToolCalls.get(toolUseBlock.id);
+			// Defensive guard: replaying a function_call without a persisted completed
+			// tool call would create an invalid Responses history (missing the paired
+			// function_call_output). If the DB/tool-call relation is missing, skip the
+			// orphaned tool_use block instead of sending malformed history.
+			if (!toolCall?.toolName) continue;
+			consumedToolUseIds.add(toolUseBlock.id);
+			items.push({
+				type: "function_call",
+				call_id: toolUseBlock.id,
+				name: toolCall.toolName,
+				arguments: JSON.stringify(toolCall.inputJson ?? toolUseBlock.input ?? {}),
+			} as unknown as OAIMessage);
+		}
+	}
+
+	flushTextBuffer();
+	for (const [toolUseId, toolCall] of completedToolCalls.entries()) {
+		if (consumedToolUseIds.has(toolUseId)) continue;
+		items.push({
+			type: "function_call",
+			call_id: toolUseId,
+			name: toolCall.toolName,
+			arguments: JSON.stringify(toolCall.inputJson ?? {}),
 		} as unknown as OAIMessage);
 	}
 	return items;
@@ -1967,51 +2129,7 @@ async function buildResponsesHistory(
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 
-			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const textParts = content
-				.filter((b: { type: string }) => b.type === "text")
-				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
-			const reasoningBlocks = content
-				.filter((b: { type: string }) => b.type === "reasoning")
-				.map(
-					(b: {
-						text: string;
-						providerMetadata?: import("./types").ReasoningProviderMetadata;
-						outputIndex?: number;
-					}) => ({
-						text: b.text,
-						providerMetadata: b.providerMetadata,
-						outputIndex: b.outputIndex,
-					}),
-				);
-			const webSearchBlocks = content
-				.filter((b: { type: string }) => b.type === "web_search")
-				.map((b: { id: string; query?: string; queries?: string[]; outputIndex?: number }) => ({
-					id: b.id,
-					query: b.query,
-					queries: b.queries,
-					outputIndex: b.outputIndex,
-				}));
-			const completedToolUseIds = new Set(
-				msg.toolCalls
-					?.filter((tc) => tc.status === "success" || tc.status === "fail")
-					.map((tc) => tc.toolUseId) ?? [],
-			);
-			const toolUses =
-				msg.toolCalls
-					?.filter((tc) => tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId))
-					.map((tc) => ({
-						toolUseId: tc.toolUseId,
-						name: tc.toolName,
-						input: (tc.inputJson ?? {}) as Record<string, unknown>,
-					})) ?? [];
-			const assistantItems = buildResponsesAssistantTurnItems(
-				text,
-				toolUses,
-				reasoningBlocks,
-				webSearchBlocks,
-			);
+			const assistantItems = buildResponsesAssistantItemsFromStoredContent(msg);
 			if (assistantItems.length === 0) {
 				continue;
 			}

@@ -57,6 +57,8 @@
 	"splitDown": "向下分割",
 	"dropNarratorHere": "拖放叙述者到此处",
 	"distributePanels": "均匀分配面板",
+	"workspaceSplitMode": "分屏模式",
+	"workspaceDirectorMode": "导播台模式",
 	"createdAtLabel": "创建于 {{time}}",
 	"lastMessageAtLabel": "最后消息 {{time}}",
 	"addWebview": "添加网页视图",

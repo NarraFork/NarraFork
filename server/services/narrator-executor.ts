@@ -25,8 +25,11 @@ export interface ExecuteLoopResult {
 	retryableError?: string;
 	/** Set when smart interruption check detected the output was cut off. */
 	interrupted?: boolean;
+	/** Upstream socket closed quietly and the turn should end without recovery/error UI. */
+	silentDisconnect?: boolean;
 	/** Set when the agent loop was aborted before the turn completed normally. */
 	aborted?: boolean;
+
 	/**
 	 * When true, the interrupted turn should be resumed by replaying the
 	 * trailing tool-result request packet instead of sending a textual
@@ -63,6 +66,7 @@ export async function executeAgentLoop(
 	let retryableError: string | undefined;
 	let lastToolNames: string[] = [];
 	let interrupted = false;
+	let silentDisconnect = false;
 	let aborted = false;
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
@@ -119,6 +123,10 @@ export async function executeAgentLoop(
 			// mark as interrupted directly, no need for AI judgement.
 			interrupted = true;
 		}
+		if (event.type === "silent_disconnect") {
+			silentDisconnect = true;
+			break;
+		}
 		if (event.type === "error") {
 			if (event.message === "Aborted") {
 				aborted = true;
@@ -150,6 +158,7 @@ export async function executeAgentLoop(
 		lastToolNames.length > 0 && lastToolNames.every((n) => n === "TaskCreate");
 	if (
 		!interrupted &&
+		!silentDisconnect &&
 		settings.agent.smartInterruptionCheck &&
 		!hasError &&
 		!contextLengthExceeded &&
@@ -167,6 +176,7 @@ export async function executeAgentLoop(
 		contextLengthExceeded,
 		retryableError,
 		interrupted,
+		silentDisconnect,
 		aborted,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),

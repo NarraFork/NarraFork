@@ -23,6 +23,7 @@
 	"plan": "计划",
 	"back": "返回",
 	"sendPlaceholder": "发送消息...",
+	"sendFailed": "发送消息失败",
 	"chapterMergedHint": "本章节已合并，需重新唤醒后才能继续编辑。",
 	"interrupt": "中断",
 	"interruptHoldHint": "长按按钮以中断",

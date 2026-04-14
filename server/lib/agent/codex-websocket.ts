@@ -1,6 +1,9 @@
 import type { Agent as HttpAgent, IncomingMessage } from "node:http";
+import { eq, sql } from "drizzle-orm";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import type WebSocket from "ws";
+import { db } from "../../db";
+import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
 import { getHttpUserAgent } from "../user-agent";
 import {
@@ -22,6 +25,13 @@ const CONNECTION_IDLE_TIMEOUT_MS = 60_000;
 const SESSION_IDLE_TTL_MS = 10 * 60_000;
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
 const MAX_SESSION_CACHE_SIZE = 100;
+const RECENT_NARRATOR_MESSAGE_WINDOW_MS = 5 * 60_000;
+const MAX_PREMATURE_CLOSE_RECONNECTS = 1;
+
+interface PrematureCloseRetryDecision {
+	shouldReconnect: boolean;
+	shouldFallback: boolean;
+}
 
 type PendingFrame =
 	| { type: "message"; text: string }
@@ -71,6 +81,7 @@ export interface StreamCodexResponsesWebSocketOptions {
 	accountId?: string;
 	proxy?: string;
 	sessionKey: string;
+	narratorId?: string;
 	credentialId: string;
 	model: string;
 	request: CodexResponsesRequestBody;
@@ -157,6 +168,61 @@ export function isCodexResponsesWebSocketSessionExpired(
 	idleTtlMs = SESSION_IDLE_TTL_MS,
 ): boolean {
 	return !session.busy && now - session.lastUsedAt > idleTtlMs;
+}
+
+export function hasRecentNarratorMessage(
+	createdAt?: string | null,
+	now = Date.now(),
+	windowMs = RECENT_NARRATOR_MESSAGE_WINDOW_MS,
+): boolean {
+	if (!createdAt) return false;
+	const createdAtMs = Date.parse(createdAt);
+	if (Number.isNaN(createdAtMs)) return false;
+	return now - createdAtMs <= windowMs;
+}
+
+export function isCodexWebSocketIdleTimeoutError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		error.message === "Codex WebSocket idle timeout waiting for response event"
+	);
+}
+
+export function decidePrematureCodexReconnect(
+	latestMessageCreatedAt: string | null,
+	hasYieldedEvents: boolean,
+	reconnectCount: number,
+	now = Date.now(),
+): PrematureCloseRetryDecision {
+	const hasRecentNarratorActivity = hasRecentNarratorMessage(latestMessageCreatedAt, now);
+	return {
+		shouldReconnect:
+			hasRecentNarratorActivity &&
+			!hasYieldedEvents &&
+			reconnectCount < MAX_PREMATURE_CLOSE_RECONNECTS,
+		shouldFallback: hasRecentNarratorActivity && !hasYieldedEvents,
+	};
+}
+
+async function getLatestNarratorMessageCreatedAt(narratorId?: string): Promise<string | null> {
+	if (!narratorId) return null;
+	const rows = await db
+		.select({ createdAt: narratorMessages.createdAt })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+		.where(eq(narratorMessageRefs.narratorId, narratorId))
+		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+		.limit(1);
+	return rows[0]?.createdAt ?? null;
+}
+
+export function shouldTreatCodexStreamEventAsYielded(event: ParsedStreamEvent): boolean {
+	return Boolean(
+		(typeof event.text === "string" && event.text.length > 0) ||
+			(typeof event.reasoning === "string" && event.reasoning.length > 0) ||
+			event.toolUseChunk?.stop === true ||
+			event.webSearch?.final === true,
+	);
 }
 
 async function removeSession(cacheKey: string, session: CachedSession): Promise<void> {
@@ -541,23 +607,103 @@ export async function* streamCodexResponsesWebSocket(
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 
 	try {
-		connection = await ensureConnection(session, options);
 		const websocketRequest = buildCodexResponsesWebSocketRequest(
 			request,
 			session.lastRequest,
 			session.lastCompleted,
 		);
-		await connection.send(JSON.stringify(websocketRequest));
+		const requestText = JSON.stringify(websocketRequest);
+		let reconnectCount = 0;
+		let hasYieldedEvents = false;
+
+		connection = await ensureConnection(session, options);
+		await connection.send(requestText);
 
 		while (true) {
-			const frame = await connection.nextFrame(CONNECTION_IDLE_TIMEOUT_MS, options.signal);
+			let frame: PendingFrame;
+			try {
+				frame = await connection.nextFrame(CONNECTION_IDLE_TIMEOUT_MS, options.signal);
+			} catch (error) {
+				if (!isCodexWebSocketIdleTimeoutError(error)) {
+					throw error;
+				}
+				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
+				const decision = decidePrematureCodexReconnect(
+					latestMessageCreatedAt,
+					hasYieldedEvents,
+					reconnectCount,
+				);
+				logger.warn("Codex WebSocket timed out before response.completed", {
+					sessionKey: options.sessionKey,
+					narratorId: options.narratorId,
+					credentialId: options.credentialId,
+					model: options.model,
+					latestMessageCreatedAt,
+					shouldReconnect: decision.shouldReconnect,
+					shouldFallback: decision.shouldFallback,
+					hasYieldedEvents,
+					reconnectCount,
+				});
+				if (decision.shouldReconnect) {
+					await closeSessionConnection(session);
+					connection = null;
+					reconnectCount++;
+					touchSession(session);
+					connection = await ensureConnection(session, options);
+					await connection.send(requestText);
+					continue;
+				}
+				await resetSession(session, false);
+				connection = null;
+				if (decision.shouldFallback) {
+					throw new CodexWebSocketFallbackError(
+						error instanceof Error ? error.message : String(error),
+					);
+				}
+				yield { silentDisconnect: true };
+				return;
+			}
 			if (frame.type === "error") {
 				throw frame.error;
 			}
 			if (frame.type === "close") {
-				throw new Error(
-					`Codex WebSocket closed before response.completed (code: ${frame.code}, reason: ${frame.reason})`,
+				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
+				const decision = decidePrematureCodexReconnect(
+					latestMessageCreatedAt,
+					hasYieldedEvents,
+					reconnectCount,
 				);
+				logger.warn("Codex WebSocket closed before response.completed", {
+					sessionKey: options.sessionKey,
+					narratorId: options.narratorId,
+					credentialId: options.credentialId,
+					model: options.model,
+					code: frame.code,
+					reason: frame.reason,
+					latestMessageCreatedAt,
+					shouldReconnect: decision.shouldReconnect,
+					shouldFallback: decision.shouldFallback,
+					hasYieldedEvents,
+					reconnectCount,
+				});
+				if (decision.shouldReconnect) {
+					await closeSessionConnection(session);
+					connection = null;
+					reconnectCount++;
+					touchSession(session);
+					connection = await ensureConnection(session, options);
+					await connection.send(requestText);
+					continue;
+				}
+				await resetSession(session, false);
+				connection = null;
+				if (decision.shouldFallback) {
+					throw new CodexWebSocketFallbackError(
+						`Codex WebSocket closed before response.completed (code: ${frame.code}, reason: ${frame.reason})`,
+					);
+				}
+				yield { silentDisconnect: true };
+				return;
 			}
 
 			const wrappedError = parseWrappedError(frame.text);
@@ -586,6 +732,7 @@ export async function* streamCodexResponsesWebSocket(
 			}
 
 			for (const event of parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum)) {
+				hasYieldedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 				yield event;
 			}
 
