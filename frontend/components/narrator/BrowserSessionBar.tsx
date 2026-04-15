@@ -22,12 +22,22 @@ import { useTranslation } from "react-i18next";
 import { useBrowserSessions, useCloseBrowserSession } from "../../hooks/useBrowserSessions";
 import { getToken } from "../../lib/api";
 
-export function BrowserSessionBar({ narratorId }: { narratorId: string }) {
+export function BrowserSessionBar({
+	narratorId,
+	sessionCount,
+}: {
+	narratorId: string;
+	sessionCount?: number;
+}) {
 	const { t } = useTranslation("narrator");
-	const { data: sessions } = useBrowserSessions(narratorId);
 	const [opened, setOpened] = useState(false);
+	// Only fetch full session list when the bar is expanded — avoids API call on page load.
+	// The parent provides sessionCount from WS events to show/hide the bar without fetching.
+	const { data: sessions } = useBrowserSessions(opened ? narratorId : "");
 
-	if (!sessions?.length) return null;
+	// Show the bar if WS told us there are sessions, or if we already fetched them
+	const count = sessions?.length ?? sessionCount ?? 0;
+	if (count === 0) return null;
 
 	return (
 		<Box
@@ -49,14 +59,14 @@ export function BrowserSessionBar({ narratorId }: { narratorId: string }) {
 						{t("browser.title")}
 					</Text>
 					<Badge size="xs" variant="light" color="teal" circle>
-						{sessions.length}
+						{count}
 					</Badge>
 				</Group>
 				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</UnstyledButton>
 			<Collapse in={opened}>
 				<Box px="md" pb="xs">
-					{sessions.map((session) => (
+					{sessions?.map((session) => (
 						<SessionCard key={session.id} narratorId={narratorId} session={session} />
 					))}
 				</Box>

@@ -1,7 +1,7 @@
 import { Badge, Card, Group, Text } from "@mantine/core";
 import { IconEye } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
@@ -53,19 +53,8 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 	const onResizeEnd = useCallback(() => setIsResizing(false), []);
 
 	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over NarratorPanel
+	// (handled by NowheelPassthrough in NarraFlow — no per-node listener needed)
 	const panelWheelRef = useRef<HTMLDivElement>(null);
-	useEffect(() => {
-		const el = panelWheelRef.current;
-		if (!el) return;
-		const handler = (e: WheelEvent) => {
-			if (e.ctrlKey || e.metaKey) {
-				el.classList.remove("nowheel");
-				requestAnimationFrame(() => el.classList.add("nowheel"));
-			}
-		};
-		el.addEventListener("wheel", handler, { capture: true, passive: true });
-		return () => el.removeEventListener("wheel", handler, { capture: true });
-	}, []);
 
 	return (
 		<>

@@ -78,6 +78,32 @@ interface ContextMenuState {
 
 const PAN_SPEED = 1.5;
 
+/**
+ * Delegated Ctrl+wheel passthrough for all `.nowheel` containers inside graph nodes.
+ * Instead of each node registering its own wheel listener, this single capture-phase
+ * listener on the ReactFlow root temporarily removes `.nowheel` so the event bubbles
+ * through to ReactFlow's zoom handler.
+ */
+function NowheelPassthrough() {
+	useEffect(() => {
+		const root = document.querySelector(".react-flow") as HTMLElement | null;
+		if (!root) return;
+
+		const onWheel = (e: WheelEvent) => {
+			if (!e.ctrlKey && !e.metaKey) return;
+			const el = (e.target as HTMLElement).closest?.(".nowheel") as HTMLElement | null;
+			if (!el || !root.contains(el)) return;
+			el.classList.remove("nowheel");
+			requestAnimationFrame(() => el.classList.add("nowheel"));
+		};
+
+		root.addEventListener("wheel", onWheel, { capture: true, passive: true });
+		return () => root.removeEventListener("wheel", onWheel, { capture: true });
+	}, []);
+
+	return null;
+}
+
 /** Mounted inside <ReactFlow> — intercepts Ctrl+wheel (vertical pan) and Shift+wheel (horizontal pan). */
 function ModifierWheelPan() {
 	const { getViewport, setViewport } = useReactFlow();
@@ -1615,6 +1641,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					proOptions={{ hideAttribution: true }}
 				>
 					<ModifierWheelPan />
+					<NowheelPassthrough />
 					<LassoSelection pcDragMode={pcDragMode} onSelect={onLassoSelect} />
 					<SelectionToolbar
 						selectedNodeIds={selectedNodeIds}

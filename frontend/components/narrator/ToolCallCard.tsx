@@ -737,155 +737,178 @@ export function StatusIcon({ status }: { status: string }) {
 
 // --- Shared card header ---
 
-function ToolHeader({
-	toolCall,
-	opened,
-	onToggle,
-}: {
-	toolCall: ToolCallData;
-	opened: boolean;
-	onToggle?: () => void;
-}) {
-	const cat = getCategory(toolCall.toolName);
-	const Icon = getCategoryIcon(cat);
-	const color = getCategoryColor(cat);
-	const summary = useMemo(
-		() => getSummary(toolCall.toolName, toolCall.inputJson, toolCall._metadata),
-		[toolCall.toolName, toolCall.inputJson, toolCall._metadata],
-	);
-	const searchPathSuffix = useMemo(() => {
-		if (cat !== "search") return null;
-		const p = extractField(toolCall.inputJson, "path");
-		if (!p) return null;
-		return basename(p) || p;
-	}, [cat, toolCall.inputJson]);
-	const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
-	const { t } = useTranslation("narrator");
+const ToolHeader = memo(
+	function ToolHeader({
+		toolCall,
+		opened,
+		onToggle,
+	}: {
+		toolCall: ToolCallData;
+		opened: boolean;
+		onToggle?: () => void;
+	}) {
+		const cat = getCategory(toolCall.toolName);
+		const Icon = getCategoryIcon(cat);
+		const color = getCategoryColor(cat);
+		const summary = useMemo(
+			() => getSummary(toolCall.toolName, toolCall.inputJson, toolCall._metadata),
+			[toolCall.toolName, toolCall.inputJson, toolCall._metadata],
+		);
+		const searchPathSuffix = useMemo(() => {
+			if (cat !== "search") return null;
+			const p = extractField(toolCall.inputJson, "path");
+			if (!p) return null;
+			return basename(p) || p;
+		}, [cat, toolCall.inputJson]);
+		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
+		const { t } = useTranslation("narrator");
 
-	const startedAtLabel = useMemo(() => {
-		if (toolCall.startedAt == null) return null;
-		return t("toolStartedAt", {
-			time: new Date(toolCall.startedAt).toLocaleTimeString(),
-		});
-	}, [toolCall.startedAt, t]);
+		const startedAtLabel = useMemo(() => {
+			if (toolCall.startedAt == null) return null;
+			return t("toolStartedAt", {
+				time: new Date(toolCall.startedAt).toLocaleTimeString(),
+			});
+		}, [toolCall.startedAt, t]);
 
-	// For Terminal tool, show "Terminal Read" / "Terminal Write" / "Terminal List" as the label
-	const displayName = useMemo(() => {
-		if (cat === "terminal") {
-			const action = extractField(toolCall.inputJson, "action");
-			if (action) return `Terminal ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
-		}
-		return toolCall.toolName;
-	}, [cat, toolCall.toolName, toolCall.inputJson]);
+		// For Terminal tool, show "Terminal Read" / "Terminal Write" / "Terminal List" as the label
+		const displayName = useMemo(() => {
+			if (cat === "terminal") {
+				const action = extractField(toolCall.inputJson, "action");
+				if (action) return `Terminal ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
+			}
+			return toolCall.toolName;
+		}, [cat, toolCall.toolName, toolCall.inputJson]);
 
-	// For Bash tools, show a badge when a custom timeout is specified (default is 120000ms)
-	const customTimeout = useMemo(() => {
-		if (cat !== "bash") return null;
-		const ms = extractNumericField(toolCall.inputJson, "timeout");
-		if (ms == null || ms === 120_000) return null;
-		if (ms >= 60_000) {
-			const m = Math.round(ms / 60_000);
-			return `${m}m`;
-		}
-		return `${Math.round(ms / 1000)}s`;
-	}, [cat, toolCall.inputJson]);
+		// For Bash tools, show a badge when a custom timeout is specified (default is 120000ms)
+		const customTimeout = useMemo(() => {
+			if (cat !== "bash") return null;
+			const ms = extractNumericField(toolCall.inputJson, "timeout");
+			if (ms == null || ms === 120_000) return null;
+			if (ms >= 60_000) {
+				const m = Math.round(ms / 60_000);
+				return `${m}m`;
+			}
+			return `${Math.round(ms / 1000)}s`;
+		}, [cat, toolCall.inputJson]);
 
-	// For Bash tools, prefer pure execution time (excludes streaming parse + permission wait)
-	const displayDurationMs = useMemo(() => {
-		if (toolCall.durationMs == null) return null;
-		if (cat === "bash") {
-			const exec =
-				typeof toolCall._metadata?.execDurationMs === "number"
-					? toolCall._metadata.execDurationMs
-					: undefined;
-			if (exec != null) return exec;
-		}
-		return toolCall.durationMs;
-	}, [cat, toolCall.durationMs, toolCall._metadata]);
+		// For Bash tools, prefer pure execution time (excludes streaming parse + permission wait)
+		const displayDurationMs = useMemo(() => {
+			if (toolCall.durationMs == null) return null;
+			if (cat === "bash") {
+				const exec =
+					typeof toolCall._metadata?.execDurationMs === "number"
+						? toolCall._metadata.execDurationMs
+						: undefined;
+				if (exec != null) return exec;
+			}
+			return toolCall.durationMs;
+		}, [cat, toolCall.durationMs, toolCall._metadata]);
 
-	const content = (
-		<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
-			<ThemeIcon size={16} variant="light" color={color} radius="sm">
-				<Icon size={10} />
-			</ThemeIcon>
-			<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-				{displayName}
-			</Text>
-			{searchPathSuffix ? (
-				<Box
-					component="span"
-					ff="monospace"
-					style={{
-						flex: 1,
-						minWidth: 0,
-						fontSize: 12,
-						overflow: "hidden",
-						textOverflow: "ellipsis",
-						whiteSpace: "nowrap",
-					}}
-					title={summary}
-				>
-					<span>{extractField(toolCall.inputJson, "pattern", "glob")}</span>
-					<span style={{ color: "var(--mantine-color-dimmed)", marginLeft: 4 }}>
-						in {searchPathSuffix}
-					</span>
-				</Box>
-			) : (
-				<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
-					{summary}
+		const content = (
+			<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
+				<ThemeIcon size={16} variant="light" color={color} radius="sm">
+					<Icon size={10} />
+				</ThemeIcon>
+				<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+					{displayName}
 				</Text>
-			)}
-			<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
-				<Tooltip label={startedAtLabel} disabled={!startedAtLabel} position="top" withArrow fz="xs">
-					<Group gap={4} wrap="nowrap" align="center">
-						<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
-							<StatusIcon status={toolCall.status} />
-						</Box>
-						{toolCall.startedAt != null &&
-						(toolCall.status === "running" ||
-							toolCall.status === "pending" ||
-							toolCall.status === "initializing") ? (
-							<ElapsedTimer startedAt={toolCall.startedAt} />
-						) : (
-							displayDurationMs != null && (
-								<Text size="xs" c="dimmed" ff="monospace">
-									{(displayDurationMs / 1000).toFixed(1)}s{customTimeout && `/${customTimeout}`}
-								</Text>
-							)
-						)}
-					</Group>
-				</Tooltip>
-				<Box style={{ display: "flex", alignItems: "center" }}>
-					{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-				</Box>
+				{searchPathSuffix ? (
+					<Box
+						component="span"
+						ff="monospace"
+						style={{
+							flex: 1,
+							minWidth: 0,
+							fontSize: 12,
+							overflow: "hidden",
+							textOverflow: "ellipsis",
+							whiteSpace: "nowrap",
+						}}
+						title={summary}
+					>
+						<span>{extractField(toolCall.inputJson, "pattern", "glob")}</span>
+						<span style={{ color: "var(--mantine-color-dimmed)", marginLeft: 4 }}>
+							in {searchPathSuffix}
+						</span>
+					</Box>
+				) : (
+					<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
+						{summary}
+					</Text>
+				)}
+				<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
+					<Tooltip
+						label={startedAtLabel}
+						disabled={!startedAtLabel}
+						position="top"
+						withArrow
+						fz="xs"
+					>
+						<Group gap={4} wrap="nowrap" align="center">
+							<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
+								<StatusIcon status={toolCall.status} />
+							</Box>
+							{toolCall.startedAt != null &&
+							(toolCall.status === "running" ||
+								toolCall.status === "pending" ||
+								toolCall.status === "initializing") ? (
+								<ElapsedTimer startedAt={toolCall.startedAt} />
+							) : (
+								displayDurationMs != null && (
+									<Text size="xs" c="dimmed" ff="monospace">
+										{(displayDurationMs / 1000).toFixed(1)}s{customTimeout && `/${customTimeout}`}
+									</Text>
+								)
+							)}
+						</Group>
+					</Tooltip>
+					<Box style={{ display: "flex", alignItems: "center" }}>
+						{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+					</Box>
+				</Group>
 			</Group>
-		</Group>
-	);
+		);
 
-	const handleClick = useCallback(
-		(e: React.MouseEvent) => {
-			// When Ctrl/Cmd or Shift is held, skip toggle — let the event bubble
-			// up to the outer selection handler so the card is only selected.
-			if (e.metaKey || e.ctrlKey || e.shiftKey) return;
-			onToggle?.();
-		},
-		[onToggle],
-	);
+		const handleClick = useCallback(
+			(e: React.MouseEvent) => {
+				// When Ctrl/Cmd or Shift is held, skip toggle — let the event bubble
+				// up to the outer selection handler so the card is only selected.
+				if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+				onToggle?.();
+			},
+			[onToggle],
+		);
 
-	return (
-		<UnstyledButton
-			onClick={handleClick}
-			w="100%"
-			style={{
-				...(onToggle ? {} : { cursor: "default", pointerEvents: "none" as const }),
-				display: "flex",
-				alignItems: "center",
-			}}
-		>
-			{content}
-		</UnstyledButton>
-	);
-}
+		return (
+			<UnstyledButton
+				onClick={handleClick}
+				w="100%"
+				style={{
+					...(onToggle ? {} : { cursor: "default", pointerEvents: "none" as const }),
+					display: "flex",
+					alignItems: "center",
+				}}
+			>
+				{content}
+			</UnstyledButton>
+		);
+	},
+	(prev, next) => {
+		const p = prev.toolCall;
+		const n = next.toolCall;
+		return (
+			p.toolName === n.toolName &&
+			p.toolUseId === n.toolUseId &&
+			p.status === n.status &&
+			p.durationMs === n.durationMs &&
+			p.inputJson === n.inputJson &&
+			p._metadata === n._metadata &&
+			p.startedAt === n.startedAt &&
+			prev.opened === next.opened &&
+			prev.onToggle === next.onToggle
+		);
+	},
+);
 
 /**
  * Localize known tool error messages (e.g. Chrome not installed).
@@ -1249,54 +1272,64 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
  * Rendered outside LazyCollapse so it's always visible without expanding the card.
  * Uses a local timer to detect ≥60s elapsed — no dependency on WS push.
  */
-function LongRunningTerminateButton({
-	toolCall,
-	narratorId,
-}: {
-	toolCall: ToolCallData;
-	narratorId?: string;
-}) {
-	const { t: tNarrator } = useTranslation("narrator");
-	const interruptMutation = useInterruptNarrator();
+const LongRunningTerminateButton = memo(
+	function LongRunningTerminateButton({
+		toolCall,
+		narratorId,
+	}: {
+		toolCall: ToolCallData;
+		narratorId?: string;
+	}) {
+		const { t: tNarrator } = useTranslation("narrator");
+		const interruptMutation = useInterruptNarrator();
 
-	const isBash = BASH_TOOLS.has(toolCall.toolName);
-	const isMcp = toolCall.toolName.startsWith("mcp__");
-	const isLongRunnable = isBash || isMcp;
-	const isRunning = toolCall.status === "running" && !!narratorId;
+		const isBash = BASH_TOOLS.has(toolCall.toolName);
+		const isMcp = toolCall.toolName.startsWith("mcp__");
+		const isLongRunnable = isBash || isMcp;
+		const isRunning = toolCall.status === "running" && !!narratorId;
 
-	// 本地 5s 轮询计算已运行时长。startedAt 来自 tool_started WS 事件，
-	// 由 MessageBubble 从 message.toolCalls 传入。不依赖 WS 的 _longRunning 推送，
-	// 因为 WS 可能因心跳超时断开。
-	const [elapsed, setElapsed] = useState(0);
-	useEffect(() => {
-		if (!isLongRunnable || !isRunning || toolCall.startedAt == null) {
-			setElapsed(0);
-			return;
-		}
-		const update = () => setElapsed(Date.now() - (toolCall.startedAt ?? Date.now()));
-		update();
-		const timer = setInterval(update, 5_000);
-		return () => clearInterval(timer);
-	}, [isLongRunnable, isRunning, toolCall.startedAt]);
+		// 本地 5s 轮询计算已运行时长。startedAt 来自 tool_started WS 事件，
+		// 由 MessageBubble 从 message.toolCalls 传入。不依赖 WS 的 _longRunning 推送，
+		// 因为 WS 可能因心跳超时断开。
+		const [elapsed, setElapsed] = useState(0);
+		useEffect(() => {
+			if (!isLongRunnable || !isRunning || toolCall.startedAt == null) {
+				setElapsed(0);
+				return;
+			}
+			const update = () => setElapsed(Date.now() - (toolCall.startedAt ?? Date.now()));
+			update();
+			const timer = setInterval(update, 5_000);
+			return () => clearInterval(timer);
+		}, [isLongRunnable, isRunning, toolCall.startedAt]);
 
-	// 60_000 与后端 LONG_RUNNING_THRESHOLD_MS 保持一致
-	if (!isLongRunnable || !isRunning || elapsed < 60_000) return null;
+		// 60_000 与后端 LONG_RUNNING_THRESHOLD_MS 保持一致
+		if (!isLongRunnable || !isRunning || elapsed < 60_000) return null;
 
-	return (
-		<Box mt={4} mb={2}>
-			<Button
-				size="xs"
-				variant="light"
-				color="red"
-				leftSection={<IconPlayerStop size={14} />}
-				loading={interruptMutation.isPending}
-				onClick={() => narratorId && interruptMutation.mutate(narratorId)}
-			>
-				{tNarrator("terminateProcess")}
-			</Button>
-		</Box>
-	);
-}
+		return (
+			<Box mt={4} mb={2}>
+				<Button
+					size="xs"
+					variant="light"
+					color="red"
+					leftSection={<IconPlayerStop size={14} />}
+					loading={interruptMutation.isPending}
+					onClick={() => narratorId && interruptMutation.mutate(narratorId)}
+				>
+					{tNarrator("terminateProcess")}
+				</Button>
+			</Box>
+		);
+	},
+	(prev, next) => {
+		return (
+			prev.toolCall.toolName === next.toolCall.toolName &&
+			prev.toolCall.status === next.toolCall.status &&
+			prev.toolCall.startedAt === next.toolCall.startedAt &&
+			prev.narratorId === next.narratorId
+		);
+	},
+);
 
 function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
@@ -2951,6 +2984,42 @@ const SWIPE_REVEAL_WIDTH = 180;
 
 // --- Main single card ---
 
+/** Custom areEqual for ToolCallCard — compares toolCall by value fields instead of reference */
+function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps): boolean {
+	// Compare toolCall by key fields (avoids inline object reference mismatch)
+	const p = prev.toolCall;
+	const n = next.toolCall;
+	if (
+		p.toolUseId !== n.toolUseId ||
+		p.status !== n.status ||
+		p.durationMs !== n.durationMs ||
+		p.inputJson !== n.inputJson ||
+		p.outputJson !== n.outputJson ||
+		p._longRunning !== n._longRunning ||
+		p._streamingOutput !== n._streamingOutput ||
+		p.startedAt !== n.startedAt ||
+		p.errorMessage !== n.errorMessage
+	) {
+		return false;
+	}
+	// Compare other props
+	if (
+		prev.narratorId !== next.narratorId ||
+		prev.inRun !== next.inRun ||
+		prev.isLast !== next.isLast ||
+		prev.forceExpand !== next.forceExpand ||
+		prev.editExpandOverride !== next.editExpandOverride ||
+		prev.blockIndex !== next.blockIndex ||
+		prev.pendingPermission !== next.pendingPermission ||
+		prev.onPermissionDecision !== next.onPermissionDecision ||
+		prev.onQuestionSubmit !== next.onQuestionSubmit ||
+		prev.onQuestionDeny !== next.onQuestionDeny
+	) {
+		return false;
+	}
+	return true;
+}
+
 export const ToolCallCard = memo(function ToolCallCard({
 	toolCall,
 	narratorId,
@@ -3313,13 +3382,14 @@ export const ToolCallCard = memo(function ToolCallCard({
 		</Menu>
 	);
 
-	const previewModal = readFilePath ? (
-		<FilePreviewModal
-			filePath={readFilePath}
-			opened={previewOpened}
-			onClose={() => setPreviewOpened(false)}
-		/>
-	) : null;
+	const previewModal =
+		readFilePath && previewOpened ? (
+			<FilePreviewModal
+				filePath={readFilePath}
+				opened={previewOpened}
+				onClose={() => setPreviewOpened(false)}
+			/>
+		) : null;
 
 	// Shared selection-aware style computation for both inRun and standalone layouts
 	const buildSelectionStyle = (): React.CSSProperties => {
@@ -3392,7 +3462,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			{previewModal}
 		</>
 	);
-});
+}, toolCallCardAreEqual);
 
 // --- Grouped card for consecutive same-category tools ---
 

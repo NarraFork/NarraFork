@@ -3,7 +3,7 @@ import { notifications } from "@mantine/notifications";
 import { IconGitCommit, IconMessage, IconMinimize } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
@@ -134,22 +134,8 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 	const onResizeEnd = useCallback(() => setIsResizing(false), []);
 
 	// Allow Ctrl+wheel to pass through to ReactFlow for zoom even when over NarratorPanel
+	// (handled by NowheelPassthrough in NarraFlow — no per-node listener needed)
 	const panelWheelRef = useRef<HTMLDivElement>(null);
-	useEffect(() => {
-		const el = panelWheelRef.current;
-		if (!el) return;
-		const handler = (e: WheelEvent) => {
-			if (e.ctrlKey || e.metaKey) {
-				// Remove nowheel temporarily so ReactFlow receives the event
-				el.classList.remove("nowheel");
-				// Re-add on next frame after the event has bubbled
-				requestAnimationFrame(() => el.classList.add("nowheel"));
-			}
-		};
-		// Must use capture phase so we act before ReactFlow's listener checks the class
-		el.addEventListener("wheel", handler, { capture: true, passive: true });
-		return () => el.removeEventListener("wheel", handler, { capture: true });
-	}, []);
 
 	return (
 		<>

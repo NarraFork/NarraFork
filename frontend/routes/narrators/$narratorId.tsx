@@ -4,10 +4,9 @@ import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FileModificationsPanel } from "../../components/narrator/FileModificationsDrawer";
-import { clearHighlightCache } from "../../components/narrator/HighlightedCode";
+import { clearHighlightCache } from "../../components/narrator/highlight-cache";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import type { FileModPanelExternalProps } from "../../components/narrator/narrator-panel-types";
 import {
@@ -15,7 +14,19 @@ import {
 	createLeafWith,
 	type SplitDirection,
 } from "../../components/narrator/split-tree";
-import { NarratorTerminal } from "../../components/terminal/NarratorTerminal";
+
+// Lazy-loaded heavy panels — not needed for first paint
+const NarratorTerminal = lazy(() =>
+	import("../../components/terminal/NarratorTerminal").then((m) => ({
+		default: m.NarratorTerminal,
+	})),
+);
+const FileModificationsPanel = lazy(() =>
+	import("../../components/narrator/FileModificationsDrawer").then((m) => ({
+		default: m.FileModificationsPanel,
+	})),
+);
+
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { usePageUnload } from "../../hooks/usePageUnload";
@@ -565,12 +576,20 @@ function NarratorDetailPage() {
 					title="Terminal"
 					styles={{ body: { height: "calc(100% - 60px)", padding: 0 } }}
 				>
-					<NarratorTerminal
-						narratorId={narratorId}
-						onSendToChat={handleSendToChat}
-						onWriteRef={handleWriteRef}
-						onExit={handleTerminalExit}
-					/>
+					<Suspense
+						fallback={
+							<Center h="100%">
+								<Loader size="sm" />
+							</Center>
+						}
+					>
+						<NarratorTerminal
+							narratorId={narratorId}
+							onSendToChat={handleSendToChat}
+							onWriteRef={handleWriteRef}
+							onExit={handleTerminalExit}
+						/>
+					</Suspense>
 				</Drawer>
 			</Box>
 		);
@@ -631,12 +650,20 @@ function NarratorDetailPage() {
 							overflow: "hidden",
 						}}
 					>
-						<NarratorTerminal
-							narratorId={narratorId}
-							onSendToChat={handleSendToChat}
-							onWriteRef={handleWriteRef}
-							onExit={handleTerminalExit}
-						/>
+						<Suspense
+							fallback={
+								<Center h="100%">
+									<Loader size="sm" />
+								</Center>
+							}
+						>
+							<NarratorTerminal
+								narratorId={narratorId}
+								onSendToChat={handleSendToChat}
+								onWriteRef={handleWriteRef}
+								onExit={handleTerminalExit}
+							/>
+						</Suspense>
 					</Box>
 				</>
 			)}
@@ -665,15 +692,23 @@ function NarratorDetailPage() {
 							overflow: "hidden",
 						}}
 					>
-						<FileModificationsPanel
-							narratorId={narratorId}
-							onClose={() => setFileModOpen(false)}
-							pendingPermission={fileModPanelProps?.pendingPermission}
-							onPermissionDecision={fileModPanelProps?.onPermissionDecision}
-							deletePreviewMessageId={fileModPanelProps?.deletePreviewMessageId}
-							onConfirmDelete={fileModPanelProps?.onConfirmDelete}
-							onCancelDelete={fileModPanelProps?.onCancelDelete}
-						/>
+						<Suspense
+							fallback={
+								<Center h="100%">
+									<Loader size="sm" />
+								</Center>
+							}
+						>
+							<FileModificationsPanel
+								narratorId={narratorId}
+								onClose={() => setFileModOpen(false)}
+								pendingPermission={fileModPanelProps?.pendingPermission}
+								onPermissionDecision={fileModPanelProps?.onPermissionDecision}
+								deletePreviewMessageId={fileModPanelProps?.deletePreviewMessageId}
+								onConfirmDelete={fileModPanelProps?.onConfirmDelete}
+								onCancelDelete={fileModPanelProps?.onCancelDelete}
+							/>
+						</Suspense>
 					</Box>
 				</>
 			)}

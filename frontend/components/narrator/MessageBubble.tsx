@@ -220,399 +220,402 @@ function TextFileBlock({ block }: { block: any }) {
 	);
 }
 
-function ReasoningBlock({
-	block,
-	streaming,
-	narratorId,
-	blockIndex,
-	messageId,
-}: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
-	block: any;
-	streaming?: boolean;
-	narratorId?: string;
-	blockIndex?: number;
-	messageId?: string;
-}) {
-	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("common");
-	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
+const ReasoningBlock = memo(
+	function ReasoningBlock({
+		block,
+		streaming,
+		narratorId,
+		blockIndex,
+		messageId,
+	}: {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+		block: any;
+		streaming?: boolean;
+		narratorId?: string;
+		blockIndex?: number;
+		messageId?: string;
+	}) {
+		const { t } = useTranslation("narrator");
+		const { t: tc } = useTranslation("common");
+		const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
 
-	// Build a stable persistence key from narratorId + blockIndex.
-	// This key survives component remounts (streaming → real message transition).
-	const persistKey =
-		narratorId != null && blockIndex != null ? `${narratorId}:${blockIndex}` : undefined;
+		// Build a stable persistence key from narratorId + blockIndex.
+		// This key survives component remounts (streaming → real message transition).
+		const persistKey =
+			narratorId != null && blockIndex != null ? `${narratorId}:${blockIndex}` : undefined;
 
-	// Initialize from persisted state (if user toggled before remount) or global pref.
-	const persistedState = persistKey != null ? reasoningExpandState.get(persistKey) : undefined;
-	const [opened, setOpened] = useState(
-		persistedState !== undefined ? persistedState : expandReasoning,
-	);
+		// Initialize from persisted state (if user toggled before remount) or global pref.
+		const persistedState = persistKey != null ? reasoningExpandState.get(persistKey) : undefined;
+		const [opened, setOpened] = useState(
+			persistedState !== undefined ? persistedState : expandReasoning,
+		);
 
-	// Track whether this instance has ever been toggled by the user.
-	// On the very first render with opened=true, we bypass LazyCollapse
-	// and render Mantine's Collapse directly — this avoids the LazyCollapse
-	// effect cascade (setMounted → rAF → setReveal) that causes "Maximum
-	// update depth exceeded" when many ReasoningBlock instances mount
-	// simultaneously (e.g. loading a long conversation with expand=true).
-	const hasToggled = useRef(persistedState !== undefined);
+		// Track whether this instance has ever been toggled by the user.
+		// On the very first render with opened=true, we bypass LazyCollapse
+		// and render Mantine's Collapse directly — this avoids the LazyCollapse
+		// effect cascade (setMounted → rAF → setReveal) that causes "Maximum
+		// update depth exceeded" when many ReasoningBlock instances mount
+		// simultaneously (e.g. loading a long conversation with expand=true).
+		const hasToggled = useRef(persistedState !== undefined);
 
-	const rawText: string = block.text || block.thinking || "";
-	const translatedText: string | undefined = block.translatedText;
-	const hasEncryptedReasoning = hasEncryptedReasoningMetadata(block);
-	const encryptedPlaceholder = t("reasoningEncryptedPlaceholder");
-	const text = rawText || (hasEncryptedReasoning ? encryptedPlaceholder : "");
-	const [showTranslation, setShowTranslation] = useState(!!translatedText);
-	const prevTranslatedRef = useRef(translatedText);
-	// Auto-switch to translation when it arrives via WS update
-	useEffect(() => {
-		if (translatedText && !prevTranslatedRef.current) {
-			setShowTranslation(true);
-		}
-		prevTranslatedRef.current = translatedText;
-	}, [translatedText]);
-	const displayText = showTranslation && translatedText ? translatedText : text;
+		const rawText: string = block.text || block.thinking || "";
+		const translatedText: string | undefined = block.translatedText;
+		const hasEncryptedReasoning = hasEncryptedReasoningMetadata(block);
+		const encryptedPlaceholder = t("reasoningEncryptedPlaceholder");
+		const text = rawText || (hasEncryptedReasoning ? encryptedPlaceholder : "");
+		const [showTranslation, setShowTranslation] = useState(!!translatedText);
+		const prevTranslatedRef = useRef(translatedText);
+		// Auto-switch to translation when it arrives via WS update
+		useEffect(() => {
+			if (translatedText && !prevTranslatedRef.current) {
+				setShowTranslation(true);
+			}
+			prevTranslatedRef.current = translatedText;
+		}, [translatedText]);
+		const displayText = showTranslation && translatedText ? translatedText : text;
 
-	// --- Block ID, selection, swipe & context menu state ---
-	const rbInstanceId = useRef(nextRbInstanceId++);
-	const blockIdStr = `rb-${rbInstanceId.current}`;
-	const rootRef = useRef<HTMLDivElement>(null);
-	const selection = useMessageSelection();
-	const msgCtx = useMessageContextMenu();
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+		// --- Block ID, selection, swipe & context menu state ---
+		const rbInstanceId = useRef(nextRbInstanceId++);
+		const blockIdStr = `rb-${rbInstanceId.current}`;
+		const rootRef = useRef<HTMLDivElement>(null);
+		const selection = useMessageSelection();
+		const msgCtx = useMessageContextMenu();
+		const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 
-	const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
+		const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
 
-	const handleDeselect = useCallback(() => {
-		selection.deselectBlock(blockIdStr);
-	}, [selection.deselectBlock, blockIdStr]);
+		const handleDeselect = useCallback(() => {
+			selection.deselectBlock(blockIdStr);
+		}, [selection.deselectBlock, blockIdStr]);
 
-	const swipe = useSwipeMenu({
-		enabled: true,
-		externalBoxRef: rootRef,
-		excludeSelectors: [".mantine-Menu-dropdown"],
-		blockId: blockIdStr,
-		onSwipeRight: isSelected ? handleDeselect : undefined,
-	});
+		const swipe = useSwipeMenu({
+			enabled: true,
+			externalBoxRef: rootRef,
+			excludeSelectors: [".mantine-Menu-dropdown"],
+			blockId: blockIdStr,
+			onSwipeRight: isSelected ? handleDeselect : undefined,
+		});
 
-	// Desktop: right-click opens context menu
-	const handleContextMenu = useCallback(
-		(e: React.MouseEvent) => {
-			if (isMobile) return;
-			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
-			e.preventDefault();
-			e.stopPropagation();
-			const x = Math.min(e.clientX, window.innerWidth - 200);
-			const flipY = e.clientY > window.innerHeight - 300;
-			swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
-			swipe.setCtxMenuOpened(true);
-		},
-		[isMobile, swipe],
-	);
-
-	// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
-	const handleBlockClick = useCallback(
-		(e: React.MouseEvent) => {
-			if (isMobile) return;
-			const isModKey = e.metaKey || e.ctrlKey;
-			const isShift = e.shiftKey;
-			if (!isModKey && !isShift) return;
-			// Don't interfere with text selection — but when block selection
-			// is already active, Shift+Click should always do range-select.
-			if (!selection.selectionMode) {
+		// Desktop: right-click opens context menu
+		const handleContextMenu = useCallback(
+			(e: React.MouseEvent) => {
+				if (isMobile) return;
 				const sel = window.getSelection();
 				if (sel && sel.toString().trim().length > 0) return;
-			}
-			e.preventDefault();
-			if (isShift) {
-				window.getSelection()?.removeAllRanges();
-				selection.rangeSelectTo(blockIdStr);
-			} else {
-				selection.toggleBlock(blockIdStr);
-			}
-		},
-		[isMobile, blockIdStr, selection],
-	);
-
-	const handleToggle = () => {
-		hasToggled.current = true;
-		setOpened((v) => {
-			const next = !v;
-			// Persist to module-level map so the state survives component remounts
-			// (e.g. when streaming __streaming__ message is replaced by real message).
-			if (persistKey) reasoningExpandState.set(persistKey, next);
-			return next;
-		});
-	};
-
-	const copyText = useCallback(() => {
-		navigator.clipboard.writeText(displayText);
-	}, [displayText]);
-
-	// During streaming with no content yet, show a minimal "thinking" indicator
-	if (streaming && !displayText) {
-		return (
-			<Group
-				ref={rootRef}
-				gap={0}
-				py={2}
-				wrap="nowrap"
-				align="center"
-				data-content-block
-				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-				{...(messageId ? { "data-message-id": messageId } : {})}
-				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
-				onContextMenu={handleContextMenu}
-				onClick={handleBlockClick}
-				style={{
-					outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
-					outlineOffset: isSelected ? -2 : undefined,
-					borderRadius: isSelected ? 4 : undefined,
-					transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
-					transition: swipe.swipeTransition,
-				}}
-			>
-				<Box style={{ display: "flex", alignItems: "center", width: 11, justifyContent: "center" }}>
-					<IconChevronRight
-						size={12}
-						style={{ color: "var(--mantine-color-dimmed)", opacity: 0.5 }}
-					/>
-				</Box>
-				<ThemeIcon size={16} variant="light" color="grape" radius="sm">
-					<IconBrain size={10} />
-				</ThemeIcon>
-				<Text size="xs" c="dimmed" fs="italic" ml={4}>
-					{t("thinking")}…
-				</Text>
-			</Group>
+				e.preventDefault();
+				e.stopPropagation();
+				const x = Math.min(e.clientX, window.innerWidth - 200);
+				const flipY = e.clientY > window.innerHeight - 300;
+				swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
+				swipe.setCtxMenuOpened(true);
+			},
+			[isMobile, swipe],
 		);
-	}
 
-	if (!displayText) return null;
+		// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
+		const handleBlockClick = useCallback(
+			(e: React.MouseEvent) => {
+				if (isMobile) return;
+				const isModKey = e.metaKey || e.ctrlKey;
+				const isShift = e.shiftKey;
+				if (!isModKey && !isShift) return;
+				// Don't interfere with text selection — but when block selection
+				// is already active, Shift+Click should always do range-select.
+				if (!selection.selectionMode) {
+					const sel = window.getSelection();
+					if (sel && sel.toString().trim().length > 0) return;
+				}
+				e.preventDefault();
+				if (isShift) {
+					window.getSelection()?.removeAllRanges();
+					selection.rangeSelectTo(blockIdStr);
+				} else {
+					selection.toggleBlock(blockIdStr);
+				}
+			},
+			[isMobile, blockIdStr, selection],
+		);
 
-	const content = (
-		<Box
-			pl="md"
-			py={4}
-			style={{
-				borderLeft: "2px solid var(--mantine-color-grape-9)",
-				opacity: 0.75,
-				fontSize: "var(--mantine-font-size-xs)",
-			}}
-		>
-			<MarkdownContent text={displayText} streaming={streaming} />
-			{translatedText && rawText && (
+		const handleToggle = () => {
+			hasToggled.current = true;
+			setOpened((v) => {
+				const next = !v;
+				// Persist to module-level map so the state survives component remounts
+				// (e.g. when streaming __streaming__ message is replaced by real message).
+				if (persistKey) reasoningExpandState.set(persistKey, next);
+				return next;
+			});
+		};
+
+		const copyText = useCallback(() => {
+			navigator.clipboard.writeText(displayText);
+		}, [displayText]);
+
+		// During streaming with no content yet, show a minimal "thinking" indicator
+		if (streaming && !displayText) {
+			return (
 				<Group
-					gap={4}
-					mt={4}
-					style={{ cursor: "pointer", display: "inline-flex" }}
-					onClick={(e) => {
-						e.stopPropagation();
-						setShowTranslation((v) => !v);
-					}}
-				>
-					<IconLanguage size={12} style={{ opacity: 0.5 }} />
-					<Text size="xs" c="dimmed">
-						{showTranslation ? t("showOriginal") : t("showTranslated")}
-					</Text>
-				</Group>
-			)}
-		</Box>
-	);
-
-	const SWIPE_REVEAL_WIDTH = 180;
-
-	// Menu items shared between context menu (desktop) and swipe menu (mobile)
-	const hasMenuActions = !!(
-		msgCtx.onForkFromMessage ||
-		msgCtx.onAskInPassing ||
-		msgCtx.onCompactBeforeMessage ||
-		msgCtx.onDeleteBlock
-	);
-	const menuItemsNode = (
-		<>
-			<Menu.Item
-				leftSection={<IconCopy size={14} />}
-				onClick={() => {
-					copyText();
-					swipe.closeSwipe();
-				}}
-			>
-				{tc("copy")}
-			</Menu.Item>
-			{hasMenuActions && <Menu.Divider />}
-			{msgCtx.onForkFromMessage && (
-				<Menu.Item
-					leftSection={<IconGitFork size={14} />}
-					onClick={() => {
-						msgCtx.onForkFromMessage?.();
-						swipe.closeSwipe();
-					}}
-				>
-					{t("contextMenu_fork")}
-				</Menu.Item>
-			)}
-			{msgCtx.onAskInPassing && (
-				<Menu.Item
-					leftSection={<IconMessageQuestion size={14} />}
-					onClick={() => {
-						msgCtx.onAskInPassing?.();
-						swipe.closeSwipe();
-					}}
-				>
-					{t("contextMenu_askInPassing")}
-				</Menu.Item>
-			)}
-			{msgCtx.onCompactBeforeMessage && (
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						msgCtx.onCompactBeforeMessage?.();
-						swipe.closeSwipe();
-					}}
-				>
-					{t("contextMenu_compactBefore")}
-				</Menu.Item>
-			)}
-			{msgCtx.onDeleteBlock && blockIndex != null && (
-				<Menu.Item
-					color="red"
-					leftSection={<IconTrash size={14} />}
-					onClick={() => {
-						msgCtx.onDeleteBlock?.(blockIndex);
-						swipe.closeSwipe();
-					}}
-				>
-					{t("contextMenu_delete")}
-				</Menu.Item>
-			)}
-			<Menu.Divider />
-			<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
-				{tc("cancel")}
-			</Menu.Item>
-		</>
-	);
-
-	// Right-click context menu (desktop)
-	const ctxMenu = (
-		<Menu
-			opened={swipe.ctxMenuOpened}
-			onChange={swipe.setCtxMenuOpened}
-			position="bottom-start"
-			withinPortal
-			styles={{
-				dropdown: {
-					position: "fixed",
-					left: swipe.ctxMenuPos.x,
-					...(swipe.ctxMenuPos.flipY
-						? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
-						: { top: swipe.ctxMenuPos.y }),
-				},
-			}}
-		>
-			<Menu.Target>
-				<div
-					style={{
-						position: "fixed",
-						left: swipe.ctxMenuPos.x,
-						top: swipe.ctxMenuPos.y,
-						pointerEvents: "none",
-					}}
-				/>
-			</Menu.Target>
-			<Menu.Dropdown>{menuItemsNode}</Menu.Dropdown>
-		</Menu>
-	);
-
-	// Swipe-reveal action menu (mobile, portal to body)
-	const swipeMenu =
-		(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
-		(() => {
-			const menuEl = swipe.swipeMenuRef.current;
-			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
-			return createPortal(
-				<Box
-					ref={swipe.swipeMenuRef}
-					style={{
-						position: "fixed",
-						left: pos.left,
-						top: pos.top,
-						transform: "translateY(-50%)",
-						zIndex: 1000,
-						transition: swipe.swipeMenuTransition,
-						pointerEvents: swipe.swipeClosing ? "none" : "auto",
-					}}
-				>
-					<Menu opened withinPortal={false} position="bottom-start">
-						<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
-							{menuItemsNode}
-						</Menu.Dropdown>
-					</Menu>
-				</Box>,
-				document.body,
-			);
-		})();
-
-	return (
-		<>
-			<Box
-				ref={rootRef}
-				data-content-block
-				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-				{...(messageId ? { "data-message-id": messageId } : {})}
-				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
-				onContextMenu={handleContextMenu}
-				onClick={handleBlockClick}
-				style={{
-					outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
-					outlineOffset: isSelected ? -2 : undefined,
-					borderRadius: isSelected ? 4 : undefined,
-					transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
-					transition: swipe.swipeTransition,
-				}}
-			>
-				<Group
+					ref={rootRef}
 					gap={0}
 					py={2}
 					wrap="nowrap"
 					align="center"
-					style={{ cursor: "pointer", userSelect: "none" }}
-					onClick={handleToggle}
+					data-content-block
+					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+					{...(messageId ? { "data-message-id": messageId } : {})}
+					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+					onContextMenu={handleContextMenu}
+					onClick={handleBlockClick}
+					style={{
+						outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+						outlineOffset: isSelected ? -2 : undefined,
+						borderRadius: isSelected ? 4 : undefined,
+						transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+						transition: swipe.swipeTransition,
+					}}
 				>
 					<Box
-						style={{
-							display: "flex",
-							alignItems: "center",
-							width: 11,
-							justifyContent: "center",
-						}}
+						style={{ display: "flex", alignItems: "center", width: 11, justifyContent: "center" }}
 					>
-						{opened ? (
-							<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-						) : (
-							<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-						)}
+						<IconChevronRight
+							size={12}
+							style={{ color: "var(--mantine-color-dimmed)", opacity: 0.5 }}
+						/>
 					</Box>
 					<ThemeIcon size={16} variant="light" color="grape" radius="sm">
 						<IconBrain size={10} />
 					</ThemeIcon>
-					<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
-						{t("reasoning")}
+					<Text size="xs" c="dimmed" fs="italic" ml={4}>
+						{t("thinking")}…
 					</Text>
-					{!hasEncryptedReasoning && (
-						<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
-							{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
-						</Text>
-					)}
-					{!opened && (
-						<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
-							— {displayText.slice(0, 80)}
-							{displayText.length > 80 ? "…" : ""}
-						</Text>
-					)}
 				</Group>
-				{/*
+			);
+		}
+
+		if (!displayText) return null;
+
+		const content = (
+			<Box
+				pl="md"
+				py={4}
+				style={{
+					borderLeft: "2px solid var(--mantine-color-grape-9)",
+					opacity: 0.75,
+					fontSize: "var(--mantine-font-size-xs)",
+				}}
+			>
+				<MarkdownContent text={displayText} streaming={streaming} />
+				{translatedText && rawText && (
+					<Group
+						gap={4}
+						mt={4}
+						style={{ cursor: "pointer", display: "inline-flex" }}
+						onClick={(e) => {
+							e.stopPropagation();
+							setShowTranslation((v) => !v);
+						}}
+					>
+						<IconLanguage size={12} style={{ opacity: 0.5 }} />
+						<Text size="xs" c="dimmed">
+							{showTranslation ? t("showOriginal") : t("showTranslated")}
+						</Text>
+					</Group>
+				)}
+			</Box>
+		);
+
+		const SWIPE_REVEAL_WIDTH = 180;
+
+		// Menu items shared between context menu (desktop) and swipe menu (mobile)
+		const hasMenuActions = !!(
+			msgCtx.onForkFromMessage ||
+			msgCtx.onAskInPassing ||
+			msgCtx.onCompactBeforeMessage ||
+			msgCtx.onDeleteBlock
+		);
+		const menuItemsNode = (
+			<>
+				<Menu.Item
+					leftSection={<IconCopy size={14} />}
+					onClick={() => {
+						copyText();
+						swipe.closeSwipe();
+					}}
+				>
+					{tc("copy")}
+				</Menu.Item>
+				{hasMenuActions && <Menu.Divider />}
+				{msgCtx.onForkFromMessage && (
+					<Menu.Item
+						leftSection={<IconGitFork size={14} />}
+						onClick={() => {
+							msgCtx.onForkFromMessage?.();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_fork")}
+					</Menu.Item>
+				)}
+				{msgCtx.onAskInPassing && (
+					<Menu.Item
+						leftSection={<IconMessageQuestion size={14} />}
+						onClick={() => {
+							msgCtx.onAskInPassing?.();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_askInPassing")}
+					</Menu.Item>
+				)}
+				{msgCtx.onCompactBeforeMessage && (
+					<Menu.Item
+						leftSection={<IconArrowsMinimize size={14} />}
+						onClick={() => {
+							msgCtx.onCompactBeforeMessage?.();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_compactBefore")}
+					</Menu.Item>
+				)}
+				{msgCtx.onDeleteBlock && blockIndex != null && (
+					<Menu.Item
+						color="red"
+						leftSection={<IconTrash size={14} />}
+						onClick={() => {
+							msgCtx.onDeleteBlock?.(blockIndex);
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_delete")}
+					</Menu.Item>
+				)}
+				<Menu.Divider />
+				<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
+					{tc("cancel")}
+				</Menu.Item>
+			</>
+		);
+
+		// Right-click context menu (desktop)
+		const ctxMenu = (
+			<Menu
+				opened={swipe.ctxMenuOpened}
+				onChange={swipe.setCtxMenuOpened}
+				position="bottom-start"
+				withinPortal
+				styles={{
+					dropdown: {
+						position: "fixed",
+						left: swipe.ctxMenuPos.x,
+						...(swipe.ctxMenuPos.flipY
+							? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+							: { top: swipe.ctxMenuPos.y }),
+					},
+				}}
+			>
+				<Menu.Target>
+					<div
+						style={{
+							position: "fixed",
+							left: swipe.ctxMenuPos.x,
+							top: swipe.ctxMenuPos.y,
+							pointerEvents: "none",
+						}}
+					/>
+				</Menu.Target>
+				<Menu.Dropdown>{menuItemsNode}</Menu.Dropdown>
+			</Menu>
+		);
+
+		// Swipe-reveal action menu (mobile, portal to body)
+		const swipeMenu =
+			(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+			(() => {
+				const menuEl = swipe.swipeMenuRef.current;
+				const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
+				return createPortal(
+					<Box
+						ref={swipe.swipeMenuRef}
+						style={{
+							position: "fixed",
+							left: pos.left,
+							top: pos.top,
+							transform: "translateY(-50%)",
+							zIndex: 1000,
+							transition: swipe.swipeMenuTransition,
+							pointerEvents: swipe.swipeClosing ? "none" : "auto",
+						}}
+					>
+						<Menu opened withinPortal={false} position="bottom-start">
+							<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+								{menuItemsNode}
+							</Menu.Dropdown>
+						</Menu>
+					</Box>,
+					document.body,
+				);
+			})();
+
+		return (
+			<>
+				<Box
+					ref={rootRef}
+					data-content-block
+					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+					{...(messageId ? { "data-message-id": messageId } : {})}
+					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+					onContextMenu={handleContextMenu}
+					onClick={handleBlockClick}
+					style={{
+						outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+						outlineOffset: isSelected ? -2 : undefined,
+						borderRadius: isSelected ? 4 : undefined,
+						transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+						transition: swipe.swipeTransition,
+					}}
+				>
+					<Group
+						gap={0}
+						py={2}
+						wrap="nowrap"
+						align="center"
+						style={{ cursor: "pointer", userSelect: "none" }}
+						onClick={handleToggle}
+					>
+						<Box
+							style={{
+								display: "flex",
+								alignItems: "center",
+								width: 11,
+								justifyContent: "center",
+							}}
+						>
+							{opened ? (
+								<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+							) : (
+								<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+							)}
+						</Box>
+						<ThemeIcon size={16} variant="light" color="grape" radius="sm">
+							<IconBrain size={10} />
+						</ThemeIcon>
+						<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
+							{t("reasoning")}
+						</Text>
+						{!hasEncryptedReasoning && (
+							<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
+								{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+							</Text>
+						)}
+						{!opened && (
+							<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
+								— {displayText.slice(0, 80)}
+								{displayText.length > 80 ? "…" : ""}
+							</Text>
+						)}
+					</Group>
+					{/*
 					Initial mount with opened=true: render Collapse directly to avoid
 					LazyCollapse's effect cascade (setMounted → rAF → setReveal) that
 					triggers "Maximum update depth exceeded" in Mantine's Transition
@@ -620,17 +623,27 @@ function ReasoningBlock({
 					After first user toggle: switch to LazyCollapse for proper
 					expand/collapse animation with content unmount.
 				*/}
-				{!hasToggled.current && opened ? (
-					<Collapse in={opened}>{content}</Collapse>
-				) : (
-					<LazyCollapse in={opened}>{content}</LazyCollapse>
-				)}
-			</Box>
-			{swipeMenu}
-			{ctxMenu}
-		</>
-	);
-}
+					{!hasToggled.current && opened ? (
+						<Collapse in={opened}>{content}</Collapse>
+					) : (
+						<LazyCollapse in={opened}>{content}</LazyCollapse>
+					)}
+				</Box>
+				{swipeMenu}
+				{ctxMenu}
+			</>
+		);
+	},
+	(prev, next) => {
+		return (
+			prev.block === next.block &&
+			prev.streaming === next.streaming &&
+			prev.narratorId === next.narratorId &&
+			prev.blockIndex === next.blockIndex &&
+			prev.messageId === next.messageId
+		);
+	},
+);
 
 function ErrorNotice({
 	message,

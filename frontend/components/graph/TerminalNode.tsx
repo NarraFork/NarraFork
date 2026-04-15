@@ -11,7 +11,7 @@ import {
 } from "@mantine/core";
 import { IconMinus, IconTerminal2, IconX } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { TerminalPanel } from "../terminal/TerminalPanel";
@@ -89,18 +89,7 @@ function TerminalNodeInner({ data, id }: NodeProps) {
 	}, [d.terminalName]);
 
 	// Allow Ctrl+wheel to pass through to ReactFlow for zoom
-	useEffect(() => {
-		const el = panelWheelRef.current;
-		if (!el) return;
-		const handler = (e: WheelEvent) => {
-			if (e.ctrlKey || e.metaKey) {
-				el.classList.remove("nowheel");
-				requestAnimationFrame(() => el.classList.add("nowheel"));
-			}
-		};
-		el.addEventListener("wheel", handler, { capture: true, passive: true });
-		return () => el.removeEventListener("wheel", handler, { capture: true });
-	}, []);
+	// (handled by NowheelPassthrough in NarraFlow — no per-node listener needed)
 
 	const handleStyle = { opacity: 0, width: 8, height: 8 };
 

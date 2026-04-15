@@ -154,12 +154,30 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 			setActive(true);
 		};
 
+		// --- Lazy mouse/touch listeners: only registered while drawing ---
+		const addDrawingListeners = () => {
+			window.addEventListener("mousemove", onMouseMove);
+			window.addEventListener("mouseup", onMouseUp);
+			document.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
+			document.addEventListener("touchend", onTouchEnd, { capture: true });
+			document.addEventListener("touchcancel", onTouchEnd, { capture: true });
+		};
+
+		const removeDrawingListeners = () => {
+			window.removeEventListener("mousemove", onMouseMove);
+			window.removeEventListener("mouseup", onMouseUp);
+			document.removeEventListener("touchmove", onTouchMove, { capture: true });
+			document.removeEventListener("touchend", onTouchEnd, { capture: true });
+			document.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+		};
+
 		// --- Mouse lasso ---
 		const onMouseDown = (e: MouseEvent) => {
 			if (pcDragModeRef.current !== "select") return;
 			if (e.button !== 0) return;
 			if (!isOnPane(e.target as HTMLElement)) return;
 			beginLasso(e.clientX, e.clientY);
+			addDrawingListeners();
 		};
 
 		const onMouseMove = (e: MouseEvent) => {
@@ -168,7 +186,10 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 			setPoints([...currentPointsRef.current]);
 		};
 
-		const onMouseUp = () => doStop();
+		const onMouseUp = () => {
+			doStop();
+			removeDrawingListeners();
+		};
 
 		// --- Touch lasso via contextmenu (long-press on mobile) ---
 		const onContextMenu = (e: Event) => {
@@ -183,6 +204,7 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 			onSelectRef.current(new Set());
 			cancelPan();
 			beginLasso((e as MouseEvent).clientX, (e as MouseEvent).clientY);
+			addDrawingListeners();
 		};
 
 		// Touch move/end use capture + non-passive so we can block d3-zoom pan.
@@ -196,24 +218,19 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 			setPoints([...currentPointsRef.current]);
 		};
 
-		const onTouchEnd = () => doStop();
+		const onTouchEnd = () => {
+			doStop();
+			removeDrawingListeners();
+		};
 
 		el.addEventListener("mousedown", onMouseDown);
-		window.addEventListener("mousemove", onMouseMove);
-		window.addEventListener("mouseup", onMouseUp);
 		document.addEventListener("contextmenu", onContextMenu, { capture: true });
-		document.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
-		document.addEventListener("touchend", onTouchEnd, { capture: true });
-		document.addEventListener("touchcancel", onTouchEnd, { capture: true });
 
 		return () => {
 			el.removeEventListener("mousedown", onMouseDown);
-			window.removeEventListener("mousemove", onMouseMove);
-			window.removeEventListener("mouseup", onMouseUp);
 			document.removeEventListener("contextmenu", onContextMenu, { capture: true });
-			document.removeEventListener("touchmove", onTouchMove, { capture: true });
-			document.removeEventListener("touchend", onTouchEnd, { capture: true });
-			document.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+			// Safety: remove drawing listeners in case unmount happens mid-draw
+			removeDrawingListeners();
 		};
 		// Effect runs once — all mutable state accessed via refs.
 		// eslint-disable-next-line react-hooks/exhaustive-deps

@@ -1,5 +1,5 @@
 import { Collapse } from "@mantine/core";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 
 interface LazyCollapseProps {
 	in: boolean;
@@ -21,7 +21,10 @@ interface LazyCollapseProps {
  * `set-state-in-effect` lint rule flags and which causes "Maximum update
  * depth exceeded" when many LazyCollapse instances mount simultaneously.
  */
-export function LazyCollapse({ in: opened, children }: LazyCollapseProps) {
+export const LazyCollapse = memo(function LazyCollapse({
+	in: opened,
+	children,
+}: LazyCollapseProps) {
 	const [mounted, setMounted] = useState(opened);
 	const [reveal, setReveal] = useState(opened);
 	const isFirstMount = useRef(true);
@@ -87,4 +90,4 @@ export function LazyCollapse({ in: opened, children }: LazyCollapseProps) {
 			{children}
 		</Collapse>
 	);
-}
+});

@@ -1,6 +1,6 @@
 import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
@@ -123,6 +123,8 @@ export interface UseNarratorPanelWSReturn {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
+	// Browser sessions
+	browserSessionCount: number;
 	// Retry
 	retryInfo: RetryInfo | null;
 	// Todos
@@ -142,6 +144,37 @@ export interface UseNarratorPanelWSReturn {
 
 /** Max messages to keep in cache while the user is at the bottom. */
 const MAX_LIVE_MESSAGES = 200;
+
+// --- Reducer for co-updated state ---
+// These fields are frequently set together in the same WS callback
+// (onStatusChange, onContextUsage, onPruneBoundary, onCompactDone, etc.).
+// Merging them into a single useReducer avoids multiple independent re-renders
+// per callback since React batches reducer dispatches into one update.
+
+interface StatusState {
+	isCompacting: boolean;
+	isCheckingInterrupt: boolean;
+	contextPercent: number | null;
+	promptTokens: number | null;
+	contextWindow: number | null;
+	isEstimated: boolean;
+	activePruneStart: number | null;
+	activeCompactStart: number | null;
+	pruneBoundaryMessageId: string | null;
+	prunedPercent: number | null;
+}
+
+type StatusAction = { type: "patch"; payload: Partial<StatusState> };
+
+function statusReducer(state: StatusState, action: StatusAction): StatusState {
+	if (action.type === "patch") {
+		// Bail out early if nothing actually changed — avoids a re-render.
+		const keys = Object.keys(action.payload) as (keyof StatusState)[];
+		if (keys.every((k) => state[k] === action.payload[k])) return state;
+		return { ...state, ...action.payload };
+	}
+	return state;
+}
 
 function applyPendingPermissionsToCache(
 	old: MessagesQueryData | undefined,
@@ -232,6 +265,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		return () => {
 			if (streamingRafRef.current) cancelAnimationFrame(streamingRafRef.current);
 			if (toolChunkRafRef.current) cancelAnimationFrame(toolChunkRafRef.current);
+			if (cacheUpdateRafRef.current) cancelAnimationFrame(cacheUpdateRafRef.current);
 		};
 	}, []);
 
@@ -277,6 +311,41 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		}
 	}, []);
 
+	// --- RAF-batched cache update queue for messagesQueryKey ---
+	// Instead of calling qc.setQueryData(messagesQueryKey, fn) on every WS event,
+	// we queue updater functions and flush them all in a single setQueryData call
+	// per animation frame. This collapses N WS events into 1 React Query cache
+	// update + 1 re-render.
+	type CacheUpdater = (
+		old: MessagesQueryData | undefined,
+	) => MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] };
+	const pendingCacheUpdatesRef = useRef<CacheUpdater[]>([]);
+	const cacheUpdateRafRef = useRef(0);
+	const scheduleCacheUpdate = useCallback(
+		(fn: CacheUpdater) => {
+			pendingCacheUpdatesRef.current.push(fn);
+			if (!cacheUpdateRafRef.current) {
+				cacheUpdateRafRef.current = requestAnimationFrame(() => {
+					cacheUpdateRafRef.current = 0;
+					const fns = pendingCacheUpdatesRef.current;
+					if (fns.length === 0) return;
+					pendingCacheUpdatesRef.current = [];
+					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						let result:
+							| MessagesQueryData
+							| undefined
+							| { pages: unknown[]; pageParams?: unknown[] } = old;
+						for (const updater of fns) {
+							result = updater(result as MessagesQueryData | undefined);
+						}
+						return result;
+					});
+				});
+			}
+		},
+		[qc, messagesQueryKey],
+	);
+
 	// --- Permission state ---
 	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
 		() => new Map(),
@@ -291,10 +360,55 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		() => new Map(),
 	);
 
-	// --- Misc state ---
+	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
-	const [isCompacting, setIsCompacting] = useState(false);
-	const [isCheckingInterrupt, setIsCheckingInterrupt] = useState(false);
+	const [statusState, dispatchStatus] = useReducer(statusReducer, {
+		isCompacting: false,
+		isCheckingInterrupt: false,
+		contextPercent: null,
+		promptTokens: null,
+		contextWindow: null,
+		isEstimated: false,
+		activePruneStart: null,
+		activeCompactStart: null,
+		pruneBoundaryMessageId: null,
+		prunedPercent: null,
+	});
+	const {
+		isCompacting,
+		isCheckingInterrupt,
+		contextPercent,
+		promptTokens,
+		contextWindow,
+		isEstimated,
+		activePruneStart,
+		activeCompactStart,
+		pruneBoundaryMessageId,
+		prunedPercent,
+	} = statusState;
+	// Expose setters that match the original useState API for external callers
+	const setIsCompacting = useCallback(
+		(v: React.SetStateAction<boolean>) => {
+			dispatchStatus({
+				type: "patch",
+				payload: {
+					isCompacting: typeof v === "function" ? v(statusState.isCompacting) : v,
+				},
+			});
+		},
+		[statusState.isCompacting],
+	);
+	const setContextPercent = useCallback(
+		(v: React.SetStateAction<number | null>) => {
+			dispatchStatus({
+				type: "patch",
+				payload: {
+					contextPercent: typeof v === "function" ? v(statusState.contextPercent) : v,
+				},
+			});
+		},
+		[statusState.contextPercent],
+	);
 	const interruptCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	useEffect(() => {
 		return () => {
@@ -304,14 +418,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			}
 		};
 	}, []);
-	const [contextPercent, setContextPercent] = useState<number | null>(null);
-	const [promptTokens, setPromptTokens] = useState<number | null>(null);
-	const [contextWindow, setContextWindow] = useState<number | null>(null);
-	const [isEstimated, setIsEstimated] = useState(false);
-	const [activePruneStart, setActivePruneStart] = useState<number | null>(null);
-	const [activeCompactStart, setActiveCompactStart] = useState<number | null>(null);
-	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
-	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
+	const [browserSessionCount, setBrowserSessionCount] = useState(0);
 	);
 	useEffect(() => {
 		}
@@ -353,30 +460,39 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	useEffect(() => {
 		if (contextInitRef.current || !messagesData?.pages?.length) return;
 		const firstPage = messagesData.pages[0];
+		const patch: Partial<StatusState> = {};
 		if (firstPage?.pruneBoundaryMessageId) {
-			setPruneBoundaryMessageId(firstPage.pruneBoundaryMessageId);
+			patch.pruneBoundaryMessageId = firstPage.pruneBoundaryMessageId;
 		}
 		if (firstPage?.prunedPercent != null) {
-			setPrunedPercent(firstPage.prunedPercent);
+			patch.prunedPercent = firstPage.prunedPercent;
 		}
 		const msgs = firstPage?.messages;
-		if (!msgs?.length) return;
+		if (!msgs?.length) {
+			if (Object.keys(patch).length > 0) {
+				dispatchStatus({ type: "patch", payload: patch });
+			}
+			return;
+		}
 		for (let i = msgs.length - 1; i >= 0; i--) {
 			const m = msgs[i] as unknown as Record<string, unknown>;
 			const cp = m.contextPercent;
 			if (cp != null) {
-				setContextPercent(cp as number);
+				patch.contextPercent = cp as number;
 				// Restore promptTokens / contextWindow / isEstimated from turnUsageJson
 				const tu = m.turnUsageJson as Record<string, unknown> | null | undefined;
 				if (tu) {
-					if (tu.input_tokens != null) setPromptTokens(tu.input_tokens as number);
-					if (tu.context_window != null) setContextWindow(tu.context_window as number);
-					setIsEstimated(!!tu.is_estimated);
+					if (tu.input_tokens != null) patch.promptTokens = tu.input_tokens as number;
+					if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
+					patch.isEstimated = !!tu.is_estimated;
 				} else if (m.tokensIn != null) {
-					setPromptTokens(m.tokensIn as number);
+					patch.promptTokens = m.tokensIn as number;
 				}
 				break;
 			}
+		}
+		if (Object.keys(patch).length > 0) {
+			dispatchStatus({ type: "patch", payload: patch });
 		}
 		contextInitRef.current = true;
 	}, [messagesData]);
@@ -774,13 +890,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
 				);
 				if (compactBlock) {
-					setIsCompacting(compactBlock.status === "compacting");
+					const patch: Partial<StatusState> = {
+						isCompacting: compactBlock.status === "compacting",
+					};
 					if (compactBlock.status === "compacted" && wsData.message?.contextPercent != null) {
-						setContextPercent(wsData.message.contextPercent as number);
+						patch.contextPercent = wsData.message.contextPercent as number;
 					}
 					if (compactBlock.status === "failed") {
-						setIsCompacting(false);
+						patch.isCompacting = false;
 					}
+					dispatchStatus({ type: "patch", payload: patch });
 				}
 				// Note: do NOT setIsCompacting(false) for non-compact messages —
 				// that causes a race condition where subagent or other messages
@@ -810,7 +929,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						// Atomic remove-synthetic + insert-real in a single setQueryData
 						// to avoid an intermediate render where the card disappears.
 						const ptuId = newMsg.parentToolUseId;
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						scheduleCacheUpdate((old) => {
 							if (!old?.pages?.length) return old;
 							let result = removeSubagentStreamingChunk(old, ptuId, toolUseIndexRef.current);
 							result = insertChildIntoCache(
@@ -823,7 +942,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					} else if (newMsg.parentToolUseId) {
 						// Non-assistant subagent message (e.g. user/system) — insert
 						// into the message tree rather than appending as top-level.
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						scheduleCacheUpdate((old) => {
 							if (!old?.pages?.length) return old;
 							return insertChildIntoCache(
 								old,
@@ -843,7 +962,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							newMsg.contentJson.some((b: ContentBlock) => b.type === "ask_in_passing");
 						const needsMiddleInsertReload = isNewCompactMsg || isNewAskInPassingMsg;
 
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						scheduleCacheUpdate((old) => {
 							if (!old?.pages?.length) return old;
 							const pages = [...old.pages];
 							const firstPage = { ...pages[0] };
@@ -902,7 +1021,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onUserMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
 				if (!wsData.message?.id || !wsData.message?.createdAt) return;
 				const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) {
 						return {
 							pages: [{ messages: [newMsg], hasMore: false, nextCursor: null }],
@@ -984,7 +1103,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 				}
 
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let result = updateToolCallByIndex(
 						old,
@@ -1033,7 +1152,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 				// 同时更新已持久化的消息缓存，确保 streaming chunk 被清除后
 				// _longRunning 状态仍保留（query cache 渲染路径）
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(
 						old,
@@ -1045,7 +1164,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onToolOutput: (toolUseId: string, output: string, _parentToolUseId?: string) => {
 				// 实时更新 bash 工具的流式输出到已持久化的 tool call 上
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(
 						old,
@@ -1086,7 +1205,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 				}
 
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					// For subagent tools, also replace the synthetic _streamingChars inputJson
 					// with the real input so ToolCallCard stops showing the shimmer and renders
@@ -1109,7 +1228,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onSubagentStarted: (toolUseId: string, model?: string) => {
 				if (!model) return;
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(
 						old,
@@ -1149,7 +1268,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						let topLevelChanged = false;
 						const subagentChunks = chunks.filter((chunk) => !!chunk.parentToolUseId);
 						if (subagentChunks.length > 0) {
-							qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+							scheduleCacheUpdate((old) => {
 								let result = old;
 								for (const chunk of subagentChunks) {
 									if (!chunk.parentToolUseId || !result) continue;
@@ -1200,7 +1319,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 				if (tuId) {
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					scheduleCacheUpdate((old) => {
 						if (!old?.pages?.length) return old;
 						return mergeFieldsByIndex(old, tuId, { status: "pending" }, toolUseIndexRef.current);
 					});
@@ -1221,7 +1340,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						next.delete(toolUseId);
 						return next;
 					});
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					scheduleCacheUpdate((old) => {
 						if (!old?.pages?.length) return old;
 						if (decision === "deny") {
 							return mergeFieldsByIndex(
@@ -1267,18 +1386,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onStatusChange: (status, turnStartedAt) => {
-				setIsCompacting(false);
 				clearRetryIfActive();
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
 				// "interrupted" and "done" also mean the agent loop has stopped, so any
 				// residual streaming text / tool chunks must be flushed.
 				const isTerminal =
 					status === "idle" || status === "interrupted" || status === "done" || status === "error";
-				// Clear interrupt checking state on any terminal status (safety net)
-				if (isTerminal) setIsCheckingInterrupt(false);
-				// shortly after the thinking transition.
+				// Batch all reducer state updates into a single dispatch
+				const patch: Partial<StatusState> = { isCompacting: false };
 				if (isTerminal) {
-
+					patch.isCheckingInterrupt = false;
+				}
+				dispatchStatus({ type: "patch", payload: patch });
+				if (isTerminal) {
 					const hadStreaming = streamingBlocksRef.current.length > 0;
 					streamingBlocksRef.current = [];
 					// Only bump streamingVersion when there was actual streaming content
@@ -1342,24 +1462,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, relaxedPlan } : old,
 				);
 			},
-			onContextUsage: (
-				percentage,
-				promptTokens,
-				contextWindow,
-				isEst,
-				pruneStart,
-				compactStart,
-			) => {
-				setContextPercent(percentage);
-				setPromptTokens(promptTokens ?? null);
-				setContextWindow(contextWindow ?? null);
-				setIsEstimated(!!isEst);
-				setActivePruneStart(pruneStart ?? null);
-				setActiveCompactStart(compactStart ?? null);
+			onContextUsage: (percentage, pTokens, ctxWindow, isEst, pruneStart, compactStart) => {
+				dispatchStatus({
+					type: "patch",
+					payload: {
+						contextPercent: percentage,
+						promptTokens: pTokens ?? null,
+						contextWindow: ctxWindow ?? null,
+						isEstimated: !!isEst,
+						activePruneStart: pruneStart ?? null,
+						activeCompactStart: compactStart ?? null,
+					},
+				});
 			},
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
-				setPruneBoundaryMessageId(boundaryMessageId);
-				setPrunedPercent(prunedPct);
+				dispatchStatus({
+					type: "patch",
+					payload: {
+						pruneBoundaryMessageId: boundaryMessageId,
+						prunedPercent: prunedPct,
+					},
+				});
 			},
 				// Sync back to settings cache so provider info stays up-to-date
 					// biome-ignore lint/suspicious/noExplicitAny: dynamic settings shape
@@ -1373,8 +1496,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
+				dispatchStatus({
+					type: "patch",
+				});
 			},
-			onBrowserSessionCount: () => {
+			onBrowserSessionCount: (count) => {
+				setBrowserSessionCount(count);
 				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
 			},
 			onWebSearch: (id, status, query, queries, outputIndex) => {
@@ -1411,14 +1538,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["gitStatus", data.chapterId] });
 			},
 			onCompacting: () => {
-				setIsCompacting(true);
+				dispatchStatus({ type: "patch", payload: { isCompacting: true } });
 			},
 			onSegmentCompactHide: (hiddenMessageIds: string[]) => {
 				// Remove hidden messages from the cache immediately so the UI
 				// reflects the fold before the compact summary arrives.
 				if (hiddenMessageIds.length === 0) return;
 				const idSet = new Set(hiddenMessageIds);
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let anyChanged = false;
 					const pages = old.pages.map((page: MessagesPage) => {
@@ -1433,9 +1560,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onCompactDone: (contextPercentAfter?: number, isSegment?: boolean) => {
-				setIsCompacting(false);
-				setPruneBoundaryMessageId(null);
-				setPrunedPercent(null);
+				dispatchStatus({
+					type: "patch",
+					payload: {
+						isCompacting: false,
+						pruneBoundaryMessageId: null,
+						prunedPercent: null,
+					},
+				});
 				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
@@ -1452,7 +1584,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onInterruptChecking: () => {
-				setIsCheckingInterrupt(true);
+				dispatchStatus({ type: "patch", payload: { isCheckingInterrupt: true } });
 				// Safety timeout: if the backend never sends interrupt_check_done
 				// (e.g. WS glitch, backend crash), clear the checking state after
 				// 20 s so the UI doesn't stay stuck forever.
@@ -1460,12 +1592,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					clearTimeout(interruptCheckTimeoutRef.current);
 				}
 				interruptCheckTimeoutRef.current = setTimeout(() => {
-					setIsCheckingInterrupt(false);
+					dispatchStatus({ type: "patch", payload: { isCheckingInterrupt: false } });
 					interruptCheckTimeoutRef.current = null;
 				}, 20_000);
 			},
 			onInterruptCheckDone: () => {
-				setIsCheckingInterrupt(false);
+				dispatchStatus({ type: "patch", payload: { isCheckingInterrupt: false } });
 				if (interruptCheckTimeoutRef.current) {
 					clearTimeout(interruptCheckTimeoutRef.current);
 					interruptCheckTimeoutRef.current = null;
@@ -1516,7 +1648,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Clean up any residual streaming chunks from before the disconnect
 				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let result: MessagesQueryData = old;
 					for (const child of orphanChildren) {
@@ -1565,7 +1697,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onMessagesDeleted: (deletedMessageIds: string[]) => {
 				// Remove deleted messages from cache
 				const deletedSet = new Set(deletedMessageIds);
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const pages = old.pages.map((page) => ({
 						...page,
@@ -1576,7 +1708,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onMessageUpdated: (updatedMsg: NarratorMsg) => {
 				// Update the message in cache
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const pages = old.pages.map((page) => ({
 						...page,
@@ -1589,7 +1721,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onBackgroundTaskCompleted: (_taskNarratorId, toolUseId, resultPreview) => {
 				// Update the tool call status in cache to reflect completion
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const result = updateToolCallByIndex(
 						old,
@@ -1602,7 +1734,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onBackgroundTaskFailed: (_taskNarratorId, toolUseId, error) => {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let result = updateToolCallByIndex(
 						old,
@@ -1623,7 +1755,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return updateToolCallByIndex(
 						old,
@@ -1650,7 +1782,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					for (const chunk of snapshot.toolChunks) {
 						if (chunk.parentToolUseId) {
 							// Subagent chunk — upsert into message cache
-							qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+							scheduleCacheUpdate((old) => {
 								if (!old?.pages?.length || !chunk.parentToolUseId) return old;
 								return upsertSubagentStreamingChunk(
 									old,
@@ -1713,6 +1845,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// won't refetch, and the WS catch-up may not fire (lastMessageId was
 	// cleared on unsubscribe).  Fix: on mount, if we already have cached data
 	// (i.e. returning to the page), fetch the latest page and merge it.
+	// NOTE: permissions and buffered messages are synced by the mount/reconnect
+	// effect below — no need to duplicate here.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: mount-only effect — intentionally runs once
 	useEffect(() => {
 		const cached = qc.getQueryData(messagesQueryKey) as MessagesQueryData | undefined;
@@ -1751,31 +1885,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
-			})
-			.catch(() => {});
-
-		// Also sync permissions and buffered messages
-		api
-			.getPendingPermissions(narratorId)
-			.then((perms) => {
-				if (cancelled || perms.length === 0) return;
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					for (const p of perms) {
-						if (p.toolUseId) next.set(p.toolUseId, p);
-					}
-					return next;
-				});
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-					applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-				);
-			})
-			.catch(() => {});
-
-		api
-			.getBufferedMessages(narratorId)
-			.then((msgs) => {
-				if (!cancelled) setQueuedMessages(msgs ?? []);
 			})
 			.catch(() => {});
 
@@ -1885,7 +1994,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
 		);
 		if (compactBlock) {
-			setIsCompacting(compactBlock.status === "compacting");
+			dispatchStatus({
+				type: "patch",
+				payload: { isCompacting: compactBlock.status === "compacting" },
+			});
 		}
 	}, [messagesData]);
 
@@ -1916,6 +2028,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
+		browserSessionCount,
 		retryInfo,
 		currentTodos,
 		todosToolUseId,

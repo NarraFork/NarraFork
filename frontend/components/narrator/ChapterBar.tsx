@@ -1,9 +1,3 @@
-import { ChapterForkModal } from "@frontend/components/chapter/ChapterForkModal";
-import { ChapterMergeModal } from "@frontend/components/chapter/ChapterMergeModal";
-import { GitPanel } from "@frontend/components/chapter/GitPanel";
-import { ContainerConfigModal } from "@frontend/components/container/ContainerConfigModal";
-import { ContainerPanel } from "@frontend/components/container/ContainerPanel";
-import { PodmanInstallModal } from "@frontend/components/container/PodmanInstallModal";
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useContainers } from "@frontend/hooks/useContainers";
@@ -32,8 +26,38 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+
+// Lazy-loaded heavy panels and modals — only needed when user opens them
+const GitPanel = lazy(() =>
+	import("@frontend/components/chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
+);
+const ContainerPanel = lazy(() =>
+	import("@frontend/components/container/ContainerPanel").then((m) => ({
+		default: m.ContainerPanel,
+	})),
+);
+const ChapterForkModal = lazy(() =>
+	import("@frontend/components/chapter/ChapterForkModal").then((m) => ({
+		default: m.ChapterForkModal,
+	})),
+);
+const ChapterMergeModal = lazy(() =>
+	import("@frontend/components/chapter/ChapterMergeModal").then((m) => ({
+		default: m.ChapterMergeModal,
+	})),
+);
+const ContainerConfigModal = lazy(() =>
+	import("@frontend/components/container/ContainerConfigModal").then((m) => ({
+		default: m.ContainerConfigModal,
+	})),
+);
+const PodmanInstallModal = lazy(() =>
+	import("@frontend/components/container/PodmanInstallModal").then((m) => ({
+		default: m.PodmanInstallModal,
+	})),
+);
 
 interface ChapterBarProps {
 	chapterId: string;
@@ -283,11 +307,13 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 						borderBottom: "1px solid var(--mantine-color-default-border)",
 					}}
 				>
-					<ContainerPanel
-						chapterId={chapterId}
-						onOpenConfig={() => setContainerConfigOpen(true)}
-						onContainerError={handleContainerError}
-					/>
+					<Suspense fallback={null}>
+						<ContainerPanel
+							chapterId={chapterId}
+							onOpenConfig={() => setContainerConfigOpen(true)}
+							onContainerError={handleContainerError}
+						/>
+					</Suspense>
 				</div>
 			</Collapse>
 
@@ -298,29 +324,50 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 						borderBottom: "1px solid var(--mantine-color-default-border)",
 					}}
 				>
-					<GitPanel chapterId={chapterId} />
+					<Suspense fallback={null}>
+						<GitPanel chapterId={chapterId} />
+					</Suspense>
 				</div>
 			</Collapse>
 
 			{/* Modals */}
-			<ChapterForkModal
-				chapterId={chapterId}
-				opened={forkModalOpen}
-				onClose={() => setForkModalOpen(false)}
-			/>
-			<ChapterMergeModal
-				chapterId={chapterId}
-				projectId={chapter.projectId}
-				opened={mergeModalOpen}
-				onClose={() => setMergeModalOpen(false)}
-			/>
-			<ContainerConfigModal
-				chapterId={chapterId}
-				currentConfig={chapter.containerConfig}
-				opened={containerConfigOpen}
-				onClose={() => setContainerConfigOpen(false)}
-			/>
-			<PodmanInstallModal opened={podmanInstallOpen} onClose={() => setPodmanInstallOpen(false)} />
+			{forkModalOpen && (
+				<Suspense fallback={null}>
+					<ChapterForkModal
+						chapterId={chapterId}
+						opened={forkModalOpen}
+						onClose={() => setForkModalOpen(false)}
+					/>
+				</Suspense>
+			)}
+			{mergeModalOpen && (
+				<Suspense fallback={null}>
+					<ChapterMergeModal
+						chapterId={chapterId}
+						projectId={chapter.projectId}
+						opened={mergeModalOpen}
+						onClose={() => setMergeModalOpen(false)}
+					/>
+				</Suspense>
+			)}
+			{containerConfigOpen && (
+				<Suspense fallback={null}>
+					<ContainerConfigModal
+						chapterId={chapterId}
+						currentConfig={chapter.containerConfig}
+						opened={containerConfigOpen}
+						onClose={() => setContainerConfigOpen(false)}
+					/>
+				</Suspense>
+			)}
+			{podmanInstallOpen && (
+				<Suspense fallback={null}>
+					<PodmanInstallModal
+						opened={podmanInstallOpen}
+						onClose={() => setPodmanInstallOpen(false)}
+					/>
+				</Suspense>
+			)}
 		</>
 	);
 }

@@ -418,28 +418,31 @@ function CmdPatternInput({
 
 function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: string) => string }) {
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
-	const { data: wlDirs = [] } = useWhitelistDirs(narratorId);
+	const [opened, { toggle, close }] = useDisclosure(false);
+	const dropdownRef = useRef<HTMLDivElement>(null);
+
+	// Only fetch rules when the popover is open — avoids 4 API calls on every page load
+	const enabledId = opened ? narratorId : "";
+	const { data: wlDirs = [] } = useWhitelistDirs(enabledId);
 	const createWl = useCreateWhitelistDir();
 	const updateWl = useUpdateWhitelistDir(narratorId);
 	const deleteWl = useDeleteWhitelistDir(narratorId);
 
-	const { data: blDirs = [] } = useBlacklistDirs(narratorId);
+	const { data: blDirs = [] } = useBlacklistDirs(enabledId);
 	const createBl = useCreateBlacklistDir();
 	const updateBl = useUpdateBlacklistDir(narratorId);
 	const deleteBl = useDeleteBlacklistDir(narratorId);
 
-	const { data: cmdWl = [] } = useCmdWhitelist(narratorId);
+	const { data: cmdWl = [] } = useCmdWhitelist(enabledId);
 	const createCmdWl = useCreateCmdWhitelist();
 	const updateCmdWl = useUpdateCmdWhitelist(narratorId);
 	const deleteCmdWl = useDeleteCmdWhitelist(narratorId);
 
-	const { data: cmdBl = [] } = useCmdBlacklist(narratorId);
+	const { data: cmdBl = [] } = useCmdBlacklist(enabledId);
 	const createCmdBl = useCreateCmdBlacklist();
 	const updateCmdBl = useUpdateCmdBlacklist(narratorId);
 	const deleteCmdBl = useDeleteCmdBlacklist(narratorId);
 
-	const [opened, { toggle, close }] = useDisclosure(false);
-	const dropdownRef = useRef<HTMLDivElement>(null);
 	const badgeCount = wlDirs.length + blDirs.length + cmdWl.length + cmdBl.length;
 
 	// Custom click-outside handler that ignores clicks on portal children
@@ -1099,8 +1102,6 @@ export function NarratorPanel({
 	);
 
 	// --- Message operations ---
-	const setContextPercentRef =
-		useRef<React.Dispatch<React.SetStateAction<number | null>>>(undefined);
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
 	const handleDeleteBlock = useCallback(
 		async (messageId: string, blockIndex: number) => {
@@ -1174,7 +1175,10 @@ export function NarratorPanel({
 	}, [input, narratorId]);
 
 	// --- Command popover ---
-	const { data: commandsList } = useNarratorCommands(narratorId);
+	// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
+	const { data: commandsList } = useNarratorCommands(
+		input.startsWith("/") ? narratorId : undefined,
+	);
 	// Show command popover only when typing command name (no space yet),
 	// or when typing "/load <tool>" sub-completion.
 	// Suppress when browsing input history so arrow keys keep navigating history.
@@ -1382,7 +1386,6 @@ export function NarratorPanel({
 		setUnreadCount,
 		viewers,
 	} = wsState;
-	setContextPercentRef.current = wsState.setContextPercent;
 	setUnreadCountRef.current = setUnreadCount;
 
 	const handleCompactError = useCallback(
@@ -4066,14 +4069,16 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
-					<NarratorDetailsPanel
-						opened={detailsOpened}
-						onClose={closeDetails}
-						narratorId={narratorId}
-						narrator={narrator}
-						viewers={viewers}
-						defaultModelValue={defaultModelValue}
-					/>
+					{detailsOpened && (
+						<NarratorDetailsPanel
+							opened={detailsOpened}
+							onClose={closeDetails}
+							narratorId={narratorId}
+							narrator={narrator}
+							viewers={viewers}
+							defaultModelValue={defaultModelValue}
+						/>
+					)}
 
 					{/* Messages */}
 					<Box pos="relative" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
@@ -4464,7 +4469,7 @@ export function NarratorPanel({
 					{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
 
 					{/* Browser sessions bar */}
-					<BrowserSessionBar narratorId={narratorId} />
+					<BrowserSessionBar narratorId={narratorId} sessionCount={wsState.browserSessionCount} />
 
 					{/* Status bar */}
 					<Group

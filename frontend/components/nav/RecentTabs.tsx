@@ -45,8 +45,7 @@ import {
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
@@ -404,6 +403,10 @@ export function RecentTabList({
 		return { pinnedItems: pinned, unpinnedItems: unpinned };
 	}, [topLevel, childrenByWorkspace]);
 
+	// Stable sort-id arrays for SortableContext
+	const pinnedSortIds = useMemo(() => pinnedItems.map(tabSortId), [pinnedItems]);
+	const unpinnedSortIds = useMemo(() => unpinnedItems.map(tabSortId), [unpinnedItems]);
+
 	// Helper: for a given sortIdx in a specific group, return the indices of the whole workspace group
 	// that the item at that index belongs to (header + all children).
 	// Returns a range [startIdx, endIdx] (inclusive).
@@ -425,10 +428,16 @@ export function RecentTabList({
 	);
 
 	// Custom collision detection factory for a specific group
-	const makeCollisionDetection = useCallback(
-		(items: RecentTab[]) => (args: Parameters<CollisionDetection>[0]) =>
-			workspaceGroupCollisionDetection(args, items, childrenByWorkspace),
-		[childrenByWorkspace],
+	const pinnedCollisionDetection = useMemo(
+		() => (args: Parameters<CollisionDetection>[0]) =>
+			workspaceGroupCollisionDetection(args, pinnedItems, childrenByWorkspace),
+		[pinnedItems, childrenByWorkspace],
+	);
+
+	const unpinnedCollisionDetection = useMemo(
+		() => (args: Parameters<CollisionDetection>[0]) =>
+			workspaceGroupCollisionDetection(args, unpinnedItems, childrenByWorkspace),
+		[unpinnedItems, childrenByWorkspace],
 	);
 
 	const sensors = useSensors(
@@ -446,14 +455,19 @@ export function RecentTabList({
 	const [activeGroup, setActiveGroup] = useState<"pinned" | "unpinned" | null>(null);
 
 	// Bridge @dnd-kit drag into global narrator drag so workspace panels can receive drops
-	const handleDragStart = useCallback(
-		(group: "pinned" | "unpinned") => (event: DragStartEvent) => {
+	const pinnedItemsRef = useRef(pinnedItems);
+	pinnedItemsRef.current = pinnedItems;
+	const unpinnedItemsRef = useRef(unpinnedItems);
+	unpinnedItemsRef.current = unpinnedItems;
+
+	const handleDragStartForGroup = useCallback(
+		(group: "pinned" | "unpinned", event: DragStartEvent) => {
 			setOptimisticTabs(null);
 			const activeId = event.active.id as string;
 			setDraggingTabId(activeId);
 			setActiveGroup(group);
 
-			const items = group === "pinned" ? pinnedItems : unpinnedItems;
+			const items = group === "pinned" ? pinnedItemsRef.current : unpinnedItemsRef.current;
 
 			// Measure workspace group height before children collapse
 			const tab = items.find((t) => tabSortId(t) === activeId);
@@ -488,7 +502,17 @@ export function RecentTabList({
 			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
 			startNarratorDragManual(nId, tab.title, x, y);
 		},
-		[pinnedItems, unpinnedItems],
+		[],
+	);
+
+	const handleDragStartPinned = useCallback(
+		(event: DragStartEvent) => handleDragStartForGroup("pinned", event),
+		[handleDragStartForGroup],
+	);
+
+	const handleDragStartUnpinned = useCallback(
+		(event: DragStartEvent) => handleDragStartForGroup("unpinned", event),
+		[handleDragStartForGroup],
 	);
 
 	const handleDragMove = useCallback((event: DragMoveEvent) => {
@@ -815,14 +839,16 @@ export function RecentTabList({
 	const renderTabGroup = (items: RecentTab[], group: "pinned" | "unpinned") => {
 		if (items.length === 0) return null;
 
-		const sortIds = items.map(tabSortId);
-		const collisionDetection = makeCollisionDetection(items);
+		const sortIds = group === "pinned" ? pinnedSortIds : unpinnedSortIds;
+		const collisionDetection =
+			group === "pinned" ? pinnedCollisionDetection : unpinnedCollisionDetection;
+		const onDragStart = group === "pinned" ? handleDragStartPinned : handleDragStartUnpinned;
 
 		return (
 			<DndContext
 				sensors={sensors}
 				collisionDetection={collisionDetection}
-				onDragStart={handleDragStart(group)}
+				onDragStart={onDragStart}
 				onDragMove={handleDragMove}
 				onDragEnd={handleDragEnd}
 				onDragCancel={handleDragCancel}
@@ -1015,7 +1041,7 @@ function WorkspaceChildTab({
 }
 
 /** Compact sortable child tab for workspace children. */
-function SortableWorkspaceChildTab({
+const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab({
 	tab,
 	active,
 	onRemove,
@@ -1117,7 +1143,7 @@ function SortableWorkspaceChildTab({
 			/>
 		</div>
 	);
-}
+});
 
 /**
  * Rendered in DragOverlay while a workspace is being dragged.
@@ -1235,7 +1261,7 @@ interface SortableTabItemProps {
 	wsGroupHeight?: number;
 }
 
-function SortableTabItem({
+const SortableTabItem = React.memo(function SortableTabItem({
 	tab,
 	active,
 	onRemove,
@@ -1487,7 +1513,7 @@ function SortableTabItem({
 			</div>
 		</div>
 	);
-}
+});
 
 // === Indicator components for extra tab info ===
 

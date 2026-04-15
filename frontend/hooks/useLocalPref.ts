@@ -15,15 +15,26 @@ type Key =
 
 const listeners = new Set<() => void>();
 
+// --- Singleton storage listener ---
+// One global "storage" listener dispatches to all subscribers,
+// instead of each useLocalPref instance registering its own.
+let storageListenerInstalled = false;
+
+function ensureStorageListener() {
+	if (storageListenerInstalled) return;
+	storageListenerInstalled = true;
+	window.addEventListener("storage", (e: StorageEvent) => {
+		if (e.key?.startsWith("narrafork_")) {
+			for (const cb of listeners) cb();
+		}
+	});
+}
+
 function subscribe(cb: () => void) {
 	listeners.add(cb);
-	const onStorage = (e: StorageEvent) => {
-		if (e.key?.startsWith("narrafork_")) cb();
-	};
-	window.addEventListener("storage", onStorage);
+	ensureStorageListener();
 	return () => {
 		listeners.delete(cb);
-		window.removeEventListener("storage", onStorage);
 	};
 }
 

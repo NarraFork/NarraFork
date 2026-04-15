@@ -37,10 +37,16 @@ if (import.meta.hot) {
 		}
 	};
 
-	document.addEventListener("visibilitychange", () => {
+	const onVisibilityChange = () => {
 		if (document.hidden) {
 			pageWasHidden = true;
 		}
+	};
+
+	document.addEventListener("visibilitychange", onVisibilityChange);
+
+	import.meta.hot.dispose(() => {
+		document.removeEventListener("visibilitychange", onVisibilityChange);
 	});
 
 	import.meta.hot.on("vite:ws:disconnect", () => {

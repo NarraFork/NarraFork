@@ -1,5 +1,6 @@
 import {
 	createContext,
+	memo,
 	type ReactNode,
 	useCallback,
 	useContext,
@@ -133,12 +134,18 @@ export function useBlurInOnAppear(animationId?: string | null) {
 	return shouldAnimate;
 }
 
-function BlurInAnimated({ animationId, children }: { animationId: string; children: ReactNode }) {
+const BlurInAnimated = memo(function BlurInAnimated({
+	animationId,
+	children,
+}: {
+	animationId: string;
+	children: ReactNode;
+}) {
 	const shouldAnimate = useBlurInOnAppear(animationId);
 	return <div className={shouldAnimate ? "nf-blur-in-enter" : undefined}>{children}</div>;
-}
+});
 
-export function BlurInOnAppear({
+export const BlurInOnAppear = memo(function BlurInOnAppear({
 	animationId,
 	children,
 }: {
@@ -148,4 +155,4 @@ export function BlurInOnAppear({
 	const registry = useContext(BlurInOnAppearContext);
 	if (!animationId || !registry) return <>{children}</>;
 	return <BlurInAnimated animationId={animationId}>{children}</BlurInAnimated>;
-}
+});

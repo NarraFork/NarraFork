@@ -1,7 +1,16 @@
 import { Code, useComputedColorScheme } from "@mantine/core";
-import { type CSSProperties, memo, useEffect, useState } from "react";
-import { bundledLanguages, codeToHtml } from "shiki";
+import { type CSSProperties, memo, useEffect, useRef, useState } from "react";
 import classes from "./HighlightedCode.module.css";
+import {
+	cacheKey,
+	getCachedHtml,
+	MAX_CACHEABLE_CODE_CHARS,
+	peekCachedHtml,
+	setCachedHtml,
+} from "./highlight-cache";
+
+// Re-export for backward compat — callers that imported from here still work.
+export { clearHighlightCache } from "./highlight-cache";
 
 interface HighlightedCodeProps {
 	/** Source code to highlight */
@@ -12,60 +21,20 @@ interface HighlightedCodeProps {
 	style?: CSSProperties;
 }
 
-type CacheEntry = {
-	html: string;
-	size: number;
-};
+// Lazy-loaded shiki helpers — resolved once on first use.
+let shikiReady: Promise<{
+	bundledLanguages: Record<string, unknown>;
+	codeToHtml: typeof import("shiki").codeToHtml;
+}> | null = null;
 
-const htmlCache = new Map<string, CacheEntry>();
-let htmlCacheBytes = 0;
-const MAX_CACHE_ENTRIES = 64;
-const MAX_CACHE_BYTES = 1 * 1024 * 1024;
-const MAX_CACHEABLE_CODE_CHARS = 20_000;
-
-function cacheKey(theme: string, lang: string, code: string) {
-	return `${theme}\0${lang}\0${code}`;
-}
-
-function peekCachedHtml(key: string): string | null {
-	return htmlCache.get(key)?.html ?? null;
-}
-
-function getCachedHtml(key: string): string | null {
-	const entry = htmlCache.get(key);
-	if (!entry) return null;
-	htmlCache.delete(key);
-	htmlCache.set(key, entry);
-	return entry.html;
-}
-
-function evictOldestCachedHtml() {
-	const oldestKey = htmlCache.keys().next().value;
-	if (!oldestKey) return;
-	const oldest = htmlCache.get(oldestKey);
-	if (!oldest) return;
-	htmlCacheBytes -= oldest.size;
-	htmlCache.delete(oldestKey);
-}
-
-function setCachedHtml(key: string, html: string) {
-	const existing = htmlCache.get(key);
-	if (existing) {
-		htmlCacheBytes -= existing.size;
-		htmlCache.delete(key);
+function getShiki() {
+	if (!shikiReady) {
+		shikiReady = import("shiki").then((m) => ({
+			bundledLanguages: m.bundledLanguages,
+			codeToHtml: m.codeToHtml,
+		}));
 	}
-	const entry = { html, size: html.length * 2 };
-	htmlCache.set(key, entry);
-	htmlCacheBytes += entry.size;
-	while (htmlCache.size > MAX_CACHE_ENTRIES || htmlCacheBytes > MAX_CACHE_BYTES) {
-		evictOldestCachedHtml();
-	}
-}
-
-/** Clear the entire highlight cache. Call when navigating away from narrator pages. */
-export function clearHighlightCache() {
-	htmlCache.clear();
-	htmlCacheBytes = 0;
+	return shikiReady;
 }
 
 /**
@@ -80,46 +49,60 @@ export const HighlightedCode = memo(function HighlightedCode({
 }: HighlightedCodeProps) {
 	const computedScheme = useComputedColorScheme("dark");
 	const theme = computedScheme === "light" ? "github-light-default" : "github-dark-default";
-	const effectiveLang = lang && lang in bundledLanguages ? lang : "text";
-	const key = cacheKey(theme, effectiveLang, code);
-	const shouldCache = code.length <= MAX_CACHEABLE_CODE_CHARS;
-	const [html, setHtml] = useState<string | null>(() => peekCachedHtml(key));
+
+	// We can't synchronously check bundledLanguages before shiki loads,
+	// so we start with the raw lang and validate once shiki is available.
+	const [html, setHtml] = useState<string | null>(() => {
+		if (!lang || lang === "text") return null;
+		return peekCachedHtml(cacheKey(theme, lang, code));
+	});
+
+	// Track whether shiki's bundledLanguages has been resolved.
+	const bundledLangsRef = useRef<Record<string, unknown> | null>(null);
 
 	useEffect(() => {
-		if (effectiveLang === "text") {
+		if (!lang || lang === "text") {
 			setHtml(null);
 			return;
 		}
 
-		const existing = shouldCache ? getCachedHtml(key) : null;
-		if (existing) {
-			setHtml(existing);
-			return;
-		}
-
-		setHtml(null);
+		const shouldCache = code.length <= MAX_CACHEABLE_CODE_CHARS;
 		let cancelled = false;
-		codeToHtml(code, {
-			lang: effectiveLang,
-			theme,
-		})
-			.then((result) => {
-				if (cancelled) return;
-				if (shouldCache) {
-					setCachedHtml(key, result);
-				}
-				setHtml(result);
-			})
-			.catch(() => {
-				if (!cancelled) {
-					setHtml(null);
-				}
-			});
+
+		getShiki().then(({ bundledLanguages, codeToHtml }) => {
+			if (cancelled) return;
+			bundledLangsRef.current = bundledLanguages;
+
+			const effectiveLang = lang in bundledLanguages ? lang : "text";
+			if (effectiveLang === "text") {
+				setHtml(null);
+				return;
+			}
+
+			const key = cacheKey(theme, effectiveLang, code);
+			const existing = shouldCache ? getCachedHtml(key) : null;
+			if (existing) {
+				setHtml(existing);
+				return;
+			}
+
+			codeToHtml(code, { lang: effectiveLang, theme })
+				.then((result) => {
+					if (cancelled) return;
+					if (shouldCache) {
+						setCachedHtml(key, result);
+					}
+					setHtml(result);
+				})
+				.catch(() => {
+					if (!cancelled) setHtml(null);
+				});
+		});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [key, effectiveLang, code, theme, shouldCache]);
+	}, [lang, code, theme]);
 
 	// Plain text or pending — use Mantine Code
 	if (!html) {
